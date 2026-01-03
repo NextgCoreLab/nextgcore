@@ -1,0 +1,21 @@
+# AUSF (Authentication Server Function) Configuration
+# Docker container configuration for 5G Core deployment
+
+logger:
+  file:
+    path: /var/log/nextgcore/ausf.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+ausf:
+  sbi:
+    server:
+      - address: 172.23.0.11
+        port: 7777
+    client:
+      nrf:
+        - uri: http://172.23.0.10:7777

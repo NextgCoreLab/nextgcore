@@ -1,0 +1,48 @@
+# NextGCore MME Configuration for Docker EPC Deployment
+# Rust implementation
+
+logger:
+  file:
+    path: /var/log/nextgcore/mme.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+mme:
+  freeDiameter: /etc/freeDiameter/mme.conf
+  s1ap:
+    server:
+      - address: 172.24.0.5
+  gtpc:
+    server:
+      - address: 172.24.0.5
+    client:
+      sgwc:
+        - address: 172.24.0.3
+      smf:
+        - address: 172.24.0.4
+  metrics:
+    server:
+      - address: 172.24.0.5
+        port: 9090
+  gummei:
+    - plmn_id:
+        mcc: 999
+        mnc: 70
+      mme_gid: 2
+      mme_code: 1
+  tai:
+    - plmn_id:
+        mcc: 999
+        mnc: 70
+      tac: 1
+  security:
+    integrity_order: [EIA2, EIA1, EIA0]
+    ciphering_order: [EEA0, EEA1, EEA2]
+  network_name:
+    full: NextGCore
+    short: Next
+  mme_name: nextgcore-mme0

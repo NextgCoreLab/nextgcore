@@ -1,0 +1,15 @@
+[package]
+name = "ogs-tun"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore TUN Interface Library"
+
+[dependencies]
+ogs-core = { workspace = true }
+libc.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

@@ -1,0 +1,30 @@
+[package]
+name = "nextgcore-smfd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore SMF (Session Management Function)"
+
+[[bin]]
+name = "nextgcore-smfd"
+path = "src/main.rs"
+
+[dependencies]
+ogs-core = { workspace = true }
+ogs-nas = { workspace = true }
+ogs-ngap = { workspace = true }
+ogs-pfcp = { workspace = true }
+ogs-gtp = { workspace = true }
+ogs-sbi = { workspace = true }
+ogs-diameter = { workspace = true }
+ogs-app = { workspace = true }
+log.workspace = true
+env_logger.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+bytes.workspace = true
+ctrlc.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

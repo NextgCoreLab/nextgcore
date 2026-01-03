@@ -1,0 +1,16 @@
+[package]
+name = "ogs-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore Application Framework Library"
+
+[dependencies]
+ogs-core = { workspace = true }
+thiserror.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

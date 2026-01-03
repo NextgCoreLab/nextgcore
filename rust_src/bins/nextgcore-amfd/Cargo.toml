@@ -1,0 +1,32 @@
+[package]
+name = "nextgcore-amfd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore AMF (Access and Mobility Management Function)"
+
+[[bin]]
+name = "nextgcore-amfd"
+path = "src/main.rs"
+
+[dependencies]
+ogs-core = { workspace = true }
+ogs-crypt = { workspace = true }
+ogs-nas = { workspace = true }
+ogs-ngap = { workspace = true }
+ogs-sbi = { workspace = true }
+ogs-app = { workspace = true }
+ogs-metrics = { workspace = true }
+log.workspace = true
+env_logger.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+uuid = { version = "1.0", features = ["v4"] }
+clap = { version = "4.0", features = ["derive"] }
+ctrlc = "3.4"
+sha2 = "0.10"
+bytes = "1.5"
+
+[dev-dependencies]
+proptest.workspace = true

@@ -1,0 +1,31 @@
+[package]
+name = "ogs-sctp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore SCTP Transport Library - Pure Rust Implementation"
+
+[features]
+default = ["userspace"]
+# Pure Rust userspace SCTP (default - no C dependencies)
+userspace = ["webrtc-sctp", "webrtc-util"]
+# Linux kernel SCTP (requires libsctp-dev) - for compatibility testing
+kernel = []
+
+[dependencies]
+ogs-core = { workspace = true }
+thiserror.workspace = true
+log.workspace = true
+tokio = { workspace = true, features = ["net", "sync", "time", "rt"] }
+bytes.workspace = true
+async-trait.workspace = true
+
+# Pure Rust SCTP implementation (userspace over UDP)
+webrtc-sctp = { workspace = true, optional = true }
+webrtc-util = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+env_logger.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

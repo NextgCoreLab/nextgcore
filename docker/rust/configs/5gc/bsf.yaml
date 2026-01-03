@@ -1,0 +1,21 @@
+# BSF (Binding Support Function) Configuration
+# Docker container configuration for 5G Core deployment
+
+logger:
+  file:
+    path: /var/log/nextgcore/bsf.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+bsf:
+  sbi:
+    server:
+      - address: 172.23.0.15
+        port: 7777
+    client:
+      nrf:
+        - uri: http://172.23.0.10:7777

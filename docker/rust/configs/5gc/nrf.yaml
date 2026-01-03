@@ -1,0 +1,22 @@
+# NRF (Network Repository Function) Configuration
+# Docker container configuration for 5G Core deployment
+
+logger:
+  file:
+    path: /var/log/nextgcore/nrf.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+nrf:
+  serving:
+    - plmn_id:
+        mcc: 999
+        mnc: 70
+  sbi:
+    server:
+      - address: 172.23.0.10
+        port: 7777

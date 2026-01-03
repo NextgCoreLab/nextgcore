@@ -1,0 +1,24 @@
+[package]
+name = "ogs-crypt"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore Cryptographic Library"
+
+[dependencies]
+ogs-core = { workspace = true }
+aes.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+cmac.workspace = true
+zuc.workspace = true
+p256 = { workspace = true, features = ["ecdh", "ecdsa"] }
+elliptic-curve = { workspace = true, features = ["sec1"] }
+rand = { workspace = true }
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+hex-literal.workspace = true

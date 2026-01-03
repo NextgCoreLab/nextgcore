@@ -1,0 +1,28 @@
+# UDM (Unified Data Management) Configuration
+# Docker container configuration for 5G Core deployment
+
+logger:
+  file:
+    path: /var/log/nextgcore/udm.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+udm:
+  hnet:
+    - id: 1
+      scheme: 1
+      key: /etc/nextgcore/hnet/curve25519-1.key
+    - id: 2
+      scheme: 2
+      key: /etc/nextgcore/hnet/secp256r1-2.key
+  sbi:
+    server:
+      - address: 172.23.0.12
+        port: 7777
+    client:
+      nrf:
+        - uri: http://172.23.0.10:7777

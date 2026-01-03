@@ -1,0 +1,21 @@
+# NextGCore HSS Configuration for Docker EPC Deployment
+# Rust implementation
+
+db_uri: mongodb://mongodb:27017/nextgcore
+
+logger:
+  file:
+    path: /var/log/nextgcore/hss.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+hss:
+  freeDiameter: /etc/freeDiameter/hss.conf
+  metrics:
+    server:
+      - address: 172.24.0.8
+        port: 9090

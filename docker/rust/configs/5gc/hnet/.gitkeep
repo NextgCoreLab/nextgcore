@@ -1,0 +1,7 @@
+# Home Network Public Key files for UDM
+# 
+# Generate keys using:
+#   openssl genpkey -algorithm X25519 -out curve25519-1.key
+#   openssl ecparam -name prime256v1 -genkey -conv_form compressed -out secp256r1-2.key
+#
+# These keys are used for SUPI concealment (5G-AKA)

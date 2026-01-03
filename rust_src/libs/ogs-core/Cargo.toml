@@ -1,0 +1,19 @@
+[package]
+name = "ogs-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore Core Utilities Library"
+
+[dependencies]
+log.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+bitflags.workspace = true
+libc.workspace = true
+env_logger.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

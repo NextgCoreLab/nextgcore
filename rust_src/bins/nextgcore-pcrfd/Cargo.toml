@@ -1,0 +1,34 @@
+[package]
+name = "nextgcore-pcrfd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NextGCore PCRF - Policy and Charging Rules Function"
+
+[[bin]]
+name = "nextgcore-pcrfd"
+path = "src/main.rs"
+
+[lib]
+name = "nextgcore_pcrfd"
+path = "src/lib.rs"
+
+[dependencies]
+# Workspace dependencies
+log.workspace = true
+env_logger.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+
+# Internal crates
+ogs-core = { path = "../../libs/ogs-core" }
+ogs-diameter = { path = "../../libs/ogs-diameter" }
+ogs-dbi = { path = "../../libs/ogs-dbi" }
+ogs-app = { path = "../../libs/ogs-app" }
+
+[dev-dependencies]
+proptest.workspace = true

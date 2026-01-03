@@ -1,0 +1,17 @@
+[package]
+name = "ogs-ffi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore FFI Bindings for C Comparison Testing"
+build = "build.rs"
+
+[dependencies]
+libc.workspace = true
+
+[build-dependencies]
+bindgen.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

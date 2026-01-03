@@ -1,0 +1,29 @@
+[package]
+name = "nextgcore-nrfd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore NRF (Network Repository Function)"
+
+[[bin]]
+name = "nextgcore-nrfd"
+path = "src/main.rs"
+
+[lib]
+name = "nextgcore_nrfd"
+path = "src/lib.rs"
+
+[dependencies]
+ogs-core = { workspace = true }
+ogs-sbi = { workspace = true }
+ogs-app = { workspace = true }
+log.workspace = true
+env_logger.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+clap = { version = "4.4", features = ["derive"] }
+ctrlc = { version = "3.4", features = ["termination"] }
+
+[dev-dependencies]
+proptest.workspace = true

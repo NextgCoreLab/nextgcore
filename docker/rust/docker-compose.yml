@@ -1,0 +1,719 @@
+# NextGCore Rust Full Deployment Docker Compose
+# Combined 5G Core (5GC) + Evolved Packet Core (EPC) deployment
+#
+# This file provides a complete deployment with all network functions including:
+#   - 5G Core: NRF, AUSF, UDM, UDR, PCF, NSSF, BSF, AMF, SMF, UPF
+#   - EPC: MME, HSS, PCRF, SGW-C, SGW-U
+#   - Service Mesh: SCP (Service Communication Proxy)
+#   - Roaming: SEPP (Security Edge Protection Proxy)
+#   - Infrastructure: MongoDB, WebUI
+#
+# Usage:
+#   # Start all services (5GC + EPC)
+#   docker compose up -d
+#
+#   # Start with SCP (Service Communication Proxy)
+#   docker compose --profile scp up -d
+#
+#   # Start with SEPP (Security Edge Protection Proxy for roaming)
+#   docker compose --profile sepp up -d
+#
+#   # Start with all optional services
+#   docker compose --profile scp --profile sepp up -d
+#
+#   # Stop all services
+#   docker compose down
+#
+#   # View logs
+#   docker compose logs -f [service_name]
+#
+# Network Architecture:
+#   - 172.22.0.0/24: Main network for all NFs
+#   - MongoDB: 172.22.0.2
+#   - WebUI: 172.22.0.3
+#   - 5GC NFs: 172.22.0.10-172.22.0.29
+#   - EPC NFs: 172.22.0.30-172.22.0.49
+#   - SCP/SEPP: 172.22.0.50-172.22.0.59
+
+x-common-env: &common-env
+  RUST_LOG: info
+  RUST_BACKTRACE: 1
+
+x-common-restart: &common-restart
+  restart: unless-stopped
+
+x-common-healthcheck: &common-healthcheck
+  interval: 30s
+  timeout: 10s
+  retries: 3
+  start_period: 15s
+
+services:
+  # ==========================================================================
+  # Infrastructure Services
+  # ==========================================================================
+
+  # MongoDB - Database for subscriber and session data
+  mongodb:
+    image: mongo:6.0
+    container_name: nextgcore-mongodb
+    <<: *common-restart
+    environment:
+      MONGO_INITDB_DATABASE: nextgcore
+    volumes:
+      - mongodb_data:/data/db
+      - ../../docs/assets/webui/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    networks:
+      nextgcore-net:
+        ipv4_address: 172.22.0.2
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      <<: *common-healthcheck
+
+  # WebUI - Web-based management interface
+  webui:
+    build:
+      context: ../..
+      dockerfile: docker/webui/Dockerfile
+    image: nextgcore-rust/webui:latest
+    container_name: nextgcore-webui
+    <<: *common-restart
+    environment:
+      DB_URI: mongodb://mongodb/nextgcore
+      WAIT_HOSTS: mongodb:27017
+      WAIT_HOSTS_TIMEOUT: 120
+    networks:
+      nextgcore-net:
+        ipv4_address: 172.22.0.3
+    ports:
+      - "9999:9999"
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9999"]
+      <<: *common-healthcheck
+
+
+  # ==========================================================================
+  # 5G Core Network Functions - Core NFs
+  # ==========================================================================
+
+  # NRF - Network Repository Function
+  # Central registry for NF discovery and management
+  nrf:
+    build:
+      context: ../..
+      dockerfile: docker/rust/Dockerfile.nf-template
+      args:
+        NF_NAME: nextgcore-nrfd
+    image: nextgcore-rust/nrf:latest
+    container_name: nextgcore-nrf
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    volumes:
+      - ./configs/5gc/nrf.yaml:/etc/nextgcore/nextgcore-nrfd.yaml:ro
+      - logs_nrf:/var/log/nextgcore
+    networks:
+      nextgcore-net:
+        ipv4_address: 172.22.0.10
+    ports:
+      - "7777:7777"  # SBI
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7777/nnrf-nfm/v1/nf-instances"]
+      <<: *common-healthcheck
+
+  # AUSF - Authentication Server Function
+  # Handles UE authentication for 5G
+  ausf:
+    build:
+      context: ../..
+      dockerfile: docker/rust/Dockerfile.nf-template
+      args:
+        NF_NAME: nextgcore-ausfd
+    image: nextgcore-rust/ausf:latest
+    container_name: nextgcore-ausf
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    volumes:
+      - ./configs/5gc/ausf.yaml:/etc/nextgcore/nextgcore-ausfd.yaml:ro
+      - logs_ausf:/var/log/nextgcore
+    networks:
+      nextgcore-net:
+        ipv4_address: 172.22.0.11
+    depends_on:
+      - nrf
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7777/nausf-auth/v1/ue-authentications"]
+      <<: *common-healthcheck
+
+  # UDM - Unified Data Management
+  # Manages subscriber data and authentication credentials
+  udm:
+    build:
+      context: ../..
+      dockerfile: docker/rust/Dockerfile.nf-template
+      args:
+        NF_NAME: nextgcore-udmd
+    image: nextgcore-rust/udm:latest
+    container_name: nextgcore-udm
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    volumes:
+      - ./configs/5gc/udm.yaml:/etc/nextgcore/nextgcore-udmd.yaml:ro
+      - ./configs/5gc/hnet:/etc/nextgcore/hnet:ro
+      - logs_udm:/var/log/nextgcore
+    networks:
+      nextgcore-net:
+        ipv4_address: 172.22.0.12
+    depends_on:
+      - nrf
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7777/nudm-sdm/v2/"]
+      <<: *common-healthcheck
+
+  # UDR - Unified Data Repository
+  # Stores subscriber and policy data in MongoDB
+  udr:
+    build:
+      context: ../..
+      dockerfile: docker/rust/Dockerfile.nf-template
+      args:
+        NF_NAME: nextgcore-udrd
+    image: nextgcore-rust/udr:latest
+    container_name: nextgcore-udr
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    volumes:
+      - ./configs/5gc/udr.yaml:/etc/nextgcore/nextgcore-udrd.yaml:ro
+      - logs_udr:/var/log/nextgcore
+    networks:
+      nextgcore-net:
+        ipv4_address: 172.22.0.13
+    depends_on:
+      - nrf
+      - mongodb
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7777/nudr-dr/v2/"]
+      <<: *common-healthcheck
+
+  # PCF - Policy Control Function
+  # Manages policy rules and QoS for 5G
+  pcf:
+    build:
+      context: ../..
+      dockerfile: docker/rust/Dockerfile.nf-template
+      args:
+        NF_NAME: nextgcore-pcfd
+    image: nextgcore-rust/pcf:latest
+    container_name: nextgcore-pcf
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    volumes:
+      - ./configs/5gc/pcf.yaml:/etc/nextgcore/nextgcore-pcfd.yaml:ro
+      - logs_pcf:/var/log/nextgcore
+    networks:
+      nextgcore-net:
+        ipv4_address: 172.22.0.14
+    ports:
+      - "9093:9090"  # Metrics
+    depends_on:
+      - nrf
+      - mongodb
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7777/npcf-am-policy-control/v1/"]
+      <<: *common-healthcheck
+
+  # NSSF - Network Slice Selection Function
+  # Selects network slices for UEs
+  nssf:
+    build:
+      context: ../..
+      dockerfile: docker/rust/Dockerfile.nf-template
+      args:
+        NF_NAME: nextgcore-nssfd
+    image: nextgcore-rust/nssf:latest
+    container_name: nextgcore-nssf
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    volumes:
+      - ./configs/5gc/nssf.yaml:/etc/nextgcore/nextgcore-nssfd.yaml:ro
+      - logs_nssf:/var/log/nextgcore
+    networks:
+      nextgcore-net:
+        ipv4_address: 172.22.0.15
+    depends_on:
+      - nrf
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7777/nnssf-nsselection/v2/"]
+      <<: *common-healthcheck
+
+  # BSF - Binding Support Function
+  # Manages PCF bindings for UE sessions
+  bsf:
+    build:
+      context: ../..
+      dockerfile: docker/rust/Dockerfile.nf-template
+      args:
+        NF_NAME: nextgcore-bsfd
+    image: nextgcore-rust/bsf:latest
+    container_name: nextgcore-bsf
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    volumes:
+      - ./configs/5gc/bsf.yaml:/etc/nextgcore/nextgcore-bsfd.yaml:ro
+      - logs_bsf:/var/log/nextgcore
+    networks:
+      nextgcore-net:
+        ipv4_address: 172.22.0.16
+    depends_on:
+      - nrf
+      - mongodb
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7777/nbsf-management/v1/"]
+      <<: *common-healthcheck
+
+
+  # ==========================================================================
+  # 5G Core Network Functions - Access NFs
+  # ==========================================================================
+
+  # AMF - Access and Mobility Management Function
+  # Handles UE registration, mobility, and connection management for 5G
+  amf:
+    build:
+      context: ../..
+      dockerfile: docker/rust/Dockerfile.nf-template
+      args:
+        NF_NAME: nextgcore-amfd
+    image: nextgcore-rust/amf:latest
+    container_name: nextgcore-amf
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    volumes:
+      - ./configs/5gc/amf.yaml:/etc/nextgcore/nextgcore-amfd.yaml:ro
+      - logs_amf:/var/log/nextgcore
+    networks:
+      nextgcore-net:
+        ipv4_address: 172.22.0.17
+    ports:
+      - "38412:38412/sctp"  # NGAP (N2 interface to gNB)
+      - "9091:9090"         # Metrics
+    depends_on:
+      - nrf
+      - ausf
+      - udm
+      - pcf
+      - nssf
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7777/namf-comm/v1/"]
+      <<: *common-healthcheck
+
+  # SMF - Session Management Function
+  # Manages PDU sessions and UPF selection (also serves as PGW-C for EPC)
+  smf:
+    build:
+      context: ../..
+      dockerfile: docker/rust/Dockerfile.nf-template
+      args:
+        NF_NAME: nextgcore-smfd
+    image: nextgcore-rust/smf:latest
+    container_name: nextgcore-smf
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    volumes:
+      - ./configs/5gc/smf.yaml:/etc/nextgcore/nextgcore-smfd.yaml:ro
+      - logs_smf:/var/log/nextgcore
+    networks:
+      nextgcore-net:
+        ipv4_address: 172.22.0.18
+    ports:
+      - "8805:8805/udp"  # PFCP (N4 interface to UPF)
+      - "9092:9090"      # Metrics
+    depends_on:
+      - nrf
+      - pcf
+      - amf
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7777/nsmf-pdusession/v1/"]
+      <<: *common-healthcheck
+
+  # ==========================================================================
+  # 5G Core User Plane
+  # ==========================================================================
+
+  # UPF - User Plane Function
+  # Handles user data forwarding and packet processing (also serves as PGW-U for EPC)
+  upf:
+    build:
+      context: ../..
+      dockerfile: docker/rust/Dockerfile.nf-template
+      args:
+        NF_NAME: nextgcore-upfd
+    image: nextgcore-rust/upf:latest
+    container_name: nextgcore-upf
+    <<: *common-restart
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv6.conf.all.forwarding=1
+    environment:
+      <<: *common-env
+    volumes:
+      - ./configs/5gc/upf.yaml:/etc/nextgcore/nextgcore-upfd.yaml:ro
+      - logs_upf:/var/log/nextgcore
+    networks:
+      nextgcore-net:
+        ipv4_address: 172.22.0.19
+    ports:
+      - "2152:2152/udp"  # GTP-U (N3 interface to gNB, S1-U for EPC)
+      - "9094:9090"      # Metrics
+    depends_on:
+      - smf
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "nextgcore-upfd"]
+      <<: *common-healthcheck
+
+
+  # ==========================================================================
+  # EPC (Evolved Packet Core) Network Functions
+  # ==========================================================================
+
+  # HSS - Home Subscriber Server
+  # Manages subscriber data and authentication for LTE
+  hss:
+    build:
+      context: ../..
+      dockerfile: docker/rust/Dockerfile.nf-template
+      args:
+        NF_NAME: nextgcore-hssd
+    image: nextgcore-rust/hss:latest
+    container_name: nextgcore-hss
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    volumes:
+      - ./configs/epc/hss.yaml:/etc/nextgcore/nextgcore-hssd.yaml:ro
+      - ./configs/epc/freeDiameter/hss.conf:/etc/freeDiameter/hss.conf:ro
+      - logs_hss:/var/log/nextgcore
+    networks:
+      nextgcore-net:
+        ipv4_address: 172.22.0.30
+    ports:
+      - "3868:3868/tcp"   # Diameter (S6a)
+      - "3868:3868/sctp"  # Diameter over SCTP
+      - "9098:9090"       # Metrics
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "nextgcore-hssd"]
+      <<: *common-healthcheck
+
+  # PCRF - Policy and Charging Rules Function
+  # Manages policy rules and QoS for EPC
+  pcrf:
+    build:
+      context: ../..
+      dockerfile: docker/rust/Dockerfile.nf-template
+      args:
+        NF_NAME: nextgcore-pcrfd
+    image: nextgcore-rust/pcrf:latest
+    container_name: nextgcore-pcrf
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    volumes:
+      - ./configs/epc/pcrf.yaml:/etc/nextgcore/nextgcore-pcrfd.yaml:ro
+      - ./configs/epc/freeDiameter/pcrf.conf:/etc/freeDiameter/pcrf.conf:ro
+      - logs_pcrf:/var/log/nextgcore
+    networks:
+      nextgcore-net:
+        ipv4_address: 172.22.0.31
+    ports:
+      - "3869:3868/tcp"   # Diameter (Gx)
+      - "9099:9090"       # Metrics
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "nextgcore-pcrfd"]
+      <<: *common-healthcheck
+
+  # SGW-C - Serving Gateway Control Plane
+  # Handles control plane signaling for user data routing
+  sgwc:
+    build:
+      context: ../..
+      dockerfile: docker/rust/Dockerfile.nf-template
+      args:
+        NF_NAME: nextgcore-sgwcd
+    image: nextgcore-rust/sgwc:latest
+    container_name: nextgcore-sgwc
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    volumes:
+      - ./configs/epc/sgwc.yaml:/etc/nextgcore/nextgcore-sgwcd.yaml:ro
+      - logs_sgwc:/var/log/nextgcore
+    networks:
+      nextgcore-net:
+        ipv4_address: 172.22.0.32
+    ports:
+      - "2123:2123/udp"  # GTP-C (S11 interface to MME)
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "nextgcore-sgwcd"]
+      <<: *common-healthcheck
+
+  # MME - Mobility Management Entity
+  # Handles UE registration, mobility, and connection management for LTE
+  mme:
+    build:
+      context: ../..
+      dockerfile: docker/rust/Dockerfile.nf-template
+      args:
+        NF_NAME: nextgcore-mmed
+    image: nextgcore-rust/mme:latest
+    container_name: nextgcore-mme
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    volumes:
+      - ./configs/epc/mme.yaml:/etc/nextgcore/nextgcore-mmed.yaml:ro
+      - ./configs/epc/freeDiameter/mme.conf:/etc/freeDiameter/mme.conf:ro
+      - logs_mme:/var/log/nextgcore
+    networks:
+      nextgcore-net:
+        ipv4_address: 172.22.0.33
+    ports:
+      - "36412:36412/sctp"  # S1AP (S1-MME interface to eNB)
+      - "9095:9090"         # Metrics
+    depends_on:
+      - hss
+      - sgwc
+      - smf
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "nextgcore-mmed"]
+      <<: *common-healthcheck
+
+  # SGW-U - Serving Gateway User Plane
+  # Handles user plane data forwarding between eNB and PGW-U
+  sgwu:
+    build:
+      context: ../..
+      dockerfile: docker/rust/Dockerfile.nf-template
+      args:
+        NF_NAME: nextgcore-sgwud
+    image: nextgcore-rust/sgwu:latest
+    container_name: nextgcore-sgwu
+    <<: *common-restart
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    sysctls:
+      - net.ipv4.ip_forward=1
+    environment:
+      <<: *common-env
+    volumes:
+      - ./configs/epc/sgwu.yaml:/etc/nextgcore/nextgcore-sgwud.yaml:ro
+      - logs_sgwu:/var/log/nextgcore
+    networks:
+      nextgcore-net:
+        ipv4_address: 172.22.0.34
+    depends_on:
+      - sgwc
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "nextgcore-sgwud"]
+      <<: *common-healthcheck
+
+
+  # ==========================================================================
+  # Service Communication Proxy (SCP)
+  # Optional: Enable with --profile scp
+  # ==========================================================================
+
+  # SCP - Service Communication Proxy
+  # Provides indirect communication between NFs via service mesh
+  scp:
+    build:
+      context: ../..
+      dockerfile: docker/rust/Dockerfile.nf-template
+      args:
+        NF_NAME: nextgcore-scpd
+    image: nextgcore-rust/scp:latest
+    container_name: nextgcore-scp
+    <<: *common-restart
+    profiles:
+      - scp
+      - full
+    environment:
+      <<: *common-env
+    volumes:
+      - ./configs/scp.yaml:/etc/nextgcore/nextgcore-scpd.yaml:ro
+      - logs_scp:/var/log/nextgcore
+    networks:
+      nextgcore-net:
+        ipv4_address: 172.22.0.50
+    ports:
+      - "7778:7777"  # SBI (different port to avoid conflict with NRF)
+    depends_on:
+      - nrf
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "nextgcore-scpd"]
+      <<: *common-healthcheck
+
+  # ==========================================================================
+  # Security Edge Protection Proxy (SEPP)
+  # Optional: Enable with --profile sepp
+  # ==========================================================================
+
+  # SEPP1 - Security Edge Protection Proxy (Home PLMN)
+  # Provides secure inter-PLMN communication for roaming
+  sepp1:
+    build:
+      context: ../..
+      dockerfile: docker/rust/Dockerfile.nf-template
+      args:
+        NF_NAME: nextgcore-seppd
+    image: nextgcore-rust/sepp:latest
+    container_name: nextgcore-sepp1
+    <<: *common-restart
+    profiles:
+      - sepp
+      - full
+    environment:
+      <<: *common-env
+    volumes:
+      - ./configs/sepp1.yaml:/etc/nextgcore/nextgcore-seppd.yaml:ro
+      - ./configs/tls:/etc/nextgcore/tls:ro
+      - logs_sepp1:/var/log/nextgcore
+    networks:
+      nextgcore-net:
+        ipv4_address: 172.22.0.51
+    ports:
+      - "7779:7777"  # SBI
+      - "7780:7778"  # N32c
+      - "7781:7779"  # N32f
+    depends_on:
+      - nrf
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "nextgcore-seppd"]
+      <<: *common-healthcheck
+
+  # SEPP2 - Security Edge Protection Proxy (Visited PLMN)
+  # Second SEPP for testing roaming scenarios
+  sepp2:
+    build:
+      context: ../..
+      dockerfile: docker/rust/Dockerfile.nf-template
+      args:
+        NF_NAME: nextgcore-seppd
+    image: nextgcore-rust/sepp:latest
+    container_name: nextgcore-sepp2
+    <<: *common-restart
+    profiles:
+      - sepp
+      - full
+    environment:
+      <<: *common-env
+    volumes:
+      - ./configs/sepp2.yaml:/etc/nextgcore/nextgcore-seppd.yaml:ro
+      - ./configs/tls:/etc/nextgcore/tls:ro
+      - logs_sepp2:/var/log/nextgcore
+    networks:
+      nextgcore-net:
+        ipv4_address: 172.22.0.52
+    ports:
+      - "7782:7777"  # SBI
+      - "7783:7778"  # N32c
+      - "7784:7779"  # N32f
+    depends_on:
+      - nrf
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "nextgcore-seppd"]
+      <<: *common-healthcheck
+
+
+# ==========================================================================
+# Networks
+# ==========================================================================
+networks:
+  nextgcore-net:
+    driver: bridge
+    name: nextgcore-network
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.22.0.0/24
+          gateway: 172.22.0.1
+
+# ==========================================================================
+# Volumes
+# ==========================================================================
+volumes:
+  # Infrastructure
+  mongodb_data:
+    name: nextgcore-mongodb-data
+
+  # 5GC Logs
+  logs_nrf:
+    name: nextgcore-logs-nrf
+  logs_ausf:
+    name: nextgcore-logs-ausf
+  logs_udm:
+    name: nextgcore-logs-udm
+  logs_udr:
+    name: nextgcore-logs-udr
+  logs_pcf:
+    name: nextgcore-logs-pcf
+  logs_nssf:
+    name: nextgcore-logs-nssf
+  logs_bsf:
+    name: nextgcore-logs-bsf
+  logs_amf:
+    name: nextgcore-logs-amf
+  logs_smf:
+    name: nextgcore-logs-smf
+  logs_upf:
+    name: nextgcore-logs-upf
+
+  # EPC Logs
+  logs_hss:
+    name: nextgcore-logs-hss
+  logs_pcrf:
+    name: nextgcore-logs-pcrf
+  logs_sgwc:
+    name: nextgcore-logs-sgwc
+  logs_mme:
+    name: nextgcore-logs-mme
+  logs_sgwu:
+    name: nextgcore-logs-sgwu
+
+  # SCP/SEPP Logs
+  logs_scp:
+    name: nextgcore-logs-scp
+  logs_sepp1:
+    name: nextgcore-logs-sepp1
+  logs_sepp2:
+    name: nextgcore-logs-sepp2

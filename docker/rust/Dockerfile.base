@@ -1,0 +1,175 @@
+# NextGCore Rust Base Image
+# Multi-stage build for minimal runtime images
+#
+# This Dockerfile provides:
+# - Builder stage with Rust toolchain and all build dependencies
+# - Runtime base stage with minimal runtime dependencies
+# - Optimized layer caching for faster rebuilds
+#
+# Usage:
+#   docker build -f docker/rust/Dockerfile.base -t nextgcore-rust-base .
+#   docker build -f docker/rust/Dockerfile.nf-template --build-arg NF_NAME=nextgcore-amfd -t nextgcore-amf .
+
+ARG RUST_VERSION=1.85
+ARG DEBIAN_VERSION=bookworm
+
+# =============================================================================
+# Stage 1: Chef - Cargo dependency caching
+# =============================================================================
+FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS chef
+
+# Install cargo-chef for dependency caching
+RUN cargo install cargo-chef --locked
+
+WORKDIR /app
+
+# =============================================================================
+# Stage 2: Planner - Generate dependency recipe
+# =============================================================================
+FROM chef AS planner
+
+# Copy workspace files
+COPY rust_src/ ./
+
+# Generate recipe.json for dependency caching
+RUN cargo chef prepare --recipe-path recipe.json
+
+# =============================================================================
+# Stage 3: Builder - Build all binaries
+# =============================================================================
+FROM chef AS builder
+
+# Install build dependencies
+# These are required for compiling Rust crates with native dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Build essentials
+    build-essential \
+    pkg-config \
+    cmake \
+    # SSL/TLS
+    libssl-dev \
+    # SCTP support (for NGAP/S1AP)
+    libsctp-dev \
+    # YAML configuration parsing
+    libyaml-dev \
+    # MongoDB driver
+    libmongoc-dev \
+    libbson-dev \
+    # HTTP/2 support (for SBI)
+    libnghttp2-dev \
+    # Packet capture (for debugging)
+    libtins-dev \
+    # Network utilities
+    iproute2 \
+    # Clang for bindgen (FFI generation)
+    clang \
+    libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy recipe and build dependencies first (cached layer)
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+
+# Copy full source and build
+COPY rust_src/ ./
+
+# Build all workspace members in release mode
+RUN cargo build --release --workspace
+
+# Strip debug symbols from binaries for smaller images
+RUN find target/release -maxdepth 1 -type f -executable -name 'nextgcore-*' \
+    -exec strip --strip-all {} \;
+
+# =============================================================================
+# Stage 4: Runtime Base - Minimal runtime image
+# =============================================================================
+FROM debian:${DEBIAN_VERSION}-slim AS runtime-base
+
+LABEL org.opencontainers.image.title="NextGCore Rust Runtime Base"
+LABEL org.opencontainers.image.description="Base runtime image for NextGCore Rust network functions"
+LABEL org.opencontainers.image.source="https://github.com/nextgcore/nextgcore"
+LABEL org.opencontainers.image.licenses="AGPL-3.0"
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # SSL/TLS runtime
+    ca-certificates \
+    libssl3 \
+    # SCTP runtime (for NGAP/S1AP signaling)
+    libsctp1 \
+    # YAML runtime
+    libyaml-0-2 \
+    # MongoDB runtime
+    libmongoc-1.0-0 \
+    libbson-1.0-0 \
+    # HTTP/2 runtime (for SBI)
+    libnghttp2-14 \
+    # Network utilities (for UPF TUN interface)
+    iproute2 \
+    iptables \
+    # Packet capture runtime (optional, for debugging)
+    libtins4.0 \
+    # Health check utilities
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for running services
+RUN groupadd -r nextgcore && useradd -r -g nextgcore -s /bin/false nextgcore
+
+# Create directories for configs, logs, and runtime data
+RUN mkdir -p /etc/nextgcore /var/log/nextgcore /var/run/nextgcore && \
+    chown -R nextgcore:nextgcore /etc/nextgcore /var/log/nextgcore /var/run/nextgcore
+
+# Set default environment variables
+ENV OGS_LOG_LEVEL=info
+ENV OGS_LOG_PATH=/var/log/nextgcore
+
+# Default working directory
+WORKDIR /
+
+# =============================================================================
+# Stage 5: Runtime with all binaries (for all-in-one deployments)
+# =============================================================================
+FROM runtime-base AS runtime-all
+
+# Copy all binaries from builder
+COPY --from=builder /app/target/release/nextgcore-amfd /usr/local/bin/
+COPY --from=builder /app/target/release/nextgcore-ausfd /usr/local/bin/
+COPY --from=builder /app/target/release/nextgcore-bsfd /usr/local/bin/
+COPY --from=builder /app/target/release/nextgcore-hssd /usr/local/bin/
+COPY --from=builder /app/target/release/nextgcore-mmed /usr/local/bin/
+COPY --from=builder /app/target/release/nextgcore-nrfd /usr/local/bin/
+COPY --from=builder /app/target/release/nextgcore-nssfd /usr/local/bin/
+COPY --from=builder /app/target/release/nextgcore-pcfd /usr/local/bin/
+COPY --from=builder /app/target/release/nextgcore-pcrfd /usr/local/bin/
+COPY --from=builder /app/target/release/nextgcore-scpd /usr/local/bin/
+COPY --from=builder /app/target/release/nextgcore-seppd /usr/local/bin/
+COPY --from=builder /app/target/release/nextgcore-sgwcd /usr/local/bin/
+COPY --from=builder /app/target/release/nextgcore-sgwud /usr/local/bin/
+COPY --from=builder /app/target/release/nextgcore-smfd /usr/local/bin/
+COPY --from=builder /app/target/release/nextgcore-udmd /usr/local/bin/
+COPY --from=builder /app/target/release/nextgcore-udrd /usr/local/bin/
+COPY --from=builder /app/target/release/nextgcore-upfd /usr/local/bin/
+
+# Set ownership
+RUN chown nextgcore:nextgcore /usr/local/bin/nextgcore-*
+
+# =============================================================================
+# Usage Notes:
+# =============================================================================
+# Individual NF Dockerfiles should:
+# 1. Use 'runtime-base' as the base stage
+# 2. Copy specific binary from 'builder' stage
+# 3. Set appropriate EXPOSE ports
+# 4. Set ENTRYPOINT and CMD
+#
+# Example for AMF:
+#   FROM nextgcore-rust-base:latest AS runtime-base
+#   COPY --from=builder /app/target/release/nextgcore-amfd /usr/local/bin/
+#   EXPOSE 7777 38412/sctp
+#   USER nextgcore
+#   ENTRYPOINT ["/usr/local/bin/nextgcore-amfd"]
+#   CMD ["-c", "/etc/nextgcore/amf.yaml"]
+# =============================================================================

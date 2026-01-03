@@ -1,0 +1,30 @@
+[package]
+name = "nextgcore-upfd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore UPF (User Plane Function)"
+
+[[bin]]
+name = "nextgcore-upfd"
+path = "src/main.rs"
+
+[dependencies]
+ogs-core = { workspace = true }
+ogs-pfcp = { workspace = true }
+ogs-gtp = { workspace = true }
+ogs-tun = { workspace = true }
+ogs-ipfw = { workspace = true }
+ogs-app = { workspace = true }
+log.workspace = true
+env_logger.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+libc.workspace = true
+bytes.workspace = true
+clap = { version = "4.4", features = ["derive"] }
+ctrlc = { version = "3.4", features = ["termination"] }
+
+[dev-dependencies]
+proptest.workspace = true

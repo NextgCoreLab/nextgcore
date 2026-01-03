@@ -1,0 +1,21 @@
+# NextGCore SCP (Service Communication Proxy) Configuration
+# For Docker deployment with Rust implementation
+
+logger:
+  file:
+    path: /var/log/nextgcore/scp.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+scp:
+  sbi:
+    server:
+      - address: 172.22.0.50
+        port: 7777
+    client:
+      nrf:
+        - uri: http://172.22.0.10:7777
