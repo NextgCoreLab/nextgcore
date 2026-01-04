@@ -31,6 +31,8 @@ mod gsm_sm;
 mod gtp_build;
 mod gtp_handler;
 mod gtp_path;
+mod gn_build;
+mod gn_handler;
 mod n4_build;
 mod n4_handler;
 mod pfcp_path;

@@ -24,6 +24,8 @@ pub mod sgsap_build;
 pub mod sgsap_handler;
 pub mod fd_path;
 pub mod s6a_handler;
+pub mod sbc_message;
+pub mod sbc_handler;
 
 #[cfg(test)]
 mod property_tests;
