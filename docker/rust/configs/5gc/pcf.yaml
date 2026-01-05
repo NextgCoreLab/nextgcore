@@ -1,7 +1,7 @@
 # PCF (Policy Control Function) Configuration
 # Docker container configuration for 5G Core deployment
 
-db_uri: mongodb://172.23.0.2/nextgcore
+db_uri: mongodb://172.22.0.2/nextgcore
 
 logger:
   file:
@@ -16,12 +16,12 @@ global:
 pcf:
   sbi:
     server:
-      - address: 172.23.0.13
+      - address: 172.22.0.13
         port: 7777
     client:
       nrf:
-        - uri: http://172.23.0.10:7777
+        - uri: http://172.22.0.10:7777
   metrics:
     server:
-      - address: 172.23.0.13
+      - address: 172.22.0.13
         port: 9090

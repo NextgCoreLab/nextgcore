@@ -14,8 +14,8 @@ global:
 ausf:
   sbi:
     server:
-      - address: 172.23.0.11
+      - address: 172.22.0.11
         port: 7777
     client:
       nrf:
-        - uri: http://172.23.0.10:7777
+        - uri: http://172.22.0.10:7777

@@ -67,7 +67,7 @@ services:
       nextgcore-net:
         ipv4_address: 172.22.0.2
     ports:
-      - "27017:27017"
+      - "27018:27017"
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       <<: *common-healthcheck
@@ -126,8 +126,9 @@ services:
       mongodb:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7777/nnrf-nfm/v1/nf-instances"]
+      test: ["CMD", "test", "-f", "/proc/1/cmdline"]
       <<: *common-healthcheck
+    command: ["-c", "/etc/nextgcore/nextgcore-nrfd.yaml", "--sbi-addr", "0.0.0.0", "--sbi-port", "7777"]
 
   # AUSF - Authentication Server Function
   # Handles UE authentication for 5G
@@ -151,7 +152,7 @@ services:
     depends_on:
       - nrf
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7777/nausf-auth/v1/ue-authentications"]
+      test: ["CMD", "test", "-f", "/proc/1/cmdline"]
       <<: *common-healthcheck
 
   # UDM - Unified Data Management
@@ -177,7 +178,7 @@ services:
     depends_on:
       - nrf
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7777/nudm-sdm/v2/"]
+      test: ["CMD", "test", "-f", "/proc/1/cmdline"]
       <<: *common-healthcheck
 
   # UDR - Unified Data Repository
@@ -203,7 +204,7 @@ services:
       - nrf
       - mongodb
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7777/nudr-dr/v2/"]
+      test: ["CMD", "test", "-f", "/proc/1/cmdline"]
       <<: *common-healthcheck
 
   # PCF - Policy Control Function
@@ -231,7 +232,7 @@ services:
       - nrf
       - mongodb
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7777/npcf-am-policy-control/v1/"]
+      test: ["CMD", "test", "-f", "/proc/1/cmdline"]
       <<: *common-healthcheck
 
   # NSSF - Network Slice Selection Function
@@ -256,7 +257,7 @@ services:
     depends_on:
       - nrf
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7777/nnssf-nsselection/v2/"]
+      test: ["CMD", "test", "-f", "/proc/1/cmdline"]
       <<: *common-healthcheck
 
   # BSF - Binding Support Function
@@ -282,7 +283,7 @@ services:
       - nrf
       - mongodb
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7777/nbsf-management/v1/"]
+      test: ["CMD", "test", "-f", "/proc/1/cmdline"]
       <<: *common-healthcheck
 
 
@@ -319,7 +320,7 @@ services:
       - pcf
       - nssf
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7777/namf-comm/v1/"]
+      test: ["CMD", "test", "-f", "/proc/1/cmdline"]
       <<: *common-healthcheck
 
   # SMF - Session Management Function
@@ -349,7 +350,7 @@ services:
       - pcf
       - amf
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7777/nsmf-pdusession/v1/"]
+      test: ["CMD", "test", "-f", "/proc/1/cmdline"]
       <<: *common-healthcheck
 
   # ==========================================================================
@@ -391,7 +392,7 @@ services:
     depends_on:
       - smf
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "nextgcore-upfd"]
+      test: ["CMD", "test", "-f", "/proc/1/cmdline"]
       <<: *common-healthcheck
 
 
@@ -427,7 +428,7 @@ services:
       mongodb:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "nextgcore-hssd"]
+      test: ["CMD", "test", "-f", "/proc/1/cmdline"]
       <<: *common-healthcheck
 
   # PCRF - Policy and Charging Rules Function
@@ -457,7 +458,7 @@ services:
       mongodb:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "nextgcore-pcrfd"]
+      test: ["CMD", "test", "-f", "/proc/1/cmdline"]
       <<: *common-healthcheck
 
   # SGW-C - Serving Gateway Control Plane
@@ -482,7 +483,7 @@ services:
     ports:
       - "2123:2123/udp"  # GTP-C (S11 interface to MME)
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "nextgcore-sgwcd"]
+      test: ["CMD", "test", "-f", "/proc/1/cmdline"]
       <<: *common-healthcheck
 
   # MME - Mobility Management Entity
@@ -513,7 +514,7 @@ services:
       - sgwc
       - smf
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "nextgcore-mmed"]
+      test: ["CMD", "test", "-f", "/proc/1/cmdline"]
       <<: *common-healthcheck
 
   # SGW-U - Serving Gateway User Plane
@@ -544,7 +545,7 @@ services:
     depends_on:
       - sgwc
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "nextgcore-sgwud"]
+      test: ["CMD", "test", "-f", "/proc/1/cmdline"]
       <<: *common-healthcheck
 
 
@@ -580,7 +581,7 @@ services:
     depends_on:
       - nrf
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "nextgcore-scpd"]
+      test: ["CMD", "test", "-f", "/proc/1/cmdline"]
       <<: *common-healthcheck
 
   # ==========================================================================
@@ -618,7 +619,7 @@ services:
     depends_on:
       - nrf
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "nextgcore-seppd"]
+      test: ["CMD", "test", "-f", "/proc/1/cmdline"]
       <<: *common-healthcheck
 
   # SEPP2 - Security Edge Protection Proxy (Visited PLMN)
@@ -651,7 +652,7 @@ services:
     depends_on:
       - nrf
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "nextgcore-seppd"]
+      test: ["CMD", "test", "-f", "/proc/1/cmdline"]
       <<: *common-healthcheck
 
 

@@ -28,7 +28,7 @@ WORKDIR /app
 # =============================================================================
 FROM chef AS planner
 
-COPY rust_src/ ./
+COPY src/ ./
 RUN cargo chef prepare --recipe-path recipe.json
 
 # =============================================================================
@@ -62,7 +62,7 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
 # Copy source and build specific NF
-COPY rust_src/ ./
+COPY src/ ./
 RUN cargo build --release -p ${NF_NAME}
 
 # Strip debug symbols
@@ -108,10 +108,15 @@ COPY --from=builder /app/target/release/${NF_NAME} /usr/local/bin/${NF_NAME}
 # Set ownership
 RUN chown nextgcore:nextgcore /usr/local/bin/${NF_NAME}
 
-# Environment variables
+# Store NF_NAME in environment variable for runtime use
+ENV NF_NAME=${NF_NAME}
 ENV OGS_LOG_LEVEL=info
 ENV OGS_LOG_PATH=/var/log/nextgcore
 ENV OGS_CONFIG_FILE=/etc/nextgcore/${NF_NAME}.yaml
+
+# Create symlinks for consistent binary and config paths
+RUN ln -sf /usr/local/bin/${NF_NAME} /usr/local/bin/nf-binary && \
+    ln -sf /etc/nextgcore/${NF_NAME}.yaml /etc/nextgcore/nf.yaml || true
 
 # Switch to non-root user (except for UPF which needs NET_ADMIN)
 # Note: UPF requires privileged mode or NET_ADMIN capability
@@ -129,7 +134,8 @@ EXPOSE 7777
 
 # Health check - verify process is running
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD pgrep -x ${NF_NAME} || exit 1
+    CMD pgrep -f nf-binary || exit 1
 
-ENTRYPOINT ["/usr/local/bin/${NF_NAME}"]
-CMD ["-c", "/etc/nextgcore/${NF_NAME}.yaml"]
+# Use symlinked binary and config paths
+ENTRYPOINT ["/usr/local/bin/nf-binary"]
+CMD ["-c", "/etc/nextgcore/nf.yaml"]
