@@ -3,7 +3,7 @@
 //! Port of src/nssf/nnssf-build.c - Build NS selection request messages
 
 use crate::context::{NssfHome, RoamingIndication, SNssai, Tai};
-use crate::sbi_path::SbiRequest;
+use crate::sbi_path::PathSbiRequest;
 
 /// Parameters for NS selection request to H-NSSF
 #[derive(Debug, Clone)]
@@ -37,7 +37,7 @@ pub fn nssf_nnssf_nsselection_build_get(
     param: &NssfNsselectionParam,
     nf_instance_id: &str,
     nf_type: &str,
-) -> Option<SbiRequest> {
+) -> Option<PathSbiRequest> {
     // Validate parameters
     if !param.slice_info_for_pdu_session.presence {
         log::error!("No sliceInfoForPDUSession");
@@ -88,7 +88,7 @@ pub fn nssf_nnssf_nsselection_build_get(
 
     log::debug!("Built NS selection request: GET {}", uri);
 
-    Some(SbiRequest {
+    Some(PathSbiRequest {
         method: "GET".to_string(),
         uri,
         headers: vec![

@@ -3,6 +3,7 @@
 //! Port of src/udm/sbi-path.c - SBI server and client path functions
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use ogs_sbi::message::SbiResponse;
 
 /// SBI server configuration
 #[derive(Debug, Clone)]
@@ -23,7 +24,7 @@ impl Default for SbiServerConfig {
     fn default() -> Self {
         Self {
             addr: "127.0.0.1".to_string(),
-            port: 7779,  // UDM default port
+            port: 7777,  // UDM default port
             tls_enabled: false,
             tls_cert: None,
             tls_key: None,
@@ -194,6 +195,30 @@ impl SbiServer {
     }
 }
 
+/// Send SBI response to a client stream
+///
+/// This function sends the prepared SBI response back to the client.
+/// In a full implementation, this would interact with the HTTP server's
+/// response channel to send the data back to the client connection.
+pub fn send_sbi_response(stream_id: u64, response: SbiResponse) {
+    log::debug!(
+        "Sending SBI response (stream_id={}, status={})",
+        stream_id,
+        response.status
+    );
+
+    // In a real implementation, this would:
+    // 1. Look up the stream/connection by stream_id
+    // 2. Serialize the response to HTTP format
+    // 3. Send through the appropriate HTTP server channel
+    //
+    // For now, we track response in memory for testing/integration
+    // The actual HTTP server in main.rs handles response delivery
+
+    // Placeholder for actual response sending
+    // The response would be queued to the HTTP server's response channel
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,7 +227,7 @@ mod tests {
     fn test_sbi_server_config_default() {
         let config = SbiServerConfig::default();
         assert_eq!(config.addr, "127.0.0.1");
-        assert_eq!(config.port, 7779);
+        assert_eq!(config.port, 7777);
         assert!(!config.tls_enabled);
     }
 

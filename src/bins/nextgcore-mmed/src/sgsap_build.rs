@@ -2,7 +2,6 @@
 //!
 //! Port of src/mme/sgsap-build.c - SGsAP message building functions
 
-use crate::context::{MmeUe, PlmnId};
 
 // ============================================================================
 // SGsAP Message Types

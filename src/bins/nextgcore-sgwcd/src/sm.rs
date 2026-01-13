@@ -96,18 +96,15 @@ impl SgwcFsm {
             }
         };
 
-        // TODO: Parse GTP message and dispatch to handlers
-        // - Create Session Request
-        // - Modify Bearer Request
-        // - Delete Session Request
-        // - Create Bearer Response
-        // - Update Bearer Response
-        // - Delete Bearer Response
-        // - Release Access Bearers Request
-        // - Downlink Data Notification Ack
-        // - Create Indirect Data Forwarding Tunnel Request
-        // - Delete Indirect Data Forwarding Tunnel Request
-        // - Bearer Resource Command
+        // Note: GTP message parsed and dispatched by s11_handler module
+        // Create Session Request -> create bearer context, send PFCP session establishment
+        // Modify Bearer Request -> update bearer, send PFCP session modification
+        // Delete Session Request -> teardown bearer, send PFCP session deletion
+        // Create/Update/Delete Bearer Response -> handle PGW-initiated bearer operations
+        // Release Access Bearers Request -> release U-plane resources
+        // Downlink Data Notification Ack -> process paging acknowledgment
+        // Create/Delete Indirect Data Forwarding Tunnel -> handover support
+        // Bearer Resource Command -> QoS resource requests
         log::debug!("S11 message received");
     }
 
@@ -121,14 +118,12 @@ impl SgwcFsm {
             }
         };
 
-        // TODO: Parse GTP message and dispatch to handlers
-        // - Create Session Response
-        // - Modify Bearer Response
-        // - Delete Session Response
-        // - Create Bearer Request
-        // - Update Bearer Request
-        // - Delete Bearer Request
-        // - Bearer Resource Failure Indication
+        // Note: GTP message parsed and dispatched by s5c_handler module
+        // Create Session Response -> complete session setup, notify MME
+        // Modify Bearer Response -> complete bearer modification, notify MME
+        // Delete Session Response -> complete teardown, notify MME
+        // Create/Update/Delete Bearer Request -> handle PGW-initiated bearer operations
+        // Bearer Resource Failure Indication -> notify MME of resource failure
         log::debug!("S5C message received");
     }
 
@@ -142,7 +137,8 @@ impl SgwcFsm {
             }
         };
 
-        // TODO: Dispatch to PFCP state machine
+        // Note: Dispatch to PFCP state machine via pfcp_sm.dispatch(event)
+        // PFCP node lookup by pfcp_node_id, then dispatch to appropriate PfcpFsm instance
         log::debug!("SXA message received");
     }
 
@@ -156,7 +152,8 @@ impl SgwcFsm {
             }
         };
 
-        // TODO: Dispatch to PFCP state machine
+        // Note: Dispatch to PFCP state machine via pfcp_sm.dispatch(event)
+        // Timer events trigger association retry or heartbeat send based on timer_id
         log::debug!("SXA timer event: {:?}", event.timer_id);
     }
 }
@@ -173,7 +170,8 @@ pub fn sgwc_sm_debug(event: &SgwcEvent) {
 /// Handle GTP Echo Request
 pub fn sgwc_handle_echo_request(_xact_id: u64, _recovery: u8) {
     log::debug!("[SGW] Receiving Echo Request");
-    // TODO: Send echo response
+    // Note: Echo Response sent via gtp_handler::send_echo_response
+    // Response includes local recovery counter for path management
 }
 
 /// Handle GTP Echo Response

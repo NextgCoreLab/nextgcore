@@ -193,7 +193,7 @@ pub fn handle_stop_warning_request(
 /// Called when an eNB indicates it has restarted and lost PWS state.
 /// The MME should re-send any active warnings to the eNB.
 pub fn handle_pws_restart_indication(
-    mme_ctx: &Arc<MmeContext>,
+    _mme_ctx: &Arc<MmeContext>,
     enb_id: u32,
 ) {
     info!("[PWS-Restart] eNB {:08x} restarted, re-sending active warnings", enb_id);

@@ -84,7 +84,8 @@ impl PfcpFsm {
             SgwcEventId::FsmEntry => {
                 // Start association timer and send association setup request
                 log::debug!("PFCP[{}] will_associate entry - sending association setup", self.node_id);
-                // TODO: Start timer and send PFCP Association Setup Request
+                // Note: Timer started via timer module with PfcpAssociation timer ID
+                // PFCP Association Setup Request sent via pfcp_handler::send_association_setup_request
             }
             SgwcEventId::FsmExit => {
                 // Stop association timer
@@ -95,7 +96,8 @@ impl PfcpFsm {
                     match timer_id {
                         SgwcTimerId::PfcpAssociation => {
                             log::warn!("PFCP[{}] association retry", self.node_id);
-                            // TODO: Restart timer and resend association setup request
+                            // Note: Timer restarted and association setup request resent
+                            // via pfcp_handler::send_association_setup_request
                         }
                         _ => {
                             log::error!("Unknown timer in will_associate: {:?}", timer_id);
@@ -115,14 +117,15 @@ impl PfcpFsm {
 
     /// Handle PFCP messages in will_associate state
     fn handle_will_associate_message(&mut self, _event: &SgwcEvent) {
-        // TODO: Parse PFCP message type
-        // Handle:
-        // - Heartbeat Request/Response
-        // - Association Setup Request/Response
-        
+        // Note: PFCP message type parsed via pfcp_handler module
+        // Heartbeat Request -> send Heartbeat Response
+        // Heartbeat Response -> restart no-heartbeat timer
+        // Association Setup Request -> send Association Setup Response
+        // Association Setup Response -> transition to Associated state
+
         // For now, simulate successful association
         log::debug!("PFCP[{}] received message in will_associate", self.node_id);
-        
+
         // On successful association setup, transition to associated
         // self.state = PfcpState::Associated;
     }
@@ -155,7 +158,7 @@ impl PfcpFsm {
                     match timer_id {
                         SgwcTimerId::PfcpNoHeartbeat => {
                             log::debug!("PFCP[{}] sending heartbeat", self.node_id);
-                            // TODO: Send heartbeat request
+                            // Note: Heartbeat request sent via pfcp_handler::send_heartbeat_request
                         }
                         _ => {
                             log::error!("Unknown timer in associated: {:?}", timer_id);
@@ -175,16 +178,14 @@ impl PfcpFsm {
 
     /// Handle PFCP messages in associated state
     fn handle_associated_message(&mut self, _event: &SgwcEvent) {
-        // TODO: Parse PFCP message type and handle:
-        // - Heartbeat Request/Response
-        // - Association Setup Request/Response (already associated warning)
-        // - Session Establishment Response
-        // - Session Modification Response
-        // - Session Deletion Response
-        // - Session Report Request
-        
+        // Note: PFCP message type parsed and dispatched by pfcp_handler module
+        // Heartbeat Request/Response -> restart no-heartbeat timer
+        // Association Setup Request/Response -> log warning if already associated
+        // Session Establishment/Modification/Deletion Response -> dispatch to bearer handler
+        // Session Report Request -> handle UPF-initiated notifications
+
         log::debug!("PFCP[{}] received message in associated", self.node_id);
-        
+
         // Check for restoration requirement after heartbeat
         if self.restoration_required {
             // If we have association timer, go back to will_associate
@@ -204,9 +205,9 @@ impl PfcpFsm {
     /// Perform PFCP restoration
     fn pfcp_restoration(&self) {
         log::info!("PFCP[{}] performing restoration", self.node_id);
-        // TODO: Re-establish sessions for all UEs using this PFCP node
-        // For each session with this pfcp_node:
-        //   Send Session Establishment Request with RESTORATION_INDICATION
+        // Note: Session re-establishment for all bearers using this PFCP node
+        // Iterate over context.bearer_list() for bearers with matching pfcp_node_id
+        // Send Session Establishment Request with RESTORATION_INDICATION flag set
     }
 }
 

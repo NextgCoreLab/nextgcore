@@ -3,9 +3,8 @@
 //! Port of src/amf/ngap-handler.c - NGAP message handling functions
 
 use crate::context::{
-    AmfContext, AmfGnb, AmfUe, AmfSess, RanUe, PlmnId, SNssai, Tai5gs, NrCgi,
-    SupportedTa, BplmnEntry, NgapCause, NgapUeCtxRelAction,
-    OGS_MAX_NUM_OF_SUPPORTED_TA, OGS_MAX_NUM_OF_BPLMN, OGS_MAX_NUM_OF_SLICE,
+    AmfContext, AmfGnb, RanUe, PlmnId, SNssai, Tai5gs, NrCgi,
+    SupportedTa, NgapCause, NgapUeCtxRelAction,
 };
 use crate::ngap_build::{cause_group, radio_network_cause};
 
@@ -462,7 +461,7 @@ pub fn handle_initial_context_setup_failure(
 
 /// Handle Handover Required
 pub fn handle_handover_required(
-    ran_ue: &mut RanUe,
+    _ran_ue: &mut RanUe,
     message: &HandoverRequired,
 ) -> NgapHandlerResult {
     log::debug!(

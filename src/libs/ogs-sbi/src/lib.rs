@@ -51,7 +51,11 @@ pub use message::{
     Guami, InvalidParam, PlmnId, ProblemDetails, SNssai, SbiDiscoveryOption, SbiHeader,
     SbiHttpMessage, SbiMessageParams, SbiPart, SbiRequest, SbiResponse, Tai,
 };
-pub use server::{send_error, SbiRequestHandler, SbiServer, SbiServerConfig, StreamId};
+pub use server::{
+    send_bad_request, send_error, send_forbidden, send_gateway_timeout, send_internal_error,
+    send_method_not_allowed, send_not_found, send_service_unavailable, send_unauthorized,
+    SbiRequestHandler, SbiServer, SbiServerConfig, StreamId,
+};
 pub use types::{NfType, SbiAppError, SbiServiceType, UriScheme};
 
 /// Initialize the SBI library

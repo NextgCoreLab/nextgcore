@@ -3,6 +3,10 @@
 //! Port of src/smf/context.c, src/smf/context.h - SMF context with UE list, session list,
 //! bearer list, packet filter list, and hash tables
 
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};

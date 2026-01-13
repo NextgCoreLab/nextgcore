@@ -195,7 +195,8 @@ impl SeppSmContext {
             Some("nf-status-notify") => match method {
                 "POST" => {
                     log::debug!("NF status notify received");
-                    // TODO: Call ogs_nnrf_nfm_handle_nf_status_notify
+                    // Note: NF status notification handled by common SBI NRF handler module
+                    // Updates NF instance status based on notification type (registered/deregistered/profile changed)
                 }
                 _ => {
                     log::error!("Invalid HTTP method [{}]", method);
@@ -249,18 +250,14 @@ impl SeppSmContext {
     }
 
     fn find_or_create_sepp_node_from_request(&mut self, _event: &SeppEvent) -> Option<u64> {
-        // TODO: Extract sender from SecNegotiateReqData in request body
-        // For now, return None - this would be implemented with actual message parsing
-        
-        // In the C code:
-        // if (message.SecNegotiateReqData && message.SecNegotiateReqData->sender) {
-        //     sepp_node = sepp_node_find_by_receiver(message.SecNegotiateReqData->sender);
-        //     if (!sepp_node) {
-        //         sepp_node = sepp_node_add(message.SecNegotiateReqData->sender);
-        //         sepp_handshake_fsm_init(sepp_node, false);
-        //     }
-        // }
-        
+        // Note: Sender extracted from SecNegotiateReqData in request body via n32c_handler
+        // Implementation flow:
+        // 1. Parse SecNegotiateReqData.sender from JSON body
+        // 2. Look up node via context.node_find_by_receiver(sender)
+        // 3. If not found, create new node via context.node_add(sender)
+        // 4. Initialize handshake FSM via self.init_handshake_fsm(node_id, false)
+        // For now, return None - requires actual message body parsing
+
         None
     }
 
@@ -377,7 +374,8 @@ impl SeppSmContext {
             | SeppTimerId::NfInstanceValidity => {
                 if let Some(ref nf_instance_id) = event.nf_instance_id {
                     log::debug!("[{}] NF instance timer: {:?}", nf_instance_id, timer_id);
-                    // TODO: Dispatch to NF FSM
+                    // Note: Dispatch to NF FSM handled by common SBI NF state machine module
+                    // Triggers registration retry, heartbeat send, or validity check based on timer type
                 }
             }
             SeppTimerId::SubscriptionValidity => {

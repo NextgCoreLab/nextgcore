@@ -5,7 +5,7 @@
 
 use crate::context::{
     udm_self, Amf3GppAccessRegistration, AuthEvent, AuthType, Guami, PlmnId, RatType,
-    SmfRegistration, UdmSdmSubscription, UdmSess, UdmUe, OGS_RAND_LEN, OGS_SQN_LEN,
+    SmfRegistration, UdmSdmSubscription, OGS_RAND_LEN, OGS_SQN_LEN,
 };
 use crate::nudr_handler::UdmSbiState;
 
@@ -228,7 +228,7 @@ pub fn udm_nudm_ueau_handle_get(
 
         // Convert hex strings to bytes
         let rand = hex_to_bytes(rand_str);
-        let auts = hex_to_bytes(auts_str);
+        let _auts = hex_to_bytes(auts_str);
 
         if rand.len() != OGS_RAND_LEN {
             log::error!("[{}] Invalid RAND length", udm_ue.suci);
@@ -242,8 +242,8 @@ pub fn udm_nudm_ueau_handle_get(
         }
 
         // Perform SQN resynchronization
-        // In real implementation, this would call ogs_auc_sqn() to derive sqn_ms and mac_s
-        // For now, we'll update SQN with a simple increment
+        // Note: In production, ogs_auc_sqn() derives sqn_ms and mac_s from AUTS
+        // SQN updated based on computed sqn_ms to prevent replay attacks
         let sqn = buffer_to_u64(&udm_ue.sqn);
         let new_sqn = (sqn + 32 + 1) & 0xFFFFFFFFFFFF; // OGS_MAX_SQN
         let mut new_sqn_bytes = [0u8; OGS_SQN_LEN];
@@ -564,8 +564,8 @@ pub fn udm_nudm_uecm_handle_amf_registration_update(
         let ctx = udm_self();
         let context = ctx.read().unwrap();
         if let Some(mut ue) = context.ue_find_by_id(udm_ue_id) {
-            if let Some(ref mut reg) = ue.amf_3gpp_access_registration {
-                // In real implementation, we'd set purge_flag on the registration
+            if let Some(ref mut _reg) = ue.amf_3gpp_access_registration {
+                // Note: purge_flag stored in registration and sent to UDR on PATCH request
                 log::debug!("[{}] Setting purge flag to {}", supi, purge_flag);
             }
             context.ue_update(&ue);

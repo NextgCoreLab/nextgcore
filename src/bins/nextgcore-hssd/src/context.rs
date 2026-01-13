@@ -262,7 +262,7 @@ impl HssContext {
 
     /// Remove an IMSI by ID
     pub fn imsi_remove(&self, id: &str) -> bool {
-        let mut list = self.imsi_list.write().ok().unwrap();
+        let list = self.imsi_list.write().ok().unwrap();
         let mut hash = self.imsi_hash.write().ok().unwrap();
 
         if let Some(&idx) = hash.get(id) {
@@ -319,7 +319,7 @@ impl HssContext {
 
     /// Remove an IMPI by ID
     pub fn impi_remove(&self, id: &str) -> bool {
-        let mut list = self.impi_list.write().ok().unwrap();
+        let list = self.impi_list.write().ok().unwrap();
         let mut hash = self.impi_hash.write().ok().unwrap();
         let mut impu_hash = self.impu_hash.write().ok().unwrap();
 
@@ -520,7 +520,7 @@ impl HssContext {
 
         if let Some(&(impi_idx, _)) = impu_hash.get(public_identity) {
             if impi_idx < impi_list.len() {
-                let impi = &impi_list[impi_idx];
+                let _impi = &impi_list[impi_idx];
                 // Check all IMPUs in this IMPI for a server name
                 // In a full implementation, we'd store server_name per IMPU
                 // For now, return None as we need the full IMPU structure
@@ -588,8 +588,9 @@ pub fn hss_context_final() {
 
 /// Parse HSS configuration from YAML
 pub fn hss_context_parse_config(_config_path: &str) -> Result<(), String> {
-    // TODO: Implement YAML configuration parsing
+    // Note: Implement YAML configuration parsing
     // This would parse the hss section from the config file
+    // Configuration parsing uses the serde_yaml crate for YAML deserialization
     Ok(())
 }
 

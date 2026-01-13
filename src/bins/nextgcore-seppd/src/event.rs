@@ -264,8 +264,3 @@ impl Default for SeppEvent {
         Self::new(SeppEventId::FsmEntry)
     }
 }
-
-/// Get the name of an event (for logging)
-pub fn sepp_event_get_name(event: &SeppEvent) -> &'static str {
-    event.name()
-}

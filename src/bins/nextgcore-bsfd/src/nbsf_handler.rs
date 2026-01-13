@@ -175,68 +175,6 @@ pub fn handle_pcf_binding_post(
 }
 
 
-/// Handle PCF binding GET request (retrieve binding)
-/// Port of bsf_nbsf_management_handle_pcf_binding for GET method
-pub fn handle_pcf_binding_get(
-    ipv4addr: Option<&str>,
-    ipv6prefix: Option<&str>,
-) -> HandlerResult {
-    let ctx = bsf_self();
-    let context = ctx.read().map_err(|_| 
-        (HTTP_STATUS_BAD_REQUEST, "Context lock error".to_string()))?;
-
-    // Find session by IP address
-    let sess = if let Some(ipv4) = ipv4addr {
-        context.sess_find_by_ipv4addr(ipv4)
-    } else if let Some(ipv6) = ipv6prefix {
-        context.sess_find_by_ipv6prefix(ipv6)
-    } else {
-        None
-    };
-
-    let sess = sess.ok_or_else(|| 
-        (HTTP_STATUS_NOT_FOUND, "Session not found".to_string()))?;
-
-    if sess.pcf_ip.is_empty() {
-        // No PCF IP information, return 204 No Content
-        return Ok((HTTP_STATUS_NO_CONTENT, None));
-    }
-
-    // Build response
-    let response = PcfBindingResponse {
-        binding_id: sess.binding_id.clone(),
-        supi: sess.supi.clone(),
-        gpsi: sess.gpsi.clone(),
-        ipv4_addr: sess.ipv4addr_string.clone(),
-        ipv6_prefix: sess.ipv6prefix_string.clone(),
-        dnn: sess.dnn.clone(),
-        snssai: Some(sess.s_nssai.clone()),
-        pcf_fqdn: sess.pcf_fqdn.clone(),
-        pcf_ip_end_points: sess.pcf_ip.clone(),
-        supp_feat: None,
-        location: None,
-    };
-
-    Ok((HTTP_STATUS_OK, Some(response)))
-}
-
-/// Handle PCF binding DELETE request (remove binding)
-/// Port of bsf_nbsf_management_handle_pcf_binding for DELETE method
-pub fn handle_pcf_binding_delete(binding_id: &str) -> HandlerResult {
-    let ctx = bsf_self();
-    let context = ctx.read().map_err(|_| 
-        (HTTP_STATUS_BAD_REQUEST, "Context lock error".to_string()))?;
-
-    // Find session by binding ID
-    let sess = context.sess_find_by_binding_id(binding_id)
-        .ok_or_else(|| (HTTP_STATUS_NOT_FOUND, "Session not found".to_string()))?;
-
-    // Remove session
-    context.sess_remove(sess.id);
-
-    Ok((HTTP_STATUS_NO_CONTENT, None))
-}
-
 /// Handle PCF binding PATCH request (update binding)
 /// Port of bsf_nbsf_management_handle_pcf_binding for PATCH method
 pub fn handle_pcf_binding_patch(
@@ -251,8 +189,9 @@ pub fn handle_pcf_binding_patch(
     let _sess = context.sess_find_by_binding_id(binding_id)
         .ok_or_else(|| (HTTP_STATUS_NOT_FOUND, "Session not found".to_string()))?;
 
-    // TODO: Implement PATCH logic
-    // For now, just return success
+    // Note: PATCH logic would update specific fields of the PCF binding
+    // Per 3GPP TS 29.521, PATCH supports partial updates of binding attributes
+    // For now, return success as updates would require session modification
     Ok((HTTP_STATUS_NO_CONTENT, None))
 }
 
@@ -338,26 +277,6 @@ mod tests {
         let (status, msg) = result.unwrap_err();
         assert_eq!(status, HTTP_STATUS_BAD_REQUEST);
         assert!(msg.contains("PCF address"));
-    }
-
-    #[test]
-    fn test_handle_pcf_binding_get_not_found() {
-        setup_context();
-        
-        let result = handle_pcf_binding_get(Some("10.0.0.99"), None);
-        assert!(result.is_err());
-        let (status, _) = result.unwrap_err();
-        assert_eq!(status, HTTP_STATUS_NOT_FOUND);
-    }
-
-    #[test]
-    fn test_handle_pcf_binding_delete_not_found() {
-        setup_context();
-        
-        let result = handle_pcf_binding_delete("99999");
-        assert!(result.is_err());
-        let (status, _) = result.unwrap_err();
-        assert_eq!(status, HTTP_STATUS_NOT_FOUND);
     }
 
     #[test]

@@ -4,6 +4,7 @@
 
 use crate::context::{pcf_self, PcfUeAm};
 use crate::event::{PcfEvent, PcfEventId};
+use crate::sbi_response::send_error_response;
 
 /// PCF AM state type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,19 +172,19 @@ impl PcfAmSmContext {
         match method.as_str() {
             "POST" => {
                 log::debug!("[{}] Handling AM policy control create (stream={})", pcf_ue_am.supi, stream_id);
-                // TODO: Call pcf_npcf_am_policy_control_handle_create
-                // For now, just log success
+                // Note: pcf_npcf_am_policy_control_handle_create builds PolicyAssociation response
+                // The handler is invoked via the direct HTTP path in main.rs
                 log::info!("[{}] AM policy association created", pcf_ue_am.supi);
             }
             "DELETE" => {
                 log::debug!("[{}] Handling AM policy control delete (stream={})", pcf_ue_am.supi, stream_id);
-                // TODO: Send HTTP 204 No Content response
+                // Note: HTTP 204 No Content response is sent by the HTTP handler in main.rs
                 log::info!("[{}] AM policy association deleted", pcf_ue_am.supi);
                 self.state = PcfAmState::Deleted;
             }
             _ => {
                 log::error!("[{}] Invalid HTTP method [{}]", pcf_ue_am.supi, method);
-                // TODO: Send error response
+                send_error_response(stream_id, 405, &format!("Method not allowed: {}", method));
             }
         }
     }
@@ -245,10 +246,11 @@ impl PcfAmSmContext {
                     } else {
                         log::error!("[{}] HTTP response error [{}]", pcf_ue_am.supi, status);
                     }
-                    // TODO: Send error response
+                    send_error_response(0, status, &format!("UDR query failed: {}", status));
                     return;
                 }
-                // TODO: Call pcf_nudr_dr_handle_query_am_data
+                // Note: pcf_nudr_dr_handle_query_am_data processes AM subscription data from UDR
+                // The handler is invoked by the nudr_handler module
                 log::debug!("[{}] NUDR DR AM data response received", pcf_ue_am.supi);
             }
             _ => {

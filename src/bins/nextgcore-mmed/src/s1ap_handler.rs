@@ -2,8 +2,7 @@
 //!
 //! Port of src/mme/s1ap-handler.c - S1AP message handling functions
 
-use crate::context::{MmeContext, MmeEnb, EnbUe, MmeUe, PlmnId, EpsTai, ECgi, S1apCause, S1apCauseGroup};
-use crate::s1ap_build::{self, procedure_code, protocol_ie_id, Criticality, PduType};
+use crate::context::{MmeContext, MmeEnb, PlmnId, EpsTai, ECgi, S1apCause, S1apCauseGroup};
 
 // ============================================================================
 // S1AP Error Types

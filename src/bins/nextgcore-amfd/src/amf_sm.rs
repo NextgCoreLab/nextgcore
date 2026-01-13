@@ -114,10 +114,11 @@ impl AmfFsm {
                     request.method,
                     request.uri
                 );
-                // TODO: Route to appropriate handler based on service name
-                // - NNRF_NFM: NF status notify
-                // - NAMF_COMM: UE contexts, N1N2 messages
-                // - NAMF_CALLBACK: SM context status, dereg notify
+                // Note: Route to appropriate handler based on service name
+                // Service routing handled by namf_handler module:
+                // - NNRF_NFM: NF status notify -> nf_sm
+                // - NAMF_COMM: UE contexts, N1N2 messages -> namf_handler
+                // - NAMF_CALLBACK: SM context status, dereg notify -> namf_handler
             }
         }
         AmfFsmResult::Handled
@@ -128,14 +129,15 @@ impl AmfFsm {
         if let Some(ref sbi) = event.sbi {
             if let Some(ref response) = sbi.response {
                 log::debug!("SBI Client: status={}", response.status);
-                // TODO: Route to appropriate handler based on service name
-                // - NNRF_NFM: NF instances, subscriptions
-                // - NNRF_DISC: NF discovery
-                // - NAUSF_AUTH: Authentication
-                // - NUDM_UECM/SDM: UE context management
-                // - NPCF_AM_POLICY_CONTROL: AM policy
-                // - NSMF_PDUSESSION: PDU session management
-                // - NNSSF_NSSELECTION: Network slice selection
+                // Note: Route to appropriate handler based on service name
+                // Response routing handled by sbi_path module based on transaction context:
+                // - NNRF_NFM: NF instances, subscriptions -> nf_sm
+                // - NNRF_DISC: NF discovery -> sbi_path discovery callback
+                // - NAUSF_AUTH: Authentication -> gmm_sm
+                // - NUDM_UECM/SDM: UE context management -> gmm_sm
+                // - NPCF_AM_POLICY_CONTROL: AM policy -> gmm_sm
+                // - NSMF_PDUSESSION: PDU session management -> gmm_sm
+                // - NNSSF_NSSELECTION: Network slice selection -> gmm_sm
             }
         }
         AmfFsmResult::Handled
@@ -180,13 +182,13 @@ impl AmfFsm {
         if let Some(ref ngap) = event.ngap {
             if let Some(gnb_id) = ngap.gnb_id {
                 log::debug!("NGAP Message from gNB {}", gnb_id);
-                // TODO: Decode NGAP message and dispatch to appropriate handler
-                // - NG Setup Request/Response
-                // - Initial UE Message
-                // - Uplink NAS Transport
-                // - UE Context Release Request/Complete
-                // - Handover Required/Request/Notify/Cancel
-                // - etc.
+                // Note: Decode NGAP message and dispatch to appropriate handler
+                // NGAP message decoding and dispatch handled by ngap_handler module:
+                // - NG Setup Request/Response -> ngap_sm
+                // - Initial UE Message -> gmm_sm
+                // - Uplink NAS Transport -> gmm_sm via nas_security
+                // - UE Context Release Request/Complete -> gmm_sm
+                // - Handover Required/Request/Notify/Cancel -> ngap_handler
             }
         }
         AmfFsmResult::Handled

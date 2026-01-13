@@ -212,7 +212,7 @@ pub fn hss_swx_is_initialized() -> bool {
 pub fn handle_mar(
     user_name: &str,
     auth_scheme: Option<&str>,
-    sip_authorization: Option<&[u8]>,
+    _sip_authorization: Option<&[u8]>,
 ) -> Result<MarResponse> {
     debug!("Rx Multimedia-Auth-Request for user: {}", user_name);
     swx_stats().inc_rx_mar();

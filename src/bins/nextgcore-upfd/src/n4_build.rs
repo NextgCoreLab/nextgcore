@@ -2,7 +2,7 @@
 //!
 //! Port of src/upf/n4-build.c - PFCP message building for UPF
 
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 // ============================================================================
@@ -665,6 +665,626 @@ pub fn build_session_report_request(
     }
     
     let _ = msg_type;
+    builder.build()
+}
+
+// ============================================================================
+// PFCP Message Parsing
+// ============================================================================
+
+/// Parsed PFCP message header
+#[derive(Debug, Clone, Default)]
+pub struct ParsedPfcpHeader {
+    pub version: u8,
+    pub msg_type: u8,
+    pub length: u16,
+    pub seid_present: bool,
+    pub seid: u64,
+    pub sequence_number: u32,
+}
+
+impl ParsedPfcpHeader {
+    /// Parse PFCP header from bytes
+    pub fn parse(data: &[u8]) -> Result<(Self, &[u8]), &'static str> {
+        if data.len() < 8 {
+            return Err("PFCP message too short");
+        }
+
+        let flags = data[0];
+        let version = flags >> 5;
+        let seid_present = (flags & 0x01) != 0;
+
+        if version != 1 {
+            return Err("Unsupported PFCP version");
+        }
+
+        let msg_type = data[1];
+        let length = u16::from_be_bytes([data[2], data[3]]);
+
+        let (seid, seq_offset) = if seid_present {
+            if data.len() < 16 {
+                return Err("PFCP message too short for SEID");
+            }
+            let seid = u64::from_be_bytes([
+                data[4], data[5], data[6], data[7],
+                data[8], data[9], data[10], data[11],
+            ]);
+            (seid, 12)
+        } else {
+            (0, 4)
+        };
+
+        let seq_start = seq_offset;
+        if data.len() < seq_start + 4 {
+            return Err("PFCP message too short for sequence");
+        }
+        let sequence_number = u32::from_be_bytes([0, data[seq_start], data[seq_start + 1], data[seq_start + 2]]);
+
+        let header_len = if seid_present { 16 } else { 8 };
+        let payload = &data[header_len..];
+
+        Ok((Self {
+            version,
+            msg_type,
+            length,
+            seid_present,
+            seid,
+            sequence_number,
+        }, payload))
+    }
+}
+
+/// Parsed PFCP IE (Information Element)
+#[derive(Debug, Clone)]
+pub struct ParsedIe {
+    pub ie_type: u16,
+    pub length: u16,
+    pub value: Vec<u8>,
+}
+
+impl ParsedIe {
+    /// Parse all IEs from PFCP message payload
+    pub fn parse_all(mut data: &[u8]) -> Vec<ParsedIe> {
+        let mut ies = Vec::new();
+        while data.len() >= 4 {
+            let ie_type = u16::from_be_bytes([data[0], data[1]]);
+            let length = u16::from_be_bytes([data[2], data[3]]);
+            data = &data[4..];
+
+            if data.len() < length as usize {
+                break;
+            }
+
+            let value = data[..length as usize].to_vec();
+            data = &data[length as usize..];
+
+            ies.push(ParsedIe { ie_type, length, value });
+        }
+        ies
+    }
+
+    /// Find IE by type
+    pub fn find_ie(ies: &[ParsedIe], ie_type: u16) -> Option<&ParsedIe> {
+        ies.iter().find(|ie| ie.ie_type == ie_type)
+    }
+
+    /// Find all IEs of a type
+    pub fn find_all_ies(ies: &[ParsedIe], ie_type: u16) -> Vec<&ParsedIe> {
+        ies.iter().filter(|ie| ie.ie_type == ie_type).collect()
+    }
+}
+
+/// Parsed F-SEID from request
+#[derive(Debug, Clone, Default)]
+pub struct ParsedFSeid {
+    pub seid: u64,
+    pub ipv4: Option<Ipv4Addr>,
+    pub ipv6: Option<Ipv6Addr>,
+}
+
+impl ParsedFSeid {
+    /// Parse F-SEID IE value
+    pub fn parse(data: &[u8]) -> Result<Self, &'static str> {
+        if data.is_empty() {
+            return Err("F-SEID IE empty");
+        }
+        let flags = data[0];
+        let v6 = (flags & 0x01) != 0;
+        let v4 = (flags & 0x02) != 0;
+
+        let mut cursor = &data[1..];
+        if cursor.len() < 8 {
+            return Err("F-SEID too short for SEID");
+        }
+        let seid = u64::from_be_bytes([
+            cursor[0], cursor[1], cursor[2], cursor[3],
+            cursor[4], cursor[5], cursor[6], cursor[7],
+        ]);
+        cursor = &cursor[8..];
+
+        let ipv4 = if v4 {
+            if cursor.len() < 4 {
+                return Err("F-SEID too short for IPv4");
+            }
+            let addr = Ipv4Addr::new(cursor[0], cursor[1], cursor[2], cursor[3]);
+            cursor = &cursor[4..];
+            Some(addr)
+        } else {
+            None
+        };
+
+        let ipv6 = if v6 {
+            if cursor.len() < 16 {
+                return Err("F-SEID too short for IPv6");
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&cursor[..16]);
+            Some(Ipv6Addr::from(octets))
+        } else {
+            None
+        };
+
+        Ok(Self { seid, ipv4, ipv6 })
+    }
+}
+
+/// Parsed F-TEID from request
+#[derive(Debug, Clone, Default)]
+pub struct ParsedFTeid {
+    pub teid: u32,
+    pub ipv4: Option<Ipv4Addr>,
+    pub ipv6: Option<Ipv6Addr>,
+    pub ch: bool,       // CHOOSE flag
+    pub chid: bool,     // CHOOSE ID flag
+    pub choose_id: Option<u8>,
+}
+
+impl ParsedFTeid {
+    /// Parse F-TEID IE value
+    pub fn parse(data: &[u8]) -> Result<Self, &'static str> {
+        if data.is_empty() {
+            return Err("F-TEID IE empty");
+        }
+        let flags = data[0];
+        let v6 = (flags & 0x01) != 0;
+        let v4 = (flags & 0x02) != 0;
+        let ch = (flags & 0x04) != 0;
+        let chid = (flags & 0x08) != 0;
+
+        let mut cursor = &data[1..];
+        if cursor.len() < 4 {
+            return Err("F-TEID too short for TEID");
+        }
+        let teid = u32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
+        cursor = &cursor[4..];
+
+        let ipv4 = if v4 && !ch {
+            if cursor.len() < 4 {
+                return Err("F-TEID too short for IPv4");
+            }
+            let addr = Ipv4Addr::new(cursor[0], cursor[1], cursor[2], cursor[3]);
+            cursor = &cursor[4..];
+            Some(addr)
+        } else {
+            None
+        };
+
+        let ipv6 = if v6 && !ch {
+            if cursor.len() < 16 {
+                return Err("F-TEID too short for IPv6");
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&cursor[..16]);
+            cursor = &cursor[16..];
+            Some(Ipv6Addr::from(octets))
+        } else {
+            None
+        };
+
+        let choose_id = if chid && !cursor.is_empty() {
+            Some(cursor[0])
+        } else {
+            None
+        };
+
+        Ok(Self { teid, ipv4, ipv6, ch, chid, choose_id })
+    }
+}
+
+/// Parsed UE IP Address from request
+#[derive(Debug, Clone, Default)]
+pub struct ParsedUeIpAddr {
+    pub ipv4: Option<Ipv4Addr>,
+    pub ipv6: Option<Ipv6Addr>,
+    pub ipv6_prefix_len: u8,
+    pub source: bool,      // SD=0: source (uplink)
+    pub destination: bool, // SD=1: destination (downlink)
+}
+
+impl ParsedUeIpAddr {
+    /// Parse UE IP Address IE value
+    pub fn parse(data: &[u8]) -> Result<Self, &'static str> {
+        if data.is_empty() {
+            return Err("UE IP Address IE empty");
+        }
+        let flags = data[0];
+        let v6 = (flags & 0x01) != 0;
+        let v4 = (flags & 0x02) != 0;
+        let sd = (flags & 0x04) != 0; // Source/Destination
+        let ipv6d = (flags & 0x08) != 0; // IPv6 prefix delegated
+
+        let mut cursor = &data[1..];
+
+        let ipv4 = if v4 {
+            if cursor.len() < 4 {
+                return Err("UE IP too short for IPv4");
+            }
+            let addr = Ipv4Addr::new(cursor[0], cursor[1], cursor[2], cursor[3]);
+            cursor = &cursor[4..];
+            Some(addr)
+        } else {
+            None
+        };
+
+        let ipv6 = if v6 {
+            if cursor.len() < 16 {
+                return Err("UE IP too short for IPv6");
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&cursor[..16]);
+            cursor = &cursor[16..];
+            Some(Ipv6Addr::from(octets))
+        } else {
+            None
+        };
+
+        let ipv6_prefix_len = if ipv6d && !cursor.is_empty() {
+            cursor[0]
+        } else if v6 {
+            64 // default prefix length
+        } else {
+            0
+        };
+
+        Ok(Self {
+            ipv4,
+            ipv6,
+            ipv6_prefix_len,
+            source: !sd,
+            destination: sd,
+        })
+    }
+}
+
+/// Parsed Outer Header Creation
+#[derive(Debug, Clone, Default)]
+pub struct ParsedOuterHeaderCreation {
+    pub description: u16,
+    pub teid: u32,
+    pub ipv4: Option<Ipv4Addr>,
+    pub ipv6: Option<Ipv6Addr>,
+    pub port: Option<u16>,
+}
+
+impl ParsedOuterHeaderCreation {
+    /// Parse Outer Header Creation IE value
+    pub fn parse(data: &[u8]) -> Result<Self, &'static str> {
+        if data.len() < 2 {
+            return Err("Outer Header Creation too short");
+        }
+        let description = u16::from_be_bytes([data[0], data[1]]);
+        let mut cursor = &data[2..];
+
+        // GTP-U/UDP/IPv4 = 0x0100
+        // GTP-U/UDP/IPv6 = 0x0200
+        let gtpu_ipv4 = (description & 0x0100) != 0;
+        let gtpu_ipv6 = (description & 0x0200) != 0;
+
+        let teid = if gtpu_ipv4 || gtpu_ipv6 {
+            if cursor.len() < 4 {
+                return Err("OHC too short for TEID");
+            }
+            let t = u32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
+            cursor = &cursor[4..];
+            t
+        } else {
+            0
+        };
+
+        let ipv4 = if gtpu_ipv4 {
+            if cursor.len() < 4 {
+                return Err("OHC too short for IPv4");
+            }
+            let addr = Ipv4Addr::new(cursor[0], cursor[1], cursor[2], cursor[3]);
+            cursor = &cursor[4..];
+            Some(addr)
+        } else {
+            None
+        };
+
+        let ipv6 = if gtpu_ipv6 {
+            if cursor.len() < 16 {
+                return Err("OHC too short for IPv6");
+            }
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&cursor[..16]);
+            cursor = &cursor[16..];
+            Some(Ipv6Addr::from(octets))
+        } else {
+            None
+        };
+
+        // Port is optional
+        let port = if cursor.len() >= 2 {
+            Some(u16::from_be_bytes([cursor[0], cursor[1]]))
+        } else {
+            None
+        };
+
+        Ok(Self { description, teid, ipv4, ipv6, port })
+    }
+}
+
+/// Parse Create PDR IE and extract relevant fields
+pub fn parse_create_pdr(data: &[u8]) -> Result<ParsedCreatePdr, &'static str> {
+    let ies = ParsedIe::parse_all(data);
+    let mut pdr = ParsedCreatePdr::default();
+
+    // PDR ID (mandatory)
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::PDR_ID) {
+        if ie.value.len() >= 2 {
+            pdr.pdr_id = u16::from_be_bytes([ie.value[0], ie.value[1]]);
+        }
+    } else {
+        return Err("PDR ID missing");
+    }
+
+    // Precedence (mandatory)
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::PRECEDENCE) {
+        if ie.value.len() >= 4 {
+            pdr.precedence = u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]);
+        }
+    }
+
+    // PDI (mandatory)
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::PDI) {
+        pdr.pdi = parse_pdi(&ie.value)?;
+    }
+
+    // Outer Header Removal
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::OUTER_HEADER_REMOVAL) {
+        if !ie.value.is_empty() {
+            pdr.outer_header_removal = Some(ie.value[0]);
+        }
+    }
+
+    // FAR ID
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::FAR_ID) {
+        if ie.value.len() >= 4 {
+            pdr.far_id = Some(u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]));
+        }
+    }
+
+    // URR IDs
+    for ie in ParsedIe::find_all_ies(&ies, pfcp_ie::URR_ID) {
+        if ie.value.len() >= 4 {
+            pdr.urr_ids.push(u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]));
+        }
+    }
+
+    // QER ID
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::QER_ID) {
+        if ie.value.len() >= 4 {
+            pdr.qer_id = Some(u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]));
+        }
+    }
+
+    Ok(pdr)
+}
+
+/// Parsed Create PDR structure
+#[derive(Debug, Clone, Default)]
+pub struct ParsedCreatePdr {
+    pub pdr_id: u16,
+    pub precedence: u32,
+    pub pdi: ParsedPdi,
+    pub outer_header_removal: Option<u8>,
+    pub far_id: Option<u32>,
+    pub urr_ids: Vec<u32>,
+    pub qer_id: Option<u32>,
+}
+
+/// Parsed PDI (Packet Detection Information)
+#[derive(Debug, Clone, Default)]
+pub struct ParsedPdi {
+    pub source_interface: u8,
+    pub local_f_teid: Option<ParsedFTeid>,
+    pub network_instance: Option<String>,
+    pub ue_ip_address: Option<ParsedUeIpAddr>,
+    pub qfi: Option<u8>,
+}
+
+/// Parse PDI IE
+fn parse_pdi(data: &[u8]) -> Result<ParsedPdi, &'static str> {
+    let ies = ParsedIe::parse_all(data);
+    let mut pdi = ParsedPdi::default();
+
+    // Source Interface (mandatory)
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::SOURCE_INTERFACE) {
+        if !ie.value.is_empty() {
+            pdi.source_interface = ie.value[0];
+        }
+    }
+
+    // Local F-TEID
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::F_TEID) {
+        pdi.local_f_teid = Some(ParsedFTeid::parse(&ie.value)?);
+    }
+
+    // Network Instance
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::NETWORK_INSTANCE) {
+        pdi.network_instance = Some(String::from_utf8_lossy(&ie.value).to_string());
+    }
+
+    // UE IP Address
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::UE_IP_ADDRESS) {
+        pdi.ue_ip_address = Some(ParsedUeIpAddr::parse(&ie.value)?);
+    }
+
+    // QFI
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::QFI) {
+        if !ie.value.is_empty() {
+            pdi.qfi = Some(ie.value[0]);
+        }
+    }
+
+    Ok(pdi)
+}
+
+/// Parse Create FAR IE
+pub fn parse_create_far(data: &[u8]) -> Result<ParsedCreateFar, &'static str> {
+    let ies = ParsedIe::parse_all(data);
+    let mut far = ParsedCreateFar::default();
+
+    // FAR ID (mandatory)
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::FAR_ID) {
+        if ie.value.len() >= 4 {
+            far.far_id = u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]);
+        }
+    } else {
+        return Err("FAR ID missing");
+    }
+
+    // Apply Action (mandatory)
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::APPLY_ACTION) {
+        if ie.value.len() >= 2 {
+            far.apply_action = u16::from_be_bytes([ie.value[0], ie.value[1]]);
+        } else if !ie.value.is_empty() {
+            far.apply_action = ie.value[0] as u16;
+        }
+    }
+
+    // Forwarding Parameters
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::FORWARDING_PARAMETERS) {
+        far.forwarding_parameters = Some(parse_forwarding_parameters(&ie.value)?);
+    }
+
+    // BAR ID
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::BAR_ID) {
+        if !ie.value.is_empty() {
+            far.bar_id = Some(ie.value[0]);
+        }
+    }
+
+    Ok(far)
+}
+
+/// Parsed Create FAR structure
+#[derive(Debug, Clone, Default)]
+pub struct ParsedCreateFar {
+    pub far_id: u32,
+    pub apply_action: u16,
+    pub forwarding_parameters: Option<ParsedForwardingParameters>,
+    pub bar_id: Option<u8>,
+}
+
+/// Parsed Forwarding Parameters
+#[derive(Debug, Clone, Default)]
+pub struct ParsedForwardingParameters {
+    pub destination_interface: u8,
+    pub network_instance: Option<String>,
+    pub outer_header_creation: Option<ParsedOuterHeaderCreation>,
+}
+
+/// Parse Forwarding Parameters IE
+fn parse_forwarding_parameters(data: &[u8]) -> Result<ParsedForwardingParameters, &'static str> {
+    let ies = ParsedIe::parse_all(data);
+    let mut fp = ParsedForwardingParameters::default();
+
+    // Destination Interface
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::DESTINATION_INTERFACE) {
+        if !ie.value.is_empty() {
+            fp.destination_interface = ie.value[0];
+        }
+    }
+
+    // Network Instance
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::NETWORK_INSTANCE) {
+        fp.network_instance = Some(String::from_utf8_lossy(&ie.value).to_string());
+    }
+
+    // Outer Header Creation
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::OUTER_HEADER_CREATION) {
+        fp.outer_header_creation = Some(ParsedOuterHeaderCreation::parse(&ie.value)?);
+    }
+
+    Ok(fp)
+}
+
+/// Parsed Node ID
+#[derive(Debug, Clone)]
+pub enum ParsedNodeId {
+    Ipv4(Ipv4Addr),
+    Ipv6(Ipv6Addr),
+    Fqdn(String),
+}
+
+impl ParsedNodeId {
+    /// Parse Node ID IE value
+    pub fn parse(data: &[u8]) -> Result<Self, &'static str> {
+        if data.is_empty() {
+            return Err("Node ID IE empty");
+        }
+        let node_type = data[0];
+        let cursor = &data[1..];
+
+        match node_type {
+            0 => {
+                // IPv4
+                if cursor.len() < 4 {
+                    return Err("Node ID too short for IPv4");
+                }
+                Ok(ParsedNodeId::Ipv4(Ipv4Addr::new(cursor[0], cursor[1], cursor[2], cursor[3])))
+            }
+            1 => {
+                // IPv6
+                if cursor.len() < 16 {
+                    return Err("Node ID too short for IPv6");
+                }
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&cursor[..16]);
+                Ok(ParsedNodeId::Ipv6(Ipv6Addr::from(octets)))
+            }
+            2 => {
+                // FQDN
+                let fqdn = String::from_utf8_lossy(cursor).to_string();
+                Ok(ParsedNodeId::Fqdn(fqdn))
+            }
+            _ => Err("Unknown Node ID type"),
+        }
+    }
+}
+
+/// Build Heartbeat Response
+pub fn build_heartbeat_response(recovery_time_stamp: u32) -> Vec<u8> {
+    let mut builder = PfcpMessageBuilder::new();
+    builder.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, recovery_time_stamp);
+    builder.build()
+}
+
+/// Build Association Setup Response
+pub fn build_association_setup_response(
+    node_id: &NodeId,
+    recovery_time_stamp: u32,
+    cause: PfcpCause,
+) -> Vec<u8> {
+    let mut builder = PfcpMessageBuilder::new();
+    builder.add_node_id(node_id);
+    builder.add_cause(cause);
+    builder.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, recovery_time_stamp);
+    // Add UP Function Features (simplified)
+    let features: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
+    builder.add_tlv(pfcp_ie::UP_FUNCTION_FEATURES, &features);
     builder.build()
 }
 

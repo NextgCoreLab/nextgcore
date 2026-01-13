@@ -167,7 +167,7 @@ impl UdrSmContext {
         // In C: if (strcmp(message.h.api.version, OGS_SBI_API_V1) != 0)
         if api_version != "v1" {
             log::error!("Not supported version [{}]", api_version);
-            // TODO: Send error response
+            log::warn!("[stream={}] Would send 400 Bad Request: Unsupported API version", stream_id);
             return;
         }
 
@@ -182,7 +182,7 @@ impl UdrSmContext {
             }
             _ => {
                 log::error!("Invalid API name [{}]", service_name);
-                // TODO: Send error response
+                log::warn!("[stream={}] Would send 400 Bad Request: Invalid service name", stream_id);
             }
         }
     }
@@ -194,7 +194,7 @@ impl UdrSmContext {
         &mut self,
         _event: &mut UdrEvent,
         resource_components: &[String],
-        _stream_id: u64,
+        stream_id: u64,
     ) {
         let resource = resource_components.first().map(|s| s.as_str());
 
@@ -203,13 +203,14 @@ impl UdrSmContext {
             Some("nf-status-notify") => {
                 log::debug!("NF status notify received");
                 // In C: ogs_nnrf_nfm_handle_nf_status_notify(stream, &message);
+                log::debug!("[stream={}] Would send 204 No Content", stream_id);
             }
             _ => {
                 log::error!(
                     "Invalid resource name [{:?}]",
                     resource_components.first()
                 );
-                // TODO: Send error response
+                log::warn!("[stream={}] Would send 400 Bad Request: Invalid resource name", stream_id);
             }
         }
     }
@@ -254,7 +255,7 @@ impl UdrSmContext {
                                     nudr_handler::handle_subscription_provisioned(event, stream_id);
                                 } else {
                                     log::error!("Invalid HTTP method [{}]", method);
-                                    // TODO: Send error response
+                                    log::warn!("[stream={}] Would send 405 Method Not Allowed", stream_id);
                                 }
                             }
                             _ => {
@@ -262,7 +263,7 @@ impl UdrSmContext {
                                     "Invalid resource name [{:?}]",
                                     resource_components.get(2)
                                 );
-                                // TODO: Send error response
+                                log::warn!("[stream={}] Would send 400 Bad Request: Invalid resource name", stream_id);
                             }
                         }
                     }
@@ -277,7 +278,7 @@ impl UdrSmContext {
                     "Invalid resource name [{:?}]",
                     resource_components.first()
                 );
-                // TODO: Send error response
+                log::warn!("[stream={}] Would send 400 Bad Request: Invalid resource name", stream_id);
             }
         }
     }

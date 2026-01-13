@@ -104,8 +104,7 @@ rasn-derive = "0.18"
 diameter-rs = "0.5"            # Diameter protocol (AAA)
 
 # Pure Rust SCTP (userspace over UDP - no C dependencies)
-webrtc-sctp = "0.10"           # SCTP protocol implementation
-webrtc-util = "0.9"            # WebRTC utilities
+sctp-proto = "0.6"             # SCTP protocol (same as nextgsim for wire compatibility)
 
 # FFI and bindgen (optional - only for C interop testing)
 bindgen = "0.69"

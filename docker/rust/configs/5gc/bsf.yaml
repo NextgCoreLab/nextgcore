@@ -14,8 +14,8 @@ global:
 bsf:
   sbi:
     server:
-      - address: 172.22.0.15
+      - address: 172.23.0.15
         port: 7777
     client:
       nrf:
-        - uri: http://172.22.0.10:7777
+        - uri: http://172.23.0.10:7777

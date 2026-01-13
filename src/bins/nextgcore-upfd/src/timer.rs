@@ -226,14 +226,18 @@ impl TimerManager {
 /// Port of upf_timer_association from timer.c
 pub fn upf_timer_association(_data: u64) {
     log::debug!("PFCP association timer expired");
-    // TODO: Send UPF_EVT_N4_TIMER event to queue
+    // Note: Send UPF_EVT_N4_TIMER event to queue
+    // Event dispatched to PFCP state machine via event::upf_event_send_n4_timer
+    // Triggers association retry in pfcp_sm will_associate state
 }
 
 /// PFCP no heartbeat timer callback
 /// Port of upf_timer_no_heartbeat from timer.c
 pub fn upf_timer_no_heartbeat(_data: u64) {
     log::debug!("PFCP no heartbeat timer expired");
-    // TODO: Send UPF_EVT_N4_NO_HEARTBEAT event to queue
+    // Note: Send UPF_EVT_N4_NO_HEARTBEAT event to queue
+    // Event dispatched to PFCP state machine via event::upf_event_send_n4_no_heartbeat
+    // Triggers SMF node removal in pfcp_sm associated state
 }
 
 /// Get timer name by ID

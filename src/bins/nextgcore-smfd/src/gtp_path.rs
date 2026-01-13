@@ -1,4 +1,8 @@
 //! GTP Path Management
+
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 //!
 //! Port of src/smf/gtp-path.c - GTP path management for SMF
 //! Handles GTP-C and GTP-U path setup, teardown, and message sending

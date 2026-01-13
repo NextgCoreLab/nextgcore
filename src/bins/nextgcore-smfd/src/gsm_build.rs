@@ -1,4 +1,8 @@
 //! GSM (5G Session Management) Message Building
+
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 //!
 //! Port of src/smf/gsm-build.c - GSM message building functions for 5G NAS
 

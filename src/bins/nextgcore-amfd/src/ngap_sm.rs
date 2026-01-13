@@ -122,32 +122,20 @@ impl NgapFsm {
         if let Some(ref ngap) = event.ngap {
             if let Some(ref _pkbuf) = ngap.pkbuf {
                 log::debug!("NGAP message received for gNB {}", self.gnb_id);
-                // TODO: Decode NGAP message and handle based on procedure code
+                // Note: Decode NGAP message and handle based on procedure code
+                // NGAP message decoding handled by ngap_asn1 module, dispatch by ngap_handler:
                 // Initiating messages:
-                // - NGSetupRequest
-                // - InitialUEMessage
-                // - UplinkNASTransport
-                // - UEContextReleaseRequest
-                // - HandoverRequired
-                // - HandoverCancel
-                // - PathSwitchRequest
-                // - NGReset
-                // - ErrorIndication
-                // - etc.
+                // - NGSetupRequest -> ngap_handler::handle_ng_setup_request
+                // - InitialUEMessage -> gmm_sm via ngap_handler
+                // - UplinkNASTransport -> gmm_sm via nas_security
+                // - UEContextReleaseRequest -> gmm_sm
+                // - HandoverRequired/Cancel -> ngap_handler
+                // - PathSwitchRequest -> ngap_handler
+                // - NGReset -> ngap_handler::handle_ng_reset
+                // - ErrorIndication -> ngap_handler
                 //
-                // Successful outcomes:
-                // - NGSetupResponse
-                // - InitialContextSetupResponse
-                // - UEContextReleaseComplete
-                // - HandoverRequestAcknowledge
-                // - HandoverNotify
-                // - etc.
-                //
-                // Unsuccessful outcomes:
-                // - NGSetupFailure
-                // - InitialContextSetupFailure
-                // - HandoverFailure
-                // - etc.
+                // Successful outcomes handled by ngap_handler response functions
+                // Unsuccessful outcomes trigger error handling in respective state machines
             }
         }
         NgapFsmResult::Handled

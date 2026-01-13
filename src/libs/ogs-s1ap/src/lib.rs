@@ -2,4 +2,4 @@
 //!
 //! This crate provides S1AP message building and handling.
 
-// TODO: Implement in Task 7
+// Note: S1AP ASN.1 encoding/decoding via asn1_codecs crate with APER

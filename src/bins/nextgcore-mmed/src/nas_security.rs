@@ -319,7 +319,7 @@ pub fn nas_eps_security_encode(
     plain_message: &[u8],
 ) -> Option<Vec<u8>> {
     let mut integrity_protected;
-    let mut new_security_context;
+    let new_security_context;
     let mut ciphered;
 
     match security_header_type {
@@ -560,8 +560,6 @@ pub fn nas_eps_security_decode(
 
 /// Decode service request with short MAC
 fn decode_service_request(mme_ue: &mut MmeUe, message: &mut Vec<u8>) -> Result<(), &'static str> {
-    const SHORT_MAC_SIZE: usize = 2;
-
     if mme_ue.selected_int_algorithm == 0 {
         log::warn!("Integrity algorithm is not defined");
         return Err("Integrity algorithm not defined");

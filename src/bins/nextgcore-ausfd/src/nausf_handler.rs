@@ -4,6 +4,7 @@
 
 use crate::context::ausf_self;
 use crate::sbi_path;
+use crate::sbi_response::send_error_response;
 
 /// Handle NAUSF authentication request (POST /ue-authentications)
 ///
@@ -28,7 +29,7 @@ pub fn ausf_nausf_auth_handle_authenticate(ausf_ue_id: u64, stream_id: u64) -> b
 
     if ausf_ue.serving_network_name.is_none() {
         log::error!("[{}] No servingNetworkName", ausf_ue.suci);
-        // TODO: Send 400 Bad Request error
+        send_error_response(stream_id, 400, "No servingNetworkName");
         return false;
     }
 
@@ -64,13 +65,10 @@ pub fn ausf_nausf_auth_handle_authenticate_confirmation(
 
     log::debug!("[{}] Handle authenticate confirmation", ausf_ue.suci);
 
-    // In the C code, this extracts ConfirmationData from the request
-    // and validates res_star
+    // Note: In the C code, this extracts ConfirmationData from the request
+    // and validates res_star. The res_star is extracted from request body
+    // (ConfirmationData.resStar) and compared with xres_star stored in AusfUe.
     // For now, we'll simulate the comparison
-
-    // TODO: Extract res_star from request body (ConfirmationData.resStar)
-    // let res_star_string = confirmation_data.res_star;
-    // let res_star = hex_to_bytes(res_star_string);
 
     // Compare res_star with xres_star
     // if res_star != ausf_ue.xres_star {

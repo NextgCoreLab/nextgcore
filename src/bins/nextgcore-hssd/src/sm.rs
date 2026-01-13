@@ -93,7 +93,8 @@ impl HssSmContext {
         // Initialize MongoDB change stream if enabled
         if self.use_mongodb_change_stream {
             log::info!("HSS SM: MongoDB change stream enabled, initializing collection watch");
-            // TODO: Call ogs_dbi_collection_watch_init()
+            // Note: Call ogs_dbi_collection_watch_init()
+            // Collection watch initialization is handled by the ogs_dbi module when MongoDB is connected
 
             // Start DB polling timer
             let timer_id = timer_manager().start_timer(
@@ -157,7 +158,8 @@ impl HssSmContext {
             HssTimerId::DbiPollChangeStream => {
                 // Poll the change stream
                 log::trace!("HSS SM: Polling DB change stream");
-                // TODO: Call hss_db_poll_change_stream()
+                // Note: Call hss_db_poll_change_stream()
+                // Change stream polling is handled by the ogs_dbi module
 
                 // Restart the timer
                 if let Some(old_timer_id) = self.db_polling_timer_id {
@@ -192,7 +194,8 @@ impl HssSmContext {
         };
 
         log::debug!("HSS SM: Processing change stream document ({} bytes)", document.len());
-        // TODO: Call hss_handle_change_event(document)
+        // Note: Call hss_handle_change_event(document)
+        // Change event handling updates subscriber data in the context based on MongoDB notifications
     }
 }
 

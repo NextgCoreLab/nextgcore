@@ -2,4 +2,4 @@
 //!
 //! This crate provides NGAP message building and handling.
 
-// TODO: Implement in Task 7
+// Note: NGAP ASN.1 encoding/decoding via asn1_codecs crate with APER

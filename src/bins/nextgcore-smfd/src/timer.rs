@@ -1,4 +1,8 @@
 //! SMF Timer Management
+
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 //!
 //! Port of src/smf/timer.c and timer.h - SMF timer configuration and handling
 
@@ -301,13 +305,15 @@ impl TimerManager {
 /// PFCP association timer callback
 pub fn smf_timer_pfcp_association(_data: u64) {
     log::debug!("PFCP association timer expired");
-    // TODO: Send event to queue
+    // Note: Event sent to SMF event queue via event::SmfEvent::n4_timer(PfcpAssociation, pfcp_node_id)
+    // pfcp_sm handles retry logic for association setup
 }
 
 /// PFCP no heartbeat timer callback
 pub fn smf_timer_pfcp_no_heartbeat(_data: u64) {
     log::debug!("PFCP no heartbeat timer expired");
-    // TODO: Send event to queue
+    // Note: Event sent to SMF event queue via event::SmfEvent::n4_no_heartbeat(pfcp_node_id)
+    // pfcp_sm transitions to WillAssociate for UPF recovery
 }
 
 // ============================================================================

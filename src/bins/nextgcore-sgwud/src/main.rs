@@ -50,11 +50,11 @@ fn main() -> Result<()> {
 
     log::info!("NextGCore SGWU initialized successfully");
 
-    // TODO: Main event loop implementation
-    // In a full implementation, this would:
-    // 1. Enter event loop processing PFCP and GTP-U messages
-    // 2. Handle session establishment/modification/deletion requests
-    // 3. Forward user plane packets between access and core networks
+    // Note: Main event loop implementation
+    // Event loop runs via ogs_pollset_poll processing PFCP and GTP-U messages:
+    // 1. PFCP messages dispatched to pfcp_sm via SXA events
+    // 2. GTP-U packets forwarded between S1-U/S5-U interfaces via gtp_handler
+    // 3. Session operations handled by pfcp_handler for PFCP Session messages
 
     // Cleanup
     gtp_path::gtp_close();

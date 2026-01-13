@@ -10,6 +10,34 @@
 
 use crate::event::UdrEvent;
 
+/// Send an error response to the client
+/// This is a placeholder that will be connected to the SBI server infrastructure
+#[allow(dead_code)]
+fn send_error_response(stream_id: u64, status: u16, title: &str, detail: &str) {
+    log::warn!(
+        "[stream={}] Would send error response: {} {} - {}",
+        stream_id,
+        status,
+        title,
+        detail
+    );
+    // When SBI server infrastructure is connected:
+    // ogs_sbi::send_error(status, title, detail, None)
+}
+
+/// Send a success response to the client
+#[allow(dead_code)]
+fn send_success_response(stream_id: u64, status: u16, body: Option<&str>) {
+    log::debug!(
+        "[stream={}] Would send success response: {} body={}",
+        stream_id,
+        status,
+        body.is_some()
+    );
+    // When SBI server infrastructure is connected:
+    // SbiResponse::with_status(status).with_body(body)
+}
+
 /// Handle subscription authentication requests
 ///
 /// Port of udr_nudr_dr_handle_subscription_authentication()
@@ -29,7 +57,7 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
         Some(s) => s,
         None => {
             log::error!("No SUPI");
-            // TODO: Send BAD_REQUEST error
+            send_error_response(stream_id, 400, "Bad Request", "Missing SUPI");
             return;
         }
     };
@@ -38,7 +66,7 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
     // In C: if (strncmp(supi, OGS_ID_SUPI_TYPE_IMSI, strlen(OGS_ID_SUPI_TYPE_IMSI)) != 0)
     if !supi.starts_with("imsi-") {
         log::error!("[{}] Unknown SUPI Type", supi);
-        // TODO: Send FORBIDDEN error
+        send_error_response(stream_id, 403, "Forbidden", "Unknown SUPI type");
         return;
     }
 
@@ -74,7 +102,7 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
                 }
                 _ => {
                     log::error!("Invalid HTTP method [{}]", method);
-                    // TODO: Send METHOD_NOT_ALLOWED error
+                    send_error_response(stream_id, 405, "Method Not Allowed", &format!("Method {} not allowed", method));
                 }
             }
         }
@@ -87,17 +115,17 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
                     log::debug!("[{}] {} authentication-status (stream={})", supi, method, stream_id);
                     // In C: For PUT, validate AuthEvent is present
                     // Increment SQN: ogs_dbi_increment_sqn(supi)
-                    // Send HTTP 204 No Content
+                    send_success_response(stream_id, 204, None);
                 }
                 _ => {
                     log::error!("Invalid HTTP method [{}]", method);
-                    // TODO: Send METHOD_NOT_ALLOWED error
+                    send_error_response(stream_id, 405, "Method Not Allowed", &format!("Method {} not allowed", method));
                 }
             }
         }
         _ => {
             log::error!("Invalid resource name [{:?}]", resource3);
-            // TODO: Send METHOD_NOT_ALLOWED error
+            send_error_response(stream_id, 400, "Bad Request", "Invalid resource name");
         }
     }
 }
@@ -120,7 +148,7 @@ pub fn handle_subscription_context(event: &UdrEvent, stream_id: u64) {
         Some(s) => s,
         None => {
             log::error!("No SUPI");
-            // TODO: Send BAD_REQUEST error
+            send_error_response(stream_id, 400, "Bad Request", "Missing SUPI");
             return;
         }
     };
@@ -128,7 +156,7 @@ pub fn handle_subscription_context(event: &UdrEvent, stream_id: u64) {
     // Validate SUPI type
     if !supi.starts_with("imsi-") {
         log::error!("[{}] Unknown SUPI Type", supi);
-        // TODO: Send FORBIDDEN error
+        send_error_response(stream_id, 403, "Forbidden", "Unknown SUPI type");
         return;
     }
 
@@ -144,18 +172,18 @@ pub fn handle_subscription_context(event: &UdrEvent, stream_id: u64) {
                     log::debug!("[{}] PUT amf-3gpp-access (stream={})", supi, stream_id);
                     // In C: Validate Amf3GppAccessRegistration is present
                     // If PEI (imeisv) is present, update in DB: ogs_dbi_update_imeisv(supi, value)
-                    // Send HTTP 204 No Content
+                    send_success_response(stream_id, 204, None);
                 }
                 // In C: CASE(OGS_SBI_HTTP_METHOD_PATCH)
                 "PATCH" => {
                     log::debug!("[{}] PATCH amf-3gpp-access (stream={})", supi, stream_id);
                     // In C: Validate PatchItemList is present
-                    // TODO: parse PatchItemList
-                    // Send HTTP 204 No Content
+                    // Parse PatchItemList (placeholder - needs JSON parsing)
+                    send_success_response(stream_id, 204, None);
                 }
                 _ => {
                     log::error!("Invalid HTTP method [{}]", method);
-                    // TODO: Send METHOD_NOT_ALLOWED error
+                    send_error_response(stream_id, 405, "Method Not Allowed", &format!("Method {} not allowed", method));
                 }
             }
         }
@@ -166,22 +194,22 @@ pub fn handle_subscription_context(event: &UdrEvent, stream_id: u64) {
                 "PUT" => {
                     log::debug!("[{}] PUT smf-registrations (stream={})", supi, stream_id);
                     // In C: Validate SmfRegistration is present
-                    // Send HTTP 204 No Content
+                    send_success_response(stream_id, 204, None);
                 }
                 // In C: CASE(OGS_SBI_HTTP_METHOD_DELETE)
                 "DELETE" => {
                     log::debug!("[{}] DELETE smf-registrations (stream={})", supi, stream_id);
-                    // Send HTTP 204 No Content
+                    send_success_response(stream_id, 204, None);
                 }
                 _ => {
                     log::error!("Invalid HTTP method [{}]", method);
-                    // TODO: Send METHOD_NOT_ALLOWED error
+                    send_error_response(stream_id, 405, "Method Not Allowed", &format!("Method {} not allowed", method));
                 }
             }
         }
         _ => {
             log::error!("Invalid resource name [{:?}]", resource3);
-            // TODO: Send METHOD_NOT_ALLOWED error
+            send_error_response(stream_id, 400, "Bad Request", "Invalid resource name");
         }
     }
 }
@@ -206,7 +234,7 @@ pub fn handle_subscription_provisioned(event: &UdrEvent, stream_id: u64) {
         Some(s) => s,
         None => {
             log::error!("No SUPI");
-            // TODO: Send BAD_REQUEST error
+            send_error_response(stream_id, 400, "Bad Request", "Missing SUPI");
             return;
         }
     };
@@ -214,7 +242,7 @@ pub fn handle_subscription_provisioned(event: &UdrEvent, stream_id: u64) {
     // Validate SUPI type
     if !supi.starts_with("imsi-") {
         log::error!("[{}] Unknown SUPI Type", supi);
-        // TODO: Send FORBIDDEN error
+        send_error_response(stream_id, 403, "Forbidden", "Unknown SUPI type");
         return;
     }
 
@@ -229,7 +257,7 @@ pub fn handle_subscription_provisioned(event: &UdrEvent, stream_id: u64) {
     // Determine what data to process based on resource component[4] or dataset-names param
     let resource4 = resource_components.get(4).map(|s| s.as_str());
 
-    let (process_am_data, process_smf_sel, process_sm_data, return_provisioned_data) = 
+    let (process_am_data, process_smf_sel, process_sm_data, return_provisioned_data) =
         match resource4 {
             // In C: CASE(OGS_SBI_RESOURCE_NAME_AM_DATA)
             Some("am-data") => (true, false, false, false),
@@ -245,7 +273,7 @@ pub fn handle_subscription_provisioned(event: &UdrEvent, stream_id: u64) {
             }
             _ => {
                 log::error!("Invalid resource name [{:?}]", resource4);
-                // TODO: Send METHOD_NOT_ALLOWED error
+                send_error_response(stream_id, 400, "Bad Request", "Invalid resource name");
                 return;
             }
         };
@@ -283,7 +311,8 @@ pub fn handle_subscription_provisioned(event: &UdrEvent, stream_id: u64) {
         log::debug!("[{}] Returning combined provisioned data sets", supi);
     }
 
-    // TODO: Send HTTP 200 OK with appropriate response body
+    // Return placeholder JSON response (actual data would come from database)
+    send_success_response(stream_id, 200, Some("{}"));
 }
 
 /// Handle policy data requests
@@ -310,7 +339,7 @@ pub fn handle_policy_data(event: &UdrEvent, stream_id: u64) {
                 Some(s) => s,
                 None => {
                     log::error!("No SUPI");
-                    // TODO: Send BAD_REQUEST error
+                    send_error_response(stream_id, 400, "Bad Request", "Missing SUPI");
                     return;
                 }
             };
@@ -318,7 +347,7 @@ pub fn handle_policy_data(event: &UdrEvent, stream_id: u64) {
             // Validate SUPI type
             if !supi.starts_with("imsi-") {
                 log::error!("[{}] Unknown SUPI Type", supi);
-                // TODO: Send FORBIDDEN error
+                send_error_response(stream_id, 403, "Forbidden", "Unknown SUPI type");
                 return;
             }
 
@@ -336,7 +365,7 @@ pub fn handle_policy_data(event: &UdrEvent, stream_id: u64) {
                         Some("am-data") => {
                             log::debug!("[{}] GET policy am-data (stream={})", supi, stream_id);
                             // In C: Build AmPolicyData (empty in current implementation)
-                            // Send HTTP 200 OK with AmPolicyData
+                            send_success_response(stream_id, 200, Some("{}"));
                         }
                         // In C: CASE(OGS_SBI_RESOURCE_NAME_SM_DATA)
                         Some("sm-data") => {
@@ -346,23 +375,23 @@ pub fn handle_policy_data(event: &UdrEvent, stream_id: u64) {
                             // Build SmPolicyData with:
                             // - sm_policy_snssai_data: Map of S-NSSAI to SmPolicySnssaiData
                             // - Each SmPolicySnssaiData has: snssai, sm_policy_dnn_data
-                            // Send HTTP 200 OK with SmPolicyData
+                            send_success_response(stream_id, 200, Some("{}"));
                         }
                         _ => {
                             log::error!("Invalid resource name [{:?}]", resource3);
-                            // TODO: Send METHOD_NOT_ALLOWED error
+                            send_error_response(stream_id, 400, "Bad Request", "Invalid resource name");
                         }
                     }
                 }
                 _ => {
                     log::error!("Invalid HTTP method [{}]", method);
-                    // TODO: Send METHOD_NOT_ALLOWED error
+                    send_error_response(stream_id, 405, "Method Not Allowed", &format!("Method {} not allowed", method));
                 }
             }
         }
         _ => {
             log::error!("Invalid resource name [{:?}]", resource1);
-            // TODO: Send METHOD_NOT_ALLOWED error
+            send_error_response(stream_id, 400, "Bad Request", "Invalid resource name");
         }
     }
 }

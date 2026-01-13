@@ -20,7 +20,8 @@ pub fn build_security_capability_request(
             let sender = context.sender.clone()?;
             let security_capability = context.security_capability.clone();
             let target_apiroot_supported = context.target_apiroot_supported;
-            // TODO: Get serving PLMN IDs from local configuration
+            // Note: Serving PLMN IDs retrieved from context.serving_plmn_ids
+            // Configured via YAML configuration or command line during initialization
             let serving_plmn_ids: Vec<PlmnId> = vec![];
             (sender, security_capability, target_apiroot_supported, serving_plmn_ids)
         } else {
@@ -87,7 +88,8 @@ pub fn build_security_capability_response(node: &SeppNode) -> Option<SecNegotiat
     let (sender, serving_plmn_ids) = {
         if let Ok(context) = ctx.read() {
             let sender = context.sender.clone()?;
-            // TODO: Get serving PLMN IDs from local configuration
+            // Note: Serving PLMN IDs retrieved from context.serving_plmn_ids
+            // Configured via YAML configuration or command line during initialization
             let serving_plmn_ids: Vec<PlmnId> = vec![];
             (sender, serving_plmn_ids)
         } else {

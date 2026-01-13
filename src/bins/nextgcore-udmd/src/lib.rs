@@ -9,6 +9,7 @@ pub mod event;
 pub mod nudm_handler;
 pub mod nudr_handler;
 pub mod sbi_path;
+pub mod sbi_response;
 pub mod sess_sm;
 pub mod timer;
 pub mod udm_sm;

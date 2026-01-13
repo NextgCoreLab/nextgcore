@@ -22,8 +22,8 @@ pub struct SbiServerConfig {
 impl Default for SbiServerConfig {
     fn default() -> Self {
         Self {
-            addr: "127.0.0.1".to_string(),
-            port: 7780,  // UDR default port
+            addr: "0.0.0.0".to_string(),
+            port: 7777,  // Standard SBI port
             tls_enabled: false,
             tls_cert: None,
             tls_key: None,
@@ -131,8 +131,8 @@ mod tests {
     #[test]
     fn test_sbi_server_config_default() {
         let config = SbiServerConfig::default();
-        assert_eq!(config.addr, "127.0.0.1");
-        assert_eq!(config.port, 7780);
+        assert_eq!(config.addr, "0.0.0.0");
+        assert_eq!(config.port, 7777);
         assert!(!config.tls_enabled);
     }
 

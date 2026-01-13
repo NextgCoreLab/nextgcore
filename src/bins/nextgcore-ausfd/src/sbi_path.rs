@@ -24,7 +24,7 @@ impl Default for SbiServerConfig {
     fn default() -> Self {
         Self {
             addr: "127.0.0.1".to_string(),
-            port: 7778,
+            port: 7777,
             tls_enabled: false,
             tls_cert: None,
             tls_key: None,
@@ -253,7 +253,7 @@ mod tests {
     fn test_sbi_server_config_default() {
         let config = SbiServerConfig::default();
         assert_eq!(config.addr, "127.0.0.1");
-        assert_eq!(config.port, 7778);
+        assert_eq!(config.port, 7777);
         assert!(!config.tls_enabled);
     }
 

@@ -1,4 +1,8 @@
 //! PFCP Path Management
+
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 //!
 //! Port of src/smf/pfcp-path.c - PFCP path management for SMF
 //! Handles PFCP session establishment, modification, and deletion requests

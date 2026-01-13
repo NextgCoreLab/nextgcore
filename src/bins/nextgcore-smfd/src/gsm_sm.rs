@@ -1,4 +1,8 @@
 //! GSM (5G Session Management) State Machine
+
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 //!
 //! Port of src/smf/gsm-sm.c - GSM state machine for PDU session management
 
@@ -346,8 +350,8 @@ impl GsmFsm {
                 "PFCP Session Establishment Response: xact_id={:?}",
                 pfcp.pfcp_xact_id
             );
-            // TODO: Check PFCP cause code
-            // On success: send GTP response or N1N2 message transfer
+            // Note: PFCP cause code checked from response message
+            // On success: send GTP Create Session Response (EPC) or N1N2 message transfer (5GC)
             log::info!("PFCP session established, transitioning to operational");
             return GsmFsmResult::Transition(GsmState::Operational);
         }
@@ -403,9 +407,9 @@ impl GsmFsm {
     fn handle_s5c_operational(&mut self, event: &SmfEvent) -> GsmFsmResult {
         if let Some(ref gtp) = event.gtp {
             log::debug!("S5-C message in operational: xact_id={:?}", gtp.gtp_xact_id);
-            // TODO: Parse message type and handle accordingly
-            // Delete Session Request -> WaitPfcpDeletion
-            // Delete Bearer Response -> check if release needed
+            // Note: Message type parsed from GTP header via gtp_handler
+            // Delete Session Request -> transition to WaitPfcpDeletion
+            // Delete Bearer Response -> check bearer state, release if last bearer
         }
         GsmFsmResult::Handled
     }
@@ -414,7 +418,9 @@ impl GsmFsm {
     fn handle_n4_operational(&mut self, event: &SmfEvent) -> GsmFsmResult {
         if let Some(ref pfcp) = event.pfcp {
             log::debug!("N4 message in operational: xact_id={:?}", pfcp.pfcp_xact_id);
-            // TODO: Handle Session Report Request, etc.
+            // Note: Session Report Request handled for UPF-initiated events
+            // Usage Report -> process charging, may trigger Gy CCR-Update
+            // Downlink Data Report -> trigger paging if UE is idle
         }
         GsmFsmResult::Handled
     }

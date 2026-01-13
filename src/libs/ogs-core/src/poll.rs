@@ -513,8 +513,8 @@ pub fn ogs_pollset_destroy(pollset: OgsPollset) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    
+    
 
     #[test]
     fn test_pollset_create() {

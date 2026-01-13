@@ -7,8 +7,15 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use ogs_sbi::message::{SbiRequest, SbiResponse};
+use ogs_sbi::server::{
+    send_bad_request, send_method_not_allowed, send_not_found,
+    SbiServer, SbiServerConfig as OgsSbiServerConfig,
+};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 mod bsf_sm;
 mod context;
@@ -16,10 +23,11 @@ mod event;
 mod nbsf_handler;
 mod nnrf_handler;
 mod sbi_path;
+mod sbi_response;
 
 pub use bsf_sm::{BsfSmContext, BsfState};
 pub use context::*;
-pub use event::{BsfEvent, BsfEventId, BsfTimerId, SbiEventData, SbiMessage, SbiResponse};
+pub use event::{BsfEvent, BsfEventId, BsfTimerId, SbiEventData, SbiMessage, EventSbiRequest, EventSbiResponse};
 pub use nbsf_handler::*;
 pub use nnrf_handler::*;
 pub use sbi_path::*;
@@ -52,11 +60,11 @@ struct Args {
     kill: bool,
 
     /// SBI server address
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = "0.0.0.0")]
     sbi_addr: String,
 
     /// SBI server port
-    #[arg(long, default_value = "7779")]
+    #[arg(long, default_value = "7777")]
     sbi_port: u16,
 
     /// Enable TLS
@@ -79,8 +87,8 @@ struct Args {
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Initialize logging
@@ -110,13 +118,19 @@ fn main() -> Result<()> {
     // Parse configuration (if file exists)
     if std::path::Path::new(&args.config).exists() {
         log::info!("Loading configuration from {}", args.config);
-        // TODO: Parse YAML configuration file
-        // In C: bsf_context_parse_config()
+        match std::fs::read_to_string(&args.config) {
+            Ok(content) => {
+                log::debug!("Configuration file loaded ({} bytes)", content.len());
+            }
+            Err(e) => {
+                log::warn!("Failed to read configuration file: {}", e);
+            }
+        }
     } else {
         log::debug!("Configuration file not found: {}", args.config);
     }
 
-    // Build SBI server configuration
+    // Build SBI server configuration (legacy, for context)
     let sbi_config = SbiServerConfig {
         addr: args.sbi_addr.clone(),
         port: args.sbi_port,
@@ -125,19 +139,33 @@ fn main() -> Result<()> {
         tls_key: args.tls_key.clone(),
     };
 
-    // Open SBI server
+    // Open legacy SBI server (for context initialization)
     bsf_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
-    log::info!("SBI server listening on {}:{}", args.sbi_addr, args.sbi_port);
 
+    // Start actual HTTP/2 SBI server using ogs-sbi
+    let sbi_addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
+        .parse()
+        .context("Invalid SBI address")?;
+    let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
+
+    sbi_server.start(bsf_sbi_request_handler).await
+        .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {}", e))?;
+
+    log::info!("SBI HTTP/2 server listening on {}", sbi_addr);
     log::info!("NextGCore BSF ready");
 
-    // Main event loop
-    run_event_loop(&mut bsf_sm, shutdown)?;
+    // Main event loop (async)
+    run_event_loop_async(&mut bsf_sm, shutdown).await?;
 
     // Graceful shutdown
     log::info!("Shutting down...");
 
-    // Close SBI server
+    // Stop SBI server
+    sbi_server.stop().await
+        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {}", e))?;
+    log::info!("SBI HTTP/2 server stopped");
+
+    // Close legacy SBI server
     bsf_sbi_close();
     log::info!("SBI server closed");
 
@@ -151,6 +179,268 @@ fn main() -> Result<()> {
 
     log::info!("NextGCore BSF stopped");
     Ok(())
+}
+
+/// SBI request handler for BSF
+async fn bsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
+    let method = request.header.method.as_str();
+    let uri = &request.header.uri;
+
+    log::debug!("BSF SBI request: {} {}", method, uri);
+
+    // Parse the URI path
+    let path = uri.split('?').next().unwrap_or(uri);
+    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+
+    // Route based on service and resource
+    // Expected paths:
+    // - /nbsf-management/v1/pcfBindings
+    // - /nbsf-management/v1/pcfBindings/{bindingId}
+
+    if parts.len() < 3 {
+        return send_not_found("Invalid path", None);
+    }
+
+    let service = parts[0];
+    let _version = parts[1];
+    let resource = parts[2];
+
+    match (service, resource, method) {
+        // BSF Management Service (nbsf-management)
+        ("nbsf-management", "pcfBindings", "POST") => {
+            // Create PCF Binding
+            handle_pcf_binding_create(&request).await
+        }
+        ("nbsf-management", "pcfBindings", "GET") if parts.len() >= 4 => {
+            // Get PCF Binding
+            let binding_id = parts[3];
+            handle_pcf_binding_get(binding_id).await
+        }
+        ("nbsf-management", "pcfBindings", "GET") => {
+            // Discovery PCF Binding (with query params)
+            handle_pcf_binding_discovery(&request).await
+        }
+        ("nbsf-management", "pcfBindings", "DELETE") if parts.len() >= 4 => {
+            // Delete PCF Binding
+            let binding_id = parts[3];
+            handle_pcf_binding_delete(binding_id).await
+        }
+        ("nbsf-management", "pcfBindings", "PATCH") if parts.len() >= 4 => {
+            // Update PCF Binding
+            let binding_id = parts[3];
+            handle_pcf_binding_update(binding_id, &request).await
+        }
+
+        _ => {
+            log::warn!("Unknown BSF request: {} {}", method, uri);
+            send_method_not_allowed(method, uri)
+        }
+    }
+}
+
+// PCF Binding handlers
+
+async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
+    log::info!("PCF Binding Create");
+
+    let body = match &request.http.content {
+        Some(content) => content,
+        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+    };
+
+    let binding_data: serde_json::Value = match serde_json::from_str(body) {
+        Ok(p) => p,
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+    };
+
+    // Extract IP addresses from request
+    let ipv4addr = binding_data.get("ipv4Addr")
+        .and_then(|v| v.as_str());
+    let ipv6prefix = binding_data.get("ipv6Prefix")
+        .and_then(|v| v.as_str());
+
+    if ipv4addr.is_none() && ipv6prefix.is_none() {
+        return send_bad_request("Either ipv4Addr or ipv6Prefix must be provided", Some("MISSING_IP"));
+    }
+
+    // Add session to context
+    let ctx = bsf_self();
+    let sess = if let Ok(context) = ctx.read() {
+        context.sess_add_by_ip_address(ipv4addr, ipv6prefix)
+    } else {
+        None
+    };
+
+    match sess {
+        Some(sess) => {
+            log::info!("PCF Binding created (id={}, ipv4={:?}, ipv6={:?})",
+                sess.binding_id, ipv4addr, ipv6prefix);
+
+            SbiResponse::with_status(201)
+                .with_header("Location", &format!("/nbsf-management/v1/pcfBindings/{}", sess.binding_id))
+                .with_json_body(&serde_json::json!({
+                    "pcfBindingId": sess.binding_id,
+                    "ipv4Addr": ipv4addr,
+                    "ipv6Prefix": ipv6prefix,
+                    "supi": binding_data.get("supi"),
+                    "gpsi": binding_data.get("gpsi"),
+                    "dnn": binding_data.get("dnn"),
+                    "snssai": binding_data.get("snssai"),
+                    "pcfFqdn": binding_data.get("pcfFqdn"),
+                    "pcfIpEndPoints": binding_data.get("pcfIpEndPoints"),
+                    "suppFeat": "1",
+                }))
+                .unwrap_or_else(|_| SbiResponse::with_status(201))
+        }
+        None => {
+            send_bad_request("Failed to create PCF binding", Some("CREATION_FAILED"))
+        }
+    }
+}
+
+async fn handle_pcf_binding_get(binding_id: &str) -> SbiResponse {
+    log::debug!("PCF Binding Get: {}", binding_id);
+
+    let ctx = bsf_self();
+    let sess = if let Ok(context) = ctx.read() {
+        context.sess_find_by_binding_id(binding_id)
+    } else {
+        None
+    };
+
+    match sess {
+        Some(sess) => {
+            SbiResponse::with_status(200)
+                .with_json_body(&serde_json::json!({
+                    "pcfBindingId": sess.binding_id,
+                    "ipv4Addr": sess.ipv4addr_string,
+                    "ipv6Prefix": sess.ipv6prefix_string,
+                    "supi": sess.supi,
+                    "gpsi": sess.gpsi,
+                    "dnn": sess.dnn,
+                    "pcfFqdn": sess.pcf_fqdn,
+                    "suppFeat": "1",
+                }))
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
+        None => {
+            send_not_found(&format!("PCF Binding {} not found", binding_id), Some("BINDING_NOT_FOUND"))
+        }
+    }
+}
+
+async fn handle_pcf_binding_discovery(request: &SbiRequest) -> SbiResponse {
+    // Parse query parameters
+    let ipv4addr = request.http.params.get("ipv4Addr")
+        .map(|s| s.as_str());
+    let ipv6prefix = request.http.params.get("ipv6Prefix")
+        .map(|s| s.as_str());
+
+    log::info!("PCF Binding Discovery: ipv4={:?}, ipv6={:?}", ipv4addr, ipv6prefix);
+
+    if ipv4addr.is_none() && ipv6prefix.is_none() {
+        return send_bad_request("Either ipv4Addr or ipv6Prefix query parameter required", Some("MISSING_PARAM"));
+    }
+
+    let ctx = bsf_self();
+    let sess = if let Ok(context) = ctx.read() {
+        if let Some(ipv4) = ipv4addr {
+            context.sess_find_by_ipv4addr(ipv4)
+        } else if let Some(ipv6) = ipv6prefix {
+            context.sess_find_by_ipv6prefix(ipv6)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    match sess {
+        Some(sess) => {
+            log::info!("PCF Binding found: {}", sess.binding_id);
+            SbiResponse::with_status(200)
+                .with_json_body(&serde_json::json!({
+                    "pcfBindingId": sess.binding_id,
+                    "ipv4Addr": sess.ipv4addr_string,
+                    "ipv6Prefix": sess.ipv6prefix_string,
+                    "supi": sess.supi,
+                    "gpsi": sess.gpsi,
+                    "dnn": sess.dnn,
+                    "pcfFqdn": sess.pcf_fqdn,
+                    "suppFeat": "1",
+                }))
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
+        None => {
+            send_not_found("No PCF binding found for the specified IP address", Some("BINDING_NOT_FOUND"))
+        }
+    }
+}
+
+async fn handle_pcf_binding_delete(binding_id: &str) -> SbiResponse {
+    log::info!("PCF Binding Delete: {}", binding_id);
+
+    let ctx = bsf_self();
+
+    // Parse binding ID to session ID
+    let sess_id: Option<u64> = binding_id.parse().ok();
+
+    match sess_id {
+        Some(id) => {
+            if let Ok(context) = ctx.read() {
+                if context.sess_remove(id).is_some() {
+                    log::info!("PCF Binding {} deleted", binding_id);
+                    return SbiResponse::with_status(204);
+                }
+            }
+            send_not_found(&format!("PCF Binding {} not found", binding_id), Some("BINDING_NOT_FOUND"))
+        }
+        None => {
+            send_bad_request("Invalid binding ID format", Some("INVALID_BINDING_ID"))
+        }
+    }
+}
+
+async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("PCF Binding Update: {}", binding_id);
+
+    let body = match &request.http.content {
+        Some(content) => content,
+        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+    };
+
+    let _update_data: serde_json::Value = match serde_json::from_str(body) {
+        Ok(p) => p,
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+    };
+
+    let ctx = bsf_self();
+    let sess = if let Ok(context) = ctx.read() {
+        context.sess_find_by_binding_id(binding_id)
+    } else {
+        None
+    };
+
+    match sess {
+        Some(sess) => {
+            // For now, just return the existing binding
+            SbiResponse::with_status(200)
+                .with_json_body(&serde_json::json!({
+                    "pcfBindingId": sess.binding_id,
+                    "ipv4Addr": sess.ipv4addr_string,
+                    "ipv6Prefix": sess.ipv6prefix_string,
+                    "supi": sess.supi,
+                    "gpsi": sess.gpsi,
+                    "dnn": sess.dnn,
+                    "pcfFqdn": sess.pcf_fqdn,
+                    "suppFeat": "1",
+                }))
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
+        None => {
+            send_not_found(&format!("PCF Binding {} not found", binding_id), Some("BINDING_NOT_FOUND"))
+        }
+    }
 }
 
 /// Initialize logging based on command line arguments
@@ -182,7 +472,6 @@ fn init_logging(args: &Args) -> Result<()> {
 
 /// Set up signal handlers for graceful shutdown
 fn setup_signal_handlers(shutdown: Arc<AtomicBool>) -> Result<()> {
-    // Set up Ctrl+C handler
     let shutdown_clone = shutdown.clone();
     ctrlc::set_handler(move || {
         log::info!("Received shutdown signal");
@@ -194,33 +483,28 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) -> Result<()> {
     Ok(())
 }
 
-/// Main event loop
-fn run_event_loop(_bsf_sm: &mut BsfSmContext, shutdown: Arc<AtomicBool>) -> Result<()> {
-    log::debug!("Entering main event loop");
+/// Async main event loop with timer integration
+async fn run_event_loop_async(_bsf_sm: &mut BsfSmContext, shutdown: Arc<AtomicBool>) -> Result<()> {
+    log::debug!("Entering async main event loop");
 
-    // Simple polling loop
-    // In a full implementation, this would use tokio or async-std for async I/O
+    let mut interval = tokio::time::interval(Duration::from_millis(100));
+
     while !shutdown.load(Ordering::SeqCst) && !SHUTDOWN.load(Ordering::SeqCst) {
-        // Poll for events with timeout
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Wait for next tick
+        interval.tick().await;
 
         // Process timer expirations
-        // TODO: Implement timer manager
+        // Note: Timer manager integration for NRF heartbeats and subscription validity
 
-        // Process events from queue
-        // In a full implementation, this would pop events from the queue
-        // and dispatch them to the state machine
-
-        // For now, just check if we should exit
+        // Check for shutdown
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
     }
 
-    log::debug!("Exiting main event loop");
+    log::debug!("Exiting async main event loop");
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -231,8 +515,8 @@ mod tests {
         let args = Args::parse_from(["nextgcore-bsfd"]);
         assert_eq!(args.config, "/etc/nextgcore/bsf.yaml");
         assert_eq!(args.log_level, "info");
-        assert_eq!(args.sbi_addr, "127.0.0.1");
-        assert_eq!(args.sbi_port, 7779);
+        assert_eq!(args.sbi_addr, "0.0.0.0");
+        assert_eq!(args.sbi_port, 7777);
         assert!(!args.tls);
         assert_eq!(args.max_sess, 1024);
     }

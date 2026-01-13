@@ -1,4 +1,8 @@
 //! GTP-C Message Handling
+
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 //!
 //! Port of src/smf/s5c-handler.c - GTP-C message handling for SMF
 //! Handles GTPv2-C (S5/S8) request and response processing

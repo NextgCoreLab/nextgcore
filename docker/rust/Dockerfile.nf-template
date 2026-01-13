@@ -28,7 +28,11 @@ WORKDIR /app
 # =============================================================================
 FROM chef AS planner
 
-COPY src/ ./
+# Copy nextgsim first (needed for nextgsim-ngap dependency)
+COPY nextgsim /nextgsim
+
+# Copy nextgcore source
+COPY nextgcore/src/ ./
 RUN cargo chef prepare --recipe-path recipe.json
 
 # =============================================================================
@@ -38,7 +42,7 @@ FROM chef AS builder
 
 ARG NF_NAME
 
-# Install build dependencies
+# Install build dependencies and rustfmt (needed for ASN.1 code generation)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     pkg-config \
@@ -53,16 +57,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 \
     clang \
     libclang-dev \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup component add rustfmt
 
 WORKDIR /app
+
+# Copy nextgsim first (needed for nextgsim-ngap dependency during chef cook)
+COPY nextgsim /nextgsim
 
 # Build dependencies first (cached)
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
 # Copy source and build specific NF
-COPY src/ ./
+COPY nextgcore/src/ ./
 RUN cargo build --release -p ${NF_NAME}
 
 # Strip debug symbols

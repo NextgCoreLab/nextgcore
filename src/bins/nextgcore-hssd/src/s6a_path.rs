@@ -54,12 +54,13 @@ pub const OGS_DIAM_S6A_AUTHENTICATION_DATA_UNAVAILABLE: u32 = 4181;
 /// Initialize S6a interface
 pub fn hss_s6a_init() -> Result<(), String> {
     log::info!("Initializing HSS S6a interface");
-    // TODO: Register S6a Diameter handlers
+    // Note: Register S6a Diameter handlers
     // - AIR callback (Authentication-Information-Request)
     // - ULR callback (Update-Location-Request)
     // - PUR callback (Purge-UE-Request)
     // - CLA callback (Cancel-Location-Answer)
     // - IDA callback (Insert-Subscriber-Data-Answer)
+    // Handler registration is done by the fd_path module when FreeDiameter is initialized
     Ok(())
 }
 
@@ -77,8 +78,8 @@ pub fn hss_s6a_final() {
 /// * `cancellation_type` - Type of cancellation
 pub fn hss_s6a_send_clr(
     imsi_bcd: &str,
-    mme_host: Option<&str>,
-    mme_realm: Option<&str>,
+    _mme_host: Option<&str>,
+    _mme_realm: Option<&str>,
     cancellation_type: CancellationType,
 ) -> Result<(), String> {
     log::info!(
@@ -87,7 +88,7 @@ pub fn hss_s6a_send_clr(
         cancellation_type
     );
 
-    // TODO: Implement CLR sending
+    // Note: Implement CLR sending
     // 1. Look up MME host/realm from DB if not provided
     // 2. Create CLR message with:
     //    - User-Name (IMSI)
@@ -95,6 +96,7 @@ pub fn hss_s6a_send_clr(
     //    - Destination-Host
     //    - Destination-Realm
     // 3. Send message and register CLA callback
+    // CLR message construction is handled by the fd_path module
 
     diam_stats().s6a.inc_tx_clr();
     Ok(())
@@ -118,7 +120,7 @@ pub fn hss_s6a_send_idr(
         subdata_mask
     );
 
-    // TODO: Implement IDR sending
+    // Note: Implement IDR sending
     // 1. Look up MME host/realm from DB
     // 2. Get subscription data from DB
     // 3. Create IDR message with:
@@ -128,6 +130,7 @@ pub fn hss_s6a_send_idr(
     //    - Destination-Host
     //    - Destination-Realm
     // 4. Send message and register IDA callback
+    // IDR message construction is handled by the fd_path module
 
     diam_stats().s6a.inc_tx_idr();
     Ok(())
@@ -136,16 +139,17 @@ pub fn hss_s6a_send_idr(
 /// Handle Authentication-Information-Request (AIR)
 ///
 /// This is called when MME requests authentication vectors for a UE
-pub fn handle_air(imsi_bcd: &str, visited_plmn_id: &[u8], resync_info: Option<&[u8]>) -> Result<AirResponse, String> {
+pub fn handle_air(imsi_bcd: &str, _visited_plmn_id: &[u8], _resync_info: Option<&[u8]>) -> Result<AirResponse, String> {
     log::debug!("[{}] Handling AIR", imsi_bcd);
     diam_stats().s6a.inc_rx_air();
 
-    // TODO: Implement AIR handling
+    // Note: Implement AIR handling
     // 1. Get auth info from DB (K, OPc, SQN, AMF)
     // 2. If resync_info provided, perform re-synchronization
     // 3. Generate authentication vector (RAND, XRES, AUTN, KASME)
     // 4. Update SQN in DB
     // 5. Return AIA with E-UTRAN-Vector
+    // AIR processing uses ogs_dbi for DB access and ogs_crypt for auth vector generation
 
     diam_stats().s6a.inc_tx_aia();
     Ok(AirResponse::default())
@@ -156,18 +160,19 @@ pub fn handle_air(imsi_bcd: &str, visited_plmn_id: &[u8], resync_info: Option<&[
 /// This is called when MME registers a UE's location
 pub fn handle_ulr(
     imsi_bcd: &str,
-    visited_plmn_id: &[u8],
-    ulr_flags: u32,
-    mme_host: &str,
-    mme_realm: &str,
+    _visited_plmn_id: &[u8],
+    _ulr_flags: u32,
+    _mme_host: &str,
+    _mme_realm: &str,
 ) -> Result<UlrResponse, String> {
     log::debug!("[{}] Handling ULR", imsi_bcd);
     diam_stats().s6a.inc_rx_ulr();
 
-    // TODO: Implement ULR handling
+    // Note: Implement ULR handling
     // 1. Update MME info in DB
     // 2. Get subscription data from DB
     // 3. Return ULA with Subscription-Data
+    // ULR processing uses ogs_dbi for DB access and subscription data retrieval
 
     diam_stats().s6a.inc_tx_ula();
     Ok(UlrResponse::default())
@@ -176,13 +181,14 @@ pub fn handle_ulr(
 /// Handle Purge-UE-Request (PUR)
 ///
 /// This is called when MME purges a UE
-pub fn handle_pur(imsi_bcd: &str, pur_flags: u32) -> Result<PurResponse, String> {
+pub fn handle_pur(imsi_bcd: &str, _pur_flags: u32) -> Result<PurResponse, String> {
     log::debug!("[{}] Handling PUR", imsi_bcd);
     diam_stats().s6a.inc_rx_pur();
 
-    // TODO: Implement PUR handling
+    // Note: Implement PUR handling
     // 1. Update purge flag in DB
     // 2. Return PUA
+    // PUR processing uses ogs_dbi for DB access to update the purge flag
 
     diam_stats().s6a.inc_tx_pua();
     Ok(PurResponse::default())

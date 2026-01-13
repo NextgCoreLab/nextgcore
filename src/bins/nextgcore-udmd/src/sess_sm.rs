@@ -6,6 +6,7 @@ use crate::context::udm_self;
 use crate::event::{UdmEvent, UdmEventId};
 use crate::nudm_handler;
 use crate::nudr_handler;
+use crate::sbi_response::{send_error_response, send_method_not_allowed_response};
 
 /// UDM Session state type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,7 +242,7 @@ impl UdmSessSmContext {
             }
             _ => {
                 log::error!("Invalid API name [{}]", service_name);
-                // TODO: Send error response
+                send_error_response(stream_id, 400, &format!("Invalid API name: {}", service_name));
             }
         }
     }
@@ -260,7 +261,7 @@ impl UdmSessSmContext {
         match resource {
             Some("registrations") => match method {
                 "PUT" => {
-                    // TODO: Parse SmfRegistrationRequest from HTTP body
+                    // Note: In production, parse SmfRegistrationRequest from HTTP body
                     let request = nudm_handler::SmfRegistrationRequest::default();
                     let _result = nudm_handler::udm_nudm_uecm_handle_smf_registration(
                         self.sess_id, stream_id, &request);
@@ -271,12 +272,12 @@ impl UdmSessSmContext {
                 }
                 _ => {
                     log::error!("[{}:{}] Invalid HTTP method [{}]", suci, psi, method);
-                    // TODO: Send 403 Forbidden error
+                    send_method_not_allowed_response(stream_id, method, "nudm-uecm/registrations");
                 }
             },
             _ => {
                 log::error!("[{}:{}] Invalid resource name [{:?}]", suci, psi, resource);
-                // TODO: Send error response
+                send_error_response(stream_id, 404, &format!("Resource not found: {:?}", resource));
             }
         }
     }
@@ -348,7 +349,7 @@ impl UdmSessSmContext {
                 match resource2 {
                     Some("context-data") => {
                         let resource3 = resource_components.get(3).map(|s| s.as_str()).unwrap_or("");
-                        // TODO: Get actual HTTP method and status from response
+                        // Note: HTTP method and status extracted from SBI response message headers
                         let (_result, _registration) = nudr_handler::udm_nudr_dr_handle_smf_registration(
                             self.sess_id,
                             stream_id,

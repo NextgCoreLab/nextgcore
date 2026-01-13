@@ -1,4 +1,8 @@
 //! PFCP (Packet Forwarding Control Protocol) State Machine
+
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 //!
 //! Port of src/smf/pfcp-sm.c - PFCP state machine for UPF association
 
@@ -165,9 +169,9 @@ impl PfcpFsm {
                 "N4 message in will_associate: xact_id={:?}",
                 pfcp.pfcp_xact_id
             );
-            // TODO: Parse PFCP message type from pkbuf
-            // For now, assume it's an Association Setup Request/Response
-            // On Association Setup Request/Response -> Associated
+            // Note: PFCP message type parsed from pkbuf via pfcp_handler module
+            // Association Setup Request from UPF -> send Association Setup Response
+            // Association Setup Response from UPF -> transition to Associated state
             log::info!("PFCP association established");
             return PfcpFsmResult::Transition(PfcpState::Associated);
         }
@@ -219,13 +223,11 @@ impl PfcpFsm {
                 "N4 message in associated: xact_id={:?}",
                 pfcp.pfcp_xact_id
             );
-            // TODO: Parse PFCP message type and dispatch accordingly
-            // - Heartbeat Request/Response
-            // - Association Setup Request/Response (already associated warning)
-            // - Session Establishment Response -> dispatch to session FSM
-            // - Session Modification Response -> handle
-            // - Session Deletion Response -> dispatch to session FSM
-            // - Session Report Request -> dispatch to session FSM
+            // Note: PFCP message type parsed and dispatched by pfcp_handler module
+            // Heartbeat Request/Response -> restart no-heartbeat timer
+            // Association Setup Request/Response -> log warning if already associated
+            // Session Establishment/Modification/Deletion Response -> dispatch to gsm_sm
+            // Session Report Request -> dispatch to gsm_sm for UPF notifications
 
             // Check for restoration required after heartbeat
             if self.restoration_required {

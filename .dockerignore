@@ -1,0 +1,48 @@
+# Rust build artifacts
+target/
+src/target/
+**/target/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+
+# Documentation build
+docs/_build/
+
+# Local development
+*.log
+*.tmp
+.env
+.env.local
+
+# macOS
+.DS_Store
+
+# Docker build cache
+docker/rust/build-cache/
+
+# Test artifacts
+*.profraw
+*.profdata
+
+# Cargo lock for libraries (keep for binaries)
+# Cargo.lock
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
+
+# Misc
+README.md
+LICENSE
+CHANGELOG.md
+*.md

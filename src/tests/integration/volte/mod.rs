@@ -10,7 +10,6 @@
 //!
 //! Reference: 3GPP TS 23.228 (IMS), 3GPP TS 24.229, 3GPP TS 23.401
 
-use std::time::Duration;
 
 /// QCI values for VoLTE
 pub mod qci {

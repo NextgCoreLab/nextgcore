@@ -19,5 +19,5 @@ nrf:
   sbi:
     server:
       - address: 0.0.0.0
-        advertise: 172.22.0.10
+        advertise: 172.23.0.10
         port: 7777

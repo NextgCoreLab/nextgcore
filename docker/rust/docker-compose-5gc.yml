@@ -60,8 +60,8 @@ services:
   # Central registry for NF discovery and management
   nrf:
     build:
-      context: ../..
-      dockerfile: docker/rust/Dockerfile.nf-template
+      context: ../../..
+      dockerfile: nextgcore/docker/rust/Dockerfile.nf-template
       args:
         NF_NAME: nextgcore-nrfd
     image: nextgcore-rust/nrf:latest
@@ -89,8 +89,8 @@ services:
   # Handles UE authentication
   ausf:
     build:
-      context: ../..
-      dockerfile: docker/rust/Dockerfile.nf-template
+      context: ../../..
+      dockerfile: nextgcore/docker/rust/Dockerfile.nf-template
       args:
         NF_NAME: nextgcore-ausfd
     image: nextgcore-rust/ausf:latest
@@ -115,8 +115,8 @@ services:
   # Manages subscriber data and authentication credentials
   udm:
     build:
-      context: ../..
-      dockerfile: docker/rust/Dockerfile.nf-template
+      context: ../../..
+      dockerfile: nextgcore/docker/rust/Dockerfile.nf-template
       args:
         NF_NAME: nextgcore-udmd
     image: nextgcore-rust/udm:latest
@@ -142,8 +142,8 @@ services:
   # Stores subscriber and policy data in MongoDB
   udr:
     build:
-      context: ../..
-      dockerfile: docker/rust/Dockerfile.nf-template
+      context: ../../..
+      dockerfile: nextgcore/docker/rust/Dockerfile.nf-template
       args:
         NF_NAME: nextgcore-udrd
     image: nextgcore-rust/udr:latest
@@ -169,8 +169,8 @@ services:
   # Manages policy rules and QoS
   pcf:
     build:
-      context: ../..
-      dockerfile: docker/rust/Dockerfile.nf-template
+      context: ../../..
+      dockerfile: nextgcore/docker/rust/Dockerfile.nf-template
       args:
         NF_NAME: nextgcore-pcfd
     image: nextgcore-rust/pcf:latest
@@ -198,8 +198,8 @@ services:
   # Selects network slices for UEs
   nssf:
     build:
-      context: ../..
-      dockerfile: docker/rust/Dockerfile.nf-template
+      context: ../../..
+      dockerfile: nextgcore/docker/rust/Dockerfile.nf-template
       args:
         NF_NAME: nextgcore-nssfd
     image: nextgcore-rust/nssf:latest
@@ -224,8 +224,8 @@ services:
   # Manages PCF bindings for UE sessions
   bsf:
     build:
-      context: ../..
-      dockerfile: docker/rust/Dockerfile.nf-template
+      context: ../../..
+      dockerfile: nextgcore/docker/rust/Dockerfile.nf-template
       args:
         NF_NAME: nextgcore-bsfd
     image: nextgcore-rust/bsf:latest
@@ -255,8 +255,8 @@ services:
   # Handles UE registration, mobility, and connection management
   amf:
     build:
-      context: ../..
-      dockerfile: docker/rust/Dockerfile.nf-template
+      context: ../../..
+      dockerfile: nextgcore/docker/rust/Dockerfile.nf-template
       args:
         NF_NAME: nextgcore-amfd
     image: nextgcore-rust/amf:latest
@@ -288,8 +288,8 @@ services:
   # Manages PDU sessions and UPF selection
   smf:
     build:
-      context: ../..
-      dockerfile: docker/rust/Dockerfile.nf-template
+      context: ../../..
+      dockerfile: nextgcore/docker/rust/Dockerfile.nf-template
       args:
         NF_NAME: nextgcore-smfd
     image: nextgcore-rust/smf:latest
@@ -323,8 +323,8 @@ services:
   # Handles user data forwarding and packet processing
   upf:
     build:
-      context: ../..
-      dockerfile: docker/rust/Dockerfile.nf-template
+      context: ../../..
+      dockerfile: nextgcore/docker/rust/Dockerfile.nf-template
       args:
         NF_NAME: nextgcore-upfd
     image: nextgcore-rust/upf:latest

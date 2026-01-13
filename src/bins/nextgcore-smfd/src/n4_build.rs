@@ -1,6 +1,11 @@
 //! SMF N4 (PFCP) Message Building
 //!
 //! Port of src/smf/n4-build.c - PFCP message building for SMF
+//!
+//! Note: Many constants and types in this module are defined for completeness
+//! per 3GPP TS 29.244 but may not yet be used in the current implementation.
+
+#![allow(dead_code)]
 
 use bytes::{BufMut, BytesMut};
 

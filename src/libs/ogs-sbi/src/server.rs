@@ -329,20 +329,65 @@ pub fn send_error(
     cause: Option<&str>,
 ) -> SbiResponse {
     use crate::message::ProblemDetails;
-    
+
     let problem = ProblemDetails::with_status(status as i32)
         .with_title(title)
         .with_detail(detail);
-    
+
     let problem = if let Some(c) = cause {
         problem.with_cause(c)
     } else {
         problem
     };
-    
+
     SbiResponse::with_status(status)
         .with_json_body(&problem)
         .unwrap_or_else(|_| SbiResponse::with_status(status))
+}
+
+/// Send a 400 Bad Request error response
+pub fn send_bad_request(detail: &str, cause: Option<&str>) -> SbiResponse {
+    send_error(400, "Bad Request", detail, cause)
+}
+
+/// Send a 401 Unauthorized error response
+pub fn send_unauthorized(detail: &str, cause: Option<&str>) -> SbiResponse {
+    send_error(401, "Unauthorized", detail, cause)
+}
+
+/// Send a 403 Forbidden error response
+pub fn send_forbidden(detail: &str, cause: Option<&str>) -> SbiResponse {
+    send_error(403, "Forbidden", detail, cause)
+}
+
+/// Send a 404 Not Found error response
+pub fn send_not_found(detail: &str, cause: Option<&str>) -> SbiResponse {
+    send_error(404, "Not Found", detail, cause)
+}
+
+/// Send a 405 Method Not Allowed error response
+pub fn send_method_not_allowed(method: &str, resource: &str) -> SbiResponse {
+    send_error(
+        405,
+        "Method Not Allowed",
+        &format!("Method {} not allowed for resource {}", method, resource),
+        Some("METHOD_NOT_ALLOWED"),
+    )
+}
+
+/// Send a 500 Internal Server Error response
+pub fn send_internal_error(detail: &str) -> SbiResponse {
+    send_error(500, "Internal Server Error", detail, Some("INTERNAL_ERROR"))
+}
+
+/// Send a 503 Service Unavailable error response
+pub fn send_service_unavailable(detail: &str) -> SbiResponse {
+    send_error(503, "Service Unavailable", detail, Some("SERVICE_UNAVAILABLE"))
+}
+
+/// Send a 504 Gateway Timeout error response
+pub fn send_gateway_timeout(detail: &str) -> SbiResponse {
+    send_error(504, "Gateway Timeout", detail, Some("GATEWAY_TIMEOUT"))
 }
 
 #[cfg(test)]

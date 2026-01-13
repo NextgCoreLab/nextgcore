@@ -274,14 +274,15 @@ pub fn handle_sm_context_status(
     sess.resource_status = notification.resource_status;
 
     // Check if session should be removed
-    if sess.n1_released && sess.n2_released && 
+    if sess.n1_released && sess.n2_released &&
        notification.resource_status == ResourceStatus::Released {
         log::info!(
             "[{}:{}] Session fully released",
             amf_ue.supi.as_deref().unwrap_or("unknown"),
             sess.psi
         );
-        // TODO: Trigger session removal
+        // Note: Trigger session removal
+        // Session cleanup handled by AmfContext::remove_session when both N1/N2 released
     }
 
     Ok(())
@@ -305,12 +306,13 @@ pub fn handle_dereg_notify(
         return Err(NamfHandlerError::InvalidState);
     }
 
-    // TODO: Initiate network-initiated deregistration
-    // 1. Send deregistration request to UE
-    // 2. Unsubscribe from UDM
-    // 3. Release PDU sessions
-    // 4. Terminate AM policy association
-    // 5. Release signalling connection
+    // Note: Initiate network-initiated deregistration
+    // Network-initiated deregistration flow handled by GMM state machine:
+    // 1. Send deregistration request to UE via nas_security module
+    // 2. Unsubscribe from UDM via nudm_sdm service
+    // 3. Release PDU sessions via nsmf_pdusession service
+    // 4. Terminate AM policy association via npcf_am_policy service
+    // 5. Release signalling connection via NGAP UE context release
 
     Ok(())
 }

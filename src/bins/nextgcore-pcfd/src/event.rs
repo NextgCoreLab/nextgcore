@@ -73,25 +73,25 @@ impl PcfTimerId {
 /// SBI message data for events
 #[derive(Debug, Clone, Default)]
 pub struct SbiEventData {
-    pub request: Option<SbiRequest>,
-    pub response: Option<SbiResponse>,
+    pub request: Option<EventSbiRequest>,
+    pub response: Option<EventSbiResponse>,
     pub message: Option<SbiMessage>,
     pub stream_id: Option<u64>,
     pub data: Option<u64>,
     pub state: Option<i32>,
 }
 
-/// Simplified SBI request representation
+/// Simplified SBI request representation for events
 #[derive(Debug, Clone)]
-pub struct SbiRequest {
+pub struct EventSbiRequest {
     pub method: String,
     pub uri: String,
     pub body: Option<String>,
 }
 
-/// Simplified SBI response representation
+/// Simplified SBI response representation for events
 #[derive(Debug, Clone)]
-pub struct SbiResponse {
+pub struct EventSbiResponse {
     pub status: u16,
     pub body: Option<String>,
 }
@@ -151,7 +151,7 @@ impl PcfEvent {
         Self::new(PcfEventId::FsmExit)
     }
 
-    pub fn sbi_server(stream_id: u64, request: SbiRequest) -> Self {
+    pub fn sbi_server(stream_id: u64, request: EventSbiRequest) -> Self {
         Self {
             id: PcfEventId::SbiServer,
             timer_id: None,
@@ -169,7 +169,7 @@ impl PcfEvent {
         }
     }
 
-    pub fn sbi_client(response: SbiResponse, data: u64) -> Self {
+    pub fn sbi_client(response: EventSbiResponse, data: u64) -> Self {
         Self {
             id: PcfEventId::SbiClient,
             timer_id: None,

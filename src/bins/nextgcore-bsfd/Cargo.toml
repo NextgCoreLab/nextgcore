@@ -18,6 +18,8 @@ log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+serde_json.workspace = true
+uuid = { version = "1.6", features = ["v4"] }
 clap = { version = "4.0", features = ["derive"] }
 ctrlc = "3.4"
 

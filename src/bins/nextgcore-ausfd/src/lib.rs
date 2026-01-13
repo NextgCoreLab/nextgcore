@@ -14,6 +14,7 @@ pub mod nausf_handler;
 pub mod nudm_build;
 pub mod nudm_handler;
 pub mod sbi_path;
+pub mod sbi_response;
 pub mod timer;
 pub mod ue_sm;
 

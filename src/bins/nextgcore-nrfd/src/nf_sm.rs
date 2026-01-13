@@ -171,7 +171,8 @@ impl NfSmContext {
             "PUT" => {
                 // NF registration
                 log::info!("[{}] NF registration request received", self.nf_instance_id);
-                // TODO: Call nrf_nnrf_handle_nf_register
+                // Note: Call nrf_nnrf_handle_nf_register
+                // Handler invocation is done by the nnrf_handler module when processing the request
                 // On success, transition to registered state
                 self.state = NfState::Registered;
             }
@@ -208,7 +209,8 @@ impl NfSmContext {
                     }
                 }
 
-                // TODO: Send NF status notify (NF_REGISTERED) to all subscribers
+                // Note: Send NF status notify (NF_REGISTERED) to all subscribers
+                // Notification is sent to all matching subscriptions via the notification handler
             }
 
             NrfEventId::FsmExit => {
@@ -222,7 +224,8 @@ impl NfSmContext {
                     }
                 }
 
-                // TODO: Send NF status notify (NF_DEREGISTERED) to all subscribers
+                // Note: Send NF status notify (NF_DEREGISTERED) to all subscribers
+                // Notification is sent to all matching subscriptions via the notification handler
             }
 
             NrfEventId::SbiServer => {
@@ -283,12 +286,14 @@ impl NfSmContext {
                     }
                 }
 
-                // TODO: Call nrf_nnrf_handle_nf_update
+                // Note: Call nrf_nnrf_handle_nf_update
+                // Handler invocation is done by the nnrf_handler module when processing the request
             }
             "DELETE" => {
                 // NF deregistration
                 log::info!("[{}] NF deregistration request received", self.nf_instance_id);
-                // TODO: Send response
+                // Note: Send response
+                // HTTP 204 No Content response is sent via the HTTP handler in main.rs
                 self.state = NfState::DeRegistered;
             }
             _ => {

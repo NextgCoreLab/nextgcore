@@ -25,6 +25,7 @@ serde_json.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 ctrlc = "3.4"
 clap = { version = "4.4", features = ["derive"] }
+ogs-sbi = { path = "../../libs/ogs-sbi" }
 
 [dev-dependencies]
 proptest.workspace = true

@@ -12,6 +12,7 @@
 //! - `volte`: Voice over LTE call flows and IMS procedures
 //! - `handover`: Mobility procedures (X2, S1, Xn, N2, inter-RAT)
 //! - `slicing`: 5G network slicing (S-NSSAI, NSSF, slice QoS)
+//! - `pfcp`: PFCP N4 interface tests (SMF-UPF communication)
 
 pub mod common;
 pub mod registration;
@@ -21,6 +22,7 @@ pub mod property;
 pub mod volte;
 pub mod handover;
 pub mod slicing;
+pub mod pfcp;
 
 // Re-export common test utilities
 pub use common::*;

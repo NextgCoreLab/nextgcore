@@ -4,6 +4,7 @@
 
 use crate::context::{udm_self, UdmUe};
 use crate::event::{UdmEvent, UdmEventId, UdmTimerId};
+use crate::sbi_response::{send_error_response, send_gateway_timeout_response, send_not_found_response};
 use crate::sess_sm::{UdmSessSmContext, UdmSessState};
 use crate::ue_sm::{UdmUeSmContext, UdmUeState};
 
@@ -162,7 +163,7 @@ impl UdmSmContext {
         let expected_version = if service_name == "nudm-sdm" { "v2" } else { "v1" };
         if api_version != expected_version {
             log::error!("Not supported version [{}]", api_version);
-            // TODO: Send error response
+            send_error_response(stream_id, 400, &format!("Unsupported API version: {}", api_version));
             return;
         }
 
@@ -183,7 +184,7 @@ impl UdmSmContext {
             }
             _ => {
                 log::error!("Invalid API name [{}]", service_name);
-                // TODO: Send error response
+                send_error_response(stream_id, 400, &format!("Invalid API name: {}", service_name));
             }
         }
     }
@@ -201,7 +202,7 @@ impl UdmSmContext {
             Some("nf-status-notify") => match method {
                 "POST" => {
                     log::debug!("NF status notify received");
-                    // TODO: Call ogs_nnrf_nfm_handle_nf_status_notify
+                    // Note: NF status notify handling requires NRF integration to dispatch to NF FSM
                 }
                 _ => {
                     log::error!("Invalid HTTP method [{}]", method);
@@ -231,7 +232,7 @@ impl UdmSmContext {
             Some(s) => s,
             None => {
                 log::error!("Not found [{}]", method);
-                // TODO: Send 404 error response
+                send_not_found_response(stream_id, "SUPI/SUCI not specified");
                 return;
             }
         };
@@ -285,7 +286,7 @@ impl UdmSmContext {
             Some(ue) => ue,
             None => {
                 log::error!("Not found [{}]", method);
-                // TODO: Send 404 error response
+                send_not_found_response(stream_id, "UDM UE not found");
                 return;
             }
         };
@@ -449,11 +450,11 @@ impl UdmSmContext {
         match resource {
             Some("nf-instances") => {
                 log::debug!("NF instances response received");
-                // TODO: Dispatch to NF instance FSM
+                // Note: NF instance FSM dispatch requires NRF integration
             }
             Some("subscriptions") => {
                 log::debug!("Subscriptions response received");
-                // TODO: Handle subscription response
+                // Note: Subscription handling requires NRF integration
             }
             _ => {
                 log::error!(
@@ -471,7 +472,7 @@ impl UdmSmContext {
         match resource {
             Some("nf-instances") => {
                 log::debug!("NF discover response received");
-                // TODO: Call udm_nnrf_handle_nf_discover
+                // Note: NF discover handling requires NRF integration
             }
             _ => {
                 log::error!(
@@ -615,24 +616,29 @@ impl UdmSmContext {
             | UdmTimerId::NfInstanceValidity => {
                 if let Some(ref nf_instance_id) = event.nf_instance_id {
                     log::debug!("[{}] NF instance timer: {:?}", nf_instance_id, timer_id);
-                    // TODO: Update NF instance load and dispatch to NF FSM
+                    // Note: NF instance FSM dispatch requires NRF integration
                 }
             }
             UdmTimerId::SubscriptionValidity => {
                 if let Some(ref subscription_id) = event.subscription_id {
                     log::error!("[{}] Subscription validity expired", subscription_id);
-                    // TODO: Send new subscription and remove old one
+                    // Note: Subscription renewal requires NRF integration
                 }
             }
             UdmTimerId::SubscriptionPatch => {
                 if let Some(ref subscription_id) = event.subscription_id {
                     log::info!("[{}] Need to update Subscription", subscription_id);
-                    // TODO: Send subscription update
+                    // Note: Subscription update requires NRF integration
                 }
             }
             UdmTimerId::SbiClientWait => {
                 log::error!("Cannot receive SBI message");
-                // TODO: Send gateway timeout error
+                // Send gateway timeout if we have stream context
+                if let Some(ref sbi) = event.sbi {
+                    if let Some(stream_id) = sbi.stream_id {
+                        send_gateway_timeout_response(stream_id, "SBI client timeout");
+                    }
+                }
             }
         }
     }

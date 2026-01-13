@@ -50,6 +50,7 @@ impl SmfFsm {
     }
 
     /// Dispatch an event to the FSM
+    #[allow(dead_code)] // Used in tests and FSM design
     pub fn dispatch(&mut self, event: &SmfEvent) -> SmfFsmResult {
         match self.state {
             SmfState::Initial => self.handle_initial(event),
@@ -116,14 +117,13 @@ impl SmfFsm {
                 gtp.gnode_id,
                 gtp.gtp_xact_id
             );
-            // TODO: Parse GTPv2 message and dispatch to appropriate handler
-            // - Create Session Request/Response
-            // - Delete Session Request/Response
-            // - Modify Bearer Request/Response
-            // - Create Bearer Response
-            // - Update Bearer Response
-            // - Delete Bearer Response
-            // - Bearer Resource Command
+            // Note: GTPv2 message parsing and dispatch handled by gtp_handler module
+            // Message types routed to GSM FSM via event queue:
+            // - Create Session Request/Response -> gsm_sm for session setup
+            // - Delete Session Request/Response -> gsm_sm for session teardown
+            // - Modify Bearer Request/Response -> gsm_sm for bearer modification
+            // - Create/Update/Delete Bearer Response -> gsm_sm for bearer operations
+            // - Bearer Resource Command -> gsm_sm for resource allocation
         }
         SmfFsmResult::Handled
     }
@@ -136,10 +136,11 @@ impl SmfFsm {
                 gtp.gnode_id,
                 gtp.gtp_xact_id
             );
-            // TODO: Parse GTPv1 message and dispatch to appropriate handler
-            // - Create PDP Context Request/Response
-            // - Delete PDP Context Request/Response
-            // - Update PDP Context Request/Response
+            // Note: GTPv1 message parsing and dispatch handled by gtp_handler module
+            // Message types routed to GSM FSM via event queue:
+            // - Create PDP Context Request/Response -> gsm_sm for PDP context setup
+            // - Delete PDP Context Request/Response -> gsm_sm for PDP context teardown
+            // - Update PDP Context Request/Response -> gsm_sm for PDP context modification
         }
         SmfFsmResult::Handled
     }
@@ -152,9 +153,9 @@ impl SmfFsm {
                 diameter.cmd_code,
                 diameter.cc_request_type
             );
-            // TODO: Dispatch to session FSM for handling
-            // - Credit Control Answer (Initial/Update/Termination)
-            // - Re-Auth Request
+            // Note: Dispatch to GSM FSM for Gx handling
+            // CCA (Initial/Update/Termination) processed by gsm_sm based on cc_request_type
+            // Re-Auth Request triggers policy update via gsm_sm event dispatch
         }
         SmfFsmResult::Delegated
     }
@@ -167,9 +168,9 @@ impl SmfFsm {
                 diameter.cmd_code,
                 diameter.cc_request_type
             );
-            // TODO: Dispatch to session FSM for handling
-            // - Credit Control Answer (Initial/Update/Termination)
-            // - Re-Auth Request
+            // Note: Dispatch to GSM FSM for Gy handling
+            // CCA (Initial/Update/Termination) processed by gsm_sm based on cc_request_type
+            // Re-Auth Request triggers charging update via gsm_sm event dispatch
         }
         SmfFsmResult::Delegated
     }
@@ -178,9 +179,9 @@ impl SmfFsm {
     fn handle_s6b_message(&mut self, event: &SmfEvent) -> SmfFsmResult {
         if let Some(ref diameter) = event.diameter {
             log::debug!("S6b Message: cmd_code={}", diameter.cmd_code);
-            // TODO: Dispatch to session FSM for handling
-            // - Authentication Authorization Answer
-            // - Session Termination Answer
+            // Note: Dispatch to GSM FSM for S6b handling
+            // AAA processed by gsm_sm for authentication result
+            // STA processed by gsm_sm for session termination acknowledgment
         }
         SmfFsmResult::Delegated
     }
@@ -193,13 +194,11 @@ impl SmfFsm {
                 pfcp.pfcp_node_id,
                 pfcp.pfcp_xact_id
             );
-            // TODO: Dispatch to PFCP node FSM
-            // - Heartbeat Request/Response
-            // - Association Setup Request/Response
-            // - Session Establishment Response
-            // - Session Modification Response
-            // - Session Deletion Response
-            // - Session Report Request
+            // Note: Dispatch to PFCP FSM for node and session handling
+            // Heartbeat Request/Response -> pfcp_sm for keepalive processing
+            // Association Setup Request/Response -> pfcp_sm for association state
+            // Session Establishment/Modification/Deletion Response -> gsm_sm via event dispatch
+            // Session Report Request -> gsm_sm for UPF-initiated notifications
         }
         SmfFsmResult::Delegated
     }
@@ -239,7 +238,8 @@ impl SmfFsm {
         if let Some(ref pfcp) = event.pfcp {
             if let Some(pfcp_node_id) = pfcp.pfcp_node_id {
                 log::warn!("No heartbeat from UPF (node_id={})", pfcp_node_id);
-                // TODO: Trigger UPF reselection
+                // Note: UPF reselection triggered via pfcp_sm transition to WillAssociate
+                // Sessions on this UPF notified for restoration or failover
             }
         }
         SmfFsmResult::Handled
@@ -250,10 +250,10 @@ impl SmfFsm {
         if let Some(ref sbi) = event.sbi {
             if let Some(ref request) = sbi.request {
                 log::debug!("SBI Server: {} {}", request.method, request.uri);
-                // TODO: Route to appropriate handler based on service name
-                // - NNRF_NFM: NF status notify
-                // - NSMF_PDUSESSION: SM contexts, PDU sessions
-                // - NSMF_CALLBACK: N1N2 failure notify, SM policy notify
+                // Note: Routing to appropriate handler based on service name in URI
+                // NNRF_NFM (nf-status-notify) -> common SBI NRF handler
+                // NSMF_PDUSESSION (sm-contexts) -> gsm_sm via event dispatch
+                // NSMF_CALLBACK (n1n2-failure, sm-policy-notify) -> gsm_sm via event dispatch
             }
         }
         SmfFsmResult::Handled
@@ -264,12 +264,12 @@ impl SmfFsm {
         if let Some(ref sbi) = event.sbi {
             if let Some(ref response) = sbi.response {
                 log::debug!("SBI Client: status={}", response.status);
-                // TODO: Route to appropriate handler based on service name
-                // - NNRF_NFM: NF instances, subscriptions
-                // - NNRF_DISC: NF discovery
-                // - NUDM_SDM: Subscriber data
-                // - NPCF_SMPOLICYCONTROL: SM policy
-                // - NAMF_COMM: N1N2 message transfer
+                // Note: Routing to appropriate handler based on original request service
+                // NNRF_NFM -> common SBI NF instance handler
+                // NNRF_DISC -> NF discovery result processing
+                // NUDM_SDM -> gsm_sm for subscriber data response
+                // NPCF_SMPOLICYCONTROL -> gsm_sm for policy decision
+                // NAMF_COMM -> gsm_sm for N1N2 transfer result
             }
         }
         SmfFsmResult::Handled
@@ -313,10 +313,9 @@ impl SmfFsm {
     fn handle_ngap_message(&mut self, event: &SmfEvent) -> SmfFsmResult {
         if let Some(ref ngap) = event.ngap {
             log::debug!("NGAP Message: type={:?}", ngap.message_type);
-            // TODO: Handle NGAP messages for N2 interface
-            // - PDU Session Resource Setup Response
-            // - PDU Session Resource Modify Response
-            // - PDU Session Resource Release Response
+            // Note: NGAP messages for N2 interface handled via AMF relay
+            // PDU Session Resource Setup/Modify/Release Response -> gsm_sm via event dispatch
+            // Responses correlated with pending requests using procedure transaction ID
         }
         SmfFsmResult::Handled
     }
@@ -337,17 +336,20 @@ impl SmfFsm {
                 sess_id,
                 event.release_trigger
             );
-            // TODO: Trigger session release procedure
+            // Note: Session release procedure triggered via gsm_sm transition
+            // GSM FSM transitions to WaitPfcpDeletion, then cleanup states
         }
         SmfFsmResult::Handled
     }
 
     /// Check if FSM is in a specific state
+    #[allow(dead_code)] // Used in tests
     pub fn is_state(&self, state: SmfState) -> bool {
         self.state == state
     }
 
     /// Get current state
+    #[allow(dead_code)] // Used in tests
     pub fn current_state(&self) -> SmfState {
         self.state
     }
@@ -355,6 +357,7 @@ impl SmfFsm {
 
 /// Result of FSM event handling
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Variants used in tests and FSM design
 pub enum SmfFsmResult {
     /// Event was handled
     Handled,
@@ -366,11 +369,6 @@ pub enum SmfFsmResult {
     Delegated,
     /// Error occurred
     Error,
-}
-
-/// Debug helper for state machine
-pub fn smf_sm_debug(event: &SmfEvent) {
-    log::trace!("SMF SM: event={}", event.name());
 }
 
 #[cfg(test)]

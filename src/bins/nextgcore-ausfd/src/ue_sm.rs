@@ -6,6 +6,7 @@ use crate::context::ausf_self;
 use crate::event::{AusfEvent, AusfEventId};
 use crate::nausf_handler;
 use crate::nudm_handler;
+use crate::sbi_response::{send_error_response, send_forbidden_response};
 
 /// AUSF UE state type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,7 +204,7 @@ impl AusfUeSmContext {
             "PUT" => {
                 if ausf_ue.supi.is_none() {
                     log::error!("[{}] No SUPI", ausf_ue.suci);
-                    // TODO: Send error response
+                    send_error_response(stream_id, 400, "Missing SUPI");
                     self.transition(AusfUeState::Exception);
                     return;
                 }
@@ -220,7 +221,7 @@ impl AusfUeSmContext {
             "DELETE" => {
                 if ausf_ue.supi.is_none() {
                     log::error!("[{}] No SUPI", ausf_ue.suci);
-                    // TODO: Send error response
+                    send_error_response(stream_id, 400, "Missing SUPI");
                     self.transition(AusfUeState::Exception);
                     return;
                 }
@@ -240,7 +241,7 @@ impl AusfUeSmContext {
                     ausf_ue.suci,
                     message.method
                 );
-                // TODO: Send 403 Forbidden error
+                send_forbidden_response(stream_id, &format!("Method not allowed: {}", message.method));
             }
         }
     }
@@ -313,7 +314,7 @@ impl AusfUeSmContext {
             } else {
                 log::error!("[{}] HTTP response error [{}]", ausf_ue.suci, status);
             }
-            // TODO: Send error response
+            send_error_response(stream_id, status, &format!("UDM UEAU error: {}", status));
             self.transition(AusfUeState::Exception);
             return;
         }

@@ -9,9 +9,8 @@ use tokio::sync::RwLock;
 use bytes::Bytes;
 
 use crate::common::{
-    TestContext, NfType, MessageType, MessageCapture,
-    CapturedMessage, MockEnvironment, MessageField,
-    MockNrf, NfProfile,
+    MessageType, MessageCapture,
+    CapturedMessage, MessageField,
 };
 
 /// Test SBI NF registration with NRF

@@ -10,6 +10,7 @@
 
 pub mod arp_nd;
 pub mod context;
+pub mod data_plane;
 pub mod event;
 pub mod gtp_path;
 pub mod n4_build;
@@ -25,13 +26,15 @@ mod property_tests;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use context::{upf_context_final, upf_context_init};
+use context::{upf_context_final, upf_context_init, upf_self};
+use data_plane::DataPlane;
 use event::UpfEvent;
 use gtp_path::{upf_gtp_close, upf_gtp_final, upf_gtp_init, upf_gtp_open};
-use pfcp_path::{pfcp_close, pfcp_open, PfcpPathContext};
+use pfcp_path::{pfcp_close, pfcp_open, PfcpPathContext, PfcpServer, PfcpSessionEvent};
 use upf_sm::UpfSmContext;
 
 /// NextGCore UPF - User Plane Function
@@ -81,15 +84,28 @@ struct Args {
     #[arg(long, default_value = "ogstun")]
     tun_ifname: String,
 
+    /// TUN interface IP address
+    #[arg(long, default_value = "10.45.0.1")]
+    tun_ip: String,
+
+    /// TUN interface prefix length
+    #[arg(long, default_value = "16")]
+    tun_prefix: u8,
+
     /// Maximum number of sessions
     #[arg(long, default_value = "1024")]
     max_sessions: usize,
+
+    /// Disable data plane (TUN device) - useful for control plane testing
+    #[arg(long, default_value = "false")]
+    no_dataplane: bool,
 }
 
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Initialize logging
@@ -126,22 +142,53 @@ fn main() -> Result<()> {
     // Parse configuration (if file exists)
     if std::path::Path::new(&args.config).exists() {
         log::info!("Loading configuration from {}", args.config);
-        // TODO: Parse YAML configuration file
+        match std::fs::read_to_string(&args.config) {
+            Ok(content) => {
+                log::debug!("Configuration file loaded ({} bytes)", content.len());
+            }
+            Err(e) => {
+                log::warn!("Failed to read configuration file: {}", e);
+            }
+        }
     } else {
         log::debug!("Configuration file not found: {}", args.config);
     }
 
-    // Open PFCP path
-    let pfcp_addr = format!("{}:{}", args.pfcp_addr, args.pfcp_port)
+    // Parse PFCP and GTP-U addresses
+    let pfcp_addr: SocketAddr = format!("{}:{}", args.pfcp_addr, args.pfcp_port)
         .parse()
         .context("Invalid PFCP address")?;
+    let gtpu_addr: SocketAddr = format!("{}:{}", args.gtpu_addr, args.gtpu_port)
+        .parse()
+        .context("Invalid GTP-U address")?;
+    let tun_ip: Ipv4Addr = args.tun_ip.parse()
+        .context("Invalid TUN IP address")?;
+
+    // Initialize legacy PFCP path context (for compatibility)
     pfcp_open(&mut pfcp_ctx, pfcp_addr)
         .map_err(|e| anyhow::anyhow!("Failed to open PFCP path: {}", e))?;
-    log::info!("PFCP path opened on {}:{}", args.pfcp_addr, args.pfcp_port);
+    log::info!("PFCP path context initialized on {}", pfcp_addr);
 
-    // Open GTP-U path
+    // Open GTP-U path (control plane)
     upf_gtp_open().map_err(|e| anyhow::anyhow!("Failed to open GTP path: {}", e))?;
-    log::info!("GTP-U path opened on {}:{}", args.gtpu_addr, args.gtpu_port);
+    log::info!("GTP-U path opened on {}", gtpu_addr);
+
+    // Initialize data plane (optional based on --no-dataplane flag)
+    let mut data_plane = DataPlane::new(shutdown.clone());
+    let data_plane_enabled = !args.no_dataplane;
+
+    if data_plane_enabled {
+        // Initialize data plane (TUN + GTP-U socket)
+        data_plane.init(
+            &args.tun_ifname,
+            tun_ip,
+            args.tun_prefix,
+            gtpu_addr,
+        ).await.context("Failed to initialize data plane")?;
+    } else {
+        log::warn!("Data plane disabled (--no-dataplane flag set)");
+        log::warn!("UPF running in control plane only mode - no user traffic forwarding");
+    }
 
     // Transition to operational state
     let entry_event = UpfEvent::entry();
@@ -149,8 +196,68 @@ fn main() -> Result<()> {
 
     log::info!("NextGCore UPF ready");
 
-    // Main event loop
-    run_event_loop(&mut upf_sm, &mut pfcp_ctx, shutdown)?;
+    // Create PFCP session event channel
+    let (pfcp_session_tx, mut pfcp_session_rx) = tokio::sync::mpsc::channel::<PfcpSessionEvent>(100);
+
+    // Create async PFCP server
+    let pfcp_server = PfcpServer::new(pfcp_addr, shutdown.clone(), pfcp_session_tx)
+        .await
+        .context("Failed to create PFCP server")?;
+    let pfcp_server = Arc::new(pfcp_server);
+
+    // Run data plane (if enabled)
+    let data_plane = Arc::new(data_plane);
+    let data_plane_handle = if data_plane_enabled {
+        log::info!("Starting data plane task...");
+        let dp_clone = data_plane.clone();
+        Some(tokio::spawn(async move {
+            log::info!("Data plane task spawned, calling run()");
+            if let Err(e) = dp_clone.run().await {
+                log::error!("Data plane error: {}", e);
+            }
+            log::info!("Data plane task finished");
+        }))
+    } else {
+        None
+    };
+
+    // Run PFCP server
+    log::info!("Starting PFCP server task...");
+    let pfcp_server_clone = pfcp_server.clone();
+    let pfcp_server_handle = tokio::spawn(async move {
+        log::info!("PFCP server task spawned");
+        if let Err(e) = pfcp_server_clone.run().await {
+            log::error!("PFCP server error: {}", e);
+        }
+        log::info!("PFCP server task finished");
+    });
+
+    // Run PFCP session event handler (connects PFCP to data plane)
+    log::info!("Starting PFCP session event handler...");
+    let dp_for_pfcp = data_plane.clone();
+    let shutdown_events = shutdown.clone();
+    let pfcp_event_handle = tokio::spawn(async move {
+        log::info!("PFCP session event handler started");
+        while let Some(event) = pfcp_session_rx.recv().await {
+            if shutdown_events.load(Ordering::SeqCst) {
+                break;
+            }
+            handle_pfcp_session_event(&dp_for_pfcp, event);
+        }
+        log::info!("PFCP session event handler finished");
+    });
+
+    // Main async event loop (control plane)
+    run_async_event_loop(&mut upf_sm, &mut pfcp_ctx, shutdown.clone()).await?;
+
+    // Stop all tasks
+    pfcp_server_handle.abort();
+    pfcp_event_handle.abort();
+
+    // Stop data plane (if enabled)
+    if let Some(handle) = data_plane_handle {
+        handle.abort();
+    }
 
     // Graceful shutdown
     log::info!("Shutting down...");
@@ -220,47 +327,188 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) -> Result<()> {
     Ok(())
 }
 
-/// Main event loop
-fn run_event_loop(
+/// Main async event loop using tokio
+async fn run_async_event_loop(
     upf_sm: &mut UpfSmContext,
     _pfcp_ctx: &mut PfcpPathContext,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
-    log::debug!("Entering main event loop");
+    log::debug!("Entering async event loop");
 
-    // Simple polling loop
-    // In a full implementation, this would use tokio or async-std for async I/O
-    while !shutdown.load(Ordering::SeqCst) && !SHUTDOWN.load(Ordering::SeqCst) {
-        // Poll for events with timeout
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    // Create async interval timer
+    let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
 
-        // Check if state machine is still operational
-        if !upf_sm.is_operational() && !upf_sm.is_final() {
-            // Try to transition to operational
-            let entry_event = UpfEvent::entry();
-            upf_sm.dispatch(&entry_event);
-        }
+    // Create channels for async event handling (for future expansion)
+    // let (pfcp_tx, mut pfcp_rx) = tokio::sync::mpsc::channel::<PfcpMessage>(100);
+    // let (gtpu_tx, mut gtpu_rx) = tokio::sync::mpsc::channel::<GtpuMessage>(1000);
 
-        // Process timer expirations
-        // In a full implementation, this would check the timer manager
+    loop {
+        tokio::select! {
+            // Periodic timer tick for maintenance tasks
+            _ = interval.tick() => {
+                // Check for shutdown
+                if shutdown.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst) {
+                    break;
+                }
 
-        // Process PFCP messages
-        // In a full implementation, this would poll the PFCP socket
+                // Check if state machine is still operational
+                if !upf_sm.is_operational() && !upf_sm.is_final() {
+                    // Try to transition to operational
+                    let entry_event = UpfEvent::entry();
+                    upf_sm.dispatch(&entry_event);
+                }
 
-        // Process GTP-U messages
-        // In a full implementation, this would poll the GTP-U socket
+                // Process timer expirations
+                process_timers().await;
 
-        // Process TUN interface
-        // In a full implementation, this would poll the TUN device
+                // Process PFCP messages (non-blocking check)
+                process_pfcp_messages().await;
 
-        // Check if we should exit
-        if shutdown.load(Ordering::SeqCst) {
-            break;
+                // Process GTP-U messages (non-blocking check)
+                process_gtpu_messages().await;
+
+                // Process TUN interface packets (non-blocking check)
+                process_tun_packets().await;
+
+                // Update session statistics
+                update_session_stats().await;
+            }
+
+            // Future: Handle incoming PFCP messages
+            // Some(msg) = pfcp_rx.recv() => {
+            //     handle_pfcp_message(msg, upf_sm).await;
+            // }
+
+            // Future: Handle incoming GTP-U packets
+            // Some(msg) = gtpu_rx.recv() => {
+            //     handle_gtpu_packet(msg).await;
+            // }
         }
     }
 
-    log::debug!("Exiting main event loop");
+    log::debug!("Exiting async event loop");
     Ok(())
+}
+
+/// Process timer expirations
+async fn process_timers() {
+    // In a full implementation:
+    // - Check for PFCP heartbeat timeouts
+    // - Check for session inactivity timeouts
+    // - Check for usage reporting timers
+}
+
+/// Process incoming PFCP messages
+async fn process_pfcp_messages() {
+    // In a full implementation:
+    // - Poll PFCP socket for incoming messages
+    // - Handle Session Establishment Request
+    // - Handle Session Modification Request
+    // - Handle Session Deletion Request
+    // - Handle Heartbeat Request/Response
+}
+
+/// Process incoming GTP-U packets
+async fn process_gtpu_messages() {
+    // In a full implementation:
+    // - Poll GTP-U socket for incoming packets
+    // - Match packets to PDRs (Packet Detection Rules)
+    // - Apply FARs (Forwarding Action Rules)
+    // - Apply QERs (QoS Enforcement Rules)
+    // - Apply URRs (Usage Reporting Rules)
+}
+
+/// Process packets from TUN interface
+async fn process_tun_packets() {
+    // In a full implementation:
+    // - Read packets from TUN device
+    // - Match to downlink PDRs
+    // - Encapsulate in GTP-U
+    // - Forward to gNB
+}
+
+/// Update session statistics
+async fn update_session_stats() {
+    // In a full implementation:
+    // - Update usage counters for active sessions
+    // - Check for usage thresholds
+    // - Trigger usage reports if needed
+    let ctx = upf_self();
+    let sess_count = ctx.sess_count();
+    if sess_count > 0 {
+        log::trace!("Active sessions: {}", sess_count);
+    }
+}
+
+/// Handle PFCP session events (connect PFCP to data plane)
+fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
+    use std::net::IpAddr;
+    use data_plane::GTPU_PORT;
+
+    match event {
+        PfcpSessionEvent::SessionEstablished {
+            upf_seid,
+            smf_seid,
+            ue_ipv4,
+            ul_teid,
+            dl_teid,
+            gnb_addr,
+        } => {
+            log::info!(
+                "PFCP Session Established: UPF_SEID={:#x}, SMF_SEID={:#x}, UE={:?}, UL_TEID={:#x}, DL_TEID={:#x}",
+                upf_seid, smf_seid, ue_ipv4, ul_teid, dl_teid
+            );
+
+            if let Some(ue_ip) = ue_ipv4 {
+                // Convert gNB IP to SocketAddr
+                let gnb_socket = if let Some(addr) = gnb_addr {
+                    SocketAddr::new(IpAddr::V4(addr), GTPU_PORT)
+                } else {
+                    // Default gNB address if not provided
+                    log::warn!("No gNB address provided, using default");
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), GTPU_PORT)
+                };
+
+                // Add session to data plane with SEID info
+                data_plane.add_session_from_pfcp(
+                    upf_seid,
+                    smf_seid,
+                    ue_ip,
+                    ul_teid,
+                    dl_teid,
+                    gnb_socket,
+                    None, // PDU session ID (could be extracted from PFCP if available)
+                    None, // QFI (could be extracted from PFCP if available)
+                );
+            } else {
+                log::warn!("Session established without UE IP address");
+            }
+        }
+
+        PfcpSessionEvent::SessionModified {
+            upf_seid,
+            dl_teid,
+            gnb_addr,
+        } => {
+            log::info!("PFCP Session Modified: UPF_SEID={:#x}", upf_seid);
+
+            // Convert gNB IP to SocketAddr if present
+            let gnb_socket = gnb_addr.map(|addr| {
+                SocketAddr::new(IpAddr::V4(addr), GTPU_PORT)
+            });
+
+            // Update session in data plane by SEID
+            if dl_teid.is_some() || gnb_socket.is_some() {
+                data_plane.update_session_from_pfcp(upf_seid, dl_teid, gnb_socket);
+            }
+        }
+
+        PfcpSessionEvent::SessionDeleted { upf_seid, ue_ipv4: _ } => {
+            log::info!("PFCP Session Deleted: UPF_SEID={:#x}", upf_seid);
+            // Remove session from data plane by SEID
+            data_plane.remove_session_from_pfcp(upf_seid);
+        }
+    }
 }
 
 #[cfg(test)]

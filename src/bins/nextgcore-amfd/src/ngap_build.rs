@@ -3,8 +3,8 @@
 //! Port of src/amf/ngap-build.c - NGAP message building functions
 
 use crate::context::{
-    AmfContext, AmfGnb, AmfUe, AmfSess, RanUe, PlmnId, SNssai, Guami, Tai5gs,
-    NgapCause, OGS_MAX_NUM_OF_SERVED_GUAMI, OGS_MAX_NUM_OF_PLMN,
+    AmfContext, AmfUe, AmfSess, RanUe, Tai5gs,
+    NgapCause,
 };
 use bytes::{BufMut, BytesMut};
 
@@ -454,7 +454,7 @@ pub fn build_paging(amf_ue: &AmfUe, tai: &Tai5gs) -> Option<Vec<u8>> {
 /// Build Handover Request message
 pub fn build_handover_request(
     target_ue: &RanUe,
-    source_ue: &RanUe,
+    _source_ue: &RanUe,
     amf_ue: &AmfUe,
     cause: &NgapCause,
     source_to_target_container: &[u8],

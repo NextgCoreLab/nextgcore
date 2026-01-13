@@ -7,11 +7,11 @@ license.workspace = true
 description = "NextGCore SCTP Transport Library - Pure Rust Implementation"
 
 [features]
-default = ["userspace"]
-# Pure Rust userspace SCTP (default - no C dependencies)
-userspace = ["webrtc-sctp", "webrtc-util"]
-# Linux kernel SCTP (requires libsctp-dev) - for compatibility testing
-kernel = []
+default = ["sctp-proto"]
+# Pure Rust userspace SCTP using sctp-proto (wire-compatible with nextgsim)
+sctp-proto = ["dep:sctp-proto"]
+# Linux kernel SCTP (requires libsctp-dev) - uses native SCTP sockets
+kernel = ["nix", "libc"]
 
 [dependencies]
 ogs-core = { workspace = true }
@@ -21,9 +21,13 @@ tokio = { workspace = true, features = ["net", "sync", "time", "rt"] }
 bytes.workspace = true
 async-trait.workspace = true
 
-# Pure Rust SCTP implementation (userspace over UDP)
-webrtc-sctp = { workspace = true, optional = true }
-webrtc-util = { workspace = true, optional = true }
+# Pure Rust SCTP implementation (userspace over UDP, wire-compatible with nextgsim)
+sctp-proto = { workspace = true, optional = true }
+tracing = "0.1"
+
+# Linux kernel SCTP dependencies
+nix = { version = "0.29", features = ["socket", "net"], optional = true }
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 proptest.workspace = true

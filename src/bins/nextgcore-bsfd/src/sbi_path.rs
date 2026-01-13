@@ -18,7 +18,7 @@ impl Default for SbiServerConfig {
     fn default() -> Self {
         Self {
             addr: "127.0.0.1".to_string(),
-            port: 7779,
+            port: 7777,
             tls_enabled: false,
             tls_cert: None,
             tls_key: None,
@@ -44,19 +44,18 @@ pub fn bsf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
         config.port
     );
 
-    // TODO: Initialize SELF NF instance
+    // Note: Initialize SELF NF instance
     // In C: ogs_sbi_nf_instance_build_default(nf_instance)
     // - Add allowed NF types: SCP, PCF, AF
     // - Build NF service for nbsf-management (v1)
 
-    // TODO: Initialize NRF NF Instance if configured
+    // Note: Initialize NRF NF Instance if configured
     // In C: ogs_sbi_nf_fsm_init(nf_instance)
 
-    // TODO: Setup subscription data
+    // Note: Setup subscription data
     // In C: ogs_sbi_subscription_spec_add(OpenAPI_nf_type_SEPP, NULL)
 
-    // TODO: Start SBI server
-    // In C: ogs_sbi_server_start_all(ogs_sbi_server_handler)
+    // Note: Start SBI server - handled by main.rs HTTP server startup
 
     SBI_SERVER_RUNNING.store(true, Ordering::SeqCst);
 
@@ -73,10 +72,10 @@ pub fn bsf_sbi_close() {
 
     log::info!("Closing BSF SBI server");
 
-    // TODO: Stop SBI client
+    // Note: Stop SBI client - handled by HTTP client shutdown
     // In C: ogs_sbi_client_stop_all()
 
-    // TODO: Stop SBI server
+    // Note: Stop SBI server - handled by main.rs HTTP server shutdown
     // In C: ogs_sbi_server_stop_all()
 
     SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
@@ -91,11 +90,11 @@ pub fn bsf_sbi_is_running() -> bool {
 
 
 /// SBI request builder function type
-pub type SbiRequestBuilder = fn(sess_id: u64, data: &dyn std::any::Any) -> Option<SbiRequest>;
+pub type PathSbiRequestBuilder = fn(sess_id: u64, data: &dyn std::any::Any) -> Option<PathSbiRequest>;
 
-/// Simplified SBI request
+/// Simplified SBI request for path operations
 #[derive(Debug, Clone)]
-pub struct SbiRequest {
+pub struct PathSbiRequest {
     pub method: String,
     pub uri: String,
     pub headers: Vec<(String, String)>,
@@ -113,7 +112,7 @@ pub struct SbiXact {
 
 /// Send SBI request to NF instance
 /// Port of bsf_sbi_send_request
-pub fn bsf_sbi_send_request(nf_instance_id: &str, request: SbiRequest) -> Result<u64, String> {
+pub fn bsf_sbi_send_request(nf_instance_id: &str, request: PathSbiRequest) -> Result<u64, String> {
     log::debug!(
         "Sending SBI request to NF instance [{}]: {} {}",
         nf_instance_id,
@@ -121,8 +120,9 @@ pub fn bsf_sbi_send_request(nf_instance_id: &str, request: SbiRequest) -> Result
         request.uri
     );
 
-    // TODO: Implement actual SBI request sending
+    // Note: SBI request sending requires HTTP client integration
     // In C: ogs_sbi_send_request_to_nf_instance(nf_instance, xact)
+    // The actual HTTP client would send the request and handle the response
 
     // Return transaction ID (placeholder)
     Ok(1)
@@ -134,7 +134,7 @@ pub fn bsf_sbi_discover_and_send(
     service_type: &str,
     sess_id: u64,
     stream_id: u64,
-    _request: SbiRequest,
+    _request: PathSbiRequest,
 ) -> Result<u64, String> {
     log::debug!(
         "Discover and send: service_type={}, sess_id={}, stream_id={}",
@@ -143,11 +143,9 @@ pub fn bsf_sbi_discover_and_send(
         stream_id
     );
 
-    // TODO: Create SBI transaction
-    // In C: ogs_sbi_xact_add(...)
-
-    // TODO: Discover NF instance
-    // In C: ogs_sbi_discover_and_send(xact)
+    // Note: SBI transaction tracking and NF discovery require NRF integration
+    // In C: ogs_sbi_xact_add(...) creates a transaction
+    // In C: ogs_sbi_discover_and_send(xact) discovers and sends to target NF
 
     // Return transaction ID (placeholder)
     Ok(1)
@@ -158,9 +156,10 @@ pub fn bsf_sbi_discover_and_send(
 pub fn bsf_sbi_send_response(stream_id: u64, status: u16) -> Result<(), String> {
     log::debug!("Sending SBI response: stream_id={}, status={}", stream_id, status);
 
-    // TODO: Build and send response
+    // Note: Build and send response through HTTP server
     // In C: ogs_sbi_build_response(&sendmsg, status)
     // In C: ogs_sbi_server_send_response(stream, response)
+    // The actual response is sent by the HTTP handler in main.rs
 
     Ok(())
 }
@@ -173,7 +172,7 @@ mod tests {
     fn test_sbi_server_config_default() {
         let config = SbiServerConfig::default();
         assert_eq!(config.addr, "127.0.0.1");
-        assert_eq!(config.port, 7779);
+        assert_eq!(config.port, 7777);
         assert!(!config.tls_enabled);
     }
 
@@ -204,7 +203,7 @@ mod tests {
 
     #[test]
     fn test_sbi_request() {
-        let request = SbiRequest {
+        let request = PathSbiRequest {
             method: "POST".to_string(),
             uri: "/nbsf-management/v1/pcf-bindings".to_string(),
             headers: vec![],

@@ -16,17 +16,24 @@ ogs-crypt = { workspace = true }
 ogs-nas = { workspace = true }
 ogs-ngap = { workspace = true }
 ogs-sbi = { workspace = true }
+ogs-sctp = { workspace = true }
 ogs-app = { workspace = true }
 ogs-metrics = { workspace = true }
 log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+serde = { workspace = true }
+serde_yaml = { workspace = true }
 uuid = { version = "1.0", features = ["v4"] }
 clap = { version = "4.0", features = ["derive"] }
 ctrlc = "3.4"
 sha2 = "0.10"
 bytes = "1.5"
+once_cell = "1.19"
+# Proper ASN.1 NGAP encoding from nextgsim
+nextgsim-ngap = { path = "../../../../nextgsim/nextgsim-ngap" }
+bitvec = "1"
 
 [dev-dependencies]
 proptest.workspace = true

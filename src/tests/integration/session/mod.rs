@@ -9,8 +9,8 @@ use tokio::sync::RwLock;
 use bytes::Bytes;
 
 use crate::common::{
-    TestContext, NfType, MessageType, MessageCapture,
-    CapturedMessage, MockEnvironment, MessageField,
+    MessageType, MessageCapture,
+    CapturedMessage, MessageField,
 };
 
 /// Test PDU session establishment flow

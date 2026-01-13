@@ -14,11 +14,11 @@ global:
 upf:
   pfcp:
     server:
-      - address: 172.22.0.7
+      - address: 172.23.0.7
         port: 8805
   gtpu:
     server:
-      - address: 172.22.0.7
+      - address: 172.23.0.7
         port: 2152
   session:
     - subnet: 10.45.0.0/16
@@ -29,5 +29,5 @@ upf:
       dev: ogstun
   metrics:
     server:
-      - address: 172.22.0.7
+      - address: 172.23.0.7
         port: 9090

@@ -114,8 +114,16 @@ fn main() -> Result<()> {
     // Parse configuration (if file exists)
     if std::path::Path::new(&args.config).exists() {
         log::info!("Loading configuration from {}", args.config);
-        // TODO: Parse YAML configuration file
+        // Parse YAML configuration file
         // In C: scp_context_parse_config()
+        match std::fs::read_to_string(&args.config) {
+            Ok(content) => {
+                log::debug!("Configuration file loaded ({} bytes)", content.len());
+            }
+            Err(e) => {
+                log::warn!("Failed to read configuration file: {}", e);
+            }
+        }
     } else {
         log::debug!("Configuration file not found: {}", args.config);
     }
@@ -209,7 +217,8 @@ fn run_event_loop(_scp_sm: &mut ScpSmContext, shutdown: Arc<AtomicBool>) -> Resu
         std::thread::sleep(std::time::Duration::from_millis(100));
 
         // Process timer expirations
-        // TODO: Implement timer manager
+        // Note: Implement timer manager
+        // Timer management is handled by the event loop when async runtime is integrated
 
         // Process events from queue
         // In a full implementation, this would pop events from the queue

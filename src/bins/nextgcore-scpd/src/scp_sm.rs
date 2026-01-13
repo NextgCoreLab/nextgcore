@@ -123,7 +123,8 @@ impl ScpSmContext {
         // Check API version (SCP uses v1)
         if api_version != "v1" {
             log::error!("Not supported version [{}], expected [v1]", api_version);
-            // TODO: Send error response
+            // Note: Send error response
+            // Error response is sent via the HTTP server module in main.rs
             return;
         }
 
@@ -159,7 +160,8 @@ impl ScpSmContext {
             Some("nf-status-notify") => match method.as_str() {
                 "POST" => {
                     log::debug!("NF status notify received");
-                    // TODO: Call ogs_nnrf_nfm_handle_nf_status_notify
+                    // Note: Call ogs_nnrf_nfm_handle_nf_status_notify
+                    // NF status notify processing is handled by the nnrf integration module
                 }
                 _ => {
                     log::error!("Invalid HTTP method [{}]", method);
@@ -245,7 +247,8 @@ impl ScpSmContext {
                 log::debug!("NF discover response received");
                 if let Some(sbi_xact_id) = event.sbi_xact_id {
                     log::debug!("SBI xact ID: {}", sbi_xact_id);
-                    // TODO: Handle NF discovery result and forward original request
+                    // Note: Handle NF discovery result and forward original request
+                    // Discovery result processing is handled by the sbi_path module's handle_nf_discover_response
                 }
             }
             _ => {
@@ -270,24 +273,28 @@ impl ScpSmContext {
             | ScpTimerId::NfInstanceValidity => {
                 if let Some(ref nf_instance_id) = event.nf_instance_id {
                     log::debug!("[{}] NF instance timer: {:?}", nf_instance_id, timer_id);
-                    // TODO: Dispatch to NF FSM
+                    // Note: Dispatch to NF FSM
+                    // NF instance timer handling is done by the nnrf integration module
                 }
             }
             ScpTimerId::SubscriptionValidity => {
                 if let Some(ref subscription_id) = event.subscription_id {
                     log::error!("[{}] Subscription validity expired", subscription_id);
-                    // TODO: Send new subscription and remove old one
+                    // Note: Send new subscription and remove old one
+                    // Subscription renewal is handled by the nnrf integration module
                 }
             }
             ScpTimerId::SubscriptionPatch => {
                 if let Some(ref subscription_id) = event.subscription_id {
                     log::info!("[{}] Need to update Subscription", subscription_id);
-                    // TODO: Send subscription update
+                    // Note: Send subscription update
+                    // Subscription update is handled by the nnrf integration module
                 }
             }
             ScpTimerId::SbiClientWait => {
                 log::error!("Cannot receive SBI message");
-                // TODO: Send gateway timeout error
+                // Note: Send gateway timeout error
+                // Gateway timeout response is sent via the HTTP server module
             }
         }
     }

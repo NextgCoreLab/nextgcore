@@ -341,7 +341,7 @@ fn emm_cause_from_diameter(
 
 /// Process APN configurations from subscription data
 fn process_apn_configurations(
-    mme_ue: &mut MmeUe,
+    _mme_ue: &mut MmeUe,
     apn_configs: &[ApnConfiguration],
 ) -> usize {
     let mut num_sessions = 0;

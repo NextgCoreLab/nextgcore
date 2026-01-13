@@ -2,7 +2,7 @@
 //!
 //! Port of src/mme/emm-build.c - EMM message building functions
 
-use crate::context::{MmeUe, PlmnId, EpsTai, Lai};
+use crate::context::{MmeUe, PlmnId, EpsTai};
 
 // ============================================================================
 // EMM Cause Codes (3GPP TS 24.301)
@@ -567,7 +567,7 @@ pub fn build_security_mode_command(
 
 /// Build detach request message (to UE)
 pub fn build_detach_request(
-    mme_ue: &MmeUe,
+    _mme_ue: &MmeUe,
     detach_type: DetachTypeToUe,
 ) -> Vec<u8> {
     let mut buf = NasBuffer::new();
@@ -595,7 +595,7 @@ pub fn build_detach_request(
 }
 
 /// Build detach accept message
-pub fn build_detach_accept(mme_ue: &MmeUe) -> Vec<u8> {
+pub fn build_detach_accept(_mme_ue: &MmeUe) -> Vec<u8> {
     let mut buf = NasBuffer::new();
     
     // Security header

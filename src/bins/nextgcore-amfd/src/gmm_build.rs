@@ -2,7 +2,7 @@
 //!
 //! Port of src/amf/gmm-build.c - GMM message building functions for 5G NAS
 
-use crate::context::{AmfUe, AmfSess, Guti5gs, PlmnId};
+use crate::context::{AmfUe, AmfSess, Guti5gs};
 use bytes::{BufMut, BytesMut};
 
 // ============================================================================
@@ -668,20 +668,6 @@ fn get_pdu_session_status(amf_ue: &AmfUe) -> u16 {
 
     for sess in &amf_ue.sessions {
         psimask |= 1 << sess.psi;
-    }
-
-    // Swap bytes for NAS encoding
-    ((psimask << 8) | (psimask >> 8)) & 0xffff
-}
-
-/// Get PDU session reactivation result bitmap
-fn get_pdu_session_reactivation_result(amf_ue: &AmfUe) -> u16 {
-    let mut psimask: u16 = 0;
-
-    for sess in &amf_ue.sessions {
-        if !sess.sm_context_in_smf {
-            psimask |= 1 << sess.psi;
-        }
     }
 
     // Swap bytes for NAS encoding

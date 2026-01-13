@@ -1,0 +1,193 @@
+PLMN Configuration Loading - nextgcore AMF
+==========================================
+
+Status: PENDING - AMF needs to load PLMN config from YAML file
+Date: 2026-01-06
+
+================================================================================
+PROBLEM
+================================================================================
+
+The SCTP connection between nextgsim (gNB) and nextgcore (AMF) is now working.
+Both projects use sctp-proto 0.6 and are wire-compatible.
+
+HOWEVER, the NG Setup procedure fails because the AMF context is not configured
+with the correct PLMN, TAI, and S-NSSAI values.
+
+Current behavior:
+- SCTP handshake: SUCCESS
+- NG Setup Request received by AMF: SUCCESS
+- NG Setup Response: FAILURE (cause group=4, cause=0)
+
+The failure occurs because AmfContext starts with empty configuration:
+- num_of_served_guami = 0
+- num_of_served_tai = 0
+- num_of_plmn_support = 0
+
+================================================================================
+ROOT CAUSE
+================================================================================
+
+The AMF does not load configuration from the YAML config file.
+
+Config file location: /etc/nextgcore/amf.yaml (in container)
+Source: docker/rust/configs/5gc/amf.yaml
+
+The YAML file has the correct values:
+```yaml
+amf:
+  guami:
+    - plmn_id:
+        mcc: 999
+        mnc: 70
+      amf_id:
+        region: 2
+        set: 1
+  tai:
+    - plmn_id:
+        mcc: 999
+        mnc: 70
+      tac: 1
+  plmn_support:
+    - plmn_id:
+        mcc: 999
+        mnc: 70
+      s_nssai:
+        - sst: 1
+```
+
+But these values are never loaded into AmfContext.
+
+================================================================================
+REQUIRED IMPLEMENTATION
+================================================================================
+
+1. Add YAML config parsing to main.rs
+   Path: src/bins/nextgcore-amfd/src/main.rs
+
+   In the `init()` method, parse the YAML config file:
+   ```rust
+   pub fn init(&mut self, config_path: &str) -> Result<()> {
+       log::info!("Initializing AMF...");
+
+       // Parse YAML configuration
+       let config = std::fs::read_to_string(config_path)?;
+       let yaml: serde_yaml::Value = serde_yaml::from_str(&config)?;
+
+       // Initialize AMF context
+       context::amf_context_init(64, 1024, 4096);
+
+       // Load PLMN configuration into context
+       self.load_plmn_config(&yaml)?;
+
+       // ... rest of initialization
+   }
+   ```
+
+2. Create load_plmn_config method in AmfApp
+
+   ```rust
+   fn load_plmn_config(&self, yaml: &serde_yaml::Value) -> Result<()> {
+       let ctx = context::amf_self();
+       let mut context = ctx.write().map_err(|_| anyhow::anyhow!("Lock error"))?;
+
+       if let Some(amf) = yaml.get("amf") {
+           // Load GUAMI
+           if let Some(guami_list) = amf.get("guami").and_then(|g| g.as_sequence()) {
+               for guami in guami_list {
+                   let plmn_id = parse_plmn_id(guami.get("plmn_id"))?;
+                   let amf_id = parse_amf_id(guami.get("amf_id"))?;
+                   context.served_guami.push(Guami { plmn_id, amf_id });
+                   context.num_of_served_guami += 1;
+               }
+           }
+
+           // Load TAI
+           if let Some(tai_list) = amf.get("tai").and_then(|t| t.as_sequence()) {
+               // ... similar parsing
+           }
+
+           // Load PLMN Support
+           if let Some(plmn_support) = amf.get("plmn_support").and_then(|p| p.as_sequence()) {
+               // ... similar parsing
+           }
+       }
+
+       Ok(())
+   }
+   ```
+
+3. Key structures to populate in AmfContext:
+
+   a) served_guami: Vec<Guami>
+      - plmn_id: PlmnId (mcc="999", mnc="70")
+      - amf_id: AmfId (region=2, set=1, pointer=0)
+
+   b) served_tai: Vec<ServedTai>
+      - list0.plmn_id: PlmnId (mcc="999", mnc="70")
+      - list0.tac: vec![1]
+
+   c) plmn_support: Vec<PlmnSupport>
+      - plmn_id: PlmnId (mcc="999", mnc="70")
+      - s_nssai: vec![SNssai { sst: 1, sd: None }]
+
+================================================================================
+FILES TO MODIFY
+================================================================================
+
+1. src/bins/nextgcore-amfd/src/main.rs
+   - Add YAML parsing in init()
+   - Load configuration into AmfContext
+
+2. src/bins/nextgcore-amfd/Cargo.toml
+   - Ensure serde_yaml is a dependency (already in workspace)
+
+================================================================================
+VERIFICATION
+================================================================================
+
+After implementing, verify with:
+
+1. Start nextgcore:
+   cd /Users/parlakisik/projects/github/nextgcore/docker/rust
+   docker compose up -d
+
+2. Check AMF logs for config loading:
+   docker logs nextgcore-amf 2>&1 | grep -i "plmn\|guami\|tai"
+   # Should show: "AMF configured with PLMN 999-70, TAC 1, SST 1"
+
+3. Start nextgsim:
+   cd /Users/parlakisik/projects/github/nextgsim
+   docker compose up -d
+
+4. Check gNB logs for NG Setup:
+   docker logs nextgsim-gnb 2>&1 | tail -20
+   # Should show: "Received NG Setup Response"
+
+================================================================================
+COMPATIBILITY
+================================================================================
+
+nextgsim gNB configuration (config/gnb.yaml):
+- PLMN: 999-70
+- TAC: 1
+- S-NSSAI: SST=1
+
+nextgcore AMF configuration (docker/rust/configs/5gc/amf.yaml):
+- PLMN: 999-70
+- TAC: 1
+- S-NSSAI: SST=1
+
+Both are configured correctly - nextgcore just needs to load and apply the config.
+
+================================================================================
+SCTP STATUS (COMPLETED)
+================================================================================
+
+The SCTP migration to sctp-proto is complete and working:
+
+- nextgsim: sctp-proto 0.6
+- nextgcore: sctp-proto 0.6
+
+Both are wire-compatible. The SCTP handshake succeeds and NGAP messages
+are being exchanged. Only the PLMN configuration loading remains.

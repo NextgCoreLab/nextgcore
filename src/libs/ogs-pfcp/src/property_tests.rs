@@ -10,7 +10,7 @@
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
-    use bytes::{Bytes, BytesMut};
+    use bytes::BytesMut;
 
     // ========================================================================
     // PFCP Message Property Tests
@@ -28,7 +28,7 @@ mod tests {
             build_message, parse_message,
         };
         use crate::types::{NodeId, FSeid, PfcpCause};
-        use std::net::Ipv4Addr;
+        
 
         // Feature: nextgcore-rust-conversion, Property 11: Protocol Message Round-Trip
         // Test: PFCP Heartbeat Request round-trip

@@ -24,7 +24,6 @@ pub const OGS_HASH_MME_LEN: usize = 8;
 pub const ECC_BYTES: usize = 32; // secp256r1
 
 // FC (Function Code) values for KDF
-const FC_FOR_CK_PRIME_IK_PRIME_DERIVATION: u8 = 0x20;
 const FC_FOR_5GS_ALGORITHM_KEY_DERIVATION: u8 = 0x69;
 const FC_FOR_KAUSF_DERIVATION: u8 = 0x6A;
 const FC_FOR_RES_STAR_XRES_STAR_DERIVATION: u8 = 0x6B;
@@ -45,8 +44,6 @@ const FC_FOR_CK_IK_DERIVATION_IDLE_MOBILITY: u8 = 0x1B;
 // Algorithm Type Distinguishers
 pub const OGS_KDF_NAS_ENC_ALG: u8 = 0x01;
 pub const OGS_KDF_NAS_INT_ALG: u8 = 0x02;
-
-const MAX_NUM_OF_KDF_PARAM: usize = 16;
 
 type HmacSha256 = Hmac<Sha256>;
 

@@ -243,8 +243,8 @@ pub fn pcf_nudr_dr_handle_query_sm_data(
 /// Query subscription data from database
 /// In C: ogs_dbi_subscription_data()
 fn query_subscription_data(supi: &str) -> Option<SubscriptionData> {
-    // TODO: Implement actual database query
-    // For now, return mock data
+    // Note: Database query requires UDR/MongoDB integration
+    // For now, return mock data for testing
     log::debug!("Querying subscription data for SUPI: {}", supi);
 
     // In a real implementation, this would query MongoDB
@@ -270,8 +270,8 @@ pub fn pcf_get_session_data(
         dnn
     );
 
-    // TODO: Implement actual database query
-    // For now, return mock data
+    // Note: Database query requires UDR/MongoDB integration
+    // For now, return mock data for testing
     Some(SessionData {
         qos_index: 9, // Default 5QI
         arp_priority_level: 8,

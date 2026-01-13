@@ -2,8 +2,8 @@
 //!
 //! Port of src/mme/emm-handler.c - EMM message handling functions
 
-use crate::context::{MmeUe, EnbUe, EpsTai, ECgi, PlmnId};
-use crate::emm_build::{EmmCause, IdentityType2};
+use crate::context::{MmeUe, EnbUe, EpsTai, PlmnId};
+use crate::emm_build::EmmCause;
 
 // ============================================================================
 // EMM Handler Result
@@ -270,7 +270,7 @@ pub fn handle_attach_request(
 
 /// Handle attach complete
 pub fn handle_attach_complete(
-    enb_ue: &EnbUe,
+    _enb_ue: &EnbUe,
     mme_ue: &mut MmeUe,
     data: &[u8],
 ) -> EmmResult<Vec<u8>> {
@@ -298,7 +298,7 @@ pub fn handle_attach_complete(
 
 /// Handle authentication response
 pub fn handle_authentication_response(
-    enb_ue: &EnbUe,
+    _enb_ue: &EnbUe,
     mme_ue: &mut MmeUe,
     data: &[u8],
 ) -> EmmResult<bool> {
@@ -341,7 +341,7 @@ pub fn handle_authentication_response(
 
 /// Handle identity response
 pub fn handle_identity_response(
-    enb_ue: &EnbUe,
+    _enb_ue: &EnbUe,
     mme_ue: &mut MmeUe,
     data: &[u8],
 ) -> EmmResult<Option<String>> {
@@ -392,7 +392,7 @@ pub fn handle_identity_response(
 
 /// Handle security mode complete
 pub fn handle_security_mode_complete(
-    enb_ue: &EnbUe,
+    _enb_ue: &EnbUe,
     mme_ue: &mut MmeUe,
     data: &[u8],
 ) -> EmmResult<Option<String>> {
@@ -618,7 +618,7 @@ pub fn handle_extended_service_request(
 
 /// Handle detach request (from UE)
 pub fn handle_detach_request(
-    enb_ue: &EnbUe,
+    _enb_ue: &EnbUe,
     mme_ue: &mut MmeUe,
     data: &[u8],
 ) -> EmmResult<(u8, bool)> {

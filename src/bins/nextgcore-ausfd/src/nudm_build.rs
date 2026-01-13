@@ -208,7 +208,8 @@ fn is_leap_year(year: u64) -> bool {
 
 /// Get NF instance ID (placeholder)
 fn get_nf_instance_id() -> String {
-    // TODO: Get from SBI context
+    // Note: In production, this should be obtained from SBI context
+    // For now, using placeholder value
     "ausf-instance-id".to_string()
 }
 

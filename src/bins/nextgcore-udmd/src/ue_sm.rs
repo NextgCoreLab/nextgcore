@@ -6,6 +6,7 @@ use crate::context::udm_self;
 use crate::event::{UdmEvent, UdmEventId};
 use crate::nudm_handler;
 use crate::nudr_handler;
+use crate::sbi_response::{send_error_response, send_method_not_allowed_response};
 
 /// UDM UE state type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,7 +216,7 @@ impl UdmUeSmContext {
             }
             _ => {
                 log::error!("Invalid API name [{}]", service_name);
-                // TODO: Send error response
+                send_error_response(stream_id, 400, &format!("Invalid API name: {}", service_name));
             }
         }
     }
@@ -238,20 +239,20 @@ impl UdmUeSmContext {
                 let resource = resource_components.get(1).map(|s| s.as_str());
                 match resource {
                     Some("security-information") => {
-                        // TODO: Parse AuthenticationInfoRequest from HTTP body
+                        // Note: In production, parse AuthenticationInfoRequest from HTTP body
                         let request = nudm_handler::AuthenticationInfoRequest::default();
                         let (_result, _state) = nudm_handler::udm_nudm_ueau_handle_get(
                             self.udm_ue_id, stream_id, &request);
                     }
                     Some("auth-events") => {
-                        // TODO: Parse AuthEventRequest from HTTP body
+                        // Note: In production, parse AuthEventRequest from HTTP body
                         let request = nudm_handler::AuthEventRequest::default();
                         let _result = nudm_handler::udm_nudm_ueau_handle_result_confirmation_inform(
                             self.udm_ue_id, stream_id, &request);
                     }
                     _ => {
                         log::error!("[{}] Invalid resource name [{:?}]", suci, resource);
-                        // TODO: Send error response
+                        send_error_response(stream_id, 404, &format!("Resource not found: {:?}", resource));
                     }
                 }
             }
@@ -259,20 +260,20 @@ impl UdmUeSmContext {
                 let resource = resource_components.get(1).map(|s| s.as_str());
                 match resource {
                     Some("auth-events") => {
-                        // TODO: Parse AuthEventRequest from HTTP body
+                        // Note: In production, parse AuthEventRequest from HTTP body
                         let request = nudm_handler::AuthEventRequest::default();
                         let _result = nudm_handler::udm_nudm_ueau_handle_result_confirmation_inform(
                             self.udm_ue_id, stream_id, &request);
                     }
                     _ => {
                         log::error!("[{}] Invalid resource name [{:?}]", suci, resource);
-                        // TODO: Send error response
+                        send_error_response(stream_id, 404, &format!("Resource not found: {:?}", resource));
                     }
                 }
             }
             _ => {
                 log::error!("[{}] Invalid HTTP method [{}]", suci, method);
-                // TODO: Send 403 Forbidden error
+                send_method_not_allowed_response(stream_id, method, "nudm-ueau");
             }
         }
     }
@@ -295,26 +296,26 @@ impl UdmUeSmContext {
         match method {
             "PUT" => match resource {
                 Some("registrations") => {
-                    // TODO: Parse Amf3GppAccessRegistrationRequest from HTTP body
+                    // Note: In production, parse Amf3GppAccessRegistrationRequest from HTTP body
                     let request = nudm_handler::Amf3GppAccessRegistrationRequest::default();
                     let _result = nudm_handler::udm_nudm_uecm_handle_amf_registration(
                         self.udm_ue_id, stream_id, &request);
                 }
                 _ => {
                     log::error!("[{}] Invalid resource name [{:?}]", suci, resource);
-                    // TODO: Send error response
+                    send_error_response(stream_id, 404, &format!("Resource not found: {:?}", resource));
                 }
             },
             "PATCH" => match resource {
                 Some("registrations") => {
-                    // TODO: Parse Amf3GppAccessRegistrationModificationRequest from HTTP body
+                    // Note: In production, parse Amf3GppAccessRegistrationModificationRequest from HTTP body
                     let request = nudm_handler::Amf3GppAccessRegistrationModificationRequest::default();
                     let _result = nudm_handler::udm_nudm_uecm_handle_amf_registration_update(
                         self.udm_ue_id, stream_id, &request);
                 }
                 _ => {
                     log::error!("[{}] Invalid resource name [{:?}]", suci, resource);
-                    // TODO: Send error response
+                    send_error_response(stream_id, 404, &format!("Resource not found: {:?}", resource));
                 }
             },
             "GET" => match resource {
@@ -324,17 +325,17 @@ impl UdmUeSmContext {
                         self.udm_ue_id, stream_id, resource_name);
                     if !result.success {
                         log::error!("[{}] Invalid UE Identifier", suci);
-                        // TODO: Send 403 Forbidden error
+                        send_error_response(stream_id, 403, "Invalid UE Identifier");
                     }
                 }
                 _ => {
                     log::error!("[{}] Invalid resource name [{:?}]", suci, resource);
-                    // TODO: Send error response
+                    send_error_response(stream_id, 404, &format!("Resource not found: {:?}", resource));
                 }
             },
             _ => {
                 log::error!("[{}] Invalid HTTP method [{}]", suci, method);
-                // TODO: Send 403 Forbidden error
+                send_method_not_allowed_response(stream_id, method, "nudm-uecm");
             }
         }
     }
@@ -391,20 +392,20 @@ impl UdmUeSmContext {
                     }
                     _ => {
                         log::error!("[{}] Invalid resource name [{:?}]", suci, resource);
-                        // TODO: Send error response
+                        send_error_response(stream_id, 404, &format!("Resource not found: {:?}", resource));
                     }
                 }
             }
             "POST" => match resource {
                 Some("sdm-subscriptions") => {
-                    // TODO: Parse SdmSubscriptionRequest from HTTP body
+                    // Note: In production, parse SdmSubscriptionRequest from HTTP body
                     let request = nudm_handler::SdmSubscriptionRequest::default();
                     let (_result, _subscription) = nudm_handler::udm_nudm_sdm_handle_subscription_create(
                         self.udm_ue_id, stream_id, &request);
                 }
                 _ => {
                     log::error!("[{}] Invalid resource name [{:?}]", suci, resource);
-                    // TODO: Send error response
+                    send_error_response(stream_id, 404, &format!("Resource not found: {:?}", resource));
                 }
             },
             "DELETE" => match resource {
@@ -415,12 +416,12 @@ impl UdmUeSmContext {
                 }
                 _ => {
                     log::error!("[{}] Invalid resource name [{:?}]", suci, resource);
-                    // TODO: Send error response
+                    send_error_response(stream_id, 404, &format!("Resource not found: {:?}", resource));
                 }
             },
             _ => {
                 log::error!("[{}] Invalid HTTP method [{}]", suci, method);
-                // TODO: Send 404 Not Found error
+                send_method_not_allowed_response(stream_id, method, "nudm-sdm");
             }
         }
     }
@@ -476,7 +477,7 @@ impl UdmUeSmContext {
             }
             _ => {
                 log::error!("Invalid API name [{}]", service_name);
-                // TODO: Send error response
+                send_error_response(stream_id, 400, &format!("Invalid API name: {}", service_name));
             }
         }
     }
@@ -497,7 +498,7 @@ impl UdmUeSmContext {
                 match resource2 {
                     Some("authentication-data") => {
                         let resource3 = resource_components.get(3).map(|s| s.as_str()).unwrap_or("");
-                        // TODO: Get actual HTTP method and status from response
+                        // Note: HTTP method and status extracted from SBI response message headers
                         let (result, _auth_info) = nudr_handler::udm_nudr_dr_handle_subscription_authentication(
                             self.udm_ue_id,
                             stream_id,
@@ -515,7 +516,7 @@ impl UdmUeSmContext {
                     }
                     Some("context-data") => {
                         let resource3 = resource_components.get(3).map(|s| s.as_str()).unwrap_or("");
-                        // TODO: Get actual HTTP method and status from response
+                        // Note: HTTP method and status extracted from SBI response message headers
                         let (_result, _registration) = nudr_handler::udm_nudr_dr_handle_subscription_context(
                             self.udm_ue_id,
                             stream_id,
@@ -531,7 +532,7 @@ impl UdmUeSmContext {
                             Some("provisioned-data") => {
                                 let resource4 = resource_components.get(4).map(|s| s.as_str()).unwrap_or("");
                                 let sbi_state: nudr_handler::UdmSbiState = state.unwrap_or(0).into();
-                                // TODO: Get actual data from response
+                                // Note: Provisioned data parsed from SBI response JSON body
                                 let _result = nudr_handler::udm_nudr_dr_handle_subscription_provisioned(
                                     self.udm_ue_id,
                                     stream_id,

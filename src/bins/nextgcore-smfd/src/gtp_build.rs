@@ -2,6 +2,12 @@
 //!
 //! Port of src/smf/s5c-build.c, src/smf/gn-build.c - GTP-C message building for SMF
 //! Handles GTPv2-C (S5/S8) and GTPv1-C (Gn) message construction
+//!
+//! Note: Many constants and types in this module are defined for completeness
+//! per 3GPP TS 29.274 but may not yet be used in the current implementation.
+
+#![allow(dead_code)]
+#![allow(unused_imports)]
 
 use bytes::{BufMut, BytesMut};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -1064,7 +1070,7 @@ impl Gtp2MessageBuilder {
     }
 
     /// Start a grouped IE (Bearer Context)
-    pub fn start_bearer_context(mut self, instance: u8) -> BearerContextBuilder {
+    pub fn start_bearer_context(self, instance: u8) -> BearerContextBuilder {
         BearerContextBuilder {
             parent: self,
             instance,

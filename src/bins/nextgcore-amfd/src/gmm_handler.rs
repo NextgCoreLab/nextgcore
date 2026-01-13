@@ -6,7 +6,7 @@ use crate::context::{
     AmfUe, RanUe, PlmnId, Guti5gs, UeSecurityCapability,
     OGS_NAS_KSI_NO_KEY_IS_AVAILABLE,
 };
-use crate::gmm_build::{GmmCause, mobile_identity_type, registration_type};
+use crate::gmm_build::{GmmCause, mobile_identity_type};
 
 // ============================================================================
 // Constants

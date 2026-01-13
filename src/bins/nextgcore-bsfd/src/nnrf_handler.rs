@@ -82,7 +82,7 @@ pub fn bsf_nnrf_handle_nf_discover(
 
     // Send request to discovered NF instance
     // In C: bsf_sbi_send_request(nf_instance, xact)
-    let request = crate::sbi_path::SbiRequest {
+    let request = crate::sbi_path::PathSbiRequest {
         method: "GET".to_string(),
         uri: format!("/nbsf-management/v1/pcf-bindings"),
         headers: vec![],

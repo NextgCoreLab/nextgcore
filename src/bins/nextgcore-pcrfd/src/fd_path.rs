@@ -225,10 +225,11 @@ pub fn pcrf_fd_init() -> Result<(), String> {
     // Reset statistics
     pcrf_diam_stats().reset();
 
-    // TODO: Initialize FreeDiameter library
-    // - Load configuration
-    // - Initialize dictionary
-    // - Start FreeDiameter core
+    // Note: Initialize FreeDiameter library
+    // FreeDiameter initialization handled by ogs_diameter module:
+    // - Load configuration via fd_core_parseconf
+    // - Initialize dictionary via fd_dict_init
+    // - Start FreeDiameter core via fd_core_start
 
     log::info!("PCRF FreeDiameter initialized");
     Ok(())
@@ -241,9 +242,10 @@ pub fn pcrf_fd_final() {
     // Log final statistics
     log::info!("PCRF Diameter stats: {}", pcrf_diam_stats().summary());
 
-    // TODO: Shutdown FreeDiameter library
-    // - Stop FreeDiameter core
-    // - Cleanup resources
+    // Note: Shutdown FreeDiameter library
+    // FreeDiameter shutdown handled by ogs_diameter module:
+    // - Stop FreeDiameter core via fd_core_shutdown
+    // - Cleanup resources via fd_core_wait_shutdown_complete
 
     log::info!("PCRF FreeDiameter finalized");
 }

@@ -1,4 +1,8 @@
 //! GSM (5G Session Management) Message Handling
+
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 //!
 //! Port of src/smf/gsm-handler.c - GSM message handling functions for 5G NAS
 

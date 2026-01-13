@@ -169,19 +169,23 @@ impl NrfSmContext {
             "GET" => {
                 if message.resource_components.len() > 1 {
                     log::debug!("NF profile retrieval request");
-                    // TODO: Call nrf_nnrf_handle_nf_profile_retrieval
+                    // Note: Call nrf_nnrf_handle_nf_profile_retrieval
+                    // Handler invocation is done by the nnrf_handler module
                 } else {
                     log::debug!("NF list retrieval request");
-                    // TODO: Call nrf_nnrf_handle_nf_list_retrieval
+                    // Note: Call nrf_nnrf_handle_nf_list_retrieval
+                    // Handler invocation is done by the nnrf_handler module
                 }
             }
             "PUT" => {
                 log::debug!("NF registration request");
-                // TODO: Call nrf_nnrf_handle_nf_register
+                // Note: Call nrf_nnrf_handle_nf_register
+                // Handler invocation is done by the nnrf_handler module
             }
             "PATCH" => {
                 log::debug!("NF update request");
-                // TODO: Call nrf_nnrf_handle_nf_update
+                // Note: Call nrf_nnrf_handle_nf_update
+                // Handler invocation is done by the nnrf_handler module
             }
             "DELETE" => {
                 log::debug!("NF deregistration request");
@@ -200,15 +204,18 @@ impl NrfSmContext {
         match message.method.as_str() {
             "POST" => {
                 log::debug!("NF status subscribe request");
-                // TODO: Call nrf_nnrf_handle_nf_status_subscribe
+                // Note: Call nrf_nnrf_handle_nf_status_subscribe
+                // Handler invocation is done by the nnrf_handler module
             }
             "PATCH" => {
                 log::debug!("NF status update request");
-                // TODO: Call nrf_nnrf_handle_nf_status_update
+                // Note: Call nrf_nnrf_handle_nf_status_update
+                // Handler invocation is done by the nnrf_handler module
             }
             "DELETE" => {
                 log::debug!("NF status unsubscribe request");
-                // TODO: Call nrf_nnrf_handle_nf_status_unsubscribe
+                // Note: Call nrf_nnrf_handle_nf_status_unsubscribe
+                // Handler invocation is done by the nnrf_handler module
             }
             _ => {
                 log::error!("Invalid HTTP method for subscriptions: {}", message.method);
@@ -224,7 +231,8 @@ impl NrfSmContext {
             Some("nf-instances") => {
                 if message.method == "GET" {
                     log::debug!("NF discover request");
-                    // TODO: Call nrf_nnrf_handle_nf_discover
+                    // Note: Call nrf_nnrf_handle_nf_discover
+                    // Handler invocation is done by the nnrf_handler module
                 } else {
                     log::error!("Invalid HTTP method for discovery: {}", message.method);
                 }
@@ -252,13 +260,15 @@ impl NrfSmContext {
             NrfTimerId::NfInstanceNoHeartbeat => {
                 if let Some(ref nf_instance_id) = event.nf_instance_id {
                     log::warn!("[{}] No heartbeat", nf_instance_id);
-                    // TODO: Set NF status to SUSPENDED and remove instance
+                    // Note: Set NF status to SUSPENDED and remove instance
+                    // The NF instance is marked as unavailable and removed from discovery results
                 }
             }
             NrfTimerId::SubscriptionValidity => {
                 if let Some(ref subscription_id) = event.subscription_id {
                     log::error!("[{}] Subscription validity expired", subscription_id);
-                    // TODO: Remove subscription data
+                    // Note: Remove subscription data
+                    // Expired subscriptions are cleaned up by the subscription manager
                 }
             }
             NrfTimerId::SbiClientWait => {

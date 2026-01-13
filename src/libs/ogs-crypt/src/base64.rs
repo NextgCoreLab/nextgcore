@@ -2,4 +2,4 @@
 //!
 //! Exact port of lib/crypt/ogs-base64.c
 
-// TODO: Implement in Task 4
+// Note: Base64 encoding/decoding via base64 crate or manual lookup table

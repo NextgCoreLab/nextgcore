@@ -1,0 +1,403 @@
+================================================================================
+                        NextGCore Implementation Roadmap
+================================================================================
+Total TODOs: 316
+Generated: 2026-01-10
+
+This roadmap organizes the remaining implementation tasks by priority and
+dependency order. Each phase builds upon the previous one.
+
+================================================================================
+PHASE 1: Core Infrastructure (Priority: Critical)
+================================================================================
+Estimated Tasks: ~40 TODOs
+
+These are foundational components that other features depend on.
+
+1.1 Timer Management System
+----------------------------
+Files affected: main.rs in all NFs
+  - src/bins/nextgcore-nssfd/src/main.rs:219    - TODO: Implement timer manager
+  - src/bins/nextgcore-bsfd/src/main.rs:216     - TODO: Implement timer manager
+  - src/bins/nextgcore-scpd/src/main.rs:220     - TODO: Implement timer manager
+  - src/bins/nextgcore-seppd/src/main.rs:269    - TODO: Implement timer manager
+  - src/bins/nextgcore-pcfd/src/main.rs:231     - TODO: Implement timer manager similar to UDM
+  - src/bins/nextgcore-ausfd/src/main.rs:215    - TODO: Create timer event and dispatch to state machine
+  - src/bins/nextgcore-udmd/src/main.rs:218     - TODO: Create timer event and dispatch to state machine
+
+Implementation strategy:
+  1. Create common timer module in libs/ogs-core or as shared NF utility
+  2. Implement timer wheel or hierarchical timer queue
+  3. Integrate with each NF's event loop
+
+1.2 SBI Client/Server Infrastructure
+------------------------------------
+Common across all NFs (sbi_path.rs files):
+  - Initialize SELF NF instance (4 instances)
+  - Initialize NRF NF instance (3 instances)
+  - Setup subscription data (2 instances)
+  - Start/Stop SBI server (6 instances)
+  - Start/Stop SBI client (4 instances)
+
+Files:
+  - src/bins/nextgcore-nssfd/src/sbi_path.rs:47-79
+  - src/bins/nextgcore-bsfd/src/sbi_path.rs:47-79
+  - src/bins/nextgcore-scpd/src/sbi_path.rs:79-115
+  - src/bins/nextgcore-seppd/src/sbi_path.rs:77-104
+  - src/bins/nextgcore-amfd/src/sbi_path.rs:266-273
+  - src/bins/nextgcore-pcfd/src/sbi_path.rs:63
+
+Implementation strategy:
+  1. Create SBI server abstraction using hyper/axum
+  2. Create SBI client abstraction with connection pooling
+  3. Implement NF instance lifecycle management
+
+1.3 SCTP Enhancements
+---------------------
+  - src/libs/ogs-sctp/src/kernel.rs:257         - TODO: Use sctp_sendmsg for PPID/stream
+  - src/libs/ogs-sctp/src/kernel.rs:277         - TODO: Use sctp_recvmsg to get PPID/stream info
+
+================================================================================
+PHASE 2: Error Response Framework (Priority: High)
+================================================================================
+Estimated Tasks: ~50 TODOs
+
+Unified error handling across all NFs.
+
+2.1 Generic Error Response Helper
+---------------------------------
+Create: src/libs/ogs-sbi/src/error.rs
+
+TODOs to address (29 "Send error response" + 5 "Send 404 error response" +
+                  5 "Send 403 Forbidden error" + others):
+
+NRF:
+  (none - NRF is the registry)
+
+NSSF:
+  - src/bins/nextgcore-nssfd/src/nssf_sm.rs:134     - TODO: Send error response
+  - src/bins/nextgcore-nssfd/src/nssf_sm.rs:148     - TODO: Send error response
+
+BSF:
+  - src/bins/nextgcore-bsfd/src/bsf_sm.rs:128       - TODO: Send error response
+  - src/bins/nextgcore-bsfd/src/bsf_sm.rs:142       - TODO: Send error response
+  - src/bins/nextgcore-bsfd/src/bsf_sm.rs:196       - TODO: Send 404 Not Found
+
+AUSF:
+  - src/bins/nextgcore-ausfd/src/nausf_handler.rs:31  - TODO: Send 400 Bad Request error
+  - src/bins/nextgcore-ausfd/src/ue_sm.rs:206       - TODO: Send error response
+  - src/bins/nextgcore-ausfd/src/ue_sm.rs:223       - TODO: Send error response
+  - src/bins/nextgcore-ausfd/src/ue_sm.rs:243       - TODO: Send 403 Forbidden error
+  - src/bins/nextgcore-ausfd/src/ue_sm.rs:316       - TODO: Send error response
+  - src/bins/nextgcore-ausfd/src/ausf_sm.rs:158     - TODO: Send error response
+  - src/bins/nextgcore-ausfd/src/ausf_sm.rs:172     - TODO: Send error response
+  - src/bins/nextgcore-ausfd/src/ausf_sm.rs:245     - TODO: Send 404 error response
+
+UDM:
+  - src/bins/nextgcore-udmd/src/sess_sm.rs:244      - TODO: Send error response
+  - src/bins/nextgcore-udmd/src/sess_sm.rs:274      - TODO: Send 403 Forbidden error
+  - src/bins/nextgcore-udmd/src/sess_sm.rs:279      - TODO: Send error response
+  - src/bins/nextgcore-udmd/src/ue_sm.rs:218        - TODO: Send error response
+  - src/bins/nextgcore-udmd/src/ue_sm.rs:254-479    - Multiple error response TODOs
+  - src/bins/nextgcore-udmd/src/udm_sm.rs:165-288   - Multiple error response TODOs
+
+PCF:
+  - src/bins/nextgcore-pcfd/src/pcf_sm.rs:135       - TODO: Send error response
+  - src/bins/nextgcore-pcfd/src/pcf_sm.rs:155       - TODO: Send error response
+  - src/bins/nextgcore-pcfd/src/pcf_sm.rs:210       - TODO: Send 404 error response
+  - src/bins/nextgcore-pcfd/src/pcf_sm.rs:302       - TODO: Send USER_UNKNOWN error
+  - src/bins/nextgcore-pcfd/src/pcf_sm.rs:362       - TODO: Send 404 error response
+  - src/bins/nextgcore-pcfd/src/am_sm.rs:186        - TODO: Send error response
+  - src/bins/nextgcore-pcfd/src/am_sm.rs:248        - TODO: Send error response
+  - src/bins/nextgcore-pcfd/src/sm_sm.rs:323-326    - TODO: Send USER_UNKNOWN/POLICY_CONTEXT_DENIED error
+
+SCP:
+  - src/bins/nextgcore-scpd/src/scp_sm.rs:126       - TODO: Send error response
+
+SEPP:
+  - src/bins/nextgcore-seppd/src/handshake_sm.rs:203 - TODO: Send error response
+
+2.2 Gateway Timeout Handler
+---------------------------
+  - src/bins/nextgcore-nssfd/src/nssf_sm.rs:353     - TODO: Send gateway timeout error
+  - src/bins/nextgcore-bsfd/src/bsf_sm.rs:357       - TODO: Send gateway timeout error
+  - src/bins/nextgcore-ausfd/src/ausf_sm.rs:476     - TODO: Send gateway timeout error
+  - src/bins/nextgcore-udmd/src/udm_sm.rs:635       - TODO: Send gateway timeout error
+  - src/bins/nextgcore-scpd/src/scp_sm.rs:290       - TODO: Send gateway timeout error
+  - src/bins/nextgcore-pcfd/src/pcf_sm.rs:606       - TODO: Send gateway timeout error
+
+================================================================================
+PHASE 3: NRF Integration (Priority: High)
+================================================================================
+Estimated Tasks: ~35 TODOs
+
+NF registration, discovery, and subscription management.
+
+3.1 NF Status Notify Handler
+----------------------------
+  - src/bins/nextgcore-nssfd/src/nssf_sm.rs:160     - TODO: Call ogs_nnrf_nfm_handle_nf_status_notify
+  - src/bins/nextgcore-bsfd/src/bsf_sm.rs:154       - TODO: Call ogs_nnrf_nfm_handle_nf_status_notify
+  - src/bins/nextgcore-ausfd/src/ausf_sm.rs:185     - TODO: Call ogs_nnrf_nfm_handle_nf_status_notify
+  - src/bins/nextgcore-udmd/src/udm_sm.rs:204       - TODO: Call ogs_nnrf_nfm_handle_nf_status_notify
+  - src/bins/nextgcore-scpd/src/scp_sm.rs:162       - TODO: Call ogs_nnrf_nfm_handle_nf_status_notify
+  - src/bins/nextgcore-seppd/src/sepp_sm.rs:198     - TODO: Call ogs_nnrf_nfm_handle_nf_status_notify
+  - src/bins/nextgcore-pcfd/src/pcf_sm.rs:167       - TODO: Call ogs_nnrf_nfm_handle_nf_status_notify
+
+3.2 NF Discovery Handlers
+-------------------------
+  - src/bins/nextgcore-nssfd/src/nssf_sm.rs:282     - TODO: Call nssf_nnrf_handle_nf_discover
+  - src/bins/nextgcore-bsfd/src/bsf_sm.rs:313       - TODO: Call bsf_nnrf_handle_nf_discover
+  - src/bins/nextgcore-ausfd/src/ausf_sm.rs:358     - TODO: Call ausf_nnrf_handle_nf_discover
+  - src/bins/nextgcore-udmd/src/udm_sm.rs:474       - TODO: Call udm_nnrf_handle_nf_discover
+  - src/bins/nextgcore-pcfd/src/pcf_sm.rs:472       - TODO: Call pcf_nnrf_handle_nf_discover
+  - src/bins/nextgcore-nrfd/src/nrf_sm.rs:227       - TODO: Call nrf_nnrf_handle_nf_discover
+
+3.3 Subscription Management
+---------------------------
+  - src/bins/nextgcore-nssfd/src/nssf_sm.rs:266     - TODO: Handle subscription response
+  - src/bins/nextgcore-nssfd/src/nssf_sm.rs:342     - TODO: Send new subscription and remove old one
+  - src/bins/nextgcore-nssfd/src/nssf_sm.rs:348     - TODO: Send subscription update
+  - src/bins/nextgcore-bsfd/src/bsf_sm.rs:297-352   - Subscription handling TODOs
+  - src/bins/nextgcore-ausfd/src/ausf_sm.rs:338-471 - Subscription handling TODOs
+  - src/bins/nextgcore-udmd/src/udm_sm.rs:456-630   - Subscription handling TODOs
+  - src/bins/nextgcore-scpd/src/scp_sm.rs:279-285   - Subscription handling TODOs
+  - src/bins/nextgcore-pcfd/src/pcf_sm.rs:458-601   - Subscription handling TODOs
+
+3.4 NF Instance FSM Dispatch
+----------------------------
+  - src/bins/nextgcore-nssfd/src/nssf_sm.rs:259     - TODO: Dispatch to NF instance FSM
+  - src/bins/nextgcore-bsfd/src/bsf_sm.rs:290       - TODO: Dispatch to NF instance FSM
+  - src/bins/nextgcore-ausfd/src/ausf_sm.rs:334     - TODO: Dispatch to NF instance FSM
+  - src/bins/nextgcore-udmd/src/udm_sm.rs:452       - TODO: Dispatch to NF instance FSM
+  - src/bins/nextgcore-pcfd/src/pcf_sm.rs:454       - TODO: Dispatch to NF instance FSM
+
+3.5 NRF Server Handlers
+-----------------------
+  - src/bins/nextgcore-nrfd/src/nnrf_handler.rs:252  - TODO: Apply patch items
+  - src/bins/nextgcore-nrfd/src/nnrf_handler.rs:298  - TODO: Update validity time
+  - src/bins/nextgcore-nrfd/src/nnrf_handler.rs:322  - TODO: Return list of NF instance URIs
+  - src/bins/nextgcore-nrfd/src/nnrf_handler.rs:336  - TODO: Return NF profile
+  - src/bins/nextgcore-nrfd/src/nnrf_handler.rs:361  - TODO: Search for matching NF instances
+  - src/bins/nextgcore-nrfd/src/nf_sm.rs:174-291    - NF register/update/deregister handlers
+  - src/bins/nextgcore-nrfd/src/nrf_sm.rs:172-261   - NRF state machine handlers
+
+================================================================================
+PHASE 4: Service-Specific Handlers (Priority: Medium)
+================================================================================
+Estimated Tasks: ~80 TODOs
+
+4.1 AUSF - Authentication Service
+---------------------------------
+  - src/bins/nextgcore-ausfd/src/nausf_handler.rs:71  - TODO: Extract res_star from request body
+  - src/bins/nextgcore-ausfd/src/nudm_handler.rs:37   - TODO: Extract from response
+  - src/bins/nextgcore-ausfd/src/nudm_handler.rs:87   - TODO: Build and send HTTP 201 Created
+  - src/bins/nextgcore-ausfd/src/nudm_handler.rs:113  - TODO: Build and send HTTP 204 No Content
+  - src/bins/nextgcore-ausfd/src/nudm_handler.rs:141  - TODO: Extract from response
+  - src/bins/nextgcore-ausfd/src/nudm_handler.rs:174  - TODO: Build and send HTTP 200 OK
+  - src/bins/nextgcore-ausfd/src/nudm_handler.rs:260  - TODO: Store autn in AusfUe
+  - src/bins/nextgcore-ausfd/src/nudm_build.rs:211    - TODO: Get from SBI context
+
+4.2 UDM - Subscriber Data Management
+------------------------------------
+  - src/bins/nextgcore-udmd/src/sess_sm.rs:263      - TODO: Parse SmfRegistrationRequest from HTTP body
+  - src/bins/nextgcore-udmd/src/ue_sm.rs:241-400    - Multiple HTTP body parsing TODOs
+
+4.3 BSF - Binding Support Function
+----------------------------------
+  - src/bins/nextgcore-bsfd/src/nbsf_handler.rs:254  - TODO: Implement PATCH logic
+  - src/bins/nextgcore-bsfd/src/bsf_sm.rs:196-223   - PCF binding handlers
+
+4.4 NSSF - Network Slice Selection
+----------------------------------
+  - src/bins/nextgcore-nssfd/src/nssf_sm.rs:185     - TODO: Call nssf_nnrf_nsselection_handle_get_from_amf_or_vnssf
+  - src/bins/nextgcore-nssfd/src/nssf_sm.rs:310     - TODO: Call nssf_nnrf_nsselection_handle_get_from_hnssf
+
+4.5 PCF - Policy Control Function
+---------------------------------
+  - src/bins/nextgcore-pcfd/src/npcf_handler.rs:614  - TODO: Implement proper VPLMN detection
+  - src/bins/nextgcore-pcfd/src/nudr_handler.rs:246  - TODO: Implement actual database query
+  - src/bins/nextgcore-pcfd/src/nudr_handler.rs:273  - TODO: Implement actual database query
+  - src/bins/nextgcore-pcfd/src/am_sm.rs:174-251     - AM policy control handlers
+  - src/bins/nextgcore-pcfd/src/sm_sm.rs:83-381      - SM policy control handlers
+
+4.6 AMF - Access and Mobility Function
+--------------------------------------
+  - src/bins/nextgcore-amfd/src/sbi_path.rs:281-388  - SBI request/discovery TODOs
+  - src/bins/nextgcore-amfd/src/namf_handler.rs:284  - TODO: Trigger session removal
+  - src/bins/nextgcore-amfd/src/namf_handler.rs:308  - TODO: Initiate network-initiated deregistration
+  - src/bins/nextgcore-amfd/src/amf_sm.rs:117-183   - Route to handlers, decode NGAP
+  - src/bins/nextgcore-amfd/src/main.rs:383         - TODO: Route to appropriate gNB FSM
+  - src/bins/nextgcore-amfd/src/ngap_sm.rs:125      - TODO: Decode NGAP message and handle
+
+4.7 SMF - Session Management Function
+-------------------------------------
+  - src/bins/nextgcore-smfd/src/smf_sm.rs:119-340   - GTPv2/GTPv1/Session/PFCP handling
+  - src/bins/nextgcore-smfd/src/timer.rs:304-310    - Timer event sending
+  - src/bins/nextgcore-smfd/src/gsm_sm.rs:349-417   - PFCP cause/message handling
+  - src/bins/nextgcore-smfd/src/pfcp_sm.rs:168-222  - PFCP message parsing
+
+================================================================================
+PHASE 5: SCP/SEPP Routing (Priority: Medium)
+================================================================================
+Estimated Tasks: ~40 TODOs
+
+5.1 SCP - Service Communication Proxy
+-------------------------------------
+  - src/bins/nextgcore-scpd/src/sbi_path.rs:302-500 - VPLMN routing, discovery, forwarding
+
+Key TODOs:
+  - Check if target is in VPLMN (requires SEPP)
+  - Forward request to target
+  - Send discovery request to NRF
+  - Parse SearchResult from response body
+  - Find NF instance by discovery parameters
+  - Store NF service producer
+  - Get client for the discovered NF
+  - Forward original request to discovered NF
+
+5.2 SEPP - Security Edge Protection Proxy
+-----------------------------------------
+  - src/bins/nextgcore-seppd/src/sbi_path.rs:203-434 - Request handling/forwarding
+  - src/bins/nextgcore-seppd/src/n32c_build.rs:23-90 - Serving PLMN IDs
+  - src/bins/nextgcore-seppd/src/handshake_sm.rs:*  - N32 handshake state machine
+  - src/bins/nextgcore-seppd/src/sepp_sm.rs:252     - Extract sender from SecNegotiateReqData
+
+Handshake SM TODOs (src/bins/nextgcore-seppd/src/handshake_sm.rs):
+  - Line 85: sepp_n32c_handshake_send_security_capability_request
+  - Line 136-144: Timer management
+  - Line 203: Send error response
+  - Line 298: Restart timer and send request
+  - Line 430-576: Timer management for various states
+  - Line 605-620: Request/response handling stubs
+
+================================================================================
+PHASE 6: Protocol Libraries (Priority: Medium)
+================================================================================
+Estimated Tasks: ~20 TODOs
+
+6.1 NGAP/S1AP Protocol Support
+------------------------------
+  - src/libs/ogs-ngap/src/lib.rs:5                  - TODO: Implement in Task 7
+  - src/libs/ogs-s1ap/src/lib.rs:5                  - TODO: Implement in Task 7
+
+Note: These require ASN.1 codec implementation (asn1c/rasn integration)
+
+6.2 NAS Protocol Enhancements
+-----------------------------
+  - src/libs/ogs-nas/src/eps/types.rs:317          - TODO (IMEI encoding)
+
+6.3 Cryptographic Functions
+---------------------------
+  - src/libs/ogs-crypt/src/base64.rs:5             - TODO: Implement in Task 4
+
+================================================================================
+PHASE 7: EPC/Diameter Support (Priority: Low)
+================================================================================
+Estimated Tasks: ~25 TODOs
+
+7.1 HSS - Home Subscriber Server (4G)
+-------------------------------------
+  - src/bins/nextgcore-hssd/src/sm.rs:96-195       - Database polling, change events
+  - src/bins/nextgcore-hssd/src/s6a_path.rs:57-183 - Diameter S6a handlers
+  - src/bins/nextgcore-hssd/src/cx_path.rs:80-169  - Diameter Cx handlers
+  - src/bins/nextgcore-hssd/src/context.rs:591     - YAML configuration parsing
+
+7.2 PCRF - Policy and Charging Rules Function (4G)
+--------------------------------------------------
+  - src/bins/nextgcore-pcrfd/src/gx_path.rs:167-326 - Gx Diameter handlers
+  - src/bins/nextgcore-pcrfd/src/fd_path.rs:228-244 - FreeDiameter integration
+  - src/bins/nextgcore-pcrfd/src/rx_path.rs:151-280 - Rx Diameter handlers
+  - src/bins/nextgcore-pcrfd/src/context.rs:489     - YAML configuration parsing
+
+7.3 SGW-C/SGW-U (4G)
+--------------------
+  - src/bins/nextgcore-sgwcd/src/sm.rs:99-176      - GTP/PFCP message handling
+  - src/bins/nextgcore-sgwcd/src/pfcp_sm.rs:87-207 - PFCP state machine
+  - src/bins/nextgcore-sgwud/src/timer.rs:229-236  - Timer events
+  - src/bins/nextgcore-sgwud/src/main.rs:53        - Main event loop
+
+================================================================================
+PHASE 8: UPF Enhancements (Priority: Low)
+================================================================================
+Estimated Tasks: ~5 TODOs
+
+  - src/bins/nextgcore-upfd/src/timer.rs:229       - TODO: Send UPF_EVT_N4_TIMER event
+  - src/bins/nextgcore-upfd/src/timer.rs:236       - TODO: Send UPF_EVT_N4_NO_HEARTBEAT event
+
+================================================================================
+IMPLEMENTATION ORDER RECOMMENDATION
+================================================================================
+
+Week-by-week suggested approach:
+
+WEEK 1-2: Foundation
+- Complete Phase 1 (Timer Management + SBI Infrastructure)
+- Enables all other NF features
+
+WEEK 3-4: Error Handling
+- Complete Phase 2 (Error Response Framework)
+- Makes NFs production-ready for error scenarios
+
+WEEK 5-6: NRF Integration
+- Complete Phase 3 (NRF Integration)
+- Enables dynamic NF discovery and registration
+
+WEEK 7-10: Service Handlers
+- Complete Phase 4 (Service-Specific Handlers)
+- Full 5GC functionality
+
+WEEK 11-12: Routing
+- Complete Phase 5 (SCP/SEPP Routing)
+- Inter-PLMN roaming support
+
+WEEK 13-14: Protocol Libraries
+- Complete Phase 6 (Protocol Libraries)
+- NGAP/S1AP full implementation
+
+WEEK 15-16: EPC Support
+- Complete Phase 7 (EPC/Diameter)
+- 4G/LTE compatibility
+
+WEEK 17: Finalization
+- Complete Phase 8 (UPF Enhancements)
+- Final testing and integration
+
+================================================================================
+QUICK WINS (Can be done anytime, independent tasks)
+================================================================================
+
+These are small, isolated tasks that can be completed quickly:
+
+1. Error response helpers (just need a utility function)
+2. Timer manager (can use existing tokio timers)
+3. Configuration parsing (serde_yaml already available)
+4. HTTP body parsing (serde_json already available)
+
+================================================================================
+DEPENDENCIES GRAPH
+================================================================================
+
+Phase 1 (Infrastructure)
+    ↓
+Phase 2 (Error Handling)  ←→  Phase 3 (NRF Integration)
+    ↓                              ↓
+Phase 4 (Service Handlers)
+    ↓
+Phase 5 (SCP/SEPP)
+    ↓
+Phase 6 (Protocols)  ←→  Phase 7 (EPC)
+    ↓
+Phase 8 (UPF)
+
+================================================================================
+NOTES
+================================================================================
+
+- Phase 1 blocks everything else (critical path)
+- Phases 2-4 can be partially parallelized across different NFs
+- Phases 6-7 are optional for 5G-only deployments
+- Phase 8 is mostly complete (UPF data plane works)
+
+Total effort estimate: 316 TODOs across ~8 phases
+Suggested timeline: 17 weeks for full implementation
+Minimum viable: Phases 1-4 (~200 TODOs, ~10 weeks) for basic 5GC operation

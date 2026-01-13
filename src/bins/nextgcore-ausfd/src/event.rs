@@ -284,6 +284,22 @@ impl AusfEvent {
         }
         self
     }
+
+    /// Set stream ID
+    pub fn with_stream_id(mut self, stream_id: u64) -> Self {
+        if let Some(ref mut sbi) = self.sbi {
+            sbi.stream_id = Some(stream_id);
+        } else {
+            self.sbi = Some(SbiEventData {
+                request: None,
+                response: None,
+                message: None,
+                stream_id: Some(stream_id),
+                data: None,
+            });
+        }
+        self
+    }
 }
 
 impl Default for AusfEvent {

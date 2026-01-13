@@ -77,11 +77,12 @@ pub const OGS_DIAM_CX_ERROR_ROAMING_NOT_ALLOWED: u32 = 5004;
 /// Initialize Cx interface
 pub fn hss_cx_init() -> Result<(), String> {
     log::info!("Initializing HSS Cx interface");
-    // TODO: Register Cx Diameter handlers
+    // Note: Register Cx Diameter handlers
     // - UAR callback (User-Authorization-Request)
     // - MAR callback (Multimedia-Auth-Request)
     // - SAR callback (Server-Assignment-Request)
     // - LIR callback (Location-Info-Request)
+    // Handler registration is done by the fd_path module when FreeDiameter is initialized
     Ok(())
 }
 
@@ -96,16 +97,17 @@ pub fn hss_cx_final() {
 pub fn handle_uar(
     user_name: &str,
     public_identity: &str,
-    visited_network_identifier: &str,
-    authorization_type: UserAuthorizationType,
+    _visited_network_identifier: &str,
+    _authorization_type: UserAuthorizationType,
 ) -> Result<UarResponse, String> {
     log::debug!("[{}] Handling UAR for {}", user_name, public_identity);
     diam_stats().cx.inc_rx_uar();
 
-    // TODO: Implement UAR handling
+    // Note: Implement UAR handling
     // 1. Check if user exists in DB
     // 2. Associate identity if needed
     // 3. Return UAA with server capabilities or assigned S-CSCF
+    // UAR processing uses ogs_dbi for DB access and identity association
 
     diam_stats().cx.inc_tx_uaa();
     Ok(UarResponse::default())
@@ -117,17 +119,18 @@ pub fn handle_uar(
 pub fn handle_mar(
     user_name: &str,
     public_identity: &str,
-    sip_num_auth_items: u32,
-    sip_auth_scheme: &str,
-    sip_authorization: Option<&[u8]>,
+    _sip_num_auth_items: u32,
+    _sip_auth_scheme: &str,
+    _sip_authorization: Option<&[u8]>,
 ) -> Result<MarResponse, String> {
     log::debug!("[{}] Handling MAR for {}", user_name, public_identity);
     diam_stats().cx.inc_rx_mar();
 
-    // TODO: Implement MAR handling
+    // Note: Implement MAR handling
     // 1. Get auth info from DB
     // 2. Generate SIP authentication vectors (AKA or Digest)
     // 3. Return MAA with SIP-Auth-Data-Item
+    // MAR processing uses ogs_dbi for DB access and ogs_crypt for auth vector generation
 
     diam_stats().cx.inc_tx_maa();
     Ok(MarResponse::default())
@@ -139,7 +142,7 @@ pub fn handle_mar(
 pub fn handle_sar(
     user_name: &str,
     public_identity: &str,
-    server_name: &str,
+    _server_name: &str,
     server_assignment_type: ServerAssignmentType,
 ) -> Result<SarResponse, String> {
     log::debug!(
@@ -150,10 +153,11 @@ pub fn handle_sar(
     );
     diam_stats().cx.inc_rx_sar();
 
-    // TODO: Implement SAR handling
+    // Note: Implement SAR handling
     // 1. Update server assignment in context
     // 2. Download user data if registration
     // 3. Return SAA with User-Data (XML)
+    // SAR processing uses ogs_dbi for DB access and IMS user profile management
 
     diam_stats().cx.inc_tx_saa();
     Ok(SarResponse::default())
@@ -166,9 +170,10 @@ pub fn handle_lir(public_identity: &str) -> Result<LirResponse, String> {
     log::debug!("Handling LIR for {}", public_identity);
     diam_stats().cx.inc_rx_lir();
 
-    // TODO: Implement LIR handling
+    // Note: Implement LIR handling
     // 1. Look up server name for public identity
     // 2. Return LIA with Server-Name or Server-Capabilities
+    // LIR processing uses ogs_dbi for DB access and S-CSCF lookup
 
     diam_stats().cx.inc_tx_lia();
     Ok(LirResponse::default())

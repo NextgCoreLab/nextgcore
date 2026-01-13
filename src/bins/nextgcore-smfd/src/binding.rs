@@ -1,4 +1,8 @@
 //! SMF Policy Binding Implementation
+
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 //!
 //! This module implements policy binding for the SMF, handling PCC rules
 //! from the PCF and binding them to bearers/QoS flows.

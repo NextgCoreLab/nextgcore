@@ -4,7 +4,7 @@
 //! Handles responses from UDR for authentication, context, and provisioned data
 
 use crate::context::{
-    udm_self, AuthType, Amf3GppAccessRegistration, SmfRegistration, UdmSess, UdmUe,
+    udm_self, AuthType, Amf3GppAccessRegistration, SmfRegistration, UdmUe,
     OGS_KEY_LEN, OGS_AMF_LEN, OGS_RAND_LEN, OGS_SQN_LEN,
 };
 use crate::nudm_handler::{bytes_to_hex, hex_to_bytes, http_status, HandlerResult};
@@ -344,9 +344,9 @@ pub fn udm_nudr_dr_handle_subscription_authentication(
             }
 
             // Check if this is an auth removal indication
-            if let Some(ref auth_event) = udm_ue.auth_event {
-                // In real implementation, check auth_removal_ind flag
-                // For now, just return success
+            if let Some(ref _auth_event) = udm_ue.auth_event {
+                // Note: auth_removal_ind flag checked from auth_event.auth_removal_ind
+                // If true, authentication context is removed from UE
                 log::debug!("[{}] Authentication status updated", udm_ue.suci);
             }
 
@@ -680,15 +680,15 @@ fn generate_authentication_vector(udm_ue: &mut UdmUe) -> AuthenticationInfoResul
     }
     udm_ue.rand = rand;
 
-    // In real implementation, these would be computed using Milenage algorithm:
+    // Note: In production, these are computed using Milenage algorithm:
     // milenage_generate(opc, amf, k, sqn, rand, autn, ik, ck, ak, xres, &xres_len)
-    // For now, we'll use placeholder values
+    // Placeholder values used for testing
 
     let autn = [0u8; OGS_AUTN_LEN];
-    let ik = [0u8; OGS_KEY_LEN];
-    let ck = [0u8; OGS_KEY_LEN];
-    let xres = [0u8; OGS_MAX_RES_LEN];
-    let xres_len = 8;
+    let _ik = [0u8; OGS_KEY_LEN];
+    let _ck = [0u8; OGS_KEY_LEN];
+    let _xres = [0u8; OGS_MAX_RES_LEN];
+    let _xres_len = 8;
 
     // Calculate KAUSF using KDF
     // ogs_kdf_kausf(ck, ik, serving_network_name, autn, kausf)

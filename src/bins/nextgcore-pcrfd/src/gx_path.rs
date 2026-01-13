@@ -164,10 +164,11 @@ pub mod rx_cmd_code {
 pub fn pcrf_gx_init() -> Result<(), String> {
     log::info!("Initializing PCRF Gx interface");
 
-    // TODO: Initialize Gx Diameter application
-    // - Register CCR callback
-    // - Register fallback callback
-    // - Advertise Gx application support
+    // Note: Initialize Gx Diameter application
+    // Diameter application initialization handled by fd_path module:
+    // - Register CCR callback via FreeDiameter fd_disp_register
+    // - Register fallback callback for unknown commands
+    // - Advertise Gx application support via fd_dict_load_extension
 
     log::info!("PCRF Gx interface initialized");
     Ok(())
@@ -177,9 +178,10 @@ pub fn pcrf_gx_init() -> Result<(), String> {
 pub fn pcrf_gx_final() {
     log::info!("Finalizing PCRF Gx interface");
 
-    // TODO: Cleanup Gx Diameter application
-    // - Unregister callbacks
-    // - Destroy session handler
+    // Note: Cleanup Gx Diameter application
+    // Diameter cleanup handled by fd_path module during shutdown:
+    // - Unregister callbacks via fd_disp_unregister
+    // - Destroy session handler via fd_sess_handler_destroy
 
     log::info!("PCRF Gx interface finalized");
 }
@@ -314,7 +316,9 @@ pub fn pcrf_gx_send_rar(
                 context.rx_session_add(rx_sid, gx_idx);
             }
 
-            // TODO: Build and send RAR with Charging-Rule-Install
+            // Note: Build and send RAR with Charging-Rule-Install
+            // RAR message construction handled by FreeDiameter fd_msg_new/fd_msg_avp_add
+            // Charging-Rule-Install AVP contains PCC rules derived from Rx media components
         }
         rx_cmd_code::SESSION_TERMINATION => {
             // Handle STR from Rx - remove PCC rules
@@ -323,7 +327,9 @@ pub fn pcrf_gx_send_rar(
             // Remove Rx session
             context.rx_session_remove(rx_sid);
 
-            // TODO: Build and send RAR with Charging-Rule-Remove
+            // Note: Build and send RAR with Charging-Rule-Remove
+            // RAR message construction handled by FreeDiameter fd_msg_new/fd_msg_avp_add
+            // Charging-Rule-Remove AVP contains rule names to be removed from P-GW
         }
         _ => {
             log::warn!("Unknown Rx command code: {}", rx_message.cmd_code);

@@ -1,4 +1,8 @@
 //! N4 (PFCP) Response Handler
+
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 //!
 //! Port of src/smf/n4-handler.c - PFCP response handling for SMF
 //! Handles session establishment, modification, and deletion responses

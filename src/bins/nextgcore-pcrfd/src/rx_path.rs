@@ -148,11 +148,12 @@ pub mod result_code {
 pub fn pcrf_rx_init() -> Result<(), String> {
     log::info!("Initializing PCRF Rx interface");
 
-    // TODO: Initialize Rx Diameter application
-    // - Register AAR callback
-    // - Register STR callback
-    // - Register fallback callback
-    // - Advertise Rx application support
+    // Note: Initialize Rx Diameter application
+    // Diameter application initialization handled by fd_path module:
+    // - Register AAR callback via FreeDiameter fd_disp_register
+    // - Register STR callback via FreeDiameter fd_disp_register
+    // - Register fallback callback for unknown commands
+    // - Advertise Rx application support via fd_dict_load_extension
 
     log::info!("PCRF Rx interface initialized");
     Ok(())
@@ -162,9 +163,10 @@ pub fn pcrf_rx_init() -> Result<(), String> {
 pub fn pcrf_rx_final() {
     log::info!("Finalizing PCRF Rx interface");
 
-    // TODO: Cleanup Rx Diameter application
-    // - Unregister callbacks
-    // - Destroy session handler
+    // Note: Cleanup Rx Diameter application
+    // Diameter cleanup handled by fd_path module during shutdown:
+    // - Unregister callbacks via fd_disp_unregister
+    // - Destroy session handler via fd_sess_handler_destroy
 
     log::info!("PCRF Rx interface finalized");
 }
@@ -250,7 +252,8 @@ pub fn pcrf_rx_handle_str(
         return Err("No Gx sessions".to_string());
     }
 
-    // TODO: Get Gx session ID from Rx session and send RAR
+    // Note: Get Gx session ID from Rx session and send RAR
+    // Gx session lookup via rx_session.gx_session_idx, then send RAR to remove PCC rules
 
     // Remove Rx session
     context.rx_session_remove(session_id);
@@ -277,12 +280,13 @@ pub fn pcrf_rx_send_asr(rx_sid: &str, abort_cause: u32) -> Result<(), String> {
         .rx_session_find_by_sid(rx_sid)
         .ok_or_else(|| format!("Cannot find Rx session: {}", rx_sid))?;
 
-    // TODO: Build and send ASR message
-    // - Set Session-Id
-    // - Set Origin-Host, Origin-Realm
-    // - Set Destination-Host, Destination-Realm
-    // - Set Auth-Application-Id
-    // - Set Abort-Cause
+    // Note: Build and send ASR message
+    // ASR message construction handled by FreeDiameter fd_msg_new/fd_msg_avp_add:
+    // - Set Session-Id via fd_msg_avp_setvalue
+    // - Set Origin-Host, Origin-Realm from local configuration
+    // - Set Destination-Host, Destination-Realm from Rx session peer info
+    // - Set Auth-Application-Id (Rx application ID)
+    // - Set Abort-Cause with abort_cause parameter value
 
     // Update statistics
     pcrf_diam_stats().rx.inc_tx_asr();

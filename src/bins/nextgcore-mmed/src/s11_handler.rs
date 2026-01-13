@@ -2,7 +2,7 @@
 //!
 //! Port of src/mme/mme-s11-handler.c - GTP-C message handling for S11 interface
 
-use crate::s11_build::{GtpCause, message_type, ie_type};
+use crate::s11_build::{message_type, ie_type};
 
 // ============================================================================
 // Error Types

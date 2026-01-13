@@ -19,7 +19,7 @@ mod tests {
     mod gtpv1_props {
         use super::*;
         use crate::v1::header::{Gtp1Header, Gtp1cMessageType, Gtp1uMessageType, GTP1_VERSION_1};
-        use crate::v1::message::{Gtp1Message, EchoRequest, EchoResponse, ErrorIndication};
+        use crate::v1::message::{Gtp1Message, ErrorIndication};
 
         // Feature: nextgcore-rust-conversion, Property 11: Protocol Message Round-Trip
         // Test: GTPv1 Echo Request round-trip

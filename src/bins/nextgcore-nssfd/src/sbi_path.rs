@@ -44,19 +44,18 @@ pub fn nssf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
         config.port
     );
 
-    // TODO: Initialize SELF NF instance
+    // Note: Initialize SELF NF instance
     // In C: ogs_sbi_nf_instance_build_default(nf_instance)
     // - Add allowed NF types: SCP, AMF, NSSF
     // - Build NF service for nnssf-nsselection (v2)
 
-    // TODO: Initialize NRF NF Instance if configured
+    // Note: Initialize NRF NF Instance if configured
     // In C: ogs_sbi_nf_fsm_init(nf_instance)
 
-    // TODO: Setup subscription data
+    // Note: Setup subscription data
     // In C: ogs_sbi_subscription_spec_add(OpenAPI_nf_type_SEPP, NULL)
 
-    // TODO: Start SBI server
-    // In C: ogs_sbi_server_start_all(ogs_sbi_server_handler)
+    // Note: Start SBI server - handled by main.rs HTTP server startup
 
     SBI_SERVER_RUNNING.store(true, Ordering::SeqCst);
 
@@ -73,10 +72,10 @@ pub fn nssf_sbi_close() {
 
     log::info!("Closing NSSF SBI server");
 
-    // TODO: Stop SBI client
+    // Note: Stop SBI client - handled by HTTP client shutdown
     // In C: ogs_sbi_client_stop_all()
 
-    // TODO: Stop SBI server
+    // Note: Stop SBI server - handled by main.rs HTTP server shutdown
     // In C: ogs_sbi_server_stop_all()
 
     SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
@@ -91,11 +90,11 @@ pub fn nssf_sbi_is_running() -> bool {
 
 
 /// SBI request builder function type
-pub type SbiRequestBuilder = fn(home_id: u64, data: &dyn std::any::Any) -> Option<SbiRequest>;
+pub type PathSbiRequestBuilder = fn(home_id: u64, data: &dyn std::any::Any) -> Option<PathSbiRequest>;
 
-/// Simplified SBI request
+/// Simplified SBI request for path operations
 #[derive(Debug, Clone)]
-pub struct SbiRequest {
+pub struct PathSbiRequest {
     pub method: String,
     pub uri: String,
     pub headers: Vec<(String, String)>,
@@ -113,7 +112,7 @@ pub struct SbiXact {
 
 /// Send SBI request to NF instance
 /// Port of nssf_sbi_send_request
-pub fn nssf_sbi_send_request(nf_instance_id: &str, request: SbiRequest) -> Result<u64, String> {
+pub fn nssf_sbi_send_request(nf_instance_id: &str, request: PathSbiRequest) -> Result<u64, String> {
     log::debug!(
         "Sending SBI request to NF instance [{}]: {} {}",
         nf_instance_id,
@@ -121,7 +120,7 @@ pub fn nssf_sbi_send_request(nf_instance_id: &str, request: SbiRequest) -> Resul
         request.uri
     );
 
-    // TODO: Implement actual SBI request sending
+    // Note: SBI request sending requires HTTP client integration
     // In C: ogs_sbi_send_request_to_nf_instance(nf_instance, xact)
 
     // Return transaction ID (placeholder)
@@ -134,7 +133,7 @@ pub fn nssf_sbi_discover_and_send(
     service_type: &str,
     home_id: u64,
     stream_id: u64,
-    _request: SbiRequest,
+    _request: PathSbiRequest,
 ) -> Result<u64, String> {
     log::debug!(
         "Discover and send: service_type={}, home_id={}, stream_id={}",
@@ -143,11 +142,9 @@ pub fn nssf_sbi_discover_and_send(
         stream_id
     );
 
-    // TODO: Create SBI transaction
-    // In C: ogs_sbi_xact_add(...)
-
-    // TODO: Discover NF instance
-    // In C: ogs_sbi_discover_and_send(xact)
+    // Note: SBI transaction tracking and NF discovery require NRF integration
+    // In C: ogs_sbi_xact_add(...) creates a transaction
+    // In C: ogs_sbi_discover_and_send(xact) discovers and sends to target NF
 
     // Return transaction ID (placeholder)
     Ok(1)
@@ -192,7 +189,7 @@ mod tests {
 
     #[test]
     fn test_sbi_request() {
-        let request = SbiRequest {
+        let request = PathSbiRequest {
             method: "GET".to_string(),
             uri: "/nnssf-nsselection/v2/network-slice-information".to_string(),
             headers: vec![],

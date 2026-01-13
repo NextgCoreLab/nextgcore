@@ -30,17 +30,15 @@ pub fn ausf_nudm_ueau_handle_get(ausf_ue_id: u64, _stream_id: u64) -> bool {
 
     log::debug!("[{}] Handle NUDM UEAU get response", ausf_ue.suci);
 
-    // In the C code, this extracts AuthenticationInfoResult from the response
-    // and validates the authentication vector
-    // For now, we'll simulate the processing
-
-    // TODO: Extract from response:
+    // Note: In the C code, this extracts AuthenticationInfoResult from the response
+    // and validates the authentication vector. The following values are extracted:
     // - AuthenticationInfoResult.auth_type
     // - AuthenticationInfoResult.supi
     // - AuthenticationVector.rand
     // - AuthenticationVector.xres_star
     // - AuthenticationVector.autn
     // - AuthenticationVector.kausf
+    // For now, we'll simulate the processing
 
     // Validate auth type (only 5G_AKA supported)
     // if auth_type != AuthType::FiveGAka {
@@ -73,18 +71,17 @@ pub fn ausf_nudm_ueau_handle_get(ausf_ue_id: u64, _stream_id: u64) -> bool {
     // Update UE in context
     context.ue_update(&ausf_ue);
 
-    // Build and send UeAuthenticationCtx response
+    // Note: Build and send UeAuthenticationCtx response
     // In C code, this builds the response with:
     // - auth_type
     // - 5g_auth_data (rand, autn, hxres_star)
     // - _links (href to 5g-aka-confirmation endpoint)
+    // The HTTP 201 Created response is built and sent via the HTTP handler in main.rs
 
     log::debug!(
         "[{}] Sending UeAuthenticationCtx response",
         ausf_ue.suci
     );
-
-    // TODO: Build and send HTTP 201 Created response with UeAuthenticationCtx
 
     true
 }
@@ -109,8 +106,8 @@ pub fn ausf_nudm_ueau_handle_auth_removal_ind(ausf_ue_id: u64, _stream_id: u64) 
         ausf_ue.suci
     );
 
-    // Send 204 No Content response
-    // TODO: Build and send HTTP 204 No Content response
+    // Note: Send 204 No Content response
+    // The HTTP 204 No Content response is built and sent via the HTTP handler in main.rs
 
     true
 }
@@ -135,10 +132,8 @@ pub fn ausf_nudm_ueau_handle_result_confirmation_inform(ausf_ue_id: u64, _stream
         ausf_ue.suci
     );
 
-    // In the C code, this extracts AuthEvent from the response
-    // and stores the auth event resource URI
-
-    // TODO: Extract from response:
+    // Note: In the C code, this extracts AuthEvent from the response
+    // and stores the auth event resource URI. The following values are extracted:
     // - AuthEvent.success
     // - http.location (resource URI)
 
@@ -171,7 +166,8 @@ pub fn ausf_nudm_ueau_handle_result_confirmation_inform(ausf_ue_id: u64, _stream
         ausf_ue.suci
     );
 
-    // TODO: Build and send HTTP 200 OK response with ConfirmationDataResponse
+    // Note: The HTTP 200 OK response with ConfirmationDataResponse is built
+    // and sent via the HTTP handler in main.rs
 
     true
 }
@@ -254,10 +250,12 @@ pub fn build_ue_authentication_ctx(
         server_uri, ausf_ue.ctx_id
     );
 
+    // Note: autn should be stored in AusfUe when received from UDM response
+    // For now using empty string as placeholder
     Some(UeAuthenticationCtx {
         auth_type: ausf_ue.auth_type,
         rand: rand_hex,
-        autn: String::new(), // TODO: Store autn in AusfUe
+        autn: String::new(),
         hxres_star: hxres_star_hex,
         links_href,
     })

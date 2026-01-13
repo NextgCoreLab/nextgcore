@@ -1,4 +1,8 @@
 //! GTP v1 (Gn/Gp) Message Building for SMF
+
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
 //!
 //! Port of src/smf/gn-build.c - GTPv1-C message building for GGSN interworking
 //!

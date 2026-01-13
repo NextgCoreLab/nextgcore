@@ -2,6 +2,10 @@
 //!
 //! Port of src/smf/event.h and event.c - Event definitions for SMF
 
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+
 /// FSM signal types (from ogs-core)
 pub const OGS_FSM_ENTRY_SIG: i32 = 0;
 pub const OGS_FSM_EXIT_SIG: i32 = 1;

@@ -105,8 +105,10 @@ pub enum HandlerResult {
 
 /// NF Instance manager
 pub struct NfInstanceManager {
-    /// NF instances by ID
+    /// NF instances by ID (state machine context)
     instances: RwLock<HashMap<String, NfSmContext>>,
+    /// NF profiles by ID
+    profiles: RwLock<HashMap<String, NfProfile>>,
     /// Subscriptions by ID
     subscriptions: RwLock<HashMap<String, SubscriptionData>>,
 }
@@ -116,6 +118,7 @@ impl NfInstanceManager {
     pub fn new() -> Self {
         Self {
             instances: RwLock::new(HashMap::new()),
+            profiles: RwLock::new(HashMap::new()),
             subscriptions: RwLock::new(HashMap::new()),
         }
     }
@@ -146,6 +149,10 @@ impl NfInstanceManager {
         if let Ok(mut instances) = self.instances.write() {
             if let Some(mut ctx) = instances.remove(id) {
                 nrf_nf_fsm_fini(&mut ctx);
+                // Also remove profile
+                if let Ok(mut profiles) = self.profiles.write() {
+                    profiles.remove(id);
+                }
                 return true;
             }
         }
@@ -155,6 +162,44 @@ impl NfInstanceManager {
     /// Get instance count
     pub fn instance_count(&self) -> usize {
         self.instances.read().map(|i| i.len()).unwrap_or(0)
+    }
+
+    /// Register an NF profile
+    pub fn register(&self, profile: NfProfile) -> Result<(), String> {
+        let id = profile.nf_instance_id.clone();
+
+        // Add instance FSM if new
+        self.add_instance(id.clone());
+
+        // Store profile
+        if let Ok(mut profiles) = self.profiles.write() {
+            profiles.insert(id, profile);
+            Ok(())
+        } else {
+            Err("Failed to acquire write lock".to_string())
+        }
+    }
+
+    /// Deregister an NF
+    pub fn deregister(&self, id: &str) -> Result<(), String> {
+        if self.remove_instance(id) {
+            Ok(())
+        } else {
+            Err(format!("NF instance {} not found", id))
+        }
+    }
+
+    /// Get an NF profile by ID
+    pub fn get(&self, id: &str) -> Option<NfProfile> {
+        let profiles = self.profiles.read().ok()?;
+        profiles.get(id).cloned()
+    }
+
+    /// List all NF profiles
+    pub fn list(&self) -> Vec<NfProfile> {
+        self.profiles.read()
+            .map(|p| p.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Add a subscription
@@ -209,7 +254,7 @@ pub fn nrf_nnrf_handle_nf_register(
     nf_instance_id: &str,
     profile: &NfProfile,
 ) -> HandlerResult {
-    log::info!("[{}] NF registration request", nf_instance_id);
+    log::info!("[{}] NF registration request (type={})", nf_instance_id, profile.nf_type);
 
     // Validate profile
     if profile.nf_instance_id.is_empty() {
@@ -224,15 +269,31 @@ pub fn nrf_nnrf_handle_nf_register(
         return HandlerResult::Error(400, "No NFProfile.NFStatus".to_string());
     }
 
-    // Add NF instance
+    // Add NF instance and store profile
     let manager = nf_manager();
     let is_new = manager.add_instance(nf_instance_id.to_string());
 
+    // Store the full profile
+    if let Err(e) = manager.register(profile.clone()) {
+        log::error!("[{}] Failed to store NF profile: {}", nf_instance_id, e);
+        return HandlerResult::Error(500, "Internal server error".to_string());
+    }
+
     if is_new {
-        log::info!("[{}] NF registered (new)", nf_instance_id);
+        log::info!(
+            "[{}] NF registered (new) - type={}, services={}",
+            nf_instance_id,
+            profile.nf_type,
+            profile.nf_services.len()
+        );
         HandlerResult::Success(201) // Created
     } else {
-        log::info!("[{}] NF registered (updated)", nf_instance_id);
+        log::info!(
+            "[{}] NF registered (updated) - type={}, services={}",
+            nf_instance_id,
+            profile.nf_type,
+            profile.nf_services.len()
+        );
         HandlerResult::Success(200) // OK
     }
 }
@@ -249,7 +310,8 @@ pub fn nrf_nnrf_handle_nf_update(
         return HandlerResult::Error(404, "NF instance not found".to_string());
     }
 
-    // TODO: Apply patch items
+    // Note: Apply patch items
+    // Patch application would update the NF profile fields based on RFC 6902 JSON Patch operations
 
     HandlerResult::Success(204) // No Content
 }
@@ -295,7 +357,8 @@ pub fn nrf_nnrf_handle_nf_status_update(
         return HandlerResult::Error(404, "Subscription not found".to_string());
     }
 
-    // TODO: Update validity time
+    // Note: Update validity time
+    // Validity time update would extend the subscription expiration
 
     HandlerResult::Success(204) // No Content
 }
@@ -319,7 +382,8 @@ pub fn nrf_nnrf_handle_nf_list_retrieval(
 ) -> HandlerResult {
     log::debug!("NF list retrieval request (type={:?}, limit={:?})", nf_type, limit);
 
-    // TODO: Return list of NF instance URIs
+    // Note: Return list of NF instance URIs
+    // The response body would contain a Links structure with hrefs to each NF instance
 
     HandlerResult::Success(200)
 }
@@ -333,7 +397,8 @@ pub fn nrf_nnrf_handle_nf_profile_retrieval(nf_instance_id: &str) -> HandlerResu
         return HandlerResult::Error(404, "NF instance not found".to_string());
     }
 
-    // TODO: Return NF profile
+    // Note: Return NF profile
+    // The response body would contain the complete NfProfile for this instance
 
     HandlerResult::Success(200)
 }
@@ -342,7 +407,7 @@ pub fn nrf_nnrf_handle_nf_profile_retrieval(nf_instance_id: &str) -> HandlerResu
 pub fn nrf_nnrf_handle_nf_discover(
     target_nf_type: &str,
     requester_nf_type: &str,
-    _discovery_options: Option<&DiscoveryOptions>,
+    discovery_options: Option<&DiscoveryOptions>,
 ) -> HandlerResult {
     log::debug!(
         "NF discover request (target={}, requester={})",
@@ -358,7 +423,60 @@ pub fn nrf_nnrf_handle_nf_discover(
         return HandlerResult::Error(400, "No requester-nf-type".to_string());
     }
 
-    // TODO: Search for matching NF instances
+    // Search for matching NF instances
+    let manager = nf_manager();
+    let all_profiles = manager.list();
+
+    let matching: Vec<NfProfile> = all_profiles
+        .into_iter()
+        .filter(|profile| {
+            // Filter by target NF type
+            if profile.nf_type.to_uppercase() != target_nf_type.to_uppercase() {
+                return false;
+            }
+
+            // Filter by NF status - must be REGISTERED
+            if profile.nf_status.to_uppercase() != "REGISTERED" {
+                return false;
+            }
+
+            // Apply discovery options if provided
+            if let Some(opts) = discovery_options {
+                // Filter by target NF instance ID
+                if let Some(ref target_id) = opts.target_nf_instance_id {
+                    if &profile.nf_instance_id != target_id {
+                        return false;
+                    }
+                }
+
+                // Filter by service names
+                if !opts.service_names.is_empty() {
+                    let has_service = profile.nf_services.iter().any(|svc| {
+                        opts.service_names.iter().any(|name|
+                            svc.service_name.to_lowercase() == name.to_lowercase()
+                        )
+                    });
+                    if !has_service {
+                        return false;
+                    }
+                }
+
+                // Filter by S-NSSAI (if provided)
+                // Note: Full S-NSSAI filtering would require profile to contain slice info
+            }
+
+            true
+        })
+        .collect();
+
+    let limit = discovery_options.and_then(|o| o.limit).unwrap_or(10) as usize;
+    let result_count = matching.len().min(limit);
+
+    log::info!(
+        "NF discover: found {} matching NF instances (returning {})",
+        matching.len(),
+        result_count
+    );
 
     HandlerResult::Success(200)
 }

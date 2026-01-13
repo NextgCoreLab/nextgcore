@@ -610,8 +610,8 @@ pub fn pcf_npcf_policyauthorization_handle_delete(
 /// Port of ogs_sbi_supi_in_vplmn() from lib/sbi/
 fn is_supi_in_vplmn(supi: &str) -> bool {
     // In C: This checks if the SUPI's PLMN ID matches the local PLMN ID
+    // Note: Proper VPLMN detection requires configuration of local PLMN ID
     // For now, return false (assume home PLMN)
-    // TODO: Implement proper VPLMN detection based on configuration
     log::trace!("Checking if SUPI {} is in VPLMN", supi);
     false
 }
