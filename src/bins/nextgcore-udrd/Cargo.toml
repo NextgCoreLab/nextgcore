@@ -1,0 +1,31 @@
+[package]
+name = "nextgcore-udrd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NextGCore UDR (Unified Data Repository) - Rust Implementation"
+
+[[bin]]
+name = "nextgcore-udrd"
+path = "src/main.rs"
+
+[lib]
+name = "nextgcore_udrd"
+path = "src/lib.rs"
+
+[dependencies]
+log.workspace = true
+env_logger.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+ctrlc = "3.4"
+clap = { version = "4.4", features = ["derive"] }
+ogs-sbi = { path = "../../libs/ogs-sbi" }
+
+[dev-dependencies]
+proptest.workspace = true

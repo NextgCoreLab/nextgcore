@@ -1,0 +1,16 @@
+[package]
+name = "ogs-nas"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore NAS Protocol Library"
+
+[dependencies]
+ogs-core = { workspace = true }
+ogs-crypt = { workspace = true }
+thiserror.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

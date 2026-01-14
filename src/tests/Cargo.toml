@@ -1,0 +1,60 @@
+[package]
+name = "nextgcore-integration-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full", "test-util"] }
+async-trait = "0.1"
+
+# Testing
+proptest = "1.4"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# HTTP client for SBI
+hyper = { version = "1.1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
+
+# MongoDB - using sync feature to be compatible with ogs-dbi
+mongodb = { version = "2.8", default-features = false, features = ["sync"] }
+bson = "2.9"
+
+# Testcontainers for MongoDB
+testcontainers = "0.15"
+testcontainers-modules = { version = "0.3", default-features = false, features = ["mongo"] }
+
+# UUID
+uuid = { version = "1.6", features = ["v4"] }
+
+# Bytes
+bytes = "1.5"
+
+# Internal crates
+ogs-core = { path = "../libs/ogs-core" }
+ogs-crypt = { path = "../libs/ogs-crypt" }
+ogs-nas = { path = "../libs/ogs-nas" }
+ogs-ngap = { path = "../libs/ogs-ngap" }
+ogs-s1ap = { path = "../libs/ogs-s1ap" }
+ogs-gtp = { path = "../libs/ogs-gtp" }
+ogs-pfcp = { path = "../libs/ogs-pfcp" }
+ogs-sbi = { path = "../libs/ogs-sbi" }
+ogs-diameter = { path = "../libs/ogs-diameter" }
+ogs-app = { path = "../libs/ogs-app" }
+
+[[test]]
+name = "integration"
+path = "integration/mod.rs"

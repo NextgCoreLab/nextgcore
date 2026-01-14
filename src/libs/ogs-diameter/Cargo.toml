@@ -1,0 +1,21 @@
+[package]
+name = "ogs-diameter"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore Diameter Protocol Library"
+
+[dependencies]
+ogs-core = { workspace = true }
+ogs-crypt = { workspace = true }
+thiserror.workspace = true
+bytes.workspace = true
+bitflags.workspace = true
+log.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "sync", "time"] }
+async-trait.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

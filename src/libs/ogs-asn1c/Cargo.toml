@@ -1,0 +1,17 @@
+[package]
+name = "ogs-asn1c"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore ASN.1 Codec Library"
+
+[dependencies]
+ogs-core = { workspace = true }
+thiserror.workspace = true
+bytes.workspace = true
+bitvec = "1.0"
+
+[dev-dependencies]
+proptest.workspace = true
+hex = "0.4"

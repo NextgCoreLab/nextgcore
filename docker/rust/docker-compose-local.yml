@@ -1,0 +1,223 @@
+# NextGCore 5G Core - Local Pre-built Images
+# Uses images built from build-images.sh (no compilation during docker-compose up)
+#
+# Usage:
+#   1. Build binaries: docker build -f Dockerfile.builder -t nextgcore-builder .
+#   2. Extract binaries and build images: ./build-images.sh
+#   3. Start services: docker compose -f docker-compose-local.yml up -d
+
+x-common-env: &common-env
+  RUST_LOG: info
+  RUST_BACKTRACE: 1
+
+x-common-restart: &common-restart
+  restart: unless-stopped
+
+services:
+  # ==========================================================================
+  # Infrastructure
+  # ==========================================================================
+  mongodb:
+    image: mongo:6.0
+    container_name: nextgcore-mongodb
+    <<: *common-restart
+    environment:
+      MONGO_INITDB_DATABASE: nextgcore
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      nextgcore-5gc:
+        ipv4_address: 172.23.0.2
+    ports:
+      - "27017:27017"
+
+  # ==========================================================================
+  # 5G Core Network Functions
+  # ==========================================================================
+  nrf:
+    image: nextgcore-rust/nrf:latest
+    container_name: nextgcore-nrf
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    command: ["-c", "/etc/nextgcore/nrf.yaml"]
+    volumes:
+      - ./configs/5gc/nrf.yaml:/etc/nextgcore/nrf.yaml:ro
+    networks:
+      nextgcore-5gc:
+        ipv4_address: 172.23.0.10
+    ports:
+      - "7777:7777"
+    depends_on:
+      - mongodb
+
+  ausf:
+    image: nextgcore-rust/ausf:latest
+    container_name: nextgcore-ausf
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    command: ["-c", "/etc/nextgcore/ausf.yaml"]
+    volumes:
+      - ./configs/5gc/ausf.yaml:/etc/nextgcore/ausf.yaml:ro
+    networks:
+      nextgcore-5gc:
+        ipv4_address: 172.23.0.11
+    depends_on:
+      - nrf
+
+  udm:
+    image: nextgcore-rust/udm:latest
+    container_name: nextgcore-udm
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    command: ["-c", "/etc/nextgcore/udm.yaml"]
+    volumes:
+      - ./configs/5gc/udm.yaml:/etc/nextgcore/udm.yaml:ro
+    networks:
+      nextgcore-5gc:
+        ipv4_address: 172.23.0.12
+    depends_on:
+      - nrf
+
+  udr:
+    image: nextgcore-rust/udr:latest
+    container_name: nextgcore-udr
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    command: ["-c", "/etc/nextgcore/udr.yaml"]
+    volumes:
+      - ./configs/5gc/udr.yaml:/etc/nextgcore/udr.yaml:ro
+    networks:
+      nextgcore-5gc:
+        ipv4_address: 172.23.0.20
+    depends_on:
+      - nrf
+      - mongodb
+
+  pcf:
+    image: nextgcore-rust/pcf:latest
+    container_name: nextgcore-pcf
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    command: ["-c", "/etc/nextgcore/pcf.yaml"]
+    volumes:
+      - ./configs/5gc/pcf.yaml:/etc/nextgcore/pcf.yaml:ro
+    networks:
+      nextgcore-5gc:
+        ipv4_address: 172.23.0.13
+    depends_on:
+      - nrf
+
+  nssf:
+    image: nextgcore-rust/nssf:latest
+    container_name: nextgcore-nssf
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    command: ["-c", "/etc/nextgcore/nssf.yaml"]
+    volumes:
+      - ./configs/5gc/nssf.yaml:/etc/nextgcore/nssf.yaml:ro
+    networks:
+      nextgcore-5gc:
+        ipv4_address: 172.23.0.14
+    depends_on:
+      - nrf
+
+  bsf:
+    image: nextgcore-rust/bsf:latest
+    container_name: nextgcore-bsf
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    command: ["-c", "/etc/nextgcore/bsf.yaml"]
+    volumes:
+      - ./configs/5gc/bsf.yaml:/etc/nextgcore/bsf.yaml:ro
+    networks:
+      nextgcore-5gc:
+        ipv4_address: 172.23.0.15
+    depends_on:
+      - nrf
+
+  amf:
+    image: nextgcore-rust/amf:latest
+    container_name: nextgcore-amf
+    <<: *common-restart
+    environment:
+      <<: *common-env
+      RUST_LOG: info,nextgcore_amfd=debug
+    command: ["-c", "/etc/nextgcore/amf.yaml"]
+    volumes:
+      - ./configs/5gc/amf.yaml:/etc/nextgcore/amf.yaml:ro
+    networks:
+      nextgcore-5gc:
+        ipv4_address: 172.23.0.5
+    ports:
+      - "38412:38412/udp"  # NGAP (SCTP over UDP)
+      - "9091:9090"        # Metrics
+    depends_on:
+      - nrf
+      - ausf
+      - udm
+      - pcf
+      - nssf
+
+  smf:
+    image: nextgcore-rust/smf:latest
+    container_name: nextgcore-smf
+    <<: *common-restart
+    environment:
+      <<: *common-env
+    command: ["-c", "/etc/nextgcore/smf.yaml"]
+    volumes:
+      - ./configs/5gc/smf.yaml:/etc/nextgcore/smf.yaml:ro
+    networks:
+      nextgcore-5gc:
+        ipv4_address: 172.23.0.4
+    ports:
+      - "8805:8805/udp"  # PFCP
+    depends_on:
+      - nrf
+      - pcf
+      - amf
+
+  upf:
+    image: nextgcore-rust/upf:latest
+    container_name: nextgcore-upf
+    <<: *common-restart
+    privileged: true
+    user: root
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      - net.ipv4.ip_forward=1
+    environment:
+      <<: *common-env
+      RUST_LOG: info,nextgcore_upfd=debug
+    command: ["-c", "/etc/nextgcore/upf.yaml", "--pfcp-addr", "172.23.0.7", "--gtpu-addr", "172.23.0.7", "--tun-ip", "10.45.0.1", "--tun-prefix", "16"]
+    volumes:
+      - ./configs/5gc/upf.yaml:/etc/nextgcore/upf.yaml:ro
+    networks:
+      nextgcore-5gc:
+        ipv4_address: 172.23.0.7
+    ports:
+      - "2152:2152/udp"  # GTP-U
+    depends_on:
+      - smf
+
+networks:
+  nextgcore-5gc:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.23.0.0/24
+          gateway: 172.23.0.1
+
+volumes:
+  mongodb_data:

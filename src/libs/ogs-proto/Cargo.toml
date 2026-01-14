@@ -1,0 +1,13 @@
+[package]
+name = "ogs-proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore Protocol Definitions Library"
+
+[dependencies]
+ogs-core = { workspace = true }
+
+[dev-dependencies]
+proptest.workspace = true

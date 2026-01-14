@@ -1,0 +1,48 @@
+# NextGCore SEPP2 (Security Edge Protection Proxy) Configuration
+# Visited PLMN SEPP for Docker deployment with Rust implementation
+
+logger:
+  file:
+    path: /var/log/nextgcore/sepp2.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+sepp:
+  default:
+    tls:
+      server:
+        private_key: /etc/nextgcore/tls/sepp2.key
+        cert: /etc/nextgcore/tls/sepp2.crt
+      client:
+        cacert: /etc/nextgcore/tls/ca.crt
+  sbi:
+    server:
+      - address: 172.22.0.52
+        port: 7777
+    client:
+      scp:
+        - uri: http://172.22.0.50:7777
+      nrf:
+        - uri: http://172.22.0.10:7777
+  n32:
+    server:
+      - sender: sepp2.localdomain
+        scheme: https
+        address: 172.22.0.52
+        port: 7778
+        n32f:
+          scheme: https
+          address: 172.22.0.52
+          port: 7779
+    client:
+      sepp:
+        - receiver: sepp1.localdomain
+          uri: https://sepp1.localdomain:7778
+          resolve: 172.22.0.51
+          n32f:
+            uri: https://sepp1.localdomain:7779
+            resolve: 172.22.0.51

@@ -1,0 +1,16 @@
+[package]
+name = "ogs-metrics"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore Metrics Collection Library"
+
+[dependencies]
+ogs-core = { workspace = true }
+prometheus.workspace = true
+log.workspace = true
+serde_yaml.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

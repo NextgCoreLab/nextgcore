@@ -1,0 +1,22 @@
+[package]
+name = "ogs-sbi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore SBI (Service Based Interface) Library"
+
+[dependencies]
+ogs-core = { workspace = true }
+thiserror.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+h2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

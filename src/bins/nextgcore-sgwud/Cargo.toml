@@ -1,0 +1,24 @@
+[package]
+name = "nextgcore-sgwud"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore SGWU (Serving Gateway User Plane)"
+
+[[bin]]
+name = "nextgcore-sgwud"
+path = "src/main.rs"
+
+[dependencies]
+ogs-core = { workspace = true }
+ogs-gtp = { workspace = true }
+ogs-pfcp = { workspace = true }
+ogs-app = { workspace = true }
+log.workspace = true
+env_logger.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

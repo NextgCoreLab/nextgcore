@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 95ec0e18aa360553064a5439005d5e783721f44721e0ecb730b7fc6af367657c # shrinks to guti = FiveGGuti { plmn_id: PlmnId { mcc: [0, 0, 0], mnc: [0, 0, 0], mnc_len: 2 }, amf_region_id: 0, amf_set_id: 0, amf_pointer: 0, tmsi: 0 }
+cc f881ebe500ed64d7d3d69944f5acf1ed706fef2fe3475bb254fb06cf794f3aa1 # shrinks to digits = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]

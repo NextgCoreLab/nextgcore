@@ -1,0 +1,23 @@
+# UDR (Unified Data Repository) Configuration
+# Docker container configuration for 5G Core deployment
+
+db_uri: mongodb://172.23.0.2/nextgcore
+
+logger:
+  file:
+    path: /var/log/nextgcore/udr.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+udr:
+  sbi:
+    server:
+      - address: 172.23.0.20
+        port: 7777
+    client:
+      nrf:
+        - uri: http://172.23.0.10:7777

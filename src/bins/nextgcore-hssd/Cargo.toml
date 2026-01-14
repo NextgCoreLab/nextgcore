@@ -1,0 +1,27 @@
+[package]
+name = "nextgcore-hssd"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore HSS (Home Subscriber Server)"
+
+[[bin]]
+name = "nextgcore-hssd"
+path = "src/main.rs"
+
+[dependencies]
+ogs-core = { workspace = true }
+ogs-crypt = { workspace = true }
+ogs-diameter = { workspace = true }
+ogs-dbi = { workspace = true }
+ogs-app = { workspace = true }
+log.workspace = true
+env_logger.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+ctrlc = { workspace = true, features = ["termination"] }
+
+[dev-dependencies]
+proptest.workspace = true

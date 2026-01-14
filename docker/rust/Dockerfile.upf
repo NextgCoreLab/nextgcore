@@ -1,0 +1,59 @@
+# NextGCore UPF Runtime Image
+# UPF requires root privileges to create TUN devices
+#
+# Usage:
+#   docker build -f Dockerfile.upf -t nextgcore-rust/upf:latest .
+
+ARG DEBIAN_VERSION=bookworm
+
+FROM debian:${DEBIAN_VERSION}-slim AS runtime
+
+LABEL org.opencontainers.image.title="NextGCore UPF"
+LABEL org.opencontainers.image.description="NextGCore Rust UPF network function"
+LABEL org.opencontainers.image.source="https://github.com/nextgcore/nextgcore"
+LABEL org.opencontainers.image.licenses="AGPL-3.0"
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    libsctp1 \
+    libyaml-0-2 \
+    libmongoc-1.0-0 \
+    libbson-1.0-0 \
+    libnghttp2-14 \
+    iproute2 \
+    iptables \
+    libtins4.0 \
+    curl \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create directories
+RUN mkdir -p /etc/nextgcore /var/log/nextgcore /var/run/nextgcore
+
+# Copy binary from build context
+COPY binaries/nextgcore-upfd /usr/local/bin/nextgcore-upfd
+
+# Make executable
+RUN chmod +x /usr/local/bin/nextgcore-upfd
+
+ENV OGS_LOG_LEVEL=info
+ENV OGS_LOG_PATH=/var/log/nextgcore
+ENV OGS_CONFIG_FILE=/etc/nextgcore/nextgcore-upfd.yaml
+
+# Create symlinks for consistent binary and config paths
+RUN ln -sf /usr/local/bin/nextgcore-upfd /usr/local/bin/nf-binary && \
+    ln -sf /etc/nextgcore/nextgcore-upfd.yaml /etc/nextgcore/nf.yaml || true
+
+# UPF runs as root to create TUN devices
+# Expose GTP-U and PFCP ports
+EXPOSE 2152/udp 8805/udp
+
+# Health check - verify process is running
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD pgrep -f nf-binary || exit 1
+
+# Use symlinked binary and config paths
+ENTRYPOINT ["/usr/local/bin/nf-binary"]
+CMD ["-c", "/etc/nextgcore/nf.yaml"]

@@ -1,0 +1,15 @@
+[package]
+name = "ogs-pfcp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore PFCP Protocol Library"
+
+[dependencies]
+ogs-core = { workspace = true }
+thiserror.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

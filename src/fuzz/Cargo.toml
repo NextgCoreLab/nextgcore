@@ -1,0 +1,57 @@
+[package]
+name = "nextgcore-fuzz"
+version = "0.0.0"
+authors = ["NextGCore Contributors"]
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+# Protocol libraries to fuzz
+ogs-pfcp = { path = "../libs/ogs-pfcp" }
+ogs-gtp = { path = "../libs/ogs-gtp" }
+ogs-nas = { path = "../libs/ogs-nas" }
+ogs-ngap = { path = "../libs/ogs-ngap" }
+ogs-s1ap = { path = "../libs/ogs-s1ap" }
+ogs-diameter = { path = "../libs/ogs-diameter" }
+
+# Workspace members used for fuzzing
+bytes = "1"
+
+[profile.release]
+debug = 1
+
+# Fuzz targets
+
+[[bin]]
+name = "fuzz_pfcp_message"
+path = "fuzz_targets/fuzz_pfcp_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_gtp_message"
+path = "fuzz_targets/fuzz_gtp_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_nas_message"
+path = "fuzz_targets/fuzz_nas_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_diameter_message"
+path = "fuzz_targets/fuzz_diameter_message.rs"
+test = false
+doc = false
+bench = false
