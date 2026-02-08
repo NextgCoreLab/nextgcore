@@ -204,7 +204,7 @@ impl AperDecode for TimeToWait {
             4 => Ok(TimeToWait::V20s),
             5 => Ok(TimeToWait::V60s),
             _ => Err(crate::per::PerError::DecodeError(
-                format!("Unknown TimeToWait value: {}", value)
+                format!("Unknown TimeToWait value: {value}")
             )),
         }
     }

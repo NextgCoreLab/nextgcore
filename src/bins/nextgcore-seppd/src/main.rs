@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 mod context;
 mod event;
@@ -17,6 +18,7 @@ mod handshake_sm;
 mod n32c_build;
 mod n32c_handler;
 mod sbi_path;
+mod sbi_response;
 mod sepp_sm;
 mod timer;
 
@@ -34,7 +36,7 @@ pub use sbi_path::{
     SbiServerConfig, SbiRequest, SbiResponse, RequestHandlerResult,
 };
 pub use sepp_sm::SeppSmContext;
-pub use timer::{TimerConfig, TimerManager, sepp_timer_get_name};
+pub use timer::{TimerConfig, TimerManager, sepp_timer_get_name, timer_manager};
 
 /// NextGCore SEPP - Security Edge Protection Proxy
 #[derive(Parser, Debug)]
@@ -107,7 +109,8 @@ struct Args {
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Initialize logging
@@ -189,8 +192,8 @@ fn main() -> Result<()> {
 
     log::info!("NextGCore SEPP ready");
 
-    // Main event loop
-    run_event_loop(&mut sepp_sm, shutdown)?;
+    // Main event loop (async)
+    run_event_loop_async(&mut sepp_sm, shutdown).await?;
 
     // Graceful shutdown
     log::info!("Shutting down...");
@@ -252,34 +255,49 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) -> Result<()> {
     Ok(())
 }
 
-/// Main event loop
-fn run_event_loop(
-    _sepp_sm: &mut SeppSmContext,
+/// Async main event loop with timer integration
+async fn run_event_loop_async(
+    sepp_sm: &mut SeppSmContext,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
-    log::debug!("Entering main event loop");
+    log::debug!("Entering async main event loop");
 
-    // Simple polling loop
-    // In a full implementation, this would use tokio or async-std for async I/O
+    let timer_mgr = timer_manager();
+
     while !shutdown.load(Ordering::SeqCst) && !SHUTDOWN.load(Ordering::SeqCst) {
-        // Poll for events with timeout
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Compute optimal sleep duration based on pending timers
+        let poll_interval = ogs_core::async_timer::compute_poll_interval(
+            timer_mgr.inner(),
+            Duration::from_millis(100),
+        );
+        tokio::time::sleep(poll_interval).await;
 
-        // Process timer expirations
-        // Note: Timer manager implementation in timer module handles expiration checks
-        // Expired timers generate SeppEvent::SbiTimer events dispatched to sepp_sm
+        // Process timer expirations and dispatch to state machine
+        let expired = timer_mgr.process_expired();
+        for entry in &expired {
+            log::debug!(
+                "SEPP timer expired: id={} type={:?} data={:?}",
+                entry.id, entry.timer_type, entry.data
+            );
 
-        // Process events from queue
-        // In a full implementation, this would pop events from the queue
-        // and dispatch them to the state machine
+            // Create timer event and dispatch to state machine
+            let mut event = SeppEvent::sbi_timer(entry.timer_type);
+            if let Some(ref nf_id) = entry.data {
+                event = event.with_nf_instance(nf_id.clone());
+            }
 
-        // For now, just check if we should exit
+            sepp_sm.dispatch(&mut event);
+        }
+
+        // Check for shutdown
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
     }
 
-    log::debug!("Exiting main event loop");
+    // Cleanup: clear all timers on shutdown
+    timer_mgr.clear();
+    log::debug!("Exiting async main event loop");
     Ok(())
 }
 

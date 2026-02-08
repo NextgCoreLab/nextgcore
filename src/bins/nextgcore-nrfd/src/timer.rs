@@ -85,10 +85,7 @@ impl NrfTimerManager {
         if let Ok(mut timers) = self.timers.write() {
             timers.insert(id, entry);
             log::debug!(
-                "Timer added: id={}, type={:?}, duration={:?}",
-                id,
-                timer_type,
-                duration
+                "Timer added: id={id}, type={timer_type:?}, duration={duration:?}"
             );
             Some(id)
         } else {
@@ -111,7 +108,7 @@ impl NrfTimerManager {
         if let Ok(mut timers) = self.timers.write() {
             if let Some(timer) = timers.get_mut(&id) {
                 timer.stop();
-                log::debug!("Timer stopped: id={}", id);
+                log::debug!("Timer stopped: id={id}");
                 return true;
             }
         }
@@ -122,7 +119,7 @@ impl NrfTimerManager {
     pub fn delete_timer(&self, id: u64) -> bool {
         if let Ok(mut timers) = self.timers.write() {
             if timers.remove(&id).is_some() {
-                log::debug!("Timer deleted: id={}", id);
+                log::debug!("Timer deleted: id={id}");
                 return true;
             }
         }
@@ -134,7 +131,7 @@ impl NrfTimerManager {
         if let Ok(mut timers) = self.timers.write() {
             if let Some(timer) = timers.get_mut(&id) {
                 timer.restart(duration);
-                log::debug!("Timer restarted: id={}, duration={:?}", id, duration);
+                log::debug!("Timer restarted: id={id}, duration={duration:?}");
                 return true;
             }
         }

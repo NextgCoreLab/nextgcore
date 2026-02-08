@@ -18,9 +18,11 @@ use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 use tokio::sync::{oneshot, Mutex};
+use tokio_rustls::TlsAcceptor;
 
 use crate::error::{SbiError, SbiResult};
 use crate::message::{SbiHttpMessage, SbiRequest, SbiResponse};
+use crate::tls;
 use crate::types::UriScheme;
 
 /// Server configuration
@@ -69,7 +71,7 @@ impl SbiServerConfig {
     pub fn with_host_port(host: impl AsRef<str>, port: u16) -> SbiResult<Self> {
         let addr: SocketAddr = format!("{}:{}", host.as_ref(), port)
             .parse()
-            .map_err(|e| SbiError::InvalidUri(format!("Invalid address: {}", e)))?;
+            .map_err(|e| SbiError::InvalidUri(format!("Invalid address: {e}")))?;
         Ok(Self::new(addr))
     }
 
@@ -236,24 +238,53 @@ impl SbiServer {
         &self.config
     }
 
+    /// Build a TLS acceptor from the server config
+    fn build_tls_acceptor(&self) -> SbiResult<TlsAcceptor> {
+        let cert_path = self.config.cert.as_ref()
+            .ok_or_else(|| SbiError::TlsError("TLS certificate path not configured".into()))?;
+        let key_path = self.config.private_key.as_ref()
+            .ok_or_else(|| SbiError::TlsError("TLS private key path not configured".into()))?;
+
+        let certs = tls::load_certs(cert_path)?;
+        let key = tls::load_private_key(key_path)?;
+
+        let mut server_config = if self.config.verify_client {
+            let ca_path = self.config.verify_client_cacert.as_ref()
+                .ok_or_else(|| SbiError::TlsError(
+                    "Client CA certificate required for mTLS but not configured".into(),
+                ))?;
+            tls::build_server_config_mtls(certs, key, ca_path)?
+        } else {
+            tls::build_server_config(certs, key)?
+        };
+
+        server_config.alpn_protocols = vec![b"h2".to_vec()];
+        Ok(TlsAcceptor::from(Arc::new(server_config)))
+    }
+
     /// Start the server with a request handler
     pub async fn start<H: SbiRequestHandler>(&self, handler: H) -> SbiResult<()> {
         let mut state = self.state.lock().await;
-        
+
         if matches!(*state, ServerState::Running(_)) {
             return Err(SbiError::ServerError("Server already running".to_string()));
         }
 
         let listener = TcpListener::bind(self.config.addr)
             .await
-            .map_err(|e| SbiError::ServerError(format!("Failed to bind: {}", e)))?;
+            .map_err(|e| SbiError::ServerError(format!("Failed to bind: {e}")))?;
+
+        let tls_acceptor = if self.config.scheme == UriScheme::Https {
+            Some(self.build_tls_acceptor()?)
+        } else {
+            None
+        };
 
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         *state = ServerState::Running(shutdown_tx);
         drop(state);
 
         let handler = Arc::new(handler);
-        let _addr = self.config.addr;
 
         // Spawn the server task
         tokio::spawn(async move {
@@ -262,24 +293,46 @@ impl SbiServer {
                     result = listener.accept() => {
                         match result {
                             Ok((stream, _)) => {
-                                let io = TokioIo::new(stream);
                                 let service = SbiService {
                                     handler: handler.clone(),
                                 };
 
-                                tokio::spawn(async move {
-                                    if let Err(e) = http2::Builder::new(
-                                        hyper_util::rt::TokioExecutor::new()
-                                    )
-                                    .serve_connection(io, service)
-                                    .await
-                                    {
-                                        eprintln!("HTTP/2 connection error: {}", e);
-                                    }
-                                });
+                                if let Some(ref acceptor) = tls_acceptor {
+                                    let acceptor = acceptor.clone();
+                                    tokio::spawn(async move {
+                                        match acceptor.accept(stream).await {
+                                            Ok(tls_stream) => {
+                                                let io = TokioIo::new(tls_stream);
+                                                if let Err(e) = http2::Builder::new(
+                                                    hyper_util::rt::TokioExecutor::new()
+                                                )
+                                                .serve_connection(io, service)
+                                                .await
+                                                {
+                                                    eprintln!("HTTP/2 TLS connection error: {e}");
+                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!("TLS accept error: {e}");
+                                            }
+                                        }
+                                    });
+                                } else {
+                                    let io = TokioIo::new(stream);
+                                    tokio::spawn(async move {
+                                        if let Err(e) = http2::Builder::new(
+                                            hyper_util::rt::TokioExecutor::new()
+                                        )
+                                        .serve_connection(io, service)
+                                        .await
+                                        {
+                                            eprintln!("HTTP/2 connection error: {e}");
+                                        }
+                                    });
+                                }
                             }
                             Err(e) => {
-                                eprintln!("Accept error: {}", e);
+                                eprintln!("Accept error: {e}");
                             }
                         }
                     }
@@ -370,7 +423,7 @@ pub fn send_method_not_allowed(method: &str, resource: &str) -> SbiResponse {
     send_error(
         405,
         "Method Not Allowed",
-        &format!("Method {} not allowed for resource {}", method, resource),
+        &format!("Method {method} not allowed for resource {resource}"),
         Some("METHOD_NOT_ALLOWED"),
     )
 }

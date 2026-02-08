@@ -611,7 +611,7 @@ pub fn parse_cause(group: u8, value: i64) -> NgapCause {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::AmfId;
+    use crate::context::{AmfId, BplmnEntry};
 
     fn create_test_context() -> AmfContext {
         let mut ctx = AmfContext::new();

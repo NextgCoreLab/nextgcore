@@ -384,3 +384,200 @@ impl NetworkSlicingIndication {
         }
     }
 }
+
+// =========================================================================
+// 5GSM Information Elements
+// =========================================================================
+
+/// PDU session type (TS 24.501 Section 9.11.4.11)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum PduSessionType {
+    #[default]
+    Ipv4 = 1,
+    Ipv6 = 2,
+    Ipv4v6 = 3,
+    Unstructured = 4,
+    Ethernet = 5,
+}
+
+/// SSC mode (TS 24.501 Section 9.11.4.16)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum SscMode {
+    #[default]
+    SscMode1 = 1,
+    SscMode2 = 2,
+    SscMode3 = 3,
+}
+
+/// 5GSM cause values (TS 24.501 Section 9.11.4.2)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
+pub enum FiveGsmCause {
+    #[default]
+    OperatorDeterminedBarring = 8,
+    InsufficientResources = 26,
+    MissingOrUnknownDnn = 27,
+    UnknownPduSessionType = 28,
+    UserAuthenticationOrAuthorizationFailed = 29,
+    RequestRejectedUnspecified = 31,
+    ServiceOptionNotSupported = 32,
+    RequestedServiceOptionNotSubscribed = 33,
+    RegularDeactivation = 36,
+    NetworkFailure = 38,
+    ReactivationRequested = 39,
+    PduSessionDoesNotExist = 43,
+    PtiMismatch = 44,
+    SyntacticalErrorInPacketFilter = 45,
+    InvalidPduSessionIdentity = 46,
+    PtiAlreadyInUse = 47,
+    OutOfLadnServiceArea = 48,
+    SemanticErrorsInPacketFilter = 49,
+    InsufficientResourcesForSliceAndDnn = 67,
+    NotSupportedSscMode = 68,
+    InsufficientResourcesForSlice = 69,
+    MissingOrUnknownDnnInSlice = 70,
+    SemanticallyIncorrectMessage = 95,
+    InvalidMandatoryInformation = 96,
+    MessageTypeNonExistent = 97,
+    MessageTypeNotCompatible = 98,
+    InformationElementNonExistent = 99,
+    ConditionalIeError = 100,
+    MessageNotCompatibleWithProtocolState = 101,
+    ProtocolErrorUnspecified = 111,
+}
+
+impl FiveGsmCause {
+    pub fn from_u8(v: u8) -> u8 {
+        v
+    }
+}
+
+/// QoS rules (TS 24.501 Section 9.11.4.13)
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QosRules {
+    pub length: u16,
+    pub data: Vec<u8>,
+}
+
+impl QosRules {
+    pub fn new(data: Vec<u8>) -> Self {
+        Self { length: data.len() as u16, data }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u16(self.length);
+        buf.put_slice(&self.data);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 2 {
+            return Err(NasError::BufferTooShort { expected: 2, actual: buf.remaining() });
+        }
+        let length = buf.get_u16();
+        if buf.remaining() < length as usize {
+            return Err(NasError::BufferTooShort { expected: length as usize, actual: buf.remaining() });
+        }
+        let data = buf.copy_to_bytes(length as usize).to_vec();
+        Ok(Self { length, data })
+    }
+}
+
+/// QoS flow descriptions (TS 24.501 Section 9.11.4.12)
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QosFlowDescriptions {
+    pub length: u16,
+    pub data: Vec<u8>,
+}
+
+impl QosFlowDescriptions {
+    pub fn new(data: Vec<u8>) -> Self {
+        Self { length: data.len() as u16, data }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u16(self.length);
+        buf.put_slice(&self.data);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 2 {
+            return Err(NasError::BufferTooShort { expected: 2, actual: buf.remaining() });
+        }
+        let length = buf.get_u16();
+        if buf.remaining() < length as usize {
+            return Err(NasError::BufferTooShort { expected: length as usize, actual: buf.remaining() });
+        }
+        let data = buf.copy_to_bytes(length as usize).to_vec();
+        Ok(Self { length, data })
+    }
+}
+
+/// Session AMBR (TS 24.501 Section 9.11.4.14)
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionAmbr {
+    pub length: u8,
+    pub dl_unit: u8,
+    pub dl_value: u16,
+    pub ul_unit: u8,
+    pub ul_value: u16,
+}
+
+impl SessionAmbr {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(6); // Length
+        buf.put_u8(self.dl_unit);
+        buf.put_u16(self.dl_value);
+        buf.put_u8(self.ul_unit);
+        buf.put_u16(self.ul_value);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 7 {
+            return Err(NasError::BufferTooShort { expected: 7, actual: buf.remaining() });
+        }
+        let length = buf.get_u8();
+        let dl_unit = buf.get_u8();
+        let dl_value = buf.get_u16();
+        let ul_unit = buf.get_u8();
+        let ul_value = buf.get_u16();
+        if length > 6 {
+            buf.advance((length - 6) as usize);
+        }
+        Ok(Self { length, dl_unit, dl_value, ul_unit, ul_value })
+    }
+}
+
+/// PDU address (TS 24.501 Section 9.11.4.10)
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PduAddress {
+    pub pdu_session_type: u8,
+    pub address: Vec<u8>,
+}
+
+impl PduAddress {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        let len = 1 + self.address.len();
+        buf.put_u8(len as u8);
+        buf.put_u8(self.pdu_session_type & 0x07);
+        buf.put_slice(&self.address);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 2 {
+            return Err(NasError::BufferTooShort { expected: 2, actual: buf.remaining() });
+        }
+        let length = buf.get_u8() as usize;
+        if buf.remaining() < length {
+            return Err(NasError::BufferTooShort { expected: length, actual: buf.remaining() });
+        }
+        let pdu_session_type = buf.get_u8() & 0x07;
+        let address = if length > 1 {
+            buf.copy_to_bytes(length - 1).to_vec()
+        } else {
+            Vec::new()
+        };
+        Ok(Self { pdu_session_type, address })
+    }
+}

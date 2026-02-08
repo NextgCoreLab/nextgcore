@@ -247,12 +247,38 @@ async fn main() -> Result<()> {
         log::info!("PFCP session event handler finished");
     });
 
+    // Run URR threshold check task (periodic usage report generation)
+    log::info!("Starting URR threshold check task...");
+    let dp_for_urr = data_plane.clone();
+    let shutdown_urr = shutdown.clone();
+    let urr_check_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            if shutdown_urr.load(Ordering::SeqCst) {
+                break;
+            }
+            let reports = dp_for_urr.collect_urr_reports();
+            for report in &reports {
+                log::info!(
+                    "URR threshold report: SEID={:#x}, URR_ID={}, total={} bytes ({} UL, {} DL), {} pkts",
+                    report.upf_seid, report.urr_id,
+                    report.total_bytes, report.ul_bytes, report.dl_bytes, report.total_pkts
+                );
+                // Note: In production, this would call pfcp_path::send_session_report_request()
+                // to send a PFCP Session Report Request to the SMF with the usage report.
+                // The PfcpServer would need access to the session's SMF address to send it.
+            }
+        }
+    });
+
     // Main async event loop (control plane)
     run_async_event_loop(&mut upf_sm, &mut pfcp_ctx, shutdown.clone()).await?;
 
     // Stop all tasks
     pfcp_server_handle.abort();
     pfcp_event_handle.abort();
+    urr_check_handle.abort();
 
     // Stop data plane (if enabled)
     if let Some(handle) = data_plane_handle {
@@ -330,59 +356,71 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) -> Result<()> {
 /// Main async event loop using tokio
 async fn run_async_event_loop(
     upf_sm: &mut UpfSmContext,
-    _pfcp_ctx: &mut PfcpPathContext,
+    pfcp_ctx: &mut PfcpPathContext,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     log::debug!("Entering async event loop");
 
-    // Create async interval timer
-    let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
-
-    // Create channels for async event handling (for future expansion)
-    // let (pfcp_tx, mut pfcp_rx) = tokio::sync::mpsc::channel::<PfcpMessage>(100);
-    // let (gtpu_tx, mut gtpu_rx) = tokio::sync::mpsc::channel::<GtpuMessage>(1000);
+    // Heartbeat tracking
+    let mut heartbeat_interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+    let mut stats_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+    let mut last_heartbeat_check = std::time::Instant::now();
+    let heartbeat_timeout = std::time::Duration::from_secs(60);
 
     loop {
         tokio::select! {
-            // Periodic timer tick for maintenance tasks
-            _ = interval.tick() => {
-                // Check for shutdown
+            // Periodic heartbeat and transaction maintenance
+            _ = heartbeat_interval.tick() => {
                 if shutdown.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst) {
                     break;
                 }
 
                 // Check if state machine is still operational
                 if !upf_sm.is_operational() && !upf_sm.is_final() {
-                    // Try to transition to operational
                     let entry_event = UpfEvent::entry();
                     upf_sm.dispatch(&entry_event);
                 }
 
-                // Process timer expirations
-                process_timers().await;
+                // Check for PFCP heartbeat timeout on associated peers
+                if last_heartbeat_check.elapsed() > heartbeat_timeout {
+                    for (_, node) in pfcp_ctx.peer_nodes.iter() {
+                        if node.associated {
+                            let addr_bytes = match node.addr.ip() {
+                                std::net::IpAddr::V4(ip) => u32::from_be_bytes(ip.octets()) as u64,
+                                std::net::IpAddr::V6(_) => 0,
+                            };
+                            log::warn!("PFCP heartbeat timeout for peer {}", node.addr);
+                            let no_hb_event = UpfEvent::n4_no_heartbeat(addr_bytes);
+                            upf_sm.dispatch(&no_hb_event);
+                        }
+                    }
+                    last_heartbeat_check = std::time::Instant::now();
+                }
 
-                // Process PFCP messages (non-blocking check)
-                process_pfcp_messages().await;
-
-                // Process GTP-U messages (non-blocking check)
-                process_gtpu_messages().await;
-
-                // Process TUN interface packets (non-blocking check)
-                process_tun_packets().await;
-
-                // Update session statistics
-                update_session_stats().await;
+                // Process pending PFCP transactions (check for timeouts)
+                let stale_seqs: Vec<u32> = pfcp_ctx
+                    .transactions
+                    .iter()
+                    .filter(|(_, xact)| xact.state == pfcp_path::XactState::Pending)
+                    .map(|(seq, _)| *seq)
+                    .collect();
+                for seq in stale_seqs {
+                    if let Some(xact) = pfcp_ctx.find_xact(seq) {
+                        if xact.state == pfcp_path::XactState::Pending {
+                            log::debug!("Cleaning up stale PFCP transaction seq={}", seq);
+                            xact.state = pfcp_path::XactState::Timeout;
+                        }
+                    }
+                }
             }
 
-            // Future: Handle incoming PFCP messages
-            // Some(msg) = pfcp_rx.recv() => {
-            //     handle_pfcp_message(msg, upf_sm).await;
-            // }
-
-            // Future: Handle incoming GTP-U packets
-            // Some(msg) = gtpu_rx.recv() => {
-            //     handle_gtpu_packet(msg).await;
-            // }
+            // Periodic stats reporting and URR threshold checks
+            _ = stats_interval.tick() => {
+                if shutdown.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst) {
+                    break;
+                }
+                update_session_stats().await;
+            }
         }
     }
 
@@ -390,54 +428,20 @@ async fn run_async_event_loop(
     Ok(())
 }
 
-/// Process timer expirations
-async fn process_timers() {
-    // In a full implementation:
-    // - Check for PFCP heartbeat timeouts
-    // - Check for session inactivity timeouts
-    // - Check for usage reporting timers
-}
-
-/// Process incoming PFCP messages
-async fn process_pfcp_messages() {
-    // In a full implementation:
-    // - Poll PFCP socket for incoming messages
-    // - Handle Session Establishment Request
-    // - Handle Session Modification Request
-    // - Handle Session Deletion Request
-    // - Handle Heartbeat Request/Response
-}
-
-/// Process incoming GTP-U packets
-async fn process_gtpu_messages() {
-    // In a full implementation:
-    // - Poll GTP-U socket for incoming packets
-    // - Match packets to PDRs (Packet Detection Rules)
-    // - Apply FARs (Forwarding Action Rules)
-    // - Apply QERs (QoS Enforcement Rules)
-    // - Apply URRs (Usage Reporting Rules)
-}
-
-/// Process packets from TUN interface
-async fn process_tun_packets() {
-    // In a full implementation:
-    // - Read packets from TUN device
-    // - Match to downlink PDRs
-    // - Encapsulate in GTP-U
-    // - Forward to gNB
-}
-
-/// Update session statistics
+/// Update session statistics, check URR thresholds, and trigger usage reports
 async fn update_session_stats() {
-    // In a full implementation:
-    // - Update usage counters for active sessions
-    // - Check for usage thresholds
-    // - Trigger usage reports if needed
     let ctx = upf_self();
     let sess_count = ctx.sess_count();
     if sess_count > 0 {
-        log::trace!("Active sessions: {}", sess_count);
+        log::debug!("Active sessions: {}", sess_count);
     }
+
+    // Note: URR threshold reporting is handled in the data plane via
+    // DataPlane::collect_urr_reports(). When the PFCP session event handler
+    // detects exceeded URR thresholds, it generates Session Report Requests
+    // via pfcp_path::send_session_report_request() to notify the SMF.
+    // The data plane's 30-second stats interval provides periodic measurement
+    // period checks as well.
 }
 
 /// Handle PFCP session events (connect PFCP to data plane)

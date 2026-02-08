@@ -145,6 +145,157 @@ pub struct DeregistrationData {
 }
 
 // ============================================================================
+// Event Exposure Types (B18.12)
+// ============================================================================
+
+/// Event type for Namf-evts
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AmfEventType {
+    /// Location report
+    LocationReport,
+    /// Presence in AOI report
+    PresenceInAoiReport,
+    /// Timezone report
+    TimezoneReport,
+    /// Access type report
+    AccessTypeReport,
+    /// Registration state report
+    RegistrationStateReport,
+    /// Connectivity state report
+    ConnectivityStateReport,
+    /// Reachability report
+    ReachabilityReport,
+    /// Communication failure report
+    CommunicationFailureReport,
+    /// UE mobility report
+    UeMobilityReport,
+    /// PDU session status report
+    PduSessStatusReport,
+}
+
+impl AmfEventType {
+    /// Convert to string representation
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::LocationReport => "LOCATION_REPORT",
+            Self::PresenceInAoiReport => "PRESENCE_IN_AOI_REPORT",
+            Self::TimezoneReport => "TIMEZONE_REPORT",
+            Self::AccessTypeReport => "ACCESS_TYPE_REPORT",
+            Self::RegistrationStateReport => "REGISTRATION_STATE_REPORT",
+            Self::ConnectivityStateReport => "CONNECTIVITY_STATE_REPORT",
+            Self::ReachabilityReport => "REACHABILITY_REPORT",
+            Self::CommunicationFailureReport => "COMMUNICATION_FAILURE_REPORT",
+            Self::UeMobilityReport => "UE_MOBILITY_REPORT",
+            Self::PduSessStatusReport => "PDU_SESS_STATUS_REPORT",
+        }
+    }
+}
+
+/// Event subscription
+#[derive(Debug, Clone)]
+pub struct AmfEventSubscription {
+    /// Event type
+    pub event_type: AmfEventType,
+    /// Immediate flag (report immediately)
+    pub immediate_flag: bool,
+    /// Area of interest list
+    pub area_list: Option<Vec<AreaOfInterest>>,
+    /// Location filter list
+    pub location_filter_list: Option<Vec<LocationFilter>>,
+}
+
+/// Area of interest
+#[derive(Debug, Clone)]
+pub struct AreaOfInterest {
+    /// TAI list
+    pub tai_list: Vec<TrackingAreaId>,
+    /// NCGI list
+    pub ncgi_list: Vec<NrCellGlobalId>,
+    /// Global RAN node ID list
+    pub global_ran_node_id_list: Vec<GlobalRanNodeId>,
+}
+
+/// Tracking area identity
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TrackingAreaId {
+    /// PLMN ID
+    pub plmn_id: String,
+    /// TAC
+    pub tac: u32,
+}
+
+/// NR cell global identity
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NrCellGlobalId {
+    /// PLMN ID
+    pub plmn_id: String,
+    /// Cell ID
+    pub cell_id: u64,
+}
+
+/// Global RAN node ID
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GlobalRanNodeId {
+    /// PLMN ID
+    pub plmn_id: String,
+    /// Node ID
+    pub node_id: String,
+}
+
+/// Location filter
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocationFilter {
+    /// TAI
+    Tai,
+    /// Cell ID
+    CellId,
+    /// RAN node ID
+    RanNodeId,
+}
+
+/// Event notification
+#[derive(Debug, Clone)]
+pub struct AmfEventNotification {
+    /// Event type
+    pub event_type: AmfEventType,
+    /// Event state
+    pub state: AmfEventState,
+    /// Timestamp
+    pub timestamp: std::time::SystemTime,
+    /// SUPI
+    pub supi: String,
+    /// Additional info
+    pub additional_info: Option<AmfEventAdditionalInfo>,
+}
+
+/// Event state
+#[derive(Debug, Clone)]
+pub enum AmfEventState {
+    /// Active
+    Active,
+    /// Idle
+    Idle,
+    /// Connected
+    Connected,
+    /// Location info
+    Location {
+        tai: TrackingAreaId,
+        ncgi: Option<NrCellGlobalId>,
+    },
+}
+
+/// Additional event information
+#[derive(Debug, Clone)]
+pub struct AmfEventAdditionalInfo {
+    /// Access type
+    pub access_type: Option<AccessType>,
+    /// Timezone
+    pub timezone: Option<String>,
+    /// PDU session ID
+    pub pdu_session_id: Option<u8>,
+}
+
+// ============================================================================
 // Handler Error Types
 // ============================================================================
 
@@ -317,6 +468,88 @@ pub fn handle_dereg_notify(
     Ok(())
 }
 
+/// Handle event subscription (Namf_EventExposure_Subscribe)
+///
+/// This is called when NF subscribes to AMF events
+pub fn handle_event_subscribe(
+    subscription: &AmfEventSubscription,
+    callback_uri: &str,
+) -> NamfHandlerResult<String> {
+    log::info!(
+        "Event subscription request: event={:?}, callback={}",
+        subscription.event_type,
+        callback_uri
+    );
+
+    // Validate subscription
+    if callback_uri.is_empty() {
+        return Err(NamfHandlerError::MissingField("callback_uri".to_string()));
+    }
+
+    // Generate subscription ID
+    let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());
+
+    // Store subscription (in real implementation, this would be persisted)
+    // For now, just log and return subscription ID
+    log::debug!(
+        "Created event subscription: id={}, type={:?}",
+        subscription_id,
+        subscription.event_type
+    );
+
+    Ok(subscription_id)
+}
+
+/// Handle event notification (send to subscriber)
+///
+/// This is called when an event occurs and needs to be notified
+pub fn send_event_notification(
+    subscription_id: &str,
+    notification: &AmfEventNotification,
+) -> NamfHandlerResult<()> {
+    log::info!(
+        "[{}] Sending event notification: type={:?}, state={:?}",
+        notification.supi,
+        notification.event_type,
+        notification.state
+    );
+
+    // In real implementation, this would:
+    // 1. Look up subscription by ID
+    // 2. Build HTTP POST request with notification data
+    // 3. Send to callback_uri from subscription
+    // 4. Handle response/retries
+
+    // For now, just log the notification
+    log::debug!(
+        "Event notification: subscription={}, event={}, timestamp={:?}",
+        subscription_id,
+        notification.event_type.as_str(),
+        notification.timestamp
+    );
+
+    Ok(())
+}
+
+/// Handle event unsubscribe (Namf_EventExposure_Unsubscribe)
+///
+/// This is called when NF wants to cancel an event subscription
+pub fn handle_event_unsubscribe(
+    subscription_id: &str,
+) -> NamfHandlerResult<()> {
+    log::info!("Event unsubscribe request: subscription={}", subscription_id);
+
+    // In real implementation, this would:
+    // 1. Look up subscription by ID
+    // 2. Remove from storage
+    // 3. Stop sending notifications
+
+    // For now, just log
+    log::debug!("Removed event subscription: {}", subscription_id);
+
+    Ok(())
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -421,5 +654,67 @@ mod tests {
 
         let result = handle_dereg_notify(&ue, &data);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_event_subscribe() {
+        let subscription = AmfEventSubscription {
+            event_type: AmfEventType::LocationReport,
+            immediate_flag: false,
+            area_list: None,
+            location_filter_list: None,
+        };
+
+        let result = handle_event_subscribe(&subscription, "http://nef.example.com/callback");
+        assert!(result.is_ok());
+        let sub_id = result.unwrap();
+        assert!(sub_id.starts_with("sub-"));
+    }
+
+    #[test]
+    fn test_event_subscribe_missing_callback() {
+        let subscription = AmfEventSubscription {
+            event_type: AmfEventType::ReachabilityReport,
+            immediate_flag: true,
+            area_list: None,
+            location_filter_list: None,
+        };
+
+        let result = handle_event_subscribe(&subscription, "");
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), NamfHandlerError::MissingField(_)));
+    }
+
+    #[test]
+    fn test_send_event_notification() {
+        let notification = AmfEventNotification {
+            event_type: AmfEventType::LocationReport,
+            state: AmfEventState::Location {
+                tai: TrackingAreaId {
+                    plmn_id: "310260".to_string(),
+                    tac: 1,
+                },
+                ncgi: None,
+            },
+            timestamp: std::time::SystemTime::now(),
+            supi: "imsi-310260000000001".to_string(),
+            additional_info: None,
+        };
+
+        let result = send_event_notification("sub-12345", &notification);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_event_unsubscribe() {
+        let result = handle_event_unsubscribe("sub-12345");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_event_type_as_str() {
+        assert_eq!(AmfEventType::LocationReport.as_str(), "LOCATION_REPORT");
+        assert_eq!(AmfEventType::ReachabilityReport.as_str(), "REACHABILITY_REPORT");
+        assert_eq!(AmfEventType::PduSessStatusReport.as_str(), "PDU_SESS_STATUS_REPORT");
     }
 }

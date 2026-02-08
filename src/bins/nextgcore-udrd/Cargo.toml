@@ -26,6 +26,8 @@ uuid = { workspace = true, features = ["v4"] }
 ctrlc = "3.4"
 clap = { version = "4.4", features = ["derive"] }
 ogs-sbi = { path = "../../libs/ogs-sbi" }
+ogs-dbi = { path = "../../libs/ogs-dbi" }
+ogs-core = { path = "../../libs/ogs-core" }
 
 [dev-dependencies]
 proptest.workspace = true

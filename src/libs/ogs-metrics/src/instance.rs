@@ -180,11 +180,10 @@ impl MetricsInstance {
             
             // Increment the appropriate bucket(s)
             for (i, &upper_bound) in buckets.iter().enumerate() {
-                if val <= upper_bound {
-                    if i < self.histogram_observations.len() {
+                if val <= upper_bound
+                    && i < self.histogram_observations.len() {
                         self.histogram_observations[i].fetch_add(1, Ordering::SeqCst);
                     }
-                }
             }
 
             // Update sum and count

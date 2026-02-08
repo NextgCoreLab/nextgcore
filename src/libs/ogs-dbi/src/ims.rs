@@ -64,7 +64,7 @@ pub fn ogs_dbi_msisdn_data(imsi_or_msisdn_bcd: &str) -> DbiResult<OgsMsisdnData>
             if let Bson::String(bcd) = msisdn_val {
                 let mut msisdn = OgsMsisdn::default();
                 msisdn.bcd = bcd.clone();
-                ogs_bcd_to_buffer(&bcd, &mut msisdn.buf);
+                ogs_bcd_to_buffer(bcd, &mut msisdn.buf);
                 msisdn.len = msisdn.buf.len();
                 msisdn_data.msisdn.push(msisdn);
                 msisdn_data.num_of_msisdn += 1;
@@ -105,7 +105,7 @@ pub fn ogs_dbi_ims_data(supi: &str) -> DbiResult<OgsImsData> {
             if let Bson::String(bcd) = msisdn_val {
                 let mut msisdn = OgsMsisdn::default();
                 msisdn.bcd = bcd.clone();
-                ogs_bcd_to_buffer(&bcd, &mut msisdn.buf);
+                ogs_bcd_to_buffer(bcd, &mut msisdn.buf);
                 msisdn.len = msisdn.buf.len();
                 ims_data.msisdn.push(msisdn);
                 ims_data.num_of_msisdn += 1;

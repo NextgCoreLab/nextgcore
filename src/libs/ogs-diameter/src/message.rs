@@ -138,8 +138,7 @@ impl DiameterHeader {
         let version = buf.get_u8();
         if version != DIAMETER_VERSION {
             return Err(DiameterError::Protocol(format!(
-                "Unsupported Diameter version: {}",
-                version
+                "Unsupported Diameter version: {version}"
             )));
         }
 

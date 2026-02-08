@@ -26,6 +26,7 @@ serde_json.workspace = true
 uuid = { version = "1.6", features = ["v4"] }
 clap = { version = "4.4", features = ["derive"] }
 ctrlc = { version = "3.4", features = ["termination"] }
+base64.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

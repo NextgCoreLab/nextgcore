@@ -177,22 +177,63 @@ pub fn handle_pcf_binding_post(
 
 /// Handle PCF binding PATCH request (update binding)
 /// Port of bsf_nbsf_management_handle_pcf_binding for PATCH method
+/// Per 3GPP TS 29.521, PATCH supports partial updates of binding attributes:
+/// - pcfFqdn, pcfIpEndPoints, ipv4Addr, ipv6Prefix, ipv4FrameRouteList,
+///   ipv6FrameRouteList, supi, gpsi, snssai, dnn
 pub fn handle_pcf_binding_patch(
     binding_id: &str,
-    _request: &PcfBindingRequest,
+    request: &PcfBindingRequest,
 ) -> HandlerResult {
     let ctx = bsf_self();
-    let context = ctx.read().map_err(|_| 
+    let context = ctx.read().map_err(|_|
         (HTTP_STATUS_BAD_REQUEST, "Context lock error".to_string()))?;
 
     // Find session by binding ID
-    let _sess = context.sess_find_by_binding_id(binding_id)
+    let sess = context.sess_find_by_binding_id(binding_id)
         .ok_or_else(|| (HTTP_STATUS_NOT_FOUND, "Session not found".to_string()))?;
 
-    // Note: PATCH logic would update specific fields of the PCF binding
-    // Per 3GPP TS 29.521, PATCH supports partial updates of binding attributes
-    // For now, return success as updates would require session modification
-    Ok((HTTP_STATUS_NO_CONTENT, None))
+    let mut updated_sess = sess.clone();
+
+    // Apply partial updates from the PATCH request
+    if let Some(ref pcf_fqdn) = request.pcf_fqdn {
+        updated_sess.pcf_fqdn = Some(pcf_fqdn.clone());
+    }
+    if !request.pcf_ip_end_points.is_empty() {
+        updated_sess.pcf_ip = request.pcf_ip_end_points.clone();
+    }
+    if let Some(ref ipv4) = request.ipv4_addr {
+        updated_sess.set_ipv4addr(ipv4);
+    }
+    if let Some(ref ipv6) = request.ipv6_prefix {
+        updated_sess.set_ipv6prefix(ipv6);
+    }
+    if !request.ipv4_frame_route_list.is_empty() {
+        updated_sess.ipv4_frame_route_list = request.ipv4_frame_route_list.clone();
+    }
+    if !request.ipv6_frame_route_list.is_empty() {
+        updated_sess.ipv6_frame_route_list = request.ipv6_frame_route_list.clone();
+    }
+    if let Some(ref supi) = request.supi {
+        updated_sess.supi = Some(supi.clone());
+    }
+    if let Some(ref gpsi) = request.gpsi {
+        updated_sess.gpsi = Some(gpsi.clone());
+    }
+    if let Some(ref snssai) = request.snssai {
+        updated_sess.s_nssai = snssai.clone();
+    }
+    if let Some(ref dnn) = request.dnn {
+        updated_sess.dnn = Some(dnn.clone());
+    }
+
+    // Update session in context
+    context.sess_update(&updated_sess);
+
+    log::info!("PCF Binding {} patched successfully", binding_id);
+
+    // Build updated response
+    let response = build_pcf_binding_from_sess(&updated_sess);
+    Ok((HTTP_STATUS_OK, Some(response)))
 }
 
 /// Build PcfBindingRequest from session (for response building)

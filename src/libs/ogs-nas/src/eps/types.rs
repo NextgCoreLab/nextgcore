@@ -89,7 +89,7 @@ impl TryFrom<u8> for EmmCause {
             100 => Ok(Self::ConditionalIeError),
             101 => Ok(Self::MessageNotCompatible),
             111 => Ok(Self::ProtocolErrorUnspecified),
-            _ => Err(NasError::DecodingError(format!("Unknown EMM cause: {}", value))),
+            _ => Err(NasError::DecodingError(format!("Unknown EMM cause: {value}"))),
         }
     }
 }

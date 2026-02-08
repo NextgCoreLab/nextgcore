@@ -76,7 +76,7 @@ fn utun_open(unit: u32) -> TunResult<(i32, String)> {
         let errno = get_errno();
         return Err(TunError::SyscallError(
             errno,
-            format!("socket() failed: errno {}", errno),
+            format!("socket() failed: errno {errno}"),
         ));
     }
 
@@ -97,7 +97,7 @@ fn utun_open(unit: u32) -> TunResult<(i32, String)> {
         unsafe { libc::close(fd) };
         return Err(TunError::SyscallError(
             errno,
-            format!("ioctl CTLIOCGINFO failed: errno {}", errno),
+            format!("ioctl CTLIOCGINFO failed: errno {errno}"),
         ));
     }
 
@@ -119,7 +119,7 @@ fn utun_open(unit: u32) -> TunResult<(i32, String)> {
         unsafe { libc::close(fd) };
         return Err(TunError::SyscallError(
             errno,
-            format!("connect() failed: errno {}", errno),
+            format!("connect() failed: errno {errno}"),
         ));
     }
 
@@ -142,7 +142,7 @@ fn utun_open(unit: u32) -> TunResult<(i32, String)> {
         unsafe { libc::close(fd) };
         return Err(TunError::SyscallError(
             errno,
-            format!("getsockopt UTUN_OPT_IFNAME failed: errno {}", errno),
+            format!("getsockopt UTUN_OPT_IFNAME failed: errno {errno}"),
         ));
     }
 
@@ -201,9 +201,9 @@ fn tun_set_ipv4(ifname: &str, ipaddr: &IpSubnet, _ipsub: &IpSubnet) -> TunResult
 
     // Use ifconfig to set the address
     let output = Command::new("/sbin/ifconfig")
-        .args([ifname, "inet", &addr_str, &format!("/{}", prefix_len), "up"])
+        .args([ifname, "inet", &addr_str, &format!("/{prefix_len}"), "up"])
         .output()
-        .map_err(|e| TunError::IoError(format!("Failed to run ifconfig: {}", e)))?;
+        .map_err(|e| TunError::IoError(format!("Failed to run ifconfig: {e}")))?;
 
     if !output.status.success() {
         return Err(TunError::IoError(format!(
@@ -232,13 +232,13 @@ fn tun_set_ipv6(ifname: &str, ipaddr: &IpSubnet, ipsub: &IpSubnet) -> TunResult<
         prefix_len += u32::from_be(ipsub.mask[i]).count_ones();
     }
 
-    let addr_str = format!("{}/{}", addr, prefix_len);
+    let addr_str = format!("{addr}/{prefix_len}");
 
     // Use ifconfig to set the address
     let output = Command::new("/sbin/ifconfig")
         .args([ifname, "inet6", &addr_str, "up"])
         .output()
-        .map_err(|e| TunError::IoError(format!("Failed to run ifconfig: {}", e)))?;
+        .map_err(|e| TunError::IoError(format!("Failed to run ifconfig: {e}")))?;
 
     if !output.status.success() {
         return Err(TunError::IoError(format!(
@@ -271,5 +271,245 @@ mod tests {
         let addr = SockaddrCtl::default();
         assert_eq!(addr.sc_family, libc::AF_SYSTEM as u8);
         assert_eq!(addr.ss_sysaddr, AF_SYS_CONTROL);
+    }
+}
+
+//
+// Additional macOS utun support (B6.1)
+//
+
+/// Set MTU on a TUN interface
+pub fn tun_set_mtu(ifname: &str, mtu: u32) -> TunResult<()> {
+    let output = Command::new("/sbin/ifconfig")
+        .args([ifname, "mtu", &mtu.to_string()])
+        .output()
+        .map_err(|e| TunError::IoError(format!("Failed to run ifconfig: {e}")))?;
+
+    if !output.status.success() {
+        return Err(TunError::IoError(format!(
+            "ifconfig mtu failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    Ok(())
+}
+
+/// Bring interface up
+pub fn tun_set_up(ifname: &str) -> TunResult<()> {
+    let output = Command::new("/sbin/ifconfig")
+        .args([ifname, "up"])
+        .output()
+        .map_err(|e| TunError::IoError(format!("Failed to run ifconfig: {e}")))?;
+
+    if !output.status.success() {
+        return Err(TunError::IoError(format!(
+            "ifconfig up failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    Ok(())
+}
+
+/// Bring interface down
+pub fn tun_set_down(ifname: &str) -> TunResult<()> {
+    let output = Command::new("/sbin/ifconfig")
+        .args([ifname, "down"])
+        .output()
+        .map_err(|e| TunError::IoError(format!("Failed to run ifconfig: {e}")))?;
+
+    if !output.status.success() {
+        return Err(TunError::IoError(format!(
+            "ifconfig down failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    Ok(())
+}
+
+/// Add route to interface
+pub fn tun_add_route(ifname: &str, dest: &IpSubnet, gateway: Option<&IpSubnet>) -> TunResult<()> {
+    if dest.is_ipv4() {
+        tun_add_route_ipv4(ifname, dest, gateway)
+    } else if dest.is_ipv6() {
+        tun_add_route_ipv6(ifname, dest, gateway)
+    } else {
+        Err(TunError::InvalidPacket("Unknown address family".to_string()))
+    }
+}
+
+/// Add IPv4 route
+fn tun_add_route_ipv4(ifname: &str, dest: &IpSubnet, gateway: Option<&IpSubnet>) -> TunResult<()> {
+    let dest_bytes = dest.sub[0].to_be_bytes();
+    let dest_str = format!(
+        "{}.{}.{}.{}",
+        dest_bytes[0], dest_bytes[1], dest_bytes[2], dest_bytes[3]
+    );
+
+    let mask = u32::from_be(dest.mask[0]);
+    let prefix_len = mask.count_ones();
+
+    let mut args = vec!["add", "-net", &dest_str];
+    args.push("-prefixlen");
+    let prefix_str = prefix_len.to_string();
+    args.push(&prefix_str);
+
+    let gw_str;
+    if let Some(gw) = gateway {
+        let gw_bytes = gw.sub[0].to_be_bytes();
+        gw_str = format!(
+            "{}.{}.{}.{}",
+            gw_bytes[0], gw_bytes[1], gw_bytes[2], gw_bytes[3]
+        );
+        args.push(&gw_str);
+    } else {
+        args.push("-interface");
+        args.push(ifname);
+    }
+
+    let output = Command::new("/sbin/route")
+        .args(&args)
+        .output()
+        .map_err(|e| TunError::IoError(format!("Failed to run route: {e}")))?;
+
+    if !output.status.success() {
+        return Err(TunError::IoError(format!(
+            "route add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    Ok(())
+}
+
+/// Add IPv6 route
+fn tun_add_route_ipv6(ifname: &str, dest: &IpSubnet, gateway: Option<&IpSubnet>) -> TunResult<()> {
+    let mut dest_bytes = [0u8; 16];
+    for i in 0..4 {
+        let bytes = dest.sub[i].to_be_bytes();
+        dest_bytes[i * 4..i * 4 + 4].copy_from_slice(&bytes);
+    }
+    let dest_addr = std::net::Ipv6Addr::from(dest_bytes);
+
+    let mut prefix_len = 0u32;
+    for i in 0..4 {
+        prefix_len += u32::from_be(dest.mask[i]).count_ones();
+    }
+
+    let dest_str = format!("{dest_addr}/{prefix_len}");
+
+    let mut args = vec!["add", "-inet6", &dest_str];
+
+    let gw_str;
+    if let Some(gw) = gateway {
+        let mut gw_bytes = [0u8; 16];
+        for i in 0..4 {
+            let bytes = gw.sub[i].to_be_bytes();
+            gw_bytes[i * 4..i * 4 + 4].copy_from_slice(&bytes);
+        }
+        let gw_addr = std::net::Ipv6Addr::from(gw_bytes);
+        gw_str = gw_addr.to_string();
+        args.push(&gw_str);
+    } else {
+        args.push("-interface");
+        args.push(ifname);
+    }
+
+    let output = Command::new("/sbin/route")
+        .args(&args)
+        .output()
+        .map_err(|e| TunError::IoError(format!("Failed to run route: {e}")))?;
+
+    if !output.status.success() {
+        return Err(TunError::IoError(format!(
+            "route add failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    Ok(())
+}
+
+/// Delete route from interface
+pub fn tun_del_route(_ifname: &str, dest: &IpSubnet) -> TunResult<()> {
+    if dest.is_ipv4() {
+        tun_del_route_ipv4(dest)
+    } else if dest.is_ipv6() {
+        tun_del_route_ipv6(dest)
+    } else {
+        Err(TunError::InvalidPacket("Unknown address family".to_string()))
+    }
+}
+
+/// Delete IPv4 route
+fn tun_del_route_ipv4(dest: &IpSubnet) -> TunResult<()> {
+    let dest_bytes = dest.sub[0].to_be_bytes();
+    let dest_str = format!(
+        "{}.{}.{}.{}",
+        dest_bytes[0], dest_bytes[1], dest_bytes[2], dest_bytes[3]
+    );
+
+    let mask = u32::from_be(dest.mask[0]);
+    let prefix_len = mask.count_ones();
+
+    let output = Command::new("/sbin/route")
+        .args(["delete", "-net", &dest_str, "-prefixlen", &prefix_len.to_string()])
+        .output()
+        .map_err(|e| TunError::IoError(format!("Failed to run route: {e}")))?;
+
+    if !output.status.success() {
+        return Err(TunError::IoError(format!(
+            "route delete failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    Ok(())
+}
+
+/// Delete IPv6 route
+fn tun_del_route_ipv6(dest: &IpSubnet) -> TunResult<()> {
+    let mut dest_bytes = [0u8; 16];
+    for i in 0..4 {
+        let bytes = dest.sub[i].to_be_bytes();
+        dest_bytes[i * 4..i * 4 + 4].copy_from_slice(&bytes);
+    }
+    let dest_addr = std::net::Ipv6Addr::from(dest_bytes);
+
+    let mut prefix_len = 0u32;
+    for i in 0..4 {
+        prefix_len += u32::from_be(dest.mask[i]).count_ones();
+    }
+
+    let dest_str = format!("{dest_addr}/{prefix_len}");
+
+    let output = Command::new("/sbin/route")
+        .args(["delete", "-inet6", &dest_str])
+        .output()
+        .map_err(|e| TunError::IoError(format!("Failed to run route: {e}")))?;
+
+    if !output.status.success() {
+        return Err(TunError::IoError(format!(
+            "route delete failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod macos_ext_tests {
+    use super::*;
+
+    #[test]
+    fn test_route_commands() {
+        // These are integration tests that would need actual network interfaces
+        // Just verify the functions exist and have correct signatures
+        let _: fn(&str, u32) -> TunResult<()> = tun_set_mtu;
+        let _: fn(&str) -> TunResult<()> = tun_set_up;
+        let _: fn(&str) -> TunResult<()> = tun_set_down;
     }
 }

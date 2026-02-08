@@ -11,6 +11,8 @@ ogs-core = { workspace = true }
 prometheus.workspace = true
 log.workspace = true
 serde_yaml.workspace = true
+thiserror.workspace = true
+hex.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

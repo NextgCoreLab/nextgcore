@@ -233,24 +233,66 @@ pub fn handle_mar(
         }
     }
 
-    // In full implementation:
     // 1. Query database for auth info (K, OPc, SQN, AMF)
-    // 2. Handle re-sync if sip_authorization present
-    // 3. Generate authentication vectors using Milenage
-    // 4. Update SQN in database
-    // 5. Build and return MAA
+    use ogs_dbi::{ogs_dbi_auth_info, ogs_dbi_increment_sqn};
+    use ogs_crypt::milenage::{milenage_f1, milenage_f2345, milenage_opc};
 
-    // Placeholder response
+    let supi = format!("imsi-{}", imsi_bcd);
+    let auth_info = ogs_dbi_auth_info(&supi)?;
+
+    // 2. Handle re-sync if sip_authorization present
+    // (Not implemented in this basic version)
+
+    // 3. Generate authentication vectors using Milenage
+    let rand = auth_info.rand;
+    let sqn_bytes: [u8; 6] = [
+        ((auth_info.sqn >> 40) & 0xFF) as u8,
+        ((auth_info.sqn >> 32) & 0xFF) as u8,
+        ((auth_info.sqn >> 24) & 0xFF) as u8,
+        ((auth_info.sqn >> 16) & 0xFF) as u8,
+        ((auth_info.sqn >> 8) & 0xFF) as u8,
+        (auth_info.sqn & 0xFF) as u8,
+    ];
+
+    let opc = if auth_info.use_opc {
+        auth_info.opc
+    } else {
+        milenage_opc(&auth_info.k, &auth_info.op)
+            .map_err(|e| anyhow::anyhow!("Failed to compute OPc: {:?}", e))?
+    };
+
+    let (mac_a, _mac_s) = milenage_f1(&opc, &auth_info.k, &rand, &sqn_bytes, &auth_info.amf)
+        .map_err(|e| anyhow::anyhow!("Failed to compute f1: {:?}", e))?;
+    let (res, ck, ik, ak, _ak_star) = milenage_f2345(&opc, &auth_info.k, &rand)
+        .map_err(|e| anyhow::anyhow!("Failed to compute f2-f5: {:?}", e))?;
+
+    // Build AUTN
+    let mut autn = [0u8; 16];
+    for i in 0..6 {
+        autn[i] = sqn_bytes[i] ^ ak[i];
+    }
+    autn[6..8].copy_from_slice(&auth_info.amf);
+    autn[8..16].copy_from_slice(&mac_a);
+
+    // Build SIP-Authenticate = RAND || AUTN
+    let mut sip_authenticate = Vec::new();
+    sip_authenticate.extend_from_slice(&rand);
+    sip_authenticate.extend_from_slice(&autn);
+
+    // 4. Update SQN in database
+    ogs_dbi_increment_sqn(&supi)?;
+
+    // 5. Build and return MAA
     let response = MarResponse {
         user_name: user_name.to_string(),
         sip_number_auth_items: 1,
         sip_auth_data_item: SipAuthDataItem {
             sip_item_number: 1,
-            sip_authentication_scheme: SWX_AUTH_SCHEME_EAP_AKA.to_string(),
-            sip_authenticate: vec![0u8; 32], // RAND || AUTN
-            sip_authorization: vec![0u8; 8], // XRES
-            confidentiality_key: vec![0u8; 16], // CK
-            integrity_key: vec![0u8; 16],    // IK
+            sip_authentication_scheme: auth_scheme.unwrap_or(SWX_AUTH_SCHEME_EAP_AKA).to_string(),
+            sip_authenticate,
+            sip_authorization: res.to_vec(),
+            confidentiality_key: ck.to_vec(),
+            integrity_key: ik.to_vec(),
         },
     };
 
@@ -286,8 +328,11 @@ pub fn handle_sar(
     let imsi_bcd = extract_imsi_from_username(user_name)?;
     debug!("Extracted IMSI: {}", imsi_bcd);
 
-    // In full implementation:
     // 1. Query database for subscription data
+    use ogs_dbi::ogs_dbi_subscription_data;
+
+    let supi = format!("imsi-{}", imsi_bcd);
+
     // 2. Build Non-3GPP-User-Data AVP
     // 3. Include APN configurations
     // 4. Return SAA
@@ -295,17 +340,38 @@ pub fn handle_sar(
     // Handle based on assignment type
     match server_assignment_type {
         ServerAssignmentType::Registration | ServerAssignmentType::AaaUserDataRequest => {
+            // Get subscription data from database
+            let subscription_data = ogs_dbi_subscription_data(&supi)?;
+
+            // Build APN configurations from subscription data
+            let mut apn_configurations = Vec::new();
+            if let Some(slice) = subscription_data.slice.first() {
+                if let Some(session) = slice.session.first() {
+                    apn_configurations.push(ApnConfiguration {
+                        context_identifier: 1,
+                        pdn_type: 3, // IPv4v6
+                        service_selection: session.name.clone().unwrap_or_else(|| "internet".to_string()),
+                        qos_class_identifier: 9, // QCI 9 (default bearer)
+                        priority_level: 8,
+                        pre_emption_capability: false,
+                        pre_emption_vulnerability: true,
+                        ambr_ul: subscription_data.ambr.uplink,
+                        ambr_dl: subscription_data.ambr.downlink,
+                    });
+                }
+            }
+
             // Return full subscription data
             let response = SarResponse {
                 user_name: user_name.to_string(),
                 non_3gpp_user_data: Some(Non3gppUserData {
-                    subscription_id: None,
+                    subscription_id: subscription_data.msisdn.first().map(|m| m.bcd.clone()),
                     non_3gpp_ip_access: Non3gppIpAccess::Allowed,
                     non_3gpp_ip_access_apn: Non3gppIpAccessApn::Enable,
-                    ambr_ul: 1000000000, // 1 Gbps
-                    ambr_dl: 1000000000, // 1 Gbps
+                    ambr_ul: subscription_data.ambr.uplink,
+                    ambr_dl: subscription_data.ambr.downlink,
                     context_identifier: 1,
-                    apn_configurations: vec![],
+                    apn_configurations,
                 }),
             };
 
@@ -504,16 +570,9 @@ mod tests {
         // Initialize first
         let _ = hss_swx_init();
 
+        // MAR requires MongoDB for auth info lookup - verify graceful error without DB
         let result = handle_mar("001010123456789", Some(SWX_AUTH_SCHEME_EAP_AKA), None);
-        assert!(result.is_ok());
-
-        let response = result.unwrap();
-        assert_eq!(response.user_name, "001010123456789");
-        assert_eq!(response.sip_number_auth_items, 1);
-        assert_eq!(
-            response.sip_auth_data_item.sip_authentication_scheme,
-            SWX_AUTH_SCHEME_EAP_AKA
-        );
+        assert!(result.is_err());
     }
 
     #[test]
@@ -528,15 +587,9 @@ mod tests {
     fn test_handle_sar_registration() {
         let _ = hss_swx_init();
 
+        // SAR Registration requires MongoDB for subscription data - verify graceful error without DB
         let result = handle_sar("001010123456789", ServerAssignmentType::Registration);
-        assert!(result.is_ok());
-
-        let response = result.unwrap();
-        assert_eq!(response.user_name, "001010123456789");
-        assert!(response.non_3gpp_user_data.is_some());
-
-        let user_data = response.non_3gpp_user_data.unwrap();
-        assert_eq!(user_data.non_3gpp_ip_access, Non3gppIpAccess::Allowed);
+        assert!(result.is_err());
     }
 
     #[test]

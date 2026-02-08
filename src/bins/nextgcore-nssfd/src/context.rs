@@ -161,6 +161,14 @@ impl NssfHome {
     }
 }
 
+/// NSSAI Availability info stored per NF
+#[derive(Debug, Clone)]
+pub struct NssaiAvailabilityInfo {
+    pub nf_id: String,
+    pub supported_snssai_list: Vec<SNssai>,
+    pub tai_list: Vec<Tai>,
+}
+
 /// NSSF Context - main context structure for NSSF
 /// Port of nssf_context_t from context.h
 pub struct NssfContext {
@@ -172,6 +180,8 @@ pub struct NssfContext {
     snssai_hash: RwLock<HashMap<(u8, Option<u32>), u64>>,
     /// (PLMN ID, S-NSSAI) -> Home ID hash for quick lookup
     home_hash: RwLock<HashMap<(String, String, u8, Option<u32>), u64>>,
+    /// NSSAI availability per NF instance ID (B24.4)
+    nssai_availability: RwLock<HashMap<String, NssaiAvailabilityInfo>>,
     /// Next NSI ID
     next_nsi_id: AtomicUsize,
     /// Next Home ID
@@ -190,6 +200,7 @@ impl NssfContext {
             home_list: RwLock::new(HashMap::new()),
             snssai_hash: RwLock::new(HashMap::new()),
             home_hash: RwLock::new(HashMap::new()),
+            nssai_availability: RwLock::new(HashMap::new()),
             next_nsi_id: AtomicUsize::new(1),
             next_home_id: AtomicUsize::new(1),
             max_num_of_nf: 0,
@@ -370,6 +381,34 @@ impl NssfContext {
             }
         }
         false
+    }
+
+    // NSSAI Availability management (B24.4)
+
+    pub fn set_nssai_availability(&self, nf_id: &str, info: NssaiAvailabilityInfo) {
+        if let Ok(mut avail) = self.nssai_availability.write() {
+            avail.insert(nf_id.to_string(), info);
+        }
+    }
+
+    pub fn get_nssai_availability(&self, nf_id: &str) -> Option<NssaiAvailabilityInfo> {
+        let avail = self.nssai_availability.read().ok()?;
+        avail.get(nf_id).cloned()
+    }
+
+    pub fn remove_nssai_availability(&self, nf_id: &str) -> bool {
+        if let Ok(mut avail) = self.nssai_availability.write() {
+            return avail.remove(nf_id).is_some();
+        }
+        false
+    }
+
+    /// Get all NSI entries
+    pub fn nsi_get_all(&self) -> Vec<NssfNsi> {
+        self.nsi_list
+            .read()
+            .map(|l| l.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Get NSI load percentage

@@ -5,6 +5,7 @@
 use crate::context::{sepp_self, SeppNode};
 use crate::event::{SeppEvent, SeppEventId, SeppTimerId};
 use crate::handshake_sm::{HandshakeSmContext, HandshakeState};
+use crate::sbi_response::{send_error_response, send_gateway_timeout_response};
 
 /// SEPP state type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +167,7 @@ impl SeppSmContext {
         // Check API version
         if api_version != "v1" {
             log::error!("Not supported version [{}], expected [v1]", api_version);
+            send_error_response(stream_id, 400, &format!("Unsupported API version: {}", api_version));
             return;
         }
 
@@ -390,6 +392,7 @@ impl SeppSmContext {
             }
             SeppTimerId::SbiClientWait => {
                 log::error!("Cannot receive SBI message");
+                send_gateway_timeout_response(0, "SBI client wait timeout");
             }
         }
     }

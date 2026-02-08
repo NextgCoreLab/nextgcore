@@ -4,6 +4,9 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use ogs_sbi::context::{global_context, NfInstance, NfService};
+use ogs_sbi::types::{NfType, SbiServiceType, UriScheme};
+
 /// SBI server configuration
 #[derive(Debug, Clone)]
 pub struct SbiServerConfig {
@@ -12,6 +15,7 @@ pub struct SbiServerConfig {
     pub tls_enabled: bool,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
+    pub nrf_uri: Option<String>,
 }
 
 impl Default for SbiServerConfig {
@@ -22,6 +26,7 @@ impl Default for SbiServerConfig {
             tls_enabled: false,
             tls_cert: None,
             tls_key: None,
+            nrf_uri: None,
         }
     }
 }
@@ -29,7 +34,136 @@ impl Default for SbiServerConfig {
 /// SBI server state
 static SBI_SERVER_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// Open SBI server
+/// Build the PCF NF instance with service information
+fn build_pcf_nf_instance(config: &SbiServerConfig) -> NfInstance {
+    let nf_id = uuid::Uuid::new_v4().to_string();
+    let mut nf_instance = NfInstance::new(&nf_id, NfType::Pcf);
+
+    nf_instance.ipv4_addresses.push(config.addr.clone());
+    nf_instance.heartbeat_interval = 10;
+
+    let scheme = if config.tls_enabled {
+        UriScheme::Https
+    } else {
+        UriScheme::Http
+    };
+
+    // npcf-am-policy-control service (allowed: AMF)
+    let mut am_policy_svc = NfService::new(
+        SbiServiceType::NpcfAmPolicyControl.to_name(),
+        SbiServiceType::NpcfAmPolicyControl,
+    );
+    am_policy_svc.scheme = scheme;
+    am_policy_svc.ip_addresses.push(config.addr.clone());
+    am_policy_svc.port = config.port;
+    nf_instance.add_service(am_policy_svc);
+
+    // npcf-smpolicycontrol service (allowed: SMF)
+    let mut sm_policy_svc = NfService::new(
+        SbiServiceType::NpcfSmpolicycontrol.to_name(),
+        SbiServiceType::NpcfSmpolicycontrol,
+    );
+    sm_policy_svc.scheme = scheme;
+    sm_policy_svc.ip_addresses.push(config.addr.clone());
+    sm_policy_svc.port = config.port;
+    nf_instance.add_service(sm_policy_svc);
+
+    // npcf-policyauthorization service (allowed: AF, PCF)
+    let mut pa_svc = NfService::new(
+        SbiServiceType::NpcfPolicyauthorization.to_name(),
+        SbiServiceType::NpcfPolicyauthorization,
+    );
+    pa_svc.scheme = scheme;
+    pa_svc.ip_addresses.push(config.addr.clone());
+    pa_svc.port = config.port;
+    nf_instance.add_service(pa_svc);
+
+    nf_instance
+}
+
+/// Parse host and port from a URI string (e.g., "http://127.0.0.1:7777")
+fn parse_uri_host_port(uri_str: &str) -> Result<(String, u16), String> {
+    let stripped = uri_str
+        .strip_prefix("https://")
+        .or_else(|| uri_str.strip_prefix("http://"))
+        .unwrap_or(uri_str);
+    let (host, port_str) = if let Some(idx) = stripped.rfind(':') {
+        (&stripped[..idx], &stripped[idx + 1..])
+    } else {
+        (stripped, if uri_str.starts_with("https") { "443" } else { "80" })
+    };
+    let port: u16 = port_str
+        .split('/')
+        .next()
+        .unwrap_or(port_str)
+        .parse()
+        .map_err(|e| format!("Invalid port in URI: {}", e))?;
+    Ok((host.to_string(), port))
+}
+
+/// Register PCF NF instance with NRF
+async fn register_with_nrf(nrf_uri: &str, nf_instance: &NfInstance) -> Result<(), String> {
+    let (host, port) = parse_uri_host_port(nrf_uri)?;
+
+    let ctx = global_context();
+    let client = ctx.get_client(&host, port).await;
+
+    let register_path = format!(
+        "/nnrf-nfm/v1/nf-instances/{}",
+        nf_instance.id
+    );
+
+    let body = serde_json::json!({
+        "nfInstanceId": nf_instance.id,
+        "nfType": "PCF",
+        "nfStatus": "REGISTERED",
+        "heartBeatTimer": nf_instance.heartbeat_interval,
+        "ipv4Addresses": nf_instance.ipv4_addresses,
+        "nfServices": nf_instance.services.iter().map(|s| {
+            serde_json::json!({
+                "serviceName": s.name,
+                "versions": s.versions.iter().map(|v| {
+                    serde_json::json!({"apiVersionInUri": v, "apiFullVersion": format!("{}.0.0", v)})
+                }).collect::<Vec<_>>(),
+                "scheme": s.scheme.as_str(),
+                "nfServiceStatus": "REGISTERED",
+            })
+        }).collect::<Vec<_>>(),
+    });
+
+    match client
+        .put_json(&register_path, &body)
+        .await
+    {
+        Ok(response) => {
+            let status = response.status;
+            if status == 200 || status == 201 {
+                log::info!(
+                    "PCF registered with NRF (id={}, status={})",
+                    nf_instance.id,
+                    status
+                );
+                Ok(())
+            } else {
+                let msg = format!(
+                    "NRF registration returned status {}: {:?}",
+                    status,
+                    response.http.content
+                );
+                log::warn!("{}", msg);
+                // Non-fatal: PCF can operate without NRF
+                Ok(())
+            }
+        }
+        Err(e) => {
+            log::warn!("NRF registration failed (PCF will operate standalone): {}", e);
+            // Non-fatal: PCF can operate without NRF
+            Ok(())
+        }
+    }
+}
+
+/// Open SBI server and register with NRF
 /// Port of pcf_sbi_open() from sbi-path.c
 pub fn pcf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     let config = config.unwrap_or_default();
@@ -44,24 +178,33 @@ pub fn pcf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
         config.port
     );
 
-    // In C implementation:
-    // 1. Initialize SELF NF instance
-    // 2. Build NF instance information for NRF
-    // 3. Add allowed NF types (SCP, AMF, SMF, AF)
-    // 4. Build NF service information:
-    //    - npcf-am-policy-control (allowed: AMF)
-    //    - npcf-smpolicycontrol (allowed: SMF)
-    //    - npcf-policyauthorization (allowed: AF, PCF)
-    // 5. Initialize NRF NF instance
-    // 6. Setup subscription data for SEPP, NBSF, NUDR
-    // 7. Start all SBI servers
+    // Build and register the PCF NF instance
+    let nf_instance = build_pcf_nf_instance(&config);
 
-    // Validate that smpolicycontrol and policyauthorization are enabled together
-    // (or both disabled) - this is a PCF-specific requirement
-    // In C: if one is enabled and other disabled, return OGS_ERROR
+    // Store self instance and NRF URI in SBI context
+    let sbi_ctx = global_context();
+    let nf_id = nf_instance.id.clone();
+    let nrf_uri_clone = config.nrf_uri.clone();
+    let nf_clone = nf_instance.clone();
 
-    // Note: HTTP/2 server implementation is in main.rs using hyper
-    // For now, just mark as running
+    // Attempt async registration (only if tokio runtime is available)
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            sbi_ctx.set_self_instance(nf_clone).await;
+            if let Some(ref nrf_uri) = nrf_uri_clone {
+                sbi_ctx.set_nrf_uri(nrf_uri).await;
+                if let Err(e) = register_with_nrf(nrf_uri, &nf_instance).await {
+                    log::error!("Failed to register PCF with NRF: {}", e);
+                }
+            } else {
+                log::info!("No NRF URI configured, PCF running in standalone mode");
+            }
+        });
+    } else {
+        log::debug!("No tokio runtime available, skipping async NRF registration");
+    }
+
+    log::info!("PCF NF instance built (id={})", nf_id);
 
     SBI_SERVER_RUNNING.store(true, Ordering::SeqCst);
 
@@ -69,7 +212,7 @@ pub fn pcf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     Ok(())
 }
 
-/// Close SBI server
+/// Close SBI server and deregister from NRF
 /// Port of pcf_sbi_close() from sbi-path.c
 pub fn pcf_sbi_close() {
     if !SBI_SERVER_RUNNING.load(Ordering::SeqCst) {
@@ -79,9 +222,27 @@ pub fn pcf_sbi_close() {
 
     log::info!("Closing PCF SBI server");
 
-    // In C implementation:
-    // 1. Stop all SBI clients
-    // 2. Stop all SBI servers
+    // Attempt async deregistration (only if tokio runtime is available)
+    let sbi_ctx = global_context();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            if let (Some(nrf_uri), Some(self_instance)) = (
+                sbi_ctx.get_nrf_uri().await,
+                sbi_ctx.get_self_instance().await,
+            ) {
+                if let Ok((host, port)) = parse_uri_host_port(&nrf_uri) {
+                    let client = sbi_ctx.get_client(&host, port).await;
+                    let path = format!("/nnrf-nfm/v1/nf-instances/{}", self_instance.id);
+                    if let Err(e) = client.delete(&path).await {
+                        log::warn!("Failed to deregister PCF from NRF: {}", e);
+                    } else {
+                        log::info!("PCF deregistered from NRF");
+                    }
+                }
+            }
+            sbi_ctx.clear_clients().await;
+        });
+    }
 
     SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
 
@@ -257,12 +418,11 @@ mod tests {
     }
 
     #[test]
-    fn test_sbi_open_close() {
+    fn test_sbi_open_close_and_config() {
         // Reset state
         SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
 
-        assert!(!pcf_sbi_is_running());
-
+        // Open with default config
         let result = pcf_sbi_open(None);
         assert!(result.is_ok());
         assert!(pcf_sbi_is_running());
@@ -273,24 +433,31 @@ mod tests {
 
         pcf_sbi_close();
         assert!(!pcf_sbi_is_running());
-    }
 
-    #[test]
-    fn test_sbi_open_with_config() {
-        // Reset state
-        SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
-
+        // Open with custom config
         let config = SbiServerConfig {
             addr: "0.0.0.0".to_string(),
             port: 8080,
             tls_enabled: true,
             tls_cert: Some("/path/to/cert.pem".to_string()),
             tls_key: Some("/path/to/key.pem".to_string()),
+            nrf_uri: None,
         };
 
         let result = pcf_sbi_open(Some(config));
         assert!(result.is_ok());
 
         pcf_sbi_close();
+    }
+
+    #[test]
+    fn test_parse_uri_host_port() {
+        let (host, port) = parse_uri_host_port("http://127.0.0.1:7777").unwrap();
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 7777);
+
+        let (host, port) = parse_uri_host_port("https://nrf.example.com:443").unwrap();
+        assert_eq!(host, "nrf.example.com");
+        assert_eq!(port, 443);
     }
 }

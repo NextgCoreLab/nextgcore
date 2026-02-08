@@ -240,22 +240,45 @@ pub fn pcf_nudr_dr_handle_query_sm_data(
 }
 
 
-/// Query subscription data from database
-/// In C: ogs_dbi_subscription_data()
-fn query_subscription_data(supi: &str) -> Option<SubscriptionData> {
-    // Note: Database query requires UDR/MongoDB integration
-    // For now, return mock data for testing
-    log::debug!("Querying subscription data for SUPI: {}", supi);
-
-    // In a real implementation, this would query MongoDB
-    // using the ogs-dbi library
-    Some(SubscriptionData {
-        ambr_uplink: 1000000000,   // 1 Gbps
-        ambr_downlink: 1000000000, // 1 Gbps
-    })
+/// Public API for querying subscription data (used by AM policy handler)
+pub fn query_subscription_data_pub(supi: &str) -> Option<SubscriptionData> {
+    query_subscription_data(supi)
 }
 
-/// Get session data from database
+/// Query subscription data from database via ogs-dbi
+/// In C: ogs_dbi_subscription_data()
+fn query_subscription_data(supi: &str) -> Option<SubscriptionData> {
+    log::debug!("Querying subscription data for SUPI: {}", supi);
+
+    match ogs_dbi::ogs_dbi_subscription_data(supi) {
+        Ok(sub_data) => {
+            log::debug!(
+                "[{}] Subscription data: AMBR up={}, down={}",
+                supi,
+                sub_data.ambr.uplink,
+                sub_data.ambr.downlink
+            );
+            Some(SubscriptionData {
+                ambr_uplink: sub_data.ambr.uplink,
+                ambr_downlink: sub_data.ambr.downlink,
+            })
+        }
+        Err(e) => {
+            log::warn!(
+                "[{}] Failed to query subscription data from DB: {}, using defaults",
+                supi,
+                e
+            );
+            // Fallback to default values when DB is unavailable
+            Some(SubscriptionData {
+                ambr_uplink: 1000000000,   // 1 Gbps
+                ambr_downlink: 1000000000, // 1 Gbps
+            })
+        }
+    }
+}
+
+/// Get session data from database via ogs-dbi
 /// In C: pcf_get_session_data()
 pub fn pcf_get_session_data(
     supi: &str,
@@ -270,17 +293,80 @@ pub fn pcf_get_session_data(
         dnn
     );
 
-    // Note: Database query requires UDR/MongoDB integration
-    // For now, return mock data for testing
-    Some(SessionData {
-        qos_index: 9, // Default 5QI
-        arp_priority_level: 8,
-        arp_preempt_cap: false,
-        arp_preempt_vuln: true,
-        ambr_uplink: 100000000,   // 100 Mbps
-        ambr_downlink: 100000000, // 100 Mbps
-        pcc_rules: vec![],
-    })
+    let ogs_snssai = ogs_dbi::OgsSNssai::new(s_nssai.sst, s_nssai.sd);
+
+    match ogs_dbi::ogs_dbi_session_data(supi, Some(&ogs_snssai), dnn) {
+        Ok(sess_data) => {
+            let qos = &sess_data.session.qos;
+            let ambr = &sess_data.session.ambr;
+
+            let pcc_rules = sess_data
+                .pcc_rule
+                .iter()
+                .map(|r| {
+                    PccRule {
+                        id: r.id.clone().unwrap_or_default(),
+                        precedence: r.precedence as u32,
+                        qos_index: r.qos.index,
+                        flow_status: crate::npcf_handler::FlowStatus::Enabled,
+                        flows: r
+                            .flow
+                            .iter()
+                            .map(|f| FlowDescription {
+                                direction: match f.direction {
+                                    1 => FlowDirection::Downlink,
+                                    2 => FlowDirection::Uplink,
+                                    3 => FlowDirection::Bidirectional,
+                                    _ => FlowDirection::Bidirectional,
+                                },
+                                description: f
+                                    .description
+                                    .clone()
+                                    .unwrap_or_default(),
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+
+            log::debug!(
+                "[{}] Session data: 5QI={}, ARP={}, AMBR up={} down={}, {} PCC rules",
+                supi,
+                qos.index,
+                qos.arp.priority_level,
+                ambr.uplink,
+                ambr.downlink,
+                sess_data.num_of_pcc_rule
+            );
+
+            Some(SessionData {
+                qos_index: qos.index,
+                arp_priority_level: qos.arp.priority_level,
+                arp_preempt_cap: qos.arp.pre_emption_capability != 0,
+                arp_preempt_vuln: qos.arp.pre_emption_vulnerability != 0,
+                ambr_uplink: ambr.uplink,
+                ambr_downlink: ambr.downlink,
+                pcc_rules,
+            })
+        }
+        Err(e) => {
+            log::warn!(
+                "[{}] Failed to query session data from DB: {}, using defaults",
+                supi,
+                e
+            );
+            // Fallback to default values when DB is unavailable
+            Some(SessionData {
+                qos_index: 9,
+                arp_priority_level: 8,
+                arp_preempt_cap: false,
+                arp_preempt_vuln: true,
+                ambr_uplink: 100000000,
+                ambr_downlink: 100000000,
+                pcc_rules: vec![],
+            })
+        }
+    }
 }
 
 /// Session Data from database

@@ -3,6 +3,7 @@
 //! Port of src/scp/scp-sm.c - Main SCP state machine implementation
 
 use crate::event::{ScpEvent, ScpEventId, ScpTimerId};
+use crate::sbi_response::{send_error_response, send_gateway_timeout_response};
 
 /// SCP state type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,8 +124,7 @@ impl ScpSmContext {
         // Check API version (SCP uses v1)
         if api_version != "v1" {
             log::error!("Not supported version [{}], expected [v1]", api_version);
-            // Note: Send error response
-            // Error response is sent via the HTTP server module in main.rs
+            send_error_response(stream_id, 400, &format!("Unsupported API version: {}", api_version));
             return;
         }
 
@@ -293,8 +293,7 @@ impl ScpSmContext {
             }
             ScpTimerId::SbiClientWait => {
                 log::error!("Cannot receive SBI message");
-                // Note: Send gateway timeout error
-                // Gateway timeout response is sent via the HTTP server module
+                send_gateway_timeout_response(0, "SBI client wait timeout");
             }
         }
     }

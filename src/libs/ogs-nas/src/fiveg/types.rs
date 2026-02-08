@@ -95,7 +95,7 @@ impl TryFrom<u8> for FiveGmmCause {
             97 => Ok(Self::MessageTypeNonExistent),
             98 => Ok(Self::MessageTypeNotCompatible),
             99 => Ok(Self::InformationElementNonExistent),
-            _ => Err(NasError::DecodingError(format!("Unknown 5GMM cause: {}", value))),
+            _ => Err(NasError::DecodingError(format!("Unknown 5GMM cause: {value}"))),
         }
     }
 }

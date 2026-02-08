@@ -39,7 +39,7 @@ pub fn tun_read(device: &TunDevice) -> TunResult<Vec<u8>> {
         let errno = get_errno();
         return Err(TunError::SyscallError(
             errno,
-            format!("read() failed: {}", errno),
+            format!("read() failed: {errno}"),
         ));
     }
 
@@ -78,8 +78,7 @@ pub fn tun_write(device: &TunDevice, data: &[u8]) -> TunResult<()> {
             6 => libc::AF_INET6 as u32,
             _ => {
                 return Err(TunError::InvalidPacket(format!(
-                    "Invalid IP version: {}",
-                    version
+                    "Invalid IP version: {version}"
                 )));
             }
         };
@@ -106,7 +105,7 @@ pub fn tun_write(device: &TunDevice, data: &[u8]) -> TunResult<()> {
         let errno = get_errno();
         return Err(TunError::SyscallError(
             errno,
-            format!("write() failed: {}", errno),
+            format!("write() failed: {errno}"),
         ));
     }
 

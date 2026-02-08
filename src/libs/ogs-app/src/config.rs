@@ -628,11 +628,10 @@ impl OgsLocalConf {
     fn parse_serving(&mut self, local_iter: &mut OgsYamlIter) -> Result<(), ConfigError> {
         if let Some(mut serving_array) = local_iter.recurse() {
             loop {
-                if serving_array.node_type() == YamlNodeType::Sequence {
-                    if !serving_array.next() {
+                if serving_array.node_type() == YamlNodeType::Sequence
+                    && !serving_array.next() {
                         break;
                     }
-                }
 
                 if let Some(mut serving_iter) = serving_array.recurse() {
                     while serving_iter.next() {
@@ -977,5 +976,701 @@ global:
         assert_eq!(ogs_time_from_sec(1), 1_000_000);
         assert_eq!(ogs_time_from_msec(1), 1_000);
         assert_eq!(ogs_time_from_sec(10), 10_000_000);
+    }
+}
+
+//
+// Dynamic Reconfiguration Support (B3.1)
+//
+
+use std::path::PathBuf;
+use std::sync::mpsc::{channel, Sender, Receiver};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// Configuration reload event
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfigEvent {
+    /// Configuration file changed
+    FileChanged(PathBuf),
+    /// Configuration reloaded successfully
+    Reloaded,
+    /// Configuration reload failed
+    ReloadFailed(String),
+    /// Shutdown requested
+    Shutdown,
+}
+
+/// Configuration watcher
+pub struct ConfigWatcher {
+    config_path: PathBuf,
+    event_tx: Sender<ConfigEvent>,
+    event_rx: Arc<Mutex<Receiver<ConfigEvent>>>,
+    running: Arc<Mutex<bool>>,
+}
+
+impl ConfigWatcher {
+    /// Create a new configuration watcher
+    pub fn new(config_path: PathBuf) -> Self {
+        let (event_tx, event_rx) = channel();
+        ConfigWatcher {
+            config_path,
+            event_tx,
+            event_rx: Arc::new(Mutex::new(event_rx)),
+            running: Arc::new(Mutex::new(false)),
+        }
+    }
+
+    /// Start watching the configuration file
+    pub fn start(&self) {
+        let config_path = self.config_path.clone();
+        let event_tx = self.event_tx.clone();
+        let running = Arc::clone(&self.running);
+
+        *running.lock().unwrap() = true;
+
+        std::thread::spawn(move || {
+            // Get initial modification time
+            let mut last_modified = std::fs::metadata(&config_path)
+                .and_then(|m| m.modified())
+                .ok();
+
+            while *running.lock().unwrap() {
+                // Check file modification time
+                if let Ok(metadata) = std::fs::metadata(&config_path) {
+                    if let Ok(modified) = metadata.modified() {
+                        if Some(modified) != last_modified {
+                            last_modified = Some(modified);
+                            // Notify about file change
+                            let _ = event_tx.send(ConfigEvent::FileChanged(config_path.clone()));
+                        }
+                    }
+                }
+
+                // Check every second
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+    }
+
+    /// Stop watching
+    pub fn stop(&self) {
+        *self.running.lock().unwrap() = false;
+        let _ = self.event_tx.send(ConfigEvent::Shutdown);
+    }
+
+    /// Get next event (blocking)
+    pub fn recv(&self) -> Result<ConfigEvent, std::sync::mpsc::RecvError> {
+        let rx = self.event_rx.lock().unwrap();
+        rx.recv()
+    }
+
+    /// Try to get next event (non-blocking)
+    pub fn try_recv(&self) -> Result<ConfigEvent, std::sync::mpsc::TryRecvError> {
+        let rx = self.event_rx.lock().unwrap();
+        rx.try_recv()
+    }
+
+    /// Notify reload success
+    pub fn notify_reloaded(&self) {
+        let _ = self.event_tx.send(ConfigEvent::Reloaded);
+    }
+
+    /// Notify reload failure
+    pub fn notify_reload_failed(&self, error: String) {
+        let _ = self.event_tx.send(ConfigEvent::ReloadFailed(error));
+    }
+
+    /// Get config path
+    pub fn config_path(&self) -> &PathBuf {
+        &self.config_path
+    }
+}
+
+impl Drop for ConfigWatcher {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl OgsGlobalConf {
+    /// Reload configuration from file
+    pub fn reload(&mut self, config_path: &str) -> Result<(), ConfigError> {
+        use crate::yaml::OgsYamlDocument;
+
+        // Parse YAML document
+        let doc = OgsYamlDocument::from_file(config_path)
+            .map_err(|e| ConfigError::ParseError(format!("Failed to parse YAML: {e:?}")))?;
+
+        let mut iter = doc.iter();
+
+        // Find and parse global section
+        while iter.next() {
+            if iter.key() == Some("global") {
+                self.parse(&mut iter)?;
+                return Ok(());
+            }
+        }
+
+        Err(ConfigError::ParseError(
+            "No 'global' section found in config".to_string(),
+        ))
+    }
+}
+
+impl OgsLocalConf {
+    /// Reload configuration from file
+    pub fn reload(&mut self, config_path: &str) -> Result<(), ConfigError> {
+        use crate::yaml::OgsYamlDocument;
+
+        // Parse YAML document
+        let doc = OgsYamlDocument::from_file(config_path)
+            .map_err(|e| ConfigError::ParseError(format!("Failed to parse YAML: {e:?}")))?;
+
+        let mut iter = doc.iter();
+
+        // Find local config sections (usually under NF-specific section)
+        while iter.next() {
+            let key = iter.key().unwrap_or("");
+
+            // Look for common NF sections that contain local config
+            if key == "amf" || key == "smf" || key == "upf" || key == "nrf" || key == "local" {
+                if let Some(mut local_iter) = iter.recurse() {
+                    self.parse(&mut local_iter)?;
+                    return Ok(());
+                }
+            }
+        }
+
+        Err(ConfigError::ParseError(
+            "No local config section found in config".to_string(),
+        ))
+    }
+}
+
+/// Configuration reload manager
+pub struct ConfigReloadManager {
+    watcher: ConfigWatcher,
+    global_conf: Arc<Mutex<OgsGlobalConf>>,
+    local_conf: Arc<Mutex<OgsLocalConf>>,
+}
+
+impl ConfigReloadManager {
+    /// Create a new reload manager
+    pub fn new(
+        config_path: PathBuf,
+        global_conf: Arc<Mutex<OgsGlobalConf>>,
+        local_conf: Arc<Mutex<OgsLocalConf>>,
+    ) -> Self {
+        ConfigReloadManager {
+            watcher: ConfigWatcher::new(config_path),
+            global_conf,
+            local_conf,
+        }
+    }
+
+    /// Start watching and auto-reloading
+    pub fn start_auto_reload(&self) {
+        self.watcher.start();
+
+        let watcher = ConfigWatcher::new(self.watcher.config_path().clone());
+        let event_rx = Arc::clone(&self.watcher.event_rx);
+        let global_conf = Arc::clone(&self.global_conf);
+        let local_conf = Arc::clone(&self.local_conf);
+        let config_path = self.watcher.config_path().clone();
+
+        std::thread::spawn(move || {
+            loop {
+                let rx = event_rx.lock().unwrap();
+                match rx.recv() {
+                    Ok(ConfigEvent::FileChanged(_)) => {
+                        drop(rx); // Release lock before reloading
+
+                        eprintln!("Configuration file changed, reloading...");
+
+                        // Try to reload global config
+                        let mut global = global_conf.lock().unwrap();
+                        if let Err(e) = global.reload(config_path.to_str().unwrap()) {
+                            eprintln!("Failed to reload global config: {e}");
+                            watcher.notify_reload_failed(format!("Global config: {e}"));
+                            continue;
+                        }
+                        drop(global);
+
+                        // Try to reload local config
+                        let mut local = local_conf.lock().unwrap();
+                        if let Err(e) = local.reload(config_path.to_str().unwrap()) {
+                            eprintln!("Failed to reload local config: {e}");
+                            watcher.notify_reload_failed(format!("Local config: {e}"));
+                            continue;
+                        }
+                        drop(local);
+
+                        eprintln!("Configuration reloaded successfully");
+                        watcher.notify_reloaded();
+                    }
+                    Ok(ConfigEvent::Shutdown) => {
+                        eprintln!("Config reload manager shutting down");
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    /// Stop auto-reload
+    pub fn stop(&self) {
+        self.watcher.stop();
+    }
+
+    /// Get watcher reference
+    pub fn watcher(&self) -> &ConfigWatcher {
+        &self.watcher
+    }
+}
+
+#[cfg(test)]
+mod config_reload_tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write;
+
+    #[test]
+    fn test_config_watcher_create() {
+        let watcher = ConfigWatcher::new(PathBuf::from("/tmp/test.yaml"));
+        assert_eq!(watcher.config_path(), &PathBuf::from("/tmp/test.yaml"));
+    }
+
+    #[test]
+    fn test_config_watcher_events() {
+        let watcher = ConfigWatcher::new(PathBuf::from("/tmp/test.yaml"));
+
+        watcher.notify_reloaded();
+        let event = watcher.try_recv();
+        assert!(event.is_ok());
+        assert_eq!(event.unwrap(), ConfigEvent::Reloaded);
+
+        watcher.notify_reload_failed("test error".to_string());
+        let event = watcher.try_recv();
+        assert!(event.is_ok());
+        assert!(matches!(event.unwrap(), ConfigEvent::ReloadFailed(_)));
+    }
+
+    #[test]
+    fn test_global_conf_reload() {
+        // Create temporary config file
+        let temp_file = "/tmp/test_global_conf.yaml";
+        let yaml = r#"
+global:
+  parameter:
+    no_ipv4: false
+    no_ipv6: true
+  max:
+    ue: 2048
+"#;
+        fs::write(temp_file, yaml).unwrap();
+
+        let mut conf = OgsGlobalConf::new();
+        let result = conf.reload(temp_file);
+
+        fs::remove_file(temp_file).ok();
+
+        assert!(result.is_ok());
+        assert_eq!(conf.max.ue, 2048);
+    }
+}
+
+//
+// B3.3: Configuration Versioning and Rollback (6G Feature)
+//
+
+/// Configuration version information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigVersion {
+    /// Version number
+    pub version: u64,
+    /// Timestamp when version was created
+    pub timestamp: u64,
+    /// Description of changes
+    pub description: String,
+    /// Git commit hash (if available)
+    pub commit_hash: Option<String>,
+}
+
+impl ConfigVersion {
+    /// Create a new config version
+    pub fn new(version: u64, description: impl Into<String>) -> Self {
+        ConfigVersion {
+            version,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            description: description.into(),
+            commit_hash: None,
+        }
+    }
+
+    /// Set commit hash
+    pub fn with_commit_hash(mut self, hash: impl Into<String>) -> Self {
+        self.commit_hash = Some(hash.into());
+        self
+    }
+}
+
+/// Versioned configuration snapshot
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigSnapshot {
+    /// Version information
+    pub version: ConfigVersion,
+    /// Global configuration
+    pub global_conf: OgsGlobalConf,
+    /// Local configuration
+    pub local_conf: OgsLocalConf,
+}
+
+impl ConfigSnapshot {
+    /// Create a new snapshot
+    pub fn new(
+        version: ConfigVersion,
+        global_conf: OgsGlobalConf,
+        local_conf: OgsLocalConf,
+    ) -> Self {
+        ConfigSnapshot {
+            version,
+            global_conf,
+            local_conf,
+        }
+    }
+}
+
+/// Configuration history manager with versioning and rollback support
+pub struct ConfigHistoryManager {
+    /// Configuration snapshots (newest first)
+    snapshots: Vec<ConfigSnapshot>,
+    /// Maximum number of snapshots to keep
+    max_history: usize,
+    /// Current version number
+    current_version: u64,
+}
+
+impl ConfigHistoryManager {
+    /// Create a new history manager
+    pub fn new(max_history: usize) -> Self {
+        ConfigHistoryManager {
+            snapshots: Vec::new(),
+            max_history,
+            current_version: 0,
+        }
+    }
+
+    /// Take a snapshot of current configuration
+    pub fn take_snapshot(
+        &mut self,
+        global_conf: &OgsGlobalConf,
+        local_conf: &OgsLocalConf,
+        description: impl Into<String>,
+    ) -> u64 {
+        self.current_version += 1;
+
+        let version = ConfigVersion::new(self.current_version, description);
+        let snapshot = ConfigSnapshot::new(
+            version,
+            global_conf.clone(),
+            local_conf.clone(),
+        );
+
+        // Add to beginning
+        self.snapshots.insert(0, snapshot);
+
+        // Trim history if needed
+        if self.snapshots.len() > self.max_history {
+            self.snapshots.truncate(self.max_history);
+        }
+
+        self.current_version
+    }
+
+    /// Get snapshot by version
+    pub fn get_snapshot(&self, version: u64) -> Option<&ConfigSnapshot> {
+        self.snapshots.iter().find(|s| s.version.version == version)
+    }
+
+    /// Get latest snapshot
+    pub fn get_latest(&self) -> Option<&ConfigSnapshot> {
+        self.snapshots.first()
+    }
+
+    /// Get all versions
+    pub fn list_versions(&self) -> Vec<&ConfigVersion> {
+        self.snapshots.iter().map(|s| &s.version).collect()
+    }
+
+    /// Rollback to a specific version
+    pub fn rollback(
+        &mut self,
+        version: u64,
+        current_global: &mut OgsGlobalConf,
+        current_local: &mut OgsLocalConf,
+    ) -> Result<(), ConfigError> {
+        // Clone the snapshot data before borrowing self mutably
+        let snapshot_data = {
+            let snapshot = self.get_snapshot(version)
+                .ok_or_else(|| ConfigError::ParseError(format!("Version {version} not found")))?;
+            (snapshot.global_conf.clone(), snapshot.local_conf.clone())
+        };
+
+        // Before rollback, take a snapshot of current state
+        self.take_snapshot(current_global, current_local, format!("Before rollback to v{version}"));
+
+        // Apply snapshot
+        *current_global = snapshot_data.0;
+        *current_local = snapshot_data.1;
+
+        Ok(())
+    }
+
+    /// Rollback to previous version
+    pub fn rollback_previous(
+        &mut self,
+        current_global: &mut OgsGlobalConf,
+        current_local: &mut OgsLocalConf,
+    ) -> Result<(), ConfigError> {
+        if self.snapshots.len() < 2 {
+            return Err(ConfigError::ParseError("No previous version available".to_string()));
+        }
+
+        // Get second snapshot (first is current)
+        let prev_version = self.snapshots[1].version.version;
+        self.rollback(prev_version, current_global, current_local)
+    }
+
+    /// Get number of snapshots
+    pub fn snapshot_count(&self) -> usize {
+        self.snapshots.len()
+    }
+
+    /// Clear all history
+    pub fn clear(&mut self) {
+        self.snapshots.clear();
+        self.current_version = 0;
+    }
+
+    /// Export snapshot to JSON
+    pub fn export_snapshot(&self, version: u64) -> Result<String, ConfigError> {
+        let snapshot = self.get_snapshot(version)
+            .ok_or_else(|| ConfigError::ParseError(format!("Version {version} not found")))?;
+
+        serde_json::to_string_pretty(snapshot)
+            .map_err(|e| ConfigError::ParseError(format!("Export failed: {e}")))
+    }
+
+    /// Import snapshot from JSON
+    pub fn import_snapshot(&mut self, json: &str) -> Result<u64, ConfigError> {
+        let snapshot: ConfigSnapshot = serde_json::from_str(json)
+            .map_err(|e| ConfigError::ParseError(format!("Import failed: {e}")))?;
+
+        // Assign new version number
+        self.current_version += 1;
+        let mut new_snapshot = snapshot;
+        new_snapshot.version.version = self.current_version;
+
+        self.snapshots.insert(0, new_snapshot);
+
+        if self.snapshots.len() > self.max_history {
+            self.snapshots.truncate(self.max_history);
+        }
+
+        Ok(self.current_version)
+    }
+
+    /// Compare two versions and get differences
+    pub fn diff_versions(&self, v1: u64, v2: u64) -> Result<Vec<String>, ConfigError> {
+        let snap1 = self.get_snapshot(v1)
+            .ok_or_else(|| ConfigError::ParseError(format!("Version {v1} not found")))?;
+        let snap2 = self.get_snapshot(v2)
+            .ok_or_else(|| ConfigError::ParseError(format!("Version {v2} not found")))?;
+
+        let mut diffs = Vec::new();
+
+        // Compare global config
+        if snap1.global_conf.max.ue != snap2.global_conf.max.ue {
+            diffs.push(format!("max.ue: {} -> {}", snap1.global_conf.max.ue, snap2.global_conf.max.ue));
+        }
+        if snap1.global_conf.max.peer != snap2.global_conf.max.peer {
+            diffs.push(format!("max.peer: {} -> {}", snap1.global_conf.max.peer, snap2.global_conf.max.peer));
+        }
+
+        // Compare local config
+        if snap1.local_conf.time.nf_instance.validity_duration != snap2.local_conf.time.nf_instance.validity_duration {
+            diffs.push(format!(
+                "time.nf_instance.validity: {} -> {}",
+                snap1.local_conf.time.nf_instance.validity_duration,
+                snap2.local_conf.time.nf_instance.validity_duration
+            ));
+        }
+
+        Ok(diffs)
+    }
+}
+
+impl Default for ConfigHistoryManager {
+    fn default() -> Self {
+        Self::new(10) // Keep last 10 versions by default
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn test_config_version_creation() {
+        let version = ConfigVersion::new(1, "Initial version");
+        assert_eq!(version.version, 1);
+        assert_eq!(version.description, "Initial version");
+        assert!(version.commit_hash.is_none());
+    }
+
+    #[test]
+    fn test_config_version_with_commit() {
+        let version = ConfigVersion::new(1, "Initial")
+            .with_commit_hash("abc123");
+        assert_eq!(version.commit_hash, Some("abc123".to_string()));
+    }
+
+    #[test]
+    fn test_history_manager_snapshot() {
+        let mut manager = ConfigHistoryManager::new(5);
+        let global = OgsGlobalConf::new();
+        let local = OgsLocalConf::new();
+
+        let v1 = manager.take_snapshot(&global, &local, "Version 1");
+        assert_eq!(v1, 1);
+        assert_eq!(manager.snapshot_count(), 1);
+
+        let v2 = manager.take_snapshot(&global, &local, "Version 2");
+        assert_eq!(v2, 2);
+        assert_eq!(manager.snapshot_count(), 2);
+    }
+
+    #[test]
+    fn test_history_manager_get_snapshot() {
+        let mut manager = ConfigHistoryManager::new(5);
+        let global = OgsGlobalConf::new();
+        let local = OgsLocalConf::new();
+
+        manager.take_snapshot(&global, &local, "Version 1");
+        manager.take_snapshot(&global, &local, "Version 2");
+
+        let snapshot = manager.get_snapshot(1);
+        assert!(snapshot.is_some());
+        assert_eq!(snapshot.unwrap().version.description, "Version 1");
+    }
+
+    #[test]
+    fn test_history_manager_get_latest() {
+        let mut manager = ConfigHistoryManager::new(5);
+        let global = OgsGlobalConf::new();
+        let local = OgsLocalConf::new();
+
+        manager.take_snapshot(&global, &local, "Version 1");
+        manager.take_snapshot(&global, &local, "Version 2");
+
+        let latest = manager.get_latest();
+        assert!(latest.is_some());
+        assert_eq!(latest.unwrap().version.version, 2);
+        assert_eq!(latest.unwrap().version.description, "Version 2");
+    }
+
+    #[test]
+    fn test_history_manager_max_history() {
+        let mut manager = ConfigHistoryManager::new(3);
+        let global = OgsGlobalConf::new();
+        let local = OgsLocalConf::new();
+
+        for i in 1..=5 {
+            manager.take_snapshot(&global, &local, format!("Version {}", i));
+        }
+
+        // Should only keep last 3
+        assert_eq!(manager.snapshot_count(), 3);
+
+        // Should have versions 5, 4, 3 (newest first)
+        assert!(manager.get_snapshot(5).is_some());
+        assert!(manager.get_snapshot(4).is_some());
+        assert!(manager.get_snapshot(3).is_some());
+        assert!(manager.get_snapshot(2).is_none());
+        assert!(manager.get_snapshot(1).is_none());
+    }
+
+    #[test]
+    fn test_history_manager_rollback() {
+        let mut manager = ConfigHistoryManager::new(5);
+        let mut global = OgsGlobalConf::new();
+        let mut local = OgsLocalConf::new();
+
+        // Take initial snapshot
+        manager.take_snapshot(&global, &local, "Initial");
+
+        // Modify config
+        global.max.ue = 2048;
+        manager.take_snapshot(&global, &local, "Modified");
+
+        // Rollback to initial
+        let result = manager.rollback(1, &mut global, &mut local);
+        assert!(result.is_ok());
+        assert_eq!(global.max.ue, MAX_NUM_OF_UE); // Should be reset to default
+    }
+
+    #[test]
+    fn test_history_manager_rollback_previous() {
+        let mut manager = ConfigHistoryManager::new(5);
+        let mut global = OgsGlobalConf::new();
+        let mut local = OgsLocalConf::new();
+
+        manager.take_snapshot(&global, &local, "V1");
+        global.max.ue = 2048;
+        manager.take_snapshot(&global, &local, "V2");
+
+        // Rollback to previous
+        let result = manager.rollback_previous(&mut global, &mut local);
+        assert!(result.is_ok());
+        assert_eq!(global.max.ue, MAX_NUM_OF_UE);
+    }
+
+    #[test]
+    fn test_history_manager_export_import() {
+        let mut manager = ConfigHistoryManager::new(5);
+        let global = OgsGlobalConf::new();
+        let local = OgsLocalConf::new();
+
+        let v1 = manager.take_snapshot(&global, &local, "Export test");
+        let json = manager.export_snapshot(v1).unwrap();
+
+        let mut manager2 = ConfigHistoryManager::new(5);
+        let v2 = manager2.import_snapshot(&json).unwrap();
+
+        let snapshot = manager2.get_snapshot(v2).unwrap();
+        assert_eq!(snapshot.version.description, "Export test");
+    }
+
+    #[test]
+    fn test_list_versions() {
+        let mut manager = ConfigHistoryManager::new(5);
+        let global = OgsGlobalConf::new();
+        let local = OgsLocalConf::new();
+
+        manager.take_snapshot(&global, &local, "V1");
+        manager.take_snapshot(&global, &local, "V2");
+        manager.take_snapshot(&global, &local, "V3");
+
+        let versions = manager.list_versions();
+        assert_eq!(versions.len(), 3);
+        assert_eq!(versions[0].version, 3); // Newest first
+        assert_eq!(versions[1].version, 2);
+        assert_eq!(versions[2].version, 1);
     }
 }

@@ -696,7 +696,7 @@ pub fn build_error_indication(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{AmfId, OGS_SHA256_DIGEST_SIZE};
+    use crate::context::{AmfId, Guami, PlmnId, SNssai, OGS_SHA256_DIGEST_SIZE};
 
     fn create_test_context() -> AmfContext {
         let mut ctx = AmfContext::new();

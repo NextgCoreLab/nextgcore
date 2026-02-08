@@ -143,10 +143,7 @@ pub fn ogs_dbi_update_imeisv(supi: &str, imeisv: &str) -> DbiResult<()> {
     let supi_id = ogs_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
 
     log::debug!(
-        "SUPI type: {}, SUPI id: {}, imeisv: {}",
-        supi_type,
-        supi_id,
-        imeisv
+        "SUPI type: {supi_type}, SUPI id: {supi_id}, imeisv: {imeisv}"
     );
 
     let collection = get_subscriber_collection()?;
@@ -178,11 +175,7 @@ pub fn ogs_dbi_update_mme(
     let supi_id = ogs_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
 
     log::debug!(
-        "SUPI type: {}, SUPI id: {}, mme_host: {}, mme_realm: {}",
-        supi_type,
-        supi_id,
-        mme_host,
-        mme_realm
+        "SUPI type: {supi_type}, SUPI id: {supi_id}, mme_host: {mme_host}, mme_realm: {mme_realm}"
     );
 
     let collection = get_subscriber_collection()?;
@@ -238,7 +231,7 @@ pub fn ogs_dbi_subscription_data(supi: &str) -> DbiResult<OgsSubscriptionData> {
             if let Bson::String(bcd) = msisdn_val {
                 let mut msisdn = OgsMsisdn::default();
                 msisdn.bcd = bcd.clone();
-                ogs_bcd_to_buffer(&bcd, &mut msisdn.buf);
+                ogs_bcd_to_buffer(bcd, &mut msisdn.buf);
                 msisdn.len = msisdn.buf.len();
                 subscription_data.msisdn.push(msisdn);
                 subscription_data.num_of_msisdn += 1;
@@ -426,16 +419,16 @@ fn parse_session(doc: &Document) -> OgsSession {
         session.lbo_roaming_allowed = lbo;
     }
 
-    if let Ok(ref qos_doc) = doc.get_document(OGS_QOS_STRING) {
+    if let Ok(qos_doc) = doc.get_document(OGS_QOS_STRING) {
         session.qos = parse_qos(qos_doc);
     }
 
-    if let Ok(ref ambr_doc) = doc.get_document(OGS_AMBR_STRING) {
+    if let Ok(ambr_doc) = doc.get_document(OGS_AMBR_STRING) {
         session.ambr = parse_ambr(ambr_doc);
     }
 
     // Parse SMF IP
-    if let Ok(ref smf_doc) = doc.get_document(OGS_SMF_STRING) {
+    if let Ok(smf_doc) = doc.get_document(OGS_SMF_STRING) {
         if let Ok(ipv4_str) = smf_doc.get_str(OGS_IPV4_STRING) {
             if let Ok(addr) = ipv4_str.parse::<std::net::Ipv4Addr>() {
                 session.smf_ip.ipv4 = true;
@@ -451,7 +444,7 @@ fn parse_session(doc: &Document) -> OgsSession {
     }
 
     // Parse UE IP
-    if let Ok(ref ue_doc) = doc.get_document(OGS_UE_STRING) {
+    if let Ok(ue_doc) = doc.get_document(OGS_UE_STRING) {
         if let Ok(ipv4_str) = ue_doc.get_str(OGS_IPV4_STRING) {
             if let Ok(addr) = ipv4_str.parse::<std::net::Ipv4Addr>() {
                 session.ue_ip.ipv4 = true;

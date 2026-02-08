@@ -99,9 +99,7 @@ pub fn ausf_sbi_is_running() -> bool {
 /// Port of ausf_sbi_send_request()
 pub fn ausf_sbi_send_request(nf_instance_id: &str, xact_id: u64) -> bool {
     log::debug!(
-        "Sending SBI request to NF instance [{}] xact [{}]",
-        nf_instance_id,
-        xact_id
+        "Sending SBI request to NF instance [{nf_instance_id}] xact [{xact_id}]"
     );
 
     // In C: ogs_sbi_send_request_to_nf_instance(nf_instance, xact)
@@ -119,9 +117,7 @@ pub fn ausf_sbi_discover_and_send_nudm_ueau_get(
     resync_info: Option<&ResynchronizationInfo>,
 ) -> Result<(), String> {
     log::debug!(
-        "Discover and send NUDM UEAU get for UE [{}] stream [{}]",
-        ausf_ue_id,
-        stream_id
+        "Discover and send NUDM UEAU get for UE [{ausf_ue_id}] stream [{stream_id}]"
     );
 
     // Build the request
@@ -152,9 +148,7 @@ pub fn ausf_sbi_discover_and_send_nudm_ueau_result_confirmation(
     stream_id: u64,
 ) -> Result<(), String> {
     log::debug!(
-        "Discover and send NUDM UEAU result confirmation for UE [{}] stream [{}]",
-        ausf_ue_id,
-        stream_id
+        "Discover and send NUDM UEAU result confirmation for UE [{ausf_ue_id}] stream [{stream_id}]"
     );
 
     // Build the request
@@ -179,9 +173,7 @@ pub fn ausf_sbi_discover_and_send_nudm_ueau_auth_removal(
     stream_id: u64,
 ) -> Result<(), String> {
     log::debug!(
-        "Discover and send NUDM UEAU auth removal for UE [{}] stream [{}]",
-        ausf_ue_id,
-        stream_id
+        "Discover and send NUDM UEAU auth removal for UE [{ausf_ue_id}] stream [{stream_id}]"
     );
 
     // Build the request

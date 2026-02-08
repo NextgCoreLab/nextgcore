@@ -19,12 +19,12 @@ pub fn ogs_hex_from_string(hex: &str) -> Option<Vec<u8>> {
 
 /// Convert bytes to hex string (identical to ogs_hex_to_string)
 pub fn ogs_hex_to_string(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Convert bytes to uppercase hex string
 pub fn ogs_hex_to_string_upper(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02X}", b)).collect()
+    bytes.iter().map(|b| format!("{b:02X}")).collect()
 }
 
 /// Convert uint24 to bytes (big-endian)

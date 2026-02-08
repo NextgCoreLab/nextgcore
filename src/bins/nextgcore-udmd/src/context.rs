@@ -9,8 +9,10 @@ use uuid::Uuid;
 
 /// Authentication type (from OpenAPI)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum AuthType {
     /// 5G AKA authentication
+    #[default]
     FiveGAka,
     /// EAP-AKA' authentication
     EapAkaPrime,
@@ -18,16 +20,13 @@ pub enum AuthType {
     EapTls,
 }
 
-impl Default for AuthType {
-    fn default() -> Self {
-        AuthType::FiveGAka
-    }
-}
 
 /// RAT type (from OpenAPI)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum RatType {
     /// NR (New Radio)
+    #[default]
     Nr,
     /// EUTRA (LTE)
     Eutra,
@@ -37,11 +36,6 @@ pub enum RatType {
     Virtual,
 }
 
-impl Default for RatType {
-    fn default() -> Self {
-        RatType::Nr
-    }
-}
 
 /// GUAMI (Globally Unique AMF Identifier)
 #[derive(Debug, Clone, Default)]
@@ -396,7 +390,7 @@ impl UdmContext {
         }
         ue_list.insert(id, ue.clone());
 
-        log::debug!("[{}] UDM UE added (id={})", suci, id);
+        log::debug!("[{suci}] UDM UE added (id={id})");
         Some(ue)
     }
 
@@ -537,7 +531,7 @@ impl UdmContext {
 
         sess_list.insert(id, sess.clone());
 
-        log::debug!("[ue_id={}, psi={}] UDM session added (id={})", udm_ue_id, psi, id);
+        log::debug!("[ue_id={udm_ue_id}, psi={psi}] UDM session added (id={id})");
         Some(sess)
     }
 
@@ -611,9 +605,7 @@ impl UdmContext {
         sdm_list.insert(id.clone(), subscription.clone());
 
         log::debug!(
-            "[ue_id={}] SDM subscription added (id={})",
-            udm_ue_id,
-            id
+            "[ue_id={udm_ue_id}] SDM subscription added (id={id})"
         );
         Some(subscription)
     }

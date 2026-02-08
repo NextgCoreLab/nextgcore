@@ -74,7 +74,7 @@ impl AperDecode for CauseRadioNetwork {
             Ok(unsafe { std::mem::transmute(value as u8) })
         } else {
             Err(PerError::DecodeError(format!(
-                "Unknown CauseRadioNetwork value: {}", value
+                "Unknown CauseRadioNetwork value: {value}"
             )))
         }
     }
@@ -106,7 +106,7 @@ impl AperDecode for CauseTransport {
             0 => Ok(CauseTransport::TransportResourceUnavailable),
             1 => Ok(CauseTransport::Unspecified),
             _ => Err(PerError::DecodeError(format!(
-                "Unknown CauseTransport value: {}", value
+                "Unknown CauseTransport value: {value}"
             ))),
         }
     }
@@ -147,7 +147,7 @@ impl AperDecode for CauseNas {
             4 => Ok(CauseNas::CsgSubscriptionExpiry),
             5 => Ok(CauseNas::UeNotInPlmnServingArea),
             _ => Err(PerError::DecodeError(format!(
-                "Unknown CauseNas value: {}", value
+                "Unknown CauseNas value: {value}"
             ))),
         }
     }
@@ -184,7 +184,7 @@ impl AperDecode for CauseProtocol {
             Ok(unsafe { std::mem::transmute(value as u8) })
         } else {
             Err(PerError::DecodeError(format!(
-                "Unknown CauseProtocol value: {}", value
+                "Unknown CauseProtocol value: {value}"
             )))
         }
     }
@@ -220,7 +220,7 @@ impl AperDecode for CauseMisc {
             Ok(unsafe { std::mem::transmute(value as u8) })
         } else {
             Err(PerError::DecodeError(format!(
-                "Unknown CauseMisc value: {}", value
+                "Unknown CauseMisc value: {value}"
             )))
         }
     }

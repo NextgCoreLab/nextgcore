@@ -110,7 +110,7 @@ impl OgsUint24 {
 
     /// Parse SD from hex string (e.g., "000001")
     pub fn from_hex_string(s: &str) -> Option<Self> {
-        u32::from_str_radix(s, 16).ok().map(|v| OgsUint24::new(v))
+        u32::from_str_radix(s, 16).ok().map(OgsUint24::new)
     }
 }
 

@@ -82,6 +82,7 @@ impl UdmTimerId {
 
 /// SBI message data for events
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct SbiEventData {
     /// Request data (if any)
     pub request: Option<SbiRequest>,
@@ -97,18 +98,6 @@ pub struct SbiEventData {
     pub state: Option<i32>,
 }
 
-impl Default for SbiEventData {
-    fn default() -> Self {
-        Self {
-            request: None,
-            response: None,
-            message: None,
-            stream_id: None,
-            data: None,
-            state: None,
-        }
-    }
-}
 
 /// Simplified SBI request representation
 #[derive(Debug, Clone)]
@@ -132,6 +121,7 @@ pub struct SbiResponse {
 
 /// Simplified SBI message representation
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct SbiMessage {
     /// Service name
     pub service_name: String,
@@ -147,18 +137,6 @@ pub struct SbiMessage {
     pub num_of_dataset_names: usize,
 }
 
-impl Default for SbiMessage {
-    fn default() -> Self {
-        Self {
-            service_name: String::new(),
-            api_version: String::new(),
-            resource_components: Vec::new(),
-            method: String::new(),
-            res_status: None,
-            num_of_dataset_names: 0,
-        }
-    }
-}
 
 
 /// UDM Event structure

@@ -3,7 +3,10 @@
 //! Port of src/udm/sbi-path.c - SBI server and client path functions
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use ogs_sbi::message::SbiResponse;
+
+use ogs_sbi::context::{global_context, NfInstance, NfService};
+use ogs_sbi::message::{SbiRequest, SbiResponse};
+use ogs_sbi::types::{NfType, SbiServiceType};
 
 /// SBI server configuration
 #[derive(Debug, Clone)]
@@ -35,7 +38,7 @@ impl Default for SbiServerConfig {
 /// SBI server state
 static SBI_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// Open SBI server
+/// Open SBI server and register with NRF
 ///
 /// Port of udm_sbi_open()
 pub fn udm_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
@@ -43,46 +46,209 @@ pub fn udm_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
 
     log::info!("Opening UDM SBI server on {}:{}", config.addr, config.port);
 
-    // Initialize SELF NF instance
-    // In C: nf_instance = ogs_sbi_self()->nf_instance;
-    // ogs_sbi_nf_fsm_init(nf_instance);
+    // Build self NF instance for UDM
+    let nf_instance_id = uuid::Uuid::new_v4().to_string();
+    let mut nf_instance = NfInstance::new(&nf_instance_id, NfType::Udm);
+    nf_instance.ipv4_addresses.push(config.addr.clone());
 
-    // Build NF instance information
-    // In C: ogs_sbi_nf_instance_build_default(nf_instance);
-    // ogs_sbi_nf_instance_add_allowed_nf_type(nf_instance, OpenAPI_nf_type_SCP);
-    // ogs_sbi_nf_instance_add_allowed_nf_type(nf_instance, OpenAPI_nf_type_AMF);
-    // ogs_sbi_nf_instance_add_allowed_nf_type(nf_instance, OpenAPI_nf_type_SMF);
-    // ogs_sbi_nf_instance_add_allowed_nf_type(nf_instance, OpenAPI_nf_type_AUSF);
+    // Register NUDM services: nudm-ueau, nudm-uecm, nudm-sdm
+    let mut ueau_service = NfService::new("nudm-ueau", SbiServiceType::NudmUeau);
+    ueau_service.versions = vec!["v1".to_string()];
+    ueau_service.port = config.port;
+    nf_instance.add_service(ueau_service);
 
-    // Build NF service information (nudm-ueau, nudm-uecm, nudm-sdm)
-    // In C: service = ogs_sbi_nf_service_build_default(nf_instance, OGS_SBI_SERVICE_NAME_NUDM_UEAU);
-    // ogs_sbi_nf_service_add_version(service, OGS_SBI_API_V1, OGS_SBI_API_V1_0_0, NULL);
-    // ogs_sbi_nf_service_add_allowed_nf_type(service, OpenAPI_nf_type_AUSF);
+    let mut uecm_service = NfService::new("nudm-uecm", SbiServiceType::NudmUecm);
+    uecm_service.versions = vec!["v1".to_string()];
+    uecm_service.port = config.port;
+    nf_instance.add_service(uecm_service);
 
-    // service = ogs_sbi_nf_service_build_default(nf_instance, OGS_SBI_SERVICE_NAME_NUDM_UECM);
-    // ogs_sbi_nf_service_add_version(service, OGS_SBI_API_V1, OGS_SBI_API_V1_0_0, NULL);
-    // ogs_sbi_nf_service_add_allowed_nf_type(service, OpenAPI_nf_type_AMF);
-    // ogs_sbi_nf_service_add_allowed_nf_type(service, OpenAPI_nf_type_SMF);
+    let mut sdm_service = NfService::new("nudm-sdm", SbiServiceType::NudmSdm);
+    sdm_service.versions = vec!["v2".to_string()];
+    sdm_service.port = config.port;
+    nf_instance.add_service(sdm_service);
 
-    // service = ogs_sbi_nf_service_build_default(nf_instance, OGS_SBI_SERVICE_NAME_NUDM_SDM);
-    // ogs_sbi_nf_service_add_version(service, OGS_SBI_API_V2, OGS_SBI_API_V2_0_0, NULL);
-    // ogs_sbi_nf_service_add_allowed_nf_type(service, OpenAPI_nf_type_AMF);
-    // ogs_sbi_nf_service_add_allowed_nf_type(service, OpenAPI_nf_type_SMF);
-
-    // Initialize NRF NF Instance
-    // In C: nf_instance = ogs_sbi_self()->nrf_instance;
-    // if (nf_instance) ogs_sbi_nf_fsm_init(nf_instance);
-
-    // Setup Subscription-Data
-    // In C: ogs_sbi_subscription_spec_add(OpenAPI_nf_type_SEPP, NULL);
-    // ogs_sbi_subscription_spec_add(OpenAPI_nf_type_NULL, OGS_SBI_SERVICE_NAME_NUDR_DR);
-
-    // Start SBI server
-    // In C: ogs_sbi_server_start_all(ogs_sbi_server_handler)
+    // Store self NF instance in global SBI context
+    let sbi_ctx = global_context();
+    let rt = tokio::runtime::Handle::try_current();
+    if let Ok(handle) = rt {
+        handle.block_on(async {
+            sbi_ctx.set_self_instance(nf_instance.clone()).await;
+        });
+    } else {
+        log::warn!("No tokio runtime; deferring NRF registration");
+    }
 
     SBI_RUNNING.store(true, Ordering::SeqCst);
 
-    log::info!("UDM SBI server opened successfully");
+    log::info!("UDM SBI server opened successfully (nf_instance_id={nf_instance_id})");
+    Ok(())
+}
+
+/// Register UDM NF instance with NRF
+///
+/// Sends NFRegister (PUT) to NRF at /nnrf-nfm/v1/nf-instances/{nfInstanceId}
+pub async fn udm_nrf_register(nrf_host: &str, nrf_port: u16) -> Result<(), String> {
+    let sbi_ctx = global_context();
+    let self_instance = sbi_ctx.get_self_instance().await
+        .ok_or("Self NF instance not initialized")?;
+
+    let client = sbi_ctx.get_client(nrf_host, nrf_port).await;
+
+    let path = format!("/nnrf-nfm/v1/nf-instances/{}", self_instance.id);
+
+    // Build NF profile JSON for registration
+    let nf_profile = serde_json::json!({
+        "nfInstanceId": self_instance.id,
+        "nfType": "UDM",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": self_instance.ipv4_addresses,
+        "nfServices": self_instance.services.iter().map(|s| {
+            serde_json::json!({
+                "serviceName": s.name,
+                "versions": s.versions.iter().map(|v| {
+                    serde_json::json!({"apiVersionInUri": v, "apiFullVersion": format!("{}.0.0", v)})
+                }).collect::<Vec<_>>(),
+                "scheme": "http",
+            })
+        }).collect::<Vec<_>>(),
+        "heartBeatTimer": self_instance.heartbeat_interval,
+    });
+
+    let request = SbiRequest::put(&path)
+        .with_json_body(&nf_profile)
+        .map_err(|e| format!("Failed to serialize NF profile: {e}"))?;
+
+    let response = client.send_request(request).await
+        .map_err(|e| format!("NRF registration request failed: {e}"))?;
+
+    if response.is_success() {
+        // Parse heartbeat interval from response if provided
+        log::info!("UDM registered with NRF (status={})", response.status);
+        Ok(())
+    } else {
+        Err(format!("NRF registration failed with status {}", response.status))
+    }
+}
+
+/// Send NRF heartbeat (PATCH to NRF)
+pub async fn udm_nrf_heartbeat(nrf_host: &str, nrf_port: u16) -> Result<(), String> {
+    let sbi_ctx = global_context();
+    let self_instance = sbi_ctx.get_self_instance().await
+        .ok_or("Self NF instance not initialized")?;
+
+    let client = sbi_ctx.get_client(nrf_host, nrf_port).await;
+
+    let path = format!("/nnrf-nfm/v1/nf-instances/{}", self_instance.id);
+
+    let update = serde_json::json!([{
+        "op": "replace",
+        "path": "/nfStatus",
+        "value": "REGISTERED"
+    }, {
+        "op": "replace",
+        "path": "/load",
+        "value": crate::context::get_ue_load()
+    }]);
+
+    let request = SbiRequest::patch(&path)
+        .with_json_body(&update)
+        .map_err(|e| format!("Failed to serialize heartbeat: {e}"))?;
+
+    let response = client.send_request(request).await
+        .map_err(|e| format!("NRF heartbeat request failed: {e}"))?;
+
+    if response.is_success() {
+        log::debug!("NRF heartbeat OK (status={})", response.status);
+        Ok(())
+    } else {
+        Err(format!("NRF heartbeat failed with status {}", response.status))
+    }
+}
+
+/// Discover NF instances via NRF
+///
+/// Queries /nnrf-disc/v1/nf-instances?target-nf-type={type}
+pub async fn udm_nrf_discover(
+    nrf_host: &str,
+    nrf_port: u16,
+    target_nf_type: NfType,
+) -> Result<Vec<NfInstance>, String> {
+    let sbi_ctx = global_context();
+    let _self_instance = sbi_ctx.get_self_instance().await
+        .ok_or("Self NF instance not initialized")?;
+
+    let client = sbi_ctx.get_client(nrf_host, nrf_port).await;
+
+    let target_type_str = match target_nf_type {
+        NfType::Udr => "UDR",
+        NfType::Ausf => "AUSF",
+        NfType::Amf => "AMF",
+        NfType::Smf => "SMF",
+        _ => "UNKNOWN",
+    };
+
+    let request = SbiRequest::get("/nnrf-disc/v1/nf-instances")
+        .with_param("target-nf-type", target_type_str)
+        .with_param("requester-nf-type", "UDM");
+
+    let response = client.send_request(request).await
+        .map_err(|e| format!("NRF discovery request failed: {e}"))?;
+
+    if !response.is_success() {
+        return Err(format!("NRF discovery failed with status {}", response.status));
+    }
+
+    // Parse discovered NF instances from response body
+    let body = response.http.content.unwrap_or_default();
+    let search_result: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("Failed to parse NRF discovery response: {e}"))?;
+
+    let mut instances = Vec::new();
+    if let Some(nf_instances) = search_result.get("nfInstances").and_then(|v| v.as_array()) {
+        for nf_json in nf_instances {
+            let id = nf_json.get("nfInstanceId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let mut instance = NfInstance::new(&id, target_nf_type);
+
+            if let Some(addrs) = nf_json.get("ipv4Addresses").and_then(|v| v.as_array()) {
+                for addr in addrs {
+                    if let Some(s) = addr.as_str() {
+                        instance.ipv4_addresses.push(s.to_string());
+                    }
+                }
+            }
+
+            // Cache discovered instance in SBI context
+            sbi_ctx.add_nf_instance(instance.clone()).await;
+            instances.push(instance);
+        }
+    }
+
+    log::info!("NRF discovery found {} {} instances", instances.len(), target_type_str);
+    Ok(instances)
+}
+
+/// Deregister from NRF and close SBI server
+///
+/// Port of udm_sbi_close()
+pub async fn udm_nrf_deregister(nrf_host: &str, nrf_port: u16) -> Result<(), String> {
+    let sbi_ctx = global_context();
+    if let Some(self_instance) = sbi_ctx.get_self_instance().await {
+        let client = sbi_ctx.get_client(nrf_host, nrf_port).await;
+        let path = format!("/nnrf-nfm/v1/nf-instances/{}", self_instance.id);
+        let request = SbiRequest::delete(&path);
+
+        match client.send_request(request).await {
+            Ok(response) if response.is_success() => {
+                log::info!("UDM deregistered from NRF");
+            }
+            Ok(response) => {
+                log::warn!("NRF deregister returned status {}", response.status);
+            }
+            Err(e) => {
+                log::warn!("NRF deregister failed: {e}");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -92,9 +258,14 @@ pub fn udm_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
 pub fn udm_sbi_close() {
     log::info!("Closing UDM SBI server");
 
-    // Stop all clients and servers
-    // In C: ogs_sbi_client_stop_all();
-    // ogs_sbi_server_stop_all();
+    // Clear SBI client connections
+    let sbi_ctx = global_context();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.block_on(async {
+            sbi_ctx.clear_clients().await;
+            sbi_ctx.clear_nf_instances().await;
+        });
+    }
 
     SBI_RUNNING.store(false, Ordering::SeqCst);
 
@@ -106,43 +277,139 @@ pub fn udm_sbi_is_running() -> bool {
     SBI_RUNNING.load(Ordering::SeqCst)
 }
 
-/// Send SBI request to NF instance
+/// Send SBI request to a specific NF instance by ID
 ///
 /// Port of udm_sbi_send_request()
-pub fn udm_sbi_send_request(nf_instance_id: &str, xact_id: u64) -> bool {
+pub async fn udm_sbi_send_request(
+    nf_instance_id: &str,
+    request: SbiRequest,
+) -> Result<SbiResponse, String> {
+    let sbi_ctx = global_context();
+
+    // Look up the NF instance to get its address
+    let nf_instance = sbi_ctx.get_nf_instance(nf_instance_id).await
+        .ok_or_else(|| format!("NF instance not found: {nf_instance_id}"))?;
+
+    let host = nf_instance.ipv4_addresses.first()
+        .ok_or_else(|| format!("NF instance {nf_instance_id} has no IPv4 address"))?;
+
+    // Determine port from first service or default
+    let port = nf_instance.services.first()
+        .map(|s| s.port)
+        .unwrap_or(80);
+
+    let client = sbi_ctx.get_client(host, port).await;
+
     log::debug!(
-        "Sending SBI request to NF instance [{}] xact [{}]",
+        "Sending SBI request to NF [{}] at {}:{} ({})",
         nf_instance_id,
-        xact_id
+        host,
+        port,
+        request.header.method
     );
 
-    // In C: ogs_sbi_send_request_to_nf_instance(nf_instance, xact)
-    // This would send the request through the SBI client
-
-    true
+    client.send_request(request).await
+        .map_err(|e| format!("SBI request to {nf_instance_id} failed: {e}"))
 }
 
-/// Discover and send NUDR DR request
+/// Discover UDR and send a NUDR-DR request
 ///
-/// Port of udm_sbi_discover_and_send() for UDR queries
-pub fn udm_sbi_discover_and_send_nudr_dr(
+/// Port of udm_sbi_discover_and_send() for UDR queries.
+/// 1. Looks up cached UDR instances in SBI context
+/// 2. If none found, returns error (caller should trigger NRF discovery first)
+/// 3. Sends the request to the first available UDR
+pub async fn udm_sbi_discover_and_send_nudr_dr(
     udm_ue_id: u64,
     stream_id: u64,
-    service_name: &str,
-) -> Result<(), String> {
+    request: SbiRequest,
+) -> Result<SbiResponse, String> {
+    let sbi_ctx = global_context();
+
+    // Find UDR instances (from discovery cache)
+    let udr_instances = sbi_ctx.find_nf_instances_by_type(NfType::Udr).await;
+
+    if udr_instances.is_empty() {
+        return Err("No UDR instance discovered; NRF discovery needed".to_string());
+    }
+
+    // Use first available UDR
+    let udr = &udr_instances[0];
+    let host = udr.ipv4_addresses.first()
+        .ok_or("UDR has no IPv4 address")?;
+
+    // Find the nudr-dr service port
+    let port = udr.find_service(SbiServiceType::NudrDr)
+        .map(|s| s.port)
+        .unwrap_or(80);
+
+    let client = sbi_ctx.get_client(host, port).await;
+
     log::debug!(
-        "Discover and send NUDR DR for UE [{}] stream [{}] service [{}]",
+        "Sending NUDR-DR request for UE [{}] stream [{}] to UDR [{}] at {}:{}",
         udm_ue_id,
         stream_id,
-        service_name
+        udr.id,
+        host,
+        port
     );
 
-    // In C code:
-    // 1. Create SBI xact with udm_ue->id, service_type, discovery_option, build function
-    // 2. Set xact->assoc_stream_id = stream_id
-    // 3. Call ogs_sbi_discover_and_send(xact)
+    client.send_request(request).await
+        .map_err(|e| format!("NUDR-DR request to UDR failed: {e}"))
+}
 
-    Ok(())
+/// Build and send authentication subscription GET to UDR
+///
+/// Builds: GET /nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-subscription
+pub async fn udm_nudr_dr_send_auth_subscription_get(
+    supi: &str,
+    udm_ue_id: u64,
+    stream_id: u64,
+) -> Result<SbiResponse, String> {
+    let path = format!(
+        "/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-subscription"
+    );
+    let request = SbiRequest::get(&path);
+    udm_sbi_discover_and_send_nudr_dr(udm_ue_id, stream_id, request).await
+}
+
+/// Build and send SQN update PATCH to UDR
+///
+/// Builds: PATCH /nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-subscription
+pub async fn udm_nudr_dr_send_auth_subscription_patch(
+    supi: &str,
+    sqn_hex: &str,
+    udm_ue_id: u64,
+    stream_id: u64,
+) -> Result<SbiResponse, String> {
+    let path = format!(
+        "/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-subscription"
+    );
+    let patch_body = serde_json::json!([{
+        "op": "replace",
+        "path": "/sequenceNumber/sqn",
+        "value": sqn_hex
+    }]);
+    let request = SbiRequest::patch(&path)
+        .with_json_body(&patch_body)
+        .map_err(|e| format!("Failed to serialize PATCH body: {e}"))?;
+
+    udm_sbi_discover_and_send_nudr_dr(udm_ue_id, stream_id, request).await
+}
+
+/// Build and send provisioned data GET to UDR
+///
+/// Builds: GET /nudr-dr/v1/subscription-data/{supi}/provisioned-data/{dataset}
+pub async fn udm_nudr_dr_send_provisioned_data_get(
+    supi: &str,
+    dataset: &str,
+    udm_ue_id: u64,
+    stream_id: u64,
+) -> Result<SbiResponse, String> {
+    let path = format!(
+        "/nudr-dr/v1/subscription-data/{supi}/provisioned-data/{dataset}"
+    );
+    let request = SbiRequest::get(&path);
+    udm_sbi_discover_and_send_nudr_dr(udm_ue_id, stream_id, request).await
 }
 
 /// SBI transaction for tracking requests

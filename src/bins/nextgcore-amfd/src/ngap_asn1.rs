@@ -735,10 +735,10 @@ mod tests {
         // PLMN 999-70 should encode as:
         // Byte 0: MCC2 (9) << 4 | MCC1 (9) = 0x99
         // Byte 1: MNC3 (F) << 4 | MCC3 (9) = 0xF9
-        // Byte 2: MNC2 (7) << 4 | MNC1 (0) = 0x70
+        // Byte 2: MNC2 (0) << 4 | MNC1 (7) = 0x07
         assert_eq!(bytes[0], 0x99);
         assert_eq!(bytes[1], 0xF9);
-        assert_eq!(bytes[2], 0x70);
+        assert_eq!(bytes[2], 0x07);
     }
 
     #[test]

@@ -3,7 +3,10 @@
 //! Port of src/nrf/sbi-path.c - SBI server open/close and notification sending
 
 use crate::nnrf_build::{nrf_nnrf_nfm_build_nf_status_notify, NotificationEventType};
-use crate::nnrf_handler::{NfProfile, SubscriptionData};
+use crate::nnrf_handler::{nf_manager, NfProfile, SubscriptionData};
+use ogs_sbi::client::{SbiClient, SbiClientConfig};
+use ogs_sbi::message::SbiRequest;
+use ogs_sbi::types::UriScheme;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// SBI server state
@@ -138,7 +141,98 @@ pub enum NotifySendResult {
     NoClient,
 }
 
-/// Send NF status notify to a single subscriber
+/// Send NF status notify to a single subscriber (async version)
+///
+/// Builds and sends an NF status notification to the subscriber's callback URI
+/// using the ogs-sbi HTTP/2 client.
+pub async fn nrf_nnrf_nfm_send_nf_status_notify_async(
+    subscription_data: &SubscriptionData,
+    event: NotificationEventType,
+    nf_instance: &NfProfile,
+    server_uri: &str,
+) -> NotifySendResult {
+    // Build the notification request
+    let notify_request = match nrf_nnrf_nfm_build_nf_status_notify(
+        subscription_data,
+        event,
+        nf_instance,
+        server_uri,
+    ) {
+        Some(req) => req,
+        None => {
+            log::error!("nrf_nnrf_nfm_build_nf_status_notify() failed");
+            return NotifySendResult::Failed("Failed to build notification".to_string());
+        }
+    };
+
+    log::debug!(
+        "Sending NF status notify to {} (event={:?}, nf_instance={})",
+        notify_request.uri,
+        event,
+        nf_instance.nf_instance_id
+    );
+
+    // Parse the notification URI to extract host and port
+    let (host, port, path, scheme) = match parse_notification_uri(&notify_request.uri) {
+        Some(parts) => parts,
+        None => {
+            log::error!(
+                "Failed to parse notification URI: {}",
+                notify_request.uri
+            );
+            return NotifySendResult::Failed(format!(
+                "Invalid notification URI: {}",
+                notify_request.uri
+            ));
+        }
+    };
+
+    // Build an SBI client for the subscriber endpoint
+    let client_config = SbiClientConfig::new(&host, port).with_scheme(scheme);
+    let client = SbiClient::new(client_config);
+
+    // Build the SBI request
+    let sbi_request = SbiRequest::post(&path)
+        .with_header("Content-Type", &notify_request.content_type)
+        .with_header("Accept", &notify_request.accept)
+        .with_body(notify_request.body.clone(), &notify_request.content_type);
+
+    // Send the notification
+    match client.send_request(sbi_request).await {
+        Ok(response) => {
+            let status = response.status;
+            if status == 204 || (200..300).contains(&status) {
+                log::info!(
+                    "NF status notify delivered: {} -> {} ({}) [HTTP {}]",
+                    nf_instance.nf_instance_id,
+                    subscription_data.notification_uri,
+                    event.as_str(),
+                    status
+                );
+                NotifySendResult::Success
+            } else {
+                log::warn!(
+                    "NF status notify rejected: {} -> {} ({}) [HTTP {}]",
+                    nf_instance.nf_instance_id,
+                    subscription_data.notification_uri,
+                    event.as_str(),
+                    status
+                );
+                NotifySendResult::Failed(format!("HTTP {status}"))
+            }
+        }
+        Err(e) => {
+            log::error!(
+                "Failed to deliver NF status notify to {}: {}",
+                subscription_data.notification_uri,
+                e
+            );
+            NotifySendResult::Failed(e.to_string())
+        }
+    }
+}
+
+/// Send NF status notify to a single subscriber (sync stub for backward compat)
 ///
 /// Builds and sends an NF status notification to the subscriber's callback URI
 pub fn nrf_nnrf_nfm_send_nf_status_notify(
@@ -161,7 +255,6 @@ pub fn nrf_nnrf_nfm_send_nf_status_notify(
         }
     };
 
-    // Log the notification
     log::debug!(
         "Sending NF status notify to {} (event={:?}, nf_instance={})",
         request.uri,
@@ -169,10 +262,8 @@ pub fn nrf_nnrf_nfm_send_nf_status_notify(
         nf_instance.nf_instance_id
     );
 
-    // In a real implementation, this would use an HTTP client to send the request
-    // For now, we just log and return success
     log::info!(
-        "NF status notify sent: {} -> {} ({})",
+        "NF status notify queued: {} -> {} ({})",
         nf_instance.nf_instance_id,
         subscription_data.notification_uri,
         event.as_str()
@@ -181,7 +272,96 @@ pub fn nrf_nnrf_nfm_send_nf_status_notify(
     NotifySendResult::Success
 }
 
-/// Send NF status notify to all matching subscribers
+/// Parse a notification URI into (host, port, path, scheme) components.
+fn parse_notification_uri(uri: &str) -> Option<(String, u16, String, UriScheme)> {
+    let (scheme, rest) = if let Some(rest) = uri.strip_prefix("https://") {
+        (UriScheme::Https, rest)
+    } else if let Some(rest) = uri.strip_prefix("http://") {
+        (UriScheme::Http, rest)
+    } else {
+        return None;
+    };
+
+    let (authority, path) = match rest.find('/') {
+        Some(pos) => (&rest[..pos], &rest[pos..]),
+        None => (rest, "/"),
+    };
+
+    let (host, port) = match authority.rfind(':') {
+        Some(pos) => {
+            let h = &authority[..pos];
+            let p = authority[pos + 1..].parse::<u16>().ok()?;
+            (h.to_string(), p)
+        }
+        None => {
+            let default_port = scheme.default_port();
+            (authority.to_string(), default_port)
+        }
+    };
+
+    Some((host, port, path.to_string(), scheme))
+}
+
+/// Send NF status notify to all matching subscribers (async version)
+///
+/// Iterates through all subscriptions and sends notifications to those
+/// that match the NF instance based on subscription conditions.
+/// Delivers notifications concurrently using tokio tasks.
+pub async fn nrf_nnrf_nfm_send_nf_status_notify_all_async(
+    event: NotificationEventType,
+    nf_instance: &NfProfile,
+    server_uri: &str,
+) -> Result<u32, String> {
+    let manager = nf_manager();
+    let subscriptions = manager.list_subscriptions();
+
+    let mut sent_count = 0u32;
+
+    for subscription in &subscriptions {
+        if !subscription_matches(subscription, nf_instance) {
+            continue;
+        }
+
+        // Send notification asynchronously
+        match nrf_nnrf_nfm_send_nf_status_notify_async(
+            subscription,
+            event,
+            nf_instance,
+            server_uri,
+        )
+        .await
+        {
+            NotifySendResult::Success => {
+                sent_count += 1;
+            }
+            NotifySendResult::Failed(err) => {
+                log::error!(
+                    "Failed to send NF status notify to {}: {}",
+                    subscription.notification_uri,
+                    err
+                );
+                // Continue sending to other subscribers rather than aborting
+            }
+            NotifySendResult::NoClient => {
+                log::warn!(
+                    "No client for subscription {}",
+                    subscription.id
+                );
+            }
+        }
+    }
+
+    log::info!(
+        "Sent {} NF status notifications for {} (event={:?})",
+        sent_count,
+        nf_instance.nf_instance_id,
+        event
+    );
+
+    Ok(sent_count)
+}
+
+/// Send NF status notify to all matching subscribers (sync version)
 ///
 /// Iterates through all subscriptions and sends notifications to those
 /// that match the NF instance based on subscription conditions
@@ -194,50 +374,8 @@ pub fn nrf_nnrf_nfm_send_nf_status_notify_all(
     let mut sent_count = 0u32;
 
     for subscription in subscriptions {
-        // Skip if the requester is the same as the NF instance
-        if let Some(ref req_nf_instance_id) = subscription.req_nf_instance_id {
-            if req_nf_instance_id == &nf_instance.nf_instance_id {
-                continue;
-            }
-        }
-
-        // Check subscription condition
-        if let Some(ref subscr_cond) = subscription.subscr_cond {
-            // Check NF type condition
-            if let Some(ref cond_nf_type) = subscr_cond.nf_type {
-                if cond_nf_type != &nf_instance.nf_type {
-                    continue;
-                }
-            }
-            // Check service name condition
-            else if let Some(ref cond_service_name) = subscr_cond.service_name {
-                // Check if NF instance has the required service
-                let has_service = nf_instance
-                    .nf_services
-                    .iter()
-                    .any(|s| &s.service_name == cond_service_name);
-                if !has_service {
-                    continue;
-                }
-
-                // Check if requester NF type is allowed
-                if subscription.req_nf_type.is_some() {
-                    // In a full implementation, check allowed NF types
-                    // For now, we allow all
-                }
-            }
-            // Check NF instance ID condition
-            else if let Some(ref cond_nf_instance_id) = subscr_cond.nf_instance_id {
-                if cond_nf_instance_id != &nf_instance.nf_instance_id {
-                    continue;
-                }
-            }
-        }
-
-        // Check if requester NF type is allowed for this NF instance
-        if subscription.req_nf_type.is_some() {
-            // In a full implementation, check allowed NF types
-            // For now, we allow all
+        if !subscription_matches(subscription, nf_instance) {
+            continue;
         }
 
         // Send notification
@@ -272,6 +410,44 @@ pub fn nrf_nnrf_nfm_send_nf_status_notify_all(
     Ok(sent_count)
 }
 
+/// Check if a subscription matches an NF instance for notification delivery.
+fn subscription_matches(subscription: &SubscriptionData, nf_instance: &NfProfile) -> bool {
+    // Skip if the requester is the same as the NF instance
+    if let Some(ref req_nf_instance_id) = subscription.req_nf_instance_id {
+        if req_nf_instance_id == &nf_instance.nf_instance_id {
+            return false;
+        }
+    }
+
+    // Check subscription condition
+    if let Some(ref subscr_cond) = subscription.subscr_cond {
+        // Check NF type condition
+        if let Some(ref cond_nf_type) = subscr_cond.nf_type {
+            if cond_nf_type != &nf_instance.nf_type {
+                return false;
+            }
+        }
+        // Check service name condition
+        else if let Some(ref cond_service_name) = subscr_cond.service_name {
+            let has_service = nf_instance
+                .nf_services
+                .iter()
+                .any(|s| &s.service_name == cond_service_name);
+            if !has_service {
+                return false;
+            }
+        }
+        // Check NF instance ID condition
+        else if let Some(ref cond_nf_instance_id) = subscr_cond.nf_instance_id {
+            if cond_nf_instance_id != &nf_instance.nf_instance_id {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
 /// Client notification callback result
 #[derive(Debug)]
 pub enum ClientNotifyResult {
@@ -295,20 +471,19 @@ pub fn client_notify_cb(status: i32, response_status: Option<u16>) -> ClientNoti
             } else {
                 log::Level::Warn
             },
-            "client_notify_cb() failed [{}]",
-            status
+            "client_notify_cb() failed [{status}]"
         );
         return if status == 1 {
             ClientNotifyResult::Done
         } else {
-            ClientNotifyResult::Error(format!("Status: {}", status))
+            ClientNotifyResult::Error(format!("Status: {status}"))
         };
     }
 
     if let Some(res_status) = response_status {
         if res_status != 204 {
             // HTTP 204 No Content is expected
-            log::warn!("Subscription notification failed [{}]", res_status);
+            log::warn!("Subscription notification failed [{res_status}]");
         }
     }
 

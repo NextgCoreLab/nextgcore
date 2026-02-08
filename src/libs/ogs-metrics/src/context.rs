@@ -60,7 +60,7 @@ impl MetricsContext {
     pub fn open(&mut self) {
         for server in &mut self.servers {
             if let Err(e) = server.start() {
-                log::error!("Failed to start metrics server: {}", e);
+                log::error!("Failed to start metrics server: {e}");
             }
         }
     }
@@ -223,7 +223,7 @@ impl MetricsContext {
 
             // Create server configs for each address
             for addr in addresses {
-                if let Ok(socket_addr) = format!("{}:{}", addr, port).parse() {
+                if let Ok(socket_addr) = format!("{addr}:{port}").parse() {
                     self.add_server(ServerConfig::new(socket_addr));
                 }
             }

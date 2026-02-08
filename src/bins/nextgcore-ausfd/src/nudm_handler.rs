@@ -23,7 +23,7 @@ pub fn ausf_nudm_ueau_handle_get(ausf_ue_id: u64, _stream_id: u64) -> bool {
     let mut ausf_ue = match context.ue_find_by_id(ausf_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("AUSF UE not found [{}]", ausf_ue_id);
+            log::error!("AUSF UE not found [{ausf_ue_id}]");
             return false;
         }
     };
@@ -60,12 +60,8 @@ pub fn ausf_nudm_ueau_handle_get(ausf_ue_id: u64, _stream_id: u64) -> bool {
     // Set auth type
     ausf_ue.auth_type = AuthType::FiveGAka;
 
-    // Store authentication vector values
-    // ausf_ue.rand = hex_to_bytes(authentication_vector.rand);
-    // ausf_ue.xres_star = hex_to_bytes(authentication_vector.xres_star);
-    // ausf_ue.kausf = hex_to_bytes(authentication_vector.kausf);
-
-    // Calculate HXRES*
+    // Calculate HXRES* from stored RAND and XRES*
+    // (RAND, XRES*, AUTN, KAUSF are populated by process_authentication_vector)
     ausf_ue.calculate_hxres_star();
 
     // Update UE in context
@@ -96,7 +92,7 @@ pub fn ausf_nudm_ueau_handle_auth_removal_ind(ausf_ue_id: u64, _stream_id: u64) 
     let ausf_ue = match context.ue_find_by_id(ausf_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("AUSF UE not found [{}]", ausf_ue_id);
+            log::error!("AUSF UE not found [{ausf_ue_id}]");
             return false;
         }
     };
@@ -122,7 +118,7 @@ pub fn ausf_nudm_ueau_handle_result_confirmation_inform(ausf_ue_id: u64, _stream
     let mut ausf_ue = match context.ue_find_by_id(ausf_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("AUSF UE not found [{}]", ausf_ue_id);
+            log::error!("AUSF UE not found [{ausf_ue_id}]");
             return false;
         }
     };
@@ -137,17 +133,14 @@ pub fn ausf_nudm_ueau_handle_result_confirmation_inform(ausf_ue_id: u64, _stream
     // - AuthEvent.success
     // - http.location (resource URI)
 
-    // Parse and store auth event client
-    // let (scheme, fqdn, port, addr, addr6) = parse_uri(location);
-    // ausf_ue.auth_event.client = find_or_create_client(scheme, fqdn, port, addr, addr6);
-    // ausf_ue.auth_event_store(location);
-
-    // Update auth result based on AuthEvent.success
-    // if auth_event.success {
-    //     ausf_ue.auth_result = AuthResult::AuthenticationSuccess;
-    // } else {
-    //     ausf_ue.auth_result = AuthResult::AuthenticationFailure;
-    // }
+    // Auth result is already set by nausf_handler during confirmation
+    // (either AuthenticationSuccess or AuthenticationFailure based on HRES* vs HXRES*)
+    // The UDM just confirms storage of the auth event.
+    log::debug!(
+        "[{}] Auth result from UDM confirmation: {:?}",
+        ausf_ue.suci,
+        ausf_ue.auth_result
+    );
 
     // Calculate KSEAF
     ausf_ue.calculate_kseaf();
@@ -210,6 +203,7 @@ pub fn process_authentication_vector(
     updated_ue.auth_type = auth_info.auth_type;
     updated_ue.rand = auth_info.rand;
     updated_ue.xres_star = auth_info.xres_star;
+    updated_ue.autn = auth_info.autn;
     updated_ue.kausf = auth_info.kausf;
 
     // Calculate HXRES*
@@ -250,12 +244,12 @@ pub fn build_ue_authentication_ctx(
         server_uri, ausf_ue.ctx_id
     );
 
-    // Note: autn should be stored in AusfUe when received from UDM response
-    // For now using empty string as placeholder
+    let autn_hex = bytes_to_hex(&ausf_ue.autn);
+
     Some(UeAuthenticationCtx {
         auth_type: ausf_ue.auth_type,
         rand: rand_hex,
-        autn: String::new(),
+        autn: autn_hex,
         hxres_star: hxres_star_hex,
         links_href,
     })
@@ -285,8 +279,8 @@ pub fn build_confirmation_data_response(ausf_ue_id: u64) -> Option<ConfirmationD
 }
 
 /// Convert bytes to hex string
-fn bytes_to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+pub fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Convert hex string to bytes

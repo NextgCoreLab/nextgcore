@@ -22,7 +22,7 @@ pub fn compile_rule(flow_description: &str) -> IpfwResult<IpfwRule> {
     }
 
     // Check for "permit" keyword
-    if tokens.get(0) != Some(&"permit") {
+    if tokens.first() != Some(&"permit") {
         return Err(IpfwError::MissingKeyword("permit".to_string()));
     }
 
@@ -220,7 +220,7 @@ fn encode_address_port(rule: &IpfwRule, is_src: bool) -> String {
         } else if prefix == 32 {
             result.push_str(&addr.to_string());
         } else {
-            result.push_str(&format!("{}/{}", addr, prefix));
+            result.push_str(&format!("{addr}/{prefix}"));
         }
     } else if has_ipv6 {
         let mut octets = [0u8; 16];
@@ -236,7 +236,7 @@ fn encode_address_port(rule: &IpfwRule, is_src: bool) -> String {
         } else if prefix == 128 {
             result.push_str(&addr.to_string());
         } else {
-            result.push_str(&format!("{}/{}", addr, prefix));
+            result.push_str(&format!("{addr}/{prefix}"));
         }
     } else {
         result.push_str(if is_src { "any" } else { "assigned" });
@@ -257,7 +257,7 @@ fn encode_address_port(rule: &IpfwRule, is_src: bool) -> String {
 /// Count contiguous prefix bits in a mask
 fn count_prefix_bits(mask: &[u32; 4], max_bits: usize) -> u32 {
     let mut count = 0u32;
-    let num_words = (max_bits + 31) / 32;
+    let num_words = max_bits.div_ceil(32);
 
     for i in 0..num_words {
         let word = u32::from_be(mask[i]);

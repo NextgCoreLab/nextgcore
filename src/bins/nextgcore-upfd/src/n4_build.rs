@@ -2,7 +2,7 @@
 //!
 //! Port of src/upf/n4-build.c - PFCP message building for UPF
 
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{BufMut, BytesMut};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 // ============================================================================

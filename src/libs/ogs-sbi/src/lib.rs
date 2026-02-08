@@ -32,13 +32,19 @@
 //! - [`client`] - HTTP/2 client implementation
 //! - [`server`] - HTTP/2 server implementation
 //! - [`context`] - NF instance and service discovery context
+//! - [`tls`] - TLS/mTLS configuration and certificate loading
+//! - [`oauth`] - OAuth2 client credentials flow for 5G SBA
 //! - [`error`] - Error types
 
 pub mod constants;
 pub mod context;
 pub mod error;
 pub mod message;
+pub mod oauth;
+pub mod tls;
 pub mod types;
+pub mod scp;
+pub mod heartbeat;
 
 pub mod client;
 pub mod server;
@@ -57,6 +63,16 @@ pub use server::{
     SbiRequestHandler, SbiServer, SbiServerConfig, StreamId,
 };
 pub use types::{NfType, SbiAppError, SbiServiceType, UriScheme};
+pub use oauth::{
+    AccessTokenClaims, AccessTokenError, AccessTokenRequest, AccessTokenResponse, TokenCache,
+};
+pub use scp::{
+    ScpBinding, ScpRouter, ScpRoutingInfo, ScpRoutingMode, global_scp_router, init_scp_router,
+};
+pub use heartbeat::{
+    HeartbeatConfig, HeartbeatManager, HeartbeatRecord, HeartbeatStats, HeartbeatStatus,
+    global_heartbeat_manager, init_heartbeat_manager,
+};
 
 /// Initialize the SBI library
 pub fn init() {

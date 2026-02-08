@@ -108,8 +108,8 @@ impl ZucState {
 }
 
 pub fn zuc_eea3(ck: &[u8; 16], count: u32, bearer: u32, dir: u32, len: u32, m: &[u8], c: &mut [u8]) {
-    let l = ((len + 31) / 32) as usize;
-    let l8 = ((len + 7) / 8) as usize;
+    let l = len.div_ceil(32) as usize;
+    let l8 = len.div_ceil(8) as usize;
     let lastbits = (8 - (len % 8)) % 8;
     let mut iv = [0u8; 16];
     iv[0] = (count >> 24) as u8; iv[1] = (count >> 16) as u8;
@@ -142,7 +142,7 @@ pub fn zuc_eia3(ik: &[u8; 16], count: u32, bearer: u32, dir: u32, len: u32, m: &
     iv[8] = iv[0] ^ (((dir & 1) << 7) as u8);
     iv[9] = iv[1]; iv[10] = iv[2]; iv[11] = iv[3];
     iv[12] = iv[4]; iv[14] = ((dir & 1) << 7) as u8;
-    let n = len + 64; let l = ((n + 31) / 32) as usize;
+    let n = len + 64; let l = n.div_ceil(32) as usize;
     let mut state = ZucState::new();
     state.initialize(ik, &iv);
     let mut z = vec![0u32; l];

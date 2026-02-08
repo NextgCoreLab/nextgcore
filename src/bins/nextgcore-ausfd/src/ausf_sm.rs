@@ -155,8 +155,8 @@ impl AusfSmContext {
 
         // Check API version
         if api_version != "v1" {
-            log::error!("Not supported version [{}]", api_version);
-            send_error_response(stream_id, 400, &format!("Unsupported API version: {}", api_version));
+            log::error!("Not supported version [{api_version}]");
+            send_error_response(stream_id, 400, &format!("Unsupported API version: {api_version}"));
             return;
         }
 
@@ -169,8 +169,8 @@ impl AusfSmContext {
                 self.handle_nausf_auth_request_simple(event, &method, &resource_components, stream_id);
             }
             _ => {
-                log::error!("Invalid API name [{}]", service_name);
-                send_error_response(stream_id, 400, &format!("Invalid API name: {}", service_name));
+                log::error!("Invalid API name [{service_name}]");
+                send_error_response(stream_id, 400, &format!("Invalid API name: {service_name}"));
             }
         }
     }
@@ -187,7 +187,7 @@ impl AusfSmContext {
                     // This is handled by the nnrf integration when NRF is enabled
                 }
                 _ => {
-                    log::error!("Invalid HTTP method [{}]", method);
+                    log::error!("Invalid HTTP method [{method}]");
                 }
             },
             _ => {
@@ -243,7 +243,7 @@ impl AusfSmContext {
         let ausf_ue = match ausf_ue {
             Some(ue) => ue,
             None => {
-                log::error!("Not found [{}]", method);
+                log::error!("Not found [{method}]");
                 send_not_found_response(stream_id, "Authentication context not found");
                 return;
             }
@@ -305,7 +305,7 @@ impl AusfSmContext {
 
         // Check API version
         if api_version != "v1" {
-            log::error!("Not supported version [{}]", api_version);
+            log::error!("Not supported version [{api_version}]");
             return;
         }
 
@@ -321,7 +321,7 @@ impl AusfSmContext {
                 self.handle_nudm_ueau_response_simple(event, &method, &resource_components, res_status, data);
             }
             _ => {
-                log::error!("Invalid API name [{}]", service_name);
+                log::error!("Invalid API name [{service_name}]");
             }
         }
     }
@@ -368,7 +368,7 @@ impl AusfSmContext {
                         );
                     }
                 } else {
-                    log::error!("Invalid HTTP method [{}]", method);
+                    log::error!("Invalid HTTP method [{method}]");
                 }
             }
             _ => {
@@ -437,7 +437,7 @@ impl AusfSmContext {
             context.ue_remove(ausf_ue_id);
         } else if ue_sm.state() == AusfUeState::Deleted {
             if let Some(ref supi) = ausf_ue.supi {
-                log::info!("[{}] AUSF-UE removed", supi);
+                log::info!("[{supi}] AUSF-UE removed");
             }
             self.ue_sms.remove(&ausf_ue_id);
             context.ue_remove(ausf_ue_id);
@@ -460,21 +460,21 @@ impl AusfSmContext {
             | AusfTimerId::NfInstanceNoHeartbeat
             | AusfTimerId::NfInstanceValidity => {
                 if let Some(ref nf_instance_id) = event.nf_instance_id {
-                    log::debug!("[{}] NF instance timer: {:?}", nf_instance_id, timer_id);
+                    log::debug!("[{nf_instance_id}] NF instance timer: {timer_id:?}");
                     // Note: Update NF instance load and dispatch to NF FSM
                     // This is handled by the nnrf integration when NRF is enabled
                 }
             }
             AusfTimerId::SubscriptionValidity => {
                 if let Some(ref subscription_id) = event.subscription_id {
-                    log::error!("[{}] Subscription validity expired", subscription_id);
+                    log::error!("[{subscription_id}] Subscription validity expired");
                     // Note: Send new subscription and remove old one
                     // This is handled by the nnrf integration when NRF is enabled
                 }
             }
             AusfTimerId::SubscriptionPatch => {
                 if let Some(ref subscription_id) = event.subscription_id {
-                    log::info!("[{}] Need to update Subscription", subscription_id);
+                    log::info!("[{subscription_id}] Need to update Subscription");
                     // Note: Send subscription update to NRF
                     // This is handled by the nnrf integration when NRF is enabled
                 }

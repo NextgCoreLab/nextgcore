@@ -10,11 +10,14 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use nextgcore_nrfd::{
     nf_manager, nrf_context_final, nrf_context_init, nrf_sbi_close, nrf_sbi_open,
+    nrf_nnrf_nfm_send_nf_status_notify_all_async,
     timer_manager, NrfSmContext, SbiServerConfig,
+    NotificationEventType,
 };
 use ogs_sbi::message::{SbiRequest, SbiResponse};
+use ogs_sbi::oauth::AccessTokenResponse;
 use ogs_sbi::server::{
-    send_bad_request, send_method_not_allowed, send_not_found,
+    send_bad_request, send_method_not_allowed, send_not_found, send_unauthorized,
     SbiServer, SbiServerConfig as OgsSbiServerConfig,
 };
 use std::net::SocketAddr;
@@ -68,6 +71,14 @@ struct Args {
     /// TLS key path
     #[arg(long)]
     tls_key: Option<String>,
+
+    /// Enable mTLS (require client certificates)
+    #[arg(long)]
+    mtls: bool,
+
+    /// CA certificate for client verification (mTLS)
+    #[arg(long)]
+    tls_ca_cert: Option<String>,
 
     /// Maximum number of UEs
     #[arg(long, default_value = "1024")]
@@ -136,12 +147,30 @@ async fn main() -> Result<()> {
     let sbi_addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
         .parse()
         .context("Invalid SBI address")?;
-    let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
+    let mut sbi_server_config = OgsSbiServerConfig::new(sbi_addr);
+
+    // Wire TLS/mTLS configuration from CLI args into the ogs-sbi server
+    if args.tls {
+        let cert = args.tls_cert.as_deref().unwrap_or("/etc/nextgcore/tls/server.crt");
+        let key = args.tls_key.as_deref().unwrap_or("/etc/nextgcore/tls/server.key");
+        sbi_server_config = sbi_server_config.with_tls(key, cert);
+        log::info!("TLS enabled: cert={}, key={}", cert, key);
+
+        if args.mtls {
+            let ca = args.tls_ca_cert.as_deref().unwrap_or("/etc/nextgcore/tls/ca.crt");
+            sbi_server_config.verify_client = true;
+            sbi_server_config.verify_client_cacert = Some(ca.to_string());
+            log::info!("mTLS enabled: client CA={}", ca);
+        }
+    }
+
+    let sbi_server = SbiServer::new(sbi_server_config);
 
     sbi_server.start(nrf_sbi_request_handler).await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {}", e))?;
 
-    log::info!("SBI HTTP/2 server listening on {}", sbi_addr);
+    let scheme = if args.tls { "HTTPS" } else { "HTTP" };
+    log::info!("SBI HTTP/2 {} server listening on {}", scheme, sbi_addr);
     log::info!("NextGCore NRF ready");
 
     // Main event loop (async)
@@ -245,6 +274,12 @@ async fn nrf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             handle_nf_discover(&request).await
         }
 
+        // OAuth2 Access Token Service (nnrf-oauth2)
+        ("nnrf-oauth2", "access-token", "POST") => {
+            // Access Token Request: POST /nnrf-oauth2/v1/access-token
+            handle_access_token_request(&request).await
+        }
+
         _ => {
             log::warn!("Unknown NRF request: {} {}", method, uri);
             send_method_not_allowed(method, uri)
@@ -300,6 +335,21 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
         Ok(_) => {
             log::info!("NF {} ({}) registered successfully", nf_instance_id, nf_type);
 
+            // Send NF status notifications to all matching subscribers
+            let notify_profile = nf_profile.clone();
+            tokio::spawn(async move {
+                let server_uri = "http://127.0.0.1:7777"; // TODO: use configured URI
+                if let Err(e) = nrf_nnrf_nfm_send_nf_status_notify_all_async(
+                    NotificationEventType::NfRegistered,
+                    &notify_profile,
+                    server_uri,
+                )
+                .await
+                {
+                    log::error!("Failed to send NF_REGISTERED notifications: {}", e);
+                }
+            });
+
             // Return 201 Created with the NF profile
             SbiResponse::with_status(201)
                 .with_header("Location", &format!("/nnrf-nfm/v1/nf-instances/{}", nf_instance_id))
@@ -342,9 +392,29 @@ async fn handle_nf_deregister(nf_instance_id: &str) -> SbiResponse {
 
     let manager = nf_manager();
 
+    // Fetch the profile before deregistering so we can notify subscribers
+    let profile_for_notify = manager.get(nf_instance_id);
+
     match manager.deregister(nf_instance_id) {
         Ok(_) => {
             log::info!("NF {} deregistered successfully", nf_instance_id);
+
+            // Send NF_DEREGISTERED notifications to matching subscribers
+            if let Some(profile) = profile_for_notify {
+                tokio::spawn(async move {
+                    let server_uri = "http://127.0.0.1:7777"; // TODO: use configured URI
+                    if let Err(e) = nrf_nnrf_nfm_send_nf_status_notify_all_async(
+                        NotificationEventType::NfDeregistered,
+                        &profile,
+                        server_uri,
+                    )
+                    .await
+                    {
+                        log::error!("Failed to send NF_DEREGISTERED notifications: {}", e);
+                    }
+                });
+            }
+
             SbiResponse::with_status(204) // No Content
         }
         Err(e) => {
@@ -420,14 +490,84 @@ async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
         Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
     };
 
+    // Extract notification URI (required field)
+    let notification_uri = match subscription
+        .get("nfStatusNotificationUri")
+        .and_then(|v| v.as_str())
+    {
+        Some(uri) => uri.to_string(),
+        None => {
+            return send_bad_request(
+                "Missing nfStatusNotificationUri",
+                Some("MISSING_NOTIFY_URI"),
+            )
+        }
+    };
+
     // Generate subscription ID
     let subscription_id = uuid::Uuid::new_v4().to_string();
 
-    log::info!("Created subscription: {}", subscription_id);
+    // Parse subscription condition
+    let subscr_cond = subscription.get("subscrCond").map(|cond| {
+        nextgcore_nrfd::nnrf_handler::SubscrCond {
+            nf_type: cond.get("nfType").and_then(|v| v.as_str()).map(String::from),
+            service_name: cond
+                .get("serviceName")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            nf_instance_id: cond
+                .get("nfInstanceId")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        }
+    });
+
+    // Parse validity duration (default 86400 seconds = 24 hours)
+    let validity_duration = subscription
+        .get("validityTime")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(86400);
+
+    // Build subscription data
+    let subscription_data = nextgcore_nrfd::SubscriptionData {
+        id: subscription_id.clone(),
+        req_nf_type: subscription
+            .get("reqNfType")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        req_nf_instance_id: subscription
+            .get("reqNfInstanceId")
+            .and_then(|v| v.as_str())
+            .map(String::from),
+        notification_uri,
+        subscr_cond,
+        validity_duration,
+    };
+
+    // Store the subscription in the manager
+    let manager = nf_manager();
+    manager.add_subscription(subscription_data);
+
+    // Start a subscription validity timer
+    let timer_mgr = timer_manager();
+    timer_mgr.start_timer(
+        nextgcore_nrfd::NrfTimerId::SubscriptionValidity,
+        Duration::from_secs(validity_duration),
+        subscription_id.clone(),
+    );
+
+    log::info!(
+        "Created subscription: {} (validity={}s)",
+        subscription_id,
+        validity_duration
+    );
 
     // Return 201 Created
     SbiResponse::with_status(201)
-        .with_header("Location", &format!("/nnrf-nfm/v1/subscriptions/{}", subscription_id))
+        .with_header(
+            "Location",
+            &format!("/nnrf-nfm/v1/subscriptions/{}", subscription_id),
+        )
         .with_json_body(&serde_json::json!({
             "subscriptionId": subscription_id,
             "nfStatusNotificationUri": subscription.get("nfStatusNotificationUri"),
@@ -439,7 +579,17 @@ async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
 /// Handle Subscription Delete request
 async fn handle_subscription_delete(subscription_id: &str) -> SbiResponse {
     log::info!("Subscription Delete: {}", subscription_id);
-    SbiResponse::with_status(204) // No Content
+
+    let manager = nf_manager();
+    if manager.remove_subscription(subscription_id) {
+        log::info!("Subscription {} removed", subscription_id);
+        SbiResponse::with_status(204) // No Content
+    } else {
+        send_not_found(
+            &format!("Subscription {} not found", subscription_id),
+            Some("SUBSCRIPTION_NOT_FOUND"),
+        )
+    }
 }
 
 /// Handle Subscription Update request
@@ -492,6 +642,132 @@ async fn handle_nf_discover(request: &SbiRequest) -> SbiResponse {
             "validityPeriod": 3600,
             "nfInstances": nf_instances,
         }))
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+/// Handle OAuth2 Access Token Request
+///
+/// Implements the NRF's role as Authorization Server per 3GPP TS 29.510.
+/// Accepts client_credentials grant and issues Bearer tokens.
+async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
+    log::info!("OAuth2 Access Token Request");
+
+    let body = match &request.http.content {
+        Some(content) => content,
+        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+    };
+
+    // Parse as form-urlencoded or JSON
+    let (grant_type, nf_instance_id, nf_type, target_nf_type, scope) =
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
+            (
+                parsed.get("grant_type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                parsed.get("nfInstanceId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                parsed.get("nfType").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                parsed.get("targetNfType").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                parsed.get("scope").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            )
+        } else {
+            // Try form-urlencoded
+            let mut grant_type = String::new();
+            let mut nf_instance_id = String::new();
+            let mut nf_type = String::new();
+            let mut target_nf_type = String::new();
+            let mut scope = String::new();
+
+            for pair in body.split('&') {
+                if let Some((key, value)) = pair.split_once('=') {
+                    match key {
+                        "grant_type" => grant_type = value.to_string(),
+                        "nfInstanceId" => nf_instance_id = value.to_string(),
+                        "nfType" => nf_type = value.to_string(),
+                        "targetNfType" => target_nf_type = value.to_string(),
+                        "scope" => scope = value.replace('+', " "),
+                        _ => {}
+                    }
+                }
+            }
+            (grant_type, nf_instance_id, nf_type, target_nf_type, scope)
+        };
+
+    // Validate grant_type
+    if grant_type != "client_credentials" {
+        return send_bad_request(
+            &format!("Unsupported grant_type: {}", grant_type),
+            Some("UNSUPPORTED_GRANT_TYPE"),
+        );
+    }
+
+    // Validate required fields
+    if nf_instance_id.is_empty() {
+        return send_bad_request("Missing nfInstanceId", Some("INVALID_REQUEST"));
+    }
+    if nf_type.is_empty() {
+        return send_bad_request("Missing nfType", Some("INVALID_REQUEST"));
+    }
+    if target_nf_type.is_empty() {
+        return send_bad_request("Missing targetNfType", Some("INVALID_REQUEST"));
+    }
+    if scope.is_empty() {
+        return send_bad_request("Missing scope", Some("INVALID_SCOPE"));
+    }
+
+    // Verify that the requesting NF is registered
+    let manager = nf_manager();
+    if manager.get(&nf_instance_id).is_none() {
+        return send_unauthorized(
+            &format!("NF instance {} not registered", nf_instance_id),
+            Some("UNAUTHORIZED_NF"),
+        );
+    }
+
+    // Issue a JWT access token
+    // In production, this would use proper RSA/ECDSA signing.
+    // For now, build a base64-encoded JWT structure.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let expires_in = 3600u64; // 1 hour
+
+    let header_json = r#"{"alg":"HS256","typ":"JWT"}"#;
+    let claims_json = serde_json::json!({
+        "iss": "NRF",
+        "sub": nf_instance_id,
+        "aud": target_nf_type,
+        "scope": scope,
+        "exp": now + expires_in,
+        "iat": now,
+    });
+    let claims_str = claims_json.to_string();
+
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
+    let payload_b64 = URL_SAFE_NO_PAD.encode(claims_str.as_bytes());
+    // Placeholder signature (in production, sign with NRF private key)
+    let signature_b64 = URL_SAFE_NO_PAD.encode(b"nrf-signature-placeholder");
+
+    let access_token = format!("{}.{}.{}", header_b64, payload_b64, signature_b64);
+
+    log::info!(
+        "Issued access token for {} ({}) -> {} scope={}",
+        nf_instance_id,
+        nf_type,
+        target_nf_type,
+        scope
+    );
+
+    let response = AccessTokenResponse {
+        access_token,
+        token_type: "Bearer".to_string(),
+        expires_in: Some(expires_in),
+        scope: Some(scope),
+    };
+
+    SbiResponse::with_status(200)
+        .with_json_body(&response)
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
@@ -549,8 +825,57 @@ async fn run_event_loop_async(_nrf_sm: &mut NrfSmContext, shutdown: Arc<AtomicBo
         let expired_events = timer_manager().get_expired_events();
         for event in expired_events {
             log::debug!("Processing timer event: {:?}", event);
-            // Dispatch to state machine
-            // nrf_sm.handle_event(event);
+
+            match event.timer_id {
+                Some(nextgcore_nrfd::NrfTimerId::SubscriptionValidity) => {
+                    // Subscription has expired -- remove it
+                    if let Some(ref subscription_id) = event.subscription_id {
+                        log::info!("Subscription {} validity expired, removing", subscription_id);
+                        let manager = nf_manager();
+                        manager.remove_subscription(subscription_id);
+                    }
+                }
+                Some(nextgcore_nrfd::NrfTimerId::NfInstanceNoHeartbeat) => {
+                    // NF instance missed heartbeat -- deregister it
+                    if let Some(ref nf_instance_id) = event.nf_instance_id {
+                        log::warn!(
+                            "NF instance {} missed heartbeat, deregistering",
+                            nf_instance_id
+                        );
+                        let manager = nf_manager();
+
+                        // Fetch profile before removal for notification
+                        let profile = manager.get(nf_instance_id);
+                        manager.deregister(nf_instance_id).ok();
+
+                        // Send NF_DEREGISTERED notification
+                        if let Some(profile) = profile {
+                            let server_uri = "http://127.0.0.1:7777".to_string();
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    nrf_nnrf_nfm_send_nf_status_notify_all_async(
+                                        NotificationEventType::NfDeregistered,
+                                        &profile,
+                                        &server_uri,
+                                    )
+                                    .await
+                                {
+                                    log::error!(
+                                        "Failed to send NF_DEREGISTERED notifications: {}",
+                                        e
+                                    );
+                                }
+                            });
+                        }
+                    }
+                }
+                Some(nextgcore_nrfd::NrfTimerId::SbiClientWait) => {
+                    log::debug!("SBI client wait timer expired");
+                }
+                None => {
+                    log::warn!("Timer event with no timer ID");
+                }
+            }
         }
 
         // Check for shutdown

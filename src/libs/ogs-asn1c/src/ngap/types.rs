@@ -32,7 +32,7 @@ impl AperDecode for Criticality {
             1 => Ok(Criticality::Ignore),
             2 => Ok(Criticality::Notify),
             _ => Err(crate::per::PerError::DecodeError(
-                format!("Invalid Criticality value: {}", value)
+                format!("Invalid Criticality value: {value}")
             )),
         }
     }
@@ -191,7 +191,7 @@ impl AperDecode for TriggeringMessage {
             1 => Ok(TriggeringMessage::SuccessfulOutcome),
             2 => Ok(TriggeringMessage::UnsuccessfulOutcome),
             _ => Err(crate::per::PerError::DecodeError(
-                format!("Invalid TriggeringMessage value: {}", value)
+                format!("Invalid TriggeringMessage value: {value}")
             )),
         }
     }
@@ -225,7 +225,7 @@ impl AperDecode for Presence {
             1 => Ok(Presence::Conditional),
             2 => Ok(Presence::Mandatory),
             _ => Err(crate::per::PerError::DecodeError(
-                format!("Invalid Presence value: {}", value)
+                format!("Invalid Presence value: {value}")
             )),
         }
     }

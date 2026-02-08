@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 ogs-core = { workspace = true }
 ogs-sbi = { workspace = true }
+ogs-dbi = { workspace = true }
 ogs-app = { workspace = true }
 log.workspace = true
 env_logger.workspace = true

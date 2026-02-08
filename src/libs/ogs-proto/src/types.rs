@@ -527,6 +527,417 @@ pub struct Session {
     pub smf_ip: IpAddr,
 }
 
+// ============================================================================
+// 6G ISAC (Integrated Sensing and Communication) Types
+// ============================================================================
+
+/// ISAC sensing configuration for 6G networks.
+///
+/// Defines operational parameters for integrated sensing and communication
+/// at the network level.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SensingConfig {
+    /// Whether ISAC sensing is enabled
+    pub enabled: bool,
+    /// Sensing mode (0=passive, 1=active radar, 2=hybrid)
+    pub mode: u8,
+    /// Sensing bandwidth in MHz
+    pub bandwidth_mhz: u32,
+    /// Maximum sensing range in meters
+    pub max_range_meters: f64,
+    /// Minimum detection threshold in dBm
+    pub detection_threshold_dbm: f32,
+}
+
+impl SensingConfig {
+    /// Creates a new sensing configuration.
+    pub fn new(mode: u8, bandwidth_mhz: u32, max_range_meters: f64) -> Self {
+        Self {
+            enabled: true,
+            mode,
+            bandwidth_mhz,
+            max_range_meters,
+            detection_threshold_dbm: -100.0,
+        }
+    }
+}
+
+impl Default for SensingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: 0,
+            bandwidth_mhz: 100,
+            max_range_meters: 1000.0,
+            detection_threshold_dbm: -100.0,
+        }
+    }
+}
+
+/// ISAC sensing result containing detection information.
+///
+/// Aggregated result from ISAC operations at the network layer.
+#[derive(Debug, Clone, Default)]
+pub struct SensingResult {
+    /// Timestamp of result (milliseconds since epoch)
+    pub timestamp_ms: u64,
+    /// Number of detections
+    pub detection_count: u32,
+    /// Average signal strength (dBm)
+    pub avg_signal_strength_dbm: f32,
+    /// Average range (meters)
+    pub avg_range_meters: f64,
+    /// Confidence level (0.0-1.0)
+    pub confidence: f32,
+}
+
+impl SensingResult {
+    /// Creates a new sensing result.
+    pub fn new(timestamp_ms: u64, detection_count: u32) -> Self {
+        Self {
+            timestamp_ms,
+            detection_count,
+            avg_signal_strength_dbm: 0.0,
+            avg_range_meters: 0.0,
+            confidence: 0.0,
+        }
+    }
+}
+
+// ============================================================================
+// 6G Semantic Communication Types
+// ============================================================================
+
+/// Semantic communication profile for network-level optimization.
+///
+/// Contains metadata for semantic communication optimization in the core network.
+#[derive(Debug, Clone)]
+pub struct SemanticProfile {
+    /// Content modality (0=text, 1=image, 2=audio, 3=video, 4=sensor, 5=mixed)
+    pub modality: u8,
+    /// Compression level (0=none, 1=low, 2=medium, 3=high, 4=maximum)
+    pub compression_level: u8,
+    /// Semantic importance score (0.0-1.0)
+    pub importance: f32,
+    /// Context identifier
+    pub context_id: u32,
+    /// Minimum acceptable quality (0.0-1.0)
+    pub min_quality: f32,
+}
+
+impl SemanticProfile {
+    /// Creates a new semantic profile.
+    pub fn new(modality: u8, compression_level: u8, importance: f32) -> Self {
+        Self {
+            modality,
+            compression_level,
+            importance: importance.clamp(0.0, 1.0),
+            context_id: 0,
+            min_quality: 0.7,
+        }
+    }
+}
+
+impl Default for SemanticProfile {
+    fn default() -> Self {
+        Self {
+            modality: 0,
+            compression_level: 2,
+            importance: 0.5,
+            context_id: 0,
+            min_quality: 0.7,
+        }
+    }
+}
+
+// ============================================================================
+// 6G Split-Hybrid Edge (SHE) Computing Types
+// ============================================================================
+
+/// Compute descriptor for SHE operations.
+///
+/// Describes computational task characteristics for edge offloading decisions.
+#[derive(Debug, Clone)]
+pub struct ComputeDescriptor {
+    /// Task identifier
+    pub task_id: u64,
+    /// Task type name
+    pub task_type: String,
+    /// Workload in compute units
+    pub workload_units: u64,
+    /// Maximum latency budget (milliseconds)
+    pub max_latency_ms: u32,
+    /// Required accelerator (0=none, 1=gpu, 2=tpu, 3=fpga, 4=npu, 5=cpu)
+    pub required_accelerator: u8,
+    /// Input data size (bytes)
+    pub input_size_bytes: u64,
+    /// Output data size (bytes)
+    pub output_size_bytes: u64,
+    /// Priority (0-255, higher = more important)
+    pub priority: u8,
+}
+
+impl ComputeDescriptor {
+    /// Creates a new compute descriptor.
+    pub fn new(task_id: u64, task_type: String, workload_units: u64) -> Self {
+        Self {
+            task_id,
+            task_type,
+            workload_units,
+            max_latency_ms: 1000,
+            required_accelerator: 5, // Default to CPU
+            input_size_bytes: 0,
+            output_size_bytes: 0,
+            priority: 128,
+        }
+    }
+}
+
+impl Default for ComputeDescriptor {
+    fn default() -> Self {
+        Self {
+            task_id: 0,
+            task_type: String::new(),
+            workload_units: 0,
+            max_latency_ms: 1000,
+            required_accelerator: 5,
+            input_size_bytes: 0,
+            output_size_bytes: 0,
+            priority: 128,
+        }
+    }
+}
+
+// ============================================================================
+// 6G Non-Terrestrial Network (NTN) Types
+// ============================================================================
+
+/// Satellite identifier for NTN operations.
+///
+/// Uniquely identifies a satellite in the NTN constellation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SatelliteId(pub u32);
+
+impl SatelliteId {
+    /// Creates a new satellite ID.
+    pub const fn new(id: u32) -> Self {
+        Self(id)
+    }
+
+    /// Returns the raw ID value.
+    pub const fn value(&self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for SatelliteId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "sat-{:08x}", self.0)
+    }
+}
+
+/// Orbital parameters for satellite positioning.
+///
+/// Describes satellite orbit characteristics for NTN operations.
+#[derive(Debug, Clone, Copy)]
+pub struct OrbitParams {
+    /// Semi-major axis (kilometers)
+    pub semi_major_axis_km: f64,
+    /// Eccentricity (0.0-1.0)
+    pub eccentricity: f64,
+    /// Inclination (degrees)
+    pub inclination_deg: f64,
+    /// Right ascension of ascending node (degrees)
+    pub raan_deg: f64,
+    /// Argument of perigee (degrees)
+    pub arg_perigee_deg: f64,
+    /// Mean anomaly (degrees)
+    pub mean_anomaly_deg: f64,
+}
+
+impl OrbitParams {
+    /// Creates new orbital parameters.
+    pub fn new(semi_major_axis_km: f64, eccentricity: f64, inclination_deg: f64) -> Self {
+        Self {
+            semi_major_axis_km,
+            eccentricity,
+            inclination_deg,
+            raan_deg: 0.0,
+            arg_perigee_deg: 0.0,
+            mean_anomaly_deg: 0.0,
+        }
+    }
+}
+
+impl Default for OrbitParams {
+    fn default() -> Self {
+        // Default to LEO orbit (approx. 550km altitude)
+        Self {
+            semi_major_axis_km: 6371.0 + 550.0,
+            eccentricity: 0.0,
+            inclination_deg: 53.0,
+            raan_deg: 0.0,
+            arg_perigee_deg: 0.0,
+            mean_anomaly_deg: 0.0,
+        }
+    }
+}
+
+/// Timing advance for NTN communications.
+///
+/// Compensates for propagation delay in satellite links.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TimingAdvance {
+    /// Timing advance value (microseconds)
+    pub value_us: u32,
+    /// Whether timing advance is valid
+    pub valid: bool,
+}
+
+impl TimingAdvance {
+    /// Creates a new timing advance.
+    pub const fn new(value_us: u32) -> Self {
+        Self {
+            value_us,
+            valid: true,
+        }
+    }
+
+    /// Returns invalid timing advance.
+    pub const fn invalid() -> Self {
+        Self {
+            value_us: 0,
+            valid: false,
+        }
+    }
+}
+
+// ============================================================================
+// 6G AI/ML Types
+// ============================================================================
+
+/// AI/ML model metadata for network intelligence.
+///
+/// Describes ML models used for network optimization and analytics.
+#[derive(Debug, Clone)]
+pub struct ModelMetadata {
+    /// Model identifier
+    pub model_id: u64,
+    /// Model name
+    pub name: String,
+    /// Model version (major.minor.patch)
+    pub version: (u32, u32, u32),
+    /// Model type (0=classification, 1=regression, 2=clustering, 3=other)
+    pub model_type: u8,
+    /// Input dimension
+    pub input_dim: u32,
+    /// Output dimension
+    pub output_dim: u32,
+}
+
+impl ModelMetadata {
+    /// Creates new model metadata.
+    pub fn new(model_id: u64, name: String, version: (u32, u32, u32)) -> Self {
+        Self {
+            model_id,
+            name,
+            version,
+            model_type: 0,
+            input_dim: 0,
+            output_dim: 0,
+        }
+    }
+}
+
+impl Default for ModelMetadata {
+    fn default() -> Self {
+        Self {
+            model_id: 0,
+            name: String::new(),
+            version: (0, 0, 0),
+            model_type: 0,
+            input_dim: 0,
+            output_dim: 0,
+        }
+    }
+}
+
+/// ML inference request for network functions.
+///
+/// Request for ML inference at network elements.
+#[derive(Debug, Clone)]
+pub struct InferenceRequest {
+    /// Request ID
+    pub request_id: u64,
+    /// Model ID to use
+    pub model_id: u64,
+    /// Input data (serialized)
+    pub input_data: Vec<f32>,
+    /// Timestamp (milliseconds since epoch)
+    pub timestamp_ms: u64,
+}
+
+impl InferenceRequest {
+    /// Creates a new inference request.
+    pub fn new(request_id: u64, model_id: u64, input_data: Vec<f32>) -> Self {
+        Self {
+            request_id,
+            model_id,
+            input_data,
+            timestamp_ms: 0,
+        }
+    }
+}
+
+impl Default for InferenceRequest {
+    fn default() -> Self {
+        Self {
+            request_id: 0,
+            model_id: 0,
+            input_data: Vec::new(),
+            timestamp_ms: 0,
+        }
+    }
+}
+
+/// ML inference response.
+///
+/// Result from ML inference operation.
+#[derive(Debug, Clone)]
+pub struct InferenceResponse {
+    /// Request ID (matches InferenceRequest)
+    pub request_id: u64,
+    /// Output data
+    pub output_data: Vec<f32>,
+    /// Confidence score (0.0-1.0)
+    pub confidence: f32,
+    /// Processing latency (microseconds)
+    pub latency_us: u64,
+}
+
+impl InferenceResponse {
+    /// Creates a new inference response.
+    pub fn new(request_id: u64, output_data: Vec<f32>, confidence: f32) -> Self {
+        Self {
+            request_id,
+            output_data,
+            confidence,
+            latency_us: 0,
+        }
+    }
+}
+
+impl Default for InferenceResponse {
+    fn default() -> Self {
+        Self {
+            request_id: 0,
+            output_data: Vec::new(),
+            confidence: 0.0,
+            latency_us: 0,
+        }
+    }
+}
+
 // Helper module for hex encoding
 mod hex {
     pub fn decode(s: &str) -> Result<Vec<u8>, ()> {
@@ -538,5 +949,109 @@ mod hex {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))
             .collect()
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ISAC tests
+    #[test]
+    fn test_sensing_config_new() {
+        let config = SensingConfig::new(1, 200, 500.0);
+        assert!(config.enabled);
+        assert_eq!(config.mode, 1);
+        assert_eq!(config.bandwidth_mhz, 200);
+        assert_eq!(config.max_range_meters, 500.0);
+    }
+
+    #[test]
+    fn test_sensing_result_new() {
+        let result = SensingResult::new(1000, 5);
+        assert_eq!(result.timestamp_ms, 1000);
+        assert_eq!(result.detection_count, 5);
+    }
+
+    // Semantic communication tests
+    #[test]
+    fn test_semantic_profile_new() {
+        let profile = SemanticProfile::new(1, 3, 0.8);
+        assert_eq!(profile.modality, 1);
+        assert_eq!(profile.compression_level, 3);
+        assert_eq!(profile.importance, 0.8);
+    }
+
+    #[test]
+    fn test_semantic_profile_clamping() {
+        let profile = SemanticProfile::new(0, 0, 1.5);
+        assert_eq!(profile.importance, 1.0);
+    }
+
+    // SHE computing tests
+    #[test]
+    fn test_compute_descriptor_new() {
+        let desc = ComputeDescriptor::new(123, "inference".to_string(), 1000);
+        assert_eq!(desc.task_id, 123);
+        assert_eq!(desc.task_type, "inference");
+        assert_eq!(desc.workload_units, 1000);
+    }
+
+    // NTN tests
+    #[test]
+    fn test_satellite_id_new() {
+        let id = SatelliteId::new(42);
+        assert_eq!(id.value(), 42);
+        assert_eq!(id.to_string(), "sat-0000002a");
+    }
+
+    #[test]
+    fn test_orbit_params_new() {
+        let params = OrbitParams::new(7000.0, 0.001, 45.0);
+        assert_eq!(params.semi_major_axis_km, 7000.0);
+        assert_eq!(params.eccentricity, 0.001);
+        assert_eq!(params.inclination_deg, 45.0);
+    }
+
+    #[test]
+    fn test_timing_advance_new() {
+        let ta = TimingAdvance::new(100);
+        assert_eq!(ta.value_us, 100);
+        assert!(ta.valid);
+    }
+
+    #[test]
+    fn test_timing_advance_invalid() {
+        let ta = TimingAdvance::invalid();
+        assert!(!ta.valid);
+    }
+
+    // AI/ML tests
+    #[test]
+    fn test_model_metadata_new() {
+        let meta = ModelMetadata::new(1, "test_model".to_string(), (1, 2, 3));
+        assert_eq!(meta.model_id, 1);
+        assert_eq!(meta.name, "test_model");
+        assert_eq!(meta.version, (1, 2, 3));
+    }
+
+    #[test]
+    fn test_inference_request_new() {
+        let req = InferenceRequest::new(100, 1, vec![1.0, 2.0, 3.0]);
+        assert_eq!(req.request_id, 100);
+        assert_eq!(req.model_id, 1);
+        assert_eq!(req.input_data.len(), 3);
+    }
+
+    #[test]
+    fn test_inference_response_new() {
+        let resp = InferenceResponse::new(100, vec![0.5, 0.3, 0.2], 0.95);
+        assert_eq!(resp.request_id, 100);
+        assert_eq!(resp.output_data.len(), 3);
+        assert_eq!(resp.confidence, 0.95);
     }
 }

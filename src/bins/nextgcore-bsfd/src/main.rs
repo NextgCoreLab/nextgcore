@@ -24,6 +24,7 @@ mod nbsf_handler;
 mod nnrf_handler;
 mod sbi_path;
 mod sbi_response;
+mod timer;
 
 pub use bsf_sm::{BsfSmContext, BsfState};
 pub use context::*;
@@ -31,6 +32,7 @@ pub use event::{BsfEvent, BsfEventId, BsfTimerId, SbiEventData, SbiMessage, Even
 pub use nbsf_handler::*;
 pub use nnrf_handler::*;
 pub use sbi_path::*;
+pub use timer::{timer_manager, BsfTimerManager};
 
 /// NextGCore BSF - Binding Support Function
 #[derive(Parser, Debug)]
@@ -79,6 +81,10 @@ struct Args {
     #[arg(long)]
     tls_key: Option<String>,
 
+    /// NRF URI (e.g., http://127.0.0.10:7777)
+    #[arg(long)]
+    nrf_uri: Option<String>,
+
     /// Maximum number of sessions
     #[arg(long, default_value = "1024")]
     max_sess: usize,
@@ -110,6 +116,15 @@ async fn main() -> Result<()> {
     bsf_context_init(args.max_sess);
     log::info!("BSF context initialized (max_sess={})", args.max_sess);
 
+    // Load persisted bindings from database (if available)
+    {
+        let ctx = bsf_self();
+        let guard = ctx.read();
+        if let Ok(context) = guard {
+            context.load_persisted_bindings();
+        }
+    }
+
     // Initialize BSF state machine
     let mut bsf_sm = BsfSmContext::new();
     bsf_sm.init();
@@ -137,6 +152,7 @@ async fn main() -> Result<()> {
         tls_enabled: args.tls,
         tls_cert: args.tls_cert.clone(),
         tls_key: args.tls_key.clone(),
+        nrf_uri: args.nrf_uri.clone(),
     };
 
     // Open legacy SBI server (for context initialization)
@@ -272,7 +288,33 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
     };
 
     match sess {
-        Some(sess) => {
+        Some(mut sess) => {
+            // Apply additional fields from request
+            if let Some(supi) = binding_data.get("supi").and_then(|v| v.as_str()) {
+                sess.supi = Some(supi.to_string());
+            }
+            if let Some(gpsi) = binding_data.get("gpsi").and_then(|v| v.as_str()) {
+                sess.gpsi = Some(gpsi.to_string());
+            }
+            if let Some(dnn) = binding_data.get("dnn").and_then(|v| v.as_str()) {
+                sess.dnn = Some(dnn.to_string());
+            }
+            if let Some(pcf_fqdn) = binding_data.get("pcfFqdn").and_then(|v| v.as_str()) {
+                sess.pcf_fqdn = Some(pcf_fqdn.to_string());
+            }
+            if let Some(snssai) = binding_data.get("snssai") {
+                let sst = snssai.get("sst").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                let sd = snssai.get("sd").and_then(|v| v.as_str())
+                    .and_then(|s| u32::from_str_radix(s, 16).ok());
+                sess.s_nssai = context::SNssai::new(sst, sd);
+            }
+
+            // Update session in context and persist to DB
+            if let Ok(context) = ctx.read() {
+                context.sess_update(&sess);
+                context.sess_persist(&sess);
+            }
+
             log::info!("PCF Binding created (id={}, ipv4={:?}, ipv6={:?})",
                 sess.binding_id, ipv4addr, ipv6prefix);
 
@@ -282,11 +324,11 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
                     "pcfBindingId": sess.binding_id,
                     "ipv4Addr": ipv4addr,
                     "ipv6Prefix": ipv6prefix,
-                    "supi": binding_data.get("supi"),
-                    "gpsi": binding_data.get("gpsi"),
-                    "dnn": binding_data.get("dnn"),
+                    "supi": sess.supi,
+                    "gpsi": sess.gpsi,
+                    "dnn": sess.dnn,
                     "snssai": binding_data.get("snssai"),
-                    "pcfFqdn": binding_data.get("pcfFqdn"),
+                    "pcfFqdn": sess.pcf_fqdn,
                     "pcfIpEndPoints": binding_data.get("pcfIpEndPoints"),
                     "suppFeat": "1",
                 }))
@@ -389,6 +431,7 @@ async fn handle_pcf_binding_delete(binding_id: &str) -> SbiResponse {
         Some(id) => {
             if let Ok(context) = ctx.read() {
                 if context.sess_remove(id).is_some() {
+                    context.sess_unpersist(binding_id);
                     log::info!("PCF Binding {} deleted", binding_id);
                     return SbiResponse::with_status(204);
                 }
@@ -402,14 +445,14 @@ async fn handle_pcf_binding_delete(binding_id: &str) -> SbiResponse {
 }
 
 async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("PCF Binding Update: {}", binding_id);
+    log::info!("PCF Binding Update (PATCH): {}", binding_id);
 
     let body = match &request.http.content {
         Some(content) => content,
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
     };
 
-    let _update_data: serde_json::Value = match serde_json::from_str(body) {
+    let update_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
         Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
     };
@@ -422,8 +465,61 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
     };
 
     match sess {
-        Some(sess) => {
-            // For now, just return the existing binding
+        Some(mut sess) => {
+            // Apply patch fields from the request body
+            if let Some(pcf_fqdn) = update_data.get("pcfFqdn").and_then(|v| v.as_str()) {
+                sess.pcf_fqdn = Some(pcf_fqdn.to_string());
+            }
+            if let Some(ipv4) = update_data.get("ipv4Addr").and_then(|v| v.as_str()) {
+                sess.set_ipv4addr(ipv4);
+            }
+            if let Some(ipv6) = update_data.get("ipv6Prefix").and_then(|v| v.as_str()) {
+                sess.set_ipv6prefix(ipv6);
+            }
+            if let Some(supi) = update_data.get("supi").and_then(|v| v.as_str()) {
+                sess.supi = Some(supi.to_string());
+            }
+            if let Some(gpsi) = update_data.get("gpsi").and_then(|v| v.as_str()) {
+                sess.gpsi = Some(gpsi.to_string());
+            }
+            if let Some(dnn) = update_data.get("dnn").and_then(|v| v.as_str()) {
+                sess.dnn = Some(dnn.to_string());
+            }
+            if let Some(snssai) = update_data.get("snssai") {
+                let sst = snssai.get("sst").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                let sd = snssai.get("sd").and_then(|v| v.as_str())
+                    .and_then(|s| u32::from_str_radix(s, 16).ok());
+                sess.s_nssai = context::SNssai::new(sst, sd);
+            }
+            if let Some(routes) = update_data.get("ipv4FrameRouteList").and_then(|v| v.as_array()) {
+                sess.ipv4_frame_route_list = routes.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+            }
+            if let Some(routes) = update_data.get("ipv6FrameRouteList").and_then(|v| v.as_array()) {
+                sess.ipv6_frame_route_list = routes.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+            }
+            if let Some(endpoints) = update_data.get("pcfIpEndPoints").and_then(|v| v.as_array()) {
+                sess.pcf_ip = endpoints.iter().map(|ep| {
+                    context::PcfIpEndpoint {
+                        addr: ep.get("ipv4Address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        addr6: ep.get("ipv6Address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                        is_port: ep.get("port").is_some(),
+                        port: ep.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16,
+                    }
+                }).collect();
+            }
+
+            // Update session in context and persist to DB
+            if let Ok(context) = ctx.read() {
+                context.sess_update(&sess);
+                context.sess_persist(&sess);
+            }
+
+            log::info!("PCF Binding {} updated", binding_id);
+
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({
                     "pcfBindingId": sess.binding_id,
@@ -433,6 +529,10 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
                     "gpsi": sess.gpsi,
                     "dnn": sess.dnn,
                     "pcfFqdn": sess.pcf_fqdn,
+                    "snssai": {
+                        "sst": sess.s_nssai.sst,
+                        "sd": sess.s_nssai.sd_to_string(),
+                    },
                     "suppFeat": "1",
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
@@ -484,17 +584,35 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) -> Result<()> {
 }
 
 /// Async main event loop with timer integration
-async fn run_event_loop_async(_bsf_sm: &mut BsfSmContext, shutdown: Arc<AtomicBool>) -> Result<()> {
+async fn run_event_loop_async(bsf_sm: &mut BsfSmContext, shutdown: Arc<AtomicBool>) -> Result<()> {
     log::debug!("Entering async main event loop");
 
-    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    let timer_mgr = timer_manager();
 
     while !shutdown.load(Ordering::SeqCst) && !SHUTDOWN.load(Ordering::SeqCst) {
-        // Wait for next tick
-        interval.tick().await;
+        // Compute optimal sleep duration based on pending timers
+        let poll_interval = ogs_core::async_timer::compute_poll_interval(
+            timer_mgr.inner(),
+            Duration::from_millis(100),
+        );
+        tokio::time::sleep(poll_interval).await;
 
-        // Process timer expirations
-        // Note: Timer manager integration for NRF heartbeats and subscription validity
+        // Process timer expirations and dispatch to state machine
+        let expired = timer_mgr.process_expired();
+        for entry in &expired {
+            log::debug!(
+                "BSF timer expired: id={} type={:?} data={:?}",
+                entry.id, entry.timer_type, entry.data
+            );
+
+            // Create timer event and dispatch to state machine
+            let mut event = BsfEvent::sbi_timer(entry.timer_type);
+            if let Some(ref nf_id) = entry.data {
+                event = event.with_nf_instance(nf_id.clone());
+            }
+
+            bsf_sm.dispatch(&mut event);
+        }
 
         // Check for shutdown
         if shutdown.load(Ordering::SeqCst) {
@@ -502,6 +620,8 @@ async fn run_event_loop_async(_bsf_sm: &mut BsfSmContext, shutdown: Arc<AtomicBo
         }
     }
 
+    // Cleanup: clear all timers on shutdown
+    timer_mgr.clear();
     log::debug!("Exiting async main event loop");
     Ok(())
 }

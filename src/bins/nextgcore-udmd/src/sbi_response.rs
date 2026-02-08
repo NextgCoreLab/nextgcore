@@ -14,7 +14,7 @@ pub fn send_error_response(stream_id: u64, status: u16, detail: &str) {
         _ => send_bad_request(detail, None),
     };
 
-    log::debug!("Sending error response (stream_id={}, status={}): {}", stream_id, status, detail);
+    log::debug!("Sending error response (stream_id={stream_id}, status={status}): {detail}");
 
     // In a real implementation, this would send the response through the SBI server
     // For now, we just log it as the SBI server infrastructure handles the actual sending
@@ -25,7 +25,7 @@ pub fn send_error_response(stream_id: u64, status: u16, detail: &str) {
 pub fn send_method_not_allowed_response(stream_id: u64, method: &str, resource: &str) {
     let response = send_method_not_allowed(method, resource);
 
-    log::debug!("Sending 405 Method Not Allowed (stream_id={}): {} {}", stream_id, method, resource);
+    log::debug!("Sending 405 Method Not Allowed (stream_id={stream_id}): {method} {resource}");
 
     crate::sbi_path::send_sbi_response(stream_id, response);
 }

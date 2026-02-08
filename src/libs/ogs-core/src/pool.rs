@@ -445,8 +445,8 @@ mod tests {
         let (id1, _idx1) = pool.alloc().unwrap();
         let (id2, _idx2) = pool.alloc().unwrap();
         
-        assert!(id1 >= OGS_MIN_POOL_ID && id1 <= OGS_MAX_POOL_ID);
-        assert!(id2 >= OGS_MIN_POOL_ID && id2 <= OGS_MAX_POOL_ID);
+        assert!((OGS_MIN_POOL_ID..=OGS_MAX_POOL_ID).contains(&id1));
+        assert!((OGS_MIN_POOL_ID..=OGS_MAX_POOL_ID).contains(&id2));
         assert_ne!(id1, id2);
         
         // Find by ID
@@ -691,7 +691,7 @@ mod tests {
                 }
                 
                 // Verify all lookups
-                for (id, _idx) in &id_to_idx {
+                for id in id_to_idx.keys() {
                     let item = pool.find_by_id(*id);
                     prop_assert!(item.is_some(), "Should find item by ID {}", id);
                     prop_assert_eq!(item.unwrap().id(), *id, "Item ID should match lookup ID");

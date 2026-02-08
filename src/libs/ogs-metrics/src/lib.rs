@@ -8,12 +8,14 @@ pub mod server;
 pub mod spec;
 pub mod instance;
 pub mod types;
+pub mod otel;
 
 pub use context::*;
 pub use server::*;
 pub use spec::*;
 pub use instance::*;
 pub use types::*;
+pub use otel::*;
 
 /// Default Prometheus HTTP port
 pub const DEFAULT_PROMETHEUS_HTTP_PORT: u16 = 9090;

@@ -51,6 +51,15 @@ pub mod server;
 #[cfg(feature = "sctp-proto")]
 pub use server::{SctpServer, SctpServerConfig, ServerError, ServerEvent};
 
+// QUIC transport option (B13.3 - 6G forward-looking)
+pub mod quic;
+
+pub use quic::{
+    QuicTransport, QuicServer, QuicConfig, TlsConfig as QuicTlsConfig,
+    QuicConnectionState, QuicError, QuicResult, StreamMessage,
+    CongestionController, QuicStats,
+};
+
 // ============================================================================
 // Constants (matching 3GPP specifications)
 // ============================================================================
@@ -324,7 +333,7 @@ mod sctp_proto_impl {
             // Initiate connection
             let (handle, association) = endpoint
                 .connect(client_config, remote_addr)
-                .map_err(|e| SctpError::ConnectFailed(io::Error::new(io::ErrorKind::Other, e.to_string())))?;
+                .map_err(|e| SctpError::ConnectFailed(io::Error::other(e.to_string())))?;
 
             let socket = Arc::new(socket);
             let mut assoc = Self {
@@ -591,10 +600,7 @@ mod sctp_proto_impl {
             // Wait for shutdown to complete with timeout
             let deadline = Instant::now() + Duration::from_secs(5);
             while self.state == AssociationState::ShuttingDown && Instant::now() < deadline {
-                match timeout(Duration::from_millis(100), self.handle_incoming()).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_)) | Err(_) => {}
-                }
+                if let Ok(Ok(())) = timeout(Duration::from_millis(100), self.handle_incoming()).await {}
                 self.poll_events();
                 self.flush_transmits().await?;
 
@@ -996,12 +1002,12 @@ mod tests {
     #[test]
     fn test_error_display() {
         let err = SctpError::NotConnected;
-        assert_eq!(format!("{}", err), "Association not established");
+        assert_eq!(format!("{err}"), "Association not established");
     }
 
     #[test]
     fn test_error_socket_creation() {
-        let err = SctpError::SocketCreation(io::Error::new(io::ErrorKind::Other, "test"));
+        let err = SctpError::SocketCreation(io::Error::other("test"));
         assert!(err.to_string().contains("Socket creation failed"));
     }
 
@@ -1019,7 +1025,7 @@ mod tests {
 
     #[test]
     fn test_error_listen_failed() {
-        let err = SctpError::ListenFailed(io::Error::new(io::ErrorKind::Other, "test"));
+        let err = SctpError::ListenFailed(io::Error::other("test"));
         assert!(err.to_string().contains("Listen failed"));
     }
 

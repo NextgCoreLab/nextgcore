@@ -9,8 +9,10 @@ use std::sync::{Arc, RwLock};
 
 /// Authentication type (from OpenAPI)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum AuthType {
     /// 5G AKA authentication
+    #[default]
     FiveGAka,
     /// EAP-AKA' authentication
     EapAkaPrime,
@@ -18,28 +20,20 @@ pub enum AuthType {
     EapTls,
 }
 
-impl Default for AuthType {
-    fn default() -> Self {
-        AuthType::FiveGAka
-    }
-}
 
 /// Authentication result (from OpenAPI)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum AuthResult {
     /// Authentication success
     AuthenticationSuccess,
     /// Authentication failure
     AuthenticationFailure,
     /// Authentication ongoing
+    #[default]
     AuthenticationOngoing,
 }
 
-impl Default for AuthResult {
-    fn default() -> Self {
-        AuthResult::AuthenticationOngoing
-    }
-}
 
 /// Authentication event data
 #[derive(Debug, Clone, Default)]
@@ -96,6 +90,10 @@ pub struct AusfUe {
     pub kausf: [u8; 32],
     /// KSEAF value (32 bytes)
     pub kseaf: [u8; 32],
+    /// AUTN value (16 bytes)
+    pub autn: [u8; 16],
+    /// RES* hex string from confirmation data
+    pub res_star_hex: Option<String>,
     /// Associated stream ID
     pub stream_id: Option<u64>,
 }
@@ -117,6 +115,8 @@ impl AusfUe {
             hxres_star: [0u8; 16],
             kausf: [0u8; 32],
             kseaf: [0u8; 32],
+            autn: [0u8; 16],
+            res_star_hex: None,
             stream_id: None,
         }
     }
@@ -219,7 +219,7 @@ impl AusfContext {
         suci_hash.insert(suci.to_string(), id);
         ue_list.insert(id, ue.clone());
 
-        log::debug!("[{}] AUSF UE added (id={})", suci, id);
+        log::debug!("[{suci}] AUSF UE added (id={id})");
         Some(ue)
     }
 

@@ -329,6 +329,590 @@ pub struct EmmStatus {
     pub emm_cause: u8,
 }
 
+impl AttachComplete {
+    /// Encode to bytes
+    pub fn encode(&self, buf: &mut BytesMut) {
+        self.esm_message_container.encode(buf);
+    }
+
+    /// Decode from bytes
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        let esm_message_container = EsmMessageContainer::decode(buf)?;
+        Ok(Self { esm_message_container })
+    }
+}
+
+impl AttachReject {
+    /// Encode to bytes
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.emm_cause);
+        if let Some(ref esm) = self.esm_message_container {
+            buf.put_u8(0x78); // IEI
+            esm.encode(buf);
+        }
+        if let Some(ref t3346) = self.t3346_value {
+            buf.put_u8(0x5F); // IEI
+            t3346.encode(buf);
+        }
+        if let Some(ref t3402) = self.t3402_value {
+            buf.put_u8(0x16); // IEI
+            t3402.encode(buf);
+        }
+    }
+
+    /// Decode from bytes
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let emm_cause = buf.get_u8();
+        let mut msg = Self {
+            emm_cause,
+            ..Default::default()
+        };
+
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            match iei {
+                0x78 => {
+                    buf.advance(1);
+                    msg.esm_message_container = Some(EsmMessageContainer::decode(buf)?);
+                }
+                0x5F => {
+                    buf.advance(1);
+                    msg.t3346_value = Some(GprsTimer2::decode(buf)?);
+                }
+                0x16 => {
+                    buf.advance(1);
+                    msg.t3402_value = Some(GprsTimer2::decode(buf)?);
+                }
+                _ => break,
+            }
+        }
+
+        Ok(msg)
+    }
+}
+
+impl DetachRequest {
+    /// Encode to bytes
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8((self.nas_key_set_identifier.encode() << 4) | (self.detach_type & 0x07));
+        self.eps_mobile_identity.encode(buf);
+    }
+
+    /// Decode from bytes
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let first_byte = buf.get_u8();
+        let detach_type = first_byte & 0x0F;
+        let nas_key_set_identifier = KeySetIdentifier::decode((first_byte >> 4) & 0x0F);
+        let eps_mobile_identity = EpsMobileIdentity::decode(buf)?;
+        Ok(Self {
+            detach_type,
+            nas_key_set_identifier,
+            eps_mobile_identity,
+        })
+    }
+}
+
+impl TrackingAreaUpdateRequest {
+    /// Encode to bytes
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8((self.nas_key_set_identifier.encode() << 4) | (self.eps_update_type & 0x0F));
+        self.old_guti.encode(buf);
+    }
+
+    /// Decode from bytes
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let first_byte = buf.get_u8();
+        let eps_update_type = first_byte & 0x0F;
+        let nas_key_set_identifier = KeySetIdentifier::decode((first_byte >> 4) & 0x0F);
+        let old_guti = EpsMobileIdentity::decode(buf)?;
+        Ok(Self {
+            eps_update_type,
+            nas_key_set_identifier,
+            old_guti,
+            ..Default::default()
+        })
+    }
+}
+
+impl TrackingAreaUpdateAccept {
+    /// Encode to bytes
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.eps_update_result & 0x07);
+        // Optional IEs
+        if let Some(t3412) = self.t3412_value {
+            buf.put_u8(0x5A); // IEI
+            buf.put_u8(t3412.encode());
+        }
+        if let Some(ref guti) = self.guti {
+            buf.put_u8(0x50); // IEI
+            guti.encode(buf);
+        }
+        if let Some(ref tai_list) = self.tai_list {
+            buf.put_u8(0x54); // IEI
+            tai_list.encode(buf);
+        }
+    }
+
+    /// Decode from bytes
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let eps_update_result = buf.get_u8() & 0x07;
+        let mut msg = Self {
+            eps_update_result,
+            ..Default::default()
+        };
+
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            match iei {
+                0x5A => {
+                    buf.advance(1);
+                    if buf.remaining() >= 1 {
+                        msg.t3412_value = Some(GprsTimer::decode(buf.get_u8()));
+                    }
+                }
+                0x50 => {
+                    buf.advance(1);
+                    msg.guti = Some(EpsMobileIdentity::decode(buf)?);
+                }
+                0x54 => {
+                    buf.advance(1);
+                    msg.tai_list = Some(EpsTaiList::decode(buf)?);
+                }
+                _ => break,
+            }
+        }
+
+        Ok(msg)
+    }
+}
+
+impl TrackingAreaUpdateReject {
+    /// Encode to bytes
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.emm_cause);
+    }
+
+    /// Decode from bytes
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        Ok(Self {
+            emm_cause: buf.get_u8(),
+        })
+    }
+}
+
+impl EpsAuthenticationRequest {
+    /// Encode to bytes
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.nas_key_set_identifier.encode());
+        // Spare half octet
+        buf.put_slice(&self.rand);
+        // AUTN with length
+        buf.put_u8(16);
+        buf.put_slice(&self.autn);
+    }
+
+    /// Decode from bytes
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 34 {
+            return Err(NasError::BufferTooShort { expected: 34, actual: buf.remaining() });
+        }
+        let nas_key_set_identifier = KeySetIdentifier::decode(buf.get_u8() & 0x0F);
+        let mut rand = [0u8; 16];
+        buf.copy_to_slice(&mut rand);
+        let _autn_len = buf.get_u8();
+        let mut autn = [0u8; 16];
+        buf.copy_to_slice(&mut autn);
+        Ok(Self {
+            nas_key_set_identifier,
+            rand,
+            autn,
+        })
+    }
+}
+
+impl EpsAuthenticationResponse {
+    /// Encode to bytes
+    pub fn encode(&self, buf: &mut BytesMut) {
+        self.authentication_response_parameter.encode(buf);
+    }
+
+    /// Decode from bytes
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        let authentication_response_parameter = AuthenticationResponseParameter::decode(buf)?;
+        Ok(Self {
+            authentication_response_parameter,
+        })
+    }
+}
+
+impl EpsAuthenticationFailure {
+    /// Encode to bytes
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.emm_cause);
+        if let Some(ref param) = self.authentication_failure_parameter {
+            buf.put_u8(0x30); // IEI
+            buf.put_u8(param.len() as u8);
+            buf.put_slice(param);
+        }
+    }
+
+    /// Decode from bytes
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let emm_cause = buf.get_u8();
+        let mut msg = Self {
+            emm_cause,
+            ..Default::default()
+        };
+
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            match iei {
+                0x30 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 1 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len {
+                            msg.authentication_failure_parameter = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        Ok(msg)
+    }
+}
+
+impl EpsSecurityModeCommand {
+    /// Encode to bytes
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.selected_nas_security_algorithms.encode());
+        buf.put_u8(self.nas_key_set_identifier.encode());
+        self.replayed_ue_security_capabilities.encode(buf);
+        // Optional IEs
+        if let Some(imeisv_req) = self.imeisv_request {
+            buf.put_u8(0xC0 | (imeisv_req & 0x0F)); // Type 1 IE
+        }
+        if let Some(ref nonce) = self.replayed_nonce_ue {
+            buf.put_u8(0x55); // IEI
+            buf.put_u8(4); // Length
+            buf.put_slice(nonce);
+        }
+        if let Some(ref nonce) = self.nonce_mme {
+            buf.put_u8(0x56); // IEI
+            buf.put_u8(4); // Length
+            buf.put_slice(nonce);
+        }
+    }
+
+    /// Decode from bytes
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 3 {
+            return Err(NasError::BufferTooShort { expected: 3, actual: buf.remaining() });
+        }
+        let selected_nas_security_algorithms = SecurityAlgorithms::decode(buf.get_u8());
+        let nas_key_set_identifier = KeySetIdentifier::decode(buf.get_u8() & 0x0F);
+        let replayed_ue_security_capabilities = UeNetworkCapability::decode(buf)?;
+
+        let mut msg = Self {
+            selected_nas_security_algorithms,
+            nas_key_set_identifier,
+            replayed_ue_security_capabilities,
+            ..Default::default()
+        };
+
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            match iei {
+                0xC0..=0xCF => {
+                    msg.imeisv_request = Some(buf.get_u8() & 0x0F);
+                }
+                0x55 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 5 {
+                        let _len = buf.get_u8();
+                        let mut nonce = [0u8; 4];
+                        buf.copy_to_slice(&mut nonce);
+                        msg.replayed_nonce_ue = Some(nonce);
+                    }
+                }
+                0x56 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 5 {
+                        let _len = buf.get_u8();
+                        let mut nonce = [0u8; 4];
+                        buf.copy_to_slice(&mut nonce);
+                        msg.nonce_mme = Some(nonce);
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        Ok(msg)
+    }
+}
+
+impl EpsSecurityModeComplete {
+    /// Encode to bytes
+    pub fn encode(&self, buf: &mut BytesMut) {
+        if let Some(ref imeisv) = self.imeisv {
+            buf.put_u8(0x23); // IEI
+            buf.put_u8(imeisv.len() as u8);
+            buf.put_slice(imeisv);
+        }
+    }
+
+    /// Decode from bytes
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        let mut msg = Self::default();
+
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            match iei {
+                0x23 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 1 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len {
+                            msg.imeisv = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+
+        Ok(msg)
+    }
+}
+
+impl EpsSecurityModeReject {
+    /// Encode to bytes
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.emm_cause);
+    }
+
+    /// Decode from bytes
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        Ok(Self {
+            emm_cause: buf.get_u8(),
+        })
+    }
+}
+
+impl EpsIdentityRequest {
+    /// Encode to bytes
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.identity_type & 0x07);
+    }
+
+    /// Decode from bytes
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        Ok(Self {
+            identity_type: buf.get_u8() & 0x07,
+        })
+    }
+}
+
+impl EpsIdentityResponse {
+    /// Encode to bytes
+    pub fn encode(&self, buf: &mut BytesMut) {
+        self.mobile_identity.encode(buf);
+    }
+
+    /// Decode from bytes
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        let mobile_identity = EpsMobileIdentity::decode(buf)?;
+        Ok(Self { mobile_identity })
+    }
+}
+
+impl EmmStatus {
+    /// Encode to bytes
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.emm_cause);
+    }
+
+    /// Decode from bytes
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        Ok(Self {
+            emm_cause: buf.get_u8(),
+        })
+    }
+}
+
+/// ESM message
+#[derive(Debug, Clone, PartialEq)]
+pub enum EsmMessage {
+    ActivateDefaultEpsBearerContextRequest(ActivateDefaultEpsBearerContextRequest),
+    ActivateDefaultEpsBearerContextAccept,
+    ActivateDefaultEpsBearerContextReject(ActivateDefaultEpsBearerContextReject),
+    PdnConnectivityRequest(PdnConnectivityRequest),
+    PdnConnectivityReject(PdnConnectivityReject),
+    PdnDisconnectRequest(PdnDisconnectRequest),
+    PdnDisconnectReject(PdnDisconnectReject),
+    BearerResourceAllocationRequest(BearerResourceAllocationRequest),
+    BearerResourceAllocationReject(BearerResourceAllocationReject),
+    BearerResourceModificationRequest(BearerResourceModificationRequest),
+    BearerResourceModificationReject(BearerResourceModificationReject),
+    EsmInformationRequest,
+    EsmInformationResponse(EsmInformationResponse),
+    EsmStatus(EsmStatus),
+}
+
+/// PDN Connectivity Request message
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PdnConnectivityRequest {
+    /// Request type
+    pub request_type: u8,
+    /// PDN type
+    pub pdn_type: u8,
+    /// EPS bearer identity
+    pub eps_bearer_identity: u8,
+    /// Procedure transaction identity
+    pub pti: u8,
+}
+
+/// PDN Connectivity Reject message
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PdnConnectivityReject {
+    /// ESM cause
+    pub esm_cause: u8,
+    /// Procedure transaction identity
+    pub pti: u8,
+}
+
+/// PDN Disconnect Request message
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PdnDisconnectRequest {
+    /// Linked EPS bearer identity
+    pub linked_eps_bearer_identity: u8,
+    /// Procedure transaction identity
+    pub pti: u8,
+}
+
+/// PDN Disconnect Reject message
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PdnDisconnectReject {
+    /// ESM cause
+    pub esm_cause: u8,
+    /// Procedure transaction identity
+    pub pti: u8,
+}
+
+/// Activate Default EPS Bearer Context Request message
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ActivateDefaultEpsBearerContextRequest {
+    /// EPS QoS
+    pub eps_qos: Vec<u8>,
+    /// Access Point Name
+    pub access_point_name: Vec<u8>,
+    /// PDN address
+    pub pdn_address: Vec<u8>,
+    /// Procedure transaction identity
+    pub pti: u8,
+}
+
+/// Activate Default EPS Bearer Context Reject message
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ActivateDefaultEpsBearerContextReject {
+    /// ESM cause
+    pub esm_cause: u8,
+    /// Procedure transaction identity
+    pub pti: u8,
+}
+
+/// Bearer Resource Allocation Request message
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BearerResourceAllocationRequest {
+    /// Linked EPS bearer identity
+    pub linked_eps_bearer_identity: u8,
+    /// Traffic flow aggregate
+    pub traffic_flow_aggregate: Vec<u8>,
+    /// Required traffic flow QoS
+    pub required_traffic_flow_qos: Vec<u8>,
+    /// Procedure transaction identity
+    pub pti: u8,
+}
+
+/// Bearer Resource Allocation Reject message
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BearerResourceAllocationReject {
+    /// ESM cause
+    pub esm_cause: u8,
+    /// Procedure transaction identity
+    pub pti: u8,
+}
+
+/// Bearer Resource Modification Request message
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BearerResourceModificationRequest {
+    /// EPS bearer identity for packet filter
+    pub eps_bearer_identity: u8,
+    /// Traffic flow aggregate
+    pub traffic_flow_aggregate: Vec<u8>,
+    /// Procedure transaction identity
+    pub pti: u8,
+}
+
+/// Bearer Resource Modification Reject message
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BearerResourceModificationReject {
+    /// ESM cause
+    pub esm_cause: u8,
+    /// Procedure transaction identity
+    pub pti: u8,
+}
+
+/// ESM Information Response message
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EsmInformationResponse {
+    /// Access Point Name
+    pub access_point_name: Option<Vec<u8>>,
+    /// Protocol configuration options
+    pub protocol_configuration_options: Option<Vec<u8>>,
+    /// Procedure transaction identity
+    pub pti: u8,
+}
+
+/// ESM Status message
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EsmStatus {
+    /// ESM cause
+    pub esm_cause: u8,
+    /// Procedure transaction identity
+    pub pti: u8,
+}
+
 /// Build an EMM message with header
 pub fn build_emm_message(msg: &EmmMessage) -> BytesMut {
     let mut buf = BytesMut::new();
@@ -363,7 +947,23 @@ pub fn build_emm_message(msg: &EmmMessage) -> BytesMut {
     match msg {
         EmmMessage::AttachRequest(m) => m.encode(&mut buf),
         EmmMessage::AttachAccept(m) => m.encode(&mut buf),
-        _ => {} // Other messages would be encoded here
+        EmmMessage::AttachComplete(m) => m.encode(&mut buf),
+        EmmMessage::AttachReject(m) => m.encode(&mut buf),
+        EmmMessage::DetachRequest(m) => m.encode(&mut buf),
+        EmmMessage::DetachAccept => {},
+        EmmMessage::TrackingAreaUpdateRequest(m) => m.encode(&mut buf),
+        EmmMessage::TrackingAreaUpdateAccept(m) => m.encode(&mut buf),
+        EmmMessage::TrackingAreaUpdateReject(m) => m.encode(&mut buf),
+        EmmMessage::AuthenticationRequest(m) => m.encode(&mut buf),
+        EmmMessage::AuthenticationResponse(m) => m.encode(&mut buf),
+        EmmMessage::AuthenticationReject => {},
+        EmmMessage::AuthenticationFailure(m) => m.encode(&mut buf),
+        EmmMessage::SecurityModeCommand(m) => m.encode(&mut buf),
+        EmmMessage::SecurityModeComplete(m) => m.encode(&mut buf),
+        EmmMessage::SecurityModeReject(m) => m.encode(&mut buf),
+        EmmMessage::IdentityRequest(m) => m.encode(&mut buf),
+        EmmMessage::IdentityResponse(m) => m.encode(&mut buf),
+        EmmMessage::EmmStatus(m) => m.encode(&mut buf),
     }
 
     buf
@@ -380,6 +980,57 @@ pub fn parse_emm_message(buf: &mut Bytes) -> NasResult<EmmMessage> {
         }
         EmmMessageType::AttachAccept => {
             Ok(EmmMessage::AttachAccept(AttachAccept::decode(buf)?))
+        }
+        EmmMessageType::AttachComplete => {
+            Ok(EmmMessage::AttachComplete(AttachComplete::decode(buf)?))
+        }
+        EmmMessageType::AttachReject => {
+            Ok(EmmMessage::AttachReject(AttachReject::decode(buf)?))
+        }
+        EmmMessageType::DetachRequest => {
+            Ok(EmmMessage::DetachRequest(DetachRequest::decode(buf)?))
+        }
+        EmmMessageType::DetachAccept => {
+            Ok(EmmMessage::DetachAccept)
+        }
+        EmmMessageType::TrackingAreaUpdateRequest => {
+            Ok(EmmMessage::TrackingAreaUpdateRequest(TrackingAreaUpdateRequest::decode(buf)?))
+        }
+        EmmMessageType::TrackingAreaUpdateAccept => {
+            Ok(EmmMessage::TrackingAreaUpdateAccept(TrackingAreaUpdateAccept::decode(buf)?))
+        }
+        EmmMessageType::TrackingAreaUpdateReject => {
+            Ok(EmmMessage::TrackingAreaUpdateReject(TrackingAreaUpdateReject::decode(buf)?))
+        }
+        EmmMessageType::AuthenticationRequest => {
+            Ok(EmmMessage::AuthenticationRequest(EpsAuthenticationRequest::decode(buf)?))
+        }
+        EmmMessageType::AuthenticationResponse => {
+            Ok(EmmMessage::AuthenticationResponse(EpsAuthenticationResponse::decode(buf)?))
+        }
+        EmmMessageType::AuthenticationReject => {
+            Ok(EmmMessage::AuthenticationReject)
+        }
+        EmmMessageType::AuthenticationFailure => {
+            Ok(EmmMessage::AuthenticationFailure(EpsAuthenticationFailure::decode(buf)?))
+        }
+        EmmMessageType::SecurityModeCommand => {
+            Ok(EmmMessage::SecurityModeCommand(EpsSecurityModeCommand::decode(buf)?))
+        }
+        EmmMessageType::SecurityModeComplete => {
+            Ok(EmmMessage::SecurityModeComplete(EpsSecurityModeComplete::decode(buf)?))
+        }
+        EmmMessageType::SecurityModeReject => {
+            Ok(EmmMessage::SecurityModeReject(EpsSecurityModeReject::decode(buf)?))
+        }
+        EmmMessageType::IdentityRequest => {
+            Ok(EmmMessage::IdentityRequest(EpsIdentityRequest::decode(buf)?))
+        }
+        EmmMessageType::IdentityResponse => {
+            Ok(EmmMessage::IdentityResponse(EpsIdentityResponse::decode(buf)?))
+        }
+        EmmMessageType::EmmStatus => {
+            Ok(EmmMessage::EmmStatus(EmmStatus::decode(buf)?))
         }
         _ => Err(NasError::InvalidMessageType(header.message_type)),
     }

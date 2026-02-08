@@ -9,6 +9,9 @@ use crate::context::{
 };
 use crate::nudr_handler::UdmSbiState;
 
+use ogs_crypt::kdf;
+use ogs_crypt::milenage::OGS_AUTS_LEN;
+
 /// HTTP status codes
 pub mod http_status {
     pub const OK: u16 = 200;
@@ -172,7 +175,7 @@ pub fn udm_nudm_ueau_handle_get(
     let mut udm_ue = match context.ue_find_by_id(udm_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("UDM UE not found [{}]", udm_ue_id);
+            log::error!("UDM UE not found [{udm_ue_id}]");
             return (HandlerResult::bad_request("UDM UE not found"), None);
         }
     };
@@ -227,25 +230,54 @@ pub fn udm_nudm_ueau_handle_get(
         };
 
         // Convert hex strings to bytes
-        let rand = hex_to_bytes(rand_str);
-        let _auts = hex_to_bytes(auts_str);
+        let rand_bytes = hex_to_bytes(rand_str);
+        let auts_bytes = hex_to_bytes(auts_str);
 
-        if rand.len() != OGS_RAND_LEN {
+        if rand_bytes.len() != OGS_RAND_LEN {
             log::error!("[{}] Invalid RAND length", udm_ue.suci);
             return (HandlerResult::bad_request("Invalid RAND"), None);
         }
 
         // Compare RAND with stored value
-        if rand != udm_ue.rand {
+        if rand_bytes != udm_ue.rand {
             log::error!("[{}] Invalid RAND", udm_ue.suci);
             return (HandlerResult::bad_request("Invalid RAND"), None);
         }
 
-        // Perform SQN resynchronization
-        // Note: In production, ogs_auc_sqn() derives sqn_ms and mac_s from AUTS
-        // SQN updated based on computed sqn_ms to prevent replay attacks
-        let sqn = buffer_to_u64(&udm_ue.sqn);
-        let new_sqn = (sqn + 32 + 1) & 0xFFFFFFFFFFFF; // OGS_MAX_SQN
+        if auts_bytes.len() != OGS_AUTS_LEN {
+            log::error!("[{}] Invalid AUTS length", udm_ue.suci);
+            return (HandlerResult::bad_request("Invalid AUTS"), None);
+        }
+
+        // Extract concealed SQN_MS from AUTS (first 6 bytes)
+        let mut conc_sqn_ms = [0u8; OGS_SQN_LEN];
+        conc_sqn_ms.copy_from_slice(&auts_bytes[..OGS_SQN_LEN]);
+
+        // Use ogs_auc_sqn() to derive SQN_MS and MAC-S from AUTS
+        // This verifies the AUTS by recomputing MAC-S with f1* and comparing
+        let rand_arr: &[u8; OGS_RAND_LEN] = rand_bytes.as_slice().try_into().unwrap();
+        let (sqn_ms, mac_s) = match kdf::ogs_auc_sqn(
+            &udm_ue.opc,
+            &udm_ue.k,
+            rand_arr,
+            &conc_sqn_ms,
+        ) {
+            Ok(result) => result,
+            Err(e) => {
+                log::error!("[{}] SQN extraction failed: {:?}", udm_ue.suci, e);
+                return (HandlerResult::bad_request("SQN extraction failed"), None);
+            }
+        };
+
+        // Verify MAC-S matches the MAC-S in AUTS (bytes 6..14)
+        if mac_s != auts_bytes[OGS_SQN_LEN..OGS_AUTS_LEN] {
+            log::error!("[{}] AUTS MAC-S verification failed", udm_ue.suci);
+            return (HandlerResult::bad_request("AUTS verification failed"), None);
+        }
+
+        // Set new SQN = SQN_MS + 1 (prevents replay)
+        let sqn_ms_val = buffer_to_u64(&sqn_ms);
+        let new_sqn = (sqn_ms_val + 1) & 0xFFFFFFFFFFFF;
         let mut new_sqn_bytes = [0u8; OGS_SQN_LEN];
         u64_to_buffer(new_sqn, &mut new_sqn_bytes);
 
@@ -258,7 +290,7 @@ pub fn udm_nudm_ueau_handle_get(
         }
         drop(context);
 
-        log::debug!("[{}] SQN resynchronization completed", udm_ue.suci);
+        log::debug!("[{}] SQN resynchronization completed (new SQN=0x{:012x})", udm_ue.suci, new_sqn);
     }
 
     // Send request to UDR for authentication subscription
@@ -279,7 +311,7 @@ pub fn udm_nudm_ueau_handle_result_confirmation_inform(
     let mut udm_ue = match context.ue_find_by_id(udm_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("UDM UE not found [{}]", udm_ue_id);
+            log::error!("UDM UE not found [{udm_ue_id}]");
             return HandlerResult::bad_request("UDM UE not found");
         }
     };
@@ -371,20 +403,20 @@ pub fn udm_nudm_uecm_handle_amf_registration(
     let mut udm_ue = match context.ue_find_by_id(udm_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("UDM UE not found [{}]", udm_ue_id);
+            log::error!("UDM UE not found [{udm_ue_id}]");
             return HandlerResult::bad_request("UDM UE not found");
         }
     };
     drop(context);
 
     let supi = udm_ue.supi.clone().unwrap_or_else(|| udm_ue.suci.clone());
-    log::debug!("[{}] Handle NUDM UECM AMF registration", supi);
+    log::debug!("[{supi}] Handle NUDM UECM AMF registration");
 
     // Validate Amf3GppAccessRegistration
     let amf_instance_id = match &request.amf_instance_id {
         Some(id) if !id.is_empty() => id.clone(),
         _ => {
-            log::error!("[{}] No amfInstanceId", supi);
+            log::error!("[{supi}] No amfInstanceId");
             return HandlerResult::bad_request("No amfInstanceId");
         }
     };
@@ -392,7 +424,7 @@ pub fn udm_nudm_uecm_handle_amf_registration(
     let dereg_callback_uri = match &request.dereg_callback_uri {
         Some(uri) if !uri.is_empty() => uri.clone(),
         _ => {
-            log::error!("[{}] No dregCallbackUri", supi);
+            log::error!("[{supi}] No dregCallbackUri");
             return HandlerResult::bad_request("No dregCallbackUri");
         }
     };
@@ -401,7 +433,7 @@ pub fn udm_nudm_uecm_handle_amf_registration(
     let guami_req = match &request.guami {
         Some(g) => g,
         None => {
-            log::error!("[{}] No Guami", supi);
+            log::error!("[{supi}] No Guami");
             return HandlerResult::bad_request("No Guami");
         }
     };
@@ -409,7 +441,7 @@ pub fn udm_nudm_uecm_handle_amf_registration(
     let amf_id = match &guami_req.amf_id {
         Some(id) if !id.is_empty() => id.clone(),
         _ => {
-            log::error!("[{}] No Guami.AmfId", supi);
+            log::error!("[{supi}] No Guami.AmfId");
             return HandlerResult::bad_request("No Guami.AmfId");
         }
     };
@@ -417,7 +449,7 @@ pub fn udm_nudm_uecm_handle_amf_registration(
     let plmn_id_req = match &guami_req.plmn_id {
         Some(p) => p,
         None => {
-            log::error!("[{}] No PlmnId", supi);
+            log::error!("[{supi}] No PlmnId");
             return HandlerResult::bad_request("No PlmnId");
         }
     };
@@ -425,7 +457,7 @@ pub fn udm_nudm_uecm_handle_amf_registration(
     let mcc = match &plmn_id_req.mcc {
         Some(m) if !m.is_empty() => m.clone(),
         _ => {
-            log::error!("[{}] No PlmnId.Mcc", supi);
+            log::error!("[{supi}] No PlmnId.Mcc");
             return HandlerResult::bad_request("No PlmnId.Mcc");
         }
     };
@@ -433,14 +465,14 @@ pub fn udm_nudm_uecm_handle_amf_registration(
     let mnc = match &plmn_id_req.mnc {
         Some(m) if !m.is_empty() => m.clone(),
         _ => {
-            log::error!("[{}] No PlmnId.Mnc", supi);
+            log::error!("[{supi}] No PlmnId.Mnc");
             return HandlerResult::bad_request("No PlmnId.Mnc");
         }
     };
 
     // Validate RAT type
     if request.rat_type.is_none() {
-        log::error!("[{}] No RatType", supi);
+        log::error!("[{supi}] No RatType");
         return HandlerResult::bad_request("No RatType");
     }
 
@@ -496,20 +528,20 @@ pub fn udm_nudm_uecm_handle_amf_registration_update(
     let udm_ue = match context.ue_find_by_id(udm_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("UDM UE not found [{}]", udm_ue_id);
+            log::error!("UDM UE not found [{udm_ue_id}]");
             return HandlerResult::bad_request("UDM UE not found");
         }
     };
     drop(context);
 
     let supi = udm_ue.supi.clone().unwrap_or_else(|| udm_ue.suci.clone());
-    log::debug!("[{}] Handle NUDM UECM AMF registration update", supi);
+    log::debug!("[{supi}] Handle NUDM UECM AMF registration update");
 
     // Validate GUAMI
     let guami_req = match &request.guami {
         Some(g) => g,
         None => {
-            log::error!("[{}] No Guami", supi);
+            log::error!("[{supi}] No Guami");
             return HandlerResult::bad_request("No Guami");
         }
     };
@@ -517,7 +549,7 @@ pub fn udm_nudm_uecm_handle_amf_registration_update(
     let amf_id = match &guami_req.amf_id {
         Some(id) if !id.is_empty() => id.clone(),
         _ => {
-            log::error!("[{}] No Guami.AmfId", supi);
+            log::error!("[{supi}] No Guami.AmfId");
             return HandlerResult::bad_request("No Guami.AmfId");
         }
     };
@@ -525,7 +557,7 @@ pub fn udm_nudm_uecm_handle_amf_registration_update(
     let plmn_id_req = match &guami_req.plmn_id {
         Some(p) => p,
         None => {
-            log::error!("[{}] No PlmnId", supi);
+            log::error!("[{supi}] No PlmnId");
             return HandlerResult::bad_request("No PlmnId");
         }
     };
@@ -533,7 +565,7 @@ pub fn udm_nudm_uecm_handle_amf_registration_update(
     let mcc = match &plmn_id_req.mcc {
         Some(m) if !m.is_empty() => m.clone(),
         _ => {
-            log::error!("[{}] No PlmnId.Mcc", supi);
+            log::error!("[{supi}] No PlmnId.Mcc");
             return HandlerResult::bad_request("No PlmnId.Mcc");
         }
     };
@@ -541,7 +573,7 @@ pub fn udm_nudm_uecm_handle_amf_registration_update(
     let mnc = match &plmn_id_req.mnc {
         Some(m) if !m.is_empty() => m.clone(),
         _ => {
-            log::error!("[{}] No PlmnId.Mnc", supi);
+            log::error!("[{supi}] No PlmnId.Mnc");
             return HandlerResult::bad_request("No PlmnId.Mnc");
         }
     };
@@ -555,7 +587,7 @@ pub fn udm_nudm_uecm_handle_amf_registration_update(
     // Check if received GUAMI matches stored GUAMI
     // TS 29.503: 5.3.2.4.2 AMF deregistration for 3GPP access
     if !guami_matches(&recv_guami, &udm_ue.guami) {
-        log::error!("[{}] Guami mismatch", supi);
+        log::error!("[{supi}] Guami mismatch");
         return HandlerResult::forbidden("Guami mismatch", Some("INVALID_GUAMI"));
     }
 
@@ -566,7 +598,7 @@ pub fn udm_nudm_uecm_handle_amf_registration_update(
         if let Some(mut ue) = context.ue_find_by_id(udm_ue_id) {
             if let Some(ref mut _reg) = ue.amf_3gpp_access_registration {
                 // Note: purge_flag stored in registration and sent to UDR on PATCH request
-                log::debug!("[{}] Setting purge flag to {}", supi, purge_flag);
+                log::debug!("[{supi}] Setting purge flag to {purge_flag}");
             }
             context.ue_update(&ue);
         }
@@ -590,14 +622,14 @@ pub fn udm_nudm_uecm_handle_amf_registration_get(
     let udm_ue = match context.ue_find_by_id(udm_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("UDM UE not found [{}]", udm_ue_id);
+            log::error!("UDM UE not found [{udm_ue_id}]");
             return (HandlerResult::bad_request("UDM UE not found"), None);
         }
     };
     drop(context);
 
     let supi = udm_ue.supi.clone().unwrap_or_else(|| udm_ue.suci.clone());
-    log::debug!("[{}] Handle NUDM UECM AMF registration get", supi);
+    log::debug!("[{supi}] Handle NUDM UECM AMF registration get");
 
     match resource_name {
         "registrations" => {
@@ -609,7 +641,7 @@ pub fn udm_nudm_uecm_handle_amf_registration_get(
             }
         }
         _ => {
-            log::error!("Invalid resource name [{}]", resource_name);
+            log::error!("Invalid resource name [{resource_name}]");
             (HandlerResult::bad_request("Invalid resource name"), None)
         }
     }
@@ -628,7 +660,7 @@ pub fn udm_nudm_uecm_handle_smf_registration(
     let mut sess = match context.sess_find_by_id(sess_id) {
         Some(s) => s,
         None => {
-            log::error!("UDM session not found [{}]", sess_id);
+            log::error!("UDM session not found [{sess_id}]");
             return HandlerResult::bad_request("UDM session not found");
         }
     };
@@ -636,7 +668,7 @@ pub fn udm_nudm_uecm_handle_smf_registration(
     let udm_ue = match context.ue_find_by_id(sess.udm_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("UDM UE not found for session [{}]", sess_id);
+            log::error!("UDM UE not found for session [{sess_id}]");
             return HandlerResult::bad_request("UDM UE not found");
         }
     };
@@ -732,7 +764,7 @@ pub fn udm_nudm_uecm_handle_smf_deregistration(sess_id: u64, _stream_id: u64) ->
     let sess = match context.sess_find_by_id(sess_id) {
         Some(s) => s,
         None => {
-            log::error!("UDM session not found [{}]", sess_id);
+            log::error!("UDM session not found [{sess_id}]");
             return HandlerResult::bad_request("UDM session not found");
         }
     };
@@ -740,7 +772,7 @@ pub fn udm_nudm_uecm_handle_smf_deregistration(sess_id: u64, _stream_id: u64) ->
     let udm_ue = match context.ue_find_by_id(sess.udm_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("UDM UE not found for session [{}]", sess_id);
+            log::error!("UDM UE not found for session [{sess_id}]");
             return HandlerResult::bad_request("UDM UE not found");
         }
     };
@@ -766,14 +798,14 @@ pub fn udm_nudm_sdm_handle_subscription_provisioned(
     let udm_ue = match context.ue_find_by_id(udm_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("UDM UE not found [{}]", udm_ue_id);
+            log::error!("UDM UE not found [{udm_ue_id}]");
             return HandlerResult::bad_request("UDM UE not found");
         }
     };
     drop(context);
 
     let supi = udm_ue.supi.clone().unwrap_or_else(|| udm_ue.suci.clone());
-    log::debug!("[{}] Handle NUDM SDM subscription provisioned", supi);
+    log::debug!("[{supi}] Handle NUDM SDM subscription provisioned");
 
     match resource_name {
         "ue-context-in-smf-data" => {
@@ -782,7 +814,7 @@ pub fn udm_nudm_sdm_handle_subscription_provisioned(
             HandlerResult::ok()
         }
         _ => {
-            log::error!("Invalid resource name [{}]", resource_name);
+            log::error!("Invalid resource name [{resource_name}]");
             HandlerResult::bad_request("Invalid resource name")
         }
     }
@@ -801,27 +833,27 @@ pub fn udm_nudm_sdm_handle_subscription_create(
     let udm_ue = match context.ue_find_by_id(udm_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("UDM UE not found [{}]", udm_ue_id);
+            log::error!("UDM UE not found [{udm_ue_id}]");
             return (HandlerResult::bad_request("UDM UE not found"), None);
         }
     };
 
     let supi = udm_ue.supi.clone().unwrap_or_else(|| udm_ue.suci.clone());
-    log::debug!("[{}] Handle NUDM SDM subscription create", supi);
+    log::debug!("[{supi}] Handle NUDM SDM subscription create");
 
     // Validate SDMSubscription
     if request.nf_instance_id.is_none() || request.nf_instance_id.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
-        log::error!("[{}] No nfInstanceId", supi);
+        log::error!("[{supi}] No nfInstanceId");
         return (HandlerResult::bad_request("No nfInstanceId"), None);
     }
 
     if request.callback_reference.is_none() || request.callback_reference.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
-        log::error!("[{}] No callbackReference", supi);
+        log::error!("[{supi}] No callbackReference");
         return (HandlerResult::bad_request("No callbackReference"), None);
     }
 
     if request.monitored_resource_uris.is_empty() {
-        log::error!("[{}] No monitoredResourceUris", supi);
+        log::error!("[{supi}] No monitoredResourceUris");
         return (HandlerResult::bad_request("No monitoredResourceUris"), None);
     }
 
@@ -833,7 +865,7 @@ pub fn udm_nudm_sdm_handle_subscription_create(
             sub
         }
         None => {
-            log::error!("[{}] sdm_subscription_add() failed", supi);
+            log::error!("[{supi}] sdm_subscription_add() failed");
             return (HandlerResult::bad_request("sdm_subscription_add() failed"), None);
         }
     };
@@ -856,18 +888,18 @@ pub fn udm_nudm_sdm_handle_subscription_delete(
     let udm_ue = match context.ue_find_by_id(udm_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("UDM UE not found [{}]", udm_ue_id);
+            log::error!("UDM UE not found [{udm_ue_id}]");
             return HandlerResult::bad_request("UDM UE not found");
         }
     };
 
     let supi = udm_ue.supi.clone().unwrap_or_else(|| udm_ue.suci.clone());
-    log::debug!("[{}] Handle NUDM SDM subscription delete", supi);
+    log::debug!("[{supi}] Handle NUDM SDM subscription delete");
 
     let sub_id = match subscription_id {
         Some(id) if !id.is_empty() => id,
         _ => {
-            log::error!("[{}] No subscriptionID", supi);
+            log::error!("[{supi}] No subscriptionID");
             return HandlerResult::bad_request("No subscriptionID");
         }
     };
@@ -875,10 +907,10 @@ pub fn udm_nudm_sdm_handle_subscription_delete(
     // Find and remove subscription
     if context.sdm_subscription_find_by_id(sub_id).is_some() {
         context.sdm_subscription_remove(sub_id);
-        log::debug!("[{}] SDM subscription deleted: {}", supi, sub_id);
+        log::debug!("[{supi}] SDM subscription deleted: {sub_id}");
         HandlerResult::no_content()
     } else {
-        log::error!("Subscription to be deleted does not exist [{}]", sub_id);
+        log::error!("Subscription to be deleted does not exist [{sub_id}]");
         HandlerResult::not_found("Subscription Not found")
     }
 }
@@ -895,7 +927,7 @@ pub fn hex_to_bytes(hex: &str) -> Vec<u8> {
 
 /// Convert bytes to hex string
 pub fn bytes_to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Convert buffer to u64

@@ -82,6 +82,7 @@ impl AusfTimerId {
 
 /// SBI message data for events
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct SbiEventData {
     /// Request data (if any)
     pub request: Option<SbiRequest>,
@@ -95,17 +96,6 @@ pub struct SbiEventData {
     pub data: Option<u64>,
 }
 
-impl Default for SbiEventData {
-    fn default() -> Self {
-        Self {
-            request: None,
-            response: None,
-            message: None,
-            stream_id: None,
-            data: None,
-        }
-    }
-}
 
 /// Simplified SBI request representation
 #[derive(Debug, Clone)]

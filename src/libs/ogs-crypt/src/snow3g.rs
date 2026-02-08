@@ -282,7 +282,7 @@ pub fn snow_3g_f8(key: &[u8; 16], count: u32, bearer: u32, dir: u32, data: &mut 
         return;
     }
 
-    let n = ((length + 31) / 32) as usize;
+    let n = length.div_ceil(32) as usize;
     let lastbits = (8 - (length % 8)) % 8;
 
     // Load the confidentiality key for SNOW 3G initialization as in section 3.4
@@ -297,7 +297,7 @@ pub fn snow_3g_f8(key: &[u8; 16], count: u32, bearer: u32, dir: u32, data: &mut 
     // Prepare the initialization vector (IV) for SNOW 3G initialization as in section 3.4
     let mut iv = [0u32; 4];
     iv[3] = count;
-    iv[2] = ((bearer << 27) | ((dir & 0x1) << 26)) as u32;
+    iv[2] = (bearer << 27) | ((dir & 0x1) << 26);
     iv[1] = iv[3];
     iv[0] = iv[2];
 

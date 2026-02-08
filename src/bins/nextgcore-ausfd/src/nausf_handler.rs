@@ -16,7 +16,7 @@ pub fn ausf_nausf_auth_handle_authenticate(ausf_ue_id: u64, stream_id: u64) -> b
     let ausf_ue = match context.ue_find_by_id(ausf_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("AUSF UE not found [{}]", ausf_ue_id);
+            log::error!("AUSF UE not found [{ausf_ue_id}]");
             return false;
         }
     };
@@ -58,27 +58,43 @@ pub fn ausf_nausf_auth_handle_authenticate_confirmation(
     let mut ausf_ue = match context.ue_find_by_id(ausf_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("AUSF UE not found [{}]", ausf_ue_id);
+            log::error!("AUSF UE not found [{ausf_ue_id}]");
             return false;
         }
     };
 
     log::debug!("[{}] Handle authenticate confirmation", ausf_ue.suci);
 
-    // Note: In the C code, this extracts ConfirmationData from the request
-    // and validates res_star. The res_star is extracted from request body
-    // (ConfirmationData.resStar) and compared with xres_star stored in AusfUe.
-    // For now, we'll simulate the comparison
+    // Extract RES* from confirmation data and compare with HXRES*
+    // In 5G-AKA, the AUSF receives RES* and computes HRES* from it,
+    // then compares HRES* with the stored HXRES*.
+    // The actual RES* vs XRES* comparison happens at AUSF after UDM confirmation.
+    if let Some(ref res_star_hex) = ausf_ue.res_star_hex.clone() {
+        let res_star_bytes = crate::nudm_handler::hex_to_bytes(res_star_hex);
+        if res_star_bytes.len() == 16 {
+            let mut res_star = [0u8; 16];
+            res_star.copy_from_slice(&res_star_bytes);
 
-    // Compare res_star with xres_star
-    // if res_star != ausf_ue.xres_star {
-    //     ausf_ue.auth_result = AuthResult::AuthenticationFailure;
-    // } else {
-    //     ausf_ue.auth_result = AuthResult::AuthenticationSuccess;
-    // }
+            // Compute HRES* from RAND and RES* using the same derivation as HXRES*
+            let hres_star = ogs_crypt::kdf::ogs_kdf_hxres_star(&ausf_ue.rand, &res_star);
 
-    // For now, assume success
-    ausf_ue.auth_result = crate::context::AuthResult::AuthenticationSuccess;
+            // Compare HRES* with stored HXRES*
+            if compare_res_star(&hres_star, &ausf_ue.hxres_star) {
+                ausf_ue.auth_result = crate::context::AuthResult::AuthenticationSuccess;
+                log::info!("[{}] 5G-AKA authentication succeeded (HRES* matches HXRES*)", ausf_ue.suci);
+            } else {
+                ausf_ue.auth_result = crate::context::AuthResult::AuthenticationFailure;
+                log::warn!("[{}] 5G-AKA authentication failed (HRES* mismatch)", ausf_ue.suci);
+            }
+        } else {
+            log::error!("[{}] Invalid RES* length: {}", ausf_ue.suci, res_star_bytes.len());
+            ausf_ue.auth_result = crate::context::AuthResult::AuthenticationFailure;
+        }
+    } else {
+        log::error!("[{}] No RES* in confirmation data", ausf_ue.suci);
+        send_error_response(stream_id, 400, "No ConfirmationData.resStar");
+        return false;
+    }
     context.ue_update(&ausf_ue);
     drop(context);
 
@@ -104,7 +120,7 @@ pub fn ausf_nausf_auth_handle_authenticate_delete(ausf_ue_id: u64, stream_id: u6
     let ausf_ue = match context.ue_find_by_id(ausf_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("AUSF UE not found [{}]", ausf_ue_id);
+            log::error!("AUSF UE not found [{ausf_ue_id}]");
             return false;
         }
     };

@@ -189,8 +189,7 @@ impl Avp {
 
         if avp_len < header_len {
             return Err(DiameterError::InvalidAvp(format!(
-                "AVP length {} is less than header size {}",
-                avp_len, header_len
+                "AVP length {avp_len} is less than header size {header_len}"
             )));
         }
 

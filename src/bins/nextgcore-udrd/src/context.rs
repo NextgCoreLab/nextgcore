@@ -1,20 +1,45 @@
 //! UDR Context Management
 //!
-//! Port of src/udr/context.c - UDR context (empty struct in C)
+//! Port of src/udr/context.c - UDR context with per-UE and per-session tracking.
 //!
-//! UDR is a stateless data repository - it has no UE/session management.
-//! The context is essentially empty, just providing initialization/finalization.
+//! While UDR is primarily a stateless data repository, per-UE/per-session
+//! tracking enables subscription data change notifications and request correlation.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
+use crate::ue_sm::UdrUeSmContext;
+use crate::sess_sm::UdrSessSmContext;
+
+/// UDR UE tracking data
+pub struct UdrUe {
+    /// SUPI (Subscriber Permanent Identifier)
+    pub supi: String,
+    /// Per-UE state machine
+    pub sm: UdrUeSmContext,
+    /// Sessions for this UE, keyed by PSI
+    pub sessions: HashMap<u8, UdrSess>,
+}
+
+/// UDR Session tracking data
+pub struct UdrSess {
+    /// Parent SUPI
+    pub supi: String,
+    /// PDU Session Identifier
+    pub psi: u8,
+    /// DNN (Data Network Name)
+    pub dnn: Option<String>,
+    /// Per-session state machine
+    pub sm: UdrSessSmContext,
+}
+
 /// UDR Context - main context structure for UDR
-///
-/// Note: In the C implementation, udr_context_t is an empty struct.
-/// UDR is a stateless data repository that queries the database directly.
 pub struct UdrContext {
     /// Context initialized flag
     initialized: AtomicBool,
+    /// Per-UE tracking, keyed by SUPI
+    ues: HashMap<String, UdrUe>,
 }
 
 impl UdrContext {
@@ -22,33 +47,36 @@ impl UdrContext {
     pub fn new() -> Self {
         Self {
             initialized: AtomicBool::new(false),
+            ues: HashMap::new(),
         }
     }
 
     /// Initialize the UDR context
-    ///
-    /// Port of udr_context_init()
     pub fn init(&mut self) {
         if self.initialized.load(Ordering::SeqCst) {
             return;
         }
 
-        // In C: memset(&self, 0, sizeof(udr_context_t));
-        // ogs_log_install_domain(&__ogs_dbi_domain, "dbi", ogs_core()->log.level);
-        // ogs_log_install_domain(&__udr_log_domain, "udr", ogs_core()->log.level);
-
+        self.ues.clear();
         self.initialized.store(true, Ordering::SeqCst);
 
         log::info!("UDR context initialized");
     }
 
     /// Finalize the UDR context
-    ///
-    /// Port of udr_context_final()
     pub fn fini(&mut self) {
         if !self.initialized.load(Ordering::SeqCst) {
             return;
         }
+
+        // Finalize all UE and session state machines
+        for (_, ue) in &mut self.ues {
+            for (_, sess) in &mut ue.sessions {
+                sess.sm.fini();
+            }
+            ue.sm.fini();
+        }
+        self.ues.clear();
 
         self.initialized.store(false, Ordering::SeqCst);
         log::info!("UDR context finalized");
@@ -60,18 +88,85 @@ impl UdrContext {
     }
 
     /// Parse configuration
-    ///
-    /// Port of udr_context_parse_config()
     pub fn parse_config(&self) -> Result<(), String> {
-        // In C: This parses YAML config for udr section
-        // Keys handled: default, sbi, nrf, scp, service_name, discovery
-        // All are handled in sbi library
-
-        // udr_context_prepare() - returns OGS_OK
-        // udr_context_validation() - returns OGS_OK
-
         log::debug!("UDR configuration parsed");
         Ok(())
+    }
+
+    /// Find or create a UE context by SUPI
+    pub fn ue_find_or_add(&mut self, supi: &str) -> &mut UdrUe {
+        if !self.ues.contains_key(supi) {
+            log::debug!("[{}] Creating UDR UE context", supi);
+            let ue = UdrUe {
+                supi: supi.to_string(),
+                sm: UdrUeSmContext::new(supi),
+                sessions: HashMap::new(),
+            };
+            self.ues.insert(supi.to_string(), ue);
+        }
+        self.ues.get_mut(supi).unwrap()
+    }
+
+    /// Find a UE context by SUPI
+    pub fn ue_find(&self, supi: &str) -> Option<&UdrUe> {
+        self.ues.get(supi)
+    }
+
+    /// Find a mutable UE context by SUPI
+    pub fn ue_find_mut(&mut self, supi: &str) -> Option<&mut UdrUe> {
+        self.ues.get_mut(supi)
+    }
+
+    /// Remove a UE context by SUPI
+    pub fn ue_remove(&mut self, supi: &str) -> Option<UdrUe> {
+        if let Some(mut ue) = self.ues.remove(supi) {
+            for (_, sess) in &mut ue.sessions {
+                sess.sm.fini();
+            }
+            ue.sm.fini();
+            log::debug!("[{}] Removed UDR UE context", supi);
+            Some(ue)
+        } else {
+            None
+        }
+    }
+
+    /// Get the number of tracked UEs
+    pub fn ue_count(&self) -> usize {
+        self.ues.len()
+    }
+
+    /// Find or create a session context for a UE
+    pub fn sess_find_or_add(&mut self, supi: &str, psi: u8, dnn: Option<&str>) -> Option<&mut UdrSess> {
+        let ue = self.ue_find_or_add(supi);
+        if !ue.sessions.contains_key(&psi) {
+            log::debug!("[{}:{}] Creating UDR session context", supi, psi);
+            let sess = UdrSess {
+                supi: supi.to_string(),
+                psi,
+                dnn: dnn.map(|s| s.to_string()),
+                sm: UdrSessSmContext::new(supi, psi, dnn),
+            };
+            ue.sessions.insert(psi, sess);
+        }
+        ue.sessions.get_mut(&psi)
+    }
+
+    /// Find a session context
+    pub fn sess_find(&self, supi: &str, psi: u8) -> Option<&UdrSess> {
+        self.ues.get(supi).and_then(|ue| ue.sessions.get(&psi))
+    }
+
+    /// Remove a session context
+    pub fn sess_remove(&mut self, supi: &str, psi: u8) -> Option<UdrSess> {
+        if let Some(ue) = self.ues.get_mut(supi) {
+            if let Some(mut sess) = ue.sessions.remove(&psi) {
+                sess.sm.fini();
+                log::debug!("[{}:{}] Removed UDR session context", supi, psi);
+                return Some(sess);
+            }
+        }
+        None
     }
 }
 
@@ -151,5 +246,62 @@ mod tests {
 
         let result = ctx.parse_config();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_udr_context_ue_lifecycle() {
+        let mut ctx = UdrContext::new();
+        ctx.init();
+
+        // Add UE
+        let ue = ctx.ue_find_or_add("imsi-001010000000001");
+        assert_eq!(ue.supi, "imsi-001010000000001");
+        assert_eq!(ctx.ue_count(), 1);
+
+        // Find UE
+        assert!(ctx.ue_find("imsi-001010000000001").is_some());
+        assert!(ctx.ue_find("imsi-999999999999999").is_none());
+
+        // Remove UE
+        assert!(ctx.ue_remove("imsi-001010000000001").is_some());
+        assert_eq!(ctx.ue_count(), 0);
+        assert!(ctx.ue_find("imsi-001010000000001").is_none());
+    }
+
+    #[test]
+    fn test_udr_context_sess_lifecycle() {
+        let mut ctx = UdrContext::new();
+        ctx.init();
+
+        // Add session (auto-creates UE)
+        let sess = ctx.sess_find_or_add("imsi-001010000000001", 5, Some("internet"));
+        assert!(sess.is_some());
+        let sess = sess.unwrap();
+        assert_eq!(sess.psi, 5);
+        assert_eq!(sess.dnn.as_deref(), Some("internet"));
+
+        // Find session
+        assert!(ctx.sess_find("imsi-001010000000001", 5).is_some());
+        assert!(ctx.sess_find("imsi-001010000000001", 6).is_none());
+
+        // Remove session
+        assert!(ctx.sess_remove("imsi-001010000000001", 5).is_some());
+        assert!(ctx.sess_find("imsi-001010000000001", 5).is_none());
+
+        // UE still exists
+        assert!(ctx.ue_find("imsi-001010000000001").is_some());
+    }
+
+    #[test]
+    fn test_udr_context_fini_cleans_ues() {
+        let mut ctx = UdrContext::new();
+        ctx.init();
+
+        ctx.ue_find_or_add("imsi-001010000000001");
+        ctx.sess_find_or_add("imsi-001010000000001", 5, Some("internet"));
+        assert_eq!(ctx.ue_count(), 1);
+
+        ctx.fini();
+        assert_eq!(ctx.ue_count(), 0);
     }
 }

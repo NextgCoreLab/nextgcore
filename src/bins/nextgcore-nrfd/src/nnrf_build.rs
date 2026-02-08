@@ -126,7 +126,7 @@ fn build_nf_profile_json(profile: &NfProfile) -> Option<String> {
 
     // Optional heartbeat timer
     if let Some(heartbeat) = profile.heartbeat_timer {
-        json.push_str(&format!(",\"heartBeatTimer\":{}", heartbeat));
+        json.push_str(&format!(",\"heartBeatTimer\":{heartbeat}"));
     }
 
     // PLMN list
@@ -147,7 +147,7 @@ fn build_nf_profile_json(profile: &NfProfile) -> Option<String> {
         let addrs: Vec<String> = profile
             .ipv4_addresses
             .iter()
-            .map(|a| format!("\"{}\"", a))
+            .map(|a| format!("\"{a}\""))
             .collect();
         json.push_str(&addrs.join(","));
         json.push(']');
@@ -159,7 +159,7 @@ fn build_nf_profile_json(profile: &NfProfile) -> Option<String> {
         let addrs: Vec<String> = profile
             .ipv6_addresses
             .iter()
-            .map(|a| format!("\"{}\"", a))
+            .map(|a| format!("\"{a}\""))
             .collect();
         json.push_str(&addrs.join(","));
         json.push(']');
@@ -167,7 +167,7 @@ fn build_nf_profile_json(profile: &NfProfile) -> Option<String> {
 
     // FQDN
     if let Some(ref fqdn) = profile.fqdn {
-        json.push_str(&format!(",\"fqdn\":\"{}\"", fqdn));
+        json.push_str(&format!(",\"fqdn\":\"{fqdn}\""));
     }
 
     json.push('}');

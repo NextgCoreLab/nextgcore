@@ -162,8 +162,8 @@ impl UdmSmContext {
         // Check API version based on service
         let expected_version = if service_name == "nudm-sdm" { "v2" } else { "v1" };
         if api_version != expected_version {
-            log::error!("Not supported version [{}]", api_version);
-            send_error_response(stream_id, 400, &format!("Unsupported API version: {}", api_version));
+            log::error!("Not supported version [{api_version}]");
+            send_error_response(stream_id, 400, &format!("Unsupported API version: {api_version}"));
             return;
         }
 
@@ -183,8 +183,8 @@ impl UdmSmContext {
                 );
             }
             _ => {
-                log::error!("Invalid API name [{}]", service_name);
-                send_error_response(stream_id, 400, &format!("Invalid API name: {}", service_name));
+                log::error!("Invalid API name [{service_name}]");
+                send_error_response(stream_id, 400, &format!("Invalid API name: {service_name}"));
             }
         }
     }
@@ -205,7 +205,7 @@ impl UdmSmContext {
                     // Note: NF status notify handling requires NRF integration to dispatch to NF FSM
                 }
                 _ => {
-                    log::error!("Invalid HTTP method [{}]", method);
+                    log::error!("Invalid HTTP method [{method}]");
                 }
             },
             _ => {
@@ -231,7 +231,7 @@ impl UdmSmContext {
         let supi_or_suci = match resource_components.first() {
             Some(s) => s,
             None => {
-                log::error!("Not found [{}]", method);
+                log::error!("Not found [{method}]");
                 send_not_found_response(stream_id, "SUPI/SUCI not specified");
                 return;
             }
@@ -272,11 +272,11 @@ impl UdmSmContext {
                         let context = ctx.read().unwrap();
                         udm_ue = context.ue_add(supi_or_suci);
                         if udm_ue.is_none() {
-                            log::error!("Invalid Request [{}]", supi_or_suci);
+                            log::error!("Invalid Request [{supi_or_suci}]");
                         }
                     }
                     _ => {
-                        log::error!("Invalid HTTP method [{}]", method);
+                        log::error!("Invalid HTTP method [{method}]");
                     }
                 }
             }
@@ -285,7 +285,7 @@ impl UdmSmContext {
         let udm_ue = match udm_ue {
             Some(ue) => ue,
             None => {
-                log::error!("Not found [{}]", method);
+                log::error!("Not found [{method}]");
                 send_not_found_response(stream_id, "UDM UE not found");
                 return;
             }
@@ -422,7 +422,7 @@ impl UdmSmContext {
         // Check API version
         let expected_version = if service_name == "nudm-sdm" { "v2" } else { "v1" };
         if api_version != expected_version {
-            log::error!("Not supported version [{}]", api_version);
+            log::error!("Not supported version [{api_version}]");
             return;
         }
 
@@ -438,7 +438,7 @@ impl UdmSmContext {
                 self.handle_nudr_dr_response(event, &resource_components);
             }
             _ => {
-                log::error!("Invalid API name [{}]", service_name);
+                log::error!("Invalid API name [{service_name}]");
             }
         }
     }
@@ -615,19 +615,19 @@ impl UdmSmContext {
             | UdmTimerId::NfInstanceNoHeartbeat
             | UdmTimerId::NfInstanceValidity => {
                 if let Some(ref nf_instance_id) = event.nf_instance_id {
-                    log::debug!("[{}] NF instance timer: {:?}", nf_instance_id, timer_id);
+                    log::debug!("[{nf_instance_id}] NF instance timer: {timer_id:?}");
                     // Note: NF instance FSM dispatch requires NRF integration
                 }
             }
             UdmTimerId::SubscriptionValidity => {
                 if let Some(ref subscription_id) = event.subscription_id {
-                    log::error!("[{}] Subscription validity expired", subscription_id);
+                    log::error!("[{subscription_id}] Subscription validity expired");
                     // Note: Subscription renewal requires NRF integration
                 }
             }
             UdmTimerId::SubscriptionPatch => {
                 if let Some(ref subscription_id) = event.subscription_id {
-                    log::info!("[{}] Need to update Subscription", subscription_id);
+                    log::info!("[{subscription_id}] Need to update Subscription");
                     // Note: Subscription update requires NRF integration
                 }
             }

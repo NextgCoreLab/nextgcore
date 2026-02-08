@@ -53,7 +53,7 @@ impl MetricsSpec {
         labels: &[&str],
         histogram_params: Option<HistogramBucketParams>,
     ) -> Self {
-        assert!(labels.len() <= MAX_LABELS, "Too many labels (max {})", MAX_LABELS);
+        assert!(labels.len() <= MAX_LABELS, "Too many labels (max {MAX_LABELS})");
         
         if metric_type == MetricType::Histogram {
             assert!(histogram_params.is_some(), "Histogram metrics require bucket parameters");

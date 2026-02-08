@@ -889,6 +889,148 @@ pub fn build_pdu_session_release_reject(sess: &SmfSess, cause: GsmCause) -> Vec<
     builder.build()
 }
 
+/// Build PDU Session Modification Complete message
+pub fn build_pdu_session_modification_complete(sess: &SmfSess) -> Vec<u8> {
+    let builder = GsmMessageBuilder::with_header(
+        sess.psi,
+        sess.pti,
+        message_type::PDU_SESSION_MODIFICATION_COMPLETE,
+    );
+
+    builder.build()
+}
+
+/// Build PDU Session Release Complete message
+pub fn build_pdu_session_release_complete(sess: &SmfSess) -> Vec<u8> {
+    let builder = GsmMessageBuilder::with_header(
+        sess.psi,
+        sess.pti,
+        message_type::PDU_SESSION_RELEASE_COMPLETE,
+    );
+
+    builder.build()
+}
+
+/// Build PDU Session Establishment Accept with extended options
+/// This version supports IPv4v6 dual-stack and additional optional IEs
+pub fn build_pdu_session_establishment_accept_extended(
+    sess: &SmfSess,
+    qos_flow: &SmfBearer,
+    dns_servers: &[std::net::Ipv4Addr],
+    mtu: Option<u16>,
+) -> Option<Vec<u8>> {
+    let mut builder = GsmMessageBuilder::with_header(
+        sess.psi,
+        sess.pti,
+        message_type::PDU_SESSION_ESTABLISHMENT_ACCEPT,
+    );
+
+    // Selected PDU session type (mandatory)
+    let session_type = match sess.session_type {
+        crate::context::PduSessionType::Ipv4 => pdu_session_type::IPV4,
+        crate::context::PduSessionType::Ipv6 => pdu_session_type::IPV6,
+        crate::context::PduSessionType::Ipv4v6 => pdu_session_type::IPV4V6,
+        crate::context::PduSessionType::Unstructured => pdu_session_type::UNSTRUCTURED,
+        crate::context::PduSessionType::Ethernet => pdu_session_type::ETHERNET,
+    };
+    builder.write_u8(session_type);
+
+    // Authorized QoS rules (mandatory)
+    let default_rule = encode_default_qos_rule(qos_flow);
+    let qos_rules_bytes = encode_qos_rules(&[default_rule]);
+    builder.write_lv_e(&qos_rules_bytes);
+
+    // Session AMBR (mandatory)
+    let ambr_bytes = encode_session_ambr(sess.session_ambr.downlink, sess.session_ambr.uplink);
+    builder.write_lv(&ambr_bytes);
+
+    // PDU address (optional, IEI = 0x29)
+    match sess.session_type {
+        crate::context::PduSessionType::Ipv4 => {
+            if let Some(addr) = sess.ipv4_addr {
+                let mut pdu_addr = vec![pdu_session_type::IPV4];
+                pdu_addr.extend_from_slice(&addr.octets());
+                builder.write_tlv(0x29, &pdu_addr);
+            }
+        }
+        crate::context::PduSessionType::Ipv6 => {
+            if let Some((_, addr)) = sess.ipv6_prefix {
+                let mut pdu_addr = vec![pdu_session_type::IPV6];
+                pdu_addr.extend_from_slice(&addr.octets()[8..16]);
+                builder.write_tlv(0x29, &pdu_addr);
+            }
+        }
+        crate::context::PduSessionType::Ipv4v6 => {
+            let mut pdu_addr = vec![pdu_session_type::IPV4V6];
+            // IPv6 interface identifier (8 bytes)
+            if let Some((_, addr6)) = sess.ipv6_prefix {
+                pdu_addr.extend_from_slice(&addr6.octets()[8..16]);
+            } else {
+                pdu_addr.extend_from_slice(&[0u8; 8]);
+            }
+            // IPv4 address (4 bytes)
+            if let Some(addr4) = sess.ipv4_addr {
+                pdu_addr.extend_from_slice(&addr4.octets());
+            } else {
+                pdu_addr.extend_from_slice(&[0u8; 4]);
+            }
+            builder.write_tlv(0x29, &pdu_addr);
+        }
+        _ => {}
+    }
+
+    // S-NSSAI (optional, IEI = 0x22)
+    let snssai_bytes = encode_snssai(&sess.s_nssai);
+    builder.write_tlv(0x22, &snssai_bytes);
+
+    // Authorized QoS flow descriptions (optional, IEI = 0x79)
+    let default_desc = encode_default_qos_flow_description(qos_flow);
+    let qos_desc_bytes = encode_qos_flow_descriptions(&[default_desc]);
+    builder.write_tlv_e(0x79, &qos_desc_bytes);
+
+    // Extended protocol configuration options (optional, IEI = 0x7B)
+    // Build ePCO with DNS servers and MTU
+    if !dns_servers.is_empty() || mtu.is_some() {
+        let epco = build_epco(dns_servers, mtu);
+        if !epco.is_empty() {
+            builder.write_tlv_e(0x7B, &epco);
+        }
+    }
+
+    // DNN (optional, IEI = 0x25)
+    if let Some(ref dnn) = sess.session_name {
+        builder.write_tlv(0x25, dnn.as_bytes());
+    }
+
+    Some(builder.build())
+}
+
+/// Build Extended Protocol Configuration Options (ePCO) for establishment accept
+fn build_epco(dns_servers: &[std::net::Ipv4Addr], mtu: Option<u16>) -> Vec<u8> {
+    let mut buffer = BytesMut::with_capacity(64);
+
+    // Configuration protocol byte (0x80 = PPP with extensions)
+    buffer.put_u8(0x80);
+
+    // DNS Server IPv4 Address (Protocol ID = 0x000D)
+    for dns in dns_servers {
+        buffer.put_u16(0x000D); // Container ID: DNS Server IPv4
+        buffer.put_u8(4); // Length
+        buffer.put_slice(&dns.octets());
+    }
+
+    // IPv4 Link MTU (Protocol ID = 0x0010)
+    if let Some(mtu_val) = mtu {
+        if mtu_val > 0 {
+            buffer.put_u16(0x0010); // Container ID: IPv4 Link MTU
+            buffer.put_u8(2); // Length
+            buffer.put_u16(mtu_val);
+        }
+    }
+
+    buffer.to_vec()
+}
+
 /// Build 5GSM Status message
 pub fn build_gsm_status(sess: &SmfSess, cause: GsmCause) -> Vec<u8> {
     let mut builder = GsmMessageBuilder::with_header(
@@ -1378,6 +1520,55 @@ mod tests {
         assert_eq!(pdu_session_type::IPV4V6, 3);
         assert_eq!(pdu_session_type::UNSTRUCTURED, 4);
         assert_eq!(pdu_session_type::ETHERNET, 5);
+    }
+
+    #[test]
+    fn test_build_pdu_session_modification_complete() {
+        let sess = create_test_sess();
+        let msg = build_pdu_session_modification_complete(&sess);
+
+        assert_eq!(msg.len(), 4);
+        assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
+        assert_eq!(msg[3], message_type::PDU_SESSION_MODIFICATION_COMPLETE);
+    }
+
+    #[test]
+    fn test_build_pdu_session_release_complete() {
+        let sess = create_test_sess();
+        let msg = build_pdu_session_release_complete(&sess);
+
+        assert_eq!(msg.len(), 4);
+        assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
+        assert_eq!(msg[3], message_type::PDU_SESSION_RELEASE_COMPLETE);
+    }
+
+    #[test]
+    fn test_build_pdu_session_establishment_accept_extended() {
+        let sess = create_test_sess();
+        let bearer = create_test_bearer();
+        let dns = vec!["8.8.8.8".parse().unwrap(), "8.8.4.4".parse().unwrap()];
+
+        let result = build_pdu_session_establishment_accept_extended(
+            &sess, &bearer, &dns, Some(1400),
+        );
+        assert!(result.is_some());
+
+        let msg = result.unwrap();
+        assert!(msg.len() > 4);
+        assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
+        assert_eq!(msg[3], message_type::PDU_SESSION_ESTABLISHMENT_ACCEPT);
+        assert_eq!(msg[4], pdu_session_type::IPV4);
+    }
+
+    #[test]
+    fn test_build_pdu_session_establishment_accept_extended_no_extras() {
+        let sess = create_test_sess();
+        let bearer = create_test_bearer();
+
+        let result = build_pdu_session_establishment_accept_extended(
+            &sess, &bearer, &[], None,
+        );
+        assert!(result.is_some());
     }
 
     #[test]

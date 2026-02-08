@@ -26,6 +26,7 @@ mod pcf_sm;
 mod sbi_path;
 mod sbi_response;
 mod sm_sm;
+mod timer;
 
 pub use am_sm::{PcfAmSmContext, PcfAmState};
 pub use context::*;
@@ -35,6 +36,7 @@ pub use nudr_handler::*;
 pub use pcf_sm::{PcfSmContext, PcfState};
 pub use sbi_path::*;
 pub use sm_sm::{PcfSmSmContext, PcfSmState};
+pub use timer::{timer_manager, PcfTimerManager};
 
 /// NextGCore PCF - Policy Control Function
 #[derive(Parser, Debug)]
@@ -82,6 +84,10 @@ struct Args {
     /// TLS key path
     #[arg(long)]
     tls_key: Option<String>,
+
+    /// NRF URI (e.g., http://127.0.0.10:7777)
+    #[arg(long)]
+    nrf_uri: Option<String>,
 
     /// Maximum number of UEs
     #[arg(long, default_value = "1024")]
@@ -149,6 +155,7 @@ async fn main() -> Result<()> {
         tls_enabled: args.tls,
         tls_cert: args.tls_cert.clone(),
         tls_key: args.tls_key.clone(),
+        nrf_uri: args.nrf_uri.clone(),
     };
 
     // Open legacy SBI server (for context initialization)
@@ -322,15 +329,41 @@ async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
         Some(ue_am) => {
             log::info!("AM Policy created for SUPI {} (id={})", supi, ue_am.association_id);
 
+            // Query subscription data for UE-AMBR
+            let sub_data = nudr_handler::query_subscription_data_pub(supi);
+            let (triggers, ue_ambr) = if let Some(ref sd) = sub_data {
+                let mut triggers = Vec::new();
+                // Check if subscribed UE-AMBR differs from requested
+                if let Some(req_ambr) = policy_data.get("ueAmbr") {
+                    let req_up = req_ambr.get("uplink").and_then(|v| v.as_str()).unwrap_or("0");
+                    let req_down = req_ambr.get("downlink").and_then(|v| v.as_str()).unwrap_or("0");
+                    if req_up != format_bitrate(sd.ambr_uplink) || req_down != format_bitrate(sd.ambr_downlink) {
+                        triggers.push("UE_AMBR_CH");
+                    }
+                }
+                let ambr = serde_json::json!({
+                    "uplink": format_bitrate(sd.ambr_uplink),
+                    "downlink": format_bitrate(sd.ambr_downlink),
+                });
+                (triggers, Some(ambr))
+            } else {
+                (vec![], None)
+            };
+
+            let mut resp = serde_json::json!({
+                "polAssoId": ue_am.association_id,
+                "supi": supi,
+                "triggers": triggers,
+                "servAreaRes": null,
+                "rfsp": null,
+            });
+            if let Some(ambr) = ue_ambr {
+                resp["ueAmbr"] = ambr;
+            }
+
             SbiResponse::with_status(201)
                 .with_header("Location", &format!("/npcf-am-policy-control/v1/policies/{}", ue_am.association_id))
-                .with_json_body(&serde_json::json!({
-                    "polAssoId": ue_am.association_id,
-                    "supi": supi,
-                    "triggers": [],
-                    "servAreaRes": null,
-                    "rfsp": null,
-                }))
+                .with_json_body(&resp)
                 .unwrap_or_else(|_| SbiResponse::with_status(201))
         }
         None => {
@@ -449,6 +482,21 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
     let pdu_session_id = policy_data.get("pduSessionId")
         .and_then(|v| v.as_u64())
         .unwrap_or(1) as u8;
+    let dnn = policy_data.get("dnn")
+        .and_then(|v| v.as_str())
+        .unwrap_or("internet");
+    let sst = policy_data
+        .get("sliceInfo")
+        .and_then(|s| s.get("sNssai"))
+        .and_then(|s| s.get("sst"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as u8;
+    let sd = policy_data
+        .get("sliceInfo")
+        .and_then(|s| s.get("sNssai"))
+        .and_then(|s| s.get("sd"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| u32::from_str_radix(s, 16).ok());
 
     let ctx = pcf_self();
 
@@ -474,21 +522,102 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
         Some(sess) => {
             log::info!("SM Policy created for SUPI {} PDU Session {} (id={})", supi, pdu_session_id, sess.sm_policy_id);
 
+            // Query real session data from UDR/database
+            let s_nssai = SNssai { sst, sd };
+            let session_data = pcf_get_session_data(supi, None, &s_nssai, dnn);
+
+            // Build policy decision with real data
+            let (sess_rules, pcc_rules, qos_decs) = if let Some(ref sd) = session_data {
+                let sess_rule_id = format!("SessRule-{}", sess.sm_policy_id);
+                let def_qos_id = format!("QosDec-{}", sess.sm_policy_id);
+
+                // Session rules with authorized session AMBR and default QoS
+                let sess_rules = serde_json::json!({
+                    &sess_rule_id: {
+                        "sessRuleId": sess_rule_id,
+                        "authSessAmbr": {
+                            "uplink": format_bitrate(sd.ambr_uplink),
+                            "downlink": format_bitrate(sd.ambr_downlink),
+                        },
+                        "authDefQos": {
+                            "5qi": sd.qos_index,
+                            "arp": {
+                                "priorityLevel": sd.arp_priority_level,
+                                "preemptCap": if sd.arp_preempt_cap { "MAY_PREEMPT" } else { "NOT_PREEMPT" },
+                                "preemptVuln": if sd.arp_preempt_vuln { "PREEMPTABLE" } else { "NOT_PREEMPTABLE" },
+                            },
+                        },
+                        "defQosRef": def_qos_id,
+                    }
+                });
+
+                // QoS decisions
+                let qos_decs = serde_json::json!({
+                    &def_qos_id: {
+                        "qosDecId": def_qos_id,
+                        "5qi": sd.qos_index,
+                        "maxbrUl": format_bitrate(sd.ambr_uplink),
+                        "maxbrDl": format_bitrate(sd.ambr_downlink),
+                    }
+                });
+
+                // PCC rules from database
+                let mut pcc_map = serde_json::Map::new();
+                for rule in &sd.pcc_rules {
+                    let rule_qos_ref = format!("QosDec-pcc-{}", rule.id);
+                    let flows: Vec<serde_json::Value> = rule.flows.iter().enumerate().map(|(i, f)| {
+                        serde_json::json!({
+                            "flowDescription": f.description,
+                            "flowDirection": match f.direction {
+                                FlowDirection::Uplink => "UPLINK",
+                                FlowDirection::Downlink => "DOWNLINK",
+                                _ => "BIDIRECTIONAL",
+                            },
+                            "packFiltId": format!("pf-{}-{}", rule.id, i),
+                        })
+                    }).collect();
+
+                    pcc_map.insert(rule.id.clone(), serde_json::json!({
+                        "pccRuleId": rule.id,
+                        "precedence": rule.precedence,
+                        "flowInfos": flows,
+                        "refQosData": [rule_qos_ref],
+                    }));
+                }
+
+                (sess_rules, serde_json::Value::Object(pcc_map), qos_decs)
+            } else {
+                (serde_json::json!({}), serde_json::json!({}), serde_json::json!({}))
+            };
+
             SbiResponse::with_status(201)
                 .with_header("Location", &format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id))
                 .with_json_body(&serde_json::json!({
                     "smPolicyId": sess.sm_policy_id,
                     "supi": supi,
                     "pduSessionId": pdu_session_id,
-                    "sessRules": {},
-                    "pccRules": {},
-                    "qosDecs": {},
+                    "sessRules": sess_rules,
+                    "pccRules": pcc_rules,
+                    "qosDecs": qos_decs,
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(201))
         }
         None => {
             send_bad_request("Failed to create SM policy", Some("CREATION_FAILED"))
         }
+    }
+}
+
+/// Format bitrate as a human-readable string per 3GPP TS 29.571
+fn format_bitrate(bps: u64) -> String {
+    if bps >= 1_000_000_000 && bps % 1_000_000_000 == 0 {
+        format!("{} Gbps", bps / 1_000_000_000)
+    } else if bps >= 1_000_000 && bps % 1_000_000 == 0 {
+        format!("{} Mbps", bps / 1_000_000)
+    } else if bps >= 1_000 && bps % 1_000 == 0 {
+        format!("{} Kbps", bps / 1_000)
+    } else {
+        format!("{} bps", bps)
     }
 }
 
@@ -735,21 +864,35 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) -> Result<()> {
 }
 
 /// Async main event loop with timer integration
-async fn run_event_loop_async(_pcf_sm: &mut PcfSmContext, shutdown: Arc<AtomicBool>) -> Result<()> {
+async fn run_event_loop_async(pcf_sm: &mut PcfSmContext, shutdown: Arc<AtomicBool>) -> Result<()> {
     log::debug!("Entering async main event loop");
 
-    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    let timer_mgr = timer_manager();
 
     while !shutdown.load(Ordering::SeqCst) && !SHUTDOWN.load(Ordering::SeqCst) {
-        // Wait for next tick
-        interval.tick().await;
+        // Compute optimal sleep duration based on pending timers
+        let poll_interval = ogs_core::async_timer::compute_poll_interval(
+            timer_mgr.inner(),
+            Duration::from_millis(100),
+        );
+        tokio::time::sleep(poll_interval).await;
 
-        // Process timer expirations
-        // Note: Timer manager integration for NRF heartbeats and subscription validity
-        // let expired_events = timer_manager().get_expired_events();
-        // for event in expired_events {
-        //     log::debug!("Processing timer event: {:?}", event);
-        // }
+        // Process timer expirations and dispatch to state machine
+        let expired = timer_mgr.process_expired();
+        for entry in &expired {
+            log::debug!(
+                "PCF timer expired: id={} type={:?} data={:?}",
+                entry.id, entry.timer_type, entry.data
+            );
+
+            // Create timer event and dispatch to state machine
+            let mut event = PcfEvent::sbi_timer(entry.timer_type);
+            if let Some(ref nf_id) = entry.data {
+                event = event.with_nf_instance(nf_id.clone());
+            }
+
+            pcf_sm.dispatch(&mut event);
+        }
 
         // Check for shutdown
         if shutdown.load(Ordering::SeqCst) {
@@ -757,6 +900,8 @@ async fn run_event_loop_async(_pcf_sm: &mut PcfSmContext, shutdown: Arc<AtomicBo
         }
     }
 
+    // Cleanup: clear all timers on shutdown
+    timer_mgr.clear();
     log::debug!("Exiting async main event loop");
     Ok(())
 }

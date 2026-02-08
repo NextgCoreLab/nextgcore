@@ -21,10 +21,14 @@ pub use event::{UdmEvent, UdmEventId, UdmTimerId};
 pub use udm_sm::{UdmSmContext, UdmState};
 pub use ue_sm::{UdmUeSmContext, UdmUeState};
 pub use sess_sm::{UdmSessSmContext, UdmSessState};
-pub use timer::{udm_timer_get_name, timer_manager, UdmTimerManager};
+pub use timer::{udm_timer_get_name, timer_manager, timer_type_to_timer_id, UdmTimerManager};
 
 // Re-export SBI path functions
 pub use sbi_path::{
     udm_sbi_close, udm_sbi_is_running, udm_sbi_open,
+    udm_nrf_register, udm_nrf_heartbeat, udm_nrf_discover, udm_nrf_deregister,
+    udm_sbi_send_request, udm_sbi_discover_and_send_nudr_dr,
+    udm_nudr_dr_send_auth_subscription_get, udm_nudr_dr_send_auth_subscription_patch,
+    udm_nudr_dr_send_provisioned_data_get,
     SbiServer, SbiServerConfig, SbiXact,
 };

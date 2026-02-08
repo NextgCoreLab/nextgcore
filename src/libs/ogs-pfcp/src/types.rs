@@ -1501,3 +1501,1140 @@ impl CpFunctionFeatures {
         }
     }
 }
+
+/// Measurement Method flags (TS 29.244 Section 8.2.40)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MeasurementMethod {
+    pub durat: bool,  // Duration
+    pub volum: bool,  // Volume
+    pub event: bool,  // Event
+}
+
+impl MeasurementMethod {
+    pub fn encode(&self) -> u8 {
+        ((self.event as u8) << 2) | ((self.volum as u8) << 1) | (self.durat as u8)
+    }
+
+    pub fn decode(val: u8) -> Self {
+        Self {
+            durat: val & 0x01 != 0,
+            volum: (val >> 1) & 0x01 != 0,
+            event: (val >> 2) & 0x01 != 0,
+        }
+    }
+}
+
+/// PDI (Packet Detection Information) - grouped IE within PDR
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pdi {
+    pub source_interface: SourceInterface,
+    pub local_f_teid: Option<FTeid>,
+    pub network_instance: Option<String>,
+    pub ue_ip_address: Option<UeIpAddress>,
+    pub sdf_filter: Option<Vec<u8>>,
+    pub application_id: Option<Vec<u8>>,
+}
+
+impl Pdi {
+    pub fn new(source_interface: SourceInterface) -> Self {
+        Self {
+            source_interface,
+            local_f_teid: None,
+            network_instance: None,
+            ue_ip_address: None,
+            sdf_filter: None,
+            application_id: None,
+        }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{IeHeader, IeType, encode_u8_ie, encode_bytes_ie};
+
+        encode_u8_ie(buf, IeType::SourceInterface, self.source_interface as u8);
+
+        if let Some(fteid) = &self.local_f_teid {
+            let mut fteid_buf = BytesMut::new();
+            fteid.encode(&mut fteid_buf);
+            let header = IeHeader::new(IeType::FTeid as u16, fteid_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&fteid_buf);
+        }
+
+        if let Some(ni) = &self.network_instance {
+            encode_bytes_ie(buf, IeType::NetworkInstance, ni.as_bytes());
+        }
+
+        if let Some(ue_ip) = &self.ue_ip_address {
+            let mut ip_buf = BytesMut::new();
+            ue_ip.encode(&mut ip_buf);
+            let header = IeHeader::new(IeType::UeIpAddress as u16, ip_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&ip_buf);
+        }
+
+        if let Some(sdf) = &self.sdf_filter {
+            encode_bytes_ie(buf, IeType::SdfFilter, sdf);
+        }
+
+        if let Some(app_id) = &self.application_id {
+            encode_bytes_ie(buf, IeType::ApplicationId, app_id);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+
+        let mut source_interface = SourceInterface::Access;
+        let mut local_f_teid = None;
+        let mut network_instance = None;
+        let mut ue_ip_address = None;
+        let mut sdf_filter = None;
+        let mut application_id = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::SourceInterface as u16 => {
+                    if !ie.data.is_empty() {
+                        source_interface = SourceInterface::try_from(ie.data[0] & 0x0F)?;
+                    }
+                }
+                t if t == IeType::FTeid as u16 => {
+                    let mut data = ie.data;
+                    local_f_teid = Some(FTeid::decode(&mut data)?);
+                }
+                t if t == IeType::NetworkInstance as u16 => {
+                    network_instance = Some(String::from_utf8_lossy(&ie.data).to_string());
+                }
+                t if t == IeType::UeIpAddress as u16 => {
+                    let mut data = ie.data;
+                    ue_ip_address = Some(UeIpAddress::decode(&mut data)?);
+                }
+                t if t == IeType::SdfFilter as u16 => {
+                    sdf_filter = Some(ie.data.to_vec());
+                }
+                t if t == IeType::ApplicationId as u16 => {
+                    application_id = Some(ie.data.to_vec());
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            source_interface,
+            local_f_teid,
+            network_instance,
+            ue_ip_address,
+            sdf_filter,
+            application_id,
+        })
+    }
+}
+
+/// Create PDR (Packet Detection Rule) - grouped IE (TS 29.244 Section 7.5.2.2)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatePdr {
+    pub pdr_id: u16,
+    pub precedence: u32,
+    pub pdi: Pdi,
+    pub outer_header_removal: Option<OuterHeaderRemoval>,
+    pub far_id: Option<u32>,
+    pub urr_ids: Vec<u32>,
+    pub qer_id: Option<u32>,
+}
+
+impl CreatePdr {
+    pub fn new(pdr_id: u16, precedence: u32, pdi: Pdi) -> Self {
+        Self {
+            pdr_id,
+            precedence,
+            pdi,
+            outer_header_removal: None,
+            far_id: None,
+            urr_ids: Vec::new(),
+            qer_id: None,
+        }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{IeHeader, IeType, encode_u16_ie, encode_u32_ie};
+
+        encode_u16_ie(buf, IeType::PdrId, self.pdr_id);
+        encode_u32_ie(buf, IeType::Precedence, self.precedence);
+
+        // PDI is a grouped IE
+        let mut pdi_buf = BytesMut::new();
+        self.pdi.encode(&mut pdi_buf);
+        let header = IeHeader::new(IeType::Pdi as u16, pdi_buf.len() as u16);
+        header.encode(buf);
+        buf.put_slice(&pdi_buf);
+
+        if let Some(ohr) = &self.outer_header_removal {
+            let mut ohr_buf = BytesMut::new();
+            ohr.encode(&mut ohr_buf);
+            let header = IeHeader::new(IeType::OuterHeaderRemoval as u16, ohr_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&ohr_buf);
+        }
+
+        if let Some(far_id) = self.far_id {
+            encode_u32_ie(buf, IeType::FarId, far_id);
+        }
+
+        for urr_id in &self.urr_ids {
+            encode_u32_ie(buf, IeType::UrrId, *urr_id);
+        }
+
+        if let Some(qer_id) = self.qer_id {
+            encode_u32_ie(buf, IeType::QerId, qer_id);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+
+        let mut pdr_id = 0u16;
+        let mut precedence = 0u32;
+        let mut pdi = None;
+        let mut outer_header_removal = None;
+        let mut far_id = None;
+        let mut urr_ids = Vec::new();
+        let mut qer_id = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::PdrId as u16 => {
+                    if ie.data.len() >= 2 {
+                        let mut data = ie.data;
+                        pdr_id = data.get_u16();
+                    }
+                }
+                t if t == IeType::Precedence as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        precedence = data.get_u32();
+                    }
+                }
+                t if t == IeType::Pdi as u16 => {
+                    let mut data = ie.data;
+                    pdi = Some(Pdi::decode(&mut data)?);
+                }
+                t if t == IeType::OuterHeaderRemoval as u16 => {
+                    let mut data = ie.data;
+                    outer_header_removal = Some(OuterHeaderRemoval::decode(&mut data)?);
+                }
+                t if t == IeType::FarId as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        far_id = Some(data.get_u32());
+                    }
+                }
+                t if t == IeType::UrrId as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        urr_ids.push(data.get_u32());
+                    }
+                }
+                t if t == IeType::QerId as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        qer_id = Some(data.get_u32());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let pdi = pdi.ok_or_else(|| PfcpError::MissingMandatoryIe("PDI".to_string()))?;
+
+        Ok(Self {
+            pdr_id,
+            precedence,
+            pdi,
+            outer_header_removal,
+            far_id,
+            urr_ids,
+            qer_id,
+        })
+    }
+}
+
+/// Forwarding Parameters - grouped IE within FAR (TS 29.244 Section 7.5.2.3-3)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardingParameters {
+    pub destination_interface: DestinationInterface,
+    pub network_instance: Option<String>,
+    pub outer_header_creation: Option<OuterHeaderCreation>,
+}
+
+impl ForwardingParameters {
+    pub fn new(destination_interface: DestinationInterface) -> Self {
+        Self {
+            destination_interface,
+            network_instance: None,
+            outer_header_creation: None,
+        }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{IeHeader, IeType, encode_u8_ie, encode_bytes_ie};
+
+        encode_u8_ie(buf, IeType::DestinationInterface, self.destination_interface as u8);
+
+        if let Some(ni) = &self.network_instance {
+            encode_bytes_ie(buf, IeType::NetworkInstance, ni.as_bytes());
+        }
+
+        if let Some(ohc) = &self.outer_header_creation {
+            let mut ohc_buf = BytesMut::new();
+            ohc.encode(&mut ohc_buf);
+            let header = IeHeader::new(IeType::OuterHeaderCreation as u16, ohc_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&ohc_buf);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+
+        let mut destination_interface = DestinationInterface::Access;
+        let mut network_instance = None;
+        let mut outer_header_creation = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::DestinationInterface as u16 => {
+                    if !ie.data.is_empty() {
+                        destination_interface = DestinationInterface::try_from(ie.data[0] & 0x0F)?;
+                    }
+                }
+                t if t == IeType::NetworkInstance as u16 => {
+                    network_instance = Some(String::from_utf8_lossy(&ie.data).to_string());
+                }
+                t if t == IeType::OuterHeaderCreation as u16 => {
+                    let mut data = ie.data;
+                    outer_header_creation = Some(OuterHeaderCreation::decode(&mut data)?);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            destination_interface,
+            network_instance,
+            outer_header_creation,
+        })
+    }
+}
+
+/// Create FAR (Forwarding Action Rule) - grouped IE (TS 29.244 Section 7.5.2.3)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateFar {
+    pub far_id: u32,
+    pub apply_action: ApplyAction,
+    pub forwarding_parameters: Option<ForwardingParameters>,
+    pub bar_id: Option<u8>,
+}
+
+impl CreateFar {
+    pub fn new(far_id: u32, apply_action: ApplyAction) -> Self {
+        Self {
+            far_id,
+            apply_action,
+            forwarding_parameters: None,
+            bar_id: None,
+        }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{IeHeader, IeType, encode_u32_ie, encode_u16_ie, encode_u8_ie};
+
+        encode_u32_ie(buf, IeType::FarId, self.far_id);
+        encode_u16_ie(buf, IeType::ApplyAction, self.apply_action.encode());
+
+        if let Some(fp) = &self.forwarding_parameters {
+            let mut fp_buf = BytesMut::new();
+            fp.encode(&mut fp_buf);
+            let header = IeHeader::new(IeType::ForwardingParameters as u16, fp_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&fp_buf);
+        }
+
+        if let Some(bar_id) = self.bar_id {
+            encode_u8_ie(buf, IeType::BarId, bar_id);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+
+        let mut far_id = 0u32;
+        let mut apply_action = ApplyAction::default();
+        let mut forwarding_parameters = None;
+        let mut bar_id = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::FarId as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        far_id = data.get_u32();
+                    }
+                }
+                t if t == IeType::ApplyAction as u16 => {
+                    if ie.data.len() >= 2 {
+                        let mut data = ie.data;
+                        apply_action = ApplyAction::decode(data.get_u16());
+                    }
+                }
+                t if t == IeType::ForwardingParameters as u16 => {
+                    let mut data = ie.data;
+                    forwarding_parameters = Some(ForwardingParameters::decode(&mut data)?);
+                }
+                t if t == IeType::BarId as u16 => {
+                    if !ie.data.is_empty() {
+                        bar_id = Some(ie.data[0]);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            far_id,
+            apply_action,
+            forwarding_parameters,
+            bar_id,
+        })
+    }
+}
+
+/// Create QER (QoS Enforcement Rule) - grouped IE (TS 29.244 Section 7.5.2.5)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateQer {
+    pub qer_id: u32,
+    pub gate_status: GateStatus,
+    pub maximum_bitrate: Option<Bitrate>,
+    pub guaranteed_bitrate: Option<Bitrate>,
+    pub qfi: Option<u8>,
+}
+
+impl CreateQer {
+    pub fn new(qer_id: u32, gate_status: GateStatus) -> Self {
+        Self {
+            qer_id,
+            gate_status,
+            maximum_bitrate: None,
+            guaranteed_bitrate: None,
+            qfi: None,
+        }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{IeHeader, IeType, encode_u32_ie, encode_u8_ie};
+
+        encode_u32_ie(buf, IeType::QerId, self.qer_id);
+        encode_u8_ie(buf, IeType::GateStatus, self.gate_status.encode());
+
+        if let Some(mbr) = &self.maximum_bitrate {
+            let mut mbr_buf = BytesMut::new();
+            mbr.encode(&mut mbr_buf);
+            let header = IeHeader::new(IeType::Mbr as u16, mbr_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&mbr_buf);
+        }
+
+        if let Some(gbr) = &self.guaranteed_bitrate {
+            let mut gbr_buf = BytesMut::new();
+            gbr.encode(&mut gbr_buf);
+            let header = IeHeader::new(IeType::Gbr as u16, gbr_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&gbr_buf);
+        }
+
+        if let Some(qfi) = self.qfi {
+            encode_u8_ie(buf, IeType::Qfi, qfi);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+
+        let mut qer_id = 0u32;
+        let mut gate_status = GateStatus::default();
+        let mut maximum_bitrate = None;
+        let mut guaranteed_bitrate = None;
+        let mut qfi = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::QerId as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        qer_id = data.get_u32();
+                    }
+                }
+                t if t == IeType::GateStatus as u16 => {
+                    if !ie.data.is_empty() {
+                        gate_status = GateStatus::decode(ie.data[0]);
+                    }
+                }
+                t if t == IeType::Mbr as u16 => {
+                    let mut data = ie.data;
+                    maximum_bitrate = Some(Bitrate::decode(&mut data)?);
+                }
+                t if t == IeType::Gbr as u16 => {
+                    let mut data = ie.data;
+                    guaranteed_bitrate = Some(Bitrate::decode(&mut data)?);
+                }
+                t if t == IeType::Qfi as u16 => {
+                    if !ie.data.is_empty() {
+                        qfi = Some(ie.data[0]);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            qer_id,
+            gate_status,
+            maximum_bitrate,
+            guaranteed_bitrate,
+            qfi,
+        })
+    }
+}
+
+/// Create URR (Usage Reporting Rule) - grouped IE (TS 29.244 Section 7.5.2.4)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateUrr {
+    pub urr_id: u32,
+    pub measurement_method: MeasurementMethod,
+    pub reporting_triggers: ReportingTriggers,
+    pub measurement_period: Option<u32>,
+    pub volume_threshold: Option<VolumeThreshold>,
+    pub time_threshold: Option<u32>,
+}
+
+impl CreateUrr {
+    pub fn new(urr_id: u32, measurement_method: MeasurementMethod, reporting_triggers: ReportingTriggers) -> Self {
+        Self {
+            urr_id,
+            measurement_method,
+            reporting_triggers,
+            measurement_period: None,
+            volume_threshold: None,
+            time_threshold: None,
+        }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{IeHeader, IeType, encode_u8_ie, encode_u32_ie};
+
+        encode_u32_ie(buf, IeType::UrrId, self.urr_id);
+        encode_u8_ie(buf, IeType::MeasurementMethod, self.measurement_method.encode());
+
+        // Reporting Triggers is 3 bytes (24 bits used out of 32)
+        let rt_val = self.reporting_triggers.encode();
+        let header = IeHeader::new(IeType::ReportingTriggers as u16, 3);
+        header.encode(buf);
+        buf.put_u8((rt_val >> 16) as u8);
+        buf.put_u8((rt_val >> 8) as u8);
+        buf.put_u8(rt_val as u8);
+
+        if let Some(period) = self.measurement_period {
+            encode_u32_ie(buf, IeType::MeasurementPeriod, period);
+        }
+
+        if let Some(vt) = &self.volume_threshold {
+            let mut vt_buf = BytesMut::new();
+            vt.encode(&mut vt_buf);
+            let header = IeHeader::new(IeType::VolumeThreshold as u16, vt_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&vt_buf);
+        }
+
+        if let Some(tt) = self.time_threshold {
+            encode_u32_ie(buf, IeType::TimeThreshold, tt);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+
+        let mut urr_id = 0u32;
+        let mut measurement_method = MeasurementMethod::default();
+        let mut reporting_triggers = ReportingTriggers::default();
+        let mut measurement_period = None;
+        let mut volume_threshold = None;
+        let mut time_threshold = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::UrrId as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        urr_id = data.get_u32();
+                    }
+                }
+                t if t == IeType::MeasurementMethod as u16 => {
+                    if !ie.data.is_empty() {
+                        measurement_method = MeasurementMethod::decode(ie.data[0]);
+                    }
+                }
+                t if t == IeType::ReportingTriggers as u16 => {
+                    let data = &ie.data;
+                    let val = match data.len() {
+                        1 => data[0] as u32,
+                        2 => ((data[0] as u32) << 8) | (data[1] as u32),
+                        _ => ((data[0] as u32) << 16) | ((data[1] as u32) << 8) | (data[2] as u32),
+                    };
+                    reporting_triggers = ReportingTriggers::decode(val);
+                }
+                t if t == IeType::MeasurementPeriod as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        measurement_period = Some(data.get_u32());
+                    }
+                }
+                t if t == IeType::VolumeThreshold as u16 => {
+                    let mut data = ie.data;
+                    volume_threshold = Some(VolumeThreshold::decode(&mut data)?);
+                }
+                t if t == IeType::TimeThreshold as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        time_threshold = Some(data.get_u32());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            urr_id,
+            measurement_method,
+            reporting_triggers,
+            measurement_period,
+            volume_threshold,
+            time_threshold,
+        })
+    }
+}
+
+/// Create BAR (Buffering Action Rule) - grouped IE (TS 29.244 Section 7.5.2.6)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateBar {
+    pub bar_id: u8,
+    pub downlink_data_notification_delay: Option<u8>,
+    pub suggested_buffering_packets_count: Option<u8>,
+}
+
+impl CreateBar {
+    pub fn new(bar_id: u8) -> Self {
+        Self {
+            bar_id,
+            downlink_data_notification_delay: None,
+            suggested_buffering_packets_count: None,
+        }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{IeType, encode_u8_ie};
+
+        encode_u8_ie(buf, IeType::BarId, self.bar_id);
+
+        if let Some(delay) = self.downlink_data_notification_delay {
+            encode_u8_ie(buf, IeType::DownlinkDataNotificationDelay, delay);
+        }
+
+        if let Some(count) = self.suggested_buffering_packets_count {
+            encode_u8_ie(buf, IeType::SuggestedBufferingPacketsCount, count);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+
+        let mut bar_id = 0u8;
+        let mut downlink_data_notification_delay = None;
+        let mut suggested_buffering_packets_count = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::BarId as u16 => {
+                    if !ie.data.is_empty() {
+                        bar_id = ie.data[0];
+                    }
+                }
+                t if t == IeType::DownlinkDataNotificationDelay as u16 => {
+                    if !ie.data.is_empty() {
+                        downlink_data_notification_delay = Some(ie.data[0]);
+                    }
+                }
+                t if t == IeType::SuggestedBufferingPacketsCount as u16 => {
+                    if !ie.data.is_empty() {
+                        suggested_buffering_packets_count = Some(ie.data[0]);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            bar_id,
+            downlink_data_notification_delay,
+            suggested_buffering_packets_count,
+        })
+    }
+}
+
+/// Update PDR - grouped IE for Session Modification (TS 29.244 Section 7.5.4.2)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdatePdr {
+    pub pdr_id: u16,
+    pub precedence: Option<u32>,
+    pub pdi: Option<Pdi>,
+    pub outer_header_removal: Option<OuterHeaderRemoval>,
+    pub far_id: Option<u32>,
+    pub urr_ids: Vec<u32>,
+    pub qer_id: Option<u32>,
+}
+
+impl UpdatePdr {
+    pub fn new(pdr_id: u16) -> Self {
+        Self {
+            pdr_id,
+            precedence: None,
+            pdi: None,
+            outer_header_removal: None,
+            far_id: None,
+            urr_ids: Vec::new(),
+            qer_id: None,
+        }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{IeHeader, IeType, encode_u16_ie, encode_u32_ie};
+
+        encode_u16_ie(buf, IeType::PdrId, self.pdr_id);
+
+        if let Some(prec) = self.precedence {
+            encode_u32_ie(buf, IeType::Precedence, prec);
+        }
+
+        if let Some(pdi) = &self.pdi {
+            let mut pdi_buf = BytesMut::new();
+            pdi.encode(&mut pdi_buf);
+            let header = IeHeader::new(IeType::Pdi as u16, pdi_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&pdi_buf);
+        }
+
+        if let Some(ohr) = &self.outer_header_removal {
+            let mut ohr_buf = BytesMut::new();
+            ohr.encode(&mut ohr_buf);
+            let header = IeHeader::new(IeType::OuterHeaderRemoval as u16, ohr_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&ohr_buf);
+        }
+
+        if let Some(far_id) = self.far_id {
+            encode_u32_ie(buf, IeType::FarId, far_id);
+        }
+
+        for urr_id in &self.urr_ids {
+            encode_u32_ie(buf, IeType::UrrId, *urr_id);
+        }
+
+        if let Some(qer_id) = self.qer_id {
+            encode_u32_ie(buf, IeType::QerId, qer_id);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+
+        let mut pdr_id = 0u16;
+        let mut precedence = None;
+        let mut pdi = None;
+        let mut outer_header_removal = None;
+        let mut far_id = None;
+        let mut urr_ids = Vec::new();
+        let mut qer_id = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::PdrId as u16 => {
+                    if ie.data.len() >= 2 {
+                        let mut data = ie.data;
+                        pdr_id = data.get_u16();
+                    }
+                }
+                t if t == IeType::Precedence as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        precedence = Some(data.get_u32());
+                    }
+                }
+                t if t == IeType::Pdi as u16 => {
+                    let mut data = ie.data;
+                    pdi = Some(Pdi::decode(&mut data)?);
+                }
+                t if t == IeType::OuterHeaderRemoval as u16 => {
+                    let mut data = ie.data;
+                    outer_header_removal = Some(OuterHeaderRemoval::decode(&mut data)?);
+                }
+                t if t == IeType::FarId as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        far_id = Some(data.get_u32());
+                    }
+                }
+                t if t == IeType::UrrId as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        urr_ids.push(data.get_u32());
+                    }
+                }
+                t if t == IeType::QerId as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        qer_id = Some(data.get_u32());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            pdr_id,
+            precedence,
+            pdi,
+            outer_header_removal,
+            far_id,
+            urr_ids,
+            qer_id,
+        })
+    }
+}
+
+/// Update FAR - grouped IE for Session Modification (TS 29.244 Section 7.5.4.3)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateFar {
+    pub far_id: u32,
+    pub apply_action: Option<ApplyAction>,
+    pub forwarding_parameters: Option<ForwardingParameters>,
+    pub bar_id: Option<u8>,
+}
+
+impl UpdateFar {
+    pub fn new(far_id: u32) -> Self {
+        Self {
+            far_id,
+            apply_action: None,
+            forwarding_parameters: None,
+            bar_id: None,
+        }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{IeHeader, IeType, encode_u32_ie, encode_u16_ie, encode_u8_ie};
+
+        encode_u32_ie(buf, IeType::FarId, self.far_id);
+
+        if let Some(aa) = &self.apply_action {
+            encode_u16_ie(buf, IeType::ApplyAction, aa.encode());
+        }
+
+        if let Some(fp) = &self.forwarding_parameters {
+            let mut fp_buf = BytesMut::new();
+            fp.encode(&mut fp_buf);
+            let header = IeHeader::new(IeType::UpdateForwardingParameters as u16, fp_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&fp_buf);
+        }
+
+        if let Some(bar_id) = self.bar_id {
+            encode_u8_ie(buf, IeType::BarId, bar_id);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+
+        let mut far_id = 0u32;
+        let mut apply_action = None;
+        let mut forwarding_parameters = None;
+        let mut bar_id = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::FarId as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        far_id = data.get_u32();
+                    }
+                }
+                t if t == IeType::ApplyAction as u16 => {
+                    if ie.data.len() >= 2 {
+                        let mut data = ie.data;
+                        apply_action = Some(ApplyAction::decode(data.get_u16()));
+                    }
+                }
+                t if t == IeType::UpdateForwardingParameters as u16 => {
+                    let mut data = ie.data;
+                    forwarding_parameters = Some(ForwardingParameters::decode(&mut data)?);
+                }
+                t if t == IeType::BarId as u16 => {
+                    if !ie.data.is_empty() {
+                        bar_id = Some(ie.data[0]);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            far_id,
+            apply_action,
+            forwarding_parameters,
+            bar_id,
+        })
+    }
+}
+
+/// Remove PDR - grouped IE for Session Modification
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovePdr {
+    pub pdr_id: u16,
+}
+
+impl RemovePdr {
+    pub fn new(pdr_id: u16) -> Self {
+        Self { pdr_id }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{IeType, encode_u16_ie};
+        encode_u16_ie(buf, IeType::PdrId, self.pdr_id);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+        let mut pdr_id = 0u16;
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            if ie.ie_type == IeType::PdrId as u16 && ie.data.len() >= 2 {
+                let mut data = ie.data;
+                pdr_id = data.get_u16();
+            }
+        }
+        Ok(Self { pdr_id })
+    }
+}
+
+/// Remove FAR - grouped IE for Session Modification
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveFar {
+    pub far_id: u32,
+}
+
+impl RemoveFar {
+    pub fn new(far_id: u32) -> Self {
+        Self { far_id }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{IeType, encode_u32_ie};
+        encode_u32_ie(buf, IeType::FarId, self.far_id);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+        let mut far_id = 0u32;
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            if ie.ie_type == IeType::FarId as u16 && ie.data.len() >= 4 {
+                let mut data = ie.data;
+                far_id = data.get_u32();
+            }
+        }
+        Ok(Self { far_id })
+    }
+}
+
+/// Usage Report (Session Report) - grouped IE in Session Report Request
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageReportSrr {
+    pub urr_id: u32,
+    pub ur_seqn: Option<u32>,
+    pub usage_report_trigger: Option<u32>,
+    pub volume_measurement: Option<VolumeMeasurement>,
+    pub duration_measurement: Option<u32>,
+    pub start_time: Option<u32>,
+    pub end_time: Option<u32>,
+}
+
+impl UsageReportSrr {
+    pub fn new(urr_id: u32) -> Self {
+        Self {
+            urr_id,
+            ur_seqn: None,
+            usage_report_trigger: None,
+            volume_measurement: None,
+            duration_measurement: None,
+            start_time: None,
+            end_time: None,
+        }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{IeHeader, IeType, encode_u32_ie};
+
+        encode_u32_ie(buf, IeType::UrrId, self.urr_id);
+
+        if let Some(seqn) = self.ur_seqn {
+            encode_u32_ie(buf, IeType::UrSeqn, seqn);
+        }
+
+        if let Some(trigger) = self.usage_report_trigger {
+            let header = IeHeader::new(IeType::UsageReportTrigger as u16, 3);
+            header.encode(buf);
+            buf.put_u8((trigger >> 16) as u8);
+            buf.put_u8((trigger >> 8) as u8);
+            buf.put_u8(trigger as u8);
+        }
+
+        if let Some(vm) = &self.volume_measurement {
+            let mut vm_buf = BytesMut::new();
+            vm.encode(&mut vm_buf);
+            let header = IeHeader::new(IeType::VolumeMeasurement as u16, vm_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&vm_buf);
+        }
+
+        if let Some(dm) = self.duration_measurement {
+            encode_u32_ie(buf, IeType::DurationMeasurement, dm);
+        }
+
+        if let Some(st) = self.start_time {
+            encode_u32_ie(buf, IeType::StartTime, st);
+        }
+
+        if let Some(et) = self.end_time {
+            encode_u32_ie(buf, IeType::EndTime, et);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+
+        let mut urr_id = 0u32;
+        let mut ur_seqn = None;
+        let mut usage_report_trigger = None;
+        let mut volume_measurement = None;
+        let mut duration_measurement = None;
+        let mut start_time = None;
+        let mut end_time = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::UrrId as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        urr_id = data.get_u32();
+                    }
+                }
+                t if t == IeType::UrSeqn as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        ur_seqn = Some(data.get_u32());
+                    }
+                }
+                t if t == IeType::UsageReportTrigger as u16 => {
+                    let data = &ie.data;
+                    let val = match data.len() {
+                        1 => data[0] as u32,
+                        2 => ((data[0] as u32) << 8) | (data[1] as u32),
+                        _ => ((data[0] as u32) << 16) | ((data[1] as u32) << 8) | (data[2] as u32),
+                    };
+                    usage_report_trigger = Some(val);
+                }
+                t if t == IeType::VolumeMeasurement as u16 => {
+                    let mut data = ie.data;
+                    volume_measurement = Some(VolumeMeasurement::decode(&mut data)?);
+                }
+                t if t == IeType::DurationMeasurement as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        duration_measurement = Some(data.get_u32());
+                    }
+                }
+                t if t == IeType::StartTime as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        start_time = Some(data.get_u32());
+                    }
+                }
+                t if t == IeType::EndTime as u16 => {
+                    if ie.data.len() >= 4 {
+                        let mut data = ie.data;
+                        end_time = Some(data.get_u32());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            urr_id,
+            ur_seqn,
+            usage_report_trigger,
+            volume_measurement,
+            duration_measurement,
+            start_time,
+            end_time,
+        })
+    }
+}
+
+/// Downlink Data Report - grouped IE in Session Report Request
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownlinkDataReport {
+    pub pdr_id: u16,
+}
+
+impl DownlinkDataReport {
+    pub fn new(pdr_id: u16) -> Self {
+        Self { pdr_id }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{IeType, encode_u16_ie};
+        encode_u16_ie(buf, IeType::PdrId, self.pdr_id);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        use crate::ie::{IeHeader, IeType, RawIe};
+        let mut pdr_id = 0u16;
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            if ie.ie_type == IeType::PdrId as u16 && ie.data.len() >= 2 {
+                let mut data = ie.data;
+                pdr_id = data.get_u16();
+            }
+        }
+        Ok(Self { pdr_id })
+    }
+}

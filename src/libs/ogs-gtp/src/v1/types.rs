@@ -25,7 +25,7 @@ impl TryFrom<u8> for ExtensionHeaderType {
             0x00 => Ok(ExtensionHeaderType::NoMoreExtensionHeaders),
             0x40 => Ok(ExtensionHeaderType::UdpPort),
             0x85 => Ok(ExtensionHeaderType::PduSessionContainer),
-            _ => Err(GtpError::InvalidFormat(format!("Unknown extension header type: {:#x}", value))),
+            _ => Err(GtpError::InvalidFormat(format!("Unknown extension header type: {value:#x}"))),
         }
     }
 }
@@ -47,7 +47,7 @@ impl TryFrom<u8> for PduType {
         match value {
             0 => Ok(PduType::DlPduSessionInformation),
             1 => Ok(PduType::UlPduSessionInformation),
-            _ => Err(GtpError::InvalidFormat(format!("Unknown PDU type: {}", value))),
+            _ => Err(GtpError::InvalidFormat(format!("Unknown PDU type: {value}"))),
         }
     }
 }
@@ -369,7 +369,7 @@ impl TryFrom<u8> for RatType {
             4 => Ok(RatType::Gan),
             5 => Ok(RatType::HspaEvolution),
             6 => Ok(RatType::Eutran),
-            _ => Err(GtpError::InvalidFormat(format!("Unknown RAT type: {}", value))),
+            _ => Err(GtpError::InvalidFormat(format!("Unknown RAT type: {value}"))),
         }
     }
 }
@@ -497,7 +497,7 @@ impl Uli {
             0 => Ok(Uli::Cgi(UliCgi { plmn_id, lac, ci: value })),
             1 => Ok(Uli::Sai(UliSai { plmn_id, lac, sac: value })),
             2 => Ok(Uli::Rai(UliRai { plmn_id, lac, rac: value })),
-            _ => Err(GtpError::InvalidFormat(format!("Unknown geo location type: {}", geo_loc_type))),
+            _ => Err(GtpError::InvalidFormat(format!("Unknown geo location type: {geo_loc_type}"))),
         }
     }
 }
@@ -543,7 +543,7 @@ impl GsnAddress {
                 buf.copy_to_slice(&mut addr);
                 Ok(GsnAddress::Ipv6(addr))
             }
-            _ => Err(GtpError::InvalidFormat(format!("Invalid GSN address length: {}", len))),
+            _ => Err(GtpError::InvalidFormat(format!("Invalid GSN address length: {len}"))),
         }
     }
 }
