@@ -34,5 +34,5 @@ USER nextgcore
 
 EXPOSE 7777 38412 9090 8805/udp 2152/udp
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD pgrep -f nf-binary || exit 1
+HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3 \
+    CMD curl -sf http://localhost:7777/health || exit 1

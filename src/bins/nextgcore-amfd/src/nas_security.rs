@@ -479,24 +479,57 @@ pub struct SecurityAlgorithmSet {
     pub integrity: u8,  // bit mask
 }
 
+/// PQC algorithm identifiers (Rel-20 research, using spare 5G-EA4/5G-IA4 slots)
+pub mod pqc_algorithm {
+    /// 5G-EA4: Hybrid KEM (X25519 + ML-KEM-768) for key derivation
+    pub const NEA4_PQC_HYBRID: u8 = 4;
+    /// 5G-IA4: ML-DSA-65 for integrity (FIPS 204)
+    pub const NIA4_PQC_DSA: u8 = 4;
+}
+
+/// PQC configuration for NAS security
+#[derive(Debug, Clone, Default)]
+pub struct PqcConfig {
+    /// Enable PQC algorithms in algorithm selection
+    pub enabled: bool,
+    /// Prefer PQC over classical when both UE and network support it
+    pub prefer_pqc: bool,
+}
+
 /// Select best encryption algorithm
 ///
-/// Returns algorithm ID (0=NEA0, 1=NEA1, 2=NEA2, 3=NEA3)
-/// Selection priority: NEA2 > NEA1 > NEA3 > NEA0
+/// Returns algorithm ID (0=NEA0, 1=NEA1, 2=NEA2, 3=NEA3, 4=NEA4-PQC)
+/// Selection priority (PQC enabled): NEA4 > NEA2 > NEA1 > NEA3 > NEA0
+/// Selection priority (PQC disabled): NEA2 > NEA1 > NEA3 > NEA0
 pub fn select_encryption_algorithm(
     ue_algos: u8,
     amf_supported: u8,
 ) -> u8 {
-    // Intersect UE and AMF supported algorithms
+    select_encryption_algorithm_with_pqc(ue_algos, amf_supported, &PqcConfig::default())
+}
+
+/// Select best encryption algorithm with PQC support
+pub fn select_encryption_algorithm_with_pqc(
+    ue_algos: u8,
+    amf_supported: u8,
+    pqc: &PqcConfig,
+) -> u8 {
     let supported = ue_algos & amf_supported;
 
-    // Priority order: NEA2 (AES) > NEA1 (SNOW 3G) > NEA3 (ZUC) > NEA0 (null)
+    // If PQC enabled + preferred, try NEA4 first
+    if pqc.enabled && pqc.prefer_pqc && supported & (1 << 4) != 0 {
+        return pqc_algorithm::NEA4_PQC_HYBRID;
+    }
+
+    // Classical priority: NEA2 (AES) > NEA1 (SNOW 3G) > NEA3 (ZUC) > NEA0 (null)
     if supported & (1 << 2) != 0 {
         2 // NEA2 (AES-CTR)
     } else if supported & (1 << 1) != 0 {
         1 // NEA1 (SNOW 3G)
     } else if supported & (1 << 3) != 0 {
         3 // NEA3 (ZUC)
+    } else if pqc.enabled && supported & (1 << 4) != 0 {
+        pqc_algorithm::NEA4_PQC_HYBRID // Fallback to PQC if no classical available
     } else {
         0 // NEA0 (null encryption)
     }
@@ -504,23 +537,38 @@ pub fn select_encryption_algorithm(
 
 /// Select best integrity algorithm
 ///
-/// Returns algorithm ID (0=NIA0, 1=NIA1, 2=NIA2, 3=NIA3)
-/// Selection priority: NIA2 > NIA1 > NIA3 > NIA0
+/// Returns algorithm ID (0=NIA0, 1=NIA1, 2=NIA2, 3=NIA3, 4=NIA4-PQC)
+/// Selection priority (PQC enabled): NIA4 > NIA2 > NIA1 > NIA3 > NIA0
+/// Selection priority (PQC disabled): NIA2 > NIA1 > NIA3 > NIA0
 pub fn select_integrity_algorithm(
     ue_algos: u8,
     amf_supported: u8,
 ) -> u8 {
-    // Intersect UE and AMF supported algorithms
+    select_integrity_algorithm_with_pqc(ue_algos, amf_supported, &PqcConfig::default())
+}
+
+/// Select best integrity algorithm with PQC support
+pub fn select_integrity_algorithm_with_pqc(
+    ue_algos: u8,
+    amf_supported: u8,
+    pqc: &PqcConfig,
+) -> u8 {
     let supported = ue_algos & amf_supported;
 
-    // Priority order: NIA2 (AES) > NIA1 (SNOW 3G) > NIA3 (ZUC) > NIA0 (null)
-    // Note: NIA0 should not be selected unless it's the only option
+    // If PQC enabled + preferred, try NIA4 first
+    if pqc.enabled && pqc.prefer_pqc && supported & (1 << 4) != 0 {
+        return pqc_algorithm::NIA4_PQC_DSA;
+    }
+
+    // Classical priority: NIA2 (AES) > NIA1 (SNOW 3G) > NIA3 (ZUC) > NIA0 (null)
     if supported & (1 << 2) != 0 {
         2 // NIA2 (AES-CMAC)
     } else if supported & (1 << 1) != 0 {
         1 // NIA1 (SNOW 3G)
     } else if supported & (1 << 3) != 0 {
         3 // NIA3 (ZUC)
+    } else if pqc.enabled && supported & (1 << 4) != 0 {
+        pqc_algorithm::NIA4_PQC_DSA
     } else if supported & (1 << 0) != 0 {
         0 // NIA0 (null integrity) - only as last resort
     } else {
@@ -567,6 +615,7 @@ pub fn get_encryption_algorithm_name(algo: u8) -> &'static str {
         1 => "128-NEA1",
         2 => "128-NEA2",
         3 => "128-NEA3",
+        4 => "PQC-NEA4 (X25519+ML-KEM-768)",
         _ => "Unknown",
     }
 }
@@ -578,6 +627,7 @@ pub fn get_integrity_algorithm_name(algo: u8) -> &'static str {
         1 => "128-NIA1",
         2 => "128-NIA2",
         3 => "128-NIA3",
+        4 => "PQC-NIA4 (ML-DSA-65)",
         _ => "Unknown",
     }
 }

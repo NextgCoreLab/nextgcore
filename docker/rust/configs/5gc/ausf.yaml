@@ -19,3 +19,7 @@ ausf:
     client:
       nrf:
         - uri: http://172.23.0.10:7777
+  security:
+    pqc:
+      enabled: false
+      prefer_pqc: false
