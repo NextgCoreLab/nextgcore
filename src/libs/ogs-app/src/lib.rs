@@ -9,6 +9,7 @@ pub mod yaml;
 pub mod config;
 pub mod context;
 pub mod init;
+pub mod intent;  // B3.2: Intent-based configuration translation
 
 #[cfg(test)]
 mod property_tests;
@@ -30,6 +31,11 @@ pub use context::{
 pub use init::{
     InitError, CommandLineOptions, OgsAppInitializer,
     ogs_app_initialize, ogs_app_terminate, ogs_app_config_read,
+};
+pub use intent::{
+    NetworkIntent, IntentTranslator, IntentError, IntentResult,
+    IntentPriority, SliceIntent, QosIntent, SecurityIntent, EnergyIntent,
+    AiMlIntent, DerivedConfig,
 };
 
 // Macros are automatically exported via #[macro_export]

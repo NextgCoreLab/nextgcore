@@ -2,6 +2,9 @@
 //!
 //! Port of src/amf/sbi-path.c - SBI service discovery and message routing
 
+use base64::Engine;
+use ogs_sbi::client::SbiClient;
+
 use crate::context::{AmfUe, AmfSess, RanUe};
 
 // ============================================================================
@@ -394,6 +397,292 @@ pub fn amf_sess_have_session_release_pending(_sess: &AmfSess) -> bool {
     // Note: Check session state for pending release
     // Release state tracked via n1_released/n2_released flags and resource_status
     false
+}
+
+// ============================================================================
+// SMF SBI Client Functions
+// ============================================================================
+
+/// SM Context Create response from SMF
+pub struct SmContextCreateResponse {
+    /// N1 SM message (NAS PDU Session Establishment Accept)
+    pub n1_sm_msg: Vec<u8>,
+    /// N2 SM Information (UPF tunnel endpoint)
+    pub n2_sm_info: Vec<u8>,
+    /// SM Context reference
+    pub sm_context_ref: String,
+}
+
+/// Call SMF to create SM context (POST /nsmf-pdusession/v1/sm-contexts)
+///
+/// Returns the N1 SM message (PDU Session Accept), N2 SM Info (UPF TEID/addr),
+/// and SM Context reference for subsequent updates.
+pub async fn call_smf_create_sm_context(
+    smf_host: &str,
+    smf_port: u16,
+    pdu_session_id: u8,
+    sst: u8,
+    sd: Option<u32>,
+    dnn: &str,
+    n1_sm_msg_from_ue: &[u8],
+) -> SbiResult<SmContextCreateResponse> {
+    log::info!(
+        "Calling SMF SM Context Create: {}:{}, PSI={}, SST={}, DNN={}",
+        smf_host, smf_port, pdu_session_id, sst, dnn
+    );
+
+    let client = SbiClient::with_host_port(smf_host, smf_port);
+
+    let body = serde_json::json!({
+        "pduSessionId": pdu_session_id,
+        "sNssai": {
+            "sst": sst,
+            "sd": sd.map(|v| format!("{:06x}", v))
+        },
+        "dnn": dnn,
+        "n1SmMsg": base64::engine::general_purpose::STANDARD.encode(n1_sm_msg_from_ue),
+        "servingNetwork": {
+            "mcc": "001",
+            "mnc": "01"
+        }
+    });
+
+    let response = client.post_json("/nsmf-pdusession/v1/sm-contexts", &body)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("SMF request failed: {}", e)))?;
+
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "SMF returned status {}", response.status
+        )));
+    }
+
+    let response_body: serde_json::Value = match &response.http.content {
+        Some(content) => serde_json::from_str(content)
+            .map_err(|e| SbiError::ResponseParseError(format!("Invalid JSON: {}", e)))?,
+        None => return Err(SbiError::ResponseParseError("Empty response body".to_string())),
+    };
+
+    // Extract SM Context ref from Location header or response body
+    let sm_context_ref = response.http.headers.get("location")
+        .and_then(|loc| loc.rsplit('/').next().map(|s| s.to_string()))
+        .or_else(|| response_body["smContextRef"].as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "1".to_string());
+
+    // Extract N1 SM message (base64-encoded PDU Session Accept from SMF)
+    let n1_sm_msg = response_body["n1SmMsg"].as_str()
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+        .unwrap_or_default();
+
+    // Extract N2 SM Information (base64-encoded UPF tunnel info from SMF)
+    let n2_sm_info = response_body["n2SmInfo"].as_str()
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+        .unwrap_or_default();
+
+    log::info!(
+        "SMF SM Context Created: ref={}, n1_len={}, n2_len={}",
+        sm_context_ref, n1_sm_msg.len(), n2_sm_info.len()
+    );
+
+    Ok(SmContextCreateResponse {
+        n1_sm_msg,
+        n2_sm_info,
+        sm_context_ref,
+    })
+}
+
+/// Call SMF to update SM context (POST /nsmf-pdusession/v1/sm-contexts/{ref}/modify)
+///
+/// Used to send gNB TEID back to SMF after PDU Session Resource Setup Response.
+pub async fn call_smf_update_sm_context(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+    n2_sm_info: &[u8],
+) -> SbiResult<()> {
+    log::info!(
+        "Calling SMF SM Context Update: ref={}, n2_info_len={}",
+        sm_context_ref, n2_sm_info.len()
+    );
+
+    let client = SbiClient::with_host_port(smf_host, smf_port);
+
+    let body = serde_json::json!({
+        "n2SmInfo": base64::engine::general_purpose::STANDARD.encode(n2_sm_info),
+        "n2SmInfoType": "PDU_RES_SETUP_RSP"
+    });
+
+    let path = format!("/nsmf-pdusession/v1/sm-contexts/{}/modify", sm_context_ref);
+    let response = client.post_json(&path, &body)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("SMF update failed: {}", e)))?;
+
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "SMF update returned status {}", response.status
+        )));
+    }
+
+    log::info!("SMF SM Context Updated: ref={}", sm_context_ref);
+    Ok(())
+}
+
+// ============================================================================
+// AUSF SBI Client Functions
+// ============================================================================
+
+/// AUSF authentication response
+pub struct AusfAuthResponse {
+    /// RAND (16 bytes)
+    pub rand: [u8; 16],
+    /// AUTN (16 bytes)
+    pub autn: [u8; 16],
+    /// HXRES* (16 bytes)
+    pub hxres_star: [u8; 16],
+    /// Auth context ID (for 5G-AKA confirmation)
+    pub auth_ctx_id: String,
+}
+
+/// Call AUSF to authenticate UE (POST /nausf-auth/v1/ue-authentications)
+pub async fn call_ausf_authenticate(
+    ausf_host: &str,
+    ausf_port: u16,
+    suci: &str,
+    serving_network_name: &str,
+) -> SbiResult<AusfAuthResponse> {
+    log::info!(
+        "Calling AUSF authenticate: {}:{}, SUCI={}, SNN={}",
+        ausf_host, ausf_port, suci, serving_network_name
+    );
+
+    let client = SbiClient::with_host_port(ausf_host, ausf_port);
+
+    let body = serde_json::json!({
+        "supiOrSuci": suci,
+        "servingNetworkName": serving_network_name
+    });
+
+    let response = client.post_json("/nausf-auth/v1/ue-authentications", &body)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("AUSF request failed: {}", e)))?;
+
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "AUSF returned status {}", response.status
+        )));
+    }
+
+    let response_body: serde_json::Value = match &response.http.content {
+        Some(content) => serde_json::from_str(content)
+            .map_err(|e| SbiError::ResponseParseError(format!("Invalid JSON: {}", e)))?,
+        None => return Err(SbiError::ResponseParseError("Empty response body".to_string())),
+    };
+
+    // Extract auth data
+    let auth_data = &response_body["5gAuthData"];
+
+    let rand = hex_to_16bytes(auth_data["rand"].as_str().unwrap_or(""))
+        .map_err(|e| SbiError::ResponseParseError(format!("Invalid RAND: {}", e)))?;
+    let autn = hex_to_16bytes(auth_data["autn"].as_str().unwrap_or(""))
+        .map_err(|e| SbiError::ResponseParseError(format!("Invalid AUTN: {}", e)))?;
+    let hxres_star = hex_to_16bytes(auth_data["hxresStar"].as_str().unwrap_or(""))
+        .map_err(|e| SbiError::ResponseParseError(format!("Invalid HXRES*: {}", e)))?;
+
+    // Extract auth context ID from Location header
+    let auth_ctx_id = response.http.headers.get("location")
+        .and_then(|loc| loc.rsplit('/').next().map(|s| s.to_string()))
+        .unwrap_or_else(|| "1".to_string());
+
+    log::info!(
+        "AUSF auth response: ctx_id={}, RAND={}, AUTN={}",
+        auth_ctx_id,
+        hex::encode(&rand[..4]),
+        hex::encode(&autn[..4])
+    );
+
+    Ok(AusfAuthResponse {
+        rand,
+        autn,
+        hxres_star,
+        auth_ctx_id,
+    })
+}
+
+/// AUSF 5G-AKA confirmation response
+pub struct AusfConfirmResponse {
+    /// Auth result
+    pub auth_result: String,
+    /// KSEAF (32 bytes)
+    pub kseaf: [u8; 32],
+    /// SUPI
+    pub supi: Option<String>,
+}
+
+/// Call AUSF for 5G-AKA confirmation (PUT /nausf-auth/v1/ue-authentications/{id}/5g-aka-confirmation)
+pub async fn call_ausf_5g_aka_confirm(
+    ausf_host: &str,
+    ausf_port: u16,
+    auth_ctx_id: &str,
+    res_star: &[u8; 16],
+) -> SbiResult<AusfConfirmResponse> {
+    log::info!(
+        "Calling AUSF 5G-AKA confirmation: ctx_id={}, RES*={}",
+        auth_ctx_id, hex::encode(&res_star[..4])
+    );
+
+    let client = SbiClient::with_host_port(ausf_host, ausf_port);
+
+    let body = serde_json::json!({
+        "resStar": hex::encode(res_star)
+    });
+
+    let path = format!("/nausf-auth/v1/ue-authentications/{}/5g-aka-confirmation", auth_ctx_id);
+    let response = client.put_json(&path, &body)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("AUSF confirmation failed: {}", e)))?;
+
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "AUSF confirmation returned status {}", response.status
+        )));
+    }
+
+    let response_body: serde_json::Value = match &response.http.content {
+        Some(content) => serde_json::from_str(content)
+            .map_err(|e| SbiError::ResponseParseError(format!("Invalid JSON: {}", e)))?,
+        None => return Err(SbiError::ResponseParseError("Empty response body".to_string())),
+    };
+
+    let auth_result = response_body["authResult"].as_str().unwrap_or("UNKNOWN").to_string();
+
+    let kseaf_hex = response_body["kseaf"].as_str().unwrap_or("");
+    let kseaf_bytes = hex::decode(kseaf_hex)
+        .map_err(|e| SbiError::ResponseParseError(format!("Invalid KSEAF: {}", e)))?;
+    let mut kseaf = [0u8; 32];
+    if kseaf_bytes.len() >= 32 {
+        kseaf.copy_from_slice(&kseaf_bytes[..32]);
+    }
+
+    let supi = response_body["supi"].as_str().map(|s| s.to_string());
+
+    log::info!("AUSF 5G-AKA confirmation: result={}, supi={:?}", auth_result, supi);
+
+    Ok(AusfConfirmResponse {
+        auth_result,
+        kseaf,
+        supi,
+    })
+}
+
+/// Helper: convert hex string to [u8; 16]
+fn hex_to_16bytes(hex_str: &str) -> Result<[u8; 16], String> {
+    let bytes = hex::decode(hex_str).map_err(|e| format!("hex decode: {}", e))?;
+    if bytes.len() != 16 {
+        return Err(format!("expected 16 bytes, got {}", bytes.len()));
+    }
+    let mut arr = [0u8; 16];
+    arr.copy_from_slice(&bytes);
+    Ok(arr)
 }
 
 // ============================================================================

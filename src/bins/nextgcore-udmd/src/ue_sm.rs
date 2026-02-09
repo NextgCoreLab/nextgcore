@@ -215,8 +215,8 @@ impl UdmUeSmContext {
                 self.handle_nudm_sdm_request(&method, &resource_components, stream_id, num_of_dataset_names);
             }
             _ => {
-                log::error!("Invalid API name [{}]", service_name);
-                send_error_response(stream_id, 400, &format!("Invalid API name: {}", service_name));
+                log::error!("Invalid API name [{service_name}]");
+                send_error_response(stream_id, 400, &format!("Invalid API name: {service_name}"));
             }
         }
     }
@@ -251,8 +251,8 @@ impl UdmUeSmContext {
                             self.udm_ue_id, stream_id, &request);
                     }
                     _ => {
-                        log::error!("[{}] Invalid resource name [{:?}]", suci, resource);
-                        send_error_response(stream_id, 404, &format!("Resource not found: {:?}", resource));
+                        log::error!("[{suci}] Invalid resource name [{resource:?}]");
+                        send_error_response(stream_id, 404, &format!("Resource not found: {resource:?}"));
                     }
                 }
             }
@@ -266,13 +266,13 @@ impl UdmUeSmContext {
                             self.udm_ue_id, stream_id, &request);
                     }
                     _ => {
-                        log::error!("[{}] Invalid resource name [{:?}]", suci, resource);
-                        send_error_response(stream_id, 404, &format!("Resource not found: {:?}", resource));
+                        log::error!("[{suci}] Invalid resource name [{resource:?}]");
+                        send_error_response(stream_id, 404, &format!("Resource not found: {resource:?}"));
                     }
                 }
             }
             _ => {
-                log::error!("[{}] Invalid HTTP method [{}]", suci, method);
+                log::error!("[{suci}] Invalid HTTP method [{method}]");
                 send_method_not_allowed_response(stream_id, method, "nudm-ueau");
             }
         }
@@ -302,8 +302,8 @@ impl UdmUeSmContext {
                         self.udm_ue_id, stream_id, &request);
                 }
                 _ => {
-                    log::error!("[{}] Invalid resource name [{:?}]", suci, resource);
-                    send_error_response(stream_id, 404, &format!("Resource not found: {:?}", resource));
+                    log::error!("[{suci}] Invalid resource name [{resource:?}]");
+                    send_error_response(stream_id, 404, &format!("Resource not found: {resource:?}"));
                 }
             },
             "PATCH" => match resource {
@@ -314,8 +314,8 @@ impl UdmUeSmContext {
                         self.udm_ue_id, stream_id, &request);
                 }
                 _ => {
-                    log::error!("[{}] Invalid resource name [{:?}]", suci, resource);
-                    send_error_response(stream_id, 404, &format!("Resource not found: {:?}", resource));
+                    log::error!("[{suci}] Invalid resource name [{resource:?}]");
+                    send_error_response(stream_id, 404, &format!("Resource not found: {resource:?}"));
                 }
             },
             "GET" => match resource {
@@ -324,17 +324,17 @@ impl UdmUeSmContext {
                     let (result, _registration) = nudm_handler::udm_nudm_uecm_handle_amf_registration_get(
                         self.udm_ue_id, stream_id, resource_name);
                     if !result.success {
-                        log::error!("[{}] Invalid UE Identifier", suci);
+                        log::error!("[{suci}] Invalid UE Identifier");
                         send_error_response(stream_id, 403, "Invalid UE Identifier");
                     }
                 }
                 _ => {
-                    log::error!("[{}] Invalid resource name [{:?}]", suci, resource);
-                    send_error_response(stream_id, 404, &format!("Resource not found: {:?}", resource));
+                    log::error!("[{suci}] Invalid resource name [{resource:?}]");
+                    send_error_response(stream_id, 404, &format!("Resource not found: {resource:?}"));
                 }
             },
             _ => {
-                log::error!("[{}] Invalid HTTP method [{}]", suci, method);
+                log::error!("[{suci}] Invalid HTTP method [{method}]");
                 send_method_not_allowed_response(stream_id, method, "nudm-uecm");
             }
         }
@@ -391,8 +391,8 @@ impl UdmUeSmContext {
                         );
                     }
                     _ => {
-                        log::error!("[{}] Invalid resource name [{:?}]", suci, resource);
-                        send_error_response(stream_id, 404, &format!("Resource not found: {:?}", resource));
+                        log::error!("[{suci}] Invalid resource name [{resource:?}]");
+                        send_error_response(stream_id, 404, &format!("Resource not found: {resource:?}"));
                     }
                 }
             }
@@ -404,8 +404,8 @@ impl UdmUeSmContext {
                         self.udm_ue_id, stream_id, &request);
                 }
                 _ => {
-                    log::error!("[{}] Invalid resource name [{:?}]", suci, resource);
-                    send_error_response(stream_id, 404, &format!("Resource not found: {:?}", resource));
+                    log::error!("[{suci}] Invalid resource name [{resource:?}]");
+                    send_error_response(stream_id, 404, &format!("Resource not found: {resource:?}"));
                 }
             },
             "DELETE" => match resource {
@@ -415,12 +415,12 @@ impl UdmUeSmContext {
                         self.udm_ue_id, stream_id, subscription_id);
                 }
                 _ => {
-                    log::error!("[{}] Invalid resource name [{:?}]", suci, resource);
-                    send_error_response(stream_id, 404, &format!("Resource not found: {:?}", resource));
+                    log::error!("[{suci}] Invalid resource name [{resource:?}]");
+                    send_error_response(stream_id, 404, &format!("Resource not found: {resource:?}"));
                 }
             },
             _ => {
-                log::error!("[{}] Invalid HTTP method [{}]", suci, method);
+                log::error!("[{suci}] Invalid HTTP method [{method}]");
                 send_method_not_allowed_response(stream_id, method, "nudm-sdm");
             }
         }
@@ -476,8 +476,8 @@ impl UdmUeSmContext {
                 self.handle_nudr_dr_response(&suci, &resource_components, stream_id, state);
             }
             _ => {
-                log::error!("Invalid API name [{}]", service_name);
-                send_error_response(stream_id, 400, &format!("Invalid API name: {}", service_name));
+                log::error!("Invalid API name [{service_name}]");
+                send_error_response(stream_id, 400, &format!("Invalid API name: {service_name}"));
             }
         }
     }
@@ -547,9 +547,7 @@ impl UdmUeSmContext {
                             }
                             _ => {
                                 log::error!(
-                                    "[{}] Invalid resource name [{:?}]",
-                                    suci,
-                                    resource2
+                                    "[{suci}] Invalid resource name [{resource2:?}]"
                                 );
                             }
                         }
@@ -557,7 +555,7 @@ impl UdmUeSmContext {
                 }
             }
             _ => {
-                log::error!("[{}] Invalid resource name [{:?}]", suci, resource);
+                log::error!("[{suci}] Invalid resource name [{resource:?}]");
             }
         }
     }

@@ -191,11 +191,11 @@ pub enum IpfwError {
 impl fmt::Display for IpfwError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            IpfwError::InvalidSyntax(msg) => write!(f, "Invalid syntax: {}", msg),
-            IpfwError::MissingKeyword(kw) => write!(f, "Missing keyword: {}", kw),
-            IpfwError::InvalidAddress(addr) => write!(f, "Invalid address: {}", addr),
-            IpfwError::InvalidPort(port) => write!(f, "Invalid port: {}", port),
-            IpfwError::InvalidProtocol(proto) => write!(f, "Invalid protocol: {}", proto),
+            IpfwError::InvalidSyntax(msg) => write!(f, "Invalid syntax: {msg}"),
+            IpfwError::MissingKeyword(kw) => write!(f, "Missing keyword: {kw}"),
+            IpfwError::InvalidAddress(addr) => write!(f, "Invalid address: {addr}"),
+            IpfwError::InvalidPort(port) => write!(f, "Invalid port: {port}"),
+            IpfwError::InvalidProtocol(proto) => write!(f, "Invalid protocol: {proto}"),
         }
     }
 }

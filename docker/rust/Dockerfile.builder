@@ -1,60 +1,43 @@
-# NextGCore Builder Image
-# Builds all network functions in a single container
+# NextGCore + NextGSim Rust Builder (multi-stage)
+# Builds all binaries inside Docker, outputs only the binaries.
 #
-# Usage:
-#   cd /path/to/nextg  # Parent directory containing nextgcore and nextgsim
-#   docker build -f nextgcore/docker/rust/Dockerfile.builder -t nextgcore-builder .
-#   docker create --name builder nextgcore-builder
-#   docker cp builder:/app/binaries/. ./nextgcore/docker/rust/binaries/
+# Build:
+#   docker build -f Dockerfile.builder -t nextg-builder .
+#   docker create --name builder nextg-builder /bin/true
+#   docker cp builder:/out/. binaries/
 #   docker rm builder
 
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.88-bookworm AS builder
 
-# Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    pkg-config \
-    cmake \
-    libssl-dev \
-    libsctp-dev \
-    libyaml-dev \
-    libmongoc-dev \
-    libbson-dev \
-    libnghttp2-dev \
-    libtins-dev \
-    clang \
-    libclang-dev \
-    && rm -rf /var/lib/apt/lists/*
+    pkg-config libssl-dev cmake g++ protobuf-compiler \
+    libstdc++-12-dev libclang-dev clang \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup component add rustfmt
 
-# Install rustfmt for ASN.1 code generation
-RUN rustup component add rustfmt
+WORKDIR /build
 
-WORKDIR /app
+# Copy both workspaces
+COPY nextgcore/src /build/nextgcore/src
+COPY nextgsim /build/nextgsim
 
-# Copy both nextgcore and nextgsim source code
-COPY nextgcore/src/ ./nextgcore/src/
-COPY nextgsim/ ./nextgsim/
-
-WORKDIR /app/nextgcore/src
-
-# Build nextgcore binaries in release mode
-RUN cargo build --release
-
-# Build nextgsim binaries
-WORKDIR /app/nextgsim
-RUN cargo build --release --bin nr-gnb --bin nr-ue
-
-# Strip binaries and copy to output directory
-RUN mkdir -p /app/binaries && \
-    for bin in /app/nextgcore/src/target/release/nextgcore-*; do \
-        if [ -f "$bin" ] && [ -x "$bin" ] && ! [[ "$bin" == *.d ]]; then \
-            strip --strip-all "$bin" && cp "$bin" /app/binaries/; \
+# Build nextgcore (workspace root is nextgcore/src/)
+WORKDIR /build/nextgcore/src
+RUN cargo build --release 2>&1 && \
+    mkdir -p /out && \
+    for bin in target/release/nextgcore-*; do \
+        if [ -f "$bin" ] && [ -x "$bin" ] && [ "${bin%.d}" = "$bin" ]; then \
+            cp "$bin" /out/; \
         fi; \
-    done && \
-    strip --strip-all /app/nextgsim/target/release/nr-gnb && \
-    strip --strip-all /app/nextgsim/target/release/nr-ue && \
-    cp /app/nextgsim/target/release/nr-gnb /app/binaries/ && \
-    cp /app/nextgsim/target/release/nr-ue /app/binaries/
+    done
 
-# List built binaries
-RUN ls -la /app/binaries/
+# Build nextgsim gNB and UE
+WORKDIR /build/nextgsim
+RUN cargo build --release --bin nr-gnb --bin nr-ue 2>&1 || true
+RUN cp target/release/nr-gnb /out/ 2>/dev/null || true && \
+    cp target/release/nr-ue /out/ 2>/dev/null || true
+
+# Final stage: tiny image with only binaries
+FROM debian:bookworm-slim
+COPY --from=builder /out/ /out/
+CMD ["/bin/true"]

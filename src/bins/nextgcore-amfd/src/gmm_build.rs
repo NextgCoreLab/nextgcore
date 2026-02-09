@@ -681,6 +681,7 @@ fn get_pdu_session_status(amf_ue: &AmfUe) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::PlmnId;
 
     fn create_test_amf_ue() -> AmfUe {
         AmfUe {

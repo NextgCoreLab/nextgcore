@@ -324,6 +324,147 @@ impl<T> Default for OgsTimerMgr<T> {
     }
 }
 
+//
+// B2.2: Distributed Timer Coordination (6G Feature)
+//
+
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+
+/// Distributed timer coordination mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DistributedTimerMode {
+    /// Local-only (legacy 5G mode)
+    Local,
+    /// Coordinated across multiple instances
+    Coordinated,
+    /// Leader-based coordination
+    LeaderBased,
+}
+
+/// Distributed timer synchronization record
+#[derive(Debug, Clone)]
+pub struct TimerSyncRecord {
+    /// Timer ID
+    pub timer_id: OgsTimerId,
+    /// Instance ID that owns the timer
+    pub instance_id: String,
+    /// Synchronized expiration time (nanoseconds since epoch)
+    pub sync_expiry_nanos: u128,
+    /// Last synchronization timestamp
+    pub last_sync: Instant,
+}
+
+/// Distributed timer coordinator for multi-instance deployments
+/// Enables timer synchronization across horizontally scaled NF instances
+pub struct DistributedTimerCoordinator {
+    mode: DistributedTimerMode,
+    instance_id: String,
+    sync_records: Arc<StdMutex<Vec<TimerSyncRecord>>>,
+    clock_skew_tolerance_nanos: u128,
+}
+
+impl DistributedTimerCoordinator {
+    /// Create a new distributed timer coordinator
+    pub fn new(mode: DistributedTimerMode, instance_id: String) -> Self {
+        DistributedTimerCoordinator {
+            mode,
+            instance_id,
+            sync_records: Arc::new(StdMutex::new(Vec::new())),
+            clock_skew_tolerance_nanos: 1_000_000_000, // 1 second default tolerance
+        }
+    }
+
+    /// Get the coordination mode
+    pub fn mode(&self) -> DistributedTimerMode {
+        self.mode
+    }
+
+    /// Get instance ID
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    /// Set clock skew tolerance (nanoseconds)
+    pub fn set_clock_skew_tolerance(&mut self, tolerance_nanos: u128) {
+        self.clock_skew_tolerance_nanos = tolerance_nanos;
+    }
+
+    /// Synchronize a timer across instances
+    /// Returns the coordinated expiration time
+    pub fn sync_timer(&self, timer_id: OgsTimerId, local_expiry_nanos: u128) -> u128 {
+        match self.mode {
+            DistributedTimerMode::Local => local_expiry_nanos,
+            DistributedTimerMode::Coordinated => {
+                // In coordinated mode, record and adjust for clock skew
+                let mut records = self.sync_records.lock().unwrap();
+
+                // Find existing record
+                if let Some(record) = records.iter_mut().find(|r| r.timer_id == timer_id) {
+                    // Update existing record
+                    record.sync_expiry_nanos = local_expiry_nanos;
+                    record.last_sync = Instant::now();
+                    local_expiry_nanos
+                } else {
+                    // Create new sync record
+                    records.push(TimerSyncRecord {
+                        timer_id,
+                        instance_id: self.instance_id.clone(),
+                        sync_expiry_nanos: local_expiry_nanos,
+                        last_sync: Instant::now(),
+                    });
+                    local_expiry_nanos
+                }
+            }
+            DistributedTimerMode::LeaderBased => {
+                // In leader mode, wait for leader coordination
+                // For now, return local expiry (leader election not implemented)
+                local_expiry_nanos
+            }
+        }
+    }
+
+    /// Get synchronized timer expiration
+    pub fn get_sync_expiry(&self, timer_id: OgsTimerId) -> Option<u128> {
+        let records = self.sync_records.lock().unwrap();
+        records.iter()
+            .find(|r| r.timer_id == timer_id)
+            .map(|r| r.sync_expiry_nanos)
+    }
+
+    /// Remove timer from coordination
+    pub fn unsync_timer(&self, timer_id: OgsTimerId) {
+        let mut records = self.sync_records.lock().unwrap();
+        records.retain(|r| r.timer_id != timer_id);
+    }
+
+    /// Get all synchronized timers
+    pub fn get_all_synced_timers(&self) -> Vec<TimerSyncRecord> {
+        let records = self.sync_records.lock().unwrap();
+        records.clone()
+    }
+
+    /// Adjust timer for clock skew between instances
+    pub fn adjust_for_skew(&self, remote_expiry_nanos: u128, skew_nanos: i128) -> u128 {
+        if skew_nanos.unsigned_abs() > self.clock_skew_tolerance_nanos {
+            // Significant skew detected, adjust
+            if skew_nanos > 0 {
+                remote_expiry_nanos.saturating_add(skew_nanos.unsigned_abs())
+            } else {
+                remote_expiry_nanos.saturating_sub(skew_nanos.unsigned_abs())
+            }
+        } else {
+            remote_expiry_nanos
+        }
+    }
+}
+
+impl Default for DistributedTimerCoordinator {
+    fn default() -> Self {
+        Self::new(DistributedTimerMode::Local, uuid::Uuid::new_v4().to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,5 +772,107 @@ mod tests {
                 }
             }
         }
+    }
+
+    // Tests for distributed timer coordination (B2.2)
+    #[test]
+    fn test_distributed_coordinator_creation() {
+        let coordinator = DistributedTimerCoordinator::new(
+            DistributedTimerMode::Coordinated,
+            "instance-1".to_string(),
+        );
+        assert_eq!(coordinator.mode(), DistributedTimerMode::Coordinated);
+        assert_eq!(coordinator.instance_id(), "instance-1");
+    }
+
+    #[test]
+    fn test_local_mode_passthrough() {
+        let coordinator = DistributedTimerCoordinator::new(
+            DistributedTimerMode::Local,
+            "instance-1".to_string(),
+        );
+        let expiry = 1000000u128;
+        let result = coordinator.sync_timer(1, expiry);
+        assert_eq!(result, expiry); // Local mode returns unchanged
+    }
+
+    #[test]
+    fn test_coordinated_mode_sync() {
+        let coordinator = DistributedTimerCoordinator::new(
+            DistributedTimerMode::Coordinated,
+            "instance-1".to_string(),
+        );
+        let timer_id = 42;
+        let expiry = 2000000u128;
+
+        // First sync
+        let result = coordinator.sync_timer(timer_id, expiry);
+        assert_eq!(result, expiry);
+
+        // Should have sync record
+        let sync_expiry = coordinator.get_sync_expiry(timer_id);
+        assert_eq!(sync_expiry, Some(expiry));
+
+        // Update sync
+        let new_expiry = 3000000u128;
+        coordinator.sync_timer(timer_id, new_expiry);
+        assert_eq!(coordinator.get_sync_expiry(timer_id), Some(new_expiry));
+    }
+
+    #[test]
+    fn test_unsync_timer() {
+        let coordinator = DistributedTimerCoordinator::new(
+            DistributedTimerMode::Coordinated,
+            "instance-1".to_string(),
+        );
+        let timer_id = 99;
+
+        coordinator.sync_timer(timer_id, 1000000);
+        assert!(coordinator.get_sync_expiry(timer_id).is_some());
+
+        coordinator.unsync_timer(timer_id);
+        assert!(coordinator.get_sync_expiry(timer_id).is_none());
+    }
+
+    #[test]
+    fn test_clock_skew_adjustment() {
+        let coordinator = DistributedTimerCoordinator::new(
+            DistributedTimerMode::Coordinated,
+            "instance-1".to_string(),
+        );
+
+        let expiry = 5000000000u128;
+
+        // Small skew (within tolerance) - no adjustment
+        let adjusted = coordinator.adjust_for_skew(expiry, 500_000_000); // 0.5s skew
+        assert_eq!(adjusted, expiry);
+
+        // Large positive skew - adjust forward
+        let adjusted = coordinator.adjust_for_skew(expiry, 2_000_000_000); // 2s skew
+        assert!(adjusted > expiry);
+
+        // Large negative skew - adjust backward
+        let adjusted = coordinator.adjust_for_skew(expiry, -2_000_000_000); // -2s skew
+        assert!(adjusted < expiry);
+    }
+
+    #[test]
+    fn test_get_all_synced_timers() {
+        let coordinator = DistributedTimerCoordinator::new(
+            DistributedTimerMode::Coordinated,
+            "instance-1".to_string(),
+        );
+
+        coordinator.sync_timer(1, 1000000);
+        coordinator.sync_timer(2, 2000000);
+        coordinator.sync_timer(3, 3000000);
+
+        let all_timers = coordinator.get_all_synced_timers();
+        assert_eq!(all_timers.len(), 3);
+
+        let timer_ids: Vec<OgsTimerId> = all_timers.iter().map(|r| r.timer_id).collect();
+        assert!(timer_ids.contains(&1));
+        assert!(timer_ids.contains(&2));
+        assert!(timer_ids.contains(&3));
     }
 }

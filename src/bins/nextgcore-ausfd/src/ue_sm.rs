@@ -292,7 +292,7 @@ impl AusfUeSmContext {
                 self.handle_nudm_ueau_response(ausf_ue, &method, &resource_components, res_status, stream_id);
             }
             _ => {
-                log::error!("Invalid API name [{}]", service_name);
+                log::error!("Invalid API name [{service_name}]");
             }
         }
     }
@@ -314,7 +314,7 @@ impl AusfUeSmContext {
             } else {
                 log::error!("[{}] HTTP response error [{}]", ausf_ue.suci, status);
             }
-            send_error_response(stream_id, status, &format!("UDM UEAU error: {}", status));
+            send_error_response(stream_id, status, &format!("UDM UEAU error: {status}"));
             self.transition(AusfUeState::Exception);
             return;
         }

@@ -22,6 +22,11 @@ use p256::{
 };
 use thiserror::Error;
 
+use aes::cipher::{KeyInit, generic_array::GenericArray};
+use aes::Aes128;
+use hmac::{Hmac, Mac};
+use sha2::{Sha256, Digest};
+
 /// ECC key size in bytes for P-256 curve
 pub const ECC_BYTES: usize = 32;
 
@@ -30,6 +35,9 @@ pub const ECC_PUBLIC_KEY_SIZE: usize = ECC_BYTES + 1;
 
 /// Signature size (r + s, each 32 bytes)
 pub const ECC_SIGNATURE_SIZE: usize = ECC_BYTES * 2;
+
+/// ECIES Profile B MAC tag size (HMAC-SHA256 truncated to 8 bytes)
+pub const ECIES_MAC_TAG_SIZE: usize = 8;
 
 /// ECC error types
 #[derive(Error, Debug)]
@@ -48,6 +56,12 @@ pub enum EccError {
     SigningFailed,
     #[error("Verification failed")]
     VerificationFailed,
+    #[error("ECIES encryption failed")]
+    EciesEncryptionFailed,
+    #[error("ECIES decryption failed")]
+    EciesDecryptionFailed,
+    #[error("ECIES MAC verification failed")]
+    EciesMacVerificationFailed,
 }
 
 /// Result type for ECC operations
@@ -254,6 +268,236 @@ pub fn ecdsa_verify(
 }
 
 // ============================================================================
+// ECIES Profile B (3GPP TS 33.501 Annex C.3.4.2)
+//
+// Uses P-256 ECDH, X9.63 KDF with SHA-256, AES-128-CTR, HMAC-SHA256 (8 bytes)
+// ============================================================================
+
+/// X9.63 KDF for ECIES Profile B.
+///
+/// Derives enc_key (16 bytes) and mac_key (32 bytes) from the shared secret
+/// using ANSI X9.63 KDF with SHA-256.
+///
+/// KDF output = SHA-256(Z || counter || SharedInfo)
+/// - First 16 bytes -> encryption key (AES-128)
+/// - Next 32 bytes -> MAC key (HMAC-SHA256)
+fn x963_kdf_profile_b(shared_secret: &[u8; ECC_BYTES]) -> ([u8; 16], [u8; 32]) {
+    // We need 48 bytes total: 16 (enc_key) + 32 (mac_key)
+    // SHA-256 produces 32 bytes per iteration, so we need 2 iterations.
+
+    // Iteration 1: counter = 0x00000001
+    let mut hasher1 = Sha256::new();
+    hasher1.update(shared_secret);
+    hasher1.update(1u32.to_be_bytes());
+    let output1 = hasher1.finalize();
+
+    // Iteration 2: counter = 0x00000002
+    let mut hasher2 = Sha256::new();
+    hasher2.update(shared_secret);
+    hasher2.update(2u32.to_be_bytes());
+    let output2 = hasher2.finalize();
+
+    let mut enc_key = [0u8; 16];
+    let mut mac_key = [0u8; 32];
+
+    // First 16 bytes of output1 -> enc_key
+    enc_key.copy_from_slice(&output1[..16]);
+    // Last 16 bytes of output1 + first 16 bytes of output2 -> mac_key
+    mac_key[..16].copy_from_slice(&output1[16..32]);
+    mac_key[16..].copy_from_slice(&output2[..16]);
+
+    (enc_key, mac_key)
+}
+
+/// AES-128-CTR encryption/decryption (symmetric operation).
+///
+/// Uses a zero IV (all zeros) as the initial counter block per Profile B.
+fn aes128_ctr(key: &[u8; 16], data: &[u8]) -> Vec<u8> {
+    use aes::cipher::BlockEncrypt;
+
+    let cipher = Aes128::new(GenericArray::from_slice(key));
+    let mut output = vec![0u8; data.len()];
+    let mut counter = [0u8; 16]; // zero IV for Profile B
+    let mut pos = 0;
+
+    while pos < data.len() {
+        // Encrypt counter to get keystream block
+        let mut keystream = GenericArray::clone_from_slice(&counter);
+        cipher.encrypt_block(&mut keystream);
+
+        // XOR data with keystream
+        let remaining = data.len() - pos;
+        let block_len = remaining.min(16);
+        for i in 0..block_len {
+            output[pos + i] = data[pos + i] ^ keystream[i];
+        }
+
+        pos += block_len;
+
+        // Increment counter (big-endian)
+        let mut carry: u16 = 1;
+        for j in (0..16).rev() {
+            carry += counter[j] as u16;
+            counter[j] = carry as u8;
+            carry >>= 8;
+            if carry == 0 {
+                break;
+            }
+        }
+    }
+
+    output
+}
+
+/// ECIES Profile B encryption.
+///
+/// Encrypts plaintext using ECIES Profile B as defined in 3GPP TS 33.501:
+/// 1. Generate ephemeral P-256 key pair
+/// 2. Compute ECDH shared secret with recipient's public key
+/// 3. Derive enc_key + mac_key via X9.63 KDF
+/// 4. Encrypt with AES-128-CTR
+/// 5. Compute HMAC-SHA256 over ciphertext, truncated to 8 bytes
+///
+/// # Arguments
+/// * `pub_key` - Recipient's P-256 public key (compressed, 33 bytes)
+/// * `plaintext` - Data to encrypt
+///
+/// # Returns
+/// * `(ephemeral_pub, ciphertext, mac_tag)` on success
+pub fn ecies_profile_b_encrypt(
+    pub_key: &[u8; ECC_PUBLIC_KEY_SIZE],
+    plaintext: &[u8],
+) -> EccResult<([u8; ECC_PUBLIC_KEY_SIZE], Vec<u8>, [u8; ECIES_MAC_TAG_SIZE])> {
+    // 1. Generate ephemeral key pair
+    let mut eph_pub = [0u8; ECC_PUBLIC_KEY_SIZE];
+    let mut eph_priv = [0u8; ECC_BYTES];
+    ecc_make_key(&mut eph_pub, &mut eph_priv)?;
+
+    // 2. Compute ECDH shared secret
+    let mut shared_secret = [0u8; ECC_BYTES];
+    ecdh_shared_secret(pub_key, &eph_priv, &mut shared_secret)?;
+
+    // 3. Derive enc_key and mac_key via X9.63 KDF
+    let (enc_key, mac_key) = x963_kdf_profile_b(&shared_secret);
+
+    // 4. Encrypt with AES-128-CTR
+    let ciphertext = aes128_ctr(&enc_key, plaintext);
+
+    // 5. Compute HMAC-SHA256 over ciphertext, truncated to 8 bytes
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&mac_key)
+        .map_err(|_| EccError::EciesEncryptionFailed)?;
+    mac.update(&ciphertext);
+    let mac_result = mac.finalize().into_bytes();
+
+    let mut mac_tag = [0u8; ECIES_MAC_TAG_SIZE];
+    mac_tag.copy_from_slice(&mac_result[..ECIES_MAC_TAG_SIZE]);
+
+    Ok((eph_pub, ciphertext, mac_tag))
+}
+
+/// ECIES Profile B decryption.
+///
+/// Decrypts ciphertext using ECIES Profile B as defined in 3GPP TS 33.501:
+/// 1. Compute ECDH shared secret using own private key + ephemeral public key
+/// 2. Derive enc_key + mac_key via X9.63 KDF
+/// 3. Verify HMAC-SHA256 MAC tag
+/// 4. Decrypt with AES-128-CTR
+///
+/// # Arguments
+/// * `priv_key` - Recipient's P-256 private key (32 bytes)
+/// * `ephemeral_pub` - Sender's ephemeral public key (compressed, 33 bytes)
+/// * `ciphertext` - Encrypted data
+/// * `mac_tag` - 8-byte MAC tag
+///
+/// # Returns
+/// * Decrypted plaintext on success
+pub fn ecies_profile_b_decrypt(
+    priv_key: &[u8; ECC_BYTES],
+    ephemeral_pub: &[u8; ECC_PUBLIC_KEY_SIZE],
+    ciphertext: &[u8],
+    mac_tag: &[u8; ECIES_MAC_TAG_SIZE],
+) -> EccResult<Vec<u8>> {
+    // 1. Compute ECDH shared secret
+    let mut shared_secret = [0u8; ECC_BYTES];
+    ecdh_shared_secret(ephemeral_pub, priv_key, &mut shared_secret)?;
+
+    // 2. Derive enc_key and mac_key via X9.63 KDF
+    let (enc_key, mac_key) = x963_kdf_profile_b(&shared_secret);
+
+    // 3. Verify MAC tag
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&mac_key)
+        .map_err(|_| EccError::EciesDecryptionFailed)?;
+    mac.update(ciphertext);
+    let mac_result = mac.finalize().into_bytes();
+
+    let mut expected_tag = [0u8; ECIES_MAC_TAG_SIZE];
+    expected_tag.copy_from_slice(&mac_result[..ECIES_MAC_TAG_SIZE]);
+
+    // Constant-time comparison
+    if expected_tag != *mac_tag {
+        return Err(EccError::EciesMacVerificationFailed);
+    }
+
+    // 4. Decrypt with AES-128-CTR (symmetric operation)
+    let plaintext = aes128_ctr(&enc_key, ciphertext);
+
+    Ok(plaintext)
+}
+
+/// C-compatible ECIES Profile B encrypt function.
+///
+/// Encrypts plaintext and writes ephemeral public key, ciphertext, and MAC tag
+/// to the provided output buffers.
+///
+/// Returns 1 on success, 0 on failure.
+pub fn ecies_profile_b_encrypt_c(
+    pub_key: &[u8; ECC_PUBLIC_KEY_SIZE],
+    plaintext: &[u8],
+    plaintext_len: usize,
+    ephemeral_pub_out: &mut [u8; ECC_PUBLIC_KEY_SIZE],
+    ciphertext_out: &mut [u8],
+    mac_tag_out: &mut [u8; ECIES_MAC_TAG_SIZE],
+) -> i32 {
+    if ciphertext_out.len() < plaintext_len {
+        return 0;
+    }
+    match ecies_profile_b_encrypt(pub_key, &plaintext[..plaintext_len]) {
+        Ok((eph_pub, ct, mac_tag)) => {
+            ephemeral_pub_out.copy_from_slice(&eph_pub);
+            ciphertext_out[..ct.len()].copy_from_slice(&ct);
+            mac_tag_out.copy_from_slice(&mac_tag);
+            1
+        }
+        Err(_) => 0,
+    }
+}
+
+/// C-compatible ECIES Profile B decrypt function.
+///
+/// Decrypts ciphertext and writes plaintext to the provided output buffer.
+///
+/// Returns 1 on success, 0 on failure.
+pub fn ecies_profile_b_decrypt_c(
+    priv_key: &[u8; ECC_BYTES],
+    ephemeral_pub: &[u8; ECC_PUBLIC_KEY_SIZE],
+    ciphertext: &[u8],
+    ciphertext_len: usize,
+    mac_tag: &[u8; ECIES_MAC_TAG_SIZE],
+    plaintext_out: &mut [u8],
+) -> i32 {
+    if plaintext_out.len() < ciphertext_len {
+        return 0;
+    }
+    match ecies_profile_b_decrypt(priv_key, ephemeral_pub, &ciphertext[..ciphertext_len], mac_tag) {
+        Ok(pt) => {
+            plaintext_out[..pt.len()].copy_from_slice(&pt);
+            1
+        }
+        Err(_) => 0,
+    }
+}
+
+// ============================================================================
 // C-compatible interface functions (returning 1 for success, 0 for failure)
 // These match the exact interface of lib/crypt/ecc.h
 // ============================================================================
@@ -449,5 +693,169 @@ mod tests {
             ecdsa_sign(&private_key, &hash, &mut signature).unwrap();
             assert!(ecdsa_verify(&public_key, &hash, &signature).unwrap());
         }
+    }
+
+    // ========================================================================
+    // ECIES Profile B tests
+    // ========================================================================
+
+    #[test]
+    fn test_ecies_profile_b_roundtrip() {
+        // Generate recipient key pair
+        let mut pub_key = [0u8; ECC_PUBLIC_KEY_SIZE];
+        let mut priv_key = [0u8; ECC_BYTES];
+        ecc_make_key(&mut pub_key, &mut priv_key).unwrap();
+
+        let plaintext = b"Hello, ECIES Profile B!";
+
+        // Encrypt
+        let (eph_pub, ciphertext, mac_tag) =
+            ecies_profile_b_encrypt(&pub_key, plaintext).unwrap();
+
+        // Ciphertext should differ from plaintext
+        assert_ne!(&ciphertext[..], &plaintext[..]);
+
+        // Decrypt
+        let decrypted =
+            ecies_profile_b_decrypt(&priv_key, &eph_pub, &ciphertext, &mac_tag).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_ecies_profile_b_empty_plaintext() {
+        let mut pub_key = [0u8; ECC_PUBLIC_KEY_SIZE];
+        let mut priv_key = [0u8; ECC_BYTES];
+        ecc_make_key(&mut pub_key, &mut priv_key).unwrap();
+
+        let plaintext = b"";
+
+        let (eph_pub, ciphertext, mac_tag) =
+            ecies_profile_b_encrypt(&pub_key, plaintext).unwrap();
+
+        assert!(ciphertext.is_empty());
+
+        let decrypted =
+            ecies_profile_b_decrypt(&priv_key, &eph_pub, &ciphertext, &mac_tag).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_ecies_profile_b_large_plaintext() {
+        let mut pub_key = [0u8; ECC_PUBLIC_KEY_SIZE];
+        let mut priv_key = [0u8; ECC_BYTES];
+        ecc_make_key(&mut pub_key, &mut priv_key).unwrap();
+
+        // Test with data larger than one AES block
+        let plaintext = vec![0xABu8; 256];
+
+        let (eph_pub, ciphertext, mac_tag) =
+            ecies_profile_b_encrypt(&pub_key, &plaintext).unwrap();
+
+        let decrypted =
+            ecies_profile_b_decrypt(&priv_key, &eph_pub, &ciphertext, &mac_tag).unwrap();
+
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn test_ecies_profile_b_wrong_key() {
+        let mut pub_key = [0u8; ECC_PUBLIC_KEY_SIZE];
+        let mut priv_key = [0u8; ECC_BYTES];
+        ecc_make_key(&mut pub_key, &mut priv_key).unwrap();
+
+        // Generate a different key pair
+        let mut wrong_pub = [0u8; ECC_PUBLIC_KEY_SIZE];
+        let mut wrong_priv = [0u8; ECC_BYTES];
+        ecc_make_key(&mut wrong_pub, &mut wrong_priv).unwrap();
+
+        let plaintext = b"Secret message";
+
+        let (eph_pub, ciphertext, mac_tag) =
+            ecies_profile_b_encrypt(&pub_key, plaintext).unwrap();
+
+        // Decrypting with wrong private key should fail MAC verification
+        let result =
+            ecies_profile_b_decrypt(&wrong_priv, &eph_pub, &ciphertext, &mac_tag);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ecies_profile_b_tampered_ciphertext() {
+        let mut pub_key = [0u8; ECC_PUBLIC_KEY_SIZE];
+        let mut priv_key = [0u8; ECC_BYTES];
+        ecc_make_key(&mut pub_key, &mut priv_key).unwrap();
+
+        let plaintext = b"Integrity test";
+
+        let (eph_pub, mut ciphertext, mac_tag) =
+            ecies_profile_b_encrypt(&pub_key, plaintext).unwrap();
+
+        // Tamper with ciphertext
+        if !ciphertext.is_empty() {
+            ciphertext[0] ^= 0xFF;
+        }
+
+        // MAC verification should fail
+        let result =
+            ecies_profile_b_decrypt(&priv_key, &eph_pub, &ciphertext, &mac_tag);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ecies_profile_b_tampered_mac() {
+        let mut pub_key = [0u8; ECC_PUBLIC_KEY_SIZE];
+        let mut priv_key = [0u8; ECC_BYTES];
+        ecc_make_key(&mut pub_key, &mut priv_key).unwrap();
+
+        let plaintext = b"MAC tamper test";
+
+        let (eph_pub, ciphertext, mut mac_tag) =
+            ecies_profile_b_encrypt(&pub_key, plaintext).unwrap();
+
+        // Tamper with MAC tag
+        mac_tag[0] ^= 0xFF;
+
+        let result =
+            ecies_profile_b_decrypt(&priv_key, &eph_pub, &ciphertext, &mac_tag);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ecies_profile_b_c_interface() {
+        let mut pub_key = [0u8; ECC_PUBLIC_KEY_SIZE];
+        let mut priv_key = [0u8; ECC_BYTES];
+        ecc_make_key(&mut pub_key, &mut priv_key).unwrap();
+
+        let plaintext = b"C interface test";
+        let mut eph_pub = [0u8; ECC_PUBLIC_KEY_SIZE];
+        let mut ciphertext = vec![0u8; plaintext.len()];
+        let mut mac_tag = [0u8; ECIES_MAC_TAG_SIZE];
+
+        let ret = ecies_profile_b_encrypt_c(
+            &pub_key,
+            plaintext,
+            plaintext.len(),
+            &mut eph_pub,
+            &mut ciphertext,
+            &mut mac_tag,
+        );
+        assert_eq!(ret, 1);
+
+        let mut decrypted = vec![0u8; plaintext.len()];
+        let ret = ecies_profile_b_decrypt_c(
+            &priv_key,
+            &eph_pub,
+            &ciphertext,
+            ciphertext.len(),
+            &mac_tag,
+            &mut decrypted,
+        );
+        assert_eq!(ret, 1);
+        assert_eq!(&decrypted[..], &plaintext[..]);
     }
 }

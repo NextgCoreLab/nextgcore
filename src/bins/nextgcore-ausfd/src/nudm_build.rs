@@ -153,8 +153,8 @@ fn get_current_timestamp() -> String {
 
     // Format as ISO 8601
     let secs = duration.as_secs();
-    let datetime = chrono_lite_format(secs);
-    datetime
+    
+    chrono_lite_format(secs)
 }
 
 /// Simple ISO 8601 timestamp formatter (without chrono dependency)
@@ -197,8 +197,7 @@ fn chrono_lite_format(secs: u64) -> String {
     let day = remaining_days + 1;
 
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        year, month, day, hours, minutes, seconds
+        "{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z"
     )
 }
 

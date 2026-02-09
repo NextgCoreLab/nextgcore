@@ -565,7 +565,7 @@ impl SctpServer {
         let handle = self
             .addr_to_handle
             .get(&remote_addr)
-            .ok_or_else(|| ServerError::AssociationNotFound(0))?;
+            .ok_or(ServerError::AssociationNotFound(0))?;
 
         if let Some(&id) = self.handle_to_id.get(handle) {
             self.send(id, stream_id, data).await
@@ -823,8 +823,7 @@ mod tests {
 
     #[test]
     fn test_server_error_display() {
-        let io_err = ServerError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        let io_err = ServerError::Io(std::io::Error::other(
             "test error",
         ));
         assert!(io_err.to_string().contains("I/O error"));

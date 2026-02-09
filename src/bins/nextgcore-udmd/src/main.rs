@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use nextgcore_udmd::{
     udm_context_final, udm_context_init, udm_sbi_close, udm_sbi_open, udm_self,
-    timer_manager, UdmSmContext, SbiServerConfig,
+    timer_manager, timer_type_to_timer_id, UdmEvent, UdmSmContext, SbiServerConfig,
 };
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::server::{
@@ -378,40 +378,48 @@ async fn handle_smf_deregistration(supi: &str, pdu_session_id: &str) -> SbiRespo
 async fn handle_get_am_data(supi: &str, _request: &SbiRequest) -> SbiResponse {
     log::info!("Get AM Data: SUPI={}", supi);
 
-    // Return subscriber access and mobility data
-    SbiResponse::with_status(200)
-        .with_json_body(&serde_json::json!({
-            "gpsis": ["msisdn-1234567890"],
-            "subscribedUeAmbr": {
-                "uplink": "1000 Mbps",
-                "downlink": "1000 Mbps"
-            },
-            "nssai": {
-                "defaultSingleNssais": [
-                    { "sst": 1, "sd": "000001" }
-                ],
-                "singleNssais": [
-                    { "sst": 1, "sd": "000001" }
-                ]
+    // Query UDR for provisioned access and mobility data
+    match nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get(supi, "am-data", 0, 0).await {
+        Ok(udr_response) if udr_response.is_success() => {
+            // Forward UDR response body directly
+            let mut response = SbiResponse::with_status(200);
+            if let Some(body) = udr_response.http.content {
+                response = response.with_body(body, "application/json");
             }
-        }))
-        .unwrap_or_else(|_| SbiResponse::with_status(200))
+            response
+        }
+        Ok(udr_response) => {
+            log::warn!("[{}] UDR am-data query returned status {}", supi, udr_response.status);
+            SbiResponse::with_status(udr_response.status)
+        }
+        Err(e) => {
+            log::warn!("[{}] UDR am-data query failed: {}", supi, e);
+            ogs_sbi::server::send_service_unavailable("UDR unavailable")
+        }
+    }
 }
 
 async fn handle_get_smf_select_data(supi: &str, _request: &SbiRequest) -> SbiResponse {
     log::info!("Get SMF Select Data: SUPI={}", supi);
 
-    SbiResponse::with_status(200)
-        .with_json_body(&serde_json::json!({
-            "subscribedSnssaiInfos": {
-                "01000001": {
-                    "dnnInfos": [
-                        { "dnn": "internet", "defaultDnnIndicator": true }
-                    ]
-                }
+    // Query UDR for SMF selection subscription data
+    match nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get(supi, "smf-selection-subscription-data", 0, 0).await {
+        Ok(udr_response) if udr_response.is_success() => {
+            let mut response = SbiResponse::with_status(200);
+            if let Some(body) = udr_response.http.content {
+                response = response.with_body(body, "application/json");
             }
-        }))
-        .unwrap_or_else(|_| SbiResponse::with_status(200))
+            response
+        }
+        Ok(udr_response) => {
+            log::warn!("[{}] UDR smf-select query returned status {}", supi, udr_response.status);
+            SbiResponse::with_status(udr_response.status)
+        }
+        Err(e) => {
+            log::warn!("[{}] UDR smf-select query failed: {}", supi, e);
+            ogs_sbi::server::send_service_unavailable("UDR unavailable")
+        }
+    }
 }
 
 async fn handle_get_sm_data(supi: &str, request: &SbiRequest) -> SbiResponse {
@@ -421,50 +429,53 @@ async fn handle_get_sm_data(supi: &str, request: &SbiRequest) -> SbiResponse {
 
     log::info!("Get SM Data: SUPI={}, DNN={}", supi, dnn);
 
-    SbiResponse::with_status(200)
-        .with_json_body(&serde_json::json!([{
-            "singleNssai": { "sst": 1, "sd": "000001" },
-            "dnnConfigurations": {
-                "internet": {
-                    "pduSessionTypes": {
-                        "defaultSessionType": "IPV4",
-                        "allowedSessionTypes": ["IPV4", "IPV6", "IPV4V6"]
-                    },
-                    "sscModes": {
-                        "defaultSscMode": "SSC_MODE_1",
-                        "allowedSscModes": ["SSC_MODE_1", "SSC_MODE_2", "SSC_MODE_3"]
-                    },
-                    "5gQosProfile": {
-                        "5qi": 9,
-                        "arp": {
-                            "priorityLevel": 8,
-                            "preemptCap": "NOT_PREEMPT",
-                            "preemptVuln": "PREEMPTABLE"
-                        }
-                    },
-                    "sessionAmbr": {
-                        "uplink": "1000 Mbps",
-                        "downlink": "1000 Mbps"
-                    }
-                }
+    // Query UDR for session management subscription data
+    match nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get(supi, "sm-data", 0, 0).await {
+        Ok(udr_response) if udr_response.is_success() => {
+            let mut response = SbiResponse::with_status(200);
+            if let Some(body) = udr_response.http.content {
+                response = response.with_body(body, "application/json");
             }
-        }]))
-        .unwrap_or_else(|_| SbiResponse::with_status(200))
+            response
+        }
+        Ok(udr_response) => {
+            log::warn!("[{}] UDR sm-data query returned status {}", supi, udr_response.status);
+            SbiResponse::with_status(udr_response.status)
+        }
+        Err(e) => {
+            log::warn!("[{}] UDR sm-data query failed: {}", supi, e);
+            ogs_sbi::server::send_service_unavailable("UDR unavailable")
+        }
+    }
 }
 
 async fn handle_get_nssai(supi: &str, _request: &SbiRequest) -> SbiResponse {
     log::info!("Get NSSAI: SUPI={}", supi);
 
-    SbiResponse::with_status(200)
-        .with_json_body(&serde_json::json!({
-            "defaultSingleNssais": [
-                { "sst": 1, "sd": "000001" }
-            ],
-            "singleNssais": [
-                { "sst": 1, "sd": "000001" }
-            ]
-        }))
-        .unwrap_or_else(|_| SbiResponse::with_status(200))
+    // Query UDR for am-data which contains NSSAI
+    match nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get(supi, "am-data", 0, 0).await {
+        Ok(udr_response) if udr_response.is_success() => {
+            // Extract NSSAI from am-data response
+            if let Some(body) = &udr_response.http.content {
+                if let Ok(am_data) = serde_json::from_str::<serde_json::Value>(body) {
+                    if let Some(nssai) = am_data.get("nssai") {
+                        return SbiResponse::with_status(200)
+                            .with_json_body(nssai)
+                            .unwrap_or_else(|_| SbiResponse::with_status(200));
+                    }
+                }
+            }
+            SbiResponse::with_status(200)
+        }
+        Ok(udr_response) => {
+            log::warn!("[{}] UDR nssai query returned status {}", supi, udr_response.status);
+            SbiResponse::with_status(udr_response.status)
+        }
+        Err(e) => {
+            log::warn!("[{}] UDR nssai query failed: {}", supi, e);
+            ogs_sbi::server::send_service_unavailable("UDR unavailable")
+        }
+    }
 }
 
 async fn handle_sdm_subscribe(supi: &str, request: &SbiRequest) -> SbiResponse {
@@ -519,16 +530,116 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
 
     log::info!("Generate Auth Data: SNN={}", serving_network_name);
 
-    // Return mock authentication vector
+    // Step 1: Query UDR for authentication subscription data
+    let udr_response = match nextgcore_udmd::udm_nudr_dr_send_auth_subscription_get(supi, 0, 0).await {
+        Ok(resp) if resp.is_success() => resp,
+        Ok(resp) => {
+            log::error!("[{}] UDR auth subscription query failed: status={}", supi, resp.status);
+            return ogs_sbi::server::send_service_unavailable("UDR query failed");
+        }
+        Err(e) => {
+            log::error!("[{}] UDR auth subscription query failed: {}", supi, e);
+            return ogs_sbi::server::send_service_unavailable("UDR unavailable");
+        }
+    };
+
+    // Step 2: Parse authentication subscription from UDR response
+    let auth_sub_json: serde_json::Value = match udr_response.http.content.as_deref()
+        .and_then(|b| serde_json::from_str(b).ok()) {
+        Some(v) => v,
+        None => {
+            log::error!("[{}] Failed to parse UDR auth subscription response", supi);
+            return send_bad_request("Invalid UDR response", None);
+        }
+    };
+
+    // Step 3: Create/update UE in context with subscriber keys from UDR
+    let mut ue = {
+        let ctx = udm_self();
+        let context = ctx.read().unwrap();
+        let ue = context.ue_find_by_supi(supi)
+            .or_else(|| context.ue_add(supi))
+            .unwrap();
+        ue.clone()
+    };
+
+    // Store serving network name
+    ue.serving_network_name = Some(serving_network_name.to_string());
+
+    // Parse subscriber keys from UDR response
+    if let Some(k_hex) = auth_sub_json.get("encPermanentKey").and_then(|v| v.as_str()) {
+        let k_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(k_hex);
+        if k_bytes.len() >= 16 {
+            ue.k.copy_from_slice(&k_bytes[..16]);
+        }
+    }
+    if let Some(opc_hex) = auth_sub_json.get("encOpcKey").and_then(|v| v.as_str()) {
+        let opc_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(opc_hex);
+        if opc_bytes.len() >= 16 {
+            ue.opc.copy_from_slice(&opc_bytes[..16]);
+        }
+    }
+    if let Some(amf_hex) = auth_sub_json.get("authenticationManagementField").and_then(|v| v.as_str()) {
+        let amf_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(amf_hex);
+        if amf_bytes.len() >= 2 {
+            ue.amf.copy_from_slice(&amf_bytes[..2]);
+        }
+    }
+    if let Some(sqn_hex) = auth_sub_json.get("sequenceNumber").and_then(|v| v.get("sqn")).and_then(|v| v.as_str()) {
+        let sqn_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(sqn_hex);
+        if sqn_bytes.len() >= 6 {
+            ue.sqn.copy_from_slice(&sqn_bytes[..6]);
+        }
+    }
+
+    // Step 4: Generate RAND and compute auth vector using Milenage
+    let mut rand = [0u8; 16];
+    ogs_core::rand::ogs_random(&mut rand);
+    ue.rand = rand;
+
+    let (autn, ik, ck, _ak, res) = match ogs_crypt::milenage::milenage_generate(
+        &ue.opc, &ue.amf, &ue.k, &ue.sqn, &rand,
+    ) {
+        Ok(result) => result,
+        Err(e) => {
+            log::error!("[{}] Milenage generate failed: {:?}", supi, e);
+            return ogs_sbi::server::send_internal_error("Milenage computation failed");
+        }
+    };
+
+    // Step 5: Derive KAUSF and XRES* using 5G KDFs
+    let kausf = ogs_crypt::kdf::ogs_kdf_kausf(&ck, &ik, serving_network_name, &autn);
+    let xres_star = ogs_crypt::kdf::ogs_kdf_xres_star(&ck, &ik, serving_network_name, &rand, &res);
+
+    // Step 6: Update UE context
+    {
+        let ctx = udm_self();
+        let context = ctx.read().unwrap();
+        context.ue_update(&ue);
+    }
+
+    // Step 7: Update SQN in UDR (increment for next auth)
+    let sqn_val = {
+        let mut v: u64 = 0;
+        for &b in ue.sqn.iter() { v = (v << 8) | (b as u64); }
+        v
+    };
+    let new_sqn = (sqn_val + 32 + 1) & 0xFFFFFFFFFFFF;
+    let new_sqn_hex = format!("{:012x}", new_sqn);
+    let _ = nextgcore_udmd::udm_nudr_dr_send_auth_subscription_patch(
+        supi, &new_sqn_hex, 0, 0,
+    ).await;
+
+    // Step 8: Return authentication vector
     SbiResponse::with_status(200)
         .with_json_body(&serde_json::json!({
             "authType": "5G_AKA",
             "authenticationVector": {
                 "avType": "5G_HE_AKA",
-                "rand": "00000000000000000000000000000000",
-                "autn": "00000000000000000000000000000000",
-                "xresStar": "0000000000000000",
-                "kausf": "0000000000000000000000000000000000000000000000000000000000000000"
+                "rand": nextgcore_udmd::nudm_handler::bytes_to_hex(&rand),
+                "autn": nextgcore_udmd::nudm_handler::bytes_to_hex(&autn),
+                "xresStar": nextgcore_udmd::nudm_handler::bytes_to_hex(&xres_star),
+                "kausf": nextgcore_udmd::nudm_handler::bytes_to_hex(&kausf)
             },
             "supi": supi
         }))
@@ -605,20 +716,32 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) -> Result<()> {
 }
 
 /// Async main event loop with timer integration
-async fn run_event_loop_async(_udm_sm: &mut UdmSmContext, shutdown: Arc<AtomicBool>) -> Result<()> {
+async fn run_event_loop_async(udm_sm: &mut UdmSmContext, shutdown: Arc<AtomicBool>) -> Result<()> {
     log::debug!("Entering async main event loop");
 
-    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    let timer_mgr = timer_manager();
 
     while !shutdown.load(Ordering::SeqCst) && !SHUTDOWN.load(Ordering::SeqCst) {
-        // Wait for next tick
-        interval.tick().await;
+        // Poll with a reasonable interval
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Process timer expirations
-        let timer_mgr = timer_manager();
+        // Process timer expirations and dispatch to state machine
         let expired = timer_mgr.process_expired();
-        for timer in expired {
-            log::debug!("Timer expired: {} ({:?})", timer.id, timer.timer_type);
+        for entry in expired {
+            log::debug!(
+                "UDM timer expired: id={} type={:?} data={:?}",
+                entry.id, entry.timer_type, entry.data
+            );
+
+            // Convert UdmTimerType to UdmTimerId for event dispatch
+            if let Some(timer_id) = timer_type_to_timer_id(entry.timer_type) {
+                let mut event = UdmEvent::sbi_timer(timer_id);
+                if let Some(nf_data) = entry.data {
+                    event = event.with_nf_instance(nf_data.to_string());
+                }
+
+                udm_sm.dispatch(&mut event);
+            }
         }
 
         // Check for shutdown
@@ -627,6 +750,8 @@ async fn run_event_loop_async(_udm_sm: &mut UdmSmContext, shutdown: Arc<AtomicBo
         }
     }
 
+    // Cleanup: clear all timers on shutdown
+    timer_mgr.clear();
     log::debug!("Exiting async main event loop");
     Ok(())
 }

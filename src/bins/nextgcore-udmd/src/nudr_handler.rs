@@ -9,6 +9,9 @@ use crate::context::{
 };
 use crate::nudm_handler::{bytes_to_hex, hex_to_bytes, http_status, HandlerResult};
 
+use ogs_crypt::milenage;
+use ogs_crypt::kdf;
+
 /// UDM SBI state for multi-step operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdmSbiState {
@@ -127,14 +130,14 @@ pub fn udm_nudr_dr_query_subscription_provisioned(
     let udm_ue = match context.ue_find_by_id(udm_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("UDM UE not found [{}]", udm_ue_id);
+            log::error!("UDM UE not found [{udm_ue_id}]");
             return HandlerResult::bad_request("UDM UE not found");
         }
     };
     drop(context);
 
     let supi = udm_ue.supi.clone().unwrap_or_else(|| udm_ue.suci.clone());
-    log::debug!("[{}] Query subscription provisioned data (state={:?})", supi, state);
+    log::debug!("[{supi}] Query subscription provisioned data (state={state:?})");
 
     // This would send a request to UDR
     // The actual HTTP request would be built and sent here
@@ -157,7 +160,7 @@ pub fn udm_nudr_dr_handle_subscription_authentication(
     let mut udm_ue = match context.ue_find_by_id(udm_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("UDM UE not found [{}]", udm_ue_id);
+            log::error!("UDM UE not found [{udm_ue_id}]");
             return (HandlerResult::bad_request("UDM UE not found"), None);
         }
     };
@@ -309,8 +312,22 @@ pub fn udm_nudr_dr_handle_subscription_authentication(
                         );
                     }
 
-                    // Generate authentication vector
-                    let auth_result = generate_authentication_vector(&mut udm_ue);
+                    // Generate authentication vector using Milenage + 5G KDFs
+                    let auth_result = match generate_authentication_vector(&mut udm_ue) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            log::error!("[{}] Auth vector generation failed: {}", udm_ue.suci, e);
+                            return (
+                                HandlerResult {
+                                    success: false,
+                                    status: http_status::INTERNAL_SERVER_ERROR,
+                                    error_message: Some(format!("Auth vector generation failed: {e}")),
+                                    error_cause: None,
+                                },
+                                None,
+                            );
+                        }
+                    };
 
                     // Update UE in context
                     let ctx = udm_self();
@@ -322,7 +339,7 @@ pub fn udm_nudr_dr_handle_subscription_authentication(
                 }
 
                 _ => {
-                    log::error!("Invalid HTTP method [{}]", http_method);
+                    log::error!("Invalid HTTP method [{http_method}]");
                     (HandlerResult::forbidden("Invalid HTTP method", None), None)
                 }
             }
@@ -375,17 +392,17 @@ pub fn udm_nudr_dr_handle_subscription_context(
     let udm_ue = match context.ue_find_by_id(udm_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("UDM UE not found [{}]", udm_ue_id);
+            log::error!("UDM UE not found [{udm_ue_id}]");
             return (HandlerResult::bad_request("UDM UE not found"), None);
         }
     };
     drop(context);
 
     let supi = udm_ue.supi.clone().unwrap_or_else(|| udm_ue.suci.clone());
-    log::debug!("[{}] Handle subscription context response", supi);
+    log::debug!("[{supi}] Handle subscription context response");
 
     if res_status != http_status::NO_CONTENT {
-        log::error!("[{}] HTTP response error [{}]", supi, res_status);
+        log::error!("[{supi}] HTTP response error [{res_status}]");
         return (
             HandlerResult {
                 success: false,
@@ -405,7 +422,7 @@ pub fn udm_nudr_dr_handle_subscription_context(
                     (HandlerResult::no_content(), None)
                 }
                 _ => {
-                    log::error!("[{}] Invalid resource name [{}]", supi, resource_name);
+                    log::error!("[{supi}] Invalid resource name [{resource_name}]");
                     (HandlerResult::bad_request("Invalid resource name"), None)
                 }
             }
@@ -417,7 +434,7 @@ pub fn udm_nudr_dr_handle_subscription_context(
                     let registration = udm_ue.amf_3gpp_access_registration.clone();
 
                     if registration.is_none() {
-                        log::error!("[{}] No Amf3GppAccessRegistration", supi);
+                        log::error!("[{supi}] No Amf3GppAccessRegistration");
                         return (HandlerResult::bad_request("No Amf3GppAccessRegistration"), None);
                     }
 
@@ -439,7 +456,7 @@ pub fn udm_nudr_dr_handle_subscription_context(
                     )
                 }
                 _ => {
-                    log::error!("[{}] Invalid resource name [{}]", supi, resource_name);
+                    log::error!("[{supi}] Invalid resource name [{resource_name}]");
                     (HandlerResult::bad_request("Invalid resource name"), None)
                 }
             }
@@ -466,19 +483,19 @@ pub fn udm_nudr_dr_handle_subscription_provisioned(
     let udm_ue = match context.ue_find_by_id(udm_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("UDM UE not found [{}]", udm_ue_id);
+            log::error!("UDM UE not found [{udm_ue_id}]");
             return HandlerResult::bad_request("UDM UE not found");
         }
     };
     drop(context);
 
     let supi = udm_ue.supi.clone().unwrap_or_else(|| udm_ue.suci.clone());
-    log::debug!("[{}] Handle subscription provisioned response (state={:?})", supi, state);
+    log::debug!("[{supi}] Handle subscription provisioned response (state={state:?})");
 
     // Handle UE provisioned datasets state
     if state == UdmSbiState::UeProvisionedDatasets {
         if provisioned_data.is_none() {
-            log::error!("[{}] No ProvisionedDataSets", supi);
+            log::error!("[{supi}] No ProvisionedDataSets");
             return HandlerResult::bad_request("No ProvisionedDataSets");
         }
 
@@ -495,7 +512,7 @@ pub fn udm_nudr_dr_handle_subscription_provisioned(
     match resource_name {
         "am-data" => {
             if am_data.is_none() {
-                log::error!("[{}] No AccessAndMobilitySubscriptionData", supi);
+                log::error!("[{supi}] No AccessAndMobilitySubscriptionData");
                 return HandlerResult::bad_request("No AccessAndMobilitySubscriptionData");
             }
 
@@ -503,7 +520,7 @@ pub fn udm_nudr_dr_handle_subscription_provisioned(
             if state == UdmSbiState::UeProvisionedNssaiOnly {
                 if let Some(data) = am_data {
                     if data.nssai.is_none() {
-                        log::error!("[{}] No Nssai", supi);
+                        log::error!("[{supi}] No Nssai");
                         return HandlerResult::bad_request("No Nssai");
                     }
                 }
@@ -519,7 +536,7 @@ pub fn udm_nudr_dr_handle_subscription_provisioned(
 
         "smf-selection-subscription-data" => {
             if smf_sel_data.is_none() {
-                log::error!("[{}] No SmfSelectionSubscriptionData", supi);
+                log::error!("[{supi}] No SmfSelectionSubscriptionData");
                 return HandlerResult::bad_request("No SmfSelectionSubscriptionData");
             }
 
@@ -533,7 +550,7 @@ pub fn udm_nudr_dr_handle_subscription_provisioned(
 
         "sm-data" => {
             if sm_data.is_none() || sm_data.map(|d| d.is_empty()).unwrap_or(true) {
-                log::error!("[{}] No SessionManagementSubscriptionData", supi);
+                log::error!("[{supi}] No SessionManagementSubscriptionData");
                 return HandlerResult::bad_request("No SessionManagementSubscriptionData");
             }
 
@@ -546,7 +563,7 @@ pub fn udm_nudr_dr_handle_subscription_provisioned(
         }
 
         _ => {
-            log::error!("[{}] Invalid resource name [{}]", supi, resource_name);
+            log::error!("[{supi}] Invalid resource name [{resource_name}]");
             HandlerResult::bad_request("Invalid resource name")
         }
     }
@@ -567,7 +584,7 @@ pub fn udm_nudr_dr_handle_smf_registration(
     let sess = match context.sess_find_by_id(sess_id) {
         Some(s) => s,
         None => {
-            log::error!("UDM session not found [{}]", sess_id);
+            log::error!("UDM session not found [{sess_id}]");
             return (HandlerResult::bad_request("UDM session not found"), None);
         }
     };
@@ -575,7 +592,7 @@ pub fn udm_nudr_dr_handle_smf_registration(
     let udm_ue = match context.ue_find_by_id(sess.udm_ue_id) {
         Some(ue) => ue,
         None => {
-            log::error!("UDM UE not found for session [{}]", sess_id);
+            log::error!("UDM UE not found for session [{sess_id}]");
             return (HandlerResult::bad_request("UDM UE not found"), None);
         }
     };
@@ -670,36 +687,51 @@ pub fn udm_nudr_dr_handle_smf_registration(
     }
 }
 
-/// Generate authentication vector
-/// Port of milenage_generate() and related functions
-fn generate_authentication_vector(udm_ue: &mut UdmUe) -> AuthenticationInfoResult {
-    // Generate random RAND
+/// Generate authentication vector using 3GPP Milenage algorithm and 5G KDFs
+///
+/// Computes a 5G-AKA authentication vector from the UE's stored keys (K, OPc, AMF, SQN):
+/// 1. Generate cryptographic RAND
+/// 2. Run Milenage to produce AUTN, IK, CK, RES
+/// 3. Derive KAUSF via TS 33.501 A.2
+/// 4. Derive XRES* via TS 33.501 A.4
+fn generate_authentication_vector(udm_ue: &mut UdmUe) -> Result<AuthenticationInfoResult, String> {
+    // Generate cryptographically random RAND
     let mut rand = [0u8; OGS_RAND_LEN];
-    for i in 0..OGS_RAND_LEN {
-        rand[i] = rand::random();
-    }
+    ogs_core::rand::ogs_random(&mut rand);
     udm_ue.rand = rand;
 
-    // Note: In production, these are computed using Milenage algorithm:
-    // milenage_generate(opc, amf, k, sqn, rand, autn, ik, ck, ak, xres, &xres_len)
-    // Placeholder values used for testing
+    // Run Milenage: produces AUTN, IK, CK, AK, RES
+    let (autn, ik, ck, _ak, res) = milenage::milenage_generate(
+        &udm_ue.opc,
+        &udm_ue.amf,
+        &udm_ue.k,
+        &udm_ue.sqn,
+        &rand,
+    ).map_err(|e| format!("Milenage generate failed: {e:?}"))?;
 
-    let autn = [0u8; OGS_AUTN_LEN];
-    let _ik = [0u8; OGS_KEY_LEN];
-    let _ck = [0u8; OGS_KEY_LEN];
-    let _xres = [0u8; OGS_MAX_RES_LEN];
-    let _xres_len = 8;
+    // Get serving network name (required for 5G KDF)
+    let serving_network_name = udm_ue.serving_network_name.as_deref()
+        .ok_or_else(|| "No serving network name".to_string())?;
 
-    // Calculate KAUSF using KDF
-    // ogs_kdf_kausf(ck, ik, serving_network_name, autn, kausf)
-    let kausf = [0u8; OGS_SHA256_DIGEST_SIZE];
+    // TS 33.501 A.2: Derive KAUSF from CK, IK, serving network name, AUTN
+    let kausf = kdf::ogs_kdf_kausf(
+        <&[u8; OGS_KEY_LEN]>::try_from(&ck[..OGS_KEY_LEN]).unwrap(),
+        <&[u8; OGS_KEY_LEN]>::try_from(&ik[..OGS_KEY_LEN]).unwrap(),
+        serving_network_name,
+        &autn,
+    );
 
-    // Calculate XRES*
-    // ogs_kdf_xres_star(ck, ik, serving_network_name, rand, xres, xres_len, xres_star)
-    let xres_star = [0u8; OGS_MAX_RES_LEN];
+    // TS 33.501 A.4: Derive XRES* from CK, IK, serving network name, RAND, RES
+    let xres_star = kdf::ogs_kdf_xres_star(
+        <&[u8; OGS_KEY_LEN]>::try_from(&ck[..OGS_KEY_LEN]).unwrap(),
+        <&[u8; OGS_KEY_LEN]>::try_from(&ik[..OGS_KEY_LEN]).unwrap(),
+        serving_network_name,
+        &rand,
+        &res,
+    );
 
     // Build authentication info result
-    AuthenticationInfoResult {
+    Ok(AuthenticationInfoResult {
         supi: udm_ue.supi.clone().unwrap_or_else(|| udm_ue.suci.clone()),
         auth_type: AuthType::FiveGAka,
         authentication_vector: AuthenticationVector {
@@ -709,15 +741,7 @@ fn generate_authentication_vector(udm_ue: &mut UdmUe) -> AuthenticationInfoResul
             autn: bytes_to_hex(&autn),
             kausf: bytes_to_hex(&kausf),
         },
-    }
-}
-
-// Simple random number generation for testing
-mod rand {
-    pub fn random<T: Default>() -> T {
-        // In real implementation, use proper random number generator
-        T::default()
-    }
+    })
 }
 
 #[cfg(test)]

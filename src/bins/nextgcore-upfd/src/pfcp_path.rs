@@ -410,7 +410,7 @@ pub enum PfcpSessionEvent {
 /// Async PFCP server for handling SMF requests
 pub struct PfcpServer {
     socket: Arc<UdpSocket>,
-    local_addr: SocketAddr,
+    _local_addr: SocketAddr,
     local_node_id: NodeId,
     recovery_time_stamp: u32,
     next_seid: AtomicU64,
@@ -456,7 +456,7 @@ impl PfcpServer {
 
         Ok(Self {
             socket: Arc::new(socket),
-            local_addr,
+            _local_addr: local_addr,
             local_node_id,
             recovery_time_stamp,
             next_seid: AtomicU64::new(1),

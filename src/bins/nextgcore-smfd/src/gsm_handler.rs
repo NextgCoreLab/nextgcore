@@ -8,7 +8,7 @@
 
 use crate::context::{
     SmfSess, SmfBearer, SmfPf, FlowDirection, IpfwRule,
-    MaxIntegrityProtectedDataRate,
+    MaxIntegrityProtectedDataRate, PduSessionType, Qos, SessionAmbr,
 };
 use crate::gsm_build::GsmCause;
 use std::net::Ipv4Addr;
@@ -198,6 +198,188 @@ pub fn handle_pdu_session_establishment_request(
     log::info!("[PSI:{}] PDU session establishment request processed", sess.psi);
 
     Ok(())
+}
+
+/// PDU session release request
+#[derive(Debug, Clone, Default)]
+pub struct PduSessionReleaseRequest {
+    /// 5GSM cause (if present)
+    pub gsm_cause: Option<u8>,
+    /// Extended protocol configuration options
+    pub epco: Option<Vec<u8>>,
+    /// Presence mask
+    pub presencemask: u64,
+}
+
+/// Result of PDU session creation (resource allocation phase)
+#[derive(Debug, Clone)]
+pub struct PduSessionCreateResult {
+    /// Allocated default QoS flow ID (bearer ID in context)
+    pub default_bearer_id: u64,
+    /// Allocated QFI
+    pub qfi: u8,
+    /// Determined PDU session type
+    pub session_type: PduSessionType,
+    /// Session AMBR applied
+    pub session_ambr: SessionAmbr,
+    /// Default 5QI
+    pub five_qi: u8,
+}
+
+/// Determine PDU session type based on UE request, subscription, and DNN config
+/// Port of logic from smf_sess_set_ue_ip() and related functions in context.c
+pub fn determine_pdu_session_type(
+    ue_requested_type: u8,
+    subscribed_type: PduSessionType,
+) -> Result<PduSessionType, GsmCause> {
+    // Map UE requested type byte to enum
+    let ue_type = match ue_requested_type {
+        1 => PduSessionType::Ipv4,
+        2 => PduSessionType::Ipv6,
+        3 => PduSessionType::Ipv4v6,
+        4 => PduSessionType::Unstructured,
+        5 => PduSessionType::Ethernet,
+        0 => subscribed_type, // No preference, use subscribed
+        _ => {
+            log::warn!("Unknown UE requested PDU session type: {}", ue_requested_type);
+            return Err(GsmCause::UnknownPduSessionType);
+        }
+    };
+
+    // Determine final type based on subscription and request
+    match (subscribed_type, ue_type) {
+        // If subscribed is IPv4v6, honor UE request for either IPv4 or IPv6
+        (PduSessionType::Ipv4v6, PduSessionType::Ipv4) => Ok(PduSessionType::Ipv4),
+        (PduSessionType::Ipv4v6, PduSessionType::Ipv6) => Ok(PduSessionType::Ipv6),
+        (PduSessionType::Ipv4v6, PduSessionType::Ipv4v6) => Ok(PduSessionType::Ipv4v6),
+        // If subscribed is IPv4 only
+        (PduSessionType::Ipv4, PduSessionType::Ipv4) => Ok(PduSessionType::Ipv4),
+        (PduSessionType::Ipv4, _) => {
+            log::info!("Subscribed type is IPv4 only, overriding UE request");
+            Ok(PduSessionType::Ipv4)
+        }
+        // If subscribed is IPv6 only
+        (PduSessionType::Ipv6, PduSessionType::Ipv6) => Ok(PduSessionType::Ipv6),
+        (PduSessionType::Ipv6, _) => {
+            log::info!("Subscribed type is IPv6 only, overriding UE request");
+            Ok(PduSessionType::Ipv6)
+        }
+        // Other types: use subscribed
+        _ => Ok(subscribed_type),
+    }
+}
+
+/// Allocate resources for a PDU session (IP address, QoS flow, etc.)
+/// This is called after the establishment request is validated and policy is obtained.
+/// Port of logic from smf_5gc_handle_create_sm_context() and related in gsm-handler.c
+pub fn allocate_pdu_session_resources(
+    sess: &mut SmfSess,
+    default_qos: &Qos,
+    session_ambr: &SessionAmbr,
+    ipv4_addr: Option<Ipv4Addr>,
+) -> Result<PduSessionCreateResult, GsmCause> {
+    // Determine PDU session type
+    let session_type = determine_pdu_session_type(
+        sess.ue_session_type,
+        sess.session_type,
+    )?;
+    sess.session_type = session_type;
+
+    // Assign IP address based on session type
+    match session_type {
+        PduSessionType::Ipv4 | PduSessionType::Ipv4v6 => {
+            if let Some(addr) = ipv4_addr {
+                sess.ipv4_addr = Some(addr);
+                log::info!("[PSI:{}] IPv4 address allocated: {}", sess.psi, addr);
+            } else {
+                log::error!("[PSI:{}] No IPv4 address available", sess.psi);
+                return Err(GsmCause::InsufficientResources);
+            }
+        }
+        PduSessionType::Ipv6 => {
+            // IPv6 prefix would be allocated from pool
+            log::info!("[PSI:{}] IPv6 session type selected", sess.psi);
+        }
+        _ => {}
+    }
+
+    // Set session AMBR
+    sess.session_ambr = session_ambr.clone();
+
+    // Set session QoS (default)
+    sess.session_qos = default_qos.clone();
+
+    // Default QFI is 1 for 5GC (or based on 5QI)
+    let qfi = if default_qos.index > 0 { default_qos.index } else { 1 };
+
+    log::info!(
+        "[PSI:{}] PDU session resources allocated: type={:?}, 5QI={}, AMBR DL={} UL={}",
+        sess.psi, session_type, default_qos.index,
+        session_ambr.downlink, session_ambr.uplink
+    );
+
+    Ok(PduSessionCreateResult {
+        default_bearer_id: 0, // Will be set when QoS flow is actually added to context
+        qfi,
+        session_type,
+        session_ambr: session_ambr.clone(),
+        five_qi: default_qos.index,
+    })
+}
+
+/// Handle PDU session release request
+/// Port of smf_gsm_handle_pdu_session_release_request() from gsm-handler.c
+pub fn handle_pdu_session_release_request(
+    sess: &mut SmfSess,
+    request: &PduSessionReleaseRequest,
+) -> Result<(), GsmCause> {
+    log::info!("[PSI:{}] PDU session release request received", sess.psi);
+
+    // Validate session state
+    if sess.psi == 0 {
+        log::error!("Invalid PDU session identity");
+        return Err(GsmCause::InvalidPduSessionIdentity);
+    }
+
+    // Store the release cause if provided
+    if let Some(cause) = request.gsm_cause {
+        log::debug!("[PSI:{}] Release cause from UE: {}", sess.psi, cause);
+    }
+
+    // Mark session for release
+    sess.ngap_state = crate::context::NgapState::DeleteTriggerUeRequested;
+
+    log::info!("[PSI:{}] PDU session release request processed", sess.psi);
+    Ok(())
+}
+
+/// Validate SSC mode requested by UE
+/// Returns the accepted SSC mode or error
+pub fn validate_ssc_mode(ue_ssc_mode: u8, subscribed_ssc_mode: u8) -> Result<u8, GsmCause> {
+    match ue_ssc_mode {
+        1 => Ok(1), // SSC mode 1 always accepted
+        2 => {
+            if subscribed_ssc_mode >= 2 {
+                Ok(2)
+            } else {
+                log::warn!("SSC mode 2 not supported for this subscription");
+                Err(GsmCause::NotSupportedSscMode)
+            }
+        }
+        3 => {
+            if subscribed_ssc_mode >= 3 {
+                Ok(3)
+            } else {
+                log::warn!("SSC mode 3 not supported for this subscription");
+                Err(GsmCause::NotSupportedSscMode)
+            }
+        }
+        0 => Ok(1), // No preference, use SSC mode 1
+        _ => {
+            log::error!("Invalid SSC mode: {}", ue_ssc_mode);
+            Err(GsmCause::NotSupportedSscMode)
+        }
+    }
 }
 
 /// Handle PDU session modification request - QoS rules
@@ -543,7 +725,7 @@ pub fn nas_bitrate_to_u64(unit: u8, value: u16) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{SmfSess, SmfBearer, Qos, PduSessionType, SNssai, SessionAmbr};
+    use crate::context::{SmfSess, SmfBearer, Qos, PduSessionType, SNssai, SessionAmbr, NgapState};
     use std::net::Ipv4Addr;
 
     fn create_test_sess() -> SmfSess {
@@ -811,6 +993,118 @@ mod tests {
         assert_eq!(smf_pf.direction, FlowDirection::DownlinkOnly);
         // For downlink, addresses are swapped
         assert!(smf_pf.ipfw_rule.src_addr.is_some());
+    }
+
+    #[test]
+    fn test_determine_pdu_session_type_ipv4() {
+        let result = determine_pdu_session_type(1, PduSessionType::Ipv4v6);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), PduSessionType::Ipv4);
+    }
+
+    #[test]
+    fn test_determine_pdu_session_type_ipv6() {
+        let result = determine_pdu_session_type(2, PduSessionType::Ipv4v6);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), PduSessionType::Ipv6);
+    }
+
+    #[test]
+    fn test_determine_pdu_session_type_subscribed_ipv4_only() {
+        // UE requests IPv6 but subscription is IPv4 only
+        let result = determine_pdu_session_type(2, PduSessionType::Ipv4);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), PduSessionType::Ipv4);
+    }
+
+    #[test]
+    fn test_determine_pdu_session_type_no_preference() {
+        let result = determine_pdu_session_type(0, PduSessionType::Ipv4v6);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), PduSessionType::Ipv4v6);
+    }
+
+    #[test]
+    fn test_determine_pdu_session_type_unknown() {
+        let result = determine_pdu_session_type(99, PduSessionType::Ipv4);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), GsmCause::UnknownPduSessionType);
+    }
+
+    #[test]
+    fn test_allocate_pdu_session_resources_ipv4() {
+        let mut sess = create_test_sess();
+        sess.ue_session_type = 1; // IPv4
+        sess.session_type = PduSessionType::Ipv4v6;
+
+        let qos = Qos {
+            index: 9,
+            arp_priority_level: 8,
+            ..Default::default()
+        };
+        let ambr = SessionAmbr {
+            downlink: 100_000_000,
+            uplink: 50_000_000,
+        };
+
+        let result = allocate_pdu_session_resources(
+            &mut sess, &qos, &ambr, Some(Ipv4Addr::new(10, 45, 0, 2)),
+        );
+        assert!(result.is_ok());
+        let create_result = result.unwrap();
+        assert_eq!(create_result.session_type, PduSessionType::Ipv4);
+        assert_eq!(create_result.qfi, 9);
+        assert_eq!(sess.ipv4_addr, Some(Ipv4Addr::new(10, 45, 0, 2)));
+        assert_eq!(sess.session_ambr.downlink, 100_000_000);
+    }
+
+    #[test]
+    fn test_allocate_pdu_session_resources_no_ip() {
+        let mut sess = create_test_sess();
+        sess.ue_session_type = 1; // IPv4
+        sess.session_type = PduSessionType::Ipv4v6;
+
+        let qos = Qos::default();
+        let ambr = SessionAmbr::default();
+
+        let result = allocate_pdu_session_resources(&mut sess, &qos, &ambr, None);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), GsmCause::InsufficientResources);
+    }
+
+    #[test]
+    fn test_handle_pdu_session_release_request() {
+        let mut sess = create_test_sess();
+        let request = PduSessionReleaseRequest {
+            gsm_cause: Some(GsmCause::RegularDeactivation as u8),
+            ..Default::default()
+        };
+
+        let result = handle_pdu_session_release_request(&mut sess, &request);
+        assert!(result.is_ok());
+        assert_eq!(sess.ngap_state, crate::context::NgapState::DeleteTriggerUeRequested);
+    }
+
+    #[test]
+    fn test_handle_pdu_session_release_request_invalid_psi() {
+        let mut sess = create_test_sess();
+        sess.psi = 0; // Invalid
+        let request = PduSessionReleaseRequest::default();
+
+        let result = handle_pdu_session_release_request(&mut sess, &request);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), GsmCause::InvalidPduSessionIdentity);
+    }
+
+    #[test]
+    fn test_validate_ssc_mode() {
+        assert_eq!(validate_ssc_mode(1, 1).unwrap(), 1);
+        assert_eq!(validate_ssc_mode(0, 1).unwrap(), 1);
+        assert_eq!(validate_ssc_mode(2, 2).unwrap(), 2);
+        assert_eq!(validate_ssc_mode(3, 3).unwrap(), 3);
+        assert!(validate_ssc_mode(2, 1).is_err());
+        assert!(validate_ssc_mode(3, 2).is_err());
+        assert!(validate_ssc_mode(99, 1).is_err());
     }
 
     #[test]

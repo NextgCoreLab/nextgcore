@@ -81,6 +81,12 @@ hyper-util = { version = "0.1", features = ["full"] }
 http-body-util = "0.1"
 h2 = "0.4"
 
+# TLS
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2.1"
+webpki-roots = "0.26"
+
 # Database
 mongodb = { version = "2.8", default-features = false, features = ["sync"] }
 
@@ -95,6 +101,7 @@ zuc = "0.1"                    # ZUC cipher (3GPP EEA3/EIA3)
 p256 = "0.13"                  # NIST P-256 elliptic curve
 elliptic-curve = "0.13"        # Generic elliptic curve traits
 base64 = "0.22"
+hex = "0.4"                    # Hex encoding/decoding
 
 # ASN.1 codec - using rasn for PER encoding
 rasn = "0.18"

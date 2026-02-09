@@ -259,14 +259,14 @@ impl NrfSmContext {
         match timer_id {
             NrfTimerId::NfInstanceNoHeartbeat => {
                 if let Some(ref nf_instance_id) = event.nf_instance_id {
-                    log::warn!("[{}] No heartbeat", nf_instance_id);
+                    log::warn!("[{nf_instance_id}] No heartbeat");
                     // Note: Set NF status to SUSPENDED and remove instance
                     // The NF instance is marked as unavailable and removed from discovery results
                 }
             }
             NrfTimerId::SubscriptionValidity => {
                 if let Some(ref subscription_id) = event.subscription_id {
-                    log::error!("[{}] Subscription validity expired", subscription_id);
+                    log::error!("[{subscription_id}] Subscription validity expired");
                     // Note: Remove subscription data
                     // Expired subscriptions are cleaned up by the subscription manager
                 }

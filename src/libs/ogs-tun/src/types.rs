@@ -151,11 +151,11 @@ impl fmt::Display for TunError {
             TunError::PermissionDenied => write!(f, "Permission denied"),
             TunError::DeviceBusy => write!(f, "Device busy"),
             TunError::InvalidIfname => write!(f, "Invalid interface name"),
-            TunError::IoError(msg) => write!(f, "I/O error: {}", msg),
+            TunError::IoError(msg) => write!(f, "I/O error: {msg}"),
             TunError::SyscallError(errno, msg) => {
-                write!(f, "System call error ({}): {}", errno, msg)
+                write!(f, "System call error ({errno}): {msg}")
             }
-            TunError::InvalidPacket(msg) => write!(f, "Invalid packet: {}", msg),
+            TunError::InvalidPacket(msg) => write!(f, "Invalid packet: {msg}"),
             TunError::NotSupported => write!(f, "Not supported on this platform"),
         }
     }

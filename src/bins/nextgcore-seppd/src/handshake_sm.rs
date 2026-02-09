@@ -12,6 +12,7 @@
 
 use crate::context::{sepp_self, SecurityCapability};
 use crate::event::{SeppEvent, SeppEventId, SeppTimerId};
+use crate::sbi_response::send_not_implemented_response;
 
 /// Handshake state type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -158,16 +159,18 @@ impl HandshakeSmContext {
     }
 
     fn handle_will_establish_server_event(&mut self, event: &mut SeppEvent) {
-        let (service_name, resource, method) = {
+        let (stream_id, service_name, resource, method) = {
             let sbi = match &event.sbi {
                 Some(sbi) => sbi,
                 None => return,
             };
+            let stream_id = sbi.stream_id.unwrap_or(0);
             let message = match &sbi.message {
                 Some(msg) => msg,
                 None => return,
             };
             (
+                stream_id,
                 message.service_name.clone(),
                 message.resource_components.first().cloned(),
                 message.method.clone(),
@@ -192,7 +195,7 @@ impl HandshakeSmContext {
 
                     // Check negotiated security scheme
                     let negotiated_scheme = self.get_negotiated_security_scheme();
-                    
+
                     match negotiated_scheme {
                         SecurityCapability::Tls => {
                             log::info!("[node_id={}] TLS negotiated, transitioning to Established", self.node_id);
@@ -201,7 +204,7 @@ impl HandshakeSmContext {
                         }
                         SecurityCapability::Prins => {
                             log::error!("[node_id={}] PRINS is not supported", self.node_id);
-                            // Note: Error response sent via SBI path with 501 Not Implemented status
+                            send_not_implemented_response(stream_id, "PRINS security scheme is not supported");
                         }
                         SecurityCapability::None => {
                             log::warn!("[node_id={}] SEPP has not been established (NONE)", self.node_id);
@@ -327,16 +330,18 @@ impl HandshakeSmContext {
     }
 
     fn handle_established_server_event(&mut self, event: &mut SeppEvent) {
-        let (service_name, resource, method) = {
+        let (stream_id, service_name, resource, method) = {
             let sbi = match &event.sbi {
                 Some(sbi) => sbi,
                 None => return,
             };
+            let stream_id = sbi.stream_id.unwrap_or(0);
             let message = match &sbi.message {
                 Some(msg) => msg,
                 None => return,
             };
             (
+                stream_id,
                 message.service_name.clone(),
                 message.resource_components.first().cloned(),
                 message.method.clone(),
@@ -366,6 +371,7 @@ impl HandshakeSmContext {
                         }
                         SecurityCapability::Prins => {
                             log::error!("[node_id={}] PRINS is not supported", self.node_id);
+                            send_not_implemented_response(stream_id, "PRINS security scheme is not supported");
                         }
                         SecurityCapability::None => {
                             log::info!("[node_id={}] Transitioning to Terminated", self.node_id);
@@ -450,16 +456,18 @@ impl HandshakeSmContext {
     }
 
     fn handle_terminated_server_event(&mut self, event: &mut SeppEvent) {
-        let (service_name, resource, method) = {
+        let (stream_id, service_name, resource, method) = {
             let sbi = match &event.sbi {
                 Some(sbi) => sbi,
                 None => return,
             };
+            let stream_id = sbi.stream_id.unwrap_or(0);
             let message = match &sbi.message {
                 Some(msg) => msg,
                 None => return,
             };
             (
+                stream_id,
                 message.service_name.clone(),
                 message.resource_components.first().cloned(),
                 message.method.clone(),
@@ -490,6 +498,7 @@ impl HandshakeSmContext {
                         }
                         SecurityCapability::Prins => {
                             log::error!("[node_id={}] PRINS is not supported", self.node_id);
+                            send_not_implemented_response(stream_id, "PRINS security scheme is not supported");
                         }
                         SecurityCapability::None => {
                             log::warn!("[node_id={}] SEPP has not been established (NONE)", self.node_id);

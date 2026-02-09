@@ -34,8 +34,7 @@ impl TryFrom<u8> for Gtp2ExtensionHeaderType {
             0x85 => Ok(Self::PduSessionContainer),
             0xc0 => Ok(Self::PdcpNumber),
             _ => Err(GtpError::InvalidFormat(format!(
-                "Unknown extension header type: {:#x}",
-                value
+                "Unknown extension header type: {value:#x}"
             ))),
         }
     }
@@ -341,7 +340,7 @@ impl TryFrom<u8> for Gtp2RatType {
             6 => Ok(Self::Eutran),
             7 => Ok(Self::Virtual),
             8 => Ok(Self::EutranNbIot),
-            _ => Err(GtpError::InvalidFormat(format!("Unknown RAT type: {}", value))),
+            _ => Err(GtpError::InvalidFormat(format!("Unknown RAT type: {value}"))),
         }
     }
 }

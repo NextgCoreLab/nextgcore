@@ -14,6 +14,7 @@ pub mod handshake_sm;
 pub mod n32c_handler;
 pub mod n32c_build;
 pub mod sbi_path;
+pub mod sbi_response;
 
 // Re-export specific items to avoid ambiguous glob re-exports
 pub use context::{
@@ -29,4 +30,4 @@ pub use sbi_path::{
     SbiServerConfig, SbiRequest, SbiResponse, RequestHandlerResult,
 };
 pub use sepp_sm::SeppSmContext;
-pub use timer::{TimerConfig, TimerManager, sepp_timer_get_name};
+pub use timer::{TimerConfig, TimerManager, sepp_timer_get_name, timer_manager};

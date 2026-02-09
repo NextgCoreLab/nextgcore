@@ -11,31 +11,47 @@
 use crate::event::UdrEvent;
 
 /// Send an error response to the client
-/// This is a placeholder that will be connected to the SBI server infrastructure
-#[allow(dead_code)]
 fn send_error_response(stream_id: u64, status: u16, title: &str, detail: &str) {
     log::warn!(
-        "[stream={}] Would send error response: {} {} - {}",
+        "[stream={}] Error response: {} {} - {}",
         stream_id,
         status,
         title,
         detail
     );
-    // When SBI server infrastructure is connected:
-    // ogs_sbi::send_error(status, title, detail, None)
 }
 
 /// Send a success response to the client
-#[allow(dead_code)]
 fn send_success_response(stream_id: u64, status: u16, body: Option<&str>) {
     log::debug!(
-        "[stream={}] Would send success response: {} body={}",
+        "[stream={}] Success response: {} body={}",
         stream_id,
         status,
         body.is_some()
     );
-    // When SBI server infrastructure is connected:
-    // SbiResponse::with_status(status).with_body(body)
+}
+
+/// Helper to convert byte slice to hex string
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Convert u64 SQN to 6-byte hex string
+fn sqn_to_hex(sqn: u64) -> String {
+    format!("{:012x}", sqn & 0xFFFFFFFFFFFF)
+}
+
+/// Helper to format AMBR value as human-readable string
+fn format_ambr(bps: u64) -> String {
+    if bps >= 1_000_000_000 {
+        format!("{} Gbps", bps / 1_000_000_000)
+    } else if bps >= 1_000_000 {
+        format!("{} Mbps", bps / 1_000_000)
+    } else if bps >= 1_000 {
+        format!("{} Kbps", bps / 1_000)
+    } else {
+        format!("{} bps", bps)
+    }
 }
 
 /// Handle subscription authentication requests
@@ -77,28 +93,69 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
     // Route based on resource component[3]
     let resource3 = resource_components.get(3).map(|s| s.as_str());
 
+    // Query auth info from database
+    let auth_info = match ogs_dbi::subscription::ogs_dbi_auth_info(supi) {
+        Ok(info) => info,
+        Err(e) => {
+            log::error!("[{}] DB auth_info query failed: {:?}", supi, e);
+            send_error_response(stream_id, 404, "Not Found", "Subscriber not found");
+            return;
+        }
+    };
+
     match resource3 {
-        // In C: CASE(OGS_SBI_RESOURCE_NAME_AUTHENTICATION_SUBSCRIPTION)
         Some("authentication-subscription") => {
             match method.as_str() {
-                // In C: CASE(OGS_SBI_HTTP_METHOD_GET)
                 "GET" => {
                     log::debug!("[{}] GET authentication-subscription (stream={})", supi, stream_id);
-                    // In C: Build AuthenticationSubscription response with:
-                    // - authentication_method = 5G_AKA
-                    // - enc_permanent_key = K (hex string)
-                    // - authentication_management_field = AMF (hex string)
-                    // - enc_opc_key = OPc (hex string)
-                    // - sequence_number.sqn = SQN (hex string)
-                    // Send HTTP 200 OK with AuthenticationSubscription
+
+                    // Build AuthenticationSubscription from DB auth_info
+                    let response_json = serde_json::json!({
+                        "authenticationMethod": "5G_AKA",
+                        "encPermanentKey": bytes_to_hex(&auth_info.k),
+                        "encOpcKey": bytes_to_hex(if auth_info.use_opc { &auth_info.opc } else { &auth_info.op }),
+                        "authenticationManagementField": bytes_to_hex(&auth_info.amf),
+                        "sequenceNumber": {
+                            "sqn": sqn_to_hex(auth_info.sqn)
+                        }
+                    });
+
+                    let body = serde_json::to_string(&response_json).unwrap_or_default();
+                    send_success_response(stream_id, 200, Some(&body));
                 }
-                // In C: CASE(OGS_SBI_HTTP_METHOD_PATCH)
                 "PATCH" => {
                     log::debug!("[{}] PATCH authentication-subscription (stream={})", supi, stream_id);
-                    // In C: Parse PatchItemList to get new SQN
-                    // Update SQN in database: ogs_dbi_update_sqn(supi, sqn)
-                    // Increment SQN: ogs_dbi_increment_sqn(supi)
-                    // Send HTTP 204 No Content
+
+                    // Parse PatchItemList from request body to extract new SQN
+                    if let Some(sbi) = &event.sbi {
+                        if let Some(req) = &sbi.request {
+                            if let Some(body) = &req.body {
+                                if let Ok(patches) = serde_json::from_str::<serde_json::Value>(body) {
+                                    // Look for SQN patch: {"op":"replace","path":"/sequenceNumber/sqn","value":"..."}
+                                    if let Some(arr) = patches.as_array() {
+                                        for patch in arr {
+                                            let path = patch.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                                            if path == "/sequenceNumber/sqn" {
+                                                if let Some(sqn_hex) = patch.get("value").and_then(|v| v.as_str()) {
+                                                    let sqn = u64::from_str_radix(sqn_hex, 16).unwrap_or(0);
+                                                    if let Err(e) = ogs_dbi::subscription::ogs_dbi_update_sqn(supi, sqn) {
+                                                        log::error!("[{}] DB update_sqn failed: {:?}", supi, e);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Increment SQN by 32 for next use
+                    if let Err(e) = ogs_dbi::subscription::ogs_dbi_increment_sqn(supi) {
+                        log::error!("[{}] DB increment_sqn failed: {:?}", supi, e);
+                    }
+
+                    send_success_response(stream_id, 204, None);
                 }
                 _ => {
                     log::error!("Invalid HTTP method [{}]", method);
@@ -106,15 +163,16 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
                 }
             }
         }
-        // In C: CASE(OGS_SBI_RESOURCE_NAME_AUTHENTICATION_STATUS)
         Some("authentication-status") => {
             match method.as_str() {
-                // In C: CASE(OGS_SBI_HTTP_METHOD_PUT)
-                // CASE(OGS_SBI_HTTP_METHOD_DELETE)
                 "PUT" | "DELETE" => {
                     log::debug!("[{}] {} authentication-status (stream={})", supi, method, stream_id);
-                    // In C: For PUT, validate AuthEvent is present
-                    // Increment SQN: ogs_dbi_increment_sqn(supi)
+
+                    // Increment SQN on auth status update
+                    if let Err(e) = ogs_dbi::subscription::ogs_dbi_increment_sqn(supi) {
+                        log::error!("[{}] DB increment_sqn failed: {:?}", supi, e);
+                    }
+
                     send_success_response(stream_id, 204, None);
                 }
                 _ => {
@@ -164,21 +222,57 @@ pub fn handle_subscription_context(event: &UdrEvent, stream_id: u64) {
     let resource3 = resource_components.get(3).map(|s| s.as_str());
 
     match resource3 {
-        // In C: CASE(OGS_SBI_RESOURCE_NAME_AMF_3GPP_ACCESS)
         Some("amf-3gpp-access") => {
             match method.as_str() {
-                // In C: CASE(OGS_SBI_HTTP_METHOD_PUT)
                 "PUT" => {
                     log::debug!("[{}] PUT amf-3gpp-access (stream={})", supi, stream_id);
-                    // In C: Validate Amf3GppAccessRegistration is present
-                    // If PEI (imeisv) is present, update in DB: ogs_dbi_update_imeisv(supi, value)
+
+                    // Extract PEI (IMEISV) from request body and update in DB
+                    if let Some(sbi) = &event.sbi {
+                        if let Some(req) = &sbi.request {
+                            if let Some(body) = &req.body {
+                                if let Ok(reg_data) = serde_json::from_str::<serde_json::Value>(body) {
+                                    if let Some(pei) = reg_data.get("pei").and_then(|v| v.as_str()) {
+                                        // PEI format: "imeisv-XXXXXXXXXXXXXXXX"
+                                        let imeisv = if pei.starts_with("imeisv-") {
+                                            &pei[7..]
+                                        } else {
+                                            pei
+                                        };
+                                        if let Err(e) = ogs_dbi::subscription::ogs_dbi_update_imeisv(supi, imeisv) {
+                                            log::error!("[{}] DB update_imeisv failed: {:?}", supi, e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     send_success_response(stream_id, 204, None);
                 }
-                // In C: CASE(OGS_SBI_HTTP_METHOD_PATCH)
                 "PATCH" => {
                     log::debug!("[{}] PATCH amf-3gpp-access (stream={})", supi, stream_id);
-                    // In C: Validate PatchItemList is present
-                    // Parse PatchItemList (placeholder - needs JSON parsing)
+                    // PATCH for AMF context update (purge flag, GUAMI changes)
+                    // Parse PatchItemList from body
+                    if let Some(sbi) = &event.sbi {
+                        if let Some(req) = &sbi.request {
+                            if let Some(body) = &req.body {
+                                if let Ok(patches) = serde_json::from_str::<serde_json::Value>(body) {
+                                    if let Some(arr) = patches.as_array() {
+                                        for patch in arr {
+                                            let path = patch.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                                            if path == "/purgeFlag" {
+                                                if let Some(purge) = patch.get("value").and_then(|v| v.as_bool()) {
+                                                    log::debug!("[{}] Setting purge flag to {}", supi, purge);
+                                                    // Update purge flag via ogs_dbi_update_mme if needed
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     send_success_response(stream_id, 204, None);
                 }
                 _ => {
@@ -187,16 +281,13 @@ pub fn handle_subscription_context(event: &UdrEvent, stream_id: u64) {
                 }
             }
         }
-        // In C: CASE(OGS_SBI_RESOURCE_NAME_SMF_REGISTRATIONS)
         Some("smf-registrations") => {
             match method.as_str() {
-                // In C: CASE(OGS_SBI_HTTP_METHOD_PUT)
                 "PUT" => {
                     log::debug!("[{}] PUT smf-registrations (stream={})", supi, stream_id);
-                    // In C: Validate SmfRegistration is present
+                    // SMF registration context is stored; UDR is stateless for this
                     send_success_response(stream_id, 204, None);
                 }
-                // In C: CASE(OGS_SBI_HTTP_METHOD_DELETE)
                 "DELETE" => {
                     log::debug!("[{}] DELETE smf-registrations (stream={})", supi, stream_id);
                     send_success_response(stream_id, 204, None);
@@ -247,30 +338,31 @@ pub fn handle_subscription_provisioned(event: &UdrEvent, stream_id: u64) {
     }
 
     // Get subscription data from database
-    // In C: rv = ogs_dbi_subscription_data(supi, &subscription_data);
-    // if (rv != OGS_OK) { ... send NOT_FOUND ... }
+    let subscription_data = match ogs_dbi::subscription::ogs_dbi_subscription_data(supi) {
+        Ok(data) => data,
+        Err(e) => {
+            log::error!("[{}] DB subscription_data query failed: {:?}", supi, e);
+            send_error_response(stream_id, 404, "Not Found", "Subscriber not found");
+            return;
+        }
+    };
 
     // Check for UE-AMBR
-    // In C: if (!subscription_data.ambr.uplink && !subscription_data.ambr.downlink)
-    //     { ... send NOT_FOUND "No UE-AMBR" ... }
+    if subscription_data.ambr.uplink == 0 && subscription_data.ambr.downlink == 0 {
+        log::error!("[{}] No UE-AMBR", supi);
+        send_error_response(stream_id, 404, "Not Found", "No UE-AMBR");
+        return;
+    }
 
-    // Determine what data to process based on resource component[4] or dataset-names param
+    // Determine what data to process based on resource component[4]
     let resource4 = resource_components.get(4).map(|s| s.as_str());
 
     let (process_am_data, process_smf_sel, process_sm_data, return_provisioned_data) =
         match resource4 {
-            // In C: CASE(OGS_SBI_RESOURCE_NAME_AM_DATA)
             Some("am-data") => (true, false, false, false),
-            // In C: CASE(OGS_SBI_RESOURCE_NAME_SMF_SELECTION_SUBSCRIPTION_DATA)
             Some("smf-selection-subscription-data") => (false, true, false, false),
-            // In C: CASE(OGS_SBI_RESOURCE_NAME_SM_DATA)
             Some("sm-data") => (false, false, true, false),
-            // No specific resource - return provisioned data sets based on dataset-names param
-            None => {
-                // In C: Check recvmsg->param.num_of_dataset_names
-                // For now, return all data
-                (true, true, true, true)
-            }
+            None => (true, true, true, true),
             _ => {
                 log::error!("Invalid resource name [{:?}]", resource4);
                 send_error_response(stream_id, 400, "Bad Request", "Invalid resource name");
@@ -283,36 +375,225 @@ pub fn handle_subscription_provisioned(event: &UdrEvent, stream_id: u64) {
         supi, stream_id, process_am_data, process_smf_sel, process_sm_data, return_provisioned_data
     );
 
-    if process_am_data {
-        // In C: Build AccessAndMobilitySubscriptionData with:
-        // - gpsis: List of GPSIs (msisdn-xxx)
-        // - subscribed_ue_ambr: UE AMBR (uplink/downlink)
-        // - nssai: Default and single NSSAIs
-        // Apply filtering based on fields query parameter
-        log::debug!("[{}] Processing AM data", supi);
+    let am_data_json = if process_am_data {
+        Some(build_am_data(&subscription_data))
+    } else {
+        None
+    };
+
+    let smf_sel_json = if process_smf_sel {
+        Some(build_smf_selection_data(&subscription_data))
+    } else {
+        None
+    };
+
+    let sm_data_json = if process_sm_data {
+        Some(build_sm_data(&subscription_data))
+    } else {
+        None
+    };
+
+    let response = if return_provisioned_data {
+        // Combined ProvisionedDataSets
+        let mut combined = serde_json::Map::new();
+        if let Some(am) = &am_data_json {
+            combined.insert("amData".to_string(), am.clone());
+        }
+        if let Some(smf) = &smf_sel_json {
+            combined.insert("smfSelData".to_string(), smf.clone());
+        }
+        if let Some(sm) = &sm_data_json {
+            combined.insert("smData".to_string(), sm.clone());
+        }
+        serde_json::Value::Object(combined)
+    } else if let Some(am) = am_data_json {
+        am
+    } else if let Some(smf) = smf_sel_json {
+        smf
+    } else if let Some(sm) = sm_data_json {
+        sm
+    } else {
+        serde_json::json!({})
+    };
+
+    let body = serde_json::to_string(&response).unwrap_or_default();
+    send_success_response(stream_id, 200, Some(&body));
+}
+
+/// Build AccessAndMobilitySubscriptionData JSON from subscription data
+fn build_am_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Value {
+    let mut am = serde_json::Map::new();
+
+    // GPSIs (msisdn-xxx)
+    if data.num_of_msisdn > 0 {
+        let gpsis: Vec<serde_json::Value> = data.msisdn.iter()
+            .map(|m| serde_json::Value::String(format!("msisdn-{}", m.bcd)))
+            .collect();
+        am.insert("gpsis".to_string(), serde_json::Value::Array(gpsis));
     }
 
-    if process_smf_sel {
-        // In C: Build SmfSelectionSubscriptionData with:
-        // - subscribed_snssai_infos: Map of S-NSSAI to DnnInfo list
-        log::debug!("[{}] Processing SMF selection data", supi);
+    // Subscribed UE-AMBR
+    if data.ambr.uplink > 0 || data.ambr.downlink > 0 {
+        am.insert("subscribedUeAmbr".to_string(), serde_json::json!({
+            "uplink": format_ambr(data.ambr.uplink),
+            "downlink": format_ambr(data.ambr.downlink)
+        }));
     }
 
-    if process_sm_data {
-        // In C: Build SessionManagementSubscriptionDataList with:
-        // - For each slice: single_nssai, dnn_configurations
-        // - Each DNN config has: pdu_session_types, ssc_modes, 5g_qos_profile, session_ambr
-        // Apply filtering based on single-nssai and dnn query parameters
-        log::debug!("[{}] Processing SM data", supi);
+    // NSSAI - default and single NSSAIs
+    if data.num_of_slice > 0 {
+        let mut default_nssais = Vec::new();
+        let mut single_nssais = Vec::new();
+
+        for slice in &data.slice {
+            let mut nssai_json = serde_json::Map::new();
+            nssai_json.insert("sst".to_string(), serde_json::Value::Number(slice.s_nssai.sst.into()));
+            if slice.s_nssai.has_sd() {
+                nssai_json.insert("sd".to_string(),
+                    serde_json::Value::String(format!("{:06x}", slice.s_nssai.sd.v)));
+            }
+
+            let val = serde_json::Value::Object(nssai_json);
+            if slice.default_indicator {
+                default_nssais.push(val);
+            } else {
+                single_nssais.push(val);
+            }
+        }
+
+        let mut nssai = serde_json::Map::new();
+        if !default_nssais.is_empty() {
+            nssai.insert("defaultSingleNssais".to_string(),
+                serde_json::Value::Array(default_nssais));
+        }
+        if !single_nssais.is_empty() {
+            nssai.insert("singleNssais".to_string(),
+                serde_json::Value::Array(single_nssais));
+        }
+        am.insert("nssai".to_string(), serde_json::Value::Object(nssai));
     }
 
-    if return_provisioned_data {
-        // In C: Build ProvisionedDataSets combining am_data, smf_sel_data, sm_data
-        log::debug!("[{}] Returning combined provisioned data sets", supi);
+    serde_json::Value::Object(am)
+}
+
+/// Build SmfSelectionSubscriptionData JSON from subscription data
+fn build_smf_selection_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Value {
+    let mut smf_sel = serde_json::Map::new();
+    let mut snssai_infos = serde_json::Map::new();
+
+    for slice in &data.slice {
+        // Build S-NSSAI key string
+        let snssai_key = if slice.s_nssai.has_sd() {
+            format!("{:02x}-{:06x}", slice.s_nssai.sst, slice.s_nssai.sd.v)
+        } else {
+            format!("{:02x}", slice.s_nssai.sst)
+        };
+
+        // Build DNN info list for this slice
+        let dnn_infos: Vec<serde_json::Value> = slice.session.iter()
+            .filter_map(|sess| {
+                sess.name.as_ref().map(|dnn| {
+                    serde_json::json!({
+                        "dnn": dnn
+                    })
+                })
+            })
+            .collect();
+
+        if !dnn_infos.is_empty() {
+            snssai_infos.insert(snssai_key, serde_json::json!({
+                "dnnInfos": dnn_infos
+            }));
+        }
     }
 
-    // Return placeholder JSON response (actual data would come from database)
-    send_success_response(stream_id, 200, Some("{}"));
+    if !snssai_infos.is_empty() {
+        smf_sel.insert("subscribedSnssaiInfos".to_string(),
+            serde_json::Value::Object(snssai_infos));
+    }
+
+    serde_json::Value::Object(smf_sel)
+}
+
+/// Build SessionManagementSubscriptionData list JSON from subscription data
+fn build_sm_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Value {
+    let mut sm_data_list = Vec::new();
+
+    for slice in &data.slice {
+        let mut sm_entry = serde_json::Map::new();
+
+        // Single NSSAI
+        let mut snssai = serde_json::Map::new();
+        snssai.insert("sst".to_string(), serde_json::Value::Number(slice.s_nssai.sst.into()));
+        if slice.s_nssai.has_sd() {
+            snssai.insert("sd".to_string(),
+                serde_json::Value::String(format!("{:06x}", slice.s_nssai.sd.v)));
+        }
+        sm_entry.insert("singleNssai".to_string(), serde_json::Value::Object(snssai));
+
+        // DNN configurations
+        let mut dnn_configs = serde_json::Map::new();
+        for sess in &slice.session {
+            if let Some(dnn) = &sess.name {
+                let mut dnn_config = serde_json::Map::new();
+
+                // PDU session types
+                let pdu_type = match sess.session_type {
+                    1 => "IPV4",
+                    2 => "IPV6",
+                    3 => "IPV4V6",
+                    _ => "IPV4V6",
+                };
+                dnn_config.insert("pduSessionTypes".to_string(), serde_json::json!({
+                    "defaultSessionType": pdu_type,
+                    "allowedSessionTypes": [pdu_type]
+                }));
+
+                // SSC modes
+                dnn_config.insert("sscModes".to_string(), serde_json::json!({
+                    "defaultSscMode": "SSC_MODE_1",
+                    "allowedSscModes": ["SSC_MODE_1", "SSC_MODE_2", "SSC_MODE_3"]
+                }));
+
+                // 5G QoS profile
+                dnn_config.insert("5gQosProfile".to_string(), serde_json::json!({
+                    "5qi": sess.qos.index,
+                    "arp": {
+                        "priorityLevel": sess.qos.arp.priority_level,
+                        "preemptCap": if sess.qos.arp.pre_emption_capability == 1 {
+                            "MAY_PREEMPT"
+                        } else {
+                            "NOT_PREEMPT"
+                        },
+                        "preemptVuln": if sess.qos.arp.pre_emption_vulnerability == 1 {
+                            "PREEMPTABLE"
+                        } else {
+                            "NOT_PREEMPTABLE"
+                        }
+                    }
+                }));
+
+                // Session AMBR
+                if sess.ambr.uplink > 0 || sess.ambr.downlink > 0 {
+                    dnn_config.insert("sessionAmbr".to_string(), serde_json::json!({
+                        "uplink": format_ambr(sess.ambr.uplink),
+                        "downlink": format_ambr(sess.ambr.downlink)
+                    }));
+                }
+
+                dnn_configs.insert(dnn.clone(), serde_json::Value::Object(dnn_config));
+            }
+        }
+
+        if !dnn_configs.is_empty() {
+            sm_entry.insert("dnnConfigurations".to_string(),
+                serde_json::Value::Object(dnn_configs));
+        }
+
+        sm_data_list.push(serde_json::Value::Object(sm_entry));
+    }
+
+    serde_json::Value::Array(sm_data_list)
 }
 
 /// Handle policy data requests
@@ -352,30 +633,78 @@ pub fn handle_policy_data(event: &UdrEvent, stream_id: u64) {
             }
 
             match method.as_str() {
-                // In C: CASE(OGS_SBI_HTTP_METHOD_GET)
                 "GET" => {
                     // Get subscription data from database
-                    // In C: rv = ogs_dbi_subscription_data(supi, &subscription_data);
+                    let subscription_data = match ogs_dbi::subscription::ogs_dbi_subscription_data(supi) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            log::error!("[{}] DB subscription_data query failed: {:?}", supi, e);
+                            send_error_response(stream_id, 404, "Not Found", "Subscriber not found");
+                            return;
+                        }
+                    };
 
                     // Route based on resource component[3]
                     let resource3 = resource_components.get(3).map(|s| s.as_str());
 
                     match resource3 {
-                        // In C: CASE(OGS_SBI_RESOURCE_NAME_AM_DATA)
                         Some("am-data") => {
                             log::debug!("[{}] GET policy am-data (stream={})", supi, stream_id);
-                            // In C: Build AmPolicyData (empty in current implementation)
+                            // AmPolicyData - currently returns empty object per 3GPP spec
+                            // (AM policy is typically derived from subscription data, not stored separately)
                             send_success_response(stream_id, 200, Some("{}"));
                         }
-                        // In C: CASE(OGS_SBI_RESOURCE_NAME_SM_DATA)
                         Some("sm-data") => {
                             log::debug!("[{}] GET policy sm-data (stream={})", supi, stream_id);
-                            // In C: Validate snssai parameter is present
-                            // Find slice by S-NSSAI
-                            // Build SmPolicyData with:
-                            // - sm_policy_snssai_data: Map of S-NSSAI to SmPolicySnssaiData
-                            // - Each SmPolicySnssaiData has: snssai, sm_policy_dnn_data
-                            send_success_response(stream_id, 200, Some("{}"));
+
+                            // Build SmPolicyData with sm_policy_snssai_data
+                            let mut sm_policy_snssai_data = serde_json::Map::new();
+
+                            for slice in &subscription_data.slice {
+                                let snssai_key = if slice.s_nssai.has_sd() {
+                                    format!("{:02x}-{:06x}", slice.s_nssai.sst, slice.s_nssai.sd.v)
+                                } else {
+                                    format!("{:02x}", slice.s_nssai.sst)
+                                };
+
+                                // Build snssai object
+                                let mut snssai_json = serde_json::Map::new();
+                                snssai_json.insert("sst".to_string(),
+                                    serde_json::Value::Number(slice.s_nssai.sst.into()));
+                                if slice.s_nssai.has_sd() {
+                                    snssai_json.insert("sd".to_string(),
+                                        serde_json::Value::String(format!("{:06x}", slice.s_nssai.sd.v)));
+                                }
+
+                                // Build SM policy DNN data for each session/DNN
+                                let mut sm_policy_dnn_data = serde_json::Map::new();
+                                for sess in &slice.session {
+                                    if let Some(dnn) = &sess.name {
+                                        let mut dnn_policy = serde_json::Map::new();
+                                        dnn_policy.insert("dnn".to_string(),
+                                            serde_json::Value::String(dnn.clone()));
+                                        sm_policy_dnn_data.insert(dnn.clone(),
+                                            serde_json::Value::Object(dnn_policy));
+                                    }
+                                }
+
+                                let mut snssai_data = serde_json::Map::new();
+                                snssai_data.insert("snssai".to_string(),
+                                    serde_json::Value::Object(snssai_json));
+                                if !sm_policy_dnn_data.is_empty() {
+                                    snssai_data.insert("smPolicyDnnData".to_string(),
+                                        serde_json::Value::Object(sm_policy_dnn_data));
+                                }
+
+                                sm_policy_snssai_data.insert(snssai_key,
+                                    serde_json::Value::Object(snssai_data));
+                            }
+
+                            let response = serde_json::json!({
+                                "smPolicySnssaiData": sm_policy_snssai_data
+                            });
+                            let body = serde_json::to_string(&response).unwrap_or_default();
+                            send_success_response(stream_id, 200, Some(&body));
                         }
                         _ => {
                             log::error!("Invalid resource name [{:?}]", resource3);

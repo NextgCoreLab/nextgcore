@@ -43,7 +43,7 @@ impl OgsRbnode {
 
     /// Check if node is empty (parent points to self)
     pub fn is_empty(&self) -> bool {
-        self.parent == self as *const _ as *mut _
+        std::ptr::eq(self.parent, self)
     }
 }
 
@@ -501,7 +501,7 @@ mod tests {
     #[test]
     fn test_rbtree_insert_multiple() {
         let mut tree = OgsRbtree::new();
-        let mut nodes: Vec<Box<TestNode>> = (0..10).map(|i| TestNode::new(i)).collect();
+        let mut nodes: Vec<Box<TestNode>> = (0..10).map(TestNode::new).collect();
         
         for node in &mut nodes {
             unsafe {
@@ -570,7 +570,7 @@ mod tests {
     #[test]
     fn test_rbtree_delete() {
         let mut tree = OgsRbtree::new();
-        let mut nodes: Vec<Box<TestNode>> = (0..5).map(|i| TestNode::new(i)).collect();
+        let mut nodes: Vec<Box<TestNode>> = (0..5).map(TestNode::new).collect();
         
         // Insert all nodes
         for node in &mut nodes {

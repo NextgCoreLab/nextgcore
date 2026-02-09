@@ -55,7 +55,7 @@ pub struct TunDevice {
     /// Interface name
     name: String,
     /// Async file handle
-    file: Option<tokio::fs::File>,
+    _file: Option<tokio::fs::File>,
 }
 
 impl TunDevice {
@@ -116,7 +116,7 @@ impl TunDevice {
         Ok(Self {
             fd,
             name: actual_name,
-            file: None,
+            _file: None,
         })
     }
 
@@ -324,6 +324,252 @@ pub fn build_gtpu_echo_response(seq: Option<u16>) -> Vec<u8> {
 // Session/TEID Management
 // ============================================================================
 
+// ============================================================================
+// FAR Apply Action Flags (from 3GPP TS 29.244)
+// ============================================================================
+
+/// FAR Apply Action: Forward
+pub const FAR_ACTION_FORW: u16 = 0x0002;
+/// FAR Apply Action: Drop
+pub const FAR_ACTION_DROP: u16 = 0x0001;
+/// FAR Apply Action: Buffer
+pub const FAR_ACTION_BUFF: u16 = 0x0004;
+/// FAR Apply Action: Notify CP
+pub const FAR_ACTION_NOCP: u16 = 0x0008;
+
+/// Source interface: Access (uplink from UE/gNB)
+pub const SRC_INTF_ACCESS: u8 = 0;
+/// Source interface: Core (downlink from DN)
+pub const SRC_INTF_CORE: u8 = 1;
+
+// ============================================================================
+// PDR / FAR / QER / URR for data plane
+// ============================================================================
+
+/// Lightweight PDR for fast-path matching in the data plane
+#[derive(Debug, Clone)]
+pub struct DataPlanePdr {
+    pub pdr_id: u16,
+    pub precedence: u32,
+    pub source_interface: u8,
+    pub far_id: Option<u32>,
+    pub qer_id: Option<u32>,
+    pub urr_ids: Vec<u32>,
+    pub outer_header_removal: Option<u8>,
+}
+
+/// Lightweight FAR for fast-path forwarding in the data plane
+#[derive(Debug, Clone)]
+pub struct DataPlaneFar {
+    pub far_id: u32,
+    pub apply_action: u16,
+    pub destination_interface: u8,
+    /// Outer header creation: DL TEID for GTP-U encap
+    pub ohc_teid: Option<u32>,
+    /// Outer header creation: peer address
+    pub ohc_addr: Option<Ipv4Addr>,
+}
+
+/// Lightweight QER for QoS enforcement in the data plane
+#[derive(Debug)]
+pub struct DataPlaneQer {
+    pub qer_id: u32,
+    pub ul_gate_open: bool,
+    pub dl_gate_open: bool,
+    /// Maximum Bit Rate uplink (kbps, 0 = unlimited)
+    pub ul_mbr: u64,
+    /// Maximum Bit Rate downlink (kbps, 0 = unlimited)
+    pub dl_mbr: u64,
+    pub qfi: Option<u8>,
+    /// Bytes forwarded in current rate window (uplink)
+    ul_bytes_in_window: AtomicU64,
+    /// Bytes forwarded in current rate window (downlink)
+    dl_bytes_in_window: AtomicU64,
+    /// Window start time
+    window_start: RwLock<std::time::Instant>,
+}
+
+impl Clone for DataPlaneQer {
+    fn clone(&self) -> Self {
+        Self {
+            qer_id: self.qer_id,
+            ul_gate_open: self.ul_gate_open,
+            dl_gate_open: self.dl_gate_open,
+            ul_mbr: self.ul_mbr,
+            dl_mbr: self.dl_mbr,
+            qfi: self.qfi,
+            ul_bytes_in_window: AtomicU64::new(self.ul_bytes_in_window.load(Ordering::Relaxed)),
+            dl_bytes_in_window: AtomicU64::new(self.dl_bytes_in_window.load(Ordering::Relaxed)),
+            window_start: RwLock::new(*self.window_start.read().unwrap()),
+        }
+    }
+}
+
+impl DataPlaneQer {
+    pub fn new(qer_id: u32) -> Self {
+        Self {
+            qer_id,
+            ul_gate_open: true,
+            dl_gate_open: true,
+            ul_mbr: 0,
+            dl_mbr: 0,
+            qfi: None,
+            ul_bytes_in_window: AtomicU64::new(0),
+            dl_bytes_in_window: AtomicU64::new(0),
+            window_start: RwLock::new(std::time::Instant::now()),
+        }
+    }
+
+    /// Check if a packet of given size is within the MBR rate limit.
+    /// Returns true if the packet should be allowed.
+    pub fn check_rate(&self, bytes: u64, is_uplink: bool) -> bool {
+        let mbr = if is_uplink { self.ul_mbr } else { self.dl_mbr };
+        if mbr == 0 {
+            return true; // Unlimited
+        }
+
+        // Simple sliding window: 1-second window, mbr in kbps -> bytes/sec = mbr * 1000 / 8
+        let max_bytes_per_sec = mbr * 125; // kbps to bytes/sec
+        let window = self.window_start.read().unwrap();
+        let elapsed = window.elapsed();
+
+        if elapsed.as_secs() >= 1 {
+            // Reset window
+            drop(window);
+            *self.window_start.write().unwrap() = std::time::Instant::now();
+            if is_uplink {
+                self.ul_bytes_in_window.store(bytes, Ordering::Relaxed);
+            } else {
+                self.dl_bytes_in_window.store(bytes, Ordering::Relaxed);
+            }
+            return true;
+        }
+
+        let counter = if is_uplink {
+            &self.ul_bytes_in_window
+        } else {
+            &self.dl_bytes_in_window
+        };
+
+        let current = counter.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        current <= max_bytes_per_sec
+    }
+}
+
+/// Lightweight URR for usage reporting in the data plane
+#[derive(Debug)]
+pub struct DataPlaneUrr {
+    pub urr_id: u32,
+    pub volume_threshold_total: Option<u64>,
+    pub volume_threshold_ul: Option<u64>,
+    pub volume_threshold_dl: Option<u64>,
+    pub time_threshold_secs: Option<u32>,
+    pub measurement_period_secs: Option<u32>,
+    /// Accumulated volume since last report
+    pub acc_total_bytes: AtomicU64,
+    pub acc_ul_bytes: AtomicU64,
+    pub acc_dl_bytes: AtomicU64,
+    pub acc_total_pkts: AtomicU64,
+    pub acc_ul_pkts: AtomicU64,
+    pub acc_dl_pkts: AtomicU64,
+    /// Timestamp of first packet in this measurement period
+    pub first_pkt_time: RwLock<Option<std::time::Instant>>,
+    /// Timestamp of last report
+    pub last_report_time: RwLock<Option<std::time::Instant>>,
+    /// Whether a threshold has been exceeded (needs reporting)
+    pub threshold_exceeded: AtomicBool,
+}
+
+impl DataPlaneUrr {
+    pub fn new(urr_id: u32) -> Self {
+        Self {
+            urr_id,
+            volume_threshold_total: None,
+            volume_threshold_ul: None,
+            volume_threshold_dl: None,
+            time_threshold_secs: None,
+            measurement_period_secs: None,
+            acc_total_bytes: AtomicU64::new(0),
+            acc_ul_bytes: AtomicU64::new(0),
+            acc_dl_bytes: AtomicU64::new(0),
+            acc_total_pkts: AtomicU64::new(0),
+            acc_ul_pkts: AtomicU64::new(0),
+            acc_dl_pkts: AtomicU64::new(0),
+            first_pkt_time: RwLock::new(None),
+            last_report_time: RwLock::new(Some(std::time::Instant::now())),
+            threshold_exceeded: AtomicBool::new(false),
+        }
+    }
+
+    /// Record traffic and check thresholds, returns true if threshold exceeded
+    pub fn record(&self, bytes: u64, is_uplink: bool) -> bool {
+        let total = self.acc_total_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        self.acc_total_pkts.fetch_add(1, Ordering::Relaxed);
+
+        if is_uplink {
+            let ul = self.acc_ul_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+            self.acc_ul_pkts.fetch_add(1, Ordering::Relaxed);
+            if let Some(thresh) = self.volume_threshold_ul {
+                if ul >= thresh {
+                    self.threshold_exceeded.store(true, Ordering::Relaxed);
+                    return true;
+                }
+            }
+        } else {
+            let dl = self.acc_dl_bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+            self.acc_dl_pkts.fetch_add(1, Ordering::Relaxed);
+            if let Some(thresh) = self.volume_threshold_dl {
+                if dl >= thresh {
+                    self.threshold_exceeded.store(true, Ordering::Relaxed);
+                    return true;
+                }
+            }
+        }
+
+        // Track first packet time
+        {
+            let mut fpt = self.first_pkt_time.write().unwrap();
+            if fpt.is_none() {
+                *fpt = Some(std::time::Instant::now());
+            }
+        }
+
+        // Check total volume threshold
+        if let Some(thresh) = self.volume_threshold_total {
+            if total >= thresh {
+                self.threshold_exceeded.store(true, Ordering::Relaxed);
+                return true;
+            }
+        }
+
+        // Check time threshold
+        if let Some(time_thresh) = self.time_threshold_secs {
+            let report_time = self.last_report_time.read().unwrap();
+            if let Some(last) = *report_time {
+                if last.elapsed().as_secs() >= time_thresh as u64 {
+                    self.threshold_exceeded.store(true, Ordering::Relaxed);
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Reset counters after generating a report
+    pub fn reset_counters(&self) {
+        self.acc_total_bytes.store(0, Ordering::Relaxed);
+        self.acc_ul_bytes.store(0, Ordering::Relaxed);
+        self.acc_dl_bytes.store(0, Ordering::Relaxed);
+        self.acc_total_pkts.store(0, Ordering::Relaxed);
+        self.acc_ul_pkts.store(0, Ordering::Relaxed);
+        self.acc_dl_pkts.store(0, Ordering::Relaxed);
+        *self.first_pkt_time.write().unwrap() = None;
+        *self.last_report_time.write().unwrap() = Some(std::time::Instant::now());
+        self.threshold_exceeded.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Session entry for data plane forwarding
 #[derive(Debug)]
 pub struct DataPlaneSession {
@@ -348,6 +594,14 @@ pub struct DataPlaneSession {
     pub dl_packets: AtomicU64,
     pub ul_bytes: AtomicU64,
     pub dl_bytes: AtomicU64,
+    /// PDR rules (sorted by precedence, lower value = higher priority)
+    pub pdrs: RwLock<Vec<DataPlanePdr>>,
+    /// FAR rules (keyed by far_id)
+    pub fars: RwLock<HashMap<u32, DataPlaneFar>>,
+    /// QER rules (keyed by qer_id)
+    pub qers: RwLock<HashMap<u32, DataPlaneQer>>,
+    /// URR rules (keyed by urr_id)
+    pub urrs: RwLock<HashMap<u32, Arc<DataPlaneUrr>>>,
 }
 
 /// Data plane session manager
@@ -435,7 +689,7 @@ impl SessionManager {
 
     /// Update session downlink info (called when gNB provides DL TEID)
     pub fn update_session_dl(&self, seid: u64, dl_teid: u32, gnb_addr: SocketAddr) -> bool {
-        if let Some(session) = self.find_by_seid(seid) {
+        if let Some(_session) = self.find_by_seid(seid) {
             // We need to create a new session with updated values since Arc<DataPlaneSession>
             // For simplicity, remove old and add new with updated values
             // In production, use interior mutability (Mutex/RwLock inside DataPlaneSession)
@@ -520,6 +774,80 @@ impl SessionManager {
                     s.dl_bytes.load(Ordering::Relaxed),
                 )
             })
+            .collect()
+    }
+}
+
+impl DataPlaneSession {
+    /// Find the best matching PDR for a packet direction
+    /// Returns (far_id, qer_id, urr_ids, outer_header_removal)
+    pub fn match_pdr(&self, source_interface: u8) -> Option<(Option<u32>, Option<u32>, Vec<u32>, Option<u8>)> {
+        let pdrs = self.pdrs.read().unwrap();
+        // PDRs are sorted by precedence (lower = higher priority)
+        for pdr in pdrs.iter() {
+            if pdr.source_interface == source_interface {
+                return Some((pdr.far_id, pdr.qer_id, pdr.urr_ids.clone(), pdr.outer_header_removal));
+            }
+        }
+        None
+    }
+
+    /// Look up a FAR and determine if the packet should be forwarded
+    /// Returns: (should_forward, dl_teid, peer_addr)
+    pub fn apply_far(&self, far_id: u32) -> (bool, Option<u32>, Option<Ipv4Addr>) {
+        let fars = self.fars.read().unwrap();
+        if let Some(far) = fars.get(&far_id) {
+            if far.apply_action & FAR_ACTION_DROP != 0 {
+                return (false, None, None);
+            }
+            if far.apply_action & FAR_ACTION_FORW != 0 {
+                return (true, far.ohc_teid, far.ohc_addr);
+            }
+            // BUFF or NOCP - don't forward
+            (false, None, None)
+        } else {
+            // No FAR found - default forward
+            (true, None, None)
+        }
+    }
+
+    /// Check QER gate status and MBR for the given direction.
+    /// Returns true if traffic is allowed (gate open and within rate limit).
+    pub fn check_qer_gate(&self, qer_id: u32, is_uplink: bool, pkt_bytes: u64) -> bool {
+        let qers = self.qers.read().unwrap();
+        if let Some(qer) = qers.get(&qer_id) {
+            // Check gate status
+            let gate_open = if is_uplink { qer.ul_gate_open } else { qer.dl_gate_open };
+            if !gate_open {
+                return false;
+            }
+            // Check MBR rate limit
+            qer.check_rate(pkt_bytes, is_uplink)
+        } else {
+            true // No QER means open
+        }
+    }
+
+    /// Record traffic in all matching URRs. Returns true if any threshold exceeded.
+    pub fn record_urrs(&self, urr_ids: &[u32], bytes: u64, is_uplink: bool) -> bool {
+        let urrs = self.urrs.read().unwrap();
+        let mut any_exceeded = false;
+        for urr_id in urr_ids {
+            if let Some(urr) = urrs.get(urr_id) {
+                if urr.record(bytes, is_uplink) {
+                    any_exceeded = true;
+                }
+            }
+        }
+        any_exceeded
+    }
+
+    /// Check if any URR has a threshold exceeded
+    pub fn has_urr_threshold_exceeded(&self) -> Vec<u32> {
+        let urrs = self.urrs.read().unwrap();
+        urrs.iter()
+            .filter(|(_, urr)| urr.threshold_exceeded.load(Ordering::Relaxed))
+            .map(|(id, _)| *id)
             .collect()
     }
 }
@@ -631,7 +959,6 @@ impl DataPlane {
         let tun_fd = tun.fd();
         let gtpu_clone = gtpu.clone();
         let shutdown = self.shutdown.clone();
-        let sessions = &self.sessions;
         let stats = &self.stats;
 
         // Create channels for packet forwarding
@@ -746,7 +1073,6 @@ impl DataPlane {
 
         match header.msg_type {
             gtpu_msg_type::ECHO_REQUEST => {
-                // Send echo response
                 log::debug!("GTP-U Echo Request from {}", from);
                 let response = build_gtpu_echo_response(header.seq_num);
                 if let Some(sock) = &self.gtpu_socket {
@@ -755,7 +1081,7 @@ impl DataPlane {
                 return;
             }
             gtpu_msg_type::GPDU => {
-                // Process G-PDU
+                // Process G-PDU below
             }
             _ => {
                 log::debug!("Ignoring GTP-U message type {}", header.msg_type);
@@ -769,47 +1095,97 @@ impl DataPlane {
             return;
         }
         let ip_payload = &pkt[header.header_len..];
+        let payload_len = ip_payload.len() as u64;
 
-        // Auto-learn session from uplink packet if not exists
-        // Extract source IP from IPv4 header for session lookup/creation
-        if ip_payload.len() >= 20 {
-            let ip_version = (ip_payload[0] >> 4) & 0x0F;
-            if ip_version == IP_VERSION_4 {
-                let src_ip = Ipv4Addr::new(
-                    ip_payload[12], ip_payload[13], ip_payload[14], ip_payload[15]
-                );
-
-                // Check if session exists for this UE IP
-                if self.sessions.find_by_ue_ip(src_ip).is_none() {
-                    // Auto-create session from uplink packet info
-                    // Use the incoming TEID as the uplink TEID
-                    // Use the same TEID for downlink (gNB should accept it)
-                    // Allocate a new SEID for auto-learned sessions
-                    let upf_seid = self.sessions.allocate_seid();
-                    let session = DataPlaneSession {
-                        upf_seid,
-                        smf_seid: 0, // Unknown for auto-learned sessions
-                        ue_ipv4: Some(src_ip),
-                        ul_teid: header.teid,
-                        dl_teid: header.teid, // Use same TEID for downlink
-                        gnb_addr: from,
-                        pdu_session_id: None,
-                        qfi: None,
-                        ul_packets: AtomicU64::new(0),
-                        dl_packets: AtomicU64::new(0),
-                        ul_bytes: AtomicU64::new(0),
-                        dl_bytes: AtomicU64::new(0),
-                    };
-                    self.sessions.add_session(session);
-                    log::info!(
-                        "Auto-learned session: UE={}, TEID=0x{:x}, gNB={}",
-                        src_ip, header.teid, from
+        // Look up session by UL TEID first, then by source IP
+        let session = self.sessions.find_by_ul_teid(header.teid).or_else(|| {
+            if ip_payload.len() >= 20 {
+                let ip_version = (ip_payload[0] >> 4) & 0x0F;
+                if ip_version == IP_VERSION_4 {
+                    let src_ip = Ipv4Addr::new(
+                        ip_payload[12], ip_payload[13], ip_payload[14], ip_payload[15],
                     );
+                    self.sessions.find_by_ue_ip(src_ip)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+
+        // Auto-learn session if not found
+        let session = match session {
+            Some(s) => s,
+            None => {
+                if ip_payload.len() >= 20 {
+                    let ip_version = (ip_payload[0] >> 4) & 0x0F;
+                    if ip_version == IP_VERSION_4 {
+                        let src_ip = Ipv4Addr::new(
+                            ip_payload[12], ip_payload[13], ip_payload[14], ip_payload[15],
+                        );
+                        let upf_seid = self.sessions.allocate_seid();
+                        let new_sess = DataPlaneSession {
+                            upf_seid,
+                            smf_seid: 0,
+                            ue_ipv4: Some(src_ip),
+                            ul_teid: header.teid,
+                            dl_teid: header.teid,
+                            gnb_addr: from,
+                            pdu_session_id: None,
+                            qfi: None,
+                            ul_packets: AtomicU64::new(0),
+                            dl_packets: AtomicU64::new(0),
+                            ul_bytes: AtomicU64::new(0),
+                            dl_bytes: AtomicU64::new(0),
+                            pdrs: RwLock::new(Vec::new()),
+                            fars: RwLock::new(HashMap::new()),
+                            qers: RwLock::new(HashMap::new()),
+                            urrs: RwLock::new(HashMap::new()),
+                        };
+                        let arc = self.sessions.add_session(new_sess);
+                        log::info!("Auto-learned session: UE={}, TEID=0x{:x}, gNB={}", src_ip, header.teid, from);
+                        arc
+                    } else {
+                        self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                } else {
+                    self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    return;
                 }
             }
-        }
+        };
 
-        // Write to TUN device
+        // --- PDR matching (uplink: source_interface = Access) ---
+        if let Some((far_id, qer_id, urr_ids, _ohr)) = session.match_pdr(SRC_INTF_ACCESS) {
+            // Check QER gate
+            if let Some(qid) = qer_id {
+                if !session.check_qer_gate(qid, true, payload_len) {
+                    log::debug!("UL packet dropped by QER gate (qer_id={})", qid);
+                    self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+
+            // Apply FAR
+            if let Some(fid) = far_id {
+                let (should_forward, _, _) = session.apply_far(fid);
+                if !should_forward {
+                    log::debug!("UL packet dropped by FAR (far_id={})", fid);
+                    self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+
+            // Record URR usage
+            if !urr_ids.is_empty() {
+                session.record_urrs(&urr_ids, payload_len, true);
+            }
+        }
+        // If no PDR matches, default to forwarding (pass-through)
+
+        // Write to TUN device (decapsulated uplink)
         let ret = unsafe {
             libc::write(tun_fd, ip_payload.as_ptr() as *const libc::c_void, ip_payload.len())
         };
@@ -818,9 +1194,11 @@ impl DataPlane {
             log::error!("TUN write failed: {}", io::Error::last_os_error());
             self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
         } else {
+            session.ul_packets.fetch_add(1, Ordering::Relaxed);
+            session.ul_bytes.fetch_add(payload_len, Ordering::Relaxed);
             self.stats.ul_packets.fetch_add(1, Ordering::Relaxed);
-            self.stats.ul_bytes.fetch_add(ip_payload.len() as u64, Ordering::Relaxed);
-            log::trace!("UL: {} bytes from {} TEID=0x{:x}", ip_payload.len(), from, header.teid);
+            self.stats.ul_bytes.fetch_add(payload_len, Ordering::Relaxed);
+            log::trace!("UL: {} bytes from {} TEID=0x{:x}", payload_len, from, header.teid);
         }
     }
 
@@ -830,33 +1208,67 @@ impl DataPlane {
             return;
         }
 
-        // Get destination IP from packet
         let ip_version = (pkt[0] >> 4) & 0x0F;
+        let payload_len = pkt.len() as u64;
 
         let dst_ip = match ip_version {
             IP_VERSION_4 if pkt.len() >= 20 => {
-                let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-                Some(dst)
+                Some(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]))
             }
             _ => None,
         };
 
-        // Find session by destination IP
+        // Find session by destination UE IP
         let session = dst_ip.and_then(|ip| self.sessions.find_by_ue_ip(ip));
 
-        // If no session, try to find by looking at context
-        let (dl_teid, gnb_addr) = if let Some(sess) = session {
-            (sess.dl_teid, sess.gnb_addr)
-        } else {
-            // Default session for testing - use first available or hardcoded
-            // In production, this would look up PFCP session rules
-            log::trace!("No session for DL packet to {:?}, using default", dst_ip);
+        let (dl_teid, gnb_addr) = if let Some(ref sess) = session {
+            // --- PDR matching (downlink: source_interface = Core) ---
+            if let Some((far_id, qer_id, urr_ids, _ohr)) = sess.match_pdr(SRC_INTF_CORE) {
+                // Check QER gate
+                if let Some(qid) = qer_id {
+                    if !sess.check_qer_gate(qid, false, payload_len) {
+                        log::debug!("DL packet dropped by QER gate (qer_id={})", qid);
+                        self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                }
 
-            // For testing: use a default TEID and gNB address
-            // This should be populated from PFCP session establishment
+                // Apply FAR - may override dl_teid/gnb_addr from outer header creation
+                if let Some(fid) = far_id {
+                    let (should_forward, ohc_teid, ohc_addr) = sess.apply_far(fid);
+                    if !should_forward {
+                        log::debug!("DL packet dropped by FAR (far_id={})", fid);
+                        self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    // Use FAR outer header creation values if present, otherwise session defaults
+                    let teid = ohc_teid.unwrap_or(sess.dl_teid);
+                    let addr = ohc_addr
+                        .map(|ip| SocketAddr::new(IpAddr::V4(ip), GTPU_PORT))
+                        .unwrap_or(sess.gnb_addr);
+
+                    // Record URR usage
+                    if !urr_ids.is_empty() {
+                        sess.record_urrs(&urr_ids, payload_len, false);
+                    }
+
+                    (teid, addr)
+                } else {
+                    if !urr_ids.is_empty() {
+                        sess.record_urrs(&urr_ids, payload_len, false);
+                    }
+                    (sess.dl_teid, sess.gnb_addr)
+                }
+            } else {
+                // No matching PDR, use session defaults
+                (sess.dl_teid, sess.gnb_addr)
+            }
+        } else {
+            // No session found - drop in production, use default for testing
+            log::trace!("No session for DL packet to {:?}", dst_ip);
             let default_teid = 1u32;
             let default_gnb = SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(172, 23, 0, 100)), // nextgsim-gnb
+                IpAddr::V4(Ipv4Addr::new(172, 23, 0, 100)),
                 GTPU_PORT,
             );
             (default_teid, default_gnb)
@@ -871,9 +1283,13 @@ impl DataPlane {
         // Send to gNB
         match gtpu.send_to(&gtpu_pkt, gnb_addr).await {
             Ok(_) => {
+                if let Some(ref sess) = session {
+                    sess.dl_packets.fetch_add(1, Ordering::Relaxed);
+                    sess.dl_bytes.fetch_add(payload_len, Ordering::Relaxed);
+                }
                 self.stats.dl_packets.fetch_add(1, Ordering::Relaxed);
-                self.stats.dl_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
-                log::trace!("DL: {} bytes to {} TEID=0x{:x}", pkt.len(), gnb_addr, dl_teid);
+                self.stats.dl_bytes.fetch_add(payload_len, Ordering::Relaxed);
+                log::trace!("DL: {} bytes to {} TEID=0x{:x}", payload_len, gnb_addr, dl_teid);
             }
             Err(e) => {
                 log::error!("GTP-U send failed: {}", e);
@@ -894,6 +1310,49 @@ impl DataPlane {
         pdu_session_id: Option<u8>,
         qfi: Option<u8>,
     ) {
+        // Create default PDRs: uplink (Access->Core) and downlink (Core->Access)
+        let mut pdrs = vec![
+            DataPlanePdr {
+                pdr_id: 1,
+                precedence: 100,
+                source_interface: SRC_INTF_ACCESS,
+                far_id: Some(1),
+                qer_id: None,
+                urr_ids: Vec::new(),
+                outer_header_removal: Some(0), // GTP-U/UDP/IPv4
+            },
+            DataPlanePdr {
+                pdr_id: 2,
+                precedence: 100,
+                source_interface: SRC_INTF_CORE,
+                far_id: Some(2),
+                qer_id: None,
+                urr_ids: Vec::new(),
+                outer_header_removal: None,
+            },
+        ];
+        pdrs.sort_by_key(|p| p.precedence);
+
+        // Default FARs: UL forward (to core), DL forward (to access with GTP-U encap)
+        let mut fars = HashMap::new();
+        fars.insert(1, DataPlaneFar {
+            far_id: 1,
+            apply_action: FAR_ACTION_FORW,
+            destination_interface: SRC_INTF_CORE,
+            ohc_teid: None,
+            ohc_addr: None,
+        });
+        fars.insert(2, DataPlaneFar {
+            far_id: 2,
+            apply_action: FAR_ACTION_FORW,
+            destination_interface: SRC_INTF_ACCESS,
+            ohc_teid: Some(dl_teid),
+            ohc_addr: match gnb_addr.ip() {
+                IpAddr::V4(ip) => Some(ip),
+                _ => None,
+            },
+        });
+
         let session = DataPlaneSession {
             upf_seid,
             smf_seid,
@@ -907,6 +1366,10 @@ impl DataPlane {
             dl_packets: AtomicU64::new(0),
             ul_bytes: AtomicU64::new(0),
             dl_bytes: AtomicU64::new(0),
+            pdrs: RwLock::new(pdrs),
+            fars: RwLock::new(fars),
+            qers: RwLock::new(HashMap::new()),
+            urrs: RwLock::new(HashMap::new()),
         };
 
         self.sessions.add_session(session);
@@ -923,17 +1386,36 @@ impl DataPlane {
         dl_teid: Option<u32>,
         gnb_addr: Option<SocketAddr>,
     ) {
-        // Find and update the session by SEID
         if let Some(session) = self.sessions.find_by_seid(upf_seid) {
-            // Note: DataPlaneSession fields are not mutable through Arc
-            // For now, we'll remove and re-add with updated values
             let new_dl_teid = dl_teid.unwrap_or(session.dl_teid);
             let new_gnb_addr = gnb_addr.unwrap_or(session.gnb_addr);
 
-            // Remove old session by SEID
+            // Update the downlink FAR's outer header creation if present
+            if dl_teid.is_some() || gnb_addr.is_some() {
+                let mut fars = session.fars.write().unwrap();
+                // Update any FAR targeting access interface (downlink)
+                for far in fars.values_mut() {
+                    if far.destination_interface == SRC_INTF_ACCESS {
+                        if let Some(teid) = dl_teid {
+                            far.ohc_teid = Some(teid);
+                        }
+                        if let Some(addr) = gnb_addr {
+                            if let IpAddr::V4(ip) = addr.ip() {
+                                far.ohc_addr = Some(ip);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Remove and re-add to update the immutable fields
+            let pdrs = std::mem::take(&mut *session.pdrs.write().unwrap());
+            let fars_map = std::mem::take(&mut *session.fars.write().unwrap());
+            let qers_map = std::mem::take(&mut *session.qers.write().unwrap());
+            let urrs_map = std::mem::take(&mut *session.urrs.write().unwrap());
+
             self.sessions.remove_session_by_seid(upf_seid);
 
-            // Add updated session
             let new_session = DataPlaneSession {
                 upf_seid: session.upf_seid,
                 smf_seid: session.smf_seid,
@@ -947,6 +1429,10 @@ impl DataPlane {
                 dl_packets: AtomicU64::new(session.dl_packets.load(Ordering::Relaxed)),
                 ul_bytes: AtomicU64::new(session.ul_bytes.load(Ordering::Relaxed)),
                 dl_bytes: AtomicU64::new(session.dl_bytes.load(Ordering::Relaxed)),
+                pdrs: RwLock::new(pdrs),
+                fars: RwLock::new(fars_map),
+                qers: RwLock::new(qers_map),
+                urrs: RwLock::new(urrs_map),
             };
 
             self.sessions.add_session(new_session);
@@ -984,6 +1470,80 @@ impl DataPlane {
     pub fn get_all_session_stats(&self) -> Vec<(u64, Option<Ipv4Addr>, u64, u64, u64, u64)> {
         self.sessions.get_all_session_stats()
     }
+
+    /// Check all sessions for URR threshold exceedances.
+    /// Returns a list of (upf_seid, smf_seid, urr_id, total_bytes, ul_bytes, dl_bytes, total_pkts)
+    /// for each URR that has a threshold exceeded. Resets counters after collection.
+    pub fn collect_urr_reports(&self) -> Vec<UrrReportEntry> {
+        let mut reports = Vec::new();
+        let seid_map = self.sessions.seid_map.read().unwrap();
+
+        for session in seid_map.values() {
+            let urrs = session.urrs.read().unwrap();
+            for (urr_id, urr) in urrs.iter() {
+                if urr.threshold_exceeded.load(Ordering::Relaxed) {
+                    let entry = UrrReportEntry {
+                        upf_seid: session.upf_seid,
+                        smf_seid: session.smf_seid,
+                        urr_id: *urr_id,
+                        total_bytes: urr.acc_total_bytes.load(Ordering::Relaxed),
+                        ul_bytes: urr.acc_ul_bytes.load(Ordering::Relaxed),
+                        dl_bytes: urr.acc_dl_bytes.load(Ordering::Relaxed),
+                        total_pkts: urr.acc_total_pkts.load(Ordering::Relaxed),
+                        ul_pkts: urr.acc_ul_pkts.load(Ordering::Relaxed),
+                        dl_pkts: urr.acc_dl_pkts.load(Ordering::Relaxed),
+                    };
+                    urr.reset_counters();
+                    reports.push(entry);
+                }
+            }
+
+            // Also check time-based thresholds (measurement period)
+            for (urr_id, urr) in urrs.iter() {
+                if !urr.threshold_exceeded.load(Ordering::Relaxed) {
+                    if let Some(period) = urr.measurement_period_secs {
+                        let last_report = urr.last_report_time.read().unwrap();
+                        if let Some(last) = *last_report {
+                            if last.elapsed().as_secs() >= period as u64 {
+                                let total = urr.acc_total_bytes.load(Ordering::Relaxed);
+                                if total > 0 {
+                                    let entry = UrrReportEntry {
+                                        upf_seid: session.upf_seid,
+                                        smf_seid: session.smf_seid,
+                                        urr_id: *urr_id,
+                                        total_bytes: total,
+                                        ul_bytes: urr.acc_ul_bytes.load(Ordering::Relaxed),
+                                        dl_bytes: urr.acc_dl_bytes.load(Ordering::Relaxed),
+                                        total_pkts: urr.acc_total_pkts.load(Ordering::Relaxed),
+                                        ul_pkts: urr.acc_ul_pkts.load(Ordering::Relaxed),
+                                        dl_pkts: urr.acc_dl_pkts.load(Ordering::Relaxed),
+                                    };
+                                    urr.reset_counters();
+                                    reports.push(entry);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        reports
+    }
+}
+
+/// Entry for a URR usage report that needs to be sent as Session Report Request
+#[derive(Debug, Clone)]
+pub struct UrrReportEntry {
+    pub upf_seid: u64,
+    pub smf_seid: u64,
+    pub urr_id: u32,
+    pub total_bytes: u64,
+    pub ul_bytes: u64,
+    pub dl_bytes: u64,
+    pub total_pkts: u64,
+    pub ul_pkts: u64,
+    pub dl_pkts: u64,
 }
 
 // ============================================================================
@@ -1040,6 +1600,10 @@ mod tests {
             dl_packets: AtomicU64::new(0),
             ul_bytes: AtomicU64::new(0),
             dl_bytes: AtomicU64::new(0),
+            pdrs: RwLock::new(Vec::new()),
+            fars: RwLock::new(HashMap::new()),
+            qers: RwLock::new(HashMap::new()),
+            urrs: RwLock::new(HashMap::new()),
         };
         mgr.add_session(session);
 

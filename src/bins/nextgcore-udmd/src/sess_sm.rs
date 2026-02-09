@@ -211,7 +211,7 @@ impl UdmSessSmContext {
         let sbi = match &event.sbi {
             Some(sbi) => sbi,
             None => {
-                log::error!("[{}:{}] No SBI data in server event", suci, psi);
+                log::error!("[{suci}:{psi}] No SBI data in server event");
                 return;
             }
         };
@@ -219,7 +219,7 @@ impl UdmSessSmContext {
         let stream_id = match sbi.stream_id {
             Some(id) => id,
             None => {
-                log::error!("[{}:{}] No stream ID in SBI event", suci, psi);
+                log::error!("[{suci}:{psi}] No stream ID in SBI event");
                 return;
             }
         };
@@ -227,7 +227,7 @@ impl UdmSessSmContext {
         let message = match &sbi.message {
             Some(msg) => msg,
             None => {
-                log::error!("[{}:{}] No message in SBI event", suci, psi);
+                log::error!("[{suci}:{psi}] No message in SBI event");
                 return;
             }
         };
@@ -241,8 +241,8 @@ impl UdmSessSmContext {
                 self.handle_nudm_uecm_request(suci, psi, &method, &resource_components, stream_id);
             }
             _ => {
-                log::error!("Invalid API name [{}]", service_name);
-                send_error_response(stream_id, 400, &format!("Invalid API name: {}", service_name));
+                log::error!("Invalid API name [{service_name}]");
+                send_error_response(stream_id, 400, &format!("Invalid API name: {service_name}"));
             }
         }
     }
@@ -271,13 +271,13 @@ impl UdmSessSmContext {
                         self.sess_id, stream_id);
                 }
                 _ => {
-                    log::error!("[{}:{}] Invalid HTTP method [{}]", suci, psi, method);
+                    log::error!("[{suci}:{psi}] Invalid HTTP method [{method}]");
                     send_method_not_allowed_response(stream_id, method, "nudm-uecm/registrations");
                 }
             },
             _ => {
-                log::error!("[{}:{}] Invalid resource name [{:?}]", suci, psi, resource);
-                send_error_response(stream_id, 404, &format!("Resource not found: {:?}", resource));
+                log::error!("[{suci}:{psi}] Invalid resource name [{resource:?}]");
+                send_error_response(stream_id, 404, &format!("Resource not found: {resource:?}"));
             }
         }
     }
@@ -293,7 +293,7 @@ impl UdmSessSmContext {
         let sbi = match &event.sbi {
             Some(sbi) => sbi,
             None => {
-                log::error!("[{}:{}] No SBI data in client event", suci, psi);
+                log::error!("[{suci}:{psi}] No SBI data in client event");
                 return;
             }
         };
@@ -301,7 +301,7 @@ impl UdmSessSmContext {
         let stream_id = match sbi.stream_id {
             Some(id) => id,
             None => {
-                log::error!("[{}:{}] No stream ID in SBI client event", suci, psi);
+                log::error!("[{suci}:{psi}] No stream ID in SBI client event");
                 return;
             }
         };
@@ -309,7 +309,7 @@ impl UdmSessSmContext {
         let message = match &sbi.message {
             Some(msg) => msg,
             None => {
-                log::error!("[{}:{}] No message in SBI client event", suci, psi);
+                log::error!("[{suci}:{psi}] No message in SBI client event");
                 return;
             }
         };
@@ -360,16 +360,13 @@ impl UdmSessSmContext {
                     }
                     _ => {
                         log::error!(
-                            "[{}:{}] Invalid resource name [{:?}]",
-                            suci,
-                            psi,
-                            resource2
+                            "[{suci}:{psi}] Invalid resource name [{resource2:?}]"
                         );
                     }
                 }
             }
             _ => {
-                log::error!("[{}:{}] Invalid resource name [{:?}]", suci, psi, resource);
+                log::error!("[{suci}:{psi}] Invalid resource name [{resource:?}]");
             }
         }
     }

@@ -106,25 +106,25 @@ impl ResultCode {
     /// Check if result code indicates success
     pub fn is_success(&self) -> bool {
         let code = *self as u32;
-        code >= 2000 && code < 3000
+        (2000..3000).contains(&code)
     }
 
     /// Check if result code indicates protocol error
     pub fn is_protocol_error(&self) -> bool {
         let code = *self as u32;
-        code >= 3000 && code < 4000
+        (3000..4000).contains(&code)
     }
 
     /// Check if result code indicates transient failure
     pub fn is_transient_failure(&self) -> bool {
         let code = *self as u32;
-        code >= 4000 && code < 5000
+        (4000..5000).contains(&code)
     }
 
     /// Check if result code indicates permanent failure
     pub fn is_permanent_failure(&self) -> bool {
         let code = *self as u32;
-        code >= 5000 && code < 6000
+        (5000..6000).contains(&code)
     }
 }
 

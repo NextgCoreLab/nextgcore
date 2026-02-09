@@ -256,6 +256,7 @@ pub mod exp_result {
 
 /// E-UTRAN authentication vector
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct EUtranVector {
     /// RAND (16 bytes)
     pub rand: [u8; 16],
@@ -267,16 +268,6 @@ pub struct EUtranVector {
     pub kasme: [u8; 32],
 }
 
-impl Default for EUtranVector {
-    fn default() -> Self {
-        Self {
-            rand: [0u8; 16],
-            xres: Vec::new(),
-            autn: [0u8; 16],
-            kasme: [0u8; 32],
-        }
-    }
-}
 
 /// AIA (Authentication-Information-Answer) message data
 #[derive(Debug, Clone, Default)]

@@ -149,12 +149,12 @@ pub fn ogs_addaddrinfo(
 
     let host = hostname.unwrap_or("");
     let addr_str = if host.is_empty() {
-        format!("0.0.0.0:{}", port)
+        format!("0.0.0.0:{port}")
     } else if host.contains(':') {
         // IPv6 address
-        format!("[{}]:{}", host, port)
+        format!("[{host}]:{port}")
     } else {
-        format!("{}:{}", host, port)
+        format!("{host}:{port}")
     };
 
     // Try to resolve the address
@@ -162,7 +162,7 @@ pub fn ogs_addaddrinfo(
         Ok(addrs) => addrs,
         Err(_) => {
             // Try DNS resolution
-            let host_with_port = format!("{}:{}", host, port);
+            let host_with_port = format!("{host}:{port}");
             match host_with_port.to_socket_addrs() {
                 Ok(addrs) => addrs,
                 Err(_) => return OGS_ERROR,

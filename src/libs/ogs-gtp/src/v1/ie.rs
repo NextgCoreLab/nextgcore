@@ -238,7 +238,7 @@ impl Gtp1Ie {
 
         if is_tv_ie(ie_type) {
             // TV format
-            let length = get_tv_ie_length(ie_type).ok_or_else(|| {
+            let length = get_tv_ie_length(ie_type).ok_or({
                 GtpError::InvalidIeType(ie_type)
             })?;
 

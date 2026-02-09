@@ -989,6 +989,208 @@ pub fn build_session_establishment_request(
     builder.build()
 }
 
+/// Session modification request parameters
+#[derive(Debug, Clone, Default)]
+pub struct SessionModificationParams {
+    /// PDRs to create
+    pub create_pdrs: Vec<PdrParams>,
+    /// PDRs to update (pdr_id, outer_header_removal)
+    pub update_pdrs: Vec<(u16, Option<u8>)>,
+    /// PDRs to remove
+    pub remove_pdr_ids: Vec<u16>,
+    /// FARs to create
+    pub create_fars: Vec<FarParams>,
+    /// FARs to update-activate (far_id, dst_if, outer_header_creation, send_end_marker)
+    pub update_fars_activate: Vec<(u32, u8, Option<(u16, u32, Option<[u8; 4]>, Option<[u8; 16]>)>, bool)>,
+    /// FARs to update-deactivate
+    pub update_fars_deactivate: Vec<u32>,
+    /// FARs to remove
+    pub remove_far_ids: Vec<u32>,
+    /// QERs to create
+    pub create_qers: Vec<QerParams>,
+    /// QERs to update
+    pub update_qers: Vec<QerParams>,
+    /// QERs to remove
+    pub remove_qer_ids: Vec<u32>,
+    /// URRs to create
+    pub create_urrs: Vec<UrrParams>,
+    /// URRs to update (params, modify_flags)
+    pub update_urrs: Vec<(UrrParams, u64)>,
+    /// URRs to remove
+    pub remove_urr_ids: Vec<u32>,
+}
+
+/// Build PFCP Session Modification Request
+/// Port of smf_n4_build_session_modification_request
+pub fn build_session_modification_request(params: &SessionModificationParams) -> Vec<u8> {
+    let mut builder = PfcpMessageBuilder::new();
+
+    // Create PDRs
+    for pdr in &params.create_pdrs {
+        let pdr_bytes = build_create_pdr(pdr);
+        builder.add_tlv(pfcp_ie::CREATE_PDR, &pdr_bytes);
+    }
+
+    // Update PDRs
+    for (pdr_id, ohr) in &params.update_pdrs {
+        let pdr_bytes = build_update_pdr(*pdr_id, *ohr);
+        builder.add_tlv(pfcp_ie::UPDATE_PDR, &pdr_bytes);
+    }
+
+    // Remove PDRs
+    for pdr_id in &params.remove_pdr_ids {
+        let pdr_bytes = build_remove_pdr(*pdr_id);
+        builder.add_tlv(pfcp_ie::REMOVE_PDR, &pdr_bytes);
+    }
+
+    // Create FARs
+    for far in &params.create_fars {
+        let far_bytes = build_create_far(far);
+        builder.add_tlv(pfcp_ie::CREATE_FAR, &far_bytes);
+    }
+
+    // Update FARs (activate)
+    for (far_id, dst_if, ohc, send_em) in &params.update_fars_activate {
+        let far_bytes = build_update_far_activate(*far_id, *dst_if, *ohc, *send_em);
+        builder.add_tlv(pfcp_ie::UPDATE_FAR, &far_bytes);
+    }
+
+    // Update FARs (deactivate)
+    for far_id in &params.update_fars_deactivate {
+        let far_bytes = build_update_far_deactivate(*far_id);
+        builder.add_tlv(pfcp_ie::UPDATE_FAR, &far_bytes);
+    }
+
+    // Remove FARs
+    for far_id in &params.remove_far_ids {
+        let far_bytes = build_remove_far(*far_id);
+        builder.add_tlv(pfcp_ie::REMOVE_FAR, &far_bytes);
+    }
+
+    // Create QERs
+    for qer in &params.create_qers {
+        let qer_bytes = build_create_qer(qer);
+        builder.add_tlv(pfcp_ie::CREATE_QER, &qer_bytes);
+    }
+
+    // Update QERs
+    for qer in &params.update_qers {
+        let qer_bytes = build_update_qer(qer);
+        builder.add_tlv(pfcp_ie::UPDATE_QER, &qer_bytes);
+    }
+
+    // Remove QERs
+    for qer_id in &params.remove_qer_ids {
+        let qer_bytes = build_remove_qer(*qer_id);
+        builder.add_tlv(pfcp_ie::REMOVE_QER, &qer_bytes);
+    }
+
+    // Create URRs
+    for urr in &params.create_urrs {
+        let urr_bytes = build_create_urr(urr);
+        builder.add_tlv(pfcp_ie::CREATE_URR, &urr_bytes);
+    }
+
+    // Update URRs
+    for (urr, flags) in &params.update_urrs {
+        let urr_bytes = build_update_urr(urr, *flags);
+        builder.add_tlv(pfcp_ie::UPDATE_URR, &urr_bytes);
+    }
+
+    // Remove URRs
+    for urr_id in &params.remove_urr_ids {
+        let urr_bytes = build_remove_urr(*urr_id);
+        builder.add_tlv(pfcp_ie::REMOVE_URR, &urr_bytes);
+    }
+
+    builder.build()
+}
+
+/// Build a complete PFCP Session Establishment Request with PDR/FAR/QER/URR rules
+/// This is the full version that includes all forwarding rules for session setup.
+/// Port of the full smf_5gc_n4_build_session_establishment_request()
+pub fn build_session_establishment_request_full(
+    smf_n4_seid: u64,
+    node_id: &[u8],
+    local_addr_v4: Option<[u8; 4]>,
+    local_addr_v6: Option<[u8; 16]>,
+    pdn_type: Option<u8>,
+    apn_dnn: Option<&str>,
+    s_nssai: Option<(u8, Option<u32>)>,
+    user_id: Option<(&[u8], Option<&[u8]>, Option<&[u8]>)>,
+    restoration_indication: bool,
+    create_pdrs: &[PdrParams],
+    create_fars: &[FarParams],
+    create_qers: &[QerParams],
+    create_urrs: &[UrrParams],
+    create_bars: &[BarParams],
+) -> Vec<u8> {
+    let mut builder = PfcpMessageBuilder::new();
+
+    // Node ID
+    builder.add_node_id(node_id);
+
+    // F-SEID
+    builder.add_f_seid(smf_n4_seid, local_addr_v4, local_addr_v6);
+
+    // PDN Type
+    if let Some(pdn) = pdn_type {
+        builder.add_pdn_type(pdn);
+    }
+
+    // User ID
+    if let Some((imsi, imeisv, msisdn)) = user_id {
+        builder.add_user_id(Some(imsi), imeisv, msisdn);
+    }
+
+    // APN/DNN
+    if let Some(apn) = apn_dnn {
+        builder.add_apn_dnn(apn);
+    }
+
+    // S-NSSAI (5GC only)
+    if let Some((sst, sd)) = s_nssai {
+        builder.add_s_nssai(sst, sd);
+    }
+
+    // Restoration Indication
+    if restoration_indication {
+        builder.add_pfcpsereq_flags(true);
+    }
+
+    // Create PDRs
+    for pdr in create_pdrs {
+        let pdr_bytes = build_create_pdr(pdr);
+        builder.add_tlv(pfcp_ie::CREATE_PDR, &pdr_bytes);
+    }
+
+    // Create FARs
+    for far in create_fars {
+        let far_bytes = build_create_far(far);
+        builder.add_tlv(pfcp_ie::CREATE_FAR, &far_bytes);
+    }
+
+    // Create QERs
+    for qer in create_qers {
+        let qer_bytes = build_create_qer(qer);
+        builder.add_tlv(pfcp_ie::CREATE_QER, &qer_bytes);
+    }
+
+    // Create URRs
+    for urr in create_urrs {
+        let urr_bytes = build_create_urr(urr);
+        builder.add_tlv(pfcp_ie::CREATE_URR, &urr_bytes);
+    }
+
+    // Create BARs
+    for bar in create_bars {
+        let bar_bytes = build_create_bar(bar);
+        builder.add_tlv(pfcp_ie::CREATE_BAR, &bar_bytes);
+    }
+
+    builder.build()
+}
+
 /// Build PFCP Session Deletion Request
 /// Port of smf_n4_build_session_deletion_request
 pub fn build_session_deletion_request() -> Vec<u8> {
@@ -1765,7 +1967,210 @@ mod tests {
         let mut builder = PfcpMessageBuilder::new();
         builder.add_sdf_filter(Some("permit out ip from any to any"), None, None, None, None);
         let data = builder.build();
-        
+
         assert!(!data.is_empty());
+    }
+
+    #[test]
+    fn test_build_session_modification_request_empty() {
+        let params = SessionModificationParams::default();
+        let data = build_session_modification_request(&params);
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn test_build_session_modification_request_create_pdr_far() {
+        let params = SessionModificationParams {
+            create_pdrs: vec![PdrParams {
+                pdr_id: 1,
+                precedence: 100,
+                source_interface: interface::ACCESS,
+                far_id: Some(1),
+                qfi: Some(9),
+                ..Default::default()
+            }],
+            create_fars: vec![FarParams {
+                far_id: 1,
+                apply_action: apply_action::FORW,
+                destination_interface: Some(interface::CORE),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let data = build_session_modification_request(&params);
+        assert!(!data.is_empty());
+    }
+
+    #[test]
+    fn test_build_session_modification_request_remove_rules() {
+        let params = SessionModificationParams {
+            remove_pdr_ids: vec![1, 2],
+            remove_far_ids: vec![1, 2],
+            remove_qer_ids: vec![1],
+            remove_urr_ids: vec![1],
+            ..Default::default()
+        };
+        let data = build_session_modification_request(&params);
+        assert!(!data.is_empty());
+    }
+
+    #[test]
+    fn test_build_session_modification_request_update_far() {
+        let params = SessionModificationParams {
+            update_fars_activate: vec![(
+                1,
+                interface::ACCESS,
+                Some((0x0100, 0x12345678, Some([10, 0, 0, 1]), None)),
+                false,
+            )],
+            update_fars_deactivate: vec![2],
+            ..Default::default()
+        };
+        let data = build_session_modification_request(&params);
+        assert!(!data.is_empty());
+    }
+
+    #[test]
+    fn test_build_session_modification_request_qer_urr() {
+        let params = SessionModificationParams {
+            create_qers: vec![QerParams {
+                qer_id: 1,
+                gate_status: (0, 0),
+                mbr: Some((100_000_000, 100_000_000)),
+                qfi: Some(9),
+                ..Default::default()
+            }],
+            update_qers: vec![QerParams {
+                qer_id: 2,
+                gate_status: (0, 0),
+                mbr: Some((200_000_000, 200_000_000)),
+                ..Default::default()
+            }],
+            create_urrs: vec![UrrParams {
+                urr_id: 1,
+                measurement_method: (true, true, false),
+                reporting_triggers: 0x010000,
+                ..Default::default()
+            }],
+            update_urrs: vec![(
+                UrrParams {
+                    urr_id: 2,
+                    volume_quota: Some((Some(500_000), None, None)),
+                    ..Default::default()
+                },
+                modify_flags::URR_VOLUME_QUOTA,
+            )],
+            ..Default::default()
+        };
+        let data = build_session_modification_request(&params);
+        assert!(!data.is_empty());
+    }
+
+    #[test]
+    fn test_build_session_establishment_request_full_basic() {
+        let data = build_session_establishment_request_full(
+            0x123456789ABCDEF0,
+            &[0x00, 192, 168, 1, 1],
+            Some([192, 168, 1, 1]),
+            None,
+            Some(1),
+            Some("internet"),
+            Some((1, Some(0x010203))),
+            None,
+            false,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(!data.is_empty());
+    }
+
+    #[test]
+    fn test_build_session_establishment_request_full_with_rules() {
+        let pdrs = vec![
+            PdrParams {
+                pdr_id: 1,
+                precedence: 100,
+                source_interface: interface::ACCESS,
+                far_id: Some(1),
+                qer_id: Some(1),
+                qfi: Some(9),
+                ..Default::default()
+            },
+            PdrParams {
+                pdr_id: 2,
+                precedence: 200,
+                source_interface: interface::CORE,
+                far_id: Some(2),
+                qer_id: Some(1),
+                ue_ip_address: Some((Some([10, 45, 0, 1]), None, false)),
+                ..Default::default()
+            },
+        ];
+        let fars = vec![
+            FarParams {
+                far_id: 1,
+                apply_action: apply_action::BUFF | apply_action::NOCP,
+                ..Default::default()
+            },
+            FarParams {
+                far_id: 2,
+                apply_action: apply_action::FORW,
+                destination_interface: Some(interface::ACCESS),
+                ..Default::default()
+            },
+        ];
+        let qers = vec![QerParams {
+            qer_id: 1,
+            gate_status: (0, 0),
+            mbr: Some((100_000_000, 100_000_000)),
+            qfi: Some(9),
+            ..Default::default()
+        }];
+        let urrs = vec![UrrParams {
+            urr_id: 1,
+            measurement_method: (true, true, false),
+            reporting_triggers: 0x010000,
+            volume_threshold: Some((Some(1_000_000), None, None)),
+            ..Default::default()
+        }];
+        let bars = vec![BarParams {
+            bar_id: 1,
+            downlink_data_notification_delay: Some(50),
+            suggested_buffering_packets_count: Some(10),
+        }];
+
+        let data = build_session_establishment_request_full(
+            0x100,
+            &[0x00, 10, 0, 0, 1],
+            Some([10, 0, 0, 1]),
+            None,
+            Some(1),
+            Some("internet"),
+            Some((1, None)),
+            Some((&[0x00, 0x10, 0x10], None, None)),
+            true,
+            &pdrs,
+            &fars,
+            &qers,
+            &urrs,
+            &bars,
+        );
+        assert!(!data.is_empty());
+        // Should be significantly larger than basic version due to rules
+        let basic_data = build_session_establishment_request(
+            0x100,
+            &[0x00, 10, 0, 0, 1],
+            Some([10, 0, 0, 1]),
+            None,
+            Some(1),
+            Some("internet"),
+            Some((1, None)),
+            Some((&[0x00, 0x10, 0x10], None, None)),
+            true,
+        );
+        assert!(data.len() > basic_data.len());
     }
 }

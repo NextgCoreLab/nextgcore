@@ -41,6 +41,7 @@ pub type DbiResult<T> = Result<T, DbiError>;
 
 /// MongoDB connection state
 #[derive(Debug)]
+#[derive(Default)]
 pub struct OgsMongoc {
     pub initialized: bool,
     pub name: String,
@@ -49,33 +50,15 @@ pub struct OgsMongoc {
     pub masked_db_uri: Option<String>,
 }
 
-impl Default for OgsMongoc {
-    fn default() -> Self {
-        Self {
-            initialized: false,
-            name: String::new(),
-            client: None,
-            database: None,
-            masked_db_uri: None,
-        }
-    }
-}
 
 /// Database interface with subscriber collection
 #[derive(Debug)]
+#[derive(Default)]
 pub struct OgsDbi {
     pub mongoc: OgsMongoc,
     pub subscriber_collection: Option<Collection<Document>>,
 }
 
-impl Default for OgsDbi {
-    fn default() -> Self {
-        Self {
-            mongoc: OgsMongoc::default(),
-            subscriber_collection: None,
-        }
-    }
-}
 
 /// Global singleton for database interface
 static OGS_DBI: OnceLock<Arc<Mutex<OgsDbi>>> = OnceLock::new();
@@ -92,7 +75,7 @@ fn masked_db_uri(db_uri: &str) -> String {
     // Split on '@' to separate credentials from host
     if let Some(at_pos) = db_uri.find('@') {
         let host_part = &db_uri[at_pos + 1..];
-        format!("mongodb://*****:*****@{}", host_part)
+        format!("mongodb://*****:*****@{host_part}")
     } else {
         db_uri.to_string()
     }
@@ -224,5 +207,434 @@ mod tests {
         let uri_no_auth = "mongodb://localhost:27017/nextgcore";
         let masked_no_auth = masked_db_uri(uri_no_auth);
         assert_eq!(masked_no_auth, "mongodb://localhost:27017/nextgcore");
+    }
+}
+
+//
+// B4.6: Distributed Database Support (6G Feature)
+//
+
+
+/// Database replication modes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationMode {
+    /// Primary-secondary replication
+    PrimarySecondary,
+    /// Multi-primary (active-active)
+    MultiPrimary,
+    /// Sharded cluster
+    Sharded,
+}
+
+/// Database node role
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeRole {
+    /// Primary node (read/write)
+    Primary,
+    /// Secondary node (read-only replica)
+    Secondary,
+    /// Arbiter (voting only, no data)
+    Arbiter,
+}
+
+/// Database node information
+#[derive(Debug, Clone)]
+pub struct DbNode {
+    /// Node host
+    pub host: String,
+    /// Node port
+    pub port: u16,
+    /// Node role
+    pub role: NodeRole,
+    /// Node health status
+    pub healthy: bool,
+    /// Replication lag (seconds)
+    pub replication_lag_sec: Option<f64>,
+}
+
+impl DbNode {
+    /// Create a new database node
+    pub fn new(host: impl Into<String>, port: u16, role: NodeRole) -> Self {
+        DbNode {
+            host: host.into(),
+            port,
+            role,
+            healthy: true,
+            replication_lag_sec: None,
+        }
+    }
+
+    /// Get connection string for this node
+    pub fn connection_string(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
+/// Distributed database coordinator
+pub struct DistributedDbCoordinator {
+    /// Replication mode
+    mode: ReplicationMode,
+    /// Database nodes
+    nodes: Vec<DbNode>,
+    /// Active read preference
+    read_preference: ReadPreference,
+    /// Write concern level
+    write_concern: WriteConcern,
+}
+
+/// Read preference for distributed queries
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadPreference {
+    /// Read from primary only
+    Primary,
+    /// Read from primary, fall back to secondary if primary unavailable
+    PrimaryPreferred,
+    /// Read from secondary only
+    Secondary,
+    /// Read from secondary, fall back to primary if no secondary available
+    SecondaryPreferred,
+    /// Read from nearest node (lowest latency)
+    Nearest,
+}
+
+/// Write concern for distributed writes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteConcern {
+    /// Write to primary only (no replication confirmation)
+    Unacknowledged,
+    /// Write to primary, wait for acknowledgment
+    Acknowledged,
+    /// Write to majority of nodes
+    Majority,
+    /// Write to all nodes
+    All,
+}
+
+impl DistributedDbCoordinator {
+    /// Create a new distributed database coordinator
+    pub fn new(mode: ReplicationMode) -> Self {
+        DistributedDbCoordinator {
+            mode,
+            nodes: Vec::new(),
+            read_preference: ReadPreference::PrimaryPreferred,
+            write_concern: WriteConcern::Majority,
+        }
+    }
+
+    /// Add a database node
+    pub fn add_node(&mut self, node: DbNode) {
+        self.nodes.push(node);
+    }
+
+    /// Remove a database node
+    pub fn remove_node(&mut self, host: &str, port: u16) {
+        self.nodes.retain(|node| !(node.host == host && node.port == port));
+    }
+
+    /// Get all nodes
+    pub fn nodes(&self) -> &[DbNode] {
+        &self.nodes
+    }
+
+    /// Get primary nodes
+    pub fn primary_nodes(&self) -> Vec<&DbNode> {
+        self.nodes
+            .iter()
+            .filter(|node| node.role == NodeRole::Primary)
+            .collect()
+    }
+
+    /// Get secondary nodes
+    pub fn secondary_nodes(&self) -> Vec<&DbNode> {
+        self.nodes
+            .iter()
+            .filter(|node| node.role == NodeRole::Secondary)
+            .collect()
+    }
+
+    /// Get healthy nodes
+    pub fn healthy_nodes(&self) -> Vec<&DbNode> {
+        self.nodes
+            .iter()
+            .filter(|node| node.healthy)
+            .collect()
+    }
+
+    /// Set read preference
+    pub fn set_read_preference(&mut self, preference: ReadPreference) {
+        self.read_preference = preference;
+    }
+
+    /// Get read preference
+    pub fn read_preference(&self) -> ReadPreference {
+        self.read_preference
+    }
+
+    /// Set write concern
+    pub fn set_write_concern(&mut self, concern: WriteConcern) {
+        self.write_concern = concern;
+    }
+
+    /// Get write concern
+    pub fn write_concern(&self) -> WriteConcern {
+        self.write_concern
+    }
+
+    /// Get replication mode
+    pub fn mode(&self) -> ReplicationMode {
+        self.mode
+    }
+
+    /// Select nodes for read operation based on preference
+    pub fn select_read_nodes(&self) -> Vec<&DbNode> {
+        match self.read_preference {
+            ReadPreference::Primary => self.primary_nodes()
+                .into_iter()
+                .filter(|n| n.healthy)
+                .collect(),
+            ReadPreference::PrimaryPreferred => {
+                let primary = self.primary_nodes()
+                    .into_iter()
+                    .filter(|n| n.healthy)
+                    .collect::<Vec<_>>();
+                if !primary.is_empty() {
+                    primary
+                } else {
+                    self.secondary_nodes()
+                        .into_iter()
+                        .filter(|n| n.healthy)
+                        .collect()
+                }
+            }
+            ReadPreference::Secondary => self.secondary_nodes()
+                .into_iter()
+                .filter(|n| n.healthy)
+                .collect(),
+            ReadPreference::SecondaryPreferred => {
+                let secondary = self.secondary_nodes()
+                    .into_iter()
+                    .filter(|n| n.healthy)
+                    .collect::<Vec<_>>();
+                if !secondary.is_empty() {
+                    secondary
+                } else {
+                    self.primary_nodes()
+                        .into_iter()
+                        .filter(|n| n.healthy)
+                        .collect()
+                }
+            }
+            ReadPreference::Nearest => self.healthy_nodes(),
+        }
+    }
+
+    /// Select nodes for write operation based on write concern
+    pub fn select_write_nodes(&self) -> Vec<&DbNode> {
+        match self.write_concern {
+            WriteConcern::Unacknowledged | WriteConcern::Acknowledged => {
+                self.primary_nodes()
+                    .into_iter()
+                    .filter(|n| n.healthy)
+                    .take(1)
+                    .collect()
+            }
+            WriteConcern::Majority => {
+                let all_nodes = self.healthy_nodes();
+                let majority_count = (all_nodes.len() / 2) + 1;
+                all_nodes.into_iter().take(majority_count).collect()
+            }
+            WriteConcern::All => self.healthy_nodes(),
+        }
+    }
+
+    /// Check if cluster has quorum
+    pub fn has_quorum(&self) -> bool {
+        let healthy_count = self.healthy_nodes().len();
+        let total_count = self.nodes.len();
+        healthy_count > total_count / 2
+    }
+
+    /// Get replica set status
+    pub fn get_status(&self) -> ReplicaSetStatus {
+        let primary_count = self.primary_nodes().len();
+        let secondary_count = self.secondary_nodes().len();
+        let healthy_count = self.healthy_nodes().len();
+        let unhealthy_count = self.nodes.len() - healthy_count;
+
+        ReplicaSetStatus {
+            mode: self.mode,
+            total_nodes: self.nodes.len(),
+            primary_nodes: primary_count,
+            secondary_nodes: secondary_count,
+            healthy_nodes: healthy_count,
+            unhealthy_nodes: unhealthy_count,
+            has_quorum: self.has_quorum(),
+        }
+    }
+
+    /// Mark node as healthy/unhealthy
+    pub fn set_node_health(&mut self, host: &str, port: u16, healthy: bool) {
+        if let Some(node) = self.nodes.iter_mut().find(|n| n.host == host && n.port == port) {
+            node.healthy = healthy;
+        }
+    }
+
+    /// Update replication lag for a node
+    pub fn set_replication_lag(&mut self, host: &str, port: u16, lag_sec: f64) {
+        if let Some(node) = self.nodes.iter_mut().find(|n| n.host == host && n.port == port) {
+            node.replication_lag_sec = Some(lag_sec);
+        }
+    }
+}
+
+/// Replica set status information
+#[derive(Debug, Clone)]
+pub struct ReplicaSetStatus {
+    /// Replication mode
+    pub mode: ReplicationMode,
+    /// Total number of nodes
+    pub total_nodes: usize,
+    /// Number of primary nodes
+    pub primary_nodes: usize,
+    /// Number of secondary nodes
+    pub secondary_nodes: usize,
+    /// Number of healthy nodes
+    pub healthy_nodes: usize,
+    /// Number of unhealthy nodes
+    pub unhealthy_nodes: usize,
+    /// Whether cluster has quorum
+    pub has_quorum: bool,
+}
+
+#[cfg(test)]
+mod distributed_tests {
+    use super::*;
+
+    #[test]
+    fn test_db_node_creation() {
+        let node = DbNode::new("localhost", 27017, NodeRole::Primary);
+        assert_eq!(node.host, "localhost");
+        assert_eq!(node.port, 27017);
+        assert_eq!(node.role, NodeRole::Primary);
+        assert!(node.healthy);
+    }
+
+    #[test]
+    fn test_coordinator_add_nodes() {
+        let mut coordinator = DistributedDbCoordinator::new(ReplicationMode::PrimarySecondary);
+
+        coordinator.add_node(DbNode::new("host1", 27017, NodeRole::Primary));
+        coordinator.add_node(DbNode::new("host2", 27017, NodeRole::Secondary));
+        coordinator.add_node(DbNode::new("host3", 27017, NodeRole::Secondary));
+
+        assert_eq!(coordinator.nodes().len(), 3);
+        assert_eq!(coordinator.primary_nodes().len(), 1);
+        assert_eq!(coordinator.secondary_nodes().len(), 2);
+    }
+
+    #[test]
+    fn test_read_preference_primary() {
+        let mut coordinator = DistributedDbCoordinator::new(ReplicationMode::PrimarySecondary);
+
+        coordinator.add_node(DbNode::new("host1", 27017, NodeRole::Primary));
+        coordinator.add_node(DbNode::new("host2", 27017, NodeRole::Secondary));
+
+        coordinator.set_read_preference(ReadPreference::Primary);
+        let read_nodes = coordinator.select_read_nodes();
+
+        assert_eq!(read_nodes.len(), 1);
+        assert_eq!(read_nodes[0].role, NodeRole::Primary);
+    }
+
+    #[test]
+    fn test_read_preference_primary_preferred_fallback() {
+        let mut coordinator = DistributedDbCoordinator::new(ReplicationMode::PrimarySecondary);
+
+        let mut primary = DbNode::new("host1", 27017, NodeRole::Primary);
+        primary.healthy = false; // Primary unhealthy
+        coordinator.add_node(primary);
+        coordinator.add_node(DbNode::new("host2", 27017, NodeRole::Secondary));
+
+        coordinator.set_read_preference(ReadPreference::PrimaryPreferred);
+        let read_nodes = coordinator.select_read_nodes();
+
+        // Should fall back to secondary
+        assert_eq!(read_nodes.len(), 1);
+        assert_eq!(read_nodes[0].role, NodeRole::Secondary);
+    }
+
+    #[test]
+    fn test_write_concern_majority() {
+        let mut coordinator = DistributedDbCoordinator::new(ReplicationMode::PrimarySecondary);
+
+        coordinator.add_node(DbNode::new("host1", 27017, NodeRole::Primary));
+        coordinator.add_node(DbNode::new("host2", 27017, NodeRole::Secondary));
+        coordinator.add_node(DbNode::new("host3", 27017, NodeRole::Secondary));
+
+        coordinator.set_write_concern(WriteConcern::Majority);
+        let write_nodes = coordinator.select_write_nodes();
+
+        // Majority of 3 is 2
+        assert_eq!(write_nodes.len(), 2);
+    }
+
+    #[test]
+    fn test_quorum() {
+        let mut coordinator = DistributedDbCoordinator::new(ReplicationMode::PrimarySecondary);
+
+        coordinator.add_node(DbNode::new("host1", 27017, NodeRole::Primary));
+        coordinator.add_node(DbNode::new("host2", 27017, NodeRole::Secondary));
+        coordinator.add_node(DbNode::new("host3", 27017, NodeRole::Secondary));
+
+        // All healthy - has quorum
+        assert!(coordinator.has_quorum());
+
+        // Mark two as unhealthy - no quorum
+        coordinator.set_node_health("host2", 27017, false);
+        coordinator.set_node_health("host3", 27017, false);
+        assert!(!coordinator.has_quorum());
+    }
+
+    #[test]
+    fn test_replica_set_status() {
+        let mut coordinator = DistributedDbCoordinator::new(ReplicationMode::PrimarySecondary);
+
+        coordinator.add_node(DbNode::new("host1", 27017, NodeRole::Primary));
+        coordinator.add_node(DbNode::new("host2", 27017, NodeRole::Secondary));
+        coordinator.add_node(DbNode::new("host3", 27017, NodeRole::Secondary));
+
+        let status = coordinator.get_status();
+
+        assert_eq!(status.total_nodes, 3);
+        assert_eq!(status.primary_nodes, 1);
+        assert_eq!(status.secondary_nodes, 2);
+        assert_eq!(status.healthy_nodes, 3);
+        assert_eq!(status.unhealthy_nodes, 0);
+        assert!(status.has_quorum);
+    }
+
+    #[test]
+    fn test_replication_lag() {
+        let mut coordinator = DistributedDbCoordinator::new(ReplicationMode::PrimarySecondary);
+
+        coordinator.add_node(DbNode::new("host1", 27017, NodeRole::Secondary));
+
+        coordinator.set_replication_lag("host1", 27017, 2.5);
+
+        let node = &coordinator.nodes()[0];
+        assert_eq!(node.replication_lag_sec, Some(2.5));
+    }
+
+    #[test]
+    fn test_remove_node() {
+        let mut coordinator = DistributedDbCoordinator::new(ReplicationMode::PrimarySecondary);
+
+        coordinator.add_node(DbNode::new("host1", 27017, NodeRole::Primary));
+        coordinator.add_node(DbNode::new("host2", 27017, NodeRole::Secondary));
+
+        assert_eq!(coordinator.nodes().len(), 2);
+
+        coordinator.remove_node("host2", 27017);
+        assert_eq!(coordinator.nodes().len(), 1);
     }
 }

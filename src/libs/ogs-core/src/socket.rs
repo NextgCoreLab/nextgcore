@@ -333,8 +333,16 @@ mod tests {
         let (raw, len) = sockaddr_to_raw(&addr);
         assert!(len > 0);
 
-        let storage = unsafe { &*(raw.as_ptr() as *const libc::sockaddr_storage) };
-        let recovered = raw_to_sockaddr(storage, len);
+        // Copy into a properly aligned sockaddr_storage
+        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                raw.as_ptr(),
+                &mut storage as *mut _ as *mut u8,
+                len as usize,
+            );
+        }
+        let recovered = raw_to_sockaddr(&storage, len);
         assert!(recovered.is_some());
         let recovered = recovered.unwrap();
         assert_eq!(recovered.port(), 8080);

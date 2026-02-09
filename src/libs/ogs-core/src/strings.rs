@@ -59,7 +59,7 @@ pub fn ogs_strlcpy(dst: &mut [u8], src: &str) -> usize {
     if copy_len > 0 {
         dst[..copy_len].copy_from_slice(&src_bytes[..copy_len]);
     }
-    if dst.len() > 0 {
+    if !dst.is_empty() {
         dst[copy_len] = 0; // Null terminate
     }
     

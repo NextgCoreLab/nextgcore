@@ -4,6 +4,9 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use ogs_sbi::context::{global_context, NfInstance, NfService};
+use ogs_sbi::types::{NfType, SbiServiceType, UriScheme};
+
 /// SBI server configuration
 #[derive(Debug, Clone)]
 pub struct SbiServerConfig {
@@ -12,6 +15,7 @@ pub struct SbiServerConfig {
     pub tls_enabled: bool,
     pub tls_cert: Option<String>,
     pub tls_key: Option<String>,
+    pub nrf_uri: Option<String>,
 }
 
 impl Default for SbiServerConfig {
@@ -22,6 +26,7 @@ impl Default for SbiServerConfig {
             tls_enabled: false,
             tls_cert: None,
             tls_key: None,
+            nrf_uri: None,
         }
     }
 }
@@ -29,7 +34,113 @@ impl Default for SbiServerConfig {
 /// SBI server state
 static SBI_SERVER_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// Open SBI server
+/// Parse host and port from a URI string (e.g., "http://127.0.0.1:7777")
+fn parse_uri_host_port(uri_str: &str) -> Result<(String, u16), String> {
+    let stripped = uri_str
+        .strip_prefix("https://")
+        .or_else(|| uri_str.strip_prefix("http://"))
+        .unwrap_or(uri_str);
+    let (host, port_str) = if let Some(idx) = stripped.rfind(':') {
+        (&stripped[..idx], &stripped[idx + 1..])
+    } else {
+        (stripped, if uri_str.starts_with("https") { "443" } else { "80" })
+    };
+    let port: u16 = port_str
+        .split('/')
+        .next()
+        .unwrap_or(port_str)
+        .parse()
+        .map_err(|e| format!("Invalid port in URI: {}", e))?;
+    Ok((host.to_string(), port))
+}
+
+/// Build the BSF NF instance with service information
+fn build_bsf_nf_instance(config: &SbiServerConfig) -> NfInstance {
+    let nf_id = uuid::Uuid::new_v4().to_string();
+    let mut nf_instance = NfInstance::new(&nf_id, NfType::Bsf);
+
+    nf_instance.ipv4_addresses.push(config.addr.clone());
+    nf_instance.heartbeat_interval = 10;
+
+    let scheme = if config.tls_enabled {
+        UriScheme::Https
+    } else {
+        UriScheme::Http
+    };
+
+    // nbsf-management service (allowed: PCF, AF)
+    let mut bsf_svc = NfService::new(
+        SbiServiceType::NbsfManagement.to_name(),
+        SbiServiceType::NbsfManagement,
+    );
+    bsf_svc.scheme = scheme;
+    bsf_svc.ip_addresses.push(config.addr.clone());
+    bsf_svc.port = config.port;
+    nf_instance.add_service(bsf_svc);
+
+    nf_instance
+}
+
+/// Register BSF NF instance with NRF
+async fn register_with_nrf(nrf_uri: &str, nf_instance: &NfInstance) -> Result<(), String> {
+    let (host, port) = parse_uri_host_port(nrf_uri)?;
+
+    let ctx = global_context();
+    let client = ctx.get_client(&host, port).await;
+
+    let register_path = format!(
+        "/nnrf-nfm/v1/nf-instances/{}",
+        nf_instance.id
+    );
+
+    let body = serde_json::json!({
+        "nfInstanceId": nf_instance.id,
+        "nfType": "BSF",
+        "nfStatus": "REGISTERED",
+        "heartBeatTimer": nf_instance.heartbeat_interval,
+        "ipv4Addresses": nf_instance.ipv4_addresses,
+        "nfServices": nf_instance.services.iter().map(|s| {
+            serde_json::json!({
+                "serviceName": s.name,
+                "versions": s.versions.iter().map(|v| {
+                    serde_json::json!({"apiVersionInUri": v, "apiFullVersion": format!("{}.0.0", v)})
+                }).collect::<Vec<_>>(),
+                "scheme": s.scheme.as_str(),
+                "nfServiceStatus": "REGISTERED",
+            })
+        }).collect::<Vec<_>>(),
+    });
+
+    match client
+        .put_json(&register_path, &body)
+        .await
+    {
+        Ok(response) => {
+            let status = response.status;
+            if status == 200 || status == 201 {
+                log::info!(
+                    "BSF registered with NRF (id={}, status={})",
+                    nf_instance.id,
+                    status
+                );
+                Ok(())
+            } else {
+                log::warn!(
+                    "NRF registration returned status {}: {:?}",
+                    status,
+                    response.http.content
+                );
+                Ok(())
+            }
+        }
+        Err(e) => {
+            log::warn!("NRF registration failed (BSF will operate standalone): {}", e);
+            Ok(())
+        }
+    }
+}
+
+/// Open SBI server and register with NRF
 /// Port of bsf_sbi_open
 pub fn bsf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     if SBI_SERVER_RUNNING.load(Ordering::SeqCst) {
@@ -44,18 +155,31 @@ pub fn bsf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
         config.port
     );
 
-    // Note: Initialize SELF NF instance
-    // In C: ogs_sbi_nf_instance_build_default(nf_instance)
-    // - Add allowed NF types: SCP, PCF, AF
-    // - Build NF service for nbsf-management (v1)
+    // Build and register the BSF NF instance
+    let nf_instance = build_bsf_nf_instance(&config);
+    let nf_id = nf_instance.id.clone();
+    let nrf_uri_clone = config.nrf_uri.clone();
+    let nf_clone = nf_instance.clone();
 
-    // Note: Initialize NRF NF Instance if configured
-    // In C: ogs_sbi_nf_fsm_init(nf_instance)
+    // Attempt async registration (only if tokio runtime is available)
+    let sbi_ctx = global_context();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            sbi_ctx.set_self_instance(nf_clone).await;
+            if let Some(ref nrf_uri) = nrf_uri_clone {
+                sbi_ctx.set_nrf_uri(nrf_uri).await;
+                if let Err(e) = register_with_nrf(nrf_uri, &nf_instance).await {
+                    log::error!("Failed to register BSF with NRF: {}", e);
+                }
+            } else {
+                log::info!("No NRF URI configured, BSF running in standalone mode");
+            }
+        });
+    } else {
+        log::debug!("No tokio runtime available, skipping async NRF registration");
+    }
 
-    // Note: Setup subscription data
-    // In C: ogs_sbi_subscription_spec_add(OpenAPI_nf_type_SEPP, NULL)
-
-    // Note: Start SBI server - handled by main.rs HTTP server startup
+    log::info!("BSF NF instance built (id={})", nf_id);
 
     SBI_SERVER_RUNNING.store(true, Ordering::SeqCst);
 
@@ -63,7 +187,7 @@ pub fn bsf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     Ok(())
 }
 
-/// Close SBI server
+/// Close SBI server and deregister from NRF
 /// Port of bsf_sbi_close
 pub fn bsf_sbi_close() {
     if !SBI_SERVER_RUNNING.load(Ordering::SeqCst) {
@@ -72,11 +196,27 @@ pub fn bsf_sbi_close() {
 
     log::info!("Closing BSF SBI server");
 
-    // Note: Stop SBI client - handled by HTTP client shutdown
-    // In C: ogs_sbi_client_stop_all()
-
-    // Note: Stop SBI server - handled by main.rs HTTP server shutdown
-    // In C: ogs_sbi_server_stop_all()
+    // Attempt async deregistration (only if tokio runtime is available)
+    let sbi_ctx = global_context();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            if let (Some(nrf_uri), Some(self_instance)) = (
+                sbi_ctx.get_nrf_uri().await,
+                sbi_ctx.get_self_instance().await,
+            ) {
+                if let Ok((host, port)) = parse_uri_host_port(&nrf_uri) {
+                    let client = sbi_ctx.get_client(&host, port).await;
+                    let path = format!("/nnrf-nfm/v1/nf-instances/{}", self_instance.id);
+                    if let Err(e) = client.delete(&path).await {
+                        log::warn!("Failed to deregister BSF from NRF: {}", e);
+                    } else {
+                        log::info!("BSF deregistered from NRF");
+                    }
+                }
+            }
+            sbi_ctx.clear_clients().await;
+        });
+    }
 
     SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
 
@@ -185,20 +325,12 @@ mod tests {
         assert!(result.is_ok());
         assert!(bsf_sbi_is_running());
 
-        bsf_sbi_close();
-        assert!(!bsf_sbi_is_running());
-    }
-
-    #[test]
-    fn test_sbi_open_already_running() {
-        // Reset state
-        SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
-
-        let _ = bsf_sbi_open(None);
+        // Try to open again while running - should fail
         let result = bsf_sbi_open(None);
         assert!(result.is_err());
 
         bsf_sbi_close();
+        assert!(!bsf_sbi_is_running());
     }
 
     #[test]

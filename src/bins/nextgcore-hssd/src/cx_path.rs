@@ -98,19 +98,39 @@ pub fn handle_uar(
     user_name: &str,
     public_identity: &str,
     _visited_network_identifier: &str,
-    _authorization_type: UserAuthorizationType,
+    authorization_type: UserAuthorizationType,
 ) -> Result<UarResponse, String> {
-    log::debug!("[{}] Handling UAR for {}", user_name, public_identity);
+    log::debug!("[{}] Handling UAR for {} (type={:?})", user_name, public_identity, authorization_type);
     diam_stats().cx.inc_rx_uar();
 
-    // Note: Implement UAR handling
-    // 1. Check if user exists in DB
-    // 2. Associate identity if needed
-    // 3. Return UAA with server capabilities or assigned S-CSCF
-    // UAR processing uses ogs_dbi for DB access and identity association
+    use crate::context::hss_self;
+    use ogs_dbi::ogs_dbi_ims_data;
 
+    // 1. Check if user exists in DB
+    let supi = format!("imsi-{}", user_name.trim_start_matches("imsi-"));
+    let _ims_data = ogs_dbi_ims_data(&supi)
+        .map_err(|e| format!("Failed to get IMS data: {}", e))?;
+
+    // 2. Associate identity if needed
+    let ctx = hss_self();
+    let context = ctx.read().map_err(|_| "Failed to lock context".to_string())?;
+    context.cx_associate_identity(user_name, public_identity);
+
+    // 3. Return UAA with server capabilities or assigned S-CSCF
+    let mut response = UarResponse::default();
+    response.result_code = 2001; // DIAMETER_SUCCESS
+    response.experimental_result_code = OGS_DIAM_CX_FIRST_REGISTRATION;
+
+    // Return default server capabilities (no scscf_name field in OgsImsData)
+    response.server_capabilities = Some(ServerCapabilities {
+        mandatory_capability: vec![0], // No mandatory capabilities
+        optional_capability: vec![0],   // No optional capabilities
+        server_name: vec!["sip:scscf.ims.mnc001.mcc001.3gppnetwork.org".to_string()],
+    });
+
+    log::debug!("[{}] UAR processed for {}", user_name, public_identity);
     diam_stats().cx.inc_tx_uaa();
-    Ok(UarResponse::default())
+    Ok(response)
 }
 
 /// Handle Multimedia-Auth-Request (MAR)
@@ -119,21 +139,77 @@ pub fn handle_uar(
 pub fn handle_mar(
     user_name: &str,
     public_identity: &str,
-    _sip_num_auth_items: u32,
-    _sip_auth_scheme: &str,
+    sip_num_auth_items: u32,
+    sip_auth_scheme: &str,
     _sip_authorization: Option<&[u8]>,
 ) -> Result<MarResponse, String> {
-    log::debug!("[{}] Handling MAR for {}", user_name, public_identity);
+    log::debug!("[{}] Handling MAR for {} (scheme={})", user_name, public_identity, sip_auth_scheme);
     diam_stats().cx.inc_rx_mar();
 
-    // Note: Implement MAR handling
-    // 1. Get auth info from DB
-    // 2. Generate SIP authentication vectors (AKA or Digest)
-    // 3. Return MAA with SIP-Auth-Data-Item
-    // MAR processing uses ogs_dbi for DB access and ogs_crypt for auth vector generation
+    use ogs_dbi::ogs_dbi_auth_info;
+    use ogs_crypt::milenage::{milenage_f1, milenage_f2345, milenage_opc};
 
+    // 1. Get auth info from DB
+    let supi = format!("imsi-{}", user_name.trim_start_matches("imsi-"));
+    let auth_info = ogs_dbi_auth_info(&supi)
+        .map_err(|e| format!("Failed to get auth info: {}", e))?;
+
+    // 2. Generate SIP authentication vectors (AKA or Digest)
+    let rand = auth_info.rand;
+    let sqn_bytes: [u8; 6] = [
+        ((auth_info.sqn >> 40) & 0xFF) as u8,
+        ((auth_info.sqn >> 32) & 0xFF) as u8,
+        ((auth_info.sqn >> 24) & 0xFF) as u8,
+        ((auth_info.sqn >> 16) & 0xFF) as u8,
+        ((auth_info.sqn >> 8) & 0xFF) as u8,
+        (auth_info.sqn & 0xFF) as u8,
+    ];
+
+    let opc = if auth_info.use_opc {
+        auth_info.opc
+    } else {
+        milenage_opc(&auth_info.k, &auth_info.op)
+            .map_err(|_| "Failed to compute OPc".to_string())?
+    };
+
+    let (mac_a, _mac_s) = milenage_f1(&opc, &auth_info.k, &rand, &sqn_bytes, &auth_info.amf)
+        .map_err(|_| "Failed to compute f1".to_string())?;
+
+    let (res, ck, ik, ak, _ak_star) = milenage_f2345(&opc, &auth_info.k, &rand)
+        .map_err(|_| "Failed to compute f2-f5".to_string())?;
+
+    // Build AUTN = SQN ^ AK || AMF || MAC-A
+    let mut autn = [0u8; 16];
+    for i in 0..6 {
+        autn[i] = sqn_bytes[i] ^ ak[i];
+    }
+    autn[6..8].copy_from_slice(&auth_info.amf);
+    autn[8..16].copy_from_slice(&mac_a);
+
+    // 3. Return MAA with SIP-Auth-Data-Item
+    let mut sip_authenticate = Vec::new();
+    sip_authenticate.extend_from_slice(&rand);
+    sip_authenticate.extend_from_slice(&autn);
+
+    let sip_auth_data_item = SipAuthDataItem {
+        sip_auth_scheme: sip_auth_scheme.to_string(),
+        sip_authenticate,
+        sip_authorization: res.to_vec(),
+        confidentiality_key: ck.to_vec(),
+        integrity_key: ik.to_vec(),
+    };
+
+    let response = MarResponse {
+        result_code: 2001, // DIAMETER_SUCCESS
+        user_name: Some(user_name.to_string()),
+        public_identity: Some(public_identity.to_string()),
+        sip_num_auth_items,
+        sip_auth_data_items: vec![sip_auth_data_item],
+    };
+
+    log::debug!("[{}] MAR processed for {}", user_name, public_identity);
     diam_stats().cx.inc_tx_maa();
-    Ok(MarResponse::default())
+    Ok(response)
 }
 
 /// Handle Server-Assignment-Request (SAR)
@@ -142,25 +218,79 @@ pub fn handle_mar(
 pub fn handle_sar(
     user_name: &str,
     public_identity: &str,
-    _server_name: &str,
+    server_name: &str,
     server_assignment_type: ServerAssignmentType,
 ) -> Result<SarResponse, String> {
     log::debug!(
-        "[{}] Handling SAR for {} (type={:?})",
+        "[{}] Handling SAR for {} (type={:?}, server={})",
         user_name,
         public_identity,
-        server_assignment_type
+        server_assignment_type,
+        server_name
     );
     diam_stats().cx.inc_rx_sar();
 
-    // Note: Implement SAR handling
-    // 1. Update server assignment in context
-    // 2. Download user data if registration
-    // 3. Return SAA with User-Data (XML)
-    // SAR processing uses ogs_dbi for DB access and IMS user profile management
+    use crate::context::hss_self;
+    use ogs_dbi::ogs_dbi_ims_data;
 
+    // 1. Update server assignment in context
+    let ctx = hss_self();
+    let context = ctx.read().map_err(|_| "Failed to lock context".to_string())?;
+
+    context.cx_associate_identity(user_name, public_identity);
+    context.cx_set_server_name(public_identity, server_name, true);
+
+    // 2. Download user data if registration
+    let mut response = SarResponse::default();
+    response.result_code = 2001; // DIAMETER_SUCCESS
+
+    match server_assignment_type {
+        ServerAssignmentType::Registration | ServerAssignmentType::ReRegistration => {
+            // Get IMS user data from DB
+            let supi = format!("imsi-{}", user_name.trim_start_matches("imsi-"));
+            let _ims_data = ogs_dbi_ims_data(&supi)
+                .map_err(|e| format!("Failed to get IMS data: {}", e))?;
+
+            // 3. Return SAA with User-Data (XML)
+            // Note: In full implementation, this would build IMS user profile XML
+            let user_data_xml = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<IMSSubscription>
+    <PrivateID>{}</PrivateID>
+    <ServiceProfile>
+        <PublicIdentity>
+            <Identity>{}</Identity>
+        </PublicIdentity>
+        <InitialFilterCriteria>
+            <Priority>0</Priority>
+            <ApplicationServer>
+                <ServerName>sip:as.ims.mnc001.mcc001.3gppnetwork.org</ServerName>
+            </ApplicationServer>
+        </InitialFilterCriteria>
+    </ServiceProfile>
+</IMSSubscription>"#,
+                user_name, public_identity
+            );
+
+            response.user_data = Some(user_data_xml);
+
+            // Include charging information
+            response.charging_information = Some(ChargingInformation {
+                primary_event_charging_function_name: Some("pcf.ims.mnc001.mcc001.3gppnetwork.org".to_string()),
+                secondary_event_charging_function_name: None,
+                primary_charging_collection_function_name: Some("ccf.ims.mnc001.mcc001.3gppnetwork.org".to_string()),
+                secondary_charging_collection_function_name: None,
+            });
+        }
+        _ => {
+            // Deregistration or other types - no user data
+            log::debug!("[{}] SAR type {:?} - no user data returned", user_name, server_assignment_type);
+        }
+    }
+
+    log::debug!("[{}] SAR processed for {}", user_name, public_identity);
     diam_stats().cx.inc_tx_saa();
-    Ok(SarResponse::default())
+    Ok(response)
 }
 
 /// Handle Location-Info-Request (LIR)
@@ -170,13 +300,36 @@ pub fn handle_lir(public_identity: &str) -> Result<LirResponse, String> {
     log::debug!("Handling LIR for {}", public_identity);
     diam_stats().cx.inc_rx_lir();
 
-    // Note: Implement LIR handling
-    // 1. Look up server name for public identity
-    // 2. Return LIA with Server-Name or Server-Capabilities
-    // LIR processing uses ogs_dbi for DB access and S-CSCF lookup
+    use crate::context::hss_self;
 
+    // 1. Look up server name for public identity
+    let ctx = hss_self();
+    let context = ctx.read().map_err(|_| "Failed to lock context".to_string())?;
+
+    let mut response = LirResponse::default();
+    response.result_code = 2001; // DIAMETER_SUCCESS
+
+    // 2. Return LIA with Server-Name or Server-Capabilities
+    if let Some(server_name) = context.cx_get_server_name(public_identity) {
+        // User is registered - return assigned S-CSCF
+        response.server_name = Some(server_name);
+        response.experimental_result_code = OGS_DIAM_CX_SUBSEQUENT_REGISTRATION;
+    } else {
+        // User not registered - return server capabilities for selection
+        response.server_capabilities = Some(ServerCapabilities {
+            mandatory_capability: vec![0], // No mandatory capabilities
+            optional_capability: vec![0],   // No optional capabilities
+            server_name: vec![
+                "sip:scscf1.ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+                "sip:scscf2.ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+            ],
+        });
+        response.experimental_result_code = OGS_DIAM_CX_ERROR_IDENTITY_NOT_REGISTERED;
+    }
+
+    log::debug!("LIR processed for {}", public_identity);
     diam_stats().cx.inc_tx_lia();
-    Ok(LirResponse::default())
+    Ok(response)
 }
 
 /// UAR Response structure
@@ -295,17 +448,19 @@ mod tests {
 
     #[test]
     fn test_handle_uar() {
+        // UAR requires MongoDB for IMS data lookup - verify graceful error without DB
         let result = handle_uar(
             "user@example.com",
             "sip:user@example.com",
             "example.com",
             UserAuthorizationType::Registration,
         );
-        assert!(result.is_ok());
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_handle_mar() {
+        // MAR requires MongoDB for auth info lookup - verify graceful error without DB
         let result = handle_mar(
             "user@example.com",
             "sip:user@example.com",
@@ -313,18 +468,19 @@ mod tests {
             "Digest-AKAv1-MD5",
             None,
         );
-        assert!(result.is_ok());
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_handle_sar() {
+        // SAR requires MongoDB for IMS data lookup - verify graceful error without DB
         let result = handle_sar(
             "user@example.com",
             "sip:user@example.com",
             "sip:scscf.example.com",
             ServerAssignmentType::Registration,
         );
-        assert!(result.is_ok());
+        assert!(result.is_err());
     }
 
     #[test]

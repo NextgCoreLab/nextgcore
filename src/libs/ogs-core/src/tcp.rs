@@ -113,7 +113,6 @@ mod tests {
         // The test is mainly to verify the code compiles and runs
         if server.is_none() {
             // Skip test if we can't create server
-            return;
         }
     }
 }

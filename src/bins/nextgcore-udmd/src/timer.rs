@@ -8,8 +8,10 @@ use std::time::{Duration, Instant};
 
 /// UDM Timer types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum UdmTimerType {
     /// No timer
+    #[default]
     None,
     /// NF instance heartbeat timer
     NfInstanceHeartbeat,
@@ -23,11 +25,6 @@ pub enum UdmTimerType {
     SbiClientWait,
 }
 
-impl Default for UdmTimerType {
-    fn default() -> Self {
-        UdmTimerType::None
-    }
-}
 
 /// Get timer name for logging
 pub fn udm_timer_get_name(timer_type: UdmTimerType) -> &'static str {
@@ -111,10 +108,7 @@ impl UdmTimerManager {
         timers.insert(id, timer);
 
         log::debug!(
-            "Timer started: {} ({:?}, {:?})",
-            id,
-            timer_type,
-            duration
+            "Timer started: {id} ({timer_type:?}, {duration:?})"
         );
 
         id
@@ -126,7 +120,7 @@ impl UdmTimerManager {
         let timer = timers.remove(&id);
         
         if timer.is_some() {
-            log::debug!("Timer stopped: {}", id);
+            log::debug!("Timer stopped: {id}");
         }
 
         timer
@@ -160,9 +154,30 @@ impl UdmTimerManager {
     }
 }
 
+impl UdmTimerManager {
+    /// Clear all timers
+    pub fn clear(&self) {
+        self.timers.write().unwrap().clear();
+    }
+}
+
 impl Default for UdmTimerManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Convert UdmTimerType to UdmTimerId (from event module) for dispatching
+/// This mapping bridges the timer module's types with the event module's types
+pub fn timer_type_to_timer_id(timer_type: UdmTimerType) -> Option<crate::event::UdmTimerId> {
+    use crate::event::UdmTimerId;
+    match timer_type {
+        UdmTimerType::None => None,
+        UdmTimerType::NfInstanceHeartbeat => Some(UdmTimerId::NfInstanceHeartbeatInterval),
+        UdmTimerType::NfInstanceNoHeartbeat => Some(UdmTimerId::NfInstanceNoHeartbeat),
+        UdmTimerType::NfInstanceValidity => Some(UdmTimerId::NfInstanceValidity),
+        UdmTimerType::SubscriptionValidity => Some(UdmTimerId::SubscriptionValidity),
+        UdmTimerType::SbiClientWait => Some(UdmTimerId::SbiClientWait),
     }
 }
 

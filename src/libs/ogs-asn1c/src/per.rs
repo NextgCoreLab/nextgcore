@@ -210,6 +210,7 @@ impl AperEncoder {
     }
 
     /// Encode length determinant (X.691 Section 11.9)
+    /// Now supports fragmented encoding for lengths > 16383 (B16.2)
     pub fn encode_length_determinant(&mut self, length: usize) -> PerResult<()> {
         self.align();
         if length <= 127 {
@@ -219,8 +220,27 @@ impl AperEncoder {
             // Long form: 10xxxxxx xxxxxxxx
             self.write_bits(0x8000 | length as u64, 16);
         } else {
-            // Fragmented form not supported for now
-            return Err(PerError::InvalidLength { length });
+            // Fragmented form: 11xxxxxx for lengths > 16383
+            // Each fragment can encode up to 16384 octets
+            let mut remaining = length;
+            while remaining > 0 {
+                let fragment_size = std::cmp::min(remaining, 16384);
+                let multiplier = fragment_size / 16384;
+
+                if remaining > 16384 {
+                    // More fragments follow: 11xxxxxx (where xxxxxx is multiplier)
+                    self.write_bits(0xC0 | multiplier as u64, 8);
+                } else {
+                    // Last fragment
+                    if fragment_size <= 127 {
+                        self.write_bits(fragment_size as u64, 8);
+                    } else {
+                        self.write_bits(0x8000 | fragment_size as u64, 16);
+                    }
+                }
+
+                remaining = remaining.saturating_sub(fragment_size);
+            }
         }
         Ok(())
     }
@@ -496,6 +516,7 @@ impl<'a> AperDecoder<'a> {
     }
 
     /// Decode length determinant (X.691 Section 11.9)
+    /// Now supports fragmented decoding for lengths > 16383 (B16.2)
     pub fn decode_length_determinant(&mut self) -> PerResult<usize> {
         self.align();
         let first_byte = self.read_bits(8)? as u8;
@@ -508,10 +529,33 @@ impl<'a> AperDecoder<'a> {
             let second_byte = self.read_bits(8)? as u8;
             Ok((((first_byte & 0x3F) as usize) << 8) | (second_byte as usize))
         } else {
-            // Fragmented - not supported
-            Err(PerError::InvalidLength {
-                length: first_byte as usize,
-            })
+            // Fragmented form: 11xxxxxx
+            let mut total_length = 0;
+            let mut current_byte = first_byte;
+
+            loop {
+                if current_byte & 0xC0 == 0xC0 {
+                    // Fragment header: 11xxxxxx
+                    let multiplier = (current_byte & 0x3F) as usize;
+                    total_length += multiplier * 16384;
+
+                    // Read next byte to check if more fragments follow
+                    current_byte = self.read_bits(8)? as u8;
+                } else {
+                    // Last fragment - decode as normal length
+                    if current_byte & 0x80 == 0 {
+                        // Short form
+                        total_length += current_byte as usize;
+                    } else if current_byte & 0x40 == 0 {
+                        // Long form
+                        let second_byte = self.read_bits(8)? as u8;
+                        total_length += (((current_byte & 0x3F) as usize) << 8) | (second_byte as usize);
+                    }
+                    break;
+                }
+            }
+
+            Ok(total_length)
         }
     }
 
@@ -591,8 +635,8 @@ impl<'a> AperDecoder<'a> {
                 len
             }
             _ => {
-                let len = self.decode_length_determinant()?;
-                len
+                
+                self.decode_length_determinant()?
             }
         };
 

@@ -13,11 +13,14 @@ use hyper::body::Incoming;
 use hyper::client::conn::http2::SendRequest;
 use hyper::{Method, Request, Uri};
 use hyper_util::rt::TokioIo;
+use rustls::pki_types::ServerName;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tokio_rustls::TlsConnector;
 
 use crate::error::{SbiError, SbiResult};
 use crate::message::{SbiRequest, SbiResponse};
+use crate::tls;
 use crate::types::UriScheme;
 
 /// Default connection timeout in seconds
@@ -137,10 +140,34 @@ impl SbiClient {
         &self.config
     }
 
+    /// Build a TLS connector from the client config
+    fn build_tls_connector(&self) -> SbiResult<TlsConnector> {
+        let client_config = if let (Some(cert_path), Some(key_path)) =
+            (&self.config.client_cert, &self.config.client_key)
+        {
+            // mTLS: client certificate authentication
+            let certs = tls::load_certs(cert_path)?;
+            let key = tls::load_private_key(key_path)?;
+            tls::build_client_config_mtls(
+                certs,
+                key,
+                self.config.ca_cert.as_deref(),
+                self.config.insecure_skip_verify,
+            )?
+        } else {
+            tls::build_client_config(
+                self.config.ca_cert.as_deref(),
+                self.config.insecure_skip_verify,
+            )?
+        };
+
+        Ok(TlsConnector::from(Arc::new(client_config)))
+    }
+
     /// Connect to the server
     async fn connect(&self) -> SbiResult<SendRequest<Full<Bytes>>> {
         let addr = format!("{}:{}", self.config.host, self.config.port);
-        
+
         let stream = tokio::time::timeout(
             self.config.connect_timeout,
             TcpStream::connect(&addr),
@@ -149,23 +176,53 @@ impl SbiClient {
         .map_err(|_| SbiError::Timeout)?
         .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
 
-        let io = TokioIo::new(stream);
+        if self.config.scheme == UriScheme::Https {
+            let connector = self.build_tls_connector()?;
+            let server_name = ServerName::try_from(self.config.host.clone())
+                .map_err(|e| SbiError::TlsError(format!("Invalid server name: {e}")))?;
 
-        let (sender, conn) = hyper::client::conn::http2::handshake(
-            hyper_util::rt::TokioExecutor::new(),
-            io,
-        )
-        .await
-        .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
+            let tls_stream = tokio::time::timeout(
+                self.config.connect_timeout,
+                connector.connect(server_name, stream),
+            )
+            .await
+            .map_err(|_| SbiError::Timeout)?
+            .map_err(|e| SbiError::TlsError(format!("TLS handshake failed: {e}")))?;
 
-        // Spawn the connection driver
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                eprintln!("HTTP/2 connection error: {}", e);
-            }
-        });
+            let io = TokioIo::new(tls_stream);
 
-        Ok(sender)
+            let (sender, conn) = hyper::client::conn::http2::handshake(
+                hyper_util::rt::TokioExecutor::new(),
+                io,
+            )
+            .await
+            .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
+
+            tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    eprintln!("HTTP/2 TLS connection error: {e}");
+                }
+            });
+
+            Ok(sender)
+        } else {
+            let io = TokioIo::new(stream);
+
+            let (sender, conn) = hyper::client::conn::http2::handshake(
+                hyper_util::rt::TokioExecutor::new(),
+                io,
+            )
+            .await
+            .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
+
+            tokio::spawn(async move {
+                if let Err(e) = conn.await {
+                    eprintln!("HTTP/2 connection error: {e}");
+                }
+            });
+
+            Ok(sender)
+        }
     }
 
     /// Get or create a connection
@@ -203,14 +260,14 @@ impl SbiClient {
                 .http
                 .params
                 .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
+                .map(|(k, v)| format!("{k}={v}"))
                 .collect();
             format!("{}?{}", uri_str, params.join("&"))
         };
 
         let uri: Uri = uri_with_params
             .parse()
-            .map_err(|e| SbiError::InvalidUri(format!("{}: {}", uri_with_params, e)))?;
+            .map_err(|e| SbiError::InvalidUri(format!("{uri_with_params}: {e}")))?;
 
         // Build the HTTP method
         let method = match request.header.method.to_uppercase().as_str() {

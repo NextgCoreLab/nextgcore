@@ -588,6 +588,110 @@ pub fn build_downlink_nas_transport_asn1(
     }
 }
 
+/// Build a PDU Session Resource Setup Request with proper ASN.1 APER encoding
+///
+/// This is sent by AMF to gNB to establish PDU session resources.
+/// The message follows 3GPP TS 38.413 Section 8.2.1.
+pub fn build_pdu_session_resource_setup_request_asn1(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    pdu_session_id: u8,
+    s_nssai_sst: u8,
+    s_nssai_sd: Option<u32>,
+    nas_pdu: Option<&[u8]>,
+    n2_sm_transfer: &[u8],
+) -> Option<Vec<u8>> {
+    let mut protocol_ies = Vec::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory)
+    protocol_ies.push(PDUSessionResourceSetupRequestProtocolIEs_Entry {
+        id: ProtocolIE_ID(ID_AMF_UE_NGAP_ID),
+        criticality: Criticality(Criticality::REJECT),
+        value: PDUSessionResourceSetupRequestProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(
+            AMF_UE_NGAP_ID(amf_ue_ngap_id),
+        ),
+    });
+
+    // IE: RAN-UE-NGAP-ID (mandatory)
+    protocol_ies.push(PDUSessionResourceSetupRequestProtocolIEs_Entry {
+        id: ProtocolIE_ID(ID_RAN_UE_NGAP_ID),
+        criticality: Criticality(Criticality::REJECT),
+        value: PDUSessionResourceSetupRequestProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(
+            RAN_UE_NGAP_ID(ran_ue_ngap_id),
+        ),
+    });
+
+    // IE: NAS-PDU (optional, common for all sessions)
+    if let Some(pdu) = nas_pdu {
+        protocol_ies.push(PDUSessionResourceSetupRequestProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_NAS_PDU),
+            criticality: Criticality(Criticality::REJECT),
+            value: PDUSessionResourceSetupRequestProtocolIEs_EntryValue::Id_NAS_PDU(
+                NAS_PDU(pdu.to_vec()),
+            ),
+        });
+    }
+
+    // IE: PDUSessionResourceSetupListSUReq (mandatory)
+    let sd = s_nssai_sd.map(|sd_val| {
+        SD(vec![
+            ((sd_val >> 16) & 0xFF) as u8,
+            ((sd_val >> 8) & 0xFF) as u8,
+            (sd_val & 0xFF) as u8,
+        ])
+    });
+
+    let item = PDUSessionResourceSetupItemSUReq {
+        pdu_session_id: PDUSessionID(pdu_session_id),
+        pdu_session_nas_pdu: None,
+        s_nssai: S_NSSAI {
+            sst: SST(vec![s_nssai_sst]),
+            sd,
+            ie_extensions: None,
+        },
+        pdu_session_resource_setup_request_transfer:
+            PDUSessionResourceSetupItemSUReqPDUSessionResourceSetupRequestTransfer(
+                n2_sm_transfer.to_vec(),
+            ),
+        ie_extensions: None,
+    };
+
+    let list = PDUSessionResourceSetupListSUReq(vec![item]);
+    protocol_ies.push(PDUSessionResourceSetupRequestProtocolIEs_Entry {
+        id: ProtocolIE_ID(ID_PDU_SESSION_RESOURCE_SETUP_LIST_SU_REQ),
+        criticality: Criticality(Criticality::REJECT),
+        value: PDUSessionResourceSetupRequestProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListSUReq(list),
+    });
+
+    let request = PDUSessionResourceSetupRequest {
+        protocol_i_es: PDUSessionResourceSetupRequestProtocolIEs(protocol_ies),
+    };
+
+    let initiating_message = InitiatingMessage {
+        procedure_code: ProcedureCode(ID_PDU_SESSION_RESOURCE_SETUP),
+        criticality: Criticality(Criticality::REJECT),
+        value: InitiatingMessageValue::Id_PDUSessionResourceSetup(request),
+    };
+
+    let pdu = NGAP_PDU::InitiatingMessage(initiating_message);
+
+    match encode_ngap_pdu(&pdu) {
+        Ok(bytes) => {
+            log::debug!(
+                "Built PDU Session Resource Setup Request: {} bytes, amf_ue_ngap_id={}, psi={}",
+                bytes.len(),
+                amf_ue_ngap_id,
+                pdu_session_id
+            );
+            Some(bytes)
+        }
+        Err(e) => {
+            log::error!("Failed to encode PDU Session Resource Setup Request: {:?}", e);
+            None
+        }
+    }
+}
+
 /// Parsed Uplink NAS Transport data
 #[derive(Debug, Clone)]
 pub struct UplinkNasTransportData {
@@ -735,10 +839,10 @@ mod tests {
         // PLMN 999-70 should encode as:
         // Byte 0: MCC2 (9) << 4 | MCC1 (9) = 0x99
         // Byte 1: MNC3 (F) << 4 | MCC3 (9) = 0xF9
-        // Byte 2: MNC2 (7) << 4 | MNC1 (0) = 0x70
+        // Byte 2: MNC2 (0) << 4 | MNC1 (7) = 0x07
         assert_eq!(bytes[0], 0x99);
         assert_eq!(bytes[1], 0xF9);
-        assert_eq!(bytes[2], 0x70);
+        assert_eq!(bytes[2], 0x07);
     }
 
     #[test]

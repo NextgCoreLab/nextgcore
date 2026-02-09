@@ -7,6 +7,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
+use ogs_dbi::mongoc::{ogs_mongoc, DbiResult};
+
 /// Maximum number of IP addresses for PCF
 pub const MAX_NUM_OF_PCF_IP: usize = 8;
 
@@ -404,6 +406,160 @@ impl BsfContext {
     pub fn sess_count(&self) -> usize {
         self.sess_list.read().map(|l| l.len()).unwrap_or(0)
     }
+}
+
+impl BsfContext {
+    /// Persist a session binding to the database (if available)
+    pub fn sess_persist(&self, sess: &BsfSess) {
+        if let Err(e) = bsf_db_upsert_binding(sess) {
+            log::debug!("DB persistence unavailable, binding in-memory only: {}", e);
+        }
+    }
+
+    /// Remove a session binding from the database (if available)
+    pub fn sess_unpersist(&self, binding_id: &str) {
+        if let Err(e) = bsf_db_delete_binding(binding_id) {
+            log::debug!("DB persistence unavailable for delete: {}", e);
+        }
+    }
+
+    /// Load persisted bindings from database on startup
+    pub fn load_persisted_bindings(&self) {
+        match bsf_db_load_all_bindings() {
+            Ok(bindings) => {
+                for sess in bindings {
+                    if let Ok(mut sess_list) = self.sess_list.write() {
+                        let id = sess.id;
+                        // Update hashes
+                        if let (Ok(mut ipv4_hash), Some(addr)) =
+                            (self.ipv4addr_hash.write(), sess.ipv4addr)
+                        {
+                            ipv4_hash.insert(addr, id);
+                        }
+                        if let (Ok(mut ipv6_hash), Some(ref prefix)) =
+                            (self.ipv6prefix_hash.write(), &sess.ipv6prefix)
+                        {
+                            ipv6_hash.insert(prefix.hash_key(), id);
+                        }
+                        sess_list.insert(id, sess);
+                    }
+                }
+                log::info!("Loaded persisted BSF bindings from database");
+            }
+            Err(e) => {
+                log::debug!("No persisted bindings loaded (DB unavailable): {}", e);
+            }
+        }
+    }
+}
+
+/// Get the BSF bindings collection from MongoDB
+fn get_bsf_bindings_collection()
+    -> DbiResult<ogs_dbi::mongodb::sync::Collection<ogs_dbi::mongodb::bson::Document>>
+{
+    let dbi = ogs_mongoc();
+    let dbi_guard = dbi.lock().unwrap();
+    let db = dbi_guard
+        .mongoc
+        .database
+        .as_ref()
+        .ok_or(ogs_dbi::DbiError::NotInitialized)?;
+    Ok(db.collection("bsf_bindings"))
+}
+
+/// Upsert a BSF binding to MongoDB
+fn bsf_db_upsert_binding(sess: &BsfSess) -> DbiResult<()> {
+    let collection = get_bsf_bindings_collection()?;
+    let filter = ogs_dbi::mongodb::bson::doc! { "binding_id": &sess.binding_id };
+
+    let mut doc = ogs_dbi::mongodb::bson::doc! {
+        "binding_id": &sess.binding_id,
+        "id": sess.id as i64,
+    };
+    if let Some(ref supi) = sess.supi {
+        doc.insert("supi", supi);
+    }
+    if let Some(ref gpsi) = sess.gpsi {
+        doc.insert("gpsi", gpsi);
+    }
+    if let Some(ref ipv4) = sess.ipv4addr_string {
+        doc.insert("ipv4Addr", ipv4);
+    }
+    if let Some(ref ipv6) = sess.ipv6prefix_string {
+        doc.insert("ipv6Prefix", ipv6);
+    }
+    if let Some(ref dnn) = sess.dnn {
+        doc.insert("dnn", dnn);
+    }
+    doc.insert("sst", sess.s_nssai.sst as i32);
+    if let Some(sd) = sess.s_nssai.sd {
+        doc.insert("sd", sd as i64);
+    }
+    if let Some(ref pcf_fqdn) = sess.pcf_fqdn {
+        doc.insert("pcf_fqdn", pcf_fqdn);
+    }
+
+    let opts = ogs_dbi::mongodb::options::ReplaceOptions::builder()
+        .upsert(true)
+        .build();
+    collection.replace_one(filter, doc, opts)?;
+
+    log::debug!("BSF binding {} persisted to DB", sess.binding_id);
+    Ok(())
+}
+
+/// Delete a BSF binding from MongoDB
+fn bsf_db_delete_binding(binding_id: &str) -> DbiResult<()> {
+    let collection = get_bsf_bindings_collection()?;
+    let filter = ogs_dbi::mongodb::bson::doc! { "binding_id": binding_id };
+    collection.delete_one(filter, None)?;
+    log::debug!("BSF binding {} removed from DB", binding_id);
+    Ok(())
+}
+
+/// Load all BSF bindings from MongoDB
+fn bsf_db_load_all_bindings() -> DbiResult<Vec<BsfSess>> {
+    let collection = get_bsf_bindings_collection()?;
+    let cursor = collection.find(ogs_dbi::mongodb::bson::doc! {}, None)?;
+
+    let mut bindings = Vec::new();
+    for result in cursor {
+        let doc = result?;
+        let id = doc.get_i64("id").unwrap_or(0) as u64;
+        let mut sess = BsfSess::new(id);
+
+        if let Ok(binding_id) = doc.get_str("binding_id") {
+            sess.binding_id = binding_id.to_string();
+        }
+        if let Ok(supi) = doc.get_str("supi") {
+            sess.supi = Some(supi.to_string());
+        }
+        if let Ok(gpsi) = doc.get_str("gpsi") {
+            sess.gpsi = Some(gpsi.to_string());
+        }
+        if let Ok(ipv4) = doc.get_str("ipv4Addr") {
+            sess.set_ipv4addr(ipv4);
+        }
+        if let Ok(ipv6) = doc.get_str("ipv6Prefix") {
+            sess.set_ipv6prefix(ipv6);
+        }
+        if let Ok(dnn) = doc.get_str("dnn") {
+            sess.dnn = Some(dnn.to_string());
+        }
+        if let Ok(sst) = doc.get_i32("sst") {
+            sess.s_nssai.sst = sst as u8;
+        }
+        if let Ok(sd) = doc.get_i64("sd") {
+            sess.s_nssai.sd = Some(sd as u32);
+        }
+        if let Ok(pcf_fqdn) = doc.get_str("pcf_fqdn") {
+            sess.pcf_fqdn = Some(pcf_fqdn.to_string());
+        }
+
+        bindings.push(sess);
+    }
+
+    Ok(bindings)
 }
 
 impl Default for BsfContext {

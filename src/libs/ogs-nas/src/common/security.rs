@@ -9,6 +9,7 @@ use crate::common::types::SecurityAlgorithms;
 
 /// NAS security context
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct NasSecurityContext {
     /// Selected NAS security algorithms
     pub algorithms: SecurityAlgorithms,
@@ -22,17 +23,6 @@ pub struct NasSecurityContext {
     pub ul_count: NasCount,
 }
 
-impl Default for NasSecurityContext {
-    fn default() -> Self {
-        Self {
-            algorithms: SecurityAlgorithms::default(),
-            knas_enc: [0u8; 16],
-            knas_int: [0u8; 16],
-            dl_count: NasCount::default(),
-            ul_count: NasCount::default(),
-        }
-    }
-}
 
 impl NasSecurityContext {
     /// Create a new NAS security context
@@ -239,7 +229,7 @@ impl NasSecurityContext {
 
         let mut output = vec![0u8; message.len()];
         aes::aes_ctr128_encrypt(&self.knas_enc, &mut iv, message, &mut output)
-            .map_err(|e| NasError::SecurityError(format!("AES-CTR error: {:?}", e)))?;
+            .map_err(|e| NasError::SecurityError(format!("AES-CTR error: {e:?}")))?;
         Ok(output)
     }
 

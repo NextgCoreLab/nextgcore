@@ -566,3 +566,228 @@ mod tests {
         assert!(elapsed.as_millis() >= 10);
     }
 }
+
+//
+// Async I/O Support (B2.1)
+//
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll as TaskPoll, Waker};
+
+/// Async event notification
+struct AsyncEvent {
+    waker: Option<Waker>,
+    ready: bool,
+    event_mask: i16,
+}
+
+impl AsyncEvent {
+    fn new() -> Self {
+        Self {
+            waker: None,
+            ready: false,
+            event_mask: 0,
+        }
+    }
+}
+
+/// Async pollset manager wrapping OgsPollset
+pub struct AsyncPollManager {
+    pollset: Arc<Mutex<OgsPollset>>,
+    running: Arc<Mutex<bool>>,
+}
+
+impl AsyncPollManager {
+    /// Create a new async poll manager
+    pub fn new(capacity: usize) -> Option<Self> {
+        let pollset = OgsPollset::create(capacity)?;
+        Some(AsyncPollManager {
+            pollset: Arc::new(Mutex::new(pollset)),
+            running: Arc::new(Mutex::new(false)),
+        })
+    }
+
+    /// Add an async socket to the pollset
+    pub fn add_async<F>(
+        &self,
+        when: i16,
+        fd: OgsSocket,
+        handler: F,
+        data: *mut std::ffi::c_void,
+    ) -> Option<AsyncPollHandle>
+    where
+        F: FnMut(i16, OgsSocket, *mut std::ffi::c_void) + Send + 'static,
+    {
+        let mut pollset = self.pollset.lock().unwrap();
+        let id = pollset.add(when, fd, handler, data)?;
+
+        Some(AsyncPollHandle {
+            id,
+            fd,
+            pollset: Arc::clone(&self.pollset),
+            event: Arc::new(Mutex::new(AsyncEvent::new())),
+        })
+    }
+
+    /// Remove a socket from the pollset
+    pub fn remove(&self, id: usize) -> i32 {
+        let mut pollset = self.pollset.lock().unwrap();
+        pollset.remove(id)
+    }
+
+    /// Run the poll loop in the background
+    pub fn spawn_poll_loop(&self, timeout: OgsTime) {
+        let pollset = Arc::clone(&self.pollset);
+        let running = Arc::clone(&self.running);
+
+        *running.lock().unwrap() = true;
+
+        std::thread::spawn(move || {
+            while *running.lock().unwrap() {
+                let mut ps = pollset.lock().unwrap();
+                ps.poll(timeout);
+            }
+        });
+    }
+
+    /// Stop the poll loop
+    pub fn stop(&self) {
+        *self.running.lock().unwrap() = false;
+        // Wake up the poll loop
+        let pollset = self.pollset.lock().unwrap();
+        pollset.notify();
+    }
+
+    /// Notify the pollset to wake up
+    pub fn notify(&self) -> i32 {
+        let pollset = self.pollset.lock().unwrap();
+        pollset.notify()
+    }
+}
+
+/// Handle for an async poll operation
+pub struct AsyncPollHandle {
+    id: usize,
+    fd: OgsSocket,
+    pollset: Arc<Mutex<OgsPollset>>,
+    event: Arc<Mutex<AsyncEvent>>,
+}
+
+impl AsyncPollHandle {
+    /// Get the poll ID
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
+    /// Get the file descriptor
+    pub fn fd(&self) -> OgsSocket {
+        self.fd
+    }
+
+    /// Wait for readable event
+    pub fn readable(&self) -> AsyncPollFuture {
+        AsyncPollFuture {
+            event: Arc::clone(&self.event),
+            mask: OGS_POLLIN,
+        }
+    }
+
+    /// Wait for writable event
+    pub fn writable(&self) -> AsyncPollFuture {
+        AsyncPollFuture {
+            event: Arc::clone(&self.event),
+            mask: OGS_POLLOUT,
+        }
+    }
+
+    /// Mark event as ready (called from poll handler)
+    pub fn mark_ready(&self, event_mask: i16) {
+        let mut event = self.event.lock().unwrap();
+        event.ready = true;
+        event.event_mask = event_mask;
+        if let Some(waker) = event.waker.take() {
+            waker.wake();
+        }
+    }
+}
+
+impl Drop for AsyncPollHandle {
+    fn drop(&mut self) {
+        let mut pollset = self.pollset.lock().unwrap();
+        pollset.remove(self.id);
+    }
+}
+
+/// Future for async poll operations
+pub struct AsyncPollFuture {
+    event: Arc<Mutex<AsyncEvent>>,
+    mask: i16,
+}
+
+impl Future for AsyncPollFuture {
+    type Output = i16;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> TaskPoll<Self::Output> {
+        let mut event = self.event.lock().unwrap();
+
+        if event.ready && (event.event_mask & self.mask) != 0 {
+            let result = event.event_mask;
+            event.ready = false;
+            event.event_mask = 0;
+            TaskPoll::Ready(result)
+        } else {
+            event.waker = Some(cx.waker().clone());
+            TaskPoll::Pending
+        }
+    }
+}
+
+#[cfg(test)]
+mod async_tests {
+    use super::*;
+
+    #[test]
+    fn test_async_poll_manager_create() {
+        let manager = AsyncPollManager::new(10);
+        assert!(manager.is_some());
+    }
+
+    #[test]
+    fn test_async_poll_manager_notify() {
+        let manager = AsyncPollManager::new(10).unwrap();
+        let rv = manager.notify();
+        assert_eq!(rv, OGS_OK);
+    }
+
+    #[tokio::test]
+    async fn test_async_poll_handle() {
+        let manager = AsyncPollManager::new(10).unwrap();
+
+        // Create a pipe for testing
+        let mut pipe_fds: [RawFd; 2] = [-1, -1];
+        unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
+
+        let handle = manager
+            .add_async(
+                OGS_POLLIN,
+                pipe_fds[0],
+                |_when, _fd, _data| {},
+                std::ptr::null_mut(),
+            )
+            .unwrap();
+
+        // Simulate event
+        handle.mark_ready(OGS_POLLIN);
+
+        // Wait for readable
+        let result = handle.readable().await;
+        assert_eq!(result & OGS_POLLIN, OGS_POLLIN);
+
+        unsafe {
+            libc::close(pipe_fds[0]);
+            libc::close(pipe_fds[1]);
+        }
+    }
+}

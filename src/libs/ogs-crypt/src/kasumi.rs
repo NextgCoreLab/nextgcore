@@ -342,9 +342,7 @@ pub fn kasumi_f9(key: &[u8; 16], count: u32, fresh: u32, dir: u32, data: &[u8], 
             val |= final_bit[remaining as usize];
         }
         val
-    } else {
-        if dir != 0 { 0x80 } else { 0 }
-    };
+    } else if dir != 0 { 0x80 } else { 0 };
     a[n] ^= i;
     n += 1;
 

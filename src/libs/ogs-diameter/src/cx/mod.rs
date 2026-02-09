@@ -396,7 +396,7 @@ pub fn create_mar(
     msg.add_avp(Avp::vendor_mandatory(
         avp::SERVER_NAME,
         OGS_3GPP_VENDOR_ID,
-        AvpData::Utf8String(format!("sip:{}", origin_host)),
+        AvpData::Utf8String(format!("sip:{origin_host}")),
     ));
 
     msg

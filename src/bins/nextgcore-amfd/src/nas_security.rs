@@ -467,6 +467,122 @@ pub fn nas_mac_calculate(
 }
 
 // ============================================================================
+// Security Algorithm Selection (B18.13)
+// ============================================================================
+
+/// Security algorithm set
+#[derive(Debug, Clone, Default)]
+pub struct SecurityAlgorithmSet {
+    /// Encryption algorithms (NEA0, NEA1, NEA2, NEA3)
+    pub encryption: u8, // bit mask
+    /// Integrity algorithms (NIA0, NIA1, NIA2, NIA3)
+    pub integrity: u8,  // bit mask
+}
+
+/// Select best encryption algorithm
+///
+/// Returns algorithm ID (0=NEA0, 1=NEA1, 2=NEA2, 3=NEA3)
+/// Selection priority: NEA2 > NEA1 > NEA3 > NEA0
+pub fn select_encryption_algorithm(
+    ue_algos: u8,
+    amf_supported: u8,
+) -> u8 {
+    // Intersect UE and AMF supported algorithms
+    let supported = ue_algos & amf_supported;
+
+    // Priority order: NEA2 (AES) > NEA1 (SNOW 3G) > NEA3 (ZUC) > NEA0 (null)
+    if supported & (1 << 2) != 0 {
+        2 // NEA2 (AES-CTR)
+    } else if supported & (1 << 1) != 0 {
+        1 // NEA1 (SNOW 3G)
+    } else if supported & (1 << 3) != 0 {
+        3 // NEA3 (ZUC)
+    } else {
+        0 // NEA0 (null encryption)
+    }
+}
+
+/// Select best integrity algorithm
+///
+/// Returns algorithm ID (0=NIA0, 1=NIA1, 2=NIA2, 3=NIA3)
+/// Selection priority: NIA2 > NIA1 > NIA3 > NIA0
+pub fn select_integrity_algorithm(
+    ue_algos: u8,
+    amf_supported: u8,
+) -> u8 {
+    // Intersect UE and AMF supported algorithms
+    let supported = ue_algos & amf_supported;
+
+    // Priority order: NIA2 (AES) > NIA1 (SNOW 3G) > NIA3 (ZUC) > NIA0 (null)
+    // Note: NIA0 should not be selected unless it's the only option
+    if supported & (1 << 2) != 0 {
+        2 // NIA2 (AES-CMAC)
+    } else if supported & (1 << 1) != 0 {
+        1 // NIA1 (SNOW 3G)
+    } else if supported & (1 << 3) != 0 {
+        3 // NIA3 (ZUC)
+    } else if supported & (1 << 0) != 0 {
+        0 // NIA0 (null integrity) - only as last resort
+    } else {
+        2 // Default to NIA2 if no match
+    }
+}
+
+/// Select security algorithms for UE
+///
+/// This is called during security mode command to select algorithms
+pub fn select_security_algorithms(
+    amf_ue: &mut AmfUe,
+    ue_security_capability: &SecurityAlgorithmSet,
+    amf_supported: &SecurityAlgorithmSet,
+) {
+    // Select encryption algorithm
+    let selected_enc = select_encryption_algorithm(
+        ue_security_capability.encryption,
+        amf_supported.encryption,
+    );
+    amf_ue.selected_enc_algorithm = selected_enc;
+
+    // Select integrity algorithm
+    let selected_int = select_integrity_algorithm(
+        ue_security_capability.integrity,
+        amf_supported.integrity,
+    );
+    amf_ue.selected_int_algorithm = selected_int;
+
+    log::info!(
+        "[{}] Selected security algorithms: enc={}EA{}, int={}IA{}",
+        amf_ue.supi.as_deref().unwrap_or("unknown"),
+        if selected_enc == 0 { "N" } else { "1" },
+        selected_enc,
+        if selected_int == 0 { "N" } else { "1" },
+        selected_int
+    );
+}
+
+/// Get algorithm name for logging
+pub fn get_encryption_algorithm_name(algo: u8) -> &'static str {
+    match algo {
+        0 => "NEA0",
+        1 => "128-NEA1",
+        2 => "128-NEA2",
+        3 => "128-NEA3",
+        _ => "Unknown",
+    }
+}
+
+/// Get algorithm name for logging
+pub fn get_integrity_algorithm_name(algo: u8) -> &'static str {
+    match algo {
+        0 => "NIA0",
+        1 => "128-NIA1",
+        2 => "128-NIA2",
+        3 => "128-NIA3",
+        _ => "Unknown",
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -715,5 +831,87 @@ mod tests {
 
         // Verify sender's dl_count was incremented
         assert_eq!(sender_ue.dl_count, 1);
+    }
+
+    #[test]
+    fn test_select_encryption_algorithm_nea2() {
+        let ue_algos = 0b1110; // Supports NEA1, NEA2, NEA3
+        let amf_algos = 0b1111; // Supports all
+        let selected = select_encryption_algorithm(ue_algos, amf_algos);
+        assert_eq!(selected, 2); // Should select NEA2 (highest priority)
+    }
+
+    #[test]
+    fn test_select_encryption_algorithm_nea1() {
+        let ue_algos = 0b1010; // Supports NEA1, NEA3
+        let amf_algos = 0b1111;
+        let selected = select_encryption_algorithm(ue_algos, amf_algos);
+        assert_eq!(selected, 1); // Should select NEA1
+    }
+
+    #[test]
+    fn test_select_encryption_algorithm_nea0_fallback() {
+        let ue_algos = 0b0001; // Supports only NEA0
+        let amf_algos = 0b1111;
+        let selected = select_encryption_algorithm(ue_algos, amf_algos);
+        assert_eq!(selected, 0); // Should select NEA0 (null)
+    }
+
+    #[test]
+    fn test_select_integrity_algorithm_nia2() {
+        let ue_algos = 0b1110; // Supports NIA1, NIA2, NIA3
+        let amf_algos = 0b1111;
+        let selected = select_integrity_algorithm(ue_algos, amf_algos);
+        assert_eq!(selected, 2); // Should select NIA2 (highest priority)
+    }
+
+    #[test]
+    fn test_select_integrity_algorithm_nia1() {
+        let ue_algos = 0b1010; // Supports NIA1, NIA3
+        let amf_algos = 0b1111;
+        let selected = select_integrity_algorithm(ue_algos, amf_algos);
+        assert_eq!(selected, 1); // Should select NIA1
+    }
+
+    #[test]
+    fn test_select_integrity_algorithm_no_match() {
+        let ue_algos = 0b0000; // No support
+        let amf_algos = 0b1111;
+        let selected = select_integrity_algorithm(ue_algos, amf_algos);
+        assert_eq!(selected, 2); // Should default to NIA2
+    }
+
+    #[test]
+    fn test_select_security_algorithms() {
+        let mut ue = create_test_ue();
+        let ue_capability = SecurityAlgorithmSet {
+            encryption: 0b1110,  // NEA1, NEA2, NEA3
+            integrity: 0b1110,   // NIA1, NIA2, NIA3
+        };
+        let amf_capability = SecurityAlgorithmSet {
+            encryption: 0b1111,  // All
+            integrity: 0b1111,   // All
+        };
+
+        select_security_algorithms(&mut ue, &ue_capability, &amf_capability);
+
+        assert_eq!(ue.selected_enc_algorithm, 2); // NEA2
+        assert_eq!(ue.selected_int_algorithm, 2); // NIA2
+    }
+
+    #[test]
+    fn test_get_encryption_algorithm_name() {
+        assert_eq!(get_encryption_algorithm_name(0), "NEA0");
+        assert_eq!(get_encryption_algorithm_name(1), "128-NEA1");
+        assert_eq!(get_encryption_algorithm_name(2), "128-NEA2");
+        assert_eq!(get_encryption_algorithm_name(3), "128-NEA3");
+    }
+
+    #[test]
+    fn test_get_integrity_algorithm_name() {
+        assert_eq!(get_integrity_algorithm_name(0), "NIA0");
+        assert_eq!(get_integrity_algorithm_name(1), "128-NIA1");
+        assert_eq!(get_integrity_algorithm_name(2), "128-NIA2");
+        assert_eq!(get_integrity_algorithm_name(3), "128-NIA3");
     }
 }

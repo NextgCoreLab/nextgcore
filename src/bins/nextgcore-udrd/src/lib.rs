@@ -8,12 +8,16 @@ pub mod context;
 pub mod event;
 pub mod nudr_handler;
 pub mod sbi_path;
+pub mod sess_sm;
 pub mod udr_sm;
+pub mod ue_sm;
 
 // Re-export commonly used types
-pub use context::{udr_context_final, udr_context_init, udr_self, UdrContext};
+pub use context::{udr_context_final, udr_context_init, udr_self, UdrContext, UdrUe, UdrSess};
 pub use event::{UdrEvent, UdrEventId, UdrTimerId};
 pub use udr_sm::{UdrSmContext, UdrState};
+pub use ue_sm::{UdrUeSmContext, UdrUeState};
+pub use sess_sm::{UdrSessSmContext, UdrSessState};
 
 // Re-export SBI path functions
 pub use sbi_path::{

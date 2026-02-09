@@ -185,7 +185,7 @@ impl NfInstanceManager {
         if self.remove_instance(id) {
             Ok(())
         } else {
-            Err(format!("NF instance {} not found", id))
+            Err(format!("NF instance {id} not found"))
         }
     }
 
@@ -231,6 +231,28 @@ impl NfInstanceManager {
     pub fn subscription_count(&self) -> usize {
         self.subscriptions.read().map(|s| s.len()).unwrap_or(0)
     }
+
+    /// List all subscriptions
+    pub fn list_subscriptions(&self) -> Vec<SubscriptionData> {
+        self.subscriptions
+            .read()
+            .map(|s| s.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Remove expired subscriptions (returns number removed)
+    pub fn remove_expired_subscriptions(&self, expired_ids: &[String]) -> usize {
+        let mut removed = 0;
+        if let Ok(mut subscriptions) = self.subscriptions.write() {
+            for id in expired_ids {
+                if subscriptions.remove(id).is_some() {
+                    log::info!("Removed expired subscription: {id}");
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
 }
 
 impl Default for NfInstanceManager {
@@ -275,7 +297,7 @@ pub fn nrf_nnrf_handle_nf_register(
 
     // Store the full profile
     if let Err(e) = manager.register(profile.clone()) {
-        log::error!("[{}] Failed to store NF profile: {}", nf_instance_id, e);
+        log::error!("[{nf_instance_id}] Failed to store NF profile: {e}");
         return HandlerResult::Error(500, "Internal server error".to_string());
     }
 
@@ -303,7 +325,7 @@ pub fn nrf_nnrf_handle_nf_update(
     nf_instance_id: &str,
     _patch_items: &[PatchItem],
 ) -> HandlerResult {
-    log::debug!("[{}] NF update request", nf_instance_id);
+    log::debug!("[{nf_instance_id}] NF update request");
 
     let manager = nf_manager();
     if manager.find_instance(nf_instance_id).is_none() {
@@ -350,7 +372,7 @@ pub fn nrf_nnrf_handle_nf_status_update(
     subscription_id: &str,
     _validity_time: Option<&str>,
 ) -> HandlerResult {
-    log::debug!("[{}] NF status update request", subscription_id);
+    log::debug!("[{subscription_id}] NF status update request");
 
     let manager = nf_manager();
     if manager.find_subscription(subscription_id).is_none() {
@@ -365,7 +387,7 @@ pub fn nrf_nnrf_handle_nf_status_update(
 
 /// Handle NF status unsubscribe (DELETE /subscriptions/{subscriptionId})
 pub fn nrf_nnrf_handle_nf_status_unsubscribe(subscription_id: &str) -> HandlerResult {
-    log::info!("[{}] NF status unsubscribe request", subscription_id);
+    log::info!("[{subscription_id}] NF status unsubscribe request");
 
     let manager = nf_manager();
     if manager.remove_subscription(subscription_id) {
@@ -380,7 +402,7 @@ pub fn nrf_nnrf_handle_nf_list_retrieval(
     nf_type: Option<&str>,
     limit: Option<u32>,
 ) -> HandlerResult {
-    log::debug!("NF list retrieval request (type={:?}, limit={:?})", nf_type, limit);
+    log::debug!("NF list retrieval request (type={nf_type:?}, limit={limit:?})");
 
     // Note: Return list of NF instance URIs
     // The response body would contain a Links structure with hrefs to each NF instance
@@ -390,7 +412,7 @@ pub fn nrf_nnrf_handle_nf_list_retrieval(
 
 /// Handle NF profile retrieval (GET /nf-instances/{nfInstanceId})
 pub fn nrf_nnrf_handle_nf_profile_retrieval(nf_instance_id: &str) -> HandlerResult {
-    log::debug!("[{}] NF profile retrieval request", nf_instance_id);
+    log::debug!("[{nf_instance_id}] NF profile retrieval request");
 
     let manager = nf_manager();
     if manager.find_instance(nf_instance_id).is_none() {
@@ -410,9 +432,7 @@ pub fn nrf_nnrf_handle_nf_discover(
     discovery_options: Option<&DiscoveryOptions>,
 ) -> HandlerResult {
     log::debug!(
-        "NF discover request (target={}, requester={})",
-        target_nf_type,
-        requester_nf_type
+        "NF discover request (target={target_nf_type}, requester={requester_nf_type})"
     );
 
     if target_nf_type.is_empty() {

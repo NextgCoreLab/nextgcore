@@ -48,16 +48,12 @@ pub const OGS_KDF_NAS_INT_ALG: u8 = 0x02;
 type HmacSha256 = Hmac<Sha256>;
 
 /// KDF parameter structure
+#[derive(Default)]
 struct KdfParam {
     buf: Option<Vec<u8>>,
     len: u16,
 }
 
-impl Default for KdfParam {
-    fn default() -> Self {
-        KdfParam { buf: None, len: 0 }
-    }
-}
 
 /// Common KDF function as defined in TS 33.220 clause B.2.0
 ///

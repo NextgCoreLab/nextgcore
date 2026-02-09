@@ -24,12 +24,16 @@ pub mod cx;
 pub mod swx;
 pub mod error;
 pub mod config;
+pub mod transport;
+pub mod peer;
 
 pub use common::*;
 pub use avp::*;
 pub use message::*;
 pub use error::*;
 pub use config::*;
+pub use transport::*;
+pub use peer::*;
 
 /// 3GPP Vendor ID
 pub const OGS_3GPP_VENDOR_ID: u32 = 10415;

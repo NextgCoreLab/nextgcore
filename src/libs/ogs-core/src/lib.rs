@@ -8,6 +8,7 @@ pub mod hash;      // Hash table (ogs-hash.h)
 pub mod pool;      // Object pool (ogs-pool.h)
 pub mod pkbuf;     // Packet buffer (ogs-pkbuf.h)
 pub mod timer;     // Timer wheel (ogs-timer.h)
+pub mod async_timer; // Async timer manager for NF event loops
 pub mod fsm;       // Finite state machine (ogs-fsm.h)
 pub mod tlv;       // TLV encoding (ogs-tlv.h)
 pub mod errno;     // Error codes (ogs-errno.h)
@@ -28,6 +29,7 @@ pub mod sockopt;   // Socket options (ogs-sockopt.h)
 pub mod poll;      // Event polling (ogs-poll.h)
 pub mod tcp;       // TCP server/client (ogs-tcp.h)
 pub mod udp;       // UDP server/client (ogs-udp.h)
+pub mod lockfree;  // Lock-free data structures (B2.4 - 6G advanced research)
 
 // Re-export commonly used types
 pub use list::{OgsList, OgsLnode};
@@ -45,3 +47,5 @@ pub use sockaddr::OgsSockaddr;
 pub use socket::{OgsSock, OgsSocket, INVALID_SOCKET};
 pub use sockopt::OgsSockopt;
 pub use poll::{OgsPollset, OGS_POLLIN, OGS_POLLOUT};
+pub use async_timer::{AsyncTimerMgr, AsyncTimerEntry, TimerMode, compute_poll_interval};
+pub use lockfree::{LockFreeQueue, LockFreeStack, LockFreeHashMap};

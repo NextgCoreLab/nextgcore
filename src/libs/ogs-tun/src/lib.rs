@@ -52,9 +52,9 @@ mod tests {
     #[test]
     fn test_tun_error_display() {
         let err = TunError::DeviceNotFound;
-        assert!(!format!("{}", err).is_empty());
+        assert!(!format!("{err}").is_empty());
         
         let err = TunError::IoError("test".to_string());
-        assert!(format!("{}", err).contains("test"));
+        assert!(format!("{err}").contains("test"));
     }
 }

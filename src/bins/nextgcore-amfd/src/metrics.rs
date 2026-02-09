@@ -318,6 +318,126 @@ impl AmfMetrics {
             metrics.clear();
         }
     }
+
+    /// Export metrics in Prometheus format
+    pub fn export_prometheus(&self) -> String {
+        let mut output = String::new();
+
+        // Export global counters
+        for (metric, counter) in &self.global_counters {
+            let value = counter.load(Ordering::Relaxed);
+            let metric_type = if metric.is_gauge() { "gauge" } else { "counter" };
+
+            output.push_str(&format!(
+                "# HELP {} {}\n",
+                metric.name(),
+                metric.description()
+            ));
+            output.push_str(&format!(
+                "# TYPE {} {}\n",
+                metric.name(),
+                metric_type
+            ));
+            output.push_str(&format!("{} {}\n", metric.name(), value));
+        }
+
+        // Export slice metrics
+        if let Ok(slice_metrics) = self.slice_metrics.read() {
+            for ((key, metric), value) in slice_metrics.iter() {
+                output.push_str(&format!(
+                    "# HELP {} {}\n",
+                    metric.name(),
+                    metric.description()
+                ));
+                output.push_str(&format!("# TYPE {} gauge\n", metric.name()));
+                output.push_str(&format!(
+                    "{}{{plmn_id=\"{}\",snssai=\"{}\"}} {}\n",
+                    metric.name(),
+                    key.plmn_id,
+                    key.snssai,
+                    value
+                ));
+            }
+        }
+
+        // Export cause metrics
+        if let Ok(cause_metrics) = self.cause_metrics.read() {
+            for ((cause, metric), value) in cause_metrics.iter() {
+                output.push_str(&format!(
+                    "# HELP {} {}\n",
+                    metric.name(),
+                    metric.description()
+                ));
+                output.push_str(&format!("# TYPE {} counter\n", metric.name()));
+                output.push_str(&format!(
+                    "{}{{cause=\"{}\"}} {}\n",
+                    metric.name(),
+                    cause,
+                    value
+                ));
+            }
+        }
+
+        output
+    }
+
+    /// Get summary statistics
+    pub fn get_summary(&self) -> MetricsSummary {
+        MetricsSummary {
+            total_ran_ues: self.get(GlobalMetric::RanUe),
+            total_sessions: self.get(GlobalMetric::AmfSession),
+            total_gnbs: self.get(GlobalMetric::Gnb),
+            reg_init_success_rate: self.calculate_success_rate(
+                GlobalMetric::RmRegInitReq,
+                GlobalMetric::RmRegInitSucc,
+            ),
+            reg_mob_success_rate: self.calculate_success_rate(
+                GlobalMetric::RmRegMobReq,
+                GlobalMetric::RmRegMobSucc,
+            ),
+            auth_success_rate: self.calculate_auth_success_rate(),
+        }
+    }
+
+    /// Calculate success rate as percentage
+    fn calculate_success_rate(&self, req_metric: GlobalMetric, succ_metric: GlobalMetric) -> f64 {
+        let req = self.get(req_metric);
+        let succ = self.get(succ_metric);
+        if req == 0 {
+            0.0
+        } else {
+            (succ as f64 / req as f64) * 100.0
+        }
+    }
+
+    /// Calculate authentication success rate
+    fn calculate_auth_success_rate(&self) -> f64 {
+        let req = self.get(GlobalMetric::AmfAuthReq);
+        let reject = self.get(GlobalMetric::AmfAuthReject);
+        if req == 0 {
+            0.0
+        } else {
+            let succ = req.saturating_sub(reject);
+            (succ as f64 / req as f64) * 100.0
+        }
+    }
+}
+
+/// Metrics summary statistics
+#[derive(Debug, Clone)]
+pub struct MetricsSummary {
+    /// Total RAN UEs
+    pub total_ran_ues: u64,
+    /// Total AMF sessions
+    pub total_sessions: u64,
+    /// Total gNodeBs
+    pub total_gnbs: u64,
+    /// Initial registration success rate (%)
+    pub reg_init_success_rate: f64,
+    /// Mobility registration success rate (%)
+    pub reg_mob_success_rate: f64,
+    /// Authentication success rate (%)
+    pub auth_success_rate: f64,
 }
 
 // ============================================================================
@@ -423,5 +543,65 @@ mod tests {
         assert_eq!(metrics.get(GlobalMetric::RmRegInitReq), 0);
         assert_eq!(metrics.get(GlobalMetric::RanUe), 0);
         assert_eq!(metrics.get_slice_metric(&key, SliceMetric::RegisteredSubNbr), 0);
+    }
+
+    #[test]
+    fn test_export_prometheus() {
+        let metrics = AmfMetrics::new();
+        metrics.inc(GlobalMetric::RmRegInitReq);
+        metrics.inc(GlobalMetric::RmRegInitSucc);
+        metrics.set(GlobalMetric::RanUe, 5);
+
+        let output = metrics.export_prometheus();
+        assert!(output.contains("fivegs_amffunction_rm_reginitreq"));
+        assert!(output.contains("ran_ue"));
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn test_get_summary() {
+        let metrics = AmfMetrics::new();
+        metrics.add(GlobalMetric::RmRegInitReq, 100);
+        metrics.add(GlobalMetric::RmRegInitSucc, 95);
+        metrics.set(GlobalMetric::RanUe, 50);
+        metrics.set(GlobalMetric::Gnb, 3);
+
+        let summary = metrics.get_summary();
+        assert_eq!(summary.total_ran_ues, 50);
+        assert_eq!(summary.total_gnbs, 3);
+        assert_eq!(summary.reg_init_success_rate, 95.0);
+    }
+
+    #[test]
+    fn test_calculate_success_rate() {
+        let metrics = AmfMetrics::new();
+        metrics.add(GlobalMetric::RmRegMobReq, 200);
+        metrics.add(GlobalMetric::RmRegMobSucc, 180);
+
+        let rate = metrics.calculate_success_rate(
+            GlobalMetric::RmRegMobReq,
+            GlobalMetric::RmRegMobSucc
+        );
+        assert_eq!(rate, 90.0);
+    }
+
+    #[test]
+    fn test_calculate_success_rate_zero_requests() {
+        let metrics = AmfMetrics::new();
+        let rate = metrics.calculate_success_rate(
+            GlobalMetric::RmRegMobReq,
+            GlobalMetric::RmRegMobSucc
+        );
+        assert_eq!(rate, 0.0);
+    }
+
+    #[test]
+    fn test_auth_success_rate() {
+        let metrics = AmfMetrics::new();
+        metrics.add(GlobalMetric::AmfAuthReq, 100);
+        metrics.add(GlobalMetric::AmfAuthReject, 10);
+
+        let summary = metrics.get_summary();
+        assert_eq!(summary.auth_success_rate, 90.0);
     }
 }

@@ -87,7 +87,7 @@ impl AusfTimerManager {
             timers.insert(id, entry);
         }
 
-        log::debug!("Timer started: {} ({:?})", id, timer_type);
+        log::debug!("Timer started: {id} ({timer_type:?})");
         id
     }
 
@@ -96,7 +96,7 @@ impl AusfTimerManager {
         if let Ok(mut timers) = self.timers.write() {
             if let Some(entry) = timers.get_mut(&id) {
                 entry.cancel();
-                log::debug!("Timer stopped: {}", id);
+                log::debug!("Timer stopped: {id}");
                 return true;
             }
         }

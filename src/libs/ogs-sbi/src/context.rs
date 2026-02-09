@@ -221,7 +221,7 @@ impl SbiContext {
 
     /// Get or create a client for the given endpoint
     pub async fn get_client(&self, host: &str, port: u16) -> Arc<SbiClient> {
-        let key = format!("{}:{}", host, port);
+        let key = format!("{host}:{port}");
         
         // Check if client exists
         {
