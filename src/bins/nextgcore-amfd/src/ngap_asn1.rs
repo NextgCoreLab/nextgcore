@@ -692,6 +692,83 @@ pub fn build_pdu_session_resource_setup_request_asn1(
     }
 }
 
+/// Build a PDU Session Resource Release Command with proper ASN.1 APER encoding
+///
+/// Sent by AMF to gNB to release PDU session resources.
+pub fn build_pdu_session_resource_release_command_asn1(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    pdu_session_ids: &[u8],
+) -> Option<Vec<u8>> {
+    let mut protocol_ies = Vec::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory)
+    protocol_ies.push(PDUSessionResourceReleaseCommandProtocolIEs_Entry {
+        id: ProtocolIE_ID(ID_AMF_UE_NGAP_ID),
+        criticality: Criticality(Criticality::REJECT),
+        value: PDUSessionResourceReleaseCommandProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(
+            AMF_UE_NGAP_ID(amf_ue_ngap_id),
+        ),
+    });
+
+    // IE: RAN-UE-NGAP-ID (mandatory)
+    protocol_ies.push(PDUSessionResourceReleaseCommandProtocolIEs_Entry {
+        id: ProtocolIE_ID(ID_RAN_UE_NGAP_ID),
+        criticality: Criticality(Criticality::REJECT),
+        value: PDUSessionResourceReleaseCommandProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(
+            RAN_UE_NGAP_ID(ran_ue_ngap_id),
+        ),
+    });
+
+    // IE: PDUSessionResourceToReleaseListRelCmd (mandatory)
+    let release_items: Vec<PDUSessionResourceToReleaseItemRelCmd> = pdu_session_ids
+        .iter()
+        .map(|&psi| PDUSessionResourceToReleaseItemRelCmd {
+            pdu_session_id: PDUSessionID(psi),
+            pdu_session_resource_release_command_transfer:
+                PDUSessionResourceToReleaseItemRelCmdPDUSessionResourceReleaseCommandTransfer(
+                    vec![], // empty transfer for simple release
+                ),
+            ie_extensions: None,
+        })
+        .collect();
+
+    let release_list = PDUSessionResourceToReleaseListRelCmd(release_items);
+    protocol_ies.push(PDUSessionResourceReleaseCommandProtocolIEs_Entry {
+        id: ProtocolIE_ID(ID_PDU_SESSION_RESOURCE_TO_RELEASE_LIST_REL_CMD),
+        criticality: Criticality(Criticality::REJECT),
+        value: PDUSessionResourceReleaseCommandProtocolIEs_EntryValue::Id_PDUSessionResourceToReleaseListRelCmd(
+            release_list,
+        ),
+    });
+
+    let command = PDUSessionResourceReleaseCommand {
+        protocol_i_es: PDUSessionResourceReleaseCommandProtocolIEs(protocol_ies),
+    };
+
+    let initiating_message = InitiatingMessage {
+        procedure_code: ProcedureCode(ID_PDU_SESSION_RESOURCE_RELEASE),
+        criticality: Criticality(Criticality::REJECT),
+        value: InitiatingMessageValue::Id_PDUSessionResourceRelease(command),
+    };
+
+    let pdu = NGAP_PDU::InitiatingMessage(initiating_message);
+
+    match encode_ngap_pdu(&pdu) {
+        Ok(bytes) => {
+            log::debug!(
+                "Built PDU Session Resource Release Command: {} bytes, amf_ue_ngap_id={}, psi_count={}",
+                bytes.len(), amf_ue_ngap_id, pdu_session_ids.len()
+            );
+            Some(bytes)
+        }
+        Err(e) => {
+            log::error!("Failed to encode PDU Session Resource Release Command: {:?}", e);
+            None
+        }
+    }
+}
+
 /// Parsed Uplink NAS Transport data
 #[derive(Debug, Clone)]
 pub struct UplinkNasTransportData {

@@ -527,6 +527,41 @@ pub async fn call_smf_update_sm_context(
     Ok(())
 }
 
+/// Release an SM context via SMF SBI
+///
+/// Sends POST /nsmf-pdusession/v1/sm-contexts/{ref}/release to SMF,
+/// which triggers PFCP Session Deletion to UPF.
+pub async fn call_smf_release_sm_context(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+) -> SbiResult<()> {
+    log::info!(
+        "Calling SMF SM Context Release: ref={}",
+        sm_context_ref
+    );
+
+    let client = SbiClient::with_host_port(smf_host, smf_port);
+
+    let body = serde_json::json!({
+        "cause": "REL_DUE_TO_UE_REQUEST"
+    });
+
+    let path = format!("/nsmf-pdusession/v1/sm-contexts/{}/release", sm_context_ref);
+    let response = client.post_json(&path, &body)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("SMF release failed: {}", e)))?;
+
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "SMF release returned status {}", response.status
+        )));
+    }
+
+    log::info!("SMF SM Context Released: ref={}", sm_context_ref);
+    Ok(())
+}
+
 // ============================================================================
 // AUSF SBI Client Functions
 // ============================================================================

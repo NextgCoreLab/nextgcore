@@ -675,6 +675,120 @@ impl NgapServer {
                     log::info!("PDU Session Resource Setup Request sent to gNB: PSI={}", psi);
                 }
 
+                // PDU Session Modification Request (0xC9)
+                if sm_msg_type == 0xC9 {
+                    log::info!("PDU Session Modification Request from UE: PSI={}, PTI={}", psi, pti);
+
+                    // Forward to SMF via SM Context Update
+                    let smf_host = std::env::var("SMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+                    let smf_port: u16 = std::env::var("SMF_SBI_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
+                    let sm_context_ref = format!("{}", psi);
+
+                    // Build modification command NAS and forward N1 to UE
+                    match crate::sbi_path::call_smf_update_sm_context(
+                        &smf_host, smf_port, &sm_context_ref, &ul_nas.nas_pdu,
+                    ).await {
+                        Ok(()) => {
+                            log::info!("SMF SM Context Updated for modification: PSI={}", psi);
+
+                            // Send PDU Session Modification Command to UE
+                            // Format: EPD(0x2E) + PSI + PTI + MsgType(0xCB) + 5QI(1)
+                            let mut mod_cmd = Vec::new();
+                            mod_cmd.push(0x2E); mod_cmd.push(psi); mod_cmd.push(pti);
+                            mod_cmd.push(0xCB); // PDU Session Modification Command
+                            // No mandatory IEs beyond header for basic modification acknowledgement
+
+                            let dl_nas = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
+                                ul_nas.amf_ue_ngap_id, ul_nas.ran_ue_ngap_id, &mod_cmd,
+                            ) {
+                                Some(bytes) => bytes,
+                                None => return Ok(()),
+                            };
+                            self.send_to_association(association_id, &dl_nas).await?;
+                            log::info!("PDU Session Modification Command sent to UE: PSI={}", psi);
+                        }
+                        Err(e) => {
+                            log::warn!("SMF modification failed ({}), sending reject", e);
+                            // Send Modification Reject
+                            let mut reject = Vec::new();
+                            reject.push(0x2E); reject.push(psi); reject.push(pti);
+                            reject.push(0xCC); // PDU Session Modification Reject
+                            reject.push(0x1A); // 5GSM cause: Insufficient resources
+
+                            let dl_nas = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
+                                ul_nas.amf_ue_ngap_id, ul_nas.ran_ue_ngap_id, &reject,
+                            ) {
+                                Some(bytes) => bytes,
+                                None => return Ok(()),
+                            };
+                            self.send_to_association(association_id, &dl_nas).await?;
+                        }
+                    }
+                }
+
+                // PDU Session Modification Complete (0xCD)
+                if sm_msg_type == 0xCD {
+                    log::info!("PDU Session Modification Complete from UE: PSI={}", psi);
+                    // Modification procedure complete - no further action needed
+                }
+
+                // PDU Session Release Request (0xD1)
+                if sm_msg_type == 0xD1 {
+                    log::info!("PDU Session Release Request from UE: PSI={}, PTI={}", psi, pti);
+
+                    // Call SMF to release SM context
+                    let smf_host = std::env::var("SMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+                    let smf_port: u16 = std::env::var("SMF_SBI_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
+                    let sm_context_ref = format!("{}", psi);
+
+                    match crate::sbi_path::call_smf_release_sm_context(
+                        &smf_host, smf_port, &sm_context_ref,
+                    ).await {
+                        Ok(()) => {
+                            log::info!("SMF SM Context Released: PSI={}", psi);
+                        }
+                        Err(e) => {
+                            log::warn!("SMF release failed: {}", e);
+                        }
+                    }
+
+                    // Send PDU Session Release Command to UE
+                    let mut release_cmd = Vec::new();
+                    release_cmd.push(0x2E); release_cmd.push(psi); release_cmd.push(pti);
+                    release_cmd.push(0xD4); // PDU Session Release Command
+                    release_cmd.push(0x24); // 5GSM cause: Regular deactivation
+
+                    let dl_nas = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
+                        ul_nas.amf_ue_ngap_id, ul_nas.ran_ue_ngap_id, &release_cmd,
+                    ) {
+                        Some(bytes) => bytes,
+                        None => return Ok(()),
+                    };
+                    self.send_to_association(association_id, &dl_nas).await?;
+                    log::info!("PDU Session Release Command sent to UE: PSI={}", psi);
+
+                    // Send PDU Session Resource Release Command to gNB
+                    let release_ngap = match crate::ngap_asn1::build_pdu_session_resource_release_command_asn1(
+                        ul_nas.amf_ue_ngap_id,
+                        ul_nas.ran_ue_ngap_id,
+                        &[psi],
+                    ) {
+                        Some(bytes) => bytes,
+                        None => {
+                            log::error!("Failed to build PDU Session Resource Release Command");
+                            return Ok(());
+                        }
+                    };
+                    self.send_to_association(association_id, &release_ngap).await?;
+                    log::info!("PDU Session Resource Release Command sent to gNB: PSI={}", psi);
+                }
+
+                // PDU Session Release Complete (0xD6)
+                if sm_msg_type == 0xD6 {
+                    log::info!("PDU Session Release Complete from UE: PSI={}", psi);
+                    // Release procedure complete - session fully released
+                }
+
                 return Ok(());
             }
 
