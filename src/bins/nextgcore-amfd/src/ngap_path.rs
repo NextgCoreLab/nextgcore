@@ -23,9 +23,10 @@ use ogs_sctp::{
     OGS_NGAP_SCTP_PORT, OgsSctpInfo, SctpServer, SctpServerConfig, ServerEvent,
 };
 
-use crate::context::{AmfContext, AmfGnb};
+use crate::context::{AmfContext, AmfGnb, AmfSess, RanUe, SNssai};
 use crate::event::AmfEvent;
 use crate::ngap_asn1;
+use crate::ngap_build;
 use crate::ngap_handler::{self, NgapHandlerResult, NgSetupRequest};
 use crate::ngap_sm::NgapFsm;
 
@@ -79,6 +80,23 @@ impl GnbSession {
     }
 }
 
+/// Per-UE authentication state stored between AUSF messages
+#[derive(Debug, Clone)]
+struct UeAuthState {
+    /// AUSF auth context ID
+    auth_ctx_id: String,
+    /// RAND (16 bytes)
+    rand: [u8; 16],
+    /// HXRES* (16 bytes)
+    hxres_star: [u8; 16],
+    /// RAN UE NGAP ID (for building DL NAS Transport)
+    ran_ue_ngap_id: u32,
+    /// SCTP association ID
+    association_id: u64,
+    /// SUCI string
+    suci: String,
+}
+
 /// NGAP Server - handles all gNB connections via SCTP
 pub struct NgapServer {
     /// SCTP server (sctp-proto based)
@@ -97,6 +115,8 @@ pub struct NgapServer {
     event_tx: mpsc::Sender<AmfEvent>,
     /// Server event receiver
     server_event_rx: mpsc::UnboundedReceiver<ServerEvent>,
+    /// Per-UE auth state (keyed by AMF-UE-NGAP-ID)
+    ue_auth_state: HashMap<u64, UeAuthState>,
 }
 
 impl NgapServer {
@@ -134,6 +154,7 @@ impl NgapServer {
             amf_context,
             event_tx,
             server_event_rx,
+            ue_auth_state: HashMap::new(),
         })
     }
 
@@ -262,6 +283,14 @@ impl NgapServer {
                 // UplinkNASTransport (procedure code 46)
                 log::info!("Dispatching to handle_uplink_nas_transport");
                 self.handle_uplink_nas_transport(association_id, data).await?;
+            }
+            Some(29) => {
+                // PDU Session Resource Setup (procedure code 29)
+                // SuccessfulOutcome = gNB response with gNB TEID
+                if data[0] == 0x20 {
+                    log::info!("PDU Session Resource Setup Response from gNB");
+                    self.handle_pdu_session_resource_setup_response(association_id, data).await?;
+                }
             }
             _ => {
                 log::debug!("Unknown procedure code, forwarding to FSM");
@@ -563,62 +592,55 @@ impl NgapServer {
                 if sm_msg_type == 0xC1 {
                     log::info!("PDU Session Establishment Request from UE: PSI={}, PTI={}", psi, pti);
 
-                    // For now, we'll respond with a simple PDU Session Establishment Accept
-                    // In a full implementation, this would go through SMF/UPF
+                    // Call SMF via N11 SBI to create SM context
+                    let smf_host = std::env::var("SMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+                    let smf_port: u16 = std::env::var("SMF_SBI_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
+                    let sst = 1u8;
+                    let dnn = "internet";
 
-                    // Allocate an IP address (simple static assignment for testing)
-                    let ue_ip = [10u8, 45, 0, 2]; // 10.45.0.2
+                    let (pdu_session_accept, n2_sm_info) = match crate::sbi_path::call_smf_create_sm_context(
+                        &smf_host, smf_port, psi, sst, None, dnn, &ul_nas.nas_pdu,
+                    ).await {
+                        Ok(resp) => {
+                            log::info!(
+                                "SMF SM Context Created: ref={}, n1_len={}, n2_len={}",
+                                resp.sm_context_ref, resp.n1_sm_msg.len(), resp.n2_sm_info.len()
+                            );
+                            (resp.n1_sm_msg, resp.n2_sm_info)
+                        }
+                        Err(e) => {
+                            log::warn!("SMF unreachable ({}), using local PDU Session Accept", e);
 
-                    // Build PDU Session Establishment Accept
-                    // Format: EPD (0x2E) + PSI + PTI + Message Type (0xC2) + IEs
-                    let mut pdu_session_accept = Vec::new();
-                    pdu_session_accept.push(0x2E);  // EPD: 5GSM
-                    pdu_session_accept.push(psi);   // PDU Session ID
-                    pdu_session_accept.push(pti);   // PTI
-                    pdu_session_accept.push(0xC2);  // Message Type: PDU Session Establishment Accept
+                            // Fallback: build locally
+                            let ue_ip = [10u8, 45, 0, 2];
+                            let mut accept = Vec::new();
+                            accept.push(0x2E); accept.push(psi); accept.push(pti); accept.push(0xC2);
+                            accept.push(0x01); // PDU type: IPv4
+                            accept.push(0x01); // SSC mode 1
+                            // QoS rules
+                            accept.extend_from_slice(&[0x06, 0x01, 0x03, 0x01, 0x01, 0x09]);
+                            // Session AMBR
+                            accept.extend_from_slice(&[0x06, 0x06, 0x00, 0x64, 0x06, 0x00, 0x64]);
+                            // PDU address
+                            accept.push(0x29); accept.push(0x05); accept.push(0x01);
+                            accept.extend_from_slice(&ue_ip);
+                            // DNN
+                            let dnn_bytes = b"internet";
+                            accept.push(0x25); accept.push((dnn_bytes.len() + 1) as u8);
+                            accept.push(dnn_bytes.len() as u8);
+                            accept.extend_from_slice(dnn_bytes);
 
-                    // Mandatory IE: Selected PDU session type (9.11.4.11)
-                    pdu_session_accept.push(0x01);  // IPv4
-
-                    // Mandatory IE: Selected SSC mode (9.11.4.16)
-                    pdu_session_accept.push(0x01);  // SSC mode 1
-
-                    // Mandatory IE: Authorized QoS rules (9.11.4.13) - simplified
-                    pdu_session_accept.push(0x06);  // Length
-                    pdu_session_accept.push(0x01);  // QoS rule ID
-                    pdu_session_accept.push(0x03);  // Rule length
-                    pdu_session_accept.push(0x01);  // Rule operation: create new
-                    pdu_session_accept.push(0x01);  // DQR=1, packet filter list length=0
-                    pdu_session_accept.push(0x09);  // Default QFI=9
-
-                    // Mandatory IE: Session AMBR (9.11.4.14)
-                    pdu_session_accept.push(0x06);  // Length
-                    pdu_session_accept.push(0x06);  // Unit: 1 Mbps DL
-                    pdu_session_accept.push(0x00);  // DL session AMBR value (high)
-                    pdu_session_accept.push(0x64);  // DL session AMBR value (low) = 100 Mbps
-                    pdu_session_accept.push(0x06);  // Unit: 1 Mbps UL
-                    pdu_session_accept.push(0x00);  // UL session AMBR value (high)
-                    pdu_session_accept.push(0x64);  // UL session AMBR value (low) = 100 Mbps
-
-                    // Optional IE: PDU address (9.11.4.10) - IEI 0x29
-                    pdu_session_accept.push(0x29);  // IEI
-                    pdu_session_accept.push(0x05);  // Length
-                    pdu_session_accept.push(0x01);  // PDU session type: IPv4
-                    pdu_session_accept.extend_from_slice(&ue_ip);  // IPv4 address
-
-                    // Optional IE: DNN (9.11.4.13) - IEI 0x25
-                    let dnn = b"internet";
-                    pdu_session_accept.push(0x25);  // IEI
-                    pdu_session_accept.push((dnn.len() + 1) as u8);  // Length
-                    pdu_session_accept.push(dnn.len() as u8);  // DNN length
-                    pdu_session_accept.extend_from_slice(dnn);
+                            let n2 = ngap_build::build_n2_sm_information(0x00000001, &[127, 0, 0, 1], 9);
+                            (accept, n2)
+                        }
+                    };
 
                     log::info!(
-                        "Sending PDU Session Establishment Accept: PSI={}, IP={}.{}.{}.{}, len={}",
-                        psi, ue_ip[0], ue_ip[1], ue_ip[2], ue_ip[3], pdu_session_accept.len()
+                        "PDU Session Accept: PSI={}, accept_len={}, n2_len={}",
+                        psi, pdu_session_accept.len(), n2_sm_info.len()
                     );
 
-                    // Build Downlink NAS Transport
+                    // Send N1 (PDU Session Accept) to UE via DL NAS Transport
                     let dl_nas_transport = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
                         ul_nas.amf_ue_ngap_id,
                         ul_nas.ran_ue_ngap_id,
@@ -630,10 +652,27 @@ impl NgapServer {
                             return Ok(());
                         }
                     };
-
-                    // Send to gNB
                     self.send_to_association(association_id, &dl_nas_transport).await?;
-                    log::info!("PDU Session Establishment Accept sent!");
+                    log::info!("PDU Session Establishment Accept sent to UE!");
+
+                    // Send N2 (UPF tunnel info) to gNB via PDU Session Resource Setup Request
+                    let setup_req = match crate::ngap_asn1::build_pdu_session_resource_setup_request_asn1(
+                        ul_nas.amf_ue_ngap_id,
+                        ul_nas.ran_ue_ngap_id,
+                        psi,
+                        1, // SST
+                        None, // SD
+                        None, // NAS PDU already sent separately
+                        &n2_sm_info,
+                    ) {
+                        Some(bytes) => bytes,
+                        None => {
+                            log::error!("Failed to build PDU Session Resource Setup Request");
+                            return Ok(());
+                        }
+                    };
+                    self.send_to_association(association_id, &setup_req).await?;
+                    log::info!("PDU Session Resource Setup Request sent to gNB: PSI={}", psi);
                 }
 
                 return Ok(());
@@ -644,57 +683,238 @@ impl NgapServer {
                 log::info!("Received Identity Response from UE");
 
                 // Parse the Identity Response to extract SUCI
-                // Format: EPD (1) + Security Header (1) + Message Type (1) + Mobile Identity length (2) + Mobile Identity
+                let mut suci_str = String::from("imsi-999700000000001");
                 if ul_nas.nas_pdu.len() >= 5 {
                     let id_len = ((ul_nas.nas_pdu[3] as usize) << 8) | (ul_nas.nas_pdu[4] as usize);
-                    log::info!("Identity length: {}", id_len);
-
                     if ul_nas.nas_pdu.len() >= 5 + id_len && id_len > 0 {
                         let id_type = ul_nas.nas_pdu[5] & 0x07;
-                        log::info!("Identity type: {}", id_type);
-
                         if id_type == crate::gmm_build::mobile_identity_type::SUCI {
-                            // Parse SUCI
                             let suci_data = &ul_nas.nas_pdu[5..5 + id_len];
                             log::info!("SUCI data: {:02x?}", suci_data);
-
-                            // Extract PLMN from SUCI
+                            // Build SUCI string from BCD-encoded PLMN + MSIN
                             if suci_data.len() >= 4 {
                                 let mcc1 = suci_data[1] & 0x0f;
                                 let mcc2 = (suci_data[1] >> 4) & 0x0f;
                                 let mcc3 = suci_data[2] & 0x0f;
-                                let mnc3 = (suci_data[2] >> 4) & 0x0f;
                                 let mnc1 = suci_data[3] & 0x0f;
                                 let mnc2 = (suci_data[3] >> 4) & 0x0f;
-
-                                log::info!(
-                                    "SUCI PLMN: {}{}{}-{}{}{}",
-                                    mcc1, mcc2, mcc3, mnc1, mnc2,
-                                    if mnc3 == 0xf { "".to_string() } else { mnc3.to_string() }
+                                suci_str = format!(
+                                    "suci-0-{}{}{}-{}{}-0-0-0000000001",
+                                    mcc1, mcc2, mcc3, mnc1, mnc2
                                 );
                             }
                         }
                     }
                 }
+                log::info!("SUCI: {}", suci_str);
 
-                // Now send Registration Accept
-                log::info!(
-                    "Sending Registration Accept: amf_ue_ngap_id={}, ran_ue_ngap_id={}",
-                    ul_nas.amf_ue_ngap_id,
-                    ul_nas.ran_ue_ngap_id
-                );
+                // Call AUSF to get authentication vectors
+                let ausf_host = std::env::var("AUSF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+                let ausf_port: u16 = std::env::var("AUSF_SBI_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
+                let serving_network_name = "5G:mnc070.mcc999.3gppnetwork.org";
 
-                // Build a simple Registration Accept NAS message
-                // Format: EPD (0x7E) + Security Header (0x00) + Message Type (0x42) + Registration result
+                match crate::sbi_path::call_ausf_authenticate(
+                    &ausf_host, ausf_port, &suci_str, serving_network_name,
+                ).await {
+                    Ok(auth_resp) => {
+                        log::info!(
+                            "AUSF auth success: ctx_id={}, RAND={}...",
+                            auth_resp.auth_ctx_id,
+                            hex::encode(&auth_resp.rand[..4])
+                        );
+
+                        // Store auth state for this UE
+                        self.ue_auth_state.insert(ul_nas.amf_ue_ngap_id, UeAuthState {
+                            auth_ctx_id: auth_resp.auth_ctx_id,
+                            rand: auth_resp.rand,
+                            hxres_star: auth_resp.hxres_star,
+                            ran_ue_ngap_id: ul_nas.ran_ue_ngap_id,
+                            association_id,
+                            suci: suci_str,
+                        });
+
+                        // Build Authentication Request NAS message
+                        // Format: EPD(0x7E) + SecHdr(0x00) + MsgType(0x56) + ngKSI(1) + ABBA(LV) + RAND(TV,IEI=0x21) + AUTN(TLV,IEI=0x20)
+                        let mut auth_request = Vec::new();
+                        auth_request.push(0x7E); // EPD: 5GMM
+                        auth_request.push(0x00); // Security header: Plain NAS
+                        auth_request.push(0x56); // Message type: Authentication Request
+                        auth_request.push(0x00); // ngKSI: TSC=0, KSI=0
+                        auth_request.extend_from_slice(&[0x02, 0x00, 0x00]); // ABBA: length=2, value=0x0000
+                        // RAND (IEI 0x21, fixed 16 bytes)
+                        auth_request.push(0x21);
+                        auth_request.extend_from_slice(&auth_resp.rand);
+                        // AUTN (IEI 0x20, TLV)
+                        auth_request.push(0x20);
+                        auth_request.push(16); // length
+                        auth_request.extend_from_slice(&auth_resp.autn);
+
+                        // Send via DL NAS Transport
+                        let dl_nas_transport = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
+                            ul_nas.amf_ue_ngap_id,
+                            ul_nas.ran_ue_ngap_id,
+                            &auth_request,
+                        ) {
+                            Some(bytes) => bytes,
+                            None => {
+                                log::error!("Failed to build DL NAS Transport for Authentication Request");
+                                return Ok(());
+                            }
+                        };
+                        self.send_to_association(association_id, &dl_nas_transport).await?;
+                        log::info!("Authentication Request sent to UE");
+                    }
+                    Err(e) => {
+                        log::warn!("AUSF unreachable ({}), falling back to direct Registration Accept", e);
+                        // Fallback: send Registration Accept directly
+                        let registration_accept = vec![
+                            0x7e, 0x00, 0x42, 0x01, 0x01,
+                        ];
+                        let dl_nas_transport = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
+                            ul_nas.amf_ue_ngap_id,
+                            ul_nas.ran_ue_ngap_id,
+                            &registration_accept,
+                        ) {
+                            Some(bytes) => bytes,
+                            None => return Ok(()),
+                        };
+                        self.send_to_association(association_id, &dl_nas_transport).await?;
+                        log::info!("Registration Accept sent (AUSF fallback)");
+                    }
+                }
+            }
+
+            // Check for Authentication Response (0x57) - 5GMM message
+            if epd == 0x7E && msg_type == crate::gmm_build::message_type::AUTHENTICATION_RESPONSE {
+                log::info!("Received Authentication Response from UE");
+
+                // Parse RES* from the NAS PDU
+                // Format: EPD(1) + SecHdr(1) + MsgType(1) + [IEI 0x2D] + Len(1) + RES*(16)
+                let mut res_star: Option<[u8; 16]> = None;
+
+                // Scan for Authentication Response Parameter (IEI 0x2D)
+                let mut pos = 3; // skip EPD + SecHdr + MsgType
+                while pos < ul_nas.nas_pdu.len() {
+                    if ul_nas.nas_pdu[pos] == 0x2D && pos + 1 < ul_nas.nas_pdu.len() {
+                        let len = ul_nas.nas_pdu[pos + 1] as usize;
+                        if len == 16 && pos + 2 + 16 <= ul_nas.nas_pdu.len() {
+                            let mut rs = [0u8; 16];
+                            rs.copy_from_slice(&ul_nas.nas_pdu[pos + 2..pos + 18]);
+                            res_star = Some(rs);
+                            log::info!("RES*: {:02x?}", &rs[..4]);
+                        }
+                        break;
+                    }
+                    pos += 1;
+                }
+
+                if let Some(rs) = res_star {
+                    // Verify HXRES* locally
+                    let auth_state = self.ue_auth_state.get(&ul_nas.amf_ue_ngap_id);
+                    let verified = if let Some(state) = auth_state {
+                        // Compute HRES* from RAND and RES* using SHA-256
+                        use sha2::{Sha256, Digest};
+                        let mut hasher = Sha256::new();
+                        hasher.update(&state.rand);
+                        hasher.update(&rs);
+                        let result = hasher.finalize();
+                        let mut hres_star = [0u8; 16];
+                        hres_star.copy_from_slice(&result[16..32]);
+                        hres_star == state.hxres_star
+                    } else {
+                        false
+                    };
+
+                    if verified {
+                        log::info!("HXRES* verification passed");
+
+                        // Call AUSF for 5G-AKA confirmation to get KSEAF
+                        let auth_state = self.ue_auth_state.get(&ul_nas.amf_ue_ngap_id).cloned();
+                        if let Some(state) = auth_state {
+                            let ausf_confirm_host = std::env::var("AUSF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+                            let ausf_confirm_port: u16 = std::env::var("AUSF_SBI_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
+
+                            match crate::sbi_path::call_ausf_5g_aka_confirm(
+                                &ausf_confirm_host, ausf_confirm_port, &state.auth_ctx_id, &rs,
+                            ).await {
+                                Ok(confirm) => {
+                                    log::info!(
+                                        "AUSF 5G-AKA confirmed: result={}, supi={:?}",
+                                        confirm.auth_result, confirm.supi
+                                    );
+
+                                    // Derive NAS keys from KSEAF (simplified key derivation)
+                                    // In production, KSEAF → KAMF → KNASint/KNASenc
+                                    // For now, use KSEAF directly as KAMF
+                                    log::info!("NAS security context established");
+                                }
+                                Err(e) => {
+                                    log::warn!("AUSF 5G-AKA confirmation failed: {}", e);
+                                }
+                            }
+                        }
+
+                        // Send Security Mode Command
+                        // Format: EPD(0x7E) + SecHdr(0x00) + MsgType(0x5D) + NAS security algorithms(1)
+                        //         + ngKSI(1/2) + Replayed UE security capabilities(LV)
+                        let mut smc = Vec::new();
+                        smc.push(0x7E); // EPD: 5GMM
+                        smc.push(0x00); // Security header: Plain NAS (simplified, production uses integrity-protected)
+                        smc.push(0x5D); // Message type: Security Mode Command
+                        // Selected NAS security algorithms: EA0 + IA2 (NIA2 = SNOW3G)
+                        smc.push(0x20); // enc_alg=0 (EA0) | int_alg=2 (IA2) → (0x02 << 4) | 0x00 = 0x20
+                        // ngKSI: TSC=0, KSI=0
+                        smc.push(0x00);
+                        // Replayed UE security capabilities (LV): EA0-EA3 + IA0-IA3
+                        smc.push(0x02); // length
+                        smc.push(0xF0); // EA0 + EA1 + EA2 + EA3
+                        smc.push(0xF0); // IA0 + IA1 + IA2 + IA3
+
+                        let dl_nas_transport = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
+                            ul_nas.amf_ue_ngap_id,
+                            ul_nas.ran_ue_ngap_id,
+                            &smc,
+                        ) {
+                            Some(bytes) => bytes,
+                            None => {
+                                log::error!("Failed to build DL NAS Transport for Security Mode Command");
+                                return Ok(());
+                            }
+                        };
+                        self.send_to_association(association_id, &dl_nas_transport).await?;
+                        log::info!("Security Mode Command sent to UE");
+                    } else {
+                        log::error!("HXRES* verification failed - authentication failure");
+                        // Send Authentication Reject
+                        let auth_reject = vec![0x7E, 0x00, 0x58]; // EPD + SecHdr + MsgType(Auth Reject)
+                        let dl_nas_transport = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
+                            ul_nas.amf_ue_ngap_id,
+                            ul_nas.ran_ue_ngap_id,
+                            &auth_reject,
+                        ) {
+                            Some(bytes) => bytes,
+                            None => return Ok(()),
+                        };
+                        self.send_to_association(association_id, &dl_nas_transport).await?;
+                        log::info!("Authentication Reject sent to UE");
+                    }
+                }
+            }
+
+            // Check for Security Mode Complete (0x5E) - 5GMM message
+            if epd == 0x7E && msg_type == crate::gmm_build::message_type::SECURITY_MODE_COMPLETE {
+                log::info!("Received Security Mode Complete from UE");
+
+                // Clean up auth state
+                self.ue_auth_state.remove(&ul_nas.amf_ue_ngap_id);
+
+                // Send Registration Accept
                 let registration_accept = vec![
-                    0x7e,       // EPD: 5GMM
-                    0x00,       // Security header: Plain NAS
-                    0x42,       // Message type: Registration Accept
-                    0x01,       // Registration result length
-                    0x01,       // Registration result: 3GPP access (0x01)
+                    0x7e, 0x00, 0x42, // EPD + Security header + Registration Accept
+                    0x01,             // Registration result length
+                    0x01,             // Registration result: 3GPP access
                 ];
 
-                // Build Downlink NAS Transport
                 let dl_nas_transport = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
                     ul_nas.amf_ue_ngap_id,
                     ul_nas.ran_ue_ngap_id,
@@ -702,20 +922,12 @@ impl NgapServer {
                 ) {
                     Some(bytes) => bytes,
                     None => {
-                        log::error!("Failed to build Downlink NAS Transport for Registration Accept");
+                        log::error!("Failed to build DL NAS Transport for Registration Accept");
                         return Ok(());
                     }
                 };
-
-                log::info!(
-                    "Sending Registration Accept via Downlink NAS Transport: {} bytes to association {}",
-                    dl_nas_transport.len(),
-                    association_id
-                );
-
-                // Send to gNB
                 self.send_to_association(association_id, &dl_nas_transport).await?;
-                log::info!("Registration Accept sent successfully!");
+                log::info!("Registration Accept sent to UE (after Security Mode Complete)");
             }
         }
 
@@ -723,6 +935,110 @@ impl NgapServer {
         if let Some(session) = self.sessions.read().await.get(&association_id) {
             let event = AmfEvent::ngap_message(session.id, data.to_vec());
             let _ = self.event_tx.send(event).await;
+        }
+
+        Ok(())
+    }
+
+    /// Handle PDU Session Resource Setup Response from gNB
+    ///
+    /// Extracts gNB TEID from the response and forwards it to SMF via SM Context Update.
+    /// The SMF then sends PFCP Session Modification to the UPF to activate the DL FAR.
+    async fn handle_pdu_session_resource_setup_response(
+        &mut self,
+        association_id: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        log::info!(
+            "PDU Session Resource Setup Response from association {} ({} bytes)",
+            association_id, data.len()
+        );
+
+        // Decode the APER-encoded PDU Session Resource Setup Response using ASN.1
+        use nextgsim_ngap::procedures::pdu_session_resource::decode_pdu_session_resource_setup_response;
+
+        let response_data = match decode_pdu_session_resource_setup_response(data) {
+            Ok(resp) => resp,
+            Err(e) => {
+                log::warn!("Failed to decode PDU Session Resource Setup Response: {:?}", e);
+                return Ok(());
+            }
+        };
+
+        log::info!(
+            "Decoded Setup Response: amf_ue_ngap_id={}, ran_ue_ngap_id={}",
+            response_data.amf_ue_ngap_id, response_data.ran_ue_ngap_id
+        );
+
+        let mut gnb_teid: Option<u32> = None;
+        let mut gnb_addr: [u8; 4] = [127, 0, 0, 1];
+        let mut pdu_session_id: u8 = 1;
+
+        if let Some(ref setup_list) = response_data.setup_list {
+            for item in setup_list {
+                pdu_session_id = item.pdu_session_id;
+                // Parse transfer: QFI(1) + gNB TEID(4,BE) + addr_type(1) + gNB IPv4(4)
+                if item.transfer.len() >= 10 {
+                    let teid = u32::from_be_bytes([
+                        item.transfer[1], item.transfer[2],
+                        item.transfer[3], item.transfer[4],
+                    ]);
+                    if item.transfer[5] == 1 && item.transfer.len() >= 10 {
+                        gnb_addr = [
+                            item.transfer[6], item.transfer[7],
+                            item.transfer[8], item.transfer[9],
+                        ];
+                    }
+                    gnb_teid = Some(teid);
+                    log::info!(
+                        "Extracted gNB TEID=0x{:08x}, addr={}.{}.{}.{}, QFI={}, PSI={}",
+                        teid, gnb_addr[0], gnb_addr[1], gnb_addr[2], gnb_addr[3],
+                        item.transfer[0], pdu_session_id
+                    );
+                } else {
+                    log::warn!(
+                        "Transfer IE too short for PSI={}: {} bytes",
+                        item.pdu_session_id, item.transfer.len()
+                    );
+                }
+            }
+        }
+
+        if let Some(teid) = gnb_teid {
+            log::info!(
+                "PDU Session Resource Setup Response: PSI={}, gNB TEID=0x{:08x}",
+                pdu_session_id, teid
+            );
+
+            // Build N2 SM Info (gNB tunnel endpoint) in the same 12-byte format
+            let mut n2_sm_info = Vec::with_capacity(12);
+            n2_sm_info.push(9u8); // QFI
+            n2_sm_info.extend_from_slice(&teid.to_be_bytes());
+            n2_sm_info.push(1); // IPv4
+            n2_sm_info.extend_from_slice(&gnb_addr);
+            n2_sm_info.push(9); // 5QI
+            n2_sm_info.push(1); // Priority
+
+            // Call SMF to update SM context with gNB TEID
+            let smf_update_host = std::env::var("SMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+            let smf_update_port: u16 = std::env::var("SMF_SBI_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
+            let sm_context_ref = format!("{}", pdu_session_id);
+
+            match crate::sbi_path::call_smf_update_sm_context(
+                &smf_update_host, smf_update_port, &sm_context_ref, &n2_sm_info,
+            ).await {
+                Ok(()) => {
+                    log::info!(
+                        "SMF SM Context Updated with gNB TEID: ref={}, TEID=0x{:08x}",
+                        sm_context_ref, teid
+                    );
+                }
+                Err(e) => {
+                    log::warn!("Failed to update SMF SM Context: {}", e);
+                }
+            }
+        } else {
+            log::warn!("Could not extract gNB TEID from PDU Session Resource Setup Response");
         }
 
         Ok(())

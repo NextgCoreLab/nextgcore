@@ -68,15 +68,11 @@ pub fn udm_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
     nf_instance.add_service(sdm_service);
 
     // Store self NF instance in global SBI context
+    // Use spawn to avoid blocking the runtime (block_on panics inside async)
     let sbi_ctx = global_context();
-    let rt = tokio::runtime::Handle::try_current();
-    if let Ok(handle) = rt {
-        handle.block_on(async {
-            sbi_ctx.set_self_instance(nf_instance.clone()).await;
-        });
-    } else {
-        log::warn!("No tokio runtime; deferring NRF registration");
-    }
+    tokio::spawn(async move {
+        sbi_ctx.set_self_instance(nf_instance.clone()).await;
+    });
 
     SBI_RUNNING.store(true, Ordering::SeqCst);
 
@@ -325,31 +321,33 @@ pub async fn udm_sbi_discover_and_send_nudr_dr(
 ) -> Result<SbiResponse, String> {
     let sbi_ctx = global_context();
 
-    // Find UDR instances (from discovery cache)
+    // Find UDR instances (from discovery cache or env var fallback)
     let udr_instances = sbi_ctx.find_nf_instances_by_type(NfType::Udr).await;
 
-    if udr_instances.is_empty() {
-        return Err("No UDR instance discovered; NRF discovery needed".to_string());
+    let (host_str, port);
+    if let Some(udr) = udr_instances.first() {
+        host_str = udr.ipv4_addresses.first()
+            .ok_or("UDR has no IPv4 address")?.clone();
+        port = udr.find_service(SbiServiceType::NudrDr)
+            .map(|s| s.port)
+            .unwrap_or(80);
+    } else {
+        // Fallback: use UDR_SBI_ADDR/UDR_SBI_PORT env vars
+        host_str = std::env::var("UDR_SBI_ADDR").map_err(|_| {
+            "No UDR instance discovered and UDR_SBI_ADDR not set".to_string()
+        })?;
+        port = std::env::var("UDR_SBI_PORT")
+            .ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
+        log::info!("Using UDR env var fallback: {}:{}", host_str, port);
     }
 
-    // Use first available UDR
-    let udr = &udr_instances[0];
-    let host = udr.ipv4_addresses.first()
-        .ok_or("UDR has no IPv4 address")?;
-
-    // Find the nudr-dr service port
-    let port = udr.find_service(SbiServiceType::NudrDr)
-        .map(|s| s.port)
-        .unwrap_or(80);
-
-    let client = sbi_ctx.get_client(host, port).await;
+    let client = sbi_ctx.get_client(&host_str, port).await;
 
     log::debug!(
-        "Sending NUDR-DR request for UE [{}] stream [{}] to UDR [{}] at {}:{}",
+        "Sending NUDR-DR request for UE [{}] stream [{}] to UDR at {}:{}",
         udm_ue_id,
         stream_id,
-        udr.id,
-        host,
+        host_str,
         port
     );
 

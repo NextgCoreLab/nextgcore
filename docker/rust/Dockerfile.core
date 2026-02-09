@@ -1,0 +1,38 @@
+# NextGCore Core Runtime Image
+# Shared base image with all runtime dependencies
+# All NF images extend this - only need to COPY their binary
+#
+# Build: docker buildx build --platform linux/amd64,linux/arm64 \
+#          -f Dockerfile.core -t nextgcore-core:latest .
+
+FROM debian:bookworm-slim
+
+LABEL org.opencontainers.image.title="NextGCore Core Runtime"
+LABEL org.opencontainers.image.description="Shared base image for all NextGCore network functions"
+
+# Install all runtime dependencies (shared across all NFs)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    iproute2 \
+    iptables \
+    iputils-ping \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user
+RUN groupadd -r nextgcore && useradd -r -g nextgcore -s /bin/false nextgcore
+
+# Create standard directories
+RUN mkdir -p /etc/nextgcore /var/log/nextgcore /var/run/nextgcore && \
+    chown -R nextgcore:nextgcore /etc/nextgcore /var/log/nextgcore /var/run/nextgcore
+
+ENV RUST_LOG=info
+
+# Default to non-root (UPF overrides with --user root)
+USER nextgcore
+
+EXPOSE 7777 38412 9090 8805/udp 2152/udp
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD pgrep -f nf-binary || exit 1

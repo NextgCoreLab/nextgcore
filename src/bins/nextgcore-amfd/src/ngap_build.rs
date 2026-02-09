@@ -386,6 +386,21 @@ pub fn build_pdu_session_resource_setup_request(
     Some(builder.build())
 }
 
+/// Build N2 SM Information (transfer IE) for PDU Session Resource Setup
+///
+/// Encodes UPF tunnel endpoint information that gNB needs to set up GTP-U tunnel.
+/// Format: QFI(1) + UPF TEID(4, big-endian) + addr_type(1) + IPv4(4) + 5QI(1) + priority(1)
+pub fn build_n2_sm_information(upf_teid: u32, upf_addr: &[u8; 4], qfi: u8) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(12);
+    buf.push(qfi);
+    buf.extend_from_slice(&upf_teid.to_be_bytes());
+    buf.push(1); // IPv4
+    buf.extend_from_slice(upf_addr);
+    buf.push(9); // 5QI = 9 (default non-GBR)
+    buf.push(1); // Priority level 1
+    buf
+}
+
 /// Build PDU Session Resource Release Command message
 pub fn build_pdu_session_resource_release_command(
     ran_ue: &RanUe,

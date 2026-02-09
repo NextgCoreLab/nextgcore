@@ -100,6 +100,7 @@ pub mod pfcp_ie {
     pub const CREATED_PDR: u16 = 8;
     pub const UPDATE_PDR: u16 = 9;
     pub const UPDATE_FAR: u16 = 10;
+    pub const UPDATE_FORWARDING_PARAMETERS: u16 = 11;
     pub const UPDATE_URR: u16 = 13;
     pub const UPDATE_QER: u16 = 14;
     pub const REMOVE_PDR: u16 = 15;
@@ -1164,8 +1165,10 @@ pub fn parse_create_far(data: &[u8]) -> Result<ParsedCreateFar, &'static str> {
         }
     }
 
-    // Forwarding Parameters
+    // Forwarding Parameters (IE type 4 for Create FAR, IE type 11 for Update FAR)
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::FORWARDING_PARAMETERS) {
+        far.forwarding_parameters = Some(parse_forwarding_parameters(&ie.value)?);
+    } else if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::UPDATE_FORWARDING_PARAMETERS) {
         far.forwarding_parameters = Some(parse_forwarding_parameters(&ie.value)?);
     }
 

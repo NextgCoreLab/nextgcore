@@ -626,28 +626,33 @@ async fn send_udm_generate_auth_data(
 ) -> Result<UdmAuthVector, String> {
     let sbi_ctx = ogs_sbi::context::global_context();
 
-    // Find UDM instance via cached discovery results
+    // Find UDM instance via cached discovery results or env var fallback
+    let (host_owned, port);
     let udm_instances = sbi_ctx
         .find_nf_instances_by_service(ogs_sbi::types::SbiServiceType::NudmUeau)
         .await;
 
-    let udm_instance = udm_instances.first().ok_or_else(|| {
-        "No UDM instance available for nudm-ueau service".to_string()
-    })?;
+    if let Some(udm_instance) = udm_instances.first() {
+        let udm_service = udm_instance
+            .find_service(ogs_sbi::types::SbiServiceType::NudmUeau)
+            .ok_or("UDM instance has no nudm-ueau service")?;
+        host_owned = udm_service.fqdn.clone()
+            .or(udm_instance.fqdn.clone())
+            .or(udm_service.ip_addresses.first().cloned())
+            .or(udm_instance.ipv4_addresses.first().cloned())
+            .ok_or("No UDM endpoint address available")?;
+        port = udm_service.port;
+    } else {
+        // Fallback: use UDM_SBI_ADDR/UDM_SBI_PORT env vars
+        host_owned = std::env::var("UDM_SBI_ADDR").map_err(|_| {
+            "No UDM instance available and UDM_SBI_ADDR not set".to_string()
+        })?;
+        port = std::env::var("UDM_SBI_PORT")
+            .ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
+        log::info!("Using UDM env var fallback: {}:{}", host_owned, port);
+    }
 
-    // Get UDM endpoint
-    let udm_service = udm_instance
-        .find_service(ogs_sbi::types::SbiServiceType::NudmUeau)
-        .ok_or("UDM instance has no nudm-ueau service")?;
-
-    let host = udm_service.fqdn.as_deref()
-        .or(udm_instance.fqdn.as_deref())
-        .or(udm_service.ip_addresses.first().map(|s| s.as_str()))
-        .or(udm_instance.ipv4_addresses.first().map(|s| s.as_str()))
-        .ok_or("No UDM endpoint address available")?;
-    let port = udm_service.port;
-
-    let client = sbi_ctx.get_client(host, port).await;
+    let client = sbi_ctx.get_client(&host_owned, port).await;
 
     // Build request body
     let mut body = serde_json::json!({

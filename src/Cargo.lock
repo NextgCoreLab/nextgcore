@@ -2119,11 +2119,13 @@ name = "nextgcore-amfd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bitvec",
  "bytes",
  "clap",
  "ctrlc",
  "env_logger 0.11.8",
+ "hex",
  "log",
  "nextgsim-ngap",
  "ogs-app",
@@ -2137,6 +2139,7 @@ dependencies = [
  "once_cell",
  "proptest",
  "serde",
+ "serde_json",
  "serde_yaml",
  "sha2",
  "tokio",
@@ -2398,6 +2401,7 @@ name = "nextgcore-smfd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytes",
  "ctrlc",
  "env_logger 0.11.8",
@@ -2452,6 +2456,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tokio",
  "uuid",
 ]
 

@@ -13,6 +13,12 @@ use nextgcore_udrd::{
     udr_context_final, udr_context_init, udr_sbi_close, udr_sbi_open, UdrSmContext,
     SbiServerConfig,
 };
+use ogs_sbi::message::{SbiRequest, SbiResponse};
+use ogs_sbi::server::{
+    send_bad_request, send_method_not_allowed, send_not_found,
+    SbiServer, SbiServerConfig as OgsSbiServerConfig,
+};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -67,7 +73,8 @@ struct Args {
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Args::parse();
 
     // Initialize logging
@@ -94,26 +101,18 @@ fn main() -> Result<()> {
     udr_sm.init();
     log::info!("UDR state machine initialized");
 
-    // Parse configuration (if file exists)
-    if std::path::Path::new(&args.config).exists() {
-        log::info!("Loading configuration from {}", args.config);
-        // Parse YAML configuration file
-        // In C: udr_context_parse_config()
-        match std::fs::read_to_string(&args.config) {
-            Ok(content) => {
-                log::debug!("Configuration file loaded ({} bytes)", content.len());
-                // Configuration values would override CLI defaults
-                // For now, we use CLI args as the primary configuration
-            }
-            Err(e) => {
-                log::warn!("Failed to read configuration file: {}", e);
-            }
+    // Parse configuration to get db_uri
+    let db_uri = parse_db_uri(&args.config);
+    if !db_uri.is_empty() {
+        match ogs_dbi::ogs_dbi_init(&db_uri) {
+            Ok(()) => log::info!("MongoDB connected: {}", mask_uri(&db_uri)),
+            Err(e) => log::warn!("MongoDB init failed (will use defaults): {:?}", e),
         }
     } else {
-        log::debug!("Configuration file not found: {}", args.config);
+        log::warn!("No db_uri configured, UDR will return hardcoded test data");
     }
 
-    // Build SBI server configuration
+    // Build SBI server configuration (legacy, for context)
     let sbi_config = SbiServerConfig {
         addr: args.sbi_addr.clone(),
         port: args.sbi_port,
@@ -122,23 +121,33 @@ fn main() -> Result<()> {
         tls_key: args.tls_key.clone(),
     };
 
-    // Open SBI server
+    // Open legacy SBI context (for context initialization)
     udr_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
-    log::info!(
-        "SBI server listening on {}:{}",
-        args.sbi_addr,
-        args.sbi_port
-    );
 
+    // Start actual HTTP/2 SBI server using ogs-sbi
+    let sbi_addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
+        .parse()
+        .context("Invalid SBI address")?;
+    let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
+
+    sbi_server.start(udr_sbi_request_handler).await
+        .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {}", e))?;
+
+    log::info!("SBI HTTP/2 server listening on {}", sbi_addr);
     log::info!("NextGCore UDR ready");
 
-    // Main event loop
-    run_event_loop(&mut udr_sm, shutdown)?;
+    // Main event loop (async)
+    run_event_loop_async(shutdown).await?;
 
     // Graceful shutdown
     log::info!("Shutting down...");
 
-    // Close SBI server
+    // Stop SBI server
+    sbi_server.stop().await
+        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {}", e))?;
+    log::info!("SBI HTTP/2 server stopped");
+
+    // Close legacy SBI server
     udr_sbi_close();
     log::info!("SBI server closed");
 
@@ -150,15 +159,449 @@ fn main() -> Result<()> {
     udr_context_final();
     log::info!("UDR context finalized");
 
+    // Cleanup database
+    ogs_dbi::ogs_dbi_final();
+
     log::info!("NextGCore UDR stopped");
     Ok(())
 }
+
+/// SBI request handler for UDR
+async fn udr_sbi_request_handler(request: SbiRequest) -> SbiResponse {
+    let method = request.header.method.as_str();
+    let uri = &request.header.uri;
+
+    log::debug!("UDR SBI request: {} {}", method, uri);
+
+    // Parse the URI path
+    let path = uri.split('?').next().unwrap_or(uri);
+    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+
+    // Expected paths:
+    // /nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-subscription
+    // /nudr-dr/v1/subscription-data/{supi}/provisioned-data/{dataset}
+    // /nudr-dr/v1/subscription-data/{supi}/{plmn}/provisioned-data/{dataset}
+    // /nudr-dr/v1/policy-data/ues/{supi}/{resource}
+
+    if parts.len() < 3 {
+        return send_not_found("Invalid path", None);
+    }
+
+    let service = parts[0];
+    let _version = parts[1];
+
+    if service != "nudr-dr" {
+        log::warn!("Unknown service: {}", service);
+        return send_not_found(&format!("Unknown service: {}", service), None);
+    }
+
+    // Route based on resource type
+    let resource_type = parts.get(2).copied().unwrap_or("");
+
+    match resource_type {
+        "subscription-data" => handle_subscription_data(&parts, method, &request).await,
+        "policy-data" => handle_policy_data(&parts, method).await,
+        _ => {
+            log::warn!("Unknown UDR resource: {} {}", method, uri);
+            send_not_found(&format!("Unknown resource: {}", resource_type), None)
+        }
+    }
+}
+
+/// Handle subscription-data requests
+/// Path: /nudr-dr/v1/subscription-data/{supi}/...
+async fn handle_subscription_data(parts: &[&str], method: &str, request: &SbiRequest) -> SbiResponse {
+    // parts[3] = {supi} or {suci}
+    let supi_or_suci = match parts.get(3) {
+        Some(s) => *s,
+        None => return send_bad_request("Missing SUPI", Some("MISSING_SUPI")),
+    };
+
+    // Convert SUCI to IMSI if needed
+    // SUCI format: suci-{type}-{mcc}-{mnc}-{routing}-{scheme}-{msin}
+    // For null scheme (0), IMSI = MCC + MNC + MSIN
+    let supi = if supi_or_suci.starts_with("suci-") {
+        let suci_parts: Vec<&str> = supi_or_suci.split('-').collect();
+        if suci_parts.len() >= 7 && suci_parts[1] == "0" {
+            let mcc = suci_parts[2];
+            let mnc = suci_parts[3];
+            let msin = suci_parts[6..].join("");
+            let imsi = format!("imsi-{}{}{}", mcc, mnc, msin);
+            log::info!("Converted SUCI {} -> SUPI {}", supi_or_suci, imsi);
+            imsi
+        } else {
+            log::warn!("Unsupported SUCI format: {}", supi_or_suci);
+            return send_bad_request(&format!("Unsupported SUCI: {}", supi_or_suci), Some("INVALID_SUCI"));
+        }
+    } else if supi_or_suci.starts_with("imsi-") {
+        supi_or_suci.to_string()
+    } else {
+        log::warn!("Invalid SUPI type: {}", supi_or_suci);
+        return send_bad_request(&format!("Invalid SUPI type: {}", supi_or_suci), Some("INVALID_SUPI"));
+    };
+    let supi = supi.as_str();
+
+    // Determine sub-resource: parts[4] could be "authentication-data" or "provisioned-data"
+    // or a PLMN ID (then parts[5] = "provisioned-data")
+    let sub_resource = parts.get(4).copied().unwrap_or("");
+
+    match sub_resource {
+        "authentication-data" => handle_auth_data(supi, parts, method, request).await,
+        "provisioned-data" => handle_provisioned_data(supi, parts, 5, method).await,
+        _ => {
+            // Check if parts[4] is a PLMN ID and parts[5] = "provisioned-data"
+            if parts.get(5).copied() == Some("provisioned-data") {
+                handle_provisioned_data(supi, parts, 6, method).await
+            } else {
+                log::warn!("Unknown subscription-data sub-resource: {}", sub_resource);
+                send_not_found("Unknown sub-resource", None)
+            }
+        }
+    }
+}
+
+/// Handle authentication-data requests
+/// Path: /nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-subscription
+async fn handle_auth_data(supi: &str, parts: &[&str], method: &str, request: &SbiRequest) -> SbiResponse {
+    let resource = parts.get(5).copied().unwrap_or("");
+
+    match (resource, method) {
+        ("authentication-subscription", "GET") => {
+            log::info!("[{}] GET authentication-subscription", supi);
+
+            match ogs_dbi::subscription::ogs_dbi_auth_info(supi) {
+                Ok(auth_info) => {
+                    let response_json = serde_json::json!({
+                        "authenticationMethod": "5G_AKA",
+                        "encPermanentKey": bytes_to_hex(&auth_info.k),
+                        "encOpcKey": bytes_to_hex(if auth_info.use_opc { &auth_info.opc } else { &auth_info.op }),
+                        "authenticationManagementField": bytes_to_hex(&auth_info.amf),
+                        "sequenceNumber": {
+                            "sqn": format!("{:012x}", auth_info.sqn & 0xFFFFFFFFFFFF)
+                        }
+                    });
+
+                    log::info!("[{}] Returning auth subscription data", supi);
+                    SbiResponse::with_status(200)
+                        .with_body(response_json.to_string(), "application/json")
+                }
+                Err(e) => {
+                    log::error!("[{}] DB auth_info query failed: {:?}", supi, e);
+                    send_not_found("Subscriber not found", Some("NOT_FOUND"))
+                }
+            }
+        }
+        ("authentication-subscription", "PATCH") => {
+            log::info!("[{}] PATCH authentication-subscription", supi);
+
+            // Parse PatchItemList from request body to extract new SQN
+            if let Some(content) = &request.http.content {
+                if let Ok(patches) = serde_json::from_str::<serde_json::Value>(content) {
+                    if let Some(arr) = patches.as_array() {
+                        for patch in arr {
+                            let path = patch.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                            if path == "/sequenceNumber/sqn" {
+                                if let Some(sqn_hex) = patch.get("value").and_then(|v| v.as_str()) {
+                                    let sqn = u64::from_str_radix(sqn_hex, 16).unwrap_or(0);
+                                    if let Err(e) = ogs_dbi::subscription::ogs_dbi_update_sqn(supi, sqn) {
+                                        log::error!("[{}] DB update_sqn failed: {:?}", supi, e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Increment SQN for next use
+            if let Err(e) = ogs_dbi::subscription::ogs_dbi_increment_sqn(supi) {
+                log::error!("[{}] DB increment_sqn failed: {:?}", supi, e);
+            }
+
+            SbiResponse::with_status(204)
+        }
+        ("authentication-status", "PUT") | ("authentication-status", "DELETE") => {
+            log::info!("[{}] {} authentication-status", supi, method);
+
+            if let Err(e) = ogs_dbi::subscription::ogs_dbi_increment_sqn(supi) {
+                log::error!("[{}] DB increment_sqn failed: {:?}", supi, e);
+            }
+
+            SbiResponse::with_status(204)
+        }
+        _ => {
+            log::warn!("[{}] Unknown auth resource: {} {}", supi, method, resource);
+            send_method_not_allowed(method, &format!("/nudr-dr/v1/subscription-data/{}/authentication-data/{}", supi, resource))
+        }
+    }
+}
+
+/// Handle provisioned-data requests
+/// Path: /nudr-dr/v1/subscription-data/{supi}/provisioned-data/{dataset}
+async fn handle_provisioned_data(supi: &str, parts: &[&str], dataset_idx: usize, method: &str) -> SbiResponse {
+    if method != "GET" {
+        return send_method_not_allowed(method, "provisioned-data");
+    }
+
+    let dataset = parts.get(dataset_idx).copied().unwrap_or("");
+
+    log::info!("[{}] GET provisioned-data/{}", supi, dataset);
+
+    let subscription_data = match ogs_dbi::subscription::ogs_dbi_subscription_data(supi) {
+        Ok(data) => data,
+        Err(e) => {
+            log::error!("[{}] DB subscription_data query failed: {:?}", supi, e);
+            return send_not_found("Subscriber not found", Some("NOT_FOUND"));
+        }
+    };
+
+    let response = match dataset {
+        "am-data" => {
+            build_am_data(&subscription_data)
+        }
+        "smf-selection-subscription-data" => {
+            build_smf_selection_data(&subscription_data)
+        }
+        "sm-data" => {
+            build_sm_data(&subscription_data)
+        }
+        "" => {
+            // Combined provisioned data
+            let mut combined = serde_json::Map::new();
+            combined.insert("amData".to_string(), build_am_data(&subscription_data));
+            combined.insert("smfSelData".to_string(), build_smf_selection_data(&subscription_data));
+            combined.insert("smData".to_string(), build_sm_data(&subscription_data));
+            serde_json::Value::Object(combined)
+        }
+        _ => {
+            log::warn!("[{}] Unknown dataset: {}", supi, dataset);
+            return send_not_found(&format!("Unknown dataset: {}", dataset), None);
+        }
+    };
+
+    SbiResponse::with_status(200)
+        .with_body(response.to_string(), "application/json")
+}
+
+/// Handle policy-data requests
+async fn handle_policy_data(parts: &[&str], method: &str) -> SbiResponse {
+    // /nudr-dr/v1/policy-data/ues/{supi}/{resource}
+    if method != "GET" {
+        return send_method_not_allowed(method, "policy-data");
+    }
+
+    let supi = match parts.get(4) {
+        Some(s) => *s,
+        None => return send_bad_request("Missing SUPI", Some("MISSING_SUPI")),
+    };
+
+    let resource = parts.get(5).copied().unwrap_or("");
+
+    match resource {
+        "am-data" => {
+            log::debug!("[{}] GET policy am-data", supi);
+            SbiResponse::with_status(200)
+                .with_body("{}".to_string(), "application/json")
+        }
+        "sm-data" => {
+            log::debug!("[{}] GET policy sm-data", supi);
+            match ogs_dbi::subscription::ogs_dbi_subscription_data(supi) {
+                Ok(data) => {
+                    let mut sm_policy_snssai_data = serde_json::Map::new();
+                    for slice in &data.slice {
+                        let snssai_key = if slice.s_nssai.has_sd() {
+                            format!("{:02x}-{:06x}", slice.s_nssai.sst, slice.s_nssai.sd.v)
+                        } else {
+                            format!("{:02x}", slice.s_nssai.sst)
+                        };
+                        let mut snssai_json = serde_json::Map::new();
+                        snssai_json.insert("sst".to_string(), serde_json::Value::Number(slice.s_nssai.sst.into()));
+                        if slice.s_nssai.has_sd() {
+                            snssai_json.insert("sd".to_string(), serde_json::Value::String(format!("{:06x}", slice.s_nssai.sd.v)));
+                        }
+                        let mut sm_policy_dnn_data = serde_json::Map::new();
+                        for sess in &slice.session {
+                            if let Some(dnn) = &sess.name {
+                                sm_policy_dnn_data.insert(dnn.clone(), serde_json::json!({"dnn": dnn}));
+                            }
+                        }
+                        let mut snssai_data = serde_json::Map::new();
+                        snssai_data.insert("snssai".to_string(), serde_json::Value::Object(snssai_json));
+                        if !sm_policy_dnn_data.is_empty() {
+                            snssai_data.insert("smPolicyDnnData".to_string(), serde_json::Value::Object(sm_policy_dnn_data));
+                        }
+                        sm_policy_snssai_data.insert(snssai_key, serde_json::Value::Object(snssai_data));
+                    }
+                    let response = serde_json::json!({"smPolicySnssaiData": sm_policy_snssai_data});
+                    SbiResponse::with_status(200)
+                        .with_body(response.to_string(), "application/json")
+                }
+                Err(_) => send_not_found("Subscriber not found", None),
+            }
+        }
+        _ => send_not_found(&format!("Unknown policy resource: {}", resource), None),
+    }
+}
+
+// ============================================================================
+// Data builders (from nudr_handler.rs, adapted for direct SBI response)
+// ============================================================================
+
+fn build_am_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Value {
+    let mut am = serde_json::Map::new();
+    if data.num_of_msisdn > 0 {
+        let gpsis: Vec<serde_json::Value> = data.msisdn.iter()
+            .map(|m| serde_json::Value::String(format!("msisdn-{}", m.bcd)))
+            .collect();
+        am.insert("gpsis".to_string(), serde_json::Value::Array(gpsis));
+    }
+    if data.ambr.uplink > 0 || data.ambr.downlink > 0 {
+        am.insert("subscribedUeAmbr".to_string(), serde_json::json!({
+            "uplink": format_ambr(data.ambr.uplink),
+            "downlink": format_ambr(data.ambr.downlink)
+        }));
+    }
+    if data.num_of_slice > 0 {
+        let mut default_nssais = Vec::new();
+        let mut single_nssais = Vec::new();
+        for slice in &data.slice {
+            let mut nssai_json = serde_json::Map::new();
+            nssai_json.insert("sst".to_string(), serde_json::Value::Number(slice.s_nssai.sst.into()));
+            if slice.s_nssai.has_sd() {
+                nssai_json.insert("sd".to_string(), serde_json::Value::String(format!("{:06x}", slice.s_nssai.sd.v)));
+            }
+            let val = serde_json::Value::Object(nssai_json);
+            if slice.default_indicator {
+                default_nssais.push(val);
+            } else {
+                single_nssais.push(val);
+            }
+        }
+        let mut nssai = serde_json::Map::new();
+        if !default_nssais.is_empty() {
+            nssai.insert("defaultSingleNssais".to_string(), serde_json::Value::Array(default_nssais));
+        }
+        if !single_nssais.is_empty() {
+            nssai.insert("singleNssais".to_string(), serde_json::Value::Array(single_nssais));
+        }
+        am.insert("nssai".to_string(), serde_json::Value::Object(nssai));
+    }
+    serde_json::Value::Object(am)
+}
+
+fn build_smf_selection_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Value {
+    let mut smf_sel = serde_json::Map::new();
+    let mut snssai_infos = serde_json::Map::new();
+    for slice in &data.slice {
+        let snssai_key = if slice.s_nssai.has_sd() {
+            format!("{:02x}-{:06x}", slice.s_nssai.sst, slice.s_nssai.sd.v)
+        } else {
+            format!("{:02x}", slice.s_nssai.sst)
+        };
+        let dnn_infos: Vec<serde_json::Value> = slice.session.iter()
+            .filter_map(|sess| sess.name.as_ref().map(|dnn| serde_json::json!({"dnn": dnn})))
+            .collect();
+        if !dnn_infos.is_empty() {
+            snssai_infos.insert(snssai_key, serde_json::json!({"dnnInfos": dnn_infos}));
+        }
+    }
+    if !snssai_infos.is_empty() {
+        smf_sel.insert("subscribedSnssaiInfos".to_string(), serde_json::Value::Object(snssai_infos));
+    }
+    serde_json::Value::Object(smf_sel)
+}
+
+fn build_sm_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Value {
+    let mut sm_data_list = Vec::new();
+    for slice in &data.slice {
+        let mut sm_entry = serde_json::Map::new();
+        let mut snssai = serde_json::Map::new();
+        snssai.insert("sst".to_string(), serde_json::Value::Number(slice.s_nssai.sst.into()));
+        if slice.s_nssai.has_sd() {
+            snssai.insert("sd".to_string(), serde_json::Value::String(format!("{:06x}", slice.s_nssai.sd.v)));
+        }
+        sm_entry.insert("singleNssai".to_string(), serde_json::Value::Object(snssai));
+        let mut dnn_configs = serde_json::Map::new();
+        for sess in &slice.session {
+            if let Some(dnn) = &sess.name {
+                let pdu_type = match sess.session_type { 1 => "IPV4", 2 => "IPV6", 3 => "IPV4V6", _ => "IPV4V6" };
+                dnn_configs.insert(dnn.clone(), serde_json::json!({
+                    "pduSessionTypes": { "defaultSessionType": pdu_type, "allowedSessionTypes": [pdu_type] },
+                    "sscModes": { "defaultSscMode": "SSC_MODE_1", "allowedSscModes": ["SSC_MODE_1"] },
+                    "5gQosProfile": { "5qi": sess.qos.index, "arp": { "priorityLevel": sess.qos.arp.priority_level } },
+                    "sessionAmbr": { "uplink": format_ambr(sess.ambr.uplink), "downlink": format_ambr(sess.ambr.downlink) }
+                }));
+            }
+        }
+        if !dnn_configs.is_empty() {
+            sm_entry.insert("dnnConfigurations".to_string(), serde_json::Value::Object(dnn_configs));
+        }
+        sm_data_list.push(serde_json::Value::Object(sm_entry));
+    }
+    serde_json::Value::Array(sm_data_list)
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn format_ambr(bps: u64) -> String {
+    if bps >= 1_000_000_000 {
+        format!("{} Gbps", bps / 1_000_000_000)
+    } else if bps >= 1_000_000 {
+        format!("{} Mbps", bps / 1_000_000)
+    } else if bps >= 1_000 {
+        format!("{} Kbps", bps / 1_000)
+    } else {
+        format!("{} bps", bps)
+    }
+}
+
+// ============================================================================
+// Config parsing
+// ============================================================================
+
+/// Parse db_uri from YAML config file
+fn parse_db_uri(config_path: &str) -> String {
+    // Try config file first
+    if let Ok(content) = std::fs::read_to_string(config_path) {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("db_uri:") {
+                let uri = trimmed.trim_start_matches("db_uri:").trim();
+                if !uri.is_empty() {
+                    log::info!("Found db_uri in config: {}", mask_uri(uri));
+                    return uri.to_string();
+                }
+            }
+        }
+    }
+    // Fall back to env var
+    if let Ok(uri) = std::env::var("DB_URI") {
+        return uri;
+    }
+    // Default for Docker deployment
+    String::from("mongodb://172.23.0.2/nextgcore")
+}
+
+/// Mask MongoDB URI for logging (hide credentials)
+fn mask_uri(uri: &str) -> String {
+    if let Some(at_pos) = uri.find('@') {
+        if let Some(proto_end) = uri.find("://") {
+            return format!("{}://***@{}", &uri[..proto_end], &uri[at_pos + 1..]);
+        }
+    }
+    uri.to_string()
+}
+
+// ============================================================================
+// Infrastructure
+// ============================================================================
 
 /// Initialize logging based on command line arguments
 fn init_logging(args: &Args) -> Result<()> {
     let mut builder = env_logger::Builder::new();
 
-    // Set log level
     let level = match args.log_level.to_lowercase().as_str() {
         "trace" => log::LevelFilter::Trace,
         "debug" => log::LevelFilter::Debug,
@@ -167,9 +610,8 @@ fn init_logging(args: &Args) -> Result<()> {
         "error" => log::LevelFilter::Error,
         _ => log::LevelFilter::Info,
     };
-    builder.filter_level(level);
 
-    // Configure format
+    builder.filter_level(level);
     builder.format_timestamp_millis();
 
     if args.no_color {
@@ -177,13 +619,11 @@ fn init_logging(args: &Args) -> Result<()> {
     }
 
     builder.init();
-
     Ok(())
 }
 
 /// Set up signal handlers for graceful shutdown
 fn setup_signal_handlers(shutdown: Arc<AtomicBool>) -> Result<()> {
-    // Set up Ctrl+C handler
     let shutdown_clone = shutdown.clone();
     ctrlc::set_handler(move || {
         log::info!("Received shutdown signal");
@@ -195,27 +635,12 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) -> Result<()> {
     Ok(())
 }
 
-/// Main event loop
-fn run_event_loop(_udr_sm: &mut UdrSmContext, shutdown: Arc<AtomicBool>) -> Result<()> {
-    log::debug!("Entering main event loop");
+/// Async main event loop
+async fn run_event_loop_async(shutdown: Arc<AtomicBool>) -> Result<()> {
+    log::debug!("Entering async main event loop");
 
-    // Simple polling loop
-    // In a full implementation, this would use tokio or async-std for async I/O
     while !shutdown.load(Ordering::SeqCst) && !SHUTDOWN.load(Ordering::SeqCst) {
-        // Poll for events with timeout
-        std::thread::sleep(std::time::Duration::from_millis(100));
-
-        // Process timer expirations
-        // In C: ogs_pollset_poll(ogs_app()->pollset, ogs_timer_mgr_next(ogs_app()->timer_mgr));
-        //       while ((e = ogs_queue_trypop(ogs_app()->queue)) != NULL) {
-        //           udr_sm_dispatch(e);
-        //           udr_event_free(e);
-        //       }
-
-        // For now, just check if we should exit
-        if shutdown.load(Ordering::SeqCst) {
-            break;
-        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     log::debug!("Exiting main event loop");
@@ -268,5 +693,11 @@ mod tests {
         assert!(args.tls);
         assert_eq!(args.tls_cert, Some("/path/to/cert.pem".to_string()));
         assert_eq!(args.tls_key, Some("/path/to/key.pem".to_string()));
+    }
+
+    #[test]
+    fn test_mask_uri() {
+        assert_eq!(mask_uri("mongodb://user:pass@host/db"), "mongodb://***@host/db");
+        assert_eq!(mask_uri("mongodb://host/db"), "mongodb://host/db");
     }
 }

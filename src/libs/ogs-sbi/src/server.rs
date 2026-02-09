@@ -146,7 +146,7 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
 /// Convert hyper request to SbiRequest
 async fn convert_request(req: Request<Incoming>) -> SbiRequest {
     let method = req.method().to_string();
-    let uri = req.uri().to_string();
+    let uri = req.uri().path().to_string();
     
     // Extract headers
     let mut http = SbiHttpMessage::new();
