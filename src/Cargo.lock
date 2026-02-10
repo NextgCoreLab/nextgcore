@@ -2287,6 +2287,7 @@ dependencies = [
  "log",
  "ogs-app",
  "ogs-core",
+ "ogs-dbi",
  "ogs-sbi",
  "proptest",
  "serde_json",

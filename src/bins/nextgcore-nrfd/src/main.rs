@@ -335,6 +335,22 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
         Ok(_) => {
             log::info!("NF {} ({}) registered successfully", nf_instance_id, nf_type);
 
+            // Start heartbeat expiry timer if NF has heartBeatTimer
+            if let Some(hb_timer) = heartbeat_timer {
+                let timer_mgr = timer_manager();
+                // Use 2x heartbeat interval as tolerance before declaring missed heartbeat
+                let expiry_secs = (hb_timer as u64) * 2;
+                timer_mgr.start_timer(
+                    nextgcore_nrfd::NrfTimerId::NfInstanceNoHeartbeat,
+                    Duration::from_secs(expiry_secs),
+                    nf_instance_id.to_string(),
+                );
+                log::info!(
+                    "Heartbeat timer started for NF {} ({} seconds, 2x {}s interval)",
+                    nf_instance_id, expiry_secs, hb_timer
+                );
+            }
+
             // Send NF status notifications to all matching subscribers
             let notify_profile = nf_profile.clone();
             tokio::spawn(async move {
@@ -439,11 +455,27 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
         Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
     };
 
-    // For now, just verify the NF exists and return success
+    // Verify the NF exists and refresh heartbeat timer
     let manager = nf_manager();
 
     match manager.get(nf_instance_id) {
         Some(profile) => {
+            // Refresh heartbeat timer on any PATCH (serves as heartbeat)
+            if let Some(hb_timer) = profile.heartbeat_timer {
+                let timer_mgr = timer_manager();
+                // Start new heartbeat timer (old one will expire harmlessly)
+                let expiry_secs = (hb_timer as u64) * 2;
+                timer_mgr.start_timer(
+                    nextgcore_nrfd::NrfTimerId::NfInstanceNoHeartbeat,
+                    Duration::from_secs(expiry_secs),
+                    nf_instance_id.to_string(),
+                );
+                log::debug!(
+                    "Heartbeat timer refreshed for NF {} ({}s)",
+                    nf_instance_id, expiry_secs
+                );
+            }
+
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({
                     "nfInstanceId": profile.nf_instance_id,

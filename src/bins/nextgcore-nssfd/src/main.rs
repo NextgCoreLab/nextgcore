@@ -353,6 +353,14 @@ async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
         }
     }
 
+    // Parse SUPI for subscription-based filtering (TS 29.531)
+    let supi = request.http.params.get("supi")
+        .map(|s| s.as_str().to_string());
+
+    if let Some(ref s) = supi {
+        log::debug!("NS Selection with SUPI={} for subscription-based filtering", s);
+    }
+
     // Call the real NS selection handler
     let result = nnssf_handler::nssf_nnssf_nsselection_handle_get_from_amf_or_vnssf(0, &param);
 
@@ -364,7 +372,7 @@ async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
 
             // Build allowedNssaiList from configured NSIs
             let all_nsi = context.nsi_get_all();
-            let allowed_snssai_list: Vec<serde_json::Value> = all_nsi.iter().map(|nsi| {
+            let mut allowed_snssai_list: Vec<serde_json::Value> = all_nsi.iter().map(|nsi| {
                 let mut snssai = serde_json::json!({"sst": nsi.s_nssai.sst});
                 if let Some(sd) = nsi.s_nssai.sd {
                     snssai["sd"] = serde_json::json!(format!("{:06x}", sd));
@@ -373,19 +381,76 @@ async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
             }).collect();
 
             // If no NSIs configured, use the matched one from the request
-            let allowed_snssai_list = if allowed_snssai_list.is_empty() {
+            if allowed_snssai_list.is_empty() {
                 if let Some(ref si) = param.slice_info_for_pdu_session.snssai {
                     let mut snssai = serde_json::json!({"sst": si.sst});
                     if let Some(sd) = si.sd {
                         snssai["sd"] = serde_json::json!(format!("{:06x}", sd));
                     }
-                    vec![serde_json::json!({"allowedSnssai": snssai})]
-                } else {
-                    vec![]
+                    allowed_snssai_list.push(serde_json::json!({"allowedSnssai": snssai}));
                 }
-            } else {
-                allowed_snssai_list
-            };
+            }
+
+            // Subscription-based filtering: if SUPI provided, query UDR for subscribed NSSAIs
+            // and filter out any S-NSSAIs that the UE is not subscribed to (TS 29.531 6.1.3.2.3.1)
+            if let Some(ref _supi) = supi {
+                // Query subscribed S-NSSAIs from UDR via ogs-dbi
+                match ogs_dbi::ogs_dbi_subscription_data(_supi) {
+                    Ok(sub_data) => {
+                        let subscribed: Vec<(u8, Option<u32>)> = sub_data.slice
+                            .iter()
+                            .map(|s| (s.s_nssai.sst, if s.s_nssai.sd.v == 0xFFFFFF { None } else { Some(s.s_nssai.sd.v) }))
+                            .collect();
+
+                        if !subscribed.is_empty() {
+                            log::info!("Filtering allowed NSSAIs against {} subscribed slices for SUPI", subscribed.len());
+
+                            allowed_snssai_list.retain(|item| {
+                                let sst = item.get("allowedSnssai")
+                                    .and_then(|s| s.get("sst"))
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0) as u8;
+                                let sd = item.get("allowedSnssai")
+                                    .and_then(|s| s.get("sd"))
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|s| u32::from_str_radix(s, 16).ok());
+
+                                subscribed.iter().any(|(sub_sst, sub_sd)| *sub_sst == sst && *sub_sd == sd)
+                            });
+
+                            log::debug!("After subscription filtering: {} allowed S-NSSAIs", allowed_snssai_list.len());
+                        }
+                    }
+                    Err(e) => {
+                        log::debug!("UDR subscription query unavailable for SUPI ({}), allowing all NSSAIs", e);
+                    }
+                }
+            }
+
+            // Also filter against NSSAI availability if TAI provided (TS 29.531 6.1.3.2.3.2)
+            if let Some(ref tai) = param.tai {
+                let supported = context.get_supported_snssai_for_tai(&context::Tai {
+                    plmn_id: tai.plmn_id.clone(),
+                    tac: tai.tac,
+                });
+
+                if !supported.is_empty() {
+                    log::debug!("Filtering against {} NSSAI availability entries for TAI", supported.len());
+                    allowed_snssai_list.retain(|item| {
+                        let sst = item.get("allowedSnssai")
+                            .and_then(|s| s.get("sst"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u8;
+                        let sd = item.get("allowedSnssai")
+                            .and_then(|s| s.get("sd"))
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| u32::from_str_radix(s, 16).ok());
+                        supported.iter().any(|s| s.sst == sst && s.sd == sd)
+                    });
+                }
+            }
+
+            let allowed_snssai_list = allowed_snssai_list;
 
             let mut response = serde_json::json!({
                 "allowedNssaiList": [{

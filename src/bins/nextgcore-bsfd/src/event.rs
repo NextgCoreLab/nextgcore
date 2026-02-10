@@ -53,6 +53,7 @@ pub enum BsfTimerId {
     SubscriptionValidity,
     SubscriptionPatch,
     SbiClientWait,
+    BindingExpiry,
 }
 
 impl BsfTimerId {
@@ -65,6 +66,7 @@ impl BsfTimerId {
             BsfTimerId::SubscriptionValidity => "OGS_TIMER_SUBSCRIPTION_VALIDITY",
             BsfTimerId::SubscriptionPatch => "OGS_TIMER_SUBSCRIPTION_PATCH",
             BsfTimerId::SbiClientWait => "OGS_TIMER_SBI_CLIENT_WAIT",
+            BsfTimerId::BindingExpiry => "BSF_TIMER_BINDING_EXPIRY",
         }
     }
 }

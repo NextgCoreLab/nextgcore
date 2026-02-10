@@ -843,6 +843,52 @@ pub fn parse_uplink_nas_transport_asn1(data: &[u8]) -> Option<UplinkNasTransport
     })
 }
 
+/// Build a Paging message with proper ASN.1 APER encoding
+///
+/// Sent by AMF to gNBs to page a UE in CM-IDLE state.
+/// The message follows 3GPP TS 38.413 Section 8.7.2.
+pub fn build_paging_asn1(
+    amf_set_id: u16,
+    amf_pointer: u8,
+    tmsi: u32,
+    plmn_id: &crate::context::PlmnId,
+    tac: u32,
+) -> Option<Vec<u8>> {
+    use nextgsim_ngap::procedures::paging::*;
+    use nextgsim_ngap::procedures::initial_ue_message::{FiveGSTmsi, Tai};
+
+    let plmn_bytes = encode_plmn_id(plmn_id);
+
+    let params = PagingParams {
+        ue_paging_identity: UePagingIdentityValue::FiveGSTmsi(FiveGSTmsi {
+            amf_set_id,
+            amf_pointer,
+            five_g_tmsi: tmsi.to_be_bytes(),
+        }),
+        tai_list_for_paging: vec![Tai {
+            plmn_identity: plmn_bytes,
+            tac: [(tac >> 16) as u8, (tac >> 8) as u8, tac as u8],
+        }],
+        paging_drx: None,
+        paging_priority: None,
+        paging_origin: None,
+    };
+
+    match encode_paging(&params) {
+        Ok(bytes) => {
+            log::debug!(
+                "Built Paging: {} bytes, amf_set_id={}, tmsi=0x{:08x}, tac={}",
+                bytes.len(), amf_set_id, tmsi, tac
+            );
+            Some(bytes)
+        }
+        Err(e) => {
+            log::error!("Failed to encode Paging: {:?}", e);
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -403,6 +403,28 @@ impl NssfContext {
         false
     }
 
+    /// Get supported S-NSSAIs for a specific TAI from NSSAI availability data
+    pub fn get_supported_snssai_for_tai(&self, tai: &Tai) -> Vec<SNssai> {
+        let mut result = Vec::new();
+        if let Ok(avail) = self.nssai_availability.read() {
+            for info in avail.values() {
+                let tai_match = info.tai_list.iter().any(|t| {
+                    t.plmn_id.mcc == tai.plmn_id.mcc &&
+                    t.plmn_id.mnc == tai.plmn_id.mnc &&
+                    t.tac == tai.tac
+                });
+                if tai_match {
+                    for snssai in &info.supported_snssai_list {
+                        if !result.iter().any(|s: &SNssai| s.sst == snssai.sst && s.sd == snssai.sd) {
+                            result.push(snssai.clone());
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
     /// Get all NSI entries
     pub fn nsi_get_all(&self) -> Vec<NssfNsi> {
         self.nsi_list

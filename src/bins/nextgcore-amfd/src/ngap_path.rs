@@ -1022,12 +1022,36 @@ impl NgapServer {
                 // Clean up auth state
                 self.ue_auth_state.remove(&ul_nas.amf_ue_ngap_id);
 
-                // Send Registration Accept
-                let registration_accept = vec![
+                // Send Registration Accept with T3512 timer and 5G-GUTI
+                let mut registration_accept = vec![
                     0x7e, 0x00, 0x42, // EPD + Security header + Registration Accept
                     0x01,             // Registration result length
                     0x01,             // Registration result: 3GPP access
                 ];
+
+                // 5G-GUTI (IEI 0x77, TLV-E) - assign a GUTI to the UE
+                let guti_amf_set_id: u16 = 1;
+                let guti_amf_pointer: u8 = 0;
+                let guti_tmsi: u32 = ul_nas.amf_ue_ngap_id as u32;
+                registration_accept.push(0x77); // IEI
+                registration_accept.extend_from_slice(&[0x00, 0x0B]); // Length = 11
+                registration_accept.push(0xF2); // SUPI format=GUTI, odd/even
+                // PLMN: MCC=999, MNC=70
+                registration_accept.extend_from_slice(&[0x99, 0xF9, 0x07]);
+                // AMF Region ID
+                registration_accept.push(0x02);
+                // AMF Set ID (10 bits) + AMF Pointer (6 bits) = 2 bytes
+                let set_ptr = ((guti_amf_set_id & 0x3FF) << 6) | (guti_amf_pointer as u16 & 0x3F);
+                registration_accept.extend_from_slice(&set_ptr.to_be_bytes());
+                // 5G-TMSI (4 bytes)
+                registration_accept.extend_from_slice(&guti_tmsi.to_be_bytes());
+
+                // T3512 timer (IEI 0x5E, GPRS Timer 3)
+                // Value: 540 seconds = 9 minutes → unit=multiples of 1 minute (010), value=9 (01001)
+                // Timer value byte: 010 01001 = 0x49
+                registration_accept.push(0x5E); // IEI
+                registration_accept.push(0x01); // Length
+                registration_accept.push(0x49); // 9 minutes (unit=010=1min, val=01001=9)
 
                 let dl_nas_transport = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
                     ul_nas.amf_ue_ngap_id,
@@ -1041,7 +1065,92 @@ impl NgapServer {
                     }
                 };
                 self.send_to_association(association_id, &dl_nas_transport).await?;
-                log::info!("Registration Accept sent to UE (after Security Mode Complete)");
+                log::info!("Registration Accept sent to UE (with T3512=540s, 5G-GUTI assigned)");
+            }
+
+            // Check for Service Request (0x4C) - 5GMM message
+            if epd == 0x7E && msg_type == 0x4C {
+                log::info!("Received Service Request from UE (amf_ue_ngap_id={})", ul_nas.amf_ue_ngap_id);
+
+                // Service Request indicates UE is transitioning from CM-IDLE to CM-CONNECTED
+                // Parse the Service Request to extract 5G-S-TMSI and service type
+                // Format: EPD(0x7E) + SecHdr(0x00) + MsgType(0x4C) + ngKSI+ServiceType(1) + 5G-S-TMSI(TLV)
+                let service_type = if ul_nas.nas_pdu.len() > 3 {
+                    ul_nas.nas_pdu[3] & 0x0F // Lower nibble = service type
+                } else {
+                    0 // signalling
+                };
+
+                log::info!("Service Request: service_type={}", service_type);
+
+                // Send Service Accept
+                // Format: EPD(0x7E) + SecHdr(0x00) + MsgType(0x4E)
+                let service_accept = vec![0x7E, 0x00, 0x4E];
+
+                let dl_nas_transport = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
+                    ul_nas.amf_ue_ngap_id,
+                    ul_nas.ran_ue_ngap_id,
+                    &service_accept,
+                ) {
+                    Some(bytes) => bytes,
+                    None => {
+                        log::error!("Failed to build DL NAS Transport for Service Accept");
+                        return Ok(());
+                    }
+                };
+                self.send_to_association(association_id, &dl_nas_transport).await?;
+                log::info!("Service Accept sent to UE");
+            }
+
+            // Check for Registration Request (0x41) as periodic registration update
+            if epd == 0x7E && msg_type == 0x41 {
+                // Check registration type for periodic update
+                if ul_nas.nas_pdu.len() > 3 {
+                    let reg_type = ul_nas.nas_pdu[3] & 0x07;
+                    if reg_type == 0x03 {
+                        // Periodic Registration Update (type 3)
+                        log::info!("Periodic Registration Update from UE (amf_ue_ngap_id={})", ul_nas.amf_ue_ngap_id);
+
+                        // Send Registration Accept with refreshed T3512
+                        let mut reg_accept = vec![
+                            0x7e, 0x00, 0x42,
+                            0x01, 0x01, // Registration result: 3GPP access
+                        ];
+                        // T3512 timer (refreshed)
+                        reg_accept.push(0x5E);
+                        reg_accept.push(0x01);
+                        reg_accept.push(0x49); // 9 minutes
+
+                        let dl_nas = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
+                            ul_nas.amf_ue_ngap_id,
+                            ul_nas.ran_ue_ngap_id,
+                            &reg_accept,
+                        ) {
+                            Some(bytes) => bytes,
+                            None => return Ok(()),
+                        };
+                        self.send_to_association(association_id, &dl_nas).await?;
+                        log::info!("Registration Accept sent for periodic update (T3512 refreshed)");
+                    }
+                }
+            }
+
+            // Check for Deregistration Request UE Originating (0x45) - 5GMM message
+            if epd == 0x7E && msg_type == 0x45 {
+                log::info!("Received Deregistration Request from UE (amf_ue_ngap_id={})", ul_nas.amf_ue_ngap_id);
+
+                // Send Deregistration Accept
+                let dereg_accept = vec![0x7E, 0x00, 0x46]; // EPD + SecHdr + Dereg Accept
+                let dl_nas = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
+                    ul_nas.amf_ue_ngap_id,
+                    ul_nas.ran_ue_ngap_id,
+                    &dereg_accept,
+                ) {
+                    Some(bytes) => bytes,
+                    None => return Ok(()),
+                };
+                self.send_to_association(association_id, &dl_nas).await?;
+                log::info!("Deregistration Accept sent to UE");
             }
         }
 
@@ -1155,6 +1264,45 @@ impl NgapServer {
             log::warn!("Could not extract gNB TEID from PDU Session Resource Setup Response");
         }
 
+        Ok(())
+    }
+
+    /// Send Paging to all connected gNBs in the UE's tracking area
+    ///
+    /// This is called when the AMF needs to page a UE in CM-IDLE state,
+    /// e.g., when downlink data notification is received from SMF.
+    pub async fn send_paging(
+        &mut self,
+        amf_set_id: u16,
+        amf_pointer: u8,
+        tmsi: u32,
+        plmn_id: &crate::context::PlmnId,
+        tac: u32,
+    ) -> Result<()> {
+        let paging_bytes = match crate::ngap_asn1::build_paging_asn1(
+            amf_set_id, amf_pointer, tmsi, plmn_id, tac,
+        ) {
+            Some(bytes) => bytes,
+            None => {
+                log::error!("Failed to build Paging message");
+                return Err(anyhow::anyhow!("Failed to build Paging message"));
+            }
+        };
+
+        // Send to all connected gNBs (in production, filter by TAI match)
+        let association_ids: Vec<u64> = self.sessions.read().await.keys().copied().collect();
+        let gnb_count = association_ids.len();
+
+        for assoc_id in association_ids {
+            if let Err(e) = self.send_to_association(assoc_id, &paging_bytes).await {
+                log::warn!("Failed to send Paging to association {}: {}", assoc_id, e);
+            }
+        }
+
+        log::info!(
+            "Paging sent to {} gNBs: amf_set_id={}, tmsi=0x{:08x}, tac={}",
+            gnb_count, amf_set_id, tmsi, tac
+        );
         Ok(())
     }
 

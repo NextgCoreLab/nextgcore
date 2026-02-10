@@ -315,8 +315,26 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
                 context.sess_persist(&sess);
             }
 
-            log::info!("PCF Binding created (id={}, ipv4={:?}, ipv6={:?})",
-                sess.binding_id, ipv4addr, ipv6prefix);
+            // Start binding expiry timer (TTL)
+            // Use expiry from request if provided, otherwise default 1 hour
+            let ttl_secs = binding_data.get("expiry")
+                .and_then(|v| v.as_str())
+                .and_then(|s| {
+                    // Parse ISO 8601 duration or seconds
+                    s.parse::<u64>().ok()
+                })
+                .unwrap_or(timer::defaults::BINDING_EXPIRY.as_secs());
+
+            let timer_mgr = timer_manager();
+            timer_mgr.start(
+                BsfTimerId::BindingExpiry,
+                Duration::from_secs(ttl_secs),
+                Some(sess.binding_id.clone()),
+            );
+            log::debug!("Binding expiry timer started for {} (TTL={}s)", sess.binding_id, ttl_secs);
+
+            log::info!("PCF Binding created (id={}, ipv4={:?}, ipv6={:?}, TTL={}s)",
+                sess.binding_id, ipv4addr, ipv6prefix, ttl_secs);
 
             SbiResponse::with_status(201)
                 .with_header("Location", &format!("/nbsf-management/v1/pcfBindings/{}", sess.binding_id))
@@ -604,6 +622,23 @@ async fn run_event_loop_async(bsf_sm: &mut BsfSmContext, shutdown: Arc<AtomicBoo
                 "BSF timer expired: id={} type={:?} data={:?}",
                 entry.id, entry.timer_type, entry.data
             );
+
+            // Handle binding expiry timer directly (TTL cleanup)
+            if entry.timer_type == BsfTimerId::BindingExpiry {
+                if let Some(ref binding_id) = entry.data {
+                    log::info!("PCF Binding {} expired (TTL), removing", binding_id);
+                    let ctx = bsf_self();
+                    if let Ok(sess_id) = binding_id.parse::<u64>() {
+                        if let Ok(context) = ctx.read() {
+                            if context.sess_remove(sess_id).is_some() {
+                                context.sess_unpersist(binding_id);
+                                log::info!("PCF Binding {} auto-removed on TTL expiry", binding_id);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
 
             // Create timer event and dispatch to state machine
             let mut event = BsfEvent::sbi_timer(entry.timer_type);

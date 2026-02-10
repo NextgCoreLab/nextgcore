@@ -109,6 +109,7 @@ pub mod defaults {
     pub const NF_INSTANCE_NO_HEARTBEAT: Duration = Duration::from_secs(30);
     pub const SUBSCRIPTION_VALIDITY: Duration = Duration::from_secs(86400);
     pub const SBI_CLIENT_WAIT: Duration = Duration::from_secs(2);
+    pub const BINDING_EXPIRY: Duration = Duration::from_secs(3600);
 }
 
 #[cfg(test)]

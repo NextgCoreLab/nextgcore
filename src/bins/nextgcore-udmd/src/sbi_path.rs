@@ -256,8 +256,9 @@ pub fn udm_sbi_close() {
 
     // Clear SBI client connections
     let sbi_ctx = global_context();
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.block_on(async {
+    if let Ok(_handle) = tokio::runtime::Handle::try_current() {
+        // Use spawn instead of block_on to avoid panicking when called from async context
+        tokio::spawn(async move {
             sbi_ctx.clear_clients().await;
             sbi_ctx.clear_nf_instances().await;
         });
@@ -496,8 +497,8 @@ mod tests {
         assert!(!config.tls_enabled);
     }
 
-    #[test]
-    fn test_sbi_open_close() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_sbi_open_close() {
         assert!(!udm_sbi_is_running());
 
         udm_sbi_open(None).unwrap();

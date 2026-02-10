@@ -101,6 +101,27 @@ pub struct PcfUeAm {
     pub subscribed_ue_ambr: Option<Ambr>,
     /// Associated stream ID
     pub stream_id: Option<u64>,
+    /// URSP rules for this UE (Rel-17, TS 24.526)
+    pub ursp_rules: Vec<UrspRule>,
+    /// RedCap UE flag (Rel-17)
+    pub is_redcap: bool,
+    /// SNPN NID (Rel-17)
+    pub snpn_nid: Option<String>,
+}
+
+/// UE Route Selection Policy rule (TS 24.526)
+#[derive(Debug, Clone)]
+pub struct UrspRule {
+    /// Rule precedence (lower = higher priority)
+    pub precedence: u8,
+    /// Traffic descriptor (app ID or domain)
+    pub traffic_descriptor: String,
+    /// Preferred S-NSSAI SST
+    pub preferred_sst: Option<u8>,
+    /// Preferred DNN
+    pub preferred_dnn: Option<String>,
+    /// SSC mode (1, 2, or 3)
+    pub ssc_mode: Option<u8>,
 }
 
 impl PcfUeAm {
@@ -118,7 +139,41 @@ impl PcfUeAm {
             am_policy_control_features: 0,
             subscribed_ue_ambr: None,
             stream_id: None,
+            ursp_rules: Vec::new(),
+            is_redcap: false,
+            snpn_nid: None,
         }
+    }
+
+    /// Generate default URSP rules based on UE subscription.
+    ///
+    /// In production, rules would come from UDR subscription data.
+    /// This creates sensible defaults for standard slice types.
+    pub fn generate_default_ursp_rules(&mut self) {
+        self.ursp_rules = vec![
+            UrspRule {
+                precedence: 1,
+                traffic_descriptor: "internet".to_string(),
+                preferred_sst: Some(1), // eMBB
+                preferred_dnn: Some("internet".to_string()),
+                ssc_mode: Some(1),
+            },
+            UrspRule {
+                precedence: 2,
+                traffic_descriptor: "ims".to_string(),
+                preferred_sst: Some(1),
+                preferred_dnn: Some("ims".to_string()),
+                ssc_mode: Some(1),
+            },
+            UrspRule {
+                precedence: 3,
+                traffic_descriptor: "v2x".to_string(),
+                preferred_sst: Some(4), // V2X
+                preferred_dnn: Some("v2x".to_string()),
+                ssc_mode: Some(2),
+            },
+        ];
+        log::info!("PCF: Generated {} URSP rules for SUPI={}", self.ursp_rules.len(), self.supi);
     }
 }
 
