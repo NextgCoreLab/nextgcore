@@ -681,7 +681,7 @@ async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
     };
 
-    let _update_data: serde_json::Value = match serde_json::from_str(body) {
+    let update_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
         Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
     };
@@ -695,10 +695,88 @@ async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest
 
     match sess {
         Some(sess) => {
+            // Process reported triggers from SMF
+            let triggers = update_data.get("repPolicyCtrlReqTriggers")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>())
+                .unwrap_or_default();
+
+            log::info!("SM Policy Update triggers: {:?} for session PSI={}", triggers, sess.psi);
+
+            // Process PCC rule reports from SMF (rule status changes)
+            let mut rule_reports = Vec::new();
+            if let Some(reports) = update_data.get("repPccRuleStatusList").and_then(|v| v.as_object()) {
+                for (rule_id, report) in reports {
+                    let status = report.get("ruleStatus").and_then(|v| v.as_str()).unwrap_or("ACTIVE");
+                    log::debug!("PCC rule {} status: {}", rule_id, status);
+                    rule_reports.push((rule_id.clone(), status.to_string()));
+                }
+            }
+
+            // Build updated policy decision based on triggers
+            let mut pcc_rules = serde_json::Map::new();
+            let mut qos_decs = serde_json::Map::new();
+
+            // If UE requested resource modification, generate new PCC rules
+            if let Some(ue_req) = update_data.get("ueInitResReq") {
+                let req_5qi = ue_req.get("reqQos").and_then(|q| q.get("5qi")).and_then(|v| v.as_u64()).unwrap_or(9);
+                let req_gbr_ul = ue_req.get("reqQos").and_then(|q| q.get("gbrUl")).and_then(|v| v.as_str());
+                let req_gbr_dl = ue_req.get("reqQos").and_then(|q| q.get("gbrDl")).and_then(|v| v.as_str());
+
+                let rule_id = format!("PccRule-ue-{}", sess.sm_policy_id);
+                let qos_ref = format!("QosDec-ue-{}", sess.sm_policy_id);
+
+                pcc_rules.insert(rule_id.clone(), serde_json::json!({
+                    "pccRuleId": rule_id,
+                    "precedence": 100,
+                    "refQosData": [&qos_ref],
+                }));
+
+                let mut qos_dec = serde_json::json!({
+                    "qosDecId": qos_ref,
+                    "5qi": req_5qi,
+                });
+                if let Some(gbr_ul) = req_gbr_ul {
+                    qos_dec["gbrUl"] = serde_json::json!(gbr_ul);
+                }
+                if let Some(gbr_dl) = req_gbr_dl {
+                    qos_dec["gbrDl"] = serde_json::json!(gbr_dl);
+                }
+                qos_decs.insert(qos_ref, qos_dec);
+
+                log::info!("Generated PCC rule for UE-initiated resource request: 5QI={}", req_5qi);
+            }
+
+            // If SESS_AMBR_CH trigger, re-evaluate session AMBR
+            let sess_rules = if triggers.iter().any(|t| t == "SE_AMBR_CH") {
+                // Re-query session data for updated AMBR
+                let s_nssai = SNssai { sst: sess.s_nssai.sst, sd: sess.s_nssai.sd };
+                let dnn = sess.dnn.as_deref().unwrap_or("internet");
+                if let Some(sd) = pcf_get_session_data("", None, &s_nssai, dnn) {
+                    let sess_rule_id = format!("SessRule-{}", sess.sm_policy_id);
+                    serde_json::json!({
+                        &sess_rule_id: {
+                            "sessRuleId": sess_rule_id,
+                            "authSessAmbr": {
+                                "uplink": format_bitrate(sd.ambr_uplink),
+                                "downlink": format_bitrate(sd.ambr_downlink),
+                            },
+                        }
+                    })
+                } else {
+                    serde_json::json!({})
+                }
+            } else {
+                serde_json::json!({})
+            };
+
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({
                     "smPolicyId": sess.sm_policy_id,
                     "pduSessionId": sess.psi,
+                    "sessRules": sess_rules,
+                    "pccRules": serde_json::Value::Object(pcc_rules),
+                    "qosDecs": serde_json::Value::Object(qos_decs),
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }

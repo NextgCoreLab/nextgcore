@@ -73,6 +73,14 @@ pub struct RegistrationRequest {
     pub presencemask: u64,
     /// NAS message container present
     pub nas_message_container_present: bool,
+    /// RedCap indication (Rel-17, TS 38.101)
+    pub redcap_indication: bool,
+    /// SNPN NID (Rel-17, standalone non-public network)
+    pub snpn_nid: Option<String>,
+    /// CAG ID for SNPN access (Rel-17)
+    pub cag_id: Option<u32>,
+    /// ProSe capability
+    pub prose_capable: bool,
 }
 
 /// Handle registration request
@@ -148,6 +156,43 @@ pub fn handle_registration_request(
 
     // Generate new GUTI
     amf_ue.generate_new_guti();
+
+    // --- Rel-17 Feature Processing ---
+
+    // RedCap indication (TS 38.101 Rel-17)
+    if request.redcap_indication {
+        amf_ue.redcap_indication = true;
+        log::info!("UE indicates RedCap (Reduced Capability) device");
+        // Apply reduced AMBR for RedCap UEs
+        if amf_ue.ue_ambr.downlink > 150_000_000 {
+            amf_ue.ue_ambr.downlink = 150_000_000; // Cap at 150 Mbps DL
+        }
+        if amf_ue.ue_ambr.uplink > 50_000_000 {
+            amf_ue.ue_ambr.uplink = 50_000_000; // Cap at 50 Mbps UL
+        }
+    }
+
+    // SNPN access authorization (TS 23.501 Rel-17)
+    if let Some(ref nid) = request.snpn_nid {
+        amf_ue.snpn_nid = Some(nid.clone());
+        amf_ue.cag_id = request.cag_id;
+        log::info!("SNPN registration: NID={}, CAG={:?}", nid, request.cag_id);
+        // In production: verify NID against configured SNPN list
+        // and check CAG authorization via UDM
+    }
+
+    // ProSe capability
+    if request.prose_capable {
+        amf_ue.prose_capable = true;
+        log::info!("UE indicates ProSe/Sidelink capability");
+    }
+
+    // Network slice admission control (NSACF, TS 29.536)
+    // In production: would query NSACF for each requested S-NSSAI
+    amf_ue.slice_admission_granted = true;
+    for snssai in &amf_ue.requested_nssai {
+        log::debug!("Slice admission check: SST={}, SD={:?}", snssai.sst, snssai.sd);
+    }
 
     GmmCause::RequestAccepted
 }

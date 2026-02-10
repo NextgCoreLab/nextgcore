@@ -1589,6 +1589,38 @@ pub struct AmfUe {
     pub sessions: Vec<AmfSessRef>,
     /// AUTN as Vec for variable length
     pub autn: Vec<u8>,
+
+    // ========================================================================
+    // Rel-17 Feature Fields
+    // ========================================================================
+
+    /// RedCap (Reduced Capability) UE indication (TS 38.101)
+    pub redcap_indication: bool,
+    /// SNPN NID if UE is registering via SNPN
+    pub snpn_nid: Option<String>,
+    /// CAG (Closed Access Group) ID for SNPN
+    pub cag_id: Option<u32>,
+    /// Slice admission control result (from NSACF)
+    pub slice_admission_granted: bool,
+    /// UE Route Selection Policy rules (from PCF)
+    pub ursp_rules: Vec<UrspPolicyRule>,
+    /// ProSe capability
+    pub prose_capable: bool,
+    /// PIN (Personal IoT Network) role
+    pub pin_role: Option<String>,
+}
+
+/// URSP policy rule for UE policy delivery (TS 24.526)
+#[derive(Debug, Clone, Default)]
+pub struct UrspPolicyRule {
+    /// Rule precedence (lower = higher priority)
+    pub precedence: u8,
+    /// Traffic descriptor (app ID or IP descriptor)
+    pub traffic_descriptor: String,
+    /// Preferred S-NSSAI SST
+    pub preferred_sst: Option<u8>,
+    /// Preferred DNN
+    pub preferred_dnn: Option<String>,
 }
 
 /// Reference to an AMF session (for PDU session status)
@@ -1684,6 +1716,13 @@ impl AmfUe {
             pending_psi: None,
             sessions: Vec::new(),
             autn: vec![0u8; OGS_AUTN_LEN],
+            redcap_indication: false,
+            snpn_nid: None,
+            cag_id: None,
+            slice_admission_granted: true,
+            ursp_rules: Vec::new(),
+            prose_capable: false,
+            pin_role: None,
         }
     }
 

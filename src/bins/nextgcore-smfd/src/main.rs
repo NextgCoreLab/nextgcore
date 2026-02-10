@@ -652,6 +652,66 @@ async fn pfcp_session_modify(
     Ok(())
 }
 
+/// Send PFCP Session Deletion Request to UPF
+async fn pfcp_session_delete(
+    upf_seid: u64,
+    upf_addr: &str,
+    upf_port: u16,
+) -> Result<()> {
+    use tokio::net::UdpSocket;
+    use std::time::Duration;
+
+    log::info!("PFCP Session Deletion: UPF SEID=0x{:016x}", upf_seid);
+
+    // PFCP Session Deletion Request has no IEs beyond the header
+    let payload: Vec<u8> = Vec::new();
+
+    // Build PFCP header with UPF SEID
+    let mut packet = Vec::with_capacity(16 + payload.len());
+    packet.push(0x21); // flags: version=1 + SEID present
+    packet.push(54);   // Session Deletion Request (message type 54)
+    let total_len = (12 + payload.len()) as u16;
+    packet.extend_from_slice(&total_len.to_be_bytes());
+    packet.extend_from_slice(&upf_seid.to_be_bytes());
+    let seq: u32 = 3;
+    packet.extend_from_slice(&seq.to_be_bytes()[1..4]);
+    packet.push(0); // spare
+    packet.extend_from_slice(&payload);
+
+    // Send via UDP
+    let socket = UdpSocket::bind("0.0.0.0:0").await
+        .context("Failed to bind PFCP client socket")?;
+    let upf_endpoint: SocketAddr = format!("{}:{}", upf_addr, upf_port).parse()
+        .context("Invalid UPF address")?;
+
+    socket.send_to(&packet, upf_endpoint).await
+        .context("Failed to send PFCP deletion to UPF")?;
+    log::info!("PFCP Session Deletion Request sent ({} bytes)", packet.len());
+
+    // Receive response with timeout
+    let mut resp_buf = vec![0u8; 4096];
+    let (resp_len, _) = tokio::time::timeout(
+        Duration::from_secs(5),
+        socket.recv_from(&mut resp_buf),
+    ).await
+        .context("PFCP deletion response timeout")?
+        .context("PFCP deletion recv error")?;
+
+    log::info!("PFCP Session Deletion Response received ({} bytes)", resp_len);
+
+    // Check response header: verify it's a Session Deletion Response (55)
+    if resp_len >= 16 {
+        let msg_type = resp_buf[1];
+        if msg_type == 55 {
+            log::info!("PFCP Session Deletion successful");
+        } else {
+            log::warn!("Unexpected PFCP deletion response type: {}", msg_type);
+        }
+    }
+
+    Ok(())
+}
+
 // =============================================================================
 // SM Context Handlers
 // =============================================================================
@@ -847,9 +907,39 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
 }
 
 /// Handle SM Context Release
+///
+/// Sends PFCP Session Deletion Request to UPF to release the N4 session,
+/// then removes session state.
 async fn handle_sm_context_release(sm_context_ref: &str) -> SbiResponse {
     log::info!("SM Context Release request for ref={}", sm_context_ref);
 
+    // Look up UPF SEID for this session
+    let upf_seid = PFCP_SESSIONS.lock().ok()
+        .and_then(|sessions| sessions.get(sm_context_ref).copied());
+
+    if let Some(seid) = upf_seid {
+        // Send PFCP Session Deletion Request to UPF
+        let upf_addr = std::env::var("UPF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let upf_port: u16 = std::env::var("UPF_PFCP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8805);
+
+        match pfcp_session_delete(seid, &upf_addr, upf_port).await {
+            Ok(()) => {
+                log::info!("PFCP Session Deleted: UPF SEID=0x{:016x} for ref={}", seid, sm_context_ref);
+            }
+            Err(e) => {
+                log::warn!("PFCP Session Deletion failed: {} (continuing with release)", e);
+            }
+        }
+
+        // Remove from PFCP sessions map
+        if let Ok(mut sessions) = PFCP_SESSIONS.lock() {
+            sessions.remove(sm_context_ref);
+        }
+    } else {
+        log::warn!("No PFCP session found for sm_context_ref={}", sm_context_ref);
+    }
+
+    // Remove from SMF context
     let ctx = smf_self();
     if let Ok(context) = ctx.read() {
         if let Some(sess) = context.sess_find_by_sm_context_ref(sm_context_ref) {

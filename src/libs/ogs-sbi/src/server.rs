@@ -127,17 +127,28 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let handler = self.handler.clone();
-        
+        let path = req.uri().path().to_string();
+
         Box::pin(async move {
+            // Health/readiness probe — handled before the NF handler
+            if path == "/health" || path == "/ready" || path == "/live" {
+                let body = Full::new(Bytes::from(r#"{"status":"healthy"}"#));
+                return Ok(Response::builder()
+                    .status(200)
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .expect("health response"));
+            }
+
             // Convert hyper request to SbiRequest
             let sbi_request = convert_request(req).await;
-            
+
             // Call the handler
             let sbi_response = handler.handle(sbi_request).await;
-            
+
             // Convert SbiResponse to hyper response
             let response = convert_response(sbi_response);
-            
+
             Ok(response)
         })
     }

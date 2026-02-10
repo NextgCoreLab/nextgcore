@@ -10,10 +10,18 @@
 #   docker compose down               # Stop all services
 
 x-common: &common
-  restart: unless-stopped
+  restart: on-failure:5
   environment: &common-env
     RUST_LOG: info
     RUST_BACKTRACE: 1
+
+x-nf-healthcheck: &nf-healthcheck
+  healthcheck:
+    test: ["CMD", "curl", "-sf", "http://localhost:7777/health"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 10s
 
 services:
   # ==========================================================================
@@ -46,7 +54,7 @@ services:
   nrf:
     image: nextgcore-rust/nrf:latest
     container_name: nextgcore-nrf
-    <<: *common
+    <<: [*common, *nf-healthcheck]
     command: ["-c", "/etc/nextgcore/nrf.yaml"]
     volumes:
       - ./configs/5gc/nrf.yaml:/etc/nextgcore/nrf.yaml:ro
@@ -62,7 +70,7 @@ services:
   ausf:
     image: nextgcore-rust/ausf:latest
     container_name: nextgcore-ausf
-    <<: *common
+    <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
       UDM_SBI_ADDR: 172.23.0.12
@@ -74,13 +82,15 @@ services:
       core:
         ipv4_address: 172.23.0.11
     depends_on:
-      - nrf
-      - udm
+      nrf:
+        condition: service_healthy
+      udm:
+        condition: service_healthy
 
   udm:
     image: nextgcore-rust/udm:latest
     container_name: nextgcore-udm
-    <<: *common
+    <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
       UDR_SBI_ADDR: 172.23.0.20
@@ -93,12 +103,13 @@ services:
       core:
         ipv4_address: 172.23.0.12
     depends_on:
-      - nrf
+      nrf:
+        condition: service_healthy
 
   udr:
     image: nextgcore-rust/udr:latest
     container_name: nextgcore-udr
-    <<: *common
+    <<: [*common, *nf-healthcheck]
     command: ["-c", "/etc/nextgcore/udr.yaml"]
     volumes:
       - ./configs/5gc/udr.yaml:/etc/nextgcore/udr.yaml:ro
@@ -106,13 +117,15 @@ services:
       core:
         ipv4_address: 172.23.0.20
     depends_on:
-      - nrf
-      - mongodb
+      nrf:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
 
   pcf:
     image: nextgcore-rust/pcf:latest
     container_name: nextgcore-pcf
-    <<: *common
+    <<: [*common, *nf-healthcheck]
     command: ["-c", "/etc/nextgcore/pcf.yaml"]
     volumes:
       - ./configs/5gc/pcf.yaml:/etc/nextgcore/pcf.yaml:ro
@@ -120,12 +133,13 @@ services:
       core:
         ipv4_address: 172.23.0.13
     depends_on:
-      - nrf
+      nrf:
+        condition: service_healthy
 
   nssf:
     image: nextgcore-rust/nssf:latest
     container_name: nextgcore-nssf
-    <<: *common
+    <<: [*common, *nf-healthcheck]
     command: ["-c", "/etc/nextgcore/nssf.yaml"]
     volumes:
       - ./configs/5gc/nssf.yaml:/etc/nextgcore/nssf.yaml:ro
@@ -133,12 +147,13 @@ services:
       core:
         ipv4_address: 172.23.0.14
     depends_on:
-      - nrf
+      nrf:
+        condition: service_healthy
 
   bsf:
     image: nextgcore-rust/bsf:latest
     container_name: nextgcore-bsf
-    <<: *common
+    <<: [*common, *nf-healthcheck]
     command: ["-c", "/etc/nextgcore/bsf.yaml"]
     volumes:
       - ./configs/5gc/bsf.yaml:/etc/nextgcore/bsf.yaml:ro
@@ -146,7 +161,8 @@ services:
       core:
         ipv4_address: 172.23.0.15
     depends_on:
-      - nrf
+      nrf:
+        condition: service_healthy
 
   # ==========================================================================
   # 5G Core - Access + Session Management
@@ -154,7 +170,7 @@ services:
   amf:
     image: nextgcore-rust/amf:latest
     container_name: nextgcore-amf
-    <<: *common
+    <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
       RUST_LOG: info,nextgcore_amfd=debug
@@ -171,16 +187,21 @@ services:
     ports:
       - "38412:38412/udp"
     depends_on:
-      - nrf
-      - ausf
-      - udm
-      - pcf
-      - nssf
+      nrf:
+        condition: service_healthy
+      ausf:
+        condition: service_healthy
+      udm:
+        condition: service_healthy
+      pcf:
+        condition: service_healthy
+      nssf:
+        condition: service_healthy
 
   smf:
     image: nextgcore-rust/smf:latest
     container_name: nextgcore-smf
-    <<: *common
+    <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
       UPF_PFCP_ADDR: 172.23.0.7
@@ -195,9 +216,12 @@ services:
     ports:
       - "8805:8805/udp"
     depends_on:
-      - nrf
-      - pcf
-      - amf
+      nrf:
+        condition: service_healthy
+      pcf:
+        condition: service_healthy
+      amf:
+        condition: service_healthy
 
   # ==========================================================================
   # 5G Core - User Plane
@@ -226,8 +250,15 @@ services:
         ipv4_address: 172.23.0.7
     ports:
       - "2152:2152/udp"
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "nextgcore-upfd"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     depends_on:
-      - smf
+      smf:
+        condition: service_healthy
 
   # ==========================================================================
   # RAN - gNB + UE Simulator
@@ -244,9 +275,17 @@ services:
     networks:
       core:
         ipv4_address: 172.23.0.100
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "nr-gnb"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
     depends_on:
-      - amf
-      - upf
+      amf:
+        condition: service_healthy
+      upf:
+        condition: service_healthy
 
   ue:
     image: nextgsim-ue:latest
@@ -264,8 +303,15 @@ services:
     networks:
       core:
         ipv4_address: 172.23.0.101
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "nr-ue"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     depends_on:
-      - gnb
+      gnb:
+        condition: service_healthy
 
 # ==========================================================================
 # Network

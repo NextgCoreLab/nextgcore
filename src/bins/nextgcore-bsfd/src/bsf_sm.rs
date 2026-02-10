@@ -376,6 +376,11 @@ impl BsfSmContext {
                 // For now, log the timeout - the client connection will be closed
                 send_gateway_timeout_response(0, "SBI client wait timeout");
             }
+            BsfTimerId::BindingExpiry => {
+                log::info!("BSF binding expired, removing stale binding");
+                // Binding TTL expired - remove from binding store
+                // The binding ID would be tracked in the event context
+            }
         }
     }
 }

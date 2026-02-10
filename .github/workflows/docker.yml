@@ -1,0 +1,77 @@
+name: Docker Build & Push
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository_owner }}/nextgcore
+
+jobs:
+  build-binaries:
+    name: Build Rust Binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build binary builder image
+        run: |
+          docker build \
+            -f docker/rust/Dockerfile.builder \
+            -t nextg-builder:latest \
+            ..
+
+      - name: Extract binaries
+        run: |
+          docker create --name builder nextg-builder:latest /bin/true
+          mkdir -p docker/rust/binaries
+          docker cp builder:/out/. docker/rust/binaries/
+          docker rm builder
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: docker/rust/binaries/
+          retention-days: 1
+
+  push-images:
+    name: Push NF Images
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        nf: [amf, ausf, bsf, nrf, nssf, pcf, smf, udm, udr, upf]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: docker/rust/binaries/
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build core image
+        run: docker build -f docker/rust/Dockerfile.core -t nextgcore-core:latest docker/rust/
+
+      - name: Build and push ${{ matrix.nf }}
+        run: |
+          TAG="${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.nf }}:${GITHUB_REF_NAME}"
+          TAG_LATEST="${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.nf }}:latest"
+          docker build \
+            -f docker/rust/Dockerfile.nf \
+            --build-arg NF_NAME=nextgcore-${{ matrix.nf }}d \
+            -t "$TAG" \
+            -t "$TAG_LATEST" \
+            docker/rust/
+          docker push "$TAG"
+          docker push "$TAG_LATEST"

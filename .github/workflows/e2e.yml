@@ -1,0 +1,43 @@
+name: E2E Test
+
+on:
+  push:
+    branches: [main, initial_commit]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    name: End-to-End Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run E2E test
+        run: |
+          cd docker/rust
+          ./e2e-test.sh
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          cd docker/rust
+          mkdir -p logs
+          for c in $(docker compose -f docker-compose.yml ps -q 2>/dev/null); do
+            name=$(docker inspect --format='{{.Name}}' "$c" | sed 's|^/||')
+            docker logs "$c" > "logs/${name}.log" 2>&1 || true
+          done
+          docker compose -f docker-compose.yml down -v --remove-orphans 2>/dev/null || true
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: docker/rust/logs/
+          retention-days: 7

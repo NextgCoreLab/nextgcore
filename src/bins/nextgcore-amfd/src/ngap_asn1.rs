@@ -692,6 +692,83 @@ pub fn build_pdu_session_resource_setup_request_asn1(
     }
 }
 
+/// Build a PDU Session Resource Release Command with proper ASN.1 APER encoding
+///
+/// Sent by AMF to gNB to release PDU session resources.
+pub fn build_pdu_session_resource_release_command_asn1(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    pdu_session_ids: &[u8],
+) -> Option<Vec<u8>> {
+    let mut protocol_ies = Vec::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory)
+    protocol_ies.push(PDUSessionResourceReleaseCommandProtocolIEs_Entry {
+        id: ProtocolIE_ID(ID_AMF_UE_NGAP_ID),
+        criticality: Criticality(Criticality::REJECT),
+        value: PDUSessionResourceReleaseCommandProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(
+            AMF_UE_NGAP_ID(amf_ue_ngap_id),
+        ),
+    });
+
+    // IE: RAN-UE-NGAP-ID (mandatory)
+    protocol_ies.push(PDUSessionResourceReleaseCommandProtocolIEs_Entry {
+        id: ProtocolIE_ID(ID_RAN_UE_NGAP_ID),
+        criticality: Criticality(Criticality::REJECT),
+        value: PDUSessionResourceReleaseCommandProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(
+            RAN_UE_NGAP_ID(ran_ue_ngap_id),
+        ),
+    });
+
+    // IE: PDUSessionResourceToReleaseListRelCmd (mandatory)
+    let release_items: Vec<PDUSessionResourceToReleaseItemRelCmd> = pdu_session_ids
+        .iter()
+        .map(|&psi| PDUSessionResourceToReleaseItemRelCmd {
+            pdu_session_id: PDUSessionID(psi),
+            pdu_session_resource_release_command_transfer:
+                PDUSessionResourceToReleaseItemRelCmdPDUSessionResourceReleaseCommandTransfer(
+                    vec![], // empty transfer for simple release
+                ),
+            ie_extensions: None,
+        })
+        .collect();
+
+    let release_list = PDUSessionResourceToReleaseListRelCmd(release_items);
+    protocol_ies.push(PDUSessionResourceReleaseCommandProtocolIEs_Entry {
+        id: ProtocolIE_ID(ID_PDU_SESSION_RESOURCE_TO_RELEASE_LIST_REL_CMD),
+        criticality: Criticality(Criticality::REJECT),
+        value: PDUSessionResourceReleaseCommandProtocolIEs_EntryValue::Id_PDUSessionResourceToReleaseListRelCmd(
+            release_list,
+        ),
+    });
+
+    let command = PDUSessionResourceReleaseCommand {
+        protocol_i_es: PDUSessionResourceReleaseCommandProtocolIEs(protocol_ies),
+    };
+
+    let initiating_message = InitiatingMessage {
+        procedure_code: ProcedureCode(ID_PDU_SESSION_RESOURCE_RELEASE),
+        criticality: Criticality(Criticality::REJECT),
+        value: InitiatingMessageValue::Id_PDUSessionResourceRelease(command),
+    };
+
+    let pdu = NGAP_PDU::InitiatingMessage(initiating_message);
+
+    match encode_ngap_pdu(&pdu) {
+        Ok(bytes) => {
+            log::debug!(
+                "Built PDU Session Resource Release Command: {} bytes, amf_ue_ngap_id={}, psi_count={}",
+                bytes.len(), amf_ue_ngap_id, pdu_session_ids.len()
+            );
+            Some(bytes)
+        }
+        Err(e) => {
+            log::error!("Failed to encode PDU Session Resource Release Command: {:?}", e);
+            None
+        }
+    }
+}
+
 /// Parsed Uplink NAS Transport data
 #[derive(Debug, Clone)]
 pub struct UplinkNasTransportData {
@@ -764,6 +841,52 @@ pub fn parse_uplink_nas_transport_asn1(data: &[u8]) -> Option<UplinkNasTransport
         ran_ue_ngap_id,
         nas_pdu,
     })
+}
+
+/// Build a Paging message with proper ASN.1 APER encoding
+///
+/// Sent by AMF to gNBs to page a UE in CM-IDLE state.
+/// The message follows 3GPP TS 38.413 Section 8.7.2.
+pub fn build_paging_asn1(
+    amf_set_id: u16,
+    amf_pointer: u8,
+    tmsi: u32,
+    plmn_id: &crate::context::PlmnId,
+    tac: u32,
+) -> Option<Vec<u8>> {
+    use nextgsim_ngap::procedures::paging::*;
+    use nextgsim_ngap::procedures::initial_ue_message::{FiveGSTmsi, Tai};
+
+    let plmn_bytes = encode_plmn_id(plmn_id);
+
+    let params = PagingParams {
+        ue_paging_identity: UePagingIdentityValue::FiveGSTmsi(FiveGSTmsi {
+            amf_set_id,
+            amf_pointer,
+            five_g_tmsi: tmsi.to_be_bytes(),
+        }),
+        tai_list_for_paging: vec![Tai {
+            plmn_identity: plmn_bytes,
+            tac: [(tac >> 16) as u8, (tac >> 8) as u8, tac as u8],
+        }],
+        paging_drx: None,
+        paging_priority: None,
+        paging_origin: None,
+    };
+
+    match encode_paging(&params) {
+        Ok(bytes) => {
+            log::debug!(
+                "Built Paging: {} bytes, amf_set_id={}, tmsi=0x{:08x}, tac={}",
+                bytes.len(), amf_set_id, tmsi, tac
+            );
+            Some(bytes)
+        }
+        Err(e) => {
+            log::error!("Failed to encode Paging: {:?}", e);
+            None
+        }
+    }
 }
 
 #[cfg(test)]

@@ -707,6 +707,14 @@ pub struct SmfSess {
     pub n2_released: bool,
     /// Establishment accept sent flag
     pub establishment_accept_sent: bool,
+
+    // Rel-17 Fields
+    /// MBS session flag (Multicast/Broadcast Service, TS 23.247)
+    pub is_mbs_session: bool,
+    /// MBS session ID (if MBS)
+    pub mbs_session_id: Option<String>,
+    /// RedCap UE flag (reduced QoS for RedCap devices)
+    pub is_redcap_ue: bool,
 }
 
 impl SmfSess {
@@ -788,6 +796,9 @@ impl SmfSess {
             n1_released: false,
             n2_released: false,
             establishment_accept_sent: false,
+            is_mbs_session: false,
+            mbs_session_id: None,
+            is_redcap_ue: false,
         }
     }
 
