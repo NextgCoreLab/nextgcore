@@ -1,0 +1,22 @@
+# Item 126: Helm chart for NextGCore 5G Core
+apiVersion: v2
+name: nextgcore
+description: NextGCore 5G Core Network Functions
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - 5g
+  - core-network
+  - nextgcore
+  - 3gpp
+home: https://github.com/nextgsim/nextgcore
+sources:
+  - https://github.com/nextgsim/nextgcore
+maintainers:
+  - name: NextGCore Contributors
+dependencies:
+  - name: mongodb
+    version: "14.x.x"
+    repository: https://charts.bitnami.com/bitnami
+    condition: mongodb.enabled

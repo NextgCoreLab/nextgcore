@@ -313,6 +313,80 @@ services:
       gnb:
         condition: service_healthy
 
+  # ==========================================================================
+  # Observability (Items 120-123)
+  # ==========================================================================
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    container_name: nextgcore-prometheus
+    <<: *common
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./configs/observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./configs/observability/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      core:
+        ipv4_address: 172.23.0.200
+    ports:
+      - "9090:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--tries=1", "-O", "/dev/null", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: nextgcore-grafana
+    <<: *common
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: nextgcore
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/overview.json
+    volumes:
+      - ./configs/observability/grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ./configs/observability/grafana-dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+      - ./configs/observability/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    networks:
+      core:
+        ipv4_address: 172.23.0.201
+    ports:
+      - "3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--tries=1", "-O", "/dev/null", "http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.55
+    container_name: nextgcore-jaeger
+    <<: *common
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    networks:
+      core:
+        ipv4_address: 172.23.0.202
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC
+      - "4318:4318"     # OTLP HTTP
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--tries=1", "-O", "/dev/null", "http://localhost:14269/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
 # ==========================================================================
 # Network
 # ==========================================================================
@@ -326,3 +400,5 @@ networks:
 
 volumes:
   mongodb_data:
+  prometheus_data:
+  grafana_data:

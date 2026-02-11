@@ -1,0 +1,171 @@
+# Default values for NextGCore 5G Core Helm chart
+# Item 126: Helm charts from K8s YAML manifests
+
+global:
+  image:
+    registry: ""
+    pullPolicy: IfNotPresent
+  sbi:
+    scheme: http
+    port: 7777
+
+# MongoDB
+mongodb:
+  enabled: true
+  auth:
+    enabled: false
+  persistence:
+    size: 8Gi
+
+# NRF - Network Repository Function
+nrf:
+  enabled: true
+  replicas: 1
+  image:
+    repository: nextgcore-rust/nrf
+    tag: latest
+  service:
+    type: ClusterIP
+    port: 7777
+  metrics:
+    enabled: true
+    port: 9090
+  config: {}
+
+# AMF - Access and Mobility Management Function
+amf:
+  enabled: true
+  replicas: 1
+  image:
+    repository: nextgcore-rust/amf
+    tag: latest
+  service:
+    type: ClusterIP
+    sbiPort: 7777
+    ngapPort: 38412
+  ngap:
+    nodePort: null  # Set for NodePort service
+  metrics:
+    enabled: true
+    port: 9090
+  config:
+    plmn:
+      mcc: "999"
+      mnc: "70"
+    guami:
+      amfId: "cafe00"
+    tai:
+      tac: 1
+    nssai:
+      - sst: 1
+
+# SMF - Session Management Function
+smf:
+  enabled: true
+  replicas: 1
+  image:
+    repository: nextgcore-rust/smf
+    tag: latest
+  service:
+    type: ClusterIP
+    sbiPort: 7777
+    pfcpPort: 8805
+  metrics:
+    enabled: true
+    port: 9090
+  config:
+    subnet: "10.45.0.0/16"
+    dnn: "internet"
+
+# UPF - User Plane Function
+upf:
+  enabled: true
+  replicas: 1
+  image:
+    repository: nextgcore-rust/upf
+    tag: latest
+  service:
+    type: ClusterIP
+    pfcpPort: 8805
+    gtpuPort: 2152
+  securityContext:
+    privileged: true
+    capabilities:
+      add: ["NET_ADMIN", "SYS_ADMIN"]
+  config:
+    tunIp: "10.45.0.1"
+    tunPrefix: 16
+
+# AUSF - Authentication Server Function
+ausf:
+  enabled: true
+  replicas: 1
+  image:
+    repository: nextgcore-rust/ausf
+    tag: latest
+  service:
+    type: ClusterIP
+    port: 7777
+
+# UDM - Unified Data Management
+udm:
+  enabled: true
+  replicas: 1
+  image:
+    repository: nextgcore-rust/udm
+    tag: latest
+  service:
+    type: ClusterIP
+    port: 7777
+
+# UDR - Unified Data Repository
+udr:
+  enabled: true
+  replicas: 1
+  image:
+    repository: nextgcore-rust/udr
+    tag: latest
+  service:
+    type: ClusterIP
+    port: 7777
+
+# PCF - Policy Control Function
+pcf:
+  enabled: true
+  replicas: 1
+  image:
+    repository: nextgcore-rust/pcf
+    tag: latest
+  service:
+    type: ClusterIP
+    port: 7777
+
+# NSSF - Network Slice Selection Function
+nssf:
+  enabled: true
+  replicas: 1
+  image:
+    repository: nextgcore-rust/nssf
+    tag: latest
+  service:
+    type: ClusterIP
+    port: 7777
+
+# BSF - Binding Support Function
+bsf:
+  enabled: true
+  replicas: 1
+  image:
+    repository: nextgcore-rust/bsf
+    tag: latest
+  service:
+    type: ClusterIP
+    port: 7777
+
+# Observability
+prometheus:
+  enabled: false
+grafana:
+  enabled: false
+jaeger:
+  enabled: false

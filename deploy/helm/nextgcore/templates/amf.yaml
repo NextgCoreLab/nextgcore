@@ -1,0 +1,86 @@
+{{- if .Values.amf.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-amf
+  labels:
+    app.kubernetes.io/name: amf
+    app.kubernetes.io/instance: {{ .Release.Name }}-amf
+    app.kubernetes.io/component: control-plane
+    {{- include "nextgcore.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.amf.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: amf
+      app.kubernetes.io/instance: {{ .Release.Name }}-amf
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: amf
+        app.kubernetes.io/instance: {{ .Release.Name }}-amf
+    spec:
+      containers:
+        - name: amf
+          image: {{ .Values.amf.image.repository }}:{{ .Values.amf.image.tag }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          ports:
+            - name: sbi
+              containerPort: {{ .Values.amf.service.sbiPort }}
+              protocol: TCP
+            - name: ngap
+              containerPort: {{ .Values.amf.service.ngapPort }}
+              protocol: SCTP
+            {{- if .Values.amf.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.amf.metrics.port }}
+              protocol: TCP
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: sbi
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: sbi
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          env:
+            - name: RUST_LOG
+              value: info,nextgcore_amfd=debug
+            - name: NRF_SBI_ADDR
+              value: {{ .Release.Name }}-nrf
+            - name: NRF_SBI_PORT
+              value: "{{ .Values.global.sbi.port }}"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-amf
+  labels:
+    app.kubernetes.io/name: amf
+    {{- include "nextgcore.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.amf.service.type }}
+  ports:
+    - port: {{ .Values.amf.service.sbiPort }}
+      targetPort: sbi
+      protocol: TCP
+      name: sbi
+    - port: {{ .Values.amf.service.ngapPort }}
+      targetPort: ngap
+      protocol: SCTP
+      name: ngap
+    {{- if .Values.amf.metrics.enabled }}
+    - port: {{ .Values.amf.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+    {{- end }}
+  selector:
+    app.kubernetes.io/name: amf
+    app.kubernetes.io/instance: {{ .Release.Name }}-amf
+{{- end }}

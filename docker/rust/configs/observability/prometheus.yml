@@ -1,0 +1,87 @@
+# Prometheus configuration for NextGCore 5G Core
+# Item 120: Prometheus + Grafana in Docker Compose
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+rule_files:
+  - "alert-rules.yml"
+
+scrape_configs:
+  # 5G Core NFs - SBI health + metrics endpoints
+  - job_name: "nextgcore-nrf"
+    static_configs:
+      - targets: ["172.23.0.10:9090"]
+        labels:
+          nf_type: "NRF"
+          instance_name: "nrf-1"
+
+  - job_name: "nextgcore-ausf"
+    static_configs:
+      - targets: ["172.23.0.11:9090"]
+        labels:
+          nf_type: "AUSF"
+          instance_name: "ausf-1"
+
+  - job_name: "nextgcore-udm"
+    static_configs:
+      - targets: ["172.23.0.12:9090"]
+        labels:
+          nf_type: "UDM"
+          instance_name: "udm-1"
+
+  - job_name: "nextgcore-udr"
+    static_configs:
+      - targets: ["172.23.0.20:9090"]
+        labels:
+          nf_type: "UDR"
+          instance_name: "udr-1"
+
+  - job_name: "nextgcore-pcf"
+    static_configs:
+      - targets: ["172.23.0.13:9090"]
+        labels:
+          nf_type: "PCF"
+          instance_name: "pcf-1"
+
+  - job_name: "nextgcore-nssf"
+    static_configs:
+      - targets: ["172.23.0.14:9090"]
+        labels:
+          nf_type: "NSSF"
+          instance_name: "nssf-1"
+
+  - job_name: "nextgcore-bsf"
+    static_configs:
+      - targets: ["172.23.0.15:9090"]
+        labels:
+          nf_type: "BSF"
+          instance_name: "bsf-1"
+
+  - job_name: "nextgcore-amf"
+    static_configs:
+      - targets: ["172.23.0.5:9090"]
+        labels:
+          nf_type: "AMF"
+          instance_name: "amf-1"
+
+  - job_name: "nextgcore-smf"
+    static_configs:
+      - targets: ["172.23.0.4:9090"]
+        labels:
+          nf_type: "SMF"
+          instance_name: "smf-1"
+
+  - job_name: "nextgcore-upf"
+    static_configs:
+      - targets: ["172.23.0.7:9090"]
+        labels:
+          nf_type: "UPF"
+          instance_name: "upf-1"
+
+  # Prometheus self-monitoring
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]

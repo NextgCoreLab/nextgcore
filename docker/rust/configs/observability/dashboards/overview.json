@@ -1,0 +1,252 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "NF Health Status",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "count(up{job=~\"nextgcore-.*\"} == 1)",
+          "legendFormat": "Healthy NFs"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "value": 0, "color": "red" },
+              { "value": 5, "color": "yellow" },
+              { "value": 8, "color": "green" }
+            ]
+          },
+          "unit": "none"
+        }
+      }
+    },
+    {
+      "title": "NF Instance Status",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        {
+          "expr": "up{job=~\"nextgcore-.*\"}",
+          "format": "table",
+          "instant": true
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "includeByName": { "nf_type": true, "instance_name": true, "Value": true },
+            "renameByName": { "nf_type": "NF Type", "instance_name": "Instance", "Value": "Status" }
+          }
+        }
+      ]
+    },
+    {
+      "title": "Scrape Duration by NF",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        {
+          "expr": "scrape_duration_seconds{job=~\"nextgcore-.*\"}",
+          "legendFormat": "{{ nf_type }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        }
+      }
+    },
+    {
+      "title": "AMF - Connected UEs",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "expr": "amf_connected_ue_count",
+          "legendFormat": "Connected UEs"
+        },
+        {
+          "expr": "amf_registered_ue_count",
+          "legendFormat": "Registered UEs"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "none", "custom": { "lineWidth": 2, "fillOpacity": 20 } }
+      }
+    },
+    {
+      "title": "AMF - Registration Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 12 },
+      "targets": [
+        {
+          "expr": "rate(amf_registration_success_total[5m])",
+          "legendFormat": "Success/s"
+        },
+        {
+          "expr": "rate(amf_registration_failure_total[5m])",
+          "legendFormat": "Failure/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "lineWidth": 2 } }
+      }
+    },
+    {
+      "title": "AMF - Auth Success/Failure",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 12 },
+      "targets": [
+        {
+          "expr": "rate(amf_auth_success_total[5m])",
+          "legendFormat": "Auth Success/s"
+        },
+        {
+          "expr": "rate(amf_auth_failure_total[5m])",
+          "legendFormat": "Auth Failure/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "lineWidth": 2 } }
+      }
+    },
+    {
+      "title": "SMF - Active PDU Sessions",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
+      "targets": [
+        {
+          "expr": "smf_active_pdu_sessions",
+          "legendFormat": "Active Sessions"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "none", "custom": { "lineWidth": 2, "fillOpacity": 20 } }
+      }
+    },
+    {
+      "title": "SMF - Session Create Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
+      "targets": [
+        {
+          "expr": "rate(smf_session_success_total[5m])",
+          "legendFormat": "Success/s"
+        },
+        {
+          "expr": "rate(smf_session_failure_total[5m])",
+          "legendFormat": "Failure/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "lineWidth": 2 } }
+      }
+    },
+    {
+      "title": "UPF - Packet Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
+      "targets": [
+        {
+          "expr": "rate(upf_packets_total{direction=\"uplink\"}[5m])",
+          "legendFormat": "Uplink pps"
+        },
+        {
+          "expr": "rate(upf_packets_total{direction=\"downlink\"}[5m])",
+          "legendFormat": "Downlink pps"
+        },
+        {
+          "expr": "rate(upf_packets_dropped_total[5m])",
+          "legendFormat": "Dropped pps"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "pps", "custom": { "lineWidth": 2 } }
+      }
+    },
+    {
+      "title": "UPF - Throughput",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "targets": [
+        {
+          "expr": "rate(upf_bytes_total{direction=\"uplink\"}[5m]) * 8",
+          "legendFormat": "Uplink bps"
+        },
+        {
+          "expr": "rate(upf_bytes_total{direction=\"downlink\"}[5m]) * 8",
+          "legendFormat": "Downlink bps"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bps", "custom": { "lineWidth": 2, "fillOpacity": 15 } }
+      }
+    },
+    {
+      "title": "NRF - Registered NFs / Discovery",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "targets": [
+        {
+          "expr": "nrf_registered_nf_count",
+          "legendFormat": "Registered NFs"
+        },
+        {
+          "expr": "rate(nrf_discovery_success_total[5m])",
+          "legendFormat": "Discovery/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "none", "custom": { "lineWidth": 2 } }
+      }
+    },
+    {
+      "title": "Per-NF Memory Usage",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
+      "targets": [
+        {
+          "expr": "process_resident_memory_bytes{job=~\"nextgcore-.*\"}",
+          "legendFormat": "{{ nf_type }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "bytes", "custom": { "lineWidth": 2 } }
+      }
+    },
+    {
+      "title": "Per-NF CPU Usage",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 36 },
+      "targets": [
+        {
+          "expr": "rate(process_cpu_seconds_total{job=~\"nextgcore-.*\"}[5m])",
+          "legendFormat": "{{ nf_type }}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "percentunit", "custom": { "lineWidth": 2 } }
+      }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["nextgcore", "5g-core"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "NextGCore 5G Core Overview",
+  "uid": "nextgcore-overview",
+  "version": 1
+}

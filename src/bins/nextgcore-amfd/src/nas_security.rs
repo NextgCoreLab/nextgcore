@@ -576,6 +576,57 @@ pub fn select_integrity_algorithm_with_pqc(
     }
 }
 
+/// NAS ciphering enforcement policy (Item 118)
+///
+/// Controls whether null algorithms (NEA0/NIA0) are accepted.
+/// Per 3GPP TS 33.501 §6.7.2, null integrity (NIA0) SHALL NOT be used
+/// for NAS signaling in production. Null ciphering (NEA0) MAY be used
+/// in limited contexts but is strongly discouraged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NasCipheringPolicy {
+    /// Allow null algorithms (development/testing only)
+    AllowNull,
+    /// Reject null integrity but allow null ciphering (TS 33.501 minimum)
+    RejectNullIntegrity,
+    /// Reject all null algorithms (recommended for production)
+    RejectAllNull,
+}
+
+impl Default for NasCipheringPolicy {
+    fn default() -> Self {
+        NasCipheringPolicy::RejectNullIntegrity
+    }
+}
+
+/// Validate selected algorithms against the ciphering policy
+///
+/// Returns Ok(()) if the algorithms are acceptable, Err with reason if not.
+pub fn validate_algorithm_policy(
+    enc_algorithm: u8,
+    int_algorithm: u8,
+    policy: NasCipheringPolicy,
+) -> Result<(), &'static str> {
+    match policy {
+        NasCipheringPolicy::AllowNull => Ok(()),
+        NasCipheringPolicy::RejectNullIntegrity => {
+            if int_algorithm == 0 {
+                Err("NIA0 (null integrity) rejected by security policy (TS 33.501 §6.7.2)")
+            } else {
+                Ok(())
+            }
+        }
+        NasCipheringPolicy::RejectAllNull => {
+            if int_algorithm == 0 {
+                Err("NIA0 (null integrity) rejected by security policy")
+            } else if enc_algorithm == 0 {
+                Err("NEA0 (null ciphering) rejected by security policy")
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Select security algorithms for UE
 ///
 /// This is called during security mode command to select algorithms
@@ -583,6 +634,21 @@ pub fn select_security_algorithms(
     amf_ue: &mut AmfUe,
     ue_security_capability: &SecurityAlgorithmSet,
     amf_supported: &SecurityAlgorithmSet,
+) {
+    select_security_algorithms_with_policy(
+        amf_ue,
+        ue_security_capability,
+        amf_supported,
+        NasCipheringPolicy::default(),
+    );
+}
+
+/// Select security algorithms for UE with ciphering policy enforcement
+pub fn select_security_algorithms_with_policy(
+    amf_ue: &mut AmfUe,
+    ue_security_capability: &SecurityAlgorithmSet,
+    amf_supported: &SecurityAlgorithmSet,
+    policy: NasCipheringPolicy,
 ) {
     // Select encryption algorithm
     let selected_enc = select_encryption_algorithm(
@@ -598,13 +664,45 @@ pub fn select_security_algorithms(
     );
     amf_ue.selected_int_algorithm = selected_int;
 
+    // Enforce ciphering policy
+    if let Err(reason) = validate_algorithm_policy(selected_enc, selected_int, policy) {
+        log::warn!(
+            "[{}] NAS algorithm policy violation: {} (enc={}, int={})",
+            amf_ue.supi.as_deref().unwrap_or("unknown"),
+            reason,
+            get_encryption_algorithm_name(selected_enc),
+            get_integrity_algorithm_name(selected_int),
+        );
+
+        // Force to strongest available non-null algorithms
+        if selected_int == 0
+            && matches!(
+                policy,
+                NasCipheringPolicy::RejectNullIntegrity | NasCipheringPolicy::RejectAllNull
+            )
+        {
+            amf_ue.selected_int_algorithm = 2; // Force NIA2 (AES-CMAC)
+            log::info!(
+                "[{}] Forced integrity algorithm to NIA2 (AES-CMAC)",
+                amf_ue.supi.as_deref().unwrap_or("unknown"),
+            );
+        }
+        if selected_enc == 0 && policy == NasCipheringPolicy::RejectAllNull {
+            amf_ue.selected_enc_algorithm = 2; // Force NEA2 (AES-CTR)
+            log::info!(
+                "[{}] Forced encryption algorithm to NEA2 (AES-CTR)",
+                amf_ue.supi.as_deref().unwrap_or("unknown"),
+            );
+        }
+    }
+
     log::info!(
         "[{}] Selected security algorithms: enc={}EA{}, int={}IA{}",
         amf_ue.supi.as_deref().unwrap_or("unknown"),
-        if selected_enc == 0 { "N" } else { "1" },
-        selected_enc,
-        if selected_int == 0 { "N" } else { "1" },
-        selected_int
+        if amf_ue.selected_enc_algorithm == 0 { "N" } else { "1" },
+        amf_ue.selected_enc_algorithm,
+        if amf_ue.selected_int_algorithm == 0 { "N" } else { "1" },
+        amf_ue.selected_int_algorithm
     );
 }
 
@@ -963,5 +1061,87 @@ mod tests {
         assert_eq!(get_integrity_algorithm_name(1), "128-NIA1");
         assert_eq!(get_integrity_algorithm_name(2), "128-NIA2");
         assert_eq!(get_integrity_algorithm_name(3), "128-NIA3");
+    }
+
+    // ======================================================================
+    // NAS Ciphering Enforcement (Item 118)
+    // ======================================================================
+
+    #[test]
+    fn test_validate_algorithm_policy_allow_null() {
+        assert!(validate_algorithm_policy(0, 0, NasCipheringPolicy::AllowNull).is_ok());
+        assert!(validate_algorithm_policy(2, 2, NasCipheringPolicy::AllowNull).is_ok());
+    }
+
+    #[test]
+    fn test_validate_algorithm_policy_reject_null_integrity() {
+        // NIA0 should be rejected
+        assert!(validate_algorithm_policy(2, 0, NasCipheringPolicy::RejectNullIntegrity).is_err());
+        // NEA0 is OK (only integrity null is rejected)
+        assert!(validate_algorithm_policy(0, 2, NasCipheringPolicy::RejectNullIntegrity).is_ok());
+        // Both non-null OK
+        assert!(validate_algorithm_policy(2, 2, NasCipheringPolicy::RejectNullIntegrity).is_ok());
+    }
+
+    #[test]
+    fn test_validate_algorithm_policy_reject_all_null() {
+        assert!(validate_algorithm_policy(0, 2, NasCipheringPolicy::RejectAllNull).is_err());
+        assert!(validate_algorithm_policy(2, 0, NasCipheringPolicy::RejectAllNull).is_err());
+        assert!(validate_algorithm_policy(0, 0, NasCipheringPolicy::RejectAllNull).is_err());
+        assert!(validate_algorithm_policy(2, 2, NasCipheringPolicy::RejectAllNull).is_ok());
+    }
+
+    #[test]
+    fn test_select_algorithms_with_policy_forces_non_null() {
+        let mut ue = create_test_ue();
+        let ue_capability = SecurityAlgorithmSet {
+            encryption: 0b0001, // Only NEA0
+            integrity: 0b0001,  // Only NIA0
+        };
+        let amf_capability = SecurityAlgorithmSet {
+            encryption: 0b0001,
+            integrity: 0b0001,
+        };
+
+        select_security_algorithms_with_policy(
+            &mut ue,
+            &ue_capability,
+            &amf_capability,
+            NasCipheringPolicy::RejectNullIntegrity,
+        );
+
+        // Integrity should be forced to NIA2
+        assert_eq!(ue.selected_int_algorithm, 2);
+        // Encryption can stay NEA0 (only null integrity rejected)
+        assert_eq!(ue.selected_enc_algorithm, 0);
+    }
+
+    #[test]
+    fn test_select_algorithms_with_policy_reject_all() {
+        let mut ue = create_test_ue();
+        let ue_capability = SecurityAlgorithmSet {
+            encryption: 0b0001,
+            integrity: 0b0001,
+        };
+        let amf_capability = SecurityAlgorithmSet {
+            encryption: 0b0001,
+            integrity: 0b0001,
+        };
+
+        select_security_algorithms_with_policy(
+            &mut ue,
+            &ue_capability,
+            &amf_capability,
+            NasCipheringPolicy::RejectAllNull,
+        );
+
+        // Both should be forced to algorithm 2
+        assert_eq!(ue.selected_enc_algorithm, 2);
+        assert_eq!(ue.selected_int_algorithm, 2);
+    }
+
+    #[test]
+    fn test_default_policy_is_reject_null_integrity() {
+        assert_eq!(NasCipheringPolicy::default(), NasCipheringPolicy::RejectNullIntegrity);
     }
 }

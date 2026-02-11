@@ -1,0 +1,75 @@
+{{- if .Values.nrf.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-nrf
+  labels:
+    app.kubernetes.io/name: nrf
+    app.kubernetes.io/instance: {{ .Release.Name }}-nrf
+    app.kubernetes.io/component: control-plane
+    {{- include "nextgcore.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.nrf.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nrf
+      app.kubernetes.io/instance: {{ .Release.Name }}-nrf
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nrf
+        app.kubernetes.io/instance: {{ .Release.Name }}-nrf
+    spec:
+      containers:
+        - name: nrf
+          image: {{ .Values.nrf.image.repository }}:{{ .Values.nrf.image.tag }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          ports:
+            - name: sbi
+              containerPort: {{ .Values.nrf.service.port }}
+              protocol: TCP
+            {{- if .Values.nrf.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.nrf.metrics.port }}
+              protocol: TCP
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: sbi
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: sbi
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          env:
+            - name: RUST_LOG
+              value: info
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-nrf
+  labels:
+    app.kubernetes.io/name: nrf
+    {{- include "nextgcore.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.nrf.service.type }}
+  ports:
+    - port: {{ .Values.nrf.service.port }}
+      targetPort: sbi
+      protocol: TCP
+      name: sbi
+    {{- if .Values.nrf.metrics.enabled }}
+    - port: {{ .Values.nrf.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+    {{- end }}
+  selector:
+    app.kubernetes.io/name: nrf
+    app.kubernetes.io/instance: {{ .Release.Name }}-nrf
+{{- end }}

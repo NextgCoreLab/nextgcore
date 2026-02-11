@@ -1,0 +1,13 @@
+# Grafana dashboard provisioning for NextGCore
+apiVersion: 1
+
+providers:
+  - name: "NextGCore"
+    orgId: 1
+    folder: "NextGCore 5G Core"
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
