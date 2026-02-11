@@ -581,3 +581,189 @@ impl PduAddress {
         Ok(Self { pdu_session_type, address })
     }
 }
+
+// ============================================================================
+// 6G Extension IEs (Rel-20)
+// ============================================================================
+
+/// AI/ML Capability IE (6G extension)
+///
+/// Indicates the UE's AI/ML capabilities for 6G systems.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AiMlCapability {
+    /// AI/ML capability flags (FL, inference, training, beam mgmt, CSI, positioning)
+    pub capability_flags: u8,
+    /// Maximum model size supported (in KB)
+    pub max_model_size_kb: u16,
+}
+
+impl AiMlCapability {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(3); // length
+        buf.put_u8(self.capability_flags);
+        buf.put_u16(self.max_model_size_kb);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 4 {
+            return Err(NasError::BufferTooShort { expected: 4, actual: buf.remaining() });
+        }
+        let length = buf.get_u8() as usize;
+        let capability_flags = buf.get_u8();
+        let max_model_size_kb = buf.get_u16();
+        if length > 3 { buf.advance(length - 3); }
+        Ok(Self { capability_flags, max_model_size_kb })
+    }
+}
+
+/// ISAC (Integrated Sensing and Communication) Parameter IE (6G extension)
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IsacParameter {
+    /// Mode flags (monostatic, bistatic, comm-assisted, sensing-assisted)
+    pub mode_flags: u8,
+    /// Sensing resolution
+    pub sensing_resolution: u8,
+    /// Maximum sensing range
+    pub max_sensing_range: u8,
+}
+
+impl IsacParameter {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(3);
+        buf.put_u8(self.mode_flags);
+        buf.put_u8(self.sensing_resolution);
+        buf.put_u8(self.max_sensing_range);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 4 {
+            return Err(NasError::BufferTooShort { expected: 4, actual: buf.remaining() });
+        }
+        let length = buf.get_u8() as usize;
+        let mode_flags = buf.get_u8();
+        let sensing_resolution = buf.get_u8();
+        let max_sensing_range = buf.get_u8();
+        if length > 3 { buf.advance(length - 3); }
+        Ok(Self { mode_flags, sensing_resolution, max_sensing_range })
+    }
+}
+
+/// Semantic Communication Parameter IE (6G extension)
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SemanticCommParameter {
+    /// Capability flags (extraction, encoding, decoding, task-oriented)
+    pub capability_flags: u8,
+    /// Supported semantic codec type
+    pub codec_type: u8,
+}
+
+impl SemanticCommParameter {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(2);
+        buf.put_u8(self.capability_flags);
+        buf.put_u8(self.codec_type);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 3 {
+            return Err(NasError::BufferTooShort { expected: 3, actual: buf.remaining() });
+        }
+        let length = buf.get_u8() as usize;
+        let capability_flags = buf.get_u8();
+        let codec_type = buf.get_u8();
+        if length > 2 { buf.advance(length - 2); }
+        Ok(Self { capability_flags, codec_type })
+    }
+}
+
+/// Sub-THz Band Parameter IE (6G extension)
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SubThzBandParameter {
+    /// Supported sub-THz band flags (100-200 GHz, 200-300 GHz, 300-450 GHz)
+    pub band_flags: u8,
+    /// Maximum supported bandwidth in MHz
+    pub max_bandwidth_mhz: u16,
+    /// Minimum beam tracking interval in ms
+    pub beam_tracking_interval_ms: u8,
+}
+
+impl SubThzBandParameter {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(4);
+        buf.put_u8(self.band_flags);
+        buf.put_u16(self.max_bandwidth_mhz);
+        buf.put_u8(self.beam_tracking_interval_ms);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 5 {
+            return Err(NasError::BufferTooShort { expected: 5, actual: buf.remaining() });
+        }
+        let length = buf.get_u8() as usize;
+        let band_flags = buf.get_u8();
+        let max_bandwidth_mhz = buf.get_u16();
+        let beam_tracking_interval_ms = buf.get_u8();
+        if length > 4 { buf.advance(length - 4); }
+        Ok(Self { band_flags, max_bandwidth_mhz, beam_tracking_interval_ms })
+    }
+}
+
+/// NTN Timing Advance IE (6G extension)
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NtnTimingAdvance {
+    /// Timing advance value (in units of 0.5 microseconds)
+    pub timing_advance: u32,
+    /// UE-specific timing advance valid flag
+    pub ta_valid: bool,
+}
+
+impl NtnTimingAdvance {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(5);
+        buf.put_u32(self.timing_advance);
+        buf.put_u8(if self.ta_valid { 0x01 } else { 0x00 });
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 6 {
+            return Err(NasError::BufferTooShort { expected: 6, actual: buf.remaining() });
+        }
+        let length = buf.get_u8() as usize;
+        let timing_advance = buf.get_u32();
+        let flags = buf.get_u8();
+        if length > 5 { buf.advance(length - 5); }
+        Ok(Self { timing_advance, ta_valid: (flags & 0x01) != 0 })
+    }
+}
+
+/// NTN Access Barring IE (6G extension)
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct NtnAccessBarring {
+    /// Access barring factor (0-100, percentage)
+    pub barring_factor: u8,
+    /// Access barring time in seconds
+    pub barring_time_seconds: u16,
+    /// Access class barring flags
+    pub ac_barring_flags: u16,
+}
+
+impl NtnAccessBarring {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(5);
+        buf.put_u8(self.barring_factor);
+        buf.put_u16(self.barring_time_seconds);
+        buf.put_u16(self.ac_barring_flags);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 6 {
+            return Err(NasError::BufferTooShort { expected: 6, actual: buf.remaining() });
+        }
+        let length = buf.get_u8() as usize;
+        let barring_factor = buf.get_u8();
+        let barring_time_seconds = buf.get_u16();
+        let ac_barring_flags = buf.get_u16();
+        if length > 5 { buf.advance(length - 5); }
+        Ok(Self { barring_factor, barring_time_seconds, ac_barring_flags })
+    }
+}

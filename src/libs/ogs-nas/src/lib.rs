@@ -120,6 +120,13 @@ pub mod prelude {
         FiveGsmStatus,
         build_5gsm_message,
         parse_5gsm_message,
+        // 6G extension IEs
+        AiMlCapability,
+        IsacParameter,
+        SemanticCommParameter,
+        SubThzBandParameter,
+        NtnTimingAdvance,
+        NtnAccessBarring,
     };
     pub use crate::eps::{
         EmmMessage,
