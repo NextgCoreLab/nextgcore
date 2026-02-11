@@ -370,6 +370,114 @@ pub struct DataPlaneFar {
     pub ohc_addr: Option<Ipv4Addr>,
 }
 
+// ============================================================================
+// Rel-18 QFI→DSCP Mapping (TS 29.281, TS 23.501)
+// ============================================================================
+
+/// Map QFI to DSCP value for outer IP header marking in GTP-U tunnel.
+///
+/// Per 3GPP TS 23.501 Table 5.7.4-1, each 5QI has standardized QoS
+/// characteristics that map to DiffServ DSCP values for transport-level
+/// QoS enforcement.
+pub fn qfi_to_dscp(qfi: u8) -> u8 {
+    match qfi {
+        1 => 46,  // EF: Conversational voice
+        2 => 34,  // AF41: Conversational video
+        3 => 26,  // AF31: Real-time gaming
+        4 => 24,  // AF21: Non-conversational video
+        5 => 0,   // BE: IMS signaling
+        6 => 18,  // AF21: Buffered streaming
+        7 => 10,  // AF11: Interactive gaming
+        8 | 9 => 0, // BE: Default
+        65 => 46, // EF: Mission-critical user plane
+        66 => 26, // AF31: Non-mission-critical user plane
+        82 => 46, // EF: XR cloud rendering DL (Rel-18)
+        83 => 46, // EF: XR pose/control UL (Rel-18)
+        84 => 34, // AF41: XR split rendering DL (Rel-18)
+        85 => 46, // EF: XR haptic feedback (Rel-18)
+        _ => 0,   // Unknown → Best Effort
+    }
+}
+
+/// Apply DSCP marking to an IP packet's TOS/Traffic Class field.
+pub fn apply_dscp_to_ip_packet(packet: &mut [u8], dscp: u8) -> bool {
+    if packet.is_empty() {
+        return false;
+    }
+    let version = (packet[0] >> 4) & 0x0F;
+    match version {
+        4 if packet.len() >= 20 => {
+            // IPv4: DSCP is in TOS field (byte 1), bits 7:2
+            packet[1] = (dscp << 2) | (packet[1] & 0x03);
+            true
+        }
+        6 if packet.len() >= 40 => {
+            // IPv6: Traffic Class spans bytes 0-1 (bits 4:11)
+            let tc = (dscp << 2) | (packet[1] & 0x03);
+            packet[0] = (packet[0] & 0xF0) | ((tc >> 4) & 0x0F);
+            packet[1] = ((tc & 0x0F) << 4) | (packet[1] & 0x0F);
+            true
+        }
+        _ => false,
+    }
+}
+
+// ============================================================================
+// Rel-18 Energy Saving State
+// ============================================================================
+
+/// Energy saving state for UPF session-level power management.
+#[derive(Debug)]
+pub struct EnergySavingState {
+    /// Last packet forwarded timestamp
+    pub last_packet_time: RwLock<std::time::Instant>,
+    /// Inactivity threshold before entering low-power (seconds)
+    pub inactivity_threshold_secs: u32,
+    /// Whether low-power mode is active
+    pub low_power_active: AtomicBool,
+}
+
+impl EnergySavingState {
+    pub fn new(inactivity_threshold_secs: u32) -> Self {
+        Self {
+            last_packet_time: RwLock::new(std::time::Instant::now()),
+            inactivity_threshold_secs,
+            low_power_active: AtomicBool::new(false),
+        }
+    }
+
+    /// Record packet activity (resets inactivity timer).
+    pub fn record_activity(&self) {
+        *self.last_packet_time.write().unwrap() = std::time::Instant::now();
+        self.low_power_active.store(false, Ordering::Relaxed);
+    }
+
+    /// Check if session is inactive beyond threshold.
+    pub fn check_inactivity(&self) -> bool {
+        let last = self.last_packet_time.read().unwrap();
+        let inactive = last.elapsed().as_secs() > self.inactivity_threshold_secs as u64;
+        if inactive {
+            self.low_power_active.store(true, Ordering::Relaxed);
+        }
+        inactive
+    }
+
+    /// Returns whether session is in low-power mode.
+    pub fn is_low_power(&self) -> bool {
+        self.low_power_active.load(Ordering::Relaxed)
+    }
+}
+
+impl Clone for EnergySavingState {
+    fn clone(&self) -> Self {
+        Self {
+            last_packet_time: RwLock::new(*self.last_packet_time.read().unwrap()),
+            inactivity_threshold_secs: self.inactivity_threshold_secs,
+            low_power_active: AtomicBool::new(self.low_power_active.load(Ordering::Relaxed)),
+        }
+    }
+}
+
 /// Lightweight QER for QoS enforcement in the data plane
 #[derive(Debug)]
 pub struct DataPlaneQer {
@@ -381,6 +489,8 @@ pub struct DataPlaneQer {
     /// Maximum Bit Rate downlink (kbps, 0 = unlimited)
     pub dl_mbr: u64,
     pub qfi: Option<u8>,
+    /// DSCP value for outer GTP-U IP header (computed from QFI)
+    pub dscp: u8,
     /// Bytes forwarded in current rate window (uplink)
     ul_bytes_in_window: AtomicU64,
     /// Bytes forwarded in current rate window (downlink)
@@ -398,6 +508,7 @@ impl Clone for DataPlaneQer {
             ul_mbr: self.ul_mbr,
             dl_mbr: self.dl_mbr,
             qfi: self.qfi,
+            dscp: self.dscp,
             ul_bytes_in_window: AtomicU64::new(self.ul_bytes_in_window.load(Ordering::Relaxed)),
             dl_bytes_in_window: AtomicU64::new(self.dl_bytes_in_window.load(Ordering::Relaxed)),
             window_start: RwLock::new(*self.window_start.read().unwrap()),
@@ -414,10 +525,17 @@ impl DataPlaneQer {
             ul_mbr: 0,
             dl_mbr: 0,
             qfi: None,
+            dscp: 0,
             ul_bytes_in_window: AtomicU64::new(0),
             dl_bytes_in_window: AtomicU64::new(0),
             window_start: RwLock::new(std::time::Instant::now()),
         }
+    }
+
+    /// Set QFI and automatically compute DSCP mapping.
+    pub fn set_qfi(&mut self, qfi: u8) {
+        self.qfi = Some(qfi);
+        self.dscp = qfi_to_dscp(qfi);
     }
 
     /// Check if a packet of given size is within the MBR rate limit.

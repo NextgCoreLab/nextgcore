@@ -214,6 +214,94 @@ pub struct Qos {
     pub gbr_downlink: u64,
 }
 
+// ============================================================================
+// Rel-18 XR QoS Characteristics (TS 23.501 Table 5.7.4-1)
+// ============================================================================
+
+/// 5QI characteristics table entry for XR and standard flows.
+#[derive(Debug, Clone)]
+pub struct QosCharacteristics {
+    /// Resource type: 0=GBR, 1=Delay-critical GBR, 2=Non-GBR
+    pub resource_type: u8,
+    /// Priority level (1=highest)
+    pub priority_level: u8,
+    /// Packet delay budget (ms)
+    pub packet_delay_budget_ms: u16,
+    /// Packet error rate (e.g., 1e-3 stored as exponent: 3)
+    pub packet_error_rate_exp: u8,
+    /// Maximum Data Burst Volume (bytes, 0 = N/A)
+    pub max_data_burst_volume: u32,
+    /// Default averaging window (ms)
+    pub averaging_window_ms: u32,
+}
+
+impl QosCharacteristics {
+    /// Look up 5QI characteristics from the 3GPP standardized table.
+    pub fn from_5qi(five_qi: u8) -> Option<Self> {
+        match five_qi {
+            // Standard GBR 5QIs
+            1 => Some(Self { resource_type: 0, priority_level: 20, packet_delay_budget_ms: 100, packet_error_rate_exp: 2, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
+            2 => Some(Self { resource_type: 0, priority_level: 40, packet_delay_budget_ms: 150, packet_error_rate_exp: 3, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
+            3 => Some(Self { resource_type: 0, priority_level: 30, packet_delay_budget_ms: 50, packet_error_rate_exp: 3, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
+            4 => Some(Self { resource_type: 0, priority_level: 50, packet_delay_budget_ms: 300, packet_error_rate_exp: 6, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
+            65 => Some(Self { resource_type: 0, priority_level: 7, packet_delay_budget_ms: 75, packet_error_rate_exp: 2, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
+            66 => Some(Self { resource_type: 0, priority_level: 20, packet_delay_budget_ms: 100, packet_error_rate_exp: 2, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
+            67 => Some(Self { resource_type: 0, priority_level: 15, packet_delay_budget_ms: 100, packet_error_rate_exp: 3, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
+            // Standard Non-GBR 5QIs
+            5 => Some(Self { resource_type: 2, priority_level: 10, packet_delay_budget_ms: 100, packet_error_rate_exp: 6, max_data_burst_volume: 0, averaging_window_ms: 0 }),
+            6 => Some(Self { resource_type: 2, priority_level: 60, packet_delay_budget_ms: 300, packet_error_rate_exp: 6, max_data_burst_volume: 0, averaging_window_ms: 0 }),
+            7 => Some(Self { resource_type: 2, priority_level: 70, packet_delay_budget_ms: 100, packet_error_rate_exp: 3, max_data_burst_volume: 0, averaging_window_ms: 0 }),
+            8 => Some(Self { resource_type: 2, priority_level: 80, packet_delay_budget_ms: 300, packet_error_rate_exp: 6, max_data_burst_volume: 0, averaging_window_ms: 0 }),
+            9 => Some(Self { resource_type: 2, priority_level: 90, packet_delay_budget_ms: 300, packet_error_rate_exp: 6, max_data_burst_volume: 0, averaging_window_ms: 0 }),
+            // Rel-18 XR 5QI values (TS 23.501 Table 5.7.4-1)
+            82 => Some(Self { resource_type: 0, priority_level: 21, packet_delay_budget_ms: 10, packet_error_rate_exp: 3, max_data_burst_volume: 60_000, averaging_window_ms: 2000 }),
+            83 => Some(Self { resource_type: 0, priority_level: 20, packet_delay_budget_ms: 5, packet_error_rate_exp: 4, max_data_burst_volume: 1_500, averaging_window_ms: 2000 }),
+            84 => Some(Self { resource_type: 0, priority_level: 22, packet_delay_budget_ms: 15, packet_error_rate_exp: 3, max_data_burst_volume: 30_000, averaging_window_ms: 2000 }),
+            85 => Some(Self { resource_type: 0, priority_level: 19, packet_delay_budget_ms: 5, packet_error_rate_exp: 5, max_data_burst_volume: 500, averaging_window_ms: 2000 }),
+            _ => None,
+        }
+    }
+
+    /// Returns true if this 5QI is a GBR (Guaranteed Bit Rate) flow.
+    pub fn is_gbr(&self) -> bool {
+        self.resource_type == 0 || self.resource_type == 1
+    }
+
+    /// Returns true if this 5QI is an XR-specific QoS indicator.
+    pub fn is_xr(five_qi: u8) -> bool {
+        (82..=85).contains(&five_qi)
+    }
+}
+
+// ============================================================================
+// Rel-18 Energy Saving Types
+// ============================================================================
+
+/// UE power saving preference (Rel-18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PowerPreference {
+    /// Normal operation
+    #[default]
+    Normal,
+    /// Low power mode (prefer longer DRX, relaxed measurements)
+    LowPower,
+    /// Ultra-low power (aggressive PSM, extended eDRX)
+    UltraLowPower,
+}
+
+/// Energy-aware session parameters.
+#[derive(Debug, Clone, Default)]
+pub struct EnergyConfig {
+    /// UE power preference indication
+    pub power_preference: PowerPreference,
+    /// Inactivity detection timer (seconds, 0 = disabled)
+    pub inactivity_timer_sec: u32,
+    /// Buffered packet count suggestion (for UPF, 0 = no buffering)
+    pub suggested_buffering_packets: u32,
+    /// Whether to use reflective QoS to reduce signaling
+    pub reflective_qos: bool,
+}
+
 /// Session AMBR
 #[derive(Debug, Clone, Default)]
 pub struct SessionAmbr {

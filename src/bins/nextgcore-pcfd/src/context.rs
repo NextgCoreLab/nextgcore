@@ -336,6 +336,56 @@ impl PcfSess {
 }
 
 
+// ============================================================================
+// Rel-18 PCF Analytics Integration (NWDAF)
+// ============================================================================
+
+/// Traffic classification for analytics-based policy decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrafficClass {
+    /// Standard best-effort traffic
+    #[default]
+    BestEffort,
+    /// XR interactive traffic (5QI 82-85)
+    XrInteractive,
+    /// Video streaming
+    VideoStreaming,
+    /// Voice/VoNR
+    Voice,
+    /// Machine-type communication
+    Mtc,
+    /// V2X traffic
+    V2x,
+}
+
+/// Analytics-based policy adjustment state.
+#[derive(Debug, Clone, Default)]
+pub struct AnalyticsState {
+    /// NWDAF analytics subscription ID (if subscribed)
+    pub analytics_subscription_id: Option<String>,
+    /// Predicted congestion level from NWDAF (0.0-1.0)
+    pub predicted_congestion: f32,
+    /// Classified traffic type
+    pub traffic_class: TrafficClass,
+    /// QoS sustainability score from NWDAF (0.0-1.0)
+    pub qos_sustainability: f32,
+    /// Whether energy-optimized policy is active
+    pub energy_optimized: bool,
+}
+
+/// Energy-aware policy parameters.
+#[derive(Debug, Clone, Default)]
+pub struct EnergyAwarePolicy {
+    /// Allow extended DRX cycles
+    pub allow_extended_drx: bool,
+    /// Reduce measurement frequency for idle UEs
+    pub reduce_measurement_frequency: bool,
+    /// Optimize QoS for battery life
+    pub optimize_for_battery: bool,
+    /// Maximum inactivity before session release (seconds)
+    pub max_inactivity_before_release: u32,
+}
+
 /// PCF App Session context
 /// Port of pcf_app_t from context.h
 #[derive(Debug, Clone)]

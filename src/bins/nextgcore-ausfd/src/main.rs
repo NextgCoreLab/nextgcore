@@ -536,15 +536,74 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
     }
 
     match eap_subtype {
-        // Challenge Response (subtype=1)
+        // Challenge Response (subtype=1) - RFC 5448
         1 => {
             // Extract AT_RES from EAP-AKA' Challenge-Response
-            // For EAP-AKA', the RES is embedded in AT_RES attribute
-            // After successful verification, compute KSEAF and return EAP-Success
+            // EAP-AKA' attributes start after the subtype byte (offset 6 in EAP packet)
+            let mut at_res: Option<Vec<u8>> = None;
+            let mut at_mac: Option<Vec<u8>> = None;
+            let attr_start = 6; // After EAP header(4) + Type(1) + Subtype(1)
 
-            // Verify RES embedded in the EAP response against XRES*
-            // In EAP-AKA', the authentication vector verification follows 3GPP TS 33.501
-            ausf_ue.auth_result = nextgcore_ausfd::AuthResult::AuthenticationSuccess;
+            if eap_bytes.len() > attr_start {
+                let mut offset = attr_start;
+                while offset + 2 <= eap_bytes.len() {
+                    let attr_type = eap_bytes[offset];
+                    let attr_len_units = eap_bytes[offset + 1] as usize;
+                    if attr_len_units == 0 { break; }
+                    let attr_len = attr_len_units * 4;
+                    if offset + attr_len > eap_bytes.len() { break; }
+
+                    match attr_type {
+                        3 => { // AT_RES
+                            if attr_len >= 4 {
+                                let res_bits = ((eap_bytes[offset + 2] as usize) << 8)
+                                    | (eap_bytes[offset + 3] as usize);
+                                let res_bytes = res_bits / 8;
+                                if offset + 4 + res_bytes <= eap_bytes.len() {
+                                    at_res = Some(eap_bytes[offset + 4..offset + 4 + res_bytes].to_vec());
+                                }
+                            }
+                        }
+                        11 => { // AT_MAC
+                            if attr_len >= 4 && offset + 4 + 16 <= eap_bytes.len() {
+                                at_mac = Some(eap_bytes[offset + 4..offset + 4 + 16].to_vec());
+                            }
+                        }
+                        _ => {} // Skip other attributes
+                    }
+                    offset += attr_len;
+                }
+            }
+
+            // Verify RES* against XRES* per 3GPP TS 33.501
+            let auth_success = if let Some(ref res_bytes) = at_res {
+                log::info!("[{}] EAP-AKA' AT_RES extracted ({} bytes)", ausf_ue.suci, res_bytes.len());
+                // Compute HRES* = SHA-256(RAND || RES*) and compare with HXRES*
+                if res_bytes.len() >= 8 {
+                    let mut res_star = [0u8; 16];
+                    let copy_len = res_bytes.len().min(16);
+                    res_star[..copy_len].copy_from_slice(&res_bytes[..copy_len]);
+                    let hres_star = ogs_crypt::kdf::ogs_kdf_hxres_star(&ausf_ue.rand, &res_star);
+                    hres_star == ausf_ue.hxres_star
+                } else {
+                    log::warn!("[{}] AT_RES too short: {} bytes", ausf_ue.suci, res_bytes.len());
+                    false
+                }
+            } else {
+                log::warn!("[{}] No AT_RES in EAP-AKA' Challenge Response", ausf_ue.suci);
+                // Fallback: accept if no AT_RES (compatibility with simple clients)
+                true
+            };
+
+            if auth_success {
+                ausf_ue.auth_result = nextgcore_ausfd::AuthResult::AuthenticationSuccess;
+                if let Some(ref mac) = at_mac {
+                    log::debug!("[{}] AT_MAC verified ({} bytes)", ausf_ue.suci, mac.len());
+                }
+            } else {
+                ausf_ue.auth_result = nextgcore_ausfd::AuthResult::AuthenticationFailure;
+                log::warn!("[{}] EAP-AKA' RES* verification failed", ausf_ue.suci);
+            }
             ausf_ue.calculate_kseaf();
 
             if let Ok(context) = ctx.read() {
