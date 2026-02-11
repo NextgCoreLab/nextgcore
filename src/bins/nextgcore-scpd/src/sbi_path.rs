@@ -561,6 +561,119 @@ pub fn copy_request_headers(
     target
 }
 
+// ============================================================================
+// NF Instance Selection & Request Routing
+// ============================================================================
+
+/// NF instance candidate for load-balanced routing
+#[derive(Debug, Clone)]
+pub struct NfInstanceCandidate {
+    pub nf_instance_id: String,
+    pub nf_type: NfType,
+    pub host: String,
+    pub port: u16,
+    pub priority: u16,
+    pub capacity: u16,
+    pub load: u16,
+}
+
+/// Select the best NF instance from a list of candidates using weighted round-robin
+/// Based on priority (lower = better) and capacity/load
+pub fn select_nf_instance(candidates: &[NfInstanceCandidate]) -> Option<&NfInstanceCandidate> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Group by priority (lower is better)
+    let min_priority = candidates.iter().map(|c| c.priority).min().unwrap_or(0);
+    let top_priority: Vec<&NfInstanceCandidate> = candidates
+        .iter()
+        .filter(|c| c.priority == min_priority)
+        .collect();
+
+    if top_priority.len() == 1 {
+        return Some(top_priority[0]);
+    }
+
+    // Among same-priority candidates, pick by available capacity (capacity - load)
+    top_priority
+        .iter()
+        .max_by_key(|c| {
+            c.capacity.saturating_sub(c.load) as u32
+        })
+        .copied()
+}
+
+/// Route an SBI request to the appropriate NF instance
+/// Returns the target host:port to forward to
+pub fn route_request(
+    request: &SbiRequest,
+    candidates: &[NfInstanceCandidate],
+) -> Result<(String, u16, HashMap<String, String>), String> {
+    // If Target-apiRoot is present, use it directly
+    if let Some(target_apiroot) = request.get_header(headers::TARGET_APIROOT) {
+        // Parse host:port from target_apiroot URL
+        let (host, port) = parse_apiroot_url(target_apiroot)?;
+        let fwd_headers = copy_request_headers(request, false);
+        return Ok((host, port, fwd_headers));
+    }
+
+    // Otherwise, select from candidates via NF discovery
+    let selected = select_nf_instance(candidates)
+        .ok_or_else(|| "No NF instance available for routing".to_string())?;
+
+    log::debug!(
+        "Selected NF instance {} ({}:{}) for routing",
+        selected.nf_instance_id,
+        selected.host,
+        selected.port
+    );
+
+    let fwd_headers = copy_request_headers(request, false);
+    Ok((selected.host.clone(), selected.port, fwd_headers))
+}
+
+/// Parse a URL to extract host and port
+fn parse_apiroot_url(url: &str) -> Result<(String, u16), String> {
+    // Strip scheme
+    let without_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+
+    // Strip path
+    let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
+
+    if let Some(colon_idx) = host_port.rfind(':') {
+        let host = &host_port[..colon_idx];
+        let port: u16 = host_port[colon_idx + 1..]
+            .parse()
+            .map_err(|_| "Invalid port in URL".to_string())?;
+        Ok((host.to_string(), port))
+    } else {
+        // Default ports
+        let port = if url.starts_with("https://") { 443 } else { 80 };
+        Ok((host_port.to_string(), port))
+    }
+}
+
+/// Build a forwarded SBI request with updated authority
+pub fn build_forwarded_request(
+    original: &SbiRequest,
+    target_host: &str,
+    target_port: u16,
+    headers: HashMap<String, String>,
+) -> SbiRequest {
+    let mut fwd = SbiRequest {
+        method: original.method.clone(),
+        uri: original.uri.clone(),
+        headers,
+        body: original.body.clone(),
+    };
+    fwd.set_header(":authority", &format!("{}:{}", target_host, target_port));
+    fwd
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,5 +766,119 @@ mod tests {
         // With custom headers preserved
         let headers = copy_request_headers(&request, true);
         assert!(headers.contains_key(headers::TARGET_APIROOT));
+    }
+
+    #[test]
+    fn test_select_nf_instance_empty() {
+        let result = select_nf_instance(&[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_select_nf_instance_single() {
+        let candidates = vec![NfInstanceCandidate {
+            nf_instance_id: "nf-1".to_string(),
+            nf_type: NfType::Amf,
+            host: "amf.local".to_string(),
+            port: 7777,
+            priority: 10,
+            capacity: 100,
+            load: 50,
+        }];
+        let selected = select_nf_instance(&candidates);
+        assert!(selected.is_some());
+        assert_eq!(selected.unwrap().nf_instance_id, "nf-1");
+    }
+
+    #[test]
+    fn test_select_nf_instance_by_priority() {
+        let candidates = vec![
+            NfInstanceCandidate {
+                nf_instance_id: "nf-low".to_string(),
+                nf_type: NfType::Smf,
+                host: "smf1.local".to_string(),
+                port: 7777,
+                priority: 20,
+                capacity: 100,
+                load: 10,
+            },
+            NfInstanceCandidate {
+                nf_instance_id: "nf-high".to_string(),
+                nf_type: NfType::Smf,
+                host: "smf2.local".to_string(),
+                port: 7777,
+                priority: 10,
+                capacity: 100,
+                load: 90,
+            },
+        ];
+        let selected = select_nf_instance(&candidates);
+        assert_eq!(selected.unwrap().nf_instance_id, "nf-high");
+    }
+
+    #[test]
+    fn test_select_nf_instance_by_capacity() {
+        let candidates = vec![
+            NfInstanceCandidate {
+                nf_instance_id: "nf-loaded".to_string(),
+                nf_type: NfType::Udm,
+                host: "udm1.local".to_string(),
+                port: 7777,
+                priority: 10,
+                capacity: 100,
+                load: 90,
+            },
+            NfInstanceCandidate {
+                nf_instance_id: "nf-idle".to_string(),
+                nf_type: NfType::Udm,
+                host: "udm2.local".to_string(),
+                port: 7777,
+                priority: 10,
+                capacity: 100,
+                load: 10,
+            },
+        ];
+        let selected = select_nf_instance(&candidates);
+        assert_eq!(selected.unwrap().nf_instance_id, "nf-idle");
+    }
+
+    #[test]
+    fn test_parse_apiroot_url() {
+        let (host, port) = parse_apiroot_url("https://amf.example.com:8443").unwrap();
+        assert_eq!(host, "amf.example.com");
+        assert_eq!(port, 8443);
+
+        let (host, port) = parse_apiroot_url("https://smf.local").unwrap();
+        assert_eq!(host, "smf.local");
+        assert_eq!(port, 443);
+
+        let (host, port) = parse_apiroot_url("http://127.0.0.1:7777/path").unwrap();
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 7777);
+    }
+
+    #[test]
+    fn test_route_request_with_target_apiroot() {
+        let mut request = SbiRequest::new("POST", "/nsmf-pdusession/v1/sm-contexts");
+        request.set_header(headers::TARGET_APIROOT, "https://smf.local:7778");
+
+        let result = route_request(&request, &[]);
+        assert!(result.is_ok());
+        let (host, port, _) = result.unwrap();
+        assert_eq!(host, "smf.local");
+        assert_eq!(port, 7778);
+    }
+
+    #[test]
+    fn test_build_forwarded_request() {
+        let original = SbiRequest::new("GET", "/nudm-sdm/v1/imsi-123/sm-data");
+        let headers = HashMap::new();
+        let fwd = build_forwarded_request(&original, "udm.local", 7777, headers);
+        assert_eq!(fwd.method, "GET");
+        assert_eq!(fwd.uri, "/nudm-sdm/v1/imsi-123/sm-data");
+        assert_eq!(
+            fwd.headers.get(":authority"),
+            Some(&"udm.local:7777".to_string())
+        );
     }
 }

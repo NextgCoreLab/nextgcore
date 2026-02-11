@@ -259,6 +259,165 @@ impl From<&SecNegotiateRspData> for SecurityCapabilityResponseJson {
     }
 }
 
+// ============================================================================
+// N32f JOSE Message Protection (TS 29.573 section 6.3)
+// ============================================================================
+
+/// N32f protected message envelope
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct N32fMessage {
+    /// JWS/JWE compact serialization of the protected SBI message
+    pub request_line: N32fRequestLine,
+    /// Protected headers (JWS signed or JWE encrypted)
+    pub header: Vec<N32fHeader>,
+    /// Protected payload (JWS signed or JWE encrypted), base64url-encoded
+    pub payload: Option<String>,
+    /// Modification list for PRINS (if security is PRINS)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub modifications_block: Vec<N32fModification>,
+}
+
+/// Request line in N32f message
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct N32fRequestLine {
+    pub method: String,
+    pub url: String,
+    pub protocol: String,
+}
+
+/// Header in N32f message
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct N32fHeader {
+    pub name: String,
+    pub value: String,
+}
+
+/// Modification entry for PRINS mode
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct N32fModification {
+    pub ie_location: String,
+    pub ie_path: String,
+    pub ie_value: Option<String>,
+    pub ie_action: String,
+}
+
+/// Build N32f protected message using TLS mode (pass-through, whole-message protection)
+pub fn build_n32f_tls_message(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+) -> N32fMessage {
+    let request_line = N32fRequestLine {
+        method: method.to_string(),
+        url: url.to_string(),
+        protocol: "HTTP/2".to_string(),
+    };
+
+    let n32f_headers: Vec<N32fHeader> = headers
+        .iter()
+        .map(|(name, value)| N32fHeader {
+            name: name.clone(),
+            value: value.clone(),
+        })
+        .collect();
+
+    let payload = body.map(|b| base64url_encode(b));
+
+    log::debug!(
+        "Built N32f TLS message: {} {} ({} headers, payload={})",
+        method,
+        url,
+        n32f_headers.len(),
+        payload.is_some()
+    );
+
+    N32fMessage {
+        request_line,
+        header: n32f_headers,
+        payload,
+        modifications_block: Vec::new(),
+    }
+}
+
+/// Build N32f protected message using PRINS mode (selective protection)
+/// PRINS allows modifying certain IEs while protecting integrity of others
+pub fn build_n32f_prins_message(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    modifications: Vec<N32fModification>,
+) -> N32fMessage {
+    let request_line = N32fRequestLine {
+        method: method.to_string(),
+        url: url.to_string(),
+        protocol: "HTTP/2".to_string(),
+    };
+
+    let n32f_headers: Vec<N32fHeader> = headers
+        .iter()
+        .map(|(name, value)| N32fHeader {
+            name: name.clone(),
+            value: value.clone(),
+        })
+        .collect();
+
+    let payload = body.map(|b| base64url_encode(b));
+
+    log::debug!(
+        "Built N32f PRINS message: {} {} ({} headers, {} modifications)",
+        method,
+        url,
+        n32f_headers.len(),
+        modifications.len()
+    );
+
+    N32fMessage {
+        request_line,
+        header: n32f_headers,
+        payload,
+        modifications_block: modifications,
+    }
+}
+
+/// Parse an N32f message received from peer SEPP
+pub fn parse_n32f_message(json_bytes: &[u8]) -> Result<N32fMessage, String> {
+    serde_json::from_slice(json_bytes).map_err(|e| format!("Failed to parse N32f message: {}", e))
+}
+
+/// Base64url encode (no padding) - RFC 4648 section 5
+fn base64url_encode(data: &[u8]) -> String {
+    let mut result = String::new();
+    let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+    let mut i = 0;
+    while i + 2 < data.len() {
+        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);
+        result.push(table[((n >> 18) & 0x3F) as usize] as char);
+        result.push(table[((n >> 12) & 0x3F) as usize] as char);
+        result.push(table[((n >> 6) & 0x3F) as usize] as char);
+        result.push(table[(n & 0x3F) as usize] as char);
+        i += 3;
+    }
+
+    let remaining = data.len() - i;
+    if remaining == 2 {
+        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
+        result.push(table[((n >> 18) & 0x3F) as usize] as char);
+        result.push(table[((n >> 12) & 0x3F) as usize] as char);
+        result.push(table[((n >> 6) & 0x3F) as usize] as char);
+    } else if remaining == 1 {
+        let n = (data[i] as u32) << 16;
+        result.push(table[((n >> 18) & 0x3F) as usize] as char);
+        result.push(table[((n >> 12) & 0x3F) as usize] as char);
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -326,5 +485,61 @@ mod tests {
         assert_eq!(rsp_data.sender, "sepp.local.example.com");
         assert_eq!(rsp_data.selected_sec_capability, SecurityCapability::Tls);
         assert!(rsp_data.target_apiroot_supported);
+    }
+
+    #[test]
+    fn test_base64url_encode() {
+        assert_eq!(base64url_encode(b""), "");
+        assert_eq!(base64url_encode(b"f"), "Zg");
+        assert_eq!(base64url_encode(b"fo"), "Zm8");
+        assert_eq!(base64url_encode(b"foo"), "Zm9v");
+        assert_eq!(base64url_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn test_build_n32f_tls_message() {
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            (":authority".to_string(), "sepp.peer.com".to_string()),
+        ];
+        let body = b"{\"key\":\"value\"}";
+        let msg = build_n32f_tls_message("POST", "/nudm-sdm/v1/supi", &headers, Some(body));
+
+        assert_eq!(msg.request_line.method, "POST");
+        assert_eq!(msg.request_line.url, "/nudm-sdm/v1/supi");
+        assert_eq!(msg.header.len(), 2);
+        assert!(msg.payload.is_some());
+        assert!(msg.modifications_block.is_empty());
+    }
+
+    #[test]
+    fn test_build_n32f_prins_message() {
+        let modifications = vec![N32fModification {
+            ie_location: "body".to_string(),
+            ie_path: "$.supi".to_string(),
+            ie_value: Some("imsi-001010123456789".to_string()),
+            ie_action: "modify".to_string(),
+        }];
+        let msg = build_n32f_prins_message(
+            "GET",
+            "/nudm-sdm/v1/supi",
+            &[],
+            None,
+            modifications,
+        );
+
+        assert_eq!(msg.request_line.method, "GET");
+        assert!(msg.payload.is_none());
+        assert_eq!(msg.modifications_block.len(), 1);
+        assert_eq!(msg.modifications_block[0].ie_path, "$.supi");
+    }
+
+    #[test]
+    fn test_parse_n32f_message() {
+        let json = r#"{"requestLine":{"method":"POST","url":"/test","protocol":"HTTP/2"},"header":[],"payload":null,"modificationsBlock":[]}"#;
+        let result = parse_n32f_message(json.as_bytes());
+        assert!(result.is_ok());
+        let msg = result.unwrap();
+        assert_eq!(msg.request_line.method, "POST");
     }
 }

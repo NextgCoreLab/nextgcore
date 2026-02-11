@@ -323,6 +323,17 @@ impl GtpBuffer {
         self.write_ie_header(ie_type::EBI, 1, instance);
         self.write_u8(ebi & 0x0f);
     }
+
+    /// Write a complete IE (header + data)
+    pub fn write_ie(&mut self, ie_type: u8, instance: u8, data: &[u8]) {
+        self.write_ie_header(ie_type, data.len() as u16, instance);
+        self.write_bytes(data);
+    }
+
+    /// Finalize message length in the GTP header
+    pub fn finalize_length(&mut self) {
+        self.update_length();
+    }
 }
 
 impl Default for GtpBuffer {
@@ -355,37 +366,118 @@ pub fn build_echo_response(seq_num: u32, recovery: u8) -> Vec<u8> {
 
 /// Build Create Session Request
 pub fn build_create_session_request(
-    _sess: &MmeSess,
-    _mme_ue: &MmeUe,
-    _sgw_ue: &SgwUe,
+    sess: &MmeSess,
+    mme_ue: &MmeUe,
+    sgw_ue: &SgwUe,
     _create_action: GtpCreateAction,
 ) -> S11BuildResult<Vec<u8>> {
-    log::debug!("Build Create Session Request");
-    // Placeholder - actual implementation would build full message
-    Ok(Vec::new())
+    log::debug!("Build Create Session Request for APN={}", sess.apn);
+    let mut buf = GtpBuffer::new();
+    buf.write_gtp_header_with_teid(
+        message_type::CREATE_SESSION_REQUEST,
+        sgw_ue.sgw_s11_teid,
+        0,
+    );
+
+    // IE: IMSI (1) - mandatory
+    buf.write_ie(ie_type::IMSI, 0, &mme_ue.imsi[..mme_ue.imsi_len]);
+
+    // IE: MSISDN (76) - conditional
+    if mme_ue.msisdn_len > 0 {
+        buf.write_ie(ie_type::MSISDN, 0, &mme_ue.msisdn[..mme_ue.msisdn_len]);
+    }
+
+    // IE: MEI (75) - conditional
+    if mme_ue.imeisv_len > 0 {
+        buf.write_ie(ie_type::MEI, 0, &mme_ue.imeisv[..mme_ue.imeisv_len]);
+    }
+
+    // IE: RAT Type (82) - mandatory (E-UTRAN = 6)
+    buf.write_ie(ie_type::RAT_TYPE, 0, &[6]);
+
+    // IE: APN (71) - mandatory (DNS format)
+    let apn_bytes = encode_apn_dns(&sess.apn);
+    buf.write_ie(ie_type::APN, 0, &apn_bytes);
+
+    // IE: Selection Mode (80)
+    buf.write_ie(ie_type::SELECTION_MODE, 0, &[0]);
+
+    // IE: PDN Type (99) - mandatory
+    buf.write_ie(ie_type::PDN_TYPE, 0, &[sess.ue_request_pdn_type as u8]);
+
+    // IE: APN-AMBR (72) - mandatory
+    let mut ambr_data = Vec::new();
+    ambr_data.extend_from_slice(&(sess.ambr.uplink as u32).to_be_bytes());
+    ambr_data.extend_from_slice(&(sess.ambr.downlink as u32).to_be_bytes());
+    buf.write_ie(ie_type::AMBR, 0, &ambr_data);
+
+    buf.finalize_length();
+    Ok(buf.into_vec())
 }
 
 /// Build Modify Bearer Request
 pub fn build_modify_bearer_request(
     _mme_ue: &MmeUe,
-    _sgw_ue: &SgwUe,
-    _bearers: &[&MmeBearer],
+    sgw_ue: &SgwUe,
+    bearers: &[&MmeBearer],
     _uli_presence: bool,
 ) -> S11BuildResult<Vec<u8>> {
-    log::debug!("Build Modify Bearer Request");
-    Ok(Vec::new())
+    log::debug!("Build Modify Bearer Request with {} bearers", bearers.len());
+    let mut buf = GtpBuffer::new();
+    buf.write_gtp_header_with_teid(
+        message_type::MODIFY_BEARER_REQUEST,
+        sgw_ue.sgw_s11_teid,
+        0,
+    );
+
+    // IE: Bearer Context to be modified (93, instance 0) for each bearer
+    for bearer in bearers {
+        let mut bearer_ctx = GtpBuffer::new();
+        // Sub-IE: EBI
+        bearer_ctx.write_ie(ie_type::EBI, 0, &[bearer.ebi]);
+        // Sub-IE: S1-U eNB F-TEID (interface type 0 = S1-U eNB)
+        let mut fteid = Vec::new();
+        fteid.push(0x80); // V4 flag | interface type 0
+        fteid.extend_from_slice(&bearer.enb_s1u_teid.to_be_bytes());
+        if let Some(ipv4) = bearer.enb_s1u_ip.ipv4 {
+            fteid.extend_from_slice(&ipv4);
+        }
+        bearer_ctx.write_ie(ie_type::F_TEID, 0, &fteid);
+
+        buf.write_ie(ie_type::BEARER_CONTEXT, 0, bearer_ctx.data());
+    }
+
+    // IE: RAT Type (82) - E-UTRAN = 6
+    buf.write_ie(ie_type::RAT_TYPE, 0, &[6]);
+
+    buf.finalize_length();
+    Ok(buf.into_vec())
 }
 
 /// Build Delete Session Request
 pub fn build_delete_session_request(
     _sess: &MmeSess,
     _mme_ue: &MmeUe,
-    _sgw_ue: &SgwUe,
-    _default_bearer_ebi: u8,
+    sgw_ue: &SgwUe,
+    default_bearer_ebi: u8,
     _action: GtpDeleteAction,
 ) -> S11BuildResult<Vec<u8>> {
-    log::debug!("Build Delete Session Request");
-    Ok(Vec::new())
+    log::debug!("Build Delete Session Request for EBI={}", default_bearer_ebi);
+    let mut buf = GtpBuffer::new();
+    buf.write_gtp_header_with_teid(
+        message_type::DELETE_SESSION_REQUEST,
+        sgw_ue.sgw_s11_teid,
+        0,
+    );
+
+    // IE: EBI (73) - mandatory (Linked EPS Bearer ID)
+    buf.write_ie(ie_type::EBI, 0, &[default_bearer_ebi]);
+
+    // IE: Indication Flags (77)
+    buf.write_ie(ie_type::INDICATION, 0, &[0x00, 0x08, 0x00]); // OI flag
+
+    buf.finalize_length();
+    Ok(buf.into_vec())
 }
 
 /// Build Create Bearer Response
@@ -465,6 +557,16 @@ pub fn build_bearer_resource_command(
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// Encode APN to DNS wire format (label-length prefix per TS 23.003)
+fn encode_apn_dns(apn: &str) -> Vec<u8> {
+    let mut result = Vec::new();
+    for label in apn.split('.') {
+        result.push(label.len() as u8);
+        result.extend_from_slice(label.as_bytes());
+    }
+    result
+}
 
 #[cfg(test)]
 mod tests {

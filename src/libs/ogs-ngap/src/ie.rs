@@ -1207,3 +1207,380 @@ pub fn encode_pdu_session_modify_list_res(
     });
     Ok(())
 }
+
+// ============================================================================
+// Handover-related IE encoding
+// ============================================================================
+
+/// Encode HandoverType IE
+pub fn encode_handover_type(
+    container: &mut ProtocolIeContainer,
+    handover_type: HandoverType,
+) -> NgapResult<()> {
+    let mut encoder = AperEncoder::new();
+    // HandoverType ::= ENUMERATED { intra5gs, fivegstoeps, epsto5gs, ... }
+    let constraint = ogs_asn1c::per::Constraint::extensible(0, 2);
+    encoder.encode_enumerated(handover_type as i64, &constraint)?;
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(IE_ID_HANDOVER_TYPE),
+        criticality: Criticality::Reject,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+pub const IE_ID_HANDOVER_TYPE: u16 = 28;
+pub const IE_ID_TARGET_ID: u16 = 39;
+pub const IE_ID_DIRECT_FORWARDING_PATH_AVAILABILITY: u16 = 27;
+pub const IE_ID_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER: u16 = 104;
+pub const IE_ID_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER: u16 = 105;
+pub const IE_ID_SECURITY_CONTEXT: u16 = 99;
+pub const IE_ID_PDU_SESSION_RESOURCE_FAILED_TO_SETUP_LIST_HO_ACK: u16 = 82;
+pub const IE_ID_UE_PAGING_IDENTITY: u16 = 112;
+pub const IE_ID_PAGING_DRX: u16 = 70;
+pub const IE_ID_TAI_LIST_FOR_PAGING: u16 = 106;
+pub const IE_ID_PAGING_PRIORITY: u16 = 69;
+pub const IE_ID_UE_RADIO_CAPABILITY_FOR_PAGING: u16 = 119;
+pub const IE_ID_PAGING_ORIGIN: u16 = 64;
+pub const IE_ID_ASSISTANCE_DATA_FOR_PAGING: u16 = 2;
+
+/// Encode TargetID IE
+pub fn encode_target_id(
+    container: &mut ProtocolIeContainer,
+    target_id: &TargetId,
+) -> NgapResult<()> {
+    let mut encoder = AperEncoder::new();
+    // TargetID ::= CHOICE { targetRANNodeID, targetHomeENB-ID, ... }
+    match target_id {
+        TargetId::TargetRanNodeId { global_ran_node_id, selected_tai } => {
+            encoder.encode_choice_index(0, 2, true)?;
+            // TargetRANNodeID SEQUENCE { globalRANNodeID, selectedTAI, iE-Extensions OPTIONAL }
+            encoder.write_bit(false); // extension
+            encoder.write_bit(false); // no iE-Extensions
+            encode_global_ran_node_id_inline(&mut encoder, global_ran_node_id)?;
+            encode_tai_inline(&mut encoder, selected_tai)?;
+        }
+        TargetId::TargetGlobalNgEnbId { plmn_identity, ng_enb_id, selected_tai } => {
+            encoder.encode_choice_index(1, 2, true)?;
+            encoder.write_bit(false);
+            encoder.write_bit(false);
+            encoder.encode_octet_string(plmn_identity, Some(3), Some(3))?;
+            // ng-eNB-ID is a BIT STRING (SIZE(20..32))
+            encoder.write_bits(*ng_enb_id as u64, 32);
+            encode_tai_inline(&mut encoder, selected_tai)?;
+        }
+    }
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(IE_ID_TARGET_ID),
+        criticality: Criticality::Reject,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Encode GlobalRANNodeID inline
+fn encode_global_ran_node_id_inline(
+    encoder: &mut AperEncoder,
+    ran_id: &GlobalRanNodeId,
+) -> NgapResult<()> {
+    match ran_id {
+        GlobalRanNodeId::GlobalGnbId { plmn_identity, gnb_id, gnb_id_len } => {
+            encoder.encode_choice_index(0, 2, true)?;
+            encoder.write_bit(false);
+            encoder.write_bit(false);
+            encoder.encode_octet_string(plmn_identity, Some(3), Some(3))?;
+            // gNB-ID is a BIT STRING (SIZE(22..32))
+            encoder.write_bits(*gnb_id as u64, *gnb_id_len as usize);
+        }
+        GlobalRanNodeId::GlobalNgEnbId { plmn_identity, ng_enb_id } => {
+            encoder.encode_choice_index(1, 2, true)?;
+            encoder.write_bit(false);
+            encoder.write_bit(false);
+            encoder.encode_octet_string(plmn_identity, Some(3), Some(3))?;
+            encoder.write_bits(*ng_enb_id as u64, 32);
+        }
+    }
+    Ok(())
+}
+
+/// Encode TAI inline
+fn encode_tai_inline(encoder: &mut AperEncoder, tai: &TaiListItem) -> NgapResult<()> {
+    // TAI SEQUENCE { pLMNIdentity, tAC, iE-Extensions OPTIONAL }
+    encoder.write_bit(false); // extension
+    encoder.write_bit(false); // no iE-Extensions
+    encoder.encode_octet_string(&tai.tai_plmn, Some(3), Some(3))?;
+    encoder.encode_octet_string(&tai.tai_tac, Some(3), Some(3))?;
+    Ok(())
+}
+
+/// Encode SourceToTarget-TransparentContainer IE
+pub fn encode_source_to_target_container(
+    container: &mut ProtocolIeContainer,
+    data: &[u8],
+) -> NgapResult<()> {
+    encode_raw_octet_ie(
+        container,
+        IE_ID_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER,
+        Criticality::Reject,
+        data,
+    )
+}
+
+/// Encode TargetToSource-TransparentContainer IE
+pub fn encode_target_to_source_container(
+    container: &mut ProtocolIeContainer,
+    data: &[u8],
+) -> NgapResult<()> {
+    encode_raw_octet_ie(
+        container,
+        IE_ID_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER,
+        Criticality::Reject,
+        data,
+    )
+}
+
+/// Encode SecurityContext IE
+pub fn encode_security_context(
+    container: &mut ProtocolIeContainer,
+    ctx: &SecurityContext,
+) -> NgapResult<()> {
+    let mut encoder = AperEncoder::new();
+    // SecurityContext SEQUENCE { nextHopChainingCount, nextHopNH, iE-Extensions OPTIONAL }
+    encoder.write_bit(false); // extension
+    encoder.write_bit(false); // no iE-Extensions
+    // nextHopChainingCount INTEGER (0..7)
+    let constraint = ogs_asn1c::per::Constraint::new(0, 7);
+    encoder.encode_constrained_whole_number(ctx.next_hop_chaining_count as i64, &constraint)?;
+    // nextHopNH BIT STRING (SIZE(256))
+    for byte in &ctx.next_hop {
+        encoder.write_bits(*byte as u64, 8);
+    }
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(IE_ID_SECURITY_CONTEXT),
+        criticality: Criticality::Reject,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Encode PDU Session Resource list for Handover Required
+pub fn encode_pdu_session_ho_required_list(
+    container: &mut ProtocolIeContainer,
+    _list: &[PduSessionResourceSetupItem],
+) -> NgapResult<()> {
+    // Stub: reuse setup list encoding for now
+    let mut encoder = AperEncoder::new();
+    encoder.encode_constrained_length(0, 1, 256)?;
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(75), // PDUSessionResourceListHORqd
+        criticality: Criticality::Reject,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Encode PDU Session Resource list for Handover Request
+pub fn encode_pdu_session_ho_request_list(
+    container: &mut ProtocolIeContainer,
+    _list: &[PduSessionResourceSetupItemHoReq],
+) -> NgapResult<()> {
+    // Stub: similar structure
+    let mut encoder = AperEncoder::new();
+    encoder.encode_constrained_length(0, 1, 256)?;
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(74), // PDUSessionResourceSetupListHOReq
+        criticality: Criticality::Reject,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Encode PDU Session Resource Admitted List
+pub fn encode_pdu_session_admitted_list(
+    container: &mut ProtocolIeContainer,
+    _list: &[PduSessionResourceAdmittedItemHoAck],
+) -> NgapResult<()> {
+    // Stub
+    let mut encoder = AperEncoder::new();
+    encoder.encode_constrained_length(0, 1, 256)?;
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(81), // PDUSessionResourceAdmittedList
+        criticality: Criticality::Ignore,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Encode PDU Session Resource Handover List
+pub fn encode_pdu_session_handover_list(
+    container: &mut ProtocolIeContainer,
+    _list: &[PduSessionResourceHandoverItem],
+) -> NgapResult<()> {
+    // Stub
+    let mut encoder = AperEncoder::new();
+    encoder.encode_constrained_length(0, 1, 256)?;
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(83), // PDUSessionResourceHandoverList
+        criticality: Criticality::Reject,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Encode CriticalityDiagnostics IE
+pub fn encode_criticality_diagnostics(
+    container: &mut ProtocolIeContainer,
+    _diag: &CriticalityDiagnostics,
+) -> NgapResult<()> {
+    // Stub: empty CriticalityDiagnostics
+    let mut encoder = AperEncoder::new();
+    encoder.write_bit(false); // extension
+    encoder.write_bit(false); // no optionals
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(7), // CriticalityDiagnostics
+        criticality: Criticality::Ignore,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+// ============================================================================
+// Paging-related IE encoding
+// ============================================================================
+
+/// Encode UEPagingIdentity IE
+pub fn encode_ue_paging_identity(
+    container: &mut ProtocolIeContainer,
+    ue_paging_id: &UePagingIdentity,
+) -> NgapResult<()> {
+    let mut encoder = AperEncoder::new();
+    // UEPagingIdentity ::= CHOICE { fiveG-S-TMSI, ... }
+    match ue_paging_id {
+        UePagingIdentity::FiveGSTmsi { amf_set_id, amf_pointer, tmsi } => {
+            encoder.encode_choice_index(0, 1, true)?;
+            // FiveG-S-TMSI SEQUENCE { aMFSetID, aMFPointer, fiveG-TMSI, iE-Extensions OPTIONAL }
+            encoder.write_bit(false); // extension
+            encoder.write_bit(false); // no iE-Extensions
+            // AMFSetID BIT STRING (SIZE(10))
+            encoder.write_bits(*amf_set_id as u64, 10);
+            // AMFPointer BIT STRING (SIZE(6))
+            encoder.write_bits(*amf_pointer as u64, 6);
+            // FiveG-TMSI BIT STRING (SIZE(32))
+            encoder.write_bits(*tmsi as u64, 32);
+        }
+    }
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(IE_ID_UE_PAGING_IDENTITY),
+        criticality: Criticality::Reject,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Encode PagingDRX IE (same as default paging DRX)
+pub fn encode_paging_drx(
+    container: &mut ProtocolIeContainer,
+    drx: PagingDrx,
+) -> NgapResult<()> {
+    let mut encoder = AperEncoder::new();
+    let constraint = ogs_asn1c::per::Constraint::extensible(0, 3);
+    encoder.encode_enumerated(drx as i64, &constraint)?;
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(IE_ID_PAGING_DRX),
+        criticality: Criticality::Ignore,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Encode TAIListForPaging IE
+pub fn encode_tai_list_for_paging(
+    container: &mut ProtocolIeContainer,
+    list: &[TaiListItem],
+) -> NgapResult<()> {
+    let mut encoder = AperEncoder::new();
+    // TAIListForPaging SEQUENCE (SIZE (1..maxnoofTAIforPaging=16)) OF TAI
+    encoder.encode_constrained_length(list.len(), 1, 16)?;
+    for tai in list {
+        encode_tai_inline(&mut encoder, tai)?;
+    }
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(IE_ID_TAI_LIST_FOR_PAGING),
+        criticality: Criticality::Reject,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Encode PagingPriority IE
+pub fn encode_paging_priority(
+    container: &mut ProtocolIeContainer,
+    priority: PagingPriority,
+) -> NgapResult<()> {
+    let mut encoder = AperEncoder::new();
+    // PagingPriority ::= ENUMERATED { priolevel1, ..., priolevel8, ... }
+    let constraint = ogs_asn1c::per::Constraint::extensible(0, 7);
+    encoder.encode_enumerated(priority as i64, &constraint)?;
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(IE_ID_PAGING_PRIORITY),
+        criticality: Criticality::Ignore,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Encode UERadioCapabilityForPaging IE
+pub fn encode_ue_radio_capability_for_paging(
+    container: &mut ProtocolIeContainer,
+    radio_cap: &[u8],
+) -> NgapResult<()> {
+    encode_raw_octet_ie(
+        container,
+        IE_ID_UE_RADIO_CAPABILITY_FOR_PAGING,
+        Criticality::Ignore,
+        radio_cap,
+    )
+}
+
+/// Encode PagingOrigin IE
+pub fn encode_paging_origin(
+    container: &mut ProtocolIeContainer,
+    origin: PagingOrigin,
+) -> NgapResult<()> {
+    let mut encoder = AperEncoder::new();
+    // PagingOrigin ::= ENUMERATED { non-3gpp, ... }
+    let constraint = ogs_asn1c::per::Constraint::extensible(0, 0);
+    encoder.encode_enumerated(origin as i64, &constraint)?;
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(IE_ID_PAGING_ORIGIN),
+        criticality: Criticality::Ignore,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Encode AssistanceDataForPaging IE
+pub fn encode_assistance_data_for_paging(
+    container: &mut ProtocolIeContainer,
+    assistance: &[u8],
+) -> NgapResult<()> {
+    encode_raw_octet_ie(
+        container,
+        IE_ID_ASSISTANCE_DATA_FOR_PAGING,
+        Criticality::Ignore,
+        assistance,
+    )
+}

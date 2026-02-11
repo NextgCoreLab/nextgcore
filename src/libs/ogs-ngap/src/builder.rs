@@ -497,3 +497,252 @@ pub fn build_ue_context_release_request(msg: &UeContextReleaseRequest) -> NgapRe
 
     encode_pdu(&pdu)
 }
+
+// ============================================================================
+// B10.7: Handover Procedures
+// ============================================================================
+
+/// Build a Handover Required PDU
+pub fn build_handover_required(msg: &HandoverRequired) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory)
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+
+    // IE: RAN-UE-NGAP-ID (mandatory)
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+
+    // IE: HandoverType (mandatory)
+    ie::encode_handover_type(&mut container, msg.handover_type)?;
+
+    // IE: Cause (mandatory)
+    ie::encode_cause(&mut container, &msg.cause)?;
+
+    // IE: TargetID (mandatory)
+    ie::encode_target_id(&mut container, &msg.target_id)?;
+
+    // IE: PDUSessionResourceListHORqd (optional)
+    if let Some(ref list) = msg.pdu_session_list {
+        ie::encode_pdu_session_ho_required_list(&mut container, list)?;
+    }
+
+    // IE: SourceToTarget-TransparentContainer (mandatory)
+    ie::encode_source_to_target_container(&mut container, &msg.source_to_target_container)?;
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::HANDOVER_PREPARATION,
+        criticality: Criticality::Reject,
+        value: InitiatingMessageValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+/// Build a Handover Request PDU
+pub fn build_handover_request(msg: &HandoverRequest) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory)
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+
+    // IE: HandoverType (mandatory)
+    ie::encode_handover_type(&mut container, msg.handover_type)?;
+
+    // IE: Cause (mandatory)
+    ie::encode_cause(&mut container, &msg.cause)?;
+
+    // IE: UEAggregateMaximumBitRate (mandatory)
+    ie::encode_ue_ambr(&mut container, &msg.ue_ambr)?;
+
+    // IE: UESecurityCapabilities (mandatory)
+    ie::encode_ue_security_capabilities(&mut container, &msg.ue_security_capabilities)?;
+
+    // IE: SecurityContext (mandatory)
+    ie::encode_security_context(&mut container, &msg.security_context)?;
+
+    // IE: PDUSessionResourceSetupListHOReq (mandatory)
+    ie::encode_pdu_session_ho_request_list(&mut container, &msg.pdu_session_list)?;
+
+    // IE: AllowedNSSAI (mandatory)
+    ie::encode_allowed_nssai(&mut container, &msg.allowed_nssai)?;
+
+    // IE: SourceToTarget-TransparentContainer (mandatory)
+    ie::encode_source_to_target_container(&mut container, &msg.source_to_target_container)?;
+
+    // IE: GUAMI (mandatory)
+    ie::encode_guami_ie(&mut container, &msg.guami)?;
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::HANDOVER_RESOURCE_ALLOCATION,
+        criticality: Criticality::Reject,
+        value: InitiatingMessageValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+/// Build a Handover Request Acknowledge PDU
+pub fn build_handover_request_acknowledge(msg: &HandoverRequestAcknowledge) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory)
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+
+    // IE: RAN-UE-NGAP-ID (mandatory)
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+
+    // IE: PDUSessionResourceAdmittedList (mandatory)
+    ie::encode_pdu_session_admitted_list(&mut container, &msg.admitted_list)?;
+
+    // IE: PDUSessionResourceFailedToSetupListHOAck (optional)
+    if let Some(ref failed) = msg.failed_list {
+        ie::encode_pdu_session_failed_list(
+            &mut container,
+            ie::IE_ID_PDU_SESSION_RESOURCE_FAILED_TO_SETUP_LIST_HO_ACK,
+            failed,
+        )?;
+    }
+
+    // IE: TargetToSource-TransparentContainer (mandatory)
+    ie::encode_target_to_source_container(&mut container, &msg.target_to_source_container)?;
+
+    let pdu = NgapPdu::SuccessfulOutcome(SuccessfulOutcome {
+        procedure_code: ProcedureCode::HANDOVER_RESOURCE_ALLOCATION,
+        criticality: Criticality::Reject,
+        value: SuccessfulOutcomeValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+/// Build a Handover Failure PDU
+pub fn build_handover_failure(msg: &HandoverFailure) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory)
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+
+    // IE: Cause (mandatory)
+    ie::encode_cause(&mut container, &msg.cause)?;
+
+    // IE: CriticalityDiagnostics (optional)
+    if let Some(ref diag) = msg.criticality_diagnostics {
+        ie::encode_criticality_diagnostics(&mut container, diag)?;
+    }
+
+    let pdu = NgapPdu::UnsuccessfulOutcome(UnsuccessfulOutcome {
+        procedure_code: ProcedureCode::HANDOVER_RESOURCE_ALLOCATION,
+        criticality: Criticality::Reject,
+        value: UnsuccessfulOutcomeValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+/// Build a Handover Command PDU
+pub fn build_handover_command(msg: &HandoverCommand) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory)
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+
+    // IE: RAN-UE-NGAP-ID (mandatory)
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+
+    // IE: HandoverType (mandatory)
+    ie::encode_handover_type(&mut container, msg.handover_type)?;
+
+    // IE: NAS-PDU (optional)
+    if let Some(ref nas_pdu) = msg.nas_pdu {
+        ie::encode_nas_pdu(&mut container, nas_pdu)?;
+    }
+
+    // IE: PDUSessionResourceHandoverList (mandatory)
+    ie::encode_pdu_session_handover_list(&mut container, &msg.pdu_session_list)?;
+
+    // IE: PDUSessionResourceToReleaseListHOCmd (optional)
+    if let Some(ref release_list) = msg.release_list {
+        ie::encode_pdu_session_release_list(&mut container, release_list)?;
+    }
+
+    // IE: TargetToSource-TransparentContainer (mandatory)
+    ie::encode_target_to_source_container(&mut container, &msg.target_to_source_container)?;
+
+    let pdu = NgapPdu::SuccessfulOutcome(SuccessfulOutcome {
+        procedure_code: ProcedureCode::HANDOVER_PREPARATION,
+        criticality: Criticality::Reject,
+        value: SuccessfulOutcomeValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+/// Build a Handover Notify PDU
+pub fn build_handover_notify(msg: &HandoverNotify) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory)
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+
+    // IE: RAN-UE-NGAP-ID (mandatory)
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+
+    // IE: UserLocationInformation (mandatory)
+    ie::encode_user_location_info(&mut container, &msg.user_location_info)?;
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::HANDOVER_NOTIFICATION,
+        criticality: Criticality::Ignore,
+        value: InitiatingMessageValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+// ============================================================================
+// B10.8: Paging Procedure
+// ============================================================================
+
+/// Build a Paging PDU
+pub fn build_paging(msg: &Paging) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: UEPagingIdentity (mandatory)
+    ie::encode_ue_paging_identity(&mut container, &msg.ue_paging_identity)?;
+
+    // IE: PagingDRX (optional)
+    if let Some(drx) = msg.paging_drx {
+        ie::encode_paging_drx(&mut container, drx)?;
+    }
+
+    // IE: TAIListForPaging (mandatory)
+    ie::encode_tai_list_for_paging(&mut container, &msg.tai_list)?;
+
+    // IE: PagingPriority (optional)
+    if let Some(priority) = msg.paging_priority {
+        ie::encode_paging_priority(&mut container, priority)?;
+    }
+
+    // IE: UERadioCapabilityForPaging (optional)
+    if let Some(ref radio_cap) = msg.ue_radio_capability {
+        ie::encode_ue_radio_capability_for_paging(&mut container, radio_cap)?;
+    }
+
+    // IE: PagingOrigin (optional)
+    if let Some(origin) = msg.paging_origin {
+        ie::encode_paging_origin(&mut container, origin)?;
+    }
+
+    // IE: AssistanceDataForPaging (optional)
+    if let Some(ref assistance) = msg.assistance_data {
+        ie::encode_assistance_data_for_paging(&mut container, assistance)?;
+    }
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::PAGING,
+        criticality: Criticality::Ignore,
+        value: InitiatingMessageValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}

@@ -6,6 +6,8 @@ pub mod types;
 pub mod header;
 pub mod message;
 pub mod ie;
+pub mod builder;
+pub mod teid_pool;
 
 // Re-export header types
 pub use header::{
@@ -45,3 +47,12 @@ pub use types::{
     GTP2_MAX_EXTENSION_HEADER_LEN, GTP2_F_TEID_HDR_LEN,
     GTP2_F_TEID_IPV4_LEN, GTP2_F_TEID_IPV6_LEN, GTP2_F_TEID_IPV4V6_LEN,
 };
+
+// Re-export builder functions and types
+pub use builder::{
+    build_create_session_request, build_modify_bearer_request,
+    build_delete_session_request, FTeid as BuilderFTeid, Uli, Ambr as BuilderAmbr
+};
+
+// Re-export TEID pool
+pub use teid_pool::TeidPool;

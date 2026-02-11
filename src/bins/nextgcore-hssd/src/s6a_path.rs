@@ -442,6 +442,151 @@ pub struct PurResponse {
     pub result_code: u32,
 }
 
+// ============================================================================
+// Diameter Wire Protocol Helpers (Item 108)
+// ============================================================================
+
+/// Diameter AVP data for wire encoding
+#[derive(Debug, Clone)]
+pub struct DiameterAvpData {
+    /// AVP Code (per RFC 6733)
+    pub code: u32,
+    /// Vendor-ID (0 = IETF, 10415 = 3GPP)
+    pub vendor_id: u32,
+    /// Raw AVP data
+    pub data: Vec<u8>,
+}
+
+/// Build a Diameter answer message with AVPs
+///
+/// Encodes per RFC 6733 Section 3:
+/// - 4 bytes: Version(1) + Message Length(3)
+/// - 4 bytes: Command Flags(1) + Command Code(3)
+/// - 4 bytes: Application-ID
+/// - 4 bytes: Hop-by-Hop Identifier
+/// - 4 bytes: End-to-End Identifier
+/// - AVPs
+pub fn build_diameter_answer(
+    command_code: u32,
+    application_id: u32,
+    avps: &[DiameterAvpData],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(256);
+
+    // Placeholder for header (20 bytes) - will fill length after
+    buf.extend_from_slice(&[0u8; 20]);
+
+    // Encode each AVP
+    for avp in avps {
+        let avp_len = if avp.vendor_id != 0 { 12 + avp.data.len() } else { 8 + avp.data.len() };
+        let padded_len = (avp_len + 3) & !3; // 4-byte aligned
+
+        // AVP Code (4 bytes)
+        buf.extend_from_slice(&avp.code.to_be_bytes());
+        // AVP Flags (1 byte) + AVP Length (3 bytes)
+        let flags: u8 = if avp.vendor_id != 0 { 0x80 } else { 0x40 }; // V flag or M flag
+        buf.push(flags);
+        buf.extend_from_slice(&(avp_len as u32).to_be_bytes()[1..4]);
+        // Vendor-ID (4 bytes, optional)
+        if avp.vendor_id != 0 {
+            buf.extend_from_slice(&avp.vendor_id.to_be_bytes());
+        }
+        // AVP Data
+        buf.extend_from_slice(&avp.data);
+        // Padding
+        let padding = padded_len - avp_len;
+        for _ in 0..padding {
+            buf.push(0);
+        }
+    }
+
+    let msg_len = buf.len() as u32;
+
+    // Fill header
+    buf[0] = 1; // Version
+    buf[1..4].copy_from_slice(&msg_len.to_be_bytes()[1..4]); // Length (3 bytes)
+    // Command Flags: Answer (no R-bit), Proxiable
+    buf[4] = 0x40; // P-bit set (proxiable)
+    buf[5..8].copy_from_slice(&command_code.to_be_bytes()[1..4]); // Command Code (3 bytes)
+    buf[8..12].copy_from_slice(&application_id.to_be_bytes()); // Application-ID
+    buf[12..16].copy_from_slice(&1u32.to_be_bytes()); // Hop-by-Hop (placeholder)
+    buf[16..20].copy_from_slice(&1u32.to_be_bytes()); // End-to-End (placeholder)
+
+    log::debug!("Built Diameter answer: cmd={}, app_id={}, len={}, avps={}",
+        command_code, application_id, msg_len, avps.len());
+
+    buf
+}
+
+/// Encode AIA (Authentication-Information-Answer) AVPs
+pub fn build_aia_avps(auth_info: &AirResponse) -> Vec<DiameterAvpData> {
+    let mut avps = Vec::new();
+
+    // Session-Id (263)
+    avps.push(DiameterAvpData {
+        code: 263, vendor_id: 0,
+        data: b"hss.s6a.session.1".to_vec(),
+    });
+
+    // Result-Code (268) - DIAMETER_SUCCESS
+    avps.push(DiameterAvpData {
+        code: 268, vendor_id: 0,
+        data: 2001u32.to_be_bytes().to_vec(),
+    });
+
+    // Auth-Session-State (277) - NO_STATE_MAINTAINED
+    avps.push(DiameterAvpData {
+        code: 277, vendor_id: 0,
+        data: 1u32.to_be_bytes().to_vec(),
+    });
+
+    // Authentication-Info (1413, 3GPP) containing E-UTRAN-Vector
+    let mut auth_data = Vec::new();
+    auth_data.extend_from_slice(&auth_info.rand);
+    auth_data.extend_from_slice(&auth_info.xres);
+    auth_data.extend_from_slice(&auth_info.autn);
+    auth_data.extend_from_slice(&auth_info.kasme);
+    avps.push(DiameterAvpData {
+        code: 1413, vendor_id: 10415,
+        data: auth_data,
+    });
+
+    avps
+}
+
+/// Encode ULA (Update-Location-Answer) AVPs
+pub fn build_ula_avps(ulr_resp: &UlrResponse) -> Vec<DiameterAvpData> {
+    let mut avps = Vec::new();
+
+    // Session-Id (263)
+    avps.push(DiameterAvpData {
+        code: 263, vendor_id: 0,
+        data: b"hss.s6a.session.1".to_vec(),
+    });
+
+    // Result-Code (268)
+    avps.push(DiameterAvpData {
+        code: 268, vendor_id: 0,
+        data: ulr_resp.result_code.to_be_bytes().to_vec(),
+    });
+
+    // ULA-Flags (1406, 3GPP) - Separation Indication
+    avps.push(DiameterAvpData {
+        code: 1406, vendor_id: 10415,
+        data: 1u32.to_be_bytes().to_vec(),
+    });
+
+    // Subscription-Data (1400, 3GPP)
+    if !ulr_resp.subscription_data.is_empty() {
+        avps.push(DiameterAvpData {
+            code: 1400, vendor_id: 10415,
+            data: ulr_resp.subscription_data.clone(),
+        });
+    }
+
+    avps
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,6 +632,17 @@ mod tests {
         let visited_plmn = [0x00, 0xF1, 0x10]; // MCC=001, MNC=01
         let result = handle_air("123456789012345", &visited_plmn, None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_send_diameter_answer() {
+        // Verify answer builder produces non-empty bytes
+        let avps = vec![
+            DiameterAvpData { code: 263, vendor_id: 0, data: b"session-1".to_vec() },
+            DiameterAvpData { code: 268, vendor_id: 0, data: 2001u32.to_be_bytes().to_vec() },
+        ];
+        let answer = build_diameter_answer(272, OGS_DIAM_S6A_APPLICATION_ID, &avps);
+        assert!(answer.len() > 20); // header + AVPs
     }
 
     #[test]

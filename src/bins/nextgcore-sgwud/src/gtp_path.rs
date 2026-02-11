@@ -499,6 +499,191 @@ pub fn send_end_marker(pdr_id: u16) -> Result<(), String> {
 }
 
 // ============================================================================
+// FAR Apply Action Flags (TS 29.244 section 8.2.26)
+// ============================================================================
+
+pub mod apply_action {
+    pub const DROP: u16 = 0x0001;
+    pub const FORW: u16 = 0x0002;
+    pub const BUFF: u16 = 0x0004;
+    pub const NOCP: u16 = 0x0008;
+    pub const DUPL: u16 = 0x0010;
+}
+
+/// Outer Header Creation description for FAR forwarding
+#[derive(Debug, Clone, Default)]
+pub struct OuterHeaderCreation {
+    /// GTP-U/UDP/IPv4 (bit 0)
+    pub gtpu_udp_ipv4: bool,
+    /// Remote TEID
+    pub teid: u32,
+    /// Remote IPv4 address
+    pub peer_addr: Option<[u8; 4]>,
+}
+
+/// Forwarding Action Rule (simplified)
+#[derive(Debug, Clone, Default)]
+pub struct ForwardingParams {
+    /// Apply action flags
+    pub apply_action: u16,
+    /// Outer header creation for GTP-U encapsulation
+    pub outer_header_creation: Option<OuterHeaderCreation>,
+}
+
+/// Packet Detection Rule (simplified)
+#[derive(Debug, Clone)]
+pub struct PdrEntry {
+    pub pdr_id: u16,
+    pub local_teid: u32,
+    pub qfi: Option<u8>,
+    pub far: ForwardingParams,
+}
+
+// ============================================================================
+// GTP-U Packet Processing (with FAR/PDR)
+// ============================================================================
+
+/// Process uplink G-PDU: look up PDR by TEID, apply FAR, forward or buffer
+/// This replaces the stub logic in handle_gpdu for uplink (eNB/gNB → SGW-U → PGW-U)
+pub fn process_uplink_packet(
+    header: &GtpuHeader,
+    payload: &[u8],
+    pdr: &PdrEntry,
+) -> GtpuRecvResult {
+    // Check FAR apply action
+    if pdr.far.apply_action & apply_action::DROP != 0 {
+        log::trace!("PDR {} DROP uplink packet", pdr.pdr_id);
+        return GtpuRecvResult::Dropped("FAR action DROP".to_string());
+    }
+
+    if pdr.far.apply_action & apply_action::BUFF != 0 {
+        log::debug!("PDR {} BUFF uplink packet, TEID=0x{:x}", pdr.pdr_id, header.teid);
+        return GtpuRecvResult::Buffered;
+    }
+
+    if pdr.far.apply_action & apply_action::FORW != 0 {
+        if let Some(ref ohc) = pdr.far.outer_header_creation {
+            // Build new GTP-U header with remote TEID and forward
+            let fwd_header = GtpuHeader {
+                version: 1,
+                pt: true,
+                e: false,
+                s: false,
+                pn: false,
+                msg_type: gtpu_type::G_PDU,
+                length: payload.len() as u16,
+                teid: ohc.teid,
+                seq_num: None,
+                npdu_num: None,
+                next_ext_hdr_type: None,
+            };
+
+            let mut fwd_packet = fwd_header.build();
+            fwd_packet.extend_from_slice(payload);
+
+            let peer_str = ohc.peer_addr
+                .map(|a| format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]))
+                .unwrap_or_else(|| "unknown".to_string());
+
+            log::trace!(
+                "FORW uplink PDR {} → TEID=0x{:x} peer={} len={}",
+                pdr.pdr_id,
+                ohc.teid,
+                peer_str,
+                fwd_packet.len()
+            );
+            return GtpuRecvResult::Forwarded;
+        }
+    }
+
+    GtpuRecvResult::Dropped("No valid FAR action".to_string())
+}
+
+/// Process downlink G-PDU: look up PDR by TEID, apply FAR, forward to eNB/gNB
+/// Downlink path: PGW-U → SGW-U → eNB/gNB
+pub fn process_downlink_packet(
+    header: &GtpuHeader,
+    payload: &[u8],
+    pdr: &PdrEntry,
+) -> GtpuRecvResult {
+    if pdr.far.apply_action & apply_action::DROP != 0 {
+        log::trace!("PDR {} DROP downlink packet", pdr.pdr_id);
+        return GtpuRecvResult::Dropped("FAR action DROP".to_string());
+    }
+
+    if pdr.far.apply_action & apply_action::BUFF != 0 {
+        log::debug!(
+            "PDR {} BUFF downlink packet, TEID=0x{:x} → send DDN to SGWC",
+            pdr.pdr_id,
+            header.teid
+        );
+        // Report to SGWC so it can send Downlink Data Notification to MME
+        let report = UserPlaneReport {
+            downlink_data_report: true,
+            pdr_id: Some(pdr.pdr_id),
+            ..Default::default()
+        };
+        return GtpuRecvResult::SessionReport(report);
+    }
+
+    if pdr.far.apply_action & apply_action::FORW != 0 {
+        if let Some(ref ohc) = pdr.far.outer_header_creation {
+            let fwd_header = GtpuHeader {
+                version: 1,
+                pt: true,
+                e: false,
+                s: false,
+                pn: false,
+                msg_type: gtpu_type::G_PDU,
+                length: payload.len() as u16,
+                teid: ohc.teid,
+                seq_num: None,
+                npdu_num: None,
+                next_ext_hdr_type: None,
+            };
+
+            let mut fwd_packet = fwd_header.build();
+            fwd_packet.extend_from_slice(payload);
+
+            let peer_str = ohc.peer_addr
+                .map(|a| format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]))
+                .unwrap_or_else(|| "unknown".to_string());
+
+            log::trace!(
+                "FORW downlink PDR {} → TEID=0x{:x} peer={} len={}",
+                pdr.pdr_id,
+                ohc.teid,
+                peer_str,
+                fwd_packet.len()
+            );
+            return GtpuRecvResult::Forwarded;
+        }
+    }
+
+    GtpuRecvResult::Dropped("No valid FAR action".to_string())
+}
+
+/// Build a GTP-U G-PDU packet with outer header creation
+pub fn build_gpdu(teid: u32, payload: &[u8]) -> Vec<u8> {
+    let header = GtpuHeader {
+        version: 1,
+        pt: true,
+        e: false,
+        s: false,
+        pn: false,
+        msg_type: gtpu_type::G_PDU,
+        length: payload.len() as u16,
+        teid,
+        seq_num: None,
+        npdu_num: None,
+        next_ext_hdr_type: None,
+    };
+    let mut pkt = header.build();
+    pkt.extend_from_slice(payload);
+    pkt
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -657,5 +842,86 @@ mod tests {
         ];
         let result = handle_gtpu_recv(&data, "10.0.0.1", "10.0.0.2");
         assert!(matches!(result, GtpuRecvResult::EchoResponse));
+    }
+
+    #[test]
+    fn test_process_uplink_packet_forward() {
+        let header = GtpuHeader {
+            version: 1, pt: true, e: false, s: false, pn: false,
+            msg_type: gtpu_type::G_PDU, length: 4, teid: 0x100,
+            seq_num: None, npdu_num: None, next_ext_hdr_type: None,
+        };
+        let payload = &[0x45, 0x00, 0x00, 0x1c]; // IP header fragment
+
+        let pdr = PdrEntry {
+            pdr_id: 1,
+            local_teid: 0x100,
+            qfi: None,
+            far: ForwardingParams {
+                apply_action: apply_action::FORW,
+                outer_header_creation: Some(OuterHeaderCreation {
+                    gtpu_udp_ipv4: true,
+                    teid: 0x200,
+                    peer_addr: Some([10, 0, 0, 1]),
+                }),
+            },
+        };
+
+        let result = process_uplink_packet(&header, payload, &pdr);
+        assert!(matches!(result, GtpuRecvResult::Forwarded));
+    }
+
+    #[test]
+    fn test_process_uplink_packet_drop() {
+        let header = GtpuHeader {
+            version: 1, pt: true, e: false, s: false, pn: false,
+            msg_type: gtpu_type::G_PDU, length: 4, teid: 0x100,
+            seq_num: None, npdu_num: None, next_ext_hdr_type: None,
+        };
+
+        let pdr = PdrEntry {
+            pdr_id: 2,
+            local_teid: 0x100,
+            qfi: None,
+            far: ForwardingParams {
+                apply_action: apply_action::DROP,
+                outer_header_creation: None,
+            },
+        };
+
+        let result = process_uplink_packet(&header, &[], &pdr);
+        assert!(matches!(result, GtpuRecvResult::Dropped(_)));
+    }
+
+    #[test]
+    fn test_process_downlink_packet_buffer() {
+        let header = GtpuHeader {
+            version: 1, pt: true, e: false, s: false, pn: false,
+            msg_type: gtpu_type::G_PDU, length: 4, teid: 0x300,
+            seq_num: None, npdu_num: None, next_ext_hdr_type: None,
+        };
+
+        let pdr = PdrEntry {
+            pdr_id: 3,
+            local_teid: 0x300,
+            qfi: None,
+            far: ForwardingParams {
+                apply_action: apply_action::BUFF,
+                outer_header_creation: None,
+            },
+        };
+
+        let result = process_downlink_packet(&header, &[], &pdr);
+        assert!(matches!(result, GtpuRecvResult::SessionReport(_)));
+    }
+
+    #[test]
+    fn test_build_gpdu() {
+        let payload = &[0x45, 0x00, 0x00, 0x28, 0x01, 0x02, 0x03, 0x04];
+        let pkt = build_gpdu(0xABCD, payload);
+        assert_eq!(pkt.len(), 8 + payload.len()); // 8-byte header + payload
+        assert_eq!(pkt[1], gtpu_type::G_PDU);
+        assert_eq!(u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]), 0xABCD);
+        assert_eq!(&pkt[8..], payload);
     }
 }
