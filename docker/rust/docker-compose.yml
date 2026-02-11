@@ -17,11 +17,11 @@ x-common: &common
 
 x-nf-healthcheck: &nf-healthcheck
   healthcheck:
-    test: ["CMD", "curl", "-sf", "http://localhost:7777/health"]
+    test: ["CMD-SHELL", "kill -0 1"]
     interval: 10s
     timeout: 5s
     retries: 3
-    start_period: 10s
+    start_period: 5s
 
 services:
   # ==========================================================================
@@ -251,11 +251,11 @@ services:
     ports:
       - "2152:2152/udp"
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "nextgcore-upfd"]
+      test: ["CMD-SHELL", "kill -0 1"]
       interval: 10s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 5s
     depends_on:
       smf:
         condition: service_healthy
@@ -276,11 +276,11 @@ services:
       core:
         ipv4_address: 172.23.0.100
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "nr-gnb"]
+      test: ["CMD-SHELL", "kill -0 1"]
       interval: 10s
       timeout: 5s
       retries: 3
-      start_period: 15s
+      start_period: 10s
     depends_on:
       amf:
         condition: service_healthy
@@ -304,11 +304,11 @@ services:
       core:
         ipv4_address: 172.23.0.101
     healthcheck:
-      test: ["CMD", "pgrep", "-f", "nr-ue"]
+      test: ["CMD-SHELL", "kill -0 1"]
       interval: 10s
       timeout: 5s
       retries: 3
-      start_period: 20s
+      start_period: 15s
     depends_on:
       gnb:
         condition: service_healthy
