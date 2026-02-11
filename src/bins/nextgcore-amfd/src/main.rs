@@ -18,6 +18,7 @@ pub mod sbi_path;
 pub mod namf_handler;
 pub mod timer;
 pub mod metrics;
+pub mod emergency; // #203: Emergency services (TS 23.167)
 
 #[cfg(test)]
 mod property_tests;

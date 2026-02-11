@@ -45,6 +45,7 @@ mod pfcp_path;
 mod pfcp_sm;
 #[cfg(test)]
 mod property_tests;
+mod session_extensions; // #199-#201: IPv6 dual-stack, SSC modes, Ethernet PDU
 mod smf_sm;
 mod timer;
 

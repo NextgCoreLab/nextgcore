@@ -44,6 +44,10 @@ pub use nf_hooks::{
     NfStateSnapshot, NfStatus, DigitalTwinExporter,
     NfEnergyState, EnergyRecommendation, EnergyCoordinator,
     CrossNfIntent, CrossNfIntentCategory, IntentStatus, CrossNfIntentCoordinator,
+    // #214: Digital twin full state synchronization
+    NfStateDelta, SnapshotHistoryEntry, DigitalTwinSyncManager,
+    // #215: NF power profiling & optimization
+    PowerComponent, ComponentPowerProfile, PowerOptimization, PowerAction, NfPowerProfiler,
 };
 
 // Macros are automatically exported via #[macro_export]

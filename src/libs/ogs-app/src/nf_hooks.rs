@@ -437,6 +437,378 @@ impl CrossNfIntentCoordinator {
 }
 
 // ============================================================================
+// Item #214: Digital Twin Full State Synchronization
+// ============================================================================
+
+/// Delta between two NF state snapshots for efficient sync.
+#[derive(Debug, Clone)]
+pub struct NfStateDelta {
+    /// NF instance ID.
+    pub nf_instance_id: String,
+    /// Timestamp (ms since epoch).
+    pub timestamp_ms: u64,
+    /// Changed KPIs only (key → new value).
+    pub changed_kpis: HashMap<String, f64>,
+    /// Changed load (if different).
+    pub load_delta: Option<f64>,
+    /// Changed session count (if different).
+    pub session_delta: Option<i64>,
+    /// Status change (if different).
+    pub status_change: Option<NfStatus>,
+}
+
+/// Snapshot history entry with sequence number for ordering.
+#[derive(Debug, Clone)]
+pub struct SnapshotHistoryEntry {
+    /// Monotonic sequence number.
+    pub sequence: u64,
+    /// The snapshot.
+    pub snapshot: NfStateSnapshot,
+}
+
+/// Full digital twin state synchronization manager.
+/// Extends DigitalTwinExporter with delta sync, history, and cross-NF propagation.
+pub struct DigitalTwinSyncManager {
+    /// Inner exporter.
+    exporter: DigitalTwinExporter,
+    /// Snapshot history (ring buffer).
+    history: Vec<SnapshotHistoryEntry>,
+    /// Max history entries.
+    max_history: usize,
+    /// Next sequence number.
+    next_sequence: u64,
+    /// Peer NF snapshots received via cross-NF sync.
+    peer_snapshots: HashMap<String, NfStateSnapshot>,
+    /// Delta sync count.
+    delta_sync_count: u64,
+}
+
+impl DigitalTwinSyncManager {
+    /// Creates a new sync manager wrapping an exporter.
+    pub fn new(nf_instance_id: impl Into<String>, nf_type: impl Into<String>, sync_interval: Duration, max_history: usize) -> Self {
+        Self {
+            exporter: DigitalTwinExporter::new(nf_instance_id, nf_type, sync_interval),
+            history: Vec::with_capacity(max_history),
+            max_history,
+            next_sequence: 1,
+            peer_snapshots: HashMap::new(),
+            delta_sync_count: 0,
+        }
+    }
+
+    /// Captures a snapshot and stores in history.
+    pub fn capture_with_history(&mut self, load: f64, active_sessions: u64, cpu: f64, memory: f64, kpis: HashMap<String, f64>) -> &NfStateSnapshot {
+        let snap = self.exporter.capture(load, active_sessions, cpu, memory, kpis);
+        let entry = SnapshotHistoryEntry {
+            sequence: self.next_sequence,
+            snapshot: snap.clone(),
+        };
+        self.next_sequence += 1;
+        if self.history.len() >= self.max_history {
+            self.history.remove(0);
+        }
+        self.history.push(entry);
+        self.exporter.latest().unwrap()
+    }
+
+    /// Computes a delta between the current snapshot and a previous one.
+    pub fn compute_delta(&mut self, previous_sequence: u64) -> Option<NfStateDelta> {
+        let current = self.exporter.latest()?;
+        let previous = self.history.iter().find(|e| e.sequence == previous_sequence)?;
+        self.delta_sync_count += 1;
+
+        let mut changed_kpis = HashMap::new();
+        for (k, v) in &current.kpis {
+            match previous.snapshot.kpis.get(k) {
+                Some(prev_v) if (prev_v - v).abs() > f64::EPSILON => {
+                    changed_kpis.insert(k.clone(), *v);
+                }
+                None => {
+                    changed_kpis.insert(k.clone(), *v);
+                }
+                _ => {}
+            }
+        }
+
+        let load_delta = if (current.load - previous.snapshot.load).abs() > 0.001 {
+            Some(current.load)
+        } else { None };
+
+        let session_delta = if current.active_sessions != previous.snapshot.active_sessions {
+            Some(current.active_sessions as i64 - previous.snapshot.active_sessions as i64)
+        } else { None };
+
+        let status_change = if current.status != previous.snapshot.status {
+            Some(current.status)
+        } else { None };
+
+        Some(NfStateDelta {
+            nf_instance_id: current.nf_instance_id.clone(),
+            timestamp_ms: current.timestamp_ms,
+            changed_kpis,
+            load_delta,
+            session_delta,
+            status_change,
+        })
+    }
+
+    /// Receives a peer NF snapshot for cross-NF digital twin view.
+    pub fn receive_peer_snapshot(&mut self, snapshot: NfStateSnapshot) {
+        self.peer_snapshots.insert(snapshot.nf_instance_id.clone(), snapshot);
+    }
+
+    /// Gets the full digital twin view (self + all peers).
+    pub fn full_twin_view(&self) -> Vec<&NfStateSnapshot> {
+        let mut view: Vec<&NfStateSnapshot> = Vec::new();
+        if let Some(snap) = self.exporter.latest() {
+            view.push(snap);
+        }
+        for snap in self.peer_snapshots.values() {
+            view.push(snap);
+        }
+        view
+    }
+
+    /// Latest snapshot sequence number.
+    pub fn latest_sequence(&self) -> u64 { self.next_sequence.saturating_sub(1) }
+    /// History length.
+    pub fn history_len(&self) -> usize { self.history.len() }
+    /// Peer count.
+    pub fn peer_count(&self) -> usize { self.peer_snapshots.len() }
+    /// Delta sync count.
+    pub fn delta_sync_count(&self) -> u64 { self.delta_sync_count }
+    /// Access inner exporter.
+    pub fn exporter(&self) -> &DigitalTwinExporter { &self.exporter }
+}
+
+// ============================================================================
+// Item #215: NF Power Profiling & Optimization
+// ============================================================================
+
+/// Power component within an NF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PowerComponent {
+    /// CPU/processing.
+    Cpu,
+    /// Memory subsystem.
+    Memory,
+    /// Network I/O.
+    NetworkIo,
+    /// Storage I/O.
+    StorageIo,
+    /// Crypto/security acceleration.
+    CryptoAccel,
+    /// Base/idle overhead.
+    BaseIdle,
+}
+
+/// Per-component power measurement.
+#[derive(Debug, Clone)]
+pub struct ComponentPowerProfile {
+    /// Component type.
+    pub component: PowerComponent,
+    /// Current power draw (watts).
+    pub current_watts: f64,
+    /// Peak power draw (watts).
+    pub peak_watts: f64,
+    /// Idle power draw (watts).
+    pub idle_watts: f64,
+    /// Utilization (0.0-1.0).
+    pub utilization: f64,
+}
+
+impl ComponentPowerProfile {
+    pub fn new(component: PowerComponent, idle_watts: f64, peak_watts: f64) -> Self {
+        Self {
+            component,
+            current_watts: idle_watts,
+            peak_watts,
+            idle_watts,
+            utilization: 0.0,
+        }
+    }
+
+    /// Updates power based on utilization using linear model.
+    pub fn update_utilization(&mut self, utilization: f64) {
+        self.utilization = utilization.clamp(0.0, 1.0);
+        self.current_watts = self.idle_watts + (self.peak_watts - self.idle_watts) * self.utilization;
+    }
+
+    /// Energy efficiency ratio (throughput-equivalent per watt).
+    pub fn efficiency(&self) -> f64 {
+        if self.current_watts > 0.0 { self.utilization / self.current_watts } else { 0.0 }
+    }
+}
+
+/// Power optimization recommendation.
+#[derive(Debug, Clone)]
+pub struct PowerOptimization {
+    /// Target component.
+    pub component: PowerComponent,
+    /// Recommended action.
+    pub action: PowerAction,
+    /// Estimated saving (watts).
+    pub estimated_saving_watts: f64,
+    /// Impact on latency (estimated ms increase).
+    pub latency_impact_ms: f64,
+}
+
+/// Power optimization action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerAction {
+    /// Reduce clock frequency.
+    ReduceFrequency,
+    /// Disable idle cores.
+    DisableIdleCores,
+    /// Batch I/O operations.
+    BatchIo,
+    /// Enable hardware offload.
+    EnableHwOffload,
+    /// Consolidate workloads.
+    ConsolidateWorkloads,
+    /// No change needed.
+    NoChange,
+}
+
+/// NF power profiler and optimizer.
+pub struct NfPowerProfiler {
+    /// NF instance ID.
+    nf_instance_id: String,
+    /// Per-component profiles.
+    components: HashMap<PowerComponent, ComponentPowerProfile>,
+    /// Power measurement history (timestamp_ms → total_watts).
+    power_history: Vec<(u64, f64)>,
+    /// Max history entries.
+    max_history: usize,
+    /// Optimization recommendations generated.
+    optimization_count: u64,
+    /// Carbon intensity (gCO2/kWh, for carbon-aware scheduling).
+    carbon_intensity: f64,
+}
+
+impl NfPowerProfiler {
+    /// Creates a new profiler with default component profiles.
+    pub fn new(nf_instance_id: impl Into<String>) -> Self {
+        let mut components = HashMap::new();
+        components.insert(PowerComponent::Cpu, ComponentPowerProfile::new(PowerComponent::Cpu, 5.0, 65.0));
+        components.insert(PowerComponent::Memory, ComponentPowerProfile::new(PowerComponent::Memory, 2.0, 10.0));
+        components.insert(PowerComponent::NetworkIo, ComponentPowerProfile::new(PowerComponent::NetworkIo, 1.0, 15.0));
+        components.insert(PowerComponent::StorageIo, ComponentPowerProfile::new(PowerComponent::StorageIo, 0.5, 5.0));
+        components.insert(PowerComponent::CryptoAccel, ComponentPowerProfile::new(PowerComponent::CryptoAccel, 0.0, 20.0));
+        components.insert(PowerComponent::BaseIdle, ComponentPowerProfile::new(PowerComponent::BaseIdle, 3.0, 3.0));
+
+        Self {
+            nf_instance_id: nf_instance_id.into(),
+            components,
+            power_history: Vec::new(),
+            max_history: 1000,
+            optimization_count: 0,
+            carbon_intensity: 400.0, // Global average gCO2/kWh
+        }
+    }
+
+    /// Updates utilization for a component.
+    pub fn update_component(&mut self, component: PowerComponent, utilization: f64) {
+        if let Some(profile) = self.components.get_mut(&component) {
+            profile.update_utilization(utilization);
+        }
+    }
+
+    /// Records a power measurement.
+    pub fn record_measurement(&mut self) {
+        let total = self.total_power_watts();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        if self.power_history.len() >= self.max_history {
+            self.power_history.remove(0);
+        }
+        self.power_history.push((now, total));
+    }
+
+    /// Total current power draw across all components (watts).
+    pub fn total_power_watts(&self) -> f64 {
+        self.components.values().map(|c| c.current_watts).sum()
+    }
+
+    /// Average power over the history window (watts).
+    pub fn average_power_watts(&self) -> f64 {
+        if self.power_history.is_empty() { return 0.0; }
+        let sum: f64 = self.power_history.iter().map(|(_, w)| w).sum();
+        sum / self.power_history.len() as f64
+    }
+
+    /// Carbon footprint estimate (gCO2 per hour at current draw).
+    pub fn carbon_footprint_g_per_hour(&self) -> f64 {
+        self.total_power_watts() / 1000.0 * self.carbon_intensity
+    }
+
+    /// Sets carbon intensity for the deployment region.
+    pub fn set_carbon_intensity(&mut self, g_co2_per_kwh: f64) {
+        self.carbon_intensity = g_co2_per_kwh;
+    }
+
+    /// Generates power optimization recommendations.
+    pub fn recommend_optimizations(&mut self) -> Vec<PowerOptimization> {
+        self.optimization_count += 1;
+        let mut recommendations = Vec::new();
+
+        for profile in self.components.values() {
+            let opt = match profile.component {
+                PowerComponent::Cpu if profile.utilization < 0.2 => {
+                    Some(PowerOptimization {
+                        component: PowerComponent::Cpu,
+                        action: PowerAction::DisableIdleCores,
+                        estimated_saving_watts: (profile.current_watts - profile.idle_watts) * 0.5,
+                        latency_impact_ms: 0.5,
+                    })
+                }
+                PowerComponent::Cpu if profile.utilization < 0.5 => {
+                    Some(PowerOptimization {
+                        component: PowerComponent::Cpu,
+                        action: PowerAction::ReduceFrequency,
+                        estimated_saving_watts: (profile.current_watts - profile.idle_watts) * 0.3,
+                        latency_impact_ms: 1.0,
+                    })
+                }
+                PowerComponent::NetworkIo if profile.utilization < 0.3 => {
+                    Some(PowerOptimization {
+                        component: PowerComponent::NetworkIo,
+                        action: PowerAction::BatchIo,
+                        estimated_saving_watts: profile.current_watts * 0.2,
+                        latency_impact_ms: 2.0,
+                    })
+                }
+                PowerComponent::CryptoAccel if profile.utilization > 0.5 => {
+                    Some(PowerOptimization {
+                        component: PowerComponent::CryptoAccel,
+                        action: PowerAction::EnableHwOffload,
+                        estimated_saving_watts: profile.current_watts * 0.4,
+                        latency_impact_ms: -0.5, // Actually faster
+                    })
+                }
+                _ => None,
+            };
+            if let Some(o) = opt {
+                recommendations.push(o);
+            }
+        }
+
+        recommendations
+    }
+
+    /// Gets profile for a specific component.
+    pub fn get_component(&self, component: PowerComponent) -> Option<&ComponentPowerProfile> {
+        self.components.get(&component)
+    }
+
+    /// NF instance ID.
+    pub fn nf_instance_id(&self) -> &str { &self.nf_instance_id }
+    /// Total optimization recommendations generated.
+    pub fn optimization_count(&self) -> u64 { self.optimization_count }
+    /// Power history length.
+    pub fn history_len(&self) -> usize { self.power_history.len() }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -523,5 +895,145 @@ mod tests {
         coord.update_consumption(300.0, 0.1); // Under budget, low renewable
         let rec = coord.recommend("upf-1", 0.1);
         assert_eq!(rec.recommended_state, NfEnergyState::EnergySaving1);
+    }
+
+    // ---- Item #214: Digital Twin State Sync tests ----
+
+    #[test]
+    fn test_digital_twin_sync_capture_history() {
+        let mut mgr = DigitalTwinSyncManager::new("amf-1", "AMF", Duration::from_secs(5), 100);
+        let kpis = HashMap::from([("ue_count".into(), 10.0)]);
+        mgr.capture_with_history(0.3, 50, 0.2, 0.3, kpis);
+        assert_eq!(mgr.history_len(), 1);
+        assert_eq!(mgr.latest_sequence(), 1);
+
+        let kpis2 = HashMap::from([("ue_count".into(), 20.0)]);
+        mgr.capture_with_history(0.6, 100, 0.5, 0.4, kpis2);
+        assert_eq!(mgr.history_len(), 2);
+        assert_eq!(mgr.latest_sequence(), 2);
+    }
+
+    #[test]
+    fn test_digital_twin_sync_delta() {
+        let mut mgr = DigitalTwinSyncManager::new("smf-1", "SMF", Duration::from_secs(5), 100);
+        let kpis1 = HashMap::from([("sessions".into(), 100.0)]);
+        mgr.capture_with_history(0.3, 50, 0.2, 0.3, kpis1);
+        let seq1 = mgr.latest_sequence();
+
+        let kpis2 = HashMap::from([("sessions".into(), 150.0), ("throughput".into(), 500.0)]);
+        mgr.capture_with_history(0.6, 80, 0.5, 0.4, kpis2);
+
+        let delta = mgr.compute_delta(seq1).unwrap();
+        assert_eq!(delta.nf_instance_id, "smf-1");
+        assert!(delta.load_delta.is_some());
+        assert!(delta.session_delta.is_some());
+        assert_eq!(delta.session_delta.unwrap(), 30); // 80 - 50
+        assert!(delta.changed_kpis.contains_key("sessions"));
+        assert!(delta.changed_kpis.contains_key("throughput"));
+        assert_eq!(mgr.delta_sync_count(), 1);
+    }
+
+    #[test]
+    fn test_digital_twin_sync_peer_view() {
+        let mut mgr = DigitalTwinSyncManager::new("amf-1", "AMF", Duration::from_secs(5), 100);
+        mgr.capture_with_history(0.5, 100, 0.3, 0.4, HashMap::new());
+
+        let peer_snap = NfStateSnapshot {
+            nf_instance_id: "smf-1".into(),
+            nf_type: "SMF".into(),
+            timestamp_ms: 1000,
+            status: NfStatus::Registered,
+            load: 0.4,
+            active_sessions: 200,
+            cpu_utilization: 0.3,
+            memory_utilization: 0.5,
+            kpis: HashMap::new(),
+        };
+        mgr.receive_peer_snapshot(peer_snap);
+        assert_eq!(mgr.peer_count(), 1);
+
+        let view = mgr.full_twin_view();
+        assert_eq!(view.len(), 2); // self + 1 peer
+    }
+
+    #[test]
+    fn test_digital_twin_sync_history_ring_buffer() {
+        let mut mgr = DigitalTwinSyncManager::new("upf-1", "UPF", Duration::from_secs(1), 3);
+        for i in 0..5 {
+            mgr.capture_with_history(0.1 * i as f64, i as u64, 0.0, 0.0, HashMap::new());
+        }
+        assert_eq!(mgr.history_len(), 3); // Capped at max
+        assert_eq!(mgr.latest_sequence(), 5);
+    }
+
+    // ---- Item #215: NF Power Profiling tests ----
+
+    #[test]
+    fn test_power_profiler_defaults() {
+        let profiler = NfPowerProfiler::new("amf-1");
+        // At idle: CPU(5) + Mem(2) + Net(1) + Storage(0.5) + Crypto(0) + Base(3) = 11.5W
+        let total = profiler.total_power_watts();
+        assert!((total - 11.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_power_profiler_utilization() {
+        let mut profiler = NfPowerProfiler::new("amf-1");
+        profiler.update_component(PowerComponent::Cpu, 1.0); // Full load
+        let cpu = profiler.get_component(PowerComponent::Cpu).unwrap();
+        assert!((cpu.current_watts - 65.0).abs() < 0.01); // Peak
+        assert!((cpu.utilization - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_power_profiler_efficiency() {
+        let mut profile = ComponentPowerProfile::new(PowerComponent::Cpu, 5.0, 65.0);
+        profile.update_utilization(0.5);
+        let eff = profile.efficiency();
+        assert!(eff > 0.0);
+        // At 50% util: power = 5 + 60*0.5 = 35W, efficiency = 0.5/35 ≈ 0.0143
+        assert!((eff - 0.5 / 35.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_power_profiler_recommendations() {
+        let mut profiler = NfPowerProfiler::new("smf-1");
+        profiler.update_component(PowerComponent::Cpu, 0.1); // Low CPU
+        profiler.update_component(PowerComponent::NetworkIo, 0.1); // Low network
+
+        let recs = profiler.recommend_optimizations();
+        assert!(!recs.is_empty());
+        // Should recommend DisableIdleCores for CPU
+        assert!(recs.iter().any(|r| r.component == PowerComponent::Cpu && r.action == PowerAction::DisableIdleCores));
+        // Should recommend BatchIo for NetworkIo
+        assert!(recs.iter().any(|r| r.component == PowerComponent::NetworkIo && r.action == PowerAction::BatchIo));
+        assert_eq!(profiler.optimization_count(), 1);
+    }
+
+    #[test]
+    fn test_power_profiler_carbon_footprint() {
+        let profiler = NfPowerProfiler::new("upf-1");
+        let carbon = profiler.carbon_footprint_g_per_hour();
+        // 11.5W / 1000 * 400 gCO2/kWh = 4.6 gCO2/h
+        assert!((carbon - 4.6).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_power_profiler_measurement_history() {
+        let mut profiler = NfPowerProfiler::new("amf-1");
+        profiler.record_measurement();
+        profiler.record_measurement();
+        assert_eq!(profiler.history_len(), 2);
+        assert!(profiler.average_power_watts() > 0.0);
+    }
+
+    #[test]
+    fn test_power_profiler_crypto_offload() {
+        let mut profiler = NfPowerProfiler::new("ausf-1");
+        profiler.update_component(PowerComponent::CryptoAccel, 0.8); // High crypto
+        profiler.update_component(PowerComponent::Cpu, 0.7); // High CPU (no recommendation)
+
+        let recs = profiler.recommend_optimizations();
+        assert!(recs.iter().any(|r| r.component == PowerComponent::CryptoAccel && r.action == PowerAction::EnableHwOffload));
     }
 }
