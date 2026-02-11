@@ -10,6 +10,7 @@ pub mod config;
 pub mod context;
 pub mod init;
 pub mod intent;  // B3.2: Intent-based configuration translation
+pub mod nf_hooks; // #197: Cross-NF AI/ML hooks, digital twin, energy, intent API
 
 #[cfg(test)]
 mod property_tests;
@@ -36,6 +37,13 @@ pub use intent::{
     NetworkIntent, IntentTranslator, IntentError, IntentResult,
     IntentPriority, SliceIntent, QosIntent, SecurityIntent, EnergyIntent,
     AiMlIntent, DerivedConfig,
+};
+
+pub use nf_hooks::{
+    AiMlHookPoint, AiMlHookAction, AiMlHook, AiMlHookRegistry,
+    NfStateSnapshot, NfStatus, DigitalTwinExporter,
+    NfEnergyState, EnergyRecommendation, EnergyCoordinator,
+    CrossNfIntent, CrossNfIntentCategory, IntentStatus, CrossNfIntentCoordinator,
 };
 
 // Macros are automatically exported via #[macro_export]

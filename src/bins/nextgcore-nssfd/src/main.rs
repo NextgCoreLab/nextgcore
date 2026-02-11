@@ -20,6 +20,7 @@ use std::time::Duration;
 mod context;
 mod event;
 mod nnrf_handler;
+mod nsacf;
 mod nnssf_build;
 mod nnssf_handler;
 mod nssf_sm;

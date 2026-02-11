@@ -18,6 +18,7 @@ pub mod n4_handler;
 pub mod pfcp_path;
 pub mod pfcp_sm;
 pub mod rule_match;
+pub mod programmable_plane;
 pub mod timer;
 pub mod upf_sm;
 

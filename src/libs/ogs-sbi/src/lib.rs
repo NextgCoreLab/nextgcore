@@ -46,6 +46,8 @@ pub mod tls;
 pub mod types;
 pub mod scp;
 pub mod heartbeat;
+pub mod grpc;    // SBI 2.0 gRPC support (B6.1)
+pub mod pubsub;  // Event-driven pub-sub (B6.1)
 
 pub mod client;
 pub mod server;
@@ -77,6 +79,12 @@ pub use heartbeat::{
 pub use security::{
     NrfSecurityConfig, PqcKeyExchange, PqcSignature, PqcTlsConfig, SbiSecurityPolicy,
     TlsPaths, TlsVersion, authorize_sbi_request, extract_bearer_token, validate_bearer_token,
+};
+pub use grpc::{
+    GrpcConfig, GrpcMetadata, GrpcMethod, GrpcServiceType, GrpcStatus,
+};
+pub use pubsub::{
+    EventBroker, EventFilter, SbiEvent, SbiEventCategory, Subscription, SubscriptionId,
 };
 
 /// Initialize the SBI library

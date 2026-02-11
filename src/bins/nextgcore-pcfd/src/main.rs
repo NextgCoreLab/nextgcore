@@ -25,6 +25,7 @@ mod nudr_handler;
 mod pcf_sm;
 mod sbi_path;
 mod sbi_response;
+mod intent_policy;
 mod sm_sm;
 mod timer;
 

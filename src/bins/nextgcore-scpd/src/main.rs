@@ -15,6 +15,7 @@ use std::time::Duration;
 mod context;
 mod event;
 mod sbi_path;
+mod service_mesh;
 mod sbi_response;
 mod scp_sm;
 mod timer;
