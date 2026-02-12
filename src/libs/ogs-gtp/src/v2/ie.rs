@@ -2,6 +2,7 @@
 //!
 //! Information Element types and encoding/decoding for GTPv2-C protocol.
 
+use std::fmt;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::error::{GtpError, GtpResult};
 
@@ -851,24 +852,27 @@ impl Gtp2ApnIe {
         Ok(Self { apn: value.to_vec() })
     }
 
-    pub fn to_string(&self) -> String {
-        // Convert length-prefixed format to dot-separated string
-        let mut result = String::new();
+}
+
+impl fmt::Display for Gtp2ApnIe {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
         let mut i = 0;
         while i < self.apn.len() {
             let len = self.apn[i] as usize;
             if i + 1 + len > self.apn.len() {
                 break;
             }
-            if !result.is_empty() {
-                result.push('.');
+            if !first {
+                write!(f, ".")?;
             }
+            first = false;
             if let Ok(s) = std::str::from_utf8(&self.apn[i + 1..i + 1 + len]) {
-                result.push_str(s);
+                write!(f, "{s}")?;
             }
             i += 1 + len;
         }
-        result
+        Ok(())
     }
 }
 

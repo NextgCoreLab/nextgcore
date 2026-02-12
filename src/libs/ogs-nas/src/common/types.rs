@@ -2,6 +2,7 @@
 //!
 //! Based on 3GPP TS 24.501 and TS 24.301
 
+use std::fmt;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::error::{NasError, NasResult};
 
@@ -440,9 +441,11 @@ impl Dnn {
         Ok(Self { value })
     }
 
-    /// Convert to string representation
-    pub fn to_string(&self) -> String {
-        let mut result = String::new();
+}
+
+impl fmt::Display for Dnn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
         let mut i = 0;
         while i < self.value.len() {
             let label_len = self.value[i] as usize;
@@ -450,15 +453,16 @@ impl Dnn {
             if i + label_len > self.value.len() {
                 break;
             }
-            if !result.is_empty() {
-                result.push('.');
+            if !first {
+                write!(f, ".")?;
             }
+            first = false;
             if let Ok(s) = std::str::from_utf8(&self.value[i..i + label_len]) {
-                result.push_str(s);
+                write!(f, "{s}")?;
             }
             i += label_len;
         }
-        result
+        Ok(())
     }
 }
 
