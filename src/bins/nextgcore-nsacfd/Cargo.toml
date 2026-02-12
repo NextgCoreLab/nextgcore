@@ -1,28 +1,27 @@
 [package]
-name = "nextgcore-hssd"
+name = "nextgcore-nsacfd"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "NextGCore HSS (Home Subscriber Server)"
+description = "NextGCore NSACF (Network Slice Admission Control Function, TS 23.502 4.2.9)"
 
 [[bin]]
-name = "nextgcore-hssd"
+name = "nextgcore-nsacfd"
 path = "src/main.rs"
 
 [dependencies]
 ogs-core = { workspace = true }
-ogs-crypt = { workspace = true }
-ogs-diameter = { workspace = true }
-ogs-dbi = { workspace = true }
+ogs-sbi = { workspace = true }
 ogs-app = { workspace = true }
-bytes.workspace = true
 log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
-clap = { workspace = true, features = ["derive"] }
-ctrlc = { workspace = true, features = ["termination"] }
+serde_json.workspace = true
+uuid = { version = "1.6", features = ["v4"] }
+clap = { version = "4.4", features = ["derive"] }
+ctrlc = "3.4"
 
 [dev-dependencies]
 proptest.workspace = true

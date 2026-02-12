@@ -860,34 +860,57 @@ async fn run_event_loop_async(_nrf_sm: &mut NrfSmContext, shutdown: Arc<AtomicBo
                     }
                 }
                 Some(nextgcore_nrfd::NrfTimerId::NfInstanceNoHeartbeat) => {
-                    // NF instance missed heartbeat -- deregister it
+                    // NF instance missed heartbeat (TS 29.510)
                     if let Some(ref nf_instance_id) = event.nf_instance_id {
-                        log::warn!(
-                            "NF instance {nf_instance_id} missed heartbeat, deregistering"
-                        );
                         let manager = nf_manager();
 
-                        // Fetch profile before removal for notification
-                        let profile = manager.get(nf_instance_id);
-                        manager.deregister(nf_instance_id).ok();
+                        if manager.is_suspended(nf_instance_id) {
+                            // Already SUSPENDED - now auto-deregister
+                            log::warn!(
+                                "NF instance {nf_instance_id} still no heartbeat after suspension, deregistering"
+                            );
 
-                        // Send NF_DEREGISTERED notification
-                        if let Some(profile) = profile {
-                            let server_uri = "http://127.0.0.1:7777".to_string();
-                            tokio::spawn(async move {
-                                if let Err(e) =
-                                    nrf_nnrf_nfm_send_nf_status_notify_all_async(
-                                        NotificationEventType::NfDeregistered,
-                                        &profile,
-                                        &server_uri,
-                                    )
-                                    .await
-                                {
-                                    log::error!(
-                                        "Failed to send NF_DEREGISTERED notifications: {e}"
-                                    );
-                                }
-                            });
+                            let profile = manager.get(nf_instance_id);
+                            manager.deregister(nf_instance_id).ok();
+
+                            // Send NF_DEREGISTERED notification
+                            if let Some(profile) = profile {
+                                let server_uri = "http://127.0.0.1:7777".to_string();
+                                tokio::spawn(async move {
+                                    if let Err(e) =
+                                        nrf_nnrf_nfm_send_nf_status_notify_all_async(
+                                            NotificationEventType::NfDeregistered,
+                                            &profile,
+                                            &server_uri,
+                                        )
+                                        .await
+                                    {
+                                        log::error!(
+                                            "Failed to send NF_DEREGISTERED notifications: {e}"
+                                        );
+                                    }
+                                });
+                            }
+                        } else {
+                            // First missed heartbeat - mark as SUSPENDED
+                            log::warn!(
+                                "NF instance {nf_instance_id} missed heartbeat, marking SUSPENDED"
+                            );
+                            manager.suspend(nf_instance_id);
+
+                            // Start a grace period timer for auto-deregistration
+                            // Use same interval as heartbeat for the grace period
+                            if let Some(profile) = manager.get(nf_instance_id) {
+                                let grace_secs = profile.heartbeat_timer.unwrap_or(10) as u64;
+                                let _ = timer_manager().add_timer(
+                                    nextgcore_nrfd::NrfTimerId::NfInstanceNoHeartbeat,
+                                    std::time::Duration::from_secs(grace_secs),
+                                    nf_instance_id.clone(),
+                                );
+                                log::info!(
+                                    "NF instance {nf_instance_id} grace period: {grace_secs}s before deregistration"
+                                );
+                            }
                         }
                     }
                 }

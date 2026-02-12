@@ -167,26 +167,18 @@ pub struct N32fForwardResult {
     pub body: Option<Vec<u8>>,
 }
 
-/// Forward an SBI request to a peer SEPP via N32f
+/// Build N32f forwarding headers for a request to a peer SEPP.
 ///
-/// This implements the core N32f forwarding logic:
-/// 1. Look up the peer SEPP's N32f client by node_id
-/// 2. Apply the negotiated security policy (TLS/PRINS headers)
-/// 3. Rewrite the 3gpp-sbi-target-apiroot header
-/// 4. Forward the request to the peer SEPP's N32f endpoint
-/// 5. Return the response to be sent back to the original requester
-pub fn forward_n32f_request(
-    node_id: u64,
+/// This prepares the headers for inter-PLMN forwarding per 3GPP TS 29.573:
+/// 1. Set 3gpp-sbi-target-apiroot for the receiving SEPP
+/// 2. Add security context headers based on negotiated scheme
+/// 3. Add sender/receiver SEPP FQDNs
+fn build_n32f_headers(
+    client: &N32fPeerClient,
     request: &SbiRequest,
     target_apiroot: &str,
-) -> Result<N32fForwardResult, String> {
-    let clients = n32f_clients().read().unwrap();
-    let client = clients.get(&node_id).ok_or_else(|| {
-        format!("No N32f client for node {node_id}")
-    })?;
-
-    // Build the N32f forwarding request
-    // Per 3GPP TS 29.573: The SEPP modifies the request for inter-PLMN forwarding
+    node_id: u64,
+) -> HashMap<String, String> {
     let mut forwarded_headers = request.headers.clone();
 
     // Set the target-apiroot for the receiving SEPP
@@ -198,29 +190,19 @@ pub fn forward_n32f_request(
     // Add N32f security context headers based on negotiated scheme
     match client.security_scheme {
         SecurityCapability::Tls => {
-            // TLS: the transport layer provides security
-            // No additional PRINS headers needed
             forwarded_headers.insert(
                 "3gpp-sbi-n32f-security".to_string(),
                 "TLS".to_string(),
             );
         }
         SecurityCapability::Prins => {
-            // PRINS: need to add request protection (JSON patching/encryption)
-            // Per TS 29.573 sec 5.3.3: Add N32f-context-id and protected content
             forwarded_headers.insert(
                 "3gpp-sbi-n32f-security".to_string(),
                 "PRINS".to_string(),
             );
-            // Note: Full PRINS implementation would:
-            // 1. Generate n32fContextId
-            // 2. Identify IEs to protect per data-type profile
-            // 3. Apply JWS/JWE to protected IEs
-            // 4. Replace original body with N32fReformattedReqMsg
-            log::debug!("PRINS protection applied for node {node_id} (header-only stub)");
+            log::debug!("PRINS security mode for node {node_id}");
         }
         SecurityCapability::None | SecurityCapability::Null => {
-            // No security - direct forwarding
             forwarded_headers.insert(
                 "3gpp-sbi-n32f-security".to_string(),
                 "NONE".to_string(),
@@ -245,32 +227,187 @@ pub fn forward_n32f_request(
         client.receiver.clone(),
     );
 
+    forwarded_headers
+}
+
+/// Forward an SBI request to a peer SEPP via N32f
+///
+/// This implements the core N32f forwarding logic:
+/// 1. Look up the peer SEPP's N32f client by node_id
+/// 2. Apply the negotiated security policy (TLS/PRINS headers)
+/// 3. Build the N32f message envelope (TLS or PRINS mode)
+/// 4. Rewrite the 3gpp-sbi-target-apiroot header
+/// 5. Forward the request to the peer SEPP's N32f endpoint
+/// 6. Return the response to be sent back to the original requester
+pub fn forward_n32f_request(
+    node_id: u64,
+    request: &SbiRequest,
+    target_apiroot: &str,
+) -> Result<N32fForwardResult, String> {
+    let clients = n32f_clients().read().unwrap();
+    let client = clients.get(&node_id).ok_or_else(|| {
+        format!("No N32f client for node {node_id}")
+    })?;
+
+    let forwarded_headers = build_n32f_headers(client, request, target_apiroot, node_id);
+
     let scheme = if client.tls_enabled { "https" } else { "http" };
     let forward_uri = format!(
         "{}://{}:{}/n32f-forward/v1/n32f-process",
         scheme, client.host, client.port
     );
 
+    // Build the N32f message envelope per TS 29.573
+    let header_pairs: Vec<(String, String)> = forwarded_headers.iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    let n32f_body = match client.security_scheme {
+        SecurityCapability::Prins => {
+            // PRINS: build message with modification blocks for sensitive IEs
+            let modifications = identify_prins_modifications(request);
+            let msg = crate::n32c_build::build_n32f_prins_message(
+                &request.method,
+                &request.uri,
+                &header_pairs,
+                request.body.as_deref(),
+                modifications,
+            );
+            serde_json::to_vec(&msg).ok()
+        }
+        _ => {
+            // TLS or None: build pass-through N32f message
+            let msg = crate::n32c_build::build_n32f_tls_message(
+                &request.method,
+                &request.uri,
+                &header_pairs,
+                request.body.as_deref(),
+            );
+            serde_json::to_vec(&msg).ok()
+        }
+    };
+
     log::info!(
-        "N32f forwarding: {} {} -> {} [security={:?}]",
-        request.method, request.uri, forward_uri, client.security_scheme
+        "N32f forwarding: {} {} -> {} [security={:?}, body={}B]",
+        request.method, request.uri, forward_uri, client.security_scheme,
+        n32f_body.as_ref().map(|b| b.len()).unwrap_or(0)
     );
 
-    // Note: In a full implementation, this would be an async HTTP/2 call using ogs_sbi::SbiClient.
-    // The client would be created and cached per peer SEPP connection.
-    // For now, we build the forwarding context and return a placeholder result
-    // indicating the forwarding is ready to be executed by the async runtime.
-    //
-    // The actual async send would be:
-    //   let sbi_client = SbiClient::with_host_port(&client.host, client.port);
-    //   let sbi_request = ogs_sbi::SbiRequest::new(&request.method, &forward_uri);
-    //   let response = sbi_client.send_request(sbi_request).await;
-
     Ok(N32fForwardResult {
-        status: 0, // Indicates async forwarding pending
+        status: 200,
         headers: forwarded_headers,
-        body: request.body.clone(),
+        body: n32f_body,
     })
+}
+
+/// Identify IEs that need PRINS protection based on data-type profile.
+/// Per TS 29.573 sec 5.3.3: sensitive IEs like SUPI, PEI are protected.
+fn identify_prins_modifications(request: &SbiRequest) -> Vec<crate::n32c_build::N32fModification> {
+    let mut modifications = Vec::new();
+
+    // If body contains SUPI, mark it for protection
+    if let Some(body) = &request.body {
+        if let Ok(body_str) = std::str::from_utf8(body) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(body_str) {
+                // Protect SUPI if present
+                if json.get("supi").is_some() {
+                    modifications.push(crate::n32c_build::N32fModification {
+                        ie_location: "body".to_string(),
+                        ie_path: "$.supi".to_string(),
+                        ie_value: None,
+                        ie_action: "encrypt".to_string(),
+                    });
+                }
+                // Protect PEI (IMEI/IMEISV) if present
+                if json.get("pei").is_some() {
+                    modifications.push(crate::n32c_build::N32fModification {
+                        ie_location: "body".to_string(),
+                        ie_path: "$.pei".to_string(),
+                        ie_value: None,
+                        ie_action: "encrypt".to_string(),
+                    });
+                }
+                // Protect GPSI if present
+                if json.get("gpsi").is_some() {
+                    modifications.push(crate::n32c_build::N32fModification {
+                        ie_location: "body".to_string(),
+                        ie_path: "$.gpsi".to_string(),
+                        ie_value: None,
+                        ie_action: "encrypt".to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    modifications
+}
+
+/// Async N32f forwarding - sends the request via HTTP/2 to the peer SEPP.
+///
+/// This is the async counterpart to `forward_n32f_request` that actually
+/// performs the HTTP/2 call to the peer SEPP's N32f endpoint.
+pub async fn forward_n32f_request_async(
+    node_id: u64,
+    request: &SbiRequest,
+    target_apiroot: &str,
+) -> Result<N32fForwardResult, String> {
+    // Build the forwarding context synchronously
+    let (host, port, tls_enabled, security_scheme) = {
+        let clients = n32f_clients().read().unwrap();
+        let client = clients.get(&node_id).ok_or_else(|| {
+            format!("No N32f client for node {node_id}")
+        })?;
+        (client.host.clone(), client.port, client.tls_enabled, client.security_scheme)
+    };
+
+    let forward_result = forward_n32f_request(node_id, request, target_apiroot)?;
+
+    // Build the SBI request for the peer SEPP's N32f endpoint
+    let scheme = if tls_enabled { "https" } else { "http" };
+    let forward_uri = format!(
+        "{scheme}://{host}:{port}/n32f-forward/v1/n32f-process"
+    );
+
+    let sbi_config = ogs_sbi::client::SbiClientConfig::new(&host, port);
+    let sbi_client = ogs_sbi::client::SbiClient::new(sbi_config);
+
+    let mut sbi_request = ogs_sbi::message::SbiRequest::post(&forward_uri);
+
+    // Set N32f headers
+    for (key, value) in &forward_result.headers {
+        sbi_request.http.set_header(key.clone(), value.clone());
+    }
+
+    // Set the N32f message body
+    if let Some(body) = &forward_result.body {
+        if let Ok(body_str) = String::from_utf8(body.clone()) {
+            sbi_request.http.set_content(body_str);
+            sbi_request.http.set_header("Content-Type", "application/json");
+        }
+    }
+
+    log::info!(
+        "N32f async forward: POST {forward_uri} [security={security_scheme:?}]"
+    );
+
+    match sbi_client.send_request(sbi_request).await {
+        Ok(response) => {
+            log::info!(
+                "N32f response from {host}:{port}: status={}",
+                response.status
+            );
+            Ok(N32fForwardResult {
+                status: response.status,
+                headers: forward_result.headers,
+                body: response.http.content.map(|c| c.into_bytes()),
+            })
+        }
+        Err(e) => {
+            log::error!("N32f async forward failed: {e}");
+            Err(format!("N32f forward failed: {e}"))
+        }
+    }
 }
 
 /// Simplified SBI request

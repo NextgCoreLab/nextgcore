@@ -460,6 +460,9 @@ pub struct AmfContext {
 
     /// Context initialized flag
     initialized: AtomicBool,
+
+    /// Paging context map: AMF-UE-NGAP-ID -> PagingContext (TS 23.502 4.2.3.3)
+    paging_map: RwLock<HashMap<u64, PagingContext>>,
 }
 
 impl AmfContext {
@@ -506,6 +509,7 @@ impl AmfContext {
             max_num_of_ran_ue: 0,
             max_num_of_sess: 0,
             initialized: AtomicBool::new(false),
+            paging_map: RwLock::new(HashMap::new()),
         }
     }
 
@@ -1082,6 +1086,93 @@ impl AmfContext {
             .filter(|sess| sess.amf_ue_id == amf_ue_id)
             .cloned()
             .collect()
+    }
+
+    // ========================================================================
+    // Paging Management (TS 23.502 4.2.3.3)
+    // ========================================================================
+
+    /// Initiate paging for a UE in CM-IDLE state
+    pub fn paging_add(&self, ctx: PagingContext) -> bool {
+        if let Ok(mut paging_map) = self.paging_map.write() {
+            let id = ctx.amf_ue_ngap_id;
+            log::info!(
+                "[UE NGAP ID: {}] Paging initiated (TMSI: 0x{:08x}, TAC: {})",
+                id, ctx.tmsi, ctx.tac
+            );
+            paging_map.insert(id, ctx);
+            return true;
+        }
+        false
+    }
+
+    /// Cancel paging for a UE (e.g., Service Request received)
+    pub fn paging_remove(&self, amf_ue_ngap_id: u64) -> Option<PagingContext> {
+        if let Ok(mut paging_map) = self.paging_map.write() {
+            if let Some(ctx) = paging_map.remove(&amf_ue_ngap_id) {
+                log::info!(
+                    "[UE NGAP ID: {}] Paging cancelled (retransmit_count: {})",
+                    amf_ue_ngap_id, ctx.retransmit_count
+                );
+                return Some(ctx);
+            }
+        }
+        None
+    }
+
+    /// Get paging context for a UE
+    pub fn paging_find(&self, amf_ue_ngap_id: u64) -> Option<PagingContext> {
+        if let Ok(paging_map) = self.paging_map.read() {
+            return paging_map.get(&amf_ue_ngap_id).cloned();
+        }
+        None
+    }
+
+    /// Increment retransmit count, returns false if max reached
+    pub fn paging_retransmit(&self, amf_ue_ngap_id: u64) -> bool {
+        if let Ok(mut paging_map) = self.paging_map.write() {
+            if let Some(ctx) = paging_map.get_mut(&amf_ue_ngap_id) {
+                if ctx.retransmit_count >= ctx.max_retransmit {
+                    log::warn!(
+                        "[UE NGAP ID: {}] Paging max retransmissions ({}) reached",
+                        amf_ue_ngap_id, ctx.max_retransmit
+                    );
+                    return false;
+                }
+                ctx.retransmit_count += 1;
+                log::debug!(
+                    "[UE NGAP ID: {}] Paging retransmit {}/{}",
+                    amf_ue_ngap_id, ctx.retransmit_count, ctx.max_retransmit
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Process paging timeout - remove expired entries (> 10s default)
+    pub fn paging_expire(&self, timeout_secs: u64) -> Vec<PagingContext> {
+        let mut expired = Vec::new();
+        if let Ok(mut paging_map) = self.paging_map.write() {
+            let now = std::time::Instant::now();
+            paging_map.retain(|id, ctx| {
+                if now.duration_since(ctx.initiated_at).as_secs() > timeout_secs {
+                    log::warn!(
+                        "[UE NGAP ID: {id}] Paging expired after {timeout_secs}s"
+                    );
+                    expired.push(ctx.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        expired
+    }
+
+    /// Get number of active paging entries
+    pub fn paging_count(&self) -> usize {
+        self.paging_map.read().map(|m| m.len()).unwrap_or(0)
     }
 
     // ========================================================================
@@ -1862,6 +1953,54 @@ impl Default for AmfUe {
 // AmfSess - PDU Session Context
 // ============================================================================
 
+/// Paging context for tracking UEs awaiting paging response (TS 23.502 4.2.3.3)
+#[derive(Debug, Clone)]
+pub struct PagingContext {
+    /// UE NGAP ID (AMF-side)
+    pub amf_ue_ngap_id: u64,
+    /// 5G-S-TMSI for paging
+    pub tmsi: u32,
+    /// AMF Set ID for paging identity
+    pub amf_set_id: u16,
+    /// AMF Pointer for paging identity
+    pub amf_pointer: u8,
+    /// PLMN for paging area
+    pub plmn_id: PlmnId,
+    /// TAC for paging area
+    pub tac: u32,
+    /// Timestamp when paging was initiated
+    pub initiated_at: std::time::Instant,
+    /// Number of paging retransmissions
+    pub retransmit_count: u8,
+    /// Maximum retransmissions before giving up
+    pub max_retransmit: u8,
+    /// Pending N1 message to deliver after paging response
+    pub pending_n1: Option<Vec<u8>>,
+    /// Pending N2 info to deliver after paging response
+    pub pending_n2: Option<Vec<u8>>,
+    /// PDU session ID that triggered paging
+    pub pdu_session_id: Option<u8>,
+}
+
+impl Default for PagingContext {
+    fn default() -> Self {
+        Self {
+            amf_ue_ngap_id: 0,
+            tmsi: 0,
+            amf_set_id: 0,
+            amf_pointer: 0,
+            plmn_id: PlmnId::default(),
+            tac: 0,
+            initiated_at: std::time::Instant::now(),
+            retransmit_count: 0,
+            max_retransmit: 4,
+            pending_n1: None,
+            pending_n2: None,
+            pdu_session_id: None,
+        }
+    }
+}
+
 /// Session paging info
 #[derive(Debug, Clone, Default)]
 pub struct SessionPaging {
@@ -2304,5 +2443,50 @@ mod tests {
 
         sess.clear_session_context();
         assert!(!sess.session_context_in_smf());
+    }
+
+    #[test]
+    fn test_paging_add_find_remove() {
+        let mut ctx = AmfContext::new();
+        ctx.init(64, 1024, 4096);
+
+        let paging = PagingContext {
+            amf_ue_ngap_id: 42,
+            tmsi: 0xDEADBEEF,
+            amf_set_id: 1,
+            amf_pointer: 0,
+            plmn_id: PlmnId::new("001", "01"),
+            tac: 7,
+            ..Default::default()
+        };
+
+        assert!(ctx.paging_add(paging));
+        assert_eq!(ctx.paging_count(), 1);
+
+        let found = ctx.paging_find(42);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().tmsi, 0xDEADBEEF);
+
+        let removed = ctx.paging_remove(42);
+        assert!(removed.is_some());
+        assert_eq!(ctx.paging_count(), 0);
+    }
+
+    #[test]
+    fn test_paging_retransmit_limit() {
+        let mut ctx = AmfContext::new();
+        ctx.init(64, 1024, 4096);
+
+        let paging = PagingContext {
+            amf_ue_ngap_id: 10,
+            tmsi: 0x1234,
+            max_retransmit: 2,
+            ..Default::default()
+        };
+        ctx.paging_add(paging);
+
+        assert!(ctx.paging_retransmit(10)); // 1/2
+        assert!(ctx.paging_retransmit(10)); // 2/2
+        assert!(!ctx.paging_retransmit(10)); // exceeded
     }
 }

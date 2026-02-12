@@ -2190,6 +2190,7 @@ name = "nextgcore-hssd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "ctrlc",
  "env_logger 0.11.8",
@@ -2238,10 +2239,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextgcore-mbsmfd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "env_logger 0.11.8",
+ "hex",
+ "log",
+ "ogs-app",
+ "ogs-core",
+ "ogs-sbi",
+ "proptest",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "nextgcore-mmed"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "ctrlc",
  "env_logger 0.11.8",
@@ -2263,6 +2284,24 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "clap",
+ "ctrlc",
+ "env_logger 0.11.8",
+ "log",
+ "ogs-app",
+ "ogs-core",
+ "ogs-sbi",
+ "proptest",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "nextgcore-nsacfd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "clap",
  "ctrlc",
  "env_logger 0.11.8",
@@ -2344,6 +2383,7 @@ dependencies = [
  "ogs-core",
  "ogs-sbi",
  "proptest",
+ "serde_json",
  "tokio",
 ]
 
@@ -2801,6 +2841,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "log",
  "ogs-core",
  "proptest",
  "rustls 0.23.36",

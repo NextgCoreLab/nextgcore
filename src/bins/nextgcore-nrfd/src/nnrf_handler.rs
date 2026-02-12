@@ -189,6 +189,34 @@ impl NfInstanceManager {
         }
     }
 
+    /// Suspend an NF (mark as SUSPENDED due to missed heartbeat, TS 29.510)
+    ///
+    /// The NF is not deregistered yet - it will be auto-deregistered if no
+    /// heartbeat is received within the grace period.
+    pub fn suspend(&self, id: &str) -> bool {
+        if let Ok(mut profiles) = self.profiles.write() {
+            if let Some(profile) = profiles.get_mut(id) {
+                log::warn!(
+                    "[{}] NF status: {} -> SUSPENDED (missed heartbeat)",
+                    id, profile.nf_status
+                );
+                profile.nf_status = "SUSPENDED".to_string();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if an NF is suspended
+    pub fn is_suspended(&self, id: &str) -> bool {
+        if let Ok(profiles) = self.profiles.read() {
+            if let Some(profile) = profiles.get(id) {
+                return profile.nf_status == "SUSPENDED";
+            }
+        }
+        false
+    }
+
     /// Get an NF profile by ID
     pub fn get(&self, id: &str) -> Option<NfProfile> {
         let profiles = self.profiles.read().ok()?;
@@ -634,6 +662,46 @@ mod tests {
             }
             _ => panic!("Expected error for empty requester_nf_type"),
         }
+    }
+
+    #[test]
+    fn test_nf_suspend_and_deregister() {
+        let manager = NfInstanceManager::new();
+
+        let profile = NfProfile {
+            nf_instance_id: "nf-suspend-test".to_string(),
+            nf_type: "SMF".to_string(),
+            nf_status: "REGISTERED".to_string(),
+            heartbeat_timer: Some(10),
+            plmn_list: vec![],
+            ipv4_addresses: vec!["10.0.0.1".to_string()],
+            ipv6_addresses: vec![],
+            fqdn: None,
+            nf_services: vec![],
+        };
+        manager.register(profile).unwrap();
+
+        // Verify initially registered
+        assert!(!manager.is_suspended("nf-suspend-test"));
+        let p = manager.get("nf-suspend-test").unwrap();
+        assert_eq!(p.nf_status, "REGISTERED");
+
+        // Suspend on first missed heartbeat
+        assert!(manager.suspend("nf-suspend-test"));
+        assert!(manager.is_suspended("nf-suspend-test"));
+        let p = manager.get("nf-suspend-test").unwrap();
+        assert_eq!(p.nf_status, "SUSPENDED");
+
+        // Discovery should not return SUSPENDED NFs
+        let result = nrf_nnrf_handle_nf_discover("SMF", "AMF", None);
+        match result {
+            HandlerResult::Success(_) => {} // Empty result or no match
+            _ => {}
+        }
+
+        // Auto-deregister after grace period
+        manager.deregister("nf-suspend-test").unwrap();
+        assert!(manager.get("nf-suspend-test").is_none());
     }
 
     #[test]

@@ -19,6 +19,7 @@
 //! - S5/S8: GTP-C interface to SGW (EPC mode)
 
 use anyhow::{Context, Result};
+use ogs_sbi::context::{global_context, NfInstance, NfService};
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::server::{
     send_bad_request, send_not_found,
@@ -194,6 +195,12 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
+
+    // Register with NRF (if configured)
+    if let Err(e) = smf_nrf_register(&config.sbi_addr, config.sbi_port).await {
+        log::warn!("NRF registration failed (will operate without NRF): {e}");
+    }
+
     log::info!("NextGCore SMF ready");
 
     // Main async event loop
@@ -230,6 +237,97 @@ async fn main() -> Result<()> {
 
     log::info!("NextGCore SMF stopped");
     Ok(())
+}
+
+/// Register SMF NF instance with NRF
+///
+/// Sends PUT /nnrf-nfm/v1/nf-instances/{nfInstanceId} to NRF
+async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<(), String> {
+    let sbi_ctx = global_context();
+
+    let nrf_uri = std::env::var("NRF_URI").ok();
+    let nrf_uri = match nrf_uri {
+        Some(uri) => uri,
+        None => {
+            log::debug!("No NRF_URI configured, skipping NRF registration");
+            return Ok(());
+        }
+    };
+
+    log::info!("Registering SMF with NRF at {nrf_uri}");
+
+    let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
+    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
+
+    let nf_instance_id = uuid::Uuid::new_v4().to_string();
+
+    let nf_profile = serde_json::json!({
+        "nfInstanceId": nf_instance_id,
+        "nfType": "SMF",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": [sbi_addr],
+        "nfServices": [{
+            "serviceInstanceId": format!("{nf_instance_id}-nsmf-pdusession"),
+            "serviceName": "nsmf-pdusession",
+            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+            "scheme": "http",
+            "nfServiceStatus": "REGISTERED",
+            "ipEndPoints": [{
+                "ipv4Address": sbi_addr,
+                "port": sbi_port
+            }]
+        }],
+        "allowedNfTypes": ["AMF"],
+        "heartBeatTimer": 10
+    });
+
+    let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
+    log::debug!("NRF registration: PUT {path}");
+
+    let response = client
+        .put_json(&path, &nf_profile)
+        .await
+        .map_err(|e| format!("NRF registration failed: {e}"))?;
+
+    match response.status {
+        200 | 201 => {
+            log::info!("SMF registered with NRF (id={nf_instance_id})");
+
+            // Store self instance in SBI context
+            let mut self_instance = NfInstance::new(
+                &nf_instance_id,
+                ogs_sbi::types::NfType::Smf,
+            );
+            self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
+            let mut svc = NfService::new(
+                "nsmf-pdusession",
+                ogs_sbi::types::SbiServiceType::NsmfPdusession,
+            );
+            svc.port = sbi_port;
+            svc.ip_addresses = vec![sbi_addr.to_string()];
+            self_instance.add_service(svc);
+            sbi_ctx.set_self_instance(self_instance).await;
+
+            Ok(())
+        }
+        _ => Err(format!("NRF registration returned status {}", response.status)),
+    }
+}
+
+/// Parse host and port from a URI string (e.g., "http://localhost:7777")
+fn parse_host_port(uri: &str) -> Option<(String, u16)> {
+    let without_scheme = uri
+        .strip_prefix("https://")
+        .or_else(|| uri.strip_prefix("http://"))
+        .unwrap_or(uri);
+    let (host_port, _path) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    if let Some((host, port_str)) = host_port.rsplit_once(':') {
+        let port: u16 = port_str.parse().ok()?;
+        Some((host.to_string(), port))
+    } else {
+        let default_port = if uri.starts_with("https://") { 443 } else { 80 };
+        Some((host_port.to_string(), default_port))
+    }
 }
 
 /// SBI request handler for SMF
@@ -897,8 +995,131 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 }
             }
         }
+
+        let response_body = serde_json::json!({
+            "upCnxState": "ACTIVATED"
+        });
+
+        return SbiResponse::with_status(200)
+            .with_body(response_body.to_string(), "application/json");
     }
 
+    // UE-initiated PDU Session Modification: AMF forwards N1 SM info from UE
+    if n2_sm_info_type == "PDU_RES_MOD_REQ" {
+        use base64::Engine;
+
+        let n1_sm_msg = req_body["n1SmMsg"].as_str()
+            .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+            .unwrap_or_default();
+
+        if n1_sm_msg.len() < 4 {
+            log::warn!("SM Context Update: N1 SM msg too short ({} bytes)", n1_sm_msg.len());
+            return SbiResponse::with_status(400);
+        }
+
+        let psi: u8 = sm_context_ref.parse().unwrap_or(1);
+        log::info!(
+            "SM Context Update (Modification): PSI={}, N1 SM msg len={}",
+            psi, n1_sm_msg.len()
+        );
+
+        // Look up UPF SEID for PFCP session modification with updated QoS
+        let upf_seid = PFCP_SESSIONS.lock().ok()
+            .and_then(|sessions| sessions.get(sm_context_ref).copied());
+
+        if let Some(seid) = upf_seid {
+            // Send PFCP Session Modification to UPF with QoS update
+            // Use existing gNB TEID (no tunnel change, just QoS parameters)
+            let upf_addr = std::env::var("UPF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+            let upf_port: u16 = std::env::var("UPF_PFCP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8805);
+
+            // Build PFCP modification with QoS update (modify QER on existing PDRs)
+            let params = n4_build::SessionModificationParams {
+                update_qers: vec![n4_build::QerParams {
+                    qer_id: 1,
+                    gate_status: (0, 0), // Both gates open
+                    mbr: Some((100_000_000, 100_000_000)), // 100 Mbps UL/DL
+                    gbr: None,
+                    qfi: Some(1),
+                }],
+                ..Default::default()
+            };
+
+            let payload = n4_build::build_session_modification_request(&params);
+
+            // Build PFCP header with UPF SEID
+            let mut packet = Vec::with_capacity(16 + payload.len());
+            packet.push(0x21); // flags: version=1 + SEID present
+            packet.push(52);   // Session Modification Request
+            let total_len = (12 + payload.len()) as u16;
+            packet.extend_from_slice(&total_len.to_be_bytes());
+            packet.extend_from_slice(&seid.to_be_bytes());
+            let seq: u32 = 3;
+            packet.extend_from_slice(&seq.to_be_bytes()[1..4]);
+            packet.push(0); // spare
+            packet.extend_from_slice(&payload);
+
+            // Send via UDP
+            let upf_endpoint: std::net::SocketAddr = match format!("{upf_addr}:{upf_port}").parse() {
+                Ok(ep) => ep,
+                Err(e) => {
+                    log::warn!("Invalid UPF address: {e}");
+                    return SbiResponse::with_status(500);
+                }
+            };
+            match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                Ok(socket) => {
+                    if let Err(e) = socket.send_to(&packet, upf_endpoint).await {
+                        log::warn!("PFCP modification send failed: {e}");
+                    } else {
+                        log::info!("PFCP Session Modification (QoS) sent: UPF SEID=0x{seid:016x}");
+                        let mut resp_buf = vec![0u8; 4096];
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            socket.recv_from(&mut resp_buf),
+                        ).await {
+                            Ok(Ok((len, _))) => {
+                                log::info!("PFCP Session Modification (QoS) response: {len} bytes");
+                            }
+                            _ => {
+                                log::warn!("PFCP modification response timeout or error");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to bind PFCP socket: {e}");
+                }
+            }
+        } else {
+            log::warn!("No PFCP session found for modification: ref={sm_context_ref}");
+        }
+
+        // Build N1 SM message: PDU Session Modification Command (0xCB)
+        let mut n1_mod_cmd = Vec::new();
+        n1_mod_cmd.push(0x2E); // Extended protocol discriminator: 5GSM
+        n1_mod_cmd.push(psi);  // PDU session identity
+        n1_mod_cmd.push(0x01); // PTI
+        n1_mod_cmd.push(0xCB); // PDU Session Modification Command message type
+
+        // Build N2 SM Info: QoS flow modification for gNB
+        // Format: QFI (1) + modification indicator
+        let qfi: u8 = 1; // Default QoS flow
+        let mut n2_sm_info = Vec::new();
+        n2_sm_info.push(qfi);
+        n2_sm_info.push(0x01); // Modification confirm indicator
+
+        let response_body = serde_json::json!({
+            "n1SmMsg": base64::engine::general_purpose::STANDARD.encode(&n1_mod_cmd),
+            "n2SmInfo": base64::engine::general_purpose::STANDARD.encode(&n2_sm_info),
+            "n2SmInfoType": "PDU_RES_MOD_REQ"
+        });
+
+        return SbiResponse::with_status(200)
+            .with_body(response_body.to_string(), "application/json");
+    }
+
+    // Default response for unrecognized update types
     let response_body = serde_json::json!({
         "upCnxState": "ACTIVATED"
     });

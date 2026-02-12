@@ -40,7 +40,11 @@ members = [
     "bins/nextgcore-udmd",
     "bins/nextgcore-udrd",
     "bins/nextgcore-upfd",
-    
+
+    # Rel-17 NFs
+    "bins/nextgcore-mbsmfd",
+    "bins/nextgcore-nsacfd",
+
     # Integration tests
     "tests",
 ]

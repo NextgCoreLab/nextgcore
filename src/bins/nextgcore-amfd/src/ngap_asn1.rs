@@ -766,6 +766,82 @@ pub fn build_pdu_session_resource_release_command_asn1(
     }
 }
 
+/// Build a PDU Session Resource Modify Request with proper ASN.1 APER encoding
+///
+/// Sent by AMF to gNB to modify PDU session resources (e.g., QoS changes).
+/// The message follows 3GPP TS 38.413 Section 8.2.3.
+pub fn build_pdu_session_resource_modify_request_asn1(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    pdu_session_id: u8,
+    nas_pdu: Option<&[u8]>,
+    n2_sm_transfer: &[u8],
+) -> Option<Vec<u8>> {
+    let mut protocol_ies = Vec::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory)
+    protocol_ies.push(PDUSessionResourceModifyRequestProtocolIEs_Entry {
+        id: ProtocolIE_ID(ID_AMF_UE_NGAP_ID),
+        criticality: Criticality(Criticality::REJECT),
+        value: PDUSessionResourceModifyRequestProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(
+            AMF_UE_NGAP_ID(amf_ue_ngap_id),
+        ),
+    });
+
+    // IE: RAN-UE-NGAP-ID (mandatory)
+    protocol_ies.push(PDUSessionResourceModifyRequestProtocolIEs_Entry {
+        id: ProtocolIE_ID(ID_RAN_UE_NGAP_ID),
+        criticality: Criticality(Criticality::REJECT),
+        value: PDUSessionResourceModifyRequestProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(
+            RAN_UE_NGAP_ID(ran_ue_ngap_id),
+        ),
+    });
+
+    // IE: PDUSessionResourceModifyListModReq (mandatory)
+    let item = PDUSessionResourceModifyItemModReq {
+        pdu_session_id: PDUSessionID(pdu_session_id),
+        nas_pdu: nas_pdu.map(|p| NAS_PDU(p.to_vec())),
+        pdu_session_resource_modify_request_transfer:
+            PDUSessionResourceModifyItemModReqPDUSessionResourceModifyRequestTransfer(
+                n2_sm_transfer.to_vec(),
+            ),
+        ie_extensions: None,
+    };
+
+    let list = PDUSessionResourceModifyListModReq(vec![item]);
+    protocol_ies.push(PDUSessionResourceModifyRequestProtocolIEs_Entry {
+        id: ProtocolIE_ID(ID_PDU_SESSION_RESOURCE_MODIFY_LIST_MOD_REQ),
+        criticality: Criticality(Criticality::REJECT),
+        value: PDUSessionResourceModifyRequestProtocolIEs_EntryValue::Id_PDUSessionResourceModifyListModReq(list),
+    });
+
+    let request = PDUSessionResourceModifyRequest {
+        protocol_i_es: PDUSessionResourceModifyRequestProtocolIEs(protocol_ies),
+    };
+
+    let initiating_message = InitiatingMessage {
+        procedure_code: ProcedureCode(ID_PDU_SESSION_RESOURCE_MODIFY),
+        criticality: Criticality(Criticality::REJECT),
+        value: InitiatingMessageValue::Id_PDUSessionResourceModify(request),
+    };
+
+    let pdu = NGAP_PDU::InitiatingMessage(initiating_message);
+
+    match encode_ngap_pdu(&pdu) {
+        Ok(bytes) => {
+            log::debug!(
+                "Built PDU Session Resource Modify Request: {} bytes, amf_ue_ngap_id={}, psi={}",
+                bytes.len(), amf_ue_ngap_id, pdu_session_id
+            );
+            Some(bytes)
+        }
+        Err(e) => {
+            log::error!("Failed to encode PDU Session Resource Modify Request: {e:?}");
+            None
+        }
+    }
+}
+
 /// Parsed Uplink NAS Transport data
 #[derive(Debug, Clone)]
 pub struct UplinkNasTransportData {

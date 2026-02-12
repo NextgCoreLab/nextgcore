@@ -8,6 +8,7 @@ description = "NextGCore SBI (Service Based Interface) Library"
 
 [dependencies]
 ogs-core = { workspace = true }
+log.workspace = true
 thiserror.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true

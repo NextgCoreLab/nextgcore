@@ -67,7 +67,8 @@ pub use server::{
 };
 pub use types::{NfType, SbiAppError, SbiServiceType, UriScheme};
 pub use oauth::{
-    AccessTokenClaims, AccessTokenError, AccessTokenRequest, AccessTokenResponse, TokenCache,
+    AccessTokenClaims, AccessTokenError, AccessTokenRequest, AccessTokenResponse,
+    OAuth2Client, TokenCache,
 };
 pub use scp::{
     ScpBinding, ScpRouter, ScpRoutingInfo, ScpRoutingMode, global_scp_router, init_scp_router,

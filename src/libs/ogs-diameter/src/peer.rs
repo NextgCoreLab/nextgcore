@@ -448,6 +448,76 @@ impl DiameterPeer {
     }
 }
 
+/// Run a Diameter peer with automatic watchdog keepalive.
+///
+/// This spawns a loop that:
+/// 1. Sends DWR at the configured `watchdog_interval`
+/// 2. Processes incoming events and forwards application messages to the channel
+/// 3. Detects missed watchdog responses and closes the connection
+///
+/// Returns when the peer is disconnected or an error occurs.
+pub async fn run_peer_with_keepalive(
+    mut peer: DiameterPeer,
+    app_tx: tokio::sync::mpsc::Sender<DiameterMessage>,
+) -> DiameterResult<()> {
+    let interval = peer.watchdog_interval();
+    let mut watchdog_timer = tokio::time::interval(interval);
+    let mut missed_watchdogs: u32 = 0;
+    const MAX_MISSED_WATCHDOGS: u32 = 3;
+
+    loop {
+        tokio::select! {
+            _ = watchdog_timer.tick() => {
+                if peer.state() == PeerState::Open {
+                    if missed_watchdogs >= MAX_MISSED_WATCHDOGS {
+                        log::warn!(
+                            "Peer {:?} missed {} watchdogs, disconnecting",
+                            peer.remote_host(),
+                            missed_watchdogs
+                        );
+                        let _ = peer.disconnect(DisconnectCause::Rebooting).await;
+                        return Err(DiameterError::Protocol(
+                            "watchdog timeout".into(),
+                        ));
+                    }
+                    match peer.send_watchdog().await {
+                        Ok(()) => {
+                            missed_watchdogs += 1;
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to send watchdog: {e}");
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            event_result = peer.next_event() => {
+                match event_result? {
+                    PeerEvent::Established { origin_host, origin_realm } => {
+                        log::info!(
+                            "Peer established: host={origin_host}, realm={origin_realm}"
+                        );
+                        missed_watchdogs = 0;
+                    }
+                    PeerEvent::Message(msg) => {
+                        if app_tx.send(msg).await.is_err() {
+                            log::warn!("Application channel closed");
+                            return Ok(());
+                        }
+                    }
+                    PeerEvent::WatchdogAck => {
+                        missed_watchdogs = 0;
+                    }
+                    PeerEvent::Disconnected => {
+                        log::info!("Peer disconnected");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Peer table managing multiple Diameter peer connections
 pub struct PeerTable {
     peers: Arc<Mutex<HashMap<String, PeerInfo>>>,

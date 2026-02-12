@@ -290,6 +290,25 @@ impl NgapServer {
                     self.handle_pdu_session_resource_setup_response(association_id, data).await?;
                 }
             }
+            Some(26) => {
+                // PDU Session Resource Modify (procedure code 26)
+                if data[0] == 0x20 {
+                    // SuccessfulOutcome = gNB confirmed resource modification
+                    log::info!("PDU Session Resource Modify Response from gNB");
+                    // Modification confirmed by gNB - no further action needed.
+                    // The UE-side completion comes via PDU Session Modification Complete (0xCD).
+                } else if data[0] == 0x40 {
+                    // UnsuccessfulOutcome = gNB rejected modification
+                    log::warn!("PDU Session Resource Modify Failure from gNB");
+                }
+            }
+            Some(28) => {
+                // PDU Session Resource Release (procedure code 28)
+                if data[0] == 0x20 {
+                    log::info!("PDU Session Resource Release Response from gNB");
+                    // gNB confirmed resource release - session cleanup already done.
+                }
+            }
             _ => {
                 log::debug!("Unknown procedure code, forwarding to FSM");
                 // Create NGAP event for FSM processing
@@ -675,24 +694,21 @@ impl NgapServer {
                 if sm_msg_type == 0xC9 {
                     log::info!("PDU Session Modification Request from UE: PSI={psi}, PTI={pti}");
 
-                    // Forward to SMF via SM Context Update
+                    // Forward to SMF via SM Context Update with N1 SM info
                     let smf_host = std::env::var("SMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
                     let smf_port: u16 = std::env::var("SMF_SBI_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
                     let sm_context_ref = format!("{psi}");
 
-                    // Build modification command NAS and forward N1 to UE
-                    match crate::sbi_path::call_smf_update_sm_context(
+                    match crate::sbi_path::call_smf_update_sm_context_with_n1(
                         &smf_host, smf_port, &sm_context_ref, &ul_nas.nas_pdu,
                     ).await {
-                        Ok(()) => {
+                        Ok(resp) => {
                             log::info!("SMF SM Context Updated for modification: PSI={psi}");
 
-                            // Send PDU Session Modification Command to UE
-                            // Format: EPD(0x2E) + PSI + PTI + MsgType(0xCB) + 5QI(1)
+                            // Send PDU Session Modification Command to UE (N1)
                             let mut mod_cmd = Vec::new();
                             mod_cmd.push(0x2E); mod_cmd.push(psi); mod_cmd.push(pti);
                             mod_cmd.push(0xCB); // PDU Session Modification Command
-                            // No mandatory IEs beyond header for basic modification acknowledgement
 
                             let dl_nas = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
                                 ul_nas.amf_ue_ngap_id, ul_nas.ran_ue_ngap_id, &mod_cmd,
@@ -702,10 +718,28 @@ impl NgapServer {
                             };
                             self.send_to_association(association_id, &dl_nas).await?;
                             log::info!("PDU Session Modification Command sent to UE: PSI={psi}");
+
+                            // Send PDU Session Resource Modify Request to gNB (N2) if N2 info present
+                            if !resp.n2_sm_info.is_empty() {
+                                let modify_req = match crate::ngap_asn1::build_pdu_session_resource_modify_request_asn1(
+                                    ul_nas.amf_ue_ngap_id,
+                                    ul_nas.ran_ue_ngap_id,
+                                    psi,
+                                    None,
+                                    &resp.n2_sm_info,
+                                ) {
+                                    Some(bytes) => bytes,
+                                    None => {
+                                        log::error!("Failed to build PDU Session Resource Modify Request");
+                                        return Ok(());
+                                    }
+                                };
+                                self.send_to_association(association_id, &modify_req).await?;
+                                log::info!("PDU Session Resource Modify Request sent to gNB: PSI={psi}");
+                            }
                         }
                         Err(e) => {
                             log::warn!("SMF modification failed ({e}), sending reject");
-                            // Send Modification Reject
                             let mut reject = Vec::new();
                             reject.push(0x2E); reject.push(psi); reject.push(pti);
                             reject.push(0xCC); // PDU Session Modification Reject

@@ -562,7 +562,7 @@ pub fn copy_request_headers(
 }
 
 // ============================================================================
-// NF Instance Selection & Request Routing
+// NF Instance Selection & Request Routing (W1.25, W1.27)
 // ============================================================================
 
 /// NF instance candidate for load-balanced routing
@@ -575,18 +575,36 @@ pub struct NfInstanceCandidate {
     pub priority: u16,
     pub capacity: u16,
     pub load: u16,
+    /// Whether the instance is considered healthy
+    pub healthy: bool,
 }
 
-/// Select the best NF instance from a list of candidates using weighted round-robin
-/// Based on priority (lower = better) and capacity/load
+/// Select the best NF instance from a list of candidates using weighted round-robin.
+///
+/// W1.27: Supports health-check awareness (skips unhealthy instances) and
+/// weighted distribution based on NF load/priority.
+///
+/// Selection algorithm:
+/// 1. Filter to healthy instances only
+/// 2. Group by priority (lower = better)
+/// 3. Among same-priority, pick by available capacity (capacity - load)
 pub fn select_nf_instance(candidates: &[NfInstanceCandidate]) -> Option<&NfInstanceCandidate> {
     if candidates.is_empty() {
         return None;
     }
 
+    // W1.27: Filter to healthy instances only
+    let healthy: Vec<&NfInstanceCandidate> = candidates
+        .iter()
+        .filter(|c| c.healthy)
+        .collect();
+
+    // Fall back to all candidates if none are marked healthy
+    let pool = if healthy.is_empty() { candidates.iter().collect() } else { healthy };
+
     // Group by priority (lower is better)
-    let min_priority = candidates.iter().map(|c| c.priority).min().unwrap_or(0);
-    let top_priority: Vec<&NfInstanceCandidate> = candidates
+    let min_priority = pool.iter().map(|c| c.priority).min().unwrap_or(0);
+    let top_priority: Vec<&&NfInstanceCandidate> = pool
         .iter()
         .filter(|c| c.priority == min_priority)
         .collect();
@@ -601,7 +619,214 @@ pub fn select_nf_instance(candidates: &[NfInstanceCandidate]) -> Option<&NfInsta
         .max_by_key(|c| {
             c.capacity.saturating_sub(c.load) as u32
         })
-        .copied()
+        .map(|c| **c)
+}
+
+/// Round-robin index for distributing requests across equal-weight instances.
+static ROUND_ROBIN_INDEX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Select an NF instance using round-robin among healthy, same-priority candidates.
+///
+/// W1.27: Implements round-robin load balancing among NF instances with
+/// weighted distribution based on NF load/priority and health-check awareness.
+pub fn select_nf_instance_round_robin(candidates: &[NfInstanceCandidate]) -> Option<&NfInstanceCandidate> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Filter to healthy instances
+    let healthy: Vec<&NfInstanceCandidate> = candidates
+        .iter()
+        .filter(|c| c.healthy)
+        .collect();
+
+    let pool: Vec<&NfInstanceCandidate> = if healthy.is_empty() {
+        candidates.iter().collect()
+    } else {
+        healthy
+    };
+
+    // Group by best priority
+    let min_priority = pool.iter().map(|c| c.priority).min().unwrap_or(0);
+    let top_priority: Vec<&NfInstanceCandidate> = pool
+        .into_iter()
+        .filter(|c| c.priority == min_priority)
+        .collect();
+
+    if top_priority.is_empty() {
+        return None;
+    }
+
+    // Round-robin within the top-priority group
+    let idx = ROUND_ROBIN_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let selected_idx = (idx as usize) % top_priority.len();
+    Some(top_priority[selected_idx])
+}
+
+// ============================================================================
+// NF Discovery Cache (W1.26)
+// ============================================================================
+
+/// Cached NF discovery result with TTL.
+#[derive(Debug, Clone)]
+pub struct DiscoveryCacheEntry {
+    pub candidates: Vec<NfInstanceCandidate>,
+    pub cached_at: std::time::Instant,
+    pub ttl: std::time::Duration,
+}
+
+impl DiscoveryCacheEntry {
+    pub fn is_expired(&self) -> bool {
+        self.cached_at.elapsed() >= self.ttl
+    }
+}
+
+/// NF discovery result cache.
+///
+/// W1.26: Caches NF discovery results with TTL to avoid repeated NRF queries.
+/// Cache key is (target_nf_type, service_name).
+pub struct DiscoveryCache {
+    entries: std::sync::RwLock<HashMap<(String, String), DiscoveryCacheEntry>>,
+}
+
+impl DiscoveryCache {
+    pub fn new() -> Self {
+        Self {
+            entries: std::sync::RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Look up a cached discovery result.
+    pub fn get(&self, target_nf_type: &str, service_name: &str) -> Option<Vec<NfInstanceCandidate>> {
+        let entries = self.entries.read().ok()?;
+        let key = (target_nf_type.to_string(), service_name.to_string());
+        entries.get(&key).and_then(|entry| {
+            if entry.is_expired() {
+                None
+            } else {
+                Some(entry.candidates.clone())
+            }
+        })
+    }
+
+    /// Store a discovery result in the cache.
+    pub fn put(
+        &self,
+        target_nf_type: &str,
+        service_name: &str,
+        candidates: Vec<NfInstanceCandidate>,
+        ttl: std::time::Duration,
+    ) {
+        if let Ok(mut entries) = self.entries.write() {
+            let key = (target_nf_type.to_string(), service_name.to_string());
+            entries.insert(key, DiscoveryCacheEntry {
+                candidates,
+                cached_at: std::time::Instant::now(),
+                ttl,
+            });
+        }
+    }
+
+    /// Purge expired entries.
+    pub fn purge_expired(&self) {
+        if let Ok(mut entries) = self.entries.write() {
+            entries.retain(|_, v| !v.is_expired());
+        }
+    }
+
+    /// Clear the entire cache.
+    pub fn clear(&self) {
+        if let Ok(mut entries) = self.entries.write() {
+            entries.clear();
+        }
+    }
+}
+
+impl Default for DiscoveryCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Global discovery cache
+static DISCOVERY_CACHE: std::sync::OnceLock<DiscoveryCache> = std::sync::OnceLock::new();
+
+/// Get the global discovery cache instance.
+pub fn discovery_cache() -> &'static DiscoveryCache {
+    DISCOVERY_CACHE.get_or_init(DiscoveryCache::new)
+}
+
+/// Parse NF discovery search result JSON into NfInstanceCandidate list.
+///
+/// W1.26: Parses the SearchResult response from NRF discovery
+/// (TS 29.510 Section 6.2.3.2.3.1).
+pub fn parse_search_result(body: &[u8]) -> Vec<NfInstanceCandidate> {
+    let value: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("Failed to parse NF discovery response: {e}");
+            return Vec::new();
+        }
+    };
+
+    let mut candidates = Vec::new();
+
+    if let Some(instances) = value.get("nfInstances").and_then(|v| v.as_array()) {
+        for inst in instances {
+            let nf_instance_id = inst.get("nfInstanceId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let nf_type_str = inst.get("nfType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("NULL");
+            let nf_status = inst.get("nfStatus")
+                .and_then(|v| v.as_str())
+                .unwrap_or("REGISTERED");
+
+            // Extract host/port from ipv4Addresses or fqdn
+            let host = inst.get("ipv4Addresses")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                .or_else(|| inst.get("fqdn").and_then(|v| v.as_str()))
+                .unwrap_or("127.0.0.1")
+                .to_string();
+
+            let port = inst.get("nfServices")
+                .and_then(|v| v.as_array())
+                .and_then(|services| services.first())
+                .and_then(|svc| svc.get("ipEndPoints"))
+                .and_then(|v| v.as_array())
+                .and_then(|eps| eps.first())
+                .and_then(|ep| ep.get("port"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(7777) as u16;
+
+            let priority = inst.get("priority")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(50) as u16;
+            let capacity = inst.get("capacity")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100) as u16;
+            let load = inst.get("load")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u16;
+
+            candidates.push(NfInstanceCandidate {
+                nf_instance_id,
+                nf_type: NfType::from_string(nf_type_str),
+                host,
+                port,
+                priority,
+                capacity,
+                load,
+                healthy: nf_status == "REGISTERED",
+            });
+        }
+    }
+
+    candidates
 }
 
 /// Route an SBI request to the appropriate NF instance
@@ -784,6 +1009,7 @@ mod tests {
             priority: 10,
             capacity: 100,
             load: 50,
+            healthy: true,
         }];
         let selected = select_nf_instance(&candidates);
         assert!(selected.is_some());
@@ -801,6 +1027,7 @@ mod tests {
                 priority: 20,
                 capacity: 100,
                 load: 10,
+                healthy: true,
             },
             NfInstanceCandidate {
                 nf_instance_id: "nf-high".to_string(),
@@ -810,6 +1037,7 @@ mod tests {
                 priority: 10,
                 capacity: 100,
                 load: 90,
+                healthy: true,
             },
         ];
         let selected = select_nf_instance(&candidates);
@@ -827,6 +1055,7 @@ mod tests {
                 priority: 10,
                 capacity: 100,
                 load: 90,
+                healthy: true,
             },
             NfInstanceCandidate {
                 nf_instance_id: "nf-idle".to_string(),
@@ -836,10 +1065,129 @@ mod tests {
                 priority: 10,
                 capacity: 100,
                 load: 10,
+                healthy: true,
             },
         ];
         let selected = select_nf_instance(&candidates);
         assert_eq!(selected.unwrap().nf_instance_id, "nf-idle");
+    }
+
+    #[test]
+    fn test_select_nf_instance_skips_unhealthy() {
+        let candidates = vec![
+            NfInstanceCandidate {
+                nf_instance_id: "nf-unhealthy".to_string(),
+                nf_type: NfType::Smf,
+                host: "smf1.local".to_string(),
+                port: 7777,
+                priority: 1,
+                capacity: 100,
+                load: 0,
+                healthy: false,
+            },
+            NfInstanceCandidate {
+                nf_instance_id: "nf-healthy".to_string(),
+                nf_type: NfType::Smf,
+                host: "smf2.local".to_string(),
+                port: 7777,
+                priority: 10,
+                capacity: 100,
+                load: 50,
+                healthy: true,
+            },
+        ];
+        let selected = select_nf_instance(&candidates);
+        assert_eq!(selected.unwrap().nf_instance_id, "nf-healthy");
+    }
+
+    #[test]
+    fn test_round_robin_selection() {
+        let candidates = vec![
+            NfInstanceCandidate {
+                nf_instance_id: "nf-a".to_string(),
+                nf_type: NfType::Smf,
+                host: "smf1.local".to_string(),
+                port: 7777,
+                priority: 10,
+                capacity: 100,
+                load: 50,
+                healthy: true,
+            },
+            NfInstanceCandidate {
+                nf_instance_id: "nf-b".to_string(),
+                nf_type: NfType::Smf,
+                host: "smf2.local".to_string(),
+                port: 7777,
+                priority: 10,
+                capacity: 100,
+                load: 50,
+                healthy: true,
+            },
+        ];
+        // Call twice to see round-robin switching
+        let first = select_nf_instance_round_robin(&candidates).unwrap().nf_instance_id.clone();
+        let second = select_nf_instance_round_robin(&candidates).unwrap().nf_instance_id.clone();
+        // They should be different (round-robin)
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn test_discovery_cache() {
+        let cache = DiscoveryCache::new();
+
+        assert!(cache.get("SMF", "nsmf-pdusession").is_none());
+
+        let candidates = vec![NfInstanceCandidate {
+            nf_instance_id: "smf-1".to_string(),
+            nf_type: NfType::Smf,
+            host: "smf.local".to_string(),
+            port: 7777,
+            priority: 10,
+            capacity: 100,
+            load: 0,
+            healthy: true,
+        }];
+
+        cache.put("SMF", "nsmf-pdusession", candidates.clone(), std::time::Duration::from_secs(3600));
+
+        let cached = cache.get("SMF", "nsmf-pdusession");
+        assert!(cached.is_some());
+        assert_eq!(cached.unwrap().len(), 1);
+
+        assert!(cache.get("AMF", "nsmf-pdusession").is_none());
+        assert!(cache.get("SMF", "other").is_none());
+    }
+
+    #[test]
+    fn test_parse_search_result() {
+        let json = serde_json::json!({
+            "validityPeriod": 3600,
+            "nfInstances": [
+                {
+                    "nfInstanceId": "smf-001",
+                    "nfType": "SMF",
+                    "nfStatus": "REGISTERED",
+                    "ipv4Addresses": ["10.0.0.1"],
+                    "priority": 10,
+                    "capacity": 100,
+                    "load": 30,
+                },
+                {
+                    "nfInstanceId": "smf-002",
+                    "nfType": "SMF",
+                    "nfStatus": "SUSPENDED",
+                    "fqdn": "smf2.local",
+                }
+            ]
+        });
+        let body = serde_json::to_vec(&json).unwrap();
+        let candidates = parse_search_result(&body);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].nf_instance_id, "smf-001");
+        assert_eq!(candidates[0].host, "10.0.0.1");
+        assert!(candidates[0].healthy);
+        assert_eq!(candidates[1].nf_instance_id, "smf-002");
+        assert!(!candidates[1].healthy);
     }
 
     #[test]

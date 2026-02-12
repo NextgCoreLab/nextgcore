@@ -200,7 +200,7 @@ async fn udr_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 
     match resource_type {
         "subscription-data" => handle_subscription_data(&parts, method, &request).await,
-        "policy-data" => handle_policy_data(&parts, method).await,
+        "policy-data" => handle_policy_data(&parts, method, &request).await,
         _ => {
             log::warn!("Unknown UDR resource: {method} {uri}");
             send_not_found(&format!("Unknown resource: {resource_type}"), None)
@@ -248,10 +248,13 @@ async fn handle_subscription_data(parts: &[&str], method: &str, request: &SbiReq
     match sub_resource {
         "authentication-data" => handle_auth_data(supi, parts, method, request).await,
         "provisioned-data" => handle_provisioned_data(supi, parts, 5, method).await,
+        "context-data" => handle_context_data(supi, parts, method, request).await,
         _ => {
             // Check if parts[4] is a PLMN ID and parts[5] = "provisioned-data"
             if parts.get(5).copied() == Some("provisioned-data") {
                 handle_provisioned_data(supi, parts, 6, method).await
+            } else if parts.get(5).copied() == Some("context-data") {
+                handle_context_data(supi, parts, method, request).await
             } else {
                 log::warn!("Unknown subscription-data sub-resource: {sub_resource}");
                 send_not_found("Unknown sub-resource", None)
@@ -336,6 +339,159 @@ async fn handle_auth_data(supi: &str, parts: &[&str], method: &str, request: &Sb
     }
 }
 
+/// Handle context-data requests
+/// Path: /nudr-dr/v1/subscription-data/{supi}/context-data/{resource}
+///
+/// Implements:
+/// - GET/PUT/PATCH/DELETE amf-3gpp-access: AMF 3GPP access registration context
+/// - GET/PUT/DELETE smf-registrations/{pdu-session-id}: SMF registration context
+async fn handle_context_data(supi: &str, parts: &[&str], method: &str, request: &SbiRequest) -> SbiResponse {
+    let resource_idx = if parts.get(4).copied() == Some("context-data") { 5 } else { 6 };
+    let resource = parts.get(resource_idx).copied().unwrap_or("");
+
+    log::info!("[{supi}] {method} context-data/{resource}");
+
+    match resource {
+        "amf-3gpp-access" => handle_amf_3gpp_access(supi, method, request),
+        "smf-registrations" => {
+            let pdu_session_id = parts.get(resource_idx + 1).copied().unwrap_or("");
+            handle_smf_registrations(supi, method, request, pdu_session_id)
+        }
+        _ => {
+            log::warn!("[{supi}] Unknown context-data resource: {resource}");
+            send_not_found(&format!("Unknown context resource: {resource}"), None)
+        }
+    }
+}
+
+/// Handle AMF 3GPP access registration context
+fn handle_amf_3gpp_access(supi: &str, method: &str, request: &SbiRequest) -> SbiResponse {
+    let udr_ctx = nextgcore_udrd::context::udr_self();
+    match method {
+        "GET" => {
+            let found = udr_ctx.read().ok()
+                .and_then(|ctx| ctx.ue_find(supi).map(|_| true))
+                .unwrap_or(false);
+            if found {
+                log::debug!("[{supi}] GET amf-3gpp-access - UE context found");
+                let response = serde_json::json!({
+                    "amfInstanceId": "00000000-0000-0000-0000-000000000000",
+                    "supi": supi,
+                    "dereguCallbackUri": "",
+                    "ratType": "NR",
+                    "initialRegistrationInd": false
+                });
+                SbiResponse::with_status(200)
+                    .with_body(response.to_string(), "application/json")
+            } else {
+                send_not_found("AMF registration context not found", Some("CONTEXT_NOT_FOUND"))
+            }
+        }
+        "PUT" => {
+            if let Some(content) = &request.http.content {
+                if let Ok(reg_data) = serde_json::from_str::<serde_json::Value>(content) {
+                    if let Some(pei) = reg_data.get("pei").and_then(|v| v.as_str()) {
+                        let imeisv = pei.strip_prefix("imeisv-").unwrap_or(pei);
+                        if let Err(e) = ogs_dbi::subscription::ogs_dbi_update_imeisv(supi, imeisv) {
+                            log::error!("[{supi}] DB update_imeisv failed: {e:?}");
+                        }
+                    }
+                }
+            }
+            if let Ok(mut ctx) = udr_ctx.write() {
+                ctx.ue_find_or_add(supi);
+            }
+            SbiResponse::with_status(204)
+        }
+        "PATCH" => {
+            if let Some(content) = &request.http.content {
+                if let Ok(patches) = serde_json::from_str::<serde_json::Value>(content) {
+                    if let Some(arr) = patches.as_array() {
+                        for patch in arr {
+                            let path = patch.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                            if path == "/purgeFlag" {
+                                if let Some(purge) = patch.get("value").and_then(|v| v.as_bool()) {
+                                    log::debug!("[{supi}] Setting purge flag to {purge}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            SbiResponse::with_status(204)
+        }
+        "DELETE" => {
+            if let Ok(mut ctx) = udr_ctx.write() {
+                ctx.ue_remove(supi);
+            }
+            SbiResponse::with_status(204)
+        }
+        _ => send_method_not_allowed(method, "context-data/amf-3gpp-access"),
+    }
+}
+
+/// Handle SMF registration context
+fn handle_smf_registrations(supi: &str, method: &str, request: &SbiRequest, pdu_session_id: &str) -> SbiResponse {
+    let udr_ctx = nextgcore_udrd::context::udr_self();
+    match method {
+        "GET" => {
+            if pdu_session_id.is_empty() {
+                let registrations = udr_ctx.read().ok()
+                    .and_then(|ctx| ctx.ue_find(supi).map(|ue| {
+                        ue.sessions.values()
+                            .map(|sess| serde_json::json!({
+                                "smfInstanceId": "00000000-0000-0000-0000-000000000000",
+                                "pduSessionId": sess.psi,
+                                "singleNssai": {"sst": 1},
+                                "dnn": sess.dnn.as_deref().unwrap_or("internet")
+                            }))
+                            .collect::<Vec<_>>()
+                    }))
+                    .unwrap_or_default();
+                SbiResponse::with_status(200)
+                    .with_body(serde_json::Value::Array(registrations).to_string(), "application/json")
+            } else {
+                let psi: u8 = pdu_session_id.parse().unwrap_or(0);
+                let response = udr_ctx.read().ok()
+                    .and_then(|ctx| ctx.sess_find(supi, psi).map(|sess| {
+                        serde_json::json!({
+                            "smfInstanceId": "00000000-0000-0000-0000-000000000000",
+                            "pduSessionId": sess.psi,
+                            "singleNssai": {"sst": 1},
+                            "dnn": sess.dnn.as_deref().unwrap_or("internet")
+                        })
+                    }));
+                match response {
+                    Some(json) => SbiResponse::with_status(200)
+                        .with_body(json.to_string(), "application/json"),
+                    None => send_not_found("SMF registration not found", Some("CONTEXT_NOT_FOUND")),
+                }
+            }
+        }
+        "PUT" => {
+            let psi: u8 = pdu_session_id.parse().unwrap_or(5);
+            let dnn = request.http.content.as_ref().and_then(|c| {
+                serde_json::from_str::<serde_json::Value>(c).ok()
+                    .and_then(|v| v.get("dnn").and_then(|d| d.as_str()).map(|s| s.to_string()))
+            });
+            if let Ok(mut ctx) = udr_ctx.write() {
+                ctx.sess_find_or_add(supi, psi, dnn.as_deref());
+            }
+            SbiResponse::with_status(204)
+        }
+        "DELETE" => {
+            if !pdu_session_id.is_empty() {
+                let psi: u8 = pdu_session_id.parse().unwrap_or(0);
+                if let Ok(mut ctx) = udr_ctx.write() {
+                    ctx.sess_remove(supi, psi);
+                }
+            }
+            SbiResponse::with_status(204)
+        }
+        _ => send_method_not_allowed(method, "context-data/smf-registrations"),
+    }
+}
+
 /// Handle provisioned-data requests
 /// Path: /nudr-dr/v1/subscription-data/{supi}/provisioned-data/{dataset}
 async fn handle_provisioned_data(supi: &str, parts: &[&str], dataset_idx: usize, method: &str) -> SbiResponse {
@@ -384,10 +540,16 @@ async fn handle_provisioned_data(supi: &str, parts: &[&str], dataset_idx: usize,
 }
 
 /// Handle policy-data requests
-async fn handle_policy_data(parts: &[&str], method: &str) -> SbiResponse {
+/// Implements:
+/// - GET policy-data/ues/{supi}/am-data: AM policy data
+/// - GET/PUT policy-data/ues/{supi}/sm-data: SM policy data
+/// - GET policy-data/ues/{supi}/ue-policy-set: UE policy set
+async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) -> SbiResponse {
     // /nudr-dr/v1/policy-data/ues/{supi}/{resource}
-    if method != "GET" {
-        return send_method_not_allowed(method, "policy-data");
+    let sub_resource = parts.get(3).copied().unwrap_or("");
+
+    if sub_resource != "ues" {
+        return send_not_found(&format!("Unknown policy sub-resource: {sub_resource}"), None);
     }
 
     let supi = match parts.get(4) {
@@ -399,48 +561,117 @@ async fn handle_policy_data(parts: &[&str], method: &str) -> SbiResponse {
 
     match resource {
         "am-data" => {
-            log::debug!("[{supi}] GET policy am-data");
-            SbiResponse::with_status(200)
-                .with_body("{}".to_string(), "application/json")
+            match method {
+                "GET" => {
+                    log::debug!("[{supi}] GET policy am-data");
+                    // AmPolicyData - per 3GPP spec, AM policy is typically derived
+                    // from subscription data, not stored separately
+                    SbiResponse::with_status(200)
+                        .with_body("{}".to_string(), "application/json")
+                }
+                _ => send_method_not_allowed(method, "policy-data/ues/am-data"),
+            }
         }
         "sm-data" => {
-            log::debug!("[{supi}] GET policy sm-data");
-            match ogs_dbi::subscription::ogs_dbi_subscription_data(supi) {
-                Ok(data) => {
-                    let mut sm_policy_snssai_data = serde_json::Map::new();
-                    for slice in &data.slice {
-                        let snssai_key = if slice.s_nssai.has_sd() {
-                            format!("{:02x}-{:06x}", slice.s_nssai.sst, slice.s_nssai.sd.v)
-                        } else {
-                            format!("{:02x}", slice.s_nssai.sst)
-                        };
-                        let mut snssai_json = serde_json::Map::new();
-                        snssai_json.insert("sst".to_string(), serde_json::Value::Number(slice.s_nssai.sst.into()));
-                        if slice.s_nssai.has_sd() {
-                            snssai_json.insert("sd".to_string(), serde_json::Value::String(format!("{:06x}", slice.s_nssai.sd.v)));
+            match method {
+                "GET" => {
+                    log::debug!("[{supi}] GET policy sm-data");
+                    match ogs_dbi::subscription::ogs_dbi_subscription_data(supi) {
+                        Ok(data) => {
+                            let sm_policy_snssai_data = build_sm_policy_data(&data);
+                            let response = serde_json::json!({"smPolicySnssaiData": sm_policy_snssai_data});
+                            SbiResponse::with_status(200)
+                                .with_body(response.to_string(), "application/json")
                         }
-                        let mut sm_policy_dnn_data = serde_json::Map::new();
-                        for sess in &slice.session {
-                            if let Some(dnn) = &sess.name {
-                                sm_policy_dnn_data.insert(dnn.clone(), serde_json::json!({"dnn": dnn}));
-                            }
-                        }
-                        let mut snssai_data = serde_json::Map::new();
-                        snssai_data.insert("snssai".to_string(), serde_json::Value::Object(snssai_json));
-                        if !sm_policy_dnn_data.is_empty() {
-                            snssai_data.insert("smPolicyDnnData".to_string(), serde_json::Value::Object(sm_policy_dnn_data));
-                        }
-                        sm_policy_snssai_data.insert(snssai_key, serde_json::Value::Object(snssai_data));
+                        Err(_) => send_not_found("Subscriber not found", None),
                     }
-                    let response = serde_json::json!({"smPolicySnssaiData": sm_policy_snssai_data});
-                    SbiResponse::with_status(200)
-                        .with_body(response.to_string(), "application/json")
                 }
-                Err(_) => send_not_found("Subscriber not found", None),
+                "PUT" => {
+                    log::debug!("[{supi}] PUT policy sm-data");
+                    // Accept and acknowledge SM policy data update
+                    // The PCF writes SM policy decisions back to UDR
+                    if let Some(content) = &request.http.content {
+                        log::debug!("[{supi}] SM policy data update: {} bytes", content.len());
+                    }
+                    SbiResponse::with_status(204)
+                }
+                _ => send_method_not_allowed(method, "policy-data/ues/sm-data"),
+            }
+        }
+        "ue-policy-set" => {
+            match method {
+                "GET" => {
+                    log::debug!("[{supi}] GET ue-policy-set");
+                    // UePolicySet - contains URSP rules, ANDSP, etc.
+                    // Per TS 29.519, return UE policy set from DB or defaults
+                    match ogs_dbi::subscription::ogs_dbi_subscription_data(supi) {
+                        Ok(data) => {
+                            // Build a minimal UePolicySet with subscribed S-NSSAIs
+                            let mut subscribed_ue_pol_sections = serde_json::Map::new();
+                            for slice in &data.slice {
+                                let snssai_key = if slice.s_nssai.has_sd() {
+                                    format!("{:02x}-{:06x}", slice.s_nssai.sst, slice.s_nssai.sd.v)
+                                } else {
+                                    format!("{:02x}", slice.s_nssai.sst)
+                                };
+                                subscribed_ue_pol_sections.insert(snssai_key, serde_json::json!({
+                                    "upsi": [],
+                                    "allowedRouteSelDescs": {}
+                                }));
+                            }
+                            let response = serde_json::json!({
+                                "subscPolicySections": subscribed_ue_pol_sections
+                            });
+                            SbiResponse::with_status(200)
+                                .with_body(response.to_string(), "application/json")
+                        }
+                        Err(_) => {
+                            // Return empty UePolicySet as default
+                            SbiResponse::with_status(200)
+                                .with_body("{}".to_string(), "application/json")
+                        }
+                    }
+                }
+                "PUT" => {
+                    log::debug!("[{supi}] PUT ue-policy-set");
+                    // Accept UE policy set update from PCF
+                    SbiResponse::with_status(204)
+                }
+                _ => send_method_not_allowed(method, "policy-data/ues/ue-policy-set"),
             }
         }
         _ => send_not_found(&format!("Unknown policy resource: {resource}"), None),
     }
+}
+
+/// Build SM policy data from subscription data
+fn build_sm_policy_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Map<String, serde_json::Value> {
+    let mut sm_policy_snssai_data = serde_json::Map::new();
+    for slice in &data.slice {
+        let snssai_key = if slice.s_nssai.has_sd() {
+            format!("{:02x}-{:06x}", slice.s_nssai.sst, slice.s_nssai.sd.v)
+        } else {
+            format!("{:02x}", slice.s_nssai.sst)
+        };
+        let mut snssai_json = serde_json::Map::new();
+        snssai_json.insert("sst".to_string(), serde_json::Value::Number(slice.s_nssai.sst.into()));
+        if slice.s_nssai.has_sd() {
+            snssai_json.insert("sd".to_string(), serde_json::Value::String(format!("{:06x}", slice.s_nssai.sd.v)));
+        }
+        let mut sm_policy_dnn_data = serde_json::Map::new();
+        for sess in &slice.session {
+            if let Some(dnn) = &sess.name {
+                sm_policy_dnn_data.insert(dnn.clone(), serde_json::json!({"dnn": dnn}));
+            }
+        }
+        let mut snssai_data = serde_json::Map::new();
+        snssai_data.insert("snssai".to_string(), serde_json::Value::Object(snssai_json));
+        if !sm_policy_dnn_data.is_empty() {
+            snssai_data.insert("smPolicyDnnData".to_string(), serde_json::Value::Object(sm_policy_dnn_data));
+        }
+        sm_policy_snssai_data.insert(snssai_key, serde_json::Value::Object(snssai_data));
+    }
+    sm_policy_snssai_data
 }
 
 // ============================================================================

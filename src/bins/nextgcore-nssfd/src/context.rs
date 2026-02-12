@@ -181,7 +181,7 @@ pub struct NssfContext {
     /// (PLMN ID, S-NSSAI) -> Home ID hash for quick lookup
     home_hash: RwLock<HashMap<(String, String, u8, Option<u32>), u64>>,
     /// NSSAI availability per NF instance ID (B24.4)
-    nssai_availability: RwLock<HashMap<String, NssaiAvailabilityInfo>>,
+    pub(crate) nssai_availability: RwLock<HashMap<String, NssaiAvailabilityInfo>>,
     /// Next NSI ID
     next_nsi_id: AtomicUsize,
     /// Next Home ID

@@ -6,7 +6,9 @@ use crate::n4_build::{
     build_association_setup_response, build_heartbeat_response,
     build_session_deletion_response, build_session_establishment_response,
     build_session_modification_response, build_session_report_request,
-    parse_create_far, parse_create_pdr, pfcp_ie, pfcp_type, CreatedPdr, FSeid, FTeid, NodeId,
+    parse_create_far, parse_create_pdr, parse_create_qer, parse_create_urr,
+    pfcp_ie, pfcp_type, CreatedPdr, FSeid, FTeid, NodeId,
+    ParsedCreateFar, ParsedCreatePdr, ParsedCreateQer, ParsedCreateUrr,
     ParsedFSeid, ParsedIe, ParsedPfcpHeader, PfcpCause, UserPlaneReport,
 };
 use std::collections::HashMap;
@@ -387,6 +389,14 @@ pub enum PfcpSessionEvent {
         dl_teid: u32,
         /// gNB address for downlink
         gnb_addr: Option<Ipv4Addr>,
+        /// Parsed PDR rules from PFCP
+        pdrs: Vec<ParsedCreatePdr>,
+        /// Parsed FAR rules from PFCP
+        fars: Vec<ParsedCreateFar>,
+        /// Parsed QER rules from PFCP
+        qers: Vec<ParsedCreateQer>,
+        /// Parsed URR rules from PFCP
+        urrs: Vec<ParsedCreateUrr>,
     },
     /// Session modified - update forwarding rules
     SessionModified {
@@ -395,6 +405,10 @@ pub enum PfcpSessionEvent {
         dl_teid: Option<u32>,
         /// Updated gNB address
         gnb_addr: Option<Ipv4Addr>,
+        /// Updated FAR rules
+        updated_fars: Vec<ParsedCreateFar>,
+        /// Updated QERs
+        updated_qers: Vec<ParsedCreateQer>,
     },
     /// Session deleted - remove forwarding rules
     SessionDeleted {
@@ -647,15 +661,19 @@ impl PfcpServer {
         let mut ue_ipv4: Option<Ipv4Addr> = None;
         let mut ul_teid: u32 = 0;
         let mut created_pdrs = Vec::new();
+        let mut parsed_pdrs = Vec::new();
 
         for pdr_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::CREATE_PDR) {
             match parse_create_pdr(&pdr_ie.value) {
                 Ok(pdr) => {
                     log::debug!(
-                        "PDR {}: src_if={}, precedence={}",
+                        "PDR {}: src_if={}, precedence={}, far_id={:?}, qer_id={:?}, urr_ids={:?}",
                         pdr.pdr_id,
                         pdr.pdi.source_interface,
-                        pdr.precedence
+                        pdr.precedence,
+                        pdr.far_id,
+                        pdr.qer_id,
+                        pdr.urr_ids,
                     );
 
                     // Check if this PDR needs a local F-TEID (uplink PDR)
@@ -695,6 +713,7 @@ impl PfcpServer {
                         local_f_teid,
                         ue_ip_address: None,
                     });
+                    parsed_pdrs.push(pdr);
                 }
                 Err(e) => {
                     log::warn!("Failed to parse PDR: {e}");
@@ -702,9 +721,10 @@ impl PfcpServer {
             }
         }
 
-        // Parse Create FARs to get downlink info
+        // Parse Create FARs
         let mut dl_teid: u32 = 0;
         let mut gnb_addr: Option<Ipv4Addr> = None;
+        let mut parsed_fars = Vec::new();
 
         for far_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::CREATE_FAR) {
             match parse_create_far(&far_ie.value) {
@@ -718,9 +738,44 @@ impl PfcpServer {
                             log::debug!("Downlink: TEID={dl_teid:#x}, gNB={gnb_addr:?}");
                         }
                     }
+                    parsed_fars.push(far);
                 }
                 Err(e) => {
                     log::warn!("Failed to parse FAR: {e}");
+                }
+            }
+        }
+
+        // Parse Create QERs
+        let mut parsed_qers = Vec::new();
+        for qer_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::CREATE_QER) {
+            match parse_create_qer(&qer_ie.value) {
+                Ok(qer) => {
+                    log::debug!(
+                        "QER {}: ul_gate={}, dl_gate={}, ul_mbr={}, dl_mbr={}, qfi={:?}",
+                        qer.qer_id, qer.ul_gate, qer.dl_gate, qer.ul_mbr, qer.dl_mbr, qer.qfi
+                    );
+                    parsed_qers.push(qer);
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse QER: {e}");
+                }
+            }
+        }
+
+        // Parse Create URRs
+        let mut parsed_urrs = Vec::new();
+        for urr_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::CREATE_URR) {
+            match parse_create_urr(&urr_ie.value) {
+                Ok(urr) => {
+                    log::debug!(
+                        "URR {}: vol_thresh={:?}, time_thresh={:?}",
+                        urr.urr_id, urr.volume_threshold_total, urr.time_threshold_secs
+                    );
+                    parsed_urrs.push(urr);
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse URR: {e}");
                 }
             }
         }
@@ -772,7 +827,7 @@ impl PfcpServer {
             sessions.insert(upf_seid, session_info.clone());
         }
 
-        // Notify data plane
+        // Notify data plane with full rule set
         let event = PfcpSessionEvent::SessionEstablished {
             upf_seid,
             smf_seid,
@@ -780,6 +835,10 @@ impl PfcpServer {
             ul_teid,
             dl_teid,
             gnb_addr,
+            pdrs: parsed_pdrs,
+            fars: parsed_fars,
+            qers: parsed_qers,
+            urrs: parsed_urrs,
         };
 
         if let Err(e) = self.session_tx.send(event).await {
@@ -810,6 +869,7 @@ impl PfcpServer {
         // Parse Update FARs
         let mut updated_dl_teid: Option<u32> = None;
         let mut updated_gnb_addr: Option<Ipv4Addr> = None;
+        let mut mod_fars = Vec::new();
 
         // Update FAR IE type = 10
         for far_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::UPDATE_FAR) {
@@ -827,9 +887,24 @@ impl PfcpServer {
                             );
                         }
                     }
+                    mod_fars.push(far);
                 }
                 Err(e) => {
                     log::warn!("Failed to parse Update FAR: {e}");
+                }
+            }
+        }
+
+        // Parse Update QERs (IE type 14)
+        let mut mod_qers = Vec::new();
+        for qer_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::UPDATE_QER) {
+            match parse_create_qer(&qer_ie.value) {
+                Ok(qer) => {
+                    log::debug!("Update QER {}: qfi={:?}", qer.qer_id, qer.qfi);
+                    mod_qers.push(qer);
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse Update QER: {e}");
                 }
             }
         }
@@ -870,11 +945,18 @@ impl PfcpServer {
             .map_err(|e| format!("Send error: {e}"))?;
 
         // Notify data plane
-        if updated_dl_teid.is_some() || updated_gnb_addr.is_some() {
+        let has_changes = updated_dl_teid.is_some()
+            || updated_gnb_addr.is_some()
+            || !mod_fars.is_empty()
+            || !mod_qers.is_empty();
+
+        if has_changes {
             let event = PfcpSessionEvent::SessionModified {
                 upf_seid,
                 dl_teid: updated_dl_teid,
                 gnb_addr: updated_gnb_addr,
+                updated_fars: mod_fars,
+                updated_qers: mod_qers,
             };
 
             if let Err(e) = self.session_tx.send(event).await {
@@ -935,6 +1017,90 @@ impl PfcpServer {
         }
 
         log::info!("Session {upf_seid:#x} deleted");
+        Ok(())
+    }
+
+    /// Send a PFCP Session Report Request for URR usage reports.
+    /// Called by the URR threshold check task when thresholds are exceeded.
+    pub async fn send_urr_report(
+        &self,
+        upf_seid: u64,
+        smf_seid: u64,
+        reports: Vec<crate::data_plane::UrrReportEntry>,
+    ) -> Result<(), String> {
+        // Look up the SMF address from the session
+        let smf_addr = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(&upf_seid)
+                .map(|s| s.smf_addr)
+        };
+
+        let smf_addr = match smf_addr {
+            Some(addr) => addr,
+            None => {
+                return Err(format!("Session {upf_seid:#x} not found for URR report"));
+            }
+        };
+
+        // Build usage reports
+        let usage_reports: Vec<crate::n4_build::UsageReport> = reports
+            .iter()
+            .map(|r| {
+                let mut trigger = crate::n4_build::UsageReportTrigger::default();
+                trigger.volume_threshold = true;
+
+                crate::n4_build::UsageReport {
+                    urr_id: r.urr_id,
+                    ur_seqn: 1,
+                    trigger,
+                    volume_measurement: Some(crate::n4_build::VolumeMeasurement {
+                        total_volume: Some(r.total_bytes),
+                        uplink_volume: Some(r.ul_bytes),
+                        downlink_volume: Some(r.dl_bytes),
+                        total_packets: Some(r.total_pkts),
+                        uplink_packets: Some(r.ul_pkts),
+                        downlink_packets: Some(r.dl_pkts),
+                    }),
+                    ..Default::default()
+                }
+            })
+            .collect();
+
+        let user_plane_report = UserPlaneReport {
+            report_type: crate::n4_build::ReportType {
+                usage_report: true,
+                ..Default::default()
+            },
+            usage_reports,
+            ..Default::default()
+        };
+
+        let payload = build_session_report_request(
+            pfcp_type::SESSION_REPORT_REQUEST,
+            &user_plane_report,
+        );
+
+        // Use a simple sequence number (atomic counter)
+        let seq = self.next_teid.fetch_add(1, Ordering::SeqCst); // reuse counter for seq
+
+        let message = self.build_response(
+            pfcp_type::SESSION_REPORT_REQUEST,
+            smf_seid,
+            seq,
+            &payload,
+            true,
+        );
+
+        self.socket
+            .send_to(&message, smf_addr)
+            .await
+            .map_err(|e| format!("Failed to send Session Report Request: {e}"))?;
+
+        log::info!(
+            "Sent Session Report Request to {smf_addr} for SEID={upf_seid:#x} ({} URR reports)",
+            reports.len()
+        );
         Ok(())
     }
 

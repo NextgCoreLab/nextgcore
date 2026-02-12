@@ -528,68 +528,11 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
             let s_nssai = SNssai { sst, sd };
             let session_data = pcf_get_session_data(supi, None, &s_nssai, dnn);
 
-            // Build policy decision with real data
-            let (sess_rules, pcc_rules, qos_decs) = if let Some(ref sd) = session_data {
-                let sess_rule_id = format!("SessRule-{}", sess.sm_policy_id);
-                let def_qos_id = format!("QosDec-{}", sess.sm_policy_id);
-
-                // Session rules with authorized session AMBR and default QoS
-                let sess_rules = serde_json::json!({
-                    &sess_rule_id: {
-                        "sessRuleId": sess_rule_id,
-                        "authSessAmbr": {
-                            "uplink": format_bitrate(sd.ambr_uplink),
-                            "downlink": format_bitrate(sd.ambr_downlink),
-                        },
-                        "authDefQos": {
-                            "5qi": sd.qos_index,
-                            "arp": {
-                                "priorityLevel": sd.arp_priority_level,
-                                "preemptCap": if sd.arp_preempt_cap { "MAY_PREEMPT" } else { "NOT_PREEMPT" },
-                                "preemptVuln": if sd.arp_preempt_vuln { "PREEMPTABLE" } else { "NOT_PREEMPTABLE" },
-                            },
-                        },
-                        "defQosRef": def_qos_id,
-                    }
-                });
-
-                // QoS decisions
-                let qos_decs = serde_json::json!({
-                    &def_qos_id: {
-                        "qosDecId": def_qos_id,
-                        "5qi": sd.qos_index,
-                        "maxbrUl": format_bitrate(sd.ambr_uplink),
-                        "maxbrDl": format_bitrate(sd.ambr_downlink),
-                    }
-                });
-
-                // PCC rules from database
-                let mut pcc_map = serde_json::Map::new();
-                for rule in &sd.pcc_rules {
-                    let rule_qos_ref = format!("QosDec-pcc-{}", rule.id);
-                    let flows: Vec<serde_json::Value> = rule.flows.iter().enumerate().map(|(i, f)| {
-                        serde_json::json!({
-                            "flowDescription": f.description,
-                            "flowDirection": match f.direction {
-                                FlowDirection::Uplink => "UPLINK",
-                                FlowDirection::Downlink => "DOWNLINK",
-                                _ => "BIDIRECTIONAL",
-                            },
-                            "packFiltId": format!("pf-{}-{}", rule.id, i),
-                        })
-                    }).collect();
-
-                    pcc_map.insert(rule.id.clone(), serde_json::json!({
-                        "pccRuleId": rule.id,
-                        "precedence": rule.precedence,
-                        "flowInfos": flows,
-                        "refQosData": [rule_qos_ref],
-                    }));
-                }
-
-                (sess_rules, serde_json::Value::Object(pcc_map), qos_decs)
+            // Build policy decision from subscription data (TS 29.512)
+            let (sess_rules, pcc_rules, qos_decs, triggers) = if let Some(ref sd) = session_data {
+                build_sm_policy_decision(&sess.sm_policy_id, sd)
             } else {
-                (serde_json::json!({}), serde_json::json!({}), serde_json::json!({}))
+                (serde_json::json!({}), serde_json::json!({}), serde_json::json!({}), vec![])
             };
 
             SbiResponse::with_status(201)
@@ -601,6 +544,8 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
                     "sessRules": sess_rules,
                     "pccRules": pcc_rules,
                     "qosDecs": qos_decs,
+                    "policyCtrlReqTriggers": triggers,
+                    "suppFeat": policy_data.get("suppFeat").and_then(|v| v.as_str()).unwrap_or(""),
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(201))
         }
@@ -608,6 +553,95 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
             send_bad_request("Failed to create SM policy", Some("CREATION_FAILED"))
         }
     }
+}
+
+/// Build a complete SM Policy Decision from session data (TS 29.512)
+///
+/// Generates session rules, PCC rules, QoS decisions, and policy control
+/// request triggers based on subscription data from UDR.
+fn build_sm_policy_decision(
+    sm_policy_id: &str,
+    session_data: &nudr_handler::SessionData,
+) -> (serde_json::Value, serde_json::Value, serde_json::Value, Vec<String>) {
+    let sess_rule_id = format!("SessRule-{sm_policy_id}");
+    let def_qos_id = format!("QosDec-{sm_policy_id}");
+
+    // Session rules with authorized session AMBR and default QoS
+    let sess_rules = serde_json::json!({
+        &sess_rule_id: {
+            "sessRuleId": sess_rule_id,
+            "authSessAmbr": {
+                "uplink": format_bitrate(session_data.ambr_uplink),
+                "downlink": format_bitrate(session_data.ambr_downlink),
+            },
+            "authDefQos": {
+                "5qi": session_data.qos_index,
+                "arp": {
+                    "priorityLevel": session_data.arp_priority_level,
+                    "preemptCap": if session_data.arp_preempt_cap { "MAY_PREEMPT" } else { "NOT_PREEMPT" },
+                    "preemptVuln": if session_data.arp_preempt_vuln { "PREEMPTABLE" } else { "NOT_PREEMPTABLE" },
+                },
+            },
+            "defQosRef": def_qos_id,
+        }
+    });
+
+    // Default QoS decision
+    let mut qos_map = serde_json::Map::new();
+    qos_map.insert(def_qos_id.clone(), serde_json::json!({
+        "qosDecId": def_qos_id,
+        "5qi": session_data.qos_index,
+        "maxbrUl": format_bitrate(session_data.ambr_uplink),
+        "maxbrDl": format_bitrate(session_data.ambr_downlink),
+    }));
+
+    // PCC rules from database subscription data
+    let mut pcc_map = serde_json::Map::new();
+    for rule in &session_data.pcc_rules {
+        let rule_qos_id = format!("QosDec-pcc-{}", rule.id);
+
+        let flows: Vec<serde_json::Value> = rule.flows.iter().enumerate().map(|(i, f)| {
+            serde_json::json!({
+                "flowDescription": f.description,
+                "flowDirection": match f.direction {
+                    nudr_handler::FlowDirection::Uplink => "UPLINK",
+                    nudr_handler::FlowDirection::Downlink => "DOWNLINK",
+                    _ => "BIDIRECTIONAL",
+                },
+                "packFiltId": format!("pf-{}-{}", rule.id, i),
+            })
+        }).collect();
+
+        pcc_map.insert(rule.id.clone(), serde_json::json!({
+            "pccRuleId": rule.id,
+            "precedence": rule.precedence,
+            "flowInfos": flows,
+            "refQosData": [&rule_qos_id],
+        }));
+
+        // Per-rule QoS decision
+        qos_map.insert(rule_qos_id.clone(), serde_json::json!({
+            "qosDecId": rule_qos_id,
+            "5qi": rule.qos_index,
+        }));
+    }
+
+    // Policy control request triggers (TS 29.512 Table 5.6.2.6-1)
+    let triggers = vec![
+        "SE_AMBR_CH".to_string(),    // Session AMBR change
+        "DEF_QOS_CH".to_string(),    // Default QoS change
+        "UE_IP_CH".to_string(),      // UE IP address change
+        "PLMN_CH".to_string(),       // Serving network change
+        "AC_TY_CH".to_string(),      // Access type change
+        "RAT_TY_CH".to_string(),     // RAT type change
+    ];
+
+    (
+        sess_rules,
+        serde_json::Value::Object(pcc_map),
+        serde_json::Value::Object(qos_map),
+        triggers,
+    )
 }
 
 /// Format bitrate as a human-readable string per 3GPP TS 29.571
@@ -1040,5 +1074,53 @@ mod tests {
         assert!(args.tls);
         assert_eq!(args.tls_cert, Some("/path/to/cert.pem".to_string()));
         assert_eq!(args.tls_key, Some("/path/to/key.pem".to_string()));
+    }
+
+    #[test]
+    fn test_build_sm_policy_decision() {
+        let session_data = nudr_handler::SessionData {
+            qos_index: 9,
+            arp_priority_level: 8,
+            arp_preempt_cap: false,
+            arp_preempt_vuln: true,
+            ambr_uplink: 100_000_000,
+            ambr_downlink: 200_000_000,
+            pcc_rules: vec![
+                nudr_handler::PccRule {
+                    id: "rule-1".to_string(),
+                    precedence: 50,
+                    qos_index: 5,
+                    flow_status: npcf_handler::FlowStatus::Enabled,
+                    flows: vec![
+                        nudr_handler::FlowDescription {
+                            direction: nudr_handler::FlowDirection::Downlink,
+                            description: "permit out ip from any to assigned".to_string(),
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let (sess_rules, pcc_rules, qos_decs, triggers) =
+            build_sm_policy_decision("test-policy-1", &session_data);
+
+        // Verify session rules
+        let sr = &sess_rules["SessRule-test-policy-1"];
+        assert_eq!(sr["authDefQos"]["5qi"], 9);
+        assert_eq!(sr["authSessAmbr"]["uplink"], "100 Mbps");
+        assert_eq!(sr["authSessAmbr"]["downlink"], "200 Mbps");
+
+        // Verify PCC rules from subscription
+        let pcc = &pcc_rules["rule-1"];
+        assert_eq!(pcc["precedence"], 50);
+        assert!(!pcc["flowInfos"].as_array().unwrap().is_empty());
+
+        // Verify QoS decisions (default + per-rule)
+        assert!(qos_decs.get("QosDec-test-policy-1").is_some());
+        assert!(qos_decs.get("QosDec-pcc-rule-1").is_some());
+
+        // Verify triggers
+        assert!(triggers.contains(&"SE_AMBR_CH".to_string()));
+        assert!(triggers.contains(&"DEF_QOS_CH".to_string()));
     }
 }

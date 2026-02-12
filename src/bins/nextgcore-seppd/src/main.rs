@@ -17,6 +17,7 @@ mod event;
 mod handshake_sm;
 mod n32c_build;
 mod n32c_handler;
+mod prins;
 mod sbi_path;
 mod sbi_response;
 mod sepp_sm;

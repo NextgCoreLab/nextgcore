@@ -1275,13 +1275,21 @@ impl DataPlane {
         };
 
         // --- PDR matching (uplink: source_interface = Access) ---
+        let mut dscp_to_apply: Option<u8> = None;
         if let Some((far_id, qer_id, urr_ids, _ohr)) = session.match_pdr(SRC_INTF_ACCESS) {
-            // Check QER gate
+            // Check QER gate and extract DSCP
             if let Some(qid) = qer_id {
                 if !session.check_qer_gate(qid, true, payload_len) {
                     log::debug!("UL packet dropped by QER gate (qer_id={qid})");
                     self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                     return;
+                }
+                // Get DSCP from QER for marking
+                let qers = session.qers.read().unwrap();
+                if let Some(qer) = qers.get(&qid) {
+                    if qer.dscp != 0 {
+                        dscp_to_apply = Some(qer.dscp);
+                    }
                 }
             }
 
@@ -1301,6 +1309,15 @@ impl DataPlane {
             }
         }
         // If no PDR matches, default to forwarding (pass-through)
+
+        // Apply DSCP marking to inner IP packet before writing to TUN
+        let ip_payload = if let Some(dscp) = dscp_to_apply {
+            let mut marked = ip_payload.to_vec();
+            apply_dscp_to_ip_packet(&mut marked, dscp);
+            marked
+        } else {
+            ip_payload.to_vec()
+        };
 
         // Write to TUN device (decapsulated uplink)
         let ret = unsafe {
@@ -1338,15 +1355,23 @@ impl DataPlane {
         // Find session by destination UE IP
         let session = dst_ip.and_then(|ip| self.sessions.find_by_ue_ip(ip));
 
+        let mut dscp_to_apply: Option<u8> = None;
         let (dl_teid, gnb_addr) = if let Some(ref sess) = session {
             // --- PDR matching (downlink: source_interface = Core) ---
             if let Some((far_id, qer_id, urr_ids, _ohr)) = sess.match_pdr(SRC_INTF_CORE) {
-                // Check QER gate
+                // Check QER gate and extract DSCP
                 if let Some(qid) = qer_id {
                     if !sess.check_qer_gate(qid, false, payload_len) {
                         log::debug!("DL packet dropped by QER gate (qer_id={qid})");
                         self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                         return;
+                    }
+                    // Get DSCP from QER for marking
+                    let qers = sess.qers.read().unwrap();
+                    if let Some(qer) = qers.get(&qid) {
+                        if qer.dscp != 0 {
+                            dscp_to_apply = Some(qer.dscp);
+                        }
                     }
                 }
 
@@ -1391,11 +1416,20 @@ impl DataPlane {
             (default_teid, default_gnb)
         };
 
+        // Apply DSCP marking to inner IP packet before GTP-U encapsulation
+        let marked_pkt = if let Some(dscp) = dscp_to_apply {
+            let mut marked = pkt.to_vec();
+            apply_dscp_to_ip_packet(&mut marked, dscp);
+            marked
+        } else {
+            pkt.to_vec()
+        };
+
         // Build GTP-U encapsulated packet
-        let gtpu_header = build_gtpu_header(dl_teid, pkt.len() as u16);
-        let mut gtpu_pkt = Vec::with_capacity(GTPU_HEADER_SIZE + pkt.len());
+        let gtpu_header = build_gtpu_header(dl_teid, marked_pkt.len() as u16);
+        let mut gtpu_pkt = Vec::with_capacity(GTPU_HEADER_SIZE + marked_pkt.len());
         gtpu_pkt.extend_from_slice(&gtpu_header);
-        gtpu_pkt.extend_from_slice(pkt);
+        gtpu_pkt.extend_from_slice(&marked_pkt);
 
         // Send to gNB
         match gtpu.send_to(&gtpu_pkt, gnb_addr).await {

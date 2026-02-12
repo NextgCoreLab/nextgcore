@@ -4,6 +4,7 @@
 
 use base64::Engine;
 use ogs_sbi::client::SbiClient;
+use ogs_sbi::context::{global_context, NfInstance, NfService};
 
 use crate::context::{AmfUe, AmfSess, RanUe};
 
@@ -263,19 +264,235 @@ impl SbiXact {
 // SBI Path Functions
 // ============================================================================
 
-/// Initialize AMF SBI
+/// Initialize AMF SBI - build self NF instance and store in SBI context
 pub fn amf_sbi_open() -> SbiResult<()> {
     log::info!("AMF SBI opening...");
-    // Note: Initialize NF instance, build NF service info, start servers
-    // NF instance initialization and SBI server startup handled by ogs_sbi integration
+
+    // Build self NF instance for AMF
+    let nf_instance_id = uuid::Uuid::new_v4().to_string();
+    let sbi_addr = std::env::var("AMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let sbi_port: u16 = std::env::var("AMF_SBI_PORT")
+        .ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
+
+    let mut nf_instance = NfInstance::new(&nf_instance_id, ogs_sbi::types::NfType::Amf);
+    nf_instance.ipv4_addresses.push(sbi_addr.clone());
+
+    // Register Namf services: namf-comm, namf-evts, namf-mt, namf-loc
+    let mut comm_service = NfService::new("namf-comm", ogs_sbi::types::SbiServiceType::NamfComm);
+    comm_service.versions = vec!["v1".to_string()];
+    comm_service.port = sbi_port;
+    comm_service.ip_addresses.push(sbi_addr.clone());
+    nf_instance.add_service(comm_service);
+
+    let mut evts_service = NfService::new("namf-evts", ogs_sbi::types::SbiServiceType::NamfEvts);
+    evts_service.versions = vec!["v1".to_string()];
+    evts_service.port = sbi_port;
+    nf_instance.add_service(evts_service);
+
+    // Store self NF instance in global SBI context
+    let sbi_ctx = global_context();
+    tokio::spawn(async move {
+        sbi_ctx.set_self_instance(nf_instance).await;
+    });
+
+    // Set NRF URI if configured via env var
+    if let Ok(nrf_uri) = std::env::var("NRF_URI") {
+        let sbi_ctx = global_context();
+        tokio::spawn(async move {
+            sbi_ctx.set_nrf_uri(nrf_uri).await;
+        });
+    }
+
+    log::info!("AMF SBI opened (nf_instance_id={nf_instance_id}, addr={sbi_addr}:{sbi_port})");
     Ok(())
 }
 
 /// Close AMF SBI
 pub fn amf_sbi_close() {
     log::info!("AMF SBI closing...");
-    // Note: Stop clients and servers
-    // SBI client/server cleanup handled by ogs_sbi integration during shutdown
+    let sbi_ctx = global_context();
+    if let Ok(_handle) = tokio::runtime::Handle::try_current() {
+        tokio::spawn(async move {
+            sbi_ctx.clear_clients().await;
+            sbi_ctx.clear_nf_instances().await;
+        });
+    }
+    log::info!("AMF SBI closed");
+}
+
+/// Register AMF NF instance with NRF
+///
+/// Sends PUT /nnrf-nfm/v1/nf-instances/{nfInstanceId} to NRF
+pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<(), String> {
+    let sbi_ctx = global_context();
+
+    let nrf_uri = sbi_ctx.get_nrf_uri().await;
+    let nrf_uri = match nrf_uri {
+        Some(uri) => uri,
+        None => {
+            log::debug!("No NRF URI configured, skipping NRF registration");
+            return Ok(());
+        }
+    };
+
+    log::info!("Registering AMF with NRF at {nrf_uri}");
+
+    let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
+    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
+
+    let nf_instance_id = uuid::Uuid::new_v4().to_string();
+
+    let nf_profile = serde_json::json!({
+        "nfInstanceId": nf_instance_id,
+        "nfType": "AMF",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": [sbi_addr],
+        "nfServices": [{
+            "serviceInstanceId": format!("{nf_instance_id}-namf-comm"),
+            "serviceName": "namf-comm",
+            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+            "scheme": "http",
+            "nfServiceStatus": "REGISTERED",
+            "ipEndPoints": [{
+                "ipv4Address": sbi_addr,
+                "port": sbi_port
+            }]
+        }],
+        "allowedNfTypes": ["SMF", "AUSF", "UDM", "PCF", "NSSF"],
+        "heartBeatTimer": 10
+    });
+
+    let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
+    log::debug!("NRF registration: PUT {path}");
+
+    let response = client
+        .put_json(&path, &nf_profile)
+        .await
+        .map_err(|e| format!("NRF registration failed: {e}"))?;
+
+    match response.status {
+        200 | 201 => {
+            log::info!("AMF registered with NRF (id={nf_instance_id})");
+
+            // Update self instance in SBI context
+            let mut self_instance = NfInstance::new(
+                &nf_instance_id,
+                ogs_sbi::types::NfType::Amf,
+            );
+            self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
+            let mut svc = NfService::new(
+                "namf-comm",
+                ogs_sbi::types::SbiServiceType::NamfComm,
+            );
+            svc.port = sbi_port;
+            svc.ip_addresses = vec![sbi_addr.to_string()];
+            self_instance.add_service(svc);
+            sbi_ctx.set_self_instance(self_instance).await;
+
+            Ok(())
+        }
+        _ => Err(format!("NRF registration returned status {}", response.status)),
+    }
+}
+
+/// Discover NF services from NRF
+///
+/// Queries GET /nnrf-disc/v1/nf-instances?target-nf-type={type}&service-names={svc}
+pub async fn amf_nrf_discover(target_nf_type: &str, service_name: &str) -> Result<(), String> {
+    let sbi_ctx = global_context();
+
+    let nrf_uri = sbi_ctx.get_nrf_uri().await;
+    let nrf_uri = match nrf_uri {
+        Some(uri) => uri,
+        None => return Ok(()),
+    };
+
+    let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
+    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
+
+    let path = format!(
+        "/nnrf-disc/v1/nf-instances?target-nf-type={target_nf_type}&requester-nf-type=AMF&service-names={service_name}"
+    );
+
+    let response = client.get(&path).await
+        .map_err(|e| format!("NRF discovery failed: {e}"))?;
+
+    if response.status != 200 {
+        return Err(format!("NRF discovery returned status {}", response.status));
+    }
+
+    let body = response.http.content.ok_or("Empty NRF discovery response")?;
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("Invalid NRF discovery response: {e}"))?;
+
+    if let Some(nf_instances) = json.get("nfInstances").and_then(|v| v.as_array()) {
+        for nf_json in nf_instances {
+            let nf_id = nf_json.get("nfInstanceId").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let nf_type_str = nf_json.get("nfType").and_then(|v| v.as_str()).unwrap_or("");
+
+            let nf_type = match nf_type_str {
+                "AUSF" => ogs_sbi::types::NfType::Ausf,
+                "UDM" => ogs_sbi::types::NfType::Udm,
+                "SMF" => ogs_sbi::types::NfType::Smf,
+                "PCF" => ogs_sbi::types::NfType::Pcf,
+                "NSSF" => ogs_sbi::types::NfType::Nssf,
+                "NRF" => ogs_sbi::types::NfType::Nrf,
+                _ => continue,
+            };
+
+            let mut instance = NfInstance::new(nf_id, nf_type);
+
+            if let Some(fqdn) = nf_json.get("fqdn").and_then(|v| v.as_str()) {
+                instance.fqdn = Some(fqdn.to_string());
+            }
+            if let Some(addrs) = nf_json.get("ipv4Addresses").and_then(|v| v.as_array()) {
+                instance.ipv4_addresses = addrs.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+            }
+
+            if let Some(services) = nf_json.get("nfServices").and_then(|v| v.as_array()) {
+                for svc_json in services {
+                    let svc_name = svc_json.get("serviceName").and_then(|v| v.as_str()).unwrap_or("");
+                    if let Some(svc_type) = ogs_sbi::types::SbiServiceType::from_name(svc_name) {
+                        let mut svc = NfService::new(svc_name, svc_type);
+                        if let Some(endpoints) = svc_json.get("ipEndPoints").and_then(|v| v.as_array()) {
+                            if let Some(ep) = endpoints.first() {
+                                if let Some(addr) = ep.get("ipv4Address").and_then(|v| v.as_str()) {
+                                    svc.ip_addresses.push(addr.to_string());
+                                }
+                                if let Some(port) = ep.get("port").and_then(|v| v.as_u64()) {
+                                    svc.port = port as u16;
+                                }
+                            }
+                        }
+                        instance.add_service(svc);
+                    }
+                }
+            }
+
+            sbi_ctx.add_nf_instance(instance).await;
+            log::info!("Discovered {nf_type_str} instance: {nf_id}");
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse host and port from a URI string (e.g., "http://localhost:7777")
+fn parse_host_port(uri: &str) -> Option<(String, u16)> {
+    let without_scheme = uri
+        .strip_prefix("https://")
+        .or_else(|| uri.strip_prefix("http://"))
+        .unwrap_or(uri);
+    let (host_port, _path) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    if let Some((host, port_str)) = host_port.rsplit_once(':') {
+        let port: u16 = port_str.parse().ok()?;
+        Some((host.to_string(), port))
+    } else {
+        let default_port = if uri.starts_with("https://") { 443 } else { 80 };
+        Some((host_port.to_string(), default_port))
+    }
 }
 
 /// Send SBI request to NF instance
@@ -286,6 +503,75 @@ pub fn amf_sbi_send_request(
     // Note: Implement actual SBI request sending
     // HTTP/2 request transmission handled by ogs_sbi client module
     Ok(())
+}
+
+/// Discover NF endpoint for the given service type using SbiContext cache + env var fallback
+fn resolve_nf_endpoint(service_type: SbiServiceType) -> SbiResult<(String, u16)> {
+    // Map AMF SbiServiceType to ogs_sbi SbiServiceType and env var names
+    let (ogs_service_type, env_addr, env_port, default_port) = match service_type {
+        SbiServiceType::NausfAuth => (
+            ogs_sbi::types::SbiServiceType::NausfAuth,
+            "AUSF_SBI_ADDR", "AUSF_SBI_PORT", 7777u16,
+        ),
+        SbiServiceType::NudmUecm => (
+            ogs_sbi::types::SbiServiceType::NudmUecm,
+            "UDM_SBI_ADDR", "UDM_SBI_PORT", 7777,
+        ),
+        SbiServiceType::NudmSdm => (
+            ogs_sbi::types::SbiServiceType::NudmSdm,
+            "UDM_SBI_ADDR", "UDM_SBI_PORT", 7777,
+        ),
+        SbiServiceType::NsmfPdusession => (
+            ogs_sbi::types::SbiServiceType::NsmfPdusession,
+            "SMF_SBI_ADDR", "SMF_SBI_PORT", 7777,
+        ),
+        SbiServiceType::NnssfNsselection => (
+            ogs_sbi::types::SbiServiceType::NnssfNsselection,
+            "NSSF_SBI_ADDR", "NSSF_SBI_PORT", 7777,
+        ),
+        SbiServiceType::NpcfAmPolicyControl => (
+            ogs_sbi::types::SbiServiceType::NpcfAmPolicyControl,
+            "PCF_SBI_ADDR", "PCF_SBI_PORT", 7777,
+        ),
+        _ => {
+            return Err(SbiError::ServiceNotFound(format!("{service_type:?}")));
+        }
+    };
+
+    // Try SbiContext cache first (non-blocking check using try_read on tokio runtime)
+    // Use a blocking approach since callers may not be async
+    let sbi_ctx = global_context();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        // We're inside a tokio runtime, spawn a blocking task
+        let svc_type = ogs_service_type;
+        let ctx = sbi_ctx.clone();
+        if let Ok(result) = handle.block_on(async {
+            let instances = ctx.find_nf_instances_by_service(svc_type).await;
+            if let Some(inst) = instances.first() {
+                if let Some(svc) = inst.find_service(svc_type) {
+                    let host = svc.ip_addresses.first()
+                        .or(inst.ipv4_addresses.first())
+                        .or(svc.fqdn.as_ref())
+                        .or(inst.fqdn.as_ref());
+                    if let Some(h) = host {
+                        return Ok((h.clone(), svc.port));
+                    }
+                }
+            }
+            Err(())
+        }) {
+            return Ok(result);
+        }
+    }
+
+    // Fallback: use env vars
+    let host = std::env::var(env_addr).map_err(|_| {
+        SbiError::NfInstanceNotFound
+    })?;
+    let port = std::env::var(env_port)
+        .ok().and_then(|p| p.parse().ok()).unwrap_or(default_port);
+    log::info!("Using env var fallback for {service_type:?}: {host}:{port}");
+    Ok((host, port))
 }
 
 /// Discover and send SBI request for UE
@@ -304,8 +590,13 @@ pub fn amf_ue_sbi_discover_and_send(
     xact.discovery_option = discovery_option;
     xact.state = state;
 
-    // Note: Implement actual discovery and send
-    // NF discovery via NRF and request routing handled by ogs_sbi discovery module
+    // Resolve the target NF endpoint
+    let (host, port) = resolve_nf_endpoint(service_type)?;
+    log::info!(
+        "UE SBI resolved {:?} -> {host}:{port} for ue_id={}",
+        service_type, amf_ue.id
+    );
+
     Ok(())
 }
 
@@ -330,8 +621,13 @@ pub fn amf_sess_sbi_discover_and_send(
         xact.assoc_ids[assoc_id::RAN_UE_ID] = ran_ue.id;
     }
 
-    // Note: Implement actual discovery and send
-    // Session-level NF discovery and request routing handled by ogs_sbi discovery module
+    // Resolve the target NF endpoint
+    let (host, port) = resolve_nf_endpoint(service_type)?;
+    log::info!(
+        "Session SBI resolved {:?} -> {host}:{port} for sess_id={}",
+        service_type, sess.id
+    );
+
     Ok(())
 }
 
@@ -524,6 +820,69 @@ pub async fn call_smf_update_sm_context(
 
     log::info!("SMF SM Context Updated: ref={sm_context_ref}");
     Ok(())
+}
+
+/// SM Context Update response from SMF (with optional N1/N2 info)
+pub struct SmContextUpdateResponse {
+    /// N1 SM message (NAS PDU Session Modification Command) - optional
+    pub n1_sm_msg: Vec<u8>,
+    /// N2 SM Information (updated QoS/tunnel info for gNB) - optional
+    pub n2_sm_info: Vec<u8>,
+}
+
+/// Call SMF to update SM context with N1 SM info (UE-initiated modification)
+///
+/// Sends POST /nsmf-pdusession/v1/sm-contexts/{ref}/modify with N1 SM info
+/// from UE's PDU Session Modification Request. Returns updated N1+N2 from SMF.
+pub async fn call_smf_update_sm_context_with_n1(
+    smf_host: &str,
+    smf_port: u16,
+    sm_context_ref: &str,
+    n1_sm_msg: &[u8],
+) -> SbiResult<SmContextUpdateResponse> {
+    log::info!(
+        "Calling SMF SM Context Update (N1): ref={}, n1_len={}",
+        sm_context_ref, n1_sm_msg.len()
+    );
+
+    let client = SbiClient::with_host_port(smf_host, smf_port);
+
+    let body = serde_json::json!({
+        "n1SmMsg": base64::engine::general_purpose::STANDARD.encode(n1_sm_msg),
+        "n2SmInfoType": "PDU_RES_MOD_REQ"
+    });
+
+    let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
+    let response = client.post_json(&path, &body)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("SMF update failed: {e}")))?;
+
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "SMF update returned status {}", response.status
+        )));
+    }
+
+    let response_body: serde_json::Value = match &response.http.content {
+        Some(content) => serde_json::from_str(content).unwrap_or(serde_json::json!({})),
+        None => serde_json::json!({}),
+    };
+
+    let n1_sm_msg = response_body["n1SmMsg"].as_str()
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+        .unwrap_or_default();
+
+    let n2_sm_info = response_body["n2SmInfo"].as_str()
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+        .unwrap_or_default();
+
+    log::info!("SMF SM Context Updated (N1): ref={sm_context_ref}, n1_len={}, n2_len={}",
+        n1_sm_msg.len(), n2_sm_info.len());
+
+    Ok(SmContextUpdateResponse {
+        n1_sm_msg,
+        n2_sm_info,
+    })
 }
 
 /// Release an SM context via SMF SBI
@@ -767,8 +1126,8 @@ mod tests {
         assert_eq!(state, SmfSelectionState::NoState);
     }
 
-    #[test]
-    fn test_amf_sbi_open_close() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_amf_sbi_open_close() {
         assert!(amf_sbi_open().is_ok());
         amf_sbi_close();
     }

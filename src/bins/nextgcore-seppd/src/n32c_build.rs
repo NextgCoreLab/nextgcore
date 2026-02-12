@@ -273,7 +273,7 @@ pub struct N32fMessage {
     /// Protected payload (JWS signed or JWE encrypted), base64url-encoded
     pub payload: Option<String>,
     /// Modification list for PRINS (if security is PRINS)
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modifications_block: Vec<N32fModification>,
 }
 

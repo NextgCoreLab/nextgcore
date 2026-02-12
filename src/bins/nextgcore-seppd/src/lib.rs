@@ -13,6 +13,7 @@ pub mod sepp_sm;
 pub mod handshake_sm;
 pub mod n32c_handler;
 pub mod n32c_build;
+pub mod prins;
 pub mod pqc_security;
 pub mod sbi_path;
 pub mod sbi_response;
