@@ -119,8 +119,7 @@ fn test_registration_with_nssai() {
         if config.subscribed_nssai.contains(requested) {
             assert!(
                 result.allowed_nssai.contains(requested),
-                "Subscribed slice {:?} should be allowed",
-                requested
+                "Subscribed slice {requested:?} should be allowed"
             );
         }
     }
@@ -144,7 +143,7 @@ fn test_nssf_slice_selection() {
     assert!(!result.target_amf_set.is_empty());
 
     // Should include slice-specific AMF if configured
-    assert!(result.nrf_access_token.is_some() || result.target_amf_set.len() > 0);
+    assert!(result.nrf_access_token.is_some() || !result.target_amf_set.is_empty());
 }
 
 /// Test: Slice Not Available
@@ -289,7 +288,7 @@ fn test_slice_isolation() {
 
     let latency_ms = urllc_latency.unwrap();
     // URLLC should maintain low latency even under eMBB load
-    assert!(latency_ms < 10, "URLLC latency should remain low: {} ms", latency_ms);
+    assert!(latency_ms < 10, "URLLC latency should remain low: {latency_ms} ms");
 }
 
 /// Test: Slice Resource Allocation

@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
                 log::debug!("Configuration file loaded ({} bytes)", content.len());
             }
             Err(e) => {
-                log::warn!("Failed to read configuration file: {}", e);
+                log::warn!("Failed to read configuration file: {e}");
             }
         }
     } else {
@@ -154,23 +154,23 @@ async fn main() -> Result<()> {
         let cert = args.tls_cert.as_deref().unwrap_or("/etc/nextgcore/tls/server.crt");
         let key = args.tls_key.as_deref().unwrap_or("/etc/nextgcore/tls/server.key");
         sbi_server_config = sbi_server_config.with_tls(key, cert);
-        log::info!("TLS enabled: cert={}, key={}", cert, key);
+        log::info!("TLS enabled: cert={cert}, key={key}");
 
         if args.mtls {
             let ca = args.tls_ca_cert.as_deref().unwrap_or("/etc/nextgcore/tls/ca.crt");
             sbi_server_config.verify_client = true;
             sbi_server_config.verify_client_cacert = Some(ca.to_string());
-            log::info!("mTLS enabled: client CA={}", ca);
+            log::info!("mTLS enabled: client CA={ca}");
         }
     }
 
     let sbi_server = SbiServer::new(sbi_server_config);
 
     sbi_server.start(nrf_sbi_request_handler).await
-        .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
     let scheme = if args.tls { "HTTPS" } else { "HTTP" };
-    log::info!("SBI HTTP/2 {} server listening on {}", scheme, sbi_addr);
+    log::info!("SBI HTTP/2 {scheme} server listening on {sbi_addr}");
     log::info!("NextGCore NRF ready");
 
     // Main event loop (async)
@@ -181,7 +181,7 @@ async fn main() -> Result<()> {
 
     // Stop SBI server
     sbi_server.stop().await
-        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
     log::info!("SBI HTTP/2 server stopped");
 
     // Close legacy SBI server
@@ -205,7 +205,7 @@ async fn nrf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("NRF SBI request: {} {}", method, uri);
+    log::debug!("NRF SBI request: {method} {uri}");
 
     // Parse the URI path
     let path = uri.split('?').next().unwrap_or(uri);
@@ -281,7 +281,7 @@ async fn nrf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         }
 
         _ => {
-            log::warn!("Unknown NRF request: {} {}", method, uri);
+            log::warn!("Unknown NRF request: {method} {uri}");
             send_method_not_allowed(method, uri)
         }
     }
@@ -289,7 +289,7 @@ async fn nrf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 
 /// Handle NF Register request
 async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("NF Register: {}", nf_instance_id);
+    log::info!("NF Register: {nf_instance_id}");
 
     // Parse the NF profile from request body
     let body = match &request.http.content {
@@ -300,7 +300,7 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
     // Parse as NfProfile
     let profile: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
     // Register the NF instance
@@ -333,7 +333,7 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
 
     match manager.register(nf_profile.clone()) {
         Ok(_) => {
-            log::info!("NF {} ({}) registered successfully", nf_instance_id, nf_type);
+            log::info!("NF {nf_instance_id} ({nf_type}) registered successfully");
 
             // Start heartbeat expiry timer if NF has heartBeatTimer
             if let Some(hb_timer) = heartbeat_timer {
@@ -346,8 +346,7 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
                     nf_instance_id.to_string(),
                 );
                 log::info!(
-                    "Heartbeat timer started for NF {} ({} seconds, 2x {}s interval)",
-                    nf_instance_id, expiry_secs, hb_timer
+                    "Heartbeat timer started for NF {nf_instance_id} ({expiry_secs} seconds, 2x {hb_timer}s interval)"
                 );
             }
 
@@ -362,18 +361,18 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
                 )
                 .await
                 {
-                    log::error!("Failed to send NF_REGISTERED notifications: {}", e);
+                    log::error!("Failed to send NF_REGISTERED notifications: {e}");
                 }
             });
 
             // Return 201 Created with the NF profile
             SbiResponse::with_status(201)
-                .with_header("Location", &format!("/nnrf-nfm/v1/nf-instances/{}", nf_instance_id))
+                .with_header("Location", format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}"))
                 .with_json_body(&profile)
                 .unwrap_or_else(|_| SbiResponse::with_status(201))
         }
         Err(e) => {
-            log::error!("Failed to register NF {}: {}", nf_instance_id, e);
+            log::error!("Failed to register NF {nf_instance_id}: {e}");
             send_bad_request(&e, Some("REGISTRATION_FAILED"))
         }
     }
@@ -381,7 +380,7 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
 
 /// Handle NF Profile Retrieval request
 async fn handle_nf_profile_retrieval(nf_instance_id: &str) -> SbiResponse {
-    log::debug!("NF Profile Retrieval: {}", nf_instance_id);
+    log::debug!("NF Profile Retrieval: {nf_instance_id}");
 
     let manager = nf_manager();
 
@@ -397,14 +396,14 @@ async fn handle_nf_profile_retrieval(nf_instance_id: &str) -> SbiResponse {
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }
         None => {
-            send_not_found(&format!("NF instance {} not found", nf_instance_id), Some("NF_NOT_FOUND"))
+            send_not_found(&format!("NF instance {nf_instance_id} not found"), Some("NF_NOT_FOUND"))
         }
     }
 }
 
 /// Handle NF Deregister request
 async fn handle_nf_deregister(nf_instance_id: &str) -> SbiResponse {
-    log::info!("NF Deregister: {}", nf_instance_id);
+    log::info!("NF Deregister: {nf_instance_id}");
 
     let manager = nf_manager();
 
@@ -413,7 +412,7 @@ async fn handle_nf_deregister(nf_instance_id: &str) -> SbiResponse {
 
     match manager.deregister(nf_instance_id) {
         Ok(_) => {
-            log::info!("NF {} deregistered successfully", nf_instance_id);
+            log::info!("NF {nf_instance_id} deregistered successfully");
 
             // Send NF_DEREGISTERED notifications to matching subscribers
             if let Some(profile) = profile_for_notify {
@@ -426,7 +425,7 @@ async fn handle_nf_deregister(nf_instance_id: &str) -> SbiResponse {
                     )
                     .await
                     {
-                        log::error!("Failed to send NF_DEREGISTERED notifications: {}", e);
+                        log::error!("Failed to send NF_DEREGISTERED notifications: {e}");
                     }
                 });
             }
@@ -434,7 +433,7 @@ async fn handle_nf_deregister(nf_instance_id: &str) -> SbiResponse {
             SbiResponse::with_status(204) // No Content
         }
         Err(e) => {
-            log::error!("Failed to deregister NF {}: {}", nf_instance_id, e);
+            log::error!("Failed to deregister NF {nf_instance_id}: {e}");
             send_not_found(&e, Some("NF_NOT_FOUND"))
         }
     }
@@ -442,7 +441,7 @@ async fn handle_nf_deregister(nf_instance_id: &str) -> SbiResponse {
 
 /// Handle NF Update request (PATCH)
 async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("NF Update: {}", nf_instance_id);
+    log::info!("NF Update: {nf_instance_id}");
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -452,7 +451,7 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
     // Parse patch items
     let _patch: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
     // Verify the NF exists and refresh heartbeat timer
@@ -471,8 +470,7 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
                     nf_instance_id.to_string(),
                 );
                 log::debug!(
-                    "Heartbeat timer refreshed for NF {} ({}s)",
-                    nf_instance_id, expiry_secs
+                    "Heartbeat timer refreshed for NF {nf_instance_id} ({expiry_secs}s)"
                 );
             }
 
@@ -485,7 +483,7 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }
         None => {
-            send_not_found(&format!("NF instance {} not found", nf_instance_id), Some("NF_NOT_FOUND"))
+            send_not_found(&format!("NF instance {nf_instance_id} not found"), Some("NF_NOT_FOUND"))
         }
     }
 }
@@ -502,7 +500,7 @@ async fn handle_nf_list_retrieval(_request: &SbiRequest) -> SbiResponse {
         .with_json_body(&serde_json::json!({
             "_links": {
                 "self": "/nnrf-nfm/v1/nf-instances",
-                "items": instances.iter().map(|id| format!("/nnrf-nfm/v1/nf-instances/{}", id)).collect::<Vec<_>>()
+                "items": instances.iter().map(|id| format!("/nnrf-nfm/v1/nf-instances/{id}")).collect::<Vec<_>>()
             }
         }))
         .unwrap_or_else(|_| SbiResponse::with_status(200))
@@ -519,7 +517,7 @@ async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
 
     let subscription: serde_json::Value = match serde_json::from_str(body) {
         Ok(s) => s,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
     // Extract notification URI (required field)
@@ -589,16 +587,14 @@ async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
     );
 
     log::info!(
-        "Created subscription: {} (validity={}s)",
-        subscription_id,
-        validity_duration
+        "Created subscription: {subscription_id} (validity={validity_duration}s)"
     );
 
     // Return 201 Created
     SbiResponse::with_status(201)
         .with_header(
             "Location",
-            &format!("/nnrf-nfm/v1/subscriptions/{}", subscription_id),
+            format!("/nnrf-nfm/v1/subscriptions/{subscription_id}"),
         )
         .with_json_body(&serde_json::json!({
             "subscriptionId": subscription_id,
@@ -610,15 +606,15 @@ async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
 
 /// Handle Subscription Delete request
 async fn handle_subscription_delete(subscription_id: &str) -> SbiResponse {
-    log::info!("Subscription Delete: {}", subscription_id);
+    log::info!("Subscription Delete: {subscription_id}");
 
     let manager = nf_manager();
     if manager.remove_subscription(subscription_id) {
-        log::info!("Subscription {} removed", subscription_id);
+        log::info!("Subscription {subscription_id} removed");
         SbiResponse::with_status(204) // No Content
     } else {
         send_not_found(
-            &format!("Subscription {} not found", subscription_id),
+            &format!("Subscription {subscription_id} not found"),
             Some("SUBSCRIPTION_NOT_FOUND"),
         )
     }
@@ -626,7 +622,7 @@ async fn handle_subscription_delete(subscription_id: &str) -> SbiResponse {
 
 /// Handle Subscription Update request
 async fn handle_subscription_update(subscription_id: &str, _request: &SbiRequest) -> SbiResponse {
-    log::info!("Subscription Update: {}", subscription_id);
+    log::info!("Subscription Update: {subscription_id}");
     SbiResponse::with_status(200)
 }
 
@@ -640,7 +636,7 @@ async fn handle_nf_discover(request: &SbiRequest) -> SbiResponse {
         .map(|s| s.as_str())
         .unwrap_or("");
 
-    log::info!("NF Discovery: target={}, requester={}", target_nf_type, requester_nf_type);
+    log::info!("NF Discovery: target={target_nf_type}, requester={requester_nf_type}");
 
     if target_nf_type.is_empty() {
         return send_bad_request("Missing target-nf-type parameter", Some("MISSING_PARAM"));
@@ -725,7 +721,7 @@ async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
     // Validate grant_type
     if grant_type != "client_credentials" {
         return send_bad_request(
-            &format!("Unsupported grant_type: {}", grant_type),
+            &format!("Unsupported grant_type: {grant_type}"),
             Some("UNSUPPORTED_GRANT_TYPE"),
         );
     }
@@ -748,7 +744,7 @@ async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
     let manager = nf_manager();
     if manager.get(&nf_instance_id).is_none() {
         return send_unauthorized(
-            &format!("NF instance {} not registered", nf_instance_id),
+            &format!("NF instance {nf_instance_id} not registered"),
             Some("UNAUTHORIZED_NF"),
         );
     }
@@ -781,14 +777,10 @@ async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
     // Placeholder signature (in production, sign with NRF private key)
     let signature_b64 = URL_SAFE_NO_PAD.encode(b"nrf-signature-placeholder");
 
-    let access_token = format!("{}.{}.{}", header_b64, payload_b64, signature_b64);
+    let access_token = format!("{header_b64}.{payload_b64}.{signature_b64}");
 
     log::info!(
-        "Issued access token for {} ({}) -> {} scope={}",
-        nf_instance_id,
-        nf_type,
-        target_nf_type,
-        scope
+        "Issued access token for {nf_instance_id} ({nf_type}) -> {target_nf_type} scope={scope}"
     );
 
     let response = AccessTokenResponse {
@@ -856,13 +848,13 @@ async fn run_event_loop_async(_nrf_sm: &mut NrfSmContext, shutdown: Arc<AtomicBo
         // Process timer expirations
         let expired_events = timer_manager().get_expired_events();
         for event in expired_events {
-            log::debug!("Processing timer event: {:?}", event);
+            log::debug!("Processing timer event: {event:?}");
 
             match event.timer_id {
                 Some(nextgcore_nrfd::NrfTimerId::SubscriptionValidity) => {
                     // Subscription has expired -- remove it
                     if let Some(ref subscription_id) = event.subscription_id {
-                        log::info!("Subscription {} validity expired, removing", subscription_id);
+                        log::info!("Subscription {subscription_id} validity expired, removing");
                         let manager = nf_manager();
                         manager.remove_subscription(subscription_id);
                     }
@@ -871,8 +863,7 @@ async fn run_event_loop_async(_nrf_sm: &mut NrfSmContext, shutdown: Arc<AtomicBo
                     // NF instance missed heartbeat -- deregister it
                     if let Some(ref nf_instance_id) = event.nf_instance_id {
                         log::warn!(
-                            "NF instance {} missed heartbeat, deregistering",
-                            nf_instance_id
+                            "NF instance {nf_instance_id} missed heartbeat, deregistering"
                         );
                         let manager = nf_manager();
 
@@ -893,8 +884,7 @@ async fn run_event_loop_async(_nrf_sm: &mut NrfSmContext, shutdown: Arc<AtomicBo
                                     .await
                                 {
                                     log::error!(
-                                        "Failed to send NF_DEREGISTERED notifications: {}",
-                                        e
+                                        "Failed to send NF_DEREGISTERED notifications: {e}"
                                     );
                                 }
                             });

@@ -210,8 +210,8 @@ impl std::fmt::Display for S11BuildError {
             Self::InvalidSession => write!(f, "Invalid session"),
             Self::InvalidUe => write!(f, "Invalid UE"),
             Self::InvalidBearer => write!(f, "Invalid bearer"),
-            Self::MissingRequiredField(field) => write!(f, "Missing required field: {}", field),
-            Self::BuildFailed(msg) => write!(f, "Build failed: {}", msg),
+            Self::MissingRequiredField(field) => write!(f, "Missing required field: {field}"),
+            Self::BuildFailed(msg) => write!(f, "Build failed: {msg}"),
         }
     }
 }
@@ -462,7 +462,7 @@ pub fn build_delete_session_request(
     default_bearer_ebi: u8,
     _action: GtpDeleteAction,
 ) -> S11BuildResult<Vec<u8>> {
-    log::debug!("Build Delete Session Request for EBI={}", default_bearer_ebi);
+    log::debug!("Build Delete Session Request for EBI={default_bearer_ebi}");
     let mut buf = GtpBuffer::new();
     buf.write_gtp_header_with_teid(
         message_type::DELETE_SESSION_REQUEST,

@@ -289,7 +289,7 @@ pub fn decode_e1ap_procedure(data: &[u8]) -> PerResult<E1ApProcedure> {
         5 => Ok(E1ApProcedure::BearerContextSetup),
         6 => Ok(E1ApProcedure::BearerContextModification),
         7 => Ok(E1ApProcedure::BearerContextRelease),
-        _ => Err(PerError::DecodeError(format!("Unknown E1AP procedure: {}", code))),
+        _ => Err(PerError::DecodeError(format!("Unknown E1AP procedure: {code}"))),
     }
 }
 

@@ -346,7 +346,7 @@ mod tests {
         let payload = URL_SAFE_NO_PAD.encode(b"{\"sub\":\"test\"}");
         let sig = URL_SAFE_NO_PAD.encode(b"fakesig");
 
-        let token = format!("{}.{}.{}", header, payload, sig);
+        let token = format!("{header}.{payload}.{sig}");
         let result = decode_jwt_parts(&token);
         assert!(result.is_ok());
 

@@ -88,15 +88,15 @@ impl MmeApp {
 
         // Initialize GTP path (S11 interface to SGW)
         if let Err(e) = gtp_path::gtp_open(&mut self.gtp_state) {
-            log::error!("Failed to open GTP path: {}", e);
-            return Err(anyhow::anyhow!("GTP path initialization failed: {}", e));
+            log::error!("Failed to open GTP path: {e}");
+            return Err(anyhow::anyhow!("GTP path initialization failed: {e}"));
         }
         log::debug!("GTP path initialized");
 
         // Initialize Diameter S6a interface
         if let Err(e) = fd_path::mme_fd_init() {
-            log::error!("Failed to initialize Diameter: {}", e);
-            return Err(anyhow::anyhow!("Diameter initialization failed: {}", e));
+            log::error!("Failed to initialize Diameter: {e}");
+            return Err(anyhow::anyhow!("Diameter initialization failed: {e}"));
         }
         log::debug!("Diameter S6a interface initialized");
 
@@ -136,7 +136,7 @@ impl MmeApp {
 
         // Close GTP path
         if let Err(e) = gtp_path::gtp_close(&mut self.gtp_state) {
-            log::error!("Failed to close GTP path: {}", e);
+            log::error!("Failed to close GTP path: {e}");
         }
         log::debug!("GTP path closed");
 

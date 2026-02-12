@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
     if !db_uri.is_empty() {
         match ogs_dbi::ogs_dbi_init(&db_uri) {
             Ok(()) => log::info!("MongoDB connected: {}", mask_uri(&db_uri)),
-            Err(e) => log::warn!("MongoDB init failed (will use defaults): {:?}", e),
+            Err(e) => log::warn!("MongoDB init failed (will use defaults): {e:?}"),
         }
     } else {
         log::warn!("No db_uri configured, UDR will return hardcoded test data");
@@ -131,9 +131,9 @@ async fn main() -> Result<()> {
     let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
 
     sbi_server.start(udr_sbi_request_handler).await
-        .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
-    log::info!("SBI HTTP/2 server listening on {}", sbi_addr);
+    log::info!("SBI HTTP/2 server listening on {sbi_addr}");
     log::info!("NextGCore UDR ready");
 
     // Main event loop (async)
@@ -144,7 +144,7 @@ async fn main() -> Result<()> {
 
     // Stop SBI server
     sbi_server.stop().await
-        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
     log::info!("SBI HTTP/2 server stopped");
 
     // Close legacy SBI server
@@ -171,7 +171,7 @@ async fn udr_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("UDR SBI request: {} {}", method, uri);
+    log::debug!("UDR SBI request: {method} {uri}");
 
     // Parse the URI path
     let path = uri.split('?').next().unwrap_or(uri);
@@ -191,8 +191,8 @@ async fn udr_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let _version = parts[1];
 
     if service != "nudr-dr" {
-        log::warn!("Unknown service: {}", service);
-        return send_not_found(&format!("Unknown service: {}", service), None);
+        log::warn!("Unknown service: {service}");
+        return send_not_found(&format!("Unknown service: {service}"), None);
     }
 
     // Route based on resource type
@@ -202,8 +202,8 @@ async fn udr_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         "subscription-data" => handle_subscription_data(&parts, method, &request).await,
         "policy-data" => handle_policy_data(&parts, method).await,
         _ => {
-            log::warn!("Unknown UDR resource: {} {}", method, uri);
-            send_not_found(&format!("Unknown resource: {}", resource_type), None)
+            log::warn!("Unknown UDR resource: {method} {uri}");
+            send_not_found(&format!("Unknown resource: {resource_type}"), None)
         }
     }
 }
@@ -226,18 +226,18 @@ async fn handle_subscription_data(parts: &[&str], method: &str, request: &SbiReq
             let mcc = suci_parts[2];
             let mnc = suci_parts[3];
             let msin = suci_parts[6..].join("");
-            let imsi = format!("imsi-{}{}{}", mcc, mnc, msin);
-            log::info!("Converted SUCI {} -> SUPI {}", supi_or_suci, imsi);
+            let imsi = format!("imsi-{mcc}{mnc}{msin}");
+            log::info!("Converted SUCI {supi_or_suci} -> SUPI {imsi}");
             imsi
         } else {
-            log::warn!("Unsupported SUCI format: {}", supi_or_suci);
-            return send_bad_request(&format!("Unsupported SUCI: {}", supi_or_suci), Some("INVALID_SUCI"));
+            log::warn!("Unsupported SUCI format: {supi_or_suci}");
+            return send_bad_request(&format!("Unsupported SUCI: {supi_or_suci}"), Some("INVALID_SUCI"));
         }
     } else if supi_or_suci.starts_with("imsi-") {
         supi_or_suci.to_string()
     } else {
-        log::warn!("Invalid SUPI type: {}", supi_or_suci);
-        return send_bad_request(&format!("Invalid SUPI type: {}", supi_or_suci), Some("INVALID_SUPI"));
+        log::warn!("Invalid SUPI type: {supi_or_suci}");
+        return send_bad_request(&format!("Invalid SUPI type: {supi_or_suci}"), Some("INVALID_SUPI"));
     };
     let supi = supi.as_str();
 
@@ -253,7 +253,7 @@ async fn handle_subscription_data(parts: &[&str], method: &str, request: &SbiReq
             if parts.get(5).copied() == Some("provisioned-data") {
                 handle_provisioned_data(supi, parts, 6, method).await
             } else {
-                log::warn!("Unknown subscription-data sub-resource: {}", sub_resource);
+                log::warn!("Unknown subscription-data sub-resource: {sub_resource}");
                 send_not_found("Unknown sub-resource", None)
             }
         }
@@ -267,7 +267,7 @@ async fn handle_auth_data(supi: &str, parts: &[&str], method: &str, request: &Sb
 
     match (resource, method) {
         ("authentication-subscription", "GET") => {
-            log::info!("[{}] GET authentication-subscription", supi);
+            log::info!("[{supi}] GET authentication-subscription");
 
             match ogs_dbi::subscription::ogs_dbi_auth_info(supi) {
                 Ok(auth_info) => {
@@ -281,18 +281,18 @@ async fn handle_auth_data(supi: &str, parts: &[&str], method: &str, request: &Sb
                         }
                     });
 
-                    log::info!("[{}] Returning auth subscription data", supi);
+                    log::info!("[{supi}] Returning auth subscription data");
                     SbiResponse::with_status(200)
                         .with_body(response_json.to_string(), "application/json")
                 }
                 Err(e) => {
-                    log::error!("[{}] DB auth_info query failed: {:?}", supi, e);
+                    log::error!("[{supi}] DB auth_info query failed: {e:?}");
                     send_not_found("Subscriber not found", Some("NOT_FOUND"))
                 }
             }
         }
         ("authentication-subscription", "PATCH") => {
-            log::info!("[{}] PATCH authentication-subscription", supi);
+            log::info!("[{supi}] PATCH authentication-subscription");
 
             // Parse PatchItemList from request body to extract new SQN
             if let Some(content) = &request.http.content {
@@ -304,7 +304,7 @@ async fn handle_auth_data(supi: &str, parts: &[&str], method: &str, request: &Sb
                                 if let Some(sqn_hex) = patch.get("value").and_then(|v| v.as_str()) {
                                     let sqn = u64::from_str_radix(sqn_hex, 16).unwrap_or(0);
                                     if let Err(e) = ogs_dbi::subscription::ogs_dbi_update_sqn(supi, sqn) {
-                                        log::error!("[{}] DB update_sqn failed: {:?}", supi, e);
+                                        log::error!("[{supi}] DB update_sqn failed: {e:?}");
                                     }
                                 }
                             }
@@ -315,23 +315,23 @@ async fn handle_auth_data(supi: &str, parts: &[&str], method: &str, request: &Sb
 
             // Increment SQN for next use
             if let Err(e) = ogs_dbi::subscription::ogs_dbi_increment_sqn(supi) {
-                log::error!("[{}] DB increment_sqn failed: {:?}", supi, e);
+                log::error!("[{supi}] DB increment_sqn failed: {e:?}");
             }
 
             SbiResponse::with_status(204)
         }
         ("authentication-status", "PUT") | ("authentication-status", "DELETE") => {
-            log::info!("[{}] {} authentication-status", supi, method);
+            log::info!("[{supi}] {method} authentication-status");
 
             if let Err(e) = ogs_dbi::subscription::ogs_dbi_increment_sqn(supi) {
-                log::error!("[{}] DB increment_sqn failed: {:?}", supi, e);
+                log::error!("[{supi}] DB increment_sqn failed: {e:?}");
             }
 
             SbiResponse::with_status(204)
         }
         _ => {
-            log::warn!("[{}] Unknown auth resource: {} {}", supi, method, resource);
-            send_method_not_allowed(method, &format!("/nudr-dr/v1/subscription-data/{}/authentication-data/{}", supi, resource))
+            log::warn!("[{supi}] Unknown auth resource: {method} {resource}");
+            send_method_not_allowed(method, &format!("/nudr-dr/v1/subscription-data/{supi}/authentication-data/{resource}"))
         }
     }
 }
@@ -345,12 +345,12 @@ async fn handle_provisioned_data(supi: &str, parts: &[&str], dataset_idx: usize,
 
     let dataset = parts.get(dataset_idx).copied().unwrap_or("");
 
-    log::info!("[{}] GET provisioned-data/{}", supi, dataset);
+    log::info!("[{supi}] GET provisioned-data/{dataset}");
 
     let subscription_data = match ogs_dbi::subscription::ogs_dbi_subscription_data(supi) {
         Ok(data) => data,
         Err(e) => {
-            log::error!("[{}] DB subscription_data query failed: {:?}", supi, e);
+            log::error!("[{supi}] DB subscription_data query failed: {e:?}");
             return send_not_found("Subscriber not found", Some("NOT_FOUND"));
         }
     };
@@ -374,8 +374,8 @@ async fn handle_provisioned_data(supi: &str, parts: &[&str], dataset_idx: usize,
             serde_json::Value::Object(combined)
         }
         _ => {
-            log::warn!("[{}] Unknown dataset: {}", supi, dataset);
-            return send_not_found(&format!("Unknown dataset: {}", dataset), None);
+            log::warn!("[{supi}] Unknown dataset: {dataset}");
+            return send_not_found(&format!("Unknown dataset: {dataset}"), None);
         }
     };
 
@@ -399,12 +399,12 @@ async fn handle_policy_data(parts: &[&str], method: &str) -> SbiResponse {
 
     match resource {
         "am-data" => {
-            log::debug!("[{}] GET policy am-data", supi);
+            log::debug!("[{supi}] GET policy am-data");
             SbiResponse::with_status(200)
                 .with_body("{}".to_string(), "application/json")
         }
         "sm-data" => {
-            log::debug!("[{}] GET policy sm-data", supi);
+            log::debug!("[{supi}] GET policy sm-data");
             match ogs_dbi::subscription::ogs_dbi_subscription_data(supi) {
                 Ok(data) => {
                     let mut sm_policy_snssai_data = serde_json::Map::new();
@@ -439,7 +439,7 @@ async fn handle_policy_data(parts: &[&str], method: &str) -> SbiResponse {
                 Err(_) => send_not_found("Subscriber not found", None),
             }
         }
-        _ => send_not_found(&format!("Unknown policy resource: {}", resource), None),
+        _ => send_not_found(&format!("Unknown policy resource: {resource}"), None),
     }
 }
 
@@ -542,7 +542,7 @@ fn build_sm_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Valu
 }
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn format_ambr(bps: u64) -> String {
@@ -553,7 +553,7 @@ fn format_ambr(bps: u64) -> String {
     } else if bps >= 1_000 {
         format!("{} Kbps", bps / 1_000)
     } else {
-        format!("{} bps", bps)
+        format!("{bps} bps")
     }
 }
 

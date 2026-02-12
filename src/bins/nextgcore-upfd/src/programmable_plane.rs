@@ -3,8 +3,6 @@
 //! Provides P4/eBPF-inspired programmable data plane abstractions
 //! and AI-driven energy-aware packet forwarding for 6G UPF.
 
-use std::collections::HashMap;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ============================================================================
 // Programmable Data Plane
@@ -82,6 +80,12 @@ pub struct ProgrammablePlane {
     next_entry_id: u32,
     /// Total packet count.
     total_packets: u64,
+}
+
+impl Default for ProgrammablePlane {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ProgrammablePlane {
@@ -175,6 +179,12 @@ pub struct EnergyForwardingProfile {
     pub active_paths: u32,
     /// Renewable energy percentage.
     pub renewable_pct: f64,
+}
+
+impl Default for EnergyForwardingProfile {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EnergyForwardingProfile {

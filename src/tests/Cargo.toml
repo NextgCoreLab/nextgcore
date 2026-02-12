@@ -58,3 +58,6 @@ ogs-app = { path = "../libs/ogs-app" }
 [[test]]
 name = "integration"
 path = "integration/mod.rs"
+
+[lints]
+workspace = true

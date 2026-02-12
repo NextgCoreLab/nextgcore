@@ -215,7 +215,7 @@ impl PfcpStateMachine {
                             return PfcpSmResult::SendAssociationSetupRequest;
                         }
                         _ => {
-                            log::error!("Unknown timer {:?} in will_associate state", timer_id);
+                            log::error!("Unknown timer {timer_id:?} in will_associate state");
                         }
                     }
                 }
@@ -259,7 +259,7 @@ impl PfcpStateMachine {
                             return PfcpSmResult::StateChanged(PfcpState::Associated);
                         }
                         _ => {
-                            log::warn!("Cannot handle PFCP message type {} in will_associate", msg_type);
+                            log::warn!("Cannot handle PFCP message type {msg_type} in will_associate");
                         }
                     }
                 }
@@ -302,7 +302,7 @@ impl PfcpStateMachine {
                             return PfcpSmResult::SendHeartbeatRequest;
                         }
                         _ => {
-                            log::error!("Unknown timer {:?} in associated state", timer_id);
+                            log::error!("Unknown timer {timer_id:?} in associated state");
                         }
                     }
                 }
@@ -377,7 +377,7 @@ impl PfcpStateMachine {
                             return PfcpSmResult::HandleSessionReportResponse;
                         }
                         _ => {
-                            log::error!("Not implemented PFCP message type {}", msg_type);
+                            log::error!("Not implemented PFCP message type {msg_type}");
                         }
                     }
                 }

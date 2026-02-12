@@ -538,8 +538,7 @@ pub fn handle_handover_notification(
     nr_cgi: &NrCgi,
 ) -> NgapHandlerResult {
     log::debug!(
-        "Handover Notification, AMF UE NGAP ID: {}, RAN UE NGAP ID: {}",
-        amf_ue_ngap_id, ran_ue_ngap_id
+        "Handover Notification, AMF UE NGAP ID: {amf_ue_ngap_id}, RAN UE NGAP ID: {ran_ue_ngap_id}"
     );
 
     // Update User Location Information

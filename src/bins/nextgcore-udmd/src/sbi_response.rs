@@ -52,7 +52,7 @@ pub fn send_gateway_timeout_response(stream_id: u64, detail: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     #[test]
     fn test_send_error_response_creates_correct_status() {

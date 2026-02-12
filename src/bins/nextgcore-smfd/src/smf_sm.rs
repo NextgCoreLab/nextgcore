@@ -215,14 +215,14 @@ impl SmfFsm {
                 SmfTimerId::PfcpNoEstablishmentResponse => {
                     // Handle no establishment response
                     if let Some(sess_id) = event.sess_id {
-                        log::warn!("PFCP establishment timeout for session {}", sess_id);
+                        log::warn!("PFCP establishment timeout for session {sess_id}");
                     }
                     SmfFsmResult::Delegated
                 }
                 SmfTimerId::PfcpNoDeletionResponse => {
                     // Handle no deletion response
                     if let Some(sess_id) = event.sess_id {
-                        log::warn!("PFCP deletion timeout for session {}", sess_id);
+                        log::warn!("PFCP deletion timeout for session {sess_id}");
                     }
                     SmfFsmResult::Handled
                 }
@@ -237,7 +237,7 @@ impl SmfFsm {
     fn handle_n4_no_heartbeat(&mut self, event: &SmfEvent) -> SmfFsmResult {
         if let Some(ref pfcp) = event.pfcp {
             if let Some(pfcp_node_id) = pfcp.pfcp_node_id {
-                log::warn!("No heartbeat from UPF (node_id={})", pfcp_node_id);
+                log::warn!("No heartbeat from UPF (node_id={pfcp_node_id})");
                 // Note: UPF reselection triggered via pfcp_sm transition to WillAssociate
                 // Sessions on this UPF notified for restoration or failover
             }

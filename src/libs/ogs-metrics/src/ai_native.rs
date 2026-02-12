@@ -191,6 +191,12 @@ pub struct SlaMonitor {
     violation_count: u64,
 }
 
+impl Default for SlaMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SlaMonitor {
     /// Creates a new SLA monitor.
     pub fn new() -> Self {

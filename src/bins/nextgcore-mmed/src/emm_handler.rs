@@ -28,10 +28,10 @@ pub enum EmmError {
 impl std::fmt::Display for EmmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EmmError::InvalidMessage(msg) => write!(f, "Invalid message: {}", msg),
-            EmmError::SecurityFailure(msg) => write!(f, "Security failure: {}", msg),
-            EmmError::ProtocolError(cause) => write!(f, "Protocol error: {:?}", cause),
-            EmmError::InternalError(msg) => write!(f, "Internal error: {}", msg),
+            EmmError::InvalidMessage(msg) => write!(f, "Invalid message: {msg}"),
+            EmmError::SecurityFailure(msg) => write!(f, "Security failure: {msg}"),
+            EmmError::ProtocolError(cause) => write!(f, "Protocol error: {cause:?}"),
+            EmmError::InternalError(msg) => write!(f, "Internal error: {msg}"),
         }
     }
 }
@@ -325,8 +325,8 @@ pub fn handle_authentication_response(
     
     if res != xres {
         log::warn!("Authentication response mismatch");
-        log::debug!("  RES: {:02x?}", res);
-        log::debug!("  XRES: {:02x?}", xres);
+        log::debug!("  RES: {res:02x?}");
+        log::debug!("  XRES: {xres:02x?}");
         return Ok(false);
     }
     
@@ -363,24 +363,24 @@ pub fn handle_identity_response(
             // IMSI
             let imsi = decode_imsi(identity_data)?;
             mme_ue.imsi_bcd = imsi.clone();
-            log::info!("Identity response: IMSI[{}]", imsi);
+            log::info!("Identity response: IMSI[{imsi}]");
             Ok(Some(imsi))
         }
         2 => {
             // IMEI
             let imei = decode_imei(identity_data)?;
-            log::info!("Identity response: IMEI[{}]", imei);
+            log::info!("Identity response: IMEI[{imei}]");
             Ok(Some(imei))
         }
         3 => {
             // IMEISV
             let imeisv = decode_imeisv(identity_data)?;
             mme_ue.imeisv_bcd = imeisv.clone();
-            log::info!("Identity response: IMEISV[{}]", imeisv);
+            log::info!("Identity response: IMEISV[{imeisv}]");
             Ok(Some(imeisv))
         }
         _ => {
-            log::warn!("Unknown identity type: {}", identity_type);
+            log::warn!("Unknown identity type: {identity_type}");
             Ok(None)
         }
     }
@@ -676,7 +676,7 @@ fn parse_mobile_identity(data: &[u8]) -> EmmResult<(Option<String>, Option<Parse
             Ok((None, Some(guti)))
         }
         _ => {
-            log::warn!("Unknown mobile identity type: {}", identity_type);
+            log::warn!("Unknown mobile identity type: {identity_type}");
             Ok((None, None))
         }
     }

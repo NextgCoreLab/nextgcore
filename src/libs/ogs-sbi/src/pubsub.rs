@@ -229,6 +229,12 @@ pub struct EventBroker {
     total_delivered: u64,
 }
 
+impl Default for EventBroker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EventBroker {
     /// Creates a new event broker.
     pub fn new() -> Self {

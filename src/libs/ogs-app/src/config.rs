@@ -1235,7 +1235,7 @@ impl ConfigReloadManager {
 mod config_reload_tests {
     use super::*;
     use std::fs;
-    use std::io::Write;
+    
 
     #[test]
     fn test_config_watcher_create() {
@@ -1592,7 +1592,7 @@ mod version_tests {
         let local = OgsLocalConf::new();
 
         for i in 1..=5 {
-            manager.take_snapshot(&global, &local, format!("Version {}", i));
+            manager.take_snapshot(&global, &local, format!("Version {i}"));
         }
 
         // Should only keep last 3

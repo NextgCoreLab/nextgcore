@@ -209,7 +209,7 @@ impl PcrfContext {
         self.max_sess.store(max_sess, Ordering::SeqCst);
         self.initialized.store(true, Ordering::SeqCst);
 
-        log::info!("PCRF context initialized (max_sess={})", max_sess);
+        log::info!("PCRF context initialized (max_sess={max_sess})");
     }
 
     /// Finalize the PCRF context
@@ -247,7 +247,7 @@ impl PcrfContext {
         sessions.push(session);
         hash.insert(sid.to_string(), idx);
 
-        log::debug!("Gx session added: {}", sid);
+        log::debug!("Gx session added: {sid}");
         Some(idx)
     }
 
@@ -300,7 +300,7 @@ impl PcrfContext {
                 }
             }
             hash.remove(sid);
-            log::debug!("Gx session removed: {}", sid);
+            log::debug!("Gx session removed: {sid}");
             return true;
         }
         false
@@ -335,10 +335,10 @@ impl PcrfContext {
 
         if let Some(sid) = sid {
             hash.insert(key, sid.to_string());
-            log::debug!("IPv4 mapping set: {:?} -> {}", addr, sid);
+            log::debug!("IPv4 mapping set: {addr:?} -> {sid}");
         } else {
             hash.remove(&key);
-            log::debug!("IPv4 mapping removed: {:?}", addr);
+            log::debug!("IPv4 mapping removed: {addr:?}");
         }
     }
 
@@ -348,10 +348,10 @@ impl PcrfContext {
 
         if let Some(sid) = sid {
             hash.insert(*addr, sid.to_string());
-            log::debug!("IPv6 mapping set: {:?} -> {}", addr, sid);
+            log::debug!("IPv6 mapping set: {addr:?} -> {sid}");
         } else {
             hash.remove(addr);
-            log::debug!("IPv6 mapping removed: {:?}", addr);
+            log::debug!("IPv6 mapping removed: {addr:?}");
         }
     }
 
@@ -391,7 +391,7 @@ impl PcrfContext {
             }
         }
 
-        log::debug!("Rx session added: {} (gx_idx={})", sid, gx_session_idx);
+        log::debug!("Rx session added: {sid} (gx_idx={gx_session_idx})");
         Some(idx)
     }
 
@@ -420,7 +420,7 @@ impl PcrfContext {
                 }
             }
             hash.remove(sid);
-            log::debug!("Rx session removed: {}", sid);
+            log::debug!("Rx session removed: {sid}");
             return true;
         }
         false

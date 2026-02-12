@@ -215,9 +215,7 @@ impl HssContext {
         self.initialized.store(true, Ordering::SeqCst);
 
         log::info!(
-            "HSS context initialized (max_impi={}, max_impu={})",
-            max_impi,
-            max_impu
+            "HSS context initialized (max_impi={max_impi}, max_impu={max_impu})"
         );
     }
 
@@ -256,7 +254,7 @@ impl HssContext {
         list.push(imsi);
         hash.insert(id.to_string(), idx);
 
-        log::debug!("IMSI added: {}", id);
+        log::debug!("IMSI added: {id}");
         Some(idx)
     }
 
@@ -269,7 +267,7 @@ impl HssContext {
             // Mark as removed (we don't actually remove to preserve indices)
             if idx < list.len() {
                 hash.remove(id);
-                log::debug!("IMSI removed: {}", id);
+                log::debug!("IMSI removed: {id}");
                 return true;
             }
         }
@@ -313,7 +311,7 @@ impl HssContext {
         list.push(impi);
         hash.insert(id.to_string(), idx);
 
-        log::debug!("IMPI added: {}", id);
+        log::debug!("IMPI added: {id}");
         Some(idx)
     }
 
@@ -331,7 +329,7 @@ impl HssContext {
                     impu_hash.remove(&impu_id);
                 }
                 hash.remove(id);
-                log::debug!("IMPI removed: {}", id);
+                log::debug!("IMPI removed: {id}");
                 return true;
             }
         }
@@ -377,7 +375,7 @@ impl HssContext {
                 let impu_idx = list[impi_idx].impu_list.len();
                 list[impi_idx].add_impu(impu_id);
                 impu_hash.insert(impu_id.to_string(), (impi_idx, impu_idx));
-                log::debug!("IMPU added: {} -> {}", impu_id, impi_id);
+                log::debug!("IMPU added: {impu_id} -> {impi_id}");
                 return true;
             }
         }
@@ -536,10 +534,7 @@ impl HssContext {
         // In a full implementation, we'd update the IMPU's server_name
         // This requires storing HssImpu objects with server_name field
         log::debug!(
-            "cx_set_server_name: {} -> {} (overwrite={})",
-            public_identity,
-            server_name,
-            overwrite
+            "cx_set_server_name: {public_identity} -> {server_name} (overwrite={overwrite})"
         );
     }
 

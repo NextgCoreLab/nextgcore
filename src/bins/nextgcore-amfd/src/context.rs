@@ -573,7 +573,7 @@ impl AmfContext {
         gnb_addr_hash.insert(addr.to_string(), id);
         gnb_list.insert(id, gnb.clone());
 
-        log::debug!("[{}] gNB added (id={})", addr, id);
+        log::debug!("[{addr}] gNB added (id={id})");
         Some(gnb)
     }
 
@@ -699,8 +699,7 @@ impl AmfContext {
         ran_ue_list.insert(id, ran_ue.clone());
 
         log::debug!(
-            "RAN UE added (id={}, ran_ue_ngap_id={}, amf_ue_ngap_id={})",
-            id, ran_ue_ngap_id, amf_ue_ngap_id
+            "RAN UE added (id={id}, ran_ue_ngap_id={ran_ue_ngap_id}, amf_ue_ngap_id={amf_ue_ngap_id})"
         );
         Some(ran_ue)
     }
@@ -808,7 +807,7 @@ impl AmfContext {
         let amf_ue = AmfUe::new(id, ran_ue_id);
         amf_ue_list.insert(id, amf_ue.clone());
 
-        log::debug!("AMF UE added (id={})", id);
+        log::debug!("AMF UE added (id={id})");
         Some(amf_ue)
     }
 
@@ -831,7 +830,7 @@ impl AmfContext {
             // Remove all sessions for this UE
             self.sess_remove_all_for_ue(id);
 
-            log::debug!("AMF UE removed (id={})", id);
+            log::debug!("AMF UE removed (id={id})");
             return Some(amf_ue);
         }
         None
@@ -1007,7 +1006,7 @@ impl AmfContext {
         let sess = AmfSess::new(id, amf_ue_id, psi);
         sess_list.insert(id, sess.clone());
 
-        log::debug!("[ue_id={}, psi={}] AMF session added (id={})", amf_ue_id, psi, id);
+        log::debug!("[ue_id={amf_ue_id}, psi={psi}] AMF session added (id={id})");
         Some(sess)
     }
 

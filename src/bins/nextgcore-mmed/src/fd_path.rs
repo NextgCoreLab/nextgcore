@@ -316,7 +316,7 @@ impl std::fmt::Display for DiameterError {
             DiameterError::SendFailed => write!(f, "Send failed"),
             DiameterError::Timeout => write!(f, "Timeout"),
             DiameterError::InvalidResponse => write!(f, "Invalid response"),
-            DiameterError::HssError(code) => write!(f, "HSS error: {}", code),
+            DiameterError::HssError(code) => write!(f, "HSS error: {code}"),
         }
     }
 }

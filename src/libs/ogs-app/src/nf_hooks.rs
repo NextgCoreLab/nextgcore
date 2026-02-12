@@ -71,6 +71,12 @@ pub struct AiMlHookRegistry {
     execution_count: u64,
 }
 
+impl Default for AiMlHookRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AiMlHookRegistry {
     /// Creates a new hook registry.
     pub fn new() -> Self {
@@ -380,6 +386,12 @@ pub struct CrossNfIntentCoordinator {
     next_id: u64,
     /// Completed intents count.
     completed_count: u64,
+}
+
+impl Default for CrossNfIntentCoordinator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CrossNfIntentCoordinator {

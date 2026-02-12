@@ -13,11 +13,7 @@ use crate::event::UdrEvent;
 /// Send an error response to the client
 fn send_error_response(stream_id: u64, status: u16, title: &str, detail: &str) {
     log::warn!(
-        "[stream={}] Error response: {} {} - {}",
-        stream_id,
-        status,
-        title,
-        detail
+        "[stream={stream_id}] Error response: {status} {title} - {detail}"
     );
 }
 
@@ -33,7 +29,7 @@ fn send_success_response(stream_id: u64, status: u16, body: Option<&str>) {
 
 /// Helper to convert byte slice to hex string
 fn bytes_to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Convert u64 SQN to 6-byte hex string
@@ -50,7 +46,7 @@ fn format_ambr(bps: u64) -> String {
     } else if bps >= 1_000 {
         format!("{} Kbps", bps / 1_000)
     } else {
-        format!("{} bps", bps)
+        format!("{bps} bps")
     }
 }
 
@@ -81,7 +77,7 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
     // Validate SUPI type
     // In C: if (strncmp(supi, OGS_ID_SUPI_TYPE_IMSI, strlen(OGS_ID_SUPI_TYPE_IMSI)) != 0)
     if !supi.starts_with("imsi-") {
-        log::error!("[{}] Unknown SUPI Type", supi);
+        log::error!("[{supi}] Unknown SUPI Type");
         send_error_response(stream_id, 403, "Forbidden", "Unknown SUPI type");
         return;
     }
@@ -97,7 +93,7 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
     let auth_info = match ogs_dbi::subscription::ogs_dbi_auth_info(supi) {
         Ok(info) => info,
         Err(e) => {
-            log::error!("[{}] DB auth_info query failed: {:?}", supi, e);
+            log::error!("[{supi}] DB auth_info query failed: {e:?}");
             send_error_response(stream_id, 404, "Not Found", "Subscriber not found");
             return;
         }
@@ -107,7 +103,7 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
         Some("authentication-subscription") => {
             match method.as_str() {
                 "GET" => {
-                    log::debug!("[{}] GET authentication-subscription (stream={})", supi, stream_id);
+                    log::debug!("[{supi}] GET authentication-subscription (stream={stream_id})");
 
                     // Build AuthenticationSubscription from DB auth_info
                     let response_json = serde_json::json!({
@@ -124,7 +120,7 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
                     send_success_response(stream_id, 200, Some(&body));
                 }
                 "PATCH" => {
-                    log::debug!("[{}] PATCH authentication-subscription (stream={})", supi, stream_id);
+                    log::debug!("[{supi}] PATCH authentication-subscription (stream={stream_id})");
 
                     // Parse PatchItemList from request body to extract new SQN
                     if let Some(sbi) = &event.sbi {
@@ -139,7 +135,7 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
                                                 if let Some(sqn_hex) = patch.get("value").and_then(|v| v.as_str()) {
                                                     let sqn = u64::from_str_radix(sqn_hex, 16).unwrap_or(0);
                                                     if let Err(e) = ogs_dbi::subscription::ogs_dbi_update_sqn(supi, sqn) {
-                                                        log::error!("[{}] DB update_sqn failed: {:?}", supi, e);
+                                                        log::error!("[{supi}] DB update_sqn failed: {e:?}");
                                                     }
                                                 }
                                             }
@@ -152,37 +148,37 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
 
                     // Increment SQN by 32 for next use
                     if let Err(e) = ogs_dbi::subscription::ogs_dbi_increment_sqn(supi) {
-                        log::error!("[{}] DB increment_sqn failed: {:?}", supi, e);
+                        log::error!("[{supi}] DB increment_sqn failed: {e:?}");
                     }
 
                     send_success_response(stream_id, 204, None);
                 }
                 _ => {
-                    log::error!("Invalid HTTP method [{}]", method);
-                    send_error_response(stream_id, 405, "Method Not Allowed", &format!("Method {} not allowed", method));
+                    log::error!("Invalid HTTP method [{method}]");
+                    send_error_response(stream_id, 405, "Method Not Allowed", &format!("Method {method} not allowed"));
                 }
             }
         }
         Some("authentication-status") => {
             match method.as_str() {
                 "PUT" | "DELETE" => {
-                    log::debug!("[{}] {} authentication-status (stream={})", supi, method, stream_id);
+                    log::debug!("[{supi}] {method} authentication-status (stream={stream_id})");
 
                     // Increment SQN on auth status update
                     if let Err(e) = ogs_dbi::subscription::ogs_dbi_increment_sqn(supi) {
-                        log::error!("[{}] DB increment_sqn failed: {:?}", supi, e);
+                        log::error!("[{supi}] DB increment_sqn failed: {e:?}");
                     }
 
                     send_success_response(stream_id, 204, None);
                 }
                 _ => {
-                    log::error!("Invalid HTTP method [{}]", method);
-                    send_error_response(stream_id, 405, "Method Not Allowed", &format!("Method {} not allowed", method));
+                    log::error!("Invalid HTTP method [{method}]");
+                    send_error_response(stream_id, 405, "Method Not Allowed", &format!("Method {method} not allowed"));
                 }
             }
         }
         _ => {
-            log::error!("Invalid resource name [{:?}]", resource3);
+            log::error!("Invalid resource name [{resource3:?}]");
             send_error_response(stream_id, 400, "Bad Request", "Invalid resource name");
         }
     }
@@ -213,7 +209,7 @@ pub fn handle_subscription_context(event: &UdrEvent, stream_id: u64) {
 
     // Validate SUPI type
     if !supi.starts_with("imsi-") {
-        log::error!("[{}] Unknown SUPI Type", supi);
+        log::error!("[{supi}] Unknown SUPI Type");
         send_error_response(stream_id, 403, "Forbidden", "Unknown SUPI type");
         return;
     }
@@ -225,7 +221,7 @@ pub fn handle_subscription_context(event: &UdrEvent, stream_id: u64) {
         Some("amf-3gpp-access") => {
             match method.as_str() {
                 "PUT" => {
-                    log::debug!("[{}] PUT amf-3gpp-access (stream={})", supi, stream_id);
+                    log::debug!("[{supi}] PUT amf-3gpp-access (stream={stream_id})");
 
                     // Extract PEI (IMEISV) from request body and update in DB
                     if let Some(sbi) = &event.sbi {
@@ -240,7 +236,7 @@ pub fn handle_subscription_context(event: &UdrEvent, stream_id: u64) {
                                             pei
                                         };
                                         if let Err(e) = ogs_dbi::subscription::ogs_dbi_update_imeisv(supi, imeisv) {
-                                            log::error!("[{}] DB update_imeisv failed: {:?}", supi, e);
+                                            log::error!("[{supi}] DB update_imeisv failed: {e:?}");
                                         }
                                     }
                                 }
@@ -251,7 +247,7 @@ pub fn handle_subscription_context(event: &UdrEvent, stream_id: u64) {
                     send_success_response(stream_id, 204, None);
                 }
                 "PATCH" => {
-                    log::debug!("[{}] PATCH amf-3gpp-access (stream={})", supi, stream_id);
+                    log::debug!("[{supi}] PATCH amf-3gpp-access (stream={stream_id})");
                     // PATCH for AMF context update (purge flag, GUAMI changes)
                     // Parse PatchItemList from body
                     if let Some(sbi) = &event.sbi {
@@ -263,7 +259,7 @@ pub fn handle_subscription_context(event: &UdrEvent, stream_id: u64) {
                                             let path = patch.get("path").and_then(|v| v.as_str()).unwrap_or("");
                                             if path == "/purgeFlag" {
                                                 if let Some(purge) = patch.get("value").and_then(|v| v.as_bool()) {
-                                                    log::debug!("[{}] Setting purge flag to {}", supi, purge);
+                                                    log::debug!("[{supi}] Setting purge flag to {purge}");
                                                     // Update purge flag via ogs_dbi_update_mme if needed
                                                 }
                                             }
@@ -276,30 +272,30 @@ pub fn handle_subscription_context(event: &UdrEvent, stream_id: u64) {
                     send_success_response(stream_id, 204, None);
                 }
                 _ => {
-                    log::error!("Invalid HTTP method [{}]", method);
-                    send_error_response(stream_id, 405, "Method Not Allowed", &format!("Method {} not allowed", method));
+                    log::error!("Invalid HTTP method [{method}]");
+                    send_error_response(stream_id, 405, "Method Not Allowed", &format!("Method {method} not allowed"));
                 }
             }
         }
         Some("smf-registrations") => {
             match method.as_str() {
                 "PUT" => {
-                    log::debug!("[{}] PUT smf-registrations (stream={})", supi, stream_id);
+                    log::debug!("[{supi}] PUT smf-registrations (stream={stream_id})");
                     // SMF registration context is stored; UDR is stateless for this
                     send_success_response(stream_id, 204, None);
                 }
                 "DELETE" => {
-                    log::debug!("[{}] DELETE smf-registrations (stream={})", supi, stream_id);
+                    log::debug!("[{supi}] DELETE smf-registrations (stream={stream_id})");
                     send_success_response(stream_id, 204, None);
                 }
                 _ => {
-                    log::error!("Invalid HTTP method [{}]", method);
-                    send_error_response(stream_id, 405, "Method Not Allowed", &format!("Method {} not allowed", method));
+                    log::error!("Invalid HTTP method [{method}]");
+                    send_error_response(stream_id, 405, "Method Not Allowed", &format!("Method {method} not allowed"));
                 }
             }
         }
         _ => {
-            log::error!("Invalid resource name [{:?}]", resource3);
+            log::error!("Invalid resource name [{resource3:?}]");
             send_error_response(stream_id, 400, "Bad Request", "Invalid resource name");
         }
     }
@@ -332,7 +328,7 @@ pub fn handle_subscription_provisioned(event: &UdrEvent, stream_id: u64) {
 
     // Validate SUPI type
     if !supi.starts_with("imsi-") {
-        log::error!("[{}] Unknown SUPI Type", supi);
+        log::error!("[{supi}] Unknown SUPI Type");
         send_error_response(stream_id, 403, "Forbidden", "Unknown SUPI type");
         return;
     }
@@ -341,7 +337,7 @@ pub fn handle_subscription_provisioned(event: &UdrEvent, stream_id: u64) {
     let subscription_data = match ogs_dbi::subscription::ogs_dbi_subscription_data(supi) {
         Ok(data) => data,
         Err(e) => {
-            log::error!("[{}] DB subscription_data query failed: {:?}", supi, e);
+            log::error!("[{supi}] DB subscription_data query failed: {e:?}");
             send_error_response(stream_id, 404, "Not Found", "Subscriber not found");
             return;
         }
@@ -349,7 +345,7 @@ pub fn handle_subscription_provisioned(event: &UdrEvent, stream_id: u64) {
 
     // Check for UE-AMBR
     if subscription_data.ambr.uplink == 0 && subscription_data.ambr.downlink == 0 {
-        log::error!("[{}] No UE-AMBR", supi);
+        log::error!("[{supi}] No UE-AMBR");
         send_error_response(stream_id, 404, "Not Found", "No UE-AMBR");
         return;
     }
@@ -364,15 +360,14 @@ pub fn handle_subscription_provisioned(event: &UdrEvent, stream_id: u64) {
             Some("sm-data") => (false, false, true, false),
             None => (true, true, true, true),
             _ => {
-                log::error!("Invalid resource name [{:?}]", resource4);
+                log::error!("Invalid resource name [{resource4:?}]");
                 send_error_response(stream_id, 400, "Bad Request", "Invalid resource name");
                 return;
             }
         };
 
     log::debug!(
-        "[{}] GET provisioned data (stream={}) am={} smf_sel={} sm={} combined={}",
-        supi, stream_id, process_am_data, process_smf_sel, process_sm_data, return_provisioned_data
+        "[{supi}] GET provisioned data (stream={stream_id}) am={process_am_data} smf_sel={process_smf_sel} sm={process_sm_data} combined={return_provisioned_data}"
     );
 
     let am_data_json = if process_am_data {
@@ -627,7 +622,7 @@ pub fn handle_policy_data(event: &UdrEvent, stream_id: u64) {
 
             // Validate SUPI type
             if !supi.starts_with("imsi-") {
-                log::error!("[{}] Unknown SUPI Type", supi);
+                log::error!("[{supi}] Unknown SUPI Type");
                 send_error_response(stream_id, 403, "Forbidden", "Unknown SUPI type");
                 return;
             }
@@ -638,7 +633,7 @@ pub fn handle_policy_data(event: &UdrEvent, stream_id: u64) {
                     let subscription_data = match ogs_dbi::subscription::ogs_dbi_subscription_data(supi) {
                         Ok(data) => data,
                         Err(e) => {
-                            log::error!("[{}] DB subscription_data query failed: {:?}", supi, e);
+                            log::error!("[{supi}] DB subscription_data query failed: {e:?}");
                             send_error_response(stream_id, 404, "Not Found", "Subscriber not found");
                             return;
                         }
@@ -649,13 +644,13 @@ pub fn handle_policy_data(event: &UdrEvent, stream_id: u64) {
 
                     match resource3 {
                         Some("am-data") => {
-                            log::debug!("[{}] GET policy am-data (stream={})", supi, stream_id);
+                            log::debug!("[{supi}] GET policy am-data (stream={stream_id})");
                             // AmPolicyData - currently returns empty object per 3GPP spec
                             // (AM policy is typically derived from subscription data, not stored separately)
                             send_success_response(stream_id, 200, Some("{}"));
                         }
                         Some("sm-data") => {
-                            log::debug!("[{}] GET policy sm-data (stream={})", supi, stream_id);
+                            log::debug!("[{supi}] GET policy sm-data (stream={stream_id})");
 
                             // Build SmPolicyData with sm_policy_snssai_data
                             let mut sm_policy_snssai_data = serde_json::Map::new();
@@ -707,19 +702,19 @@ pub fn handle_policy_data(event: &UdrEvent, stream_id: u64) {
                             send_success_response(stream_id, 200, Some(&body));
                         }
                         _ => {
-                            log::error!("Invalid resource name [{:?}]", resource3);
+                            log::error!("Invalid resource name [{resource3:?}]");
                             send_error_response(stream_id, 400, "Bad Request", "Invalid resource name");
                         }
                     }
                 }
                 _ => {
-                    log::error!("Invalid HTTP method [{}]", method);
-                    send_error_response(stream_id, 405, "Method Not Allowed", &format!("Method {} not allowed", method));
+                    log::error!("Invalid HTTP method [{method}]");
+                    send_error_response(stream_id, 405, "Method Not Allowed", &format!("Method {method} not allowed"));
                 }
             }
         }
         _ => {
-            log::error!("Invalid resource name [{:?}]", resource1);
+            log::error!("Invalid resource name [{resource1:?}]");
             send_error_response(stream_id, 400, "Bad Request", "Invalid resource name");
         }
     }

@@ -355,7 +355,7 @@ pub fn pfcp_open(ctx: &mut PfcpPathContext, local_addr: SocketAddr) -> Result<()
         .map(|d| d.as_secs() as u32)
         .unwrap_or(0);
 
-    log::info!("PFCP path opened on {}", local_addr);
+    log::info!("PFCP path opened on {local_addr}");
     Ok(())
 }
 
@@ -442,7 +442,7 @@ impl PfcpServer {
         session_tx: mpsc::Sender<PfcpSessionEvent>,
     ) -> Result<Self, std::io::Error> {
         let socket = UdpSocket::bind(local_addr).await?;
-        log::info!("PFCP server bound to {}", local_addr);
+        log::info!("PFCP server bound to {local_addr}");
 
         let local_node_id = match local_addr {
             SocketAddr::V4(addr) => NodeId::Ipv4(*addr.ip()),
@@ -498,14 +498,14 @@ impl PfcpServer {
             match recv_result {
                 Ok(Ok((len, src_addr))) => {
                     let data = &buf[..len];
-                    log::debug!("PFCP received {} bytes from {}", len, src_addr);
+                    log::debug!("PFCP received {len} bytes from {src_addr}");
 
                     if let Err(e) = self.handle_message(data, src_addr).await {
-                        log::error!("PFCP message handling error: {}", e);
+                        log::error!("PFCP message handling error: {e}");
                     }
                 }
                 Ok(Err(e)) => {
-                    log::error!("PFCP socket error: {}", e);
+                    log::error!("PFCP socket error: {e}");
                 }
                 Err(_) => {
                     // Timeout - continue loop
@@ -561,7 +561,7 @@ impl PfcpServer {
         header: &ParsedPfcpHeader,
         src_addr: SocketAddr,
     ) -> Result<(), String> {
-        log::debug!("Handling Heartbeat Request from {}", src_addr);
+        log::debug!("Handling Heartbeat Request from {src_addr}");
 
         let payload = build_heartbeat_response(self.recovery_time_stamp);
         let response = self.build_response(
@@ -575,9 +575,9 @@ impl PfcpServer {
         self.socket
             .send_to(&response, src_addr)
             .await
-            .map_err(|e| format!("Send error: {}", e))?;
+            .map_err(|e| format!("Send error: {e}"))?;
 
-        log::debug!("Sent Heartbeat Response to {}", src_addr);
+        log::debug!("Sent Heartbeat Response to {src_addr}");
         Ok(())
     }
 
@@ -588,7 +588,7 @@ impl PfcpServer {
         payload: &[u8],
         src_addr: SocketAddr,
     ) -> Result<(), String> {
-        log::info!("Handling Association Setup Request from {}", src_addr);
+        log::info!("Handling Association Setup Request from {src_addr}");
 
         // Parse Node ID from request
         let ies = ParsedIe::parse_all(payload);
@@ -613,9 +613,9 @@ impl PfcpServer {
         self.socket
             .send_to(&response, src_addr)
             .await
-            .map_err(|e| format!("Send error: {}", e))?;
+            .map_err(|e| format!("Send error: {e}"))?;
 
-        log::info!("PFCP Association established with {}", src_addr);
+        log::info!("PFCP Association established with {src_addr}");
         Ok(())
     }
 
@@ -626,7 +626,7 @@ impl PfcpServer {
         payload: &[u8],
         src_addr: SocketAddr,
     ) -> Result<(), String> {
-        log::info!("Handling Session Establishment Request from {}", src_addr);
+        log::info!("Handling Session Establishment Request from {src_addr}");
 
         let ies = ParsedIe::parse_all(payload);
 
@@ -641,7 +641,7 @@ impl PfcpServer {
 
         // Allocate UPF SEID
         let upf_seid = self.alloc_seid();
-        log::debug!("Allocated UPF SEID: {:#x}", upf_seid);
+        log::debug!("Allocated UPF SEID: {upf_seid:#x}");
 
         // Parse Create PDRs
         let mut ue_ipv4: Option<Ipv4Addr> = None;
@@ -663,7 +663,7 @@ impl PfcpServer {
                         if fteid.ch {
                             // CHOOSE flag - allocate TEID
                             ul_teid = self.alloc_teid();
-                            log::debug!("Allocated uplink TEID: {:#x}", ul_teid);
+                            log::debug!("Allocated uplink TEID: {ul_teid:#x}");
                             Some(FTeid {
                                 teid: ul_teid,
                                 ipv4: match &self.local_node_id {
@@ -686,7 +686,7 @@ impl PfcpServer {
                     if let Some(ref ue_ip) = pdr.pdi.ue_ip_address {
                         if let Some(addr) = ue_ip.ipv4 {
                             ue_ipv4 = Some(addr);
-                            log::debug!("UE IPv4: {}", addr);
+                            log::debug!("UE IPv4: {addr}");
                         }
                     }
 
@@ -697,7 +697,7 @@ impl PfcpServer {
                     });
                 }
                 Err(e) => {
-                    log::warn!("Failed to parse PDR: {}", e);
+                    log::warn!("Failed to parse PDR: {e}");
                 }
             }
         }
@@ -715,12 +715,12 @@ impl PfcpServer {
                         if let Some(ref ohc) = fp.outer_header_creation {
                             dl_teid = ohc.teid;
                             gnb_addr = ohc.ipv4;
-                            log::debug!("Downlink: TEID={:#x}, gNB={:?}", dl_teid, gnb_addr);
+                            log::debug!("Downlink: TEID={dl_teid:#x}, gNB={gnb_addr:?}");
                         }
                     }
                 }
                 Err(e) => {
-                    log::warn!("Failed to parse FAR: {}", e);
+                    log::warn!("Failed to parse FAR: {e}");
                 }
             }
         }
@@ -754,7 +754,7 @@ impl PfcpServer {
         self.socket
             .send_to(&response, src_addr)
             .await
-            .map_err(|e| format!("Send error: {}", e))?;
+            .map_err(|e| format!("Send error: {e}"))?;
 
         // Store session info
         let session_info = PfcpSessionInfo {
@@ -783,16 +783,11 @@ impl PfcpServer {
         };
 
         if let Err(e) = self.session_tx.send(event).await {
-            log::error!("Failed to send session event: {}", e);
+            log::error!("Failed to send session event: {e}");
         }
 
         log::info!(
-            "Session established: UPF_SEID={:#x}, SMF_SEID={:#x}, UE_IP={:?}, UL_TEID={:#x}, DL_TEID={:#x}",
-            upf_seid,
-            smf_seid,
-            ue_ipv4,
-            ul_teid,
-            dl_teid
+            "Session established: UPF_SEID={upf_seid:#x}, SMF_SEID={smf_seid:#x}, UE_IP={ue_ipv4:?}, UL_TEID={ul_teid:#x}, DL_TEID={dl_teid:#x}"
         );
 
         Ok(())
@@ -807,8 +802,7 @@ impl PfcpServer {
     ) -> Result<(), String> {
         let upf_seid = header.seid;
         log::info!(
-            "Handling Session Modification Request for SEID {:#x}",
-            upf_seid
+            "Handling Session Modification Request for SEID {upf_seid:#x}"
         );
 
         let ies = ParsedIe::parse_all(payload);
@@ -835,7 +829,7 @@ impl PfcpServer {
                     }
                 }
                 Err(e) => {
-                    log::warn!("Failed to parse Update FAR: {}", e);
+                    log::warn!("Failed to parse Update FAR: {e}");
                 }
             }
         }
@@ -852,7 +846,7 @@ impl PfcpServer {
                 }
                 session.smf_seid
             } else {
-                return Err(format!("Session {:#x} not found", upf_seid));
+                return Err(format!("Session {upf_seid:#x} not found"));
             }
         };
 
@@ -873,7 +867,7 @@ impl PfcpServer {
         self.socket
             .send_to(&response, src_addr)
             .await
-            .map_err(|e| format!("Send error: {}", e))?;
+            .map_err(|e| format!("Send error: {e}"))?;
 
         // Notify data plane
         if updated_dl_teid.is_some() || updated_gnb_addr.is_some() {
@@ -884,11 +878,11 @@ impl PfcpServer {
             };
 
             if let Err(e) = self.session_tx.send(event).await {
-                log::error!("Failed to send session event: {}", e);
+                log::error!("Failed to send session event: {e}");
             }
         }
 
-        log::info!("Session {:#x} modified", upf_seid);
+        log::info!("Session {upf_seid:#x} modified");
         Ok(())
     }
 
@@ -900,7 +894,7 @@ impl PfcpServer {
         src_addr: SocketAddr,
     ) -> Result<(), String> {
         let upf_seid = header.seid;
-        log::info!("Handling Session Deletion Request for SEID {:#x}", upf_seid);
+        log::info!("Handling Session Deletion Request for SEID {upf_seid:#x}");
 
         // Remove session
         let session_info = {
@@ -931,16 +925,16 @@ impl PfcpServer {
         self.socket
             .send_to(&response, src_addr)
             .await
-            .map_err(|e| format!("Send error: {}", e))?;
+            .map_err(|e| format!("Send error: {e}"))?;
 
         // Notify data plane
         let event = PfcpSessionEvent::SessionDeleted { upf_seid, ue_ipv4 };
 
         if let Err(e) = self.session_tx.send(event).await {
-            log::error!("Failed to send session event: {}", e);
+            log::error!("Failed to send session event: {e}");
         }
 
-        log::info!("Session {:#x} deleted", upf_seid);
+        log::info!("Session {upf_seid:#x} deleted");
         Ok(())
     }
 

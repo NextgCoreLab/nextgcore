@@ -491,7 +491,7 @@ impl ScpContext {
         }
         self.max_num_of_assoc = max_assoc;
         self.initialized.store(true, Ordering::SeqCst);
-        log::info!("SCP context initialized with max {} associations", max_assoc);
+        log::info!("SCP context initialized with max {max_assoc} associations");
     }
 
     pub fn fini(&mut self) {
@@ -521,7 +521,7 @@ impl ScpContext {
         let assoc = ScpAssoc::new(id, stream_id);
 
         assoc_list.insert(id, assoc.clone());
-        log::debug!("SCP association added (id={}, stream_id={})", id, stream_id);
+        log::debug!("SCP association added (id={id}, stream_id={stream_id})");
 
         Some(assoc)
     }
@@ -532,7 +532,7 @@ impl ScpContext {
         let mut assoc_list = self.assoc_list.write().ok()?;
 
         if let Some(assoc) = assoc_list.remove(&id) {
-            log::debug!("SCP association removed (id={})", id);
+            log::debug!("SCP association removed (id={id})");
             return Some(assoc);
         }
         None

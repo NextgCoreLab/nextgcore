@@ -178,7 +178,7 @@ pub fn pcrf_rx_handle_aar(
     ipv6_addr: Option<[u8; OGS_IPV6_LEN]>,
     _rx_message: &RxMessage,
 ) -> Result<u32, String> {
-    log::debug!("Handling AAR: session={}", session_id);
+    log::debug!("Handling AAR: session={session_id}");
 
     // Update statistics
     pcrf_diam_stats().rx.inc_rx_aar();
@@ -209,7 +209,7 @@ pub fn pcrf_rx_handle_aar(
     };
 
     if let Err(e) = pcrf_gx_send_rar(&gx_sid, session_id, &mut rx_msg_for_rar) {
-        log::error!("Failed to send RAR: {}", e);
+        log::error!("Failed to send RAR: {e}");
         pcrf_diam_stats().rx.inc_rx_aar_error();
         return Err(e);
     }
@@ -226,16 +226,14 @@ pub fn pcrf_rx_handle_str(
     termination_cause: u32,
 ) -> Result<u32, String> {
     log::debug!(
-        "Handling STR: session={}, cause={}",
-        session_id,
-        termination_cause
+        "Handling STR: session={session_id}, cause={termination_cause}"
     );
 
     // Update statistics
     pcrf_diam_stats().rx.inc_rx_str();
 
     let ctx = pcrf_self();
-    let context = ctx.read().map_err(|e| format!("Failed to read context: {}", e))?;
+    let context = ctx.read().map_err(|e| format!("Failed to read context: {e}"))?;
 
     // Find Rx session
     let _rx_session = context
@@ -267,18 +265,16 @@ pub fn pcrf_rx_handle_str(
 /// Send ASR (Abort-Session-Request) to AF/P-CSCF
 pub fn pcrf_rx_send_asr(rx_sid: &str, abort_cause: u32) -> Result<(), String> {
     log::debug!(
-        "Sending ASR: rx_sid={}, abort_cause={}",
-        rx_sid,
-        abort_cause
+        "Sending ASR: rx_sid={rx_sid}, abort_cause={abort_cause}"
     );
 
     let ctx = pcrf_self();
-    let context = ctx.read().map_err(|e| format!("Failed to read context: {}", e))?;
+    let context = ctx.read().map_err(|e| format!("Failed to read context: {e}"))?;
 
     // Find Rx session
     let _rx_session = context
         .rx_session_find_by_sid(rx_sid)
-        .ok_or_else(|| format!("Cannot find Rx session: {}", rx_sid))?;
+        .ok_or_else(|| format!("Cannot find Rx session: {rx_sid}"))?;
 
     // Note: Build and send ASR message
     // ASR message construction handled by FreeDiameter fd_msg_new/fd_msg_avp_add:
@@ -291,23 +287,21 @@ pub fn pcrf_rx_send_asr(rx_sid: &str, abort_cause: u32) -> Result<(), String> {
     // Update statistics
     pcrf_diam_stats().rx.inc_tx_asr();
 
-    log::info!("ASR sent for Rx session: {}", rx_sid);
+    log::info!("ASR sent for Rx session: {rx_sid}");
     Ok(())
 }
 
 /// Handle ASA (Abort-Session-Answer) callback - stub implementation
 pub fn pcrf_rx_handle_asa(session_id: &str, result_code: u32) {
     log::debug!(
-        "Handling ASA: session={}, result_code={}",
-        session_id,
-        result_code
+        "Handling ASA: session={session_id}, result_code={result_code}"
     );
 
     // Update statistics
     pcrf_diam_stats().rx.inc_rx_asa();
 
     if result_code != result_code::DIAMETER_SUCCESS {
-        log::error!("ASA error: result_code={}", result_code);
+        log::error!("ASA error: result_code={result_code}");
     }
 }
 

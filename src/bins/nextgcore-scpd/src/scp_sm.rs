@@ -123,8 +123,8 @@ impl ScpSmContext {
 
         // Check API version (SCP uses v1)
         if api_version != "v1" {
-            log::error!("Not supported version [{}], expected [v1]", api_version);
-            send_error_response(stream_id, 400, &format!("Unsupported API version: {}", api_version));
+            log::error!("Not supported version [{api_version}], expected [v1]");
+            send_error_response(stream_id, 400, &format!("Unsupported API version: {api_version}"));
             return;
         }
 
@@ -136,7 +136,7 @@ impl ScpSmContext {
             }
             _ => {
                 // SCP forwards most requests - this is handled in sbi_path.rs
-                log::debug!("SCP forwarding request for service [{}]", service_name);
+                log::debug!("SCP forwarding request for service [{service_name}]");
             }
         }
     }
@@ -164,7 +164,7 @@ impl ScpSmContext {
                     // NF status notify processing is handled by the nnrf integration module
                 }
                 _ => {
-                    log::error!("Invalid HTTP method [{}]", method);
+                    log::error!("Invalid HTTP method [{method}]");
                 }
             },
             _ => {
@@ -201,7 +201,7 @@ impl ScpSmContext {
 
         // Check API version
         if api_version != "v1" {
-            log::error!("Not supported version [{}]", api_version);
+            log::error!("Not supported version [{api_version}]");
             return;
         }
 
@@ -215,7 +215,7 @@ impl ScpSmContext {
             }
             _ => {
                 // SCP forwards responses back to original requester
-                log::debug!("SCP forwarding response for service [{}]", service_name);
+                log::debug!("SCP forwarding response for service [{service_name}]");
             }
         }
     }
@@ -227,7 +227,7 @@ impl ScpSmContext {
             Some("nf-instances") => {
                 log::debug!("NF instances response received");
                 if let Some(ref nf_instance_id) = event.nf_instance_id {
-                    log::debug!("[{}] NF instance response", nf_instance_id);
+                    log::debug!("[{nf_instance_id}] NF instance response");
                 }
             }
             Some("subscriptions") => {
@@ -246,7 +246,7 @@ impl ScpSmContext {
             Some("nf-instances") => {
                 log::debug!("NF discover response received");
                 if let Some(sbi_xact_id) = event.sbi_xact_id {
-                    log::debug!("SBI xact ID: {}", sbi_xact_id);
+                    log::debug!("SBI xact ID: {sbi_xact_id}");
                     // Note: Handle NF discovery result and forward original request
                     // Discovery result processing is handled by the sbi_path module's handle_nf_discover_response
                 }
@@ -272,21 +272,21 @@ impl ScpSmContext {
             | ScpTimerId::NfInstanceNoHeartbeat
             | ScpTimerId::NfInstanceValidity => {
                 if let Some(ref nf_instance_id) = event.nf_instance_id {
-                    log::debug!("[{}] NF instance timer: {:?}", nf_instance_id, timer_id);
+                    log::debug!("[{nf_instance_id}] NF instance timer: {timer_id:?}");
                     // Note: Dispatch to NF FSM
                     // NF instance timer handling is done by the nnrf integration module
                 }
             }
             ScpTimerId::SubscriptionValidity => {
                 if let Some(ref subscription_id) = event.subscription_id {
-                    log::error!("[{}] Subscription validity expired", subscription_id);
+                    log::error!("[{subscription_id}] Subscription validity expired");
                     // Note: Send new subscription and remove old one
                     // Subscription renewal is handled by the nnrf integration module
                 }
             }
             ScpTimerId::SubscriptionPatch => {
                 if let Some(ref subscription_id) = event.subscription_id {
-                    log::info!("[{}] Need to update Subscription", subscription_id);
+                    log::info!("[{subscription_id}] Need to update Subscription");
                     // Note: Send subscription update
                     // Subscription update is handled by the nnrf integration module
                 }

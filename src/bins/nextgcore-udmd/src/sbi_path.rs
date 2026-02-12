@@ -339,17 +339,13 @@ pub async fn udm_sbi_discover_and_send_nudr_dr(
         })?;
         port = std::env::var("UDR_SBI_PORT")
             .ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
-        log::info!("Using UDR env var fallback: {}:{}", host_str, port);
+        log::info!("Using UDR env var fallback: {host_str}:{port}");
     }
 
     let client = sbi_ctx.get_client(&host_str, port).await;
 
     log::debug!(
-        "Sending NUDR-DR request for UE [{}] stream [{}] to UDR at {}:{}",
-        udm_ue_id,
-        stream_id,
-        host_str,
-        port
+        "Sending NUDR-DR request for UE [{udm_ue_id}] stream [{stream_id}] to UDR at {host_str}:{port}"
     );
 
     client.send_request(request).await

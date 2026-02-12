@@ -834,7 +834,7 @@ mod tests {
         assert_eq!(ctx.get_ue_load(), 1);
 
         for i in 2..=50 {
-            ctx.ue_add(&format!("suci-0-001-01-0000-0-0-{:010}", i));
+            ctx.ue_add(&format!("suci-0-001-01-0000-0-0-{i:010}"));
         }
         assert_eq!(ctx.get_ue_load(), 50);
     }

@@ -197,19 +197,14 @@ pub fn pcrf_gx_handle_ccr(
     ipv6_addr: Option<[u8; OGS_IPV6_LEN]>,
 ) -> Result<GxMessage, String> {
     log::debug!(
-        "Handling CCR: session={}, type={:?}, number={}, imsi={}, apn={}",
-        session_id,
-        cc_request_type,
-        cc_request_number,
-        imsi,
-        apn
+        "Handling CCR: session={session_id}, type={cc_request_type:?}, number={cc_request_number}, imsi={imsi}, apn={apn}"
     );
 
     // Update statistics
     pcrf_diam_stats().gx.inc_rx_ccr();
 
     let ctx = pcrf_self();
-    let context = ctx.read().map_err(|e| format!("Failed to read context: {}", e))?;
+    let context = ctx.read().map_err(|e| format!("Failed to read context: {e}"))?;
 
     match cc_request_type {
         CcRequestType::Initial => {
@@ -288,7 +283,7 @@ pub fn pcrf_gx_send_rar(
     );
 
     let ctx = pcrf_self();
-    let context = ctx.read().map_err(|e| format!("Failed to read context: {}", e))?;
+    let context = ctx.read().map_err(|e| format!("Failed to read context: {e}"))?;
 
     // Find Gx session
     let gx_session = context
@@ -483,12 +478,12 @@ pub fn derive_pcc_rules(
         // If no sub-components, create a default permit-all flow
         if flows.is_empty() {
             flows.push(FlowData {
-                direction: flow_status::ENABLED as i32,
-                description: format!("permit out ip from any to any"),
+                direction: flow_status::ENABLED,
+                description: "permit out ip from any to any".to_string(),
             });
             flows.push(FlowData {
-                direction: flow_status::ENABLED as i32,
-                description: format!("permit in ip from any to any"),
+                direction: flow_status::ENABLED,
+                description: "permit in ip from any to any".to_string(),
             });
         }
 

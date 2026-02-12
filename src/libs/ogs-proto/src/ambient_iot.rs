@@ -248,6 +248,12 @@ pub struct AmbientIotFleet {
     devices: HashMap<String, AmbientIotDevice>,
 }
 
+impl Default for AmbientIotFleet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AmbientIotFleet {
     pub fn new() -> Self {
         Self { devices: HashMap::new() }

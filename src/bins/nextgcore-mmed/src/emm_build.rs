@@ -11,6 +11,7 @@ use crate::context::{MmeUe, PlmnId, EpsTai};
 /// EMM Cause codes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum EmmCause {
     /// IMSI unknown in HSS
     ImsiUnknownInHss = 2,
@@ -85,14 +86,10 @@ pub enum EmmCause {
     /// Protocol error, unspecified
     ProtocolErrorUnspecified = 111,
     /// Request accepted
+    #[default]
     RequestAccepted = 0,
 }
 
-impl Default for EmmCause {
-    fn default() -> Self {
-        EmmCause::RequestAccepted
-    }
-}
 
 // ============================================================================
 // NAS EPS Message Types
@@ -293,17 +290,17 @@ impl GprsTimer {
         
         // Try 2-second increments (unit 0)
         if seconds <= 62 {
-            return Self { unit: 0, value: ((seconds + 1) / 2) as u8 };
+            return Self { unit: 0, value: seconds.div_ceil(2) as u8 };
         }
         
         // Try 1-minute increments (unit 1)
-        let minutes = (seconds + 59) / 60;
+        let minutes = seconds.div_ceil(60);
         if minutes <= 31 {
             return Self { unit: 1, value: minutes as u8 };
         }
         
         // Try 6-minute increments (unit 2)
-        let six_minutes = (seconds + 359) / 360;
+        let six_minutes = seconds.div_ceil(360);
         if six_minutes <= 31 {
             return Self { unit: 2, value: six_minutes as u8 };
         }

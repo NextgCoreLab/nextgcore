@@ -222,7 +222,7 @@ pub fn upf_gtp_close() -> Result<(), GtpPathError> {
             unsafe {
                 libc::close(dev.fd);
             }
-            log::info!("Closed TUN/TAP device: {}", name);
+            log::info!("Closed TUN/TAP device: {name}");
         }
     }
 
@@ -407,7 +407,7 @@ pub fn gtpv1_tun_recv_cb(data: &[u8], is_tap: bool) -> TunRecvResult {
                 &data[ETHER_HDR_LEN..]
             }
             _ => {
-                log::error!("[DROP] Invalid eth_type [0x{:04x}]", eth_type);
+                log::error!("[DROP] Invalid eth_type [0x{eth_type:04x}]");
                 return TunRecvResult::Handled;
             }
         }
@@ -503,7 +503,7 @@ pub fn gtpv1_u_recv_cb(
     let header_desc = match parse_gtpu_header(data) {
         Ok(h) => h,
         Err(e) => {
-            log::error!("[DROP] Cannot decode GTP-U packet: {:?}", e);
+            log::error!("[DROP] Cannot decode GTP-U packet: {e:?}");
             return GtpuRecvResult::Error(e);
         }
     };
@@ -511,7 +511,7 @@ pub fn gtpv1_u_recv_cb(
     // Check GTP version
     let version = (data[0] >> 5) & 0x07;
     if version != 1 {
-        log::error!("[DROP] Invalid GTP-U version [{}]", version);
+        log::error!("[DROP] Invalid GTP-U version [{version}]");
         return GtpuRecvResult::Error(GtpPathError::InvalidVersion(version));
     }
 
@@ -524,16 +524,16 @@ pub fn gtpv1_u_recv_cb(
 
     match header_desc.msg_type {
         gtpu_msg_type::ECHO_REQUEST => {
-            log::info!("[RECV] Echo Request from [{}]", from);
+            log::info!("[RECV] Echo Request from [{from}]");
             // Would send echo response here
             GtpuRecvResult::EchoResponse
         }
         gtpu_msg_type::END_MARKER => {
-            log::debug!("[RECV] End Marker from [{}]", from);
+            log::debug!("[RECV] End Marker from [{from}]");
             GtpuRecvResult::EndMarker
         }
         gtpu_msg_type::ERROR_INDICATION => {
-            log::warn!("[RECV] Error Indication from [{}]", from);
+            log::warn!("[RECV] Error Indication from [{from}]");
             // Would handle error indication here
             GtpuRecvResult::ErrorIndication
         }
@@ -640,11 +640,10 @@ fn verify_source_address(sess: &UpfSess, ip_data: &[u8], ip_version: u8) -> bool
             // Check if session has IPv6 address
             if let Some(ref ipv6) = sess.ipv6 {
                 // Check link-local (interface identifier match)
-                if is_ipv6_link_local(&src_addr) {
-                    if src_addr[2] == ipv6.addr[2] && src_addr[3] == ipv6.addr[3] {
+                if is_ipv6_link_local(&src_addr)
+                    && src_addr[2] == ipv6.addr[2] && src_addr[3] == ipv6.addr[3] {
                         return true;
                     }
-                }
                 // Check global (64-bit prefix match)
                 if src_addr[0] == ipv6.addr[0] && src_addr[1] == ipv6.addr[1] {
                     return true;
@@ -878,12 +877,12 @@ impl std::fmt::Display for GtpPathError {
             GtpPathError::LockError => write!(f, "Failed to acquire lock"),
             GtpPathError::PacketTooShort => write!(f, "Packet too short"),
             GtpPathError::EmptyPacket => write!(f, "Empty packet"),
-            GtpPathError::InvalidVersion(v) => write!(f, "Invalid GTP version: {}", v),
-            GtpPathError::InvalidMessageType(t) => write!(f, "Invalid message type: {}", t),
+            GtpPathError::InvalidVersion(v) => write!(f, "Invalid GTP version: {v}"),
+            GtpPathError::InvalidMessageType(t) => write!(f, "Invalid message type: {t}"),
             GtpPathError::InvalidIfname => write!(f, "Invalid interface name"),
-            GtpPathError::SyscallError(msg) => write!(f, "System call error: {}", msg),
+            GtpPathError::SyscallError(msg) => write!(f, "System call error: {msg}"),
             GtpPathError::NotSupported => write!(f, "Not supported on this platform"),
-            GtpPathError::IoError(msg) => write!(f, "I/O error: {}", msg),
+            GtpPathError::IoError(msg) => write!(f, "I/O error: {msg}"),
         }
     }
 }

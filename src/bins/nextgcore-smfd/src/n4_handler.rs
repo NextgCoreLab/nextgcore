@@ -230,7 +230,7 @@ pub fn handle_5gc_session_establishment_response(
     if cause_present {
         if let Some(cause) = cause_value {
             if cause != PfcpCause::RequestAccepted as u8 {
-                log::error!("PFCP Cause [{}] : Not Accepted", cause);
+                log::error!("PFCP Cause [{cause}] : Not Accepted");
                 result.cause = cause;
                 return result;
             }
@@ -243,7 +243,7 @@ pub fn handle_5gc_session_establishment_response(
 
     // Process created PDRs
     for (pdr_id, f_teid, src_if) in created_pdrs {
-        log::debug!("Processing created PDR: id={}, src_if={}", pdr_id, src_if);
+        log::debug!("Processing created PDR: id={pdr_id}, src_if={src_if}");
         
         // PFCP_INTERFACE_CORE = 1, PFCP_INTERFACE_ACCESS = 0
         if *src_if == 1 {
@@ -319,7 +319,7 @@ pub fn handle_5gc_session_modification_response(
     if cause_present {
         if let Some(cause) = cause_value {
             if cause != PfcpCause::RequestAccepted as u8 {
-                log::warn!("PFCP Cause [{}] : Not Accepted", cause);
+                log::warn!("PFCP Cause [{cause}] : Not Accepted");
                 result.status = sbi_status_from_pfcp(cause);
                 return result;
             }
@@ -332,7 +332,7 @@ pub fn handle_5gc_session_modification_response(
 
     // Process created PDRs
     for (pdr_id, f_teid, src_if, dst_if) in created_pdrs {
-        log::debug!("Processing created PDR: id={}, src_if={}, dst_if={}", pdr_id, src_if, dst_if);
+        log::debug!("Processing created PDR: id={pdr_id}, src_if={src_if}, dst_if={dst_if}");
         
         // PFCP_INTERFACE_CORE = 1, PFCP_INTERFACE_ACCESS = 0
         if *src_if == 1 {
@@ -376,7 +376,7 @@ pub fn handle_5gc_session_deletion_response(
     if cause_present {
         if let Some(cause) = cause_value {
             if cause != PfcpCause::RequestAccepted as u8 {
-                log::warn!("PFCP Cause [{}] : Not Accepted", cause);
+                log::warn!("PFCP Cause [{cause}] : Not Accepted");
                 status = sbi_status_from_pfcp(cause);
             }
         }
@@ -386,7 +386,7 @@ pub fn handle_5gc_session_deletion_response(
     }
 
     if status != sbi_status::OK {
-        log::error!("[{}] PFCP Cause : Not Accepted", trigger);
+        log::error!("[{trigger}] PFCP Cause : Not Accepted");
     }
 
     status
@@ -436,7 +436,7 @@ pub fn handle_epc_session_establishment_response(
     if cause_present {
         if let Some(cause) = cause_value {
             if cause != PfcpCause::RequestAccepted as u8 {
-                log::warn!("PFCP Cause [{}] : Not Accepted", cause);
+                log::warn!("PFCP Cause [{cause}] : Not Accepted");
                 result.cause = cause;
                 return result;
             }
@@ -449,7 +449,7 @@ pub fn handle_epc_session_establishment_response(
 
     // Process created PDRs for bearer F-TEID
     for (pdr_id, f_teid, src_if) in created_pdrs {
-        log::debug!("Processing created PDR: id={}, src_if={}", pdr_id, src_if);
+        log::debug!("Processing created PDR: id={pdr_id}, src_if={src_if}");
         
         // PFCP_INTERFACE_ACCESS = 0
         if *src_if == 0 {
@@ -490,7 +490,7 @@ pub fn handle_epc_session_modification_response(
     if cause_present {
         if let Some(cause) = cause_value {
             if cause != PfcpCause::RequestAccepted as u8 {
-                log::error!("PFCP Cause [{}] : Not Accepted", cause);
+                log::error!("PFCP Cause [{cause}] : Not Accepted");
                 return (cause, None);
             }
         }
@@ -502,7 +502,7 @@ pub fn handle_epc_session_modification_response(
     // Process created PDRs for bearer F-TEID
     let mut pgw_s5u_teid = None;
     for (pdr_id, f_teid, src_if) in created_pdrs {
-        log::debug!("Processing created PDR: id={}, src_if={}, flags={}", pdr_id, src_if, flags);
+        log::debug!("Processing created PDR: id={pdr_id}, src_if={src_if}, flags={flags}");
         
         // PFCP_INTERFACE_ACCESS = 0
         if *src_if == 0 {
@@ -544,7 +544,7 @@ pub fn handle_epc_session_deletion_response(
 
     if let Some(cause) = cause_value {
         if cause != PfcpCause::RequestAccepted as u8 {
-            log::warn!("PFCP Cause [{}] : Not Accepted", cause);
+            log::warn!("PFCP Cause [{cause}] : Not Accepted");
             return (cause, Vec::new());
         }
     }
@@ -636,7 +636,7 @@ pub fn handle_session_report_request(
                 log::error!("PDU Session had been SUSPENDED");
             }
             _ => {
-                log::error!("Invalid UpCnxState[{}]", up_cnx_state);
+                log::error!("Invalid UpCnxState[{up_cnx_state}]");
             }
         }
     }
@@ -655,7 +655,7 @@ pub fn handle_session_report_request(
     if (report_type_value & (report_type::DOWNLINK_DATA_REPORT |
                              report_type::ERROR_INDICATION_REPORT |
                              report_type::USAGE_REPORT)) == 0 {
-        log::error!("Not supported Report Type[{}]", report_type_value);
+        log::error!("Not supported Report Type[{report_type_value}]");
         result.cause = PfcpCause::SystemFailure as u8;
         return result;
     }

@@ -75,7 +75,7 @@ mod tests {
                 assert_eq!(dl.ran_ue_ngap_id, 100);
                 assert_eq!(dl.nas_pdu, vec![0x7e, 0x00, 0x56, 0x01, 0x02]);
             }
-            other => panic!("Expected DownlinkNasTransport, got {:?}", other),
+            other => panic!("Expected DownlinkNasTransport, got {other:?}"),
         }
     }
 
@@ -96,7 +96,7 @@ mod tests {
                 assert_eq!(failure.cause, Cause::Misc(CauseMisc::Unspecified));
                 assert_eq!(failure.time_to_wait, Some(types::TimeToWait::V5s));
             }
-            other => panic!("Expected NgSetupFailure, got {:?}", other),
+            other => panic!("Expected NgSetupFailure, got {other:?}"),
         }
     }
 
@@ -131,7 +131,7 @@ mod tests {
                     Cause::RadioNetwork(CauseRadioNetwork::UserInactivity)
                 );
             }
-            other => panic!("Expected UeContextReleaseCommand, got {:?}", other),
+            other => panic!("Expected UeContextReleaseCommand, got {other:?}"),
         }
     }
 
@@ -151,7 +151,7 @@ mod tests {
                 assert_eq!(complete.amf_ue_ngap_id, 1000);
                 assert_eq!(complete.ran_ue_ngap_id, 500);
             }
-            other => panic!("Expected UeContextReleaseComplete, got {:?}", other),
+            other => panic!("Expected UeContextReleaseComplete, got {other:?}"),
         }
     }
 
@@ -173,7 +173,7 @@ mod tests {
                 assert_eq!(req.ran_ue_ngap_id, 7);
                 assert_eq!(req.cause, Cause::Nas(CauseNas::NormalRelease));
             }
-            other => panic!("Expected UeContextReleaseRequest, got {:?}", other),
+            other => panic!("Expected UeContextReleaseRequest, got {other:?}"),
         }
     }
 
@@ -193,7 +193,7 @@ mod tests {
                 assert_eq!(resp.amf_ue_ngap_id, 55);
                 assert_eq!(resp.ran_ue_ngap_id, 33);
             }
-            other => panic!("Expected InitialContextSetupResponse, got {:?}", other),
+            other => panic!("Expected InitialContextSetupResponse, got {other:?}"),
         }
     }
 
@@ -218,7 +218,7 @@ mod tests {
                     Cause::RadioNetwork(CauseRadioNetwork::Unspecified)
                 );
             }
-            other => panic!("Expected InitialContextSetupFailure, got {:?}", other),
+            other => panic!("Expected InitialContextSetupFailure, got {other:?}"),
         }
     }
 
@@ -255,7 +255,7 @@ mod tests {
                 assert_eq!(resp.amf_name, "TestAMF");
                 assert_eq!(resp.relative_amf_capacity, 255);
             }
-            other => panic!("Expected NgSetupResponse, got {:?}", other),
+            other => panic!("Expected NgSetupResponse, got {other:?}"),
         }
     }
 
@@ -277,7 +277,7 @@ mod tests {
                 assert_eq!(resp.amf_ue_ngap_id, 100);
                 assert_eq!(resp.ran_ue_ngap_id, 200);
             }
-            other => panic!("Expected PduSessionResourceSetupResponse, got {:?}", other),
+            other => panic!("Expected PduSessionResourceSetupResponse, got {other:?}"),
         }
     }
 }

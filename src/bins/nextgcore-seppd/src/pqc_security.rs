@@ -80,7 +80,7 @@ impl ZeroTrustEngine {
             _ => ZeroTrustLevel::None,
         };
 
-        let peer_level = self.trusted_peers.get(plmn_id).copied().unwrap_or(ZeroTrustLevel::None);
+        let _peer_level = self.trusted_peers.get(plmn_id).copied().unwrap_or(ZeroTrustLevel::None);
         let trust_score = match achieved_level {
             ZeroTrustLevel::Full => 1.0,
             ZeroTrustLevel::Enhanced => 0.8,
@@ -244,7 +244,7 @@ impl ThreatDetector {
                 score,
                 category: ThreatCategory::Clean,
                 block: false,
-                details: format!("{} requests in window", count),
+                details: format!("{count} requests in window"),
             }
         }
     }

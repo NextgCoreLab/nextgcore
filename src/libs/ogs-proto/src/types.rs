@@ -176,19 +176,15 @@ impl PlmnId {
         &self.data
     }
 
-    /// Convert to string (e.g., "310410")
-    pub fn to_string(&self) -> String {
-        if self.mnc_len() == 2 {
-            format!("{:03}{:02}", self.mcc(), self.mnc())
-        } else {
-            format!("{:03}{:03}", self.mcc(), self.mnc())
-        }
-    }
 }
 
 impl fmt::Display for PlmnId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.to_string())
+        if self.mnc_len() == 2 {
+            write!(f, "{:03}{:02}", self.mcc(), self.mnc())
+        } else {
+            write!(f, "{:03}{:03}", self.mcc(), self.mnc())
+        }
     }
 }
 
@@ -334,7 +330,7 @@ impl SNssai {
     pub fn sd_to_string(&self) -> Option<String> {
         self.sd
             .filter(|&sd| sd != S_NSSAI_NO_SD_VALUE)
-            .map(|sd| format!("{:06x}", sd))
+            .map(|sd| format!("{sd:06x}"))
     }
 }
 
@@ -820,6 +816,7 @@ impl TimingAdvance {
 ///
 /// Describes ML models used for network optimization and analytics.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct ModelMetadata {
     /// Model identifier
     pub model_id: u64,
@@ -849,23 +846,12 @@ impl ModelMetadata {
     }
 }
 
-impl Default for ModelMetadata {
-    fn default() -> Self {
-        Self {
-            model_id: 0,
-            name: String::new(),
-            version: (0, 0, 0),
-            model_type: 0,
-            input_dim: 0,
-            output_dim: 0,
-        }
-    }
-}
 
 /// ML inference request for network functions.
 ///
 /// Request for ML inference at network elements.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct InferenceRequest {
     /// Request ID
     pub request_id: u64,
@@ -889,16 +875,6 @@ impl InferenceRequest {
     }
 }
 
-impl Default for InferenceRequest {
-    fn default() -> Self {
-        Self {
-            request_id: 0,
-            model_id: 0,
-            input_data: Vec::new(),
-            timestamp_ms: 0,
-        }
-    }
-}
 
 /// ML inference response.
 ///

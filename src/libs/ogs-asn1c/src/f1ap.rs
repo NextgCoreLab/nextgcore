@@ -246,7 +246,7 @@ pub fn decode_f1ap_procedure(data: &[u8]) -> PerResult<F1ApProcedure> {
         11 => Ok(F1ApProcedure::DlRrcMessageTransfer),
         12 => Ok(F1ApProcedure::UlRrcMessageTransfer),
         20 => Ok(F1ApProcedure::Paging),
-        _ => Err(PerError::DecodeError(format!("Unknown F1AP procedure: {}", code))),
+        _ => Err(PerError::DecodeError(format!("Unknown F1AP procedure: {code}"))),
     }
 }
 

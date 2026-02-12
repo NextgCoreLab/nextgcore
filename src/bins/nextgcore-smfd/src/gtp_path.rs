@@ -47,8 +47,10 @@ pub const GTP2_VERSION: u8 = 2;
 
 /// GTP transaction state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum GtpXactState {
     /// Initial state
+    #[default]
     Initial,
     /// Request sent, waiting for response
     WaitingResponse,
@@ -62,11 +64,6 @@ pub enum GtpXactState {
     Failed,
 }
 
-impl Default for GtpXactState {
-    fn default() -> Self {
-        GtpXactState::Initial
-    }
-}
 
 
 // ============================================================================
@@ -224,11 +221,7 @@ impl GtpNode {
     pub fn socket_addr(&self) -> Option<SocketAddr> {
         if let Some(addr) = self.addr {
             Some(SocketAddr::new(addr.into(), self.port))
-        } else if let Some(addr) = self.addr6 {
-            Some(SocketAddr::new(addr.into(), self.port))
-        } else {
-            None
-        }
+        } else { self.addr6.map(|addr| SocketAddr::new(addr.into(), self.port)) }
     }
 
     /// Update echo time

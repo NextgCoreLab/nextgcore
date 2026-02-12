@@ -11,7 +11,6 @@
 
 use crate::error::{SbiError, SbiResult};
 use crate::oauth::{AccessTokenClaims, decode_jwt_parts};
-use crate::tls;
 use crate::types::NfType;
 
 // ============================================================================
@@ -238,7 +237,7 @@ pub fn validate_bearer_token(
 
     // Check scope
     let scopes: Vec<&str> = claims.scope.split_whitespace().collect();
-    if !scopes.iter().any(|s| *s == required_scope) {
+    if !scopes.contains(&required_scope) {
         return Err(SbiError::AuthorizationFailed(format!(
             "Token scope '{}' does not include required scope '{}'",
             claims.scope, required_scope

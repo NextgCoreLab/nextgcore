@@ -581,7 +581,7 @@ pub fn decode_global_ran_node_id(field: &ProtocolIeField) -> NgapResult<GlobalRa
         }
         _ => Err(crate::error::NgapError::InvalidIeValue {
             ie_name: "GlobalRANNodeID",
-            reason: format!("Unknown choice index: {}", choice),
+            reason: format!("Unknown choice index: {choice}"),
         }),
     }
 }
@@ -716,7 +716,7 @@ pub fn decode_default_paging_drx(field: &ProtocolIeField) -> NgapResult<PagingDr
         3 => Ok(PagingDrx::V256),
         _ => Err(crate::error::NgapError::InvalidIeValue {
             ie_name: "PagingDRX",
-            reason: format!("Unknown value: {}", val),
+            reason: format!("Unknown value: {val}"),
         }),
     }
 }
@@ -799,7 +799,7 @@ pub fn decode_user_location_info(
         }
         _ => Err(crate::error::NgapError::InvalidIeValue {
             ie_name: "UserLocationInformation",
-            reason: format!("Unsupported choice index: {}", choice),
+            reason: format!("Unsupported choice index: {choice}"),
         }),
     }
 }
@@ -917,7 +917,7 @@ pub fn decode_ue_ngap_ids(field: &ProtocolIeField) -> NgapResult<UeNgapIds> {
         }
         _ => Err(crate::error::NgapError::InvalidIeValue {
             ie_name: "UE-NGAP-IDs",
-            reason: format!("Unknown choice index: {}", choice),
+            reason: format!("Unknown choice index: {choice}"),
         }),
     }
 }

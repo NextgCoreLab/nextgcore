@@ -322,7 +322,7 @@ impl SeppContext {
         self.max_num_of_node = max_node;
         self.max_num_of_assoc = max_assoc;
         self.initialized.store(true, Ordering::SeqCst);
-        log::info!("SEPP context initialized (max_node={}, max_assoc={})", max_node, max_assoc);
+        log::info!("SEPP context initialized (max_node={max_node}, max_assoc={max_assoc})");
     }
 
     pub fn fini(&mut self) {
@@ -359,7 +359,7 @@ impl SeppContext {
         let node = SeppNode::new(id, receiver);
 
         peer_list.insert(id, node.clone());
-        log::debug!("SEPP node added (id={}, receiver={})", id, receiver);
+        log::debug!("SEPP node added (id={id}, receiver={receiver})");
 
         Some(node)
     }
@@ -451,7 +451,7 @@ impl SeppContext {
         let assoc = SeppAssoc::new(id, stream_id);
 
         assoc_list.insert(id, assoc.clone());
-        log::debug!("SEPP association added (id={}, stream_id={})", id, stream_id);
+        log::debug!("SEPP association added (id={id}, stream_id={stream_id})");
 
         Some(assoc)
     }
@@ -462,7 +462,7 @@ impl SeppContext {
         let mut assoc_list = self.assoc_list.write().ok()?;
 
         if let Some(assoc) = assoc_list.remove(&id) {
-            log::debug!("SEPP association removed (id={})", id);
+            log::debug!("SEPP association removed (id={id})");
             return Some(assoc);
         }
         None

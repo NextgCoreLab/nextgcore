@@ -242,7 +242,7 @@ impl TimerManager {
             self.stop(timer_id);
         }
         
-        log::debug!("Stopped all timers for PFCP node {}", pfcp_node_id);
+        log::debug!("Stopped all timers for PFCP node {pfcp_node_id}");
     }
 
     /// Get active timer count

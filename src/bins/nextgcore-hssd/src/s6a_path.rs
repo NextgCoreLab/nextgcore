@@ -83,9 +83,7 @@ pub fn hss_s6a_send_clr(
     cancellation_type: CancellationType,
 ) -> Result<(), String> {
     log::info!(
-        "[{}] Sending Cancel-Location-Request (type={:?})",
-        imsi_bcd,
-        cancellation_type
+        "[{imsi_bcd}] Sending Cancel-Location-Request (type={cancellation_type:?})"
     );
 
     use ogs_diameter::s6a::{S6A_APPLICATION_ID, cmd, avp};
@@ -99,12 +97,12 @@ pub fn hss_s6a_send_clr(
         use ogs_dbi::{mongoc::get_subscriber_collection, mongodb::bson::doc};
 
         let collection = get_subscriber_collection()
-            .map_err(|e| format!("Failed to get subscriber collection: {}", e))?;
+            .map_err(|e| format!("Failed to get subscriber collection: {e}"))?;
 
         let query = doc! { "imsi": imsi_bcd };
         let doc = collection.find_one(query, None)
-            .map_err(|e| format!("Failed to query DB: {}", e))?
-            .ok_or_else(|| format!("Subscriber not found: {}", imsi_bcd))?;
+            .map_err(|e| format!("Failed to query DB: {e}"))?
+            .ok_or_else(|| format!("Subscriber not found: {imsi_bcd}"))?;
 
         let host = doc.get_str("mme_host")
             .unwrap_or("mme.epc.mnc001.mcc001.3gppnetwork.org").to_string();
@@ -147,7 +145,7 @@ pub fn hss_s6a_send_clr(
     // 3. Send message and register CLA callback
     // Note: In full implementation, this would use the Diameter transport to send
     // For now, we just log that we would send it
-    log::debug!("[{}] CLR message prepared (would send to {})", imsi_bcd, dest_host);
+    log::debug!("[{imsi_bcd}] CLR message prepared (would send to {dest_host})");
 
     diam_stats().s6a.inc_tx_clr();
     Ok(())
@@ -165,10 +163,7 @@ pub fn hss_s6a_send_idr(
     subdata_mask: u32,
 ) -> Result<(), String> {
     log::info!(
-        "[{}] Sending Insert-Subscriber-Data-Request (flags={}, mask={})",
-        imsi_bcd,
-        idr_flags,
-        subdata_mask
+        "[{imsi_bcd}] Sending Insert-Subscriber-Data-Request (flags={idr_flags}, mask={subdata_mask})"
     );
 
     use ogs_diameter::s6a::{S6A_APPLICATION_ID, cmd, avp};
@@ -178,12 +173,12 @@ pub fn hss_s6a_send_idr(
 
     // 1. Look up MME host/realm from DB
     let collection = get_subscriber_collection()
-        .map_err(|e| format!("Failed to get subscriber collection: {}", e))?;
+        .map_err(|e| format!("Failed to get subscriber collection: {e}"))?;
 
     let query = doc! { "imsi": imsi_bcd };
     let doc = collection.find_one(query, None)
-        .map_err(|e| format!("Failed to query DB: {}", e))?
-        .ok_or_else(|| format!("Subscriber not found: {}", imsi_bcd))?;
+        .map_err(|e| format!("Failed to query DB: {e}"))?
+        .ok_or_else(|| format!("Subscriber not found: {imsi_bcd}"))?;
 
     let dest_host = doc.get_str("mme_host")
         .unwrap_or("mme.epc.mnc001.mcc001.3gppnetwork.org").to_string();
@@ -191,9 +186,9 @@ pub fn hss_s6a_send_idr(
         .unwrap_or("epc.mnc001.mcc001.3gppnetwork.org").to_string();
 
     // 2. Get subscription data from DB
-    let supi = format!("imsi-{}", imsi_bcd);
+    let supi = format!("imsi-{imsi_bcd}");
     let _subscription_data = ogs_dbi_subscription_data(&supi)
-        .map_err(|e| format!("Failed to get subscription data: {}", e))?;
+        .map_err(|e| format!("Failed to get subscription data: {e}"))?;
 
     // 3. Create IDR message
     let mut msg = DiameterMessage::new_request(cmd::INSERT_SUBSCRIBER_DATA, S6A_APPLICATION_ID);
@@ -229,14 +224,14 @@ pub fn hss_s6a_send_idr(
     // Note: In full implementation, this would build a complex grouped AVP
     // containing AMBR, APN configs, QoS profiles, etc.
     if subdata_mask & OGS_DIAM_S6A_SUBDATA_UEAMBR != 0 {
-        log::debug!("[{}] Including UE-AMBR in subscription data", imsi_bcd);
+        log::debug!("[{imsi_bcd}] Including UE-AMBR in subscription data");
     }
     if subdata_mask & OGS_DIAM_S6A_SUBDATA_APN_CONFIG != 0 {
-        log::debug!("[{}] Including APN-Config in subscription data", imsi_bcd);
+        log::debug!("[{imsi_bcd}] Including APN-Config in subscription data");
     }
 
     // 4. Send message and register IDA callback
-    log::debug!("[{}] IDR message prepared (would send to {})", imsi_bcd, dest_host);
+    log::debug!("[{imsi_bcd}] IDR message prepared (would send to {dest_host})");
 
     diam_stats().s6a.inc_tx_idr();
     Ok(())
@@ -246,7 +241,7 @@ pub fn hss_s6a_send_idr(
 ///
 /// This is called when MME requests authentication vectors for a UE
 pub fn handle_air(imsi_bcd: &str, visited_plmn_id: &[u8], resync_info: Option<&[u8]>) -> Result<AirResponse, String> {
-    log::debug!("[{}] Handling AIR", imsi_bcd);
+    log::debug!("[{imsi_bcd}] Handling AIR");
     diam_stats().s6a.inc_rx_air();
 
     use ogs_dbi::{ogs_dbi_auth_info, ogs_dbi_increment_sqn, ogs_dbi_update_sqn};
@@ -254,22 +249,22 @@ pub fn handle_air(imsi_bcd: &str, visited_plmn_id: &[u8], resync_info: Option<&[
     use ogs_crypt::kdf::ogs_auc_kasme;
 
     // 1. Get auth info from DB (K, OPc, SQN, AMF)
-    let supi = format!("imsi-{}", imsi_bcd);
+    let supi = format!("imsi-{imsi_bcd}");
     let auth_info = ogs_dbi_auth_info(&supi)
-        .map_err(|e| format!("Failed to get auth info: {}", e))?;
+        .map_err(|e| format!("Failed to get auth info: {e}"))?;
 
     let mut sqn = auth_info.sqn;
 
     // 2. Handle re-synchronization if provided
     if let Some(auts) = resync_info {
-        log::debug!("[{}] Performing SQN re-synchronization", imsi_bcd);
+        log::debug!("[{imsi_bcd}] Performing SQN re-synchronization");
         if auts.len() >= 14 {
             // AUTS = SQN_MS ^ AK || MAC-S
             // Extract and verify MAC-S, then extract SQN_MS
             // For now, we'll increment SQN significantly on resync
             sqn = sqn.wrapping_add(0x10000); // Jump ahead on resync
             ogs_dbi_update_sqn(&supi, sqn)
-                .map_err(|e| format!("Failed to update SQN: {}", e))?;
+                .map_err(|e| format!("Failed to update SQN: {e}"))?;
         }
     }
 
@@ -314,7 +309,7 @@ pub fn handle_air(imsi_bcd: &str, visited_plmn_id: &[u8], resync_info: Option<&[
 
     // Derive KASME from CK, IK, SQN, AK
     let plmn_id: [u8; 3] = [
-        visited_plmn_id.get(0).copied().unwrap_or(0),
+        visited_plmn_id.first().copied().unwrap_or(0),
         visited_plmn_id.get(1).copied().unwrap_or(0),
         visited_plmn_id.get(2).copied().unwrap_or(0),
     ];
@@ -322,7 +317,7 @@ pub fn handle_air(imsi_bcd: &str, visited_plmn_id: &[u8], resync_info: Option<&[
 
     // 4. Update SQN in DB (increment by 32)
     ogs_dbi_increment_sqn(&supi)
-        .map_err(|e| format!("Failed to increment SQN: {}", e))?;
+        .map_err(|e| format!("Failed to increment SQN: {e}"))?;
 
     // 5. Return AIA with E-UTRAN-Vector
     let response = AirResponse {
@@ -347,19 +342,19 @@ pub fn handle_ulr(
     mme_host: &str,
     mme_realm: &str,
 ) -> Result<UlrResponse, String> {
-    log::debug!("[{}] Handling ULR from {}.{}", imsi_bcd, mme_host, mme_realm);
+    log::debug!("[{imsi_bcd}] Handling ULR from {mme_host}.{mme_realm}");
     diam_stats().s6a.inc_rx_ulr();
 
     use ogs_dbi::{ogs_dbi_update_mme, ogs_dbi_subscription_data};
 
     // 1. Update MME info in DB
-    let supi = format!("imsi-{}", imsi_bcd);
+    let supi = format!("imsi-{imsi_bcd}");
     ogs_dbi_update_mme(&supi, mme_host, mme_realm, true)
-        .map_err(|e| format!("Failed to update MME: {}", e))?;
+        .map_err(|e| format!("Failed to update MME: {e}"))?;
 
     // 2. Get subscription data from DB
     let _subscription_data = ogs_dbi_subscription_data(&supi)
-        .map_err(|e| format!("Failed to get subscription data: {}", e))?;
+        .map_err(|e| format!("Failed to get subscription data: {e}"))?;
 
     // 3. Return ULA with Subscription-Data
     // Note: In full implementation, subscription_data would be serialized to AVP format
@@ -370,7 +365,7 @@ pub fn handle_ulr(
     };
 
     diam_stats().s6a.inc_tx_ula();
-    log::debug!("[{}] ULR handled successfully", imsi_bcd);
+    log::debug!("[{imsi_bcd}] ULR handled successfully");
     Ok(response)
 }
 
@@ -378,7 +373,7 @@ pub fn handle_ulr(
 ///
 /// This is called when MME purges a UE
 pub fn handle_pur(imsi_bcd: &str, pur_flags: u32) -> Result<PurResponse, String> {
-    log::debug!("[{}] Handling PUR (flags={})", imsi_bcd, pur_flags);
+    log::debug!("[{imsi_bcd}] Handling PUR (flags={pur_flags})");
     diam_stats().s6a.inc_rx_pur();
 
     use ogs_dbi::{mongoc::get_subscriber_collection, mongodb::bson::doc};
@@ -388,7 +383,7 @@ pub fn handle_pur(imsi_bcd: &str, pur_flags: u32) -> Result<PurResponse, String>
     let supi_id = imsi_bcd;
 
     let collection = get_subscriber_collection()
-        .map_err(|e| format!("Failed to get subscriber collection: {}", e))?;
+        .map_err(|e| format!("Failed to get subscriber collection: {e}"))?;
 
     let query = doc! { supi_type: supi_id };
     let update = doc! {
@@ -399,7 +394,7 @@ pub fn handle_pur(imsi_bcd: &str, pur_flags: u32) -> Result<PurResponse, String>
     };
 
     collection.update_one(query, update, None)
-        .map_err(|e| format!("Failed to update purge flag: {}", e))?;
+        .map_err(|e| format!("Failed to update purge flag: {e}"))?;
 
     // 2. Return PUA
     let response = PurResponse {
@@ -407,7 +402,7 @@ pub fn handle_pur(imsi_bcd: &str, pur_flags: u32) -> Result<PurResponse, String>
     };
 
     diam_stats().s6a.inc_tx_pua();
-    log::debug!("[{}] PUR handled successfully", imsi_bcd);
+    log::debug!("[{imsi_bcd}] PUR handled successfully");
     Ok(response)
 }
 
@@ -495,9 +490,7 @@ pub fn build_diameter_answer(
         buf.extend_from_slice(&avp.data);
         // Padding
         let padding = padded_len - avp_len;
-        for _ in 0..padding {
-            buf.push(0);
-        }
+        buf.extend(std::iter::repeat_n(0u8, padding));
     }
 
     let msg_len = buf.len() as u32;

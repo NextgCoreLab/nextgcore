@@ -30,13 +30,13 @@ pub enum S1apError {
 impl std::fmt::Display for S1apError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            S1apError::InvalidMessage(msg) => write!(f, "Invalid message: {}", msg),
-            S1apError::MissingMandatoryIe(ie) => write!(f, "Missing mandatory IE: {}", ie),
-            S1apError::UnknownProcedure(code) => write!(f, "Unknown procedure: {}", code),
+            S1apError::InvalidMessage(msg) => write!(f, "Invalid message: {msg}"),
+            S1apError::MissingMandatoryIe(ie) => write!(f, "Missing mandatory IE: {ie}"),
+            S1apError::UnknownProcedure(code) => write!(f, "Unknown procedure: {code}"),
             S1apError::UnknownEnb => write!(f, "Unknown eNB"),
             S1apError::UnknownUe => write!(f, "Unknown UE"),
-            S1apError::DecodingError(msg) => write!(f, "Decoding error: {}", msg),
-            S1apError::ProtocolError(msg) => write!(f, "Protocol error: {}", msg),
+            S1apError::DecodingError(msg) => write!(f, "Decoding error: {msg}"),
+            S1apError::ProtocolError(msg) => write!(f, "Protocol error: {msg}"),
         }
     }
 }

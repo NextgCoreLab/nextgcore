@@ -385,7 +385,7 @@ pub fn nas_encrypt(
             );
         }
         _ => {
-            log::warn!("Unsupported encryption algorithm: {}", algorithm);
+            log::warn!("Unsupported encryption algorithm: {algorithm}");
         }
     }
 }
@@ -460,7 +460,7 @@ pub fn nas_mac_calculate(
             mac_u32.to_be_bytes()
         }
         _ => {
-            log::warn!("Unsupported integrity algorithm: {}", algorithm);
+            log::warn!("Unsupported integrity algorithm: {algorithm}");
             [0u8; 4]
         }
     }
@@ -583,20 +583,17 @@ pub fn select_integrity_algorithm_with_pqc(
 /// for NAS signaling in production. Null ciphering (NEA0) MAY be used
 /// in limited contexts but is strongly discouraged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum NasCipheringPolicy {
     /// Allow null algorithms (development/testing only)
     AllowNull,
     /// Reject null integrity but allow null ciphering (TS 33.501 minimum)
+    #[default]
     RejectNullIntegrity,
     /// Reject all null algorithms (recommended for production)
     RejectAllNull,
 }
 
-impl Default for NasCipheringPolicy {
-    fn default() -> Self {
-        NasCipheringPolicy::RejectNullIntegrity
-    }
-}
 
 /// Validate selected algorithms against the ciphering policy
 ///

@@ -25,6 +25,7 @@ mod nudr_handler;
 mod pcf_sm;
 mod sbi_path;
 mod sbi_response;
+#[allow(dead_code)]
 mod intent_policy;
 mod sm_sm;
 mod timer;
@@ -142,7 +143,7 @@ async fn main() -> Result<()> {
                 log::debug!("Configuration file loaded ({} bytes)", content.len());
             }
             Err(e) => {
-                log::warn!("Failed to read configuration file: {}", e);
+                log::warn!("Failed to read configuration file: {e}");
             }
         }
     } else {
@@ -169,9 +170,9 @@ async fn main() -> Result<()> {
     let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
 
     sbi_server.start(pcf_sbi_request_handler).await
-        .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
-    log::info!("SBI HTTP/2 server listening on {}", sbi_addr);
+    log::info!("SBI HTTP/2 server listening on {sbi_addr}");
     log::info!("NextGCore PCF ready");
 
     // Main event loop (async)
@@ -182,7 +183,7 @@ async fn main() -> Result<()> {
 
     // Stop SBI server
     sbi_server.stop().await
-        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
     log::info!("SBI HTTP/2 server stopped");
 
     // Close legacy SBI server
@@ -206,7 +207,7 @@ async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("PCF SBI request: {} {}", method, uri);
+    log::debug!("PCF SBI request: {method} {uri}");
 
     // Parse the URI path
     let path = uri.split('?').next().unwrap_or(uri);
@@ -292,7 +293,7 @@ async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         }
 
         _ => {
-            log::warn!("Unknown PCF request: {} {}", method, uri);
+            log::warn!("Unknown PCF request: {method} {uri}");
             send_method_not_allowed(method, uri)
         }
     }
@@ -310,7 +311,7 @@ async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
 
     let policy_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
     // Extract SUPI from request
@@ -363,7 +364,7 @@ async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
             }
 
             SbiResponse::with_status(201)
-                .with_header("Location", &format!("/npcf-am-policy-control/v1/policies/{}", ue_am.association_id))
+                .with_header("Location", format!("/npcf-am-policy-control/v1/policies/{}", ue_am.association_id))
                 .with_json_body(&resp)
                 .unwrap_or_else(|_| SbiResponse::with_status(201))
         }
@@ -374,7 +375,7 @@ async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
 }
 
 async fn handle_am_policy_get(pol_asso_id: &str) -> SbiResponse {
-    log::debug!("AM Policy Get: {}", pol_asso_id);
+    log::debug!("AM Policy Get: {pol_asso_id}");
 
     let ctx = pcf_self();
     let ue_am = if let Ok(context) = ctx.read() {
@@ -394,13 +395,13 @@ async fn handle_am_policy_get(pol_asso_id: &str) -> SbiResponse {
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }
         None => {
-            send_not_found(&format!("AM Policy {} not found", pol_asso_id), Some("POLICY_NOT_FOUND"))
+            send_not_found(&format!("AM Policy {pol_asso_id} not found"), Some("POLICY_NOT_FOUND"))
         }
     }
 }
 
 async fn handle_am_policy_delete(pol_asso_id: &str) -> SbiResponse {
-    log::info!("AM Policy Delete: {}", pol_asso_id);
+    log::info!("AM Policy Delete: {pol_asso_id}");
 
     let ctx = pcf_self();
 
@@ -417,17 +418,17 @@ async fn handle_am_policy_delete(pol_asso_id: &str) -> SbiResponse {
             if let Ok(context) = ctx.read() {
                 context.ue_am_remove(ue_am.id);
             }
-            log::info!("AM Policy {} deleted", pol_asso_id);
+            log::info!("AM Policy {pol_asso_id} deleted");
             SbiResponse::with_status(204)
         }
         None => {
-            send_not_found(&format!("AM Policy {} not found", pol_asso_id), Some("POLICY_NOT_FOUND"))
+            send_not_found(&format!("AM Policy {pol_asso_id} not found"), Some("POLICY_NOT_FOUND"))
         }
     }
 }
 
 async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("AM Policy Update: {}", pol_asso_id);
+    log::info!("AM Policy Update: {pol_asso_id}");
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -436,7 +437,7 @@ async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) -> Sbi
 
     let _update_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
     let ctx = pcf_self();
@@ -457,7 +458,7 @@ async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) -> Sbi
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }
         None => {
-            send_not_found(&format!("AM Policy {} not found", pol_asso_id), Some("POLICY_NOT_FOUND"))
+            send_not_found(&format!("AM Policy {pol_asso_id} not found"), Some("POLICY_NOT_FOUND"))
         }
     }
 }
@@ -474,7 +475,7 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
 
     let policy_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
     let supi = policy_data.get("supi")
@@ -592,7 +593,7 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
             };
 
             SbiResponse::with_status(201)
-                .with_header("Location", &format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id))
+                .with_header("Location", format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id))
                 .with_json_body(&serde_json::json!({
                     "smPolicyId": sess.sm_policy_id,
                     "supi": supi,
@@ -618,12 +619,12 @@ fn format_bitrate(bps: u64) -> String {
     } else if bps >= 1_000 && bps % 1_000 == 0 {
         format!("{} Kbps", bps / 1_000)
     } else {
-        format!("{} bps", bps)
+        format!("{bps} bps")
     }
 }
 
 async fn handle_sm_policy_get(sm_policy_id: &str) -> SbiResponse {
-    log::debug!("SM Policy Get: {}", sm_policy_id);
+    log::debug!("SM Policy Get: {sm_policy_id}");
 
     let ctx = pcf_self();
     let sess = if let Ok(context) = ctx.read() {
@@ -644,13 +645,13 @@ async fn handle_sm_policy_get(sm_policy_id: &str) -> SbiResponse {
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }
         None => {
-            send_not_found(&format!("SM Policy {} not found", sm_policy_id), Some("POLICY_NOT_FOUND"))
+            send_not_found(&format!("SM Policy {sm_policy_id} not found"), Some("POLICY_NOT_FOUND"))
         }
     }
 }
 
 async fn handle_sm_policy_delete(sm_policy_id: &str) -> SbiResponse {
-    log::info!("SM Policy Delete: {}", sm_policy_id);
+    log::info!("SM Policy Delete: {sm_policy_id}");
 
     let ctx = pcf_self();
 
@@ -665,17 +666,17 @@ async fn handle_sm_policy_delete(sm_policy_id: &str) -> SbiResponse {
             if let Ok(context) = ctx.read() {
                 context.sess_remove(sess.id);
             }
-            log::info!("SM Policy {} deleted", sm_policy_id);
+            log::info!("SM Policy {sm_policy_id} deleted");
             SbiResponse::with_status(204)
         }
         None => {
-            send_not_found(&format!("SM Policy {} not found", sm_policy_id), Some("POLICY_NOT_FOUND"))
+            send_not_found(&format!("SM Policy {sm_policy_id} not found"), Some("POLICY_NOT_FOUND"))
         }
     }
 }
 
 async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("SM Policy Update Notify: {}", sm_policy_id);
+    log::info!("SM Policy Update Notify: {sm_policy_id}");
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -684,7 +685,7 @@ async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest
 
     let update_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
     let ctx = pcf_self();
@@ -709,7 +710,7 @@ async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest
             if let Some(reports) = update_data.get("repPccRuleStatusList").and_then(|v| v.as_object()) {
                 for (rule_id, report) in reports {
                     let status = report.get("ruleStatus").and_then(|v| v.as_str()).unwrap_or("ACTIVE");
-                    log::debug!("PCC rule {} status: {}", rule_id, status);
+                    log::debug!("PCC rule {rule_id} status: {status}");
                     rule_reports.push((rule_id.clone(), status.to_string()));
                 }
             }
@@ -745,7 +746,7 @@ async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest
                 }
                 qos_decs.insert(qos_ref, qos_dec);
 
-                log::info!("Generated PCC rule for UE-initiated resource request: 5QI={}", req_5qi);
+                log::info!("Generated PCC rule for UE-initiated resource request: 5QI={req_5qi}");
             }
 
             // If SESS_AMBR_CH trigger, re-evaluate session AMBR
@@ -782,7 +783,7 @@ async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }
         None => {
-            send_not_found(&format!("SM Policy {} not found", sm_policy_id), Some("POLICY_NOT_FOUND"))
+            send_not_found(&format!("SM Policy {sm_policy_id} not found"), Some("POLICY_NOT_FOUND"))
         }
     }
 }
@@ -799,16 +800,16 @@ async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
 
     let session_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
     // For now, just create a dummy app session
     let app_session_id = uuid::Uuid::new_v4().to_string();
 
-    log::info!("App Session created (id={})", app_session_id);
+    log::info!("App Session created (id={app_session_id})");
 
     SbiResponse::with_status(201)
-        .with_header("Location", &format!("/npcf-policyauthorization/v1/app-sessions/{}", app_session_id))
+        .with_header("Location", format!("/npcf-policyauthorization/v1/app-sessions/{app_session_id}"))
         .with_json_body(&serde_json::json!({
             "appSessionId": app_session_id,
             "notifUri": session_data.get("notifUri"),
@@ -818,7 +819,7 @@ async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
 }
 
 async fn handle_app_session_get(app_session_id: &str) -> SbiResponse {
-    log::debug!("App Session Get: {}", app_session_id);
+    log::debug!("App Session Get: {app_session_id}");
 
     let ctx = pcf_self();
     let app = if let Ok(context) = ctx.read() {
@@ -837,13 +838,13 @@ async fn handle_app_session_get(app_session_id: &str) -> SbiResponse {
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }
         None => {
-            send_not_found(&format!("App Session {} not found", app_session_id), Some("SESSION_NOT_FOUND"))
+            send_not_found(&format!("App Session {app_session_id} not found"), Some("SESSION_NOT_FOUND"))
         }
     }
 }
 
 async fn handle_app_session_delete(app_session_id: &str) -> SbiResponse {
-    log::info!("App Session Delete: {}", app_session_id);
+    log::info!("App Session Delete: {app_session_id}");
 
     let ctx = pcf_self();
 
@@ -858,17 +859,17 @@ async fn handle_app_session_delete(app_session_id: &str) -> SbiResponse {
             if let Ok(context) = ctx.read() {
                 context.app_remove(app.id);
             }
-            log::info!("App Session {} deleted", app_session_id);
+            log::info!("App Session {app_session_id} deleted");
             SbiResponse::with_status(204)
         }
         None => {
-            send_not_found(&format!("App Session {} not found", app_session_id), Some("SESSION_NOT_FOUND"))
+            send_not_found(&format!("App Session {app_session_id} not found"), Some("SESSION_NOT_FOUND"))
         }
     }
 }
 
 async fn handle_app_session_modify(app_session_id: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("App Session Modify: {}", app_session_id);
+    log::info!("App Session Modify: {app_session_id}");
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -877,7 +878,7 @@ async fn handle_app_session_modify(app_session_id: &str, request: &SbiRequest) -
 
     let _modify_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
     let ctx = pcf_self();
@@ -897,7 +898,7 @@ async fn handle_app_session_modify(app_session_id: &str, request: &SbiRequest) -
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }
         None => {
-            send_not_found(&format!("App Session {} not found", app_session_id), Some("SESSION_NOT_FOUND"))
+            send_not_found(&format!("App Session {app_session_id} not found"), Some("SESSION_NOT_FOUND"))
         }
     }
 }

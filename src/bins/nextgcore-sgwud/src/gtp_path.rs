@@ -302,12 +302,12 @@ pub fn handle_gtpu_recv(
 
 /// Handle Echo Request
 fn handle_echo_request(header: &GtpuHeader, from_addr: &str) -> GtpuRecvResult {
-    log::debug!("[RECV] Echo Request from [{}]", from_addr);
+    log::debug!("[RECV] Echo Request from [{from_addr}]");
 
     // Build Echo Response
     let _response = build_echo_response(header);
 
-    log::debug!("[SEND] Echo Response to [{}]", from_addr);
+    log::debug!("[SEND] Echo Response to [{from_addr}]");
 
     // In actual implementation, send response via socket
     GtpuRecvResult::EchoResponse
@@ -478,7 +478,7 @@ pub fn build_end_marker(teid: u32) -> Vec<u8> {
 /// Send buffered packets for a PDR
 /// Port of ogs_pfcp_send_buffered_gtpu
 pub fn send_buffered_packets(pdr_id: u16) {
-    log::debug!("Sending buffered packets for PDR {}", pdr_id);
+    log::debug!("Sending buffered packets for PDR {pdr_id}");
 
     // In actual implementation:
     // 1. Get buffered packets for PDR
@@ -488,7 +488,7 @@ pub fn send_buffered_packets(pdr_id: u16) {
 /// Send End Marker
 /// Port of ogs_pfcp_send_end_marker
 pub fn send_end_marker(pdr_id: u16) -> Result<(), String> {
-    log::debug!("Sending End Marker for PDR {}", pdr_id);
+    log::debug!("Sending End Marker for PDR {pdr_id}");
 
     // In actual implementation:
     // 1. Get FAR for PDR

@@ -480,7 +480,7 @@ impl PcfContext {
         self.max_num_of_ue = max_ue;
         self.max_num_of_sess = max_sess;
         self.initialized.store(true, Ordering::SeqCst);
-        log::info!("PCF context initialized with max {} UEs, {} sessions", max_ue, max_sess);
+        log::info!("PCF context initialized with max {max_ue} UEs, {max_sess} sessions");
     }
 
     pub fn fini(&mut self) {
@@ -516,7 +516,7 @@ impl PcfContext {
         association_id_hash.insert(ue_am.association_id.clone(), id);
         ue_am_list.insert(id, ue_am.clone());
 
-        log::debug!("[{}] PCF UE AM added (id={})", supi, id);
+        log::debug!("[{supi}] PCF UE AM added (id={id})");
         Some(ue_am)
     }
 
@@ -591,7 +591,7 @@ impl PcfContext {
         supi_sm_hash.insert(supi.to_string(), id);
         ue_sm_list.insert(id, ue_sm.clone());
 
-        log::debug!("[{}] PCF UE SM added (id={})", supi, id);
+        log::debug!("[{supi}] PCF UE SM added (id={id})");
         Some(ue_sm)
     }
 
@@ -670,7 +670,7 @@ impl PcfContext {
             ue_sm.sess_ids.push(id);
         }
 
-        log::debug!("[ue_sm_id={}, psi={}] PCF session added (id={})", pcf_ue_sm_id, psi, id);
+        log::debug!("[ue_sm_id={pcf_ue_sm_id}, psi={psi}] PCF session added (id={id})");
         Some(sess)
     }
 
@@ -805,7 +805,7 @@ impl PcfContext {
             sess.app_ids.push(id);
         }
 
-        log::debug!("[sess_id={}] PCF app added (id={})", sess_id, id);
+        log::debug!("[sess_id={sess_id}] PCF app added (id={id})");
         Some(app)
     }
 
@@ -820,7 +820,7 @@ impl PcfContext {
             if let Some(sess) = sess_list.get_mut(&app.sess_id) {
                 sess.app_ids.retain(|&aid| aid != id);
             }
-            log::debug!("PCF app removed (id={})", id);
+            log::debug!("PCF app removed (id={id})");
             return Some(app);
         }
         None

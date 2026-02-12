@@ -228,7 +228,7 @@ impl<T: PoolItem + Default> OgsPoolWithId<T> {
         
         // Generate next ID (wrapping from MIN to MAX)
         let id = self.next_id;
-        self.next_id = if self.next_id >= OGS_MAX_POOL_ID {
+        self.next_id = if self.next_id == OGS_MAX_POOL_ID {
             OGS_MIN_POOL_ID
         } else {
             self.next_id + 1

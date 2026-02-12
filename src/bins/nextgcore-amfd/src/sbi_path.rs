@@ -116,10 +116,10 @@ pub enum SbiError {
 impl std::fmt::Display for SbiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SbiError::ServiceNotFound(s) => write!(f, "Service not found: {}", s),
+            SbiError::ServiceNotFound(s) => write!(f, "Service not found: {s}"),
             SbiError::NfInstanceNotFound => write!(f, "NF instance not found"),
-            SbiError::RequestFailed(s) => write!(f, "Request failed: {}", s),
-            SbiError::ResponseParseError(s) => write!(f, "Response parse error: {}", s),
+            SbiError::RequestFailed(s) => write!(f, "Request failed: {s}"),
+            SbiError::ResponseParseError(s) => write!(f, "Response parse error: {s}"),
             SbiError::Timeout => write!(f, "Timeout"),
             SbiError::GatewayTimeout => write!(f, "Gateway timeout"),
             SbiError::InvalidState => write!(f, "Invalid state"),
@@ -427,8 +427,7 @@ pub async fn call_smf_create_sm_context(
     n1_sm_msg_from_ue: &[u8],
 ) -> SbiResult<SmContextCreateResponse> {
     log::info!(
-        "Calling SMF SM Context Create: {}:{}, PSI={}, SST={}, DNN={}",
-        smf_host, smf_port, pdu_session_id, sst, dnn
+        "Calling SMF SM Context Create: {smf_host}:{smf_port}, PSI={pdu_session_id}, SST={sst}, DNN={dnn}"
     );
 
     let client = SbiClient::with_host_port(smf_host, smf_port);
@@ -437,7 +436,7 @@ pub async fn call_smf_create_sm_context(
         "pduSessionId": pdu_session_id,
         "sNssai": {
             "sst": sst,
-            "sd": sd.map(|v| format!("{:06x}", v))
+            "sd": sd.map(|v| format!("{v:06x}"))
         },
         "dnn": dnn,
         "n1SmMsg": base64::engine::general_purpose::STANDARD.encode(n1_sm_msg_from_ue),
@@ -449,7 +448,7 @@ pub async fn call_smf_create_sm_context(
 
     let response = client.post_json("/nsmf-pdusession/v1/sm-contexts", &body)
         .await
-        .map_err(|e| SbiError::RequestFailed(format!("SMF request failed: {}", e)))?;
+        .map_err(|e| SbiError::RequestFailed(format!("SMF request failed: {e}")))?;
 
     if !response.is_success() {
         return Err(SbiError::RequestFailed(format!(
@@ -459,7 +458,7 @@ pub async fn call_smf_create_sm_context(
 
     let response_body: serde_json::Value = match &response.http.content {
         Some(content) => serde_json::from_str(content)
-            .map_err(|e| SbiError::ResponseParseError(format!("Invalid JSON: {}", e)))?,
+            .map_err(|e| SbiError::ResponseParseError(format!("Invalid JSON: {e}")))?,
         None => return Err(SbiError::ResponseParseError("Empty response body".to_string())),
     };
 
@@ -512,10 +511,10 @@ pub async fn call_smf_update_sm_context(
         "n2SmInfoType": "PDU_RES_SETUP_RSP"
     });
 
-    let path = format!("/nsmf-pdusession/v1/sm-contexts/{}/modify", sm_context_ref);
+    let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
     let response = client.post_json(&path, &body)
         .await
-        .map_err(|e| SbiError::RequestFailed(format!("SMF update failed: {}", e)))?;
+        .map_err(|e| SbiError::RequestFailed(format!("SMF update failed: {e}")))?;
 
     if !response.is_success() {
         return Err(SbiError::RequestFailed(format!(
@@ -523,7 +522,7 @@ pub async fn call_smf_update_sm_context(
         )));
     }
 
-    log::info!("SMF SM Context Updated: ref={}", sm_context_ref);
+    log::info!("SMF SM Context Updated: ref={sm_context_ref}");
     Ok(())
 }
 
@@ -537,8 +536,7 @@ pub async fn call_smf_release_sm_context(
     sm_context_ref: &str,
 ) -> SbiResult<()> {
     log::info!(
-        "Calling SMF SM Context Release: ref={}",
-        sm_context_ref
+        "Calling SMF SM Context Release: ref={sm_context_ref}"
     );
 
     let client = SbiClient::with_host_port(smf_host, smf_port);
@@ -547,10 +545,10 @@ pub async fn call_smf_release_sm_context(
         "cause": "REL_DUE_TO_UE_REQUEST"
     });
 
-    let path = format!("/nsmf-pdusession/v1/sm-contexts/{}/release", sm_context_ref);
+    let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/release");
     let response = client.post_json(&path, &body)
         .await
-        .map_err(|e| SbiError::RequestFailed(format!("SMF release failed: {}", e)))?;
+        .map_err(|e| SbiError::RequestFailed(format!("SMF release failed: {e}")))?;
 
     if !response.is_success() {
         return Err(SbiError::RequestFailed(format!(
@@ -558,7 +556,7 @@ pub async fn call_smf_release_sm_context(
         )));
     }
 
-    log::info!("SMF SM Context Released: ref={}", sm_context_ref);
+    log::info!("SMF SM Context Released: ref={sm_context_ref}");
     Ok(())
 }
 
@@ -586,8 +584,7 @@ pub async fn call_ausf_authenticate(
     serving_network_name: &str,
 ) -> SbiResult<AusfAuthResponse> {
     log::info!(
-        "Calling AUSF authenticate: {}:{}, SUCI={}, SNN={}",
-        ausf_host, ausf_port, suci, serving_network_name
+        "Calling AUSF authenticate: {ausf_host}:{ausf_port}, SUCI={suci}, SNN={serving_network_name}"
     );
 
     let client = SbiClient::with_host_port(ausf_host, ausf_port);
@@ -599,7 +596,7 @@ pub async fn call_ausf_authenticate(
 
     let response = client.post_json("/nausf-auth/v1/ue-authentications", &body)
         .await
-        .map_err(|e| SbiError::RequestFailed(format!("AUSF request failed: {}", e)))?;
+        .map_err(|e| SbiError::RequestFailed(format!("AUSF request failed: {e}")))?;
 
     if !response.is_success() {
         return Err(SbiError::RequestFailed(format!(
@@ -609,7 +606,7 @@ pub async fn call_ausf_authenticate(
 
     let response_body: serde_json::Value = match &response.http.content {
         Some(content) => serde_json::from_str(content)
-            .map_err(|e| SbiError::ResponseParseError(format!("Invalid JSON: {}", e)))?,
+            .map_err(|e| SbiError::ResponseParseError(format!("Invalid JSON: {e}")))?,
         None => return Err(SbiError::ResponseParseError("Empty response body".to_string())),
     };
 
@@ -617,11 +614,11 @@ pub async fn call_ausf_authenticate(
     let auth_data = &response_body["5gAuthData"];
 
     let rand = hex_to_16bytes(auth_data["rand"].as_str().unwrap_or(""))
-        .map_err(|e| SbiError::ResponseParseError(format!("Invalid RAND: {}", e)))?;
+        .map_err(|e| SbiError::ResponseParseError(format!("Invalid RAND: {e}")))?;
     let autn = hex_to_16bytes(auth_data["autn"].as_str().unwrap_or(""))
-        .map_err(|e| SbiError::ResponseParseError(format!("Invalid AUTN: {}", e)))?;
+        .map_err(|e| SbiError::ResponseParseError(format!("Invalid AUTN: {e}")))?;
     let hxres_star = hex_to_16bytes(auth_data["hxresStar"].as_str().unwrap_or(""))
-        .map_err(|e| SbiError::ResponseParseError(format!("Invalid HXRES*: {}", e)))?;
+        .map_err(|e| SbiError::ResponseParseError(format!("Invalid HXRES*: {e}")))?;
 
     // Extract auth context ID from Location header
     let auth_ctx_id = response.http.headers.get("location")
@@ -671,10 +668,10 @@ pub async fn call_ausf_5g_aka_confirm(
         "resStar": hex::encode(res_star)
     });
 
-    let path = format!("/nausf-auth/v1/ue-authentications/{}/5g-aka-confirmation", auth_ctx_id);
+    let path = format!("/nausf-auth/v1/ue-authentications/{auth_ctx_id}/5g-aka-confirmation");
     let response = client.put_json(&path, &body)
         .await
-        .map_err(|e| SbiError::RequestFailed(format!("AUSF confirmation failed: {}", e)))?;
+        .map_err(|e| SbiError::RequestFailed(format!("AUSF confirmation failed: {e}")))?;
 
     if !response.is_success() {
         return Err(SbiError::RequestFailed(format!(
@@ -684,7 +681,7 @@ pub async fn call_ausf_5g_aka_confirm(
 
     let response_body: serde_json::Value = match &response.http.content {
         Some(content) => serde_json::from_str(content)
-            .map_err(|e| SbiError::ResponseParseError(format!("Invalid JSON: {}", e)))?,
+            .map_err(|e| SbiError::ResponseParseError(format!("Invalid JSON: {e}")))?,
         None => return Err(SbiError::ResponseParseError("Empty response body".to_string())),
     };
 
@@ -692,7 +689,7 @@ pub async fn call_ausf_5g_aka_confirm(
 
     let kseaf_hex = response_body["kseaf"].as_str().unwrap_or("");
     let kseaf_bytes = hex::decode(kseaf_hex)
-        .map_err(|e| SbiError::ResponseParseError(format!("Invalid KSEAF: {}", e)))?;
+        .map_err(|e| SbiError::ResponseParseError(format!("Invalid KSEAF: {e}")))?;
     let mut kseaf = [0u8; 32];
     if kseaf_bytes.len() >= 32 {
         kseaf.copy_from_slice(&kseaf_bytes[..32]);
@@ -700,7 +697,7 @@ pub async fn call_ausf_5g_aka_confirm(
 
     let supi = response_body["supi"].as_str().map(|s| s.to_string());
 
-    log::info!("AUSF 5G-AKA confirmation: result={}, supi={:?}", auth_result, supi);
+    log::info!("AUSF 5G-AKA confirmation: result={auth_result}, supi={supi:?}");
 
     Ok(AusfConfirmResponse {
         auth_result,
@@ -711,7 +708,7 @@ pub async fn call_ausf_5g_aka_confirm(
 
 /// Helper: convert hex string to [u8; 16]
 fn hex_to_16bytes(hex_str: &str) -> Result<[u8; 16], String> {
-    let bytes = hex::decode(hex_str).map_err(|e| format!("hex decode: {}", e))?;
+    let bytes = hex::decode(hex_str).map_err(|e| format!("hex decode: {e}"))?;
     if bytes.len() != 16 {
         return Err(format!("expected 16 bytes, got {}", bytes.len()));
     }

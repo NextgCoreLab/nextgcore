@@ -141,7 +141,7 @@ async fn main() -> Result<()> {
         let ctx = sepp_self();
         if let Ok(mut context) = ctx.write() {
             context.set_sender(sender);
-            log::info!("SEPP sender FQDN: {}", sender);
+            log::info!("SEPP sender FQDN: {sender}");
         };
     }
 
@@ -160,7 +160,7 @@ async fn main() -> Result<()> {
                 log::debug!("Configuration file loaded ({} bytes)", content.len());
             }
             Err(e) => {
-                log::warn!("Failed to read configuration file: {}", e);
+                log::warn!("Failed to read configuration file: {e}");
             }
         }
     } else {
@@ -187,7 +187,7 @@ async fn main() -> Result<()> {
     );
 
     if let (Some(n32_addr), Some(n32_port)) = (&args.n32_addr, args.n32_port) {
-        log::info!("N32 interface listening on {}:{}", n32_addr, n32_port);
+        log::info!("N32 interface listening on {n32_addr}:{n32_port}");
     }
 
     log::info!("NextGCore SEPP ready");

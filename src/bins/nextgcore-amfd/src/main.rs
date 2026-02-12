@@ -108,19 +108,19 @@ impl AmfApp {
 
     /// Load configuration from YAML file
     async fn load_config(&self, config_path: &str) -> Result<()> {
-        log::info!("Loading configuration from: {}", config_path);
+        log::info!("Loading configuration from: {config_path}");
 
         // Read and parse YAML file
         let config_content = match std::fs::read_to_string(config_path) {
             Ok(content) => content,
             Err(e) => {
-                log::warn!("Could not read config file '{}': {}. Using defaults.", config_path, e);
+                log::warn!("Could not read config file '{config_path}': {e}. Using defaults.");
                 return Ok(());
             }
         };
 
         let yaml: Value = serde_yaml::from_str(&config_content)
-            .map_err(|e| anyhow::anyhow!("Failed to parse YAML config: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to parse YAML config: {e}"))?;
 
         // Get AMF section
         let amf_section = match yaml.get("amf") {
@@ -138,7 +138,7 @@ impl AmfApp {
             // Load AMF name
             if let Some(name) = amf_section.get("amf_name").and_then(|v| v.as_str()) {
                 ctx.amf_name = Some(name.to_string());
-                log::info!("AMF name: {}", name);
+                log::info!("AMF name: {name}");
             }
 
             // Load network name
@@ -321,7 +321,7 @@ impl AmfApp {
 
     /// Initialize NGAP server (async)
     pub async fn init_ngap(&mut self, ngap_addr: SocketAddr) -> Result<()> {
-        log::info!("Initializing NGAP server on {}...", ngap_addr);
+        log::info!("Initializing NGAP server on {ngap_addr}...");
 
         let event_tx = self.ngap_event_tx.take()
             .ok_or_else(|| anyhow::anyhow!("NGAP event sender already taken"))?;
@@ -332,7 +332,7 @@ impl AmfApp {
             event_tx,
         ).await?;
 
-        log::info!("NGAP server initialized on {}", ngap_addr);
+        log::info!("NGAP server initialized on {ngap_addr}");
         Ok(())
     }
 
@@ -353,7 +353,7 @@ impl AmfApp {
                     // No message available
                 }
                 Err(e) => {
-                    log::warn!("NGAP poll error: {}", e);
+                    log::warn!("NGAP poll error: {e}");
                 }
             }
 

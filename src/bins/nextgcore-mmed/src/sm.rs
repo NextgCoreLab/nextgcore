@@ -325,7 +325,7 @@ impl EmmFsm {
                             // Handle identity request retransmission
                         }
                         _ => {
-                            log::error!("Unknown timer {:?} in de-registered state", timer_id);
+                            log::error!("Unknown timer {timer_id:?} in de-registered state");
                         }
                     }
                 }
@@ -365,7 +365,7 @@ impl EmmFsm {
                             self.transition(EmmState::DeRegistered);
                         }
                         _ => {
-                            log::error!("Unknown timer {:?} in registered state", timer_id);
+                            log::error!("Unknown timer {timer_id:?} in registered state");
                         }
                     }
                 }

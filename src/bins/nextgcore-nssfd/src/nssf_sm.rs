@@ -131,8 +131,8 @@ impl NssfSmContext {
         };
 
         if api_version != expected_version {
-            log::error!("Not supported version [{}], expected [{}]", api_version, expected_version);
-            send_error_response(stream_id, 400, &format!("Unsupported API version: {}", api_version));
+            log::error!("Not supported version [{api_version}], expected [{expected_version}]");
+            send_error_response(stream_id, 400, &format!("Unsupported API version: {api_version}"));
             return;
         }
 
@@ -145,8 +145,8 @@ impl NssfSmContext {
                 self.handle_nnssf_nsselection_request(event, &method, &resource_components, stream_id);
             }
             _ => {
-                log::error!("Invalid API name [{}]", service_name);
-                send_error_response(stream_id, 400, &format!("Invalid API name: {}", service_name));
+                log::error!("Invalid API name [{service_name}]");
+                send_error_response(stream_id, 400, &format!("Invalid API name: {service_name}"));
             }
         }
     }
@@ -162,7 +162,7 @@ impl NssfSmContext {
                     // This is handled by the nnrf integration when NRF is enabled
                 }
                 _ => {
-                    log::error!("Invalid HTTP method [{}]", method);
+                    log::error!("Invalid HTTP method [{method}]");
                 }
             },
             _ => {
@@ -183,12 +183,12 @@ impl NssfSmContext {
         match resource {
             Some("network-slice-information") => match method {
                 "GET" => {
-                    log::debug!("NS selection GET request received (stream_id={})", stream_id);
+                    log::debug!("NS selection GET request received (stream_id={stream_id})");
                     // Note: nssf_nnrf_nsselection_handle_get_from_amf_or_vnssf handles slice selection
                     // The handler is invoked via the direct HTTP path in main.rs
                 }
                 _ => {
-                    log::error!("Invalid HTTP method [{}]", method);
+                    log::error!("Invalid HTTP method [{method}]");
                 }
             },
             _ => {
@@ -232,7 +232,7 @@ impl NssfSmContext {
         };
 
         if api_version != expected_version {
-            log::error!("Not supported version [{}]", api_version);
+            log::error!("Not supported version [{api_version}]");
             return;
         }
 
@@ -248,7 +248,7 @@ impl NssfSmContext {
                 self.handle_nnssf_nsselection_response(event, &resource_components);
             }
             _ => {
-                log::error!("Invalid API name [{}]", service_name);
+                log::error!("Invalid API name [{service_name}]");
             }
         }
     }
@@ -262,7 +262,7 @@ impl NssfSmContext {
                 // Note: Dispatch to NF instance FSM for registration handling
                 // This is handled by the nnrf integration when NRF is enabled
                 if let Some(ref nf_instance_id) = event.nf_instance_id {
-                    log::debug!("[{}] NF instance response", nf_instance_id);
+                    log::debug!("[{nf_instance_id}] NF instance response");
                 }
             }
             Some("subscriptions") => {
@@ -283,7 +283,7 @@ impl NssfSmContext {
             Some("nf-instances") => {
                 log::debug!("NF discover response received");
                 if let Some(sbi_xact_id) = event.sbi_xact_id {
-                    log::debug!("SBI xact ID: {}", sbi_xact_id);
+                    log::debug!("SBI xact ID: {sbi_xact_id}");
                     // Note: nssf_nnrf_handle_nf_discover processes NF discovery results
                     // This is handled by the nnrf integration when NRF is enabled
                 }
@@ -310,8 +310,7 @@ impl NssfSmContext {
 
             if let Some((mcc, mnc, sst)) = home_info {
                 log::debug!(
-                    "NS selection response for home (plmn={}{}, sst={})",
-                    mcc, mnc, sst
+                    "NS selection response for home (plmn={mcc}{mnc}, sst={sst})"
                 );
                 // Note: nssf_nnrf_nsselection_handle_get_from_hnssf handles H-NSSF response
                 // This is invoked when V-NSSF receives slice info from H-NSSF
@@ -337,7 +336,7 @@ impl NssfSmContext {
             | NssfTimerId::NfInstanceNoHeartbeat
             | NssfTimerId::NfInstanceValidity => {
                 if let Some(ref nf_instance_id) = event.nf_instance_id {
-                    log::debug!("[{}] NF instance timer: {:?}", nf_instance_id, timer_id);
+                    log::debug!("[{nf_instance_id}] NF instance timer: {timer_id:?}");
                     // Update NF instance load
                     let _load = get_nsi_load();
                     // Note: Dispatch to NF FSM for timer handling
@@ -346,14 +345,14 @@ impl NssfSmContext {
             }
             NssfTimerId::SubscriptionValidity => {
                 if let Some(ref subscription_id) = event.subscription_id {
-                    log::error!("[{}] Subscription validity expired", subscription_id);
+                    log::error!("[{subscription_id}] Subscription validity expired");
                     // Note: Send new subscription and remove old one
                     // This is handled by the nnrf integration when NRF is enabled
                 }
             }
             NssfTimerId::SubscriptionPatch => {
                 if let Some(ref subscription_id) = event.subscription_id {
-                    log::info!("[{}] Need to update Subscription", subscription_id);
+                    log::info!("[{subscription_id}] Need to update Subscription");
                     // Note: Send subscription update to NRF
                     // This is handled by the nnrf integration when NRF is enabled
                 }

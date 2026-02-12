@@ -131,8 +131,8 @@ impl BsfSmContext {
 
         // Check API version (BSF uses v1)
         if api_version != "v1" {
-            log::error!("Not supported version [{}], expected [v1]", api_version);
-            send_error_response(stream_id, 400, &format!("Unsupported API version: {}", api_version));
+            log::error!("Not supported version [{api_version}], expected [v1]");
+            send_error_response(stream_id, 400, &format!("Unsupported API version: {api_version}"));
             return;
         }
 
@@ -145,8 +145,8 @@ impl BsfSmContext {
                 self.handle_nbsf_management_request(event, &method, &resource_components, stream_id);
             }
             _ => {
-                log::error!("Invalid API name [{}]", service_name);
-                send_error_response(stream_id, 400, &format!("Invalid API name: {}", service_name));
+                log::error!("Invalid API name [{service_name}]");
+                send_error_response(stream_id, 400, &format!("Invalid API name: {service_name}"));
             }
         }
     }
@@ -162,7 +162,7 @@ impl BsfSmContext {
                     // This is handled by the NRF handler when NRF integration is enabled
                 }
                 _ => {
-                    log::error!("Invalid HTTP method [{}]", method);
+                    log::error!("Invalid HTTP method [{method}]");
                 }
             },
             _ => {
@@ -187,8 +187,7 @@ impl BsfSmContext {
                 
                 if let Some(binding_id) = binding_id {
                     // Operations on existing binding
-                    log::debug!("PCF binding operation: {} on binding_id={} (stream_id={})", 
-                        method, binding_id, stream_id);
+                    log::debug!("PCF binding operation: {method} on binding_id={binding_id} (stream_id={stream_id})");
                     
                     let ctx = bsf_self();
                     let sess = {
@@ -200,42 +199,42 @@ impl BsfSmContext {
                     };
 
                     if sess.is_none() {
-                        log::error!("Session not found for binding_id={}", binding_id);
-                        send_not_found_response(stream_id, &format!("PCF binding not found: {}", binding_id));
+                        log::error!("Session not found for binding_id={binding_id}");
+                        send_not_found_response(stream_id, &format!("PCF binding not found: {binding_id}"));
                         return;
                     }
 
                     match method {
                         "DELETE" => {
-                            log::debug!("DELETE PCF binding: {}", binding_id);
+                            log::debug!("DELETE PCF binding: {binding_id}");
                             // Note: nbsf_handler::handle_pcf_binding_delete handles actual deletion
                             // The handler is invoked via the direct HTTP path in main.rs
                         }
                         "PATCH" => {
-                            log::debug!("PATCH PCF binding: {}", binding_id);
+                            log::debug!("PATCH PCF binding: {binding_id}");
                             // Note: nbsf_handler::handle_pcf_binding_patch handles updates
                             // The handler is invoked via the direct HTTP path in main.rs
                         }
                         _ => {
-                            log::error!("Invalid HTTP method [{}]", method);
+                            log::error!("Invalid HTTP method [{method}]");
                         }
                     }
                 } else {
                     // Operations without binding_id
                     match method {
                         "POST" => {
-                            log::debug!("POST PCF binding (stream_id={})", stream_id);
+                            log::debug!("POST PCF binding (stream_id={stream_id})");
                             // Note: nbsf_handler::handle_pcf_binding_post creates new bindings
                             // The handler is invoked via the direct HTTP path in main.rs
                             event.sess_id = None; // Will be set by handler
                         }
                         "GET" => {
-                            log::debug!("GET PCF binding (stream_id={})", stream_id);
+                            log::debug!("GET PCF binding (stream_id={stream_id})");
                             // Note: nbsf_handler::handle_pcf_binding_get retrieves bindings
                             // The handler is invoked via the direct HTTP path in main.rs
                         }
                         _ => {
-                            log::error!("Invalid HTTP method [{}]", method);
+                            log::error!("Invalid HTTP method [{method}]");
                         }
                     }
                 }
@@ -275,7 +274,7 @@ impl BsfSmContext {
 
         // Check API version
         if api_version != "v1" {
-            log::error!("Not supported version [{}]", api_version);
+            log::error!("Not supported version [{api_version}]");
             return;
         }
 
@@ -288,7 +287,7 @@ impl BsfSmContext {
                 self.handle_nnrf_disc_response(event, &resource_components);
             }
             _ => {
-                log::error!("Invalid service name [{}]", service_name);
+                log::error!("Invalid service name [{service_name}]");
             }
         }
     }
@@ -302,7 +301,7 @@ impl BsfSmContext {
                 // Note: Dispatch to NF instance FSM for registration/deregistration handling
                 // This is handled by the nnrf_handler module when NRF integration is enabled
                 if let Some(ref nf_instance_id) = event.nf_instance_id {
-                    log::debug!("[{}] NF instance response", nf_instance_id);
+                    log::debug!("[{nf_instance_id}] NF instance response");
                 }
             }
             Some("subscriptions") => {
@@ -323,7 +322,7 @@ impl BsfSmContext {
             Some("nf-instances") => {
                 log::debug!("NF discover response received");
                 if let Some(sbi_xact_id) = event.sbi_xact_id {
-                    log::debug!("SBI xact ID: {}", sbi_xact_id);
+                    log::debug!("SBI xact ID: {sbi_xact_id}");
                     // Note: bsf_nnrf_handle_nf_discover processes NF discovery results
                     // This is handled by the nnrf_handler module when NRF integration is enabled
                 }
@@ -349,7 +348,7 @@ impl BsfSmContext {
             | BsfTimerId::NfInstanceNoHeartbeat
             | BsfTimerId::NfInstanceValidity => {
                 if let Some(ref nf_instance_id) = event.nf_instance_id {
-                    log::debug!("[{}] NF instance timer: {:?}", nf_instance_id, timer_id);
+                    log::debug!("[{nf_instance_id}] NF instance timer: {timer_id:?}");
                     // Update NF instance load
                     let _load = get_sess_load();
                     // Note: Dispatch to NF FSM for timer handling
@@ -358,14 +357,14 @@ impl BsfSmContext {
             }
             BsfTimerId::SubscriptionValidity => {
                 if let Some(ref subscription_id) = event.subscription_id {
-                    log::error!("[{}] Subscription validity expired", subscription_id);
+                    log::error!("[{subscription_id}] Subscription validity expired");
                     // Note: Send new subscription and remove old one
                     // This is handled by the nnrf_handler module when NRF integration is enabled
                 }
             }
             BsfTimerId::SubscriptionPatch => {
                 if let Some(ref subscription_id) = event.subscription_id {
-                    log::info!("[{}] Need to update Subscription", subscription_id);
+                    log::info!("[{subscription_id}] Need to update Subscription");
                     // Note: Send subscription update to NRF
                     // This is handled by the nnrf_handler module when NRF integration is enabled
                 }

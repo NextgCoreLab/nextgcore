@@ -25,3 +25,6 @@ ctrlc = { workspace = true, features = ["termination"] }
 
 [dev-dependencies]
 proptest.workspace = true
+
+[lints]
+workspace = true

@@ -575,10 +575,10 @@ bool_0: 0
             
             match key {
                 "bool_true" | "bool_yes" | "bool_1" => {
-                    assert!(child.bool_value(), "Expected true for {}", key);
+                    assert!(child.bool_value(), "Expected true for {key}");
                 }
                 "bool_false" | "bool_no" | "bool_0" => {
-                    assert!(!child.bool_value(), "Expected false for {}", key);
+                    assert!(!child.bool_value(), "Expected false for {key}");
                 }
                 _ => {}
             }

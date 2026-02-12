@@ -157,12 +157,12 @@ impl DistTimerEntry {
 
     /// Time until next fire (None if not active).
     pub fn time_until_fire(&self) -> Option<Duration> {
-        self.next_fire.and_then(|next| {
+        self.next_fire.map(|next| {
             let now = Instant::now();
             if next > now {
-                Some(next - now)
+                next - now
             } else {
-                Some(Duration::ZERO)
+                Duration::ZERO
             }
         })
     }

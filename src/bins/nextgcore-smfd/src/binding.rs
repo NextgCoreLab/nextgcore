@@ -780,9 +780,9 @@ pub fn encode_traffic_flow_template(
         }
         
         let mut tft_pf = TftPacketFilter {
-            identifier: pf.identifier.saturating_sub(1) as u8,
+            identifier: pf.identifier.saturating_sub(1),
             direction: pf.direction as u8,
-            precedence: pf.precedence.saturating_sub(1) as u8,
+            precedence: pf.precedence.saturating_sub(1),
             content: PacketFilterContent::default(),
         };
         

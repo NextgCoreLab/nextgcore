@@ -256,7 +256,7 @@ impl QosProfileDecoded {
                 profile.traffic_handling_priority = 3;
                 profile.delay_class = 3;
             }
-            9 | _ => {
+            _ => {
                 // Default bearer / Best Effort
                 profile.traffic_class = traffic_class::BACKGROUND;
                 profile.delay_class = 4;

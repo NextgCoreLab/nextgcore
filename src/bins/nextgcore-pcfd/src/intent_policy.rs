@@ -151,7 +151,7 @@ impl IntentPolicyTranslator {
 
         let policy = GeneratedPolicy {
             intent_id: intent.id,
-            five_qi: five_qi,
+            five_qi,
             arp_priority: arp,
             mbr_dl_kbps: mbr_dl,
             mbr_ul_kbps: mbr_ul,

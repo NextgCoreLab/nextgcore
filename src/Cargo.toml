@@ -155,6 +155,40 @@ ogs-ipfw = { path = "libs/ogs-ipfw" }
 ogs-tun = { path = "libs/ogs-tun" }
 ogs-ffi = { path = "libs/ogs-ffi" }
 
+# Workspace-wide lint configuration
+# 3GPP protocol implementations naturally have many parameters and complex types.
+[workspace.lints.clippy]
+# Protocol implementations naturally have many parameters and complex types
+too_many_arguments = "allow"
+type_complexity = "allow"
+# Protocol codecs use specific initialization and construction patterns
+field_reassign_with_default = "allow"
+vec_init_then_push = "allow"
+# ASN.1 codecs use transmute for type punning
+missing_transmute_annotations = "allow"
+# Build scripts use PathBuf parameters
+ptr_arg = "allow"
+# Protocol methods may shadow std trait names (from_str, next, default)
+should_implement_trait = "allow"
+# Protocol enums may have common prefixes
+enum_variant_names = "allow"
+# Iterator patterns in low-level codec/crypto code
+needless_range_loop = "allow"
+# Manual prefix stripping in protocol parsers
+manual_strip = "allow"
+# Some match arms have identical fallthrough behavior
+if_same_then_else = "allow"
+# Protocol drop patterns
+drop_non_drop = "allow"
+# Collapsible match/if patterns in state machines
+collapsible_match = "allow"
+
+[workspace.lints.rust]
+# SCTP feature flag used in conditional compilation
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("sctp"))'] }
+# Future-use code for Rel-17/18/20 features
+dead_code = "allow"
+
 [profile.release]
 opt-level = 3
 lto = true

@@ -184,7 +184,7 @@ impl PcfAmSmContext {
             }
             _ => {
                 log::error!("[{}] Invalid HTTP method [{}]", pcf_ue_am.supi, method);
-                send_error_response(stream_id, 405, &format!("Method not allowed: {}", method));
+                send_error_response(stream_id, 405, &format!("Method not allowed: {method}"));
             }
         }
     }
@@ -246,7 +246,7 @@ impl PcfAmSmContext {
                     } else {
                         log::error!("[{}] HTTP response error [{}]", pcf_ue_am.supi, status);
                     }
-                    send_error_response(0, status, &format!("UDR query failed: {}", status));
+                    send_error_response(0, status, &format!("UDR query failed: {status}"));
                     return;
                 }
                 // Note: pcf_nudr_dr_handle_query_am_data processes AM subscription data from UDR

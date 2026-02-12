@@ -612,7 +612,7 @@ fn is_supi_in_vplmn(supi: &str) -> bool {
     // In C: This checks if the SUPI's PLMN ID matches the local PLMN ID
     // Note: Proper VPLMN detection requires configuration of local PLMN ID
     // For now, return false (assume home PLMN)
-    log::trace!("Checking if SUPI {} is in VPLMN", supi);
+    log::trace!("Checking if SUPI {supi} is in VPLMN");
     false
 }
 

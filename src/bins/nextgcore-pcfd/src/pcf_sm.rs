@@ -132,8 +132,8 @@ impl PcfSmContext {
 
         // Check API version
         if api_version != "v1" {
-            log::error!("Not supported version [{}]", api_version);
-            send_error_response(stream_id, 400, &format!("Unsupported API version: {}", api_version));
+            log::error!("Not supported version [{api_version}]");
+            send_error_response(stream_id, 400, &format!("Unsupported API version: {api_version}"));
             return;
         }
 
@@ -152,8 +152,8 @@ impl PcfSmContext {
                 self.handle_policyauthorization_request(event, &method, &resource_components, stream_id);
             }
             _ => {
-                log::error!("Invalid API name [{}]", service_name);
-                send_error_response(stream_id, 400, &format!("Invalid API name: {}", service_name));
+                log::error!("Invalid API name [{service_name}]");
+                send_error_response(stream_id, 400, &format!("Invalid API name: {service_name}"));
             }
         }
     }
@@ -169,7 +169,7 @@ impl PcfSmContext {
                     // This is handled by the nnrf integration when NRF is enabled
                 }
                 _ => {
-                    log::error!("Invalid HTTP method [{}]", method);
+                    log::error!("Invalid HTTP method [{method}]");
                 }
             },
             _ => {
@@ -208,7 +208,7 @@ impl PcfSmContext {
         let pcf_ue_am = match pcf_ue_am {
             Some(ue) => ue,
             None => {
-                log::error!("Not found [{}]", method);
+                log::error!("Not found [{method}]");
                 send_not_found_response(stream_id, "AM policy association not found");
                 return;
             }
@@ -300,7 +300,7 @@ impl PcfSmContext {
         let sess = match sess {
             Some(s) => s,
             None => {
-                log::error!("Not found [{}]", method);
+                log::error!("Not found [{method}]");
                 send_user_unknown_response(stream_id);
                 return;
             }
@@ -360,7 +360,7 @@ impl PcfSmContext {
         let sess = match sess {
             Some(s) => s,
             None => {
-                log::error!("Not found [{}]", method);
+                log::error!("Not found [{method}]");
                 send_not_found_response(stream_id, "Policy authorization session not found");
                 return;
             }
@@ -423,7 +423,7 @@ impl PcfSmContext {
 
         // Check API version
         if api_version != "v1" {
-            log::error!("Not supported version [{}]", api_version);
+            log::error!("Not supported version [{api_version}]");
             return;
         }
 
@@ -442,7 +442,7 @@ impl PcfSmContext {
                 self.handle_nbsf_management_response(event, &resource_components);
             }
             _ => {
-                log::error!("Invalid API name [{}]", service_name);
+                log::error!("Invalid API name [{service_name}]");
             }
         }
     }
@@ -516,12 +516,12 @@ impl PcfSmContext {
                         }
                     }
                     _ => {
-                        log::error!("Invalid resource name [{:?}]", resource3);
+                        log::error!("Invalid resource name [{resource3:?}]");
                     }
                 }
             }
             _ => {
-                log::error!("Invalid resource name [{:?}]", resource);
+                log::error!("Invalid resource name [{resource:?}]");
             }
         }
     }
@@ -539,7 +539,7 @@ impl PcfSmContext {
                 }
             }
             _ => {
-                log::error!("Invalid resource name [{:?}]", resource);
+                log::error!("Invalid resource name [{resource:?}]");
             }
         }
     }
@@ -590,21 +590,21 @@ impl PcfSmContext {
             | PcfTimerId::NfInstanceNoHeartbeat
             | PcfTimerId::NfInstanceValidity => {
                 if let Some(ref nf_instance_id) = event.nf_instance_id {
-                    log::debug!("[{}] NF instance timer: {:?}", nf_instance_id, timer_id);
+                    log::debug!("[{nf_instance_id}] NF instance timer: {timer_id:?}");
                     // Note: Update NF instance load and dispatch to NF FSM
                     // This is handled by the nnrf integration when NRF is enabled
                 }
             }
             PcfTimerId::SubscriptionValidity => {
                 if let Some(ref subscription_id) = event.subscription_id {
-                    log::error!("[{}] Subscription validity expired", subscription_id);
+                    log::error!("[{subscription_id}] Subscription validity expired");
                     // Note: Send new subscription and remove old one
                     // This is handled by the nnrf integration when NRF is enabled
                 }
             }
             PcfTimerId::SubscriptionPatch => {
                 if let Some(ref subscription_id) = event.subscription_id {
-                    log::info!("[{}] Need to update Subscription", subscription_id);
+                    log::info!("[{subscription_id}] Need to update Subscription");
                     // Note: Send subscription update to NRF
                     // This is handled by the nnrf integration when NRF is enabled
                 }

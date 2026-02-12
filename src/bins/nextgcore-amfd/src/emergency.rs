@@ -143,6 +143,12 @@ pub struct EmergencyHandler {
     emergency_count: u64,
 }
 
+impl Default for EmergencyHandler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EmergencyHandler {
     /// Creates a new emergency handler
     pub fn new() -> Self {

@@ -492,7 +492,7 @@ pub fn build_epc_deactivation_request(
             Some((header, builder.build()))
         }
         _ => {
-            log::error!("Invalid GTP-Cause[{}]", gtp_cause);
+            log::error!("Invalid GTP-Cause[{gtp_cause}]");
             None
         }
     }

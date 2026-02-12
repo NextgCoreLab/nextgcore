@@ -26,10 +26,10 @@ impl std::fmt::Display for SgsapError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidMessageFormat => write!(f, "Invalid message format"),
-            Self::UnknownMessageType(t) => write!(f, "Unknown message type: {}", t),
-            Self::MandatoryIeMissing(ie) => write!(f, "Mandatory IE missing: {}", ie),
-            Self::InvalidIeValue(ie) => write!(f, "Invalid IE value: {}", ie),
-            Self::ParseError(msg) => write!(f, "Parse error: {}", msg),
+            Self::UnknownMessageType(t) => write!(f, "Unknown message type: {t}"),
+            Self::MandatoryIeMissing(ie) => write!(f, "Mandatory IE missing: {ie}"),
+            Self::InvalidIeValue(ie) => write!(f, "Invalid IE value: {ie}"),
+            Self::ParseError(msg) => write!(f, "Parse error: {msg}"),
         }
     }
 }

@@ -181,7 +181,7 @@ impl AmfFsm {
     fn handle_ngap_message(&mut self, event: &AmfEvent) -> AmfFsmResult {
         if let Some(ref ngap) = event.ngap {
             if let Some(gnb_id) = ngap.gnb_id {
-                log::debug!("NGAP Message from gNB {}", gnb_id);
+                log::debug!("NGAP Message from gNB {gnb_id}");
                 // Note: Decode NGAP message and dispatch to appropriate handler
                 // NGAP message decoding and dispatch handled by ngap_handler module:
                 // - NG Setup Request/Response -> ngap_sm
@@ -206,7 +206,7 @@ impl AmfFsm {
                 AmfTimerId::NgHolding => {
                     // Handle NG holding timer expiry
                     if let Some(ran_ue_id) = event.ran_ue_id {
-                        log::debug!("NG Holding timer expired for RAN UE {}", ran_ue_id);
+                        log::debug!("NG Holding timer expired for RAN UE {ran_ue_id}");
                     }
                     AmfFsmResult::Handled
                 }

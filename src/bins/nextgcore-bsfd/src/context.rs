@@ -3,6 +3,7 @@
 //! Port of src/bsf/context.c - BSF context with session management and IP address hashing
 
 use std::collections::HashMap;
+use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -32,7 +33,7 @@ impl SNssai {
 
     /// Convert SD to string representation
     pub fn sd_to_string(&self) -> Option<String> {
-        self.sd.map(|sd| format!("{:06X}", sd))
+        self.sd.map(|sd| format!("{sd:06X}"))
     }
 
     /// Parse SD from string
@@ -73,17 +74,19 @@ impl Ipv6Prefix {
         })
     }
 
-    pub fn to_string(&self) -> String {
-        let addr = Ipv6Addr::from(self.addr6);
-        format!("{}/{}", addr, self.len)
-    }
-
     /// Get hash key bytes (prefix length / 8 + 1 bytes)
     pub fn hash_key(&self) -> Vec<u8> {
         let key_len = (self.len as usize >> 3) + 1;
         let mut key = vec![self.len];
         key.extend_from_slice(&self.addr6[..key_len.min(16)]);
         key
+    }
+}
+
+impl fmt::Display for Ipv6Prefix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let addr = Ipv6Addr::from(self.addr6);
+        write!(f, "{addr}/{}", self.len)
     }
 }
 
@@ -164,7 +167,7 @@ impl BsfSess {
                 true
             }
             Err(_) => {
-                log::error!("Failed to parse IPv4 address: {}", ipv4addr_string);
+                log::error!("Failed to parse IPv4 address: {ipv4addr_string}");
                 false
             }
         }
@@ -179,7 +182,7 @@ impl BsfSess {
                 true
             }
             None => {
-                log::error!("Failed to parse IPv6 prefix: {}", ipv6prefix_string);
+                log::error!("Failed to parse IPv6 prefix: {ipv6prefix_string}");
                 false
             }
         }
@@ -232,7 +235,7 @@ impl BsfContext {
         }
         self.max_num_of_sess = max_sess;
         self.initialized.store(true, Ordering::SeqCst);
-        log::info!("BSF context initialized with max {} sessions", max_sess);
+        log::info!("BSF context initialized with max {max_sess} sessions");
     }
 
     pub fn fini(&mut self) {
@@ -293,8 +296,7 @@ impl BsfContext {
         }
 
         sess_list.insert(id, sess.clone());
-        log::debug!("BSF session added (id={}, ipv4={:?}, ipv6={:?})", 
-            id, ipv4addr_string, ipv6prefix_string);
+        log::debug!("BSF session added (id={id}, ipv4={ipv4addr_string:?}, ipv6={ipv6prefix_string:?})");
         
         Some(sess)
     }
@@ -312,7 +314,7 @@ impl BsfContext {
             if let (Ok(mut hash), Some(ref prefix)) = (self.ipv6prefix_hash.write(), &sess.ipv6prefix) {
                 hash.remove(&prefix.hash_key());
             }
-            log::debug!("BSF session removed (id={})", id);
+            log::debug!("BSF session removed (id={id})");
             return Some(sess);
         }
         None
@@ -412,14 +414,14 @@ impl BsfContext {
     /// Persist a session binding to the database (if available)
     pub fn sess_persist(&self, sess: &BsfSess) {
         if let Err(e) = bsf_db_upsert_binding(sess) {
-            log::debug!("DB persistence unavailable, binding in-memory only: {}", e);
+            log::debug!("DB persistence unavailable, binding in-memory only: {e}");
         }
     }
 
     /// Remove a session binding from the database (if available)
     pub fn sess_unpersist(&self, binding_id: &str) {
         if let Err(e) = bsf_db_delete_binding(binding_id) {
-            log::debug!("DB persistence unavailable for delete: {}", e);
+            log::debug!("DB persistence unavailable for delete: {e}");
         }
     }
 
@@ -447,7 +449,7 @@ impl BsfContext {
                 log::info!("Loaded persisted BSF bindings from database");
             }
             Err(e) => {
-                log::debug!("No persisted bindings loaded (DB unavailable): {}", e);
+                log::debug!("No persisted bindings loaded (DB unavailable): {e}");
             }
         }
     }
@@ -513,7 +515,7 @@ fn bsf_db_delete_binding(binding_id: &str) -> DbiResult<()> {
     let collection = get_bsf_bindings_collection()?;
     let filter = ogs_dbi::mongodb::bson::doc! { "binding_id": binding_id };
     collection.delete_one(filter, None)?;
-    log::debug!("BSF binding {} removed from DB", binding_id);
+    log::debug!("BSF binding {binding_id} removed from DB");
     Ok(())
 }
 
@@ -702,7 +704,7 @@ mod tests {
 
         // Add 10 sessions
         for i in 0..10 {
-            ctx.sess_add_by_ip_address(Some(&format!("192.168.1.{}", i)), None);
+            ctx.sess_add_by_ip_address(Some(&format!("192.168.1.{i}")), None);
         }
 
         assert_eq!(ctx.get_sess_load(), 10); // 10/100 = 10%

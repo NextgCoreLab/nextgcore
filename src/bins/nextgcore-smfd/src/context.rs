@@ -1091,7 +1091,7 @@ impl SmfContext {
         supi_hash.insert(supi.to_string(), id);
         smf_ue_list.insert(id, ue.clone());
 
-        log::info!("[Added] SMF UE by SUPI [{}] (id={})", supi, id);
+        log::info!("[Added] SMF UE by SUPI [{supi}] (id={id})");
         Some(ue)
     }
 
@@ -1151,7 +1151,7 @@ impl SmfContext {
                 imsi_hash.remove(&ue.imsi);
             }
 
-            log::info!("[Removed] SMF UE (id={})", id);
+            log::info!("[Removed] SMF UE (id={id})");
             return Some(ue);
         }
         None
@@ -1253,8 +1253,8 @@ impl SmfContext {
         sess.psi = psi;
         sess.smf_n4_seid = n4_seid;
         sess.smf_n4_teid = n4_seid as u32;
-        sess.sm_context_ref = Some(format!("{}", index));
-        sess.pdu_session_ref = Some(format!("{}", index));
+        sess.sm_context_ref = Some(format!("{index}"));
+        sess.pdu_session_ref = Some(format!("{index}"));
         sess.charging.id = index;
 
         smf_n4_seid_hash.insert(n4_seid, id);
@@ -1265,7 +1265,7 @@ impl SmfContext {
             ue.sess_ids.push(id);
         }
 
-        log::debug!("[ue_id={}, psi={}] SMF session added (id={}, seid={})", smf_ue_id, psi, id, n4_seid);
+        log::debug!("[ue_id={smf_ue_id}, psi={psi}] SMF session added (id={id}, seid={n4_seid})");
         Some(sess)
     }
 
@@ -1300,7 +1300,7 @@ impl SmfContext {
             ue.sess_ids.push(id);
         }
 
-        log::debug!("[ue_id={}, apn={}] SMF session added (id={}, seid={})", smf_ue_id, apn, id, n4_seid);
+        log::debug!("[ue_id={smf_ue_id}, apn={apn}] SMF session added (id={id}, seid={n4_seid})");
         Some(sess)
     }
 
@@ -1538,7 +1538,7 @@ impl SmfContext {
             sess.bearer_ids.push(id);
         }
 
-        log::debug!("[sess_id={}] QoS flow added (id={})", sess_id, id);
+        log::debug!("[sess_id={sess_id}] QoS flow added (id={id})");
         Some(bearer)
     }
 
@@ -1562,7 +1562,7 @@ impl SmfContext {
                 sess.bearer_ids.retain(|&bid| bid != id);
             }
 
-            log::debug!("Bearer removed (id={})", id);
+            log::debug!("Bearer removed (id={id})");
             return Some(bearer);
         }
         None
@@ -1684,7 +1684,7 @@ impl SmfContext {
             bearer.pf_ids.push(id);
         }
 
-        log::debug!("[bearer_id={}] PF added (id={})", bearer_id, id);
+        log::debug!("[bearer_id={bearer_id}] PF added (id={id})");
         Some(pf)
     }
 
@@ -1699,7 +1699,7 @@ impl SmfContext {
                 bearer.pf_ids.retain(|&pid| pid != id);
             }
 
-            log::debug!("PF removed (id={})", id);
+            log::debug!("PF removed (id={id})");
             return Some(pf);
         }
         None

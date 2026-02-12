@@ -491,7 +491,7 @@ impl SgwcContext {
             }
             sgw_s11_teid_hash.remove(&ue.sgw_s11_teid);
 
-            log::info!("[Removed] SGWC UE (id={})", id);
+            log::info!("[Removed] SGWC UE (id={id})");
             return Some(ue);
         }
         None
@@ -575,7 +575,7 @@ impl SgwcContext {
             }
         }
 
-        log::info!("[Added] SGWC Session APN[{}] (id={}, seid={})", apn, id, seid);
+        log::info!("[Added] SGWC Session APN[{apn}] (id={id}, seid={seid})");
         Some(sess)
     }
 
@@ -597,7 +597,7 @@ impl SgwcContext {
                 }
             }
 
-            log::info!("[Removed] SGWC Session (id={})", id);
+            log::info!("[Removed] SGWC Session (id={id})");
             return Some(sess);
         }
         None
@@ -697,7 +697,7 @@ impl SgwcContext {
         self.tunnel_add(id, gtp_interface::S5_S8_SGW_GTP_U);
         self.tunnel_add(id, gtp_interface::S1_U_SGW_GTP_U);
 
-        log::debug!("[Added] SGWC Bearer (id={})", id);
+        log::debug!("[Added] SGWC Bearer (id={id})");
         Some(bearer)
     }
 
@@ -716,7 +716,7 @@ impl SgwcContext {
                 }
             }
 
-            log::debug!("[Removed] SGWC Bearer (id={})", id);
+            log::debug!("[Removed] SGWC Bearer (id={id})");
             return Some(bearer);
         }
         None
@@ -803,7 +803,7 @@ impl SgwcContext {
             }
         }
 
-        log::debug!("[Added] SGWC Tunnel (id={}, type={})", id, interface_type);
+        log::debug!("[Added] SGWC Tunnel (id={id}, type={interface_type})");
         Some(tunnel)
     }
 
@@ -819,7 +819,7 @@ impl SgwcContext {
                 }
             }
 
-            log::debug!("[Removed] SGWC Tunnel (id={})", id);
+            log::debug!("[Removed] SGWC Tunnel (id={id})");
             return Some(tunnel);
         }
         None

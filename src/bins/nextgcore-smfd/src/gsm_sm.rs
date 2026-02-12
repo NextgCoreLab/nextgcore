@@ -194,14 +194,13 @@ impl GsmFsm {
         if let Some(ref sbi) = event.sbi {
             if let Some(ref message) = sbi.message {
                 // Check service name and resource
-                if message.service_name == "nsmf-pdusession" {
-                    if message.resource_components.first().map(|s| s.as_str()) == Some("sm-contexts") {
+                if message.service_name == "nsmf-pdusession"
+                    && message.resource_components.first().map(|s| s.as_str()) == Some("sm-contexts") {
                         log::debug!("GSM: SM Context Create");
                         // For home-routed roaming in V-SMF, go directly to PFCP establishment
                         // Otherwise, go to SM policy association
                         return GsmFsmResult::Transition(GsmState::Wait5gcSmPolicyAssociation);
                     }
-                }
             }
         }
         GsmFsmResult::Handled
@@ -297,7 +296,7 @@ impl GsmFsm {
                             log::debug!("UDM SDM response OK");
                             return GsmFsmResult::Handled;
                         } else {
-                            log::error!("UDM SDM response error: {}", status);
+                            log::error!("UDM SDM response error: {status}");
                             return GsmFsmResult::Transition(GsmState::Exception);
                         }
                     }
@@ -308,7 +307,7 @@ impl GsmFsm {
                             log::debug!("PCF SM policy created, transitioning to PFCP establishment");
                             return GsmFsmResult::Transition(GsmState::WaitPfcpEstablishment);
                         } else {
-                            log::error!("PCF SM policy error: {}", status);
+                            log::error!("PCF SM policy error: {status}");
                             return GsmFsmResult::Transition(GsmState::N1N2Reject5gc);
                         }
                     }
@@ -388,7 +387,7 @@ impl GsmFsm {
                         // UPDATE_REQUEST
                         let result_code = diameter.result_code.unwrap_or(0);
                         if result_code != 2001 {
-                            log::warn!("Gy CCA-Update failed: {}", result_code);
+                            log::warn!("Gy CCA-Update failed: {result_code}");
                             return GsmFsmResult::Transition(GsmState::WaitPfcpDeletion);
                         }
                     }

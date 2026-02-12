@@ -381,8 +381,8 @@ impl SgwuContext {
     /// Update session in context
     pub fn sess_update(&self, sess: &SgwuSess) -> bool {
         if let Ok(mut sess_list) = self.sess_list.write() {
-            if sess_list.contains_key(&sess.id) {
-                sess_list.insert(sess.id, sess.clone());
+            if let std::collections::hash_map::Entry::Occupied(mut e) = sess_list.entry(sess.id) {
+                e.insert(sess.clone());
                 return true;
             }
         }
@@ -446,7 +446,7 @@ pub fn sgwu_self() -> &'static SgwuContext {
 /// Initialize the global SGWU context
 pub fn sgwu_context_init(max_sess: usize) {
     let _ctx = SGWU_CONTEXT.get_or_init(SgwuContext::new);
-    log::info!("SGWU context initialized with max {} sessions", max_sess);
+    log::info!("SGWU context initialized with max {max_sess} sessions");
 }
 
 /// Finalize the global SGWU context

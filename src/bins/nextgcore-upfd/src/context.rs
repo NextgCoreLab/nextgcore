@@ -244,6 +244,7 @@ impl RouteTrie {
 /// URR (Usage Reporting Rule) accounting data
 /// Port of upf_sess_urr_acc_t from context.h
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct UrrAccounting {
     /// Reporting enabled
     pub reporting_enabled: bool,
@@ -283,24 +284,6 @@ pub struct UrrAccountingSnapshot {
     pub timestamp: Option<Instant>,
 }
 
-impl Default for UrrAccounting {
-    fn default() -> Self {
-        Self {
-            reporting_enabled: false,
-            report_seqn: 0,
-            total_octets: 0,
-            ul_octets: 0,
-            dl_octets: 0,
-            total_pkts: 0,
-            ul_pkts: 0,
-            dl_pkts: 0,
-            time_of_first_packet: None,
-            time_of_last_packet: None,
-            time_start: None,
-            last_report: UrrAccountingSnapshot::default(),
-        }
-    }
-}
 
 impl UrrAccounting {
     /// Add traffic to accounting
@@ -704,7 +687,7 @@ impl UpfContext {
                 }
             }
 
-            log::info!("[Removed] UPF Session (id={})", id);
+            log::info!("[Removed] UPF Session (id={id})");
             return Some(sess);
         }
         None
@@ -879,8 +862,8 @@ impl UpfContext {
     /// Update session in context
     pub fn sess_update(&self, sess: &UpfSess) -> bool {
         if let Ok(mut sess_list) = self.sess_list.write() {
-            if sess_list.contains_key(&sess.id) {
-                sess_list.insert(sess.id, sess.clone());
+            if let std::collections::hash_map::Entry::Occupied(mut e) = sess_list.entry(sess.id) {
+                e.insert(sess.clone());
                 return true;
             }
         }
@@ -912,7 +895,7 @@ pub fn upf_context_init(max_sess: usize) {
     let _ctx = UPF_CONTEXT.get_or_init(UpfContext::new);
     // Note: We can't mutate through OnceLock, so init is a no-op after first call
     // In real implementation, would use a different pattern
-    log::info!("UPF context initialized with max {} sessions", max_sess);
+    log::info!("UPF context initialized with max {max_sess} sessions");
 }
 
 /// Finalize the global UPF context

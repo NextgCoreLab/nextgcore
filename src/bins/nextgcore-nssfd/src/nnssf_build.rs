@@ -65,7 +65,7 @@ pub fn nssf_nnssf_nsselection_build_get(
     ];
 
     if let Some(sd) = snssai.sd {
-        query_params.push(format!("slice-info-request-for-pdu-session.sNssai.sd={:06x}", sd));
+        query_params.push(format!("slice-info-request-for-pdu-session.sNssai.sd={sd:06x}"));
     }
 
     query_params.push(format!(
@@ -82,11 +82,10 @@ pub fn nssf_nnssf_nsselection_build_get(
 
     let query_string = query_params.join("&");
     let uri = format!(
-        "/nnssf-nsselection/v2/network-slice-information?{}",
-        query_string
+        "/nnssf-nsselection/v2/network-slice-information?{query_string}"
     );
 
-    log::debug!("Built NS selection request: GET {}", uri);
+    log::debug!("Built NS selection request: GET {uri}");
 
     Some(PathSbiRequest {
         method: "GET".to_string(),

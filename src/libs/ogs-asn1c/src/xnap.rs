@@ -225,7 +225,7 @@ pub fn decode_xnap_procedure(data: &[u8]) -> PerResult<XnApProcedure> {
         4 => Ok(XnApProcedure::UeContextRelease),
         5 => Ok(XnApProcedure::HandoverCancel),
         10 => Ok(XnApProcedure::SNodeAddition),
-        _ => Err(PerError::DecodeError(format!("Unknown XnAP procedure: {}", code))),
+        _ => Err(PerError::DecodeError(format!("Unknown XnAP procedure: {code}"))),
     }
 }
 

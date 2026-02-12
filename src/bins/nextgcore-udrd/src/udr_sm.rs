@@ -166,8 +166,8 @@ impl UdrSmContext {
         // Check API version
         // In C: if (strcmp(message.h.api.version, OGS_SBI_API_V1) != 0)
         if api_version != "v1" {
-            log::error!("Not supported version [{}]", api_version);
-            log::warn!("[stream={}] Would send 400 Bad Request: Unsupported API version", stream_id);
+            log::error!("Not supported version [{api_version}]");
+            log::warn!("[stream={stream_id}] Would send 400 Bad Request: Unsupported API version");
             return;
         }
 
@@ -181,8 +181,8 @@ impl UdrSmContext {
                 self.handle_nudr_dr_request(event, &resource_components, stream_id);
             }
             _ => {
-                log::error!("Invalid API name [{}]", service_name);
-                log::warn!("[stream={}] Would send 400 Bad Request: Invalid service name", stream_id);
+                log::error!("Invalid API name [{service_name}]");
+                log::warn!("[stream={stream_id}] Would send 400 Bad Request: Invalid service name");
             }
         }
     }
@@ -203,14 +203,14 @@ impl UdrSmContext {
             Some("nf-status-notify") => {
                 log::debug!("NF status notify received");
                 // In C: ogs_nnrf_nfm_handle_nf_status_notify(stream, &message);
-                log::debug!("[stream={}] Would send 204 No Content", stream_id);
+                log::debug!("[stream={stream_id}] Would send 204 No Content");
             }
             _ => {
                 log::error!(
                     "Invalid resource name [{:?}]",
                     resource_components.first()
                 );
-                log::warn!("[stream={}] Would send 400 Bad Request: Invalid resource name", stream_id);
+                log::warn!("[stream={stream_id}] Would send 400 Bad Request: Invalid resource name");
             }
         }
     }
@@ -254,8 +254,8 @@ impl UdrSmContext {
                                 if method == "GET" {
                                     nudr_handler::handle_subscription_provisioned(event, stream_id);
                                 } else {
-                                    log::error!("Invalid HTTP method [{}]", method);
-                                    log::warn!("[stream={}] Would send 405 Method Not Allowed", stream_id);
+                                    log::error!("Invalid HTTP method [{method}]");
+                                    log::warn!("[stream={stream_id}] Would send 405 Method Not Allowed");
                                 }
                             }
                             _ => {
@@ -263,7 +263,7 @@ impl UdrSmContext {
                                     "Invalid resource name [{:?}]",
                                     resource_components.get(2)
                                 );
-                                log::warn!("[stream={}] Would send 400 Bad Request: Invalid resource name", stream_id);
+                                log::warn!("[stream={stream_id}] Would send 400 Bad Request: Invalid resource name");
                             }
                         }
                     }
@@ -278,7 +278,7 @@ impl UdrSmContext {
                     "Invalid resource name [{:?}]",
                     resource_components.first()
                 );
-                log::warn!("[stream={}] Would send 400 Bad Request: Invalid resource name", stream_id);
+                log::warn!("[stream={stream_id}] Would send 400 Bad Request: Invalid resource name");
             }
         }
     }
@@ -314,7 +314,7 @@ impl UdrSmContext {
 
         // Check API version
         if api_version != "v1" {
-            log::error!("Not supported version [{}]", api_version);
+            log::error!("Not supported version [{api_version}]");
             return;
         }
 
@@ -326,7 +326,7 @@ impl UdrSmContext {
                 self.handle_nnrf_nfm_response(&resource_components, res_status);
             }
             _ => {
-                log::error!("Invalid API name [{}]", service_name);
+                log::error!("Invalid API name [{service_name}]");
             }
         }
     }
@@ -350,7 +350,7 @@ impl UdrSmContext {
             }
             // In C: CASE(OGS_SBI_RESOURCE_NAME_SUBSCRIPTIONS)
             Some("subscriptions") => {
-                log::debug!("Subscriptions response received, status: {:?}", res_status);
+                log::debug!("Subscriptions response received, status: {res_status:?}");
                 // In C: Handle subscription response based on method
                 // POST: ogs_nnrf_nfm_handle_nf_status_subscribe
                 // PATCH: ogs_nnrf_nfm_handle_nf_status_update
@@ -387,7 +387,7 @@ impl UdrSmContext {
             | UdrTimerId::NfInstanceNoHeartbeat
             | UdrTimerId::NfInstanceValidity => {
                 if let Some(ref nf_instance_id) = event.nf_instance_id {
-                    log::debug!("[{}] NF instance timer: {:?}", nf_instance_id, timer_id);
+                    log::debug!("[{nf_instance_id}] NF instance timer: {timer_id:?}");
                     // In C: nf_instance = e->h.sbi.data;
                     // ogs_fsm_dispatch(&nf_instance->sm, e);
                     // if (OGS_FSM_CHECK(&nf_instance->sm, ogs_sbi_nf_state_exception))
@@ -398,7 +398,7 @@ impl UdrSmContext {
             // In C: case OGS_TIMER_SUBSCRIPTION_VALIDITY:
             UdrTimerId::SubscriptionValidity => {
                 if let Some(ref subscription_id) = event.subscription_id {
-                    log::error!("[{}] Subscription validity expired", subscription_id);
+                    log::error!("[{subscription_id}] Subscription validity expired");
                     // In C: ogs_nnrf_nfm_send_nf_status_subscribe(...)
                     // ogs_sbi_subscription_data_remove(subscription_data);
                 }
@@ -406,7 +406,7 @@ impl UdrSmContext {
             // In C: case OGS_TIMER_SUBSCRIPTION_PATCH:
             UdrTimerId::SubscriptionPatch => {
                 if let Some(ref subscription_id) = event.subscription_id {
-                    log::info!("[{}] Need to update Subscription", subscription_id);
+                    log::info!("[{subscription_id}] Need to update Subscription");
                     // In C: ogs_nnrf_nfm_send_nf_status_update(subscription_data);
                 }
             }

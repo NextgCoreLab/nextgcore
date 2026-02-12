@@ -83,11 +83,11 @@ pub enum LogValue {
 impl fmt::Display for LogValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LogValue::String(s) => write!(f, "{}", s),
-            LogValue::Int(i) => write!(f, "{}", i),
-            LogValue::Float(v) => write!(f, "{}", v),
-            LogValue::Bool(b) => write!(f, "{}", b),
-            LogValue::Bytes(b) => write!(f, "{:02x?}", b),
+            LogValue::String(s) => write!(f, "{s}"),
+            LogValue::Int(i) => write!(f, "{i}"),
+            LogValue::Float(v) => write!(f, "{v}"),
+            LogValue::Bool(b) => write!(f, "{b}"),
+            LogValue::Bytes(b) => write!(f, "{b:02x?}"),
         }
     }
 }
@@ -161,9 +161,9 @@ impl StructuredLogEntry {
             let attrs: Vec<String> = self.attributes.iter().map(|(k, v)| {
                 let val = match v {
                     LogValue::String(s) => format!("{{\"stringValue\":\"{}\"}}", escape_json(s)),
-                    LogValue::Int(i) => format!("{{\"intValue\":\"{}\"}}", i),
-                    LogValue::Float(f) => format!("{{\"doubleValue\":{}}}", f),
-                    LogValue::Bool(b) => format!("{{\"boolValue\":{}}}", b),
+                    LogValue::Int(i) => format!("{{\"intValue\":\"{i}\"}}"),
+                    LogValue::Float(f) => format!("{{\"doubleValue\":{f}}}"),
+                    LogValue::Bool(b) => format!("{{\"boolValue\":{b}}}"),
                     LogValue::Bytes(b) => format!("{{\"bytesValue\":\"{}\"}}", hex_encode(b)),
                 };
                 format!("{{\"key\":\"{}\",\"value\":{}}}", escape_json(k), val)
@@ -253,7 +253,7 @@ fn escape_json(s: &str) -> String {
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ============================================================================

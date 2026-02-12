@@ -52,14 +52,11 @@ impl PfcpFsm {
     fn state_initial(&mut self, event: &SgwcEvent) {
         pfcp_sm_debug(event, self.state);
 
-        match event.id {
-            SgwcEventId::FsmEntry => {
-                // Create no-heartbeat timer (would be done in real impl)
-                // Transition to will_associate state
-                self.state = PfcpState::WillAssociate;
-                log::info!("PFCP[{}] state: Initial -> WillAssociate", self.node_id);
-            }
-            _ => {}
+        if event.id == SgwcEventId::FsmEntry {
+            // Create no-heartbeat timer (would be done in real impl)
+            // Transition to will_associate state
+            self.state = PfcpState::WillAssociate;
+            log::info!("PFCP[{}] state: Initial -> WillAssociate", self.node_id);
         }
     }
 
@@ -67,12 +64,9 @@ impl PfcpFsm {
     fn state_final(&mut self, event: &SgwcEvent) {
         pfcp_sm_debug(event, self.state);
 
-        match event.id {
-            SgwcEventId::FsmEntry => {
-                // Delete no-heartbeat timer
-                log::info!("PFCP[{}] state machine finalized", self.node_id);
-            }
-            _ => {}
+        if event.id == SgwcEventId::FsmEntry {
+            // Delete no-heartbeat timer
+            log::info!("PFCP[{}] state machine finalized", self.node_id);
         }
     }
 
@@ -100,7 +94,7 @@ impl PfcpFsm {
                             // via pfcp_handler::send_association_setup_request
                         }
                         _ => {
-                            log::error!("Unknown timer in will_associate: {:?}", timer_id);
+                            log::error!("Unknown timer in will_associate: {timer_id:?}");
                         }
                     }
                 }
@@ -161,7 +155,7 @@ impl PfcpFsm {
                             // Note: Heartbeat request sent via pfcp_handler::send_heartbeat_request
                         }
                         _ => {
-                            log::error!("Unknown timer in associated: {:?}", timer_id);
+                            log::error!("Unknown timer in associated: {timer_id:?}");
                         }
                     }
                 }

@@ -148,8 +148,7 @@ pub fn register_n32f_client(node_id: u64, receiver: &str, host: &str, port: u16,
     };
     let mut clients = n32f_clients().write().unwrap();
     clients.insert(node_id, client);
-    log::info!("Registered N32f client for node {} -> {}:{}  (TLS={}, scheme={:?})",
-        node_id, host, port, tls, scheme);
+    log::info!("Registered N32f client for node {node_id} -> {host}:{port}  (TLS={tls}, scheme={scheme:?})");
 }
 
 /// Unregister an N32f client
@@ -183,7 +182,7 @@ pub fn forward_n32f_request(
 ) -> Result<N32fForwardResult, String> {
     let clients = n32f_clients().read().unwrap();
     let client = clients.get(&node_id).ok_or_else(|| {
-        format!("No N32f client for node {}", node_id)
+        format!("No N32f client for node {node_id}")
     })?;
 
     // Build the N32f forwarding request
@@ -218,7 +217,7 @@ pub fn forward_n32f_request(
             // 2. Identify IEs to protect per data-type profile
             // 3. Apply JWS/JWE to protected IEs
             // 4. Replace original body with N32fReformattedReqMsg
-            log::debug!("PRINS protection applied for node {} (header-only stub)", node_id);
+            log::debug!("PRINS protection applied for node {node_id} (header-only stub)");
         }
         SecurityCapability::None | SecurityCapability::Null => {
             // No security - direct forwarding
@@ -401,8 +400,7 @@ fn handle_forwarding_request(
         // Request from local NF to remote PLMN - forward via peer SEPP
         if server_interface.is_some() {
             log::error!(
-                "[DROP] Peer SEPP is using the wrong interface [{:?}]",
-                server_interface
+                "[DROP] Peer SEPP is using the wrong interface [{server_interface:?}]"
             );
             remove_assoc(assoc.id);
             return RequestHandlerResult::Error("Wrong interface".to_string());
@@ -446,10 +444,7 @@ fn handle_forwarding_request(
             }
             None => {
                 log::error!(
-                    "Cannot find SEPP Peer Node for [{}:{}:{}]",
-                    target_apiroot,
-                    mcc,
-                    mnc
+                    "Cannot find SEPP Peer Node for [{target_apiroot}:{mcc}:{mnc}]"
                 );
                 remove_assoc(assoc.id);
                 RequestHandlerResult::Error("Peer SEPP not found".to_string())
@@ -465,7 +460,7 @@ fn handle_forwarding_request(
 
         // Note: Forward to local NF via SCP (if configured) or directly
         // Forwarding handled by HTTP client with target_apiroot as destination URL
-        log::debug!("Forwarding to local NF: {}", target_apiroot);
+        log::debug!("Forwarding to local NF: {target_apiroot}");
         RequestHandlerResult::ForwardedToLocalNf
     }
 }
@@ -480,8 +475,7 @@ fn handle_local_request(
     if let Some(interface) = server_interface {
         if interface == interfaces::N32F {
             log::error!(
-                "[DROP] Peer SEPP is using the wrong interface [{}]",
-                interface
+                "[DROP] Peer SEPP is using the wrong interface [{interface}]"
             );
             return RequestHandlerResult::Error("Wrong interface".to_string());
         }
@@ -508,7 +502,7 @@ pub fn handle_response(assoc_id: u64, response: &SbiResponse) -> Result<(), Stri
     let assoc = match assoc {
         Some(a) => a,
         None => {
-            return Err(format!("Association not found: {}", assoc_id));
+            return Err(format!("Association not found: {assoc_id}"));
         }
     };
 

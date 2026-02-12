@@ -309,7 +309,7 @@ pub fn handle_request(
         // In C: ogs_sbi_fqdn_in_vplmn(headers.target_apiroot)
         // VPLMN detection is handled by the SEPP integration when inter-PLMN routing is enabled
 
-        log::debug!("Forwarding to target apiroot: {}", target_apiroot);
+        log::debug!("Forwarding to target apiroot: {target_apiroot}");
 
         // Note: Forward request to target
         // In C: send_request(client, response_handler, request, false, assoc)
@@ -394,7 +394,7 @@ pub fn handle_response(
     let assoc = match assoc {
         Some(a) => a,
         None => {
-            return Err(format!("Association not found: {}", assoc_id));
+            return Err(format!("Association not found: {assoc_id}"));
         }
     };
 
@@ -435,7 +435,7 @@ pub fn handle_nf_discover_response(
     let assoc = match assoc {
         Some(a) => a,
         None => {
-            return Err(format!("Association not found: {}", assoc_id));
+            return Err(format!("Association not found: {assoc_id}"));
         }
     };
 
@@ -499,7 +499,7 @@ pub fn handle_sepp_discover_response(
     let assoc = match assoc {
         Some(a) => a,
         None => {
-            return Err(format!("Association not found: {}", assoc_id));
+            return Err(format!("Association not found: {assoc_id}"));
         }
     };
 
@@ -670,7 +670,7 @@ pub fn build_forwarded_request(
         headers,
         body: original.body.clone(),
     };
-    fwd.set_header(":authority", &format!("{}:{}", target_host, target_port));
+    fwd.set_header(":authority", &format!("{target_host}:{target_port}"));
     fwd
 }
 

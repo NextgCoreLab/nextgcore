@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
     log::info!("UPF context initialized (max_sessions={})", args.max_sessions);
 
     // Initialize GTP-U path
-    upf_gtp_init().map_err(|e| anyhow::anyhow!("Failed to initialize GTP path: {}", e))?;
+    upf_gtp_init().map_err(|e| anyhow::anyhow!("Failed to initialize GTP path: {e}"))?;
     log::info!("GTP-U path initialized");
 
     // Initialize UPF state machine
@@ -148,7 +148,7 @@ async fn main() -> Result<()> {
                 log::debug!("Configuration file loaded ({} bytes)", content.len());
             }
             Err(e) => {
-                log::warn!("Failed to read configuration file: {}", e);
+                log::warn!("Failed to read configuration file: {e}");
             }
         }
     } else {
@@ -167,12 +167,12 @@ async fn main() -> Result<()> {
 
     // Initialize legacy PFCP path context (for compatibility)
     pfcp_open(&mut pfcp_ctx, pfcp_addr)
-        .map_err(|e| anyhow::anyhow!("Failed to open PFCP path: {}", e))?;
-    log::info!("PFCP path context initialized on {}", pfcp_addr);
+        .map_err(|e| anyhow::anyhow!("Failed to open PFCP path: {e}"))?;
+    log::info!("PFCP path context initialized on {pfcp_addr}");
 
     // Open GTP-U path (control plane)
-    upf_gtp_open().map_err(|e| anyhow::anyhow!("Failed to open GTP path: {}", e))?;
-    log::info!("GTP-U path opened on {}", gtpu_addr);
+    upf_gtp_open().map_err(|e| anyhow::anyhow!("Failed to open GTP path: {e}"))?;
+    log::info!("GTP-U path opened on {gtpu_addr}");
 
     // Initialize data plane (optional based on --no-dataplane flag)
     let mut data_plane = DataPlane::new(shutdown.clone());
@@ -214,7 +214,7 @@ async fn main() -> Result<()> {
         Some(tokio::spawn(async move {
             log::info!("Data plane task spawned, calling run()");
             if let Err(e) = dp_clone.run().await {
-                log::error!("Data plane error: {}", e);
+                log::error!("Data plane error: {e}");
             }
             log::info!("Data plane task finished");
         }))
@@ -228,7 +228,7 @@ async fn main() -> Result<()> {
     let pfcp_server_handle = tokio::spawn(async move {
         log::info!("PFCP server task spawned");
         if let Err(e) = pfcp_server_clone.run().await {
-            log::error!("PFCP server error: {}", e);
+            log::error!("PFCP server error: {e}");
         }
         log::info!("PFCP server task finished");
     });
@@ -290,7 +290,7 @@ async fn main() -> Result<()> {
     log::info!("Shutting down...");
 
     // Close GTP-U path
-    upf_gtp_close().map_err(|e| anyhow::anyhow!("Failed to close GTP path: {}", e))?;
+    upf_gtp_close().map_err(|e| anyhow::anyhow!("Failed to close GTP path: {e}"))?;
     log::info!("GTP-U path closed");
 
     // Close PFCP path
@@ -298,7 +298,7 @@ async fn main() -> Result<()> {
     log::info!("PFCP path closed");
 
     // Finalize GTP-U
-    upf_gtp_final().map_err(|e| anyhow::anyhow!("Failed to finalize GTP path: {}", e))?;
+    upf_gtp_final().map_err(|e| anyhow::anyhow!("Failed to finalize GTP path: {e}"))?;
     log::info!("GTP-U path finalized");
 
     // Cleanup state machine
@@ -408,7 +408,7 @@ async fn run_async_event_loop(
                 for seq in stale_seqs {
                     if let Some(xact) = pfcp_ctx.find_xact(seq) {
                         if xact.state == pfcp_path::XactState::Pending {
-                            log::debug!("Cleaning up stale PFCP transaction seq={}", seq);
+                            log::debug!("Cleaning up stale PFCP transaction seq={seq}");
                             xact.state = pfcp_path::XactState::Timeout;
                         }
                     }
@@ -434,7 +434,7 @@ async fn update_session_stats() {
     let ctx = upf_self();
     let sess_count = ctx.sess_count();
     if sess_count > 0 {
-        log::debug!("Active sessions: {}", sess_count);
+        log::debug!("Active sessions: {sess_count}");
     }
 
     // Note: URR threshold reporting is handled in the data plane via
@@ -460,8 +460,7 @@ fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
             gnb_addr,
         } => {
             log::info!(
-                "PFCP Session Established: UPF_SEID={:#x}, SMF_SEID={:#x}, UE={:?}, UL_TEID={:#x}, DL_TEID={:#x}",
-                upf_seid, smf_seid, ue_ipv4, ul_teid, dl_teid
+                "PFCP Session Established: UPF_SEID={upf_seid:#x}, SMF_SEID={smf_seid:#x}, UE={ue_ipv4:?}, UL_TEID={ul_teid:#x}, DL_TEID={dl_teid:#x}"
             );
 
             if let Some(ue_ip) = ue_ipv4 {
@@ -495,7 +494,7 @@ fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
             dl_teid,
             gnb_addr,
         } => {
-            log::info!("PFCP Session Modified: UPF_SEID={:#x}", upf_seid);
+            log::info!("PFCP Session Modified: UPF_SEID={upf_seid:#x}");
 
             // Convert gNB IP to SocketAddr if present
             let gnb_socket = gnb_addr.map(|addr| {
@@ -509,7 +508,7 @@ fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
         }
 
         PfcpSessionEvent::SessionDeleted { upf_seid, ue_ipv4: _ } => {
-            log::info!("PFCP Session Deleted: UPF_SEID={:#x}", upf_seid);
+            log::info!("PFCP Session Deleted: UPF_SEID={upf_seid:#x}");
             // Remove session from data plane by SEID
             data_plane.remove_session_from_pfcp(upf_seid);
         }

@@ -196,7 +196,7 @@ pub fn nssf_nnssf_nsselection_handle_get_from_hnssf(
 ) -> NsSelectionResult {
     // Check response status
     if res_status != 200 {
-        return NsSelectionResult::Error(res_status, format!("HTTP response error [{}]", res_status));
+        return NsSelectionResult::Error(res_status, format!("HTTP response error [{res_status}]"));
     }
 
     // Validate response

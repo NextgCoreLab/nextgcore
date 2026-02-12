@@ -106,11 +106,10 @@ pub fn build_security_capability_response(node: &SeppNode) -> Option<SecNegotiat
     };
 
     // Set target API root support (only if security is enabled)
-    if node.negotiated_security_scheme != SecurityCapability::None {
-        if node.target_apiroot_supported {
+    if node.negotiated_security_scheme != SecurityCapability::None
+        && node.target_apiroot_supported {
             rsp_data.target_apiroot_supported = true;
         }
-    }
 
     // Add serving PLMN IDs
     rsp_data.plmn_id_list = serving_plmn_ids;
@@ -324,7 +323,7 @@ pub fn build_n32f_tls_message(
         })
         .collect();
 
-    let payload = body.map(|b| base64url_encode(b));
+    let payload = body.map(base64url_encode);
 
     log::debug!(
         "Built N32f TLS message: {} {} ({} headers, payload={})",
@@ -365,7 +364,7 @@ pub fn build_n32f_prins_message(
         })
         .collect();
 
-    let payload = body.map(|b| base64url_encode(b));
+    let payload = body.map(base64url_encode);
 
     log::debug!(
         "Built N32f PRINS message: {} {} ({} headers, {} modifications)",
@@ -385,7 +384,7 @@ pub fn build_n32f_prins_message(
 
 /// Parse an N32f message received from peer SEPP
 pub fn parse_n32f_message(json_bytes: &[u8]) -> Result<N32fMessage, String> {
-    serde_json::from_slice(json_bytes).map_err(|e| format!("Failed to parse N32f message: {}", e))
+    serde_json::from_slice(json_bytes).map_err(|e| format!("Failed to parse N32f message: {e}"))
 }
 
 /// Base64url encode (no padding) - RFC 4648 section 5

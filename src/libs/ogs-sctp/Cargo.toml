@@ -33,3 +33,6 @@ libc = { version = "0.2", optional = true }
 proptest.workspace = true
 env_logger.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

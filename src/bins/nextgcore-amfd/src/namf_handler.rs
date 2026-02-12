@@ -537,7 +537,7 @@ pub fn send_event_notification(
 pub fn handle_event_unsubscribe(
     subscription_id: &str,
 ) -> NamfHandlerResult<()> {
-    log::info!("Event unsubscribe request: subscription={}", subscription_id);
+    log::info!("Event unsubscribe request: subscription={subscription_id}");
 
     // In real implementation, this would:
     // 1. Look up subscription by ID
@@ -545,7 +545,7 @@ pub fn handle_event_unsubscribe(
     // 3. Stop sending notifications
 
     // For now, just log
-    log::debug!("Removed event subscription: {}", subscription_id);
+    log::debug!("Removed event subscription: {subscription_id}");
 
     Ok(())
 }

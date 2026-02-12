@@ -22,6 +22,7 @@ pub const PTI_UNASSIGNED: u8 = 0;
 /// ESM Cause codes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum EsmCause {
     /// Operator determined barring
     OperatorDeterminedBarring = 8,
@@ -110,6 +111,7 @@ pub enum EsmCause {
     /// Message not compatible with protocol state
     MessageNotCompatible = 101,
     /// Protocol error, unspecified
+    #[default]
     ProtocolErrorUnspecified = 111,
     /// APN restriction value incompatible with active EPS bearer context
     ApnRestrictionValueIncompatible = 112,
@@ -117,11 +119,6 @@ pub enum EsmCause {
     MultipleAccessesToPdnConnectionNotAllowed = 113,
 }
 
-impl Default for EsmCause {
-    fn default() -> Self {
-        EsmCause::ProtocolErrorUnspecified
-    }
-}
 
 
 // ============================================================================
@@ -275,7 +272,7 @@ pub fn eps_qos_build(
     buf.write_u8(qci);
     
     // Check if GBR bearer (QCI 1-4)
-    let is_gbr = qci >= 1 && qci <= 4;
+    let is_gbr = (1..=4).contains(&qci);
     
     if is_gbr {
         // MBR for uplink
@@ -289,14 +286,13 @@ pub fn eps_qos_build(
     }
     
     // Extended values if needed
-    if mbr_ul > 8640000 || mbr_dl > 8640000 || gbr_ul > 8640000 || gbr_dl > 8640000 {
-        if is_gbr {
+    if (mbr_ul > 8640000 || mbr_dl > 8640000 || gbr_ul > 8640000 || gbr_dl > 8640000)
+        && is_gbr {
             buf.write_u8(encode_bitrate_ext(mbr_ul));
             buf.write_u8(encode_bitrate_ext(mbr_dl));
             buf.write_u8(encode_bitrate_ext(gbr_ul));
             buf.write_u8(encode_bitrate_ext(gbr_dl));
         }
-    }
     
     buf.into_vec()
 }

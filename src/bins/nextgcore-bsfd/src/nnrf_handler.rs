@@ -84,7 +84,7 @@ pub fn bsf_nnrf_handle_nf_discover(
     // In C: bsf_sbi_send_request(nf_instance, xact)
     let request = crate::sbi_path::PathSbiRequest {
         method: "GET".to_string(),
-        uri: format!("/nbsf-management/v1/pcf-bindings"),
+        uri: "/nbsf-management/v1/pcf-bindings".to_string(),
         headers: vec![],
         body: None,
     };
@@ -100,23 +100,21 @@ pub fn handle_nf_status_notify(
     nf_status: &str,
 ) -> Result<(), String> {
     log::debug!(
-        "NF status notify: nf_instance_id={}, status={}",
-        nf_instance_id,
-        nf_status
+        "NF status notify: nf_instance_id={nf_instance_id}, status={nf_status}"
     );
 
     match nf_status {
         "REGISTERED" => {
-            log::info!("NF instance [{}] registered", nf_instance_id);
+            log::info!("NF instance [{nf_instance_id}] registered");
         }
         "DEREGISTERED" => {
-            log::info!("NF instance [{}] deregistered", nf_instance_id);
+            log::info!("NF instance [{nf_instance_id}] deregistered");
         }
         "SUSPENDED" => {
-            log::warn!("NF instance [{}] suspended", nf_instance_id);
+            log::warn!("NF instance [{nf_instance_id}] suspended");
         }
         _ => {
-            log::warn!("Unknown NF status [{}] for instance [{}]", nf_status, nf_instance_id);
+            log::warn!("Unknown NF status [{nf_status}] for instance [{nf_instance_id}]");
         }
     }
 

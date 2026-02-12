@@ -21,12 +21,12 @@ use crate::common::{
 fn arb_imsi() -> impl Strategy<Value = String> {
     // IMSI format: MCC (3 digits) + MNC (2-3 digits) + MSIN (9-10 digits)
     (100u32..999, 10u32..999, 100000000u64..9999999999)
-        .prop_map(|(mcc, mnc, msin)| format!("{:03}{:03}{:010}", mcc, mnc, msin))
+        .prop_map(|(mcc, mnc, msin)| format!("{mcc:03}{mnc:03}{msin:010}"))
 }
 
 /// Strategy for generating valid SUPI values
 fn arb_supi() -> impl Strategy<Value = String> {
-    arb_imsi().prop_map(|imsi| format!("imsi-{}", imsi))
+    arb_imsi().prop_map(|imsi| format!("imsi-{imsi}"))
 }
 
 /// Strategy for generating valid DNN values
@@ -397,10 +397,10 @@ proptest! {
             // Valid 5QI ranges: 1-9 (standardized), 65-67, 69, 70, 75, 79, 80, 82-85 (standardized)
             // and 128-254 (operator-specific)
             prop_assert!(
-                (stored_5qi >= 1 && stored_5qi <= 9) ||
-                (stored_5qi >= 65 && stored_5qi <= 70) ||
-                (stored_5qi >= 75 && stored_5qi <= 85) ||
-                (stored_5qi >= 128 && stored_5qi <= 254)
+                (1..=9).contains(&stored_5qi) ||
+                (65..=70).contains(&stored_5qi) ||
+                (75..=85).contains(&stored_5qi) ||
+                (128..=254).contains(&stored_5qi)
             );
             
             Ok(())

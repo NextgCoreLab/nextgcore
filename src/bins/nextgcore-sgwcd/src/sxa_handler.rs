@@ -112,7 +112,7 @@ pub fn handle_session_establishment_response(
 
     // Check PFCP cause
     if pfcp_cause != pfcp_cause::REQUEST_ACCEPTED {
-        log::warn!("PFCP Cause [{}] : Not Accepted", pfcp_cause);
+        log::warn!("PFCP Cause [{pfcp_cause}] : Not Accepted");
         return HandlerResult::Error(gtp_cause_from_pfcp(pfcp_cause));
     }
 
@@ -150,7 +150,7 @@ pub fn handle_session_modification_response(
 
     // Check PFCP cause first
     if pfcp_cause != pfcp_cause::REQUEST_ACCEPTED {
-        log::warn!("PFCP Cause [{}] : Not Accepted", pfcp_cause);
+        log::warn!("PFCP Cause [{pfcp_cause}] : Not Accepted");
         return HandlerResult::Error(gtp_cause_from_pfcp(pfcp_cause));
     }
 
@@ -182,7 +182,7 @@ pub fn handle_session_modification_response(
         sess.sgwc_sxa_seid,
         sess.sgwu_sxa_seid
     );
-    log::debug!("    modify_flags=0x{:x}", modify_flags);
+    log::debug!("    modify_flags=0x{modify_flags:x}");
 
     // Determine next action based on modify flags
     if modify_flags & pfcp_modify::REMOVE != 0 {
@@ -234,7 +234,7 @@ pub fn handle_session_deletion_response(
 
     // Check PFCP cause first
     if pfcp_cause != pfcp_cause::REQUEST_ACCEPTED {
-        log::warn!("PFCP Cause [{}] : Not Accepted", pfcp_cause);
+        log::warn!("PFCP Cause [{pfcp_cause}] : Not Accepted");
         return HandlerResult::Error(gtp_cause_from_pfcp(pfcp_cause));
     }
 
@@ -312,7 +312,7 @@ pub fn handle_session_report_request(
         sess.sgwc_sxa_seid,
         sess.sgwu_sxa_seid
     );
-    log::info!("    Report Type: {}, PDR ID: {:?}", report_type, pdr_id);
+    log::info!("    Report Type: {report_type}, PDR ID: {pdr_id:?}");
 
     // Report types:
     // - DLDR (Downlink Data Report): Need to send Downlink Data Notification
@@ -332,7 +332,7 @@ pub fn handle_session_report_request(
         log::warn!("    Error Indication Report received");
         HandlerResult::Ok
     } else {
-        log::debug!("    Other report type: {}", report_type);
+        log::debug!("    Other report type: {report_type}");
         HandlerResult::Ok
     }
 }

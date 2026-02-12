@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -812,12 +812,11 @@ impl SessionManager {
             // For simplicity, remove old and add new with updated values
             // In production, use interior mutability (Mutex/RwLock inside DataPlaneSession)
             log::info!(
-                "Session update: SEID={:#x}, new DL_TEID={:#x}, gNB={}",
-                seid, dl_teid, gnb_addr
+                "Session update: SEID={seid:#x}, new DL_TEID={dl_teid:#x}, gNB={gnb_addr}"
             );
             true
         } else {
-            log::warn!("Session not found for update: SEID={:#x}", seid);
+            log::warn!("Session not found for update: SEID={seid:#x}");
             false
         }
     }
@@ -842,10 +841,10 @@ impl SessionManager {
                 ip_map.remove(&ip);
             }
 
-            log::info!("Session removed: SEID={:#x}", seid);
+            log::info!("Session removed: SEID={seid:#x}");
             true
         } else {
-            log::warn!("Session not found for removal: SEID={:#x}", seid);
+            log::warn!("Session not found for removal: SEID={seid:#x}");
             false
         }
     }
@@ -1036,11 +1035,11 @@ impl DataPlane {
         gtpu_addr: SocketAddr,
     ) -> io::Result<()> {
         // Create TUN device
-        log::info!("Creating TUN device: {}", tun_name);
+        log::info!("Creating TUN device: {tun_name}");
         let tun = TunDevice::create(tun_name)?;
 
         // Configure IP
-        log::info!("Configuring TUN IP: {}/{}", tun_ip, tun_prefix);
+        log::info!("Configuring TUN IP: {tun_ip}/{tun_prefix}");
         tun.configure_ip(tun_ip, tun_prefix)?;
 
         // Setup NAT for UE subnet
@@ -1050,13 +1049,13 @@ impl DataPlane {
             0,
             0,
         );
-        log::info!("Setting up NAT for subnet: {}/{}", subnet, tun_prefix);
+        log::info!("Setting up NAT for subnet: {subnet}/{tun_prefix}");
         tun.setup_nat(subnet, tun_prefix)?;
 
         self.tun = Some(tun);
 
         // Create GTP-U socket
-        log::info!("Binding GTP-U socket on {}", gtpu_addr);
+        log::info!("Binding GTP-U socket on {gtpu_addr}");
         let socket = TokioUdpSocket::bind(gtpu_addr).await?;
         self.gtpu_socket = Some(Arc::new(socket));
 
@@ -1099,13 +1098,13 @@ impl DataPlane {
                 match gtpu_recv.recv_from(&mut buf).await {
                     Ok((len, from)) => {
                         if len > 0 {
-                            log::debug!("GTP-U received {} bytes from {}", len, from);
+                            log::debug!("GTP-U received {len} bytes from {from}");
                             let _ = ul_tx_clone.send((buf[..len].to_vec(), from)).await;
                         }
                     }
                     Err(e) => {
                         if e.kind() != io::ErrorKind::WouldBlock {
-                            log::error!("GTP-U recv error: {}", e);
+                            log::error!("GTP-U recv error: {e}");
                         }
                     }
                 }
@@ -1133,7 +1132,7 @@ impl DataPlane {
                 } else if ret < 0 {
                     let err = io::Error::last_os_error();
                     if err.kind() != io::ErrorKind::WouldBlock {
-                        log::error!("TUN read error: {}", err);
+                        log::error!("TUN read error: {err}");
                     }
                     // Small delay on would-block to prevent busy loop
                     tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
@@ -1165,7 +1164,7 @@ impl DataPlane {
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
                     let ul = stats.ul_packets.load(Ordering::Relaxed);
                     let dl = stats.dl_packets.load(Ordering::Relaxed);
-                    log::info!("Data plane stats: UL={} pkts, DL={} pkts", ul, dl);
+                    log::info!("Data plane stats: UL={ul} pkts, DL={dl} pkts");
                 }
             }
         }
@@ -1183,7 +1182,7 @@ impl DataPlane {
         let header = match parse_gtpu_header(pkt) {
             Ok(h) => h,
             Err(e) => {
-                log::debug!("Failed to parse GTP-U header: {:?}", e);
+                log::debug!("Failed to parse GTP-U header: {e:?}");
                 self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -1191,7 +1190,7 @@ impl DataPlane {
 
         match header.msg_type {
             gtpu_msg_type::ECHO_REQUEST => {
-                log::debug!("GTP-U Echo Request from {}", from);
+                log::debug!("GTP-U Echo Request from {from}");
                 let response = build_gtpu_echo_response(header.seq_num);
                 if let Some(sock) = &self.gtpu_socket {
                     let _ = sock.send_to(&response, from).await;
@@ -1280,7 +1279,7 @@ impl DataPlane {
             // Check QER gate
             if let Some(qid) = qer_id {
                 if !session.check_qer_gate(qid, true, payload_len) {
-                    log::debug!("UL packet dropped by QER gate (qer_id={})", qid);
+                    log::debug!("UL packet dropped by QER gate (qer_id={qid})");
                     self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
@@ -1290,7 +1289,7 @@ impl DataPlane {
             if let Some(fid) = far_id {
                 let (should_forward, _, _) = session.apply_far(fid);
                 if !should_forward {
-                    log::debug!("UL packet dropped by FAR (far_id={})", fid);
+                    log::debug!("UL packet dropped by FAR (far_id={fid})");
                     self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
@@ -1345,7 +1344,7 @@ impl DataPlane {
                 // Check QER gate
                 if let Some(qid) = qer_id {
                     if !sess.check_qer_gate(qid, false, payload_len) {
-                        log::debug!("DL packet dropped by QER gate (qer_id={})", qid);
+                        log::debug!("DL packet dropped by QER gate (qer_id={qid})");
                         self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -1355,7 +1354,7 @@ impl DataPlane {
                 if let Some(fid) = far_id {
                     let (should_forward, ohc_teid, ohc_addr) = sess.apply_far(fid);
                     if !should_forward {
-                        log::debug!("DL packet dropped by FAR (far_id={})", fid);
+                        log::debug!("DL packet dropped by FAR (far_id={fid})");
                         self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -1383,7 +1382,7 @@ impl DataPlane {
             }
         } else {
             // No session found - drop in production, use default for testing
-            log::trace!("No session for DL packet to {:?}", dst_ip);
+            log::trace!("No session for DL packet to {dst_ip:?}");
             let default_teid = 1u32;
             let default_gnb = SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(172, 23, 0, 100)),
@@ -1407,10 +1406,10 @@ impl DataPlane {
                 }
                 self.stats.dl_packets.fetch_add(1, Ordering::Relaxed);
                 self.stats.dl_bytes.fetch_add(payload_len, Ordering::Relaxed);
-                log::trace!("DL: {} bytes to {} TEID=0x{:x}", payload_len, gnb_addr, dl_teid);
+                log::trace!("DL: {payload_len} bytes to {gnb_addr} TEID=0x{dl_teid:x}");
             }
             Err(e) => {
-                log::error!("GTP-U send failed: {}", e);
+                log::error!("GTP-U send failed: {e}");
                 self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -1492,8 +1491,7 @@ impl DataPlane {
 
         self.sessions.add_session(session);
         log::info!(
-            "Added data plane session: SEID={:#x}, SMF_SEID={:#x}, UE={}, UL_TEID=0x{:x}, DL_TEID=0x{:x}, gNB={}, PDU={:?}, QFI={:?}",
-            upf_seid, smf_seid, ue_ip, ul_teid, dl_teid, gnb_addr, pdu_session_id, qfi
+            "Added data plane session: SEID={upf_seid:#x}, SMF_SEID={smf_seid:#x}, UE={ue_ip}, UL_TEID=0x{ul_teid:x}, DL_TEID=0x{dl_teid:x}, gNB={gnb_addr}, PDU={pdu_session_id:?}, QFI={qfi:?}"
         );
     }
 
@@ -1555,20 +1553,19 @@ impl DataPlane {
 
             self.sessions.add_session(new_session);
             log::info!(
-                "Updated data plane session: SEID={:#x}, DL_TEID=0x{:x}, gNB={}",
-                upf_seid, new_dl_teid, new_gnb_addr
+                "Updated data plane session: SEID={upf_seid:#x}, DL_TEID=0x{new_dl_teid:x}, gNB={new_gnb_addr}"
             );
         } else {
-            log::warn!("Session not found for SEID {:#x} during update", upf_seid);
+            log::warn!("Session not found for SEID {upf_seid:#x} during update");
         }
     }
 
     /// Remove a session from PFCP deletion
     pub fn remove_session_from_pfcp(&self, upf_seid: u64) {
         if self.sessions.remove_session_by_seid(upf_seid) {
-            log::info!("Removed data plane session: SEID={:#x}", upf_seid);
+            log::info!("Removed data plane session: SEID={upf_seid:#x}");
         } else {
-            log::warn!("Session not found for SEID {:#x} during deletion", upf_seid);
+            log::warn!("Session not found for SEID {upf_seid:#x} during deletion");
         }
     }
 

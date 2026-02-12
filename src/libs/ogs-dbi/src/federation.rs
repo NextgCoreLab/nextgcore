@@ -559,7 +559,7 @@ mod tests {
 
             responses.push(FederatedResponse {
                 query_id: "query-1".to_string(),
-                operator: OperatorId::new(format!("op-{}", i)),
+                operator: OperatorId::new(format!("op-{i}")),
                 success: true,
                 data,
                 error: None,
