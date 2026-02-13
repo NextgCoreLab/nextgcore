@@ -23,6 +23,8 @@ pub use config::{
     ogs_time_from_sec, ogs_time_from_msec, parse_sockopt_config,
     OGS_MAX_NUM_OF_PLMN, OGS_MAX_NUM_OF_SLICE, OGS_MAX_NUM_OF_SESS,
     MAX_NUM_OF_UE, MAX_NUM_OF_PEER,
+    // B3.4: Configuration drift detection
+    DriftSeverity, ConfigDrift, DriftReport, ConfigDriftDetector,
 };
 pub use context::{
     OgsApp, OgsAppContext, OgsLogTs, LoggerConf, PoolConf, MetricsConf,
@@ -37,6 +39,8 @@ pub use intent::{
     NetworkIntent, IntentTranslator, IntentError, IntentResult,
     IntentPriority, SliceIntent, QosIntent, SecurityIntent, EnergyIntent,
     AiMlIntent, DerivedConfig,
+    // B3.5: Intent lifecycle management
+    IntentState, ManagedIntent, IntentLifecycleManager,
 };
 
 pub use nf_hooks::{
@@ -48,6 +52,10 @@ pub use nf_hooks::{
     NfStateDelta, SnapshotHistoryEntry, DigitalTwinSyncManager,
     // #215: NF power profiling & optimization
     PowerComponent, ComponentPowerProfile, PowerOptimization, PowerAction, NfPowerProfiler,
+    // B6.5: AI/ML model version registry
+    ModelDeploymentStatus, DeployedModel, ModelVersionRegistry,
+    // B6.6: Digital twin scenario simulator
+    WhatIfScenario, ScenarioResult, ScenarioSimulator,
 };
 
 // Macros are automatically exported via #[macro_export]

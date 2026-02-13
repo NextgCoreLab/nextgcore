@@ -545,3 +545,312 @@ mod tests {
         assert_eq!(config.slice_config.get("sst"), Some(&"1".to_string()));
     }
 }
+
+//
+// B3.5: Intent Lifecycle Management (6G Feature)
+//
+
+/// Intent lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IntentState {
+    /// Intent submitted, awaiting validation.
+    Pending,
+    /// Intent validated and translated to config.
+    Active,
+    /// Intent temporarily suspended.
+    Suspended,
+    /// Intent fulfilled and completed.
+    Fulfilled,
+    /// Intent failed or rejected.
+    Failed,
+    /// Intent expired.
+    Expired,
+}
+
+/// Tracked intent with lifecycle state and derived configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedIntent {
+    /// The original network intent.
+    pub intent: NetworkIntent,
+    /// Current lifecycle state.
+    pub state: IntentState,
+    /// Derived configuration (populated when Active).
+    pub derived_config: Option<DerivedConfig>,
+    /// Creation timestamp (epoch seconds).
+    pub created_at: u64,
+    /// Last state change timestamp.
+    pub updated_at: u64,
+    /// Failure reason (if Failed).
+    pub failure_reason: Option<String>,
+}
+
+/// Intent lifecycle manager - tracks, activates, and expires intents.
+pub struct IntentLifecycleManager {
+    /// All managed intents by ID.
+    intents: HashMap<String, ManagedIntent>,
+    /// Intent translator for deriving configs.
+    translator: IntentTranslator,
+    /// Default TTL for intents (seconds, 0 = no expiry).
+    default_ttl_secs: u64,
+    /// Total intents ever submitted.
+    total_submitted: u64,
+    /// Total intents that reached Active state.
+    total_activated: u64,
+}
+
+impl IntentLifecycleManager {
+    /// Create a new lifecycle manager.
+    pub fn new(default_ttl_secs: u64) -> Self {
+        Self {
+            intents: HashMap::new(),
+            translator: IntentTranslator::new(),
+            default_ttl_secs,
+            total_submitted: 0,
+            total_activated: 0,
+        }
+    }
+
+    /// Submit a new intent. Returns the intent ID.
+    pub fn submit(&mut self, intent: NetworkIntent) -> IntentResult<String> {
+        intent.validate()?;
+        self.total_submitted += 1;
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let id = intent.id.clone();
+        let managed = ManagedIntent {
+            intent,
+            state: IntentState::Pending,
+            derived_config: None,
+            created_at: now,
+            updated_at: now,
+            failure_reason: None,
+        };
+
+        self.intents.insert(id.clone(), managed);
+        Ok(id)
+    }
+
+    /// Activate a pending intent (translate to config).
+    pub fn activate(&mut self, id: &str) -> IntentResult<&DerivedConfig> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let managed = self.intents.get_mut(id)
+            .ok_or_else(|| IntentError::InvalidIntent(format!("Intent {id} not found")))?;
+
+        if managed.state != IntentState::Pending && managed.state != IntentState::Suspended {
+            return Err(IntentError::InvalidIntent(
+                format!("Intent {id} is in state {:?}, cannot activate", managed.state),
+            ));
+        }
+
+        let config = self.translator.translate(&managed.intent)?;
+        managed.derived_config = Some(config);
+        managed.state = IntentState::Active;
+        managed.updated_at = now;
+        self.total_activated += 1;
+
+        Ok(self.intents[id].derived_config.as_ref().unwrap())
+    }
+
+    /// Suspend an active intent.
+    pub fn suspend(&mut self, id: &str) -> IntentResult<()> {
+        let managed = self.intents.get_mut(id)
+            .ok_or_else(|| IntentError::InvalidIntent(format!("Intent {id} not found")))?;
+
+        if managed.state != IntentState::Active {
+            return Err(IntentError::InvalidIntent(
+                format!("Intent {id} is not Active, cannot suspend"),
+            ));
+        }
+
+        managed.state = IntentState::Suspended;
+        managed.updated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        Ok(())
+    }
+
+    /// Mark an intent as fulfilled.
+    pub fn fulfill(&mut self, id: &str) -> IntentResult<()> {
+        let managed = self.intents.get_mut(id)
+            .ok_or_else(|| IntentError::InvalidIntent(format!("Intent {id} not found")))?;
+
+        managed.state = IntentState::Fulfilled;
+        managed.updated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        Ok(())
+    }
+
+    /// Fail an intent with a reason.
+    pub fn fail(&mut self, id: &str, reason: impl Into<String>) -> IntentResult<()> {
+        let managed = self.intents.get_mut(id)
+            .ok_or_else(|| IntentError::InvalidIntent(format!("Intent {id} not found")))?;
+
+        managed.state = IntentState::Failed;
+        managed.failure_reason = Some(reason.into());
+        managed.updated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        Ok(())
+    }
+
+    /// Expire intents that have exceeded their TTL.
+    pub fn expire_stale(&mut self) -> usize {
+        if self.default_ttl_secs == 0 {
+            return 0;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut expired = 0;
+        for managed in self.intents.values_mut() {
+            if (managed.state == IntentState::Active || managed.state == IntentState::Pending)
+                && now - managed.created_at > self.default_ttl_secs {
+                managed.state = IntentState::Expired;
+                managed.updated_at = now;
+                expired += 1;
+            }
+        }
+        expired
+    }
+
+    /// Get a managed intent by ID.
+    pub fn get(&self, id: &str) -> Option<&ManagedIntent> {
+        self.intents.get(id)
+    }
+
+    /// List all intents in a given state.
+    pub fn list_by_state(&self, state: IntentState) -> Vec<&ManagedIntent> {
+        self.intents.values().filter(|m| m.state == state).collect()
+    }
+
+    /// Total managed intents.
+    pub fn count(&self) -> usize {
+        self.intents.len()
+    }
+
+    /// Total intents submitted.
+    pub fn total_submitted(&self) -> u64 {
+        self.total_submitted
+    }
+
+    /// Total intents activated.
+    pub fn total_activated(&self) -> u64 {
+        self.total_activated
+    }
+}
+
+impl Default for IntentLifecycleManager {
+    fn default() -> Self {
+        Self::new(3600) // 1 hour default TTL
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    fn make_intent(id: &str) -> NetworkIntent {
+        NetworkIntent::new(id, format!("Test intent {id}"))
+            .with_slice(SliceIntent::EMbb)
+    }
+
+    #[test]
+    fn test_submit_and_activate() {
+        let mut mgr = IntentLifecycleManager::new(0);
+        let id = mgr.submit(make_intent("i1")).unwrap();
+
+        assert_eq!(mgr.get(&id).unwrap().state, IntentState::Pending);
+
+        let config = mgr.activate(&id).unwrap();
+        assert_eq!(config.slice_config.get("sst"), Some(&"1".to_string()));
+        assert_eq!(mgr.get(&id).unwrap().state, IntentState::Active);
+    }
+
+    #[test]
+    fn test_suspend_and_reactivate() {
+        let mut mgr = IntentLifecycleManager::new(0);
+        let id = mgr.submit(make_intent("i2")).unwrap();
+        mgr.activate(&id).unwrap();
+        mgr.suspend(&id).unwrap();
+
+        assert_eq!(mgr.get(&id).unwrap().state, IntentState::Suspended);
+
+        // Can re-activate from Suspended
+        mgr.activate(&id).unwrap();
+        assert_eq!(mgr.get(&id).unwrap().state, IntentState::Active);
+    }
+
+    #[test]
+    fn test_fulfill() {
+        let mut mgr = IntentLifecycleManager::new(0);
+        let id = mgr.submit(make_intent("i3")).unwrap();
+        mgr.activate(&id).unwrap();
+        mgr.fulfill(&id).unwrap();
+
+        assert_eq!(mgr.get(&id).unwrap().state, IntentState::Fulfilled);
+    }
+
+    #[test]
+    fn test_fail_with_reason() {
+        let mut mgr = IntentLifecycleManager::new(0);
+        let id = mgr.submit(make_intent("i4")).unwrap();
+        mgr.fail(&id, "Resource unavailable").unwrap();
+
+        let managed = mgr.get(&id).unwrap();
+        assert_eq!(managed.state, IntentState::Failed);
+        assert_eq!(managed.failure_reason.as_deref(), Some("Resource unavailable"));
+    }
+
+    #[test]
+    fn test_list_by_state() {
+        let mut mgr = IntentLifecycleManager::new(0);
+        mgr.submit(make_intent("a")).unwrap();
+        mgr.submit(make_intent("b")).unwrap();
+        mgr.submit(make_intent("c")).unwrap();
+        mgr.activate("a").unwrap();
+        mgr.activate("b").unwrap();
+
+        assert_eq!(mgr.list_by_state(IntentState::Active).len(), 2);
+        assert_eq!(mgr.list_by_state(IntentState::Pending).len(), 1);
+    }
+
+    #[test]
+    fn test_counters() {
+        let mut mgr = IntentLifecycleManager::new(0);
+        mgr.submit(make_intent("x")).unwrap();
+        mgr.submit(make_intent("y")).unwrap();
+        mgr.activate("x").unwrap();
+
+        assert_eq!(mgr.total_submitted(), 2);
+        assert_eq!(mgr.total_activated(), 1);
+        assert_eq!(mgr.count(), 2);
+    }
+
+    #[test]
+    fn test_invalid_submit() {
+        let mut mgr = IntentLifecycleManager::new(0);
+        let bad_intent = NetworkIntent::new("bad", "Bad")
+            .with_qos(QosIntent {
+                target_latency_ms: None,
+                target_throughput_mbps: None,
+                target_reliability_pct: Some(200), // Invalid
+                jitter_tolerance_ms: None,
+                packet_loss_tolerance_pct: None,
+            });
+        assert!(mgr.submit(bad_intent).is_err());
+    }
+}

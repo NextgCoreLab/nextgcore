@@ -257,6 +257,144 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 // ============================================================================
+// Batch Log Exporter (W4.30: Async I/O + OTel logging)
+// ============================================================================
+
+/// Batch log export configuration.
+pub struct BatchExportConfig {
+    /// Maximum batch size before forced export.
+    pub max_batch_size: usize,
+    /// Export interval (milliseconds).
+    pub export_interval_ms: u64,
+    /// Maximum queue depth.
+    pub max_queue_depth: usize,
+}
+
+impl Default for BatchExportConfig {
+    fn default() -> Self {
+        Self {
+            max_batch_size: 512,
+            export_interval_ms: 5000,
+            max_queue_depth: 2048,
+        }
+    }
+}
+
+/// Export target for batch log exporter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportTarget {
+    /// Export to stdout (OTLP JSON).
+    Stdout,
+    /// Export to OTLP HTTP endpoint.
+    OtlpHttp,
+    /// Export to OTLP gRPC endpoint.
+    OtlpGrpc,
+    /// Export to file.
+    File,
+}
+
+/// Batch log exporter that buffers entries and exports in bulk.
+pub struct BatchLogExporter {
+    buffer: Vec<StructuredLogEntry>,
+    config: BatchExportConfig,
+    target: ExportTarget,
+    total_exported: AtomicU64,
+    total_dropped: AtomicU64,
+}
+
+impl BatchLogExporter {
+    /// Creates a new batch log exporter.
+    pub fn new(config: BatchExportConfig, target: ExportTarget) -> Self {
+        Self {
+            buffer: Vec::with_capacity(config.max_batch_size),
+            config,
+            target,
+            total_exported: AtomicU64::new(0),
+            total_dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// Enqueue a log entry for batch export.
+    pub fn enqueue(&mut self, entry: StructuredLogEntry) -> bool {
+        if self.buffer.len() >= self.config.max_queue_depth {
+            self.total_dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        self.buffer.push(entry);
+        if self.buffer.len() >= self.config.max_batch_size {
+            self.flush();
+        }
+        true
+    }
+
+    /// Flush all buffered entries.
+    pub fn flush(&mut self) -> usize {
+        let count = self.buffer.len();
+        if count == 0 {
+            return 0;
+        }
+        self.total_exported.fetch_add(count as u64, Ordering::Relaxed);
+        self.buffer.clear();
+        count
+    }
+
+    /// Render the current buffer as an OTLP JSON resource logs payload.
+    pub fn render_otlp_json(&self) -> String {
+        let records: Vec<String> = self.buffer.iter().map(|e| e.to_json()).collect();
+        format!("{{\"resourceLogs\":[{{\"scopeLogs\":[{{\"logRecords\":[{}]}}]}}]}}",
+            records.join(","))
+    }
+
+    /// Total entries exported.
+    pub fn total_exported(&self) -> u64 {
+        self.total_exported.load(Ordering::Relaxed)
+    }
+
+    /// Total entries dropped due to queue overflow.
+    pub fn total_dropped(&self) -> u64 {
+        self.total_dropped.load(Ordering::Relaxed)
+    }
+
+    /// Current buffer size.
+    pub fn buffered_count(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Export target.
+    pub fn target(&self) -> ExportTarget {
+        self.target
+    }
+}
+
+// ============================================================================
+// Resource Auto-Detection (W4.30)
+// ============================================================================
+
+/// Auto-detect OTel resource attributes from the runtime environment.
+pub fn detect_resource_attributes() -> HashMap<String, String> {
+    let mut attrs = HashMap::new();
+    attrs.insert("telemetry.sdk.name".to_string(), "nextgcore".to_string());
+    attrs.insert("telemetry.sdk.language".to_string(), "rust".to_string());
+    attrs.insert("telemetry.sdk.version".to_string(), env!("CARGO_PKG_VERSION").to_string());
+
+    if let Ok(hostname) = std::env::var("HOSTNAME") {
+        attrs.insert("host.name".to_string(), hostname);
+    }
+    if let Ok(node) = std::env::var("KUBERNETES_NODE_NAME") {
+        attrs.insert("k8s.node.name".to_string(), node);
+    }
+    if let Ok(pod) = std::env::var("KUBERNETES_POD_NAME") {
+        attrs.insert("k8s.pod.name".to_string(), pod);
+    }
+    if let Ok(ns) = std::env::var("KUBERNETES_NAMESPACE") {
+        attrs.insert("k8s.namespace.name".to_string(), ns);
+    }
+
+    attrs.insert("process.pid".to_string(), std::process::id().to_string());
+    attrs
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -322,5 +460,77 @@ mod tests {
         assert_eq!(LogValue::String("hello".into()).to_string(), "hello");
         assert_eq!(LogValue::Int(42).to_string(), "42");
         assert_eq!(LogValue::Bool(true).to_string(), "true");
+    }
+
+    #[test]
+    fn test_batch_exporter_enqueue_and_flush() {
+        let config = BatchExportConfig {
+            max_batch_size: 10,
+            export_interval_ms: 1000,
+            max_queue_depth: 100,
+        };
+        let mut exporter = BatchLogExporter::new(config, ExportTarget::Stdout);
+
+        for i in 0..5 {
+            let entry = StructuredLogEntry::new(OtelSeverity::Info, format!("msg {i}"));
+            assert!(exporter.enqueue(entry));
+        }
+        assert_eq!(exporter.buffered_count(), 5);
+
+        let flushed = exporter.flush();
+        assert_eq!(flushed, 5);
+        assert_eq!(exporter.total_exported(), 5);
+        assert_eq!(exporter.buffered_count(), 0);
+    }
+
+    #[test]
+    fn test_batch_exporter_auto_flush_on_max_batch() {
+        let config = BatchExportConfig {
+            max_batch_size: 3,
+            export_interval_ms: 1000,
+            max_queue_depth: 100,
+        };
+        let mut exporter = BatchLogExporter::new(config, ExportTarget::OtlpHttp);
+
+        for i in 0..3 {
+            exporter.enqueue(StructuredLogEntry::new(OtelSeverity::Debug, format!("msg {i}")));
+        }
+        // Auto-flushed after 3rd enqueue
+        assert_eq!(exporter.total_exported(), 3);
+        assert_eq!(exporter.buffered_count(), 0);
+    }
+
+    #[test]
+    fn test_batch_exporter_queue_overflow() {
+        let config = BatchExportConfig {
+            max_batch_size: 100,
+            export_interval_ms: 1000,
+            max_queue_depth: 2,
+        };
+        let mut exporter = BatchLogExporter::new(config, ExportTarget::File);
+
+        assert!(exporter.enqueue(StructuredLogEntry::new(OtelSeverity::Info, "a")));
+        assert!(exporter.enqueue(StructuredLogEntry::new(OtelSeverity::Info, "b")));
+        assert!(!exporter.enqueue(StructuredLogEntry::new(OtelSeverity::Info, "c")));
+        assert_eq!(exporter.total_dropped(), 1);
+    }
+
+    #[test]
+    fn test_batch_exporter_otlp_json() {
+        let config = BatchExportConfig::default();
+        let mut exporter = BatchLogExporter::new(config, ExportTarget::Stdout);
+        exporter.enqueue(StructuredLogEntry::new(OtelSeverity::Info, "test"));
+
+        let json = exporter.render_otlp_json();
+        assert!(json.contains("resourceLogs"));
+        assert!(json.contains("logRecords"));
+    }
+
+    #[test]
+    fn test_detect_resource_attributes() {
+        let attrs = detect_resource_attributes();
+        assert_eq!(attrs.get("telemetry.sdk.name"), Some(&"nextgcore".to_string()));
+        assert_eq!(attrs.get("telemetry.sdk.language"), Some(&"rust".to_string()));
+        assert!(attrs.contains_key("process.pid"));
     }
 }

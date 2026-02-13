@@ -141,6 +141,56 @@ impl ProgrammablePlane {
     pub fn stage_count(&self) -> usize {
         self.stages.len()
     }
+
+    /// Classify a packet against a specific stage's match-action table.
+    /// Returns the first matching entry's (id, action) or None.
+    pub fn classify_packet(
+        &mut self,
+        table_id: u32,
+        packet_fields: &[MatchField],
+    ) -> Option<(u32, ForwardingAction)> {
+        self.total_packets += 1;
+        let stage = self.stages.iter_mut().find(|s| s.table_id == table_id)?;
+
+        for entry in &mut stage.entries {
+            let all_match = entry.matches.iter().all(|em| packet_fields.contains(em));
+            // Empty match list acts as wildcard (matches everything)
+            if entry.matches.is_empty() || all_match {
+                entry.hit_count += 1;
+                return Some((entry.id, entry.action.clone()));
+            }
+        }
+        None
+    }
+
+    /// Get statistics for a pipeline stage.
+    pub fn stage_stats(&self, table_id: u32) -> Option<PipelineStageStats> {
+        let stage = self.stages.iter().find(|s| s.table_id == table_id)?;
+        Some(PipelineStageStats {
+            name: stage.name.clone(),
+            table_id: stage.table_id,
+            entry_count: stage.entries.len(),
+            total_hits: stage.entries.iter().map(|e| e.hit_count).sum(),
+        })
+    }
+
+    /// Total packets processed.
+    pub fn total_packets(&self) -> u64 {
+        self.total_packets
+    }
+}
+
+/// Statistics for a pipeline stage.
+#[derive(Debug, Clone)]
+pub struct PipelineStageStats {
+    /// Stage name.
+    pub name: String,
+    /// Table ID.
+    pub table_id: u32,
+    /// Number of entries.
+    pub entry_count: usize,
+    /// Total hit count across all entries.
+    pub total_hits: u64,
 }
 
 // ============================================================================
@@ -294,5 +344,61 @@ mod tests {
 
         profile.update_state(0.5);
         assert!(!profile.should_shed_load());
+    }
+
+    #[test]
+    fn test_classify_packet() {
+        let mut plane = ProgrammablePlane::new();
+        // Add a TEID match rule
+        plane.add_entry(
+            0, // ingress_classifier
+            vec![MatchField::GtpTeid(0xABCD)],
+            ForwardingAction::GtpDecap,
+            100,
+        );
+        // Add a default drop
+        plane.add_entry(
+            0,
+            vec![],
+            ForwardingAction::Drop,
+            1,
+        );
+
+        // Packet with matching TEID should hit the first rule
+        let result = plane.classify_packet(0, &[MatchField::GtpTeid(0xABCD)]);
+        assert!(result.is_some());
+        let (entry_id, _action) = result.unwrap();
+        assert!(entry_id > 0);
+    }
+
+    #[test]
+    fn test_classify_no_match() {
+        let mut plane = ProgrammablePlane::new();
+        plane.add_entry(
+            0,
+            vec![MatchField::GtpTeid(0x1111)],
+            ForwardingAction::Drop,
+            100,
+        );
+
+        // Packet with non-matching TEID
+        let result = plane.classify_packet(0, &[MatchField::GtpTeid(0x2222)]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_pipeline_stats() {
+        let mut plane = ProgrammablePlane::new();
+        plane.add_entry(0, vec![MatchField::GtpTeid(0xAA)], ForwardingAction::GtpDecap, 100);
+
+        // Classify a few packets to increment hit count
+        plane.classify_packet(0, &[MatchField::GtpTeid(0xAA)]);
+        plane.classify_packet(0, &[MatchField::GtpTeid(0xAA)]);
+
+        let stats = plane.stage_stats(0);
+        assert!(stats.is_some());
+        let stats = stats.unwrap();
+        assert_eq!(stats.entry_count, 1);
+        assert_eq!(stats.total_hits, 2);
     }
 }

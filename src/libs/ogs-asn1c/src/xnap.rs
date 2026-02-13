@@ -42,6 +42,14 @@ pub enum XnApProcedure {
     SNodeChange = 14,
     /// Activity Notification.
     ActivityNotification = 15,
+
+    // 6G extensions
+    /// ISAC Sensing Configuration (6G).
+    IsacSensingConfig = 50,
+    /// Energy Saving Indication (6G).
+    EnergySavingIndication = 51,
+    /// AI/ML Model Transfer (6G).
+    AiMlModelTransfer = 52,
 }
 
 // ============================================================================
@@ -182,6 +190,66 @@ pub struct TaiSupportItem {
 }
 
 // ============================================================================
+// 6G Extension Messages
+// ============================================================================
+
+/// ISAC Sensing Configuration Request (6G extension).
+#[derive(Debug, Clone)]
+pub struct IsacSensingConfigRequest {
+    /// Sensing type requested.
+    pub sensing_type: u8,
+    /// Sensing mode (monostatic=0, bistatic=1, multistatic=2).
+    pub sensing_mode: u8,
+    /// Sensing bandwidth (MHz).
+    pub bandwidth_mhz: u16,
+    /// Sensing periodicity (ms).
+    pub periodicity_ms: u16,
+    /// Maximum range (meters).
+    pub max_range_m: u16,
+    /// Sensing resource ratio (0-100, percentage).
+    pub resource_ratio_pct: u8,
+}
+
+/// Energy Saving Indication (6G extension).
+#[derive(Debug, Clone)]
+pub struct EnergySavingIndication {
+    /// Cell ID for energy saving.
+    pub cell_id: u64,
+    /// Action: 0=enter_sleep, 1=wake_up, 2=reduce_power.
+    pub action: u8,
+    /// Duration in seconds (0=indefinite).
+    pub duration_secs: u32,
+    /// Target power reduction percentage (0-100).
+    pub power_reduction_pct: u8,
+}
+
+/// Encode an ISAC Sensing Configuration Request.
+pub fn encode_isac_sensing_config(msg: &IsacSensingConfigRequest) -> PerResult<Vec<u8>> {
+    let mut encoder = AperEncoder::new();
+    encoder.encode_constrained_whole_number(XnApProcedure::IsacSensingConfig as i64, &Constraint::new(0, 255))?;
+    encoder.encode_constrained_whole_number(0, &Constraint::new(0, 2))?; // Criticality
+    encoder.encode_constrained_whole_number(msg.sensing_type as i64, &Constraint::new(0, 7))?;
+    encoder.encode_constrained_whole_number(msg.sensing_mode as i64, &Constraint::new(0, 4))?;
+    encoder.encode_constrained_whole_number(msg.bandwidth_mhz as i64, &Constraint::new(1, 10000))?;
+    encoder.encode_constrained_whole_number(msg.periodicity_ms as i64, &Constraint::new(1, 10000))?;
+    encoder.encode_constrained_whole_number(msg.max_range_m as i64, &Constraint::new(1, 65535))?;
+    encoder.encode_constrained_whole_number(msg.resource_ratio_pct as i64, &Constraint::new(0, 100))?;
+    Ok(encoder.into_bytes().to_vec())
+}
+
+/// Encode an Energy Saving Indication.
+pub fn encode_energy_saving_indication(msg: &EnergySavingIndication) -> PerResult<Vec<u8>> {
+    let mut encoder = AperEncoder::new();
+    encoder.encode_constrained_whole_number(XnApProcedure::EnergySavingIndication as i64, &Constraint::new(0, 255))?;
+    encoder.encode_constrained_whole_number(0, &Constraint::new(0, 2))?; // Criticality
+    encoder.encode_unconstrained_whole_number(msg.cell_id as i64)?;
+    encoder.encode_constrained_whole_number(msg.action as i64, &Constraint::new(0, 2))?;
+    encoder.encode_unconstrained_whole_number(msg.duration_secs as i64)?;
+    encoder.encode_constrained_whole_number(msg.power_reduction_pct as i64, &Constraint::new(0, 100))?;
+    Ok(encoder.into_bytes().to_vec())
+}
+
+// ============================================================================
 // XnAP Codec Functions
 // ============================================================================
 
@@ -225,6 +293,9 @@ pub fn decode_xnap_procedure(data: &[u8]) -> PerResult<XnApProcedure> {
         4 => Ok(XnApProcedure::UeContextRelease),
         5 => Ok(XnApProcedure::HandoverCancel),
         10 => Ok(XnApProcedure::SNodeAddition),
+        50 => Ok(XnApProcedure::IsacSensingConfig),
+        51 => Ok(XnApProcedure::EnergySavingIndication),
+        52 => Ok(XnApProcedure::AiMlModelTransfer),
         _ => Err(PerError::DecodeError(format!("Unknown XnAP procedure: {code}"))),
     }
 }
@@ -289,5 +360,44 @@ mod tests {
     fn test_xn_cause() {
         let cause = XnCause::RadioNetwork(XnCauseRadioNetwork::ReduceLoad);
         assert!(matches!(cause, XnCause::RadioNetwork(XnCauseRadioNetwork::ReduceLoad)));
+    }
+
+    #[test]
+    fn test_isac_sensing_config_encode_decode() {
+        let msg = IsacSensingConfigRequest {
+            sensing_type: 0,   // TargetDetection
+            sensing_mode: 0,   // Monostatic
+            bandwidth_mhz: 100,
+            periodicity_ms: 100,
+            max_range_m: 200,
+            resource_ratio_pct: 10,
+        };
+        let bytes = encode_isac_sensing_config(&msg).unwrap();
+        assert!(!bytes.is_empty());
+
+        let proc = decode_xnap_procedure(&bytes).unwrap();
+        assert_eq!(proc, XnApProcedure::IsacSensingConfig);
+    }
+
+    #[test]
+    fn test_energy_saving_indication_encode_decode() {
+        let msg = EnergySavingIndication {
+            cell_id: 0x123456,
+            action: 0, // enter_sleep
+            duration_secs: 300,
+            power_reduction_pct: 50,
+        };
+        let bytes = encode_energy_saving_indication(&msg).unwrap();
+        assert!(!bytes.is_empty());
+
+        let proc = decode_xnap_procedure(&bytes).unwrap();
+        assert_eq!(proc, XnApProcedure::EnergySavingIndication);
+    }
+
+    #[test]
+    fn test_6g_procedure_codes() {
+        assert_eq!(XnApProcedure::IsacSensingConfig as u8, 50);
+        assert_eq!(XnApProcedure::EnergySavingIndication as u8, 51);
+        assert_eq!(XnApProcedure::AiMlModelTransfer as u8, 52);
     }
 }

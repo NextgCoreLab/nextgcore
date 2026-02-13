@@ -248,4 +248,170 @@ mod tests {
         assert_eq!(translator.translation_count(), 1);
         assert_eq!(translator.policy_count(), 1);
     }
+
+    #[test]
+    fn test_sla_policy_adapter_no_violation() {
+        let adapter = SlaPolicyAdapter::new(0.2);
+        let policy = GeneratedPolicy {
+            intent_id: 1,
+            five_qi: 9,
+            arp_priority: 10,
+            mbr_dl_kbps: 100_000,
+            mbr_ul_kbps: 50_000,
+            gbr_dl_kbps: 0,
+            gbr_ul_kbps: 0,
+            drx_cycle_ms: 320,
+            energy_mode: EnergyPolicyMode::Normal,
+        };
+        let feedback = SlaFeedback {
+            latency_ms: 5.0,
+            target_latency_ms: 10.0,
+            throughput_mbps: 200.0,
+            target_throughput_mbps: 100.0,
+            packet_loss_pct: 0.01,
+            target_packet_loss_pct: 1.0,
+        };
+
+        let adapted = adapter.adapt(&policy, &feedback);
+        // No violations, policy should be unchanged
+        assert_eq!(adapted.drx_cycle_ms, policy.drx_cycle_ms);
+    }
+
+    #[test]
+    fn test_sla_policy_adapter_latency_violation() {
+        let adapter = SlaPolicyAdapter::new(0.5);
+        let policy = GeneratedPolicy {
+            intent_id: 2,
+            five_qi: 9,
+            arp_priority: 10,
+            mbr_dl_kbps: 100_000,
+            mbr_ul_kbps: 50_000,
+            gbr_dl_kbps: 0,
+            gbr_ul_kbps: 0,
+            drx_cycle_ms: 320,
+            energy_mode: EnergyPolicyMode::Normal,
+        };
+        let feedback = SlaFeedback {
+            latency_ms: 15.0,
+            target_latency_ms: 10.0,
+            throughput_mbps: 200.0,
+            target_throughput_mbps: 100.0,
+            packet_loss_pct: 0.01,
+            target_packet_loss_pct: 1.0,
+        };
+
+        let adapted = adapter.adapt(&policy, &feedback);
+        // Latency violation: DRX should decrease
+        assert!(adapted.drx_cycle_ms < policy.drx_cycle_ms);
+    }
+
+    #[test]
+    fn test_sla_policy_adapter_throughput_violation() {
+        let adapter = SlaPolicyAdapter::new(0.5);
+        let policy = GeneratedPolicy {
+            intent_id: 3,
+            five_qi: 9,
+            arp_priority: 10,
+            mbr_dl_kbps: 100_000,
+            mbr_ul_kbps: 50_000,
+            gbr_dl_kbps: 0,
+            gbr_ul_kbps: 0,
+            drx_cycle_ms: 320,
+            energy_mode: EnergyPolicyMode::Normal,
+        };
+        let feedback = SlaFeedback {
+            latency_ms: 5.0,
+            target_latency_ms: 10.0,
+            throughput_mbps: 50.0,
+            target_throughput_mbps: 100.0,
+            packet_loss_pct: 0.01,
+            target_packet_loss_pct: 1.0,
+        };
+
+        let adapted = adapter.adapt(&policy, &feedback);
+        // Throughput violation: MBR should increase
+        assert!(adapted.mbr_dl_kbps > policy.mbr_dl_kbps);
+    }
+}
+
+// ============================================================================
+// SLA-Aware Policy Adaptation (B6.4)
+// ============================================================================
+
+/// Real-time SLA feedback for policy adaptation.
+#[derive(Debug, Clone)]
+pub struct SlaFeedback {
+    /// Current measured latency (ms).
+    pub latency_ms: f64,
+    /// Target latency (ms).
+    pub target_latency_ms: f64,
+    /// Current measured throughput (Mbps).
+    pub throughput_mbps: f64,
+    /// Target throughput (Mbps).
+    pub target_throughput_mbps: f64,
+    /// Current packet loss percentage.
+    pub packet_loss_pct: f64,
+    /// Target packet loss percentage.
+    pub target_packet_loss_pct: f64,
+}
+
+impl SlaFeedback {
+    /// Whether latency SLA is violated.
+    pub fn latency_violated(&self) -> bool {
+        self.latency_ms > self.target_latency_ms
+    }
+
+    /// Whether throughput SLA is violated.
+    pub fn throughput_violated(&self) -> bool {
+        self.throughput_mbps < self.target_throughput_mbps
+    }
+
+    /// Whether packet loss SLA is violated.
+    pub fn packet_loss_violated(&self) -> bool {
+        self.packet_loss_pct > self.target_packet_loss_pct
+    }
+}
+
+/// SLA-aware policy adapter that tunes generated policies in response to
+/// real-time SLA measurements.
+pub struct SlaPolicyAdapter {
+    /// Adaptation aggressiveness (0.0 to 1.0).
+    aggressiveness: f64,
+}
+
+impl SlaPolicyAdapter {
+    /// Create a new SLA policy adapter.
+    pub fn new(aggressiveness: f64) -> Self {
+        Self {
+            aggressiveness: aggressiveness.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Adapt a policy based on SLA feedback.
+    pub fn adapt(&self, policy: &GeneratedPolicy, feedback: &SlaFeedback) -> GeneratedPolicy {
+        let mut adapted = policy.clone();
+
+        // Latency violation: reduce DRX cycle (more frequent scheduling)
+        if feedback.latency_violated() {
+            let ratio = feedback.latency_ms / feedback.target_latency_ms;
+            let reduction = (ratio - 1.0) * self.aggressiveness;
+            let new_drx = (adapted.drx_cycle_ms as f64 * (1.0 - reduction).max(0.1)) as u32;
+            adapted.drx_cycle_ms = new_drx.max(5); // minimum 5ms
+        }
+
+        // Throughput violation: increase MBR
+        if feedback.throughput_violated() {
+            let ratio = feedback.target_throughput_mbps / feedback.throughput_mbps.max(0.001);
+            let increase = (ratio - 1.0) * self.aggressiveness;
+            adapted.mbr_dl_kbps = (adapted.mbr_dl_kbps as f64 * (1.0 + increase)) as u64;
+            adapted.mbr_ul_kbps = (adapted.mbr_ul_kbps as f64 * (1.0 + increase)) as u64;
+        }
+
+        // Packet loss violation: increase ARP priority (lower number = higher priority)
+        if feedback.packet_loss_violated() && adapted.arp_priority > 1 {
+            adapted.arp_priority = adapted.arp_priority.saturating_sub(1);
+        }
+
+        adapted
+    }
 }

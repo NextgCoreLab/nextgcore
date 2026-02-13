@@ -51,7 +51,10 @@ pub use sockopt::OgsSockopt;
 pub use poll::{OgsPollset, OGS_POLLIN, OGS_POLLOUT};
 pub use async_timer::{AsyncTimerMgr, AsyncTimerEntry, TimerMode, compute_poll_interval};
 pub use lockfree::{LockFreeQueue, LockFreeStack, LockFreeHashMap};
-pub use otel_log::{OtelSeverity, StructuredLogEntry, StructuredLogger, LogValue};
+pub use otel_log::{
+    OtelSeverity, StructuredLogEntry, StructuredLogger, LogValue,
+    BatchExportConfig, BatchLogExporter, ExportTarget, detect_resource_attributes,
+};
 pub use distributed_timer::{
     DistTimerId, DistTimerEntry, DistTimerManager, TimerScope,
     ClockSyncInfo, ClockSyncState,

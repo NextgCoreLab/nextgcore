@@ -1674,3 +1674,262 @@ mod version_tests {
         assert_eq!(versions[2].version, 1);
     }
 }
+
+//
+// B3.4: Configuration Drift Detection (6G Feature)
+//
+
+/// Drift severity level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DriftSeverity {
+    /// Cosmetic difference, no operational impact.
+    Info,
+    /// Minor drift, may affect performance.
+    Warning,
+    /// Significant drift, likely affects SLA compliance.
+    Error,
+    /// Critical drift, immediate remediation required.
+    Critical,
+}
+
+/// A single detected configuration drift.
+#[derive(Debug, Clone)]
+pub struct ConfigDrift {
+    /// Human-readable path to the drifted parameter (e.g. "max.ue").
+    pub path: String,
+    /// Expected value (from desired/golden config).
+    pub expected: String,
+    /// Actual value (from running config).
+    pub actual: String,
+    /// Severity of this drift.
+    pub severity: DriftSeverity,
+    /// Detection timestamp (epoch seconds).
+    pub detected_at: u64,
+}
+
+/// Result of a drift detection scan.
+#[derive(Debug, Clone)]
+pub struct DriftReport {
+    /// Detected drifts.
+    pub drifts: Vec<ConfigDrift>,
+    /// Scan timestamp.
+    pub scanned_at: u64,
+    /// Whether the configuration is fully compliant (no drifts).
+    pub compliant: bool,
+}
+
+/// Configuration drift detector compares running config against a desired baseline.
+pub struct ConfigDriftDetector {
+    /// Desired/golden global configuration.
+    desired_global: OgsGlobalConf,
+    /// Desired/golden local configuration.
+    desired_local: OgsLocalConf,
+    /// Total scans performed.
+    scan_count: u64,
+    /// Total drifts ever detected.
+    total_drifts: u64,
+}
+
+impl ConfigDriftDetector {
+    /// Create a new drift detector with desired baseline configs.
+    pub fn new(desired_global: OgsGlobalConf, desired_local: OgsLocalConf) -> Self {
+        Self {
+            desired_global,
+            desired_local,
+            scan_count: 0,
+            total_drifts: 0,
+        }
+    }
+
+    /// Update the desired baseline.
+    pub fn update_baseline(&mut self, global: OgsGlobalConf, local: OgsLocalConf) {
+        self.desired_global = global;
+        self.desired_local = local;
+    }
+
+    /// Detect drifts between running config and desired baseline.
+    pub fn detect(
+        &mut self,
+        running_global: &OgsGlobalConf,
+        running_local: &OgsLocalConf,
+    ) -> DriftReport {
+        self.scan_count += 1;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut drifts = Vec::new();
+
+        // Check global config drifts
+        if running_global.max.ue != self.desired_global.max.ue {
+            drifts.push(ConfigDrift {
+                path: "max.ue".to_string(),
+                expected: self.desired_global.max.ue.to_string(),
+                actual: running_global.max.ue.to_string(),
+                severity: DriftSeverity::Warning,
+                detected_at: now,
+            });
+        }
+        if running_global.max.peer != self.desired_global.max.peer {
+            drifts.push(ConfigDrift {
+                path: "max.peer".to_string(),
+                expected: self.desired_global.max.peer.to_string(),
+                actual: running_global.max.peer.to_string(),
+                severity: DriftSeverity::Warning,
+                detected_at: now,
+            });
+        }
+        if running_global.parameter.no_ipv4 != self.desired_global.parameter.no_ipv4 {
+            drifts.push(ConfigDrift {
+                path: "parameter.no_ipv4".to_string(),
+                expected: self.desired_global.parameter.no_ipv4.to_string(),
+                actual: running_global.parameter.no_ipv4.to_string(),
+                severity: DriftSeverity::Error,
+                detected_at: now,
+            });
+        }
+        if running_global.parameter.no_ipv6 != self.desired_global.parameter.no_ipv6 {
+            drifts.push(ConfigDrift {
+                path: "parameter.no_ipv6".to_string(),
+                expected: self.desired_global.parameter.no_ipv6.to_string(),
+                actual: running_global.parameter.no_ipv6.to_string(),
+                severity: DriftSeverity::Error,
+                detected_at: now,
+            });
+        }
+
+        // Check local config drifts
+        if running_local.time.nf_instance.validity_duration != self.desired_local.time.nf_instance.validity_duration {
+            drifts.push(ConfigDrift {
+                path: "time.nf_instance.validity_duration".to_string(),
+                expected: self.desired_local.time.nf_instance.validity_duration.to_string(),
+                actual: running_local.time.nf_instance.validity_duration.to_string(),
+                severity: DriftSeverity::Warning,
+                detected_at: now,
+            });
+        }
+        if running_local.time.nf_instance.heartbeat_interval != self.desired_local.time.nf_instance.heartbeat_interval {
+            drifts.push(ConfigDrift {
+                path: "time.nf_instance.heartbeat_interval".to_string(),
+                expected: self.desired_local.time.nf_instance.heartbeat_interval.to_string(),
+                actual: running_local.time.nf_instance.heartbeat_interval.to_string(),
+                severity: DriftSeverity::Warning,
+                detected_at: now,
+            });
+        }
+        if running_local.time.message.duration != self.desired_local.time.message.duration {
+            drifts.push(ConfigDrift {
+                path: "time.message.duration".to_string(),
+                expected: self.desired_local.time.message.duration.to_string(),
+                actual: running_local.time.message.duration.to_string(),
+                severity: DriftSeverity::Critical,
+                detected_at: now,
+            });
+        }
+
+        self.total_drifts += drifts.len() as u64;
+        let compliant = drifts.is_empty();
+
+        DriftReport {
+            drifts,
+            scanned_at: now,
+            compliant,
+        }
+    }
+
+    /// Get the worst severity from a drift report.
+    pub fn worst_severity(report: &DriftReport) -> Option<DriftSeverity> {
+        report.drifts.iter().map(|d| d.severity).max()
+    }
+
+    /// Number of scans performed.
+    pub fn scan_count(&self) -> u64 {
+        self.scan_count
+    }
+
+    /// Total drifts ever detected.
+    pub fn total_drifts(&self) -> u64 {
+        self.total_drifts
+    }
+}
+
+#[cfg(test)]
+mod drift_tests {
+    use super::*;
+
+    #[test]
+    fn test_no_drift() {
+        let global = OgsGlobalConf::new();
+        let local = OgsLocalConf::new();
+        let mut detector = ConfigDriftDetector::new(global.clone(), local.clone());
+
+        let report = detector.detect(&global, &local);
+        assert!(report.compliant);
+        assert!(report.drifts.is_empty());
+    }
+
+    #[test]
+    fn test_detect_ue_drift() {
+        let global = OgsGlobalConf::new();
+        let local = OgsLocalConf::new();
+        let mut detector = ConfigDriftDetector::new(global.clone(), local.clone());
+
+        let mut drifted_global = global.clone();
+        drifted_global.max.ue = 4096;
+
+        let report = detector.detect(&drifted_global, &local);
+        assert!(!report.compliant);
+        assert_eq!(report.drifts.len(), 1);
+        assert_eq!(report.drifts[0].path, "max.ue");
+        assert_eq!(report.drifts[0].severity, DriftSeverity::Warning);
+    }
+
+    #[test]
+    fn test_detect_message_duration_drift() {
+        let global = OgsGlobalConf::new();
+        let local = OgsLocalConf::new();
+        let mut detector = ConfigDriftDetector::new(global.clone(), local.clone());
+
+        let mut drifted_local = local.clone();
+        drifted_local.time.message.duration = ogs_time_from_sec(30);
+
+        let report = detector.detect(&global, &drifted_local);
+        assert!(!report.compliant);
+        assert_eq!(ConfigDriftDetector::worst_severity(&report), Some(DriftSeverity::Critical));
+    }
+
+    #[test]
+    fn test_drift_detector_counters() {
+        let global = OgsGlobalConf::new();
+        let local = OgsLocalConf::new();
+        let mut detector = ConfigDriftDetector::new(global.clone(), local.clone());
+
+        let mut drifted = global.clone();
+        drifted.max.ue = 999;
+
+        detector.detect(&drifted, &local);
+        detector.detect(&drifted, &local);
+
+        assert_eq!(detector.scan_count(), 2);
+        assert_eq!(detector.total_drifts(), 2);
+    }
+
+    #[test]
+    fn test_update_baseline() {
+        let global = OgsGlobalConf::new();
+        let local = OgsLocalConf::new();
+        let mut detector = ConfigDriftDetector::new(global.clone(), local.clone());
+
+        let mut updated = global.clone();
+        updated.max.ue = 4096;
+
+        // Before baseline update, this is a drift
+        let report = detector.detect(&updated, &local);
+        assert!(!report.compliant);
+
+        // After baseline update, no drift
+        detector.update_baseline(updated.clone(), local.clone());
+        let report = detector.detect(&updated, &local);
+        assert!(report.compliant);
+    }
+}

@@ -357,6 +357,48 @@ pub fn zuc256_eia3_c(
     1
 }
 
+/// ZUC-256 EIA3 with 64-bit MAC (8 bytes) for enhanced integrity.
+///
+/// Uses two sequential keystream evaluations to produce an 8-byte MAC
+/// instead of the standard 4-byte MAC, providing stronger forgery resistance.
+pub fn zuc256_eia3_64(key: &[u8; 32], iv: &[u8; 25], data: &[u8]) -> [u8; 8] {
+    // Compute first 4-byte MAC with the original IV
+    let mac_lo = zuc256_eia3(key, iv, data);
+
+    // Compute second 4-byte MAC with a modified IV (flip LSB of first byte)
+    let mut iv2 = *iv;
+    iv2[0] ^= 0x01;
+    let mac_hi = zuc256_eia3(key, &iv2, data);
+
+    let mut mac64 = [0u8; 8];
+    mac64[..4].copy_from_slice(&mac_hi);
+    mac64[4..].copy_from_slice(&mac_lo);
+    mac64
+}
+
+/// Derive a subkey from a master key using ZUC-256 keystream.
+///
+/// Generates `output_len` bytes of key material by running ZUC-256 with the
+/// given key and IV, then extracting keystream bytes.
+pub fn zuc256_kdf(key: &[u8; 32], iv: &[u8; 25], output_len: usize) -> Vec<u8> {
+    let mut state = Zuc256State::new();
+    state.initialize(key, iv);
+
+    let num_words = output_len.div_ceil(4);
+    let mut keystream = vec![0u32; num_words];
+    state.generate_keystream(&mut keystream);
+
+    let mut output = Vec::with_capacity(output_len);
+    for word in &keystream {
+        output.extend_from_slice(&word.to_be_bytes());
+        if output.len() >= output_len {
+            break;
+        }
+    }
+    output.truncate(output_len);
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +528,58 @@ mod tests {
         let ct2 = zuc256_eea3(&key2, &iv, data);
 
         assert_ne!(ct1, ct2);
+    }
+
+    #[test]
+    fn test_zuc256_eia3_64() {
+        let key = [0x17u8; 32];
+        let iv = [0x3Du8; 25];
+        let data = b"64-bit MAC integrity test";
+
+        let mac64 = zuc256_eia3_64(&key, &iv, data);
+        assert_ne!(mac64, [0; 8]);
+        assert_eq!(mac64.len(), 8);
+
+        // Deterministic
+        let mac64_2 = zuc256_eia3_64(&key, &iv, data);
+        assert_eq!(mac64, mac64_2);
+    }
+
+    #[test]
+    fn test_zuc256_eia3_64_different_data() {
+        let key = [0xABu8; 32];
+        let iv = [0xCDu8; 25];
+
+        let mac_a = zuc256_eia3_64(&key, &iv, b"Data A");
+        let mac_b = zuc256_eia3_64(&key, &iv, b"Data B");
+        assert_ne!(mac_a, mac_b);
+    }
+
+    #[test]
+    fn test_zuc256_kdf() {
+        let key = [0x42u8; 32];
+        let iv = [0x13u8; 25];
+
+        let derived = zuc256_kdf(&key, &iv, 16);
+        assert_eq!(derived.len(), 16);
+        assert!(derived.iter().any(|&b| b != 0));
+
+        // Deterministic
+        let derived2 = zuc256_kdf(&key, &iv, 16);
+        assert_eq!(derived, derived2);
+    }
+
+    #[test]
+    fn test_zuc256_kdf_different_lengths() {
+        let key = [0x42u8; 32];
+        let iv = [0x13u8; 25];
+
+        let d16 = zuc256_kdf(&key, &iv, 16);
+        let d32 = zuc256_kdf(&key, &iv, 32);
+        assert_eq!(d16.len(), 16);
+        assert_eq!(d32.len(), 32);
+        // First 16 bytes should match
+        assert_eq!(&d16[..], &d32[..16]);
     }
 
     #[test]

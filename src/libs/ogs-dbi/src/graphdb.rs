@@ -339,6 +339,78 @@ impl GraphDbClient {
         self.relationships.clear();
         self.next_id = 1;
     }
+
+    /// Get neighbor node IDs (nodes connected via outgoing relationships).
+    pub fn neighbors(&self, node_id: &str) -> Vec<String> {
+        self.relationships
+            .values()
+            .filter_map(|rel| {
+                if rel.from_node == node_id {
+                    Some(rel.to_node.clone())
+                } else if rel.to_node == node_id {
+                    Some(rel.from_node.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// BFS shortest path between two nodes. Returns node ID sequence or None.
+    pub fn shortest_path(&self, from: &str, to: &str) -> Option<Vec<String>> {
+        if from == to {
+            return Some(vec![from.to_string()]);
+        }
+        if !self.nodes.contains_key(from) || !self.nodes.contains_key(to) {
+            return None;
+        }
+
+        let mut visited = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        // Queue entries: (current_node, path_so_far)
+        queue.push_back((from.to_string(), vec![from.to_string()]));
+        visited.insert(from.to_string());
+
+        while let Some((current, path)) = queue.pop_front() {
+            for neighbor in self.neighbors(&current) {
+                if neighbor == to {
+                    let mut result = path;
+                    result.push(neighbor);
+                    return Some(result);
+                }
+                if visited.insert(neighbor.clone()) {
+                    let mut new_path = path.clone();
+                    new_path.push(neighbor.clone());
+                    queue.push_back((neighbor, new_path));
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract a subgraph containing all nodes with a given label and their relationships.
+    pub fn subgraph_by_label(&self, label: &str) -> (Vec<&GraphNode>, Vec<&GraphRelationship>) {
+        let node_ids: std::collections::HashSet<&str> = self
+            .nodes
+            .values()
+            .filter(|n| n.labels.contains(&label.to_string()))
+            .map(|n| n.id.as_str())
+            .collect();
+
+        let nodes: Vec<&GraphNode> = self
+            .nodes
+            .values()
+            .filter(|n| node_ids.contains(n.id.as_str()))
+            .collect();
+
+        let rels: Vec<&GraphRelationship> = self
+            .relationships
+            .values()
+            .filter(|r| node_ids.contains(r.from_node.as_str()) || node_ids.contains(r.to_node.as_str()))
+            .collect();
+
+        (nodes, rels)
+    }
 }
 
 /// Network topology graph helper
@@ -557,5 +629,68 @@ mod tests {
 
         let bool_val = PropertyValue::Bool(true);
         assert_eq!(bool_val.as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_bfs_neighbors() {
+        let mut client = GraphDbClient::in_memory();
+        let n1 = client.create_node(vec!["A".into()], HashMap::new()).unwrap();
+        let n2 = client.create_node(vec!["B".into()], HashMap::new()).unwrap();
+        let n3 = client.create_node(vec!["C".into()], HashMap::new()).unwrap();
+        let n4 = client.create_node(vec!["D".into()], HashMap::new()).unwrap();
+        client.create_relationship(&n1.id, &n2.id, "LINK", HashMap::new()).unwrap();
+        client.create_relationship(&n2.id, &n3.id, "LINK", HashMap::new()).unwrap();
+        client.create_relationship(&n3.id, &n4.id, "LINK", HashMap::new()).unwrap();
+
+        let path = client.shortest_path(&n1.id, &n4.id);
+        assert!(path.is_some());
+        let path = path.unwrap();
+        assert_eq!(path.len(), 4);
+        assert_eq!(path[0], n1.id);
+        assert_eq!(path[3], n4.id);
+    }
+
+    #[test]
+    fn test_bfs_no_path() {
+        let mut client = GraphDbClient::in_memory();
+        let n1 = client.create_node(vec!["A".into()], HashMap::new()).unwrap();
+        let n2 = client.create_node(vec!["B".into()], HashMap::new()).unwrap();
+        // No relationship between them
+        assert!(client.shortest_path(&n1.id, &n2.id).is_none());
+    }
+
+    #[test]
+    fn test_bfs_same_node() {
+        let mut client = GraphDbClient::in_memory();
+        let n1 = client.create_node(vec!["A".into()], HashMap::new()).unwrap();
+        let path = client.shortest_path(&n1.id, &n1.id).unwrap();
+        assert_eq!(path, vec![n1.id]);
+    }
+
+    #[test]
+    fn test_neighbors() {
+        let mut client = GraphDbClient::in_memory();
+        let n1 = client.create_node(vec!["A".into()], HashMap::new()).unwrap();
+        let n2 = client.create_node(vec!["B".into()], HashMap::new()).unwrap();
+        let n3 = client.create_node(vec!["C".into()], HashMap::new()).unwrap();
+        client.create_relationship(&n1.id, &n2.id, "LINK", HashMap::new()).unwrap();
+        client.create_relationship(&n1.id, &n3.id, "LINK", HashMap::new()).unwrap();
+
+        let neighbors = client.neighbors(&n1.id);
+        assert_eq!(neighbors.len(), 2);
+    }
+
+    #[test]
+    fn test_subgraph_by_label() {
+        let mut client = GraphDbClient::in_memory();
+        let n1 = client.create_node(vec!["UE".into()], HashMap::new()).unwrap();
+        let n2 = client.create_node(vec!["AMF".into()], HashMap::new()).unwrap();
+        let n3 = client.create_node(vec!["UE".into()], HashMap::new()).unwrap();
+        client.create_relationship(&n1.id, &n2.id, "REG", HashMap::new()).unwrap();
+        client.create_relationship(&n3.id, &n2.id, "REG", HashMap::new()).unwrap();
+
+        let (nodes, rels) = client.subgraph_by_label("UE");
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(rels.len(), 2); // Both rels involve a UE node
     }
 }

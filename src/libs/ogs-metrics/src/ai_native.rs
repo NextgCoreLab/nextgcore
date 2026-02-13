@@ -653,3 +653,228 @@ mod tests {
         assert!(violations.is_empty()); // 150 >= 100
     }
 }
+
+// ============================================================================
+// Distributed Trace Correlation for AI Pipelines (B5.2)
+// ============================================================================
+
+/// Trace segment representing one hop in a distributed AI pipeline.
+#[derive(Debug, Clone)]
+pub struct AiTraceSegment {
+    /// Segment identifier.
+    pub segment_id: String,
+    /// Parent segment (None for root).
+    pub parent_id: Option<String>,
+    /// NF that executed this segment.
+    pub nf_id: String,
+    /// Operation name (e.g., "model_inference", "data_collection").
+    pub operation: String,
+    /// Start timestamp (epoch ms).
+    pub start_ms: u64,
+    /// Duration in milliseconds.
+    pub duration_ms: u64,
+    /// Status (true = success).
+    pub success: bool,
+    /// Attributes.
+    pub attributes: HashMap<String, String>,
+}
+
+/// Distributed trace spanning multiple NFs in an AI/ML pipeline.
+#[derive(Debug, Clone)]
+pub struct AiPipelineTrace {
+    /// Trace identifier (unique across the pipeline).
+    pub trace_id: String,
+    /// Pipeline name (e.g., "nwdaf_anomaly_detection").
+    pub pipeline_name: String,
+    /// Ordered segments.
+    pub segments: Vec<AiTraceSegment>,
+    /// Overall status.
+    pub completed: bool,
+}
+
+impl AiPipelineTrace {
+    /// Create a new pipeline trace.
+    pub fn new(trace_id: impl Into<String>, pipeline_name: impl Into<String>) -> Self {
+        Self {
+            trace_id: trace_id.into(),
+            pipeline_name: pipeline_name.into(),
+            segments: Vec::new(),
+            completed: false,
+        }
+    }
+
+    /// Add a trace segment.
+    pub fn add_segment(&mut self, segment: AiTraceSegment) {
+        self.segments.push(segment);
+    }
+
+    /// Total end-to-end latency (first segment start to last segment end).
+    pub fn e2e_latency_ms(&self) -> u64 {
+        if self.segments.is_empty() {
+            return 0;
+        }
+        let earliest = self.segments.iter().map(|s| s.start_ms).min().unwrap_or(0);
+        let latest = self.segments.iter().map(|s| s.start_ms + s.duration_ms).max().unwrap_or(0);
+        latest.saturating_sub(earliest)
+    }
+
+    /// Count of failed segments.
+    pub fn failure_count(&self) -> usize {
+        self.segments.iter().filter(|s| !s.success).count()
+    }
+
+    /// Mark the trace as completed.
+    pub fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+/// AI pipeline trace collector.
+pub struct AiTraceCollector {
+    /// Active traces by trace ID.
+    traces: HashMap<String, AiPipelineTrace>,
+    /// Completed traces (for analysis).
+    completed: Vec<AiPipelineTrace>,
+    /// Max completed traces to retain.
+    max_completed: usize,
+}
+
+impl AiTraceCollector {
+    /// Create a new trace collector.
+    pub fn new(max_completed: usize) -> Self {
+        Self {
+            traces: HashMap::new(),
+            completed: Vec::new(),
+            max_completed,
+        }
+    }
+
+    /// Start a new pipeline trace.
+    pub fn start_trace(&mut self, trace_id: impl Into<String>, pipeline_name: impl Into<String>) -> String {
+        let id: String = trace_id.into();
+        let trace = AiPipelineTrace::new(id.clone(), pipeline_name);
+        self.traces.insert(id.clone(), trace);
+        id
+    }
+
+    /// Add a segment to an active trace.
+    pub fn add_segment(&mut self, trace_id: &str, segment: AiTraceSegment) -> bool {
+        if let Some(trace) = self.traces.get_mut(trace_id) {
+            trace.add_segment(segment);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Complete a trace and move it to the completed list.
+    pub fn complete_trace(&mut self, trace_id: &str) -> bool {
+        if let Some(mut trace) = self.traces.remove(trace_id) {
+            trace.complete();
+            self.completed.push(trace);
+            if self.completed.len() > self.max_completed {
+                self.completed.remove(0);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Get an active trace.
+    pub fn get_trace(&self, trace_id: &str) -> Option<&AiPipelineTrace> {
+        self.traces.get(trace_id)
+    }
+
+    /// Number of active traces.
+    pub fn active_count(&self) -> usize {
+        self.traces.len()
+    }
+
+    /// Number of completed traces.
+    pub fn completed_count(&self) -> usize {
+        self.completed.len()
+    }
+
+    /// Average E2E latency of completed traces (ms).
+    pub fn avg_e2e_latency_ms(&self) -> f64 {
+        if self.completed.is_empty() {
+            return 0.0;
+        }
+        let total: u64 = self.completed.iter().map(|t| t.e2e_latency_ms()).sum();
+        total as f64 / self.completed.len() as f64
+    }
+}
+
+impl Default for AiTraceCollector {
+    fn default() -> Self {
+        Self::new(1000)
+    }
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+
+    #[test]
+    fn test_pipeline_trace_e2e() {
+        let mut trace = AiPipelineTrace::new("t1", "anomaly_detection");
+        trace.add_segment(AiTraceSegment {
+            segment_id: "s1".into(),
+            parent_id: None,
+            nf_id: "nwdaf-1".into(),
+            operation: "data_collection".into(),
+            start_ms: 1000,
+            duration_ms: 50,
+            success: true,
+            attributes: HashMap::new(),
+        });
+        trace.add_segment(AiTraceSegment {
+            segment_id: "s2".into(),
+            parent_id: Some("s1".into()),
+            nf_id: "nwdaf-1".into(),
+            operation: "model_inference".into(),
+            start_ms: 1050,
+            duration_ms: 30,
+            success: true,
+            attributes: HashMap::new(),
+        });
+
+        assert_eq!(trace.e2e_latency_ms(), 80); // 1080 - 1000
+        assert_eq!(trace.failure_count(), 0);
+    }
+
+    #[test]
+    fn test_trace_collector() {
+        let mut collector = AiTraceCollector::new(10);
+        let trace_id = collector.start_trace("t1", "pipeline");
+        assert_eq!(collector.active_count(), 1);
+
+        collector.add_segment(&trace_id, AiTraceSegment {
+            segment_id: "s1".into(),
+            parent_id: None,
+            nf_id: "amf-1".into(),
+            operation: "classify".into(),
+            start_ms: 100,
+            duration_ms: 20,
+            success: true,
+            attributes: HashMap::new(),
+        });
+
+        collector.complete_trace(&trace_id);
+        assert_eq!(collector.active_count(), 0);
+        assert_eq!(collector.completed_count(), 1);
+        assert!((collector.avg_e2e_latency_ms() - 20.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_trace_collector_max_completed() {
+        let mut collector = AiTraceCollector::new(2);
+        for i in 0..5 {
+            let id = format!("t{i}");
+            collector.start_trace(id.clone(), "p");
+            collector.complete_trace(&id);
+        }
+        assert_eq!(collector.completed_count(), 2);
+    }
+}

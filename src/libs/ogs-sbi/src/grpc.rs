@@ -269,6 +269,69 @@ impl GrpcStatus {
 }
 
 // ============================================================================
+// gRPC Service Registry (B6.2)
+// ============================================================================
+
+/// Registry of gRPC service methods with health status tracking.
+pub struct GrpcServiceRegistry {
+    /// Registered methods indexed by (service, method_name).
+    methods: HashMap<(GrpcServiceType, String), GrpcMethod>,
+    /// Service health status (true = serving).
+    serving: HashMap<GrpcServiceType, bool>,
+}
+
+impl GrpcServiceRegistry {
+    /// Creates an empty service registry.
+    pub fn new() -> Self {
+        Self {
+            methods: HashMap::new(),
+            serving: HashMap::new(),
+        }
+    }
+
+    /// Register a gRPC method.
+    pub fn register(&mut self, method: GrpcMethod) {
+        let key = (method.service, method.name.clone());
+        self.methods.insert(key, method);
+    }
+
+    /// Look up a method by service and name.
+    pub fn lookup(&self, service: GrpcServiceType, name: &str) -> Option<&GrpcMethod> {
+        self.methods.get(&(service, name.to_string()))
+    }
+
+    /// List all methods for a service.
+    pub fn list_methods(&self, service: GrpcServiceType) -> Vec<&GrpcMethod> {
+        self.methods
+            .iter()
+            .filter(|((s, _), _)| *s == service)
+            .map(|(_, m)| m)
+            .collect()
+    }
+
+    /// Total registered methods.
+    pub fn method_count(&self) -> usize {
+        self.methods.len()
+    }
+
+    /// Set serving status for a service.
+    pub fn set_serving(&mut self, service: GrpcServiceType, serving: bool) {
+        self.serving.insert(service, serving);
+    }
+
+    /// Check if a service is currently serving.
+    pub fn is_serving(&self, service: GrpcServiceType) -> bool {
+        self.serving.get(&service).copied().unwrap_or(false)
+    }
+}
+
+impl Default for GrpcServiceRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -325,5 +388,39 @@ mod tests {
         assert!(!GrpcStatus::Internal.is_ok());
         assert_eq!(GrpcStatus::Ok.code(), 0);
         assert_eq!(GrpcStatus::Internal.name(), "INTERNAL");
+    }
+
+    #[test]
+    fn test_service_registry() {
+        let mut reg = GrpcServiceRegistry::new();
+        let method = GrpcMethod::unary("GetAnalytics", GrpcServiceType::NnwdafAnalytics);
+        reg.register(method);
+        assert_eq!(reg.method_count(), 1);
+
+        let found = reg.lookup(GrpcServiceType::NnwdafAnalytics, "GetAnalytics");
+        assert!(found.is_some());
+        assert!(reg.lookup(GrpcServiceType::NnwdafAnalytics, "Missing").is_none());
+    }
+
+    #[test]
+    fn test_service_registry_list() {
+        let mut reg = GrpcServiceRegistry::new();
+        reg.register(GrpcMethod::unary("M1", GrpcServiceType::NamfComm));
+        reg.register(GrpcMethod::server_stream("M2", GrpcServiceType::NamfComm));
+        reg.register(GrpcMethod::unary("M3", GrpcServiceType::NsmfPduSession));
+
+        let amf_methods = reg.list_methods(GrpcServiceType::NamfComm);
+        assert_eq!(amf_methods.len(), 2);
+    }
+
+    #[test]
+    fn test_service_registry_health() {
+        let mut reg = GrpcServiceRegistry::new();
+        reg.set_serving(GrpcServiceType::NamfComm, true);
+        assert!(reg.is_serving(GrpcServiceType::NamfComm));
+        assert!(!reg.is_serving(GrpcServiceType::NsmfPduSession));
+
+        reg.set_serving(GrpcServiceType::NamfComm, false);
+        assert!(!reg.is_serving(GrpcServiceType::NamfComm));
     }
 }

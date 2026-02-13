@@ -313,6 +313,74 @@ impl EventBroker {
     pub fn total_delivered(&self) -> u64 {
         self.total_delivered
     }
+
+    /// Publish and also store the event in the replay buffer.
+    pub fn publish_with_replay(
+        &mut self,
+        event: SbiEvent,
+        replay_buffer: &mut EventReplayBuffer,
+    ) -> Vec<(SubscriptionId, String)> {
+        replay_buffer.store(event.clone());
+        self.publish(&event)
+    }
+}
+
+// ============================================================================
+// Event Replay Buffer (B6.2)
+// ============================================================================
+
+/// Stores recent events so that late-joining subscribers can replay missed events.
+pub struct EventReplayBuffer {
+    /// Ring buffer of recent events.
+    events: Vec<SbiEvent>,
+    /// Maximum buffer size.
+    max_size: usize,
+}
+
+impl EventReplayBuffer {
+    /// Creates a new replay buffer.
+    pub fn new(max_size: usize) -> Self {
+        Self {
+            events: Vec::with_capacity(max_size),
+            max_size,
+        }
+    }
+
+    /// Store an event in the buffer.
+    pub fn store(&mut self, event: SbiEvent) {
+        if self.events.len() >= self.max_size {
+            self.events.remove(0);
+        }
+        self.events.push(event);
+    }
+
+    /// Replay events matching a filter since a given timestamp.
+    pub fn replay_since(&self, since_ms: u64, filter: &EventFilter) -> Vec<&SbiEvent> {
+        self.events
+            .iter()
+            .filter(|e| e.timestamp_ms >= since_ms && filter.matches(e))
+            .collect()
+    }
+
+    /// Replay all events matching a filter.
+    pub fn replay_all(&self, filter: &EventFilter) -> Vec<&SbiEvent> {
+        self.events.iter().filter(|e| filter.matches(e)).collect()
+    }
+
+    /// Number of events in the buffer.
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Whether the buffer is empty.
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    /// Clear the buffer.
+    pub fn clear(&mut self) {
+        self.events.clear();
+    }
 }
 
 // ============================================================================
@@ -403,5 +471,61 @@ mod tests {
         let event = SbiEvent::new(1, SbiEventCategory::Analytics, "TEST", "nf-2", "{}");
         let targets = broker.publish(&event);
         assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn test_replay_buffer_store_and_replay() {
+        let mut buf = EventReplayBuffer::new(5);
+        for i in 1..=3 {
+            buf.store(SbiEvent::new(i, SbiEventCategory::Analytics, "TEST", "nf-1", "{}"));
+        }
+        assert_eq!(buf.len(), 3);
+
+        let all = buf.replay_all(&EventFilter::all());
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn test_replay_buffer_max_size() {
+        let mut buf = EventReplayBuffer::new(2);
+        for i in 1..=5 {
+            let mut event = SbiEvent::new(i, SbiEventCategory::Analytics, "TEST", "nf-1", "{}");
+            event.timestamp_ms = i * 1000;
+            buf.store(event);
+        }
+        assert_eq!(buf.len(), 2);
+        // Oldest events should have been evicted
+        let all = buf.replay_all(&EventFilter::all());
+        assert_eq!(all[0].event_id, 4);
+        assert_eq!(all[1].event_id, 5);
+    }
+
+    #[test]
+    fn test_replay_since() {
+        let mut buf = EventReplayBuffer::new(10);
+        for i in 1..=5 {
+            let mut event = SbiEvent::new(i, SbiEventCategory::Analytics, "TEST", "nf-1", "{}");
+            event.timestamp_ms = i * 1000;
+            buf.store(event);
+        }
+
+        let recent = buf.replay_since(3000, &EventFilter::all());
+        assert_eq!(recent.len(), 3); // events at 3000, 4000, 5000
+    }
+
+    #[test]
+    fn test_publish_with_replay() {
+        let mut broker = EventBroker::new();
+        let mut buf = EventReplayBuffer::new(10);
+
+        let sub_id = broker.alloc_subscription_id();
+        let sub = Subscription::new(sub_id, "nf-1", "http://cb", EventFilter::all());
+        broker.subscribe(sub);
+
+        let event = SbiEvent::new(1, SbiEventCategory::Energy, "SAVING_MODE", "upf-1", "{}");
+        let targets = broker.publish_with_replay(event, &mut buf);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(buf.len(), 1);
     }
 }

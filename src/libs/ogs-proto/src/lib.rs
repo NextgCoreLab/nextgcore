@@ -9,6 +9,8 @@ mod event;
 mod timer;
 pub mod ambient_iot;     // #212: Ambient IoT energy harvesting
 pub mod ntn_constellation; // #213: NTN constellation planning
+pub mod isac;            // #216: ISAC sensing types (6G)
+pub mod sub_thz;         // #217: Sub-THz spectrum types (6G)
 
 pub use types::*;
 pub use conv::*;

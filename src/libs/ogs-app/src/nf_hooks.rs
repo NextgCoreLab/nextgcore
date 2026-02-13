@@ -821,6 +821,250 @@ impl NfPowerProfiler {
 }
 
 // ============================================================================
+// B6.5: AI/ML Model Version Registry
+// ============================================================================
+
+/// Deployment status of an ML model on an NF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelDeploymentStatus {
+    /// Model is being downloaded/prepared.
+    Staging,
+    /// Model is active and serving inference.
+    Active,
+    /// Model is being rolled back.
+    RollingBack,
+    /// Model deployment failed.
+    Failed,
+    /// Model was retired.
+    Retired,
+}
+
+/// A deployed ML model instance on an NF.
+#[derive(Debug, Clone)]
+pub struct DeployedModel {
+    /// Model identifier (e.g., "anomaly-detector-v3").
+    pub model_id: String,
+    /// Semantic version (e.g., "3.2.1").
+    pub version: String,
+    /// NF instance where deployed.
+    pub nf_instance_id: String,
+    /// Current status.
+    pub status: ModelDeploymentStatus,
+    /// Accuracy metric (0.0-1.0), updated after validation.
+    pub accuracy: f64,
+    /// Deployment timestamp (ms since epoch).
+    pub deployed_at_ms: u64,
+}
+
+/// Cross-NF ML model version registry for coordinated rollout/rollback.
+pub struct ModelVersionRegistry {
+    /// All deployments: key = (model_id, nf_instance_id).
+    deployments: HashMap<(String, String), DeployedModel>,
+    /// Rollout count.
+    rollout_count: u64,
+    /// Rollback count.
+    rollback_count: u64,
+}
+
+impl Default for ModelVersionRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ModelVersionRegistry {
+    /// Creates a new model version registry.
+    pub fn new() -> Self {
+        Self {
+            deployments: HashMap::new(),
+            rollout_count: 0,
+            rollback_count: 0,
+        }
+    }
+
+    /// Deploy a model version to an NF.
+    pub fn deploy(&mut self, model_id: impl Into<String>, version: impl Into<String>, nf_instance_id: impl Into<String>) {
+        let model_id = model_id.into();
+        let nf_instance_id = nf_instance_id.into();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        self.rollout_count += 1;
+        self.deployments.insert(
+            (model_id.clone(), nf_instance_id.clone()),
+            DeployedModel {
+                model_id,
+                version: version.into(),
+                nf_instance_id,
+                status: ModelDeploymentStatus::Staging,
+                accuracy: 0.0,
+                deployed_at_ms: now,
+            },
+        );
+    }
+
+    /// Activate a staged deployment.
+    pub fn activate(&mut self, model_id: &str, nf_instance_id: &str) -> bool {
+        if let Some(dep) = self.deployments.get_mut(&(model_id.to_string(), nf_instance_id.to_string())) {
+            if dep.status == ModelDeploymentStatus::Staging {
+                dep.status = ModelDeploymentStatus::Active;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Roll back a deployment (marks as RollingBack, then Retired).
+    pub fn rollback(&mut self, model_id: &str, nf_instance_id: &str) -> bool {
+        if let Some(dep) = self.deployments.get_mut(&(model_id.to_string(), nf_instance_id.to_string())) {
+            if dep.status == ModelDeploymentStatus::Active || dep.status == ModelDeploymentStatus::Staging {
+                dep.status = ModelDeploymentStatus::Retired;
+                self.rollback_count += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Update accuracy metric after validation.
+    pub fn update_accuracy(&mut self, model_id: &str, nf_instance_id: &str, accuracy: f64) -> bool {
+        if let Some(dep) = self.deployments.get_mut(&(model_id.to_string(), nf_instance_id.to_string())) {
+            dep.accuracy = accuracy;
+            return true;
+        }
+        false
+    }
+
+    /// Get all NFs running a specific model.
+    pub fn nfs_with_model(&self, model_id: &str) -> Vec<&DeployedModel> {
+        self.deployments.values()
+            .filter(|d| d.model_id == model_id && d.status == ModelDeploymentStatus::Active)
+            .collect()
+    }
+
+    /// Get all models deployed on a specific NF.
+    pub fn models_on_nf(&self, nf_instance_id: &str) -> Vec<&DeployedModel> {
+        self.deployments.values()
+            .filter(|d| d.nf_instance_id == nf_instance_id)
+            .collect()
+    }
+
+    /// Total deployments.
+    pub fn deployment_count(&self) -> usize { self.deployments.len() }
+    /// Active deployments.
+    pub fn active_count(&self) -> usize {
+        self.deployments.values().filter(|d| d.status == ModelDeploymentStatus::Active).count()
+    }
+    /// Total rollouts.
+    pub fn rollout_count(&self) -> u64 { self.rollout_count }
+    /// Total rollbacks.
+    pub fn rollback_count(&self) -> u64 { self.rollback_count }
+}
+
+// ============================================================================
+// B6.6: Digital Twin Scenario Simulator
+// ============================================================================
+
+/// A what-if scenario to evaluate against digital twin state.
+#[derive(Debug, Clone)]
+pub struct WhatIfScenario {
+    /// Scenario name.
+    pub name: String,
+    /// Load multiplier per NF (nf_instance_id → multiplier).
+    pub load_multipliers: HashMap<String, f64>,
+    /// NF failures to simulate (nf_instance_id set).
+    pub simulated_failures: Vec<String>,
+    /// Additional sessions to inject per NF.
+    pub extra_sessions: HashMap<String, u64>,
+}
+
+/// Result of running a what-if scenario.
+#[derive(Debug, Clone)]
+pub struct ScenarioResult {
+    /// Scenario name.
+    pub scenario_name: String,
+    /// Projected NF statuses after scenario.
+    pub projected_statuses: HashMap<String, NfStatus>,
+    /// NFs projected to be overloaded.
+    pub overloaded_nfs: Vec<String>,
+    /// NFs projected as unreachable (failed).
+    pub unreachable_nfs: Vec<String>,
+    /// Total projected load across all NFs.
+    pub total_projected_load: f64,
+    /// Whether the scenario causes SLA risk.
+    pub sla_risk: bool,
+}
+
+/// Runs what-if simulations against the current digital twin state.
+pub struct ScenarioSimulator {
+    /// Simulation run count.
+    simulation_count: u64,
+    /// Overload threshold.
+    overload_threshold: f64,
+}
+
+impl Default for ScenarioSimulator {
+    fn default() -> Self {
+        Self::new(0.9)
+    }
+}
+
+impl ScenarioSimulator {
+    /// Creates a new scenario simulator.
+    pub fn new(overload_threshold: f64) -> Self {
+        Self {
+            simulation_count: 0,
+            overload_threshold,
+        }
+    }
+
+    /// Simulate a what-if scenario against current twin state.
+    pub fn simulate(&mut self, snapshots: &[&NfStateSnapshot], scenario: &WhatIfScenario) -> ScenarioResult {
+        self.simulation_count += 1;
+        let mut projected_statuses = HashMap::new();
+        let mut overloaded_nfs = Vec::new();
+        let mut unreachable_nfs = Vec::new();
+        let mut total_load = 0.0;
+
+        for snap in snapshots {
+            let nf_id = &snap.nf_instance_id;
+
+            // Check if this NF is simulated as failed
+            if scenario.simulated_failures.contains(nf_id) {
+                projected_statuses.insert(nf_id.clone(), NfStatus::Unreachable);
+                unreachable_nfs.push(nf_id.clone());
+                continue;
+            }
+
+            // Apply load multiplier
+            let multiplier = scenario.load_multipliers.get(nf_id).copied().unwrap_or(1.0);
+            let projected_load = (snap.load * multiplier).min(1.0);
+            total_load += projected_load;
+
+            let status = if projected_load > self.overload_threshold {
+                overloaded_nfs.push(nf_id.clone());
+                NfStatus::Overloaded
+            } else {
+                NfStatus::Registered
+            };
+            projected_statuses.insert(nf_id.clone(), status);
+        }
+
+        let sla_risk = !overloaded_nfs.is_empty() || !unreachable_nfs.is_empty();
+
+        ScenarioResult {
+            scenario_name: scenario.name.clone(),
+            projected_statuses,
+            overloaded_nfs,
+            unreachable_nfs,
+            total_projected_load: total_load,
+            sla_risk,
+        }
+    }
+
+    /// Total simulations run.
+    pub fn simulation_count(&self) -> u64 { self.simulation_count }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1047,5 +1291,142 @@ mod tests {
 
         let recs = profiler.recommend_optimizations();
         assert!(recs.iter().any(|r| r.component == PowerComponent::CryptoAccel && r.action == PowerAction::EnableHwOffload));
+    }
+
+    // ---- B6.5: Model Version Registry tests ----
+
+    #[test]
+    fn test_model_registry_deploy_activate() {
+        let mut registry = ModelVersionRegistry::new();
+        registry.deploy("anomaly-det", "1.0.0", "amf-1");
+        assert_eq!(registry.deployment_count(), 1);
+        assert_eq!(registry.active_count(), 0);
+
+        assert!(registry.activate("anomaly-det", "amf-1"));
+        assert_eq!(registry.active_count(), 1);
+        assert_eq!(registry.rollout_count(), 1);
+    }
+
+    #[test]
+    fn test_model_registry_rollback() {
+        let mut registry = ModelVersionRegistry::new();
+        registry.deploy("anomaly-det", "1.0.0", "amf-1");
+        registry.activate("anomaly-det", "amf-1");
+
+        assert!(registry.rollback("anomaly-det", "amf-1"));
+        assert_eq!(registry.active_count(), 0);
+        assert_eq!(registry.rollback_count(), 1);
+    }
+
+    #[test]
+    fn test_model_registry_cross_nf_query() {
+        let mut registry = ModelVersionRegistry::new();
+        registry.deploy("anomaly-det", "2.0.0", "amf-1");
+        registry.deploy("anomaly-det", "2.0.0", "smf-1");
+        registry.deploy("qos-predict", "1.0.0", "pcf-1");
+        registry.activate("anomaly-det", "amf-1");
+        registry.activate("anomaly-det", "smf-1");
+        registry.activate("qos-predict", "pcf-1");
+
+        let nfs = registry.nfs_with_model("anomaly-det");
+        assert_eq!(nfs.len(), 2);
+
+        let models = registry.models_on_nf("amf-1");
+        assert_eq!(models.len(), 1);
+    }
+
+    #[test]
+    fn test_model_registry_accuracy_update() {
+        let mut registry = ModelVersionRegistry::new();
+        registry.deploy("anomaly-det", "1.0.0", "amf-1");
+        assert!(registry.update_accuracy("anomaly-det", "amf-1", 0.95));
+
+        let models = registry.models_on_nf("amf-1");
+        assert!((models[0].accuracy - 0.95).abs() < f64::EPSILON);
+    }
+
+    // ---- B6.6: Scenario Simulator tests ----
+
+    #[test]
+    fn test_scenario_simulator_no_overload() {
+        let mut sim = ScenarioSimulator::new(0.9);
+        let snap1 = NfStateSnapshot {
+            nf_instance_id: "amf-1".into(),
+            nf_type: "AMF".into(),
+            timestamp_ms: 1000,
+            status: NfStatus::Registered,
+            load: 0.4,
+            active_sessions: 100,
+            cpu_utilization: 0.3,
+            memory_utilization: 0.4,
+            kpis: HashMap::new(),
+        };
+
+        let scenario = WhatIfScenario {
+            name: "normal".into(),
+            load_multipliers: HashMap::new(),
+            simulated_failures: vec![],
+            extra_sessions: HashMap::new(),
+        };
+
+        let result = sim.simulate(&[&snap1], &scenario);
+        assert!(!result.sla_risk);
+        assert!(result.overloaded_nfs.is_empty());
+    }
+
+    #[test]
+    fn test_scenario_simulator_load_spike() {
+        let mut sim = ScenarioSimulator::new(0.9);
+        let snap1 = NfStateSnapshot {
+            nf_instance_id: "amf-1".into(),
+            nf_type: "AMF".into(),
+            timestamp_ms: 1000,
+            status: NfStatus::Registered,
+            load: 0.5,
+            active_sessions: 100,
+            cpu_utilization: 0.4,
+            memory_utilization: 0.4,
+            kpis: HashMap::new(),
+        };
+
+        let scenario = WhatIfScenario {
+            name: "load_spike".into(),
+            load_multipliers: HashMap::from([("amf-1".into(), 2.0)]),
+            simulated_failures: vec![],
+            extra_sessions: HashMap::new(),
+        };
+
+        let result = sim.simulate(&[&snap1], &scenario);
+        assert!(result.sla_risk);
+        assert_eq!(result.overloaded_nfs.len(), 1);
+        assert_eq!(result.overloaded_nfs[0], "amf-1");
+    }
+
+    #[test]
+    fn test_scenario_simulator_nf_failure() {
+        let mut sim = ScenarioSimulator::new(0.9);
+        let snap1 = NfStateSnapshot {
+            nf_instance_id: "smf-1".into(),
+            nf_type: "SMF".into(),
+            timestamp_ms: 1000,
+            status: NfStatus::Registered,
+            load: 0.3,
+            active_sessions: 50,
+            cpu_utilization: 0.2,
+            memory_utilization: 0.3,
+            kpis: HashMap::new(),
+        };
+
+        let scenario = WhatIfScenario {
+            name: "smf_failure".into(),
+            load_multipliers: HashMap::new(),
+            simulated_failures: vec!["smf-1".into()],
+            extra_sessions: HashMap::new(),
+        };
+
+        let result = sim.simulate(&[&snap1], &scenario);
+        assert!(result.sla_risk);
+        assert_eq!(result.unreachable_nfs.len(), 1);
+        assert_eq!(sim.simulation_count(), 1);
     }
 }

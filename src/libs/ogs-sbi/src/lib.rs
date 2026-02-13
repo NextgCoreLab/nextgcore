@@ -83,9 +83,11 @@ pub use security::{
 };
 pub use grpc::{
     GrpcConfig, GrpcMetadata, GrpcMethod, GrpcServiceType, GrpcStatus,
+    GrpcServiceRegistry,
 };
 pub use pubsub::{
     EventBroker, EventFilter, SbiEvent, SbiEventCategory, Subscription, SubscriptionId,
+    EventReplayBuffer,
 };
 
 /// Initialize the SBI library
