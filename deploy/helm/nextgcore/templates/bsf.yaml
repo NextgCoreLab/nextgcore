@@ -1,0 +1,68 @@
+{{- if .Values.bsf.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-bsf
+  labels:
+    app.kubernetes.io/name: bsf
+    app.kubernetes.io/instance: {{ .Release.Name }}-bsf
+    app.kubernetes.io/component: control-plane
+    {{- include "nextgcore.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.bsf.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bsf
+      app.kubernetes.io/instance: {{ .Release.Name }}-bsf
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bsf
+        app.kubernetes.io/instance: {{ .Release.Name }}-bsf
+    spec:
+      containers:
+        - name: bsf
+          image: {{ .Values.bsf.image.repository }}:{{ .Values.bsf.image.tag }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          ports:
+            - name: sbi
+              containerPort: {{ .Values.bsf.service.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: sbi
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: sbi
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: NRF_SBI_ADDR
+              value: {{ .Release.Name }}-nrf
+            - name: NRF_SBI_PORT
+              value: "{{ .Values.global.sbi.port }}"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-bsf
+  labels:
+    app.kubernetes.io/name: bsf
+    {{- include "nextgcore.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.bsf.service.type }}
+  ports:
+    - port: {{ .Values.bsf.service.port }}
+      targetPort: sbi
+      protocol: TCP
+      name: sbi
+  selector:
+    app.kubernetes.io/name: bsf
+    app.kubernetes.io/instance: {{ .Release.Name }}-bsf
+{{- end }}

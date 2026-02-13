@@ -1,0 +1,70 @@
+{{- if .Values.udr.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-udr
+  labels:
+    app.kubernetes.io/name: udr
+    app.kubernetes.io/instance: {{ .Release.Name }}-udr
+    app.kubernetes.io/component: control-plane
+    {{- include "nextgcore.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.udr.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: udr
+      app.kubernetes.io/instance: {{ .Release.Name }}-udr
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: udr
+        app.kubernetes.io/instance: {{ .Release.Name }}-udr
+    spec:
+      containers:
+        - name: udr
+          image: {{ .Values.udr.image.repository }}:{{ .Values.udr.image.tag }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          ports:
+            - name: sbi
+              containerPort: {{ .Values.udr.service.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: sbi
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: sbi
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: NRF_SBI_ADDR
+              value: {{ .Release.Name }}-nrf
+            - name: NRF_SBI_PORT
+              value: "{{ .Values.global.sbi.port }}"
+            - name: MONGODB_URI
+              value: "mongodb://{{ .Release.Name }}-mongodb:27017/nextgcore"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-udr
+  labels:
+    app.kubernetes.io/name: udr
+    {{- include "nextgcore.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.udr.service.type }}
+  ports:
+    - port: {{ .Values.udr.service.port }}
+      targetPort: sbi
+      protocol: TCP
+      name: sbi
+  selector:
+    app.kubernetes.io/name: udr
+    app.kubernetes.io/instance: {{ .Release.Name }}-udr
+{{- end }}

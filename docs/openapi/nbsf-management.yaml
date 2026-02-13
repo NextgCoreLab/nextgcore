@@ -1,0 +1,177 @@
+# NextGCore BSF Management Service OpenAPI Specification
+# Based on 3GPP TS 29.521 v18.6.0
+
+openapi: 3.0.3
+info:
+  title: BSF Management Service
+  version: 1.3.0
+  description: BSF Management Service (nbsf-management) per 3GPP TS 29.521
+
+servers:
+  - url: "{apiRoot}/nbsf-management/v1"
+    variables:
+      apiRoot:
+        default: http://localhost:7777
+
+paths:
+  /pcfBindings:
+    post:
+      summary: Create PCF binding
+      operationId: CreatePCFBinding
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PcfBinding"
+      responses:
+        "201":
+          description: PCF binding created
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PcfBinding"
+    get:
+      summary: Discover PCF binding
+      operationId: GetPCFBindings
+      parameters:
+        - name: ipv4Addr
+          in: query
+          schema:
+            type: string
+            format: ipv4
+        - name: ipv6Prefix
+          in: query
+          schema:
+            type: string
+        - name: dnn
+          in: query
+          schema:
+            type: string
+        - name: supi
+          in: query
+          schema:
+            type: string
+        - name: gpsi
+          in: query
+          schema:
+            type: string
+        - name: snssai
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: PCF binding(s) found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PcfBinding"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /pcfBindings/{bindingId}:
+    delete:
+      summary: Delete PCF binding
+      operationId: DeletePCFBinding
+      parameters:
+        - name: bindingId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: PCF binding deleted
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+components:
+  schemas:
+    PcfBinding:
+      type: object
+      required:
+        - dnn
+        - snssai
+        - pcfFqdn
+      properties:
+        supi:
+          type: string
+        gpsi:
+          type: string
+        dnn:
+          type: string
+        snssai:
+          $ref: "#/components/schemas/Snssai"
+        pcfFqdn:
+          type: string
+        pcfIpEndPoints:
+          type: array
+          items:
+            $ref: "#/components/schemas/IpEndPoint"
+        pcfId:
+          type: string
+          format: uuid
+        ipv4Addr:
+          type: string
+          format: ipv4
+        ipv6Prefix:
+          type: string
+        ipDomain:
+          type: string
+        macAddr48:
+          type: string
+        bindLevel:
+          type: string
+          enum: [NF_INSTANCE, NF_SET, NF_SERVICE_SET]
+
+    IpEndPoint:
+      type: object
+      properties:
+        ipv4Address:
+          type: string
+          format: ipv4
+        ipv6Address:
+          type: string
+        transport:
+          type: string
+          enum: [TCP]
+        port:
+          type: integer
+
+    Snssai:
+      type: object
+      required: [sst]
+      properties:
+        sst:
+          type: integer
+          minimum: 0
+          maximum: 255
+        sd:
+          type: string
+          pattern: "^[0-9a-fA-F]{6}$"
+
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+
+  responses:
+    NotFound:
+      description: Resource not found
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"

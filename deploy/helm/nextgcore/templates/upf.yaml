@@ -1,0 +1,85 @@
+{{- if .Values.upf.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-upf
+  labels:
+    app.kubernetes.io/name: upf
+    app.kubernetes.io/instance: {{ .Release.Name }}-upf
+    app.kubernetes.io/component: user-plane
+    {{- include "nextgcore.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.upf.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: upf
+      app.kubernetes.io/instance: {{ .Release.Name }}-upf
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: upf
+        app.kubernetes.io/instance: {{ .Release.Name }}-upf
+    spec:
+      containers:
+        - name: upf
+          image: {{ .Values.upf.image.repository }}:{{ .Values.upf.image.tag }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          {{- with .Values.upf.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: pfcp
+              containerPort: {{ .Values.upf.service.pfcpPort }}
+              protocol: UDP
+            - name: gtpu
+              containerPort: {{ .Values.upf.service.gtpuPort }}
+              protocol: UDP
+          env:
+            - name: RUST_LOG
+              value: info,nextgcore_upfd=debug
+            - name: TUN_IP
+              value: "{{ .Values.upf.config.tunIp }}"
+            - name: TUN_PREFIX
+              value: "{{ .Values.upf.config.tunPrefix }}"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-upf
+  labels:
+    app.kubernetes.io/name: upf
+    {{- include "nextgcore.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.upf.service.type }}
+  ports:
+    - port: {{ .Values.upf.service.pfcpPort }}
+      targetPort: pfcp
+      protocol: UDP
+      name: pfcp
+    - port: {{ .Values.upf.service.gtpuPort }}
+      targetPort: gtpu
+      protocol: UDP
+      name: gtpu
+  selector:
+    app.kubernetes.io/name: upf
+    app.kubernetes.io/instance: {{ .Release.Name }}-upf
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-upf-config
+  labels:
+    app.kubernetes.io/name: upf
+    {{- include "nextgcore.labels" . | nindent 4 }}
+data:
+  nf.yaml: |
+    upf:
+      pfcp:
+        port: {{ .Values.upf.service.pfcpPort }}
+      gtpu:
+        port: {{ .Values.upf.service.gtpuPort }}
+      tun:
+        ip: {{ .Values.upf.config.tunIp }}
+        prefix: {{ .Values.upf.config.tunPrefix }}
+{{- end }}

@@ -1,0 +1,68 @@
+{{- if .Values.udm.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-udm
+  labels:
+    app.kubernetes.io/name: udm
+    app.kubernetes.io/instance: {{ .Release.Name }}-udm
+    app.kubernetes.io/component: control-plane
+    {{- include "nextgcore.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.udm.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: udm
+      app.kubernetes.io/instance: {{ .Release.Name }}-udm
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: udm
+        app.kubernetes.io/instance: {{ .Release.Name }}-udm
+    spec:
+      containers:
+        - name: udm
+          image: {{ .Values.udm.image.repository }}:{{ .Values.udm.image.tag }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          ports:
+            - name: sbi
+              containerPort: {{ .Values.udm.service.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: sbi
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: sbi
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: NRF_SBI_ADDR
+              value: {{ .Release.Name }}-nrf
+            - name: NRF_SBI_PORT
+              value: "{{ .Values.global.sbi.port }}"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-udm
+  labels:
+    app.kubernetes.io/name: udm
+    {{- include "nextgcore.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.udm.service.type }}
+  ports:
+    - port: {{ .Values.udm.service.port }}
+      targetPort: sbi
+      protocol: TCP
+      name: sbi
+  selector:
+    app.kubernetes.io/name: udm
+    app.kubernetes.io/instance: {{ .Release.Name }}-udm
+{{- end }}
