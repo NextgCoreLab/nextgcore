@@ -2,8 +2,9 @@
 //!
 //! The MB-SMF is a 5G core network function responsible for (TS 23.247):
 //! - MBS session management (create, update, release)
-//! - Multicast transport resource management
+//! - Multicast transport resource management via N4mb PFCP
 //! - MBS QoS flow management
+//! - TMGI-based session identification and group membership tracking
 //! - Interaction with SMF for unicast-to-multicast switching
 
 use anyhow::{Context, Result};
@@ -173,11 +174,39 @@ async fn mbsmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                 _ => send_method_not_allowed(method, "mbs-sessions/{id}"),
             }
         }
+        // N4mb PFCP activation (TS 23.247 7.3)
+        ["nmbsmf-mbssession", "v1", "mbs-sessions", session_id, "activate"] => {
+            match method {
+                "POST" => handle_mbs_session_activate(session_id, &request).await,
+                _ => send_method_not_allowed(method, "mbs-sessions/{id}/activate"),
+            }
+        }
+        // Group membership management
+        ["nmbsmf-mbssession", "v1", "mbs-sessions", session_id, "members"] => {
+            match method {
+                "POST" => handle_member_join(session_id, &request).await,
+                "GET" => handle_member_list(session_id).await,
+                _ => send_method_not_allowed(method, "mbs-sessions/{id}/members"),
+            }
+        }
+        ["nmbsmf-mbssession", "v1", "mbs-sessions", session_id, "members", supi] => {
+            match method {
+                "DELETE" => handle_member_leave(session_id, supi).await,
+                _ => send_method_not_allowed(method, "mbs-sessions/{id}/members/{supi}"),
+            }
+        }
         _ => {
             log::debug!("Unknown path: {path}");
             send_not_found(&format!("Resource not found: {path}"), None)
         }
     }
+}
+
+/// Parse session pool ID from string like "mbs-sess-123"
+fn parse_session_id(session_id: &str) -> Option<u64> {
+    session_id
+        .strip_prefix("mbs-sess-")
+        .and_then(|s| s.parse::<u64>().ok())
 }
 
 /// Handle MBS Session Create (TS 23.247 7.2.1)
@@ -260,6 +289,7 @@ async fn handle_mbs_session_create(request: &SbiRequest) -> SbiResponse {
                         "plmnId": {"mcc": plmn_mcc, "mnc": plmn_mnc}
                     },
                     "mbsSessionStatus": "CREATED",
+                    "gtpTeid": format!("{:#010x}", session.gtp_teid),
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(201))
         }
@@ -269,15 +299,23 @@ async fn handle_mbs_session_create(request: &SbiRequest) -> SbiResponse {
     }
 }
 
-/// Handle MBS Session List
+/// Handle MBS Session List - now returns real session data
 async fn handle_mbs_session_list() -> SbiResponse {
     log::debug!("MBS Session List");
 
     let ctx = mbsmf_self();
     let sessions: Vec<serde_json::Value> = if let Ok(context) = ctx.read() {
-        (0..context.session_count())
-            .filter_map(|_| None::<serde_json::Value>) // Placeholder
-            .collect()
+        context.all_sessions().iter().map(|s| {
+            let has_n4mb = s.n4mb_session.is_some();
+            serde_json::json!({
+                "mbsSessionId": format!("mbs-sess-{}", s.id),
+                "mbsSessionType": format!("{:?}", s.session_type).to_uppercase(),
+                "mbsSessionStatus": format!("{:?}", s.state).to_uppercase(),
+                "joinedUeCount": s.joined_ue_count,
+                "gtpTeid": format!("{:#010x}", s.gtp_teid),
+                "n4mbEstablished": has_n4mb,
+            })
+        }).collect()
     } else {
         vec![]
     };
@@ -291,10 +329,7 @@ async fn handle_mbs_session_list() -> SbiResponse {
 async fn handle_mbs_session_get(session_id: &str) -> SbiResponse {
     log::debug!("MBS Session Get: {session_id}");
 
-    // Parse session pool ID from session_id
-    let pool_id = session_id
-        .strip_prefix("mbs-sess-")
-        .and_then(|s| s.parse::<u64>().ok());
+    let pool_id = parse_session_id(session_id);
 
     let ctx = mbsmf_self();
     let session = pool_id.and_then(|id| {
@@ -307,12 +342,26 @@ async fn handle_mbs_session_get(session_id: &str) -> SbiResponse {
 
     match session {
         Some(session) => {
+            let n4mb_info = session.n4mb_session.as_ref().map(|n| {
+                serde_json::json!({
+                    "localSeid": n.local_seid,
+                    "remoteSeid": n.remote_seid,
+                    "upfAddr": n.upf_addr.to_string(),
+                    "state": format!("{:?}", n.state),
+                    "dlTeid": format!("{:#010x}", n.dl_teid),
+                    "gnbEndpoints": n.gnb_teids.len(),
+                })
+            });
+
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({
                     "mbsSessionId": session_id,
                     "mbsSessionType": format!("{:?}", session.session_type).to_uppercase(),
                     "mbsSessionStatus": format!("{:?}", session.state).to_uppercase(),
                     "joinedUeCount": session.joined_ue_count,
+                    "gtpTeid": format!("{:#010x}", session.gtp_teid),
+                    "n4mbSession": n4mb_info,
+                    "groupMembers": session.group_members.len(),
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }
@@ -336,9 +385,7 @@ async fn handle_mbs_session_update(session_id: &str, request: &SbiRequest) -> Sb
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let pool_id = session_id
-        .strip_prefix("mbs-sess-")
-        .and_then(|s| s.parse::<u64>().ok());
+    let pool_id = parse_session_id(session_id);
 
     let ctx = mbsmf_self();
     let session = pool_id.and_then(|id| {
@@ -381,9 +428,7 @@ async fn handle_mbs_session_update(session_id: &str, request: &SbiRequest) -> Sb
 async fn handle_mbs_session_release(session_id: &str) -> SbiResponse {
     log::info!("MBS Session Release: {session_id}");
 
-    let pool_id = session_id
-        .strip_prefix("mbs-sess-")
-        .and_then(|s| s.parse::<u64>().ok());
+    let pool_id = parse_session_id(session_id);
 
     let ctx = mbsmf_self();
     let removed = pool_id.and_then(|id| {
@@ -402,6 +447,169 @@ async fn handle_mbs_session_release(session_id: &str) -> SbiResponse {
         None => {
             send_not_found(&format!("MBS Session {session_id} not found"), Some("SESSION_NOT_FOUND"))
         }
+    }
+}
+
+/// Handle MBS Session Activate - establish N4mb PFCP with UPF (TS 23.247 7.3)
+async fn handle_mbs_session_activate(session_id: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("MBS Session Activate (N4mb): {session_id}");
+
+    let pool_id = match parse_session_id(session_id) {
+        Some(id) => id,
+        None => return send_bad_request("Invalid session ID", Some("INVALID_SESSION_ID")),
+    };
+
+    // Parse UPF address from request body
+    let upf_addr: std::net::Ipv4Addr = if let Some(body) = &request.http.content {
+        let data: serde_json::Value = match serde_json::from_str(body) {
+            Ok(p) => p,
+            Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+        };
+        data.get("upfAddr")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(std::net::Ipv4Addr::new(127, 0, 0, 7))
+    } else {
+        std::net::Ipv4Addr::new(127, 0, 0, 7)
+    };
+
+    let ctx = mbsmf_self();
+    let session = if let Ok(context) = ctx.read() {
+        context.session_activate_n4mb(pool_id, upf_addr)
+    } else {
+        None
+    };
+
+    match session {
+        Some(session) => {
+            let n4mb = session.n4mb_session.as_ref().unwrap();
+            log::info!(
+                "MBS Session {session_id} activated: N4mb SEID={}, UPF={}, TEID={:#x}",
+                n4mb.local_seid, upf_addr, n4mb.dl_teid
+            );
+
+            SbiResponse::with_status(200)
+                .with_json_body(&serde_json::json!({
+                    "mbsSessionId": session_id,
+                    "mbsSessionStatus": "ACTIVE",
+                    "n4mbSession": {
+                        "localSeid": n4mb.local_seid,
+                        "upfAddr": upf_addr.to_string(),
+                        "dlTeid": format!("{:#010x}", n4mb.dl_teid),
+                        "state": "ESTABLISHMENT_PENDING",
+                        "mcastPdrId": n4mb.mcast_pdr_id,
+                        "mcastFarId": n4mb.mcast_far_id,
+                    },
+                }))
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
+        None => {
+            send_not_found(&format!("MBS Session {session_id} not found"), Some("SESSION_NOT_FOUND"))
+        }
+    }
+}
+
+/// Handle member join (TMGI group membership)
+async fn handle_member_join(session_id: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("MBS Member Join: {session_id}");
+
+    let pool_id = match parse_session_id(session_id) {
+        Some(id) => id,
+        None => return send_bad_request("Invalid session ID", Some("INVALID_SESSION_ID")),
+    };
+
+    let body = match &request.http.content {
+        Some(content) => content,
+        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+    };
+
+    let data: serde_json::Value = match serde_json::from_str(body) {
+        Ok(p) => p,
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+    };
+
+    let supi = data.get("supi")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    let ctx = mbsmf_self();
+    let joined = if let Ok(context) = ctx.read() {
+        context.session_member_join(pool_id, supi)
+    } else {
+        false
+    };
+
+    if joined {
+        SbiResponse::with_status(201)
+            .with_json_body(&serde_json::json!({
+                "mbsSessionId": session_id,
+                "supi": supi,
+                "result": "JOINED",
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(201))
+    } else {
+        send_bad_request(
+            &format!("Failed to join UE {supi} to session {session_id}"),
+            Some("JOIN_FAILED"),
+        )
+    }
+}
+
+/// Handle member list
+async fn handle_member_list(session_id: &str) -> SbiResponse {
+    log::debug!("MBS Member List: {session_id}");
+
+    let pool_id = parse_session_id(session_id);
+
+    let ctx = mbsmf_self();
+    let session = pool_id.and_then(|id| {
+        if let Ok(context) = ctx.read() {
+            context.session_find_by_id(id)
+        } else {
+            None
+        }
+    });
+
+    match session {
+        Some(session) => {
+            let members: Vec<&String> = session.group_members.iter().collect();
+            SbiResponse::with_status(200)
+                .with_json_body(&serde_json::json!({
+                    "mbsSessionId": session_id,
+                    "memberCount": members.len(),
+                    "members": members,
+                }))
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
+        None => {
+            send_not_found(&format!("MBS Session {session_id} not found"), Some("SESSION_NOT_FOUND"))
+        }
+    }
+}
+
+/// Handle member leave
+async fn handle_member_leave(session_id: &str, supi: &str) -> SbiResponse {
+    log::info!("MBS Member Leave: {session_id} / {supi}");
+
+    let pool_id = match parse_session_id(session_id) {
+        Some(id) => id,
+        None => return send_bad_request("Invalid session ID", Some("INVALID_SESSION_ID")),
+    };
+
+    let ctx = mbsmf_self();
+    let left = if let Ok(context) = ctx.read() {
+        context.session_member_leave(pool_id, supi)
+    } else {
+        false
+    };
+
+    if left {
+        SbiResponse::with_status(204)
+    } else {
+        send_not_found(
+            &format!("UE {supi} not found in session {session_id}"),
+            Some("MEMBER_NOT_FOUND"),
+        )
     }
 }
 
@@ -429,5 +637,12 @@ mod tests {
         assert_eq!(args.sbi_port, 8812);
         assert_eq!(args.max_sessions, 512);
         assert_eq!(args.nrf_uri, "http://nrf:7777");
+    }
+
+    #[test]
+    fn test_parse_session_id() {
+        assert_eq!(parse_session_id("mbs-sess-42"), Some(42));
+        assert_eq!(parse_session_id("mbs-sess-0"), Some(0));
+        assert_eq!(parse_session_id("invalid"), None);
     }
 }

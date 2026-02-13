@@ -94,6 +94,217 @@ pub const INFERENCE_THROUGHPUT: AiMetricDef = AiMetricDef {
 };
 
 // ============================================================================
+// Predefined Energy Efficiency Metrics (Rel-18, TS 28.310)
+// ============================================================================
+
+/// Energy efficiency KPI: bits per joule (gauge).
+pub const ENERGY_BITS_PER_JOULE: AiMetricDef = AiMetricDef {
+    name: "energy_efficiency_bits_per_joule",
+    help: "Energy efficiency in bits per joule per TS 28.310",
+    category: AiMetricCategory::Energy,
+    labels: &["nf_type", "nf_id", "slice_sst"],
+};
+
+/// Energy consumption in watts (gauge).
+pub const ENERGY_CONSUMPTION_WATTS: AiMetricDef = AiMetricDef {
+    name: "energy_consumption_watts",
+    help: "Current energy consumption in watts",
+    category: AiMetricCategory::Energy,
+    labels: &["nf_type", "nf_id", "component"],
+};
+
+/// Total energy consumed in joules (counter).
+pub const ENERGY_TOTAL_JOULES: AiMetricDef = AiMetricDef {
+    name: "energy_consumed_joules_total",
+    help: "Total energy consumed in joules",
+    category: AiMetricCategory::Energy,
+    labels: &["nf_type", "nf_id"],
+};
+
+/// Data volume in bits (counter).
+pub const ENERGY_DATA_VOLUME_BITS: AiMetricDef = AiMetricDef {
+    name: "energy_data_volume_bits_total",
+    help: "Total data volume in bits for energy efficiency calculation",
+    category: AiMetricCategory::Energy,
+    labels: &["nf_type", "nf_id", "direction"],
+};
+
+/// Cell sleep ratio (gauge, 0.0-1.0).
+pub const ENERGY_SLEEP_RATIO: AiMetricDef = AiMetricDef {
+    name: "energy_sleep_ratio",
+    help: "Ratio of time in sleep/dormant mode (0.0-1.0)",
+    category: AiMetricCategory::Energy,
+    labels: &["nf_type", "nf_id", "cell_id"],
+};
+
+// ============================================================================
+// Energy Efficiency Monitor (Rel-18, TS 28.310)
+// ============================================================================
+
+/// Energy efficiency KPI per TS 28.310.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EnergyKpi {
+    /// EE_DV: Data volume-based energy efficiency (bits/J).
+    DataVolumeEe,
+    /// EE_SC: Service capacity-based energy efficiency.
+    ServiceCapacityEe,
+    /// EE_CO: Coverage-based energy efficiency.
+    CoverageEe,
+    /// Power consumption (watts).
+    PowerConsumption,
+    /// Sleep ratio (fraction of time in sleep mode).
+    SleepRatio,
+}
+
+impl EnergyKpi {
+    /// Returns the unit string for this KPI.
+    pub fn unit(&self) -> &'static str {
+        match self {
+            Self::DataVolumeEe => "bits/J",
+            Self::ServiceCapacityEe => "connections/J",
+            Self::CoverageEe => "km2/J",
+            Self::PowerConsumption => "W",
+            Self::SleepRatio => "ratio",
+        }
+    }
+}
+
+/// NF energy metrics entry.
+#[derive(Debug, Clone)]
+pub struct NfEnergyMetrics {
+    /// NF type (e.g., "gNB", "UPF", "AMF").
+    pub nf_type: String,
+    /// NF identifier.
+    pub nf_id: String,
+    /// Current power consumption in watts.
+    pub power_consumption_w: f64,
+    /// Total energy consumed in joules.
+    pub total_energy_j: f64,
+    /// Total data volume in bits (uplink + downlink).
+    pub total_data_bits: u64,
+    /// Time active (seconds).
+    pub time_active_s: f64,
+    /// Time in sleep mode (seconds).
+    pub time_sleep_s: f64,
+}
+
+impl NfEnergyMetrics {
+    /// Creates a new NF energy metrics entry.
+    pub fn new(nf_type: &str, nf_id: &str) -> Self {
+        Self {
+            nf_type: nf_type.to_string(),
+            nf_id: nf_id.to_string(),
+            power_consumption_w: 0.0,
+            total_energy_j: 0.0,
+            total_data_bits: 0,
+            time_active_s: 0.0,
+            time_sleep_s: 0.0,
+        }
+    }
+
+    /// Data volume energy efficiency (bits/J).
+    pub fn bits_per_joule(&self) -> f64 {
+        if self.total_energy_j > 0.0 {
+            self.total_data_bits as f64 / self.total_energy_j
+        } else {
+            0.0
+        }
+    }
+
+    /// Sleep ratio (0.0 - 1.0).
+    pub fn sleep_ratio(&self) -> f64 {
+        let total = self.time_active_s + self.time_sleep_s;
+        if total > 0.0 {
+            self.time_sleep_s / total
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Energy efficiency monitoring engine per TS 28.310.
+pub struct EnergyMonitor {
+    /// NF energy metrics by NF ID.
+    nf_metrics: HashMap<String, NfEnergyMetrics>,
+    /// Total reporting periods.
+    reporting_count: u64,
+}
+
+impl Default for EnergyMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EnergyMonitor {
+    /// Creates a new energy monitor.
+    pub fn new() -> Self {
+        Self {
+            nf_metrics: HashMap::new(),
+            reporting_count: 0,
+        }
+    }
+
+    /// Register an NF for energy monitoring.
+    pub fn register_nf(&mut self, nf_type: &str, nf_id: &str) {
+        self.nf_metrics
+            .insert(nf_id.to_string(), NfEnergyMetrics::new(nf_type, nf_id));
+    }
+
+    /// Update power consumption for an NF.
+    pub fn update_power(&mut self, nf_id: &str, power_w: f64) {
+        if let Some(metrics) = self.nf_metrics.get_mut(nf_id) {
+            metrics.power_consumption_w = power_w;
+        }
+    }
+
+    /// Record energy consumed by an NF during a time period.
+    pub fn record_energy(&mut self, nf_id: &str, energy_j: f64, data_bits: u64) {
+        if let Some(metrics) = self.nf_metrics.get_mut(nf_id) {
+            metrics.total_energy_j += energy_j;
+            metrics.total_data_bits += data_bits;
+        }
+    }
+
+    /// Record time spent in active/sleep states.
+    pub fn record_time(&mut self, nf_id: &str, active_s: f64, sleep_s: f64) {
+        if let Some(metrics) = self.nf_metrics.get_mut(nf_id) {
+            metrics.time_active_s += active_s;
+            metrics.time_sleep_s += sleep_s;
+        }
+    }
+
+    /// Get energy efficiency for an NF.
+    pub fn get_efficiency(&self, nf_id: &str) -> Option<f64> {
+        self.nf_metrics.get(nf_id).map(|m| m.bits_per_joule())
+    }
+
+    /// Get metrics for an NF.
+    pub fn get_nf_metrics(&self, nf_id: &str) -> Option<&NfEnergyMetrics> {
+        self.nf_metrics.get(nf_id)
+    }
+
+    /// Report all NF efficiencies.
+    pub fn report_all(&mut self) -> Vec<(String, f64)> {
+        self.reporting_count += 1;
+        self.nf_metrics
+            .iter()
+            .map(|(id, m)| (id.clone(), m.bits_per_joule()))
+            .collect()
+    }
+
+    /// Number of monitored NFs.
+    pub fn nf_count(&self) -> usize {
+        self.nf_metrics.len()
+    }
+
+    /// Total reporting periods.
+    pub fn reporting_count(&self) -> u64 {
+        self.reporting_count
+    }
+}
+
+// ============================================================================
 // SLA Monitoring
 // ============================================================================
 
@@ -360,6 +571,61 @@ mod tests {
         let violations = monitor.evaluate();
         assert_eq!(violations.len(), 1); // Reliability is 99.995 < 99.999
         assert_eq!(monitor.evaluation_count(), 1);
+    }
+
+    #[test]
+    fn test_energy_kpi_unit() {
+        assert_eq!(EnergyKpi::DataVolumeEe.unit(), "bits/J");
+        assert_eq!(EnergyKpi::PowerConsumption.unit(), "W");
+        assert_eq!(EnergyKpi::SleepRatio.unit(), "ratio");
+    }
+
+    #[test]
+    fn test_energy_metric_defs() {
+        assert_eq!(ENERGY_BITS_PER_JOULE.category, AiMetricCategory::Energy);
+        assert_eq!(ENERGY_CONSUMPTION_WATTS.category, AiMetricCategory::Energy);
+        assert_eq!(ENERGY_TOTAL_JOULES.category, AiMetricCategory::Energy);
+        assert_eq!(ENERGY_DATA_VOLUME_BITS.category, AiMetricCategory::Energy);
+        assert_eq!(ENERGY_SLEEP_RATIO.category, AiMetricCategory::Energy);
+    }
+
+    #[test]
+    fn test_nf_energy_metrics() {
+        let mut m = NfEnergyMetrics::new("gNB", "gnb-001");
+        assert_eq!(m.bits_per_joule(), 0.0);
+        assert_eq!(m.sleep_ratio(), 0.0);
+
+        m.total_energy_j = 100.0;
+        m.total_data_bits = 1_000_000;
+        assert_eq!(m.bits_per_joule(), 10_000.0);
+
+        m.time_active_s = 80.0;
+        m.time_sleep_s = 20.0;
+        assert!((m.sleep_ratio() - 0.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_energy_monitor() {
+        let mut monitor = EnergyMonitor::new();
+
+        monitor.register_nf("gNB", "gnb-001");
+        monitor.register_nf("UPF", "upf-001");
+        assert_eq!(monitor.nf_count(), 2);
+
+        monitor.update_power("gnb-001", 100.0);
+        monitor.record_energy("gnb-001", 500.0, 5_000_000);
+        monitor.record_time("gnb-001", 4.0, 1.0);
+
+        let eff = monitor.get_efficiency("gnb-001").unwrap();
+        assert_eq!(eff, 10_000.0); // 5M bits / 500 J
+
+        let m = monitor.get_nf_metrics("gnb-001").unwrap();
+        assert_eq!(m.power_consumption_w, 100.0);
+        assert!((m.sleep_ratio() - 0.2).abs() < f64::EPSILON);
+
+        let report = monitor.report_all();
+        assert_eq!(report.len(), 2);
+        assert_eq!(monitor.reporting_count(), 1);
     }
 
     #[test]

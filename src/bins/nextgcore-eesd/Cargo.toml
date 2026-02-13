@@ -1,32 +1,24 @@
 [package]
-name = "nextgcore-ausfd"
+name = "nextgcore-eesd"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "NextGCore AUSF (Authentication Server Function)"
-
-[lib]
-name = "nextgcore_ausfd"
-path = "src/lib.rs"
+description = "NextGCore EES (Edge Enabler Server, TS 23.558)"
 
 [[bin]]
-name = "nextgcore-ausfd"
+name = "nextgcore-eesd"
 path = "src/main.rs"
 
 [dependencies]
 ogs-core = { workspace = true }
-ogs-crypt = { workspace = true }
 ogs-sbi = { workspace = true }
 ogs-app = { workspace = true }
 log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
-serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-hmac.workspace = true
 uuid = { version = "1.6", features = ["v4"] }
 clap = { version = "4.4", features = ["derive"] }
 ctrlc = "3.4"

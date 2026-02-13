@@ -2154,6 +2154,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "env_logger 0.11.8",
+ "hmac",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2162,6 +2163,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "uuid",
 ]
@@ -2178,6 +2180,24 @@ dependencies = [
  "ogs-app",
  "ogs-core",
  "ogs-dbi",
+ "ogs-sbi",
+ "proptest",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "nextgcore-eesd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "env_logger 0.11.8",
+ "log",
+ "ogs-app",
+ "ogs-core",
  "ogs-sbi",
  "proptest",
  "serde_json",
@@ -2234,6 +2254,24 @@ dependencies = [
  "testcontainers",
  "testcontainers-modules",
  "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "nextgcore-lmfd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "env_logger 0.11.8",
+ "log",
+ "ogs-app",
+ "ogs-core",
+ "ogs-sbi",
+ "proptest",
+ "serde_json",
  "tokio",
  "uuid",
 ]
@@ -2368,6 +2406,24 @@ dependencies = [
  "ogs-diameter",
  "proptest",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "nextgcore-pind"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "env_logger 0.11.8",
+ "log",
+ "ogs-app",
+ "ogs-core",
+ "ogs-sbi",
+ "proptest",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

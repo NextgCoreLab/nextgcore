@@ -371,6 +371,165 @@ pub struct AnalyticsState {
     pub qos_sustainability: f32,
     /// Whether energy-optimized policy is active
     pub energy_optimized: bool,
+    /// Anomaly detection alerts
+    pub anomaly_alerts: Vec<AnomalyAlert>,
+    /// Last NWDAF query timestamp (epoch seconds)
+    pub last_query_epoch: u64,
+}
+
+/// Anomaly alert from NWDAF analytics (Rel-18, TS 23.288)
+#[derive(Debug, Clone)]
+pub struct AnomalyAlert {
+    /// Alert type
+    pub alert_type: AnomalyAlertType,
+    /// Severity (0.0 = info, 1.0 = critical)
+    pub severity: f32,
+    /// Affected S-NSSAI (if slice-specific)
+    pub affected_snssai: Option<SNssai>,
+    /// Recommended action
+    pub recommended_action: AnomalyAction,
+}
+
+/// Types of anomaly alerts
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnomalyAlertType {
+    /// Unexpected traffic spike
+    TrafficSpike,
+    /// DDoS-like pattern detected
+    DdosPattern,
+    /// Slice SLA violation predicted
+    SlaSlaViolation,
+    /// Abnormal UE behavior
+    AbnormalUeBehavior,
+    /// Network congestion predicted
+    CongestionPredicted,
+}
+
+/// Recommended action for anomaly
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnomalyAction {
+    /// No action, informational only
+    None,
+    /// Throttle affected traffic
+    Throttle,
+    /// Re-route to different slice
+    ReRoute,
+    /// Tighten admission control
+    TightenAdmission,
+    /// Trigger energy saving
+    EnergySaving,
+}
+
+/// Analytics-based policy engine (Rel-18, TS 23.288 integration)
+#[derive(Debug)]
+pub struct AnalyticsPolicyEngine {
+    /// Congestion threshold for policy downgrade (0.0-1.0)
+    pub congestion_threshold: f32,
+    /// QoS sustainability floor before adjustment
+    pub qos_sustainability_floor: f32,
+    /// Number of policies dynamically adjusted
+    pub adjustments_count: u64,
+}
+
+impl Default for AnalyticsPolicyEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AnalyticsPolicyEngine {
+    /// Create a new analytics policy engine with default thresholds
+    pub fn new() -> Self {
+        Self {
+            congestion_threshold: 0.75,
+            qos_sustainability_floor: 0.5,
+            adjustments_count: 0,
+        }
+    }
+
+    /// Evaluate analytics state and produce a policy adjustment if needed.
+    /// Returns (adjusted_5qi, adjusted_arp, reason) or None if no change needed.
+    pub fn evaluate(
+        &mut self,
+        analytics: &AnalyticsState,
+        current_5qi: u8,
+        current_arp: u8,
+    ) -> Option<PolicyAdjustment> {
+        // Check for anomaly-driven adjustments first
+        for alert in &analytics.anomaly_alerts {
+            if alert.severity >= 0.8 {
+                self.adjustments_count += 1;
+                return Some(PolicyAdjustment {
+                    adjusted_5qi: current_5qi,
+                    adjusted_arp: current_arp.min(14) + 1, // lower priority
+                    reason: AdjustmentReason::AnomalyDetected,
+                    action: alert.recommended_action,
+                });
+            }
+        }
+
+        // Congestion-based downgrade
+        if analytics.predicted_congestion >= self.congestion_threshold {
+            self.adjustments_count += 1;
+            // Downgrade non-critical traffic to best-effort
+            let new_5qi = match analytics.traffic_class {
+                TrafficClass::BestEffort | TrafficClass::Mtc => current_5qi,
+                _ => 9, // fallback to non-GBR best-effort
+            };
+            return Some(PolicyAdjustment {
+                adjusted_5qi: new_5qi,
+                adjusted_arp: current_arp.min(14) + 1,
+                reason: AdjustmentReason::CongestionAvoidance,
+                action: AnomalyAction::Throttle,
+            });
+        }
+
+        // QoS sustainability below floor
+        if analytics.qos_sustainability < self.qos_sustainability_floor
+            && analytics.qos_sustainability > 0.0
+        {
+            self.adjustments_count += 1;
+            return Some(PolicyAdjustment {
+                adjusted_5qi: current_5qi,
+                adjusted_arp: current_arp,
+                reason: AdjustmentReason::QosSustainability,
+                action: AnomalyAction::ReRoute,
+            });
+        }
+
+        None
+    }
+
+    /// Number of dynamic adjustments made
+    pub fn adjustment_count(&self) -> u64 {
+        self.adjustments_count
+    }
+}
+
+/// Result of analytics-based policy evaluation
+#[derive(Debug, Clone)]
+pub struct PolicyAdjustment {
+    /// Adjusted 5QI value
+    pub adjusted_5qi: u8,
+    /// Adjusted ARP priority level
+    pub adjusted_arp: u8,
+    /// Reason for adjustment
+    pub reason: AdjustmentReason,
+    /// Recommended action
+    pub action: AnomalyAction,
+}
+
+/// Reason for policy adjustment
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdjustmentReason {
+    /// Congestion avoidance
+    CongestionAvoidance,
+    /// QoS sustainability below threshold
+    QosSustainability,
+    /// Anomaly detected by NWDAF
+    AnomalyDetected,
+    /// Energy optimization
+    EnergyOptimization,
 }
 
 /// Energy-aware policy parameters.
@@ -1024,5 +1183,65 @@ mod tests {
         let found = ctx.sess_find_by_ipv4addr("10.45.0.1");
         assert!(found.is_some());
         assert_eq!(found.unwrap().psi, 1);
+    }
+
+    #[test]
+    fn test_analytics_policy_engine_no_adjustment() {
+        let mut engine = AnalyticsPolicyEngine::new();
+        let analytics = AnalyticsState {
+            predicted_congestion: 0.3,
+            qos_sustainability: 0.8,
+            ..Default::default()
+        };
+        let result = engine.evaluate(&analytics, 9, 8);
+        assert!(result.is_none());
+        assert_eq!(engine.adjustment_count(), 0);
+    }
+
+    #[test]
+    fn test_analytics_policy_engine_congestion() {
+        let mut engine = AnalyticsPolicyEngine::new();
+        let analytics = AnalyticsState {
+            predicted_congestion: 0.85,
+            traffic_class: TrafficClass::VideoStreaming,
+            qos_sustainability: 0.7,
+            ..Default::default()
+        };
+        let result = engine.evaluate(&analytics, 4, 5).unwrap();
+        assert_eq!(result.reason, AdjustmentReason::CongestionAvoidance);
+        assert_eq!(result.adjusted_5qi, 9); // downgraded to best-effort
+        assert_eq!(result.adjusted_arp, 6); // priority lowered
+    }
+
+    #[test]
+    fn test_analytics_policy_engine_anomaly() {
+        let mut engine = AnalyticsPolicyEngine::new();
+        let analytics = AnalyticsState {
+            predicted_congestion: 0.2,
+            qos_sustainability: 0.9,
+            anomaly_alerts: vec![AnomalyAlert {
+                alert_type: AnomalyAlertType::DdosPattern,
+                severity: 0.95,
+                affected_snssai: None,
+                recommended_action: AnomalyAction::TightenAdmission,
+            }],
+            ..Default::default()
+        };
+        let result = engine.evaluate(&analytics, 9, 8).unwrap();
+        assert_eq!(result.reason, AdjustmentReason::AnomalyDetected);
+        assert_eq!(result.action, AnomalyAction::TightenAdmission);
+    }
+
+    #[test]
+    fn test_analytics_policy_engine_qos_sustainability() {
+        let mut engine = AnalyticsPolicyEngine::new();
+        let analytics = AnalyticsState {
+            predicted_congestion: 0.3,
+            qos_sustainability: 0.3,
+            ..Default::default()
+        };
+        let result = engine.evaluate(&analytics, 5, 3).unwrap();
+        assert_eq!(result.reason, AdjustmentReason::QosSustainability);
+        assert_eq!(result.action, AnomalyAction::ReRoute);
     }
 }

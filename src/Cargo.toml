@@ -44,6 +44,9 @@ members = [
     # Rel-17 NFs
     "bins/nextgcore-mbsmfd",
     "bins/nextgcore-nsacfd",
+    "bins/nextgcore-eesd",
+    "bins/nextgcore-pind",
+    "bins/nextgcore-lmfd",
 
     # Integration tests
     "tests",

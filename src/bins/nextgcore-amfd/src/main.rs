@@ -19,6 +19,7 @@ pub mod namf_handler;
 pub mod timer;
 pub mod metrics;
 pub mod emergency; // #203: Emergency services (TS 23.167)
+pub mod ngap_mcast; // MBS: NGAP multicast session procedures (TS 38.413 / TS 23.247)
 
 #[cfg(test)]
 mod property_tests;

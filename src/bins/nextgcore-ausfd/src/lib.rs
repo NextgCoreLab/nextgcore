@@ -9,6 +9,7 @@
 
 pub mod ausf_sm;
 pub mod context;
+pub mod eap_aka_prime;
 pub mod event;
 pub mod nausf_handler;
 pub mod nudm_build;
@@ -27,6 +28,9 @@ pub use event::{AusfEvent, AusfEventId, AusfTimerId};
 pub use ausf_sm::{ausf_sm_debug, AusfSmContext, AusfState};
 pub use ue_sm::{AusfUeSmContext, AusfUeState};
 pub use timer::{ausf_timer_get_name, timer_manager, AusfTimerManager};
+
+// Re-export EAP-AKA' types
+pub use eap_aka_prime::{EapAkaSession, EapPacket, EapCode, EapType};
 
 // Re-export handler types
 pub use nausf_handler::{
