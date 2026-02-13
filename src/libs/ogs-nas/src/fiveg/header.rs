@@ -45,6 +45,9 @@ pub enum FiveGmmMessageType {
     NotificationResponse = 0x66,
     UlNasTransport = 0x67,
     DlNasTransport = 0x68,
+    NetworkSliceSpecificAuthenticationCommand = 0x69,
+    NetworkSliceSpecificAuthenticationComplete = 0x6A,
+    NetworkSliceSpecificAuthenticationResult = 0x6B,
 }
 
 impl TryFrom<u8> for FiveGmmMessageType {
@@ -81,6 +84,9 @@ impl TryFrom<u8> for FiveGmmMessageType {
             0x66 => Ok(Self::NotificationResponse),
             0x67 => Ok(Self::UlNasTransport),
             0x68 => Ok(Self::DlNasTransport),
+            0x69 => Ok(Self::NetworkSliceSpecificAuthenticationCommand),
+            0x6A => Ok(Self::NetworkSliceSpecificAuthenticationComplete),
+            0x6B => Ok(Self::NetworkSliceSpecificAuthenticationResult),
             _ => Err(NasError::InvalidMessageType(value)),
         }
     }
@@ -106,6 +112,8 @@ pub enum FiveGsmMessageType {
     PduSessionReleaseCommand = 0xD3,
     PduSessionReleaseComplete = 0xD4,
     FiveGsmStatus = 0xD6,
+    RemoteUeReport = 0xD9,
+    RemoteUeReportResponse = 0xDA,
 }
 
 impl TryFrom<u8> for FiveGsmMessageType {
@@ -129,6 +137,8 @@ impl TryFrom<u8> for FiveGsmMessageType {
             0xD3 => Ok(Self::PduSessionReleaseCommand),
             0xD4 => Ok(Self::PduSessionReleaseComplete),
             0xD6 => Ok(Self::FiveGsmStatus),
+            0xD9 => Ok(Self::RemoteUeReport),
+            0xDA => Ok(Self::RemoteUeReportResponse),
             _ => Err(NasError::InvalidMessageType(value)),
         }
     }

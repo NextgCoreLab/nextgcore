@@ -18,6 +18,7 @@ ogs-s1ap = { workspace = true }
 ogs-gtp = { workspace = true }
 ogs-diameter = { workspace = true }
 ogs-app = { workspace = true }
+bytes.workspace = true
 log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true
