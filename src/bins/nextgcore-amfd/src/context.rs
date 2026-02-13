@@ -1713,6 +1713,86 @@ pub struct UrspPolicyRule {
     pub preferred_dnn: Option<String>,
 }
 
+// ============================================================================
+// Rel-17 SNPN Authentication (TS 23.501, TS 33.501)
+// ============================================================================
+
+/// SNPN Authentication Context
+#[derive(Debug, Clone, Default)]
+pub struct SnpnAuthContext {
+    /// NID (Network Identifier) - identifies the SNPN
+    pub nid: String,
+    /// Subscription credentials for SNPN authentication
+    pub subscription_credentials: Option<SnpnSubscriptionCredentials>,
+    /// Onboarding state
+    pub onboarding_state: SnpnOnboardingState,
+    /// Timestamp of last authentication
+    pub last_auth_time: u64,
+}
+
+/// SNPN subscription credentials
+#[derive(Debug, Clone, Default)]
+pub struct SnpnSubscriptionCredentials {
+    /// K (128-bit authentication key)
+    pub k: [u8; 16],
+    /// OPc (128-bit operator variant key)
+    pub opc: [u8; 16],
+    /// AMF value (2 bytes)
+    pub amf: [u8; 2],
+    /// SQN (6 bytes)
+    pub sqn: [u8; 6],
+}
+
+/// SNPN onboarding state
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SnpnOnboardingState {
+    /// Not onboarded
+    #[default]
+    NotOnboarded,
+    /// Onboarding in progress
+    OnboardingInProgress,
+    /// Onboarded (credentials provisioned)
+    Onboarded,
+    /// Onboarding failed
+    OnboardingFailed,
+}
+
+impl AmfUe {
+    /// Start SNPN-specific authentication
+    /// Returns true if SNPN authentication should proceed
+    pub fn start_snpn_auth(&mut self, nid: &str) -> bool {
+        if self.snpn_nid.is_none() {
+            self.snpn_nid = Some(nid.to_string());
+            log::info!(
+                "[SNPN Auth] Starting SNPN authentication for UE with NID={nid}"
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Handle SNPN onboarding process
+    /// This provisions initial credentials for a new SNPN UE
+    pub fn handle_snpn_onboarding(&mut self, nid: &str, _credentials: SnpnSubscriptionCredentials) -> bool {
+        self.snpn_nid = Some(nid.to_string());
+        log::info!(
+            "[SNPN Onboarding] Provisioning credentials for UE in SNPN NID={nid}"
+        );
+        // In production, this would contact DCS (Default Credential Server)
+        // and provision initial K/OPc for the UE
+        true
+    }
+
+    /// Validate NID (Network Identifier) against allowed SNPN list
+    pub fn validate_nid(&self, nid: &str, allowed_nids: &[String]) -> bool {
+        if allowed_nids.is_empty() {
+            // If no NID restriction, accept all
+            return true;
+        }
+        allowed_nids.iter().any(|allowed| allowed == nid)
+    }
+}
+
 /// Reference to an AMF session (for PDU session status)
 #[derive(Debug, Clone, Default)]
 pub struct AmfSessRef {

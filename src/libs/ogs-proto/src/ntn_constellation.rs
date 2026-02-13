@@ -309,7 +309,7 @@ mod tests {
         assert_eq!(c.sats_per_plane, 22);
 
         let period = c.orbital_period_s();
-        assert!(period > 5000.0 && period < 7000.0, "Period = {}s", period);
+        assert!(period > 5000.0 && period < 7000.0, "Period = {period}s");
     }
 
     #[test]
@@ -322,19 +322,19 @@ mod tests {
     #[test]
     fn test_coverage_radius_leo() {
         let radius = coverage_radius_km(550.0, 25.0);
-        assert!(radius > 200.0 && radius < 1500.0, "Radius = {}km", radius);
+        assert!(radius > 200.0 && radius < 1500.0, "Radius = {radius}km");
     }
 
     #[test]
     fn test_coverage_radius_geo() {
         let radius = coverage_radius_km(35786.0, 10.0);
-        assert!(radius > 5000.0, "GEO coverage radius = {}km", radius);
+        assert!(radius > 5000.0, "GEO coverage radius = {radius}km");
     }
 
     #[test]
     fn test_min_satellites() {
         let min_sats = min_satellites_for_coverage(550.0, 25.0);
-        assert!(min_sats > 100 && min_sats < 5000, "Min sats = {}", min_sats);
+        assert!(min_sats > 100 && min_sats < 5000, "Min sats = {min_sats}");
     }
 
     #[test]
@@ -383,14 +383,14 @@ mod tests {
     fn test_visibility_duration_leo() {
         let duration = avg_visibility_duration_s(550.0, 25.0);
         // LEO visibility: typically 3-10 minutes
-        assert!(duration > 100.0 && duration < 800.0, "Duration = {}s", duration);
+        assert!(duration > 100.0 && duration < 800.0, "Duration = {duration}s");
     }
 
     #[test]
     fn test_handover_frequency() {
         let freq = handover_frequency_per_hour(550.0, 25.0);
         // LEO: several handovers per hour
-        assert!(freq > 2.0 && freq < 30.0, "HO freq = {}/hr", freq);
+        assert!(freq > 2.0 && freq < 30.0, "HO freq = {freq}/hr");
     }
 
     #[test]
@@ -400,7 +400,7 @@ mod tests {
 
         // MEO at 8062 km: period ≈ 17256s (4.79 hours)
         let period = c.orbital_period_s();
-        assert!(period > 15000.0 && period < 20000.0, "MEO period = {}s", period);
+        assert!(period > 15000.0 && period < 20000.0, "MEO period = {period}s");
     }
 
     #[test]

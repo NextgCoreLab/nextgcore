@@ -156,6 +156,7 @@ impl McastContext {
 
     /// Perform 1-to-many multicast forwarding
     /// Returns the list of (gnb_addr, gnb_teid) destinations for a given ingress TEID
+    /// This function handles PDR matching for source interface = N3mb
     pub fn forward_lookup(&self, ingress_teid: u32) -> Vec<(Ipv4Addr, u32)> {
         let teid_index = match self.teid_index.read().ok() {
             Some(idx) => idx,
@@ -176,10 +177,28 @@ impl McastContext {
             _ => return vec![],
         };
 
+        // Multicast replication: one incoming packet → multiple outgoing GTP-U tunnels
         session.gnb_endpoints
             .iter()
             .map(|e| (e.gnb_addr, e.gnb_teid))
             .collect()
+    }
+
+    /// Check if a TEID corresponds to a multicast PDR (source interface = N3mb)
+    pub fn is_multicast_pdr(&self, ingress_teid: u32) -> bool {
+        if let Ok(teid_index) = self.teid_index.read() {
+            return teid_index.contains_key(&ingress_teid);
+        }
+        false
+    }
+
+    /// Get multicast distribution tree size for a session
+    pub fn get_distribution_tree_size(&self, n4mb_seid: u64) -> usize {
+        self.sessions
+            .read()
+            .ok()
+            .and_then(|s| s.get(&n4mb_seid).map(|sess| sess.gnb_endpoints.len()))
+            .unwrap_or(0)
     }
 
     /// Record forwarded packet statistics

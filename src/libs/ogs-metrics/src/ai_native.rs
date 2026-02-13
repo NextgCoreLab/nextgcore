@@ -93,6 +93,22 @@ pub const INFERENCE_THROUGHPUT: AiMetricDef = AiMetricDef {
     labels: &["model_id", "result"],
 };
 
+/// NWDAF model accuracy (gauge) - Rel-17
+pub const NWDAF_MODEL_ACCURACY: AiMetricDef = AiMetricDef {
+    name: "nwdaf_model_accuracy_ratio",
+    help: "Current accuracy of NWDAF ML model (0.0-1.0)",
+    category: AiMetricCategory::NwdafAnalytics,
+    labels: &["model_id", "analytics_id"],
+};
+
+/// NWDAF feedback received (counter) - Rel-17
+pub const NWDAF_FEEDBACK_RECEIVED: AiMetricDef = AiMetricDef {
+    name: "nwdaf_feedback_received_total",
+    help: "Total accuracy feedback messages received from consumers",
+    category: AiMetricCategory::NwdafAnalytics,
+    labels: &["consumer_nf", "analytics_id"],
+};
+
 // ============================================================================
 // Predefined Energy Efficiency Metrics (Rel-18, TS 28.310)
 // ============================================================================
@@ -876,5 +892,173 @@ mod trace_tests {
             collector.complete_trace(&id);
         }
         assert_eq!(collector.completed_count(), 2);
+    }
+}
+
+// ============================================================================
+// NWDAF Analytics Feedback (Rel-17)
+// ============================================================================
+
+/// Analytics feedback from NF consumer to NWDAF
+/// Enables ML model accuracy improvement via closed-loop feedback
+#[derive(Debug, Clone)]
+pub struct AnalyticsFeedback {
+    /// Analytics ID that this feedback pertains to
+    pub analytics_id: String,
+    /// Consumer NF type (e.g., "AMF", "SMF", "PCF")
+    pub consumer_nf_type: String,
+    /// Consumer NF instance ID
+    pub consumer_nf_id: String,
+    /// Reported accuracy (0.0 = completely wrong, 1.0 = perfect)
+    pub accuracy: f64,
+    /// Prediction error (predicted value - actual value)
+    pub prediction_error: Option<f64>,
+    /// Timestamp when feedback was generated
+    pub timestamp: u64,
+    /// Contextual attributes (e.g., slice, UE ID, location)
+    pub context: HashMap<String, String>,
+}
+
+impl AnalyticsFeedback {
+    pub fn new(
+        analytics_id: String,
+        consumer_nf_type: String,
+        consumer_nf_id: String,
+        accuracy: f64,
+    ) -> Self {
+        Self {
+            analytics_id,
+            consumer_nf_type,
+            consumer_nf_id,
+            accuracy: accuracy.clamp(0.0, 1.0),
+            prediction_error: None,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            context: HashMap::new(),
+        }
+    }
+
+    pub fn with_error(mut self, error: f64) -> Self {
+        self.prediction_error = Some(error);
+        self
+    }
+
+    pub fn with_context(mut self, key: String, value: String) -> Self {
+        self.context.insert(key, value);
+        self
+    }
+}
+
+/// NWDAF Analytics Feedback Manager (Rel-17 TS 23.288)
+pub struct NwdafFeedbackManager {
+    /// Model ID to feedback history
+    feedback_history: HashMap<String, Vec<AnalyticsFeedback>>,
+    /// Model accuracy (rolling average)
+    model_accuracy: HashMap<String, f64>,
+    /// Model weights adjustment history
+    adjustment_count: HashMap<String, u64>,
+    /// Maximum feedback items to retain per model
+    max_feedback_per_model: usize,
+}
+
+impl NwdafFeedbackManager {
+    pub fn new(max_feedback_per_model: usize) -> Self {
+        Self {
+            feedback_history: HashMap::new(),
+            model_accuracy: HashMap::new(),
+            adjustment_count: HashMap::new(),
+            max_feedback_per_model,
+        }
+    }
+
+    /// Receive accuracy feedback from a consumer NF
+    pub fn receive_feedback(&mut self, feedback: AnalyticsFeedback) {
+        let analytics_id = feedback.analytics_id.clone();
+
+        log::info!(
+            "[NWDAF Feedback] Received from {}:{} for analytics_id={} accuracy={:.3}",
+            feedback.consumer_nf_type,
+            feedback.consumer_nf_id,
+            analytics_id,
+            feedback.accuracy
+        );
+
+        // Store feedback
+        let history = self.feedback_history.entry(analytics_id.clone()).or_default();
+        history.push(feedback.clone());
+
+        // Limit history size
+        if history.len() > self.max_feedback_per_model {
+            history.remove(0);
+        }
+
+        // Update rolling accuracy
+        self.update_accuracy(&analytics_id);
+
+        // Trigger model adjustment if accuracy drops below threshold
+        if let Some(&accuracy) = self.model_accuracy.get(&analytics_id) {
+            if accuracy < 0.7 {
+                log::warn!(
+                    "[NWDAF Feedback] Low accuracy detected for analytics_id={analytics_id}: {accuracy:.3}"
+                );
+                self.adjust_model_weights(&analytics_id);
+            }
+        }
+    }
+
+    /// Adjust ML model weights based on feedback
+    fn adjust_model_weights(&mut self, analytics_id: &str) {
+        log::info!("[NWDAF Feedback] Adjusting model weights for analytics_id={analytics_id}");
+
+        // Increment adjustment count
+        *self.adjustment_count.entry(analytics_id.to_string()).or_insert(0) += 1;
+
+        // In production, this would:
+        // 1. Retrieve recent feedback for this model
+        // 2. Compute gradient updates based on prediction errors
+        // 3. Apply weight updates to the ML model
+        // 4. Optionally trigger retraining with federated learning
+    }
+
+    /// Update rolling accuracy for a model
+    fn update_accuracy(&mut self, analytics_id: &str) {
+        if let Some(history) = self.feedback_history.get(analytics_id) {
+            if !history.is_empty() {
+                let avg_accuracy = history.iter()
+                    .map(|f| f.accuracy)
+                    .sum::<f64>() / history.len() as f64;
+                self.model_accuracy.insert(analytics_id.to_string(), avg_accuracy);
+            }
+        }
+    }
+
+    /// Report current accuracy for a model
+    pub fn report_accuracy(&self, analytics_id: &str) -> Option<f64> {
+        self.model_accuracy.get(analytics_id).copied()
+    }
+
+    /// Get feedback count for a model
+    pub fn feedback_count(&self, analytics_id: &str) -> usize {
+        self.feedback_history.get(analytics_id).map(|h| h.len()).unwrap_or(0)
+    }
+
+    /// Get adjustment count for a model
+    pub fn adjustment_count(&self, analytics_id: &str) -> u64 {
+        self.adjustment_count.get(analytics_id).copied().unwrap_or(0)
+    }
+
+    /// Get recent feedback for a model
+    pub fn recent_feedback(&self, analytics_id: &str, limit: usize) -> Vec<&AnalyticsFeedback> {
+        self.feedback_history
+            .get(analytics_id)
+            .map(|history| {
+                history.iter()
+                    .rev()
+                    .take(limit)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }

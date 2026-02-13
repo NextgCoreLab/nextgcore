@@ -714,14 +714,36 @@ pub fn process_qos_flow_binding(
                         ));
                         continue;
                     }
-                    
+
                     if existing_flows.len() >= MAX_NUM_OF_BEARER {
                         results.push(QosFlowBindingResult::Error(
                             format!("QoS flow overflow: {}", existing_flows.len())
                         ));
                         continue;
                     }
-                    
+
+                    // Rel-16: Enforce strict URLLC constraints for 5QI 80-81
+                    // Note: 5QI 82-85 are XR delay-critical GBR with relaxed constraints
+                    use crate::context::UrllcConstraints;
+                    let five_qi = pcc_rule.qos.qci;
+                    if UrllcConstraints::is_strict_urllc_5qi(five_qi) {
+                        let priority_level = pcc_rule.qos.arp.priority_level;
+                        let packet_delay_budget_ms = 10;
+
+                        if !UrllcConstraints::enforce_urllc_constraints(
+                            five_qi,
+                            priority_level,
+                            packet_delay_budget_ms,
+                        ) {
+                            results.push(QosFlowBindingResult::Error(
+                                format!(
+                                    "URLLC constraints not met for 5QI {five_qi}: priority={priority_level}, pdb={packet_delay_budget_ms}ms"
+                                )
+                            ));
+                            continue;
+                        }
+                    }
+
                     pfcp_flags |= pfcp_modify::CREATE;
                     results.push(QosFlowBindingResult::Created {
                         qos_flow_id: 0, // Would be assigned by caller

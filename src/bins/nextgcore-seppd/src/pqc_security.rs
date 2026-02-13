@@ -254,6 +254,78 @@ impl ThreatDetector {
 }
 
 // ============================================================================
+// Anomaly Tracking for AI Threat Detection (B6.3)
+// ============================================================================
+
+/// Tracks statistical baselines to detect anomalous inter-PLMN behavior.
+pub struct AnomalyTracker {
+    /// Ring buffer of historical observations.
+    observations: Vec<f64>,
+    /// Maximum observations to retain for baseline.
+    max_observations: usize,
+    /// Cached mean.
+    mean: f64,
+    /// Cached standard deviation.
+    std_dev: f64,
+    /// Whether baseline statistics are valid.
+    baseline_valid: bool,
+}
+
+impl AnomalyTracker {
+    /// Create a new anomaly tracker.
+    pub fn new(max_observations: usize) -> Self {
+        Self {
+            observations: Vec::with_capacity(max_observations),
+            max_observations,
+            mean: 0.0,
+            std_dev: 0.0,
+            baseline_valid: false,
+        }
+    }
+
+    /// Record an observation and update baseline statistics.
+    pub fn record_observation(&mut self, value: f64) {
+        if self.observations.len() >= self.max_observations {
+            self.observations.remove(0);
+        }
+        self.observations.push(value);
+        self.recompute_baseline();
+    }
+
+    /// Check if the baseline has enough data.
+    pub fn has_baseline(&self) -> bool {
+        self.baseline_valid
+    }
+
+    /// Check if a value is anomalous.
+    /// Returns (anomaly_score, is_anomaly).
+    /// Score is 0.0 (normal) to 1.0 (extreme outlier).
+    pub fn check_anomaly(&self, value: f64) -> (f64, bool) {
+        if !self.baseline_valid || self.std_dev == 0.0 {
+            return (0.0, false);
+        }
+        let z_score = ((value - self.mean) / self.std_dev).abs();
+        let score = (z_score / 5.0).min(1.0); // Normalize to 0-1 range
+        let anomaly = z_score > 3.0; // 3-sigma rule
+        (score, anomaly)
+    }
+
+    fn recompute_baseline(&mut self) {
+        let n = self.observations.len() as f64;
+        if n < 3.0 {
+            self.baseline_valid = false;
+            return;
+        }
+        self.mean = self.observations.iter().sum::<f64>() / n;
+        let variance: f64 = self.observations.iter()
+            .map(|v| (v - self.mean).powi(2))
+            .sum::<f64>() / n;
+        self.std_dev = variance.sqrt();
+        self.baseline_valid = true;
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -345,77 +417,5 @@ mod tests {
         assert!(!tracker.has_baseline());
         let (_, anomaly) = tracker.check_anomaly(100.0);
         assert!(!anomaly); // Cannot detect anomaly without baseline
-    }
-}
-
-// ============================================================================
-// Anomaly Tracking for AI Threat Detection (B6.3)
-// ============================================================================
-
-/// Tracks statistical baselines to detect anomalous inter-PLMN behavior.
-pub struct AnomalyTracker {
-    /// Ring buffer of historical observations.
-    observations: Vec<f64>,
-    /// Maximum observations to retain for baseline.
-    max_observations: usize,
-    /// Cached mean.
-    mean: f64,
-    /// Cached standard deviation.
-    std_dev: f64,
-    /// Whether baseline statistics are valid.
-    baseline_valid: bool,
-}
-
-impl AnomalyTracker {
-    /// Create a new anomaly tracker.
-    pub fn new(max_observations: usize) -> Self {
-        Self {
-            observations: Vec::with_capacity(max_observations),
-            max_observations,
-            mean: 0.0,
-            std_dev: 0.0,
-            baseline_valid: false,
-        }
-    }
-
-    /// Record an observation and update baseline statistics.
-    pub fn record_observation(&mut self, value: f64) {
-        if self.observations.len() >= self.max_observations {
-            self.observations.remove(0);
-        }
-        self.observations.push(value);
-        self.recompute_baseline();
-    }
-
-    /// Check if the baseline has enough data.
-    pub fn has_baseline(&self) -> bool {
-        self.baseline_valid
-    }
-
-    /// Check if a value is anomalous.
-    /// Returns (anomaly_score, is_anomaly).
-    /// Score is 0.0 (normal) to 1.0 (extreme outlier).
-    pub fn check_anomaly(&self, value: f64) -> (f64, bool) {
-        if !self.baseline_valid || self.std_dev == 0.0 {
-            return (0.0, false);
-        }
-        let z_score = ((value - self.mean) / self.std_dev).abs();
-        let score = (z_score / 5.0).min(1.0); // Normalize to 0-1 range
-        let anomaly = z_score > 3.0; // 3-sigma rule
-        (score, anomaly)
-    }
-
-    fn recompute_baseline(&mut self) {
-        let n = self.observations.len() as f64;
-        if n < 3.0 {
-            self.baseline_valid = false;
-            return;
-        }
-        self.mean = self.observations.iter().sum::<f64>() / n;
-        let variance: f64 = self.observations.iter()
-            .map(|v| (v - self.mean).powi(2))
-            .sum::<f64>() / n;
-        self.std_dev = variance.sqrt();
-        self.baseline_valid = true;
     }
 }

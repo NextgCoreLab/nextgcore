@@ -301,7 +301,7 @@ mod tests {
         let power = h.compute_rf_harvest_uw(-10.0); // -10 dBm = 0.1 mW
         assert!(power > 0.0);
         // 0.1 mW * 0.25 efficiency = 0.025 mW = 25 µW
-        assert!((power - 25.0).abs() < 1.0, "Got {}µW", power);
+        assert!((power - 25.0).abs() < 1.0, "Got {power}µW");
     }
 
     #[test]

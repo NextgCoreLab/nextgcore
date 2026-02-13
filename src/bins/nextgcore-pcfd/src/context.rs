@@ -112,16 +112,59 @@ pub struct PcfUeAm {
 /// UE Route Selection Policy rule (TS 24.526)
 #[derive(Debug, Clone)]
 pub struct UrspRule {
-    /// Rule precedence (lower = higher priority)
+    /// Rule precedence (lower = higher priority, range 0-255)
     pub precedence: u8,
-    /// Traffic descriptor (app ID or domain)
-    pub traffic_descriptor: String,
-    /// Preferred S-NSSAI SST
-    pub preferred_sst: Option<u8>,
-    /// Preferred DNN
-    pub preferred_dnn: Option<String>,
-    /// SSC mode (1, 2, or 3)
+    /// Traffic descriptors for matching packets
+    pub traffic_descriptors: Vec<TrafficDescriptor>,
+    /// Route selection descriptors (ordered by precedence)
+    pub route_selection_descriptors: Vec<RouteSelectionDescriptor>,
+}
+
+/// Traffic Descriptor for URSP matching (TS 24.526 5.2)
+#[derive(Debug, Clone)]
+pub struct TrafficDescriptor {
+    /// Application ID (from OSID/OMA)
+    pub app_id: Option<String>,
+    /// IP packet filter descriptor (5-tuple)
+    pub ip_descriptor: Option<IpPacketFilterDescriptor>,
+    /// DNN for this traffic
+    pub dnn: Option<String>,
+    /// S-NSSAI for this traffic
+    pub s_nssai: Option<SNssai>,
+    /// Connection capabilities (IMS, MMS, SUPL, Internet)
+    pub connection_caps: Option<String>,
+}
+
+/// IP Packet Filter Descriptor (5-tuple matching)
+#[derive(Debug, Clone, Default)]
+pub struct IpPacketFilterDescriptor {
+    /// Source IP address
+    pub src_ip: Option<String>,
+    /// Source port range
+    pub src_port: Option<(u16, u16)>,
+    /// Destination IP address
+    pub dst_ip: Option<String>,
+    /// Destination port range
+    pub dst_port: Option<(u16, u16)>,
+    /// Protocol (TCP=6, UDP=17, etc.)
+    pub protocol: Option<u8>,
+}
+
+/// Route Selection Descriptor (TS 24.526 5.2)
+#[derive(Debug, Clone)]
+pub struct RouteSelectionDescriptor {
+    /// Precedence within route descriptors (lower = higher priority)
+    pub precedence: u8,
+    /// S-NSSAI for route selection
+    pub s_nssai: Option<SNssai>,
+    /// DNN for route selection
+    pub dnn: Option<String>,
+    /// PDU Session Type (IPv4, IPv6, IPv4v6, Ethernet, Unstructured)
+    pub pdu_session_type: Option<PduSessionType>,
+    /// SSC Mode (1, 2, 3)
     pub ssc_mode: Option<u8>,
+    /// Access type preference (3GPP, Non-3GPP)
+    pub access_type: Option<Vec<AccessType>>,
 }
 
 impl PcfUeAm {
@@ -145,36 +188,135 @@ impl PcfUeAm {
         }
     }
 
+    /// Build complete URSP rules from UE subscription data
+    /// This creates properly structured URSP rules per TS 24.526
+    pub fn build_ursp_rules(&mut self, subscription_data: &UrspSubscriptionData) {
+        self.ursp_rules.clear();
+
+        // Build rules from subscription data
+        for rule_template in &subscription_data.rule_templates {
+            self.ursp_rules.push(UrspRule {
+                precedence: rule_template.precedence,
+                traffic_descriptors: rule_template.traffic_descriptors.clone(),
+                route_selection_descriptors: rule_template.route_selection_descriptors.clone(),
+            });
+        }
+
+        log::info!(
+            "[PCF URSP] Built {} URSP rules for SUPI={}",
+            self.ursp_rules.len(),
+            self.supi
+        );
+    }
+
     /// Generate default URSP rules based on UE subscription.
     ///
     /// In production, rules would come from UDR subscription data.
-    /// This creates sensible defaults for standard slice types.
+    /// This creates sensible defaults for standard slice types with full URSP structure.
     pub fn generate_default_ursp_rules(&mut self) {
         self.ursp_rules = vec![
+            // Rule 1: IMS traffic → eMBB slice, IMS DNN
             UrspRule {
                 precedence: 1,
-                traffic_descriptor: "internet".to_string(),
-                preferred_sst: Some(1), // eMBB
-                preferred_dnn: Some("internet".to_string()),
-                ssc_mode: Some(1),
+                traffic_descriptors: vec![TrafficDescriptor {
+                    app_id: Some("ims".to_string()),
+                    ip_descriptor: None,
+                    dnn: Some("ims".to_string()),
+                    s_nssai: Some(SNssai { sst: 1, sd: None }),
+                    connection_caps: Some("IMS".to_string()),
+                }],
+                route_selection_descriptors: vec![RouteSelectionDescriptor {
+                    precedence: 1,
+                    s_nssai: Some(SNssai { sst: 1, sd: None }),
+                    dnn: Some("ims".to_string()),
+                    pdu_session_type: Some(PduSessionType::Ipv4v6),
+                    ssc_mode: Some(1),
+                    access_type: Some(vec![AccessType::ThreeGppAccess]),
+                }],
             },
+            // Rule 2: Internet traffic → eMBB slice, Internet DNN
             UrspRule {
                 precedence: 2,
-                traffic_descriptor: "ims".to_string(),
-                preferred_sst: Some(1),
-                preferred_dnn: Some("ims".to_string()),
-                ssc_mode: Some(1),
+                traffic_descriptors: vec![TrafficDescriptor {
+                    app_id: Some("internet".to_string()),
+                    ip_descriptor: None,
+                    dnn: Some("internet".to_string()),
+                    s_nssai: Some(SNssai { sst: 1, sd: None }),
+                    connection_caps: Some("Internet".to_string()),
+                }],
+                route_selection_descriptors: vec![RouteSelectionDescriptor {
+                    precedence: 1,
+                    s_nssai: Some(SNssai { sst: 1, sd: None }),
+                    dnn: Some("internet".to_string()),
+                    pdu_session_type: Some(PduSessionType::Ipv4),
+                    ssc_mode: Some(1),
+                    access_type: Some(vec![AccessType::ThreeGppAccess, AccessType::NonThreeGppAccess]),
+                }],
             },
+            // Rule 3: V2X traffic → URLLC slice, V2X DNN
             UrspRule {
                 precedence: 3,
-                traffic_descriptor: "v2x".to_string(),
-                preferred_sst: Some(4), // V2X
-                preferred_dnn: Some("v2x".to_string()),
-                ssc_mode: Some(2),
+                traffic_descriptors: vec![TrafficDescriptor {
+                    app_id: Some("v2x".to_string()),
+                    ip_descriptor: None,
+                    dnn: Some("v2x".to_string()),
+                    s_nssai: Some(SNssai { sst: 4, sd: None }),
+                    connection_caps: Some("V2X".to_string()),
+                }],
+                route_selection_descriptors: vec![RouteSelectionDescriptor {
+                    precedence: 1,
+                    s_nssai: Some(SNssai { sst: 4, sd: None }),
+                    dnn: Some("v2x".to_string()),
+                    pdu_session_type: Some(PduSessionType::Ipv4),
+                    ssc_mode: Some(2),
+                    access_type: Some(vec![AccessType::ThreeGppAccess]),
+                }],
             },
         ];
-        log::info!("PCF: Generated {} URSP rules for SUPI={}", self.ursp_rules.len(), self.supi);
+        log::info!("[PCF URSP] Generated {} default URSP rules for SUPI={}", self.ursp_rules.len(), self.supi);
     }
+
+    /// Provision UE policy (URSP) to AMF via UE Configuration Update
+    /// Returns true if provisioning was successful
+    pub fn provision_ue_policy(&self) -> bool {
+        if self.ursp_rules.is_empty() {
+            log::warn!(
+                "[PCF URSP] No URSP rules to provision for SUPI={}",
+                self.supi
+            );
+            return false;
+        }
+
+        log::info!(
+            "[PCF URSP] Provisioning {} URSP rules to AMF for SUPI={} via UE Configuration Update",
+            self.ursp_rules.len(),
+            self.supi
+        );
+
+        // In production, this would:
+        // 1. Send Namf_Communication_N1N2MessageTransfer to AMF
+        // 2. AMF sends NAS UE Configuration Update Command to UE
+        // 3. UE acknowledges with UE Configuration Update Complete
+        true
+    }
+}
+
+/// URSP subscription data from UDR
+#[derive(Debug, Clone, Default)]
+pub struct UrspSubscriptionData {
+    /// URSP rule templates from subscription
+    pub rule_templates: Vec<UrspRuleTemplate>,
+}
+
+/// URSP rule template from subscription
+#[derive(Debug, Clone)]
+pub struct UrspRuleTemplate {
+    /// Rule precedence
+    pub precedence: u8,
+    /// Traffic descriptors
+    pub traffic_descriptors: Vec<TrafficDescriptor>,
+    /// Route selection descriptors
+    pub route_selection_descriptors: Vec<RouteSelectionDescriptor>,
 }
 
 
