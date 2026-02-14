@@ -48,6 +48,9 @@ members = [
     "bins/nextgcore-pind",
     "bins/nextgcore-lmfd",
 
+    # Rel-20 (6G) NFs
+    "bins/nextgcore-nwdafd",
+
     # Integration tests
     "tests",
 ]

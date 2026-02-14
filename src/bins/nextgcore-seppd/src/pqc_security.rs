@@ -40,12 +40,78 @@ pub struct VerificationResult {
     pub timestamp_ms: u64,
 }
 
-/// Zero-trust policy engine.
+/// NF instance trust information for service mesh authentication
+#[derive(Debug, Clone)]
+pub struct NfInstanceTrust {
+    /// NF instance ID
+    pub nf_instance_id: String,
+    /// NF type (AMF, SMF, UPF, etc.)
+    pub nf_type: String,
+    /// Current trust score (0.0 - 1.0)
+    pub trust_score: f64,
+    /// mTLS certificate fingerprint (SHA-256)
+    pub cert_fingerprint: Option<String>,
+    /// Last successful authentication timestamp
+    pub last_auth_ms: u64,
+    /// Total authentication attempts
+    pub auth_attempts: u64,
+    /// Failed authentication attempts
+    pub failed_attempts: u64,
+    /// Trust revoked flag
+    pub revoked: bool,
+}
+
+/// Zero-trust policy decision
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyDecision {
+    /// Allow the request
+    Allow,
+    /// Deny the request
+    Deny,
+    /// Require additional verification
+    Challenge,
+}
+
+/// Zero-trust policy rule
+#[derive(Debug, Clone)]
+pub struct PolicyRule {
+    /// Rule ID
+    pub rule_id: String,
+    /// Source NF type pattern (e.g., "AMF", "*")
+    pub source_nf_type: String,
+    /// Target NF type pattern
+    pub target_nf_type: String,
+    /// Minimum trust score required
+    pub min_trust_score: f64,
+    /// Require mTLS
+    pub require_mtls: bool,
+    /// Policy decision if rule matches
+    pub decision: PolicyDecision,
+}
+
+impl Default for PolicyRule {
+    fn default() -> Self {
+        Self {
+            rule_id: "default-deny".to_string(),
+            source_nf_type: "*".to_string(),
+            target_nf_type: "*".to_string(),
+            min_trust_score: 0.8,
+            require_mtls: true,
+            decision: PolicyDecision::Deny,
+        }
+    }
+}
+
+/// Zero-trust policy engine with service mesh authentication.
 pub struct ZeroTrustEngine {
     /// Minimum required trust level.
     min_level: ZeroTrustLevel,
     /// Trusted PLMN peers (PLMN ID → trust level).
     trusted_peers: HashMap<String, ZeroTrustLevel>,
+    /// NF instance trust tracking for service mesh
+    nf_trust: HashMap<String, NfInstanceTrust>,
+    /// Zero-trust policy rules (deny by default, explicit allow)
+    policy_rules: Vec<PolicyRule>,
     /// Verification count.
     verification_count: u64,
     /// Denied count.
@@ -53,19 +119,142 @@ pub struct ZeroTrustEngine {
 }
 
 impl ZeroTrustEngine {
-    /// Creates a new zero-trust engine.
+    /// Creates a new zero-trust engine with deny-by-default policy.
     pub fn new(min_level: ZeroTrustLevel) -> Self {
-        Self {
+        let mut engine = Self {
             min_level,
             trusted_peers: HashMap::new(),
+            nf_trust: HashMap::new(),
+            policy_rules: Vec::new(),
             verification_count: 0,
             denied_count: 0,
-        }
+        };
+        // Default deny rule
+        engine.add_policy_rule(PolicyRule::default());
+        engine
     }
 
     /// Register a trusted peer PLMN.
     pub fn add_trusted_peer(&mut self, plmn_id: impl Into<String>, level: ZeroTrustLevel) {
         self.trusted_peers.insert(plmn_id.into(), level);
+    }
+
+    /// Add a zero-trust policy rule.
+    pub fn add_policy_rule(&mut self, rule: PolicyRule) {
+        log::info!(
+            "Zero-trust policy rule added: {} -> {} (score >= {}, mtls={})",
+            rule.source_nf_type,
+            rule.target_nf_type,
+            rule.min_trust_score,
+            rule.require_mtls
+        );
+        self.policy_rules.push(rule);
+    }
+
+    /// Register or update NF instance trust for service mesh authentication.
+    pub fn register_nf_instance(&mut self, nf_instance_id: String, nf_type: String, cert_fingerprint: Option<String>) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let trust = NfInstanceTrust {
+            nf_instance_id: nf_instance_id.clone(),
+            nf_type,
+            trust_score: 1.0, // Start with full trust
+            cert_fingerprint,
+            last_auth_ms: now,
+            auth_attempts: 1,
+            failed_attempts: 0,
+            revoked: false,
+        };
+        self.nf_trust.insert(nf_instance_id.clone(), trust);
+        log::info!("NF instance registered in zero-trust mesh: {nf_instance_id}");
+    }
+
+    /// Authenticate NF instance with mTLS and update trust score dynamically.
+    pub fn authenticate_nf(&mut self, nf_instance_id: &str, has_mtls: bool, cert_fingerprint: Option<String>) -> bool {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+
+        if let Some(trust) = self.nf_trust.get_mut(nf_instance_id) {
+            trust.auth_attempts += 1;
+
+            // Check if trust is revoked
+            if trust.revoked {
+                log::warn!("Authentication denied: NF {nf_instance_id} trust revoked");
+                self.denied_count += 1;
+                return false;
+            }
+
+            // Verify mTLS certificate fingerprint
+            if has_mtls {
+                if let (Some(expected), Some(actual)) = (&trust.cert_fingerprint, &cert_fingerprint) {
+                    if expected != actual {
+                        log::error!("mTLS certificate mismatch for NF {nf_instance_id}: expected {expected}, got {actual}");
+                        trust.failed_attempts += 1;
+                        trust.trust_score = (trust.trust_score - 0.2).max(0.0);
+                        self.denied_count += 1;
+                        return false;
+                    }
+                }
+                trust.last_auth_ms = now;
+                trust.trust_score = (trust.trust_score + 0.05).min(1.0); // Slowly increase trust
+                return true;
+            } else {
+                log::warn!("No mTLS for NF {nf_instance_id}, trust score degraded");
+                trust.failed_attempts += 1;
+                trust.trust_score = (trust.trust_score - 0.1).max(0.0);
+                self.denied_count += 1;
+                return false;
+            }
+        }
+
+        // Unknown NF instance - deny by default
+        log::warn!("Unknown NF instance attempted authentication: {nf_instance_id}");
+        self.denied_count += 1;
+        false
+    }
+
+    /// Evaluate zero-trust policy for inter-NF communication.
+    pub fn evaluate_policy(&self, source_nf_type: &str, target_nf_type: &str, source_instance_id: &str) -> PolicyDecision {
+        // Check NF instance trust
+        if let Some(trust) = self.nf_trust.get(source_instance_id) {
+            if trust.revoked {
+                log::warn!("Policy denied: source NF {source_instance_id} trust revoked");
+                return PolicyDecision::Deny;
+            }
+
+            // Find matching policy rule (first match wins)
+            for rule in &self.policy_rules {
+                let source_match = rule.source_nf_type == "*" || rule.source_nf_type == source_nf_type;
+                let target_match = rule.target_nf_type == "*" || rule.target_nf_type == target_nf_type;
+
+                if source_match && target_match {
+                    if trust.trust_score >= rule.min_trust_score {
+                        log::debug!("Policy matched: {} -> {} (score {:.2}, rule: {})",
+                                   source_nf_type, target_nf_type, trust.trust_score, rule.rule_id);
+                        return rule.decision;
+                    } else {
+                        log::warn!("Trust score too low: {:.2} < {:.2}", trust.trust_score, rule.min_trust_score);
+                        return PolicyDecision::Deny;
+                    }
+                }
+            }
+        }
+
+        // Default deny (no matching rule or unknown NF)
+        log::warn!("Policy denied (default): {source_nf_type} -> {target_nf_type}");
+        PolicyDecision::Deny
+    }
+
+    /// Revoke trust for an NF instance based on anomaly detection.
+    pub fn revoke_nf_trust(&mut self, nf_instance_id: &str, reason: &str) {
+        if let Some(trust) = self.nf_trust.get_mut(nf_instance_id) {
+            trust.revoked = true;
+            trust.trust_score = 0.0;
+            log::error!("Trust revoked for NF {nf_instance_id}: {reason}");
+        }
+    }
+
+    /// Get current trust score for an NF instance.
+    pub fn get_nf_trust_score(&self, nf_instance_id: &str) -> Option<f64> {
+        self.nf_trust.get(nf_instance_id).map(|t| t.trust_score)
     }
 
     /// Verify an inter-PLMN request.
@@ -108,6 +297,7 @@ impl ZeroTrustEngine {
 
     pub fn verification_count(&self) -> u64 { self.verification_count }
     pub fn denied_count(&self) -> u64 { self.denied_count }
+    pub fn nf_instance_count(&self) -> usize { self.nf_trust.len() }
 }
 
 // ============================================================================
@@ -417,5 +607,70 @@ mod tests {
         assert!(!tracker.has_baseline());
         let (_, anomaly) = tracker.check_anomaly(100.0);
         assert!(!anomaly); // Cannot detect anomaly without baseline
+    }
+
+    #[test]
+    fn test_zero_trust_service_mesh() {
+        let mut engine = ZeroTrustEngine::new(ZeroTrustLevel::Enhanced);
+
+        // Register NF instance with mTLS cert
+        engine.register_nf_instance(
+            "amf-instance-1".to_string(),
+            "AMF".to_string(),
+            Some("sha256:abcd1234".to_string()),
+        );
+
+        // Authenticate with correct cert
+        assert!(engine.authenticate_nf("amf-instance-1", true, Some("sha256:abcd1234".to_string())));
+
+        // Authenticate with wrong cert should fail
+        assert!(!engine.authenticate_nf("amf-instance-1", true, Some("sha256:wrong".to_string())));
+
+        // Trust score should have degraded
+        let score = engine.get_nf_trust_score("amf-instance-1").unwrap();
+        assert!(score < 1.0);
+    }
+
+    #[test]
+    fn test_zero_trust_policy_evaluation() {
+        let mut engine = ZeroTrustEngine::new(ZeroTrustLevel::Enhanced);
+
+        // Register NF with high trust
+        engine.register_nf_instance("amf-1".to_string(), "AMF".to_string(), None);
+
+        // Add allow rule for AMF -> SMF
+        engine.add_policy_rule(PolicyRule {
+            rule_id: "allow-amf-smf".to_string(),
+            source_nf_type: "AMF".to_string(),
+            target_nf_type: "SMF".to_string(),
+            min_trust_score: 0.8,
+            require_mtls: true,
+            decision: PolicyDecision::Allow,
+        });
+
+        // Should allow AMF -> SMF
+        let decision = engine.evaluate_policy("AMF", "SMF", "amf-1");
+        assert_eq!(decision, PolicyDecision::Allow);
+
+        // Should deny AMF -> UDM (no explicit rule, default deny)
+        let decision = engine.evaluate_policy("AMF", "UDM", "amf-1");
+        assert_eq!(decision, PolicyDecision::Deny);
+    }
+
+    #[test]
+    fn test_zero_trust_anomaly_revocation() {
+        let mut engine = ZeroTrustEngine::new(ZeroTrustLevel::Enhanced);
+
+        engine.register_nf_instance("smf-1".to_string(), "SMF".to_string(), None);
+        assert_eq!(engine.get_nf_trust_score("smf-1"), Some(1.0));
+
+        // Revoke trust due to anomaly
+        engine.revoke_nf_trust("smf-1", "Abnormal traffic pattern detected");
+
+        // Trust score should be 0
+        assert_eq!(engine.get_nf_trust_score("smf-1"), Some(0.0));
+
+        // Authentication should fail
+        assert!(!engine.authenticate_nf("smf-1", true, None));
     }
 }

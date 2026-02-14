@@ -1168,6 +1168,60 @@ pub enum MbsSessionState {
     Releasing,
 }
 
+/// MBS Service Area for multicast delivery
+#[derive(Debug, Clone, Default)]
+pub struct MbsServiceArea {
+    /// List of TAIs (Tracking Area Identifiers) for MBS coverage
+    pub tais: Vec<u32>,
+    /// List of Cell IDs for MBS coverage
+    pub cell_ids: Vec<u64>,
+}
+
+/// MBS QoS Flow for multicast bearer
+#[derive(Debug, Clone)]
+pub struct MbsQosFlow {
+    /// QoS Flow Identifier
+    pub qfi: u8,
+    /// 5QI (5G QoS Identifier) - e.g., 1-85
+    pub fiveqi: u8,
+    /// Guaranteed Flow Bit Rate (GFBR) in kbps
+    pub gfbr: Option<u64>,
+    /// Maximum Flow Bit Rate (MFBR) in kbps
+    pub mfbr: Option<u64>,
+    /// Priority level (1-127, lower = higher priority)
+    pub priority: u8,
+}
+
+/// N4mb Session Context for PFCP multicast session with UPF
+#[derive(Debug, Clone)]
+pub struct N4mbSession {
+    /// N4mb PFCP Session ID
+    pub session_id: u64,
+    /// UPF node ID (IPv4 or FQDN)
+    pub upf_node_id: String,
+    /// Multicast F-TEID (Fully Qualified Tunnel Endpoint Identifier)
+    pub multicast_fteid: Option<u32>,
+    /// Multicast transport IP (allocated by UPF)
+    pub multicast_transport_ip: Option<std::net::Ipv4Addr>,
+    /// Session state
+    pub state: N4mbSessionState,
+    /// QoS flows for this N4mb session
+    pub qos_flows: Vec<MbsQosFlow>,
+}
+
+/// N4mb PFCP Session State
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum N4mbSessionState {
+    /// Session establishment in progress
+    Establishing,
+    /// Session established and active
+    Active,
+    /// Session modification in progress
+    Modifying,
+    /// Session release in progress
+    Releasing,
+}
+
 /// MBS Session Context (Rel-17 TS 23.247)
 #[derive(Debug, Clone)]
 pub struct MbsSession {
@@ -1183,8 +1237,12 @@ pub struct MbsSession {
     pub joined_ues: Vec<u64>,
     /// Session state
     pub state: MbsSessionState,
-    /// N4mb PFCP Session ID (for multicast user plane)
-    pub n4mb_session: Option<u64>,
+    /// N4mb PFCP Session (for multicast user plane with UPF)
+    pub n4mb_session: Option<N4mbSession>,
+    /// MBS Service Area (coverage area for multicast)
+    pub mbs_service_area: MbsServiceArea,
+    /// QoS Flow list for multicast bearer
+    pub qos_flow_list: Vec<MbsQosFlow>,
     /// Creation timestamp
     pub created_at: u64,
     /// Last state change timestamp
@@ -1205,6 +1263,8 @@ impl MbsSession {
             joined_ues: Vec::new(),
             state: MbsSessionState::Creating,
             n4mb_session: None,
+            mbs_service_area: MbsServiceArea::default(),
+            qos_flow_list: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -1216,6 +1276,62 @@ impl MbsSession {
 
     pub fn is_active(&self) -> bool {
         self.state == MbsSessionState::Active
+    }
+
+    /// Establish N4mb session with UPF for multicast bearer
+    pub fn establish_n4mb_session(&mut self, upf_node_id: String, session_id: u64) {
+        let n4mb = N4mbSession {
+            session_id,
+            upf_node_id,
+            multicast_fteid: None,
+            multicast_transport_ip: None,
+            state: N4mbSessionState::Establishing,
+            qos_flows: self.qos_flow_list.clone(),
+        };
+        self.n4mb_session = Some(n4mb);
+        log::info!("MBS Session {} N4mb establishment initiated with UPF", self.id);
+    }
+
+    /// Activate N4mb session after successful PFCP establishment
+    pub fn activate_n4mb_session(&mut self, fteid: u32, transport_ip: std::net::Ipv4Addr) -> bool {
+        if let Some(ref mut n4mb) = self.n4mb_session {
+            n4mb.state = N4mbSessionState::Active;
+            n4mb.multicast_fteid = Some(fteid);
+            n4mb.multicast_transport_ip = Some(transport_ip);
+            log::info!("MBS Session {} N4mb session activated (F-TEID: {}, IP: {})",
+                      self.id, fteid, transport_ip);
+            return true;
+        }
+        false
+    }
+
+    /// Release N4mb session
+    pub fn release_n4mb_session(&mut self) -> bool {
+        if let Some(ref mut n4mb) = self.n4mb_session {
+            n4mb.state = N4mbSessionState::Releasing;
+            log::info!("MBS Session {} N4mb session release initiated", self.id);
+            return true;
+        }
+        false
+    }
+
+    /// Add QoS flow to multicast bearer
+    pub fn add_qos_flow(&mut self, qos_flow: MbsQosFlow) {
+        self.qos_flow_list.push(qos_flow);
+        // Sync to N4mb session if active
+        if let Some(ref mut n4mb) = self.n4mb_session {
+            n4mb.qos_flows = self.qos_flow_list.clone();
+        }
+    }
+
+    /// Update MBS service area
+    pub fn update_service_area(&mut self, tais: Vec<u32>, cell_ids: Vec<u64>) {
+        self.mbs_service_area.tais = tais;
+        self.mbs_service_area.cell_ids = cell_ids;
+        self.updated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
     }
 }
 
@@ -2109,24 +2225,31 @@ impl SmfContext {
         Some(session)
     }
 
-    /// Activate an MBS session
+    /// Activate an MBS session with N4mb PFCP session
     pub fn activate_mbs_session(
         &self,
         mbs_sess_id: u64,
         multicast_addr: std::net::Ipv4Addr,
-        n4mb_session: u64,
+        upf_node_id: String,
+        n4mb_session_id: u64,
+        fteid: u32,
+        transport_ip: std::net::Ipv4Addr,
     ) -> bool {
         if let Ok(mut mbs_sess_list) = self.mbs_sess_list.write() {
             if let Some(session) = mbs_sess_list.get_mut(&mbs_sess_id) {
                 session.state = MbsSessionState::Active;
                 session.multicast_addr = Some(multicast_addr);
-                session.n4mb_session = Some(n4mb_session);
+
+                // Establish N4mb session
+                session.establish_n4mb_session(upf_node_id, n4mb_session_id);
+                session.activate_n4mb_session(fteid, transport_ip);
+
                 session.updated_at = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
                 log::info!(
-                    "[MBS] Session activated: id={mbs_sess_id} mcast_addr={multicast_addr} n4mb_seid={n4mb_session}"
+                    "[MBS] Session activated: id={mbs_sess_id} mcast_addr={multicast_addr} n4mb_seid={n4mb_session_id}"
                 );
                 return true;
             }

@@ -14,6 +14,10 @@ x-common: &common
   environment: &common-env
     RUST_LOG: info
     RUST_BACKTRACE: 1
+    # TLS Configuration (G36: SBI TLS by default)
+    # Set TLS_ENABLED=true to enable HTTPS for SBI
+    TLS_ENABLED: "${TLS_ENABLED:-false}"
+    SBI_SCHEME: "${SBI_SCHEME:-http}"
 
 x-nf-healthcheck: &nf-healthcheck
   healthcheck:
@@ -55,9 +59,15 @@ services:
     image: nextgcore-rust/nrf:latest
     container_name: nextgcore-nrf
     <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      TLS_CERT: /etc/nextgcore/certs/nrf.crt
+      TLS_KEY: /etc/nextgcore/certs/nrf.key
+      TLS_CA: /etc/nextgcore/certs/ca.crt
     command: ["-c", "/etc/nextgcore/nrf.yaml"]
     volumes:
       - ./configs/5gc/nrf.yaml:/etc/nextgcore/nrf.yaml:ro
+      - ./certs:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.10
@@ -75,9 +85,13 @@ services:
       <<: *common-env
       UDM_SBI_ADDR: 172.23.0.12
       UDM_SBI_PORT: "7777"
+      TLS_CERT: /etc/nextgcore/certs/ausf.crt
+      TLS_KEY: /etc/nextgcore/certs/ausf.key
+      TLS_CA: /etc/nextgcore/certs/ca.crt
     command: ["-c", "/etc/nextgcore/ausf.yaml"]
     volumes:
       - ./configs/5gc/ausf.yaml:/etc/nextgcore/ausf.yaml:ro
+      - ./certs:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.11
@@ -95,10 +109,14 @@ services:
       <<: *common-env
       UDR_SBI_ADDR: 172.23.0.20
       UDR_SBI_PORT: "7777"
+      TLS_CERT: /etc/nextgcore/certs/udm.crt
+      TLS_KEY: /etc/nextgcore/certs/udm.key
+      TLS_CA: /etc/nextgcore/certs/ca.crt
     command: ["-c", "/etc/nextgcore/udm.yaml"]
     volumes:
       - ./configs/5gc/udm.yaml:/etc/nextgcore/udm.yaml:ro
       - ./configs/5gc/hnet:/etc/nextgcore/hnet:ro
+      - ./certs:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.12
@@ -110,9 +128,15 @@ services:
     image: nextgcore-rust/udr:latest
     container_name: nextgcore-udr
     <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      TLS_CERT: /etc/nextgcore/certs/udr.crt
+      TLS_KEY: /etc/nextgcore/certs/udr.key
+      TLS_CA: /etc/nextgcore/certs/ca.crt
     command: ["-c", "/etc/nextgcore/udr.yaml"]
     volumes:
       - ./configs/5gc/udr.yaml:/etc/nextgcore/udr.yaml:ro
+      - ./certs:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.20
@@ -126,9 +150,15 @@ services:
     image: nextgcore-rust/pcf:latest
     container_name: nextgcore-pcf
     <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      TLS_CERT: /etc/nextgcore/certs/pcf.crt
+      TLS_KEY: /etc/nextgcore/certs/pcf.key
+      TLS_CA: /etc/nextgcore/certs/ca.crt
     command: ["-c", "/etc/nextgcore/pcf.yaml"]
     volumes:
       - ./configs/5gc/pcf.yaml:/etc/nextgcore/pcf.yaml:ro
+      - ./certs:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.13
@@ -140,9 +170,15 @@ services:
     image: nextgcore-rust/nssf:latest
     container_name: nextgcore-nssf
     <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      TLS_CERT: /etc/nextgcore/certs/nssf.crt
+      TLS_KEY: /etc/nextgcore/certs/nssf.key
+      TLS_CA: /etc/nextgcore/certs/ca.crt
     command: ["-c", "/etc/nextgcore/nssf.yaml"]
     volumes:
       - ./configs/5gc/nssf.yaml:/etc/nextgcore/nssf.yaml:ro
+      - ./certs:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.14
@@ -154,9 +190,15 @@ services:
     image: nextgcore-rust/bsf:latest
     container_name: nextgcore-bsf
     <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+      TLS_CERT: /etc/nextgcore/certs/bsf.crt
+      TLS_KEY: /etc/nextgcore/certs/bsf.key
+      TLS_CA: /etc/nextgcore/certs/ca.crt
     command: ["-c", "/etc/nextgcore/bsf.yaml"]
     volumes:
       - ./configs/5gc/bsf.yaml:/etc/nextgcore/bsf.yaml:ro
+      - ./certs:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.15
@@ -178,9 +220,13 @@ services:
       SMF_SBI_PORT: "7777"
       AUSF_SBI_ADDR: 172.23.0.11
       AUSF_SBI_PORT: "7777"
+      TLS_CERT: /etc/nextgcore/certs/amf.crt
+      TLS_KEY: /etc/nextgcore/certs/amf.key
+      TLS_CA: /etc/nextgcore/certs/ca.crt
     command: ["-c", "/etc/nextgcore/amf.yaml"]
     volumes:
       - ./configs/5gc/amf.yaml:/etc/nextgcore/amf.yaml:ro
+      - ./certs:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.5
@@ -207,9 +253,13 @@ services:
       UPF_PFCP_ADDR: 172.23.0.7
       UPF_PFCP_PORT: "8805"
       SMF_PFCP_ADDR: 172.23.0.4
+      TLS_CERT: /etc/nextgcore/certs/smf.crt
+      TLS_KEY: /etc/nextgcore/certs/smf.key
+      TLS_CA: /etc/nextgcore/certs/ca.crt
     command: ["-c", "/etc/nextgcore/smf.yaml"]
     volumes:
       - ./configs/5gc/smf.yaml:/etc/nextgcore/smf.yaml:ro
+      - ./certs:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.4
@@ -242,9 +292,13 @@ services:
     environment:
       <<: *common-env
       RUST_LOG: info,nextgcore_upfd=debug
+      TLS_CERT: /etc/nextgcore/certs/upf.crt
+      TLS_KEY: /etc/nextgcore/certs/upf.key
+      TLS_CA: /etc/nextgcore/certs/ca.crt
     command: ["-c", "/etc/nextgcore/upf.yaml", "--pfcp-addr", "172.23.0.7", "--gtpu-addr", "172.23.0.7", "--tun-ip", "10.45.0.1", "--tun-prefix", "16"]
     volumes:
       - ./configs/5gc/upf.yaml:/etc/nextgcore/upf.yaml:ro
+      - ./certs:/etc/nextgcore/certs:ro
     networks:
       core:
         ipv4_address: 172.23.0.7
