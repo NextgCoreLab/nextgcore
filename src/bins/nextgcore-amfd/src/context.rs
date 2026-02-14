@@ -650,8 +650,8 @@ impl AmfContext {
 
     /// Set gNB ID for a gNB
     pub fn gnb_set_gnb_id(&self, id: u64, gnb_id: u32) -> bool {
-        let mut gnb_list = self.gnb_list.write().ok().unwrap();
-        let mut gnb_id_hash = self.gnb_id_hash.write().ok().unwrap();
+        let mut gnb_list = self.gnb_list.write().unwrap();
+        let mut gnb_id_hash = self.gnb_id_hash.write().unwrap();
 
         if let Some(gnb) = gnb_list.get_mut(&id) {
             // Remove old gNB ID from hash if present
@@ -669,7 +669,7 @@ impl AmfContext {
 
     /// Update gNB in the context
     pub fn gnb_update(&self, gnb: &AmfGnb) -> bool {
-        let mut gnb_list = self.gnb_list.write().ok().unwrap();
+        let mut gnb_list = self.gnb_list.write().unwrap();
         if let Some(existing) = gnb_list.get_mut(&gnb.id) {
             *existing = gnb.clone();
             return true;
@@ -770,7 +770,7 @@ impl AmfContext {
 
     /// Update RAN UE in the context
     pub fn ran_ue_update(&self, ran_ue: &RanUe) -> bool {
-        let mut ran_ue_list = self.ran_ue_list.write().ok().unwrap();
+        let mut ran_ue_list = self.ran_ue_list.write().unwrap();
         if let Some(existing) = ran_ue_list.get_mut(&ran_ue.id) {
             *existing = ran_ue.clone();
             return true;
@@ -780,7 +780,7 @@ impl AmfContext {
 
     /// Switch RAN UE to a new gNB (for handover)
     pub fn ran_ue_switch_to_gnb(&self, ran_ue_id: u64, new_gnb_id: u64) -> bool {
-        let mut ran_ue_list = self.ran_ue_list.write().ok().unwrap();
+        let mut ran_ue_list = self.ran_ue_list.write().unwrap();
         if let Some(ran_ue) = ran_ue_list.get_mut(&ran_ue_id) {
             ran_ue.gnb_id = new_gnb_id;
             return true;
@@ -901,8 +901,8 @@ impl AmfContext {
 
     /// Set SUCI for an AMF UE
     pub fn amf_ue_set_suci(&self, id: u64, suci: &str) -> bool {
-        let mut amf_ue_list = self.amf_ue_list.write().ok().unwrap();
-        let mut suci_hash = self.suci_hash.write().ok().unwrap();
+        let mut amf_ue_list = self.amf_ue_list.write().unwrap();
+        let mut suci_hash = self.suci_hash.write().unwrap();
 
         if let Some(amf_ue) = amf_ue_list.get_mut(&id) {
             // Remove old SUCI from hash
@@ -919,8 +919,8 @@ impl AmfContext {
 
     /// Set SUPI for an AMF UE
     pub fn amf_ue_set_supi(&self, id: u64, supi: &str) -> bool {
-        let mut amf_ue_list = self.amf_ue_list.write().ok().unwrap();
-        let mut supi_hash = self.supi_hash.write().ok().unwrap();
+        let mut amf_ue_list = self.amf_ue_list.write().unwrap();
+        let mut supi_hash = self.supi_hash.write().unwrap();
 
         if let Some(amf_ue) = amf_ue_list.get_mut(&id) {
             // Remove old SUPI from hash
@@ -937,8 +937,8 @@ impl AmfContext {
 
     /// Update GUTI for an AMF UE
     pub fn amf_ue_update_guti(&self, id: u64, guti: &Guti5gs) -> bool {
-        let mut amf_ue_list = self.amf_ue_list.write().ok().unwrap();
-        let mut guti_ue_hash = self.guti_ue_hash.write().ok().unwrap();
+        let mut amf_ue_list = self.amf_ue_list.write().unwrap();
+        let mut guti_ue_hash = self.guti_ue_hash.write().unwrap();
 
         if let Some(amf_ue) = amf_ue_list.get_mut(&id) {
             // Remove old GUTI from hash
@@ -953,7 +953,7 @@ impl AmfContext {
 
     /// Update AMF UE in the context
     pub fn amf_ue_update(&self, amf_ue: &AmfUe) -> bool {
-        let mut amf_ue_list = self.amf_ue_list.write().ok().unwrap();
+        let mut amf_ue_list = self.amf_ue_list.write().unwrap();
         if let Some(existing) = amf_ue_list.get_mut(&amf_ue.id) {
             *existing = amf_ue.clone();
             return true;
@@ -963,8 +963,8 @@ impl AmfContext {
 
     /// Associate AMF UE with RAN UE
     pub fn amf_ue_associate_ran_ue(&self, amf_ue_id: u64, ran_ue_id: u64) -> bool {
-        let mut amf_ue_list = self.amf_ue_list.write().ok().unwrap();
-        let mut ran_ue_list = self.ran_ue_list.write().ok().unwrap();
+        let mut amf_ue_list = self.amf_ue_list.write().unwrap();
+        let mut ran_ue_list = self.ran_ue_list.write().unwrap();
 
         if let (Some(amf_ue), Some(ran_ue)) = (amf_ue_list.get_mut(&amf_ue_id), ran_ue_list.get_mut(&ran_ue_id)) {
             amf_ue.ran_ue_id = ran_ue_id;
@@ -976,8 +976,8 @@ impl AmfContext {
 
     /// Deassociate AMF UE from RAN UE
     pub fn amf_ue_deassociate_ran_ue(&self, amf_ue_id: u64, ran_ue_id: u64) -> bool {
-        let mut amf_ue_list = self.amf_ue_list.write().ok().unwrap();
-        let mut ran_ue_list = self.ran_ue_list.write().ok().unwrap();
+        let mut amf_ue_list = self.amf_ue_list.write().unwrap();
+        let mut ran_ue_list = self.ran_ue_list.write().unwrap();
 
         if let Some(amf_ue) = amf_ue_list.get_mut(&amf_ue_id) {
             amf_ue.ran_ue_id = OGS_INVALID_POOL_ID;
@@ -1065,7 +1065,7 @@ impl AmfContext {
 
     /// Update session in the context
     pub fn sess_update(&self, sess: &AmfSess) -> bool {
-        let mut sess_list = self.sess_list.write().ok().unwrap();
+        let mut sess_list = self.sess_list.write().unwrap();
         if let Some(existing) = sess_list.get_mut(&sess.id) {
             *existing = sess.clone();
             return true;
@@ -1080,7 +1080,7 @@ impl AmfContext {
 
     /// Get sessions for an AMF UE
     pub fn sess_list_for_ue(&self, amf_ue_id: u64) -> Vec<AmfSess> {
-        let sess_list = self.sess_list.read().ok().unwrap();
+        let sess_list = self.sess_list.read().unwrap();
         sess_list
             .values()
             .filter(|sess| sess.amf_ue_id == amf_ue_id)
@@ -1181,7 +1181,7 @@ impl AmfContext {
 
     /// Get UE load percentage
     pub fn get_ue_load(&self) -> i32 {
-        let amf_ue_list = self.amf_ue_list.read().ok().unwrap();
+        let amf_ue_list = self.amf_ue_list.read().unwrap();
         let used = amf_ue_list.len();
         let total = self.max_num_of_ue;
         if total == 0 {

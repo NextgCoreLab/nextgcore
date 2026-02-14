@@ -180,8 +180,8 @@ impl PinContext {
 
     /// List PINs owned by a SUPI
     pub fn pins_by_owner(&self, supi: &str) -> Vec<PersonalIotNetwork> {
-        let owners = self.owner_index.read().ok().unwrap();
-        let pins = self.pin_networks.read().ok().unwrap();
+        let owners = self.owner_index.read().unwrap();
+        let pins = self.pin_networks.read().unwrap();
 
         owners.get(supi)
             .map(|ids| ids.iter().filter_map(|id| pins.get(id).cloned()).collect())
@@ -261,8 +261,8 @@ impl PinContext {
 
     /// Discover elements in a PIN by capability
     pub fn element_discover(&self, pin_id: &str, capability: Option<&str>) -> Vec<PinElement> {
-        let elements = self.elements.read().ok().unwrap();
-        let pins = self.pin_networks.read().ok().unwrap();
+        let elements = self.elements.read().unwrap();
+        let pins = self.pin_networks.read().unwrap();
 
         let pin = match pins.get(pin_id) {
             Some(p) => p,

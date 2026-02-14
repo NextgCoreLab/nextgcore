@@ -617,8 +617,8 @@ impl IntentLifecycleManager {
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
         let id = intent.id.clone();
         let managed = ManagedIntent {
@@ -638,8 +638,8 @@ impl IntentLifecycleManager {
     pub fn activate(&mut self, id: &str) -> IntentResult<&DerivedConfig> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
         let managed = self.intents.get_mut(id)
             .ok_or_else(|| IntentError::InvalidIntent(format!("Intent {id} not found")))?;
@@ -656,7 +656,9 @@ impl IntentLifecycleManager {
         managed.updated_at = now;
         self.total_activated += 1;
 
-        Ok(self.intents[id].derived_config.as_ref().unwrap())
+        // Safe: we just set derived_config above
+        Ok(self.intents[id].derived_config.as_ref()
+            .expect("derived_config was just set"))
     }
 
     /// Suspend an active intent.
@@ -712,8 +714,8 @@ impl IntentLifecycleManager {
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
 
         let mut expired = 0;
         for managed in self.intents.values_mut() {

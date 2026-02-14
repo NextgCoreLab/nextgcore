@@ -260,8 +260,8 @@ impl HssContext {
 
     /// Remove an IMSI by ID
     pub fn imsi_remove(&self, id: &str) -> bool {
-        let list = self.imsi_list.write().ok().unwrap();
-        let mut hash = self.imsi_hash.write().ok().unwrap();
+        let list = self.imsi_list.write().unwrap();
+        let mut hash = self.imsi_hash.write().unwrap();
 
         if let Some(&idx) = hash.get(id) {
             // Mark as removed (we don't actually remove to preserve indices)
@@ -317,9 +317,9 @@ impl HssContext {
 
     /// Remove an IMPI by ID
     pub fn impi_remove(&self, id: &str) -> bool {
-        let list = self.impi_list.write().ok().unwrap();
-        let mut hash = self.impi_hash.write().ok().unwrap();
-        let mut impu_hash = self.impu_hash.write().ok().unwrap();
+        let list = self.impi_list.write().unwrap();
+        let mut hash = self.impi_hash.write().unwrap();
+        let mut impu_hash = self.impu_hash.write().unwrap();
 
         if let Some(&idx) = hash.get(id) {
             if idx < list.len() {
@@ -366,9 +366,9 @@ impl HssContext {
 
     /// Add a new IMPU to an IMPI
     pub fn impu_add(&self, impi_id: &str, impu_id: &str) -> bool {
-        let mut list = self.impi_list.write().ok().unwrap();
-        let hash = self.impi_hash.read().ok().unwrap();
-        let mut impu_hash = self.impu_hash.write().ok().unwrap();
+        let mut list = self.impi_list.write().unwrap();
+        let hash = self.impi_hash.read().unwrap();
+        let mut impu_hash = self.impu_hash.write().unwrap();
 
         if let Some(&impi_idx) = hash.get(impi_id) {
             if impi_idx < list.len() {

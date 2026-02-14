@@ -283,9 +283,9 @@ impl PcrfContext {
 
     /// Remove Gx session
     pub fn gx_session_remove(&self, sid: &str) -> bool {
-        let mut hash = self.gx_sid_hash.write().ok().unwrap();
-        let mut ipv4_hash = self.ipv4_hash.write().ok().unwrap();
-        let mut ipv6_hash = self.ipv6_hash.write().ok().unwrap();
+        let mut hash = self.gx_sid_hash.write().unwrap();
+        let mut ipv4_hash = self.ipv4_hash.write().unwrap();
+        let mut ipv6_hash = self.ipv6_hash.write().unwrap();
 
         if let Some(&idx) = hash.get(sid) {
             // Remove IP mappings
@@ -405,7 +405,7 @@ impl PcrfContext {
 
     /// Remove Rx session
     pub fn rx_session_remove(&self, sid: &str) -> bool {
-        let mut hash = self.rx_sid_hash.write().ok().unwrap();
+        let mut hash = self.rx_sid_hash.write().unwrap();
 
         if let Some(&idx) = hash.get(sid) {
             // Remove from Gx session's rx_sessions list

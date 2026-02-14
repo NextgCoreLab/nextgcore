@@ -148,7 +148,11 @@ impl ZeroTrustEngine {
             rule.min_trust_score,
             rule.require_mtls
         );
-        self.policy_rules.push(rule);
+        // Insert specific rules before wildcard default-deny so first-match semantics work
+        let insert_pos = self.policy_rules.iter().position(|r| {
+            r.source_nf_type == "*" && r.target_nf_type == "*"
+        }).unwrap_or(self.policy_rules.len());
+        self.policy_rules.insert(insert_pos, rule);
     }
 
     /// Register or update NF instance trust for service mesh authentication.

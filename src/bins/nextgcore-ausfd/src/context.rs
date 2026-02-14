@@ -343,8 +343,8 @@ impl AusfContext {
 
     /// Update UE in the context
     pub fn ue_update(&self, ue: &AusfUe) -> bool {
-        let mut ue_list = self.ue_list.write().ok().unwrap();
-        let mut supi_hash = self.supi_hash.write().ok().unwrap();
+        let mut ue_list = self.ue_list.write().unwrap();
+        let mut supi_hash = self.supi_hash.write().unwrap();
 
         if let Some(existing) = ue_list.get_mut(&ue.id) {
             // Update SUPI hash if SUPI changed
@@ -364,8 +364,8 @@ impl AusfContext {
 
     /// Set SUPI for a UE
     pub fn ue_set_supi(&self, id: u64, supi: &str) -> bool {
-        let mut ue_list = self.ue_list.write().ok().unwrap();
-        let mut supi_hash = self.supi_hash.write().ok().unwrap();
+        let mut ue_list = self.ue_list.write().unwrap();
+        let mut supi_hash = self.supi_hash.write().unwrap();
 
         if let Some(ue) = ue_list.get_mut(&id) {
             // Remove old SUPI from hash
@@ -382,7 +382,7 @@ impl AusfContext {
 
     /// Get UE load percentage
     pub fn get_ue_load(&self) -> i32 {
-        let ue_list = self.ue_list.read().ok().unwrap();
+        let ue_list = self.ue_list.read().unwrap();
         let used = ue_list.len();
         let total = self.max_num_of_ue;
         if total == 0 {

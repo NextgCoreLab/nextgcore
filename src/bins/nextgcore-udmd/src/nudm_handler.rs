@@ -255,7 +255,13 @@ pub fn udm_nudm_ueau_handle_get(
 
         // Use ogs_auc_sqn() to derive SQN_MS and MAC-S from AUTS
         // This verifies the AUTS by recomputing MAC-S with f1* and comparing
-        let rand_arr: &[u8; OGS_RAND_LEN] = rand_bytes.as_slice().try_into().unwrap();
+        let rand_arr: &[u8; OGS_RAND_LEN] = match rand_bytes.as_slice().try_into() {
+            Ok(arr) => arr,
+            Err(_) => {
+                log::error!("[{}] RAND array conversion failed", udm_ue.suci);
+                return (HandlerResult::bad_request("RAND conversion failed"), None);
+            }
+        };
         let (sqn_ms, mac_s) = match kdf::ogs_auc_sqn(
             &udm_ue.opc,
             &udm_ue.k,
@@ -1094,5 +1100,34 @@ mod tests {
             },
         };
         assert!(!guami_matches(&guami1, &guami3));
+    }
+
+    #[test]
+    fn test_hex_to_bytes_invalid_length() {
+        // Test that invalid RAND length is handled
+        let hex = "0123"; // Only 2 bytes instead of 16
+        let bytes = hex_to_bytes(hex);
+        assert_eq!(bytes.len(), 2);
+    }
+
+    #[test]
+    fn test_buffer_to_u64_conversion() {
+        // Test SQN conversion edge cases
+        let buf = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let val = buffer_to_u64(&buf);
+        assert_eq!(val, 0xFFFFFFFFFFFF);
+
+        let buf2 = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let val2 = buffer_to_u64(&buf2);
+        assert_eq!(val2, 0);
+    }
+
+    #[test]
+    fn test_u64_to_buffer_roundtrip() {
+        let mut buf = [0u8; 6];
+        let original = 0x123456789ABC;
+        u64_to_buffer(original, &mut buf);
+        let converted = buffer_to_u64(&buf);
+        assert_eq!(converted & 0xFFFFFFFFFFFF, original & 0xFFFFFFFFFFFF);
     }
 }

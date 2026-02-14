@@ -204,7 +204,7 @@ impl DigitalTwinExporter {
         };
         self.latest_snapshot = Some(snapshot);
         self.export_count += 1;
-        self.latest_snapshot.as_ref().unwrap()
+        self.latest_snapshot.as_ref().expect("snapshot was just set")
     }
 
     /// Get latest snapshot.
@@ -520,7 +520,7 @@ impl DigitalTwinSyncManager {
             self.history.remove(0);
         }
         self.history.push(entry);
-        self.exporter.latest().unwrap()
+        self.exporter.latest().expect("snapshot was just captured")
     }
 
     /// Computes a delta between the current snapshot and a previous one.

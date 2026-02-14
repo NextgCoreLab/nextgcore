@@ -557,9 +557,13 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
     let mut ue = {
         let ctx = udm_self();
         let context = ctx.read().unwrap();
-        let ue = context.ue_find_by_supi(supi)
-            .or_else(|| context.ue_add(supi))
-            .unwrap();
+        let ue = match context.ue_find_by_supi(supi).or_else(|| context.ue_add(supi)) {
+            Some(ue) => ue,
+            None => {
+                log::error!("[{supi}] Failed to create/find UE in context");
+                return ogs_sbi::server::send_service_unavailable("UE context creation failed");
+            }
+        };
         ue.clone()
     };
 

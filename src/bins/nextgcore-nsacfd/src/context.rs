@@ -269,8 +269,8 @@ impl NsacfContext {
 
     /// Release a UE from a slice
     pub fn release_ue(&self, s_nssai: &SNssai) {
-        let snssai_hash = self.snssai_hash.read().ok().unwrap();
-        let quota_list = self.quota_list.read().ok().unwrap();
+        let snssai_hash = self.snssai_hash.read().unwrap();
+        let quota_list = self.quota_list.read().unwrap();
 
         if let Some(&quota_id) = snssai_hash.get(&(s_nssai.sst, s_nssai.sd)) {
             if let Some(quota) = quota_list.get(&quota_id) {

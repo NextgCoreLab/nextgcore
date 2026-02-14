@@ -159,15 +159,9 @@ impl RouteTrie {
             let bit = (addr[word_idx] >> bit_pos) & 1;
             
             if bit == 0 {
-                if node.left.is_none() {
-                    node.left = Some(Box::new(RouteTrie::new()));
-                }
-                node = node.left.as_mut().unwrap();
+                node = node.left.get_or_insert_with(|| Box::new(RouteTrie::new()));
             } else {
-                if node.right.is_none() {
-                    node.right = Some(Box::new(RouteTrie::new()));
-                }
-                node = node.right.as_mut().unwrap();
+                node = node.right.get_or_insert_with(|| Box::new(RouteTrie::new()));
             }
         }
         node.sess_id = Some(sess_id);
@@ -1562,9 +1556,9 @@ impl UpfContext {
 
     /// Set UE IP for session
     pub fn sess_set_ue_ip(&self, sess_id: u64, ipv4: Option<Ipv4Addr>, ipv6: Option<Ipv6Addr>) -> bool {
-        let mut sess_list = self.sess_list.write().ok().unwrap();
-        let mut ipv4_hash = self.ipv4_hash.write().ok().unwrap();
-        let mut ipv6_hash = self.ipv6_hash.write().ok().unwrap();
+        let mut sess_list = self.sess_list.write().unwrap();
+        let mut ipv4_hash = self.ipv4_hash.write().unwrap();
+        let mut ipv6_hash = self.ipv6_hash.write().unwrap();
 
         if let Some(sess) = sess_list.get_mut(&sess_id) {
             if let Some(addr) = ipv4 {
@@ -1588,7 +1582,7 @@ impl UpfContext {
 
     /// Add framed route for session
     pub fn sess_add_framed_route(&self, sess_id: u64, subnet: IpSubnet, is_ipv6: bool) -> bool {
-        let mut sess_list = self.sess_list.write().ok().unwrap();
+        let mut sess_list = self.sess_list.write().unwrap();
         
         if let Some(sess) = sess_list.get_mut(&sess_id) {
             let prefix_len = if is_ipv6 {

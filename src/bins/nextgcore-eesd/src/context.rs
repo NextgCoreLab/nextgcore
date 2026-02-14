@@ -168,8 +168,8 @@ impl EesContext {
 
     /// Discover EAS by application ID and optional TAC
     pub fn eas_discover(&self, app_id: &str, tac: Option<u32>) -> Vec<EasDiscoveryResult> {
-        let profiles = self.eas_profiles.read().ok().unwrap();
-        let index = self.app_eas_index.read().ok().unwrap();
+        let profiles = self.eas_profiles.read().unwrap();
+        let index = self.app_eas_index.read().unwrap();
 
         let eas_ids = match index.get(app_id) {
             Some(ids) => ids,

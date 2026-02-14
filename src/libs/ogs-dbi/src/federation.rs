@@ -586,7 +586,8 @@ mod tests {
 
         // Value should be different (with high probability)
         // But we can't assert exact value due to randomness
-        assert!(noisy_value != original_value || true); // Always passes but shows DP is applied
+        // Differential privacy adds noise; value may or may not differ due to randomness
+        let _noisy = noisy_value; // Verify it was computed without panic
     }
 
     #[test]

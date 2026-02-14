@@ -1189,8 +1189,17 @@ impl ConfigReloadManager {
                         eprintln!("Configuration file changed, reloading...");
 
                         // Try to reload global config
+                        let config_path_str = match config_path.to_str() {
+                            Some(s) => s,
+                            None => {
+                                eprintln!("Invalid config path: contains invalid UTF-8");
+                                watcher.notify_reload_failed("Invalid config path".to_string());
+                                continue;
+                            }
+                        };
+
                         let mut global = global_conf.lock().unwrap();
-                        if let Err(e) = global.reload(config_path.to_str().unwrap()) {
+                        if let Err(e) = global.reload(config_path_str) {
                             eprintln!("Failed to reload global config: {e}");
                             watcher.notify_reload_failed(format!("Global config: {e}"));
                             continue;
@@ -1199,7 +1208,7 @@ impl ConfigReloadManager {
 
                         // Try to reload local config
                         let mut local = local_conf.lock().unwrap();
-                        if let Err(e) = local.reload(config_path.to_str().unwrap()) {
+                        if let Err(e) = local.reload(config_path_str) {
                             eprintln!("Failed to reload local config: {e}");
                             watcher.notify_reload_failed(format!("Local config: {e}"));
                             continue;
@@ -1302,12 +1311,14 @@ pub struct ConfigVersion {
 impl ConfigVersion {
     /// Create a new config version
     pub fn new(version: u64, description: impl Into<String>) -> Self {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
         ConfigVersion {
             version,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
+            timestamp,
             description: description.into(),
             commit_hash: None,
         }
@@ -1756,8 +1767,8 @@ impl ConfigDriftDetector {
         self.scan_count += 1;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let mut drifts = Vec::new();
 
         // Check global config drifts
