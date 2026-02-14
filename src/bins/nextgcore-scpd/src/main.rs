@@ -15,6 +15,7 @@ use std::time::Duration;
 mod context;
 mod event;
 mod sbi_path;
+mod service_mesh;
 mod sbi_response;
 mod scp_sm;
 mod timer;
@@ -28,7 +29,9 @@ pub use sbi_path::{
     scp_sbi_open, scp_sbi_close, scp_sbi_is_running, SbiServerConfig,
     SbiRequest, handle_request, handle_response, handle_nf_discover_response,
     handle_sepp_discover_response, parse_discovery_headers, copy_request_headers,
-    RequestHandlerResult, headers,
+    RequestHandlerResult, headers, NfInstanceCandidate, select_nf_instance,
+    select_nf_instance_round_robin, route_request, build_forwarded_request,
+    discovery_cache, DiscoveryCache, parse_search_result,
 };
 pub use scp_sm::{ScpSmContext, ScpState};
 pub use timer::{timer_manager, ScpTimerManager};
@@ -126,7 +129,7 @@ async fn main() -> Result<()> {
                 log::debug!("Configuration file loaded ({} bytes)", content.len());
             }
             Err(e) => {
-                log::warn!("Failed to read configuration file: {}", e);
+                log::warn!("Failed to read configuration file: {e}");
             }
         }
     } else {

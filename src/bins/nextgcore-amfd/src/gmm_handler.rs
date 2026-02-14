@@ -6,7 +6,7 @@ use crate::context::{
     AmfUe, RanUe, PlmnId, Guti5gs, UeSecurityCapability,
     OGS_NAS_KSI_NO_KEY_IS_AVAILABLE,
 };
-use crate::gmm_build::{GmmCause, mobile_identity_type, registration_type};
+use crate::gmm_build::{GmmCause, mobile_identity_type};
 
 // ============================================================================
 // Constants
@@ -108,7 +108,7 @@ pub fn handle_registration_request(
         mobile_identity_type::SUCI => {
             if let Some(ref suci) = request.suci {
                 amf_ue.suci = Some(suci.clone());
-                log::info!("[{}] SUCI received", suci);
+                log::info!("[{suci}] SUCI received");
             }
             if let Some(ref plmn_id) = request.home_plmn_id {
                 amf_ue.home_plmn_id = plmn_id.clone();
@@ -413,7 +413,7 @@ pub fn handle_identity_response(
         mobile_identity_type::SUCI => {
             if let Some(ref suci) = response.suci {
                 amf_ue.suci = Some(suci.clone());
-                log::info!("[{}] SUCI from identity response", suci);
+                log::info!("[{suci}] SUCI from identity response");
             }
             if let Some(ref plmn_id) = response.home_plmn_id {
                 amf_ue.home_plmn_id = plmn_id.clone();
@@ -457,7 +457,7 @@ pub fn handle_security_mode_complete(
     // Store IMEISV if present
     if let Some(ref imeisv) = complete.imeisv {
         amf_ue.imeisv = Some(imeisv.clone());
-        amf_ue.pei = Some(format!("imeisv-{}", imeisv));
+        amf_ue.pei = Some(format!("imeisv-{imeisv}"));
     }
 
     GmmCause::RequestAccepted
@@ -649,6 +649,7 @@ pub fn parse_guti(buffer: &[u8]) -> Option<Guti5gs> {
 mod tests {
     use super::*;
     use crate::context::{Tai5gs, NrCgi};
+    use crate::gmm_build::registration_type;
 
     fn create_test_amf_ue() -> AmfUe {
         AmfUe {

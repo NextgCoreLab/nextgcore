@@ -36,7 +36,9 @@ pub mod pfcp_type {
 /// PFCP cause values (3GPP TS 29.244)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum PfcpCause {
+    #[default]
     RequestAccepted = 1,
     RequestRejected = 64,
     SessionContextNotFound = 65,
@@ -79,11 +81,6 @@ impl From<u8> for PfcpCause {
     }
 }
 
-impl Default for PfcpCause {
-    fn default() -> Self {
-        PfcpCause::RequestAccepted
-    }
-}
 
 // ============================================================================
 // PFCP IE Types
@@ -1222,6 +1219,162 @@ fn parse_forwarding_parameters(data: &[u8]) -> Result<ParsedForwardingParameters
     }
 
     Ok(fp)
+}
+
+/// Parse Create QER IE
+pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
+    let ies = ParsedIe::parse_all(data);
+    let mut qer = ParsedCreateQer::default();
+
+    // QER ID (mandatory)
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::QER_ID) {
+        if ie.value.len() >= 4 {
+            qer.qer_id = u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]);
+        }
+    } else {
+        return Err("QER ID missing");
+    }
+
+    // Gate Status (IE type 25)
+    if let Some(ie) = ParsedIe::find_ie(&ies, 25) {
+        if !ie.value.is_empty() {
+            qer.ul_gate = ie.value[0] & 0x03;         // bits 0-1
+            qer.dl_gate = (ie.value[0] >> 2) & 0x03;  // bits 2-3
+        }
+    }
+
+    // MBR (IE type 26)
+    if let Some(ie) = ParsedIe::find_ie(&ies, 26) {
+        if ie.value.len() >= 10 {
+            qer.ul_mbr = u64::from_be_bytes([
+                0, 0, 0, ie.value[0], ie.value[1], ie.value[2], ie.value[3], ie.value[4],
+            ]);
+            qer.dl_mbr = u64::from_be_bytes([
+                0, 0, 0, ie.value[5], ie.value[6], ie.value[7], ie.value[8], ie.value[9],
+            ]);
+        }
+    }
+
+    // GBR (IE type 27)
+    if let Some(ie) = ParsedIe::find_ie(&ies, 27) {
+        if ie.value.len() >= 10 {
+            qer.ul_gbr = u64::from_be_bytes([
+                0, 0, 0, ie.value[0], ie.value[1], ie.value[2], ie.value[3], ie.value[4],
+            ]);
+            qer.dl_gbr = u64::from_be_bytes([
+                0, 0, 0, ie.value[5], ie.value[6], ie.value[7], ie.value[8], ie.value[9],
+            ]);
+        }
+    }
+
+    // QFI
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::QFI) {
+        if !ie.value.is_empty() {
+            qer.qfi = Some(ie.value[0] & 0x3F);
+        }
+    }
+
+    Ok(qer)
+}
+
+/// Parsed Create QER structure
+#[derive(Debug, Clone, Default)]
+pub struct ParsedCreateQer {
+    pub qer_id: u32,
+    pub ul_gate: u8,    // 0=OPEN, 1=CLOSED
+    pub dl_gate: u8,
+    pub ul_mbr: u64,    // kbps
+    pub dl_mbr: u64,
+    pub ul_gbr: u64,
+    pub dl_gbr: u64,
+    pub qfi: Option<u8>,
+}
+
+/// Parse Create URR IE
+pub fn parse_create_urr(data: &[u8]) -> Result<ParsedCreateUrr, &'static str> {
+    let ies = ParsedIe::parse_all(data);
+    let mut urr = ParsedCreateUrr::default();
+
+    // URR ID (mandatory)
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::URR_ID) {
+        if ie.value.len() >= 4 {
+            urr.urr_id = u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]);
+        }
+    } else {
+        return Err("URR ID missing");
+    }
+
+    // Measurement Method (IE type 62)
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::MEASUREMENT_METHOD) {
+        if !ie.value.is_empty() {
+            urr.measure_duration = (ie.value[0] & 0x01) != 0;
+            urr.measure_volume = (ie.value[0] & 0x02) != 0;
+        }
+    }
+
+    // Reporting Triggers (IE type 37)
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::REPORTING_TRIGGERS) {
+        if !ie.value.is_empty() {
+            urr.trigger_periodic = (ie.value[0] & 0x01) != 0;
+            urr.trigger_volume_threshold = (ie.value[0] & 0x02) != 0;
+            urr.trigger_time_threshold = (ie.value[0] & 0x04) != 0;
+        }
+    }
+
+    // Volume Threshold (IE type 31) - grouped IE with flags + values
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::VOLUME_THRESHOLD) {
+        if !ie.value.is_empty() {
+            let flags = ie.value[0];
+            let mut cursor = &ie.value[1..];
+            if (flags & 0x01) != 0 && cursor.len() >= 8 {
+                urr.volume_threshold_total = Some(u64::from_be_bytes([
+                    cursor[0], cursor[1], cursor[2], cursor[3],
+                    cursor[4], cursor[5], cursor[6], cursor[7],
+                ]));
+                cursor = &cursor[8..];
+            }
+            if (flags & 0x02) != 0 && cursor.len() >= 8 {
+                urr.volume_threshold_ul = Some(u64::from_be_bytes([
+                    cursor[0], cursor[1], cursor[2], cursor[3],
+                    cursor[4], cursor[5], cursor[6], cursor[7],
+                ]));
+                cursor = &cursor[8..];
+            }
+            if (flags & 0x04) != 0 && cursor.len() >= 8 {
+                urr.volume_threshold_dl = Some(u64::from_be_bytes([
+                    cursor[0], cursor[1], cursor[2], cursor[3],
+                    cursor[4], cursor[5], cursor[6], cursor[7],
+                ]));
+            }
+            let _ = cursor; // suppress unused warning
+        }
+    }
+
+    // Time Threshold (IE type 32) - u32 seconds
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::TIME_THRESHOLD) {
+        if ie.value.len() >= 4 {
+            urr.time_threshold_secs = Some(u32::from_be_bytes([
+                ie.value[0], ie.value[1], ie.value[2], ie.value[3],
+            ]));
+        }
+    }
+
+    Ok(urr)
+}
+
+/// Parsed Create URR structure
+#[derive(Debug, Clone, Default)]
+pub struct ParsedCreateUrr {
+    pub urr_id: u32,
+    pub measure_duration: bool,
+    pub measure_volume: bool,
+    pub trigger_periodic: bool,
+    pub trigger_volume_threshold: bool,
+    pub trigger_time_threshold: bool,
+    pub volume_threshold_total: Option<u64>,
+    pub volume_threshold_ul: Option<u64>,
+    pub volume_threshold_dl: Option<u64>,
+    pub time_threshold_secs: Option<u32>,
 }
 
 /// Parsed Node ID

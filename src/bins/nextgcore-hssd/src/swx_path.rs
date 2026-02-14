@@ -214,21 +214,20 @@ pub fn handle_mar(
     auth_scheme: Option<&str>,
     _sip_authorization: Option<&[u8]>,
 ) -> Result<MarResponse> {
-    debug!("Rx Multimedia-Auth-Request for user: {}", user_name);
+    debug!("Rx Multimedia-Auth-Request for user: {user_name}");
     swx_stats().inc_rx_mar();
 
     // Extract IMSI from user name
     let imsi_bcd = extract_imsi_from_username(user_name)?;
-    debug!("Extracted IMSI: {}", imsi_bcd);
+    debug!("Extracted IMSI: {imsi_bcd}");
 
     // Validate authentication scheme (only EAP-AKA supported)
     if let Some(scheme) = auth_scheme {
         if scheme != SWX_AUTH_SCHEME_EAP_AKA && scheme != SWX_AUTH_SCHEME_EAP_AKA_PRIME {
-            error!("Unsupported authentication scheme: {}", scheme);
+            error!("Unsupported authentication scheme: {scheme}");
             swx_stats().inc_rx_mar_error();
             return Err(anyhow::anyhow!(
-                "Authentication scheme not supported: {}",
-                scheme
+                "Authentication scheme not supported: {scheme}"
             ));
         }
     }
@@ -237,7 +236,7 @@ pub fn handle_mar(
     use ogs_dbi::{ogs_dbi_auth_info, ogs_dbi_increment_sqn};
     use ogs_crypt::milenage::{milenage_f1, milenage_f2345, milenage_opc};
 
-    let supi = format!("imsi-{}", imsi_bcd);
+    let supi = format!("imsi-{imsi_bcd}");
     let auth_info = ogs_dbi_auth_info(&supi)?;
 
     // 2. Handle re-sync if sip_authorization present
@@ -258,13 +257,13 @@ pub fn handle_mar(
         auth_info.opc
     } else {
         milenage_opc(&auth_info.k, &auth_info.op)
-            .map_err(|e| anyhow::anyhow!("Failed to compute OPc: {:?}", e))?
+            .map_err(|e| anyhow::anyhow!("Failed to compute OPc: {e:?}"))?
     };
 
     let (mac_a, _mac_s) = milenage_f1(&opc, &auth_info.k, &rand, &sqn_bytes, &auth_info.amf)
-        .map_err(|e| anyhow::anyhow!("Failed to compute f1: {:?}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to compute f1: {e:?}"))?;
     let (res, ck, ik, ak, _ak_star) = milenage_f2345(&opc, &auth_info.k, &rand)
-        .map_err(|e| anyhow::anyhow!("Failed to compute f2-f5: {:?}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to compute f2-f5: {e:?}"))?;
 
     // Build AUTN
     let mut autn = [0u8; 16];
@@ -297,7 +296,7 @@ pub fn handle_mar(
     };
 
     swx_stats().inc_tx_maa();
-    debug!("Tx Multimedia-Auth-Answer for user: {}", user_name);
+    debug!("Tx Multimedia-Auth-Answer for user: {user_name}");
 
     Ok(response)
 }
@@ -319,19 +318,18 @@ pub fn handle_sar(
     server_assignment_type: ServerAssignmentType,
 ) -> Result<SarResponse> {
     debug!(
-        "Rx Server-Assignment-Request for user: {}, type: {:?}",
-        user_name, server_assignment_type
+        "Rx Server-Assignment-Request for user: {user_name}, type: {server_assignment_type:?}"
     );
     swx_stats().inc_rx_sar();
 
     // Extract IMSI from user name
     let imsi_bcd = extract_imsi_from_username(user_name)?;
-    debug!("Extracted IMSI: {}", imsi_bcd);
+    debug!("Extracted IMSI: {imsi_bcd}");
 
     // 1. Query database for subscription data
     use ogs_dbi::ogs_dbi_subscription_data;
 
-    let supi = format!("imsi-{}", imsi_bcd);
+    let supi = format!("imsi-{imsi_bcd}");
 
     // 2. Build Non-3GPP-User-Data AVP
     // 3. Include APN configurations
@@ -376,7 +374,7 @@ pub fn handle_sar(
             };
 
             swx_stats().inc_tx_saa();
-            debug!("Tx Server-Assignment-Answer for user: {}", user_name);
+            debug!("Tx Server-Assignment-Answer for user: {user_name}");
             Ok(response)
         }
         _ => {
@@ -387,7 +385,7 @@ pub fn handle_sar(
             };
 
             swx_stats().inc_tx_saa();
-            debug!("Tx Server-Assignment-Answer for user: {}", user_name);
+            debug!("Tx Server-Assignment-Answer for user: {user_name}");
             Ok(response)
         }
     }
@@ -406,7 +404,7 @@ fn extract_imsi_from_username(user_name: &str) -> Result<String> {
     }
 
     if imsi.is_empty() {
-        return Err(anyhow::anyhow!("No IMSI found in username: {}", user_name));
+        return Err(anyhow::anyhow!("No IMSI found in username: {user_name}"));
     }
 
     if imsi.len() < 10 || imsi.len() > 15 {

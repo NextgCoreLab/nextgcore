@@ -215,9 +215,7 @@ pub fn aes_cbc_encrypt(
             block[i] = input[in_pos + i] ^ iv[i];
         }
         // Pad with IV bytes (matching C implementation behavior)
-        for i in remaining..AES_BLOCK_SIZE {
-            block[i] = iv[i];
-        }
+        block[remaining..AES_BLOCK_SIZE].copy_from_slice(&iv[remaining..AES_BLOCK_SIZE]);
         
         // Encrypt
         let mut out_block = [0u8; 16];

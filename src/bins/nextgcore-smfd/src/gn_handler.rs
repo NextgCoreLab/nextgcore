@@ -186,7 +186,7 @@ pub fn handle_echo_request(
     _smf_ctx: &Arc<SmfContext>,
     recovery: u8,
 ) -> Vec<u8> {
-    debug!("[GTPv1] Echo Request received, recovery={}", recovery);
+    debug!("[GTPv1] Echo Request received, recovery={recovery}");
     crate::gn_build::build_echo_response(recovery)
 }
 
@@ -197,7 +197,7 @@ pub fn handle_echo_response(
     _smf_ctx: &Arc<SmfContext>,
     recovery: u8,
 ) {
-    debug!("[GTPv1] Echo Response received, recovery={}", recovery);
+    debug!("[GTPv1] Echo Response received, recovery={recovery}");
     // In a complete implementation, this would update path state
 }
 
@@ -253,10 +253,10 @@ pub fn handle_create_pdp_context_request(
 
     // Log the request details
     if let Some(ref apn) = req.apn {
-        info!("[GTPv1] APN: {}", apn);
+        info!("[GTPv1] APN: {apn}");
     }
     if let Some(nsapi) = req.nsapi {
-        info!("[GTPv1] NSAPI: {}", nsapi);
+        info!("[GTPv1] NSAPI: {nsapi}");
     }
     if let Some(ref qos) = req.qos_profile {
         info!("[GTPv1] QoS: traffic_class={}, arp={}", qos.traffic_class, qos.arp);
@@ -305,7 +305,7 @@ pub fn handle_update_pdp_context_request(
     }
 
     let nsapi = req.nsapi.unwrap();
-    info!("[GTPv1] Updating NSAPI: {}", nsapi);
+    info!("[GTPv1] Updating NSAPI: {nsapi}");
 
     // In a full implementation, would update session state and UPF
     let ggsn_addr = Ipv4Addr::new(10, 45, 0, 1);

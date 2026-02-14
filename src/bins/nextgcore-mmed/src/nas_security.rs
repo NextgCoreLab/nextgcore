@@ -204,7 +204,7 @@ pub fn nas_mac_calculate(
             mac.to_be_bytes()
         }
         _ => {
-            log::warn!("Unknown integrity algorithm: {}", algorithm);
+            log::warn!("Unknown integrity algorithm: {algorithm}");
             [0u8; 4]
         }
     }
@@ -294,7 +294,7 @@ pub fn nas_encrypt(
             message.copy_from_slice(&output);
         }
         _ => {
-            log::warn!("Unknown encryption algorithm: {}", algorithm);
+            log::warn!("Unknown encryption algorithm: {algorithm}");
         }
     }
 }

@@ -20,3 +20,6 @@ tokio = { workspace = true, features = ["time", "sync", "rt"] }
 [dev-dependencies]
 proptest.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
+
+[lints]
+workspace = true

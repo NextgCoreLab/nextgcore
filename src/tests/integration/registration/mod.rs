@@ -185,10 +185,10 @@ async fn test_concurrent_registrations() {
             let reg_request = CapturedMessage::new(
                 MessageType::RegistrationRequest,
                 Bytes::new(),
-                &format!("UE{}", i),
+                &format!("UE{i}"),
                 "AMF",
             )
-            .with_field("supi", crate::common::MessageField::String(format!("imsi-00101000000000{}", i)));
+            .with_field("supi", crate::common::MessageField::String(format!("imsi-00101000000000{i}")));
             
             let response = env.send_message(NfType::Amf, reg_request).await;
             assert!(response.is_ok());

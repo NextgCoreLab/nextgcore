@@ -24,3 +24,6 @@ ctrlc = { version = "3.4", features = ["termination"] }
 
 [dev-dependencies]
 proptest.workspace = true
+
+[lints]
+workspace = true

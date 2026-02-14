@@ -217,7 +217,7 @@ pub fn handle_modify_bearer_request(
     let bearer = match ctx.bearer_find_by_ue_ebi(sgwc_ue.id, bearer_ebi) {
         Some(b) => b,
         None => {
-            log::error!("Unknown EPS Bearer ID[{}]", bearer_ebi);
+            log::error!("Unknown EPS Bearer ID[{bearer_ebi}]");
             return HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND);
         }
     };
@@ -317,7 +317,7 @@ pub fn handle_create_bearer_response(
     };
 
     if cause != gtp_cause::REQUEST_ACCEPTED {
-        log::error!("GTP Cause [VALUE:{}]", cause);
+        log::error!("GTP Cause [VALUE:{cause}]");
         return HandlerResult::Error(cause);
     }
 
@@ -327,7 +327,7 @@ pub fn handle_create_bearer_response(
     let bearer = match ctx.bearer_find_by_ue_ebi(sgwc_ue.id, bearer_ebi) {
         Some(b) => b,
         None => {
-            log::error!("No Bearer Context [EBI:{}]", bearer_ebi);
+            log::error!("No Bearer Context [EBI:{bearer_ebi}]");
             return HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND);
         }
     };
@@ -358,7 +358,7 @@ pub fn handle_update_bearer_response(
     };
 
     if cause != gtp_cause::REQUEST_ACCEPTED {
-        log::error!("GTP Cause [VALUE:{}]", cause);
+        log::error!("GTP Cause [VALUE:{cause}]");
         return HandlerResult::Error(cause);
     }
 
@@ -368,7 +368,7 @@ pub fn handle_update_bearer_response(
     let bearer = match ctx.bearer_find_by_ue_ebi(sgwc_ue.id, bearer_ebi) {
         Some(b) => b,
         None => {
-            log::error!("No Bearer Context [EBI:{}]", bearer_ebi);
+            log::error!("No Bearer Context [EBI:{bearer_ebi}]");
             return HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND);
         }
     };
@@ -399,7 +399,7 @@ pub fn handle_delete_bearer_response(
     };
 
     if cause != gtp_cause::REQUEST_ACCEPTED {
-        log::error!("GTP Cause [VALUE:{}]", cause);
+        log::error!("GTP Cause [VALUE:{cause}]");
     }
 
     let ctx = sgwc_self();
@@ -408,7 +408,7 @@ pub fn handle_delete_bearer_response(
     let bearer = match ctx.bearer_find_by_ue_ebi(sgwc_ue.id, bearer_ebi) {
         Some(b) => b,
         None => {
-            log::error!("No Bearer Context [EBI:{}]", bearer_ebi);
+            log::error!("No Bearer Context [EBI:{bearer_ebi}]");
             return HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND);
         }
     };
@@ -465,7 +465,7 @@ pub fn handle_downlink_data_notification_ack(
     };
 
     if cause != gtp_cause::REQUEST_ACCEPTED {
-        log::warn!("GTP Cause [VALUE:{}]", cause);
+        log::warn!("GTP Cause [VALUE:{cause}]");
     }
 
     log::info!(

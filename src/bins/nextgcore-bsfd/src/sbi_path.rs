@@ -50,7 +50,7 @@ fn parse_uri_host_port(uri_str: &str) -> Result<(String, u16), String> {
         .next()
         .unwrap_or(port_str)
         .parse()
-        .map_err(|e| format!("Invalid port in URI: {}", e))?;
+        .map_err(|e| format!("Invalid port in URI: {e}"))?;
     Ok((host.to_string(), port))
 }
 
@@ -134,7 +134,7 @@ async fn register_with_nrf(nrf_uri: &str, nf_instance: &NfInstance) -> Result<()
             }
         }
         Err(e) => {
-            log::warn!("NRF registration failed (BSF will operate standalone): {}", e);
+            log::warn!("NRF registration failed (BSF will operate standalone): {e}");
             Ok(())
         }
     }
@@ -169,7 +169,7 @@ pub fn bsf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
             if let Some(ref nrf_uri) = nrf_uri_clone {
                 sbi_ctx.set_nrf_uri(nrf_uri).await;
                 if let Err(e) = register_with_nrf(nrf_uri, &nf_instance).await {
-                    log::error!("Failed to register BSF with NRF: {}", e);
+                    log::error!("Failed to register BSF with NRF: {e}");
                 }
             } else {
                 log::info!("No NRF URI configured, BSF running in standalone mode");
@@ -179,7 +179,7 @@ pub fn bsf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
         log::debug!("No tokio runtime available, skipping async NRF registration");
     }
 
-    log::info!("BSF NF instance built (id={})", nf_id);
+    log::info!("BSF NF instance built (id={nf_id})");
 
     SBI_SERVER_RUNNING.store(true, Ordering::SeqCst);
 
@@ -208,7 +208,7 @@ pub fn bsf_sbi_close() {
                     let client = sbi_ctx.get_client(&host, port).await;
                     let path = format!("/nnrf-nfm/v1/nf-instances/{}", self_instance.id);
                     if let Err(e) = client.delete(&path).await {
-                        log::warn!("Failed to deregister BSF from NRF: {}", e);
+                        log::warn!("Failed to deregister BSF from NRF: {e}");
                     } else {
                         log::info!("BSF deregistered from NRF");
                     }
@@ -277,10 +277,7 @@ pub fn bsf_sbi_discover_and_send(
     _request: PathSbiRequest,
 ) -> Result<u64, String> {
     log::debug!(
-        "Discover and send: service_type={}, sess_id={}, stream_id={}",
-        service_type,
-        sess_id,
-        stream_id
+        "Discover and send: service_type={service_type}, sess_id={sess_id}, stream_id={stream_id}"
     );
 
     // Note: SBI transaction tracking and NF discovery require NRF integration
@@ -294,7 +291,7 @@ pub fn bsf_sbi_discover_and_send(
 /// Send SBI response
 /// Port of bsf_sbi_send_response
 pub fn bsf_sbi_send_response(stream_id: u64, status: u16) -> Result<(), String> {
-    log::debug!("Sending SBI response: stream_id={}, status={}", stream_id, status);
+    log::debug!("Sending SBI response: stream_id={stream_id}, status={status}");
 
     // Note: Build and send response through HTTP server
     // In C: ogs_sbi_build_response(&sendmsg, status)

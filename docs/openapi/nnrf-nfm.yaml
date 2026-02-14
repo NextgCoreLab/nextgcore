@@ -1,0 +1,330 @@
+# NextGCore NRF NFM Service OpenAPI Specification
+# Item 127: OpenAPI specs for all SBI endpoints
+# Based on 3GPP TS 29.510 v18.6.0
+
+openapi: 3.0.3
+info:
+  title: NRF NFManagement Service
+  version: 1.3.0
+  description: NRF NF Management Service (nnrf-nfm) per 3GPP TS 29.510
+
+servers:
+  - url: "{apiRoot}/nnrf-nfm/v1"
+    variables:
+      apiRoot:
+        default: http://localhost:7777
+
+paths:
+  /nf-instances:
+    get:
+      summary: List NF instances
+      operationId: GetNFInstances
+      parameters:
+        - name: nf-type
+          in: query
+          schema:
+            $ref: "#/components/schemas/NFType"
+        - name: limit
+          in: query
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: NF instance list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: string
+                  format: uri
+
+  /nf-instances/{nfInstanceId}:
+    put:
+      summary: Register NF instance
+      operationId: RegisterNFInstance
+      parameters:
+        - $ref: "#/components/parameters/NfInstanceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NFProfile"
+      responses:
+        "200":
+          description: NF profile updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NFProfile"
+        "201":
+          description: NF instance registered
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NFProfile"
+
+    get:
+      summary: Get NF instance profile
+      operationId: GetNFInstance
+      parameters:
+        - $ref: "#/components/parameters/NfInstanceId"
+      responses:
+        "200":
+          description: NF profile
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NFProfile"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+    patch:
+      summary: Update NF instance
+      operationId: UpdateNFInstance
+      parameters:
+        - $ref: "#/components/parameters/NfInstanceId"
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: NF profile updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NFProfile"
+
+    delete:
+      summary: Deregister NF instance
+      operationId: DeregisterNFInstance
+      parameters:
+        - $ref: "#/components/parameters/NfInstanceId"
+      responses:
+        "204":
+          description: NF instance deregistered
+
+  /subscriptions:
+    post:
+      summary: Create subscription
+      operationId: CreateSubscription
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubscriptionData"
+      responses:
+        "201":
+          description: Subscription created
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubscriptionData"
+
+  /subscriptions/{subscriptionId}:
+    delete:
+      summary: Delete subscription
+      operationId: RemoveSubscription
+      parameters:
+        - name: subscriptionId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Subscription removed
+
+components:
+  parameters:
+    NfInstanceId:
+      name: nfInstanceId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    NFType:
+      type: string
+      enum:
+        - NRF
+        - AMF
+        - SMF
+        - UPF
+        - AUSF
+        - UDM
+        - UDR
+        - PCF
+        - BSF
+        - NSSF
+        - SCP
+        - SEPP
+        - NWDAF
+
+    NFProfile:
+      type: object
+      required:
+        - nfInstanceId
+        - nfType
+        - nfStatus
+      properties:
+        nfInstanceId:
+          type: string
+          format: uuid
+        nfType:
+          $ref: "#/components/schemas/NFType"
+        nfStatus:
+          type: string
+          enum: [REGISTERED, SUSPENDED, UNDISCOVERABLE]
+        heartBeatTimer:
+          type: integer
+        plmnList:
+          type: array
+          items:
+            $ref: "#/components/schemas/PlmnId"
+        sNssais:
+          type: array
+          items:
+            $ref: "#/components/schemas/Snssai"
+        fqdn:
+          type: string
+        ipv4Addresses:
+          type: array
+          items:
+            type: string
+            format: ipv4
+        nfServices:
+          type: array
+          items:
+            $ref: "#/components/schemas/NFService"
+        capacity:
+          type: integer
+          minimum: 0
+          maximum: 65535
+        load:
+          type: integer
+          minimum: 0
+          maximum: 100
+        priority:
+          type: integer
+          minimum: 0
+          maximum: 65535
+
+    NFService:
+      type: object
+      required:
+        - serviceInstanceId
+        - serviceName
+        - versions
+        - scheme
+        - nfServiceStatus
+      properties:
+        serviceInstanceId:
+          type: string
+        serviceName:
+          type: string
+        versions:
+          type: array
+          items:
+            type: object
+            properties:
+              apiVersionInUri:
+                type: string
+              apiFullVersion:
+                type: string
+        scheme:
+          type: string
+          enum: [http, https]
+        nfServiceStatus:
+          type: string
+          enum: [REGISTERED, SUSPENDED, UNDISCOVERABLE]
+        ipEndPoints:
+          type: array
+          items:
+            type: object
+            properties:
+              ipv4Address:
+                type: string
+              port:
+                type: integer
+
+    PlmnId:
+      type: object
+      required: [mcc, mnc]
+      properties:
+        mcc:
+          type: string
+          pattern: "^[0-9]{3}$"
+        mnc:
+          type: string
+          pattern: "^[0-9]{2,3}$"
+
+    Snssai:
+      type: object
+      required: [sst]
+      properties:
+        sst:
+          type: integer
+          minimum: 0
+          maximum: 255
+        sd:
+          type: string
+          pattern: "^[0-9a-fA-F]{6}$"
+
+    SubscriptionData:
+      type: object
+      required:
+        - nfStatusNotificationUri
+        - subscrCond
+      properties:
+        subscriptionId:
+          type: string
+        nfStatusNotificationUri:
+          type: string
+          format: uri
+        subscrCond:
+          type: object
+          properties:
+            nfType:
+              $ref: "#/components/schemas/NFType"
+        validityTime:
+          type: string
+          format: date-time
+
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        cause:
+          type: string
+
+  responses:
+    NotFound:
+      description: Resource not found
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"

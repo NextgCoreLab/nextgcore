@@ -1821,11 +1821,10 @@ impl MmeContext {
     pub fn find_served_tai(&self, tai: &EpsTai) -> Option<usize> {
         for (idx, served) in self.served_tai.iter().enumerate() {
             // Check TAI0 list
-            if served.list0.plmn_id == tai.plmn_id {
-                if served.list0.tac.contains(&tai.tac) {
+            if served.list0.plmn_id == tai.plmn_id
+                && served.list0.tac.contains(&tai.tac) {
                     return Some(idx);
                 }
-            }
             // Check TAI2 list
             for t in &served.list2.tai {
                 if t == tai {

@@ -23,11 +23,11 @@ pub enum GtpPathError {
 impl std::fmt::Display for GtpPathError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SocketError(msg) => write!(f, "Socket error: {}", msg),
-            Self::BuildError(msg) => write!(f, "Build error: {}", msg),
-            Self::TransactionError(msg) => write!(f, "Transaction error: {}", msg),
+            Self::SocketError(msg) => write!(f, "Socket error: {msg}"),
+            Self::BuildError(msg) => write!(f, "Build error: {msg}"),
+            Self::TransactionError(msg) => write!(f, "Transaction error: {msg}"),
             Self::ContextNotFound => write!(f, "Context not found"),
-            Self::InvalidState(msg) => write!(f, "Invalid state: {}", msg),
+            Self::InvalidState(msg) => write!(f, "Invalid state: {msg}"),
         }
     }
 }

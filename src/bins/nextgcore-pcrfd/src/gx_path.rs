@@ -197,19 +197,14 @@ pub fn pcrf_gx_handle_ccr(
     ipv6_addr: Option<[u8; OGS_IPV6_LEN]>,
 ) -> Result<GxMessage, String> {
     log::debug!(
-        "Handling CCR: session={}, type={:?}, number={}, imsi={}, apn={}",
-        session_id,
-        cc_request_type,
-        cc_request_number,
-        imsi,
-        apn
+        "Handling CCR: session={session_id}, type={cc_request_type:?}, number={cc_request_number}, imsi={imsi}, apn={apn}"
     );
 
     // Update statistics
     pcrf_diam_stats().gx.inc_rx_ccr();
 
     let ctx = pcrf_self();
-    let context = ctx.read().map_err(|e| format!("Failed to read context: {}", e))?;
+    let context = ctx.read().map_err(|e| format!("Failed to read context: {e}"))?;
 
     match cc_request_type {
         CcRequestType::Initial => {
@@ -288,7 +283,7 @@ pub fn pcrf_gx_send_rar(
     );
 
     let ctx = pcrf_self();
-    let context = ctx.read().map_err(|e| format!("Failed to read context: {}", e))?;
+    let context = ctx.read().map_err(|e| format!("Failed to read context: {e}"))?;
 
     // Find Gx session
     let gx_session = context
@@ -343,6 +338,193 @@ pub fn pcrf_gx_send_rar(
     rx_message.result_code = 2001; // DIAMETER_SUCCESS
 
     Ok(())
+}
+
+// ============================================================================
+// Flow Status Values (TS 29.214)
+// ============================================================================
+
+pub mod flow_status {
+    pub const ENABLED_UPLINK: i32 = 0;
+    pub const ENABLED_DOWNLINK: i32 = 1;
+    pub const ENABLED: i32 = 2;
+    pub const DISABLED: i32 = 3;
+    pub const REMOVED: i32 = 4;
+}
+
+// ============================================================================
+// QCI → QoS Mapping (TS 23.203 Table 6.1.7)
+// ============================================================================
+
+/// QoS characteristics for a given QCI
+#[derive(Debug, Clone)]
+pub struct QciQosMapping {
+    pub qci: u8,
+    pub resource_type: QciResourceType,
+    pub priority: u8,
+    pub packet_delay_budget_ms: u32,
+    pub packet_error_loss_rate: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QciResourceType {
+    Gbr,
+    NonGbr,
+}
+
+/// Get QoS parameters for a given QCI value (TS 23.203 Table 6.1.7)
+pub fn qci_to_qos(qci: u8) -> QciQosMapping {
+    match qci {
+        1 => QciQosMapping {
+            qci: 1, resource_type: QciResourceType::Gbr,
+            priority: 2, packet_delay_budget_ms: 100, packet_error_loss_rate: 1e-2,
+        },
+        2 => QciQosMapping {
+            qci: 2, resource_type: QciResourceType::Gbr,
+            priority: 4, packet_delay_budget_ms: 150, packet_error_loss_rate: 1e-3,
+        },
+        3 => QciQosMapping {
+            qci: 3, resource_type: QciResourceType::Gbr,
+            priority: 3, packet_delay_budget_ms: 50, packet_error_loss_rate: 1e-3,
+        },
+        4 => QciQosMapping {
+            qci: 4, resource_type: QciResourceType::Gbr,
+            priority: 5, packet_delay_budget_ms: 300, packet_error_loss_rate: 1e-6,
+        },
+        5 => QciQosMapping {
+            qci: 5, resource_type: QciResourceType::NonGbr,
+            priority: 1, packet_delay_budget_ms: 100, packet_error_loss_rate: 1e-6,
+        },
+        6 => QciQosMapping {
+            qci: 6, resource_type: QciResourceType::NonGbr,
+            priority: 6, packet_delay_budget_ms: 300, packet_error_loss_rate: 1e-6,
+        },
+        7 => QciQosMapping {
+            qci: 7, resource_type: QciResourceType::NonGbr,
+            priority: 7, packet_delay_budget_ms: 100, packet_error_loss_rate: 1e-3,
+        },
+        8 => QciQosMapping {
+            qci: 8, resource_type: QciResourceType::NonGbr,
+            priority: 8, packet_delay_budget_ms: 300, packet_error_loss_rate: 1e-6,
+        },
+        9 => QciQosMapping {
+            qci: 9, resource_type: QciResourceType::NonGbr,
+            priority: 9, packet_delay_budget_ms: 300, packet_error_loss_rate: 1e-6,
+        },
+        65 => QciQosMapping {
+            qci: 65, resource_type: QciResourceType::Gbr,
+            priority: 0, packet_delay_budget_ms: 75, packet_error_loss_rate: 1e-2,
+        },
+        66 => QciQosMapping {
+            qci: 66, resource_type: QciResourceType::Gbr,
+            priority: 2, packet_delay_budget_ms: 100, packet_error_loss_rate: 1e-2,
+        },
+        _ => QciQosMapping {
+            qci, resource_type: QciResourceType::NonGbr,
+            priority: 9, packet_delay_budget_ms: 300, packet_error_loss_rate: 1e-6,
+        },
+    }
+}
+
+// ============================================================================
+// PCC Rule Derivation from Rx Media Components
+// ============================================================================
+
+/// Derive PCC rules from IMS media components (Rx → Gx)
+/// Port of pcrf-gx-path logic that converts Rx media info to PCC rules
+pub fn derive_pcc_rules(
+    ims_data: &ImsData,
+    base_rule_name: &str,
+) -> Vec<PccRuleData> {
+    let mut rules = Vec::new();
+
+    for (idx, mc) in ims_data.media_components.iter().enumerate() {
+        let rule_name = format!("{}-mc{}", base_rule_name, mc.media_component_number);
+
+        // Determine QCI from media type (TS 29.213 section 7.1.4)
+        let qci = match mc.media_type {
+            media_type::AUDIO => 1,   // Conversational Voice
+            media_type::VIDEO => 2,   // Conversational Video (live)
+            media_type::APPLICATION => 5, // IMS signalling
+            media_type::CONTROL => 5, // IMS signalling
+            _ => 9,                   // Default non-GBR
+        };
+
+        // Determine flow status
+        let rule_flow_status = if mc.flow_status != 0 {
+            mc.flow_status
+        } else {
+            flow_status::ENABLED
+        };
+
+        // Build flow descriptions from sub-components
+        let mut flows = Vec::new();
+        for sub in &mc.sub_components {
+            for flow_desc in &sub.flows {
+                // Determine direction from flow description
+                // IPFilterRule: "permit in/out ..." where in=downlink, out=uplink
+                let direction = if flow_desc.contains("out") {
+                    0 // Uplink
+                } else {
+                    1 // Downlink
+                };
+                flows.push(FlowData {
+                    direction,
+                    description: flow_desc.clone(),
+                });
+            }
+        }
+
+        // If no sub-components, create a default permit-all flow
+        if flows.is_empty() {
+            flows.push(FlowData {
+                direction: flow_status::ENABLED,
+                description: "permit out ip from any to any".to_string(),
+            });
+            flows.push(FlowData {
+                direction: flow_status::ENABLED,
+                description: "permit in ip from any to any".to_string(),
+            });
+        }
+
+        let rule = PccRuleData {
+            name: rule_name,
+            qos_index: qci,
+            flow_status: rule_flow_status,
+            precedence: (idx as u32 + 1) * 10,
+            mbr_downlink: mc.max_requested_bandwidth_dl as u64,
+            mbr_uplink: mc.max_requested_bandwidth_ul as u64,
+            gbr_downlink: if qci <= 4 { mc.max_requested_bandwidth_dl as u64 } else { 0 },
+            gbr_uplink: if qci <= 4 { mc.max_requested_bandwidth_ul as u64 } else { 0 },
+            flows,
+        };
+
+        rules.push(rule);
+    }
+
+    log::debug!("Derived {} PCC rules from {} media components",
+        rules.len(), ims_data.media_components.len());
+
+    rules
+}
+
+/// Build GxSessionData with PCC rules for a CCA response
+pub fn build_session_data_with_rules(
+    qos_index: u8,
+    ambr_dl: u64,
+    ambr_ul: u64,
+    pcc_rules: Vec<PccRuleData>,
+) -> GxSessionData {
+    let qos = qci_to_qos(qos_index);
+    GxSessionData {
+        ambr_downlink: ambr_dl,
+        ambr_uplink: ambr_ul,
+        qos_index,
+        arp_priority_level: qos.priority,
+        arp_pre_emption_capability: false,
+        arp_pre_emption_vulnerability: true,
+        pcc_rules,
+    }
 }
 
 #[cfg(test)]
@@ -471,5 +653,102 @@ mod tests {
         let result = pcrf_gx_send_rar("gx-session-rar", "rx-session-1", &mut rx_msg);
         assert!(result.is_ok());
         assert_eq!(rx_msg.result_code, 2001);
+    }
+
+    #[test]
+    fn test_qci_to_qos() {
+        let qos1 = qci_to_qos(1);
+        assert_eq!(qos1.qci, 1);
+        assert_eq!(qos1.resource_type, QciResourceType::Gbr);
+        assert_eq!(qos1.priority, 2);
+        assert_eq!(qos1.packet_delay_budget_ms, 100);
+
+        let qos5 = qci_to_qos(5);
+        assert_eq!(qos5.resource_type, QciResourceType::NonGbr);
+        assert_eq!(qos5.priority, 1);
+
+        let qos9 = qci_to_qos(9);
+        assert_eq!(qos9.resource_type, QciResourceType::NonGbr);
+        assert_eq!(qos9.priority, 9);
+
+        // Unknown QCI falls back to non-GBR
+        let qos_unknown = qci_to_qos(200);
+        assert_eq!(qos_unknown.resource_type, QciResourceType::NonGbr);
+    }
+
+    #[test]
+    fn test_derive_pcc_rules_audio() {
+        let ims_data = ImsData {
+            media_components: vec![
+                MediaComponent {
+                    media_component_number: 1,
+                    media_type: media_type::AUDIO,
+                    max_requested_bandwidth_dl: 64000,
+                    max_requested_bandwidth_ul: 64000,
+                    flow_status: flow_status::ENABLED,
+                    sub_components: vec![
+                        MediaSubComponent {
+                            flow_number: 1,
+                            flow_usage: 0,
+                            flows: vec![
+                                "permit out 17 from 10.0.0.1 to 10.0.0.2".to_string(),
+                                "permit in 17 from 10.0.0.2 to 10.0.0.1".to_string(),
+                            ],
+                        },
+                    ],
+                },
+            ],
+        };
+
+        let rules = derive_pcc_rules(&ims_data, "test-rule");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].qos_index, 1); // Audio → QCI 1
+        assert_eq!(rules[0].mbr_downlink, 64000);
+        assert_eq!(rules[0].gbr_downlink, 64000); // GBR for QCI 1
+        assert_eq!(rules[0].flows.len(), 2);
+    }
+
+    #[test]
+    fn test_derive_pcc_rules_video_and_data() {
+        let ims_data = ImsData {
+            media_components: vec![
+                MediaComponent {
+                    media_component_number: 1,
+                    media_type: media_type::VIDEO,
+                    max_requested_bandwidth_dl: 1000000,
+                    max_requested_bandwidth_ul: 500000,
+                    flow_status: 0,
+                    sub_components: vec![],
+                },
+                MediaComponent {
+                    media_component_number: 2,
+                    media_type: media_type::APPLICATION,
+                    max_requested_bandwidth_dl: 100000,
+                    max_requested_bandwidth_ul: 100000,
+                    flow_status: 0,
+                    sub_components: vec![],
+                },
+            ],
+        };
+
+        let rules = derive_pcc_rules(&ims_data, "multi");
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].qos_index, 2); // Video → QCI 2
+        assert_eq!(rules[1].qos_index, 5); // Application → QCI 5
+        assert_eq!(rules[1].gbr_downlink, 0); // Non-GBR for QCI 5
+    }
+
+    #[test]
+    fn test_build_session_data_with_rules() {
+        let rules = vec![PccRuleData {
+            name: "rule1".to_string(),
+            qos_index: 1,
+            ..Default::default()
+        }];
+        let data = build_session_data_with_rules(9, 100000, 50000, rules);
+        assert_eq!(data.ambr_downlink, 100000);
+        assert_eq!(data.ambr_uplink, 50000);
+        assert_eq!(data.qos_index, 9);
+        assert_eq!(data.pcc_rules.len(), 1);
     }
 }

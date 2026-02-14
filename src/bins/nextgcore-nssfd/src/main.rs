@@ -20,6 +20,7 @@ use std::time::Duration;
 mod context;
 mod event;
 mod nnrf_handler;
+mod nsacf;
 mod nnssf_build;
 mod nnssf_handler;
 mod nssf_sm;
@@ -127,7 +128,7 @@ async fn main() -> Result<()> {
                 log::debug!("Configuration file loaded ({} bytes)", content.len());
             }
             Err(e) => {
-                log::warn!("Failed to read configuration file: {}", e);
+                log::warn!("Failed to read configuration file: {e}");
             }
         }
     } else {
@@ -153,18 +154,18 @@ async fn main() -> Result<()> {
     let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
 
     sbi_server.start(nssf_sbi_request_handler).await
-        .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
-    log::info!("SBI HTTP/2 server listening on {}", sbi_addr);
+    log::info!("SBI HTTP/2 server listening on {sbi_addr}");
 
     // Register with NRF (B24.3)
     if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port).await {
-        log::warn!("NRF registration failed (will operate without NRF): {}", e);
+        log::warn!("NRF registration failed (will operate without NRF): {e}");
     }
 
     // Discover H-NSSF instances from NRF
     if let Err(e) = discover_nf_from_nrf("NSSF", "nnssf-nsselection").await {
-        log::warn!("H-NSSF discovery failed (will retry on demand): {}", e);
+        log::warn!("H-NSSF discovery failed (will retry on demand): {e}");
     }
 
     log::info!("NextGCore NSSF ready");
@@ -177,7 +178,7 @@ async fn main() -> Result<()> {
 
     // Stop SBI server
     sbi_server.stop().await
-        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
     log::info!("SBI HTTP/2 server stopped");
 
     // Close legacy SBI server
@@ -201,7 +202,7 @@ async fn nssf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("NSSF SBI request: {} {}", method, uri);
+    log::debug!("NSSF SBI request: {method} {uri}");
 
     // Parse the URI path
     let path = uri.split('?').next().unwrap_or(uri);
@@ -260,7 +261,7 @@ async fn nssf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         }
 
         _ => {
-            log::warn!("Unknown NSSF request: {} {}", method, uri);
+            log::warn!("Unknown NSSF request: {method} {uri}");
             send_method_not_allowed(method, uri)
         }
     }
@@ -276,7 +277,7 @@ async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
     let nf_id = request.http.params.get("nf-id")
         .map(|s| s.as_str());
 
-    log::info!("NS Selection: nf-type={}, nf-id={:?}", nf_type, nf_id);
+    log::info!("NS Selection: nf-type={nf_type}, nf-id={nf_id:?}");
 
     // Parse slice-info-request-for-pdu-session (JSON query param)
     let slice_info_json = request.http.params.get("slice-info-request-for-pdu-session")
@@ -358,7 +359,7 @@ async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
         .map(|s| s.as_str().to_string());
 
     if let Some(ref s) = supi {
-        log::debug!("NS Selection with SUPI={} for subscription-based filtering", s);
+        log::debug!("NS Selection with SUPI={s} for subscription-based filtering");
     }
 
     // Call the real NS selection handler
@@ -422,7 +423,7 @@ async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
                         }
                     }
                     Err(e) => {
-                        log::debug!("UDR subscription query unavailable for SUPI ({}), allowing all NSSAIs", e);
+                        log::debug!("UDR subscription query unavailable for SUPI ({e}), allowing all NSSAIs");
                     }
                 }
             }
@@ -474,7 +475,7 @@ async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
         }
         nnssf_handler::NsSelectionResult::NeedHnssf(home_id) => {
             // Query H-NSSF via SBI client
-            log::info!("NS Selection requires H-NSSF query (home_id={})", home_id);
+            log::info!("NS Selection requires H-NSSF query (home_id={home_id})");
 
             // Try to query H-NSSF
             match send_hnssf_query(home_id, &param).await {
@@ -490,7 +491,7 @@ async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
                         .unwrap_or_else(|_| SbiResponse::with_status(200))
                 }
                 Err(e) => {
-                    log::warn!("H-NSSF query failed: {}", e);
+                    log::warn!("H-NSSF query failed: {e}");
                     SbiResponse::with_status(500)
                         .with_json_body(&serde_json::json!({
                             "status": 500,
@@ -502,7 +503,7 @@ async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
             }
         }
         nnssf_handler::NsSelectionResult::Error(status, msg) => {
-            log::warn!("NS Selection error: {} - {}", status, msg);
+            log::warn!("NS Selection error: {status} - {msg}");
             SbiResponse::with_status(status)
                 .with_json_body(&serde_json::json!({
                     "status": status,
@@ -517,7 +518,7 @@ async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
 // NSSAI Availability handlers
 
 async fn handle_nssai_availability_update(nf_id: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("NSSAI Availability Update: nf_id={}", nf_id);
+    log::info!("NSSAI Availability Update: nf_id={nf_id}");
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -526,7 +527,7 @@ async fn handle_nssai_availability_update(nf_id: &str, request: &SbiRequest) -> 
 
     let availability_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
     // Parse and store NSSAI availability info in context (B24.4)
@@ -579,7 +580,7 @@ async fn handle_nssai_availability_update(nf_id: &str, request: &SbiRequest) -> 
 }
 
 async fn handle_nssai_availability_patch(nf_id: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("NSSAI Availability Patch: nf_id={}", nf_id);
+    log::info!("NSSAI Availability Patch: nf_id={nf_id}");
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -588,7 +589,7 @@ async fn handle_nssai_availability_patch(nf_id: &str, request: &SbiRequest) -> S
 
     let patch_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
     // Apply patch to existing NSSAI availability (B24.4)
@@ -630,7 +631,7 @@ async fn handle_nssai_availability_patch(nf_id: &str, request: &SbiRequest) -> S
         context.set_nssai_availability(nf_id, avail);
     }
 
-    log::info!("Patched NSSAI availability for NF {}", nf_id);
+    log::info!("Patched NSSAI availability for NF {nf_id}");
 
     SbiResponse::with_status(200)
         .with_json_body(&serde_json::json!({
@@ -640,7 +641,7 @@ async fn handle_nssai_availability_patch(nf_id: &str, request: &SbiRequest) -> S
 }
 
 async fn handle_nssai_availability_delete(nf_id: &str) -> SbiResponse {
-    log::info!("NSSAI Availability Delete: nf_id={}", nf_id);
+    log::info!("NSSAI Availability Delete: nf_id={nf_id}");
 
     // Remove NSSAI availability from context (B24.4)
     let ctx = nssf_self();
@@ -669,15 +670,15 @@ async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
 
     let subscription_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
     let subscription_id = uuid::Uuid::new_v4().to_string();
 
-    log::info!("Created subscription: {}", subscription_id);
+    log::info!("Created subscription: {subscription_id}");
 
     SbiResponse::with_status(201)
-        .with_header("Location", &format!("/nnssf-nssaiavailability/v1/subscriptions/{}", subscription_id))
+        .with_header("Location", format!("/nnssf-nssaiavailability/v1/subscriptions/{subscription_id}"))
         .with_json_body(&serde_json::json!({
             "subscriptionId": subscription_id,
             "nfNssaiAvailabilityUri": subscription_data.get("nfNssaiAvailabilityUri"),
@@ -687,7 +688,7 @@ async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
 }
 
 async fn handle_subscription_delete(subscription_id: &str) -> SbiResponse {
-    log::info!("NSSAI Availability Subscription Delete: {}", subscription_id);
+    log::info!("NSSAI Availability Subscription Delete: {subscription_id}");
     SbiResponse::with_status(204)
 }
 
@@ -725,14 +726,14 @@ async fn send_hnssf_query(
         format!("nf-type={}", param.nf_type.as_deref().unwrap_or("AMF")),
     ];
     if let Some(ref nf_id) = param.nf_id {
-        query_parts.push(format!("nf-id={}", nf_id));
+        query_parts.push(format!("nf-id={nf_id}"));
     }
     if let Some(ref snssai) = param.slice_info_for_pdu_session.snssai {
         let mut si = serde_json::json!({"sNssai": {"sst": snssai.sst}});
         if let Some(sd) = snssai.sd {
             si["sNssai"]["sd"] = serde_json::json!(format!("{:06x}", sd));
         }
-        query_parts.push(format!("slice-info-request-for-pdu-session={}", si));
+        query_parts.push(format!("slice-info-request-for-pdu-session={si}"));
     }
 
     let path = format!(
@@ -740,10 +741,10 @@ async fn send_hnssf_query(
         query_parts.join("&")
     );
 
-    log::debug!("Sending H-NSSF query: GET {}", path);
+    log::debug!("Sending H-NSSF query: GET {path}");
 
     let response = client.get(&path).await
-        .map_err(|e| format!("H-NSSF request failed: {}", e))?;
+        .map_err(|e| format!("H-NSSF request failed: {e}"))?;
 
     if response.status != 200 {
         return Err(format!("H-NSSF returned status {}", response.status));
@@ -752,7 +753,7 @@ async fn send_hnssf_query(
     let body = response.http.content
         .ok_or("Empty H-NSSF response body")?;
     let json: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| format!("Invalid H-NSSF response JSON: {}", e))?;
+        .map_err(|e| format!("Invalid H-NSSF response JSON: {e}"))?;
 
     // Extract NSI information from response
     let nsi_info = json.get("nsiInformationList")
@@ -811,7 +812,7 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> 
         }
     };
 
-    log::info!("Registering NSSF with NRF at {}", nrf_uri);
+    log::info!("Registering NSSF with NRF at {nrf_uri}");
 
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
 
@@ -849,17 +850,17 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> 
         "heartBeatTimer": 10
     });
 
-    let path = format!("/nnrf-nfm/v1/nf-instances/{}", nf_instance_id);
-    log::debug!("NRF registration: PUT {}", path);
+    let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
+    log::debug!("NRF registration: PUT {path}");
 
     let response = client
         .put_json(&path, &nf_profile)
         .await
-        .map_err(|e| format!("NRF registration failed: {}", e))?;
+        .map_err(|e| format!("NRF registration failed: {e}"))?;
 
     match response.status {
         200 | 201 => {
-            log::info!("NSSF registered with NRF successfully (id={})", nf_instance_id);
+            log::info!("NSSF registered with NRF successfully (id={nf_instance_id})");
 
             let mut self_instance = ogs_sbi::context::NfInstance::new(
                 &nf_instance_id,
@@ -906,12 +907,11 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
 
     let path = format!(
-        "/nnrf-disc/v1/nf-instances?target-nf-type={}&requester-nf-type=NSSF&service-names={}",
-        target_nf_type, service_name
+        "/nnrf-disc/v1/nf-instances?target-nf-type={target_nf_type}&requester-nf-type=NSSF&service-names={service_name}"
     );
 
     let response = client.get(&path).await
-        .map_err(|e| format!("NRF discovery failed: {}", e))?;
+        .map_err(|e| format!("NRF discovery failed: {e}"))?;
 
     if response.status != 200 {
         return Err(format!("NRF discovery returned status {}", response.status));
@@ -919,7 +919,7 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
 
     let body = response.http.content.ok_or("Empty NRF discovery response")?;
     let json: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| format!("Invalid NRF discovery response: {}", e))?;
+        .map_err(|e| format!("Invalid NRF discovery response: {e}"))?;
 
     if let Some(nf_instances) = json.get("nfInstances").and_then(|v| v.as_array()) {
         for nf_json in nf_instances {
@@ -965,7 +965,7 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
             }
 
             sbi_ctx.add_nf_instance(instance).await;
-            log::info!("Discovered {} instance: {}", nf_type_str, nf_id);
+            log::info!("Discovered {nf_type_str} instance: {nf_id}");
         }
     }
 

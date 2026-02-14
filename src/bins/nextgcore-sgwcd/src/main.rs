@@ -81,11 +81,10 @@ impl SgwcApp {
         // Initialize SGWC context with default pool sizes
         let ctx = sgwc_self();
         // In a real implementation, these values would come from config
-        if let Ok(mut ctx_guard) = Arc::try_unwrap(ctx.clone()).or_else(|arc| {
+        if let Ok(mut ctx_guard) = Arc::try_unwrap(ctx.clone()).inspect_err(|_arc| {
             // Context is shared, we need to use interior mutability
             // For now, just log that we're using defaults
             log::debug!("Using default context configuration");
-            Err(arc)
         }) {
             ctx_guard.init(1024, 4096, 16384, 32768);
         }
@@ -98,16 +97,16 @@ impl SgwcApp {
 
         // Open GTP-C path (S11 and S5-C interfaces)
         if let Err(e) = gtp_path::gtp_open() {
-            log::error!("Failed to open GTP path: {}", e);
-            return Err(anyhow::anyhow!("GTP path initialization failed: {}", e));
+            log::error!("Failed to open GTP path: {e}");
+            return Err(anyhow::anyhow!("GTP path initialization failed: {e}"));
         }
         log::debug!("GTP path initialized (S11/S5-C interfaces)");
 
         // Open PFCP path (SXA interface to SGW-U)
         if let Err(e) = pfcp_path::pfcp_open() {
-            log::error!("Failed to open PFCP path: {}", e);
+            log::error!("Failed to open PFCP path: {e}");
             gtp_path::gtp_close();
-            return Err(anyhow::anyhow!("PFCP path initialization failed: {}", e));
+            return Err(anyhow::anyhow!("PFCP path initialization failed: {e}"));
         }
         log::debug!("PFCP path initialized (SXA interface)");
 
@@ -144,7 +143,7 @@ impl SgwcApp {
         // Check for expired timers and generate events
         let expired = self.timer_mgr.check_expired();
         for timer_id in expired {
-            log::debug!("Timer expired: {:?}", timer_id);
+            log::debug!("Timer expired: {timer_id:?}");
             // Create timer event and dispatch to state machine
             // Convert timer::SgwcTimerId to event::SgwcTimerId
             let event_timer_id = match timer_id {
@@ -203,9 +202,9 @@ impl SgwcApp {
 
         // Finalize context
         let ctx = sgwc_self();
-        if let Ok(mut ctx_guard) = Arc::try_unwrap(ctx.clone()).or_else(|_| {
+        if let Ok(mut ctx_guard) = Arc::try_unwrap(ctx.clone()).map_err(|_| {
             log::debug!("Context cleanup via shared reference");
-            Err(())
+            
         }) {
             ctx_guard.fini();
         }

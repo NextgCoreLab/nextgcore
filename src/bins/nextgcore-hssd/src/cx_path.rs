@@ -100,7 +100,7 @@ pub fn handle_uar(
     _visited_network_identifier: &str,
     authorization_type: UserAuthorizationType,
 ) -> Result<UarResponse, String> {
-    log::debug!("[{}] Handling UAR for {} (type={:?})", user_name, public_identity, authorization_type);
+    log::debug!("[{user_name}] Handling UAR for {public_identity} (type={authorization_type:?})");
     diam_stats().cx.inc_rx_uar();
 
     use crate::context::hss_self;
@@ -109,7 +109,7 @@ pub fn handle_uar(
     // 1. Check if user exists in DB
     let supi = format!("imsi-{}", user_name.trim_start_matches("imsi-"));
     let _ims_data = ogs_dbi_ims_data(&supi)
-        .map_err(|e| format!("Failed to get IMS data: {}", e))?;
+        .map_err(|e| format!("Failed to get IMS data: {e}"))?;
 
     // 2. Associate identity if needed
     let ctx = hss_self();
@@ -128,7 +128,7 @@ pub fn handle_uar(
         server_name: vec!["sip:scscf.ims.mnc001.mcc001.3gppnetwork.org".to_string()],
     });
 
-    log::debug!("[{}] UAR processed for {}", user_name, public_identity);
+    log::debug!("[{user_name}] UAR processed for {public_identity}");
     diam_stats().cx.inc_tx_uaa();
     Ok(response)
 }
@@ -143,7 +143,7 @@ pub fn handle_mar(
     sip_auth_scheme: &str,
     _sip_authorization: Option<&[u8]>,
 ) -> Result<MarResponse, String> {
-    log::debug!("[{}] Handling MAR for {} (scheme={})", user_name, public_identity, sip_auth_scheme);
+    log::debug!("[{user_name}] Handling MAR for {public_identity} (scheme={sip_auth_scheme})");
     diam_stats().cx.inc_rx_mar();
 
     use ogs_dbi::ogs_dbi_auth_info;
@@ -152,7 +152,7 @@ pub fn handle_mar(
     // 1. Get auth info from DB
     let supi = format!("imsi-{}", user_name.trim_start_matches("imsi-"));
     let auth_info = ogs_dbi_auth_info(&supi)
-        .map_err(|e| format!("Failed to get auth info: {}", e))?;
+        .map_err(|e| format!("Failed to get auth info: {e}"))?;
 
     // 2. Generate SIP authentication vectors (AKA or Digest)
     let rand = auth_info.rand;
@@ -207,7 +207,7 @@ pub fn handle_mar(
         sip_auth_data_items: vec![sip_auth_data_item],
     };
 
-    log::debug!("[{}] MAR processed for {}", user_name, public_identity);
+    log::debug!("[{user_name}] MAR processed for {public_identity}");
     diam_stats().cx.inc_tx_maa();
     Ok(response)
 }
@@ -222,11 +222,7 @@ pub fn handle_sar(
     server_assignment_type: ServerAssignmentType,
 ) -> Result<SarResponse, String> {
     log::debug!(
-        "[{}] Handling SAR for {} (type={:?}, server={})",
-        user_name,
-        public_identity,
-        server_assignment_type,
-        server_name
+        "[{user_name}] Handling SAR for {public_identity} (type={server_assignment_type:?}, server={server_name})"
     );
     diam_stats().cx.inc_rx_sar();
 
@@ -249,17 +245,17 @@ pub fn handle_sar(
             // Get IMS user data from DB
             let supi = format!("imsi-{}", user_name.trim_start_matches("imsi-"));
             let _ims_data = ogs_dbi_ims_data(&supi)
-                .map_err(|e| format!("Failed to get IMS data: {}", e))?;
+                .map_err(|e| format!("Failed to get IMS data: {e}"))?;
 
             // 3. Return SAA with User-Data (XML)
             // Note: In full implementation, this would build IMS user profile XML
             let user_data_xml = format!(
                 r#"<?xml version="1.0" encoding="UTF-8"?>
 <IMSSubscription>
-    <PrivateID>{}</PrivateID>
+    <PrivateID>{user_name}</PrivateID>
     <ServiceProfile>
         <PublicIdentity>
-            <Identity>{}</Identity>
+            <Identity>{public_identity}</Identity>
         </PublicIdentity>
         <InitialFilterCriteria>
             <Priority>0</Priority>
@@ -268,8 +264,7 @@ pub fn handle_sar(
             </ApplicationServer>
         </InitialFilterCriteria>
     </ServiceProfile>
-</IMSSubscription>"#,
-                user_name, public_identity
+</IMSSubscription>"#
             );
 
             response.user_data = Some(user_data_xml);
@@ -284,11 +279,11 @@ pub fn handle_sar(
         }
         _ => {
             // Deregistration or other types - no user data
-            log::debug!("[{}] SAR type {:?} - no user data returned", user_name, server_assignment_type);
+            log::debug!("[{user_name}] SAR type {server_assignment_type:?} - no user data returned");
         }
     }
 
-    log::debug!("[{}] SAR processed for {}", user_name, public_identity);
+    log::debug!("[{user_name}] SAR processed for {public_identity}");
     diam_stats().cx.inc_tx_saa();
     Ok(response)
 }
@@ -297,7 +292,7 @@ pub fn handle_sar(
 ///
 /// This is called by I-CSCF to get the S-CSCF for a user
 pub fn handle_lir(public_identity: &str) -> Result<LirResponse, String> {
-    log::debug!("Handling LIR for {}", public_identity);
+    log::debug!("Handling LIR for {public_identity}");
     diam_stats().cx.inc_rx_lir();
 
     use crate::context::hss_self;
@@ -327,7 +322,7 @@ pub fn handle_lir(public_identity: &str) -> Result<LirResponse, String> {
         response.experimental_result_code = OGS_DIAM_CX_ERROR_IDENTITY_NOT_REGISTERED;
     }
 
-    log::debug!("LIR processed for {}", public_identity);
+    log::debug!("LIR processed for {public_identity}");
     diam_stats().cx.inc_tx_lia();
     Ok(response)
 }

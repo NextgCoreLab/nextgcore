@@ -315,7 +315,7 @@ mod tests {
     fn test_subscriber_creation() {
         let sub = TestSubscriber::new("001010000000001");
         assert_eq!(sub.imsi, "001010000000001");
-        assert!(sub.security.k.len() > 0);
+        assert!(!sub.security.k.is_empty());
     }
     
     #[test]

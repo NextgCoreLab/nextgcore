@@ -152,10 +152,11 @@ impl<T> OgsTimerMgr<T> {
         if let Some(index) = self.find_index(id) {
             // Get timer info for tree operations
             let (old_timeout_nanos, timer_id) = {
-                let timer = self.timers[index].as_ref().unwrap();
+                let timer = self.timers[index].as_ref()
+                    .expect("timer exists after find_index");
                 (timer.timeout_nanos, timer.id)
             };
-            
+
             // If already running, remove from tree first
             if let Some(timeout_nanos) = old_timeout_nanos {
                 let key = TimerKey {
@@ -164,12 +165,13 @@ impl<T> OgsTimerMgr<T> {
                 };
                 self.tree.remove(&key);
             }
-            
+
             // Calculate new timeout
             let timeout_nanos = self.instant_to_nanos(Instant::now() + duration);
-            
+
             // Update timer
-            let timer = self.timers[index].as_mut().unwrap();
+            let timer = self.timers[index].as_mut()
+                .expect("timer exists after find_index");
             timer.timeout_nanos = Some(timeout_nanos);
             timer.running = true;
             
@@ -187,14 +189,15 @@ impl<T> OgsTimerMgr<T> {
         if let Some(index) = self.find_index(id) {
             // Get timer info for tree operations
             let (timeout_nanos, timer_id, running) = {
-                let timer = self.timers[index].as_ref().unwrap();
+                let timer = self.timers[index].as_ref()
+                    .expect("timer exists after find_index");
                 (timer.timeout_nanos, timer.id, timer.running)
             };
-            
+
             if !running {
                 return;
             }
-            
+
             // Remove from tree
             if let Some(timeout_nanos) = timeout_nanos {
                 let key = TimerKey {
@@ -203,9 +206,10 @@ impl<T> OgsTimerMgr<T> {
                 };
                 self.tree.remove(&key);
             }
-            
+
             // Update timer
-            let timer = self.timers[index].as_mut().unwrap();
+            let timer = self.timers[index].as_mut()
+                .expect("timer exists after find_index");
             timer.running = false;
             timer.timeout_nanos = None;
         }

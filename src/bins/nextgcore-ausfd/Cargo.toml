@@ -25,9 +25,14 @@ tokio.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+hmac.workspace = true
 uuid = { version = "1.6", features = ["v4"] }
 clap = { version = "4.4", features = ["derive"] }
 ctrlc = "3.4"
 
 [dev-dependencies]
 proptest.workspace = true
+
+[lints]
+workspace = true

@@ -30,6 +30,16 @@ pub enum EmmMessage {
     IdentityRequest(EpsIdentityRequest),
     IdentityResponse(EpsIdentityResponse),
     EmmStatus(EmmStatus),
+    ServiceRequest(EpsServiceRequest),
+    ExtendedServiceRequest(ExtendedServiceRequest),
+    ServiceReject(EpsServiceReject),
+    GutiReallocationCommand(GutiReallocationCommand),
+    GutiReallocationComplete,
+    TrackingAreaUpdateComplete,
+    EmmInformation(EmmInformation),
+    DownlinkNasTransport(EpsDownlinkNasTransport),
+    UplinkNasTransport(EpsUplinkNasTransport),
+    CsServiceNotification(CsServiceNotification),
 }
 
 /// Attach Request message (TS 24.301 Section 8.2.4)
@@ -770,6 +780,346 @@ impl EmmStatus {
     }
 }
 
+/// EPS Service Request message (TS 24.301 Section 8.2.15)
+/// Note: This is sent with security header type 0x0C (service request)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EpsServiceRequest {
+    /// KSI and sequence number
+    pub ksi_and_sequence_number: u8,
+    /// Short MAC
+    pub short_mac: u16,
+}
+
+impl EpsServiceRequest {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.ksi_and_sequence_number);
+        buf.put_u16(self.short_mac);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 3 {
+            return Err(NasError::BufferTooShort { expected: 3, actual: buf.remaining() });
+        }
+        let ksi_and_sequence_number = buf.get_u8();
+        let short_mac = buf.get_u16();
+        Ok(Self { ksi_and_sequence_number, short_mac })
+    }
+}
+
+/// Extended Service Request message (TS 24.301 Section 8.2.15A)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ExtendedServiceRequest {
+    /// Service type
+    pub service_type: u8,
+    /// NAS key set identifier
+    pub nas_key_set_identifier: KeySetIdentifier,
+    /// M-TMSI
+    pub m_tmsi: EpsMobileIdentity,
+    /// CSFB response
+    pub csfb_response: Option<u8>,
+    /// EPS bearer context status
+    pub eps_bearer_context_status: Option<u16>,
+}
+
+impl ExtendedServiceRequest {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8((self.nas_key_set_identifier.encode() << 4) | (self.service_type & 0x0F));
+        self.m_tmsi.encode(buf);
+        if let Some(csfb) = self.csfb_response {
+            buf.put_u8(0xB0 | (csfb & 0x0F)); // IEI B- (half-byte)
+        }
+        if let Some(status) = self.eps_bearer_context_status {
+            buf.put_u8(0x57); // IEI
+            buf.put_u8(2); // Length
+            buf.put_u16(status);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let first_byte = buf.get_u8();
+        let service_type = first_byte & 0x0F;
+        let nas_key_set_identifier = KeySetIdentifier::decode((first_byte >> 4) & 0x0F);
+        let m_tmsi = EpsMobileIdentity::decode(buf)?;
+        let mut msg = Self { service_type, nas_key_set_identifier, m_tmsi, ..Default::default() };
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            let iei_type = if iei >= 0x80 { iei & 0xF0 } else { iei };
+            match iei_type {
+                0xB0 => {
+                    buf.advance(1);
+                    msg.csfb_response = Some(iei & 0x0F);
+                }
+                0x57 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 3 {
+                        let _len = buf.get_u8();
+                        msg.eps_bearer_context_status = Some(buf.get_u16());
+                    }
+                }
+                _ => {
+                    buf.advance(1);
+                    if buf.remaining() > 0 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len { buf.advance(len); }
+                    }
+                }
+            }
+        }
+        Ok(msg)
+    }
+}
+
+/// EPS Service Reject message (TS 24.301 Section 8.2.24)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EpsServiceReject {
+    /// EMM cause
+    pub emm_cause: u8,
+    /// T3346 value
+    pub t3346_value: Option<GprsTimer2>,
+    /// T3448 value
+    pub t3448_value: Option<GprsTimer2>,
+}
+
+impl EpsServiceReject {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.emm_cause);
+        if let Some(ref t3346) = self.t3346_value {
+            buf.put_u8(0x5F); // IEI
+            t3346.encode(buf);
+        }
+        if let Some(ref t3448) = self.t3448_value {
+            buf.put_u8(0x6B); // IEI
+            t3448.encode(buf);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let emm_cause = buf.get_u8();
+        let mut msg = Self { emm_cause, ..Default::default() };
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            match iei {
+                0x5F => {
+                    buf.advance(1);
+                    msg.t3346_value = Some(GprsTimer2::decode(buf)?);
+                }
+                0x6B => {
+                    buf.advance(1);
+                    msg.t3448_value = Some(GprsTimer2::decode(buf)?);
+                }
+                _ => break,
+            }
+        }
+        Ok(msg)
+    }
+}
+
+/// GUTI Reallocation Command message (TS 24.301 Section 8.2.16)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct GutiReallocationCommand {
+    /// GUTI
+    pub guti: EpsMobileIdentity,
+    /// TAI list
+    pub tai_list: Option<EpsTaiList>,
+}
+
+impl GutiReallocationCommand {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        self.guti.encode(buf);
+        if let Some(ref tai_list) = self.tai_list {
+            buf.put_u8(0x54); // IEI
+            tai_list.encode(buf);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        let guti = EpsMobileIdentity::decode(buf)?;
+        let mut msg = Self { guti, ..Default::default() };
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            match iei {
+                0x54 => {
+                    buf.advance(1);
+                    msg.tai_list = Some(EpsTaiList::decode(buf)?);
+                }
+                _ => break,
+            }
+        }
+        Ok(msg)
+    }
+}
+
+/// EMM Information message (TS 24.301 Section 8.2.13)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EmmInformation {
+    /// Full name for network
+    pub full_name_for_network: Option<Vec<u8>>,
+    /// Short name for network
+    pub short_name_for_network: Option<Vec<u8>>,
+    /// Local time zone
+    pub local_time_zone: Option<u8>,
+    /// Universal time and local time zone
+    pub universal_time_and_local_time_zone: Option<[u8; 7]>,
+    /// Network daylight saving time
+    pub network_daylight_saving_time: Option<u8>,
+}
+
+impl EmmInformation {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        if let Some(ref full_name) = self.full_name_for_network {
+            buf.put_u8(0x43); // IEI
+            buf.put_u8(full_name.len() as u8);
+            buf.put_slice(full_name);
+        }
+        if let Some(ref short_name) = self.short_name_for_network {
+            buf.put_u8(0x45); // IEI
+            buf.put_u8(short_name.len() as u8);
+            buf.put_slice(short_name);
+        }
+        if let Some(tz) = self.local_time_zone {
+            buf.put_u8(0x46); // IEI
+            buf.put_u8(tz);
+        }
+        if let Some(ref utltz) = self.universal_time_and_local_time_zone {
+            buf.put_u8(0x47); // IEI
+            buf.put_slice(utltz);
+        }
+        if let Some(dst) = self.network_daylight_saving_time {
+            buf.put_u8(0x49); // IEI
+            buf.put_u8(1); // Length
+            buf.put_u8(dst);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        let mut msg = Self::default();
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            match iei {
+                0x43 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 1 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len {
+                            msg.full_name_for_network = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
+                0x45 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 1 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len {
+                            msg.short_name_for_network = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
+                0x46 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 1 {
+                        msg.local_time_zone = Some(buf.get_u8());
+                    }
+                }
+                0x47 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 7 {
+                        let mut utltz = [0u8; 7];
+                        buf.copy_to_slice(&mut utltz);
+                        msg.universal_time_and_local_time_zone = Some(utltz);
+                    }
+                }
+                0x49 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 2 {
+                        let _len = buf.get_u8();
+                        msg.network_daylight_saving_time = Some(buf.get_u8());
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(msg)
+    }
+}
+
+/// EPS Downlink NAS Transport message (TS 24.301 Section 8.2.12)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EpsDownlinkNasTransport {
+    /// NAS message container
+    pub nas_message_container: Vec<u8>,
+}
+
+impl EpsDownlinkNasTransport {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.nas_message_container.len() as u8);
+        buf.put_slice(&self.nas_message_container);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let len = buf.get_u8() as usize;
+        if buf.remaining() < len {
+            return Err(NasError::BufferTooShort { expected: len, actual: buf.remaining() });
+        }
+        let nas_message_container = buf.copy_to_bytes(len).to_vec();
+        Ok(Self { nas_message_container })
+    }
+}
+
+/// EPS Uplink NAS Transport message (TS 24.301 Section 8.2.30)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EpsUplinkNasTransport {
+    /// NAS message container
+    pub nas_message_container: Vec<u8>,
+}
+
+impl EpsUplinkNasTransport {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.nas_message_container.len() as u8);
+        buf.put_slice(&self.nas_message_container);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let len = buf.get_u8() as usize;
+        if buf.remaining() < len {
+            return Err(NasError::BufferTooShort { expected: len, actual: buf.remaining() });
+        }
+        let nas_message_container = buf.copy_to_bytes(len).to_vec();
+        Ok(Self { nas_message_container })
+    }
+}
+
+/// CS Service Notification message (TS 24.301 Section 8.2.9)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CsServiceNotification {
+    /// Paging identity
+    pub paging_identity: u8,
+}
+
+impl CsServiceNotification {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.paging_identity);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        Ok(Self { paging_identity: buf.get_u8() })
+    }
+}
+
 /// ESM message
 #[derive(Debug, Clone, PartialEq)]
 pub enum EsmMessage {
@@ -784,6 +1134,14 @@ pub enum EsmMessage {
     BearerResourceAllocationReject(BearerResourceAllocationReject),
     BearerResourceModificationRequest(BearerResourceModificationRequest),
     BearerResourceModificationReject(BearerResourceModificationReject),
+    ActivateDedicatedEpsBearerContextRequest(ActivateDedicatedEpsBearerContextRequest),
+    ActivateDedicatedEpsBearerContextAccept,
+    ActivateDedicatedEpsBearerContextReject(ActivateDedicatedEpsBearerContextReject),
+    ModifyEpsBearerContextRequest(ModifyEpsBearerContextRequest),
+    ModifyEpsBearerContextAccept(ModifyEpsBearerContextAccept),
+    ModifyEpsBearerContextReject(ModifyEpsBearerContextReject),
+    DeactivateEpsBearerContextRequest(DeactivateEpsBearerContextRequest),
+    DeactivateEpsBearerContextAccept,
     EsmInformationRequest,
     EsmInformationResponse(EsmInformationResponse),
     EsmStatus(EsmStatus),
@@ -913,6 +1271,590 @@ pub struct EsmStatus {
     pub pti: u8,
 }
 
+impl PdnConnectivityRequest {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8((self.pdn_type << 4) | (self.request_type & 0x0F));
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let byte = buf.get_u8();
+        Ok(Self {
+            request_type: byte & 0x0F,
+            pdn_type: (byte >> 4) & 0x0F,
+            ..Default::default()
+        })
+    }
+}
+
+impl PdnConnectivityReject {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.esm_cause);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        Ok(Self { esm_cause: buf.get_u8(), ..Default::default() })
+    }
+}
+
+impl PdnDisconnectRequest {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.linked_eps_bearer_identity & 0x0F);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        Ok(Self { linked_eps_bearer_identity: buf.get_u8() & 0x0F, ..Default::default() })
+    }
+}
+
+impl PdnDisconnectReject {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.esm_cause);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        Ok(Self { esm_cause: buf.get_u8(), ..Default::default() })
+    }
+}
+
+impl ActivateDefaultEpsBearerContextRequest {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.eps_qos.len() as u8);
+        buf.put_slice(&self.eps_qos);
+        buf.put_u8(self.access_point_name.len() as u8);
+        buf.put_slice(&self.access_point_name);
+        buf.put_u8(self.pdn_address.len() as u8);
+        buf.put_slice(&self.pdn_address);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let qos_len = buf.get_u8() as usize;
+        if buf.remaining() < qos_len {
+            return Err(NasError::BufferTooShort { expected: qos_len, actual: buf.remaining() });
+        }
+        let eps_qos = buf.copy_to_bytes(qos_len).to_vec();
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let apn_len = buf.get_u8() as usize;
+        if buf.remaining() < apn_len {
+            return Err(NasError::BufferTooShort { expected: apn_len, actual: buf.remaining() });
+        }
+        let access_point_name = buf.copy_to_bytes(apn_len).to_vec();
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let addr_len = buf.get_u8() as usize;
+        if buf.remaining() < addr_len {
+            return Err(NasError::BufferTooShort { expected: addr_len, actual: buf.remaining() });
+        }
+        let pdn_address = buf.copy_to_bytes(addr_len).to_vec();
+        Ok(Self { eps_qos, access_point_name, pdn_address, ..Default::default() })
+    }
+}
+
+impl ActivateDefaultEpsBearerContextReject {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.esm_cause);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        Ok(Self { esm_cause: buf.get_u8(), ..Default::default() })
+    }
+}
+
+impl BearerResourceAllocationRequest {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.linked_eps_bearer_identity & 0x0F);
+        buf.put_u8(self.traffic_flow_aggregate.len() as u8);
+        buf.put_slice(&self.traffic_flow_aggregate);
+        buf.put_u8(self.required_traffic_flow_qos.len() as u8);
+        buf.put_slice(&self.required_traffic_flow_qos);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let linked = buf.get_u8() & 0x0F;
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let tfa_len = buf.get_u8() as usize;
+        if buf.remaining() < tfa_len {
+            return Err(NasError::BufferTooShort { expected: tfa_len, actual: buf.remaining() });
+        }
+        let tfa = buf.copy_to_bytes(tfa_len).to_vec();
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let qos_len = buf.get_u8() as usize;
+        if buf.remaining() < qos_len {
+            return Err(NasError::BufferTooShort { expected: qos_len, actual: buf.remaining() });
+        }
+        let qos = buf.copy_to_bytes(qos_len).to_vec();
+        Ok(Self { linked_eps_bearer_identity: linked, traffic_flow_aggregate: tfa, required_traffic_flow_qos: qos, ..Default::default() })
+    }
+}
+
+impl BearerResourceAllocationReject {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.esm_cause);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        Ok(Self { esm_cause: buf.get_u8(), ..Default::default() })
+    }
+}
+
+impl BearerResourceModificationRequest {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.eps_bearer_identity & 0x0F);
+        buf.put_u8(self.traffic_flow_aggregate.len() as u8);
+        buf.put_slice(&self.traffic_flow_aggregate);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let ebi = buf.get_u8() & 0x0F;
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let tfa_len = buf.get_u8() as usize;
+        if buf.remaining() < tfa_len {
+            return Err(NasError::BufferTooShort { expected: tfa_len, actual: buf.remaining() });
+        }
+        let tfa = buf.copy_to_bytes(tfa_len).to_vec();
+        Ok(Self { eps_bearer_identity: ebi, traffic_flow_aggregate: tfa, ..Default::default() })
+    }
+}
+
+impl BearerResourceModificationReject {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.esm_cause);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        Ok(Self { esm_cause: buf.get_u8(), ..Default::default() })
+    }
+}
+
+/// Activate Dedicated EPS Bearer Context Request message (TS 24.301 Section 8.3.3)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ActivateDedicatedEpsBearerContextRequest {
+    /// Linked EPS bearer identity
+    pub linked_eps_bearer_identity: u8,
+    /// EPS QoS
+    pub eps_qos: Vec<u8>,
+    /// TFT (Traffic Flow Template)
+    pub tft: Vec<u8>,
+}
+
+impl ActivateDedicatedEpsBearerContextRequest {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.linked_eps_bearer_identity & 0x0F);
+        buf.put_u8(self.eps_qos.len() as u8);
+        buf.put_slice(&self.eps_qos);
+        buf.put_u8(self.tft.len() as u8);
+        buf.put_slice(&self.tft);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let linked = buf.get_u8() & 0x0F;
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let qos_len = buf.get_u8() as usize;
+        if buf.remaining() < qos_len {
+            return Err(NasError::BufferTooShort { expected: qos_len, actual: buf.remaining() });
+        }
+        let eps_qos = buf.copy_to_bytes(qos_len).to_vec();
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let tft_len = buf.get_u8() as usize;
+        if buf.remaining() < tft_len {
+            return Err(NasError::BufferTooShort { expected: tft_len, actual: buf.remaining() });
+        }
+        let tft = buf.copy_to_bytes(tft_len).to_vec();
+        Ok(Self { linked_eps_bearer_identity: linked, eps_qos, tft })
+    }
+}
+
+/// Activate Dedicated EPS Bearer Context Reject message (TS 24.301 Section 8.3.4)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ActivateDedicatedEpsBearerContextReject {
+    /// ESM cause
+    pub esm_cause: u8,
+}
+
+impl ActivateDedicatedEpsBearerContextReject {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.esm_cause);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        Ok(Self { esm_cause: buf.get_u8() })
+    }
+}
+
+/// Modify EPS Bearer Context Request message (TS 24.301 Section 8.3.17)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ModifyEpsBearerContextRequest {
+    /// New EPS QoS
+    pub new_eps_qos: Option<Vec<u8>>,
+    /// TFT
+    pub tft: Option<Vec<u8>>,
+    /// New QoS
+    pub new_qos: Option<Vec<u8>>,
+}
+
+impl ModifyEpsBearerContextRequest {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        if let Some(ref qos) = self.new_eps_qos {
+            buf.put_u8(0x5B); // IEI
+            buf.put_u8(qos.len() as u8);
+            buf.put_slice(qos);
+        }
+        if let Some(ref tft) = self.tft {
+            buf.put_u8(0x36); // IEI
+            buf.put_u8(tft.len() as u8);
+            buf.put_slice(tft);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        let mut msg = Self::default();
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            match iei {
+                0x5B => {
+                    buf.advance(1);
+                    if buf.remaining() >= 1 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len {
+                            msg.new_eps_qos = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
+                0x36 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 1 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len {
+                            msg.tft = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(msg)
+    }
+}
+
+/// Modify EPS Bearer Context Accept message (TS 24.301 Section 8.3.18)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ModifyEpsBearerContextAccept {
+    /// Protocol configuration options
+    pub protocol_configuration_options: Option<Vec<u8>>,
+}
+
+impl ModifyEpsBearerContextAccept {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        if let Some(ref pco) = self.protocol_configuration_options {
+            buf.put_u8(0x27); // IEI
+            buf.put_u8(pco.len() as u8);
+            buf.put_slice(pco);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        let mut msg = Self::default();
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            match iei {
+                0x27 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 1 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len {
+                            msg.protocol_configuration_options = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(msg)
+    }
+}
+
+/// Modify EPS Bearer Context Reject message (TS 24.301 Section 8.3.19)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ModifyEpsBearerContextReject {
+    /// ESM cause
+    pub esm_cause: u8,
+}
+
+impl ModifyEpsBearerContextReject {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.esm_cause);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        Ok(Self { esm_cause: buf.get_u8() })
+    }
+}
+
+/// Deactivate EPS Bearer Context Request message (TS 24.301 Section 8.3.12)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DeactivateEpsBearerContextRequest {
+    /// ESM cause
+    pub esm_cause: u8,
+}
+
+impl DeactivateEpsBearerContextRequest {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.esm_cause);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        Ok(Self { esm_cause: buf.get_u8() })
+    }
+}
+
+impl EsmInformationResponse {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        if let Some(ref apn) = self.access_point_name {
+            buf.put_u8(0x28); // IEI
+            buf.put_u8(apn.len() as u8);
+            buf.put_slice(apn);
+        }
+        if let Some(ref pco) = self.protocol_configuration_options {
+            buf.put_u8(0x27); // IEI
+            buf.put_u8(pco.len() as u8);
+            buf.put_slice(pco);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        let mut msg = Self::default();
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            match iei {
+                0x28 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 1 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len {
+                            msg.access_point_name = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
+                0x27 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 1 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len {
+                            msg.protocol_configuration_options = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(msg)
+    }
+}
+
+impl EsmStatus {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.esm_cause);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        Ok(Self { esm_cause: buf.get_u8(), ..Default::default() })
+    }
+}
+
+/// Build an ESM message with header
+pub fn build_esm_message(eps_bearer_identity: u8, pti: u8, msg: &EsmMessage) -> BytesMut {
+    let mut buf = BytesMut::new();
+
+    let message_type = match msg {
+        EsmMessage::ActivateDefaultEpsBearerContextRequest(_) => EsmMessageType::ActivateDefaultEpsBearerContextRequest,
+        EsmMessage::ActivateDefaultEpsBearerContextAccept => EsmMessageType::ActivateDefaultEpsBearerContextAccept,
+        EsmMessage::ActivateDefaultEpsBearerContextReject(_) => EsmMessageType::ActivateDefaultEpsBearerContextReject,
+        EsmMessage::ActivateDedicatedEpsBearerContextRequest(_) => EsmMessageType::ActivateDedicatedEpsBearerContextRequest,
+        EsmMessage::ActivateDedicatedEpsBearerContextAccept => EsmMessageType::ActivateDedicatedEpsBearerContextAccept,
+        EsmMessage::ActivateDedicatedEpsBearerContextReject(_) => EsmMessageType::ActivateDedicatedEpsBearerContextReject,
+        EsmMessage::ModifyEpsBearerContextRequest(_) => EsmMessageType::ModifyEpsBearerContextRequest,
+        EsmMessage::ModifyEpsBearerContextAccept(_) => EsmMessageType::ModifyEpsBearerContextAccept,
+        EsmMessage::ModifyEpsBearerContextReject(_) => EsmMessageType::ModifyEpsBearerContextReject,
+        EsmMessage::DeactivateEpsBearerContextRequest(_) => EsmMessageType::DeactivateEpsBearerContextRequest,
+        EsmMessage::DeactivateEpsBearerContextAccept => EsmMessageType::DeactivateEpsBearerContextAccept,
+        EsmMessage::PdnConnectivityRequest(_) => EsmMessageType::PdnConnectivityRequest,
+        EsmMessage::PdnConnectivityReject(_) => EsmMessageType::PdnConnectivityReject,
+        EsmMessage::PdnDisconnectRequest(_) => EsmMessageType::PdnDisconnectRequest,
+        EsmMessage::PdnDisconnectReject(_) => EsmMessageType::PdnDisconnectReject,
+        EsmMessage::BearerResourceAllocationRequest(_) => EsmMessageType::BearerResourceAllocationRequest,
+        EsmMessage::BearerResourceAllocationReject(_) => EsmMessageType::BearerResourceAllocationReject,
+        EsmMessage::BearerResourceModificationRequest(_) => EsmMessageType::BearerResourceModificationRequest,
+        EsmMessage::BearerResourceModificationReject(_) => EsmMessageType::BearerResourceModificationReject,
+        EsmMessage::EsmInformationRequest => EsmMessageType::EsmInformationRequest,
+        EsmMessage::EsmInformationResponse(_) => EsmMessageType::EsmInformationResponse,
+        EsmMessage::EsmStatus(_) => EsmMessageType::EsmStatus,
+    };
+
+    let header = EpsNasEsmHeader::new(eps_bearer_identity, pti, message_type);
+    header.encode(&mut buf);
+
+    match msg {
+        EsmMessage::ActivateDefaultEpsBearerContextRequest(m) => m.encode(&mut buf),
+        EsmMessage::ActivateDefaultEpsBearerContextAccept => {}
+        EsmMessage::ActivateDefaultEpsBearerContextReject(m) => m.encode(&mut buf),
+        EsmMessage::ActivateDedicatedEpsBearerContextRequest(m) => m.encode(&mut buf),
+        EsmMessage::ActivateDedicatedEpsBearerContextAccept => {}
+        EsmMessage::ActivateDedicatedEpsBearerContextReject(m) => m.encode(&mut buf),
+        EsmMessage::ModifyEpsBearerContextRequest(m) => m.encode(&mut buf),
+        EsmMessage::ModifyEpsBearerContextAccept(m) => m.encode(&mut buf),
+        EsmMessage::ModifyEpsBearerContextReject(m) => m.encode(&mut buf),
+        EsmMessage::DeactivateEpsBearerContextRequest(m) => m.encode(&mut buf),
+        EsmMessage::DeactivateEpsBearerContextAccept => {}
+        EsmMessage::PdnConnectivityRequest(m) => m.encode(&mut buf),
+        EsmMessage::PdnConnectivityReject(m) => m.encode(&mut buf),
+        EsmMessage::PdnDisconnectRequest(m) => m.encode(&mut buf),
+        EsmMessage::PdnDisconnectReject(m) => m.encode(&mut buf),
+        EsmMessage::BearerResourceAllocationRequest(m) => m.encode(&mut buf),
+        EsmMessage::BearerResourceAllocationReject(m) => m.encode(&mut buf),
+        EsmMessage::BearerResourceModificationRequest(m) => m.encode(&mut buf),
+        EsmMessage::BearerResourceModificationReject(m) => m.encode(&mut buf),
+        EsmMessage::EsmInformationRequest => {}
+        EsmMessage::EsmInformationResponse(m) => m.encode(&mut buf),
+        EsmMessage::EsmStatus(m) => m.encode(&mut buf),
+    }
+
+    buf
+}
+
+/// Parse an ESM message
+pub fn parse_esm_message(buf: &mut Bytes) -> NasResult<(u8, u8, EsmMessage)> {
+    let header = EpsNasEsmHeader::decode(buf)?;
+    let message_type = EsmMessageType::try_from(header.message_type)?;
+
+    let msg = match message_type {
+        EsmMessageType::ActivateDefaultEpsBearerContextRequest => {
+            EsmMessage::ActivateDefaultEpsBearerContextRequest(ActivateDefaultEpsBearerContextRequest::decode(buf)?)
+        }
+        EsmMessageType::ActivateDefaultEpsBearerContextAccept => {
+            EsmMessage::ActivateDefaultEpsBearerContextAccept
+        }
+        EsmMessageType::ActivateDefaultEpsBearerContextReject => {
+            EsmMessage::ActivateDefaultEpsBearerContextReject(ActivateDefaultEpsBearerContextReject::decode(buf)?)
+        }
+        EsmMessageType::ActivateDedicatedEpsBearerContextRequest => {
+            EsmMessage::ActivateDedicatedEpsBearerContextRequest(ActivateDedicatedEpsBearerContextRequest::decode(buf)?)
+        }
+        EsmMessageType::ActivateDedicatedEpsBearerContextAccept => {
+            EsmMessage::ActivateDedicatedEpsBearerContextAccept
+        }
+        EsmMessageType::ActivateDedicatedEpsBearerContextReject => {
+            EsmMessage::ActivateDedicatedEpsBearerContextReject(ActivateDedicatedEpsBearerContextReject::decode(buf)?)
+        }
+        EsmMessageType::ModifyEpsBearerContextRequest => {
+            EsmMessage::ModifyEpsBearerContextRequest(ModifyEpsBearerContextRequest::decode(buf)?)
+        }
+        EsmMessageType::ModifyEpsBearerContextAccept => {
+            EsmMessage::ModifyEpsBearerContextAccept(ModifyEpsBearerContextAccept::decode(buf)?)
+        }
+        EsmMessageType::ModifyEpsBearerContextReject => {
+            EsmMessage::ModifyEpsBearerContextReject(ModifyEpsBearerContextReject::decode(buf)?)
+        }
+        EsmMessageType::DeactivateEpsBearerContextRequest => {
+            EsmMessage::DeactivateEpsBearerContextRequest(DeactivateEpsBearerContextRequest::decode(buf)?)
+        }
+        EsmMessageType::DeactivateEpsBearerContextAccept => {
+            EsmMessage::DeactivateEpsBearerContextAccept
+        }
+        EsmMessageType::PdnConnectivityRequest => {
+            EsmMessage::PdnConnectivityRequest(PdnConnectivityRequest::decode(buf)?)
+        }
+        EsmMessageType::PdnConnectivityReject => {
+            EsmMessage::PdnConnectivityReject(PdnConnectivityReject::decode(buf)?)
+        }
+        EsmMessageType::PdnDisconnectRequest => {
+            EsmMessage::PdnDisconnectRequest(PdnDisconnectRequest::decode(buf)?)
+        }
+        EsmMessageType::PdnDisconnectReject => {
+            EsmMessage::PdnDisconnectReject(PdnDisconnectReject::decode(buf)?)
+        }
+        EsmMessageType::BearerResourceAllocationRequest => {
+            EsmMessage::BearerResourceAllocationRequest(BearerResourceAllocationRequest::decode(buf)?)
+        }
+        EsmMessageType::BearerResourceAllocationReject => {
+            EsmMessage::BearerResourceAllocationReject(BearerResourceAllocationReject::decode(buf)?)
+        }
+        EsmMessageType::BearerResourceModificationRequest => {
+            EsmMessage::BearerResourceModificationRequest(BearerResourceModificationRequest::decode(buf)?)
+        }
+        EsmMessageType::BearerResourceModificationReject => {
+            EsmMessage::BearerResourceModificationReject(BearerResourceModificationReject::decode(buf)?)
+        }
+        EsmMessageType::EsmInformationRequest => {
+            EsmMessage::EsmInformationRequest
+        }
+        EsmMessageType::EsmInformationResponse => {
+            EsmMessage::EsmInformationResponse(EsmInformationResponse::decode(buf)?)
+        }
+        EsmMessageType::EsmStatus => {
+            EsmMessage::EsmStatus(EsmStatus::decode(buf)?)
+        }
+    };
+
+    Ok((header.eps_bearer_identity, header.procedure_transaction_identity, msg))
+}
+
 /// Build an EMM message with header
 pub fn build_emm_message(msg: &EmmMessage) -> BytesMut {
     let mut buf = BytesMut::new();
@@ -937,6 +1879,16 @@ pub fn build_emm_message(msg: &EmmMessage) -> BytesMut {
         EmmMessage::IdentityRequest(_) => EmmMessageType::IdentityRequest,
         EmmMessage::IdentityResponse(_) => EmmMessageType::IdentityResponse,
         EmmMessage::EmmStatus(_) => EmmMessageType::EmmStatus,
+        EmmMessage::ServiceRequest(_) => EmmMessageType::ExtendedServiceRequest, // Service Request uses security header, map to ExtendedServiceRequest
+        EmmMessage::ExtendedServiceRequest(_) => EmmMessageType::ExtendedServiceRequest,
+        EmmMessage::ServiceReject(_) => EmmMessageType::ServiceReject,
+        EmmMessage::GutiReallocationCommand(_) => EmmMessageType::GutiReallocationCommand,
+        EmmMessage::GutiReallocationComplete => EmmMessageType::GutiReallocationComplete,
+        EmmMessage::TrackingAreaUpdateComplete => EmmMessageType::TrackingAreaUpdateComplete,
+        EmmMessage::EmmInformation(_) => EmmMessageType::EmmInformation,
+        EmmMessage::DownlinkNasTransport(_) => EmmMessageType::DownlinkNasTransport,
+        EmmMessage::UplinkNasTransport(_) => EmmMessageType::UplinkNasTransport,
+        EmmMessage::CsServiceNotification(_) => EmmMessageType::CsServiceNotification,
     };
 
     // Encode header
@@ -964,6 +1916,16 @@ pub fn build_emm_message(msg: &EmmMessage) -> BytesMut {
         EmmMessage::IdentityRequest(m) => m.encode(&mut buf),
         EmmMessage::IdentityResponse(m) => m.encode(&mut buf),
         EmmMessage::EmmStatus(m) => m.encode(&mut buf),
+        EmmMessage::ServiceRequest(m) => m.encode(&mut buf),
+        EmmMessage::ExtendedServiceRequest(m) => m.encode(&mut buf),
+        EmmMessage::ServiceReject(m) => m.encode(&mut buf),
+        EmmMessage::GutiReallocationCommand(m) => m.encode(&mut buf),
+        EmmMessage::GutiReallocationComplete => {}
+        EmmMessage::TrackingAreaUpdateComplete => {}
+        EmmMessage::EmmInformation(m) => m.encode(&mut buf),
+        EmmMessage::DownlinkNasTransport(m) => m.encode(&mut buf),
+        EmmMessage::UplinkNasTransport(m) => m.encode(&mut buf),
+        EmmMessage::CsServiceNotification(m) => m.encode(&mut buf),
     }
 
     buf
@@ -1032,6 +1994,32 @@ pub fn parse_emm_message(buf: &mut Bytes) -> NasResult<EmmMessage> {
         EmmMessageType::EmmStatus => {
             Ok(EmmMessage::EmmStatus(EmmStatus::decode(buf)?))
         }
-        _ => Err(NasError::InvalidMessageType(header.message_type)),
+        EmmMessageType::ExtendedServiceRequest => {
+            Ok(EmmMessage::ExtendedServiceRequest(ExtendedServiceRequest::decode(buf)?))
+        }
+        EmmMessageType::ServiceReject => {
+            Ok(EmmMessage::ServiceReject(EpsServiceReject::decode(buf)?))
+        }
+        EmmMessageType::GutiReallocationCommand => {
+            Ok(EmmMessage::GutiReallocationCommand(GutiReallocationCommand::decode(buf)?))
+        }
+        EmmMessageType::GutiReallocationComplete => {
+            Ok(EmmMessage::GutiReallocationComplete)
+        }
+        EmmMessageType::TrackingAreaUpdateComplete => {
+            Ok(EmmMessage::TrackingAreaUpdateComplete)
+        }
+        EmmMessageType::EmmInformation => {
+            Ok(EmmMessage::EmmInformation(EmmInformation::decode(buf)?))
+        }
+        EmmMessageType::DownlinkNasTransport => {
+            Ok(EmmMessage::DownlinkNasTransport(EpsDownlinkNasTransport::decode(buf)?))
+        }
+        EmmMessageType::UplinkNasTransport => {
+            Ok(EmmMessage::UplinkNasTransport(EpsUplinkNasTransport::decode(buf)?))
+        }
+        EmmMessageType::CsServiceNotification => {
+            Ok(EmmMessage::CsServiceNotification(CsServiceNotification::decode(buf)?))
+        }
     }
 }

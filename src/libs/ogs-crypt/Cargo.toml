@@ -24,3 +24,6 @@ ml-dsa = "0.1.0-rc.7"
 [dev-dependencies]
 proptest.workspace = true
 hex-literal.workspace = true
+
+[lints]
+workspace = true

@@ -317,13 +317,13 @@ impl TimerManager {
     /// Stop all timers for UE
     pub fn stop_all_ue_timers(&mut self, amf_ue_id: u64) {
         self.active_timers.retain(|t| t.amf_ue_id != Some(amf_ue_id));
-        log::debug!("Stopped all timers for UE {}", amf_ue_id);
+        log::debug!("Stopped all timers for UE {amf_ue_id}");
     }
 
     /// Stop all timers for RAN UE
     pub fn stop_all_ran_ue_timers(&mut self, ran_ue_id: u64) {
         self.active_timers.retain(|t| t.ran_ue_id != Some(ran_ue_id));
-        log::debug!("Stopped all timers for RAN UE {}", ran_ue_id);
+        log::debug!("Stopped all timers for RAN UE {ran_ue_id}");
     }
 
     /// Get active timer count

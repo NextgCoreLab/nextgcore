@@ -20,8 +20,9 @@ use tokio_rustls::TlsConnector;
 
 use crate::error::{SbiError, SbiResult};
 use crate::message::{SbiRequest, SbiResponse};
+use crate::oauth::OAuth2Client;
 use crate::tls;
-use crate::types::UriScheme;
+use crate::types::{NfType, UriScheme};
 
 /// Default connection timeout in seconds
 const DEFAULT_CONNECT_TIMEOUT: u64 = 5;
@@ -119,6 +120,10 @@ pub struct SbiClient {
     config: SbiClientConfig,
     /// Connection state (lazily initialized)
     connection: Arc<Mutex<Option<ConnectionState>>>,
+    /// OAuth2 client for automatic token attachment (W1.23)
+    oauth2: Option<Arc<OAuth2Client>>,
+    /// Target NF type for OAuth2 scope resolution
+    target_nf_type: Option<NfType>,
 }
 
 impl SbiClient {
@@ -127,12 +132,24 @@ impl SbiClient {
         Self {
             config,
             connection: Arc::new(Mutex::new(None)),
+            oauth2: None,
+            target_nf_type: None,
         }
     }
 
     /// Create a client with host and port
     pub fn with_host_port(host: impl Into<String>, port: u16) -> Self {
         Self::new(SbiClientConfig::new(host, port))
+    }
+
+    /// Attach an OAuth2 client for automatic Bearer token attachment (W1.23).
+    ///
+    /// When set, the client will request a token from the NRF before each
+    /// SBI request that does not already carry an Authorization header.
+    pub fn with_oauth2(mut self, oauth2: Arc<OAuth2Client>, target_nf_type: NfType) -> Self {
+        self.oauth2 = Some(oauth2);
+        self.target_nf_type = Some(target_nf_type);
+        self
     }
 
     /// Get the client configuration
@@ -242,7 +259,26 @@ impl SbiClient {
     }
 
     /// Send an SBI request and receive a response
-    pub async fn send_request(&self, request: SbiRequest) -> SbiResult<SbiResponse> {
+    pub async fn send_request(&self, mut request: SbiRequest) -> SbiResult<SbiResponse> {
+        // W1.23: Automatically attach Bearer token if OAuth2 is configured
+        // and the request does not already carry an Authorization header
+        if let (Some(oauth2), Some(target_nf_type)) = (&self.oauth2, &self.target_nf_type) {
+            if request.http.get_header("Authorization").is_none() {
+                // Derive scope from the request URI service name
+                let scope = derive_scope_from_uri(&request.header.uri);
+                if !scope.is_empty() {
+                    match oauth2.authorization_header(*target_nf_type, &scope).await {
+                        Ok(auth_value) => {
+                            request.http.set_header("Authorization", auth_value);
+                        }
+                        Err(e) => {
+                            log::warn!("OAuth2 token request failed, sending without token: {e}");
+                        }
+                    }
+                }
+            }
+        }
+
         let mut sender = self.get_connection().await?;
 
         // Build the URI
@@ -403,6 +439,20 @@ impl SbiClient {
 /// Client callback type for async responses
 pub type ClientCallback = Box<dyn Fn(SbiResult<SbiResponse>) + Send + Sync>;
 
+/// Derive the OAuth2 scope from the request URI.
+///
+/// The scope is the SBI service name, extracted from the first path component.
+/// For example, `/nsmf-pdusession/v1/sm-contexts` yields `nsmf-pdusession`.
+fn derive_scope_from_uri(uri: &str) -> String {
+    let path = uri.split('?').next().unwrap_or(uri);
+    let trimmed = path.trim_start_matches('/');
+    trimmed
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,5 +474,23 @@ mod tests {
         let client = SbiClient::with_host_port("127.0.0.1", 7777);
         assert_eq!(client.config().host, "127.0.0.1");
         assert_eq!(client.config().port, 7777);
+    }
+
+    #[test]
+    fn test_derive_scope_from_uri() {
+        assert_eq!(
+            derive_scope_from_uri("/nsmf-pdusession/v1/sm-contexts"),
+            "nsmf-pdusession"
+        );
+        assert_eq!(
+            derive_scope_from_uri("/nudm-uecm/v1/imsi-123/registrations/amf-3gpp-access"),
+            "nudm-uecm"
+        );
+        assert_eq!(derive_scope_from_uri("/"), "");
+        assert_eq!(derive_scope_from_uri(""), "");
+        assert_eq!(
+            derive_scope_from_uri("/nbsf-management/v1/pcfBindings?ipv4Addr=10.0.0.1"),
+            "nbsf-management"
+        );
     }
 }

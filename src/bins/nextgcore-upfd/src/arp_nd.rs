@@ -360,8 +360,8 @@ fn calculate_icmpv6_checksum(
 
     // Pseudo-header: upper-layer packet length
     let len = icmpv6_data.len() as u32;
-    sum += (len >> 16) as u32;
-    sum += (len & 0xFFFF) as u32;
+    sum += len >> 16;
+    sum += len & 0xFFFF;
 
     // Pseudo-header: next header (ICMPv6 = 58)
     sum += IPV6_NEXT_HEADER_ICMPV6 as u32;

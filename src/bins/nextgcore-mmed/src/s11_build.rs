@@ -210,8 +210,8 @@ impl std::fmt::Display for S11BuildError {
             Self::InvalidSession => write!(f, "Invalid session"),
             Self::InvalidUe => write!(f, "Invalid UE"),
             Self::InvalidBearer => write!(f, "Invalid bearer"),
-            Self::MissingRequiredField(field) => write!(f, "Missing required field: {}", field),
-            Self::BuildFailed(msg) => write!(f, "Build failed: {}", msg),
+            Self::MissingRequiredField(field) => write!(f, "Missing required field: {field}"),
+            Self::BuildFailed(msg) => write!(f, "Build failed: {msg}"),
         }
     }
 }
@@ -323,6 +323,17 @@ impl GtpBuffer {
         self.write_ie_header(ie_type::EBI, 1, instance);
         self.write_u8(ebi & 0x0f);
     }
+
+    /// Write a complete IE (header + data)
+    pub fn write_ie(&mut self, ie_type: u8, instance: u8, data: &[u8]) {
+        self.write_ie_header(ie_type, data.len() as u16, instance);
+        self.write_bytes(data);
+    }
+
+    /// Finalize message length in the GTP header
+    pub fn finalize_length(&mut self) {
+        self.update_length();
+    }
 }
 
 impl Default for GtpBuffer {
@@ -355,70 +366,234 @@ pub fn build_echo_response(seq_num: u32, recovery: u8) -> Vec<u8> {
 
 /// Build Create Session Request
 pub fn build_create_session_request(
-    _sess: &MmeSess,
-    _mme_ue: &MmeUe,
-    _sgw_ue: &SgwUe,
+    sess: &MmeSess,
+    mme_ue: &MmeUe,
+    sgw_ue: &SgwUe,
     _create_action: GtpCreateAction,
 ) -> S11BuildResult<Vec<u8>> {
-    log::debug!("Build Create Session Request");
-    // Placeholder - actual implementation would build full message
-    Ok(Vec::new())
+    log::debug!("Build Create Session Request for APN={}", sess.apn);
+    let mut buf = GtpBuffer::new();
+    buf.write_gtp_header_with_teid(
+        message_type::CREATE_SESSION_REQUEST,
+        sgw_ue.sgw_s11_teid,
+        0,
+    );
+
+    // IE: IMSI (1) - mandatory
+    buf.write_ie(ie_type::IMSI, 0, &mme_ue.imsi[..mme_ue.imsi_len]);
+
+    // IE: MSISDN (76) - conditional
+    if mme_ue.msisdn_len > 0 {
+        buf.write_ie(ie_type::MSISDN, 0, &mme_ue.msisdn[..mme_ue.msisdn_len]);
+    }
+
+    // IE: MEI (75) - conditional
+    if mme_ue.imeisv_len > 0 {
+        buf.write_ie(ie_type::MEI, 0, &mme_ue.imeisv[..mme_ue.imeisv_len]);
+    }
+
+    // IE: RAT Type (82) - mandatory (E-UTRAN = 6)
+    buf.write_ie(ie_type::RAT_TYPE, 0, &[6]);
+
+    // IE: APN (71) - mandatory (DNS format)
+    let apn_bytes = encode_apn_dns(&sess.apn);
+    buf.write_ie(ie_type::APN, 0, &apn_bytes);
+
+    // IE: Selection Mode (80)
+    buf.write_ie(ie_type::SELECTION_MODE, 0, &[0]);
+
+    // IE: PDN Type (99) - mandatory
+    buf.write_ie(ie_type::PDN_TYPE, 0, &[sess.ue_request_pdn_type as u8]);
+
+    // IE: APN-AMBR (72) - mandatory
+    let mut ambr_data = Vec::new();
+    ambr_data.extend_from_slice(&(sess.ambr.uplink as u32).to_be_bytes());
+    ambr_data.extend_from_slice(&(sess.ambr.downlink as u32).to_be_bytes());
+    buf.write_ie(ie_type::AMBR, 0, &ambr_data);
+
+    buf.finalize_length();
+    Ok(buf.into_vec())
 }
 
 /// Build Modify Bearer Request
 pub fn build_modify_bearer_request(
     _mme_ue: &MmeUe,
-    _sgw_ue: &SgwUe,
-    _bearers: &[&MmeBearer],
+    sgw_ue: &SgwUe,
+    bearers: &[&MmeBearer],
     _uli_presence: bool,
 ) -> S11BuildResult<Vec<u8>> {
-    log::debug!("Build Modify Bearer Request");
-    Ok(Vec::new())
+    log::debug!("Build Modify Bearer Request with {} bearers", bearers.len());
+    let mut buf = GtpBuffer::new();
+    buf.write_gtp_header_with_teid(
+        message_type::MODIFY_BEARER_REQUEST,
+        sgw_ue.sgw_s11_teid,
+        0,
+    );
+
+    // IE: Bearer Context to be modified (93, instance 0) for each bearer
+    for bearer in bearers {
+        let mut bearer_ctx = GtpBuffer::new();
+        // Sub-IE: EBI
+        bearer_ctx.write_ie(ie_type::EBI, 0, &[bearer.ebi]);
+        // Sub-IE: S1-U eNB F-TEID (interface type 0 = S1-U eNB)
+        let mut fteid = Vec::new();
+        fteid.push(0x80); // V4 flag | interface type 0
+        fteid.extend_from_slice(&bearer.enb_s1u_teid.to_be_bytes());
+        if let Some(ipv4) = bearer.enb_s1u_ip.ipv4 {
+            fteid.extend_from_slice(&ipv4);
+        }
+        bearer_ctx.write_ie(ie_type::F_TEID, 0, &fteid);
+
+        buf.write_ie(ie_type::BEARER_CONTEXT, 0, bearer_ctx.data());
+    }
+
+    // IE: RAT Type (82) - E-UTRAN = 6
+    buf.write_ie(ie_type::RAT_TYPE, 0, &[6]);
+
+    buf.finalize_length();
+    Ok(buf.into_vec())
 }
 
 /// Build Delete Session Request
 pub fn build_delete_session_request(
     _sess: &MmeSess,
     _mme_ue: &MmeUe,
-    _sgw_ue: &SgwUe,
-    _default_bearer_ebi: u8,
+    sgw_ue: &SgwUe,
+    default_bearer_ebi: u8,
     _action: GtpDeleteAction,
 ) -> S11BuildResult<Vec<u8>> {
-    log::debug!("Build Delete Session Request");
-    Ok(Vec::new())
+    log::debug!("Build Delete Session Request for EBI={default_bearer_ebi}");
+    let mut buf = GtpBuffer::new();
+    buf.write_gtp_header_with_teid(
+        message_type::DELETE_SESSION_REQUEST,
+        sgw_ue.sgw_s11_teid,
+        0,
+    );
+
+    // IE: EBI (73) - mandatory (Linked EPS Bearer ID)
+    buf.write_ie(ie_type::EBI, 0, &[default_bearer_ebi]);
+
+    // IE: Indication Flags (77)
+    buf.write_ie(ie_type::INDICATION, 0, &[0x00, 0x08, 0x00]); // OI flag
+
+    buf.finalize_length();
+    Ok(buf.into_vec())
 }
 
 /// Build Create Bearer Response
 pub fn build_create_bearer_response(
-    _bearer: &MmeBearer,
-    _mme_ue: &MmeUe,
-    _sgw_ue: &SgwUe,
-    _cause_value: GtpCause,
+    bearer: &MmeBearer,
+    mme_ue: &MmeUe,
+    sgw_ue: &SgwUe,
+    cause_value: GtpCause,
 ) -> S11BuildResult<Vec<u8>> {
-    log::debug!("Build Create Bearer Response");
-    Ok(Vec::new())
+    log::debug!("Build Create Bearer Response for EBI={}", bearer.ebi);
+    let mut buf = GtpBuffer::new();
+    buf.write_gtp_header_with_teid(
+        message_type::CREATE_BEARER_RESPONSE,
+        sgw_ue.sgw_s11_teid,
+        0,
+    );
+
+    // IE: Cause (2)
+    buf.write_cause(cause_value, 0);
+
+    // Bearer Context (93, instance 0)
+    let mut bearer_ctx = GtpBuffer::new();
+    // Sub-IE: EBI
+    bearer_ctx.write_ie(ie_type::EBI, 0, &[bearer.ebi]);
+    // Sub-IE: Cause
+    bearer_ctx.write_ie(ie_type::CAUSE, 0, &[cause_value as u8, 0]);
+    // Sub-IE: S1-U eNB F-TEID (if accepted)
+    if cause_value as u8 == GtpCause::RequestAccepted as u8 {
+        let mut fteid = Vec::new();
+        fteid.push(0x80); // V4 flag | interface type 0 (S1-U eNB)
+        fteid.extend_from_slice(&bearer.enb_s1u_teid.to_be_bytes());
+        if let Some(ipv4) = bearer.enb_s1u_ip.ipv4 {
+            fteid.extend_from_slice(&ipv4);
+        }
+        bearer_ctx.write_ie(ie_type::F_TEID, 0, &fteid);
+    }
+    buf.write_ie(ie_type::BEARER_CONTEXT, 0, bearer_ctx.data());
+
+    // IE: ULI (86) - User Location Information
+    {
+        let mut uli = Vec::new();
+        // Flags: TAI=0x08, ECGI=0x10
+        uli.push(0x08 | 0x10);
+        // TAI: PLMN (3 bytes BCD) + TAC (2 bytes)
+        let tai_plmn = &mme_ue.tai.plmn_id;
+        uli.push((tai_plmn.mcc2 << 4) | tai_plmn.mcc1);
+        uli.push((tai_plmn.mnc3 << 4) | tai_plmn.mcc3);
+        uli.push((tai_plmn.mnc2 << 4) | tai_plmn.mnc1);
+        uli.extend_from_slice(&mme_ue.tai.tac.to_be_bytes());
+        // ECGI: PLMN (3 bytes BCD) + Cell ID (4 bytes, 28-bit)
+        let ecgi_plmn = &mme_ue.e_cgi.plmn_id;
+        uli.push((ecgi_plmn.mcc2 << 4) | ecgi_plmn.mcc1);
+        uli.push((ecgi_plmn.mnc3 << 4) | ecgi_plmn.mcc3);
+        uli.push((ecgi_plmn.mnc2 << 4) | ecgi_plmn.mnc1);
+        uli.extend_from_slice(&mme_ue.e_cgi.cell_id.to_be_bytes());
+        buf.write_ie(ie_type::ULI, 0, &uli);
+    }
+
+    buf.finalize_length();
+    Ok(buf.into_vec())
 }
 
 /// Build Update Bearer Response
 pub fn build_update_bearer_response(
-    _bearer: &MmeBearer,
+    bearer: &MmeBearer,
     _mme_ue: &MmeUe,
-    _sgw_ue: &SgwUe,
-    _cause_value: GtpCause,
+    sgw_ue: &SgwUe,
+    cause_value: GtpCause,
 ) -> S11BuildResult<Vec<u8>> {
-    log::debug!("Build Update Bearer Response");
-    Ok(Vec::new())
+    log::debug!("Build Update Bearer Response for EBI={}", bearer.ebi);
+    let mut buf = GtpBuffer::new();
+    buf.write_gtp_header_with_teid(
+        message_type::UPDATE_BEARER_RESPONSE,
+        sgw_ue.sgw_s11_teid,
+        0,
+    );
+
+    // IE: Cause (2)
+    buf.write_cause(cause_value, 0);
+
+    // Bearer Context (93, instance 0)
+    let mut bearer_ctx = GtpBuffer::new();
+    bearer_ctx.write_ie(ie_type::EBI, 0, &[bearer.ebi]);
+    bearer_ctx.write_ie(ie_type::CAUSE, 0, &[cause_value as u8, 0]);
+    buf.write_ie(ie_type::BEARER_CONTEXT, 0, bearer_ctx.data());
+
+    buf.finalize_length();
+    Ok(buf.into_vec())
 }
 
 /// Build Delete Bearer Response
 pub fn build_delete_bearer_response(
-    _bearer: &MmeBearer,
+    bearer: &MmeBearer,
     _mme_ue: &MmeUe,
-    _sgw_ue: &SgwUe,
-    _cause_value: GtpCause,
+    sgw_ue: &SgwUe,
+    cause_value: GtpCause,
 ) -> S11BuildResult<Vec<u8>> {
-    log::debug!("Build Delete Bearer Response");
-    Ok(Vec::new())
+    log::debug!("Build Delete Bearer Response for EBI={}", bearer.ebi);
+    let mut buf = GtpBuffer::new();
+    buf.write_gtp_header_with_teid(
+        message_type::DELETE_BEARER_RESPONSE,
+        sgw_ue.sgw_s11_teid,
+        0,
+    );
+
+    // IE: Cause (2)
+    buf.write_cause(cause_value, 0);
+
+    // Bearer Context (93, instance 0)
+    let mut bearer_ctx = GtpBuffer::new();
+    bearer_ctx.write_ie(ie_type::EBI, 0, &[bearer.ebi]);
+    bearer_ctx.write_ie(ie_type::CAUSE, 0, &[cause_value as u8, 0]);
+    buf.write_ie(ie_type::BEARER_CONTEXT, 0, bearer_ctx.data());
+
+    buf.finalize_length();
+    Ok(buf.into_vec())
 }
 
 /// Build Release Access Bearers Request
@@ -441,30 +616,138 @@ pub fn build_downlink_data_notification_ack(teid: u32, seq_num: u32, cause: GtpC
 /// Build Create Indirect Data Forwarding Tunnel Request
 pub fn build_create_indirect_data_forwarding_tunnel_request(
     _mme_ue: &MmeUe,
-    _sgw_ue: &SgwUe,
-    _bearers: &[&MmeBearer],
+    sgw_ue: &SgwUe,
+    bearers: &[&MmeBearer],
 ) -> S11BuildResult<Vec<u8>> {
-    log::debug!("Build Create Indirect Data Forwarding Tunnel Request");
-    Ok(Vec::new())
+    log::debug!(
+        "Build Create Indirect Data Forwarding Tunnel Request with {} bearers",
+        bearers.len()
+    );
+    let mut buf = GtpBuffer::new();
+    buf.write_gtp_header_with_teid(
+        message_type::CREATE_INDIRECT_DATA_FORWARDING_TUNNEL_REQUEST,
+        sgw_ue.sgw_s11_teid,
+        0,
+    );
+
+    // Bearer Contexts for each bearer
+    for bearer in bearers {
+        let mut bearer_ctx = GtpBuffer::new();
+        // Sub-IE: EBI
+        bearer_ctx.write_ie(ie_type::EBI, 0, &[bearer.ebi]);
+
+        // Sub-IE: S1-U eNB F-TEID for DL data forwarding
+        if bearer.enb_s1u_teid != 0 {
+            let mut fteid = Vec::new();
+            fteid.push(0x80 | 4); // V4 | interface type 4 (S1-U eNB for DL data forwarding)
+            fteid.extend_from_slice(&bearer.enb_s1u_teid.to_be_bytes());
+            if let Some(ipv4) = bearer.enb_s1u_ip.ipv4 {
+                fteid.extend_from_slice(&ipv4);
+            }
+            bearer_ctx.write_ie(ie_type::F_TEID, 0, &fteid);
+        }
+
+        buf.write_ie(ie_type::BEARER_CONTEXT, 0, bearer_ctx.data());
+    }
+
+    buf.finalize_length();
+    Ok(buf.into_vec())
 }
 
 /// Build Bearer Resource Command
 pub fn build_bearer_resource_command(
     _bearer: &MmeBearer,
     _mme_ue: &MmeUe,
-    _sgw_ue: &SgwUe,
-    _linked_bearer_ebi: u8,
-    _pti: u8,
-    _tad: &[u8],
-    _qos: Option<&Gtp2BearerQos>,
+    sgw_ue: &SgwUe,
+    linked_bearer_ebi: u8,
+    pti: u8,
+    tad: &[u8],
+    qos: Option<&Gtp2BearerQos>,
 ) -> S11BuildResult<Vec<u8>> {
-    log::debug!("Build Bearer Resource Command");
-    Ok(Vec::new())
+    log::debug!("Build Bearer Resource Command, linked EBI={linked_bearer_ebi}");
+    let mut buf = GtpBuffer::new();
+    buf.write_gtp_header_with_teid(
+        message_type::BEARER_RESOURCE_COMMAND,
+        sgw_ue.sgw_s11_teid,
+        0,
+    );
+
+    // IE: Linked EPS Bearer ID (73, instance 0)
+    buf.write_ie(ie_type::EBI, 0, &[linked_bearer_ebi]);
+
+    // IE: Procedure Transaction Id (100)
+    buf.write_ie(ie_type::PTI, 0, &[pti]);
+
+    // IE: TAD (85) - Traffic Aggregate Description
+    if !tad.is_empty() {
+        buf.write_ie(ie_type::TAD, 0, tad);
+    }
+
+    // IE: Flow QoS (81) - optional
+    if let Some(q) = qos {
+        let mut qos_data = Vec::with_capacity(22);
+        // ARP: PEC(2bits) | PL(4bits) | PEV(1bit) | spare(1bit)
+        let arp_byte = (q.pre_emption_capability << 6)
+            | (q.priority_level << 2)
+            | q.pre_emption_vulnerability;
+        qos_data.push(arp_byte);
+        qos_data.push(q.qci);
+        // MBR UL (5 bytes)
+        let mbr_ul_kbps = q.ul_mbr / 1000;
+        qos_data.extend_from_slice(&[
+            ((mbr_ul_kbps >> 32) & 0xff) as u8,
+            ((mbr_ul_kbps >> 24) & 0xff) as u8,
+            ((mbr_ul_kbps >> 16) & 0xff) as u8,
+            ((mbr_ul_kbps >> 8) & 0xff) as u8,
+            (mbr_ul_kbps & 0xff) as u8,
+        ]);
+        // MBR DL (5 bytes)
+        let mbr_dl_kbps = q.dl_mbr / 1000;
+        qos_data.extend_from_slice(&[
+            ((mbr_dl_kbps >> 32) & 0xff) as u8,
+            ((mbr_dl_kbps >> 24) & 0xff) as u8,
+            ((mbr_dl_kbps >> 16) & 0xff) as u8,
+            ((mbr_dl_kbps >> 8) & 0xff) as u8,
+            (mbr_dl_kbps & 0xff) as u8,
+        ]);
+        // GBR UL (5 bytes)
+        let gbr_ul_kbps = q.ul_gbr / 1000;
+        qos_data.extend_from_slice(&[
+            ((gbr_ul_kbps >> 32) & 0xff) as u8,
+            ((gbr_ul_kbps >> 24) & 0xff) as u8,
+            ((gbr_ul_kbps >> 16) & 0xff) as u8,
+            ((gbr_ul_kbps >> 8) & 0xff) as u8,
+            (gbr_ul_kbps & 0xff) as u8,
+        ]);
+        // GBR DL (5 bytes)
+        let gbr_dl_kbps = q.dl_gbr / 1000;
+        qos_data.extend_from_slice(&[
+            ((gbr_dl_kbps >> 32) & 0xff) as u8,
+            ((gbr_dl_kbps >> 24) & 0xff) as u8,
+            ((gbr_dl_kbps >> 16) & 0xff) as u8,
+            ((gbr_dl_kbps >> 8) & 0xff) as u8,
+            (gbr_dl_kbps & 0xff) as u8,
+        ]);
+        buf.write_ie(ie_type::FLOW_QOS, 0, &qos_data);
+    }
+
+    buf.finalize_length();
+    Ok(buf.into_vec())
 }
 
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// Encode APN to DNS wire format (label-length prefix per TS 23.003)
+fn encode_apn_dns(apn: &str) -> Vec<u8> {
+    let mut result = Vec::new();
+    for label in apn.split('.') {
+        result.push(label.len() as u8);
+        result.extend_from_slice(label.as_bytes());
+    }
+    result
+}
 
 #[cfg(test)]
 mod tests {

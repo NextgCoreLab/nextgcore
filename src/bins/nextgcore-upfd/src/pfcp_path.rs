@@ -6,7 +6,9 @@ use crate::n4_build::{
     build_association_setup_response, build_heartbeat_response,
     build_session_deletion_response, build_session_establishment_response,
     build_session_modification_response, build_session_report_request,
-    parse_create_far, parse_create_pdr, pfcp_ie, pfcp_type, CreatedPdr, FSeid, FTeid, NodeId,
+    parse_create_far, parse_create_pdr, parse_create_qer, parse_create_urr,
+    pfcp_ie, pfcp_type, CreatedPdr, FSeid, FTeid, NodeId,
+    ParsedCreateFar, ParsedCreatePdr, ParsedCreateQer, ParsedCreateUrr,
     ParsedFSeid, ParsedIe, ParsedPfcpHeader, PfcpCause, UserPlaneReport,
 };
 use std::collections::HashMap;
@@ -355,7 +357,7 @@ pub fn pfcp_open(ctx: &mut PfcpPathContext, local_addr: SocketAddr) -> Result<()
         .map(|d| d.as_secs() as u32)
         .unwrap_or(0);
 
-    log::info!("PFCP path opened on {}", local_addr);
+    log::info!("PFCP path opened on {local_addr}");
     Ok(())
 }
 
@@ -387,6 +389,14 @@ pub enum PfcpSessionEvent {
         dl_teid: u32,
         /// gNB address for downlink
         gnb_addr: Option<Ipv4Addr>,
+        /// Parsed PDR rules from PFCP
+        pdrs: Vec<ParsedCreatePdr>,
+        /// Parsed FAR rules from PFCP
+        fars: Vec<ParsedCreateFar>,
+        /// Parsed QER rules from PFCP
+        qers: Vec<ParsedCreateQer>,
+        /// Parsed URR rules from PFCP
+        urrs: Vec<ParsedCreateUrr>,
     },
     /// Session modified - update forwarding rules
     SessionModified {
@@ -395,6 +405,10 @@ pub enum PfcpSessionEvent {
         dl_teid: Option<u32>,
         /// Updated gNB address
         gnb_addr: Option<Ipv4Addr>,
+        /// Updated FAR rules
+        updated_fars: Vec<ParsedCreateFar>,
+        /// Updated QERs
+        updated_qers: Vec<ParsedCreateQer>,
     },
     /// Session deleted - remove forwarding rules
     SessionDeleted {
@@ -442,7 +456,7 @@ impl PfcpServer {
         session_tx: mpsc::Sender<PfcpSessionEvent>,
     ) -> Result<Self, std::io::Error> {
         let socket = UdpSocket::bind(local_addr).await?;
-        log::info!("PFCP server bound to {}", local_addr);
+        log::info!("PFCP server bound to {local_addr}");
 
         let local_node_id = match local_addr {
             SocketAddr::V4(addr) => NodeId::Ipv4(*addr.ip()),
@@ -498,14 +512,14 @@ impl PfcpServer {
             match recv_result {
                 Ok(Ok((len, src_addr))) => {
                     let data = &buf[..len];
-                    log::debug!("PFCP received {} bytes from {}", len, src_addr);
+                    log::debug!("PFCP received {len} bytes from {src_addr}");
 
                     if let Err(e) = self.handle_message(data, src_addr).await {
-                        log::error!("PFCP message handling error: {}", e);
+                        log::error!("PFCP message handling error: {e}");
                     }
                 }
                 Ok(Err(e)) => {
-                    log::error!("PFCP socket error: {}", e);
+                    log::error!("PFCP socket error: {e}");
                 }
                 Err(_) => {
                     // Timeout - continue loop
@@ -561,7 +575,7 @@ impl PfcpServer {
         header: &ParsedPfcpHeader,
         src_addr: SocketAddr,
     ) -> Result<(), String> {
-        log::debug!("Handling Heartbeat Request from {}", src_addr);
+        log::debug!("Handling Heartbeat Request from {src_addr}");
 
         let payload = build_heartbeat_response(self.recovery_time_stamp);
         let response = self.build_response(
@@ -575,9 +589,9 @@ impl PfcpServer {
         self.socket
             .send_to(&response, src_addr)
             .await
-            .map_err(|e| format!("Send error: {}", e))?;
+            .map_err(|e| format!("Send error: {e}"))?;
 
-        log::debug!("Sent Heartbeat Response to {}", src_addr);
+        log::debug!("Sent Heartbeat Response to {src_addr}");
         Ok(())
     }
 
@@ -588,7 +602,7 @@ impl PfcpServer {
         payload: &[u8],
         src_addr: SocketAddr,
     ) -> Result<(), String> {
-        log::info!("Handling Association Setup Request from {}", src_addr);
+        log::info!("Handling Association Setup Request from {src_addr}");
 
         // Parse Node ID from request
         let ies = ParsedIe::parse_all(payload);
@@ -613,9 +627,9 @@ impl PfcpServer {
         self.socket
             .send_to(&response, src_addr)
             .await
-            .map_err(|e| format!("Send error: {}", e))?;
+            .map_err(|e| format!("Send error: {e}"))?;
 
-        log::info!("PFCP Association established with {}", src_addr);
+        log::info!("PFCP Association established with {src_addr}");
         Ok(())
     }
 
@@ -626,7 +640,7 @@ impl PfcpServer {
         payload: &[u8],
         src_addr: SocketAddr,
     ) -> Result<(), String> {
-        log::info!("Handling Session Establishment Request from {}", src_addr);
+        log::info!("Handling Session Establishment Request from {src_addr}");
 
         let ies = ParsedIe::parse_all(payload);
 
@@ -641,21 +655,25 @@ impl PfcpServer {
 
         // Allocate UPF SEID
         let upf_seid = self.alloc_seid();
-        log::debug!("Allocated UPF SEID: {:#x}", upf_seid);
+        log::debug!("Allocated UPF SEID: {upf_seid:#x}");
 
         // Parse Create PDRs
         let mut ue_ipv4: Option<Ipv4Addr> = None;
         let mut ul_teid: u32 = 0;
         let mut created_pdrs = Vec::new();
+        let mut parsed_pdrs = Vec::new();
 
         for pdr_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::CREATE_PDR) {
             match parse_create_pdr(&pdr_ie.value) {
                 Ok(pdr) => {
                     log::debug!(
-                        "PDR {}: src_if={}, precedence={}",
+                        "PDR {}: src_if={}, precedence={}, far_id={:?}, qer_id={:?}, urr_ids={:?}",
                         pdr.pdr_id,
                         pdr.pdi.source_interface,
-                        pdr.precedence
+                        pdr.precedence,
+                        pdr.far_id,
+                        pdr.qer_id,
+                        pdr.urr_ids,
                     );
 
                     // Check if this PDR needs a local F-TEID (uplink PDR)
@@ -663,7 +681,7 @@ impl PfcpServer {
                         if fteid.ch {
                             // CHOOSE flag - allocate TEID
                             ul_teid = self.alloc_teid();
-                            log::debug!("Allocated uplink TEID: {:#x}", ul_teid);
+                            log::debug!("Allocated uplink TEID: {ul_teid:#x}");
                             Some(FTeid {
                                 teid: ul_teid,
                                 ipv4: match &self.local_node_id {
@@ -686,7 +704,7 @@ impl PfcpServer {
                     if let Some(ref ue_ip) = pdr.pdi.ue_ip_address {
                         if let Some(addr) = ue_ip.ipv4 {
                             ue_ipv4 = Some(addr);
-                            log::debug!("UE IPv4: {}", addr);
+                            log::debug!("UE IPv4: {addr}");
                         }
                     }
 
@@ -695,16 +713,18 @@ impl PfcpServer {
                         local_f_teid,
                         ue_ip_address: None,
                     });
+                    parsed_pdrs.push(pdr);
                 }
                 Err(e) => {
-                    log::warn!("Failed to parse PDR: {}", e);
+                    log::warn!("Failed to parse PDR: {e}");
                 }
             }
         }
 
-        // Parse Create FARs to get downlink info
+        // Parse Create FARs
         let mut dl_teid: u32 = 0;
         let mut gnb_addr: Option<Ipv4Addr> = None;
+        let mut parsed_fars = Vec::new();
 
         for far_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::CREATE_FAR) {
             match parse_create_far(&far_ie.value) {
@@ -715,12 +735,47 @@ impl PfcpServer {
                         if let Some(ref ohc) = fp.outer_header_creation {
                             dl_teid = ohc.teid;
                             gnb_addr = ohc.ipv4;
-                            log::debug!("Downlink: TEID={:#x}, gNB={:?}", dl_teid, gnb_addr);
+                            log::debug!("Downlink: TEID={dl_teid:#x}, gNB={gnb_addr:?}");
                         }
                     }
+                    parsed_fars.push(far);
                 }
                 Err(e) => {
-                    log::warn!("Failed to parse FAR: {}", e);
+                    log::warn!("Failed to parse FAR: {e}");
+                }
+            }
+        }
+
+        // Parse Create QERs
+        let mut parsed_qers = Vec::new();
+        for qer_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::CREATE_QER) {
+            match parse_create_qer(&qer_ie.value) {
+                Ok(qer) => {
+                    log::debug!(
+                        "QER {}: ul_gate={}, dl_gate={}, ul_mbr={}, dl_mbr={}, qfi={:?}",
+                        qer.qer_id, qer.ul_gate, qer.dl_gate, qer.ul_mbr, qer.dl_mbr, qer.qfi
+                    );
+                    parsed_qers.push(qer);
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse QER: {e}");
+                }
+            }
+        }
+
+        // Parse Create URRs
+        let mut parsed_urrs = Vec::new();
+        for urr_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::CREATE_URR) {
+            match parse_create_urr(&urr_ie.value) {
+                Ok(urr) => {
+                    log::debug!(
+                        "URR {}: vol_thresh={:?}, time_thresh={:?}",
+                        urr.urr_id, urr.volume_threshold_total, urr.time_threshold_secs
+                    );
+                    parsed_urrs.push(urr);
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse URR: {e}");
                 }
             }
         }
@@ -754,7 +809,7 @@ impl PfcpServer {
         self.socket
             .send_to(&response, src_addr)
             .await
-            .map_err(|e| format!("Send error: {}", e))?;
+            .map_err(|e| format!("Send error: {e}"))?;
 
         // Store session info
         let session_info = PfcpSessionInfo {
@@ -772,7 +827,7 @@ impl PfcpServer {
             sessions.insert(upf_seid, session_info.clone());
         }
 
-        // Notify data plane
+        // Notify data plane with full rule set
         let event = PfcpSessionEvent::SessionEstablished {
             upf_seid,
             smf_seid,
@@ -780,19 +835,18 @@ impl PfcpServer {
             ul_teid,
             dl_teid,
             gnb_addr,
+            pdrs: parsed_pdrs,
+            fars: parsed_fars,
+            qers: parsed_qers,
+            urrs: parsed_urrs,
         };
 
         if let Err(e) = self.session_tx.send(event).await {
-            log::error!("Failed to send session event: {}", e);
+            log::error!("Failed to send session event: {e}");
         }
 
         log::info!(
-            "Session established: UPF_SEID={:#x}, SMF_SEID={:#x}, UE_IP={:?}, UL_TEID={:#x}, DL_TEID={:#x}",
-            upf_seid,
-            smf_seid,
-            ue_ipv4,
-            ul_teid,
-            dl_teid
+            "Session established: UPF_SEID={upf_seid:#x}, SMF_SEID={smf_seid:#x}, UE_IP={ue_ipv4:?}, UL_TEID={ul_teid:#x}, DL_TEID={dl_teid:#x}"
         );
 
         Ok(())
@@ -807,8 +861,7 @@ impl PfcpServer {
     ) -> Result<(), String> {
         let upf_seid = header.seid;
         log::info!(
-            "Handling Session Modification Request for SEID {:#x}",
-            upf_seid
+            "Handling Session Modification Request for SEID {upf_seid:#x}"
         );
 
         let ies = ParsedIe::parse_all(payload);
@@ -816,6 +869,7 @@ impl PfcpServer {
         // Parse Update FARs
         let mut updated_dl_teid: Option<u32> = None;
         let mut updated_gnb_addr: Option<Ipv4Addr> = None;
+        let mut mod_fars = Vec::new();
 
         // Update FAR IE type = 10
         for far_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::UPDATE_FAR) {
@@ -833,9 +887,24 @@ impl PfcpServer {
                             );
                         }
                     }
+                    mod_fars.push(far);
                 }
                 Err(e) => {
-                    log::warn!("Failed to parse Update FAR: {}", e);
+                    log::warn!("Failed to parse Update FAR: {e}");
+                }
+            }
+        }
+
+        // Parse Update QERs (IE type 14)
+        let mut mod_qers = Vec::new();
+        for qer_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::UPDATE_QER) {
+            match parse_create_qer(&qer_ie.value) {
+                Ok(qer) => {
+                    log::debug!("Update QER {}: qfi={:?}", qer.qer_id, qer.qfi);
+                    mod_qers.push(qer);
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse Update QER: {e}");
                 }
             }
         }
@@ -852,7 +921,7 @@ impl PfcpServer {
                 }
                 session.smf_seid
             } else {
-                return Err(format!("Session {:#x} not found", upf_seid));
+                return Err(format!("Session {upf_seid:#x} not found"));
             }
         };
 
@@ -873,22 +942,29 @@ impl PfcpServer {
         self.socket
             .send_to(&response, src_addr)
             .await
-            .map_err(|e| format!("Send error: {}", e))?;
+            .map_err(|e| format!("Send error: {e}"))?;
 
         // Notify data plane
-        if updated_dl_teid.is_some() || updated_gnb_addr.is_some() {
+        let has_changes = updated_dl_teid.is_some()
+            || updated_gnb_addr.is_some()
+            || !mod_fars.is_empty()
+            || !mod_qers.is_empty();
+
+        if has_changes {
             let event = PfcpSessionEvent::SessionModified {
                 upf_seid,
                 dl_teid: updated_dl_teid,
                 gnb_addr: updated_gnb_addr,
+                updated_fars: mod_fars,
+                updated_qers: mod_qers,
             };
 
             if let Err(e) = self.session_tx.send(event).await {
-                log::error!("Failed to send session event: {}", e);
+                log::error!("Failed to send session event: {e}");
             }
         }
 
-        log::info!("Session {:#x} modified", upf_seid);
+        log::info!("Session {upf_seid:#x} modified");
         Ok(())
     }
 
@@ -900,7 +976,7 @@ impl PfcpServer {
         src_addr: SocketAddr,
     ) -> Result<(), String> {
         let upf_seid = header.seid;
-        log::info!("Handling Session Deletion Request for SEID {:#x}", upf_seid);
+        log::info!("Handling Session Deletion Request for SEID {upf_seid:#x}");
 
         // Remove session
         let session_info = {
@@ -931,16 +1007,100 @@ impl PfcpServer {
         self.socket
             .send_to(&response, src_addr)
             .await
-            .map_err(|e| format!("Send error: {}", e))?;
+            .map_err(|e| format!("Send error: {e}"))?;
 
         // Notify data plane
         let event = PfcpSessionEvent::SessionDeleted { upf_seid, ue_ipv4 };
 
         if let Err(e) = self.session_tx.send(event).await {
-            log::error!("Failed to send session event: {}", e);
+            log::error!("Failed to send session event: {e}");
         }
 
-        log::info!("Session {:#x} deleted", upf_seid);
+        log::info!("Session {upf_seid:#x} deleted");
+        Ok(())
+    }
+
+    /// Send a PFCP Session Report Request for URR usage reports.
+    /// Called by the URR threshold check task when thresholds are exceeded.
+    pub async fn send_urr_report(
+        &self,
+        upf_seid: u64,
+        smf_seid: u64,
+        reports: Vec<crate::data_plane::UrrReportEntry>,
+    ) -> Result<(), String> {
+        // Look up the SMF address from the session
+        let smf_addr = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(&upf_seid)
+                .map(|s| s.smf_addr)
+        };
+
+        let smf_addr = match smf_addr {
+            Some(addr) => addr,
+            None => {
+                return Err(format!("Session {upf_seid:#x} not found for URR report"));
+            }
+        };
+
+        // Build usage reports
+        let usage_reports: Vec<crate::n4_build::UsageReport> = reports
+            .iter()
+            .map(|r| {
+                let mut trigger = crate::n4_build::UsageReportTrigger::default();
+                trigger.volume_threshold = true;
+
+                crate::n4_build::UsageReport {
+                    urr_id: r.urr_id,
+                    ur_seqn: 1,
+                    trigger,
+                    volume_measurement: Some(crate::n4_build::VolumeMeasurement {
+                        total_volume: Some(r.total_bytes),
+                        uplink_volume: Some(r.ul_bytes),
+                        downlink_volume: Some(r.dl_bytes),
+                        total_packets: Some(r.total_pkts),
+                        uplink_packets: Some(r.ul_pkts),
+                        downlink_packets: Some(r.dl_pkts),
+                    }),
+                    ..Default::default()
+                }
+            })
+            .collect();
+
+        let user_plane_report = UserPlaneReport {
+            report_type: crate::n4_build::ReportType {
+                usage_report: true,
+                ..Default::default()
+            },
+            usage_reports,
+            ..Default::default()
+        };
+
+        let payload = build_session_report_request(
+            pfcp_type::SESSION_REPORT_REQUEST,
+            &user_plane_report,
+        );
+
+        // Use a simple sequence number (atomic counter)
+        let seq = self.next_teid.fetch_add(1, Ordering::SeqCst); // reuse counter for seq
+
+        let message = self.build_response(
+            pfcp_type::SESSION_REPORT_REQUEST,
+            smf_seid,
+            seq,
+            &payload,
+            true,
+        );
+
+        self.socket
+            .send_to(&message, smf_addr)
+            .await
+            .map_err(|e| format!("Failed to send Session Report Request: {e}"))?;
+
+        log::info!(
+            "Sent Session Report Request to {smf_addr} for SEID={upf_seid:#x} ({} URR reports)",
+            reports.len()
+        );
         Ok(())
     }
 

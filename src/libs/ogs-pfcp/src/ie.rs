@@ -467,6 +467,378 @@ pub fn encode_bytes_ie(buf: &mut BytesMut, ie_type: IeType, data: &[u8]) {
     buf.put_slice(data);
 }
 
+// ============================================================================
+// Structured PFCP IE Encoders/Decoders
+// ============================================================================
+
+/// VolumeMeasurement (IE 66) - Measurement of uplink/downlink/total volume
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VolumeMeasurement {
+    pub total_volume: Option<u64>,
+    pub uplink_volume: Option<u64>,
+    pub downlink_volume: Option<u64>,
+    pub total_packets: Option<u64>,
+    pub uplink_packets: Option<u64>,
+    pub downlink_packets: Option<u64>,
+}
+
+impl VolumeMeasurement {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        let mut flags = 0u8;
+        if self.total_volume.is_some() { flags |= 0x01; }
+        if self.uplink_volume.is_some() { flags |= 0x02; }
+        if self.downlink_volume.is_some() { flags |= 0x04; }
+        if self.total_packets.is_some() { flags |= 0x08; }
+        if self.uplink_packets.is_some() { flags |= 0x10; }
+        if self.downlink_packets.is_some() { flags |= 0x20; }
+
+        buf.put_u8(flags);
+        if let Some(v) = self.total_volume { buf.put_u64(v); }
+        if let Some(v) = self.uplink_volume { buf.put_u64(v); }
+        if let Some(v) = self.downlink_volume { buf.put_u64(v); }
+        if let Some(v) = self.total_packets { buf.put_u64(v); }
+        if let Some(v) = self.uplink_packets { buf.put_u64(v); }
+        if let Some(v) = self.downlink_packets { buf.put_u64(v); }
+
+        buf.freeze()
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        if data.is_empty() {
+            return Err(PfcpError::BufferTooShort { needed: 1, available: 0 });
+        }
+        let mut buf = Bytes::copy_from_slice(data);
+        let flags = buf.get_u8();
+        let mut vm = VolumeMeasurement::default();
+
+        if flags & 0x01 != 0 { vm.total_volume = Some(buf.get_u64()); }
+        if flags & 0x02 != 0 { vm.uplink_volume = Some(buf.get_u64()); }
+        if flags & 0x04 != 0 { vm.downlink_volume = Some(buf.get_u64()); }
+        if flags & 0x08 != 0 { vm.total_packets = Some(buf.get_u64()); }
+        if flags & 0x10 != 0 { vm.uplink_packets = Some(buf.get_u64()); }
+        if flags & 0x20 != 0 { vm.downlink_packets = Some(buf.get_u64()); }
+
+        Ok(vm)
+    }
+}
+
+/// DurationMeasurement (IE 67) - Duration in seconds
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurationMeasurement(pub u32);
+
+impl DurationMeasurement {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        buf.put_u32(self.0);
+        buf.freeze()
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        if data.len() < 4 {
+            return Err(PfcpError::BufferTooShort { needed: 4, available: data.len() });
+        }
+        let mut buf = Bytes::copy_from_slice(data);
+        Ok(DurationMeasurement(buf.get_u32()))
+    }
+}
+
+/// VolumeThreshold (IE 31) - Volume thresholds
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VolumeThreshold {
+    pub total_volume: Option<u64>,
+    pub uplink_volume: Option<u64>,
+    pub downlink_volume: Option<u64>,
+}
+
+impl VolumeThreshold {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        let mut flags = 0u8;
+        if self.total_volume.is_some() { flags |= 0x01; }
+        if self.uplink_volume.is_some() { flags |= 0x02; }
+        if self.downlink_volume.is_some() { flags |= 0x04; }
+
+        buf.put_u8(flags);
+        if let Some(v) = self.total_volume { buf.put_u64(v); }
+        if let Some(v) = self.uplink_volume { buf.put_u64(v); }
+        if let Some(v) = self.downlink_volume { buf.put_u64(v); }
+
+        buf.freeze()
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        if data.is_empty() {
+            return Err(PfcpError::BufferTooShort { needed: 1, available: 0 });
+        }
+        let mut buf = Bytes::copy_from_slice(data);
+        let flags = buf.get_u8();
+        let mut vt = VolumeThreshold::default();
+
+        if flags & 0x01 != 0 { vt.total_volume = Some(buf.get_u64()); }
+        if flags & 0x02 != 0 { vt.uplink_volume = Some(buf.get_u64()); }
+        if flags & 0x04 != 0 { vt.downlink_volume = Some(buf.get_u64()); }
+
+        Ok(vt)
+    }
+}
+
+/// ReportingTriggers (IE 37) - Bitmap of reporting triggers
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportingTriggers {
+    pub periodic_reporting: bool,
+    pub volume_threshold: bool,
+    pub time_threshold: bool,
+    pub quota_holding_time: bool,
+    pub start_of_traffic: bool,
+    pub stop_of_traffic: bool,
+    pub dropped_dl_traffic_threshold: bool,
+    pub linked_usage_reporting: bool,
+}
+
+impl ReportingTriggers {
+    pub fn encode(&self) -> Bytes {
+        let mut flags = 0u16;
+        if self.periodic_reporting { flags |= 0x0001; }
+        if self.volume_threshold { flags |= 0x0002; }
+        if self.time_threshold { flags |= 0x0004; }
+        if self.quota_holding_time { flags |= 0x0008; }
+        if self.start_of_traffic { flags |= 0x0010; }
+        if self.stop_of_traffic { flags |= 0x0020; }
+        if self.dropped_dl_traffic_threshold { flags |= 0x0040; }
+        if self.linked_usage_reporting { flags |= 0x0080; }
+
+        let mut buf = BytesMut::new();
+        buf.put_u16(flags);
+        buf.freeze()
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        if data.len() < 2 {
+            return Err(PfcpError::BufferTooShort { needed: 2, available: data.len() });
+        }
+        let mut buf = Bytes::copy_from_slice(data);
+        let flags = buf.get_u16();
+
+        Ok(ReportingTriggers {
+            periodic_reporting: flags & 0x0001 != 0,
+            volume_threshold: flags & 0x0002 != 0,
+            time_threshold: flags & 0x0004 != 0,
+            quota_holding_time: flags & 0x0008 != 0,
+            start_of_traffic: flags & 0x0010 != 0,
+            stop_of_traffic: flags & 0x0020 != 0,
+            dropped_dl_traffic_threshold: flags & 0x0040 != 0,
+            linked_usage_reporting: flags & 0x0080 != 0,
+        })
+    }
+}
+
+/// ReportType (IE 39) - Type of usage report
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportType {
+    pub downlink_data_report: bool,
+    pub usage_report: bool,
+    pub error_indication_report: bool,
+}
+
+impl ReportType {
+    pub fn encode(&self) -> Bytes {
+        let mut flags = 0u8;
+        if self.downlink_data_report { flags |= 0x01; }
+        if self.usage_report { flags |= 0x02; }
+        if self.error_indication_report { flags |= 0x04; }
+
+        Bytes::copy_from_slice(&[flags])
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        if data.is_empty() {
+            return Err(PfcpError::BufferTooShort { needed: 1, available: 0 });
+        }
+        let flags = data[0];
+
+        Ok(ReportType {
+            downlink_data_report: flags & 0x01 != 0,
+            usage_report: flags & 0x02 != 0,
+            error_indication_report: flags & 0x04 != 0,
+        })
+    }
+}
+
+/// UsageReportTrigger (IE 63) - Trigger for usage report
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageReportTrigger {
+    pub immediate_report: bool,
+    pub volume_threshold: bool,
+    pub time_threshold: bool,
+    pub periodic_reporting: bool,
+    pub event_threshold: bool,
+}
+
+impl UsageReportTrigger {
+    pub fn encode(&self) -> Bytes {
+        let mut flags = 0u16;
+        if self.immediate_report { flags |= 0x0001; }
+        if self.volume_threshold { flags |= 0x0002; }
+        if self.time_threshold { flags |= 0x0004; }
+        if self.periodic_reporting { flags |= 0x0008; }
+        if self.event_threshold { flags |= 0x0010; }
+
+        let mut buf = BytesMut::new();
+        buf.put_u16(flags);
+        buf.freeze()
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        if data.len() < 2 {
+            return Err(PfcpError::BufferTooShort { needed: 2, available: data.len() });
+        }
+        let mut buf = Bytes::copy_from_slice(data);
+        let flags = buf.get_u16();
+
+        Ok(UsageReportTrigger {
+            immediate_report: flags & 0x0001 != 0,
+            volume_threshold: flags & 0x0002 != 0,
+            time_threshold: flags & 0x0004 != 0,
+            periodic_reporting: flags & 0x0008 != 0,
+            event_threshold: flags & 0x0010 != 0,
+        })
+    }
+}
+
+/// PacketRate (IE 94) - UL/DL packet rate limits
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PacketRate {
+    pub uplink_time_unit: Option<u8>,
+    pub max_uplink_packet_rate: Option<u16>,
+    pub downlink_time_unit: Option<u8>,
+    pub max_downlink_packet_rate: Option<u16>,
+}
+
+impl PacketRate {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        let mut flags = 0u8;
+        if self.uplink_time_unit.is_some() { flags |= 0x01; }
+        if self.downlink_time_unit.is_some() { flags |= 0x02; }
+
+        buf.put_u8(flags);
+        if let Some(unit) = self.uplink_time_unit {
+            buf.put_u8(unit);
+            buf.put_u16(self.max_uplink_packet_rate.unwrap_or(0));
+        }
+        if let Some(unit) = self.downlink_time_unit {
+            buf.put_u8(unit);
+            buf.put_u16(self.max_downlink_packet_rate.unwrap_or(0));
+        }
+
+        buf.freeze()
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        if data.is_empty() {
+            return Err(PfcpError::BufferTooShort { needed: 1, available: 0 });
+        }
+        let mut buf = Bytes::copy_from_slice(data);
+        let flags = buf.get_u8();
+        let mut pr = PacketRate::default();
+
+        if flags & 0x01 != 0 {
+            pr.uplink_time_unit = Some(buf.get_u8());
+            pr.max_uplink_packet_rate = Some(buf.get_u16());
+        }
+        if flags & 0x02 != 0 {
+            pr.downlink_time_unit = Some(buf.get_u8());
+            pr.max_downlink_packet_rate = Some(buf.get_u16());
+        }
+
+        Ok(pr)
+    }
+}
+
+/// QerControlIndications (IE 251) - QER control indications
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QerControlIndications {
+    pub rcsr: bool, // Rate Control Status Reporting
+}
+
+impl QerControlIndications {
+    pub fn encode(&self) -> Bytes {
+        let flags = if self.rcsr { 0x01 } else { 0x00 };
+        Bytes::copy_from_slice(&[flags])
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        if data.is_empty() {
+            return Err(PfcpError::BufferTooShort { needed: 1, available: 0 });
+        }
+        Ok(QerControlIndications {
+            rcsr: data[0] & 0x01 != 0,
+        })
+    }
+}
+
+/// MeasurementMethod (IE 62) - Method used for measurement
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeasurementMethod {
+    pub duration: bool,
+    pub volume: bool,
+    pub event: bool,
+}
+
+impl MeasurementMethod {
+    pub fn encode(&self) -> Bytes {
+        let mut flags = 0u8;
+        if self.duration { flags |= 0x01; }
+        if self.volume { flags |= 0x02; }
+        if self.event { flags |= 0x04; }
+        Bytes::copy_from_slice(&[flags])
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        if data.is_empty() {
+            return Err(PfcpError::BufferTooShort { needed: 1, available: 0 });
+        }
+        Ok(MeasurementMethod {
+            duration: data[0] & 0x01 != 0,
+            volume: data[0] & 0x02 != 0,
+            event: data[0] & 0x04 != 0,
+        })
+    }
+}
+
+/// MeasurementInformation (IE 100) - Information about measurements
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeasurementInformation {
+    pub mbqe: bool,  // Measurement Before QoS Enforcement
+    pub inam: bool,  // Inactive Measurement
+    pub radi: bool,  // Reduced Application Detection Information
+    pub istm: bool,  // Immediate Start Time Metering
+}
+
+impl MeasurementInformation {
+    pub fn encode(&self) -> Bytes {
+        let mut flags = 0u8;
+        if self.mbqe { flags |= 0x01; }
+        if self.inam { flags |= 0x02; }
+        if self.radi { flags |= 0x04; }
+        if self.istm { flags |= 0x08; }
+        Bytes::copy_from_slice(&[flags])
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        if data.is_empty() {
+            return Err(PfcpError::BufferTooShort { needed: 1, available: 0 });
+        }
+        Ok(MeasurementInformation {
+            mbqe: data[0] & 0x01 != 0,
+            inam: data[0] & 0x02 != 0,
+            radi: data[0] & 0x04 != 0,
+            istm: data[0] & 0x08 != 0,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,10 +848,10 @@ mod tests {
         let header = IeHeader::new(IeType::Cause as u16, 1);
         let mut buf = BytesMut::new();
         header.encode(&mut buf);
-        
+
         let mut bytes = buf.freeze();
         let decoded = IeHeader::decode(&mut bytes).unwrap();
-        
+
         assert_eq!(decoded.ie_type, IeType::Cause as u16);
         assert_eq!(decoded.length, 1);
     }
@@ -489,11 +861,43 @@ mod tests {
         let ie = RawIe::new(IeType::Cause as u16, Bytes::from_static(&[0x01]));
         let mut buf = BytesMut::new();
         ie.encode(&mut buf);
-        
+
         let mut bytes = buf.freeze();
         let decoded = RawIe::decode(&mut bytes).unwrap();
-        
+
         assert_eq!(decoded.ie_type, IeType::Cause as u16);
         assert_eq!(decoded.data.as_ref(), &[0x01]);
+    }
+
+    #[test]
+    fn test_volume_measurement_roundtrip() {
+        let vm = VolumeMeasurement {
+            total_volume: Some(1000),
+            uplink_volume: Some(400),
+            downlink_volume: Some(600),
+            total_packets: None,
+            uplink_packets: None,
+            downlink_packets: None,
+        };
+        let encoded = vm.encode();
+        let decoded = VolumeMeasurement::decode(&encoded).unwrap();
+        assert_eq!(vm, decoded);
+    }
+
+    #[test]
+    fn test_reporting_triggers_roundtrip() {
+        let rt = ReportingTriggers {
+            periodic_reporting: true,
+            volume_threshold: true,
+            time_threshold: false,
+            quota_holding_time: false,
+            start_of_traffic: true,
+            stop_of_traffic: false,
+            dropped_dl_traffic_threshold: false,
+            linked_usage_reporting: false,
+        };
+        let encoded = rt.encode();
+        let decoded = ReportingTriggers::decode(&encoded).unwrap();
+        assert_eq!(rt, decoded);
     }
 }

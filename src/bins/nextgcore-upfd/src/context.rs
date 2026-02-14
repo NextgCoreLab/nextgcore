@@ -159,15 +159,9 @@ impl RouteTrie {
             let bit = (addr[word_idx] >> bit_pos) & 1;
             
             if bit == 0 {
-                if node.left.is_none() {
-                    node.left = Some(Box::new(RouteTrie::new()));
-                }
-                node = node.left.as_mut().unwrap();
+                node = node.left.get_or_insert_with(|| Box::new(RouteTrie::new()));
             } else {
-                if node.right.is_none() {
-                    node.right = Some(Box::new(RouteTrie::new()));
-                }
-                node = node.right.as_mut().unwrap();
+                node = node.right.get_or_insert_with(|| Box::new(RouteTrie::new()));
             }
         }
         node.sess_id = Some(sess_id);
@@ -244,6 +238,7 @@ impl RouteTrie {
 /// URR (Usage Reporting Rule) accounting data
 /// Port of upf_sess_urr_acc_t from context.h
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct UrrAccounting {
     /// Reporting enabled
     pub reporting_enabled: bool,
@@ -269,6 +264,37 @@ pub struct UrrAccounting {
     pub time_start: Option<Instant>,
     /// Last report snapshot
     pub last_report: UrrAccountingSnapshot,
+    /// Per-QoS-flow accounting (QFI -> flow accounting)
+    pub qos_flow_acc: HashMap<u8, QosFlowAccounting>,
+    /// Combined threshold: volume (bytes) + time (seconds)
+    pub volume_threshold: Option<u64>,
+    /// Time threshold in seconds
+    pub time_threshold_secs: Option<u64>,
+    /// Volume quota remaining (bytes); when 0, traffic is blocked
+    pub volume_quota: Option<u64>,
+    /// Time quota remaining (seconds)
+    pub time_quota_secs: Option<u64>,
+    /// Whether this URR has triggered (threshold exceeded)
+    pub triggered: bool,
+}
+
+/// Per-QoS-flow accounting (Rel-18 enhanced usage reporting)
+#[derive(Debug, Clone, Default)]
+pub struct QosFlowAccounting {
+    /// QoS Flow Identifier
+    pub qfi: u8,
+    /// Total octets for this flow
+    pub total_octets: u64,
+    /// Uplink octets
+    pub ul_octets: u64,
+    /// Downlink octets
+    pub dl_octets: u64,
+    /// Total packets
+    pub total_pkts: u64,
+    /// Time of first packet
+    pub time_of_first_packet: Option<Instant>,
+    /// Time of last packet
+    pub time_of_last_packet: Option<Instant>,
 }
 
 /// Snapshot of URR accounting for last report
@@ -283,38 +309,37 @@ pub struct UrrAccountingSnapshot {
     pub timestamp: Option<Instant>,
 }
 
-impl Default for UrrAccounting {
-    fn default() -> Self {
-        Self {
-            reporting_enabled: false,
-            report_seqn: 0,
-            total_octets: 0,
-            ul_octets: 0,
-            dl_octets: 0,
-            total_pkts: 0,
-            ul_pkts: 0,
-            dl_pkts: 0,
-            time_of_first_packet: None,
-            time_of_last_packet: None,
-            time_start: None,
-            last_report: UrrAccountingSnapshot::default(),
-        }
-    }
+/// Reason for a usage report trigger
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UrrTriggerReason {
+    /// Volume threshold exceeded
+    VolumeThreshold,
+    /// Time threshold exceeded
+    TimeThreshold,
+    /// Volume quota exhausted
+    VolumeQuotaExhausted,
+    /// Time quota exhausted
+    TimeQuotaExhausted,
+    /// Periodic reporting
+    Periodic,
+    /// Immediate report requested
+    ImmediateReport,
 }
+
 
 impl UrrAccounting {
     /// Add traffic to accounting
     pub fn add(&mut self, size: usize, is_uplink: bool) {
         let now = Instant::now();
-        
+
         if self.time_of_first_packet.is_none() {
             self.time_of_first_packet = Some(now);
         }
         self.time_of_last_packet = Some(now);
-        
+
         self.total_octets += size as u64;
         self.total_pkts += 1;
-        
+
         if is_uplink {
             self.ul_octets += size as u64;
             self.ul_pkts += 1;
@@ -322,6 +347,92 @@ impl UrrAccounting {
             self.dl_octets += size as u64;
             self.dl_pkts += 1;
         }
+    }
+
+    /// Add traffic with QoS flow identifier (Rel-18 per-QoS-flow accounting)
+    pub fn add_with_qfi(&mut self, size: usize, is_uplink: bool, qfi: u8) {
+        self.add(size, is_uplink);
+
+        let now = Instant::now();
+        let flow = self.qos_flow_acc.entry(qfi).or_insert_with(|| QosFlowAccounting {
+            qfi,
+            ..Default::default()
+        });
+        flow.total_octets += size as u64;
+        flow.total_pkts += 1;
+        if is_uplink {
+            flow.ul_octets += size as u64;
+        } else {
+            flow.dl_octets += size as u64;
+        }
+        if flow.time_of_first_packet.is_none() {
+            flow.time_of_first_packet = Some(now);
+        }
+        flow.time_of_last_packet = Some(now);
+    }
+
+    /// Consume volume quota. Returns false if quota exhausted.
+    pub fn consume_quota(&mut self, size: usize) -> bool {
+        if let Some(ref mut quota) = self.volume_quota {
+            let bytes = size as u64;
+            if *quota >= bytes {
+                *quota -= bytes;
+                true
+            } else {
+                *quota = 0;
+                self.triggered = true;
+                false
+            }
+        } else {
+            true // no quota configured
+        }
+    }
+
+    /// Check if any threshold is exceeded and return the reason.
+    pub fn check_thresholds(&mut self) -> Option<UrrTriggerReason> {
+        // Volume threshold
+        if let Some(thresh) = self.volume_threshold {
+            let (delta, _, _) = self.delta_since_last_report();
+            if delta >= thresh {
+                self.triggered = true;
+                return Some(UrrTriggerReason::VolumeThreshold);
+            }
+        }
+        // Time threshold
+        if let Some(thresh_secs) = self.time_threshold_secs {
+            if let Some(start) = self.time_start {
+                let elapsed = start.elapsed().as_secs();
+                if elapsed >= thresh_secs {
+                    self.triggered = true;
+                    return Some(UrrTriggerReason::TimeThreshold);
+                }
+            }
+        }
+        // Volume quota exhausted
+        if let Some(quota) = self.volume_quota {
+            if quota == 0 {
+                self.triggered = true;
+                return Some(UrrTriggerReason::VolumeQuotaExhausted);
+            }
+        }
+        // Time quota exhausted
+        if let (Some(tq), Some(start)) = (self.time_quota_secs, self.time_start) {
+            if start.elapsed().as_secs() >= tq {
+                self.triggered = true;
+                return Some(UrrTriggerReason::TimeQuotaExhausted);
+            }
+        }
+        None
+    }
+
+    /// Get per-QoS-flow accounting for a specific QFI
+    pub fn flow_accounting(&self, qfi: u8) -> Option<&QosFlowAccounting> {
+        self.qos_flow_acc.get(&qfi)
+    }
+
+    /// Number of tracked QoS flows
+    pub fn tracked_flow_count(&self) -> usize {
+        self.qos_flow_acc.len()
     }
 
     /// Take a snapshot for reporting
@@ -336,6 +447,9 @@ impl UrrAccounting {
             timestamp: Some(Instant::now()),
         };
         self.report_seqn += 1;
+        self.triggered = false;
+        // Reset time start for next measurement period
+        self.time_start = Some(Instant::now());
     }
 
     /// Get delta since last report
@@ -348,6 +462,637 @@ impl UrrAccounting {
     }
 }
 
+// ============================================================================
+// TSN Bridge (Rel-18, IEEE 802.1Q)
+// ============================================================================
+
+/// TSN (Time-Sensitive Networking) bridge port configuration
+#[derive(Debug, Clone)]
+pub struct TsnBridgePort {
+    /// Port identifier (maps to a GTP tunnel endpoint)
+    pub port_id: u16,
+    /// VLAN ID (IEEE 802.1Q, 1-4094)
+    pub vlan_id: u16,
+    /// Port priority (PCP, 0-7)
+    pub priority: u8,
+    /// Whether this port is trunk (carries multiple VLANs)
+    pub is_trunk: bool,
+    /// Allowed VLAN IDs when trunk
+    pub allowed_vlans: Vec<u16>,
+    /// Port type (DS-TT: Device-Side Translator, NW-TT: Network-Side Translator)
+    pub port_type: TsnPortType,
+    /// Time-aware shaper enabled (IEEE 802.1Qbv)
+    pub time_aware_shaper_enabled: bool,
+    /// Gate control list for time-aware scheduling
+    pub gate_control_list: Vec<TsnGateControlEntry>,
+}
+
+/// TSN port type (TS 23.501 Section 5.28)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TsnPortType {
+    /// Device-Side Translator (connected to TSN device)
+    #[default]
+    DeviceSideTt,
+    /// Network-Side Translator (connected to 5G network)
+    NetworkSideTt,
+}
+
+/// TSN Gate Control Entry (IEEE 802.1Qbv)
+#[derive(Debug, Clone, Default)]
+pub struct TsnGateControlEntry {
+    /// Gate state for each priority queue (bit mask, 8 bits for 8 priorities)
+    pub gate_states: u8,
+    /// Time interval for this gate state (nanoseconds)
+    pub time_interval_ns: u64,
+}
+
+/// PTP (Precision Time Protocol) transparent clock state
+#[derive(Debug, Clone, Default)]
+pub struct PtpTransparentClock {
+    /// Whether PTP transparent clock is enabled
+    pub enabled: bool,
+    /// Accumulated residence time in nanoseconds
+    pub residence_time_ns: u64,
+    /// Number of PTP messages processed
+    pub messages_processed: u64,
+    /// Mean path delay (nanoseconds)
+    pub mean_path_delay_ns: u64,
+}
+
+impl PtpTransparentClock {
+    /// Record residence time for a PTP message transit
+    pub fn record_residence(&mut self, ingress_ns: u64, egress_ns: u64) {
+        if !self.enabled {
+            return;
+        }
+        let residence = egress_ns.saturating_sub(ingress_ns);
+        self.residence_time_ns += residence;
+        self.messages_processed += 1;
+        if self.messages_processed > 0 {
+            self.mean_path_delay_ns = self.residence_time_ns / self.messages_processed;
+        }
+    }
+}
+
+/// TSN Stream Identification (TS 23.501 Section 5.28)
+#[derive(Debug, Clone, Default)]
+pub struct TsnStreamIdentification {
+    /// Stream ID
+    pub stream_id: u32,
+    /// Source MAC address
+    pub source_mac: [u8; 6],
+    /// Destination MAC address
+    pub destination_mac: [u8; 6],
+    /// VLAN ID
+    pub vlan_id: u16,
+    /// Priority Code Point (PCP)
+    pub pcp: u8,
+    /// Mapped QoS Flow Identifier (QFI)
+    pub qfi: u8,
+    /// Mapped 5QI
+    pub five_qi: u8,
+    /// GFBR (Guaranteed Flow Bit Rate) in kbps
+    pub gfbr_kbps: Option<u32>,
+    /// MFBR (Maximum Flow Bit Rate) in kbps
+    pub mfbr_kbps: Option<u32>,
+}
+
+impl TsnStreamIdentification {
+    /// Create a new TSN stream identification
+    pub fn new(stream_id: u32, vlan_id: u16, qfi: u8, five_qi: u8) -> Self {
+        Self {
+            stream_id,
+            source_mac: [0; 6],
+            destination_mac: [0; 6],
+            vlan_id,
+            pcp: 0,
+            qfi,
+            five_qi,
+            gfbr_kbps: None,
+            mfbr_kbps: None,
+        }
+    }
+
+    /// Check if packet matches this stream
+    pub fn matches(&self, src_mac: &[u8; 6], dst_mac: &[u8; 6], vlan_id: u16) -> bool {
+        (self.source_mac == [0; 6] || self.source_mac == *src_mac)
+            && (self.destination_mac == [0; 6] || self.destination_mac == *dst_mac)
+            && self.vlan_id == vlan_id
+    }
+}
+
+/// CNC (Centralized Network Controller) Interface Context
+#[derive(Debug, Clone, Default)]
+pub struct TsnCncInterface {
+    /// CNC endpoint URI
+    pub cnc_endpoint: String,
+    /// CNC session identifier
+    pub cnc_session_id: Option<String>,
+    /// CNC connection status
+    pub connected: bool,
+    /// Last configuration update time
+    pub last_config_update: u64,
+    /// Stream configurations from CNC
+    pub stream_configs: Vec<TsnStreamIdentification>,
+    /// Gate control list update interval (nanoseconds)
+    pub gate_update_interval_ns: u64,
+}
+
+impl TsnCncInterface {
+    /// Create a new CNC interface
+    pub fn new(cnc_endpoint: &str) -> Self {
+        Self {
+            cnc_endpoint: cnc_endpoint.to_string(),
+            cnc_session_id: None,
+            connected: false,
+            last_config_update: 0,
+            stream_configs: Vec::new(),
+            gate_update_interval_ns: 1_000_000, // Default 1ms
+        }
+    }
+
+    /// Connect to CNC
+    pub fn connect(&mut self, session_id: &str) {
+        self.cnc_session_id = Some(session_id.to_string());
+        self.connected = true;
+        self.last_config_update = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        log::info!(
+            "[TSN CNC] Connected to CNC at {} with session ID {}",
+            self.cnc_endpoint,
+            session_id
+        );
+    }
+
+    /// Disconnect from CNC
+    pub fn disconnect(&mut self) {
+        self.connected = false;
+        log::info!("[TSN CNC] Disconnected from CNC at {}", self.cnc_endpoint);
+    }
+
+    /// Add stream configuration from CNC
+    pub fn add_stream_config(&mut self, stream: TsnStreamIdentification) {
+        log::info!(
+            "[TSN CNC] Adding stream config: ID={}, VLAN={}, QFI={}, 5QI={}",
+            stream.stream_id,
+            stream.vlan_id,
+            stream.qfi,
+            stream.five_qi
+        );
+        self.stream_configs.push(stream);
+        self.last_config_update = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+    }
+
+    /// Find stream by ID
+    pub fn find_stream(&self, stream_id: u32) -> Option<&TsnStreamIdentification> {
+        self.stream_configs.iter().find(|s| s.stream_id == stream_id)
+    }
+
+    /// Find stream by packet characteristics
+    pub fn find_stream_by_packet(&self, src_mac: &[u8; 6], dst_mac: &[u8; 6], vlan_id: u16) -> Option<&TsnStreamIdentification> {
+        self.stream_configs.iter().find(|s| s.matches(src_mac, dst_mac, vlan_id))
+    }
+}
+
+/// UPF TSN Bridge context (Rel-18, TS 23.501 clause 5.28)
+#[derive(Debug, Clone, Default)]
+pub struct TsnBridge {
+    /// Bridge ports (port_id -> config)
+    pub ports: HashMap<u16, TsnBridgePort>,
+    /// PTP transparent clock
+    pub ptp_clock: PtpTransparentClock,
+    /// Bridge ID (MAC-based, 8 bytes)
+    pub bridge_id: [u8; 8],
+    /// TSN stream identifications (stream_id -> stream)
+    pub streams: HashMap<u32, TsnStreamIdentification>,
+    /// CNC interface for centralized configuration
+    pub cnc_interface: Option<TsnCncInterface>,
+    /// Time-aware scheduling enabled globally
+    pub time_aware_scheduling_enabled: bool,
+    /// Cycle time for time-aware scheduling (nanoseconds)
+    pub cycle_time_ns: u64,
+}
+
+impl TsnBridge {
+    /// Create a new TSN bridge with the given bridge ID
+    pub fn new(bridge_id: [u8; 8]) -> Self {
+        Self {
+            ports: HashMap::new(),
+            ptp_clock: PtpTransparentClock::default(),
+            bridge_id,
+            streams: HashMap::new(),
+            cnc_interface: None,
+            time_aware_scheduling_enabled: false,
+            cycle_time_ns: 1_000_000, // Default 1ms cycle
+        }
+    }
+
+    /// Add a bridge port
+    pub fn add_port(&mut self, port: TsnBridgePort) {
+        log::info!(
+            "[TSN Bridge] Adding port {} (type: {:?}, VLAN: {})",
+            port.port_id,
+            port.port_type,
+            port.vlan_id
+        );
+        self.ports.insert(port.port_id, port);
+    }
+
+    /// Remove a bridge port
+    pub fn remove_port(&mut self, port_id: u16) -> Option<TsnBridgePort> {
+        self.ports.remove(&port_id)
+    }
+
+    /// Look up egress port for a given VLAN ID
+    pub fn lookup_egress(&self, vlan_id: u16) -> Vec<u16> {
+        self.ports
+            .iter()
+            .filter(|(_, p)| {
+                p.vlan_id == vlan_id || (p.is_trunk && p.allowed_vlans.contains(&vlan_id))
+            })
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
+    /// Enable PTP transparent clock
+    pub fn enable_ptp(&mut self) {
+        self.ptp_clock.enabled = true;
+        log::info!("[TSN Bridge] PTP transparent clock enabled");
+    }
+
+    /// Number of configured ports
+    pub fn port_count(&self) -> usize {
+        self.ports.len()
+    }
+
+    /// Add TSN stream identification
+    pub fn add_stream(&mut self, stream: TsnStreamIdentification) {
+        log::info!(
+            "[TSN Bridge] Adding stream {}: VLAN={}, QFI={}, 5QI={}",
+            stream.stream_id,
+            stream.vlan_id,
+            stream.qfi,
+            stream.five_qi
+        );
+        self.streams.insert(stream.stream_id, stream);
+    }
+
+    /// Remove TSN stream
+    pub fn remove_stream(&mut self, stream_id: u32) -> Option<TsnStreamIdentification> {
+        self.streams.remove(&stream_id)
+    }
+
+    /// Map TSN stream to QoS Flow
+    pub fn map_stream_to_qos_flow(&self, src_mac: &[u8; 6], dst_mac: &[u8; 6], vlan_id: u16) -> Option<(u8, u8)> {
+        // Find matching stream
+        let stream = self.streams.values().find(|s| s.matches(src_mac, dst_mac, vlan_id))?;
+
+        log::debug!(
+            "[TSN Bridge] Mapped stream {} to QFI={}, 5QI={}",
+            stream.stream_id,
+            stream.qfi,
+            stream.five_qi
+        );
+
+        Some((stream.qfi, stream.five_qi))
+    }
+
+    /// Set CNC interface
+    pub fn set_cnc_interface(&mut self, cnc: TsnCncInterface) {
+        log::info!("[TSN Bridge] Setting CNC interface: {}", cnc.cnc_endpoint);
+        self.cnc_interface = Some(cnc);
+    }
+
+    /// Enable time-aware scheduling (IEEE 802.1Qbv)
+    pub fn enable_time_aware_scheduling(&mut self, cycle_time_ns: u64) {
+        self.time_aware_scheduling_enabled = true;
+        self.cycle_time_ns = cycle_time_ns;
+        log::info!(
+            "[TSN Bridge] Time-aware scheduling enabled with cycle time {cycle_time_ns}ns"
+        );
+    }
+
+    /// Get current gate state for a port and priority (IEEE 802.1Qbv)
+    pub fn get_gate_state(&self, port_id: u16, priority: u8, current_time_ns: u64) -> bool {
+        let port = match self.ports.get(&port_id) {
+            Some(p) => p,
+            None => return true, // Port not found, allow all
+        };
+
+        if !port.time_aware_shaper_enabled || port.gate_control_list.is_empty() {
+            return true; // Shaper disabled, allow all
+        }
+
+        // Calculate position in cycle
+        let cycle_position = current_time_ns % self.cycle_time_ns;
+
+        // Find active gate control entry
+        let mut accumulated_time = 0u64;
+        for entry in &port.gate_control_list {
+            accumulated_time += entry.time_interval_ns;
+            if cycle_position < accumulated_time {
+                // Check if gate is open for this priority
+                return (entry.gate_states & (1 << priority)) != 0;
+            }
+        }
+
+        // Fallback: allow
+        true
+    }
+
+    /// Number of configured streams
+    pub fn stream_count(&self) -> usize {
+        self.streams.len()
+    }
+}
+
+
+// ============================================================================
+// PDR / FAR Structures for Rel-16 Completeness
+// ============================================================================
+
+/// Packet Detection Rule - comprehensive structure per TS 29.244
+#[derive(Debug, Clone)]
+pub struct Pdr {
+    /// PDR ID
+    pub pdr_id: u16,
+    /// Precedence
+    pub precedence: u32,
+    /// Source interface (0=Access, 1=Core, 2=SGi-LAN, etc.)
+    pub source_interface: u8,
+    /// UE IP address for matching
+    pub ue_ip: Option<UeIp>,
+    /// F-TEID for GTP-U matching
+    pub f_teid: Option<FTeid>,
+    /// SDF filter (optional)
+    pub sdf_filter: Option<SdfFilter>,
+    /// Associated FAR ID
+    pub far_id: Option<u32>,
+    /// Associated QER ID
+    pub qer_id: Option<u32>,
+    /// Associated URR IDs
+    pub urr_ids: Vec<u32>,
+    /// Outer header removal
+    pub outer_header_removal: Option<u8>,
+}
+
+impl Pdr {
+    /// Match a packet against this PDR
+    /// Returns true if all PDR matching criteria are met
+    pub fn pdr_match(
+        &self,
+        source_interface: u8,
+        ue_ip: Option<&UeIp>,
+        f_teid: Option<u32>,
+        _sdf_match: bool, // SDF filter matching placeholder
+    ) -> bool {
+        // Check source interface
+        if self.source_interface != source_interface {
+            return false;
+        }
+
+        // Check UE IP if specified
+        if let Some(pdr_ue_ip) = &self.ue_ip {
+            match ue_ip {
+                Some(packet_ue_ip) => {
+                    if pdr_ue_ip.addr != packet_ue_ip.addr {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+
+        // Check F-TEID if specified
+        if let Some(pdr_fteid) = &self.f_teid {
+            match f_teid {
+                Some(packet_teid) => {
+                    if pdr_fteid.teid != packet_teid {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
+        }
+
+        // SDF filter matching would go here
+        // For now, we just accept if no SDF filter is defined
+        if self.sdf_filter.is_some() {
+            // TODO: Implement SDF filter matching
+            // For now, accept all if SDF filter is present
+        }
+
+        true
+    }
+}
+
+/// F-TEID for PDR matching
+#[derive(Debug, Clone)]
+pub struct FTeid {
+    /// TEID value
+    pub teid: u32,
+    /// IPv4 address
+    pub ipv4: Option<Ipv4Addr>,
+    /// IPv6 address
+    pub ipv6: Option<Ipv6Addr>,
+}
+
+/// SDF Filter for application-level filtering
+#[derive(Debug, Clone)]
+pub struct SdfFilter {
+    /// Flow description (e.g., "permit in ip from 10.0.0.0/8 to assigned")
+    pub flow_description: Option<String>,
+    /// TOS traffic class
+    pub tos_traffic_class: Option<u16>,
+    /// Security parameter index
+    pub security_parameter_index: Option<u32>,
+    /// Flow label
+    pub flow_label: Option<u32>,
+}
+
+/// Forwarding Action Rule - comprehensive structure per TS 29.244
+#[derive(Debug, Clone)]
+pub struct Far {
+    /// FAR ID
+    pub far_id: u32,
+    /// Apply Action (bitmask: DROP=0x01, FORW=0x02, BUFF=0x04, NOCP=0x08, DUPL=0x10)
+    pub apply_action: u16,
+    /// Destination interface
+    pub destination_interface: u8,
+    /// Outer header creation (for forwarding)
+    pub outer_header_creation: Option<OuterHeaderCreation>,
+    /// Forwarding parameters
+    pub forwarding_parameters: Option<ForwardingParameters>,
+    /// Duplicating parameters (for packet duplication)
+    pub duplicating_parameters: Vec<DuplicatingParameters>,
+    /// BAR ID (for buffering)
+    pub bar_id: Option<u8>,
+}
+
+impl Far {
+    /// Check if FAR action includes forwarding
+    pub fn should_forward(&self) -> bool {
+        (self.apply_action & 0x02) != 0
+    }
+
+    /// Check if FAR action includes dropping
+    pub fn should_drop(&self) -> bool {
+        (self.apply_action & 0x01) != 0
+    }
+
+    /// Check if FAR action includes buffering
+    pub fn should_buffer(&self) -> bool {
+        (self.apply_action & 0x04) != 0
+    }
+
+    /// Check if FAR action includes duplicating
+    pub fn should_duplicate(&self) -> bool {
+        (self.apply_action & 0x10) != 0
+    }
+}
+
+/// Outer Header Creation for FAR
+#[derive(Debug, Clone)]
+pub struct OuterHeaderCreation {
+    /// GTP-U TEID for encapsulation
+    pub teid: u32,
+    /// Peer IPv4 address
+    pub ipv4: Option<Ipv4Addr>,
+    /// Peer IPv6 address
+    pub ipv6: Option<Ipv6Addr>,
+    /// Port number
+    pub port: u16,
+}
+
+/// Forwarding Parameters
+#[derive(Debug, Clone)]
+pub struct ForwardingParameters {
+    /// Destination interface
+    pub destination_interface: u8,
+    /// Network instance (e.g., APN/DNN)
+    pub network_instance: Option<String>,
+    /// Redirect information
+    pub redirect_information: Option<RedirectInformation>,
+    /// Header enrichment
+    pub header_enrichment: Option<HeaderEnrichment>,
+}
+
+/// Duplicating Parameters (for packet duplication to multiple destinations)
+#[derive(Debug, Clone)]
+pub struct DuplicatingParameters {
+    /// Destination interface
+    pub destination_interface: u8,
+    /// Outer header creation
+    pub outer_header_creation: Option<OuterHeaderCreation>,
+}
+
+/// Redirect Information
+#[derive(Debug, Clone)]
+pub struct RedirectInformation {
+    /// Redirect server address type
+    pub redirect_address_type: u8,
+    /// Redirect server address
+    pub redirect_server_address: String,
+}
+
+/// Header Enrichment
+#[derive(Debug, Clone)]
+pub struct HeaderEnrichment {
+    /// Header type
+    pub header_type: u8,
+    /// Header field name
+    pub header_field_name: String,
+    /// Header field value
+    pub header_field_value: String,
+}
+
+// ============================================================================
+// Rate Limiter (Token Bucket) - Rel-16
+// ============================================================================
+
+/// Per-flow token bucket rate limiter
+#[derive(Debug)]
+pub struct RateLimiter {
+    /// Rate in bits per second
+    pub rate_bps: u64,
+    /// Burst size in bytes
+    pub burst_bytes: u64,
+    /// Current token count (in bytes)
+    tokens: AtomicU64,
+    /// Last update timestamp (nanoseconds since epoch)
+    last_update: AtomicU64,
+}
+
+impl RateLimiter {
+    /// Create a new rate limiter
+    pub fn new(rate_bps: u64, burst_bytes: u64) -> Self {
+        Self {
+            rate_bps,
+            burst_bytes,
+            tokens: AtomicU64::new(burst_bytes),
+            last_update: AtomicU64::new(Self::now_nanos()),
+        }
+    }
+
+    /// Get current time in nanoseconds
+    fn now_nanos() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64
+    }
+
+    /// Check if a packet of given size can be forwarded
+    /// Returns true if packet is allowed, false if it should be rate-limited
+    pub fn allow_packet(&self, packet_size: usize) -> bool {
+        let now = Self::now_nanos();
+        let last = self.last_update.load(Ordering::Relaxed);
+
+        // Calculate elapsed time in seconds
+        let elapsed_ns = now.saturating_sub(last);
+        let elapsed_secs = elapsed_ns as f64 / 1_000_000_000.0;
+
+        // Calculate tokens to add based on rate
+        let tokens_to_add = (self.rate_bps as f64 * elapsed_secs / 8.0) as u64;
+
+        // Get current tokens and add new tokens (capped at burst size)
+        let current_tokens = self.tokens.load(Ordering::Relaxed);
+        let new_tokens = (current_tokens + tokens_to_add).min(self.burst_bytes);
+
+        // Check if we have enough tokens for this packet
+        if new_tokens >= packet_size as u64 {
+            // Consume tokens
+            self.tokens.store(new_tokens - packet_size as u64, Ordering::Relaxed);
+            self.last_update.store(now, Ordering::Relaxed);
+            true
+        } else {
+            // Not enough tokens - rate limit
+            false
+        }
+    }
+
+    /// Reset the rate limiter
+    pub fn reset(&self) {
+        self.tokens.store(self.burst_bytes, Ordering::Relaxed);
+        self.last_update.store(Self::now_nanos(), Ordering::Relaxed);
+    }
+}
+
+impl Clone for RateLimiter {
+    fn clone(&self) -> Self {
+        Self {
+            rate_bps: self.rate_bps,
+            burst_bytes: self.burst_bytes,
+            tokens: AtomicU64::new(self.tokens.load(Ordering::Relaxed)),
+            last_update: AtomicU64::new(self.last_update.load(Ordering::Relaxed)),
+        }
+    }
+}
 
 // ============================================================================
 // PFCP Session (simplified)
@@ -435,6 +1180,8 @@ pub struct UpfSess {
     pub urr_acc: [UrrAccounting; OGS_MAX_NUM_OF_URR],
     /// APN/DNN
     pub apn_dnn: Option<String>,
+    /// TSN bridge (Rel-18)
+    pub tsn_bridge: Option<TsnBridge>,
 }
 
 impl UpfSess {
@@ -453,6 +1200,7 @@ impl UpfSess {
             pfcp_node_id: None,
             urr_acc: Default::default(),
             apn_dnn: None,
+            tsn_bridge: None,
         }
     }
 
@@ -704,7 +1452,7 @@ impl UpfContext {
                 }
             }
 
-            log::info!("[Removed] UPF Session (id={})", id);
+            log::info!("[Removed] UPF Session (id={id})");
             return Some(sess);
         }
         None
@@ -808,9 +1556,9 @@ impl UpfContext {
 
     /// Set UE IP for session
     pub fn sess_set_ue_ip(&self, sess_id: u64, ipv4: Option<Ipv4Addr>, ipv6: Option<Ipv6Addr>) -> bool {
-        let mut sess_list = self.sess_list.write().ok().unwrap();
-        let mut ipv4_hash = self.ipv4_hash.write().ok().unwrap();
-        let mut ipv6_hash = self.ipv6_hash.write().ok().unwrap();
+        let mut sess_list = self.sess_list.write().unwrap();
+        let mut ipv4_hash = self.ipv4_hash.write().unwrap();
+        let mut ipv6_hash = self.ipv6_hash.write().unwrap();
 
         if let Some(sess) = sess_list.get_mut(&sess_id) {
             if let Some(addr) = ipv4 {
@@ -834,7 +1582,7 @@ impl UpfContext {
 
     /// Add framed route for session
     pub fn sess_add_framed_route(&self, sess_id: u64, subnet: IpSubnet, is_ipv6: bool) -> bool {
-        let mut sess_list = self.sess_list.write().ok().unwrap();
+        let mut sess_list = self.sess_list.write().unwrap();
         
         if let Some(sess) = sess_list.get_mut(&sess_id) {
             let prefix_len = if is_ipv6 {
@@ -879,8 +1627,8 @@ impl UpfContext {
     /// Update session in context
     pub fn sess_update(&self, sess: &UpfSess) -> bool {
         if let Ok(mut sess_list) = self.sess_list.write() {
-            if sess_list.contains_key(&sess.id) {
-                sess_list.insert(sess.id, sess.clone());
+            if let std::collections::hash_map::Entry::Occupied(mut e) = sess_list.entry(sess.id) {
+                e.insert(sess.clone());
                 return true;
             }
         }
@@ -912,7 +1660,7 @@ pub fn upf_context_init(max_sess: usize) {
     let _ctx = UPF_CONTEXT.get_or_init(UpfContext::new);
     // Note: We can't mutate through OnceLock, so init is a no-op after first call
     // In real implementation, would use a different pattern
-    log::info!("UPF context initialized with max {} sessions", max_sess);
+    log::info!("UPF context initialized with max {max_sess} sessions");
 }
 
 /// Finalize the global UPF context
@@ -962,20 +1710,137 @@ mod tests {
     #[test]
     fn test_urr_accounting() {
         let mut acc = UrrAccounting::default();
-        
+
         acc.add(100, true);  // uplink
         acc.add(200, false); // downlink
-        
+
         assert_eq!(acc.total_octets, 300);
         assert_eq!(acc.ul_octets, 100);
         assert_eq!(acc.dl_octets, 200);
         assert_eq!(acc.total_pkts, 2);
         assert_eq!(acc.ul_pkts, 1);
         assert_eq!(acc.dl_pkts, 1);
-        
+
         acc.snapshot();
         assert_eq!(acc.last_report.total_octets, 300);
         assert_eq!(acc.report_seqn, 1);
+    }
+
+    #[test]
+    fn test_urr_per_qos_flow_accounting() {
+        let mut acc = UrrAccounting::default();
+
+        acc.add_with_qfi(100, true, 5);   // QFI 5 uplink
+        acc.add_with_qfi(200, false, 5);  // QFI 5 downlink
+        acc.add_with_qfi(50, true, 9);    // QFI 9 uplink
+
+        // Overall accounting
+        assert_eq!(acc.total_octets, 350);
+        assert_eq!(acc.total_pkts, 3);
+
+        // Per-flow accounting
+        assert_eq!(acc.tracked_flow_count(), 2);
+        let flow5 = acc.flow_accounting(5).unwrap();
+        assert_eq!(flow5.total_octets, 300);
+        assert_eq!(flow5.ul_octets, 100);
+        assert_eq!(flow5.dl_octets, 200);
+        assert_eq!(flow5.total_pkts, 2);
+
+        let flow9 = acc.flow_accounting(9).unwrap();
+        assert_eq!(flow9.total_octets, 50);
+        assert_eq!(flow9.ul_octets, 50);
+        assert_eq!(flow9.total_pkts, 1);
+    }
+
+    #[test]
+    fn test_urr_volume_threshold() {
+        let mut acc = UrrAccounting::default();
+        acc.volume_threshold = Some(500);
+        acc.time_start = Some(Instant::now());
+        // below threshold
+        acc.add(200, true);
+        assert!(acc.check_thresholds().is_none());
+        // exceed threshold
+        acc.add(400, false);
+        let reason = acc.check_thresholds();
+        assert_eq!(reason, Some(UrrTriggerReason::VolumeThreshold));
+        assert!(acc.triggered);
+    }
+
+    #[test]
+    fn test_urr_volume_quota() {
+        let mut acc = UrrAccounting::default();
+        acc.volume_quota = Some(300);
+
+        assert!(acc.consume_quota(100)); // 200 remaining
+        assert!(acc.consume_quota(100)); // 100 remaining
+        assert!(acc.consume_quota(100)); // 0 remaining
+        assert!(!acc.consume_quota(1));  // exhausted
+        assert!(acc.triggered);
+
+        let reason = acc.check_thresholds();
+        assert_eq!(reason, Some(UrrTriggerReason::VolumeQuotaExhausted));
+    }
+
+    #[test]
+    fn test_tsn_bridge() {
+        let mut bridge = TsnBridge::new([0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77]);
+
+        bridge.add_port(TsnBridgePort {
+            port_id: 1,
+            vlan_id: 100,
+            priority: 5,
+            is_trunk: false,
+            allowed_vlans: vec![],
+            port_type: TsnPortType::DeviceSideTt,
+            time_aware_shaper_enabled: false,
+            gate_control_list: vec![],
+        });
+        bridge.add_port(TsnBridgePort {
+            port_id: 2,
+            vlan_id: 200,
+            priority: 3,
+            is_trunk: true,
+            allowed_vlans: vec![100, 200, 300],
+            port_type: TsnPortType::NetworkSideTt,
+            time_aware_shaper_enabled: false,
+            gate_control_list: vec![],
+        });
+
+        assert_eq!(bridge.port_count(), 2);
+
+        // VLAN 100 matches port 1 (access) and port 2 (trunk with 100 allowed)
+        let egress = bridge.lookup_egress(100);
+        assert_eq!(egress.len(), 2);
+
+        // VLAN 300 matches only port 2 (trunk)
+        let egress = bridge.lookup_egress(300);
+        assert_eq!(egress.len(), 1);
+        assert_eq!(egress[0], 2);
+
+        // VLAN 999 matches nothing
+        assert!(bridge.lookup_egress(999).is_empty());
+
+        bridge.remove_port(1);
+        assert_eq!(bridge.port_count(), 1);
+    }
+
+    #[test]
+    fn test_ptp_transparent_clock() {
+        let mut clock = PtpTransparentClock::default();
+        assert!(!clock.enabled);
+
+        // disabled clock ignores records
+        clock.record_residence(100, 200);
+        assert_eq!(clock.messages_processed, 0);
+
+        clock.enabled = true;
+        clock.record_residence(1000, 1500); // 500 ns
+        clock.record_residence(2000, 2300); // 300 ns
+
+        assert_eq!(clock.messages_processed, 2);
+        assert_eq!(clock.residence_time_ns, 800);
+        assert_eq!(clock.mean_path_delay_ns, 400);
     }
 
     #[test]

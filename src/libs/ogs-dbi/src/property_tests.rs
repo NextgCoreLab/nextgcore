@@ -91,7 +91,7 @@ proptest! {
     /// Property 13.4: SUPI parsing consistency
     #[test]
     fn test_supi_parsing(id_type in "[a-z]{2,8}", id_value in "[a-zA-Z0-9]{1,20}") {
-        let supi = format!("{}-{}", id_type, id_value);
+        let supi = format!("{id_type}-{id_value}");
         let parsed_type = ogs_id_get_type(&supi);
         let parsed_value = ogs_id_get_value(&supi);
 
@@ -120,7 +120,7 @@ proptest! {
         let len = ogs_bcd_to_buffer(&bcd, &mut buf);
 
         // Length should be ceil(bcd.len() / 2)
-        let expected_len = (bcd.len() + 1) / 2;
+        let expected_len = bcd.len().div_ceil(2);
         prop_assert_eq!(len, expected_len);
         prop_assert_eq!(buf.len(), expected_len);
     }

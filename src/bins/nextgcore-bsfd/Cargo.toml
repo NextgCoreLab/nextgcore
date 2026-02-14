@@ -26,3 +26,6 @@ ctrlc = "3.4"
 
 [dev-dependencies]
 proptest.workspace = true
+
+[lints]
+workspace = true

@@ -611,7 +611,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "145052bdd345b87320e369255277e3fb5152762ad123a901ef5c262dd38fe8d2"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -2154,6 +2156,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "env_logger 0.11.8",
+ "hmac",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2162,6 +2165,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "uuid",
 ]
@@ -2186,10 +2190,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextgcore-eesd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "env_logger 0.11.8",
+ "log",
+ "ogs-app",
+ "ogs-core",
+ "ogs-sbi",
+ "proptest",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "nextgcore-hssd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "ctrlc",
  "env_logger 0.11.8",
@@ -2238,10 +2261,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextgcore-lmfd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "env_logger 0.11.8",
+ "log",
+ "ogs-app",
+ "ogs-core",
+ "ogs-sbi",
+ "proptest",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "nextgcore-mbsmfd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "env_logger 0.11.8",
+ "hex",
+ "log",
+ "ogs-app",
+ "ogs-core",
+ "ogs-sbi",
+ "proptest",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "nextgcore-mmed"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "ctrlc",
  "env_logger 0.11.8",
@@ -2277,6 +2338,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextgcore-nsacfd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "env_logger 0.11.8",
+ "log",
+ "ogs-app",
+ "ogs-core",
+ "ogs-sbi",
+ "proptest",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "nextgcore-nssfd"
 version = "0.1.0"
 dependencies = [
@@ -2290,6 +2369,26 @@ dependencies = [
  "ogs-dbi",
  "ogs-sbi",
  "proptest",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "nextgcore-nwdafd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "ctrlc",
+ "env_logger 0.11.8",
+ "log",
+ "ogs-app",
+ "ogs-core",
+ "ogs-sbi",
+ "proptest",
+ "serde",
  "serde_json",
  "tokio",
  "uuid",
@@ -2332,6 +2431,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextgcore-pind"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "env_logger 0.11.8",
+ "log",
+ "ogs-app",
+ "ogs-core",
+ "ogs-sbi",
+ "proptest",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "nextgcore-scpd"
 version = "0.1.0"
 dependencies = [
@@ -2344,6 +2461,7 @@ dependencies = [
  "ogs-core",
  "ogs-sbi",
  "proptest",
+ "serde_json",
  "tokio",
 ]
 
@@ -2778,6 +2896,7 @@ version = "0.1.0"
 dependencies = [
  "ogs-core",
  "proptest",
+ "serde",
 ]
 
 [[package]]
@@ -2801,6 +2920,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "log",
  "ogs-core",
  "proptest",
  "rustls 0.23.36",

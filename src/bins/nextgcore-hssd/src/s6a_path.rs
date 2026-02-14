@@ -83,9 +83,7 @@ pub fn hss_s6a_send_clr(
     cancellation_type: CancellationType,
 ) -> Result<(), String> {
     log::info!(
-        "[{}] Sending Cancel-Location-Request (type={:?})",
-        imsi_bcd,
-        cancellation_type
+        "[{imsi_bcd}] Sending Cancel-Location-Request (type={cancellation_type:?})"
     );
 
     use ogs_diameter::s6a::{S6A_APPLICATION_ID, cmd, avp};
@@ -99,12 +97,12 @@ pub fn hss_s6a_send_clr(
         use ogs_dbi::{mongoc::get_subscriber_collection, mongodb::bson::doc};
 
         let collection = get_subscriber_collection()
-            .map_err(|e| format!("Failed to get subscriber collection: {}", e))?;
+            .map_err(|e| format!("Failed to get subscriber collection: {e}"))?;
 
         let query = doc! { "imsi": imsi_bcd };
         let doc = collection.find_one(query, None)
-            .map_err(|e| format!("Failed to query DB: {}", e))?
-            .ok_or_else(|| format!("Subscriber not found: {}", imsi_bcd))?;
+            .map_err(|e| format!("Failed to query DB: {e}"))?
+            .ok_or_else(|| format!("Subscriber not found: {imsi_bcd}"))?;
 
         let host = doc.get_str("mme_host")
             .unwrap_or("mme.epc.mnc001.mcc001.3gppnetwork.org").to_string();
@@ -147,7 +145,7 @@ pub fn hss_s6a_send_clr(
     // 3. Send message and register CLA callback
     // Note: In full implementation, this would use the Diameter transport to send
     // For now, we just log that we would send it
-    log::debug!("[{}] CLR message prepared (would send to {})", imsi_bcd, dest_host);
+    log::debug!("[{imsi_bcd}] CLR message prepared (would send to {dest_host})");
 
     diam_stats().s6a.inc_tx_clr();
     Ok(())
@@ -165,10 +163,7 @@ pub fn hss_s6a_send_idr(
     subdata_mask: u32,
 ) -> Result<(), String> {
     log::info!(
-        "[{}] Sending Insert-Subscriber-Data-Request (flags={}, mask={})",
-        imsi_bcd,
-        idr_flags,
-        subdata_mask
+        "[{imsi_bcd}] Sending Insert-Subscriber-Data-Request (flags={idr_flags}, mask={subdata_mask})"
     );
 
     use ogs_diameter::s6a::{S6A_APPLICATION_ID, cmd, avp};
@@ -178,12 +173,12 @@ pub fn hss_s6a_send_idr(
 
     // 1. Look up MME host/realm from DB
     let collection = get_subscriber_collection()
-        .map_err(|e| format!("Failed to get subscriber collection: {}", e))?;
+        .map_err(|e| format!("Failed to get subscriber collection: {e}"))?;
 
     let query = doc! { "imsi": imsi_bcd };
     let doc = collection.find_one(query, None)
-        .map_err(|e| format!("Failed to query DB: {}", e))?
-        .ok_or_else(|| format!("Subscriber not found: {}", imsi_bcd))?;
+        .map_err(|e| format!("Failed to query DB: {e}"))?
+        .ok_or_else(|| format!("Subscriber not found: {imsi_bcd}"))?;
 
     let dest_host = doc.get_str("mme_host")
         .unwrap_or("mme.epc.mnc001.mcc001.3gppnetwork.org").to_string();
@@ -191,9 +186,9 @@ pub fn hss_s6a_send_idr(
         .unwrap_or("epc.mnc001.mcc001.3gppnetwork.org").to_string();
 
     // 2. Get subscription data from DB
-    let supi = format!("imsi-{}", imsi_bcd);
+    let supi = format!("imsi-{imsi_bcd}");
     let _subscription_data = ogs_dbi_subscription_data(&supi)
-        .map_err(|e| format!("Failed to get subscription data: {}", e))?;
+        .map_err(|e| format!("Failed to get subscription data: {e}"))?;
 
     // 3. Create IDR message
     let mut msg = DiameterMessage::new_request(cmd::INSERT_SUBSCRIBER_DATA, S6A_APPLICATION_ID);
@@ -229,14 +224,14 @@ pub fn hss_s6a_send_idr(
     // Note: In full implementation, this would build a complex grouped AVP
     // containing AMBR, APN configs, QoS profiles, etc.
     if subdata_mask & OGS_DIAM_S6A_SUBDATA_UEAMBR != 0 {
-        log::debug!("[{}] Including UE-AMBR in subscription data", imsi_bcd);
+        log::debug!("[{imsi_bcd}] Including UE-AMBR in subscription data");
     }
     if subdata_mask & OGS_DIAM_S6A_SUBDATA_APN_CONFIG != 0 {
-        log::debug!("[{}] Including APN-Config in subscription data", imsi_bcd);
+        log::debug!("[{imsi_bcd}] Including APN-Config in subscription data");
     }
 
     // 4. Send message and register IDA callback
-    log::debug!("[{}] IDR message prepared (would send to {})", imsi_bcd, dest_host);
+    log::debug!("[{imsi_bcd}] IDR message prepared (would send to {dest_host})");
 
     diam_stats().s6a.inc_tx_idr();
     Ok(())
@@ -246,7 +241,7 @@ pub fn hss_s6a_send_idr(
 ///
 /// This is called when MME requests authentication vectors for a UE
 pub fn handle_air(imsi_bcd: &str, visited_plmn_id: &[u8], resync_info: Option<&[u8]>) -> Result<AirResponse, String> {
-    log::debug!("[{}] Handling AIR", imsi_bcd);
+    log::debug!("[{imsi_bcd}] Handling AIR");
     diam_stats().s6a.inc_rx_air();
 
     use ogs_dbi::{ogs_dbi_auth_info, ogs_dbi_increment_sqn, ogs_dbi_update_sqn};
@@ -254,22 +249,22 @@ pub fn handle_air(imsi_bcd: &str, visited_plmn_id: &[u8], resync_info: Option<&[
     use ogs_crypt::kdf::ogs_auc_kasme;
 
     // 1. Get auth info from DB (K, OPc, SQN, AMF)
-    let supi = format!("imsi-{}", imsi_bcd);
+    let supi = format!("imsi-{imsi_bcd}");
     let auth_info = ogs_dbi_auth_info(&supi)
-        .map_err(|e| format!("Failed to get auth info: {}", e))?;
+        .map_err(|e| format!("Failed to get auth info: {e}"))?;
 
     let mut sqn = auth_info.sqn;
 
     // 2. Handle re-synchronization if provided
     if let Some(auts) = resync_info {
-        log::debug!("[{}] Performing SQN re-synchronization", imsi_bcd);
+        log::debug!("[{imsi_bcd}] Performing SQN re-synchronization");
         if auts.len() >= 14 {
             // AUTS = SQN_MS ^ AK || MAC-S
             // Extract and verify MAC-S, then extract SQN_MS
             // For now, we'll increment SQN significantly on resync
             sqn = sqn.wrapping_add(0x10000); // Jump ahead on resync
             ogs_dbi_update_sqn(&supi, sqn)
-                .map_err(|e| format!("Failed to update SQN: {}", e))?;
+                .map_err(|e| format!("Failed to update SQN: {e}"))?;
         }
     }
 
@@ -314,7 +309,7 @@ pub fn handle_air(imsi_bcd: &str, visited_plmn_id: &[u8], resync_info: Option<&[
 
     // Derive KASME from CK, IK, SQN, AK
     let plmn_id: [u8; 3] = [
-        visited_plmn_id.get(0).copied().unwrap_or(0),
+        visited_plmn_id.first().copied().unwrap_or(0),
         visited_plmn_id.get(1).copied().unwrap_or(0),
         visited_plmn_id.get(2).copied().unwrap_or(0),
     ];
@@ -322,7 +317,7 @@ pub fn handle_air(imsi_bcd: &str, visited_plmn_id: &[u8], resync_info: Option<&[
 
     // 4. Update SQN in DB (increment by 32)
     ogs_dbi_increment_sqn(&supi)
-        .map_err(|e| format!("Failed to increment SQN: {}", e))?;
+        .map_err(|e| format!("Failed to increment SQN: {e}"))?;
 
     // 5. Return AIA with E-UTRAN-Vector
     let response = AirResponse {
@@ -347,19 +342,19 @@ pub fn handle_ulr(
     mme_host: &str,
     mme_realm: &str,
 ) -> Result<UlrResponse, String> {
-    log::debug!("[{}] Handling ULR from {}.{}", imsi_bcd, mme_host, mme_realm);
+    log::debug!("[{imsi_bcd}] Handling ULR from {mme_host}.{mme_realm}");
     diam_stats().s6a.inc_rx_ulr();
 
     use ogs_dbi::{ogs_dbi_update_mme, ogs_dbi_subscription_data};
 
     // 1. Update MME info in DB
-    let supi = format!("imsi-{}", imsi_bcd);
+    let supi = format!("imsi-{imsi_bcd}");
     ogs_dbi_update_mme(&supi, mme_host, mme_realm, true)
-        .map_err(|e| format!("Failed to update MME: {}", e))?;
+        .map_err(|e| format!("Failed to update MME: {e}"))?;
 
     // 2. Get subscription data from DB
     let _subscription_data = ogs_dbi_subscription_data(&supi)
-        .map_err(|e| format!("Failed to get subscription data: {}", e))?;
+        .map_err(|e| format!("Failed to get subscription data: {e}"))?;
 
     // 3. Return ULA with Subscription-Data
     // Note: In full implementation, subscription_data would be serialized to AVP format
@@ -370,7 +365,7 @@ pub fn handle_ulr(
     };
 
     diam_stats().s6a.inc_tx_ula();
-    log::debug!("[{}] ULR handled successfully", imsi_bcd);
+    log::debug!("[{imsi_bcd}] ULR handled successfully");
     Ok(response)
 }
 
@@ -378,7 +373,7 @@ pub fn handle_ulr(
 ///
 /// This is called when MME purges a UE
 pub fn handle_pur(imsi_bcd: &str, pur_flags: u32) -> Result<PurResponse, String> {
-    log::debug!("[{}] Handling PUR (flags={})", imsi_bcd, pur_flags);
+    log::debug!("[{imsi_bcd}] Handling PUR (flags={pur_flags})");
     diam_stats().s6a.inc_rx_pur();
 
     use ogs_dbi::{mongoc::get_subscriber_collection, mongodb::bson::doc};
@@ -388,7 +383,7 @@ pub fn handle_pur(imsi_bcd: &str, pur_flags: u32) -> Result<PurResponse, String>
     let supi_id = imsi_bcd;
 
     let collection = get_subscriber_collection()
-        .map_err(|e| format!("Failed to get subscriber collection: {}", e))?;
+        .map_err(|e| format!("Failed to get subscriber collection: {e}"))?;
 
     let query = doc! { supi_type: supi_id };
     let update = doc! {
@@ -399,7 +394,7 @@ pub fn handle_pur(imsi_bcd: &str, pur_flags: u32) -> Result<PurResponse, String>
     };
 
     collection.update_one(query, update, None)
-        .map_err(|e| format!("Failed to update purge flag: {}", e))?;
+        .map_err(|e| format!("Failed to update purge flag: {e}"))?;
 
     // 2. Return PUA
     let response = PurResponse {
@@ -407,7 +402,7 @@ pub fn handle_pur(imsi_bcd: &str, pur_flags: u32) -> Result<PurResponse, String>
     };
 
     diam_stats().s6a.inc_tx_pua();
-    log::debug!("[{}] PUR handled successfully", imsi_bcd);
+    log::debug!("[{imsi_bcd}] PUR handled successfully");
     Ok(response)
 }
 
@@ -440,6 +435,415 @@ pub struct UlrResponse {
 pub struct PurResponse {
     /// Result code (0 = success)
     pub result_code: u32,
+}
+
+// ============================================================================
+// S6a Diameter Message Dispatch (W1.20)
+// ============================================================================
+
+/// Dispatch an incoming S6a Diameter request and produce an answer.
+///
+/// This is the main entry point for wiring Diameter transport to S6a handlers.
+/// It extracts the command code, IMSI, and relevant AVPs from the Diameter message,
+/// calls the appropriate handler (AIR, ULR, PUR), and builds the Diameter answer.
+pub fn dispatch_s6a_request(
+    request: &ogs_diameter::DiameterMessage,
+) -> Option<ogs_diameter::DiameterMessage> {
+    use ogs_diameter::s6a::{S6A_APPLICATION_ID, cmd, avp as s6a_avp};
+    use ogs_diameter::{DiameterMessage, Avp, AvpData, avp_code, OGS_3GPP_VENDOR_ID};
+
+    let cmd_code = request.header.command_code;
+
+    // Verify this is an S6a request
+    if request.header.application_id != S6A_APPLICATION_ID {
+        log::warn!("Non-S6a message received: app_id={}", request.header.application_id);
+        return None;
+    }
+    if !request.header.is_request() {
+        return None;
+    }
+
+    // Extract IMSI from User-Name AVP
+    let imsi_bcd = match request.user_name() {
+        Some(imsi) => imsi.to_string(),
+        None => {
+            log::error!("S6a request missing User-Name (IMSI)");
+            return Some(build_error_answer(request, 5005)); // MISSING_AVP
+        }
+    };
+
+    // Extract Visited-PLMN-Id
+    let visited_plmn_id = request
+        .find_vendor_avp(s6a_avp::VISITED_PLMN_ID, OGS_3GPP_VENDOR_ID)
+        .and_then(|a| a.as_octet_string())
+        .map(|b| b.to_vec())
+        .unwrap_or_else(|| vec![0x00, 0xF1, 0x10]);
+
+    match cmd_code {
+        cmd::AUTHENTICATION_INFORMATION => {
+            log::debug!("[{imsi_bcd}] Dispatching AIR");
+            diam_stats().s6a.inc_rx_air();
+
+            // Extract Re-Synchronization-Info if present
+            let resync_info = request
+                .find_vendor_avp(s6a_avp::RE_SYNC_INFO, OGS_3GPP_VENDOR_ID)
+                .and_then(|a| a.as_octet_string())
+                .map(|b| b.to_vec());
+
+            match handle_air(&imsi_bcd, &visited_plmn_id, resync_info.as_deref()) {
+                Ok(air_resp) => {
+                    let mut answer = DiameterMessage::new_answer(request);
+                    // Session-Id (echo from request)
+                    if let Some(sid) = request.session_id() {
+                        answer.add_avp(Avp::mandatory(
+                            avp_code::SESSION_ID,
+                            AvpData::Utf8String(sid.to_string()),
+                        ));
+                    }
+                    // Result-Code
+                    answer.add_avp(Avp::mandatory(
+                        avp_code::RESULT_CODE,
+                        AvpData::Unsigned32(air_resp.result_code),
+                    ));
+                    // Auth-Session-State = NO_STATE_MAINTAINED
+                    answer.add_avp(Avp::mandatory(
+                        avp_code::AUTH_SESSION_STATE,
+                        AvpData::Enumerated(1),
+                    ));
+                    // Origin-Host / Origin-Realm
+                    add_origin_avps(&mut answer);
+
+                    // Authentication-Info -> E-UTRAN-Vector
+                    let e_utran_vector = Avp::vendor_mandatory(
+                        s6a_avp::E_UTRAN_VECTOR,
+                        OGS_3GPP_VENDOR_ID,
+                        AvpData::Grouped(vec![
+                            Avp::vendor_mandatory(
+                                s6a_avp::RAND,
+                                OGS_3GPP_VENDOR_ID,
+                                AvpData::OctetString(bytes::Bytes::copy_from_slice(&air_resp.rand)),
+                            ),
+                            Avp::vendor_mandatory(
+                                s6a_avp::XRES,
+                                OGS_3GPP_VENDOR_ID,
+                                AvpData::OctetString(bytes::Bytes::copy_from_slice(&air_resp.xres)),
+                            ),
+                            Avp::vendor_mandatory(
+                                s6a_avp::AUTN,
+                                OGS_3GPP_VENDOR_ID,
+                                AvpData::OctetString(bytes::Bytes::copy_from_slice(&air_resp.autn)),
+                            ),
+                            Avp::vendor_mandatory(
+                                s6a_avp::KASME,
+                                OGS_3GPP_VENDOR_ID,
+                                AvpData::OctetString(bytes::Bytes::copy_from_slice(&air_resp.kasme)),
+                            ),
+                        ]),
+                    );
+                    let auth_info = Avp::vendor_mandatory(
+                        s6a_avp::AUTHENTICATION_INFO,
+                        OGS_3GPP_VENDOR_ID,
+                        AvpData::Grouped(vec![e_utran_vector]),
+                    );
+                    answer.add_avp(auth_info);
+
+                    Some(answer)
+                }
+                Err(e) => {
+                    log::error!("[{imsi_bcd}] AIR handler error: {e}");
+                    diam_stats().s6a.inc_rx_air_error();
+                    Some(build_error_answer(request, 5012)) // UNABLE_TO_COMPLY
+                }
+            }
+        }
+        cmd::UPDATE_LOCATION => {
+            log::debug!("[{imsi_bcd}] Dispatching ULR");
+            diam_stats().s6a.inc_rx_ulr();
+
+            // Extract ULR-Flags
+            let ulr_flags_val = request
+                .find_vendor_avp(s6a_avp::ULR_FLAGS, OGS_3GPP_VENDOR_ID)
+                .and_then(|a| a.as_u32())
+                .unwrap_or(0);
+
+            // Extract Origin-Host/Realm as MME identity
+            let mme_host = request.origin_host().unwrap_or("unknown").to_string();
+            let mme_realm = request.origin_realm().unwrap_or("unknown").to_string();
+
+            match handle_ulr(&imsi_bcd, &visited_plmn_id, ulr_flags_val, &mme_host, &mme_realm) {
+                Ok(ulr_resp) => {
+                    let mut answer = DiameterMessage::new_answer(request);
+                    if let Some(sid) = request.session_id() {
+                        answer.add_avp(Avp::mandatory(
+                            avp_code::SESSION_ID,
+                            AvpData::Utf8String(sid.to_string()),
+                        ));
+                    }
+                    answer.add_avp(Avp::mandatory(
+                        avp_code::RESULT_CODE,
+                        AvpData::Unsigned32(ulr_resp.result_code),
+                    ));
+                    answer.add_avp(Avp::mandatory(
+                        avp_code::AUTH_SESSION_STATE,
+                        AvpData::Enumerated(1),
+                    ));
+                    add_origin_avps(&mut answer);
+
+                    // ULA-Flags
+                    answer.add_avp(Avp::vendor_mandatory(
+                        s6a_avp::ULA_FLAGS,
+                        OGS_3GPP_VENDOR_ID,
+                        AvpData::Unsigned32(1), // Separation Indication
+                    ));
+
+                    // Subscription-Data (placeholder)
+                    if !ulr_resp.subscription_data.is_empty() {
+                        answer.add_avp(Avp::vendor_mandatory(
+                            s6a_avp::SUBSCRIPTION_DATA,
+                            OGS_3GPP_VENDOR_ID,
+                            AvpData::OctetString(bytes::Bytes::copy_from_slice(
+                                &ulr_resp.subscription_data,
+                            )),
+                        ));
+                    }
+
+                    Some(answer)
+                }
+                Err(e) => {
+                    log::error!("[{imsi_bcd}] ULR handler error: {e}");
+                    diam_stats().s6a.inc_rx_ulr_error();
+                    Some(build_error_answer(request, 5012))
+                }
+            }
+        }
+        cmd::PURGE_UE => {
+            log::debug!("[{imsi_bcd}] Dispatching PUR");
+            diam_stats().s6a.inc_rx_pur();
+
+            let pur_flags = request
+                .find_vendor_avp(s6a_avp::PUA_FLAGS, OGS_3GPP_VENDOR_ID)
+                .and_then(|a| a.as_u32())
+                .unwrap_or(0);
+
+            match handle_pur(&imsi_bcd, pur_flags) {
+                Ok(pur_resp) => {
+                    let mut answer = DiameterMessage::new_answer(request);
+                    if let Some(sid) = request.session_id() {
+                        answer.add_avp(Avp::mandatory(
+                            avp_code::SESSION_ID,
+                            AvpData::Utf8String(sid.to_string()),
+                        ));
+                    }
+                    answer.add_avp(Avp::mandatory(
+                        avp_code::RESULT_CODE,
+                        AvpData::Unsigned32(pur_resp.result_code),
+                    ));
+                    answer.add_avp(Avp::mandatory(
+                        avp_code::AUTH_SESSION_STATE,
+                        AvpData::Enumerated(1),
+                    ));
+                    add_origin_avps(&mut answer);
+                    Some(answer)
+                }
+                Err(e) => {
+                    log::error!("[{imsi_bcd}] PUR handler error: {e}");
+                    diam_stats().s6a.inc_rx_pur_error();
+                    Some(build_error_answer(request, 5012))
+                }
+            }
+        }
+        _ => {
+            log::warn!("[{imsi_bcd}] Unknown S6a command code: {cmd_code}");
+            diam_stats().s6a.inc_rx_unknown();
+            Some(build_error_answer(request, 3001)) // COMMAND_UNSUPPORTED
+        }
+    }
+}
+
+/// Build a Diameter error answer with the given result code
+fn build_error_answer(
+    request: &ogs_diameter::DiameterMessage,
+    result_code: u32,
+) -> ogs_diameter::DiameterMessage {
+    use ogs_diameter::{DiameterMessage, Avp, AvpData, avp_code};
+
+    let mut answer = DiameterMessage::new_answer(request);
+    if let Some(sid) = request.session_id() {
+        answer.add_avp(Avp::mandatory(
+            avp_code::SESSION_ID,
+            AvpData::Utf8String(sid.to_string()),
+        ));
+    }
+    answer.add_avp(Avp::mandatory(
+        avp_code::RESULT_CODE,
+        AvpData::Unsigned32(result_code),
+    ));
+    answer.add_avp(Avp::mandatory(
+        avp_code::AUTH_SESSION_STATE,
+        AvpData::Enumerated(1),
+    ));
+    add_origin_avps(&mut answer);
+    // Set error flag in header
+    answer.header.set_error();
+    answer
+}
+
+/// Add Origin-Host and Origin-Realm AVPs from HSS config
+fn add_origin_avps(msg: &mut ogs_diameter::DiameterMessage) {
+    use ogs_diameter::{Avp, AvpData, avp_code};
+
+    // In production these come from the HSS context/config
+    msg.add_avp(Avp::mandatory(
+        avp_code::ORIGIN_HOST,
+        AvpData::DiameterIdentity("hss.epc.mnc001.mcc001.3gppnetwork.org".to_string()),
+    ));
+    msg.add_avp(Avp::mandatory(
+        avp_code::ORIGIN_REALM,
+        AvpData::DiameterIdentity("epc.mnc001.mcc001.3gppnetwork.org".to_string()),
+    ));
+}
+
+// ============================================================================
+// Diameter Wire Protocol Helpers (Item 108)
+// ============================================================================
+
+/// Diameter AVP data for wire encoding
+#[derive(Debug, Clone)]
+pub struct DiameterAvpData {
+    /// AVP Code (per RFC 6733)
+    pub code: u32,
+    /// Vendor-ID (0 = IETF, 10415 = 3GPP)
+    pub vendor_id: u32,
+    /// Raw AVP data
+    pub data: Vec<u8>,
+}
+
+/// Build a Diameter answer message with AVPs
+///
+/// Encodes per RFC 6733 Section 3:
+/// - 4 bytes: Version(1) + Message Length(3)
+/// - 4 bytes: Command Flags(1) + Command Code(3)
+/// - 4 bytes: Application-ID
+/// - 4 bytes: Hop-by-Hop Identifier
+/// - 4 bytes: End-to-End Identifier
+/// - AVPs
+pub fn build_diameter_answer(
+    command_code: u32,
+    application_id: u32,
+    avps: &[DiameterAvpData],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(256);
+
+    // Placeholder for header (20 bytes) - will fill length after
+    buf.extend_from_slice(&[0u8; 20]);
+
+    // Encode each AVP
+    for avp in avps {
+        let avp_len = if avp.vendor_id != 0 { 12 + avp.data.len() } else { 8 + avp.data.len() };
+        let padded_len = (avp_len + 3) & !3; // 4-byte aligned
+
+        // AVP Code (4 bytes)
+        buf.extend_from_slice(&avp.code.to_be_bytes());
+        // AVP Flags (1 byte) + AVP Length (3 bytes)
+        let flags: u8 = if avp.vendor_id != 0 { 0x80 } else { 0x40 }; // V flag or M flag
+        buf.push(flags);
+        buf.extend_from_slice(&(avp_len as u32).to_be_bytes()[1..4]);
+        // Vendor-ID (4 bytes, optional)
+        if avp.vendor_id != 0 {
+            buf.extend_from_slice(&avp.vendor_id.to_be_bytes());
+        }
+        // AVP Data
+        buf.extend_from_slice(&avp.data);
+        // Padding
+        let padding = padded_len - avp_len;
+        buf.extend(std::iter::repeat_n(0u8, padding));
+    }
+
+    let msg_len = buf.len() as u32;
+
+    // Fill header
+    buf[0] = 1; // Version
+    buf[1..4].copy_from_slice(&msg_len.to_be_bytes()[1..4]); // Length (3 bytes)
+    // Command Flags: Answer (no R-bit), Proxiable
+    buf[4] = 0x40; // P-bit set (proxiable)
+    buf[5..8].copy_from_slice(&command_code.to_be_bytes()[1..4]); // Command Code (3 bytes)
+    buf[8..12].copy_from_slice(&application_id.to_be_bytes()); // Application-ID
+    buf[12..16].copy_from_slice(&1u32.to_be_bytes()); // Hop-by-Hop (placeholder)
+    buf[16..20].copy_from_slice(&1u32.to_be_bytes()); // End-to-End (placeholder)
+
+    log::debug!("Built Diameter answer: cmd={}, app_id={}, len={}, avps={}",
+        command_code, application_id, msg_len, avps.len());
+
+    buf
+}
+
+/// Encode AIA (Authentication-Information-Answer) AVPs
+pub fn build_aia_avps(auth_info: &AirResponse) -> Vec<DiameterAvpData> {
+    let mut avps = Vec::new();
+
+    // Session-Id (263)
+    avps.push(DiameterAvpData {
+        code: 263, vendor_id: 0,
+        data: b"hss.s6a.session.1".to_vec(),
+    });
+
+    // Result-Code (268) - DIAMETER_SUCCESS
+    avps.push(DiameterAvpData {
+        code: 268, vendor_id: 0,
+        data: 2001u32.to_be_bytes().to_vec(),
+    });
+
+    // Auth-Session-State (277) - NO_STATE_MAINTAINED
+    avps.push(DiameterAvpData {
+        code: 277, vendor_id: 0,
+        data: 1u32.to_be_bytes().to_vec(),
+    });
+
+    // Authentication-Info (1413, 3GPP) containing E-UTRAN-Vector
+    let mut auth_data = Vec::new();
+    auth_data.extend_from_slice(&auth_info.rand);
+    auth_data.extend_from_slice(&auth_info.xres);
+    auth_data.extend_from_slice(&auth_info.autn);
+    auth_data.extend_from_slice(&auth_info.kasme);
+    avps.push(DiameterAvpData {
+        code: 1413, vendor_id: 10415,
+        data: auth_data,
+    });
+
+    avps
+}
+
+/// Encode ULA (Update-Location-Answer) AVPs
+pub fn build_ula_avps(ulr_resp: &UlrResponse) -> Vec<DiameterAvpData> {
+    let mut avps = Vec::new();
+
+    // Session-Id (263)
+    avps.push(DiameterAvpData {
+        code: 263, vendor_id: 0,
+        data: b"hss.s6a.session.1".to_vec(),
+    });
+
+    // Result-Code (268)
+    avps.push(DiameterAvpData {
+        code: 268, vendor_id: 0,
+        data: ulr_resp.result_code.to_be_bytes().to_vec(),
+    });
+
+    // ULA-Flags (1406, 3GPP) - Separation Indication
+    avps.push(DiameterAvpData {
+        code: 1406, vendor_id: 10415,
+        data: 1u32.to_be_bytes().to_vec(),
+    });
+
+    // Subscription-Data (1400, 3GPP)
+    if !ulr_resp.subscription_data.is_empty() {
+        avps.push(DiameterAvpData {
+            code: 1400, vendor_id: 10415,
+            data: ulr_resp.subscription_data.clone(),
+        });
+    }
+
+    avps
 }
 
 #[cfg(test)]
@@ -490,6 +894,17 @@ mod tests {
     }
 
     #[test]
+    fn test_send_diameter_answer() {
+        // Verify answer builder produces non-empty bytes
+        let avps = vec![
+            DiameterAvpData { code: 263, vendor_id: 0, data: b"session-1".to_vec() },
+            DiameterAvpData { code: 268, vendor_id: 0, data: 2001u32.to_be_bytes().to_vec() },
+        ];
+        let answer = build_diameter_answer(272, OGS_DIAM_S6A_APPLICATION_ID, &avps);
+        assert!(answer.len() > 20); // header + AVPs
+    }
+
+    #[test]
     fn test_handle_ulr() {
         // ULR requires MongoDB for subscription data - verify graceful error without DB
         let visited_plmn = [0x00, 0xF1, 0x10];
@@ -508,5 +923,74 @@ mod tests {
         // PUR requires MongoDB for subscriber collection - verify graceful error without DB
         let result = handle_pur("123456789012345", 0);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_dispatch_s6a_air_without_db() {
+        // Test dispatch without DB - should return error answer
+        let air = ogs_diameter::s6a::create_air(
+            "test-session-1",
+            "mme.epc.mnc001.mcc001.3gppnetwork.org",
+            "epc.mnc001.mcc001.3gppnetwork.org",
+            "epc.mnc001.mcc001.3gppnetwork.org",
+            "001010123456789",
+            &[0x00, 0xF1, 0x10],
+            1,
+        );
+        let answer = dispatch_s6a_request(&air);
+        assert!(answer.is_some());
+        let answer = answer.unwrap();
+        assert!(answer.header.is_answer());
+        assert_eq!(answer.header.command_code, 318);
+        // Without DB, should return error (5012 UNABLE_TO_COMPLY)
+        assert_eq!(answer.result_code(), Some(5012));
+    }
+
+    #[test]
+    fn test_dispatch_s6a_ulr_without_db() {
+        let ulr = ogs_diameter::s6a::create_ulr(
+            "test-session-2",
+            "mme.epc.mnc001.mcc001.3gppnetwork.org",
+            "epc.mnc001.mcc001.3gppnetwork.org",
+            "epc.mnc001.mcc001.3gppnetwork.org",
+            "001010123456789",
+            &[0x00, 0xF1, 0x10],
+            0x22, // S6A_S6D_INDICATOR | INITIAL_ATTACH_IND
+            1004, // E-UTRAN
+        );
+        let answer = dispatch_s6a_request(&ulr);
+        assert!(answer.is_some());
+        let answer = answer.unwrap();
+        assert!(answer.header.is_answer());
+        assert_eq!(answer.header.command_code, 316);
+    }
+
+    #[test]
+    fn test_dispatch_s6a_missing_username() {
+        // Build a request without User-Name
+        let mut msg = ogs_diameter::DiameterMessage::new_request(318, OGS_DIAM_S6A_APPLICATION_ID);
+        msg.add_avp(ogs_diameter::Avp::mandatory(
+            263,
+            ogs_diameter::AvpData::Utf8String("test-session".to_string()),
+        ));
+        let answer = dispatch_s6a_request(&msg);
+        assert!(answer.is_some());
+        let answer = answer.unwrap();
+        // Should return MISSING_AVP (5005)
+        assert_eq!(answer.result_code(), Some(5005));
+    }
+
+    #[test]
+    fn test_dispatch_s6a_unknown_command() {
+        let mut msg = ogs_diameter::DiameterMessage::new_request(999, OGS_DIAM_S6A_APPLICATION_ID);
+        msg.add_avp(ogs_diameter::Avp::mandatory(
+            1,
+            ogs_diameter::AvpData::Utf8String("001010123456789".to_string()),
+        ));
+        let answer = dispatch_s6a_request(&msg);
+        assert!(answer.is_some());
+        let answer = answer.unwrap();
+        // Should return COMMAND_UNSUPPORTED (3001)
+        assert_eq!(answer.result_code(), Some(3001));
     }
 }

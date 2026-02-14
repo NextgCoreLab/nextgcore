@@ -1,0 +1,104 @@
+{{- if .Values.smf.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-smf
+  labels:
+    app.kubernetes.io/name: smf
+    app.kubernetes.io/instance: {{ .Release.Name }}-smf
+    app.kubernetes.io/component: control-plane
+    {{- include "nextgcore.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.smf.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: smf
+      app.kubernetes.io/instance: {{ .Release.Name }}-smf
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: smf
+        app.kubernetes.io/instance: {{ .Release.Name }}-smf
+    spec:
+      containers:
+        - name: smf
+          image: {{ .Values.smf.image.repository }}:{{ .Values.smf.image.tag }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          ports:
+            - name: sbi
+              containerPort: {{ .Values.smf.service.sbiPort }}
+              protocol: TCP
+            - name: pfcp
+              containerPort: {{ .Values.smf.service.pfcpPort }}
+              protocol: UDP
+            {{- if .Values.smf.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.smf.metrics.port }}
+              protocol: TCP
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: sbi
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: sbi
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          env:
+            - name: RUST_LOG
+              value: info,nextgcore_smfd=debug
+            - name: NRF_SBI_ADDR
+              value: {{ .Release.Name }}-nrf
+            - name: NRF_SBI_PORT
+              value: "{{ .Values.global.sbi.port }}"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-smf
+  labels:
+    app.kubernetes.io/name: smf
+    {{- include "nextgcore.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.smf.service.type }}
+  ports:
+    - port: {{ .Values.smf.service.sbiPort }}
+      targetPort: sbi
+      protocol: TCP
+      name: sbi
+    - port: {{ .Values.smf.service.pfcpPort }}
+      targetPort: pfcp
+      protocol: UDP
+      name: pfcp
+    {{- if .Values.smf.metrics.enabled }}
+    - port: {{ .Values.smf.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+    {{- end }}
+  selector:
+    app.kubernetes.io/name: smf
+    app.kubernetes.io/instance: {{ .Release.Name }}-smf
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-smf-config
+  labels:
+    app.kubernetes.io/name: smf
+    {{- include "nextgcore.labels" . | nindent 4 }}
+data:
+  nf.yaml: |
+    smf:
+      sbi:
+        addr: 0.0.0.0
+        port: {{ .Values.smf.service.sbiPort }}
+      pfcp:
+        port: {{ .Values.smf.service.pfcpPort }}
+      subnet: {{ .Values.smf.config.subnet }}
+      dnn: {{ .Values.smf.config.dnn }}
+{{- end }}

@@ -334,6 +334,319 @@ pub fn init_otel(config: OtelConfig) -> Result<Arc<std::sync::Mutex<OtelProvider
     Ok(provider)
 }
 
+// ============================================================================
+// SBI Tracing Helpers (G32: OTel NF Integration)
+// ============================================================================
+
+/// NF type identifier for telemetry attributes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NfType {
+    Amf, Ausf, Bsf, Ees, Hss, Lmf, MbSmf, Mme, Nrf, Nsacf,
+    Nssf, Nwdaf, Pcf, Pcrf, Pin, Scp, Sepp, Sgwc, Sgwu, Smf, Udm, Udr, Upf,
+}
+
+impl NfType {
+    /// Get the string name of this NF type
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Amf => "AMF", Self::Ausf => "AUSF", Self::Bsf => "BSF",
+            Self::Ees => "EES", Self::Hss => "HSS", Self::Lmf => "LMF",
+            Self::MbSmf => "MB-SMF", Self::Mme => "MME", Self::Nrf => "NRF",
+            Self::Nsacf => "NSACF", Self::Nssf => "NSSF", Self::Nwdaf => "NWDAF",
+            Self::Pcf => "PCF", Self::Pcrf => "PCRF", Self::Pin => "PIN",
+            Self::Scp => "SCP", Self::Sepp => "SEPP", Self::Sgwc => "SGW-C",
+            Self::Sgwu => "SGW-U", Self::Smf => "SMF", Self::Udm => "UDM",
+            Self::Udr => "UDR", Self::Upf => "UPF",
+        }
+    }
+}
+
+/// SBI span for wrapping SBI service calls with trace context
+#[derive(Debug, Clone)]
+pub struct SbiSpan {
+    /// Parent trace context
+    pub parent: OtelSpanContext,
+    /// Span context for this SBI call
+    pub context: OtelSpanContext,
+    /// NF type making the call
+    pub nf_type: NfType,
+    /// SBI service name (e.g., "namf-comm", "nsmf-pdusession")
+    pub sbi_service: String,
+    /// Operation ID (e.g., "UEContextTransfer", "CreateSMContext")
+    pub operation_id: String,
+    /// HTTP method
+    pub method: String,
+    /// Target URI
+    pub uri: String,
+    /// Start time (monotonic nanos)
+    pub start_time_ns: u64,
+    /// HTTP status code (set on completion)
+    pub status_code: Option<u16>,
+    /// Error message if failed
+    pub error: Option<String>,
+}
+
+impl SbiSpan {
+    /// Create a new SBI span
+    pub fn new(
+        parent: &OtelSpanContext,
+        nf_type: NfType,
+        sbi_service: impl Into<String>,
+        operation_id: impl Into<String>,
+    ) -> Self {
+        let mut span_id = [0u8; 8];
+        // Simple span ID generation using timestamp
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        span_id.copy_from_slice(&now.to_be_bytes());
+
+        Self {
+            parent: parent.clone(),
+            context: OtelSpanContext {
+                trace_id: parent.trace_id,
+                span_id,
+                trace_flags: parent.trace_flags,
+                trace_state: parent.trace_state.clone(),
+            },
+            nf_type,
+            sbi_service: sbi_service.into(),
+            operation_id: operation_id.into(),
+            method: String::new(),
+            uri: String::new(),
+            start_time_ns: now,
+            status_code: None,
+            error: None,
+        }
+    }
+
+    /// Set HTTP method and URI
+    pub fn with_request(mut self, method: &str, uri: &str) -> Self {
+        self.method = method.to_string();
+        self.uri = uri.to_string();
+        self
+    }
+
+    /// Complete the span with a status code
+    pub fn complete(&mut self, status_code: u16) {
+        self.status_code = Some(status_code);
+    }
+
+    /// Complete the span with an error
+    pub fn complete_with_error(&mut self, error: impl Into<String>) {
+        self.error = Some(error.into());
+    }
+
+    /// Get span attributes as key-value pairs
+    pub fn attributes(&self) -> Vec<(&'static str, String)> {
+        let mut attrs = vec![
+            ("nf.type", self.nf_type.as_str().to_string()),
+            ("sbi.service", self.sbi_service.clone()),
+            ("sbi.operation", self.operation_id.clone()),
+        ];
+        if !self.method.is_empty() {
+            attrs.push(("http.method", self.method.clone()));
+        }
+        if !self.uri.is_empty() {
+            attrs.push(("http.url", self.uri.clone()));
+        }
+        if let Some(code) = self.status_code {
+            attrs.push(("http.status_code", code.to_string()));
+        }
+        if let Some(ref err) = self.error {
+            attrs.push(("error.message", err.clone()));
+        }
+        attrs
+    }
+
+    /// Inject trace context into HTTP headers (W3C traceparent)
+    pub fn inject_headers(&self) -> Vec<(String, String)> {
+        let mut headers = vec![
+            ("traceparent".to_string(), self.context.to_traceparent()),
+        ];
+        if let Some(ref state) = self.context.trace_state {
+            headers.push(("tracestate".to_string(), state.clone()));
+        }
+        headers
+    }
+}
+
+/// Extract trace context from HTTP headers
+pub fn extract_trace_context(headers: &[(String, String)]) -> Option<OtelSpanContext> {
+    headers.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("traceparent"))
+        .and_then(|(_, v)| OtelSpanContext::from_traceparent(v).ok())
+}
+
+// ============================================================================
+// NF Metrics Registry (G41: Prometheus NF Wiring)
+// ============================================================================
+
+/// Standard NF metrics that every NF should expose
+#[derive(Debug, Clone)]
+pub struct NfMetrics {
+    /// NF type
+    pub nf_type: NfType,
+    /// Total SBI requests received
+    pub sbi_request_total: u64,
+    /// Total SBI errors
+    pub sbi_error_total: u64,
+    /// Active sessions (UE contexts for AMF, PDU sessions for SMF, etc.)
+    pub active_sessions: u64,
+    /// Request duration histogram buckets (ms): [1, 5, 10, 25, 50, 100, 250, 500, 1000]
+    pub request_duration_buckets: [u64; 9],
+    /// Total request duration for average calculation
+    pub request_duration_total_ms: u64,
+    /// NF uptime in seconds
+    pub uptime_secs: u64,
+    /// NF registration status with NRF
+    pub registered_with_nrf: bool,
+}
+
+impl NfMetrics {
+    /// Create new metrics for an NF type
+    pub fn new(nf_type: NfType) -> Self {
+        Self {
+            nf_type,
+            sbi_request_total: 0,
+            sbi_error_total: 0,
+            active_sessions: 0,
+            request_duration_buckets: [0; 9],
+            request_duration_total_ms: 0,
+            uptime_secs: 0,
+            registered_with_nrf: false,
+        }
+    }
+
+    /// Record an SBI request
+    pub fn record_request(&mut self, duration_ms: u64, is_error: bool) {
+        self.sbi_request_total += 1;
+        if is_error {
+            self.sbi_error_total += 1;
+        }
+        self.request_duration_total_ms += duration_ms;
+
+        // Update histogram buckets
+        let thresholds = [1, 5, 10, 25, 50, 100, 250, 500, 1000];
+        for (i, &threshold) in thresholds.iter().enumerate() {
+            if duration_ms <= threshold {
+                self.request_duration_buckets[i] += 1;
+            }
+        }
+    }
+
+    /// Get error rate (0.0 - 1.0)
+    pub fn error_rate(&self) -> f64 {
+        if self.sbi_request_total == 0 {
+            0.0
+        } else {
+            self.sbi_error_total as f64 / self.sbi_request_total as f64
+        }
+    }
+
+    /// Get average request duration in ms
+    pub fn avg_duration_ms(&self) -> f64 {
+        if self.sbi_request_total == 0 {
+            0.0
+        } else {
+            self.request_duration_total_ms as f64 / self.sbi_request_total as f64
+        }
+    }
+
+    /// Generate Prometheus exposition format
+    pub fn to_prometheus(&self) -> String {
+        let nf = self.nf_type.as_str().to_lowercase();
+        let mut output = String::new();
+
+        output.push_str(&format!(
+            "# HELP nextgcore_{nf}_sbi_request_total Total SBI requests\n\
+             # TYPE nextgcore_{nf}_sbi_request_total counter\n\
+             nextgcore_{nf}_sbi_request_total {}\n",
+            self.sbi_request_total
+        ));
+        output.push_str(&format!(
+            "# HELP nextgcore_{nf}_sbi_error_total Total SBI errors\n\
+             # TYPE nextgcore_{nf}_sbi_error_total counter\n\
+             nextgcore_{nf}_sbi_error_total {}\n",
+            self.sbi_error_total
+        ));
+        output.push_str(&format!(
+            "# HELP nextgcore_{nf}_active_sessions Active sessions\n\
+             # TYPE nextgcore_{nf}_active_sessions gauge\n\
+             nextgcore_{nf}_active_sessions {}\n",
+            self.active_sessions
+        ));
+        output.push_str(&format!(
+            "# HELP nextgcore_{nf}_uptime_seconds NF uptime\n\
+             # TYPE nextgcore_{nf}_uptime_seconds gauge\n\
+             nextgcore_{nf}_uptime_seconds {}\n",
+            self.uptime_secs
+        ));
+        output.push_str(&format!(
+            "# HELP nextgcore_{nf}_nrf_registered NRF registration status\n\
+             # TYPE nextgcore_{nf}_nrf_registered gauge\n\
+             nextgcore_{nf}_nrf_registered {}\n",
+            if self.registered_with_nrf { 1 } else { 0 }
+        ));
+
+        output
+    }
+}
+
+// ============================================================================
+// Jaeger Configuration (G43: Jaeger Trace Wiring)
+// ============================================================================
+
+/// Jaeger exporter configuration
+#[derive(Debug, Clone)]
+pub struct JaegerConfig {
+    /// Jaeger collector endpoint
+    pub endpoint: String,
+    /// Service name
+    pub service_name: String,
+    /// Sampling rate (0.0 - 1.0)
+    pub sampling_rate: f64,
+    /// Whether to propagate baggage items
+    pub propagate_baggage: bool,
+    /// Max tag value length
+    pub max_tag_value_length: usize,
+}
+
+impl Default for JaegerConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: "http://localhost:14268/api/traces".to_string(),
+            service_name: "nextgcore".to_string(),
+            sampling_rate: 1.0,
+            propagate_baggage: true,
+            max_tag_value_length: 256,
+        }
+    }
+}
+
+impl JaegerConfig {
+    /// Create a new Jaeger config for an NF
+    pub fn for_nf(nf_type: NfType) -> Self {
+        Self {
+            service_name: format!("nextgcore-{}", nf_type.as_str().to_lowercase()),
+            ..Default::default()
+        }
+    }
+
+    /// Set endpoint
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = endpoint.into();
+        self
+    }
+
+    /// Set sampling rate
+    pub fn with_sampling_rate(mut self, rate: f64) -> Self {
+        self.sampling_rate = rate.clamp(0.0, 1.0);
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

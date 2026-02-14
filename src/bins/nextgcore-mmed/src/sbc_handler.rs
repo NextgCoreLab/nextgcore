@@ -55,7 +55,7 @@ pub fn handle_write_replace_warning_request(
     let enb_pool = match mme_ctx.enb_pool.read() {
         Ok(pool) => pool,
         Err(e) => {
-            error!("Failed to acquire eNB pool lock: {}", e);
+            error!("Failed to acquire eNB pool lock: {e}");
             return Err(SbcCause::MmeCapacityExceeded);
         }
     };
@@ -139,7 +139,7 @@ pub fn handle_stop_warning_request(
     let enb_pool = match mme_ctx.enb_pool.read() {
         Ok(pool) => pool,
         Err(e) => {
-            error!("Failed to acquire eNB pool lock: {}", e);
+            error!("Failed to acquire eNB pool lock: {e}");
             return Err(SbcCause::MmeCapacityExceeded);
         }
     };
@@ -196,13 +196,13 @@ pub fn handle_pws_restart_indication(
     _mme_ctx: &Arc<MmeContext>,
     enb_id: u32,
 ) {
-    info!("[PWS-Restart] eNB {:08x} restarted, re-sending active warnings", enb_id);
+    info!("[PWS-Restart] eNB {enb_id:08x} restarted, re-sending active warnings");
 
     // In a full implementation:
     // 1. Look up active warnings for this eNB's TAIs
     // 2. Re-send Write-Replace Warning for each active warning
     // For now, just log the event
-    debug!("PWS restart indication from eNB {:08x} - stub implementation", enb_id);
+    debug!("PWS restart indication from eNB {enb_id:08x} - stub implementation");
 }
 
 /// Handle PWS Failure Indication
@@ -215,8 +215,7 @@ pub fn handle_pws_failure_indication(
     serial_number: u16,
 ) {
     warn!(
-        "[PWS-Failure] eNB {:08x} failed to broadcast message_id={:#06x} serial_number={:#06x}",
-        enb_id, message_id, serial_number
+        "[PWS-Failure] eNB {enb_id:08x} failed to broadcast message_id={message_id:#06x} serial_number={serial_number:#06x}"
     );
 
     // In a full implementation, would:

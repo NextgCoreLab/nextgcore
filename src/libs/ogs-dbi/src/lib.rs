@@ -38,7 +38,7 @@ pub use graphdb::{
 };
 pub use tsdb::{
     TsDbClient, TimeSeries, DataPoint, Timestamp, NetworkMetricsCollector,
-    TsDbError, TsDbResult,
+    TsDbError, TsDbResult, MetricStats,
 };
 pub use federation::{
     FederationClient, FederatedQuery, FederatedResponse, OperatorId,

@@ -28,7 +28,7 @@ impl<'a> MongoDbTestContainer<'a> {
         let container = docker.run(mongo_image);
         let port = container.get_host_port_ipv4(27017);
         
-        let connection_string = format!("mongodb://localhost:{}", port);
+        let connection_string = format!("mongodb://localhost:{port}");
         
         // Connect to MongoDB (sync API)
         let client_options = ClientOptions::parse(&connection_string)?;
@@ -59,7 +59,7 @@ impl<'a> MongoDbTestContainer<'a> {
                 }
                 Err(e) => {
                     if i == max_retries - 1 {
-                        return Err(anyhow::anyhow!("MongoDB not ready after {} attempts: {}", max_retries, e));
+                        return Err(anyhow::anyhow!("MongoDB not ready after {max_retries} attempts: {e}"));
                     }
                     std::thread::sleep(retry_delay);
                 }
@@ -159,7 +159,7 @@ mod tests {
                         log::info!("MongoDB container started at: {}", mongo.connection_string());
                     }
                     Err(e) => {
-                        log::warn!("MongoDB container failed to start: {}", e);
+                        log::warn!("MongoDB container failed to start: {e}");
                     }
                 }
             }

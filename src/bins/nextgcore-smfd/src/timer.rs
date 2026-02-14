@@ -283,13 +283,13 @@ impl TimerManager {
     /// Stop all timers for session
     pub fn stop_all_sess_timers(&mut self, sess_id: u64) {
         self.active_timers.retain(|t| t.sess_id != Some(sess_id));
-        log::debug!("Stopped all timers for session {}", sess_id);
+        log::debug!("Stopped all timers for session {sess_id}");
     }
 
     /// Stop all timers for PFCP node
     pub fn stop_all_pfcp_node_timers(&mut self, pfcp_node_id: u64) {
         self.active_timers.retain(|t| t.pfcp_node_id != Some(pfcp_node_id));
-        log::debug!("Stopped all timers for PFCP node {}", pfcp_node_id);
+        log::debug!("Stopped all timers for PFCP node {pfcp_node_id}");
     }
 
     /// Get active timer count

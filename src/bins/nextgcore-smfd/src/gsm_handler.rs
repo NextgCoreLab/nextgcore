@@ -241,7 +241,7 @@ pub fn determine_pdu_session_type(
         5 => PduSessionType::Ethernet,
         0 => subscribed_type, // No preference, use subscribed
         _ => {
-            log::warn!("Unknown UE requested PDU session type: {}", ue_requested_type);
+            log::warn!("Unknown UE requested PDU session type: {ue_requested_type}");
             return Err(GsmCause::UnknownPduSessionType);
         }
     };
@@ -376,7 +376,7 @@ pub fn validate_ssc_mode(ue_ssc_mode: u8, subscribed_ssc_mode: u8) -> Result<u8,
         }
         0 => Ok(1), // No preference, use SSC mode 1
         _ => {
-            log::error!("Invalid SSC mode: {}", ue_ssc_mode);
+            log::error!("Invalid SSC mode: {ue_ssc_mode}");
             Err(GsmCause::NotSupportedSscMode)
         }
     }
@@ -593,14 +593,13 @@ pub fn handle_pdu_session_modification_request(
     }
 
     // Validate PFCP flags
-    if pfcp_flags & pfcp_flags::MODIFY_REMOVE != 0 {
-        if pfcp_flags & (pfcp_flags::MODIFY_TFT_NEW | pfcp_flags::MODIFY_TFT_ADD |
+    if pfcp_flags & pfcp_flags::MODIFY_REMOVE != 0
+        && pfcp_flags & (pfcp_flags::MODIFY_TFT_NEW | pfcp_flags::MODIFY_TFT_ADD |
                         pfcp_flags::MODIFY_TFT_REPLACE | pfcp_flags::MODIFY_TFT_DELETE |
                         pfcp_flags::MODIFY_QOS_MODIFY) != 0 {
             log::error!("[PSI:{}] Invalid PFCP flags combination: 0x{:x}", sess.psi, pfcp_flags);
             return Err(GsmCause::InvalidMandatoryInformation);
         }
-    }
 
     pfcp_flags |= pfcp_flags::MODIFY_UE_REQUESTED;
 

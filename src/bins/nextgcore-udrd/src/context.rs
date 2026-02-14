@@ -70,8 +70,8 @@ impl UdrContext {
         }
 
         // Finalize all UE and session state machines
-        for (_, ue) in &mut self.ues {
-            for (_, sess) in &mut ue.sessions {
+        for ue in self.ues.values_mut() {
+            for sess in ue.sessions.values_mut() {
                 sess.sm.fini();
             }
             ue.sm.fini();
@@ -96,7 +96,7 @@ impl UdrContext {
     /// Find or create a UE context by SUPI
     pub fn ue_find_or_add(&mut self, supi: &str) -> &mut UdrUe {
         if !self.ues.contains_key(supi) {
-            log::debug!("[{}] Creating UDR UE context", supi);
+            log::debug!("[{supi}] Creating UDR UE context");
             let ue = UdrUe {
                 supi: supi.to_string(),
                 sm: UdrUeSmContext::new(supi),
@@ -120,11 +120,11 @@ impl UdrContext {
     /// Remove a UE context by SUPI
     pub fn ue_remove(&mut self, supi: &str) -> Option<UdrUe> {
         if let Some(mut ue) = self.ues.remove(supi) {
-            for (_, sess) in &mut ue.sessions {
+            for sess in ue.sessions.values_mut() {
                 sess.sm.fini();
             }
             ue.sm.fini();
-            log::debug!("[{}] Removed UDR UE context", supi);
+            log::debug!("[{supi}] Removed UDR UE context");
             Some(ue)
         } else {
             None
@@ -139,16 +139,16 @@ impl UdrContext {
     /// Find or create a session context for a UE
     pub fn sess_find_or_add(&mut self, supi: &str, psi: u8, dnn: Option<&str>) -> Option<&mut UdrSess> {
         let ue = self.ue_find_or_add(supi);
-        if !ue.sessions.contains_key(&psi) {
-            log::debug!("[{}:{}] Creating UDR session context", supi, psi);
-            let sess = UdrSess {
+        ue.sessions.entry(psi).or_insert_with(|| {
+            log::debug!("[{supi}:{psi}] Creating UDR session context");
+            
+            UdrSess {
                 supi: supi.to_string(),
                 psi,
                 dnn: dnn.map(|s| s.to_string()),
                 sm: UdrSessSmContext::new(supi, psi, dnn),
-            };
-            ue.sessions.insert(psi, sess);
-        }
+            }
+        });
         ue.sessions.get_mut(&psi)
     }
 
@@ -162,7 +162,7 @@ impl UdrContext {
         if let Some(ue) = self.ues.get_mut(supi) {
             if let Some(mut sess) = ue.sessions.remove(&psi) {
                 sess.sm.fini();
-                log::debug!("[{}:{}] Removed UDR session context", supi, psi);
+                log::debug!("[{supi}:{psi}] Removed UDR session context");
                 return Some(sess);
             }
         }

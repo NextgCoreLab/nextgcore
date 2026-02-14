@@ -248,7 +248,7 @@ pub fn query_subscription_data_pub(supi: &str) -> Option<SubscriptionData> {
 /// Query subscription data from database via ogs-dbi
 /// In C: ogs_dbi_subscription_data()
 fn query_subscription_data(supi: &str) -> Option<SubscriptionData> {
-    log::debug!("Querying subscription data for SUPI: {}", supi);
+    log::debug!("Querying subscription data for SUPI: {supi}");
 
     match ogs_dbi::ogs_dbi_subscription_data(supi) {
         Ok(sub_data) => {
@@ -265,9 +265,7 @@ fn query_subscription_data(supi: &str) -> Option<SubscriptionData> {
         }
         Err(e) => {
             log::warn!(
-                "[{}] Failed to query subscription data from DB: {}, using defaults",
-                supi,
-                e
+                "[{supi}] Failed to query subscription data from DB: {e}, using defaults"
             );
             // Fallback to default values when DB is unavailable
             Some(SubscriptionData {
@@ -287,10 +285,7 @@ pub fn pcf_get_session_data(
     dnn: &str,
 ) -> Option<SessionData> {
     log::debug!(
-        "Getting session data for SUPI={}, S-NSSAI={:?}, DNN={}",
-        supi,
-        s_nssai,
-        dnn
+        "Getting session data for SUPI={supi}, S-NSSAI={s_nssai:?}, DNN={dnn}"
     );
 
     let ogs_snssai = ogs_dbi::OgsSNssai::new(s_nssai.sst, s_nssai.sd);
@@ -351,9 +346,7 @@ pub fn pcf_get_session_data(
         }
         Err(e) => {
             log::warn!(
-                "[{}] Failed to query session data from DB: {}, using defaults",
-                supi,
-                e
+                "[{supi}] Failed to query session data from DB: {e}, using defaults"
             );
             // Fallback to default values when DB is unavailable
             Some(SessionData {

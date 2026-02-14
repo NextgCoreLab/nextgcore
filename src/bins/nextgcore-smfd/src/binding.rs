@@ -714,14 +714,36 @@ pub fn process_qos_flow_binding(
                         ));
                         continue;
                     }
-                    
+
                     if existing_flows.len() >= MAX_NUM_OF_BEARER {
                         results.push(QosFlowBindingResult::Error(
                             format!("QoS flow overflow: {}", existing_flows.len())
                         ));
                         continue;
                     }
-                    
+
+                    // Rel-16: Enforce strict URLLC constraints for 5QI 80-81
+                    // Note: 5QI 82-85 are XR delay-critical GBR with relaxed constraints
+                    use crate::context::UrllcConstraints;
+                    let five_qi = pcc_rule.qos.qci;
+                    if UrllcConstraints::is_strict_urllc_5qi(five_qi) {
+                        let priority_level = pcc_rule.qos.arp.priority_level;
+                        let packet_delay_budget_ms = 10;
+
+                        if !UrllcConstraints::enforce_urllc_constraints(
+                            five_qi,
+                            priority_level,
+                            packet_delay_budget_ms,
+                        ) {
+                            results.push(QosFlowBindingResult::Error(
+                                format!(
+                                    "URLLC constraints not met for 5QI {five_qi}: priority={priority_level}, pdb={packet_delay_budget_ms}ms"
+                                )
+                            ));
+                            continue;
+                        }
+                    }
+
                     pfcp_flags |= pfcp_modify::CREATE;
                     results.push(QosFlowBindingResult::Created {
                         qos_flow_id: 0, // Would be assigned by caller
@@ -780,9 +802,9 @@ pub fn encode_traffic_flow_template(
         }
         
         let mut tft_pf = TftPacketFilter {
-            identifier: pf.identifier.saturating_sub(1) as u8,
+            identifier: pf.identifier.saturating_sub(1),
             direction: pf.direction as u8,
-            precedence: pf.precedence.saturating_sub(1) as u8,
+            precedence: pf.precedence.saturating_sub(1),
             content: PacketFilterContent::default(),
         };
         
@@ -888,16 +910,184 @@ fn ipfw_rule_to_pf_content(rule: &IpfwRule, direction: FlowDirection) -> PacketF
 
 
 /// Validate PFCP flags for consistency
-/// 
+///
 /// Ensures that CREATE and REMOVE flags are not both set
 pub fn validate_pfcp_flags(flags: u64) -> Result<(), &'static str> {
     let check = flags & (pfcp_modify::CREATE | pfcp_modify::REMOVE);
-    
+
     if check != 0 && check != pfcp_modify::CREATE && check != pfcp_modify::REMOVE {
         return Err("Invalid flags: CREATE and REMOVE cannot both be set");
     }
-    
+
     Ok(())
+}
+
+// ============================================================================
+// Rel-18 XR/URLLC QoS Flow Binding (5QI 82-85)
+// ============================================================================
+
+/// 5QI resource type classification
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QosResourceType {
+    /// GBR (Guaranteed Bit Rate)
+    Gbr,
+    /// Non-GBR
+    NonGbr,
+    /// Delay-critical GBR (Rel-16+, XR/URLLC)
+    DelayCriticalGbr,
+}
+
+/// XR/URLLC 5QI characteristics (TS 23.501 Table 5.7.4-1)
+#[derive(Debug, Clone)]
+pub struct FiveQiCharacteristics {
+    /// 5QI value
+    pub five_qi: u8,
+    /// Resource type
+    pub resource_type: QosResourceType,
+    /// Default priority level (1-127, lower = higher priority)
+    pub priority: u8,
+    /// Packet delay budget in milliseconds
+    pub packet_delay_budget_ms: u32,
+    /// Packet error rate (e.g., 1e-6 stored as 6)
+    pub packet_error_rate_exp: u8,
+    /// Default averaging window (ms), only for GBR
+    pub averaging_window_ms: Option<u32>,
+}
+
+/// Standard 5QI table for XR/URLLC (Rel-18, TS 23.501)
+pub fn xr_urllc_5qi_table() -> Vec<FiveQiCharacteristics> {
+    vec![
+        // 5QI 82: Delay-critical GBR, XR/cloud gaming DL
+        FiveQiCharacteristics {
+            five_qi: 82,
+            resource_type: QosResourceType::DelayCriticalGbr,
+            priority: 19,
+            packet_delay_budget_ms: 10,
+            packet_error_rate_exp: 4,
+            averaging_window_ms: Some(2000),
+        },
+        // 5QI 83: Delay-critical GBR, XR/cloud gaming DL with higher error tolerance
+        FiveQiCharacteristics {
+            five_qi: 83,
+            resource_type: QosResourceType::DelayCriticalGbr,
+            priority: 22,
+            packet_delay_budget_ms: 15,
+            packet_error_rate_exp: 3,
+            averaging_window_ms: Some(2000),
+        },
+        // 5QI 84: Delay-critical GBR, XR split rendering DL
+        FiveQiCharacteristics {
+            five_qi: 84,
+            resource_type: QosResourceType::DelayCriticalGbr,
+            priority: 24,
+            packet_delay_budget_ms: 30,
+            packet_error_rate_exp: 5,
+            averaging_window_ms: Some(2000),
+        },
+        // 5QI 85: Delay-critical GBR, XR split rendering UL
+        FiveQiCharacteristics {
+            five_qi: 85,
+            resource_type: QosResourceType::DelayCriticalGbr,
+            priority: 21,
+            packet_delay_budget_ms: 5,
+            packet_error_rate_exp: 5,
+            averaging_window_ms: Some(2000),
+        },
+    ]
+}
+
+/// Look up XR/URLLC 5QI characteristics
+pub fn lookup_xr_5qi(five_qi: u8) -> Option<FiveQiCharacteristics> {
+    xr_urllc_5qi_table().into_iter().find(|c| c.five_qi == five_qi)
+}
+
+/// Check if a 5QI value is an XR/URLLC delay-critical type
+pub fn is_xr_5qi(five_qi: u8) -> bool {
+    (82..=85).contains(&five_qi)
+}
+
+/// Create a PCC rule pre-configured for XR/URLLC QoS flow binding.
+///
+/// Sets appropriate 5QI, GBR rates, and flow description for XR traffic.
+pub fn create_xr_pcc_rule(
+    rule_id: &str,
+    five_qi: u8,
+    gbr_dl_bps: u64,
+    gbr_ul_bps: u64,
+    mbr_dl_bps: u64,
+    mbr_ul_bps: u64,
+    flow_description: &str,
+) -> PccRule {
+    let chars = lookup_xr_5qi(five_qi);
+    let arp_priority = chars.as_ref().map(|c| c.priority).unwrap_or(25);
+
+    let mut rule = PccRule::new_5gc_install(rule_id);
+    rule.set_qos(PccQos {
+        qci: five_qi,
+        arp: ArpParams {
+            priority_level: arp_priority,
+            pre_emption_capability: true,  // XR can preempt lower-priority
+            pre_emption_vulnerability: false,
+        },
+        mbr: BitRate {
+            uplink: mbr_ul_bps,
+            downlink: mbr_dl_bps,
+        },
+        gbr: BitRate {
+            uplink: gbr_ul_bps,
+            downlink: gbr_dl_bps,
+        },
+    });
+    rule.add_flow(FlowDir::Bidirectional, flow_description);
+    rule.set_precedence(10); // high precedence for XR
+    rule
+}
+
+/// Process XR-aware QoS flow binding.
+///
+/// Extends standard QoS flow binding with XR/URLLC-specific logic:
+/// - Validates that XR 5QI values (82-85) get delay-critical GBR treatment
+/// - Ensures GBR rates are provided for delay-critical flows
+/// - Returns enriched results with XR metadata
+pub fn process_xr_qos_flow_binding(
+    policy: &SessionPolicy,
+    existing_flows: &[SmfBearer],
+) -> (Vec<QosFlowBindingResult>, u64, Vec<XrFlowMetadata>) {
+    let (results, flags) = process_qos_flow_binding(policy, existing_flows);
+
+    let mut xr_metadata = Vec::new();
+    for rule in &policy.pcc_rules {
+        if rule.rule_type == PccRuleType::Install && is_xr_5qi(rule.qos.qci) {
+            let chars = lookup_xr_5qi(rule.qos.qci);
+            xr_metadata.push(XrFlowMetadata {
+                rule_id: rule.id.clone().unwrap_or_default(),
+                five_qi: rule.qos.qci,
+                delay_budget_ms: chars.as_ref().map(|c| c.packet_delay_budget_ms).unwrap_or(30),
+                gbr_dl_bps: rule.qos.gbr.downlink,
+                gbr_ul_bps: rule.qos.gbr.uplink,
+                requires_pdb_enforcement: true,
+            });
+        }
+    }
+
+    (results, flags, xr_metadata)
+}
+
+/// Metadata for an XR QoS flow
+#[derive(Debug, Clone)]
+pub struct XrFlowMetadata {
+    /// PCC rule ID
+    pub rule_id: String,
+    /// 5QI value
+    pub five_qi: u8,
+    /// Packet delay budget (ms)
+    pub delay_budget_ms: u32,
+    /// GBR downlink (bps)
+    pub gbr_dl_bps: u64,
+    /// GBR uplink (bps)
+    pub gbr_ul_bps: u64,
+    /// Whether PDB enforcement is required
+    pub requires_pdb_enforcement: bool,
 }
 
 // ============================================================================
@@ -1124,5 +1314,87 @@ mod tests {
         let encoded = tft.encode();
         // First byte: operation code (2) << 5 | num_pf (0) = 0x40
         assert_eq!(encoded[0], 0x40);
+    }
+
+    #[test]
+    fn test_xr_5qi_lookup() {
+        let c82 = lookup_xr_5qi(82).unwrap();
+        assert_eq!(c82.resource_type, QosResourceType::DelayCriticalGbr);
+        assert_eq!(c82.packet_delay_budget_ms, 10);
+
+        let c85 = lookup_xr_5qi(85).unwrap();
+        assert_eq!(c85.packet_delay_budget_ms, 5);
+        assert_eq!(c85.priority, 21);
+
+        assert!(lookup_xr_5qi(9).is_none()); // not XR
+    }
+
+    #[test]
+    fn test_is_xr_5qi() {
+        assert!(is_xr_5qi(82));
+        assert!(is_xr_5qi(83));
+        assert!(is_xr_5qi(84));
+        assert!(is_xr_5qi(85));
+        assert!(!is_xr_5qi(9));
+        assert!(!is_xr_5qi(1));
+        assert!(!is_xr_5qi(86));
+    }
+
+    #[test]
+    fn test_create_xr_pcc_rule() {
+        let rule = create_xr_pcc_rule(
+            "xr-dl-1",
+            82,
+            50_000_000,  // 50 Mbps GBR DL
+            10_000_000,  // 10 Mbps GBR UL
+            100_000_000, // 100 Mbps MBR DL
+            20_000_000,  // 20 Mbps MBR UL
+            "permit out ip from any to assigned",
+        );
+        assert_eq!(rule.qos.qci, 82);
+        assert_eq!(rule.qos.gbr.downlink, 50_000_000);
+        assert_eq!(rule.qos.gbr.uplink, 10_000_000);
+        assert_eq!(rule.qos.mbr.downlink, 100_000_000);
+        assert!(rule.qos.arp.pre_emption_capability);
+        assert!(!rule.qos.arp.pre_emption_vulnerability);
+        assert_eq!(rule.precedence, 10);
+        assert_eq!(rule.flows.len(), 1);
+    }
+
+    #[test]
+    fn test_xr_qos_flow_binding() {
+        let mut policy = SessionPolicy::new();
+        let rule = create_xr_pcc_rule(
+            "xr-flow-1",
+            83,
+            30_000_000,
+            5_000_000,
+            60_000_000,
+            10_000_000,
+            "permit out ip from any to assigned",
+        );
+        policy.add_rule(rule);
+
+        let (results, flags, xr_meta) = process_xr_qos_flow_binding(&policy, &[]);
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], QosFlowBindingResult::Created { .. }));
+        assert!(flags & pfcp_modify::CREATE != 0);
+
+        assert_eq!(xr_meta.len(), 1);
+        assert_eq!(xr_meta[0].five_qi, 83);
+        assert_eq!(xr_meta[0].delay_budget_ms, 15);
+        assert_eq!(xr_meta[0].gbr_dl_bps, 30_000_000);
+        assert!(xr_meta[0].requires_pdb_enforcement);
+    }
+
+    #[test]
+    fn test_xr_urllc_5qi_table_completeness() {
+        let table = xr_urllc_5qi_table();
+        assert_eq!(table.len(), 4);
+        for entry in &table {
+            assert!(is_xr_5qi(entry.five_qi));
+            assert_eq!(entry.resource_type, QosResourceType::DelayCriticalGbr);
+            assert!(entry.averaging_window_ms.is_some());
+        }
     }
 }

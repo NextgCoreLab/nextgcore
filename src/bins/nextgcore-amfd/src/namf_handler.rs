@@ -2,7 +2,7 @@
 //!
 //! Port of src/amf/namf-handler.c - Namf-comm service handlers
 
-use crate::context::{AmfUe, AmfSess, RanUe, ResourceStatus};
+use crate::context::{AmfUe, AmfSess, RanUe, ResourceStatus, PagingContext, amf_self};
 
 // ============================================================================
 // N1N2 Message Transfer Types
@@ -358,9 +358,14 @@ pub fn handle_n1_n2_message_transfer(
                 } else {
                     // No N1 message - network triggered service request
                     if !amf_ue.security_context_available {
-                        // UE is idle, need to page
+                        // UE is idle, need to page (TS 23.502 4.2.3.3)
                         cause = N1N2MessageTransferCause::AttemptingToReachUe;
-                        log::debug!("UE is idle, initiating paging");
+                        initiate_paging_for_idle_ue(
+                            amf_ue, sess,
+                            req_data.n1_message.clone(),
+                            n2_info.ngap_data.clone(),
+                            req_data.pdu_session_id,
+                        );
                     } else {
                         // UE is connected
                         log::debug!("Sending PDU session setup request");
@@ -381,7 +386,12 @@ pub fn handle_n1_n2_message_transfer(
                         cause = N1N2MessageTransferCause::N1MsgNotTransferred;
                     } else {
                         cause = N1N2MessageTransferCause::AttemptingToReachUe;
-                        log::debug!("UE is idle, initiating paging for release");
+                        initiate_paging_for_idle_ue(
+                            amf_ue, sess,
+                            req_data.n1_message.clone(),
+                            n2_info.ngap_data.clone(),
+                            req_data.pdu_session_id,
+                        );
                     }
                 } else {
                     log::debug!("Sending PDU session release command");
@@ -531,13 +541,73 @@ pub fn send_event_notification(
     Ok(())
 }
 
+// ============================================================================
+// Paging Trigger (TS 23.502 4.2.3.3)
+// ============================================================================
+
+/// Initiate paging for an idle UE when DL data arrives
+///
+/// Creates a PagingContext, stores it in the AMF context paging map,
+/// and marks the session paging as ongoing. The NGAP Paging message
+/// will be sent by the event loop timer when it processes paging entries.
+fn initiate_paging_for_idle_ue(
+    amf_ue: &AmfUe,
+    sess: &mut AmfSess,
+    pending_n1: Option<Vec<u8>>,
+    pending_n2: Option<Vec<u8>>,
+    pdu_session_id: Option<u8>,
+) {
+    // Extract 5G-S-TMSI components from current GUTI
+    let tmsi = amf_ue.current_guti.tmsi;
+    let amf_set_id = amf_ue.current_guti.amf_set_id;
+    let amf_pointer = amf_ue.current_guti.amf_pointer;
+    let plmn_id = amf_ue.current_guti.plmn_id.clone();
+
+    // Use the last known TAC from the UE's registration area
+    let tac = amf_ue.nr_tai.tac;
+
+    let paging_ctx = PagingContext {
+        amf_ue_ngap_id: amf_ue.id,
+        tmsi,
+        amf_set_id,
+        amf_pointer,
+        plmn_id,
+        tac,
+        initiated_at: std::time::Instant::now(),
+        retransmit_count: 0,
+        max_retransmit: 4,
+        pending_n1,
+        pending_n2,
+        pdu_session_id,
+    };
+
+    // Store paging context in AMF global context
+    let ctx = amf_self();
+    if let Ok(context) = ctx.read() {
+        context.paging_add(paging_ctx);
+    }
+
+    // Mark session as paging ongoing
+    let location = format!(
+        "/namf-comm/v1/ue-contexts/{}/n1-n2-messages",
+        amf_ue.supi.as_deref().unwrap_or("unknown")
+    );
+    sess.store_paging_info(&location, None);
+
+    log::info!(
+        "[{}] Paging initiated: TMSI=0x{:08x}, TAC={}, PSI={:?}",
+        amf_ue.supi.as_deref().unwrap_or("unknown"),
+        tmsi, tac, pdu_session_id
+    );
+}
+
 /// Handle event unsubscribe (Namf_EventExposure_Unsubscribe)
 ///
 /// This is called when NF wants to cancel an event subscription
 pub fn handle_event_unsubscribe(
     subscription_id: &str,
 ) -> NamfHandlerResult<()> {
-    log::info!("Event unsubscribe request: subscription={}", subscription_id);
+    log::info!("Event unsubscribe request: subscription={subscription_id}");
 
     // In real implementation, this would:
     // 1. Look up subscription by ID
@@ -545,7 +615,7 @@ pub fn handle_event_unsubscribe(
     // 3. Stop sending notifications
 
     // For now, just log
-    log::debug!("Removed event subscription: {}", subscription_id);
+    log::debug!("Removed event subscription: {subscription_id}");
 
     Ok(())
 }
@@ -716,5 +786,35 @@ mod tests {
         assert_eq!(AmfEventType::LocationReport.as_str(), "LOCATION_REPORT");
         assert_eq!(AmfEventType::ReachabilityReport.as_str(), "REACHABILITY_REPORT");
         assert_eq!(AmfEventType::PduSessStatusReport.as_str(), "PDU_SESS_STATUS_REPORT");
+    }
+
+    #[test]
+    fn test_n1n2_transfer_idle_ue_triggers_paging() {
+        amf_context_init(64, 1024, 4096);
+
+        let mut ue = AmfUe::default();
+        ue.supi = Some("imsi-310260000000001".to_string());
+        ue.security_context_available = false; // UE is IDLE
+        ue.current_guti.tmsi = 0xAABBCCDD;
+        ue.current_guti.amf_set_id = 1;
+        ue.current_guti.amf_pointer = 0;
+        ue.nr_tai.tac = 7;
+
+        let mut sess = create_test_sess();
+        let req = N1N2MessageTransferReqData {
+            pdu_session_id: Some(1),
+            n1_message: None,
+            n2_info: Some(N2InfoContainer {
+                ngap_ie_type: NgapIeType::PduResSetupReq,
+                ngap_data: Some(vec![0x04, 0x05]),
+            }),
+            ..Default::default()
+        };
+
+        let result = handle_n1_n2_message_transfer(&ue, &mut sess, None, &req);
+        assert!(result.is_ok());
+        let rsp = result.unwrap();
+        assert_eq!(rsp.cause, N1N2MessageTransferCause::AttemptingToReachUe);
+        assert!(sess.paging.ongoing);
     }
 }

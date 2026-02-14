@@ -41,7 +41,7 @@ pub fn handle_create_session_response(
     let sess = match sess {
         Some(s) => s,
         None => {
-            log::error!("No Context in TEID [Cause:{}]", session_cause);
+            log::error!("No Context in TEID [Cause:{session_cause}]");
             return HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND);
         }
     };
@@ -62,7 +62,7 @@ pub fn handle_create_session_response(
         && session_cause != gtp_cause::NEW_PDN_TYPE_DUE_TO_NETWORK_PREFERENCE
         && session_cause != gtp_cause::NEW_PDN_TYPE_DUE_TO_SINGLE_ADDRESS_BEARER_ONLY
     {
-        log::error!("GTP Cause [VALUE:{}]", session_cause);
+        log::error!("GTP Cause [VALUE:{session_cause}]");
         return HandlerResult::Error(session_cause);
     }
 
@@ -113,7 +113,7 @@ pub fn handle_modify_bearer_response(
     let sess = match sess {
         Some(s) => s,
         None => {
-            log::error!("No Context in TEID [Cause:{}]", session_cause);
+            log::error!("No Context in TEID [Cause:{session_cause}]");
             return HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND);
         }
     };
@@ -130,7 +130,7 @@ pub fn handle_modify_bearer_response(
 
     // Check cause value
     if session_cause != gtp_cause::REQUEST_ACCEPTED {
-        log::error!("GTP Cause [VALUE:{}]", session_cause);
+        log::error!("GTP Cause [VALUE:{session_cause}]");
         return HandlerResult::Error(session_cause);
     }
 
@@ -170,7 +170,7 @@ pub fn handle_delete_session_response(
     let sess = match sess {
         Some(s) => s,
         None => {
-            log::error!("No Context in TEID [Cause:{}]", session_cause);
+            log::error!("No Context in TEID [Cause:{session_cause}]");
             return HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND);
         }
     };
@@ -186,7 +186,7 @@ pub fn handle_delete_session_response(
     };
 
     if session_cause != gtp_cause::REQUEST_ACCEPTED {
-        log::error!("GTP Cause [VALUE:{}] - Ignored", session_cause);
+        log::error!("GTP Cause [VALUE:{session_cause}] - Ignored");
     }
 
     log::info!(
@@ -236,7 +236,7 @@ pub fn handle_create_bearer_request(
 
     // Verify linked EBI exists
     if ctx.bearer_find_by_sess_ebi(sess.id, linked_ebi).is_none() {
-        log::error!("No Linked Bearer [EBI:{}]", linked_ebi);
+        log::error!("No Linked Bearer [EBI:{linked_ebi}]");
         return HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND);
     }
 
@@ -312,7 +312,7 @@ pub fn handle_update_bearer_request(
     let bearer = match ctx.bearer_find_by_sess_ebi(sess.id, bearer_ebi) {
         Some(b) => b,
         None => {
-            log::error!("No Context for EPS Bearer ID[{}]", bearer_ebi);
+            log::error!("No Context for EPS Bearer ID[{bearer_ebi}]");
             return HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND);
         }
     };
@@ -366,7 +366,7 @@ pub fn handle_delete_bearer_request(
     let bearer = match ctx.bearer_find_by_sess_ebi(sess.id, bearer_ebi) {
         Some(b) => b,
         None => {
-            log::error!("No Context for EPS Bearer ID[{}]", bearer_ebi);
+            log::error!("No Context for EPS Bearer ID[{bearer_ebi}]");
             return HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND);
         }
     };
@@ -419,7 +419,7 @@ pub fn handle_bearer_resource_failure_indication(
         }
     };
 
-    log::warn!("Bearer Resource Failure [Cause:{}]", cause);
+    log::warn!("Bearer Resource Failure [Cause:{cause}]");
     log::info!(
         "    MME_S11_TEID[{}] SGW_S11_TEID[{}]",
         sgwc_ue.mme_s11_teid,

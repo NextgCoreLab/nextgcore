@@ -103,14 +103,14 @@ pub fn build_nrf_uri(profile: &NfProfile, service_name: &str) -> Option<String> 
     } else if let Some(ipv4) = profile.ipv4_addresses.first() {
         ipv4.clone()
     } else if let Some(ipv6) = service.ipv6_addresses.first() {
-        format!("[{}]", ipv6)
+        format!("[{ipv6}]")
     } else if let Some(ipv6) = profile.ipv6_addresses.first() {
-        format!("[{}]", ipv6)
+        format!("[{ipv6}]")
     } else {
         return None;
     };
 
-    Some(format!("{}://{}:{}", scheme, host, port))
+    Some(format!("{scheme}://{host}:{port}"))
 }
 
 #[cfg(test)]

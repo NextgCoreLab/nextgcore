@@ -60,6 +60,10 @@ pub enum GtpError {
     /// Invalid PDN type
     #[error("Invalid PDN type: {0}")]
     InvalidPdnType(u8),
+
+    /// Resource exhausted
+    #[error("Resource exhausted: {0}")]
+    ResourceExhausted(String),
 }
 
 /// GTP Result type

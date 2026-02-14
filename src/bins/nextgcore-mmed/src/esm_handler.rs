@@ -35,15 +35,15 @@ pub enum EsmError {
 impl std::fmt::Display for EsmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EsmError::InvalidMessage(msg) => write!(f, "Invalid message: {}", msg),
-            EsmError::MissingMandatoryIe(ie) => write!(f, "Missing mandatory IE: {}", ie),
-            EsmError::InvalidPdnType(t) => write!(f, "Invalid PDN type: {}", t),
-            EsmError::InvalidApn(apn) => write!(f, "Invalid APN: {}", apn),
+            EsmError::InvalidMessage(msg) => write!(f, "Invalid message: {msg}"),
+            EsmError::MissingMandatoryIe(ie) => write!(f, "Missing mandatory IE: {ie}"),
+            EsmError::InvalidPdnType(t) => write!(f, "Invalid PDN type: {t}"),
+            EsmError::InvalidApn(apn) => write!(f, "Invalid APN: {apn}"),
             EsmError::NoSecurityContext => write!(f, "No security context"),
             EsmError::SessionNotFound => write!(f, "Session not found"),
             EsmError::BearerNotFound => write!(f, "Bearer not found"),
-            EsmError::ProtocolError(msg) => write!(f, "Protocol error: {}", msg),
-            EsmError::NetworkFailure(msg) => write!(f, "Network failure: {}", msg),
+            EsmError::ProtocolError(msg) => write!(f, "Protocol error: {msg}"),
+            EsmError::NetworkFailure(msg) => write!(f, "Network failure: {msg}"),
         }
     }
 }
@@ -710,7 +710,7 @@ impl TryFrom<u8> for EsmMessageType {
             0xdb => Ok(EsmMessageType::Notification),
             0xdc => Ok(EsmMessageType::EsmDummyMessage),
             0xe8 => Ok(EsmMessageType::EsmStatus),
-            _ => Err(EsmError::InvalidMessage(format!("Unknown ESM message type: 0x{:02x}", value))),
+            _ => Err(EsmError::InvalidMessage(format!("Unknown ESM message type: 0x{value:02x}"))),
         }
     }
 }

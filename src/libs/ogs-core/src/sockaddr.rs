@@ -2,6 +2,7 @@
 //!
 //! Exact port of lib/core/ogs-sockaddr.h and ogs-sockaddr.c
 
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use crate::errno::{OGS_ERROR, OGS_OK};
@@ -30,6 +31,12 @@ impl Default for OgsSockaddr {
             hostname: None,
             next: None,
         }
+    }
+}
+
+impl fmt::Display for OgsSockaddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.addr.ip())
     }
 }
 
@@ -81,11 +88,6 @@ impl OgsSockaddr {
     /// Get the IP address
     pub fn ip(&self) -> IpAddr {
         self.addr.ip()
-    }
-
-    /// Get address as string
-    pub fn to_string(&self) -> String {
-        self.addr.ip().to_string()
     }
 
     /// Get socket address length

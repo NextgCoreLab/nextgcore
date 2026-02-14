@@ -44,13 +44,10 @@ impl SgwcFsm {
     fn state_initial(&mut self, event: &SgwcEvent) {
         sgwc_sm_debug(event);
 
-        match event.id {
-            SgwcEventId::FsmEntry => {
-                // Transition to operational state
-                self.state = SgwcState::Operational;
-                log::info!("SGWC state machine: Initial -> Operational");
-            }
-            _ => {}
+        if event.id == SgwcEventId::FsmEntry {
+            // Transition to operational state
+            self.state = SgwcState::Operational;
+            log::info!("SGWC state machine: Initial -> Operational");
         }
     }
 

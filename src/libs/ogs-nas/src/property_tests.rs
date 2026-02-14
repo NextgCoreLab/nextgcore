@@ -286,7 +286,7 @@ mod tests {
             ) {
                 let suci = Suci {
                     supi_format: 0, // IMSI format
-                    plmn_id: plmn_id.clone(),
+                    plmn_id,
                     routing_indicator,
                     protection_scheme_id,
                     home_network_pki,
@@ -383,7 +383,7 @@ mod tests {
                 tac in prop::array::uniform3(any::<u8>()),
             ) {
                 let plmn_id = PlmnId::new(mcc, mnc, mnc_len);
-                let tai = Tai { plmn_id: plmn_id.clone(), tac };
+                let tai = Tai { plmn_id, tac };
                 
                 let mut buf = BytesMut::new();
                 tai.encode(&mut buf);

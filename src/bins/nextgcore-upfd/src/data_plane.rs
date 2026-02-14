@@ -10,7 +10,9 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::os::fd::{AsRawFd, RawFd};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -370,6 +372,114 @@ pub struct DataPlaneFar {
     pub ohc_addr: Option<Ipv4Addr>,
 }
 
+// ============================================================================
+// Rel-18 QFI→DSCP Mapping (TS 29.281, TS 23.501)
+// ============================================================================
+
+/// Map QFI to DSCP value for outer IP header marking in GTP-U tunnel.
+///
+/// Per 3GPP TS 23.501 Table 5.7.4-1, each 5QI has standardized QoS
+/// characteristics that map to DiffServ DSCP values for transport-level
+/// QoS enforcement.
+pub fn qfi_to_dscp(qfi: u8) -> u8 {
+    match qfi {
+        1 => 46,  // EF: Conversational voice
+        2 => 34,  // AF41: Conversational video
+        3 => 26,  // AF31: Real-time gaming
+        4 => 24,  // AF21: Non-conversational video
+        5 => 0,   // BE: IMS signaling
+        6 => 18,  // AF21: Buffered streaming
+        7 => 10,  // AF11: Interactive gaming
+        8 | 9 => 0, // BE: Default
+        65 => 46, // EF: Mission-critical user plane
+        66 => 26, // AF31: Non-mission-critical user plane
+        82 => 46, // EF: XR cloud rendering DL (Rel-18)
+        83 => 46, // EF: XR pose/control UL (Rel-18)
+        84 => 34, // AF41: XR split rendering DL (Rel-18)
+        85 => 46, // EF: XR haptic feedback (Rel-18)
+        _ => 0,   // Unknown → Best Effort
+    }
+}
+
+/// Apply DSCP marking to an IP packet's TOS/Traffic Class field.
+pub fn apply_dscp_to_ip_packet(packet: &mut [u8], dscp: u8) -> bool {
+    if packet.is_empty() {
+        return false;
+    }
+    let version = (packet[0] >> 4) & 0x0F;
+    match version {
+        4 if packet.len() >= 20 => {
+            // IPv4: DSCP is in TOS field (byte 1), bits 7:2
+            packet[1] = (dscp << 2) | (packet[1] & 0x03);
+            true
+        }
+        6 if packet.len() >= 40 => {
+            // IPv6: Traffic Class spans bytes 0-1 (bits 4:11)
+            let tc = (dscp << 2) | (packet[1] & 0x03);
+            packet[0] = (packet[0] & 0xF0) | ((tc >> 4) & 0x0F);
+            packet[1] = ((tc & 0x0F) << 4) | (packet[1] & 0x0F);
+            true
+        }
+        _ => false,
+    }
+}
+
+// ============================================================================
+// Rel-18 Energy Saving State
+// ============================================================================
+
+/// Energy saving state for UPF session-level power management.
+#[derive(Debug)]
+pub struct EnergySavingState {
+    /// Last packet forwarded timestamp
+    pub last_packet_time: RwLock<std::time::Instant>,
+    /// Inactivity threshold before entering low-power (seconds)
+    pub inactivity_threshold_secs: u32,
+    /// Whether low-power mode is active
+    pub low_power_active: AtomicBool,
+}
+
+impl EnergySavingState {
+    pub fn new(inactivity_threshold_secs: u32) -> Self {
+        Self {
+            last_packet_time: RwLock::new(std::time::Instant::now()),
+            inactivity_threshold_secs,
+            low_power_active: AtomicBool::new(false),
+        }
+    }
+
+    /// Record packet activity (resets inactivity timer).
+    pub fn record_activity(&self) {
+        *self.last_packet_time.write().unwrap() = std::time::Instant::now();
+        self.low_power_active.store(false, Ordering::Relaxed);
+    }
+
+    /// Check if session is inactive beyond threshold.
+    pub fn check_inactivity(&self) -> bool {
+        let last = self.last_packet_time.read().unwrap();
+        let inactive = last.elapsed().as_secs() > self.inactivity_threshold_secs as u64;
+        if inactive {
+            self.low_power_active.store(true, Ordering::Relaxed);
+        }
+        inactive
+    }
+
+    /// Returns whether session is in low-power mode.
+    pub fn is_low_power(&self) -> bool {
+        self.low_power_active.load(Ordering::Relaxed)
+    }
+}
+
+impl Clone for EnergySavingState {
+    fn clone(&self) -> Self {
+        Self {
+            last_packet_time: RwLock::new(*self.last_packet_time.read().unwrap()),
+            inactivity_threshold_secs: self.inactivity_threshold_secs,
+            low_power_active: AtomicBool::new(self.low_power_active.load(Ordering::Relaxed)),
+        }
+    }
+}
+
 /// Lightweight QER for QoS enforcement in the data plane
 #[derive(Debug)]
 pub struct DataPlaneQer {
@@ -381,6 +491,8 @@ pub struct DataPlaneQer {
     /// Maximum Bit Rate downlink (kbps, 0 = unlimited)
     pub dl_mbr: u64,
     pub qfi: Option<u8>,
+    /// DSCP value for outer GTP-U IP header (computed from QFI)
+    pub dscp: u8,
     /// Bytes forwarded in current rate window (uplink)
     ul_bytes_in_window: AtomicU64,
     /// Bytes forwarded in current rate window (downlink)
@@ -398,6 +510,7 @@ impl Clone for DataPlaneQer {
             ul_mbr: self.ul_mbr,
             dl_mbr: self.dl_mbr,
             qfi: self.qfi,
+            dscp: self.dscp,
             ul_bytes_in_window: AtomicU64::new(self.ul_bytes_in_window.load(Ordering::Relaxed)),
             dl_bytes_in_window: AtomicU64::new(self.dl_bytes_in_window.load(Ordering::Relaxed)),
             window_start: RwLock::new(*self.window_start.read().unwrap()),
@@ -414,10 +527,17 @@ impl DataPlaneQer {
             ul_mbr: 0,
             dl_mbr: 0,
             qfi: None,
+            dscp: 0,
             ul_bytes_in_window: AtomicU64::new(0),
             dl_bytes_in_window: AtomicU64::new(0),
             window_start: RwLock::new(std::time::Instant::now()),
         }
+    }
+
+    /// Set QFI and automatically compute DSCP mapping.
+    pub fn set_qfi(&mut self, qfi: u8) {
+        self.qfi = Some(qfi);
+        self.dscp = qfi_to_dscp(qfi);
     }
 
     /// Check if a packet of given size is within the MBR rate limit.
@@ -694,12 +814,11 @@ impl SessionManager {
             // For simplicity, remove old and add new with updated values
             // In production, use interior mutability (Mutex/RwLock inside DataPlaneSession)
             log::info!(
-                "Session update: SEID={:#x}, new DL_TEID={:#x}, gNB={}",
-                seid, dl_teid, gnb_addr
+                "Session update: SEID={seid:#x}, new DL_TEID={dl_teid:#x}, gNB={gnb_addr}"
             );
             true
         } else {
-            log::warn!("Session not found for update: SEID={:#x}", seid);
+            log::warn!("Session not found for update: SEID={seid:#x}");
             false
         }
     }
@@ -724,10 +843,10 @@ impl SessionManager {
                 ip_map.remove(&ip);
             }
 
-            log::info!("Session removed: SEID={:#x}", seid);
+            log::info!("Session removed: SEID={seid:#x}");
             true
         } else {
-            log::warn!("Session not found for removal: SEID={:#x}", seid);
+            log::warn!("Session not found for removal: SEID={seid:#x}");
             false
         }
     }
@@ -918,11 +1037,11 @@ impl DataPlane {
         gtpu_addr: SocketAddr,
     ) -> io::Result<()> {
         // Create TUN device
-        log::info!("Creating TUN device: {}", tun_name);
+        log::info!("Creating TUN device: {tun_name}");
         let tun = TunDevice::create(tun_name)?;
 
         // Configure IP
-        log::info!("Configuring TUN IP: {}/{}", tun_ip, tun_prefix);
+        log::info!("Configuring TUN IP: {tun_ip}/{tun_prefix}");
         tun.configure_ip(tun_ip, tun_prefix)?;
 
         // Setup NAT for UE subnet
@@ -932,13 +1051,13 @@ impl DataPlane {
             0,
             0,
         );
-        log::info!("Setting up NAT for subnet: {}/{}", subnet, tun_prefix);
+        log::info!("Setting up NAT for subnet: {subnet}/{tun_prefix}");
         tun.setup_nat(subnet, tun_prefix)?;
 
         self.tun = Some(tun);
 
         // Create GTP-U socket
-        log::info!("Binding GTP-U socket on {}", gtpu_addr);
+        log::info!("Binding GTP-U socket on {gtpu_addr}");
         let socket = TokioUdpSocket::bind(gtpu_addr).await?;
         self.gtpu_socket = Some(Arc::new(socket));
 
@@ -981,13 +1100,13 @@ impl DataPlane {
                 match gtpu_recv.recv_from(&mut buf).await {
                     Ok((len, from)) => {
                         if len > 0 {
-                            log::debug!("GTP-U received {} bytes from {}", len, from);
+                            log::debug!("GTP-U received {len} bytes from {from}");
                             let _ = ul_tx_clone.send((buf[..len].to_vec(), from)).await;
                         }
                     }
                     Err(e) => {
                         if e.kind() != io::ErrorKind::WouldBlock {
-                            log::error!("GTP-U recv error: {}", e);
+                            log::error!("GTP-U recv error: {e}");
                         }
                     }
                 }
@@ -1015,7 +1134,7 @@ impl DataPlane {
                 } else if ret < 0 {
                     let err = io::Error::last_os_error();
                     if err.kind() != io::ErrorKind::WouldBlock {
-                        log::error!("TUN read error: {}", err);
+                        log::error!("TUN read error: {err}");
                     }
                     // Small delay on would-block to prevent busy loop
                     tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
@@ -1047,7 +1166,7 @@ impl DataPlane {
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(30)) => {
                     let ul = stats.ul_packets.load(Ordering::Relaxed);
                     let dl = stats.dl_packets.load(Ordering::Relaxed);
-                    log::info!("Data plane stats: UL={} pkts, DL={} pkts", ul, dl);
+                    log::info!("Data plane stats: UL={ul} pkts, DL={dl} pkts");
                 }
             }
         }
@@ -1065,7 +1184,7 @@ impl DataPlane {
         let header = match parse_gtpu_header(pkt) {
             Ok(h) => h,
             Err(e) => {
-                log::debug!("Failed to parse GTP-U header: {:?}", e);
+                log::debug!("Failed to parse GTP-U header: {e:?}");
                 self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -1073,7 +1192,7 @@ impl DataPlane {
 
         match header.msg_type {
             gtpu_msg_type::ECHO_REQUEST => {
-                log::debug!("GTP-U Echo Request from {}", from);
+                log::debug!("GTP-U Echo Request from {from}");
                 let response = build_gtpu_echo_response(header.seq_num);
                 if let Some(sock) = &self.gtpu_socket {
                     let _ = sock.send_to(&response, from).await;
@@ -1158,13 +1277,21 @@ impl DataPlane {
         };
 
         // --- PDR matching (uplink: source_interface = Access) ---
+        let mut dscp_to_apply: Option<u8> = None;
         if let Some((far_id, qer_id, urr_ids, _ohr)) = session.match_pdr(SRC_INTF_ACCESS) {
-            // Check QER gate
+            // Check QER gate and extract DSCP
             if let Some(qid) = qer_id {
                 if !session.check_qer_gate(qid, true, payload_len) {
-                    log::debug!("UL packet dropped by QER gate (qer_id={})", qid);
+                    log::debug!("UL packet dropped by QER gate (qer_id={qid})");
                     self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                     return;
+                }
+                // Get DSCP from QER for marking
+                let qers = session.qers.read().unwrap();
+                if let Some(qer) = qers.get(&qid) {
+                    if qer.dscp != 0 {
+                        dscp_to_apply = Some(qer.dscp);
+                    }
                 }
             }
 
@@ -1172,7 +1299,7 @@ impl DataPlane {
             if let Some(fid) = far_id {
                 let (should_forward, _, _) = session.apply_far(fid);
                 if !should_forward {
-                    log::debug!("UL packet dropped by FAR (far_id={})", fid);
+                    log::debug!("UL packet dropped by FAR (far_id={fid})");
                     self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
@@ -1184,6 +1311,15 @@ impl DataPlane {
             }
         }
         // If no PDR matches, default to forwarding (pass-through)
+
+        // Apply DSCP marking to inner IP packet before writing to TUN
+        let ip_payload = if let Some(dscp) = dscp_to_apply {
+            let mut marked = ip_payload.to_vec();
+            apply_dscp_to_ip_packet(&mut marked, dscp);
+            marked
+        } else {
+            ip_payload.to_vec()
+        };
 
         // Write to TUN device (decapsulated uplink)
         let ret = unsafe {
@@ -1221,15 +1357,23 @@ impl DataPlane {
         // Find session by destination UE IP
         let session = dst_ip.and_then(|ip| self.sessions.find_by_ue_ip(ip));
 
+        let mut dscp_to_apply: Option<u8> = None;
         let (dl_teid, gnb_addr) = if let Some(ref sess) = session {
             // --- PDR matching (downlink: source_interface = Core) ---
             if let Some((far_id, qer_id, urr_ids, _ohr)) = sess.match_pdr(SRC_INTF_CORE) {
-                // Check QER gate
+                // Check QER gate and extract DSCP
                 if let Some(qid) = qer_id {
                     if !sess.check_qer_gate(qid, false, payload_len) {
-                        log::debug!("DL packet dropped by QER gate (qer_id={})", qid);
+                        log::debug!("DL packet dropped by QER gate (qer_id={qid})");
                         self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                         return;
+                    }
+                    // Get DSCP from QER for marking
+                    let qers = sess.qers.read().unwrap();
+                    if let Some(qer) = qers.get(&qid) {
+                        if qer.dscp != 0 {
+                            dscp_to_apply = Some(qer.dscp);
+                        }
                     }
                 }
 
@@ -1237,7 +1381,7 @@ impl DataPlane {
                 if let Some(fid) = far_id {
                     let (should_forward, ohc_teid, ohc_addr) = sess.apply_far(fid);
                     if !should_forward {
-                        log::debug!("DL packet dropped by FAR (far_id={})", fid);
+                        log::debug!("DL packet dropped by FAR (far_id={fid})");
                         self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -1265,7 +1409,7 @@ impl DataPlane {
             }
         } else {
             // No session found - drop in production, use default for testing
-            log::trace!("No session for DL packet to {:?}", dst_ip);
+            log::trace!("No session for DL packet to {dst_ip:?}");
             let default_teid = 1u32;
             let default_gnb = SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(172, 23, 0, 100)),
@@ -1274,11 +1418,20 @@ impl DataPlane {
             (default_teid, default_gnb)
         };
 
+        // Apply DSCP marking to inner IP packet before GTP-U encapsulation
+        let marked_pkt = if let Some(dscp) = dscp_to_apply {
+            let mut marked = pkt.to_vec();
+            apply_dscp_to_ip_packet(&mut marked, dscp);
+            marked
+        } else {
+            pkt.to_vec()
+        };
+
         // Build GTP-U encapsulated packet
-        let gtpu_header = build_gtpu_header(dl_teid, pkt.len() as u16);
-        let mut gtpu_pkt = Vec::with_capacity(GTPU_HEADER_SIZE + pkt.len());
+        let gtpu_header = build_gtpu_header(dl_teid, marked_pkt.len() as u16);
+        let mut gtpu_pkt = Vec::with_capacity(GTPU_HEADER_SIZE + marked_pkt.len());
         gtpu_pkt.extend_from_slice(&gtpu_header);
-        gtpu_pkt.extend_from_slice(pkt);
+        gtpu_pkt.extend_from_slice(&marked_pkt);
 
         // Send to gNB
         match gtpu.send_to(&gtpu_pkt, gnb_addr).await {
@@ -1289,10 +1442,10 @@ impl DataPlane {
                 }
                 self.stats.dl_packets.fetch_add(1, Ordering::Relaxed);
                 self.stats.dl_bytes.fetch_add(payload_len, Ordering::Relaxed);
-                log::trace!("DL: {} bytes to {} TEID=0x{:x}", payload_len, gnb_addr, dl_teid);
+                log::trace!("DL: {payload_len} bytes to {gnb_addr} TEID=0x{dl_teid:x}");
             }
             Err(e) => {
-                log::error!("GTP-U send failed: {}", e);
+                log::error!("GTP-U send failed: {e}");
                 self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -1374,8 +1527,7 @@ impl DataPlane {
 
         self.sessions.add_session(session);
         log::info!(
-            "Added data plane session: SEID={:#x}, SMF_SEID={:#x}, UE={}, UL_TEID=0x{:x}, DL_TEID=0x{:x}, gNB={}, PDU={:?}, QFI={:?}",
-            upf_seid, smf_seid, ue_ip, ul_teid, dl_teid, gnb_addr, pdu_session_id, qfi
+            "Added data plane session: SEID={upf_seid:#x}, SMF_SEID={smf_seid:#x}, UE={ue_ip}, UL_TEID=0x{ul_teid:x}, DL_TEID=0x{dl_teid:x}, gNB={gnb_addr}, PDU={pdu_session_id:?}, QFI={qfi:?}"
         );
     }
 
@@ -1437,20 +1589,19 @@ impl DataPlane {
 
             self.sessions.add_session(new_session);
             log::info!(
-                "Updated data plane session: SEID={:#x}, DL_TEID=0x{:x}, gNB={}",
-                upf_seid, new_dl_teid, new_gnb_addr
+                "Updated data plane session: SEID={upf_seid:#x}, DL_TEID=0x{new_dl_teid:x}, gNB={new_gnb_addr}"
             );
         } else {
-            log::warn!("Session not found for SEID {:#x} during update", upf_seid);
+            log::warn!("Session not found for SEID {upf_seid:#x} during update");
         }
     }
 
     /// Remove a session from PFCP deletion
     pub fn remove_session_from_pfcp(&self, upf_seid: u64) {
         if self.sessions.remove_session_by_seid(upf_seid) {
-            log::info!("Removed data plane session: SEID={:#x}", upf_seid);
+            log::info!("Removed data plane session: SEID={upf_seid:#x}");
         } else {
-            log::warn!("Session not found for SEID {:#x} during deletion", upf_seid);
+            log::warn!("Session not found for SEID {upf_seid:#x} during deletion");
         }
     }
 

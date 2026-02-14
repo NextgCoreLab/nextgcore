@@ -409,18 +409,15 @@ pub struct PlmnSupportItem {
 /// Paging DRX values
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum PagingDrx {
     V32 = 0,
     V64 = 1,
+    #[default]
     V128 = 2,
     V256 = 3,
 }
 
-impl Default for PagingDrx {
-    fn default() -> Self {
-        PagingDrx::V128
-    }
-}
 
 /// Time to Wait values
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -466,10 +463,12 @@ pub enum UserLocationInformation {
 /// RRC Establishment Cause
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum RrcEstablishmentCause {
     Emergency = 0,
     HighPriorityAccess = 1,
     MtAccess = 2,
+    #[default]
     MoSignalling = 3,
     MoData = 4,
     MoVoiceCall = 5,
@@ -480,11 +479,6 @@ pub enum RrcEstablishmentCause {
     NotAvailable = 10,
 }
 
-impl Default for RrcEstablishmentCause {
-    fn default() -> Self {
-        RrcEstablishmentCause::MoSignalling
-    }
-}
 
 /// UE Security Capabilities
 #[derive(Debug, Clone)]

@@ -23,11 +23,11 @@ impl std::fmt::Display for S11Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ContextNotFound => write!(f, "Context not found"),
-            Self::MandatoryIeMissing(ie) => write!(f, "Mandatory IE missing: {}", ie),
+            Self::MandatoryIeMissing(ie) => write!(f, "Mandatory IE missing: {ie}"),
             Self::InvalidMessageFormat => write!(f, "Invalid message format"),
-            Self::InvalidCause(c) => write!(f, "Invalid cause: {}", c),
+            Self::InvalidCause(c) => write!(f, "Invalid cause: {c}"),
             Self::TransactionError => write!(f, "Transaction error"),
-            Self::InternalError(msg) => write!(f, "Internal error: {}", msg),
+            Self::InternalError(msg) => write!(f, "Internal error: {msg}"),
         }
     }
 }

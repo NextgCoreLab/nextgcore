@@ -30,6 +30,8 @@ pub mod poll;      // Event polling (ogs-poll.h)
 pub mod tcp;       // TCP server/client (ogs-tcp.h)
 pub mod udp;       // UDP server/client (ogs-udp.h)
 pub mod lockfree;  // Lock-free data structures (B2.4 - 6G advanced research)
+pub mod otel_log;  // OTel structured logging (B2.1 - 6G observability)
+pub mod distributed_timer; // Distributed timer coordination (B2.1 - 6G)
 
 // Re-export commonly used types
 pub use list::{OgsList, OgsLnode};
@@ -49,3 +51,11 @@ pub use sockopt::OgsSockopt;
 pub use poll::{OgsPollset, OGS_POLLIN, OGS_POLLOUT};
 pub use async_timer::{AsyncTimerMgr, AsyncTimerEntry, TimerMode, compute_poll_interval};
 pub use lockfree::{LockFreeQueue, LockFreeStack, LockFreeHashMap};
+pub use otel_log::{
+    OtelSeverity, StructuredLogEntry, StructuredLogger, LogValue,
+    BatchExportConfig, BatchLogExporter, ExportTarget, detect_resource_attributes,
+};
+pub use distributed_timer::{
+    DistTimerId, DistTimerEntry, DistTimerManager, TimerScope,
+    ClockSyncInfo, ClockSyncState,
+};

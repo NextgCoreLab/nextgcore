@@ -628,7 +628,7 @@ pub fn handle_session_report_response(
     cause: PfcpCause,
 ) -> HandlerResult {
     if cause != PfcpCause::RequestAccepted {
-        log::error!("PFCP Cause[{:?}] : Not Accepted", cause);
+        log::error!("PFCP Cause[{cause:?}] : Not Accepted");
         return HandlerResult::error(cause, None);
     }
     

@@ -97,7 +97,7 @@ fn parse_uri_host_port(uri_str: &str) -> Result<(String, u16), String> {
         .next()
         .unwrap_or(port_str)
         .parse()
-        .map_err(|e| format!("Invalid port in URI: {}", e))?;
+        .map_err(|e| format!("Invalid port in URI: {e}"))?;
     Ok((host.to_string(), port))
 }
 
@@ -150,13 +150,13 @@ async fn register_with_nrf(nrf_uri: &str, nf_instance: &NfInstance) -> Result<()
                     status,
                     response.http.content
                 );
-                log::warn!("{}", msg);
+                log::warn!("{msg}");
                 // Non-fatal: PCF can operate without NRF
                 Ok(())
             }
         }
         Err(e) => {
-            log::warn!("NRF registration failed (PCF will operate standalone): {}", e);
+            log::warn!("NRF registration failed (PCF will operate standalone): {e}");
             // Non-fatal: PCF can operate without NRF
             Ok(())
         }
@@ -194,7 +194,7 @@ pub fn pcf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
             if let Some(ref nrf_uri) = nrf_uri_clone {
                 sbi_ctx.set_nrf_uri(nrf_uri).await;
                 if let Err(e) = register_with_nrf(nrf_uri, &nf_instance).await {
-                    log::error!("Failed to register PCF with NRF: {}", e);
+                    log::error!("Failed to register PCF with NRF: {e}");
                 }
             } else {
                 log::info!("No NRF URI configured, PCF running in standalone mode");
@@ -204,7 +204,7 @@ pub fn pcf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
         log::debug!("No tokio runtime available, skipping async NRF registration");
     }
 
-    log::info!("PCF NF instance built (id={})", nf_id);
+    log::info!("PCF NF instance built (id={nf_id})");
 
     SBI_SERVER_RUNNING.store(true, Ordering::SeqCst);
 
@@ -234,7 +234,7 @@ pub fn pcf_sbi_close() {
                     let client = sbi_ctx.get_client(&host, port).await;
                     let path = format!("/nnrf-nfm/v1/nf-instances/{}", self_instance.id);
                     if let Err(e) = client.delete(&path).await {
-                        log::warn!("Failed to deregister PCF from NRF: {}", e);
+                        log::warn!("Failed to deregister PCF from NRF: {e}");
                     } else {
                         log::info!("PCF deregistered from NRF");
                     }
@@ -258,8 +258,7 @@ pub fn pcf_sbi_is_running() -> bool {
 /// Port of pcf_sbi_send_am_policy_control_notify() from sbi-path.c
 pub fn pcf_sbi_send_am_policy_control_notify(pcf_ue_am_id: u64) -> bool {
     log::debug!(
-        "[ue_am_id={}] Sending AM policy control notify",
-        pcf_ue_am_id
+        "[ue_am_id={pcf_ue_am_id}] Sending AM policy control notify"
     );
 
     // In C implementation:
@@ -279,9 +278,7 @@ pub fn pcf_sbi_send_smpolicycontrol_create_response(
     stream_id: u64,
 ) -> bool {
     log::debug!(
-        "[sess_id={}, stream_id={}] Sending SM policy control create response",
-        sess_id,
-        stream_id
+        "[sess_id={sess_id}, stream_id={stream_id}] Sending SM policy control create response"
     );
 
     // In C implementation:
@@ -304,8 +301,7 @@ pub fn pcf_sbi_send_smpolicycontrol_create_response(
 /// Port of pcf_sbi_send_smpolicycontrol_update_notify() from sbi-path.c
 pub fn pcf_sbi_send_smpolicycontrol_update_notify(sess_id: u64) -> bool {
     log::debug!(
-        "[sess_id={}] Sending SM policy control update notify",
-        sess_id
+        "[sess_id={sess_id}] Sending SM policy control update notify"
     );
 
     // In C implementation:
@@ -325,9 +321,7 @@ pub fn pcf_sbi_send_smpolicycontrol_delete_notify(
     app_session_id: u64,
 ) -> bool {
     log::debug!(
-        "[sess_id={}, app_id={}] Sending SM policy control delete notify",
-        sess_id,
-        app_session_id
+        "[sess_id={sess_id}, app_id={app_session_id}] Sending SM policy control delete notify"
     );
 
     // In C implementation:
@@ -345,8 +339,7 @@ pub fn pcf_sbi_send_smpolicycontrol_delete_notify(
 /// Port of pcf_sbi_send_policyauthorization_terminate_notify() from sbi-path.c
 pub fn pcf_sbi_send_policyauthorization_terminate_notify(app_id: u64) -> bool {
     log::debug!(
-        "[app_id={}] Sending policy authorization terminate notify",
-        app_id
+        "[app_id={app_id}] Sending policy authorization terminate notify"
     );
 
     // In C implementation:
@@ -367,10 +360,7 @@ pub fn pcf_ue_am_sbi_discover_and_send(
     service_type: &str,
 ) -> Result<(), String> {
     log::debug!(
-        "[ue_am_id={}, stream_id={}] Discover and send to {}",
-        pcf_ue_am_id,
-        stream_id,
-        service_type
+        "[ue_am_id={pcf_ue_am_id}, stream_id={stream_id}] Discover and send to {service_type}"
     );
 
     // In C implementation:
@@ -390,10 +380,7 @@ pub fn pcf_sess_sbi_discover_and_send(
     service_type: &str,
 ) -> Result<(), String> {
     log::debug!(
-        "[sess_id={}, stream_id={}] Discover and send to {}",
-        sess_id,
-        stream_id,
-        service_type
+        "[sess_id={sess_id}, stream_id={stream_id}] Discover and send to {service_type}"
     );
 
     // In C implementation:

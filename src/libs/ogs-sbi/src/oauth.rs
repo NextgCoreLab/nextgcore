@@ -246,6 +246,180 @@ pub struct AccessTokenClaims {
     pub exp: u64,
 }
 
+// ============================================================================
+// OAuth2 Client (W1.23: Token exchange with NRF)
+// ============================================================================
+
+/// OAuth2 client for requesting tokens from the NRF (Authorization Server).
+///
+/// Implements the NF service consumer side of the client credentials grant
+/// flow per 3GPP TS 29.510. Handles token requests, caching with automatic
+/// expiry, and token refresh.
+pub struct OAuth2Client {
+    /// NRF URI (e.g., "http://127.0.0.10:7777")
+    nrf_uri: String,
+    /// This NF's instance ID
+    nf_instance_id: String,
+    /// This NF's type
+    nf_type: NfType,
+    /// Token cache
+    cache: TokenCache,
+}
+
+impl OAuth2Client {
+    /// Create a new OAuth2 client.
+    pub fn new(
+        nrf_uri: impl Into<String>,
+        nf_instance_id: impl Into<String>,
+        nf_type: NfType,
+    ) -> Self {
+        Self {
+            nrf_uri: nrf_uri.into(),
+            nf_instance_id: nf_instance_id.into(),
+            nf_type,
+            cache: TokenCache::new(),
+        }
+    }
+
+    /// Get the NRF URI.
+    pub fn nrf_uri(&self) -> &str {
+        &self.nrf_uri
+    }
+
+    /// Get a valid access token for the given target NF type and scope.
+    ///
+    /// Returns a cached token if available and not expired, otherwise
+    /// requests a new one from the NRF.
+    pub async fn get_token(
+        &self,
+        target_nf_type: NfType,
+        scope: &str,
+    ) -> SbiResult<String> {
+        // Check cache first
+        if let Some(cached) = self.cache.get(target_nf_type, scope).await {
+            return Ok(cached.access_token);
+        }
+
+        // Request new token from NRF
+        let response = self.request_token(target_nf_type, scope).await?;
+        let token = response.access_token.clone();
+
+        // Cache it
+        self.cache.put(target_nf_type, scope, response).await;
+
+        Ok(token)
+    }
+
+    /// Request a new access token from the NRF.
+    pub async fn request_token(
+        &self,
+        target_nf_type: NfType,
+        scope: &str,
+    ) -> SbiResult<AccessTokenResponse> {
+        let request = AccessTokenRequest::new(
+            &self.nf_instance_id,
+            self.nf_type,
+            target_nf_type,
+            scope,
+        );
+
+        let body = request.to_form_body();
+        let uri = format!("{}/nnrf-oauth2/v1/access-token", self.nrf_uri);
+
+        // Build HTTP request using hyper
+        let addr = parse_uri_to_addr(&self.nrf_uri)?;
+
+        let stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(&addr),
+        )
+        .await
+        .map_err(|_| SbiError::Timeout)?
+        .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
+
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(
+            hyper_util::rt::TokioExecutor::new(),
+            io,
+        )
+        .await
+        .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
+
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                log::error!("OAuth2 HTTP/2 connection error: {e}");
+            }
+        });
+
+        let http_request = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(&uri)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+            .map_err(|e| SbiError::ClientError(e.to_string()))?;
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.send_request(http_request),
+        )
+        .await
+        .map_err(|_| SbiError::Timeout)?
+        .map_err(|e| SbiError::HyperError(e.to_string()))?;
+
+        let status = response.status().as_u16();
+        let body_bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .map_err(|e| SbiError::InvalidResponse(e.to_string()))?
+            .to_bytes();
+
+        if status != 200 {
+            let error_body = String::from_utf8_lossy(&body_bytes);
+            return Err(SbiError::AuthorizationFailed(format!(
+                "NRF token request failed (HTTP {status}): {error_body}"
+            )));
+        }
+
+        let token_response: AccessTokenResponse = serde_json::from_slice(&body_bytes)
+            .map_err(|e| SbiError::AuthorizationFailed(format!("Invalid token response: {e}")))?;
+
+        validate_token_response(&token_response)?;
+        Ok(token_response)
+    }
+
+    /// Invalidate all cached tokens.
+    pub async fn clear_cache(&self) {
+        self.cache.clear().await;
+    }
+
+    /// Purge expired tokens from the cache.
+    pub async fn purge_expired(&self) {
+        self.cache.purge_expired().await;
+    }
+
+    /// Build an Authorization header value for the given target.
+    pub async fn authorization_header(
+        &self,
+        target_nf_type: NfType,
+        scope: &str,
+    ) -> SbiResult<String> {
+        let token = self.get_token(target_nf_type, scope).await?;
+        Ok(format!("Bearer {token}"))
+    }
+}
+
+/// Parse a URI like "http://host:port" into "host:port" for TCP connection.
+fn parse_uri_to_addr(uri: &str) -> SbiResult<String> {
+    let without_scheme = uri
+        .strip_prefix("https://")
+        .or_else(|| uri.strip_prefix("http://"))
+        .unwrap_or(uri);
+    let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
+    if host_port.is_empty() {
+        return Err(SbiError::InvalidUri("Empty NRF URI".into()));
+    }
+    Ok(host_port.to_string())
+}
+
 /// Minimal percent-encoding for form values.
 fn url_encode(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
@@ -346,7 +520,7 @@ mod tests {
         let payload = URL_SAFE_NO_PAD.encode(b"{\"sub\":\"test\"}");
         let sig = URL_SAFE_NO_PAD.encode(b"fakesig");
 
-        let token = format!("{}.{}.{}", header, payload, sig);
+        let token = format!("{header}.{payload}.{sig}");
         let result = decode_jwt_parts(&token);
         assert!(result.is_ok());
 
@@ -438,5 +612,32 @@ mod tests {
         assert_eq!(url_encode("hello"), "hello");
         assert_eq!(url_encode("hello world"), "hello+world");
         assert_eq!(url_encode("a=b&c=d"), "a%3Db%26c%3Dd");
+    }
+
+    #[test]
+    fn test_parse_uri_to_addr() {
+        assert_eq!(
+            parse_uri_to_addr("http://127.0.0.10:7777").unwrap(),
+            "127.0.0.10:7777"
+        );
+        assert_eq!(
+            parse_uri_to_addr("https://nrf.local:443").unwrap(),
+            "nrf.local:443"
+        );
+        assert_eq!(
+            parse_uri_to_addr("http://nrf:7777/some/path").unwrap(),
+            "nrf:7777"
+        );
+        assert!(parse_uri_to_addr("http://").is_err());
+    }
+
+    #[test]
+    fn test_oauth2_client_creation() {
+        let client = OAuth2Client::new(
+            "http://127.0.0.10:7777",
+            "amf-instance-001",
+            NfType::Amf,
+        );
+        assert_eq!(client.nrf_uri(), "http://127.0.0.10:7777");
     }
 }

@@ -229,7 +229,7 @@ pub fn handle_pcf_binding_patch(
     // Update session in context
     context.sess_update(&updated_sess);
 
-    log::info!("PCF Binding {} patched successfully", binding_id);
+    log::info!("PCF Binding {binding_id} patched successfully");
 
     // Build updated response
     let response = build_pcf_binding_from_sess(&updated_sess);

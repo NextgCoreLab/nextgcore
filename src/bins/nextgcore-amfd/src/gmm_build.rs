@@ -671,7 +671,7 @@ fn get_pdu_session_status(amf_ue: &AmfUe) -> u16 {
     }
 
     // Swap bytes for NAS encoding
-    ((psimask << 8) | (psimask >> 8)) & 0xffff
+    psimask.rotate_right(8)
 }
 
 // ============================================================================

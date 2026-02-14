@@ -149,6 +149,39 @@ impl ExtensionHeader {
     }
 }
 
+impl ExtensionHeader {
+    /// Map QFI to DSCP value per 3GPP TS 23.501 Table 5.7.4-1 (Rel-18).
+    ///
+    /// Maps QoS Flow Identifier to DiffServ Code Point for transport-level
+    /// QoS enforcement in outer IP header of GTP-U tunnel.
+    pub fn qfi_to_dscp(qfi: u8) -> u8 {
+        match qfi {
+            // GBR flows: Conversational voice/video
+            1 => 46, // EF (Expedited Forwarding)
+            2 => 34, // AF41
+            3 => 26, // AF31
+            4 => 24, // AF21 (non-conversational video)
+            // Non-GBR flows
+            5 => 0,  // Best Effort (IMS signaling uses CS0)
+            6 => 18, // AF21 (buffered video streaming)
+            7 => 10, // AF11 (interactive gaming)
+            8 => 10, // AF11 (TCP-based)
+            9 => 0,  // BE (default)
+            // Rel-18 XR 5QI values mapped to QFI ranges
+            82 => 46, // XR cloud rendering DL -> EF
+            83 => 46, // XR pose/control UL -> EF
+            84 => 34, // XR split rendering DL -> AF41
+            85 => 46, // XR haptic feedback -> EF
+            _ => 0,   // Unknown -> Best Effort
+        }
+    }
+
+    /// Map 5QI to QFI→DSCP (convenience for SMF/PCF use).
+    pub fn five_qi_to_dscp(five_qi: u8) -> u8 {
+        Self::qfi_to_dscp(five_qi)
+    }
+}
+
 /// GTPv1 Cause Values (TS 29.060 Table 38)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

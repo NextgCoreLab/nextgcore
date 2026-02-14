@@ -224,10 +224,10 @@ pub fn sgwu_sm_debug(event: &SgwuEvent) {
     }
     if let Some(ref pfcp) = event.pfcp {
         if let Some(node_id) = pfcp.pfcp_node_id {
-            log::trace!("  PFCP Node: {}", node_id);
+            log::trace!("  PFCP Node: {node_id}");
         }
         if let Some(xact_id) = pfcp.pfcp_xact_id {
-            log::trace!("  PFCP Xact: {}", xact_id);
+            log::trace!("  PFCP Xact: {xact_id}");
         }
     }
 }

@@ -15,3 +15,6 @@ bitvec = "1.0"
 [dev-dependencies]
 proptest.workspace = true
 hex = "0.4"
+
+[lints]
+workspace = true

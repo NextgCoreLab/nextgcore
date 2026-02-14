@@ -181,7 +181,7 @@ pub struct NssfContext {
     /// (PLMN ID, S-NSSAI) -> Home ID hash for quick lookup
     home_hash: RwLock<HashMap<(String, String, u8, Option<u32>), u64>>,
     /// NSSAI availability per NF instance ID (B24.4)
-    nssai_availability: RwLock<HashMap<String, NssaiAvailabilityInfo>>,
+    pub(crate) nssai_availability: RwLock<HashMap<String, NssaiAvailabilityInfo>>,
     /// Next NSI ID
     next_nsi_id: AtomicUsize,
     /// Next Home ID
@@ -214,7 +214,7 @@ impl NssfContext {
         }
         self.max_num_of_nf = max_nf;
         self.initialized.store(true, Ordering::SeqCst);
-        log::info!("NSSF context initialized with max {} NF instances", max_nf);
+        log::info!("NSSF context initialized with max {max_nf} NF instances");
     }
 
     pub fn fini(&mut self) {
@@ -248,7 +248,7 @@ impl NssfContext {
         snssai_hash.insert((sst, sd), id);
         nsi_list.insert(id, nsi.clone());
 
-        log::debug!("NSSF NSI added (id={}, sst={}, sd={:?})", id, sst, sd);
+        log::debug!("NSSF NSI added (id={id}, sst={sst}, sd={sd:?})");
         Some(nsi)
     }
 
@@ -258,7 +258,7 @@ impl NssfContext {
 
         if let Some(nsi) = nsi_list.remove(&id) {
             snssai_hash.remove(&(nsi.s_nssai.sst, nsi.s_nssai.sd));
-            log::debug!("NSSF NSI removed (id={})", id);
+            log::debug!("NSSF NSI removed (id={id})");
             return Some(nsi);
         }
         None
@@ -340,7 +340,7 @@ impl NssfContext {
                 home.s_nssai.sd,
             );
             home_hash.remove(&key);
-            log::debug!("NSSF Home removed (id={})", id);
+            log::debug!("NSSF Home removed (id={id})");
             return Some(home);
         }
         None
@@ -558,7 +558,7 @@ mod tests {
 
         // Add 10 NSIs
         for i in 0..10 {
-            ctx.nsi_add(&format!("http://nrf{}.example.com", i), i as u8, None);
+            ctx.nsi_add(&format!("http://nrf{i}.example.com"), i as u8, None);
         }
 
         assert_eq!(ctx.get_nsi_load(), 10); // 10/100 = 10%

@@ -309,7 +309,7 @@ pub fn handle_request(
         // In C: ogs_sbi_fqdn_in_vplmn(headers.target_apiroot)
         // VPLMN detection is handled by the SEPP integration when inter-PLMN routing is enabled
 
-        log::debug!("Forwarding to target apiroot: {}", target_apiroot);
+        log::debug!("Forwarding to target apiroot: {target_apiroot}");
 
         // Note: Forward request to target
         // In C: send_request(client, response_handler, request, false, assoc)
@@ -394,7 +394,7 @@ pub fn handle_response(
     let assoc = match assoc {
         Some(a) => a,
         None => {
-            return Err(format!("Association not found: {}", assoc_id));
+            return Err(format!("Association not found: {assoc_id}"));
         }
     };
 
@@ -435,7 +435,7 @@ pub fn handle_nf_discover_response(
     let assoc = match assoc {
         Some(a) => a,
         None => {
-            return Err(format!("Association not found: {}", assoc_id));
+            return Err(format!("Association not found: {assoc_id}"));
         }
     };
 
@@ -499,7 +499,7 @@ pub fn handle_sepp_discover_response(
     let assoc = match assoc {
         Some(a) => a,
         None => {
-            return Err(format!("Association not found: {}", assoc_id));
+            return Err(format!("Association not found: {assoc_id}"));
         }
     };
 
@@ -559,6 +559,344 @@ pub fn copy_request_headers(
     }
 
     target
+}
+
+// ============================================================================
+// NF Instance Selection & Request Routing (W1.25, W1.27)
+// ============================================================================
+
+/// NF instance candidate for load-balanced routing
+#[derive(Debug, Clone)]
+pub struct NfInstanceCandidate {
+    pub nf_instance_id: String,
+    pub nf_type: NfType,
+    pub host: String,
+    pub port: u16,
+    pub priority: u16,
+    pub capacity: u16,
+    pub load: u16,
+    /// Whether the instance is considered healthy
+    pub healthy: bool,
+}
+
+/// Select the best NF instance from a list of candidates using weighted round-robin.
+///
+/// W1.27: Supports health-check awareness (skips unhealthy instances) and
+/// weighted distribution based on NF load/priority.
+///
+/// Selection algorithm:
+/// 1. Filter to healthy instances only
+/// 2. Group by priority (lower = better)
+/// 3. Among same-priority, pick by available capacity (capacity - load)
+pub fn select_nf_instance(candidates: &[NfInstanceCandidate]) -> Option<&NfInstanceCandidate> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // W1.27: Filter to healthy instances only
+    let healthy: Vec<&NfInstanceCandidate> = candidates
+        .iter()
+        .filter(|c| c.healthy)
+        .collect();
+
+    // Fall back to all candidates if none are marked healthy
+    let pool = if healthy.is_empty() { candidates.iter().collect() } else { healthy };
+
+    // Group by priority (lower is better)
+    let min_priority = pool.iter().map(|c| c.priority).min().unwrap_or(0);
+    let top_priority: Vec<&&NfInstanceCandidate> = pool
+        .iter()
+        .filter(|c| c.priority == min_priority)
+        .collect();
+
+    if top_priority.len() == 1 {
+        return Some(top_priority[0]);
+    }
+
+    // Among same-priority candidates, pick by available capacity (capacity - load)
+    top_priority
+        .iter()
+        .max_by_key(|c| {
+            c.capacity.saturating_sub(c.load) as u32
+        })
+        .map(|c| **c)
+}
+
+/// Round-robin index for distributing requests across equal-weight instances.
+static ROUND_ROBIN_INDEX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Select an NF instance using round-robin among healthy, same-priority candidates.
+///
+/// W1.27: Implements round-robin load balancing among NF instances with
+/// weighted distribution based on NF load/priority and health-check awareness.
+pub fn select_nf_instance_round_robin(candidates: &[NfInstanceCandidate]) -> Option<&NfInstanceCandidate> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    // Filter to healthy instances
+    let healthy: Vec<&NfInstanceCandidate> = candidates
+        .iter()
+        .filter(|c| c.healthy)
+        .collect();
+
+    let pool: Vec<&NfInstanceCandidate> = if healthy.is_empty() {
+        candidates.iter().collect()
+    } else {
+        healthy
+    };
+
+    // Group by best priority
+    let min_priority = pool.iter().map(|c| c.priority).min().unwrap_or(0);
+    let top_priority: Vec<&NfInstanceCandidate> = pool
+        .into_iter()
+        .filter(|c| c.priority == min_priority)
+        .collect();
+
+    if top_priority.is_empty() {
+        return None;
+    }
+
+    // Round-robin within the top-priority group
+    let idx = ROUND_ROBIN_INDEX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let selected_idx = (idx as usize) % top_priority.len();
+    Some(top_priority[selected_idx])
+}
+
+// ============================================================================
+// NF Discovery Cache (W1.26)
+// ============================================================================
+
+/// Cached NF discovery result with TTL.
+#[derive(Debug, Clone)]
+pub struct DiscoveryCacheEntry {
+    pub candidates: Vec<NfInstanceCandidate>,
+    pub cached_at: std::time::Instant,
+    pub ttl: std::time::Duration,
+}
+
+impl DiscoveryCacheEntry {
+    pub fn is_expired(&self) -> bool {
+        self.cached_at.elapsed() >= self.ttl
+    }
+}
+
+/// NF discovery result cache.
+///
+/// W1.26: Caches NF discovery results with TTL to avoid repeated NRF queries.
+/// Cache key is (target_nf_type, service_name).
+pub struct DiscoveryCache {
+    entries: std::sync::RwLock<HashMap<(String, String), DiscoveryCacheEntry>>,
+}
+
+impl DiscoveryCache {
+    pub fn new() -> Self {
+        Self {
+            entries: std::sync::RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Look up a cached discovery result.
+    pub fn get(&self, target_nf_type: &str, service_name: &str) -> Option<Vec<NfInstanceCandidate>> {
+        let entries = self.entries.read().ok()?;
+        let key = (target_nf_type.to_string(), service_name.to_string());
+        entries.get(&key).and_then(|entry| {
+            if entry.is_expired() {
+                None
+            } else {
+                Some(entry.candidates.clone())
+            }
+        })
+    }
+
+    /// Store a discovery result in the cache.
+    pub fn put(
+        &self,
+        target_nf_type: &str,
+        service_name: &str,
+        candidates: Vec<NfInstanceCandidate>,
+        ttl: std::time::Duration,
+    ) {
+        if let Ok(mut entries) = self.entries.write() {
+            let key = (target_nf_type.to_string(), service_name.to_string());
+            entries.insert(key, DiscoveryCacheEntry {
+                candidates,
+                cached_at: std::time::Instant::now(),
+                ttl,
+            });
+        }
+    }
+
+    /// Purge expired entries.
+    pub fn purge_expired(&self) {
+        if let Ok(mut entries) = self.entries.write() {
+            entries.retain(|_, v| !v.is_expired());
+        }
+    }
+
+    /// Clear the entire cache.
+    pub fn clear(&self) {
+        if let Ok(mut entries) = self.entries.write() {
+            entries.clear();
+        }
+    }
+}
+
+impl Default for DiscoveryCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Global discovery cache
+static DISCOVERY_CACHE: std::sync::OnceLock<DiscoveryCache> = std::sync::OnceLock::new();
+
+/// Get the global discovery cache instance.
+pub fn discovery_cache() -> &'static DiscoveryCache {
+    DISCOVERY_CACHE.get_or_init(DiscoveryCache::new)
+}
+
+/// Parse NF discovery search result JSON into NfInstanceCandidate list.
+///
+/// W1.26: Parses the SearchResult response from NRF discovery
+/// (TS 29.510 Section 6.2.3.2.3.1).
+pub fn parse_search_result(body: &[u8]) -> Vec<NfInstanceCandidate> {
+    let value: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("Failed to parse NF discovery response: {e}");
+            return Vec::new();
+        }
+    };
+
+    let mut candidates = Vec::new();
+
+    if let Some(instances) = value.get("nfInstances").and_then(|v| v.as_array()) {
+        for inst in instances {
+            let nf_instance_id = inst.get("nfInstanceId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let nf_type_str = inst.get("nfType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("NULL");
+            let nf_status = inst.get("nfStatus")
+                .and_then(|v| v.as_str())
+                .unwrap_or("REGISTERED");
+
+            // Extract host/port from ipv4Addresses or fqdn
+            let host = inst.get("ipv4Addresses")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+                .or_else(|| inst.get("fqdn").and_then(|v| v.as_str()))
+                .unwrap_or("127.0.0.1")
+                .to_string();
+
+            let port = inst.get("nfServices")
+                .and_then(|v| v.as_array())
+                .and_then(|services| services.first())
+                .and_then(|svc| svc.get("ipEndPoints"))
+                .and_then(|v| v.as_array())
+                .and_then(|eps| eps.first())
+                .and_then(|ep| ep.get("port"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(7777) as u16;
+
+            let priority = inst.get("priority")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(50) as u16;
+            let capacity = inst.get("capacity")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(100) as u16;
+            let load = inst.get("load")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u16;
+
+            candidates.push(NfInstanceCandidate {
+                nf_instance_id,
+                nf_type: NfType::from_string(nf_type_str),
+                host,
+                port,
+                priority,
+                capacity,
+                load,
+                healthy: nf_status == "REGISTERED",
+            });
+        }
+    }
+
+    candidates
+}
+
+/// Route an SBI request to the appropriate NF instance
+/// Returns the target host:port to forward to
+pub fn route_request(
+    request: &SbiRequest,
+    candidates: &[NfInstanceCandidate],
+) -> Result<(String, u16, HashMap<String, String>), String> {
+    // If Target-apiRoot is present, use it directly
+    if let Some(target_apiroot) = request.get_header(headers::TARGET_APIROOT) {
+        // Parse host:port from target_apiroot URL
+        let (host, port) = parse_apiroot_url(target_apiroot)?;
+        let fwd_headers = copy_request_headers(request, false);
+        return Ok((host, port, fwd_headers));
+    }
+
+    // Otherwise, select from candidates via NF discovery
+    let selected = select_nf_instance(candidates)
+        .ok_or_else(|| "No NF instance available for routing".to_string())?;
+
+    log::debug!(
+        "Selected NF instance {} ({}:{}) for routing",
+        selected.nf_instance_id,
+        selected.host,
+        selected.port
+    );
+
+    let fwd_headers = copy_request_headers(request, false);
+    Ok((selected.host.clone(), selected.port, fwd_headers))
+}
+
+/// Parse a URL to extract host and port
+fn parse_apiroot_url(url: &str) -> Result<(String, u16), String> {
+    // Strip scheme
+    let without_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(url);
+
+    // Strip path
+    let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
+
+    if let Some(colon_idx) = host_port.rfind(':') {
+        let host = &host_port[..colon_idx];
+        let port: u16 = host_port[colon_idx + 1..]
+            .parse()
+            .map_err(|_| "Invalid port in URL".to_string())?;
+        Ok((host.to_string(), port))
+    } else {
+        // Default ports
+        let port = if url.starts_with("https://") { 443 } else { 80 };
+        Ok((host_port.to_string(), port))
+    }
+}
+
+/// Build a forwarded SBI request with updated authority
+pub fn build_forwarded_request(
+    original: &SbiRequest,
+    target_host: &str,
+    target_port: u16,
+    headers: HashMap<String, String>,
+) -> SbiRequest {
+    let mut fwd = SbiRequest {
+        method: original.method.clone(),
+        uri: original.uri.clone(),
+        headers,
+        body: original.body.clone(),
+    };
+    fwd.set_header(":authority", &format!("{target_host}:{target_port}"));
+    fwd
 }
 
 #[cfg(test)]
@@ -653,5 +991,242 @@ mod tests {
         // With custom headers preserved
         let headers = copy_request_headers(&request, true);
         assert!(headers.contains_key(headers::TARGET_APIROOT));
+    }
+
+    #[test]
+    fn test_select_nf_instance_empty() {
+        let result = select_nf_instance(&[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_select_nf_instance_single() {
+        let candidates = vec![NfInstanceCandidate {
+            nf_instance_id: "nf-1".to_string(),
+            nf_type: NfType::Amf,
+            host: "amf.local".to_string(),
+            port: 7777,
+            priority: 10,
+            capacity: 100,
+            load: 50,
+            healthy: true,
+        }];
+        let selected = select_nf_instance(&candidates);
+        assert!(selected.is_some());
+        assert_eq!(selected.unwrap().nf_instance_id, "nf-1");
+    }
+
+    #[test]
+    fn test_select_nf_instance_by_priority() {
+        let candidates = vec![
+            NfInstanceCandidate {
+                nf_instance_id: "nf-low".to_string(),
+                nf_type: NfType::Smf,
+                host: "smf1.local".to_string(),
+                port: 7777,
+                priority: 20,
+                capacity: 100,
+                load: 10,
+                healthy: true,
+            },
+            NfInstanceCandidate {
+                nf_instance_id: "nf-high".to_string(),
+                nf_type: NfType::Smf,
+                host: "smf2.local".to_string(),
+                port: 7777,
+                priority: 10,
+                capacity: 100,
+                load: 90,
+                healthy: true,
+            },
+        ];
+        let selected = select_nf_instance(&candidates);
+        assert_eq!(selected.unwrap().nf_instance_id, "nf-high");
+    }
+
+    #[test]
+    fn test_select_nf_instance_by_capacity() {
+        let candidates = vec![
+            NfInstanceCandidate {
+                nf_instance_id: "nf-loaded".to_string(),
+                nf_type: NfType::Udm,
+                host: "udm1.local".to_string(),
+                port: 7777,
+                priority: 10,
+                capacity: 100,
+                load: 90,
+                healthy: true,
+            },
+            NfInstanceCandidate {
+                nf_instance_id: "nf-idle".to_string(),
+                nf_type: NfType::Udm,
+                host: "udm2.local".to_string(),
+                port: 7777,
+                priority: 10,
+                capacity: 100,
+                load: 10,
+                healthy: true,
+            },
+        ];
+        let selected = select_nf_instance(&candidates);
+        assert_eq!(selected.unwrap().nf_instance_id, "nf-idle");
+    }
+
+    #[test]
+    fn test_select_nf_instance_skips_unhealthy() {
+        let candidates = vec![
+            NfInstanceCandidate {
+                nf_instance_id: "nf-unhealthy".to_string(),
+                nf_type: NfType::Smf,
+                host: "smf1.local".to_string(),
+                port: 7777,
+                priority: 1,
+                capacity: 100,
+                load: 0,
+                healthy: false,
+            },
+            NfInstanceCandidate {
+                nf_instance_id: "nf-healthy".to_string(),
+                nf_type: NfType::Smf,
+                host: "smf2.local".to_string(),
+                port: 7777,
+                priority: 10,
+                capacity: 100,
+                load: 50,
+                healthy: true,
+            },
+        ];
+        let selected = select_nf_instance(&candidates);
+        assert_eq!(selected.unwrap().nf_instance_id, "nf-healthy");
+    }
+
+    #[test]
+    fn test_round_robin_selection() {
+        let candidates = vec![
+            NfInstanceCandidate {
+                nf_instance_id: "nf-a".to_string(),
+                nf_type: NfType::Smf,
+                host: "smf1.local".to_string(),
+                port: 7777,
+                priority: 10,
+                capacity: 100,
+                load: 50,
+                healthy: true,
+            },
+            NfInstanceCandidate {
+                nf_instance_id: "nf-b".to_string(),
+                nf_type: NfType::Smf,
+                host: "smf2.local".to_string(),
+                port: 7777,
+                priority: 10,
+                capacity: 100,
+                load: 50,
+                healthy: true,
+            },
+        ];
+        // Call twice to see round-robin switching
+        let first = select_nf_instance_round_robin(&candidates).unwrap().nf_instance_id.clone();
+        let second = select_nf_instance_round_robin(&candidates).unwrap().nf_instance_id.clone();
+        // They should be different (round-robin)
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn test_discovery_cache() {
+        let cache = DiscoveryCache::new();
+
+        assert!(cache.get("SMF", "nsmf-pdusession").is_none());
+
+        let candidates = vec![NfInstanceCandidate {
+            nf_instance_id: "smf-1".to_string(),
+            nf_type: NfType::Smf,
+            host: "smf.local".to_string(),
+            port: 7777,
+            priority: 10,
+            capacity: 100,
+            load: 0,
+            healthy: true,
+        }];
+
+        cache.put("SMF", "nsmf-pdusession", candidates.clone(), std::time::Duration::from_secs(3600));
+
+        let cached = cache.get("SMF", "nsmf-pdusession");
+        assert!(cached.is_some());
+        assert_eq!(cached.unwrap().len(), 1);
+
+        assert!(cache.get("AMF", "nsmf-pdusession").is_none());
+        assert!(cache.get("SMF", "other").is_none());
+    }
+
+    #[test]
+    fn test_parse_search_result() {
+        let json = serde_json::json!({
+            "validityPeriod": 3600,
+            "nfInstances": [
+                {
+                    "nfInstanceId": "smf-001",
+                    "nfType": "SMF",
+                    "nfStatus": "REGISTERED",
+                    "ipv4Addresses": ["10.0.0.1"],
+                    "priority": 10,
+                    "capacity": 100,
+                    "load": 30,
+                },
+                {
+                    "nfInstanceId": "smf-002",
+                    "nfType": "SMF",
+                    "nfStatus": "SUSPENDED",
+                    "fqdn": "smf2.local",
+                }
+            ]
+        });
+        let body = serde_json::to_vec(&json).unwrap();
+        let candidates = parse_search_result(&body);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].nf_instance_id, "smf-001");
+        assert_eq!(candidates[0].host, "10.0.0.1");
+        assert!(candidates[0].healthy);
+        assert_eq!(candidates[1].nf_instance_id, "smf-002");
+        assert!(!candidates[1].healthy);
+    }
+
+    #[test]
+    fn test_parse_apiroot_url() {
+        let (host, port) = parse_apiroot_url("https://amf.example.com:8443").unwrap();
+        assert_eq!(host, "amf.example.com");
+        assert_eq!(port, 8443);
+
+        let (host, port) = parse_apiroot_url("https://smf.local").unwrap();
+        assert_eq!(host, "smf.local");
+        assert_eq!(port, 443);
+
+        let (host, port) = parse_apiroot_url("http://127.0.0.1:7777/path").unwrap();
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 7777);
+    }
+
+    #[test]
+    fn test_route_request_with_target_apiroot() {
+        let mut request = SbiRequest::new("POST", "/nsmf-pdusession/v1/sm-contexts");
+        request.set_header(headers::TARGET_APIROOT, "https://smf.local:7778");
+
+        let result = route_request(&request, &[]);
+        assert!(result.is_ok());
+        let (host, port, _) = result.unwrap();
+        assert_eq!(host, "smf.local");
+        assert_eq!(port, 7778);
+    }
+
+    #[test]
+    fn test_build_forwarded_request() {
+        let original = SbiRequest::new("GET", "/nudm-sdm/v1/imsi-123/sm-data");
+        let headers = HashMap::new();
+        let fwd = build_forwarded_request(&original, "udm.local", 7777, headers);
+        assert_eq!(fwd.method, "GET");
+        assert_eq!(fwd.uri, "/nudm-sdm/v1/imsi-123/sm-data");
+        assert_eq!(
+            fwd.headers.get(":authority"),
+            Some(&"udm.local:7777".to_string())
+        );
     }
 }

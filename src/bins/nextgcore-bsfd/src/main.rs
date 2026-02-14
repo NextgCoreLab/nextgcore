@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
                 log::debug!("Configuration file loaded ({} bytes)", content.len());
             }
             Err(e) => {
-                log::warn!("Failed to read configuration file: {}", e);
+                log::warn!("Failed to read configuration file: {e}");
             }
         }
     } else {
@@ -165,9 +165,9 @@ async fn main() -> Result<()> {
     let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
 
     sbi_server.start(bsf_sbi_request_handler).await
-        .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
-    log::info!("SBI HTTP/2 server listening on {}", sbi_addr);
+    log::info!("SBI HTTP/2 server listening on {sbi_addr}");
     log::info!("NextGCore BSF ready");
 
     // Main event loop (async)
@@ -178,7 +178,7 @@ async fn main() -> Result<()> {
 
     // Stop SBI server
     sbi_server.stop().await
-        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
     log::info!("SBI HTTP/2 server stopped");
 
     // Close legacy SBI server
@@ -202,7 +202,7 @@ async fn bsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("BSF SBI request: {} {}", method, uri);
+    log::debug!("BSF SBI request: {method} {uri}");
 
     // Parse the URI path
     let path = uri.split('?').next().unwrap_or(uri);
@@ -248,7 +248,7 @@ async fn bsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         }
 
         _ => {
-            log::warn!("Unknown BSF request: {} {}", method, uri);
+            log::warn!("Unknown BSF request: {method} {uri}");
             send_method_not_allowed(method, uri)
         }
     }
@@ -266,7 +266,7 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
 
     let binding_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
     // Extract IP addresses from request
@@ -337,7 +337,7 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
                 sess.binding_id, ipv4addr, ipv6prefix, ttl_secs);
 
             SbiResponse::with_status(201)
-                .with_header("Location", &format!("/nbsf-management/v1/pcfBindings/{}", sess.binding_id))
+                .with_header("Location", format!("/nbsf-management/v1/pcfBindings/{}", sess.binding_id))
                 .with_json_body(&serde_json::json!({
                     "pcfBindingId": sess.binding_id,
                     "ipv4Addr": ipv4addr,
@@ -359,7 +359,7 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
 }
 
 async fn handle_pcf_binding_get(binding_id: &str) -> SbiResponse {
-    log::debug!("PCF Binding Get: {}", binding_id);
+    log::debug!("PCF Binding Get: {binding_id}");
 
     let ctx = bsf_self();
     let sess = if let Ok(context) = ctx.read() {
@@ -384,7 +384,7 @@ async fn handle_pcf_binding_get(binding_id: &str) -> SbiResponse {
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }
         None => {
-            send_not_found(&format!("PCF Binding {} not found", binding_id), Some("BINDING_NOT_FOUND"))
+            send_not_found(&format!("PCF Binding {binding_id} not found"), Some("BINDING_NOT_FOUND"))
         }
     }
 }
@@ -396,7 +396,7 @@ async fn handle_pcf_binding_discovery(request: &SbiRequest) -> SbiResponse {
     let ipv6prefix = request.http.params.get("ipv6Prefix")
         .map(|s| s.as_str());
 
-    log::info!("PCF Binding Discovery: ipv4={:?}, ipv6={:?}", ipv4addr, ipv6prefix);
+    log::info!("PCF Binding Discovery: ipv4={ipv4addr:?}, ipv6={ipv6prefix:?}");
 
     if ipv4addr.is_none() && ipv6prefix.is_none() {
         return send_bad_request("Either ipv4Addr or ipv6Prefix query parameter required", Some("MISSING_PARAM"));
@@ -438,7 +438,7 @@ async fn handle_pcf_binding_discovery(request: &SbiRequest) -> SbiResponse {
 }
 
 async fn handle_pcf_binding_delete(binding_id: &str) -> SbiResponse {
-    log::info!("PCF Binding Delete: {}", binding_id);
+    log::info!("PCF Binding Delete: {binding_id}");
 
     let ctx = bsf_self();
 
@@ -450,11 +450,11 @@ async fn handle_pcf_binding_delete(binding_id: &str) -> SbiResponse {
             if let Ok(context) = ctx.read() {
                 if context.sess_remove(id).is_some() {
                     context.sess_unpersist(binding_id);
-                    log::info!("PCF Binding {} deleted", binding_id);
+                    log::info!("PCF Binding {binding_id} deleted");
                     return SbiResponse::with_status(204);
                 }
             }
-            send_not_found(&format!("PCF Binding {} not found", binding_id), Some("BINDING_NOT_FOUND"))
+            send_not_found(&format!("PCF Binding {binding_id} not found"), Some("BINDING_NOT_FOUND"))
         }
         None => {
             send_bad_request("Invalid binding ID format", Some("INVALID_BINDING_ID"))
@@ -463,7 +463,7 @@ async fn handle_pcf_binding_delete(binding_id: &str) -> SbiResponse {
 }
 
 async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("PCF Binding Update (PATCH): {}", binding_id);
+    log::info!("PCF Binding Update (PATCH): {binding_id}");
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -472,7 +472,7 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
 
     let update_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
     let ctx = bsf_self();
@@ -536,7 +536,7 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
                 context.sess_persist(&sess);
             }
 
-            log::info!("PCF Binding {} updated", binding_id);
+            log::info!("PCF Binding {binding_id} updated");
 
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({
@@ -556,7 +556,7 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }
         None => {
-            send_not_found(&format!("PCF Binding {} not found", binding_id), Some("BINDING_NOT_FOUND"))
+            send_not_found(&format!("PCF Binding {binding_id} not found"), Some("BINDING_NOT_FOUND"))
         }
     }
 }
@@ -626,13 +626,13 @@ async fn run_event_loop_async(bsf_sm: &mut BsfSmContext, shutdown: Arc<AtomicBoo
             // Handle binding expiry timer directly (TTL cleanup)
             if entry.timer_type == BsfTimerId::BindingExpiry {
                 if let Some(ref binding_id) = entry.data {
-                    log::info!("PCF Binding {} expired (TTL), removing", binding_id);
+                    log::info!("PCF Binding {binding_id} expired (TTL), removing");
                     let ctx = bsf_self();
                     if let Ok(sess_id) = binding_id.parse::<u64>() {
                         if let Ok(context) = ctx.read() {
                             if context.sess_remove(sess_id).is_some() {
                                 context.sess_unpersist(binding_id);
-                                log::info!("PCF Binding {} auto-removed on TTL expiry", binding_id);
+                                log::info!("PCF Binding {binding_id} auto-removed on TTL expiry");
                             }
                         }
                     }

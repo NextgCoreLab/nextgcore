@@ -189,7 +189,7 @@ impl MockUpf {
 
             PfcpMessage::SessionDeletionRequest(_req) => {
                 let seid = header.seid.unwrap_or(0);
-                log::info!("UPF received Session Deletion Request, SEID={}", seid);
+                log::info!("UPF received Session Deletion Request, SEID={seid}");
 
                 // Remove session
                 {

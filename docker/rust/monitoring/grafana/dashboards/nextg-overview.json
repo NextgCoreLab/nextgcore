@@ -1,0 +1,109 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "title": "NF Health Status",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 0 },
+      "targets": [{
+        "expr": "count(up{job=~\"nextgcore-.*\"} == 1)",
+        "legendFormat": "Healthy NFs"
+      }],
+      "fieldConfig": {
+        "defaults": { "thresholds": { "steps": [
+          { "color": "red", "value": null },
+          { "color": "yellow", "value": 15 },
+          { "color": "green", "value": 22 }
+        ]}}
+      }
+    },
+    {
+      "title": "SBI Request Rate (per NF)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [{
+        "expr": "rate(nextgcore_sbi_request_total[5m])",
+        "legendFormat": "{{nf_type}}"
+      }]
+    },
+    {
+      "title": "SBI Error Rate (per NF)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [{
+        "expr": "rate(nextgcore_sbi_error_total[5m]) / rate(nextgcore_sbi_request_total[5m])",
+        "legendFormat": "{{nf_type}}"
+      }]
+    },
+    {
+      "title": "AMF Registered UEs",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 12 },
+      "targets": [{
+        "expr": "nextgcore_amf_active_sessions",
+        "legendFormat": "Registered UEs"
+      }]
+    },
+    {
+      "title": "SMF PDU Sessions",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 12 },
+      "targets": [{
+        "expr": "nextgcore_smf_active_sessions",
+        "legendFormat": "PDU Sessions"
+      }]
+    },
+    {
+      "title": "UPF Active Flows",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 12 },
+      "targets": [{
+        "expr": "nextgcore_upf_active_sessions",
+        "legendFormat": "Active Flows"
+      }]
+    },
+    {
+      "title": "NRF Registered NFs",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 12 },
+      "targets": [{
+        "expr": "count(nextgcore_nrf_registered == 1)",
+        "legendFormat": "Registered NFs"
+      }]
+    },
+    {
+      "title": "SBI Request Latency (p50/p95/p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, rate(nextgcore_sbi_request_duration_seconds_bucket[5m]))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, rate(nextgcore_sbi_request_duration_seconds_bucket[5m]))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, rate(nextgcore_sbi_request_duration_seconds_bucket[5m]))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "title": "NF Uptime",
+      "type": "table",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 24 },
+      "targets": [{
+        "expr": "nextgcore_uptime_seconds",
+        "legendFormat": "{{nf_type}}",
+        "instant": true,
+        "format": "table"
+      }]
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["nextgcore", "5g", "overview"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "title": "NextGCore Overview",
+  "uid": "nextgcore-overview",
+  "version": 1
+}

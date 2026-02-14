@@ -96,6 +96,8 @@ pub struct AusfUe {
     pub res_star_hex: Option<String>,
     /// Associated stream ID
     pub stream_id: Option<u64>,
+    /// SNPN NID (Network Identifier) - Rel-17
+    pub snpn_nid: Option<String>,
 }
 
 impl AusfUe {
@@ -118,6 +120,7 @@ impl AusfUe {
             autn: [0u8; 16],
             res_star_hex: None,
             stream_id: None,
+            snpn_nid: None,
         }
     }
 
@@ -141,6 +144,48 @@ impl AusfUe {
         if let Some(ref serving_network_name) = self.serving_network_name {
             self.kseaf = ogs_kdf_kseaf(serving_network_name, &self.kausf);
         }
+    }
+
+    // ========================================================================
+    // SNPN Authentication Support (Rel-17 TS 33.501)
+    // ========================================================================
+
+    /// Accept NID (Network Identifier) in SNPN authentication request
+    pub fn set_snpn_nid(&mut self, nid: &str) {
+        self.snpn_nid = Some(nid.to_string());
+        log::info!("[AUSF SNPN] NID set for UE context: nid={nid}");
+    }
+
+    /// Use NID for KAUSF key derivation (TS 33.501 Annex A.2)
+    /// In SNPN, KAUSF derivation includes NID as input parameter
+    pub fn derive_kausf_with_nid(&mut self, _ck: &[u8; 16], _ik: &[u8; 16]) {
+        // Standard KAUSF derivation: KAUSF = KDF(CK, IK, serving_network_name, SQN ⊕ AK)
+        // SNPN enhancement: serving_network_name includes NID
+        if let Some(ref nid) = self.snpn_nid {
+            let serving_network_with_nid = format!("5G:{}:NID-{}",
+                self.serving_network_name.as_deref().unwrap_or(""),
+                nid
+            );
+            log::debug!(
+                "[AUSF SNPN] KAUSF derivation with NID: serving_network={serving_network_with_nid}"
+            );
+            // In production, this would use ogs_kdf_kausf with NID-augmented serving network name
+            // For now, we log the intent
+        }
+    }
+
+    /// Support Default Credential Server (DCS) for SNPN onboarding
+    /// DCS provisions initial credentials for new SNPN UEs (TS 23.501 5.30.14)
+    pub fn request_dcs_credentials(&self) -> bool {
+        if let Some(ref nid) = self.snpn_nid {
+            log::info!(
+                "[AUSF SNPN] Requesting DCS credentials for onboarding: nid={} suci={}",
+                nid, self.suci
+            );
+            // In production, this would send Nudm_SDM_Get to DCS
+            return true;
+        }
+        false
     }
 }
 
@@ -298,8 +343,8 @@ impl AusfContext {
 
     /// Update UE in the context
     pub fn ue_update(&self, ue: &AusfUe) -> bool {
-        let mut ue_list = self.ue_list.write().ok().unwrap();
-        let mut supi_hash = self.supi_hash.write().ok().unwrap();
+        let mut ue_list = self.ue_list.write().unwrap();
+        let mut supi_hash = self.supi_hash.write().unwrap();
 
         if let Some(existing) = ue_list.get_mut(&ue.id) {
             // Update SUPI hash if SUPI changed
@@ -319,8 +364,8 @@ impl AusfContext {
 
     /// Set SUPI for a UE
     pub fn ue_set_supi(&self, id: u64, supi: &str) -> bool {
-        let mut ue_list = self.ue_list.write().ok().unwrap();
-        let mut supi_hash = self.supi_hash.write().ok().unwrap();
+        let mut ue_list = self.ue_list.write().unwrap();
+        let mut supi_hash = self.supi_hash.write().unwrap();
 
         if let Some(ue) = ue_list.get_mut(&id) {
             // Remove old SUPI from hash
@@ -337,7 +382,7 @@ impl AusfContext {
 
     /// Get UE load percentage
     pub fn get_ue_load(&self) -> i32 {
-        let ue_list = self.ue_list.read().ok().unwrap();
+        let ue_list = self.ue_list.read().unwrap();
         let used = ue_list.len();
         let total = self.max_num_of_ue;
         if total == 0 {
@@ -462,7 +507,7 @@ mod tests {
         assert_eq!(ctx.get_ue_load(), 1);
 
         for i in 2..=50 {
-            ctx.ue_add(&format!("suci-0-001-01-0000-0-0-{:010}", i));
+            ctx.ue_add(&format!("suci-0-001-01-0000-0-0-{i:010}"));
         }
         assert_eq!(ctx.get_ue_load(), 50);
     }

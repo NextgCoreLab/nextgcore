@@ -16,6 +16,7 @@ ogs-crypt = { workspace = true }
 ogs-diameter = { workspace = true }
 ogs-dbi = { workspace = true }
 ogs-app = { workspace = true }
+bytes.workspace = true
 log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true
@@ -25,3 +26,6 @@ ctrlc = { workspace = true, features = ["termination"] }
 
 [dev-dependencies]
 proptest.workspace = true
+
+[lints]
+workspace = true

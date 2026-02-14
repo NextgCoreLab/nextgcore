@@ -90,7 +90,7 @@ fn main() -> Result<()> {
     if std::path::Path::new(&args.config).exists() {
         log::info!("Loading configuration from {}", args.config);
         if let Err(e) = pcrf_context_parse_config(&args.config) {
-            log::warn!("Failed to parse config: {}", e);
+            log::warn!("Failed to parse config: {e}");
         }
     } else {
         log::debug!("Configuration file not found: {}", args.config);
@@ -103,7 +103,7 @@ fn main() -> Result<()> {
 
     // Initialize FreeDiameter
     if let Err(e) = pcrf_fd_init() {
-        log::error!("Failed to initialize FreeDiameter: {}", e);
+        log::error!("Failed to initialize FreeDiameter: {e}");
         cleanup(&mut pcrf_sm);
         return Err(anyhow::anyhow!(e));
     }
@@ -111,20 +111,20 @@ fn main() -> Result<()> {
 
     // Initialize Gx interface (P-GW communication)
     if let Err(e) = pcrf_gx_init() {
-        log::error!("Failed to initialize Gx interface: {}", e);
+        log::error!("Failed to initialize Gx interface: {e}");
         pcrf_fd_final();
         cleanup(&mut pcrf_sm);
-        return Err(anyhow::anyhow!("{}", e));
+        return Err(anyhow::anyhow!("{e}"));
     }
     log::info!("Gx interface initialized");
 
     // Initialize Rx interface (AF/P-CSCF communication)
     if let Err(e) = pcrf_rx_init() {
-        log::error!("Failed to initialize Rx interface: {}", e);
+        log::error!("Failed to initialize Rx interface: {e}");
         pcrf_gx_final();
         pcrf_fd_final();
         cleanup(&mut pcrf_sm);
-        return Err(anyhow::anyhow!("{}", e));
+        return Err(anyhow::anyhow!("{e}"));
     }
     log::info!("Rx interface initialized");
 

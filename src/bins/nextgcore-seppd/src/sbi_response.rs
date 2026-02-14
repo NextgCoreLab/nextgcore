@@ -25,10 +25,7 @@ pub fn send_error_response(stream_id: u64, status: u16, detail: &str) {
     };
 
     log::debug!(
-        "Sending error response (stream_id={}, status={}): {}",
-        stream_id,
-        status,
-        detail
+        "Sending error response (stream_id={stream_id}, status={status}): {detail}"
     );
 
     queue_sbi_response(stream_id, response);
@@ -40,10 +37,7 @@ pub fn send_method_not_allowed_response(stream_id: u64, method: &str, resource: 
     let response = send_method_not_allowed(method, resource);
 
     log::debug!(
-        "Sending 405 Method Not Allowed (stream_id={}): {} {}",
-        stream_id,
-        method,
-        resource
+        "Sending 405 Method Not Allowed (stream_id={stream_id}): {method} {resource}"
     );
 
     queue_sbi_response(stream_id, response);

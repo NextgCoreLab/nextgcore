@@ -20,7 +20,7 @@ pub fn build_ng_setup_response_asn1(ctx: &AmfContext) -> Option<Vec<u8>> {
     let mut protocol_ies = Vec::new();
 
     // IE: AMFName (mandatory)
-    let amf_name = ctx.amf_name.as_ref().map(|s| s.as_str()).unwrap_or("AMF");
+    let amf_name = ctx.amf_name.as_deref().unwrap_or("AMF");
     protocol_ies.push(NGSetupResponseProtocolIEs_Entry {
         id: ProtocolIE_ID(ID_AMF_NAME),
         criticality: Criticality(Criticality::REJECT),
@@ -74,7 +74,7 @@ pub fn build_ng_setup_response_asn1(ctx: &AmfContext) -> Option<Vec<u8>> {
             Some(bytes)
         }
         Err(e) => {
-            log::error!("Failed to encode NG Setup Response: {:?}", e);
+            log::error!("Failed to encode NG Setup Response: {e:?}");
             None
         }
     }
@@ -134,7 +134,7 @@ pub fn build_ng_setup_failure_asn1(
             bytes
         }
         Err(e) => {
-            log::error!("Failed to encode NG Setup Failure: {:?}", e);
+            log::error!("Failed to encode NG Setup Failure: {e:?}");
             Vec::new()
         }
     }
@@ -265,7 +265,7 @@ pub fn parse_ng_setup_request_asn1(
     let pdu = match decode_ngap_pdu(data) {
         Ok(pdu) => pdu,
         Err(e) => {
-            log::error!("Failed to decode NGAP PDU: {:?}", e);
+            log::error!("Failed to decode NGAP PDU: {e:?}");
             return None;
         }
     };
@@ -273,7 +273,7 @@ pub fn parse_ng_setup_request_asn1(
     let initiating_message = match pdu {
         NGAP_PDU::InitiatingMessage(msg) => msg,
         _ => {
-            log::error!("Expected InitiatingMessage, got {:?}", pdu);
+            log::error!("Expected InitiatingMessage, got {pdu:?}");
             return None;
         }
     };
@@ -300,16 +300,13 @@ pub fn parse_ng_setup_request_asn1(
                     }
 
                     // Parse gNB ID
-                    match &global_gnb_id.gnb_id {
-                        GNB_ID::GNB_ID(gnb_id_bits) => {
-                            result.gnb_id_len = gnb_id_bits.0.len() as u8;
-                            let mut gnb_id: u32 = 0;
-                            for bit in gnb_id_bits.0.iter() {
-                                gnb_id = (gnb_id << 1) | (*bit as u32);
-                            }
-                            result.gnb_id = gnb_id;
+                    if let GNB_ID::GNB_ID(gnb_id_bits) = &global_gnb_id.gnb_id {
+                        result.gnb_id_len = gnb_id_bits.0.len() as u8;
+                        let mut gnb_id: u32 = 0;
+                        for bit in gnb_id_bits.0.iter() {
+                            gnb_id = (gnb_id << 1) | (*bit as u32);
                         }
-                        _ => {}
+                        result.gnb_id = gnb_id;
                     }
                 }
             }
@@ -430,7 +427,7 @@ pub fn parse_initial_ue_message_asn1(data: &[u8]) -> Option<InitialUeMessageData
     let pdu = match decode_ngap_pdu(data) {
         Ok(pdu) => pdu,
         Err(e) => {
-            log::error!("Failed to decode NGAP PDU: {:?}", e);
+            log::error!("Failed to decode NGAP PDU: {e:?}");
             return None;
         }
     };
@@ -438,7 +435,7 @@ pub fn parse_initial_ue_message_asn1(data: &[u8]) -> Option<InitialUeMessageData
     let initiating_message = match pdu {
         NGAP_PDU::InitiatingMessage(msg) => msg,
         _ => {
-            log::error!("Expected InitiatingMessage, got {:?}", pdu);
+            log::error!("Expected InitiatingMessage, got {pdu:?}");
             return None;
         }
     };
@@ -582,7 +579,7 @@ pub fn build_downlink_nas_transport_asn1(
             Some(bytes)
         }
         Err(e) => {
-            log::error!("Failed to encode Downlink NAS Transport: {:?}", e);
+            log::error!("Failed to encode Downlink NAS Transport: {e:?}");
             None
         }
     }
@@ -686,7 +683,7 @@ pub fn build_pdu_session_resource_setup_request_asn1(
             Some(bytes)
         }
         Err(e) => {
-            log::error!("Failed to encode PDU Session Resource Setup Request: {:?}", e);
+            log::error!("Failed to encode PDU Session Resource Setup Request: {e:?}");
             None
         }
     }
@@ -763,7 +760,83 @@ pub fn build_pdu_session_resource_release_command_asn1(
             Some(bytes)
         }
         Err(e) => {
-            log::error!("Failed to encode PDU Session Resource Release Command: {:?}", e);
+            log::error!("Failed to encode PDU Session Resource Release Command: {e:?}");
+            None
+        }
+    }
+}
+
+/// Build a PDU Session Resource Modify Request with proper ASN.1 APER encoding
+///
+/// Sent by AMF to gNB to modify PDU session resources (e.g., QoS changes).
+/// The message follows 3GPP TS 38.413 Section 8.2.3.
+pub fn build_pdu_session_resource_modify_request_asn1(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    pdu_session_id: u8,
+    nas_pdu: Option<&[u8]>,
+    n2_sm_transfer: &[u8],
+) -> Option<Vec<u8>> {
+    let mut protocol_ies = Vec::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory)
+    protocol_ies.push(PDUSessionResourceModifyRequestProtocolIEs_Entry {
+        id: ProtocolIE_ID(ID_AMF_UE_NGAP_ID),
+        criticality: Criticality(Criticality::REJECT),
+        value: PDUSessionResourceModifyRequestProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(
+            AMF_UE_NGAP_ID(amf_ue_ngap_id),
+        ),
+    });
+
+    // IE: RAN-UE-NGAP-ID (mandatory)
+    protocol_ies.push(PDUSessionResourceModifyRequestProtocolIEs_Entry {
+        id: ProtocolIE_ID(ID_RAN_UE_NGAP_ID),
+        criticality: Criticality(Criticality::REJECT),
+        value: PDUSessionResourceModifyRequestProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(
+            RAN_UE_NGAP_ID(ran_ue_ngap_id),
+        ),
+    });
+
+    // IE: PDUSessionResourceModifyListModReq (mandatory)
+    let item = PDUSessionResourceModifyItemModReq {
+        pdu_session_id: PDUSessionID(pdu_session_id),
+        nas_pdu: nas_pdu.map(|p| NAS_PDU(p.to_vec())),
+        pdu_session_resource_modify_request_transfer:
+            PDUSessionResourceModifyItemModReqPDUSessionResourceModifyRequestTransfer(
+                n2_sm_transfer.to_vec(),
+            ),
+        ie_extensions: None,
+    };
+
+    let list = PDUSessionResourceModifyListModReq(vec![item]);
+    protocol_ies.push(PDUSessionResourceModifyRequestProtocolIEs_Entry {
+        id: ProtocolIE_ID(ID_PDU_SESSION_RESOURCE_MODIFY_LIST_MOD_REQ),
+        criticality: Criticality(Criticality::REJECT),
+        value: PDUSessionResourceModifyRequestProtocolIEs_EntryValue::Id_PDUSessionResourceModifyListModReq(list),
+    });
+
+    let request = PDUSessionResourceModifyRequest {
+        protocol_i_es: PDUSessionResourceModifyRequestProtocolIEs(protocol_ies),
+    };
+
+    let initiating_message = InitiatingMessage {
+        procedure_code: ProcedureCode(ID_PDU_SESSION_RESOURCE_MODIFY),
+        criticality: Criticality(Criticality::REJECT),
+        value: InitiatingMessageValue::Id_PDUSessionResourceModify(request),
+    };
+
+    let pdu = NGAP_PDU::InitiatingMessage(initiating_message);
+
+    match encode_ngap_pdu(&pdu) {
+        Ok(bytes) => {
+            log::debug!(
+                "Built PDU Session Resource Modify Request: {} bytes, amf_ue_ngap_id={}, psi={}",
+                bytes.len(), amf_ue_ngap_id, pdu_session_id
+            );
+            Some(bytes)
+        }
+        Err(e) => {
+            log::error!("Failed to encode PDU Session Resource Modify Request: {e:?}");
             None
         }
     }
@@ -785,7 +858,7 @@ pub fn parse_uplink_nas_transport_asn1(data: &[u8]) -> Option<UplinkNasTransport
     let pdu = match decode_ngap_pdu(data) {
         Ok(pdu) => pdu,
         Err(e) => {
-            log::error!("Failed to decode NGAP PDU: {:?}", e);
+            log::error!("Failed to decode NGAP PDU: {e:?}");
             return None;
         }
     };
@@ -793,7 +866,7 @@ pub fn parse_uplink_nas_transport_asn1(data: &[u8]) -> Option<UplinkNasTransport
     let initiating_message = match pdu {
         NGAP_PDU::InitiatingMessage(msg) => msg,
         _ => {
-            log::error!("Expected InitiatingMessage, got {:?}", pdu);
+            log::error!("Expected InitiatingMessage, got {pdu:?}");
             return None;
         }
     };
@@ -883,7 +956,7 @@ pub fn build_paging_asn1(
             Some(bytes)
         }
         Err(e) => {
-            log::error!("Failed to encode Paging: {:?}", e);
+            log::error!("Failed to encode Paging: {e:?}");
             None
         }
     }

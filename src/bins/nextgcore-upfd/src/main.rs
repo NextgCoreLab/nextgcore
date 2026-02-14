@@ -18,6 +18,8 @@ pub mod n4_handler;
 pub mod pfcp_path;
 pub mod pfcp_sm;
 pub mod rule_match;
+pub mod mcast;
+pub mod programmable_plane;
 pub mod timer;
 pub mod upf_sm;
 
@@ -128,7 +130,7 @@ async fn main() -> Result<()> {
     log::info!("UPF context initialized (max_sessions={})", args.max_sessions);
 
     // Initialize GTP-U path
-    upf_gtp_init().map_err(|e| anyhow::anyhow!("Failed to initialize GTP path: {}", e))?;
+    upf_gtp_init().map_err(|e| anyhow::anyhow!("Failed to initialize GTP path: {e}"))?;
     log::info!("GTP-U path initialized");
 
     // Initialize UPF state machine
@@ -147,7 +149,7 @@ async fn main() -> Result<()> {
                 log::debug!("Configuration file loaded ({} bytes)", content.len());
             }
             Err(e) => {
-                log::warn!("Failed to read configuration file: {}", e);
+                log::warn!("Failed to read configuration file: {e}");
             }
         }
     } else {
@@ -166,12 +168,12 @@ async fn main() -> Result<()> {
 
     // Initialize legacy PFCP path context (for compatibility)
     pfcp_open(&mut pfcp_ctx, pfcp_addr)
-        .map_err(|e| anyhow::anyhow!("Failed to open PFCP path: {}", e))?;
-    log::info!("PFCP path context initialized on {}", pfcp_addr);
+        .map_err(|e| anyhow::anyhow!("Failed to open PFCP path: {e}"))?;
+    log::info!("PFCP path context initialized on {pfcp_addr}");
 
     // Open GTP-U path (control plane)
-    upf_gtp_open().map_err(|e| anyhow::anyhow!("Failed to open GTP path: {}", e))?;
-    log::info!("GTP-U path opened on {}", gtpu_addr);
+    upf_gtp_open().map_err(|e| anyhow::anyhow!("Failed to open GTP path: {e}"))?;
+    log::info!("GTP-U path opened on {gtpu_addr}");
 
     // Initialize data plane (optional based on --no-dataplane flag)
     let mut data_plane = DataPlane::new(shutdown.clone());
@@ -213,7 +215,7 @@ async fn main() -> Result<()> {
         Some(tokio::spawn(async move {
             log::info!("Data plane task spawned, calling run()");
             if let Err(e) = dp_clone.run().await {
-                log::error!("Data plane error: {}", e);
+                log::error!("Data plane error: {e}");
             }
             log::info!("Data plane task finished");
         }))
@@ -227,7 +229,7 @@ async fn main() -> Result<()> {
     let pfcp_server_handle = tokio::spawn(async move {
         log::info!("PFCP server task spawned");
         if let Err(e) = pfcp_server_clone.run().await {
-            log::error!("PFCP server error: {}", e);
+            log::error!("PFCP server error: {e}");
         }
         log::info!("PFCP server task finished");
     });
@@ -250,6 +252,7 @@ async fn main() -> Result<()> {
     // Run URR threshold check task (periodic usage report generation)
     log::info!("Starting URR threshold check task...");
     let dp_for_urr = data_plane.clone();
+    let pfcp_for_urr = pfcp_server.clone();
     let shutdown_urr = shutdown.clone();
     let urr_check_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
@@ -259,15 +262,31 @@ async fn main() -> Result<()> {
                 break;
             }
             let reports = dp_for_urr.collect_urr_reports();
-            for report in &reports {
+            if reports.is_empty() {
+                continue;
+            }
+
+            // Group reports by (upf_seid, smf_seid) for batching
+            let mut grouped: std::collections::HashMap<(u64, u64), Vec<data_plane::UrrReportEntry>> =
+                std::collections::HashMap::new();
+            for report in reports {
+                grouped
+                    .entry((report.upf_seid, report.smf_seid))
+                    .or_default()
+                    .push(report);
+            }
+
+            for ((upf_seid, smf_seid), session_reports) in grouped {
                 log::info!(
-                    "URR threshold report: SEID={:#x}, URR_ID={}, total={} bytes ({} UL, {} DL), {} pkts",
-                    report.upf_seid, report.urr_id,
-                    report.total_bytes, report.ul_bytes, report.dl_bytes, report.total_pkts
+                    "Sending {} URR reports for SEID={upf_seid:#x}",
+                    session_reports.len()
                 );
-                // Note: In production, this would call pfcp_path::send_session_report_request()
-                // to send a PFCP Session Report Request to the SMF with the usage report.
-                // The PfcpServer would need access to the session's SMF address to send it.
+                if let Err(e) = pfcp_for_urr
+                    .send_urr_report(upf_seid, smf_seid, session_reports)
+                    .await
+                {
+                    log::error!("Failed to send URR report: {e}");
+                }
             }
         }
     });
@@ -289,7 +308,7 @@ async fn main() -> Result<()> {
     log::info!("Shutting down...");
 
     // Close GTP-U path
-    upf_gtp_close().map_err(|e| anyhow::anyhow!("Failed to close GTP path: {}", e))?;
+    upf_gtp_close().map_err(|e| anyhow::anyhow!("Failed to close GTP path: {e}"))?;
     log::info!("GTP-U path closed");
 
     // Close PFCP path
@@ -297,7 +316,7 @@ async fn main() -> Result<()> {
     log::info!("PFCP path closed");
 
     // Finalize GTP-U
-    upf_gtp_final().map_err(|e| anyhow::anyhow!("Failed to finalize GTP path: {}", e))?;
+    upf_gtp_final().map_err(|e| anyhow::anyhow!("Failed to finalize GTP path: {e}"))?;
     log::info!("GTP-U path finalized");
 
     // Cleanup state machine
@@ -407,7 +426,7 @@ async fn run_async_event_loop(
                 for seq in stale_seqs {
                     if let Some(xact) = pfcp_ctx.find_xact(seq) {
                         if xact.state == pfcp_path::XactState::Pending {
-                            log::debug!("Cleaning up stale PFCP transaction seq={}", seq);
+                            log::debug!("Cleaning up stale PFCP transaction seq={seq}");
                             xact.state = pfcp_path::XactState::Timeout;
                         }
                     }
@@ -433,7 +452,7 @@ async fn update_session_stats() {
     let ctx = upf_self();
     let sess_count = ctx.sess_count();
     if sess_count > 0 {
-        log::debug!("Active sessions: {}", sess_count);
+        log::debug!("Active sessions: {sess_count}");
     }
 
     // Note: URR threshold reporting is handled in the data plane via
@@ -447,7 +466,11 @@ async fn update_session_stats() {
 /// Handle PFCP session events (connect PFCP to data plane)
 fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
     use std::net::IpAddr;
-    use data_plane::GTPU_PORT;
+    use std::sync::Arc;
+    use data_plane::{
+        DataPlaneFar, DataPlanePdr, DataPlaneQer, DataPlaneUrr,
+        GTPU_PORT, SRC_INTF_CORE,
+    };
 
     match event {
         PfcpSessionEvent::SessionEstablished {
@@ -457,33 +480,116 @@ fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
             ul_teid,
             dl_teid,
             gnb_addr,
+            pdrs,
+            fars,
+            qers,
+            urrs,
         } => {
             log::info!(
-                "PFCP Session Established: UPF_SEID={:#x}, SMF_SEID={:#x}, UE={:?}, UL_TEID={:#x}, DL_TEID={:#x}",
-                upf_seid, smf_seid, ue_ipv4, ul_teid, dl_teid
+                "PFCP Session Established: UPF_SEID={upf_seid:#x}, SMF_SEID={smf_seid:#x}, UE={ue_ipv4:?}, UL_TEID={ul_teid:#x}, DL_TEID={dl_teid:#x}"
             );
 
             if let Some(ue_ip) = ue_ipv4 {
-                // Convert gNB IP to SocketAddr
                 let gnb_socket = if let Some(addr) = gnb_addr {
                     SocketAddr::new(IpAddr::V4(addr), GTPU_PORT)
                 } else {
-                    // Default gNB address if not provided
                     log::warn!("No gNB address provided, using default");
                     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), GTPU_PORT)
                 };
 
-                // Add session to data plane with SEID info
+                // Extract QFI from QERs
+                let qfi = qers.iter().find_map(|q| q.qfi);
+
+                // Add session with basic info
                 data_plane.add_session_from_pfcp(
-                    upf_seid,
-                    smf_seid,
-                    ue_ip,
-                    ul_teid,
-                    dl_teid,
-                    gnb_socket,
-                    None, // PDU session ID (could be extracted from PFCP if available)
-                    None, // QFI (could be extracted from PFCP if available)
+                    upf_seid, smf_seid, ue_ip, ul_teid, dl_teid, gnb_socket, None, qfi,
                 );
+
+                // Now install the PFCP-provided PDR/FAR/QER/URR rules
+                if let Some(session) = data_plane.sessions.find_by_seid(upf_seid) {
+                    // Install PDRs from PFCP (replace defaults if provided)
+                    if !pdrs.is_empty() {
+                        let mut dp_pdrs: Vec<DataPlanePdr> = pdrs
+                            .iter()
+                            .map(|p| DataPlanePdr {
+                                pdr_id: p.pdr_id,
+                                precedence: p.precedence,
+                                source_interface: p.pdi.source_interface,
+                                far_id: p.far_id,
+                                qer_id: p.qer_id,
+                                urr_ids: p.urr_ids.clone(),
+                                outer_header_removal: p.outer_header_removal,
+                            })
+                            .collect();
+                        dp_pdrs.sort_by_key(|p| p.precedence);
+                        *session.pdrs.write().unwrap() = dp_pdrs;
+                    }
+
+                    // Install FARs from PFCP (replace defaults if provided)
+                    if !fars.is_empty() {
+                        let mut dp_fars = std::collections::HashMap::new();
+                        for f in &fars {
+                            let ohc_teid = f.forwarding_parameters.as_ref().and_then(|fp| {
+                                fp.outer_header_creation.as_ref().map(|ohc| ohc.teid)
+                            });
+                            let ohc_addr = f.forwarding_parameters.as_ref().and_then(|fp| {
+                                fp.outer_header_creation.as_ref().and_then(|ohc| ohc.ipv4)
+                            });
+                            let dest_if = f
+                                .forwarding_parameters
+                                .as_ref()
+                                .map(|fp| fp.destination_interface)
+                                .unwrap_or(SRC_INTF_CORE);
+                            dp_fars.insert(
+                                f.far_id,
+                                DataPlaneFar {
+                                    far_id: f.far_id,
+                                    apply_action: f.apply_action,
+                                    destination_interface: dest_if,
+                                    ohc_teid,
+                                    ohc_addr,
+                                },
+                            );
+                        }
+                        *session.fars.write().unwrap() = dp_fars;
+                    }
+
+                    // Install QERs from PFCP
+                    if !qers.is_empty() {
+                        let mut dp_qers = std::collections::HashMap::new();
+                        for q in &qers {
+                            let mut qer = DataPlaneQer::new(q.qer_id);
+                            qer.ul_gate_open = q.ul_gate == 0;
+                            qer.dl_gate_open = q.dl_gate == 0;
+                            qer.ul_mbr = q.ul_mbr;
+                            qer.dl_mbr = q.dl_mbr;
+                            if let Some(qfi_val) = q.qfi {
+                                qer.set_qfi(qfi_val);
+                            }
+                            dp_qers.insert(q.qer_id, qer);
+                        }
+                        *session.qers.write().unwrap() = dp_qers;
+                    }
+
+                    // Install URRs from PFCP
+                    if !urrs.is_empty() {
+                        let mut dp_urrs = std::collections::HashMap::new();
+                        for u in &urrs {
+                            let mut urr = DataPlaneUrr::new(u.urr_id);
+                            urr.volume_threshold_total = u.volume_threshold_total;
+                            urr.volume_threshold_ul = u.volume_threshold_ul;
+                            urr.volume_threshold_dl = u.volume_threshold_dl;
+                            urr.time_threshold_secs = u.time_threshold_secs;
+                            dp_urrs.insert(u.urr_id, Arc::new(urr));
+                        }
+                        *session.urrs.write().unwrap() = dp_urrs;
+                    }
+
+                    log::info!(
+                        "Installed rules: {} PDRs, {} FARs, {} QERs, {} URRs for SEID={upf_seid:#x}",
+                        pdrs.len(), fars.len(), qers.len(), urrs.len()
+                    );
+                }
             } else {
                 log::warn!("Session established without UE IP address");
             }
@@ -493,23 +599,68 @@ fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
             upf_seid,
             dl_teid,
             gnb_addr,
+            updated_fars,
+            updated_qers,
         } => {
-            log::info!("PFCP Session Modified: UPF_SEID={:#x}", upf_seid);
+            log::info!("PFCP Session Modified: UPF_SEID={upf_seid:#x}");
 
-            // Convert gNB IP to SocketAddr if present
-            let gnb_socket = gnb_addr.map(|addr| {
-                SocketAddr::new(IpAddr::V4(addr), GTPU_PORT)
-            });
+            let gnb_socket = gnb_addr.map(|addr| SocketAddr::new(IpAddr::V4(addr), GTPU_PORT));
 
-            // Update session in data plane by SEID
+            // Update basic session info
             if dl_teid.is_some() || gnb_socket.is_some() {
                 data_plane.update_session_from_pfcp(upf_seid, dl_teid, gnb_socket);
+            }
+
+            // Update FAR rules in the data plane session
+            if let Some(session) = data_plane.sessions.find_by_seid(upf_seid) {
+                if !updated_fars.is_empty() {
+                    let mut dp_fars = session.fars.write().unwrap();
+                    for f in &updated_fars {
+                        let ohc_teid = f.forwarding_parameters.as_ref().and_then(|fp| {
+                            fp.outer_header_creation.as_ref().map(|ohc| ohc.teid)
+                        });
+                        let ohc_addr = f.forwarding_parameters.as_ref().and_then(|fp| {
+                            fp.outer_header_creation.as_ref().and_then(|ohc| ohc.ipv4)
+                        });
+                        let dest_if = f
+                            .forwarding_parameters
+                            .as_ref()
+                            .map(|fp| fp.destination_interface)
+                            .unwrap_or(SRC_INTF_CORE);
+                        dp_fars.insert(
+                            f.far_id,
+                            DataPlaneFar {
+                                far_id: f.far_id,
+                                apply_action: f.apply_action,
+                                destination_interface: dest_if,
+                                ohc_teid,
+                                ohc_addr,
+                            },
+                        );
+                    }
+                    log::info!("Updated {} FARs for SEID={upf_seid:#x}", updated_fars.len());
+                }
+
+                if !updated_qers.is_empty() {
+                    let mut dp_qers = session.qers.write().unwrap();
+                    for q in &updated_qers {
+                        let mut qer = DataPlaneQer::new(q.qer_id);
+                        qer.ul_gate_open = q.ul_gate == 0;
+                        qer.dl_gate_open = q.dl_gate == 0;
+                        qer.ul_mbr = q.ul_mbr;
+                        qer.dl_mbr = q.dl_mbr;
+                        if let Some(qfi_val) = q.qfi {
+                            qer.set_qfi(qfi_val);
+                        }
+                        dp_qers.insert(q.qer_id, qer);
+                    }
+                    log::info!("Updated {} QERs for SEID={upf_seid:#x}", updated_qers.len());
+                }
             }
         }
 
         PfcpSessionEvent::SessionDeleted { upf_seid, ue_ipv4: _ } => {
-            log::info!("PFCP Session Deleted: UPF_SEID={:#x}", upf_seid);
-            // Remove session from data plane by SEID
+            log::info!("PFCP Session Deleted: UPF_SEID={upf_seid:#x}");
             data_plane.remove_session_from_pfcp(upf_seid);
         }
     }

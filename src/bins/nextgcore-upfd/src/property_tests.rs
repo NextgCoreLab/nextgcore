@@ -316,7 +316,7 @@ mod tests {
         /// Validates: Requirement 7.1 - UPF state naming
         #[test]
         fn prop_upf_state_names_consistent(state in arb_upf_state()) {
-            let name = format!("{:?}", state);
+            let name = format!("{state:?}");
             prop_assert!(!name.is_empty());
             // UPF states should have recognizable names
             prop_assert!(
@@ -332,7 +332,7 @@ mod tests {
         /// Validates: Requirement 7.3 - PFCP state naming
         #[test]
         fn prop_pfcp_state_names_consistent(state in arb_pfcp_state()) {
-            let name = format!("{:?}", state);
+            let name = format!("{state:?}");
             prop_assert!(!name.is_empty());
             // PFCP states should have recognizable names
             prop_assert!(

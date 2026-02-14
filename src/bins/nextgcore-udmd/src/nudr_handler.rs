@@ -714,17 +714,22 @@ fn generate_authentication_vector(udm_ue: &mut UdmUe) -> Result<AuthenticationIn
         .ok_or_else(|| "No serving network name".to_string())?;
 
     // TS 33.501 A.2: Derive KAUSF from CK, IK, serving network name, AUTN
+    let ck_arr = <&[u8; OGS_KEY_LEN]>::try_from(&ck[..OGS_KEY_LEN])
+        .map_err(|_| "CK key length mismatch".to_string())?;
+    let ik_arr = <&[u8; OGS_KEY_LEN]>::try_from(&ik[..OGS_KEY_LEN])
+        .map_err(|_| "IK key length mismatch".to_string())?;
+
     let kausf = kdf::ogs_kdf_kausf(
-        <&[u8; OGS_KEY_LEN]>::try_from(&ck[..OGS_KEY_LEN]).unwrap(),
-        <&[u8; OGS_KEY_LEN]>::try_from(&ik[..OGS_KEY_LEN]).unwrap(),
+        ck_arr,
+        ik_arr,
         serving_network_name,
         &autn,
     );
 
     // TS 33.501 A.4: Derive XRES* from CK, IK, serving network name, RAND, RES
     let xres_star = kdf::ogs_kdf_xres_star(
-        <&[u8; OGS_KEY_LEN]>::try_from(&ck[..OGS_KEY_LEN]).unwrap(),
-        <&[u8; OGS_KEY_LEN]>::try_from(&ik[..OGS_KEY_LEN]).unwrap(),
+        ck_arr,
+        ik_arr,
         serving_network_name,
         &rand,
         &res,

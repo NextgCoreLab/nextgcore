@@ -1,0 +1,68 @@
+{{- if .Values.ausf.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-ausf
+  labels:
+    app.kubernetes.io/name: ausf
+    app.kubernetes.io/instance: {{ .Release.Name }}-ausf
+    app.kubernetes.io/component: control-plane
+    {{- include "nextgcore.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.ausf.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ausf
+      app.kubernetes.io/instance: {{ .Release.Name }}-ausf
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ausf
+        app.kubernetes.io/instance: {{ .Release.Name }}-ausf
+    spec:
+      containers:
+        - name: ausf
+          image: {{ .Values.ausf.image.repository }}:{{ .Values.ausf.image.tag }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          ports:
+            - name: sbi
+              containerPort: {{ .Values.ausf.service.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: sbi
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: sbi
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: NRF_SBI_ADDR
+              value: {{ .Release.Name }}-nrf
+            - name: NRF_SBI_PORT
+              value: "{{ .Values.global.sbi.port }}"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-ausf
+  labels:
+    app.kubernetes.io/name: ausf
+    {{- include "nextgcore.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.ausf.service.type }}
+  ports:
+    - port: {{ .Values.ausf.service.port }}
+      targetPort: sbi
+      protocol: TCP
+      name: sbi
+  selector:
+    app.kubernetes.io/name: ausf
+    app.kubernetes.io/instance: {{ .Release.Name }}-ausf
+{{- end }}

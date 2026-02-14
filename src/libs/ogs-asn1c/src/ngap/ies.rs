@@ -2,7 +2,7 @@
 //!
 //! Protocol IE containers and common IEs from NGAP-IEs (3GPP TS 38.413)
 
-use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerResult};
+use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerError, PerResult};
 use super::types::{Criticality, ProtocolIeId};
 
 /// ProtocolIE-Field - Single IE with ID, criticality, and value
@@ -424,6 +424,191 @@ impl AperDecode for PagingDrx {
             3 => Ok(PagingDrx::V256),
             _ => Err(crate::per::PerError::DecodeError(
                 format!("Unknown PagingDrx value: {value}")
+            )),
+        }
+    }
+}
+
+/// SecurityIndication - Security indication for UP integrity and confidentiality
+/// ASN.1: SecurityIndication ::= SEQUENCE { integrityProtectionIndication, confidentialityProtectionIndication, ... }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityIndication {
+    pub integrity_protection_indication: IntegrityProtectionIndication,
+    pub confidentiality_protection_indication: ConfidentialityProtectionIndication,
+}
+
+/// IntegrityProtectionIndication ::= ENUMERATED { required, preferred, not-needed, ... }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum IntegrityProtectionIndication {
+    Required = 0,
+    Preferred = 1,
+    NotNeeded = 2,
+}
+
+/// ConfidentialityProtectionIndication ::= ENUMERATED { required, preferred, not-needed, ... }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ConfidentialityProtectionIndication {
+    Required = 0,
+    Preferred = 1,
+    NotNeeded = 2,
+}
+
+impl AperEncode for SecurityIndication {
+    fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()> {
+        // Extension bit
+        encoder.write_bit(false);
+        // No optional fields
+        encoder.write_bit(false);
+
+        // IntegrityProtectionIndication
+        let constraint = Constraint::extensible(0, 2);
+        encoder.encode_enumerated(self.integrity_protection_indication as i64, &constraint)?;
+
+        // ConfidentialityProtectionIndication
+        encoder.encode_enumerated(self.confidentiality_protection_indication as i64, &constraint)?;
+
+        Ok(())
+    }
+}
+
+impl AperDecode for SecurityIndication {
+    fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
+        let _ext = decoder.read_bit()?;
+        let _optional = decoder.read_bit()?;
+
+        let constraint = Constraint::extensible(0, 2);
+        let integrity = match decoder.decode_enumerated(&constraint)? {
+            0 => IntegrityProtectionIndication::Required,
+            1 => IntegrityProtectionIndication::Preferred,
+            2 => IntegrityProtectionIndication::NotNeeded,
+            v => return Err(PerError::DecodeError(format!("Invalid IntegrityProtectionIndication: {v}"))),
+        };
+
+        let confidentiality = match decoder.decode_enumerated(&constraint)? {
+            0 => ConfidentialityProtectionIndication::Required,
+            1 => ConfidentialityProtectionIndication::Preferred,
+            2 => ConfidentialityProtectionIndication::NotNeeded,
+            v => return Err(PerError::DecodeError(format!("Invalid ConfidentialityProtectionIndication: {v}"))),
+        };
+
+        Ok(SecurityIndication {
+            integrity_protection_indication: integrity,
+            confidentiality_protection_indication: confidentiality,
+        })
+    }
+}
+
+/// GUAMI - Globally Unique AMF Identifier (full structured representation)
+/// ASN.1: GUAMI ::= SEQUENCE { pLMNIdentity, aMFRegionID, aMFSetID, aMFPointer, ... }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Guami {
+    pub plmn_identity: PlmnIdentity,
+    pub amf_region_id: u8,      // BIT STRING (SIZE(8))
+    pub amf_set_id: u16,         // BIT STRING (SIZE(10))
+    pub amf_pointer: u8,         // BIT STRING (SIZE(6))
+}
+
+impl AperEncode for Guami {
+    fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()> {
+        // Extension bit
+        encoder.write_bit(false);
+        // No optional fields
+        encoder.write_bit(false);
+
+        // PLMN Identity
+        self.plmn_identity.encode_aper(encoder)?;
+
+        // AMF Region ID (8 bits)
+        encoder.write_bits(self.amf_region_id as u64, 8);
+
+        // AMF Set ID (10 bits)
+        encoder.write_bits(self.amf_set_id as u64, 10);
+
+        // AMF Pointer (6 bits)
+        encoder.write_bits(self.amf_pointer as u64, 6);
+
+        Ok(())
+    }
+}
+
+impl AperDecode for Guami {
+    fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
+        let _ext = decoder.read_bit()?;
+        let _optional = decoder.read_bit()?;
+
+        let plmn_identity = PlmnIdentity::decode_aper(decoder)?;
+        let amf_region_id = decoder.read_bits(8)? as u8;
+        let amf_set_id = decoder.read_bits(10)? as u16;
+        let amf_pointer = decoder.read_bits(6)? as u8;
+
+        Ok(Guami {
+            plmn_identity,
+            amf_region_id,
+            amf_set_id,
+            amf_pointer,
+        })
+    }
+}
+
+/// HandoverType - Type of handover
+/// ASN.1: HandoverType ::= ENUMERATED { intra5gs, fivegstoeps, epsto5gs, ... }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum HandoverType {
+    Intra5gs = 0,
+    FivegsToEps = 1,
+    EpsTo5gs = 2,
+}
+
+impl HandoverType {
+    pub const CONSTRAINT: Constraint = Constraint::extensible(0, 2);
+}
+
+impl AperEncode for HandoverType {
+    fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()> {
+        encoder.encode_enumerated(*self as i64, &Self::CONSTRAINT)
+    }
+}
+
+impl AperDecode for HandoverType {
+    fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
+        let value = decoder.decode_enumerated(&Self::CONSTRAINT)?;
+        match value {
+            0 => Ok(HandoverType::Intra5gs),
+            1 => Ok(HandoverType::FivegsToEps),
+            2 => Ok(HandoverType::EpsTo5gs),
+            _ => Err(PerError::DecodeError(format!("Unknown HandoverType value: {value}"))),
+        }
+    }
+}
+
+/// DirectForwardingPathAvailability - Indicates if direct forwarding path is available
+/// ASN.1: DirectForwardingPathAvailability ::= ENUMERATED { direct-path-available, ... }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DirectForwardingPathAvailability {
+    DirectPathAvailable = 0,
+}
+
+impl DirectForwardingPathAvailability {
+    pub const CONSTRAINT: Constraint = Constraint::extensible(0, 0);
+}
+
+impl AperEncode for DirectForwardingPathAvailability {
+    fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()> {
+        encoder.encode_enumerated(*self as i64, &Self::CONSTRAINT)
+    }
+}
+
+impl AperDecode for DirectForwardingPathAvailability {
+    fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
+        let value = decoder.decode_enumerated(&Self::CONSTRAINT)?;
+        match value {
+            0 => Ok(DirectForwardingPathAvailability::DirectPathAvailable),
+            _ => Err(PerError::DecodeError(
+                format!("Unknown DirectForwardingPathAvailability value: {value}")
             )),
         }
     }

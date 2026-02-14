@@ -276,7 +276,7 @@ fn send_pfcp_message(msg: &PfcpMessage, xact_id: u64) -> Result<(), String> {
 /// PFCP association timer callback
 /// Port of sgwc_timer_pfcp_association
 pub fn timer_pfcp_association(node_id: u64) {
-    log::debug!("PFCP association timer fired for node {}", node_id);
+    log::debug!("PFCP association timer fired for node {node_id}");
 
     // In actual implementation:
     // - Send Association Setup Request
@@ -286,7 +286,7 @@ pub fn timer_pfcp_association(node_id: u64) {
 /// PFCP no heartbeat timer callback
 /// Port of sgwc_timer_pfcp_no_heartbeat
 pub fn timer_pfcp_no_heartbeat(node_id: u64) {
-    log::warn!("PFCP no heartbeat timer fired for node {}", node_id);
+    log::warn!("PFCP no heartbeat timer fired for node {node_id}");
 
     // In actual implementation:
     // - Mark node as failed

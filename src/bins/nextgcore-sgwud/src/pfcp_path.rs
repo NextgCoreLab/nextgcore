@@ -252,11 +252,7 @@ pub fn send_error_message(
     offending_ie: u8,
 ) -> Result<(), String> {
     log::error!(
-        "Sending PFCP Error: type={}, seid=0x{:x}, cause={}, offending_ie={}",
-        msg_type,
-        seid,
-        cause,
-        offending_ie
+        "Sending PFCP Error: type={msg_type}, seid=0x{seid:x}, cause={cause}, offending_ie={offending_ie}"
     );
 
     // Build error response based on message type
@@ -384,9 +380,7 @@ pub fn handle_pfcp_recv(
     let msg_type = data[1];
 
     log::debug!(
-        "[RECV] PFCP message type={} from {}",
-        msg_type,
-        from_addr
+        "[RECV] PFCP message type={msg_type} from {from_addr}"
     );
 
     match msg_type {
@@ -409,7 +403,7 @@ pub fn handle_pfcp_recv(
             PfcpRecvResult::Handled
         }
         _ => {
-            PfcpRecvResult::Error(format!("Unknown message type: {}", msg_type))
+            PfcpRecvResult::Error(format!("Unknown message type: {msg_type}"))
         }
     }
 }
@@ -421,7 +415,7 @@ pub fn handle_pfcp_recv(
 /// PFCP association timer callback
 /// Port of sgwu_timer_association
 pub fn timer_association(node_id: u64) {
-    log::debug!("PFCP association timer fired for node {}", node_id);
+    log::debug!("PFCP association timer fired for node {node_id}");
 
     // In actual implementation:
     // - Send Association Setup Request (if initiating)
@@ -432,7 +426,7 @@ pub fn timer_association(node_id: u64) {
 /// PFCP no heartbeat timer callback
 /// Port of sgwu_timer_no_heartbeat
 pub fn timer_no_heartbeat(node_id: u64) {
-    log::warn!("PFCP no heartbeat timer fired for node {}", node_id);
+    log::warn!("PFCP no heartbeat timer fired for node {node_id}");
 
     // In actual implementation:
     // - Mark node as failed
@@ -444,10 +438,7 @@ pub fn timer_no_heartbeat(node_id: u64) {
 /// Port of sess_timeout
 pub fn sess_timeout(xact_id: u64, sess_id: u64, msg_type: u8) {
     log::error!(
-        "PFCP session timeout: xact_id={}, sess_id={}, type={}",
-        xact_id,
-        sess_id,
-        msg_type
+        "PFCP session timeout: xact_id={xact_id}, sess_id={sess_id}, type={msg_type}"
     );
 
     match msg_type {
@@ -455,7 +446,7 @@ pub fn sess_timeout(xact_id: u64, sess_id: u64, msg_type: u8) {
             log::error!("No PFCP session report response");
         }
         _ => {
-            log::error!("Not implemented timeout for type: {}", msg_type);
+            log::error!("Not implemented timeout for type: {msg_type}");
         }
     }
 }

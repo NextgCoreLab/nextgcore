@@ -485,3 +485,71 @@ fn parse_session(doc: &Document) -> OgsSession {
 
     session
 }
+
+/// Get 5GS-specific subscription data for a subscriber (SUPI-based)
+///
+/// # Arguments
+/// * `supi` - Subscriber Permanent Identifier (e.g., "imsi-123456789012345")
+///
+/// # Returns
+/// * `Ok(OgsSubscriptionData)` with 5G subscription data
+/// * `Err(DbiError)` on failure
+pub fn ogs_dbi_subscription_data_5g(supi: &str) -> DbiResult<OgsSubscriptionData> {
+    // For 5G, we use the same base subscription data function
+    // but could filter for 5G-specific fields
+    let mut subscription_data = ogs_dbi_subscription_data(supi)?;
+
+    // Mark as 5G subscription
+    subscription_data.network_access_mode = 2; // Packet and circuit switched services allowed
+
+    Ok(subscription_data)
+}
+
+/// Get policy subscription data for a subscriber
+///
+/// # Arguments
+/// * `supi` - Subscriber Permanent Identifier
+///
+/// # Returns
+/// * `Ok(OgsSubscriptionData)` with policy-related subscription data
+/// * `Err(DbiError)` on failure
+pub fn ogs_dbi_policy_subscription(supi: &str) -> DbiResult<OgsSubscriptionData> {
+    let supi_type = ogs_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let supi_id = ogs_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+
+    let collection = get_subscriber_collection()?;
+    let query = doc! { &supi_type: &supi_id };
+
+    let document = collection
+        .find_one(query, None)?
+        .ok_or_else(|| DbiError::SubscriberNotFound(supi.to_string()))?;
+
+    let mut subscription_data = OgsSubscriptionData::new();
+
+    // Parse policy-specific fields
+    if let Ok(imsi) = document.get_str(OGS_IMSI_STRING) {
+        subscription_data.imsi = Some(imsi.to_string());
+    }
+
+    // Parse AMBR for policy enforcement
+    if let Ok(ambr_doc) = document.get_document(OGS_AMBR_STRING) {
+        subscription_data.ambr = parse_ambr(ambr_doc);
+    }
+
+    // Parse slice data for policy rules
+    if let Ok(slice_array) = document.get_array(OGS_SLICE_STRING) {
+        for slice_val in slice_array {
+            if subscription_data.num_of_slice >= OGS_MAX_NUM_OF_SLICE {
+                break;
+            }
+            if let Bson::Document(slice_doc) = slice_val {
+                if let Some(slice_data) = parse_slice_data(slice_doc) {
+                    subscription_data.slice.push(slice_data);
+                    subscription_data.num_of_slice += 1;
+                }
+            }
+        }
+    }
+
+    Ok(subscription_data)
+}

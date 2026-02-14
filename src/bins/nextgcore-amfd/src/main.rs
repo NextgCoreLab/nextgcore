@@ -18,6 +18,8 @@ pub mod sbi_path;
 pub mod namf_handler;
 pub mod timer;
 pub mod metrics;
+pub mod emergency; // #203: Emergency services (TS 23.167)
+pub mod ngap_mcast; // MBS: NGAP multicast session procedures (TS 38.413 / TS 23.247)
 
 #[cfg(test)]
 mod property_tests;
@@ -107,19 +109,19 @@ impl AmfApp {
 
     /// Load configuration from YAML file
     async fn load_config(&self, config_path: &str) -> Result<()> {
-        log::info!("Loading configuration from: {}", config_path);
+        log::info!("Loading configuration from: {config_path}");
 
         // Read and parse YAML file
         let config_content = match std::fs::read_to_string(config_path) {
             Ok(content) => content,
             Err(e) => {
-                log::warn!("Could not read config file '{}': {}. Using defaults.", config_path, e);
+                log::warn!("Could not read config file '{config_path}': {e}. Using defaults.");
                 return Ok(());
             }
         };
 
         let yaml: Value = serde_yaml::from_str(&config_content)
-            .map_err(|e| anyhow::anyhow!("Failed to parse YAML config: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to parse YAML config: {e}"))?;
 
         // Get AMF section
         let amf_section = match yaml.get("amf") {
@@ -137,7 +139,7 @@ impl AmfApp {
             // Load AMF name
             if let Some(name) = amf_section.get("amf_name").and_then(|v| v.as_str()) {
                 ctx.amf_name = Some(name.to_string());
-                log::info!("AMF name: {}", name);
+                log::info!("AMF name: {name}");
             }
 
             // Load network name
@@ -320,7 +322,7 @@ impl AmfApp {
 
     /// Initialize NGAP server (async)
     pub async fn init_ngap(&mut self, ngap_addr: SocketAddr) -> Result<()> {
-        log::info!("Initializing NGAP server on {}...", ngap_addr);
+        log::info!("Initializing NGAP server on {ngap_addr}...");
 
         let event_tx = self.ngap_event_tx.take()
             .ok_or_else(|| anyhow::anyhow!("NGAP event sender already taken"))?;
@@ -331,7 +333,7 @@ impl AmfApp {
             event_tx,
         ).await?;
 
-        log::info!("NGAP server initialized on {}", ngap_addr);
+        log::info!("NGAP server initialized on {ngap_addr}");
         Ok(())
     }
 
@@ -352,7 +354,7 @@ impl AmfApp {
                     // No message available
                 }
                 Err(e) => {
-                    log::warn!("NGAP poll error: {}", e);
+                    log::warn!("NGAP poll error: {e}");
                 }
             }
 
@@ -514,6 +516,24 @@ async fn main() -> Result<()> {
     let ngap_addr: SocketAddr = args.ngap_addr.parse()
         .map_err(|e| anyhow::anyhow!("Invalid NGAP address '{}': {}", args.ngap_addr, e))?;
     app.init_ngap(ngap_addr).await?;
+
+    // Register with NRF (if configured)
+    let sbi_addr = std::env::var("AMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let sbi_port: u16 = std::env::var("AMF_SBI_PORT")
+        .ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
+    if let Err(e) = sbi_path::amf_nrf_register(&sbi_addr, sbi_port).await {
+        log::warn!("NRF registration failed (will operate without NRF): {e}");
+    }
+
+    // Discover AUSF and SMF from NRF
+    if let Err(e) = sbi_path::amf_nrf_discover("AUSF", "nausf-auth").await {
+        log::warn!("AUSF discovery failed (will retry on demand): {e}");
+    }
+    if let Err(e) = sbi_path::amf_nrf_discover("SMF", "nsmf-pdusession").await {
+        log::warn!("SMF discovery failed (will retry on demand): {e}");
+    }
+
+    log::info!("NextGCore AMF ready");
 
     // Run async main loop
     app.run_async().await?;

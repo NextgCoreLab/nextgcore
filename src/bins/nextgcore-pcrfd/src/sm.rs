@@ -175,7 +175,7 @@ impl Default for PcrfSmContext {
 /// Enable debug mode for PCRF state machine
 pub fn pcrf_sm_debug(level: i32) {
     if level > 0 {
-        log::info!("PCRF state machine debug enabled (level={})", level);
+        log::info!("PCRF state machine debug enabled (level={level})");
     }
 }
 

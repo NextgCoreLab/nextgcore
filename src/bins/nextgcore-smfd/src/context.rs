@@ -214,6 +214,322 @@ pub struct Qos {
     pub gbr_downlink: u64,
 }
 
+// ============================================================================
+// Rel-18 XR QoS Characteristics (TS 23.501 Table 5.7.4-1)
+// ============================================================================
+
+/// 5QI characteristics table entry for XR and standard flows.
+#[derive(Debug, Clone)]
+pub struct QosCharacteristics {
+    /// Resource type: 0=GBR, 1=Delay-critical GBR, 2=Non-GBR
+    pub resource_type: u8,
+    /// Priority level (1=highest)
+    pub priority_level: u8,
+    /// Packet delay budget (ms)
+    pub packet_delay_budget_ms: u16,
+    /// Packet error rate (e.g., 1e-3 stored as exponent: 3)
+    pub packet_error_rate_exp: u8,
+    /// Maximum Data Burst Volume (bytes, 0 = N/A)
+    pub max_data_burst_volume: u32,
+    /// Default averaging window (ms)
+    pub averaging_window_ms: u32,
+}
+
+impl QosCharacteristics {
+    /// Look up 5QI characteristics from the 3GPP standardized table.
+    pub fn from_5qi(five_qi: u8) -> Option<Self> {
+        match five_qi {
+            // Standard GBR 5QIs
+            1 => Some(Self { resource_type: 0, priority_level: 20, packet_delay_budget_ms: 100, packet_error_rate_exp: 2, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
+            2 => Some(Self { resource_type: 0, priority_level: 40, packet_delay_budget_ms: 150, packet_error_rate_exp: 3, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
+            3 => Some(Self { resource_type: 0, priority_level: 30, packet_delay_budget_ms: 50, packet_error_rate_exp: 3, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
+            4 => Some(Self { resource_type: 0, priority_level: 50, packet_delay_budget_ms: 300, packet_error_rate_exp: 6, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
+            65 => Some(Self { resource_type: 0, priority_level: 7, packet_delay_budget_ms: 75, packet_error_rate_exp: 2, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
+            66 => Some(Self { resource_type: 0, priority_level: 20, packet_delay_budget_ms: 100, packet_error_rate_exp: 2, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
+            67 => Some(Self { resource_type: 0, priority_level: 15, packet_delay_budget_ms: 100, packet_error_rate_exp: 3, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
+            // Standard Non-GBR 5QIs
+            5 => Some(Self { resource_type: 2, priority_level: 10, packet_delay_budget_ms: 100, packet_error_rate_exp: 6, max_data_burst_volume: 0, averaging_window_ms: 0 }),
+            6 => Some(Self { resource_type: 2, priority_level: 60, packet_delay_budget_ms: 300, packet_error_rate_exp: 6, max_data_burst_volume: 0, averaging_window_ms: 0 }),
+            7 => Some(Self { resource_type: 2, priority_level: 70, packet_delay_budget_ms: 100, packet_error_rate_exp: 3, max_data_burst_volume: 0, averaging_window_ms: 0 }),
+            8 => Some(Self { resource_type: 2, priority_level: 80, packet_delay_budget_ms: 300, packet_error_rate_exp: 6, max_data_burst_volume: 0, averaging_window_ms: 0 }),
+            9 => Some(Self { resource_type: 2, priority_level: 90, packet_delay_budget_ms: 300, packet_error_rate_exp: 6, max_data_burst_volume: 0, averaging_window_ms: 0 }),
+            // Rel-18 XR 5QI values (TS 23.501 Table 5.7.4-1)
+            82 => Some(Self { resource_type: 0, priority_level: 21, packet_delay_budget_ms: 10, packet_error_rate_exp: 3, max_data_burst_volume: 60_000, averaging_window_ms: 2000 }),
+            83 => Some(Self { resource_type: 0, priority_level: 20, packet_delay_budget_ms: 5, packet_error_rate_exp: 4, max_data_burst_volume: 1_500, averaging_window_ms: 2000 }),
+            84 => Some(Self { resource_type: 0, priority_level: 22, packet_delay_budget_ms: 15, packet_error_rate_exp: 3, max_data_burst_volume: 30_000, averaging_window_ms: 2000 }),
+            85 => Some(Self { resource_type: 0, priority_level: 19, packet_delay_budget_ms: 5, packet_error_rate_exp: 5, max_data_burst_volume: 500, averaging_window_ms: 2000 }),
+            _ => None,
+        }
+    }
+
+    /// Returns true if this 5QI is a GBR (Guaranteed Bit Rate) flow.
+    pub fn is_gbr(&self) -> bool {
+        self.resource_type == 0 || self.resource_type == 1
+    }
+
+    /// Returns true if this 5QI is an XR-specific QoS indicator.
+    pub fn is_xr(five_qi: u8) -> bool {
+        (82..=85).contains(&five_qi)
+    }
+}
+
+// ============================================================================
+// Rel-18 Energy Saving Types
+// ============================================================================
+
+/// UE power saving preference (Rel-18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PowerPreference {
+    /// Normal operation
+    #[default]
+    Normal,
+    /// Low power mode (prefer longer DRX, relaxed measurements)
+    LowPower,
+    /// Ultra-low power (aggressive PSM, extended eDRX)
+    UltraLowPower,
+}
+
+/// Energy-aware session parameters.
+#[derive(Debug, Clone, Default)]
+pub struct EnergyConfig {
+    /// UE power preference indication
+    pub power_preference: PowerPreference,
+    /// Inactivity detection timer (seconds, 0 = disabled)
+    pub inactivity_timer_sec: u32,
+    /// Buffered packet count suggestion (for UPF, 0 = no buffering)
+    pub suggested_buffering_packets: u32,
+    /// Whether to use reflective QoS to reduce signaling
+    pub reflective_qos: bool,
+}
+
+// ============================================================================
+// Rel-16: Network Slicing QoS Enforcement
+// ============================================================================
+
+/// Slice QoS Profile for per-slice resource enforcement (Rel-16 TS 23.501)
+#[derive(Debug)]
+pub struct SliceQosProfile {
+    /// S-NSSAI for this slice
+    pub s_nssai: SNssai,
+    /// Maximum number of UEs allowed in this slice
+    pub max_ues: u32,
+    /// Current number of active UEs
+    pub current_ues: AtomicU64,
+    /// Maximum aggregate bandwidth for uplink (bps)
+    pub max_ul_bandwidth_bps: u64,
+    /// Maximum aggregate bandwidth for downlink (bps)
+    pub max_dl_bandwidth_bps: u64,
+    /// Current uplink bandwidth usage (bps)
+    pub current_ul_bandwidth: AtomicU64,
+    /// Current downlink bandwidth usage (bps)
+    pub current_dl_bandwidth: AtomicU64,
+    /// Priority level for slice (1=highest, 255=lowest)
+    pub priority_level: u8,
+    /// Whether slice is enabled
+    pub enabled: AtomicBool,
+}
+
+impl SliceQosProfile {
+    /// Create a new slice QoS profile
+    pub fn new(s_nssai: SNssai, max_ues: u32, max_ul_bps: u64, max_dl_bps: u64, priority: u8) -> Self {
+        Self {
+            s_nssai,
+            max_ues,
+            current_ues: AtomicU64::new(0),
+            max_ul_bandwidth_bps: max_ul_bps,
+            max_dl_bandwidth_bps: max_dl_bps,
+            current_ul_bandwidth: AtomicU64::new(0),
+            current_dl_bandwidth: AtomicU64::new(0),
+            priority_level: priority,
+            enabled: AtomicBool::new(true),
+        }
+    }
+
+    /// Check if a new session can be admitted to this slice
+    pub fn can_admit_session(&self, ul_bandwidth: u64, dl_bandwidth: u64) -> bool {
+        if !self.enabled.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        let current_ues = self.current_ues.load(Ordering::Relaxed);
+        if current_ues >= self.max_ues as u64 {
+            return false;
+        }
+
+        let current_ul = self.current_ul_bandwidth.load(Ordering::Relaxed);
+        let current_dl = self.current_dl_bandwidth.load(Ordering::Relaxed);
+
+        if current_ul + ul_bandwidth > self.max_ul_bandwidth_bps {
+            return false;
+        }
+
+        if current_dl + dl_bandwidth > self.max_dl_bandwidth_bps {
+            return false;
+        }
+
+        true
+    }
+
+    /// Admit a new session to the slice
+    pub fn admit_session(&self, ul_bandwidth: u64, dl_bandwidth: u64) {
+        self.current_ues.fetch_add(1, Ordering::Relaxed);
+        self.current_ul_bandwidth.fetch_add(ul_bandwidth, Ordering::Relaxed);
+        self.current_dl_bandwidth.fetch_add(dl_bandwidth, Ordering::Relaxed);
+    }
+
+    /// Remove a session from the slice
+    pub fn remove_session(&self, ul_bandwidth: u64, dl_bandwidth: u64) {
+        self.current_ues.fetch_sub(1, Ordering::Relaxed);
+        self.current_ul_bandwidth.fetch_sub(ul_bandwidth, Ordering::Relaxed);
+        self.current_dl_bandwidth.fetch_sub(dl_bandwidth, Ordering::Relaxed);
+    }
+}
+
+impl Clone for SliceQosProfile {
+    fn clone(&self) -> Self {
+        Self {
+            s_nssai: self.s_nssai.clone(),
+            max_ues: self.max_ues,
+            current_ues: AtomicU64::new(self.current_ues.load(Ordering::Relaxed)),
+            max_ul_bandwidth_bps: self.max_ul_bandwidth_bps,
+            max_dl_bandwidth_bps: self.max_dl_bandwidth_bps,
+            current_ul_bandwidth: AtomicU64::new(self.current_ul_bandwidth.load(Ordering::Relaxed)),
+            current_dl_bandwidth: AtomicU64::new(self.current_dl_bandwidth.load(Ordering::Relaxed)),
+            priority_level: self.priority_level,
+            enabled: AtomicBool::new(self.enabled.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+// ============================================================================
+// Rel-16: URLLC QoS Constraints
+// ============================================================================
+
+/// URLLC QoS constraints per TS 23.501
+/// 5QI 80-85 are reserved for URLLC with strict latency/reliability requirements
+pub struct UrllcConstraints;
+
+impl UrllcConstraints {
+    /// Check if 5QI is in the URLLC/XR range (80-85)
+    pub fn is_urllc_5qi(five_qi: u8) -> bool {
+        (80..=85).contains(&five_qi)
+    }
+
+    /// Check if 5QI is strict URLLC (80-81), excluding XR-extended (82-85)
+    /// XR 5QI 82-85 have relaxed priority/delay constraints per TS 23.501
+    pub fn is_strict_urllc_5qi(five_qi: u8) -> bool {
+        (80..=81).contains(&five_qi)
+    }
+
+    /// Enforce URLLC constraints on QoS flow
+    /// Returns true if constraints are satisfied, false otherwise
+    pub fn enforce_urllc_constraints(five_qi: u8, priority_level: u8, packet_delay_budget_ms: u16) -> bool {
+        if !Self::is_urllc_5qi(five_qi) {
+            return true; // Not URLLC, no constraints
+        }
+
+        // URLLC requirements per TS 23.501:
+        // - Priority level must be ≤ 20 (higher priority)
+        // - Packet delay budget must be ≤ 10ms
+
+        if priority_level > 20 {
+            log::warn!("URLLC 5QI {five_qi} requires priority level ≤ 20, got {priority_level}");
+            return false;
+        }
+
+        if packet_delay_budget_ms > 10 {
+            log::warn!("URLLC 5QI {five_qi} requires packet delay budget ≤ 10ms, got {packet_delay_budget_ms}ms");
+            return false;
+        }
+
+        true
+    }
+}
+
+// ============================================================================
+// Rel-16: V2X QoS Profiles (TS 23.287)
+// ============================================================================
+
+/// V2X QoS profile for SST=3 (V2X services)
+/// Defines 5QI values 75-79 for different V2X communication types
+#[derive(Debug, Clone)]
+pub struct V2xQosProfile {
+    /// V2X communication type
+    pub comm_type: V2xCommType,
+    /// Recommended 5QI
+    pub five_qi: u8,
+    /// Priority level
+    pub priority_level: u8,
+    /// Packet delay budget (ms)
+    pub packet_delay_budget_ms: u16,
+    /// Packet error rate (10^-N)
+    pub packet_error_rate_exp: u8,
+}
+
+/// V2X Communication Types (TS 23.287)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum V2xCommType {
+    /// Vehicle-to-Vehicle
+    V2V,
+    /// Vehicle-to-Infrastructure
+    V2I,
+    /// Vehicle-to-Pedestrian
+    V2P,
+    /// Vehicle-to-Network
+    V2N,
+}
+
+impl V2xQosProfile {
+    /// Get V2X QoS profile for a communication type
+    pub fn for_comm_type(comm_type: V2xCommType) -> Self {
+        match comm_type {
+            V2xCommType::V2V => Self {
+                comm_type,
+                five_qi: 75, // V2V - high priority, low latency
+                priority_level: 25,
+                packet_delay_budget_ms: 50,
+                packet_error_rate_exp: 2,
+            },
+            V2xCommType::V2I => Self {
+                comm_type,
+                five_qi: 76, // V2I - infrastructure communication
+                priority_level: 30,
+                packet_delay_budget_ms: 100,
+                packet_error_rate_exp: 3,
+            },
+            V2xCommType::V2P => Self {
+                comm_type,
+                five_qi: 77, // V2P - pedestrian safety
+                priority_level: 20,
+                packet_delay_budget_ms: 50,
+                packet_error_rate_exp: 2,
+            },
+            V2xCommType::V2N => Self {
+                comm_type,
+                five_qi: 78, // V2N - network services
+                priority_level: 40,
+                packet_delay_budget_ms: 200,
+                packet_error_rate_exp: 4,
+            },
+        }
+    }
+
+    /// Check if S-NSSAI is for V2X (SST=3)
+    pub fn is_v2x_slice(s_nssai: &SNssai) -> bool {
+        s_nssai.sst == 3
+    }
+
+    /// Get recommended 5QI for V2X slice based on priority
+    pub fn get_v2x_5qi_for_priority(priority: u8) -> u8 {
+        match priority {
+            0..=20 => 75,  // V2V - highest priority
+            21..=29 => 77, // V2P - pedestrian safety
+            30..=39 => 76, // V2I - infrastructure
+            _ => 78,       // V2N - network services (default)
+        }
+    }
+}
+
 /// Session AMBR
 #[derive(Debug, Clone, Default)]
 pub struct SessionAmbr {
@@ -831,6 +1147,195 @@ impl Default for SmfSess {
 
 
 // ============================================================================
+// Rel-17 MBS (Multicast/Broadcast Service) Types (TS 23.247)
+// ============================================================================
+
+/// TMGI (Temporary Mobile Group Identity) - TS 23.247
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct Tmgi {
+    /// MBS Service ID (24 bits)
+    pub mbs_service_id: u32,
+    /// PLMN ID
+    pub plmn_id: PlmnId,
+}
+
+/// MBS Session State
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MbsSessionState {
+    #[default]
+    Creating,
+    Active,
+    Releasing,
+}
+
+/// MBS Service Area for multicast delivery
+#[derive(Debug, Clone, Default)]
+pub struct MbsServiceArea {
+    /// List of TAIs (Tracking Area Identifiers) for MBS coverage
+    pub tais: Vec<u32>,
+    /// List of Cell IDs for MBS coverage
+    pub cell_ids: Vec<u64>,
+}
+
+/// MBS QoS Flow for multicast bearer
+#[derive(Debug, Clone)]
+pub struct MbsQosFlow {
+    /// QoS Flow Identifier
+    pub qfi: u8,
+    /// 5QI (5G QoS Identifier) - e.g., 1-85
+    pub fiveqi: u8,
+    /// Guaranteed Flow Bit Rate (GFBR) in kbps
+    pub gfbr: Option<u64>,
+    /// Maximum Flow Bit Rate (MFBR) in kbps
+    pub mfbr: Option<u64>,
+    /// Priority level (1-127, lower = higher priority)
+    pub priority: u8,
+}
+
+/// N4mb Session Context for PFCP multicast session with UPF
+#[derive(Debug, Clone)]
+pub struct N4mbSession {
+    /// N4mb PFCP Session ID
+    pub session_id: u64,
+    /// UPF node ID (IPv4 or FQDN)
+    pub upf_node_id: String,
+    /// Multicast F-TEID (Fully Qualified Tunnel Endpoint Identifier)
+    pub multicast_fteid: Option<u32>,
+    /// Multicast transport IP (allocated by UPF)
+    pub multicast_transport_ip: Option<std::net::Ipv4Addr>,
+    /// Session state
+    pub state: N4mbSessionState,
+    /// QoS flows for this N4mb session
+    pub qos_flows: Vec<MbsQosFlow>,
+}
+
+/// N4mb PFCP Session State
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum N4mbSessionState {
+    /// Session establishment in progress
+    Establishing,
+    /// Session established and active
+    Active,
+    /// Session modification in progress
+    Modifying,
+    /// Session release in progress
+    Releasing,
+}
+
+/// MBS Session Context (Rel-17 TS 23.247)
+#[derive(Debug, Clone)]
+pub struct MbsSession {
+    /// Session ID
+    pub id: u64,
+    /// TMGI (Temporary Mobile Group Identity)
+    pub tmgi: Tmgi,
+    /// MBS Session ID (external identifier)
+    pub session_id: String,
+    /// Multicast IP address for content delivery
+    pub multicast_addr: Option<std::net::Ipv4Addr>,
+    /// List of UE IDs that have joined this MBS session
+    pub joined_ues: Vec<u64>,
+    /// Session state
+    pub state: MbsSessionState,
+    /// N4mb PFCP Session (for multicast user plane with UPF)
+    pub n4mb_session: Option<N4mbSession>,
+    /// MBS Service Area (coverage area for multicast)
+    pub mbs_service_area: MbsServiceArea,
+    /// QoS Flow list for multicast bearer
+    pub qos_flow_list: Vec<MbsQosFlow>,
+    /// Creation timestamp
+    pub created_at: u64,
+    /// Last state change timestamp
+    pub updated_at: u64,
+}
+
+impl MbsSession {
+    pub fn new(id: u64, tmgi: Tmgi, session_id: String) -> Self {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self {
+            id,
+            tmgi,
+            session_id,
+            multicast_addr: None,
+            joined_ues: Vec::new(),
+            state: MbsSessionState::Creating,
+            n4mb_session: None,
+            mbs_service_area: MbsServiceArea::default(),
+            qos_flow_list: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    pub fn ue_count(&self) -> usize {
+        self.joined_ues.len()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.state == MbsSessionState::Active
+    }
+
+    /// Establish N4mb session with UPF for multicast bearer
+    pub fn establish_n4mb_session(&mut self, upf_node_id: String, session_id: u64) {
+        let n4mb = N4mbSession {
+            session_id,
+            upf_node_id,
+            multicast_fteid: None,
+            multicast_transport_ip: None,
+            state: N4mbSessionState::Establishing,
+            qos_flows: self.qos_flow_list.clone(),
+        };
+        self.n4mb_session = Some(n4mb);
+        log::info!("MBS Session {} N4mb establishment initiated with UPF", self.id);
+    }
+
+    /// Activate N4mb session after successful PFCP establishment
+    pub fn activate_n4mb_session(&mut self, fteid: u32, transport_ip: std::net::Ipv4Addr) -> bool {
+        if let Some(ref mut n4mb) = self.n4mb_session {
+            n4mb.state = N4mbSessionState::Active;
+            n4mb.multicast_fteid = Some(fteid);
+            n4mb.multicast_transport_ip = Some(transport_ip);
+            log::info!("MBS Session {} N4mb session activated (F-TEID: {}, IP: {})",
+                      self.id, fteid, transport_ip);
+            return true;
+        }
+        false
+    }
+
+    /// Release N4mb session
+    pub fn release_n4mb_session(&mut self) -> bool {
+        if let Some(ref mut n4mb) = self.n4mb_session {
+            n4mb.state = N4mbSessionState::Releasing;
+            log::info!("MBS Session {} N4mb session release initiated", self.id);
+            return true;
+        }
+        false
+    }
+
+    /// Add QoS flow to multicast bearer
+    pub fn add_qos_flow(&mut self, qos_flow: MbsQosFlow) {
+        self.qos_flow_list.push(qos_flow);
+        // Sync to N4mb session if active
+        if let Some(ref mut n4mb) = self.n4mb_session {
+            n4mb.qos_flows = self.qos_flow_list.clone();
+        }
+    }
+
+    /// Update MBS service area
+    pub fn update_service_area(&mut self, tais: Vec<u32>, cell_ids: Vec<u64>) {
+        self.mbs_service_area.tais = tais;
+        self.mbs_service_area.cell_ids = cell_ids;
+        self.updated_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+    }
+}
+
+// ============================================================================
 // SMF Context (Main)
 // ============================================================================
 
@@ -865,6 +1370,8 @@ pub struct SmfContext {
     bearer_list: RwLock<HashMap<u64, SmfBearer>>,
     /// Packet filter list (by pool ID)
     pf_list: RwLock<HashMap<u64, SmfPf>>,
+    /// MBS Session list (by pool ID) - Rel-17
+    mbs_sess_list: RwLock<HashMap<u64, MbsSession>>,
 
     // Hash tables
     /// SUPI -> UE ID hash
@@ -879,6 +1386,8 @@ pub struct SmfContext {
     smf_n4_seid_hash: RwLock<HashMap<u64, u64>>,
     /// N1N2 message location -> Session ID hash
     n1n2message_hash: RwLock<HashMap<String, u64>>,
+    /// TMGI -> MBS Session ID hash - Rel-17
+    tmgi_hash: RwLock<HashMap<Tmgi, u64>>,
 
     // ID generators
     /// Next UE ID
@@ -893,6 +1402,8 @@ pub struct SmfContext {
     sess_index: AtomicU64,
     /// N4 SEID generator
     n4_seid_generator: AtomicU64,
+    /// Next MBS session ID
+    next_mbs_sess_id: AtomicUsize,
 
     // Pool limits
     /// Maximum number of UEs
@@ -923,18 +1434,21 @@ impl SmfContext {
             sess_list: RwLock::new(HashMap::new()),
             bearer_list: RwLock::new(HashMap::new()),
             pf_list: RwLock::new(HashMap::new()),
+            mbs_sess_list: RwLock::new(HashMap::new()),
             supi_hash: RwLock::new(HashMap::new()),
             imsi_hash: RwLock::new(HashMap::new()),
             ipv4_hash: RwLock::new(HashMap::new()),
             ipv6_hash: RwLock::new(HashMap::new()),
             smf_n4_seid_hash: RwLock::new(HashMap::new()),
             n1n2message_hash: RwLock::new(HashMap::new()),
+            tmgi_hash: RwLock::new(HashMap::new()),
             next_ue_id: AtomicUsize::new(1),
             next_sess_id: AtomicUsize::new(1),
             next_bearer_id: AtomicUsize::new(1),
             next_pf_id: AtomicUsize::new(1),
             sess_index: AtomicU64::new(1),
             n4_seid_generator: AtomicU64::new(1),
+            next_mbs_sess_id: AtomicUsize::new(1),
             max_num_of_ue: 0,
             max_num_of_sess: 0,
             max_num_of_bearer: 0,
@@ -1003,7 +1517,7 @@ impl SmfContext {
         supi_hash.insert(supi.to_string(), id);
         smf_ue_list.insert(id, ue.clone());
 
-        log::info!("[Added] SMF UE by SUPI [{}] (id={})", supi, id);
+        log::info!("[Added] SMF UE by SUPI [{supi}] (id={id})");
         Some(ue)
     }
 
@@ -1063,7 +1577,7 @@ impl SmfContext {
                 imsi_hash.remove(&ue.imsi);
             }
 
-            log::info!("[Removed] SMF UE (id={})", id);
+            log::info!("[Removed] SMF UE (id={id})");
             return Some(ue);
         }
         None
@@ -1165,8 +1679,8 @@ impl SmfContext {
         sess.psi = psi;
         sess.smf_n4_seid = n4_seid;
         sess.smf_n4_teid = n4_seid as u32;
-        sess.sm_context_ref = Some(format!("{}", index));
-        sess.pdu_session_ref = Some(format!("{}", index));
+        sess.sm_context_ref = Some(format!("{index}"));
+        sess.pdu_session_ref = Some(format!("{index}"));
         sess.charging.id = index;
 
         smf_n4_seid_hash.insert(n4_seid, id);
@@ -1177,7 +1691,7 @@ impl SmfContext {
             ue.sess_ids.push(id);
         }
 
-        log::debug!("[ue_id={}, psi={}] SMF session added (id={}, seid={})", smf_ue_id, psi, id, n4_seid);
+        log::debug!("[ue_id={smf_ue_id}, psi={psi}] SMF session added (id={id}, seid={n4_seid})");
         Some(sess)
     }
 
@@ -1212,7 +1726,7 @@ impl SmfContext {
             ue.sess_ids.push(id);
         }
 
-        log::debug!("[ue_id={}, apn={}] SMF session added (id={}, seid={})", smf_ue_id, apn, id, n4_seid);
+        log::debug!("[ue_id={smf_ue_id}, apn={apn}] SMF session added (id={id}, seid={n4_seid})");
         Some(sess)
     }
 
@@ -1450,7 +1964,7 @@ impl SmfContext {
             sess.bearer_ids.push(id);
         }
 
-        log::debug!("[sess_id={}] QoS flow added (id={})", sess_id, id);
+        log::debug!("[sess_id={sess_id}] QoS flow added (id={id})");
         Some(bearer)
     }
 
@@ -1474,7 +1988,7 @@ impl SmfContext {
                 sess.bearer_ids.retain(|&bid| bid != id);
             }
 
-            log::debug!("Bearer removed (id={})", id);
+            log::debug!("Bearer removed (id={id})");
             return Some(bearer);
         }
         None
@@ -1596,7 +2110,7 @@ impl SmfContext {
             bearer.pf_ids.push(id);
         }
 
-        log::debug!("[bearer_id={}] PF added (id={})", bearer_id, id);
+        log::debug!("[bearer_id={bearer_id}] PF added (id={id})");
         Some(pf)
     }
 
@@ -1611,7 +2125,7 @@ impl SmfContext {
                 bearer.pf_ids.retain(|&pid| pid != id);
             }
 
-            log::debug!("PF removed (id={})", id);
+            log::debug!("PF removed (id={id})");
             return Some(pf);
         }
         None
@@ -1687,6 +2201,151 @@ impl SmfContext {
                 .cloned();
         }
         None
+    }
+
+    // ========================================================================
+    // MBS Session Management (Rel-17 TS 23.247)
+    // ========================================================================
+
+    /// Create a new MBS session
+    pub fn create_mbs_session(&self, tmgi: Tmgi, session_id: String) -> Option<MbsSession> {
+        let mut mbs_sess_list = self.mbs_sess_list.write().ok()?;
+        let mut tmgi_hash = self.tmgi_hash.write().ok()?;
+
+        let id = self.next_mbs_sess_id.fetch_add(1, Ordering::SeqCst) as u64;
+        let session = MbsSession::new(id, tmgi.clone(), session_id);
+
+        tmgi_hash.insert(tmgi, id);
+        mbs_sess_list.insert(id, session.clone());
+
+        log::info!(
+            "[MBS] Session created: id={} session_id={} state={:?}",
+            id, session.session_id, session.state
+        );
+        Some(session)
+    }
+
+    /// Activate an MBS session with N4mb PFCP session
+    pub fn activate_mbs_session(
+        &self,
+        mbs_sess_id: u64,
+        multicast_addr: std::net::Ipv4Addr,
+        upf_node_id: String,
+        n4mb_session_id: u64,
+        fteid: u32,
+        transport_ip: std::net::Ipv4Addr,
+    ) -> bool {
+        if let Ok(mut mbs_sess_list) = self.mbs_sess_list.write() {
+            if let Some(session) = mbs_sess_list.get_mut(&mbs_sess_id) {
+                session.state = MbsSessionState::Active;
+                session.multicast_addr = Some(multicast_addr);
+
+                // Establish N4mb session
+                session.establish_n4mb_session(upf_node_id, n4mb_session_id);
+                session.activate_n4mb_session(fteid, transport_ip);
+
+                session.updated_at = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                log::info!(
+                    "[MBS] Session activated: id={mbs_sess_id} mcast_addr={multicast_addr} n4mb_seid={n4mb_session_id}"
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Release an MBS session
+    pub fn release_mbs_session(&self, mbs_sess_id: u64) -> Option<MbsSession> {
+        let mut mbs_sess_list = self.mbs_sess_list.write().ok()?;
+        let mut tmgi_hash = self.tmgi_hash.write().ok()?;
+
+        if let Some(mut session) = mbs_sess_list.remove(&mbs_sess_id) {
+            session.state = MbsSessionState::Releasing;
+            tmgi_hash.remove(&session.tmgi);
+            log::info!(
+                "[MBS] Session released: id={} ue_count={} session_id={}",
+                mbs_sess_id, session.ue_count(), session.session_id
+            );
+            return Some(session);
+        }
+        None
+    }
+
+    /// Add a UE to an MBS session
+    pub fn add_ue_to_mbs(&self, mbs_sess_id: u64, ue_id: u64) -> bool {
+        if let Ok(mut mbs_sess_list) = self.mbs_sess_list.write() {
+            if let Some(session) = mbs_sess_list.get_mut(&mbs_sess_id) {
+                if !session.joined_ues.contains(&ue_id) {
+                    session.joined_ues.push(ue_id);
+                    session.updated_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    log::debug!(
+                        "[MBS] UE added to session: mbs_sess_id={} ue_id={} total_ues={}",
+                        mbs_sess_id, ue_id, session.ue_count()
+                    );
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Remove a UE from an MBS session
+    pub fn remove_ue_from_mbs(&self, mbs_sess_id: u64, ue_id: u64) -> bool {
+        if let Ok(mut mbs_sess_list) = self.mbs_sess_list.write() {
+            if let Some(session) = mbs_sess_list.get_mut(&mbs_sess_id) {
+                let before = session.joined_ues.len();
+                session.joined_ues.retain(|&id| id != ue_id);
+                if session.joined_ues.len() < before {
+                    session.updated_at = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    log::debug!(
+                        "[MBS] UE removed from session: mbs_sess_id={} ue_id={} total_ues={}",
+                        mbs_sess_id, ue_id, session.ue_count()
+                    );
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Find MBS session by ID
+    pub fn mbs_sess_find_by_id(&self, mbs_sess_id: u64) -> Option<MbsSession> {
+        let mbs_sess_list = self.mbs_sess_list.read().ok()?;
+        mbs_sess_list.get(&mbs_sess_id).cloned()
+    }
+
+    /// Find MBS session by TMGI
+    pub fn mbs_sess_find_by_tmgi(&self, tmgi: &Tmgi) -> Option<MbsSession> {
+        let tmgi_hash = self.tmgi_hash.read().ok()?;
+        let mbs_sess_list = self.mbs_sess_list.read().ok()?;
+        tmgi_hash.get(tmgi).and_then(|&id| mbs_sess_list.get(&id).cloned())
+    }
+
+    /// Get all active MBS sessions
+    pub fn mbs_sess_active_list(&self) -> Vec<MbsSession> {
+        self.mbs_sess_list
+            .read()
+            .map(|list| {
+                list.values()
+                    .filter(|s| s.is_active())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Get number of MBS sessions
+    pub fn mbs_sess_count(&self) -> usize {
+        self.mbs_sess_list.read().map(|l| l.len()).unwrap_or(0)
     }
 
     // ========================================================================

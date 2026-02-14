@@ -224,10 +224,7 @@ pub fn send_error_message(
     cause: u8,
 ) -> Result<(), String> {
     log::error!(
-        "Sending GTP Error: type={}, teid={}, cause={}",
-        msg_type,
-        teid,
-        cause
+        "Sending GTP Error: type={msg_type}, teid={teid}, cause={cause}"
     );
 
     let mut msg = GtpMessage::new(msg_type, teid);

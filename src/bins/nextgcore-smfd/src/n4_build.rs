@@ -47,7 +47,9 @@ pub mod pfcp_type {
 /// PFCP cause values (3GPP TS 29.244)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum PfcpCause {
+    #[default]
     RequestAccepted = 1,
     RequestRejected = 64,
     SessionContextNotFound = 65,
@@ -91,11 +93,6 @@ impl From<u8> for PfcpCause {
     }
 }
 
-impl Default for PfcpCause {
-    fn default() -> Self {
-        PfcpCause::RequestAccepted
-    }
-}
 
 // ============================================================================
 // PFCP IE Types

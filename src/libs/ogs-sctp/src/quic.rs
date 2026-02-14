@@ -167,7 +167,8 @@ pub struct QuicConfig {
 impl Default for QuicConfig {
     fn default() -> Self {
         Self {
-            bind_address: "0.0.0.0:0".parse().unwrap(),
+            bind_address: "0.0.0.0:0".parse()
+                .expect("valid default bind address"),
             tls: TlsConfig::default(),
             max_streams_bidi: 100,
             max_streams_uni: 100,

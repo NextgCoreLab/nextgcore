@@ -41,10 +41,13 @@ pub mod context;
 pub mod error;
 pub mod message;
 pub mod oauth;
+pub mod security;
 pub mod tls;
 pub mod types;
 pub mod scp;
 pub mod heartbeat;
+pub mod grpc;    // SBI 2.0 gRPC support (B6.1)
+pub mod pubsub;  // Event-driven pub-sub (B6.1)
 
 pub mod client;
 pub mod server;
@@ -64,7 +67,8 @@ pub use server::{
 };
 pub use types::{NfType, SbiAppError, SbiServiceType, UriScheme};
 pub use oauth::{
-    AccessTokenClaims, AccessTokenError, AccessTokenRequest, AccessTokenResponse, TokenCache,
+    AccessTokenClaims, AccessTokenError, AccessTokenRequest, AccessTokenResponse,
+    OAuth2Client, TokenCache,
 };
 pub use scp::{
     ScpBinding, ScpRouter, ScpRoutingInfo, ScpRoutingMode, global_scp_router, init_scp_router,
@@ -72,6 +76,18 @@ pub use scp::{
 pub use heartbeat::{
     HeartbeatConfig, HeartbeatManager, HeartbeatRecord, HeartbeatStats, HeartbeatStatus,
     global_heartbeat_manager, init_heartbeat_manager,
+};
+pub use security::{
+    NrfSecurityConfig, PqcKeyExchange, PqcSignature, PqcTlsConfig, SbiSecurityPolicy,
+    TlsPaths, TlsVersion, authorize_sbi_request, extract_bearer_token, validate_bearer_token,
+};
+pub use grpc::{
+    GrpcConfig, GrpcMetadata, GrpcMethod, GrpcServiceType, GrpcStatus,
+    GrpcServiceRegistry,
+};
+pub use pubsub::{
+    EventBroker, EventFilter, SbiEvent, SbiEventCategory, Subscription, SubscriptionId,
+    EventReplayBuffer,
 };
 
 /// Initialize the SBI library

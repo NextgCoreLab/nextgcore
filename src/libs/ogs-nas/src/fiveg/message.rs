@@ -36,6 +36,14 @@ pub enum FiveGmmMessage {
     FiveGmmStatus(FiveGmmStatus),
     UlNasTransport(UlNasTransport),
     DlNasTransport(DlNasTransport),
+    ConfigurationUpdateCommand(ConfigurationUpdateCommand),
+    ConfigurationUpdateComplete,
+    Notification(Notification),
+    NotificationResponse(NotificationResponse),
+    ControlPlaneServiceRequest(ControlPlaneServiceRequest),
+    NetworkSliceSpecificAuthenticationCommand(NetworkSliceSpecificAuthenticationCommand),
+    NetworkSliceSpecificAuthenticationComplete(NetworkSliceSpecificAuthenticationComplete),
+    NetworkSliceSpecificAuthenticationResult(NetworkSliceSpecificAuthenticationResult),
 }
 
 /// Registration Request message (TS 24.501 Section 8.2.6)
@@ -1400,6 +1408,420 @@ impl DlNasTransport {
     }
 }
 
+/// Configuration Update Command message (TS 24.501 Section 8.2.18)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ConfigurationUpdateCommand {
+    /// Configuration update indication
+    pub configuration_update_indication: Option<u8>,
+    /// 5G-GUTI
+    pub guti: Option<MobileIdentity>,
+    /// TAI list
+    pub tai_list: Option<TaiList>,
+    /// Allowed NSSAI
+    pub allowed_nssai: Option<Nssai>,
+    /// Service area list
+    pub service_area_list: Option<Vec<u8>>,
+    /// Full name for network
+    pub full_name_for_network: Option<Vec<u8>>,
+    /// Short name for network
+    pub short_name_for_network: Option<Vec<u8>>,
+    /// Local time zone
+    pub local_time_zone: Option<u8>,
+    /// Universal time and local time zone
+    pub universal_time_and_local_time_zone: Option<[u8; 7]>,
+    /// Network daylight saving time
+    pub network_daylight_saving_time: Option<u8>,
+    /// LADN information
+    pub ladn_information: Option<Vec<u8>>,
+    /// Configured NSSAI
+    pub configured_nssai: Option<Nssai>,
+    /// Rejected NSSAI
+    pub rejected_nssai: Option<Vec<u8>>,
+}
+
+impl ConfigurationUpdateCommand {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        if let Some(ind) = self.configuration_update_indication {
+            buf.put_u8(0xD0 | (ind & 0x0F)); // IEI D- (half-byte)
+        }
+        if let Some(ref guti) = self.guti {
+            buf.put_u8(0x77); // IEI
+            guti.encode(buf);
+        }
+        if let Some(ref tai_list) = self.tai_list {
+            buf.put_u8(0x54); // IEI
+            tai_list.encode(buf);
+        }
+        if let Some(ref allowed_nssai) = self.allowed_nssai {
+            buf.put_u8(0x15); // IEI
+            allowed_nssai.encode(buf);
+        }
+        if let Some(ref configured_nssai) = self.configured_nssai {
+            buf.put_u8(0x31); // IEI
+            configured_nssai.encode(buf);
+        }
+        if let Some(ref rejected_nssai) = self.rejected_nssai {
+            buf.put_u8(0x11); // IEI
+            buf.put_u8(rejected_nssai.len() as u8);
+            buf.put_slice(rejected_nssai);
+        }
+        if let Some(ref full_name) = self.full_name_for_network {
+            buf.put_u8(0x43); // IEI
+            buf.put_u8(full_name.len() as u8);
+            buf.put_slice(full_name);
+        }
+        if let Some(ref short_name) = self.short_name_for_network {
+            buf.put_u8(0x45); // IEI
+            buf.put_u8(short_name.len() as u8);
+            buf.put_slice(short_name);
+        }
+        if let Some(tz) = self.local_time_zone {
+            buf.put_u8(0x46); // IEI
+            buf.put_u8(tz);
+        }
+        if let Some(ref utltz) = self.universal_time_and_local_time_zone {
+            buf.put_u8(0x47); // IEI
+            buf.put_slice(utltz);
+        }
+        if let Some(dst) = self.network_daylight_saving_time {
+            buf.put_u8(0x49); // IEI
+            buf.put_u8(1); // Length
+            buf.put_u8(dst);
+        }
+        if let Some(ref ladn) = self.ladn_information {
+            buf.put_u8(0x79); // IEI
+            buf.put_u16(ladn.len() as u16);
+            buf.put_slice(ladn);
+        }
+        if let Some(ref sal) = self.service_area_list {
+            buf.put_u8(0x27); // IEI
+            buf.put_u8(sal.len() as u8);
+            buf.put_slice(sal);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        let mut msg = Self::default();
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            let iei_type = if iei >= 0x80 { iei & 0xF0 } else { iei };
+            match iei_type {
+                0xD0 => {
+                    buf.advance(1);
+                    msg.configuration_update_indication = Some(iei & 0x0F);
+                }
+                0x77 => {
+                    buf.advance(1);
+                    msg.guti = Some(MobileIdentity::decode(buf)?);
+                }
+                0x54 => {
+                    buf.advance(1);
+                    msg.tai_list = Some(TaiList::decode(buf)?);
+                }
+                0x15 => {
+                    buf.advance(1);
+                    msg.allowed_nssai = Some(Nssai::decode(buf)?);
+                }
+                0x31 => {
+                    buf.advance(1);
+                    msg.configured_nssai = Some(Nssai::decode(buf)?);
+                }
+                0x11 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 1 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len {
+                            msg.rejected_nssai = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
+                0x43 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 1 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len {
+                            msg.full_name_for_network = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
+                0x45 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 1 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len {
+                            msg.short_name_for_network = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
+                0x46 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 1 {
+                        msg.local_time_zone = Some(buf.get_u8());
+                    }
+                }
+                0x47 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 7 {
+                        let mut utltz = [0u8; 7];
+                        buf.copy_to_slice(&mut utltz);
+                        msg.universal_time_and_local_time_zone = Some(utltz);
+                    }
+                }
+                0x49 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 2 {
+                        let _len = buf.get_u8();
+                        msg.network_daylight_saving_time = Some(buf.get_u8());
+                    }
+                }
+                0x79 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 2 {
+                        let len = buf.get_u16() as usize;
+                        if buf.remaining() >= len {
+                            msg.ladn_information = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
+                0x27 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 1 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len {
+                            msg.service_area_list = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
+                _ => {
+                    buf.advance(1);
+                    if buf.remaining() > 0 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len { buf.advance(len); }
+                    }
+                }
+            }
+        }
+        Ok(msg)
+    }
+}
+
+/// Notification message (TS 24.501 Section 8.2.27)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Notification {
+    /// Access type
+    pub access_type: u8,
+}
+
+impl Notification {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(self.access_type & 0x03);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        Ok(Self { access_type: buf.get_u8() & 0x03 })
+    }
+}
+
+/// Notification Response message (TS 24.501 Section 8.2.28)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct NotificationResponse {
+    /// PDU session status
+    pub pdu_session_status: Option<PduSessionStatus>,
+}
+
+impl NotificationResponse {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        if let Some(ref pss) = self.pdu_session_status {
+            buf.put_u8(0x50); // IEI
+            pss.encode(buf);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        let mut msg = Self::default();
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            match iei {
+                0x50 => {
+                    buf.advance(1);
+                    msg.pdu_session_status = Some(PduSessionStatus::decode(buf)?);
+                }
+                _ => {
+                    buf.advance(1);
+                    if buf.remaining() > 0 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len { buf.advance(len); }
+                    }
+                }
+            }
+        }
+        Ok(msg)
+    }
+}
+
+/// Control Plane Service Request message (TS 24.501 Section 8.2.10)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ControlPlaneServiceRequest {
+    /// ngKSI
+    pub ngksi: KeySetIdentifier,
+    /// Control plane service type
+    pub control_plane_service_type: u8,
+    /// CIoT small data container
+    pub ciot_small_data_container: Option<Vec<u8>>,
+    /// Payload container type
+    pub payload_container_type: Option<u8>,
+    /// Payload container
+    pub payload_container: Option<PayloadContainer>,
+    /// PDU session status
+    pub pdu_session_status: Option<PduSessionStatus>,
+    /// NAS message container
+    pub nas_message_container: Option<NasMessageContainer>,
+}
+
+impl ControlPlaneServiceRequest {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8((self.ngksi.encode() << 4) | (self.control_plane_service_type & 0x0F));
+        if let Some(ref csdc) = self.ciot_small_data_container {
+            buf.put_u8(0x6F); // IEI
+            buf.put_u16(csdc.len() as u16);
+            buf.put_slice(csdc);
+        }
+        if let Some(pct) = self.payload_container_type {
+            buf.put_u8(0x80 | (pct & 0x0F)); // IEI 8- (half-byte)
+        }
+        if let Some(ref pc) = self.payload_container {
+            buf.put_u8(0x7B); // IEI
+            pc.encode(buf);
+        }
+        if let Some(ref pss) = self.pdu_session_status {
+            buf.put_u8(0x50); // IEI
+            pss.encode(buf);
+        }
+        if let Some(ref nmc) = self.nas_message_container {
+            buf.put_u8(0x71); // IEI
+            nmc.encode(buf);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        if buf.remaining() < 1 {
+            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+        }
+        let first_byte = buf.get_u8();
+        let ngksi = KeySetIdentifier::decode((first_byte >> 4) & 0x0F);
+        let control_plane_service_type = first_byte & 0x0F;
+        let mut msg = Self { ngksi, control_plane_service_type, ..Default::default() };
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            let iei_type = if iei >= 0x80 { iei & 0xF0 } else { iei };
+            match iei_type {
+                0x6F => {
+                    buf.advance(1);
+                    if buf.remaining() >= 2 {
+                        let len = buf.get_u16() as usize;
+                        if buf.remaining() >= len {
+                            msg.ciot_small_data_container = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
+                0x80 => {
+                    buf.advance(1);
+                    msg.payload_container_type = Some(iei & 0x0F);
+                }
+                0x7B => {
+                    buf.advance(1);
+                    msg.payload_container = Some(PayloadContainer::decode(buf)?);
+                }
+                0x50 => {
+                    buf.advance(1);
+                    msg.pdu_session_status = Some(PduSessionStatus::decode(buf)?);
+                }
+                0x71 => {
+                    buf.advance(1);
+                    msg.nas_message_container = Some(NasMessageContainer::decode(buf)?);
+                }
+                _ => {
+                    buf.advance(1);
+                    if buf.remaining() > 0 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len { buf.advance(len); }
+                    }
+                }
+            }
+        }
+        Ok(msg)
+    }
+}
+
+/// Network Slice-Specific Authentication Command (TS 24.501 Section 8.2.29)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct NetworkSliceSpecificAuthenticationCommand {
+    /// S-NSSAI
+    pub s_nssai: SNssai,
+    /// EAP message
+    pub eap_message: EapMessage,
+}
+
+impl NetworkSliceSpecificAuthenticationCommand {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        self.s_nssai.encode(buf);
+        self.eap_message.encode(buf);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        let s_nssai = SNssai::decode(buf)?;
+        let eap_message = EapMessage::decode(buf)?;
+        Ok(Self { s_nssai, eap_message })
+    }
+}
+
+/// Network Slice-Specific Authentication Complete (TS 24.501 Section 8.2.30)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct NetworkSliceSpecificAuthenticationComplete {
+    /// S-NSSAI
+    pub s_nssai: SNssai,
+    /// EAP message
+    pub eap_message: EapMessage,
+}
+
+impl NetworkSliceSpecificAuthenticationComplete {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        self.s_nssai.encode(buf);
+        self.eap_message.encode(buf);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        let s_nssai = SNssai::decode(buf)?;
+        let eap_message = EapMessage::decode(buf)?;
+        Ok(Self { s_nssai, eap_message })
+    }
+}
+
+/// Network Slice-Specific Authentication Result (TS 24.501 Section 8.2.31)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct NetworkSliceSpecificAuthenticationResult {
+    /// S-NSSAI
+    pub s_nssai: SNssai,
+    /// EAP message
+    pub eap_message: EapMessage,
+}
+
+impl NetworkSliceSpecificAuthenticationResult {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        self.s_nssai.encode(buf);
+        self.eap_message.encode(buf);
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        let s_nssai = SNssai::decode(buf)?;
+        let eap_message = EapMessage::decode(buf)?;
+        Ok(Self { s_nssai, eap_message })
+    }
+}
+
 /// Build a 5GMM message with header
 pub fn build_5gmm_message(msg: &FiveGmmMessage) -> BytesMut {
     let mut buf = BytesMut::new();
@@ -1429,6 +1851,14 @@ pub fn build_5gmm_message(msg: &FiveGmmMessage) -> BytesMut {
         FiveGmmMessage::FiveGmmStatus(_) => FiveGmmMessageType::FiveGmmStatus,
         FiveGmmMessage::UlNasTransport(_) => FiveGmmMessageType::UlNasTransport,
         FiveGmmMessage::DlNasTransport(_) => FiveGmmMessageType::DlNasTransport,
+        FiveGmmMessage::ConfigurationUpdateCommand(_) => FiveGmmMessageType::ConfigurationUpdateCommand,
+        FiveGmmMessage::ConfigurationUpdateComplete => FiveGmmMessageType::ConfigurationUpdateComplete,
+        FiveGmmMessage::Notification(_) => FiveGmmMessageType::Notification,
+        FiveGmmMessage::NotificationResponse(_) => FiveGmmMessageType::NotificationResponse,
+        FiveGmmMessage::ControlPlaneServiceRequest(_) => FiveGmmMessageType::ControlPlaneServiceRequest,
+        FiveGmmMessage::NetworkSliceSpecificAuthenticationCommand(_) => FiveGmmMessageType::NetworkSliceSpecificAuthenticationCommand,
+        FiveGmmMessage::NetworkSliceSpecificAuthenticationComplete(_) => FiveGmmMessageType::NetworkSliceSpecificAuthenticationComplete,
+        FiveGmmMessage::NetworkSliceSpecificAuthenticationResult(_) => FiveGmmMessageType::NetworkSliceSpecificAuthenticationResult,
     };
 
     // Encode header
@@ -1461,6 +1891,14 @@ pub fn build_5gmm_message(msg: &FiveGmmMessage) -> BytesMut {
         FiveGmmMessage::FiveGmmStatus(m) => m.encode(&mut buf),
         FiveGmmMessage::UlNasTransport(m) => m.encode(&mut buf),
         FiveGmmMessage::DlNasTransport(m) => m.encode(&mut buf),
+        FiveGmmMessage::ConfigurationUpdateCommand(m) => m.encode(&mut buf),
+        FiveGmmMessage::ConfigurationUpdateComplete => {}
+        FiveGmmMessage::Notification(m) => m.encode(&mut buf),
+        FiveGmmMessage::NotificationResponse(m) => m.encode(&mut buf),
+        FiveGmmMessage::ControlPlaneServiceRequest(m) => m.encode(&mut buf),
+        FiveGmmMessage::NetworkSliceSpecificAuthenticationCommand(m) => m.encode(&mut buf),
+        FiveGmmMessage::NetworkSliceSpecificAuthenticationComplete(m) => m.encode(&mut buf),
+        FiveGmmMessage::NetworkSliceSpecificAuthenticationResult(m) => m.encode(&mut buf),
     }
 
     buf
@@ -1544,7 +1982,30 @@ pub fn parse_5gmm_message(buf: &mut Bytes) -> NasResult<FiveGmmMessage> {
         FiveGmmMessageType::DlNasTransport => {
             Ok(FiveGmmMessage::DlNasTransport(DlNasTransport::decode(buf)?))
         }
-        _ => Err(NasError::InvalidMessageType(header.message_type)),
+        FiveGmmMessageType::ConfigurationUpdateCommand => {
+            Ok(FiveGmmMessage::ConfigurationUpdateCommand(ConfigurationUpdateCommand::decode(buf)?))
+        }
+        FiveGmmMessageType::ConfigurationUpdateComplete => {
+            Ok(FiveGmmMessage::ConfigurationUpdateComplete)
+        }
+        FiveGmmMessageType::Notification => {
+            Ok(FiveGmmMessage::Notification(Notification::decode(buf)?))
+        }
+        FiveGmmMessageType::NotificationResponse => {
+            Ok(FiveGmmMessage::NotificationResponse(NotificationResponse::decode(buf)?))
+        }
+        FiveGmmMessageType::ControlPlaneServiceRequest => {
+            Ok(FiveGmmMessage::ControlPlaneServiceRequest(ControlPlaneServiceRequest::decode(buf)?))
+        }
+        FiveGmmMessageType::NetworkSliceSpecificAuthenticationCommand => {
+            Ok(FiveGmmMessage::NetworkSliceSpecificAuthenticationCommand(NetworkSliceSpecificAuthenticationCommand::decode(buf)?))
+        }
+        FiveGmmMessageType::NetworkSliceSpecificAuthenticationComplete => {
+            Ok(FiveGmmMessage::NetworkSliceSpecificAuthenticationComplete(NetworkSliceSpecificAuthenticationComplete::decode(buf)?))
+        }
+        FiveGmmMessageType::NetworkSliceSpecificAuthenticationResult => {
+            Ok(FiveGmmMessage::NetworkSliceSpecificAuthenticationResult(NetworkSliceSpecificAuthenticationResult::decode(buf)?))
+        }
     }
 }
 
@@ -1567,7 +2028,12 @@ pub enum FiveGsmMessage {
     PduSessionReleaseReject(PduSessionReleaseReject),
     PduSessionReleaseCommand(PduSessionReleaseCommand),
     PduSessionReleaseComplete(PduSessionReleaseComplete),
+    PduSessionAuthenticationCommand(PduSessionAuthenticationCommand),
+    PduSessionAuthenticationComplete(PduSessionAuthenticationComplete),
+    PduSessionAuthenticationResult(PduSessionAuthenticationResult),
     FiveGsmStatus(FiveGsmStatus),
+    RemoteUeReport(RemoteUeReport),
+    RemoteUeReportResponse(RemoteUeReportResponse),
 }
 
 /// PDU Session Establishment Request (TS 24.501 Section 8.3.1)
@@ -2294,6 +2760,234 @@ impl FiveGsmStatus {
     }
 }
 
+/// PDU Session Authentication Command (TS 24.501 Section 8.3.4)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PduSessionAuthenticationCommand {
+    /// EAP message
+    pub eap_message: EapMessage,
+    /// Extended protocol configuration options
+    pub extended_pco: Option<Vec<u8>>,
+}
+
+impl PduSessionAuthenticationCommand {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        self.eap_message.encode(buf);
+        if let Some(ref epco) = self.extended_pco {
+            buf.put_u8(0x7B); // IEI
+            buf.put_u16(epco.len() as u16);
+            buf.put_slice(epco);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        let eap_message = EapMessage::decode(buf)?;
+        let mut msg = Self { eap_message, ..Default::default() };
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            match iei {
+                0x7B => {
+                    buf.advance(1);
+                    if buf.remaining() >= 2 {
+                        let len = buf.get_u16() as usize;
+                        if buf.remaining() >= len {
+                            msg.extended_pco = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
+                _ => {
+                    buf.advance(1);
+                    if buf.remaining() > 0 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len { buf.advance(len); }
+                    }
+                }
+            }
+        }
+        Ok(msg)
+    }
+}
+
+/// PDU Session Authentication Complete (TS 24.501 Section 8.3.5)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PduSessionAuthenticationComplete {
+    /// EAP message
+    pub eap_message: EapMessage,
+    /// Extended protocol configuration options
+    pub extended_pco: Option<Vec<u8>>,
+}
+
+impl PduSessionAuthenticationComplete {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        self.eap_message.encode(buf);
+        if let Some(ref epco) = self.extended_pco {
+            buf.put_u8(0x7B); // IEI
+            buf.put_u16(epco.len() as u16);
+            buf.put_slice(epco);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        let eap_message = EapMessage::decode(buf)?;
+        let mut msg = Self { eap_message, ..Default::default() };
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            match iei {
+                0x7B => {
+                    buf.advance(1);
+                    if buf.remaining() >= 2 {
+                        let len = buf.get_u16() as usize;
+                        if buf.remaining() >= len {
+                            msg.extended_pco = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
+                _ => {
+                    buf.advance(1);
+                    if buf.remaining() > 0 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len { buf.advance(len); }
+                    }
+                }
+            }
+        }
+        Ok(msg)
+    }
+}
+
+/// PDU Session Authentication Result (TS 24.501 Section 8.3.6)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct PduSessionAuthenticationResult {
+    /// EAP message
+    pub eap_message: Option<EapMessage>,
+    /// Extended protocol configuration options
+    pub extended_pco: Option<Vec<u8>>,
+}
+
+impl PduSessionAuthenticationResult {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        if let Some(ref eap) = self.eap_message {
+            buf.put_u8(0x78); // IEI
+            eap.encode(buf);
+        }
+        if let Some(ref epco) = self.extended_pco {
+            buf.put_u8(0x7B); // IEI
+            buf.put_u16(epco.len() as u16);
+            buf.put_slice(epco);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        let mut msg = Self::default();
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            match iei {
+                0x78 => {
+                    buf.advance(1);
+                    msg.eap_message = Some(EapMessage::decode(buf)?);
+                }
+                0x7B => {
+                    buf.advance(1);
+                    if buf.remaining() >= 2 {
+                        let len = buf.get_u16() as usize;
+                        if buf.remaining() >= len {
+                            msg.extended_pco = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
+                _ => {
+                    buf.advance(1);
+                    if buf.remaining() > 0 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len { buf.advance(len); }
+                    }
+                }
+            }
+        }
+        Ok(msg)
+    }
+}
+
+/// Remote UE Report (TS 24.501 Section 8.3.17)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RemoteUeReport {
+    /// Remote UE context connected
+    pub remote_ue_context_connected: Option<Vec<u8>>,
+    /// Remote UE context disconnected
+    pub remote_ue_context_disconnected: Option<Vec<u8>>,
+}
+
+impl RemoteUeReport {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        if let Some(ref connected) = self.remote_ue_context_connected {
+            buf.put_u8(0x79); // IEI
+            buf.put_u16(connected.len() as u16);
+            buf.put_slice(connected);
+        }
+        if let Some(ref disconnected) = self.remote_ue_context_disconnected {
+            buf.put_u8(0x7A); // IEI
+            buf.put_u16(disconnected.len() as u16);
+            buf.put_slice(disconnected);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        let mut msg = Self::default();
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            match iei {
+                0x79 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 2 {
+                        let len = buf.get_u16() as usize;
+                        if buf.remaining() >= len {
+                            msg.remote_ue_context_connected = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
+                0x7A => {
+                    buf.advance(1);
+                    if buf.remaining() >= 2 {
+                        let len = buf.get_u16() as usize;
+                        if buf.remaining() >= len {
+                            msg.remote_ue_context_disconnected = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
+                _ => {
+                    buf.advance(1);
+                    if buf.remaining() > 0 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len { buf.advance(len); }
+                    }
+                }
+            }
+        }
+        Ok(msg)
+    }
+}
+
+/// Remote UE Report Response (TS 24.501 Section 8.3.18)
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RemoteUeReportResponse;
+
+impl RemoteUeReportResponse {
+    pub fn encode(&self, _buf: &mut BytesMut) {
+        // No mandatory IEs
+    }
+
+    pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
+        // Skip any optional IEs
+        while buf.remaining() > 0 {
+            buf.advance(1);
+            if buf.remaining() > 0 {
+                let len = buf.get_u8() as usize;
+                if buf.remaining() >= len { buf.advance(len); }
+            }
+        }
+        Ok(Self)
+    }
+}
+
 /// Build a 5GSM message with header
 pub fn build_5gsm_message(pdu_session_id: u8, pti: u8, msg: &FiveGsmMessage) -> BytesMut {
     let mut buf = BytesMut::new();
@@ -2311,7 +3005,12 @@ pub fn build_5gsm_message(pdu_session_id: u8, pti: u8, msg: &FiveGsmMessage) -> 
         FiveGsmMessage::PduSessionReleaseReject(_) => FiveGsmMessageType::PduSessionReleaseReject,
         FiveGsmMessage::PduSessionReleaseCommand(_) => FiveGsmMessageType::PduSessionReleaseCommand,
         FiveGsmMessage::PduSessionReleaseComplete(_) => FiveGsmMessageType::PduSessionReleaseComplete,
+        FiveGsmMessage::PduSessionAuthenticationCommand(_) => FiveGsmMessageType::PduSessionAuthenticationCommand,
+        FiveGsmMessage::PduSessionAuthenticationComplete(_) => FiveGsmMessageType::PduSessionAuthenticationComplete,
+        FiveGsmMessage::PduSessionAuthenticationResult(_) => FiveGsmMessageType::PduSessionAuthenticationResult,
         FiveGsmMessage::FiveGsmStatus(_) => FiveGsmMessageType::FiveGsmStatus,
+        FiveGsmMessage::RemoteUeReport(_) => FiveGsmMessageType::RemoteUeReport,
+        FiveGsmMessage::RemoteUeReportResponse(_) => FiveGsmMessageType::RemoteUeReportResponse,
     };
 
     let header = FiveGsNasHeader::new_gsm(pdu_session_id, pti, message_type);
@@ -2330,7 +3029,12 @@ pub fn build_5gsm_message(pdu_session_id: u8, pti: u8, msg: &FiveGsmMessage) -> 
         FiveGsmMessage::PduSessionReleaseReject(m) => m.encode(&mut buf),
         FiveGsmMessage::PduSessionReleaseCommand(m) => m.encode(&mut buf),
         FiveGsmMessage::PduSessionReleaseComplete(m) => m.encode(&mut buf),
+        FiveGsmMessage::PduSessionAuthenticationCommand(m) => m.encode(&mut buf),
+        FiveGsmMessage::PduSessionAuthenticationComplete(m) => m.encode(&mut buf),
+        FiveGsmMessage::PduSessionAuthenticationResult(m) => m.encode(&mut buf),
         FiveGsmMessage::FiveGsmStatus(m) => m.encode(&mut buf),
+        FiveGsmMessage::RemoteUeReport(m) => m.encode(&mut buf),
+        FiveGsmMessage::RemoteUeReportResponse(m) => m.encode(&mut buf),
     }
 
     buf
@@ -2378,10 +3082,24 @@ pub fn parse_5gsm_message(buf: &mut Bytes) -> NasResult<(u8, u8, FiveGsmMessage)
         FiveGsmMessageType::PduSessionReleaseComplete => {
             FiveGsmMessage::PduSessionReleaseComplete(PduSessionReleaseComplete::decode(buf)?)
         }
+        FiveGsmMessageType::PduSessionAuthenticationCommand => {
+            FiveGsmMessage::PduSessionAuthenticationCommand(PduSessionAuthenticationCommand::decode(buf)?)
+        }
+        FiveGsmMessageType::PduSessionAuthenticationComplete => {
+            FiveGsmMessage::PduSessionAuthenticationComplete(PduSessionAuthenticationComplete::decode(buf)?)
+        }
+        FiveGsmMessageType::PduSessionAuthenticationResult => {
+            FiveGsmMessage::PduSessionAuthenticationResult(PduSessionAuthenticationResult::decode(buf)?)
+        }
         FiveGsmMessageType::FiveGsmStatus => {
             FiveGsmMessage::FiveGsmStatus(FiveGsmStatus::decode(buf)?)
         }
-        _ => return Err(NasError::InvalidMessageType(header.message_type)),
+        FiveGsmMessageType::RemoteUeReport => {
+            FiveGsmMessage::RemoteUeReport(RemoteUeReport::decode(buf)?)
+        }
+        FiveGsmMessageType::RemoteUeReportResponse => {
+            FiveGsmMessage::RemoteUeReportResponse(RemoteUeReportResponse::decode(buf)?)
+        }
     };
 
     Ok((header.pdu_session_id, header.procedure_transaction_identity, msg))

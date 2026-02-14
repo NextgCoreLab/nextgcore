@@ -136,10 +136,7 @@ pub fn nssf_sbi_discover_and_send(
     _request: PathSbiRequest,
 ) -> Result<u64, String> {
     log::debug!(
-        "Discover and send: service_type={}, home_id={}, stream_id={}",
-        service_type,
-        home_id,
-        stream_id
+        "Discover and send: service_type={service_type}, home_id={home_id}, stream_id={stream_id}"
     );
 
     // Note: SBI transaction tracking and NF discovery require NRF integration

@@ -93,7 +93,7 @@ fn main() -> Result<()> {
     if std::path::Path::new(&args.config).exists() {
         log::info!("Loading configuration from {}", args.config);
         if let Err(e) = hss_context_parse_config(&args.config) {
-            log::warn!("Failed to parse config: {}", e);
+            log::warn!("Failed to parse config: {e}");
         }
     } else {
         log::debug!("Configuration file not found: {}", args.config);
@@ -106,7 +106,7 @@ fn main() -> Result<()> {
 
     // Initialize FreeDiameter
     if let Err(e) = hss_fd_init() {
-        log::error!("Failed to initialize FreeDiameter: {}", e);
+        log::error!("Failed to initialize FreeDiameter: {e}");
         cleanup(&mut hss_sm);
         return Err(anyhow::anyhow!(e));
     }
@@ -114,26 +114,26 @@ fn main() -> Result<()> {
 
     // Initialize S6a interface (MME communication)
     if let Err(e) = hss_s6a_init() {
-        log::error!("Failed to initialize S6a interface: {}", e);
+        log::error!("Failed to initialize S6a interface: {e}");
         hss_fd_final();
         cleanup(&mut hss_sm);
-        return Err(anyhow::anyhow!("{}", e));
+        return Err(anyhow::anyhow!("{e}"));
     }
     log::info!("S6a interface initialized");
 
     // Initialize Cx interface (IMS communication)
     if let Err(e) = hss_cx_init() {
-        log::error!("Failed to initialize Cx interface: {}", e);
+        log::error!("Failed to initialize Cx interface: {e}");
         hss_s6a_final();
         hss_fd_final();
         cleanup(&mut hss_sm);
-        return Err(anyhow::anyhow!("{}", e));
+        return Err(anyhow::anyhow!("{e}"));
     }
     log::info!("Cx interface initialized");
 
     // Initialize SWx interface (non-3GPP AAA communication)
     if let Err(e) = hss_swx_init() {
-        log::error!("Failed to initialize SWx interface: {}", e);
+        log::error!("Failed to initialize SWx interface: {e}");
         hss_cx_final();
         hss_s6a_final();
         hss_fd_final();

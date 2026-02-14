@@ -117,6 +117,25 @@ impl TimeSeries {
         ))
     }
 
+    /// Calculate percentile value (0-100). Uses nearest-rank method.
+    pub fn percentile(&self, pct: f64) -> Option<f64> {
+        if self.points.is_empty() || !(0.0..=100.0).contains(&pct) {
+            return None;
+        }
+        let mut sorted: Vec<f64> = self.points.iter().map(|p| p.value).collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let rank = ((pct / 100.0) * (sorted.len() as f64 - 1.0)).round() as usize;
+        Some(sorted[rank.min(sorted.len() - 1)])
+    }
+
+    /// Standard deviation of values.
+    pub fn std_dev(&self) -> Option<f64> {
+        let avg = self.avg()?;
+        let n = self.points.len() as f64;
+        let variance: f64 = self.points.iter().map(|p| (p.value - avg).powi(2)).sum::<f64>() / n;
+        Some(variance.sqrt())
+    }
+
     /// Downsample by averaging over intervals
     pub fn downsample(&self, interval_us: i64) -> Vec<DataPoint> {
         if self.points.is_empty() {
@@ -237,6 +256,53 @@ impl TsDbClient {
     pub fn clear(&mut self) {
         self.series.clear();
     }
+
+    /// Apply retention policy: remove data points older than cutoff timestamp.
+    /// Returns total number of points removed across all series.
+    pub fn apply_retention(&mut self, cutoff_timestamp: Timestamp) -> usize {
+        let mut removed = 0;
+        for series in self.series.values_mut() {
+            let before = series.points.len();
+            series.points.retain(|p| p.timestamp >= cutoff_timestamp);
+            removed += before - series.points.len();
+        }
+        // Remove empty series
+        self.series.retain(|_, s| !s.points.is_empty());
+        removed
+    }
+
+    /// Get aggregate statistics for a metric.
+    pub fn stats(&self, metric: &str) -> TsDbResult<MetricStats> {
+        let series = self.query(metric)?;
+        Ok(MetricStats {
+            count: series.points.len(),
+            avg: series.avg(),
+            min_max: series.min_max(),
+            p50: series.percentile(50.0),
+            p95: series.percentile(95.0),
+            p99: series.percentile(99.0),
+            std_dev: series.std_dev(),
+        })
+    }
+}
+
+/// Aggregate statistics for a metric.
+#[derive(Debug, Clone)]
+pub struct MetricStats {
+    /// Number of data points.
+    pub count: usize,
+    /// Average value.
+    pub avg: Option<f64>,
+    /// Min and max values.
+    pub min_max: Option<(f64, f64)>,
+    /// 50th percentile (median).
+    pub p50: Option<f64>,
+    /// 95th percentile.
+    pub p95: Option<f64>,
+    /// 99th percentile.
+    pub p99: Option<f64>,
+    /// Standard deviation.
+    pub std_dev: Option<f64>,
 }
 
 /// Network metrics collector
@@ -441,5 +507,63 @@ mod tests {
         // Start > end should fail
         let result = client.query_range("test.metric", 2000, 1000);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_percentile() {
+        let mut series = TimeSeries::new("test");
+        for i in 1..=100 {
+            series.add_point(DataPoint::new(i * 1000, i as f64));
+        }
+        // p50 should be ~50
+        let p50 = series.percentile(50.0).unwrap();
+        assert!((p50 - 50.0).abs() < 2.0);
+        // p99 should be ~99
+        let p99 = series.percentile(99.0).unwrap();
+        assert!((p99 - 99.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn test_std_dev() {
+        let mut series = TimeSeries::new("test");
+        series.add_point(DataPoint::new(1000, 10.0));
+        series.add_point(DataPoint::new(2000, 10.0));
+        series.add_point(DataPoint::new(3000, 10.0));
+        // All same values, std dev = 0
+        assert!((series.std_dev().unwrap() - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_retention_policy() {
+        let mut client = TsDbClient::in_memory();
+        client.write_point("m1", DataPoint::new(1000, 1.0)).unwrap();
+        client.write_point("m1", DataPoint::new(2000, 2.0)).unwrap();
+        client.write_point("m1", DataPoint::new(3000, 3.0)).unwrap();
+
+        let removed = client.apply_retention(2000);
+        assert_eq!(removed, 1); // Only the 1000 timestamp point
+        assert_eq!(client.query("m1").unwrap().points.len(), 2);
+    }
+
+    #[test]
+    fn test_retention_removes_empty_series() {
+        let mut client = TsDbClient::in_memory();
+        client.write_point("m1", DataPoint::new(1000, 1.0)).unwrap();
+        client.apply_retention(2000); // Removes all points in m1
+        assert_eq!(client.metric_count(), 0);
+    }
+
+    #[test]
+    fn test_metric_stats() {
+        let mut client = TsDbClient::in_memory();
+        for i in 1..=100 {
+            client.write_point("latency", DataPoint::new(i * 1000, i as f64)).unwrap();
+        }
+        let stats = client.stats("latency").unwrap();
+        assert_eq!(stats.count, 100);
+        assert!((stats.avg.unwrap() - 50.5).abs() < 0.01);
+        assert_eq!(stats.min_max.unwrap(), (1.0, 100.0));
+        assert!(stats.p95.is_some());
+        assert!(stats.std_dev.is_some());
     }
 }

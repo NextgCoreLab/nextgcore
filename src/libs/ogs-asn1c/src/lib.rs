@@ -11,6 +11,9 @@
 pub mod per;    // Packed Encoding Rules
 pub mod ngap;   // NGAP codec (directory module)
 pub mod s1ap;   // S1AP codec
+pub mod xnap;   // XnAP codec - inter-gNB (TS 38.423)
+pub mod f1ap;   // F1AP codec - CU-DU (TS 38.473)
+pub mod e1ap;   // E1AP codec - CU-CP/CU-UP (TS 38.463)
 
 #[cfg(test)]
 mod property_tests;

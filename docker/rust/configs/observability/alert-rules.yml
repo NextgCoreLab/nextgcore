@@ -1,0 +1,154 @@
+# Prometheus Alerting Rules for NextGCore 5G Core
+# Item 123: Alerting rules (Prometheus)
+
+groups:
+  - name: nextgcore_nf_health
+    rules:
+      # NF instance down for > 1 minute
+      - alert: NfInstanceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "NF instance {{ $labels.nf_type }} is down"
+          description: "{{ $labels.instance_name }} ({{ $labels.instance }}) has been unreachable for > 1 minute."
+
+      # NF responding slowly (scrape duration > 5s)
+      - alert: NfSlowResponse
+        expr: scrape_duration_seconds > 5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NF {{ $labels.nf_type }} responding slowly"
+          description: "Scrape duration for {{ $labels.instance_name }} is {{ $value }}s."
+
+  - name: nextgcore_amf_alerts
+    rules:
+      # High registration failure rate
+      - alert: AmfHighRegistrationFailureRate
+        expr: rate(amf_registration_failure_total[5m]) / (rate(amf_registration_success_total[5m]) + rate(amf_registration_failure_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          nf_type: AMF
+        annotations:
+          summary: "AMF registration failure rate > 10%"
+          description: "Registration failure rate is {{ $value | humanizePercentage }}."
+
+      # Too many connected UEs (capacity warning)
+      - alert: AmfHighUeCount
+        expr: amf_connected_ue_count > 900
+        for: 1m
+        labels:
+          severity: warning
+          nf_type: AMF
+        annotations:
+          summary: "AMF UE count approaching capacity"
+          description: "{{ $value }} UEs connected (threshold: 900)."
+
+      # Authentication failure spike
+      - alert: AmfAuthenticationFailureSpike
+        expr: rate(amf_auth_failure_total[5m]) > 10
+        for: 3m
+        labels:
+          severity: critical
+          nf_type: AMF
+        annotations:
+          summary: "AMF authentication failure spike"
+          description: "Auth failure rate: {{ $value }}/s. Possible attack or misconfiguration."
+
+  - name: nextgcore_smf_alerts
+    rules:
+      # PDU session establishment failure rate
+      - alert: SmfHighSessionFailureRate
+        expr: rate(smf_session_failure_total[5m]) / (rate(smf_session_success_total[5m]) + rate(smf_session_failure_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          nf_type: SMF
+        annotations:
+          summary: "SMF session establishment failure rate > 5%"
+          description: "Session failure rate is {{ $value | humanizePercentage }}."
+
+      # PFCP association down
+      - alert: SmfPfcpAssociationDown
+        expr: smf_pfcp_association_up == 0
+        for: 30s
+        labels:
+          severity: critical
+          nf_type: SMF
+        annotations:
+          summary: "SMF PFCP association to UPF is down"
+          description: "SMF has lost PFCP association with UPF."
+
+  - name: nextgcore_upf_alerts
+    rules:
+      # High packet drop rate
+      - alert: UpfHighDropRate
+        expr: rate(upf_packets_dropped_total[5m]) / rate(upf_packets_total[5m]) > 0.01
+        for: 5m
+        labels:
+          severity: warning
+          nf_type: UPF
+        annotations:
+          summary: "UPF packet drop rate > 1%"
+          description: "Drop rate is {{ $value | humanizePercentage }}."
+
+      # GTP-U tunnel errors
+      - alert: UpfGtpTunnelErrors
+        expr: rate(upf_gtp_error_total[5m]) > 5
+        for: 3m
+        labels:
+          severity: warning
+          nf_type: UPF
+        annotations:
+          summary: "UPF GTP-U tunnel errors detected"
+          description: "GTP error rate: {{ $value }}/s."
+
+  - name: nextgcore_nrf_alerts
+    rules:
+      # NF discovery failure rate
+      - alert: NrfDiscoveryFailureRate
+        expr: rate(nrf_discovery_failure_total[5m]) / (rate(nrf_discovery_success_total[5m]) + rate(nrf_discovery_failure_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          nf_type: NRF
+        annotations:
+          summary: "NRF discovery failure rate > 10%"
+          description: "Discovery failure rate is {{ $value | humanizePercentage }}."
+
+      # Low registered NF count (possible NF crash)
+      - alert: NrfLowRegisteredNfs
+        expr: nrf_registered_nf_count < 5
+        for: 2m
+        labels:
+          severity: critical
+          nf_type: NRF
+        annotations:
+          summary: "NRF has fewer than 5 registered NFs"
+          description: "Only {{ $value }} NFs registered. Expected 8+ in full deployment."
+
+  - name: nextgcore_infrastructure
+    rules:
+      # MongoDB down
+      - alert: MongoDbDown
+        expr: mongodb_up == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "MongoDB is down"
+          description: "MongoDB instance is unreachable."
+
+      # High memory usage
+      - alert: NfHighMemoryUsage
+        expr: process_resident_memory_bytes > 512 * 1024 * 1024
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "NF {{ $labels.nf_type }} high memory usage"
+          description: "Memory usage: {{ $value | humanize1024 }}B."

@@ -1,0 +1,294 @@
+# NextGCore PCF SM Policy Control Service OpenAPI Specification
+# Based on 3GPP TS 29.512 v18.6.0
+
+openapi: 3.0.3
+info:
+  title: PCF SM Policy Control Service
+  version: 1.3.0
+  description: PCF SM Policy Control Service (npcf-smpolicycontrol) per 3GPP TS 29.512
+
+servers:
+  - url: "{apiRoot}/npcf-smpolicycontrol/v1"
+    variables:
+      apiRoot:
+        default: http://localhost:7777
+
+paths:
+  /sm-policies:
+    post:
+      summary: Create SM policy association
+      operationId: SmPoliciesPost
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SmPolicyContextData"
+      responses:
+        "201":
+          description: SM policy created
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SmPolicyDecision"
+
+  /sm-policies/{smPolicyId}:
+    delete:
+      summary: Delete SM policy association
+      operationId: SmPoliciesSmPolicyIdDeletePost
+      parameters:
+        - $ref: "#/components/parameters/SmPolicyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SmPolicyDeleteData"
+      responses:
+        "204":
+          description: SM policy deleted
+
+  /sm-policies/{smPolicyId}/update:
+    post:
+      summary: Update SM policy association
+      operationId: SmPoliciesSmPolicyIdUpdatePost
+      parameters:
+        - $ref: "#/components/parameters/SmPolicyId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SmPolicyUpdateContextData"
+      responses:
+        "200":
+          description: SM policy updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SmPolicyDecision"
+
+components:
+  parameters:
+    SmPolicyId:
+      name: smPolicyId
+      in: path
+      required: true
+      schema:
+        type: string
+
+  schemas:
+    SmPolicyContextData:
+      type: object
+      required:
+        - supi
+        - pduSessionId
+        - pduSessionType
+        - dnn
+        - notificationUri
+        - sliceInfo
+      properties:
+        supi:
+          type: string
+        pei:
+          type: string
+        pduSessionId:
+          type: integer
+          minimum: 1
+          maximum: 255
+        pduSessionType:
+          type: string
+          enum: [IPV4, IPV6, IPV4V6, UNSTRUCTURED, ETHERNET]
+        dnn:
+          type: string
+        notificationUri:
+          type: string
+          format: uri
+        sliceInfo:
+          $ref: "#/components/schemas/Snssai"
+        ipv4Address:
+          type: string
+          format: ipv4
+        ipv6AddressPrefix:
+          type: string
+        accessType:
+          type: string
+          enum: [3GPP_ACCESS, NON_3GPP_ACCESS]
+        ratType:
+          type: string
+          enum: [NR, EUTRA, WLAN, VIRTUAL]
+
+    SmPolicyDecision:
+      type: object
+      properties:
+        sessRules:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/SessionRule"
+        pccRules:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/PccRule"
+        qosDecs:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/QosData"
+        traffContDecs:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/TrafficControlData"
+        policyCtrlReqTriggers:
+          type: array
+          items:
+            type: string
+            enum:
+              - PLMN_CH
+              - RES_MO_RE
+              - AC_TY_CH
+              - UE_IP_CH
+              - DEF_QOS_CH
+              - SE_AMBR_CH
+              - QOS_NOTIF
+              - RAT_TY_CH
+
+    SessionRule:
+      type: object
+      properties:
+        sessRuleId:
+          type: string
+        authSessAmbr:
+          $ref: "#/components/schemas/Ambr"
+        authDefQos:
+          $ref: "#/components/schemas/AuthorizedDefaultQos"
+
+    AuthorizedDefaultQos:
+      type: object
+      properties:
+        fiveQi:
+          type: integer
+          minimum: 0
+          maximum: 255
+        arp:
+          $ref: "#/components/schemas/Arp"
+        priorityLevel:
+          type: integer
+
+    Arp:
+      type: object
+      required: [priorityLevel, preemptCap, preemptVuln]
+      properties:
+        priorityLevel:
+          type: integer
+          minimum: 1
+          maximum: 15
+        preemptCap:
+          type: string
+          enum: [NOT_PREEMPT, MAY_PREEMPT]
+        preemptVuln:
+          type: string
+          enum: [NOT_PREEMPTABLE, PREEMPTABLE]
+
+    PccRule:
+      type: object
+      properties:
+        pccRuleId:
+          type: string
+        flowInfos:
+          type: array
+          items:
+            $ref: "#/components/schemas/FlowInformation"
+        refQosData:
+          type: array
+          items:
+            type: string
+        refTcData:
+          type: array
+          items:
+            type: string
+
+    FlowInformation:
+      type: object
+      properties:
+        flowDescription:
+          type: string
+        flowDirection:
+          type: string
+          enum: [DOWNLINK, UPLINK, BIDIRECTIONAL]
+
+    QosData:
+      type: object
+      required: [qosId, fiveQi]
+      properties:
+        qosId:
+          type: string
+        fiveQi:
+          type: integer
+          minimum: 0
+          maximum: 255
+        maxbrUl:
+          type: string
+        maxbrDl:
+          type: string
+        gbrUl:
+          type: string
+        gbrDl:
+          type: string
+        arp:
+          $ref: "#/components/schemas/Arp"
+
+    TrafficControlData:
+      type: object
+      properties:
+        tcId:
+          type: string
+        flowStatus:
+          type: string
+          enum: [ENABLED, DISABLED, ENABLED_UPLINK, ENABLED_DOWNLINK, REMOVED]
+
+    SmPolicyUpdateContextData:
+      type: object
+      properties:
+        repPolicyCtrlReqTriggers:
+          type: array
+          items:
+            type: string
+        accessType:
+          type: string
+          enum: [3GPP_ACCESS, NON_3GPP_ACCESS]
+        ratType:
+          type: string
+          enum: [NR, EUTRA, WLAN, VIRTUAL]
+        ipv4Address:
+          type: string
+          format: ipv4
+
+    SmPolicyDeleteData:
+      type: object
+      properties:
+        userLocationInfo:
+          type: object
+
+    Snssai:
+      type: object
+      required: [sst]
+      properties:
+        sst:
+          type: integer
+          minimum: 0
+          maximum: 255
+        sd:
+          type: string
+          pattern: "^[0-9a-fA-F]{6}$"
+
+    Ambr:
+      type: object
+      properties:
+        uplink:
+          type: string
+        downlink:
+          type: string

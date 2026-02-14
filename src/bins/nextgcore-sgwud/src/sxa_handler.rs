@@ -258,7 +258,7 @@ pub fn handle_session_establishment_request(
                 }
             }
             Err(cause) => {
-                log::error!("Failed to create PDR: cause={}", cause);
+                log::error!("Failed to create PDR: cause={cause}");
                 return (HandlerResult::Error(cause), vec![]);
             }
         }
@@ -267,7 +267,7 @@ pub fn handle_session_establishment_request(
     // Process Create FARs
     for create_far in &req.create_fars {
         if let Err(cause) = process_create_far(sess, create_far) {
-            log::error!("Failed to create FAR: cause={}", cause);
+            log::error!("Failed to create FAR: cause={cause}");
             return (HandlerResult::Error(cause), vec![]);
         }
     }
@@ -275,7 +275,7 @@ pub fn handle_session_establishment_request(
     // Process Create QERs
     for create_qer in &req.create_qers {
         if let Err(cause) = process_create_qer(sess, create_qer) {
-            log::error!("Failed to create QER: cause={}", cause);
+            log::error!("Failed to create QER: cause={cause}");
             return (HandlerResult::Error(cause), vec![]);
         }
     }
@@ -283,7 +283,7 @@ pub fn handle_session_establishment_request(
     // Process Create BAR
     if let Some(ref create_bar) = req.create_bar {
         if let Err(cause) = process_create_bar(sess, create_bar) {
-            log::error!("Failed to create BAR: cause={}", cause);
+            log::error!("Failed to create BAR: cause={cause}");
             return (HandlerResult::Error(cause), vec![]);
         }
     }
@@ -332,7 +332,7 @@ pub fn handle_session_modification_request(
                 }
             }
             Err(cause) => {
-                log::error!("Failed to create PDR: cause={}", cause);
+                log::error!("Failed to create PDR: cause={cause}");
                 return (HandlerResult::Error(cause), vec![]);
             }
         }
@@ -341,7 +341,7 @@ pub fn handle_session_modification_request(
     // Process Update PDRs
     for update_pdr in &req.update_pdrs {
         if let Err(cause) = process_update_pdr(sess, update_pdr) {
-            log::error!("Failed to update PDR: cause={}", cause);
+            log::error!("Failed to update PDR: cause={cause}");
             return (HandlerResult::Error(cause), vec![]);
         }
     }
@@ -349,7 +349,7 @@ pub fn handle_session_modification_request(
     // Process Remove PDRs
     for pdr_id in &req.remove_pdrs {
         if let Err(cause) = process_remove_pdr(sess, *pdr_id) {
-            log::error!("Failed to remove PDR: cause={}", cause);
+            log::error!("Failed to remove PDR: cause={cause}");
             return (HandlerResult::Error(cause), vec![]);
         }
     }
@@ -357,7 +357,7 @@ pub fn handle_session_modification_request(
     // Process Create FARs
     for create_far in &req.create_fars {
         if let Err(cause) = process_create_far(sess, create_far) {
-            log::error!("Failed to create FAR: cause={}", cause);
+            log::error!("Failed to create FAR: cause={cause}");
             return (HandlerResult::Error(cause), vec![]);
         }
     }
@@ -378,7 +378,7 @@ pub fn handle_session_modification_request(
     // Process Update FARs
     for update_far in &req.update_fars {
         if let Err(cause) = process_update_far(sess, update_far) {
-            log::error!("Failed to update FAR: cause={}", cause);
+            log::error!("Failed to update FAR: cause={cause}");
             return (HandlerResult::Error(cause), vec![]);
         }
     }
@@ -386,7 +386,7 @@ pub fn handle_session_modification_request(
     // Process Remove FARs
     for far_id in &req.remove_fars {
         if let Err(cause) = process_remove_far(sess, *far_id) {
-            log::error!("Failed to remove FAR: cause={}", cause);
+            log::error!("Failed to remove FAR: cause={cause}");
             return (HandlerResult::Error(cause), vec![]);
         }
     }
@@ -394,7 +394,7 @@ pub fn handle_session_modification_request(
     // Process Create QERs
     for create_qer in &req.create_qers {
         if let Err(cause) = process_create_qer(sess, create_qer) {
-            log::error!("Failed to create QER: cause={}", cause);
+            log::error!("Failed to create QER: cause={cause}");
             return (HandlerResult::Error(cause), vec![]);
         }
     }
@@ -402,7 +402,7 @@ pub fn handle_session_modification_request(
     // Process Update QERs
     for update_qer in &req.update_qers {
         if let Err(cause) = process_update_qer(sess, update_qer) {
-            log::error!("Failed to update QER: cause={}", cause);
+            log::error!("Failed to update QER: cause={cause}");
             return (HandlerResult::Error(cause), vec![]);
         }
     }
@@ -410,7 +410,7 @@ pub fn handle_session_modification_request(
     // Process Remove QERs
     for qer_id in &req.remove_qers {
         if let Err(cause) = process_remove_qer(sess, *qer_id) {
-            log::error!("Failed to remove QER: cause={}", cause);
+            log::error!("Failed to remove QER: cause={cause}");
             return (HandlerResult::Error(cause), vec![]);
         }
     }
@@ -418,7 +418,7 @@ pub fn handle_session_modification_request(
     // Process Create BAR
     if let Some(ref create_bar) = req.create_bar {
         if let Err(cause) = process_create_bar(sess, create_bar) {
-            log::error!("Failed to create BAR: cause={}", cause);
+            log::error!("Failed to create BAR: cause={cause}");
             return (HandlerResult::Error(cause), vec![]);
         }
     }
@@ -426,7 +426,7 @@ pub fn handle_session_modification_request(
     // Process Remove BAR
     if let Some(bar_id) = req.remove_bar {
         if let Err(cause) = process_remove_bar(sess, bar_id) {
-            log::error!("Failed to remove BAR: cause={}", cause);
+            log::error!("Failed to remove BAR: cause={cause}");
             return (HandlerResult::Error(cause), vec![]);
         }
     }
@@ -483,7 +483,7 @@ pub fn handle_session_report_response(
     }
 
     if cause != pfcp_cause::REQUEST_ACCEPTED {
-        log::error!("PFCP Cause[{}] : Not Accepted", cause);
+        log::error!("PFCP Cause[{cause}] : Not Accepted");
         return HandlerResult::Error(cause);
     }
 
@@ -600,7 +600,7 @@ fn process_update_pdr(_sess: &SgwuSess, req: &UpdatePdrRequest) -> Result<(), u8
 
 /// Process Remove PDR
 fn process_remove_pdr(_sess: &SgwuSess, pdr_id: u16) -> Result<(), u8> {
-    log::debug!("Removing PDR: id={}", pdr_id);
+    log::debug!("Removing PDR: id={pdr_id}");
 
     // In actual implementation:
     // 1. Find PDR by ID
@@ -625,7 +625,7 @@ fn process_update_far(_sess: &SgwuSess, req: &UpdateFarRequest) -> Result<(), u8
 
 /// Process Remove FAR
 fn process_remove_far(_sess: &SgwuSess, far_id: u32) -> Result<(), u8> {
-    log::debug!("Removing FAR: id={}", far_id);
+    log::debug!("Removing FAR: id={far_id}");
 
     // In actual implementation:
     // 1. Find FAR by ID
@@ -649,7 +649,7 @@ fn process_update_qer(_sess: &SgwuSess, req: &UpdateQerRequest) -> Result<(), u8
 
 /// Process Remove QER
 fn process_remove_qer(_sess: &SgwuSess, qer_id: u32) -> Result<(), u8> {
-    log::debug!("Removing QER: id={}", qer_id);
+    log::debug!("Removing QER: id={qer_id}");
 
     // In actual implementation:
     // 1. Find QER by ID
@@ -660,7 +660,7 @@ fn process_remove_qer(_sess: &SgwuSess, qer_id: u32) -> Result<(), u8> {
 
 /// Process Remove BAR
 fn process_remove_bar(_sess: &SgwuSess, bar_id: u8) -> Result<(), u8> {
-    log::debug!("Removing BAR: id={}", bar_id);
+    log::debug!("Removing BAR: id={bar_id}");
 
     // In actual implementation:
     // 1. Find BAR by ID

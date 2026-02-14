@@ -460,6 +460,9 @@ pub struct AmfContext {
 
     /// Context initialized flag
     initialized: AtomicBool,
+
+    /// Paging context map: AMF-UE-NGAP-ID -> PagingContext (TS 23.502 4.2.3.3)
+    paging_map: RwLock<HashMap<u64, PagingContext>>,
 }
 
 impl AmfContext {
@@ -506,6 +509,7 @@ impl AmfContext {
             max_num_of_ran_ue: 0,
             max_num_of_sess: 0,
             initialized: AtomicBool::new(false),
+            paging_map: RwLock::new(HashMap::new()),
         }
     }
 
@@ -573,7 +577,7 @@ impl AmfContext {
         gnb_addr_hash.insert(addr.to_string(), id);
         gnb_list.insert(id, gnb.clone());
 
-        log::debug!("[{}] gNB added (id={})", addr, id);
+        log::debug!("[{addr}] gNB added (id={id})");
         Some(gnb)
     }
 
@@ -646,8 +650,8 @@ impl AmfContext {
 
     /// Set gNB ID for a gNB
     pub fn gnb_set_gnb_id(&self, id: u64, gnb_id: u32) -> bool {
-        let mut gnb_list = self.gnb_list.write().ok().unwrap();
-        let mut gnb_id_hash = self.gnb_id_hash.write().ok().unwrap();
+        let mut gnb_list = self.gnb_list.write().unwrap();
+        let mut gnb_id_hash = self.gnb_id_hash.write().unwrap();
 
         if let Some(gnb) = gnb_list.get_mut(&id) {
             // Remove old gNB ID from hash if present
@@ -665,7 +669,7 @@ impl AmfContext {
 
     /// Update gNB in the context
     pub fn gnb_update(&self, gnb: &AmfGnb) -> bool {
-        let mut gnb_list = self.gnb_list.write().ok().unwrap();
+        let mut gnb_list = self.gnb_list.write().unwrap();
         if let Some(existing) = gnb_list.get_mut(&gnb.id) {
             *existing = gnb.clone();
             return true;
@@ -699,8 +703,7 @@ impl AmfContext {
         ran_ue_list.insert(id, ran_ue.clone());
 
         log::debug!(
-            "RAN UE added (id={}, ran_ue_ngap_id={}, amf_ue_ngap_id={})",
-            id, ran_ue_ngap_id, amf_ue_ngap_id
+            "RAN UE added (id={id}, ran_ue_ngap_id={ran_ue_ngap_id}, amf_ue_ngap_id={amf_ue_ngap_id})"
         );
         Some(ran_ue)
     }
@@ -767,7 +770,7 @@ impl AmfContext {
 
     /// Update RAN UE in the context
     pub fn ran_ue_update(&self, ran_ue: &RanUe) -> bool {
-        let mut ran_ue_list = self.ran_ue_list.write().ok().unwrap();
+        let mut ran_ue_list = self.ran_ue_list.write().unwrap();
         if let Some(existing) = ran_ue_list.get_mut(&ran_ue.id) {
             *existing = ran_ue.clone();
             return true;
@@ -777,7 +780,7 @@ impl AmfContext {
 
     /// Switch RAN UE to a new gNB (for handover)
     pub fn ran_ue_switch_to_gnb(&self, ran_ue_id: u64, new_gnb_id: u64) -> bool {
-        let mut ran_ue_list = self.ran_ue_list.write().ok().unwrap();
+        let mut ran_ue_list = self.ran_ue_list.write().unwrap();
         if let Some(ran_ue) = ran_ue_list.get_mut(&ran_ue_id) {
             ran_ue.gnb_id = new_gnb_id;
             return true;
@@ -808,7 +811,7 @@ impl AmfContext {
         let amf_ue = AmfUe::new(id, ran_ue_id);
         amf_ue_list.insert(id, amf_ue.clone());
 
-        log::debug!("AMF UE added (id={})", id);
+        log::debug!("AMF UE added (id={id})");
         Some(amf_ue)
     }
 
@@ -831,7 +834,7 @@ impl AmfContext {
             // Remove all sessions for this UE
             self.sess_remove_all_for_ue(id);
 
-            log::debug!("AMF UE removed (id={})", id);
+            log::debug!("AMF UE removed (id={id})");
             return Some(amf_ue);
         }
         None
@@ -898,8 +901,8 @@ impl AmfContext {
 
     /// Set SUCI for an AMF UE
     pub fn amf_ue_set_suci(&self, id: u64, suci: &str) -> bool {
-        let mut amf_ue_list = self.amf_ue_list.write().ok().unwrap();
-        let mut suci_hash = self.suci_hash.write().ok().unwrap();
+        let mut amf_ue_list = self.amf_ue_list.write().unwrap();
+        let mut suci_hash = self.suci_hash.write().unwrap();
 
         if let Some(amf_ue) = amf_ue_list.get_mut(&id) {
             // Remove old SUCI from hash
@@ -916,8 +919,8 @@ impl AmfContext {
 
     /// Set SUPI for an AMF UE
     pub fn amf_ue_set_supi(&self, id: u64, supi: &str) -> bool {
-        let mut amf_ue_list = self.amf_ue_list.write().ok().unwrap();
-        let mut supi_hash = self.supi_hash.write().ok().unwrap();
+        let mut amf_ue_list = self.amf_ue_list.write().unwrap();
+        let mut supi_hash = self.supi_hash.write().unwrap();
 
         if let Some(amf_ue) = amf_ue_list.get_mut(&id) {
             // Remove old SUPI from hash
@@ -934,8 +937,8 @@ impl AmfContext {
 
     /// Update GUTI for an AMF UE
     pub fn amf_ue_update_guti(&self, id: u64, guti: &Guti5gs) -> bool {
-        let mut amf_ue_list = self.amf_ue_list.write().ok().unwrap();
-        let mut guti_ue_hash = self.guti_ue_hash.write().ok().unwrap();
+        let mut amf_ue_list = self.amf_ue_list.write().unwrap();
+        let mut guti_ue_hash = self.guti_ue_hash.write().unwrap();
 
         if let Some(amf_ue) = amf_ue_list.get_mut(&id) {
             // Remove old GUTI from hash
@@ -950,7 +953,7 @@ impl AmfContext {
 
     /// Update AMF UE in the context
     pub fn amf_ue_update(&self, amf_ue: &AmfUe) -> bool {
-        let mut amf_ue_list = self.amf_ue_list.write().ok().unwrap();
+        let mut amf_ue_list = self.amf_ue_list.write().unwrap();
         if let Some(existing) = amf_ue_list.get_mut(&amf_ue.id) {
             *existing = amf_ue.clone();
             return true;
@@ -960,8 +963,8 @@ impl AmfContext {
 
     /// Associate AMF UE with RAN UE
     pub fn amf_ue_associate_ran_ue(&self, amf_ue_id: u64, ran_ue_id: u64) -> bool {
-        let mut amf_ue_list = self.amf_ue_list.write().ok().unwrap();
-        let mut ran_ue_list = self.ran_ue_list.write().ok().unwrap();
+        let mut amf_ue_list = self.amf_ue_list.write().unwrap();
+        let mut ran_ue_list = self.ran_ue_list.write().unwrap();
 
         if let (Some(amf_ue), Some(ran_ue)) = (amf_ue_list.get_mut(&amf_ue_id), ran_ue_list.get_mut(&ran_ue_id)) {
             amf_ue.ran_ue_id = ran_ue_id;
@@ -973,8 +976,8 @@ impl AmfContext {
 
     /// Deassociate AMF UE from RAN UE
     pub fn amf_ue_deassociate_ran_ue(&self, amf_ue_id: u64, ran_ue_id: u64) -> bool {
-        let mut amf_ue_list = self.amf_ue_list.write().ok().unwrap();
-        let mut ran_ue_list = self.ran_ue_list.write().ok().unwrap();
+        let mut amf_ue_list = self.amf_ue_list.write().unwrap();
+        let mut ran_ue_list = self.ran_ue_list.write().unwrap();
 
         if let Some(amf_ue) = amf_ue_list.get_mut(&amf_ue_id) {
             amf_ue.ran_ue_id = OGS_INVALID_POOL_ID;
@@ -1007,7 +1010,7 @@ impl AmfContext {
         let sess = AmfSess::new(id, amf_ue_id, psi);
         sess_list.insert(id, sess.clone());
 
-        log::debug!("[ue_id={}, psi={}] AMF session added (id={})", amf_ue_id, psi, id);
+        log::debug!("[ue_id={amf_ue_id}, psi={psi}] AMF session added (id={id})");
         Some(sess)
     }
 
@@ -1062,7 +1065,7 @@ impl AmfContext {
 
     /// Update session in the context
     pub fn sess_update(&self, sess: &AmfSess) -> bool {
-        let mut sess_list = self.sess_list.write().ok().unwrap();
+        let mut sess_list = self.sess_list.write().unwrap();
         if let Some(existing) = sess_list.get_mut(&sess.id) {
             *existing = sess.clone();
             return true;
@@ -1077,7 +1080,7 @@ impl AmfContext {
 
     /// Get sessions for an AMF UE
     pub fn sess_list_for_ue(&self, amf_ue_id: u64) -> Vec<AmfSess> {
-        let sess_list = self.sess_list.read().ok().unwrap();
+        let sess_list = self.sess_list.read().unwrap();
         sess_list
             .values()
             .filter(|sess| sess.amf_ue_id == amf_ue_id)
@@ -1086,12 +1089,99 @@ impl AmfContext {
     }
 
     // ========================================================================
+    // Paging Management (TS 23.502 4.2.3.3)
+    // ========================================================================
+
+    /// Initiate paging for a UE in CM-IDLE state
+    pub fn paging_add(&self, ctx: PagingContext) -> bool {
+        if let Ok(mut paging_map) = self.paging_map.write() {
+            let id = ctx.amf_ue_ngap_id;
+            log::info!(
+                "[UE NGAP ID: {}] Paging initiated (TMSI: 0x{:08x}, TAC: {})",
+                id, ctx.tmsi, ctx.tac
+            );
+            paging_map.insert(id, ctx);
+            return true;
+        }
+        false
+    }
+
+    /// Cancel paging for a UE (e.g., Service Request received)
+    pub fn paging_remove(&self, amf_ue_ngap_id: u64) -> Option<PagingContext> {
+        if let Ok(mut paging_map) = self.paging_map.write() {
+            if let Some(ctx) = paging_map.remove(&amf_ue_ngap_id) {
+                log::info!(
+                    "[UE NGAP ID: {}] Paging cancelled (retransmit_count: {})",
+                    amf_ue_ngap_id, ctx.retransmit_count
+                );
+                return Some(ctx);
+            }
+        }
+        None
+    }
+
+    /// Get paging context for a UE
+    pub fn paging_find(&self, amf_ue_ngap_id: u64) -> Option<PagingContext> {
+        if let Ok(paging_map) = self.paging_map.read() {
+            return paging_map.get(&amf_ue_ngap_id).cloned();
+        }
+        None
+    }
+
+    /// Increment retransmit count, returns false if max reached
+    pub fn paging_retransmit(&self, amf_ue_ngap_id: u64) -> bool {
+        if let Ok(mut paging_map) = self.paging_map.write() {
+            if let Some(ctx) = paging_map.get_mut(&amf_ue_ngap_id) {
+                if ctx.retransmit_count >= ctx.max_retransmit {
+                    log::warn!(
+                        "[UE NGAP ID: {}] Paging max retransmissions ({}) reached",
+                        amf_ue_ngap_id, ctx.max_retransmit
+                    );
+                    return false;
+                }
+                ctx.retransmit_count += 1;
+                log::debug!(
+                    "[UE NGAP ID: {}] Paging retransmit {}/{}",
+                    amf_ue_ngap_id, ctx.retransmit_count, ctx.max_retransmit
+                );
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Process paging timeout - remove expired entries (> 10s default)
+    pub fn paging_expire(&self, timeout_secs: u64) -> Vec<PagingContext> {
+        let mut expired = Vec::new();
+        if let Ok(mut paging_map) = self.paging_map.write() {
+            let now = std::time::Instant::now();
+            paging_map.retain(|id, ctx| {
+                if now.duration_since(ctx.initiated_at).as_secs() > timeout_secs {
+                    log::warn!(
+                        "[UE NGAP ID: {id}] Paging expired after {timeout_secs}s"
+                    );
+                    expired.push(ctx.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        expired
+    }
+
+    /// Get number of active paging entries
+    pub fn paging_count(&self) -> usize {
+        self.paging_map.read().map(|m| m.len()).unwrap_or(0)
+    }
+
+    // ========================================================================
     // Utility Methods
     // ========================================================================
 
     /// Get UE load percentage
     pub fn get_ue_load(&self) -> i32 {
-        let amf_ue_list = self.amf_ue_list.read().ok().unwrap();
+        let amf_ue_list = self.amf_ue_list.read().unwrap();
         let used = amf_ue_list.len();
         let total = self.max_num_of_ue;
         if total == 0 {
@@ -1623,6 +1713,279 @@ pub struct UrspPolicyRule {
     pub preferred_dnn: Option<String>,
 }
 
+// ============================================================================
+// Rel-17 SNPN Authentication (TS 23.501, TS 33.501)
+// ============================================================================
+
+/// SNPN Authentication Context
+#[derive(Debug, Clone, Default)]
+pub struct SnpnAuthContext {
+    /// NID (Network Identifier) - identifies the SNPN
+    pub nid: String,
+    /// Subscription credentials for SNPN authentication
+    pub subscription_credentials: Option<SnpnSubscriptionCredentials>,
+    /// Onboarding state
+    pub onboarding_state: SnpnOnboardingState,
+    /// Timestamp of last authentication
+    pub last_auth_time: u64,
+}
+
+/// SNPN subscription credentials
+#[derive(Debug, Clone, Default)]
+pub struct SnpnSubscriptionCredentials {
+    /// K (128-bit authentication key)
+    pub k: [u8; 16],
+    /// OPc (128-bit operator variant key)
+    pub opc: [u8; 16],
+    /// AMF value (2 bytes)
+    pub amf: [u8; 2],
+    /// SQN (6 bytes)
+    pub sqn: [u8; 6],
+}
+
+/// SNPN onboarding state
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SnpnOnboardingState {
+    /// Not onboarded
+    #[default]
+    NotOnboarded,
+    /// Onboarding in progress
+    OnboardingInProgress,
+    /// Onboarded (credentials provisioned)
+    Onboarded,
+    /// Onboarding failed
+    OnboardingFailed,
+}
+
+impl AmfUe {
+    /// Start SNPN-specific authentication
+    /// Returns true if SNPN authentication should proceed
+    pub fn start_snpn_auth(&mut self, nid: &str) -> bool {
+        if self.snpn_nid.is_none() {
+            self.snpn_nid = Some(nid.to_string());
+            log::info!(
+                "[SNPN Auth] Starting SNPN authentication for UE with NID={nid}"
+            );
+            return true;
+        }
+        false
+    }
+
+    /// Handle SNPN onboarding process
+    /// This provisions initial credentials for a new SNPN UE
+    pub fn handle_snpn_onboarding(&mut self, nid: &str, _credentials: SnpnSubscriptionCredentials) -> bool {
+        self.snpn_nid = Some(nid.to_string());
+        log::info!(
+            "[SNPN Onboarding] Provisioning credentials for UE in SNPN NID={nid}"
+        );
+        // In production, this would contact DCS (Default Credential Server)
+        // and provision initial K/OPc for the UE
+        true
+    }
+
+    /// Validate NID (Network Identifier) against allowed SNPN list
+    pub fn validate_nid(&self, nid: &str, allowed_nids: &[String]) -> bool {
+        if allowed_nids.is_empty() {
+            // If no NID restriction, accept all
+            return true;
+        }
+        allowed_nids.iter().any(|allowed| allowed == nid)
+    }
+}
+
+// ============================================================================
+// Rel-18 UAV Support (TS 23.256)
+// ============================================================================
+
+/// UAV Authorization Status
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UavAuthorizationStatus {
+    /// Not authorized
+    #[default]
+    NotAuthorized,
+    /// Authorized for flight
+    Authorized,
+    /// Authorization revoked
+    Revoked,
+    /// Authorization pending
+    Pending,
+}
+
+/// UAV Flight Path Point
+#[derive(Debug, Clone, Default)]
+pub struct UavFlightPathPoint {
+    /// Latitude (decimal degrees)
+    pub latitude: f64,
+    /// Longitude (decimal degrees)
+    pub longitude: f64,
+    /// Altitude (meters)
+    pub altitude: f64,
+    /// Timestamp when this point should be reached
+    pub timestamp: u64,
+}
+
+/// UAV Geofence Violation Type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UavGeofenceViolation {
+    /// Altitude exceeded
+    AltitudeExceeded,
+    /// Outside permitted area
+    OutsidePermittedArea,
+    /// Flight path deviation
+    FlightPathDeviation,
+    /// Time constraint violation
+    TimeConstraintViolation,
+}
+
+/// UAV Authorization Context (per TS 23.256)
+#[derive(Debug, Clone, Default)]
+pub struct UavAuthorizationContext {
+    /// UAV ID (UAVID from CAA - Civil Aviation Authority)
+    pub uav_id: Option<String>,
+    /// CAA-level UAV identifier
+    pub caa_level_id: Option<String>,
+    /// UAV serial number
+    pub serial_number: Option<String>,
+    /// Authorization status
+    pub authorization_status: UavAuthorizationStatus,
+    /// Authorized flight path (sequence of waypoints)
+    pub flight_path: Vec<UavFlightPathPoint>,
+    /// Geofence constraints (min/max altitude, permitted area)
+    pub min_altitude: f64,
+    pub max_altitude: f64,
+    /// Permitted latitude range
+    pub min_latitude: f64,
+    pub max_latitude: f64,
+    /// Permitted longitude range
+    pub min_longitude: f64,
+    pub max_longitude: f64,
+    /// Flight authorization start time
+    pub auth_start_time: u64,
+    /// Flight authorization end time
+    pub auth_end_time: u64,
+    /// Last reported position
+    pub last_latitude: f64,
+    pub last_longitude: f64,
+    pub last_altitude: f64,
+    pub last_position_time: u64,
+    /// Geofence violations detected
+    pub violations: Vec<UavGeofenceViolation>,
+}
+
+impl UavAuthorizationContext {
+    /// Create a new UAV authorization context
+    pub fn new(uav_id: &str, serial_number: &str) -> Self {
+        Self {
+            uav_id: Some(uav_id.to_string()),
+            serial_number: Some(serial_number.to_string()),
+            authorization_status: UavAuthorizationStatus::NotAuthorized,
+            flight_path: Vec::new(),
+            min_altitude: 0.0,
+            max_altitude: 120.0, // Default 120m per regulations
+            min_latitude: -90.0,
+            max_latitude: 90.0,
+            min_longitude: -180.0,
+            max_longitude: 180.0,
+            auth_start_time: 0,
+            auth_end_time: 0,
+            last_latitude: 0.0,
+            last_longitude: 0.0,
+            last_altitude: 0.0,
+            last_position_time: 0,
+            violations: Vec::new(),
+            caa_level_id: None,
+        }
+    }
+
+    /// Grant UAV authorization
+    pub fn grant_authorization(&mut self, start_time: u64, end_time: u64) {
+        self.authorization_status = UavAuthorizationStatus::Authorized;
+        self.auth_start_time = start_time;
+        self.auth_end_time = end_time;
+        log::info!(
+            "[UAV Auth] Authorization granted for UAV ID {:?} from {} to {}",
+            self.uav_id,
+            start_time,
+            end_time
+        );
+    }
+
+    /// Revoke UAV authorization
+    pub fn revoke_authorization(&mut self, reason: &str) {
+        self.authorization_status = UavAuthorizationStatus::Revoked;
+        log::warn!(
+            "[UAV Auth] Authorization revoked for UAV ID {:?}: {}",
+            self.uav_id,
+            reason
+        );
+    }
+
+    /// Update UAV position and check geofence violations
+    pub fn update_position(&mut self, latitude: f64, longitude: f64, altitude: f64, timestamp: u64) -> bool {
+        self.last_latitude = latitude;
+        self.last_longitude = longitude;
+        self.last_altitude = altitude;
+        self.last_position_time = timestamp;
+
+        let mut violation_detected = false;
+
+        // Check altitude constraints
+        if altitude > self.max_altitude {
+            log::warn!(
+                "[UAV Tracking] Altitude violation: {:.1}m > {:.1}m for UAV {:?}",
+                altitude,
+                self.max_altitude,
+                self.uav_id
+            );
+            self.violations.push(UavGeofenceViolation::AltitudeExceeded);
+            violation_detected = true;
+        }
+
+        // Check geographic constraints
+        if latitude < self.min_latitude || latitude > self.max_latitude
+            || longitude < self.min_longitude || longitude > self.max_longitude
+        {
+            log::warn!(
+                "[UAV Tracking] Geofence violation: ({:.6}, {:.6}) outside permitted area for UAV {:?}",
+                latitude,
+                longitude,
+                self.uav_id
+            );
+            self.violations.push(UavGeofenceViolation::OutsidePermittedArea);
+            violation_detected = true;
+        }
+
+        !violation_detected
+    }
+
+    /// Set geofence boundaries
+    pub fn set_geofence(&mut self, min_lat: f64, max_lat: f64, min_lon: f64, max_lon: f64, min_alt: f64, max_alt: f64) {
+        self.min_latitude = min_lat;
+        self.max_latitude = max_lat;
+        self.min_longitude = min_lon;
+        self.max_longitude = max_lon;
+        self.min_altitude = min_alt;
+        self.max_altitude = max_alt;
+    }
+
+    /// Add waypoint to flight path
+    pub fn add_flight_waypoint(&mut self, latitude: f64, longitude: f64, altitude: f64, timestamp: u64) {
+        self.flight_path.push(UavFlightPathPoint {
+            latitude,
+            longitude,
+            altitude,
+            timestamp,
+        });
+    }
+
+    /// Check if currently authorized
+    pub fn is_authorized(&self, current_time: u64) -> bool {
+        self.authorization_status == UavAuthorizationStatus::Authorized
+            && current_time >= self.auth_start_time
+            && current_time <= self.auth_end_time
+    }
+}
+
 /// Reference to an AMF session (for PDU session status)
 #[derive(Debug, Clone, Default)]
 pub struct AmfSessRef {
@@ -1862,6 +2225,54 @@ impl Default for AmfUe {
 // ============================================================================
 // AmfSess - PDU Session Context
 // ============================================================================
+
+/// Paging context for tracking UEs awaiting paging response (TS 23.502 4.2.3.3)
+#[derive(Debug, Clone)]
+pub struct PagingContext {
+    /// UE NGAP ID (AMF-side)
+    pub amf_ue_ngap_id: u64,
+    /// 5G-S-TMSI for paging
+    pub tmsi: u32,
+    /// AMF Set ID for paging identity
+    pub amf_set_id: u16,
+    /// AMF Pointer for paging identity
+    pub amf_pointer: u8,
+    /// PLMN for paging area
+    pub plmn_id: PlmnId,
+    /// TAC for paging area
+    pub tac: u32,
+    /// Timestamp when paging was initiated
+    pub initiated_at: std::time::Instant,
+    /// Number of paging retransmissions
+    pub retransmit_count: u8,
+    /// Maximum retransmissions before giving up
+    pub max_retransmit: u8,
+    /// Pending N1 message to deliver after paging response
+    pub pending_n1: Option<Vec<u8>>,
+    /// Pending N2 info to deliver after paging response
+    pub pending_n2: Option<Vec<u8>>,
+    /// PDU session ID that triggered paging
+    pub pdu_session_id: Option<u8>,
+}
+
+impl Default for PagingContext {
+    fn default() -> Self {
+        Self {
+            amf_ue_ngap_id: 0,
+            tmsi: 0,
+            amf_set_id: 0,
+            amf_pointer: 0,
+            plmn_id: PlmnId::default(),
+            tac: 0,
+            initiated_at: std::time::Instant::now(),
+            retransmit_count: 0,
+            max_retransmit: 4,
+            pending_n1: None,
+            pending_n2: None,
+            pdu_session_id: None,
+        }
+    }
+}
 
 /// Session paging info
 #[derive(Debug, Clone, Default)]
@@ -2305,5 +2716,50 @@ mod tests {
 
         sess.clear_session_context();
         assert!(!sess.session_context_in_smf());
+    }
+
+    #[test]
+    fn test_paging_add_find_remove() {
+        let mut ctx = AmfContext::new();
+        ctx.init(64, 1024, 4096);
+
+        let paging = PagingContext {
+            amf_ue_ngap_id: 42,
+            tmsi: 0xDEADBEEF,
+            amf_set_id: 1,
+            amf_pointer: 0,
+            plmn_id: PlmnId::new("001", "01"),
+            tac: 7,
+            ..Default::default()
+        };
+
+        assert!(ctx.paging_add(paging));
+        assert_eq!(ctx.paging_count(), 1);
+
+        let found = ctx.paging_find(42);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().tmsi, 0xDEADBEEF);
+
+        let removed = ctx.paging_remove(42);
+        assert!(removed.is_some());
+        assert_eq!(ctx.paging_count(), 0);
+    }
+
+    #[test]
+    fn test_paging_retransmit_limit() {
+        let mut ctx = AmfContext::new();
+        ctx.init(64, 1024, 4096);
+
+        let paging = PagingContext {
+            amf_ue_ngap_id: 10,
+            tmsi: 0x1234,
+            max_retransmit: 2,
+            ..Default::default()
+        };
+        ctx.paging_add(paging);
+
+        assert!(ctx.paging_retransmit(10)); // 1/2
+        assert!(ctx.paging_retransmit(10)); // 2/2
+        assert!(!ctx.paging_retransmit(10)); // exceeded
     }
 }

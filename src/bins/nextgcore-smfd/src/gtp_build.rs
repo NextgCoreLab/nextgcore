@@ -208,6 +208,7 @@ pub mod gtp2_ie_type {
 /// GTPv2-C Cause values (3GPP TS 29.274)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum Gtp2Cause {
     // Request / Initial message
     LocalDetach = 2,
@@ -224,6 +225,7 @@ pub enum Gtp2Cause {
     EpsToS5S8NotAllowed = 13,
     RequestTimedOut = 14,
     UnableToPageUe = 15,
+    #[default]
     RequestAccepted = 16,
     RequestAcceptedPartially = 17,
     NewPdnTypeDueToNetworkPreference = 18,
@@ -423,11 +425,6 @@ pub enum Gtp2Cause {
     UndefinedValue = 0,
 }
 
-impl Default for Gtp2Cause {
-    fn default() -> Self {
-        Gtp2Cause::RequestAccepted
-    }
-}
 
 impl From<u8> for Gtp2Cause {
     fn from(value: u8) -> Self {

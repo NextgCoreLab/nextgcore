@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
                 log::debug!("Configuration file loaded ({} bytes)", content.len());
             }
             Err(e) => {
-                log::warn!("Failed to read configuration file: {}", e);
+                log::warn!("Failed to read configuration file: {e}");
             }
         }
     } else {
@@ -143,9 +143,9 @@ async fn main() -> Result<()> {
     let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
 
     sbi_server.start(udm_sbi_request_handler).await
-        .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
-    log::info!("SBI HTTP/2 server listening on {}", sbi_addr);
+    log::info!("SBI HTTP/2 server listening on {sbi_addr}");
     log::info!("NextGCore UDM ready");
 
     // Main event loop (async)
@@ -156,7 +156,7 @@ async fn main() -> Result<()> {
 
     // Stop SBI server
     sbi_server.stop().await
-        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
     log::info!("SBI HTTP/2 server stopped");
 
     // Close legacy SBI server
@@ -180,7 +180,7 @@ async fn udm_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
 
-    log::debug!("UDM SBI request: {} {}", method, uri);
+    log::debug!("UDM SBI request: {method} {uri}");
 
     // Parse the URI path
     let path = uri.split('?').next().unwrap_or(uri);
@@ -277,7 +277,7 @@ async fn udm_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         }
 
         _ => {
-            log::warn!("Unknown UDM request: {} {}", method, uri);
+            log::warn!("Unknown UDM request: {method} {uri}");
             send_method_not_allowed(method, uri)
         }
     }
@@ -286,7 +286,7 @@ async fn udm_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 // UE Context Management handlers
 
 async fn handle_amf_registration(supi: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("AMF Registration: SUPI={}", supi);
+    log::info!("AMF Registration: SUPI={supi}");
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -295,7 +295,7 @@ async fn handle_amf_registration(supi: &str, request: &SbiRequest) -> SbiRespons
 
     let reg_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
     // Store AMF registration in context
@@ -305,7 +305,7 @@ async fn handle_amf_registration(supi: &str, request: &SbiRequest) -> SbiRespons
     }
 
     SbiResponse::with_status(201)
-        .with_header("Location", &format!("/nudm-uecm/v1/{}/registrations/amf-3gpp-access", supi))
+        .with_header("Location", format!("/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access"))
         .with_json_body(&serde_json::json!({
             "amfInstanceId": reg_data.get("amfInstanceId"),
             "deregCallbackUri": reg_data.get("deregCallbackUri"),
@@ -316,7 +316,7 @@ async fn handle_amf_registration(supi: &str, request: &SbiRequest) -> SbiRespons
 }
 
 async fn handle_amf_registration_update(supi: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("AMF Registration Update: SUPI={}", supi);
+    log::info!("AMF Registration Update: SUPI={supi}");
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -325,14 +325,14 @@ async fn handle_amf_registration_update(supi: &str, request: &SbiRequest) -> Sbi
 
     let _update_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
     SbiResponse::with_status(204)
 }
 
 async fn handle_amf_deregistration(supi: &str) -> SbiResponse {
-    log::info!("AMF Deregistration: SUPI={}", supi);
+    log::info!("AMF Deregistration: SUPI={supi}");
 
     let ctx = udm_self();
     if let Ok(context) = ctx.read() {
@@ -345,7 +345,7 @@ async fn handle_amf_deregistration(supi: &str) -> SbiResponse {
 }
 
 async fn handle_smf_registration(supi: &str, pdu_session_id: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("SMF Registration: SUPI={}, PDU Session={}", supi, pdu_session_id);
+    log::info!("SMF Registration: SUPI={supi}, PDU Session={pdu_session_id}");
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -354,11 +354,11 @@ async fn handle_smf_registration(supi: &str, pdu_session_id: &str, request: &Sbi
 
     let reg_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
     SbiResponse::with_status(201)
-        .with_header("Location", &format!("/nudm-uecm/v1/{}/registrations/smf-registrations/{}", supi, pdu_session_id))
+        .with_header("Location", format!("/nudm-uecm/v1/{supi}/registrations/smf-registrations/{pdu_session_id}"))
         .with_json_body(&serde_json::json!({
             "smfInstanceId": reg_data.get("smfInstanceId"),
             "pduSessionId": pdu_session_id,
@@ -369,14 +369,14 @@ async fn handle_smf_registration(supi: &str, pdu_session_id: &str, request: &Sbi
 }
 
 async fn handle_smf_deregistration(supi: &str, pdu_session_id: &str) -> SbiResponse {
-    log::info!("SMF Deregistration: SUPI={}, PDU Session={}", supi, pdu_session_id);
+    log::info!("SMF Deregistration: SUPI={supi}, PDU Session={pdu_session_id}");
     SbiResponse::with_status(204)
 }
 
 // Subscriber Data Management handlers
 
 async fn handle_get_am_data(supi: &str, _request: &SbiRequest) -> SbiResponse {
-    log::info!("Get AM Data: SUPI={}", supi);
+    log::info!("Get AM Data: SUPI={supi}");
 
     // Query UDR for provisioned access and mobility data
     match nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get(supi, "am-data", 0, 0).await {
@@ -393,14 +393,14 @@ async fn handle_get_am_data(supi: &str, _request: &SbiRequest) -> SbiResponse {
             SbiResponse::with_status(udr_response.status)
         }
         Err(e) => {
-            log::warn!("[{}] UDR am-data query failed: {}", supi, e);
+            log::warn!("[{supi}] UDR am-data query failed: {e}");
             ogs_sbi::server::send_service_unavailable("UDR unavailable")
         }
     }
 }
 
 async fn handle_get_smf_select_data(supi: &str, _request: &SbiRequest) -> SbiResponse {
-    log::info!("Get SMF Select Data: SUPI={}", supi);
+    log::info!("Get SMF Select Data: SUPI={supi}");
 
     // Query UDR for SMF selection subscription data
     match nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get(supi, "smf-selection-subscription-data", 0, 0).await {
@@ -416,7 +416,7 @@ async fn handle_get_smf_select_data(supi: &str, _request: &SbiRequest) -> SbiRes
             SbiResponse::with_status(udr_response.status)
         }
         Err(e) => {
-            log::warn!("[{}] UDR smf-select query failed: {}", supi, e);
+            log::warn!("[{supi}] UDR smf-select query failed: {e}");
             ogs_sbi::server::send_service_unavailable("UDR unavailable")
         }
     }
@@ -427,7 +427,7 @@ async fn handle_get_sm_data(supi: &str, request: &SbiRequest) -> SbiResponse {
         .map(|s| s.as_str())
         .unwrap_or("internet");
 
-    log::info!("Get SM Data: SUPI={}, DNN={}", supi, dnn);
+    log::info!("Get SM Data: SUPI={supi}, DNN={dnn}");
 
     // Query UDR for session management subscription data
     match nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get(supi, "sm-data", 0, 0).await {
@@ -443,14 +443,14 @@ async fn handle_get_sm_data(supi: &str, request: &SbiRequest) -> SbiResponse {
             SbiResponse::with_status(udr_response.status)
         }
         Err(e) => {
-            log::warn!("[{}] UDR sm-data query failed: {}", supi, e);
+            log::warn!("[{supi}] UDR sm-data query failed: {e}");
             ogs_sbi::server::send_service_unavailable("UDR unavailable")
         }
     }
 }
 
 async fn handle_get_nssai(supi: &str, _request: &SbiRequest) -> SbiResponse {
-    log::info!("Get NSSAI: SUPI={}", supi);
+    log::info!("Get NSSAI: SUPI={supi}");
 
     // Query UDR for am-data which contains NSSAI
     match nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get(supi, "am-data", 0, 0).await {
@@ -472,14 +472,14 @@ async fn handle_get_nssai(supi: &str, _request: &SbiRequest) -> SbiResponse {
             SbiResponse::with_status(udr_response.status)
         }
         Err(e) => {
-            log::warn!("[{}] UDR nssai query failed: {}", supi, e);
+            log::warn!("[{supi}] UDR nssai query failed: {e}");
             ogs_sbi::server::send_service_unavailable("UDR unavailable")
         }
     }
 }
 
 async fn handle_sdm_subscribe(supi: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("SDM Subscribe: SUPI={}", supi);
+    log::info!("SDM Subscribe: SUPI={supi}");
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -488,13 +488,13 @@ async fn handle_sdm_subscribe(supi: &str, request: &SbiRequest) -> SbiResponse {
 
     let sub_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
     let subscription_id = uuid::Uuid::new_v4().to_string();
 
     SbiResponse::with_status(201)
-        .with_header("Location", &format!("/nudm-sdm/v1/{}/sdm-subscriptions/{}", supi, subscription_id))
+        .with_header("Location", format!("/nudm-sdm/v1/{supi}/sdm-subscriptions/{subscription_id}"))
         .with_json_body(&serde_json::json!({
             "subscriptionId": subscription_id,
             "nfInstanceId": sub_data.get("nfInstanceId"),
@@ -505,14 +505,14 @@ async fn handle_sdm_subscribe(supi: &str, request: &SbiRequest) -> SbiResponse {
 }
 
 async fn handle_sdm_unsubscribe(supi: &str, subscription_id: &str) -> SbiResponse {
-    log::info!("SDM Unsubscribe: SUPI={}, subscriptionId={}", supi, subscription_id);
+    log::info!("SDM Unsubscribe: SUPI={supi}, subscriptionId={subscription_id}");
     SbiResponse::with_status(204)
 }
 
 // UE Authentication handlers
 
 async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("Generate Auth Data: SUPI={}", supi);
+    log::info!("Generate Auth Data: SUPI={supi}");
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -521,14 +521,14 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
 
     let auth_info: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
     let serving_network_name = auth_info.get("servingNetworkName")
         .and_then(|v| v.as_str())
         .unwrap_or("5G:mnc001.mcc001.3gppnetwork.org");
 
-    log::info!("Generate Auth Data: SNN={}", serving_network_name);
+    log::info!("Generate Auth Data: SNN={serving_network_name}");
 
     // Step 1: Query UDR for authentication subscription data
     let udr_response = match nextgcore_udmd::udm_nudr_dr_send_auth_subscription_get(supi, 0, 0).await {
@@ -538,7 +538,7 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
             return ogs_sbi::server::send_service_unavailable("UDR query failed");
         }
         Err(e) => {
-            log::error!("[{}] UDR auth subscription query failed: {}", supi, e);
+            log::error!("[{supi}] UDR auth subscription query failed: {e}");
             return ogs_sbi::server::send_service_unavailable("UDR unavailable");
         }
     };
@@ -548,7 +548,7 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
         .and_then(|b| serde_json::from_str(b).ok()) {
         Some(v) => v,
         None => {
-            log::error!("[{}] Failed to parse UDR auth subscription response", supi);
+            log::error!("[{supi}] Failed to parse UDR auth subscription response");
             return send_bad_request("Invalid UDR response", None);
         }
     };
@@ -557,9 +557,13 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
     let mut ue = {
         let ctx = udm_self();
         let context = ctx.read().unwrap();
-        let ue = context.ue_find_by_supi(supi)
-            .or_else(|| context.ue_add(supi))
-            .unwrap();
+        let ue = match context.ue_find_by_supi(supi).or_else(|| context.ue_add(supi)) {
+            Some(ue) => ue,
+            None => {
+                log::error!("[{supi}] Failed to create/find UE in context");
+                return ogs_sbi::server::send_service_unavailable("UE context creation failed");
+            }
+        };
         ue.clone()
     };
 
@@ -602,7 +606,7 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
     ) {
         Ok(result) => result,
         Err(e) => {
-            log::error!("[{}] Milenage generate failed: {:?}", supi, e);
+            log::error!("[{supi}] Milenage generate failed: {e:?}");
             return ogs_sbi::server::send_internal_error("Milenage computation failed");
         }
     };
@@ -625,7 +629,7 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
         v
     };
     let new_sqn = (sqn_val + 32 + 1) & 0xFFFFFFFFFFFF;
-    let new_sqn_hex = format!("{:012x}", new_sqn);
+    let new_sqn_hex = format!("{new_sqn:012x}");
     let _ = nextgcore_udmd::udm_nudr_dr_send_auth_subscription_patch(
         supi, &new_sqn_hex, 0, 0,
     ).await;
@@ -647,7 +651,7 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
 }
 
 async fn handle_auth_event(supi: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("Auth Event: SUPI={}", supi);
+    log::info!("Auth Event: SUPI={supi}");
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -656,14 +660,14 @@ async fn handle_auth_event(supi: &str, request: &SbiRequest) -> SbiResponse {
 
     let auth_event: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {}", e), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
     let success = auth_event.get("success")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    log::info!("Auth Event: success={}", success);
+    log::info!("Auth Event: success={success}");
 
     SbiResponse::with_status(201)
         .with_json_body(&serde_json::json!({

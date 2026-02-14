@@ -23,7 +23,7 @@ fn main() -> Result<()> {
 
     // Initialize GTP-U subsystem
     if let Err(e) = gtp_path::gtp_init() {
-        log::error!("Failed to initialize GTP-U: {}", e);
+        log::error!("Failed to initialize GTP-U: {e}");
         return Err(anyhow::anyhow!("GTP-U init failed"));
     }
 
@@ -34,17 +34,17 @@ fn main() -> Result<()> {
     // Dispatch entry event to transition to operational state
     let entry_event = event::SgwuEvent::entry();
     let result = sgwu_sm.dispatch(&entry_event);
-    log::info!("SGWU state machine result: {:?}", result);
+    log::info!("SGWU state machine result: {result:?}");
 
     // Open PFCP server sockets
     if let Err(e) = pfcp_path::pfcp_open() {
-        log::error!("Failed to open PFCP sockets: {}", e);
+        log::error!("Failed to open PFCP sockets: {e}");
         return Err(anyhow::anyhow!("PFCP open failed"));
     }
 
     // Open GTP-U server sockets
     if let Err(e) = gtp_path::gtp_open() {
-        log::error!("Failed to open GTP-U sockets: {}", e);
+        log::error!("Failed to open GTP-U sockets: {e}");
         return Err(anyhow::anyhow!("GTP-U open failed"));
     }
 
