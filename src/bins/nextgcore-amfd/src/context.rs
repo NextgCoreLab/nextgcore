@@ -1793,6 +1793,199 @@ impl AmfUe {
     }
 }
 
+// ============================================================================
+// Rel-18 UAV Support (TS 23.256)
+// ============================================================================
+
+/// UAV Authorization Status
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UavAuthorizationStatus {
+    /// Not authorized
+    #[default]
+    NotAuthorized,
+    /// Authorized for flight
+    Authorized,
+    /// Authorization revoked
+    Revoked,
+    /// Authorization pending
+    Pending,
+}
+
+/// UAV Flight Path Point
+#[derive(Debug, Clone, Default)]
+pub struct UavFlightPathPoint {
+    /// Latitude (decimal degrees)
+    pub latitude: f64,
+    /// Longitude (decimal degrees)
+    pub longitude: f64,
+    /// Altitude (meters)
+    pub altitude: f64,
+    /// Timestamp when this point should be reached
+    pub timestamp: u64,
+}
+
+/// UAV Geofence Violation Type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UavGeofenceViolation {
+    /// Altitude exceeded
+    AltitudeExceeded,
+    /// Outside permitted area
+    OutsidePermittedArea,
+    /// Flight path deviation
+    FlightPathDeviation,
+    /// Time constraint violation
+    TimeConstraintViolation,
+}
+
+/// UAV Authorization Context (per TS 23.256)
+#[derive(Debug, Clone, Default)]
+pub struct UavAuthorizationContext {
+    /// UAV ID (UAVID from CAA - Civil Aviation Authority)
+    pub uav_id: Option<String>,
+    /// CAA-level UAV identifier
+    pub caa_level_id: Option<String>,
+    /// UAV serial number
+    pub serial_number: Option<String>,
+    /// Authorization status
+    pub authorization_status: UavAuthorizationStatus,
+    /// Authorized flight path (sequence of waypoints)
+    pub flight_path: Vec<UavFlightPathPoint>,
+    /// Geofence constraints (min/max altitude, permitted area)
+    pub min_altitude: f64,
+    pub max_altitude: f64,
+    /// Permitted latitude range
+    pub min_latitude: f64,
+    pub max_latitude: f64,
+    /// Permitted longitude range
+    pub min_longitude: f64,
+    pub max_longitude: f64,
+    /// Flight authorization start time
+    pub auth_start_time: u64,
+    /// Flight authorization end time
+    pub auth_end_time: u64,
+    /// Last reported position
+    pub last_latitude: f64,
+    pub last_longitude: f64,
+    pub last_altitude: f64,
+    pub last_position_time: u64,
+    /// Geofence violations detected
+    pub violations: Vec<UavGeofenceViolation>,
+}
+
+impl UavAuthorizationContext {
+    /// Create a new UAV authorization context
+    pub fn new(uav_id: &str, serial_number: &str) -> Self {
+        Self {
+            uav_id: Some(uav_id.to_string()),
+            serial_number: Some(serial_number.to_string()),
+            authorization_status: UavAuthorizationStatus::NotAuthorized,
+            flight_path: Vec::new(),
+            min_altitude: 0.0,
+            max_altitude: 120.0, // Default 120m per regulations
+            min_latitude: -90.0,
+            max_latitude: 90.0,
+            min_longitude: -180.0,
+            max_longitude: 180.0,
+            auth_start_time: 0,
+            auth_end_time: 0,
+            last_latitude: 0.0,
+            last_longitude: 0.0,
+            last_altitude: 0.0,
+            last_position_time: 0,
+            violations: Vec::new(),
+            caa_level_id: None,
+        }
+    }
+
+    /// Grant UAV authorization
+    pub fn grant_authorization(&mut self, start_time: u64, end_time: u64) {
+        self.authorization_status = UavAuthorizationStatus::Authorized;
+        self.auth_start_time = start_time;
+        self.auth_end_time = end_time;
+        log::info!(
+            "[UAV Auth] Authorization granted for UAV ID {:?} from {} to {}",
+            self.uav_id,
+            start_time,
+            end_time
+        );
+    }
+
+    /// Revoke UAV authorization
+    pub fn revoke_authorization(&mut self, reason: &str) {
+        self.authorization_status = UavAuthorizationStatus::Revoked;
+        log::warn!(
+            "[UAV Auth] Authorization revoked for UAV ID {:?}: {}",
+            self.uav_id,
+            reason
+        );
+    }
+
+    /// Update UAV position and check geofence violations
+    pub fn update_position(&mut self, latitude: f64, longitude: f64, altitude: f64, timestamp: u64) -> bool {
+        self.last_latitude = latitude;
+        self.last_longitude = longitude;
+        self.last_altitude = altitude;
+        self.last_position_time = timestamp;
+
+        let mut violation_detected = false;
+
+        // Check altitude constraints
+        if altitude > self.max_altitude {
+            log::warn!(
+                "[UAV Tracking] Altitude violation: {:.1}m > {:.1}m for UAV {:?}",
+                altitude,
+                self.max_altitude,
+                self.uav_id
+            );
+            self.violations.push(UavGeofenceViolation::AltitudeExceeded);
+            violation_detected = true;
+        }
+
+        // Check geographic constraints
+        if latitude < self.min_latitude || latitude > self.max_latitude
+            || longitude < self.min_longitude || longitude > self.max_longitude
+        {
+            log::warn!(
+                "[UAV Tracking] Geofence violation: ({:.6}, {:.6}) outside permitted area for UAV {:?}",
+                latitude,
+                longitude,
+                self.uav_id
+            );
+            self.violations.push(UavGeofenceViolation::OutsidePermittedArea);
+            violation_detected = true;
+        }
+
+        !violation_detected
+    }
+
+    /// Set geofence boundaries
+    pub fn set_geofence(&mut self, min_lat: f64, max_lat: f64, min_lon: f64, max_lon: f64, min_alt: f64, max_alt: f64) {
+        self.min_latitude = min_lat;
+        self.max_latitude = max_lat;
+        self.min_longitude = min_lon;
+        self.max_longitude = max_lon;
+        self.min_altitude = min_alt;
+        self.max_altitude = max_alt;
+    }
+
+    /// Add waypoint to flight path
+    pub fn add_flight_waypoint(&mut self, latitude: f64, longitude: f64, altitude: f64, timestamp: u64) {
+        self.flight_path.push(UavFlightPathPoint {
+            latitude,
+            longitude,
+            altitude,
+            timestamp,
+        });
+    }
+
+    /// Check if currently authorized
+    pub fn is_authorized(&self, current_time: u64) -> bool {
+        self.authorization_status == UavAuthorizationStatus::Authorized
+            && current_time >= self.auth_start_time
+            && current_time <= self.auth_end_time
+    }
+}
+
 /// Reference to an AMF session (for PDU session status)
 #[derive(Debug, Clone, Default)]
 pub struct AmfSessRef {

@@ -1062,3 +1062,338 @@ impl NwdafFeedbackManager {
             .unwrap_or_default()
     }
 }
+
+// ============================================================================
+// Rel-18 NWDAF Distributed Training (Federated Learning)
+// ============================================================================
+
+/// Federated Learning Aggregation Method
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FederatedAggregationMethod {
+    /// FedAvg: Weighted average of model parameters
+    FedAvg,
+    /// FedProx: Proximal term to handle heterogeneity
+    FedProx,
+    /// FedAdam: Adaptive learning rate
+    FedAdam,
+}
+
+impl FederatedAggregationMethod {
+    /// Get method name as string
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::FedAvg => "FedAvg",
+            Self::FedProx => "FedProx",
+            Self::FedAdam => "FedAdam",
+        }
+    }
+}
+
+/// Participant NF in distributed training
+#[derive(Debug, Clone)]
+pub struct TrainingParticipant {
+    /// NF type (e.g., "AMF", "SMF", "UPF")
+    pub nf_type: String,
+    /// NF instance ID
+    pub nf_id: String,
+    /// Number of samples contributed
+    pub sample_count: u64,
+    /// Last gradient submission time
+    pub last_submission_time: u64,
+    /// Participation weight (for weighted aggregation)
+    pub weight: f64,
+    /// Whether this participant is active
+    pub active: bool,
+}
+
+impl TrainingParticipant {
+    /// Create a new training participant
+    pub fn new(nf_type: &str, nf_id: &str, sample_count: u64) -> Self {
+        Self {
+            nf_type: nf_type.to_string(),
+            nf_id: nf_id.to_string(),
+            sample_count,
+            last_submission_time: 0,
+            weight: 1.0,
+            active: true,
+        }
+    }
+
+    /// Update participation weight based on sample count
+    pub fn update_weight(&mut self, total_samples: u64) {
+        if total_samples > 0 {
+            self.weight = self.sample_count as f64 / total_samples as f64;
+        }
+    }
+}
+
+/// Federated Learning Round
+#[derive(Debug, Clone)]
+pub struct FederatedRound {
+    /// Round number
+    pub round_number: u32,
+    /// Number of participants in this round
+    pub participant_count: usize,
+    /// Number of gradients aggregated
+    pub gradients_aggregated: usize,
+    /// Total samples processed in this round
+    pub total_samples: u64,
+    /// Round start time
+    pub start_time: u64,
+    /// Round completion time (0 if not completed)
+    pub completion_time: u64,
+    /// Aggregated loss value
+    pub aggregated_loss: f64,
+    /// Model version after this round
+    pub model_version: String,
+}
+
+impl FederatedRound {
+    /// Create a new federated round
+    pub fn new(round_number: u32, model_version: &str) -> Self {
+        Self {
+            round_number,
+            participant_count: 0,
+            gradients_aggregated: 0,
+            total_samples: 0,
+            start_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            completion_time: 0,
+            aggregated_loss: 0.0,
+            model_version: model_version.to_string(),
+        }
+    }
+
+    /// Mark round as completed
+    pub fn complete(&mut self, final_loss: f64) {
+        self.completion_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.aggregated_loss = final_loss;
+    }
+
+    /// Check if round is completed
+    pub fn is_completed(&self) -> bool {
+        self.completion_time > 0
+    }
+
+    /// Round duration in seconds
+    pub fn duration_seconds(&self) -> u64 {
+        if self.is_completed() {
+            self.completion_time.saturating_sub(self.start_time)
+        } else {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_sub(self.start_time)
+        }
+    }
+}
+
+/// Distributed Training Session
+#[derive(Debug, Clone)]
+pub struct DistributedTrainingSession {
+    /// Session identifier
+    pub session_id: String,
+    /// Model identifier
+    pub model_id: String,
+    /// Current model version
+    pub model_version: String,
+    /// Participating NFs
+    pub participants: HashMap<String, TrainingParticipant>,
+    /// Training rounds history
+    pub rounds: Vec<FederatedRound>,
+    /// Current round number
+    pub current_round: u32,
+    /// Aggregation method
+    pub aggregation_method: FederatedAggregationMethod,
+    /// Target loss threshold for convergence
+    pub target_loss: f64,
+    /// Maximum number of rounds
+    pub max_rounds: u32,
+    /// Minimum participants required per round
+    pub min_participants: usize,
+    /// Session start time
+    pub start_time: u64,
+    /// Session completion time (0 if not completed)
+    pub completion_time: u64,
+    /// Whether training has converged
+    pub converged: bool,
+}
+
+impl DistributedTrainingSession {
+    /// Create a new distributed training session
+    pub fn new(session_id: &str, model_id: &str, aggregation_method: FederatedAggregationMethod) -> Self {
+        Self {
+            session_id: session_id.to_string(),
+            model_id: model_id.to_string(),
+            model_version: "1.0.0".to_string(),
+            participants: HashMap::new(),
+            rounds: Vec::new(),
+            current_round: 0,
+            aggregation_method,
+            target_loss: 0.01, // Default convergence threshold
+            max_rounds: 100,   // Default max rounds
+            min_participants: 2, // Default minimum participants
+            start_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            completion_time: 0,
+            converged: false,
+        }
+    }
+
+    /// Add a participant to the session
+    pub fn add_participant(&mut self, nf_type: &str, nf_id: &str, sample_count: u64) {
+        let participant_key = format!("{nf_type}:{nf_id}");
+        let participant = TrainingParticipant::new(nf_type, nf_id, sample_count);
+
+        log::info!(
+            "[Distributed Training] Adding participant {}/{} with {} samples to session {}",
+            nf_type,
+            nf_id,
+            sample_count,
+            self.session_id
+        );
+
+        self.participants.insert(participant_key, participant);
+        self.update_participant_weights();
+    }
+
+    /// Remove a participant from the session
+    pub fn remove_participant(&mut self, nf_type: &str, nf_id: &str) {
+        let participant_key = format!("{nf_type}:{nf_id}");
+        if self.participants.remove(&participant_key).is_some() {
+            log::info!(
+                "[Distributed Training] Removed participant {}/{} from session {}",
+                nf_type,
+                nf_id,
+                self.session_id
+            );
+            self.update_participant_weights();
+        }
+    }
+
+    /// Update weights for all participants
+    fn update_participant_weights(&mut self) {
+        let total_samples: u64 = self.participants.values().map(|p| p.sample_count).sum();
+        for participant in self.participants.values_mut() {
+            participant.update_weight(total_samples);
+        }
+    }
+
+    /// Start a new training round
+    pub fn start_round(&mut self) -> bool {
+        if self.converged || self.current_round >= self.max_rounds {
+            log::warn!(
+                "[Distributed Training] Cannot start new round: converged={}, current_round={}/{}",
+                self.converged,
+                self.current_round,
+                self.max_rounds
+            );
+            return false;
+        }
+
+        let active_participants = self.participants.values().filter(|p| p.active).count();
+        if active_participants < self.min_participants {
+            log::warn!(
+                "[Distributed Training] Insufficient active participants: {} < {}",
+                active_participants,
+                self.min_participants
+            );
+            return false;
+        }
+
+        self.current_round += 1;
+        let round = FederatedRound::new(self.current_round, &self.model_version);
+
+        log::info!(
+            "[Distributed Training] Starting round {} for session {} (method: {})",
+            self.current_round,
+            self.session_id,
+            self.aggregation_method.as_str()
+        );
+
+        self.rounds.push(round);
+        true
+    }
+
+    /// Aggregate gradients and complete current round
+    pub fn complete_round(&mut self, gradients_received: usize, samples_processed: u64, loss: f64) {
+        if let Some(round) = self.rounds.last_mut() {
+            round.participant_count = self.participants.len();
+            round.gradients_aggregated = gradients_received;
+            round.total_samples = samples_processed;
+            round.complete(loss);
+
+            log::info!(
+                "[Distributed Training] Round {} completed: loss={:.6}, gradients={}, samples={}, duration={}s",
+                round.round_number,
+                loss,
+                gradients_received,
+                samples_processed,
+                round.duration_seconds()
+            );
+
+            // Check convergence
+            if loss <= self.target_loss {
+                self.converged = true;
+                self.completion_time = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                log::info!(
+                    "[Distributed Training] Training converged at round {} with loss {:.6}",
+                    self.current_round,
+                    loss
+                );
+            }
+
+            // Update model version
+            self.model_version = format!("{}.{}.0", self.current_round / 10 + 1, self.current_round % 10);
+        }
+    }
+
+    /// Check if training is complete
+    pub fn is_complete(&self) -> bool {
+        self.converged || self.current_round >= self.max_rounds
+    }
+
+    /// Get current round
+    pub fn get_current_round(&self) -> Option<&FederatedRound> {
+        self.rounds.last()
+    }
+
+    /// Get round by number
+    pub fn get_round(&self, round_number: u32) -> Option<&FederatedRound> {
+        self.rounds.iter().find(|r| r.round_number == round_number)
+    }
+
+    /// Total training duration in seconds
+    pub fn total_duration_seconds(&self) -> u64 {
+        if self.completion_time > 0 {
+            self.completion_time.saturating_sub(self.start_time)
+        } else {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_sub(self.start_time)
+        }
+    }
+
+    /// Get participant count
+    pub fn participant_count(&self) -> usize {
+        self.participants.len()
+    }
+
+    /// Get active participant count
+    pub fn active_participant_count(&self) -> usize {
+        self.participants.values().filter(|p| p.active).count()
+    }
+}

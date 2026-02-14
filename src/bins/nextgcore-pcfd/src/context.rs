@@ -687,6 +687,260 @@ pub struct EnergyAwarePolicy {
     pub max_inactivity_before_release: u32,
 }
 
+// ============================================================================
+// Rel-18 UAV Policy Authorization (TS 23.256, TS 23.503)
+// ============================================================================
+
+/// UAV communication constraint type
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UavCommConstraint {
+    /// Maximum uplink data rate (kbps)
+    MaxUplinkRate,
+    /// Maximum downlink data rate (kbps)
+    MaxDownlinkRate,
+    /// Maximum session duration (seconds)
+    MaxSessionDuration,
+    /// Prohibited during specific time windows
+    TimeRestriction,
+}
+
+/// UAV flight zone type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UavFlightZoneType {
+    /// Unrestricted zone
+    #[default]
+    Unrestricted,
+    /// Restricted zone (requires authorization)
+    Restricted,
+    /// Prohibited zone (no-fly)
+    Prohibited,
+    /// Conditional zone (authorization based on conditions)
+    Conditional,
+}
+
+/// UAV flight zone definition
+#[derive(Debug, Clone, Default)]
+pub struct UavFlightZone {
+    /// Zone identifier
+    pub zone_id: String,
+    /// Zone type
+    pub zone_type: UavFlightZoneType,
+    /// Minimum latitude
+    pub min_latitude: f64,
+    /// Maximum latitude
+    pub max_latitude: f64,
+    /// Minimum longitude
+    pub min_longitude: f64,
+    /// Maximum longitude
+    pub max_longitude: f64,
+    /// Minimum altitude (meters)
+    pub min_altitude: f64,
+    /// Maximum altitude (meters)
+    pub max_altitude: f64,
+    /// Time window start (UTC timestamp)
+    pub time_start: Option<u64>,
+    /// Time window end (UTC timestamp)
+    pub time_end: Option<u64>,
+}
+
+impl UavFlightZone {
+    /// Create a new flight zone
+    pub fn new(zone_id: &str, zone_type: UavFlightZoneType) -> Self {
+        Self {
+            zone_id: zone_id.to_string(),
+            zone_type,
+            min_latitude: -90.0,
+            max_latitude: 90.0,
+            min_longitude: -180.0,
+            max_longitude: 180.0,
+            min_altitude: 0.0,
+            max_altitude: 120.0, // Default max altitude per regulations
+            time_start: None,
+            time_end: None,
+        }
+    }
+
+    /// Check if position is within zone
+    pub fn contains_position(&self, latitude: f64, longitude: f64, altitude: f64) -> bool {
+        latitude >= self.min_latitude
+            && latitude <= self.max_latitude
+            && longitude >= self.min_longitude
+            && longitude <= self.max_longitude
+            && altitude >= self.min_altitude
+            && altitude <= self.max_altitude
+    }
+
+    /// Check if zone is active at given time
+    pub fn is_active_at(&self, timestamp: u64) -> bool {
+        match (self.time_start, self.time_end) {
+            (Some(start), Some(end)) => timestamp >= start && timestamp <= end,
+            (Some(start), None) => timestamp >= start,
+            (None, Some(end)) => timestamp <= end,
+            (None, None) => true,
+        }
+    }
+}
+
+/// UAV Policy Authorization (per TS 23.256)
+#[derive(Debug, Clone, Default)]
+pub struct UavPolicyAuthorization {
+    /// UAV ID (UAVID)
+    pub uav_id: Option<String>,
+    /// Authorization status
+    pub authorized: bool,
+    /// Authorized flight zones
+    pub flight_zones: Vec<UavFlightZone>,
+    /// Global altitude limits (meters)
+    pub min_altitude_limit: f64,
+    pub max_altitude_limit: f64,
+    /// Communication constraints
+    pub max_uplink_rate_kbps: Option<u32>,
+    pub max_downlink_rate_kbps: Option<u32>,
+    pub max_session_duration_sec: Option<u32>,
+    /// Priority level for UAV traffic (1-15, lower is higher priority)
+    pub priority_level: u8,
+    /// Allowed S-NSSAIs for UAV
+    pub allowed_snssai: Vec<SNssai>,
+    /// CAA (Civil Aviation Authority) authorization reference
+    pub caa_authorization_ref: Option<String>,
+    /// Emergency override enabled
+    pub emergency_override: bool,
+    /// Policy creation time
+    pub created_at: u64,
+    /// Policy expiration time
+    pub expires_at: u64,
+}
+
+impl UavPolicyAuthorization {
+    /// Create a new UAV policy authorization
+    pub fn new(uav_id: &str) -> Self {
+        Self {
+            uav_id: Some(uav_id.to_string()),
+            authorized: false,
+            flight_zones: Vec::new(),
+            min_altitude_limit: 0.0,
+            max_altitude_limit: 120.0,
+            max_uplink_rate_kbps: Some(1000), // Default 1 Mbps
+            max_downlink_rate_kbps: Some(5000), // Default 5 Mbps
+            max_session_duration_sec: Some(3600), // Default 1 hour
+            priority_level: 10,
+            allowed_snssai: Vec::new(),
+            caa_authorization_ref: None,
+            emergency_override: false,
+            created_at: 0,
+            expires_at: 0,
+        }
+    }
+
+    /// Authorize UAV for flight
+    pub fn grant_authorization(&mut self, caa_ref: &str, duration_sec: u64) {
+        self.authorized = true;
+        self.caa_authorization_ref = Some(caa_ref.to_string());
+        self.created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.expires_at = self.created_at + duration_sec;
+        log::info!(
+            "[UAV Policy] Authorization granted for UAV {:?}, CAA ref: {}, expires at: {}",
+            self.uav_id,
+            caa_ref,
+            self.expires_at
+        );
+    }
+
+    /// Revoke UAV authorization
+    pub fn revoke_authorization(&mut self, reason: &str) {
+        self.authorized = false;
+        self.expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        log::warn!(
+            "[UAV Policy] Authorization revoked for UAV {:?}: {}",
+            self.uav_id,
+            reason
+        );
+    }
+
+    /// Add a flight zone
+    pub fn add_flight_zone(&mut self, zone: UavFlightZone) {
+        log::info!(
+            "[UAV Policy] Adding flight zone {} ({:?}) for UAV {:?}",
+            zone.zone_id,
+            zone.zone_type,
+            self.uav_id
+        );
+        self.flight_zones.push(zone);
+    }
+
+    /// Check if UAV is authorized at current time
+    pub fn is_authorized(&self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.authorized && now >= self.created_at && now <= self.expires_at
+    }
+
+    /// Check if position is within authorized zones
+    pub fn check_position_authorized(&self, latitude: f64, longitude: f64, altitude: f64, timestamp: u64) -> bool {
+        // Check global altitude limits
+        if altitude < self.min_altitude_limit || altitude > self.max_altitude_limit {
+            log::warn!(
+                "[UAV Policy] Altitude {:.1}m outside limits [{:.1}, {:.1}] for UAV {:?}",
+                altitude,
+                self.min_altitude_limit,
+                self.max_altitude_limit,
+                self.uav_id
+            );
+            return false;
+        }
+
+        // If no zones defined, any position is allowed (subject to altitude)
+        if self.flight_zones.is_empty() {
+            return true;
+        }
+
+        // Check if position is in any authorized zone
+        for zone in &self.flight_zones {
+            if zone.is_active_at(timestamp) {
+                match zone.zone_type {
+                    UavFlightZoneType::Prohibited => {
+                        if zone.contains_position(latitude, longitude, altitude) {
+                            log::warn!(
+                                "[UAV Policy] Position in prohibited zone {} for UAV {:?}",
+                                zone.zone_id,
+                                self.uav_id
+                            );
+                            return false;
+                        }
+                    }
+                    UavFlightZoneType::Restricted | UavFlightZoneType::Conditional => {
+                        if zone.contains_position(latitude, longitude, altitude) {
+                            return true;
+                        }
+                    }
+                    UavFlightZoneType::Unrestricted => {
+                        if zone.contains_position(latitude, longitude, altitude) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    /// Set communication constraints
+    pub fn set_comm_constraints(&mut self, max_ul_kbps: u32, max_dl_kbps: u32, max_duration_sec: u32) {
+        self.max_uplink_rate_kbps = Some(max_ul_kbps);
+        self.max_downlink_rate_kbps = Some(max_dl_kbps);
+        self.max_session_duration_sec = Some(max_duration_sec);
+    }
+}
+
 /// PCF App Session context
 /// Port of pcf_app_t from context.h
 #[derive(Debug, Clone)]

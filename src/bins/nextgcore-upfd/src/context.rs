@@ -485,6 +485,31 @@ pub struct TsnBridgePort {
     pub is_trunk: bool,
     /// Allowed VLAN IDs when trunk
     pub allowed_vlans: Vec<u16>,
+    /// Port type (DS-TT: Device-Side Translator, NW-TT: Network-Side Translator)
+    pub port_type: TsnPortType,
+    /// Time-aware shaper enabled (IEEE 802.1Qbv)
+    pub time_aware_shaper_enabled: bool,
+    /// Gate control list for time-aware scheduling
+    pub gate_control_list: Vec<TsnGateControlEntry>,
+}
+
+/// TSN port type (TS 23.501 Section 5.28)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TsnPortType {
+    /// Device-Side Translator (connected to TSN device)
+    #[default]
+    DeviceSideTt,
+    /// Network-Side Translator (connected to 5G network)
+    NetworkSideTt,
+}
+
+/// TSN Gate Control Entry (IEEE 802.1Qbv)
+#[derive(Debug, Clone, Default)]
+pub struct TsnGateControlEntry {
+    /// Gate state for each priority queue (bit mask, 8 bits for 8 priorities)
+    pub gate_states: u8,
+    /// Time interval for this gate state (nanoseconds)
+    pub time_interval_ns: u64,
 }
 
 /// PTP (Precision Time Protocol) transparent clock state
@@ -515,6 +540,131 @@ impl PtpTransparentClock {
     }
 }
 
+/// TSN Stream Identification (TS 23.501 Section 5.28)
+#[derive(Debug, Clone, Default)]
+pub struct TsnStreamIdentification {
+    /// Stream ID
+    pub stream_id: u32,
+    /// Source MAC address
+    pub source_mac: [u8; 6],
+    /// Destination MAC address
+    pub destination_mac: [u8; 6],
+    /// VLAN ID
+    pub vlan_id: u16,
+    /// Priority Code Point (PCP)
+    pub pcp: u8,
+    /// Mapped QoS Flow Identifier (QFI)
+    pub qfi: u8,
+    /// Mapped 5QI
+    pub five_qi: u8,
+    /// GFBR (Guaranteed Flow Bit Rate) in kbps
+    pub gfbr_kbps: Option<u32>,
+    /// MFBR (Maximum Flow Bit Rate) in kbps
+    pub mfbr_kbps: Option<u32>,
+}
+
+impl TsnStreamIdentification {
+    /// Create a new TSN stream identification
+    pub fn new(stream_id: u32, vlan_id: u16, qfi: u8, five_qi: u8) -> Self {
+        Self {
+            stream_id,
+            source_mac: [0; 6],
+            destination_mac: [0; 6],
+            vlan_id,
+            pcp: 0,
+            qfi,
+            five_qi,
+            gfbr_kbps: None,
+            mfbr_kbps: None,
+        }
+    }
+
+    /// Check if packet matches this stream
+    pub fn matches(&self, src_mac: &[u8; 6], dst_mac: &[u8; 6], vlan_id: u16) -> bool {
+        (self.source_mac == [0; 6] || self.source_mac == *src_mac)
+            && (self.destination_mac == [0; 6] || self.destination_mac == *dst_mac)
+            && self.vlan_id == vlan_id
+    }
+}
+
+/// CNC (Centralized Network Controller) Interface Context
+#[derive(Debug, Clone, Default)]
+pub struct TsnCncInterface {
+    /// CNC endpoint URI
+    pub cnc_endpoint: String,
+    /// CNC session identifier
+    pub cnc_session_id: Option<String>,
+    /// CNC connection status
+    pub connected: bool,
+    /// Last configuration update time
+    pub last_config_update: u64,
+    /// Stream configurations from CNC
+    pub stream_configs: Vec<TsnStreamIdentification>,
+    /// Gate control list update interval (nanoseconds)
+    pub gate_update_interval_ns: u64,
+}
+
+impl TsnCncInterface {
+    /// Create a new CNC interface
+    pub fn new(cnc_endpoint: &str) -> Self {
+        Self {
+            cnc_endpoint: cnc_endpoint.to_string(),
+            cnc_session_id: None,
+            connected: false,
+            last_config_update: 0,
+            stream_configs: Vec::new(),
+            gate_update_interval_ns: 1_000_000, // Default 1ms
+        }
+    }
+
+    /// Connect to CNC
+    pub fn connect(&mut self, session_id: &str) {
+        self.cnc_session_id = Some(session_id.to_string());
+        self.connected = true;
+        self.last_config_update = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        log::info!(
+            "[TSN CNC] Connected to CNC at {} with session ID {}",
+            self.cnc_endpoint,
+            session_id
+        );
+    }
+
+    /// Disconnect from CNC
+    pub fn disconnect(&mut self) {
+        self.connected = false;
+        log::info!("[TSN CNC] Disconnected from CNC at {}", self.cnc_endpoint);
+    }
+
+    /// Add stream configuration from CNC
+    pub fn add_stream_config(&mut self, stream: TsnStreamIdentification) {
+        log::info!(
+            "[TSN CNC] Adding stream config: ID={}, VLAN={}, QFI={}, 5QI={}",
+            stream.stream_id,
+            stream.vlan_id,
+            stream.qfi,
+            stream.five_qi
+        );
+        self.stream_configs.push(stream);
+        self.last_config_update = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+    }
+
+    /// Find stream by ID
+    pub fn find_stream(&self, stream_id: u32) -> Option<&TsnStreamIdentification> {
+        self.stream_configs.iter().find(|s| s.stream_id == stream_id)
+    }
+
+    /// Find stream by packet characteristics
+    pub fn find_stream_by_packet(&self, src_mac: &[u8; 6], dst_mac: &[u8; 6], vlan_id: u16) -> Option<&TsnStreamIdentification> {
+        self.stream_configs.iter().find(|s| s.matches(src_mac, dst_mac, vlan_id))
+    }
+}
+
 /// UPF TSN Bridge context (Rel-18, TS 23.501 clause 5.28)
 #[derive(Debug, Clone, Default)]
 pub struct TsnBridge {
@@ -524,6 +674,14 @@ pub struct TsnBridge {
     pub ptp_clock: PtpTransparentClock,
     /// Bridge ID (MAC-based, 8 bytes)
     pub bridge_id: [u8; 8],
+    /// TSN stream identifications (stream_id -> stream)
+    pub streams: HashMap<u32, TsnStreamIdentification>,
+    /// CNC interface for centralized configuration
+    pub cnc_interface: Option<TsnCncInterface>,
+    /// Time-aware scheduling enabled globally
+    pub time_aware_scheduling_enabled: bool,
+    /// Cycle time for time-aware scheduling (nanoseconds)
+    pub cycle_time_ns: u64,
 }
 
 impl TsnBridge {
@@ -533,11 +691,21 @@ impl TsnBridge {
             ports: HashMap::new(),
             ptp_clock: PtpTransparentClock::default(),
             bridge_id,
+            streams: HashMap::new(),
+            cnc_interface: None,
+            time_aware_scheduling_enabled: false,
+            cycle_time_ns: 1_000_000, // Default 1ms cycle
         }
     }
 
     /// Add a bridge port
     pub fn add_port(&mut self, port: TsnBridgePort) {
+        log::info!(
+            "[TSN Bridge] Adding port {} (type: {:?}, VLAN: {})",
+            port.port_id,
+            port.port_type,
+            port.vlan_id
+        );
         self.ports.insert(port.port_id, port);
     }
 
@@ -560,11 +728,92 @@ impl TsnBridge {
     /// Enable PTP transparent clock
     pub fn enable_ptp(&mut self) {
         self.ptp_clock.enabled = true;
+        log::info!("[TSN Bridge] PTP transparent clock enabled");
     }
 
     /// Number of configured ports
     pub fn port_count(&self) -> usize {
         self.ports.len()
+    }
+
+    /// Add TSN stream identification
+    pub fn add_stream(&mut self, stream: TsnStreamIdentification) {
+        log::info!(
+            "[TSN Bridge] Adding stream {}: VLAN={}, QFI={}, 5QI={}",
+            stream.stream_id,
+            stream.vlan_id,
+            stream.qfi,
+            stream.five_qi
+        );
+        self.streams.insert(stream.stream_id, stream);
+    }
+
+    /// Remove TSN stream
+    pub fn remove_stream(&mut self, stream_id: u32) -> Option<TsnStreamIdentification> {
+        self.streams.remove(&stream_id)
+    }
+
+    /// Map TSN stream to QoS Flow
+    pub fn map_stream_to_qos_flow(&self, src_mac: &[u8; 6], dst_mac: &[u8; 6], vlan_id: u16) -> Option<(u8, u8)> {
+        // Find matching stream
+        let stream = self.streams.values().find(|s| s.matches(src_mac, dst_mac, vlan_id))?;
+
+        log::debug!(
+            "[TSN Bridge] Mapped stream {} to QFI={}, 5QI={}",
+            stream.stream_id,
+            stream.qfi,
+            stream.five_qi
+        );
+
+        Some((stream.qfi, stream.five_qi))
+    }
+
+    /// Set CNC interface
+    pub fn set_cnc_interface(&mut self, cnc: TsnCncInterface) {
+        log::info!("[TSN Bridge] Setting CNC interface: {}", cnc.cnc_endpoint);
+        self.cnc_interface = Some(cnc);
+    }
+
+    /// Enable time-aware scheduling (IEEE 802.1Qbv)
+    pub fn enable_time_aware_scheduling(&mut self, cycle_time_ns: u64) {
+        self.time_aware_scheduling_enabled = true;
+        self.cycle_time_ns = cycle_time_ns;
+        log::info!(
+            "[TSN Bridge] Time-aware scheduling enabled with cycle time {cycle_time_ns}ns"
+        );
+    }
+
+    /// Get current gate state for a port and priority (IEEE 802.1Qbv)
+    pub fn get_gate_state(&self, port_id: u16, priority: u8, current_time_ns: u64) -> bool {
+        let port = match self.ports.get(&port_id) {
+            Some(p) => p,
+            None => return true, // Port not found, allow all
+        };
+
+        if !port.time_aware_shaper_enabled || port.gate_control_list.is_empty() {
+            return true; // Shaper disabled, allow all
+        }
+
+        // Calculate position in cycle
+        let cycle_position = current_time_ns % self.cycle_time_ns;
+
+        // Find active gate control entry
+        let mut accumulated_time = 0u64;
+        for entry in &port.gate_control_list {
+            accumulated_time += entry.time_interval_ns;
+            if cycle_position < accumulated_time {
+                // Check if gate is open for this priority
+                return (entry.gate_states & (1 << priority)) != 0;
+            }
+        }
+
+        // Fallback: allow
+        true
+    }
+
+    /// Number of configured streams
+    pub fn stream_count(&self) -> usize {
+        self.streams.len()
     }
 }
 
@@ -1549,6 +1798,9 @@ mod tests {
             priority: 5,
             is_trunk: false,
             allowed_vlans: vec![],
+            port_type: TsnPortType::DeviceSideTt,
+            time_aware_shaper_enabled: false,
+            gate_control_list: vec![],
         });
         bridge.add_port(TsnBridgePort {
             port_id: 2,
@@ -1556,6 +1808,9 @@ mod tests {
             priority: 3,
             is_trunk: true,
             allowed_vlans: vec![100, 200, 300],
+            port_type: TsnPortType::NetworkSideTt,
+            time_aware_shaper_enabled: false,
+            gate_control_list: vec![],
         });
 
         assert_eq!(bridge.port_count(), 2);

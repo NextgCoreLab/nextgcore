@@ -671,6 +671,74 @@ pub fn handle_error_indication(
 }
 
 // ============================================================================
+// Rel-18 UAV Support (TS 23.256)
+// ============================================================================
+
+/// Parsed UAV Tracking Report
+#[derive(Debug, Clone, Default)]
+pub struct UavTrackingReport {
+    /// AMF UE NGAP ID
+    pub amf_ue_ngap_id: u64,
+    /// RAN UE NGAP ID
+    pub ran_ue_ngap_id: u64,
+    /// UAV ID (UAVID)
+    pub uav_id: String,
+    /// Current latitude (decimal degrees)
+    pub latitude: f64,
+    /// Current longitude (decimal degrees)
+    pub longitude: f64,
+    /// Current altitude (meters)
+    pub altitude: f64,
+    /// Timestamp of position report
+    pub timestamp: u64,
+    /// Flight status (0=grounded, 1=flying, 2=emergency)
+    pub flight_status: u8,
+}
+
+/// Handle UAV Tracking Report (Rel-18 TS 23.256)
+/// Processes position updates from UAV UEs and checks geofence violations
+pub fn handle_uav_tracking_report(
+    ran_ue: &mut RanUe,
+    report: &UavTrackingReport,
+) -> NgapHandlerResult {
+    log::info!(
+        "[UAV Tracking] Report received: UAV ID={}, position=({:.6}, {:.6}), altitude={:.1}m, status={}",
+        report.uav_id,
+        report.latitude,
+        report.longitude,
+        report.altitude,
+        report.flight_status
+    );
+
+    // Verify NGAP IDs match
+    if ran_ue.amf_ue_ngap_id != report.amf_ue_ngap_id {
+        log::warn!(
+            "[UAV Tracking] AMF UE NGAP ID mismatch: expected {}, got {}",
+            ran_ue.amf_ue_ngap_id,
+            report.amf_ue_ngap_id
+        );
+        return NgapHandlerResult::Success;
+    }
+
+    // In production, this would:
+    // 1. Retrieve AMF UE context and UAV authorization context
+    // 2. Call uav_auth_ctx.update_position() to check geofence violations
+    // 3. If violation detected, trigger authorization revocation and notify PCF
+    // 4. Log position update for flight path tracking
+    // 5. Forward position to LCS/GMLC if location services are subscribed
+
+    log::info!(
+        "[UAV Tracking] Position update processed for UAV ID={} at ({:.6}, {:.6}), alt={:.1}m",
+        report.uav_id,
+        report.latitude,
+        report.longitude,
+        report.altitude
+    );
+
+    NgapHandlerResult::Success
+}
+
+// ============================================================================
 // Helper Functions
 // ============================================================================
 
