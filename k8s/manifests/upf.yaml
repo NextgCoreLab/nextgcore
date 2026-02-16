@@ -1,0 +1,135 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: upf-wrapper
+  namespace: nextg-system
+  labels:
+    app.kubernetes.io/name: upf
+    app.kubernetes.io/part-of: nextgcore
+data:
+  wrapper.sh: |
+    #!/bin/sh
+    set -e
+    # Try to create TUN device (Open5GS/UERANSIM pattern)
+    # Works on production K8s with privileged: true
+    # Fails on Kind/Docker Desktop macOS (nested containers)
+    if ip tuntap add name ogstun mode tun 2>/dev/null; then
+      echo "[wrapper] TUN device created successfully"
+      ip addr add 10.45.0.1/16 dev ogstun
+      sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
+      ip link set ogstun up
+      sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+      iptables -t nat -A POSTROUTING -s 10.45.0.0/16 ! -o ogstun -j MASQUERADE 2>/dev/null || true
+      echo "[wrapper] TUN configured: ogstun 10.45.0.1/16, NAT enabled"
+      exec /usr/local/bin/nf-binary -c /etc/nextgcore/upf.yaml --pfcp-addr 0.0.0.0 --gtpu-addr 0.0.0.0
+    else
+      echo "[wrapper] TUN creation failed (nested containers / Kind on macOS)"
+      echo "[wrapper] Starting UPF in control-plane-only mode (--no-dataplane)"
+      exec /usr/local/bin/nf-binary -c /etc/nextgcore/upf.yaml --pfcp-addr 0.0.0.0 --gtpu-addr 0.0.0.0 --no-dataplane
+    fi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: upf
+  namespace: nextg-system
+  labels:
+    app.kubernetes.io/name: upf
+    app.kubernetes.io/part-of: nextgcore
+spec:
+  selector:
+    app.kubernetes.io/name: upf
+  ports:
+    - name: gtpu
+      port: 2152
+      targetPort: 2152
+      protocol: UDP
+    - name: pfcp
+      port: 8805
+      targetPort: 8805
+      protocol: UDP
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: upf
+  namespace: nextg-system
+  labels:
+    app.kubernetes.io/name: upf
+    app.kubernetes.io/part-of: nextgcore
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: upf
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: upf
+        app.kubernetes.io/part-of: nextgcore
+    spec:
+      initContainers:
+        - name: wait-smf
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z smf.nextg-system.svc.cluster.local 7777; do echo waiting for smf; sleep 2; done']
+      containers:
+        - name: upf
+          image: nextgcore-rust/upf:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "/scripts/wrapper.sh"]
+          ports:
+            - containerPort: 2152
+              name: gtpu
+              protocol: UDP
+            - containerPort: 8805
+              name: pfcp
+              protocol: UDP
+            - containerPort: 9090
+              name: metrics
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: RUST_BACKTRACE
+              value: "1"
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - NET_ADMIN
+                - SYS_ADMIN
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nextgcore/upf.yaml
+              subPath: upf.yaml
+              readOnly: true
+            - name: logs
+              mountPath: /var/log/nextgcore
+            - name: dev-tun
+              mountPath: /dev/net/tun
+            - name: wrapper
+              mountPath: /scripts
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: nextgcore-configs
+        - name: logs
+          emptyDir: {}
+        - name: dev-tun
+          hostPath:
+            path: /dev/net/tun
+            type: CharDevice
+        - name: wrapper
+          configMap:
+            name: upf-wrapper
+            defaultMode: 0755

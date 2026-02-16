@@ -1,0 +1,110 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: amf
+  namespace: nextg-system
+  labels:
+    app.kubernetes.io/name: amf
+    app.kubernetes.io/part-of: nextgcore
+spec:
+  selector:
+    app.kubernetes.io/name: amf
+  ports:
+    - name: ngap
+      port: 38412
+      targetPort: 38412
+      protocol: UDP
+    - name: sbi
+      port: 7777
+      targetPort: 7777
+    - name: metrics
+      port: 9090
+      targetPort: 9090
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amf
+  namespace: nextg-system
+  labels:
+    app.kubernetes.io/name: amf
+    app.kubernetes.io/part-of: nextgcore
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: amf
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: amf
+        app.kubernetes.io/part-of: nextgcore
+    spec:
+      initContainers:
+        - name: wait-nrf
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z nrf.nextg-system.svc.cluster.local 7777; do echo waiting for nrf; sleep 2; done']
+        - name: wait-ausf
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z ausf.nextg-system.svc.cluster.local 7777; do echo waiting for ausf; sleep 2; done']
+        - name: wait-udm
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z udm.nextg-system.svc.cluster.local 7777; do echo waiting for udm; sleep 2; done']
+      containers:
+        - name: amf
+          image: nextgcore-rust/amf:latest
+          imagePullPolicy: IfNotPresent
+          args: ["-c", "/etc/nextgcore/amf.yaml"]
+          ports:
+            - containerPort: 38412
+              name: ngap
+              protocol: UDP
+            - containerPort: 7777
+              name: sbi
+            - containerPort: 9090
+              name: metrics
+          env:
+            - name: RUST_LOG
+              value: info
+            - name: RUST_BACKTRACE
+              value: "1"
+            - name: AMF_SBI_ADDR
+              value: "0.0.0.0"
+            - name: SMF_SBI_ADDR
+              value: "smf.nextg-system.svc.cluster.local"
+            - name: SMF_SBI_PORT
+              value: "7777"
+            - name: AUSF_SBI_ADDR
+              value: "ausf.nextg-system.svc.cluster.local"
+            - name: AUSF_SBI_PORT
+              value: "7777"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nextgcore/amf.yaml
+              subPath: amf.yaml
+              readOnly: true
+            - name: logs
+              mountPath: /var/log/nextgcore
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "kill -0 1"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "kill -0 1"]
+            initialDelaySeconds: 15
+            periodSeconds: 30
+      volumes:
+        - name: config
+          configMap:
+            name: nextgcore-configs
+        - name: logs
+          emptyDir: {}
