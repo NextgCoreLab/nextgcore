@@ -1,0 +1,29 @@
+# Kind cluster configuration for NextG 5G/6G deployment
+# Usage: kind create cluster --config kind-config.yaml --name nextg
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      # NRF SBI (debug access)
+      - containerPort: 30777
+        hostPort: 7777
+        protocol: TCP
+      # Grafana dashboard
+      - containerPort: 30300
+        hostPort: 3000
+        protocol: TCP
+      # Prometheus
+      - containerPort: 30909
+        hostPort: 9090
+        protocol: TCP
+      # Jaeger UI
+      - containerPort: 31686
+        hostPort: 16686
+        protocol: TCP

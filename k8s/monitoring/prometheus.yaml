@@ -1,0 +1,121 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: nextg-system
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+      scrape_timeout: 10s
+    scrape_configs:
+      - job_name: "nextgcore-nrf"
+        static_configs:
+          - targets: ["nrf.nextg-system.svc.cluster.local:9090"]
+            labels: { nf_type: "NRF" }
+      - job_name: "nextgcore-amf"
+        static_configs:
+          - targets: ["amf.nextg-system.svc.cluster.local:9090"]
+            labels: { nf_type: "AMF" }
+      - job_name: "nextgcore-smf"
+        static_configs:
+          - targets: ["smf.nextg-system.svc.cluster.local:9090"]
+            labels: { nf_type: "SMF" }
+      - job_name: "nextgcore-upf"
+        static_configs:
+          - targets: ["upf.nextg-system.svc.cluster.local:9090"]
+            labels: { nf_type: "UPF" }
+      - job_name: "nextgcore-ausf"
+        static_configs:
+          - targets: ["ausf.nextg-system.svc.cluster.local:9090"]
+            labels: { nf_type: "AUSF" }
+      - job_name: "nextgcore-udm"
+        static_configs:
+          - targets: ["udm.nextg-system.svc.cluster.local:9090"]
+            labels: { nf_type: "UDM" }
+      - job_name: "nextgcore-udr"
+        static_configs:
+          - targets: ["udr.nextg-system.svc.cluster.local:9090"]
+            labels: { nf_type: "UDR" }
+      - job_name: "nextgcore-pcf"
+        static_configs:
+          - targets: ["pcf.nextg-system.svc.cluster.local:9090"]
+            labels: { nf_type: "PCF" }
+      - job_name: "nextgcore-nssf"
+        static_configs:
+          - targets: ["nssf.nextg-system.svc.cluster.local:9090"]
+            labels: { nf_type: "NSSF" }
+      - job_name: "nextgcore-bsf"
+        static_configs:
+          - targets: ["bsf.nextg-system.svc.cluster.local:9090"]
+            labels: { nf_type: "BSF" }
+      - job_name: "prometheus"
+        static_configs:
+          - targets: ["localhost:9090"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: nextg-system
+  labels:
+    app.kubernetes.io/name: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: prometheus
+    spec:
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.51.0
+          args:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus"
+            - "--storage.tsdb.retention.time=7d"
+            - "--web.enable-lifecycle"
+          ports:
+            - containerPort: 9090
+              name: http
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus/prometheus.yml
+              subPath: prometheus.yml
+              readOnly: true
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: nextg-system
+  labels:
+    app.kubernetes.io/name: prometheus
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: 9090
+      nodePort: 30909

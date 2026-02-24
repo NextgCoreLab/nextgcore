@@ -1,0 +1,282 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nextgcore-configs
+  namespace: nextg-system
+  labels:
+    app.kubernetes.io/part-of: nextgcore
+data:
+  nrf.yaml: |
+    logger:
+      file:
+        path: /var/log/nextgcore/nrf.log
+      level: info
+    global:
+      max:
+        ue: 1024
+        peer: 64
+    nrf:
+      serving:
+        - plmn_id:
+            mcc: 999
+            mnc: 70
+      sbi:
+        server:
+          - address: 0.0.0.0
+            advertise: nrf.nextg-system.svc.cluster.local
+            port: 7777
+
+  ausf.yaml: |
+    logger:
+      file:
+        path: /var/log/nextgcore/ausf.log
+      level: info
+    global:
+      max:
+        ue: 1024
+        peer: 64
+    ausf:
+      sbi:
+        server:
+          - address: 0.0.0.0
+            port: 7777
+        client:
+          nrf:
+            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+
+  udm.yaml: |
+    logger:
+      file:
+        path: /var/log/nextgcore/udm.log
+      level: info
+    global:
+      max:
+        ue: 1024
+        peer: 64
+    udm:
+      hnet:
+        - id: 1
+          scheme: 1
+          key: /etc/nextgcore/hnet/curve25519-1.key
+        - id: 2
+          scheme: 2
+          key: /etc/nextgcore/hnet/secp256r1-2.key
+      sbi:
+        server:
+          - address: 0.0.0.0
+            port: 7777
+        client:
+          nrf:
+            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+
+  udr.yaml: |
+    db_uri: mongodb://mongodb.nextg-system.svc.cluster.local:27017/nextgcore
+    logger:
+      file:
+        path: /var/log/nextgcore/udr.log
+      level: info
+    global:
+      max:
+        ue: 1024
+        peer: 64
+    udr:
+      sbi:
+        server:
+          - address: 0.0.0.0
+            port: 7777
+        client:
+          nrf:
+            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+
+  pcf.yaml: |
+    db_uri: mongodb://mongodb.nextg-system.svc.cluster.local:27017/nextgcore
+    logger:
+      file:
+        path: /var/log/nextgcore/pcf.log
+      level: info
+    global:
+      max:
+        ue: 1024
+        peer: 64
+    pcf:
+      sbi:
+        server:
+          - address: 0.0.0.0
+            port: 7777
+        client:
+          nrf:
+            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+      metrics:
+        server:
+          - address: 0.0.0.0
+            port: 9090
+
+  nssf.yaml: |
+    logger:
+      file:
+        path: /var/log/nextgcore/nssf.log
+      level: info
+    global:
+      max:
+        ue: 1024
+        peer: 64
+    nssf:
+      sbi:
+        server:
+          - address: 0.0.0.0
+            port: 7777
+        client:
+          nrf:
+            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+          nsi:
+            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+              s_nssai:
+                sst: 1
+
+  bsf.yaml: |
+    logger:
+      file:
+        path: /var/log/nextgcore/bsf.log
+      level: info
+    global:
+      max:
+        ue: 1024
+        peer: 64
+    bsf:
+      sbi:
+        server:
+          - address: 0.0.0.0
+            port: 7777
+        client:
+          nrf:
+            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+
+  amf.yaml: |
+    logger:
+      file:
+        path: /var/log/nextgcore/amf.log
+      level: info
+    global:
+      max:
+        ue: 1024
+        peer: 64
+    amf:
+      sbi:
+        server:
+          - address: 0.0.0.0
+            port: 7777
+        client:
+          nrf:
+            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+      ngap:
+        server:
+          - address: 0.0.0.0
+            port: 38412
+      metrics:
+        server:
+          - address: 0.0.0.0
+            port: 9090
+      guami:
+        - plmn_id:
+            mcc: 999
+            mnc: 70
+          amf_id:
+            region: 2
+            set: 1
+      tai:
+        - plmn_id:
+            mcc: 999
+            mnc: 70
+          tac: 1
+      plmn_support:
+        - plmn_id:
+            mcc: 999
+            mnc: 70
+          s_nssai:
+            - sst: 1
+      security:
+        integrity_order: [NIA2, NIA1, NIA0]
+        ciphering_order: [NEA0, NEA1, NEA2]
+      network_name:
+        full: NextGCore
+        short: Next
+      amf_name: nextgcore-amf0
+      time:
+        t3512:
+          value: 540
+
+  smf.yaml: |
+    logger:
+      file:
+        path: /var/log/nextgcore/smf.log
+      level: info
+    global:
+      max:
+        ue: 1024
+        peer: 64
+    smf:
+      sbi:
+        server:
+          - address: 0.0.0.0
+            port: 7777
+        client:
+          nrf:
+            - uri: http://nrf.nextg-system.svc.cluster.local:7777
+      pfcp:
+        server:
+          - address: 0.0.0.0
+            port: 8805
+        client:
+          upf:
+            - address: upf.nextg-system.svc.cluster.local
+      gtpc:
+        server:
+          - address: 0.0.0.0
+      gtpu:
+        server:
+          - address: 0.0.0.0
+      metrics:
+        server:
+          - address: 0.0.0.0
+            port: 9090
+      session:
+        - subnet: 10.45.0.0/16
+          gateway: 10.45.0.1
+        - subnet: 2001:db8:cafe::/48
+          gateway: 2001:db8:cafe::1
+      dns:
+        - 8.8.8.8
+        - 8.8.4.4
+        - 2001:4860:4860::8888
+        - 2001:4860:4860::8844
+      mtu: 1400
+
+  upf.yaml: |
+    logger:
+      file:
+        path: /var/log/nextgcore/upf.log
+      level: info
+    global:
+      max:
+        ue: 1024
+        peer: 64
+    upf:
+      pfcp:
+        server:
+          - address: 0.0.0.0
+            port: 8805
+      gtpu:
+        server:
+          - address: 0.0.0.0
+            port: 2152
+      session:
+        - subnet: 10.45.0.0/16
+          gateway: 10.45.0.1
+          dev: ogstun
+        - subnet: 2001:db8:cafe::/48
+          gateway: 2001:db8:cafe::1
+          dev: ogstun
+      metrics:
+        server:
+          - address: 0.0.0.0
+            port: 9090
