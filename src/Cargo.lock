@@ -2192,6 +2192,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextgcore-dccfd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "env_logger 0.11.8",
+ "log",
+ "ogs-app",
+ "ogs-core",
+ "ogs-metrics",
+ "ogs-sbi",
+ "proptest",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "nextgcore-eesd"
 version = "0.1.0"
 dependencies = [
