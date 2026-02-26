@@ -1,0 +1,312 @@
+openapi: 3.0.3
+info:
+  title: Nudr_GroupData
+  version: 1.0.0
+  description: |
+    UDR Group Data Repository Service (TS 29.504 §5.2.5).
+    Stores and retrieves group-level subscription data for NSSF, NEF, and PCF.
+
+servers:
+  - url: '{apiRoot}/nudr-dr/v2'
+    variables:
+      apiRoot:
+        default: https://udr.5gc.mnc001.mcc001.3gppnetwork.org
+
+paths:
+  /group-data/group-identifiers:
+    get:
+      summary: Get group identifiers for a UE
+      operationId: QueryGroupIdentifiers
+      tags: [Group Data]
+      parameters:
+        - name: ext-group-id
+          in: query
+          schema:
+            type: string
+          description: External group identifier
+        - name: int-group-id
+          in: query
+          schema:
+            type: string
+          description: Internal group identifier
+        - name: ue-id-ind
+          in: query
+          schema:
+            type: boolean
+          description: Include UE ID list
+        - $ref: '#/components/parameters/supportedFeatures'
+      responses:
+        '200':
+          description: Group identifiers
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GroupIdentifiers'
+        '400':
+          $ref: '#/components/responses/400'
+        '404':
+          $ref: '#/components/responses/404'
+
+  /group-data/subs-to-notify:
+    get:
+      summary: Get subscriptions to notify for group data changes
+      operationId: QuerySubsToNotify
+      tags: [Group Subscriptions]
+      parameters:
+        - name: data-subset
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+        - name: ue-id
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Subscriptions to notify
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SubsToNotify'
+        '404':
+          $ref: '#/components/responses/404'
+    post:
+      summary: Subscribe to group data change notifications
+      operationId: SubscribeToNotifications
+      tags: [Group Subscriptions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubsToNotify'
+      responses:
+        '201':
+          description: Subscription created
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubsToNotify'
+        '400':
+          $ref: '#/components/responses/400'
+
+  /group-data/subs-to-notify/{subsId}:
+    delete:
+      summary: Unsubscribe from group data change notifications
+      operationId: RemovesubscriptionsToNotify
+      tags: [Group Subscriptions]
+      parameters:
+        - name: subsId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: No Content
+        '404':
+          $ref: '#/components/responses/404'
+
+  /exposure-data/{ueId}/access-and-mobility-data:
+    get:
+      summary: Get UE access and mobility data
+      operationId: QueryAccessAndMobilityData
+      tags: [Exposure Data]
+      parameters:
+        - $ref: '#/components/parameters/ueId'
+      responses:
+        '200':
+          description: Access and mobility data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessAndMobilityData'
+        '404':
+          $ref: '#/components/responses/404'
+    put:
+      summary: Create or update UE access and mobility data
+      operationId: CreateOrReplaceAccessAndMobilityData
+      tags: [Exposure Data]
+      parameters:
+        - $ref: '#/components/parameters/ueId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccessAndMobilityData'
+      responses:
+        '204':
+          description: No Content
+        '201':
+          description: Data created
+    delete:
+      summary: Delete UE access and mobility data
+      operationId: DeleteAccessAndMobilityData
+      tags: [Exposure Data]
+      parameters:
+        - $ref: '#/components/parameters/ueId'
+      responses:
+        '204':
+          description: No Content
+        '404':
+          $ref: '#/components/responses/404'
+
+components:
+  parameters:
+    ueId:
+      name: ueId
+      in: path
+      required: true
+      schema:
+        type: string
+    supportedFeatures:
+      name: supported-features
+      in: query
+      schema:
+        type: string
+
+  schemas:
+    GroupIdentifiers:
+      type: object
+      properties:
+        extGroupId:
+          type: string
+          description: External group identifier (e.g., "group001@mnc001.mcc001.3gppnetwork.org")
+        intGroupId:
+          type: string
+          description: Internal group identifier
+        ueIdList:
+          type: array
+          items:
+            type: string
+          description: List of UE identifiers (SUPI) belonging to this group
+
+    SubsToNotify:
+      type: object
+      required: [callbackRef, monitoredResourceUris]
+      properties:
+        callbackRef:
+          type: string
+          format: uri
+        monitoredResourceUris:
+          type: array
+          items:
+            type: string
+            format: uri
+        originalCallbackRef:
+          type: string
+          format: uri
+        expiry:
+          type: string
+          format: date-time
+        correlationId:
+          type: string
+        dataAccessScopes:
+          type: array
+          items:
+            type: string
+            enum: [SUBSCRIPTION_DATA, POLICY_DATA, EXPOSURE_DATA, APPLICATION_DATA]
+
+    AccessAndMobilityData:
+      type: object
+      properties:
+        location:
+          $ref: '#/components/schemas/UserLocation'
+        locationTs:
+          type: string
+          format: date-time
+        timeZone:
+          type: string
+        timeZoneTs:
+          type: string
+          format: date-time
+        accessType:
+          type: string
+          enum: [3GPP_ACCESS, NON_3GPP_ACCESS]
+        regStates:
+          type: array
+          items:
+            $ref: '#/components/schemas/RmInfo'
+        connStates:
+          type: array
+          items:
+            $ref: '#/components/schemas/CmInfo'
+        reachabilityStatus:
+          type: string
+          enum: [REACHABLE, UNREACHABLE]
+        smsOverNasStatus:
+          type: string
+          enum: [AVAILABLE, NOT_AVAILABLE]
+
+    UserLocation:
+      type: object
+      properties:
+        eutraLocation:
+          type: object
+        nrLocation:
+          type: object
+        n3gaLocation:
+          type: object
+
+    RmInfo:
+      type: object
+      required: [rmState, accessType]
+      properties:
+        rmState:
+          type: string
+          enum: [REGISTERED, DEREGISTERED]
+        accessType:
+          type: string
+          enum: [3GPP_ACCESS, NON_3GPP_ACCESS]
+
+    CmInfo:
+      type: object
+      required: [cmState, accessType]
+      properties:
+        cmState:
+          type: string
+          enum: [CM_IDLE, CM_CONNECTED]
+        accessType:
+          type: string
+          enum: [3GPP_ACCESS, NON_3GPP_ACCESS]
+
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+
+  responses:
+    '400':
+      description: Bad Request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '404':
+      description: Not Found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '500':
+      description: Internal Server Error
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'

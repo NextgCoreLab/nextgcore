@@ -1,0 +1,261 @@
+openapi: 3.0.3
+info:
+  title: Nnssf_NSSelection
+  version: 2.2.0
+  description: |
+    NSSF Network Slice Selection Service (TS 29.531).
+    Provides NS selection and Allowed NSSAI determination for AMF.
+
+servers:
+  - url: '{apiRoot}/nnssf-nsselection/v2'
+    variables:
+      apiRoot:
+        default: https://nssf.5gc.mnc001.mcc001.3gppnetwork.org
+
+paths:
+  /network-slice-information:
+    get:
+      summary: Retrieve network slice selection information
+      operationId: NSSelectionGet
+      tags: [Network Slice Information]
+      parameters:
+        - name: nf-type
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/NfType'
+        - name: nf-id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: slice-info-request-for-registration
+          in: query
+          schema:
+            $ref: '#/components/schemas/SliceInfoForRegistration'
+          style: deepObject
+          explode: true
+        - name: home-plmn-id
+          in: query
+          schema:
+            $ref: '#/components/schemas/PlmnId'
+          style: deepObject
+          explode: true
+        - name: tai
+          in: query
+          schema:
+            $ref: '#/components/schemas/Tai'
+          style: deepObject
+          explode: true
+        - name: supported-features
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Network slice selection information
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthorizedNetworkSliceInfo'
+        '400':
+          $ref: '#/components/responses/400'
+        '403':
+          $ref: '#/components/responses/403'
+        '404':
+          $ref: '#/components/responses/404'
+        '500':
+          $ref: '#/components/responses/500'
+
+components:
+  schemas:
+    NfType:
+      type: string
+      enum: [NRF, UDM, AMF, SMF, AUSF, NEF, PCF, SMSF, NSSF, UDR, LMF, GMLC, 5G_EIR,
+             SEPP, UPF, N3IWF, AF, UDSF, BSF, CHF, NWDAF, PCSCF, CBCF, HSS, UCMF,
+             SOR_AF, SPAF, MME, SCSAS, SCEF, SCP, NSSAAF, ICSCF, SCSCF, DRA, IMS_AS,
+             EES, ECS, DCCF, MFAF, ADRF, NSACF, MB_SMF, TSCTSF, PANF, IP_SM_GW,
+             SMS_GMSC, SMS_IWMSC]
+
+    PlmnId:
+      type: object
+      required: [mcc, mnc]
+      properties:
+        mcc:
+          type: string
+          pattern: '^\d{3}$'
+        mnc:
+          type: string
+          pattern: '^\d{2,3}$'
+
+    Snssai:
+      type: object
+      required: [sst]
+      properties:
+        sst:
+          type: integer
+          minimum: 0
+          maximum: 255
+        sd:
+          type: string
+          pattern: '^[A-Fa-f0-9]{6}$'
+
+    Tai:
+      type: object
+      required: [plmnId, tac]
+      properties:
+        plmnId:
+          $ref: '#/components/schemas/PlmnId'
+        tac:
+          type: string
+          pattern: '^([A-Fa-f0-9]{4}|[A-Fa-f0-9]{6})$'
+
+    SliceInfoForRegistration:
+      type: object
+      properties:
+        subscribedNssai:
+          type: array
+          items:
+            $ref: '#/components/schemas/SubscribedSnssai'
+        allowedNssaiCurrentAccess:
+          $ref: '#/components/schemas/AllowedNssai'
+        requestedNssai:
+          type: array
+          items:
+            $ref: '#/components/schemas/Snssai'
+        mappingOfNssai:
+          type: array
+          items:
+            $ref: '#/components/schemas/MappingOfSnssai'
+
+    SubscribedSnssai:
+      type: object
+      required: [subscribedSnssai]
+      properties:
+        subscribedSnssai:
+          $ref: '#/components/schemas/Snssai'
+        defaultIndication:
+          type: boolean
+
+    AllowedNssai:
+      type: object
+      required: [allowedSnssaiList]
+      properties:
+        allowedSnssaiList:
+          type: array
+          items:
+            $ref: '#/components/schemas/AllowedSnssai'
+        accessType:
+          type: string
+          enum: [3GPP_ACCESS, NON_3GPP_ACCESS]
+
+    AllowedSnssai:
+      type: object
+      required: [allowedSnssai]
+      properties:
+        allowedSnssai:
+          $ref: '#/components/schemas/Snssai'
+        nsiInformationList:
+          type: array
+          items:
+            $ref: '#/components/schemas/NsiInformation'
+
+    NsiInformation:
+      type: object
+      required: [nrfId]
+      properties:
+        nrfId:
+          type: string
+          format: uri
+        nsiId:
+          type: string
+
+    MappingOfSnssai:
+      type: object
+      required: [servingSnssai, homeSnssai]
+      properties:
+        servingSnssai:
+          $ref: '#/components/schemas/Snssai'
+        homeSnssai:
+          $ref: '#/components/schemas/Snssai'
+
+    AuthorizedNetworkSliceInfo:
+      type: object
+      properties:
+        allowedNssaiList:
+          type: array
+          items:
+            $ref: '#/components/schemas/AllowedNssai'
+        configuredNssai:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConfiguredSnssai'
+        targetAmfSet:
+          type: string
+        candidateAmfList:
+          type: array
+          items:
+            type: string
+            format: uri
+        rejectedNssaiInPlmn:
+          type: array
+          items:
+            $ref: '#/components/schemas/Snssai'
+        rejectedNssaiInTa:
+          type: array
+          items:
+            $ref: '#/components/schemas/Snssai'
+        nsiInformation:
+          $ref: '#/components/schemas/NsiInformation'
+        supportedFeatures:
+          type: string
+
+    ConfiguredSnssai:
+      type: object
+      required: [subscribedSnssai]
+      properties:
+        subscribedSnssai:
+          $ref: '#/components/schemas/Snssai'
+        defaultIndication:
+          type: boolean
+
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        cause:
+          type: string
+
+  responses:
+    '400':
+      description: Bad Request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '403':
+      description: Forbidden
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '404':
+      description: Not Found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '500':
+      description: Internal Server Error
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'

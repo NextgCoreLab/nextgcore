@@ -1,0 +1,212 @@
+openapi: 3.0.3
+info:
+  title: Nudm_UEAuthentication
+  version: 1.2.0
+  description: |
+    UDM UE Authentication Service (TS 29.503 §5.2.2).
+    Provides AV generation and SQN resynchronization for AUSF.
+
+servers:
+  - url: '{apiRoot}/nudm-ueau/v1'
+    variables:
+      apiRoot:
+        default: https://udm.5gc.mnc001.mcc001.3gppnetwork.org
+
+paths:
+  /{supiOrSuci}/security-information/generate-auth-data:
+    post:
+      summary: Generate authentication data
+      operationId: GenerateAuthData
+      tags: [Generate Auth Data]
+      parameters:
+        - name: supiOrSuci
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthenticationInfoRequest'
+      responses:
+        '200':
+          description: Authentication vectors
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationInfoResult'
+        '400':
+          $ref: '#/components/responses/400'
+        '403':
+          $ref: '#/components/responses/403'
+        '404':
+          $ref: '#/components/responses/404'
+        '500':
+          $ref: '#/components/responses/500'
+
+  /{supi}/auth-events:
+    post:
+      summary: Confirm authentication event
+      operationId: ConfirmAuth
+      tags: [Confirm Auth]
+      parameters:
+        - name: supi
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthEvent'
+      responses:
+        '201':
+          description: Auth event confirmed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthEvent'
+        '400':
+          $ref: '#/components/responses/400'
+
+components:
+  schemas:
+    AuthenticationInfoRequest:
+      type: object
+      required: [supportedFeatures, servingNetworkName, ausfInstanceId]
+      properties:
+        supportedFeatures:
+          type: string
+        servingNetworkName:
+          type: string
+        ausfInstanceId:
+          type: string
+          format: uuid
+        resynchronizationInfo:
+          $ref: '#/components/schemas/ResynchronizationInfo'
+        pei:
+          type: string
+
+    ResynchronizationInfo:
+      type: object
+      required: [rand, auts]
+      properties:
+        rand:
+          type: string
+          description: RAND used in failed authentication (hex, 32 chars)
+        auts:
+          type: string
+          description: AUTS from UE (hex, 28 chars)
+
+    AuthenticationInfoResult:
+      type: object
+      required: [authType]
+      properties:
+        authType:
+          type: string
+          enum: [5G_AKA, EAP_AKA_PRIME, EAP_TLS]
+        authenticationVector:
+          oneOf:
+            - $ref: '#/components/schemas/Av5gAka'
+            - $ref: '#/components/schemas/AvEapAkaPrime'
+        supi:
+          type: string
+        supportedFeatures:
+          type: string
+
+    Av5gAka:
+      type: object
+      required: [rand, autn, hxresStar, kausf]
+      properties:
+        rand:
+          type: string
+          description: RAND (hex, 32 chars)
+        autn:
+          type: string
+          description: AUTN (hex, 32 chars)
+        hxresStar:
+          type: string
+          description: HXRES* (hex, 64 chars)
+        kausf:
+          type: string
+          description: KAUSF (hex, 64 chars)
+
+    AvEapAkaPrime:
+      type: object
+      required: [rand, autn, ckPrime, ikPrime, xresStar]
+      properties:
+        rand:
+          type: string
+          description: RAND (hex, 32 chars)
+        autn:
+          type: string
+          description: AUTN (hex, 32 chars)
+        ckPrime:
+          type: string
+          description: CK' (hex, 32 chars)
+        ikPrime:
+          type: string
+          description: IK' (hex, 32 chars)
+        xresStar:
+          type: string
+          description: XRES* (hex, 64 chars)
+
+    AuthEvent:
+      type: object
+      required: [nfInstanceId, success, timeStamp, authType, servingNetworkName]
+      properties:
+        nfInstanceId:
+          type: string
+          format: uuid
+        success:
+          type: boolean
+        timeStamp:
+          type: string
+          format: date-time
+        authType:
+          type: string
+          enum: [5G_AKA, EAP_AKA_PRIME, EAP_TLS]
+        servingNetworkName:
+          type: string
+
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+
+  responses:
+    '400':
+      description: Bad Request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '403':
+      description: Forbidden
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '404':
+      description: Not Found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '500':
+      description: Internal Server Error
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'

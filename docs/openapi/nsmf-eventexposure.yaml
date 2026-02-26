@@ -1,0 +1,304 @@
+openapi: 3.0.3
+info:
+  title: Nsmf_EventExposure
+  version: 1.3.0
+  description: |
+    SMF Event Exposure Service (TS 29.508 §5.4).
+    Allows NFs/AFs to subscribe to PDU session events: QoS, charging, UP path change.
+
+servers:
+  - url: '{apiRoot}/nsmf-event-exposure/v1'
+    variables:
+      apiRoot:
+        default: https://smf.5gc.mnc001.mcc001.3gppnetwork.org
+
+paths:
+  /subscriptions:
+    post:
+      summary: Create SMF event subscription
+      operationId: CreateIndividualSubcription
+      tags: [Subscriptions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NsmfEventExposure'
+      responses:
+        '201':
+          description: Subscription created
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NsmfEventExposure'
+        '400':
+          $ref: '#/components/responses/400'
+        '500':
+          $ref: '#/components/responses/500'
+
+  /subscriptions/{subId}:
+    get:
+      summary: Get SMF event subscription
+      operationId: GetIndividualSubcription
+      tags: [Subscriptions]
+      parameters:
+        - $ref: '#/components/parameters/subId'
+      responses:
+        '200':
+          description: SMF event subscription
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NsmfEventExposure'
+        '404':
+          $ref: '#/components/responses/404'
+    put:
+      summary: Update SMF event subscription
+      operationId: ReplaceIndividualSubcription
+      tags: [Subscriptions]
+      parameters:
+        - $ref: '#/components/parameters/subId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NsmfEventExposure'
+      responses:
+        '200':
+          description: Subscription updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NsmfEventExposure'
+        '404':
+          $ref: '#/components/responses/404'
+    delete:
+      summary: Delete SMF event subscription
+      operationId: DeleteIndividualSubcription
+      tags: [Subscriptions]
+      parameters:
+        - $ref: '#/components/parameters/subId'
+      responses:
+        '204':
+          description: No Content
+        '404':
+          $ref: '#/components/responses/404'
+
+components:
+  parameters:
+    subId:
+      name: subId
+      in: path
+      required: true
+      schema:
+        type: string
+
+  schemas:
+    NsmfEventExposure:
+      type: object
+      required: [notifId, notifUri, eventSubs]
+      properties:
+        supi:
+          type: string
+        notifId:
+          type: string
+        notifUri:
+          type: string
+          format: uri
+        altNotifIpv4Addrs:
+          type: array
+          items:
+            type: string
+            format: ipv4
+        altNotifIpv6Addrs:
+          type: array
+          items:
+            type: string
+            format: ipv6
+        eventSubs:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventSubscription'
+          minItems: 1
+        eventNotifs:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventNotification'
+        pduSeId:
+          type: integer
+          minimum: 1
+          maximum: 255
+        dnn:
+          type: string
+        snssai:
+          $ref: '#/components/schemas/Snssai'
+        subId:
+          type: string
+        supportedFeatures:
+          type: string
+        gpsi:
+          type: string
+
+    EventSubscription:
+      type: object
+      required: [event]
+      properties:
+        event:
+          $ref: '#/components/schemas/SmfEvent'
+        dnaiChgType:
+          type: string
+          enum: [EARLY, EARLY_LATE, LATE]
+        dddTraDescriptors:
+          type: array
+          items:
+            type: object
+        dddStati:
+          type: array
+          items:
+            type: string
+            enum: [BUFFERED, TRANSMITTED, DISCARDED]
+        appIds:
+          type: array
+          items:
+            type: string
+
+    SmfEvent:
+      type: string
+      enum:
+        - AC_TY_CH
+        - UP_PATH_CH
+        - PDU_SES_REL
+        - PLMN_CH
+        - UE_IP_CH
+        - DDDS
+        - COMM_FAIL
+        - PDU_SES_EST
+        - QOS_MON
+        - SMCC_EXP
+        - DISPERSION
+        - RED_TRANS_EXP
+        - WLAN_INFO
+        - ACCESS_TYPE_CHANGE
+
+    EventNotification:
+      type: object
+      required: [event, timeStamp]
+      properties:
+        event:
+          $ref: '#/components/schemas/SmfEvent'
+        timeStamp:
+          type: string
+          format: date-time
+        supi:
+          type: string
+        gpsi:
+          type: string
+        pduSeId:
+          type: integer
+        sourceTraRouting:
+          type: object
+        targetTraRouting:
+          type: object
+        ueMac:
+          type: string
+        adIpv4Addr:
+          type: string
+          format: ipv4
+        adIpv6Prefix:
+          type: string
+        reIpv4Addr:
+          type: string
+          format: ipv4
+        reIpv6Prefix:
+          type: string
+        plmnId:
+          $ref: '#/components/schemas/PlmnId'
+        accType:
+          type: string
+          enum: [3GPP_ACCESS, NON_3GPP_ACCESS]
+        qosMonReports:
+          type: array
+          items:
+            $ref: '#/components/schemas/QosMonitoringReport'
+        commFailure:
+          type: object
+
+    QosMonitoringReport:
+      type: object
+      properties:
+        refPccRuleIds:
+          type: array
+          items:
+            type: string
+        ulDelays:
+          type: array
+          items:
+            type: integer
+        dlDelays:
+          type: array
+          items:
+            type: integer
+        rtDelays:
+          type: array
+          items:
+            type: integer
+
+    Snssai:
+      type: object
+      required: [sst]
+      properties:
+        sst:
+          type: integer
+          minimum: 0
+          maximum: 255
+        sd:
+          type: string
+          pattern: '^[A-Fa-f0-9]{6}$'
+
+    PlmnId:
+      type: object
+      required: [mcc, mnc]
+      properties:
+        mcc:
+          type: string
+          pattern: '^\d{3}$'
+        mnc:
+          type: string
+          pattern: '^\d{2,3}$'
+
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+
+  responses:
+    '400':
+      description: Bad Request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '404':
+      description: Not Found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '500':
+      description: Internal Server Error
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'

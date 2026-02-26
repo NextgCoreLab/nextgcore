@@ -1,0 +1,418 @@
+openapi: 3.0.3
+info:
+  title: Npcrf_PolicyControl
+  version: 1.0.0
+  description: |
+    PCRF Policy Control Service (EPC interwork, TS 29.215 / TS 29.214 SBI variant).
+    Provides PCC policy for EPC/IMS sessions via SGW-C, MME, and P-CSCF.
+
+servers:
+  - url: '{apiRoot}/npcrf-policycontrol/v1'
+    variables:
+      apiRoot:
+        default: https://pcrf.5gc.mnc001.mcc001.3gppnetwork.org
+
+paths:
+  /sm-policies:
+    post:
+      summary: Create SM Policy Context (Gx Create)
+      operationId: CreateSmPolicyContext
+      tags: [SM Policies]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SmPolicyContextRequest'
+      responses:
+        '201':
+          description: SM policy context created
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SmPolicyDecision'
+        '400':
+          $ref: '#/components/responses/400'
+        '500':
+          $ref: '#/components/responses/500'
+
+  /sm-policies/{smPolicyId}:
+    get:
+      summary: Get SM Policy Context
+      operationId: GetSmPolicyContext
+      tags: [SM Policies]
+      parameters:
+        - $ref: '#/components/parameters/smPolicyId'
+      responses:
+        '200':
+          description: SM policy decision
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SmPolicyDecision'
+        '404':
+          $ref: '#/components/responses/404'
+    patch:
+      summary: Update SM Policy Context (Gx Update)
+      operationId: UpdateSmPolicyContext
+      tags: [SM Policies]
+      parameters:
+        - $ref: '#/components/parameters/smPolicyId'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/SmPolicyUpdateContextData'
+      responses:
+        '200':
+          description: Updated SM policy decision
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SmPolicyDecision'
+        '404':
+          $ref: '#/components/responses/404'
+
+  /sm-policies/{smPolicyId}/delete:
+    post:
+      summary: Delete SM Policy Context (Gx Terminate)
+      operationId: DeleteSmPolicyContext
+      tags: [SM Policies]
+      parameters:
+        - $ref: '#/components/parameters/smPolicyId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SmPolicyDeleteData'
+      responses:
+        '200':
+          description: Policy context deleted
+        '204':
+          description: No Content
+        '404':
+          $ref: '#/components/responses/404'
+
+components:
+  parameters:
+    smPolicyId:
+      name: smPolicyId
+      in: path
+      required: true
+      schema:
+        type: string
+
+  schemas:
+    SmPolicyContextRequest:
+      type: object
+      required: [supi, pduSessionType, ipv4Address, accessType, ratType, servingNetwork]
+      properties:
+        supi:
+          type: string
+        pei:
+          type: string
+        gpsi:
+          type: string
+        pduSessionId:
+          type: integer
+        pduSessionType:
+          type: string
+          enum: [IPV4, IPV6, IPV4V6, UNSTRUCTURED, ETHERNET]
+        dnn:
+          type: string
+        singleNssai:
+          $ref: '#/components/schemas/Snssai'
+        ipv4Address:
+          type: string
+          format: ipv4
+        ipv6AddressPrefix:
+          type: string
+        accessType:
+          type: string
+          enum: [3GPP_ACCESS, NON_3GPP_ACCESS]
+        ratType:
+          type: string
+          enum: [NR, EUTRA, WLAN, VIRTUAL, NBIOT, WIRELINE, WIRELINE_CABLE, LTE_M,
+                 NR_U, EUTRA_U, TRUSTED_N3GA, TRUSTED_WLAN, UTRA, GERA, NR_LEO,
+                 NR_MEO, NR_GEO, NR_OTHER_SAT, NR_REDCAP]
+        servingNetwork:
+          $ref: '#/components/schemas/PlmnId'
+        ueTimeZone:
+          type: string
+        userLocationInfo:
+          $ref: '#/components/schemas/UserLocation'
+        chargingCharacteristics:
+          type: string
+          pattern: '^[0-9a-fA-F]{4}$'
+
+    SmPolicyUpdateContextData:
+      type: object
+      properties:
+        accessType:
+          type: string
+          enum: [3GPP_ACCESS, NON_3GPP_ACCESS]
+        ratType:
+          type: string
+        userLocationInfo:
+          $ref: '#/components/schemas/UserLocation'
+        servingNetwork:
+          $ref: '#/components/schemas/PlmnId'
+        accNetChargingAddress:
+          $ref: '#/components/schemas/AccNetChId'
+        ueTimeZone:
+          type: string
+        repPolicyCtrlReqTriggers:
+          type: array
+          items:
+            type: string
+            enum: [PLMN_CH, RES_MO_RE, AC_TY_CH, UE_IP_CH, UE_MAC_CH, AN_CH_COR,
+                   US_RE, APP_STA, APP_STO, AN_INFO, CM_SES_FAIL, PS_DA_OFF,
+                   DEF_QOS_CH, SE_AMBR_CH, QOS_NOTIF, NO_CREDIT, PRA_CH,
+                   SAREA_CH, SCNN_CH, RE_TIMEOUT, RES_RELEASE, SUC_SFF]
+
+    SmPolicyDecision:
+      type: object
+      properties:
+        pccRules:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/PccRule'
+        sessRules:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/SessionRule'
+        revalidationTime:
+          type: string
+          format: date-time
+        offline:
+          type: boolean
+        online:
+          type: boolean
+        suppFeat:
+          type: string
+        relCause:
+          type: string
+          enum: [UNKNOWN, UE_SUBSCRIPTION, INSUFFICIENT_RES, VALIDATION_CONDITION_NOT_MET,
+                 SESSION_HANDOVER]
+
+    PccRule:
+      type: object
+      required: [pccRuleId]
+      properties:
+        pccRuleId:
+          type: string
+        flowInfos:
+          type: array
+          items:
+            $ref: '#/components/schemas/FlowInformation'
+        precedence:
+          type: integer
+          minimum: 0
+          maximum: 255
+        refQosData:
+          type: array
+          items:
+            type: string
+        refCondData:
+          type: string
+        appId:
+          type: string
+        refChgData:
+          type: array
+          items:
+            type: string
+        refChgN3gData:
+          type: array
+          items:
+            type: string
+        afSigProtocol:
+          type: string
+          enum: [NO_INFORMATION, SIP]
+        isAppRelocatable:
+          type: boolean
+
+    FlowInformation:
+      type: object
+      required: [flowDescription]
+      properties:
+        flowDescription:
+          type: string
+          description: IP flow description (5-tuple filter, e.g. "permit out ip from any to 10.1.2.3")
+        packetFilterUsage:
+          type: boolean
+        tosTrafficClass:
+          type: string
+        spi:
+          type: string
+        flowLabel:
+          type: string
+        flowDirection:
+          type: string
+          enum: [DOWNLINK, UPLINK, BIDIRECTIONAL, UNSPECIFIED]
+
+    SessionRule:
+      type: object
+      required: [sessRuleId]
+      properties:
+        sessRuleId:
+          type: string
+        authSessAmbr:
+          $ref: '#/components/schemas/Ambr'
+        authDefQos:
+          $ref: '#/components/schemas/AuthorizedDefaultQos'
+        refUmData:
+          type: string
+        refUmN3gData:
+          type: string
+        refCondData:
+          type: string
+
+    Ambr:
+      type: object
+      required: [uplink, downlink]
+      properties:
+        uplink:
+          type: string
+        downlink:
+          type: string
+
+    AuthorizedDefaultQos:
+      type: object
+      required: [5qi]
+      properties:
+        5qi:
+          type: integer
+        arp:
+          $ref: '#/components/schemas/Arp'
+        sessionAmbr:
+          $ref: '#/components/schemas/Ambr'
+
+    Arp:
+      type: object
+      required: [priorityLevel, preemptCap, preemptVuln]
+      properties:
+        priorityLevel:
+          type: integer
+          minimum: 1
+          maximum: 15
+        preemptCap:
+          type: string
+          enum: [NOT_PREEMPT, MAY_PREEMPT]
+        preemptVuln:
+          type: string
+          enum: [NOT_PREEMPTABLE, PREEMPTABLE]
+
+    SmPolicyDeleteData:
+      type: object
+      properties:
+        cause:
+          type: string
+          enum: [UNKNOWN, UE_SUBSCRIPTION, INSUFFICIENT_RES, VALIDATION_CONDITION_NOT_MET,
+                 SESSION_HANDOVER]
+        userLocationInfo:
+          $ref: '#/components/schemas/UserLocation'
+        ueTimeZone:
+          type: string
+        usageReport:
+          type: array
+          items:
+            $ref: '#/components/schemas/UrSeqNum'
+
+    UserLocation:
+      type: object
+      properties:
+        eutraLocation:
+          type: object
+        nrLocation:
+          type: object
+
+    AccNetChId:
+      type: object
+      properties:
+        occiId:
+          type: string
+        anChargIpv4Addr:
+          type: string
+          format: ipv4
+        anChargIpv6Addr:
+          type: string
+          format: ipv6
+
+    UrSeqNum:
+      type: object
+      properties:
+        ratingGroup:
+          type: integer
+        serviceId:
+          type: integer
+        totalVolume:
+          type: integer
+          format: int64
+        uplinkVolume:
+          type: integer
+          format: int64
+        downlinkVolume:
+          type: integer
+          format: int64
+        duration:
+          type: integer
+
+    Snssai:
+      type: object
+      required: [sst]
+      properties:
+        sst:
+          type: integer
+          minimum: 0
+          maximum: 255
+        sd:
+          type: string
+          pattern: '^[A-Fa-f0-9]{6}$'
+
+    PlmnId:
+      type: object
+      required: [mcc, mnc]
+      properties:
+        mcc:
+          type: string
+          pattern: '^\d{3}$'
+        mnc:
+          type: string
+          pattern: '^\d{2,3}$'
+
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+
+  responses:
+    '400':
+      description: Bad Request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '404':
+      description: Not Found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '500':
+      description: Internal Server Error
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'

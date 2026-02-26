@@ -1,0 +1,336 @@
+openapi: 3.0.3
+info:
+  title: Nsepp_PRINS
+  version: 1.1.0
+  description: |
+    SEPP N32 PRINS (Protection at the SEPP) forwarding interface (TS 29.573).
+    Implements inter-PLMN SBI message forwarding with JWE/JWS protection.
+
+servers:
+  - url: '{n32fRoot}/n32f/v1'
+    variables:
+      n32fRoot:
+        default: https://sepp.5gc.mnc001.mcc001.3gppnetwork.org
+
+paths:
+  /exchange-capability:
+    post:
+      summary: N32-f context setup — capability exchange
+      operationId: PostExchangeCapability
+      tags: [N32-f Context]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SecNegotiateReqData'
+      responses:
+        '200':
+          description: Security capability negotiated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SecNegotiateRspData'
+        '400':
+          $ref: '#/components/responses/400'
+        '403':
+          $ref: '#/components/responses/403'
+
+  /exchange-params:
+    post:
+      summary: N32-f context setup — parameter exchange
+      operationId: PostExchangeParams
+      tags: [N32-f Context]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/N32fContextInfo'
+      responses:
+        '200':
+          description: Context established
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/N32fContextInfo'
+        '400':
+          $ref: '#/components/responses/400'
+        '403':
+          $ref: '#/components/responses/403'
+
+  /n32f-process:
+    post:
+      summary: Forward N32-f message (PRINS protected)
+      operationId: PostN32fProcess
+      tags: [N32-f Forwarding]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/N32fReformattedReqMsg'
+      responses:
+        '200':
+          description: Forward response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/N32fReformattedRspMsg'
+        '400':
+          $ref: '#/components/responses/400'
+        '403':
+          $ref: '#/components/responses/403'
+        '503':
+          $ref: '#/components/responses/503'
+
+  /n32f-terminate:
+    post:
+      summary: Terminate N32-f context
+      operationId: PostN32fTerminate
+      tags: [N32-f Context]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SecParamExchReqData'
+      responses:
+        '200':
+          description: Context terminated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SecParamExchRspData'
+        '404':
+          $ref: '#/components/responses/404'
+
+  /n32f-error:
+    post:
+      summary: Send N32-f error notification
+      operationId: PostN32fError
+      tags: [N32-f Forwarding]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/N32fErrorInfo'
+      responses:
+        '204':
+          description: No Content
+
+components:
+  schemas:
+    SecNegotiateReqData:
+      type: object
+      required: [sender, supportedSecCapabilityList]
+      properties:
+        sender:
+          type: string
+          description: FQDN of the sending SEPP
+        supportedSecCapabilityList:
+          type: array
+          items:
+            type: string
+            enum: [TLS, PRINS]
+          minItems: 1
+        3gppSbiTargetApiRootSupported:
+          type: boolean
+
+    SecNegotiateRspData:
+      type: object
+      required: [sender, selectedSecCapability]
+      properties:
+        sender:
+          type: string
+        selectedSecCapability:
+          type: string
+          enum: [TLS, PRINS]
+        3gppSbiTargetApiRootSupported:
+          type: boolean
+
+    N32fContextInfo:
+      type: object
+      required: [n32fContextId]
+      properties:
+        n32fContextId:
+          type: string
+          description: Unique N32-f context identifier
+        jweCiphersuite:
+          type: array
+          items:
+            type: string
+            enum: [A128CBC-HS256, A256CBC-HS512, A128GCM, A256GCM]
+        jwsCiphersuite:
+          type: array
+          items:
+            type: string
+            enum: [ES256, ES384, ES512, RS256, RS384, RS512, PS256, PS384, PS512]
+        protectionPolicyInfo:
+          $ref: '#/components/schemas/ProtectionPolicy'
+
+    ProtectionPolicy:
+      type: object
+      required: [apiIeMapping]
+      properties:
+        apiIeMapping:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApiIeMapping'
+        dataTypeEncPolicy:
+          type: array
+          items:
+            type: string
+            enum: [SUPI, SUCI, IMEI, IMPI, IMPU, HTTP_HEADERS, QUERY_PARAMS]
+
+    ApiIeMapping:
+      type: object
+      required: [apiSignature, ipxMessageList]
+      properties:
+        apiSignature:
+          $ref: '#/components/schemas/ApiSignature'
+        ipxMessageList:
+          type: array
+          items:
+            $ref: '#/components/schemas/IpxMessageInfo'
+
+    ApiSignature:
+      type: object
+      properties:
+        apiName:
+          type: string
+        apiVersion:
+          type: string
+
+    IpxMessageInfo:
+      type: object
+      required: [ieMappingList]
+      properties:
+        ieMappingList:
+          type: array
+          items:
+            $ref: '#/components/schemas/IeInfo'
+        ipxProviderId:
+          type: string
+
+    IeInfo:
+      type: object
+      required: [ieLoc, ieType]
+      properties:
+        ieLoc:
+          type: string
+          enum: [HEADER, BODY, QUERY_PARAM]
+        ieType:
+          type: string
+          enum: [UEID, LOCATION, KEY_MATERIAL, AUTHENTICATION_MATERIAL, AUTHORIZATION_TOKEN,
+                 OTHER, NONSENSITIVE]
+        reqIe:
+          type: string
+        rspIe:
+          type: string
+        isModifiable:
+          type: boolean
+
+    N32fReformattedReqMsg:
+      type: object
+      required: [reformattedData]
+      properties:
+        reformattedData:
+          type: string
+          description: JWE/JOSE-encoded N32-f message (base64url)
+        n32fContextId:
+          type: string
+
+    N32fReformattedRspMsg:
+      type: object
+      required: [reformattedData]
+      properties:
+        reformattedData:
+          type: string
+          description: JWE/JOSE-encoded N32-f response
+
+    SecParamExchReqData:
+      type: object
+      required: [n32fContextId, cause]
+      properties:
+        n32fContextId:
+          type: string
+        cause:
+          type: string
+          enum: [SWITCHOVER_SUCCESS, SWITCHOVER_FAILURE, CONTEXT_REMOVED_REQUESTED,
+                 CONTEXT_REMOVED_LOCAL]
+
+    SecParamExchRspData:
+      type: object
+      required: [n32fContextId]
+      properties:
+        n32fContextId:
+          type: string
+        acknowledgedTermination:
+          type: boolean
+
+    N32fErrorInfo:
+      type: object
+      required: [n32fContextId, n32fErrorType]
+      properties:
+        n32fContextId:
+          type: string
+        n32fErrorType:
+          type: string
+          enum: [INTEGRITY_CHECK_FAILED, INTEGRITY_CHECK_ON_MODIFICATIONS_FAILED,
+                 MODIFICATIONS_NOT_ALLOWED, PROTECTION_POLICY_NOT_FULFILLED,
+                 MESSAGE_RECONSTRUCTION_FAILED, CONTEXT_NOT_FOUND,
+                 INTEGRITY_KEY_EXPIRED, ENCRYPTION_KEY_EXPIRED,
+                 DECIPHERING_FAILED, FORWARD_MESSAGE_NOT_PERMITTED]
+        typeOfMessage:
+          type: string
+          enum: [N32_REQ, N32_RESP]
+        n32fMessageId:
+          type: string
+        ipxMessageIds:
+          type: array
+          items:
+            type: string
+        failedModificationList:
+          type: array
+          items:
+            type: string
+
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+
+  responses:
+    '400':
+      description: Bad Request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '403':
+      description: Forbidden
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '404':
+      description: Not Found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '503':
+      description: Service Unavailable
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
