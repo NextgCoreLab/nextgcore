@@ -309,6 +309,17 @@ impl NgapServer {
                     // gNB confirmed resource release - session cleanup already done.
                 }
             }
+            Some(41) => {
+                // UEContextReleaseRequest (procedure code 41)
+                if data[0] == 0x00 {
+                    // InitiatingMessage from gNB
+                    log::info!("UE Context Release Request from gNB");
+                    self.handle_ue_context_release(association_id, data).await?;
+                } else if data[0] == 0x20 {
+                    // SuccessfulOutcome = UEContextReleaseComplete from gNB
+                    log::info!("UE Context Release Complete from gNB");
+                }
+            }
             _ => {
                 log::debug!("Unknown procedure code, forwarding to FSM");
                 // Create NGAP event for FSM processing
@@ -1289,6 +1300,87 @@ impl NgapServer {
             }
         } else {
             log::warn!("Could not extract gNB TEID from PDU Session Resource Setup Response");
+        }
+
+        Ok(())
+    }
+
+    /// Handle UE Context Release Request from gNB
+    ///
+    /// Releases all PDU sessions at SMF and sends UEContextReleaseCommand back.
+    async fn handle_ue_context_release(
+        &mut self,
+        association_id: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        log::info!(
+            "UE Context Release Request from association {} ({} bytes)",
+            association_id, data.len()
+        );
+
+        // Parse AMF UE NGAP ID and RAN UE NGAP ID from the message
+        // The release request contains: procedure_code(1), criticality(1), length(variable),
+        // then IEs for AMF-UE-NGAP-ID, RAN-UE-NGAP-ID, PDUSessionResourceList, Cause
+        let amf_ue_ngap_id = crate::ngap_asn1::extract_amf_ue_ngap_id(data);
+        let ran_ue_ngap_id = crate::ngap_asn1::extract_ran_ue_ngap_id(data);
+
+        log::info!(
+            "UE Context Release: AMF UE NGAP ID={:?}, RAN UE NGAP ID={:?}",
+            amf_ue_ngap_id, ran_ue_ngap_id
+        );
+
+        // Release all PDU sessions at SMF
+        let smf_host = std::env::var("SMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let smf_port: u16 = std::env::var("SMF_SBI_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(7777);
+
+        // Look up active sessions for this UE via AMF UE NGAP ID -> RanUe -> amf_ue_id -> sessions
+        // Collect session refs under the read lock, then release lock before async SMF calls
+        let sm_context_refs: Vec<(u8, String)> = {
+            let mut refs = Vec::new();
+            if let Some(ngap_id) = amf_ue_ngap_id {
+                let ctx = crate::context::amf_self();
+                let context = ctx.read();
+                if let Ok(context) = context {
+                    let amf_ue_id = context
+                        .ran_ue_find_by_amf_ue_ngap_id(ngap_id)
+                        .map(|ran_ue| ran_ue.amf_ue_id)
+                        .unwrap_or(ngap_id);
+
+                    for sess in context.sess_list_for_ue(amf_ue_id).iter() {
+                        if let Some(ref r) = sess.sm_context_ref {
+                            refs.push((sess.psi, r.clone()));
+                        }
+                    }
+                }
+            }
+            refs
+        };
+
+        if sm_context_refs.is_empty() {
+            log::debug!("No PDU sessions to release for UE context release");
+        }
+        for (psi, sm_context_ref) in &sm_context_refs {
+            log::info!("Releasing SMF SM Context: PSI={psi}, ref={sm_context_ref}");
+            match crate::sbi_path::call_smf_release_sm_context(
+                &smf_host, smf_port, sm_context_ref,
+            ).await {
+                Ok(()) => log::info!("SMF SM Context Released: PSI={psi}"),
+                Err(e) => log::warn!("SMF release failed for PSI={psi}: {e}"),
+            }
+        }
+
+        // Build and send UEContextReleaseCommand
+        if let (Some(amf_id), Some(ran_id)) = (amf_ue_ngap_id, ran_ue_ngap_id) {
+            let release_cmd = crate::ngap_asn1::build_ue_context_release_command_asn1(
+                amf_id, ran_id,
+            );
+            if let Some(cmd) = release_cmd {
+                self.send_to_association(association_id, &cmd).await?;
+                log::info!("UE Context Release Command sent to gNB");
+            }
         }
 
         Ok(())

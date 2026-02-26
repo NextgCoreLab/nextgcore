@@ -22,6 +22,7 @@ mod sbi_path;
 mod sbi_response;
 mod sepp_sm;
 mod timer;
+pub mod zero_trust; // Zero-trust policy engine for inter-PLMN N32 (TS 33.501)
 
 // Re-export specific items to avoid ambiguous glob re-exports
 pub use context::{

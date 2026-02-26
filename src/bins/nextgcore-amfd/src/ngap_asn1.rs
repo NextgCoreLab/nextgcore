@@ -962,6 +962,61 @@ pub fn build_paging_asn1(
     }
 }
 
+/// Extract AMF UE NGAP ID from a UE Context Release Request
+pub fn extract_amf_ue_ngap_id(data: &[u8]) -> Option<u64> {
+    use nextgsim_ngap::procedures::ue_context_release::decode_ue_context_release_request;
+    match decode_ue_context_release_request(data) {
+        Ok(req) => Some(req.amf_ue_ngap_id),
+        Err(e) => {
+            log::warn!("Failed to extract AMF UE NGAP ID: {e}");
+            None
+        }
+    }
+}
+
+/// Extract RAN UE NGAP ID from a UE Context Release Request
+pub fn extract_ran_ue_ngap_id(data: &[u8]) -> Option<u32> {
+    use nextgsim_ngap::procedures::ue_context_release::decode_ue_context_release_request;
+    match decode_ue_context_release_request(data) {
+        Ok(req) => Some(req.ran_ue_ngap_id),
+        Err(e) => {
+            log::warn!("Failed to extract RAN UE NGAP ID: {e}");
+            None
+        }
+    }
+}
+
+/// Build a UE Context Release Command with proper ASN.1 APER encoding
+pub fn build_ue_context_release_command_asn1(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+) -> Option<Vec<u8>> {
+    use nextgsim_ngap::procedures::ue_context_release::*;
+    use nextgsim_ngap::procedures::ng_setup::NasCause;
+
+    let params = UeContextReleaseCommandParams {
+        ue_ngap_ids: UeNgapIds::Pair {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+        },
+        cause: UeContextReleaseCause::Nas(NasCause::NormalRelease),
+    };
+
+    match encode_ue_context_release_command(&params) {
+        Ok(bytes) => {
+            log::debug!(
+                "Built UE Context Release Command: {} bytes, AMF UE NGAP ID={}, RAN UE NGAP ID={}",
+                bytes.len(), amf_ue_ngap_id, ran_ue_ngap_id
+            );
+            Some(bytes)
+        }
+        Err(e) => {
+            log::error!("Failed to encode UE Context Release Command: {e}");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

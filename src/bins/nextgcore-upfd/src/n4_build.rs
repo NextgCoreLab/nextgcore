@@ -1100,6 +1100,8 @@ pub struct ParsedPdi {
     pub network_instance: Option<String>,
     pub ue_ip_address: Option<ParsedUeIpAddr>,
     pub qfi: Option<u8>,
+    /// Flow description from the first SDF Filter IE (3GPP TS 29.212 IPFilterRule)
+    pub sdf_flow_description: Option<String>,
 }
 
 /// Parse PDI IE
@@ -1133,6 +1135,23 @@ fn parse_pdi(data: &[u8]) -> Result<ParsedPdi, &'static str> {
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::QFI) {
         if !ie.value.is_empty() {
             pdi.qfi = Some(ie.value[0]);
+        }
+    }
+
+    // SDF Filter - extract flow description string
+    // SDF Filter IE format: Flags (2 bytes) + Flow Description Length (2 bytes) + Flow Description
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::SDF_FILTER) {
+        if ie.value.len() >= 4 {
+            let flags = ie.value[0];
+            // Bit 0 (FD) = Flow Description present
+            if flags & 0x01 != 0 {
+                let fd_len = u16::from_be_bytes([ie.value[2], ie.value[3]]) as usize;
+                if ie.value.len() >= 4 + fd_len {
+                    pdi.sdf_flow_description = Some(
+                        String::from_utf8_lossy(&ie.value[4..4 + fd_len]).to_string()
+                    );
+                }
+            }
         }
     }
 
@@ -1701,5 +1720,109 @@ mod tests {
         let msg = builder.build();
         // TLV header(4) + flags(1) + ipv4(4) = 9
         assert_eq!(msg.len(), 9);
+    }
+
+    // -- SDF Filter Parsing tests --
+
+    /// Build a raw SDF Filter IE value (the content inside the TLV)
+    fn build_sdf_filter_ie_value(flow_desc: &str) -> Vec<u8> {
+        let desc_bytes = flow_desc.as_bytes();
+        let mut ie_value = Vec::new();
+        // Flags: 2 bytes — bit 0 (FD) = flow description present
+        ie_value.push(0x01); // FD flag set
+        ie_value.push(0x00); // spare
+        // Flow description length: 2 bytes (big-endian)
+        ie_value.push((desc_bytes.len() >> 8) as u8);
+        ie_value.push((desc_bytes.len() & 0xFF) as u8);
+        // Flow description string
+        ie_value.extend_from_slice(desc_bytes);
+        ie_value
+    }
+
+    /// Build a PDI IE containing source_interface + SDF Filter
+    fn build_pdi_ie_with_sdf(source_interface: u8, flow_desc: &str) -> Vec<u8> {
+        let mut pdi_data = Vec::new();
+
+        // Source Interface IE (type=20, length=1)
+        pdi_data.extend_from_slice(&pfcp_ie::SOURCE_INTERFACE.to_be_bytes());
+        pdi_data.extend_from_slice(&1u16.to_be_bytes());
+        pdi_data.push(source_interface);
+
+        // SDF Filter IE (type=23)
+        let sdf_value = build_sdf_filter_ie_value(flow_desc);
+        pdi_data.extend_from_slice(&pfcp_ie::SDF_FILTER.to_be_bytes());
+        pdi_data.extend_from_slice(&(sdf_value.len() as u16).to_be_bytes());
+        pdi_data.extend_from_slice(&sdf_value);
+
+        pdi_data
+    }
+
+    #[test]
+    fn test_parse_pdi_with_sdf_filter_fd_flag_set() {
+        let pdi_data = build_pdi_ie_with_sdf(0, "permit out ip from any to any");
+        let pdi = parse_pdi(&pdi_data).unwrap();
+        assert_eq!(pdi.source_interface, 0);
+        assert_eq!(
+            pdi.sdf_flow_description.as_deref(),
+            Some("permit out ip from any to any")
+        );
+    }
+
+    #[test]
+    fn test_parse_pdi_with_sdf_filter_fd_flag_clear() {
+        let mut pdi_data = Vec::new();
+        // Source Interface
+        pdi_data.extend_from_slice(&pfcp_ie::SOURCE_INTERFACE.to_be_bytes());
+        pdi_data.extend_from_slice(&1u16.to_be_bytes());
+        pdi_data.push(1); // Core
+
+        // SDF Filter with FD flag NOT set
+        let mut sdf_value = vec![0x00, 0x00]; // flags = 0 (no FD)
+        sdf_value.extend_from_slice(&0u16.to_be_bytes()); // length = 0
+        pdi_data.extend_from_slice(&pfcp_ie::SDF_FILTER.to_be_bytes());
+        pdi_data.extend_from_slice(&(sdf_value.len() as u16).to_be_bytes());
+        pdi_data.extend_from_slice(&sdf_value);
+
+        let pdi = parse_pdi(&pdi_data).unwrap();
+        assert_eq!(pdi.source_interface, 1);
+        assert!(pdi.sdf_flow_description.is_none());
+    }
+
+    #[test]
+    fn test_parse_pdi_with_sdf_filter_too_short() {
+        let mut pdi_data = Vec::new();
+        // Source Interface
+        pdi_data.extend_from_slice(&pfcp_ie::SOURCE_INTERFACE.to_be_bytes());
+        pdi_data.extend_from_slice(&1u16.to_be_bytes());
+        pdi_data.push(0);
+
+        // SDF Filter with only 2 bytes (too short — need >= 4)
+        pdi_data.extend_from_slice(&pfcp_ie::SDF_FILTER.to_be_bytes());
+        pdi_data.extend_from_slice(&2u16.to_be_bytes());
+        pdi_data.extend_from_slice(&[0x01, 0x00]); // flags only, no length
+
+        let pdi = parse_pdi(&pdi_data).unwrap();
+        assert!(pdi.sdf_flow_description.is_none()); // graceful: not enough bytes
+    }
+
+    #[test]
+    fn test_parse_pdi_with_udp_sdf_filter() {
+        let flow = "permit out 17 from 10.0.0.1 to 10.0.0.2 80";
+        let pdi_data = build_pdi_ie_with_sdf(0, flow);
+        let pdi = parse_pdi(&pdi_data).unwrap();
+        assert_eq!(pdi.sdf_flow_description.as_deref(), Some(flow));
+    }
+
+    #[test]
+    fn test_parse_pdi_no_sdf_filter() {
+        let mut pdi_data = Vec::new();
+        // Source Interface only
+        pdi_data.extend_from_slice(&pfcp_ie::SOURCE_INTERFACE.to_be_bytes());
+        pdi_data.extend_from_slice(&1u16.to_be_bytes());
+        pdi_data.push(0);
+
+        let pdi = parse_pdi(&pdi_data).unwrap();
+        assert_eq!(pdi.source_interface, 0);
+        assert!(pdi.sdf_flow_description.is_none());
     }
 }

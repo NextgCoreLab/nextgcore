@@ -12,6 +12,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
+use crate::session_extensions::Ipv4Pool;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -1413,6 +1415,9 @@ pub struct SmfContext {
     /// Maximum number of bearers
     max_num_of_bearer: usize,
 
+    /// Bitmap-based IPv4 address pool (10.45.0.0/16)
+    pub ipv4_pool: Ipv4Pool,
+
     /// Context initialized flag
     initialized: AtomicBool,
 }
@@ -1452,6 +1457,7 @@ impl SmfContext {
             max_num_of_ue: 0,
             max_num_of_sess: 0,
             max_num_of_bearer: 0,
+            ipv4_pool: Ipv4Pool::default_pool(),
             initialized: AtomicBool::new(false),
         }
     }
@@ -1748,6 +1754,7 @@ impl SmfContext {
             
             if let Some(addr) = sess.ipv4_addr {
                 ipv4_hash.remove(&u32::from(addr));
+                self.ipv4_pool.release(addr);
             }
             if let Some((_, addr)) = sess.ipv6_prefix {
                 let prefix: [u8; 8] = addr.octets()[..8].try_into().unwrap_or([0; 8]);
@@ -1937,6 +1944,11 @@ impl SmfContext {
     /// Get number of sessions
     pub fn sess_count(&self) -> usize {
         self.sess_list.read().map(|l| l.len()).unwrap_or(0)
+    }
+
+    /// Get next session index (monotonically increasing, unique per SM context ref)
+    pub fn next_sess_index(&self) -> u64 {
+        self.sess_index.fetch_add(1, Ordering::Relaxed)
     }
 
 

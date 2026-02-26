@@ -27,6 +27,7 @@ mod sbi_path;
 mod sbi_response;
 #[allow(dead_code)]
 mod intent_policy;
+pub mod ue_policy; // Rel-16: URSP rule provisioning (TS 23.503)
 mod sm_sm;
 mod timer;
 

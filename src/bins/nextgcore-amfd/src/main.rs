@@ -20,6 +20,8 @@ pub mod timer;
 pub mod metrics;
 pub mod emergency; // #203: Emergency services (TS 23.167)
 pub mod ngap_mcast; // MBS: NGAP multicast session procedures (TS 38.413 / TS 23.247)
+pub mod snpn;       // Rel-16: SNPN authentication (TS 23.501 §5.30)
+pub mod xn_handover; // Rel-15: Xn path switch and N2 handover (TS 23.502 §4.9)
 
 #[cfg(test)]
 mod property_tests;
