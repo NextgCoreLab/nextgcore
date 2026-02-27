@@ -25,3 +25,12 @@ pcf:
     server:
       - address: 172.23.0.13
         port: 9090
+
+        # TLS configuration (G36: SBI TLS)
+        # Enable: TLS_ENABLED=true SBI_SCHEME=https docker compose up -d
+        tls:
+          enabled: false
+          cert: /etc/nextgcore/certs/pcf.crt
+          key: /etc/nextgcore/certs/pcf.key
+          ca: /etc/nextgcore/certs/ca.crt
+          min_version: "1.2"
