@@ -23,3 +23,12 @@ ausf:
     pqc:
       enabled: false
       prefer_pqc: false
+
+        # TLS configuration (G36: SBI TLS)
+        # Enable: TLS_ENABLED=true SBI_SCHEME=https docker compose up -d
+        tls:
+          enabled: false
+          cert: /etc/nextgcore/certs/ausf.crt
+          key: /etc/nextgcore/certs/ausf.key
+          ca: /etc/nextgcore/certs/ca.crt
+          min_version: "1.2"

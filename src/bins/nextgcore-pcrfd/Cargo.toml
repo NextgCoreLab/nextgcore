@@ -26,6 +26,7 @@ ctrlc.workspace = true
 
 # Internal crates
 ogs-core = { path = "../../libs/ogs-core" }
+ogs-metrics = { workspace = true }
 ogs-diameter = { path = "../../libs/ogs-diameter" }
 ogs-dbi = { path = "../../libs/ogs-dbi" }
 ogs-app = { path = "../../libs/ogs-app" }

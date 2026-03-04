@@ -24,6 +24,16 @@ use crate::oauth::OAuth2Client;
 use crate::tls;
 use crate::types::{NfType, UriScheme};
 
+/// Generate a simple 8-byte span ID from the current timestamp nanoseconds.
+/// In production this would use the OTel SDK's span ID generator.
+fn new_span_id() -> [u8; 8] {
+    let ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    ns.to_be_bytes()
+}
+
 /// Default connection timeout in seconds
 const DEFAULT_CONNECT_TIMEOUT: u64 = 5;
 /// Default request timeout in seconds
@@ -277,6 +287,29 @@ impl SbiClient {
                     }
                 }
             }
+        }
+
+        // G32/G43: Propagate W3C traceparent header for distributed tracing.
+        // If the incoming request already carries a traceparent (set by caller)
+        // we respect it; otherwise we generate a new child span.
+        if request.http.get_header("traceparent").is_none() {
+            // Generate a minimal traceparent from thread-local trace context.
+            // If no ambient trace context is set we start a new trace with a
+            // sampled root span (flags=01).
+            let trace_id: [u8; 16] = {
+                let ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as u128;
+                ns.to_be_bytes()
+            };
+            let span_id = new_span_id();
+            let traceparent = format!(
+                "00-{}-{}-01",
+                hex::encode(trace_id),
+                hex::encode(span_id),
+            );
+            request.http.set_header("traceparent", traceparent);
         }
 
         let mut sender = self.get_connection().await?;

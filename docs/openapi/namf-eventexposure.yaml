@@ -1,0 +1,355 @@
+openapi: 3.0.3
+info:
+  title: Namf_EventExposure
+  version: 1.3.0
+  description: |
+    AMF Event Exposure Service (TS 29.518 §5.3).
+    Allows NFs/AFs to subscribe to AMF events: UE registration, location, reachability.
+
+servers:
+  - url: '{apiRoot}/namf-evts/v1'
+    variables:
+      apiRoot:
+        default: https://amf.5gc.mnc001.mcc001.3gppnetwork.org
+
+paths:
+  /subscriptions:
+    post:
+      summary: Create AMF event subscription
+      operationId: CreateSubscription
+      tags: [Subscriptions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AmfCreateEventSubscription'
+      responses:
+        '201':
+          description: Subscription created
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AmfCreatedEventSubscription'
+        '400':
+          $ref: '#/components/responses/400'
+        '403':
+          $ref: '#/components/responses/403'
+        '500':
+          $ref: '#/components/responses/500'
+
+  /subscriptions/{subscriptionId}:
+    get:
+      summary: Get AMF event subscription
+      operationId: GetSubscription
+      tags: [Subscriptions]
+      parameters:
+        - $ref: '#/components/parameters/subscriptionId'
+      responses:
+        '200':
+          description: Subscription
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AmfCreatedEventSubscription'
+        '404':
+          $ref: '#/components/responses/404'
+    patch:
+      summary: Update AMF event subscription
+      operationId: ModifySubscription
+      tags: [Subscriptions]
+      parameters:
+        - $ref: '#/components/parameters/subscriptionId'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/AmfCreateEventSubscription'
+      responses:
+        '200':
+          description: Subscription updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AmfCreatedEventSubscription'
+        '404':
+          $ref: '#/components/responses/404'
+    delete:
+      summary: Delete AMF event subscription
+      operationId: DeleteSubscription
+      tags: [Subscriptions]
+      parameters:
+        - $ref: '#/components/parameters/subscriptionId'
+      responses:
+        '204':
+          description: No Content
+        '404':
+          $ref: '#/components/responses/404'
+
+components:
+  parameters:
+    subscriptionId:
+      name: subscriptionId
+      in: path
+      required: true
+      schema:
+        type: string
+
+  schemas:
+    AmfCreateEventSubscription:
+      type: object
+      required: [subscription]
+      properties:
+        subscription:
+          $ref: '#/components/schemas/AmfEventSubscription'
+        supportedFeatures:
+          type: string
+
+    AmfCreatedEventSubscription:
+      type: object
+      required: [subscription]
+      properties:
+        subscription:
+          $ref: '#/components/schemas/AmfEventSubscription'
+        subscriptionId:
+          type: string
+        reportList:
+          type: array
+          items:
+            $ref: '#/components/schemas/AmfEventReport'
+
+    AmfEventSubscription:
+      type: object
+      required: [eventList, notifyUri, notifyCorrelationId, nfId]
+      properties:
+        eventList:
+          type: array
+          items:
+            $ref: '#/components/schemas/AmfEvent'
+          minItems: 1
+        notifyUri:
+          type: string
+          format: uri
+        notifyCorrelationId:
+          type: string
+        nfId:
+          type: string
+          format: uuid
+        subsChangeNotifyUri:
+          type: string
+          format: uri
+        subsChangeNotifyCorrelationId:
+          type: string
+        supi:
+          type: string
+        groupId:
+          type: string
+        gpsi:
+          type: string
+        pei:
+          type: string
+        anyUE:
+          type: boolean
+        options:
+          $ref: '#/components/schemas/AmfEventMode'
+
+    AmfEvent:
+      type: object
+      required: [type]
+      properties:
+        type:
+          $ref: '#/components/schemas/AmfEventType'
+        immediateFlag:
+          type: boolean
+        areaList:
+          type: array
+          items:
+            $ref: '#/components/schemas/AmfEventArea'
+        locationFilterList:
+          type: array
+          items:
+            type: string
+            enum: [TAI, CELL_ID, N3IWF, UE_IP, UDP_PORT, EUPF, N6_IND, NW_APP_PORT_ID, GL2]
+        refId:
+          type: integer
+        trafficDescriptorList:
+          type: array
+          items:
+            type: object
+        reachabilityFilter:
+          type: string
+          enum: [REACHABLE, UNREACHABLE]
+        udmDetectionInd:
+          type: boolean
+        maxReports:
+          type: integer
+        presenceInfoList:
+          type: object
+          additionalProperties:
+            type: object
+
+    AmfEventType:
+      type: string
+      enum:
+        - LOCATION_REPORT
+        - PRESENCE_IN_AOI_REPORT
+        - TIMEZONE_REPORT
+        - ACCESS_TYPE_REPORT
+        - REGISTRATION_STATE_REPORT
+        - CONNECTIVITY_STATE_REPORT
+        - REACHABILITY_REPORT
+        - COMMUNICATION_FAILURE_REPORT
+        - UES_IN_AREA_REPORT
+        - SUBSCRIPTION_ID_CHANGE
+        - SUBSCRIPTION_ID_ADDITION
+        - LOSS_OF_CONNECTIVITY
+        - PDU_SES_REL
+        - PDU_SES_EST
+        - UE_DEREGISTER
+        - 5GS_USER_STATE_CHANGE
+
+    AmfEventArea:
+      type: object
+      properties:
+        areaCode:
+          type: string
+        nsiId:
+          type: string
+        ladn:
+          type: string
+
+    AmfEventMode:
+      type: object
+      properties:
+        trigger:
+          type: string
+          enum: [ONE_TIME, CONTINUOUS, PERIODIC]
+        maxReports:
+          type: integer
+        expiry:
+          type: string
+          format: date-time
+        repPeriod:
+          type: integer
+        sampRatio:
+          type: integer
+          minimum: 1
+          maximum: 100
+        partitioningCriteria:
+          type: array
+          items:
+            type: string
+            enum: [TAC, SUBPLMN, GEOAREA, SNSSAI, DNN]
+
+    AmfEventReport:
+      type: object
+      required: [type, state, timeStamp]
+      properties:
+        type:
+          $ref: '#/components/schemas/AmfEventType'
+        state:
+          $ref: '#/components/schemas/AmfEventState'
+        timeStamp:
+          type: string
+          format: date-time
+        subscriptionId:
+          type: string
+        notifyCorrelationId:
+          type: string
+        supi:
+          type: string
+        aNTypeUe:
+          type: string
+          enum: [3GPP_ACCESS, NON_3GPP_ACCESS]
+        areaList:
+          type: array
+          items:
+            $ref: '#/components/schemas/AmfEventArea'
+        refId:
+          type: integer
+        locInfo:
+          $ref: '#/components/schemas/UserLocation'
+        numOfUes:
+          type: integer
+        timeZone:
+          type: string
+        reachability:
+          type: string
+          enum: [REACHABLE, UNREACHABLE]
+        regStates:
+          type: array
+          items:
+            type: string
+            enum: [RM_REGISTERED, RM_DEREGISTERED]
+        cmInfoList:
+          type: array
+          items:
+            $ref: '#/components/schemas/CmInfo'
+
+    AmfEventState:
+      type: string
+      enum: [ACTIVE, INACTIVE]
+
+    UserLocation:
+      type: object
+      properties:
+        eutraLocation:
+          type: object
+        nrLocation:
+          type: object
+        n3gaLocation:
+          type: object
+
+    CmInfo:
+      type: object
+      required: [cmState, accessType]
+      properties:
+        cmState:
+          type: string
+          enum: [CM_IDLE, CM_CONNECTED]
+        accessType:
+          type: string
+          enum: [3GPP_ACCESS, NON_3GPP_ACCESS]
+
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+
+  responses:
+    '400':
+      description: Bad Request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '403':
+      description: Forbidden
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '404':
+      description: Not Found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '500':
+      description: Internal Server Error
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'

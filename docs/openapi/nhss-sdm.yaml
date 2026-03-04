@@ -1,0 +1,348 @@
+openapi: 3.0.3
+info:
+  title: Nhss_IMS_SDM
+  version: 1.1.0
+  description: |
+    HSS IMS Subscriber Data Management Service (TS 29.562).
+    Provides IMS subscriber data for S-CSCF and AS via Cx/Sh interfaces (SBI variant).
+
+servers:
+  - url: '{apiRoot}/nhss-ims-sdm/v1'
+    variables:
+      apiRoot:
+        default: https://hss.5gc.mnc001.mcc001.3gppnetwork.org
+
+paths:
+  /{impu}/registration-status:
+    get:
+      summary: Get IMS subscriber registration status
+      operationId: GetRegistrationStatus
+      tags: [IMS Registration]
+      parameters:
+        - $ref: '#/components/parameters/impu'
+        - $ref: '#/components/parameters/supportedFeatures'
+      responses:
+        '200':
+          description: IMS registration status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImsRegistrationStatus'
+        '404':
+          $ref: '#/components/responses/404'
+
+  /{impi}/authentication-vectors:
+    post:
+      summary: Generate IMS authentication vectors (Cx MAR)
+      operationId: GenerateAuthVectors
+      tags: [Authentication]
+      parameters:
+        - $ref: '#/components/parameters/impi'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthenticationInfoRequestIms'
+      responses:
+        '200':
+          description: IMS authentication vectors
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationInfoResultIms'
+        '400':
+          $ref: '#/components/responses/400'
+        '404':
+          $ref: '#/components/responses/404'
+
+  /{impi}/registrations:
+    put:
+      summary: Register S-CSCF (Cx SAR)
+      operationId: UpdateRegistration
+      tags: [IMS Registration]
+      parameters:
+        - $ref: '#/components/parameters/impi'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ScscfRegistration'
+      responses:
+        '200':
+          description: S-CSCF registered; subscription data returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImsSubscriptionData'
+        '404':
+          $ref: '#/components/responses/404'
+    delete:
+      summary: Deregister S-CSCF
+      operationId: DeleteRegistration
+      tags: [IMS Registration]
+      parameters:
+        - $ref: '#/components/parameters/impi'
+      responses:
+        '204':
+          description: No Content
+        '404':
+          $ref: '#/components/responses/404'
+
+  /{impu}/location-info:
+    get:
+      summary: Query S-CSCF location (Cx LIR)
+      operationId: GetLocationInfo
+      tags: [IMS Registration]
+      parameters:
+        - $ref: '#/components/parameters/impu'
+      responses:
+        '200':
+          description: Location info
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImsLocationInfo'
+        '404':
+          $ref: '#/components/responses/404'
+
+components:
+  parameters:
+    impu:
+      name: impu
+      in: path
+      required: true
+      schema:
+        type: string
+      description: IMS Public User Identity (SIP URI or TEL URI)
+    impi:
+      name: impi
+      in: path
+      required: true
+      schema:
+        type: string
+      description: IMS Private User Identity
+    supportedFeatures:
+      name: supported-features
+      in: query
+      schema:
+        type: string
+
+  schemas:
+    ImsRegistrationStatus:
+      type: object
+      required: [registrationState]
+      properties:
+        registrationState:
+          type: string
+          enum: [NOT_REGISTERED, REGISTERED, UNREGISTERED]
+        scscfName:
+          type: string
+          format: uri
+        wildcardedPublicIdentity:
+          type: string
+        serverCapabilities:
+          $ref: '#/components/schemas/ServerCapabilities'
+
+    AuthenticationInfoRequestIms:
+      type: object
+      required: [authScheme, scscfServerName]
+      properties:
+        authScheme:
+          type: string
+          enum: [DIGEST_AKAv1_MD5, DIGEST_AKAv2_SHA256, SIP_DIGEST, TISPAN_HTTP_DIGEST,
+                 EARLY_IMS, NASS_BUNDLED, EAP_AKA]
+        scscfServerName:
+          type: string
+        numberAuthItems:
+          type: integer
+          minimum: 1
+          default: 1
+
+    AuthenticationInfoResultIms:
+      type: object
+      required: [authVectors]
+      properties:
+        authVectors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImsAuthenticationVector'
+
+    ImsAuthenticationVector:
+      type: object
+      required: [itemNumber, authScheme]
+      properties:
+        itemNumber:
+          type: integer
+        authScheme:
+          type: string
+          enum: [DIGEST_AKAv1_MD5, DIGEST_AKAv2_SHA256, SIP_DIGEST, TISPAN_HTTP_DIGEST,
+                 EARLY_IMS, NASS_BUNDLED, EAP_AKA]
+        rand:
+          type: string
+          description: RAND (hex, 32 chars)
+        autn:
+          type: string
+          description: AUTN (hex, 32 chars)
+        xres:
+          type: string
+          description: XRES (hex)
+        ck:
+          type: string
+          description: CK (hex, 32 chars)
+        ik:
+          type: string
+          description: IK (hex, 32 chars)
+        ha1:
+          type: string
+          description: HA1 digest for SIP Digest
+
+    ScscfRegistration:
+      type: object
+      required: [scscfServerName, serverAssignmentType]
+      properties:
+        scscfServerName:
+          type: string
+          format: uri
+        serverAssignmentType:
+          type: string
+          enum: [REGISTRATION, RE_REGISTRATION, UNREGISTERED_USER, TIMEOUT_DEREGISTRATION,
+                 USER_DEREGISTRATION, DEREGISTRATION_STORE_SERVER_NAME,
+                 ADMINISTRATIVE_DEREGISTRATION, AUTHENTICATION_FAILURE,
+                 AUTHENTICATION_TIMEOUT, DEREGISTRATION_TOO_MUCH_DATA]
+        imsUserState:
+          type: string
+          enum: [REGISTERED, UNREGISTERED, AUTHENTICATION_PENDING, NOT_REGISTERED]
+
+    ImsSubscriptionData:
+      type: object
+      properties:
+        userProfile:
+          $ref: '#/components/schemas/UserProfile'
+        chargingInfo:
+          $ref: '#/components/schemas/ChargingInfo'
+
+    UserProfile:
+      type: object
+      properties:
+        imsPrivateId:
+          type: string
+        serviceProfile:
+          type: array
+          items:
+            $ref: '#/components/schemas/ServiceProfile'
+
+    ServiceProfile:
+      type: object
+      properties:
+        publicIdentities:
+          type: array
+          items:
+            $ref: '#/components/schemas/PublicIdentity'
+        initialFilterCriteria:
+          type: array
+          items:
+            $ref: '#/components/schemas/InitialFilterCriteria'
+
+    PublicIdentity:
+      type: object
+      required: [identity]
+      properties:
+        identity:
+          type: string
+        registrationState:
+          type: string
+          enum: [REGISTERED, NOT_REGISTERED, UNREGISTERED]
+        barringIndication:
+          type: boolean
+
+    InitialFilterCriteria:
+      type: object
+      required: [priority, applicationServer]
+      properties:
+        priority:
+          type: integer
+        applicationServer:
+          $ref: '#/components/schemas/ApplicationServer'
+        triggerPoint:
+          type: object
+
+    ApplicationServer:
+      type: object
+      required: [serverName]
+      properties:
+        serverName:
+          type: string
+          format: uri
+        defaultHandling:
+          type: string
+          enum: [SESSION_CONTINUED, SESSION_TERMINATED]
+
+    ChargingInfo:
+      type: object
+      properties:
+        primaryChargingCollectionFunctionName:
+          type: string
+          format: uri
+        secondaryChargingCollectionFunctionName:
+          type: string
+          format: uri
+
+    ImsLocationInfo:
+      type: object
+      properties:
+        scscfName:
+          type: string
+          format: uri
+        serverCapabilities:
+          $ref: '#/components/schemas/ServerCapabilities'
+
+    ServerCapabilities:
+      type: object
+      properties:
+        mandatoryCapabilities:
+          type: array
+          items:
+            type: integer
+        optionalCapabilities:
+          type: array
+          items:
+            type: integer
+        serverName:
+          type: array
+          items:
+            type: string
+            format: uri
+
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+
+  responses:
+    '400':
+      description: Bad Request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '404':
+      description: Not Found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '500':
+      description: Internal Server Error
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'

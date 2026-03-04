@@ -1,0 +1,239 @@
+openapi: 3.0.3
+info:
+  title: Nausf_UEAuthentication
+  version: 1.3.0
+  description: |
+    AUSF UE Authentication Service (TS 29.509).
+    Provides 5G-AKA and EAP-AKA' authentication for AMF.
+
+servers:
+  - url: '{apiRoot}/nausf-auth/v1'
+    variables:
+      apiRoot:
+        default: https://ausf.5gc.mnc001.mcc001.3gppnetwork.org
+
+paths:
+  /ue-authentications:
+    post:
+      summary: Create UE authentication resource
+      operationId: UEAuthenticationsPost
+      tags: [UE Authentications]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthenticationInfo'
+      responses:
+        '201':
+          description: UE Authentication resource created
+          headers:
+            Location:
+              schema:
+                type: string
+              description: URI of created authentication resource
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UeAuthenticationCtx'
+        '400':
+          $ref: '#/components/responses/400'
+        '500':
+          $ref: '#/components/responses/500'
+
+  /ue-authentications/{authCtxId}/5g-aka-confirmation:
+    put:
+      summary: Confirm 5G-AKA authentication
+      operationId: UEAuthenticationsAuthCtxId5gAkaConfirmationPut
+      tags: [UE Authentications]
+      parameters:
+        - $ref: '#/components/parameters/authCtxId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConfirmationData'
+      responses:
+        '200':
+          description: Authentication confirmed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ConfirmationDataResponse'
+        '400':
+          $ref: '#/components/responses/400'
+        '404':
+          $ref: '#/components/responses/404'
+
+  /ue-authentications/{authCtxId}/eap-session:
+    post:
+      summary: EAP session message (EAP-AKA')
+      operationId: EapAuthMethod
+      tags: [UE Authentications]
+      parameters:
+        - $ref: '#/components/parameters/authCtxId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EapSession'
+      responses:
+        '200':
+          description: EAP session updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EapSession'
+        '400':
+          $ref: '#/components/responses/400'
+        '404':
+          $ref: '#/components/responses/404'
+
+components:
+  parameters:
+    authCtxId:
+      name: authCtxId
+      in: path
+      required: true
+      schema:
+        type: string
+
+  schemas:
+    AuthenticationInfo:
+      type: object
+      required: [supiOrSuci, servingNetworkName]
+      properties:
+        supiOrSuci:
+          type: string
+          description: SUPI or SUCI
+        servingNetworkName:
+          type: string
+          description: Serving network name (e.g., "5G:mnc001.mcc001.3gppnetwork.org")
+        resynchronizationInfo:
+          $ref: '#/components/schemas/ResynchronizationInfo'
+
+    UeAuthenticationCtx:
+      type: object
+      required: [authType, _links]
+      properties:
+        authType:
+          $ref: '#/components/schemas/AuthType'
+        5gAuthData:
+          oneOf:
+            - $ref: '#/components/schemas/Av5gAka'
+            - $ref: '#/components/schemas/EapPayload'
+        _links:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/LinksValueSchema'
+
+    AuthType:
+      type: string
+      enum: [5G_AKA, EAP_AKA_PRIME, EAP_TLS]
+
+    Av5gAka:
+      type: object
+      required: [rand, autn, hxresStar]
+      properties:
+        rand:
+          type: string
+          description: Random challenge (hex, 32 chars)
+        autn:
+          type: string
+          description: Authentication token (hex, 32 chars)
+        hxresStar:
+          type: string
+          description: Expected HXRES* (hex, 64 chars)
+
+    EapPayload:
+      type: object
+      required: [eapPayload]
+      properties:
+        eapPayload:
+          type: string
+          format: byte
+          description: EAP message (base64)
+
+    ConfirmationData:
+      type: object
+      required: [resStar]
+      properties:
+        resStar:
+          type: string
+          description: RES* (hex, 64 chars)
+
+    ConfirmationDataResponse:
+      type: object
+      required: [authResult]
+      properties:
+        authResult:
+          type: string
+          enum: [AUTHENTICATION_SUCCESS, AUTHENTICATION_FAILURE, AUTHENTICATION_ONGOING]
+        supi:
+          type: string
+        kseaf:
+          type: string
+          description: KSEAF (hex, 64 chars)
+
+    EapSession:
+      type: object
+      required: [eapPayload]
+      properties:
+        eapPayload:
+          type: string
+          format: byte
+        authResult:
+          type: string
+          enum: [AUTHENTICATION_SUCCESS, AUTHENTICATION_FAILURE, AUTHENTICATION_ONGOING]
+        kseaf:
+          type: string
+
+    ResynchronizationInfo:
+      type: object
+      required: [rand, auts]
+      properties:
+        rand:
+          type: string
+        auts:
+          type: string
+
+    LinksValueSchema:
+      type: object
+      properties:
+        href:
+          type: string
+          format: uri
+
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+
+  responses:
+    '400':
+      description: Bad Request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '404':
+      description: Not Found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '500':
+      description: Internal Server Error
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'

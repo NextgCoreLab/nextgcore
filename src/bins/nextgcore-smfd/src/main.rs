@@ -47,6 +47,8 @@ mod pfcp_sm;
 #[cfg(test)]
 mod property_tests;
 mod session_extensions; // #199-#201: IPv6 dual-stack, SSC modes, Ethernet PDU
+pub mod slicing;         // Rel-17: per-slice QoS profiles
+pub mod mbs_session;    // Rel-17: MBS multicast/broadcast session
 mod smf_sm;
 mod timer;
 
@@ -156,6 +158,15 @@ async fn main() -> Result<()> {
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info")
     ).init();
+    // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
+    let _otel = ogs_metrics::otel::init_otel(
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
+            .with_endpoint(
+                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+            ),
+    )
+    .ok();
 
     log::info!("NextGCore SMF v{} starting...", env!("CARGO_PKG_VERSION"));
 
@@ -842,11 +853,18 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     let ue_ip_octets: [u8; 4];
 
     if let Ok(context) = ctx.read() {
-        let sess_idx = context.sess_count() + 1;
+        let sess_idx = context.next_sess_index();
         sm_context_ref = format!("{sess_idx}");
-        // Allocate UE IP: 10.45.0.{1+idx}
-        let ip_suffix = (sess_idx as u8).wrapping_add(1);
-        ue_ip_octets = [10, 45, 0, ip_suffix];
+        // Allocate UE IP from bitmap pool
+        match context.ipv4_pool.allocate() {
+            Some(addr) => {
+                ue_ip_octets = addr.octets();
+            }
+            None => {
+                log::error!("IPv4 address pool exhausted");
+                return SbiResponse::with_status(500);
+            }
+        }
     } else {
         return SbiResponse::with_status(500);
     }

@@ -1,0 +1,199 @@
+openapi: 3.0.3
+info:
+  title: Nscp_Routing
+  version: 1.0.0
+  description: |
+    SCP (Service Communication Proxy) Routing Service (TS 29.500 §6.10).
+    Provides indirect NF-to-NF communication, load balancing, and discovery delegation.
+
+servers:
+  - url: '{apiRoot}/nscp-routing/v1'
+    variables:
+      apiRoot:
+        default: https://scp.5gc.mnc001.mcc001.3gppnetwork.org
+
+paths:
+  /nf-instances/{targetNfType}:
+    post:
+      summary: Route an SBI request to a discovered NF instance
+      operationId: RouteRequest
+      tags: [Routing]
+      parameters:
+        - name: targetNfType
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/NfType'
+        - name: 3gpp-Sbi-Target-apiRoot
+          in: header
+          schema:
+            type: string
+          description: Specific target NF instance URI; if absent, SCP selects one
+        - name: 3gpp-Sbi-NF-Peer-Info
+          in: header
+          schema:
+            type: string
+        - name: 3gpp-Sbi-Routing-Binding
+          in: header
+          schema:
+            type: string
+          description: Routing binding hint for session affinity
+        - name: 3gpp-Sbi-Discovery-target-nf-type
+          in: header
+          schema:
+            $ref: '#/components/schemas/NfType'
+        - name: 3gpp-Sbi-Discovery-service-names
+          in: header
+          schema:
+            type: string
+          description: Comma-separated list of requested SBI service names
+        - name: 3gpp-Sbi-Discovery-requester-nf-type
+          in: header
+          schema:
+            $ref: '#/components/schemas/NfType'
+        - name: 3gpp-Sbi-Discovery-target-plmn-list
+          in: header
+          schema:
+            type: string
+        - name: 3gpp-Sbi-Discovery-preferred-locality
+          in: header
+          schema:
+            type: string
+      requestBody:
+        description: Proxied SBI request body (pass-through)
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+          application/problem+json:
+            schema:
+              type: object
+      responses:
+        '100':
+          description: Continue (pass-through from target NF)
+        '200':
+          description: Response from target NF (pass-through)
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '201':
+          description: Created (pass-through)
+        '204':
+          description: No Content (pass-through)
+        '307':
+          description: Temporary Redirect
+          headers:
+            Location:
+              schema:
+                type: string
+              required: true
+        '400':
+          $ref: '#/components/responses/400'
+        '503':
+          $ref: '#/components/responses/503'
+
+  /nf-instance-sets/{targetNfSetId}:
+    post:
+      summary: Route to a specific NF set
+      operationId: RouteToNfSet
+      tags: [Routing]
+      parameters:
+        - name: targetNfSetId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: 3gpp-Sbi-Routing-Binding
+          in: header
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200':
+          description: Response from target NF (pass-through)
+        '307':
+          description: Temporary Redirect
+          headers:
+            Location:
+              schema:
+                type: string
+              required: true
+        '503':
+          $ref: '#/components/responses/503'
+
+  /load-balancer/status:
+    get:
+      summary: Get SCP load balancer status
+      operationId: GetLoadBalancerStatus
+      tags: [Status]
+      responses:
+        '200':
+          description: Load balancer status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScpLoadBalancerStatus'
+
+components:
+  schemas:
+    NfType:
+      type: string
+      enum: [NRF, UDM, AMF, SMF, AUSF, NEF, PCF, SMSF, NSSF, UDR, LMF, GMLC, 5G_EIR,
+             SEPP, UPF, N3IWF, AF, UDSF, BSF, CHF, NWDAF, PCSCF, CBCF, HSS, UCMF,
+             SOR_AF, SPAF, MME, SCSAS, SCEF, SCP, NSSAAF, ICSCF, SCSCF, DRA, IMS_AS,
+             EES, ECS, DCCF, MFAF, ADRF, NSACF, MB_SMF, TSCTSF, PANF]
+
+    ScpLoadBalancerStatus:
+      type: object
+      required: [activeConnections, pendingRequests]
+      properties:
+        activeConnections:
+          type: integer
+          description: Total active HTTP/2 connections to target NFs
+        pendingRequests:
+          type: integer
+          description: Requests in-flight across all connections
+        targetNfCounts:
+          type: object
+          additionalProperties:
+            type: integer
+          description: Number of live instances per NF type
+        routingPolicy:
+          type: string
+          enum: [ROUND_ROBIN, LEAST_CONNECTIONS, RANDOM, WEIGHTED]
+
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        cause:
+          type: string
+
+  responses:
+    '400':
+      description: Bad Request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '503':
+      description: Service Unavailable (no reachable target NF)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'

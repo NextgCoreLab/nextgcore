@@ -19,3 +19,11 @@ scp:
     client:
       nrf:
         - uri: http://172.22.0.10:7777
+
+        # TLS configuration (G36: SBI TLS)
+        tls:
+          enabled: false
+          cert: /etc/nextgcore/certs/scp.crt
+          key: /etc/nextgcore/certs/scp.key
+          ca: /etc/nextgcore/certs/ca.crt
+          min_version: "1.2"

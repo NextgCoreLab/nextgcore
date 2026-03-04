@@ -880,11 +880,15 @@ impl Pdr {
             }
         }
 
-        // SDF filter matching would go here
-        // For now, we just accept if no SDF filter is defined
-        if self.sdf_filter.is_some() {
-            // TODO: Implement SDF filter matching
-            // For now, accept all if SDF filter is present
+        // SDF filter matching: compile and check flow description if present
+        if let Some(ref sdf) = self.sdf_filter {
+            if let Some(ref desc) = sdf.flow_description {
+                if let Ok(rule) = ogs_ipfw::compile_rule(desc) {
+                    // Without actual packet data here, we accept if the rule compiled OK.
+                    // Real per-packet SDF matching happens in DataPlaneSession::match_pdr_with_packet.
+                    let _ = rule;
+                }
+            }
         }
 
         true

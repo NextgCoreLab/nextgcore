@@ -26,3 +26,12 @@ udm:
     client:
       nrf:
         - uri: http://172.23.0.10:7777
+
+        # TLS configuration (G36: SBI TLS)
+        # Enable: TLS_ENABLED=true SBI_SCHEME=https docker compose up -d
+        tls:
+          enabled: false
+          cert: /etc/nextgcore/certs/udm.crt
+          key: /etc/nextgcore/certs/udm.key
+          ca: /etc/nextgcore/certs/ca.crt
+          min_version: "1.2"

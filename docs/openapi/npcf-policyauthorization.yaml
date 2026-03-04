@@ -1,0 +1,444 @@
+openapi: 3.0.3
+info:
+  title: Npcf_PolicyAuthorization
+  version: 1.3.0
+  description: |
+    PCF Policy Authorization Service (TS 29.514).
+    Used by AF/P-CSCF to request policy decisions for application sessions.
+
+servers:
+  - url: '{apiRoot}/npcf-policyauthorization/v1'
+    variables:
+      apiRoot:
+        default: https://pcf.5gc.mnc001.mcc001.3gppnetwork.org
+
+paths:
+  /app-sessions:
+    post:
+      summary: Create an Individual Application Session Context
+      operationId: PostAppSessions
+      tags: [Application Sessions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AppSessionContext'
+      responses:
+        '201':
+          description: Application session created
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppSessionContext'
+        '400':
+          $ref: '#/components/responses/400'
+        '500':
+          $ref: '#/components/responses/500'
+
+  /app-sessions/{appSessionId}:
+    get:
+      summary: Read Individual Application Session Context
+      operationId: GetAppSession
+      tags: [Application Sessions]
+      parameters:
+        - $ref: '#/components/parameters/appSessionId'
+      responses:
+        '200':
+          description: Application session context
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppSessionContext'
+        '404':
+          $ref: '#/components/responses/404'
+    patch:
+      summary: Modify Individual Application Session Context
+      operationId: ModAppSession
+      tags: [Application Sessions]
+      parameters:
+        - $ref: '#/components/parameters/appSessionId'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/AppSessionContextUpdateData'
+      responses:
+        '200':
+          description: Application session updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppSessionContext'
+        '400':
+          $ref: '#/components/responses/400'
+        '404':
+          $ref: '#/components/responses/404'
+
+  /app-sessions/{appSessionId}/delete:
+    post:
+      summary: Delete Individual Application Session Context
+      operationId: DeleteAppSession
+      tags: [Application Sessions]
+      parameters:
+        - $ref: '#/components/parameters/appSessionId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventsSubscReqData'
+      responses:
+        '200':
+          description: Deleted; final events subscription report
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventsNotification'
+        '204':
+          description: No Content
+
+  /app-sessions/{appSessionId}/events-subscription:
+    put:
+      summary: Create or Update Events Subscription
+      operationId: UpdateEventsSubsc
+      tags: [Application Sessions]
+      parameters:
+        - $ref: '#/components/parameters/appSessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventsSubscReqData'
+      responses:
+        '201':
+          description: Events subscription created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventsSubscReqData'
+        '200':
+          description: Events subscription updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventsSubscReqData'
+        '404':
+          $ref: '#/components/responses/404'
+    delete:
+      summary: Delete Events Subscription
+      operationId: DeleteEventsSubsc
+      tags: [Application Sessions]
+      parameters:
+        - $ref: '#/components/parameters/appSessionId'
+      responses:
+        '204':
+          description: No Content
+        '404':
+          $ref: '#/components/responses/404'
+
+components:
+  parameters:
+    appSessionId:
+      name: appSessionId
+      in: path
+      required: true
+      schema:
+        type: string
+
+  schemas:
+    AppSessionContext:
+      type: object
+      required: [ascReqData]
+      properties:
+        ascReqData:
+          $ref: '#/components/schemas/AppSessionContextReqData'
+        ascRespData:
+          $ref: '#/components/schemas/AppSessionContextRespData'
+        evsNotif:
+          $ref: '#/components/schemas/EventsNotification'
+
+    AppSessionContextReqData:
+      type: object
+      required: [notifUri, suppFeat]
+      properties:
+        afAppId:
+          type: string
+        afRoutReq:
+          $ref: '#/components/schemas/AfRoutingRequirement'
+        aspId:
+          type: string
+        evSubsc:
+          $ref: '#/components/schemas/EventsSubscReqData'
+        medComponents:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/MediaComponent'
+        mpsId:
+          type: string
+        mcsId:
+          type: string
+        notifUri:
+          type: string
+          format: uri
+        resPrio:
+          type: string
+          enum: [PRIO_SHARING_INDICATOR]
+        servInfStatus:
+          type: string
+          enum: [FINAL, PRELIMINARY]
+        sipForkInd:
+          type: boolean
+        sliceInfo:
+          $ref: '#/components/schemas/Snssai'
+        suppFeat:
+          type: string
+        supi:
+          type: string
+        ueIpv4:
+          type: string
+          format: ipv4
+        ueIpv6:
+          type: string
+          format: ipv6
+        ueMac:
+          type: string
+
+    AppSessionContextRespData:
+      type: object
+      properties:
+        servAuthInfo:
+          type: string
+          enum: [TP_NOT_KNOWN, TP_EXPIRED, TP_NOT_YET_OCURRED]
+        suppFeat:
+          type: string
+
+    AppSessionContextUpdateData:
+      type: object
+      properties:
+        afAppId:
+          type: string
+        afRoutReq:
+          $ref: '#/components/schemas/AfRoutingRequirement'
+        evSubsc:
+          $ref: '#/components/schemas/EventsSubscReqData'
+        medComponents:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/MediaComponent'
+
+    AfRoutingRequirement:
+      type: object
+      properties:
+        appReloc:
+          type: boolean
+        routeToLocs:
+          type: array
+          items:
+            $ref: '#/components/schemas/RouteToLocation'
+        spVal:
+          $ref: '#/components/schemas/SpatialValidity'
+        tempVals:
+          type: array
+          items:
+            $ref: '#/components/schemas/TemporalValidity'
+        upPathChgSub:
+          $ref: '#/components/schemas/UpPathChgEvent'
+
+    RouteToLocation:
+      type: object
+      required: [dnai]
+      properties:
+        dnai:
+          type: string
+        routeInfo:
+          $ref: '#/components/schemas/RouteInformation'
+        routeProfId:
+          type: string
+
+    RouteInformation:
+      type: object
+      required: [ipv4Addr, portNumber]
+      properties:
+        ipv4Addr:
+          type: string
+          format: ipv4
+        ipv6Addr:
+          type: string
+          format: ipv6
+        portNumber:
+          type: integer
+
+    SpatialValidity:
+      type: object
+      properties:
+        presenceInfoList:
+          type: object
+          additionalProperties:
+            type: object
+
+    TemporalValidity:
+      type: object
+      properties:
+        startTime:
+          type: string
+          format: date-time
+        stopTime:
+          type: string
+          format: date-time
+
+    UpPathChgEvent:
+      type: object
+      required: [notifUri, notifCorreId]
+      properties:
+        notifUri:
+          type: string
+          format: uri
+        notifCorreId:
+          type: string
+        dnaiChgType:
+          type: string
+          enum: [EARLY, EARLY_LATE, LATE]
+
+    MediaComponent:
+      type: object
+      required: [medCompN]
+      properties:
+        medCompN:
+          type: integer
+        fDescs:
+          type: array
+          items:
+            type: string
+        medType:
+          type: string
+          enum: [AUDIO, VIDEO, DATA, APPLICATION, CONTROL, TEXT, MESSAGE, OTHER]
+        maxRequestedBwDl:
+          type: string
+        maxRequestedBwUl:
+          type: string
+        rrBw:
+          type: string
+        rsBw:
+          type: string
+        fStatus:
+          type: string
+          enum: [REMOVED, INACTIVE, ACTIVE]
+
+    EventsSubscReqData:
+      type: object
+      required: [events, notifUri]
+      properties:
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/AfEventSubscription'
+        notifUri:
+          type: string
+          format: uri
+        reqQosMonParams:
+          type: array
+          items:
+            type: string
+            enum: [DOWNLINK, UPLINK, ROUND_TRIP]
+
+    AfEventSubscription:
+      type: object
+      required: [event]
+      properties:
+        event:
+          type: string
+          enum: [ACCESS_TYPE_CHANGE, ANI_REPORT, APP_DETECTION, CHARGING_CORRELATION,
+                 EPS_FALLBACK, FAILED_QOS_INDICATION, FAILED_RESOURCES_ALLOCATION,
+                 OUT_OF_CREDIT, PDU_SESSION_STATUS, PLMN_CHG, QOS_MONITORING,
+                 QOS_NOTIF, RAN_NAS_CAUSE, REALLOCATION_OF_CREDIT, SAT_CATEGORY_CHG,
+                 SUCCESSFUL_QOS_UPDATE, SUCCESSFUL_RESOURCES_ALLOCATION,
+                 TSN_BRIDGE_INFO, UP_PATH_CHG_FAILURE, USAGE_REPORT]
+        notifMethod:
+          type: string
+          enum: [EVENT_DETECTION, ONE_TIME, PERIODIC]
+        maxReportNbr:
+          type: integer
+        waitTime:
+          type: integer
+        repPeriod:
+          type: integer
+
+    EventsNotification:
+      type: object
+      required: [evNotifs]
+      properties:
+        evNotifs:
+          type: array
+          items:
+            $ref: '#/components/schemas/AfEventNotification'
+        accessType:
+          type: string
+          enum: [3GPP_ACCESS, NON_3GPP_ACCESS]
+        ratType:
+          type: string
+
+    AfEventNotification:
+      type: object
+      required: [event]
+      properties:
+        event:
+          type: string
+          enum: [ACCESS_TYPE_CHANGE, ANI_REPORT, APP_DETECTION, CHARGING_CORRELATION,
+                 EPS_FALLBACK, FAILED_QOS_INDICATION, FAILED_RESOURCES_ALLOCATION,
+                 OUT_OF_CREDIT, PDU_SESSION_STATUS, PLMN_CHG, QOS_MONITORING,
+                 QOS_NOTIF, RAN_NAS_CAUSE, REALLOCATION_OF_CREDIT, SAT_CATEGORY_CHG,
+                 SUCCESSFUL_QOS_UPDATE, SUCCESSFUL_RESOURCES_ALLOCATION,
+                 TSN_BRIDGE_INFO, UP_PATH_CHG_FAILURE, USAGE_REPORT]
+        timeStamp:
+          type: string
+          format: date-time
+
+    Snssai:
+      type: object
+      required: [sst]
+      properties:
+        sst:
+          type: integer
+          minimum: 0
+          maximum: 255
+        sd:
+          type: string
+          pattern: '^[A-Fa-f0-9]{6}$'
+
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+
+  responses:
+    '400':
+      description: Bad Request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '404':
+      description: Not Found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '500':
+      description: Internal Server Error
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'

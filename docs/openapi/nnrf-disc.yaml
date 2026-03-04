@@ -1,0 +1,423 @@
+openapi: 3.0.3
+info:
+  title: Nnrf_NFDiscovery
+  version: 1.3.0
+  description: |
+    NRF NF Discovery Service (TS 29.510).
+    Enables NFs to discover other NF instances.
+
+servers:
+  - url: '{apiRoot}/nnrf-disc/v1'
+    variables:
+      apiRoot:
+        default: https://nrf.5gc.mnc001.mcc001.3gppnetwork.org
+
+paths:
+  /nf-instances:
+    get:
+      summary: Discover NF instances
+      operationId: SearchNFInstances
+      tags: [NF Instance Discovery]
+      parameters:
+        - name: target-nf-type
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/NfType'
+        - name: requester-nf-type
+          in: query
+          required: true
+          schema:
+            $ref: '#/components/schemas/NfType'
+        - name: requester-nf-instance-id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: service-names
+          in: query
+          schema:
+            type: array
+            items:
+              type: string
+          style: form
+          explode: false
+        - name: target-plmn-list
+          in: query
+          schema:
+            type: array
+            items:
+              $ref: '#/components/schemas/PlmnId'
+          style: form
+          explode: false
+        - name: target-snssai-list
+          in: query
+          schema:
+            type: array
+            items:
+              $ref: '#/components/schemas/Snssai'
+          style: form
+          explode: false
+        - name: target-nf-set-id
+          in: query
+          schema:
+            type: string
+        - name: target-nf-service-set-id
+          in: query
+          schema:
+            type: string
+        - name: nf-instance-id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: preferred-locality
+          in: query
+          schema:
+            type: string
+        - name: access-type
+          in: query
+          schema:
+            type: string
+            enum: [3GPP_ACCESS, NON_3GPP_ACCESS]
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+        - name: max-payload-size
+          in: query
+          schema:
+            type: integer
+        - name: supported-features
+          in: query
+          schema:
+            type: string
+        - name: hnrf-uri
+          in: query
+          schema:
+            type: string
+            format: uri
+        - name: snpn-list
+          in: query
+          schema:
+            type: array
+            items:
+              $ref: '#/components/schemas/PlmnIdNid'
+          style: form
+          explode: false
+        - name: If-None-Match
+          in: header
+          schema:
+            type: string
+      responses:
+        '200':
+          description: NF instances matching the query
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+            ETag:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResult'
+        '307':
+          description: Temporary Redirect
+          headers:
+            Location:
+              schema:
+                type: string
+              required: true
+        '400':
+          $ref: '#/components/responses/400'
+        '403':
+          $ref: '#/components/responses/403'
+        '404':
+          $ref: '#/components/responses/404'
+        '411':
+          description: Length Required
+        '500':
+          $ref: '#/components/responses/500'
+
+  /searches/{searchId}:
+    get:
+      summary: Retrieve a stored search
+      operationId: RetrieveStoredSearch
+      tags: [NF Instance Discovery]
+      parameters:
+        - name: searchId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Search result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StoredSearchResult'
+        '404':
+          $ref: '#/components/responses/404'
+
+components:
+  schemas:
+    NfType:
+      type: string
+      enum: [NRF, UDM, AMF, SMF, AUSF, NEF, PCF, SMSF, NSSF, UDR, LMF, GMLC, 5G_EIR,
+             SEPP, UPF, N3IWF, AF, UDSF, BSF, CHF, NWDAF, PCSCF, CBCF, HSS, UCMF,
+             SOR_AF, SPAF, MME, SCSAS, SCEF, SCP, NSSAAF, ICSCF, SCSCF, DRA, IMS_AS,
+             EES, ECS, DCCF, MFAF, ADRF, NSACF, MB_SMF, TSCTSF, PANF]
+
+    PlmnId:
+      type: object
+      required: [mcc, mnc]
+      properties:
+        mcc:
+          type: string
+          pattern: '^\d{3}$'
+        mnc:
+          type: string
+          pattern: '^\d{2,3}$'
+
+    PlmnIdNid:
+      allOf:
+        - $ref: '#/components/schemas/PlmnId'
+        - type: object
+          properties:
+            nid:
+              type: string
+              pattern: '^[A-Fa-f0-9]{11}$'
+
+    Snssai:
+      type: object
+      required: [sst]
+      properties:
+        sst:
+          type: integer
+          minimum: 0
+          maximum: 255
+        sd:
+          type: string
+          pattern: '^[A-Fa-f0-9]{6}$'
+
+    SearchResult:
+      type: object
+      required: [validityPeriod, nfInstances]
+      properties:
+        validityPeriod:
+          type: integer
+          description: Cache validity in seconds
+        nfInstances:
+          type: array
+          items:
+            $ref: '#/components/schemas/NfProfile'
+        searchId:
+          type: string
+        numNfInstComplete:
+          type: integer
+
+    StoredSearchResult:
+      type: object
+      required: [searchId, validityPeriod, nfInstances]
+      properties:
+        searchId:
+          type: string
+        validityPeriod:
+          type: integer
+        nfInstances:
+          type: array
+          items:
+            $ref: '#/components/schemas/NfProfile'
+
+    NfProfile:
+      type: object
+      required: [nfInstanceId, nfType, nfStatus]
+      properties:
+        nfInstanceId:
+          type: string
+          format: uuid
+        nfType:
+          $ref: '#/components/schemas/NfType'
+        nfStatus:
+          type: string
+          enum: [REGISTERED, SUSPENDED, UNDISCOVERABLE]
+        heartBeatTimer:
+          type: integer
+        plmnList:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlmnId'
+        snpnList:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlmnIdNid'
+        sNssais:
+          type: array
+          items:
+            $ref: '#/components/schemas/Snssai'
+        nsiList:
+          type: array
+          items:
+            type: string
+        fqdn:
+          type: string
+        interPlmnFqdn:
+          type: string
+        ipv4Addresses:
+          type: array
+          items:
+            type: string
+            format: ipv4
+        ipv6Addresses:
+          type: array
+          items:
+            type: string
+            format: ipv6
+        allowedPlmns:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlmnId'
+        allowedNfTypes:
+          type: array
+          items:
+            $ref: '#/components/schemas/NfType'
+        allowedNfDomains:
+          type: array
+          items:
+            type: string
+        allowedNssais:
+          type: array
+          items:
+            $ref: '#/components/schemas/Snssai'
+        priority:
+          type: integer
+          minimum: 0
+          maximum: 65535
+        capacity:
+          type: integer
+          minimum: 0
+          maximum: 65535
+        load:
+          type: integer
+          minimum: 0
+          maximum: 100
+        locality:
+          type: string
+        nfServices:
+          type: array
+          items:
+            $ref: '#/components/schemas/NfService'
+
+    NfService:
+      type: object
+      required: [serviceInstanceId, serviceName, versions, scheme, nfServiceStatus]
+      properties:
+        serviceInstanceId:
+          type: string
+          format: uuid
+        serviceName:
+          type: string
+        versions:
+          type: array
+          items:
+            $ref: '#/components/schemas/NfServiceVersion'
+        scheme:
+          type: string
+          enum: [http, https]
+        nfServiceStatus:
+          type: string
+          enum: [REGISTERED, SUSPENDED, UNDISCOVERABLE]
+        fqdn:
+          type: string
+        ipEndPoints:
+          type: array
+          items:
+            $ref: '#/components/schemas/IpEndPoint'
+        apiPrefix:
+          type: string
+        allowedNfTypes:
+          type: array
+          items:
+            $ref: '#/components/schemas/NfType'
+        supportedFeatures:
+          type: string
+        capacity:
+          type: integer
+        load:
+          type: integer
+        priority:
+          type: integer
+        recoveryTime:
+          type: string
+          format: date-time
+
+    NfServiceVersion:
+      type: object
+      required: [apiVersionInUri, apiFullVersion]
+      properties:
+        apiVersionInUri:
+          type: string
+        apiFullVersion:
+          type: string
+        expiry:
+          type: string
+          format: date-time
+
+    IpEndPoint:
+      type: object
+      properties:
+        ipv4Address:
+          type: string
+          format: ipv4
+        ipv6Address:
+          type: string
+          format: ipv6
+        transport:
+          type: string
+          enum: [TCP]
+        port:
+          type: integer
+          minimum: 0
+          maximum: 65535
+
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+
+  responses:
+    '400':
+      description: Bad Request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '403':
+      description: Forbidden
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '404':
+      description: Not Found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '500':
+      description: Internal Server Error
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'

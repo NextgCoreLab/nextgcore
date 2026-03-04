@@ -17,6 +17,7 @@ ogs-gtp = { workspace = true }
 ogs-tun = { workspace = true }
 ogs-ipfw = { workspace = true }
 ogs-app = { workspace = true }
+ogs-metrics = { workspace = true }
 log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true

@@ -1,0 +1,10 @@
+# Never commit private keys or generated certificates
+*.key
+*.crt
+*.csr
+*.srl
+*.ext
+# But track the generation script and this README
+!generate-dev-certs.sh
+!.gitignore
+!README.md

@@ -358,6 +358,8 @@ pub struct DataPlanePdr {
     pub qer_id: Option<u32>,
     pub urr_ids: Vec<u32>,
     pub outer_header_removal: Option<u8>,
+    /// Compiled SDF filter rule for 5-tuple matching (None = match all)
+    pub sdf_rule: Option<ogs_ipfw::IpfwRule>,
 }
 
 /// Lightweight FAR for fast-path forwarding in the data plane
@@ -897,16 +899,103 @@ impl SessionManager {
     }
 }
 
+/// Packet 5-tuple for SDF filter matching
+#[derive(Debug, Clone, Copy)]
+pub struct PacketTuple {
+    pub src_ip: u32,
+    pub dst_ip: u32,
+    pub protocol: u8,
+    pub src_port: u16,
+    pub dst_port: u16,
+}
+
+impl PacketTuple {
+    /// Extract 5-tuple from an IPv4 packet payload (starting at IP header)
+    pub fn from_ipv4_packet(ip_payload: &[u8]) -> Option<Self> {
+        if ip_payload.len() < 20 {
+            return None;
+        }
+        let ihl = ((ip_payload[0] & 0x0F) as usize) * 4;
+        let protocol = ip_payload[9];
+        let src_ip = u32::from_be_bytes([ip_payload[12], ip_payload[13], ip_payload[14], ip_payload[15]]);
+        let dst_ip = u32::from_be_bytes([ip_payload[16], ip_payload[17], ip_payload[18], ip_payload[19]]);
+
+        // Extract ports for TCP (6) and UDP (17)
+        let (src_port, dst_port) = if (protocol == 6 || protocol == 17) && ip_payload.len() >= ihl + 4 {
+            let sp = u16::from_be_bytes([ip_payload[ihl], ip_payload[ihl + 1]]);
+            let dp = u16::from_be_bytes([ip_payload[ihl + 2], ip_payload[ihl + 3]]);
+            (sp, dp)
+        } else {
+            (0, 0)
+        };
+
+        Some(PacketTuple { src_ip, dst_ip, protocol, src_port, dst_port })
+    }
+
+    /// Check if this packet matches an IpfwRule
+    fn matches_rule(&self, rule: &ogs_ipfw::IpfwRule) -> bool {
+        // Check protocol (0 = any)
+        if rule.proto != 0 && rule.proto != self.protocol {
+            return false;
+        }
+        // Check source IP (if specified)
+        if rule.ipv4_src {
+            if (self.src_ip & rule.ip.src.mask[0]) != (rule.ip.src.addr[0] & rule.ip.src.mask[0]) {
+                return false;
+            }
+        }
+        // Check destination IP (if specified)
+        if rule.ipv4_dst {
+            if (self.dst_ip & rule.ip.dst.mask[0]) != (rule.ip.dst.addr[0] & rule.ip.dst.mask[0]) {
+                return false;
+            }
+        }
+        // Check source port range (if specified)
+        if !rule.port.src.is_empty() {
+            if self.src_port < rule.port.src.low || self.src_port > rule.port.src.high {
+                return false;
+            }
+        }
+        // Check destination port range (if specified)
+        if !rule.port.dst.is_empty() {
+            if self.dst_port < rule.port.dst.low || self.dst_port > rule.port.dst.high {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 impl DataPlaneSession {
-    /// Find the best matching PDR for a packet direction
+    /// Find the best matching PDR for a packet direction with optional 5-tuple matching
     /// Returns (far_id, qer_id, urr_ids, outer_header_removal)
     pub fn match_pdr(&self, source_interface: u8) -> Option<(Option<u32>, Option<u32>, Vec<u32>, Option<u8>)> {
+        self.match_pdr_with_packet(source_interface, None)
+    }
+
+    /// Find the best matching PDR with SDF filter matching against packet tuple
+    pub fn match_pdr_with_packet(
+        &self,
+        source_interface: u8,
+        packet: Option<&PacketTuple>,
+    ) -> Option<(Option<u32>, Option<u32>, Vec<u32>, Option<u8>)> {
         let pdrs = self.pdrs.read().unwrap();
         // PDRs are sorted by precedence (lower = higher priority)
         for pdr in pdrs.iter() {
-            if pdr.source_interface == source_interface {
-                return Some((pdr.far_id, pdr.qer_id, pdr.urr_ids.clone(), pdr.outer_header_removal));
+            if pdr.source_interface != source_interface {
+                continue;
             }
+            // SDF filter matching: if rule present, packet must match
+            if let Some(ref rule) = pdr.sdf_rule {
+                if let Some(pkt) = packet {
+                    if !pkt.matches_rule(rule) {
+                        continue;
+                    }
+                }
+                // If no packet info provided, skip SDF-filtered PDRs
+                // (fall through to wildcard PDRs)
+            }
+            return Some((pdr.far_id, pdr.qer_id, pdr.urr_ids.clone(), pdr.outer_header_removal));
         }
         None
     }
@@ -1277,8 +1366,9 @@ impl DataPlane {
         };
 
         // --- PDR matching (uplink: source_interface = Access) ---
+        let pkt_tuple = PacketTuple::from_ipv4_packet(ip_payload);
         let mut dscp_to_apply: Option<u8> = None;
-        if let Some((far_id, qer_id, urr_ids, _ohr)) = session.match_pdr(SRC_INTF_ACCESS) {
+        if let Some((far_id, qer_id, urr_ids, _ohr)) = session.match_pdr_with_packet(SRC_INTF_ACCESS, pkt_tuple.as_ref()) {
             // Check QER gate and extract DSCP
             if let Some(qid) = qer_id {
                 if !session.check_qer_gate(qid, true, payload_len) {
@@ -1358,9 +1448,10 @@ impl DataPlane {
         let session = dst_ip.and_then(|ip| self.sessions.find_by_ue_ip(ip));
 
         let mut dscp_to_apply: Option<u8> = None;
+        let dl_pkt_tuple = if ip_version == IP_VERSION_4 { PacketTuple::from_ipv4_packet(pkt) } else { None };
         let (dl_teid, gnb_addr) = if let Some(ref sess) = session {
             // --- PDR matching (downlink: source_interface = Core) ---
-            if let Some((far_id, qer_id, urr_ids, _ohr)) = sess.match_pdr(SRC_INTF_CORE) {
+            if let Some((far_id, qer_id, urr_ids, _ohr)) = sess.match_pdr_with_packet(SRC_INTF_CORE, dl_pkt_tuple.as_ref()) {
                 // Check QER gate and extract DSCP
                 if let Some(qid) = qer_id {
                     if !sess.check_qer_gate(qid, false, payload_len) {
@@ -1473,6 +1564,7 @@ impl DataPlane {
                 qer_id: None,
                 urr_ids: Vec::new(),
                 outer_header_removal: Some(0), // GTP-U/UDP/IPv4
+                sdf_rule: None, // match all
             },
             DataPlanePdr {
                 pdr_id: 2,
@@ -1482,6 +1574,7 @@ impl DataPlane {
                 qer_id: None,
                 urr_ids: Vec::new(),
                 outer_header_removal: None,
+                sdf_rule: None, // match all
             },
         ];
         pdrs.sort_by_key(|p| p.precedence);
@@ -1698,6 +1791,259 @@ pub struct UrrReportEntry {
 }
 
 // ============================================================================
+// Task 1: QFI Extraction from GTP-U Extension Headers
+// ============================================================================
+
+/// Extract QFI (QoS Flow Identifier) from a raw GTP-U packet's extension headers.
+///
+/// Per 3GPP TS 29.281, when the E (extension header) flag (bit 2 of flags byte)
+/// is set, extension headers follow the optional fields.  A PDU Session Container
+/// extension (type 0x85) carries the QFI in byte 1 of the extension content
+/// (lower 6 bits, mask 0x3F).
+///
+/// Returns `Some(qfi)` when found, `None` if the E flag is not set or no PDU
+/// Session Container is present.
+pub fn extract_qfi_from_gtp_header(gtp_bytes: &[u8]) -> Option<u8> {
+    if gtp_bytes.len() < 8 {
+        return None;
+    }
+    let flags = gtp_bytes[0];
+    // E flag is bit 2 (0x04) of the flags byte
+    let e_flag = (flags & 0x04) != 0;
+    if !e_flag {
+        return None;
+    }
+    // When E/S/PN flags are set the header has a 4-byte optional area (bytes 8-11)
+    if gtp_bytes.len() < 12 {
+        return None;
+    }
+    // Next Extension Header Type is at byte 11
+    let mut next_ext_type = gtp_bytes[11];
+    let mut offset = 12usize;
+
+    while next_ext_type != 0 {
+        if offset >= gtp_bytes.len() {
+            break;
+        }
+        // Extension header length is in units of 4 bytes (includes the length byte itself)
+        let ext_len_units = gtp_bytes[offset] as usize;
+        let ext_len = ext_len_units * 4;
+        if ext_len == 0 || offset + ext_len > gtp_bytes.len() {
+            break;
+        }
+        // PDU Session Container (type 0x85): QFI is in byte 1 of the extension
+        if next_ext_type == 0x85 && ext_len >= 4 {
+            let qfi = gtp_bytes[offset + 1] & 0x3F;
+            return Some(qfi);
+        }
+        // Next extension header type is at the last byte of this extension
+        next_ext_type = gtp_bytes[offset + ext_len - 1];
+        offset += ext_len;
+    }
+    None
+}
+
+// ============================================================================
+// Task 2: DSCP Marking per QFI (Vec<u8> variant)
+// ============================================================================
+
+/// Mark an IP packet's DSCP field based on QFI->DSCP mapping.
+///
+/// Sets the DSCP field (bits 7:2 of the TOS/Traffic Class byte) for both
+/// IPv4 (byte 1) and IPv6 (bytes 0-1).  The ECN bits (low 2) are preserved.
+/// The packet must be at least 20 bytes for IPv4 or 40 bytes for IPv6.
+pub fn mark_dscp(ip_bytes: &mut Vec<u8>, dscp: u8) {
+    if ip_bytes.is_empty() {
+        return;
+    }
+    let version = (ip_bytes[0] >> 4) & 0x0F;
+    match version {
+        4 if ip_bytes.len() >= 20 => {
+            // IPv4: DSCP is bits 7:2 of the TOS byte (byte 1).
+            // Preserve the two ECN bits in bits 1:0.
+            ip_bytes[1] = (dscp << 2) | (ip_bytes[1] & 0x03);
+        }
+        6 if ip_bytes.len() >= 40 => {
+            // IPv6: Traffic Class is bits 11:4 of the first 16-bit word.
+            // Byte 0 holds version (4 bits) + TC[7:4], byte 1 holds TC[3:0] + Flow[19:16].
+            let tc = (dscp << 2) | (ip_bytes[1] & 0x03);
+            ip_bytes[0] = (ip_bytes[0] & 0xF0) | ((tc >> 4) & 0x0F);
+            ip_bytes[1] = ((tc & 0x0F) << 4) | (ip_bytes[1] & 0x0F);
+        }
+        _ => {}
+    }
+}
+
+// ============================================================================
+// Task 3: Token Bucket Rate Limiter
+// ============================================================================
+
+/// Token bucket for per-flow rate limiting.
+///
+/// Tokens are added at `refill_rate` tokens per second and capped at
+/// `max_tokens`.  Each forwarded packet consumes `bytes` tokens.
+/// Returns `false` (drop) when the bucket is empty.
+#[derive(Debug)]
+pub struct TokenBucket {
+    /// Current token count (bytes available to send)
+    pub tokens: f64,
+    /// Bucket capacity (bytes)
+    pub max_tokens: f64,
+    /// Token refill rate (bytes per second)
+    pub refill_rate: f64,
+    /// Timestamp of the last refill
+    pub last_refill: std::time::Instant,
+}
+
+impl TokenBucket {
+    /// Create a new token bucket.
+    ///
+    /// `max_tokens` is the burst size (bytes), `refill_rate` is the sustained
+    /// bit rate expressed in bytes per second.
+    pub fn new(max_tokens: f64, refill_rate: f64) -> Self {
+        Self {
+            tokens: max_tokens,
+            max_tokens,
+            refill_rate,
+            last_refill: std::time::Instant::now(),
+        }
+    }
+
+    /// Create a token bucket from a Maximum Bit Rate value in kbps.
+    ///
+    /// The burst size is set to the equivalent of 10 ms worth of traffic to
+    /// allow short-term bursts typical in 5G QoS scheduling.
+    pub fn from_mbr_kbps(mbr_kbps: u64) -> Self {
+        // Convert kbps to bytes/s
+        let bytes_per_sec = (mbr_kbps as f64) * 125.0;
+        // Burst = 10ms worth of data (minimum 1500 bytes for an Ethernet frame)
+        let burst = (bytes_per_sec * 0.01).max(1500.0);
+        Self::new(burst, bytes_per_sec)
+    }
+
+    /// Try to consume `bytes` tokens from the bucket.
+    ///
+    /// Returns `true` if the packet should be forwarded, `false` if it must be
+    /// dropped because the bucket is empty.
+    pub fn try_consume(&mut self, bytes: usize) -> bool {
+        // Refill based on elapsed time
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.last_refill = now;
+        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.max_tokens);
+
+        if self.tokens >= bytes as f64 {
+            self.tokens -= bytes as f64;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+// ============================================================================
+// Task 4: GTP-U Encapsulation and Decapsulation Helpers
+// ============================================================================
+
+/// Encapsulate a raw inner-IP packet in a GTP-U/UDP/IP wrapper.
+///
+/// Builds a complete over-the-wire GTP-U G-PDU:
+/// - 20-byte outer IPv4 header (proto=UDP, src=0.0.0.0, dst=`peer_addr`)
+/// - 8-byte UDP header (src port=2152, dst port=2152)
+/// - 8-byte GTP-U header (version=1, PT=1, msg-type=G-PDU, TEID=`teid`)
+/// - `inner_ip` payload
+///
+/// In production the outer IP src address is filled in by the OS when the
+/// packet is sent through the GTP-U UDP socket; the zeros are a placeholder.
+pub fn encap_gtp(inner_ip: &[u8], teid: u32, peer_addr: std::net::Ipv4Addr) -> Vec<u8> {
+    // GTP-U payload length = inner IP length
+    let gtpu_payload_len = inner_ip.len() as u16;
+    // UDP length = UDP header (8) + GTP-U header (8) + inner IP
+    let udp_len = (8u16 + 8u16).saturating_add(gtpu_payload_len);
+    // IP total length = IP header (20) + UDP length
+    let ip_total_len = 20u16.saturating_add(udp_len);
+
+    let mut pkt = Vec::with_capacity(ip_total_len as usize);
+
+    // --- Outer IPv4 header ---
+    pkt.push(0x45); // Version=4, IHL=5
+    pkt.push(0x00); // DSCP/ECN
+    pkt.extend_from_slice(&ip_total_len.to_be_bytes());
+    pkt.extend_from_slice(&[0x00, 0x00]); // Identification
+    pkt.extend_from_slice(&[0x40, 0x00]); // Flags=DF, Fragment offset=0
+    pkt.push(0x40);                        // TTL=64
+    pkt.push(0x11);                        // Protocol=UDP
+    pkt.extend_from_slice(&[0x00, 0x00]); // Header checksum (zero = not computed here)
+    pkt.extend_from_slice(&[0, 0, 0, 0]); // Src IP (filled by OS)
+    pkt.extend_from_slice(&peer_addr.octets());
+
+    // --- UDP header ---
+    pkt.extend_from_slice(&GTPU_PORT.to_be_bytes()); // Src port = 2152
+    pkt.extend_from_slice(&GTPU_PORT.to_be_bytes()); // Dst port = 2152
+    pkt.extend_from_slice(&udp_len.to_be_bytes());
+    pkt.extend_from_slice(&[0x00, 0x00]); // UDP checksum (optional for IPv4)
+
+    // --- GTP-U header ---
+    let gtpu_hdr = build_gtpu_header(teid, gtpu_payload_len);
+    pkt.extend_from_slice(&gtpu_hdr);
+
+    // --- Inner IP payload ---
+    pkt.extend_from_slice(inner_ip);
+
+    pkt
+}
+
+/// Decapsulate a GTP-U packet, returning a reference to the inner IP payload.
+///
+/// Expects the slice to begin at the GTP-U header (after outer UDP/IP headers
+/// have already been stripped).  Returns `None` on malformed input or if the
+/// message type is not G-PDU (0xFF).
+///
+/// The returned slice is a sub-slice of the input; no copying is performed.
+pub fn decap_gtp(gtp_bytes: &[u8]) -> Option<&[u8]> {
+    if gtp_bytes.len() < GTPU_HEADER_SIZE {
+        return None;
+    }
+    let flags = gtp_bytes[0];
+    let msg_type = gtp_bytes[1];
+    // Only G-PDU (0xFF) carries an inner IP packet
+    if msg_type != 0xFF {
+        return None;
+    }
+    let has_optional = (flags & 0x07) != 0;
+    let mut header_len = GTPU_HEADER_SIZE;
+
+    if has_optional {
+        if gtp_bytes.len() < 12 {
+            return None;
+        }
+        header_len = 12;
+        // Walk extension headers if E flag is set
+        if (flags & 0x04) != 0 {
+            let mut next_ext = gtp_bytes[11];
+            let mut offset = 12usize;
+            while next_ext != 0 {
+                if offset >= gtp_bytes.len() {
+                    return None;
+                }
+                let ext_len = (gtp_bytes[offset] as usize) * 4;
+                if ext_len == 0 || offset + ext_len > gtp_bytes.len() {
+                    return None;
+                }
+                next_ext = gtp_bytes[offset + ext_len - 1];
+                offset += ext_len;
+                header_len = offset;
+            }
+        }
+    }
+
+    if header_len > gtp_bytes.len() {
+        return None;
+    }
+    Some(&gtp_bytes[header_len..])
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1778,4 +2124,467 @@ mod tests {
         assert!(mgr.remove_session_by_seid(seid1));
         assert!(mgr.find_by_seid(seid1).is_none());
     }
+
+    // -- PacketTuple tests --
+
+    /// Build a minimal valid IPv4/TCP packet for testing
+    fn make_ipv4_tcp_packet(src: [u8; 4], dst: [u8; 4], src_port: u16, dst_port: u16) -> Vec<u8> {
+        let mut pkt = vec![0u8; 40]; // 20 IP + 20 TCP
+        pkt[0] = 0x45; // Version=4, IHL=5
+        pkt[9] = 6;    // Protocol: TCP
+        pkt[12..16].copy_from_slice(&src);
+        pkt[16..20].copy_from_slice(&dst);
+        pkt[20] = (src_port >> 8) as u8;
+        pkt[21] = (src_port & 0xFF) as u8;
+        pkt[22] = (dst_port >> 8) as u8;
+        pkt[23] = (dst_port & 0xFF) as u8;
+        pkt
+    }
+
+    fn make_ipv4_udp_packet(src: [u8; 4], dst: [u8; 4], src_port: u16, dst_port: u16) -> Vec<u8> {
+        let mut pkt = make_ipv4_tcp_packet(src, dst, src_port, dst_port);
+        pkt[9] = 17; // Protocol: UDP
+        pkt
+    }
+
+    #[test]
+    fn test_packet_tuple_from_valid_tcp_packet() {
+        let pkt = make_ipv4_tcp_packet([10, 45, 0, 2], [172, 23, 0, 1], 12345, 80);
+        let tuple = PacketTuple::from_ipv4_packet(&pkt).unwrap();
+        assert_eq!(tuple.src_ip, u32::from_be_bytes([10, 45, 0, 2]));
+        assert_eq!(tuple.dst_ip, u32::from_be_bytes([172, 23, 0, 1]));
+        assert_eq!(tuple.protocol, 6);
+        assert_eq!(tuple.src_port, 12345);
+        assert_eq!(tuple.dst_port, 80);
+    }
+
+    #[test]
+    fn test_packet_tuple_from_valid_udp_packet() {
+        let pkt = make_ipv4_udp_packet([10, 0, 0, 1], [10, 0, 0, 2], 5060, 5060);
+        let tuple = PacketTuple::from_ipv4_packet(&pkt).unwrap();
+        assert_eq!(tuple.protocol, 17);
+        assert_eq!(tuple.src_port, 5060);
+        assert_eq!(tuple.dst_port, 5060);
+    }
+
+    #[test]
+    fn test_packet_tuple_from_icmp_has_zero_ports() {
+        let mut pkt = make_ipv4_tcp_packet([10, 0, 0, 1], [10, 0, 0, 2], 0, 0);
+        pkt[9] = 1; // ICMP
+        let tuple = PacketTuple::from_ipv4_packet(&pkt).unwrap();
+        assert_eq!(tuple.protocol, 1);
+        assert_eq!(tuple.src_port, 0);
+        assert_eq!(tuple.dst_port, 0);
+    }
+
+    #[test]
+    fn test_packet_tuple_too_short_returns_none() {
+        let pkt = vec![0x45, 0, 0, 0]; // Only 4 bytes
+        assert!(PacketTuple::from_ipv4_packet(&pkt).is_none());
+        assert!(PacketTuple::from_ipv4_packet(&[]).is_none());
+    }
+
+    #[test]
+    fn test_packet_tuple_with_ip_options() {
+        // IHL = 7 (28 bytes header), ports start at offset 28
+        let mut pkt = vec![0u8; 48]; // 28 IP + 20 TCP
+        pkt[0] = 0x47; // Version=4, IHL=7
+        pkt[9] = 6;    // TCP
+        pkt[12..16].copy_from_slice(&[10, 0, 0, 1]);
+        pkt[16..20].copy_from_slice(&[10, 0, 0, 2]);
+        // Ports at offset 28
+        pkt[28] = 0x30; pkt[29] = 0x39; // src_port = 12345
+        pkt[30] = 0x00; pkt[31] = 0x50; // dst_port = 80
+        let tuple = PacketTuple::from_ipv4_packet(&pkt).unwrap();
+        assert_eq!(tuple.src_port, 12345);
+        assert_eq!(tuple.dst_port, 80);
+    }
+
+    // -- matches_rule tests --
+
+    #[test]
+    fn test_matches_rule_protocol_mismatch() {
+        let tuple = PacketTuple {
+            src_ip: 0x0a000001, dst_ip: 0x0a000002,
+            protocol: 6, src_port: 1000, dst_port: 80,
+        };
+        let mut rule = ogs_ipfw::IpfwRule::default();
+        rule.proto = 17; // UDP — mismatch with TCP
+        assert!(!tuple.matches_rule(&rule));
+    }
+
+    #[test]
+    fn test_matches_rule_protocol_any_matches_all() {
+        let tuple = PacketTuple {
+            src_ip: 0x0a000001, dst_ip: 0x0a000002,
+            protocol: 6, src_port: 1000, dst_port: 80,
+        };
+        let rule = ogs_ipfw::IpfwRule::default(); // proto=0 = any
+        assert!(tuple.matches_rule(&rule));
+    }
+
+    #[test]
+    fn test_matches_rule_src_ip_subnet() {
+        let tuple = PacketTuple {
+            src_ip: u32::from_be_bytes([10, 45, 1, 50]),
+            dst_ip: u32::from_be_bytes([172, 23, 0, 1]),
+            protocol: 17, src_port: 5000, dst_port: 80,
+        };
+        let mut rule = ogs_ipfw::IpfwRule::default();
+        rule.ipv4_src = true;
+        // 10.45.0.0/16 mask
+        rule.ip.src.addr[0] = u32::from_be_bytes([10, 45, 0, 0]);
+        rule.ip.src.mask[0] = u32::from_be_bytes([255, 255, 0, 0]);
+        assert!(tuple.matches_rule(&rule), "10.45.1.50 should match 10.45.0.0/16");
+
+        // 10.46.0.0/16 — should NOT match
+        rule.ip.src.addr[0] = u32::from_be_bytes([10, 46, 0, 0]);
+        assert!(!tuple.matches_rule(&rule), "10.45.1.50 should not match 10.46.0.0/16");
+    }
+
+    #[test]
+    fn test_matches_rule_dst_port_range() {
+        let tuple = PacketTuple {
+            src_ip: 0, dst_ip: 0, protocol: 17, src_port: 5000, dst_port: 8080,
+        };
+        let mut rule = ogs_ipfw::IpfwRule::default();
+        // Port range 80-8080 (inclusive)
+        rule.port.dst = ogs_ipfw::PortRange::range(80, 8080);
+        assert!(tuple.matches_rule(&rule));
+
+        // Port 8081 — just outside range
+        let tuple2 = PacketTuple { dst_port: 8081, ..tuple };
+        assert!(!tuple2.matches_rule(&rule));
+
+        // Port 79 — just below range
+        let tuple3 = PacketTuple { dst_port: 79, ..tuple };
+        assert!(!tuple3.matches_rule(&rule));
+
+        // Exact boundary
+        let tuple4 = PacketTuple { dst_port: 80, ..tuple };
+        assert!(tuple4.matches_rule(&rule));
+    }
+
+    // -- match_pdr_with_packet tests --
+
+    fn make_test_session(pdrs: Vec<DataPlanePdr>) -> DataPlaneSession {
+        DataPlaneSession {
+            upf_seid: 1,
+            smf_seid: 1,
+            ue_ipv4: Some(Ipv4Addr::new(10, 45, 0, 2)),
+            ul_teid: 1,
+            dl_teid: 1,
+            gnb_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2152),
+            pdu_session_id: Some(1),
+            qfi: Some(9),
+            ul_packets: AtomicU64::new(0),
+            dl_packets: AtomicU64::new(0),
+            ul_bytes: AtomicU64::new(0),
+            dl_bytes: AtomicU64::new(0),
+            pdrs: RwLock::new(pdrs),
+            fars: RwLock::new(HashMap::new()),
+            qers: RwLock::new(HashMap::new()),
+            urrs: RwLock::new(HashMap::new()),
+        }
+    }
+
+    #[test]
+    fn test_match_pdr_wildcard_no_sdf_matches() {
+        let session = make_test_session(vec![
+            DataPlanePdr {
+                pdr_id: 1, precedence: 100, source_interface: SRC_INTF_ACCESS,
+                far_id: Some(1), qer_id: None, urr_ids: vec![], outer_header_removal: None,
+                sdf_rule: None,
+            },
+        ]);
+        let pkt = PacketTuple {
+            src_ip: 0, dst_ip: 0, protocol: 6, src_port: 1, dst_port: 80,
+        };
+        let result = session.match_pdr_with_packet(SRC_INTF_ACCESS, Some(&pkt));
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, Some(1)); // far_id
+    }
+
+    #[test]
+    fn test_match_pdr_sdf_packet_matches() {
+        let mut rule = ogs_ipfw::IpfwRule::default();
+        rule.proto = 17; // UDP only
+        let session = make_test_session(vec![
+            DataPlanePdr {
+                pdr_id: 1, precedence: 50, source_interface: SRC_INTF_ACCESS,
+                far_id: Some(10), qer_id: None, urr_ids: vec![], outer_header_removal: None,
+                sdf_rule: Some(rule),
+            },
+        ]);
+        let pkt = PacketTuple {
+            src_ip: 0, dst_ip: 0, protocol: 17, src_port: 5060, dst_port: 5060,
+        };
+        let result = session.match_pdr_with_packet(SRC_INTF_ACCESS, Some(&pkt));
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, Some(10));
+    }
+
+    #[test]
+    fn test_match_pdr_sdf_packet_no_match_skips_to_wildcard() {
+        let mut rule = ogs_ipfw::IpfwRule::default();
+        rule.proto = 17; // SDF: UDP only
+        let session = make_test_session(vec![
+            DataPlanePdr {
+                pdr_id: 1, precedence: 50, source_interface: SRC_INTF_ACCESS,
+                far_id: Some(10), qer_id: None, urr_ids: vec![], outer_header_removal: None,
+                sdf_rule: Some(rule),
+            },
+            DataPlanePdr {
+                pdr_id: 2, precedence: 100, source_interface: SRC_INTF_ACCESS,
+                far_id: Some(20), qer_id: None, urr_ids: vec![], outer_header_removal: None,
+                sdf_rule: None, // wildcard
+            },
+        ]);
+        // TCP packet — doesn't match UDP SDF rule, falls through to wildcard
+        let pkt = PacketTuple {
+            src_ip: 0, dst_ip: 0, protocol: 6, src_port: 1000, dst_port: 80,
+        };
+        let result = session.match_pdr_with_packet(SRC_INTF_ACCESS, Some(&pkt));
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, Some(20)); // wildcard PDR
+    }
+
+    #[test]
+    fn test_match_pdr_precedence_order() {
+        let session = make_test_session(vec![
+            DataPlanePdr {
+                pdr_id: 2, precedence: 100, source_interface: SRC_INTF_ACCESS,
+                far_id: Some(20), qer_id: None, urr_ids: vec![], outer_header_removal: None,
+                sdf_rule: None,
+            },
+            DataPlanePdr {
+                pdr_id: 1, precedence: 50, source_interface: SRC_INTF_ACCESS,
+                far_id: Some(10), qer_id: None, urr_ids: vec![], outer_header_removal: None,
+                sdf_rule: None,
+            },
+        ]);
+        // Should match pdr_id=2 first (it's at index 0) even though higher precedence number
+        // PDRs should be pre-sorted by precedence in production — this tests iteration order
+        let result = session.match_pdr_with_packet(SRC_INTF_ACCESS, None);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, Some(20)); // first in iteration order
+    }
+
+    #[test]
+    fn test_match_pdr_wrong_source_interface_no_match() {
+        let session = make_test_session(vec![
+            DataPlanePdr {
+                pdr_id: 1, precedence: 100, source_interface: SRC_INTF_ACCESS,
+                far_id: Some(1), qer_id: None, urr_ids: vec![], outer_header_removal: None,
+                sdf_rule: None,
+            },
+        ]);
+        let result = session.match_pdr_with_packet(SRC_INTF_CORE, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_apply_far_drop_action() {
+        let session = make_test_session(vec![]);
+        let mut fars = session.fars.write().unwrap();
+        fars.insert(1, DataPlaneFar {
+            far_id: 1,
+            apply_action: FAR_ACTION_DROP,
+            destination_interface: 0,
+            ohc_teid: None,
+            ohc_addr: None,
+        });
+        drop(fars);
+        let (fwd, teid, addr) = session.apply_far(1);
+        assert!(!fwd);
+        assert!(teid.is_none());
+        assert!(addr.is_none());
+    }
+
+    #[test]
+    fn test_apply_far_forward_action() {
+        let session = make_test_session(vec![]);
+        let mut fars = session.fars.write().unwrap();
+        fars.insert(1, DataPlaneFar {
+            far_id: 1,
+            apply_action: FAR_ACTION_FORW,
+            destination_interface: SRC_INTF_ACCESS,
+            ohc_teid: Some(0x1234),
+            ohc_addr: Some(Ipv4Addr::new(192, 168, 1, 1)),
+        });
+        drop(fars);
+        let (fwd, teid, addr) = session.apply_far(1);
+        assert!(fwd);
+        assert_eq!(teid, Some(0x1234));
+        assert_eq!(addr, Some(Ipv4Addr::new(192, 168, 1, 1)));
+    }
+
+    #[test]
+    fn test_apply_far_not_found_defaults_forward() {
+        let session = make_test_session(vec![]);
+        let (fwd, teid, addr) = session.apply_far(999);
+        assert!(fwd);
+        assert!(teid.is_none());
+        assert!(addr.is_none());
+    }
+
+    // -- Task 1: extract_qfi_from_gtp_header tests --
+
+    #[test]
+    fn test_extract_qfi_no_e_flag() {
+        // flags=0x30 means no E/S/PN bits set -> no extension headers
+        let pkt = vec![0x30u8, 0xFF, 0x00, 0x14, 0x00, 0x00, 0x00, 0x01,
+                       0xAA, 0xBB, 0xCC, 0xDD];
+        assert_eq!(extract_qfi_from_gtp_header(&pkt), None);
+    }
+
+    #[test]
+    fn test_extract_qfi_with_pdu_session_container() {
+        // flags=0x34: version=1, PT=1, E=1
+        // TEID=0x00000001, seq=0, npdu=0, next_ext=0x85
+        // Extension: len=1 (4 bytes), QFI=9, next_ext=0
+        let pkt = vec![
+            0x34u8, 0xFF,          // flags, msg_type=G-PDU
+            0x00, 0x18,            // length
+            0x00, 0x00, 0x00, 0x01,// TEID
+            0x00, 0x00,            // seq
+            0x00,                  // N-PDU
+            0x85,                  // next_ext = PDU Session Container
+            // Extension header: len=1 (=4 bytes total), PDU type|spare, QFI, spare, next_ext
+            0x01, 0x09, 0x00, 0x00,// len=1, QFI=9 (0x09 & 0x3F = 9), next=0
+        ];
+        assert_eq!(extract_qfi_from_gtp_header(&pkt), Some(9));
+    }
+
+    #[test]
+    fn test_extract_qfi_too_short() {
+        let pkt = vec![0x34u8, 0xFF, 0x00];
+        assert_eq!(extract_qfi_from_gtp_header(&pkt), None);
+    }
+
+    #[test]
+    fn test_extract_qfi_unknown_extension_type() {
+        // Extension type 0x01 (not PDU Session Container) -> no QFI
+        let pkt = vec![
+            0x34u8, 0xFF,
+            0x00, 0x10,
+            0x00, 0x00, 0x00, 0x01,
+            0x00, 0x00,
+            0x00,
+            0x01,                  // next_ext = type 0x01
+            0x01, 0x00, 0x00, 0x00,// ext: len=1, content, next=0
+        ];
+        assert_eq!(extract_qfi_from_gtp_header(&pkt), None);
+    }
+
+    // -- Task 2: mark_dscp tests --
+
+    #[test]
+    fn test_mark_dscp_ipv4() {
+        // Minimal IPv4 packet, 20 bytes
+        let mut pkt = vec![0x45u8, 0x00]; // version/IHL, TOS=0
+        pkt.extend_from_slice(&[0u8; 18]);
+        mark_dscp(&mut pkt, 46); // EF
+        assert_eq!(pkt[1] >> 2, 46);
+        // ECN bits preserved (were 0)
+        assert_eq!(pkt[1] & 0x03, 0);
+    }
+
+    #[test]
+    fn test_mark_dscp_ipv4_preserves_ecn() {
+        let mut pkt = vec![0x45u8, 0x03]; // TOS with ECN bits set
+        pkt.extend_from_slice(&[0u8; 18]);
+        mark_dscp(&mut pkt, 34); // AF41
+        assert_eq!(pkt[1] >> 2, 34);
+        assert_eq!(pkt[1] & 0x03, 0x03, "ECN bits must be preserved");
+    }
+
+    #[test]
+    fn test_mark_dscp_too_short_noop() {
+        let mut pkt = vec![0x45u8, 0x00, 0x00]; // too short for IPv4
+        mark_dscp(&mut pkt, 46);
+        assert_eq!(pkt[1], 0x00, "Should not modify too-short packet");
+    }
+
+    // -- Task 3: TokenBucket tests --
+
+    #[test]
+    fn test_token_bucket_allows_within_limit() {
+        let mut tb = TokenBucket::new(10_000.0, 1_000_000.0); // 1 MB/s
+        assert!(tb.try_consume(1000));
+        assert!(tb.try_consume(1000));
+    }
+
+    #[test]
+    fn test_token_bucket_drops_when_empty() {
+        let mut tb = TokenBucket::new(100.0, 0.0); // no refill
+        assert!(tb.try_consume(50));
+        assert!(tb.try_consume(50));
+        assert!(!tb.try_consume(1), "Should drop when bucket empty");
+    }
+
+    #[test]
+    fn test_token_bucket_from_mbr_kbps() {
+        let tb = TokenBucket::from_mbr_kbps(1000); // 1 Mbps
+        // refill_rate should be 1000 * 125 = 125_000 bytes/s
+        assert!((tb.refill_rate - 125_000.0).abs() < 1.0);
+        // burst should be max(125_000 * 0.01, 1500) = max(1250, 1500) = 1500
+        assert!((tb.max_tokens - 1500.0).abs() < 1.0);
+    }
+
+    // -- Task 4: encap_gtp / decap_gtp tests --
+
+    #[test]
+    fn test_encap_gtp_structure() {
+        let inner_ip = vec![0x45u8; 20]; // dummy IPv4 packet
+        let teid = 0xDEADBEEF;
+        let peer = Ipv4Addr::new(192, 168, 1, 100);
+        let pkt = encap_gtp(&inner_ip, teid, peer);
+
+        // Should have: 20 (IP) + 8 (UDP) + 8 (GTP-U) + 20 (inner) = 56 bytes
+        assert_eq!(pkt.len(), 56);
+        // IP version + IHL
+        assert_eq!(pkt[0], 0x45);
+        // IP protocol = UDP (17)
+        assert_eq!(pkt[9], 0x11);
+        // Dst IP = peer
+        assert_eq!(&pkt[16..20], &peer.octets());
+        // UDP dst port = 2152
+        let udp_dst = u16::from_be_bytes([pkt[22], pkt[23]]);
+        assert_eq!(udp_dst, 2152);
+        // GTP-U flags
+        assert_eq!(pkt[28], 0x30);
+        // GTP-U TEID
+        let gtp_teid = u32::from_be_bytes([pkt[32], pkt[33], pkt[34], pkt[35]]);
+        assert_eq!(gtp_teid, teid);
+    }
+
+    #[test]
+    fn test_decap_gtp_basic() {
+        let inner_ip = vec![0x45u8, 0x00, 0x00, 0x28, 0x00, 0x01, 0x40, 0x00,
+                            0x40, 0x06, 0x00, 0x00, 10, 45, 0, 2, 172, 23, 0, 1];
+        // Build minimal GTP-U: flags=0x30, msg=0xFF, len, TEID
+        let mut gtp = vec![0x30u8, 0xFF];
+        let payload_len = inner_ip.len() as u16;
+        gtp.extend_from_slice(&payload_len.to_be_bytes());
+        gtp.extend_from_slice(&[0x00, 0x00, 0x01, 0x23]); // TEID
+        gtp.extend_from_slice(&inner_ip);
+
+        let decapped = decap_gtp(&gtp).unwrap();
+        assert_eq!(decapped, inner_ip.as_slice());
+    }
+
+    #[test]
+    fn test_decap_gtp_non_gpdu_returns_none() {
+        // msg_type = ECHO_REQUEST (1), not G-PDU
+        let pkt = vec![0x30u8, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert!(decap_gtp(&pkt).is_none());
+    }
+
+    #[test]
+    fn test_decap_gtp_too_short_returns_none() {
+        let pkt = vec![0x30u8, 0xFF, 0x00];
+        assert!(decap_gtp(&pkt).is_none());
+    }
+
 }

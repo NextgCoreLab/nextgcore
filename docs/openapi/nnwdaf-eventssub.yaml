@@ -1,0 +1,346 @@
+openapi: 3.0.3
+info:
+  title: Nnwdaf_EventsSubscription
+  version: 1.3.0
+  description: |
+    NWDAF Events Subscription Service (TS 29.520).
+    Allows NFs and AFs to subscribe to analytics events (load, mobility, QoS).
+
+servers:
+  - url: '{apiRoot}/nnwdaf-eventssubscription/v1'
+    variables:
+      apiRoot:
+        default: https://nwdaf.5gc.mnc001.mcc001.3gppnetwork.org
+
+paths:
+  /subscriptions:
+    post:
+      summary: Create analytics subscription
+      operationId: CreateNWDAFEventsSubscription
+      tags: [Subscriptions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NnwdafEventsSubscription'
+      responses:
+        '201':
+          description: Subscription created
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NnwdafEventsSubscription'
+        '400':
+          $ref: '#/components/responses/400'
+        '403':
+          $ref: '#/components/responses/403'
+        '500':
+          $ref: '#/components/responses/500'
+
+  /subscriptions/{subscriptionId}:
+    put:
+      summary: Update analytics subscription
+      operationId: UpdateNWDAFEventsSubscription
+      tags: [Subscriptions]
+      parameters:
+        - $ref: '#/components/parameters/subscriptionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NnwdafEventsSubscription'
+      responses:
+        '200':
+          description: Subscription updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NnwdafEventsSubscription'
+        '404':
+          $ref: '#/components/responses/404'
+    delete:
+      summary: Delete analytics subscription
+      operationId: DeleteNWDAFEventsSubscription
+      tags: [Subscriptions]
+      parameters:
+        - $ref: '#/components/parameters/subscriptionId'
+      responses:
+        '204':
+          description: No Content
+        '404':
+          $ref: '#/components/responses/404'
+
+components:
+  parameters:
+    subscriptionId:
+      name: subscriptionId
+      in: path
+      required: true
+      schema:
+        type: string
+
+  schemas:
+    NnwdafEventsSubscription:
+      type: object
+      required: [eventSubscriptions, notifUri]
+      properties:
+        eventSubscriptions:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventSubscription'
+          minItems: 1
+        notifUri:
+          type: string
+          format: uri
+        subsChangeNotifyUri:
+          type: string
+          format: uri
+        subsChangeNotifyCorrelationId:
+          type: string
+        nfId:
+          type: string
+          format: uuid
+        notificationCorrelationId:
+          type: string
+        supportedFeatures:
+          type: string
+        failEventReports:
+          type: array
+          items:
+            $ref: '#/components/schemas/FailureEventInfo'
+
+    EventSubscription:
+      type: object
+      required: [event]
+      properties:
+        event:
+          $ref: '#/components/schemas/NwdafEvent'
+        notifMethod:
+          type: string
+          enum: [PERIODIC, THRESHOLD, NETWORK_AREA_INFO_CHANGE]
+        maxAnaEntry:
+          type: integer
+        repPeriod:
+          type: integer
+          description: Reporting period in seconds
+        startTs:
+          type: string
+          format: date-time
+        endTs:
+          type: string
+          format: date-time
+        timeAnaNeeded:
+          type: string
+          format: date-time
+        networkArea:
+          $ref: '#/components/schemas/NetworkAreaInfo'
+        qosRequ:
+          $ref: '#/components/schemas/QosRequirement'
+        listOfAnaSubsets:
+          type: array
+          items:
+            $ref: '#/components/schemas/AnalyticsSubset'
+        nfLoadLevelThreshold:
+          $ref: '#/components/schemas/ThresholdLevel'
+
+    NwdafEvent:
+      type: string
+      enum:
+        - SLICE_LOAD_LEVEL
+        - NETWORK_PERFORMANCE
+        - NF_LOAD
+        - SERVICE_EXPERIENCE
+        - UE_MOBILITY
+        - UE_COMMUNICATION
+        - QOS_SUSTAINABILITY
+        - ABNORMAL_BEHAVIOUR
+        - USER_DATA_CONGESTION
+        - NSI_LOAD_LEVEL
+        - DN_PERFORMANCE
+        - DISPERSION
+        - RED_TRANS_EXP
+        - WLAN_PERFORMANCE
+        - SESSION_MANAGEMENT_CONGESTION_CTRL_EXP
+        - SM_CONGESTION
+
+    NetworkAreaInfo:
+      type: object
+      properties:
+        ecgis:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ecgi'
+        ncgis:
+          type: array
+          items:
+            $ref: '#/components/schemas/Ncgi'
+        gRanNodeIds:
+          type: array
+          items:
+            $ref: '#/components/schemas/GlobalRanNodeId'
+        tais:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tai'
+
+    Ecgi:
+      type: object
+      required: [plmnId, eutraCellId]
+      properties:
+        plmnId:
+          $ref: '#/components/schemas/PlmnId'
+        eutraCellId:
+          type: string
+          pattern: '^[A-Fa-f0-9]{7}$'
+
+    Ncgi:
+      type: object
+      required: [plmnId, nrCellId]
+      properties:
+        plmnId:
+          $ref: '#/components/schemas/PlmnId'
+        nrCellId:
+          type: string
+          pattern: '^[A-Fa-f0-9]{9}$'
+
+    GlobalRanNodeId:
+      type: object
+      properties:
+        plmnId:
+          $ref: '#/components/schemas/PlmnId'
+        gNbId:
+          type: string
+        ngeNbId:
+          type: string
+
+    Tai:
+      type: object
+      required: [plmnId, tac]
+      properties:
+        plmnId:
+          $ref: '#/components/schemas/PlmnId'
+        tac:
+          type: string
+
+    PlmnId:
+      type: object
+      required: [mcc, mnc]
+      properties:
+        mcc:
+          type: string
+          pattern: '^\d{3}$'
+        mnc:
+          type: string
+          pattern: '^\d{2,3}$'
+
+    QosRequirement:
+      type: object
+      properties:
+        5qi:
+          type: integer
+        gfbrUl:
+          type: string
+        gfbrDl:
+          type: string
+        dscp:
+          type: integer
+
+    AnalyticsSubset:
+      type: string
+      enum:
+        - NUM_OF_UE
+        - PERIOD_OF_UE
+        - SESS_INACT_TIMER
+        - NF_STATUS
+        - NF_RESOURCE_USAGE
+        - NF_LOAD
+        - NF_PEAK_LOAD
+        - NF_LOAD_AVG_IN_AOI
+        - UE_COMM
+        - PDU_SES_EST
+        - PDU_SES_FAIL
+        - PDU_SES_ESTBL_SUCC_RATIO
+        - QOS_FLOW_RETAINABILITY
+        - ABNORMAL_NUM_UE
+        - ABNORMAL_NUM_PDU_SESS
+        - SUP_IND_ABNORMAL_BEHAVIOUR
+
+    ThresholdLevel:
+      type: object
+      properties:
+        congLevel:
+          type: integer
+        nfLoadLevel:
+          type: integer
+        nfCpuUsage:
+          type: integer
+        nfMemoryUsage:
+          type: integer
+        nfStorageUsage:
+          type: integer
+        avgTrafficRate:
+          type: string
+        maxTrafficRate:
+          type: string
+        avgPacketDelay:
+          type: integer
+        maxPacketDelay:
+          type: integer
+        avgPacketLossRate:
+          type: integer
+
+    FailureEventInfo:
+      type: object
+      required: [event, failureCode]
+      properties:
+        event:
+          $ref: '#/components/schemas/NwdafEvent'
+        failureCode:
+          type: string
+          enum: [UNAVAILABLE_DATA, BOTH_ANLT_AND_UNCER_LEVEL_NOTSUPP,
+                 EXCEED_MAX_SUP_ANT_PERIODS, TEMPORARY_NOT_AVAILABLE,
+                 TRAINING_ONGOING]
+
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+
+  responses:
+    '400':
+      description: Bad Request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '403':
+      description: Forbidden
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '404':
+      description: Not Found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '500':
+      description: Internal Server Error
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'

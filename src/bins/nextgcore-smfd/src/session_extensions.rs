@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 // ============================================================================
@@ -114,10 +115,116 @@ impl Ipv6PrefixPool {
     }
 }
 
-/// Dual-stack address allocator
+/// Bitmap-based IPv4 address pool with allocation and release support.
+///
+/// Manages a subnet (default 10.45.0.0/16) using a bitset where each bit
+/// represents a host address. Supports O(n/64) allocation via word scanning
+/// and O(1) release.
+pub struct Ipv4Pool {
+    /// Base network octets (first 2 octets for /16)
+    base: [u8; 4],
+    /// Total number of host addresses in the pool
+    pool_size: u32,
+    /// Bitmap: bit i = 1 means host address i is allocated
+    bitmap: Mutex<Vec<u64>>,
+    /// Number of currently allocated addresses (excludes reserved)
+    allocated_count: AtomicU32,
+}
+
+impl Ipv4Pool {
+    /// Create a new pool for the given /16 subnet.
+    /// Reserves .0.0 (network) and .0.1 (gateway).
+    pub fn new(base_a: u8, base_b: u8) -> Self {
+        let pool_size: u32 = 65536; // /16 = 2^16 addresses
+        let bitmap_words = ((pool_size + 63) / 64) as usize;
+        let pool = Self {
+            base: [base_a, base_b, 0, 0],
+            pool_size,
+            bitmap: Mutex::new(vec![0u64; bitmap_words]),
+            allocated_count: AtomicU32::new(0),
+        };
+        // Reserve network address (.0.0) and gateway (.0.1)
+        pool.mark_allocated(0);
+        pool.mark_allocated(1);
+        pool
+    }
+
+    /// Default pool: 10.45.0.0/16
+    pub fn default_pool() -> Self {
+        Self::new(10, 45)
+    }
+
+    fn mark_allocated(&self, host_idx: u32) {
+        if let Ok(mut bm) = self.bitmap.lock() {
+            let word = (host_idx / 64) as usize;
+            let bit = host_idx % 64;
+            if word < bm.len() {
+                bm[word] |= 1u64 << bit;
+            }
+        }
+    }
+
+    /// Allocate the next available IPv4 address from the pool.
+    /// Returns `None` if the pool is exhausted.
+    pub fn allocate(&self) -> Option<Ipv4Addr> {
+        let mut bm = self.bitmap.lock().ok()?;
+        for (word_idx, word) in bm.iter_mut().enumerate() {
+            if *word != u64::MAX {
+                let bit = (!*word).trailing_zeros();
+                let host_idx = (word_idx as u32) * 64 + bit;
+                if host_idx >= self.pool_size {
+                    return None;
+                }
+                *word |= 1u64 << bit;
+                self.allocated_count.fetch_add(1, Ordering::Relaxed);
+                let mut octets = self.base;
+                octets[2] = ((host_idx >> 8) & 0xFF) as u8;
+                octets[3] = (host_idx & 0xFF) as u8;
+                return Some(Ipv4Addr::from(octets));
+            }
+        }
+        None
+    }
+
+    /// Release an IPv4 address back to the pool.
+    /// Returns `true` if the address was successfully released.
+    pub fn release(&self, addr: Ipv4Addr) -> bool {
+        let octets = addr.octets();
+        if octets[0] != self.base[0] || octets[1] != self.base[1] {
+            return false;
+        }
+        let host_idx = ((octets[2] as u32) << 8) | (octets[3] as u32);
+        if host_idx >= self.pool_size {
+            return false;
+        }
+        if let Ok(mut bm) = self.bitmap.lock() {
+            let word = (host_idx / 64) as usize;
+            let bit = host_idx % 64;
+            if bm[word] & (1u64 << bit) != 0 {
+                bm[word] &= !(1u64 << bit);
+                self.allocated_count.fetch_sub(1, Ordering::Relaxed);
+                log::debug!("IPv4 pool: released {addr}");
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Number of currently allocated addresses (excluding reserved).
+    pub fn active_count(&self) -> u32 {
+        self.allocated_count.load(Ordering::Relaxed)
+    }
+
+    /// Number of available addresses in the pool.
+    pub fn available_count(&self) -> u32 {
+        self.pool_size.saturating_sub(self.allocated_count.load(Ordering::Relaxed))
+    }
+}
+
+/// Dual-stack address allocator using bitmap-based IPv4 pool
 pub struct DualStackAllocator {
-    /// IPv4 pool counter (10.45.0.x)
-    ipv4_counter: AtomicU32,
+    /// Bitmap-based IPv4 pool
+    pub ipv4_pool: Ipv4Pool,
     /// IPv6 prefix pool
     ipv6_pool: Ipv6PrefixPool,
 }
@@ -125,7 +232,7 @@ pub struct DualStackAllocator {
 impl DualStackAllocator {
     pub fn new() -> Self {
         Self {
-            ipv4_counter: AtomicU32::new(2), // Start at .2
+            ipv4_pool: Ipv4Pool::default_pool(),
             ipv6_pool: Ipv6PrefixPool::default_pool(),
         }
     }
@@ -134,26 +241,43 @@ impl DualStackAllocator {
     pub fn allocate(&self, pdu_type: PduSessionType) -> UeAddress {
         match pdu_type {
             PduSessionType::Ipv4 => {
-                let idx = self.ipv4_counter.fetch_add(1, Ordering::Relaxed);
-                UeAddress::ipv4_only(Ipv4Addr::new(10, 45, 0, idx as u8))
+                match self.ipv4_pool.allocate() {
+                    Some(addr) => UeAddress::ipv4_only(addr),
+                    None => {
+                        log::error!("IPv4 pool exhausted");
+                        UeAddress { ipv4: None, ipv6_prefix: None }
+                    }
+                }
             }
             PduSessionType::Ipv6 => {
                 let (prefix_len, addr) = self.ipv6_pool.allocate();
                 UeAddress::ipv6_only(prefix_len, addr)
             }
             PduSessionType::Ipv4v6 => {
-                let idx = self.ipv4_counter.fetch_add(1, Ordering::Relaxed);
-                let ipv4 = Ipv4Addr::new(10, 45, 0, idx as u8);
-                let (prefix_len, ipv6) = self.ipv6_pool.allocate();
-                UeAddress::dual_stack(ipv4, prefix_len, ipv6)
+                match self.ipv4_pool.allocate() {
+                    Some(ipv4) => {
+                        let (prefix_len, ipv6) = self.ipv6_pool.allocate();
+                        UeAddress::dual_stack(ipv4, prefix_len, ipv6)
+                    }
+                    None => {
+                        log::error!("IPv4 pool exhausted for dual-stack");
+                        let (prefix_len, addr) = self.ipv6_pool.allocate();
+                        UeAddress::ipv6_only(prefix_len, addr)
+                    }
+                }
             }
             _ => UeAddress { ipv4: None, ipv6_prefix: None },
         }
     }
 
-    /// Total allocations made
+    /// Release an IPv4 address back to the pool
+    pub fn release_ipv4(&self, addr: Ipv4Addr) -> bool {
+        self.ipv4_pool.release(addr)
+    }
+
+    /// Total active IPv4 allocations
     pub fn total_ipv4_allocations(&self) -> u32 {
-        self.ipv4_counter.load(Ordering::Relaxed) - 2
+        self.ipv4_pool.active_count()
     }
 }
 
@@ -548,5 +672,159 @@ mod tests {
         assert_eq!(PduSessionType::from_u8(2), PduSessionType::Ipv6);
         assert_eq!(PduSessionType::from_u8(3), PduSessionType::Ipv4v6);
         assert_eq!(PduSessionType::from_u8(5), PduSessionType::Ethernet);
+    }
+
+    #[test]
+    fn test_pdu_session_type_from_u8_unknown_defaults_to_ipv4() {
+        assert_eq!(PduSessionType::from_u8(0), PduSessionType::Ipv4);
+        assert_eq!(PduSessionType::from_u8(99), PduSessionType::Ipv4);
+        assert_eq!(PduSessionType::from_u8(255), PduSessionType::Ipv4);
+    }
+
+    // -- Ipv4Pool tests --
+
+    #[test]
+    fn test_ipv4_pool_first_alloc_skips_reserved() {
+        let pool = Ipv4Pool::default_pool();
+        // .0.0 (network) and .0.1 (gateway) are reserved
+        let addr = pool.allocate().unwrap();
+        let octets = addr.octets();
+        assert_eq!(octets[0], 10);
+        assert_eq!(octets[1], 45);
+        // Must be .0.2 or higher, never .0.0 or .0.1
+        let host = ((octets[2] as u16) << 8) | (octets[3] as u16);
+        assert!(host >= 2, "First allocation should skip reserved .0.0 and .0.1, got .{}.{}", octets[2], octets[3]);
+    }
+
+    #[test]
+    fn test_ipv4_pool_release_and_realloc() {
+        let pool = Ipv4Pool::default_pool();
+        let addr1 = pool.allocate().unwrap();
+        assert_eq!(pool.active_count(), 1);
+
+        // Release it
+        assert!(pool.release(addr1));
+        assert_eq!(pool.active_count(), 0);
+
+        // Re-allocate — should get the same address back (lowest available)
+        let addr2 = pool.allocate().unwrap();
+        assert_eq!(addr1, addr2, "Released address should be re-allocated");
+        assert_eq!(pool.active_count(), 1);
+    }
+
+    #[test]
+    fn test_ipv4_pool_release_wrong_subnet_returns_false() {
+        let pool = Ipv4Pool::default_pool(); // 10.45.0.0/16
+        // Try releasing an address from a different subnet
+        assert!(!pool.release(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(!pool.release(Ipv4Addr::new(10, 46, 0, 2)));
+    }
+
+    #[test]
+    fn test_ipv4_pool_double_release_returns_false() {
+        let pool = Ipv4Pool::default_pool();
+        let addr = pool.allocate().unwrap();
+        assert!(pool.release(addr));
+        // Second release should fail — bit already cleared
+        assert!(!pool.release(addr));
+    }
+
+    #[test]
+    fn test_ipv4_pool_release_unallocated_returns_false() {
+        let pool = Ipv4Pool::default_pool();
+        // Never allocated 10.45.1.100, should fail
+        assert!(!pool.release(Ipv4Addr::new(10, 45, 1, 100)));
+    }
+
+    #[test]
+    fn test_ipv4_pool_counters_after_alloc_and_release() {
+        let pool = Ipv4Pool::default_pool();
+        // Pool has 65536 total, 2 reserved by bitmap (but not counted in allocated_count)
+        assert_eq!(pool.active_count(), 0);
+
+        let a1 = pool.allocate().unwrap();
+        let a2 = pool.allocate().unwrap();
+        let a3 = pool.allocate().unwrap();
+        assert_eq!(pool.active_count(), 3);
+
+        pool.release(a2);
+        assert_eq!(pool.active_count(), 2);
+
+        pool.release(a1);
+        pool.release(a3);
+        assert_eq!(pool.active_count(), 0);
+    }
+
+    #[test]
+    fn test_ipv4_pool_allocations_are_unique() {
+        let pool = Ipv4Pool::default_pool();
+        let mut addrs = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let addr = pool.allocate().unwrap();
+            assert!(addrs.insert(addr), "Duplicate allocation: {addr}");
+        }
+        assert_eq!(addrs.len(), 100);
+        assert_eq!(pool.active_count(), 100);
+    }
+
+    #[test]
+    fn test_ipv4_pool_small_pool_exhaustion() {
+        // Create a tiny pool: use base 10.99 (will have 65536 addresses, but we can fill a custom one)
+        // Instead, test with default pool and verify allocate returns None after filling
+        // For speed, we'll test the logic differently: allocate a lot, release all, allocate again
+        let pool = Ipv4Pool::new(10, 99);
+        // Allocate 256 addresses (first /24 worth after reserved)
+        let mut allocated = Vec::new();
+        for _ in 0..254 {
+            match pool.allocate() {
+                Some(addr) => allocated.push(addr),
+                None => break,
+            }
+        }
+        assert_eq!(allocated.len(), 254);
+
+        // Release all
+        for addr in &allocated {
+            assert!(pool.release(*addr));
+        }
+        assert_eq!(pool.active_count(), 0);
+
+        // Re-allocate same count
+        for _ in 0..254 {
+            assert!(pool.allocate().is_some());
+        }
+        assert_eq!(pool.active_count(), 254);
+    }
+
+    #[test]
+    fn test_ipv4_pool_concurrent_access() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let pool = Arc::new(Ipv4Pool::default_pool());
+        let mut handles = Vec::new();
+
+        // Spawn 8 threads, each allocating 50 addresses
+        for _ in 0..8 {
+            let pool = Arc::clone(&pool);
+            handles.push(thread::spawn(move || {
+                let mut addrs = Vec::new();
+                for _ in 0..50 {
+                    if let Some(addr) = pool.allocate() {
+                        addrs.push(addr);
+                    }
+                }
+                addrs
+            }));
+        }
+
+        let mut all_addrs = std::collections::HashSet::new();
+        for h in handles {
+            for addr in h.join().unwrap() {
+                assert!(all_addrs.insert(addr), "Concurrent duplicate: {addr}");
+            }
+        }
+        assert_eq!(all_addrs.len(), 400); // 8 * 50
+        assert_eq!(pool.active_count(), 400);
     }
 }

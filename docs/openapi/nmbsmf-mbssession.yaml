@@ -1,0 +1,368 @@
+openapi: 3.0.3
+info:
+  title: Nmbsmf_MBSSession
+  version: 1.0.0
+  description: |
+    MB-SMF MBS Session Management Service (TS 29.532, Rel-17).
+    Manages Multicast-Broadcast Service (MBS) sessions for multicast and broadcast delivery.
+
+servers:
+  - url: '{apiRoot}/nmbsmf-mbssession/v1'
+    variables:
+      apiRoot:
+        default: https://mbsmf.5gc.mnc001.mcc001.3gppnetwork.org
+
+paths:
+  /mbs-sessions:
+    post:
+      summary: Create MBS Session
+      operationId: CreateMBSSession
+      tags: [MBS Sessions]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateMbsSessionCtxtRequest'
+      responses:
+        '201':
+          description: MBS Session created
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MbsSessionCtxt'
+        '400':
+          $ref: '#/components/responses/400'
+        '403':
+          $ref: '#/components/responses/403'
+        '500':
+          $ref: '#/components/responses/500'
+
+  /mbs-sessions/{mbsSessionId}:
+    get:
+      summary: Retrieve MBS Session
+      operationId: GetMBSSession
+      tags: [MBS Sessions]
+      parameters:
+        - $ref: '#/components/parameters/mbsSessionId'
+      responses:
+        '200':
+          description: MBS Session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MbsSessionCtxt'
+        '404':
+          $ref: '#/components/responses/404'
+    patch:
+      summary: Update MBS Session
+      operationId: UpdateMBSSession
+      tags: [MBS Sessions]
+      parameters:
+        - $ref: '#/components/parameters/mbsSessionId'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema:
+              $ref: '#/components/schemas/MbsSessionCtxtPatch'
+      responses:
+        '200':
+          description: Updated MBS Session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MbsSessionCtxt'
+        '404':
+          $ref: '#/components/responses/404'
+    delete:
+      summary: Delete MBS Session
+      operationId: DeleteMBSSession
+      tags: [MBS Sessions]
+      parameters:
+        - $ref: '#/components/parameters/mbsSessionId'
+      responses:
+        '204':
+          description: No Content
+        '404':
+          $ref: '#/components/responses/404'
+
+  /mbs-sessions/{mbsSessionId}/ue-contexts:
+    post:
+      summary: Join MBS Session (UE context creation)
+      operationId: JoinMBSSession
+      tags: [UE Context]
+      parameters:
+        - $ref: '#/components/parameters/mbsSessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MbsUeContextReq'
+      responses:
+        '201':
+          description: UE joined MBS session
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MbsUeContextRsp'
+        '403':
+          $ref: '#/components/responses/403'
+        '404':
+          $ref: '#/components/responses/404'
+
+  /mbs-sessions/{mbsSessionId}/ue-contexts/{mbsUeContextRef}/release:
+    post:
+      summary: Leave MBS Session (UE context release)
+      operationId: LeaveMBSSession
+      tags: [UE Context]
+      parameters:
+        - $ref: '#/components/parameters/mbsSessionId'
+        - name: mbsUeContextRef
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MbsUeContextRelReq'
+      responses:
+        '204':
+          description: No Content
+        '404':
+          $ref: '#/components/responses/404'
+
+components:
+  parameters:
+    mbsSessionId:
+      name: mbsSessionId
+      in: path
+      required: true
+      schema:
+        type: string
+
+  schemas:
+    CreateMbsSessionCtxtRequest:
+      type: object
+      required: [mbsSessionId, mbsServiceType]
+      properties:
+        mbsSessionId:
+          $ref: '#/components/schemas/MbsSessionId'
+        mbsServiceType:
+          $ref: '#/components/schemas/MbsServiceType'
+        mbsServiceArea:
+          $ref: '#/components/schemas/MbsServiceArea'
+        mbsQosReq:
+          $ref: '#/components/schemas/MbsQosReq'
+        mbsSecurityContext:
+          $ref: '#/components/schemas/MbsSecurityContext'
+        imsi:
+          type: string
+
+    MbsSessionCtxt:
+      type: object
+      required: [mbsSessionId, mbsServiceType, mbsSessionStatus]
+      properties:
+        mbsSessionId:
+          $ref: '#/components/schemas/MbsSessionId'
+        mbsServiceType:
+          $ref: '#/components/schemas/MbsServiceType'
+        mbsSessionStatus:
+          $ref: '#/components/schemas/MbsSessionStatus'
+        mbsServiceArea:
+          $ref: '#/components/schemas/MbsServiceArea'
+        mbsQosReq:
+          $ref: '#/components/schemas/MbsQosReq'
+        tmgi:
+          type: string
+          description: Temporary Mobile Group Identity (hex, 12 chars)
+        mbsGtpTeidInfo:
+          $ref: '#/components/schemas/MbsGtpTeidInfo'
+
+    MbsSessionCtxtPatch:
+      type: object
+      properties:
+        mbsSessionStatus:
+          $ref: '#/components/schemas/MbsSessionStatus'
+        mbsServiceArea:
+          $ref: '#/components/schemas/MbsServiceArea'
+        mbsQosReq:
+          $ref: '#/components/schemas/MbsQosReq'
+
+    MbsSessionId:
+      type: object
+      oneOf:
+        - required: [tmgi]
+          properties:
+            tmgi:
+              type: string
+              description: TMGI (hex, 12 chars)
+        - required: [ssm]
+          properties:
+            ssm:
+              type: string
+              description: Source-specific multicast group address
+
+    MbsServiceType:
+      type: string
+      enum: [MULTICAST, BROADCAST]
+
+    MbsSessionStatus:
+      type: string
+      enum: [ACTIVE, INACTIVE, DEACTIVATED]
+
+    MbsServiceArea:
+      type: object
+      properties:
+        areaCodes:
+          type: array
+          items:
+            type: string
+        tais:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tai'
+
+    Tai:
+      type: object
+      required: [plmnId, tac]
+      properties:
+        plmnId:
+          $ref: '#/components/schemas/PlmnId'
+        tac:
+          type: string
+          pattern: '^([A-Fa-f0-9]{4}|[A-Fa-f0-9]{6})$'
+
+    PlmnId:
+      type: object
+      required: [mcc, mnc]
+      properties:
+        mcc:
+          type: string
+          pattern: '^\d{3}$'
+        mnc:
+          type: string
+          pattern: '^\d{2,3}$'
+
+    MbsQosReq:
+      type: object
+      properties:
+        5qi:
+          type: integer
+          minimum: 0
+          maximum: 255
+        mbr:
+          $ref: '#/components/schemas/MbsAmbr'
+        maxDataBurstVol:
+          type: integer
+        packDelayBudget:
+          type: integer
+          description: Packet Delay Budget in ms
+
+    MbsAmbr:
+      type: object
+      properties:
+        downlink:
+          type: string
+          description: Downlink MBR (e.g., "10 Mbps")
+
+    MbsSecurityContext:
+      type: object
+      required: [msk]
+      properties:
+        msk:
+          type: string
+          description: MSK (MBMS Service Key, base64)
+        mskId:
+          type: string
+        mtk:
+          type: string
+          description: MTK (MBMS Traffic Key, base64)
+        mtkId:
+          type: string
+
+    MbsGtpTeidInfo:
+      type: object
+      required: [teid, ipv4Addr]
+      properties:
+        teid:
+          type: integer
+          description: GTP-U TEID for MBS delivery
+        ipv4Addr:
+          type: string
+          format: ipv4
+        ipv6Addr:
+          type: string
+          format: ipv6
+
+    MbsUeContextReq:
+      type: object
+      required: [supi, pduSessionId]
+      properties:
+        supi:
+          type: string
+        pduSessionId:
+          type: integer
+        requestType:
+          type: string
+          enum: [MBS_JOIN, MBS_LEAVE]
+
+    MbsUeContextRsp:
+      type: object
+      properties:
+        mbsUeContextRef:
+          type: string
+        tmgi:
+          type: string
+
+    MbsUeContextRelReq:
+      type: object
+      properties:
+        cause:
+          type: string
+          enum: [HANDOVER, UE_INITIATED, NW_INITIATED, SERVICE_AREA_LEFT]
+
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+
+  responses:
+    '400':
+      description: Bad Request
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '403':
+      description: Forbidden
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '404':
+      description: Not Found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '500':
+      description: Internal Server Error
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'

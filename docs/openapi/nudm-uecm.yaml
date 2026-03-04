@@ -1,0 +1,298 @@
+openapi: 3.0.3
+info:
+  title: Nudm_UECM
+  version: 1.3.0
+  description: |
+    UDM UE Context Management Service (TS 29.503).
+    Manages AMF/SMF/SMSF registration for UEs.
+
+servers:
+  - url: '{apiRoot}/nudm-uecm/v1'
+    variables:
+      apiRoot:
+        default: https://udm.5gc.mnc001.mcc001.3gppnetwork.org
+
+paths:
+  /{ueId}/registrations/amf-3gpp-access:
+    put:
+      summary: Register AMF for 3GPP access
+      operationId: Registration
+      tags: [AMF Registration]
+      parameters:
+        - $ref: '#/components/parameters/ueId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Amf3GppAccessRegistration'
+      responses:
+        '201':
+          description: Registration created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Amf3GppAccessRegistration'
+        '200':
+          description: Registration updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Amf3GppAccessRegistration'
+    get:
+      summary: Get AMF 3GPP access registration
+      operationId: Get3GppRegistration
+      tags: [AMF Registration]
+      parameters:
+        - $ref: '#/components/parameters/ueId'
+        - $ref: '#/components/parameters/supportedFeatures'
+      responses:
+        '200':
+          description: Registration data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Amf3GppAccessRegistration'
+        '404':
+          $ref: '#/components/responses/404'
+
+  /{ueId}/registrations/smf-registrations/{pduSessionId}:
+    put:
+      summary: Register SMF for PDU session
+      operationId: Registration_1
+      tags: [SMF Registration]
+      parameters:
+        - $ref: '#/components/parameters/ueId'
+        - $ref: '#/components/parameters/pduSessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SmfRegistration'
+      responses:
+        '201':
+          description: SMF registration created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SmfRegistration'
+        '200':
+          description: SMF registration updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SmfRegistration'
+    delete:
+      summary: Deregister SMF for PDU session
+      operationId: DeregistrationSmfRegistrations
+      tags: [SMF Registration]
+      parameters:
+        - $ref: '#/components/parameters/ueId'
+        - $ref: '#/components/parameters/pduSessionId'
+        - name: smf-set-id
+          in: query
+          schema:
+            type: string
+        - name: smf-instance-id
+          in: query
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: No Content
+        '404':
+          $ref: '#/components/responses/404'
+
+  /{ueId}/registrations:
+    get:
+      summary: Get all registrations for a UE
+      operationId: GetRegistrations
+      tags: [AMF Registration]
+      parameters:
+        - $ref: '#/components/parameters/ueId'
+        - name: reg-type
+          in: query
+          schema:
+            type: string
+            enum: [AMF_3GPP, AMF_NON_3GPP, SMF, SMSF]
+      responses:
+        '200':
+          description: Registrations
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegistrationDataSets'
+        '404':
+          $ref: '#/components/responses/404'
+
+components:
+  parameters:
+    ueId:
+      name: ueId
+      in: path
+      required: true
+      schema:
+        type: string
+    pduSessionId:
+      name: pduSessionId
+      in: path
+      required: true
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 255
+    supportedFeatures:
+      name: supported-features
+      in: query
+      schema:
+        type: string
+
+  schemas:
+    Amf3GppAccessRegistration:
+      type: object
+      required: [amfInstanceId, deregCallbackUri, guami, ratType]
+      properties:
+        amfInstanceId:
+          type: string
+          format: uuid
+        supportedFeatures:
+          type: string
+        purgeFlag:
+          type: boolean
+        pei:
+          type: string
+        imsVoPs:
+          type: string
+          enum: [HOMOGENEOUS_SUPPORT, HOMOGENEOUS_NON_SUPPORT, NON_HOMOGENEOUS_OR_UNKNOWN]
+        deregCallbackUri:
+          type: string
+          format: uri
+        guami:
+          $ref: '#/components/schemas/Guami'
+        backupAmfInfo:
+          type: array
+          items:
+            $ref: '#/components/schemas/BackupAmfInfo'
+        drFlag:
+          type: boolean
+        ratType:
+          type: string
+          enum: [NR, EUTRA, WLAN, VIRTUAL, NBIOT, WIRELINE, WIRELINE_CABLE, LTE_M,
+                 NR_U, EUTRA_U, TRUSTED_N3GA, TRUSTED_WLAN, UTRA, GERA, NR_LEO,
+                 NR_MEO, NR_GEO, NR_OTHER_SAT, NR_REDCAP]
+        urrpIndicator:
+          type: boolean
+        amfEeSubscriptionId:
+          type: string
+
+    Guami:
+      type: object
+      required: [plmnId, amfId]
+      properties:
+        plmnId:
+          $ref: '#/components/schemas/PlmnId'
+        amfId:
+          type: string
+          description: AMF Identifier (hex, 6 chars)
+
+    PlmnId:
+      type: object
+      required: [mcc, mnc]
+      properties:
+        mcc:
+          type: string
+          pattern: '^\d{3}$'
+        mnc:
+          type: string
+          pattern: '^\d{2,3}$'
+
+    BackupAmfInfo:
+      type: object
+      required: [backupAmf]
+      properties:
+        backupAmf:
+          type: string
+        accessTypes:
+          type: array
+          items:
+            type: string
+            enum: [3GPP_ACCESS, NON_3GPP_ACCESS]
+
+    SmfRegistration:
+      type: object
+      required: [smfInstanceId, pduSessionId, singleNssai, dnn]
+      properties:
+        smfInstanceId:
+          type: string
+          format: uuid
+        supportedFeatures:
+          type: string
+        pduSessionId:
+          type: integer
+          minimum: 1
+          maximum: 255
+        singleNssai:
+          $ref: '#/components/schemas/Snssai'
+        dnn:
+          type: string
+        emergencyServices:
+          type: boolean
+        pcscfRestorationCallbackUri:
+          type: string
+          format: uri
+        plmnId:
+          $ref: '#/components/schemas/PlmnId'
+        pgwFqdn:
+          type: string
+        epdgInd:
+          type: boolean
+
+    Snssai:
+      type: object
+      required: [sst]
+      properties:
+        sst:
+          type: integer
+          minimum: 0
+          maximum: 255
+        sd:
+          type: string
+          pattern: '^[A-Fa-f0-9]{6}$'
+
+    RegistrationDataSets:
+      type: object
+      properties:
+        amf3GppAccess:
+          $ref: '#/components/schemas/Amf3GppAccessRegistration'
+        smfRegistrationList:
+          type: array
+          items:
+            $ref: '#/components/schemas/SmfRegistration'
+
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+
+  responses:
+    '404':
+      description: Not Found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '500':
+      description: Internal Server Error
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'

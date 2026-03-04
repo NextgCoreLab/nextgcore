@@ -248,6 +248,15 @@ fn main() -> Result<()> {
         .filter_level(log_level)
         .format_timestamp_millis()
         .init();
+    // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
+    let _otel = ogs_metrics::otel::init_otel(
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
+            .with_endpoint(
+                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+            ),
+    )
+    .ok();
 
     log::info!("NextGCore SGWC v{}", env!("CARGO_PKG_VERSION"));
     log::info!("Configuration: {}", args.config);

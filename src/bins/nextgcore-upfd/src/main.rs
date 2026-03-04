@@ -21,6 +21,7 @@ pub mod rule_match;
 pub mod mcast;
 pub mod programmable_plane;
 pub mod timer;
+pub mod tsn_bridge;
 pub mod upf_sm;
 
 #[cfg(test)]
@@ -112,6 +113,15 @@ async fn main() -> Result<()> {
 
     // Initialize logging
     init_logging(&args)?;
+    // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
+    let _otel = ogs_metrics::otel::init_otel(
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
+            .with_endpoint(
+                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+            ),
+    )
+    .ok();
 
     log::info!("NextGCore UPF v{} starting...", env!("CARGO_PKG_VERSION"));
 
@@ -511,14 +521,28 @@ fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
                     if !pdrs.is_empty() {
                         let mut dp_pdrs: Vec<DataPlanePdr> = pdrs
                             .iter()
-                            .map(|p| DataPlanePdr {
-                                pdr_id: p.pdr_id,
-                                precedence: p.precedence,
-                                source_interface: p.pdi.source_interface,
-                                far_id: p.far_id,
-                                qer_id: p.qer_id,
-                                urr_ids: p.urr_ids.clone(),
-                                outer_header_removal: p.outer_header_removal,
+                            .map(|p| {
+                                // Compile SDF filter's flow description into an IpfwRule
+                                let sdf_rule = p.pdi.sdf_flow_description.as_ref()
+                                    .and_then(|desc| {
+                                        match ogs_ipfw::compile_rule(desc) {
+                                            Ok(rule) => Some(rule),
+                                            Err(e) => {
+                                                log::warn!("Failed to compile SDF filter '{}': {}", desc, e);
+                                                None
+                                            }
+                                        }
+                                    });
+                                DataPlanePdr {
+                                    pdr_id: p.pdr_id,
+                                    precedence: p.precedence,
+                                    source_interface: p.pdi.source_interface,
+                                    far_id: p.far_id,
+                                    qer_id: p.qer_id,
+                                    urr_ids: p.urr_ids.clone(),
+                                    outer_header_removal: p.outer_header_removal,
+                                    sdf_rule,
+                                }
                             })
                             .collect();
                         dp_pdrs.sort_by_key(|p| p.precedence);

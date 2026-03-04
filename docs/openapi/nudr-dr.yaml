@@ -1,0 +1,499 @@
+openapi: 3.0.3
+info:
+  title: Nudr_DataRepository
+  version: 2.3.0
+  description: |
+    UDR Data Repository Service (TS 29.504).
+    Stores and retrieves subscription, policy, and application data.
+
+servers:
+  - url: '{apiRoot}/nudr-dr/v2'
+    variables:
+      apiRoot:
+        default: https://udr.5gc.mnc001.mcc001.3gppnetwork.org
+
+paths:
+  /subscription-data/{ueId}/authentication-data/authentication-subscription:
+    get:
+      summary: Get authentication subscription data
+      operationId: QueryAuthSubsData
+      tags: [Subscription Data]
+      parameters:
+        - $ref: '#/components/parameters/ueId'
+        - $ref: '#/components/parameters/supportedFeatures'
+      responses:
+        '200':
+          description: Authentication subscription data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthenticationSubscription'
+        '404':
+          $ref: '#/components/responses/404'
+    put:
+      summary: Create or update authentication subscription data
+      operationId: ModifyAuthenticationSubscription
+      tags: [Subscription Data]
+      parameters:
+        - $ref: '#/components/parameters/ueId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthenticationSubscription'
+      responses:
+        '204':
+          description: No Content
+
+  /subscription-data/{ueId}/authentication-data/authentication-status:
+    put:
+      summary: Store UE authentication status
+      operationId: CreateAuthenticationStatus
+      tags: [Subscription Data]
+      parameters:
+        - $ref: '#/components/parameters/ueId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthEvent'
+      responses:
+        '204':
+          description: No Content
+
+  /subscription-data/{ueId}/{servingPlmnId}/provisioned-data/am-data:
+    get:
+      summary: Get access and mobility subscription data
+      operationId: QueryAmData
+      tags: [Subscription Data]
+      parameters:
+        - $ref: '#/components/parameters/ueId'
+        - $ref: '#/components/parameters/servingPlmnId'
+        - $ref: '#/components/parameters/supportedFeatures'
+      responses:
+        '200':
+          description: Access and mobility subscription data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccessAndMobilitySubscriptionData'
+        '404':
+          $ref: '#/components/responses/404'
+
+  /subscription-data/{ueId}/{servingPlmnId}/provisioned-data/smf-selection-subscription-data:
+    get:
+      summary: Get SMF selection subscription data
+      operationId: QuerySmfSelectData
+      tags: [Subscription Data]
+      parameters:
+        - $ref: '#/components/parameters/ueId'
+        - $ref: '#/components/parameters/servingPlmnId'
+        - $ref: '#/components/parameters/supportedFeatures'
+      responses:
+        '200':
+          description: SMF selection subscription data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SmfSelectionSubscriptionData'
+        '404':
+          $ref: '#/components/responses/404'
+
+  /subscription-data/{ueId}/{servingPlmnId}/provisioned-data/sm-data:
+    get:
+      summary: Get session management subscription data
+      operationId: QuerySmData
+      tags: [Subscription Data]
+      parameters:
+        - $ref: '#/components/parameters/ueId'
+        - $ref: '#/components/parameters/servingPlmnId'
+        - $ref: '#/components/parameters/supportedFeatures'
+        - name: dnn
+          in: query
+          schema:
+            type: string
+        - name: single-nssai
+          in: query
+          schema:
+            $ref: '#/components/schemas/Snssai'
+          style: deepObject
+          explode: true
+      responses:
+        '200':
+          description: Session management subscription data
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SessionManagementSubscriptionData'
+        '404':
+          $ref: '#/components/responses/404'
+
+  /policy-data/ues/{ueId}/am-data:
+    get:
+      summary: Get AM policy data for UE
+      operationId: ReadAccessAndMobilityPolicyData
+      tags: [Policy Data]
+      parameters:
+        - $ref: '#/components/parameters/ueId'
+      responses:
+        '200':
+          description: AM policy data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AmPolicyData'
+        '404':
+          $ref: '#/components/responses/404'
+
+  /policy-data/ues/{ueId}/sm-data:
+    get:
+      summary: Get SM policy data for UE
+      operationId: ReadSessionManagementPolicyData
+      tags: [Policy Data]
+      parameters:
+        - $ref: '#/components/parameters/ueId'
+        - name: dnn
+          in: query
+          schema:
+            type: string
+        - name: snssai
+          in: query
+          schema:
+            $ref: '#/components/schemas/Snssai'
+          style: deepObject
+          explode: true
+      responses:
+        '200':
+          description: SM policy data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SmPolicyData'
+        '404':
+          $ref: '#/components/responses/404'
+
+components:
+  parameters:
+    ueId:
+      name: ueId
+      in: path
+      required: true
+      schema:
+        type: string
+    servingPlmnId:
+      name: servingPlmnId
+      in: path
+      required: true
+      schema:
+        type: string
+    supportedFeatures:
+      name: supported-features
+      in: query
+      schema:
+        type: string
+
+  schemas:
+    Snssai:
+      type: object
+      required: [sst]
+      properties:
+        sst:
+          type: integer
+          minimum: 0
+          maximum: 255
+        sd:
+          type: string
+          pattern: '^[A-Fa-f0-9]{6}$'
+
+    AuthenticationSubscription:
+      type: object
+      required: [authenticationMethod]
+      properties:
+        authenticationMethod:
+          type: string
+          enum: [5G_AKA, EAP_AKA_PRIME, EAP_TLS]
+        encPermanentKey:
+          type: string
+          description: Encrypted K (hex, 32 chars)
+        protectionParameterId:
+          type: string
+        sequenceNumber:
+          $ref: '#/components/schemas/SequenceNumber'
+        authenticationManagementField:
+          type: string
+          description: AMF (hex, 4 chars)
+        algorithmId:
+          type: string
+        encOpcKey:
+          type: string
+          description: Encrypted OPc (hex, 32 chars)
+        encTopcKey:
+          type: string
+        hssGroupId:
+          type: string
+        supi:
+          type: string
+
+    SequenceNumber:
+      type: object
+      required: [sqn]
+      properties:
+        sqn:
+          type: string
+          description: Sequence number (hex, 12 chars)
+        indLength:
+          type: integer
+        diffHexList:
+          type: array
+          items:
+            type: string
+
+    AuthEvent:
+      type: object
+      required: [nfInstanceId, success, timeStamp, authType, servingNetworkName]
+      properties:
+        nfInstanceId:
+          type: string
+          format: uuid
+        success:
+          type: boolean
+        timeStamp:
+          type: string
+          format: date-time
+        authType:
+          type: string
+          enum: [5G_AKA, EAP_AKA_PRIME, EAP_TLS]
+        servingNetworkName:
+          type: string
+        supi:
+          type: string
+
+    AccessAndMobilitySubscriptionData:
+      type: object
+      properties:
+        subscribedUeAmbr:
+          $ref: '#/components/schemas/Ambr'
+        nssai:
+          $ref: '#/components/schemas/Nssai'
+        subscribedDnnList:
+          type: array
+          items:
+            type: string
+        ratRestrictions:
+          type: array
+          items:
+            type: string
+        forbiddenAreas:
+          type: array
+          items:
+            $ref: '#/components/schemas/Area'
+
+    Ambr:
+      type: object
+      required: [uplink, downlink]
+      properties:
+        uplink:
+          type: string
+          description: Uplink bitrate (e.g., "100 Mbps")
+        downlink:
+          type: string
+          description: Downlink bitrate (e.g., "100 Mbps")
+
+    Nssai:
+      type: object
+      properties:
+        defaultSingleNssais:
+          type: array
+          items:
+            $ref: '#/components/schemas/Snssai'
+        singleNssais:
+          type: array
+          items:
+            $ref: '#/components/schemas/Snssai'
+
+    Area:
+      type: object
+      properties:
+        tacs:
+          type: array
+          items:
+            type: string
+
+    SmfSelectionSubscriptionData:
+      type: object
+      properties:
+        subscribedSnssaiInfos:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/SnssaiInfo'
+
+    SnssaiInfo:
+      type: object
+      properties:
+        dnnInfos:
+          type: array
+          items:
+            $ref: '#/components/schemas/DnnInfo'
+
+    DnnInfo:
+      type: object
+      required: [dnn]
+      properties:
+        dnn:
+          type: string
+        defaultDnnIndicator:
+          type: boolean
+        lboRoamingAllowed:
+          type: boolean
+
+    SessionManagementSubscriptionData:
+      type: object
+      required: [singleNssai]
+      properties:
+        singleNssai:
+          $ref: '#/components/schemas/Snssai'
+        dnnConfigurations:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/DnnConfiguration'
+
+    DnnConfiguration:
+      type: object
+      required: [pduSessionTypes, sscModes]
+      properties:
+        pduSessionTypes:
+          $ref: '#/components/schemas/PduSessionTypes'
+        sscModes:
+          $ref: '#/components/schemas/SscModes'
+        sessionAmbr:
+          $ref: '#/components/schemas/Ambr'
+        5gQosProfile:
+          $ref: '#/components/schemas/SubscribedDefaultQos'
+
+    PduSessionTypes:
+      type: object
+      required: [defaultSessionType]
+      properties:
+        defaultSessionType:
+          type: string
+          enum: [IPV4, IPV6, IPV4V6, UNSTRUCTURED, ETHERNET]
+        allowedSessionTypes:
+          type: array
+          items:
+            type: string
+            enum: [IPV4, IPV6, IPV4V6, UNSTRUCTURED, ETHERNET]
+
+    SscModes:
+      type: object
+      required: [defaultSscMode]
+      properties:
+        defaultSscMode:
+          type: string
+          enum: ['SSC_MODE_1', 'SSC_MODE_2', 'SSC_MODE_3']
+        allowedSscModes:
+          type: array
+          items:
+            type: string
+            enum: ['SSC_MODE_1', 'SSC_MODE_2', 'SSC_MODE_3']
+
+    SubscribedDefaultQos:
+      type: object
+      required: [5qi]
+      properties:
+        5qi:
+          type: integer
+          minimum: 0
+          maximum: 255
+        arp:
+          $ref: '#/components/schemas/Arp'
+
+    Arp:
+      type: object
+      required: [priorityLevel, preemptCap, preemptVuln]
+      properties:
+        priorityLevel:
+          type: integer
+          minimum: 1
+          maximum: 15
+        preemptCap:
+          type: string
+          enum: [NOT_PREEMPT, MAY_PREEMPT]
+        preemptVuln:
+          type: string
+          enum: [NOT_PREEMPTABLE, PREEMPTABLE]
+
+    AmPolicyData:
+      type: object
+      properties:
+        subscCats:
+          type: array
+          items:
+            type: string
+
+    SmPolicyData:
+      type: object
+      properties:
+        smPolicySnssaiData:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/SmPolicySnssaiData'
+
+    SmPolicySnssaiData:
+      type: object
+      required: [snssai]
+      properties:
+        snssai:
+          $ref: '#/components/schemas/Snssai'
+        smPolicyDnnData:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/SmPolicyDnnData'
+
+    SmPolicyDnnData:
+      type: object
+      required: [dnn]
+      properties:
+        dnn:
+          type: string
+        allowedServices:
+          type: array
+          items:
+            type: string
+        subscCats:
+          type: array
+          items:
+            type: string
+        gbrUl:
+          type: string
+        gbrDl:
+          type: string
+
+    ProblemDetails:
+      type: object
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+
+  responses:
+    '404':
+      description: Not Found
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    '500':
+      description: Internal Server Error
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'

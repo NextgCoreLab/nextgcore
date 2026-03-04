@@ -31,3 +31,12 @@ upf:
     server:
       - address: 172.23.0.7
         port: 9090
+
+        # TLS configuration (G36: SBI TLS)
+        # Enable: TLS_ENABLED=true SBI_SCHEME=https docker compose up -d
+        tls:
+          enabled: false
+          cert: /etc/nextgcore/certs/upf.crt
+          key: /etc/nextgcore/certs/upf.key
+          ca: /etc/nextgcore/certs/ca.crt
+          min_version: "1.2"

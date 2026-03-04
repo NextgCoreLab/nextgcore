@@ -14,6 +14,7 @@ path = "src/main.rs"
 ogs-core = { workspace = true }
 ogs-crypt = { workspace = true }
 ogs-sbi = { workspace = true }
+ogs-metrics = { workspace = true }
 ogs-dbi = { workspace = true }
 ogs-app = { workspace = true }
 log.workspace = true

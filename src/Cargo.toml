@@ -47,6 +47,7 @@ members = [
     "bins/nextgcore-eesd",
     "bins/nextgcore-pind",
     "bins/nextgcore-lmfd",
+    "bins/nextgcore-dccfd",
 
     # Rel-20 (6G) NFs
     "bins/nextgcore-nwdafd",
