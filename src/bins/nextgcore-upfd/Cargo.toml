@@ -24,8 +24,8 @@ tokio.workspace = true
 anyhow.workspace = true
 libc.workspace = true
 bytes.workspace = true
-clap = { version = "4.4", features = ["derive"] }
-ctrlc = { version = "3.4", features = ["termination"] }
+clap.workspace = true
+ctrlc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

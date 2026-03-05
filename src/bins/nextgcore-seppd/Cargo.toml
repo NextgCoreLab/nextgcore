@@ -23,8 +23,8 @@ log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
-clap = { version = "4.4", features = ["derive"] }
-ctrlc = "3.4"
+clap.workspace = true
+ctrlc.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 

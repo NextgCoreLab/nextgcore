@@ -23,7 +23,7 @@ env_logger.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
-ctrlc = { workspace = true, features = ["termination"] }
+ctrlc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
