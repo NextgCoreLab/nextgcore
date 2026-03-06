@@ -460,8 +460,8 @@ pub fn nd_reply(reply_data: &mut [u8], request_data: &[u8], mac: &[u8; ETHER_ADD
     reply_data[opt_offset + 2..opt_offset + 8].copy_from_slice(mac);
 
     // Calculate and set checksum
-    let src_addr: [u8; 16] = reply_data[ipv6_offset + 8..ipv6_offset + 24].try_into().unwrap();
-    let dst_addr: [u8; 16] = reply_data[ipv6_offset + 24..ipv6_offset + 40].try_into().unwrap();
+    let src_addr: [u8; 16] = reply_data[ipv6_offset + 8..ipv6_offset + 24].try_into().unwrap_or_default();
+    let dst_addr: [u8; 16] = reply_data[ipv6_offset + 24..ipv6_offset + 40].try_into().unwrap_or_default();
     let checksum = calculate_icmpv6_checksum(
         &src_addr,
         &dst_addr,

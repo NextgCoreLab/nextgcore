@@ -275,7 +275,7 @@ async fn handle_ue_authentication(request: &SbiRequest) -> SbiResponse {
         return send_bad_request(msg, Some("INVALID_REQUEST"));
     }
 
-    let serving_network_name = serving_network_name.unwrap();
+    let serving_network_name = serving_network_name.unwrap_or_default();
     log::info!("UE Authentication: SUPI/SUCI={supi_or_suci}, SNN={serving_network_name}");
 
     // Find or create UE in context
@@ -395,7 +395,7 @@ async fn handle_5g_aka_confirmation(auth_ctx_id: &str, request: &SbiRequest) -> 
         return send_bad_request(msg, Some("INVALID_REQUEST"));
     }
 
-    let res_star_hex = res_star_hex.unwrap();
+    let res_star_hex = res_star_hex.unwrap_or_default();
     log::info!("5G-AKA Confirmation: RES*={res_star_hex}");
 
     // Find UE by auth context ID

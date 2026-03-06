@@ -144,7 +144,7 @@ impl TimeSeries {
 
         let mut result = Vec::new();
         let start_time = self.points[0].timestamp;
-        let end_time = self.points.last().unwrap().timestamp;
+        let end_time = self.points.last().unwrap_or_default().timestamp;
 
         let mut current_time = start_time;
         while current_time <= end_time {

@@ -94,7 +94,7 @@ impl MetricsContext {
     pub fn add_server(&mut self, config: ServerConfig) -> &MetricsServer {
         let server = MetricsServer::new(config);
         self.servers.push(server);
-        self.servers.last().unwrap()
+        self.servers.last().unwrap_or_default()
     }
 
     /// Remove a server by index
@@ -192,7 +192,7 @@ impl MetricsContext {
     /// Parse server configuration from YAML
     fn parse_server_config(&mut self, config: &serde_yaml::Value) -> Result<(), String> {
         let servers = if config.is_sequence() {
-            config.as_sequence().unwrap().iter().collect::<Vec<_>>()
+            config.as_sequence().unwrap_or_default().iter().collect::<Vec<_>>()
         } else if config.is_mapping() {
             vec![config]
         } else {

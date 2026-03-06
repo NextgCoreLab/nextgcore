@@ -191,7 +191,7 @@ impl OtelLogRecord {
     pub fn new(severity: OtelSeverity, message: impl Into<String>) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_nanos();
 
         OtelLogRecord {

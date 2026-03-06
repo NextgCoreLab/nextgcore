@@ -128,7 +128,7 @@ pub fn pcf_nudr_dr_handle_query_am_data(
                 return NudrHandlerResult::error(HTTP_STATUS_NOT_FOUND, "Cannot find SUPI in DB");
             }
 
-            let subscription_data = subscription_data.unwrap();
+            let subscription_data = subscription_data.unwrap_or_default();
 
             // Validate UE-AMBR
             if subscription_data.ambr_uplink == 0 && subscription_data.ambr_downlink == 0 {

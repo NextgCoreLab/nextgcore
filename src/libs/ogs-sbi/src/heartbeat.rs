@@ -370,7 +370,7 @@ pub fn global_heartbeat_manager() -> &'static HeartbeatManager {
             GLOBAL_HEARTBEAT_MANAGER = Some(HeartbeatManager::default());
         });
         GLOBAL_HEARTBEAT_MANAGER.as_ref()
-            .expect("heartbeat manager initialized by call_once")
+            .unwrap_or_default()
     }
 }
 

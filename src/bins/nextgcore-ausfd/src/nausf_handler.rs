@@ -143,11 +143,11 @@ pub fn validate_authentication_info(
     supi_or_suci: Option<&str>,
     serving_network_name: Option<&str>,
 ) -> Result<(), &'static str> {
-    if supi_or_suci.is_none() || supi_or_suci.unwrap().is_empty() {
+    if supi_or_suci.is_none() || supi_or_suci.unwrap_or_default().is_empty() {
         return Err("No supiOrSuci");
     }
 
-    if serving_network_name.is_none() || serving_network_name.unwrap().is_empty() {
+    if serving_network_name.is_none() || serving_network_name.unwrap_or_default().is_empty() {
         return Err("No servingNetworkName");
     }
 
@@ -156,7 +156,7 @@ pub fn validate_authentication_info(
 
 /// Validate confirmation data from request
 pub fn validate_confirmation_data(res_star: Option<&str>) -> Result<(), &'static str> {
-    if res_star.is_none() || res_star.unwrap().is_empty() {
+    if res_star.is_none() || res_star.unwrap_or_default().is_empty() {
         return Err("No ConfirmationData.resStar");
     }
 

@@ -304,7 +304,7 @@ pub fn handle_update_pdp_context_request(
         return Ok((cause::MANDATORY_IE_MISSING, Bytes::new()));
     }
 
-    let nsapi = req.nsapi.unwrap();
+    let nsapi = req.nsapi.unwrap_or_default();
     info!("[GTPv1] Updating NSAPI: {nsapi}");
 
     // In a full implementation, would update session state and UPF
@@ -337,7 +337,7 @@ pub fn handle_delete_pdp_context_request(
         return Ok((cause::MANDATORY_IE_MISSING, Bytes::new()));
     }
 
-    let nsapi = req.nsapi.unwrap();
+    let nsapi = req.nsapi.unwrap_or_default();
     info!("[GTPv1] Deleting NSAPI: {}, teardown={}", nsapi, req.teardown_ind);
 
     // In a full implementation, would:

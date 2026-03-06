@@ -49,6 +49,9 @@ members = [
     "bins/nextgcore-lmfd",
     "bins/nextgcore-dccfd",
 
+    # WebUI
+    "bins/nextgcore-webui",
+
     # Rel-20 (6G) NFs
     "bins/nextgcore-nwdafd",
 
@@ -145,6 +148,11 @@ clap = { version = "4.4", features = ["derive"] }
 
 # Signal handling
 ctrlc = { version = "3.4", features = ["termination"] }
+
+# Web framework (for WebUI)
+axum = { version = "0.7", features = ["macros"] }
+tower-http = { version = "0.5", features = ["fs", "cors"] }
+mime_guess = "2"
 
 # Internal crates
 ogs-core = { path = "libs/ogs-core" }

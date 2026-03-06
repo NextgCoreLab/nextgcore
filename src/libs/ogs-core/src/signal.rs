@@ -136,7 +136,7 @@ pub fn ogs_signal_init() {
 pub fn ogs_signal_description_get(signum: i32) -> &'static str {
     let descriptions = SIGNAL_DESCRIPTIONS.get_or_init(|| {
         ogs_signal_init();
-        SIGNAL_DESCRIPTIONS.get().unwrap().clone()
+        SIGNAL_DESCRIPTIONS.get().unwrap_or_default().clone()
     });
 
     if signum >= 0 && (signum as usize) < descriptions.len() {

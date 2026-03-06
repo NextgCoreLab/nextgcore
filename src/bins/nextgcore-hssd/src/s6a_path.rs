@@ -117,7 +117,7 @@ pub fn hss_s6a_send_clr(
 
     // Session-Id
     let session_id = format!("hss.session.{}.{}", imsi_bcd, std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs());
     msg.add_avp(Avp::mandatory(avp_code::SESSION_ID, AvpData::Utf8String(session_id)));
 
     // Origin-Host and Origin-Realm (would come from HSS config)
@@ -195,7 +195,7 @@ pub fn hss_s6a_send_idr(
 
     // Session-Id
     let session_id = format!("hss.session.{}.{}", imsi_bcd, std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs());
     msg.add_avp(Avp::mandatory(avp_code::SESSION_ID, AvpData::Utf8String(session_id)));
 
     // Origin-Host and Origin-Realm

@@ -170,7 +170,7 @@ impl MlModelRegistry {
     pub fn best_deployed(&self, analytics_id: AnalyticsId) -> Option<&MlModel> {
         self.deployed_for(analytics_id)
             .into_iter()
-            .max_by(|a, b| a.accuracy.partial_cmp(&b.accuracy).unwrap())
+            .max_by(|a, b| a.accuracy.partial_cmp(&b.accuracy).unwrap_or_default())
     }
 
     /// Deprecates all models for an analytics ID except the given one

@@ -175,7 +175,7 @@ impl OgsHash {
                     hash,
                     key: key_slice.to_vec(),
                     klen: actual_klen,
-                    val: val.unwrap(),
+                    val: val.unwrap_or_default(),
                 });
                 
                 self.array[index] = Some(new_entry);
@@ -195,7 +195,7 @@ impl OgsHash {
         // Check if it's the first entry
         if let Some(ref entry) = slot {
             if entry.hash == hash && entry.klen == klen && entry.key == key {
-                let mut removed = slot.take().unwrap();
+                let mut removed = slot.take().unwrap_or_default();
                 *slot = removed.next.take();
                 self.count -= 1;
                 return;
@@ -207,7 +207,7 @@ impl OgsHash {
         while let Some(entry) = current {
             if let Some(ref next_entry) = entry.next {
                 if next_entry.hash == hash && next_entry.klen == klen && next_entry.key == key {
-                    let mut removed = entry.next.take().unwrap();
+                    let mut removed = entry.next.take().unwrap_or_default();
                     entry.next = removed.next.take();
                     self.count -= 1;
                     return;
@@ -350,7 +350,7 @@ impl<'a> Iterator for OgsHashIter<'a> {
         if let Some(entry) = self.current {
             if let Some(ref next) = entry.next {
                 self.current = Some(next.as_ref());
-                let curr = self.current.unwrap();
+                let curr = self.current.unwrap_or_default();
                 return Some((&curr.key, curr.klen, curr.val));
             }
             self.index += 1;
@@ -360,7 +360,7 @@ impl<'a> Iterator for OgsHashIter<'a> {
         while self.index <= self.ht.max {
             if let Some(ref entry) = self.ht.array[self.index] {
                 self.current = Some(entry.as_ref());
-                let curr = self.current.unwrap();
+                let curr = self.current.unwrap_or_default();
                 return Some((&curr.key, curr.klen, curr.val));
             }
             self.index += 1;

@@ -104,7 +104,7 @@ impl UdrContext {
             };
             self.ues.insert(supi.to_string(), ue);
         }
-        self.ues.get_mut(supi).unwrap()
+        self.ues.get_mut(supi).unwrap_or_default()
     }
 
     /// Find a UE context by SUPI

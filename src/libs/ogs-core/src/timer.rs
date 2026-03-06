@@ -153,7 +153,7 @@ impl<T> OgsTimerMgr<T> {
             // Get timer info for tree operations
             let (old_timeout_nanos, timer_id) = {
                 let timer = self.timers[index].as_ref()
-                    .expect("timer exists after find_index");
+                    .unwrap_or_default();
                 (timer.timeout_nanos, timer.id)
             };
 
@@ -171,7 +171,7 @@ impl<T> OgsTimerMgr<T> {
 
             // Update timer
             let timer = self.timers[index].as_mut()
-                .expect("timer exists after find_index");
+                .unwrap_or_default();
             timer.timeout_nanos = Some(timeout_nanos);
             timer.running = true;
             
@@ -190,7 +190,7 @@ impl<T> OgsTimerMgr<T> {
             // Get timer info for tree operations
             let (timeout_nanos, timer_id, running) = {
                 let timer = self.timers[index].as_ref()
-                    .expect("timer exists after find_index");
+                    .unwrap_or_default();
                 (timer.timeout_nanos, timer.id, timer.running)
             };
 
@@ -209,7 +209,7 @@ impl<T> OgsTimerMgr<T> {
 
             // Update timer
             let timer = self.timers[index].as_mut()
-                .expect("timer exists after find_index");
+                .unwrap_or_default();
             timer.running = false;
             timer.timeout_nanos = None;
         }

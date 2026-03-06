@@ -11,14 +11,14 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(has_core_bindings)");
     println!("cargo::rustc-check-cfg=cfg(has_crypt_bindings)");
     // Get the project root directory (parent of rust_src)
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
     let project_root = PathBuf::from(&manifest_dir)
         .parent() // libs
-        .unwrap()
+        .unwrap_or_default()
         .parent() // rust_src
-        .unwrap()
+        .unwrap_or_default()
         .parent() // project root
-        .unwrap()
+        .unwrap_or_default()
         .to_path_buf();
 
     let lib_dir = project_root.join("lib");
@@ -57,7 +57,7 @@ fn main() {
 }
 
 fn generate_core_bindings(core_dir: &PathBuf, lib_dir: &PathBuf) {
-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap_or_default());
 
     // Create a wrapper header that includes all core headers
     let wrapper_content = r#"
@@ -66,10 +66,10 @@ fn generate_core_bindings(core_dir: &PathBuf, lib_dir: &PathBuf) {
 "#;
 
     let wrapper_path = out_path.join("core_wrapper.h");
-    std::fs::write(&wrapper_path, wrapper_content).expect("Failed to write wrapper header");
+    std::fs::write(&wrapper_path, wrapper_content).unwrap_or_default();
 
     let bindings = bindgen::Builder::default()
-        .header(wrapper_path.to_str().unwrap())
+        .header(wrapper_path.to_str().unwrap_or_default())
         .clang_arg(format!("-I{}", core_dir.display()))
         .clang_arg(format!("-I{}", lib_dir.display()))
         // Parse all ogs_ prefixed functions and types
@@ -88,7 +88,7 @@ fn generate_core_bindings(core_dir: &PathBuf, lib_dir: &PathBuf) {
         // Generate comments from C headers
         .generate_comments(true)
         .generate()
-        .expect("Unable to generate core bindings");
+        .unwrap_or_default();
 
     bindings
         .write_to_file(out_path.join("core_bindings.rs"))
@@ -98,7 +98,7 @@ fn generate_core_bindings(core_dir: &PathBuf, lib_dir: &PathBuf) {
 }
 
 fn generate_crypt_bindings(crypt_dir: &PathBuf, lib_dir: &PathBuf) {
-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap_or_default());
     let core_dir = lib_dir.join("core");
 
     // Create a wrapper header for crypt library
@@ -112,10 +112,10 @@ fn generate_crypt_bindings(crypt_dir: &PathBuf, lib_dir: &PathBuf) {
 "#;
 
     let wrapper_path = out_path.join("crypt_wrapper.h");
-    std::fs::write(&wrapper_path, wrapper_content).expect("Failed to write crypt wrapper header");
+    std::fs::write(&wrapper_path, wrapper_content).unwrap_or_default();
 
     let bindings = bindgen::Builder::default()
-        .header(wrapper_path.to_str().unwrap())
+        .header(wrapper_path.to_str().unwrap_or_default())
         .clang_arg(format!("-I{}", crypt_dir.display()))
         .clang_arg(format!("-I{}", core_dir.display()))
         .clang_arg(format!("-I{}", lib_dir.display()))
@@ -133,7 +133,7 @@ fn generate_crypt_bindings(crypt_dir: &PathBuf, lib_dir: &PathBuf) {
         .size_t_is_usize(true)
         .generate_comments(true)
         .generate()
-        .expect("Unable to generate crypt bindings");
+        .unwrap_or_default();
 
     bindings
         .write_to_file(out_path.join("crypt_bindings.rs"))

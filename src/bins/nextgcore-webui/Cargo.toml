@@ -1,0 +1,28 @@
+[package]
+name = "nextgcore-webui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "NextGCore WebUI - Subscriber Management Dashboard"
+
+[[bin]]
+name = "nextgcore-webui"
+path = "src/main.rs"
+
+[dependencies]
+ogs-dbi = { workspace = true }
+ogs-core = { workspace = true }
+log.workspace = true
+env_logger.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+
+[lints]
+workspace = true

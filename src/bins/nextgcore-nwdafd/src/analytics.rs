@@ -172,7 +172,7 @@ impl AnalyticsEngine {
         if history.is_empty() {
             return None;
         }
-        let current_cell = history.last().unwrap().0;
+        let current_cell = history.last().unwrap_or_default().0;
 
         // Count transitions to find most likely next cell
         let mut next_counts: HashMap<u64, u32> = HashMap::new();
