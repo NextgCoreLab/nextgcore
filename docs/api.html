@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>API Reference — NextGCore</title>
+  <meta name="description" content="Interactive API documentation for NextGCore 5G Core Network Functions.">
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔷</text></svg>">
+</head>
+<body>
+
+<!-- Navigation -->
+<nav class="nav">
+  <a href="index.html" class="nav-logo">Next<span>GCore</span></a>
+  <ul class="nav-links">
+    <li><a href="index.html#features">Features</a></li>
+    <li><a href="index.html#ai-native">AI-Native</a></li>
+    <li><a href="index.html#workflows">Workflows</a></li>
+    <li><a href="index.html#components">Components</a></li>
+    <li><a href="api.html" class="active">API Docs</a></li>
+    <li><a href="https://github.com/NextgCoreLab/nextgcore" class="btn btn-secondary" style="padding:0.4rem 1rem;font-size:0.8rem;">GitHub</a></li>
+  </ul>
+  <button class="mobile-menu-btn">&#9776;</button>
+</nav>
+
+<!-- API Content -->
+<section style="padding-top: calc(var(--nav-height) + 2rem);">
+  <div class="container">
+    <h2 class="section-title">API Reference</h2>
+    <p class="section-subtitle">Interactive documentation for all 3GPP-defined service APIs. Select a specification below.</p>
+
+    <div class="spec-selector">
+      <label for="spec-select">Specification:</label>
+      <select id="spec-select">
+        <option value="">— Select an API —</option>
+        <option value="openapi/namf-comm.yaml">AMF Communication Service (TS 29.518)</option>
+        <option value="openapi/namf-eventexposure.yaml">AMF Event Exposure (TS 29.518)</option>
+        <option value="openapi/nausf-auth.yaml">AUSF UE Authentication (TS 29.509)</option>
+        <option value="openapi/nbsf-management.yaml">BSF Management Service (TS 29.521)</option>
+        <option value="openapi/nees-eediscovery.yaml">EES Edge Enabler Discovery (TS 29.558)</option>
+        <option value="openapi/nhss-sdm.yaml">HSS IMS SDM (TS 29.562)</option>
+        <option value="openapi/nlmf-location.yaml">LMF Location Service (TS 29.572)</option>
+        <option value="openapi/nmbsmf-mbssession.yaml">MBSMF MBS Session (TS 29.532)</option>
+        <option value="openapi/nnrf-disc.yaml">NRF NF Discovery (TS 29.510)</option>
+        <option value="openapi/nnrf-nfm.yaml">NRF NF Management (TS 29.510)</option>
+        <option value="openapi/nnsacf-sliceauth.yaml">NSACF Slice Admission Control (TS 29.526)</option>
+        <option value="openapi/nnssf-nsselection.yaml">NSSF NS Selection (TS 29.531)</option>
+        <option value="openapi/nnwdaf-analyticsinfo.yaml">NWDAF Analytics Info (TS 29.520)</option>
+        <option value="openapi/nnwdaf-eventssub.yaml">NWDAF Events Subscription (TS 29.520)</option>
+        <option value="openapi/npcf-policyauthorization.yaml">PCF Policy Authorization (TS 29.514)</option>
+        <option value="openapi/npcf-smpolicycontrol.yaml">PCF SM Policy Control (TS 29.512)</option>
+        <option value="openapi/npcrf-policycontrol.yaml">PCRF Policy Control (TS 29.212)</option>
+        <option value="openapi/npin-eventexposure.yaml">PIN Event Exposure (TS 29.549)</option>
+        <option value="openapi/nscp-routing.yaml">SCP Routing (TS 29.500)</option>
+        <option value="openapi/nsepp-prins.yaml">SEPP PRINS (TS 33.501)</option>
+        <option value="openapi/nsmf-eventexposure.yaml">SMF Event Exposure (TS 29.508)</option>
+        <option value="openapi/nsmf-pdusession.yaml">SMF PDU Session (TS 29.502)</option>
+        <option value="openapi/nudm-sdm.yaml">UDM Subscriber Data Management (TS 29.503)</option>
+        <option value="openapi/nudm-ueau.yaml">UDM UE Authentication (TS 29.503)</option>
+        <option value="openapi/nudm-uecm.yaml">UDM UE Context Management (TS 29.503)</option>
+        <option value="openapi/nudr-dr.yaml">UDR Data Repository (TS 29.504)</option>
+        <option value="openapi/nudr-groupdata.yaml">UDR Group Data (TS 29.504)</option>
+      </select>
+    </div>
+  </div>
+
+  <div id="redoc-container" style="margin-top: 1rem;"></div>
+</section>
+
+<!-- Footer -->
+<footer class="footer">
+  <div class="container">
+    <p>NextGCore &mdash; Agentic 6G Core Network &middot; <a href="index.html">Home</a> &middot; <a href="https://github.com/NextgCoreLab/nextgcore">GitHub</a> &middot; GPL-3.0 License</p>
+    <p style="margin-top:0.5rem;font-size:0.75rem;">To update the API index: <code>bash docs/scripts/update-api-docs.sh</code></p>
+  </div>
+</footer>
+
+<script src="https://cdn.redoc.ly/redoc/latest/bundles/redoc.standalone.js"></script>
+<script src="js/main.js"></script>
+</body>
+</html>
