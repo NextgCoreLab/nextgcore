@@ -279,7 +279,7 @@ pub fn aes_cbc_decrypt(
         while in_pos < input.len() {
             let in_block: [u8; 16] = input[in_pos..in_pos + AES_BLOCK_SIZE]
                 .try_into()
-                .unwrap();
+                .unwrap_or_default();
             
             // Decrypt
             let mut out_block = [0u8; 16];

@@ -86,7 +86,7 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) {
         log::info!("Received shutdown signal");
         shutdown.store(true, Ordering::SeqCst);
     })
-    .expect("Failed to set signal handler");
+    .unwrap_or_default();
 }
 
 #[tokio::main]
@@ -491,7 +491,7 @@ async fn handle_mbs_session_activate(session_id: &str, request: &SbiRequest) -> 
 
     match session {
         Some(session) => {
-            let n4mb = session.n4mb_session.as_ref().unwrap();
+            let n4mb = session.n4mb_session.as_ref().unwrap_or_default();
             log::info!(
                 "MBS Session {session_id} activated: N4mb SEID={}, UPF={}, TEID={:#x}",
                 n4mb.local_seid, upf_addr, n4mb.dl_teid

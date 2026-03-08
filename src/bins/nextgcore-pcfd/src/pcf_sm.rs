@@ -289,7 +289,7 @@ impl PcfSmContext {
             }
         } else {
             // Operations on existing policy - find by sm_policy_id
-            let sm_policy_id = resource_components.get(1).unwrap();
+            let sm_policy_id = resource_components.get(1).unwrap_or_default();
             let ctx = pcf_self();
             let context = ctx.read().unwrap();
             let sess = context.sess_find_by_sm_policy_id(sm_policy_id);
@@ -351,7 +351,7 @@ impl PcfSmContext {
             (None, None)
         } else {
             // Operations on existing app session
-            let app_session_id = resource_components.get(1).unwrap();
+            let app_session_id = resource_components.get(1).unwrap_or_default();
             let app = context.app_find_by_app_session_id(app_session_id);
             let sess = app.as_ref().and_then(|a| context.sess_find_by_id(a.sess_id));
             (sess, app)

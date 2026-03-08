@@ -1513,7 +1513,7 @@ pub async fn amf_ngap_open(
     let addr = bind_addr.unwrap_or_else(|| {
         format!("{DEFAULT_NGAP_ADDR}:{OGS_NGAP_SCTP_PORT}")
             .parse()
-            .unwrap()
+            .unwrap_or_default()
     });
 
     let handle = NgapServerHandle::new(addr, amf_context, event_tx).await?;

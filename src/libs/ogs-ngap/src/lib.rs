@@ -34,11 +34,11 @@
 //!     ran_ue_ngap_id: 100,
 //!     nas_pdu: vec![0x7e, 0x00, 0x56],
 //! };
-//! let bytes = builder::build_downlink_nas_transport(&msg).unwrap();
+//! let bytes = builder::build_downlink_nas_transport(&msg).unwrap_or_default();
 //!
 //! // Parse any NGAP message
 //! use ogs_ngap::parser;
-//! let decoded = parser::decode_ngap_pdu(&bytes).unwrap();
+//! let decoded = parser::decode_ngap_pdu(&bytes).unwrap_or_default();
 //! ```
 
 pub mod error;

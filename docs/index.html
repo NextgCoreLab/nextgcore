@@ -1,0 +1,731 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NextGCore — Agentic 6G Core Network</title>
+  <meta name="description" content="Agentic 6G Core Network in Rust. 22 Network Functions with AI-native analytics, intent-based automation, zero-trust security, and full 3GPP Rel-15 through Rel-20 compliance.">
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔷</text></svg>">
+</head>
+<body>
+
+<!-- Navigation -->
+<nav class="nav">
+  <a href="#" class="nav-logo">Next<span>GCore</span></a>
+  <ul class="nav-links">
+    <li><a href="#features">Features</a></li>
+    <li><a href="#ai-native">AI-Native</a></li>
+    <li><a href="#architecture">Architecture</a></li>
+    <li><a href="#workflows">Workflows</a></li>
+    <li><a href="#components">Components</a></li>
+    <li><a href="#quickstart">Quick Start</a></li>
+    <li><a href="api.html">API Docs</a></li>
+    <li><a href="https://github.com/NextgCoreLab/nextgcore" class="btn btn-secondary" style="padding:0.4rem 1rem;font-size:0.8rem;">GitHub</a></li>
+  </ul>
+  <button class="mobile-menu-btn">&#9776;</button>
+</nav>
+
+<!-- Hero -->
+<section class="hero" id="hero">
+  <div class="container">
+    <div class="hero-content">
+      <div class="hero-badge">
+        <span>v0.1.0</span> &middot; 3GPP Rel-15 through Rel-20 &middot; 6G Research Ready
+      </div>
+      <h1>Agentic <span class="accent">6G Core</span> Network</h1>
+      <p>The first AI-native 5G/6G Core Network — 22 Network Functions with ML-driven analytics, intent-based autonomous operations, zero-trust security, and edge intelligence. Built entirely in Rust.</p>
+      <div class="hero-buttons">
+        <a href="#quickstart" class="btn btn-primary">Get Started</a>
+        <a href="#ai-native" class="btn btn-secondary">Explore AI Features</a>
+        <a href="api.html" class="btn btn-secondary">27 OpenAPI Specs</a>
+      </div>
+      <div class="stats-row">
+        <div class="stat"><div class="stat-value">22</div><div class="stat-label">Network Functions</div></div>
+        <div class="stat"><div class="stat-value">18</div><div class="stat-label">Libraries</div></div>
+        <div class="stat"><div class="stat-value">~100k</div><div class="stat-label">Lines of Rust</div></div>
+        <div class="stat"><div class="stat-value">6</div><div class="stat-label">AI/6G NFs</div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Features -->
+<section id="features">
+  <div class="container">
+    <h2 class="section-title">Why NextGCore?</h2>
+    <p class="section-subtitle">An agentic core network that thinks, adapts, and secures itself.</p>
+    <div class="features-grid">
+      <div class="feature-card">
+        <div class="feature-icon">&#129302;</div>
+        <h3>AI-Native Intelligence</h3>
+        <p>NWDAF with 4-layer analytics engine (real-time anomaly detection, predictive load forecasting, prescriptive handover optimization, autonomous actions). ML model lifecycle management with ONNX inference.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">&#127919;</div>
+        <h3>Intent-Based Automation</h3>
+        <p>Declarative intent system — express network goals ("optimize slice latency below 10ms") and let the agentic core figure out the actions. Conflict detection, priority resolution, and RL-based learning from outcomes.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">&#128737;</div>
+        <h3>Zero-Trust Security</h3>
+        <p>SEPP with PRINS encryption, per-PLMN trust scoring, anomaly-based blocking, and rate limiting. OAuth2 JWT with cryptographic signing. TLS on all SBI interfaces.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">&#9729;</div>
+        <h3>Cloud Native</h3>
+        <p>Kubernetes with 16 pods, Helm charts, Prometheus metrics on every NF, Jaeger distributed tracing, horizontal scaling. Docker Compose for dev, Kubernetes for production.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">&#128640;</div>
+        <h3>Edge Intelligence</h3>
+        <p>EES manages edge application servers with proximity-based discovery, capability matching, and UE context transfer for seamless edge relocation. 3-tier compute: edge → regional → cloud.</p>
+      </div>
+      <div class="feature-card">
+        <div class="feature-icon">&#9878;</div>
+        <h3>3GPP Rel-15 to Rel-20</h3>
+        <p>Full 5G SA, 5G-Advanced (Rel-17/18), and 6G research (Rel-20). MBS multicast, PIN IoT networks, NSACF slice admission, LMF positioning with 10+ methods, and beyond.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- AI-Native 6G Features -->
+<section id="ai-native">
+  <div class="container">
+    <h2 class="section-title">AI-Native Network Functions</h2>
+    <p class="section-subtitle">Six specialized NFs that bring intelligence, analytics, and autonomy to the core network.</p>
+
+    <!-- NWDAF Deep Dive -->
+    <div class="ai-feature-block">
+      <h3 class="group-heading">NWDAF — 4-Layer Analytics Engine (TS 23.288)</h3>
+      <div class="arch-diagram">
+        <div class="arch-layer">
+          <div class="arch-label">Layer 4</div>
+          <div class="arch-nodes">
+            <div class="arch-node ai-node">Autonomous Actions</div>
+          </div>
+        </div>
+        <div class="arch-connector">Adjust handover params &middot; Cell power control &middot; Load balancing triggers</div>
+        <div class="arch-layer">
+          <div class="arch-label">Layer 3</div>
+          <div class="arch-nodes">
+            <div class="arch-node ai-node">Prescriptive Analytics</div>
+          </div>
+        </div>
+        <div class="arch-connector">UE mobility &middot; NF load &middot; Abnormal behavior &middot; QoS sustainability &middot; Service experience</div>
+        <div class="arch-layer">
+          <div class="arch-label">Layer 2</div>
+          <div class="arch-nodes">
+            <div class="arch-node ai-node">Predictive ML Models</div>
+          </div>
+        </div>
+        <div class="arch-connector">ONNX trajectory prediction &middot; Load forecasting &middot; Time-to-overload estimation</div>
+        <div class="arch-layer">
+          <div class="arch-label">Layer 1</div>
+          <div class="arch-nodes">
+            <div class="arch-node ai-node">Real-Time Detection</div>
+          </div>
+        </div>
+        <div class="arch-connector">Z-score anomaly detection &middot; RSRP/SINR monitoring &middot; Cell load sampling</div>
+      </div>
+      <div class="features-grid" style="margin-top:1.5rem;">
+        <div class="feature-card">
+          <h3>ML Model Lifecycle</h3>
+          <p>Full model registry — Training → Validation → Deployed → Deprecated. Accuracy/latency metrics, version control, and inference tracking per model.</p>
+        </div>
+        <div class="feature-card">
+          <h3>Federated Analytics</h3>
+          <p>Inter-NWDAF data sharing and model transfer. Cross-domain analytics with privacy-preserving computation.</p>
+        </div>
+        <div class="feature-card">
+          <h3>Event Subscriptions</h3>
+          <p>Consumer NFs subscribe to analytics events (NF load, UE mobility, QoS) with real-time push notifications.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- EES Deep Dive -->
+    <div class="ai-feature-block">
+      <h3 class="group-heading">EES — Edge Enabler Server (TS 23.558)</h3>
+      <div class="arch-diagram">
+        <div class="arch-layer">
+          <div class="arch-nodes">
+            <div class="arch-node">EAS: AR App</div>
+            <div class="arch-node">EAS: VR Game</div>
+            <div class="arch-node">EAS: Video</div>
+          </div>
+        </div>
+        <div class="arch-connector">&#8597; EAS Registration + Discovery &#8597;</div>
+        <div class="arch-layer">
+          <div class="arch-nodes">
+            <div class="arch-node ai-node">Edge Enabler Server</div>
+          </div>
+        </div>
+        <div class="arch-connector">&#8597; UE Context Transfer &#8597;</div>
+        <div class="arch-layer">
+          <div class="arch-nodes">
+            <div class="arch-node data-plane">UE moves to new edge</div>
+          </div>
+        </div>
+      </div>
+      <div class="features-grid" style="margin-top:1.5rem;">
+        <div class="feature-card">
+          <h3>Proximity Discovery</h3>
+          <p>TAC-based EAS discovery with distance scoring and capability matching (compute %, storage, type: AR/VR/Game/Video).</p>
+        </div>
+        <div class="feature-card">
+          <h3>Context Transfer</h3>
+          <p>Application state preservation during edge relocation — store, fetch, and transfer UE contexts seamlessly across edge nodes.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- SEPP Zero Trust -->
+    <div class="ai-feature-block">
+      <h3 class="group-heading">SEPP — Zero-Trust Inter-PLMN Security (TS 33.501)</h3>
+      <div class="arch-diagram">
+        <div class="arch-layer">
+          <div class="arch-label">PLMN A</div>
+          <div class="arch-nodes">
+            <div class="arch-node">AMF</div>
+            <div class="arch-node">SMF</div>
+          </div>
+        </div>
+        <div class="arch-connector">&#8594; PRINS: Selective IE Protection &#8594;</div>
+        <div class="arch-layer">
+          <div class="arch-nodes">
+            <div class="arch-node ai-node">SEPP (Trust: 85/100)</div>
+          </div>
+        </div>
+        <div class="arch-connector">&#8594; N32c Handshake + N32f Forward &#8594;</div>
+        <div class="arch-layer">
+          <div class="arch-nodes">
+            <div class="arch-node ai-node">SEPP (Remote PLMN)</div>
+          </div>
+        </div>
+        <div class="arch-connector">&#8594;</div>
+        <div class="arch-layer">
+          <div class="arch-label">PLMN B</div>
+          <div class="arch-nodes">
+            <div class="arch-node">NRF</div>
+            <div class="arch-node">UDM</div>
+          </div>
+        </div>
+      </div>
+      <div class="features-grid" style="margin-top:1.5rem;">
+        <div class="feature-card">
+          <h3>Trust Scoring</h3>
+          <p>Dynamic trust levels (Unknown → Initial → Established → High) per remote PLMN. Anomaly scoring 0-100 with threshold blocking.</p>
+        </div>
+        <div class="feature-card">
+          <h3>PRINS Encryption</h3>
+          <p>JSON patch-based selective IE protection — encrypt SUPI, PEI, GPSI while leaving routing headers readable. Data-type profiles per IE.</p>
+        </div>
+        <div class="feature-card">
+          <h3>Rate Limiting</h3>
+          <p>Per-PLMN RPS limits, integrity/confidentiality requirements, strict vs. permissive policies. Real-time policy evaluation on every request.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Other AI NFs -->
+    <div class="ai-feature-block">
+      <h3 class="group-heading">More AI-Native Functions</h3>
+      <div class="components-grid">
+        <div class="component-card">
+          <div class="component-header"><span class="component-name">LMF</span><span class="component-badge badge-6g">Location</span></div>
+          <div class="component-desc">10+ positioning methods: ECID, OTDOA, DL-TDOA, UL-TDOA, DL-AoD, UL-AoA, Multi-RTT, GNSS, WLAN, Bluetooth. NRPPa measurement collection. QoS-based positioning (low-latency, high-accuracy, emergency).</div>
+        </div>
+        <div class="component-card">
+          <div class="component-header"><span class="component-name">MBSMF</span><span class="component-badge badge-6g">Multicast</span></div>
+          <div class="component-desc">TMGI-based group sessions. Multicast and broadcast modes. N4mb PFCP protocol with UPF for DL forwarding. Group membership tracking with dynamic join/leave. Session states: Created → Active → Suspended.</div>
+        </div>
+        <div class="component-card">
+          <div class="component-header"><span class="component-name">NSACF</span><span class="component-badge badge-6g">Slicing</span></div>
+          <div class="component-desc">S-NSSAI quota enforcement with max UEs and max PDU sessions per slice. Admission/rejection decisions with cause codes. Real-time utilization reporting with atomic counters.</div>
+        </div>
+        <div class="component-card">
+          <div class="component-header"><span class="component-name">PIN</span><span class="component-badge badge-6g">IoT</span></div>
+          <div class="component-desc">Personal IoT Network management per TS 23.542. PIN Element registration (sensors, gateways, actuators). Capability-based discovery. Relay path management for constrained devices.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Architecture -->
+<section id="architecture">
+  <div class="container">
+    <h2 class="section-title">Architecture</h2>
+    <p class="section-subtitle">Service-Based Architecture (SBA) with AI/analytics overlay.</p>
+    <div class="arch-diagram">
+      <div class="arch-layer">
+        <div class="arch-label">AI &amp; Analytics</div>
+        <div class="arch-nodes">
+          <div class="arch-node ai-node">NWDAF</div>
+          <div class="arch-node ai-node">EES</div>
+          <div class="arch-node ai-node">LMF</div>
+          <div class="arch-node ai-node">MBSMF</div>
+          <div class="arch-node ai-node">NSACF</div>
+          <div class="arch-node ai-node">PIN</div>
+        </div>
+      </div>
+      <div class="arch-connector">&#8597; Analytics + Intents + Events &#8597;</div>
+      <div class="arch-layer">
+        <div class="arch-label">Control Plane</div>
+        <div class="arch-nodes">
+          <div class="arch-node">AMF</div>
+          <div class="arch-node">SMF</div>
+          <div class="arch-node">NRF</div>
+          <div class="arch-node">AUSF</div>
+          <div class="arch-node">UDM</div>
+          <div class="arch-node">PCF</div>
+          <div class="arch-node">NSSF</div>
+          <div class="arch-node">BSF</div>
+        </div>
+      </div>
+      <div class="arch-connector">&#8597; SBI (HTTP/2 + JSON + TLS) &#8597;</div>
+      <div class="arch-layer">
+        <div class="arch-label">Routing</div>
+        <div class="arch-nodes">
+          <div class="arch-node">SCP</div>
+          <div class="arch-node">SEPP</div>
+          <div class="arch-node">UDR</div>
+          <div class="arch-node">WebUI</div>
+        </div>
+      </div>
+      <div class="arch-connector">&#8597; NGAP / PFCP / GTP-U &#8597;</div>
+      <div class="arch-layer">
+        <div class="arch-label">Data Plane</div>
+        <div class="arch-nodes">
+          <div class="arch-node data-plane">UPF</div>
+        </div>
+      </div>
+      <div class="arch-connector">&#8597;</div>
+      <div class="arch-layer">
+        <div class="arch-label">EPC (4G)</div>
+        <div class="arch-nodes">
+          <div class="arch-node epc">MME</div>
+          <div class="arch-node epc">SGW-C</div>
+          <div class="arch-node epc">SGW-U</div>
+          <div class="arch-node epc">HSS</div>
+          <div class="arch-node epc">PCRF</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Workflows -->
+<section id="workflows">
+  <div class="container">
+    <h2 class="section-title">Key Workflows</h2>
+    <p class="section-subtitle">End-to-end procedures from registration to AI-driven optimization.</p>
+
+    <!-- Registration Flow -->
+    <h3 class="group-heading">1. UE Registration &amp; Authentication (TS 23.502 §4.2.2)</h3>
+    <p class="wf-desc">Full 5G SA initial registration with SUCI concealment, 5G-AKA mutual authentication, NAS security activation, and policy retrieval.</p>
+    <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NAS: Registration Request (SUCI = ECIES-encrypted SUPI, Requested NSSAI, UE capabilities)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB</span></div>
+      <div class="workflow-step"><span class="wf-actor">gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NGAP: InitialUEMessage (NAS-PDU, User Location Info, RRC Establishment Cause)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Nnssf_NSSelection (Requested NSSAI, TAI) → returns Allowed NSSAI, target AMF set</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NSSF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Nausf_UEAuthentication (SUCI, serving network name)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AUSF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AUSF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Nudm_UEAuthentication_Get (SUCI) → SUPI resolution + auth vectors (RAND, AUTN, HXRES*, K_AUSF)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UDM</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NAS: AuthenticationRequest (RAND, AUTN) → UE computes RES*</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE</span></div>
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NAS: AuthenticationResponse (RES*) → AMF forwards to AUSF for HXRES* verification</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NAS: SecurityModeCommand (selected NAS ciphering: NEA1/2, integrity: NIA1/2, K_AMF derived)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE</span></div>
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NAS: SecurityModeComplete (encrypted + integrity-protected from this point on)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NGAP: InitialContextSetupRequest (K_gNB security key, Allowed NSSAI, UE AMBR, DRB config)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Nudm_UECM_Registration (SUPI, AMF instance ID) + Nudm_SDM_Get (subscriber data, AM policies)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UDM</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Npcf_AMPolicyControl_Create (SUPI, Access Type, Allowed NSSAI) → AM policy decisions</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">PCF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NAS: Registration Accept (5G-GUTI, Allowed NSSAI, LADN info, configured NSSAI)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE</span></div>
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NAS: Registration Complete — UE is now CM-CONNECTED, RM-REGISTERED</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
+    </div>
+
+    <!-- PDU Session Flow -->
+    <h3 class="group-heading">2. PDU Session Establishment (TS 23.502 §4.3.2)</h3>
+    <p class="wf-desc">IPv4 PDU session with policy-controlled QoS, PFCP forwarding rules, GTP-U tunnel setup, and bitmap-based IP allocation.</p>
+    <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NAS: PDU Session Establishment Request (PDU Session ID, S-NSSAI, DNN="internet", PDU type=IPv4)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">SMF selection (S-NSSAI, DNN) via NRF discovery → Nsmf_PDUSession_CreateSMContext</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">SMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">SMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Nudm_SDM_Get (session management subscription data for DNN + S-NSSAI)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UDM</span></div>
+      <div class="workflow-step"><span class="wf-actor">SMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Npcf_SMPolicyControl_Create → PCC rules, QoS decisions (QFI, AMBR, ARP, 5QI), charging rules</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">PCF</span></div>
+      <div class="workflow-step"><span class="wf-actor">SMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">IP allocation: bitmap pool 10.45.0.0/16 → allocates 10.45.0.3 (first free bit)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Pool</span></div>
+      <div class="workflow-step"><span class="wf-actor">SMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">UPF selection (DNN, TAI, load) → PFCP Session Establishment (PDR: match SDF 5-tuple, FAR: forward GTP-U, QER: enforce AMBR, URR: volume reporting)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UPF</span></div>
+      <div class="workflow-step"><span class="wf-actor">UPF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">PFCP Session Establishment Response (F-TEID for uplink = 10.11.0.7:gtp-u, DL-TEID assigned)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">SMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">SMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Namf_Communication_N1N2MessageTransfer (NAS: PDU Session Accept + N2: GTP tunnel info + QoS flows)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NGAP: PDUSessionResourceSetupRequest (GTP-U TEID, QoS flow list, NAS PDU)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNB</span></div>
+      <div class="workflow-step"><span class="wf-actor">gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">RRC Reconfiguration (DRB setup, QoS mapping) + forwards NAS to UE</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE</span></div>
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">PDU Session active: IP=10.45.0.3, DNN=internet, QFI=1, GTP tunnel established</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Data Ready</span></div>
+    </div>
+
+    <!-- Handover Flow -->
+    <h3 class="group-heading">3. Xn Handover (TS 23.502 §4.9.1)</h3>
+    <p class="wf-desc">Intra-AMF handover with path switch, GTP tunnel update, and seamless session continuity.</p>
+    <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">RRC: MeasurementReport (neighbor cell RSRP > serving + hysteresis)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Source gNB</span></div>
+      <div class="workflow-step"><span class="wf-actor">Source gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Xn: HandoverRequest (UE context, PDU sessions, security keys, target cell ID)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Target gNB</span></div>
+      <div class="workflow-step"><span class="wf-actor">Target gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Xn: HandoverRequest Acknowledge (DL forwarding tunnel, target-to-source container)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Source gNB</span></div>
+      <div class="workflow-step"><span class="wf-actor">Source gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">RRC: RRCReconfiguration (target cell config, new C-RNTI)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE</span></div>
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Detach from source → Random access on target → RRC Reconfiguration Complete</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Target gNB</span></div>
+      <div class="workflow-step"><span class="wf-actor">Target gNB</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NGAP: PathSwitchRequest (new GTP-U TEID, security key, PDU session list)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Nsmf_PDUSession_UpdateSMContext (new AN tunnel info) → SMF sends PFCP Modification to UPF</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">SMF → UPF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NGAP: PathSwitchRequest Acknowledge — handover complete, data flows via new path</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Target gNB</span></div>
+    </div>
+
+    <!-- AI Analytics Flow -->
+    <h3 class="group-heading">4. NWDAF AI-Driven Optimization (TS 23.288)</h3>
+    <p class="wf-desc">4-layer analytics pipeline: real-time anomaly detection → ONNX prediction → prescriptive recommendation → autonomous action.</p>
+    <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">AMF/SMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Nnwdaf_EventsSubscription (analytics_id: NF_LOAD, target_period: 5min, consumer: PCF)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NWDAF</span></div>
+      <div class="workflow-step"><span class="wf-actor">gNBs</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Data collection: UE measurements (RSRP, RSRQ, SINR), cell load (PRB usage, UE count, throughput)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NWDAF</span></div>
+      <div class="workflow-step"><span class="wf-actor">NWDAF L1</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Real-time: Z-score anomaly detection on RSRP/SINR → anomaly score 78/100 detected on cell 0x10</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Alert</span></div>
+      <div class="workflow-step"><span class="wf-actor">NWDAF L2</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Predictive: ONNX trajectory model → UE moving NE at 30km/h, will leave cell in ~45s, time-to-overload: 2min</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Forecast</span></div>
+      <div class="workflow-step"><span class="wf-actor">NWDAF L3</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Prescriptive: Analytics payload (UE_MOBILITY, NF_LOAD, ABNORMAL_BEHAVIOR) → handover recommendation type: LOAD_BALANCING</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Decision</span></div>
+      <div class="workflow-step"><span class="wf-actor">NWDAF L4</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Autonomous action: AdjustHandoverParams (cell 0x10 → lower HO threshold by 3dB) + TriggerLoadBalancing</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">NWDAF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Nnwdaf_AnalyticsInfo notification → push analytics to all subscribed consumers (PCF, AMF)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Consumers</span></div>
+      <div class="workflow-step"><span class="wf-actor">NWDAF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">ML model update: record outcome (handover success/fail) → retrain trajectory model → v3.1 deployed</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Model Registry</span></div>
+    </div>
+
+    <!-- Slice Admission Flow -->
+    <h3 class="group-heading">5. Slice Admission &amp; Quota Control (TS 23.502 §4.2.9)</h3>
+    <p class="wf-desc">End-to-end slice selection with NSSF, quota enforcement via NSACF, and policy binding.</p>
+    <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Registration Request (Requested NSSAI: SST=1/SD=0x010203 eMBB, SST=2 URLLC)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Nnssf_NSSelection (Requested NSSAI, TAI, PLMN) → Allowed NSSAI, AMF set for each slice</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NSSF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Nnsacf_UEAdmission (SUPI, S-NSSAI=SST:1) → check per-slice quota</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NSACF</span></div>
+      <div class="workflow-step"><span class="wf-actor">NSACF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Quota check: SST=1 → 150 UEs / 200 max, 89 PDU sessions / 500 max → ADMITTED, counters incremented</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Nnsacf_UEAdmission (SUPI, S-NSSAI=SST:2) → SST=2: 200 UEs / 200 max → REJECTED (QUOTA_EXCEEDED)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NSACF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Registration Accept: Allowed NSSAI = [SST=1/SD=0x010203], Rejected NSSAI = [SST=2, cause: QUOTA]</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">On UE deregistration: Nnsacf_UERelease → counters decremented, slot freed for next UE</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">NSACF</span></div>
+    </div>
+
+    <!-- Edge Relocation Flow -->
+    <h3 class="group-heading">6. Edge Application Relocation (TS 23.558)</h3>
+    <p class="wf-desc">Seamless MEC edge relocation with EAS discovery, context preservation, and traffic re-routing.</p>
+    <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">UE</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Mobility event: TAC changes from 0x01 to 0x02 (detected by AMF via Tracking Area Update)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">AMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Location change notification → EES evaluates if current EAS is still optimal</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">EES</span></div>
+      <div class="workflow-step"><span class="wf-actor">EES</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">POST /nees-easdiscovery/v1/discover (app_id="ar-nav", TAC=0x02) → ranked EAS list by distance score</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Discovery</span></div>
+      <div class="workflow-step"><span class="wf-actor">EES</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Best match: EAS "edge-east-2" (type: AR, compute: 80%, distance_score: 0.92, TAC: 0x02)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Selected</span></div>
+      <div class="workflow-step"><span class="wf-actor">EES</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">GET /nees-uecontexttransfer/v1/contexts/{supi} → fetch UE app state from old EAS (session data, model weights, UI state)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Old EAS</span></div>
+      <div class="workflow-step"><span class="wf-actor">EES</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">PATCH /nees-uecontexttransfer/v1/contexts/{supi} → transfer context to new EAS</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">New EAS</span></div>
+      <div class="workflow-step"><span class="wf-actor">New EAS</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Context restored, app resumes — UE sees no interruption. SMF updates UL CL / ULCL rules</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UE</span></div>
+    </div>
+
+    <!-- Inter-PLMN Security Flow -->
+    <h3 class="group-heading">7. Inter-PLMN Roaming Security (TS 33.501 / TS 29.573)</h3>
+    <p class="wf-desc">N32 security with handshake, PRINS selective encryption, zero-trust policy evaluation, and anomaly detection.</p>
+    <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">Home SEPP</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">N32c: SecurityCapabilityExchange (supported ciphers, data-type profiles, PRINS version)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Visited SEPP</span></div>
+      <div class="workflow-step"><span class="wf-actor">Visited SEPP</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">N32c: SecurityCapabilityResponse → mutual cipher selection, shared secret derivation</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Home SEPP</span></div>
+      <div class="workflow-step"><span class="wf-actor">Home NF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">SBI: Nudm_SDM request for roaming subscriber (contains SUPI, PEI, GPSI in JSON body)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Home SEPP</span></div>
+      <div class="workflow-step"><span class="wf-actor">SEPP</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Zero-trust policy: trust_level=Established (85/100), anomaly_score=12, RPS=45/100 → PASS</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Policy Engine</span></div>
+      <div class="workflow-step"><span class="wf-actor">SEPP</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">PRINS: Apply data-type profile → encrypt SUPI, PEI, GPSI IEs (JSON patch), integrity-protect message</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Protected</span></div>
+      <div class="workflow-step"><span class="wf-actor">Home SEPP</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">N32f: Forward protected message (routing headers readable, subscriber IEs encrypted)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Visited SEPP</span></div>
+      <div class="workflow-step"><span class="wf-actor">Visited SEPP</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Verify integrity → Decrypt PRINS IEs → Zero-trust check on incoming → Route to destination NF</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Visited NF</span></div>
+      <div class="workflow-step"><span class="wf-actor">SEPP</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Audit log: timestamp, source_plmn, dest_plmn, trust_score, anomaly_score, action=FORWARD</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Audit Trail</span></div>
+    </div>
+
+    <!-- Location Service Flow -->
+    <h3 class="group-heading">8. UE Positioning via LMF (TS 23.273)</h3>
+    <p class="wf-desc">Multi-method positioning with NRPPa measurement collection, coordinate calculation, and QoS-based accuracy.</p>
+    <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">App / AMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">POST /nlmf-location/v1/determine-location (SUPI, QoS=HIGH_ACCURACY, methods=[DL-TDOA, Multi-RTT])</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">LMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">LMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">POST /nlmf-location/v1/measurements (methods, cells=[0x10, 0x11, 0x12], measurement_period=500ms)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNBs</span></div>
+      <div class="workflow-step"><span class="wf-actor">gNBs</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">NRPPa reports: RSRP=-85dBm, timing_advance=12.3μs, AoA=45.2°, RTT=234ns per cell</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">LMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">LMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Multi-RTT trilateration from 3 cells → lat: 41.0082, lon: 28.9784, alt: 35m, accuracy: ±2.5m</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Position</span></div>
+      <div class="workflow-step"><span class="wf-actor">LMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">PUT /nlmf-location/v1/ue-locations/{supi} → store result + return to requesting entity</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">App / AMF</span></div>
+    </div>
+
+    <!-- MBS Flow -->
+    <h3 class="group-heading">9. Multicast/Broadcast Session (TS 23.247)</h3>
+    <p class="wf-desc">TMGI-based group session creation, UE join/leave, N4mb PFCP setup with UPF for multicast delivery.</p>
+    <div class="workflow-diagram">
+      <div class="workflow-step"><span class="wf-actor">AF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">POST /nmbsmf-mbssession/v1/mbs-sessions (type: MULTICAST, tmgi, service_area, qos: QCI=7)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">MBSMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">MBSMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Session created: id=mbs-001, TMGI=09f107fffe, state=CREATED</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">Ready</span></div>
+      <div class="workflow-step"><span class="wf-actor">UE-1</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">POST /mbs-sessions/mbs-001/members (supi=imsi-999700000000001) → JOINED (member_count: 1)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">MBSMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">UE-2</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">POST /mbs-sessions/mbs-001/members (supi=imsi-999700000000002) → JOINED (member_count: 2)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">MBSMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">AF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">POST /mbs-sessions/mbs-001/activate → MBSMF establishes N4mb PFCP session with UPF</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">MBSMF</span></div>
+      <div class="workflow-step"><span class="wf-actor">MBSMF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">N4mb: PFCP Session Establish (multicast PDR, FAR with DL-TEID for each gNB, mcast group IP)</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">UPF</span></div>
+      <div class="workflow-step"><span class="wf-actor">UPF</span><span class="wf-arrow">&#8594;</span><span class="wf-msg">Multicast forwarding active: DL data → replicated to all member gNBs via GTP-U tunnels</span><span class="wf-arrow">&#8594;</span><span class="wf-actor">gNBs → UEs</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- Components -->
+<section id="components">
+  <div class="container">
+    <h2 class="section-title">Components</h2>
+    <p class="section-subtitle">22 Network Functions and 18 shared libraries.</p>
+
+    <h3 class="group-heading">Core 5G Network Functions</h3>
+    <div class="components-grid">
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">AMF</span><span class="component-badge badge-core">Core</span></div>
+        <div class="component-desc">Access and Mobility Management — UE registration, authentication orchestration, connection management, handover control.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">SMF</span><span class="component-badge badge-core">Core</span></div>
+        <div class="component-desc">Session Management — PDU session lifecycle, bitmap IP pool (10.45.0.0/16), QoS flows, PFCP control.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">UPF</span><span class="component-badge badge-core">Core</span></div>
+        <div class="component-desc">User Plane — 5-tuple SDF filtering, QoS enforcement, GTP-U tunneling, usage reporting.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">NRF</span><span class="component-badge badge-core">Core</span></div>
+        <div class="component-desc">NF Repository — Service discovery, profiles, OAuth2 JWT (RS256/ES256), health monitoring.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">AUSF</span><span class="component-badge badge-core">Core</span></div>
+        <div class="component-desc">Authentication — 5G-AKA, EAP-AKA', SUPI/SUCI resolution, key derivation.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">UDM</span><span class="component-badge badge-core">Core</span></div>
+        <div class="component-desc">Data Management — Subscriber data, auth credentials, subscription management.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">UDR</span><span class="component-badge badge-core">Core</span></div>
+        <div class="component-desc">Data Repository — MongoDB backend, subscription/policy/exposure data persistence.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">PCF</span><span class="component-badge badge-core">Core</span></div>
+        <div class="component-desc">Policy Control — SM/AM policy decisions, QoS/charging rules, slice policies.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">NSSF</span><span class="component-badge badge-core">Core</span></div>
+        <div class="component-desc">Slice Selection — Allowed NSSAI determination, AMF set discovery.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">BSF</span><span class="component-badge badge-core">Core</span></div>
+        <div class="component-desc">Binding Support — PCF binding discovery, session binding for policy consistency.</div>
+      </div>
+    </div>
+
+    <h3 class="group-heading">AI, Analytics &amp; Advanced (6G-Ready)</h3>
+    <div class="components-grid">
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">NWDAF</span><span class="component-badge badge-6g">AI</span></div>
+        <div class="component-desc">4-layer analytics engine: real-time anomaly detection, ONNX prediction, prescriptive optimization, autonomous actions. ML model lifecycle management.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">EES</span><span class="component-badge badge-6g">Edge</span></div>
+        <div class="component-desc">Edge application management: EAS registration/discovery, proximity scoring, UE context transfer for seamless relocation.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">LMF</span><span class="component-badge badge-6g">Location</span></div>
+        <div class="component-desc">10+ positioning methods (ECID, TDOA, AoA, RTT, GNSS). NRPPa measurements. QoS modes: low-latency, high-accuracy, emergency.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">MBSMF</span><span class="component-badge badge-6g">Multicast</span></div>
+        <div class="component-desc">TMGI group sessions, multicast/broadcast modes, N4mb PFCP with UPF, dynamic member join/leave.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">NSACF</span><span class="component-badge badge-6g">Slicing</span></div>
+        <div class="component-desc">Slice admission control: S-NSSAI quotas, max UE/PDU limits, real-time utilization, admission/rejection with cause codes.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">PIN</span><span class="component-badge badge-6g">IoT</span></div>
+        <div class="component-desc">Personal IoT Networks: device group management, PEGC gateways, capability discovery, relay path management.</div>
+      </div>
+    </div>
+
+    <h3 class="group-heading">Routing &amp; Security</h3>
+    <div class="components-grid">
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">SCP</span><span class="component-badge badge-support">Routing</span></div>
+        <div class="component-desc">Service Communication Proxy — indirect communication, load balancing, message routing.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">SEPP</span><span class="component-badge badge-support">Security</span></div>
+        <div class="component-desc">Zero-trust inter-PLMN: PRINS encryption, trust scoring, anomaly blocking, N32c/N32f, rate limiting.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">WebUI</span><span class="component-badge badge-support">Ops</span></div>
+        <div class="component-desc">Subscriber dashboard: CRUD for profiles, security contexts, QoS config. MongoDB backend.</div>
+      </div>
+    </div>
+
+    <h3 class="group-heading">EPC (4G Interworking)</h3>
+    <div class="components-grid">
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">MME</span><span class="component-badge badge-epc">EPC</span></div>
+        <div class="component-desc">Mobility Management Entity — LTE attach, TAU, S1-MME.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">SGW-C</span><span class="component-badge badge-epc">EPC</span></div>
+        <div class="component-desc">Serving Gateway Control — GTP-C, bearer management, S11/S5.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">SGW-U</span><span class="component-badge badge-epc">EPC</span></div>
+        <div class="component-desc">Serving Gateway User Plane — GTP-U forwarding, buffering.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">HSS</span><span class="component-badge badge-epc">EPC</span></div>
+        <div class="component-desc">Home Subscriber Server — Diameter S6a, auth vectors.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">PCRF</span><span class="component-badge badge-epc">EPC</span></div>
+        <div class="component-desc">Policy and Charging Rules — Diameter Gx/Rx.</div>
+      </div>
+    </div>
+
+    <h3 class="group-heading">Shared Libraries (18)</h3>
+    <div class="components-grid">
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">ogs-sbi</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-desc">HTTP/2 SBI client/server with TLS, OpenTelemetry tracing.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">ogs-nas</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-desc">5G NAS codec — registration, auth, session messages.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">ogs-ngap</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-desc">NGAP ASN.1 PER codec for AMF-gNB signaling.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">ogs-pfcp</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-desc">PFCP for SMF-UPF session management.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">ogs-gtp</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-desc">GTP-C v2 and GTP-U tunneling protocol.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">ogs-diameter</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-desc">Diameter S6a, Gx, Rx, Cx for EPC/IMS.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">ogs-metrics</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-desc">Prometheus counters, histograms, gauges.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">ogs-dbi</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-desc">MongoDB interface for subscriber data.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">ogs-core</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-desc">Logging, config, timers, shared types.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">ogs-app</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-desc">CLI, YAML config, signal handling, NF lifecycle.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">ogs-crypt</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-desc">MILENAGE, TUAK, KDF, Snow3G, ZUC.</div>
+      </div>
+      <div class="component-card">
+        <div class="component-header"><span class="component-name">ogs-sctp</span><span class="component-badge badge-lib">Lib</span></div>
+        <div class="component-desc">SCTP transport for NGAP/S1AP signaling.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Quick Start -->
+<section id="quickstart">
+  <div class="container">
+    <h2 class="section-title">Quick Start</h2>
+    <p class="section-subtitle">Get the full agentic 6G core running in minutes.</p>
+
+    <h3 class="group-heading">Build from Source</h3>
+    <div class="code-block">
+      <button class="copy-btn">Copy</button>
+      <code><span class="comment"># Clone the repository</span>
+<span class="cmd">git clone https://github.com/NextgCoreLab/nextgcore.git</span>
+<span class="cmd">cd nextgcore/src</span>
+
+<span class="comment"># Build all 22 NFs (release mode)</span>
+<span class="cmd">cargo build --release</span>
+
+<span class="comment"># Binaries are in target/release/</span>
+<span class="cmd">ls target/release/nextgcore-*</span></code>
+    </div>
+
+    <h3 class="group-heading">Docker Compose</h3>
+    <div class="code-block">
+      <button class="copy-btn">Copy</button>
+      <code><span class="comment"># Start all core services + MongoDB</span>
+<span class="cmd">cd docker/rust</span>
+<span class="cmd">docker compose up -d</span>
+
+<span class="comment"># Check all services are running</span>
+<span class="cmd">docker compose ps</span>
+
+<span class="comment"># Run E2E tests</span>
+<span class="cmd">bash e2e-test.sh</span></code>
+    </div>
+
+    <h3 class="group-heading">Kubernetes (Production)</h3>
+    <div class="code-block">
+      <button class="copy-btn">Copy</button>
+      <code><span class="comment"># Deploy to K8s cluster (16 pods)</span>
+<span class="cmd">cd k8s && bash deploy.sh</span>
+
+<span class="comment"># Verify all pods running</span>
+<span class="cmd">kubectl get pods -n nextgcore</span>
+
+<span class="comment"># Run full E2E suite (70 tests)</span>
+<span class="cmd">bash e2e-test.sh</span>
+
+<span class="comment"># Check Prometheus metrics</span>
+<span class="cmd">curl http://amf:9090/metrics | head</span>
+
+<span class="comment"># View traces in Jaeger</span>
+<span class="cmd">kubectl port-forward svc/jaeger 16686:16686</span></code>
+    </div>
+  </div>
+</section>
+
+<!-- Contributing -->
+<section id="contributing">
+  <div class="container">
+    <h2 class="section-title">Contributing</h2>
+    <p class="section-subtitle">We welcome contributions of all kinds.</p>
+    <div class="contrib-grid">
+      <div class="contrib-step">
+        <div class="contrib-num">1</div>
+        <div>
+          <h4>Fork &amp; Clone</h4>
+          <p>Fork the repository on GitHub and clone your fork locally.</p>
+        </div>
+      </div>
+      <div class="contrib-step">
+        <div class="contrib-num">2</div>
+        <div>
+          <h4>Create a Branch</h4>
+          <p>Create a feature branch from <code>main</code> with a descriptive name.</p>
+        </div>
+      </div>
+      <div class="contrib-step">
+        <div class="contrib-num">3</div>
+        <div>
+          <h4>Write Code &amp; Tests</h4>
+          <p>Implement your changes following Rust conventions. Run <code>cargo test</code> and <code>cargo clippy</code>.</p>
+        </div>
+      </div>
+      <div class="contrib-step">
+        <div class="contrib-num">4</div>
+        <div>
+          <h4>Submit PR</h4>
+          <p>Push your branch, open a pull request with a clear description. We'll review promptly.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Footer -->
+<footer class="footer">
+  <div class="container">
+    <p>NextGCore &mdash; Agentic 6G Core Network &middot; <a href="https://github.com/NextgCoreLab/nextgcore">GitHub</a> &middot; <a href="api.html">API Docs</a> &middot; GPL-3.0 License</p>
+  </div>
+</footer>
+
+<script src="js/main.js"></script>
+</body>
+</html>

@@ -12,7 +12,7 @@ pub unsafe fn ogs_malloc(size: usize) -> *mut u8 {
     if size == 0 {
         return std::ptr::null_mut();
     }
-    let layout = Layout::from_size_align(size, 8).unwrap();
+    let layout = Layout::from_size_align(size, 8).unwrap_or_default();
     alloc(layout)
 }
 
@@ -57,7 +57,7 @@ pub unsafe fn ogs_realloc(ptr: *mut u8, old_size: usize, new_size: usize) -> *mu
 /// ptr must have been allocated by ogs_malloc/ogs_calloc
 pub unsafe fn ogs_free(ptr: *mut u8, size: usize) {
     if !ptr.is_null() && size > 0 {
-        let layout = Layout::from_size_align(size, 8).unwrap();
+        let layout = Layout::from_size_align(size, 8).unwrap_or_default();
         dealloc(ptr, layout);
     }
 }

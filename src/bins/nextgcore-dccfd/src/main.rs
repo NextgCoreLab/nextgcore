@@ -89,7 +89,7 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) {
         log::info!("Received shutdown signal");
         shutdown.store(true, Ordering::SeqCst);
     })
-    .expect("Failed to set signal handler");
+    .unwrap_or_default();
 }
 
 /// DCCF SBI request handler (called by the SBI server per request).

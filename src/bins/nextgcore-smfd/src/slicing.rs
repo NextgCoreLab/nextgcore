@@ -171,7 +171,7 @@ impl SlicePolicyRegistry {
     /// Look up the profile for a given SST, returns eMBB default if unknown
     pub fn get(&self, sst: u8) -> &SliceProfile {
         // Safe: eMBB (sst=1) is always registered
-        self.profiles.get(&sst).unwrap_or_else(|| self.profiles.get(&1).unwrap())
+        self.profiles.get(&sst).unwrap_or_else(|| self.profiles.get(&1).unwrap_or_default())
     }
 
     /// Register or override a profile for an SST

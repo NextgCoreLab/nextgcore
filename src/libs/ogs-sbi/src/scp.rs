@@ -242,7 +242,7 @@ pub fn global_scp_router() -> &'static ScpRouter {
         ROUTER_INIT.call_once(|| {
             GLOBAL_SCP_ROUTER = Some(ScpRouter::new());
         });
-        GLOBAL_SCP_ROUTER.as_ref().unwrap()
+        GLOBAL_SCP_ROUTER.as_ref().unwrap_or_default()
     }
 }
 

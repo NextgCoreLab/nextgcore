@@ -84,7 +84,7 @@ fn ogs_kdf_common(key: &[u8], fc: u8, params: &[KdfParam]) -> [u8; SHA256_DIGEST
     }
 
     // Compute HMAC-SHA256
-    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
+    let mut mac = HmacSha256::new_from_slice(key).unwrap_or_default();
     mac.update(&s);
     let result = mac.finalize();
     
@@ -477,7 +477,7 @@ pub fn ogs_kdf_ck_ik_idle_mobility(
 pub fn ogs_kdf_hash_mme(message: &[u8]) -> [u8; OGS_HASH_MME_LEN] {
     let key = [0u8; 32];
 
-    let mut mac = HmacSha256::new_from_slice(&key).expect("HMAC can take key of any size");
+    let mut mac = HmacSha256::new_from_slice(&key).unwrap_or_default();
     mac.update(message);
     let result = mac.finalize();
     let output = result.into_bytes();

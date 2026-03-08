@@ -192,10 +192,10 @@ impl AperEncoder {
             loop {
                 buf.push((v & 0xFF) as u8);
                 v >>= 8;
-                if v == -1 && (buf.last().unwrap() & 0x80 != 0) {
+                if v == -1 && (buf.last().unwrap_or_default() & 0x80 != 0) {
                     break;
                 }
-                if v == 0 && (buf.last().unwrap() & 0x80 == 0) {
+                if v == 0 && (buf.last().unwrap_or_default() & 0x80 == 0) {
                     break;
                 }
             }

@@ -356,7 +356,7 @@ pub fn derive_ck_ik_prime(
     s.extend_from_slice(&6u16.to_be_bytes());
 
     // HMAC-SHA-256
-    let mut mac = HmacSha256::new_from_slice(&key).expect("HMAC can take key of any size");
+    let mut mac = HmacSha256::new_from_slice(&key).unwrap_or_default();
     mac.update(&s);
     let result = mac.finalize().into_bytes();
 
@@ -387,7 +387,7 @@ pub fn derive_kausf_eap(
 /// MAC = HMAC-SHA-256-128(K_aut, EAP_packet)
 /// (Truncated to 16 bytes)
 pub fn compute_mac(k_aut: &[u8; 32], eap_data: &[u8]) -> [u8; 16] {
-    let mut mac = HmacSha256::new_from_slice(k_aut).expect("HMAC can take key of any size");
+    let mut mac = HmacSha256::new_from_slice(k_aut).unwrap_or_default();
     mac.update(eap_data);
     let result = mac.finalize().into_bytes();
 
@@ -495,7 +495,7 @@ impl EapAkaSession {
         let mut key = [0u8; 32];
         key[..16].copy_from_slice(&ck_prime);
         key[16..].copy_from_slice(&ik_prime);
-        let mut mac = HmacSha256::new_from_slice(&key).expect("HMAC can take key of any size");
+        let mut mac = HmacSha256::new_from_slice(&key).unwrap_or_default();
         mac.update(b"EAP-AKA'K_aut");
         let result = mac.finalize().into_bytes();
         self.k_aut.copy_from_slice(&result);

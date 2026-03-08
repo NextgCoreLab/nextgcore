@@ -272,7 +272,7 @@ impl FederationClient {
                 if let Some(counts) = self.query_counts.get(target) {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
+                        .unwrap_or_default()
                         .as_secs();
                     let recent = counts.iter().filter(|&&t| now - t < 3600).count();
                     if recent >= policy.max_queries_per_hour as usize {
@@ -296,7 +296,7 @@ impl FederationClient {
         // Record query for rate limiting
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         for target in &query.targets {
             self.query_counts
@@ -382,7 +382,7 @@ impl FederationClient {
             AggregationFunction::Max => values.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
             AggregationFunction::Median => {
                 let mut sorted = values.clone();
-                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or_default());
                 let mid = sorted.len() / 2;
                 if sorted.len() % 2 == 0 {
                     (sorted[mid - 1] + sorted[mid]) / 2.0

@@ -20,8 +20,8 @@ env_logger.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
-clap = { version = "4.0", features = ["derive"] }
-ctrlc = "3.4"
+clap.workspace = true
+ctrlc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

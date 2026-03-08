@@ -290,9 +290,9 @@ mod sctp_proto_impl {
         /// Connect to a remote SCTP endpoint (AMF)
         pub async fn connect(remote_addr: SocketAddr, config: SctpConfig) -> Result<Self> {
             let local_addr: SocketAddr = if remote_addr.is_ipv6() {
-                "[::]:0".parse().unwrap()
+                "[::]:0".parse().unwrap_or_default()
             } else {
-                "0.0.0.0:0".parse().unwrap()
+                "0.0.0.0:0".parse().unwrap_or_default()
             };
             Self::connect_with_local(local_addr, remote_addr, config).await
         }

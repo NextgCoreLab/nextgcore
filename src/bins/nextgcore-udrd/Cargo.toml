@@ -23,8 +23,8 @@ thiserror.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 uuid = { workspace = true, features = ["v4"] }
-ctrlc = "3.4"
-clap = { version = "4.4", features = ["derive"] }
+ctrlc.workspace = true
+clap.workspace = true
 ogs-sbi = { path = "../../libs/ogs-sbi" }
 ogs-metrics = { workspace = true }
 ogs-dbi = { path = "../../libs/ogs-dbi" }

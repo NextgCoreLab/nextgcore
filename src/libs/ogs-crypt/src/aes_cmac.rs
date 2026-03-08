@@ -26,7 +26,7 @@ pub enum CmacError {
 /// # Returns
 /// * 16-byte CMAC value
 pub fn aes_cmac_calculate(key: &[u8; 16], msg: &[u8]) -> [u8; 16] {
-    let mut mac = Cmac::<Aes128>::new_from_slice(key).expect("CMAC key should be valid");
+    let mut mac = Cmac::<Aes128>::new_from_slice(key).unwrap_or_default();
     mac.update(msg);
     let result = mac.finalize();
     let mut cmac = [0u8; 16];

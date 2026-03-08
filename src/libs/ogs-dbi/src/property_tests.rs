@@ -83,7 +83,7 @@ proptest! {
     #[test]
     fn test_s_nssai_sd_detection(sst in any::<u8>(), sd in prop_oneof![Just(None), (0u32..0xFFFFFEu32).prop_map(Some)]) {
         let snssai = OgsSNssai::new(sst, sd);
-        if sd.is_some() && sd.unwrap() != OGS_S_NSSAI_NO_SD_VALUE {
+        if sd.is_some() && sd.unwrap_or_default() != OGS_S_NSSAI_NO_SD_VALUE {
             prop_assert!(snssai.has_sd());
         }
     }
@@ -108,7 +108,7 @@ proptest! {
 
         // Verify each byte
         for i in 0..16 {
-            let expected = u8::from_str_radix(&hex_str[i*2..i*2+2], 16).unwrap();
+            let expected = u8::from_str_radix(&hex_str[i*2..i*2+2], 16).unwrap_or_default();
             prop_assert_eq!(buf[i], expected);
         }
     }

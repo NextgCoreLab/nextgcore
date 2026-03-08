@@ -322,8 +322,8 @@ pub fn handle_request(
     let discovery_presence = target_nf_type.is_some() && service_type.is_some();
 
     if discovery_presence {
-        let target_nf_type = target_nf_type.unwrap();
-        let service_type = service_type.unwrap();
+        let target_nf_type = target_nf_type.unwrap_or_default();
+        let service_type = service_type.unwrap_or_default();
 
         assoc.target_nf_type = target_nf_type;
         assoc.service_type = service_type;

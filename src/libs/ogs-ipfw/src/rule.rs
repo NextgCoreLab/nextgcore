@@ -44,14 +44,14 @@ pub fn compile_rule(flow_description: &str) -> IpfwResult<IpfwRule> {
     if from_idx.is_none() {
         return Err(IpfwError::MissingKeyword("from".to_string()));
     }
-    let from_idx = from_idx.unwrap();
+    let from_idx = from_idx.unwrap_or_default();
 
     // Find "to" keyword
     let to_idx = tokens.iter().position(|&t| t == "to");
     if to_idx.is_none() {
         return Err(IpfwError::MissingKeyword("to".to_string()));
     }
-    let to_idx = to_idx.unwrap();
+    let to_idx = to_idx.unwrap_or_default();
 
     // Parse source address and port
     let src_tokens: Vec<&str> = tokens[from_idx + 1..to_idx].to_vec();

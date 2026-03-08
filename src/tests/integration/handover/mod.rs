@@ -443,7 +443,7 @@ fn execute_x2_handover(config: &HandoverTestConfig) -> Result<HandoverResult, &'
     if history_guard.is_none() {
         *history_guard = Some(HashMap::new());
     }
-    let history = history_guard.as_mut().unwrap();
+    let history = history_guard.as_mut().unwrap_or_default();
 
     // Check for ping-pong for THIS UE only
     if let Some(prev_entry) = history.get(&config.imsi) {
