@@ -341,9 +341,30 @@ async fn handle_slice_quota_get(quota_id: &str) -> SbiResponse {
 }
 
 /// Handle Slice Quota Delete
-async fn handle_slice_quota_delete(_quota_id: &str) -> SbiResponse {
-    log::info!("Slice Quota Delete: {_quota_id}");
-    SbiResponse::with_status(204)
+async fn handle_slice_quota_delete(quota_id: &str) -> SbiResponse {
+    log::info!("Slice Quota Delete: {quota_id}");
+
+    let pool_id = quota_id
+        .strip_prefix("quota-")
+        .and_then(|s| s.parse::<u64>().ok());
+
+    let pool_id = match pool_id {
+        Some(id) => id,
+        None => return send_not_found(&format!("Slice quota {quota_id} not found"), Some("QUOTA_NOT_FOUND")),
+    };
+
+    let ctx = nsacf_self();
+    let removed = if let Ok(context) = ctx.read() {
+        context.quota_remove(pool_id)
+    } else {
+        false
+    };
+
+    if removed {
+        SbiResponse::with_status(204)
+    } else {
+        send_not_found(&format!("Slice quota {quota_id} not found"), Some("QUOTA_NOT_FOUND"))
+    }
 }
 
 /// Handle UE Admission request (TS 23.502 4.2.9.2)

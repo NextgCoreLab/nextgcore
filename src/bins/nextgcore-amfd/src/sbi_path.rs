@@ -574,6 +574,13 @@ fn resolve_nf_endpoint(service_type: SbiServiceType) -> SbiResult<(String, u16)>
     Ok((host, port))
 }
 
+/// Resolve the SMF SBI endpoint (host, port).
+///
+/// Convenience wrapper for the SMF service type used from ngap_handler.
+pub fn resolve_smf_endpoint() -> SbiResult<(String, u16)> {
+    resolve_nf_endpoint(SbiServiceType::NsmfPdusession)
+}
+
 /// Discover and send SBI request for UE
 pub fn amf_ue_sbi_discover_and_send(
     service_type: SbiServiceType,

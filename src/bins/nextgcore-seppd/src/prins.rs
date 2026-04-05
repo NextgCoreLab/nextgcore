@@ -280,31 +280,88 @@ pub fn process_n32f_request(
 }
 
 // ============================================================================
-// Crypto helpers (simplified for initial implementation)
+// Crypto helpers - AES-128-GCM AEAD
 // ============================================================================
 
-/// Encrypt an IE value (simplified XOR-based encryption).
-/// In production, this would use AES-GCM or similar AEAD.
-fn encrypt_ie(plaintext: &str, key: &[u8]) -> String {
-    let mut result = Vec::with_capacity(plaintext.len());
-    let key_bytes = if key.is_empty() { &[0x42u8] } else { key };
-    for (i, b) in plaintext.bytes().enumerate() {
-        result.push(b ^ key_bytes[i % key_bytes.len()]);
+/// AES-128-GCM nonce length in bytes.
+const AES_GCM_NONCE_LEN: usize = 12;
+
+/// Derive a 16-byte AES-128 key from whatever the shared_key contains.
+///
+/// If the key is already 16 bytes, use it directly.
+/// If it is shorter or longer, SHA-256 hash it and take the first 16 bytes.
+fn derive_aes128_key(raw_key: &[u8]) -> [u8; 16] {
+    if raw_key.len() == 16 {
+        let mut k = [0u8; 16];
+        k.copy_from_slice(raw_key);
+        return k;
     }
-    base64url_encode(&result)
+    // Hash to get a well-distributed 16-byte key
+    use sha2::{Sha256, Digest};
+    let hash = Sha256::digest(raw_key);
+    let mut k = [0u8; 16];
+    k.copy_from_slice(&hash[..16]);
+    k
 }
 
-/// Decrypt an IE value
-fn decrypt_ie(ciphertext: &str, key: &[u8]) -> String {
-    if let Ok(decoded) = base64url_decode(ciphertext) {
-        let key_bytes = if key.is_empty() { &[0x42u8] } else { key };
-        let mut result = Vec::with_capacity(decoded.len());
-        for (i, b) in decoded.iter().enumerate() {
-            result.push(b ^ key_bytes[i % key_bytes.len()]);
+/// Encrypt an IE value with AES-128-GCM.
+///
+/// Output format: base64url(nonce || ciphertext || tag)
+/// where nonce is 12 random bytes, ciphertext and tag are from AES-GCM.
+fn encrypt_ie(plaintext: &str, key: &[u8]) -> String {
+    use aes_gcm::{Aes128Gcm, KeyInit, aead::{Aead, Nonce}};
+    use rand::Rng as _;
+
+    let aes_key = derive_aes128_key(key);
+    let cipher = Aes128Gcm::new_from_slice(&aes_key)
+        .expect("AES-128 key is exactly 16 bytes");
+
+    let nonce_bytes: [u8; AES_GCM_NONCE_LEN] = rand::rng().random();
+    let nonce = Nonce::<Aes128Gcm>::from_slice(&nonce_bytes);
+
+    let ciphertext = match cipher.encrypt(nonce, plaintext.as_bytes()) {
+        Ok(ct) => ct,
+        Err(_) => {
+            log::warn!("PRINS: AES-GCM encrypt failed");
+            return String::new();
         }
-        String::from_utf8(result).expect("value expected")
-    } else {
-        String::new()
+    };
+
+    // Prepend nonce so the receiver can decrypt
+    let mut blob = Vec::with_capacity(AES_GCM_NONCE_LEN + ciphertext.len());
+    blob.extend_from_slice(&nonce_bytes);
+    blob.extend_from_slice(&ciphertext);
+    base64url_encode(&blob)
+}
+
+/// Decrypt an IE value encrypted with AES-128-GCM.
+///
+/// Expects base64url(nonce || ciphertext || tag) as produced by encrypt_ie.
+fn decrypt_ie(ciphertext_b64: &str, key: &[u8]) -> String {
+    use aes_gcm::{Aes128Gcm, KeyInit, aead::{Aead, Nonce}};
+
+    let blob = match base64url_decode(ciphertext_b64) {
+        Ok(b) => b,
+        Err(_) => return String::new(),
+    };
+
+    if blob.len() <= AES_GCM_NONCE_LEN {
+        return String::new();
+    }
+
+    let (nonce_bytes, ct) = blob.split_at(AES_GCM_NONCE_LEN);
+    let nonce = Nonce::<Aes128Gcm>::from_slice(nonce_bytes);
+
+    let aes_key = derive_aes128_key(key);
+    let cipher = Aes128Gcm::new_from_slice(&aes_key)
+        .expect("AES-128 key is exactly 16 bytes");
+
+    match cipher.decrypt(nonce, ct) {
+        Ok(plaintext) => String::from_utf8(plaintext).unwrap_or_default(),
+        Err(_) => {
+            log::warn!("PRINS: AES-GCM decrypt failed (wrong key or corrupted data)");
+            String::new()
+        }
     }
 }
 

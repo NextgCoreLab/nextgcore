@@ -262,27 +262,30 @@ pub fn handle_create_pdp_context_request(
         info!("[GTPv1] QoS: traffic_class={}, arp={}", qos.traffic_class, qos.arp);
     }
 
-    // In a full implementation, this would:
-    // 1. Create or find the UE context
-    // 2. Allocate IP address from pool
-    // 3. Establish PFCP session with UPF
-    // 4. Store session state
-    // 5. Build and return Create PDP Context Response
+    // Allocate TEID pair and UE IP from the SMF context pools.
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    let teid_u = smf_ctx.gn_teid_counter.fetch_add(2, AtomicOrdering::Relaxed);
+    let teid_c = teid_u.wrapping_add(1);
+    let charging_id = teid_u; // reuse counter value as charging ID
 
-    // For now, return a stub success response
-    let ggsn_addr = Ipv4Addr::new(10, 45, 0, 1);
+    let allocated_ipv4 = smf_ctx.ipv4_pool.allocate()
+        .unwrap_or_else(|| Ipv4Addr::new(10, 45, 0, 100));
+    let ggsn_addr = smf_ctx.gn_addr;
+
+    info!("[GTPv1] Allocated TEID-U=0x{teid_u:08x} TEID-C=0x{teid_c:08x} IP={allocated_ipv4}");
+
     let response = crate::gn_build::build_create_pdp_context_response(
         cause::REQUEST_ACCEPTED,
-        0x12345678, // GGSN TEID-U
-        0x12345679, // GGSN TEID-C
+        teid_u,  // GGSN TEID-U
+        teid_c,  // GGSN TEID-C
         req.nsapi.unwrap_or(5), // NSAPI
         false, // reordering_required
         Some(&ggsn_addr), // GGSN address for control
         Some(&ggsn_addr), // GGSN address for user
         &crate::gn_build::QosProfileDecoded::from_qci(9, req.qos_profile.as_ref().map(|q| q.arp).unwrap_or(1)),
-        0x12345680, // Charging ID
+        charging_id, // Charging ID
         None, // PCO
-        Some(Ipv4Addr::new(10, 45, 0, 100)), // Allocated IPv4
+        Some(allocated_ipv4), // Allocated IPv4
         None, // IPv6
     );
 
@@ -293,7 +296,7 @@ pub fn handle_create_pdp_context_request(
 ///
 /// Modifies an existing PDP context (QoS change, SGSN relocation).
 pub fn handle_update_pdp_context_request(
-    _smf_ctx: &Arc<SmfContext>,
+    smf_ctx: &Arc<SmfContext>,
     req: &UpdatePdpContextRequest,
 ) -> Result<(u8, Bytes), GnError> {
     info!("[GTPv1] Update PDP Context Request");
@@ -307,14 +310,16 @@ pub fn handle_update_pdp_context_request(
     let nsapi = req.nsapi.expect("value expected");
     info!("[GTPv1] Updating NSAPI: {nsapi}");
 
-    // In a full implementation, would update session state and UPF
-    let ggsn_addr = Ipv4Addr::new(10, 45, 0, 1);
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    let teid_u = smf_ctx.gn_teid_counter.fetch_add(2, AtomicOrdering::Relaxed);
+    let teid_c = teid_u.wrapping_add(1);
+    let ggsn_addr = smf_ctx.gn_addr;
     let qos = crate::gn_build::QosProfileDecoded::from_qci(9, 1);
 
     let response = crate::gn_build::build_update_pdp_context_response(
         cause::REQUEST_ACCEPTED,
-        0x12345678, // TEID-U
-        0x12345679, // TEID-C
+        teid_u, // TEID-U
+        teid_c, // TEID-C
         Some(&ggsn_addr),
         Some(&ggsn_addr),
         Some(&qos),

@@ -7,7 +7,7 @@
 //! Port of src/smf/pfcp-path.c - PFCP path management for SMF
 //! Handles PFCP session establishment, modification, and deletion requests
 
-use crate::n4_build::{PfcpCause, PfcpMessageBuilder};
+use crate::n4_build::{PfcpCause, PfcpMessageBuilder, apply_action, pfcp_ie};
 use crate::n4_handler::{DeleteTrigger, modify_flags};
 
 // ============================================================================
@@ -278,10 +278,29 @@ pub fn build_5gc_all_pdr_modification_request(
         sequence_number,
     );
 
-    let builder = PfcpMessageBuilder::new();
-    
-    // The actual PDR modifications would be added here based on flags
-    // This is a simplified version
+    let mut builder = PfcpMessageBuilder::new();
+
+    // Update FAR: set Apply-Action based on modify flags.
+    // DEACTIVATE → BUFF+NOCP (buffer and notify CP), otherwise FORW (forward).
+    let far_action = if params.flags & modify_flags::DEACTIVATE != 0 {
+        apply_action::BUFF | apply_action::NOCP
+    } else {
+        apply_action::FORW
+    };
+
+    // UPDATE_FAR grouped IE: FAR-ID + Apply-Action
+    let mut far_ie = PfcpMessageBuilder::new();
+    far_ie.add_far_id(1); // FAR ID 1 is the default uplink/downlink FAR
+    far_ie.add_apply_action(far_action);
+    builder.add_tlv(pfcp_ie::UPDATE_FAR, &far_ie.build());
+
+    // UPDATE_QER grouped IE: QER-ID + Gate-Status
+    // DEACTIVATE → gates closed (1=CLOSED), otherwise open (0=OPEN)
+    let gate = if params.flags & modify_flags::DEACTIVATE != 0 { 1u8 } else { 0u8 };
+    let mut qer_ie = PfcpMessageBuilder::new();
+    qer_ie.add_qer_id(1); // QER ID 1 is the default QER
+    qer_ie.add_gate_status(gate, gate);
+    builder.add_tlv(pfcp_ie::UPDATE_QER, &qer_ie.build());
 
     (header, builder.build())
 }
@@ -298,9 +317,28 @@ pub fn build_5gc_qos_flow_modification_request(
         sequence_number,
     );
 
-    let builder = PfcpMessageBuilder::new();
-    
-    // The actual QoS flow modifications would be added here based on flags
+    let mut builder = PfcpMessageBuilder::new();
+
+    // UPDATE_FAR: update the forwarding action for the QoS flow FAR.
+    // QOS_MODIFY flag → keep forwarding but update QoS parameters.
+    let far_action = if params.flags & modify_flags::DEACTIVATE != 0 {
+        apply_action::BUFF | apply_action::NOCP
+    } else {
+        apply_action::FORW
+    };
+
+    let mut far_ie = PfcpMessageBuilder::new();
+    far_ie.add_far_id(1);
+    far_ie.add_apply_action(far_action);
+    builder.add_tlv(pfcp_ie::UPDATE_FAR, &far_ie.build());
+
+    // UPDATE_QER: update gate status for the QoS flow.
+    // QOS_MODIFY → gates open; DEACTIVATE → gates closed.
+    let gate = if params.flags & modify_flags::DEACTIVATE != 0 { 1u8 } else { 0u8 };
+    let mut qer_ie = PfcpMessageBuilder::new();
+    qer_ie.add_qer_id(1);
+    qer_ie.add_gate_status(gate, gate);
+    builder.add_tlv(pfcp_ie::UPDATE_QER, &qer_ie.build());
 
     (header, builder.build())
 }

@@ -27,6 +27,9 @@ clap.workspace = true
 ctrlc.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
+aes-gcm.workspace = true
+rand.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

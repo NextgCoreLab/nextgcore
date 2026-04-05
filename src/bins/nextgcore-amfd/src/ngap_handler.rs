@@ -7,6 +7,7 @@ use crate::context::{
     SupportedTa, NgapCause, NgapUeCtxRelAction,
 };
 use crate::ngap_build::{cause_group, radio_network_cause};
+use crate::sbi_path;
 
 // ============================================================================
 // Constants
@@ -433,7 +434,8 @@ pub fn handle_ue_context_release_request(
             "PDU Session Resource List to Release present ({} sessions)",
             message.pdu_session_list.len()
         );
-        // TODO: Trigger session cleanup in SMF via Nsmf_PDUSession_ReleaseSMContext
+        // Trigger session cleanup in SMF via Nsmf_PDUSession_ReleaseSMContext
+        trigger_smf_session_release_for_ue(ran_ue.amf_ue_id);
     }
 
     NgapHandlerResult::ReleaseUeContext(message.cause.clone())
@@ -757,6 +759,47 @@ pub fn parse_cause(group: u8, value: i64) -> NgapCause {
     NgapCause {
         group,
         cause: value,
+    }
+}
+
+/// Fire-and-forget: release all SMF PDU sessions for the given AMF UE.
+///
+/// Called after UE Context Release to clean up Nsmf_PDUSession contexts.
+/// Sessions without an sm_context_ref are silently skipped.
+fn trigger_smf_session_release_for_ue(amf_ue_id: u64) {
+    let amf_ctx = crate::context::amf_self();
+
+    // Resolve SMF endpoint first; if unavailable, nothing to do.
+    let (smf_host, smf_port) = match sbi_path::resolve_smf_endpoint() {
+        Ok(ep) => ep,
+        Err(e) => {
+            log::debug!("SMF endpoint not resolved, skipping session cleanup: {e}");
+            return;
+        }
+    };
+
+    let sessions = {
+        let ctx = match amf_ctx.read() {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        // Collect sm_context_ref for sessions that have a live SMF context
+        ctx.sess_list_for_ue(amf_ue_id)
+            .into_iter()
+            .filter_map(|sess| sess.sm_context_ref.clone())
+            .collect::<Vec<_>>()
+    };
+
+    for sm_context_ref in sessions {
+        let host = smf_host.clone();
+        let port = smf_port;
+        tokio::spawn(async move {
+            if let Err(e) = sbi_path::call_smf_release_sm_context(&host, port, &sm_context_ref).await {
+                log::warn!(
+                    "SMF SM Context Release failed for ref={sm_context_ref}: {e}"
+                );
+            }
+        });
     }
 }
 

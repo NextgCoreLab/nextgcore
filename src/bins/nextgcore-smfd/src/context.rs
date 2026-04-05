@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::session_extensions::Ipv4Pool;
@@ -1418,6 +1418,12 @@ pub struct SmfContext {
     /// Bitmap-based IPv4 address pool (10.45.0.0/16)
     pub ipv4_pool: Ipv4Pool,
 
+    /// Counter for allocating GTPv1 TEIDs on the Gn interface
+    pub gn_teid_counter: AtomicU32,
+
+    /// GGSN address for the Gn interface (used in Create/Update PDP Context Response)
+    pub gn_addr: std::net::Ipv4Addr,
+
     /// Context initialized flag
     initialized: AtomicBool,
 }
@@ -1458,6 +1464,11 @@ impl SmfContext {
             max_num_of_sess: 0,
             max_num_of_bearer: 0,
             ipv4_pool: Ipv4Pool::default_pool(),
+            gn_teid_counter: AtomicU32::new(1),
+            gn_addr: std::env::var("SMF_GN_ADDR")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(std::net::Ipv4Addr::new(127, 0, 0, 1)),
             initialized: AtomicBool::new(false),
         }
     }

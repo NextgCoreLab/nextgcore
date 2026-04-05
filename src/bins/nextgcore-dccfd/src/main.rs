@@ -13,6 +13,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use ogs_sbi::context::global_context;
+use ogs_sbi::client::SbiClient;
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::server::{
     send_method_not_allowed, send_not_found,
@@ -120,8 +121,13 @@ async fn dccf_request_handler(req: SbiRequest) -> SbiResponse {
         ["ndccf-datamanagement", "v1", "subscriptions"] => match method {
             "POST" => {
                 let sub_id = uuid::Uuid::new_v4().to_string();
-                log::info!("[DCCF] DataManagement subscription created sub_id={}", sub_id);
-                dccf_context_add_subscription(sub_id.clone());
+                // Extract notifyUri from the request body if present (TS 29.574 §5.2)
+                let notify_uri = req.http.content.as_deref()
+                    .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+                    .and_then(|v| v.get("notifyUri").and_then(|u| u.as_str()).map(|s| s.to_string()))
+                    .unwrap_or_default();
+                log::info!("[DCCF] DataManagement subscription created sub_id={} notify_uri={}", sub_id, notify_uri);
+                dccf_context_add_subscription_with_uri(sub_id.clone(), notify_uri);
                 let body = format!(r#"{{"subscriptionId":"{}","status":"ACTIVE"}}"#, sub_id);
                 SbiResponse::created().with_body(body, "application/json")
             }
@@ -152,9 +158,38 @@ async fn dccf_request_handler(req: SbiRequest) -> SbiResponse {
         // POST /ndccf-datamanagement/v1/notify — inbound data from producers
         ["ndccf-datamanagement", "v1", "notify"] => match method {
             "POST" => {
-                let body = req.http.content.as_deref().unwrap_or("{}");
+                let body = req.http.content.as_deref().unwrap_or("{}").to_string();
                 log::debug!("[DCCF] DataManagement notify received len={}", body.len());
-                dccf_context_fanout_notify(body);
+                // Get subscriber callback URIs (without holding the context lock)
+                let targets = dccf_context_fanout_notify(&body);
+                // Fan out: POST notification body to each subscriber's callback URI
+                for (sub_id, notify_uri) in targets {
+                    if let Some((host, port)) = parse_host_port(&notify_uri) {
+                        let body_clone = body.clone();
+                        let path = notify_uri
+                            .trim_start_matches("https://")
+                            .trim_start_matches("http://");
+                        // Strip host:port prefix to get the path component
+                        let path_only = path
+                            .find('/')
+                            .map(|i| &path[i..])
+                            .unwrap_or("/");
+                        let path_owned = path_only.to_string();
+                        let client = SbiClient::with_host_port(&host, port);
+                        tokio::spawn(async move {
+                            match client.post_json(&path_owned, &serde_json::json!({"data": body_clone})).await {
+                                Ok(resp) => log::debug!(
+                                    "[DCCF] fanout POST {} -> status={}", sub_id, resp.status
+                                ),
+                                Err(e) => log::warn!(
+                                    "[DCCF] fanout POST {} failed: {}", sub_id, e
+                                ),
+                            }
+                        });
+                    } else {
+                        log::warn!("[DCCF] subscriber {} has unparseable notify_uri: {}", sub_id, notify_uri);
+                    }
+                }
                 SbiResponse::no_content()
             }
             _ => send_method_not_allowed(method, "notify"),

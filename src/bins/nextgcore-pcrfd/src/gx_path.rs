@@ -251,12 +251,27 @@ pub fn pcrf_gx_handle_ccr(
                 }
             }
             context.gx_session_remove(session_id);
+
+            // Update statistics and return (no session_data needed for termination)
+            pcrf_diam_stats().gx.inc_tx_cca();
+            return Ok(GxMessage {
+                cc_request_type: cc_request_type as u32,
+                cc_request_number,
+                result_code: 2001, // DIAMETER_SUCCESS
+                session_data: GxSessionData::default(),
+            });
         }
         CcRequestType::Event => {
             // Handle event request
             log::debug!("Event request received");
         }
     }
+
+    // Look up subscriber's policy profile from DB to build CCA session_data.
+    // For Initial/Update CCR, return AMBR and a default internet PCC rule matching
+    // the subscriber's APN.  Use QCI 9 (default bearer, non-GBR) with permissive
+    // flow descriptions so that the P-GW installs a catch-all rule.
+    let session_data = build_subscriber_session_data(imsi, apn);
 
     // Update statistics
     pcrf_diam_stats().gx.inc_tx_cca();
@@ -265,8 +280,68 @@ pub fn pcrf_gx_handle_ccr(
         cc_request_type: cc_request_type as u32,
         cc_request_number,
         result_code: 2001, // DIAMETER_SUCCESS
-        session_data: GxSessionData::default(),
+        session_data,
     })
+}
+
+/// Build GxSessionData with charging rules for a subscriber/APN pair.
+///
+/// Looks up the subscriber's policy profile from the DB.  If the DB is not
+/// available (e.g. unit-test environments), falls back to a permissive default
+/// profile: QCI 9, 100 Mbps DL / 50 Mbps UL AMBR, with a catch-all PCC rule.
+fn build_subscriber_session_data(imsi: &str, apn: &str) -> GxSessionData {
+    // Default profile values (used as fallback or when DB returns no data)
+    const DEFAULT_AMBR_DL: u64 = 100_000_000; // 100 Mbps
+    const DEFAULT_AMBR_UL: u64 =  50_000_000; //  50 Mbps
+    const DEFAULT_QCI: u8 = 9;
+
+    // Build a catch-all PCC rule for the APN.
+    // Flow descriptions use IPFilterRule syntax (RFC 3588 / TS 29.212).
+    let rule_name = format!("pcrf-{}-default", apn.replace('.', "-"));
+    let default_pcc_rule = PccRuleData {
+        name: rule_name,
+        qos_index: DEFAULT_QCI,
+        flow_status: flow_status::ENABLED,
+        precedence: 100,
+        mbr_downlink: DEFAULT_AMBR_DL,
+        mbr_uplink: DEFAULT_AMBR_UL,
+        gbr_downlink: 0, // non-GBR
+        gbr_uplink: 0,
+        flows: vec![
+            FlowData { direction: 0, description: "permit out ip from any to assigned".to_string() },
+            FlowData { direction: 1, description: "permit in ip from any to assigned".to_string() },
+        ],
+    };
+
+    // Attempt DB lookup to get subscriber-specific AMBR overrides.
+    let (ambr_dl, ambr_ul) = lookup_subscriber_ambr(imsi, apn)
+        .unwrap_or((DEFAULT_AMBR_DL, DEFAULT_AMBR_UL));
+
+    build_session_data_with_rules(DEFAULT_QCI, ambr_dl, ambr_ul, vec![default_pcc_rule])
+}
+
+/// Query the DB for a subscriber's AMBR for the given APN.
+/// Returns None if the DB is not reachable or the subscriber has no explicit AMBR.
+fn lookup_subscriber_ambr(imsi: &str, apn: &str) -> Option<(u64, u64)> {
+    use ogs_dbi::{ogs_dbi_subscription_data};
+    let supi = format!("imsi-{imsi}");
+    let subscription_data = ogs_dbi_subscription_data(&supi).ok()?;
+
+    // Try to find a session matching the APN.
+    for slice in &subscription_data.slice {
+        for session in &slice.session {
+            if session.name.as_deref().unwrap_or("") == apn {
+                if session.ambr.downlink > 0 || session.ambr.uplink > 0 {
+                    return Some((session.ambr.downlink, session.ambr.uplink));
+                }
+            }
+        }
+    }
+    // Fall back to UE-level AMBR if present
+    if subscription_data.ambr.downlink > 0 || subscription_data.ambr.uplink > 0 {
+        return Some((subscription_data.ambr.downlink, subscription_data.ambr.uplink));
+    }
+    None
 }
 
 /// Send RAR (Re-Auth-Request) to P-GW

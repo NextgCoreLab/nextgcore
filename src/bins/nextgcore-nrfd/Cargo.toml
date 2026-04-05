@@ -28,6 +28,9 @@ uuid.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
 base64.workspace = true
+rand.workspace = true
+hmac.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

@@ -353,15 +353,18 @@ pub fn handle_ulr(
         .map_err(|e| format!("Failed to update MME: {e}"))?;
 
     // 2. Get subscription data from DB
-    let _subscription_data = ogs_dbi_subscription_data(&supi)
+    let subscription_data = ogs_dbi_subscription_data(&supi)
         .map_err(|e| format!("Failed to get subscription data: {e}"))?;
 
-    // 3. Return ULA with Subscription-Data
-    // Note: In full implementation, subscription_data would be serialized to AVP format
-    // For now we return a placeholder
+    // 3. Serialize subscription data into a TLV-encoded byte buffer suitable for
+    //    inclusion in the S6a ULA Subscription-Data AVP group.
+    //    Layout: AMBR (DL 8B + UL 8B) + APN count (1B) + per-APN records.
+    let serialized = serialize_subscription_data(&subscription_data);
+
+    // 4. Return ULA with Subscription-Data
     let response = UlrResponse {
         result_code: 2001, // DIAMETER_SUCCESS
-        subscription_data: vec![0u8; 128], // Placeholder for serialized subscription data
+        subscription_data: serialized,
     };
 
     diam_stats().s6a.inc_tx_ula();
@@ -435,6 +438,57 @@ pub struct UlrResponse {
 pub struct PurResponse {
     /// Result code (0 = success)
     pub result_code: u32,
+}
+
+// ============================================================================
+// Subscription Data Serialization
+// ============================================================================
+
+/// Serialize OgsSubscriptionData into a compact TLV byte buffer.
+///
+/// Format (all values big-endian):
+///   [0..8]   UE AMBR downlink (u64, bps)
+///   [8..16]  UE AMBR uplink (u64, bps)
+///   [16]     Number of APN entries (u8)
+///   Per-APN record (repeated):
+///     [0]    APN name length (u8)
+///     [1..]  APN name bytes (UTF-8)
+///     [+0..8]  Session AMBR downlink (u64, bps)
+///     [+8..16] Session AMBR uplink (u64, bps)
+///     [+16]  QCI / 5QI index (u8)
+///     [+17]  ARP priority level (u8)
+///     [+18]  Pre-emption capability (u8)
+///     [+19]  Pre-emption vulnerability (u8)
+pub fn serialize_subscription_data(data: &ogs_dbi::OgsSubscriptionData) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(256);
+
+    // UE-level AMBR
+    buf.extend_from_slice(&data.ambr.downlink.to_be_bytes());
+    buf.extend_from_slice(&data.ambr.uplink.to_be_bytes());
+
+    // Collect all sessions from all slices
+    let sessions: Vec<&ogs_dbi::OgsSession> = data
+        .slice
+        .iter()
+        .flat_map(|s| s.session.iter())
+        .collect();
+
+    buf.push(sessions.len().min(255) as u8);
+
+    for session in sessions.iter().take(255) {
+        let apn = session.name.as_deref().unwrap_or("internet");
+        let apn_bytes = apn.as_bytes();
+        buf.push(apn_bytes.len().min(255) as u8);
+        buf.extend_from_slice(&apn_bytes[..apn_bytes.len().min(255)]);
+        buf.extend_from_slice(&session.ambr.downlink.to_be_bytes());
+        buf.extend_from_slice(&session.ambr.uplink.to_be_bytes());
+        buf.push(session.qos.index);
+        buf.push(session.qos.arp.priority_level);
+        buf.push(session.qos.arp.pre_emption_capability);
+        buf.push(session.qos.arp.pre_emption_vulnerability);
+    }
+
+    buf
 }
 
 // ============================================================================

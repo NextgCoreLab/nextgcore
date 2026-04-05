@@ -22,8 +22,18 @@ use ogs_sbi::server::{
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+/// Per-process HMAC-SHA256 signing key, generated once at startup.
+static NRF_SIGNING_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+
+fn nrf_signing_key() -> &'static [u8; 32] {
+    NRF_SIGNING_KEY.get_or_init(|| {
+        use rand::Rng;
+        rand::rng().random::<[u8; 32]>()
+    })
+}
 
 /// NextGCore NRF - Network Repository Function
 #[derive(Parser, Debug)]
@@ -783,8 +793,16 @@ async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
 
     let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
     let payload_b64 = URL_SAFE_NO_PAD.encode(claims_str.as_bytes());
-    // Placeholder signature (in production, sign with NRF private key)
-    let signature_b64 = URL_SAFE_NO_PAD.encode(b"nrf-signature-placeholder");
+
+    // Sign header.payload with HMAC-SHA256 using the per-process key
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let mut mac = Hmac::<Sha256>::new_from_slice(nrf_signing_key())
+        .expect("HMAC accepts any key length");
+    mac.update(signing_input.as_bytes());
+    let signature_bytes = mac.finalize().into_bytes();
+    let signature_b64 = URL_SAFE_NO_PAD.encode(&signature_bytes);
 
     let access_token = format!("{header_b64}.{payload_b64}.{signature_b64}");
 
