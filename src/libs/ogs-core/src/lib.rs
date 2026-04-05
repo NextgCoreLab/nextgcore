@@ -38,7 +38,8 @@ pub use list::{OgsList, OgsLnode};
 pub use pool::{OgsPool, OgsPoolId, OgsPoolWithId, PoolItem, OGS_INVALID_POOL_ID, OGS_MIN_POOL_ID, OGS_MAX_POOL_ID};
 pub use hash::{OgsHash, OgsHashMap, OgsHashIter, ogs_hashfunc_default, OGS_HASH_KEY_STRING};
 pub use pkbuf::OgsPkbuf;
-pub use fsm::OgsFsm;
+#[allow(deprecated)]
+pub use fsm::{FsmResult, OgsFsm, StateMachine};
 pub use errno::{OgsError, OGS_OK, OGS_ERROR};
 pub use tlv::{OgsTlv, OgsTlvMsg, TlvError};
 pub use uuid::OgsUuid;

@@ -4,8 +4,82 @@
 //!
 //! This implementation provides a simple hierarchical state machine
 //! with entry/exit signals and state transitions.
+//!
+//! # Migration
+//!
+//! New code should implement the [`StateMachine`] trait instead of using
+//! [`OgsFsm`].  The trait uses enum-based states which are idiomatic Rust and
+//! avoid the unreliable function-pointer comparison required by [`OgsFsm::check`].
+//!
+//! ## Quick start
+//!
+//! ```rust,ignore
+//! use ogs_core::fsm::{StateMachine, FsmResult};
+//!
+//! struct MyFsm { state: MyState }
+//!
+//! impl StateMachine for MyFsm {
+//!     type State  = MyState;
+//!     type Event  = MyEvent;
+//!     type Result = FsmResult<MyState>;
+//!
+//!     fn state(&self) -> &MyState { &self.state }
+//!     fn transition(&mut self, s: MyState) { self.state = s; }
+//!     fn dispatch(&mut self, ev: &MyEvent) -> FsmResult<MyState> { … }
+//! }
+//! ```
 
+use std::fmt::Debug;
 use std::marker::PhantomData;
+
+// ============================================================================
+// Unified StateMachine trait
+// ============================================================================
+
+/// Unified state machine trait for all NFs.
+///
+/// Prefer this over the legacy [`OgsFsm`] function-pointer approach.
+/// Enum-based states are nameable, comparable without UB, and idiomatic Rust.
+pub trait StateMachine {
+    /// The state type (typically an enum).
+    type State: Clone + PartialEq + Debug;
+    /// The event type dispatched to the machine.
+    type Event;
+    /// The result returned by [`StateMachine::dispatch`].
+    type Result;
+
+    /// Return a reference to the current state.
+    fn state(&self) -> &Self::State;
+
+    /// Dispatch an event and return the processing result.
+    fn dispatch(&mut self, event: &Self::Event) -> Self::Result;
+
+    /// Perform an immediate transition to `new_state`.
+    fn transition(&mut self, new_state: Self::State);
+
+    /// Return `true` when the machine is in `target`.
+    fn is_in(&self, target: &Self::State) -> bool {
+        self.state() == target
+    }
+}
+
+// ============================================================================
+// Generic FsmResult
+// ============================================================================
+
+/// Standard result type for [`StateMachine::dispatch`].
+///
+/// NFs that need richer results (e.g. UPF's `PfcpSmResult`) may define their
+/// own result enum and use it as `StateMachine::Result`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FsmResult<S> {
+    /// The event was handled; no state change.
+    Handled,
+    /// A state transition occurred.
+    Transition(S),
+    /// The event was not relevant to the current state.
+    Ignored,
+}
 
 /// FSM signal types (identical to ogs_fsm_signal_e)
 pub const OGS_FSM_ENTRY_SIG: i32 = 0;
@@ -16,6 +90,14 @@ pub const OGS_FSM_USER_SIG: i32 = 2;
 pub type OgsFsmHandler<S, E> = fn(&mut S, &mut E);
 
 /// Finite State Machine structure (identical to ogs_fsm_t)
+///
+/// # Deprecation
+///
+/// This type uses function-pointer comparison in [`OgsFsm::check`], which
+/// requires `#[allow(unpredictable_function_pointer_comparisons)]` and is
+/// unreliable in optimised builds.  Implement the [`StateMachine`] trait with
+/// an enum state instead.
+#[deprecated(note = "Use the StateMachine trait with an enum state instead")]
 #[repr(C)]
 pub struct OgsFsm<S, E> {
     /// Initial state handler
@@ -27,6 +109,7 @@ pub struct OgsFsm<S, E> {
     _phantom: PhantomData<(S, E)>,
 }
 
+#[allow(deprecated)]
 impl<S, E> OgsFsm<S, E> {
     /// Create a new FSM
     pub fn new() -> Self {
@@ -110,12 +193,14 @@ impl<S, E> OgsFsm<S, E> {
     }
 }
 
+#[allow(deprecated)]
 impl<S, E> Default for OgsFsm<S, E> {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[allow(deprecated)]
 impl<S, E> Clone for OgsFsm<S, E> {
     fn clone(&self) -> Self {
         OgsFsm {
@@ -127,6 +212,7 @@ impl<S, E> Clone for OgsFsm<S, E> {
     }
 }
 
+#[allow(deprecated)]
 impl<S, E> std::fmt::Debug for OgsFsm<S, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OgsFsm")
@@ -138,6 +224,7 @@ impl<S, E> std::fmt::Debug for OgsFsm<S, E> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use std::cell::RefCell;

@@ -3,6 +3,7 @@
 //! Port of src/upf/pfcp-sm.c - PFCP state machine for UPF
 
 use crate::event::{UpfEvent, UpfEventId, UpfTimerId};
+use ogs_core::fsm::StateMachine;
 
 // ============================================================================
 // PFCP Message Types (from ogs-pfcp)
@@ -431,6 +432,29 @@ impl PfcpSmContext {
     /// Set restoration required flag
     pub fn set_restoration_required(&mut self, required: bool) {
         self.restoration_required = required;
+    }
+}
+
+// ============================================================================
+// StateMachine trait implementation
+// ============================================================================
+
+impl StateMachine for PfcpSmContext {
+    type State = PfcpState;
+    type Event = UpfEvent;
+    type Result = PfcpSmResult;
+
+    fn state(&self) -> &PfcpState {
+        &self.state
+    }
+
+    fn dispatch(&mut self, event: &UpfEvent) -> PfcpSmResult {
+        // Delegate to the existing method so all logic stays in one place.
+        PfcpSmContext::dispatch(self, event)
+    }
+
+    fn transition(&mut self, new_state: PfcpState) {
+        self.state = new_state;
     }
 }
 
