@@ -157,9 +157,9 @@ pub struct AmfTimerCfg {
 #[derive(Debug, Clone, Default)]
 pub struct SbiEventData {
     /// Request data (if any)
-    pub request: Option<SbiRequest>,
+    pub request: Option<AmfSbiRequest>,
     /// Response data (if any)
-    pub response: Option<SbiResponse>,
+    pub response: Option<AmfSbiResponse>,
     /// Message data (if any)
     pub message: Option<SbiMessage>,
     /// Stream ID
@@ -170,9 +170,10 @@ pub struct SbiEventData {
     pub state: Option<i32>,
 }
 
-/// Simplified SBI request representation
+/// Simplified SBI request for AMF internal event passing.
+/// Distinct from `ogs_sbi::message::SbiRequest` (full HTTP/2 request).
 #[derive(Debug, Clone)]
-pub struct SbiRequest {
+pub struct AmfSbiRequest {
     /// HTTP method
     pub method: String,
     /// URI
@@ -181,9 +182,10 @@ pub struct SbiRequest {
     pub body: Option<String>,
 }
 
-/// Simplified SBI response representation
+/// Simplified SBI response for AMF internal event passing.
+/// Distinct from `ogs_sbi::message::SbiResponse` (full HTTP/2 response).
 #[derive(Debug, Clone)]
-pub struct SbiResponse {
+pub struct AmfSbiResponse {
     /// HTTP status code
     pub status: u16,
     /// Body content
@@ -271,7 +273,7 @@ impl AmfEvent {
     }
 
     /// Create an SBI server event
-    pub fn sbi_server(stream_id: u64, request: SbiRequest) -> Self {
+    pub fn sbi_server(stream_id: u64, request: AmfSbiRequest) -> Self {
         Self {
             id: AmfEventId::SbiServer,
             timer_id: None,
@@ -294,7 +296,7 @@ impl AmfEvent {
     }
 
     /// Create an SBI client event
-    pub fn sbi_client(response: SbiResponse, data: u64) -> Self {
+    pub fn sbi_client(response: AmfSbiResponse, data: u64) -> Self {
         Self {
             id: AmfEventId::SbiClient,
             timer_id: None,
@@ -590,7 +592,7 @@ mod tests {
 
     #[test]
     fn test_sbi_server_event() {
-        let request = SbiRequest {
+        let request = AmfSbiRequest {
             method: "POST".to_string(),
             uri: "/namf-comm/v1/ue-contexts".to_string(),
             body: None,
@@ -603,7 +605,7 @@ mod tests {
 
     #[test]
     fn test_sbi_client_event() {
-        let response = SbiResponse {
+        let response = AmfSbiResponse {
             status: 200,
             body: None,
         };

@@ -159,7 +159,7 @@ mod tests {
             let mut fsm = AmfFsm::new();
             fsm.init();
             
-            let request = crate::event::SbiRequest {
+            let request = crate::event::AmfSbiRequest {
                 method: "POST".to_string(),
                 uri: "/namf-comm/v1/ue-contexts".to_string(),
                 body: None,
