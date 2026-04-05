@@ -2531,7 +2531,9 @@ dependencies = [
  "ogs-pfcp",
  "ogs-sbi",
  "proptest",
+ "serde",
  "serde_json",
+ "serde_yaml",
  "tokio",
  "uuid",
 ]

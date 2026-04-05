@@ -61,7 +61,7 @@ pub fn sepp_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
         return Err("SBI server already running".to_string());
     }
 
-    let config = config.expect("value expected");
+    let config = config.unwrap_or(SbiServerConfig::default());
 
     log::info!(
         "Opening SEPP SBI server on {}:{}",

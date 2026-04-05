@@ -25,6 +25,7 @@ use ogs_sbi::server::{
     send_bad_request, send_not_found,
     SbiServer, SbiServerConfig as OgsSbiServerConfig,
 };
+use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -67,7 +68,44 @@ static PFCP_SESSIONS: std::sync::LazyLock<std::sync::Mutex<std::collections::Has
 /// never reuse the same sequence number.
 static PFCP_SEQ: AtomicU32 = AtomicU32::new(1);
 
-/// Configuration loaded from YAML
+// ---------------------------------------------------------------------------
+// Typed YAML configuration structs (serde_yaml Deserialize)
+// ---------------------------------------------------------------------------
+
+/// A single server/client address entry
+#[derive(Debug, Deserialize)]
+struct AddrEntry {
+    address: Option<String>,
+    port: Option<u16>,
+    uri: Option<String>,
+}
+
+/// SBI client NRF list
+#[derive(Debug, Default, Deserialize)]
+struct SbiClient {
+    nrf: Option<Vec<AddrEntry>>,
+}
+
+/// SBI section (server list + client)
+#[derive(Debug, Default, Deserialize)]
+struct SbiSection {
+    server: Option<Vec<AddrEntry>>,
+    client: Option<SbiClient>,
+}
+
+/// Top-level `smf:` section
+#[derive(Debug, Default, Deserialize)]
+struct SmfSection {
+    sbi: Option<SbiSection>,
+}
+
+/// Root YAML document
+#[derive(Debug, Default, Deserialize)]
+struct SmfYaml {
+    smf: Option<SmfSection>,
+}
+
+/// Resolved, flat configuration used at runtime
 struct SmfConfig {
     sbi_addr: String,
     sbi_port: u16,
@@ -91,63 +129,31 @@ impl Default for SmfConfig {
 fn load_config(path: &str) -> SmfConfig {
     let mut config = SmfConfig::default();
 
-    if let Ok(content) = std::fs::read_to_string(path) {
-        // Parse YAML configuration - look for sbi.server section
-        let mut in_smf_section = false;
-        let mut in_sbi_section = false;
-        let mut in_sbi_server_section = false;
-        let mut found_sbi_addr = false;
-        let mut found_sbi_port = false;
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("Could not read SMF config '{path}': {e}. Using defaults.");
+            return config;
+        }
+    };
 
-        for line in content.lines() {
-            let trimmed = line.trim();
+    let yaml: SmfYaml = match serde_yaml::from_str(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("Failed to parse SMF YAML config '{path}': {e}. Using defaults.");
+            return config;
+        }
+    };
 
-            // Track which section we're in based on indentation
-            if line.starts_with("smf:") {
-                in_smf_section = true;
-                in_sbi_section = false;
-                in_sbi_server_section = false;
-            } else if in_smf_section && line.starts_with("  sbi:") {
-                in_sbi_section = true;
-                in_sbi_server_section = false;
-            } else if in_smf_section && in_sbi_section && line.starts_with("    server:") {
-                in_sbi_server_section = true;
-            } else if in_smf_section && in_sbi_section && in_sbi_server_section {
-                // Check if we've exited the server section
-                // Server entries start with 6 spaces (for "- address:") or more
-                if !trimmed.is_empty() && !line.starts_with("      ") {
-                    in_sbi_server_section = false;
-                }
-            } else if in_smf_section && in_sbi_section {
-                // Check if we've exited the sbi section
-                // sbi subsections start with 4 spaces
-                if !trimmed.is_empty() && !line.starts_with("    ") && !line.starts_with("  sbi:") {
-                    in_sbi_section = false;
-                }
-            } else if in_smf_section {
-                // Check if we've exited the smf section
-                if !trimmed.is_empty() && !line.starts_with("  ") && !line.starts_with("smf:") {
-                    in_smf_section = false;
-                }
-            }
-
-            // Extract values only from smf.sbi.server section
-            if in_smf_section && in_sbi_section && in_sbi_server_section {
-                if !found_sbi_addr && (trimmed.starts_with("- address:") || trimmed.starts_with("address:")) {
-                    if let Some(addr) = trimmed.split(':').nth(1) {
-                        let addr = addr.trim();
-                        // Skip IPv4/IPv6 addresses with port suffix
-                        if !addr.contains(':') {
-                            config.sbi_addr = addr.to_string();
-                            found_sbi_addr = true;
-                        }
+    if let Some(smf) = yaml.smf {
+        if let Some(sbi) = smf.sbi {
+            if let Some(servers) = sbi.server {
+                if let Some(first) = servers.into_iter().next() {
+                    if let Some(addr) = first.address {
+                        config.sbi_addr = addr;
                     }
-                } else if !found_sbi_port && trimmed.starts_with("port:") {
-                    if let Some(port) = trimmed.split(':').nth(1) {
-                        if let Ok(p) = port.trim().parse() {
-                            config.sbi_port = p;
-                            found_sbi_port = true;
-                        }
+                    if let Some(port) = first.port {
+                        config.sbi_port = port;
                     }
                 }
             }

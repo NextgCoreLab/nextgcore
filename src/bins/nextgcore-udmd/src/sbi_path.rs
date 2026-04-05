@@ -42,7 +42,7 @@ static SBI_RUNNING: AtomicBool = AtomicBool::new(false);
 ///
 /// Port of udm_sbi_open()
 pub fn udm_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
-    let config = config.expect("value expected");
+    let config = config.unwrap_or(SbiServerConfig::default());
 
     log::info!("Opening UDM SBI server on {}:{}", config.addr, config.port);
 

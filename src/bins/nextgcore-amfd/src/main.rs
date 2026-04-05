@@ -28,11 +28,79 @@ mod property_tests;
 
 use anyhow::Result;
 use clap::Parser;
+use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
-use serde_yaml::Value;
+
+// ---------------------------------------------------------------------------
+// Typed YAML configuration structs
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize)]
+struct PlmnIdYaml {
+    mcc: Option<serde_yaml::Value>,
+    mnc: Option<serde_yaml::Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AmfIdYaml {
+    region: Option<u8>,
+    set: Option<u16>,
+    pointer: Option<u8>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GuamiYaml {
+    plmn_id: Option<PlmnIdYaml>,
+    amf_id: Option<AmfIdYaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TaiYaml {
+    plmn_id: Option<PlmnIdYaml>,
+    tac: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SNssaiYaml {
+    sst: Option<u8>,
+    sd: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PlmnSupportYaml {
+    plmn_id: Option<PlmnIdYaml>,
+    s_nssai: Option<Vec<SNssaiYaml>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SecurityYaml {
+    integrity_order: Option<Vec<String>>,
+    ciphering_order: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct NetworkNameYaml {
+    full: Option<String>,
+    short: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AmfSection {
+    amf_name: Option<String>,
+    network_name: Option<NetworkNameYaml>,
+    guami: Option<Vec<GuamiYaml>>,
+    tai: Option<Vec<TaiYaml>>,
+    plmn_support: Option<Vec<PlmnSupportYaml>>,
+    security: Option<SecurityYaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AmfYaml {
+    amf: Option<AmfSection>,
+}
 
 /// NextGCore AMF - Access and Mobility Management Function
 #[derive(Parser, Debug)]
@@ -113,7 +181,6 @@ impl AmfApp {
     async fn load_config(&self, config_path: &str) -> Result<()> {
         log::info!("Loading configuration from: {config_path}");
 
-        // Read and parse YAML file
         let config_content = match std::fs::read_to_string(config_path) {
             Ok(content) => content,
             Err(e) => {
@@ -122,176 +189,163 @@ impl AmfApp {
             }
         };
 
-        let yaml: Value = serde_yaml::from_str(&config_content)
-            .map_err(|e| anyhow::anyhow!("Failed to parse YAML config: {e}"))?;
+        let yaml: AmfYaml = match serde_yaml::from_str(&config_content) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("Failed to parse YAML config '{config_path}': {e}. Using defaults.");
+                return Ok(());
+            }
+        };
 
-        // Get AMF section
-        let amf_section = match yaml.get("amf") {
-            Some(section) => section,
+        let amf_section = match yaml.amf {
+            Some(s) => s,
             None => {
                 log::warn!("No 'amf' section in config file");
                 return Ok(());
             }
         };
 
-        // Load configuration into context
-        {
-            let mut ctx = self.amf_context.write().await;
+        let mut ctx = self.amf_context.write().await;
 
-            // Load AMF name
-            if let Some(name) = amf_section.get("amf_name").and_then(|v| v.as_str()) {
-                ctx.amf_name = Some(name.to_string());
-                log::info!("AMF name: {name}");
-            }
-
-            // Load network name
-            if let Some(network_name) = amf_section.get("network_name") {
-                if let Some(full) = network_name.get("full").and_then(|v| v.as_str()) {
-                    ctx.full_name = context::NetworkName { name: full.to_string() };
-                }
-                if let Some(short) = network_name.get("short").and_then(|v| v.as_str()) {
-                    ctx.short_name = context::NetworkName { name: short.to_string() };
-                }
-            }
-
-            // Load GUAMI list
-            if let Some(guami_list) = amf_section.get("guami").and_then(|v| v.as_sequence()) {
-                for guami_entry in guami_list {
-                    if let Some(guami) = Self::parse_guami(guami_entry) {
-                        log::info!(
-                            "Configured GUAMI: PLMN {}{}{}-{}{}{}, AMF Region={}, Set={}",
-                            guami.plmn_id.mcc1, guami.plmn_id.mcc2, guami.plmn_id.mcc3,
-                            guami.plmn_id.mnc1, guami.plmn_id.mnc2,
-                            if guami.plmn_id.mnc3 == 0xf { "".to_string() } else { guami.plmn_id.mnc3.to_string() },
-                            guami.amf_id.region, guami.amf_id.set
-                        );
-                        ctx.served_guami.push(guami);
-                        ctx.num_of_served_guami += 1;
-                    }
-                }
-            }
-
-            // Load TAI list
-            if let Some(tai_list) = amf_section.get("tai").and_then(|v| v.as_sequence()) {
-                for tai_entry in tai_list {
-                    if let Some(served_tai) = Self::parse_tai(tai_entry) {
-                        let tac = served_tai.list0.tac.first().copied().unwrap_or(0);
-                        log::info!(
-                            "Configured TAI: PLMN {}{}{}-{}{}{}, TAC={}",
-                            served_tai.list0.plmn_id.mcc1, served_tai.list0.plmn_id.mcc2, served_tai.list0.plmn_id.mcc3,
-                            served_tai.list0.plmn_id.mnc1, served_tai.list0.plmn_id.mnc2,
-                            if served_tai.list0.plmn_id.mnc3 == 0xf { "".to_string() } else { served_tai.list0.plmn_id.mnc3.to_string() },
-                            tac
-                        );
-                        ctx.served_tai.push(served_tai);
-                        ctx.num_of_served_tai += 1;
-                    }
-                }
-            }
-
-            // Load PLMN support
-            if let Some(plmn_list) = amf_section.get("plmn_support").and_then(|v| v.as_sequence()) {
-                for plmn_entry in plmn_list {
-                    if let Some(plmn_support) = Self::parse_plmn_support(plmn_entry) {
-                        log::info!(
-                            "Configured PLMN support: PLMN {}{}{}-{}{}{}, {} S-NSSAIs",
-                            plmn_support.plmn_id.mcc1, plmn_support.plmn_id.mcc2, plmn_support.plmn_id.mcc3,
-                            plmn_support.plmn_id.mnc1, plmn_support.plmn_id.mnc2,
-                            if plmn_support.plmn_id.mnc3 == 0xf { "".to_string() } else { plmn_support.plmn_id.mnc3.to_string() },
-                            plmn_support.num_of_s_nssai
-                        );
-                        ctx.plmn_support.push(plmn_support);
-                        ctx.num_of_plmn_support += 1;
-                    }
-                }
-            }
-
-            // Load security algorithms
-            if let Some(security) = amf_section.get("security") {
-                if let Some(integrity_order) = security.get("integrity_order").and_then(|v| v.as_sequence()) {
-                    for algo in integrity_order {
-                        if let Some(algo_str) = algo.as_str() {
-                            let algo_id = Self::parse_integrity_algorithm(algo_str);
-                            ctx.integrity_order.push(algo_id);
-                            ctx.num_of_integrity_order += 1;
-                        }
-                    }
-                }
-                if let Some(ciphering_order) = security.get("ciphering_order").and_then(|v| v.as_sequence()) {
-                    for algo in ciphering_order {
-                        if let Some(algo_str) = algo.as_str() {
-                            let algo_id = Self::parse_ciphering_algorithm(algo_str);
-                            ctx.ciphering_order.push(algo_id);
-                            ctx.num_of_ciphering_order += 1;
-                        }
-                    }
-                }
-            }
-
-            log::info!(
-                "AMF configuration loaded: {} GUAMI, {} TAI, {} PLMN support",
-                ctx.num_of_served_guami, ctx.num_of_served_tai, ctx.num_of_plmn_support
-            );
+        // AMF name
+        if let Some(name) = amf_section.amf_name {
+            log::info!("AMF name: {name}");
+            ctx.amf_name = Some(name);
         }
+
+        // Network name
+        if let Some(nn) = amf_section.network_name {
+            if let Some(full) = nn.full {
+                ctx.full_name = context::NetworkName { name: full };
+            }
+            if let Some(short) = nn.short {
+                ctx.short_name = context::NetworkName { name: short };
+            }
+        }
+
+        // GUAMI list
+        for entry in amf_section.guami.unwrap_or_default() {
+            if let Some(guami) = Self::resolve_guami(entry) {
+                log::info!(
+                    "Configured GUAMI: PLMN {}{}{}-{}{}{}, AMF Region={}, Set={}",
+                    guami.plmn_id.mcc1, guami.plmn_id.mcc2, guami.plmn_id.mcc3,
+                    guami.plmn_id.mnc1, guami.plmn_id.mnc2,
+                    if guami.plmn_id.mnc3 == 0xf { String::new() } else { guami.plmn_id.mnc3.to_string() },
+                    guami.amf_id.region, guami.amf_id.set
+                );
+                ctx.served_guami.push(guami);
+                ctx.num_of_served_guami += 1;
+            }
+        }
+
+        // TAI list
+        for entry in amf_section.tai.unwrap_or_default() {
+            if let Some(served_tai) = Self::resolve_tai(entry) {
+                let tac = served_tai.list0.tac.first().copied().unwrap_or(0);
+                log::info!(
+                    "Configured TAI: PLMN {}{}{}-{}{}{}, TAC={}",
+                    served_tai.list0.plmn_id.mcc1, served_tai.list0.plmn_id.mcc2,
+                    served_tai.list0.plmn_id.mcc3,
+                    served_tai.list0.plmn_id.mnc1, served_tai.list0.plmn_id.mnc2,
+                    if served_tai.list0.plmn_id.mnc3 == 0xf { String::new() } else { served_tai.list0.plmn_id.mnc3.to_string() },
+                    tac
+                );
+                ctx.served_tai.push(served_tai);
+                ctx.num_of_served_tai += 1;
+            }
+        }
+
+        // PLMN support
+        for entry in amf_section.plmn_support.unwrap_or_default() {
+            if let Some(plmn_support) = Self::resolve_plmn_support(entry) {
+                log::info!(
+                    "Configured PLMN support: PLMN {}{}{}-{}{}{}, {} S-NSSAIs",
+                    plmn_support.plmn_id.mcc1, plmn_support.plmn_id.mcc2,
+                    plmn_support.plmn_id.mcc3,
+                    plmn_support.plmn_id.mnc1, plmn_support.plmn_id.mnc2,
+                    if plmn_support.plmn_id.mnc3 == 0xf { String::new() } else { plmn_support.plmn_id.mnc3.to_string() },
+                    plmn_support.num_of_s_nssai
+                );
+                ctx.plmn_support.push(plmn_support);
+                ctx.num_of_plmn_support += 1;
+            }
+        }
+
+        // Security algorithms
+        if let Some(security) = amf_section.security {
+            for algo_str in security.integrity_order.unwrap_or_default() {
+                let algo_id = Self::parse_integrity_algorithm(&algo_str);
+                ctx.integrity_order.push(algo_id);
+                ctx.num_of_integrity_order += 1;
+            }
+            for algo_str in security.ciphering_order.unwrap_or_default() {
+                let algo_id = Self::parse_ciphering_algorithm(&algo_str);
+                ctx.ciphering_order.push(algo_id);
+                ctx.num_of_ciphering_order += 1;
+            }
+        }
+
+        log::info!(
+            "AMF configuration loaded: {} GUAMI, {} TAI, {} PLMN support",
+            ctx.num_of_served_guami, ctx.num_of_served_tai, ctx.num_of_plmn_support
+        );
 
         Ok(())
     }
 
-    /// Parse PLMN ID from YAML
-    fn parse_plmn_id(plmn_value: Option<&Value>) -> Option<context::PlmnId> {
-        let plmn = plmn_value?;
-        let mcc = plmn.get("mcc").and_then(|v| {
-            v.as_u64().map(|n| n.to_string()).or_else(|| v.as_str().map(|s| s.to_string()))
+    /// Resolve a PLMN ID from the typed YAML struct (mcc/mnc may be int or string)
+    fn resolve_plmn_id(plmn: PlmnIdYaml) -> Option<context::PlmnId> {
+        let mcc = plmn.mcc.and_then(|v| match v {
+            serde_yaml::Value::Number(n) => n.as_u64().map(|x| x.to_string()),
+            serde_yaml::Value::String(s) => Some(s),
+            _ => None,
         })?;
-        let mnc = plmn.get("mnc").and_then(|v| {
-            v.as_u64().map(|n| n.to_string()).or_else(|| v.as_str().map(|s| s.to_string()))
+        let mnc = plmn.mnc.and_then(|v| match v {
+            serde_yaml::Value::Number(n) => n.as_u64().map(|x| x.to_string()),
+            serde_yaml::Value::String(s) => Some(s),
+            _ => None,
         })?;
-
         Some(context::PlmnId::new(&mcc, &mnc))
     }
 
-    /// Parse GUAMI from YAML entry
-    fn parse_guami(entry: &Value) -> Option<context::Guami> {
-        let plmn_id = Self::parse_plmn_id(entry.get("plmn_id"))?;
-
-        let amf_id_section = entry.get("amf_id")?;
-        let region = amf_id_section.get("region").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
-        let set = amf_id_section.get("set").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
-        let pointer = amf_id_section.get("pointer").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
-
+    /// Build a runtime Guami from its typed YAML representation
+    fn resolve_guami(entry: GuamiYaml) -> Option<context::Guami> {
+        let plmn_id = Self::resolve_plmn_id(entry.plmn_id?)?;
+        let amf_id_yaml = entry.amf_id.unwrap_or_default();
         Some(context::Guami {
             plmn_id,
-            amf_id: context::AmfId { region, set, pointer },
+            amf_id: context::AmfId {
+                region: amf_id_yaml.region.unwrap_or(0),
+                set: amf_id_yaml.set.unwrap_or(0),
+                pointer: amf_id_yaml.pointer.unwrap_or(0),
+            },
         })
     }
 
-    /// Parse TAI from YAML entry
-    fn parse_tai(entry: &Value) -> Option<context::ServedTai> {
-        let plmn_id = Self::parse_plmn_id(entry.get("plmn_id"))?;
-        let tac = entry.get("tac").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-
+    /// Build a runtime ServedTai from its typed YAML representation
+    fn resolve_tai(entry: TaiYaml) -> Option<context::ServedTai> {
+        let plmn_id = Self::resolve_plmn_id(entry.plmn_id?)?;
         Some(context::ServedTai {
             list0: context::Tai0List {
                 plmn_id,
-                tac: vec![tac],
+                tac: vec![entry.tac.unwrap_or(0)],
             },
             ..Default::default()
         })
     }
 
-    /// Parse PLMN support from YAML entry
-    fn parse_plmn_support(entry: &Value) -> Option<context::PlmnSupport> {
-        let plmn_id = Self::parse_plmn_id(entry.get("plmn_id"))?;
-
-        let mut s_nssai_list = Vec::new();
-        if let Some(s_nssai_array) = entry.get("s_nssai").and_then(|v| v.as_sequence()) {
-            for s_nssai_entry in s_nssai_array {
-                let sst = s_nssai_entry.get("sst").and_then(|v| v.as_u64()).unwrap_or(1) as u8;
-                let sd = s_nssai_entry.get("sd").and_then(|v| v.as_u64()).map(|n| n as u32);
-                s_nssai_list.push(context::SNssai { sst, sd });
-            }
-        }
-
+    /// Build a runtime PlmnSupport from its typed YAML representation
+    fn resolve_plmn_support(entry: PlmnSupportYaml) -> Option<context::PlmnSupport> {
+        let plmn_id = Self::resolve_plmn_id(entry.plmn_id?)?;
+        let s_nssai_list: Vec<context::SNssai> = entry
+            .s_nssai
+            .unwrap_or_default()
+            .into_iter()
+            .map(|n| context::SNssai {
+                sst: n.sst.unwrap_or(1),
+                sd: n.sd,
+            })
+            .collect();
         let num_of_s_nssai = s_nssai_list.len();
         Some(context::PlmnSupport {
             plmn_id,
