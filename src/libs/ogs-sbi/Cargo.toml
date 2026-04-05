@@ -6,6 +6,11 @@ authors.workspace = true
 license.workspace = true
 description = "NextGCore SBI (Service Based Interface) Library"
 
+[features]
+## Gate 6G research modules (gRPC/SBI-2.0, event pub-sub).
+## Enable with: cargo build -p ogs-sbi --features 6g-extensions
+6g-extensions = []
+
 [dependencies]
 ogs-core = { workspace = true }
 log.workspace = true

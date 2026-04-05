@@ -46,7 +46,9 @@ pub mod tls;
 pub mod types;
 pub mod scp;
 pub mod heartbeat;
+#[cfg(feature = "6g-extensions")]
 pub mod grpc;    // SBI 2.0 gRPC support (B6.1)
+#[cfg(feature = "6g-extensions")]
 pub mod pubsub;  // Event-driven pub-sub (B6.1)
 
 pub mod client;
@@ -81,10 +83,12 @@ pub use security::{
     NrfSecurityConfig, PqcKeyExchange, PqcSignature, PqcTlsConfig, SbiSecurityPolicy,
     TlsPaths, TlsVersion, authorize_sbi_request, extract_bearer_token, validate_bearer_token,
 };
+#[cfg(feature = "6g-extensions")]
 pub use grpc::{
     GrpcConfig, GrpcMetadata, GrpcMethod, GrpcServiceType, GrpcStatus,
     GrpcServiceRegistry,
 };
+#[cfg(feature = "6g-extensions")]
 pub use pubsub::{
     EventBroker, EventFilter, SbiEvent, SbiEventCategory, Subscription, SubscriptionId,
     EventReplayBuffer,

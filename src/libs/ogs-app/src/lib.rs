@@ -9,7 +9,9 @@ pub mod yaml;
 pub mod config;
 pub mod context;
 pub mod init;
+#[cfg(feature = "6g-extensions")]
 pub mod intent;  // B3.2: Intent-based configuration translation
+#[cfg(feature = "6g-extensions")]
 pub mod nf_hooks; // #197: Cross-NF AI/ML hooks, digital twin, energy, intent API
 
 #[cfg(test)]
@@ -34,7 +36,9 @@ pub use context::{
 pub use init::{
     InitError, CommandLineOptions, OgsAppInitializer,
     ogs_app_initialize, ogs_app_terminate, ogs_app_config_read,
+    nf_common_init,
 };
+#[cfg(feature = "6g-extensions")]
 pub use intent::{
     NetworkIntent, IntentTranslator, IntentError, IntentResult,
     IntentPriority, SliceIntent, QosIntent, SecurityIntent, EnergyIntent,
@@ -43,6 +47,7 @@ pub use intent::{
     IntentState, ManagedIntent, IntentLifecycleManager,
 };
 
+#[cfg(feature = "6g-extensions")]
 pub use nf_hooks::{
     AiMlHookPoint, AiMlHookAction, AiMlHook, AiMlHookRegistry,
     NfStateSnapshot, NfStatus, DigitalTwinExporter,
