@@ -368,6 +368,149 @@ services:
         condition: service_healthy
 
   # ==========================================================================
+  # Rel-17/20 Advanced NFs
+  # ==========================================================================
+  nwdaf:
+    image: nextgcore-rust/nwdaf:latest
+    container_name: nextgcore-nwdaf
+    <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+    command: ["--sbi-addr", "0.0.0.0", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
+    volumes:
+      - ./configs/5gc/nwdaf.yaml:/etc/nextgcore/nwdaf.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.30
+    depends_on:
+      nrf:
+        condition: service_healthy
+
+  ees:
+    image: nextgcore-rust/ees:latest
+    container_name: nextgcore-ees
+    <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+    command: ["--sbi-addr", "0.0.0.0", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
+    volumes:
+      - ./configs/5gc/ees.yaml:/etc/nextgcore/ees.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.31
+    depends_on:
+      nrf:
+        condition: service_healthy
+
+  lmf:
+    image: nextgcore-rust/lmf:latest
+    container_name: nextgcore-lmf
+    <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+    command: ["--sbi-addr", "0.0.0.0", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
+    volumes:
+      - ./configs/5gc/lmf.yaml:/etc/nextgcore/lmf.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.32
+    depends_on:
+      nrf:
+        condition: service_healthy
+
+  mbsmf:
+    image: nextgcore-rust/mbsmf:latest
+    container_name: nextgcore-mbsmf
+    <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+    command: ["--sbi-addr", "0.0.0.0", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
+    volumes:
+      - ./configs/5gc/mbsmf.yaml:/etc/nextgcore/mbsmf.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.33
+    depends_on:
+      nrf:
+        condition: service_healthy
+
+  nsacf:
+    image: nextgcore-rust/nsacf:latest
+    container_name: nextgcore-nsacf
+    <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+    command: ["--sbi-addr", "0.0.0.0", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
+    volumes:
+      - ./configs/5gc/nsacf.yaml:/etc/nextgcore/nsacf.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.34
+    depends_on:
+      nrf:
+        condition: service_healthy
+
+  pin:
+    image: nextgcore-rust/pin:latest
+    container_name: nextgcore-pin
+    <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+    command: ["--sbi-addr", "0.0.0.0", "--sbi-port", "7815", "--nrf-uri", "http://172.23.0.10:7777"]
+    volumes:
+      - ./configs/5gc/pin.yaml:/etc/nextgcore/pin.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.35
+    depends_on:
+      nrf:
+        condition: service_healthy
+
+  dccf:
+    image: nextgcore-rust/dccf:latest
+    container_name: nextgcore-dccf
+    <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+    command: ["--sbi-addr", "0.0.0.0", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
+    volumes:
+      - ./configs/5gc/dccf.yaml:/etc/nextgcore/dccf.yaml:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.36
+    depends_on:
+      nrf:
+        condition: service_healthy
+
+  scp:
+    image: nextgcore-rust/scp:latest
+    container_name: nextgcore-scp
+    <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+    command: ["--sbi-addr", "0.0.0.0", "--sbi-port", "7777"]
+    networks:
+      core:
+        ipv4_address: 172.23.0.37
+    depends_on:
+      nrf:
+        condition: service_healthy
+
+  sepp:
+    image: nextgcore-rust/sepp:latest
+    container_name: nextgcore-sepp
+    <<: [*common, *nf-healthcheck]
+    environment:
+      <<: *common-env
+    command: ["--sbi-addr", "0.0.0.0", "--sbi-port", "7777"]
+    networks:
+      core:
+        ipv4_address: 172.23.0.38
+    depends_on:
+      nrf:
+        condition: service_healthy
+
+  # ==========================================================================
   # Observability (Items 120-123)
   # ==========================================================================
   prometheus:
