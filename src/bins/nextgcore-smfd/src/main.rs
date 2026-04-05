@@ -59,10 +59,6 @@ use smf_sm::SmfFsm;
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-/// Session state: stores UPF SEID per sm_context_ref for PFCP modifications
-static PFCP_SESSIONS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
 /// Monotonically-increasing PFCP sequence number counter.
 /// Each transaction fetches-and-increments this so concurrent PDU sessions
 /// never reuse the same sequence number.
@@ -1086,10 +1082,12 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 result.upf_seid, result.upf_teid,
                 result.upf_addr[0], result.upf_addr[1], result.upf_addr[2], result.upf_addr[3]
             );
-            // Store UPF SEID for later PFCP modifications
-            if let Ok(mut sessions) = PFCP_SESSIONS.lock() {
-                sessions.insert(sm_context_ref.to_string(), result.upf_seid);
-                log::debug!("Stored UPF SEID=0x{:016x} for sm_context_ref={}", result.upf_seid, sm_context_ref);
+            // Store UPF SEID for later PFCP modifications (in SmfContext, not a global)
+            if let Ok(ctx) = smf_self().read() {
+                if let Ok(mut sessions) = ctx.pfcp_sessions.write() {
+                    sessions.insert(sm_context_ref.to_string(), result.upf_seid);
+                    log::debug!("Stored UPF SEID=0x{:016x} for sm_context_ref={}", result.upf_seid, sm_context_ref);
+                }
             }
             (result.upf_teid, result.upf_addr)
         }
@@ -1168,9 +1166,10 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                     );
 
                     // Send PFCP Session Modification to UPF: activate DL FAR with gNB TEID
-                    // Retrieve the real UPF SEID stored during establishment
-                    let upf_seid = PFCP_SESSIONS.lock().ok()
-                        .and_then(|sessions| sessions.get(sm_context_ref).copied())
+                    // Retrieve the real UPF SEID stored during establishment (from SmfContext)
+                    let upf_seid = smf_self().read().ok()
+                        .and_then(|ctx| ctx.pfcp_sessions.read().ok()
+                            .and_then(|sessions| sessions.get(sm_context_ref).copied()))
                         .unwrap_or_else(|| {
                             log::warn!("No stored UPF SEID for ref={sm_context_ref}, using fallback");
                             sm_context_ref.parse::<u64>().unwrap_or(1)
@@ -1219,9 +1218,10 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             psi, n1_sm_msg.len()
         );
 
-        // Look up UPF SEID for PFCP session modification with updated QoS
-        let upf_seid = PFCP_SESSIONS.lock().ok()
-            .and_then(|sessions| sessions.get(sm_context_ref).copied());
+        // Look up UPF SEID for PFCP session modification with updated QoS (from SmfContext)
+        let upf_seid = smf_self().read().ok()
+            .and_then(|ctx| ctx.pfcp_sessions.read().ok()
+                .and_then(|sessions| sessions.get(sm_context_ref).copied()));
 
         if let Some(seid) = upf_seid {
             // Send PFCP Session Modification to UPF with QoS update
@@ -1331,9 +1331,10 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
 async fn handle_sm_context_release(sm_context_ref: &str) -> SbiResponse {
     log::info!("SM Context Release request for ref={sm_context_ref}");
 
-    // Look up UPF SEID for this session
-    let upf_seid = PFCP_SESSIONS.lock().ok()
-        .and_then(|sessions| sessions.get(sm_context_ref).copied());
+    // Look up UPF SEID for this session (from SmfContext, not a global)
+    let upf_seid = smf_self().read().ok()
+        .and_then(|ctx| ctx.pfcp_sessions.read().ok()
+            .and_then(|sessions| sessions.get(sm_context_ref).copied()));
 
     if let Some(seid) = upf_seid {
         // Send PFCP Session Deletion Request to UPF
@@ -1350,8 +1351,10 @@ async fn handle_sm_context_release(sm_context_ref: &str) -> SbiResponse {
         }
 
         // Remove from PFCP sessions map
-        if let Ok(mut sessions) = PFCP_SESSIONS.lock() {
-            sessions.remove(sm_context_ref);
+        if let Ok(ctx) = smf_self().read() {
+            if let Ok(mut sessions) = ctx.pfcp_sessions.write() {
+                sessions.remove(sm_context_ref);
+            }
         }
     } else {
         log::warn!("No PFCP session found for sm_context_ref={sm_context_ref}");

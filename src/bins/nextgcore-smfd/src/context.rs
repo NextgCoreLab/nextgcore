@@ -1426,6 +1426,13 @@ pub struct SmfContext {
 
     /// Context initialized flag
     initialized: AtomicBool,
+
+    /// PFCP session map: sm_context_ref -> UPF SEID
+    ///
+    /// Previously a standalone global (`PFCP_SESSIONS`). Moved here so that
+    /// test code can construct isolated `SmfContext` instances and avoid
+    /// cross-test contamination from a process-wide singleton.
+    pub pfcp_sessions: RwLock<HashMap<String, u64>>,
 }
 
 impl SmfContext {
@@ -1470,6 +1477,7 @@ impl SmfContext {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(std::net::Ipv4Addr::new(127, 0, 0, 1)),
             initialized: AtomicBool::new(false),
+            pfcp_sessions: RwLock::new(HashMap::new()),
         }
     }
 

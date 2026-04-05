@@ -294,6 +294,54 @@ pub fn global_context() -> Arc<SbiContext> {
         .clone()
 }
 
+impl SbiContext {
+    /// Create a fresh, independent `SbiContext` that is **not** the global
+    /// singleton.
+    ///
+    /// Use this in tests to obtain a context whose NF-instance registry and
+    /// discovery table are fully isolated from other tests and from the
+    /// production singleton.
+    ///
+    /// # Example
+    /// ```
+    /// # use ogs_sbi::context::SbiContext;
+    /// let ctx = SbiContext::new_isolated();
+    /// // ctx is independent — changes here never affect global_context()
+    /// ```
+    pub fn new_isolated() -> Arc<SbiContext> {
+        Arc::new(SbiContext::new())
+    }
+}
+
+/// Reset the global SBI context to an empty state.
+///
+/// **Only for use in tests.** Because `OnceLock` cannot be replaced on stable
+/// Rust, this clears the contents of the already-initialised singleton through
+/// its internal `RwLock`s rather than re-creating the lock.  Call this in
+/// `#[cfg(test)]` teardown so that NF instances and clients registered during
+/// one test do not bleed into subsequent ones.
+///
+/// Note: if the global singleton has not been initialised yet this is a no-op.
+#[cfg(any(test, feature = "test-helpers"))]
+pub async fn global_context_reset() {
+    if let Some(ctx) = GLOBAL_CONTEXT.get() {
+        ctx.clear_nf_instances().await;
+        ctx.clear_clients().await;
+        {
+            let mut subscriptions = ctx.subscriptions.write().await;
+            subscriptions.clear();
+        }
+        {
+            let mut self_instance = ctx.self_instance.write().await;
+            *self_instance = None;
+        }
+        {
+            let mut nrf_uri = ctx.nrf_uri.write().await;
+            *nrf_uri = None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

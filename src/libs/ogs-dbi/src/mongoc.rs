@@ -206,6 +206,56 @@ pub fn get_subscriber_collection() -> DbiResult<Collection<Document>> {
         .ok_or(DbiError::NotInitialized)
 }
 
+impl OgsDbi {
+    /// Construct a pre-initialised `OgsDbi` from an existing MongoDB `Client`.
+    ///
+    /// Intended for unit/integration tests: callers supply a real or mocked
+    /// client directly instead of going through the global `OnceLock`.  The
+    /// returned value is **not** injected into the global singleton, so it
+    /// provides full test isolation.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let client = Client::with_uri_str("mongodb://localhost:27017")?;
+    /// let dbi = OgsDbi::with_client(client, "test_db");
+    /// ```
+    pub fn with_client(client: Client, db_name: impl Into<String>) -> Self {
+        let db_name = db_name.into();
+        let database = client.database(&db_name);
+        let subscriber_collection = client
+            .database(&db_name)
+            .collection::<Document>("subscribers");
+        OgsDbi {
+            mongoc: OgsMongoc {
+                initialized: true,
+                name: db_name,
+                client: Some(client),
+                database: Some(database),
+                masked_db_uri: None,
+            },
+            subscriber_collection: Some(subscriber_collection),
+        }
+    }
+}
+
+/// Reset the global database interface to an uninitialised state.
+///
+/// **Only for use in tests.** Because `OnceLock` cannot be reset on stable
+/// Rust, this replaces the inner `OgsDbi` contents through the Mutex rather
+/// than re-creating the lock.  Call this in `#[cfg(test)]` teardown to prevent
+/// state from leaking between test cases.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn reset_for_tests() {
+    let dbi = ogs_mongoc();
+    let mut guard = dbi.lock().unwrap();
+    guard.subscriber_collection = None;
+    guard.mongoc.database = None;
+    guard.mongoc.client = None;
+    guard.mongoc.masked_db_uri = None;
+    guard.mongoc.initialized = false;
+    guard.mongoc.name = String::new();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
