@@ -101,51 +101,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
-name = "asn1-codecs"
-version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65f48d56acf2166241cab989a4d356c9bf50ddbbd3733ba5725dbdf579e94767"
-dependencies = [
- "bitvec",
- "log",
- "proc-macro2",
- "syn 1.0.109",
-]
-
-[[package]]
-name = "asn1-compiler"
-version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6f9b64c8cf0a213ff6fa91270a6b520013135b1a9936b28f47b91fc19357e6a"
-dependencies = [
- "anyhow",
- "bitvec",
- "clap",
- "env_logger 0.10.2",
- "heck 0.4.1",
- "lazy_static",
- "log",
- "proc-macro2",
- "quote",
- "regex",
- "topological-sort",
-]
-
-[[package]]
-name = "asn1_codecs_derive"
-version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "578cabff8e9458470d7018b539e905b9385bfa38bad68de0e5c3f60088717504"
-dependencies = [
- "asn1-codecs",
- "bitvec",
- "log",
- "proc-macro2",
- "quote",
- "syn 1.0.109",
-]
-
-[[package]]
 name = "async-attributes"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1063,19 +1018,6 @@ dependencies = [
 
 [[package]]
 name = "env_logger"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cd405aab171cb85d6735e5c8d9db038c17d3ca007a4d2c25f337935c3d90580"
-dependencies = [
- "humantime",
- "is-terminal",
- "log",
- "regex",
- "termcolor",
-]
-
-[[package]]
-name = "env_logger"
 version = "0.11.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c863f0904021b108aa8b2f55046443e6b1ebde8fd4a15c399893aae4fa069f"
@@ -1424,12 +1366,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fbf6a919d6cf397374f7dfeeea91d974c7c0a7221d0d0f4f20d859d329e53fcc"
 
 [[package]]
-name = "hermit-abi"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
-
-[[package]]
 name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1509,12 +1445,6 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
-
-[[package]]
-name = "humantime"
-version = "2.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "135b12329e5e3ce057a9f972339ea52bc954fe1e9358ef27f95e89716fbc5424"
 
 [[package]]
 name = "hybrid-array"
@@ -1785,17 +1715,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "469fb0b9cefa57e3ef31275ee7cacb78f2fdca44e4765491884a2b119d4eb130"
 
 [[package]]
-name = "is-terminal"
-version = "0.4.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
-dependencies = [
- "hermit-abi 0.5.2",
- "libc",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1958,15 +1877,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "matchers"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
-dependencies = [
- "regex-automata",
-]
-
-[[package]]
 name = "matches"
 version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2122,15 +2032,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
- "bitvec",
  "bytes",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "hex",
  "log",
- "nextgsim-ngap",
  "ogs-app",
+ "ogs-asn1c",
  "ogs-core",
  "ogs-crypt",
  "ogs-metrics",
@@ -2155,7 +2064,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "hmac",
  "log",
  "ogs-app",
@@ -2178,7 +2087,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2198,7 +2107,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2217,7 +2126,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2237,7 +2146,7 @@ dependencies = [
  "bytes",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2257,7 +2166,7 @@ dependencies = [
  "async-trait",
  "bson",
  "bytes",
- "env_logger 0.11.8",
+ "env_logger",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -2290,7 +2199,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2309,7 +2218,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "hex",
  "log",
  "ogs-app",
@@ -2330,7 +2239,7 @@ dependencies = [
  "bytes",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2352,7 +2261,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2371,7 +2280,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2390,7 +2299,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2411,7 +2320,7 @@ dependencies = [
  "chrono",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2431,7 +2340,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2451,7 +2360,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2469,7 +2378,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2488,7 +2397,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2506,7 +2415,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2525,7 +2434,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2541,7 +2450,7 @@ name = "nextgcore-sgwud"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2560,7 +2469,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2584,7 +2493,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "ogs-app",
  "ogs-core",
@@ -2605,7 +2514,7 @@ dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "ogs-core",
  "ogs-dbi",
@@ -2627,7 +2536,7 @@ dependencies = [
  "bytes",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "libc",
  "log",
  "ogs-app",
@@ -2649,7 +2558,7 @@ dependencies = [
  "axum",
  "clap",
  "ctrlc",
- "env_logger 0.11.8",
+ "env_logger",
  "log",
  "mongodb",
  "ogs-core",
@@ -2658,37 +2567,6 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower-http",
-]
-
-[[package]]
-name = "nextgsim-common"
-version = "0.1.0"
-dependencies = [
- "bitflags 2.10.0",
- "bytes",
- "hex",
- "num_enum",
- "serde",
- "serde_yaml",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "nextgsim-ngap"
-version = "0.1.0"
-dependencies = [
- "asn1-codecs",
- "asn1-compiler",
- "asn1_codecs_derive",
- "bitvec",
- "bytes",
- "log",
- "nextgsim-common",
- "thiserror 1.0.69",
- "tracing",
 ]
 
 [[package]]
@@ -2717,15 +2595,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nu-ansi-term"
-version = "0.50.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
-dependencies = [
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "num-conv"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2738,28 +2607,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "num_enum"
-version = "0.7.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1207a7e20ad57b847bbddc6776b968420d38292bbfe2089accff5e19e82454c"
-dependencies = [
- "num_enum_derive",
- "rustversion",
-]
-
-[[package]]
-name = "num_enum_derive"
-version = "0.7.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff32365de1b6743cb203b710788263c44a03de03802daf96092f2da4fe6ba4d7"
-dependencies = [
- "proc-macro-crate",
- "proc-macro2",
- "quote",
- "syn 2.0.111",
 ]
 
 [[package]]
@@ -2808,7 +2655,7 @@ version = "0.1.0"
 dependencies = [
  "bitflags 2.10.0",
  "bytes",
- "env_logger 0.11.8",
+ "env_logger",
  "libc",
  "log",
  "proptest",
@@ -2981,7 +2828,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
- "env_logger 0.11.8",
+ "env_logger",
  "libc",
  "log",
  "nix 0.29.0",
@@ -3200,15 +3047,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "353e1ca18966c16d9deb1c69278edbc5f194139612772bd9537af60ac231e1e6"
 dependencies = [
  "elliptic-curve",
-]
-
-[[package]]
-name = "proc-macro-crate"
-version = "3.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "219cb19e96be00ab2e37d6e299658a0cfa83e52429179969b0f0121b4ac46983"
-dependencies = [
- "toml_edit",
 ]
 
 [[package]]
@@ -3836,15 +3674,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sharded-slab"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
-dependencies = [
- "lazy_static",
-]
-
-[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4063,15 +3892,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "termcolor"
-version = "1.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
-dependencies = [
- "winapi-util",
-]
-
-[[package]]
 name = "testcontainers"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4135,15 +3955,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.111",
-]
-
-[[package]]
-name = "thread_local"
-version = "1.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
-dependencies = [
- "cfg-if",
 ]
 
 [[package]]
@@ -4265,42 +4076,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "toml_datetime"
-version = "0.7.5+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
-dependencies = [
- "serde_core",
-]
-
-[[package]]
-name = "toml_edit"
-version = "0.23.10+spec-1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84c8b9f757e028cee9fa244aea147aab2a9ec09d5325a9b01e0a49730c2b5269"
-dependencies = [
- "indexmap",
- "toml_datetime",
- "toml_parser",
- "winnow",
-]
-
-[[package]]
-name = "toml_parser"
-version = "1.0.6+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3198b4b0a8e11f09dd03e133c0280504d0801269e9afa46362ffde1cbeebf44"
-dependencies = [
- "winnow",
-]
-
-[[package]]
-name = "topological-sort"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea68304e134ecd095ac6c3574494fc62b909f416c4fca77e440530221e549d3d"
-
-[[package]]
 name = "tower"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4383,36 +4158,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
- "valuable",
-]
-
-[[package]]
-name = "tracing-log"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
-dependencies = [
- "log",
- "once_cell",
- "tracing-core",
-]
-
-[[package]]
-name = "tracing-subscriber"
-version = "0.3.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f30143827ddab0d256fd843b7a66d164e9f271cfa0dde49142c5ca0ca291f1e"
-dependencies = [
- "matchers",
- "nu-ansi-term",
- "once_cell",
- "regex-automata",
- "sharded-slab",
- "smallvec",
- "thread_local",
- "tracing",
- "tracing-core",
- "tracing-log",
 ]
 
 [[package]]
@@ -4569,12 +4314,6 @@ dependencies = [
  "serde_core",
  "wasm-bindgen",
 ]
-
-[[package]]
-name = "valuable"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "value-bag"
@@ -4740,15 +4479,6 @@ name = "winapi-i686-pc-windows-gnu"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac3b87c63620426dd9b991e5ce0329eff545bccbbb34f3be09ff6fb6ab51b7b6"
-
-[[package]]
-name = "winapi-util"
-version = "0.1.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
-dependencies = [
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "winapi-x86_64-pc-windows-gnu"
@@ -5056,15 +4786,6 @@ name = "windows_x86_64_msvc"
 version = "0.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
-
-[[package]]
-name = "winnow"
-version = "0.7.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a5364e9d77fcdeeaa6062ced926ee3381faa2ee02d3eb83a5c27a8825540829"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "winreg"

@@ -1292,10 +1292,14 @@ impl NgapServer {
         );
 
         // Decode the APER-encoded PDU Session Resource Setup Response using ASN.1
-        use nextgsim_ngap::procedures::pdu_session_resource::decode_pdu_session_resource_setup_response;
+        use ogs_ngap::{parser::decode_ngap_pdu, NgapMessage};
 
-        let response_data = match decode_pdu_session_resource_setup_response(data) {
-            Ok(resp) => resp,
+        let response_data = match decode_ngap_pdu(data) {
+            Ok(NgapMessage::PduSessionResourceSetupResponse(resp)) => resp,
+            Ok(other) => {
+                log::warn!("Expected PduSessionResourceSetupResponse, got {other:?}");
+                return Ok(());
+            }
             Err(e) => {
                 log::warn!("Failed to decode PDU Session Resource Setup Response: {e:?}");
                 return Ok(());
@@ -1311,33 +1315,31 @@ impl NgapServer {
         let mut gnb_addr: [u8; 4] = [127, 0, 0, 1];
         let mut pdu_session_id: u8 = 1;
 
-        if let Some(ref setup_list) = response_data.setup_list {
-            for item in setup_list {
-                pdu_session_id = item.pdu_session_id;
-                // Parse transfer: QFI(1) + gNB TEID(4,BE) + addr_type(1) + gNB IPv4(4)
-                if item.transfer.len() >= 10 {
-                    let teid = u32::from_be_bytes([
-                        item.transfer[1], item.transfer[2],
-                        item.transfer[3], item.transfer[4],
-                    ]);
-                    if item.transfer[5] == 1 && item.transfer.len() >= 10 {
-                        gnb_addr = [
-                            item.transfer[6], item.transfer[7],
-                            item.transfer[8], item.transfer[9],
-                        ];
-                    }
-                    gnb_teid = Some(teid);
-                    log::info!(
-                        "Extracted gNB TEID=0x{:08x}, addr={}.{}.{}.{}, QFI={}, PSI={}",
-                        teid, gnb_addr[0], gnb_addr[1], gnb_addr[2], gnb_addr[3],
-                        item.transfer[0], pdu_session_id
-                    );
-                } else {
-                    log::warn!(
-                        "Transfer IE too short for PSI={}: {} bytes",
-                        item.pdu_session_id, item.transfer.len()
-                    );
+        for item in &response_data.setup_list {
+            pdu_session_id = item.pdu_session_id;
+            // Parse transfer: QFI(1) + gNB TEID(4,BE) + addr_type(1) + gNB IPv4(4)
+            if item.transfer.len() >= 10 {
+                let teid = u32::from_be_bytes([
+                    item.transfer[1], item.transfer[2],
+                    item.transfer[3], item.transfer[4],
+                ]);
+                if item.transfer[5] == 1 && item.transfer.len() >= 10 {
+                    gnb_addr = [
+                        item.transfer[6], item.transfer[7],
+                        item.transfer[8], item.transfer[9],
+                    ];
                 }
+                gnb_teid = Some(teid);
+                log::info!(
+                    "Extracted gNB TEID=0x{:08x}, addr={}.{}.{}.{}, QFI={}, PSI={}",
+                    teid, gnb_addr[0], gnb_addr[1], gnb_addr[2], gnb_addr[3],
+                    item.transfer[0], pdu_session_id
+                );
+            } else {
+                log::warn!(
+                    "Transfer IE too short for PSI={}: {} bytes",
+                    item.pdu_session_id, item.transfer.len()
+                );
             }
         }
 
