@@ -23,7 +23,7 @@ pub use types::*;
 pub use mongoc::{
     OgsMongoc, OgsDbi, DbiError, DbiResult,
     ogs_mongoc, ogs_mongoc_init, ogs_mongoc_final,
-    ogs_dbi_init, ogs_dbi_final,
+    ogs_dbi_init, ogs_dbi_init_async, ogs_dbi_final,
 };
 pub use subscription::{
     OgsDbiAuthInfo, ogs_dbi_auth_info, ogs_dbi_update_sqn,

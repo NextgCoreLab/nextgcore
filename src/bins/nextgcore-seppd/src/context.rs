@@ -427,7 +427,7 @@ impl SeppContext {
 
     /// Get all nodes
     pub fn node_list(&self) -> Vec<SeppNode> {
-        self.peer_list.read().map(|l| l.values().cloned().collect()).unwrap_or_default()
+        self.peer_list.read().map(|l| l.values().cloned().collect()).expect("value expected")
     }
 
     /// Get node count

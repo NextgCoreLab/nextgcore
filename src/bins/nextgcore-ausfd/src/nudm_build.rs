@@ -149,7 +149,7 @@ fn get_current_timestamp() -> String {
 
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+        .expect("value expected");
 
     // Format as ISO 8601
     let secs = duration.as_secs();

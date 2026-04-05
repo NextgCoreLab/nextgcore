@@ -398,7 +398,7 @@ impl SbiSpan {
         // Simple span ID generation using timestamp
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_nanos() as u64;
         span_id.copy_from_slice(&now.to_be_bytes());
 

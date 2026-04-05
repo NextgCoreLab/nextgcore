@@ -312,7 +312,7 @@ async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
         let roaming = si_json.get("roamingIndication")
             .and_then(|v| v.as_i64())
             .map(|v| context::RoamingIndication::from_openapi(v as i32))
-            .unwrap_or_default();
+            .expect("value expected");
 
         param.slice_info_for_pdu_session = nnssf_handler::SliceInfoForPduSession {
             presence: true,

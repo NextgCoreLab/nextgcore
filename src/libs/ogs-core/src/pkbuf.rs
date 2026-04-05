@@ -184,7 +184,7 @@ impl OgsPkbuf {
     /// Pull data from head, panics if not enough data
     #[inline]
     pub fn pull_unchecked(&mut self, len: usize) -> &[u8] {
-        self.pull(len).unwrap_or_default()
+        self.pull(len).expect("value expected")
     }
 
     /// Trim buffer to specified length (identical to ogs_pkbuf_trim)
@@ -256,7 +256,7 @@ impl OgsPkbuf {
         // would fail if there are other references. For simplicity, we use
         // unsafe here since the pkbuf owns exclusive write access.
         let cluster = Arc::get_mut(&mut self.cluster)
-            .unwrap_or_default();
+            .expect("exclusive access to cluster");
         &mut cluster.buffer[start..end]
     }
 }

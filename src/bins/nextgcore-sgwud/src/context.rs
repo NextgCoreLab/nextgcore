@@ -375,7 +375,7 @@ impl SgwuContext {
         self.sess_list
             .read()
             .map(|l| l.values().cloned().collect())
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     /// Update session in context

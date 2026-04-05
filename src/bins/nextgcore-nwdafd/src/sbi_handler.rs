@@ -116,7 +116,7 @@ pub async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
+        .expect("value expected")
         .as_secs();
 
     let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());

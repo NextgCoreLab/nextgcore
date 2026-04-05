@@ -139,7 +139,7 @@ pub fn apply_prins_protection(
                                 if let Some(original_value) = obj.remove(field_name) {
                                     // Encrypt the IE value (simplified: XOR-based placeholder)
                                     let encrypted = encrypt_ie(
-                                        &serde_json::to_string(&original_value).unwrap_or_default(),
+                                        &serde_json::to_string(&original_value).expect("value expected"),
                                         &prins_ctx.shared_key,
                                     );
                                     obj.insert(
@@ -165,7 +165,7 @@ pub fn apply_prins_protection(
                             if let Some(obj) = json.as_object() {
                                 if let Some(value) = obj.get(field_name) {
                                     let signature = sign_ie(
-                                        &serde_json::to_string(value).unwrap_or_default(),
+                                        &serde_json::to_string(value).expect("value expected"),
                                         &prins_ctx.shared_key,
                                     );
                                     modifications.push(N32fModification {
@@ -302,7 +302,7 @@ fn decrypt_ie(ciphertext: &str, key: &[u8]) -> String {
         for (i, b) in decoded.iter().enumerate() {
             result.push(b ^ key_bytes[i % key_bytes.len()]);
         }
-        String::from_utf8(result).unwrap_or_default()
+        String::from_utf8(result).expect("value expected")
     } else {
         String::new()
     }
@@ -323,7 +323,7 @@ fn sign_ie(value: &str, key: &[u8]) -> String {
 fn extract_service_name(url: &str) -> String {
     let path = url.split('?').next().unwrap_or(url);
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    parts.first().map(|s| s.to_string()).unwrap_or_default()
+    parts.first().map(|s| s.to_string()).expect("value expected")
 }
 
 /// Simple base64url encode (no padding)
@@ -381,7 +381,7 @@ fn base64url_decode(input: &str) -> Result<Vec<u8>, String> {
 /// Simple random u64 for context ID generation
 fn random_u64() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("value expected");
     now.as_nanos() as u64
 }
 

@@ -292,7 +292,7 @@ impl NsacfContext {
                     .map(|q| (q.s_nssai.clone(), q.ue_utilization()))
                     .collect()
             })
-            .unwrap_or_default()
+            .expect("value expected")
     }
 }
 

@@ -1,0 +1,13 @@
+# DCCF (Data Collection Co-ordination Function) Configuration
+logger:
+  level: info
+
+dccf:
+  sbi:
+    server:
+      - address: 0.0.0.0
+        advertise: 172.23.0.36
+        port: 7777
+  nrf:
+    uri: http://172.23.0.10:7777
+  max_subscriptions: 4096

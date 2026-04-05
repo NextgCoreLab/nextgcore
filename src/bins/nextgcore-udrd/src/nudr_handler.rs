@@ -116,7 +116,7 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
                         }
                     });
 
-                    let body = serde_json::to_string(&response_json).unwrap_or_default();
+                    let body = serde_json::to_string(&response_json).expect("value expected");
                     send_success_response(stream_id, 200, Some(&body));
                 }
                 "PATCH" => {
@@ -411,7 +411,7 @@ pub fn handle_subscription_provisioned(event: &UdrEvent, stream_id: u64) {
         serde_json::json!({})
     };
 
-    let body = serde_json::to_string(&response).unwrap_or_default();
+    let body = serde_json::to_string(&response).expect("value expected");
     send_success_response(stream_id, 200, Some(&body));
 }
 
@@ -698,7 +698,7 @@ pub fn handle_policy_data(event: &UdrEvent, stream_id: u64) {
                             let response = serde_json::json!({
                                 "smPolicySnssaiData": sm_policy_snssai_data
                             });
-                            let body = serde_json::to_string(&response).unwrap_or_default();
+                            let body = serde_json::to_string(&response).expect("value expected");
                             send_success_response(stream_id, 200, Some(&body));
                         }
                         _ => {

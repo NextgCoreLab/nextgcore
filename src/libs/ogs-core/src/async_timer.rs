@@ -371,7 +371,7 @@ impl<T: Clone + fmt::Debug + Send + Sync + 'static> AsyncTimerMgr<T> {
                     .map(|e| e.id)
                     .collect()
             })
-            .unwrap_or_default()
+            .expect("value expected")
     }
 }
 

@@ -190,7 +190,7 @@ impl DigitalTwinExporter {
 
     /// Capture current NF state as a snapshot.
     pub fn capture(&mut self, load: f64, active_sessions: u64, cpu: f64, memory: f64, kpis: HashMap<String, f64>) -> &NfStateSnapshot {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("value expected").as_millis() as u64;
         let snapshot = NfStateSnapshot {
             nf_instance_id: self.nf_instance_id.clone(),
             nf_type: self.nf_type.clone(),
@@ -204,7 +204,7 @@ impl DigitalTwinExporter {
         };
         self.latest_snapshot = Some(snapshot);
         self.export_count += 1;
-        self.latest_snapshot.as_ref().unwrap_or_default()
+        self.latest_snapshot.as_ref().expect("value expected")
     }
 
     /// Get latest snapshot.
@@ -520,7 +520,7 @@ impl DigitalTwinSyncManager {
             self.history.remove(0);
         }
         self.history.push(entry);
-        self.exporter.latest().unwrap_or_default()
+        self.exporter.latest().expect("value expected")
     }
 
     /// Computes a delta between the current snapshot and a previous one.
@@ -729,7 +729,7 @@ impl NfPowerProfiler {
     /// Records a power measurement.
     pub fn record_measurement(&mut self) {
         let total = self.total_power_watts();
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("value expected").as_millis() as u64;
         if self.power_history.len() >= self.max_history {
             self.power_history.remove(0);
         }
@@ -886,7 +886,7 @@ impl ModelVersionRegistry {
     pub fn deploy(&mut self, model_id: impl Into<String>, version: impl Into<String>, nf_instance_id: impl Into<String>) {
         let model_id = model_id.into();
         let nf_instance_id = nf_instance_id.into();
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("value expected").as_millis() as u64;
         self.rollout_count += 1;
         self.deployments.insert(
             (model_id.clone(), nf_instance_id.clone()),

@@ -23,7 +23,7 @@ struct DccfContext {
 static CONTEXT: OnceLock<Mutex<DccfContext>> = OnceLock::new();
 
 fn ctx() -> &'static Mutex<DccfContext> {
-    CONTEXT.get().unwrap_or_default()
+    CONTEXT.get().expect("value expected")
 }
 
 /// Initialize the DCCF context (call once at startup).

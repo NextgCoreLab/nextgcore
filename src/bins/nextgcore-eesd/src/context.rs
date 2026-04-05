@@ -211,7 +211,7 @@ impl EesContext {
     pub fn eas_list(&self) -> Vec<EasProfile> {
         self.eas_profiles.read()
             .map(|p| p.values().cloned().collect())
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     pub fn eas_count(&self) -> usize {

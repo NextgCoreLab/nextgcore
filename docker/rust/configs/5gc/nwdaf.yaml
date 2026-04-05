@@ -1,0 +1,14 @@
+# NWDAF (Network Data Analytics Function) Configuration
+logger:
+  level: info
+
+nwdaf:
+  sbi:
+    server:
+      - address: 0.0.0.0
+        advertise: 172.23.0.30
+        port: 7777
+  nrf:
+    uri: http://172.23.0.10:7777
+  analytics:
+    ml_model_dir: /var/lib/nextgcore/models

@@ -128,7 +128,7 @@ pub fn pcf_nudr_dr_handle_query_am_data(
                 return NudrHandlerResult::error(HTTP_STATUS_NOT_FOUND, "Cannot find SUPI in DB");
             }
 
-            let subscription_data = subscription_data.unwrap_or_default();
+            let subscription_data = subscription_data.expect("value expected");
 
             // Validate UE-AMBR
             if subscription_data.ambr_uplink == 0 && subscription_data.ambr_downlink == 0 {
@@ -300,7 +300,7 @@ pub fn pcf_get_session_data(
                 .iter()
                 .map(|r| {
                     PccRule {
-                        id: r.id.clone().unwrap_or_default(),
+                        id: r.id.clone().expect("value expected"),
                         precedence: r.precedence as u32,
                         qos_index: r.qos.index,
                         flow_status: crate::npcf_handler::FlowStatus::Enabled,
@@ -317,7 +317,7 @@ pub fn pcf_get_session_data(
                                 description: f
                                     .description
                                     .clone()
-                                    .unwrap_or_default(),
+                                    .expect("value expected"),
                             })
                             .collect(),
                     }

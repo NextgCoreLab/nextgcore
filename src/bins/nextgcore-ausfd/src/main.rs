@@ -275,7 +275,7 @@ async fn handle_ue_authentication(request: &SbiRequest) -> SbiResponse {
         return send_bad_request(msg, Some("INVALID_REQUEST"));
     }
 
-    let serving_network_name = serving_network_name.unwrap_or_default();
+    let serving_network_name = serving_network_name.expect("value expected");
     log::info!("UE Authentication: SUPI/SUCI={supi_or_suci}, SNN={serving_network_name}");
 
     // Find or create UE in context
@@ -395,7 +395,7 @@ async fn handle_5g_aka_confirmation(auth_ctx_id: &str, request: &SbiRequest) -> 
         return send_bad_request(msg, Some("INVALID_REQUEST"));
     }
 
-    let res_star_hex = res_star_hex.unwrap_or_default();
+    let res_star_hex = res_star_hex.expect("value expected");
     log::info!("5G-AKA Confirmation: RES*={res_star_hex}");
 
     // Find UE by auth context ID
@@ -449,9 +449,9 @@ async fn handle_5g_aka_confirmation(auth_ctx_id: &str, request: &SbiRequest) -> 
     }
 
     // Notify UDM of authentication result (fire-and-forget)
-    let supi = ausf_ue.supi.clone().unwrap_or_default();
+    let supi = ausf_ue.supi.clone().expect("value expected");
     let auth_success = ausf_ue.auth_result == nextgcore_ausfd::AuthResult::AuthenticationSuccess;
-    let serving_network_name = ausf_ue.serving_network_name.clone().unwrap_or_default();
+    let serving_network_name = ausf_ue.serving_network_name.clone().expect("value expected");
     tokio::spawn(async move {
         if let Err(e) = send_udm_auth_result(&supi, auth_success, &serving_network_name).await {
             log::warn!("Failed to notify UDM of auth result: {e}");

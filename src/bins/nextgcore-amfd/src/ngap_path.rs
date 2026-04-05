@@ -320,6 +320,80 @@ impl NgapServer {
                     log::info!("UE Context Release Complete from gNB");
                 }
             }
+            Some(0) => {
+                // HandoverPreparation (procedure code 0)
+                // InitiatingMessage = HandoverRequired from source gNB
+                // SuccessfulOutcome  = HandoverCommand to source gNB (AMF-initiated)
+                // UnsuccessfulOutcome = HandoverPreparationFailure
+                if data[0] == 0x00 {
+                    log::info!("HandoverRequired from association {association_id}");
+                } else if data[0] == 0x20 {
+                    log::info!("HandoverCommand SuccessfulOutcome from association {association_id}");
+                } else {
+                    log::warn!("HandoverPreparationFailure from association {association_id}");
+                }
+                if let Some(session) = self.sessions.read().await.get(&association_id) {
+                    let event = AmfEvent::ngap_message(session.id, data.to_vec());
+                    let _ = self.event_tx.send(event).await;
+                }
+            }
+            Some(1) => {
+                // HandoverResourceAllocation (procedure code 1)
+                // InitiatingMessage = HandoverRequest to target gNB (AMF-initiated)
+                // SuccessfulOutcome  = HandoverRequestAcknowledge from target gNB
+                // UnsuccessfulOutcome = HandoverFailure from target gNB
+                if data[0] == 0x00 {
+                    log::info!("HandoverRequest InitiatingMessage from association {association_id}");
+                } else if data[0] == 0x20 {
+                    log::info!("HandoverRequestAcknowledge from association {association_id}");
+                } else {
+                    log::warn!("HandoverFailure from association {association_id}");
+                }
+                if let Some(session) = self.sessions.read().await.get(&association_id) {
+                    let event = AmfEvent::ngap_message(session.id, data.to_vec());
+                    let _ = self.event_tx.send(event).await;
+                }
+            }
+            Some(3) => {
+                // PathSwitchRequest (procedure code 3)
+                // InitiatingMessage = PathSwitchRequest from target gNB (Xn-based HO)
+                // SuccessfulOutcome  = PathSwitchRequestAcknowledge
+                // UnsuccessfulOutcome = PathSwitchRequestFailure
+                if data[0] == 0x00 {
+                    log::info!("PathSwitchRequest from association {association_id}");
+                } else if data[0] == 0x20 {
+                    log::info!("PathSwitchRequestAcknowledge from association {association_id}");
+                } else {
+                    log::warn!("PathSwitchRequestFailure from association {association_id}");
+                }
+                if let Some(session) = self.sessions.read().await.get(&association_id) {
+                    let event = AmfEvent::ngap_message(session.id, data.to_vec());
+                    let _ = self.event_tx.send(event).await;
+                }
+            }
+            Some(25) => {
+                // HandoverCancel (procedure code 25)
+                // InitiatingMessage = HandoverCancel from source gNB
+                // SuccessfulOutcome  = HandoverCancelAcknowledge
+                if data[0] == 0x00 {
+                    log::info!("HandoverCancel from association {association_id}");
+                } else if data[0] == 0x20 {
+                    log::info!("HandoverCancelAcknowledge from association {association_id}");
+                }
+                if let Some(session) = self.sessions.read().await.get(&association_id) {
+                    let event = AmfEvent::ngap_message(session.id, data.to_vec());
+                    let _ = self.event_tx.send(event).await;
+                }
+            }
+            Some(27) => {
+                // HandoverNotification (procedure code 27)
+                // InitiatingMessage = HandoverNotify from target gNB
+                log::info!("HandoverNotify from association {association_id}");
+                if let Some(session) = self.sessions.read().await.get(&association_id) {
+                    let event = AmfEvent::ngap_message(session.id, data.to_vec());
+                    let _ = self.event_tx.send(event).await;
+                }
+            }
             _ => {
                 log::debug!("Unknown procedure code, forwarding to FSM");
                 // Create NGAP event for FSM processing
@@ -1513,7 +1587,7 @@ pub async fn amf_ngap_open(
     let addr = bind_addr.unwrap_or_else(|| {
         format!("{DEFAULT_NGAP_ADDR}:{OGS_NGAP_SCTP_PORT}")
             .parse()
-            .unwrap_or_default()
+            .expect("value expected")
     });
 
     let handle = NgapServerHandle::new(addr, amf_context, event_tx).await?;

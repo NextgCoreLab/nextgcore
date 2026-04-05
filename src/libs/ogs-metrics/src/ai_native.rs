@@ -934,7 +934,7 @@ impl AnalyticsFeedback {
             prediction_error: None,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
+                .expect("value expected")
                 .as_secs(),
             context: HashMap::new(),
         }
@@ -1059,7 +1059,7 @@ impl NwdafFeedbackManager {
                     .take(limit)
                     .collect()
             })
-            .unwrap_or_default()
+            .expect("value expected")
     }
 }
 
@@ -1158,7 +1158,7 @@ impl FederatedRound {
             total_samples: 0,
             start_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
+                .expect("value expected")
                 .as_secs(),
             completion_time: 0,
             aggregated_loss: 0.0,
@@ -1170,7 +1170,7 @@ impl FederatedRound {
     pub fn complete(&mut self, final_loss: f64) {
         self.completion_time = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_secs();
         self.aggregated_loss = final_loss;
     }
@@ -1187,7 +1187,7 @@ impl FederatedRound {
         } else {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
+                .expect("value expected")
                 .as_secs()
                 .saturating_sub(self.start_time)
         }
@@ -1241,7 +1241,7 @@ impl DistributedTrainingSession {
             min_participants: 2, // Default minimum participants
             start_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
+                .expect("value expected")
                 .as_secs(),
             completion_time: 0,
             converged: false,
@@ -1345,7 +1345,7 @@ impl DistributedTrainingSession {
                 self.converged = true;
                 self.completion_time = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
+                    .expect("value expected")
                     .as_secs();
                 log::info!(
                     "[Distributed Training] Training converged at round {} with loss {:.6}",
@@ -1381,7 +1381,7 @@ impl DistributedTrainingSession {
         } else {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
+                .expect("value expected")
                 .as_secs()
                 .saturating_sub(self.start_time)
         }

@@ -137,7 +137,7 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                     .status(200)
                     .header("content-type", "application/json")
                     .body(body)
-                    .unwrap_or_default());
+                    .expect("value expected"));
             }
 
             // Convert hyper request to SbiRequest
@@ -211,7 +211,7 @@ fn convert_response(sbi_response: SbiResponse) -> Response<Full<Bytes>> {
         Response::builder()
             .status(500)
             .body(Full::new(Bytes::from("Internal Server Error")))
-            .unwrap_or_default()
+            .expect("value expected")
     })
 }
 

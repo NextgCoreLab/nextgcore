@@ -227,7 +227,7 @@ impl InstancePool {
     /// Add an instance to the pool
     pub fn add(&mut self, instance: MetricsInstance) -> &MetricsInstance {
         self.instances.push(instance);
-        self.instances.last().unwrap_or_default()
+        self.instances.last().expect("value expected")
     }
 
     /// Remove an instance by index

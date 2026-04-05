@@ -23,6 +23,7 @@ axum.workspace = true
 tower-http.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
+mongodb.workspace = true
 
 [lints]
 workspace = true

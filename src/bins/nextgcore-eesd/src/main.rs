@@ -9,6 +9,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use ogs_sbi::context::global_context;
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::server::{
     send_bad_request, send_method_not_allowed, send_not_found,
@@ -86,7 +87,7 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) {
         log::info!("Received shutdown signal");
         shutdown.store(true, Ordering::SeqCst);
     })
-    .unwrap_or_default();
+    .expect("value expected");
 }
 
 #[tokio::main]
@@ -128,6 +129,13 @@ async fn main() -> Result<()> {
     log::info!("Starting EES SBI server on {addr}");
     sbi_server.start(ees_sbi_request_handler).await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
+
+    // Register with NRF
+    let sbi_ctx = global_context();
+    sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
+    if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port).await {
+        log::warn!("NRF registration failed (will operate without NRF): {e}");
+    }
 
     log::info!("NextGCore EES ready");
 
@@ -219,7 +227,7 @@ async fn handle_eas_register(request: &SbiRequest) -> SbiResponse {
     let tacs: Vec<u32> = data.get("servingAreaTacs")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
-        .unwrap_or_default();
+        .expect("value expected");
 
     let profile = EasProfile {
         eas_id: String::new(),
@@ -458,6 +466,100 @@ async fn handle_ue_context_transfer(supi: &str, request: &SbiRequest) -> SbiResp
             .unwrap_or_else(|_| SbiResponse::with_status(200))
     } else {
         send_not_found(&format!("UE context for {supi} not found"), Some("CONTEXT_NOT_FOUND"))
+    }
+}
+
+/// Register EES with NRF
+async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> {
+    let sbi_ctx = global_context();
+
+    let nrf_uri = sbi_ctx.get_nrf_uri().await;
+    let nrf_uri = match nrf_uri {
+        Some(uri) => uri,
+        None => {
+            log::debug!("No NRF URI configured, skipping NRF registration");
+            return Ok(());
+        }
+    };
+
+    log::info!("Registering EES with NRF at {nrf_uri}");
+
+    let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
+    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
+    let nf_instance_id = uuid::Uuid::new_v4().to_string();
+
+    let nf_profile = serde_json::json!({
+        "nfInstanceId": nf_instance_id,
+        "nfType": "EASDF",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": [sbi_addr],
+        "nfServices": [
+            {
+                "serviceInstanceId": format!("{}-nees-easregistration", nf_instance_id),
+                "serviceName": "nees-easregistration",
+                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+            },
+            {
+                "serviceInstanceId": format!("{}-nees-easdiscovery", nf_instance_id),
+                "serviceName": "nees-easdiscovery",
+                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+            }
+        ],
+        "allowedNfTypes": ["AMF", "SMF", "NEF", "SCP"],
+        "heartBeatTimer": 10
+    });
+
+    let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
+    log::debug!("NRF registration: PUT {path}");
+
+    let response = client
+        .put_json(&path, &nf_profile)
+        .await
+        .map_err(|e| format!("NRF registration failed: {e}"))?;
+
+    match response.status {
+        200 | 201 => {
+            log::info!("EES registered with NRF successfully (id={nf_instance_id})");
+
+            let mut self_instance = ogs_sbi::context::NfInstance::new(
+                &nf_instance_id,
+                ogs_sbi::types::NfType::Easdf,
+            );
+            self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
+            let mut svc = ogs_sbi::context::NfService::new(
+                "nees-easregistration",
+                ogs_sbi::types::SbiServiceType::Null,
+            );
+            svc.port = sbi_port;
+            svc.ip_addresses = vec![sbi_addr.to_string()];
+            self_instance.add_service(svc);
+            sbi_ctx.set_self_instance(self_instance).await;
+
+            Ok(())
+        }
+        _ => Err(format!("NRF registration returned status {}", response.status)),
+    }
+}
+
+/// Parse host and port from a URI string (e.g., "http://localhost:7777")
+fn parse_host_port(uri: &str) -> Option<(String, u16)> {
+    let without_scheme = uri
+        .strip_prefix("https://")
+        .or_else(|| uri.strip_prefix("http://"))
+        .unwrap_or(uri);
+    let (host_port, _path) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    if let Some((host, port_str)) = host_port.rsplit_once(':') {
+        let port: u16 = port_str.parse().ok()?;
+        Some((host.to_string(), port))
+    } else {
+        let default_port = if uri.starts_with("https://") { 443 } else { 80 };
+        Some((host_port.to_string(), default_port))
     }
 }
 

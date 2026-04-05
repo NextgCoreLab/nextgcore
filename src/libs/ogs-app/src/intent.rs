@@ -658,7 +658,7 @@ impl IntentLifecycleManager {
 
         // Safe: we just set derived_config above
         Ok(self.intents[id].derived_config.as_ref()
-            .unwrap_or_default())
+            .expect("value expected"))
     }
 
     /// Suspend an active intent.
@@ -675,7 +675,7 @@ impl IntentLifecycleManager {
         managed.state = IntentState::Suspended;
         managed.updated_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_secs();
         Ok(())
     }
@@ -688,7 +688,7 @@ impl IntentLifecycleManager {
         managed.state = IntentState::Fulfilled;
         managed.updated_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_secs();
         Ok(())
     }
@@ -702,7 +702,7 @@ impl IntentLifecycleManager {
         managed.failure_reason = Some(reason.into());
         managed.updated_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_secs();
         Ok(())
     }

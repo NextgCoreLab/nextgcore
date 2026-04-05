@@ -12,6 +12,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use ogs_sbi::context::global_context;
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::server::{
     send_method_not_allowed, send_not_found,
@@ -89,7 +90,7 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) {
         log::info!("Received shutdown signal");
         shutdown.store(true, Ordering::SeqCst);
     })
-    .unwrap_or_default();
+    .expect("value expected");
 }
 
 /// DCCF SBI request handler (called by the SBI server per request).
@@ -239,6 +240,13 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
+    // Register with NRF
+    let sbi_ctx = global_context();
+    sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
+    if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port).await {
+        log::warn!("NRF registration failed (will operate without NRF): {e}");
+    }
+
     log::info!("NextGCore DCCF ready");
 
     while !shutdown.load(Ordering::SeqCst) {
@@ -254,4 +262,88 @@ async fn main() -> Result<()> {
     dccf_context_final();
     log::info!("DCCF shutdown complete");
     Ok(())
+}
+
+/// Register DCCF with NRF
+async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> {
+    let sbi_ctx = global_context();
+
+    let nrf_uri = sbi_ctx.get_nrf_uri().await;
+    let nrf_uri = match nrf_uri {
+        Some(uri) => uri,
+        None => {
+            log::debug!("No NRF URI configured, skipping NRF registration");
+            return Ok(());
+        }
+    };
+
+    log::info!("Registering DCCF with NRF at {nrf_uri}");
+
+    let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
+    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
+    let nf_instance_id = uuid::Uuid::new_v4().to_string();
+
+    let nf_profile = serde_json::json!({
+        "nfInstanceId": nf_instance_id,
+        "nfType": "DCCF",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": [sbi_addr],
+        "nfServices": [{
+            "serviceInstanceId": format!("{}-ndccf-datamanagement", nf_instance_id),
+            "serviceName": "ndccf-datamanagement",
+            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+            "scheme": "http",
+            "nfServiceStatus": "REGISTERED",
+            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+        }],
+        "allowedNfTypes": ["NWDAF", "AMF", "SMF", "PCF"],
+        "heartBeatTimer": 10
+    });
+
+    let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
+    log::debug!("NRF registration: PUT {path}");
+
+    let response = client
+        .put_json(&path, &nf_profile)
+        .await
+        .map_err(|e| format!("NRF registration failed: {e}"))?;
+
+    match response.status {
+        200 | 201 => {
+            log::info!("DCCF registered with NRF successfully (id={nf_instance_id})");
+
+            let mut self_instance = ogs_sbi::context::NfInstance::new(
+                &nf_instance_id,
+                ogs_sbi::types::NfType::Dccf,
+            );
+            self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
+            let mut svc = ogs_sbi::context::NfService::new(
+                "ndccf-datamanagement",
+                ogs_sbi::types::SbiServiceType::Null,
+            );
+            svc.port = sbi_port;
+            svc.ip_addresses = vec![sbi_addr.to_string()];
+            self_instance.add_service(svc);
+            sbi_ctx.set_self_instance(self_instance).await;
+
+            Ok(())
+        }
+        _ => Err(format!("NRF registration returned status {}", response.status)),
+    }
+}
+
+/// Parse host and port from a URI string
+fn parse_host_port(uri: &str) -> Option<(String, u16)> {
+    let without_scheme = uri
+        .strip_prefix("https://")
+        .or_else(|| uri.strip_prefix("http://"))
+        .unwrap_or(uri);
+    let (host_port, _path) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    if let Some((host, port_str)) = host_port.rsplit_once(':') {
+        let port: u16 = port_str.parse().ok()?;
+        Some((host.to_string(), port))
+    } else {
+        let default_port = if uri.starts_with("https://") { 443 } else { 80 };
+        Some((host_port.to_string(), default_port))
+    }
 }

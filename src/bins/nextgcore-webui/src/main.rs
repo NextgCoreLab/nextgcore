@@ -252,7 +252,7 @@ fn db_list_subscribers(uri: &str, db_name: &str) -> Result<Vec<Subscriber>> {
     let db = client.database(db_name);
     let coll = db.collection::<mongodb::bson::Document>("subscribers");
 
-    let cursor = coll.find(mongodb::bson::doc! {}).context("find failed")?;
+    let cursor = coll.find(mongodb::bson::doc! {}, None).context("find failed")?;
     let mut subs = Vec::new();
     for doc_result in cursor {
         let doc = doc_result.context("cursor error")?;
@@ -270,7 +270,7 @@ fn db_get_subscriber(uri: &str, db_name: &str, imsi: &str) -> Result<Option<Subs
     let coll = db.collection::<mongodb::bson::Document>("subscribers");
 
     let filter = mongodb::bson::doc! { "imsi": imsi };
-    match coll.find_one(filter).context("find_one failed")? {
+    match coll.find_one(filter, None).context("find_one failed")? {
         Some(doc) => {
             let sub = mongodb::bson::from_document::<Subscriber>(doc)
                 .context("deserialize subscriber")?;
@@ -287,7 +287,7 @@ fn db_create_subscriber(uri: &str, db_name: &str, sub: &Subscriber) -> Result<()
     let coll = db.collection::<mongodb::bson::Document>("subscribers");
 
     let doc = mongodb::bson::to_document(sub).context("serialize subscriber")?;
-    coll.insert_one(doc).context("insert failed")?;
+    coll.insert_one(doc, None).context("insert failed")?;
     Ok(())
 }
 
@@ -305,7 +305,7 @@ fn db_update_subscriber(
     let filter = mongodb::bson::doc! { "imsi": imsi };
     let doc = mongodb::bson::to_document(sub).context("serialize subscriber")?;
     let result = coll
-        .replace_one(filter, doc)
+        .replace_one(filter, doc, None)
         .context("replace_one failed")?;
     Ok(result.modified_count > 0)
 }
@@ -317,7 +317,7 @@ fn db_delete_subscriber(uri: &str, db_name: &str, imsi: &str) -> Result<bool> {
     let coll = db.collection::<mongodb::bson::Document>("subscribers");
 
     let filter = mongodb::bson::doc! { "imsi": imsi };
-    let result = coll.delete_one(filter).context("delete_one failed")?;
+    let result = coll.delete_one(filter, None).context("delete_one failed")?;
     Ok(result.deleted_count > 0)
 }
 
@@ -327,7 +327,7 @@ fn db_count_subscribers(uri: &str, db_name: &str) -> Result<u64> {
     let db = client.database(db_name);
     let coll = db.collection::<mongodb::bson::Document>("subscribers");
 
-    let count = coll.count_documents(mongodb::bson::doc! {}).context("count failed")?;
+    let count = coll.count_documents(mongodb::bson::doc! {}, None).context("count failed")?;
     Ok(count)
 }
 

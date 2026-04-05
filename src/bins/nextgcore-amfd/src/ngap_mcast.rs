@@ -380,7 +380,7 @@ impl NgapMcastContext {
                     .cloned()
                     .collect()
             })
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     pub fn session_count(&self) -> usize {

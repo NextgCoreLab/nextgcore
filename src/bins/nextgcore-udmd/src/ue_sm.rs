@@ -231,7 +231,7 @@ impl UdmUeSmContext {
         let ctx = udm_self();
         let context = ctx.read().unwrap();
         let udm_ue = context.ue_find_by_id(self.udm_ue_id);
-        let suci = udm_ue.as_ref().map(|u| u.suci.clone()).unwrap_or_default();
+        let suci = udm_ue.as_ref().map(|u| u.suci.clone()).expect("value expected");
         drop(context);
 
         match method {
@@ -288,7 +288,7 @@ impl UdmUeSmContext {
         let ctx = udm_self();
         let context = ctx.read().unwrap();
         let udm_ue = context.ue_find_by_id(self.udm_ue_id);
-        let suci = udm_ue.as_ref().map(|u| u.suci.clone()).unwrap_or_default();
+        let suci = udm_ue.as_ref().map(|u| u.suci.clone()).expect("value expected");
         drop(context);
 
         let resource = resource_components.get(1).map(|s| s.as_str());
@@ -351,7 +351,7 @@ impl UdmUeSmContext {
         let ctx = udm_self();
         let context = ctx.read().unwrap();
         let udm_ue = context.ue_find_by_id(self.udm_ue_id);
-        let suci = udm_ue.as_ref().map(|u| u.suci.clone()).unwrap_or_default();
+        let suci = udm_ue.as_ref().map(|u| u.suci.clone()).expect("value expected");
         drop(context);
 
         let resource = resource_components.get(1).map(|s| s.as_str());

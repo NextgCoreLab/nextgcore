@@ -160,7 +160,7 @@ impl AmfSnpnContext {
             ch_uri: self.config.credentials_holder_uri.clone(),
         };
         self.auth_contexts.insert(supi.clone(), ctx);
-        self.auth_contexts.get(&supi).unwrap_or_default()
+        self.auth_contexts.get(&supi).expect("value expected")
     }
 
     /// Marks onboarding complete for a UE

@@ -27,7 +27,7 @@ use ogs_sbi::server::{
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 mod binding;
 mod context;
@@ -61,6 +61,11 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// Session state: stores UPF SEID per sm_context_ref for PFCP modifications
 static PFCP_SESSIONS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Monotonically-increasing PFCP sequence number counter.
+/// Each transaction fetches-and-increments this so concurrent PDU sessions
+/// never reuse the same sequence number.
+static PFCP_SEQ: AtomicU32 = AtomicU32::new(1);
 
 /// Configuration loaded from YAML
 struct SmfConfig {
@@ -214,6 +219,42 @@ async fn main() -> Result<()> {
 
     log::info!("NextGCore SMF ready");
 
+    // Spawn N4 (PFCP) listener so the SMF can receive unsolicited messages
+    // from the UPF — most importantly Session Report Requests (type 56).
+    let pfcp_bind_addr: SocketAddr = {
+        let addr = std::env::var("SMF_PFCP_ADDR").unwrap_or_else(|_| "0.0.0.0".to_string());
+        let port: u16 = std::env::var("SMF_PFCP_PORT")
+            .ok().and_then(|p| p.parse().ok()).unwrap_or(8805);
+        format!("{addr}:{port}").parse()
+            .context("Invalid SMF PFCP listen address")?
+    };
+    let shutdown_pfcp = shutdown.clone();
+    let pfcp_listener_handle = tokio::spawn(async move {
+        match tokio::net::UdpSocket::bind(pfcp_bind_addr).await {
+            Ok(sock) => {
+                log::info!("SMF N4 PFCP listener bound on {pfcp_bind_addr}");
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    if shutdown_pfcp.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        sock.recv_from(&mut buf),
+                    ).await {
+                        Ok(Ok((len, peer))) => {
+                            handle_pfcp_incoming(&sock, &buf[..len], peer).await;
+                        }
+                        Ok(Err(e)) => log::warn!("PFCP listener recv error: {e}"),
+                        Err(_) => {} // timeout — loop and re-check shutdown
+                    }
+                }
+            }
+            Err(e) => log::warn!("Failed to bind SMF PFCP listener on {pfcp_bind_addr}: {e}"),
+        }
+        log::info!("SMF N4 PFCP listener stopped");
+    });
+
     // Main async event loop
     let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
 
@@ -228,6 +269,8 @@ async fn main() -> Result<()> {
         // Process timer expirations and state machine updates
         // In a full implementation, this would check the timer manager
     }
+
+    pfcp_listener_handle.abort();
 
     // Graceful shutdown
     log::info!("Shutting down...");
@@ -248,6 +291,135 @@ async fn main() -> Result<()> {
 
     log::info!("NextGCore SMF stopped");
     Ok(())
+}
+
+// =============================================================================
+// PFCP N4 Receive Path (SMF as server for UPF-initiated messages)
+// =============================================================================
+
+/// Dispatch an incoming PFCP datagram received on the SMF's N4 listen socket.
+async fn handle_pfcp_incoming(
+    sock: &tokio::net::UdpSocket,
+    pkt: &[u8],
+    peer: std::net::SocketAddr,
+) {
+    if pkt.len() < 4 {
+        log::warn!("PFCP packet from {peer} too short ({} bytes)", pkt.len());
+        return;
+    }
+    let msg_type = pkt[1];
+    log::debug!("PFCP message type={msg_type} from {peer} ({} bytes)", pkt.len());
+
+    match msg_type {
+        56 => handle_pfcp_session_report(sock, pkt, peer).await,
+        _ => log::debug!("PFCP: unhandled message type={msg_type} from {peer}"),
+    }
+}
+
+/// Handle PFCP Session Report Request (message type 56) from UPF.
+///
+/// The UPF sends this when a URR threshold is crossed.  The SMF logs the
+/// usage report and responds with a Session Report Response (type 57)
+/// carrying a "Request Accepted" cause IE.
+async fn handle_pfcp_session_report(
+    sock: &tokio::net::UdpSocket,
+    pkt: &[u8],
+    peer: std::net::SocketAddr,
+) {
+    // Minimum PFCP header with SEID: 16 bytes
+    // flags[1] + msg_type[1] + length[2] + seid[8] + seq[3] + spare[1]
+    if pkt.len() < 16 {
+        log::warn!("PFCP Session Report Request from {peer} too short ({} bytes)", pkt.len());
+        return;
+    }
+
+    let seid = u64::from_be_bytes(pkt[4..12].try_into().unwrap_or([0u8; 8]));
+    // Sequence number is 3 bytes at offset 12 (big-endian, upper byte = 0)
+    let seq = u32::from_be_bytes([0, pkt[12], pkt[13], pkt[14]]);
+
+    log::info!(
+        "PFCP Session Report Request: SEID=0x{seid:016x}, seq={seq}, peer={peer}"
+    );
+
+    // Parse IEs from the payload (offset 16 onward) to extract usage reports.
+    let payload = &pkt[16..];
+    let mut offset = 0;
+    while offset + 4 <= payload.len() {
+        let ie_type = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
+        let ie_len = u16::from_be_bytes([payload[offset + 2], payload[offset + 3]]) as usize;
+        let ie_start = offset + 4;
+        let ie_end = ie_start + ie_len;
+        if ie_end > payload.len() {
+            break;
+        }
+
+        // IE type 78 = Usage Report within Session Report Request (TS 29.244)
+        if ie_type == 78 {
+            let ur = &payload[ie_start..ie_end];
+            let mut ur_off = 0;
+            let mut urr_id: u32 = 0;
+            let mut vol_ul: u64 = 0;
+            let mut vol_dl: u64 = 0;
+            while ur_off + 4 <= ur.len() {
+                let t = u16::from_be_bytes([ur[ur_off], ur[ur_off + 1]]);
+                let l = u16::from_be_bytes([ur[ur_off + 2], ur[ur_off + 3]]) as usize;
+                let s = ur_off + 4;
+                let e = s + l;
+                if e > ur.len() { break; }
+                match t {
+                    // URR ID (IE type 81)
+                    81 if l >= 4 => {
+                        urr_id = u32::from_be_bytes(ur[s..s+4].try_into().unwrap_or([0u8;4]));
+                    }
+                    // Volume Measurement (IE type 42): flags(1) + total(8) + ul(8) + dl(8)
+                    42 if l >= 1 => {
+                        let flags = ur[s];
+                        let mut v = s + 1;
+                        if flags & 0x01 != 0 && v + 8 <= e { v += 8; } // skip total
+                        if flags & 0x02 != 0 && v + 8 <= e {
+                            vol_ul = u64::from_be_bytes(ur[v..v+8].try_into().unwrap_or([0u8;8]));
+                            v += 8;
+                        }
+                        if flags & 0x04 != 0 && v + 8 <= e {
+                            vol_dl = u64::from_be_bytes(ur[v..v+8].try_into().unwrap_or([0u8;8]));
+                        }
+                    }
+                    _ => {}
+                }
+                ur_off = e;
+            }
+            log::info!(
+                "PFCP Usage Report: SEID=0x{seid:016x}, URR ID={urr_id}, \
+                 UL={vol_ul} bytes, DL={vol_dl} bytes"
+            );
+        }
+
+        offset = ie_end;
+    }
+
+    // Build Session Report Response (type 57):
+    // flags(1) + type(1) + length(2) + seid(8) + seq(3) + spare(1) + Cause IE(6)
+    // Cause IE: type=19 (0x0013), length=1, value=1 (Request Accepted)
+    let cause_ie: [u8; 6] = [0x00, 19, 0x00, 0x01, 0x01, 0x00];
+    let payload_len = cause_ie.len();
+    let total_len = (12 + payload_len) as u16; // header after length field = 12 bytes
+
+    let mut resp = Vec::with_capacity(16 + payload_len);
+    resp.push(0x21); // version=1, SEID present
+    resp.push(57);   // Session Report Response
+    resp.extend_from_slice(&total_len.to_be_bytes());
+    resp.extend_from_slice(&seid.to_be_bytes()); // echo back the SEID
+    resp.extend_from_slice(&seq.to_be_bytes()[1..4]); // 3-byte seq
+    resp.push(0); // spare
+    resp.extend_from_slice(&cause_ie);
+
+    if let Err(e) = sock.send_to(&resp, peer).await {
+        log::warn!("Failed to send PFCP Session Report Response to {peer}: {e}");
+    } else {
+        log::info!(
+            "PFCP Session Report Response sent: SEID=0x{seid:016x}, seq={seq}, peer={peer}"
+        );
+    }
 }
 
 /// Register SMF NF instance with NRF
@@ -577,7 +749,7 @@ async fn pfcp_session_establish(
     let total_len = (12 + payload.len()) as u16;
     packet.extend_from_slice(&total_len.to_be_bytes());
     packet.extend_from_slice(&0u64.to_be_bytes()); // SEID=0 for new session
-    let seq: u32 = 1;
+    let seq: u32 = PFCP_SEQ.fetch_add(1, Ordering::Relaxed);
     packet.extend_from_slice(&seq.to_be_bytes()[1..4]); // 3 bytes
     packet.push(0); // spare
     packet.extend_from_slice(&payload);
@@ -723,7 +895,7 @@ async fn pfcp_session_modify(
     let total_len = (12 + payload.len()) as u16;
     packet.extend_from_slice(&total_len.to_be_bytes());
     packet.extend_from_slice(&upf_seid.to_be_bytes());
-    let seq: u32 = 2;
+    let seq: u32 = PFCP_SEQ.fetch_add(1, Ordering::Relaxed);
     packet.extend_from_slice(&seq.to_be_bytes()[1..4]);
     packet.push(0); // spare
     packet.extend_from_slice(&payload);
@@ -783,7 +955,7 @@ async fn pfcp_session_delete(
     let total_len = (12 + payload.len()) as u16;
     packet.extend_from_slice(&total_len.to_be_bytes());
     packet.extend_from_slice(&upf_seid.to_be_bytes());
-    let seq: u32 = 3;
+    let seq: u32 = PFCP_SEQ.fetch_add(1, Ordering::Relaxed);
     packet.extend_from_slice(&seq.to_be_bytes()[1..4]);
     packet.push(0); // spare
     packet.extend_from_slice(&payload);
@@ -1028,7 +1200,7 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
 
         let n1_sm_msg = req_body["n1SmMsg"].as_str()
             .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-            .unwrap_or_default();
+            .expect("value expected");
 
         if n1_sm_msg.len() < 4 {
             log::warn!("SM Context Update: N1 SM msg too short ({} bytes)", n1_sm_msg.len());
@@ -1072,7 +1244,7 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             let total_len = (12 + payload.len()) as u16;
             packet.extend_from_slice(&total_len.to_be_bytes());
             packet.extend_from_slice(&seid.to_be_bytes());
-            let seq: u32 = 3;
+            let seq: u32 = PFCP_SEQ.fetch_add(1, Ordering::Relaxed);
             packet.extend_from_slice(&seq.to_be_bytes()[1..4]);
             packet.push(0); // spare
             packet.extend_from_slice(&payload);

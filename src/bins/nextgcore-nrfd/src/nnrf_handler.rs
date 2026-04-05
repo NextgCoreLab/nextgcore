@@ -227,7 +227,7 @@ impl NfInstanceManager {
     pub fn list(&self) -> Vec<NfProfile> {
         self.profiles.read()
             .map(|p| p.values().cloned().collect())
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     /// Add a subscription
@@ -265,7 +265,7 @@ impl NfInstanceManager {
         self.subscriptions
             .read()
             .map(|s| s.values().cloned().collect())
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     /// Remove expired subscriptions (returns number removed)

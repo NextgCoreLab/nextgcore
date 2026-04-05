@@ -763,7 +763,7 @@ async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
     // For now, build a base64-encoded JWT structure.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
+        .expect("value expected")
         .as_secs();
     let expires_in = 3600u64; // 1 hour
 

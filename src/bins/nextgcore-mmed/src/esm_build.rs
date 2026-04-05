@@ -612,7 +612,7 @@ pub fn build_activate_default_bearer_context_request(
     // Get default bearer from session (first bearer)
     let default_bearer = MmeBearer {
         ebi: 5, // Default EBI
-        qos: sess.session.as_ref().map(|s| s.qos.clone()).unwrap_or_default(),
+        qos: sess.session.as_ref().map(|s| s.qos.clone()).expect("value expected"),
         ..Default::default()
     };
     

@@ -153,10 +153,22 @@ pub fn ogs_mongoc_final() {
     dbi_guard.mongoc.initialized = false;
 }
 
+/// Async wrapper for `ogs_dbi_init` — offloads the blocking MongoDB
+/// connection and ping to a `spawn_blocking` thread so it does not stall
+/// the tokio runtime when called from an async context (UDR, UDM, NRF).
+pub async fn ogs_dbi_init_async(db_uri: String) -> DbiResult<()> {
+    tokio::task::spawn_blocking(move || ogs_dbi_init(&db_uri))
+        .await
+        .unwrap_or_else(|e| Err(DbiError::ParseError(format!("spawn_blocking panicked: {e}"))))
+}
+
 /// Initialize database interface with subscriber collection
 ///
 /// # Arguments
 /// * `db_uri` - MongoDB connection URI
+///
+/// Note: this function performs blocking I/O (TCP + ping).  Call
+/// [`ogs_dbi_init_async`] instead when running inside a tokio async context.
 pub fn ogs_dbi_init(db_uri: &str) -> DbiResult<()> {
     ogs_mongoc_init(db_uri)?;
 

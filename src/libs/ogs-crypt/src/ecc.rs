@@ -81,7 +81,7 @@ pub type EccResult<T> = Result<T, EccError>;
 ///
 /// let mut public_key = [0u8; ECC_PUBLIC_KEY_SIZE];
 /// let mut private_key = [0u8; ECC_BYTES];
-/// ecc_make_key(&mut public_key, &mut private_key).unwrap_or_default();
+/// ecc_make_key(&mut public_key, &mut private_key).expect("value expected");
 /// ```
 pub fn ecc_make_key(
     public_key: &mut [u8; ECC_PUBLIC_KEY_SIZE],
@@ -131,17 +131,17 @@ pub fn ecc_make_key(
 /// // Generate two key pairs
 /// let mut pub1 = [0u8; ECC_PUBLIC_KEY_SIZE];
 /// let mut priv1 = [0u8; ECC_BYTES];
-/// ecc_make_key(&mut pub1, &mut priv1).unwrap_or_default();
+/// ecc_make_key(&mut pub1, &mut priv1).expect("value expected");
 ///
 /// let mut pub2 = [0u8; ECC_PUBLIC_KEY_SIZE];
 /// let mut priv2 = [0u8; ECC_BYTES];
-/// ecc_make_key(&mut pub2, &mut priv2).unwrap_or_default();
+/// ecc_make_key(&mut pub2, &mut priv2).expect("value expected");
 ///
 /// // Compute shared secrets (should be equal)
 /// let mut secret1 = [0u8; ECC_BYTES];
 /// let mut secret2 = [0u8; ECC_BYTES];
-/// ecdh_shared_secret(&pub2, &priv1, &mut secret1).unwrap_or_default();
-/// ecdh_shared_secret(&pub1, &priv2, &mut secret2).unwrap_or_default();
+/// ecdh_shared_secret(&pub2, &priv1, &mut secret1).expect("value expected");
+/// ecdh_shared_secret(&pub1, &priv2, &mut secret2).expect("value expected");
 /// assert_eq!(secret1, secret2);
 /// ```
 pub fn ecdh_shared_secret(
@@ -193,11 +193,11 @@ pub fn ecdh_shared_secret(
 ///
 /// let mut public_key = [0u8; ECC_PUBLIC_KEY_SIZE];
 /// let mut private_key = [0u8; ECC_BYTES];
-/// ecc_make_key(&mut public_key, &mut private_key).unwrap_or_default();
+/// ecc_make_key(&mut public_key, &mut private_key).expect("value expected");
 ///
 /// let hash = [0x42u8; ECC_BYTES]; // Example hash
 /// let mut signature = [0u8; ECC_SIGNATURE_SIZE];
-/// ecdsa_sign(&private_key, &hash, &mut signature).unwrap_or_default();
+/// ecdsa_sign(&private_key, &hash, &mut signature).expect("value expected");
 /// ```
 pub fn ecdsa_sign(
     private_key: &[u8; ECC_BYTES],
@@ -236,11 +236,11 @@ pub fn ecdsa_sign(
 ///
 /// let mut public_key = [0u8; ECC_PUBLIC_KEY_SIZE];
 /// let mut private_key = [0u8; ECC_BYTES];
-/// ecc_make_key(&mut public_key, &mut private_key).unwrap_or_default();
+/// ecc_make_key(&mut public_key, &mut private_key).expect("value expected");
 ///
 /// let hash = [0x42u8; ECC_BYTES];
 /// let mut signature = [0u8; ECC_SIGNATURE_SIZE];
-/// ecdsa_sign(&private_key, &hash, &mut signature).unwrap_or_default();
+/// ecdsa_sign(&private_key, &hash, &mut signature).expect("value expected");
 ///
 /// assert!(ecdsa_verify(&public_key, &hash, &signature).unwrap());
 /// ```

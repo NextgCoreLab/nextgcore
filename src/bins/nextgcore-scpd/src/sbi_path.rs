@@ -68,7 +68,7 @@ pub fn scp_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
         return Err("SBI server already running".to_string());
     }
 
-    let config = config.unwrap_or_default();
+    let config = config.expect("value expected");
 
     log::info!(
         "Opening SCP SBI server on {}:{}",
@@ -322,8 +322,8 @@ pub fn handle_request(
     let discovery_presence = target_nf_type.is_some() && service_type.is_some();
 
     if discovery_presence {
-        let target_nf_type = target_nf_type.unwrap_or_default();
-        let service_type = service_type.unwrap_or_default();
+        let target_nf_type = target_nf_type.expect("value expected");
+        let service_type = service_type.expect("value expected");
 
         assoc.target_nf_type = target_nf_type;
         assoc.service_type = service_type;

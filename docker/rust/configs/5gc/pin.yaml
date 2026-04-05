@@ -1,0 +1,12 @@
+# PIN (Personal IoT Network) Manager Configuration
+logger:
+  level: info
+
+pin:
+  sbi:
+    server:
+      - address: 0.0.0.0
+        advertise: 172.23.0.35
+        port: 7777
+  nrf:
+    uri: http://172.23.0.10:7777

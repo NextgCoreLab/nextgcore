@@ -269,7 +269,7 @@ pub fn authorize_sbi_request(
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
+        .expect("value expected")
         .as_secs();
 
     let claims = validate_bearer_token(token, required_scope, now)?;

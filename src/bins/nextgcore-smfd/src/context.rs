@@ -1255,7 +1255,7 @@ impl MbsSession {
     pub fn new(id: u64, tmgi: Tmgi, session_id: String) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_secs();
         Self {
             id,
@@ -1332,7 +1332,7 @@ impl MbsSession {
         self.mbs_service_area.cell_ids = cell_ids;
         self.updated_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_secs();
     }
 }
@@ -2258,7 +2258,7 @@ impl SmfContext {
 
                 session.updated_at = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
+                    .expect("value expected")
                     .as_secs();
                 log::info!(
                     "[MBS] Session activated: id={mbs_sess_id} mcast_addr={multicast_addr} n4mb_seid={n4mb_session_id}"
@@ -2294,7 +2294,7 @@ impl SmfContext {
                     session.joined_ues.push(ue_id);
                     session.updated_at = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
+                        .expect("value expected")
                         .as_secs();
                     log::debug!(
                         "[MBS] UE added to session: mbs_sess_id={} ue_id={} total_ues={}",
@@ -2316,7 +2316,7 @@ impl SmfContext {
                 if session.joined_ues.len() < before {
                     session.updated_at = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
+                        .expect("value expected")
                         .as_secs();
                     log::debug!(
                         "[MBS] UE removed from session: mbs_sess_id={} ue_id={} total_ues={}",
@@ -2352,7 +2352,7 @@ impl SmfContext {
                     .cloned()
                     .collect()
             })
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     /// Get number of MBS sessions

@@ -346,29 +346,42 @@ impl AmfApp {
         // Take the event receiver
         let mut event_rx = self.ngap_event_rx.take();
 
-        while self.running.load(Ordering::SeqCst) {
-            // Poll for NGAP messages
-            match ngap_path::amf_ngap_poll().await {
-                Ok(true) => {
-                    log::debug!("Processed NGAP message");
-                }
-                Ok(false) => {
-                    // No message available
-                }
-                Err(e) => {
-                    log::warn!("NGAP poll error: {e}");
-                }
-            }
+        // Periodic heartbeat interval (replaces the 10ms sleep)
+        let mut heartbeat = tokio::time::interval(tokio::time::Duration::from_secs(10));
 
-            // Process events from the event channel
-            if let Some(ref mut rx) = event_rx {
-                while let Ok(event) = rx.try_recv() {
+        loop {
+            // Drain all pending events without sleeping between them, then
+            // block until the next event or heartbeat tick arrives.
+            tokio::select! {
+                // An event is ready on the mpsc channel — process it immediately.
+                Some(event) = async {
+                    if let Some(ref mut rx) = event_rx { rx.recv().await } else { None }
+                } => {
                     self.handle_event(event).await;
+                    // Drain any additional events that arrived back-to-back.
+                    if let Some(ref mut rx) = event_rx {
+                        while let Ok(event) = rx.try_recv() {
+                            self.handle_event(event).await;
+                        }
+                    }
+                }
+
+                // Periodic tick: run NGAP poll and check the shutdown flag.
+                _ = heartbeat.tick() => {
+                    if !self.running.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    match ngap_path::amf_ngap_poll().await {
+                        Ok(true) => log::debug!("Processed NGAP message"),
+                        Ok(false) => {}
+                        Err(e) => log::warn!("NGAP poll error: {e}"),
+                    }
                 }
             }
 
-            // Brief yield to allow other tasks
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            if !self.running.load(Ordering::SeqCst) {
+                break;
+            }
         }
 
         log::info!("AMF main loop exited");

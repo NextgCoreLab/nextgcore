@@ -1060,7 +1060,7 @@ pub fn process_xr_qos_flow_binding(
         if rule.rule_type == PccRuleType::Install && is_xr_5qi(rule.qos.qci) {
             let chars = lookup_xr_5qi(rule.qos.qci);
             xr_metadata.push(XrFlowMetadata {
-                rule_id: rule.id.clone().unwrap_or_default(),
+                rule_id: rule.id.clone().expect("value expected"),
                 five_qi: rule.qos.qci,
                 delay_budget_ms: chars.as_ref().map(|c| c.packet_delay_budget_ms).unwrap_or(30),
                 gbr_dl_bps: rule.qos.gbr.downlink,

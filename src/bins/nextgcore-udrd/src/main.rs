@@ -113,7 +113,7 @@ async fn main() -> Result<()> {
     // Parse configuration to get db_uri
     let db_uri = parse_db_uri(&args.config);
     if !db_uri.is_empty() {
-        match ogs_dbi::ogs_dbi_init(&db_uri) {
+        match ogs_dbi::ogs_dbi_init_async(db_uri.clone()).await {
             Ok(()) => log::info!("MongoDB connected: {}", mask_uri(&db_uri)),
             Err(e) => log::warn!("MongoDB init failed (will use defaults): {e:?}"),
         }
@@ -456,7 +456,7 @@ fn handle_smf_registrations(supi: &str, method: &str, request: &SbiRequest, pdu_
                             }))
                             .collect::<Vec<_>>()
                     }))
-                    .unwrap_or_default();
+                    .expect("value expected");
                 SbiResponse::with_status(200)
                     .with_body(serde_json::Value::Array(registrations).to_string(), "application/json")
             } else {

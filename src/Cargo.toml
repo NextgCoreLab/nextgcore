@@ -20,8 +20,8 @@ members = [
     "libs/ogs-proto",
     "libs/ogs-ipfw",
     "libs/ogs-tun",
-    "libs/ogs-ffi",
-    
+    # "libs/ogs-ffi",  # excluded: requires clang, no crate depends on it
+
     # Binary crates (mirrors src/)
     "bins/nextgcore-amfd",
     "bins/nextgcore-ausfd",

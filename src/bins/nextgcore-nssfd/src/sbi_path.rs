@@ -36,7 +36,7 @@ pub fn nssf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
         return Err("SBI server already running".to_string());
     }
 
-    let config = config.unwrap_or_default();
+    let config = config.expect("value expected");
 
     log::info!(
         "Opening NSSF SBI server on {}:{}",

@@ -430,7 +430,7 @@ impl NssfContext {
         self.nsi_list
             .read()
             .map(|l| l.values().cloned().collect())
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     /// Get NSI load percentage

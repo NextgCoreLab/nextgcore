@@ -166,7 +166,7 @@ async fn register_with_nrf(nrf_uri: &str, nf_instance: &NfInstance) -> Result<()
 /// Open SBI server and register with NRF
 /// Port of pcf_sbi_open() from sbi-path.c
 pub fn pcf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
-    let config = config.unwrap_or_default();
+    let config = config.expect("value expected");
 
     if SBI_SERVER_RUNNING.load(Ordering::SeqCst) {
         return Err("SBI server already running".to_string());

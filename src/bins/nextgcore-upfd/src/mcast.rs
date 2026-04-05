@@ -220,7 +220,7 @@ impl McastContext {
     pub fn active_sessions(&self) -> Vec<McastSession> {
         self.sessions.read()
             .map(|s| s.values().filter(|s| s.active).cloned().collect())
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     pub fn session_count(&self) -> usize {

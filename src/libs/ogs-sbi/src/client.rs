@@ -29,7 +29,7 @@ use crate::types::{NfType, UriScheme};
 fn new_span_id() -> [u8; 8] {
     let ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
+        .expect("value expected")
         .as_nanos() as u64;
     ns.to_be_bytes()
 }
@@ -299,7 +299,7 @@ impl SbiClient {
             let trace_id: [u8; 16] = {
                 let ns = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
+                    .expect("value expected")
                     .as_nanos() as u128;
                 ns.to_be_bytes()
             };

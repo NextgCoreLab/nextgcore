@@ -157,7 +157,7 @@ impl ZeroTrustEngine {
 
     /// Register or update NF instance trust for service mesh authentication.
     pub fn register_nf_instance(&mut self, nf_instance_id: String, nf_type: String, cert_fingerprint: Option<String>) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("value expected").as_millis() as u64;
         let trust = NfInstanceTrust {
             nf_instance_id: nf_instance_id.clone(),
             nf_type,
@@ -174,7 +174,7 @@ impl ZeroTrustEngine {
 
     /// Authenticate NF instance with mTLS and update trust score dynamically.
     pub fn authenticate_nf(&mut self, nf_instance_id: &str, has_mtls: bool, cert_fingerprint: Option<String>) -> bool {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("value expected").as_millis() as u64;
 
         if let Some(trust) = self.nf_trust.get_mut(nf_instance_id) {
             trust.auth_attempts += 1;
@@ -264,7 +264,7 @@ impl ZeroTrustEngine {
     /// Verify an inter-PLMN request.
     pub fn verify(&mut self, plmn_id: &str, has_mtls: bool, has_token: bool, has_attestation: bool) -> VerificationResult {
         self.verification_count += 1;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("value expected").as_millis() as u64;
 
         let achieved_level = match (has_mtls, has_token, has_attestation) {
             (true, true, true) => ZeroTrustLevel::Full,
@@ -415,7 +415,7 @@ impl ThreatDetector {
     /// Assess a request for threats.
     pub fn assess(&mut self, plmn_id: &str) -> ThreatAssessment {
         self.assessment_count += 1;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("value expected").as_millis() as u64;
         let window_start = now.saturating_sub(self.window.as_millis() as u64);
 
         let timestamps = self.request_counts.entry(plmn_id.to_string()).or_default();
