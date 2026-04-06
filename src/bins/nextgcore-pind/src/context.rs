@@ -185,14 +185,14 @@ impl PinContext {
 
         owners.get(supi)
             .map(|ids| ids.iter().filter_map(|id| pins.get(id).cloned()).collect())
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     /// List all PINs
     pub fn pin_list(&self) -> Vec<PersonalIotNetwork> {
         self.pin_networks.read()
             .map(|p| p.values().cloned().collect())
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     pub fn pin_count(&self) -> usize {

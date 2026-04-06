@@ -9,6 +9,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use ogs_sbi::context::global_context;
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::server::{
     send_bad_request, send_method_not_allowed, send_not_found,
@@ -86,7 +87,7 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) {
         log::info!("Received shutdown signal");
         shutdown.store(true, Ordering::SeqCst);
     })
-    .unwrap_or_default();
+    .expect("value expected");
 }
 
 #[tokio::main]
@@ -136,6 +137,14 @@ async fn main() -> Result<()> {
 
     let scheme = if args.tls { "HTTPS" } else { "HTTP" };
     log::info!("SBI HTTP/2 {scheme} server listening on {addr}");
+
+    // Register with NRF
+    let sbi_ctx = global_context();
+    sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
+    if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port).await {
+        log::warn!("NRF registration failed (will operate without NRF): {e}");
+    }
+
     log::info!("NextGCore MB-SMF ready");
 
     // Main event loop
@@ -491,23 +500,54 @@ async fn handle_mbs_session_activate(session_id: &str, request: &SbiRequest) -> 
 
     match session {
         Some(session) => {
-            let n4mb = session.n4mb_session.as_ref().unwrap_or_default();
+            let n4mb = session.n4mb_session.as_ref().expect("value expected");
+            let local_seid = n4mb.local_seid;
+            let dl_teid = n4mb.dl_teid;
+            let mcast_pdr_id = n4mb.mcast_pdr_id;
+            let mcast_far_id = n4mb.mcast_far_id;
+
             log::info!(
-                "MBS Session {session_id} activated: N4mb SEID={}, UPF={}, TEID={:#x}",
-                n4mb.local_seid, upf_addr, n4mb.dl_teid
+                "MBS Session {session_id} activated: N4mb SEID={local_seid}, UPF={upf_addr}, TEID={dl_teid:#x}"
             );
+
+            // Send PFCP Session Establishment Request to UPF with MBS-specific
+            // PDR/FAR rules for multicast transport (TS 23.247 §7.3.2, TS 29.244).
+            // Fire-and-forget: the response is processed asynchronously.
+            let upf_pfcp_port: u16 = std::env::var("UPF_PFCP_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(8805);
+            let upf_addr_octets = upf_addr.octets();
+
+            tokio::spawn(async move {
+                let msg = build_n4mb_pfcp_establishment(
+                    local_seid, dl_teid, mcast_pdr_id, mcast_far_id, upf_addr_octets,
+                );
+                let dest = std::net::SocketAddr::from((upf_addr_octets, upf_pfcp_port));
+                match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
+                    Ok(sock) => match sock.send_to(&msg, dest).await {
+                        Ok(n) => log::info!(
+                            "[N4mb] PFCP Session Establishment Request sent to {dest} ({n} bytes)"
+                        ),
+                        Err(e) => log::warn!(
+                            "[N4mb] Failed to send PFCP Session Establishment to {dest}: {e}"
+                        ),
+                    },
+                    Err(e) => log::warn!("[N4mb] Failed to bind UDP socket: {e}"),
+                }
+            });
 
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({
                     "mbsSessionId": session_id,
                     "mbsSessionStatus": "ACTIVE",
                     "n4mbSession": {
-                        "localSeid": n4mb.local_seid,
+                        "localSeid": local_seid,
                         "upfAddr": upf_addr.to_string(),
-                        "dlTeid": format!("{:#010x}", n4mb.dl_teid),
+                        "dlTeid": format!("{:#010x}", dl_teid),
                         "state": "ESTABLISHMENT_PENDING",
-                        "mcastPdrId": n4mb.mcast_pdr_id,
-                        "mcastFarId": n4mb.mcast_far_id,
+                        "mcastPdrId": mcast_pdr_id,
+                        "mcastFarId": mcast_far_id,
                     },
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
@@ -516,6 +556,122 @@ async fn handle_mbs_session_activate(session_id: &str, request: &SbiRequest) -> 
             send_not_found(&format!("MBS Session {session_id} not found"), Some("SESSION_NOT_FOUND"))
         }
     }
+}
+
+/// Build a PFCP Session Establishment Request for N4mb multicast (TS 29.244).
+///
+/// Message layout (TLV, big-endian):
+///   PFCP header (version=1, SEID flag set, msg_type=50)
+///   F-SEID IE (SMF local SEID + IPv4)
+///   CREATE_PDR IE  (multicast downlink PDR)
+///     PDR-ID, Precedence, PDI (Source-Interface=ACCESS, F-TEID with multicast TEID)
+///     FAR-ID (reference to the FAR below)
+///   CREATE_FAR IE  (multicast forwarding FAR)
+///     FAR-ID, Apply-Action=FORW (0x02), Forwarding-Parameters (Destination-Interface=CORE)
+fn build_n4mb_pfcp_establishment(
+    local_seid: u64,
+    dl_teid: u32,
+    pdr_id: u16,
+    far_id: u32,
+    upf_addr: [u8; 4],
+) -> Vec<u8> {
+    // IE type codes (TS 29.244 Table 7.5.2-1)
+    const IE_CREATE_PDR: u16 = 1;
+    const IE_PDI: u16 = 2;
+    const IE_CREATE_FAR: u16 = 3;
+    const IE_FORWARDING_PARAMETERS: u16 = 4;
+    const IE_SOURCE_INTERFACE: u16 = 20;
+    const IE_F_TEID: u16 = 21;
+    const IE_PRECEDENCE: u16 = 29;
+    const IE_APPLY_ACTION: u16 = 44;
+    const IE_DESTINATION_INTERFACE: u16 = 42;
+    const IE_PDR_ID: u16 = 56;
+    const IE_F_SEID: u16 = 57;
+    const IE_FAR_ID: u16 = 108;
+
+    // Helper: append a TLV IE to buf
+    fn tlv(buf: &mut Vec<u8>, ie_type: u16, value: &[u8]) {
+        buf.extend_from_slice(&ie_type.to_be_bytes());
+        buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        buf.extend_from_slice(value);
+    }
+
+    // ---- F-SEID IE ----
+    let mut f_seid_val: Vec<u8> = Vec::new();
+    f_seid_val.push(0x02); // V4 flag
+    f_seid_val.extend_from_slice(&local_seid.to_be_bytes());
+    f_seid_val.extend_from_slice(&upf_addr);
+    let mut f_seid_ie: Vec<u8> = Vec::new();
+    tlv(&mut f_seid_ie, IE_F_SEID, &f_seid_val);
+
+    // ---- PDI grouped IE ----
+    // Source-Interface = 0 (ACCESS)
+    let mut pdi_buf: Vec<u8> = Vec::new();
+    tlv(&mut pdi_buf, IE_SOURCE_INTERFACE, &[0u8]);
+    // F-TEID: flags=V4(0x02), TEID, IPv4 (upf_addr is multicast transport addr)
+    let mut f_teid_val: Vec<u8> = Vec::new();
+    f_teid_val.push(0x02);
+    f_teid_val.extend_from_slice(&dl_teid.to_be_bytes());
+    f_teid_val.extend_from_slice(&upf_addr);
+    tlv(&mut pdi_buf, IE_F_TEID, &f_teid_val);
+
+    // ---- CREATE_PDR grouped IE ----
+    let mut pdr_buf: Vec<u8> = Vec::new();
+    tlv(&mut pdr_buf, IE_PDR_ID, &pdr_id.to_be_bytes());
+    tlv(&mut pdr_buf, IE_PRECEDENCE, &100u32.to_be_bytes());
+    // Embed PDI
+    pdr_buf.extend_from_slice(&IE_PDI.to_be_bytes());
+    pdr_buf.extend_from_slice(&(pdi_buf.len() as u16).to_be_bytes());
+    pdr_buf.extend_from_slice(&pdi_buf);
+    // FAR-ID reference
+    tlv(&mut pdr_buf, IE_FAR_ID, &far_id.to_be_bytes());
+
+    // ---- Forwarding Parameters grouped IE ----
+    let mut fwd_params: Vec<u8> = Vec::new();
+    // Destination-Interface = 1 (CORE)
+    tlv(&mut fwd_params, IE_DESTINATION_INTERFACE, &[1u8]);
+
+    // ---- CREATE_FAR grouped IE ----
+    let mut far_buf: Vec<u8> = Vec::new();
+    tlv(&mut far_buf, IE_FAR_ID, &far_id.to_be_bytes());
+    // Apply-Action = FORW (0x02)
+    tlv(&mut far_buf, IE_APPLY_ACTION, &0x0002u16.to_be_bytes());
+    // Forwarding-Parameters
+    far_buf.extend_from_slice(&IE_FORWARDING_PARAMETERS.to_be_bytes());
+    far_buf.extend_from_slice(&(fwd_params.len() as u16).to_be_bytes());
+    far_buf.extend_from_slice(&fwd_params);
+
+    // ---- Assemble IEs ----
+    let mut ies: Vec<u8> = Vec::new();
+    ies.extend_from_slice(&f_seid_ie);
+    // CREATE_PDR
+    ies.extend_from_slice(&IE_CREATE_PDR.to_be_bytes());
+    ies.extend_from_slice(&(pdr_buf.len() as u16).to_be_bytes());
+    ies.extend_from_slice(&pdr_buf);
+    // CREATE_FAR
+    ies.extend_from_slice(&IE_CREATE_FAR.to_be_bytes());
+    ies.extend_from_slice(&(far_buf.len() as u16).to_be_bytes());
+    ies.extend_from_slice(&far_buf);
+
+    // ---- PFCP Header (TS 29.244 §7.2.2) ----
+    // Byte 0: version=1 (bits 7-5), FO=0, MP=0, S=1 (SEID present, bit 0)
+    // Byte 1: Message Type = 50 (Session Establishment Request)
+    // Bytes 2-3: Message Length = everything after the first 4 bytes of header.
+    // With SEID present: 8 (SEID) + 3 (seq) + 1 (spare) + IEs = 12 + ies.len()
+    let seq_num: u32 = 1;
+    let msg_len: u16 = (12 + ies.len()) as u16;
+    let mut packet: Vec<u8> = Vec::with_capacity(16 + ies.len());
+    packet.push(0x21); // version=1, S=1
+    packet.push(50);   // SESSION_ESTABLISHMENT_REQUEST
+    packet.extend_from_slice(&msg_len.to_be_bytes());
+    packet.extend_from_slice(&0u64.to_be_bytes()); // SEID=0 for establishment (CP→UP)
+    // Sequence number (3 bytes) + spare (1 byte)
+    packet.push(((seq_num >> 16) & 0xFF) as u8);
+    packet.push(((seq_num >> 8)  & 0xFF) as u8);
+    packet.push(( seq_num        & 0xFF) as u8);
+    packet.push(0); // spare
+    packet.extend_from_slice(&ies);
+    packet
 }
 
 /// Handle member join (TMGI group membership)
@@ -619,6 +775,90 @@ async fn handle_member_leave(session_id: &str, supi: &str) -> SbiResponse {
             &format!("UE {supi} not found in session {session_id}"),
             Some("MEMBER_NOT_FOUND"),
         )
+    }
+}
+
+/// Register MB-SMF with NRF
+async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> {
+    let sbi_ctx = global_context();
+
+    let nrf_uri = sbi_ctx.get_nrf_uri().await;
+    let nrf_uri = match nrf_uri {
+        Some(uri) => uri,
+        None => {
+            log::debug!("No NRF URI configured, skipping NRF registration");
+            return Ok(());
+        }
+    };
+
+    log::info!("Registering MB-SMF with NRF at {nrf_uri}");
+
+    let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
+    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
+    let nf_instance_id = uuid::Uuid::new_v4().to_string();
+
+    let nf_profile = serde_json::json!({
+        "nfInstanceId": nf_instance_id,
+        "nfType": "MB_SMF",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": [sbi_addr],
+        "nfServices": [{
+            "serviceInstanceId": format!("{}-nmbsmf-mbssession", nf_instance_id),
+            "serviceName": "nmbsmf-mbssession",
+            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+            "scheme": "http",
+            "nfServiceStatus": "REGISTERED",
+            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+        }],
+        "allowedNfTypes": ["AMF", "SMF", "NEF", "SCP"],
+        "heartBeatTimer": 10
+    });
+
+    let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
+    log::debug!("NRF registration: PUT {path}");
+
+    let response = client
+        .put_json(&path, &nf_profile)
+        .await
+        .map_err(|e| format!("NRF registration failed: {e}"))?;
+
+    match response.status {
+        200 | 201 => {
+            log::info!("MB-SMF registered with NRF successfully (id={nf_instance_id})");
+
+            let mut self_instance = ogs_sbi::context::NfInstance::new(
+                &nf_instance_id,
+                ogs_sbi::types::NfType::Mbsmf,
+            );
+            self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
+            let mut svc = ogs_sbi::context::NfService::new(
+                "nmbsmf-mbssession",
+                ogs_sbi::types::SbiServiceType::Null,
+            );
+            svc.port = sbi_port;
+            svc.ip_addresses = vec![sbi_addr.to_string()];
+            self_instance.add_service(svc);
+            sbi_ctx.set_self_instance(self_instance).await;
+
+            Ok(())
+        }
+        _ => Err(format!("NRF registration returned status {}", response.status)),
+    }
+}
+
+/// Parse host and port from a URI string (e.g., "http://localhost:7777")
+fn parse_host_port(uri: &str) -> Option<(String, u16)> {
+    let without_scheme = uri
+        .strip_prefix("https://")
+        .or_else(|| uri.strip_prefix("http://"))
+        .unwrap_or(uri);
+    let (host_port, _path) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    if let Some((host, port_str)) = host_port.rsplit_once(':') {
+        let port: u16 = port_str.parse().ok()?;
+        Some((host.to_string(), port))
+    } else {
+        let default_port = if uri.starts_with("https://") { 443 } else { 80 };
+        Some((host_port.to_string(), default_port))
     }
 }
 

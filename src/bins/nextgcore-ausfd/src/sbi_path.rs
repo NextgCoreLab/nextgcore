@@ -39,7 +39,7 @@ static SBI_RUNNING: AtomicBool = AtomicBool::new(false);
 ///
 /// Port of ausf_sbi_open()
 pub fn ausf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
-    let config = config.unwrap_or_default();
+    let config = config.unwrap_or(SbiServerConfig::default());
 
     log::info!("Opening AUSF SBI server on {}:{}", config.addr, config.port);
 

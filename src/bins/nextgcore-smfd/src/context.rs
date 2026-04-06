@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::session_extensions::Ipv4Pool;
@@ -1255,7 +1255,7 @@ impl MbsSession {
     pub fn new(id: u64, tmgi: Tmgi, session_id: String) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_secs();
         Self {
             id,
@@ -1332,7 +1332,7 @@ impl MbsSession {
         self.mbs_service_area.cell_ids = cell_ids;
         self.updated_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_secs();
     }
 }
@@ -1418,6 +1418,12 @@ pub struct SmfContext {
     /// Bitmap-based IPv4 address pool (10.45.0.0/16)
     pub ipv4_pool: Ipv4Pool,
 
+    /// Counter for allocating GTPv1 TEIDs on the Gn interface
+    pub gn_teid_counter: AtomicU32,
+
+    /// GGSN address for the Gn interface (used in Create/Update PDP Context Response)
+    pub gn_addr: std::net::Ipv4Addr,
+
     /// Context initialized flag
     initialized: AtomicBool,
 }
@@ -1458,6 +1464,11 @@ impl SmfContext {
             max_num_of_sess: 0,
             max_num_of_bearer: 0,
             ipv4_pool: Ipv4Pool::default_pool(),
+            gn_teid_counter: AtomicU32::new(1),
+            gn_addr: std::env::var("SMF_GN_ADDR")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(std::net::Ipv4Addr::new(127, 0, 0, 1)),
             initialized: AtomicBool::new(false),
         }
     }
@@ -2258,7 +2269,7 @@ impl SmfContext {
 
                 session.updated_at = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
+                    .expect("value expected")
                     .as_secs();
                 log::info!(
                     "[MBS] Session activated: id={mbs_sess_id} mcast_addr={multicast_addr} n4mb_seid={n4mb_session_id}"
@@ -2294,7 +2305,7 @@ impl SmfContext {
                     session.joined_ues.push(ue_id);
                     session.updated_at = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
+                        .expect("value expected")
                         .as_secs();
                     log::debug!(
                         "[MBS] UE added to session: mbs_sess_id={} ue_id={} total_ues={}",
@@ -2316,7 +2327,7 @@ impl SmfContext {
                 if session.joined_ues.len() < before {
                     session.updated_at = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
+                        .expect("value expected")
                         .as_secs();
                     log::debug!(
                         "[MBS] UE removed from session: mbs_sess_id={} ue_id={} total_ues={}",
@@ -2352,7 +2363,7 @@ impl SmfContext {
                     .cloned()
                     .collect()
             })
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     /// Get number of MBS sessions

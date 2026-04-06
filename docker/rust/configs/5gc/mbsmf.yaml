@@ -1,0 +1,12 @@
+# MB-SMF (Multicast/Broadcast Session Management Function) Configuration
+logger:
+  level: info
+
+mbsmf:
+  sbi:
+    server:
+      - address: 0.0.0.0
+        advertise: 172.23.0.33
+        port: 7777
+  nrf:
+    uri: http://172.23.0.10:7777

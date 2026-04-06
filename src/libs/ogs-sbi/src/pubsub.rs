@@ -68,7 +68,7 @@ impl SbiEvent {
     ) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_millis() as u64;
         Self {
             event_id,
@@ -183,7 +183,7 @@ impl Subscription {
     ) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_millis() as u64;
         Self {
             id,
@@ -207,7 +207,7 @@ impl Subscription {
         if let Some(expiry) = self.expiry_ms {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
+                .expect("value expected")
                 .as_millis() as u64;
             now > expiry
         } else {

@@ -367,6 +367,60 @@ pub fn ogs_app_config_read(file: &str) -> Result<OgsYamlDocument, InitError> {
     Ok(OgsYamlDocument::from_file(file)?)
 }
 
+// ── NF lifecycle helpers ──────────────────────────────────────────────────────
+
+/// Common NF startup initialisation.
+///
+/// Consolidates the three lines that appear verbatim in every NF `main`:
+/// 1. `env_logger` initialisation (respects `RUST_LOG`; falls back to `log_level`).
+/// 2. OpenTelemetry / OTLP tracing setup (no-op when the collector is absent).
+/// 3. `ctrlc` / SIGTERM signal handler that sets `shutdown` to `true`.
+///
+/// # Arguments
+/// * `service_name` — value of `env!("CARGO_PKG_NAME")` from the calling binary.
+/// * `log_level`    — default log level string (e.g. `"info"`).
+/// * `shutdown`     — shared `AtomicBool`; the signal handler stores `true` here.
+///
+/// # Errors
+/// Returns `InitError` if the signal handler cannot be registered.
+///
+/// # Example
+/// ```no_run
+/// use std::sync::{Arc, atomic::AtomicBool};
+/// use ogs_app::init::nf_common_init;
+///
+/// let shutdown = Arc::new(AtomicBool::new(false));
+/// nf_common_init("my-nf", "info", shutdown.clone()).expect("init failed");
+/// ```
+pub fn nf_common_init(
+    service_name: &str,
+    log_level: &str,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), InitError> {
+    // 1. Logging — honour RUST_LOG env var; fall back to the supplied level.
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or(log_level),
+    )
+    .format_timestamp_millis()
+    .init();
+
+    // 2. OpenTelemetry — best-effort; failures are logged but not fatal.
+    let otel_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .unwrap_or_else(|_| "http://jaeger:4317".to_string());
+    let _ = ogs_metrics::otel::init_otel(
+        ogs_metrics::otel::OtelConfig::new(service_name).with_endpoint(otel_endpoint),
+    );
+
+    // 3. Signal handler — graceful shutdown on Ctrl-C / SIGTERM.
+    ctrlc::set_handler(move || {
+        log::info!("Received shutdown signal");
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+    })
+    .map_err(|e| InitError::InitFailed(format!("Failed to set signal handler: {e}")))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

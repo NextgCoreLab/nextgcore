@@ -87,7 +87,7 @@ pub fn nrf_sbi_open(config: Option<SbiServerConfig>) -> Result<SbiServer, String
         return Err("SBI server already running".to_string());
     }
 
-    let config = config.unwrap_or_default();
+    let config = config.unwrap_or(SbiServerConfig::default());
     let mut server = SbiServer::new(config);
 
     // Add nnrf-nfm service (NF Management)

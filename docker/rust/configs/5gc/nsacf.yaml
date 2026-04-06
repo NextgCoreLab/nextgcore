@@ -1,0 +1,19 @@
+# NSACF (Network Slice Admission Control Function) Configuration
+logger:
+  level: info
+
+nsacf:
+  sbi:
+    server:
+      - address: 0.0.0.0
+        advertise: 172.23.0.34
+        port: 7777
+  nrf:
+    uri: http://172.23.0.10:7777
+  slice_quotas:
+    - sst: 1
+      max_ues: 1000
+    - sst: 2
+      max_ues: 500
+    - sst: 3
+      max_ues: 2000

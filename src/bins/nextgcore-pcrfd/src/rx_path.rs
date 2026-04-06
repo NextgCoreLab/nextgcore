@@ -176,7 +176,7 @@ pub fn pcrf_rx_handle_aar(
     session_id: &str,
     ipv4_addr: Option<[u8; 4]>,
     ipv6_addr: Option<[u8; OGS_IPV6_LEN]>,
-    _rx_message: &RxMessage,
+    rx_message: &RxMessage,
 ) -> Result<u32, String> {
     log::debug!("Handling AAR: session={session_id}");
 
@@ -201,11 +201,42 @@ pub fn pcrf_rx_handle_aar(
         }
     };
 
-    // Send RAR to P-GW
+    // Convert Rx media components to Gx ImsData so derive_pcc_rules can produce
+    // matching PCC rules for the RAR Charging-Rule-Install AVP.
+    let ims_media: Vec<crate::gx_path::MediaComponent> = rx_message
+        .ims_data
+        .media_components
+        .iter()
+        .map(|mc| crate::gx_path::MediaComponent {
+            media_component_number: mc.media_component_number,
+            media_type: mc.media_type,
+            max_requested_bandwidth_dl: mc.max_requested_bandwidth_dl,
+            max_requested_bandwidth_ul: mc.max_requested_bandwidth_ul,
+            flow_status: mc.flow_status,
+            sub_components: mc.sub_components.iter().map(|sc| {
+                crate::gx_path::MediaSubComponent {
+                    flow_number: sc.flow_number,
+                    flow_usage: sc.flow_usage,
+                    flows: sc.flows.iter().map(|f| f.description.clone()).collect(),
+                }
+            }).collect(),
+        })
+        .collect();
+
+    log::debug!(
+        "AAR has {} media components for session {}",
+        ims_media.len(),
+        session_id
+    );
+
+    // Send RAR to P-GW with the extracted IMS media data.
+    // pcrf_gx_send_rar will call derive_pcc_rules and install the PCC rules.
     let mut rx_msg_for_rar = RxMessageForRar {
         cmd_code: rx_cmd_code::AA,
         result_code: 0,
-        ims_data: crate::gx_path::ImsData::default(),
+        ims_data: crate::gx_path::ImsData {
+            media_components: ims_media,
+        },
     };
 
     if let Err(e) = pcrf_gx_send_rar(&gx_sid, session_id, &mut rx_msg_for_rar) {

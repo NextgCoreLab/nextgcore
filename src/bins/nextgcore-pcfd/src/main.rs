@@ -745,7 +745,7 @@ async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest
             let triggers = update_data.get("repPolicyCtrlReqTriggers")
                 .and_then(|v| v.as_array())
                 .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>())
-                .unwrap_or_default();
+                .expect("value expected");
 
             log::info!("SM Policy Update triggers: {:?} for session PSI={}", triggers, sess.psi);
 

@@ -20,8 +20,8 @@ members = [
     "libs/ogs-proto",
     "libs/ogs-ipfw",
     "libs/ogs-tun",
-    "libs/ogs-ffi",
-    
+    # "libs/ogs-ffi",  # excluded: requires clang, no crate depends on it
+
     # Binary crates (mirrors src/)
     "bins/nextgcore-amfd",
     "bins/nextgcore-ausfd",
@@ -106,6 +106,7 @@ mongodb = { version = "2.8", default-features = false, features = ["sync"] }
 
 # Cryptography - using existing Rust crates where available
 aes = "0.8"
+aes-gcm = "0.10"
 sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"

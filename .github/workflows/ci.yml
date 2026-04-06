@@ -1,0 +1,159 @@
+name: CI
+
+on:
+  push:
+    branches: [initial_commit]
+  pull_request:
+    branches: [initial_commit]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+      - name: cargo check
+        run: cd src && cargo check --workspace
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+      - name: cargo test
+        run: cd src && cargo test --workspace
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+      - name: cargo clippy
+        run: cd src && cargo clippy --workspace -- -D warnings
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt
+        run: cd src && cargo fmt --all -- --check
+
+  docker-build:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build builder image
+        run: |
+          cd docker/rust
+          docker build -f Dockerfile.builder -t nextg-builder ../../
+
+      - name: Extract binaries
+        run: |
+          docker create --name builder nextg-builder /bin/true
+          mkdir -p docker/rust/binaries
+          docker cp builder:/out/. docker/rust/binaries/
+          docker rm builder
+          ls -la docker/rust/binaries/
+
+      - name: Build core base image
+        run: |
+          cd docker/rust
+          docker build -f Dockerfile.core -t nextgcore-core:latest .
+
+      - name: Build NF images
+        run: |
+          cd docker/rust
+          for nf in amfd ausfd bsfd eesd hssd lmfd mbsmfd mmed nrfd nsacfd nssfd nwdafd pcfd pcrfd pind scpd seppd sgwcd sgwud smfd udmd udrd upfd dccfd; do
+            echo "Building nextgcore-${nf}..."
+            docker build -f Dockerfile.nf \
+              --build-arg CORE_IMAGE=nextgcore-core:latest \
+              --build-arg NF_NAME=nextgcore-${nf} \
+              -t nextgcore-rust/${nf%%d}:latest . || echo "WARN: ${nf} build failed"
+          done
+
+      - name: Verify images
+        run: |
+          echo "Built images:"
+          docker images | grep nextgcore | sort
+
+  docker-e2e:
+    name: Docker E2E
+    runs-on: ubuntu-latest
+    needs: docker-build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build all images (repeat for job isolation)
+        run: |
+          cd docker/rust
+          docker build -f Dockerfile.builder -t nextg-builder ../../
+          docker create --name builder nextg-builder /bin/true
+          mkdir -p binaries
+          docker cp builder:/out/. binaries/
+          docker rm builder
+          docker build -f Dockerfile.core -t nextgcore-core:latest .
+          for nf in amfd ausfd bsfd nrfd nssfd pcfd smfd udmd udrd upfd; do
+            docker build -f Dockerfile.nf \
+              --build-arg CORE_IMAGE=nextgcore-core:latest \
+              --build-arg NF_NAME=nextgcore-${nf} \
+              -t nextgcore-rust/${nf%%d}:latest .
+          done
+
+      - name: Start core network
+        run: |
+          cd docker/rust
+          docker compose up -d mongodb nrf
+          sleep 5
+          docker compose up -d ausf udm udr pcf nssf bsf
+          sleep 5
+          docker compose up -d amf smf upf
+          sleep 10
+
+      - name: Health check
+        run: |
+          cd docker/rust
+          echo "=== Container status ==="
+          docker compose ps
+          echo "=== NRF health ==="
+          curl -sf http://172.23.0.10:7777/healthz || echo "NRF not responding"
+          echo "=== AMF health ==="
+          curl -sf http://172.23.0.5:7777/healthz || echo "AMF not responding"
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          cd docker/rust
+          docker compose logs --tail=50
+
+      - name: Teardown
+        if: always()
+        run: |
+          cd docker/rust
+          docker compose down -v

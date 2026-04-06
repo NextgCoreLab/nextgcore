@@ -294,7 +294,7 @@ impl DistTimerManager {
         self.sync_info.rtt_us = rtt_us;
         self.sync_info.last_sync_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_millis() as u64;
         self.sync_info.state = if offset_us.unsigned_abs() <= self.sync_info.max_drift_us {
             ClockSyncState::Synchronized

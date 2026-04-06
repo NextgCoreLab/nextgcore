@@ -216,9 +216,9 @@ pub fn ogs_addaddrinfo(
         *sa_list = new_head;
     } else {
         // Find tail of existing list
-        let mut current = sa_list.as_mut().unwrap_or_default();
+        let mut current = sa_list.as_mut().expect("sa_list was Some");
         while current.next.is_some() {
-            current = current.next.as_mut().unwrap_or_default();
+            current = current.next.as_mut().expect("next was Some");
         }
         current.next = new_head.map(Box::new);
     }
@@ -243,7 +243,7 @@ pub fn ogs_copyaddrinfo(src: &OgsSockaddr) -> OgsSockaddr {
     while let Some(ref src_next) = current_src {
         *current_dst = Some(Box::new((**src_next).clone()));
         current_src = &src_next.next;
-        current_dst = &mut current_dst.as_mut().unwrap_or_default().next;
+        current_dst = &mut current_dst.as_mut().expect("dst was set").next;
     }
 
     dst

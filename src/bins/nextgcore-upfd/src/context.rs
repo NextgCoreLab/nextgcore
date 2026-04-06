@@ -617,7 +617,7 @@ impl TsnCncInterface {
         self.connected = true;
         self.last_config_update = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_secs();
         log::info!(
             "[TSN CNC] Connected to CNC at {} with session ID {}",
@@ -644,7 +644,7 @@ impl TsnCncInterface {
         self.stream_configs.push(stream);
         self.last_config_update = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_secs();
     }
 
@@ -1047,7 +1047,7 @@ impl RateLimiter {
     fn now_nanos() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_nanos() as u64
     }
 
@@ -1625,7 +1625,7 @@ impl UpfContext {
         self.sess_list
             .read()
             .map(|l| l.values().cloned().collect())
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     /// Update session in context

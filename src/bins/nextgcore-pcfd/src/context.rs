@@ -838,7 +838,7 @@ impl UavPolicyAuthorization {
         self.caa_authorization_ref = Some(caa_ref.to_string());
         self.created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_secs();
         self.expires_at = self.created_at + duration_sec;
         log::info!(
@@ -854,7 +854,7 @@ impl UavPolicyAuthorization {
         self.authorized = false;
         self.expires_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_secs();
         log::warn!(
             "[UAV Policy] Authorization revoked for UAV {:?}: {}",
@@ -878,7 +878,7 @@ impl UavPolicyAuthorization {
     pub fn is_authorized(&self) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_secs();
         self.authorized && now >= self.created_at && now <= self.expires_at
     }

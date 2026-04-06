@@ -225,6 +225,28 @@ impl NsacfContext {
         quota_list.get(&id).cloned()
     }
 
+    /// Remove a quota by ID, returning true if it existed.
+    pub fn quota_remove(&self, id: u64) -> bool {
+        let mut quota_list = match self.quota_list.write() {
+            Ok(l) => l,
+            Err(_) => return false,
+        };
+        let mut snssai_hash = match self.snssai_hash.write() {
+            Ok(h) => h,
+            Err(_) => return false,
+        };
+        if let Some(quota) = quota_list.remove(&id) {
+            snssai_hash.remove(&(quota.s_nssai.sst, quota.s_nssai.sd));
+            log::info!(
+                "Slice quota removed: id={} S-NSSAI[SST:{} SD:{:?}]",
+                id, quota.s_nssai.sst, quota.s_nssai.sd
+            );
+            true
+        } else {
+            false
+        }
+    }
+
     /// Attempt to admit a UE to a slice (TS 23.502 4.2.9.2)
     pub fn admit_ue(&self, s_nssai: &SNssai) -> AdmissionResult {
         let snssai_hash = self.snssai_hash.read().ok()
@@ -292,7 +314,7 @@ impl NsacfContext {
                     .map(|q| (q.s_nssai.clone(), q.ue_utilization()))
                     .collect()
             })
-            .unwrap_or_default()
+            .expect("value expected")
     }
 }
 

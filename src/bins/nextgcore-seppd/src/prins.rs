@@ -139,7 +139,7 @@ pub fn apply_prins_protection(
                                 if let Some(original_value) = obj.remove(field_name) {
                                     // Encrypt the IE value (simplified: XOR-based placeholder)
                                     let encrypted = encrypt_ie(
-                                        &serde_json::to_string(&original_value).unwrap_or_default(),
+                                        &serde_json::to_string(&original_value).expect("value expected"),
                                         &prins_ctx.shared_key,
                                     );
                                     obj.insert(
@@ -165,7 +165,7 @@ pub fn apply_prins_protection(
                             if let Some(obj) = json.as_object() {
                                 if let Some(value) = obj.get(field_name) {
                                     let signature = sign_ie(
-                                        &serde_json::to_string(value).unwrap_or_default(),
+                                        &serde_json::to_string(value).expect("value expected"),
                                         &prins_ctx.shared_key,
                                     );
                                     modifications.push(N32fModification {
@@ -280,31 +280,88 @@ pub fn process_n32f_request(
 }
 
 // ============================================================================
-// Crypto helpers (simplified for initial implementation)
+// Crypto helpers - AES-128-GCM AEAD
 // ============================================================================
 
-/// Encrypt an IE value (simplified XOR-based encryption).
-/// In production, this would use AES-GCM or similar AEAD.
-fn encrypt_ie(plaintext: &str, key: &[u8]) -> String {
-    let mut result = Vec::with_capacity(plaintext.len());
-    let key_bytes = if key.is_empty() { &[0x42u8] } else { key };
-    for (i, b) in plaintext.bytes().enumerate() {
-        result.push(b ^ key_bytes[i % key_bytes.len()]);
+/// AES-128-GCM nonce length in bytes.
+const AES_GCM_NONCE_LEN: usize = 12;
+
+/// Derive a 16-byte AES-128 key from whatever the shared_key contains.
+///
+/// If the key is already 16 bytes, use it directly.
+/// If it is shorter or longer, SHA-256 hash it and take the first 16 bytes.
+fn derive_aes128_key(raw_key: &[u8]) -> [u8; 16] {
+    if raw_key.len() == 16 {
+        let mut k = [0u8; 16];
+        k.copy_from_slice(raw_key);
+        return k;
     }
-    base64url_encode(&result)
+    // Hash to get a well-distributed 16-byte key
+    use sha2::{Sha256, Digest};
+    let hash = Sha256::digest(raw_key);
+    let mut k = [0u8; 16];
+    k.copy_from_slice(&hash[..16]);
+    k
 }
 
-/// Decrypt an IE value
-fn decrypt_ie(ciphertext: &str, key: &[u8]) -> String {
-    if let Ok(decoded) = base64url_decode(ciphertext) {
-        let key_bytes = if key.is_empty() { &[0x42u8] } else { key };
-        let mut result = Vec::with_capacity(decoded.len());
-        for (i, b) in decoded.iter().enumerate() {
-            result.push(b ^ key_bytes[i % key_bytes.len()]);
+/// Encrypt an IE value with AES-128-GCM.
+///
+/// Output format: base64url(nonce || ciphertext || tag)
+/// where nonce is 12 random bytes, ciphertext and tag are from AES-GCM.
+fn encrypt_ie(plaintext: &str, key: &[u8]) -> String {
+    use aes_gcm::{Aes128Gcm, KeyInit, aead::{Aead, Nonce}};
+    use rand::Rng as _;
+
+    let aes_key = derive_aes128_key(key);
+    let cipher = Aes128Gcm::new_from_slice(&aes_key)
+        .expect("AES-128 key is exactly 16 bytes");
+
+    let nonce_bytes: [u8; AES_GCM_NONCE_LEN] = rand::rng().random();
+    let nonce = Nonce::<Aes128Gcm>::from_slice(&nonce_bytes);
+
+    let ciphertext = match cipher.encrypt(nonce, plaintext.as_bytes()) {
+        Ok(ct) => ct,
+        Err(_) => {
+            log::warn!("PRINS: AES-GCM encrypt failed");
+            return String::new();
         }
-        String::from_utf8(result).unwrap_or_default()
-    } else {
-        String::new()
+    };
+
+    // Prepend nonce so the receiver can decrypt
+    let mut blob = Vec::with_capacity(AES_GCM_NONCE_LEN + ciphertext.len());
+    blob.extend_from_slice(&nonce_bytes);
+    blob.extend_from_slice(&ciphertext);
+    base64url_encode(&blob)
+}
+
+/// Decrypt an IE value encrypted with AES-128-GCM.
+///
+/// Expects base64url(nonce || ciphertext || tag) as produced by encrypt_ie.
+fn decrypt_ie(ciphertext_b64: &str, key: &[u8]) -> String {
+    use aes_gcm::{Aes128Gcm, KeyInit, aead::{Aead, Nonce}};
+
+    let blob = match base64url_decode(ciphertext_b64) {
+        Ok(b) => b,
+        Err(_) => return String::new(),
+    };
+
+    if blob.len() <= AES_GCM_NONCE_LEN {
+        return String::new();
+    }
+
+    let (nonce_bytes, ct) = blob.split_at(AES_GCM_NONCE_LEN);
+    let nonce = Nonce::<Aes128Gcm>::from_slice(nonce_bytes);
+
+    let aes_key = derive_aes128_key(key);
+    let cipher = Aes128Gcm::new_from_slice(&aes_key)
+        .expect("AES-128 key is exactly 16 bytes");
+
+    match cipher.decrypt(nonce, ct) {
+        Ok(plaintext) => String::from_utf8(plaintext).unwrap_or_default(),
+        Err(_) => {
+            log::warn!("PRINS: AES-GCM decrypt failed (wrong key or corrupted data)");
+            String::new()
+        }
     }
 }
 
@@ -323,7 +380,7 @@ fn sign_ie(value: &str, key: &[u8]) -> String {
 fn extract_service_name(url: &str) -> String {
     let path = url.split('?').next().unwrap_or(url);
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    parts.first().map(|s| s.to_string()).unwrap_or_default()
+    parts.first().map(|s| s.to_string()).expect("value expected")
 }
 
 /// Simple base64url encode (no padding)
@@ -381,7 +438,7 @@ fn base64url_decode(input: &str) -> Result<Vec<u8>, String> {
 /// Simple random u64 for context ID generation
 fn random_u64() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("value expected");
     now.as_nanos() as u64
 }
 

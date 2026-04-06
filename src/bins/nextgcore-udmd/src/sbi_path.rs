@@ -42,7 +42,7 @@ static SBI_RUNNING: AtomicBool = AtomicBool::new(false);
 ///
 /// Port of udm_sbi_open()
 pub fn udm_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
-    let config = config.unwrap_or_default();
+    let config = config.unwrap_or(SbiServerConfig::default());
 
     log::info!("Opening UDM SBI server on {}:{}", config.addr, config.port);
 
@@ -195,7 +195,7 @@ pub async fn udm_nrf_discover(
     }
 
     // Parse discovered NF instances from response body
-    let body = response.http.content.unwrap_or_default();
+    let body = response.http.content.expect("value expected");
     let search_result: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| format!("Failed to parse NRF discovery response: {e}"))?;
 

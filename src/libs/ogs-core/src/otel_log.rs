@@ -97,7 +97,7 @@ impl StructuredLogEntry {
     pub fn new(severity: OtelSeverity, body: impl Into<String>) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_nanos() as u64;
 
         Self {

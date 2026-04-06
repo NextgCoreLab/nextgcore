@@ -8,6 +8,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use ogs_sbi::context::global_context;
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::server::{
     send_bad_request, send_method_not_allowed, send_not_found,
@@ -74,7 +75,7 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) {
         log::info!("Received shutdown signal");
         shutdown.store(true, Ordering::SeqCst);
     })
-    .unwrap_or_default();
+    .expect("value expected");
 }
 
 #[tokio::main]
@@ -114,6 +115,13 @@ async fn main() -> Result<()> {
     log::info!("Starting PIN Manager SBI server on {addr}");
     sbi_server.start(pin_sbi_request_handler).await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
+
+    // Register with NRF
+    let sbi_ctx = global_context();
+    sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
+    if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port).await {
+        log::warn!("NRF registration failed (will operate without NRF): {e}");
+    }
 
     log::info!("NextGCore PIN Manager ready");
 
@@ -297,7 +305,7 @@ async fn handle_element_register(pin_id: &str, request: &SbiRequest) -> SbiRespo
     let capabilities: Vec<String> = data.get("capabilities")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-        .unwrap_or_default();
+        .expect("value expected");
     let host_supi = data.get("hostSupi").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     let ctx = pin_self();
@@ -404,7 +412,7 @@ async fn handle_element_relay(element_id: &str, request: &SbiRequest) -> SbiResp
     let relay_path: Vec<String> = data.get("relayPath")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-        .unwrap_or_default();
+        .expect("value expected");
 
     let ctx = pin_self();
     let ok = if let Ok(context) = ctx.read() {
@@ -419,6 +427,54 @@ async fn handle_element_relay(element_id: &str, request: &SbiRequest) -> SbiResp
             .unwrap_or_else(|_| SbiResponse::with_status(200))
     } else {
         send_not_found(&format!("Element {element_id} not found"), Some("ELEMENT_NOT_FOUND"))
+    }
+}
+
+/// Register PIN Manager with NRF
+async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> {
+    let sbi_ctx = global_context();
+    let nrf_uri = match sbi_ctx.get_nrf_uri().await {
+        Some(uri) => uri,
+        None => return Ok(()),
+    };
+    log::info!("Registering PIN with NRF at {nrf_uri}");
+    let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
+    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
+    let nf_instance_id = uuid::Uuid::new_v4().to_string();
+    let nf_profile = serde_json::json!({
+        "nfInstanceId": nf_instance_id,
+        "nfType": "PIN",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": [sbi_addr],
+        "nfServices": [{
+            "serviceInstanceId": format!("{}-npin-eventexposure", nf_instance_id),
+            "serviceName": "npin-eventexposure",
+            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+            "scheme": "http",
+            "nfServiceStatus": "REGISTERED",
+            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+        }],
+        "heartBeatTimer": 10
+    });
+    let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
+    let response = client.put_json(&path, &nf_profile).await
+        .map_err(|e| format!("NRF registration failed: {e}"))?;
+    match response.status {
+        200 | 201 => {
+            log::info!("PIN registered with NRF (id={nf_instance_id})");
+            Ok(())
+        }
+        _ => Err(format!("NRF returned status {}", response.status)),
+    }
+}
+
+fn parse_host_port(uri: &str) -> Option<(String, u16)> {
+    let without_scheme = uri.strip_prefix("https://").or_else(|| uri.strip_prefix("http://")).unwrap_or(uri);
+    let (host_port, _) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    if let Some((host, port_str)) = host_port.rsplit_once(':') {
+        Some((host.to_string(), port_str.parse().ok()?))
+    } else {
+        Some((host_port.to_string(), if uri.starts_with("https://") { 443 } else { 80 }))
     }
 }
 

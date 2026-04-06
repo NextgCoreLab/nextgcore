@@ -433,7 +433,7 @@ impl MbSmfContext {
         self.session_list
             .read()
             .map(|l| l.values().cloned().collect())
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     /// Get active multicast sessions
@@ -446,7 +446,7 @@ impl MbSmfContext {
                     .cloned()
                     .collect()
             })
-            .unwrap_or_default()
+            .expect("value expected")
     }
 }
 

@@ -265,7 +265,7 @@ impl ErrorIndication {
         
         let gsn_address = msg.get_ie(133) // GSN Address
             .map(|ie| ie.value.to_vec())
-            .unwrap_or_default();
+            .expect("value expected");
         
         Ok(Self { teid, gsn_address })
     }

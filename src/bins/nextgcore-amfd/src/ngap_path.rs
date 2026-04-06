@@ -320,6 +320,80 @@ impl NgapServer {
                     log::info!("UE Context Release Complete from gNB");
                 }
             }
+            Some(0) => {
+                // HandoverPreparation (procedure code 0)
+                // InitiatingMessage = HandoverRequired from source gNB
+                // SuccessfulOutcome  = HandoverCommand to source gNB (AMF-initiated)
+                // UnsuccessfulOutcome = HandoverPreparationFailure
+                if data[0] == 0x00 {
+                    log::info!("HandoverRequired from association {association_id}");
+                } else if data[0] == 0x20 {
+                    log::info!("HandoverCommand SuccessfulOutcome from association {association_id}");
+                } else {
+                    log::warn!("HandoverPreparationFailure from association {association_id}");
+                }
+                if let Some(session) = self.sessions.read().await.get(&association_id) {
+                    let event = AmfEvent::ngap_message(session.id, data.to_vec());
+                    let _ = self.event_tx.send(event).await;
+                }
+            }
+            Some(1) => {
+                // HandoverResourceAllocation (procedure code 1)
+                // InitiatingMessage = HandoverRequest to target gNB (AMF-initiated)
+                // SuccessfulOutcome  = HandoverRequestAcknowledge from target gNB
+                // UnsuccessfulOutcome = HandoverFailure from target gNB
+                if data[0] == 0x00 {
+                    log::info!("HandoverRequest InitiatingMessage from association {association_id}");
+                } else if data[0] == 0x20 {
+                    log::info!("HandoverRequestAcknowledge from association {association_id}");
+                } else {
+                    log::warn!("HandoverFailure from association {association_id}");
+                }
+                if let Some(session) = self.sessions.read().await.get(&association_id) {
+                    let event = AmfEvent::ngap_message(session.id, data.to_vec());
+                    let _ = self.event_tx.send(event).await;
+                }
+            }
+            Some(3) => {
+                // PathSwitchRequest (procedure code 3)
+                // InitiatingMessage = PathSwitchRequest from target gNB (Xn-based HO)
+                // SuccessfulOutcome  = PathSwitchRequestAcknowledge
+                // UnsuccessfulOutcome = PathSwitchRequestFailure
+                if data[0] == 0x00 {
+                    log::info!("PathSwitchRequest from association {association_id}");
+                } else if data[0] == 0x20 {
+                    log::info!("PathSwitchRequestAcknowledge from association {association_id}");
+                } else {
+                    log::warn!("PathSwitchRequestFailure from association {association_id}");
+                }
+                if let Some(session) = self.sessions.read().await.get(&association_id) {
+                    let event = AmfEvent::ngap_message(session.id, data.to_vec());
+                    let _ = self.event_tx.send(event).await;
+                }
+            }
+            Some(25) => {
+                // HandoverCancel (procedure code 25)
+                // InitiatingMessage = HandoverCancel from source gNB
+                // SuccessfulOutcome  = HandoverCancelAcknowledge
+                if data[0] == 0x00 {
+                    log::info!("HandoverCancel from association {association_id}");
+                } else if data[0] == 0x20 {
+                    log::info!("HandoverCancelAcknowledge from association {association_id}");
+                }
+                if let Some(session) = self.sessions.read().await.get(&association_id) {
+                    let event = AmfEvent::ngap_message(session.id, data.to_vec());
+                    let _ = self.event_tx.send(event).await;
+                }
+            }
+            Some(27) => {
+                // HandoverNotification (procedure code 27)
+                // InitiatingMessage = HandoverNotify from target gNB
+                log::info!("HandoverNotify from association {association_id}");
+                if let Some(session) = self.sessions.read().await.get(&association_id) {
+                    let event = AmfEvent::ngap_message(session.id, data.to_vec());
+                    let _ = self.event_tx.send(event).await;
+                }
+            }
             _ => {
                 log::debug!("Unknown procedure code, forwarding to FSM");
                 // Create NGAP event for FSM processing
@@ -1218,10 +1292,14 @@ impl NgapServer {
         );
 
         // Decode the APER-encoded PDU Session Resource Setup Response using ASN.1
-        use nextgsim_ngap::procedures::pdu_session_resource::decode_pdu_session_resource_setup_response;
+        use ogs_ngap::{parser::decode_ngap_pdu, NgapMessage};
 
-        let response_data = match decode_pdu_session_resource_setup_response(data) {
-            Ok(resp) => resp,
+        let response_data = match decode_ngap_pdu(data) {
+            Ok(NgapMessage::PduSessionResourceSetupResponse(resp)) => resp,
+            Ok(other) => {
+                log::warn!("Expected PduSessionResourceSetupResponse, got {other:?}");
+                return Ok(());
+            }
             Err(e) => {
                 log::warn!("Failed to decode PDU Session Resource Setup Response: {e:?}");
                 return Ok(());
@@ -1237,33 +1315,31 @@ impl NgapServer {
         let mut gnb_addr: [u8; 4] = [127, 0, 0, 1];
         let mut pdu_session_id: u8 = 1;
 
-        if let Some(ref setup_list) = response_data.setup_list {
-            for item in setup_list {
-                pdu_session_id = item.pdu_session_id;
-                // Parse transfer: QFI(1) + gNB TEID(4,BE) + addr_type(1) + gNB IPv4(4)
-                if item.transfer.len() >= 10 {
-                    let teid = u32::from_be_bytes([
-                        item.transfer[1], item.transfer[2],
-                        item.transfer[3], item.transfer[4],
-                    ]);
-                    if item.transfer[5] == 1 && item.transfer.len() >= 10 {
-                        gnb_addr = [
-                            item.transfer[6], item.transfer[7],
-                            item.transfer[8], item.transfer[9],
-                        ];
-                    }
-                    gnb_teid = Some(teid);
-                    log::info!(
-                        "Extracted gNB TEID=0x{:08x}, addr={}.{}.{}.{}, QFI={}, PSI={}",
-                        teid, gnb_addr[0], gnb_addr[1], gnb_addr[2], gnb_addr[3],
-                        item.transfer[0], pdu_session_id
-                    );
-                } else {
-                    log::warn!(
-                        "Transfer IE too short for PSI={}: {} bytes",
-                        item.pdu_session_id, item.transfer.len()
-                    );
+        for item in &response_data.setup_list {
+            pdu_session_id = item.pdu_session_id;
+            // Parse transfer: QFI(1) + gNB TEID(4,BE) + addr_type(1) + gNB IPv4(4)
+            if item.transfer.len() >= 10 {
+                let teid = u32::from_be_bytes([
+                    item.transfer[1], item.transfer[2],
+                    item.transfer[3], item.transfer[4],
+                ]);
+                if item.transfer[5] == 1 && item.transfer.len() >= 10 {
+                    gnb_addr = [
+                        item.transfer[6], item.transfer[7],
+                        item.transfer[8], item.transfer[9],
+                    ];
                 }
+                gnb_teid = Some(teid);
+                log::info!(
+                    "Extracted gNB TEID=0x{:08x}, addr={}.{}.{}.{}, QFI={}, PSI={}",
+                    teid, gnb_addr[0], gnb_addr[1], gnb_addr[2], gnb_addr[3],
+                    item.transfer[0], pdu_session_id
+                );
+            } else {
+                log::warn!(
+                    "Transfer IE too short for PSI={}: {} bytes",
+                    item.pdu_session_id, item.transfer.len()
+                );
             }
         }
 
@@ -1513,7 +1589,7 @@ pub async fn amf_ngap_open(
     let addr = bind_addr.unwrap_or_else(|| {
         format!("{DEFAULT_NGAP_ADDR}:{OGS_NGAP_SCTP_PORT}")
             .parse()
-            .unwrap_or_default()
+            .expect("value expected")
     });
 
     let handle = NgapServerHandle::new(addr, amf_context, event_tx).await?;

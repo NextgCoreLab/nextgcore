@@ -574,6 +574,13 @@ fn resolve_nf_endpoint(service_type: SbiServiceType) -> SbiResult<(String, u16)>
     Ok((host, port))
 }
 
+/// Resolve the SMF SBI endpoint (host, port).
+///
+/// Convenience wrapper for the SMF service type used from ngap_handler.
+pub fn resolve_smf_endpoint() -> SbiResult<(String, u16)> {
+    resolve_nf_endpoint(SbiServiceType::NsmfPdusession)
+}
+
 /// Discover and send SBI request for UE
 pub fn amf_ue_sbi_discover_and_send(
     service_type: SbiServiceType,
@@ -767,12 +774,12 @@ pub async fn call_smf_create_sm_context(
     // Extract N1 SM message (base64-encoded PDU Session Accept from SMF)
     let n1_sm_msg = response_body["n1SmMsg"].as_str()
         .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-        .unwrap_or_default();
+        .expect("value expected");
 
     // Extract N2 SM Information (base64-encoded UPF tunnel info from SMF)
     let n2_sm_info = response_body["n2SmInfo"].as_str()
         .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-        .unwrap_or_default();
+        .expect("value expected");
 
     log::info!(
         "SMF SM Context Created: ref={}, n1_len={}, n2_len={}",
@@ -870,11 +877,11 @@ pub async fn call_smf_update_sm_context_with_n1(
 
     let n1_sm_msg = response_body["n1SmMsg"].as_str()
         .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-        .unwrap_or_default();
+        .expect("value expected");
 
     let n2_sm_info = response_body["n2SmInfo"].as_str()
         .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-        .unwrap_or_default();
+        .expect("value expected");
 
     log::info!("SMF SM Context Updated (N1): ref={sm_context_ref}, n1_len={}, n2_len={}",
         n1_sm_msg.len(), n2_sm_info.len());

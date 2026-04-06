@@ -262,12 +262,12 @@ fn parse_ng_setup_response(container: ProtocolIeContainer) -> NgapResult<NgSetup
             ie_name: "AMFName",
             ie_id: ie::IE_ID_AMF_NAME,
         })?,
-        served_guami_list: served_guami_list.unwrap_or_default(),
+        served_guami_list: served_guami_list.expect("value expected"),
         relative_amf_capacity: relative_amf_capacity.ok_or(NgapError::MissingMandatoryIe {
             ie_name: "RelativeAMFCapacity",
             ie_id: 86,
         })?,
-        plmn_support_list: plmn_support_list.unwrap_or_default(),
+        plmn_support_list: plmn_support_list.expect("value expected"),
     })
 }
 

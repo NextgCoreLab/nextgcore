@@ -1,0 +1,12 @@
+# EES (Edge Enabler Server) Configuration
+logger:
+  level: info
+
+ees:
+  sbi:
+    server:
+      - address: 0.0.0.0
+        advertise: 172.23.0.31
+        port: 7777
+  nrf:
+    uri: http://172.23.0.10:7777

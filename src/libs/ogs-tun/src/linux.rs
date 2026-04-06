@@ -48,7 +48,7 @@ impl Default for Ifreq {
 /// A `TunDevice` handle on success
 pub fn tun_open(ifname: &str, is_tap: bool) -> TunResult<TunDevice> {
     // Open /dev/net/tun
-    let dev_path = CString::new(TUN_DEV_PATH).unwrap_or_default();
+    let dev_path = CString::new(TUN_DEV_PATH).expect("value expected");
     let fd = unsafe { libc::open(dev_path.as_ptr(), libc::O_RDWR) };
 
     if fd < 0 {

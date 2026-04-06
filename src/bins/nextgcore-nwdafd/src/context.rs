@@ -126,7 +126,7 @@ impl AnalyticsSubscription {
     pub fn is_expired(&self) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_secs();
         now > self.expiry
     }
@@ -168,7 +168,7 @@ impl MlModelInfo {
     pub fn new(model_id: String, analytics_id: AnalyticsId, version: String) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("value expected")
             .as_secs();
         Self {
             model_id,
@@ -312,7 +312,7 @@ impl NwdafContext {
                     .cloned()
                     .collect()
             })
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     /// Register an ML model
@@ -340,7 +340,7 @@ impl NwdafContext {
                     .cloned()
                     .collect()
             })
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     /// Update ML model status
@@ -350,7 +350,7 @@ impl NwdafContext {
                 model.status = status;
                 model.updated_at = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
+                    .expect("value expected")
                     .as_secs();
                 log::info!("ML model {model_id} status updated to {status:?}");
                 return true;
@@ -379,7 +379,7 @@ impl NwdafContext {
                     .cloned()
                     .collect()
             })
-            .unwrap_or_default()
+            .expect("value expected")
     }
 
     pub fn subscription_count(&self) -> usize {

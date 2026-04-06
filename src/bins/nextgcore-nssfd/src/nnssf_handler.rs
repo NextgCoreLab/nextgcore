@@ -169,8 +169,8 @@ pub fn nssf_nnssf_nsselection_handle_get_from_amf_or_vnssf(
         // Return home network NSI information
         return NsSelectionResult::Success(AuthorizedNetworkSliceInfo {
             nsi_information: Some(NsiInformation {
-                nrf_id: home.nrf_id.clone().unwrap_or_default(),
-                nsi_id: home.nsi_id.clone().unwrap_or_default(),
+                nrf_id: home.nrf_id.clone().expect("value expected"),
+                nsi_id: home.nsi_id.clone().expect("value expected"),
             }),
         });
     }

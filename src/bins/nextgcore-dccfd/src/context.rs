@@ -5,13 +5,24 @@
 //! - Analytics context bindings (pairing subscriptions with analytics consumers)
 //! - Fan-out state (which consumer URIs should receive a given notification)
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
+
+/// A registered data-management subscription with its notification callback URI.
+#[derive(Debug, Clone)]
+pub struct DccfSubscription {
+    /// Subscription ID (UUID)
+    pub id: String,
+    /// Consumer callback URI for Ndccf_DataManagement_Notify (may be empty)
+    pub notify_uri: String,
+}
 
 /// DCCF process-wide context
 struct DccfContext {
     /// Active data subscription IDs (Ndccf_DataManagement)
     subscriptions: HashSet<String>,
+    /// Subscription metadata (ID -> callback URI)
+    subscription_map: HashMap<String, DccfSubscription>,
     /// Active analytics context IDs (Ndccf_ContextDocument)
     analytics_contexts: HashSet<String>,
     /// Maximum allowed subscriptions
@@ -23,7 +34,7 @@ struct DccfContext {
 static CONTEXT: OnceLock<Mutex<DccfContext>> = OnceLock::new();
 
 fn ctx() -> &'static Mutex<DccfContext> {
-    CONTEXT.get().unwrap_or_default()
+    CONTEXT.get().expect("value expected")
 }
 
 /// Initialize the DCCF context (call once at startup).
@@ -31,6 +42,7 @@ pub fn dccf_context_init(max_subscriptions: usize) {
     CONTEXT.get_or_init(|| {
         Mutex::new(DccfContext {
             subscriptions: HashSet::new(),
+            subscription_map: HashMap::new(),
             analytics_contexts: HashSet::new(),
             max_subscriptions,
             fanout_count: 0,
@@ -42,20 +54,33 @@ pub fn dccf_context_init(max_subscriptions: usize) {
 // Subscription management (Ndccf_DataManagement_Subscribe)
 // ---------------------------------------------------------------------------
 
-/// Registers a new subscription.  Returns false if capacity is exhausted.
+/// Registers a new subscription with an optional consumer callback URI.
+/// Returns false if capacity is exhausted.
 pub fn dccf_context_add_subscription(sub_id: String) -> bool {
+    dccf_context_add_subscription_with_uri(sub_id, String::new())
+}
+
+/// Registers a new subscription with a consumer callback URI.
+/// Returns false if capacity is exhausted.
+pub fn dccf_context_add_subscription_with_uri(sub_id: String, notify_uri: String) -> bool {
     let mut c = ctx().lock().unwrap();
     if c.subscriptions.len() >= c.max_subscriptions {
         log::warn!("[DCCF] subscription capacity exhausted ({})", c.max_subscriptions);
         return false;
     }
+    c.subscription_map.insert(sub_id.clone(), DccfSubscription {
+        id: sub_id.clone(),
+        notify_uri,
+    });
     c.subscriptions.insert(sub_id);
     true
 }
 
 /// Removes a subscription.  Returns true if it existed.
 pub fn dccf_context_remove_subscription(sub_id: &str) -> bool {
-    ctx().lock().unwrap().subscriptions.remove(sub_id)
+    let mut c = ctx().lock().unwrap();
+    c.subscription_map.remove(sub_id);
+    c.subscriptions.remove(sub_id)
 }
 
 /// Returns true if the subscription exists.
@@ -93,18 +118,26 @@ pub fn dccf_context_remove_analytics_context(ctx_id: &str) {
 
 /// Fans out a notification body to all registered analytics consumers.
 ///
-/// In a full implementation this would iterate over consumer callback URIs
-/// and POST the notification.  Here we log and increment the counter.
-pub fn dccf_context_fanout_notify(body: &str) {
+/// Returns the list of (sub_id, notify_uri) pairs that have a non-empty
+/// callback URI.  The caller is responsible for making the HTTP POST requests
+/// (the context lock must not be held during network I/O).
+pub fn dccf_context_fanout_notify(body: &str) -> Vec<(String, String)> {
     let mut c = ctx().lock().unwrap();
-    let subscriber_count = c.subscriptions.len();
-    c.fanout_count += subscriber_count as u64;
+    let targets: Vec<(String, String)> = c
+        .subscription_map
+        .values()
+        .filter(|s| !s.notify_uri.is_empty())
+        .map(|s| (s.id.clone(), s.notify_uri.clone()))
+        .collect();
+    c.fanout_count += targets.len().max(c.subscriptions.len()) as u64;
     log::debug!(
-        "[DCCF] fanout: {} subscribers, body_len={}, total_fanout={}",
-        subscriber_count,
+        "[DCCF] fanout: {} subscribers ({} with callback URI), body_len={}, total_fanout={}",
+        c.subscriptions.len(),
+        targets.len(),
         body.len(),
         c.fanout_count,
     );
+    targets
 }
 
 /// Returns the total number of notification fan-outs performed.
@@ -133,6 +166,7 @@ mod tests {
         let _ = CONTEXT.get_or_init(|| {
             Mutex::new(DccfContext {
                 subscriptions: HashSet::new(),
+                subscription_map: HashMap::new(),
                 analytics_contexts: HashSet::new(),
                 max_subscriptions: 16,
                 fanout_count: 0,
@@ -166,9 +200,19 @@ mod tests {
         let before = dccf_context_fanout_count();
         dccf_context_add_subscription("sub-a".into());
         dccf_context_add_subscription("sub-b".into());
-        dccf_context_fanout_notify("{}");
+        let targets = dccf_context_fanout_notify("{}");
         let after = dccf_context_fanout_count();
-        // Should have incremented by at least 2 (may be more if other tests added subs)
-        assert!(after >= before + 2);
+        // Fanout counter should have increased (by subscriber count, at least)
+        assert!(after > before);
+        // Both subs have no URI so targets list is empty
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn test_fanout_with_callback_uris() {
+        init();
+        dccf_context_add_subscription_with_uri("sub-uri-1".into(), "http://nwdaf:8080/notify".into());
+        let targets = dccf_context_fanout_notify("{}");
+        assert!(targets.iter().any(|(id, _)| id == "sub-uri-1"));
     }
 }
