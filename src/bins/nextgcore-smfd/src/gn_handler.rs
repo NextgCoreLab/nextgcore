@@ -302,12 +302,13 @@ pub fn handle_update_pdp_context_request(
     info!("[GTPv1] Update PDP Context Request");
 
     // Validate NSAPI
-    if req.nsapi.is_none() {
-        error!("No NSAPI in Update PDP Context Request");
-        return Ok((cause::MANDATORY_IE_MISSING, Bytes::new()));
-    }
-
-    let nsapi = req.nsapi.expect("value expected");
+    let nsapi = match req.nsapi {
+        Some(n) => n,
+        None => {
+            error!("No NSAPI in Update PDP Context Request");
+            return Ok((cause::MANDATORY_IE_MISSING, Bytes::new()));
+        }
+    };
     info!("[GTPv1] Updating NSAPI: {nsapi}");
 
     use std::sync::atomic::Ordering as AtomicOrdering;
@@ -337,12 +338,13 @@ pub fn handle_delete_pdp_context_request(
 ) -> Result<(u8, Bytes), GnError> {
     info!("[GTPv1] Delete PDP Context Request");
 
-    if req.nsapi.is_none() {
-        error!("No NSAPI in Delete PDP Context Request");
-        return Ok((cause::MANDATORY_IE_MISSING, Bytes::new()));
-    }
-
-    let nsapi = req.nsapi.expect("value expected");
+    let nsapi = match req.nsapi {
+        Some(n) => n,
+        None => {
+            error!("No NSAPI in Delete PDP Context Request");
+            return Ok((cause::MANDATORY_IE_MISSING, Bytes::new()));
+        }
+    };
     info!("[GTPv1] Deleting NSAPI: {}, teardown={}", nsapi, req.teardown_ind);
 
     // In a full implementation, would:

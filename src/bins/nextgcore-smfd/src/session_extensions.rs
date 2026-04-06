@@ -361,8 +361,9 @@ impl SscHandler {
             active: true,
         };
 
-        self.forwarding_tunnels.insert(session_id.to_string(), tunnel);
-        self.forwarding_tunnels.get(session_id).expect("value expected")
+        self.forwarding_tunnels
+            .entry(session_id.to_string())
+            .or_insert(tunnel)
     }
 
     /// Completes SSC Mode 3 handover (remove forwarding)

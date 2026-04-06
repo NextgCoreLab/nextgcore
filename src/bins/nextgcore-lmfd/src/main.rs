@@ -319,7 +319,7 @@ async fn handle_nrppa_report(request: &SbiRequest) -> SbiResponse {
                 rtt_ns: c.get("rttNs").and_then(|v| v.as_u64()),
             }
         }).collect())
-        .expect("value expected");
+        .unwrap_or_default();
 
     let ctx = lmf_self();
     let location = if let Ok(context) = ctx.read() {

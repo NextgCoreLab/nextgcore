@@ -1058,9 +1058,16 @@ pub fn process_xr_qos_flow_binding(
     let mut xr_metadata = Vec::new();
     for rule in &policy.pcc_rules {
         if rule.rule_type == PccRuleType::Install && is_xr_5qi(rule.qos.qci) {
+            let rule_id = match rule.id.clone() {
+                Some(id) => id,
+                None => {
+                    log::warn!("Skipping XR PCC rule with no id (5QI={})", rule.qos.qci);
+                    continue;
+                }
+            };
             let chars = lookup_xr_5qi(rule.qos.qci);
             xr_metadata.push(XrFlowMetadata {
-                rule_id: rule.id.clone().expect("value expected"),
+                rule_id,
                 five_qi: rule.qos.qci,
                 delay_budget_ms: chars.as_ref().map(|c| c.packet_delay_budget_ms).unwrap_or(30),
                 gbr_dl_bps: rule.qos.gbr.downlink,

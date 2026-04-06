@@ -322,8 +322,14 @@ pub fn handle_request(
     let discovery_presence = target_nf_type.is_some() && service_type.is_some();
 
     if discovery_presence {
-        let target_nf_type = target_nf_type.expect("value expected");
-        let service_type = service_type.expect("value expected");
+        let target_nf_type = match target_nf_type {
+            Some(t) => t,
+            None => return RequestHandlerResult::Error("Missing target NF type".to_string()),
+        };
+        let service_type = match service_type {
+            Some(s) => s,
+            None => return RequestHandlerResult::Error("Missing service type".to_string()),
+        };
 
         assoc.target_nf_type = target_nf_type;
         assoc.service_type = service_type;

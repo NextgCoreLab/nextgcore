@@ -305,7 +305,7 @@ async fn handle_element_register(pin_id: &str, request: &SbiRequest) -> SbiRespo
     let capabilities: Vec<String> = data.get("capabilities")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-        .expect("value expected");
+        .unwrap_or_default();
     let host_supi = data.get("hostSupi").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     let ctx = pin_self();
@@ -412,7 +412,7 @@ async fn handle_element_relay(element_id: &str, request: &SbiRequest) -> SbiResp
     let relay_path: Vec<String> = data.get("relayPath")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-        .expect("value expected");
+        .unwrap_or_default();
 
     let ctx = pin_self();
     let ok = if let Ok(context) = ctx.read() {

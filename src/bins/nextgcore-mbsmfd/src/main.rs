@@ -500,7 +500,13 @@ async fn handle_mbs_session_activate(session_id: &str, request: &SbiRequest) -> 
 
     match session {
         Some(session) => {
-            let n4mb = session.n4mb_session.as_ref().expect("value expected");
+            let n4mb = match session.n4mb_session.as_ref() {
+                Some(n) => n,
+                None => {
+                    log::error!("MBS Session {session_id} has no N4mb session after activation");
+                    return send_bad_request("N4mb session not initialized", Some("N4MB_SESSION_MISSING"));
+                }
+            };
             let local_seid = n4mb.local_seid;
             let dl_teid = n4mb.dl_teid;
             let mcast_pdr_id = n4mb.mcast_pdr_id;

@@ -195,7 +195,8 @@ pub async fn udm_nrf_discover(
     }
 
     // Parse discovered NF instances from response body
-    let body = response.http.content.expect("value expected");
+    let body = response.http.content
+        .ok_or_else(|| "NRF discovery response has no body".to_string())?;
     let search_result: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| format!("Failed to parse NRF discovery response: {e}"))?;
 

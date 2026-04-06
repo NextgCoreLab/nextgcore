@@ -227,7 +227,7 @@ async fn handle_eas_register(request: &SbiRequest) -> SbiResponse {
     let tacs: Vec<u32> = data.get("servingAreaTacs")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
-        .expect("value expected");
+        .unwrap_or_default();
 
     let profile = EasProfile {
         eas_id: String::new(),
@@ -490,7 +490,7 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> 
 
     let nf_profile = serde_json::json!({
         "nfInstanceId": nf_instance_id,
-        "nfType": "EASDF",
+        "nfType": "EES",
         "nfStatus": "REGISTERED",
         "ipv4Addresses": [sbi_addr],
         "nfServices": [
@@ -529,7 +529,7 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> 
 
             let mut self_instance = ogs_sbi::context::NfInstance::new(
                 &nf_instance_id,
-                ogs_sbi::types::NfType::Easdf,
+                ogs_sbi::types::NfType::Ees,
             );
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
             let mut svc = ogs_sbi::context::NfService::new(

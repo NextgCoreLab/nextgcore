@@ -185,34 +185,32 @@ impl PfcpNode {
 // ============================================================================
 
 /// PFCP Path Manager
-/// Manages PFCP connections and transactions
+/// Manages PFCP connections and transactions.
+/// Sequence numbers are sourced from the global `PFCP_SEQ` counter in main.rs
+/// so that all code paths share a single monotonically-increasing counter and
+/// never produce duplicate sequence numbers.
 pub struct PfcpPathManager {
     next_xact_id: u64,
-    next_sequence_number: u32,
 }
 
 impl PfcpPathManager {
     pub fn new() -> Self {
         Self {
             next_xact_id: 1,
-            next_sequence_number: 1,
         }
     }
 
-    /// Create a new PFCP transaction
+    /// Create a new PFCP transaction using the global sequence counter.
     pub fn create_xact(&mut self) -> PfcpXact {
         let id = self.next_xact_id;
         self.next_xact_id += 1;
-        let seq = self.next_sequence_number;
-        self.next_sequence_number += 1;
+        let seq = crate::PFCP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         PfcpXact::new(id, seq)
     }
 
-    /// Get next sequence number
+    /// Get next sequence number from the global counter.
     pub fn next_sequence(&mut self) -> u32 {
-        let seq = self.next_sequence_number;
-        self.next_sequence_number += 1;
-        seq
+        crate::PFCP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 }
 

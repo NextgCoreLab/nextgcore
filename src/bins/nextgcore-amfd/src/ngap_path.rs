@@ -1511,16 +1511,24 @@ impl NgapServer {
     }
 
     /// Send message to a gNB by ID
-    pub async fn send_by_id(&self, gnb_id: u64, data: &[u8]) -> Result<()> {
-        let sessions = self.sessions.read().await;
-        for (_assoc_id, session) in sessions.iter() {
-            if session.id == gnb_id {
+    pub async fn send_by_id(&mut self, gnb_id: u64, data: &[u8]) -> Result<()> {
+        // Find the association ID for this gNB ID, then drop the read lock
+        // before calling send_to_association (which needs &mut self).
+        let assoc_id = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .iter()
+                .find(|(_, session)| session.id == gnb_id)
+                .map(|(assoc_id, _)| *assoc_id)
+        };
+
+        match assoc_id {
+            Some(assoc_id) => {
                 log::debug!("Sending {} bytes to gNB {}", data.len(), gnb_id);
-                // Note: Same mutability issue as send_to_association
-                return Ok(());
+                self.send_to_association(assoc_id, data).await
             }
+            None => Err(anyhow::anyhow!("gNB {gnb_id} not found")),
         }
-        Err(anyhow::anyhow!("gNB {gnb_id} not found"))
     }
 
     /// Close a gNB session
