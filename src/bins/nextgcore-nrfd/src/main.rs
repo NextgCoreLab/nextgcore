@@ -28,6 +28,13 @@ use std::time::Duration;
 /// Per-process HMAC-SHA256 signing key, generated once at startup.
 static NRF_SIGNING_KEY: OnceLock<[u8; 32]> = OnceLock::new();
 
+/// The NRF's own SBI URI, set once at startup from CLI args.
+static NRF_SELF_URI: OnceLock<String> = OnceLock::new();
+
+fn nrf_self_uri() -> &'static str {
+    NRF_SELF_URI.get().map(|s| s.as_str()).unwrap_or("http://127.0.0.1:7777")
+}
+
 fn nrf_signing_key() -> &'static [u8; 32] {
     NRF_SIGNING_KEY.get_or_init(|| {
         use rand::Rng;
@@ -129,6 +136,11 @@ async fn main() -> Result<()> {
     // Initialize NRF context
     nrf_context_init(args.max_ue);
     log::info!("NRF context initialized (max_ue={})", args.max_ue);
+
+    // Store the NRF's own SBI URI so notification handlers can use it
+    let scheme = if args.tls { "https" } else { "http" };
+    let self_uri = format!("{}://{}:{}", scheme, args.sbi_addr, args.sbi_port);
+    NRF_SELF_URI.set(self_uri).ok();
 
     // Initialize NRF state machine
     let mut nrf_sm = NrfSmContext::new();
@@ -371,12 +383,12 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
 
             // Send NF status notifications to all matching subscribers
             let notify_profile = nf_profile.clone();
+            let server_uri = nrf_self_uri().to_string();
             tokio::spawn(async move {
-                let server_uri = "http://127.0.0.1:7777"; // TODO: use configured URI
                 if let Err(e) = nrf_nnrf_nfm_send_nf_status_notify_all_async(
                     NotificationEventType::NfRegistered,
                     &notify_profile,
-                    server_uri,
+                    &server_uri,
                 )
                 .await
                 {
@@ -435,12 +447,12 @@ async fn handle_nf_deregister(nf_instance_id: &str) -> SbiResponse {
 
             // Send NF_DEREGISTERED notifications to matching subscribers
             if let Some(profile) = profile_for_notify {
+                let server_uri = nrf_self_uri().to_string();
                 tokio::spawn(async move {
-                    let server_uri = "http://127.0.0.1:7777"; // TODO: use configured URI
                     if let Err(e) = nrf_nnrf_nfm_send_nf_status_notify_all_async(
                         NotificationEventType::NfDeregistered,
                         &profile,
-                        server_uri,
+                        &server_uri,
                     )
                     .await
                     {
@@ -902,7 +914,7 @@ async fn run_event_loop_async(_nrf_sm: &mut NrfSmContext, shutdown: Arc<AtomicBo
 
                             // Send NF_DEREGISTERED notification
                             if let Some(profile) = profile {
-                                let server_uri = "http://127.0.0.1:7777".to_string();
+                                let server_uri = nrf_self_uri().to_string();
                                 tokio::spawn(async move {
                                     if let Err(e) =
                                         nrf_nnrf_nfm_send_nf_status_notify_all_async(

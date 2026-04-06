@@ -110,6 +110,8 @@ async fn main() -> Result<()> {
     // Initialize context
     nsacf_context_init(args.max_quotas);
 
+    let nf_instance_id = format!("nsacf-{}", uuid::Uuid::new_v4());
+
     // Setup shutdown
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());
@@ -140,11 +142,11 @@ async fn main() -> Result<()> {
     // Register with NRF
     let sbi_ctx = global_context();
     sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
-    if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port).await {
+    if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port, &nf_instance_id).await {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
     }
 
-    log::info!("NextGCore NSACF ready");
+    log::info!("NextGCore NSACF ready (instance: {nf_instance_id})");
 
     // Main event loop
     while !shutdown.load(Ordering::SeqCst) {
@@ -496,7 +498,7 @@ async fn handle_utilization_report() -> SbiResponse {
 }
 
 /// Register NSACF with NRF
-async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> {
+async fn register_with_nrf(sbi_addr: &str, sbi_port: u16, nf_instance_id: &str) -> Result<(), String> {
     let sbi_ctx = global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
@@ -512,7 +514,6 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> 
 
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
-    let nf_instance_id = uuid::Uuid::new_v4().to_string();
 
     let nf_profile = serde_json::json!({
         "nfInstanceId": nf_instance_id,
@@ -544,13 +545,13 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> 
             log::info!("NSACF registered with NRF successfully (id={nf_instance_id})");
 
             let mut self_instance = ogs_sbi::context::NfInstance::new(
-                &nf_instance_id,
+                nf_instance_id,
                 ogs_sbi::types::NfType::Nsacf,
             );
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
             let mut svc = ogs_sbi::context::NfService::new(
                 "nnsacf-nsac",
-                ogs_sbi::types::SbiServiceType::Null,
+                ogs_sbi::types::SbiServiceType::NnsacfNsac,
             );
             svc.port = sbi_port;
             svc.ip_addresses = vec![sbi_addr.to_string()];

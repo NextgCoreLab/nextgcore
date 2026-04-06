@@ -69,6 +69,12 @@ pub enum SbiServiceType {
     NspafSecuredPacket,
     NudsfDr,
     NnssaafNssaa,
+    NneesEasregistration,
+    NneesEasdiscovery,
+    NmbsmfMbssession,
+    NnsacfNsac,
+    NdccfDatamanagement,
+    NpinEventexposure,
 }
 
 impl SbiServiceType {
@@ -137,6 +143,12 @@ impl SbiServiceType {
             Self::NspafSecuredPacket => "nspaf-secured-packet",
             Self::NudsfDr => "nudsf-dr",
             Self::NnssaafNssaa => "nnssaaf-nssaa",
+            Self::NneesEasregistration => "nees-easregistration",
+            Self::NneesEasdiscovery => "nees-easdiscovery",
+            Self::NmbsmfMbssession => "nmbsmf-mbssession",
+            Self::NnsacfNsac => "nnsacf-nsac",
+            Self::NdccfDatamanagement => "ndccf-datamanagement",
+            Self::NpinEventexposure => "npin-eventexposure",
         }
     }
 
@@ -201,6 +213,12 @@ impl SbiServiceType {
             "nspaf-secured-packet" => Some(Self::NspafSecuredPacket),
             "nudsf-dr" => Some(Self::NudsfDr),
             "nnssaaf-nssaa" => Some(Self::NnssaafNssaa),
+            "nees-easregistration" => Some(Self::NneesEasregistration),
+            "nees-easdiscovery" => Some(Self::NneesEasdiscovery),
+            "nmbsmf-mbssession" => Some(Self::NmbsmfMbssession),
+            "nnsacf-nsac" => Some(Self::NnsacfNsac),
+            "ndccf-datamanagement" => Some(Self::NdccfDatamanagement),
+            "npin-eventexposure" => Some(Self::NpinEventexposure),
             _ => None,
         }
     }

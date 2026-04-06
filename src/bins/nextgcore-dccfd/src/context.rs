@@ -129,7 +129,7 @@ pub fn dccf_context_fanout_notify(body: &str) -> Vec<(String, String)> {
         .filter(|s| !s.notify_uri.is_empty())
         .map(|s| (s.id.clone(), s.notify_uri.clone()))
         .collect();
-    c.fanout_count += targets.len().max(c.subscriptions.len()) as u64;
+    c.fanout_count += targets.len() as u64;
     log::debug!(
         "[DCCF] fanout: {} subscribers ({} with callback URI), body_len={}, total_fanout={}",
         c.subscriptions.len(),
@@ -196,16 +196,22 @@ mod tests {
     #[test]
     fn test_fanout_increments_by_subscriber_count() {
         init();
-        // Reset by starting fresh (can't reset OnceLock in tests cleanly; use stable count)
+        // Clean up any subs left by other tests that may have a URI
+        dccf_context_remove_subscription("sub-uri-1");
+        dccf_context_remove_subscription("sub-a");
+        dccf_context_remove_subscription("sub-b");
         let before = dccf_context_fanout_count();
         dccf_context_add_subscription("sub-a".into());
         dccf_context_add_subscription("sub-b".into());
         let targets = dccf_context_fanout_notify("{}");
         let after = dccf_context_fanout_count();
-        // Fanout counter should have increased (by subscriber count, at least)
-        assert!(after > before);
-        // Both subs have no URI so targets list is empty
+        // Both subs have no notify URI so no actual notifications are sent
         assert!(targets.is_empty());
+        // Counter only counts actual notifications sent, so it stays the same
+        assert_eq!(after, before);
+        // Cleanup
+        dccf_context_remove_subscription("sub-a");
+        dccf_context_remove_subscription("sub-b");
     }
 
     #[test]

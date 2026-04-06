@@ -97,6 +97,8 @@ async fn main() -> Result<()> {
 
     lmf_context_init(args.max_measurements);
 
+    let nf_instance_id = format!("lmf-{}", uuid::Uuid::new_v4());
+
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());
 
@@ -119,11 +121,11 @@ async fn main() -> Result<()> {
     // Register with NRF
     let sbi_ctx = global_context();
     sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
-    if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port).await {
+    if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port, &nf_instance_id).await {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
     }
 
-    log::info!("NextGCore LMF ready");
+    log::info!("NextGCore LMF ready (instance: {nf_instance_id})");
 
     while !shutdown.load(Ordering::SeqCst) {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -474,7 +476,7 @@ fn parse_qos(s: &str) -> PositioningQos {
 }
 
 /// Register LMF with NRF
-async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> {
+async fn register_with_nrf(sbi_addr: &str, sbi_port: u16, nf_instance_id: &str) -> Result<(), String> {
     let sbi_ctx = global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
@@ -490,7 +492,6 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> 
 
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
-    let nf_instance_id = uuid::Uuid::new_v4().to_string();
 
     let nf_profile = serde_json::json!({
         "nfInstanceId": nf_instance_id,
@@ -522,7 +523,7 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> 
             log::info!("LMF registered with NRF successfully (id={nf_instance_id})");
 
             let mut self_instance = ogs_sbi::context::NfInstance::new(
-                &nf_instance_id,
+                nf_instance_id,
                 ogs_sbi::types::NfType::Lmf,
             );
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];

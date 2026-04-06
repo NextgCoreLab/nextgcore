@@ -16,9 +16,12 @@ use ogs_sbi::server::{
     SbiServer, SbiServerConfig as OgsSbiServerConfig,
 };
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Per-process N4mb PFCP sequence number counter, incremented for each message.
+static PFCP_SEQ: AtomicU32 = AtomicU32::new(1);
 
 mod context;
 
@@ -111,6 +114,8 @@ async fn main() -> Result<()> {
     // Initialize context
     mbsmf_context_init(args.max_sessions);
 
+    let nf_instance_id = format!("mbsmf-{}", uuid::Uuid::new_v4());
+
     // Setup shutdown
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());
@@ -141,11 +146,11 @@ async fn main() -> Result<()> {
     // Register with NRF
     let sbi_ctx = global_context();
     sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
-    if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port).await {
+    if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port, &nf_instance_id).await {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
     }
 
-    log::info!("NextGCore MB-SMF ready");
+    log::info!("NextGCore MB-SMF ready (instance: {nf_instance_id})");
 
     // Main event loop
     while !shutdown.load(Ordering::SeqCst) {
@@ -664,7 +669,7 @@ fn build_n4mb_pfcp_establishment(
     // Byte 1: Message Type = 50 (Session Establishment Request)
     // Bytes 2-3: Message Length = everything after the first 4 bytes of header.
     // With SEID present: 8 (SEID) + 3 (seq) + 1 (spare) + IEs = 12 + ies.len()
-    let seq_num: u32 = 1;
+    let seq_num: u32 = PFCP_SEQ.fetch_add(1, Ordering::Relaxed);
     let msg_len: u16 = (12 + ies.len()) as u16;
     let mut packet: Vec<u8> = Vec::with_capacity(16 + ies.len());
     packet.push(0x21); // version=1, S=1
@@ -785,7 +790,7 @@ async fn handle_member_leave(session_id: &str, supi: &str) -> SbiResponse {
 }
 
 /// Register MB-SMF with NRF
-async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> {
+async fn register_with_nrf(sbi_addr: &str, sbi_port: u16, nf_instance_id: &str) -> Result<(), String> {
     let sbi_ctx = global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
@@ -801,7 +806,6 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> 
 
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
-    let nf_instance_id = uuid::Uuid::new_v4().to_string();
 
     let nf_profile = serde_json::json!({
         "nfInstanceId": nf_instance_id,
@@ -833,13 +837,13 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> 
             log::info!("MB-SMF registered with NRF successfully (id={nf_instance_id})");
 
             let mut self_instance = ogs_sbi::context::NfInstance::new(
-                &nf_instance_id,
+                nf_instance_id,
                 ogs_sbi::types::NfType::Mbsmf,
             );
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
             let mut svc = ogs_sbi::context::NfService::new(
                 "nmbsmf-mbssession",
-                ogs_sbi::types::SbiServiceType::Null,
+                ogs_sbi::types::SbiServiceType::NmbsmfMbssession,
             );
             svc.port = sbi_port;
             svc.ip_addresses = vec![sbi_addr.to_string()];
