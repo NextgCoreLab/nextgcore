@@ -88,6 +88,21 @@ struct NetworkNameYaml {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct NrfClientYaml {
+    uri: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SbiClientYaml {
+    nrf: Option<Vec<NrfClientYaml>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SbiYaml {
+    client: Option<SbiClientYaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct AmfSection {
     amf_name: Option<String>,
     network_name: Option<NetworkNameYaml>,
@@ -95,6 +110,7 @@ struct AmfSection {
     tai: Option<Vec<TaiYaml>>,
     plmn_support: Option<Vec<PlmnSupportYaml>>,
     security: Option<SecurityYaml>,
+    sbi: Option<SbiYaml>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -204,6 +220,18 @@ impl AmfApp {
                 return Ok(());
             }
         };
+
+        // Seed NRF URI into SBI context for NF registration
+        if let Some(sbi) = &amf_section.sbi {
+            if let Some(client) = &sbi.client {
+                if let Some(nrf_list) = &client.nrf {
+                    if let Some(nrf) = nrf_list.first() {
+                        log::info!("NRF URI configured: {}", nrf.uri);
+                        ogs_sbi::context::global_context().set_nrf_uri(&nrf.uri).await;
+                    }
+                }
+            }
+        }
 
         let mut ctx = self.amf_context.write().await;
 
