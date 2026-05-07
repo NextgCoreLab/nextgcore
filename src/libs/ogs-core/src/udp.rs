@@ -9,7 +9,7 @@ use crate::sockopt::{ogs_bind_to_device, OgsSockopt};
 
 /// Create a UDP server socket (identical to ogs_udp_server)
 pub fn ogs_udp_server(sa_list: &OgsSockaddr, socket_option: Option<&OgsSockopt>) -> Option<OgsSock> {
-    let option = socket_option.cloned().expect("value expected");
+    let option = socket_option.cloned().unwrap_or_default();
 
     let mut current = Some(sa_list);
 
@@ -38,7 +38,7 @@ pub fn ogs_udp_server(sa_list: &OgsSockaddr, socket_option: Option<&OgsSockopt>)
 
 /// Create a UDP client socket (identical to ogs_udp_client)
 pub fn ogs_udp_client(sa_list: &OgsSockaddr, socket_option: Option<&OgsSockopt>) -> Option<OgsSock> {
-    let _option = socket_option.cloned().expect("value expected");
+    let _option = socket_option.cloned().unwrap_or_default();
 
     let mut current = Some(sa_list);
 
