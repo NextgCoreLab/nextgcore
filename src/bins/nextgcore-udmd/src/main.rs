@@ -12,6 +12,7 @@ use nextgcore_udmd::{
     udm_context_final, udm_context_init, udm_sbi_close, udm_sbi_open, udm_self,
     timer_manager, timer_type_to_timer_id, UdmEvent, UdmSmContext, SbiServerConfig,
 };
+use serde::Deserialize;
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::server::{
     send_bad_request, send_method_not_allowed, send_not_found,
@@ -78,6 +79,35 @@ struct Args {
     max_sess: usize,
 }
 
+// ---------------------------------------------------------------------------
+// Typed YAML configuration structs for NRF URI seeding
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize)]
+struct NrfClientYaml {
+    uri: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SbiClientYaml {
+    nrf: Option<Vec<NrfClientYaml>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SbiYaml {
+    client: Option<SbiClientYaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct UdmSection {
+    sbi: Option<SbiYaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct UdmYaml {
+    udm: Option<UdmSection>,
+}
+
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -118,12 +148,27 @@ async fn main() -> Result<()> {
     udm_sm.init();
     log::info!("UDM state machine initialized");
 
-    // Parse configuration (if file exists)
+    // Parse configuration (if file exists) and seed NRF URI
     if std::path::Path::new(&args.config).exists() {
         log::info!("Loading configuration from {}", args.config);
         match std::fs::read_to_string(&args.config) {
             Ok(content) => {
                 log::debug!("Configuration file loaded ({} bytes)", content.len());
+                // Seed NRF URI into SBI context for NF registration
+                if let Ok(yaml) = serde_yaml::from_str::<UdmYaml>(&content) {
+                    if let Some(udm) = yaml.udm {
+                        if let Some(sbi) = udm.sbi {
+                            if let Some(client) = sbi.client {
+                                if let Some(nrf_list) = client.nrf {
+                                    if let Some(nrf) = nrf_list.first() {
+                                        log::info!("NRF URI configured: {}", nrf.uri);
+                                        ogs_sbi::context::global_context().set_nrf_uri(&nrf.uri).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             Err(e) => {
                 log::warn!("Failed to read configuration file: {e}");

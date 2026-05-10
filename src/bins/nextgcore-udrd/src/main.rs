@@ -13,6 +13,7 @@ use nextgcore_udrd::{
     udr_context_final, udr_context_init, udr_sbi_close, udr_sbi_open, UdrSmContext,
     SbiServerConfig,
 };
+use serde::Deserialize;
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::server::{
     send_bad_request, send_method_not_allowed, send_not_found,
@@ -70,6 +71,35 @@ struct Args {
     tls_key: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Typed YAML configuration structs for NRF URI seeding
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize)]
+struct NrfClientYaml {
+    uri: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SbiClientYaml {
+    nrf: Option<Vec<NrfClientYaml>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SbiYaml {
+    client: Option<SbiClientYaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct UdrSection {
+    sbi: Option<SbiYaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct UdrYaml {
+    udr: Option<UdrSection>,
+}
+
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -110,7 +140,7 @@ async fn main() -> Result<()> {
     udr_sm.init();
     log::info!("UDR state machine initialized");
 
-    // Parse configuration to get db_uri
+    // Parse configuration to get db_uri and seed NRF URI
     let db_uri = parse_db_uri(&args.config);
     if !db_uri.is_empty() {
         match ogs_dbi::ogs_dbi_init_async(db_uri.clone()).await {
@@ -119,6 +149,24 @@ async fn main() -> Result<()> {
         }
     } else {
         log::warn!("No db_uri configured, UDR will return hardcoded test data");
+    }
+
+    // Seed NRF URI into SBI context for NF registration
+    if let Ok(content) = std::fs::read_to_string(&args.config) {
+        if let Ok(yaml) = serde_yaml::from_str::<UdrYaml>(&content) {
+            if let Some(udr) = yaml.udr {
+                if let Some(sbi) = udr.sbi {
+                    if let Some(client) = sbi.client {
+                        if let Some(nrf_list) = client.nrf {
+                            if let Some(nrf) = nrf_list.first() {
+                                log::info!("NRF URI configured: {}", nrf.uri);
+                                ogs_sbi::context::global_context().set_nrf_uri(&nrf.uri).await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Build SBI server configuration (legacy, for context)

@@ -8,6 +8,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use ogs_sbi::message::{SbiRequest, SbiResponse};
+use serde::Deserialize;
 use ogs_sbi::server::{
     send_bad_request, send_method_not_allowed, send_not_found,
     SbiServer, SbiServerConfig as OgsSbiServerConfig,
@@ -90,6 +91,35 @@ struct Args {
     max_sess: usize,
 }
 
+// ---------------------------------------------------------------------------
+// Typed YAML configuration structs for NRF URI seeding
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize)]
+struct NrfClientYaml {
+    uri: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SbiClientYaml {
+    nrf: Option<Vec<NrfClientYaml>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SbiYaml {
+    client: Option<SbiClientYaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct BsfSection {
+    sbi: Option<SbiYaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct BsfYaml {
+    bsf: Option<BsfSection>,
+}
+
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -139,12 +169,27 @@ async fn main() -> Result<()> {
     bsf_sm.init();
     log::info!("BSF state machine initialized");
 
-    // Parse configuration (if file exists)
+    // Parse configuration (if file exists) and seed NRF URI
     if std::path::Path::new(&args.config).exists() {
         log::info!("Loading configuration from {}", args.config);
         match std::fs::read_to_string(&args.config) {
             Ok(content) => {
                 log::debug!("Configuration file loaded ({} bytes)", content.len());
+                // Seed NRF URI into SBI context for NF registration
+                if let Ok(yaml) = serde_yaml::from_str::<BsfYaml>(&content) {
+                    if let Some(bsf) = yaml.bsf {
+                        if let Some(sbi) = bsf.sbi {
+                            if let Some(client) = sbi.client {
+                                if let Some(nrf_list) = client.nrf {
+                                    if let Some(nrf) = nrf_list.first() {
+                                        log::info!("NRF URI configured: {}", nrf.uri);
+                                        ogs_sbi::context::global_context().set_nrf_uri(&nrf.uri).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             Err(e) => {
                 log::warn!("Failed to read configuration file: {e}");

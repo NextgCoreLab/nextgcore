@@ -193,6 +193,26 @@ async fn main() -> Result<()> {
     log::info!("Loading configuration from {config_path}");
     log::info!("SBI config: address={}, port={}", config.sbi_addr, config.sbi_port);
 
+    // Seed NRF URI into SBI context for NF registration
+    if let Ok(content) = std::fs::read_to_string(&config_path) {
+        if let Ok(yaml) = serde_yaml::from_str::<SmfYaml>(&content) {
+            if let Some(smf) = yaml.smf {
+                if let Some(sbi) = smf.sbi {
+                    if let Some(client) = sbi.client {
+                        if let Some(nrf_list) = client.nrf {
+                            if let Some(nrf) = nrf_list.first() {
+                                if let Some(ref uri) = nrf.uri {
+                                    log::info!("NRF URI configured: {uri}");
+                                    global_context().set_nrf_uri(uri).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Initialize SMF context
     smf_context_init(config.max_ue, config.max_sess, config.max_bearer);
     log::info!("SMF context initialized (max_ue={}, max_sess={}, max_bearer={})",
@@ -430,13 +450,16 @@ async fn handle_pfcp_session_report(
 async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<(), String> {
     let sbi_ctx = global_context();
 
-    let nrf_uri = std::env::var("NRF_URI").ok();
-    let nrf_uri = match nrf_uri {
+    // Prefer the URI seeded from YAML config; fall back to NRF_URI env var
+    let nrf_uri = match sbi_ctx.get_nrf_uri().await {
         Some(uri) => uri,
-        None => {
-            log::debug!("No NRF_URI configured, skipping NRF registration");
-            return Ok(());
-        }
+        None => match std::env::var("NRF_URI").ok() {
+            Some(uri) => uri,
+            None => {
+                log::debug!("No NRF URI configured, skipping NRF registration");
+                return Ok(());
+            }
+        },
     };
 
     log::info!("Registering SMF with NRF at {nrf_uri}");
