@@ -186,9 +186,12 @@ async fn main() -> Result<()> {
         SHUTDOWN.store(true, Ordering::SeqCst);
     }).expect("Failed to set Ctrl+C handler");
 
-    // Load configuration
-    let config_path = std::env::var("SMF_CONFIG")
-        .unwrap_or_else(|_| "/etc/nextgcore/nextgcore-smfd.yaml".to_string());
+    // Load configuration — respect -c/--config CLI arg first, then SMF_CONFIG env var
+    let config_path = std::env::args()
+        .zip(std::env::args().skip(1))
+        .find_map(|(a, b)| if a == "-c" || a == "--config" { Some(b) } else { None })
+        .or_else(|| std::env::var("SMF_CONFIG").ok())
+        .unwrap_or_else(|| "/etc/nextgcore/smf.yaml".to_string());
     let config = load_config(&config_path);
     log::info!("Loading configuration from {config_path}");
     log::info!("SBI config: address={}, port={}", config.sbi_addr, config.sbi_port);
