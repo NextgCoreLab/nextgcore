@@ -417,9 +417,9 @@ pub fn spawn_heartbeat_worker(nf_instance_id: String, interval_secs: u64) {
 
         let interval = tokio::time::Duration::from_secs(interval_secs);
         let mut ticker = tokio::time::interval(interval);
-        // Consume the immediate first tick so the first heartbeat fires after
-        // one full interval rather than immediately at startup.
-        ticker.tick().await;
+        // First tick fires immediately — we want to send the first heartbeat
+        // right away to refresh NRF state before the suspension timer
+        // (typically 10s) elapses. Subsequent ticks fire every interval.
 
         loop {
             ticker.tick().await;
