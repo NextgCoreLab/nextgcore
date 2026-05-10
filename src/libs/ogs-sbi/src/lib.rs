@@ -77,7 +77,7 @@ pub use scp::{
 };
 pub use heartbeat::{
     HeartbeatConfig, HeartbeatManager, HeartbeatRecord, HeartbeatStats, HeartbeatStatus,
-    global_heartbeat_manager, init_heartbeat_manager,
+    global_heartbeat_manager, init_heartbeat_manager, spawn_heartbeat_worker,
 };
 pub use security::{
     NrfSecurityConfig, PqcKeyExchange, PqcSignature, PqcTlsConfig, SbiSecurityPolicy,

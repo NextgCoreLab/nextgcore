@@ -379,6 +379,100 @@ pub fn init_heartbeat_manager() {
     let _ = global_heartbeat_manager();
 }
 
+// ---------------------------------------------------------------------------
+// NF-side outbound heartbeat worker
+// ---------------------------------------------------------------------------
+
+/// Parse host and port from a URI string (e.g., "http://localhost:7777").
+fn parse_nrf_host_port(uri: &str) -> Option<(String, u16)> {
+    let without_scheme = uri
+        .strip_prefix("https://")
+        .or_else(|| uri.strip_prefix("http://"))
+        .unwrap_or(uri);
+    let (host_port, _path) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    if let Some((host, port_str)) = host_port.rsplit_once(':') {
+        let port: u16 = port_str.parse().ok()?;
+        Some((host.to_string(), port))
+    } else {
+        let default_port = if uri.starts_with("https://") { 443 } else { 80 };
+        Some((host_port.to_string(), default_port))
+    }
+}
+
+/// Spawn a background tokio task that periodically sends a heartbeat
+/// `PATCH /nnrf-nfm/v1/nf-instances/{nf_instance_id}` to the NRF.
+///
+/// The NRF URI is read from the global SBI context at each tick so it
+/// stays correct even if the context is updated after startup.
+///
+/// `interval_secs` is the fire interval (use `heartBeatTimer / 2`, e.g. 5).
+/// The task runs until the process exits; it logs warnings on failure but
+/// never panics, so a temporary NRF outage does not crash the NF.
+pub fn spawn_heartbeat_worker(nf_instance_id: String, interval_secs: u64) {
+    tokio::spawn(async move {
+        log::info!(
+            "Heartbeat worker started for NF instance {} (interval={}s)",
+            nf_instance_id, interval_secs
+        );
+
+        let interval = tokio::time::Duration::from_secs(interval_secs);
+        let mut ticker = tokio::time::interval(interval);
+        // Consume the immediate first tick so the first heartbeat fires after
+        // one full interval rather than immediately at startup.
+        ticker.tick().await;
+
+        loop {
+            ticker.tick().await;
+
+            let ctx = crate::context::global_context();
+            let nrf_uri = ctx.get_nrf_uri().await;
+
+            let nrf_uri = match nrf_uri {
+                Some(u) => u,
+                None => {
+                    log::debug!("Heartbeat: no NRF URI configured, skipping");
+                    continue;
+                }
+            };
+
+            let (nrf_host, nrf_port) = match parse_nrf_host_port(&nrf_uri) {
+                Some(hp) => hp,
+                None => {
+                    log::warn!("Heartbeat: could not parse NRF URI '{nrf_uri}'");
+                    continue;
+                }
+            };
+
+            let client = SbiClient::with_host_port(&nrf_host, nrf_port);
+            let path = format!(
+                "/nnrf-nfm/v1/nf-instances/{nf_instance_id}"
+            );
+            let body = serde_json::json!({"nfStatus": "REGISTERED"});
+
+            match client.patch_json(&path, &body).await {
+                Ok(resp) if resp.status == 200 || resp.status == 204 => {
+                    log::debug!(
+                        "Heartbeat OK for {} (status={})",
+                        nf_instance_id, resp.status
+                    );
+                }
+                Ok(resp) => {
+                    log::warn!(
+                        "Heartbeat got unexpected status {} for {}",
+                        resp.status, nf_instance_id
+                    );
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Heartbeat failed for {}: {e}",
+                        nf_instance_id
+                    );
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

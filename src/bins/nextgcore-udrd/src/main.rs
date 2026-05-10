@@ -191,6 +191,18 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
+
+    // Register with NRF and start heartbeat worker
+    match register_with_nrf(&args.sbi_addr, args.sbi_port).await {
+        Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
+            ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            log::warn!("NRF registration failed (will operate without NRF): {e}");
+        }
+    }
+
     log::info!("NextGCore UDR ready");
 
     // Main event loop (async)
@@ -933,6 +945,79 @@ async fn run_event_loop_async(shutdown: Arc<AtomicBool>) -> Result<()> {
 
     log::debug!("Exiting main event loop");
     Ok(())
+}
+
+/// Register UDR with NRF.
+///
+/// Returns the NF instance ID on success so the caller can start a heartbeat
+/// worker.
+async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, String> {
+    let sbi_ctx = ogs_sbi::context::global_context();
+
+    let nrf_uri = sbi_ctx.get_nrf_uri().await;
+    let nrf_uri = match nrf_uri {
+        Some(uri) => uri,
+        None => {
+            log::debug!("No NRF URI configured, skipping NRF registration");
+            return Ok(String::new());
+        }
+    };
+
+    log::info!("Registering UDR with NRF at {nrf_uri}");
+
+    let (nrf_host, nrf_port) = parse_nrf_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
+    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
+
+    let nf_instance_id = uuid::Uuid::new_v4().to_string();
+
+    let nf_profile = serde_json::json!({
+        "nfInstanceId": nf_instance_id,
+        "nfType": "UDR",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": [sbi_addr],
+        "nfServices": [
+            {
+                "serviceInstanceId": format!("{nf_instance_id}-nudr-dr"),
+                "serviceName": "nudr-dr",
+                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+            }
+        ],
+        "allowedNfTypes": ["UDM", "PCF", "AUSF", "SCP"],
+        "heartBeatTimer": 10
+    });
+
+    let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
+    let response = client
+        .put_json(&path, &nf_profile)
+        .await
+        .map_err(|e| format!("NRF registration request failed: {e}"))?;
+
+    match response.status {
+        200 | 201 => {
+            log::info!("UDR registered with NRF successfully (id={nf_instance_id})");
+            Ok(nf_instance_id)
+        }
+        _ => Err(format!("NRF registration returned status {}", response.status)),
+    }
+}
+
+/// Parse host and port from a URI string (e.g., "http://localhost:7777").
+fn parse_nrf_host_port(uri: &str) -> Option<(String, u16)> {
+    let without_scheme = uri
+        .strip_prefix("https://")
+        .or_else(|| uri.strip_prefix("http://"))
+        .unwrap_or(uri);
+    let (host_port, _) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    if let Some((host, port_str)) = host_port.rsplit_once(':') {
+        let port: u16 = port_str.parse().ok()?;
+        Some((host.to_string(), port))
+    } else {
+        let default_port = if uri.starts_with("https://") { 443 } else { 80 };
+        Some((host_port.to_string(), default_port))
+    }
 }
 
 #[cfg(test)]

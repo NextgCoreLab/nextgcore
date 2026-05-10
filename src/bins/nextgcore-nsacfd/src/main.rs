@@ -144,6 +144,8 @@ async fn main() -> Result<()> {
     sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
     if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port, &nf_instance_id).await {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
+    } else {
+        ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id.clone(), 5);
     }
 
     log::info!("NextGCore NSACF ready (instance: {nf_instance_id})");

@@ -235,8 +235,14 @@ async fn main() -> Result<()> {
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
 
     // Register with NRF (if configured)
-    if let Err(e) = smf_nrf_register(&config.sbi_addr, config.sbi_port).await {
-        log::warn!("NRF registration failed (will operate without NRF): {e}");
+    match smf_nrf_register(&config.sbi_addr, config.sbi_port).await {
+        Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
+            ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            log::warn!("NRF registration failed (will operate without NRF): {e}");
+        }
     }
 
     log::info!("NextGCore SMF ready");
@@ -447,7 +453,7 @@ async fn handle_pfcp_session_report(
 /// Register SMF NF instance with NRF
 ///
 /// Sends PUT /nnrf-nfm/v1/nf-instances/{nfInstanceId} to NRF
-async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<(), String> {
+async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<String, String> {
     let sbi_ctx = global_context();
 
     // Prefer the URI seeded from YAML config; fall back to NRF_URI env var
@@ -457,7 +463,7 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
             Some(uri) => uri,
             None => {
                 log::debug!("No NRF URI configured, skipping NRF registration");
-                return Ok(());
+                return Ok(String::new());
             }
         },
     };
@@ -516,7 +522,7 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
             self_instance.add_service(svc);
             sbi_ctx.set_self_instance(self_instance).await;
 
-            Ok(())
+            Ok(nf_instance_id)
         }
         _ => Err(format!("NRF registration returned status {}", response.status)),
     }

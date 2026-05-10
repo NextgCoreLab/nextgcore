@@ -213,8 +213,14 @@ async fn main() -> Result<()> {
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
 
     // Register with NRF (B24.3)
-    if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port).await {
-        log::warn!("NRF registration failed (will operate without NRF): {e}");
+    match register_with_nrf(&args.sbi_addr, args.sbi_port).await {
+        Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
+            ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            log::warn!("NRF registration failed (will operate without NRF): {e}");
+        }
     }
 
     // Discover H-NSSF instances from NRF
@@ -854,7 +860,9 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 }
 
 /// Register NSSF with NRF (B24.3)
-async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> {
+///
+/// Returns the NF instance ID so callers can start a heartbeat worker.
+async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, String> {
     let sbi_ctx = ogs_sbi::context::global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
@@ -862,7 +870,7 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> 
         Some(uri) => uri,
         None => {
             log::debug!("No NRF URI configured, skipping NRF registration");
-            return Ok(());
+            return Ok(String::new());
         }
     };
 
@@ -940,7 +948,7 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> 
 
             sbi_ctx.set_self_instance(self_instance).await;
 
-            Ok(())
+            Ok(nf_instance_id)
         }
         _ => Err(format!("NRF registration returned status {}", response.status)),
     }

@@ -322,8 +322,9 @@ pub fn amf_sbi_close() {
 
 /// Register AMF NF instance with NRF
 ///
-/// Sends PUT /nnrf-nfm/v1/nf-instances/{nfInstanceId} to NRF
-pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<(), String> {
+/// Sends PUT /nnrf-nfm/v1/nf-instances/{nfInstanceId} to NRF.
+/// Returns the NF instance ID on success so the caller can start a heartbeat worker.
+pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<String, String> {
     let sbi_ctx = global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
@@ -331,7 +332,7 @@ pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<(), Strin
         Some(uri) => uri,
         None => {
             log::debug!("No NRF URI configured, skipping NRF registration");
-            return Ok(());
+            return Ok(String::new());
         }
     };
 
@@ -389,7 +390,7 @@ pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<(), Strin
             self_instance.add_service(svc);
             sbi_ctx.set_self_instance(self_instance).await;
 
-            Ok(())
+            Ok(nf_instance_id)
         }
         _ => Err(format!("NRF registration returned status {}", response.status)),
     }

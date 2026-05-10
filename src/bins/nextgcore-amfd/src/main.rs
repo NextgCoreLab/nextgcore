@@ -618,8 +618,14 @@ async fn main() -> Result<()> {
     let sbi_addr = std::env::var("AMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
     let sbi_port: u16 = std::env::var("AMF_SBI_PORT")
         .ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
-    if let Err(e) = sbi_path::amf_nrf_register(&sbi_addr, sbi_port).await {
-        log::warn!("NRF registration failed (will operate without NRF): {e}");
+    match sbi_path::amf_nrf_register(&sbi_addr, sbi_port).await {
+        Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
+            ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            log::warn!("NRF registration failed (will operate without NRF): {e}");
+        }
     }
 
     // Discover AUSF and SMF from NRF
