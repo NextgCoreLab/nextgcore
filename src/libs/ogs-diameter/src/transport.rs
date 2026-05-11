@@ -48,10 +48,12 @@ impl DiameterTransport {
     pub async fn connect_timeout(addr: SocketAddr, timeout: Duration) -> DiameterResult<Self> {
         let stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
             .await
-            .map_err(|_| DiameterError::Io(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!("connection to {addr} timed out after {timeout:?}"),
-            )))?
+            .map_err(|_| {
+                DiameterError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("connection to {addr} timed out after {timeout:?}"),
+                ))
+            })?
             .map_err(DiameterError::Io)?;
         Self::new(stream)
     }
@@ -164,10 +166,7 @@ impl DiameterListener {
     }
 
     /// Run the listener, sending accepted transports to a channel
-    pub async fn run(
-        self,
-        tx: mpsc::Sender<DiameterTransport>,
-    ) -> DiameterResult<()> {
+    pub async fn run(self, tx: mpsc::Sender<DiameterTransport>) -> DiameterResult<()> {
         loop {
             match self.accept().await {
                 Ok(transport) => {
@@ -189,9 +188,8 @@ impl DiameterListener {
 // ============================================================================
 
 /// Message handler callback type for application-level Diameter messages
-pub type MessageHandler = Box<
-    dyn Fn(DiameterMessage) -> Option<DiameterMessage> + Send + Sync + 'static,
->;
+pub type MessageHandler =
+    Box<dyn Fn(DiameterMessage) -> Option<DiameterMessage> + Send + Sync + 'static>;
 
 /// Diameter server that accepts connections and dispatches messages
 pub struct DiameterServer {
@@ -249,17 +247,14 @@ impl DiameterServer {
         peer.start().await?;
 
         loop {
-            let event = tokio::time::timeout(
-                peer.watchdog_interval() * 3,
-                peer.next_event(),
-            )
-            .await;
+            let event = tokio::time::timeout(peer.watchdog_interval() * 3, peer.next_event()).await;
 
             match event {
-                Ok(Ok(PeerEvent::Established { origin_host, origin_realm })) => {
-                    log::info!(
-                        "Peer established: host={origin_host}, realm={origin_realm}"
-                    );
+                Ok(Ok(PeerEvent::Established {
+                    origin_host,
+                    origin_realm,
+                })) => {
+                    log::info!("Peer established: host={origin_host}, realm={origin_realm}");
                 }
                 Ok(Ok(PeerEvent::Message(msg))) => {
                     if msg.header.is_request() {
@@ -315,21 +310,19 @@ impl DiameterClient {
 
     /// Connect and perform CER/CEA exchange
     pub async fn connect(&mut self) -> DiameterResult<()> {
-        let transport = DiameterTransport::connect_timeout(
-            self.peer_addr,
-            Duration::from_secs(5),
-        )
-        .await?;
+        let transport =
+            DiameterTransport::connect_timeout(self.peer_addr, Duration::from_secs(5)).await?;
 
         let mut peer = DiameterPeer::new_initiator(transport, &self.config);
         peer.start().await?;
 
         // Wait for CEA
         match peer.next_event().await? {
-            PeerEvent::Established { origin_host, origin_realm } => {
-                log::info!(
-                    "Connected to Diameter peer: host={origin_host}, realm={origin_realm}"
-                );
+            PeerEvent::Established {
+                origin_host,
+                origin_realm,
+            } => {
+                log::info!("Connected to Diameter peer: host={origin_host}, realm={origin_realm}");
                 self.peer = Some(peer);
                 Ok(())
             }
@@ -374,13 +367,11 @@ impl DiameterClient {
     }
 
     /// Send an application-level Diameter request and wait for an answer
-    pub async fn send_request(
-        &mut self,
-        msg: &DiameterMessage,
-    ) -> DiameterResult<DiameterMessage> {
-        let peer = self.peer.as_mut().ok_or(DiameterError::Protocol(
-            "not connected".into(),
-        ))?;
+    pub async fn send_request(&mut self, msg: &DiameterMessage) -> DiameterResult<DiameterMessage> {
+        let peer = self
+            .peer
+            .as_mut()
+            .ok_or(DiameterError::Protocol("not connected".into()))?;
 
         peer.send_message(msg).await?;
 
@@ -417,7 +408,8 @@ impl DiameterClient {
     /// Gracefully disconnect
     pub async fn disconnect(&mut self) -> DiameterResult<()> {
         if let Some(ref mut peer) = self.peer {
-            peer.disconnect(crate::peer::DisconnectCause::Rebooting).await?;
+            peer.disconnect(crate::peer::DisconnectCause::Rebooting)
+                .await?;
             // Wait for DPA
             if let Ok(PeerEvent::Disconnected) = peer.next_event().await {
                 log::debug!("Received DPA, disconnect complete");
@@ -454,9 +446,10 @@ mod tests {
         // Connect and send a request
         let mut client = DiameterTransport::connect(listen_addr).await.unwrap();
         let mut req = DiameterMessage::new_request(257, 0);
-        req.add_avp(Avp::mandatory(264, AvpData::DiameterIdentity(
-            "client.example.com".to_string(),
-        )));
+        req.add_avp(Avp::mandatory(
+            264,
+            AvpData::DiameterIdentity("client.example.com".to_string()),
+        ));
         req.header.hop_by_hop_id = 1;
         req.header.end_to_end_id = 1;
         client.send(&req).await.unwrap();
@@ -515,11 +508,7 @@ mod tests {
     async fn test_connect_timeout() {
         // Use a non-routable address to trigger timeout
         let addr: SocketAddr = ([192, 0, 2, 1], 3868).into();
-        let result = DiameterTransport::connect_timeout(
-            addr,
-            Duration::from_millis(100),
-        )
-        .await;
+        let result = DiameterTransport::connect_timeout(addr, Duration::from_millis(100)).await;
         assert!(result.is_err());
     }
 
@@ -574,7 +563,10 @@ mod tests {
         let mut air = DiameterMessage::new_request(318, 16777251);
         air.header.hop_by_hop_id = 1;
         air.header.end_to_end_id = 1;
-        air.add_avp(Avp::mandatory(1, AvpData::Utf8String("001010123456789".to_string())));
+        air.add_avp(Avp::mandatory(
+            1,
+            AvpData::Utf8String("001010123456789".to_string()),
+        ));
 
         let answer = client.send_request(&air).await.unwrap();
         assert!(answer.header.is_answer());

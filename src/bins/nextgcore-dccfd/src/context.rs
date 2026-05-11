@@ -65,13 +65,19 @@ pub fn dccf_context_add_subscription(sub_id: String) -> bool {
 pub fn dccf_context_add_subscription_with_uri(sub_id: String, notify_uri: String) -> bool {
     let mut c = ctx().lock().unwrap();
     if c.subscriptions.len() >= c.max_subscriptions {
-        log::warn!("[DCCF] subscription capacity exhausted ({})", c.max_subscriptions);
+        log::warn!(
+            "[DCCF] subscription capacity exhausted ({})",
+            c.max_subscriptions
+        );
         return false;
     }
-    c.subscription_map.insert(sub_id.clone(), DccfSubscription {
-        id: sub_id.clone(),
-        notify_uri,
-    });
+    c.subscription_map.insert(
+        sub_id.clone(),
+        DccfSubscription {
+            id: sub_id.clone(),
+            notify_uri,
+        },
+    );
     c.subscriptions.insert(sub_id);
     true
 }
@@ -217,7 +223,10 @@ mod tests {
     #[test]
     fn test_fanout_with_callback_uris() {
         init();
-        dccf_context_add_subscription_with_uri("sub-uri-1".into(), "http://nwdaf:8080/notify".into());
+        dccf_context_add_subscription_with_uri(
+            "sub-uri-1".into(),
+            "http://nwdaf:8080/notify".into(),
+        );
         let targets = dccf_context_fanout_notify("{}");
         assert!(targets.iter().any(|(id, _)| id == "sub-uri-1"));
     }

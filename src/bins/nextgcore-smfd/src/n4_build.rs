@@ -68,7 +68,6 @@ pub enum PfcpCause {
     AllDynamicAddressAreOccupied = 78,
 }
 
-
 impl From<u8> for PfcpCause {
     fn from(value: u8) -> Self {
         match value {
@@ -92,7 +91,6 @@ impl From<u8> for PfcpCause {
         }
     }
 }
-
 
 // ============================================================================
 // PFCP IE Types
@@ -357,7 +355,6 @@ pub mod pfcp_ie {
     pub const RDS_CONFIGURATION_INFORMATION: u16 = 255;
 }
 
-
 // ============================================================================
 // PFCP Modify Flags
 // ============================================================================
@@ -521,27 +518,32 @@ impl PfcpMessageBuilder {
     }
 
     /// Add F-SEID IE
-    pub fn add_f_seid(&mut self, seid: u64, ipv4: Option<[u8; 4]>, ipv6: Option<[u8; 16]>) -> &mut Self {
+    pub fn add_f_seid(
+        &mut self,
+        seid: u64,
+        ipv4: Option<[u8; 4]>,
+        ipv6: Option<[u8; 16]>,
+    ) -> &mut Self {
         let mut value = BytesMut::new();
         let mut flags: u8 = 0;
-        
+
         if ipv6.is_some() {
             flags |= 0x01; // V6 flag
         }
         if ipv4.is_some() {
             flags |= 0x02; // V4 flag
         }
-        
+
         value.put_u8(flags);
         value.put_u64(seid);
-        
+
         if let Some(addr) = ipv4 {
             value.put_slice(&addr);
         }
         if let Some(addr) = ipv6 {
             value.put_slice(&addr);
         }
-        
+
         self.add_tlv(pfcp_ie::F_SEID, &value)
     }
 
@@ -635,10 +637,15 @@ impl PfcpMessageBuilder {
     }
 
     /// Add User ID IE
-    pub fn add_user_id(&mut self, imsi: Option<&[u8]>, imeisv: Option<&[u8]>, msisdn: Option<&[u8]>) -> &mut Self {
+    pub fn add_user_id(
+        &mut self,
+        imsi: Option<&[u8]>,
+        imeisv: Option<&[u8]>,
+        msisdn: Option<&[u8]>,
+    ) -> &mut Self {
         let mut value = BytesMut::new();
         let mut flags: u8 = 0;
-        
+
         if imsi.is_some() {
             flags |= 0x01; // IMSIF
         }
@@ -648,9 +655,9 @@ impl PfcpMessageBuilder {
         if msisdn.is_some() {
             flags |= 0x04; // MSISDNF
         }
-        
+
         value.put_u8(flags);
-        
+
         if let Some(id) = imsi {
             value.put_u8(id.len() as u8);
             value.put_slice(id);
@@ -663,7 +670,7 @@ impl PfcpMessageBuilder {
             value.put_u8(id.len() as u8);
             value.put_slice(id);
         }
-        
+
         self.add_tlv(pfcp_ie::USER_ID, &value)
     }
 
@@ -682,10 +689,16 @@ impl PfcpMessageBuilder {
     }
 
     /// Add F-TEID IE
-    pub fn add_f_teid(&mut self, teid: u32, ipv4: Option<[u8; 4]>, ipv6: Option<[u8; 16]>, choose_id: Option<u8>) -> &mut Self {
+    pub fn add_f_teid(
+        &mut self,
+        teid: u32,
+        ipv4: Option<[u8; 4]>,
+        ipv6: Option<[u8; 16]>,
+        choose_id: Option<u8>,
+    ) -> &mut Self {
         let mut value = BytesMut::new();
         let mut flags: u8 = 0;
-        
+
         if ipv6.is_some() {
             flags |= 0x01; // V6 flag
         }
@@ -695,10 +708,10 @@ impl PfcpMessageBuilder {
         if choose_id.is_some() {
             flags |= 0x04; // CH flag (CHOOSE)
         }
-        
+
         value.put_u8(flags);
         value.put_u32(teid);
-        
+
         if let Some(addr) = ipv4 {
             value.put_slice(&addr);
         }
@@ -708,15 +721,21 @@ impl PfcpMessageBuilder {
         if let Some(id) = choose_id {
             value.put_u8(id);
         }
-        
+
         self.add_tlv(pfcp_ie::F_TEID, &value)
     }
 
     /// Add UE IP Address IE
-    pub fn add_ue_ip_address(&mut self, ipv4: Option<[u8; 4]>, ipv6: Option<[u8; 16]>, source: bool, destination: bool) -> &mut Self {
+    pub fn add_ue_ip_address(
+        &mut self,
+        ipv4: Option<[u8; 4]>,
+        ipv6: Option<[u8; 16]>,
+        source: bool,
+        destination: bool,
+    ) -> &mut Self {
         let mut value = BytesMut::new();
         let mut flags: u8 = 0;
-        
+
         if ipv6.is_some() {
             flags |= 0x01; // V6 flag
         }
@@ -729,32 +748,38 @@ impl PfcpMessageBuilder {
         if destination {
             flags |= 0x04; // S/D flag = 1 for destination
         }
-        
+
         value.put_u8(flags);
-        
+
         if let Some(addr) = ipv4 {
             value.put_slice(&addr);
         }
         if let Some(addr) = ipv6 {
             value.put_slice(&addr);
         }
-        
+
         self.add_tlv(pfcp_ie::UE_IP_ADDRESS, &value)
     }
 
     /// Add Outer Header Creation IE
-    pub fn add_outer_header_creation(&mut self, description: u16, teid: u32, ipv4: Option<[u8; 4]>, ipv6: Option<[u8; 16]>) -> &mut Self {
+    pub fn add_outer_header_creation(
+        &mut self,
+        description: u16,
+        teid: u32,
+        ipv4: Option<[u8; 4]>,
+        ipv6: Option<[u8; 16]>,
+    ) -> &mut Self {
         let mut value = BytesMut::new();
         value.put_u16(description);
         value.put_u32(teid);
-        
+
         if let Some(addr) = ipv4 {
             value.put_slice(&addr);
         }
         if let Some(addr) = ipv6 {
             value.put_slice(&addr);
         }
-        
+
         self.add_tlv(pfcp_ie::OUTER_HEADER_CREATION, &value)
     }
 
@@ -783,7 +808,12 @@ impl PfcpMessageBuilder {
     }
 
     /// Add Measurement Method IE
-    pub fn add_measurement_method(&mut self, duration: bool, volume: bool, event: bool) -> &mut Self {
+    pub fn add_measurement_method(
+        &mut self,
+        duration: bool,
+        volume: bool,
+        event: bool,
+    ) -> &mut Self {
         let mut flags: u8 = 0;
         if duration {
             flags |= 0x01;
@@ -808,10 +838,15 @@ impl PfcpMessageBuilder {
     }
 
     /// Add Volume Threshold IE
-    pub fn add_volume_threshold(&mut self, total: Option<u64>, uplink: Option<u64>, downlink: Option<u64>) -> &mut Self {
+    pub fn add_volume_threshold(
+        &mut self,
+        total: Option<u64>,
+        uplink: Option<u64>,
+        downlink: Option<u64>,
+    ) -> &mut Self {
         let mut value = BytesMut::new();
         let mut flags: u8 = 0;
-        
+
         if total.is_some() {
             flags |= 0x01;
         }
@@ -821,9 +856,9 @@ impl PfcpMessageBuilder {
         if downlink.is_some() {
             flags |= 0x04;
         }
-        
+
         value.put_u8(flags);
-        
+
         if let Some(v) = total {
             value.put_u64(v);
         }
@@ -833,15 +868,20 @@ impl PfcpMessageBuilder {
         if let Some(v) = downlink {
             value.put_u64(v);
         }
-        
+
         self.add_tlv(pfcp_ie::VOLUME_THRESHOLD, &value)
     }
 
     /// Add Volume Quota IE
-    pub fn add_volume_quota(&mut self, total: Option<u64>, uplink: Option<u64>, downlink: Option<u64>) -> &mut Self {
+    pub fn add_volume_quota(
+        &mut self,
+        total: Option<u64>,
+        uplink: Option<u64>,
+        downlink: Option<u64>,
+    ) -> &mut Self {
         let mut value = BytesMut::new();
         let mut flags: u8 = 0;
-        
+
         if total.is_some() {
             flags |= 0x01;
         }
@@ -851,9 +891,9 @@ impl PfcpMessageBuilder {
         if downlink.is_some() {
             flags |= 0x04;
         }
-        
+
         value.put_u8(flags);
-        
+
         if let Some(v) = total {
             value.put_u64(v);
         }
@@ -863,7 +903,7 @@ impl PfcpMessageBuilder {
         if let Some(v) = downlink {
             value.put_u64(v);
         }
-        
+
         self.add_tlv(pfcp_ie::VOLUME_QUOTA, &value)
     }
 
@@ -883,11 +923,17 @@ impl PfcpMessageBuilder {
     }
 
     /// Add SDF Filter IE
-    pub fn add_sdf_filter(&mut self, flow_description: Option<&str>, tos_traffic_class: Option<u16>, 
-                          security_param_index: Option<u32>, flow_label: Option<u32>, sdf_filter_id: Option<u32>) -> &mut Self {
+    pub fn add_sdf_filter(
+        &mut self,
+        flow_description: Option<&str>,
+        tos_traffic_class: Option<u16>,
+        security_param_index: Option<u32>,
+        flow_label: Option<u32>,
+        sdf_filter_id: Option<u32>,
+    ) -> &mut Self {
         let mut value = BytesMut::new();
         let mut flags: u8 = 0;
-        
+
         if flow_description.is_some() {
             flags |= 0x01; // FD
         }
@@ -903,10 +949,10 @@ impl PfcpMessageBuilder {
         if sdf_filter_id.is_some() {
             flags |= 0x10; // BID
         }
-        
+
         value.put_u8(flags);
         value.put_u8(0); // Spare
-        
+
         if let Some(fd) = flow_description {
             let fd_bytes = fd.as_bytes();
             value.put_u16(fd_bytes.len() as u16);
@@ -927,11 +973,10 @@ impl PfcpMessageBuilder {
         if let Some(bid) = sdf_filter_id {
             value.put_u32(bid);
         }
-        
+
         self.add_tlv(pfcp_ie::SDF_FILTER, &value)
     }
 }
-
 
 // ============================================================================
 // Session Establishment Request Builder
@@ -951,38 +996,38 @@ pub fn build_session_establishment_request(
     restoration_indication: bool,
 ) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
-    
+
     // Node ID
     builder.add_node_id(node_id);
-    
+
     // F-SEID
     builder.add_f_seid(smf_n4_seid, local_addr_v4, local_addr_v6);
-    
+
     // PDN Type
     if let Some(pdn) = pdn_type {
         builder.add_pdn_type(pdn);
     }
-    
+
     // User ID
     if let Some((imsi, imeisv, msisdn)) = user_id {
         builder.add_user_id(Some(imsi), imeisv, msisdn);
     }
-    
+
     // APN/DNN
     if let Some(apn) = apn_dnn {
         builder.add_apn_dnn(apn);
     }
-    
+
     // S-NSSAI (5GC only)
     if let Some((sst, sd)) = s_nssai {
         builder.add_s_nssai(sst, sd);
     }
-    
+
     // Restoration Indication
     if restoration_indication {
         builder.add_pfcpsereq_flags(true);
     }
-    
+
     builder.build()
 }
 
@@ -998,7 +1043,12 @@ pub struct SessionModificationParams {
     /// FARs to create
     pub create_fars: Vec<FarParams>,
     /// FARs to update-activate (far_id, dst_if, outer_header_creation, send_end_marker)
-    pub update_fars_activate: Vec<(u32, u8, Option<(u16, u32, Option<[u8; 4]>, Option<[u8; 16]>)>, bool)>,
+    pub update_fars_activate: Vec<(
+        u32,
+        u8,
+        Option<(u16, u32, Option<[u8; 4]>, Option<[u8; 16]>)>,
+        bool,
+    )>,
     /// FARs to update-deactivate
     pub update_fars_deactivate: Vec<u32>,
     /// FARs to remove
@@ -1219,82 +1269,82 @@ pub struct PdrParams {
 /// Build Create PDR IE
 pub fn build_create_pdr(params: &PdrParams) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
-    
+
     // PDR ID
     builder.add_pdr_id(params.pdr_id);
-    
+
     // Precedence
     builder.add_precedence(params.precedence);
-    
+
     // PDI (Packet Detection Information) - grouped IE
     let mut pdi_builder = PfcpMessageBuilder::new();
-    
+
     // Source Interface
     pdi_builder.add_source_interface(params.source_interface);
-    
+
     // F-TEID
     if let Some((teid, ipv4, ipv6)) = params.f_teid {
         pdi_builder.add_f_teid(teid, ipv4, ipv6, None);
     }
-    
+
     // UE IP Address
     if let Some((ipv4, ipv6, source)) = params.ue_ip_address {
         pdi_builder.add_ue_ip_address(ipv4, ipv6, source, !source);
     }
-    
+
     // SDF Filters
     for sdf in &params.sdf_filters {
         pdi_builder.add_sdf_filter(Some(sdf), None, None, None, None);
     }
-    
+
     // QFI
     if let Some(qfi) = params.qfi {
         pdi_builder.add_qfi(qfi);
     }
-    
+
     // Network Instance
     if let Some(ref ni) = params.network_instance {
         pdi_builder.add_tlv(pfcp_ie::NETWORK_INSTANCE, ni.as_bytes());
     }
-    
+
     // Add PDI to Create PDR
     builder.add_tlv(pfcp_ie::PDI, &pdi_builder.build());
-    
+
     // Outer Header Removal
     if let Some(ohr) = params.outer_header_removal {
         builder.add_outer_header_removal(ohr);
     }
-    
+
     // FAR ID
     if let Some(far_id) = params.far_id {
         builder.add_far_id(far_id);
     }
-    
+
     // URR IDs
     for urr_id in &params.urr_ids {
         builder.add_urr_id(*urr_id);
     }
-    
+
     // QER ID
     if let Some(qer_id) = params.qer_id {
         builder.add_qer_id(qer_id);
     }
-    
+
     builder.build()
 }
 
 /// Build Update PDR IE
 pub fn build_update_pdr(pdr_id: u16, outer_header_removal: Option<u8>) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
-    
+
     // PDR ID
     builder.add_pdr_id(pdr_id);
-    
+
     // Outer Header Removal
     if let Some(ohr) = outer_header_removal {
         builder.add_outer_header_removal(ohr);
     }
-    
+
     builder.build()
 }
 
@@ -1322,81 +1372,84 @@ pub struct FarParams {
 /// Build Create FAR IE
 pub fn build_create_far(params: &FarParams) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
-    
+
     // FAR ID
     builder.add_far_id(params.far_id);
-    
+
     // Apply Action
     builder.add_apply_action(params.apply_action);
-    
+
     // Forwarding Parameters (grouped IE) - only if FORW action
     if params.apply_action & apply_action::FORW != 0 {
         let mut fp_builder = PfcpMessageBuilder::new();
-        
+
         // Destination Interface
         if let Some(dst_if) = params.destination_interface {
             fp_builder.add_destination_interface(dst_if);
         }
-        
+
         // Network Instance
         if let Some(ref ni) = params.network_instance {
             fp_builder.add_tlv(pfcp_ie::NETWORK_INSTANCE, ni.as_bytes());
         }
-        
+
         // Outer Header Creation
         if let Some((desc, teid, ipv4, ipv6)) = params.outer_header_creation {
             fp_builder.add_outer_header_creation(desc, teid, ipv4, ipv6);
         }
-        
+
         builder.add_tlv(pfcp_ie::FORWARDING_PARAMETERS, &fp_builder.build());
     }
-    
+
     builder.build()
 }
 
 /// Build Update FAR IE for activation
-pub fn build_update_far_activate(far_id: u32, destination_interface: u8, 
-                                  outer_header_creation: Option<(u16, u32, Option<[u8; 4]>, Option<[u8; 16]>)>,
-                                  send_end_marker: bool) -> Vec<u8> {
+pub fn build_update_far_activate(
+    far_id: u32,
+    destination_interface: u8,
+    outer_header_creation: Option<(u16, u32, Option<[u8; 4]>, Option<[u8; 16]>)>,
+    send_end_marker: bool,
+) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
-    
+
     // FAR ID
     builder.add_far_id(far_id);
-    
+
     // Apply Action - FORW
     builder.add_apply_action(apply_action::FORW);
-    
+
     // Update Forwarding Parameters (grouped IE)
     let mut ufp_builder = PfcpMessageBuilder::new();
-    
+
     // Destination Interface
     ufp_builder.add_destination_interface(destination_interface);
-    
+
     // Outer Header Creation
     if let Some((desc, teid, ipv4, ipv6)) = outer_header_creation {
         ufp_builder.add_outer_header_creation(desc, teid, ipv4, ipv6);
     }
-    
+
     // PFCPSMREQ Flags (send end marker)
     if send_end_marker {
         ufp_builder.add_u8(pfcp_ie::PFCPSMREQ_FLAGS, 0x01);
     }
-    
+
     builder.add_tlv(pfcp_ie::UPDATE_FORWARDING_PARAMETERS, &ufp_builder.build());
-    
+
     builder.build()
 }
 
 /// Build Update FAR IE for deactivation
 pub fn build_update_far_deactivate(far_id: u32) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
-    
+
     // FAR ID
     builder.add_far_id(far_id);
-    
+
     // Apply Action - BUFF | NOCP
     builder.add_apply_action(apply_action::BUFF | apply_action::NOCP);
-    
+
     builder.build()
 }
 
@@ -1427,98 +1480,98 @@ pub struct UrrParams {
 /// Build Create URR IE
 pub fn build_create_urr(params: &UrrParams) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
-    
+
     // URR ID
     builder.add_urr_id(params.urr_id);
-    
+
     // Measurement Method
     let (duration, volume, event) = params.measurement_method;
     builder.add_measurement_method(duration, volume, event);
-    
+
     // Reporting Triggers
     builder.add_reporting_triggers(params.reporting_triggers);
-    
+
     // Volume Threshold
     if let Some((total, uplink, downlink)) = params.volume_threshold {
         builder.add_volume_threshold(total, uplink, downlink);
     }
-    
+
     // Volume Quota
     if let Some((total, uplink, downlink)) = params.volume_quota {
         builder.add_volume_quota(total, uplink, downlink);
     }
-    
+
     // Time Threshold
     if let Some(seconds) = params.time_threshold {
         builder.add_time_threshold(seconds);
     }
-    
+
     // Time Quota
     if let Some(seconds) = params.time_quota {
         builder.add_time_quota(seconds);
     }
-    
+
     // Quota Validity Time
     if let Some(seconds) = params.quota_validity_time {
         builder.add_quota_validity_time(seconds);
     }
-    
+
     builder.build()
 }
 
 /// Build Update URR IE
 pub fn build_update_urr(params: &UrrParams, modify_flags: u64) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
-    
+
     // URR ID
     builder.add_urr_id(params.urr_id);
-    
+
     // Measurement Method
     if modify_flags & modify_flags::URR_MEAS_METHOD != 0 {
         let (duration, volume, event) = params.measurement_method;
         builder.add_measurement_method(duration, volume, event);
     }
-    
+
     // Reporting Triggers
     if modify_flags & modify_flags::URR_REPORT_TRIGGER != 0 {
         builder.add_reporting_triggers(params.reporting_triggers);
     }
-    
+
     // Volume Threshold
     if modify_flags & modify_flags::URR_VOLUME_THRESH != 0 {
         if let Some((total, uplink, downlink)) = params.volume_threshold {
             builder.add_volume_threshold(total, uplink, downlink);
         }
     }
-    
+
     // Volume Quota
     if modify_flags & modify_flags::URR_VOLUME_QUOTA != 0 {
         if let Some((total, uplink, downlink)) = params.volume_quota {
             builder.add_volume_quota(total, uplink, downlink);
         }
     }
-    
+
     // Time Threshold
     if modify_flags & modify_flags::URR_TIME_THRESH != 0 {
         if let Some(seconds) = params.time_threshold {
             builder.add_time_threshold(seconds);
         }
     }
-    
+
     // Time Quota
     if modify_flags & modify_flags::URR_TIME_QUOTA != 0 {
         if let Some(seconds) = params.time_quota {
             builder.add_time_quota(seconds);
         }
     }
-    
+
     // Quota Validity Time
     if modify_flags & modify_flags::URR_QUOTA_VALIDITY_TIME != 0 {
         if let Some(seconds) = params.quota_validity_time {
             builder.add_quota_validity_time(seconds);
         }
     }
-    
+
     builder.build()
 }
 
@@ -1537,7 +1590,7 @@ pub fn build_remove_urr(urr_id: u32) -> Vec<u8> {
 #[derive(Debug, Clone, Default)]
 pub struct QerParams {
     pub qer_id: u32,
-    pub gate_status: (u8, u8), // (dl_gate, ul_gate)
+    pub gate_status: (u8, u8),   // (dl_gate, ul_gate)
     pub mbr: Option<(u64, u64)>, // (uplink, downlink)
     pub gbr: Option<(u64, u64)>, // (uplink, downlink)
     pub qfi: Option<u8>,
@@ -1546,29 +1599,29 @@ pub struct QerParams {
 /// Build Create QER IE
 pub fn build_create_qer(params: &QerParams) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
-    
+
     // QER ID
     builder.add_qer_id(params.qer_id);
-    
+
     // Gate Status
     let (dl_gate, ul_gate) = params.gate_status;
     builder.add_gate_status(dl_gate, ul_gate);
-    
+
     // MBR
     if let Some((uplink, downlink)) = params.mbr {
         builder.add_mbr(uplink, downlink);
     }
-    
+
     // GBR
     if let Some((uplink, downlink)) = params.gbr {
         builder.add_gbr(uplink, downlink);
     }
-    
+
     // QFI
     if let Some(qfi) = params.qfi {
         builder.add_qfi(qfi);
     }
-    
+
     builder.build()
 }
 
@@ -1600,23 +1653,22 @@ pub struct BarParams {
 /// Build Create BAR IE
 pub fn build_create_bar(params: &BarParams) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
-    
+
     // BAR ID
     builder.add_bar_id(params.bar_id);
-    
+
     // Downlink Data Notification Delay
     if let Some(delay) = params.downlink_data_notification_delay {
         builder.add_u8(pfcp_ie::DOWNLINK_DATA_NOTIFICATION_DELAY, delay);
     }
-    
+
     // Suggested Buffering Packets Count
     if let Some(count) = params.suggested_buffering_packets_count {
         builder.add_u8(pfcp_ie::SUGGESTED_BUFFERING_PACKETS_COUNT, count);
     }
-    
+
     builder.build()
 }
-
 
 // ============================================================================
 // Tests
@@ -1652,7 +1704,7 @@ mod tests {
         let mut builder = PfcpMessageBuilder::new();
         builder.add_u8(pfcp_ie::CAUSE, 1);
         let data = builder.build();
-        
+
         // Type (2 bytes) + Length (2 bytes) + Value (1 byte)
         assert_eq!(data.len(), 5);
         assert_eq!(data[0], 0); // Type high byte
@@ -1667,7 +1719,7 @@ mod tests {
         let mut builder = PfcpMessageBuilder::new();
         builder.add_u16(pfcp_ie::PDR_ID, 0x1234);
         let data = builder.build();
-        
+
         assert_eq!(data.len(), 6);
         assert_eq!(data[4], 0x12);
         assert_eq!(data[5], 0x34);
@@ -1678,7 +1730,7 @@ mod tests {
         let mut builder = PfcpMessageBuilder::new();
         builder.add_u32(pfcp_ie::FAR_ID, 0x12345678);
         let data = builder.build();
-        
+
         assert_eq!(data.len(), 8);
         assert_eq!(data[4], 0x12);
         assert_eq!(data[5], 0x34);
@@ -1691,7 +1743,7 @@ mod tests {
         let mut builder = PfcpMessageBuilder::new();
         builder.add_f_seid(0x123456789ABCDEF0, Some([192, 168, 1, 1]), None);
         let data = builder.build();
-        
+
         // Type (2) + Length (2) + Flags (1) + SEID (8) + IPv4 (4) = 17
         assert_eq!(data.len(), 17);
         assert_eq!(data[4], 0x02); // V4 flag
@@ -1702,7 +1754,7 @@ mod tests {
         let mut builder = PfcpMessageBuilder::new();
         builder.add_apn_dnn("internet");
         let data = builder.build();
-        
+
         // Type (2) + Length (2) + FQDN (1 + 8) = 13
         assert_eq!(data.len(), 13);
         assert_eq!(data[4], 8); // Label length
@@ -1714,7 +1766,7 @@ mod tests {
         let mut builder = PfcpMessageBuilder::new();
         builder.add_s_nssai(1, Some(0x010203));
         let data = builder.build();
-        
+
         // Type (2) + Length (2) + SST (1) + SD (3) = 8
         assert_eq!(data.len(), 8);
         assert_eq!(data[4], 1); // SST
@@ -1728,7 +1780,7 @@ mod tests {
         let mut builder = PfcpMessageBuilder::new();
         builder.add_s_nssai(1, None);
         let data = builder.build();
-        
+
         // Type (2) + Length (2) + SST (1) = 5
         assert_eq!(data.len(), 5);
         assert_eq!(data[4], 1); // SST
@@ -1747,7 +1799,7 @@ mod tests {
             None,
             false,
         );
-        
+
         assert!(!data.is_empty());
     }
 
@@ -1767,7 +1819,7 @@ mod tests {
             qfi: Some(9),
             ..Default::default()
         };
-        
+
         let data = build_create_pdr(&params);
         assert!(!data.is_empty());
     }
@@ -1775,7 +1827,7 @@ mod tests {
     #[test]
     fn test_build_remove_pdr() {
         let data = build_remove_pdr(1);
-        
+
         // Type (2) + Length (2) + PDR ID (2) = 6
         assert_eq!(data.len(), 6);
     }
@@ -1788,7 +1840,7 @@ mod tests {
             destination_interface: Some(interface::CORE),
             ..Default::default()
         };
-        
+
         let data = build_create_far(&params);
         assert!(!data.is_empty());
     }
@@ -1801,7 +1853,7 @@ mod tests {
             Some((0x0100, 0x12345678, Some([10, 0, 0, 1]), None)),
             true,
         );
-        
+
         assert!(!data.is_empty());
     }
 
@@ -1814,7 +1866,7 @@ mod tests {
     #[test]
     fn test_build_remove_far() {
         let data = build_remove_far(1);
-        
+
         // Type (2) + Length (2) + FAR ID (4) = 8
         assert_eq!(data.len(), 8);
     }
@@ -1829,7 +1881,7 @@ mod tests {
             time_threshold: Some(3600),
             ..Default::default()
         };
-        
+
         let data = build_create_urr(&params);
         assert!(!data.is_empty());
     }
@@ -1837,7 +1889,7 @@ mod tests {
     #[test]
     fn test_build_remove_urr() {
         let data = build_remove_urr(1);
-        
+
         // Type (2) + Length (2) + URR ID (4) = 8
         assert_eq!(data.len(), 8);
     }
@@ -1851,7 +1903,7 @@ mod tests {
             qfi: Some(9),
             ..Default::default()
         };
-        
+
         let data = build_create_qer(&params);
         assert!(!data.is_empty());
     }
@@ -1859,7 +1911,7 @@ mod tests {
     #[test]
     fn test_build_remove_qer() {
         let data = build_remove_qer(1);
-        
+
         // Type (2) + Length (2) + QER ID (4) = 8
         assert_eq!(data.len(), 8);
     }
@@ -1871,7 +1923,7 @@ mod tests {
             downlink_data_notification_delay: Some(50),
             suggested_buffering_packets_count: Some(10),
         };
-        
+
         let data = build_create_bar(&params);
         assert!(!data.is_empty());
     }
@@ -1913,7 +1965,7 @@ mod tests {
         let mut builder = PfcpMessageBuilder::new();
         builder.add_u8(pfcp_ie::CAUSE, 1);
         assert!(!builder.is_empty());
-        
+
         builder.clear();
         assert!(builder.is_empty());
     }
@@ -1925,7 +1977,7 @@ mod tests {
             .add_u8(pfcp_ie::CAUSE, 1)
             .add_u16(pfcp_ie::PDR_ID, 1)
             .add_u32(pfcp_ie::FAR_ID, 1);
-        
+
         // 5 + 6 + 8 = 19 bytes
         assert_eq!(builder.len(), 19);
     }
@@ -1943,7 +1995,7 @@ mod tests {
             volume_quota: Some((Some(500000), None, None)),
             ..Default::default()
         };
-        
+
         let data = build_update_urr(&params, modify_flags::URR_VOLUME_QUOTA);
         assert!(!data.is_empty());
     }
@@ -1953,7 +2005,7 @@ mod tests {
         let mut builder = PfcpMessageBuilder::new();
         builder.add_user_id(Some(&[0x00, 0x10, 0x10]), None, None);
         let data = builder.build();
-        
+
         assert!(!data.is_empty());
         // Flags should have IMSIF set
         assert_eq!(data[4] & 0x01, 0x01);
@@ -1962,7 +2014,13 @@ mod tests {
     #[test]
     fn test_pfcp_message_builder_add_sdf_filter() {
         let mut builder = PfcpMessageBuilder::new();
-        builder.add_sdf_filter(Some("permit out ip from any to any"), None, None, None, None);
+        builder.add_sdf_filter(
+            Some("permit out ip from any to any"),
+            None,
+            None,
+            None,
+            None,
+        );
         let data = builder.build();
 
         assert!(!data.is_empty());

@@ -346,8 +346,14 @@ mod tests {
     #[test]
     fn test_message_encode_decode() {
         let mut msg = DiameterMessage::new_request(318, 16777251);
-        msg.add_avp(Avp::mandatory(263, AvpData::Utf8String("test-session".to_string())));
-        msg.add_avp(Avp::mandatory(264, AvpData::DiameterIdentity("mme.epc.mnc001.mcc001.3gppnetwork.org".to_string())));
+        msg.add_avp(Avp::mandatory(
+            263,
+            AvpData::Utf8String("test-session".to_string()),
+        ));
+        msg.add_avp(Avp::mandatory(
+            264,
+            AvpData::DiameterIdentity("mme.epc.mnc001.mcc001.3gppnetwork.org".to_string()),
+        ));
 
         let encoded = msg.encode();
         let mut bytes = encoded.freeze();

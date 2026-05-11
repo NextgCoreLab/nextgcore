@@ -23,7 +23,12 @@ pub fn build_security_capability_request(
             // Note: Serving PLMN IDs retrieved from context.serving_plmn_ids
             // Configured via YAML configuration or command line during initialization
             let serving_plmn_ids: Vec<PlmnId> = vec![];
-            (sender, security_capability, target_apiroot_supported, serving_plmn_ids)
+            (
+                sender,
+                security_capability,
+                target_apiroot_supported,
+                serving_plmn_ids,
+            )
         } else {
             return None;
         }
@@ -40,13 +45,19 @@ pub fn build_security_capability_request(
 
     // Build supported security capability list
     if none {
-        req_data.supported_sec_capability_list.push(SecurityCapability::None);
+        req_data
+            .supported_sec_capability_list
+            .push(SecurityCapability::None);
     } else {
         if security_capability.tls {
-            req_data.supported_sec_capability_list.push(SecurityCapability::Tls);
+            req_data
+                .supported_sec_capability_list
+                .push(SecurityCapability::Tls);
         }
         if security_capability.prins {
-            req_data.supported_sec_capability_list.push(SecurityCapability::Prins);
+            req_data
+                .supported_sec_capability_list
+                .push(SecurityCapability::Prins);
         }
     }
 
@@ -106,10 +117,10 @@ pub fn build_security_capability_response(node: &SeppNode) -> Option<SecNegotiat
     };
 
     // Set target API root support (only if security is enabled)
-    if node.negotiated_security_scheme != SecurityCapability::None
-        && node.target_apiroot_supported {
-            rsp_data.target_apiroot_supported = true;
-        }
+    if node.negotiated_security_scheme != SecurityCapability::None && node.target_apiroot_supported
+    {
+        rsp_data.target_apiroot_supported = true;
+    }
 
     // Add serving PLMN IDs
     rsp_data.plmn_id_list = serving_plmn_ids;
@@ -519,13 +530,7 @@ mod tests {
             ie_value: Some("imsi-001010123456789".to_string()),
             ie_action: "modify".to_string(),
         }];
-        let msg = build_n32f_prins_message(
-            "GET",
-            "/nudm-sdm/v1/supi",
-            &[],
-            None,
-            modifications,
-        );
+        let msg = build_n32f_prins_message("GET", "/nudm-sdm/v1/supi", &[], None, modifications);
 
         assert_eq!(msg.request_line.method, "GET");
         assert!(msg.payload.is_none());

@@ -200,7 +200,8 @@ impl SbcPwsData {
 
     /// Check if this is a CMAS message
     pub fn is_cmas(&self) -> bool {
-        self.message_id >= MSG_ID_CMAS_PRESIDENTIAL && self.message_id <= MSG_ID_CMAS_STATE_LOCAL_TEST
+        self.message_id >= MSG_ID_CMAS_PRESIDENTIAL
+            && self.message_id <= MSG_ID_CMAS_STATE_LOCAL_TEST
     }
 
     /// Check if this is a test message

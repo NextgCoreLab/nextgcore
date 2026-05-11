@@ -11,8 +11,7 @@ pub const OGS_TIMEUP: i32 = -4;
 
 /// Error type enum
 #[repr(i32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OgsError {
     #[default]
     Ok = 0,
@@ -61,4 +60,3 @@ impl OgsError {
         *self == OgsError::Timeup
     }
 }
-

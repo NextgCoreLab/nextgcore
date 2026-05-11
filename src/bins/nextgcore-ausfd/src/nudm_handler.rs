@@ -74,10 +74,7 @@ pub fn ausf_nudm_ueau_handle_get(ausf_ue_id: u64, _stream_id: u64) -> bool {
     // - _links (href to 5g-aka-confirmation endpoint)
     // The HTTP 201 Created response is built and sent via the HTTP handler in main.rs
 
-    log::debug!(
-        "[{}] Sending UeAuthenticationCtx response",
-        ausf_ue.suci
-    );
+    log::debug!("[{}] Sending UeAuthenticationCtx response", ausf_ue.suci);
 
     true
 }
@@ -154,10 +151,7 @@ pub fn ausf_nudm_ueau_handle_result_confirmation_inform(ausf_ue_id: u64, _stream
     // - supi
     // - kseaf
 
-    log::debug!(
-        "[{}] Sending ConfirmationDataResponse",
-        ausf_ue.suci
-    );
+    log::debug!("[{}] Sending ConfirmationDataResponse", ausf_ue.suci);
 
     // Note: The HTTP 200 OK response with ConfirmationDataResponse is built
     // and sent via the HTTP handler in main.rs

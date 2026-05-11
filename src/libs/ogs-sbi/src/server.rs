@@ -158,7 +158,7 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
 async fn convert_request(req: Request<Incoming>) -> SbiRequest {
     let method = req.method().to_string();
     let uri = req.uri().path().to_string();
-    
+
     // Extract headers
     let mut http = SbiHttpMessage::new();
     for (key, value) in req.headers() {
@@ -166,7 +166,7 @@ async fn convert_request(req: Request<Incoming>) -> SbiRequest {
             http.set_header(key.to_string(), v.to_string());
         }
     }
-    
+
     // Extract query parameters
     if let Some(query) = req.uri().query() {
         for pair in query.split('&') {
@@ -175,7 +175,7 @@ async fn convert_request(req: Request<Incoming>) -> SbiRequest {
             }
         }
     }
-    
+
     // Read body
     if let Ok(body) = req.into_body().collect().await {
         let bytes = body.to_bytes();
@@ -183,7 +183,7 @@ async fn convert_request(req: Request<Incoming>) -> SbiRequest {
             http.set_content(String::from_utf8_lossy(&bytes).to_string());
         }
     }
-    
+
     SbiRequest {
         header: crate::message::SbiHeader::with_method_uri(method, uri),
         http,
@@ -192,21 +192,20 @@ async fn convert_request(req: Request<Incoming>) -> SbiRequest {
 
 /// Convert SbiResponse to hyper response
 fn convert_response(sbi_response: SbiResponse) -> Response<Full<Bytes>> {
-    let mut builder = Response::builder()
-        .status(sbi_response.status);
-    
+    let mut builder = Response::builder().status(sbi_response.status);
+
     // Add headers
     for (key, value) in &sbi_response.http.headers {
         builder = builder.header(key.as_str(), value.as_str());
     }
-    
+
     // Build body
     let body = sbi_response
         .http
         .content
         .map(|c| Full::new(Bytes::from(c)))
         .unwrap_or_else(|| Full::new(Bytes::new()));
-    
+
     builder.body(body).unwrap_or_else(|_| {
         Response::builder()
             .status(500)
@@ -251,19 +250,26 @@ impl SbiServer {
 
     /// Build a TLS acceptor from the server config
     fn build_tls_acceptor(&self) -> SbiResult<TlsAcceptor> {
-        let cert_path = self.config.cert.as_ref()
+        let cert_path = self
+            .config
+            .cert
+            .as_ref()
             .ok_or_else(|| SbiError::TlsError("TLS certificate path not configured".into()))?;
-        let key_path = self.config.private_key.as_ref()
+        let key_path = self
+            .config
+            .private_key
+            .as_ref()
             .ok_or_else(|| SbiError::TlsError("TLS private key path not configured".into()))?;
 
         let certs = tls::load_certs(cert_path)?;
         let key = tls::load_private_key(key_path)?;
 
         let mut server_config = if self.config.verify_client {
-            let ca_path = self.config.verify_client_cacert.as_ref()
-                .ok_or_else(|| SbiError::TlsError(
+            let ca_path = self.config.verify_client_cacert.as_ref().ok_or_else(|| {
+                SbiError::TlsError(
                     "Client CA certificate required for mTLS but not configured".into(),
-                ))?;
+                )
+            })?;
             tls::build_server_config_mtls(certs, key, ca_path)?
         } else {
             tls::build_server_config(certs, key)?
@@ -360,11 +366,13 @@ impl SbiServer {
     /// Stop the server
     pub async fn stop(&self) -> SbiResult<()> {
         let mut state = self.state.lock().await;
-        
-        if let ServerState::Running(shutdown_tx) = std::mem::replace(&mut *state, ServerState::Stopped) {
+
+        if let ServerState::Running(shutdown_tx) =
+            std::mem::replace(&mut *state, ServerState::Stopped)
+        {
             let _ = shutdown_tx.send(());
         }
-        
+
         Ok(())
     }
 
@@ -386,12 +394,7 @@ impl StreamId {
 }
 
 /// Helper function to send an error response
-pub fn send_error(
-    status: u16,
-    title: &str,
-    detail: &str,
-    cause: Option<&str>,
-) -> SbiResponse {
+pub fn send_error(status: u16, title: &str, detail: &str, cause: Option<&str>) -> SbiResponse {
     use crate::message::ProblemDetails;
 
     let problem = ProblemDetails::with_status(status as i32)
@@ -446,7 +449,12 @@ pub fn send_internal_error(detail: &str) -> SbiResponse {
 
 /// Send a 503 Service Unavailable error response
 pub fn send_service_unavailable(detail: &str) -> SbiResponse {
-    send_error(503, "Service Unavailable", detail, Some("SERVICE_UNAVAILABLE"))
+    send_error(
+        503,
+        "Service Unavailable",
+        detail,
+        Some("SERVICE_UNAVAILABLE"),
+    )
 }
 
 /// Send a 504 Gateway Timeout error response
@@ -460,9 +468,9 @@ mod tests {
 
     #[test]
     fn test_server_config() {
-        let config = SbiServerConfig::new(SocketAddr::from(([0, 0, 0, 0], 8080)))
-            .with_interface("sbi");
-        
+        let config =
+            SbiServerConfig::new(SocketAddr::from(([0, 0, 0, 0], 8080))).with_interface("sbi");
+
         assert_eq!(config.addr.port(), 8080);
         assert_eq!(config.interface, Some("sbi".to_string()));
     }

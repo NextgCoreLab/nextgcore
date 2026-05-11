@@ -149,15 +149,25 @@ impl ZeroTrustEngine {
             rule.require_mtls
         );
         // Insert specific rules before wildcard default-deny so first-match semantics work
-        let insert_pos = self.policy_rules.iter().position(|r| {
-            r.source_nf_type == "*" && r.target_nf_type == "*"
-        }).unwrap_or(self.policy_rules.len());
+        let insert_pos = self
+            .policy_rules
+            .iter()
+            .position(|r| r.source_nf_type == "*" && r.target_nf_type == "*")
+            .unwrap_or(self.policy_rules.len());
         self.policy_rules.insert(insert_pos, rule);
     }
 
     /// Register or update NF instance trust for service mesh authentication.
-    pub fn register_nf_instance(&mut self, nf_instance_id: String, nf_type: String, cert_fingerprint: Option<String>) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("value expected").as_millis() as u64;
+    pub fn register_nf_instance(
+        &mut self,
+        nf_instance_id: String,
+        nf_type: String,
+        cert_fingerprint: Option<String>,
+    ) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("value expected")
+            .as_millis() as u64;
         let trust = NfInstanceTrust {
             nf_instance_id: nf_instance_id.clone(),
             nf_type,
@@ -173,8 +183,16 @@ impl ZeroTrustEngine {
     }
 
     /// Authenticate NF instance with mTLS and update trust score dynamically.
-    pub fn authenticate_nf(&mut self, nf_instance_id: &str, has_mtls: bool, cert_fingerprint: Option<String>) -> bool {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("value expected").as_millis() as u64;
+    pub fn authenticate_nf(
+        &mut self,
+        nf_instance_id: &str,
+        has_mtls: bool,
+        cert_fingerprint: Option<String>,
+    ) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("value expected")
+            .as_millis() as u64;
 
         if let Some(trust) = self.nf_trust.get_mut(nf_instance_id) {
             trust.auth_attempts += 1;
@@ -188,7 +206,8 @@ impl ZeroTrustEngine {
 
             // Verify mTLS certificate fingerprint
             if has_mtls {
-                if let (Some(expected), Some(actual)) = (&trust.cert_fingerprint, &cert_fingerprint) {
+                if let (Some(expected), Some(actual)) = (&trust.cert_fingerprint, &cert_fingerprint)
+                {
                     if expected != actual {
                         log::error!("mTLS certificate mismatch for NF {nf_instance_id}: expected {expected}, got {actual}");
                         trust.failed_attempts += 1;
@@ -216,7 +235,12 @@ impl ZeroTrustEngine {
     }
 
     /// Evaluate zero-trust policy for inter-NF communication.
-    pub fn evaluate_policy(&self, source_nf_type: &str, target_nf_type: &str, source_instance_id: &str) -> PolicyDecision {
+    pub fn evaluate_policy(
+        &self,
+        source_nf_type: &str,
+        target_nf_type: &str,
+        source_instance_id: &str,
+    ) -> PolicyDecision {
         // Check NF instance trust
         if let Some(trust) = self.nf_trust.get(source_instance_id) {
             if trust.revoked {
@@ -226,16 +250,27 @@ impl ZeroTrustEngine {
 
             // Find matching policy rule (first match wins)
             for rule in &self.policy_rules {
-                let source_match = rule.source_nf_type == "*" || rule.source_nf_type == source_nf_type;
-                let target_match = rule.target_nf_type == "*" || rule.target_nf_type == target_nf_type;
+                let source_match =
+                    rule.source_nf_type == "*" || rule.source_nf_type == source_nf_type;
+                let target_match =
+                    rule.target_nf_type == "*" || rule.target_nf_type == target_nf_type;
 
                 if source_match && target_match {
                     if trust.trust_score >= rule.min_trust_score {
-                        log::debug!("Policy matched: {} -> {} (score {:.2}, rule: {})",
-                                   source_nf_type, target_nf_type, trust.trust_score, rule.rule_id);
+                        log::debug!(
+                            "Policy matched: {} -> {} (score {:.2}, rule: {})",
+                            source_nf_type,
+                            target_nf_type,
+                            trust.trust_score,
+                            rule.rule_id
+                        );
                         return rule.decision;
                     } else {
-                        log::warn!("Trust score too low: {:.2} < {:.2}", trust.trust_score, rule.min_trust_score);
+                        log::warn!(
+                            "Trust score too low: {:.2} < {:.2}",
+                            trust.trust_score,
+                            rule.min_trust_score
+                        );
                         return PolicyDecision::Deny;
                     }
                 }
@@ -262,9 +297,18 @@ impl ZeroTrustEngine {
     }
 
     /// Verify an inter-PLMN request.
-    pub fn verify(&mut self, plmn_id: &str, has_mtls: bool, has_token: bool, has_attestation: bool) -> VerificationResult {
+    pub fn verify(
+        &mut self,
+        plmn_id: &str,
+        has_mtls: bool,
+        has_token: bool,
+        has_attestation: bool,
+    ) -> VerificationResult {
         self.verification_count += 1;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("value expected").as_millis() as u64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("value expected")
+            .as_millis() as u64;
 
         let achieved_level = match (has_mtls, has_token, has_attestation) {
             (true, true, true) => ZeroTrustLevel::Full,
@@ -273,7 +317,11 @@ impl ZeroTrustEngine {
             _ => ZeroTrustLevel::None,
         };
 
-        let _peer_level = self.trusted_peers.get(plmn_id).copied().unwrap_or(ZeroTrustLevel::None);
+        let _peer_level = self
+            .trusted_peers
+            .get(plmn_id)
+            .copied()
+            .unwrap_or(ZeroTrustLevel::None);
         let trust_score = match achieved_level {
             ZeroTrustLevel::Full => 1.0,
             ZeroTrustLevel::Enhanced => 0.8,
@@ -293,15 +341,24 @@ impl ZeroTrustEngine {
             reason: if authorized {
                 format!("Trust level {} meets minimum", achieved_level as u8)
             } else {
-                format!("Trust level {} below minimum {}", achieved_level as u8, self.min_level as u8)
+                format!(
+                    "Trust level {} below minimum {}",
+                    achieved_level as u8, self.min_level as u8
+                )
             },
             timestamp_ms: now,
         }
     }
 
-    pub fn verification_count(&self) -> u64 { self.verification_count }
-    pub fn denied_count(&self) -> u64 { self.denied_count }
-    pub fn nf_instance_count(&self) -> usize { self.nf_trust.len() }
+    pub fn verification_count(&self) -> u64 {
+        self.verification_count
+    }
+    pub fn denied_count(&self) -> u64 {
+        self.denied_count
+    }
+    pub fn nf_instance_count(&self) -> usize {
+        self.nf_trust.len()
+    }
 }
 
 // ============================================================================
@@ -336,18 +393,29 @@ pub enum PqcSigAlgorithm {
 }
 
 /// Negotiate PQC parameters between two SEPPs.
-pub fn negotiate_pqc(local: &PqcCapability, remote: &PqcCapability) -> Option<(PqcKemAlgorithm, PqcSigAlgorithm)> {
+pub fn negotiate_pqc(
+    local: &PqcCapability,
+    remote: &PqcCapability,
+) -> Option<(PqcKemAlgorithm, PqcSigAlgorithm)> {
     // Prefer highest mutual KEM
-    let kem = [PqcKemAlgorithm::MlKem1024, PqcKemAlgorithm::MlKem768, PqcKemAlgorithm::MlKem512]
-        .iter()
-        .find(|k| local.kem_algorithms.contains(k) && remote.kem_algorithms.contains(k))
-        .copied()?;
+    let kem = [
+        PqcKemAlgorithm::MlKem1024,
+        PqcKemAlgorithm::MlKem768,
+        PqcKemAlgorithm::MlKem512,
+    ]
+    .iter()
+    .find(|k| local.kem_algorithms.contains(k) && remote.kem_algorithms.contains(k))
+    .copied()?;
 
     // Prefer highest mutual signature
-    let sig = [PqcSigAlgorithm::MlDsa87, PqcSigAlgorithm::MlDsa65, PqcSigAlgorithm::MlDsa44]
-        .iter()
-        .find(|s| local.sig_algorithms.contains(s) && remote.sig_algorithms.contains(s))
-        .copied()?;
+    let sig = [
+        PqcSigAlgorithm::MlDsa87,
+        PqcSigAlgorithm::MlDsa65,
+        PqcSigAlgorithm::MlDsa44,
+    ]
+    .iter()
+    .find(|s| local.sig_algorithms.contains(s) && remote.sig_algorithms.contains(s))
+    .copied()?;
 
     Some((kem, sig))
 }
@@ -415,7 +483,10 @@ impl ThreatDetector {
     /// Assess a request for threats.
     pub fn assess(&mut self, plmn_id: &str) -> ThreatAssessment {
         self.assessment_count += 1;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("value expected").as_millis() as u64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("value expected")
+            .as_millis() as u64;
         let window_start = now.saturating_sub(self.window.as_millis() as u64);
 
         let timestamps = self.request_counts.entry(plmn_id.to_string()).or_default();
@@ -443,8 +514,12 @@ impl ThreatDetector {
         }
     }
 
-    pub fn assessment_count(&self) -> u64 { self.assessment_count }
-    pub fn block_count(&self) -> u64 { self.block_count }
+    pub fn assessment_count(&self) -> u64 {
+        self.assessment_count
+    }
+    pub fn block_count(&self) -> u64 {
+        self.block_count
+    }
 }
 
 // ============================================================================
@@ -511,9 +586,12 @@ impl AnomalyTracker {
             return;
         }
         self.mean = self.observations.iter().sum::<f64>() / n;
-        let variance: f64 = self.observations.iter()
+        let variance: f64 = self
+            .observations
+            .iter()
             .map(|v| (v - self.mean).powi(2))
-            .sum::<f64>() / n;
+            .sum::<f64>()
+            / n;
         self.std_dev = variance.sqrt();
         self.baseline_valid = true;
     }
@@ -625,7 +703,11 @@ mod tests {
         );
 
         // Authenticate with correct cert
-        assert!(engine.authenticate_nf("amf-instance-1", true, Some("sha256:abcd1234".to_string())));
+        assert!(engine.authenticate_nf(
+            "amf-instance-1",
+            true,
+            Some("sha256:abcd1234".to_string())
+        ));
 
         // Authenticate with wrong cert should fail
         assert!(!engine.authenticate_nf("amf-instance-1", true, Some("sha256:wrong".to_string())));

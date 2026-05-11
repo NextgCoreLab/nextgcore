@@ -15,23 +15,22 @@ use std::time::Duration;
 mod context;
 mod event;
 mod sbi_path;
-mod service_mesh;
 mod sbi_response;
 mod scp_sm;
+mod service_mesh;
 mod timer;
 
 pub use context::{
-    scp_self, scp_context_init, scp_context_final, ScpContext, ScpAssoc,
-    NfType, SbiServiceType, DiscoveryOption, SNssai, Tai, Guami, PlmnId, AmfId,
+    scp_context_final, scp_context_init, scp_self, AmfId, DiscoveryOption, Guami, NfType, PlmnId,
+    SNssai, SbiServiceType, ScpAssoc, ScpContext, Tai,
 };
-pub use event::{ScpEvent, ScpEventId, ScpTimerId, SbiEventData, SbiMessage, SbiResponse};
+pub use event::{SbiEventData, SbiMessage, SbiResponse, ScpEvent, ScpEventId, ScpTimerId};
 pub use sbi_path::{
-    scp_sbi_open, scp_sbi_close, scp_sbi_is_running, SbiServerConfig,
-    SbiRequest, handle_request, handle_response, handle_nf_discover_response,
-    handle_sepp_discover_response, parse_discovery_headers, copy_request_headers,
-    RequestHandlerResult, headers, NfInstanceCandidate, select_nf_instance,
-    select_nf_instance_round_robin, route_request, build_forwarded_request,
-    discovery_cache, DiscoveryCache, parse_search_result,
+    build_forwarded_request, copy_request_headers, discovery_cache, handle_nf_discover_response,
+    handle_request, handle_response, handle_sepp_discover_response, headers,
+    parse_discovery_headers, parse_search_result, route_request, scp_sbi_close, scp_sbi_is_running,
+    scp_sbi_open, select_nf_instance, select_nf_instance_round_robin, DiscoveryCache,
+    NfInstanceCandidate, RequestHandlerResult, SbiRequest, SbiServerConfig,
 };
 pub use scp_sm::{ScpSmContext, ScpState};
 pub use timer::{timer_manager, ScpTimerManager};
@@ -99,11 +98,10 @@ async fn main() -> Result<()> {
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
-            .with_endpoint(
-                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
-            ),
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+        ),
     )
     .ok();
 
@@ -156,7 +154,11 @@ async fn main() -> Result<()> {
 
     // Open SBI server
     scp_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
-    log::info!("SBI server listening on {}:{}", args.sbi_addr, args.sbi_port);
+    log::info!(
+        "SBI server listening on {}:{}",
+        args.sbi_addr,
+        args.sbi_port
+    );
 
     log::info!("NextGCore SCP ready");
 
@@ -242,7 +244,9 @@ async fn run_event_loop_async(scp_sm: &mut ScpSmContext, shutdown: Arc<AtomicBoo
         for entry in &expired {
             log::debug!(
                 "SCP timer expired: id={} type={:?} data={:?}",
-                entry.id, entry.timer_type, entry.data
+                entry.id,
+                entry.timer_type,
+                entry.data
             );
 
             // Create timer event and dispatch to state machine

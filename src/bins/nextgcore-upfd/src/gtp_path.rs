@@ -16,8 +16,8 @@ use std::sync::RwLock;
 
 use crate::context::{upf_self, UpfSess};
 use crate::rule_match::{
-    upf_sess_find_by_ue_ip_address, Ipv4Header, Ipv6Header, 
-    IPV4_MIN_HEADER_LEN, IPV6_HEADER_LEN, IP_VERSION_4, IP_VERSION_6,
+    upf_sess_find_by_ue_ip_address, Ipv4Header, Ipv6Header, IPV4_MIN_HEADER_LEN, IPV6_HEADER_LEN,
+    IP_VERSION_4, IP_VERSION_6,
 };
 
 // ============================================================================
@@ -150,7 +150,7 @@ pub fn gtp_path() -> &'static RwLock<GtpPath> {
 /// Creates the packet pool for GTP-U processing.
 pub fn upf_gtp_init() -> Result<(), GtpPathError> {
     let mut path = gtp_path().write().map_err(|_| GtpPathError::LockError)?;
-    
+
     if path.initialized {
         log::warn!("GTP path already initialized");
         return Ok(());
@@ -159,7 +159,7 @@ pub fn upf_gtp_init() -> Result<(), GtpPathError> {
     // In the C code, this creates a packet buffer pool
     // In Rust, we rely on the allocator and Vec for packet buffers
     path.initialized = true;
-    
+
     log::info!("GTP-U path initialized");
     Ok(())
 }
@@ -170,7 +170,7 @@ pub fn upf_gtp_init() -> Result<(), GtpPathError> {
 /// Destroys the packet pool.
 pub fn upf_gtp_final() -> Result<(), GtpPathError> {
     let mut path = gtp_path().write().map_err(|_| GtpPathError::LockError)?;
-    
+
     if !path.initialized {
         log::warn!("GTP path not initialized");
         return Ok(());
@@ -180,7 +180,7 @@ pub fn upf_gtp_final() -> Result<(), GtpPathError> {
     path.devices.clear();
     path.gtpu_sock4 = None;
     path.gtpu_sock6 = None;
-    
+
     log::info!("GTP-U path finalized");
     Ok(())
 }
@@ -195,7 +195,7 @@ pub fn upf_gtp_final() -> Result<(), GtpPathError> {
 /// Opens GTP-U UDP sockets and TUN/TAP devices, sets up poll callbacks.
 pub fn upf_gtp_open() -> Result<(), GtpPathError> {
     let path = gtp_path().write().map_err(|_| GtpPathError::LockError)?;
-    
+
     if !path.initialized {
         return Err(GtpPathError::NotInitialized);
     }
@@ -205,7 +205,7 @@ pub fn upf_gtp_open() -> Result<(), GtpPathError> {
     // 2. Open TUN/TAP devices
     // 3. Set up poll callbacks for async I/O
     // 4. Configure IP addresses on TUN interfaces
-    
+
     log::info!("GTP-U path opened");
     Ok(())
 }
@@ -215,7 +215,7 @@ pub fn upf_gtp_open() -> Result<(), GtpPathError> {
 /// Port of upf_gtp_close() from gtp-path.c
 pub fn upf_gtp_close() -> Result<(), GtpPathError> {
     let mut path = gtp_path().write().map_err(|_| GtpPathError::LockError)?;
-    
+
     // Close all TUN/TAP devices
     for (name, dev) in path.devices.drain() {
         if dev.fd >= 0 {
@@ -229,12 +229,16 @@ pub fn upf_gtp_close() -> Result<(), GtpPathError> {
     // Close GTP-U sockets
     if let Some(fd) = path.gtpu_sock4.take() {
         if fd >= 0 {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
         }
     }
     if let Some(fd) = path.gtpu_sock6.take() {
         if fd >= 0 {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
         }
     }
 
@@ -245,7 +249,7 @@ pub fn upf_gtp_close() -> Result<(), GtpPathError> {
 /// Register a TUN/TAP device
 pub fn register_device(ifname: &str, fd: i32, is_tap: bool) -> Result<(), GtpPathError> {
     let mut path = gtp_path().write().map_err(|_| GtpPathError::LockError)?;
-    
+
     let mac_addr = if is_tap {
         get_dev_mac_addr(ifname)?
     } else {
@@ -260,8 +264,12 @@ pub fn register_device(ifname: &str, fd: i32, is_tap: bool) -> Result<(), GtpPat
     };
 
     path.devices.insert(ifname.to_string(), info);
-    log::info!("Registered {} device: {}", if is_tap { "TAP" } else { "TUN" }, ifname);
-    
+    log::info!(
+        "Registered {} device: {}",
+        if is_tap { "TAP" } else { "TUN" },
+        ifname
+    );
+
     Ok(())
 }
 
@@ -299,7 +307,7 @@ pub fn get_dev_mac_addr(ifname: &str) -> Result<[u8; ETHER_ADDR_LEN], GtpPathErr
     let ifname_cstr = CString::new(ifname).map_err(|_| GtpPathError::InvalidIfname)?;
     let ifname_bytes = ifname_cstr.as_bytes_with_nul();
     let copy_len = ifname_bytes.len().min(libc::IF_NAMESIZE - 1);
-    
+
     unsafe {
         std::ptr::copy_nonoverlapping(
             ifname_bytes.as_ptr(),
@@ -309,10 +317,14 @@ pub fn get_dev_mac_addr(ifname: &str) -> Result<[u8; ETHER_ADDR_LEN], GtpPathErr
     }
 
     let ret = unsafe { libc::ioctl(fd, libc::SIOCGIFHWADDR, &mut req) };
-    unsafe { libc::close(fd); }
+    unsafe {
+        libc::close(fd);
+    }
 
     if ret != 0 {
-        return Err(GtpPathError::SyscallError("ioctl(SIOCGIFHWADDR) failed".to_string()));
+        return Err(GtpPathError::SyscallError(
+            "ioctl(SIOCGIFHWADDR) failed".to_string(),
+        ));
     }
 
     let mut mac_addr = [0u8; ETHER_ADDR_LEN];
@@ -376,7 +388,7 @@ pub fn gtpv1_tun_recv_cb(data: &[u8], is_tap: bool) -> TunRecvResult {
     let ip_data = if is_tap {
         // For TAP devices, handle Ethernet framing
         let eth_type = get_eth_type(data);
-        
+
         match eth_type {
             ETHERTYPE_ARP => {
                 // Handle ARP request
@@ -490,10 +502,7 @@ pub mod gtpu_msg_type {
 ///
 /// Port of _gtpv1_u_recv_cb() from gtp-path.c
 /// This handles packets coming from gNB/eNB destined for the core network.
-pub fn gtpv1_u_recv_cb(
-    data: &[u8],
-    from: &SocketAddr,
-) -> GtpuRecvResult {
+pub fn gtpv1_u_recv_cb(data: &[u8], from: &SocketAddr) -> GtpuRecvResult {
     if data.len() < 8 {
         log::error!("[DROP] GTP-U packet too short: {} bytes", data.len());
         return GtpuRecvResult::Error(GtpPathError::PacketTooShort);
@@ -537,9 +546,7 @@ pub fn gtpv1_u_recv_cb(
             // Would handle error indication here
             GtpuRecvResult::ErrorIndication
         }
-        gtpu_msg_type::GPDU => {
-            handle_gpdu(data, &header_desc, from)
-        }
+        gtpu_msg_type::GPDU => handle_gpdu(data, &header_desc, from),
         _ => {
             log::error!("[DROP] Invalid GTP-U Type [{}]", header_desc.msg_type);
             GtpuRecvResult::Error(GtpPathError::InvalidMessageType(header_desc.msg_type))
@@ -548,20 +555,19 @@ pub fn gtpv1_u_recv_cb(
 }
 
 /// Handle G-PDU (user data) packet
-fn handle_gpdu(
-    data: &[u8],
-    header_desc: &GtpuHeaderDesc,
-    from: &SocketAddr,
-) -> GtpuRecvResult {
+fn handle_gpdu(data: &[u8], header_desc: &GtpuHeaderDesc, from: &SocketAddr) -> GtpuRecvResult {
     // Get IP payload after GTP header
     if data.len() <= header_desc.header_len {
-        log::error!("[DROP] Small GTP-U packet (type:{} len:{})", 
-            header_desc.msg_type, header_desc.header_len);
+        log::error!(
+            "[DROP] Small GTP-U packet (type:{} len:{})",
+            header_desc.msg_type,
+            header_desc.header_len
+        );
         return GtpuRecvResult::Error(GtpPathError::PacketTooShort);
     }
 
     let ip_data = &data[header_desc.header_len..];
-    
+
     if ip_data.is_empty() {
         return GtpuRecvResult::Error(GtpPathError::EmptyPacket);
     }
@@ -612,10 +618,10 @@ fn verify_source_address(sess: &UpfSess, ip_data: &[u8], ip_version: u8) -> bool
             if ip_data.len() < IPV4_MIN_HEADER_LEN {
                 return false;
             }
-            
+
             let ip_hdr = unsafe { &*(ip_data.as_ptr() as *const Ipv4Header) };
             let src_addr = ip_hdr.src_addr();
-            
+
             // Check if session has IPv4 address
             if let Some(ref ipv4) = sess.ipv4 {
                 // Source should match session IP
@@ -633,17 +639,19 @@ fn verify_source_address(sess: &UpfSess, ip_data: &[u8], ip_version: u8) -> bool
             if ip_data.len() < IPV6_HEADER_LEN {
                 return false;
             }
-            
+
             let ip6_hdr = unsafe { &*(ip_data.as_ptr() as *const Ipv6Header) };
             let src_addr = ip6_hdr.src_addr();
-            
+
             // Check if session has IPv6 address
             if let Some(ref ipv6) = sess.ipv6 {
                 // Check link-local (interface identifier match)
                 if is_ipv6_link_local(&src_addr)
-                    && src_addr[2] == ipv6.addr[2] && src_addr[3] == ipv6.addr[3] {
-                        return true;
-                    }
+                    && src_addr[2] == ipv6.addr[2]
+                    && src_addr[3] == ipv6.addr[3]
+                {
+                    return true;
+                }
                 // Check global (64-bit prefix match)
                 if src_addr[0] == ipv6.addr[0] && src_addr[1] == ipv6.addr[1] {
                     return true;
@@ -677,14 +685,14 @@ fn should_handle_multicast(ip_data: &[u8]) -> bool {
     }
 
     let ip_version = (ip_data[0] >> 4) & 0x0F;
-    
+
     if ip_version == IP_VERSION_6 && ip_data.len() >= IPV6_HEADER_LEN {
         let ip6_hdr = unsafe { &*(ip_data.as_ptr() as *const Ipv6Header) };
         let dst_addr = ip6_hdr.dst_addr();
         // IPv6 multicast addresses start with ff00::/8
         return (dst_addr[0] >> 24) == 0xFF;
     }
-    
+
     false
 }
 
@@ -732,7 +740,7 @@ fn is_arp_request(data: &[u8]) -> bool {
     if data.len() < ETHER_HDR_LEN + 8 {
         return false;
     }
-    
+
     let eth_type = get_eth_type(data);
     if eth_type != ETHERTYPE_ARP {
         return false;
@@ -761,7 +769,7 @@ fn is_nd_solicitation(data: &[u8]) -> bool {
     }
 
     let ip6_hdr = unsafe { &*(ip6_data.as_ptr() as *const Ipv6Header) };
-    
+
     // Next header should be ICMPv6 (58)
     if ip6_hdr.next_header != 58 {
         return false;
@@ -784,7 +792,7 @@ pub fn parse_gtpu_header(data: &[u8]) -> Result<GtpuHeaderDesc, GtpPathError> {
 
     let flags = data[0];
     let version = (flags >> 5) & 0x07;
-    
+
     if version != 1 {
         return Err(GtpPathError::InvalidVersion(version));
     }
@@ -812,19 +820,19 @@ pub fn parse_gtpu_header(data: &[u8]) -> Result<GtpuHeaderDesc, GtpPathError> {
         if ext_flag != 0 {
             let mut ext_offset = 12;
             let mut next_ext = data[11];
-            
+
             while next_ext != 0 && ext_offset < data.len() {
                 let ext_len = (data[ext_offset] as usize) * 4;
                 if ext_len == 0 || ext_offset + ext_len > data.len() {
                     break;
                 }
-                
+
                 // Check for PDU Session Container (type 0x85)
                 if next_ext == 0x85 && ext_len >= 4 {
                     // QFI is in the first byte of extension content
                     qfi = Some(data[ext_offset + 1] & 0x3F);
                 }
-                
+
                 next_ext = data[ext_offset + ext_len - 1];
                 ext_offset += ext_len;
                 header_len = ext_offset;
@@ -928,7 +936,7 @@ mod tests {
             0xFF, // Message type = G-PDU
             0x00, 0x10, // Length = 16
             0x12, 0x34, 0x56, 0x78, // TEID
-            // Payload would follow
+                  // Payload would follow
         ];
 
         let result = parse_gtpu_header(&data).unwrap();
@@ -962,9 +970,7 @@ mod tests {
     fn test_parse_gtpu_header_invalid_version() {
         let data = [
             0x00, // Version=0 (invalid)
-            0xFF,
-            0x00, 0x10,
-            0x12, 0x34, 0x56, 0x78,
+            0xFF, 0x00, 0x10, 0x12, 0x34, 0x56, 0x78,
         ];
 
         let result = parse_gtpu_header(&data);

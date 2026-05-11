@@ -15,14 +15,14 @@
 //! - `pfcp`: PFCP N4 interface tests (SMF-UPF communication)
 
 pub mod common;
+pub mod handover;
+pub mod inter_nf;
+pub mod pfcp;
+pub mod property;
 pub mod registration;
 pub mod session;
-pub mod inter_nf;
-pub mod property;
-pub mod volte;
-pub mod handover;
 pub mod slicing;
-pub mod pfcp;
+pub mod volte;
 
 // Re-export common test utilities
 pub use common::*;

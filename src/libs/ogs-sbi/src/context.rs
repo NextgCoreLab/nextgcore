@@ -101,7 +101,9 @@ impl NfInstance {
 
     /// Find a service by type
     pub fn find_service(&self, service_type: SbiServiceType) -> Option<&NfService> {
-        self.services.iter().find(|s| s.service_type == service_type)
+        self.services
+            .iter()
+            .find(|s| s.service_type == service_type)
     }
 }
 
@@ -222,7 +224,7 @@ impl SbiContext {
     /// Get or create a client for the given endpoint
     pub async fn get_client(&self, host: &str, port: u16) -> Arc<SbiClient> {
         let key = format!("{host}:{port}");
-        
+
         // Check if client exists
         {
             let clients = self.clients.read().await;
@@ -230,14 +232,14 @@ impl SbiContext {
                 return client.clone();
             }
         }
-        
+
         // Create new client
         let config = SbiClientConfig::new(host, port);
         let client = Arc::new(SbiClient::new(config));
-        
+
         let mut clients = self.clients.write().await;
         clients.insert(key, client.clone());
-        
+
         client
     }
 
@@ -350,7 +352,7 @@ mod tests {
     async fn test_nf_instance() {
         let mut instance = NfInstance::new("test-id", NfType::Amf);
         instance.add_service(NfService::new("namf-comm", SbiServiceType::NamfComm));
-        
+
         assert_eq!(instance.id, "test-id");
         assert_eq!(instance.nf_type, NfType::Amf);
         assert!(instance.find_service(SbiServiceType::NamfComm).is_some());
@@ -359,12 +361,12 @@ mod tests {
     #[tokio::test]
     async fn test_sbi_context() {
         let ctx = SbiContext::new();
-        
+
         let instance = NfInstance::new("nf-1", NfType::Smf);
         ctx.add_nf_instance(instance).await;
-        
+
         assert_eq!(ctx.nf_instance_count().await, 1);
-        
+
         let found = ctx.get_nf_instance("nf-1").await;
         assert!(found.is_some());
         assert_eq!(found.unwrap().nf_type, NfType::Smf);
@@ -373,11 +375,14 @@ mod tests {
     #[tokio::test]
     async fn test_find_by_type() {
         let ctx = SbiContext::new();
-        
-        ctx.add_nf_instance(NfInstance::new("amf-1", NfType::Amf)).await;
-        ctx.add_nf_instance(NfInstance::new("smf-1", NfType::Smf)).await;
-        ctx.add_nf_instance(NfInstance::new("amf-2", NfType::Amf)).await;
-        
+
+        ctx.add_nf_instance(NfInstance::new("amf-1", NfType::Amf))
+            .await;
+        ctx.add_nf_instance(NfInstance::new("smf-1", NfType::Smf))
+            .await;
+        ctx.add_nf_instance(NfInstance::new("amf-2", NfType::Amf))
+            .await;
+
         let amfs = ctx.find_nf_instances_by_type(NfType::Amf).await;
         assert_eq!(amfs.len(), 2);
     }

@@ -2,7 +2,7 @@
 //!
 //! Port of src/mme/mme-s11-handler.c - GTP-C message handling for S11 interface
 
-use crate::s11_build::{message_type, ie_type};
+use crate::s11_build::{ie_type, message_type};
 
 // ============================================================================
 // Error Types
@@ -197,7 +197,6 @@ pub struct DownlinkDataNotificationData {
     pub cause: Option<u8>,
 }
 
-
 // ============================================================================
 // Parsing Helper Functions
 // ============================================================================
@@ -207,11 +206,11 @@ pub fn parse_gtp_header(data: &[u8]) -> S11Result<(u8, u32, u32, &[u8])> {
     if data.len() < 8 {
         return Err(S11Error::InvalidMessageFormat);
     }
-    
+
     let flags = data[0];
     let msg_type = data[1];
     let has_teid = (flags & 0x08) != 0;
-    
+
     if has_teid {
         if data.len() < 12 {
             return Err(S11Error::InvalidMessageFormat);
@@ -232,15 +231,15 @@ pub fn parse_ie_header(data: &[u8]) -> Option<(u8, u16, u8, &[u8])> {
     if data.len() < 4 {
         return None;
     }
-    
+
     let ie_type = data[0];
     let length = u16::from_be_bytes([data[1], data[2]]);
     let instance = data[3] & 0x0f;
-    
+
     if data.len() < 4 + length as usize {
         return None;
     }
-    
+
     let value = &data[4..4 + length as usize];
     Some((ie_type, length, instance, value))
 }
@@ -250,26 +249,31 @@ pub fn parse_f_teid(data: &[u8]) -> Option<(u8, u32, Option<[u8; 4]>, Option<[u8
     if data.len() < 5 {
         return None;
     }
-    
+
     let flags = data[0];
     let interface_type = flags & 0x3f;
     let has_v4 = (flags & 0x80) != 0;
     let has_v6 = (flags & 0x40) != 0;
-    
+
     let teid = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
-    
+
     let mut offset = 5;
     let ipv4 = if has_v4 {
         if data.len() < offset + 4 {
             return None;
         }
-        let addr = [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]];
+        let addr = [
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ];
         offset += 4;
         Some(addr)
     } else {
         None
     };
-    
+
     let ipv6 = if has_v6 {
         if data.len() < offset + 16 {
             return None;
@@ -280,7 +284,7 @@ pub fn parse_f_teid(data: &[u8]) -> Option<(u8, u32, Option<[u8; 4]>, Option<[u8
     } else {
         None
     };
-    
+
     Some((interface_type, teid, ipv4, ipv6))
 }
 
@@ -305,18 +309,20 @@ pub fn parse_paa(data: &[u8]) -> Option<(u8, Option<[u8; 4]>, Option<[u8; 16]>)>
     if data.is_empty() {
         return None;
     }
-    
+
     let pdn_type = data[0] & 0x07;
-    
+
     match pdn_type {
-        1 => { // IPv4
+        1 => {
+            // IPv4
             if data.len() < 5 {
                 return None;
             }
             let addr = [data[1], data[2], data[3], data[4]];
             Some((pdn_type, Some(addr), None))
         }
-        2 => { // IPv6
+        2 => {
+            // IPv6
             if data.len() < 18 {
                 return None;
             }
@@ -324,7 +330,8 @@ pub fn parse_paa(data: &[u8]) -> Option<(u8, Option<[u8; 4]>, Option<[u8; 16]>)>
             addr.copy_from_slice(&data[2..18]);
             Some((pdn_type, None, Some(addr)))
         }
-        3 => { // IPv4v6
+        3 => {
+            // IPv4v6
             if data.len() < 22 {
                 return None;
             }
@@ -333,7 +340,7 @@ pub fn parse_paa(data: &[u8]) -> Option<(u8, Option<[u8; 4]>, Option<[u8; 16]>)>
             let addr4 = [data[18], data[19], data[20], data[21]];
             Some((pdn_type, Some(addr4), Some(addr6)))
         }
-        _ => Some((pdn_type, None, None))
+        _ => Some((pdn_type, None, None)),
     }
 }
 
@@ -342,10 +349,10 @@ pub fn parse_ambr(data: &[u8]) -> Option<(u64, u64)> {
     if data.len() < 8 {
         return None;
     }
-    
+
     let uplink = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as u64 * 1000;
     let downlink = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as u64 * 1000;
-    
+
     Some((uplink, downlink))
 }
 
@@ -354,20 +361,29 @@ pub fn parse_bearer_qos(data: &[u8]) -> Option<(u8, u8, u8, u8, u64, u64, u64, u
     if data.len() < 22 {
         return None;
     }
-    
+
     let arp = data[0];
     let arp_pec = (arp >> 6) & 0x01;
     let arp_priority = (arp >> 2) & 0x0f;
     let arp_pev = arp & 0x01;
-    
+
     let qci = data[1];
-    
+
     let mbr_ul = parse_bitrate(&data[2..7]);
     let mbr_dl = parse_bitrate(&data[7..12]);
     let gbr_ul = parse_bitrate(&data[12..17]);
     let gbr_dl = parse_bitrate(&data[17..22]);
-    
-    Some((qci, arp_priority, arp_pec, arp_pev, mbr_ul, mbr_dl, gbr_ul, gbr_dl))
+
+    Some((
+        qci,
+        arp_priority,
+        arp_pec,
+        arp_pev,
+        mbr_ul,
+        mbr_dl,
+        gbr_ul,
+        gbr_dl,
+    ))
 }
 
 /// Parse bitrate from 5-byte format
@@ -400,14 +416,14 @@ pub fn handle_echo_response(recovery: u8) -> S11Result<u8> {
 /// Handle Create Session Response
 pub fn handle_create_session_response(data: &[u8]) -> S11Result<CreateSessionResponseData> {
     let (msg_type, _, _, payload) = parse_gtp_header(data)?;
-    
+
     if msg_type != message_type::CREATE_SESSION_RESPONSE {
         return Err(S11Error::InvalidMessageFormat);
     }
-    
+
     let mut result = CreateSessionResponseData::default();
     let mut offset = 0;
-    
+
     while offset < payload.len() {
         if let Some((ie_t, length, instance, value)) = parse_ie_header(&payload[offset..]) {
             match ie_t {
@@ -457,25 +473,25 @@ pub fn handle_create_session_response(data: &[u8]) -> S11Result<CreateSessionRes
             break;
         }
     }
-    
+
     if result.cause == 0 {
         return Err(S11Error::MandatoryIeMissing("Cause".to_string()));
     }
-    
+
     Ok(result)
 }
 
 /// Handle Modify Bearer Response
 pub fn handle_modify_bearer_response(data: &[u8]) -> S11Result<ModifyBearerResponseData> {
     let (msg_type, _, _, payload) = parse_gtp_header(data)?;
-    
+
     if msg_type != message_type::MODIFY_BEARER_RESPONSE {
         return Err(S11Error::InvalidMessageFormat);
     }
-    
+
     let mut result = ModifyBearerResponseData::default();
     let mut offset = 0;
-    
+
     while offset < payload.len() {
         if let Some((ie_t, length, _, value)) = parse_ie_header(&payload[offset..]) {
             if ie_t == ie_type::CAUSE {
@@ -488,21 +504,21 @@ pub fn handle_modify_bearer_response(data: &[u8]) -> S11Result<ModifyBearerRespo
             break;
         }
     }
-    
+
     Ok(result)
 }
 
 /// Handle Delete Session Response
 pub fn handle_delete_session_response(data: &[u8]) -> S11Result<DeleteSessionResponseData> {
     let (msg_type, _, _, payload) = parse_gtp_header(data)?;
-    
+
     if msg_type != message_type::DELETE_SESSION_RESPONSE {
         return Err(S11Error::InvalidMessageFormat);
     }
-    
+
     let mut result = DeleteSessionResponseData::default();
     let mut offset = 0;
-    
+
     while offset < payload.len() {
         if let Some((ie_t, length, _, value)) = parse_ie_header(&payload[offset..]) {
             if ie_t == ie_type::CAUSE {
@@ -515,21 +531,23 @@ pub fn handle_delete_session_response(data: &[u8]) -> S11Result<DeleteSessionRes
             break;
         }
     }
-    
+
     Ok(result)
 }
 
 /// Handle Release Access Bearers Response
-pub fn handle_release_access_bearers_response(data: &[u8]) -> S11Result<ReleaseAccessBearersResponseData> {
+pub fn handle_release_access_bearers_response(
+    data: &[u8],
+) -> S11Result<ReleaseAccessBearersResponseData> {
     let (msg_type, _, _, payload) = parse_gtp_header(data)?;
-    
+
     if msg_type != message_type::RELEASE_ACCESS_BEARERS_RESPONSE {
         return Err(S11Error::InvalidMessageFormat);
     }
-    
+
     let mut result = ReleaseAccessBearersResponseData::default();
     let mut offset = 0;
-    
+
     while offset < payload.len() {
         if let Some((ie_t, length, _, value)) = parse_ie_header(&payload[offset..]) {
             if ie_t == ie_type::CAUSE {
@@ -542,21 +560,21 @@ pub fn handle_release_access_bearers_response(data: &[u8]) -> S11Result<ReleaseA
             break;
         }
     }
-    
+
     Ok(result)
 }
 
 /// Handle Downlink Data Notification
 pub fn handle_downlink_data_notification(data: &[u8]) -> S11Result<DownlinkDataNotificationData> {
     let (msg_type, _, _, payload) = parse_gtp_header(data)?;
-    
+
     if msg_type != message_type::DOWNLINK_DATA_NOTIFICATION {
         return Err(S11Error::InvalidMessageFormat);
     }
-    
+
     let mut result = DownlinkDataNotificationData::default();
     let mut offset = 0;
-    
+
     while offset < payload.len() {
         if let Some((ie_t, length, _, value)) = parse_ie_header(&payload[offset..]) {
             match ie_t {
@@ -577,11 +595,11 @@ pub fn handle_downlink_data_notification(data: &[u8]) -> S11Result<DownlinkDataN
             break;
         }
     }
-    
+
     if result.ebi == 0 {
         return Err(S11Error::MandatoryIeMissing("EPS Bearer ID".to_string()));
     }
-    
+
     Ok(result)
 }
 
@@ -596,8 +614,14 @@ mod tests {
 
     #[test]
     fn test_esm_cause_from_gtp() {
-        assert_eq!(esm_cause_from_gtp(64), esm_cause::INVALID_EPS_BEARER_IDENTITY);
-        assert_eq!(esm_cause_from_gtp(68), esm_cause::SERVICE_OPTION_NOT_SUPPORTED);
+        assert_eq!(
+            esm_cause_from_gtp(64),
+            esm_cause::INVALID_EPS_BEARER_IDENTITY
+        );
+        assert_eq!(
+            esm_cause_from_gtp(68),
+            esm_cause::SERVICE_OPTION_NOT_SUPPORTED
+        );
         assert_eq!(esm_cause_from_gtp(0), esm_cause::NETWORK_FAILURE);
     }
 
@@ -612,7 +636,7 @@ mod tests {
     fn test_parse_gtp_header_with_teid() {
         let msg = build_release_access_bearers_request(0x12345678, 100);
         let (msg_type, teid, seq_num, _) = parse_gtp_header(&msg).unwrap();
-        
+
         assert_eq!(msg_type, message_type::RELEASE_ACCESS_BEARERS_REQUEST);
         assert_eq!(teid, 0x12345678);
         assert_eq!(seq_num, 100);
@@ -622,7 +646,7 @@ mod tests {
     fn test_parse_gtp_header_no_teid() {
         let msg = build_echo_request(123, 5);
         let (msg_type, teid, seq_num, _) = parse_gtp_header(&msg).unwrap();
-        
+
         assert_eq!(msg_type, message_type::ECHO_REQUEST);
         assert_eq!(teid, 0);
         assert_eq!(seq_num, 123);

@@ -81,7 +81,6 @@ impl From<u8> for PfcpCause {
     }
 }
 
-
 // ============================================================================
 // PFCP IE Types
 // ============================================================================
@@ -304,7 +303,7 @@ impl NodeId {
             }
             NodeId::Fqdn(fqdn) => {
                 buf.push(2); // Type = FQDN
-                // Encode as DNS label format
+                             // Encode as DNS label format
                 for label in fqdn.split('.') {
                     buf.push(label.len() as u8);
                     buf.extend_from_slice(label.as_bytes());
@@ -332,12 +331,20 @@ impl FSeid {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = BytesMut::new();
         let mut flags: u8 = 0;
-        if self.ipv6.is_some() { flags |= 0x01; }
-        if self.ipv4.is_some() { flags |= 0x02; }
+        if self.ipv6.is_some() {
+            flags |= 0x01;
+        }
+        if self.ipv4.is_some() {
+            flags |= 0x02;
+        }
         buf.put_u8(flags);
         buf.put_u64(self.seid);
-        if let Some(addr) = self.ipv4 { buf.put_slice(&addr.octets()); }
-        if let Some(addr) = self.ipv6 { buf.put_slice(&addr.octets()); }
+        if let Some(addr) = self.ipv4 {
+            buf.put_slice(&addr.octets());
+        }
+        if let Some(addr) = self.ipv6 {
+            buf.put_slice(&addr.octets());
+        }
         buf.to_vec()
     }
 }
@@ -355,20 +362,30 @@ pub struct PfcpMessageBuilder {
 impl PfcpMessageBuilder {
     /// Create a new PFCP message builder
     pub fn new() -> Self {
-        Self { buffer: BytesMut::with_capacity(4096) }
+        Self {
+            buffer: BytesMut::with_capacity(4096),
+        }
     }
 
     /// Get the current length
-    pub fn len(&self) -> usize { self.buffer.len() }
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
 
     /// Check if empty
-    pub fn is_empty(&self) -> bool { self.buffer.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
 
     /// Clear the buffer
-    pub fn clear(&mut self) { self.buffer.clear(); }
+    pub fn clear(&mut self) {
+        self.buffer.clear();
+    }
 
     /// Build and return the message bytes
-    pub fn build(self) -> Vec<u8> { self.buffer.to_vec() }
+    pub fn build(self) -> Vec<u8> {
+        self.buffer.to_vec()
+    }
 
     /// Add a TLV IE (Type-Length-Value)
     pub fn add_tlv(&mut self, ie_type: u16, value: &[u8]) -> &mut Self {
@@ -422,14 +439,26 @@ impl PfcpMessageBuilder {
     pub fn add_f_teid(&mut self, f_teid: &FTeid) -> &mut Self {
         let mut value = BytesMut::new();
         let mut flags: u8 = 0;
-        if f_teid.ipv6.is_some() { flags |= 0x01; }
-        if f_teid.ipv4.is_some() { flags |= 0x02; }
-        if f_teid.choose { flags |= 0x04; }
+        if f_teid.ipv6.is_some() {
+            flags |= 0x01;
+        }
+        if f_teid.ipv4.is_some() {
+            flags |= 0x02;
+        }
+        if f_teid.choose {
+            flags |= 0x04;
+        }
         value.put_u8(flags);
         value.put_u32(f_teid.teid);
-        if let Some(addr) = f_teid.ipv4 { value.put_slice(&addr.octets()); }
-        if let Some(addr) = f_teid.ipv6 { value.put_slice(&addr.octets()); }
-        if let Some(id) = f_teid.choose_id { value.put_u8(id); }
+        if let Some(addr) = f_teid.ipv4 {
+            value.put_slice(&addr.octets());
+        }
+        if let Some(addr) = f_teid.ipv6 {
+            value.put_slice(&addr.octets());
+        }
+        if let Some(id) = f_teid.choose_id {
+            value.put_u8(id);
+        }
         self.add_tlv(pfcp_ie::F_TEID, &value)
     }
 
@@ -437,14 +466,28 @@ impl PfcpMessageBuilder {
     pub fn add_ue_ip_address(&mut self, ue_ip: &UeIpAddress, source: bool) -> &mut Self {
         let mut value = BytesMut::new();
         let mut flags: u8 = 0;
-        if ue_ip.ipv6.is_some() { flags |= 0x01; }
-        if ue_ip.ipv4.is_some() { flags |= 0x02; }
-        if source { flags |= 0x04; }
-        if ue_ip.ipv6_prefix_len > 0 { flags |= 0x08; }
+        if ue_ip.ipv6.is_some() {
+            flags |= 0x01;
+        }
+        if ue_ip.ipv4.is_some() {
+            flags |= 0x02;
+        }
+        if source {
+            flags |= 0x04;
+        }
+        if ue_ip.ipv6_prefix_len > 0 {
+            flags |= 0x08;
+        }
         value.put_u8(flags);
-        if let Some(addr) = ue_ip.ipv4 { value.put_slice(&addr.octets()); }
-        if let Some(addr) = ue_ip.ipv6 { value.put_slice(&addr.octets()); }
-        if ue_ip.ipv6_prefix_len > 0 { value.put_u8(ue_ip.ipv6_prefix_len); }
+        if let Some(addr) = ue_ip.ipv4 {
+            value.put_slice(&addr.octets());
+        }
+        if let Some(addr) = ue_ip.ipv6 {
+            value.put_slice(&addr.octets());
+        }
+        if ue_ip.ipv6_prefix_len > 0 {
+            value.put_u8(ue_ip.ipv6_prefix_len);
+        }
         self.add_tlv(pfcp_ie::UE_IP_ADDRESS, &value)
     }
 
@@ -467,7 +510,7 @@ impl PfcpMessageBuilder {
         inner.add_u32(pfcp_ie::URR_ID, report.urr_id);
         // UR-SEQN
         inner.add_u32(104, report.ur_seqn); // UR_SEQN IE type
-        // Usage Report Trigger
+                                            // Usage Report Trigger
         inner.add_usage_report_trigger(&report.trigger);
         if let Some(t) = report.start_time {
             inner.add_u32(pfcp_ie::START_TIME, t);
@@ -493,26 +536,66 @@ impl PfcpMessageBuilder {
     /// Add Usage Report Trigger IE
     fn add_usage_report_trigger(&mut self, trigger: &UsageReportTrigger) -> &mut Self {
         let mut flags: [u8; 3] = [0, 0, 0];
-        if trigger.periodic_reporting { flags[0] |= 0x01; }
-        if trigger.volume_threshold { flags[0] |= 0x02; }
-        if trigger.time_threshold { flags[0] |= 0x04; }
-        if trigger.quota_holding_time { flags[0] |= 0x08; }
-        if trigger.start_of_traffic { flags[0] |= 0x10; }
-        if trigger.stop_of_traffic { flags[0] |= 0x20; }
-        if trigger.dropped_dl_traffic_threshold { flags[0] |= 0x40; }
-        if trigger.immediate_report { flags[0] |= 0x80; }
-        if trigger.volume_quota { flags[1] |= 0x01; }
-        if trigger.time_quota { flags[1] |= 0x02; }
-        if trigger.linked_usage_reporting { flags[1] |= 0x04; }
-        if trigger.termination_report { flags[1] |= 0x08; }
-        if trigger.monitoring_time { flags[1] |= 0x10; }
-        if trigger.envelope_closure { flags[1] |= 0x20; }
-        if trigger.mac_addresses_reporting { flags[1] |= 0x40; }
-        if trigger.event_threshold { flags[1] |= 0x80; }
-        if trigger.event_quota { flags[2] |= 0x01; }
-        if trigger.termination_by_up_function_report { flags[2] |= 0x02; }
-        if trigger.ip_multicast_join_leave { flags[2] |= 0x04; }
-        if trigger.quota_validity_time { flags[2] |= 0x08; }
+        if trigger.periodic_reporting {
+            flags[0] |= 0x01;
+        }
+        if trigger.volume_threshold {
+            flags[0] |= 0x02;
+        }
+        if trigger.time_threshold {
+            flags[0] |= 0x04;
+        }
+        if trigger.quota_holding_time {
+            flags[0] |= 0x08;
+        }
+        if trigger.start_of_traffic {
+            flags[0] |= 0x10;
+        }
+        if trigger.stop_of_traffic {
+            flags[0] |= 0x20;
+        }
+        if trigger.dropped_dl_traffic_threshold {
+            flags[0] |= 0x40;
+        }
+        if trigger.immediate_report {
+            flags[0] |= 0x80;
+        }
+        if trigger.volume_quota {
+            flags[1] |= 0x01;
+        }
+        if trigger.time_quota {
+            flags[1] |= 0x02;
+        }
+        if trigger.linked_usage_reporting {
+            flags[1] |= 0x04;
+        }
+        if trigger.termination_report {
+            flags[1] |= 0x08;
+        }
+        if trigger.monitoring_time {
+            flags[1] |= 0x10;
+        }
+        if trigger.envelope_closure {
+            flags[1] |= 0x20;
+        }
+        if trigger.mac_addresses_reporting {
+            flags[1] |= 0x40;
+        }
+        if trigger.event_threshold {
+            flags[1] |= 0x80;
+        }
+        if trigger.event_quota {
+            flags[2] |= 0x01;
+        }
+        if trigger.termination_by_up_function_report {
+            flags[2] |= 0x02;
+        }
+        if trigger.ip_multicast_join_leave {
+            flags[2] |= 0x04;
+        }
+        if trigger.quota_validity_time {
+            flags[2] |= 0x08;
+        }
         self.add_tlv(pfcp_ie::USAGE_REPORT_TRIGGER, &flags)
     }
 
@@ -520,30 +603,64 @@ impl PfcpMessageBuilder {
     fn add_volume_measurement(&mut self, vol: &VolumeMeasurement) -> &mut Self {
         let mut value = BytesMut::new();
         let mut flags: u8 = 0;
-        if vol.total_volume.is_some() { flags |= 0x01; }
-        if vol.uplink_volume.is_some() { flags |= 0x02; }
-        if vol.downlink_volume.is_some() { flags |= 0x04; }
-        if vol.total_packets.is_some() { flags |= 0x08; }
-        if vol.uplink_packets.is_some() { flags |= 0x10; }
-        if vol.downlink_packets.is_some() { flags |= 0x20; }
+        if vol.total_volume.is_some() {
+            flags |= 0x01;
+        }
+        if vol.uplink_volume.is_some() {
+            flags |= 0x02;
+        }
+        if vol.downlink_volume.is_some() {
+            flags |= 0x04;
+        }
+        if vol.total_packets.is_some() {
+            flags |= 0x08;
+        }
+        if vol.uplink_packets.is_some() {
+            flags |= 0x10;
+        }
+        if vol.downlink_packets.is_some() {
+            flags |= 0x20;
+        }
         value.put_u8(flags);
-        if let Some(v) = vol.total_volume { value.put_u64(v); }
-        if let Some(v) = vol.uplink_volume { value.put_u64(v); }
-        if let Some(v) = vol.downlink_volume { value.put_u64(v); }
-        if let Some(v) = vol.total_packets { value.put_u64(v); }
-        if let Some(v) = vol.uplink_packets { value.put_u64(v); }
-        if let Some(v) = vol.downlink_packets { value.put_u64(v); }
+        if let Some(v) = vol.total_volume {
+            value.put_u64(v);
+        }
+        if let Some(v) = vol.uplink_volume {
+            value.put_u64(v);
+        }
+        if let Some(v) = vol.downlink_volume {
+            value.put_u64(v);
+        }
+        if let Some(v) = vol.total_packets {
+            value.put_u64(v);
+        }
+        if let Some(v) = vol.uplink_packets {
+            value.put_u64(v);
+        }
+        if let Some(v) = vol.downlink_packets {
+            value.put_u64(v);
+        }
         self.add_tlv(pfcp_ie::VOLUME_MEASUREMENT, &value)
     }
 
     /// Add Report Type IE
     pub fn add_report_type(&mut self, report_type: &ReportType) -> &mut Self {
         let mut flags: u8 = 0;
-        if report_type.downlink_data_report { flags |= 0x01; }
-        if report_type.usage_report { flags |= 0x02; }
-        if report_type.error_indication_report { flags |= 0x04; }
-        if report_type.uplink_data_report { flags |= 0x08; }
-        if report_type.session_report { flags |= 0x10; }
+        if report_type.downlink_data_report {
+            flags |= 0x01;
+        }
+        if report_type.usage_report {
+            flags |= 0x02;
+        }
+        if report_type.error_indication_report {
+            flags |= 0x04;
+        }
+        if report_type.uplink_data_report {
+            flags |= 0x08;
+        }
+        if report_type.session_report {
+            flags |= 0x10;
+        }
         self.add_u8(pfcp_ie::REPORT_TYPE, flags)
     }
 }
@@ -562,21 +679,21 @@ pub fn build_session_establishment_response(
     created_pdrs: &[CreatedPdr],
 ) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
-    
+
     // Node ID
     builder.add_node_id(node_id);
-    
+
     // Cause - Request Accepted
     builder.add_cause(PfcpCause::RequestAccepted);
-    
+
     // UP F-SEID
     builder.add_f_seid(f_seid);
-    
+
     // Created PDRs
     for pdr in created_pdrs {
         builder.add_created_pdr(pdr);
     }
-    
+
     let _ = msg_type; // Used for header construction
     let _ = upf_n4_seid;
     builder.build()
@@ -584,55 +701,46 @@ pub fn build_session_establishment_response(
 
 /// Build Session Modification Response
 /// Port of upf_n4_build_session_modification_response
-pub fn build_session_modification_response(
-    msg_type: u8,
-    created_pdrs: &[CreatedPdr],
-) -> Vec<u8> {
+pub fn build_session_modification_response(msg_type: u8, created_pdrs: &[CreatedPdr]) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
-    
+
     // Cause - Request Accepted
     builder.add_cause(PfcpCause::RequestAccepted);
-    
+
     // Created PDRs
     for pdr in created_pdrs {
         builder.add_created_pdr(pdr);
     }
-    
+
     let _ = msg_type;
     builder.build()
 }
 
 /// Build Session Deletion Response
 /// Port of upf_n4_build_session_deletion_response
-pub fn build_session_deletion_response(
-    msg_type: u8,
-    usage_reports: &[UsageReport],
-) -> Vec<u8> {
+pub fn build_session_deletion_response(msg_type: u8, usage_reports: &[UsageReport]) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
-    
+
     // Cause - Request Accepted
     builder.add_cause(PfcpCause::RequestAccepted);
-    
+
     // Usage Reports (with termination trigger)
     for report in usage_reports {
         builder.add_usage_report(report, pfcp_ie::USAGE_REPORT_SDR);
     }
-    
+
     let _ = msg_type;
     builder.build()
 }
 
 /// Build Session Report Request
 /// Port of ogs_pfcp_build_session_report_request
-pub fn build_session_report_request(
-    msg_type: u8,
-    report: &UserPlaneReport,
-) -> Vec<u8> {
+pub fn build_session_report_request(msg_type: u8, report: &UserPlaneReport) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
-    
+
     // Report Type
     builder.add_report_type(&report.report_type);
-    
+
     // Downlink Data Report
     if let Some(ref dldr) = report.downlink_data_report {
         let mut inner = PfcpMessageBuilder::new();
@@ -640,28 +748,36 @@ pub fn build_session_report_request(
         if let Some(ref info) = dldr.downlink_data_service_info {
             let mut dds_value = BytesMut::new();
             let mut flags: u8 = 0;
-            if info.ppi.is_some() { flags |= 0x01; }
-            if info.qfi.is_some() { flags |= 0x02; }
+            if info.ppi.is_some() {
+                flags |= 0x01;
+            }
+            if info.qfi.is_some() {
+                flags |= 0x02;
+            }
             dds_value.put_u8(flags);
-            if let Some(ppi) = info.ppi { dds_value.put_u8(ppi); }
-            if let Some(qfi) = info.qfi { dds_value.put_u8(qfi); }
+            if let Some(ppi) = info.ppi {
+                dds_value.put_u8(ppi);
+            }
+            if let Some(qfi) = info.qfi {
+                dds_value.put_u8(qfi);
+            }
             inner.add_tlv(45, &dds_value); // DOWNLINK_DATA_SERVICE_INFORMATION
         }
         builder.add_tlv(83, &inner.build()); // DOWNLINK_DATA_REPORT
     }
-    
+
     // Usage Reports
     for ur in &report.usage_reports {
         builder.add_usage_report(ur, pfcp_ie::USAGE_REPORT_SRR);
     }
-    
+
     // Error Indication Report
     if let Some(ref eir) = report.error_indication_report {
         let mut inner = PfcpMessageBuilder::new();
         inner.add_f_teid(&eir.remote_f_teid);
         builder.add_tlv(99, &inner.build()); // ERROR_INDICATION_REPORT
     }
-    
+
     let _ = msg_type;
     builder.build()
 }
@@ -704,8 +820,7 @@ impl ParsedPfcpHeader {
                 return Err("PFCP message too short for SEID");
             }
             let seid = u64::from_be_bytes([
-                data[4], data[5], data[6], data[7],
-                data[8], data[9], data[10], data[11],
+                data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
             ]);
             (seid, 12)
         } else {
@@ -716,19 +831,23 @@ impl ParsedPfcpHeader {
         if data.len() < seq_start + 4 {
             return Err("PFCP message too short for sequence");
         }
-        let sequence_number = u32::from_be_bytes([0, data[seq_start], data[seq_start + 1], data[seq_start + 2]]);
+        let sequence_number =
+            u32::from_be_bytes([0, data[seq_start], data[seq_start + 1], data[seq_start + 2]]);
 
         let header_len = if seid_present { 16 } else { 8 };
         let payload = &data[header_len..];
 
-        Ok((Self {
-            version,
-            msg_type,
-            length,
-            seid_present,
-            seid,
-            sequence_number,
-        }, payload))
+        Ok((
+            Self {
+                version,
+                msg_type,
+                length,
+                seid_present,
+                seid,
+                sequence_number,
+            },
+            payload,
+        ))
     }
 }
 
@@ -756,7 +875,11 @@ impl ParsedIe {
             let value = data[..length as usize].to_vec();
             data = &data[length as usize..];
 
-            ies.push(ParsedIe { ie_type, length, value });
+            ies.push(ParsedIe {
+                ie_type,
+                length,
+                value,
+            });
         }
         ies
     }
@@ -795,8 +918,7 @@ impl ParsedFSeid {
             return Err("F-SEID too short for SEID");
         }
         let seid = u64::from_be_bytes([
-            cursor[0], cursor[1], cursor[2], cursor[3],
-            cursor[4], cursor[5], cursor[6], cursor[7],
+            cursor[0], cursor[1], cursor[2], cursor[3], cursor[4], cursor[5], cursor[6], cursor[7],
         ]);
         cursor = &cursor[8..];
 
@@ -832,8 +954,8 @@ pub struct ParsedFTeid {
     pub teid: u32,
     pub ipv4: Option<Ipv4Addr>,
     pub ipv6: Option<Ipv6Addr>,
-    pub ch: bool,       // CHOOSE flag
-    pub chid: bool,     // CHOOSE ID flag
+    pub ch: bool,   // CHOOSE flag
+    pub chid: bool, // CHOOSE ID flag
     pub choose_id: Option<u8>,
 }
 
@@ -885,7 +1007,14 @@ impl ParsedFTeid {
             None
         };
 
-        Ok(Self { teid, ipv4, ipv6, ch, chid, choose_id })
+        Ok(Self {
+            teid,
+            ipv4,
+            ipv6,
+            ch,
+            chid,
+            choose_id,
+        })
     }
 }
 
@@ -1019,7 +1148,13 @@ impl ParsedOuterHeaderCreation {
             None
         };
 
-        Ok(Self { description, teid, ipv4, ipv6, port })
+        Ok(Self {
+            description,
+            teid,
+            ipv4,
+            ipv6,
+            port,
+        })
     }
 }
 
@@ -1040,7 +1175,8 @@ pub fn parse_create_pdr(data: &[u8]) -> Result<ParsedCreatePdr, &'static str> {
     // Precedence (mandatory)
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::PRECEDENCE) {
         if ie.value.len() >= 4 {
-            pdr.precedence = u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]);
+            pdr.precedence =
+                u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]);
         }
     }
 
@@ -1059,21 +1195,36 @@ pub fn parse_create_pdr(data: &[u8]) -> Result<ParsedCreatePdr, &'static str> {
     // FAR ID
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::FAR_ID) {
         if ie.value.len() >= 4 {
-            pdr.far_id = Some(u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]));
+            pdr.far_id = Some(u32::from_be_bytes([
+                ie.value[0],
+                ie.value[1],
+                ie.value[2],
+                ie.value[3],
+            ]));
         }
     }
 
     // URR IDs
     for ie in ParsedIe::find_all_ies(&ies, pfcp_ie::URR_ID) {
         if ie.value.len() >= 4 {
-            pdr.urr_ids.push(u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]));
+            pdr.urr_ids.push(u32::from_be_bytes([
+                ie.value[0],
+                ie.value[1],
+                ie.value[2],
+                ie.value[3],
+            ]));
         }
     }
 
     // QER ID
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::QER_ID) {
         if ie.value.len() >= 4 {
-            pdr.qer_id = Some(u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]]));
+            pdr.qer_id = Some(u32::from_be_bytes([
+                ie.value[0],
+                ie.value[1],
+                ie.value[2],
+                ie.value[3],
+            ]));
         }
     }
 
@@ -1147,9 +1298,8 @@ fn parse_pdi(data: &[u8]) -> Result<ParsedPdi, &'static str> {
             if flags & 0x01 != 0 {
                 let fd_len = u16::from_be_bytes([ie.value[2], ie.value[3]]) as usize;
                 if ie.value.len() >= 4 + fd_len {
-                    pdi.sdf_flow_description = Some(
-                        String::from_utf8_lossy(&ie.value[4..4 + fd_len]).to_string()
-                    );
+                    pdi.sdf_flow_description =
+                        Some(String::from_utf8_lossy(&ie.value[4..4 + fd_len]).to_string());
                 }
             }
         }
@@ -1257,8 +1407,8 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
     // Gate Status (IE type 25)
     if let Some(ie) = ParsedIe::find_ie(&ies, 25) {
         if !ie.value.is_empty() {
-            qer.ul_gate = ie.value[0] & 0x03;         // bits 0-1
-            qer.dl_gate = (ie.value[0] >> 2) & 0x03;  // bits 2-3
+            qer.ul_gate = ie.value[0] & 0x03; // bits 0-1
+            qer.dl_gate = (ie.value[0] >> 2) & 0x03; // bits 2-3
         }
     }
 
@@ -1266,10 +1416,24 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
     if let Some(ie) = ParsedIe::find_ie(&ies, 26) {
         if ie.value.len() >= 10 {
             qer.ul_mbr = u64::from_be_bytes([
-                0, 0, 0, ie.value[0], ie.value[1], ie.value[2], ie.value[3], ie.value[4],
+                0,
+                0,
+                0,
+                ie.value[0],
+                ie.value[1],
+                ie.value[2],
+                ie.value[3],
+                ie.value[4],
             ]);
             qer.dl_mbr = u64::from_be_bytes([
-                0, 0, 0, ie.value[5], ie.value[6], ie.value[7], ie.value[8], ie.value[9],
+                0,
+                0,
+                0,
+                ie.value[5],
+                ie.value[6],
+                ie.value[7],
+                ie.value[8],
+                ie.value[9],
             ]);
         }
     }
@@ -1278,10 +1442,24 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
     if let Some(ie) = ParsedIe::find_ie(&ies, 27) {
         if ie.value.len() >= 10 {
             qer.ul_gbr = u64::from_be_bytes([
-                0, 0, 0, ie.value[0], ie.value[1], ie.value[2], ie.value[3], ie.value[4],
+                0,
+                0,
+                0,
+                ie.value[0],
+                ie.value[1],
+                ie.value[2],
+                ie.value[3],
+                ie.value[4],
             ]);
             qer.dl_gbr = u64::from_be_bytes([
-                0, 0, 0, ie.value[5], ie.value[6], ie.value[7], ie.value[8], ie.value[9],
+                0,
+                0,
+                0,
+                ie.value[5],
+                ie.value[6],
+                ie.value[7],
+                ie.value[8],
+                ie.value[9],
             ]);
         }
     }
@@ -1300,9 +1478,9 @@ pub fn parse_create_qer(data: &[u8]) -> Result<ParsedCreateQer, &'static str> {
 #[derive(Debug, Clone, Default)]
 pub struct ParsedCreateQer {
     pub qer_id: u32,
-    pub ul_gate: u8,    // 0=OPEN, 1=CLOSED
+    pub ul_gate: u8, // 0=OPEN, 1=CLOSED
     pub dl_gate: u8,
-    pub ul_mbr: u64,    // kbps
+    pub ul_mbr: u64, // kbps
     pub dl_mbr: u64,
     pub ul_gbr: u64,
     pub dl_gbr: u64,
@@ -1347,22 +1525,22 @@ pub fn parse_create_urr(data: &[u8]) -> Result<ParsedCreateUrr, &'static str> {
             let mut cursor = &ie.value[1..];
             if (flags & 0x01) != 0 && cursor.len() >= 8 {
                 urr.volume_threshold_total = Some(u64::from_be_bytes([
-                    cursor[0], cursor[1], cursor[2], cursor[3],
-                    cursor[4], cursor[5], cursor[6], cursor[7],
+                    cursor[0], cursor[1], cursor[2], cursor[3], cursor[4], cursor[5], cursor[6],
+                    cursor[7],
                 ]));
                 cursor = &cursor[8..];
             }
             if (flags & 0x02) != 0 && cursor.len() >= 8 {
                 urr.volume_threshold_ul = Some(u64::from_be_bytes([
-                    cursor[0], cursor[1], cursor[2], cursor[3],
-                    cursor[4], cursor[5], cursor[6], cursor[7],
+                    cursor[0], cursor[1], cursor[2], cursor[3], cursor[4], cursor[5], cursor[6],
+                    cursor[7],
                 ]));
                 cursor = &cursor[8..];
             }
             if (flags & 0x04) != 0 && cursor.len() >= 8 {
                 urr.volume_threshold_dl = Some(u64::from_be_bytes([
-                    cursor[0], cursor[1], cursor[2], cursor[3],
-                    cursor[4], cursor[5], cursor[6], cursor[7],
+                    cursor[0], cursor[1], cursor[2], cursor[3], cursor[4], cursor[5], cursor[6],
+                    cursor[7],
                 ]));
             }
             let _ = cursor; // suppress unused warning
@@ -1373,7 +1551,10 @@ pub fn parse_create_urr(data: &[u8]) -> Result<ParsedCreateUrr, &'static str> {
     if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::TIME_THRESHOLD) {
         if ie.value.len() >= 4 {
             urr.time_threshold_secs = Some(u32::from_be_bytes([
-                ie.value[0], ie.value[1], ie.value[2], ie.value[3],
+                ie.value[0],
+                ie.value[1],
+                ie.value[2],
+                ie.value[3],
             ]));
         }
     }
@@ -1419,7 +1600,9 @@ impl ParsedNodeId {
                 if cursor.len() < 4 {
                     return Err("Node ID too short for IPv4");
                 }
-                Ok(ParsedNodeId::Ipv4(Ipv4Addr::new(cursor[0], cursor[1], cursor[2], cursor[3])))
+                Ok(ParsedNodeId::Ipv4(Ipv4Addr::new(
+                    cursor[0], cursor[1], cursor[2], cursor[3],
+                )))
             }
             1 => {
                 // IPv6
@@ -1562,19 +1745,17 @@ mod tests {
             ipv4: Some(Ipv4Addr::new(10, 0, 0, 1)),
             ipv6: None,
         };
-        let created_pdrs = vec![
-            CreatedPdr {
-                pdr_id: 1,
-                local_f_teid: Some(FTeid {
-                    teid: 0x5678,
-                    ipv4: Some(Ipv4Addr::new(10, 0, 0, 1)),
-                    ipv6: None,
-                    choose: false,
-                    choose_id: None,
-                }),
-                ue_ip_address: None,
-            },
-        ];
+        let created_pdrs = vec![CreatedPdr {
+            pdr_id: 1,
+            local_f_teid: Some(FTeid {
+                teid: 0x5678,
+                ipv4: Some(Ipv4Addr::new(10, 0, 0, 1)),
+                ipv6: None,
+                choose: false,
+                choose_id: None,
+            }),
+            ue_ip_address: None,
+        }];
         let msg = build_session_establishment_response(
             pfcp_type::SESSION_ESTABLISHMENT_RESPONSE,
             0x1234,
@@ -1587,37 +1768,31 @@ mod tests {
 
     #[test]
     fn test_build_session_modification_response() {
-        let msg = build_session_modification_response(
-            pfcp_type::SESSION_MODIFICATION_RESPONSE,
-            &[],
-        );
+        let msg =
+            build_session_modification_response(pfcp_type::SESSION_MODIFICATION_RESPONSE, &[]);
         // Should contain at least cause IE
         assert!(!msg.is_empty());
     }
 
     #[test]
     fn test_build_session_deletion_response() {
-        let usage_reports = vec![
-            UsageReport {
-                urr_id: 1,
-                ur_seqn: 1,
-                trigger: UsageReportTrigger {
-                    termination_report: true,
-                    ..Default::default()
-                },
-                volume_measurement: Some(VolumeMeasurement {
-                    total_volume: Some(1000),
-                    uplink_volume: Some(400),
-                    downlink_volume: Some(600),
-                    ..Default::default()
-                }),
+        let usage_reports = vec![UsageReport {
+            urr_id: 1,
+            ur_seqn: 1,
+            trigger: UsageReportTrigger {
+                termination_report: true,
                 ..Default::default()
             },
-        ];
-        let msg = build_session_deletion_response(
-            pfcp_type::SESSION_DELETION_RESPONSE,
-            &usage_reports,
-        );
+            volume_measurement: Some(VolumeMeasurement {
+                total_volume: Some(1000),
+                uplink_volume: Some(400),
+                downlink_volume: Some(600),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }];
+        let msg =
+            build_session_deletion_response(pfcp_type::SESSION_DELETION_RESPONSE, &usage_reports);
         assert!(!msg.is_empty());
     }
 
@@ -1637,10 +1812,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let msg = build_session_report_request(
-            pfcp_type::SESSION_REPORT_REQUEST,
-            &report,
-        );
+        let msg = build_session_report_request(pfcp_type::SESSION_REPORT_REQUEST, &report);
         assert!(!msg.is_empty());
     }
 
@@ -1731,7 +1903,7 @@ mod tests {
         // Flags: 2 bytes — bit 0 (FD) = flow description present
         ie_value.push(0x01); // FD flag set
         ie_value.push(0x00); // spare
-        // Flow description length: 2 bytes (big-endian)
+                             // Flow description length: 2 bytes (big-endian)
         ie_value.push((desc_bytes.len() >> 8) as u8);
         ie_value.push((desc_bytes.len() & 0xFF) as u8);
         // Flow description string

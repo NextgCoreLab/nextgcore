@@ -354,7 +354,10 @@ mod tests {
     #[test]
     fn test_grpc_method_path() {
         let method = GrpcMethod::unary("GetAnalytics", GrpcServiceType::NnwdafAnalytics);
-        assert_eq!(method.full_path(), "/fiveg.nwdaf.AnalyticsService/GetAnalytics");
+        assert_eq!(
+            method.full_path(),
+            "/fiveg.nwdaf.AnalyticsService/GetAnalytics"
+        );
         assert!(!method.client_streaming);
         assert!(!method.server_streaming);
     }
@@ -399,7 +402,9 @@ mod tests {
 
         let found = reg.lookup(GrpcServiceType::NnwdafAnalytics, "GetAnalytics");
         assert!(found.is_some());
-        assert!(reg.lookup(GrpcServiceType::NnwdafAnalytics, "Missing").is_none());
+        assert!(reg
+            .lookup(GrpcServiceType::NnwdafAnalytics, "Missing")
+            .is_none());
     }
 
     #[test]

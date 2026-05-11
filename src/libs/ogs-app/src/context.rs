@@ -178,11 +178,11 @@ impl OgsApp {
 
         // Reset context
         *self.context.write().unwrap() = OgsAppContext::new();
-        
+
         // Prepare global configuration
         let mut global = self.global_conf.write().unwrap();
         global.prepare();
-        
+
         // Prepare local configuration
         let mut local = self.local_conf.write().unwrap();
         local.prepare();
@@ -326,9 +326,9 @@ mod tests {
     fn test_pool_calculation() {
         let mut ctx = OgsAppContext::new();
         let global = OgsGlobalConf::new();
-        
+
         ctx.recalculate_pool_size(&global);
-        
+
         // With default 1024 UEs
         assert_eq!(ctx.pool.gtpu, 1024 * OGS_MAX_NUM_OF_GTPU_BUFFER);
         assert_eq!(ctx.pool.sess, 1024 * 4);
@@ -340,7 +340,7 @@ mod tests {
     fn test_ogs_app_singleton() {
         let app1 = ogs_app();
         let app2 = ogs_app();
-        
+
         // Should be the same instance
         assert!(std::ptr::eq(app1, app2));
     }

@@ -6,11 +6,11 @@
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
-    use crate::amf_sm::{AmfFsm, AmfState, AmfFsmResult};
-    use crate::gmm_sm::{GmmFsm, GmmState, GmmFsmResult};
-    use crate::ngap_sm::{NgapFsm, NgapState, NgapFsmResult};
+    use crate::amf_sm::{AmfFsm, AmfFsmResult, AmfState};
     use crate::event::{AmfEvent, AmfEventId, AmfTimerId};
+    use crate::gmm_sm::{GmmFsm, GmmFsmResult, GmmState};
+    use crate::ngap_sm::{NgapFsm, NgapFsmResult, NgapState};
+    use proptest::prelude::*;
 
     // ========================================================================
     // Strategies for generating test data
@@ -69,10 +69,7 @@ mod tests {
 
     /// Strategy for generating NGAP timer IDs
     fn arb_ngap_timer_id() -> impl Strategy<Value = AmfTimerId> {
-        prop_oneof![
-            Just(AmfTimerId::NgDelayedSend),
-            Just(AmfTimerId::NgHolding),
-        ]
+        prop_oneof![Just(AmfTimerId::NgDelayedSend), Just(AmfTimerId::NgHolding),]
     }
 
     /// Strategy for generating GMM states
@@ -104,7 +101,7 @@ mod tests {
         fn prop_amf_fsm_init_transitions_to_operational(_seed in any::<u64>()) {
             let mut fsm = AmfFsm::new();
             prop_assert_eq!(fsm.state, AmfState::Initial);
-            
+
             fsm.init();
             prop_assert_eq!(fsm.state, AmfState::Operational);
         }
@@ -117,7 +114,7 @@ mod tests {
             let mut fsm = AmfFsm::new();
             fsm.init();
             prop_assert_eq!(fsm.state, AmfState::Operational);
-            
+
             fsm.fini();
             prop_assert_eq!(fsm.state, AmfState::Final);
         }
@@ -129,7 +126,7 @@ mod tests {
         fn prop_amf_fsm_entry_event_transitions(_seed in any::<u64>()) {
             let mut fsm = AmfFsm::new();
             let event = AmfEvent::entry();
-            
+
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, AmfFsmResult::Transition(AmfState::Operational));
             prop_assert_eq!(fsm.state, AmfState::Operational);
@@ -144,7 +141,7 @@ mod tests {
             fsm.init();
             fsm.fini();
             prop_assert_eq!(fsm.state, AmfState::Final);
-            
+
             let event = AmfEvent::new(event_id);
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, AmfFsmResult::Ignored);
@@ -158,7 +155,7 @@ mod tests {
         fn prop_amf_fsm_operational_handles_sbi(_seed in any::<u64>()) {
             let mut fsm = AmfFsm::new();
             fsm.init();
-            
+
             let request = crate::event::AmfSbiRequest {
                 method: "POST".to_string(),
                 uri: "/namf-comm/v1/ue-contexts".to_string(),
@@ -176,7 +173,7 @@ mod tests {
         fn prop_amf_fsm_operational_handles_ngap(gnb_id in 1u64..1000) {
             let mut fsm = AmfFsm::new();
             fsm.init();
-            
+
             let event = AmfEvent::ngap_message(gnb_id, vec![1, 2, 3]);
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, AmfFsmResult::Handled);
@@ -198,7 +195,7 @@ mod tests {
             let mut fsm = GmmFsm::new(amf_ue_id);
             prop_assert_eq!(fsm.state, GmmState::Initial);
             prop_assert_eq!(fsm.amf_ue_id, amf_ue_id);
-            
+
             fsm.init();
             prop_assert_eq!(fsm.state, GmmState::DeRegistered);
             prop_assert!(fsm.is_de_registered());
@@ -211,7 +208,7 @@ mod tests {
         fn prop_gmm_fsm_fini_transitions_to_final(amf_ue_id in 1u64..10000) {
             let mut fsm = GmmFsm::new(amf_ue_id);
             fsm.init();
-            
+
             fsm.fini();
             prop_assert_eq!(fsm.state, GmmState::Final);
         }
@@ -223,7 +220,7 @@ mod tests {
         fn prop_gmm_fsm_entry_event_transitions(amf_ue_id in 1u64..10000) {
             let mut fsm = GmmFsm::new(amf_ue_id);
             let event = AmfEvent::entry();
-            
+
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, GmmFsmResult::Transition(GmmState::DeRegistered));
             prop_assert_eq!(fsm.state, GmmState::DeRegistered);
@@ -241,7 +238,7 @@ mod tests {
             fsm.init();
             fsm.fini();
             prop_assert_eq!(fsm.state, GmmState::Final);
-            
+
             let event = AmfEvent::new(event_id);
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, GmmFsmResult::Ignored);
@@ -256,17 +253,17 @@ mod tests {
             let mut fsm = GmmFsm::new(amf_ue_id);
             fsm.init();
             prop_assert!(fsm.is_de_registered());
-            
+
             // Transition through registration flow
             fsm.transition_to_authentication();
             prop_assert_eq!(fsm.state, GmmState::Authentication);
-            
+
             fsm.transition_to_security_mode();
             prop_assert_eq!(fsm.state, GmmState::SecurityMode);
-            
+
             fsm.transition_to_initial_context_setup();
             prop_assert_eq!(fsm.state, GmmState::InitialContextSetup);
-            
+
             fsm.transition_to_registered();
             prop_assert!(fsm.is_registered());
         }
@@ -280,7 +277,7 @@ mod tests {
             fsm.init();
             fsm.transition_to_registered();
             prop_assert!(fsm.is_registered());
-            
+
             let event = AmfEvent::gmm_timer(AmfTimerId::ImplicitDeregistration, amf_ue_id);
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, GmmFsmResult::Transition(GmmState::DeRegistered));
@@ -295,7 +292,7 @@ mod tests {
             let mut fsm = GmmFsm::new(amf_ue_id);
             fsm.init();
             fsm.transition_to_registered();
-            
+
             let event = AmfEvent::gmm_timer(AmfTimerId::T3522, amf_ue_id);
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, GmmFsmResult::Transition(GmmState::Exception));
@@ -328,7 +325,7 @@ mod tests {
             let mut fsm = NgapFsm::new(gnb_id);
             prop_assert_eq!(fsm.state, NgapState::Initial);
             prop_assert_eq!(fsm.gnb_id, gnb_id);
-            
+
             fsm.init();
             prop_assert_eq!(fsm.state, NgapState::Operational);
             prop_assert!(fsm.is_operational());
@@ -341,7 +338,7 @@ mod tests {
         fn prop_ngap_fsm_fini_transitions_to_final(gnb_id in 1u64..10000) {
             let mut fsm = NgapFsm::new(gnb_id);
             fsm.init();
-            
+
             fsm.fini();
             prop_assert_eq!(fsm.state, NgapState::Final);
         }
@@ -353,7 +350,7 @@ mod tests {
         fn prop_ngap_fsm_entry_event_transitions(gnb_id in 1u64..10000) {
             let mut fsm = NgapFsm::new(gnb_id);
             let event = AmfEvent::entry();
-            
+
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, NgapFsmResult::Transition(NgapState::Operational));
             prop_assert_eq!(fsm.state, NgapState::Operational);
@@ -371,7 +368,7 @@ mod tests {
             fsm.init();
             fsm.fini();
             prop_assert_eq!(fsm.state, NgapState::Final);
-            
+
             let event = AmfEvent::new(event_id);
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, NgapFsmResult::Ignored);
@@ -385,7 +382,7 @@ mod tests {
         fn prop_ngap_fsm_operational_handles_messages(gnb_id in 1u64..10000) {
             let mut fsm = NgapFsm::new(gnb_id);
             fsm.init();
-            
+
             let event = AmfEvent::ngap_message(gnb_id, vec![1, 2, 3]);
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, NgapFsmResult::Handled);
@@ -401,7 +398,7 @@ mod tests {
         ) {
             let mut fsm = NgapFsm::new(gnb_id);
             fsm.init();
-            
+
             let event = AmfEvent::ngap_timer(timer_id, gnb_id);
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, NgapFsmResult::Handled);
@@ -416,7 +413,7 @@ mod tests {
             fsm.init();
             fsm.transition_to_exception();
             prop_assert!(fsm.is_exception());
-            
+
             let event = AmfEvent::ngap_message(gnb_id, vec![1, 2, 3]);
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, NgapFsmResult::Handled);
@@ -430,10 +427,10 @@ mod tests {
             let mut fsm = NgapFsm::new(gnb_id);
             fsm.init();
             prop_assert!(fsm.is_operational());
-            
+
             fsm.transition_to_exception();
             prop_assert!(fsm.is_exception());
-            
+
             fsm.transition_to_operational();
             prop_assert!(fsm.is_operational());
         }
@@ -453,10 +450,10 @@ mod tests {
         fn prop_timer_classification_consistent(timer_id in arb_amf_timer_id()) {
             let is_gmm = timer_id.is_gmm_timer();
             let is_ngap = timer_id.is_ngap_timer();
-            
+
             // A timer cannot be both GMM and NGAP
             prop_assert!(!(is_gmm && is_ngap));
-            
+
             // Timer name should be non-empty
             prop_assert!(!timer_id.name().is_empty());
         }
@@ -484,22 +481,22 @@ mod tests {
             let mut gmm_fsm1 = GmmFsm::new(amf_ue_id1);
             let mut gmm_fsm2 = GmmFsm::new(amf_ue_id2);
             let mut ngap_fsm = NgapFsm::new(gnb_id);
-            
+
             // Initialize all FSMs
             amf_fsm.init();
             gmm_fsm1.init();
             gmm_fsm2.init();
             ngap_fsm.init();
-            
+
             // Verify independent states
             prop_assert_eq!(amf_fsm.state, AmfState::Operational);
             prop_assert_eq!(gmm_fsm1.state, GmmState::DeRegistered);
             prop_assert_eq!(gmm_fsm2.state, GmmState::DeRegistered);
             prop_assert_eq!(ngap_fsm.state, NgapState::Operational);
-            
+
             // Transition one GMM FSM
             gmm_fsm1.transition_to_registered();
-            
+
             // Verify other FSMs are unaffected
             prop_assert_eq!(gmm_fsm1.state, GmmState::Registered);
             prop_assert_eq!(gmm_fsm2.state, GmmState::DeRegistered);

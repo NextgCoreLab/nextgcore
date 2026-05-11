@@ -4,12 +4,12 @@
 //! of metrics (name, description, labels, type).
 
 use crate::{
+    types::{HistogramBucketParams, MetricType},
     MAX_LABELS,
-    types::{MetricType, HistogramBucketParams},
 };
 
 /// Metric specification
-/// 
+///
 /// Defines the structure of a metric including its name, description,
 /// type, labels, and initial value.
 #[derive(Debug, Clone)]
@@ -32,18 +32,18 @@ pub struct MetricsSpec {
 
 impl MetricsSpec {
     /// Create a new metric specification
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `metric_type` - The type of metric (Counter, Gauge, Histogram)
     /// * `name` - The metric name
     /// * `description` - Human-readable description
     /// * `initial_val` - Initial value (used for gauges)
     /// * `labels` - Label names for this metric
     /// * `histogram_params` - Histogram bucket parameters (required for Histogram type)
-    /// 
+    ///
     /// # Panics
-    /// 
+    ///
     /// Panics if more than MAX_LABELS labels are provided.
     pub fn new(
         metric_type: MetricType,
@@ -53,10 +53,16 @@ impl MetricsSpec {
         labels: &[&str],
         histogram_params: Option<HistogramBucketParams>,
     ) -> Self {
-        assert!(labels.len() <= MAX_LABELS, "Too many labels (max {MAX_LABELS})");
-        
+        assert!(
+            labels.len() <= MAX_LABELS,
+            "Too many labels (max {MAX_LABELS})"
+        );
+
         if metric_type == MetricType::Histogram {
-            assert!(histogram_params.is_some(), "Histogram metrics require bucket parameters");
+            assert!(
+                histogram_params.is_some(),
+                "Histogram metrics require bucket parameters"
+            );
         }
 
         MetricsSpec {
@@ -77,7 +83,14 @@ impl MetricsSpec {
 
     /// Create a gauge metric specification
     pub fn gauge(name: &str, description: &str, initial_val: i64, labels: &[&str]) -> Self {
-        Self::new(MetricType::Gauge, name, description, initial_val, labels, None)
+        Self::new(
+            MetricType::Gauge,
+            name,
+            description,
+            initial_val,
+            labels,
+            None,
+        )
     }
 
     /// Create a histogram metric specification with linear buckets
@@ -206,7 +219,7 @@ impl SpecPool {
         if self.specs.len() >= self.capacity {
             return None;
         }
-        
+
         self.specs.push(spec);
         self.specs.last()
     }

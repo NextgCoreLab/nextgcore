@@ -208,16 +208,16 @@ impl MmeEvent {
 pub trait Fsm {
     /// Event type
     type Event;
-    
+
     /// Initialize the state machine
     fn init(&mut self);
-    
+
     /// Finalize the state machine
     fn fini(&mut self);
-    
+
     /// Dispatch an event to the state machine
     fn dispatch(&mut self, event: &Self::Event);
-    
+
     /// Check if in a specific state
     fn check_state(&self, state_name: &str) -> bool;
 }
@@ -295,7 +295,12 @@ impl EmmFsm {
 
     /// Transition to a new state
     pub fn transition(&mut self, new_state: EmmState) {
-        log::debug!("EMM FSM [{}]: {} -> {}", self.mme_ue_id, self.state, new_state);
+        log::debug!(
+            "EMM FSM [{}]: {} -> {}",
+            self.mme_ue_id,
+            self.state,
+            new_state
+        );
         self.state = new_state;
     }
 
@@ -432,7 +437,10 @@ impl EmmFsm {
                 }
             }
             _ => {
-                log::error!("Unknown event {:?} in initial context setup state", event.id);
+                log::error!(
+                    "Unknown event {:?} in initial context setup state",
+                    event.id
+                );
             }
         }
     }
@@ -481,7 +489,6 @@ impl Fsm for EmmFsm {
         self.state.to_string() == state_name
     }
 }
-
 
 // ============================================================================
 // ESM State Machine
@@ -547,7 +554,12 @@ impl EsmFsm {
 
     /// Transition to a new state
     pub fn transition(&mut self, new_state: EsmState) {
-        log::debug!("ESM FSM [{}]: {} -> {}", self.bearer_id, self.state, new_state);
+        log::debug!(
+            "ESM FSM [{}]: {} -> {}",
+            self.bearer_id,
+            self.state,
+            new_state
+        );
         self.state = new_state;
     }
 
@@ -602,7 +614,10 @@ impl EsmFsm {
                 // Handle deactivate bearer context accept
             }
             _ => {
-                log::error!("Unknown event {:?} in ESM PDN will disconnect state", event.id);
+                log::error!(
+                    "Unknown event {:?} in ESM PDN will disconnect state",
+                    event.id
+                );
             }
         }
     }
@@ -790,7 +805,12 @@ impl S1apFsm {
 
     /// Transition to a new state
     pub fn transition(&mut self, new_state: S1apState) {
-        log::debug!("S1AP FSM [{}]: {} -> {}", self.enb_id, self.state, new_state);
+        log::debug!(
+            "S1AP FSM [{}]: {} -> {}",
+            self.enb_id,
+            self.state,
+            new_state
+        );
         self.state = new_state;
     }
 
@@ -861,7 +881,6 @@ impl Fsm for S1apFsm {
         self.state.to_string() == state_name
     }
 }
-
 
 // ============================================================================
 // SGsAP State Machine
@@ -974,7 +993,12 @@ impl SgsapFsm {
 
     /// Transition to a new state
     pub fn transition(&mut self, new_state: SgsapState) {
-        log::debug!("SGsAP FSM [{}]: {} -> {}", self.vlr_id, self.state, new_state);
+        log::debug!(
+            "SGsAP FSM [{}]: {} -> {}",
+            self.vlr_id,
+            self.state,
+            new_state
+        );
         self.state = new_state;
     }
 

@@ -22,13 +22,9 @@ impl NssfTimerManager {
     }
 
     /// Start a one-shot timer
-    pub fn start(
-        &self,
-        timer_type: NssfTimerId,
-        duration: Duration,
-        data: Option<String>,
-    ) -> u64 {
-        self.inner.start(timer_type, duration, TimerMode::OneShot, data)
+    pub fn start(&self, timer_type: NssfTimerId, duration: Duration, data: Option<String>) -> u64 {
+        self.inner
+            .start(timer_type, duration, TimerMode::OneShot, data)
     }
 
     /// Start a periodic timer
@@ -38,7 +34,8 @@ impl NssfTimerManager {
         interval: Duration,
         data: Option<String>,
     ) -> u64 {
-        self.inner.start(timer_type, interval, TimerMode::Periodic, data)
+        self.inner
+            .start(timer_type, interval, TimerMode::Periodic, data)
     }
 
     /// Stop/cancel a timer
@@ -134,11 +131,7 @@ mod tests {
     fn test_timer_manager_process_expired() {
         let mgr = NssfTimerManager::new();
 
-        mgr.start(
-            NssfTimerId::SbiClientWait,
-            Duration::from_millis(10),
-            None,
-        );
+        mgr.start(NssfTimerId::SbiClientWait, Duration::from_millis(10), None);
 
         thread::sleep(Duration::from_millis(20));
 

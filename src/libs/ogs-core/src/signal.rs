@@ -136,7 +136,10 @@ pub fn ogs_signal_init() {
 pub fn ogs_signal_description_get(signum: i32) -> &'static str {
     let descriptions = SIGNAL_DESCRIPTIONS.get_or_init(|| {
         ogs_signal_init();
-        SIGNAL_DESCRIPTIONS.get().expect("signal init completed").clone()
+        SIGNAL_DESCRIPTIONS
+            .get()
+            .expect("signal init completed")
+            .clone()
     });
 
     if signum >= 0 && (signum as usize) < descriptions.len() {
@@ -158,11 +161,7 @@ pub fn ogs_setup_signal_thread() -> i32 {
         // Remove synchronous signals that cannot be blocked
         remove_sync_sigs(sig_mask.as_mut_ptr());
 
-        let rv = libc::pthread_sigmask(
-            libc::SIG_SETMASK,
-            sig_mask.as_ptr(),
-            std::ptr::null_mut(),
-        );
+        let rv = libc::pthread_sigmask(libc::SIG_SETMASK, sig_mask.as_ptr(), std::ptr::null_mut());
 
         if rv != 0 {
             return OGS_ERROR;
@@ -243,11 +242,7 @@ pub fn ogs_signal_block(signum: i32) -> i32 {
         libc::sigemptyset(sig_mask.as_mut_ptr());
         libc::sigaddset(sig_mask.as_mut_ptr(), signum);
 
-        let rv = libc::pthread_sigmask(
-            libc::SIG_BLOCK,
-            sig_mask.as_ptr(),
-            std::ptr::null_mut(),
-        );
+        let rv = libc::pthread_sigmask(libc::SIG_BLOCK, sig_mask.as_ptr(), std::ptr::null_mut());
 
         if rv != 0 {
             return OGS_ERROR;
@@ -272,11 +267,7 @@ pub fn ogs_signal_unblock(signum: i32) -> i32 {
         libc::sigemptyset(sig_mask.as_mut_ptr());
         libc::sigaddset(sig_mask.as_mut_ptr(), signum);
 
-        let rv = libc::pthread_sigmask(
-            libc::SIG_UNBLOCK,
-            sig_mask.as_ptr(),
-            std::ptr::null_mut(),
-        );
+        let rv = libc::pthread_sigmask(libc::SIG_UNBLOCK, sig_mask.as_ptr(), std::ptr::null_mut());
 
         if rv != 0 {
             return OGS_ERROR;
@@ -310,9 +301,7 @@ pub fn ogs_signal(signum: i32, handler: libc::sighandler_t) -> libc::sighandler_
             if signum == libc::SIGCHLD && handler == libc::SIG_IGN {
                 // Use a custom handler to avoid zombies
                 extern "C" fn avoid_zombies(_signo: i32) {
-                    unsafe {
-                        while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {}
-                    }
+                    unsafe { while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {} }
                 }
                 act.sa_sigaction = avoid_zombies as libc::sighandler_t;
             }
@@ -348,7 +337,10 @@ mod tests {
         {
             assert_eq!(ogs_signal_description_get(libc::SIGINT), "Interrupt");
             assert_eq!(ogs_signal_description_get(libc::SIGTERM), "Terminated");
-            assert_eq!(ogs_signal_description_get(libc::SIGSEGV), "Segmentation fault");
+            assert_eq!(
+                ogs_signal_description_get(libc::SIGSEGV),
+                "Segmentation fault"
+            );
         }
 
         assert_eq!(ogs_signal_description_get(-1), "unknown signal (number)");

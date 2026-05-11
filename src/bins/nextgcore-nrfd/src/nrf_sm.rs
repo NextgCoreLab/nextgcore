@@ -33,7 +33,7 @@ impl NrfSmContext {
     pub fn init(&mut self) {
         log::debug!("NRF SM: Initializing");
         self.state = NrfState::Initial;
-        
+
         // Process initial state
         let mut event = NrfEvent::entry();
         self.dispatch(&mut event);
@@ -50,7 +50,7 @@ impl NrfSmContext {
     /// Dispatch an event to the state machine
     pub fn dispatch(&mut self, event: &mut NrfEvent) {
         nrf_sm_debug(event);
-        
+
         match self.state {
             NrfState::Initial => {
                 self.handle_initial_state(event);

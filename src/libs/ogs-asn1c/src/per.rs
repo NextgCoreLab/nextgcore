@@ -28,7 +28,6 @@ pub enum PerError {
 
 pub type PerResult<T> = Result<T, PerError>;
 
-
 /// Constraint definition for constrained integers
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Constraint {
@@ -39,11 +38,19 @@ pub struct Constraint {
 
 impl Constraint {
     pub const fn new(min: i64, max: i64) -> Self {
-        Self { min, max, extensible: false }
+        Self {
+            min,
+            max,
+            extensible: false,
+        }
     }
 
     pub const fn extensible(min: i64, max: i64) -> Self {
-        Self { min, max, extensible: true }
+        Self {
+            min,
+            max,
+            extensible: true,
+        }
     }
 
     /// Calculate the range of the constraint
@@ -392,7 +399,6 @@ impl AperEncoder {
     }
 }
 
-
 impl Default for AperEncoder {
     fn default() -> Self {
         Self::new()
@@ -549,7 +555,8 @@ impl<'a> AperDecoder<'a> {
                     } else if current_byte & 0x40 == 0 {
                         // Long form
                         let second_byte = self.read_bits(8)? as u8;
-                        total_length += (((current_byte & 0x3F) as usize) << 8) | (second_byte as usize);
+                        total_length +=
+                            (((current_byte & 0x3F) as usize) << 8) | (second_byte as usize);
                     }
                     break;
                 }
@@ -634,10 +641,7 @@ impl<'a> AperDecoder<'a> {
                 }
                 len
             }
-            _ => {
-                
-                self.decode_length_determinant()?
-            }
+            _ => self.decode_length_determinant()?,
         };
 
         self.read_bytes(len)
@@ -674,7 +678,6 @@ impl<'a> AperDecoder<'a> {
     }
 }
 
-
 /// Trait for types that can be encoded with APER
 pub trait AperEncode {
     fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()>;
@@ -702,16 +705,20 @@ mod tests {
     #[test]
     fn test_encode_decode_constrained() {
         let constraint = Constraint::new(0, 2);
-        
+
         for value in 0..=2 {
             let mut encoder = AperEncoder::new();
-            encoder.encode_constrained_whole_number(value, &constraint).unwrap();
+            encoder
+                .encode_constrained_whole_number(value, &constraint)
+                .unwrap();
             encoder.align();
-            
+
             let bytes = encoder.into_bytes();
             let mut decoder = AperDecoder::new(&bytes);
-            let decoded = decoder.decode_constrained_whole_number(&constraint).unwrap();
-            
+            let decoded = decoder
+                .decode_constrained_whole_number(&constraint)
+                .unwrap();
+
             assert_eq!(value, decoded);
         }
     }
@@ -721,11 +728,11 @@ mod tests {
         for len in [0, 1, 127, 128, 255, 1000, 16383] {
             let mut encoder = AperEncoder::new();
             encoder.encode_length_determinant(len).unwrap();
-            
+
             let bytes = encoder.into_bytes();
             let mut decoder = AperDecoder::new(&bytes);
             let decoded = decoder.decode_length_determinant().unwrap();
-            
+
             assert_eq!(len, decoded);
         }
     }
@@ -733,14 +740,14 @@ mod tests {
     #[test]
     fn test_encode_decode_octet_string() {
         let data = vec![0x01, 0x02, 0x03, 0x04];
-        
+
         let mut encoder = AperEncoder::new();
         encoder.encode_octet_string(&data, None, None).unwrap();
-        
+
         let bytes = encoder.into_bytes();
         let mut decoder = AperDecoder::new(&bytes);
         let decoded = decoder.decode_octet_string(None, None).unwrap();
-        
+
         assert_eq!(data, decoded);
     }
 }

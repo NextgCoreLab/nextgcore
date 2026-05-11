@@ -8,8 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Authentication type (from OpenAPI)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AuthType {
     /// 5G AKA authentication
     #[default]
@@ -20,10 +19,8 @@ pub enum AuthType {
     EapTls,
 }
 
-
 /// Authentication result (from OpenAPI)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AuthResult {
     /// Authentication success
     AuthenticationSuccess,
@@ -33,7 +30,6 @@ pub enum AuthResult {
     #[default]
     AuthenticationOngoing,
 }
-
 
 /// Authentication event data
 #[derive(Debug, Clone, Default)]
@@ -162,7 +158,8 @@ impl AusfUe {
         // Standard KAUSF derivation: KAUSF = KDF(CK, IK, serving_network_name, SQN ⊕ AK)
         // SNPN enhancement: serving_network_name includes NID
         if let Some(ref nid) = self.snpn_nid {
-            let serving_network_with_nid = format!("5G:{}:NID-{}",
+            let serving_network_with_nid = format!(
+                "5G:{}:NID-{}",
                 self.serving_network_name.as_deref().unwrap_or(""),
                 nid
             );
@@ -180,7 +177,8 @@ impl AusfUe {
         if let Some(ref nid) = self.snpn_nid {
             log::info!(
                 "[AUSF SNPN] Requesting DCS credentials for onboarding: nid={} suci={}",
-                nid, self.suci
+                nid,
+                self.suci
             );
             // In production, this would send Nudm_SDM_Get to DCS
             return true;
@@ -227,7 +225,10 @@ impl AusfContext {
         self.max_num_of_ue = max_ue;
         self.initialized.store(true, Ordering::SeqCst);
 
-        log::info!("AUSF context initialized with max {} UEs", self.max_num_of_ue);
+        log::info!(
+            "AUSF context initialized with max {} UEs",
+            self.max_num_of_ue
+        );
     }
 
     /// Finalize the AUSF context

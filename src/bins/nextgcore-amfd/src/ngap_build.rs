@@ -2,10 +2,7 @@
 //!
 //! Port of src/amf/ngap-build.c - NGAP message building functions
 
-use crate::context::{
-    AmfContext, AmfUe, AmfSess, RanUe, Tai5gs,
-    NgapCause,
-};
+use crate::context::{AmfContext, AmfSess, AmfUe, NgapCause, RanUe, Tai5gs};
 use bytes::{BufMut, BytesMut};
 
 // ============================================================================
@@ -175,7 +172,7 @@ impl Default for NgapMessageBuilder {
 // ============================================================================
 
 /// Build NG Setup Response message
-/// 
+///
 /// This is sent by AMF to gNB in response to NG Setup Request
 pub fn build_ng_setup_response(ctx: &AmfContext) -> Option<Vec<u8>> {
     let mut builder = NgapMessageBuilder::new();
@@ -222,7 +219,11 @@ pub fn build_ng_setup_response(ctx: &AmfContext) -> Option<Vec<u8>> {
         builder.write_u8((plmn_support.plmn_id.mnc2 << 4) | plmn_support.plmn_id.mnc1);
         // S-NSSAI count
         builder.write_u8(plmn_support.num_of_s_nssai as u8);
-        for s_nssai in plmn_support.s_nssai.iter().take(plmn_support.num_of_s_nssai) {
+        for s_nssai in plmn_support
+            .s_nssai
+            .iter()
+            .take(plmn_support.num_of_s_nssai)
+        {
             builder.write_u8(s_nssai.sst);
             if let Some(sd) = s_nssai.sd {
                 builder.write_u8(1); // SD present
@@ -291,10 +292,7 @@ pub fn build_downlink_nas_transport(
 }
 
 /// Build UE Context Release Command message
-pub fn build_ue_context_release_command(
-    ran_ue: &RanUe,
-    cause: &NgapCause,
-) -> Option<Vec<u8>> {
+pub fn build_ue_context_release_command(ran_ue: &RanUe, cause: &NgapCause) -> Option<Vec<u8>> {
     let mut builder = NgapMessageBuilder::new();
 
     // Procedure code
@@ -534,10 +532,7 @@ pub fn build_handover_command(
 }
 
 /// Build Handover Preparation Failure message
-pub fn build_handover_preparation_failure(
-    source_ue: &RanUe,
-    cause: &NgapCause,
-) -> Option<Vec<u8>> {
+pub fn build_handover_preparation_failure(source_ue: &RanUe, cause: &NgapCause) -> Option<Vec<u8>> {
     let mut builder = NgapMessageBuilder::new();
 
     // Procedure code
@@ -768,7 +763,10 @@ mod tests {
             id: 1,
             amf_ue_id: 1,
             psi: 5,
-            s_nssai: SNssai { sst: 1, sd: Some(0x010203) },
+            s_nssai: SNssai {
+                sst: 1,
+                sd: Some(0x010203),
+            },
             ..Default::default()
         }
     }
@@ -796,7 +794,10 @@ mod tests {
         let msg = msg.unwrap();
         assert!(!msg.is_empty());
         // Check procedure code
-        assert_eq!((msg[0] as u16) << 8 | msg[1] as u16, procedure_code::NG_SETUP);
+        assert_eq!(
+            (msg[0] as u16) << 8 | msg[1] as u16,
+            procedure_code::NG_SETUP
+        );
     }
 
     #[test]
@@ -808,7 +809,10 @@ mod tests {
         let msg = build_ng_setup_failure(&cause, Some(5));
 
         assert!(!msg.is_empty());
-        assert_eq!((msg[0] as u16) << 8 | msg[1] as u16, procedure_code::NG_SETUP);
+        assert_eq!(
+            (msg[0] as u16) << 8 | msg[1] as u16,
+            procedure_code::NG_SETUP
+        );
     }
 
     #[test]
@@ -820,7 +824,10 @@ mod tests {
         assert!(msg.is_some());
         let msg = msg.unwrap();
         assert!(!msg.is_empty());
-        assert_eq!((msg[0] as u16) << 8 | msg[1] as u16, procedure_code::DOWNLINK_NAS_TRANSPORT);
+        assert_eq!(
+            (msg[0] as u16) << 8 | msg[1] as u16,
+            procedure_code::DOWNLINK_NAS_TRANSPORT
+        );
     }
 
     #[test]
@@ -835,7 +842,10 @@ mod tests {
         assert!(msg.is_some());
         let msg = msg.unwrap();
         assert!(!msg.is_empty());
-        assert_eq!((msg[0] as u16) << 8 | msg[1] as u16, procedure_code::UE_CONTEXT_RELEASE);
+        assert_eq!(
+            (msg[0] as u16) << 8 | msg[1] as u16,
+            procedure_code::UE_CONTEXT_RELEASE
+        );
     }
 
     #[test]
@@ -848,7 +858,10 @@ mod tests {
         assert!(msg.is_some());
         let msg = msg.unwrap();
         assert!(!msg.is_empty());
-        assert_eq!((msg[0] as u16) << 8 | msg[1] as u16, procedure_code::PDU_SESSION_RESOURCE_SETUP);
+        assert_eq!(
+            (msg[0] as u16) << 8 | msg[1] as u16,
+            procedure_code::PDU_SESSION_RESOURCE_SETUP
+        );
     }
 
     #[test]
@@ -874,7 +887,10 @@ mod tests {
         assert!(msg.is_some());
         let msg = msg.unwrap();
         assert!(!msg.is_empty());
-        assert_eq!((msg[0] as u16) << 8 | msg[1] as u16, procedure_code::HANDOVER_CANCEL);
+        assert_eq!(
+            (msg[0] as u16) << 8 | msg[1] as u16,
+            procedure_code::HANDOVER_CANCEL
+        );
     }
 
     #[test]
@@ -886,7 +902,10 @@ mod tests {
         let msg = build_error_indication(Some(1001), Some(2001), &cause);
 
         assert!(!msg.is_empty());
-        assert_eq!((msg[0] as u16) << 8 | msg[1] as u16, procedure_code::ERROR_INDICATION);
+        assert_eq!(
+            (msg[0] as u16) << 8 | msg[1] as u16,
+            procedure_code::ERROR_INDICATION
+        );
     }
 
     #[test]
@@ -894,6 +913,9 @@ mod tests {
         let msg = build_ran_configuration_update_ack();
 
         assert!(!msg.is_empty());
-        assert_eq!((msg[0] as u16) << 8 | msg[1] as u16, procedure_code::RAN_CONFIGURATION_UPDATE);
+        assert_eq!(
+            (msg[0] as u16) << 8 | msg[1] as u16,
+            procedure_code::RAN_CONFIGURATION_UPDATE
+        );
     }
 }

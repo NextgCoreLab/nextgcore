@@ -76,11 +76,7 @@ impl PcrfSmContext {
     /// Dispatch an event to the state machine
     pub fn dispatch(&mut self, event: &mut PcrfEvent) {
         if self.debug {
-            log::debug!(
-                "PCRF SM: state={:?}, event={}",
-                self.state,
-                event.name()
-            );
+            log::debug!("PCRF SM: state={:?}, event={}", self.state, event.name());
         }
 
         match self.state {
@@ -103,10 +99,7 @@ impl PcrfSmContext {
                 self.state = PcrfState::Final;
             }
             _ => {
-                log::warn!(
-                    "Unexpected event {} in Initial state",
-                    event.name()
-                );
+                log::warn!("Unexpected event {} in Initial state", event.name());
             }
         }
     }
@@ -155,10 +148,7 @@ impl PcrfSmContext {
 
     /// Exception state handler
     fn state_exception(&mut self, event: &mut PcrfEvent) {
-        log::error!(
-            "PCRF in Exception state, event: {}",
-            event.name()
-        );
+        log::error!("PCRF in Exception state, event: {}", event.name());
         // Try to recover by transitioning to Final state
         if event.id == PcrfEventId::Exit {
             self.state = PcrfState::Final;

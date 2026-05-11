@@ -117,11 +117,7 @@ impl UdmSessSmContext {
 
         if let Some(sess) = context.sess_find_by_id(self.sess_id) {
             if let Some(udm_ue) = context.ue_find_by_id(sess.udm_ue_id) {
-                log::debug!(
-                    "[{}:{}] UDM Sess SM: Initial state",
-                    udm_ue.suci,
-                    sess.psi
-                );
+                log::debug!("[{}:{}] UDM Sess SM: Initial state", udm_ue.suci, sess.psi);
             }
         }
 
@@ -205,7 +201,6 @@ impl UdmSessSmContext {
         }
     }
 
-
     /// Handle SBI server events in operational state
     fn handle_sbi_server_event(&mut self, event: &mut UdmEvent, suci: &str, psi: u8) {
         let sbi = match &event.sbi {
@@ -264,11 +259,16 @@ impl UdmSessSmContext {
                     // Note: In production, parse SmfRegistrationRequest from HTTP body
                     let request = nudm_handler::SmfRegistrationRequest::default();
                     let _result = nudm_handler::udm_nudm_uecm_handle_smf_registration(
-                        self.sess_id, stream_id, &request);
+                        self.sess_id,
+                        stream_id,
+                        &request,
+                    );
                 }
                 "DELETE" => {
                     let _result = nudm_handler::udm_nudm_uecm_handle_smf_deregistration(
-                        self.sess_id, stream_id);
+                        self.sess_id,
+                        stream_id,
+                    );
                 }
                 _ => {
                     log::error!("[{suci}:{psi}] Invalid HTTP method [{method}]");
@@ -348,20 +348,20 @@ impl UdmSessSmContext {
                 let resource2 = resource_components.get(2).map(|s| s.as_str());
                 match resource2 {
                     Some("context-data") => {
-                        let resource3 = resource_components.get(3).map(|s| s.as_str()).unwrap_or("");
+                        let resource3 =
+                            resource_components.get(3).map(|s| s.as_str()).unwrap_or("");
                         // Note: HTTP method and status extracted from SBI response message headers
-                        let (_result, _registration) = nudr_handler::udm_nudr_dr_handle_smf_registration(
-                            self.sess_id,
-                            stream_id,
-                            "PUT", // HTTP method
-                            resource3,
-                            204, // HTTP status
-                        );
+                        let (_result, _registration) =
+                            nudr_handler::udm_nudr_dr_handle_smf_registration(
+                                self.sess_id,
+                                stream_id,
+                                "PUT", // HTTP method
+                                resource3,
+                                204, // HTTP status
+                            );
                     }
                     _ => {
-                        log::error!(
-                            "[{suci}:{psi}] Invalid resource name [{resource2:?}]"
-                        );
+                        log::error!("[{suci}:{psi}] Invalid resource name [{resource2:?}]");
                     }
                 }
             }

@@ -9,10 +9,9 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::context::{SmfSess, SmfBearer, SmfUe, SmfContext, Qos, IpAddr as SmfIpAddr};
+use crate::context::{IpAddr as SmfIpAddr, Qos, SmfBearer, SmfContext, SmfSess, SmfUe};
 use crate::gtp_build::{
-    Gtp2Cause, gtp2_message_type, gtp2_ie_type, gtp2_rat_type,
-    BearerQos, FTeid, Paa, pdn_type,
+    gtp2_ie_type, gtp2_message_type, gtp2_rat_type, pdn_type, BearerQos, FTeid, Gtp2Cause, Paa,
 };
 
 // ============================================================================
@@ -72,7 +71,6 @@ pub struct BearerContextToCreate {
     /// S2b U ePDG F-TEID
     pub s2b_u_epdg_f_teid: Option<FTeid>,
 }
-
 
 /// Parsed Delete Session Request
 #[derive(Debug, Clone, Default)]
@@ -203,7 +201,6 @@ pub struct FlowQos {
     pub dl_gbr: u64,
 }
 
-
 // ============================================================================
 // Handler Result Types
 // ============================================================================
@@ -232,7 +229,7 @@ pub enum ModifyBearerResult {
     /// No modification needed, send response immediately
     NoModification { sgw_relocation: bool },
     /// Modification needed, proceed with PFCP modification
-    ModificationNeeded { 
+    ModificationNeeded {
         bearers_to_modify: Vec<u64>,
         end_marker: bool,
         sgw_relocation: bool,
@@ -254,7 +251,7 @@ pub enum CreateBearerResponseResult {
 #[derive(Debug)]
 pub enum UpdateBearerResponseResult {
     /// Response accepted
-    Accepted { 
+    Accepted {
         bearer_id: u64,
         tft_update: bool,
         qos_update: bool,
@@ -288,7 +285,6 @@ pub enum BearerResourceResult {
     /// Request rejected with cause
     Rejected(Gtp2Cause),
 }
-
 
 // ============================================================================
 // Echo Handlers
@@ -417,8 +413,11 @@ pub fn handle_create_session_request(
         }
     }
 
-    log::debug!("    SGW_S5C_TEID[0x{:x}] SMF_N4_TEID[0x{:x}]",
-        sess.sgw_s5c_teid, sess.smf_n4_teid);
+    log::debug!(
+        "    SGW_S5C_TEID[0x{:x}] SMF_N4_TEID[0x{:x}]",
+        sess.sgw_s5c_teid,
+        sess.smf_n4_teid
+    );
 
     // Set AMBR
     if let Some((uplink, downlink)) = req.ambr {
@@ -434,9 +433,11 @@ pub fn handle_create_session_request(
         sess.session_qos.arp_preempt_vuln = bearer_qos.pre_emption_vulnerability;
     }
 
-    log::info!("UE IMSI[{}] APN[{}]",
+    log::info!(
+        "UE IMSI[{}] APN[{}]",
         smf_ue.imsi_bcd,
-        sess.session_name.as_deref().unwrap_or(""));
+        sess.session_name.as_deref().unwrap_or("")
+    );
 
     CreateSessionResult::Accepted
 }
@@ -456,7 +457,6 @@ fn buffer_to_bcd(buf: &[u8]) -> String {
     }
     result
 }
-
 
 // ============================================================================
 // Delete Session Request Handler
@@ -484,8 +484,11 @@ pub fn handle_delete_session_request(
         return DeleteSessionResult::Rejected(Gtp2Cause::RemotePeerNotResponding);
     }
 
-    log::debug!("    SGW_S5C_TEID[0x{:x}] SMF_N4_TEID[0x{:x}]",
-        sess.sgw_s5c_teid, sess.smf_n4_teid);
+    log::debug!(
+        "    SGW_S5C_TEID[0x{:x}] SMF_N4_TEID[0x{:x}]",
+        sess.sgw_s5c_teid,
+        sess.smf_n4_teid
+    );
 
     DeleteSessionResult::Accepted
 }
@@ -512,8 +515,11 @@ pub fn handle_modify_bearer_request(
         if let Some(addr) = f_teid.ipv6_addr {
             sess.sgw_s5c_ip.ipv6 = Some(addr);
         }
-        log::debug!("    SGW_S5C_TEID[0x{:x}] SMF_N4_TEID[0x{:x}]",
-            sess.sgw_s5c_teid, sess.smf_n4_teid);
+        log::debug!(
+            "    SGW_S5C_TEID[0x{:x}] SMF_N4_TEID[0x{:x}]",
+            sess.sgw_s5c_teid,
+            sess.smf_n4_teid
+        );
         true
     } else {
         false
@@ -530,7 +536,7 @@ pub fn handle_modify_bearer_request(
                 // Check if SGW S5U IP changed (handover)
                 let old_ip = bearer.sgw_s5u_ip.clone();
                 let new_teid = f_teid.teid;
-                
+
                 bearer.sgw_s5u_teid = new_teid;
                 if let Some(addr) = f_teid.ipv4_addr {
                     // Check if IP changed
@@ -548,8 +554,11 @@ pub fn handle_modify_bearer_request(
 
                 bearers_to_modify.push(bearer.id);
 
-                log::debug!("    SGW_S5U_TEID[0x{:x}] PGW_S5U_TEID[0x{:x}]",
-                    bearer.sgw_s5u_teid, bearer.pgw_s5u_teid);
+                log::debug!(
+                    "    SGW_S5U_TEID[0x{:x}] PGW_S5U_TEID[0x{:x}]",
+                    bearer.sgw_s5u_teid,
+                    bearer.pgw_s5u_teid
+                );
             }
         } else {
             log::error!("No Bearer Context for EBI[{}]", bc.ebi);
@@ -568,7 +577,6 @@ pub fn handle_modify_bearer_request(
     }
 }
 
-
 // ============================================================================
 // Create Bearer Response Handler
 // ============================================================================
@@ -585,7 +593,9 @@ pub fn handle_create_bearer_response(
     // Check cause
     if rsp.cause != Gtp2Cause::RequestAccepted {
         log::error!("GTP Cause [Value:{:?}]", rsp.cause);
-        return CreateBearerResponseResult::Rejected { bearer_id: bearer.id };
+        return CreateBearerResponseResult::Rejected {
+            bearer_id: bearer.id,
+        };
     }
 
     // Check bearer context
@@ -593,14 +603,18 @@ pub fn handle_create_bearer_response(
         Some(bc) => bc,
         None => {
             log::error!("No Bearer Context");
-            return CreateBearerResponseResult::Rejected { bearer_id: bearer.id };
+            return CreateBearerResponseResult::Rejected {
+                bearer_id: bearer.id,
+            };
         }
     };
 
     // Check bearer cause
     if bc.cause != Gtp2Cause::RequestAccepted {
         log::error!("GTP Bearer Cause [Value:{:?}]", bc.cause);
-        return CreateBearerResponseResult::Rejected { bearer_id: bearer.id };
+        return CreateBearerResponseResult::Rejected {
+            bearer_id: bearer.id,
+        };
     }
 
     // Get SGW S5U F-TEID
@@ -621,13 +635,20 @@ pub fn handle_create_bearer_response(
         }
     } else {
         log::error!("No SGW TEID");
-        return CreateBearerResponseResult::Rejected { bearer_id: bearer.id };
+        return CreateBearerResponseResult::Rejected {
+            bearer_id: bearer.id,
+        };
     }
 
-    log::debug!("Create Bearer Response : SGW[0x{:x}] --> SMF[0x{:x}]",
-        sess.sgw_s5c_teid, sess.smf_n4_teid);
+    log::debug!(
+        "Create Bearer Response : SGW[0x{:x}] --> SMF[0x{:x}]",
+        sess.sgw_s5c_teid,
+        sess.smf_n4_teid
+    );
 
-    CreateBearerResponseResult::Accepted { bearer_id: bearer.id }
+    CreateBearerResponseResult::Accepted {
+        bearer_id: bearer.id,
+    }
 }
 
 // ============================================================================
@@ -662,11 +683,17 @@ pub fn handle_update_bearer_response(
         return UpdateBearerResponseResult::Rejected { bearer_id };
     }
 
-    log::debug!("    SGW_S5C_TEID[0x{:x}] SMF_N4_TEID[0x{:x}]",
-        sess.sgw_s5c_teid, sess.smf_n4_teid);
+    log::debug!(
+        "    SGW_S5C_TEID[0x{:x}] SMF_N4_TEID[0x{:x}]",
+        sess.sgw_s5c_teid,
+        sess.smf_n4_teid
+    );
 
-    log::debug!("Update Bearer Response : SGW[0x{:x}] --> SMF[0x{:x}]",
-        sess.sgw_s5c_teid, sess.smf_n4_teid);
+    log::debug!(
+        "Update Bearer Response : SGW[0x{:x}] --> SMF[0x{:x}]",
+        sess.sgw_s5c_teid,
+        sess.smf_n4_teid
+    );
 
     UpdateBearerResponseResult::Accepted {
         bearer_id,
@@ -709,15 +736,20 @@ pub fn handle_delete_bearer_response(
         log::error!("No Bearer Context");
     }
 
-    log::debug!("    SGW_S5C_TEID[0x{:x}] SMF_N4_TEID[0x{:x}]",
-        sess.sgw_s5c_teid, sess.smf_n4_teid);
+    log::debug!(
+        "    SGW_S5C_TEID[0x{:x}] SMF_N4_TEID[0x{:x}]",
+        sess.sgw_s5c_teid,
+        sess.smf_n4_teid
+    );
 
-    log::debug!("Delete Bearer Response : SGW[0x{:x}] --> SMF[0x{:x}]",
-        sess.sgw_s5c_teid, sess.smf_n4_teid);
+    log::debug!(
+        "Delete Bearer Response : SGW[0x{:x}] --> SMF[0x{:x}]",
+        sess.sgw_s5c_teid,
+        sess.smf_n4_teid
+    );
 
     DeleteBearerResponseResult::DedicatedBearerDeleted { bearer_id }
 }
-
 
 // ============================================================================
 // Bearer Resource Command Handler
@@ -749,8 +781,11 @@ pub fn handle_bearer_resource_command(
         return BearerResourceResult::Rejected(Gtp2Cause::MandatoryIeMissing);
     }
 
-    log::debug!("    SGW_S5C_TEID[0x{:x}] PGW_S5C_TEID[0x{:x}]",
-        sess.sgw_s5c_teid, sess.smf_n4_teid);
+    log::debug!(
+        "    SGW_S5C_TEID[0x{:x}] PGW_S5C_TEID[0x{:x}]",
+        sess.sgw_s5c_teid,
+        sess.smf_n4_teid
+    );
 
     // Parse TAD to determine operation
     // For now, we'll use a simplified approach
@@ -826,25 +861,24 @@ impl IndicationFlags {
     /// Parse indication flags from bytes
     pub fn parse(data: &[u8]) -> Self {
         let mut flags = Self::default();
-        
+
         if !data.is_empty() {
             flags.handover_indication = (data[0] & 0x01) != 0;
             flags.direct_forwarding_indication = (data[0] & 0x02) != 0;
             flags.operation_indication = (data[0] & 0x04) != 0;
             flags.israi = (data[0] & 0x08) != 0;
         }
-        
+
         if data.len() > 1 {
             flags.sgwci = (data[1] & 0x01) != 0;
             flags.sqci = (data[1] & 0x02) != 0;
             flags.uimsi = (data[1] & 0x04) != 0;
             flags.cfsi = (data[1] & 0x08) != 0;
         }
-        
+
         flags
     }
 }
-
 
 // ============================================================================
 // Unit Tests
@@ -874,13 +908,7 @@ mod tests {
         let mut smf_ue = SmfUe::new(1);
         let req = CreateSessionRequest::default();
 
-        let result = handle_create_session_request(
-            &mut sess,
-            &mut smf_ue,
-            &req,
-            true,
-            true,
-        );
+        let result = handle_create_session_request(&mut sess, &mut smf_ue, &req, true, true);
 
         match result {
             CreateSessionResult::Rejected(cause) => {
@@ -899,13 +927,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = handle_create_session_request(
-            &mut sess,
-            &mut smf_ue,
-            &req,
-            true,
-            true,
-        );
+        let result = handle_create_session_request(&mut sess, &mut smf_ue, &req, true, true);
 
         match result {
             CreateSessionResult::Rejected(cause) => {
@@ -1058,7 +1080,11 @@ mod tests {
         let result = handle_update_bearer_response(&sess, 1, &rsp, true, false);
 
         match result {
-            UpdateBearerResponseResult::Accepted { bearer_id, tft_update, qos_update } => {
+            UpdateBearerResponseResult::Accepted {
+                bearer_id,
+                tft_update,
+                qos_update,
+            } => {
                 assert_eq!(bearer_id, 1);
                 assert!(tft_update);
                 assert!(!qos_update);
@@ -1130,7 +1156,7 @@ mod tests {
     fn test_indication_flags_parse() {
         let data = vec![0x03, 0x05];
         let flags = IndicationFlags::parse(&data);
-        
+
         assert!(flags.handover_indication);
         assert!(flags.direct_forwarding_indication);
         assert!(!flags.operation_indication);
@@ -1143,7 +1169,7 @@ mod tests {
     fn test_indication_flags_empty() {
         let data: Vec<u8> = vec![];
         let flags = IndicationFlags::parse(&data);
-        
+
         assert!(!flags.handover_indication);
         assert!(!flags.sgwci);
     }

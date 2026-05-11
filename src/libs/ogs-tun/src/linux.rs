@@ -39,11 +39,11 @@ impl Default for Ifreq {
 }
 
 /// Open a TUN/TAP device on Linux
-/// 
+///
 /// # Arguments
 /// * `ifname` - Desired interface name (e.g., "tun0"). Can be empty for auto-assignment.
 /// * `is_tap` - If true, create a TAP device (layer 2), otherwise TUN (layer 3)
-/// 
+///
 /// # Returns
 /// A `TunDevice` handle on success
 pub fn tun_open(ifname: &str, is_tap: bool) -> TunResult<TunDevice> {
@@ -61,7 +61,7 @@ pub fn tun_open(ifname: &str, is_tap: bool) -> TunResult<TunDevice> {
 
     // Prepare ifreq structure
     let mut ifr = Ifreq::default();
-    
+
     // Set flags
     let flags = IFF_NO_PI | if is_tap { IFF_TAP } else { IFF_TUN };
     ifr.ifr_flags = flags;
@@ -103,7 +103,7 @@ pub fn tun_open(ifname: &str, is_tap: bool) -> TunResult<TunDevice> {
 }
 
 /// Set IP address on a TUN interface
-/// 
+///
 /// Note: On Linux, this is typically done via netlink or ip command.
 /// This function is a placeholder that returns Ok for compatibility.
 pub fn tun_set_ip(_ifname: &str, _gw: &IpSubnet, _sub: &IpSubnet) -> TunResult<()> {

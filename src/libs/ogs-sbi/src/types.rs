@@ -477,7 +477,9 @@ impl SbiAppError {
             "REJECTED_BY_UE" => Some(Self::RejectedByUe),
             "REJECTED_DUE_VPLMN_POLICY" => Some(Self::RejectedDueVplmnPolicy),
             "HO_TAU_IN_PROGRESS" => Some(Self::HoTauInProgress),
-            "INTEGRITY_PROTECTED_MDR_NOT_ACCEPTABLE" => Some(Self::IntegrityProtectedMdrNotAcceptable),
+            "INTEGRITY_PROTECTED_MDR_NOT_ACCEPTABLE" => {
+                Some(Self::IntegrityProtectedMdrNotAcceptable)
+            }
             "EBI_EXHAUSTED" => Some(Self::EbiExhausted),
             "EBI_REJECTED_LOCAL_POLICY" => Some(Self::EbiRejectedLocalPolicy),
             "EBI_REJECTED_NO_N26" => Some(Self::EbiRejectedNoN26),
@@ -520,7 +522,10 @@ mod tests {
     #[test]
     fn test_service_type_conversion() {
         assert_eq!(SbiServiceType::NnrfNfm.to_name(), "nnrf-nfm");
-        assert_eq!(SbiServiceType::from_name("nnrf-nfm"), Some(SbiServiceType::NnrfNfm));
+        assert_eq!(
+            SbiServiceType::from_name("nnrf-nfm"),
+            Some(SbiServiceType::NnrfNfm)
+        );
         assert_eq!(SbiServiceType::from_name("invalid"), None);
     }
 
@@ -535,6 +540,9 @@ mod tests {
     #[test]
     fn test_app_error_conversion() {
         assert_eq!(SbiAppError::ContextNotFound.to_str(), "CONTEXT_NOT_FOUND");
-        assert_eq!(SbiAppError::from_str("CONTEXT_NOT_FOUND"), Some(SbiAppError::ContextNotFound));
+        assert_eq!(
+            SbiAppError::from_str("CONTEXT_NOT_FOUND"),
+            Some(SbiAppError::ContextNotFound)
+        );
     }
 }

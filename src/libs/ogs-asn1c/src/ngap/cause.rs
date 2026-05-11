@@ -2,7 +2,9 @@
 //!
 //! Cause types from NGAP-IEs (3GPP TS 38.413)
 
-use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerResult, PerError};
+use crate::per::{
+    AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerError, PerResult,
+};
 
 /// CauseRadioNetwork - Radio network layer cause values
 /// ASN.1: CauseRadioNetwork ::= ENUMERATED { ... }
@@ -58,7 +60,6 @@ pub enum CauseRadioNetwork {
     N26InterfaceNotAvailable = 45,
     ReleaseDueToPreEmption = 46,
 }
-
 
 impl CauseRadioNetwork {
     // Root enumeration has 45 values (0-44), extensible
@@ -117,7 +118,6 @@ impl AperDecode for CauseTransport {
         }
     }
 }
-
 
 /// CauseNas - NAS layer cause values
 /// ASN.1: CauseNas ::= ENUMERATED { normal-release, authentication-failure, deregister, unspecified, ... }
@@ -194,7 +194,6 @@ impl AperDecode for CauseProtocol {
         }
     }
 }
-
 
 /// CauseMisc - Miscellaneous cause values
 /// ASN.1: CauseMisc ::= ENUMERATED { ... }
@@ -276,12 +275,13 @@ impl AperEncode for Cause {
     }
 }
 
-
 impl AperDecode for Cause {
     fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
         let index = decoder.decode_choice_index(Self::NUM_ALTERNATIVES, Self::EXTENSIBLE)?;
         match index {
-            0 => Ok(Cause::RadioNetwork(CauseRadioNetwork::decode_aper(decoder)?)),
+            0 => Ok(Cause::RadioNetwork(CauseRadioNetwork::decode_aper(
+                decoder,
+            )?)),
             1 => Ok(Cause::Transport(CauseTransport::decode_aper(decoder)?)),
             2 => Ok(Cause::Nas(CauseNas::decode_aper(decoder)?)),
             3 => Ok(Cause::Protocol(CauseProtocol::decode_aper(decoder)?)),
@@ -297,35 +297,35 @@ impl AperDecode for Cause {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per::{AperEncoder, AperDecoder};
+    use crate::per::{AperDecoder, AperEncoder};
 
     #[test]
     fn test_cause_radio_network_roundtrip() {
         let cause = Cause::RadioNetwork(CauseRadioNetwork::UserInactivity);
-        
+
         let mut encoder = AperEncoder::new();
         cause.encode_aper(&mut encoder).unwrap();
         encoder.align();
-        
+
         let bytes = encoder.into_bytes();
         let mut decoder = AperDecoder::new(&bytes);
         let decoded = Cause::decode_aper(&mut decoder).unwrap();
-        
+
         assert_eq!(cause, decoded);
     }
 
     #[test]
     fn test_cause_misc_roundtrip() {
         let cause = Cause::Misc(CauseMisc::HardwareFailure);
-        
+
         let mut encoder = AperEncoder::new();
         cause.encode_aper(&mut encoder).unwrap();
         encoder.align();
-        
+
         let bytes = encoder.into_bytes();
         let mut decoder = AperDecoder::new(&bytes);
         let decoded = Cause::decode_aper(&mut decoder).unwrap();
-        
+
         assert_eq!(cause, decoded);
     }
 }

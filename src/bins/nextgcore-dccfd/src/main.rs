@@ -12,13 +12,10 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ogs_sbi::context::global_context;
 use ogs_sbi::client::SbiClient;
+use ogs_sbi::context::global_context;
 use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::server::{
-    send_method_not_allowed, send_not_found,
-    SbiServer, SbiServerConfig,
-};
+use ogs_sbi::server::{send_method_not_allowed, send_not_found, SbiServer, SbiServerConfig};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -100,7 +97,7 @@ async fn dccf_request_handler(req: SbiRequest) -> SbiResponse {
     let uri = &req.header.uri;
     let path = uri.split('?').next().unwrap_or(uri);
 
-    log::debug!("DCCF SBI: {} {}", method, path);
+    log::debug!("DCCF SBI: {method} {path}");
 
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
@@ -108,10 +105,7 @@ async fn dccf_request_handler(req: SbiRequest) -> SbiResponse {
         // ----------------------------------------------------------------
         // Health check
         // ----------------------------------------------------------------
-        ["healthz"] => {
-            SbiResponse::ok()
-                .with_body(r#"{"status":"ok"}"#, "application/json")
-        }
+        ["healthz"] => SbiResponse::ok().with_body(r#"{"status":"ok"}"#, "application/json"),
 
         // ----------------------------------------------------------------
         // Ndccf_DataManagement (TS 29.574 §5.2)
@@ -122,13 +116,22 @@ async fn dccf_request_handler(req: SbiRequest) -> SbiResponse {
             "POST" => {
                 let sub_id = uuid::Uuid::new_v4().to_string();
                 // Extract notifyUri from the request body if present (TS 29.574 §5.2)
-                let notify_uri = req.http.content.as_deref()
+                let notify_uri = req
+                    .http
+                    .content
+                    .as_deref()
                     .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
-                    .and_then(|v| v.get("notifyUri").and_then(|u| u.as_str()).map(|s| s.to_string()))
+                    .and_then(|v| {
+                        v.get("notifyUri")
+                            .and_then(|u| u.as_str())
+                            .map(|s| s.to_string())
+                    })
                     .unwrap_or_default();
-                log::info!("[DCCF] DataManagement subscription created sub_id={} notify_uri={}", sub_id, notify_uri);
+                log::info!(
+                    "[DCCF] DataManagement subscription created sub_id={sub_id} notify_uri={notify_uri}"
+                );
                 dccf_context_add_subscription_with_uri(sub_id.clone(), notify_uri);
-                let body = format!(r#"{{"subscriptionId":"{}","status":"ACTIVE"}}"#, sub_id);
+                let body = format!(r#"{{"subscriptionId":"{sub_id}","status":"ACTIVE"}}"#);
                 SbiResponse::created().with_body(body, "application/json")
             }
             _ => send_method_not_allowed(method, "subscriptions"),
@@ -138,7 +141,7 @@ async fn dccf_request_handler(req: SbiRequest) -> SbiResponse {
         ["ndccf-datamanagement", "v1", "subscriptions", sub_id] => match method {
             "GET" => {
                 if dccf_context_has_subscription(sub_id) {
-                    let body = format!(r#"{{"subscriptionId":"{}","status":"ACTIVE"}}"#, sub_id);
+                    let body = format!(r#"{{"subscriptionId":"{sub_id}","status":"ACTIVE"}}"#);
                     SbiResponse::ok().with_body(body, "application/json")
                 } else {
                     send_not_found("subscription not found", None)
@@ -146,7 +149,7 @@ async fn dccf_request_handler(req: SbiRequest) -> SbiResponse {
             }
             "DELETE" => {
                 if dccf_context_remove_subscription(sub_id) {
-                    log::info!("[DCCF] DataManagement subscription deleted sub_id={}", sub_id);
+                    log::info!("[DCCF] DataManagement subscription deleted sub_id={sub_id}");
                     SbiResponse::no_content()
                 } else {
                     send_not_found("subscription not found", None)
@@ -170,24 +173,26 @@ async fn dccf_request_handler(req: SbiRequest) -> SbiResponse {
                             .trim_start_matches("https://")
                             .trim_start_matches("http://");
                         // Strip host:port prefix to get the path component
-                        let path_only = path
-                            .find('/')
-                            .map(|i| &path[i..])
-                            .unwrap_or("/");
+                        let path_only = path.find('/').map(|i| &path[i..]).unwrap_or("/");
                         let path_owned = path_only.to_string();
                         let client = SbiClient::with_host_port(&host, port);
                         tokio::spawn(async move {
-                            match client.post_json(&path_owned, &serde_json::json!({"data": body_clone})).await {
+                            match client
+                                .post_json(&path_owned, &serde_json::json!({"data": body_clone}))
+                                .await
+                            {
                                 Ok(resp) => log::debug!(
-                                    "[DCCF] fanout POST {} -> status={}", sub_id, resp.status
+                                    "[DCCF] fanout POST {} -> status={}",
+                                    sub_id,
+                                    resp.status
                                 ),
-                                Err(e) => log::warn!(
-                                    "[DCCF] fanout POST {} failed: {}", sub_id, e
-                                ),
+                                Err(e) => log::warn!("[DCCF] fanout POST {sub_id} failed: {e}"),
                             }
                         });
                     } else {
-                        log::warn!("[DCCF] subscriber {} has unparseable notify_uri: {}", sub_id, notify_uri);
+                        log::warn!(
+                            "[DCCF] subscriber {sub_id} has unparseable notify_uri: {notify_uri}"
+                        );
                     }
                 }
                 SbiResponse::no_content()
@@ -203,9 +208,9 @@ async fn dccf_request_handler(req: SbiRequest) -> SbiResponse {
         ["ndccf-contextdocument", "v1", "contexts"] => match method {
             "POST" => {
                 let ctx_id = uuid::Uuid::new_v4().to_string();
-                log::info!("[DCCF] ContextDocument context created ctx_id={}", ctx_id);
+                log::info!("[DCCF] ContextDocument context created ctx_id={ctx_id}");
                 dccf_context_add_analytics_context(ctx_id.clone());
-                let body = format!(r#"{{"contextId":"{}"}}"#, ctx_id);
+                let body = format!(r#"{{"contextId":"{ctx_id}"}}"#);
                 SbiResponse::created().with_body(body, "application/json")
             }
             _ => send_method_not_allowed(method, "contexts"),
@@ -215,7 +220,7 @@ async fn dccf_request_handler(req: SbiRequest) -> SbiResponse {
         ["ndccf-contextdocument", "v1", "contexts", ctx_id] => match method {
             "GET" => {
                 if dccf_context_has_analytics_context(ctx_id) {
-                    let body = format!(r#"{{"contextId":"{}"}}"#, ctx_id);
+                    let body = format!(r#"{{"contextId":"{ctx_id}"}}"#);
                     SbiResponse::ok().with_body(body, "application/json")
                 } else {
                     send_not_found("context not found", None)
@@ -241,11 +246,10 @@ async fn main() -> Result<()> {
     init_logging(&args.log_level);
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
-            .with_endpoint(
-                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
-            ),
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+        ),
     )
     .ok();
 
@@ -262,7 +266,7 @@ async fn main() -> Result<()> {
     let bind_addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
         .parse()
         .context("Invalid SBI bind address")?;
-    log::info!("DCCF SBI listening on {}", bind_addr);
+    log::info!("DCCF SBI listening on {bind_addr}");
 
     let mut sbi_config = SbiServerConfig::new(bind_addr);
     if args.tls {
@@ -304,7 +308,11 @@ async fn main() -> Result<()> {
 }
 
 /// Register DCCF with NRF
-async fn register_with_nrf(sbi_addr: &str, sbi_port: u16, nf_instance_id: &str) -> Result<(), String> {
+async fn register_with_nrf(
+    sbi_addr: &str,
+    sbi_port: u16,
+    nf_instance_id: &str,
+) -> Result<(), String> {
     let sbi_ctx = global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
@@ -350,10 +358,8 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16, nf_instance_id: &str) 
         200 | 201 => {
             log::info!("DCCF registered with NRF successfully (id={nf_instance_id})");
 
-            let mut self_instance = ogs_sbi::context::NfInstance::new(
-                nf_instance_id,
-                ogs_sbi::types::NfType::Dccf,
-            );
+            let mut self_instance =
+                ogs_sbi::context::NfInstance::new(nf_instance_id, ogs_sbi::types::NfType::Dccf);
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
             let mut svc = ogs_sbi::context::NfService::new(
                 "ndccf-datamanagement",
@@ -366,7 +372,10 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16, nf_instance_id: &str) 
 
             Ok(())
         }
-        _ => Err(format!("NRF registration returned status {}", response.status)),
+        _ => Err(format!(
+            "NRF registration returned status {}",
+            response.status
+        )),
     }
 }
 
@@ -376,7 +385,9 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
         .strip_prefix("https://")
         .or_else(|| uri.strip_prefix("http://"))
         .unwrap_or(uri);
-    let (host_port, _path) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    let (host_port, _path) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
     if let Some((host, port_str)) = host_port.rsplit_once(':') {
         let port: u16 = port_str.parse().ok()?;
         Some((host.to_string(), port))

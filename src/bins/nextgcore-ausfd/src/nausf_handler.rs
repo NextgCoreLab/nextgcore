@@ -48,10 +48,7 @@ pub fn ausf_nausf_auth_handle_authenticate(ausf_ue_id: u64, stream_id: u64) -> b
 /// Handle NAUSF authentication confirmation (PUT /ue-authentications/{authCtxId}/5g-aka-confirmation)
 ///
 /// Port of ausf_nausf_auth_handle_authenticate_confirmation()
-pub fn ausf_nausf_auth_handle_authenticate_confirmation(
-    ausf_ue_id: u64,
-    stream_id: u64,
-) -> bool {
+pub fn ausf_nausf_auth_handle_authenticate_confirmation(ausf_ue_id: u64, stream_id: u64) -> bool {
     let ctx = ausf_self();
     let context = ctx.write().unwrap();
 
@@ -81,13 +78,23 @@ pub fn ausf_nausf_auth_handle_authenticate_confirmation(
             // Compare HRES* with stored HXRES*
             if compare_res_star(&hres_star, &ausf_ue.hxres_star) {
                 ausf_ue.auth_result = crate::context::AuthResult::AuthenticationSuccess;
-                log::info!("[{}] 5G-AKA authentication succeeded (HRES* matches HXRES*)", ausf_ue.suci);
+                log::info!(
+                    "[{}] 5G-AKA authentication succeeded (HRES* matches HXRES*)",
+                    ausf_ue.suci
+                );
             } else {
                 ausf_ue.auth_result = crate::context::AuthResult::AuthenticationFailure;
-                log::warn!("[{}] 5G-AKA authentication failed (HRES* mismatch)", ausf_ue.suci);
+                log::warn!(
+                    "[{}] 5G-AKA authentication failed (HRES* mismatch)",
+                    ausf_ue.suci
+                );
             }
         } else {
-            log::error!("[{}] Invalid RES* length: {}", ausf_ue.suci, res_star_bytes.len());
+            log::error!(
+                "[{}] Invalid RES* length: {}",
+                ausf_ue.suci,
+                res_star_bytes.len()
+            );
             ausf_ue.auth_result = crate::context::AuthResult::AuthenticationFailure;
         }
     } else {
@@ -185,16 +192,26 @@ mod tests {
         .is_ok());
 
         // Missing supi_or_suci
-        assert!(validate_authentication_info(None, Some("5G:mnc001.mcc001.3gppnetwork.org")).is_err());
+        assert!(
+            validate_authentication_info(None, Some("5G:mnc001.mcc001.3gppnetwork.org")).is_err()
+        );
 
         // Empty supi_or_suci
-        assert!(validate_authentication_info(Some(""), Some("5G:mnc001.mcc001.3gppnetwork.org")).is_err());
+        assert!(
+            validate_authentication_info(Some(""), Some("5G:mnc001.mcc001.3gppnetwork.org"))
+                .is_err()
+        );
 
         // Missing serving_network_name
-        assert!(validate_authentication_info(Some("suci-0-001-01-0000-0-0-0000000001"), None).is_err());
+        assert!(
+            validate_authentication_info(Some("suci-0-001-01-0000-0-0-0000000001"), None).is_err()
+        );
 
         // Empty serving_network_name
-        assert!(validate_authentication_info(Some("suci-0-001-01-0000-0-0-0000000001"), Some("")).is_err());
+        assert!(
+            validate_authentication_info(Some("suci-0-001-01-0000-0-0-0000000001"), Some(""))
+                .is_err()
+        );
     }
 
     #[test]

@@ -108,12 +108,13 @@ pub fn handle_uar(
 
     // 1. Check if user exists in DB
     let supi = format!("imsi-{}", user_name.trim_start_matches("imsi-"));
-    let _ims_data = ogs_dbi_ims_data(&supi)
-        .map_err(|e| format!("Failed to get IMS data: {e}"))?;
+    let _ims_data = ogs_dbi_ims_data(&supi).map_err(|e| format!("Failed to get IMS data: {e}"))?;
 
     // 2. Associate identity if needed
     let ctx = hss_self();
-    let context = ctx.read().map_err(|_| "Failed to lock context".to_string())?;
+    let context = ctx
+        .read()
+        .map_err(|_| "Failed to lock context".to_string())?;
     context.cx_associate_identity(user_name, public_identity);
 
     // 3. Return UAA with server capabilities or assigned S-CSCF
@@ -124,7 +125,7 @@ pub fn handle_uar(
     // Return default server capabilities (no scscf_name field in OgsImsData)
     response.server_capabilities = Some(ServerCapabilities {
         mandatory_capability: vec![0], // No mandatory capabilities
-        optional_capability: vec![0],   // No optional capabilities
+        optional_capability: vec![0],  // No optional capabilities
         server_name: vec!["sip:scscf.ims.mnc001.mcc001.3gppnetwork.org".to_string()],
     });
 
@@ -146,13 +147,13 @@ pub fn handle_mar(
     log::debug!("[{user_name}] Handling MAR for {public_identity} (scheme={sip_auth_scheme})");
     diam_stats().cx.inc_rx_mar();
 
-    use ogs_dbi::ogs_dbi_auth_info;
     use ogs_crypt::milenage::{milenage_f1, milenage_f2345, milenage_opc};
+    use ogs_dbi::ogs_dbi_auth_info;
 
     // 1. Get auth info from DB
     let supi = format!("imsi-{}", user_name.trim_start_matches("imsi-"));
-    let auth_info = ogs_dbi_auth_info(&supi)
-        .map_err(|e| format!("Failed to get auth info: {e}"))?;
+    let auth_info =
+        ogs_dbi_auth_info(&supi).map_err(|e| format!("Failed to get auth info: {e}"))?;
 
     // 2. Generate SIP authentication vectors (AKA or Digest)
     let rand = auth_info.rand;
@@ -231,7 +232,9 @@ pub fn handle_sar(
 
     // 1. Update server assignment in context
     let ctx = hss_self();
-    let context = ctx.read().map_err(|_| "Failed to lock context".to_string())?;
+    let context = ctx
+        .read()
+        .map_err(|_| "Failed to lock context".to_string())?;
 
     context.cx_associate_identity(user_name, public_identity);
     context.cx_set_server_name(public_identity, server_name, true);
@@ -244,8 +247,8 @@ pub fn handle_sar(
         ServerAssignmentType::Registration | ServerAssignmentType::ReRegistration => {
             // Get IMS user data from DB
             let supi = format!("imsi-{}", user_name.trim_start_matches("imsi-"));
-            let _ims_data = ogs_dbi_ims_data(&supi)
-                .map_err(|e| format!("Failed to get IMS data: {e}"))?;
+            let _ims_data =
+                ogs_dbi_ims_data(&supi).map_err(|e| format!("Failed to get IMS data: {e}"))?;
 
             // 3. Return SAA with User-Data (XML)
             // Note: In full implementation, this would build IMS user profile XML
@@ -271,15 +274,21 @@ pub fn handle_sar(
 
             // Include charging information
             response.charging_information = Some(ChargingInformation {
-                primary_event_charging_function_name: Some("pcf.ims.mnc001.mcc001.3gppnetwork.org".to_string()),
+                primary_event_charging_function_name: Some(
+                    "pcf.ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+                ),
                 secondary_event_charging_function_name: None,
-                primary_charging_collection_function_name: Some("ccf.ims.mnc001.mcc001.3gppnetwork.org".to_string()),
+                primary_charging_collection_function_name: Some(
+                    "ccf.ims.mnc001.mcc001.3gppnetwork.org".to_string(),
+                ),
                 secondary_charging_collection_function_name: None,
             });
         }
         _ => {
             // Deregistration or other types - no user data
-            log::debug!("[{user_name}] SAR type {server_assignment_type:?} - no user data returned");
+            log::debug!(
+                "[{user_name}] SAR type {server_assignment_type:?} - no user data returned"
+            );
         }
     }
 
@@ -299,7 +308,9 @@ pub fn handle_lir(public_identity: &str) -> Result<LirResponse, String> {
 
     // 1. Look up server name for public identity
     let ctx = hss_self();
-    let context = ctx.read().map_err(|_| "Failed to lock context".to_string())?;
+    let context = ctx
+        .read()
+        .map_err(|_| "Failed to lock context".to_string())?;
 
     let mut response = LirResponse::default();
     response.result_code = 2001; // DIAMETER_SUCCESS
@@ -313,7 +324,7 @@ pub fn handle_lir(public_identity: &str) -> Result<LirResponse, String> {
         // User not registered - return server capabilities for selection
         response.server_capabilities = Some(ServerCapabilities {
             mandatory_capability: vec![0], // No mandatory capabilities
-            optional_capability: vec![0],   // No optional capabilities
+            optional_capability: vec![0],  // No optional capabilities
             server_name: vec![
                 "sip:scscf1.ims.mnc001.mcc001.3gppnetwork.org".to_string(),
                 "sip:scscf2.ims.mnc001.mcc001.3gppnetwork.org".to_string(),
@@ -424,15 +435,30 @@ mod tests {
 
     #[test]
     fn test_server_assignment_type_from_u32() {
-        assert_eq!(ServerAssignmentType::from(1), ServerAssignmentType::Registration);
-        assert_eq!(ServerAssignmentType::from(5), ServerAssignmentType::UserDeregistration);
-        assert_eq!(ServerAssignmentType::from(99), ServerAssignmentType::NoAssignment);
+        assert_eq!(
+            ServerAssignmentType::from(1),
+            ServerAssignmentType::Registration
+        );
+        assert_eq!(
+            ServerAssignmentType::from(5),
+            ServerAssignmentType::UserDeregistration
+        );
+        assert_eq!(
+            ServerAssignmentType::from(99),
+            ServerAssignmentType::NoAssignment
+        );
     }
 
     #[test]
     fn test_user_authorization_type_from_u32() {
-        assert_eq!(UserAuthorizationType::from(0), UserAuthorizationType::Registration);
-        assert_eq!(UserAuthorizationType::from(1), UserAuthorizationType::DeRegistration);
+        assert_eq!(
+            UserAuthorizationType::from(0),
+            UserAuthorizationType::Registration
+        );
+        assert_eq!(
+            UserAuthorizationType::from(1),
+            UserAuthorizationType::DeRegistration
+        );
     }
 
     #[test]

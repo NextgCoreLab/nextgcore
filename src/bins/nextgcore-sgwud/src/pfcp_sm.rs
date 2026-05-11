@@ -150,16 +150,17 @@ impl PfcpStateMachine {
         match event.id {
             SgwuEventId::FsmEntry => {
                 // Create no heartbeat timer
-                log::debug!("PFCP FSM: Creating no heartbeat timer for node {}", self.node.id);
-                
+                log::debug!(
+                    "PFCP FSM: Creating no heartbeat timer for node {}",
+                    self.node.id
+                );
+
                 // Transition to will_associate state
                 self.state = PfcpState::WillAssociate;
                 log::debug!("PFCP FSM: Initial -> WillAssociate");
                 PfcpSmResult::StateChanged(PfcpState::WillAssociate)
             }
-            SgwuEventId::FsmExit => {
-                PfcpSmResult::Ok
-            }
+            SgwuEventId::FsmExit => PfcpSmResult::Ok,
             _ => {
                 log::warn!("Unexpected event {} in PFCP initial state", event.name());
                 PfcpSmResult::Ok
@@ -173,12 +174,13 @@ impl PfcpStateMachine {
         match event.id {
             SgwuEventId::FsmEntry => {
                 // Delete no heartbeat timer
-                log::debug!("PFCP FSM: Deleting no heartbeat timer for node {}", self.node.id);
+                log::debug!(
+                    "PFCP FSM: Deleting no heartbeat timer for node {}",
+                    self.node.id
+                );
                 PfcpSmResult::Ok
             }
-            SgwuEventId::FsmExit => {
-                PfcpSmResult::Ok
-            }
+            SgwuEventId::FsmExit => PfcpSmResult::Ok,
             _ => {
                 log::warn!("Unexpected event {} in PFCP final state", event.name());
                 PfcpSmResult::Ok
@@ -221,9 +223,7 @@ impl PfcpStateMachine {
                 }
                 PfcpSmResult::Ok
             }
-            SgwuEventId::SxaMessage => {
-                self.handle_will_associate_message(event)
-            }
+            SgwuEventId::SxaMessage => self.handle_will_associate_message(event),
             _ => {
                 log::error!("Unknown event {} in will_associate state", event.name());
                 PfcpSmResult::Ok
@@ -259,7 +259,9 @@ impl PfcpStateMachine {
                             return PfcpSmResult::StateChanged(PfcpState::Associated);
                         }
                         _ => {
-                            log::warn!("Cannot handle PFCP message type {msg_type} in will_associate");
+                            log::warn!(
+                                "Cannot handle PFCP message type {msg_type} in will_associate"
+                            );
                         }
                     }
                 }
@@ -276,13 +278,13 @@ impl PfcpStateMachine {
                 log::info!("PFCP associated {}", self.node.addr);
                 // Start no heartbeat timer and send heartbeat request
                 log::debug!("PFCP FSM: Starting no heartbeat timer");
-                
+
                 if self.node.restoration_required {
                     self.pfcp_restoration();
                     self.node.restoration_required = false;
                     log::error!("PFCP restoration");
                 }
-                
+
                 PfcpSmResult::SendHeartbeatRequest
             }
             SgwuEventId::FsmExit => {
@@ -291,9 +293,7 @@ impl PfcpStateMachine {
                 log::debug!("PFCP FSM: Stopping no heartbeat timer");
                 PfcpSmResult::Ok
             }
-            SgwuEventId::SxaMessage => {
-                self.handle_associated_message(event)
-            }
+            SgwuEventId::SxaMessage => self.handle_associated_message(event),
             SgwuEventId::SxaTimer => {
                 if let Some(timer_id) = event.timer_id {
                     match timer_id {
@@ -390,9 +390,7 @@ impl PfcpStateMachine {
     /// Port of sgwu_pfcp_state_exception from pfcp-sm.c
     fn state_exception(&mut self, event: &SgwuEvent) -> PfcpSmResult {
         match event.id {
-            SgwuEventId::FsmEntry | SgwuEventId::FsmExit => {
-                PfcpSmResult::Ok
-            }
+            SgwuEventId::FsmEntry | SgwuEventId::FsmExit => PfcpSmResult::Ok,
             _ => {
                 log::error!("Unknown event {} in exception state", event.name());
                 PfcpSmResult::Ok
@@ -500,16 +498,14 @@ mod tests {
     #[test]
     fn test_pfcp_sm_association() {
         let mut sm = PfcpStateMachine::new(1);
-        
+
         // Transition to will_associate
         sm.dispatch(&SgwuEvent::entry());
         assert!(sm.is_will_associate());
 
         // Simulate association setup response
-        let event = SgwuEvent::sxa_message(
-            1, 1, 
-            vec![pfcp_message_type::ASSOCIATION_SETUP_RESPONSE]
-        );
+        let event =
+            SgwuEvent::sxa_message(1, 1, vec![pfcp_message_type::ASSOCIATION_SETUP_RESPONSE]);
         let result = sm.dispatch(&event);
         assert_eq!(result, PfcpSmResult::StateChanged(PfcpState::Associated));
         assert!(sm.is_associated());
@@ -518,13 +514,11 @@ mod tests {
     #[test]
     fn test_pfcp_sm_no_heartbeat() {
         let mut sm = PfcpStateMachine::new(1);
-        
+
         // Transition to associated
         sm.dispatch(&SgwuEvent::entry());
-        let event = SgwuEvent::sxa_message(
-            1, 1, 
-            vec![pfcp_message_type::ASSOCIATION_SETUP_RESPONSE]
-        );
+        let event =
+            SgwuEvent::sxa_message(1, 1, vec![pfcp_message_type::ASSOCIATION_SETUP_RESPONSE]);
         sm.dispatch(&event);
         assert!(sm.is_associated());
 
@@ -538,37 +532,28 @@ mod tests {
     #[test]
     fn test_pfcp_sm_session_messages() {
         let mut sm = PfcpStateMachine::new(1);
-        
+
         // Transition to associated
         sm.dispatch(&SgwuEvent::entry());
-        let event = SgwuEvent::sxa_message(
-            1, 1, 
-            vec![pfcp_message_type::ASSOCIATION_SETUP_RESPONSE]
-        );
+        let event =
+            SgwuEvent::sxa_message(1, 1, vec![pfcp_message_type::ASSOCIATION_SETUP_RESPONSE]);
         sm.dispatch(&event);
         assert!(sm.is_associated());
 
         // Test session establishment
-        let event = SgwuEvent::sxa_message(
-            1, 2, 
-            vec![pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST]
-        );
+        let event =
+            SgwuEvent::sxa_message(1, 2, vec![pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST]);
         let result = sm.dispatch(&event);
         assert_eq!(result, PfcpSmResult::HandleSessionEstablishment);
 
         // Test session modification
-        let event = SgwuEvent::sxa_message(
-            1, 3, 
-            vec![pfcp_message_type::SESSION_MODIFICATION_REQUEST]
-        );
+        let event =
+            SgwuEvent::sxa_message(1, 3, vec![pfcp_message_type::SESSION_MODIFICATION_REQUEST]);
         let result = sm.dispatch(&event);
         assert_eq!(result, PfcpSmResult::HandleSessionModification);
 
         // Test session deletion
-        let event = SgwuEvent::sxa_message(
-            1, 4, 
-            vec![pfcp_message_type::SESSION_DELETION_REQUEST]
-        );
+        let event = SgwuEvent::sxa_message(1, 4, vec![pfcp_message_type::SESSION_DELETION_REQUEST]);
         let result = sm.dispatch(&event);
         assert_eq!(result, PfcpSmResult::HandleSessionDeletion);
     }
@@ -576,20 +561,15 @@ mod tests {
     #[test]
     fn test_pfcp_sm_heartbeat() {
         let mut sm = PfcpStateMachine::new(1);
-        
+
         // Transition to associated
         sm.dispatch(&SgwuEvent::entry());
-        let event = SgwuEvent::sxa_message(
-            1, 1, 
-            vec![pfcp_message_type::ASSOCIATION_SETUP_RESPONSE]
-        );
+        let event =
+            SgwuEvent::sxa_message(1, 1, vec![pfcp_message_type::ASSOCIATION_SETUP_RESPONSE]);
         sm.dispatch(&event);
 
         // Heartbeat request should return response action
-        let event = SgwuEvent::sxa_message(
-            1, 5, 
-            vec![pfcp_message_type::HEARTBEAT_REQUEST]
-        );
+        let event = SgwuEvent::sxa_message(1, 5, vec![pfcp_message_type::HEARTBEAT_REQUEST]);
         let result = sm.dispatch(&event);
         assert_eq!(result, PfcpSmResult::SendHeartbeatResponse);
 

@@ -30,7 +30,10 @@ fn uint24_strategy() -> impl Strategy<Value = OgsUint24> {
 
 // Strategy for generating S-NSSAI values
 fn s_nssai_strategy() -> impl Strategy<Value = OgsSNssai> {
-    (any::<u8>(), prop_oneof![Just(None), uint24_strategy().prop_map(Some)])
+    (
+        any::<u8>(),
+        prop_oneof![Just(None), uint24_strategy().prop_map(Some)],
+    )
         .prop_map(|(sst, sd)| OgsSNssai::new(sst, sd.map(|s| s.v)))
 }
 
@@ -41,25 +44,25 @@ fn ambr_strategy() -> impl Strategy<Value = OgsAmbr> {
 
 // Strategy for generating ARP values
 fn arp_strategy() -> impl Strategy<Value = OgsArp> {
-    (1u8..=15, 0u8..=1, 0u8..=1).prop_map(|(priority_level, pre_emption_capability, pre_emption_vulnerability)| {
-        OgsArp {
+    (1u8..=15, 0u8..=1, 0u8..=1).prop_map(
+        |(priority_level, pre_emption_capability, pre_emption_vulnerability)| OgsArp {
             priority_level,
             pre_emption_capability,
             pre_emption_vulnerability,
-        }
-    })
+        },
+    )
 }
 
 // Strategy for generating QoS values
 fn qos_strategy() -> impl Strategy<Value = OgsQos> {
-    (1u8..=9, arp_strategy(), ambr_strategy(), ambr_strategy()).prop_map(|(index, arp, mbr, gbr)| {
-        OgsQos {
+    (1u8..=9, arp_strategy(), ambr_strategy(), ambr_strategy()).prop_map(
+        |(index, arp, mbr, gbr)| OgsQos {
             index,
             arp,
             mbr,
             gbr,
-        }
-    })
+        },
+    )
 }
 
 proptest! {

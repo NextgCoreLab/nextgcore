@@ -61,13 +61,9 @@ pub fn sepp_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
         return Err("SBI server already running".to_string());
     }
 
-    let config = config.unwrap_or(SbiServerConfig::default());
+    let config = config.unwrap_or_default();
 
-    log::info!(
-        "Opening SEPP SBI server on {}:{}",
-        config.addr,
-        config.port
-    );
+    log::info!("Opening SEPP SBI server on {}:{}", config.addr, config.port);
 
     // Note: Initialize SELF NF instance
     // Handled by context initialization via sepp_context_init which sets up NF instance
@@ -138,7 +134,14 @@ fn n32f_clients() -> &'static RwLock<HashMap<u64, N32fPeerClient>> {
 
 /// Register an N32f client for a peer SEPP node
 #[allow(dead_code)]
-pub fn register_n32f_client(node_id: u64, receiver: &str, host: &str, port: u16, tls: bool, scheme: SecurityCapability) {
+pub fn register_n32f_client(
+    node_id: u64,
+    receiver: &str,
+    host: &str,
+    port: u16,
+    tls: bool,
+    scheme: SecurityCapability,
+) {
     let client = N32fPeerClient {
         receiver: receiver.to_string(),
         host: host.to_string(),
@@ -190,23 +193,14 @@ fn build_n32f_headers(
     // Add N32f security context headers based on negotiated scheme
     match client.security_scheme {
         SecurityCapability::Tls => {
-            forwarded_headers.insert(
-                "3gpp-sbi-n32f-security".to_string(),
-                "TLS".to_string(),
-            );
+            forwarded_headers.insert("3gpp-sbi-n32f-security".to_string(), "TLS".to_string());
         }
         SecurityCapability::Prins => {
-            forwarded_headers.insert(
-                "3gpp-sbi-n32f-security".to_string(),
-                "PRINS".to_string(),
-            );
+            forwarded_headers.insert("3gpp-sbi-n32f-security".to_string(), "PRINS".to_string());
             log::debug!("PRINS security mode for node {node_id}");
         }
         SecurityCapability::None | SecurityCapability::Null => {
-            forwarded_headers.insert(
-                "3gpp-sbi-n32f-security".to_string(),
-                "NONE".to_string(),
-            );
+            forwarded_headers.insert("3gpp-sbi-n32f-security".to_string(), "NONE".to_string());
         }
     }
 
@@ -214,10 +208,7 @@ fn build_n32f_headers(
     let ctx = sepp_self();
     if let Ok(context) = ctx.read() {
         if let Some(ref sender) = context.sender {
-            forwarded_headers.insert(
-                "3gpp-sbi-sender-sepp".to_string(),
-                sender.clone(),
-            );
+            forwarded_headers.insert("3gpp-sbi-sender-sepp".to_string(), sender.clone());
         }
     }
 
@@ -245,9 +236,9 @@ pub fn forward_n32f_request(
     target_apiroot: &str,
 ) -> Result<N32fForwardResult, String> {
     let clients = n32f_clients().read().unwrap();
-    let client = clients.get(&node_id).ok_or_else(|| {
-        format!("No N32f client for node {node_id}")
-    })?;
+    let client = clients
+        .get(&node_id)
+        .ok_or_else(|| format!("No N32f client for node {node_id}"))?;
 
     let forwarded_headers = build_n32f_headers(client, request, target_apiroot, node_id);
 
@@ -258,7 +249,8 @@ pub fn forward_n32f_request(
     );
 
     // Build the N32f message envelope per TS 29.573
-    let header_pairs: Vec<(String, String)> = forwarded_headers.iter()
+    let header_pairs: Vec<(String, String)> = forwarded_headers
+        .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
@@ -289,7 +281,10 @@ pub fn forward_n32f_request(
 
     log::info!(
         "N32f forwarding: {} {} -> {} [security={:?}, body={}B]",
-        request.method, request.uri, forward_uri, client.security_scheme,
+        request.method,
+        request.uri,
+        forward_uri,
+        client.security_scheme,
         n32f_body.as_ref().map(|b| b.len()).unwrap_or(0)
     );
 
@@ -355,19 +350,22 @@ pub async fn forward_n32f_request_async(
     // Build the forwarding context synchronously
     let (host, port, tls_enabled, security_scheme) = {
         let clients = n32f_clients().read().unwrap();
-        let client = clients.get(&node_id).ok_or_else(|| {
-            format!("No N32f client for node {node_id}")
-        })?;
-        (client.host.clone(), client.port, client.tls_enabled, client.security_scheme)
+        let client = clients
+            .get(&node_id)
+            .ok_or_else(|| format!("No N32f client for node {node_id}"))?;
+        (
+            client.host.clone(),
+            client.port,
+            client.tls_enabled,
+            client.security_scheme,
+        )
     };
 
     let forward_result = forward_n32f_request(node_id, request, target_apiroot)?;
 
     // Build the SBI request for the peer SEPP's N32f endpoint
     let scheme = if tls_enabled { "https" } else { "http" };
-    let forward_uri = format!(
-        "{scheme}://{host}:{port}/n32f-forward/v1/n32f-process"
-    );
+    let forward_uri = format!("{scheme}://{host}:{port}/n32f-forward/v1/n32f-process");
 
     let sbi_config = ogs_sbi::client::SbiClientConfig::new(&host, port);
     let sbi_client = ogs_sbi::client::SbiClient::new(sbi_config);
@@ -383,13 +381,13 @@ pub async fn forward_n32f_request_async(
     if let Some(body) = &forward_result.body {
         if let Ok(body_str) = String::from_utf8(body.clone()) {
             sbi_request.http.set_content(body_str);
-            sbi_request.http.set_header("Content-Type", "application/json");
+            sbi_request
+                .http
+                .set_header("Content-Type", "application/json");
         }
     }
 
-    log::info!(
-        "N32f async forward: POST {forward_uri} [security={security_scheme:?}]"
-    );
+    log::info!("N32f async forward: POST {forward_uri} [security={security_scheme:?}]");
 
     match sbi_client.send_request(sbi_request).await {
         Ok(response) => {
@@ -536,9 +534,7 @@ fn handle_forwarding_request(
     if is_vplmn {
         // Request from local NF to remote PLMN - forward via peer SEPP
         if server_interface.is_some() {
-            log::error!(
-                "[DROP] Peer SEPP is using the wrong interface [{server_interface:?}]"
-            );
+            log::error!("[DROP] Peer SEPP is using the wrong interface [{server_interface:?}]");
             remove_assoc(assoc.id);
             return RequestHandlerResult::Error("Wrong interface".to_string());
         }
@@ -567,7 +563,9 @@ fn handle_forwarding_request(
                     Ok(result) => {
                         log::info!(
                             "N32f forward prepared for node {} ({}), {} headers",
-                            node.id, node.receiver, result.headers.len()
+                            node.id,
+                            node.receiver,
+                            result.headers.len()
                         );
                         RequestHandlerResult::ForwardedToPeerSepp
                     }
@@ -580,9 +578,7 @@ fn handle_forwarding_request(
                 }
             }
             None => {
-                log::error!(
-                    "Cannot find SEPP Peer Node for [{target_apiroot}:{mcc}:{mnc}]"
-                );
+                log::error!("Cannot find SEPP Peer Node for [{target_apiroot}:{mcc}:{mnc}]");
                 remove_assoc(assoc.id);
                 RequestHandlerResult::Error("Peer SEPP not found".to_string())
             }
@@ -611,9 +607,7 @@ fn handle_local_request(
     // Check interface
     if let Some(interface) = server_interface {
         if interface == interfaces::N32F {
-            log::error!(
-                "[DROP] Peer SEPP is using the wrong interface [{interface}]"
-            );
+            log::error!("[DROP] Peer SEPP is using the wrong interface [{interface}]");
             return RequestHandlerResult::Error("Wrong interface".to_string());
         }
     }

@@ -27,7 +27,7 @@ impl Default for SbiServerConfig {
     fn default() -> Self {
         Self {
             addr: "127.0.0.1".to_string(),
-            port: 7777,  // UDM default port
+            port: 7777, // UDM default port
             tls_enabled: false,
             tls_cert: None,
             tls_key: None,
@@ -42,7 +42,7 @@ static SBI_RUNNING: AtomicBool = AtomicBool::new(false);
 ///
 /// Port of udm_sbi_open()
 pub fn udm_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
-    let config = config.unwrap_or(SbiServerConfig::default());
+    let config = config.unwrap_or_default();
 
     log::info!("Opening UDM SBI server on {}:{}", config.addr, config.port);
 
@@ -85,7 +85,9 @@ pub fn udm_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
 /// Sends NFRegister (PUT) to NRF at /nnrf-nfm/v1/nf-instances/{nfInstanceId}
 pub async fn udm_nrf_register(nrf_host: &str, nrf_port: u16) -> Result<(), String> {
     let sbi_ctx = global_context();
-    let self_instance = sbi_ctx.get_self_instance().await
+    let self_instance = sbi_ctx
+        .get_self_instance()
+        .await
         .ok_or("Self NF instance not initialized")?;
 
     let client = sbi_ctx.get_client(nrf_host, nrf_port).await;
@@ -114,7 +116,9 @@ pub async fn udm_nrf_register(nrf_host: &str, nrf_port: u16) -> Result<(), Strin
         .with_json_body(&nf_profile)
         .map_err(|e| format!("Failed to serialize NF profile: {e}"))?;
 
-    let response = client.send_request(request).await
+    let response = client
+        .send_request(request)
+        .await
         .map_err(|e| format!("NRF registration request failed: {e}"))?;
 
     if response.is_success() {
@@ -122,14 +126,19 @@ pub async fn udm_nrf_register(nrf_host: &str, nrf_port: u16) -> Result<(), Strin
         log::info!("UDM registered with NRF (status={})", response.status);
         Ok(())
     } else {
-        Err(format!("NRF registration failed with status {}", response.status))
+        Err(format!(
+            "NRF registration failed with status {}",
+            response.status
+        ))
     }
 }
 
 /// Send NRF heartbeat (PATCH to NRF)
 pub async fn udm_nrf_heartbeat(nrf_host: &str, nrf_port: u16) -> Result<(), String> {
     let sbi_ctx = global_context();
-    let self_instance = sbi_ctx.get_self_instance().await
+    let self_instance = sbi_ctx
+        .get_self_instance()
+        .await
         .ok_or("Self NF instance not initialized")?;
 
     let client = sbi_ctx.get_client(nrf_host, nrf_port).await;
@@ -150,14 +159,19 @@ pub async fn udm_nrf_heartbeat(nrf_host: &str, nrf_port: u16) -> Result<(), Stri
         .with_json_body(&update)
         .map_err(|e| format!("Failed to serialize heartbeat: {e}"))?;
 
-    let response = client.send_request(request).await
+    let response = client
+        .send_request(request)
+        .await
         .map_err(|e| format!("NRF heartbeat request failed: {e}"))?;
 
     if response.is_success() {
         log::debug!("NRF heartbeat OK (status={})", response.status);
         Ok(())
     } else {
-        Err(format!("NRF heartbeat failed with status {}", response.status))
+        Err(format!(
+            "NRF heartbeat failed with status {}",
+            response.status
+        ))
     }
 }
 
@@ -170,7 +184,9 @@ pub async fn udm_nrf_discover(
     target_nf_type: NfType,
 ) -> Result<Vec<NfInstance>, String> {
     let sbi_ctx = global_context();
-    let _self_instance = sbi_ctx.get_self_instance().await
+    let _self_instance = sbi_ctx
+        .get_self_instance()
+        .await
         .ok_or("Self NF instance not initialized")?;
 
     let client = sbi_ctx.get_client(nrf_host, nrf_port).await;
@@ -187,15 +203,22 @@ pub async fn udm_nrf_discover(
         .with_param("target-nf-type", target_type_str)
         .with_param("requester-nf-type", "UDM");
 
-    let response = client.send_request(request).await
+    let response = client
+        .send_request(request)
+        .await
         .map_err(|e| format!("NRF discovery request failed: {e}"))?;
 
     if !response.is_success() {
-        return Err(format!("NRF discovery failed with status {}", response.status));
+        return Err(format!(
+            "NRF discovery failed with status {}",
+            response.status
+        ));
     }
 
     // Parse discovered NF instances from response body
-    let body = response.http.content
+    let body = response
+        .http
+        .content
         .ok_or_else(|| "NRF discovery response has no body".to_string())?;
     let search_result: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| format!("Failed to parse NRF discovery response: {e}"))?;
@@ -203,7 +226,11 @@ pub async fn udm_nrf_discover(
     let mut instances = Vec::new();
     if let Some(nf_instances) = search_result.get("nfInstances").and_then(|v| v.as_array()) {
         for nf_json in nf_instances {
-            let id = nf_json.get("nfInstanceId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let id = nf_json
+                .get("nfInstanceId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let mut instance = NfInstance::new(&id, target_nf_type);
 
             if let Some(addrs) = nf_json.get("ipv4Addresses").and_then(|v| v.as_array()) {
@@ -220,7 +247,11 @@ pub async fn udm_nrf_discover(
         }
     }
 
-    log::info!("NRF discovery found {} {} instances", instances.len(), target_type_str);
+    log::info!(
+        "NRF discovery found {} {} instances",
+        instances.len(),
+        target_type_str
+    );
     Ok(instances)
 }
 
@@ -285,16 +316,18 @@ pub async fn udm_sbi_send_request(
     let sbi_ctx = global_context();
 
     // Look up the NF instance to get its address
-    let nf_instance = sbi_ctx.get_nf_instance(nf_instance_id).await
+    let nf_instance = sbi_ctx
+        .get_nf_instance(nf_instance_id)
+        .await
         .ok_or_else(|| format!("NF instance not found: {nf_instance_id}"))?;
 
-    let host = nf_instance.ipv4_addresses.first()
+    let host = nf_instance
+        .ipv4_addresses
+        .first()
         .ok_or_else(|| format!("NF instance {nf_instance_id} has no IPv4 address"))?;
 
     // Determine port from first service or default
-    let port = nf_instance.services.first()
-        .map(|s| s.port)
-        .unwrap_or(80);
+    let port = nf_instance.services.first().map(|s| s.port).unwrap_or(80);
 
     let client = sbi_ctx.get_client(host, port).await;
 
@@ -306,7 +339,9 @@ pub async fn udm_sbi_send_request(
         request.header.method
     );
 
-    client.send_request(request).await
+    client
+        .send_request(request)
+        .await
         .map_err(|e| format!("SBI request to {nf_instance_id} failed: {e}"))
 }
 
@@ -328,18 +363,23 @@ pub async fn udm_sbi_discover_and_send_nudr_dr(
 
     let (host_str, port);
     if let Some(udr) = udr_instances.first() {
-        host_str = udr.ipv4_addresses.first()
-            .ok_or("UDR has no IPv4 address")?.clone();
-        port = udr.find_service(SbiServiceType::NudrDr)
+        host_str = udr
+            .ipv4_addresses
+            .first()
+            .ok_or("UDR has no IPv4 address")?
+            .clone();
+        port = udr
+            .find_service(SbiServiceType::NudrDr)
             .map(|s| s.port)
             .unwrap_or(80);
     } else {
         // Fallback: use UDR_SBI_ADDR/UDR_SBI_PORT env vars
-        host_str = std::env::var("UDR_SBI_ADDR").map_err(|_| {
-            "No UDR instance discovered and UDR_SBI_ADDR not set".to_string()
-        })?;
+        host_str = std::env::var("UDR_SBI_ADDR")
+            .map_err(|_| "No UDR instance discovered and UDR_SBI_ADDR not set".to_string())?;
         port = std::env::var("UDR_SBI_PORT")
-            .ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(7777);
         log::info!("Using UDR env var fallback: {host_str}:{port}");
     }
 
@@ -349,7 +389,9 @@ pub async fn udm_sbi_discover_and_send_nudr_dr(
         "Sending NUDR-DR request for UE [{udm_ue_id}] stream [{stream_id}] to UDR at {host_str}:{port}"
     );
 
-    client.send_request(request).await
+    client
+        .send_request(request)
+        .await
         .map_err(|e| format!("NUDR-DR request to UDR failed: {e}"))
 }
 
@@ -401,9 +443,7 @@ pub async fn udm_nudr_dr_send_provisioned_data_get(
     udm_ue_id: u64,
     stream_id: u64,
 ) -> Result<SbiResponse, String> {
-    let path = format!(
-        "/nudr-dr/v1/subscription-data/{supi}/provisioned-data/{dataset}"
-    );
+    let path = format!("/nudr-dr/v1/subscription-data/{supi}/provisioned-data/{dataset}");
     let request = SbiRequest::get(&path);
     udm_sbi_discover_and_send_nudr_dr(udm_ue_id, stream_id, request).await
 }

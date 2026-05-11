@@ -9,26 +9,24 @@
 //! - PFCP Heartbeat mechanism
 //! - Message encoding/decoding with actual UDP sockets
 
+use bytes::{Bytes, BytesMut};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
-use bytes::{Bytes, BytesMut};
 
-use crate::common::{MessageCapture, CapturedMessage, MessageType, MessageField};
+use crate::common::{CapturedMessage, MessageCapture, MessageField, MessageType};
 
 // Re-export PFCP types from the library
 use ogs_pfcp::header::{PfcpHeader, PfcpMessageType};
 use ogs_pfcp::message::{
-    HeartbeatRequest, HeartbeatResponse,
-    AssociationSetupRequest, AssociationSetupResponse,
-    SessionEstablishmentRequest, SessionEstablishmentResponse,
-    SessionDeletionRequest, SessionDeletionResponse,
-    PfcpMessage, build_message, parse_message,
+    build_message, parse_message, AssociationSetupRequest, AssociationSetupResponse,
+    HeartbeatRequest, HeartbeatResponse, PfcpMessage, SessionDeletionRequest,
+    SessionDeletionResponse, SessionEstablishmentRequest, SessionEstablishmentResponse,
 };
-use ogs_pfcp::types::{NodeId, FSeid, PfcpCause};
+use ogs_pfcp::types::{FSeid, NodeId, PfcpCause};
 
 /// Mock UPF for PFCP testing
 pub struct MockUpf {
@@ -56,9 +54,13 @@ impl MockUpf {
         Self {
             socket: None,
             addr,
-            node_id: NodeId::new_ipv4(addr.ip().to_string().parse::<std::net::Ipv4Addr>()
-                .map(|ip| ip.octets())
-                .unwrap_or([127, 0, 0, 1])),
+            node_id: NodeId::new_ipv4(
+                addr.ip()
+                    .to_string()
+                    .parse::<std::net::Ipv4Addr>()
+                    .map(|ip| ip.octets())
+                    .unwrap_or([127, 0, 0, 1]),
+            ),
             recovery_timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -87,7 +89,10 @@ impl MockUpf {
 
     /// Process one incoming message and return response
     pub async fn process_one(&mut self) -> anyhow::Result<Option<(SocketAddr, BytesMut)>> {
-        let socket = self.socket.as_ref().ok_or_else(|| anyhow::anyhow!("Socket not bound"))?;
+        let socket = self
+            .socket
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Socket not bound"))?;
 
         let mut buf = vec![0u8; 65535];
         let (len, peer) = socket.recv_from(&mut buf).await?;
@@ -102,17 +107,18 @@ impl MockUpf {
             let msg_type = match header.message_type {
                 PfcpMessageType::HeartbeatRequest => MessageType::HeartbeatRequest,
                 PfcpMessageType::AssociationSetupRequest => MessageType::AssociationSetupRequest,
-                PfcpMessageType::SessionEstablishmentRequest => MessageType::SessionEstablishmentRequest,
+                PfcpMessageType::SessionEstablishmentRequest => {
+                    MessageType::SessionEstablishmentRequest
+                }
                 PfcpMessageType::SessionDeletionRequest => MessageType::SessionDeletionRequest,
                 _ => MessageType::Unknown(format!("{:?}", header.message_type)),
             };
-            let captured = CapturedMessage::new(
-                msg_type,
-                Bytes::copy_from_slice(&buf[..len]),
-                "SMF",
-                "UPF",
-            )
-            .with_field("sequence_number", MessageField::Number(header.sequence_number as i64));
+            let captured =
+                CapturedMessage::new(msg_type, Bytes::copy_from_slice(&buf[..len]), "SMF", "UPF")
+                    .with_field(
+                        "sequence_number",
+                        MessageField::Number(header.sequence_number as i64),
+                    );
 
             if let Some(seid) = header.seid {
                 let captured = captured.with_field("seid", MessageField::Number(seid as i64));
@@ -137,27 +143,36 @@ impl MockUpf {
     ) -> anyhow::Result<Option<BytesMut>> {
         match message {
             PfcpMessage::HeartbeatRequest(req) => {
-                log::debug!("UPF received Heartbeat Request, recovery_ts={}", req.recovery_time_stamp);
-                let response = PfcpMessage::HeartbeatResponse(HeartbeatResponse::new(
-                    self.recovery_timestamp,
-                ));
+                log::debug!(
+                    "UPF received Heartbeat Request, recovery_ts={}",
+                    req.recovery_time_stamp
+                );
+                let response =
+                    PfcpMessage::HeartbeatResponse(HeartbeatResponse::new(self.recovery_timestamp));
                 let buf = build_message(&response, header.sequence_number, None);
                 Ok(Some(buf))
             }
 
             PfcpMessage::AssociationSetupRequest(req) => {
-                log::info!("UPF received Association Setup Request from {:?}", req.node_id);
-                let response = PfcpMessage::AssociationSetupResponse(AssociationSetupResponse::new(
-                    self.node_id.clone(),
-                    PfcpCause::RequestAccepted,
-                    self.recovery_timestamp,
-                ));
+                log::info!(
+                    "UPF received Association Setup Request from {:?}",
+                    req.node_id
+                );
+                let response =
+                    PfcpMessage::AssociationSetupResponse(AssociationSetupResponse::new(
+                        self.node_id.clone(),
+                        PfcpCause::RequestAccepted,
+                        self.recovery_timestamp,
+                    ));
                 let buf = build_message(&response, header.sequence_number, None);
                 Ok(Some(buf))
             }
 
             PfcpMessage::SessionEstablishmentRequest(req) => {
-                log::info!("UPF received Session Establishment Request, CP-SEID={}", req.cp_f_seid.seid);
+                log::info!(
+                    "UPF received Session Establishment Request, CP-SEID={}",
+                    req.cp_f_seid.seid
+                );
 
                 // Allocate UP-SEID
                 self.sequence_number += 1;
@@ -166,24 +181,34 @@ impl MockUpf {
                 // Store session
                 {
                     let mut sessions = self.sessions.write().await;
-                    sessions.insert(up_seid, SessionContext {
-                        cp_seid: req.cp_f_seid.seid,
+                    sessions.insert(
                         up_seid,
-                        cp_addr: peer,
-                    });
+                        SessionContext {
+                            cp_seid: req.cp_f_seid.seid,
+                            up_seid,
+                            cp_addr: peer,
+                        },
+                    );
                 }
 
                 let mut response = SessionEstablishmentResponse::new(PfcpCause::RequestAccepted);
                 response.node_id = Some(self.node_id.clone());
                 response.up_f_seid = Some(FSeid::new_ipv4(
                     up_seid,
-                    self.addr.ip().to_string().parse::<std::net::Ipv4Addr>()
+                    self.addr
+                        .ip()
+                        .to_string()
+                        .parse::<std::net::Ipv4Addr>()
                         .map(|ip| ip.octets())
                         .unwrap_or([127, 0, 0, 1]),
                 ));
 
                 let response_msg = PfcpMessage::SessionEstablishmentResponse(response);
-                let buf = build_message(&response_msg, header.sequence_number, Some(req.cp_f_seid.seid));
+                let buf = build_message(
+                    &response_msg,
+                    header.sequence_number,
+                    Some(req.cp_f_seid.seid),
+                );
                 Ok(Some(buf))
             }
 
@@ -197,15 +222,18 @@ impl MockUpf {
                     sessions.remove(&seid);
                 }
 
-                let response = PfcpMessage::SessionDeletionResponse(
-                    SessionDeletionResponse::new(PfcpCause::RequestAccepted)
-                );
+                let response = PfcpMessage::SessionDeletionResponse(SessionDeletionResponse::new(
+                    PfcpCause::RequestAccepted,
+                ));
                 let buf = build_message(&response, header.sequence_number, header.seid);
                 Ok(Some(buf))
             }
 
             _ => {
-                log::warn!("UPF received unhandled message type: {:?}", header.message_type);
+                log::warn!(
+                    "UPF received unhandled message type: {:?}",
+                    header.message_type
+                );
                 Ok(None)
             }
         }
@@ -213,7 +241,10 @@ impl MockUpf {
 
     /// Send response back to peer
     pub async fn send_response(&self, peer: SocketAddr, response: &[u8]) -> anyhow::Result<()> {
-        let socket = self.socket.as_ref().ok_or_else(|| anyhow::anyhow!("Socket not bound"))?;
+        let socket = self
+            .socket
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Socket not bound"))?;
         socket.send_to(response, peer).await?;
         Ok(())
     }
@@ -247,9 +278,13 @@ impl MockSmf {
         Self {
             socket: None,
             addr,
-            node_id: NodeId::new_ipv4(addr.ip().to_string().parse::<std::net::Ipv4Addr>()
-                .map(|ip| ip.octets())
-                .unwrap_or([127, 0, 0, 1])),
+            node_id: NodeId::new_ipv4(
+                addr.ip()
+                    .to_string()
+                    .parse::<std::net::Ipv4Addr>()
+                    .map(|ip| ip.octets())
+                    .unwrap_or([127, 0, 0, 1]),
+            ),
             recovery_timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -280,12 +315,18 @@ impl MockSmf {
     }
 
     /// Send heartbeat request and wait for response
-    pub async fn send_heartbeat(&mut self, upf_addr: SocketAddr) -> anyhow::Result<HeartbeatResponse> {
+    pub async fn send_heartbeat(
+        &mut self,
+        upf_addr: SocketAddr,
+    ) -> anyhow::Result<HeartbeatResponse> {
         // Get values we need before borrowing socket
         let seq = self.next_sequence();
         let recovery_ts = self.recovery_timestamp;
 
-        let socket = self.socket.as_ref().ok_or_else(|| anyhow::anyhow!("Socket not bound"))?;
+        let socket = self
+            .socket
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Socket not bound"))?;
 
         let request = PfcpMessage::HeartbeatRequest(HeartbeatRequest::new(recovery_ts));
         let buf = build_message(&request, seq, None);
@@ -295,12 +336,15 @@ impl MockSmf {
         // Capture sent message
         {
             let mut cap = self.capture.write().await;
-            cap.capture(CapturedMessage::new(
-                MessageType::HeartbeatRequest,
-                buf.clone().freeze(),
-                "SMF",
-                "UPF",
-            ).with_field("sequence_number", MessageField::Number(seq as i64)));
+            cap.capture(
+                CapturedMessage::new(
+                    MessageType::HeartbeatRequest,
+                    buf.clone().freeze(),
+                    "SMF",
+                    "UPF",
+                )
+                .with_field("sequence_number", MessageField::Number(seq as i64)),
+            );
         }
 
         // Wait for response
@@ -314,12 +358,18 @@ impl MockSmf {
         // Capture received message
         {
             let mut cap = self.capture.write().await;
-            cap.capture(CapturedMessage::new(
-                MessageType::HeartbeatResponse,
-                Bytes::copy_from_slice(&resp_buf[..len]),
-                "UPF",
-                "SMF",
-            ).with_field("sequence_number", MessageField::Number(header.sequence_number as i64)));
+            cap.capture(
+                CapturedMessage::new(
+                    MessageType::HeartbeatResponse,
+                    Bytes::copy_from_slice(&resp_buf[..len]),
+                    "UPF",
+                    "SMF",
+                )
+                .with_field(
+                    "sequence_number",
+                    MessageField::Number(header.sequence_number as i64),
+                ),
+            );
         }
 
         match message {
@@ -329,17 +379,24 @@ impl MockSmf {
     }
 
     /// Send association setup request and wait for response
-    pub async fn send_association_setup(&mut self, upf_addr: SocketAddr) -> anyhow::Result<AssociationSetupResponse> {
+    pub async fn send_association_setup(
+        &mut self,
+        upf_addr: SocketAddr,
+    ) -> anyhow::Result<AssociationSetupResponse> {
         // Get values we need before borrowing socket
         let seq = self.next_sequence();
         let node_id = self.node_id.clone();
         let recovery_ts = self.recovery_timestamp;
 
-        let socket = self.socket.as_ref().ok_or_else(|| anyhow::anyhow!("Socket not bound"))?;
+        let socket = self
+            .socket
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Socket not bound"))?;
 
-        let request = PfcpMessage::AssociationSetupRequest(
-            AssociationSetupRequest::new(node_id, recovery_ts)
-        );
+        let request = PfcpMessage::AssociationSetupRequest(AssociationSetupRequest::new(
+            node_id,
+            recovery_ts,
+        ));
         let buf = build_message(&request, seq, None);
 
         socket.send_to(&buf, upf_addr).await?;
@@ -347,12 +404,15 @@ impl MockSmf {
         // Capture sent message
         {
             let mut cap = self.capture.write().await;
-            cap.capture(CapturedMessage::new(
-                MessageType::AssociationSetupRequest,
-                buf.clone().freeze(),
-                "SMF",
-                "UPF",
-            ).with_field("sequence_number", MessageField::Number(seq as i64)));
+            cap.capture(
+                CapturedMessage::new(
+                    MessageType::AssociationSetupRequest,
+                    buf.clone().freeze(),
+                    "SMF",
+                    "UPF",
+                )
+                .with_field("sequence_number", MessageField::Number(seq as i64)),
+            );
         }
 
         // Wait for response
@@ -366,12 +426,18 @@ impl MockSmf {
         // Capture received message
         {
             let mut cap = self.capture.write().await;
-            cap.capture(CapturedMessage::new(
-                MessageType::AssociationSetupResponse,
-                Bytes::copy_from_slice(&resp_buf[..len]),
-                "UPF",
-                "SMF",
-            ).with_field("sequence_number", MessageField::Number(header.sequence_number as i64)));
+            cap.capture(
+                CapturedMessage::new(
+                    MessageType::AssociationSetupResponse,
+                    Bytes::copy_from_slice(&resp_buf[..len]),
+                    "UPF",
+                    "SMF",
+                )
+                .with_field(
+                    "sequence_number",
+                    MessageField::Number(header.sequence_number as i64),
+                ),
+            );
         }
 
         match message {
@@ -391,17 +457,22 @@ impl MockSmf {
         let node_id = self.node_id.clone();
         let addr = self.addr;
 
-        let socket = self.socket.as_ref().ok_or_else(|| anyhow::anyhow!("Socket not bound"))?;
+        let socket = self
+            .socket
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Socket not bound"))?;
 
         let cp_f_seid = FSeid::new_ipv4(
             cp_seid,
-            addr.ip().to_string().parse::<std::net::Ipv4Addr>()
+            addr.ip()
+                .to_string()
+                .parse::<std::net::Ipv4Addr>()
                 .map(|ip| ip.octets())
                 .unwrap_or([127, 0, 0, 1]),
         );
-        let request = PfcpMessage::SessionEstablishmentRequest(
-            SessionEstablishmentRequest::new(node_id, cp_f_seid)
-        );
+        let request = PfcpMessage::SessionEstablishmentRequest(SessionEstablishmentRequest::new(
+            node_id, cp_f_seid,
+        ));
         let buf = build_message(&request, seq, Some(0)); // SEID=0 for new session
 
         socket.send_to(&buf, upf_addr).await?;
@@ -409,14 +480,16 @@ impl MockSmf {
         // Capture sent message
         {
             let mut cap = self.capture.write().await;
-            cap.capture(CapturedMessage::new(
-                MessageType::SessionEstablishmentRequest,
-                buf.clone().freeze(),
-                "SMF",
-                "UPF",
-            )
-            .with_field("sequence_number", MessageField::Number(seq as i64))
-            .with_field("cp_seid", MessageField::Number(cp_seid as i64)));
+            cap.capture(
+                CapturedMessage::new(
+                    MessageType::SessionEstablishmentRequest,
+                    buf.clone().freeze(),
+                    "SMF",
+                    "UPF",
+                )
+                .with_field("sequence_number", MessageField::Number(seq as i64))
+                .with_field("cp_seid", MessageField::Number(cp_seid as i64)),
+            );
         }
 
         // Wait for response
@@ -430,12 +503,18 @@ impl MockSmf {
         // Capture received message
         {
             let mut cap = self.capture.write().await;
-            cap.capture(CapturedMessage::new(
-                MessageType::SessionEstablishmentResponse,
-                Bytes::copy_from_slice(&resp_buf[..len]),
-                "UPF",
-                "SMF",
-            ).with_field("sequence_number", MessageField::Number(header.sequence_number as i64)));
+            cap.capture(
+                CapturedMessage::new(
+                    MessageType::SessionEstablishmentResponse,
+                    Bytes::copy_from_slice(&resp_buf[..len]),
+                    "UPF",
+                    "SMF",
+                )
+                .with_field(
+                    "sequence_number",
+                    MessageField::Number(header.sequence_number as i64),
+                ),
+            );
         }
 
         match message {
@@ -453,7 +532,10 @@ impl MockSmf {
         // Get sequence number before borrowing socket
         let seq = self.next_sequence();
 
-        let socket = self.socket.as_ref().ok_or_else(|| anyhow::anyhow!("Socket not bound"))?;
+        let socket = self
+            .socket
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Socket not bound"))?;
 
         let request = PfcpMessage::SessionDeletionRequest(SessionDeletionRequest::new());
         let buf = build_message(&request, seq, Some(seid));
@@ -463,14 +545,16 @@ impl MockSmf {
         // Capture sent message
         {
             let mut cap = self.capture.write().await;
-            cap.capture(CapturedMessage::new(
-                MessageType::SessionDeletionRequest,
-                buf.clone().freeze(),
-                "SMF",
-                "UPF",
-            )
-            .with_field("sequence_number", MessageField::Number(seq as i64))
-            .with_field("seid", MessageField::Number(seid as i64)));
+            cap.capture(
+                CapturedMessage::new(
+                    MessageType::SessionDeletionRequest,
+                    buf.clone().freeze(),
+                    "SMF",
+                    "UPF",
+                )
+                .with_field("sequence_number", MessageField::Number(seq as i64))
+                .with_field("seid", MessageField::Number(seid as i64)),
+            );
         }
 
         // Wait for response
@@ -484,12 +568,18 @@ impl MockSmf {
         // Capture received message
         {
             let mut cap = self.capture.write().await;
-            cap.capture(CapturedMessage::new(
-                MessageType::SessionDeletionResponse,
-                Bytes::copy_from_slice(&resp_buf[..len]),
-                "UPF",
-                "SMF",
-            ).with_field("sequence_number", MessageField::Number(header.sequence_number as i64)));
+            cap.capture(
+                CapturedMessage::new(
+                    MessageType::SessionDeletionResponse,
+                    Bytes::copy_from_slice(&resp_buf[..len]),
+                    "UPF",
+                    "SMF",
+                )
+                .with_field(
+                    "sequence_number",
+                    MessageField::Number(header.sequence_number as i64),
+                ),
+            );
         }
 
         match message {
@@ -504,7 +594,6 @@ impl MockSmf {
         log::info!("Mock SMF stopped");
     }
 }
-
 
 // ============================================================================
 // Integration Tests
@@ -619,7 +708,10 @@ mod tests {
 
         // SMF sends session establishment
         let cp_seid = 12345u64;
-        let response = smf.send_session_establishment(upf_addr, cp_seid).await.unwrap();
+        let response = smf
+            .send_session_establishment(upf_addr, cp_seid)
+            .await
+            .unwrap();
 
         // Verify response
         assert_eq!(response.cause, PfcpCause::RequestAccepted);
@@ -657,11 +749,14 @@ mod tests {
         // Pre-populate a session
         {
             let mut sessions = upf_sessions.write().await;
-            sessions.insert(1, SessionContext {
-                cp_seid: 12345,
-                up_seid: 1,
-                cp_addr: "127.0.0.1:8806".parse().unwrap(),
-            });
+            sessions.insert(
+                1,
+                SessionContext {
+                    cp_seid: 12345,
+                    up_seid: 1,
+                    cp_addr: "127.0.0.1:8806".parse().unwrap(),
+                },
+            );
         }
 
         // Create and start mock SMF
@@ -727,7 +822,10 @@ mod tests {
 
         // 2. Session establishment
         let cp_seid = 99999u64;
-        let est_resp = smf.send_session_establishment(upf_addr, cp_seid).await.unwrap();
+        let est_resp = smf
+            .send_session_establishment(upf_addr, cp_seid)
+            .await
+            .unwrap();
         assert_eq!(est_resp.cause, PfcpCause::RequestAccepted);
         let up_seid = est_resp.up_f_seid.unwrap().seid;
 
@@ -785,7 +883,10 @@ mod tests {
         let mut up_seids = Vec::new();
         for i in 0..3 {
             let cp_seid = (i + 1) as u64 * 1000;
-            let resp = smf.send_session_establishment(upf_addr, cp_seid).await.unwrap();
+            let resp = smf
+                .send_session_establishment(upf_addr, cp_seid)
+                .await
+                .unwrap();
             assert_eq!(resp.cause, PfcpCause::RequestAccepted);
             up_seids.push(resp.up_f_seid.unwrap().seid);
         }
@@ -799,7 +900,6 @@ mod tests {
         assert_eq!(unique_seids.len(), 3, "All UP-SEIDs should be unique");
     }
 }
-
 
 // ============================================================================
 // Property-based Tests

@@ -8,11 +8,11 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use ogs_sbi::message::{SbiRequest, SbiResponse};
-use serde::Deserialize;
 use ogs_sbi::server::{
-    send_bad_request, send_method_not_allowed, send_not_found,
-    SbiServer, SbiServerConfig as OgsSbiServerConfig,
+    send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
+    SbiServerConfig as OgsSbiServerConfig,
 };
+use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -21,16 +21,16 @@ use std::time::Duration;
 mod am_sm;
 mod context;
 mod event;
+#[allow(dead_code)]
+mod intent_policy;
 mod npcf_handler;
 mod nudr_handler;
 mod pcf_sm;
 mod sbi_path;
 mod sbi_response;
-#[allow(dead_code)]
-mod intent_policy;
-pub mod ue_policy; // Rel-16: URSP rule provisioning (TS 23.503)
 mod sm_sm;
 mod timer;
+pub mod ue_policy; // Rel-16: URSP rule provisioning (TS 23.503)
 
 pub use am_sm::{PcfAmSmContext, PcfAmState};
 pub use context::*;
@@ -142,11 +142,10 @@ async fn main() -> Result<()> {
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
-            .with_endpoint(
-                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
-            ),
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+        ),
     )
     .ok();
 
@@ -189,7 +188,9 @@ async fn main() -> Result<()> {
                                 if let Some(nrf_list) = client.nrf {
                                     if let Some(nrf) = nrf_list.first() {
                                         log::info!("NRF URI configured: {}", nrf.uri);
-                                        ogs_sbi::context::global_context().set_nrf_uri(&nrf.uri).await;
+                                        ogs_sbi::context::global_context()
+                                            .set_nrf_uri(&nrf.uri)
+                                            .await;
                                     }
                                 }
                             }
@@ -224,7 +225,9 @@ async fn main() -> Result<()> {
         .context("Invalid SBI address")?;
     let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
 
-    sbi_server.start(pcf_sbi_request_handler).await
+    sbi_server
+        .start(pcf_sbi_request_handler)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
@@ -249,7 +252,9 @@ async fn main() -> Result<()> {
     log::info!("Shutting down...");
 
     // Stop SBI server
-    sbi_server.stop().await
+    sbi_server
+        .stop()
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
     log::info!("SBI HTTP/2 server stopped");
 
@@ -318,7 +323,9 @@ async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 
         // SM Policy Control Service (npcf-smpolicycontrol)
         // Note: Order matters - more specific patterns first
-        ("npcf-smpolicycontrol", "sm-policies", "POST") if parts.len() >= 5 && parts[4] == "update" => {
+        ("npcf-smpolicycontrol", "sm-policies", "POST")
+            if parts.len() >= 5 && parts[4] == "update" =>
+        {
             // Update SM Policy (POST with update action)
             let sm_policy_id = parts[3];
             handle_sm_policy_update_notify(sm_policy_id, &request).await
@@ -382,7 +389,8 @@ async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
     };
 
     // Extract SUPI from request
-    let supi = policy_data.get("supi")
+    let supi = policy_data
+        .get("supi")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
 
@@ -396,7 +404,11 @@ async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
 
     match ue_am {
         Some(ue_am) => {
-            log::info!("AM Policy created for SUPI {} (id={})", supi, ue_am.association_id);
+            log::info!(
+                "AM Policy created for SUPI {} (id={})",
+                supi,
+                ue_am.association_id
+            );
 
             // Query subscription data for UE-AMBR
             let sub_data = nudr_handler::query_subscription_data_pub(supi);
@@ -404,9 +416,17 @@ async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
                 let mut triggers = Vec::new();
                 // Check if subscribed UE-AMBR differs from requested
                 if let Some(req_ambr) = policy_data.get("ueAmbr") {
-                    let req_up = req_ambr.get("uplink").and_then(|v| v.as_str()).unwrap_or("0");
-                    let req_down = req_ambr.get("downlink").and_then(|v| v.as_str()).unwrap_or("0");
-                    if req_up != format_bitrate(sd.ambr_uplink) || req_down != format_bitrate(sd.ambr_downlink) {
+                    let req_up = req_ambr
+                        .get("uplink")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0");
+                    let req_down = req_ambr
+                        .get("downlink")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0");
+                    if req_up != format_bitrate(sd.ambr_uplink)
+                        || req_down != format_bitrate(sd.ambr_downlink)
+                    {
                         triggers.push("UE_AMBR_CH");
                     }
                 }
@@ -431,13 +451,17 @@ async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
             }
 
             SbiResponse::with_status(201)
-                .with_header("Location", format!("/npcf-am-policy-control/v1/policies/{}", ue_am.association_id))
+                .with_header(
+                    "Location",
+                    format!(
+                        "/npcf-am-policy-control/v1/policies/{}",
+                        ue_am.association_id
+                    ),
+                )
                 .with_json_body(&resp)
                 .unwrap_or_else(|_| SbiResponse::with_status(201))
         }
-        None => {
-            send_bad_request("Failed to create AM policy", Some("CREATION_FAILED"))
-        }
+        None => send_bad_request("Failed to create AM policy", Some("CREATION_FAILED")),
     }
 }
 
@@ -452,18 +476,17 @@ async fn handle_am_policy_get(pol_asso_id: &str) -> SbiResponse {
     };
 
     match ue_am {
-        Some(ue_am) => {
-            SbiResponse::with_status(200)
-                .with_json_body(&serde_json::json!({
-                    "polAssoId": ue_am.association_id,
-                    "supi": ue_am.supi,
-                    "triggers": [],
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(200))
-        }
-        None => {
-            send_not_found(&format!("AM Policy {pol_asso_id} not found"), Some("POLICY_NOT_FOUND"))
-        }
+        Some(ue_am) => SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({
+                "polAssoId": ue_am.association_id,
+                "supi": ue_am.supi,
+                "triggers": [],
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("AM Policy {pol_asso_id} not found"),
+            Some("POLICY_NOT_FOUND"),
+        ),
     }
 }
 
@@ -488,9 +511,10 @@ async fn handle_am_policy_delete(pol_asso_id: &str) -> SbiResponse {
             log::info!("AM Policy {pol_asso_id} deleted");
             SbiResponse::with_status(204)
         }
-        None => {
-            send_not_found(&format!("AM Policy {pol_asso_id} not found"), Some("POLICY_NOT_FOUND"))
-        }
+        None => send_not_found(
+            &format!("AM Policy {pol_asso_id} not found"),
+            Some("POLICY_NOT_FOUND"),
+        ),
     }
 }
 
@@ -515,18 +539,17 @@ async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) -> Sbi
     };
 
     match ue_am {
-        Some(ue_am) => {
-            SbiResponse::with_status(200)
-                .with_json_body(&serde_json::json!({
-                    "polAssoId": ue_am.association_id,
-                    "supi": ue_am.supi,
-                    "triggers": [],
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(200))
-        }
-        None => {
-            send_not_found(&format!("AM Policy {pol_asso_id} not found"), Some("POLICY_NOT_FOUND"))
-        }
+        Some(ue_am) => SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({
+                "polAssoId": ue_am.association_id,
+                "supi": ue_am.supi,
+                "triggers": [],
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("AM Policy {pol_asso_id} not found"),
+            Some("POLICY_NOT_FOUND"),
+        ),
     }
 }
 
@@ -545,13 +568,16 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let supi = policy_data.get("supi")
+    let supi = policy_data
+        .get("supi")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
-    let pdu_session_id = policy_data.get("pduSessionId")
+    let pdu_session_id = policy_data
+        .get("pduSessionId")
         .and_then(|v| v.as_u64())
         .unwrap_or(1) as u8;
-    let dnn = policy_data.get("dnn")
+    let dnn = policy_data
+        .get("dnn")
         .and_then(|v| v.as_str())
         .unwrap_or("internet");
     let sst = policy_data
@@ -589,7 +615,12 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
 
     match sess {
         Some(sess) => {
-            log::info!("SM Policy created for SUPI {} PDU Session {} (id={})", supi, pdu_session_id, sess.sm_policy_id);
+            log::info!(
+                "SM Policy created for SUPI {} PDU Session {} (id={})",
+                supi,
+                pdu_session_id,
+                sess.sm_policy_id
+            );
 
             // Query real session data from UDR/database
             let s_nssai = SNssai { sst, sd };
@@ -599,11 +630,19 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
             let (sess_rules, pcc_rules, qos_decs, triggers) = if let Some(ref sd) = session_data {
                 build_sm_policy_decision(&sess.sm_policy_id, sd)
             } else {
-                (serde_json::json!({}), serde_json::json!({}), serde_json::json!({}), vec![])
+                (
+                    serde_json::json!({}),
+                    serde_json::json!({}),
+                    serde_json::json!({}),
+                    vec![],
+                )
             };
 
             SbiResponse::with_status(201)
-                .with_header("Location", format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id))
+                .with_header(
+                    "Location",
+                    format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id),
+                )
                 .with_json_body(&serde_json::json!({
                     "smPolicyId": sess.sm_policy_id,
                     "supi": supi,
@@ -616,9 +655,7 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(201))
         }
-        None => {
-            send_bad_request("Failed to create SM policy", Some("CREATION_FAILED"))
-        }
+        None => send_bad_request("Failed to create SM policy", Some("CREATION_FAILED")),
     }
 }
 
@@ -629,7 +666,12 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
 fn build_sm_policy_decision(
     sm_policy_id: &str,
     session_data: &nudr_handler::SessionData,
-) -> (serde_json::Value, serde_json::Value, serde_json::Value, Vec<String>) {
+) -> (
+    serde_json::Value,
+    serde_json::Value,
+    serde_json::Value,
+    Vec<String>,
+) {
     let sess_rule_id = format!("SessRule-{sm_policy_id}");
     let def_qos_id = format!("QosDec-{sm_policy_id}");
 
@@ -655,52 +697,66 @@ fn build_sm_policy_decision(
 
     // Default QoS decision
     let mut qos_map = serde_json::Map::new();
-    qos_map.insert(def_qos_id.clone(), serde_json::json!({
-        "qosDecId": def_qos_id,
-        "5qi": session_data.qos_index,
-        "maxbrUl": format_bitrate(session_data.ambr_uplink),
-        "maxbrDl": format_bitrate(session_data.ambr_downlink),
-    }));
+    qos_map.insert(
+        def_qos_id.clone(),
+        serde_json::json!({
+            "qosDecId": def_qos_id,
+            "5qi": session_data.qos_index,
+            "maxbrUl": format_bitrate(session_data.ambr_uplink),
+            "maxbrDl": format_bitrate(session_data.ambr_downlink),
+        }),
+    );
 
     // PCC rules from database subscription data
     let mut pcc_map = serde_json::Map::new();
     for rule in &session_data.pcc_rules {
         let rule_qos_id = format!("QosDec-pcc-{}", rule.id);
 
-        let flows: Vec<serde_json::Value> = rule.flows.iter().enumerate().map(|(i, f)| {
-            serde_json::json!({
-                "flowDescription": f.description,
-                "flowDirection": match f.direction {
-                    nudr_handler::FlowDirection::Uplink => "UPLINK",
-                    nudr_handler::FlowDirection::Downlink => "DOWNLINK",
-                    _ => "BIDIRECTIONAL",
-                },
-                "packFiltId": format!("pf-{}-{}", rule.id, i),
+        let flows: Vec<serde_json::Value> = rule
+            .flows
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                serde_json::json!({
+                    "flowDescription": f.description,
+                    "flowDirection": match f.direction {
+                        nudr_handler::FlowDirection::Uplink => "UPLINK",
+                        nudr_handler::FlowDirection::Downlink => "DOWNLINK",
+                        _ => "BIDIRECTIONAL",
+                    },
+                    "packFiltId": format!("pf-{}-{}", rule.id, i),
+                })
             })
-        }).collect();
+            .collect();
 
-        pcc_map.insert(rule.id.clone(), serde_json::json!({
-            "pccRuleId": rule.id,
-            "precedence": rule.precedence,
-            "flowInfos": flows,
-            "refQosData": [&rule_qos_id],
-        }));
+        pcc_map.insert(
+            rule.id.clone(),
+            serde_json::json!({
+                "pccRuleId": rule.id,
+                "precedence": rule.precedence,
+                "flowInfos": flows,
+                "refQosData": [&rule_qos_id],
+            }),
+        );
 
         // Per-rule QoS decision
-        qos_map.insert(rule_qos_id.clone(), serde_json::json!({
-            "qosDecId": rule_qos_id,
-            "5qi": rule.qos_index,
-        }));
+        qos_map.insert(
+            rule_qos_id.clone(),
+            serde_json::json!({
+                "qosDecId": rule_qos_id,
+                "5qi": rule.qos_index,
+            }),
+        );
     }
 
     // Policy control request triggers (TS 29.512 Table 5.6.2.6-1)
     let triggers = vec![
-        "SE_AMBR_CH".to_string(),    // Session AMBR change
-        "DEF_QOS_CH".to_string(),    // Default QoS change
-        "UE_IP_CH".to_string(),      // UE IP address change
-        "PLMN_CH".to_string(),       // Serving network change
-        "AC_TY_CH".to_string(),      // Access type change
-        "RAT_TY_CH".to_string(),     // RAT type change
+        "SE_AMBR_CH".to_string(), // Session AMBR change
+        "DEF_QOS_CH".to_string(), // Default QoS change
+        "UE_IP_CH".to_string(),   // UE IP address change
+        "PLMN_CH".to_string(),    // Serving network change
+        "AC_TY_CH".to_string(),   // Access type change
+        "RAT_TY_CH".to_string(),  // RAT type change
     ];
 
     (
@@ -735,19 +791,18 @@ async fn handle_sm_policy_get(sm_policy_id: &str) -> SbiResponse {
     };
 
     match sess {
-        Some(sess) => {
-            SbiResponse::with_status(200)
-                .with_json_body(&serde_json::json!({
-                    "smPolicyId": sess.sm_policy_id,
-                    "pduSessionId": sess.psi,
-                    "sessRules": {},
-                    "pccRules": {},
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(200))
-        }
-        None => {
-            send_not_found(&format!("SM Policy {sm_policy_id} not found"), Some("POLICY_NOT_FOUND"))
-        }
+        Some(sess) => SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({
+                "smPolicyId": sess.sm_policy_id,
+                "pduSessionId": sess.psi,
+                "sessRules": {},
+                "pccRules": {},
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("SM Policy {sm_policy_id} not found"),
+            Some("POLICY_NOT_FOUND"),
+        ),
     }
 }
 
@@ -770,9 +825,10 @@ async fn handle_sm_policy_delete(sm_policy_id: &str) -> SbiResponse {
             log::info!("SM Policy {sm_policy_id} deleted");
             SbiResponse::with_status(204)
         }
-        None => {
-            send_not_found(&format!("SM Policy {sm_policy_id} not found"), Some("POLICY_NOT_FOUND"))
-        }
+        None => send_not_found(
+            &format!("SM Policy {sm_policy_id} not found"),
+            Some("POLICY_NOT_FOUND"),
+        ),
     }
 }
 
@@ -799,18 +855,33 @@ async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest
     match sess {
         Some(sess) => {
             // Process reported triggers from SMF
-            let triggers = update_data.get("repPolicyCtrlReqTriggers")
+            let triggers = update_data
+                .get("repPolicyCtrlReqTriggers")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect::<Vec<_>>()
+                })
                 .expect("value expected");
 
-            log::info!("SM Policy Update triggers: {:?} for session PSI={}", triggers, sess.psi);
+            log::info!(
+                "SM Policy Update triggers: {:?} for session PSI={}",
+                triggers,
+                sess.psi
+            );
 
             // Process PCC rule reports from SMF (rule status changes)
             let mut rule_reports = Vec::new();
-            if let Some(reports) = update_data.get("repPccRuleStatusList").and_then(|v| v.as_object()) {
+            if let Some(reports) = update_data
+                .get("repPccRuleStatusList")
+                .and_then(|v| v.as_object())
+            {
                 for (rule_id, report) in reports {
-                    let status = report.get("ruleStatus").and_then(|v| v.as_str()).unwrap_or("ACTIVE");
+                    let status = report
+                        .get("ruleStatus")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("ACTIVE");
                     log::debug!("PCC rule {rule_id} status: {status}");
                     rule_reports.push((rule_id.clone(), status.to_string()));
                 }
@@ -822,18 +893,31 @@ async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest
 
             // If UE requested resource modification, generate new PCC rules
             if let Some(ue_req) = update_data.get("ueInitResReq") {
-                let req_5qi = ue_req.get("reqQos").and_then(|q| q.get("5qi")).and_then(|v| v.as_u64()).unwrap_or(9);
-                let req_gbr_ul = ue_req.get("reqQos").and_then(|q| q.get("gbrUl")).and_then(|v| v.as_str());
-                let req_gbr_dl = ue_req.get("reqQos").and_then(|q| q.get("gbrDl")).and_then(|v| v.as_str());
+                let req_5qi = ue_req
+                    .get("reqQos")
+                    .and_then(|q| q.get("5qi"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(9);
+                let req_gbr_ul = ue_req
+                    .get("reqQos")
+                    .and_then(|q| q.get("gbrUl"))
+                    .and_then(|v| v.as_str());
+                let req_gbr_dl = ue_req
+                    .get("reqQos")
+                    .and_then(|q| q.get("gbrDl"))
+                    .and_then(|v| v.as_str());
 
                 let rule_id = format!("PccRule-ue-{}", sess.sm_policy_id);
                 let qos_ref = format!("QosDec-ue-{}", sess.sm_policy_id);
 
-                pcc_rules.insert(rule_id.clone(), serde_json::json!({
-                    "pccRuleId": rule_id,
-                    "precedence": 100,
-                    "refQosData": [&qos_ref],
-                }));
+                pcc_rules.insert(
+                    rule_id.clone(),
+                    serde_json::json!({
+                        "pccRuleId": rule_id,
+                        "precedence": 100,
+                        "refQosData": [&qos_ref],
+                    }),
+                );
 
                 let mut qos_dec = serde_json::json!({
                     "qosDecId": qos_ref,
@@ -853,7 +937,10 @@ async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest
             // If SESS_AMBR_CH trigger, re-evaluate session AMBR
             let sess_rules = if triggers.iter().any(|t| t == "SE_AMBR_CH") {
                 // Re-query session data for updated AMBR
-                let s_nssai = SNssai { sst: sess.s_nssai.sst, sd: sess.s_nssai.sd };
+                let s_nssai = SNssai {
+                    sst: sess.s_nssai.sst,
+                    sd: sess.s_nssai.sd,
+                };
                 let dnn = sess.dnn.as_deref().unwrap_or("internet");
                 if let Some(sd) = pcf_get_session_data("", None, &s_nssai, dnn) {
                     let sess_rule_id = format!("SessRule-{}", sess.sm_policy_id);
@@ -883,9 +970,10 @@ async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }
-        None => {
-            send_not_found(&format!("SM Policy {sm_policy_id} not found"), Some("POLICY_NOT_FOUND"))
-        }
+        None => send_not_found(
+            &format!("SM Policy {sm_policy_id} not found"),
+            Some("POLICY_NOT_FOUND"),
+        ),
     }
 }
 
@@ -910,7 +998,10 @@ async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
     log::info!("App Session created (id={app_session_id})");
 
     SbiResponse::with_status(201)
-        .with_header("Location", format!("/npcf-policyauthorization/v1/app-sessions/{app_session_id}"))
+        .with_header(
+            "Location",
+            format!("/npcf-policyauthorization/v1/app-sessions/{app_session_id}"),
+        )
         .with_json_body(&serde_json::json!({
             "appSessionId": app_session_id,
             "notifUri": session_data.get("notifUri"),
@@ -930,17 +1021,16 @@ async fn handle_app_session_get(app_session_id: &str) -> SbiResponse {
     };
 
     match app {
-        Some(app) => {
-            SbiResponse::with_status(200)
-                .with_json_body(&serde_json::json!({
-                    "appSessionId": app.app_session_id,
-                    "notifUri": app.notif_uri,
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(200))
-        }
-        None => {
-            send_not_found(&format!("App Session {app_session_id} not found"), Some("SESSION_NOT_FOUND"))
-        }
+        Some(app) => SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({
+                "appSessionId": app.app_session_id,
+                "notifUri": app.notif_uri,
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("App Session {app_session_id} not found"),
+            Some("SESSION_NOT_FOUND"),
+        ),
     }
 }
 
@@ -963,9 +1053,10 @@ async fn handle_app_session_delete(app_session_id: &str) -> SbiResponse {
             log::info!("App Session {app_session_id} deleted");
             SbiResponse::with_status(204)
         }
-        None => {
-            send_not_found(&format!("App Session {app_session_id} not found"), Some("SESSION_NOT_FOUND"))
-        }
+        None => send_not_found(
+            &format!("App Session {app_session_id} not found"),
+            Some("SESSION_NOT_FOUND"),
+        ),
     }
 }
 
@@ -990,17 +1081,16 @@ async fn handle_app_session_modify(app_session_id: &str, request: &SbiRequest) -
     };
 
     match app {
-        Some(app) => {
-            SbiResponse::with_status(200)
-                .with_json_body(&serde_json::json!({
-                    "appSessionId": app.app_session_id,
-                    "notifUri": app.notif_uri,
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(200))
-        }
-        None => {
-            send_not_found(&format!("App Session {app_session_id} not found"), Some("SESSION_NOT_FOUND"))
-        }
+        Some(app) => SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({
+                "appSessionId": app.app_session_id,
+                "notifUri": app.notif_uri,
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("App Session {app_session_id} not found"),
+            Some("SESSION_NOT_FOUND"),
+        ),
     }
 }
 
@@ -1063,7 +1153,9 @@ async fn run_event_loop_async(pcf_sm: &mut PcfSmContext, shutdown: Arc<AtomicBoo
         for entry in &expired {
             log::debug!(
                 "PCF timer expired: id={} type={:?} data={:?}",
-                entry.id, entry.timer_type, entry.data
+                entry.id,
+                entry.timer_type,
+                entry.data
             );
 
             // Create timer event and dispatch to state machine
@@ -1148,7 +1240,10 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
             log::info!("PCF registered with NRF successfully (id={nf_instance_id})");
             Ok(nf_instance_id)
         }
-        _ => Err(format!("NRF registration returned status {}", response.status)),
+        _ => Err(format!(
+            "NRF registration returned status {}",
+            response.status
+        )),
     }
 }
 
@@ -1158,7 +1253,9 @@ fn parse_nrf_host_port(uri: &str) -> Option<(String, u16)> {
         .strip_prefix("https://")
         .or_else(|| uri.strip_prefix("http://"))
         .unwrap_or(uri);
-    let (host_port, _) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    let (host_port, _) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
     if let Some((host, port_str)) = host_port.rsplit_once(':') {
         let port: u16 = port_str.parse().ok()?;
         Some((host.to_string(), port))
@@ -1233,20 +1330,16 @@ mod tests {
             arp_preempt_vuln: true,
             ambr_uplink: 100_000_000,
             ambr_downlink: 200_000_000,
-            pcc_rules: vec![
-                nudr_handler::PccRule {
-                    id: "rule-1".to_string(),
-                    precedence: 50,
-                    qos_index: 5,
-                    flow_status: npcf_handler::FlowStatus::Enabled,
-                    flows: vec![
-                        nudr_handler::FlowDescription {
-                            direction: nudr_handler::FlowDirection::Downlink,
-                            description: "permit out ip from any to assigned".to_string(),
-                        },
-                    ],
-                },
-            ],
+            pcc_rules: vec![nudr_handler::PccRule {
+                id: "rule-1".to_string(),
+                precedence: 50,
+                qos_index: 5,
+                flow_status: npcf_handler::FlowStatus::Enabled,
+                flows: vec![nudr_handler::FlowDescription {
+                    direction: nudr_handler::FlowDirection::Downlink,
+                    description: "permit out ip from any to assigned".to_string(),
+                }],
+            }],
         };
 
         let (sess_rules, pcc_rules, qos_decs, triggers) =

@@ -189,9 +189,15 @@ impl LmfContext {
         if !self.initialized.load(Ordering::SeqCst) {
             return;
         }
-        if let Ok(mut locs) = self.ue_locations.write() { locs.clear(); }
-        if let Ok(mut meas) = self.measurements.write() { meas.clear(); }
-        if let Ok(mut reps) = self.reports.write() { reps.clear(); }
+        if let Ok(mut locs) = self.ue_locations.write() {
+            locs.clear();
+        }
+        if let Ok(mut meas) = self.measurements.write() {
+            meas.clear();
+        }
+        if let Ok(mut reps) = self.reports.write() {
+            reps.clear();
+        }
         self.initialized.store(false, Ordering::SeqCst);
         log::info!("LMF context finalized");
     }
@@ -216,7 +222,10 @@ impl LmfContext {
         let mut measurements = self.measurements.write().ok()?;
 
         if measurements.len() >= self.max_measurements {
-            log::error!("Maximum concurrent measurements [{}] reached", self.max_measurements);
+            log::error!(
+                "Maximum concurrent measurements [{}] reached",
+                self.max_measurements
+            );
             return None;
         }
 
@@ -263,7 +272,10 @@ impl LmfContext {
 
         log::info!(
             "Measurement report processed: id={} lat={:.6} lon={:.6} accuracy={:.1}m",
-            request_id, location.latitude, location.longitude, location.horizontal_accuracy
+            request_id,
+            location.latitude,
+            location.longitude,
+            location.horizontal_accuracy
         );
 
         Some(location)
@@ -286,13 +298,16 @@ impl LmfContext {
                 ctx.last_location = Some(location);
                 return true;
             }
-            locs.insert(supi.to_string(), UeLocationContext {
-                supi: supi.to_string(),
-                amf_ue_ngap_id: 0,
-                serving_cell: String::new(),
-                last_location: Some(location),
-                active_measurement: None,
-            });
+            locs.insert(
+                supi.to_string(),
+                UeLocationContext {
+                    supi: supi.to_string(),
+                    amf_ue_ngap_id: 0,
+                    serving_cell: String::new(),
+                    last_location: Some(location),
+                    active_measurement: None,
+                },
+            );
             return true;
         }
         false
@@ -309,7 +324,10 @@ impl LmfContext {
 }
 
 /// Compute location estimate from cell measurements (simplified)
-fn compute_location(method: &PositioningMethod, measurements: &[CellMeasurement]) -> LocationEstimate {
+fn compute_location(
+    method: &PositioningMethod,
+    measurements: &[CellMeasurement],
+) -> LocationEstimate {
     if measurements.is_empty() {
         return LocationEstimate::default();
     }
@@ -318,7 +336,8 @@ fn compute_location(method: &PositioningMethod, measurements: &[CellMeasurement]
     let accuracy = match method {
         PositioningMethod::Ecid => {
             // ECID accuracy: ~100-300m typically
-            let best_rsrp = measurements.iter()
+            let best_rsrp = measurements
+                .iter()
                 .filter_map(|m| m.rsrp)
                 .max()
                 .unwrap_or(-100);
@@ -358,7 +377,8 @@ impl Default for LmfContext {
 }
 
 /// Global LMF context
-static GLOBAL_LMF_CONTEXT: std::sync::OnceLock<Arc<RwLock<LmfContext>>> = std::sync::OnceLock::new();
+static GLOBAL_LMF_CONTEXT: std::sync::OnceLock<Arc<RwLock<LmfContext>>> =
+    std::sync::OnceLock::new();
 
 pub fn lmf_self() -> Arc<RwLock<LmfContext>> {
     GLOBAL_LMF_CONTEXT
@@ -413,10 +433,15 @@ mod tests {
         let mut ctx = LmfContext::new();
         ctx.init(256);
 
-        let req = ctx.measurement_request(
-            1001, PositioningMethod::Ecid, None, Some("gnb-001".to_string()),
-            PositioningQos::BestEffort,
-        ).unwrap();
+        let req = ctx
+            .measurement_request(
+                1001,
+                PositioningMethod::Ecid,
+                None,
+                Some("gnb-001".to_string()),
+                PositioningQos::BestEffort,
+            )
+            .unwrap();
         assert_eq!(req.method, PositioningMethod::Ecid);
         assert_eq!(req.state, MeasurementState::Pending);
 
@@ -424,16 +449,14 @@ mod tests {
         assert_eq!(found.amf_ue_ngap_id, 1001);
 
         // Submit report
-        let cells = vec![
-            CellMeasurement {
-                nr_cgi: "001-01-0001-01".to_string(),
-                rsrp: Some(-80),
-                rsrq: Some(-10),
-                timing_advance: Some(100),
-                aoa: None,
-                rtt_ns: None,
-            },
-        ];
+        let cells = vec![CellMeasurement {
+            nr_cgi: "001-01-0001-01".to_string(),
+            rsrp: Some(-80),
+            rsrq: Some(-10),
+            timing_advance: Some(100),
+            aoa: None,
+            rtt_ns: None,
+        }];
 
         let location = ctx.measurement_report(req.request_id, cells).unwrap();
         assert!(location.horizontal_accuracy > 0.0);
@@ -450,12 +473,15 @@ mod tests {
         let mut ctx = LmfContext::new();
         ctx.init(256);
 
-        let req = ctx.measurement_request(
-            2001, PositioningMethod::NrBased,
-            Some(NrPositioningMethod::MultiRtt),
-            Some("gnb-002".to_string()),
-            PositioningQos::HighAccuracy,
-        ).unwrap();
+        let req = ctx
+            .measurement_request(
+                2001,
+                PositioningMethod::NrBased,
+                Some(NrPositioningMethod::MultiRtt),
+                Some("gnb-002".to_string()),
+                PositioningQos::HighAccuracy,
+            )
+            .unwrap();
 
         let cells = vec![
             CellMeasurement {
@@ -517,7 +543,11 @@ mod tests {
     fn test_compute_location_gnss() {
         let cells = vec![CellMeasurement {
             nr_cgi: "test-cell".to_string(),
-            rsrp: None, rsrq: None, timing_advance: None, aoa: None, rtt_ns: None,
+            rsrp: None,
+            rsrq: None,
+            timing_advance: None,
+            aoa: None,
+            rtt_ns: None,
         }];
         let loc = compute_location(&PositioningMethod::Gnss, &cells);
         assert!(loc.horizontal_accuracy <= 5.0); // GNSS is accurate

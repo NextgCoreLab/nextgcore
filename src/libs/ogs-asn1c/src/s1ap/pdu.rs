@@ -2,9 +2,9 @@
 //!
 //! Top-level PDU structures from S1AP-PDU-Descriptions (3GPP TS 36.413)
 
-use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, PerResult, PerError};
-use super::types::{Criticality, ProcedureCode};
 use super::ies::ProtocolIeContainer;
+use super::types::{Criticality, ProcedureCode};
+use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, PerError, PerResult};
 
 /// S1AP-PDU - Top-level PDU for all S1AP messages
 /// ASN.1: S1AP-PDU ::= CHOICE { initiatingMessage, successfulOutcome, unsuccessfulOutcome }
@@ -43,9 +43,15 @@ impl AperDecode for S1apPdu {
     fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
         let index = decoder.decode_choice_index(Self::NUM_ALTERNATIVES, Self::EXTENSIBLE)?;
         match index {
-            0 => Ok(S1apPdu::InitiatingMessage(InitiatingMessage::decode_aper(decoder)?)),
-            1 => Ok(S1apPdu::SuccessfulOutcome(SuccessfulOutcome::decode_aper(decoder)?)),
-            2 => Ok(S1apPdu::UnsuccessfulOutcome(UnsuccessfulOutcome::decode_aper(decoder)?)),
+            0 => Ok(S1apPdu::InitiatingMessage(InitiatingMessage::decode_aper(
+                decoder,
+            )?)),
+            1 => Ok(S1apPdu::SuccessfulOutcome(SuccessfulOutcome::decode_aper(
+                decoder,
+            )?)),
+            2 => Ok(S1apPdu::UnsuccessfulOutcome(
+                UnsuccessfulOutcome::decode_aper(decoder)?,
+            )),
             _ => Err(PerError::InvalidChoiceIndex {
                 index,
                 max: Self::NUM_ALTERNATIVES - 1,
@@ -91,16 +97,16 @@ impl AperEncode for InitiatingMessage {
         // SEQUENCE with no extension marker in root
         self.procedure_code.encode_aper(encoder)?;
         self.criticality.encode_aper(encoder)?;
-        
+
         // Value is encoded as OPEN TYPE (length + content)
         let mut value_encoder = AperEncoder::new();
         self.value.encode_aper(&mut value_encoder)?;
         value_encoder.align();
         let value_bytes = value_encoder.into_bytes();
-        
+
         encoder.encode_length_determinant(value_bytes.len())?;
         encoder.write_bytes(&value_bytes);
-        
+
         Ok(())
     }
 }
@@ -109,100 +115,70 @@ impl AperDecode for InitiatingMessage {
     fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
         let procedure_code = ProcedureCode::decode_aper(decoder)?;
         let criticality = Criticality::decode_aper(decoder)?;
-        
+
         // Decode OPEN TYPE
         let value_len = decoder.decode_length_determinant()?;
         let value_bytes = decoder.read_bytes(value_len)?;
         let mut value_decoder = AperDecoder::new(&value_bytes);
-        
+
         let value = match procedure_code {
-            ProcedureCode::S1_SETUP => {
-                InitiatingMessageValue::S1SetupRequest(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
-            ProcedureCode::INITIAL_UE_MESSAGE => {
-                InitiatingMessageValue::InitialUeMessage(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
-            ProcedureCode::UPLINK_NAS_TRANSPORT => {
-                InitiatingMessageValue::UplinkNasTransport(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
-            ProcedureCode::DOWNLINK_NAS_TRANSPORT => {
-                InitiatingMessageValue::DownlinkNasTransport(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
+            ProcedureCode::S1_SETUP => InitiatingMessageValue::S1SetupRequest(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
+            ProcedureCode::INITIAL_UE_MESSAGE => InitiatingMessageValue::InitialUeMessage(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
+            ProcedureCode::UPLINK_NAS_TRANSPORT => InitiatingMessageValue::UplinkNasTransport(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
+            ProcedureCode::DOWNLINK_NAS_TRANSPORT => InitiatingMessageValue::DownlinkNasTransport(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
             ProcedureCode::INITIAL_CONTEXT_SETUP => {
                 InitiatingMessageValue::InitialContextSetupRequest(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
+                    ProtocolIeContainer::decode_aper(&mut value_decoder)?,
                 )
             }
-            ProcedureCode::UE_CONTEXT_RELEASE => {
-                InitiatingMessageValue::UeContextReleaseCommand(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
+            ProcedureCode::UE_CONTEXT_RELEASE => InitiatingMessageValue::UeContextReleaseCommand(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
             ProcedureCode::UE_CONTEXT_RELEASE_REQUEST => {
-                InitiatingMessageValue::UeContextReleaseRequest(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
+                InitiatingMessageValue::UeContextReleaseRequest(ProtocolIeContainer::decode_aper(
+                    &mut value_decoder,
+                )?)
             }
-            ProcedureCode::E_RAB_SETUP => {
-                InitiatingMessageValue::ERabSetupRequest(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
-            ProcedureCode::E_RAB_MODIFY => {
-                InitiatingMessageValue::ERabModifyRequest(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
-            ProcedureCode::E_RAB_RELEASE => {
-                InitiatingMessageValue::ERabReleaseCommand(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
-            ProcedureCode::HANDOVER_PREPARATION => {
-                InitiatingMessageValue::HandoverRequired(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
-            ProcedureCode::HANDOVER_RESOURCE_ALLOCATION => {
-                InitiatingMessageValue::HandoverRequest(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
-            ProcedureCode::PATH_SWITCH_REQUEST => {
-                InitiatingMessageValue::PathSwitchRequest(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
+            ProcedureCode::E_RAB_SETUP => InitiatingMessageValue::ERabSetupRequest(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
+            ProcedureCode::E_RAB_MODIFY => InitiatingMessageValue::ERabModifyRequest(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
+            ProcedureCode::E_RAB_RELEASE => InitiatingMessageValue::ERabReleaseCommand(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
+            ProcedureCode::HANDOVER_PREPARATION => InitiatingMessageValue::HandoverRequired(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
+            ProcedureCode::HANDOVER_RESOURCE_ALLOCATION => InitiatingMessageValue::HandoverRequest(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
+            ProcedureCode::PATH_SWITCH_REQUEST => InitiatingMessageValue::PathSwitchRequest(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
             ProcedureCode::RESET => {
-                InitiatingMessageValue::Reset(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
+                InitiatingMessageValue::Reset(ProtocolIeContainer::decode_aper(&mut value_decoder)?)
             }
-            ProcedureCode::ERROR_INDICATION => {
-                InitiatingMessageValue::ErrorIndication(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
-            ProcedureCode::PAGING => {
-                InitiatingMessageValue::Paging(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
+            ProcedureCode::ERROR_INDICATION => InitiatingMessageValue::ErrorIndication(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
+            ProcedureCode::PAGING => InitiatingMessageValue::Paging(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
             _ => {
-                InitiatingMessageValue::Other(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
+                InitiatingMessageValue::Other(ProtocolIeContainer::decode_aper(&mut value_decoder)?)
             }
         };
-        
+
         Ok(InitiatingMessage {
             procedure_code,
             criticality,
@@ -235,7 +211,6 @@ impl AperEncode for InitiatingMessageValue {
     }
 }
 
-
 /// SuccessfulOutcome - Response messages for successful procedures
 /// ASN.1: SuccessfulOutcome ::= SEQUENCE { procedureCode, criticality, value }
 #[derive(Debug, Clone, PartialEq)]
@@ -265,15 +240,15 @@ impl AperEncode for SuccessfulOutcome {
     fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()> {
         self.procedure_code.encode_aper(encoder)?;
         self.criticality.encode_aper(encoder)?;
-        
+
         let mut value_encoder = AperEncoder::new();
         self.value.encode_aper(&mut value_encoder)?;
         value_encoder.align();
         let value_bytes = value_encoder.into_bytes();
-        
+
         encoder.encode_length_determinant(value_bytes.len())?;
         encoder.write_bytes(&value_bytes);
-        
+
         Ok(())
     }
 }
@@ -282,69 +257,53 @@ impl AperDecode for SuccessfulOutcome {
     fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
         let procedure_code = ProcedureCode::decode_aper(decoder)?;
         let criticality = Criticality::decode_aper(decoder)?;
-        
+
         let value_len = decoder.decode_length_determinant()?;
         let value_bytes = decoder.read_bytes(value_len)?;
         let mut value_decoder = AperDecoder::new(&value_bytes);
-        
+
         let value = match procedure_code {
-            ProcedureCode::S1_SETUP => {
-                SuccessfulOutcomeValue::S1SetupResponse(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
+            ProcedureCode::S1_SETUP => SuccessfulOutcomeValue::S1SetupResponse(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
             ProcedureCode::INITIAL_CONTEXT_SETUP => {
                 SuccessfulOutcomeValue::InitialContextSetupResponse(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
+                    ProtocolIeContainer::decode_aper(&mut value_decoder)?,
                 )
             }
-            ProcedureCode::UE_CONTEXT_RELEASE => {
-                SuccessfulOutcomeValue::UeContextReleaseComplete(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
-            ProcedureCode::E_RAB_SETUP => {
-                SuccessfulOutcomeValue::ERabSetupResponse(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
-            ProcedureCode::E_RAB_MODIFY => {
-                SuccessfulOutcomeValue::ERabModifyResponse(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
-            ProcedureCode::E_RAB_RELEASE => {
-                SuccessfulOutcomeValue::ERabReleaseResponse(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
-            ProcedureCode::HANDOVER_PREPARATION => {
-                SuccessfulOutcomeValue::HandoverCommand(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
+            ProcedureCode::UE_CONTEXT_RELEASE => SuccessfulOutcomeValue::UeContextReleaseComplete(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
+            ProcedureCode::E_RAB_SETUP => SuccessfulOutcomeValue::ERabSetupResponse(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
+            ProcedureCode::E_RAB_MODIFY => SuccessfulOutcomeValue::ERabModifyResponse(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
+            ProcedureCode::E_RAB_RELEASE => SuccessfulOutcomeValue::ERabReleaseResponse(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
+            ProcedureCode::HANDOVER_PREPARATION => SuccessfulOutcomeValue::HandoverCommand(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
             ProcedureCode::HANDOVER_RESOURCE_ALLOCATION => {
                 SuccessfulOutcomeValue::HandoverRequestAcknowledge(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
+                    ProtocolIeContainer::decode_aper(&mut value_decoder)?,
                 )
             }
             ProcedureCode::PATH_SWITCH_REQUEST => {
                 SuccessfulOutcomeValue::PathSwitchRequestAcknowledge(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
+                    ProtocolIeContainer::decode_aper(&mut value_decoder)?,
                 )
             }
-            ProcedureCode::RESET => {
-                SuccessfulOutcomeValue::ResetAcknowledge(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
+            ProcedureCode::RESET => SuccessfulOutcomeValue::ResetAcknowledge(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
             _ => {
-                SuccessfulOutcomeValue::Other(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
+                SuccessfulOutcomeValue::Other(ProtocolIeContainer::decode_aper(&mut value_decoder)?)
             }
         };
-        
+
         Ok(SuccessfulOutcome {
             procedure_code,
             criticality,
@@ -395,15 +354,15 @@ impl AperEncode for UnsuccessfulOutcome {
     fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()> {
         self.procedure_code.encode_aper(encoder)?;
         self.criticality.encode_aper(encoder)?;
-        
+
         let mut value_encoder = AperEncoder::new();
         self.value.encode_aper(&mut value_encoder)?;
         value_encoder.align();
         let value_bytes = value_encoder.into_bytes();
-        
+
         encoder.encode_length_determinant(value_bytes.len())?;
         encoder.write_bytes(&value_bytes);
-        
+
         Ok(())
     }
 }
@@ -412,44 +371,40 @@ impl AperDecode for UnsuccessfulOutcome {
     fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
         let procedure_code = ProcedureCode::decode_aper(decoder)?;
         let criticality = Criticality::decode_aper(decoder)?;
-        
+
         let value_len = decoder.decode_length_determinant()?;
         let value_bytes = decoder.read_bytes(value_len)?;
         let mut value_decoder = AperDecoder::new(&value_bytes);
-        
+
         let value = match procedure_code {
-            ProcedureCode::S1_SETUP => {
-                UnsuccessfulOutcomeValue::S1SetupFailure(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
+            ProcedureCode::S1_SETUP => UnsuccessfulOutcomeValue::S1SetupFailure(
+                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
+            ),
             ProcedureCode::INITIAL_CONTEXT_SETUP => {
                 UnsuccessfulOutcomeValue::InitialContextSetupFailure(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
+                    ProtocolIeContainer::decode_aper(&mut value_decoder)?,
                 )
             }
             ProcedureCode::HANDOVER_PREPARATION => {
                 UnsuccessfulOutcomeValue::HandoverPreparationFailure(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
+                    ProtocolIeContainer::decode_aper(&mut value_decoder)?,
                 )
             }
             ProcedureCode::HANDOVER_RESOURCE_ALLOCATION => {
-                UnsuccessfulOutcomeValue::HandoverFailure(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
+                UnsuccessfulOutcomeValue::HandoverFailure(ProtocolIeContainer::decode_aper(
+                    &mut value_decoder,
+                )?)
             }
             ProcedureCode::PATH_SWITCH_REQUEST => {
                 UnsuccessfulOutcomeValue::PathSwitchRequestFailure(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
+                    ProtocolIeContainer::decode_aper(&mut value_decoder)?,
                 )
             }
-            _ => {
-                UnsuccessfulOutcomeValue::Other(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?
-                )
-            }
+            _ => UnsuccessfulOutcomeValue::Other(ProtocolIeContainer::decode_aper(
+                &mut value_decoder,
+            )?),
         };
-        
+
         Ok(UnsuccessfulOutcome {
             procedure_code,
             criticality,
@@ -473,10 +428,10 @@ impl AperEncode for UnsuccessfulOutcomeValue {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::per::{AperEncoder, AperDecoder};
     use super::super::ies::ProtocolIeField;
     use super::super::types::{Criticality, ProtocolIeId};
+    use super::*;
+    use crate::per::{AperDecoder, AperEncoder};
 
     #[test]
     fn test_s1ap_pdu_initiating_message_roundtrip() {
@@ -486,21 +441,21 @@ mod tests {
             criticality: Criticality::Reject,
             value: vec![0x00, 0x01, 0x02, 0x03],
         });
-        
+
         let pdu = S1apPdu::InitiatingMessage(InitiatingMessage {
             procedure_code: ProcedureCode::S1_SETUP,
             criticality: Criticality::Reject,
             value: InitiatingMessageValue::S1SetupRequest(container),
         });
-        
+
         let mut encoder = AperEncoder::new();
         pdu.encode_aper(&mut encoder).unwrap();
         encoder.align();
-        
+
         let bytes = encoder.into_bytes();
         let mut decoder = AperDecoder::new(&bytes);
         let decoded = S1apPdu::decode_aper(&mut decoder).unwrap();
-        
+
         match decoded {
             S1apPdu::InitiatingMessage(msg) => {
                 assert_eq!(msg.procedure_code, ProcedureCode::S1_SETUP);
@@ -513,21 +468,21 @@ mod tests {
     #[test]
     fn test_s1ap_pdu_successful_outcome_roundtrip() {
         let container = ProtocolIeContainer::new();
-        
+
         let pdu = S1apPdu::SuccessfulOutcome(SuccessfulOutcome {
             procedure_code: ProcedureCode::S1_SETUP,
             criticality: Criticality::Reject,
             value: SuccessfulOutcomeValue::S1SetupResponse(container),
         });
-        
+
         let mut encoder = AperEncoder::new();
         pdu.encode_aper(&mut encoder).unwrap();
         encoder.align();
-        
+
         let bytes = encoder.into_bytes();
         let mut decoder = AperDecoder::new(&bytes);
         let decoded = S1apPdu::decode_aper(&mut decoder).unwrap();
-        
+
         match decoded {
             S1apPdu::SuccessfulOutcome(msg) => {
                 assert_eq!(msg.procedure_code, ProcedureCode::S1_SETUP);
@@ -539,21 +494,21 @@ mod tests {
     #[test]
     fn test_s1ap_pdu_unsuccessful_outcome_roundtrip() {
         let container = ProtocolIeContainer::new();
-        
+
         let pdu = S1apPdu::UnsuccessfulOutcome(UnsuccessfulOutcome {
             procedure_code: ProcedureCode::S1_SETUP,
             criticality: Criticality::Reject,
             value: UnsuccessfulOutcomeValue::S1SetupFailure(container),
         });
-        
+
         let mut encoder = AperEncoder::new();
         pdu.encode_aper(&mut encoder).unwrap();
         encoder.align();
-        
+
         let bytes = encoder.into_bytes();
         let mut decoder = AperDecoder::new(&bytes);
         let decoded = S1apPdu::decode_aper(&mut decoder).unwrap();
-        
+
         match decoded {
             S1apPdu::UnsuccessfulOutcome(msg) => {
                 assert_eq!(msg.procedure_code, ProcedureCode::S1_SETUP);

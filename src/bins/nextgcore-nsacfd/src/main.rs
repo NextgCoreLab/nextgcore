@@ -11,8 +11,8 @@ use clap::Parser;
 use ogs_sbi::context::global_context;
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::server::{
-    send_bad_request, send_method_not_allowed, send_not_found,
-    SbiServer, SbiServerConfig as OgsSbiServerConfig,
+    send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
+    SbiServerConfig as OgsSbiServerConfig,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -96,11 +96,10 @@ async fn main() -> Result<()> {
     init_logging(&args.log_level);
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
-            .with_endpoint(
-                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
-            ),
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+        ),
     )
     .ok();
 
@@ -123,8 +122,14 @@ async fn main() -> Result<()> {
 
     let mut sbi_server_config = OgsSbiServerConfig::new(addr);
     if args.tls {
-        let cert = args.tls_cert.as_deref().unwrap_or("/etc/nextgcore/tls/server.crt");
-        let key = args.tls_key.as_deref().unwrap_or("/etc/nextgcore/tls/server.key");
+        let cert = args
+            .tls_cert
+            .as_deref()
+            .unwrap_or("/etc/nextgcore/tls/server.crt");
+        let key = args
+            .tls_key
+            .as_deref()
+            .unwrap_or("/etc/nextgcore/tls/server.key");
         sbi_server_config = sbi_server_config.with_tls(key, cert);
         log::info!("TLS enabled: cert={cert}, key={key}");
     }
@@ -133,7 +138,9 @@ async fn main() -> Result<()> {
 
     log::info!("Starting NSACF SBI server on {addr}");
 
-    sbi_server.start(nsacf_sbi_request_handler).await
+    sbi_server
+        .start(nsacf_sbi_request_handler)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
     let scheme = if args.tls { "HTTPS" } else { "HTTP" };
@@ -157,7 +164,9 @@ async fn main() -> Result<()> {
 
     // Graceful shutdown
     log::info!("Shutting down...");
-    sbi_server.stop().await
+    sbi_server
+        .stop()
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
     log::info!("SBI HTTP/2 server stopped");
 
@@ -180,40 +189,30 @@ async fn nsacf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 
     match parts.as_slice() {
         // Slice Admission Control (Nnsacf_NSAC)
-        ["nnsacf-nsac", "v1", "slice-quotas"] => {
-            match method {
-                "POST" => handle_slice_quota_create(&request).await,
-                "GET" => handle_slice_quota_list().await,
-                _ => send_method_not_allowed(method, "slice-quotas"),
-            }
-        }
-        ["nnsacf-nsac", "v1", "slice-quotas", quota_id] => {
-            match method {
-                "GET" => handle_slice_quota_get(quota_id).await,
-                "DELETE" => handle_slice_quota_delete(quota_id).await,
-                _ => send_method_not_allowed(method, "slice-quotas/{id}"),
-            }
-        }
+        ["nnsacf-nsac", "v1", "slice-quotas"] => match method {
+            "POST" => handle_slice_quota_create(&request).await,
+            "GET" => handle_slice_quota_list().await,
+            _ => send_method_not_allowed(method, "slice-quotas"),
+        },
+        ["nnsacf-nsac", "v1", "slice-quotas", quota_id] => match method {
+            "GET" => handle_slice_quota_get(quota_id).await,
+            "DELETE" => handle_slice_quota_delete(quota_id).await,
+            _ => send_method_not_allowed(method, "slice-quotas/{id}"),
+        },
         // Admission control operations
-        ["nnsacf-nsac", "v1", "ue-admission"] => {
-            match method {
-                "POST" => handle_ue_admission(&request).await,
-                _ => send_method_not_allowed(method, "ue-admission"),
-            }
-        }
-        ["nnsacf-nsac", "v1", "ue-release"] => {
-            match method {
-                "POST" => handle_ue_release(&request).await,
-                _ => send_method_not_allowed(method, "ue-release"),
-            }
-        }
+        ["nnsacf-nsac", "v1", "ue-admission"] => match method {
+            "POST" => handle_ue_admission(&request).await,
+            _ => send_method_not_allowed(method, "ue-admission"),
+        },
+        ["nnsacf-nsac", "v1", "ue-release"] => match method {
+            "POST" => handle_ue_release(&request).await,
+            _ => send_method_not_allowed(method, "ue-release"),
+        },
         // Utilization reporting
-        ["nnsacf-nsac", "v1", "utilization"] => {
-            match method {
-                "GET" => handle_utilization_report().await,
-                _ => send_method_not_allowed(method, "utilization"),
-            }
-        }
+        ["nnsacf-nsac", "v1", "utilization"] => match method {
+            "GET" => handle_utilization_report().await,
+            _ => send_method_not_allowed(method, "utilization"),
+        },
         _ => {
             log::debug!("Unknown path: {path}");
             send_not_found(&format!("Resource not found: {path}"), None)
@@ -235,18 +234,19 @@ async fn handle_slice_quota_create(request: &SbiRequest) -> SbiResponse {
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let sst = data.get("sNssai")
+    let sst = data
+        .get("sNssai")
         .and_then(|s| s.get("sst"))
         .and_then(|v| v.as_u64())
         .unwrap_or(1) as u8;
-    let sd = data.get("sNssai")
+    let sd = data
+        .get("sNssai")
         .and_then(|s| s.get("sd"))
         .and_then(|v| v.as_str())
         .and_then(|s| u32::from_str_radix(s, 16).ok());
-    let max_ues = data.get("maxUes")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(10000);
-    let max_pdu = data.get("maxPduSessions")
+    let max_ues = data.get("maxUes").and_then(|v| v.as_u64()).unwrap_or(10000);
+    let max_pdu = data
+        .get("maxPduSessions")
         .and_then(|v| v.as_u64())
         .unwrap_or(50000);
 
@@ -267,7 +267,10 @@ async fn handle_slice_quota_create(request: &SbiRequest) -> SbiResponse {
             );
 
             SbiResponse::with_status(201)
-                .with_header("Location", format!("/nnsacf-nsac/v1/slice-quotas/{quota_id}"))
+                .with_header(
+                    "Location",
+                    format!("/nnsacf-nsac/v1/slice-quotas/{quota_id}"),
+                )
                 .with_json_body(&serde_json::json!({
                     "quotaId": quota_id,
                     "sNssai": {"sst": sst, "sd": sd.map(|v| format!("{v:06x}"))},
@@ -278,9 +281,7 @@ async fn handle_slice_quota_create(request: &SbiRequest) -> SbiResponse {
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(201))
         }
-        None => {
-            send_bad_request("Failed to create slice quota", Some("CREATION_FAILED"))
-        }
+        None => send_bad_request("Failed to create slice quota", Some("CREATION_FAILED")),
     }
 }
 
@@ -295,12 +296,15 @@ async fn handle_slice_quota_list() -> SbiResponse {
         vec![]
     };
 
-    let quotas: Vec<serde_json::Value> = utilization.iter().map(|(snssai, util)| {
-        serde_json::json!({
-            "sNssai": {"sst": snssai.sst, "sd": snssai.sd.map(|v| format!("{v:06x}"))},
-            "utilization": util,
+    let quotas: Vec<serde_json::Value> = utilization
+        .iter()
+        .map(|(snssai, util)| {
+            serde_json::json!({
+                "sNssai": {"sst": snssai.sst, "sd": snssai.sd.map(|v| format!("{v:06x}"))},
+                "utilization": util,
+            })
         })
-    }).collect();
+        .collect();
 
     SbiResponse::with_status(200)
         .with_json_body(&serde_json::json!({"sliceQuotas": quotas}))
@@ -354,7 +358,12 @@ async fn handle_slice_quota_delete(quota_id: &str) -> SbiResponse {
 
     let pool_id = match pool_id {
         Some(id) => id,
-        None => return send_not_found(&format!("Slice quota {quota_id} not found"), Some("QUOTA_NOT_FOUND")),
+        None => {
+            return send_not_found(
+                &format!("Slice quota {quota_id} not found"),
+                Some("QUOTA_NOT_FOUND"),
+            )
+        }
     };
 
     let ctx = nsacf_self();
@@ -367,7 +376,10 @@ async fn handle_slice_quota_delete(quota_id: &str) -> SbiResponse {
     if removed {
         SbiResponse::with_status(204)
     } else {
-        send_not_found(&format!("Slice quota {quota_id} not found"), Some("QUOTA_NOT_FOUND"))
+        send_not_found(
+            &format!("Slice quota {quota_id} not found"),
+            Some("QUOTA_NOT_FOUND"),
+        )
     }
 }
 
@@ -385,15 +397,18 @@ async fn handle_ue_admission(request: &SbiRequest) -> SbiResponse {
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let sst = data.get("sNssai")
+    let sst = data
+        .get("sNssai")
         .and_then(|s| s.get("sst"))
         .and_then(|v| v.as_u64())
         .unwrap_or(1) as u8;
-    let sd = data.get("sNssai")
+    let sd = data
+        .get("sNssai")
         .and_then(|s| s.get("sd"))
         .and_then(|v| v.as_str())
         .and_then(|s| u32::from_str_radix(s, 16).ok());
-    let supi = data.get("supi")
+    let supi = data
+        .get("supi")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
 
@@ -455,11 +470,13 @@ async fn handle_ue_release(request: &SbiRequest) -> SbiResponse {
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let sst = data.get("sNssai")
+    let sst = data
+        .get("sNssai")
         .and_then(|s| s.get("sst"))
         .and_then(|v| v.as_u64())
         .unwrap_or(1) as u8;
-    let sd = data.get("sNssai")
+    let sd = data
+        .get("sNssai")
         .and_then(|s| s.get("sd"))
         .and_then(|v| v.as_str())
         .and_then(|s| u32::from_str_radix(s, 16).ok());
@@ -487,12 +504,15 @@ async fn handle_utilization_report() -> SbiResponse {
         vec![]
     };
 
-    let entries: Vec<serde_json::Value> = utilization.iter().map(|(snssai, util)| {
-        serde_json::json!({
-            "sNssai": {"sst": snssai.sst, "sd": snssai.sd.map(|v| format!("{v:06x}"))},
-            "ueUtilization": util,
+    let entries: Vec<serde_json::Value> = utilization
+        .iter()
+        .map(|(snssai, util)| {
+            serde_json::json!({
+                "sNssai": {"sst": snssai.sst, "sd": snssai.sd.map(|v| format!("{v:06x}"))},
+                "ueUtilization": util,
+            })
         })
-    }).collect();
+        .collect();
 
     SbiResponse::with_status(200)
         .with_json_body(&serde_json::json!({"sliceUtilization": entries}))
@@ -500,7 +520,11 @@ async fn handle_utilization_report() -> SbiResponse {
 }
 
 /// Register NSACF with NRF
-async fn register_with_nrf(sbi_addr: &str, sbi_port: u16, nf_instance_id: &str) -> Result<(), String> {
+async fn register_with_nrf(
+    sbi_addr: &str,
+    sbi_port: u16,
+    nf_instance_id: &str,
+) -> Result<(), String> {
     let sbi_ctx = global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
@@ -546,10 +570,8 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16, nf_instance_id: &str) 
         200 | 201 => {
             log::info!("NSACF registered with NRF successfully (id={nf_instance_id})");
 
-            let mut self_instance = ogs_sbi::context::NfInstance::new(
-                nf_instance_id,
-                ogs_sbi::types::NfType::Nsacf,
-            );
+            let mut self_instance =
+                ogs_sbi::context::NfInstance::new(nf_instance_id, ogs_sbi::types::NfType::Nsacf);
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
             let mut svc = ogs_sbi::context::NfService::new(
                 "nnsacf-nsac",
@@ -562,7 +584,10 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16, nf_instance_id: &str) 
 
             Ok(())
         }
-        _ => Err(format!("NRF registration returned status {}", response.status)),
+        _ => Err(format!(
+            "NRF registration returned status {}",
+            response.status
+        )),
     }
 }
 
@@ -572,7 +597,9 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
         .strip_prefix("https://")
         .or_else(|| uri.strip_prefix("http://"))
         .unwrap_or(uri);
-    let (host_port, _path) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    let (host_port, _path) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
     if let Some((host, port_str)) = host_port.rsplit_once(':') {
         let port: u16 = port_str.parse().ok()?;
         Some((host.to_string(), port))
@@ -599,9 +626,12 @@ mod tests {
     fn test_args_custom() {
         let args = Args::parse_from([
             "nextgcore-nsacfd",
-            "--sbi-port", "8813",
-            "--max-quotas", "128",
-            "--nrf-uri", "http://nrf:7777",
+            "--sbi-port",
+            "8813",
+            "--max-quotas",
+            "128",
+            "--nrf-uri",
+            "http://nrf:7777",
         ]);
         assert_eq!(args.sbi_port, 8813);
         assert_eq!(args.max_quotas, 128);

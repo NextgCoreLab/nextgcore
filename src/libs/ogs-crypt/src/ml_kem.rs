@@ -12,8 +12,8 @@
 //! - FIPS 203: Module-Lattice-Based Key-Encapsulation Mechanism Standard
 //! - 3GPP TR 33.831: Study on Post-Quantum Cryptography
 
-use ml_kem::{KemCore, MlKem512, MlKem768, MlKem1024, Encoded, EncodedSizeUser};
 use ml_kem::kem::{Decapsulate, Encapsulate};
+use ml_kem::{Encoded, EncodedSizeUser, KemCore, MlKem1024, MlKem512, MlKem768};
 use p256::elliptic_curve::rand_core::OsRng;
 use thiserror::Error;
 
@@ -96,10 +96,11 @@ pub fn ml_kem_encapsulate(
     match level {
         MlKemLevel::Kem512 => {
             type Ek = <MlKem512 as KemCore>::EncapsulationKey;
-            let ek_enc = Encoded::<Ek>::try_from(public_key)
-                .map_err(|_| MlKemError::InvalidPublicKey)?;
+            let ek_enc =
+                Encoded::<Ek>::try_from(public_key).map_err(|_| MlKemError::InvalidPublicKey)?;
             let ek = Ek::from_bytes(&ek_enc);
-            let (ct, ss) = ek.encapsulate(&mut rng)
+            let (ct, ss) = ek
+                .encapsulate(&mut rng)
                 .map_err(|_| MlKemError::EncapsulationFailed)?;
             let mut shared_secret = [0u8; ML_KEM_SHARED_SECRET_SIZE];
             shared_secret.copy_from_slice(ss.as_slice());
@@ -107,10 +108,11 @@ pub fn ml_kem_encapsulate(
         }
         MlKemLevel::Kem768 => {
             type Ek = <MlKem768 as KemCore>::EncapsulationKey;
-            let ek_enc = Encoded::<Ek>::try_from(public_key)
-                .map_err(|_| MlKemError::InvalidPublicKey)?;
+            let ek_enc =
+                Encoded::<Ek>::try_from(public_key).map_err(|_| MlKemError::InvalidPublicKey)?;
             let ek = Ek::from_bytes(&ek_enc);
-            let (ct, ss) = ek.encapsulate(&mut rng)
+            let (ct, ss) = ek
+                .encapsulate(&mut rng)
                 .map_err(|_| MlKemError::EncapsulationFailed)?;
             let mut shared_secret = [0u8; ML_KEM_SHARED_SECRET_SIZE];
             shared_secret.copy_from_slice(ss.as_slice());
@@ -118,10 +120,11 @@ pub fn ml_kem_encapsulate(
         }
         MlKemLevel::Kem1024 => {
             type Ek = <MlKem1024 as KemCore>::EncapsulationKey;
-            let ek_enc = Encoded::<Ek>::try_from(public_key)
-                .map_err(|_| MlKemError::InvalidPublicKey)?;
+            let ek_enc =
+                Encoded::<Ek>::try_from(public_key).map_err(|_| MlKemError::InvalidPublicKey)?;
             let ek = Ek::from_bytes(&ek_enc);
-            let (ct, ss) = ek.encapsulate(&mut rng)
+            let (ct, ss) = ek
+                .encapsulate(&mut rng)
                 .map_err(|_| MlKemError::EncapsulationFailed)?;
             let mut shared_secret = [0u8; ML_KEM_SHARED_SECRET_SIZE];
             shared_secret.copy_from_slice(ss.as_slice());
@@ -147,13 +150,13 @@ pub fn ml_kem_decapsulate(
     match level {
         MlKemLevel::Kem512 => {
             type Dk = <MlKem512 as KemCore>::DecapsulationKey;
-            let dk_enc = Encoded::<Dk>::try_from(secret_key)
-                .map_err(|_| MlKemError::InvalidSecretKey)?;
+            let dk_enc =
+                Encoded::<Dk>::try_from(secret_key).map_err(|_| MlKemError::InvalidSecretKey)?;
             let dk = Dk::from_bytes(&dk_enc);
             type Ct = ml_kem::Ciphertext<MlKem512>;
-            let ct_enc = Ct::try_from(ciphertext)
-                .map_err(|_| MlKemError::InvalidCiphertext)?;
-            let ss = dk.decapsulate(&ct_enc)
+            let ct_enc = Ct::try_from(ciphertext).map_err(|_| MlKemError::InvalidCiphertext)?;
+            let ss = dk
+                .decapsulate(&ct_enc)
                 .map_err(|_| MlKemError::DecapsulationFailed)?;
             let mut shared_secret = [0u8; ML_KEM_SHARED_SECRET_SIZE];
             shared_secret.copy_from_slice(ss.as_slice());
@@ -161,13 +164,13 @@ pub fn ml_kem_decapsulate(
         }
         MlKemLevel::Kem768 => {
             type Dk = <MlKem768 as KemCore>::DecapsulationKey;
-            let dk_enc = Encoded::<Dk>::try_from(secret_key)
-                .map_err(|_| MlKemError::InvalidSecretKey)?;
+            let dk_enc =
+                Encoded::<Dk>::try_from(secret_key).map_err(|_| MlKemError::InvalidSecretKey)?;
             let dk = Dk::from_bytes(&dk_enc);
             type Ct = ml_kem::Ciphertext<MlKem768>;
-            let ct_enc = Ct::try_from(ciphertext)
-                .map_err(|_| MlKemError::InvalidCiphertext)?;
-            let ss = dk.decapsulate(&ct_enc)
+            let ct_enc = Ct::try_from(ciphertext).map_err(|_| MlKemError::InvalidCiphertext)?;
+            let ss = dk
+                .decapsulate(&ct_enc)
                 .map_err(|_| MlKemError::DecapsulationFailed)?;
             let mut shared_secret = [0u8; ML_KEM_SHARED_SECRET_SIZE];
             shared_secret.copy_from_slice(ss.as_slice());
@@ -175,13 +178,13 @@ pub fn ml_kem_decapsulate(
         }
         MlKemLevel::Kem1024 => {
             type Dk = <MlKem1024 as KemCore>::DecapsulationKey;
-            let dk_enc = Encoded::<Dk>::try_from(secret_key)
-                .map_err(|_| MlKemError::InvalidSecretKey)?;
+            let dk_enc =
+                Encoded::<Dk>::try_from(secret_key).map_err(|_| MlKemError::InvalidSecretKey)?;
             let dk = Dk::from_bytes(&dk_enc);
             type Ct = ml_kem::Ciphertext<MlKem1024>;
-            let ct_enc = Ct::try_from(ciphertext)
-                .map_err(|_| MlKemError::InvalidCiphertext)?;
-            let ss = dk.decapsulate(&ct_enc)
+            let ct_enc = Ct::try_from(ciphertext).map_err(|_| MlKemError::InvalidCiphertext)?;
+            let ss = dk
+                .decapsulate(&ct_enc)
                 .map_err(|_| MlKemError::DecapsulationFailed)?;
             let mut shared_secret = [0u8; ML_KEM_SHARED_SECRET_SIZE];
             shared_secret.copy_from_slice(ss.as_slice());

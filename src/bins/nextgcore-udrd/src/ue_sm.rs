@@ -87,7 +87,9 @@ impl UdrUeSmContext {
     fn transition(&mut self, new_state: UdrUeState) {
         log::debug!(
             "[{}] UDR UE SM: {:?} -> {:?}",
-            self.supi, self.state, new_state
+            self.supi,
+            self.state,
+            new_state
         );
         self.state = new_state;
     }
@@ -126,7 +128,11 @@ impl UdrUeSmContext {
                 log::debug!("[{}] UDR UE exiting exception state", self.supi);
             }
             _ => {
-                log::error!("[{}] UDR UE SM: Unexpected event in exception: {}", self.supi, event.name());
+                log::error!(
+                    "[{}] UDR UE SM: Unexpected event in exception: {}",
+                    self.supi,
+                    event.name()
+                );
             }
         }
     }

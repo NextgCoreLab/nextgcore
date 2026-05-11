@@ -2,8 +2,8 @@
 //!
 //! IE types and encoding/decoding for PFCP protocol as specified in 3GPP TS 29.244.
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::error::{PfcpError, PfcpResult};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// PFCP IE Type values (TS 29.244 Section 8.1)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,7 +364,6 @@ impl TryFrom<u16> for IeType {
     }
 }
 
-
 /// PFCP IE Header (4 bytes)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IeHeader {
@@ -486,38 +485,77 @@ impl VolumeMeasurement {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
         let mut flags = 0u8;
-        if self.total_volume.is_some() { flags |= 0x01; }
-        if self.uplink_volume.is_some() { flags |= 0x02; }
-        if self.downlink_volume.is_some() { flags |= 0x04; }
-        if self.total_packets.is_some() { flags |= 0x08; }
-        if self.uplink_packets.is_some() { flags |= 0x10; }
-        if self.downlink_packets.is_some() { flags |= 0x20; }
+        if self.total_volume.is_some() {
+            flags |= 0x01;
+        }
+        if self.uplink_volume.is_some() {
+            flags |= 0x02;
+        }
+        if self.downlink_volume.is_some() {
+            flags |= 0x04;
+        }
+        if self.total_packets.is_some() {
+            flags |= 0x08;
+        }
+        if self.uplink_packets.is_some() {
+            flags |= 0x10;
+        }
+        if self.downlink_packets.is_some() {
+            flags |= 0x20;
+        }
 
         buf.put_u8(flags);
-        if let Some(v) = self.total_volume { buf.put_u64(v); }
-        if let Some(v) = self.uplink_volume { buf.put_u64(v); }
-        if let Some(v) = self.downlink_volume { buf.put_u64(v); }
-        if let Some(v) = self.total_packets { buf.put_u64(v); }
-        if let Some(v) = self.uplink_packets { buf.put_u64(v); }
-        if let Some(v) = self.downlink_packets { buf.put_u64(v); }
+        if let Some(v) = self.total_volume {
+            buf.put_u64(v);
+        }
+        if let Some(v) = self.uplink_volume {
+            buf.put_u64(v);
+        }
+        if let Some(v) = self.downlink_volume {
+            buf.put_u64(v);
+        }
+        if let Some(v) = self.total_packets {
+            buf.put_u64(v);
+        }
+        if let Some(v) = self.uplink_packets {
+            buf.put_u64(v);
+        }
+        if let Some(v) = self.downlink_packets {
+            buf.put_u64(v);
+        }
 
         buf.freeze()
     }
 
     pub fn decode(data: &[u8]) -> PfcpResult<Self> {
         if data.is_empty() {
-            return Err(PfcpError::BufferTooShort { needed: 1, available: 0 });
+            return Err(PfcpError::BufferTooShort {
+                needed: 1,
+                available: 0,
+            });
         }
         let mut buf = Bytes::copy_from_slice(data);
         let flags = buf.get_u8();
         let mut vm = VolumeMeasurement::default();
 
-        if flags & 0x01 != 0 { vm.total_volume = Some(buf.get_u64()); }
-        if flags & 0x02 != 0 { vm.uplink_volume = Some(buf.get_u64()); }
-        if flags & 0x04 != 0 { vm.downlink_volume = Some(buf.get_u64()); }
-        if flags & 0x08 != 0 { vm.total_packets = Some(buf.get_u64()); }
-        if flags & 0x10 != 0 { vm.uplink_packets = Some(buf.get_u64()); }
-        if flags & 0x20 != 0 { vm.downlink_packets = Some(buf.get_u64()); }
+        if flags & 0x01 != 0 {
+            vm.total_volume = Some(buf.get_u64());
+        }
+        if flags & 0x02 != 0 {
+            vm.uplink_volume = Some(buf.get_u64());
+        }
+        if flags & 0x04 != 0 {
+            vm.downlink_volume = Some(buf.get_u64());
+        }
+        if flags & 0x08 != 0 {
+            vm.total_packets = Some(buf.get_u64());
+        }
+        if flags & 0x10 != 0 {
+            vm.uplink_packets = Some(buf.get_u64());
+        }
+        if flags & 0x20 != 0 {
+            vm.downlink_packets = Some(buf.get_u64());
+        }
 
         Ok(vm)
     }
@@ -536,7 +574,10 @@ impl DurationMeasurement {
 
     pub fn decode(data: &[u8]) -> PfcpResult<Self> {
         if data.len() < 4 {
-            return Err(PfcpError::BufferTooShort { needed: 4, available: data.len() });
+            return Err(PfcpError::BufferTooShort {
+                needed: 4,
+                available: data.len(),
+            });
         }
         let mut buf = Bytes::copy_from_slice(data);
         Ok(DurationMeasurement(buf.get_u32()))
@@ -555,29 +596,50 @@ impl VolumeThreshold {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
         let mut flags = 0u8;
-        if self.total_volume.is_some() { flags |= 0x01; }
-        if self.uplink_volume.is_some() { flags |= 0x02; }
-        if self.downlink_volume.is_some() { flags |= 0x04; }
+        if self.total_volume.is_some() {
+            flags |= 0x01;
+        }
+        if self.uplink_volume.is_some() {
+            flags |= 0x02;
+        }
+        if self.downlink_volume.is_some() {
+            flags |= 0x04;
+        }
 
         buf.put_u8(flags);
-        if let Some(v) = self.total_volume { buf.put_u64(v); }
-        if let Some(v) = self.uplink_volume { buf.put_u64(v); }
-        if let Some(v) = self.downlink_volume { buf.put_u64(v); }
+        if let Some(v) = self.total_volume {
+            buf.put_u64(v);
+        }
+        if let Some(v) = self.uplink_volume {
+            buf.put_u64(v);
+        }
+        if let Some(v) = self.downlink_volume {
+            buf.put_u64(v);
+        }
 
         buf.freeze()
     }
 
     pub fn decode(data: &[u8]) -> PfcpResult<Self> {
         if data.is_empty() {
-            return Err(PfcpError::BufferTooShort { needed: 1, available: 0 });
+            return Err(PfcpError::BufferTooShort {
+                needed: 1,
+                available: 0,
+            });
         }
         let mut buf = Bytes::copy_from_slice(data);
         let flags = buf.get_u8();
         let mut vt = VolumeThreshold::default();
 
-        if flags & 0x01 != 0 { vt.total_volume = Some(buf.get_u64()); }
-        if flags & 0x02 != 0 { vt.uplink_volume = Some(buf.get_u64()); }
-        if flags & 0x04 != 0 { vt.downlink_volume = Some(buf.get_u64()); }
+        if flags & 0x01 != 0 {
+            vt.total_volume = Some(buf.get_u64());
+        }
+        if flags & 0x02 != 0 {
+            vt.uplink_volume = Some(buf.get_u64());
+        }
+        if flags & 0x04 != 0 {
+            vt.downlink_volume = Some(buf.get_u64());
+        }
 
         Ok(vt)
     }
@@ -599,14 +661,30 @@ pub struct ReportingTriggers {
 impl ReportingTriggers {
     pub fn encode(&self) -> Bytes {
         let mut flags = 0u16;
-        if self.periodic_reporting { flags |= 0x0001; }
-        if self.volume_threshold { flags |= 0x0002; }
-        if self.time_threshold { flags |= 0x0004; }
-        if self.quota_holding_time { flags |= 0x0008; }
-        if self.start_of_traffic { flags |= 0x0010; }
-        if self.stop_of_traffic { flags |= 0x0020; }
-        if self.dropped_dl_traffic_threshold { flags |= 0x0040; }
-        if self.linked_usage_reporting { flags |= 0x0080; }
+        if self.periodic_reporting {
+            flags |= 0x0001;
+        }
+        if self.volume_threshold {
+            flags |= 0x0002;
+        }
+        if self.time_threshold {
+            flags |= 0x0004;
+        }
+        if self.quota_holding_time {
+            flags |= 0x0008;
+        }
+        if self.start_of_traffic {
+            flags |= 0x0010;
+        }
+        if self.stop_of_traffic {
+            flags |= 0x0020;
+        }
+        if self.dropped_dl_traffic_threshold {
+            flags |= 0x0040;
+        }
+        if self.linked_usage_reporting {
+            flags |= 0x0080;
+        }
 
         let mut buf = BytesMut::new();
         buf.put_u16(flags);
@@ -615,7 +693,10 @@ impl ReportingTriggers {
 
     pub fn decode(data: &[u8]) -> PfcpResult<Self> {
         if data.len() < 2 {
-            return Err(PfcpError::BufferTooShort { needed: 2, available: data.len() });
+            return Err(PfcpError::BufferTooShort {
+                needed: 2,
+                available: data.len(),
+            });
         }
         let mut buf = Bytes::copy_from_slice(data);
         let flags = buf.get_u16();
@@ -644,16 +725,25 @@ pub struct ReportType {
 impl ReportType {
     pub fn encode(&self) -> Bytes {
         let mut flags = 0u8;
-        if self.downlink_data_report { flags |= 0x01; }
-        if self.usage_report { flags |= 0x02; }
-        if self.error_indication_report { flags |= 0x04; }
+        if self.downlink_data_report {
+            flags |= 0x01;
+        }
+        if self.usage_report {
+            flags |= 0x02;
+        }
+        if self.error_indication_report {
+            flags |= 0x04;
+        }
 
         Bytes::copy_from_slice(&[flags])
     }
 
     pub fn decode(data: &[u8]) -> PfcpResult<Self> {
         if data.is_empty() {
-            return Err(PfcpError::BufferTooShort { needed: 1, available: 0 });
+            return Err(PfcpError::BufferTooShort {
+                needed: 1,
+                available: 0,
+            });
         }
         let flags = data[0];
 
@@ -678,11 +768,21 @@ pub struct UsageReportTrigger {
 impl UsageReportTrigger {
     pub fn encode(&self) -> Bytes {
         let mut flags = 0u16;
-        if self.immediate_report { flags |= 0x0001; }
-        if self.volume_threshold { flags |= 0x0002; }
-        if self.time_threshold { flags |= 0x0004; }
-        if self.periodic_reporting { flags |= 0x0008; }
-        if self.event_threshold { flags |= 0x0010; }
+        if self.immediate_report {
+            flags |= 0x0001;
+        }
+        if self.volume_threshold {
+            flags |= 0x0002;
+        }
+        if self.time_threshold {
+            flags |= 0x0004;
+        }
+        if self.periodic_reporting {
+            flags |= 0x0008;
+        }
+        if self.event_threshold {
+            flags |= 0x0010;
+        }
 
         let mut buf = BytesMut::new();
         buf.put_u16(flags);
@@ -691,7 +791,10 @@ impl UsageReportTrigger {
 
     pub fn decode(data: &[u8]) -> PfcpResult<Self> {
         if data.len() < 2 {
-            return Err(PfcpError::BufferTooShort { needed: 2, available: data.len() });
+            return Err(PfcpError::BufferTooShort {
+                needed: 2,
+                available: data.len(),
+            });
         }
         let mut buf = Bytes::copy_from_slice(data);
         let flags = buf.get_u16();
@@ -719,8 +822,12 @@ impl PacketRate {
     pub fn encode(&self) -> Bytes {
         let mut buf = BytesMut::new();
         let mut flags = 0u8;
-        if self.uplink_time_unit.is_some() { flags |= 0x01; }
-        if self.downlink_time_unit.is_some() { flags |= 0x02; }
+        if self.uplink_time_unit.is_some() {
+            flags |= 0x01;
+        }
+        if self.downlink_time_unit.is_some() {
+            flags |= 0x02;
+        }
 
         buf.put_u8(flags);
         if let Some(unit) = self.uplink_time_unit {
@@ -737,7 +844,10 @@ impl PacketRate {
 
     pub fn decode(data: &[u8]) -> PfcpResult<Self> {
         if data.is_empty() {
-            return Err(PfcpError::BufferTooShort { needed: 1, available: 0 });
+            return Err(PfcpError::BufferTooShort {
+                needed: 1,
+                available: 0,
+            });
         }
         let mut buf = Bytes::copy_from_slice(data);
         let flags = buf.get_u8();
@@ -770,7 +880,10 @@ impl QerControlIndications {
 
     pub fn decode(data: &[u8]) -> PfcpResult<Self> {
         if data.is_empty() {
-            return Err(PfcpError::BufferTooShort { needed: 1, available: 0 });
+            return Err(PfcpError::BufferTooShort {
+                needed: 1,
+                available: 0,
+            });
         }
         Ok(QerControlIndications {
             rcsr: data[0] & 0x01 != 0,
@@ -789,15 +902,24 @@ pub struct MeasurementMethod {
 impl MeasurementMethod {
     pub fn encode(&self) -> Bytes {
         let mut flags = 0u8;
-        if self.duration { flags |= 0x01; }
-        if self.volume { flags |= 0x02; }
-        if self.event { flags |= 0x04; }
+        if self.duration {
+            flags |= 0x01;
+        }
+        if self.volume {
+            flags |= 0x02;
+        }
+        if self.event {
+            flags |= 0x04;
+        }
         Bytes::copy_from_slice(&[flags])
     }
 
     pub fn decode(data: &[u8]) -> PfcpResult<Self> {
         if data.is_empty() {
-            return Err(PfcpError::BufferTooShort { needed: 1, available: 0 });
+            return Err(PfcpError::BufferTooShort {
+                needed: 1,
+                available: 0,
+            });
         }
         Ok(MeasurementMethod {
             duration: data[0] & 0x01 != 0,
@@ -810,25 +932,36 @@ impl MeasurementMethod {
 /// MeasurementInformation (IE 100) - Information about measurements
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeasurementInformation {
-    pub mbqe: bool,  // Measurement Before QoS Enforcement
-    pub inam: bool,  // Inactive Measurement
-    pub radi: bool,  // Reduced Application Detection Information
-    pub istm: bool,  // Immediate Start Time Metering
+    pub mbqe: bool, // Measurement Before QoS Enforcement
+    pub inam: bool, // Inactive Measurement
+    pub radi: bool, // Reduced Application Detection Information
+    pub istm: bool, // Immediate Start Time Metering
 }
 
 impl MeasurementInformation {
     pub fn encode(&self) -> Bytes {
         let mut flags = 0u8;
-        if self.mbqe { flags |= 0x01; }
-        if self.inam { flags |= 0x02; }
-        if self.radi { flags |= 0x04; }
-        if self.istm { flags |= 0x08; }
+        if self.mbqe {
+            flags |= 0x01;
+        }
+        if self.inam {
+            flags |= 0x02;
+        }
+        if self.radi {
+            flags |= 0x04;
+        }
+        if self.istm {
+            flags |= 0x08;
+        }
         Bytes::copy_from_slice(&[flags])
     }
 
     pub fn decode(data: &[u8]) -> PfcpResult<Self> {
         if data.is_empty() {
-            return Err(PfcpError::BufferTooShort { needed: 1, available: 0 });
+            return Err(PfcpError::BufferTooShort {
+                needed: 1,
+                available: 0,
+            });
         }
         Ok(MeasurementInformation {
             mbqe: data[0] & 0x01 != 0,

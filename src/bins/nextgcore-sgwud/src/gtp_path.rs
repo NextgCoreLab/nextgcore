@@ -254,11 +254,7 @@ pub enum GtpuRecvResult {
 
 /// Handle received GTP-U packet
 /// Port of _gtpv1_u_recv_cb
-pub fn handle_gtpu_recv(
-    data: &[u8],
-    from_addr: &str,
-    local_addr: &str,
-) -> GtpuRecvResult {
+pub fn handle_gtpu_recv(data: &[u8], from_addr: &str, local_addr: &str) -> GtpuRecvResult {
     // Parse GTP-U header
     let (header, header_len) = match GtpuHeader::parse(data) {
         Some(h) => h,
@@ -281,18 +277,14 @@ pub fn handle_gtpu_recv(
     );
 
     match header.msg_type {
-        gtpu_type::ECHO_REQUEST => {
-            handle_echo_request(&header, from_addr)
-        }
+        gtpu_type::ECHO_REQUEST => handle_echo_request(&header, from_addr),
         gtpu_type::END_MARKER => {
             handle_end_marker(&header, &data[header_len..], from_addr, local_addr)
         }
         gtpu_type::ERROR_INDICATION => {
             handle_error_indication(&header, &data[header_len..], from_addr)
         }
-        gtpu_type::G_PDU => {
-            handle_gpdu(&header, &data[header_len..], from_addr, local_addr)
-        }
+        gtpu_type::G_PDU => handle_gpdu(&header, &data[header_len..], from_addr, local_addr),
         _ => {
             log::error!("[DROP] Invalid GTPU Type [{}]", header.msg_type);
             GtpuRecvResult::Dropped("Unknown message type".to_string())
@@ -420,7 +412,7 @@ fn build_echo_response(request: &GtpuHeader) -> Vec<u8> {
     if request.s {
         // Recovery IE: Type (14), Length (1), Recovery value
         data.push(14); // Recovery IE type
-        data.push(0);  // Recovery value (placeholder)
+        data.push(0); // Recovery value (placeholder)
     }
 
     data
@@ -557,7 +549,11 @@ pub fn process_uplink_packet(
     }
 
     if pdr.far.apply_action & apply_action::BUFF != 0 {
-        log::debug!("PDR {} BUFF uplink packet, TEID=0x{:x}", pdr.pdr_id, header.teid);
+        log::debug!(
+            "PDR {} BUFF uplink packet, TEID=0x{:x}",
+            pdr.pdr_id,
+            header.teid
+        );
         return GtpuRecvResult::Buffered;
     }
 
@@ -581,7 +577,8 @@ pub fn process_uplink_packet(
             let mut fwd_packet = fwd_header.build();
             fwd_packet.extend_from_slice(payload);
 
-            let peer_str = ohc.peer_addr
+            let peer_str = ohc
+                .peer_addr
                 .map(|a| format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]))
                 .unwrap_or_else(|| "unknown".to_string());
 
@@ -645,7 +642,8 @@ pub fn process_downlink_packet(
             let mut fwd_packet = fwd_header.build();
             fwd_packet.extend_from_slice(payload);
 
-            let peer_str = ohc.peer_addr
+            let peer_str = ohc
+                .peer_addr
                 .map(|a| format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3]))
                 .unwrap_or_else(|| "unknown".to_string());
 
@@ -834,11 +832,7 @@ mod tests {
         let data = [
             0x32, // Version=1, PT=1, S=1
             0x01, // Echo Request
-            0x00, 0x04,
-            0x00, 0x00, 0x00, 0x00,
-            0x00, 0x01,
-            0x00,
-            0x00,
+            0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
         ];
         let result = handle_gtpu_recv(&data, "10.0.0.1", "10.0.0.2");
         assert!(matches!(result, GtpuRecvResult::EchoResponse));
@@ -847,9 +841,17 @@ mod tests {
     #[test]
     fn test_process_uplink_packet_forward() {
         let header = GtpuHeader {
-            version: 1, pt: true, e: false, s: false, pn: false,
-            msg_type: gtpu_type::G_PDU, length: 4, teid: 0x100,
-            seq_num: None, npdu_num: None, next_ext_hdr_type: None,
+            version: 1,
+            pt: true,
+            e: false,
+            s: false,
+            pn: false,
+            msg_type: gtpu_type::G_PDU,
+            length: 4,
+            teid: 0x100,
+            seq_num: None,
+            npdu_num: None,
+            next_ext_hdr_type: None,
         };
         let payload = &[0x45, 0x00, 0x00, 0x1c]; // IP header fragment
 
@@ -874,9 +876,17 @@ mod tests {
     #[test]
     fn test_process_uplink_packet_drop() {
         let header = GtpuHeader {
-            version: 1, pt: true, e: false, s: false, pn: false,
-            msg_type: gtpu_type::G_PDU, length: 4, teid: 0x100,
-            seq_num: None, npdu_num: None, next_ext_hdr_type: None,
+            version: 1,
+            pt: true,
+            e: false,
+            s: false,
+            pn: false,
+            msg_type: gtpu_type::G_PDU,
+            length: 4,
+            teid: 0x100,
+            seq_num: None,
+            npdu_num: None,
+            next_ext_hdr_type: None,
         };
 
         let pdr = PdrEntry {
@@ -896,9 +906,17 @@ mod tests {
     #[test]
     fn test_process_downlink_packet_buffer() {
         let header = GtpuHeader {
-            version: 1, pt: true, e: false, s: false, pn: false,
-            msg_type: gtpu_type::G_PDU, length: 4, teid: 0x300,
-            seq_num: None, npdu_num: None, next_ext_hdr_type: None,
+            version: 1,
+            pt: true,
+            e: false,
+            s: false,
+            pn: false,
+            msg_type: gtpu_type::G_PDU,
+            length: 4,
+            teid: 0x300,
+            seq_num: None,
+            npdu_num: None,
+            next_ext_hdr_type: None,
         };
 
         let pdr = PdrEntry {

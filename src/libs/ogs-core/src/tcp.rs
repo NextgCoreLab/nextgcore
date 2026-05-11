@@ -8,7 +8,10 @@ use crate::socket::{ogs_sock_bind, ogs_sock_connect, ogs_sock_listen, ogs_sock_s
 use crate::sockopt::{ogs_listen_reusable, ogs_so_linger, ogs_tcp_nodelay, OgsSockopt};
 
 /// Create a TCP server socket (identical to ogs_tcp_server)
-pub fn ogs_tcp_server(sa_list: &OgsSockaddr, socket_option: Option<&OgsSockopt>) -> Option<OgsSock> {
+pub fn ogs_tcp_server(
+    sa_list: &OgsSockaddr,
+    socket_option: Option<&OgsSockopt>,
+) -> Option<OgsSock> {
     let option = socket_option.cloned().unwrap_or_default();
 
     let mut current = Some(sa_list);
@@ -59,7 +62,10 @@ pub fn ogs_tcp_server(sa_list: &OgsSockaddr, socket_option: Option<&OgsSockopt>)
 }
 
 /// Create a TCP client socket (identical to ogs_tcp_client)
-pub fn ogs_tcp_client(sa_list: &OgsSockaddr, socket_option: Option<&OgsSockopt>) -> Option<OgsSock> {
+pub fn ogs_tcp_client(
+    sa_list: &OgsSockaddr,
+    socket_option: Option<&OgsSockopt>,
+) -> Option<OgsSock> {
     let option = socket_option.cloned().unwrap_or_default();
 
     let mut current = Some(sa_list);

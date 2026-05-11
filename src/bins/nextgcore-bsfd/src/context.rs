@@ -64,10 +64,10 @@ impl Ipv6Prefix {
         if parts.len() != 2 {
             return None;
         }
-        
+
         let addr: Ipv6Addr = parts[0].parse().ok()?;
         let len: u8 = parts[1].parse().ok()?;
-        
+
         Some(Self {
             len,
             addr6: addr.octets(),
@@ -89,7 +89,6 @@ impl fmt::Display for Ipv6Prefix {
         write!(f, "{addr}/{}", self.len)
     }
 }
-
 
 /// BSF Session structure
 /// Port of bsf_sess_t from context.h
@@ -199,7 +198,6 @@ impl BsfSess {
     }
 }
 
-
 /// BSF Context - main context structure for BSF
 /// Port of bsf_context_t from context.h
 pub struct BsfContext {
@@ -266,7 +264,10 @@ impl BsfContext {
         let mut sess_list = self.sess_list.write().ok()?;
 
         if sess_list.len() >= self.max_num_of_sess {
-            log::error!("Maximum number of sessions [{}] reached", self.max_num_of_sess);
+            log::error!(
+                "Maximum number of sessions [{}] reached",
+                self.max_num_of_sess
+            );
             return None;
         }
 
@@ -290,28 +291,34 @@ impl BsfContext {
                 return None;
             }
             // Add to IPv6 hash
-            if let (Ok(mut hash), Some(ref prefix)) = (self.ipv6prefix_hash.write(), &sess.ipv6prefix) {
+            if let (Ok(mut hash), Some(ref prefix)) =
+                (self.ipv6prefix_hash.write(), &sess.ipv6prefix)
+            {
                 hash.insert(prefix.hash_key(), id);
             }
         }
 
         sess_list.insert(id, sess.clone());
-        log::debug!("BSF session added (id={id}, ipv4={ipv4addr_string:?}, ipv6={ipv6prefix_string:?})");
-        
+        log::debug!(
+            "BSF session added (id={id}, ipv4={ipv4addr_string:?}, ipv6={ipv6prefix_string:?})"
+        );
+
         Some(sess)
     }
 
     /// Remove session
     pub fn sess_remove(&self, id: u64) -> Option<BsfSess> {
         let mut sess_list = self.sess_list.write().ok()?;
-        
+
         if let Some(sess) = sess_list.remove(&id) {
             // Remove from IPv4 hash
             if let (Ok(mut hash), Some(addr)) = (self.ipv4addr_hash.write(), sess.ipv4addr) {
                 hash.remove(&addr);
             }
             // Remove from IPv6 hash
-            if let (Ok(mut hash), Some(ref prefix)) = (self.ipv6prefix_hash.write(), &sess.ipv6prefix) {
+            if let (Ok(mut hash), Some(ref prefix)) =
+                (self.ipv6prefix_hash.write(), &sess.ipv6prefix)
+            {
                 hash.remove(&prefix.hash_key());
             }
             log::debug!("BSF session removed (id={id})");
@@ -349,10 +356,10 @@ impl BsfContext {
     pub fn sess_find_by_ipv4addr(&self, ipv4addr_string: &str) -> Option<BsfSess> {
         let addr: Ipv4Addr = ipv4addr_string.parse().ok()?;
         let addr_u32 = u32::from(addr);
-        
+
         let ipv4_hash = self.ipv4addr_hash.read().ok()?;
         let sess_id = ipv4_hash.get(&addr_u32)?;
-        
+
         let sess_list = self.sess_list.read().ok()?;
         sess_list.get(sess_id).cloned()
     }
@@ -361,10 +368,10 @@ impl BsfContext {
     pub fn sess_find_by_ipv6prefix(&self, ipv6prefix_string: &str) -> Option<BsfSess> {
         let prefix = Ipv6Prefix::from_string(ipv6prefix_string)?;
         let key = prefix.hash_key();
-        
+
         let ipv6_hash = self.ipv6prefix_hash.read().ok()?;
         let sess_id = ipv6_hash.get(&key)?;
-        
+
         let sess_list = self.sess_list.read().ok()?;
         sess_list.get(sess_id).cloned()
     }
@@ -456,9 +463,8 @@ impl BsfContext {
 }
 
 /// Get the BSF bindings collection from MongoDB
-fn get_bsf_bindings_collection()
-    -> DbiResult<ogs_dbi::mongodb::sync::Collection<ogs_dbi::mongodb::bson::Document>>
-{
+fn get_bsf_bindings_collection(
+) -> DbiResult<ogs_dbi::mongodb::sync::Collection<ogs_dbi::mongodb::bson::Document>> {
     let dbi = ogs_mongoc();
     let dbi_guard = dbi.lock().unwrap();
     let db = dbi_guard
@@ -570,9 +576,9 @@ impl Default for BsfContext {
     }
 }
 
-
 /// Global BSF context (thread-safe singleton)
-static GLOBAL_BSF_CONTEXT: std::sync::OnceLock<Arc<RwLock<BsfContext>>> = std::sync::OnceLock::new();
+static GLOBAL_BSF_CONTEXT: std::sync::OnceLock<Arc<RwLock<BsfContext>>> =
+    std::sync::OnceLock::new();
 
 /// Get the global BSF context
 pub fn bsf_self() -> Arc<RwLock<BsfContext>> {
@@ -631,7 +637,9 @@ mod tests {
         let mut ctx = BsfContext::new();
         ctx.init(100);
 
-        let sess = ctx.sess_add_by_ip_address(Some("192.168.1.1"), None).unwrap();
+        let sess = ctx
+            .sess_add_by_ip_address(Some("192.168.1.1"), None)
+            .unwrap();
         assert_eq!(sess.ipv4addr_string, Some("192.168.1.1".to_string()));
         assert_eq!(ctx.sess_count(), 1);
 
@@ -645,7 +653,9 @@ mod tests {
         let mut ctx = BsfContext::new();
         ctx.init(100);
 
-        let sess = ctx.sess_add_by_ip_address(None, Some("2001:db8::1/128")).unwrap();
+        let sess = ctx
+            .sess_add_by_ip_address(None, Some("2001:db8::1/128"))
+            .unwrap();
         assert_eq!(sess.ipv6prefix_string, Some("2001:db8::1/128".to_string()));
         assert_eq!(ctx.sess_count(), 1);
 
@@ -658,11 +668,10 @@ mod tests {
         let mut ctx = BsfContext::new();
         ctx.init(100);
 
-        let sess = ctx.sess_add_by_ip_address(
-            Some("10.0.0.1"), 
-            Some("fd00::1/128")
-        ).unwrap();
-        
+        let sess = ctx
+            .sess_add_by_ip_address(Some("10.0.0.1"), Some("fd00::1/128"))
+            .unwrap();
+
         assert!(sess.ipv4addr_string.is_some());
         assert!(sess.ipv6prefix_string.is_some());
     }
@@ -672,7 +681,9 @@ mod tests {
         let mut ctx = BsfContext::new();
         ctx.init(100);
 
-        let sess = ctx.sess_add_by_ip_address(Some("192.168.1.1"), None).unwrap();
+        let sess = ctx
+            .sess_add_by_ip_address(Some("192.168.1.1"), None)
+            .unwrap();
         assert_eq!(ctx.sess_count(), 1);
 
         ctx.sess_remove(sess.id);
@@ -687,7 +698,9 @@ mod tests {
         let mut ctx = BsfContext::new();
         ctx.init(100);
 
-        let sess = ctx.sess_add_by_ip_address(Some("192.168.1.1"), None).unwrap();
+        let sess = ctx
+            .sess_add_by_ip_address(Some("192.168.1.1"), None)
+            .unwrap();
         let binding_id = sess.binding_id.clone();
 
         let found = ctx.sess_find_by_binding_id(&binding_id);
@@ -726,7 +739,7 @@ mod tests {
     fn test_ipv6_prefix() {
         let prefix = Ipv6Prefix::from_string("2001:db8::1/64").unwrap();
         assert_eq!(prefix.len, 64);
-        
+
         let prefix_str = prefix.to_string();
         assert!(prefix_str.contains("/64"));
     }

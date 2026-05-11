@@ -5,62 +5,106 @@
 //!
 //! Ported from lib/app/ in the C implementation.
 
-pub mod yaml;
 pub mod config;
 pub mod context;
 pub mod init;
 #[cfg(feature = "6g-extensions")]
-pub mod intent;  // B3.2: Intent-based configuration translation
+pub mod intent; // B3.2: Intent-based configuration translation
 #[cfg(feature = "6g-extensions")]
-pub mod nf_hooks; // #197: Cross-NF AI/ML hooks, digital twin, energy, intent API
+pub mod nf_hooks;
+pub mod yaml; // #197: Cross-NF AI/ML hooks, digital twin, energy, intent API
 
 #[cfg(test)]
 mod property_tests;
 
 // Re-export commonly used types
-pub use yaml::{OgsYamlDocument, OgsYamlIter, YamlError, YamlNodeType};
 pub use config::{
-    ConfigError, OgsGlobalConf, OgsLocalConf, OgsPlmnId, OgsSupiRange,
-    ParameterConf, MaxConf, SockoptConf, PkbufConfig, TimeConf,
-    ogs_time_from_sec, ogs_time_from_msec, parse_sockopt_config,
-    OGS_MAX_NUM_OF_PLMN, OGS_MAX_NUM_OF_SLICE, OGS_MAX_NUM_OF_SESS,
-    MAX_NUM_OF_UE, MAX_NUM_OF_PEER,
+    ogs_time_from_msec,
+    ogs_time_from_sec,
+    parse_sockopt_config,
+    ConfigDrift,
+    ConfigDriftDetector,
+    ConfigError,
+    DriftReport,
     // B3.4: Configuration drift detection
-    DriftSeverity, ConfigDrift, DriftReport, ConfigDriftDetector,
+    DriftSeverity,
+    MaxConf,
+    OgsGlobalConf,
+    OgsLocalConf,
+    OgsPlmnId,
+    OgsSupiRange,
+    ParameterConf,
+    PkbufConfig,
+    SockoptConf,
+    TimeConf,
+    MAX_NUM_OF_PEER,
+    MAX_NUM_OF_UE,
+    OGS_MAX_NUM_OF_PLMN,
+    OGS_MAX_NUM_OF_SESS,
+    OGS_MAX_NUM_OF_SLICE,
 };
 pub use context::{
-    OgsApp, OgsAppContext, OgsLogTs, LoggerConf, PoolConf, MetricsConf,
-    ogs_app, ogs_app_context_init, ogs_app_context_final,
-    ogs_global_conf, ogs_local_conf,
+    ogs_app, ogs_app_context_final, ogs_app_context_init, ogs_global_conf, ogs_local_conf,
+    LoggerConf, MetricsConf, OgsApp, OgsAppContext, OgsLogTs, PoolConf,
 };
 pub use init::{
-    InitError, CommandLineOptions, OgsAppInitializer,
-    ogs_app_initialize, ogs_app_terminate, ogs_app_config_read,
-    nf_common_init,
+    nf_common_init, ogs_app_config_read, ogs_app_initialize, ogs_app_terminate, CommandLineOptions,
+    InitError, OgsAppInitializer,
 };
 #[cfg(feature = "6g-extensions")]
 pub use intent::{
-    NetworkIntent, IntentTranslator, IntentError, IntentResult,
-    IntentPriority, SliceIntent, QosIntent, SecurityIntent, EnergyIntent,
-    AiMlIntent, DerivedConfig,
+    AiMlIntent,
+    DerivedConfig,
+    EnergyIntent,
+    IntentError,
+    IntentLifecycleManager,
+    IntentPriority,
+    IntentResult,
     // B3.5: Intent lifecycle management
-    IntentState, ManagedIntent, IntentLifecycleManager,
+    IntentState,
+    IntentTranslator,
+    ManagedIntent,
+    NetworkIntent,
+    QosIntent,
+    SecurityIntent,
+    SliceIntent,
 };
+pub use yaml::{OgsYamlDocument, OgsYamlIter, YamlError, YamlNodeType};
 
 #[cfg(feature = "6g-extensions")]
 pub use nf_hooks::{
-    AiMlHookPoint, AiMlHookAction, AiMlHook, AiMlHookRegistry,
-    NfStateSnapshot, NfStatus, DigitalTwinExporter,
-    NfEnergyState, EnergyRecommendation, EnergyCoordinator,
-    CrossNfIntent, CrossNfIntentCategory, IntentStatus, CrossNfIntentCoordinator,
-    // #214: Digital twin full state synchronization
-    NfStateDelta, SnapshotHistoryEntry, DigitalTwinSyncManager,
-    // #215: NF power profiling & optimization
-    PowerComponent, ComponentPowerProfile, PowerOptimization, PowerAction, NfPowerProfiler,
+    AiMlHook,
+    AiMlHookAction,
+    AiMlHookPoint,
+    AiMlHookRegistry,
+    ComponentPowerProfile,
+    CrossNfIntent,
+    CrossNfIntentCategory,
+    CrossNfIntentCoordinator,
+    DeployedModel,
+    DigitalTwinExporter,
+    DigitalTwinSyncManager,
+    EnergyCoordinator,
+    EnergyRecommendation,
+    IntentStatus,
     // B6.5: AI/ML model version registry
-    ModelDeploymentStatus, DeployedModel, ModelVersionRegistry,
+    ModelDeploymentStatus,
+    ModelVersionRegistry,
+    NfEnergyState,
+    NfPowerProfiler,
+    // #214: Digital twin full state synchronization
+    NfStateDelta,
+    NfStateSnapshot,
+    NfStatus,
+    PowerAction,
+    // #215: NF power profiling & optimization
+    PowerComponent,
+    PowerOptimization,
+    ScenarioResult,
+    ScenarioSimulator,
+    SnapshotHistoryEntry,
     // B6.6: Digital twin scenario simulator
-    WhatIfScenario, ScenarioResult, ScenarioSimulator,
+    WhatIfScenario,
 };
 
 // Macros are automatically exported via #[macro_export]

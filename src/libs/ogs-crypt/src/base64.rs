@@ -2,8 +2,7 @@
 //!
 //! Exact port of lib/crypt/ogs-base64.c
 
-const ENCODE_TABLE: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+const ENCODE_TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Encode bytes to base64 string
 pub fn encode(input: &[u8]) -> String {

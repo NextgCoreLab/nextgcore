@@ -24,7 +24,7 @@ pub trait PoolItem {
 }
 
 /// Generic object pool with identical semantics to C version
-/// 
+///
 /// Uses a circular buffer for the free list (head/tail pointers)
 /// and maintains an index array for O(1) lookup by index.
 pub struct OgsPool<T> {
@@ -52,13 +52,13 @@ impl<T> OgsPool<T> {
         let mut free = Vec::with_capacity(size);
         let mut array = Vec::with_capacity(size);
         let mut index = Vec::with_capacity(size);
-        
+
         for i in 0..size {
             free.push(Some(i));
             array.push(None);
             index.push(false);
         }
-        
+
         OgsPool {
             name: name.to_string(),
             head: 0,
@@ -225,7 +225,7 @@ impl<T: PoolItem + Default> OgsPoolWithId<T> {
     /// Allocate an item and assign it a unique ID (identical to ogs_pool_id_calloc)
     pub fn alloc(&mut self) -> Option<(OgsPoolId, usize)> {
         let index = self.pool.alloc()?;
-        
+
         // Generate next ID (wrapping from MIN to MAX)
         let id = self.next_id;
         self.next_id = if self.next_id == OGS_MAX_POOL_ID {
@@ -233,15 +233,15 @@ impl<T: PoolItem + Default> OgsPoolWithId<T> {
         } else {
             self.next_id + 1
         };
-        
+
         // Set ID on the item
         if let Some(item) = self.pool.find_mut(index) {
             item.set_id(id);
         }
-        
+
         // Add to hash
         self.id_hash.insert(id, index);
-        
+
         Some((id, index))
     }
 
@@ -360,21 +360,21 @@ mod tests {
     #[test]
     fn test_pool_alloc_free() {
         let mut pool: OgsPool<TestItem> = OgsPool::new("test_pool", 5);
-        
+
         // Allocate
         let idx1 = pool.alloc().unwrap();
         assert_eq!(pool.available(), 4);
         assert_eq!(pool.allocated(), 1);
-        
+
         let idx2 = pool.alloc().unwrap();
         assert_eq!(pool.available(), 3);
         assert_eq!(pool.allocated(), 2);
-        
+
         // Free
         pool.free(idx1);
         assert_eq!(pool.available(), 4);
         assert_eq!(pool.allocated(), 1);
-        
+
         pool.free(idx2);
         assert_eq!(pool.available(), 5);
         assert_eq!(pool.allocated(), 0);
@@ -383,18 +383,18 @@ mod tests {
     #[test]
     fn test_pool_find() {
         let mut pool: OgsPool<TestItem> = OgsPool::new("test_pool", 5);
-        
+
         let idx = pool.alloc().unwrap();
-        
+
         // Modify the item
         if let Some(item) = pool.find_mut(idx) {
             item.value = 42;
         }
-        
+
         // Find and verify
         let item = pool.find(idx).unwrap();
         assert_eq!(item.value, 42);
-        
+
         // Invalid index should return None
         assert!(pool.find(0).is_none());
         assert!(pool.find(100).is_none());
@@ -403,11 +403,11 @@ mod tests {
     #[test]
     fn test_pool_full() {
         let mut pool: OgsPool<TestItem> = OgsPool::new("test_pool", 3);
-        
+
         let _idx1 = pool.alloc().unwrap();
         let _idx2 = pool.alloc().unwrap();
         let _idx3 = pool.alloc().unwrap();
-        
+
         assert!(pool.is_full());
         assert!(pool.alloc().is_none());
     }
@@ -415,22 +415,22 @@ mod tests {
     #[test]
     fn test_pool_circular_reuse() {
         let mut pool: OgsPool<TestItem> = OgsPool::new("test_pool", 3);
-        
+
         // Allocate all
         let idx1 = pool.alloc().unwrap();
         let idx2 = pool.alloc().unwrap();
         let idx3 = pool.alloc().unwrap();
-        
+
         // Free in different order
         pool.free(idx2);
         pool.free(idx1);
         pool.free(idx3);
-        
+
         // Reallocate - should get slots back in FIFO order
         let new_idx1 = pool.alloc().unwrap();
         let new_idx2 = pool.alloc().unwrap();
         let new_idx3 = pool.alloc().unwrap();
-        
+
         // The indices should be reused
         assert!(new_idx1 > 0 && new_idx1 <= 3);
         assert!(new_idx2 > 0 && new_idx2 <= 3);
@@ -440,19 +440,19 @@ mod tests {
     #[test]
     fn test_pool_with_id() {
         let mut pool: OgsPoolWithId<TestItem> = OgsPoolWithId::new("test_pool", 5);
-        
+
         // Allocate with ID
         let (id1, _idx1) = pool.alloc().unwrap();
         let (id2, _idx2) = pool.alloc().unwrap();
-        
+
         assert!((OGS_MIN_POOL_ID..=OGS_MAX_POOL_ID).contains(&id1));
         assert!((OGS_MIN_POOL_ID..=OGS_MAX_POOL_ID).contains(&id2));
         assert_ne!(id1, id2);
-        
+
         // Find by ID
         let item1 = pool.find_by_id(id1).unwrap();
         assert_eq!(item1.id(), id1);
-        
+
         // Free by ID
         pool.free_by_id(id1);
         assert!(pool.find_by_id(id1).is_none());
@@ -462,20 +462,20 @@ mod tests {
     #[test]
     fn test_pool_iter() {
         let mut pool: OgsPool<TestItem> = OgsPool::new("test_pool", 5);
-        
+
         let idx1 = pool.alloc().unwrap();
         let idx2 = pool.alloc().unwrap();
-        
+
         if let Some(item) = pool.find_mut(idx1) {
             item.value = 10;
         }
         if let Some(item) = pool.find_mut(idx2) {
             item.value = 20;
         }
-        
+
         let items: Vec<_> = pool.iter().collect();
         assert_eq!(items.len(), 2);
-        
+
         let values: Vec<i32> = items.iter().map(|(_, item)| item.value).collect();
         assert!(values.contains(&10));
         assert!(values.contains(&20));
@@ -495,10 +495,7 @@ mod tests {
         }
 
         fn pool_op_strategy() -> impl Strategy<Value = PoolOp> {
-            prop_oneof![
-                Just(PoolOp::Alloc),
-                (0..10usize).prop_map(PoolOp::Free),
-            ]
+            prop_oneof![Just(PoolOp::Alloc), (0..10usize).prop_map(PoolOp::Free),]
         }
 
         proptest! {
@@ -513,7 +510,7 @@ mod tests {
             ) {
                 let mut pool: OgsPool<TestItem> = OgsPool::new("test", size);
                 let mut allocated_indices: Vec<usize> = Vec::new();
-                
+
                 for op in ops {
                     match op {
                         PoolOp::Alloc => {
@@ -529,7 +526,7 @@ mod tests {
                             }
                         }
                     }
-                    
+
                     // Invariant check
                     prop_assert_eq!(
                         pool.available() + pool.allocated(),
@@ -548,14 +545,14 @@ mod tests {
             ) {
                 let mut pool: OgsPool<TestItem> = OgsPool::new("test", size);
                 let mut indices: Vec<usize> = Vec::new();
-                
+
                 for _ in 0..alloc_count {
                     if let Some(idx) = pool.alloc() {
                         prop_assert!(idx >= 1 && idx <= size, "Index {} out of range [1, {}]", idx, size);
                         indices.push(idx);
                     }
                 }
-                
+
                 // All indices should be unique
                 let unique: HashSet<_> = indices.iter().collect();
                 prop_assert_eq!(unique.len(), indices.len(), "All indices should be unique");
@@ -566,23 +563,23 @@ mod tests {
             #[test]
             fn prop_find_after_alloc(size in 1..20usize) {
                 let mut pool: OgsPool<TestItem> = OgsPool::new("test", size);
-                
+
                 // Allocate all
                 let mut indices = Vec::new();
                 while let Some(idx) = pool.alloc() {
                     indices.push(idx);
                 }
-                
+
                 // All should be findable
                 for idx in &indices {
                     prop_assert!(pool.find(*idx).is_some(), "Should find allocated item at index {}", idx);
                 }
-                
+
                 // Free all
                 for idx in &indices {
                     pool.free(*idx);
                 }
-                
+
                 // None should be findable
                 for idx in &indices {
                     prop_assert!(pool.find(*idx).is_none(), "Should not find freed item at index {}", idx);
@@ -595,12 +592,12 @@ mod tests {
             fn prop_capacity_limit(size in 1..50usize) {
                 let mut pool: OgsPool<TestItem> = OgsPool::new("test", size);
                 let mut count = 0;
-                
+
                 while pool.alloc().is_some() {
                     count += 1;
                     prop_assert!(count <= size, "Allocated more than capacity");
                 }
-                
+
                 prop_assert_eq!(count, size, "Should allocate exactly capacity items");
                 prop_assert!(pool.is_full(), "Pool should be full");
             }
@@ -610,7 +607,7 @@ mod tests {
             #[test]
             fn prop_reallocation(size in 1..20usize, cycles in 1..5usize) {
                 let mut pool: OgsPool<TestItem> = OgsPool::new("test", size);
-                
+
                 for _ in 0..cycles {
                     // Allocate all
                     let mut indices = Vec::new();
@@ -619,7 +616,7 @@ mod tests {
                     }
                     prop_assert_eq!(indices.len(), size);
                     prop_assert!(pool.is_full());
-                    
+
                     // Free all
                     for idx in indices {
                         pool.free(idx);
@@ -633,13 +630,13 @@ mod tests {
             #[test]
             fn prop_double_free_safe(size in 1..20usize) {
                 let mut pool: OgsPool<TestItem> = OgsPool::new("test", size);
-                
+
                 let idx = pool.alloc().unwrap();
                 let initial_avail = pool.available();
-                
+
                 pool.free(idx);
                 prop_assert_eq!(pool.available(), initial_avail + 1);
-                
+
                 // Double free should be a no-op
                 pool.free(idx);
                 prop_assert_eq!(pool.available(), initial_avail + 1, "Double free should not change available count");
@@ -653,12 +650,12 @@ mod tests {
                 alloc_count in 0..30usize
             ) {
                 let mut pool: OgsPool<TestItem> = OgsPool::new("test", size);
-                
+
                 let actual_alloc = alloc_count.min(size);
                 for _ in 0..actual_alloc {
                     pool.alloc();
                 }
-                
+
                 let iter_count = pool.iter().count();
                 prop_assert_eq!(iter_count, pool.allocated(), "Iterator count should match allocated");
             }
@@ -669,12 +666,12 @@ mod tests {
             fn prop_id_uniqueness(size in 1..30usize) {
                 let mut pool: OgsPoolWithId<TestItem> = OgsPoolWithId::new("test", size);
                 let mut ids: HashSet<OgsPoolId> = HashSet::new();
-                
+
                 while let Some((id, _)) = pool.alloc() {
                     prop_assert!(!ids.contains(&id), "ID {} should be unique", id);
                     ids.insert(id);
                 }
-                
+
                 prop_assert_eq!(ids.len(), size, "Should have {} unique IDs", size);
             }
 
@@ -684,12 +681,12 @@ mod tests {
             fn prop_id_lookup(size in 1..20usize) {
                 let mut pool: OgsPoolWithId<TestItem> = OgsPoolWithId::new("test", size);
                 let mut id_to_idx: HashMap<OgsPoolId, usize> = HashMap::new();
-                
+
                 // Allocate all
                 while let Some((id, idx)) = pool.alloc() {
                     id_to_idx.insert(id, idx);
                 }
-                
+
                 // Verify all lookups
                 for id in id_to_idx.keys() {
                     let item = pool.find_by_id(*id);

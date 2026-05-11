@@ -3,7 +3,6 @@
 //! Provides P4/eBPF-inspired programmable data plane abstractions
 //! and AI-driven energy-aware packet forwarding for 6G UPF.
 
-
 // ============================================================================
 // Programmable Data Plane
 // ============================================================================
@@ -46,7 +45,11 @@ pub enum MatchField {
 #[derive(Debug, Clone)]
 pub enum ForwardingAction {
     /// Forward to a GTP tunnel.
-    GtpEncap { teid: u32, dst_addr: [u8; 4], dst_port: u16 },
+    GtpEncap {
+        teid: u32,
+        dst_addr: [u8; 4],
+        dst_port: u16,
+    },
     /// Decapsulate GTP and forward.
     GtpDecap,
     /// Forward to local network.
@@ -93,9 +96,21 @@ impl ProgrammablePlane {
     pub fn new() -> Self {
         Self {
             stages: vec![
-                PipelineStage { name: "ingress_classifier".into(), table_id: 0, entries: Vec::new() },
-                PipelineStage { name: "qos_enforcer".into(), table_id: 1, entries: Vec::new() },
-                PipelineStage { name: "forwarding".into(), table_id: 2, entries: Vec::new() },
+                PipelineStage {
+                    name: "ingress_classifier".into(),
+                    table_id: 0,
+                    entries: Vec::new(),
+                },
+                PipelineStage {
+                    name: "qos_enforcer".into(),
+                    table_id: 1,
+                    entries: Vec::new(),
+                },
+                PipelineStage {
+                    name: "forwarding".into(),
+                    table_id: 2,
+                    entries: Vec::new(),
+                },
             ],
             next_entry_id: 1,
             total_packets: 0,
@@ -103,7 +118,13 @@ impl ProgrammablePlane {
     }
 
     /// Add a match-action entry to a stage.
-    pub fn add_entry(&mut self, table_id: u32, matches: Vec<MatchField>, action: ForwardingAction, priority: u16) -> u32 {
+    pub fn add_entry(
+        &mut self,
+        table_id: u32,
+        matches: Vec<MatchField>,
+        action: ForwardingAction,
+        priority: u16,
+    ) -> u32 {
         let id = self.next_entry_id;
         self.next_entry_id += 1;
 
@@ -275,7 +296,11 @@ impl EnergyForwardingProfile {
     /// Compute energy efficiency.
     pub fn compute_efficiency(&mut self, bits_forwarded: u64, interval_secs: f64) {
         let joules = self.power_watts * interval_secs;
-        self.bits_per_joule = if joules > 0.0 { bits_forwarded as f64 / joules } else { 0.0 };
+        self.bits_per_joule = if joules > 0.0 {
+            bits_forwarded as f64 / joules
+        } else {
+            0.0
+        };
     }
 
     /// Whether the UPF should shed load to save energy.
@@ -357,12 +382,7 @@ mod tests {
             100,
         );
         // Add a default drop
-        plane.add_entry(
-            0,
-            vec![],
-            ForwardingAction::Drop,
-            1,
-        );
+        plane.add_entry(0, vec![], ForwardingAction::Drop, 1);
 
         // Packet with matching TEID should hit the first rule
         let result = plane.classify_packet(0, &[MatchField::GtpTeid(0xABCD)]);
@@ -389,7 +409,12 @@ mod tests {
     #[test]
     fn test_pipeline_stats() {
         let mut plane = ProgrammablePlane::new();
-        plane.add_entry(0, vec![MatchField::GtpTeid(0xAA)], ForwardingAction::GtpDecap, 100);
+        plane.add_entry(
+            0,
+            vec![MatchField::GtpTeid(0xAA)],
+            ForwardingAction::GtpDecap,
+            100,
+        );
 
         // Classify a few packets to increment hit count
         plane.classify_packet(0, &[MatchField::GtpTeid(0xAA)]);

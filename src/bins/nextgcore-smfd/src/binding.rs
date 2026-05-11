@@ -12,8 +12,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::context::{
-    SmfSess, SmfBearer, SmfUe, PduSessionType, Qos, PacketFilter,
-    FlowDirection, IpfwRule,
+    FlowDirection, IpfwRule, PacketFilter, PduSessionType, Qos, SmfBearer, SmfSess, SmfUe,
 };
 
 // ============================================================================
@@ -119,7 +118,6 @@ impl Flow {
     }
 }
 
-
 // ============================================================================
 // QoS Parameters
 // ============================================================================
@@ -203,7 +201,6 @@ impl PccRule {
         }
     }
 
-
     /// Create a new 5GC install rule with ID
     pub fn new_5gc_install(id: &str) -> Self {
         Self {
@@ -274,7 +271,6 @@ impl SessionPolicy {
     }
 }
 
-
 // ============================================================================
 // Traffic Flow Template (TFT)
 // ============================================================================
@@ -340,7 +336,6 @@ pub struct Tft {
     pub pf: Vec<TftPacketFilter>,
 }
 
-
 impl Tft {
     /// Create a new TFT with the given operation code
     pub fn new(code: u8) -> Self {
@@ -362,33 +357,33 @@ impl Tft {
     /// Encode TFT to bytes
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::new();
-        
+
         // TFT operation code and number of packet filters
         let first_byte = (self.code << 5) | (self.num_of_packet_filter as u8 & 0x0F);
         buf.push(first_byte);
-        
+
         // Encode each packet filter
         for pf in &self.pf {
             // Packet filter identifier and direction
             let id_dir = (pf.direction << 4) | (pf.identifier & 0x0F);
             buf.push(id_dir);
-            
+
             // Precedence
             buf.push(pf.precedence);
-            
+
             // Packet filter content length placeholder
             let len_pos = buf.len();
             buf.push(0);
-            
+
             // Encode packet filter content
             let content_start = buf.len();
             self.encode_pf_content(&pf.content, &mut buf);
-            
+
             // Update length
             let content_len = buf.len() - content_start;
             buf[len_pos] = content_len as u8;
         }
-        
+
         buf
     }
 
@@ -398,7 +393,7 @@ impl Tft {
             buf.push(0x30); // Component type: Protocol ID
             buf.push(proto);
         }
-        
+
         // Remote IPv4 address
         if let Some(addr) = content.remote_ipv4_addr {
             buf.push(0x10); // Component type: IPv4 remote address
@@ -410,7 +405,6 @@ impl Tft {
             }
         }
 
-        
         // Local IPv4 address
         if let Some(addr) = content.local_ipv4_addr {
             buf.push(0x11); // Component type: IPv4 local address
@@ -421,60 +415,60 @@ impl Tft {
                 buf.extend_from_slice(&[255, 255, 255, 255]);
             }
         }
-        
+
         // Remote IPv6 address
         if let Some(addr) = content.remote_ipv6_addr {
             buf.push(0x20); // Component type: IPv6 remote address
             buf.extend_from_slice(&addr.octets());
             buf.push(content.remote_ipv6_prefix_len);
         }
-        
+
         // Local IPv6 address
         if let Some(addr) = content.local_ipv6_addr {
             buf.push(0x21); // Component type: IPv6 local address
             buf.extend_from_slice(&addr.octets());
             buf.push(content.local_ipv6_prefix_len);
         }
-        
+
         // Single local port
         if let Some(port) = content.local_port {
             buf.push(0x40); // Component type: Single local port
             buf.extend_from_slice(&port.to_be_bytes());
         }
-        
+
         // Local port range
         if let Some((low, high)) = content.local_port_range {
             buf.push(0x41); // Component type: Local port range
             buf.extend_from_slice(&low.to_be_bytes());
             buf.extend_from_slice(&high.to_be_bytes());
         }
-        
+
         // Single remote port
         if let Some(port) = content.remote_port {
             buf.push(0x50); // Component type: Single remote port
             buf.extend_from_slice(&port.to_be_bytes());
         }
-        
+
         // Remote port range
         if let Some((low, high)) = content.remote_port_range {
             buf.push(0x51); // Component type: Remote port range
             buf.extend_from_slice(&low.to_be_bytes());
             buf.extend_from_slice(&high.to_be_bytes());
         }
-        
+
         // Security parameter index
         if let Some(spi) = content.spi {
             buf.push(0x60); // Component type: Security parameter index
             buf.extend_from_slice(&spi.to_be_bytes());
         }
-        
+
         // Type of service / Traffic class
         if let Some((tos, mask)) = content.tos_tc {
             buf.push(0x70); // Component type: Type of service
             buf.push(tos);
             buf.push(mask);
         }
-        
+
         // Flow label
         if let Some(label) = content.flow_label {
             buf.push(0x80); // Component type: Flow label
@@ -482,7 +476,6 @@ impl Tft {
         }
     }
 }
-
 
 // ============================================================================
 // Bearer Binding Result
@@ -492,10 +485,7 @@ impl Tft {
 #[derive(Debug, Clone)]
 pub enum BearerBindingResult {
     /// Bearer was created
-    Created {
-        bearer_id: u64,
-        pfcp_flags: u64,
-    },
+    Created { bearer_id: u64, pfcp_flags: u64 },
     /// Bearer was modified
     Modified {
         bearer_id: u64,
@@ -504,10 +494,7 @@ pub enum BearerBindingResult {
         qos_update: bool,
     },
     /// Bearer should be removed
-    Remove {
-        bearer_id: u64,
-        pfcp_flags: u64,
-    },
+    Remove { bearer_id: u64, pfcp_flags: u64 },
     /// No action needed
     NoAction,
     /// Error occurred
@@ -518,10 +505,7 @@ pub enum BearerBindingResult {
 #[derive(Debug, Clone)]
 pub enum QosFlowBindingResult {
     /// QoS flow was created
-    Created {
-        qos_flow_id: u8,
-        pfcp_flags: u64,
-    },
+    Created { qos_flow_id: u8, pfcp_flags: u64 },
     /// QoS flow was modified
     Modified {
         qos_flow_id: u8,
@@ -530,10 +514,7 @@ pub enum QosFlowBindingResult {
         qos_update: bool,
     },
     /// QoS flow should be removed
-    Remove {
-        qos_flow_id: u8,
-        pfcp_flags: u64,
-    },
+    Remove { qos_flow_id: u8, pfcp_flags: u64 },
     /// No action needed
     NoAction,
     /// Error occurred
@@ -545,7 +526,7 @@ pub enum QosFlowBindingResult {
 // ============================================================================
 
 /// Process EPC bearer binding for a session
-/// 
+///
 /// This function processes PCC rules and binds them to bearers.
 /// For each rule:
 /// - INSTALL: Creates a new bearer or updates an existing one
@@ -555,44 +536,42 @@ pub fn process_bearer_binding(
     existing_bearers: &[SmfBearer],
 ) -> Vec<BearerBindingResult> {
     let mut results = Vec::new();
-    
+
     for pcc_rule in &policy.pcc_rules {
         let rule_name = match &pcc_rule.name {
             Some(name) => name,
             None => {
-                results.push(BearerBindingResult::Error(
-                    "No PCC Rule Name".to_string()
-                ));
+                results.push(BearerBindingResult::Error("No PCC Rule Name".to_string()));
                 continue;
             }
         };
 
-        
         match pcc_rule.rule_type {
             PccRuleType::Install => {
                 // Find existing bearer with this rule name
-                let existing = existing_bearers.iter()
+                let existing = existing_bearers
+                    .iter()
                     .find(|b| b.pcc_rule_name.as_deref() == Some(rule_name));
-                
+
                 if let Some(_bearer) = existing {
                     // Bearer exists - check if update needed
                     let mut tft_update = false;
                     let mut qos_update = false;
                     let mut pfcp_flags = pfcp_modify::NETWORK_REQUESTED;
-                    
+
                     // Check for new flows
                     if !pcc_rule.flows.is_empty() {
                         tft_update = true;
                         pfcp_flags |= pfcp_modify::EPC_TFT_UPDATE;
                     }
-                    
+
                     // Check for QoS changes
                     // In a real implementation, compare with existing QoS
                     if pcc_rule.qos.mbr.downlink > 0 || pcc_rule.qos.mbr.uplink > 0 {
                         qos_update = true;
                         pfcp_flags |= pfcp_modify::EPC_QOS_UPDATE;
                     }
-                    
+
                     if tft_update || qos_update {
                         results.push(BearerBindingResult::Modified {
                             bearer_id: 0, // Would be actual bearer ID
@@ -607,18 +586,19 @@ pub fn process_bearer_binding(
                     // Create new bearer
                     if pcc_rule.flows.is_empty() {
                         results.push(BearerBindingResult::Error(
-                            "No flow in PCC Rule - TFT is mandatory".to_string()
+                            "No flow in PCC Rule - TFT is mandatory".to_string(),
                         ));
                         continue;
                     }
-                    
+
                     if existing_bearers.len() >= MAX_NUM_OF_BEARER {
-                        results.push(BearerBindingResult::Error(
-                            format!("Bearer overflow: {}", existing_bearers.len())
-                        ));
+                        results.push(BearerBindingResult::Error(format!(
+                            "Bearer overflow: {}",
+                            existing_bearers.len()
+                        )));
                         continue;
                     }
-                    
+
                     results.push(BearerBindingResult::Created {
                         bearer_id: 0, // Would be assigned by caller
                         pfcp_flags: pfcp_modify::CREATE,
@@ -627,9 +607,10 @@ pub fn process_bearer_binding(
             }
             PccRuleType::Remove => {
                 // Find bearer to remove
-                let existing = existing_bearers.iter()
+                let existing = existing_bearers
+                    .iter()
                     .find(|b| b.pcc_rule_name.as_deref() == Some(rule_name));
-                
+
                 if existing.is_some() {
                     results.push(BearerBindingResult::Remove {
                         bearer_id: 0, // Would be actual bearer ID
@@ -641,13 +622,12 @@ pub fn process_bearer_binding(
             }
         }
     }
-    
+
     results
 }
 
-
 /// Process 5GC QoS flow binding for a session
-/// 
+///
 /// This function processes PCC rules and binds them to QoS flows.
 /// For each rule:
 /// - INSTALL: Creates a new QoS flow or updates an existing one
@@ -658,43 +638,45 @@ pub fn process_qos_flow_binding(
 ) -> (Vec<QosFlowBindingResult>, u64) {
     let mut results = Vec::new();
     let mut pfcp_flags = pfcp_modify::NETWORK_REQUESTED;
-    
+
     for pcc_rule in &policy.pcc_rules {
         let rule_id = match &pcc_rule.id {
             Some(id) => id,
             None => {
-                results.push(QosFlowBindingResult::Error(
-                    "No PCC Rule Id".to_string()
-                ));
+                results.push(QosFlowBindingResult::Error("No PCC Rule Id".to_string()));
                 continue;
             }
         };
-        
+
         match pcc_rule.rule_type {
             PccRuleType::Install => {
                 // Find existing QoS flow with this rule ID
-                let existing = existing_flows.iter()
+                let existing = existing_flows
+                    .iter()
                     .find(|f| f.pcc_rule_id.as_deref() == Some(rule_id));
-                
+
                 if let Some(_flow) = existing {
                     // QoS flow exists - check if update needed
                     let mut tft_update = false;
                     let mut qos_update = false;
                     let mut flow_pfcp_flags = pfcp_modify::NETWORK_REQUESTED;
-                    
+
                     // Check for new flows
                     if !pcc_rule.flows.is_empty() {
                         tft_update = true;
                         flow_pfcp_flags |= pfcp_modify::TFT_ADD;
                     }
-                    
+
                     // Check for QoS changes (GBR flows)
-                    if pcc_rule.qos.mbr.downlink > 0 || pcc_rule.qos.mbr.uplink > 0 ||
-                       pcc_rule.qos.gbr.downlink > 0 || pcc_rule.qos.gbr.uplink > 0 {
+                    if pcc_rule.qos.mbr.downlink > 0
+                        || pcc_rule.qos.mbr.uplink > 0
+                        || pcc_rule.qos.gbr.downlink > 0
+                        || pcc_rule.qos.gbr.uplink > 0
+                    {
                         qos_update = true;
                         flow_pfcp_flags |= pfcp_modify::QOS_MODIFY;
                     }
-                    
+
                     if tft_update || qos_update {
                         pfcp_flags |= flow_pfcp_flags;
                         results.push(QosFlowBindingResult::Modified {
@@ -710,15 +692,16 @@ pub fn process_qos_flow_binding(
                     // Create new QoS flow
                     if pcc_rule.flows.is_empty() {
                         results.push(QosFlowBindingResult::Error(
-                            "No flow in PCC Rule".to_string()
+                            "No flow in PCC Rule".to_string(),
                         ));
                         continue;
                     }
 
                     if existing_flows.len() >= MAX_NUM_OF_BEARER {
-                        results.push(QosFlowBindingResult::Error(
-                            format!("QoS flow overflow: {}", existing_flows.len())
-                        ));
+                        results.push(QosFlowBindingResult::Error(format!(
+                            "QoS flow overflow: {}",
+                            existing_flows.len()
+                        )));
                         continue;
                     }
 
@@ -754,9 +737,10 @@ pub fn process_qos_flow_binding(
 
             PccRuleType::Remove => {
                 // Find QoS flow to remove
-                let existing = existing_flows.iter()
+                let existing = existing_flows
+                    .iter()
                     .find(|f| f.pcc_rule_id.as_deref() == Some(rule_id));
-                
+
                 if existing.is_some() {
                     pfcp_flags |= pfcp_modify::REMOVE;
                     results.push(QosFlowBindingResult::Remove {
@@ -769,14 +753,14 @@ pub fn process_qos_flow_binding(
             }
         }
     }
-    
+
     (results, pfcp_flags)
 }
 
 /// Encode traffic flow template from packet filters
-/// 
+///
 /// This function creates a TFT from the packet filters to be added to a bearer.
-/// 
+///
 /// Issue #338 from NextGCore:
 /// - DOWNLINK/BI-DIRECTIONAL:
 ///   RULE: Source <P-CSCF_RTP_IP> <P-CSCF_RTP_PORT> Destination <UE_IP> <UE_PORT>
@@ -784,52 +768,49 @@ pub fn process_qos_flow_binding(
 /// - UPLINK:
 ///   RULE: Source <UE_IP> <UE_PORT> Destination <P-CSCF_RTP_IP> <P-CSCF_RTP_PORT>
 ///   TFT: Local <UE_IP> <UE_PORT> REMOTE <P-CSCF_RTP_IP> <P-CSCF_RTP_PORT>
-pub fn encode_traffic_flow_template(
-    packet_filters: &[PacketFilter],
-    operation_code: u8,
-) -> Tft {
+pub fn encode_traffic_flow_template(packet_filters: &[PacketFilter], operation_code: u8) -> Tft {
     let mut tft = Tft::new(operation_code);
-    
+
     // Skip encoding for delete or no-op
-    if operation_code == tft_code::DELETE_EXISTING_TFT ||
-       operation_code == tft_code::NO_TFT_OPERATION {
+    if operation_code == tft_code::DELETE_EXISTING_TFT
+        || operation_code == tft_code::NO_TFT_OPERATION
+    {
         return tft;
     }
-    
+
     for (i, pf) in packet_filters.iter().enumerate() {
         if i >= MAX_NUM_OF_FLOW_IN_GTP {
             break;
         }
-        
+
         let mut tft_pf = TftPacketFilter {
             identifier: pf.identifier.saturating_sub(1),
             direction: pf.direction as u8,
             precedence: pf.precedence.saturating_sub(1),
             content: PacketFilterContent::default(),
         };
-        
+
         // For delete packet filters, only identifier is needed
         if operation_code != tft_code::DELETE_PACKET_FILTERS_FROM_EXISTING {
             // Convert IPFW rule to packet filter content
             tft_pf.content = ipfw_rule_to_pf_content(&pf.ipfw_rule, pf.direction);
         }
-        
+
         tft.add_packet_filter(tft_pf);
     }
-    
+
     tft
 }
-
 
 /// Convert IPFW rule to packet filter content
 fn ipfw_rule_to_pf_content(rule: &IpfwRule, direction: FlowDirection) -> PacketFilterContent {
     let mut content = PacketFilterContent::default();
-    
+
     // Protocol
     if rule.proto != 0 {
         content.protocol_id = Some(rule.proto);
     }
-    
+
     // For downlink/bidirectional: source is remote, destination is local
     // For uplink: source is local, destination is remote
     match direction {
@@ -850,7 +831,7 @@ fn ipfw_rule_to_pf_content(rule: &IpfwRule, direction: FlowDirection) -> PacketF
                     content.remote_port_range = Some((rule.src_port_low, rule.src_port_high));
                 }
             }
-            
+
             // Destination -> Local
             if let Some(addr) = rule.dst_addr {
                 content.local_ipv4_addr = Some(addr);
@@ -885,7 +866,7 @@ fn ipfw_rule_to_pf_content(rule: &IpfwRule, direction: FlowDirection) -> PacketF
                     content.local_port_range = Some((rule.src_port_low, rule.src_port_high));
                 }
             }
-            
+
             // Destination -> Remote (after swap)
             if let Some(addr) = rule.dst_addr {
                 content.remote_ipv4_addr = Some(addr);
@@ -904,10 +885,9 @@ fn ipfw_rule_to_pf_content(rule: &IpfwRule, direction: FlowDirection) -> PacketF
             }
         }
     }
-    
+
     content
 }
-
 
 /// Validate PFCP flags for consistency
 ///
@@ -998,7 +978,9 @@ pub fn xr_urllc_5qi_table() -> Vec<FiveQiCharacteristics> {
 
 /// Look up XR/URLLC 5QI characteristics
 pub fn lookup_xr_5qi(five_qi: u8) -> Option<FiveQiCharacteristics> {
-    xr_urllc_5qi_table().into_iter().find(|c| c.five_qi == five_qi)
+    xr_urllc_5qi_table()
+        .into_iter()
+        .find(|c| c.five_qi == five_qi)
 }
 
 /// Check if a 5QI value is an XR/URLLC delay-critical type
@@ -1026,7 +1008,7 @@ pub fn create_xr_pcc_rule(
         qci: five_qi,
         arp: ArpParams {
             priority_level: arp_priority,
-            pre_emption_capability: true,  // XR can preempt lower-priority
+            pre_emption_capability: true, // XR can preempt lower-priority
             pre_emption_vulnerability: false,
         },
         mbr: BitRate {
@@ -1069,7 +1051,10 @@ pub fn process_xr_qos_flow_binding(
             xr_metadata.push(XrFlowMetadata {
                 rule_id,
                 five_qi: rule.qos.qci,
-                delay_budget_ms: chars.as_ref().map(|c| c.packet_delay_budget_ms).unwrap_or(30),
+                delay_budget_ms: chars
+                    .as_ref()
+                    .map(|c| c.packet_delay_budget_ms)
+                    .unwrap_or(30),
                 gbr_dl_bps: rule.qos.gbr.downlink,
                 gbr_ul_bps: rule.qos.gbr.uplink,
                 requires_pdb_enforcement: true,
@@ -1140,7 +1125,7 @@ mod tests {
     fn test_session_policy() {
         let mut policy = SessionPolicy::new();
         assert_eq!(policy.num_rules(), 0);
-        
+
         policy.add_rule(PccRule::new_install("rule1"));
         policy.add_rule(PccRule::new_remove("rule2"));
         assert_eq!(policy.num_rules(), 2);
@@ -1153,18 +1138,17 @@ mod tests {
         assert_eq!(tft.num_of_packet_filter, 0);
     }
 
-
     #[test]
     fn test_tft_add_packet_filter() {
         let mut tft = Tft::new(tft_code::CREATE_NEW_TFT);
-        
+
         let pf = TftPacketFilter {
             identifier: 0,
             direction: 1,
             precedence: 0,
             content: PacketFilterContent::default(),
         };
-        
+
         tft.add_packet_filter(pf);
         assert_eq!(tft.num_of_packet_filter, 1);
         assert_eq!(tft.pf.len(), 1);
@@ -1173,19 +1157,19 @@ mod tests {
     #[test]
     fn test_tft_encode_basic() {
         let mut tft = Tft::new(tft_code::CREATE_NEW_TFT);
-        
+
         let mut content = PacketFilterContent::default();
         content.protocol_id = Some(17); // UDP
-        
+
         let pf = TftPacketFilter {
             identifier: 0,
             direction: 1,
             precedence: 0,
             content,
         };
-        
+
         tft.add_packet_filter(pf);
-        
+
         let encoded = tft.encode();
         assert!(!encoded.is_empty());
         // First byte: operation code (1) << 5 | num_pf (1) = 0x21
@@ -1206,7 +1190,7 @@ mod tests {
         let mut rule = PccRule::new_install("test");
         rule.name = None; // Remove name
         policy.add_rule(rule);
-        
+
         let results = process_bearer_binding(&policy, &[]);
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0], BearerBindingResult::Error(_)));
@@ -1216,7 +1200,7 @@ mod tests {
     fn test_process_bearer_binding_no_flows() {
         let mut policy = SessionPolicy::new();
         policy.add_rule(PccRule::new_install("test"));
-        
+
         let results = process_bearer_binding(&policy, &[]);
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0], BearerBindingResult::Error(_)));
@@ -1228,18 +1212,17 @@ mod tests {
         let mut rule = PccRule::new_install("test");
         rule.add_flow(FlowDir::Bidirectional, "permit out ip from any to any");
         policy.add_rule(rule);
-        
+
         let results = process_bearer_binding(&policy, &[]);
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0], BearerBindingResult::Created { .. }));
     }
 
-
     #[test]
     fn test_process_bearer_binding_remove_not_found() {
         let mut policy = SessionPolicy::new();
         policy.add_rule(PccRule::new_remove("nonexistent"));
-        
+
         let results = process_bearer_binding(&policy, &[]);
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0], BearerBindingResult::NoAction));
@@ -1251,7 +1234,7 @@ mod tests {
         let mut rule = PccRule::new_5gc_install("test");
         rule.id = None; // Remove ID
         policy.add_rule(rule);
-        
+
         let (results, _) = process_qos_flow_binding(&policy, &[]);
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0], QosFlowBindingResult::Error(_)));
@@ -1263,7 +1246,7 @@ mod tests {
         let mut rule = PccRule::new_5gc_install("rule-1");
         rule.add_flow(FlowDir::Bidirectional, "permit out ip from any to any");
         policy.add_rule(rule);
-        
+
         let (results, flags) = process_qos_flow_binding(&policy, &[]);
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0], QosFlowBindingResult::Created { .. }));

@@ -69,8 +69,8 @@ pub struct FTeidInfo {
     pub teid: u32,
     pub ipv4: Option<[u8; 4]>,
     pub ipv6: Option<[u8; 16]>,
-    pub ch: bool,      // CHOOSE flag
-    pub chid: bool,    // CHOOSE ID flag
+    pub ch: bool,   // CHOOSE flag
+    pub chid: bool, // CHOOSE ID flag
     pub choose_id: u8,
 }
 
@@ -158,34 +158,34 @@ pub struct Urr {
 /// Measurement Method flags
 #[derive(Debug, Clone, Default)]
 pub struct MeasurementMethod {
-    pub durat: bool,  // Duration
-    pub volum: bool,  // Volume
-    pub event: bool,  // Event
+    pub durat: bool, // Duration
+    pub volum: bool, // Volume
+    pub event: bool, // Event
 }
 
 /// Reporting Triggers
 #[derive(Debug, Clone, Default)]
 pub struct ReportingTriggers {
-    pub perio: bool,  // Periodic Reporting
-    pub volth: bool,  // Volume Threshold
-    pub timth: bool,  // Time Threshold
-    pub quhti: bool,  // Quota Holding Time
-    pub start: bool,  // Start of Traffic
-    pub stopt: bool,  // Stop of Traffic
-    pub droth: bool,  // Dropped DL Traffic Threshold
-    pub immer: bool,  // Immediate Report
-    pub volqu: bool,  // Volume Quota
-    pub timqu: bool,  // Time Quota
-    pub liusa: bool,  // Linked Usage Reporting
-    pub termr: bool,  // Termination Report
-    pub monit: bool,  // Monitoring Time
-    pub envcl: bool,  // Envelope Closure
-    pub macar: bool,  // MAC Addresses Reporting
-    pub eveth: bool,  // Event Threshold
-    pub evequ: bool,  // Event Quota
-    pub tebur: bool,  // Termination by UP function Report
-    pub ipmjl: bool,  // IP Multicast Join/Leave
-    pub quvti: bool,  // Quota Validity Time
+    pub perio: bool, // Periodic Reporting
+    pub volth: bool, // Volume Threshold
+    pub timth: bool, // Time Threshold
+    pub quhti: bool, // Quota Holding Time
+    pub start: bool, // Start of Traffic
+    pub stopt: bool, // Stop of Traffic
+    pub droth: bool, // Dropped DL Traffic Threshold
+    pub immer: bool, // Immediate Report
+    pub volqu: bool, // Volume Quota
+    pub timqu: bool, // Time Quota
+    pub liusa: bool, // Linked Usage Reporting
+    pub termr: bool, // Termination Report
+    pub monit: bool, // Monitoring Time
+    pub envcl: bool, // Envelope Closure
+    pub macar: bool, // MAC Addresses Reporting
+    pub eveth: bool, // Event Threshold
+    pub evequ: bool, // Event Quota
+    pub tebur: bool, // Termination by UP function Report
+    pub ipmjl: bool, // IP Multicast Join/Leave
+    pub quvti: bool, // Quota Validity Time
 }
 
 /// Volume Threshold
@@ -207,11 +207,11 @@ pub struct VolumeQuota {
 /// Measurement Information
 #[derive(Debug, Clone, Default)]
 pub struct MeasurementInfo {
-    pub mbqe: bool,  // Measurement Before QoS Enforcement
-    pub inam: bool,  // Inactive Measurement
-    pub radi: bool,  // Reduced Application Detection Information
-    pub istm: bool,  // Immediate Start Time Metering
-    pub mnop: bool,  // Measurement of Number of Packets
+    pub mbqe: bool, // Measurement Before QoS Enforcement
+    pub inam: bool, // Inactive Measurement
+    pub radi: bool, // Reduced Application Detection Information
+    pub istm: bool, // Immediate Start Time Metering
+    pub mnop: bool, // Measurement of Number of Packets
 }
 
 // ============================================================================
@@ -234,7 +234,7 @@ pub struct Qer {
 /// Gate Status
 #[derive(Debug, Clone, Default)]
 pub struct GateStatus {
-    pub ul_gate: u8,  // 0=OPEN, 1=CLOSED
+    pub ul_gate: u8, // 0=OPEN, 1=CLOSED
     pub dl_gate: u8,
 }
 
@@ -290,7 +290,10 @@ impl HandlerResult {
     }
 
     pub fn error(cause: PfcpCause, offending_ie: Option<u16>) -> Self {
-        Self { cause, offending_ie }
+        Self {
+            cause,
+            offending_ie,
+        }
     }
 
     pub fn is_success(&self) -> bool {
@@ -415,17 +418,14 @@ impl UrrAccountingSnapshot {
 
 /// Handle Create URR
 /// Port of upf_n4_handle_create_urr
-pub fn handle_create_urr(
-    sess: &mut SessionContext,
-    urr: Urr,
-) -> HandlerResult {
+pub fn handle_create_urr(sess: &mut SessionContext, urr: Urr) -> HandlerResult {
     if sess.urrs.len() >= MAX_NUM_OF_URR {
         return HandlerResult::error(PfcpCause::NoResourcesAvailable, None);
     }
-    
+
     let urr_id = urr.urr_id;
     sess.urrs.insert(urr_id, urr);
-    
+
     HandlerResult::success()
 }
 
@@ -443,25 +443,31 @@ pub fn handle_session_establishment_request(
     pdn_type: Option<u8>,
 ) -> (HandlerResult, Vec<u16>) {
     let mut created_pdr_ids = Vec::new();
-    
+
     // Process PDRs
     for pdr in pdrs {
         if sess.pdrs.len() >= MAX_NUM_OF_PDR {
-            return (HandlerResult::error(PfcpCause::NoResourcesAvailable, None), created_pdr_ids);
+            return (
+                HandlerResult::error(PfcpCause::NoResourcesAvailable, None),
+                created_pdr_ids,
+            );
         }
         let pdr_id = pdr.pdr_id;
         sess.pdrs.insert(pdr_id, pdr);
         created_pdr_ids.push(pdr_id);
     }
-    
+
     // Process FARs
     for far in fars {
         if sess.fars.len() >= MAX_NUM_OF_FAR {
-            return (HandlerResult::error(PfcpCause::NoResourcesAvailable, None), created_pdr_ids);
+            return (
+                HandlerResult::error(PfcpCause::NoResourcesAvailable, None),
+                created_pdr_ids,
+            );
         }
         sess.fars.insert(far.far_id, far);
     }
-    
+
     // Process URRs
     for urr in urrs {
         let result = handle_create_urr(sess, urr);
@@ -469,28 +475,31 @@ pub fn handle_session_establishment_request(
             return (result, created_pdr_ids);
         }
     }
-    
+
     // Process QERs
     for qer in qers {
         if sess.qers.len() >= MAX_NUM_OF_QER {
-            return (HandlerResult::error(PfcpCause::NoResourcesAvailable, None), created_pdr_ids);
+            return (
+                HandlerResult::error(PfcpCause::NoResourcesAvailable, None),
+                created_pdr_ids,
+            );
         }
         sess.qers.insert(qer.qer_id, qer);
     }
-    
+
     // Process BAR
     sess.bar = bar;
-    
+
     // Set APN/DNN
     sess.apn_dnn = apn_dnn;
     sess.pdn_type = pdn_type;
-    
+
     // Handle restoration indication
     if sereq_flags.restoration_indication {
         // TEID restoration logic would go here
         log::debug!("Restoration indication set");
     }
-    
+
     (HandlerResult::success(), created_pdr_ids)
 }
 
@@ -514,45 +523,51 @@ pub fn handle_session_modification_request(
     remove_bar: bool,
 ) -> (HandlerResult, Vec<u16>) {
     let mut created_pdr_ids = Vec::new();
-    
+
     // Create PDRs
     for pdr in create_pdrs {
         if sess.pdrs.len() >= MAX_NUM_OF_PDR {
-            return (HandlerResult::error(PfcpCause::NoResourcesAvailable, None), created_pdr_ids);
+            return (
+                HandlerResult::error(PfcpCause::NoResourcesAvailable, None),
+                created_pdr_ids,
+            );
         }
         let pdr_id = pdr.pdr_id;
         sess.pdrs.insert(pdr_id, pdr);
         created_pdr_ids.push(pdr_id);
     }
-    
+
     // Update PDRs
     for pdr in update_pdrs {
         sess.pdrs.insert(pdr.pdr_id, pdr);
     }
-    
+
     // Remove PDRs
     for pdr_id in remove_pdr_ids {
         sess.pdrs.remove(&pdr_id);
     }
-    
+
     // Create FARs
     for far in create_fars {
         if sess.fars.len() >= MAX_NUM_OF_FAR {
-            return (HandlerResult::error(PfcpCause::NoResourcesAvailable, None), created_pdr_ids);
+            return (
+                HandlerResult::error(PfcpCause::NoResourcesAvailable, None),
+                created_pdr_ids,
+            );
         }
         sess.fars.insert(far.far_id, far);
     }
-    
+
     // Update FARs
     for far in update_fars {
         sess.fars.insert(far.far_id, far);
     }
-    
+
     // Remove FARs
     for far_id in remove_far_ids {
         sess.fars.remove(&far_id);
     }
-    
+
     // Create URRs
     for urr in create_urrs {
         let result = handle_create_urr(sess, urr);
@@ -560,35 +575,38 @@ pub fn handle_session_modification_request(
             return (result, created_pdr_ids);
         }
     }
-    
+
     // Update URRs
     for urr in update_urrs {
         sess.urrs.insert(urr.urr_id, urr);
     }
-    
+
     // Remove URRs
     for urr_id in remove_urr_ids {
         sess.urrs.remove(&urr_id);
     }
-    
+
     // Create QERs
     for qer in create_qers {
         if sess.qers.len() >= MAX_NUM_OF_QER {
-            return (HandlerResult::error(PfcpCause::NoResourcesAvailable, None), created_pdr_ids);
+            return (
+                HandlerResult::error(PfcpCause::NoResourcesAvailable, None),
+                created_pdr_ids,
+            );
         }
         sess.qers.insert(qer.qer_id, qer);
     }
-    
+
     // Update QERs
     for qer in update_qers {
         sess.qers.insert(qer.qer_id, qer);
     }
-    
+
     // Remove QERs
     for qer_id in remove_qer_ids {
         sess.qers.remove(&qer_id);
     }
-    
+
     // Create/Remove BAR
     if let Some(bar) = create_bar {
         sess.bar = Some(bar);
@@ -596,7 +614,7 @@ pub fn handle_session_modification_request(
     if remove_bar {
         sess.bar = None;
     }
-    
+
     (HandlerResult::success(), created_pdr_ids)
 }
 
@@ -608,7 +626,7 @@ pub fn handle_session_deletion_request(
 ) -> (HandlerResult, Vec<UsageReport>) {
     let mut usage_reports = Vec::new();
     let mut ur_seqn = 1u32;
-    
+
     // Generate usage reports for all URRs
     for urr_id in sess.urrs.keys() {
         if let Some(acc) = urr_accounting.get_mut(urr_id) {
@@ -618,20 +636,18 @@ pub fn handle_session_deletion_request(
             ur_seqn += 1;
         }
     }
-    
+
     (HandlerResult::success(), usage_reports)
 }
 
 /// Handle Session Report Response
 /// Port of upf_n4_handle_session_report_response
-pub fn handle_session_report_response(
-    cause: PfcpCause,
-) -> HandlerResult {
+pub fn handle_session_report_response(cause: PfcpCause) -> HandlerResult {
     if cause != PfcpCause::RequestAccepted {
         log::error!("PFCP Cause[{cause:?}] : Not Accepted");
         return HandlerResult::error(cause, None);
     }
-    
+
     HandlerResult::success()
 }
 
@@ -687,19 +703,31 @@ mod tests {
         let mut sess = SessionContext::default();
         let sereq_flags = PfcpSereqFlags::default();
         let pdrs = vec![
-            Pdr { pdr_id: 1, precedence: 100, ..Default::default() },
-            Pdr { pdr_id: 2, precedence: 200, ..Default::default() },
+            Pdr {
+                pdr_id: 1,
+                precedence: 100,
+                ..Default::default()
+            },
+            Pdr {
+                pdr_id: 2,
+                precedence: 200,
+                ..Default::default()
+            },
         ];
-        let fars = vec![
-            Far { far_id: 1, apply_action: 0x02, ..Default::default() },
-        ];
-        let urrs = vec![
-            Urr { urr_id: 1, ..Default::default() },
-        ];
-        let qers = vec![
-            Qer { qer_id: 1, ..Default::default() },
-        ];
-        
+        let fars = vec![Far {
+            far_id: 1,
+            apply_action: 0x02,
+            ..Default::default()
+        }];
+        let urrs = vec![Urr {
+            urr_id: 1,
+            ..Default::default()
+        }];
+        let qers = vec![Qer {
+            qer_id: 1,
+            ..Default::default()
+        }];
+
         let (result, created_pdr_ids) = handle_session_establishment_request(
             &mut sess,
             &sereq_flags,
@@ -711,7 +739,7 @@ mod tests {
             Some("internet".to_string()),
             Some(1),
         );
-        
+
         assert!(result.is_success());
         assert_eq!(created_pdr_ids.len(), 2);
         assert_eq!(sess.pdrs.len(), 2);
@@ -724,15 +752,33 @@ mod tests {
     #[test]
     fn test_handle_session_modification_request() {
         let mut sess = SessionContext::default();
-        sess.pdrs.insert(1, Pdr { pdr_id: 1, ..Default::default() });
-        sess.fars.insert(1, Far { far_id: 1, ..Default::default() });
-        
+        sess.pdrs.insert(
+            1,
+            Pdr {
+                pdr_id: 1,
+                ..Default::default()
+            },
+        );
+        sess.fars.insert(
+            1,
+            Far {
+                far_id: 1,
+                ..Default::default()
+            },
+        );
+
         let (result, created_pdr_ids) = handle_session_modification_request(
             &mut sess,
-            vec![Pdr { pdr_id: 2, ..Default::default() }],  // create
+            vec![Pdr {
+                pdr_id: 2,
+                ..Default::default()
+            }], // create
             vec![],  // update
             vec![1], // remove
-            vec![Far { far_id: 2, ..Default::default() }],  // create
+            vec![Far {
+                far_id: 2,
+                ..Default::default()
+            }], // create
             vec![],  // update
             vec![1], // remove
             vec![],  // create urrs
@@ -744,7 +790,7 @@ mod tests {
             None,    // create bar
             false,   // remove bar
         );
-        
+
         assert!(result.is_success());
         assert_eq!(created_pdr_ids.len(), 1);
         assert_eq!(sess.pdrs.len(), 1);
@@ -757,25 +803,43 @@ mod tests {
     #[test]
     fn test_handle_session_deletion_request() {
         let mut sess = SessionContext::default();
-        sess.urrs.insert(1, Urr { urr_id: 1, ..Default::default() });
-        sess.urrs.insert(2, Urr { urr_id: 2, ..Default::default() });
-        
+        sess.urrs.insert(
+            1,
+            Urr {
+                urr_id: 1,
+                ..Default::default()
+            },
+        );
+        sess.urrs.insert(
+            2,
+            Urr {
+                urr_id: 2,
+                ..Default::default()
+            },
+        );
+
         let mut urr_accounting = HashMap::new();
-        urr_accounting.insert(1, UrrAccounting {
-            total_octets: 1000,
-            uplink_octets: 400,
-            downlink_octets: 600,
-            ..Default::default()
-        });
-        urr_accounting.insert(2, UrrAccounting {
-            total_octets: 2000,
-            uplink_octets: 800,
-            downlink_octets: 1200,
-            ..Default::default()
-        });
-        
+        urr_accounting.insert(
+            1,
+            UrrAccounting {
+                total_octets: 1000,
+                uplink_octets: 400,
+                downlink_octets: 600,
+                ..Default::default()
+            },
+        );
+        urr_accounting.insert(
+            2,
+            UrrAccounting {
+                total_octets: 2000,
+                uplink_octets: 800,
+                downlink_octets: 1200,
+                ..Default::default()
+            },
+        );
+
         let (result, usage_reports) = handle_session_deletion_request(&sess, &mut urr_accounting);
-        
+
         assert!(result.is_success());
         assert_eq!(usage_reports.len(), 2);
     }
@@ -794,15 +858,15 @@ mod tests {
             time_of_first_packet: Some(1001),
             time_of_last_packet: Some(1999),
         };
-        
+
         let snapshot = acc.snapshot();
-        
+
         assert_eq!(snapshot.total_octets, 1000);
         assert_eq!(snapshot.uplink_octets, 400);
         assert_eq!(snapshot.downlink_octets, 600);
         assert_eq!(snapshot.start_time, Some(1000));
         assert_eq!(snapshot.end_time, Some(2000));
-        
+
         // Verify counters are reset
         assert_eq!(acc.total_octets, 0);
         assert_eq!(acc.uplink_octets, 0);
@@ -823,14 +887,14 @@ mod tests {
             time_of_first_packet: Some(1001),
             time_of_last_packet: Some(1999),
         };
-        
+
         let report = snapshot.to_usage_report(1, 1, true);
-        
+
         assert_eq!(report.urr_id, 1);
         assert_eq!(report.ur_seqn, 1);
         assert!(report.trigger.termination_report);
         assert_eq!(report.duration_measurement, Some(1000));
-        
+
         let vol = report.volume_measurement.unwrap();
         assert_eq!(vol.total_volume, Some(1000));
         assert_eq!(vol.uplink_volume, Some(400));

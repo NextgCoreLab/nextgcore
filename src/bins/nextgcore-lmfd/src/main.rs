@@ -11,8 +11,8 @@ use clap::Parser;
 use ogs_sbi::context::global_context;
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::server::{
-    send_bad_request, send_method_not_allowed, send_not_found,
-    SbiServer, SbiServerConfig as OgsSbiServerConfig,
+    send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
+    SbiServerConfig as OgsSbiServerConfig,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -84,11 +84,10 @@ async fn main() -> Result<()> {
     init_logging(&args.log_level);
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
-            .with_endpoint(
-                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
-            ),
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+        ),
     )
     .ok();
 
@@ -108,14 +107,22 @@ async fn main() -> Result<()> {
 
     let mut sbi_server_config = OgsSbiServerConfig::new(addr);
     if args.tls {
-        let cert = args.tls_cert.as_deref().unwrap_or("/etc/nextgcore/tls/server.crt");
-        let key = args.tls_key.as_deref().unwrap_or("/etc/nextgcore/tls/server.key");
+        let cert = args
+            .tls_cert
+            .as_deref()
+            .unwrap_or("/etc/nextgcore/tls/server.crt");
+        let key = args
+            .tls_key
+            .as_deref()
+            .unwrap_or("/etc/nextgcore/tls/server.key");
         sbi_server_config = sbi_server_config.with_tls(key, cert);
     }
 
     let sbi_server = SbiServer::new(sbi_server_config);
     log::info!("Starting LMF SBI server on {addr}");
-    sbi_server.start(lmf_sbi_request_handler).await
+    sbi_server
+        .start(lmf_sbi_request_handler)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
     // Register with NRF
@@ -134,7 +141,9 @@ async fn main() -> Result<()> {
     }
 
     log::info!("Shutting down...");
-    sbi_server.stop().await
+    sbi_server
+        .stop()
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
     lmf_context_final();
     log::info!("LMF shutdown complete");
@@ -154,47 +163,35 @@ async fn lmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 
     match parts.as_slice() {
         // NLs Location Determination (Nlmf_Location)
-        ["nlmf-location", "v1", "determine-location"] => {
-            match method {
-                "POST" => handle_determine_location(&request).await,
-                _ => send_method_not_allowed(method, "determine-location"),
-            }
-        }
+        ["nlmf-location", "v1", "determine-location"] => match method {
+            "POST" => handle_determine_location(&request).await,
+            _ => send_method_not_allowed(method, "determine-location"),
+        },
         // Measurement requests/reports
-        ["nlmf-location", "v1", "measurements"] => {
-            match method {
-                "POST" => handle_measurement_request(&request).await,
-                _ => send_method_not_allowed(method, "measurements"),
-            }
-        }
-        ["nlmf-location", "v1", "measurements", request_id] => {
-            match method {
-                "GET" => handle_measurement_get(request_id).await,
-                _ => send_method_not_allowed(method, "measurements/{id}"),
-            }
-        }
+        ["nlmf-location", "v1", "measurements"] => match method {
+            "POST" => handle_measurement_request(&request).await,
+            _ => send_method_not_allowed(method, "measurements"),
+        },
+        ["nlmf-location", "v1", "measurements", request_id] => match method {
+            "GET" => handle_measurement_get(request_id).await,
+            _ => send_method_not_allowed(method, "measurements/{id}"),
+        },
         // NRPPa measurement reports (from gNB via AMF)
-        ["nlmf-location", "v1", "nrppa-reports"] => {
-            match method {
-                "POST" => handle_nrppa_report(&request).await,
-                _ => send_method_not_allowed(method, "nrppa-reports"),
-            }
-        }
+        ["nlmf-location", "v1", "nrppa-reports"] => match method {
+            "POST" => handle_nrppa_report(&request).await,
+            _ => send_method_not_allowed(method, "nrppa-reports"),
+        },
         // UE location queries
-        ["nlmf-location", "v1", "ue-locations", supi] => {
-            match method {
-                "GET" => handle_ue_location_get(supi).await,
-                "PUT" => handle_ue_location_update(supi, &request).await,
-                _ => send_method_not_allowed(method, "ue-locations/{supi}"),
-            }
-        }
+        ["nlmf-location", "v1", "ue-locations", supi] => match method {
+            "GET" => handle_ue_location_get(supi).await,
+            "PUT" => handle_ue_location_update(supi, &request).await,
+            _ => send_method_not_allowed(method, "ue-locations/{supi}"),
+        },
         // Capabilities
-        ["nlmf-location", "v1", "capabilities"] => {
-            match method {
-                "GET" => handle_capabilities().await,
-                _ => send_method_not_allowed(method, "capabilities"),
-            }
-        }
+        ["nlmf-location", "v1", "capabilities"] => match method {
+            "GET" => handle_capabilities().await,
+            _ => send_method_not_allowed(method, "capabilities"),
+        },
         _ => send_not_found(&format!("Resource not found: {path}"), None),
     }
 }
@@ -212,12 +209,27 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let amf_ue_ngap_id = data.get("amfUeNgapId").and_then(|v| v.as_u64()).unwrap_or(0);
-    let method_str = data.get("positioningMethod").and_then(|v| v.as_str()).unwrap_or("ECID");
+    let amf_ue_ngap_id = data
+        .get("amfUeNgapId")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let method_str = data
+        .get("positioningMethod")
+        .and_then(|v| v.as_str())
+        .unwrap_or("ECID");
     let method = parse_positioning_method(method_str);
-    let nr_method = data.get("nrMethod").and_then(|v| v.as_str()).and_then(parse_nr_method);
-    let gnb_id = data.get("gnbId").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let qos_str = data.get("qosClass").and_then(|v| v.as_str()).unwrap_or("BEST_EFFORT");
+    let nr_method = data
+        .get("nrMethod")
+        .and_then(|v| v.as_str())
+        .and_then(parse_nr_method);
+    let gnb_id = data
+        .get("gnbId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let qos_str = data
+        .get("qosClass")
+        .and_then(|v| v.as_str())
+        .unwrap_or("BEST_EFFORT");
     let qos = parse_qos(qos_str);
 
     let ctx = lmf_self();
@@ -228,18 +240,19 @@ async fn handle_determine_location(request: &SbiRequest) -> SbiResponse {
     };
 
     match result {
-        Some(req) => {
-            SbiResponse::with_status(201)
-                .with_json_body(&serde_json::json!({
-                    "requestId": req.request_id,
-                    "amfUeNgapId": amf_ue_ngap_id,
-                    "positioningMethod": method_str,
-                    "state": "PENDING",
-                    "qosClass": qos_str,
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(201))
-        }
-        None => send_bad_request("Failed to create measurement request", Some("REQUEST_FAILED")),
+        Some(req) => SbiResponse::with_status(201)
+            .with_json_body(&serde_json::json!({
+                "requestId": req.request_id,
+                "amfUeNgapId": amf_ue_ngap_id,
+                "positioningMethod": method_str,
+                "state": "PENDING",
+                "qosClass": qos_str,
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(201)),
+        None => send_bad_request(
+            "Failed to create measurement request",
+            Some("REQUEST_FAILED"),
+        ),
     }
 }
 
@@ -257,7 +270,10 @@ async fn handle_measurement_get(request_id: &str) -> SbiResponse {
 
     let ctx = lmf_self();
     let (measurement, report) = if let Ok(context) = ctx.read() {
-        (context.measurement_find(req_id), context.report_find(req_id))
+        (
+            context.measurement_find(req_id),
+            context.report_find(req_id),
+        )
     } else {
         (None, None)
     };
@@ -311,18 +327,28 @@ async fn handle_nrppa_report(request: &SbiRequest) -> SbiResponse {
     };
 
     let request_id = data.get("requestId").and_then(|v| v.as_u64()).unwrap_or(0);
-    let cells: Vec<CellMeasurement> = data.get("cellMeasurements")
+    let cells: Vec<CellMeasurement> = data
+        .get("cellMeasurements")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().map(|c| {
-            CellMeasurement {
-                nr_cgi: c.get("nrCgi").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                rsrp: c.get("rsrp").and_then(|v| v.as_i64()).map(|n| n as i16),
-                rsrq: c.get("rsrq").and_then(|v| v.as_i64()).map(|n| n as i16),
-                timing_advance: c.get("timingAdvance").and_then(|v| v.as_u64()).map(|n| n as u32),
-                aoa: c.get("aoa").and_then(|v| v.as_f64()),
-                rtt_ns: c.get("rttNs").and_then(|v| v.as_u64()),
-            }
-        }).collect())
+        .map(|arr| {
+            arr.iter()
+                .map(|c| CellMeasurement {
+                    nr_cgi: c
+                        .get("nrCgi")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    rsrp: c.get("rsrp").and_then(|v| v.as_i64()).map(|n| n as i16),
+                    rsrq: c.get("rsrq").and_then(|v| v.as_i64()).map(|n| n as i16),
+                    timing_advance: c
+                        .get("timingAdvance")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as u32),
+                    aoa: c.get("aoa").and_then(|v| v.as_f64()),
+                    rtt_ns: c.get("rttNs").and_then(|v| v.as_u64()),
+                })
+                .collect()
+        })
         .unwrap_or_default();
 
     let ctx = lmf_self();
@@ -333,20 +359,18 @@ async fn handle_nrppa_report(request: &SbiRequest) -> SbiResponse {
     };
 
     match location {
-        Some(loc) => {
-            SbiResponse::with_status(200)
-                .with_json_body(&serde_json::json!({
-                    "requestId": request_id,
-                    "result": "COMPLETED",
-                    "location": {
-                        "latitude": loc.latitude,
-                        "longitude": loc.longitude,
-                        "horizontalAccuracy": loc.horizontal_accuracy,
-                        "methodUsed": loc.method_used,
-                    },
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(200))
-        }
+        Some(loc) => SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({
+                "requestId": request_id,
+                "result": "COMPLETED",
+                "location": {
+                    "latitude": loc.latitude,
+                    "longitude": loc.longitude,
+                    "horizontalAccuracy": loc.horizontal_accuracy,
+                    "methodUsed": loc.method_used,
+                },
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
         None => send_not_found(
             &format!("Measurement request {request_id} not found"),
             Some("MEASUREMENT_NOT_FOUND"),
@@ -402,11 +426,20 @@ async fn handle_ue_location_update(supi: &str, request: &SbiRequest) -> SbiRespo
 
     let loc = LocationEstimate {
         latitude: data.get("latitude").and_then(|v| v.as_f64()).unwrap_or(0.0),
-        longitude: data.get("longitude").and_then(|v| v.as_f64()).unwrap_or(0.0),
+        longitude: data
+            .get("longitude")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0),
         altitude: data.get("altitude").and_then(|v| v.as_f64()),
-        horizontal_accuracy: data.get("horizontalAccuracy").and_then(|v| v.as_f64()).unwrap_or(100.0),
+        horizontal_accuracy: data
+            .get("horizontalAccuracy")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(100.0),
         vertical_accuracy: data.get("verticalAccuracy").and_then(|v| v.as_f64()),
-        method_used: data.get("methodUsed").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        method_used: data
+            .get("methodUsed")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         timestamp: data.get("timestamp").and_then(|v| v.as_u64()).unwrap_or(0),
     };
 
@@ -430,7 +463,11 @@ async fn handle_ue_location_update(supi: &str, request: &SbiRequest) -> SbiRespo
 async fn handle_capabilities() -> SbiResponse {
     let ctx = lmf_self();
     let methods: Vec<String> = if let Ok(context) = ctx.read() {
-        context.supported_methods().iter().map(|m| format!("{m:?}")).collect()
+        context
+            .supported_methods()
+            .iter()
+            .map(|m| format!("{m:?}"))
+            .collect()
     } else {
         vec![]
     };
@@ -478,7 +515,11 @@ fn parse_qos(s: &str) -> PositioningQos {
 }
 
 /// Register LMF with NRF
-async fn register_with_nrf(sbi_addr: &str, sbi_port: u16, nf_instance_id: &str) -> Result<(), String> {
+async fn register_with_nrf(
+    sbi_addr: &str,
+    sbi_port: u16,
+    nf_instance_id: &str,
+) -> Result<(), String> {
     let sbi_ctx = global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
@@ -524,10 +565,8 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16, nf_instance_id: &str) 
         200 | 201 => {
             log::info!("LMF registered with NRF successfully (id={nf_instance_id})");
 
-            let mut self_instance = ogs_sbi::context::NfInstance::new(
-                nf_instance_id,
-                ogs_sbi::types::NfType::Lmf,
-            );
+            let mut self_instance =
+                ogs_sbi::context::NfInstance::new(nf_instance_id, ogs_sbi::types::NfType::Lmf);
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
             let mut svc = ogs_sbi::context::NfService::new(
                 "nlmf-loc",
@@ -540,7 +579,10 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16, nf_instance_id: &str) 
 
             Ok(())
         }
-        _ => Err(format!("NRF registration returned status {}", response.status)),
+        _ => Err(format!(
+            "NRF registration returned status {}",
+            response.status
+        )),
     }
 }
 
@@ -550,7 +592,9 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
         .strip_prefix("https://")
         .or_else(|| uri.strip_prefix("http://"))
         .unwrap_or(uri);
-    let (host_port, _path) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    let (host_port, _path) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
     if let Some((host, port_str)) = host_port.rsplit_once(':') {
         let port: u16 = port_str.parse().ok()?;
         Some((host.to_string(), port))
@@ -575,15 +619,24 @@ mod tests {
     #[test]
     fn test_parse_positioning_method() {
         assert_eq!(parse_positioning_method("ECID"), PositioningMethod::Ecid);
-        assert_eq!(parse_positioning_method("NR_BASED"), PositioningMethod::NrBased);
+        assert_eq!(
+            parse_positioning_method("NR_BASED"),
+            PositioningMethod::NrBased
+        );
         assert_eq!(parse_positioning_method("GNSS"), PositioningMethod::Gnss);
         assert_eq!(parse_positioning_method("unknown"), PositioningMethod::Ecid);
     }
 
     #[test]
     fn test_parse_nr_method() {
-        assert_eq!(parse_nr_method("MULTI_RTT"), Some(NrPositioningMethod::MultiRtt));
-        assert_eq!(parse_nr_method("DL_TDOA"), Some(NrPositioningMethod::DlTdoa));
+        assert_eq!(
+            parse_nr_method("MULTI_RTT"),
+            Some(NrPositioningMethod::MultiRtt)
+        );
+        assert_eq!(
+            parse_nr_method("DL_TDOA"),
+            Some(NrPositioningMethod::DlTdoa)
+        );
         assert_eq!(parse_nr_method("unknown"), None);
     }
 

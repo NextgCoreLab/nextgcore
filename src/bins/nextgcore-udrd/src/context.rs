@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
-use crate::ue_sm::UdrUeSmContext;
 use crate::sess_sm::UdrSessSmContext;
+use crate::ue_sm::UdrUeSmContext;
 
 /// UDR UE tracking data
 pub struct UdrUe {
@@ -137,11 +137,16 @@ impl UdrContext {
     }
 
     /// Find or create a session context for a UE
-    pub fn sess_find_or_add(&mut self, supi: &str, psi: u8, dnn: Option<&str>) -> Option<&mut UdrSess> {
+    pub fn sess_find_or_add(
+        &mut self,
+        supi: &str,
+        psi: u8,
+        dnn: Option<&str>,
+    ) -> Option<&mut UdrSess> {
         let ue = self.ue_find_or_add(supi);
         ue.sessions.entry(psi).or_insert_with(|| {
             log::debug!("[{supi}:{psi}] Creating UDR session context");
-            
+
             UdrSess {
                 supi: supi.to_string(),
                 psi,
@@ -177,7 +182,8 @@ impl Default for UdrContext {
 }
 
 /// Global UDR context (thread-safe singleton)
-static GLOBAL_UDR_CONTEXT: std::sync::OnceLock<Arc<RwLock<UdrContext>>> = std::sync::OnceLock::new();
+static GLOBAL_UDR_CONTEXT: std::sync::OnceLock<Arc<RwLock<UdrContext>>> =
+    std::sync::OnceLock::new();
 
 /// Get the global UDR context
 ///

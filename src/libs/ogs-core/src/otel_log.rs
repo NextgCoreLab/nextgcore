@@ -148,7 +148,10 @@ impl StructuredLogEntry {
         parts.push(format!("\"timeUnixNano\":\"{}\"", self.timestamp_ns));
         parts.push(format!("\"severityNumber\":{}", self.severity.number()));
         parts.push(format!("\"severityText\":\"{}\"", self.severity.text()));
-        parts.push(format!("\"body\":{{\"stringValue\":\"{}\"}}", escape_json(&self.body)));
+        parts.push(format!(
+            "\"body\":{{\"stringValue\":\"{}\"}}",
+            escape_json(&self.body)
+        ));
 
         if let Some(tid) = &self.trace_id {
             parts.push(format!("\"traceId\":\"{}\"", hex_encode(tid)));
@@ -158,16 +161,22 @@ impl StructuredLogEntry {
         }
 
         if !self.attributes.is_empty() {
-            let attrs: Vec<String> = self.attributes.iter().map(|(k, v)| {
-                let val = match v {
-                    LogValue::String(s) => format!("{{\"stringValue\":\"{}\"}}", escape_json(s)),
-                    LogValue::Int(i) => format!("{{\"intValue\":\"{i}\"}}"),
-                    LogValue::Float(f) => format!("{{\"doubleValue\":{f}}}"),
-                    LogValue::Bool(b) => format!("{{\"boolValue\":{b}}}"),
-                    LogValue::Bytes(b) => format!("{{\"bytesValue\":\"{}\"}}", hex_encode(b)),
-                };
-                format!("{{\"key\":\"{}\",\"value\":{}}}", escape_json(k), val)
-            }).collect();
+            let attrs: Vec<String> = self
+                .attributes
+                .iter()
+                .map(|(k, v)| {
+                    let val = match v {
+                        LogValue::String(s) => {
+                            format!("{{\"stringValue\":\"{}\"}}", escape_json(s))
+                        }
+                        LogValue::Int(i) => format!("{{\"intValue\":\"{i}\"}}"),
+                        LogValue::Float(f) => format!("{{\"doubleValue\":{f}}}"),
+                        LogValue::Bool(b) => format!("{{\"boolValue\":{b}}}"),
+                        LogValue::Bytes(b) => format!("{{\"bytesValue\":\"{}\"}}", hex_encode(b)),
+                    };
+                    format!("{{\"key\":\"{}\",\"value\":{}}}", escape_json(k), val)
+                })
+                .collect();
             parts.push(format!("\"attributes\":[{}]", attrs.join(",")));
         }
 
@@ -333,7 +342,8 @@ impl BatchLogExporter {
         if count == 0 {
             return 0;
         }
-        self.total_exported.fetch_add(count as u64, Ordering::Relaxed);
+        self.total_exported
+            .fetch_add(count as u64, Ordering::Relaxed);
         self.buffer.clear();
         count
     }
@@ -341,8 +351,10 @@ impl BatchLogExporter {
     /// Render the current buffer as an OTLP JSON resource logs payload.
     pub fn render_otlp_json(&self) -> String {
         let records: Vec<String> = self.buffer.iter().map(|e| e.to_json()).collect();
-        format!("{{\"resourceLogs\":[{{\"scopeLogs\":[{{\"logRecords\":[{}]}}]}}]}}",
-            records.join(","))
+        format!(
+            "{{\"resourceLogs\":[{{\"scopeLogs\":[{{\"logRecords\":[{}]}}]}}]}}",
+            records.join(",")
+        )
     }
 
     /// Total entries exported.
@@ -375,7 +387,10 @@ pub fn detect_resource_attributes() -> HashMap<String, String> {
     let mut attrs = HashMap::new();
     attrs.insert("telemetry.sdk.name".to_string(), "nextgcore".to_string());
     attrs.insert("telemetry.sdk.language".to_string(), "rust".to_string());
-    attrs.insert("telemetry.sdk.version".to_string(), env!("CARGO_PKG_VERSION").to_string());
+    attrs.insert(
+        "telemetry.sdk.version".to_string(),
+        env!("CARGO_PKG_VERSION").to_string(),
+    );
 
     if let Ok(hostname) = std::env::var("HOSTNAME") {
         attrs.insert("host.name".to_string(), hostname);
@@ -438,8 +453,7 @@ mod tests {
     fn test_structured_log_trace_context() {
         let tid = [1u8; 16];
         let sid = [2u8; 8];
-        let entry = StructuredLogEntry::new(OtelSeverity::Info, "Traced")
-            .with_trace(tid, sid);
+        let entry = StructuredLogEntry::new(OtelSeverity::Info, "Traced").with_trace(tid, sid);
 
         let json = entry.to_json();
         assert!(json.contains("\"traceId\""));
@@ -493,7 +507,10 @@ mod tests {
         let mut exporter = BatchLogExporter::new(config, ExportTarget::OtlpHttp);
 
         for i in 0..3 {
-            exporter.enqueue(StructuredLogEntry::new(OtelSeverity::Debug, format!("msg {i}")));
+            exporter.enqueue(StructuredLogEntry::new(
+                OtelSeverity::Debug,
+                format!("msg {i}"),
+            ));
         }
         // Auto-flushed after 3rd enqueue
         assert_eq!(exporter.total_exported(), 3);
@@ -529,8 +546,14 @@ mod tests {
     #[test]
     fn test_detect_resource_attributes() {
         let attrs = detect_resource_attributes();
-        assert_eq!(attrs.get("telemetry.sdk.name"), Some(&"nextgcore".to_string()));
-        assert_eq!(attrs.get("telemetry.sdk.language"), Some(&"rust".to_string()));
+        assert_eq!(
+            attrs.get("telemetry.sdk.name"),
+            Some(&"nextgcore".to_string())
+        );
+        assert_eq!(
+            attrs.get("telemetry.sdk.language"),
+            Some(&"rust".to_string())
+        );
         assert!(attrs.contains_key("process.pid"));
     }
 }

@@ -69,30 +69,24 @@ fn decode_initiating_message(msg: InitiatingMessage) -> NgapResult<NgapMessage> 
         InitiatingMessageValue::NgSetupRequest(ies) => {
             Ok(NgapMessage::NgSetupRequest(parse_ng_setup_request(ies)?))
         }
-        InitiatingMessageValue::InitialUeMessage(ies) => {
-            Ok(NgapMessage::InitialUeMessage(parse_initial_ue_message(ies)?))
-        }
-        InitiatingMessageValue::DownlinkNasTransport(ies) => {
-            Ok(NgapMessage::DownlinkNasTransport(parse_downlink_nas_transport(ies)?))
-        }
-        InitiatingMessageValue::UplinkNasTransport(ies) => {
-            Ok(NgapMessage::UplinkNasTransport(parse_uplink_nas_transport(ies)?))
-        }
-        InitiatingMessageValue::InitialContextSetupRequest(ies) => {
-            Ok(NgapMessage::InitialContextSetupRequest(
-                parse_initial_context_setup_request(ies)?,
-            ))
-        }
-        InitiatingMessageValue::UeContextReleaseCommand(ies) => {
-            Ok(NgapMessage::UeContextReleaseCommand(
-                parse_ue_context_release_command(ies)?,
-            ))
-        }
-        InitiatingMessageValue::UeContextReleaseRequest(ies) => {
-            Ok(NgapMessage::UeContextReleaseRequest(
-                parse_ue_context_release_request(ies)?,
-            ))
-        }
+        InitiatingMessageValue::InitialUeMessage(ies) => Ok(NgapMessage::InitialUeMessage(
+            parse_initial_ue_message(ies)?,
+        )),
+        InitiatingMessageValue::DownlinkNasTransport(ies) => Ok(NgapMessage::DownlinkNasTransport(
+            parse_downlink_nas_transport(ies)?,
+        )),
+        InitiatingMessageValue::UplinkNasTransport(ies) => Ok(NgapMessage::UplinkNasTransport(
+            parse_uplink_nas_transport(ies)?,
+        )),
+        InitiatingMessageValue::InitialContextSetupRequest(ies) => Ok(
+            NgapMessage::InitialContextSetupRequest(parse_initial_context_setup_request(ies)?),
+        ),
+        InitiatingMessageValue::UeContextReleaseCommand(ies) => Ok(
+            NgapMessage::UeContextReleaseCommand(parse_ue_context_release_command(ies)?),
+        ),
+        InitiatingMessageValue::UeContextReleaseRequest(ies) => Ok(
+            NgapMessage::UeContextReleaseRequest(parse_ue_context_release_request(ies)?),
+        ),
         InitiatingMessageValue::PduSessionResourceSetupRequest(ies) => {
             Ok(NgapMessage::PduSessionResourceSetupRequest(
                 parse_pdu_session_resource_setup_request(ies)?,
@@ -119,16 +113,12 @@ fn decode_successful_outcome(msg: SuccessfulOutcome) -> NgapResult<NgapMessage> 
         SuccessfulOutcomeValue::NgSetupResponse(ies) => {
             Ok(NgapMessage::NgSetupResponse(parse_ng_setup_response(ies)?))
         }
-        SuccessfulOutcomeValue::InitialContextSetupResponse(ies) => {
-            Ok(NgapMessage::InitialContextSetupResponse(
-                parse_initial_context_setup_response(ies)?,
-            ))
-        }
-        SuccessfulOutcomeValue::UeContextReleaseComplete(ies) => {
-            Ok(NgapMessage::UeContextReleaseComplete(
-                parse_ue_context_release_complete(ies)?,
-            ))
-        }
+        SuccessfulOutcomeValue::InitialContextSetupResponse(ies) => Ok(
+            NgapMessage::InitialContextSetupResponse(parse_initial_context_setup_response(ies)?),
+        ),
+        SuccessfulOutcomeValue::UeContextReleaseComplete(ies) => Ok(
+            NgapMessage::UeContextReleaseComplete(parse_ue_context_release_complete(ies)?),
+        ),
         SuccessfulOutcomeValue::PduSessionResourceSetupResponse(ies) => {
             Ok(NgapMessage::PduSessionResourceSetupResponse(
                 parse_pdu_session_resource_setup_response(ies)?,
@@ -175,11 +165,9 @@ fn decode_unsuccessful_outcome(msg: UnsuccessfulOutcome) -> NgapResult<NgapMessa
         UnsuccessfulOutcomeValue::NgSetupFailure(ies) => {
             Ok(NgapMessage::NgSetupFailure(parse_ng_setup_failure(ies)?))
         }
-        UnsuccessfulOutcomeValue::InitialContextSetupFailure(ies) => {
-            Ok(NgapMessage::InitialContextSetupFailure(
-                parse_initial_context_setup_failure(ies)?,
-            ))
-        }
+        UnsuccessfulOutcomeValue::InitialContextSetupFailure(ies) => Ok(
+            NgapMessage::InitialContextSetupFailure(parse_initial_context_setup_failure(ies)?),
+        ),
         _ => Ok(NgapMessage::Unknown {
             procedure_code: msg.procedure_code.0,
             message_type: "UnsuccessfulOutcome",
@@ -394,9 +382,7 @@ fn parse_downlink_nas_transport(
     })
 }
 
-fn parse_uplink_nas_transport(
-    container: ProtocolIeContainer,
-) -> NgapResult<UplinkNasTransport> {
+fn parse_uplink_nas_transport(container: ProtocolIeContainer) -> NgapResult<UplinkNasTransport> {
     let mut amf_ue_ngap_id = None;
     let mut ran_ue_ngap_id = None;
     let mut nas_pdu = None;

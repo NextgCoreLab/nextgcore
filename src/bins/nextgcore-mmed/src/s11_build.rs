@@ -220,7 +220,6 @@ impl std::error::Error for S11BuildError {}
 
 pub type S11BuildResult<T> = Result<T, S11BuildError>;
 
-
 // ============================================================================
 // GTP Buffer Helper
 // ============================================================================
@@ -233,7 +232,9 @@ pub struct GtpBuffer {
 
 impl GtpBuffer {
     pub fn new() -> Self {
-        Self { data: Vec::with_capacity(1024) }
+        Self {
+            data: Vec::with_capacity(1024),
+        }
     }
 
     pub fn data(&self) -> &[u8] {
@@ -373,11 +374,7 @@ pub fn build_create_session_request(
 ) -> S11BuildResult<Vec<u8>> {
     log::debug!("Build Create Session Request for APN={}", sess.apn);
     let mut buf = GtpBuffer::new();
-    buf.write_gtp_header_with_teid(
-        message_type::CREATE_SESSION_REQUEST,
-        sgw_ue.sgw_s11_teid,
-        0,
-    );
+    buf.write_gtp_header_with_teid(message_type::CREATE_SESSION_REQUEST, sgw_ue.sgw_s11_teid, 0);
 
     // IE: IMSI (1) - mandatory
     buf.write_ie(ie_type::IMSI, 0, &mme_ue.imsi[..mme_ue.imsi_len]);
@@ -424,11 +421,7 @@ pub fn build_modify_bearer_request(
 ) -> S11BuildResult<Vec<u8>> {
     log::debug!("Build Modify Bearer Request with {} bearers", bearers.len());
     let mut buf = GtpBuffer::new();
-    buf.write_gtp_header_with_teid(
-        message_type::MODIFY_BEARER_REQUEST,
-        sgw_ue.sgw_s11_teid,
-        0,
-    );
+    buf.write_gtp_header_with_teid(message_type::MODIFY_BEARER_REQUEST, sgw_ue.sgw_s11_teid, 0);
 
     // IE: Bearer Context to be modified (93, instance 0) for each bearer
     for bearer in bearers {
@@ -464,11 +457,7 @@ pub fn build_delete_session_request(
 ) -> S11BuildResult<Vec<u8>> {
     log::debug!("Build Delete Session Request for EBI={default_bearer_ebi}");
     let mut buf = GtpBuffer::new();
-    buf.write_gtp_header_with_teid(
-        message_type::DELETE_SESSION_REQUEST,
-        sgw_ue.sgw_s11_teid,
-        0,
-    );
+    buf.write_gtp_header_with_teid(message_type::DELETE_SESSION_REQUEST, sgw_ue.sgw_s11_teid, 0);
 
     // IE: EBI (73) - mandatory (Linked EPS Bearer ID)
     buf.write_ie(ie_type::EBI, 0, &[default_bearer_ebi]);
@@ -489,11 +478,7 @@ pub fn build_create_bearer_response(
 ) -> S11BuildResult<Vec<u8>> {
     log::debug!("Build Create Bearer Response for EBI={}", bearer.ebi);
     let mut buf = GtpBuffer::new();
-    buf.write_gtp_header_with_teid(
-        message_type::CREATE_BEARER_RESPONSE,
-        sgw_ue.sgw_s11_teid,
-        0,
-    );
+    buf.write_gtp_header_with_teid(message_type::CREATE_BEARER_RESPONSE, sgw_ue.sgw_s11_teid, 0);
 
     // IE: Cause (2)
     buf.write_cause(cause_value, 0);
@@ -549,11 +534,7 @@ pub fn build_update_bearer_response(
 ) -> S11BuildResult<Vec<u8>> {
     log::debug!("Build Update Bearer Response for EBI={}", bearer.ebi);
     let mut buf = GtpBuffer::new();
-    buf.write_gtp_header_with_teid(
-        message_type::UPDATE_BEARER_RESPONSE,
-        sgw_ue.sgw_s11_teid,
-        0,
-    );
+    buf.write_gtp_header_with_teid(message_type::UPDATE_BEARER_RESPONSE, sgw_ue.sgw_s11_teid, 0);
 
     // IE: Cause (2)
     buf.write_cause(cause_value, 0);
@@ -577,11 +558,7 @@ pub fn build_delete_bearer_response(
 ) -> S11BuildResult<Vec<u8>> {
     log::debug!("Build Delete Bearer Response for EBI={}", bearer.ebi);
     let mut buf = GtpBuffer::new();
-    buf.write_gtp_header_with_teid(
-        message_type::DELETE_BEARER_RESPONSE,
-        sgw_ue.sgw_s11_teid,
-        0,
-    );
+    buf.write_gtp_header_with_teid(message_type::DELETE_BEARER_RESPONSE, sgw_ue.sgw_s11_teid, 0);
 
     // IE: Cause (2)
     buf.write_cause(cause_value, 0);
@@ -687,9 +664,8 @@ pub fn build_bearer_resource_command(
     if let Some(q) = qos {
         let mut qos_data = Vec::with_capacity(22);
         // ARP: PEC(2bits) | PL(4bits) | PEV(1bit) | spare(1bit)
-        let arp_byte = (q.pre_emption_capability << 6)
-            | (q.priority_level << 2)
-            | q.pre_emption_vulnerability;
+        let arp_byte =
+            (q.pre_emption_capability << 6) | (q.priority_level << 2) | q.pre_emption_vulnerability;
         qos_data.push(arp_byte);
         qos_data.push(q.qci);
         // MBR UL (5 bytes)

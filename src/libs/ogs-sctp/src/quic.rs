@@ -167,8 +167,7 @@ pub struct QuicConfig {
 impl Default for QuicConfig {
     fn default() -> Self {
         Self {
-            bind_address: "0.0.0.0:0".parse()
-                .expect("value expected"),
+            bind_address: "0.0.0.0:0".parse().expect("value expected"),
             tls: TlsConfig::default(),
             max_streams_bidi: 100,
             max_streams_uni: 100,
@@ -372,9 +371,7 @@ impl QuicTransport {
     /// 3. Handle 0-RTT rejection
     pub async fn send_0rtt(&self, stream_id: u64, data: &[u8]) -> QuicResult<()> {
         if !self.config.enable_0rtt {
-            return Err(QuicError::NotImplemented(
-                "0-RTT not enabled".to_string(),
-            ));
+            return Err(QuicError::NotImplemented("0-RTT not enabled".to_string()));
         }
 
         // Placeholder: fall back to regular send
@@ -475,7 +472,9 @@ impl QuicServer {
         }
 
         // Placeholder: return error
-        Err(QuicError::NotImplemented("accept() not implemented".to_string()))
+        Err(QuicError::NotImplemented(
+            "accept() not implemented".to_string(),
+        ))
     }
 
     /// Stops the server
@@ -568,7 +567,10 @@ mod tests {
     async fn test_quic_open_stream() {
         let config = QuicConfig::default();
         let mut transport = QuicTransport::new(config).unwrap();
-        transport.connect("127.0.0.1:443".parse().unwrap()).await.unwrap();
+        transport
+            .connect("127.0.0.1:443".parse().unwrap())
+            .await
+            .unwrap();
 
         let stream_id1 = transport.open_bidi_stream().unwrap();
         let stream_id2 = transport.open_bidi_stream().unwrap();
@@ -581,7 +583,10 @@ mod tests {
     async fn test_quic_close() {
         let config = QuicConfig::default();
         let mut transport = QuicTransport::new(config).unwrap();
-        transport.connect("127.0.0.1:443".parse().unwrap()).await.unwrap();
+        transport
+            .connect("127.0.0.1:443".parse().unwrap())
+            .await
+            .unwrap();
 
         assert!(transport.is_connected());
 
@@ -596,7 +601,10 @@ mod tests {
     async fn test_quic_migration() {
         let config = QuicConfig::default();
         let mut transport = QuicTransport::new(config).unwrap();
-        transport.connect("127.0.0.1:443".parse().unwrap()).await.unwrap();
+        transport
+            .connect("127.0.0.1:443".parse().unwrap())
+            .await
+            .unwrap();
 
         let new_addr: SocketAddr = "192.168.1.10:12345".parse().unwrap();
         let result = transport.migrate_to(new_addr).await;
@@ -611,7 +619,10 @@ mod tests {
         config.enable_migration = false;
 
         let mut transport = QuicTransport::new(config).unwrap();
-        transport.connect("127.0.0.1:443".parse().unwrap()).await.unwrap();
+        transport
+            .connect("127.0.0.1:443".parse().unwrap())
+            .await
+            .unwrap();
 
         let new_addr: SocketAddr = "192.168.1.10:12345".parse().unwrap();
         let result = transport.migrate_to(new_addr).await;

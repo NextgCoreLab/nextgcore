@@ -153,7 +153,7 @@ fn get_current_timestamp() -> String {
 
     // Format as ISO 8601
     let secs = duration.as_secs();
-    
+
     chrono_lite_format(secs)
 }
 
@@ -196,9 +196,7 @@ fn chrono_lite_format(secs: u64) -> String {
 
     let day = remaining_days + 1;
 
-    format!(
-        "{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z"
-    )
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
 }
 
 fn is_leap_year(year: u64) -> bool {
@@ -213,9 +211,7 @@ fn get_nf_instance_id() -> String {
 }
 
 /// Convert AuthenticationInfoRequest to JSON value
-fn auth_info_request_to_json(
-    req: &AuthenticationInfoRequest,
-) -> serde_json::Value {
+fn auth_info_request_to_json(req: &AuthenticationInfoRequest) -> serde_json::Value {
     let mut json = serde_json::json!({
         "servingNetworkName": req.serving_network_name,
         "ausfInstanceId": req.ausf_instance_id,

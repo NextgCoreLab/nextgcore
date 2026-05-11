@@ -101,7 +101,10 @@ impl NfSmContext {
         );
 
         // Transition to will_register state
-        log::debug!("[{}] Transitioning to will_register state", self.nf_instance_id);
+        log::debug!(
+            "[{}] Transitioning to will_register state",
+            self.nf_instance_id
+        );
         self.state = NfState::WillRegister;
     }
 
@@ -203,8 +206,9 @@ impl NfSmContext {
                         let timer_mgr = timer_manager();
                         // Add margin to heartbeat interval (default 3 seconds)
                         let no_heartbeat_margin = 3;
-                        let duration =
-                            Duration::from_secs((self.heartbeat_interval + no_heartbeat_margin) as u64);
+                        let duration = Duration::from_secs(
+                            (self.heartbeat_interval + no_heartbeat_margin) as u64,
+                        );
                         timer_mgr.restart_timer(timer_id, duration);
                     }
                 }
@@ -280,8 +284,9 @@ impl NfSmContext {
                     if let Some(timer_id) = self.t_no_heartbeat {
                         let timer_mgr = timer_manager();
                         let no_heartbeat_margin = 3;
-                        let duration =
-                            Duration::from_secs((self.heartbeat_interval + no_heartbeat_margin) as u64);
+                        let duration = Duration::from_secs(
+                            (self.heartbeat_interval + no_heartbeat_margin) as u64,
+                        );
                         timer_mgr.restart_timer(timer_id, duration);
                     }
                 }
@@ -291,7 +296,10 @@ impl NfSmContext {
             }
             "DELETE" => {
                 // NF deregistration
-                log::info!("[{}] NF deregistration request received", self.nf_instance_id);
+                log::info!(
+                    "[{}] NF deregistration request received",
+                    self.nf_instance_id
+                );
                 // Note: Send response
                 // HTTP 204 No Content response is sent via the HTTP handler in main.rs
                 self.state = NfState::DeRegistered;

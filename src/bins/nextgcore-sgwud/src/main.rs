@@ -18,11 +18,10 @@ fn main() -> Result<()> {
     env_logger::init();
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
-            .with_endpoint(
-                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
-            ),
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+        ),
     )
     .ok();
     log::info!("NextGCore SGWU starting...");
@@ -99,10 +98,7 @@ mod tests {
         let ctx = context::SgwuContext::new();
 
         // Add session
-        let f_seid = context::FSeid::with_ipv4(
-            0x1234,
-            std::net::Ipv4Addr::new(10, 0, 0, 1),
-        );
+        let f_seid = context::FSeid::with_ipv4(0x1234, std::net::Ipv4Addr::new(10, 0, 0, 1));
         let sess = ctx.sess_add(&f_seid).unwrap();
         assert_eq!(ctx.sess_count(), 1);
 
@@ -147,7 +143,10 @@ mod tests {
         };
 
         let msg = sxa_build::build_session_establishment_response(&sess, &[]).unwrap();
-        assert_eq!(msg.msg_type, sxa_build::pfcp_type::SESSION_ESTABLISHMENT_RESPONSE);
+        assert_eq!(
+            msg.msg_type,
+            sxa_build::pfcp_type::SESSION_ESTABLISHMENT_RESPONSE
+        );
         assert_eq!(msg.seid, 0x2000);
     }
 

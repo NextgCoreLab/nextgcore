@@ -158,7 +158,6 @@ impl Default for PkbufConfig {
     }
 }
 
-
 /// Global configuration
 /// Mirrors ogs_app_global_conf_t
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -386,7 +385,6 @@ impl OgsGlobalConf {
     }
 }
 
-
 /// Time type (microseconds)
 pub type OgsTime = i64;
 
@@ -586,8 +584,7 @@ impl OgsLocalConf {
 
         const GTP_N3_HOLDING_RETRY_COUNT: i32 = 1;
         self.time.message.gtp.n3_holding_rcount = GTP_N3_HOLDING_RETRY_COUNT;
-        self.time.message.gtp.t3_holding_duration = self.time.message.gtp.n3_response_rcount
-            as i64
+        self.time.message.gtp.t3_holding_duration = self.time.message.gtp.n3_response_rcount as i64
             * self.time.message.gtp.t3_response_duration;
     }
 
@@ -628,10 +625,9 @@ impl OgsLocalConf {
     fn parse_serving(&mut self, local_iter: &mut OgsYamlIter) -> Result<(), ConfigError> {
         if let Some(mut serving_array) = local_iter.recurse() {
             loop {
-                if serving_array.node_type() == YamlNodeType::Sequence
-                    && !serving_array.next() {
-                        break;
-                    }
+                if serving_array.node_type() == YamlNodeType::Sequence && !serving_array.next() {
+                    break;
+                }
 
                 if let Some(mut serving_iter) = serving_array.recurse() {
                     while serving_iter.next() {
@@ -674,9 +670,8 @@ impl OgsLocalConf {
 
                                 if let (Some(mcc_val), Some(mnc_val)) = (mcc, mnc) {
                                     if self.serving_plmn_id.len() < OGS_MAX_NUM_OF_PLMN {
-                                        self.serving_plmn_id.push(OgsPlmnId::build(
-                                            mcc_val, mnc_val, mnc_len,
-                                        ));
+                                        self.serving_plmn_id
+                                            .push(OgsPlmnId::build(mcc_val, mnc_val, mnc_len));
                                     }
                                 }
                             }
@@ -952,9 +947,9 @@ global:
 "#;
         let doc = OgsYamlDocument::from_str(yaml).unwrap();
         let mut iter = doc.iter();
-        
+
         let mut conf = OgsGlobalConf::new();
-        
+
         while iter.next() {
             if iter.key() == Some("global") {
                 conf.parse(&mut iter).unwrap();
@@ -984,7 +979,7 @@ global:
 //
 
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Sender, Receiver};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -1244,7 +1239,6 @@ impl ConfigReloadManager {
 mod config_reload_tests {
     use super::*;
     use std::fs;
-    
 
     #[test]
     fn test_config_watcher_create() {
@@ -1387,11 +1381,7 @@ impl ConfigHistoryManager {
         self.current_version += 1;
 
         let version = ConfigVersion::new(self.current_version, description);
-        let snapshot = ConfigSnapshot::new(
-            version,
-            global_conf.clone(),
-            local_conf.clone(),
-        );
+        let snapshot = ConfigSnapshot::new(version, global_conf.clone(), local_conf.clone());
 
         // Add to beginning
         self.snapshots.insert(0, snapshot);
@@ -1428,13 +1418,18 @@ impl ConfigHistoryManager {
     ) -> Result<(), ConfigError> {
         // Clone the snapshot data before borrowing self mutably
         let snapshot_data = {
-            let snapshot = self.get_snapshot(version)
+            let snapshot = self
+                .get_snapshot(version)
                 .ok_or_else(|| ConfigError::ParseError(format!("Version {version} not found")))?;
             (snapshot.global_conf.clone(), snapshot.local_conf.clone())
         };
 
         // Before rollback, take a snapshot of current state
-        self.take_snapshot(current_global, current_local, format!("Before rollback to v{version}"));
+        self.take_snapshot(
+            current_global,
+            current_local,
+            format!("Before rollback to v{version}"),
+        );
 
         // Apply snapshot
         *current_global = snapshot_data.0;
@@ -1450,7 +1445,9 @@ impl ConfigHistoryManager {
         current_local: &mut OgsLocalConf,
     ) -> Result<(), ConfigError> {
         if self.snapshots.len() < 2 {
-            return Err(ConfigError::ParseError("No previous version available".to_string()));
+            return Err(ConfigError::ParseError(
+                "No previous version available".to_string(),
+            ));
         }
 
         // Get second snapshot (first is current)
@@ -1471,7 +1468,8 @@ impl ConfigHistoryManager {
 
     /// Export snapshot to JSON
     pub fn export_snapshot(&self, version: u64) -> Result<String, ConfigError> {
-        let snapshot = self.get_snapshot(version)
+        let snapshot = self
+            .get_snapshot(version)
             .ok_or_else(|| ConfigError::ParseError(format!("Version {version} not found")))?;
 
         serde_json::to_string_pretty(snapshot)
@@ -1499,23 +1497,33 @@ impl ConfigHistoryManager {
 
     /// Compare two versions and get differences
     pub fn diff_versions(&self, v1: u64, v2: u64) -> Result<Vec<String>, ConfigError> {
-        let snap1 = self.get_snapshot(v1)
+        let snap1 = self
+            .get_snapshot(v1)
             .ok_or_else(|| ConfigError::ParseError(format!("Version {v1} not found")))?;
-        let snap2 = self.get_snapshot(v2)
+        let snap2 = self
+            .get_snapshot(v2)
             .ok_or_else(|| ConfigError::ParseError(format!("Version {v2} not found")))?;
 
         let mut diffs = Vec::new();
 
         // Compare global config
         if snap1.global_conf.max.ue != snap2.global_conf.max.ue {
-            diffs.push(format!("max.ue: {} -> {}", snap1.global_conf.max.ue, snap2.global_conf.max.ue));
+            diffs.push(format!(
+                "max.ue: {} -> {}",
+                snap1.global_conf.max.ue, snap2.global_conf.max.ue
+            ));
         }
         if snap1.global_conf.max.peer != snap2.global_conf.max.peer {
-            diffs.push(format!("max.peer: {} -> {}", snap1.global_conf.max.peer, snap2.global_conf.max.peer));
+            diffs.push(format!(
+                "max.peer: {} -> {}",
+                snap1.global_conf.max.peer, snap2.global_conf.max.peer
+            ));
         }
 
         // Compare local config
-        if snap1.local_conf.time.nf_instance.validity_duration != snap2.local_conf.time.nf_instance.validity_duration {
+        if snap1.local_conf.time.nf_instance.validity_duration
+            != snap2.local_conf.time.nf_instance.validity_duration
+        {
             diffs.push(format!(
                 "time.nf_instance.validity: {} -> {}",
                 snap1.local_conf.time.nf_instance.validity_duration,
@@ -1547,8 +1555,7 @@ mod version_tests {
 
     #[test]
     fn test_config_version_with_commit() {
-        let version = ConfigVersion::new(1, "Initial")
-            .with_commit_hash("abc123");
+        let version = ConfigVersion::new(1, "Initial").with_commit_hash("abc123");
         assert_eq!(version.commit_hash, Some("abc123".to_string()));
     }
 
@@ -1810,20 +1817,38 @@ impl ConfigDriftDetector {
         }
 
         // Check local config drifts
-        if running_local.time.nf_instance.validity_duration != self.desired_local.time.nf_instance.validity_duration {
+        if running_local.time.nf_instance.validity_duration
+            != self.desired_local.time.nf_instance.validity_duration
+        {
             drifts.push(ConfigDrift {
                 path: "time.nf_instance.validity_duration".to_string(),
-                expected: self.desired_local.time.nf_instance.validity_duration.to_string(),
+                expected: self
+                    .desired_local
+                    .time
+                    .nf_instance
+                    .validity_duration
+                    .to_string(),
                 actual: running_local.time.nf_instance.validity_duration.to_string(),
                 severity: DriftSeverity::Warning,
                 detected_at: now,
             });
         }
-        if running_local.time.nf_instance.heartbeat_interval != self.desired_local.time.nf_instance.heartbeat_interval {
+        if running_local.time.nf_instance.heartbeat_interval
+            != self.desired_local.time.nf_instance.heartbeat_interval
+        {
             drifts.push(ConfigDrift {
                 path: "time.nf_instance.heartbeat_interval".to_string(),
-                expected: self.desired_local.time.nf_instance.heartbeat_interval.to_string(),
-                actual: running_local.time.nf_instance.heartbeat_interval.to_string(),
+                expected: self
+                    .desired_local
+                    .time
+                    .nf_instance
+                    .heartbeat_interval
+                    .to_string(),
+                actual: running_local
+                    .time
+                    .nf_instance
+                    .heartbeat_interval
+                    .to_string(),
                 severity: DriftSeverity::Warning,
                 detected_at: now,
             });
@@ -1906,7 +1931,10 @@ mod drift_tests {
 
         let report = detector.detect(&global, &drifted_local);
         assert!(!report.compliant);
-        assert_eq!(ConfigDriftDetector::worst_severity(&report), Some(DriftSeverity::Critical));
+        assert_eq!(
+            ConfigDriftDetector::worst_severity(&report),
+            Some(DriftSeverity::Critical)
+        );
     }
 
     #[test]

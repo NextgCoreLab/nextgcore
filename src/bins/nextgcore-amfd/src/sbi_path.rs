@@ -6,7 +6,7 @@ use base64::Engine;
 use ogs_sbi::client::SbiClient;
 use ogs_sbi::context::{global_context, NfInstance, NfService};
 
-use crate::context::{AmfUe, AmfSess, RanUe};
+use crate::context::{AmfSess, AmfUe, RanUe};
 
 // ============================================================================
 // Constants
@@ -272,7 +272,9 @@ pub fn amf_sbi_open() -> SbiResult<()> {
     let nf_instance_id = uuid::Uuid::new_v4().to_string();
     let sbi_addr = std::env::var("AMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
     let sbi_port: u16 = std::env::var("AMF_SBI_PORT")
-        .ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(7777);
 
     let mut nf_instance = NfInstance::new(&nf_instance_id, ogs_sbi::types::NfType::Amf);
     nf_instance.ipv4_addresses.push(sbi_addr.clone());
@@ -376,15 +378,9 @@ pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<String, S
             log::info!("AMF registered with NRF (id={nf_instance_id})");
 
             // Update self instance in SBI context
-            let mut self_instance = NfInstance::new(
-                &nf_instance_id,
-                ogs_sbi::types::NfType::Amf,
-            );
+            let mut self_instance = NfInstance::new(&nf_instance_id, ogs_sbi::types::NfType::Amf);
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
-            let mut svc = NfService::new(
-                "namf-comm",
-                ogs_sbi::types::SbiServiceType::NamfComm,
-            );
+            let mut svc = NfService::new("namf-comm", ogs_sbi::types::SbiServiceType::NamfComm);
             svc.port = sbi_port;
             svc.ip_addresses = vec![sbi_addr.to_string()];
             self_instance.add_service(svc);
@@ -392,7 +388,10 @@ pub async fn amf_nrf_register(sbi_addr: &str, sbi_port: u16) -> Result<String, S
 
             Ok(nf_instance_id)
         }
-        _ => Err(format!("NRF registration returned status {}", response.status)),
+        _ => Err(format!(
+            "NRF registration returned status {}",
+            response.status
+        )),
     }
 }
 
@@ -415,20 +414,28 @@ pub async fn amf_nrf_discover(target_nf_type: &str, service_name: &str) -> Resul
         "/nnrf-disc/v1/nf-instances?target-nf-type={target_nf_type}&requester-nf-type=AMF&service-names={service_name}"
     );
 
-    let response = client.get(&path).await
+    let response = client
+        .get(&path)
+        .await
         .map_err(|e| format!("NRF discovery failed: {e}"))?;
 
     if response.status != 200 {
         return Err(format!("NRF discovery returned status {}", response.status));
     }
 
-    let body = response.http.content.ok_or("Empty NRF discovery response")?;
-    let json: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| format!("Invalid NRF discovery response: {e}"))?;
+    let body = response
+        .http
+        .content
+        .ok_or("Empty NRF discovery response")?;
+    let json: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("Invalid NRF discovery response: {e}"))?;
 
     if let Some(nf_instances) = json.get("nfInstances").and_then(|v| v.as_array()) {
         for nf_json in nf_instances {
-            let nf_id = nf_json.get("nfInstanceId").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let nf_id = nf_json
+                .get("nfInstanceId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
             let nf_type_str = nf_json.get("nfType").and_then(|v| v.as_str()).unwrap_or("");
 
             let nf_type = match nf_type_str {
@@ -447,17 +454,23 @@ pub async fn amf_nrf_discover(target_nf_type: &str, service_name: &str) -> Resul
                 instance.fqdn = Some(fqdn.to_string());
             }
             if let Some(addrs) = nf_json.get("ipv4Addresses").and_then(|v| v.as_array()) {
-                instance.ipv4_addresses = addrs.iter()
+                instance.ipv4_addresses = addrs
+                    .iter()
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect();
             }
 
             if let Some(services) = nf_json.get("nfServices").and_then(|v| v.as_array()) {
                 for svc_json in services {
-                    let svc_name = svc_json.get("serviceName").and_then(|v| v.as_str()).unwrap_or("");
+                    let svc_name = svc_json
+                        .get("serviceName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     if let Some(svc_type) = ogs_sbi::types::SbiServiceType::from_name(svc_name) {
                         let mut svc = NfService::new(svc_name, svc_type);
-                        if let Some(endpoints) = svc_json.get("ipEndPoints").and_then(|v| v.as_array()) {
+                        if let Some(endpoints) =
+                            svc_json.get("ipEndPoints").and_then(|v| v.as_array())
+                        {
                             if let Some(ep) = endpoints.first() {
                                 if let Some(addr) = ep.get("ipv4Address").and_then(|v| v.as_str()) {
                                     svc.ip_addresses.push(addr.to_string());
@@ -486,7 +499,9 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
         .strip_prefix("https://")
         .or_else(|| uri.strip_prefix("http://"))
         .unwrap_or(uri);
-    let (host_port, _path) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    let (host_port, _path) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
     if let Some((host, port_str)) = host_port.rsplit_once(':') {
         let port: u16 = port_str.parse().ok()?;
         Some((host.to_string(), port))
@@ -497,10 +512,7 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 }
 
 /// Send SBI request to NF instance
-pub fn amf_sbi_send_request(
-    _nf_instance_id: &str,
-    _xact: &SbiXact,
-) -> SbiResult<()> {
+pub fn amf_sbi_send_request(_nf_instance_id: &str, _xact: &SbiXact) -> SbiResult<()> {
     // Note: Implement actual SBI request sending
     // HTTP/2 request transmission handled by ogs_sbi client module
     Ok(())
@@ -512,27 +524,39 @@ fn resolve_nf_endpoint(service_type: SbiServiceType) -> SbiResult<(String, u16)>
     let (ogs_service_type, env_addr, env_port, default_port) = match service_type {
         SbiServiceType::NausfAuth => (
             ogs_sbi::types::SbiServiceType::NausfAuth,
-            "AUSF_SBI_ADDR", "AUSF_SBI_PORT", 7777u16,
+            "AUSF_SBI_ADDR",
+            "AUSF_SBI_PORT",
+            7777u16,
         ),
         SbiServiceType::NudmUecm => (
             ogs_sbi::types::SbiServiceType::NudmUecm,
-            "UDM_SBI_ADDR", "UDM_SBI_PORT", 7777,
+            "UDM_SBI_ADDR",
+            "UDM_SBI_PORT",
+            7777,
         ),
         SbiServiceType::NudmSdm => (
             ogs_sbi::types::SbiServiceType::NudmSdm,
-            "UDM_SBI_ADDR", "UDM_SBI_PORT", 7777,
+            "UDM_SBI_ADDR",
+            "UDM_SBI_PORT",
+            7777,
         ),
         SbiServiceType::NsmfPdusession => (
             ogs_sbi::types::SbiServiceType::NsmfPdusession,
-            "SMF_SBI_ADDR", "SMF_SBI_PORT", 7777,
+            "SMF_SBI_ADDR",
+            "SMF_SBI_PORT",
+            7777,
         ),
         SbiServiceType::NnssfNsselection => (
             ogs_sbi::types::SbiServiceType::NnssfNsselection,
-            "NSSF_SBI_ADDR", "NSSF_SBI_PORT", 7777,
+            "NSSF_SBI_ADDR",
+            "NSSF_SBI_PORT",
+            7777,
         ),
         SbiServiceType::NpcfAmPolicyControl => (
             ogs_sbi::types::SbiServiceType::NpcfAmPolicyControl,
-            "PCF_SBI_ADDR", "PCF_SBI_PORT", 7777,
+            "PCF_SBI_ADDR",
+            "PCF_SBI_PORT",
+            7777,
         ),
         _ => {
             return Err(SbiError::ServiceNotFound(format!("{service_type:?}")));
@@ -550,7 +574,9 @@ fn resolve_nf_endpoint(service_type: SbiServiceType) -> SbiResult<(String, u16)>
             let instances = ctx.find_nf_instances_by_service(svc_type).await;
             if let Some(inst) = instances.first() {
                 if let Some(svc) = inst.find_service(svc_type) {
-                    let host = svc.ip_addresses.first()
+                    let host = svc
+                        .ip_addresses
+                        .first()
                         .or(inst.ipv4_addresses.first())
                         .or(svc.fqdn.as_ref())
                         .or(inst.fqdn.as_ref());
@@ -566,11 +592,11 @@ fn resolve_nf_endpoint(service_type: SbiServiceType) -> SbiResult<(String, u16)>
     }
 
     // Fallback: use env vars
-    let host = std::env::var(env_addr).map_err(|_| {
-        SbiError::NfInstanceNotFound
-    })?;
+    let host = std::env::var(env_addr).map_err(|_| SbiError::NfInstanceNotFound)?;
     let port = std::env::var(env_port)
-        .ok().and_then(|p| p.parse().ok()).unwrap_or(default_port);
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(default_port);
     log::info!("Using env var fallback for {service_type:?}: {host}:{port}");
     Ok((host, port))
 }
@@ -591,7 +617,9 @@ pub fn amf_ue_sbi_discover_and_send(
 ) -> SbiResult<()> {
     log::debug!(
         "UE SBI discover and send: service={:?}, ue_id={}, state={}",
-        service_type, amf_ue.id, state
+        service_type,
+        amf_ue.id,
+        state
     );
 
     let mut xact = SbiXact::new(0, service_type, amf_ue.id);
@@ -602,7 +630,8 @@ pub fn amf_ue_sbi_discover_and_send(
     let (host, port) = resolve_nf_endpoint(service_type)?;
     log::info!(
         "UE SBI resolved {:?} -> {host}:{port} for ue_id={}",
-        service_type, amf_ue.id
+        service_type,
+        amf_ue.id
     );
 
     Ok(())
@@ -618,7 +647,9 @@ pub fn amf_sess_sbi_discover_and_send(
 ) -> SbiResult<()> {
     log::debug!(
         "Session SBI discover and send: service={:?}, sess_id={}, state={}",
-        service_type, sess.id, state
+        service_type,
+        sess.id,
+        state
     );
 
     let mut xact = SbiXact::new(0, service_type, sess.id);
@@ -633,7 +664,8 @@ pub fn amf_sess_sbi_discover_and_send(
     let (host, port) = resolve_nf_endpoint(service_type)?;
     log::info!(
         "Session SBI resolved {:?} -> {host}:{port} for sess_id={}",
-        service_type, sess.id
+        service_type,
+        sess.id
     );
 
     Ok(())
@@ -645,14 +677,12 @@ pub fn amf_sbi_send_activating_session(
     sess: &AmfSess,
     state: i32,
 ) -> SbiResult<()> {
-    log::debug!("Send activating session: sess_id={}, state={}", sess.id, state);
-    amf_sess_sbi_discover_and_send(
-        SbiServiceType::NsmfPdusession,
-        None,
-        ran_ue,
-        sess,
-        state,
-    )
+    log::debug!(
+        "Send activating session: sess_id={}, state={}",
+        sess.id,
+        state
+    );
+    amf_sess_sbi_discover_and_send(SbiServiceType::NsmfPdusession, None, ran_ue, sess, state)
 }
 
 /// Send deactivate session request
@@ -663,14 +693,12 @@ pub fn amf_sbi_send_deactivate_session(
     _cause_group: u8,
     _cause_value: i64,
 ) -> SbiResult<()> {
-    log::debug!("Send deactivate session: sess_id={}, state={}", sess.id, state);
-    amf_sess_sbi_discover_and_send(
-        SbiServiceType::NsmfPdusession,
-        None,
-        ran_ue,
-        sess,
-        state,
-    )
+    log::debug!(
+        "Send deactivate session: sess_id={}, state={}",
+        sess.id,
+        state
+    );
+    amf_sess_sbi_discover_and_send(SbiServiceType::NsmfPdusession, None, ran_ue, sess, state)
 }
 
 /// Send release session request
@@ -680,13 +708,7 @@ pub fn amf_sbi_send_release_session(
     state: i32,
 ) -> SbiResult<()> {
     log::debug!("Send release session: sess_id={}, state={}", sess.id, state);
-    amf_sess_sbi_discover_and_send(
-        SbiServiceType::NsmfPdusession,
-        None,
-        ran_ue,
-        sess,
-        state,
-    )
+    amf_sess_sbi_discover_and_send(SbiServiceType::NsmfPdusession, None, ran_ue, sess, state)
 }
 
 /// Check if UE has pending session release
@@ -750,41 +772,58 @@ pub async fn call_smf_create_sm_context(
         }
     });
 
-    let response = client.post_json("/nsmf-pdusession/v1/sm-contexts", &body)
+    let response = client
+        .post_json("/nsmf-pdusession/v1/sm-contexts", &body)
         .await
         .map_err(|e| SbiError::RequestFailed(format!("SMF request failed: {e}")))?;
 
     if !response.is_success() {
         return Err(SbiError::RequestFailed(format!(
-            "SMF returned status {}", response.status
+            "SMF returned status {}",
+            response.status
         )));
     }
 
     let response_body: serde_json::Value = match &response.http.content {
         Some(content) => serde_json::from_str(content)
             .map_err(|e| SbiError::ResponseParseError(format!("Invalid JSON: {e}")))?,
-        None => return Err(SbiError::ResponseParseError("Empty response body".to_string())),
+        None => {
+            return Err(SbiError::ResponseParseError(
+                "Empty response body".to_string(),
+            ))
+        }
     };
 
     // Extract SM Context ref from Location header or response body
-    let sm_context_ref = response.http.headers.get("location")
+    let sm_context_ref = response
+        .http
+        .headers
+        .get("location")
         .and_then(|loc| loc.rsplit('/').next().map(|s| s.to_string()))
-        .or_else(|| response_body["smContextRef"].as_str().map(|s| s.to_string()))
+        .or_else(|| {
+            response_body["smContextRef"]
+                .as_str()
+                .map(|s| s.to_string())
+        })
         .unwrap_or_else(|| "1".to_string());
 
     // Extract N1 SM message (base64-encoded PDU Session Accept from SMF)
-    let n1_sm_msg = response_body["n1SmMsg"].as_str()
+    let n1_sm_msg = response_body["n1SmMsg"]
+        .as_str()
         .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .expect("value expected");
 
     // Extract N2 SM Information (base64-encoded UPF tunnel info from SMF)
-    let n2_sm_info = response_body["n2SmInfo"].as_str()
+    let n2_sm_info = response_body["n2SmInfo"]
+        .as_str()
         .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .expect("value expected");
 
     log::info!(
         "SMF SM Context Created: ref={}, n1_len={}, n2_len={}",
-        sm_context_ref, n1_sm_msg.len(), n2_sm_info.len()
+        sm_context_ref,
+        n1_sm_msg.len(),
+        n2_sm_info.len()
     );
 
     Ok(SmContextCreateResponse {
@@ -805,7 +844,8 @@ pub async fn call_smf_update_sm_context(
 ) -> SbiResult<()> {
     log::info!(
         "Calling SMF SM Context Update: ref={}, n2_info_len={}",
-        sm_context_ref, n2_sm_info.len()
+        sm_context_ref,
+        n2_sm_info.len()
     );
 
     let client = SbiClient::with_host_port(smf_host, smf_port);
@@ -816,13 +856,15 @@ pub async fn call_smf_update_sm_context(
     });
 
     let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
-    let response = client.post_json(&path, &body)
+    let response = client
+        .post_json(&path, &body)
         .await
         .map_err(|e| SbiError::RequestFailed(format!("SMF update failed: {e}")))?;
 
     if !response.is_success() {
         return Err(SbiError::RequestFailed(format!(
-            "SMF update returned status {}", response.status
+            "SMF update returned status {}",
+            response.status
         )));
     }
 
@@ -850,7 +892,8 @@ pub async fn call_smf_update_sm_context_with_n1(
 ) -> SbiResult<SmContextUpdateResponse> {
     log::info!(
         "Calling SMF SM Context Update (N1): ref={}, n1_len={}",
-        sm_context_ref, n1_sm_msg.len()
+        sm_context_ref,
+        n1_sm_msg.len()
     );
 
     let client = SbiClient::with_host_port(smf_host, smf_port);
@@ -861,13 +904,15 @@ pub async fn call_smf_update_sm_context_with_n1(
     });
 
     let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/modify");
-    let response = client.post_json(&path, &body)
+    let response = client
+        .post_json(&path, &body)
         .await
         .map_err(|e| SbiError::RequestFailed(format!("SMF update failed: {e}")))?;
 
     if !response.is_success() {
         return Err(SbiError::RequestFailed(format!(
-            "SMF update returned status {}", response.status
+            "SMF update returned status {}",
+            response.status
         )));
     }
 
@@ -876,16 +921,21 @@ pub async fn call_smf_update_sm_context_with_n1(
         None => serde_json::json!({}),
     };
 
-    let n1_sm_msg = response_body["n1SmMsg"].as_str()
+    let n1_sm_msg = response_body["n1SmMsg"]
+        .as_str()
         .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .expect("value expected");
 
-    let n2_sm_info = response_body["n2SmInfo"].as_str()
+    let n2_sm_info = response_body["n2SmInfo"]
+        .as_str()
         .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
         .expect("value expected");
 
-    log::info!("SMF SM Context Updated (N1): ref={sm_context_ref}, n1_len={}, n2_len={}",
-        n1_sm_msg.len(), n2_sm_info.len());
+    log::info!(
+        "SMF SM Context Updated (N1): ref={sm_context_ref}, n1_len={}, n2_len={}",
+        n1_sm_msg.len(),
+        n2_sm_info.len()
+    );
 
     Ok(SmContextUpdateResponse {
         n1_sm_msg,
@@ -902,9 +952,7 @@ pub async fn call_smf_release_sm_context(
     smf_port: u16,
     sm_context_ref: &str,
 ) -> SbiResult<()> {
-    log::info!(
-        "Calling SMF SM Context Release: ref={sm_context_ref}"
-    );
+    log::info!("Calling SMF SM Context Release: ref={sm_context_ref}");
 
     let client = SbiClient::with_host_port(smf_host, smf_port);
 
@@ -913,13 +961,15 @@ pub async fn call_smf_release_sm_context(
     });
 
     let path = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/release");
-    let response = client.post_json(&path, &body)
+    let response = client
+        .post_json(&path, &body)
         .await
         .map_err(|e| SbiError::RequestFailed(format!("SMF release failed: {e}")))?;
 
     if !response.is_success() {
         return Err(SbiError::RequestFailed(format!(
-            "SMF release returned status {}", response.status
+            "SMF release returned status {}",
+            response.status
         )));
     }
 
@@ -961,20 +1011,26 @@ pub async fn call_ausf_authenticate(
         "servingNetworkName": serving_network_name
     });
 
-    let response = client.post_json("/nausf-auth/v1/ue-authentications", &body)
+    let response = client
+        .post_json("/nausf-auth/v1/ue-authentications", &body)
         .await
         .map_err(|e| SbiError::RequestFailed(format!("AUSF request failed: {e}")))?;
 
     if !response.is_success() {
         return Err(SbiError::RequestFailed(format!(
-            "AUSF returned status {}", response.status
+            "AUSF returned status {}",
+            response.status
         )));
     }
 
     let response_body: serde_json::Value = match &response.http.content {
         Some(content) => serde_json::from_str(content)
             .map_err(|e| SbiError::ResponseParseError(format!("Invalid JSON: {e}")))?,
-        None => return Err(SbiError::ResponseParseError("Empty response body".to_string())),
+        None => {
+            return Err(SbiError::ResponseParseError(
+                "Empty response body".to_string(),
+            ))
+        }
     };
 
     // Extract auth data
@@ -988,7 +1044,10 @@ pub async fn call_ausf_authenticate(
         .map_err(|e| SbiError::ResponseParseError(format!("Invalid HXRES*: {e}")))?;
 
     // Extract auth context ID from Location header
-    let auth_ctx_id = response.http.headers.get("location")
+    let auth_ctx_id = response
+        .http
+        .headers
+        .get("location")
         .and_then(|loc| loc.rsplit('/').next().map(|s| s.to_string()))
         .unwrap_or_else(|| "1".to_string());
 
@@ -1026,7 +1085,8 @@ pub async fn call_ausf_5g_aka_confirm(
 ) -> SbiResult<AusfConfirmResponse> {
     log::info!(
         "Calling AUSF 5G-AKA confirmation: ctx_id={}, RES*={}",
-        auth_ctx_id, hex::encode(&res_star[..4])
+        auth_ctx_id,
+        hex::encode(&res_star[..4])
     );
 
     let client = SbiClient::with_host_port(ausf_host, ausf_port);
@@ -1036,23 +1096,32 @@ pub async fn call_ausf_5g_aka_confirm(
     });
 
     let path = format!("/nausf-auth/v1/ue-authentications/{auth_ctx_id}/5g-aka-confirmation");
-    let response = client.put_json(&path, &body)
+    let response = client
+        .put_json(&path, &body)
         .await
         .map_err(|e| SbiError::RequestFailed(format!("AUSF confirmation failed: {e}")))?;
 
     if !response.is_success() {
         return Err(SbiError::RequestFailed(format!(
-            "AUSF confirmation returned status {}", response.status
+            "AUSF confirmation returned status {}",
+            response.status
         )));
     }
 
     let response_body: serde_json::Value = match &response.http.content {
         Some(content) => serde_json::from_str(content)
             .map_err(|e| SbiError::ResponseParseError(format!("Invalid JSON: {e}")))?,
-        None => return Err(SbiError::ResponseParseError("Empty response body".to_string())),
+        None => {
+            return Err(SbiError::ResponseParseError(
+                "Empty response body".to_string(),
+            ))
+        }
     };
 
-    let auth_result = response_body["authResult"].as_str().unwrap_or("UNKNOWN").to_string();
+    let auth_result = response_body["authResult"]
+        .as_str()
+        .unwrap_or("UNKNOWN")
+        .to_string();
 
     let kseaf_hex = response_body["kseaf"].as_str().unwrap_or("");
     let kseaf_bytes = hex::decode(kseaf_hex)
@@ -1096,7 +1165,10 @@ mod tests {
     fn test_sbi_service_type_names() {
         assert_eq!(SbiServiceType::NausfAuth.service_name(), "nausf-auth");
         assert_eq!(SbiServiceType::NudmUecm.service_name(), "nudm-uecm");
-        assert_eq!(SbiServiceType::NsmfPdusession.service_name(), "nsmf-pdusession");
+        assert_eq!(
+            SbiServiceType::NsmfPdusession.service_name(),
+            "nsmf-pdusession"
+        );
     }
 
     #[test]

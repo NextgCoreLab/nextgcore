@@ -18,12 +18,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-mod context;
-mod sbi_handler;
 pub mod analytics;
-pub mod subscription;
-pub mod ml_service;
+mod context;
 pub mod federation;
+pub mod ml_service;
+mod sbi_handler;
+pub mod subscription;
 
 pub use context::*;
 pub use sbi_handler::*;
@@ -105,11 +105,10 @@ async fn main() -> Result<()> {
     init_logging(&args.log_level);
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
-            .with_endpoint(
-                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
-            ),
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+        ),
     )
     .ok();
 
@@ -220,7 +219,11 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 }
 
 /// Register NWDAF with NRF
-async fn register_with_nrf(sbi_addr: &str, sbi_port: u16, nf_instance_id: &str) -> Result<(), String> {
+async fn register_with_nrf(
+    sbi_addr: &str,
+    sbi_port: u16,
+    nf_instance_id: &str,
+) -> Result<(), String> {
     let sbi_ctx = global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
@@ -276,10 +279,8 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16, nf_instance_id: &str) 
         200 | 201 => {
             log::info!("NWDAF registered with NRF successfully (id={nf_instance_id})");
 
-            let mut self_instance = ogs_sbi::context::NfInstance::new(
-                nf_instance_id,
-                ogs_sbi::types::NfType::Nwdaf,
-            );
+            let mut self_instance =
+                ogs_sbi::context::NfInstance::new(nf_instance_id, ogs_sbi::types::NfType::Nwdaf);
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
             let mut svc = ogs_sbi::context::NfService::new(
                 "nnwdaf-eventssubscription",
@@ -299,7 +300,10 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16, nf_instance_id: &str) 
 
             Ok(())
         }
-        _ => Err(format!("NRF registration returned status {}", response.status)),
+        _ => Err(format!(
+            "NRF registration returned status {}",
+            response.status
+        )),
     }
 }
 
@@ -309,7 +313,9 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
         .strip_prefix("https://")
         .or_else(|| uri.strip_prefix("http://"))
         .unwrap_or(uri);
-    let (host_port, _path) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    let (host_port, _path) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
     if let Some((host, port_str)) = host_port.rsplit_once(':') {
         let port: u16 = port_str.parse().ok()?;
         Some((host.to_string(), port))

@@ -2,9 +2,9 @@
 //!
 //! Based on 3GPP TS 24.501
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use crate::error::{NasError, NasResult};
 use crate::common::types::{PlmnId, Tai};
+use crate::error::{NasError, NasResult};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// 5GMM cause values (TS 24.501 Section 9.11.3.2)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,7 +95,9 @@ impl TryFrom<u8> for FiveGmmCause {
             97 => Ok(Self::MessageTypeNonExistent),
             98 => Ok(Self::MessageTypeNotCompatible),
             99 => Ok(Self::InformationElementNonExistent),
-            _ => Err(NasError::DecodingError(format!("Unknown 5GMM cause: {value}"))),
+            _ => Err(NasError::DecodingError(format!(
+                "Unknown 5GMM cause: {value}"
+            ))),
         }
     }
 }
@@ -126,7 +128,10 @@ pub enum RegistrationTypeValue {
 impl RegistrationType {
     /// Create a new registration type
     pub fn new(follow_on_request: bool, value: RegistrationTypeValue) -> Self {
-        Self { follow_on_request, value }
+        Self {
+            follow_on_request,
+            value,
+        }
     }
 
     /// Encode to half-byte
@@ -148,7 +153,10 @@ impl RegistrationType {
             7 => RegistrationTypeValue::DisasterRoamingInitialRegistration,
             v => return Err(NasError::InvalidRegistrationType(v)),
         };
-        Ok(Self { follow_on_request, value })
+        Ok(Self {
+            follow_on_request,
+            value,
+        })
     }
 }
 
@@ -226,12 +234,18 @@ impl MobileIdentity {
     /// Decode mobile identity from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 3 {
-            return Err(NasError::BufferTooShort { expected: 3, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 3,
+                actual: buf.remaining(),
+            });
         }
 
         let length = buf.get_u16() as usize;
         if buf.remaining() < length {
-            return Err(NasError::BufferTooShort { expected: length, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: length,
+                actual: buf.remaining(),
+            });
         }
 
         let type_byte = buf.chunk()[0];
@@ -300,7 +314,10 @@ impl Suci {
     /// Decode SUCI content from bytes
     pub fn decode_content(buf: &mut Bytes, length: usize) -> NasResult<Self> {
         if length < 8 {
-            return Err(NasError::BufferTooShort { expected: 8, actual: length });
+            return Err(NasError::BufferTooShort {
+                expected: 8,
+                actual: length,
+            });
         }
 
         let first_byte = buf.get_u8();
@@ -356,7 +373,10 @@ impl FiveGGuti {
     /// Decode 5G-GUTI content from bytes
     pub fn decode_content(buf: &mut Bytes, length: usize) -> NasResult<Self> {
         if length < 11 {
-            return Err(NasError::BufferTooShort { expected: 11, actual: length });
+            return Err(NasError::BufferTooShort {
+                expected: 11,
+                actual: length,
+            });
         }
 
         let _first_byte = buf.get_u8(); // Type indicator
@@ -401,7 +421,10 @@ impl FiveGSTmsi {
     /// Decode 5G-S-TMSI content from bytes
     pub fn decode_content(buf: &mut Bytes, length: usize) -> NasResult<Self> {
         if length < 7 {
-            return Err(NasError::BufferTooShort { expected: 7, actual: length });
+            return Err(NasError::BufferTooShort {
+                expected: 7,
+                actual: length,
+            });
         }
 
         let _first_byte = buf.get_u8();
@@ -410,7 +433,11 @@ impl FiveGSTmsi {
         let amf_pointer = (amf_id & 0x3F) as u8;
         let tmsi = buf.get_u32();
 
-        Ok(Self { amf_set_id, amf_pointer, tmsi })
+        Ok(Self {
+            amf_set_id,
+            amf_pointer,
+            tmsi,
+        })
     }
 }
 
@@ -431,7 +458,11 @@ impl Imei {
         // Remaining digits packed as BCD
         for i in 0..7 {
             let d1 = self.digits[1 + i * 2];
-            let d2 = if 2 + i * 2 < 15 { self.digits[2 + i * 2] } else { 0x0F };
+            let d2 = if 2 + i * 2 < 15 {
+                self.digits[2 + i * 2]
+            } else {
+                0x0F
+            };
             buf.put_u8((d2 << 4) | d1);
         }
     }
@@ -439,7 +470,10 @@ impl Imei {
     /// Decode IMEI content from bytes
     pub fn decode_content(buf: &mut Bytes, length: usize) -> NasResult<Self> {
         if length < 8 {
-            return Err(NasError::BufferTooShort { expected: 8, actual: length });
+            return Err(NasError::BufferTooShort {
+                expected: 8,
+                actual: length,
+            });
         }
 
         let mut digits = [0u8; 15];
@@ -474,7 +508,11 @@ impl Imeisv {
         // 16 digits total: first digit in byte 0, remaining 15 digits in 8 bytes (last nibble is filler)
         for i in 0..8 {
             let d1 = self.digits[1 + i * 2];
-            let d2 = if 2 + i * 2 < 16 { self.digits[2 + i * 2] } else { 0x0F };
+            let d2 = if 2 + i * 2 < 16 {
+                self.digits[2 + i * 2]
+            } else {
+                0x0F
+            };
             buf.put_u8((d2 << 4) | d1);
         }
     }
@@ -482,7 +520,10 @@ impl Imeisv {
     /// Decode IMEISV content from bytes
     pub fn decode_content(buf: &mut Bytes, length: usize) -> NasResult<Self> {
         if length < 9 {
-            return Err(NasError::BufferTooShort { expected: 9, actual: length });
+            return Err(NasError::BufferTooShort {
+                expected: 9,
+                actual: length,
+            });
         }
 
         let mut digits = [0u8; 16];
@@ -533,7 +574,10 @@ impl RegistrationResult {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 2 {
-            return Err(NasError::BufferTooShort { expected: 2, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 2,
+                actual: buf.remaining(),
+            });
         }
         let _length = buf.get_u8();
         let byte = buf.get_u8();
@@ -575,7 +619,11 @@ impl DeRegistrationType {
     /// Encode to half-byte
     pub fn encode(&self) -> u8 {
         let switch_off_bit = if self.switch_off { 0x08 } else { 0 };
-        let re_reg_bit = if self.re_registration_required { 0x04 } else { 0 };
+        let re_reg_bit = if self.re_registration_required {
+            0x04
+        } else {
+            0
+        };
         switch_off_bit | re_reg_bit | (self.access_type as u8 & 0x03)
     }
 
@@ -589,7 +637,11 @@ impl DeRegistrationType {
             3 => AccessType::ThreeGppAndNon3gppAccess,
             _ => AccessType::ThreeGppAccess,
         };
-        Self { switch_off, re_registration_required, access_type }
+        Self {
+            switch_off,
+            re_registration_required,
+            access_type,
+        }
     }
 }
 
@@ -666,12 +718,18 @@ impl TaiList {
     /// Decode TAI list from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
 
         let length = buf.get_u8();
         if buf.remaining() < length as usize {
-            return Err(NasError::BufferTooShort { expected: length as usize, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: length as usize,
+                actual: buf.remaining(),
+            });
         }
 
         let mut elements = Vec::new();

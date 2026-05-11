@@ -252,12 +252,16 @@ mod tests {
     }
 
     fn state_a(ctx: &mut TestContext, event: &mut TestEvent) {
-        ctx.transitions.borrow_mut().push(format!("state_a({})", event.signal));
+        ctx.transitions
+            .borrow_mut()
+            .push(format!("state_a({})", event.signal));
         ctx.value += 1;
     }
 
     fn state_b(ctx: &mut TestContext, event: &mut TestEvent) {
-        ctx.transitions.borrow_mut().push(format!("state_b({})", event.signal));
+        ctx.transitions
+            .borrow_mut()
+            .push(format!("state_b({})", event.signal));
         ctx.value += 10;
     }
 
@@ -285,10 +289,13 @@ mod tests {
             value: 0,
             transitions: RefCell::new(Vec::new()),
         };
-        let mut event = TestEvent { signal: OGS_FSM_ENTRY_SIG, data: 42 };
-        
+        let mut event = TestEvent {
+            signal: OGS_FSM_ENTRY_SIG,
+            data: 42,
+        };
+
         fsm.init_fsm(&mut ctx, &mut event);
-        
+
         assert_eq!(ctx.value, 42);
         assert_eq!(ctx.transitions.borrow().len(), 1);
         assert_eq!(ctx.transitions.borrow()[0], "init");
@@ -297,9 +304,9 @@ mod tests {
     #[test]
     fn test_fsm_tran() {
         let mut fsm: OgsFsm<TestContext, TestEvent> = OgsFsm::new();
-        
+
         assert!(!fsm.has_state());
-        
+
         fsm.tran(state_a);
         assert!(fsm.has_state());
     }
@@ -311,11 +318,14 @@ mod tests {
             value: 0,
             transitions: RefCell::new(Vec::new()),
         };
-        let mut event = TestEvent { signal: OGS_FSM_USER_SIG, data: 0 };
-        
+        let mut event = TestEvent {
+            signal: OGS_FSM_USER_SIG,
+            data: 0,
+        };
+
         fsm.tran(state_a);
         fsm.dispatch(&mut ctx, &mut event);
-        
+
         assert_eq!(ctx.value, 1);
         assert_eq!(ctx.transitions.borrow()[0], "state_a(2)");
     }
@@ -327,18 +337,21 @@ mod tests {
             value: 0,
             transitions: RefCell::new(Vec::new()),
         };
-        let mut event = TestEvent { signal: OGS_FSM_USER_SIG, data: 0 };
-        
+        let mut event = TestEvent {
+            signal: OGS_FSM_USER_SIG,
+            data: 0,
+        };
+
         // Start in state A
         fsm.tran(state_a);
         fsm.dispatch(&mut ctx, &mut event);
         assert_eq!(ctx.value, 1);
-        
+
         // Transition to state B
         fsm.tran(state_b);
         fsm.dispatch(&mut ctx, &mut event);
         assert_eq!(ctx.value, 11);
-        
+
         // Back to state A
         fsm.tran(state_a);
         fsm.dispatch(&mut ctx, &mut event);
@@ -352,13 +365,16 @@ mod tests {
             value: 0,
             transitions: RefCell::new(Vec::new()),
         };
-        let mut event = TestEvent { signal: OGS_FSM_EXIT_SIG, data: 0 };
-        
+        let mut event = TestEvent {
+            signal: OGS_FSM_EXIT_SIG,
+            data: 0,
+        };
+
         fsm.tran(state_a);
         assert!(fsm.has_state());
-        
+
         fsm.fini_fsm(&mut ctx, &mut event);
-        
+
         assert!(!fsm.has_state());
         assert!(ctx.transitions.borrow().contains(&"fini".to_string()));
     }
@@ -366,11 +382,11 @@ mod tests {
     #[test]
     fn test_fsm_check() {
         let mut fsm: OgsFsm<TestContext, TestEvent> = OgsFsm::new();
-        
+
         fsm.tran(state_a);
         assert!(fsm.check(state_a));
         assert!(!fsm.check(state_b));
-        
+
         fsm.tran(state_b);
         assert!(!fsm.check(state_a));
         assert!(fsm.check(state_b));
@@ -379,21 +395,22 @@ mod tests {
     #[test]
     fn test_fsm_clear_state() {
         let mut fsm: OgsFsm<TestContext, TestEvent> = OgsFsm::new();
-        
+
         fsm.tran(state_a);
         assert!(fsm.has_state());
-        
+
         fsm.clear_state();
         assert!(!fsm.has_state());
     }
 
     #[test]
     fn test_fsm_clone() {
-        let mut fsm1: OgsFsm<TestContext, TestEvent> = OgsFsm::with_handlers(state_init, state_fini);
+        let mut fsm1: OgsFsm<TestContext, TestEvent> =
+            OgsFsm::with_handlers(state_init, state_fini);
         fsm1.tran(state_a);
-        
+
         let fsm2 = fsm1.clone();
-        
+
         assert!(fsm2.init.is_some());
         assert!(fsm2.fini.is_some());
         assert!(fsm2.has_state());
@@ -432,10 +449,10 @@ mod tests {
             #[test]
             fn prop_tran_sets_state(handler_idx in 0..3usize) {
                 let mut fsm: OgsFsm<i32, i32> = OgsFsm::new();
-                
+
                 let handlers = [handler_1 as OgsFsmHandler<i32, i32>, handler_2, handler_3];
                 let handler = handlers[handler_idx];
-                
+
                 prop_assert!(!fsm.has_state());
                 fsm.tran(handler);
                 prop_assert!(fsm.has_state());
@@ -447,13 +464,13 @@ mod tests {
                 let mut fsm: OgsFsm<i32, i32> = OgsFsm::new();
                 let mut ctx = 0i32;
                 let mut event = 0i32;
-                
+
                 fsm.tran(handler_1);
-                
+
                 for _ in 0..dispatch_count {
                     fsm.dispatch(&mut ctx, &mut event);
                 }
-                
+
                 prop_assert_eq!(ctx, dispatch_count as i32, "dispatch should call handler each time");
             }
 
@@ -463,17 +480,17 @@ mod tests {
                 let mut fsm: OgsFsm<i32, i32> = OgsFsm::new();
                 let mut ctx = 0i32;
                 let mut event = 0i32;
-                
+
                 let handlers = [handler_1 as OgsFsmHandler<i32, i32>, handler_2, handler_3];
                 let increments = [1, 10, 100];
-                
+
                 let mut expected = 0;
                 for idx in transitions {
                     fsm.tran(handlers[idx]);
                     fsm.dispatch(&mut ctx, &mut event);
                     expected += increments[idx];
                 }
-                
+
                 prop_assert_eq!(ctx, expected, "state transitions should be immediate");
             }
 
@@ -483,9 +500,9 @@ mod tests {
                 let mut fsm: OgsFsm<i32, i32> = OgsFsm::with_handlers(init_handler, fini_handler);
                 let mut ctx = 999i32;
                 let mut event = 0i32;
-                
+
                 fsm.init_fsm(&mut ctx, &mut event);
-                
+
                 prop_assert_eq!(ctx, 0, "init should call init handler");
             }
 
@@ -495,12 +512,12 @@ mod tests {
                 let mut fsm: OgsFsm<i32, i32> = OgsFsm::with_handlers(init_handler, fini_handler);
                 let mut ctx = 0i32;
                 let mut event = 0i32;
-                
+
                 fsm.tran(handler_1);
                 prop_assert!(fsm.has_state());
-                
+
                 fsm.fini_fsm(&mut ctx, &mut event);
-                
+
                 prop_assert!(!fsm.has_state(), "fini should clear state");
                 prop_assert_eq!(ctx, -1, "fini should call fini handler");
             }
@@ -509,10 +526,10 @@ mod tests {
             #[test]
             fn prop_clear_state(_dummy in 0..1i32) {
                 let mut fsm: OgsFsm<i32, i32> = OgsFsm::new();
-                
+
                 fsm.tran(handler_1);
                 prop_assert!(fsm.has_state());
-                
+
                 fsm.clear_state();
                 prop_assert!(!fsm.has_state());
             }
@@ -523,10 +540,10 @@ mod tests {
                 let mut fsm: OgsFsm<i32, i32> = OgsFsm::new();
                 let mut ctx = initial_value;
                 let mut event = 0i32;
-                
+
                 // No state set
                 fsm.dispatch(&mut ctx, &mut event);
-                
+
                 prop_assert_eq!(ctx, initial_value, "dispatch without state should be no-op");
             }
 
@@ -535,11 +552,11 @@ mod tests {
             fn prop_clone_preserves_state(handler_idx in 0..3usize) {
                 let mut fsm1: OgsFsm<i32, i32> = OgsFsm::with_handlers(init_handler, fini_handler);
                 let handlers = [handler_1 as OgsFsmHandler<i32, i32>, handler_2, handler_3];
-                
+
                 fsm1.tran(handlers[handler_idx]);
-                
+
                 let fsm2 = fsm1.clone();
-                
+
                 prop_assert!(fsm2.init.is_some());
                 prop_assert!(fsm2.fini.is_some());
                 prop_assert!(fsm2.has_state());

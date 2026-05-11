@@ -5,7 +5,7 @@
 
 use crate::context::{pcrf_self, pcrf_sess_find_by_ipv4, pcrf_sess_find_by_ipv6, OGS_IPV6_LEN};
 use crate::fd_path::pcrf_diam_stats;
-use crate::gx_path::{pcrf_gx_send_rar, RxMessageForRar, rx_cmd_code};
+use crate::gx_path::{pcrf_gx_send_rar, rx_cmd_code, RxMessageForRar};
 
 /// Rx session state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,13 +213,15 @@ pub fn pcrf_rx_handle_aar(
             max_requested_bandwidth_dl: mc.max_requested_bandwidth_dl,
             max_requested_bandwidth_ul: mc.max_requested_bandwidth_ul,
             flow_status: mc.flow_status,
-            sub_components: mc.sub_components.iter().map(|sc| {
-                crate::gx_path::MediaSubComponent {
+            sub_components: mc
+                .sub_components
+                .iter()
+                .map(|sc| crate::gx_path::MediaSubComponent {
                     flow_number: sc.flow_number,
                     flow_usage: sc.flow_usage,
                     flows: sc.flows.iter().map(|f| f.description.clone()).collect(),
-                }
-            }).collect(),
+                })
+                .collect(),
         })
         .collect();
 
@@ -252,27 +254,22 @@ pub fn pcrf_rx_handle_aar(
 }
 
 /// Handle STR (Session-Termination-Request) - stub implementation
-pub fn pcrf_rx_handle_str(
-    session_id: &str,
-    termination_cause: u32,
-) -> Result<u32, String> {
-    log::debug!(
-        "Handling STR: session={session_id}, cause={termination_cause}"
-    );
+pub fn pcrf_rx_handle_str(session_id: &str, termination_cause: u32) -> Result<u32, String> {
+    log::debug!("Handling STR: session={session_id}, cause={termination_cause}");
 
     // Update statistics
     pcrf_diam_stats().rx.inc_rx_str();
 
     let ctx = pcrf_self();
-    let context = ctx.read().map_err(|e| format!("Failed to read context: {e}"))?;
+    let context = ctx
+        .read()
+        .map_err(|e| format!("Failed to read context: {e}"))?;
 
     // Find Rx session
-    let _rx_session = context
-        .rx_session_find_by_sid(session_id)
-        .ok_or_else(|| {
-            pcrf_diam_stats().rx.inc_rx_str_error();
-            "Rx session not found".to_string()
-        })?;
+    let _rx_session = context.rx_session_find_by_sid(session_id).ok_or_else(|| {
+        pcrf_diam_stats().rx.inc_rx_str_error();
+        "Rx session not found".to_string()
+    })?;
 
     // Get associated Gx session
     let gx_sessions = context.gx_session_count();
@@ -295,12 +292,12 @@ pub fn pcrf_rx_handle_str(
 
 /// Send ASR (Abort-Session-Request) to AF/P-CSCF
 pub fn pcrf_rx_send_asr(rx_sid: &str, abort_cause: u32) -> Result<(), String> {
-    log::debug!(
-        "Sending ASR: rx_sid={rx_sid}, abort_cause={abort_cause}"
-    );
+    log::debug!("Sending ASR: rx_sid={rx_sid}, abort_cause={abort_cause}");
 
     let ctx = pcrf_self();
-    let context = ctx.read().map_err(|e| format!("Failed to read context: {e}"))?;
+    let context = ctx
+        .read()
+        .map_err(|e| format!("Failed to read context: {e}"))?;
 
     // Find Rx session
     let _rx_session = context
@@ -324,9 +321,7 @@ pub fn pcrf_rx_send_asr(rx_sid: &str, abort_cause: u32) -> Result<(), String> {
 
 /// Handle ASA (Abort-Session-Answer) callback - stub implementation
 pub fn pcrf_rx_handle_asa(session_id: &str, result_code: u32) {
-    log::debug!(
-        "Handling ASA: session={session_id}, result_code={result_code}"
-    );
+    log::debug!("Handling ASA: session={session_id}, result_code={result_code}");
 
     // Update statistics
     pcrf_diam_stats().rx.inc_rx_asa();
@@ -383,12 +378,7 @@ mod tests {
         crate::context::pcrf_context_init(1024);
 
         let rx_msg = RxMessage::default();
-        let result = pcrf_rx_handle_aar(
-            "rx-session-1",
-            Some([192, 168, 1, 1]),
-            None,
-            &rx_msg,
-        );
+        let result = pcrf_rx_handle_aar("rx-session-1", Some([192, 168, 1, 1]), None, &rx_msg);
 
         // Should fail because no Gx session exists for this IP
         assert!(result.is_err());

@@ -2,7 +2,7 @@
 //!
 //! Port of src/mme/emm-build.c - EMM message building functions
 
-use crate::context::{MmeUe, PlmnId, EpsTai};
+use crate::context::{EpsTai, MmeUe, PlmnId};
 
 // ============================================================================
 // EMM Cause Codes (3GPP TS 24.301)
@@ -89,7 +89,6 @@ pub enum EmmCause {
     #[default]
     RequestAccepted = 0,
 }
-
 
 // ============================================================================
 // NAS EPS Message Types
@@ -287,28 +286,37 @@ impl GprsTimer {
         if seconds == 0 {
             return Self { unit: 7, value: 0 }; // Deactivated
         }
-        
+
         // Try 2-second increments (unit 0)
         if seconds <= 62 {
-            return Self { unit: 0, value: seconds.div_ceil(2) as u8 };
+            return Self {
+                unit: 0,
+                value: seconds.div_ceil(2) as u8,
+            };
         }
-        
+
         // Try 1-minute increments (unit 1)
         let minutes = seconds.div_ceil(60);
         if minutes <= 31 {
-            return Self { unit: 1, value: minutes as u8 };
+            return Self {
+                unit: 1,
+                value: minutes as u8,
+            };
         }
-        
+
         // Try 6-minute increments (unit 2)
         let six_minutes = seconds.div_ceil(360);
         if six_minutes <= 31 {
-            return Self { unit: 2, value: six_minutes as u8 };
+            return Self {
+                unit: 2,
+                value: six_minutes as u8,
+            };
         }
-        
+
         // Maximum value
         Self { unit: 2, value: 31 }
     }
-    
+
     /// Encode to byte
     pub fn encode(&self) -> u8 {
         (self.unit << 5) | (self.value & 0x1f)
@@ -329,20 +337,22 @@ pub struct NasBuffer {
 impl NasBuffer {
     /// Create new buffer
     pub fn new() -> Self {
-        Self { data: Vec::with_capacity(256) }
+        Self {
+            data: Vec::with_capacity(256),
+        }
     }
-    
+
     /// Write byte
     pub fn write_u8(&mut self, value: u8) {
         self.data.push(value);
     }
-    
+
     /// Write 16-bit value (big endian)
     pub fn write_u16(&mut self, value: u16) {
         self.data.push((value >> 8) as u8);
         self.data.push(value as u8);
     }
-    
+
     /// Write 32-bit value (big endian)
     pub fn write_u32(&mut self, value: u32) {
         self.data.push((value >> 24) as u8);
@@ -350,28 +360,28 @@ impl NasBuffer {
         self.data.push((value >> 8) as u8);
         self.data.push(value as u8);
     }
-    
+
     /// Write bytes
     pub fn write_bytes(&mut self, bytes: &[u8]) {
         self.data.extend_from_slice(bytes);
     }
-    
+
     /// Write length-prefixed bytes
     pub fn write_lv(&mut self, bytes: &[u8]) {
         self.data.push(bytes.len() as u8);
         self.data.extend_from_slice(bytes);
     }
-    
+
     /// Get data
     pub fn into_vec(self) -> Vec<u8> {
         self.data
     }
-    
+
     /// Get length
     pub fn len(&self) -> usize {
         self.data.len()
     }
-    
+
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
@@ -390,25 +400,27 @@ pub fn build_attach_accept(
     tai_list: &[EpsTai],
 ) -> Result<Vec<u8>, &'static str> {
     let mut buf = NasBuffer::new();
-    
+
     // Security header
-    buf.write_u8((SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4 
-                 | NAS_PROTOCOL_DISCRIMINATOR_EMM);
+    buf.write_u8(
+        (SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4
+            | NAS_PROTOCOL_DISCRIMINATOR_EMM,
+    );
     buf.write_u32(0); // MAC placeholder
-    buf.write_u8(0);  // Sequence number placeholder
-    
+    buf.write_u8(0); // Sequence number placeholder
+
     // EMM header
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
     buf.write_u8(NasEpsMessageType::AttachAccept as u8);
-    
+
     // EPS attach result (4 bits) + spare (4 bits)
     let attach_result = AttachType::EpsAttach as u8;
     buf.write_u8(attach_result & 0x07);
-    
+
     // T3412 value
     let timer = GprsTimer::from_sec(t3412_value);
     buf.write_u8(timer.encode());
-    
+
     // TAI list
     if !tai_list.is_empty() {
         let tai_list_data = encode_tai_list(tai_list);
@@ -416,17 +428,17 @@ pub fn build_attach_accept(
     } else {
         buf.write_u8(0); // Empty TAI list
     }
-    
+
     // ESM message container
     buf.write_u16(esm_message.len() as u16);
     buf.write_bytes(esm_message);
-    
+
     // Optional: GUTI (if available)
     if mme_ue.next.m_tmsi.is_some() {
         buf.write_u8(0x50); // GUTI IEI
-        buf.write_u8(11);   // Length
+        buf.write_u8(11); // Length
         buf.write_u8(0xf6); // Odd/even + type
-        // PLMN ID
+                            // PLMN ID
         let plmn = encode_plmn_id(&mme_ue.next.guti.plmn_id);
         buf.write_bytes(&plmn);
         // MME Group ID
@@ -436,81 +448,74 @@ pub fn build_attach_accept(
         // M-TMSI
         buf.write_u32(mme_ue.next.guti.m_tmsi);
     }
-    
+
     Ok(buf.into_vec())
 }
 
 /// Build attach reject message
-pub fn build_attach_reject(
-    emm_cause: EmmCause,
-    esm_message: Option<&[u8]>,
-) -> Vec<u8> {
+pub fn build_attach_reject(emm_cause: EmmCause, esm_message: Option<&[u8]>) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // EMM header (plain NAS)
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
     buf.write_u8(NasEpsMessageType::AttachReject as u8);
-    
+
     // EMM cause
     buf.write_u8(emm_cause as u8);
-    
+
     // Optional: ESM message container
     if let Some(esm) = esm_message {
         buf.write_u8(0x78); // ESM message container IEI
         buf.write_u16(esm.len() as u16);
         buf.write_bytes(esm);
     }
-    
+
     buf.into_vec()
 }
 
 /// Build identity request message
 pub fn build_identity_request(identity_type: IdentityType2) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // EMM header (plain NAS)
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
     buf.write_u8(NasEpsMessageType::IdentityRequest as u8);
-    
+
     // Identity type (4 bits) + spare (4 bits)
     buf.write_u8(identity_type as u8);
-    
+
     buf.into_vec()
 }
 
 /// Build authentication request message
-pub fn build_authentication_request(
-    ksi: u8,
-    rand: &[u8; 16],
-    autn: &[u8; 16],
-) -> Vec<u8> {
+pub fn build_authentication_request(ksi: u8, rand: &[u8; 16], autn: &[u8; 16]) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // EMM header (plain NAS)
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
     buf.write_u8(NasEpsMessageType::AuthenticationRequest as u8);
-    
+
     // NAS key set identifier (4 bits) + spare (4 bits)
     buf.write_u8(ksi & 0x07);
-    
+
     // RAND
     buf.write_bytes(rand);
-    
+
     // AUTN (length + value)
     buf.write_u8(16);
     buf.write_bytes(autn);
-    
+
     buf.into_vec()
 }
 
 /// Build authentication reject message
 pub fn build_authentication_reject() -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // EMM header (plain NAS)
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
     buf.write_u8(NasEpsMessageType::AuthenticationReject as u8);
-    
+
     buf.into_vec()
 }
 
@@ -522,23 +527,25 @@ pub fn build_security_mode_command(
     selected_int_algorithm: u8,
 ) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // Security header (integrity protected with new security context)
-    buf.write_u8((SecurityHeaderType::IntegrityProtectedNewContext as u8) << 4 
-                 | NAS_PROTOCOL_DISCRIMINATOR_EMM);
+    buf.write_u8(
+        (SecurityHeaderType::IntegrityProtectedNewContext as u8) << 4
+            | NAS_PROTOCOL_DISCRIMINATOR_EMM,
+    );
     buf.write_u32(0); // MAC placeholder
-    buf.write_u8(0);  // Sequence number placeholder
-    
+    buf.write_u8(0); // Sequence number placeholder
+
     // EMM header
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
     buf.write_u8(NasEpsMessageType::SecurityModeCommand as u8);
-    
+
     // Selected NAS security algorithms
     buf.write_u8((selected_enc_algorithm << 4) | selected_int_algorithm);
-    
+
     // NAS key set identifier
     buf.write_u8(ksi & 0x07);
-    
+
     // Replayed UE security capabilities
     let mut ue_sec_cap = Vec::new();
     ue_sec_cap.push(mme_ue.ue_network_capability.eea);
@@ -548,63 +555,64 @@ pub fn build_security_mode_command(
         ue_sec_cap.push(mme_ue.ue_network_capability.uia & 0x7f);
     }
     buf.write_lv(&ue_sec_cap);
-    
+
     // Optional: IMEISV request
     buf.write_u8(0xc0 | 0x01); // IEI + IMEISV requested
-    
+
     // Optional: HashMME
     if !mme_ue.hash_mme.iter().all(|&b| b == 0) {
         buf.write_u8(0x4f); // HashMME IEI
-        buf.write_u8(8);    // Length
+        buf.write_u8(8); // Length
         buf.write_bytes(&mme_ue.hash_mme);
     }
-    
+
     buf.into_vec()
 }
 
 /// Build detach request message (to UE)
-pub fn build_detach_request(
-    _mme_ue: &MmeUe,
-    detach_type: DetachTypeToUe,
-) -> Vec<u8> {
+pub fn build_detach_request(_mme_ue: &MmeUe, detach_type: DetachTypeToUe) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // Security header
-    buf.write_u8((SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4 
-                 | NAS_PROTOCOL_DISCRIMINATOR_EMM);
+    buf.write_u8(
+        (SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4
+            | NAS_PROTOCOL_DISCRIMINATOR_EMM,
+    );
     buf.write_u32(0); // MAC placeholder
-    buf.write_u8(0);  // Sequence number placeholder
-    
+    buf.write_u8(0); // Sequence number placeholder
+
     // EMM header
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
     buf.write_u8(NasEpsMessageType::DetachRequest as u8);
-    
+
     // Detach type (4 bits) + spare (4 bits)
     buf.write_u8(detach_type as u8);
-    
+
     // Optional: EMM cause (if re-attach required)
     if detach_type == DetachTypeToUe::ReAttachRequired {
         buf.write_u8(0x53); // EMM cause IEI
         buf.write_u8(EmmCause::ImplicitlyDetached as u8);
     }
-    
+
     buf.into_vec()
 }
 
 /// Build detach accept message
 pub fn build_detach_accept(_mme_ue: &MmeUe) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // Security header
-    buf.write_u8((SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4 
-                 | NAS_PROTOCOL_DISCRIMINATOR_EMM);
+    buf.write_u8(
+        (SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4
+            | NAS_PROTOCOL_DISCRIMINATOR_EMM,
+    );
     buf.write_u32(0); // MAC placeholder
-    buf.write_u8(0);  // Sequence number placeholder
-    
+    buf.write_u8(0); // Sequence number placeholder
+
     // EMM header
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
     buf.write_u8(NasEpsMessageType::DetachAccept as u8);
-    
+
     buf.into_vec()
 }
 
@@ -616,31 +624,33 @@ pub fn build_tau_accept(
     eps_bearer_status: u16,
 ) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // Security header
-    buf.write_u8((SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4 
-                 | NAS_PROTOCOL_DISCRIMINATOR_EMM);
+    buf.write_u8(
+        (SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4
+            | NAS_PROTOCOL_DISCRIMINATOR_EMM,
+    );
     buf.write_u32(0); // MAC placeholder
-    buf.write_u8(0);  // Sequence number placeholder
-    
+    buf.write_u8(0); // Sequence number placeholder
+
     // EMM header
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
     buf.write_u8(NasEpsMessageType::TauAccept as u8);
-    
+
     // EPS update result (4 bits) + spare (4 bits)
     buf.write_u8(0x00); // TA updated
-    
+
     // Optional: T3412 value
     if t3412_value > 0 {
         buf.write_u8(0x5a); // T3412 IEI
         let timer = GprsTimer::from_sec(t3412_value);
         buf.write_u8(timer.encode());
     }
-    
+
     // Optional: GUTI
     if mme_ue.next.m_tmsi.is_some() {
         buf.write_u8(0x50); // GUTI IEI
-        buf.write_u8(11);   // Length
+        buf.write_u8(11); // Length
         buf.write_u8(0xf6); // Odd/even + type
         let plmn = encode_plmn_id(&mme_ue.next.guti.plmn_id);
         buf.write_bytes(&plmn);
@@ -648,63 +658,63 @@ pub fn build_tau_accept(
         buf.write_u8(mme_ue.next.guti.mme_code);
         buf.write_u32(mme_ue.next.guti.m_tmsi);
     }
-    
+
     // Optional: TAI list
     if !tai_list.is_empty() {
         buf.write_u8(0x54); // TAI list IEI
         let tai_list_data = encode_tai_list(tai_list);
         buf.write_lv(&tai_list_data);
     }
-    
+
     // Optional: EPS bearer context status
     if eps_bearer_status != 0 {
         buf.write_u8(0x57); // EPS bearer context status IEI
-        buf.write_u8(2);    // Length
+        buf.write_u8(2); // Length
         buf.write_u16(eps_bearer_status);
     }
-    
+
     buf.into_vec()
 }
 
 /// Build TAU reject message
 pub fn build_tau_reject(emm_cause: EmmCause) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // EMM header (plain NAS)
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
     buf.write_u8(NasEpsMessageType::TauReject as u8);
-    
+
     // EMM cause
     buf.write_u8(emm_cause as u8);
-    
+
     buf.into_vec()
 }
 
 /// Build service reject message
 pub fn build_service_reject(emm_cause: EmmCause) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // EMM header (plain NAS)
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
     buf.write_u8(NasEpsMessageType::ServiceReject as u8);
-    
+
     // EMM cause
     buf.write_u8(emm_cause as u8);
-    
+
     buf.into_vec()
 }
 
 /// Build CS service notification message
 pub fn build_cs_service_notification(paging_identity: u8) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // EMM header (plain NAS - will be security encoded later)
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
     buf.write_u8(NasEpsMessageType::CsServiceNotification as u8);
-    
+
     // Paging identity
     buf.write_u8(paging_identity);
-    
+
     buf.into_vec()
 }
 
@@ -717,50 +727,52 @@ pub fn build_emm_information(
     daylight_saving_time: Option<u8>,
 ) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // Security header
-    buf.write_u8((SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4 
-                 | NAS_PROTOCOL_DISCRIMINATOR_EMM);
+    buf.write_u8(
+        (SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4
+            | NAS_PROTOCOL_DISCRIMINATOR_EMM,
+    );
     buf.write_u32(0); // MAC placeholder
-    buf.write_u8(0);  // Sequence number placeholder
-    
+    buf.write_u8(0); // Sequence number placeholder
+
     // EMM header
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_EMM);
     buf.write_u8(NasEpsMessageType::EmmInformation as u8);
-    
+
     // Optional: Full network name
     if let Some(name) = full_network_name {
         buf.write_u8(0x43); // Full name IEI
         let encoded = encode_network_name(name);
         buf.write_lv(&encoded);
     }
-    
+
     // Optional: Short network name
     if let Some(name) = short_network_name {
         buf.write_u8(0x45); // Short name IEI
         let encoded = encode_network_name(name);
         buf.write_lv(&encoded);
     }
-    
+
     // Optional: Local time zone
     if let Some(tz) = local_time_zone {
         buf.write_u8(0x46); // Local time zone IEI
         buf.write_u8(encode_time_zone(tz));
     }
-    
+
     // Optional: Universal time and local time zone
     if let Some(time) = universal_time {
         buf.write_u8(0x47); // Universal time IEI
         buf.write_bytes(time);
     }
-    
+
     // Optional: Daylight saving time
     if let Some(dst) = daylight_saving_time {
         buf.write_u8(0x49); // DST IEI
-        buf.write_u8(1);    // Length
+        buf.write_u8(1); // Length
         buf.write_u8(dst);
     }
-    
+
     buf.into_vec()
 }
 
@@ -786,36 +798,36 @@ fn encode_tai_list(tai_list: &[EpsTai]) -> Vec<u8> {
     if tai_list.is_empty() {
         return vec![];
     }
-    
+
     let mut buf = Vec::new();
-    
+
     // Type 0 list: same PLMN, different TACs
     // For simplicity, encode as type 1 (list of TAIs)
     let num_tai = tai_list.len().min(16) as u8;
     buf.push(0x20 | (num_tai - 1)); // Type 1 + number of elements
-    
+
     for tai in tai_list.iter().take(16) {
         let plmn = encode_plmn_id(&tai.plmn_id);
         buf.extend_from_slice(&plmn);
         buf.push((tai.tac >> 8) as u8);
         buf.push(tai.tac as u8);
     }
-    
+
     buf
 }
 
 /// Encode network name (GSM 7-bit default alphabet)
 fn encode_network_name(name: &str) -> Vec<u8> {
     let mut buf = Vec::new();
-    
+
     // Extension bit (1) + coding scheme (000) + add CI (0) + spare bits (000)
     buf.push(0x80);
-    
+
     // Simple ASCII encoding (not full GSM 7-bit)
     for c in name.chars().take(255) {
         buf.push(c as u8);
     }
-    
+
     buf
 }
 
@@ -843,17 +855,17 @@ mod tests {
         // 0 seconds = deactivated
         let timer = GprsTimer::from_sec(0);
         assert_eq!(timer.unit, 7);
-        
+
         // 10 seconds = 5 * 2s
         let timer = GprsTimer::from_sec(10);
         assert_eq!(timer.unit, 0);
         assert_eq!(timer.value, 5);
-        
+
         // 120 seconds = 2 minutes
         let timer = GprsTimer::from_sec(120);
         assert_eq!(timer.unit, 1);
         assert_eq!(timer.value, 2);
-        
+
         // 3600 seconds = 10 * 6min
         let timer = GprsTimer::from_sec(3600);
         assert_eq!(timer.unit, 2);
@@ -874,7 +886,7 @@ mod tests {
         let rand = [0x01u8; 16];
         let autn = [0x02u8; 16];
         let msg = build_authentication_request(1, &rand, &autn);
-        
+
         assert_eq!(msg[0], NAS_PROTOCOL_DISCRIMINATOR_EMM);
         assert_eq!(msg[1], NasEpsMessageType::AuthenticationRequest as u8);
         assert_eq!(msg[2], 1); // KSI
@@ -930,11 +942,11 @@ mod tests {
     fn test_encode_time_zone() {
         // UTC+0
         assert_eq!(encode_time_zone(0), 0x00);
-        
+
         // UTC+5:30 = 22 quarters
         let tz = encode_time_zone(22);
         assert_eq!(tz & 0x08, 0); // Positive
-        
+
         // UTC-5 = -20 quarters
         let tz = encode_time_zone(-20);
         assert_eq!(tz & 0x08, 0x08); // Negative
@@ -947,8 +959,11 @@ mod tests {
         buf.write_u16(0x0203);
         buf.write_u32(0x04050607);
         buf.write_bytes(&[0x08, 0x09]);
-        
+
         let data = buf.into_vec();
-        assert_eq!(data, vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]);
+        assert_eq!(
+            data,
+            vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]
+        );
     }
 }

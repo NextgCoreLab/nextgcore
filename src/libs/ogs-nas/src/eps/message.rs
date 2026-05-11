@@ -2,11 +2,11 @@
 //!
 //! Based on 3GPP TS 24.301
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use crate::error::{NasError, NasResult};
-use crate::common::types::*;
-use super::types::*;
 use super::header::*;
+use super::types::*;
+use crate::common::types::*;
+use crate::error::{NasError, NasResult};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// EMM message
 #[derive(Debug, Clone, PartialEq)]
@@ -83,7 +83,10 @@ impl AttachRequest {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
 
         let first_byte = buf.get_u8();
@@ -150,7 +153,10 @@ impl AttachAccept {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 2 {
-            return Err(NasError::BufferTooShort { expected: 2, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 2,
+                actual: buf.remaining(),
+            });
         }
 
         let eps_attach_result = EpsAttachResult::decode(buf.get_u8());
@@ -348,7 +354,9 @@ impl AttachComplete {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let esm_message_container = EsmMessageContainer::decode(buf)?;
-        Ok(Self { esm_message_container })
+        Ok(Self {
+            esm_message_container,
+        })
     }
 }
 
@@ -373,7 +381,10 @@ impl AttachReject {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let emm_cause = buf.get_u8();
         let mut msg = Self {
@@ -414,7 +425,10 @@ impl DetachRequest {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let first_byte = buf.get_u8();
         let detach_type = first_byte & 0x0F;
@@ -438,7 +452,10 @@ impl TrackingAreaUpdateRequest {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let first_byte = buf.get_u8();
         let eps_update_type = first_byte & 0x0F;
@@ -475,7 +492,10 @@ impl TrackingAreaUpdateAccept {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let eps_update_result = buf.get_u8() & 0x07;
         let mut msg = Self {
@@ -517,7 +537,10 @@ impl TrackingAreaUpdateReject {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         Ok(Self {
             emm_cause: buf.get_u8(),
@@ -539,7 +562,10 @@ impl EpsAuthenticationRequest {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 34 {
-            return Err(NasError::BufferTooShort { expected: 34, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 34,
+                actual: buf.remaining(),
+            });
         }
         let nas_key_set_identifier = KeySetIdentifier::decode(buf.get_u8() & 0x0F);
         let mut rand = [0u8; 16];
@@ -584,7 +610,10 @@ impl EpsAuthenticationFailure {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let emm_cause = buf.get_u8();
         let mut msg = Self {
@@ -600,7 +629,8 @@ impl EpsAuthenticationFailure {
                     if buf.remaining() >= 1 {
                         let len = buf.get_u8() as usize;
                         if buf.remaining() >= len {
-                            msg.authentication_failure_parameter = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.authentication_failure_parameter =
+                                Some(buf.copy_to_bytes(len).to_vec());
                         }
                     }
                 }
@@ -637,7 +667,10 @@ impl EpsSecurityModeCommand {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 3 {
-            return Err(NasError::BufferTooShort { expected: 3, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 3,
+                actual: buf.remaining(),
+            });
         }
         let selected_nas_security_algorithms = SecurityAlgorithms::decode(buf.get_u8());
         let nas_key_set_identifier = KeySetIdentifier::decode(buf.get_u8() & 0x0F);
@@ -725,7 +758,10 @@ impl EpsSecurityModeReject {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         Ok(Self {
             emm_cause: buf.get_u8(),
@@ -742,7 +778,10 @@ impl EpsIdentityRequest {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         Ok(Self {
             identity_type: buf.get_u8() & 0x07,
@@ -772,7 +811,10 @@ impl EmmStatus {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         Ok(Self {
             emm_cause: buf.get_u8(),
@@ -798,11 +840,17 @@ impl EpsServiceRequest {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 3 {
-            return Err(NasError::BufferTooShort { expected: 3, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 3,
+                actual: buf.remaining(),
+            });
         }
         let ksi_and_sequence_number = buf.get_u8();
         let short_mac = buf.get_u16();
-        Ok(Self { ksi_and_sequence_number, short_mac })
+        Ok(Self {
+            ksi_and_sequence_number,
+            short_mac,
+        })
     }
 }
 
@@ -837,13 +885,21 @@ impl ExtendedServiceRequest {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let first_byte = buf.get_u8();
         let service_type = first_byte & 0x0F;
         let nas_key_set_identifier = KeySetIdentifier::decode((first_byte >> 4) & 0x0F);
         let m_tmsi = EpsMobileIdentity::decode(buf)?;
-        let mut msg = Self { service_type, nas_key_set_identifier, m_tmsi, ..Default::default() };
+        let mut msg = Self {
+            service_type,
+            nas_key_set_identifier,
+            m_tmsi,
+            ..Default::default()
+        };
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
             let iei_type = if iei >= 0x80 { iei & 0xF0 } else { iei };
@@ -863,7 +919,9 @@ impl ExtendedServiceRequest {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -898,10 +956,16 @@ impl EpsServiceReject {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let emm_cause = buf.get_u8();
-        let mut msg = Self { emm_cause, ..Default::default() };
+        let mut msg = Self {
+            emm_cause,
+            ..Default::default()
+        };
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
             match iei {
@@ -940,7 +1004,10 @@ impl GutiReallocationCommand {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let guti = EpsMobileIdentity::decode(buf)?;
-        let mut msg = Self { guti, ..Default::default() };
+        let mut msg = Self {
+            guti,
+            ..Default::default()
+        };
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
             match iei {
@@ -1063,14 +1130,22 @@ impl EpsDownlinkNasTransport {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let len = buf.get_u8() as usize;
         if buf.remaining() < len {
-            return Err(NasError::BufferTooShort { expected: len, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: len,
+                actual: buf.remaining(),
+            });
         }
         let nas_message_container = buf.copy_to_bytes(len).to_vec();
-        Ok(Self { nas_message_container })
+        Ok(Self {
+            nas_message_container,
+        })
     }
 }
 
@@ -1089,14 +1164,22 @@ impl EpsUplinkNasTransport {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let len = buf.get_u8() as usize;
         if buf.remaining() < len {
-            return Err(NasError::BufferTooShort { expected: len, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: len,
+                actual: buf.remaining(),
+            });
         }
         let nas_message_container = buf.copy_to_bytes(len).to_vec();
-        Ok(Self { nas_message_container })
+        Ok(Self {
+            nas_message_container,
+        })
     }
 }
 
@@ -1114,9 +1197,14 @@ impl CsServiceNotification {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
-        Ok(Self { paging_identity: buf.get_u8() })
+        Ok(Self {
+            paging_identity: buf.get_u8(),
+        })
     }
 }
 
@@ -1278,7 +1366,10 @@ impl PdnConnectivityRequest {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let byte = buf.get_u8();
         Ok(Self {
@@ -1296,9 +1387,15 @@ impl PdnConnectivityReject {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
-        Ok(Self { esm_cause: buf.get_u8(), ..Default::default() })
+        Ok(Self {
+            esm_cause: buf.get_u8(),
+            ..Default::default()
+        })
     }
 }
 
@@ -1309,9 +1406,15 @@ impl PdnDisconnectRequest {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
-        Ok(Self { linked_eps_bearer_identity: buf.get_u8() & 0x0F, ..Default::default() })
+        Ok(Self {
+            linked_eps_bearer_identity: buf.get_u8() & 0x0F,
+            ..Default::default()
+        })
     }
 }
 
@@ -1322,9 +1425,15 @@ impl PdnDisconnectReject {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
-        Ok(Self { esm_cause: buf.get_u8(), ..Default::default() })
+        Ok(Self {
+            esm_cause: buf.get_u8(),
+            ..Default::default()
+        })
     }
 }
 
@@ -1340,30 +1449,53 @@ impl ActivateDefaultEpsBearerContextRequest {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let qos_len = buf.get_u8() as usize;
         if buf.remaining() < qos_len {
-            return Err(NasError::BufferTooShort { expected: qos_len, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: qos_len,
+                actual: buf.remaining(),
+            });
         }
         let eps_qos = buf.copy_to_bytes(qos_len).to_vec();
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let apn_len = buf.get_u8() as usize;
         if buf.remaining() < apn_len {
-            return Err(NasError::BufferTooShort { expected: apn_len, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: apn_len,
+                actual: buf.remaining(),
+            });
         }
         let access_point_name = buf.copy_to_bytes(apn_len).to_vec();
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let addr_len = buf.get_u8() as usize;
         if buf.remaining() < addr_len {
-            return Err(NasError::BufferTooShort { expected: addr_len, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: addr_len,
+                actual: buf.remaining(),
+            });
         }
         let pdn_address = buf.copy_to_bytes(addr_len).to_vec();
-        Ok(Self { eps_qos, access_point_name, pdn_address, ..Default::default() })
+        Ok(Self {
+            eps_qos,
+            access_point_name,
+            pdn_address,
+            ..Default::default()
+        })
     }
 }
 
@@ -1374,9 +1506,15 @@ impl ActivateDefaultEpsBearerContextReject {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
-        Ok(Self { esm_cause: buf.get_u8(), ..Default::default() })
+        Ok(Self {
+            esm_cause: buf.get_u8(),
+            ..Default::default()
+        })
     }
 }
 
@@ -1391,26 +1529,46 @@ impl BearerResourceAllocationRequest {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let linked = buf.get_u8() & 0x0F;
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let tfa_len = buf.get_u8() as usize;
         if buf.remaining() < tfa_len {
-            return Err(NasError::BufferTooShort { expected: tfa_len, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: tfa_len,
+                actual: buf.remaining(),
+            });
         }
         let tfa = buf.copy_to_bytes(tfa_len).to_vec();
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let qos_len = buf.get_u8() as usize;
         if buf.remaining() < qos_len {
-            return Err(NasError::BufferTooShort { expected: qos_len, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: qos_len,
+                actual: buf.remaining(),
+            });
         }
         let qos = buf.copy_to_bytes(qos_len).to_vec();
-        Ok(Self { linked_eps_bearer_identity: linked, traffic_flow_aggregate: tfa, required_traffic_flow_qos: qos, ..Default::default() })
+        Ok(Self {
+            linked_eps_bearer_identity: linked,
+            traffic_flow_aggregate: tfa,
+            required_traffic_flow_qos: qos,
+            ..Default::default()
+        })
     }
 }
 
@@ -1421,9 +1579,15 @@ impl BearerResourceAllocationReject {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
-        Ok(Self { esm_cause: buf.get_u8(), ..Default::default() })
+        Ok(Self {
+            esm_cause: buf.get_u8(),
+            ..Default::default()
+        })
     }
 }
 
@@ -1436,18 +1600,31 @@ impl BearerResourceModificationRequest {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let ebi = buf.get_u8() & 0x0F;
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let tfa_len = buf.get_u8() as usize;
         if buf.remaining() < tfa_len {
-            return Err(NasError::BufferTooShort { expected: tfa_len, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: tfa_len,
+                actual: buf.remaining(),
+            });
         }
         let tfa = buf.copy_to_bytes(tfa_len).to_vec();
-        Ok(Self { eps_bearer_identity: ebi, traffic_flow_aggregate: tfa, ..Default::default() })
+        Ok(Self {
+            eps_bearer_identity: ebi,
+            traffic_flow_aggregate: tfa,
+            ..Default::default()
+        })
     }
 }
 
@@ -1458,9 +1635,15 @@ impl BearerResourceModificationReject {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
-        Ok(Self { esm_cause: buf.get_u8(), ..Default::default() })
+        Ok(Self {
+            esm_cause: buf.get_u8(),
+            ..Default::default()
+        })
     }
 }
 
@@ -1486,26 +1669,45 @@ impl ActivateDedicatedEpsBearerContextRequest {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let linked = buf.get_u8() & 0x0F;
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let qos_len = buf.get_u8() as usize;
         if buf.remaining() < qos_len {
-            return Err(NasError::BufferTooShort { expected: qos_len, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: qos_len,
+                actual: buf.remaining(),
+            });
         }
         let eps_qos = buf.copy_to_bytes(qos_len).to_vec();
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let tft_len = buf.get_u8() as usize;
         if buf.remaining() < tft_len {
-            return Err(NasError::BufferTooShort { expected: tft_len, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: tft_len,
+                actual: buf.remaining(),
+            });
         }
         let tft = buf.copy_to_bytes(tft_len).to_vec();
-        Ok(Self { linked_eps_bearer_identity: linked, eps_qos, tft })
+        Ok(Self {
+            linked_eps_bearer_identity: linked,
+            eps_qos,
+            tft,
+        })
     }
 }
 
@@ -1523,9 +1725,14 @@ impl ActivateDedicatedEpsBearerContextReject {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
-        Ok(Self { esm_cause: buf.get_u8() })
+        Ok(Self {
+            esm_cause: buf.get_u8(),
+        })
     }
 }
 
@@ -1610,7 +1817,8 @@ impl ModifyEpsBearerContextAccept {
                     if buf.remaining() >= 1 {
                         let len = buf.get_u8() as usize;
                         if buf.remaining() >= len {
-                            msg.protocol_configuration_options = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.protocol_configuration_options =
+                                Some(buf.copy_to_bytes(len).to_vec());
                         }
                     }
                 }
@@ -1635,9 +1843,14 @@ impl ModifyEpsBearerContextReject {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
-        Ok(Self { esm_cause: buf.get_u8() })
+        Ok(Self {
+            esm_cause: buf.get_u8(),
+        })
     }
 }
 
@@ -1655,9 +1868,14 @@ impl DeactivateEpsBearerContextRequest {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
-        Ok(Self { esm_cause: buf.get_u8() })
+        Ok(Self {
+            esm_cause: buf.get_u8(),
+        })
     }
 }
 
@@ -1694,7 +1912,8 @@ impl EsmInformationResponse {
                     if buf.remaining() >= 1 {
                         let len = buf.get_u8() as usize;
                         if buf.remaining() >= len {
-                            msg.protocol_configuration_options = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.protocol_configuration_options =
+                                Some(buf.copy_to_bytes(len).to_vec());
                         }
                     }
                 }
@@ -1712,9 +1931,15 @@ impl EsmStatus {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
-        Ok(Self { esm_cause: buf.get_u8(), ..Default::default() })
+        Ok(Self {
+            esm_cause: buf.get_u8(),
+            ..Default::default()
+        })
     }
 }
 
@@ -1723,25 +1948,51 @@ pub fn build_esm_message(eps_bearer_identity: u8, pti: u8, msg: &EsmMessage) -> 
     let mut buf = BytesMut::new();
 
     let message_type = match msg {
-        EsmMessage::ActivateDefaultEpsBearerContextRequest(_) => EsmMessageType::ActivateDefaultEpsBearerContextRequest,
-        EsmMessage::ActivateDefaultEpsBearerContextAccept => EsmMessageType::ActivateDefaultEpsBearerContextAccept,
-        EsmMessage::ActivateDefaultEpsBearerContextReject(_) => EsmMessageType::ActivateDefaultEpsBearerContextReject,
-        EsmMessage::ActivateDedicatedEpsBearerContextRequest(_) => EsmMessageType::ActivateDedicatedEpsBearerContextRequest,
-        EsmMessage::ActivateDedicatedEpsBearerContextAccept => EsmMessageType::ActivateDedicatedEpsBearerContextAccept,
-        EsmMessage::ActivateDedicatedEpsBearerContextReject(_) => EsmMessageType::ActivateDedicatedEpsBearerContextReject,
-        EsmMessage::ModifyEpsBearerContextRequest(_) => EsmMessageType::ModifyEpsBearerContextRequest,
+        EsmMessage::ActivateDefaultEpsBearerContextRequest(_) => {
+            EsmMessageType::ActivateDefaultEpsBearerContextRequest
+        }
+        EsmMessage::ActivateDefaultEpsBearerContextAccept => {
+            EsmMessageType::ActivateDefaultEpsBearerContextAccept
+        }
+        EsmMessage::ActivateDefaultEpsBearerContextReject(_) => {
+            EsmMessageType::ActivateDefaultEpsBearerContextReject
+        }
+        EsmMessage::ActivateDedicatedEpsBearerContextRequest(_) => {
+            EsmMessageType::ActivateDedicatedEpsBearerContextRequest
+        }
+        EsmMessage::ActivateDedicatedEpsBearerContextAccept => {
+            EsmMessageType::ActivateDedicatedEpsBearerContextAccept
+        }
+        EsmMessage::ActivateDedicatedEpsBearerContextReject(_) => {
+            EsmMessageType::ActivateDedicatedEpsBearerContextReject
+        }
+        EsmMessage::ModifyEpsBearerContextRequest(_) => {
+            EsmMessageType::ModifyEpsBearerContextRequest
+        }
         EsmMessage::ModifyEpsBearerContextAccept(_) => EsmMessageType::ModifyEpsBearerContextAccept,
         EsmMessage::ModifyEpsBearerContextReject(_) => EsmMessageType::ModifyEpsBearerContextReject,
-        EsmMessage::DeactivateEpsBearerContextRequest(_) => EsmMessageType::DeactivateEpsBearerContextRequest,
-        EsmMessage::DeactivateEpsBearerContextAccept => EsmMessageType::DeactivateEpsBearerContextAccept,
+        EsmMessage::DeactivateEpsBearerContextRequest(_) => {
+            EsmMessageType::DeactivateEpsBearerContextRequest
+        }
+        EsmMessage::DeactivateEpsBearerContextAccept => {
+            EsmMessageType::DeactivateEpsBearerContextAccept
+        }
         EsmMessage::PdnConnectivityRequest(_) => EsmMessageType::PdnConnectivityRequest,
         EsmMessage::PdnConnectivityReject(_) => EsmMessageType::PdnConnectivityReject,
         EsmMessage::PdnDisconnectRequest(_) => EsmMessageType::PdnDisconnectRequest,
         EsmMessage::PdnDisconnectReject(_) => EsmMessageType::PdnDisconnectReject,
-        EsmMessage::BearerResourceAllocationRequest(_) => EsmMessageType::BearerResourceAllocationRequest,
-        EsmMessage::BearerResourceAllocationReject(_) => EsmMessageType::BearerResourceAllocationReject,
-        EsmMessage::BearerResourceModificationRequest(_) => EsmMessageType::BearerResourceModificationRequest,
-        EsmMessage::BearerResourceModificationReject(_) => EsmMessageType::BearerResourceModificationReject,
+        EsmMessage::BearerResourceAllocationRequest(_) => {
+            EsmMessageType::BearerResourceAllocationRequest
+        }
+        EsmMessage::BearerResourceAllocationReject(_) => {
+            EsmMessageType::BearerResourceAllocationReject
+        }
+        EsmMessage::BearerResourceModificationRequest(_) => {
+            EsmMessageType::BearerResourceModificationRequest
+        }
+        EsmMessage::BearerResourceModificationReject(_) => {
+            EsmMessageType::BearerResourceModificationReject
+        }
         EsmMessage::EsmInformationRequest => EsmMessageType::EsmInformationRequest,
         EsmMessage::EsmInformationResponse(_) => EsmMessageType::EsmInformationResponse,
         EsmMessage::EsmStatus(_) => EsmMessageType::EsmStatus,
@@ -1785,22 +2036,30 @@ pub fn parse_esm_message(buf: &mut Bytes) -> NasResult<(u8, u8, EsmMessage)> {
 
     let msg = match message_type {
         EsmMessageType::ActivateDefaultEpsBearerContextRequest => {
-            EsmMessage::ActivateDefaultEpsBearerContextRequest(ActivateDefaultEpsBearerContextRequest::decode(buf)?)
+            EsmMessage::ActivateDefaultEpsBearerContextRequest(
+                ActivateDefaultEpsBearerContextRequest::decode(buf)?,
+            )
         }
         EsmMessageType::ActivateDefaultEpsBearerContextAccept => {
             EsmMessage::ActivateDefaultEpsBearerContextAccept
         }
         EsmMessageType::ActivateDefaultEpsBearerContextReject => {
-            EsmMessage::ActivateDefaultEpsBearerContextReject(ActivateDefaultEpsBearerContextReject::decode(buf)?)
+            EsmMessage::ActivateDefaultEpsBearerContextReject(
+                ActivateDefaultEpsBearerContextReject::decode(buf)?,
+            )
         }
         EsmMessageType::ActivateDedicatedEpsBearerContextRequest => {
-            EsmMessage::ActivateDedicatedEpsBearerContextRequest(ActivateDedicatedEpsBearerContextRequest::decode(buf)?)
+            EsmMessage::ActivateDedicatedEpsBearerContextRequest(
+                ActivateDedicatedEpsBearerContextRequest::decode(buf)?,
+            )
         }
         EsmMessageType::ActivateDedicatedEpsBearerContextAccept => {
             EsmMessage::ActivateDedicatedEpsBearerContextAccept
         }
         EsmMessageType::ActivateDedicatedEpsBearerContextReject => {
-            EsmMessage::ActivateDedicatedEpsBearerContextReject(ActivateDedicatedEpsBearerContextReject::decode(buf)?)
+            EsmMessage::ActivateDedicatedEpsBearerContextReject(
+                ActivateDedicatedEpsBearerContextReject::decode(buf)?,
+            )
         }
         EsmMessageType::ModifyEpsBearerContextRequest => {
             EsmMessage::ModifyEpsBearerContextRequest(ModifyEpsBearerContextRequest::decode(buf)?)
@@ -1812,7 +2071,9 @@ pub fn parse_esm_message(buf: &mut Bytes) -> NasResult<(u8, u8, EsmMessage)> {
             EsmMessage::ModifyEpsBearerContextReject(ModifyEpsBearerContextReject::decode(buf)?)
         }
         EsmMessageType::DeactivateEpsBearerContextRequest => {
-            EsmMessage::DeactivateEpsBearerContextRequest(DeactivateEpsBearerContextRequest::decode(buf)?)
+            EsmMessage::DeactivateEpsBearerContextRequest(
+                DeactivateEpsBearerContextRequest::decode(buf)?,
+            )
         }
         EsmMessageType::DeactivateEpsBearerContextAccept => {
             EsmMessage::DeactivateEpsBearerContextAccept
@@ -1830,29 +2091,35 @@ pub fn parse_esm_message(buf: &mut Bytes) -> NasResult<(u8, u8, EsmMessage)> {
             EsmMessage::PdnDisconnectReject(PdnDisconnectReject::decode(buf)?)
         }
         EsmMessageType::BearerResourceAllocationRequest => {
-            EsmMessage::BearerResourceAllocationRequest(BearerResourceAllocationRequest::decode(buf)?)
+            EsmMessage::BearerResourceAllocationRequest(BearerResourceAllocationRequest::decode(
+                buf,
+            )?)
         }
         EsmMessageType::BearerResourceAllocationReject => {
             EsmMessage::BearerResourceAllocationReject(BearerResourceAllocationReject::decode(buf)?)
         }
         EsmMessageType::BearerResourceModificationRequest => {
-            EsmMessage::BearerResourceModificationRequest(BearerResourceModificationRequest::decode(buf)?)
+            EsmMessage::BearerResourceModificationRequest(
+                BearerResourceModificationRequest::decode(buf)?,
+            )
         }
         EsmMessageType::BearerResourceModificationReject => {
-            EsmMessage::BearerResourceModificationReject(BearerResourceModificationReject::decode(buf)?)
+            EsmMessage::BearerResourceModificationReject(BearerResourceModificationReject::decode(
+                buf,
+            )?)
         }
-        EsmMessageType::EsmInformationRequest => {
-            EsmMessage::EsmInformationRequest
-        }
+        EsmMessageType::EsmInformationRequest => EsmMessage::EsmInformationRequest,
         EsmMessageType::EsmInformationResponse => {
             EsmMessage::EsmInformationResponse(EsmInformationResponse::decode(buf)?)
         }
-        EsmMessageType::EsmStatus => {
-            EsmMessage::EsmStatus(EsmStatus::decode(buf)?)
-        }
+        EsmMessageType::EsmStatus => EsmMessage::EsmStatus(EsmStatus::decode(buf)?),
     };
 
-    Ok((header.eps_bearer_identity, header.procedure_transaction_identity, msg))
+    Ok((
+        header.eps_bearer_identity,
+        header.procedure_transaction_identity,
+        msg,
+    ))
 }
 
 /// Build an EMM message with header
@@ -1902,13 +2169,13 @@ pub fn build_emm_message(msg: &EmmMessage) -> BytesMut {
         EmmMessage::AttachComplete(m) => m.encode(&mut buf),
         EmmMessage::AttachReject(m) => m.encode(&mut buf),
         EmmMessage::DetachRequest(m) => m.encode(&mut buf),
-        EmmMessage::DetachAccept => {},
+        EmmMessage::DetachAccept => {}
         EmmMessage::TrackingAreaUpdateRequest(m) => m.encode(&mut buf),
         EmmMessage::TrackingAreaUpdateAccept(m) => m.encode(&mut buf),
         EmmMessage::TrackingAreaUpdateReject(m) => m.encode(&mut buf),
         EmmMessage::AuthenticationRequest(m) => m.encode(&mut buf),
         EmmMessage::AuthenticationResponse(m) => m.encode(&mut buf),
-        EmmMessage::AuthenticationReject => {},
+        EmmMessage::AuthenticationReject => {}
         EmmMessage::AuthenticationFailure(m) => m.encode(&mut buf),
         EmmMessage::SecurityModeCommand(m) => m.encode(&mut buf),
         EmmMessage::SecurityModeComplete(m) => m.encode(&mut buf),
@@ -1937,89 +2204,71 @@ pub fn parse_emm_message(buf: &mut Bytes) -> NasResult<EmmMessage> {
     let message_type = EmmMessageType::try_from(header.message_type)?;
 
     match message_type {
-        EmmMessageType::AttachRequest => {
-            Ok(EmmMessage::AttachRequest(AttachRequest::decode(buf)?))
-        }
-        EmmMessageType::AttachAccept => {
-            Ok(EmmMessage::AttachAccept(AttachAccept::decode(buf)?))
-        }
+        EmmMessageType::AttachRequest => Ok(EmmMessage::AttachRequest(AttachRequest::decode(buf)?)),
+        EmmMessageType::AttachAccept => Ok(EmmMessage::AttachAccept(AttachAccept::decode(buf)?)),
         EmmMessageType::AttachComplete => {
             Ok(EmmMessage::AttachComplete(AttachComplete::decode(buf)?))
         }
-        EmmMessageType::AttachReject => {
-            Ok(EmmMessage::AttachReject(AttachReject::decode(buf)?))
-        }
-        EmmMessageType::DetachRequest => {
-            Ok(EmmMessage::DetachRequest(DetachRequest::decode(buf)?))
-        }
-        EmmMessageType::DetachAccept => {
-            Ok(EmmMessage::DetachAccept)
-        }
-        EmmMessageType::TrackingAreaUpdateRequest => {
-            Ok(EmmMessage::TrackingAreaUpdateRequest(TrackingAreaUpdateRequest::decode(buf)?))
-        }
-        EmmMessageType::TrackingAreaUpdateAccept => {
-            Ok(EmmMessage::TrackingAreaUpdateAccept(TrackingAreaUpdateAccept::decode(buf)?))
-        }
-        EmmMessageType::TrackingAreaUpdateReject => {
-            Ok(EmmMessage::TrackingAreaUpdateReject(TrackingAreaUpdateReject::decode(buf)?))
-        }
-        EmmMessageType::AuthenticationRequest => {
-            Ok(EmmMessage::AuthenticationRequest(EpsAuthenticationRequest::decode(buf)?))
-        }
-        EmmMessageType::AuthenticationResponse => {
-            Ok(EmmMessage::AuthenticationResponse(EpsAuthenticationResponse::decode(buf)?))
-        }
-        EmmMessageType::AuthenticationReject => {
-            Ok(EmmMessage::AuthenticationReject)
-        }
-        EmmMessageType::AuthenticationFailure => {
-            Ok(EmmMessage::AuthenticationFailure(EpsAuthenticationFailure::decode(buf)?))
-        }
-        EmmMessageType::SecurityModeCommand => {
-            Ok(EmmMessage::SecurityModeCommand(EpsSecurityModeCommand::decode(buf)?))
-        }
-        EmmMessageType::SecurityModeComplete => {
-            Ok(EmmMessage::SecurityModeComplete(EpsSecurityModeComplete::decode(buf)?))
-        }
-        EmmMessageType::SecurityModeReject => {
-            Ok(EmmMessage::SecurityModeReject(EpsSecurityModeReject::decode(buf)?))
-        }
-        EmmMessageType::IdentityRequest => {
-            Ok(EmmMessage::IdentityRequest(EpsIdentityRequest::decode(buf)?))
-        }
-        EmmMessageType::IdentityResponse => {
-            Ok(EmmMessage::IdentityResponse(EpsIdentityResponse::decode(buf)?))
-        }
-        EmmMessageType::EmmStatus => {
-            Ok(EmmMessage::EmmStatus(EmmStatus::decode(buf)?))
-        }
-        EmmMessageType::ExtendedServiceRequest => {
-            Ok(EmmMessage::ExtendedServiceRequest(ExtendedServiceRequest::decode(buf)?))
-        }
+        EmmMessageType::AttachReject => Ok(EmmMessage::AttachReject(AttachReject::decode(buf)?)),
+        EmmMessageType::DetachRequest => Ok(EmmMessage::DetachRequest(DetachRequest::decode(buf)?)),
+        EmmMessageType::DetachAccept => Ok(EmmMessage::DetachAccept),
+        EmmMessageType::TrackingAreaUpdateRequest => Ok(EmmMessage::TrackingAreaUpdateRequest(
+            TrackingAreaUpdateRequest::decode(buf)?,
+        )),
+        EmmMessageType::TrackingAreaUpdateAccept => Ok(EmmMessage::TrackingAreaUpdateAccept(
+            TrackingAreaUpdateAccept::decode(buf)?,
+        )),
+        EmmMessageType::TrackingAreaUpdateReject => Ok(EmmMessage::TrackingAreaUpdateReject(
+            TrackingAreaUpdateReject::decode(buf)?,
+        )),
+        EmmMessageType::AuthenticationRequest => Ok(EmmMessage::AuthenticationRequest(
+            EpsAuthenticationRequest::decode(buf)?,
+        )),
+        EmmMessageType::AuthenticationResponse => Ok(EmmMessage::AuthenticationResponse(
+            EpsAuthenticationResponse::decode(buf)?,
+        )),
+        EmmMessageType::AuthenticationReject => Ok(EmmMessage::AuthenticationReject),
+        EmmMessageType::AuthenticationFailure => Ok(EmmMessage::AuthenticationFailure(
+            EpsAuthenticationFailure::decode(buf)?,
+        )),
+        EmmMessageType::SecurityModeCommand => Ok(EmmMessage::SecurityModeCommand(
+            EpsSecurityModeCommand::decode(buf)?,
+        )),
+        EmmMessageType::SecurityModeComplete => Ok(EmmMessage::SecurityModeComplete(
+            EpsSecurityModeComplete::decode(buf)?,
+        )),
+        EmmMessageType::SecurityModeReject => Ok(EmmMessage::SecurityModeReject(
+            EpsSecurityModeReject::decode(buf)?,
+        )),
+        EmmMessageType::IdentityRequest => Ok(EmmMessage::IdentityRequest(
+            EpsIdentityRequest::decode(buf)?,
+        )),
+        EmmMessageType::IdentityResponse => Ok(EmmMessage::IdentityResponse(
+            EpsIdentityResponse::decode(buf)?,
+        )),
+        EmmMessageType::EmmStatus => Ok(EmmMessage::EmmStatus(EmmStatus::decode(buf)?)),
+        EmmMessageType::ExtendedServiceRequest => Ok(EmmMessage::ExtendedServiceRequest(
+            ExtendedServiceRequest::decode(buf)?,
+        )),
         EmmMessageType::ServiceReject => {
             Ok(EmmMessage::ServiceReject(EpsServiceReject::decode(buf)?))
         }
-        EmmMessageType::GutiReallocationCommand => {
-            Ok(EmmMessage::GutiReallocationCommand(GutiReallocationCommand::decode(buf)?))
-        }
-        EmmMessageType::GutiReallocationComplete => {
-            Ok(EmmMessage::GutiReallocationComplete)
-        }
-        EmmMessageType::TrackingAreaUpdateComplete => {
-            Ok(EmmMessage::TrackingAreaUpdateComplete)
-        }
+        EmmMessageType::GutiReallocationCommand => Ok(EmmMessage::GutiReallocationCommand(
+            GutiReallocationCommand::decode(buf)?,
+        )),
+        EmmMessageType::GutiReallocationComplete => Ok(EmmMessage::GutiReallocationComplete),
+        EmmMessageType::TrackingAreaUpdateComplete => Ok(EmmMessage::TrackingAreaUpdateComplete),
         EmmMessageType::EmmInformation => {
             Ok(EmmMessage::EmmInformation(EmmInformation::decode(buf)?))
         }
-        EmmMessageType::DownlinkNasTransport => {
-            Ok(EmmMessage::DownlinkNasTransport(EpsDownlinkNasTransport::decode(buf)?))
-        }
-        EmmMessageType::UplinkNasTransport => {
-            Ok(EmmMessage::UplinkNasTransport(EpsUplinkNasTransport::decode(buf)?))
-        }
-        EmmMessageType::CsServiceNotification => {
-            Ok(EmmMessage::CsServiceNotification(CsServiceNotification::decode(buf)?))
-        }
+        EmmMessageType::DownlinkNasTransport => Ok(EmmMessage::DownlinkNasTransport(
+            EpsDownlinkNasTransport::decode(buf)?,
+        )),
+        EmmMessageType::UplinkNasTransport => Ok(EmmMessage::UplinkNasTransport(
+            EpsUplinkNasTransport::decode(buf)?,
+        )),
+        EmmMessageType::CsServiceNotification => Ok(EmmMessage::CsServiceNotification(
+            CsServiceNotification::decode(buf)?,
+        )),
     }
 }

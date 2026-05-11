@@ -9,8 +9,8 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerError};
     use proptest::prelude::*;
-    use crate::per::{AperEncoder, AperDecoder, AperEncode, AperDecode, PerError, Constraint};
 
     // ========================================================================
     // NGAP Property Tests - Property 9: ASN.1 Encoding Round-Trip
@@ -18,9 +18,9 @@ mod tests {
 
     mod ngap_roundtrip {
         use super::*;
-        use crate::ngap::types::*;
         use crate::ngap::cause::*;
         use crate::ngap::ies::*;
+        use crate::ngap::types::*;
 
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(100))]
@@ -278,9 +278,9 @@ mod tests {
 
     mod s1ap_roundtrip {
         use super::*;
-        use crate::s1ap::types::*;
         use crate::s1ap::cause::*;
         use crate::s1ap::ies::*;
+        use crate::s1ap::types::*;
 
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(100))]
@@ -518,8 +518,8 @@ mod tests {
 
     mod error_handling {
         use super::*;
-        use crate::ngap::types::*;
         use crate::ngap::cause::*;
+        use crate::ngap::types::*;
 
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(100))]

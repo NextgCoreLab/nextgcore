@@ -39,17 +39,17 @@
 pub mod constants;
 pub mod context;
 pub mod error;
+#[cfg(feature = "6g-extensions")]
+pub mod grpc; // SBI 2.0 gRPC support (B6.1)
+pub mod heartbeat;
 pub mod message;
 pub mod oauth;
+#[cfg(feature = "6g-extensions")]
+pub mod pubsub;
+pub mod scp;
 pub mod security;
 pub mod tls;
-pub mod types;
-pub mod scp;
-pub mod heartbeat;
-#[cfg(feature = "6g-extensions")]
-pub mod grpc;    // SBI 2.0 gRPC support (B6.1)
-#[cfg(feature = "6g-extensions")]
-pub mod pubsub;  // Event-driven pub-sub (B6.1)
+pub mod types; // Event-driven pub-sub (B6.1)
 
 pub mod client;
 pub mod server;
@@ -58,9 +58,33 @@ pub mod server;
 pub use client::{SbiClient, SbiClientConfig};
 pub use context::{global_context, NfInstance, NfService, NfStatus, NfSubscription, SbiContext};
 pub use error::{SbiError, SbiResult};
+#[cfg(feature = "6g-extensions")]
+pub use grpc::{
+    GrpcConfig, GrpcMetadata, GrpcMethod, GrpcServiceRegistry, GrpcServiceType, GrpcStatus,
+};
+pub use heartbeat::{
+    global_heartbeat_manager, init_heartbeat_manager, spawn_heartbeat_worker, HeartbeatConfig,
+    HeartbeatManager, HeartbeatRecord, HeartbeatStats, HeartbeatStatus,
+};
 pub use message::{
     Guami, InvalidParam, PlmnId, ProblemDetails, SNssai, SbiDiscoveryOption, SbiHeader,
     SbiHttpMessage, SbiMessageParams, SbiPart, SbiRequest, SbiResponse, Tai,
+};
+pub use oauth::{
+    AccessTokenClaims, AccessTokenError, AccessTokenRequest, AccessTokenResponse, OAuth2Client,
+    TokenCache,
+};
+#[cfg(feature = "6g-extensions")]
+pub use pubsub::{
+    EventBroker, EventFilter, EventReplayBuffer, SbiEvent, SbiEventCategory, Subscription,
+    SubscriptionId,
+};
+pub use scp::{
+    global_scp_router, init_scp_router, ScpBinding, ScpRouter, ScpRoutingInfo, ScpRoutingMode,
+};
+pub use security::{
+    authorize_sbi_request, extract_bearer_token, validate_bearer_token, NrfSecurityConfig,
+    PqcKeyExchange, PqcSignature, PqcTlsConfig, SbiSecurityPolicy, TlsPaths, TlsVersion,
 };
 pub use server::{
     send_bad_request, send_error, send_forbidden, send_gateway_timeout, send_internal_error,
@@ -68,31 +92,6 @@ pub use server::{
     SbiRequestHandler, SbiServer, SbiServerConfig, StreamId,
 };
 pub use types::{NfType, SbiAppError, SbiServiceType, UriScheme};
-pub use oauth::{
-    AccessTokenClaims, AccessTokenError, AccessTokenRequest, AccessTokenResponse,
-    OAuth2Client, TokenCache,
-};
-pub use scp::{
-    ScpBinding, ScpRouter, ScpRoutingInfo, ScpRoutingMode, global_scp_router, init_scp_router,
-};
-pub use heartbeat::{
-    HeartbeatConfig, HeartbeatManager, HeartbeatRecord, HeartbeatStats, HeartbeatStatus,
-    global_heartbeat_manager, init_heartbeat_manager, spawn_heartbeat_worker,
-};
-pub use security::{
-    NrfSecurityConfig, PqcKeyExchange, PqcSignature, PqcTlsConfig, SbiSecurityPolicy,
-    TlsPaths, TlsVersion, authorize_sbi_request, extract_bearer_token, validate_bearer_token,
-};
-#[cfg(feature = "6g-extensions")]
-pub use grpc::{
-    GrpcConfig, GrpcMetadata, GrpcMethod, GrpcServiceType, GrpcStatus,
-    GrpcServiceRegistry,
-};
-#[cfg(feature = "6g-extensions")]
-pub use pubsub::{
-    EventBroker, EventFilter, SbiEvent, SbiEventCategory, Subscription, SubscriptionId,
-    EventReplayBuffer,
-};
 
 /// Initialize the SBI library
 pub fn init() {
@@ -137,8 +136,7 @@ mod tests {
 
     #[test]
     fn test_response_builder() {
-        let response = SbiResponse::ok()
-            .with_body(r#"{"status":"ok"}"#, "application/json");
+        let response = SbiResponse::ok().with_body(r#"{"status":"ok"}"#, "application/json");
 
         assert!(response.is_success());
         assert_eq!(response.status, 200);

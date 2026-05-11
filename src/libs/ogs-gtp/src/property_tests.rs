@@ -9,8 +9,8 @@
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
     use bytes::{Bytes, BytesMut};
+    use proptest::prelude::*;
 
     // ========================================================================
     // GTPv1 Property Tests
@@ -19,7 +19,7 @@ mod tests {
     mod gtpv1_props {
         use super::*;
         use crate::v1::header::{Gtp1Header, Gtp1cMessageType, Gtp1uMessageType, GTP1_VERSION_1};
-        use crate::v1::message::{Gtp1Message, ErrorIndication};
+        use crate::v1::message::{ErrorIndication, Gtp1Message};
 
         // Feature: nextgcore-rust-conversion, Property 11: Protocol Message Round-Trip
         // Test: GTPv1 Echo Request round-trip
@@ -33,10 +33,10 @@ mod tests {
             ) {
                 let msg = Gtp1Message::echo_request(teid, sequence_number);
                 let encoded = msg.encode();
-                
+
                 let mut bytes = encoded.freeze();
                 let decoded = Gtp1Message::decode(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(decoded.header.message_type, Gtp1cMessageType::EchoRequest as u8);
                 prop_assert_eq!(decoded.header.teid, teid);
                 prop_assert_eq!(decoded.header.sequence_number, Some(sequence_number));
@@ -53,14 +53,14 @@ mod tests {
             ) {
                 let msg = Gtp1Message::echo_response(teid, sequence_number, recovery);
                 let encoded = msg.encode();
-                
+
                 let mut bytes = encoded.freeze();
                 let decoded = Gtp1Message::decode(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(decoded.header.message_type, Gtp1cMessageType::EchoResponse as u8);
                 prop_assert_eq!(decoded.header.teid, teid);
                 prop_assert_eq!(decoded.header.sequence_number, Some(sequence_number));
-                
+
                 // Verify Recovery IE
                 let recovery_ie = decoded.get_ie(14);
                 prop_assert!(recovery_ie.is_some());
@@ -77,10 +77,10 @@ mod tests {
                 let payload_bytes = Bytes::from(payload.clone());
                 let msg = Gtp1Message::gpdu(teid, payload_bytes);
                 let encoded = msg.encode();
-                
+
                 let mut bytes = encoded.freeze();
                 let decoded = Gtp1Message::decode(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(decoded.header.message_type, Gtp1uMessageType::GPdu as u8);
                 prop_assert_eq!(decoded.header.teid, teid);
                 prop_assert!(decoded.payload.is_some());
@@ -102,15 +102,15 @@ mod tests {
                     vec![0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
                          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01] // IPv6
                 };
-                
+
                 let msg = Gtp1Message::error_indication(header_teid, peer_teid, &peer_addr);
                 let encoded = msg.encode();
-                
+
                 let mut bytes = encoded.freeze();
                 let decoded = Gtp1Message::decode(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(decoded.header.message_type, Gtp1uMessageType::ErrorIndication as u8);
-                
+
                 let err_ind = ErrorIndication::decode(&decoded).unwrap();
                 prop_assert_eq!(err_ind.teid, peer_teid);
                 prop_assert_eq!(err_ind.gsn_address, peer_addr);
@@ -124,10 +124,10 @@ mod tests {
             ) {
                 let msg = Gtp1Message::end_marker(teid);
                 let encoded = msg.encode();
-                
+
                 let mut bytes = encoded.freeze();
                 let decoded = Gtp1Message::decode(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(decoded.header.message_type, Gtp1uMessageType::EndMarker as u8);
                 prop_assert_eq!(decoded.header.teid, teid);
             }
@@ -153,13 +153,13 @@ mod tests {
                     header.sequence_number = Some(sequence_number);
                 }
                 header.length = 100;
-                
+
                 // Encode twice
                 let mut buf1 = BytesMut::new();
                 let mut buf2 = BytesMut::new();
                 header.encode(&mut buf1);
                 header.encode(&mut buf2);
-                
+
                 prop_assert_eq!(buf1, buf2, "Header encoding must be deterministic");
             }
         }
@@ -172,9 +172,11 @@ mod tests {
     mod gtpv2_props {
         use super::*;
         use crate::v2::header::{Gtp2Header, Gtp2MessageType};
-        use crate::v2::message::{Gtp2Message, CreateSessionRequest, CreateSessionResponse,
-                                  ModifyBearerRequest, DeleteSessionRequest};
         use crate::v2::ie::{Gtp2Ie, Gtp2IeType};
+        use crate::v2::message::{
+            CreateSessionRequest, CreateSessionResponse, DeleteSessionRequest, Gtp2Message,
+            ModifyBearerRequest,
+        };
 
         // Feature: nextgcore-rust-conversion, Property 11: Protocol Message Round-Trip
         // Test: GTPv2 Echo Request round-trip
@@ -187,10 +189,10 @@ mod tests {
             ) {
                 let msg = Gtp2Message::echo_request(sequence_number);
                 let encoded = msg.encode();
-                
+
                 let mut bytes = encoded.freeze();
                 let decoded = Gtp2Message::decode(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(decoded.header.message_type, Gtp2MessageType::EchoRequest as u8);
                 prop_assert!(!decoded.header.teid_presence);
                 prop_assert_eq!(decoded.header.sequence_number, sequence_number);
@@ -205,14 +207,14 @@ mod tests {
             ) {
                 let msg = Gtp2Message::echo_response(sequence_number, recovery);
                 let encoded = msg.encode();
-                
+
                 let mut bytes = encoded.freeze();
                 let decoded = Gtp2Message::decode(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(decoded.header.message_type, Gtp2MessageType::EchoResponse as u8);
                 prop_assert!(!decoded.header.teid_presence);
                 prop_assert_eq!(decoded.header.sequence_number, sequence_number);
-                
+
                 // Verify Recovery IE
                 let recovery_ie = decoded.get_ie_by_type(Gtp2IeType::Recovery as u8);
                 prop_assert!(recovery_ie.is_some());
@@ -229,16 +231,16 @@ mod tests {
             ) {
                 let mut req = CreateSessionRequest::new(teid, sequence_number);
                 req.add_ie(Gtp2Ie::from_slice(Gtp2IeType::Recovery as u8, 0, &[recovery]));
-                
+
                 let encoded = req.encode();
                 let mut bytes = encoded.freeze();
                 let decoded = Gtp2Message::decode(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(decoded.header.message_type, Gtp2MessageType::CreateSessionRequest as u8);
                 prop_assert!(decoded.header.teid_presence);
                 prop_assert_eq!(decoded.header.teid, Some(teid));
                 prop_assert_eq!(decoded.header.sequence_number, sequence_number);
-                
+
                 let decoded_req = CreateSessionRequest::decode(&decoded).unwrap();
                 prop_assert_eq!(decoded_req.teid, teid);
                 prop_assert_eq!(decoded_req.sequence_number, sequence_number);
@@ -253,10 +255,10 @@ mod tests {
             ) {
                 let req = CreateSessionResponse::new(teid, sequence_number);
                 let encoded = req.encode();
-                
+
                 let mut bytes = encoded.freeze();
                 let decoded = Gtp2Message::decode(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(decoded.header.message_type, Gtp2MessageType::CreateSessionResponse as u8);
                 prop_assert_eq!(decoded.header.teid, Some(teid));
                 prop_assert_eq!(decoded.header.sequence_number, sequence_number);
@@ -271,10 +273,10 @@ mod tests {
             ) {
                 let req = ModifyBearerRequest::new(teid, sequence_number);
                 let encoded = req.encode();
-                
+
                 let mut bytes = encoded.freeze();
                 let decoded = Gtp2Message::decode(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(decoded.header.message_type, Gtp2MessageType::ModifyBearerRequest as u8);
                 prop_assert_eq!(decoded.header.teid, Some(teid));
                 prop_assert_eq!(decoded.header.sequence_number, sequence_number);
@@ -289,10 +291,10 @@ mod tests {
             ) {
                 let req = DeleteSessionRequest::new(teid, sequence_number);
                 let encoded = req.encode();
-                
+
                 let mut bytes = encoded.freeze();
                 let decoded = Gtp2Message::decode(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(decoded.header.message_type, Gtp2MessageType::DeleteSessionRequest as u8);
                 prop_assert_eq!(decoded.header.teid, Some(teid));
                 prop_assert_eq!(decoded.header.sequence_number, sequence_number);
@@ -315,13 +317,13 @@ mod tests {
                     h.length = 0;
                     h
                 };
-                
+
                 // Encode twice
                 let mut buf1 = BytesMut::new();
                 let mut buf2 = BytesMut::new();
                 header.encode(&mut buf1);
                 header.encode(&mut buf2);
-                
+
                 prop_assert_eq!(buf1, buf2, "Header encoding must be deterministic");
             }
 
@@ -334,7 +336,7 @@ mod tests {
                 ie_values in prop::collection::vec(any::<u8>(), 1..5),
             ) {
                 let mut req = CreateSessionRequest::new(teid, sequence_number);
-                
+
                 // Add multiple IEs with different types
                 for (i, value) in ie_values.iter().enumerate() {
                     let ie_type = match i % 3 {
@@ -344,11 +346,11 @@ mod tests {
                     };
                     req.add_ie(Gtp2Ie::from_slice(ie_type, i as u8, &[*value]));
                 }
-                
+
                 let encoded = req.encode();
                 let mut bytes = encoded.freeze();
                 let decoded = Gtp2Message::decode(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(decoded.ies.len(), ie_values.len());
             }
         }

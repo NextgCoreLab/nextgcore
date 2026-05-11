@@ -7,8 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 /// UDM Timer types
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum UdmTimerType {
     /// No timer
     #[default]
@@ -24,7 +23,6 @@ pub enum UdmTimerType {
     /// SBI client wait timer
     SbiClientWait,
 }
-
 
 /// Get timer name for logging
 pub fn udm_timer_get_name(timer_type: UdmTimerType) -> &'static str {
@@ -103,13 +101,11 @@ impl UdmTimerManager {
         drop(next_id);
 
         let timer = UdmTimer::new(id, timer_type, duration, data);
-        
+
         let mut timers = self.timers.write().unwrap();
         timers.insert(id, timer);
 
-        log::debug!(
-            "Timer started: {id} ({timer_type:?}, {duration:?})"
-        );
+        log::debug!("Timer started: {id} ({timer_type:?}, {duration:?})");
 
         id
     }
@@ -118,7 +114,7 @@ impl UdmTimerManager {
     pub fn stop(&self, id: u64) -> Option<UdmTimer> {
         let mut timers = self.timers.write().unwrap();
         let timer = timers.remove(&id);
-        
+
         if timer.is_some() {
             log::debug!("Timer stopped: {id}");
         }
@@ -203,13 +199,24 @@ mod tests {
     #[test]
     fn test_timer_get_name() {
         assert_eq!(udm_timer_get_name(UdmTimerType::None), "NONE");
-        assert_eq!(udm_timer_get_name(UdmTimerType::NfInstanceHeartbeat), "NF_INSTANCE_HEARTBEAT");
-        assert_eq!(udm_timer_get_name(UdmTimerType::SbiClientWait), "SBI_CLIENT_WAIT");
+        assert_eq!(
+            udm_timer_get_name(UdmTimerType::NfInstanceHeartbeat),
+            "NF_INSTANCE_HEARTBEAT"
+        );
+        assert_eq!(
+            udm_timer_get_name(UdmTimerType::SbiClientWait),
+            "SBI_CLIENT_WAIT"
+        );
     }
 
     #[test]
     fn test_timer_creation() {
-        let timer = UdmTimer::new(1, UdmTimerType::SbiClientWait, Duration::from_secs(5), Some(100));
+        let timer = UdmTimer::new(
+            1,
+            UdmTimerType::SbiClientWait,
+            Duration::from_secs(5),
+            Some(100),
+        );
         assert_eq!(timer.id, 1);
         assert_eq!(timer.timer_type, UdmTimerType::SbiClientWait);
         assert_eq!(timer.data, Some(100));
@@ -219,7 +226,7 @@ mod tests {
     #[test]
     fn test_timer_manager_start_stop() {
         let mgr = UdmTimerManager::new();
-        
+
         let id = mgr.start(UdmTimerType::SbiClientWait, Duration::from_secs(10), None);
         assert!(mgr.exists(id));
         assert_eq!(mgr.count(), 1);
@@ -233,14 +240,14 @@ mod tests {
     #[test]
     fn test_timer_manager_process_expired() {
         let mgr = UdmTimerManager::new();
-        
+
         // Start a timer that expires immediately
         mgr.start(UdmTimerType::SbiClientWait, Duration::ZERO, None);
-        
+
         // Process expired timers
         std::thread::sleep(Duration::from_millis(10));
         let expired = mgr.process_expired();
-        
+
         assert_eq!(expired.len(), 1);
         assert_eq!(mgr.count(), 0);
     }

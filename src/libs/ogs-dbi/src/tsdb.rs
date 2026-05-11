@@ -132,7 +132,12 @@ impl TimeSeries {
     pub fn std_dev(&self) -> Option<f64> {
         let avg = self.avg()?;
         let n = self.points.len() as f64;
-        let variance: f64 = self.points.iter().map(|p| (p.value - avg).powi(2)).sum::<f64>() / n;
+        let variance: f64 = self
+            .points
+            .iter()
+            .map(|p| (p.value - avg).powi(2))
+            .sum::<f64>()
+            / n;
         Some(variance.sqrt())
     }
 
@@ -149,7 +154,8 @@ impl TimeSeries {
         let mut current_time = start_time;
         while current_time <= end_time {
             let interval_end = current_time + interval_us;
-            let points_in_interval: Vec<&DataPoint> = self.points
+            let points_in_interval: Vec<&DataPoint> = self
+                .points
                 .iter()
                 .filter(|p| p.timestamp >= current_time && p.timestamp < interval_end)
                 .collect();
@@ -194,7 +200,8 @@ impl TsDbClient {
 
     /// Write a data point
     pub fn write_point(&mut self, metric: &str, point: DataPoint) -> TsDbResult<()> {
-        let series = self.series
+        let series = self
+            .series
             .entry(metric.to_string())
             .or_insert_with(|| TimeSeries::new(metric));
 
@@ -227,9 +234,9 @@ impl TsDbClient {
         let series = self.query(metric)?;
 
         if start > end {
-            return Err(TsDbError::InvalidTimeRange(
-                format!("start {start} > end {end}")
-            ));
+            return Err(TsDbError::InvalidTimeRange(format!(
+                "start {start} > end {end}"
+            )));
         }
 
         Ok(series.get_range(start, end).into_iter().cloned().collect())
@@ -242,7 +249,8 @@ impl TsDbClient {
 
     /// Delete a metric
     pub fn delete_metric(&mut self, metric: &str) -> TsDbResult<()> {
-        self.series.remove(metric)
+        self.series
+            .remove(metric)
             .ok_or_else(|| TsDbError::MetricNotFound(metric.to_string()))?;
         Ok(())
     }
@@ -317,30 +325,46 @@ impl NetworkMetricsCollector {
     }
 
     /// Record throughput
-    pub fn record_throughput(&mut self, timestamp: Timestamp, value_mbps: f64, ue_id: &str) -> TsDbResult<()> {
-        let point = DataPoint::new(timestamp, value_mbps)
-            .with_tag("ue_id", ue_id);
+    pub fn record_throughput(
+        &mut self,
+        timestamp: Timestamp,
+        value_mbps: f64,
+        ue_id: &str,
+    ) -> TsDbResult<()> {
+        let point = DataPoint::new(timestamp, value_mbps).with_tag("ue_id", ue_id);
         self.client.write_point("network.throughput", point)
     }
 
     /// Record latency
-    pub fn record_latency(&mut self, timestamp: Timestamp, value_ms: f64, nf_type: &str) -> TsDbResult<()> {
-        let point = DataPoint::new(timestamp, value_ms)
-            .with_tag("nf_type", nf_type);
+    pub fn record_latency(
+        &mut self,
+        timestamp: Timestamp,
+        value_ms: f64,
+        nf_type: &str,
+    ) -> TsDbResult<()> {
+        let point = DataPoint::new(timestamp, value_ms).with_tag("nf_type", nf_type);
         self.client.write_point("network.latency", point)
     }
 
     /// Record packet loss
-    pub fn record_packet_loss(&mut self, timestamp: Timestamp, loss_pct: f64, slice_id: &str) -> TsDbResult<()> {
-        let point = DataPoint::new(timestamp, loss_pct)
-            .with_tag("slice_id", slice_id);
+    pub fn record_packet_loss(
+        &mut self,
+        timestamp: Timestamp,
+        loss_pct: f64,
+        slice_id: &str,
+    ) -> TsDbResult<()> {
+        let point = DataPoint::new(timestamp, loss_pct).with_tag("slice_id", slice_id);
         self.client.write_point("network.packet_loss", point)
     }
 
     /// Record energy consumption
-    pub fn record_energy(&mut self, timestamp: Timestamp, watts: f64, nf_instance: &str) -> TsDbResult<()> {
-        let point = DataPoint::new(timestamp, watts)
-            .with_tag("nf_instance", nf_instance);
+    pub fn record_energy(
+        &mut self,
+        timestamp: Timestamp,
+        watts: f64,
+        nf_instance: &str,
+    ) -> TsDbResult<()> {
+        let point = DataPoint::new(timestamp, watts).with_tag("nf_instance", nf_instance);
         self.client.write_point("network.energy", point)
     }
 
@@ -452,9 +476,15 @@ mod tests {
     fn test_tsdb_client_query_range() {
         let mut client = TsDbClient::in_memory();
 
-        client.write_point("test.metric", DataPoint::new(1000, 10.0)).unwrap();
-        client.write_point("test.metric", DataPoint::new(2000, 20.0)).unwrap();
-        client.write_point("test.metric", DataPoint::new(3000, 30.0)).unwrap();
+        client
+            .write_point("test.metric", DataPoint::new(1000, 10.0))
+            .unwrap();
+        client
+            .write_point("test.metric", DataPoint::new(2000, 20.0))
+            .unwrap();
+        client
+            .write_point("test.metric", DataPoint::new(3000, 30.0))
+            .unwrap();
 
         let points = client.query_range("test.metric", 1500, 2500).unwrap();
         assert_eq!(points.len(), 1);
@@ -465,9 +495,15 @@ mod tests {
     fn test_tsdb_client_list_metrics() {
         let mut client = TsDbClient::in_memory();
 
-        client.write_point("metric1", DataPoint::new(1000, 1.0)).unwrap();
-        client.write_point("metric2", DataPoint::new(1000, 2.0)).unwrap();
-        client.write_point("metric3", DataPoint::new(1000, 3.0)).unwrap();
+        client
+            .write_point("metric1", DataPoint::new(1000, 1.0))
+            .unwrap();
+        client
+            .write_point("metric2", DataPoint::new(1000, 2.0))
+            .unwrap();
+        client
+            .write_point("metric3", DataPoint::new(1000, 3.0))
+            .unwrap();
 
         let metrics = client.list_metrics();
         assert_eq!(metrics.len(), 3);
@@ -483,7 +519,9 @@ mod tests {
         collector.record_throughput(1000, 100.5, "ue-001").unwrap();
         collector.record_latency(1000, 5.2, "AMF").unwrap();
         collector.record_packet_loss(1000, 0.01, "slice-1").unwrap();
-        collector.record_energy(1000, 150.0, "amf-instance-1").unwrap();
+        collector
+            .record_energy(1000, 150.0, "amf-instance-1")
+            .unwrap();
 
         assert_eq!(collector.client().metric_count(), 4);
     }
@@ -492,7 +530,9 @@ mod tests {
     fn test_delete_metric() {
         let mut client = TsDbClient::in_memory();
 
-        client.write_point("test.metric", DataPoint::new(1000, 1.0)).unwrap();
+        client
+            .write_point("test.metric", DataPoint::new(1000, 1.0))
+            .unwrap();
         assert!(client.query("test.metric").is_ok());
 
         client.delete_metric("test.metric").unwrap();
@@ -502,7 +542,9 @@ mod tests {
     #[test]
     fn test_invalid_time_range() {
         let mut client = TsDbClient::in_memory();
-        client.write_point("test.metric", DataPoint::new(1000, 1.0)).unwrap();
+        client
+            .write_point("test.metric", DataPoint::new(1000, 1.0))
+            .unwrap();
 
         // Start > end should fail
         let result = client.query_range("test.metric", 2000, 1000);
@@ -557,7 +599,9 @@ mod tests {
     fn test_metric_stats() {
         let mut client = TsDbClient::in_memory();
         for i in 1..=100 {
-            client.write_point("latency", DataPoint::new(i * 1000, i as f64)).unwrap();
+            client
+                .write_point("latency", DataPoint::new(i * 1000, i as f64))
+                .unwrap();
         }
         let stats = client.stats("latency").unwrap();
         assert_eq!(stats.count, 100);

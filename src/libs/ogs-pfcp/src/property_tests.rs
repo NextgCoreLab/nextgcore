@@ -9,8 +9,8 @@
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
     use bytes::BytesMut;
+    use proptest::prelude::*;
 
     // ========================================================================
     // PFCP Message Property Tests
@@ -20,15 +20,12 @@ mod tests {
         use super::*;
         use crate::header::{PfcpHeader, PfcpMessageType};
         use crate::message::{
-            PfcpMessage, HeartbeatRequest, HeartbeatResponse,
-            AssociationSetupRequest, AssociationSetupResponse,
-            AssociationReleaseRequest, AssociationReleaseResponse,
+            build_message, parse_message, AssociationReleaseRequest, AssociationReleaseResponse,
+            AssociationSetupRequest, AssociationSetupResponse, HeartbeatRequest, HeartbeatResponse,
+            PfcpMessage, SessionDeletionRequest, SessionDeletionResponse,
             SessionEstablishmentRequest, SessionEstablishmentResponse,
-            SessionDeletionRequest, SessionDeletionResponse,
-            build_message, parse_message,
         };
-        use crate::types::{NodeId, FSeid, PfcpCause};
-        
+        use crate::types::{FSeid, NodeId, PfcpCause};
 
         // Feature: nextgcore-rust-conversion, Property 11: Protocol Message Round-Trip
         // Test: PFCP Heartbeat Request round-trip
@@ -42,14 +39,14 @@ mod tests {
             ) {
                 let msg = PfcpMessage::HeartbeatRequest(HeartbeatRequest::new(recovery_time_stamp));
                 let buf = build_message(&msg, sequence_number, None);
-                
+
                 let mut bytes = buf.freeze();
                 let (header, decoded) = parse_message(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(header.message_type, PfcpMessageType::HeartbeatRequest);
                 prop_assert_eq!(header.sequence_number, sequence_number);
                 prop_assert!(!header.seid_presence);
-                
+
                 if let PfcpMessage::HeartbeatRequest(req) = decoded {
                     prop_assert_eq!(req.recovery_time_stamp, recovery_time_stamp);
                 } else {
@@ -66,13 +63,13 @@ mod tests {
             ) {
                 let msg = PfcpMessage::HeartbeatResponse(HeartbeatResponse::new(recovery_time_stamp));
                 let buf = build_message(&msg, sequence_number, None);
-                
+
                 let mut bytes = buf.freeze();
                 let (header, decoded) = parse_message(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(header.message_type, PfcpMessageType::HeartbeatResponse);
                 prop_assert_eq!(header.sequence_number, sequence_number);
-                
+
                 if let PfcpMessage::HeartbeatResponse(resp) = decoded {
                     prop_assert_eq!(resp.recovery_time_stamp, recovery_time_stamp);
                 } else {
@@ -93,13 +90,13 @@ mod tests {
                     AssociationSetupRequest::new(node_id.clone(), recovery_time_stamp)
                 );
                 let buf = build_message(&msg, sequence_number, None);
-                
+
                 let mut bytes = buf.freeze();
                 let (header, decoded) = parse_message(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(header.message_type, PfcpMessageType::AssociationSetupRequest);
                 prop_assert_eq!(header.sequence_number, sequence_number);
-                
+
                 if let PfcpMessage::AssociationSetupRequest(req) = decoded {
                     prop_assert_eq!(req.node_id, node_id);
                     prop_assert_eq!(req.recovery_time_stamp, recovery_time_stamp);
@@ -123,12 +120,12 @@ mod tests {
                     AssociationSetupResponse::new(node_id.clone(), cause, recovery_time_stamp)
                 );
                 let buf = build_message(&msg, sequence_number, None);
-                
+
                 let mut bytes = buf.freeze();
                 let (header, decoded) = parse_message(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(header.message_type, PfcpMessageType::AssociationSetupResponse);
-                
+
                 if let PfcpMessage::AssociationSetupResponse(resp) = decoded {
                     prop_assert_eq!(resp.node_id, node_id);
                     prop_assert_eq!(resp.recovery_time_stamp, recovery_time_stamp);
@@ -150,12 +147,12 @@ mod tests {
                     AssociationReleaseRequest::new(node_id.clone())
                 );
                 let buf = build_message(&msg, sequence_number, None);
-                
+
                 let mut bytes = buf.freeze();
                 let (header, decoded) = parse_message(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(header.message_type, PfcpMessageType::AssociationReleaseRequest);
-                
+
                 if let PfcpMessage::AssociationReleaseRequest(req) = decoded {
                     prop_assert_eq!(req.node_id, node_id);
                 } else {
@@ -175,12 +172,12 @@ mod tests {
                     AssociationReleaseResponse::new(node_id.clone(), PfcpCause::RequestAccepted)
                 );
                 let buf = build_message(&msg, sequence_number, None);
-                
+
                 let mut bytes = buf.freeze();
                 let (header, decoded) = parse_message(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(header.message_type, PfcpMessageType::AssociationReleaseResponse);
-                
+
                 if let PfcpMessage::AssociationReleaseResponse(resp) = decoded {
                     prop_assert_eq!(resp.node_id, node_id);
                     prop_assert_eq!(resp.cause, PfcpCause::RequestAccepted);
@@ -203,14 +200,14 @@ mod tests {
                     SessionEstablishmentRequest::new(node_id.clone(), cp_f_seid.clone())
                 );
                 let buf = build_message(&msg, sequence_number, Some(seid));
-                
+
                 let mut bytes = buf.freeze();
                 let (header, decoded) = parse_message(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(header.message_type, PfcpMessageType::SessionEstablishmentRequest);
                 prop_assert!(header.seid_presence);
                 prop_assert_eq!(header.seid, Some(seid));
-                
+
                 if let PfcpMessage::SessionEstablishmentRequest(req) = decoded {
                     prop_assert_eq!(req.node_id, node_id);
                     prop_assert_eq!(req.cp_f_seid, cp_f_seid);
@@ -230,12 +227,12 @@ mod tests {
                     SessionEstablishmentResponse::new(PfcpCause::RequestAccepted)
                 );
                 let buf = build_message(&msg, sequence_number, Some(seid));
-                
+
                 let mut bytes = buf.freeze();
                 let (header, decoded) = parse_message(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(header.message_type, PfcpMessageType::SessionEstablishmentResponse);
-                
+
                 if let PfcpMessage::SessionEstablishmentResponse(resp) = decoded {
                     prop_assert_eq!(resp.cause, PfcpCause::RequestAccepted);
                 } else {
@@ -252,14 +249,14 @@ mod tests {
             ) {
                 let msg = PfcpMessage::SessionDeletionRequest(SessionDeletionRequest::new());
                 let buf = build_message(&msg, sequence_number, Some(seid));
-                
+
                 let mut bytes = buf.freeze();
                 let (header, decoded) = parse_message(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(header.message_type, PfcpMessageType::SessionDeletionRequest);
                 prop_assert!(header.seid_presence);
                 prop_assert_eq!(header.seid, Some(seid));
-                
+
                 prop_assert!(matches!(decoded, PfcpMessage::SessionDeletionRequest(_)));
             }
 
@@ -274,12 +271,12 @@ mod tests {
                     SessionDeletionResponse::new(PfcpCause::RequestAccepted)
                 );
                 let buf = build_message(&msg, sequence_number, Some(seid));
-                
+
                 let mut bytes = buf.freeze();
                 let (header, decoded) = parse_message(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(header.message_type, PfcpMessageType::SessionDeletionResponse);
-                
+
                 if let PfcpMessage::SessionDeletionResponse(resp) = decoded {
                     prop_assert_eq!(resp.cause, PfcpCause::RequestAccepted);
                 } else {
@@ -304,13 +301,13 @@ mod tests {
                     h.length = 8;
                     h
                 };
-                
+
                 // Encode twice
                 let mut buf1 = BytesMut::new();
                 let mut buf2 = BytesMut::new();
                 header.encode(&mut buf1);
                 header.encode(&mut buf2);
-                
+
                 prop_assert_eq!(buf1, buf2, "Header encoding must be deterministic");
             }
         }

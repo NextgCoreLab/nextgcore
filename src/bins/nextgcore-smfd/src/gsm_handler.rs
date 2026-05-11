@@ -7,8 +7,8 @@
 //! Port of src/smf/gsm-handler.c - GSM message handling functions for 5G NAS
 
 use crate::context::{
-    SmfSess, SmfBearer, SmfPf, FlowDirection, IpfwRule,
-    MaxIntegrityProtectedDataRate, PduSessionType, Qos, SessionAmbr,
+    FlowDirection, IpfwRule, MaxIntegrityProtectedDataRate, PduSessionType, Qos, SessionAmbr,
+    SmfBearer, SmfPf, SmfSess,
 };
 use crate::gsm_build::GsmCause;
 use std::net::Ipv4Addr;
@@ -178,7 +178,7 @@ pub fn handle_pdu_session_establishment_request(
         integrity_protection_rate::FULL => MaxIntegrityProtectedDataRate::MaxUeRate,
         _ => MaxIntegrityProtectedDataRate::Bitrate64kbps,
     };
-    
+
     sess.integrity_protection_mbr_ul = match request.integrity_protection_mbr_ul {
         integrity_protection_rate::RATE_64KBPS => MaxIntegrityProtectedDataRate::Bitrate64kbps,
         integrity_protection_rate::FULL => MaxIntegrityProtectedDataRate::MaxUeRate,
@@ -195,7 +195,10 @@ pub fn handle_pdu_session_establishment_request(
         sess.ue_ssc_mode = ssc_mode;
     }
 
-    log::info!("[PSI:{}] PDU session establishment request processed", sess.psi);
+    log::info!(
+        "[PSI:{}] PDU session establishment request processed",
+        sess.psi
+    );
 
     Ok(())
 }
@@ -279,10 +282,7 @@ pub fn allocate_pdu_session_resources(
     ipv4_addr: Option<Ipv4Addr>,
 ) -> Result<PduSessionCreateResult, GsmCause> {
     // Determine PDU session type
-    let session_type = determine_pdu_session_type(
-        sess.ue_session_type,
-        sess.session_type,
-    )?;
+    let session_type = determine_pdu_session_type(sess.ue_session_type, sess.session_type)?;
     sess.session_type = session_type;
 
     // Assign IP address based on session type
@@ -310,12 +310,19 @@ pub fn allocate_pdu_session_resources(
     sess.session_qos = default_qos.clone();
 
     // Default QFI is 1 for 5GC (or based on 5QI)
-    let qfi = if default_qos.index > 0 { default_qos.index } else { 1 };
+    let qfi = if default_qos.index > 0 {
+        default_qos.index
+    } else {
+        1
+    };
 
     log::info!(
         "[PSI:{}] PDU session resources allocated: type={:?}, 5QI={}, AMBR DL={} UL={}",
-        sess.psi, session_type, default_qos.index,
-        session_ambr.downlink, session_ambr.uplink
+        sess.psi,
+        session_type,
+        default_qos.index,
+        session_ambr.downlink,
+        session_ambr.uplink
     );
 
     Ok(PduSessionCreateResult {
@@ -391,7 +398,10 @@ pub fn handle_pdu_session_modification_qos_rules(
     pfcp_flags: &mut u64,
 ) -> Result<Vec<u64>, GsmCause> {
     if qos_rules.is_empty() {
-        log::error!("[PSI:{}] Invalid modification request - no QoS rules", sess.psi);
+        log::error!(
+            "[PSI:{}] Invalid modification request - no QoS rules",
+            sess.psi
+        );
         return Err(GsmCause::InvalidMandatoryInformation);
     }
 
@@ -416,12 +426,14 @@ pub fn handle_pdu_session_modification_qos_rules(
                     modified_bearer_ids.push(qos_flow.id);
                 }
             }
-            qos_rule_code::CREATE_NEW_QOS_RULE |
-            qos_rule_code::MODIFY_EXISTING_QOS_RULE_AND_ADD_PACKET_FILTERS |
-            qos_rule_code::MODIFY_EXISTING_QOS_RULE_AND_REPLACE_ALL_PACKET_FILTERS => {
+            qos_rule_code::CREATE_NEW_QOS_RULE
+            | qos_rule_code::MODIFY_EXISTING_QOS_RULE_AND_ADD_PACKET_FILTERS
+            | qos_rule_code::MODIFY_EXISTING_QOS_RULE_AND_REPLACE_ALL_PACKET_FILTERS => {
                 // For create or replace, remove existing filters first
-                if rule.code == qos_rule_code::CREATE_NEW_QOS_RULE ||
-                   rule.code == qos_rule_code::MODIFY_EXISTING_QOS_RULE_AND_REPLACE_ALL_PACKET_FILTERS {
+                if rule.code == qos_rule_code::CREATE_NEW_QOS_RULE
+                    || rule.code
+                        == qos_rule_code::MODIFY_EXISTING_QOS_RULE_AND_REPLACE_ALL_PACKET_FILTERS
+                {
                     qos_flow.pf_ids.clear();
                 }
 
@@ -473,8 +485,13 @@ pub fn handle_pdu_session_modification_qos_rules(
         }
 
         // Update TFT if needed
-        if *pfcp_flags & (pfcp_flags::MODIFY_TFT_NEW | pfcp_flags::MODIFY_TFT_ADD |
-                         pfcp_flags::MODIFY_TFT_REPLACE | pfcp_flags::MODIFY_TFT_DELETE) != 0 {
+        if *pfcp_flags
+            & (pfcp_flags::MODIFY_TFT_NEW
+                | pfcp_flags::MODIFY_TFT_ADD
+                | pfcp_flags::MODIFY_TFT_REPLACE
+                | pfcp_flags::MODIFY_TFT_DELETE)
+            != 0
+        {
             log::debug!("[QFI:{}] TFT updated", qos_flow.qfi);
         }
     }
@@ -491,7 +508,10 @@ pub fn handle_pdu_session_modification_qos_flow_descriptions(
     pfcp_flags: &mut u64,
 ) -> Result<Vec<u64>, GsmCause> {
     if descriptions.is_empty() {
-        log::error!("[PSI:{}] Invalid modification request - no QoS flow descriptions", sess.psi);
+        log::error!(
+            "[PSI:{}] Invalid modification request - no QoS flow descriptions",
+            sess.psi
+        );
         return Err(GsmCause::InvalidMandatoryInformation);
     }
 
@@ -526,8 +546,11 @@ pub fn handle_pdu_session_modification_qos_flow_descriptions(
                     qos_flow.qos.mbr_downlink = param.bitrate;
                 }
                 _ => {
-                    log::warn!("[PSI:{}] Unknown QoS flow parameter: {}", 
-                        sess.psi, param.identifier);
+                    log::warn!(
+                        "[PSI:{}] Unknown QoS flow parameter: {}",
+                        sess.psi,
+                        param.identifier
+                    );
                 }
             }
         }
@@ -539,12 +562,14 @@ pub fn handle_pdu_session_modification_qos_flow_descriptions(
 
         // Update QoS if needed
         if *pfcp_flags & pfcp_flags::MODIFY_QOS_MODIFY != 0 {
-            log::debug!("[QFI:{}] QoS updated - GBR UL:{} DL:{}, MBR UL:{} DL:{}",
+            log::debug!(
+                "[QFI:{}] QoS updated - GBR UL:{} DL:{}, MBR UL:{} DL:{}",
                 qos_flow.qfi,
                 qos_flow.qos.gbr_uplink,
                 qos_flow.qos.gbr_downlink,
                 qos_flow.qos.mbr_uplink,
-                qos_flow.qos.mbr_downlink);
+                qos_flow.qos.mbr_downlink
+            );
         }
     }
 
@@ -566,7 +591,11 @@ pub fn handle_pdu_session_modification_request(
     // Handle QoS rules if present
     if !request.qos_rules.is_empty() {
         let modified = handle_pdu_session_modification_qos_rules(
-            sess, &request.qos_rules, bearers, &mut pfcp_flags)?;
+            sess,
+            &request.qos_rules,
+            bearers,
+            &mut pfcp_flags,
+        )?;
         for id in modified {
             if !sess.qos_flow_to_modify_list.contains(&id) {
                 sess.qos_flow_to_modify_list.push(id);
@@ -577,7 +606,11 @@ pub fn handle_pdu_session_modification_request(
     // Handle QoS flow descriptions if present
     if !request.qos_flow_descriptions.is_empty() {
         let modified = handle_pdu_session_modification_qos_flow_descriptions(
-            sess, &request.qos_flow_descriptions, bearers, &mut pfcp_flags)?;
+            sess,
+            &request.qos_flow_descriptions,
+            bearers,
+            &mut pfcp_flags,
+        )?;
         for id in modified {
             if !sess.qos_flow_to_modify_list.contains(&id) {
                 sess.qos_flow_to_modify_list.push(id);
@@ -587,24 +620,39 @@ pub fn handle_pdu_session_modification_request(
 
     // Validate modification list
     if sess.qos_flow_to_modify_list.len() != 1 {
-        log::error!("[PSI:{}] Invalid modification request - modify count: {}",
-            sess.psi, sess.qos_flow_to_modify_list.len());
+        log::error!(
+            "[PSI:{}] Invalid modification request - modify count: {}",
+            sess.psi,
+            sess.qos_flow_to_modify_list.len()
+        );
         return Err(GsmCause::InvalidMandatoryInformation);
     }
 
     // Validate PFCP flags
     if pfcp_flags & pfcp_flags::MODIFY_REMOVE != 0
-        && pfcp_flags & (pfcp_flags::MODIFY_TFT_NEW | pfcp_flags::MODIFY_TFT_ADD |
-                        pfcp_flags::MODIFY_TFT_REPLACE | pfcp_flags::MODIFY_TFT_DELETE |
-                        pfcp_flags::MODIFY_QOS_MODIFY) != 0 {
-            log::error!("[PSI:{}] Invalid PFCP flags combination: 0x{:x}", sess.psi, pfcp_flags);
-            return Err(GsmCause::InvalidMandatoryInformation);
-        }
+        && pfcp_flags
+            & (pfcp_flags::MODIFY_TFT_NEW
+                | pfcp_flags::MODIFY_TFT_ADD
+                | pfcp_flags::MODIFY_TFT_REPLACE
+                | pfcp_flags::MODIFY_TFT_DELETE
+                | pfcp_flags::MODIFY_QOS_MODIFY)
+            != 0
+    {
+        log::error!(
+            "[PSI:{}] Invalid PFCP flags combination: 0x{:x}",
+            sess.psi,
+            pfcp_flags
+        );
+        return Err(GsmCause::InvalidMandatoryInformation);
+    }
 
     pfcp_flags |= pfcp_flags::MODIFY_UE_REQUESTED;
 
-    log::info!("[PSI:{}] PDU session modification request processed, flags=0x{:x}",
-        sess.psi, pfcp_flags);
+    log::info!(
+        "[PSI:{}] PDU session modification request processed, flags=0x{:x}",
+        sess.psi,
+        pfcp_flags
+    );
 
     Ok(pfcp_flags)
 }
@@ -662,7 +710,10 @@ fn create_packet_filter_from_rule(
                 ipfw_rule.dst_port_high = component.port_high;
             }
             _ => {
-                log::error!("Unknown packet filter component type: {}", component.component_type);
+                log::error!(
+                    "Unknown packet filter component type: {}",
+                    component.component_type
+                );
                 return Err(GsmCause::SemanticErrorsInPacketFilters);
             }
         }
@@ -712,10 +763,9 @@ pub fn nas_bitrate_to_u64(unit: u8, value: u16) -> u64 {
         11 => 4000000000, // 4 Gbps
         _ => 1000,
     };
-    
+
     (value as u64) * multiplier
 }
-
 
 // ============================================================================
 // Tests
@@ -724,7 +774,7 @@ pub fn nas_bitrate_to_u64(unit: u8, value: u16) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{SmfSess, SmfBearer, Qos, PduSessionType, SNssai, SessionAmbr, NgapState};
+    use crate::context::{NgapState, PduSessionType, Qos, SNssai, SessionAmbr, SmfBearer, SmfSess};
     use std::net::Ipv4Addr;
 
     fn create_test_sess() -> SmfSess {
@@ -735,7 +785,10 @@ mod tests {
             pti: 1,
             session_type: PduSessionType::Ipv4,
             session_name: Some("internet".to_string()),
-            s_nssai: SNssai { sst: 1, sd: Some(0x010203) },
+            s_nssai: SNssai {
+                sst: 1,
+                sd: Some(0x010203),
+            },
             session_ambr: SessionAmbr {
                 downlink: 100_000_000,
                 uplink: 50_000_000,
@@ -768,7 +821,7 @@ mod tests {
     #[test]
     fn test_handle_pdu_session_establishment_request() {
         let mut sess = create_test_sess();
-        
+
         let request = PduSessionEstablishmentRequest {
             integrity_protection_mbr_dl: integrity_protection_rate::FULL,
             integrity_protection_mbr_ul: integrity_protection_rate::RATE_64KBPS,
@@ -779,10 +832,16 @@ mod tests {
         };
 
         let result = handle_pdu_session_establishment_request(&mut sess, &request);
-        
+
         assert!(result.is_ok());
-        assert_eq!(sess.integrity_protection_mbr_dl, MaxIntegrityProtectedDataRate::MaxUeRate);
-        assert_eq!(sess.integrity_protection_mbr_ul, MaxIntegrityProtectedDataRate::Bitrate64kbps);
+        assert_eq!(
+            sess.integrity_protection_mbr_dl,
+            MaxIntegrityProtectedDataRate::MaxUeRate
+        );
+        assert_eq!(
+            sess.integrity_protection_mbr_ul,
+            MaxIntegrityProtectedDataRate::Bitrate64kbps
+        );
         assert_eq!(sess.ue_session_type, 1);
         assert_eq!(sess.ue_ssc_mode, 1);
     }
@@ -793,7 +852,7 @@ mod tests {
         let mut bearer = create_test_bearer();
         bearer.pf_ids.push(1); // Add a packet filter ID
         let mut bearers = vec![bearer];
-        
+
         let qos_rules = vec![ParsedQosRule {
             identifier: 1, // QFI
             code: qos_rule_code::DELETE_EXISTING_QOS_RULE,
@@ -801,8 +860,13 @@ mod tests {
         }];
 
         let mut pfcp_flags = 0u64;
-        let result = handle_pdu_session_modification_qos_rules(&sess, &qos_rules, &mut bearers, &mut pfcp_flags);
-        
+        let result = handle_pdu_session_modification_qos_rules(
+            &sess,
+            &qos_rules,
+            &mut bearers,
+            &mut pfcp_flags,
+        );
+
         assert!(result.is_ok());
         assert!(pfcp_flags & pfcp_flags::MODIFY_REMOVE != 0);
         assert!(bearers[0].pf_ids.is_empty());
@@ -812,7 +876,7 @@ mod tests {
     fn test_handle_pdu_session_modification_qos_rules_create() {
         let sess = create_test_sess();
         let mut bearers = vec![create_test_bearer()];
-        
+
         let qos_rules = vec![ParsedQosRule {
             identifier: 1,
             code: qos_rule_code::CREATE_NEW_QOS_RULE,
@@ -829,8 +893,13 @@ mod tests {
         }];
 
         let mut pfcp_flags = 0u64;
-        let result = handle_pdu_session_modification_qos_rules(&sess, &qos_rules, &mut bearers, &mut pfcp_flags);
-        
+        let result = handle_pdu_session_modification_qos_rules(
+            &sess,
+            &qos_rules,
+            &mut bearers,
+            &mut pfcp_flags,
+        );
+
         assert!(result.is_ok());
         assert!(pfcp_flags & pfcp_flags::MODIFY_TFT_NEW != 0);
     }
@@ -839,7 +908,7 @@ mod tests {
     fn test_handle_pdu_session_modification_qos_flow_descriptions() {
         let sess = create_test_sess();
         let mut bearers = vec![create_test_bearer()];
-        
+
         let descriptions = vec![ParsedQosFlowDescription {
             identifier: 1,
             code: 3, // Modify
@@ -860,8 +929,12 @@ mod tests {
 
         let mut pfcp_flags = 0u64;
         let result = handle_pdu_session_modification_qos_flow_descriptions(
-            &sess, &descriptions, &mut bearers, &mut pfcp_flags);
-        
+            &sess,
+            &descriptions,
+            &mut bearers,
+            &mut pfcp_flags,
+        );
+
         assert!(result.is_ok());
         assert!(pfcp_flags & pfcp_flags::MODIFY_QOS_MODIFY != 0);
         assert_eq!(bearers[0].qos.gbr_uplink, 10_000_000);
@@ -872,7 +945,7 @@ mod tests {
     fn test_handle_pdu_session_modification_request() {
         let mut sess = create_test_sess();
         let mut bearers = vec![create_test_bearer()];
-        
+
         let request = PduSessionModificationRequest {
             qos_rules: vec![ParsedQosRule {
                 identifier: 1,
@@ -891,7 +964,7 @@ mod tests {
         };
 
         let result = handle_pdu_session_modification_request(&mut sess, &request, &mut bearers);
-        
+
         assert!(result.is_ok());
         let flags = result.unwrap();
         assert!(flags & pfcp_flags::MODIFY_TFT_NEW != 0);
@@ -902,7 +975,7 @@ mod tests {
     fn test_handle_pdu_session_modification_request_empty_rules() {
         let mut sess = create_test_sess();
         let mut bearers = vec![create_test_bearer()];
-        
+
         let request = PduSessionModificationRequest {
             qos_rules: vec![],
             qos_flow_descriptions: vec![],
@@ -910,7 +983,7 @@ mod tests {
         };
 
         let result = handle_pdu_session_modification_request(&mut sess, &request, &mut bearers);
-        
+
         // Should fail because no modifications
         assert!(result.is_err());
     }
@@ -935,7 +1008,7 @@ mod tests {
         };
 
         let result = create_packet_filter_from_rule(&bearer, &pf);
-        
+
         assert!(result.is_ok());
         let smf_pf = result.unwrap();
         assert_eq!(smf_pf.identifier, 1);
@@ -963,7 +1036,7 @@ mod tests {
         };
 
         let result = create_packet_filter_from_rule(&bearer, &pf);
-        
+
         assert!(result.is_ok());
         let smf_pf = result.unwrap();
         assert_eq!(smf_pf.ipfw_rule.proto, 17);
@@ -986,7 +1059,7 @@ mod tests {
         };
 
         let result = create_packet_filter_from_rule(&bearer, &pf);
-        
+
         assert!(result.is_ok());
         let smf_pf = result.unwrap();
         assert_eq!(smf_pf.direction, FlowDirection::DownlinkOnly);
@@ -1047,7 +1120,10 @@ mod tests {
         };
 
         let result = allocate_pdu_session_resources(
-            &mut sess, &qos, &ambr, Some(Ipv4Addr::new(10, 45, 0, 2)),
+            &mut sess,
+            &qos,
+            &ambr,
+            Some(Ipv4Addr::new(10, 45, 0, 2)),
         );
         assert!(result.is_ok());
         let create_result = result.unwrap();
@@ -1081,7 +1157,10 @@ mod tests {
 
         let result = handle_pdu_session_release_request(&mut sess, &request);
         assert!(result.is_ok());
-        assert_eq!(sess.ngap_state, crate::context::NgapState::DeleteTriggerUeRequested);
+        assert_eq!(
+            sess.ngap_state,
+            crate::context::NgapState::DeleteTriggerUeRequested
+        );
     }
 
     #[test]
@@ -1117,10 +1196,22 @@ mod tests {
     fn test_qos_rule_code_constants() {
         assert_eq!(qos_rule_code::CREATE_NEW_QOS_RULE, 1);
         assert_eq!(qos_rule_code::DELETE_EXISTING_QOS_RULE, 2);
-        assert_eq!(qos_rule_code::MODIFY_EXISTING_QOS_RULE_AND_ADD_PACKET_FILTERS, 3);
-        assert_eq!(qos_rule_code::MODIFY_EXISTING_QOS_RULE_AND_REPLACE_ALL_PACKET_FILTERS, 4);
-        assert_eq!(qos_rule_code::MODIFY_EXISTING_QOS_RULE_AND_DELETE_PACKET_FILTERS, 5);
-        assert_eq!(qos_rule_code::MODIFY_EXISTING_QOS_RULE_WITHOUT_MODIFYING_PACKET_FILTERS, 6);
+        assert_eq!(
+            qos_rule_code::MODIFY_EXISTING_QOS_RULE_AND_ADD_PACKET_FILTERS,
+            3
+        );
+        assert_eq!(
+            qos_rule_code::MODIFY_EXISTING_QOS_RULE_AND_REPLACE_ALL_PACKET_FILTERS,
+            4
+        );
+        assert_eq!(
+            qos_rule_code::MODIFY_EXISTING_QOS_RULE_AND_DELETE_PACKET_FILTERS,
+            5
+        );
+        assert_eq!(
+            qos_rule_code::MODIFY_EXISTING_QOS_RULE_WITHOUT_MODIFYING_PACKET_FILTERS,
+            6
+        );
     }
 
     #[test]

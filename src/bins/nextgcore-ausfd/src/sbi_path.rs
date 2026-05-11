@@ -39,7 +39,7 @@ static SBI_RUNNING: AtomicBool = AtomicBool::new(false);
 ///
 /// Port of ausf_sbi_open()
 pub fn ausf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
-    let config = config.unwrap_or(SbiServerConfig::default());
+    let config = config.unwrap_or_default();
 
     log::info!("Opening AUSF SBI server on {}:{}", config.addr, config.port);
 
@@ -98,9 +98,7 @@ pub fn ausf_sbi_is_running() -> bool {
 ///
 /// Port of ausf_sbi_send_request()
 pub fn ausf_sbi_send_request(nf_instance_id: &str, xact_id: u64) -> bool {
-    log::debug!(
-        "Sending SBI request to NF instance [{nf_instance_id}] xact [{xact_id}]"
-    );
+    log::debug!("Sending SBI request to NF instance [{nf_instance_id}] xact [{xact_id}]");
 
     // In C: ogs_sbi_send_request_to_nf_instance(nf_instance, xact)
     // This would send the request through the SBI client
@@ -116,9 +114,7 @@ pub fn ausf_sbi_discover_and_send_nudm_ueau_get(
     stream_id: u64,
     resync_info: Option<&ResynchronizationInfo>,
 ) -> Result<(), String> {
-    log::debug!(
-        "Discover and send NUDM UEAU get for UE [{ausf_ue_id}] stream [{stream_id}]"
-    );
+    log::debug!("Discover and send NUDM UEAU get for UE [{ausf_ue_id}] stream [{stream_id}]");
 
     // Build the request
     let request = nudm_build::ausf_nudm_ueau_build_get(ausf_ue_id, resync_info)

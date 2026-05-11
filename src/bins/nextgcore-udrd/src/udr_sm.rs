@@ -206,11 +206,10 @@ impl UdrSmContext {
                 log::debug!("[stream={stream_id}] Would send 204 No Content");
             }
             _ => {
-                log::error!(
-                    "Invalid resource name [{:?}]",
-                    resource_components.first()
+                log::error!("Invalid resource name [{:?}]", resource_components.first());
+                log::warn!(
+                    "[stream={stream_id}] Would send 400 Bad Request: Invalid resource name"
                 );
-                log::warn!("[stream={stream_id}] Would send 400 Bad Request: Invalid resource name");
             }
         }
     }
@@ -246,7 +245,9 @@ impl UdrSmContext {
                         match resource3 {
                             // In C: CASE(OGS_SBI_RESOURCE_NAME_PROVISIONED_DATA)
                             Some("provisioned-data") => {
-                                let method = event.sbi.as_ref()
+                                let method = event
+                                    .sbi
+                                    .as_ref()
                                     .and_then(|s| s.message.as_ref())
                                     .map(|m| m.method.as_str())
                                     .unwrap_or("");
@@ -255,7 +256,9 @@ impl UdrSmContext {
                                     nudr_handler::handle_subscription_provisioned(event, stream_id);
                                 } else {
                                     log::error!("Invalid HTTP method [{method}]");
-                                    log::warn!("[stream={stream_id}] Would send 405 Method Not Allowed");
+                                    log::warn!(
+                                        "[stream={stream_id}] Would send 405 Method Not Allowed"
+                                    );
                                 }
                             }
                             _ => {
@@ -274,11 +277,10 @@ impl UdrSmContext {
                 nudr_handler::handle_policy_data(event, stream_id);
             }
             _ => {
-                log::error!(
-                    "Invalid resource name [{:?}]",
-                    resource_components.first()
+                log::error!("Invalid resource name [{:?}]", resource_components.first());
+                log::warn!(
+                    "[stream={stream_id}] Would send 400 Bad Request: Invalid resource name"
                 );
-                log::warn!("[stream={stream_id}] Would send 400 Bad Request: Invalid resource name");
             }
         }
     }
@@ -334,7 +336,11 @@ impl UdrSmContext {
     /// Handle NNRF NFM responses
     ///
     /// Port of udr_state_operational() CASE(OGS_SBI_SERVICE_NAME_NNRF_NFM) for client
-    fn handle_nnrf_nfm_response(&mut self, resource_components: &[String], res_status: Option<u16>) {
+    fn handle_nnrf_nfm_response(
+        &mut self,
+        resource_components: &[String],
+        res_status: Option<u16>,
+    ) {
         let resource = resource_components.first().map(|s| s.as_str());
 
         match resource {
@@ -357,10 +363,7 @@ impl UdrSmContext {
                 // DELETE: ogs_sbi_subscription_data_remove
             }
             _ => {
-                log::error!(
-                    "Invalid resource name [{:?}]",
-                    resource_components.first()
-                );
+                log::error!("Invalid resource name [{:?}]", resource_components.first());
             }
         }
     }

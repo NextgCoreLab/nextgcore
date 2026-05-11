@@ -3,8 +3,8 @@
 //! This crate provides TUN interface operations for creating and managing
 //! TUN/TAP devices on Linux and macOS (utun).
 
-mod types;
 mod io;
+mod types;
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -12,8 +12,8 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 
-pub use types::*;
 pub use io::*;
+pub use types::*;
 
 #[cfg(target_os = "linux")]
 pub use linux::*;
@@ -22,7 +22,7 @@ pub use linux::*;
 pub use macos::*;
 
 /// Maximum headroom for TUN packets
-/// 
+///
 /// Linux:
 /// - ogs_tun_read(16bytes): OGS_GTPV1U_5GC_HEADER_LEN(16bytes)
 /// - ogs_tun_write(0bytes): No Need for headroom
@@ -53,7 +53,7 @@ mod tests {
     fn test_tun_error_display() {
         let err = TunError::DeviceNotFound;
         assert!(!format!("{err}").is_empty());
-        
+
         let err = TunError::IoError("test".to_string());
         assert!(format!("{err}").contains("test"));
     }

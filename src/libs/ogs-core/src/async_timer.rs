@@ -51,7 +51,13 @@ pub struct AsyncTimerEntry<T: Clone + fmt::Debug> {
 
 impl<T: Clone + fmt::Debug> AsyncTimerEntry<T> {
     /// Create a new timer entry
-    pub fn new(id: u64, timer_type: T, duration: Duration, mode: TimerMode, data: Option<String>) -> Self {
+    pub fn new(
+        id: u64,
+        timer_type: T,
+        duration: Duration,
+        mode: TimerMode,
+        data: Option<String>,
+    ) -> Self {
         Self {
             id,
             timer_type,
@@ -173,22 +179,12 @@ impl<T: Clone + fmt::Debug + Send + Sync + 'static> AsyncTimerMgr<T> {
     }
 
     /// Start a one-shot timer (convenience method)
-    pub fn start_oneshot(
-        &self,
-        timer_type: T,
-        duration: Duration,
-        data: Option<String>,
-    ) -> u64 {
+    pub fn start_oneshot(&self, timer_type: T, duration: Duration, data: Option<String>) -> u64 {
         self.start(timer_type, duration, TimerMode::OneShot, data)
     }
 
     /// Start a periodic timer (convenience method)
-    pub fn start_periodic(
-        &self,
-        timer_type: T,
-        interval: Duration,
-        data: Option<String>,
-    ) -> u64 {
+    pub fn start_periodic(&self, timer_type: T, interval: Duration, data: Option<String>) -> u64 {
         self.start(timer_type, interval, TimerMode::Periodic, data)
     }
 
@@ -197,7 +193,11 @@ impl<T: Clone + fmt::Debug + Send + Sync + 'static> AsyncTimerMgr<T> {
         if let Ok(mut timers) = self.timers.write() {
             if let Some(entry) = timers.get_mut(&id) {
                 entry.cancel();
-                log::debug!("AsyncTimer cancelled: id={} type={:?}", id, entry.timer_type);
+                log::debug!(
+                    "AsyncTimer cancelled: id={} type={:?}",
+                    id,
+                    entry.timer_type
+                );
                 return true;
             }
         }
@@ -236,7 +236,9 @@ impl<T: Clone + fmt::Debug + Send + Sync + 'static> AsyncTimerMgr<T> {
                 entry.reset_with_duration(duration);
                 log::debug!(
                     "AsyncTimer reset with new duration: id={} type={:?} duration={:?}",
-                    id, entry.timer_type, duration
+                    id,
+                    entry.timer_type,
+                    duration
                 );
                 return true;
             }
@@ -354,9 +356,7 @@ impl<T: Clone + fmt::Debug + Send + Sync + 'static> AsyncTimerMgr<T> {
             }
         }
         if cancelled > 0 {
-            log::debug!(
-                "AsyncTimer: cancelled {cancelled} timers of type {timer_type:?}"
-            );
+            log::debug!("AsyncTimer: cancelled {cancelled} timers of type {timer_type:?}");
         }
         cancelled
     }

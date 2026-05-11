@@ -61,11 +61,16 @@ pub fn nssf_nnssf_nsselection_build_get(
     let mut query_params = vec![
         format!("nf-id={}", nf_instance_id),
         format!("nf-type={}", nf_type),
-        format!("slice-info-request-for-pdu-session.sNssai.sst={}", snssai.sst),
+        format!(
+            "slice-info-request-for-pdu-session.sNssai.sst={}",
+            snssai.sst
+        ),
     ];
 
     if let Some(sd) = snssai.sd {
-        query_params.push(format!("slice-info-request-for-pdu-session.sNssai.sd={sd:06x}"));
+        query_params.push(format!(
+            "slice-info-request-for-pdu-session.sNssai.sd={sd:06x}"
+        ));
     }
 
     query_params.push(format!(
@@ -81,18 +86,14 @@ pub fn nssf_nnssf_nsselection_build_get(
     }
 
     let query_string = query_params.join("&");
-    let uri = format!(
-        "/nnssf-nsselection/v2/network-slice-information?{query_string}"
-    );
+    let uri = format!("/nnssf-nsselection/v2/network-slice-information?{query_string}");
 
     log::debug!("Built NS selection request: GET {uri}");
 
     Some(PathSbiRequest {
         method: "GET".to_string(),
         uri,
-        headers: vec![
-            ("Accept".to_string(), "application/json".to_string()),
-        ],
+        headers: vec![("Accept".to_string(), "application/json".to_string())],
         body: None,
     })
 }
@@ -107,10 +108,7 @@ fn roaming_indication_to_string(indication: RoamingIndication) -> &'static str {
 }
 
 /// Build authorized network slice info response
-pub fn build_authorized_network_slice_info_response(
-    nrf_id: &str,
-    nsi_id: &str,
-) -> String {
+pub fn build_authorized_network_slice_info_response(nrf_id: &str, nsi_id: &str) -> String {
     // Build JSON response
     serde_json_minimal(nrf_id, nsi_id)
 }
@@ -140,11 +138,7 @@ mod tests {
 
     #[test]
     fn test_build_ns_selection_request() {
-        let home = NssfHome::new(
-            1,
-            PlmnId::new("001", "01"),
-            SNssai::new(1, Some(0x010203)),
-        );
+        let home = NssfHome::new(1, PlmnId::new("001", "01"), SNssai::new(1, Some(0x010203)));
 
         let param = NssfNsselectionParam {
             slice_info_for_pdu_session: SliceInfoParam {
@@ -167,11 +161,7 @@ mod tests {
 
     #[test]
     fn test_build_ns_selection_request_missing_slice_info() {
-        let home = NssfHome::new(
-            1,
-            PlmnId::new("001", "01"),
-            SNssai::new(1, None),
-        );
+        let home = NssfHome::new(1, PlmnId::new("001", "01"), SNssai::new(1, None));
 
         let param = NssfNsselectionParam {
             slice_info_for_pdu_session: SliceInfoParam::default(),
@@ -184,10 +174,8 @@ mod tests {
 
     #[test]
     fn test_build_authorized_response() {
-        let response = build_authorized_network_slice_info_response(
-            "http://nrf.example.com",
-            "nsi-123",
-        );
+        let response =
+            build_authorized_network_slice_info_response("http://nrf.example.com", "nsi-123");
         assert!(response.contains("nrfId"));
         assert!(response.contains("nsiId"));
         assert!(response.contains("http://nrf.example.com"));
@@ -195,9 +183,18 @@ mod tests {
 
     #[test]
     fn test_roaming_indication_to_string() {
-        assert_eq!(roaming_indication_to_string(RoamingIndication::NonRoaming), "NON_ROAMING");
-        assert_eq!(roaming_indication_to_string(RoamingIndication::LocalBreakout), "LOCAL_BREAKOUT");
-        assert_eq!(roaming_indication_to_string(RoamingIndication::HomeRouted), "HOME_ROUTED");
+        assert_eq!(
+            roaming_indication_to_string(RoamingIndication::NonRoaming),
+            "NON_ROAMING"
+        );
+        assert_eq!(
+            roaming_indication_to_string(RoamingIndication::LocalBreakout),
+            "LOCAL_BREAKOUT"
+        );
+        assert_eq!(
+            roaming_indication_to_string(RoamingIndication::HomeRouted),
+            "HOME_ROUTED"
+        );
     }
 
     #[test]

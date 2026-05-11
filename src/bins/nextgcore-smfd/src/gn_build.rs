@@ -14,7 +14,7 @@
 //!
 //! Reference: 3GPP TS 29.060 (GTPv1-C), 3GPP TS 23.401 Annex E (QoS mapping)
 
-use bytes::{Bytes, BytesMut, BufMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 // ============================================================================
@@ -271,16 +271,10 @@ impl QosProfileDecoded {
         let mut buf = Vec::with_capacity(21);
 
         // Octet 3: Reliability class (3 bits) + Delay class (3 bits) + spare (2 bits)
-        buf.push(
-            ((self.delay_class & 0x07) << 3)
-                | (self.reliability_class & 0x07)
-        );
+        buf.push(((self.delay_class & 0x07) << 3) | (self.reliability_class & 0x07));
 
         // Octet 4: Peak throughput (4 bits) + spare + precedence class (3 bits)
-        buf.push(
-            ((self.peak_throughput & 0x0F) << 4)
-                | (self.precedence_class & 0x07)
-        );
+        buf.push(((self.peak_throughput & 0x0F) << 4) | (self.precedence_class & 0x07));
 
         // Octet 5: Mean throughput (5 bits) + spare
         buf.push(self.mean_throughput & 0x1F);
@@ -289,7 +283,7 @@ impl QosProfileDecoded {
         buf.push(
             ((self.traffic_class & 0x07) << 5)
                 | ((self.delivery_order & 0x03) << 3)
-                | (self.delivery_erroneous_sdu & 0x07)
+                | (self.delivery_erroneous_sdu & 0x07),
         );
 
         // Octet 7: Maximum SDU size
@@ -302,15 +296,12 @@ impl QosProfileDecoded {
         buf.push(encode_bitrate_octet(self.max_bitrate_dl));
 
         // Octet 10: Residual BER (4 bits) + SDU error ratio (4 bits)
-        buf.push(
-            ((self.residual_ber & 0x0F) << 4)
-                | (self.sdu_error_ratio & 0x0F)
-        );
+        buf.push(((self.residual_ber & 0x0F) << 4) | (self.sdu_error_ratio & 0x0F));
 
         // Octet 11: Transfer delay (6 bits) + Traffic handling priority (2 bits)
         buf.push(
             ((encode_transfer_delay(self.transfer_delay) & 0x3F) << 2)
-                | (self.traffic_handling_priority & 0x03)
+                | (self.traffic_handling_priority & 0x03),
         );
 
         // Octet 12: Guaranteed bit rate for uplink
@@ -321,8 +312,11 @@ impl QosProfileDecoded {
 
         // Octet 14: Signalling indication (1 bit) + Source statistics descriptor (4 bits) + spare
         buf.push(
-            (if self.signalling_indication { 0x10 } else { 0x00 })
-                | (self.source_statistics_descriptor & 0x0F)
+            (if self.signalling_indication {
+                0x10
+            } else {
+                0x00
+            }) | (self.source_statistics_descriptor & 0x0F),
         );
 
         // Extended octets for higher bit rates would go here
@@ -362,12 +356,7 @@ fn encode_transfer_delay(ms: u16) -> u8 {
 // ============================================================================
 
 /// Build GTPv1-C header
-pub fn build_header(
-    msg_type: u8,
-    teid: u32,
-    seq_num: u16,
-    payload_len: u16,
-) -> Vec<u8> {
+pub fn build_header(msg_type: u8, teid: u32, seq_num: u16, payload_len: u16) -> Vec<u8> {
     let mut buf = Vec::with_capacity(12);
 
     // Flags: Version (3 bits) | PT (1 bit) | spare (1 bit) | E (1 bit) | S (1 bit) | PN (1 bit)

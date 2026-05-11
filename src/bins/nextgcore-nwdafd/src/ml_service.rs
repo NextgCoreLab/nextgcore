@@ -161,7 +161,8 @@ impl MlModelRegistry {
 
     /// Returns all deployed models for a given analytics ID
     pub fn deployed_for(&self, analytics_id: AnalyticsId) -> Vec<&MlModel> {
-        self.models.values()
+        self.models
+            .values()
             .filter(|m| m.analytics_id == analytics_id && m.status == ModelStatus::Deployed)
             .collect()
     }
@@ -248,19 +249,20 @@ impl FeedbackCollector {
         if self.samples.len() >= self.window_size {
             self.samples.pop_front();
         }
-        self.samples.push_back(FeedbackSample { error, timestamp: now });
+        self.samples.push_back(FeedbackSample {
+            error,
+            timestamp: now,
+        });
 
         // Trigger retraining if rolling accuracy drops
-        if self.rolling_accuracy() < self.accuracy_threshold {
-            if !self.retrain_requested {
-                log::warn!(
+        if self.rolling_accuracy() < self.accuracy_threshold && !self.retrain_requested {
+            log::warn!(
                     "[NWDAF FeedbackLoop] model={} rolling_accuracy={:.3} < threshold={:.3} → retrain requested",
                     self.model_id,
                     self.rolling_accuracy(),
                     self.accuracy_threshold,
                 );
-                self.retrain_requested = true;
-            }
+            self.retrain_requested = true;
         }
     }
 
@@ -269,8 +271,8 @@ impl FeedbackCollector {
         if self.samples.is_empty() {
             return 1.0; // no data → assume perfect
         }
-        let mean_error = self.samples.iter().map(|s| s.error).sum::<f64>()
-            / self.samples.len() as f64;
+        let mean_error =
+            self.samples.iter().map(|s| s.error).sum::<f64>() / self.samples.len() as f64;
         1.0 - mean_error
     }
 
@@ -283,7 +285,10 @@ impl FeedbackCollector {
     pub fn acknowledge_retrain(&mut self) {
         self.retrain_requested = false;
         self.samples.clear();
-        log::info!("[NWDAF FeedbackLoop] model={} retrain acknowledged, window reset", self.model_id);
+        log::info!(
+            "[NWDAF FeedbackLoop] model={} retrain acknowledged, window reset",
+            self.model_id
+        );
     }
 
     /// Returns the number of samples in the window.
@@ -306,9 +311,9 @@ impl FeedbackRegistry {
 
     /// Creates a collector for a model (called when a model is deployed).
     pub fn register_model(&mut self, model_id: String) {
-        self.collectors.entry(model_id.clone()).or_insert_with(|| {
-            FeedbackCollector::new(model_id, 100, 0.70)
-        });
+        self.collectors
+            .entry(model_id.clone())
+            .or_insert_with(|| FeedbackCollector::new(model_id, 100, 0.70));
     }
 
     /// Records feedback for a model.
@@ -320,7 +325,8 @@ impl FeedbackRegistry {
 
     /// Returns models that need retraining.
     pub fn models_needing_retrain(&self) -> Vec<&str> {
-        self.collectors.values()
+        self.collectors
+            .values()
             .filter(|c| c.retrain_requested())
             .map(|c| c.model_id.as_str())
             .collect()

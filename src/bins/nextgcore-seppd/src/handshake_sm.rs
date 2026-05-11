@@ -60,16 +60,19 @@ impl HandshakeSmContext {
     /// Initialize the handshake FSM
     /// Port of sepp_handshake_fsm_init
     pub fn init(&mut self, try_to_establish: bool) {
-        log::debug!("Handshake SM: Initializing for node {} (try_to_establish={})", 
-            self.node_id, try_to_establish);
-        
+        log::debug!(
+            "Handshake SM: Initializing for node {} (try_to_establish={})",
+            self.node_id,
+            try_to_establish
+        );
+
         self.try_to_establish = try_to_establish;
         self.state = HandshakeState::Initial;
-        
+
         if try_to_establish {
             self.timer_active = true;
         }
-        
+
         // Transition to WillEstablish
         let mut event = SeppEvent::entry().with_sepp_node(self.node_id);
         self.dispatch(&mut event);
@@ -79,17 +82,17 @@ impl HandshakeSmContext {
     /// Port of sepp_handshake_fsm_fini
     pub fn fini(&mut self) {
         log::debug!("Handshake SM: Finalizing for node {}", self.node_id);
-        
+
         // If established, send termination request
         if self.state == HandshakeState::Established {
             log::info!("[node_id={}] Sending termination request", self.node_id);
             // Note: Send termination via sepp_n32c_handshake_send_security_capability_request(sepp_node, true)
             // Termination request handled by n32c_build::build_security_capability_request with none=true
         }
-        
+
         let mut event = SeppEvent::exit().with_sepp_node(self.node_id);
         self.dispatch(&mut event);
-        
+
         self.timer_active = false;
         self.state = HandshakeState::Final;
     }
@@ -120,7 +123,10 @@ impl HandshakeSmContext {
     }
 
     fn handle_initial_state(&mut self, _event: &mut SeppEvent) {
-        log::debug!("[node_id={}] Transitioning from Initial to WillEstablish", self.node_id);
+        log::debug!(
+            "[node_id={}] Transitioning from Initial to WillEstablish",
+            self.node_id
+        );
         self.state = HandshakeState::WillEstablish;
     }
 
@@ -137,7 +143,10 @@ impl HandshakeSmContext {
                     log::debug!("[node_id={}] Starting establish timer", self.node_id);
                     // Note: Timer started via timer::TimerManager::start_timer(PeerEstablish)
                     // Note: Security capability request sent via n32c_build::build_security_capability_sbi_request
-                    log::info!("[node_id={}] Sending security capability request", self.node_id);
+                    log::info!(
+                        "[node_id={}] Sending security capability request",
+                        self.node_id
+                    );
                 }
             }
             SeppEventId::FsmExit => {
@@ -178,7 +187,11 @@ impl HandshakeSmContext {
         };
 
         if service_name != "n32c-handshake" {
-            log::error!("[node_id={}] Invalid API name [{}]", self.node_id, service_name);
+            log::error!(
+                "[node_id={}] Invalid API name [{}]",
+                self.node_id,
+                service_name
+            );
             return;
         }
 
@@ -198,16 +211,25 @@ impl HandshakeSmContext {
 
                     match negotiated_scheme {
                         SecurityCapability::Tls => {
-                            log::info!("[node_id={}] TLS negotiated, transitioning to Established", self.node_id);
+                            log::info!(
+                                "[node_id={}] TLS negotiated, transitioning to Established",
+                                self.node_id
+                            );
                             self.send_security_capability_response();
                             self.state = HandshakeState::Established;
                         }
                         SecurityCapability::Prins => {
                             log::error!("[node_id={}] PRINS is not supported", self.node_id);
-                            send_not_implemented_response(stream_id, "PRINS security scheme is not supported");
+                            send_not_implemented_response(
+                                stream_id,
+                                "PRINS security scheme is not supported",
+                            );
                         }
                         SecurityCapability::None => {
-                            log::warn!("[node_id={}] SEPP has not been established (NONE)", self.node_id);
+                            log::warn!(
+                                "[node_id={}] SEPP has not been established (NONE)",
+                                self.node_id
+                            );
                             self.send_security_capability_response();
                             // Stay in WillEstablish
                         }
@@ -217,11 +239,19 @@ impl HandshakeSmContext {
                     }
                 }
                 _ => {
-                    log::error!("[node_id={}] Invalid HTTP method [{}]", self.node_id, method);
+                    log::error!(
+                        "[node_id={}] Invalid HTTP method [{}]",
+                        self.node_id,
+                        method
+                    );
                 }
             },
             _ => {
-                log::error!("[node_id={}] Invalid resource name [{:?}]", self.node_id, resource);
+                log::error!(
+                    "[node_id={}] Invalid resource name [{:?}]",
+                    self.node_id,
+                    resource
+                );
             }
         }
     }
@@ -245,7 +275,11 @@ impl HandshakeSmContext {
         };
 
         if service_name != "n32c-handshake" {
-            log::error!("[node_id={}] Invalid API name [{}]", self.node_id, service_name);
+            log::error!(
+                "[node_id={}] Invalid API name [{}]",
+                self.node_id,
+                service_name
+            );
             return;
         }
 
@@ -261,31 +295,48 @@ impl HandshakeSmContext {
                         }
 
                         let negotiated_scheme = self.get_negotiated_security_scheme();
-                        
+
                         match negotiated_scheme {
                             SecurityCapability::Tls => {
-                                log::info!("[node_id={}] TLS negotiated, transitioning to Established", self.node_id);
+                                log::info!(
+                                    "[node_id={}] TLS negotiated, transitioning to Established",
+                                    self.node_id
+                                );
                                 self.state = HandshakeState::Established;
                             }
                             SecurityCapability::Prins => {
                                 log::error!("[node_id={}] PRINS is not supported", self.node_id);
                             }
                             SecurityCapability::None => {
-                                log::warn!("[node_id={}] SEPP has not been established (NONE)", self.node_id);
+                                log::warn!(
+                                    "[node_id={}] SEPP has not been established (NONE)",
+                                    self.node_id
+                                );
                             }
                             _ => {}
                         }
                     } else {
-                        log::error!("[node_id={}] HTTP Response Status Code [{:?}]", 
-                            self.node_id, res_status);
+                        log::error!(
+                            "[node_id={}] HTTP Response Status Code [{:?}]",
+                            self.node_id,
+                            res_status
+                        );
                     }
                 }
                 _ => {
-                    log::error!("[node_id={}] Invalid HTTP method [{}]", self.node_id, method);
+                    log::error!(
+                        "[node_id={}] Invalid HTTP method [{}]",
+                        self.node_id,
+                        method
+                    );
                 }
             },
             _ => {
-                log::error!("[node_id={}] Invalid resource name [{:?}]", self.node_id, resource);
+                log::error!(
+                    "[node_id={}] Invalid resource name [{:?}]",
+                    self.node_id,
+                    resource
+                );
             }
         }
     }
@@ -298,7 +349,10 @@ impl HandshakeSmContext {
 
         match timer_id {
             SeppTimerId::PeerEstablish => {
-                log::warn!("[node_id={}] Retry establishment with Peer SEPP", self.node_id);
+                log::warn!(
+                    "[node_id={}] Retry establishment with Peer SEPP",
+                    self.node_id
+                );
                 // Note: Timer restarted and request sent via n32c_build::build_security_capability_sbi_request
             }
             _ => {
@@ -363,15 +417,21 @@ impl HandshakeSmContext {
                     }
 
                     let negotiated_scheme = self.get_negotiated_security_scheme();
-                    
+
                     match negotiated_scheme {
                         SecurityCapability::Tls => {
-                            log::warn!("[node_id={}] SEPP has already been established", self.node_id);
+                            log::warn!(
+                                "[node_id={}] SEPP has already been established",
+                                self.node_id
+                            );
                             self.send_security_capability_response();
                         }
                         SecurityCapability::Prins => {
                             log::error!("[node_id={}] PRINS is not supported", self.node_id);
-                            send_not_implemented_response(stream_id, "PRINS security scheme is not supported");
+                            send_not_implemented_response(
+                                stream_id,
+                                "PRINS security scheme is not supported",
+                            );
                         }
                         SecurityCapability::None => {
                             log::info!("[node_id={}] Transitioning to Terminated", self.node_id);
@@ -382,11 +442,19 @@ impl HandshakeSmContext {
                     }
                 }
                 _ => {
-                    log::error!("[node_id={}] Invalid HTTP method [{}]", self.node_id, method);
+                    log::error!(
+                        "[node_id={}] Invalid HTTP method [{}]",
+                        self.node_id,
+                        method
+                    );
                 }
             },
             _ => {
-                log::error!("[node_id={}] Invalid resource name [{:?}]", self.node_id, resource);
+                log::error!(
+                    "[node_id={}] Invalid resource name [{:?}]",
+                    self.node_id,
+                    resource
+                );
             }
         }
     }
@@ -415,14 +483,24 @@ impl HandshakeSmContext {
         match resource.as_deref() {
             Some("exchange-capability") => {
                 if res_status == Some(200) {
-                    log::warn!("[node_id={}] SEPP has already been established", self.node_id);
+                    log::warn!(
+                        "[node_id={}] SEPP has already been established",
+                        self.node_id
+                    );
                 } else {
-                    log::error!("[node_id={}] HTTP Response Status Code [{:?}]", 
-                        self.node_id, res_status);
+                    log::error!(
+                        "[node_id={}] HTTP Response Status Code [{:?}]",
+                        self.node_id,
+                        res_status
+                    );
                 }
             }
             _ => {
-                log::error!("[node_id={}] Invalid resource name [{:?}]", self.node_id, resource);
+                log::error!(
+                    "[node_id={}] Invalid resource name [{:?}]",
+                    self.node_id,
+                    resource
+                );
             }
         }
     }
@@ -489,30 +567,47 @@ impl HandshakeSmContext {
                     }
 
                     let negotiated_scheme = self.get_negotiated_security_scheme();
-                    
+
                     match negotiated_scheme {
                         SecurityCapability::Tls => {
-                            log::info!("[node_id={}] TLS negotiated, transitioning to Established", self.node_id);
+                            log::info!(
+                                "[node_id={}] TLS negotiated, transitioning to Established",
+                                self.node_id
+                            );
                             self.send_security_capability_response();
                             self.state = HandshakeState::Established;
                         }
                         SecurityCapability::Prins => {
                             log::error!("[node_id={}] PRINS is not supported", self.node_id);
-                            send_not_implemented_response(stream_id, "PRINS security scheme is not supported");
+                            send_not_implemented_response(
+                                stream_id,
+                                "PRINS security scheme is not supported",
+                            );
                         }
                         SecurityCapability::None => {
-                            log::warn!("[node_id={}] SEPP has not been established (NONE)", self.node_id);
+                            log::warn!(
+                                "[node_id={}] SEPP has not been established (NONE)",
+                                self.node_id
+                            );
                             self.send_security_capability_response();
                         }
                         _ => {}
                     }
                 }
                 _ => {
-                    log::error!("[node_id={}] Invalid HTTP method [{}]", self.node_id, method);
+                    log::error!(
+                        "[node_id={}] Invalid HTTP method [{}]",
+                        self.node_id,
+                        method
+                    );
                 }
             },
             _ => {
-                log::error!("[node_id={}] Invalid resource name [{:?}]", self.node_id, resource);
+                log::error!(
+                    "[node_id={}] Invalid resource name [{:?}]",
+                    self.node_id,
+                    resource
+                );
             }
         }
     }
@@ -543,12 +638,19 @@ impl HandshakeSmContext {
                 if res_status == Some(200) {
                     log::warn!("[node_id={}] SEPP was terminated", self.node_id);
                 } else {
-                    log::error!("[node_id={}] HTTP Response Status Code [{:?}]", 
-                        self.node_id, res_status);
+                    log::error!(
+                        "[node_id={}] HTTP Response Status Code [{:?}]",
+                        self.node_id,
+                        res_status
+                    );
                 }
             }
             _ => {
-                log::error!("[node_id={}] Invalid resource name [{:?}]", self.node_id, resource);
+                log::error!(
+                    "[node_id={}] Invalid resource name [{:?}]",
+                    self.node_id,
+                    resource
+                );
             }
         }
     }
@@ -561,7 +663,10 @@ impl HandshakeSmContext {
 
         match timer_id {
             SeppTimerId::PeerEstablish => {
-                log::warn!("[node_id={}] Retry establishment with Peer SEPP", self.node_id);
+                log::warn!(
+                    "[node_id={}] Retry establishment with Peer SEPP",
+                    self.node_id
+                );
                 self.state = HandshakeState::WillEstablish;
             }
             _ => {
@@ -576,13 +681,19 @@ impl HandshakeSmContext {
         match event.id {
             SeppEventId::FsmEntry => {
                 if self.timer_active {
-                    log::debug!("[node_id={}] Starting exception reconnect timer", self.node_id);
+                    log::debug!(
+                        "[node_id={}] Starting exception reconnect timer",
+                        self.node_id
+                    );
                     // Note: Timer started with longer interval via timer::TimerManager::start_timer_with_backoff(PeerEstablish)
                 }
             }
             SeppEventId::FsmExit => {
                 if self.timer_active {
-                    log::debug!("[node_id={}] Stopping exception reconnect timer", self.node_id);
+                    log::debug!(
+                        "[node_id={}] Stopping exception reconnect timer",
+                        self.node_id
+                    );
                     // Note: Timer stopped via timer::TimerManager::stop_timer(PeerEstablish)
                 }
             }
@@ -594,8 +705,10 @@ impl HandshakeSmContext {
 
                 match timer_id {
                     SeppTimerId::PeerEstablish => {
-                        log::warn!("[node_id={}] Retry establishment with Peer SEPP (from exception)", 
-                            self.node_id);
+                        log::warn!(
+                            "[node_id={}] Retry establishment with Peer SEPP (from exception)",
+                            self.node_id
+                        );
                         self.state = HandshakeState::WillEstablish;
                     }
                     _ => {
@@ -615,21 +728,30 @@ impl HandshakeSmContext {
         // Note: Request handling implemented in n32c_handler::handle_security_capability_request
         // Parses SecNegotiateReqData and negotiates security capability via context
         // For now, return true to indicate success
-        log::debug!("[node_id={}] Handling security capability request", self.node_id);
+        log::debug!(
+            "[node_id={}] Handling security capability request",
+            self.node_id
+        );
         true
     }
 
     fn handle_security_capability_response(&mut self, _event: &mut SeppEvent) -> bool {
         // Note: Response handling implemented in n32c_handler::handle_security_capability_response
         // Parses SecNegotiateRspData and updates node's negotiated_security_scheme
-        log::debug!("[node_id={}] Handling security capability response", self.node_id);
+        log::debug!(
+            "[node_id={}] Handling security capability response",
+            self.node_id
+        );
         true
     }
 
     fn send_security_capability_response(&self) {
         // Note: Response built via n32c_build::build_security_capability_response
         // Sent via sbi_path server response mechanism
-        log::debug!("[node_id={}] Sending security capability response", self.node_id);
+        log::debug!(
+            "[node_id={}] Sending security capability response",
+            self.node_id
+        );
     }
 
     fn get_negotiated_security_scheme(&self) -> SecurityCapability {

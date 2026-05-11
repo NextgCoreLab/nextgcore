@@ -173,10 +173,9 @@ impl NsacfContext {
         if !self.initialized.load(Ordering::SeqCst) {
             return;
         }
-        if let (Ok(mut quota_list), Ok(mut snssai_hash)) = (
-            self.quota_list.write(),
-            self.snssai_hash.write(),
-        ) {
+        if let (Ok(mut quota_list), Ok(mut snssai_hash)) =
+            (self.quota_list.write(), self.snssai_hash.write())
+        {
             quota_list.clear();
             snssai_hash.clear();
         }
@@ -190,12 +189,20 @@ impl NsacfContext {
 
     // Quota management
 
-    pub fn quota_add(&self, s_nssai: SNssai, max_ues: u64, max_pdu_sessions: u64) -> Option<SliceQuota> {
+    pub fn quota_add(
+        &self,
+        s_nssai: SNssai,
+        max_ues: u64,
+        max_pdu_sessions: u64,
+    ) -> Option<SliceQuota> {
         let mut quota_list = self.quota_list.write().ok()?;
         let mut snssai_hash = self.snssai_hash.write().ok()?;
 
         if quota_list.len() >= self.max_quotas {
-            log::error!("Maximum number of slice quotas [{}] reached", self.max_quotas);
+            log::error!(
+                "Maximum number of slice quotas [{}] reached",
+                self.max_quotas
+            );
             return None;
         }
 
@@ -207,7 +214,10 @@ impl NsacfContext {
 
         log::info!(
             "Slice quota added: S-NSSAI[SST:{} SD:{:?}] max_ues={} max_pdu={}",
-            s_nssai.sst, s_nssai.sd, max_ues, max_pdu_sessions
+            s_nssai.sst,
+            s_nssai.sd,
+            max_ues,
+            max_pdu_sessions
         );
         Some(quota)
     }
@@ -239,7 +249,9 @@ impl NsacfContext {
             snssai_hash.remove(&(quota.s_nssai.sst, quota.s_nssai.sd));
             log::info!(
                 "Slice quota removed: id={} S-NSSAI[SST:{} SD:{:?}]",
-                id, quota.s_nssai.sst, quota.s_nssai.sd
+                id,
+                quota.s_nssai.sst,
+                quota.s_nssai.sd
             );
             true
         } else {
@@ -249,9 +261,15 @@ impl NsacfContext {
 
     /// Attempt to admit a UE to a slice (TS 23.502 4.2.9.2)
     pub fn admit_ue(&self, s_nssai: &SNssai) -> AdmissionResult {
-        let snssai_hash = self.snssai_hash.read().ok()
+        let snssai_hash = self
+            .snssai_hash
+            .read()
+            .ok()
             .unwrap_or_else(|| panic!("NSACF context lock poisoned"));
-        let quota_list = self.quota_list.read().ok()
+        let quota_list = self
+            .quota_list
+            .read()
+            .ok()
             .unwrap_or_else(|| panic!("NSACF context lock poisoned"));
 
         let quota_id = match snssai_hash.get(&(s_nssai.sst, s_nssai.sd)) {
@@ -259,7 +277,8 @@ impl NsacfContext {
             None => {
                 log::warn!(
                     "No quota configured for S-NSSAI[SST:{} SD:{:?}]",
-                    s_nssai.sst, s_nssai.sd
+                    s_nssai.sst,
+                    s_nssai.sd
                 );
                 return AdmissionResult::RejectedSliceNotAvailable;
             }
@@ -273,7 +292,8 @@ impl NsacfContext {
         if quota.register_ue() {
             log::debug!(
                 "UE admitted to S-NSSAI[SST:{} SD:{:?}] ({}/{})",
-                s_nssai.sst, s_nssai.sd,
+                s_nssai.sst,
+                s_nssai.sd,
                 quota.current_ues.load(Ordering::SeqCst),
                 quota.max_ues
             );
@@ -281,7 +301,8 @@ impl NsacfContext {
         } else {
             log::warn!(
                 "UE rejected from S-NSSAI[SST:{} SD:{:?}] - quota exceeded ({}/{})",
-                s_nssai.sst, s_nssai.sd,
+                s_nssai.sst,
+                s_nssai.sd,
                 quota.current_ues.load(Ordering::SeqCst),
                 quota.max_ues
             );
@@ -325,7 +346,8 @@ impl Default for NsacfContext {
 }
 
 /// Global NSACF context (thread-safe singleton)
-static GLOBAL_NSACF_CONTEXT: std::sync::OnceLock<Arc<RwLock<NsacfContext>>> = std::sync::OnceLock::new();
+static GLOBAL_NSACF_CONTEXT: std::sync::OnceLock<Arc<RwLock<NsacfContext>>> =
+    std::sync::OnceLock::new();
 
 /// Get the global NSACF context
 pub fn nsacf_self() -> Arc<RwLock<NsacfContext>> {
@@ -407,7 +429,10 @@ mod tests {
 
         assert_eq!(ctx.admit_ue(&s_nssai), AdmissionResult::Admitted);
         assert_eq!(ctx.admit_ue(&s_nssai), AdmissionResult::Admitted);
-        assert_eq!(ctx.admit_ue(&s_nssai), AdmissionResult::RejectedQuotaExceeded);
+        assert_eq!(
+            ctx.admit_ue(&s_nssai),
+            AdmissionResult::RejectedQuotaExceeded
+        );
     }
 
     #[test]
@@ -430,7 +455,10 @@ mod tests {
 
         ctx.admit_ue(&s_nssai);
         ctx.admit_ue(&s_nssai);
-        assert_eq!(ctx.admit_ue(&s_nssai), AdmissionResult::RejectedQuotaExceeded);
+        assert_eq!(
+            ctx.admit_ue(&s_nssai),
+            AdmissionResult::RejectedQuotaExceeded
+        );
 
         ctx.release_ue(&s_nssai);
         assert_eq!(ctx.admit_ue(&s_nssai), AdmissionResult::Admitted);

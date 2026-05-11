@@ -2,10 +2,10 @@
 //!
 //! Message structures and encoding/decoding for GTPv2-C protocol.
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use crate::error::{GtpError, GtpResult};
 use super::header::{Gtp2Header, Gtp2MessageType};
 use super::ie::{Gtp2Ie, Gtp2IeType};
+use crate::error::{GtpError, GtpResult};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// GTPv2-C Message
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,25 +27,20 @@ impl Gtp2Message {
 
     /// Create an Echo Request message
     pub fn echo_request(sequence_number: u32) -> Self {
-        let header = Gtp2Header::new_no_teid(
-            Gtp2MessageType::EchoRequest as u8,
-            sequence_number,
-        );
+        let header = Gtp2Header::new_no_teid(Gtp2MessageType::EchoRequest as u8, sequence_number);
         Self::new(header)
     }
 
     /// Create an Echo Response message
     pub fn echo_response(sequence_number: u32, recovery: u8) -> Self {
-        let header = Gtp2Header::new_no_teid(
-            Gtp2MessageType::EchoResponse as u8,
-            sequence_number,
-        );
+        let header = Gtp2Header::new_no_teid(Gtp2MessageType::EchoResponse as u8, sequence_number);
         let mut msg = Self::new(header);
 
         // Add Recovery IE
         let mut ie_buf = BytesMut::new();
         ie_buf.put_u8(recovery);
-        msg.ies.push(Gtp2Ie::from_slice(Gtp2IeType::Recovery as u8, 0, &ie_buf));
+        msg.ies
+            .push(Gtp2Ie::from_slice(Gtp2IeType::Recovery as u8, 0, &ie_buf));
 
         msg
     }
@@ -57,7 +52,9 @@ impl Gtp2Message {
 
     /// Get an IE by type and instance
     pub fn get_ie(&self, ie_type: u8, instance: u8) -> Option<&Gtp2Ie> {
-        self.ies.iter().find(|ie| ie.ie_type == ie_type && ie.instance == instance)
+        self.ies
+            .iter()
+            .find(|ie| ie.ie_type == ie_type && ie.instance == instance)
     }
 
     /// Get first IE by type (any instance)
@@ -768,7 +765,10 @@ mod tests {
         let mut bytes = encoded.freeze();
         let decoded = Gtp2Message::decode(&mut bytes).unwrap();
 
-        assert_eq!(decoded.header.message_type, Gtp2MessageType::EchoRequest as u8);
+        assert_eq!(
+            decoded.header.message_type,
+            Gtp2MessageType::EchoRequest as u8
+        );
         assert!(!decoded.header.teid_presence);
         assert_eq!(decoded.header.sequence_number, 0x123456);
     }
@@ -781,7 +781,10 @@ mod tests {
         let mut bytes = encoded.freeze();
         let decoded = Gtp2Message::decode(&mut bytes).unwrap();
 
-        assert_eq!(decoded.header.message_type, Gtp2MessageType::EchoResponse as u8);
+        assert_eq!(
+            decoded.header.message_type,
+            Gtp2MessageType::EchoResponse as u8
+        );
         assert!(!decoded.header.teid_presence);
 
         let recovery_ie = decoded.get_ie_by_type(Gtp2IeType::Recovery as u8).unwrap();
@@ -797,7 +800,10 @@ mod tests {
         let mut bytes = encoded.freeze();
         let decoded = Gtp2Message::decode(&mut bytes).unwrap();
 
-        assert_eq!(decoded.header.message_type, Gtp2MessageType::CreateSessionRequest as u8);
+        assert_eq!(
+            decoded.header.message_type,
+            Gtp2MessageType::CreateSessionRequest as u8
+        );
         assert_eq!(decoded.header.teid, Some(0x12345678));
         assert_eq!(decoded.header.sequence_number, 0x123456);
         assert_eq!(decoded.ies.len(), 1);

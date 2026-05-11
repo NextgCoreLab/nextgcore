@@ -284,11 +284,7 @@ pub fn create_str(
 }
 
 /// Add Subscription-Id AVP to message
-pub fn add_subscription_id(
-    msg: &mut DiameterMessage,
-    id_type: SubscriptionIdType,
-    id_data: &str,
-) {
+pub fn add_subscription_id(msg: &mut DiameterMessage, id_type: SubscriptionIdType, id_data: &str) {
     let grouped = vec![
         Avp::mandatory(
             avp::SUBSCRIPTION_ID_TYPE,

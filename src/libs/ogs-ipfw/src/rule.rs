@@ -5,10 +5,10 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
 /// Compile a flow description string into an IPFW rule
-/// 
+///
 /// Flow description format:
 /// `permit out <proto> from <src_addr> [<src_port>] to <dst_addr> [<dst_port>]`
-/// 
+///
 /// Examples:
 /// - `permit out ip from any to any`
 /// - `permit out 17 from 10.0.0.1 to 192.168.1.1 80`
@@ -18,7 +18,9 @@ pub fn compile_rule(flow_description: &str) -> IpfwResult<IpfwRule> {
     let tokens: Vec<&str> = flow_description.split_whitespace().collect();
 
     if tokens.is_empty() {
-        return Err(IpfwError::InvalidSyntax("Empty flow description".to_string()));
+        return Err(IpfwError::InvalidSyntax(
+            "Empty flow description".to_string(),
+        ));
     }
 
     // Check for "permit" keyword

@@ -201,10 +201,7 @@ pub fn build_session_report_request(
     sess: &SgwuSess,
     report: &UserPlaneReport,
 ) -> Option<PfcpMessage> {
-    let mut msg = PfcpMessage::new(
-        pfcp_type::SESSION_REPORT_REQUEST,
-        sess.sgwc_sxa_f_seid.seid,
-    );
+    let mut msg = PfcpMessage::new(pfcp_type::SESSION_REPORT_REQUEST, sess.sgwc_sxa_f_seid.seid);
 
     let mut data = Vec::new();
 
@@ -285,12 +282,12 @@ fn build_node_id_ie(data: &mut Vec<u8>) {
     // IE Length placeholder (2 bytes) - will be filled with actual length
     let len_pos = data.len();
     data.extend_from_slice(&0u16.to_be_bytes());
-    
+
     // Node ID Type: 0 = IPv4, 1 = IPv6, 2 = FQDN
     data.push(0); // IPv4 type
-    // IPv4 address (placeholder - would be actual local address)
+                  // IPv4 address (placeholder - would be actual local address)
     data.extend_from_slice(&[127, 0, 0, 1]);
-    
+
     // Update length
     let ie_len = (data.len() - len_pos - 2) as u16;
     data[len_pos..len_pos + 2].copy_from_slice(&ie_len.to_be_bytes());
@@ -313,14 +310,14 @@ fn build_f_seid_ie(data: &mut Vec<u8>, seid: u64) {
     // IE Length placeholder
     let len_pos = data.len();
     data.extend_from_slice(&0u16.to_be_bytes());
-    
+
     // Flags: bit 0 = V4, bit 1 = V6
     data.push(0x02); // V4 flag set
-    // SEID (8 bytes)
+                     // SEID (8 bytes)
     data.extend_from_slice(&seid.to_be_bytes());
     // IPv4 address (placeholder)
     data.extend_from_slice(&[127, 0, 0, 1]);
-    
+
     // Update length
     let ie_len = (data.len() - len_pos - 2) as u16;
     data[len_pos..len_pos + 2].copy_from_slice(&ie_len.to_be_bytes());
@@ -333,17 +330,17 @@ fn build_created_pdr_ie(data: &mut Vec<u8>, created_pdr: &CreatedPdr) {
     // IE Length placeholder
     let len_pos = data.len();
     data.extend_from_slice(&0u16.to_be_bytes());
-    
+
     // PDR ID (nested IE)
     data.extend_from_slice(&pfcp_ie::PDR_ID.to_be_bytes());
     data.extend_from_slice(&2u16.to_be_bytes());
     data.extend_from_slice(&created_pdr.pdr_id.to_be_bytes());
-    
+
     // Local F-TEID (if present)
     if let Some(ref f_teid) = created_pdr.local_f_teid {
         build_f_teid_ie(data, f_teid);
     }
-    
+
     // Update length
     let ie_len = (data.len() - len_pos - 2) as u16;
     data[len_pos..len_pos + 2].copy_from_slice(&ie_len.to_be_bytes());
@@ -356,7 +353,7 @@ fn build_f_teid_ie(data: &mut Vec<u8>, f_teid: &LocalFTeid) {
     // IE Length placeholder
     let len_pos = data.len();
     data.extend_from_slice(&0u16.to_be_bytes());
-    
+
     // Flags
     let mut flags = 0u8;
     if f_teid.ipv4.is_some() {
@@ -366,20 +363,20 @@ fn build_f_teid_ie(data: &mut Vec<u8>, f_teid: &LocalFTeid) {
         flags |= 0x02; // V6
     }
     data.push(flags);
-    
+
     // TEID (4 bytes)
     data.extend_from_slice(&f_teid.teid.to_be_bytes());
-    
+
     // IPv4 address
     if let Some(ipv4) = f_teid.ipv4 {
         data.extend_from_slice(&ipv4.octets());
     }
-    
+
     // IPv6 address
     if let Some(ipv6) = f_teid.ipv6 {
         data.extend_from_slice(&ipv6.octets());
     }
-    
+
     // Update length
     let ie_len = (data.len() - len_pos - 2) as u16;
     data[len_pos..len_pos + 2].copy_from_slice(&ie_len.to_be_bytes());
@@ -402,14 +399,14 @@ fn build_downlink_data_report_ie(data: &mut Vec<u8>, report: &UserPlaneReport) {
     // IE Length placeholder
     let len_pos = data.len();
     data.extend_from_slice(&0u16.to_be_bytes());
-    
+
     // PDR ID (if present)
     if let Some(pdr_id) = report.pdr_id {
         data.extend_from_slice(&pfcp_ie::PDR_ID.to_be_bytes());
         data.extend_from_slice(&2u16.to_be_bytes());
         data.extend_from_slice(&pdr_id.to_be_bytes());
     }
-    
+
     // Update length
     let ie_len = (data.len() - len_pos - 2) as u16;
     data[len_pos..len_pos + 2].copy_from_slice(&ie_len.to_be_bytes());
@@ -422,12 +419,12 @@ fn build_error_indication_report_ie(data: &mut Vec<u8>, report: &UserPlaneReport
     // IE Length placeholder
     let len_pos = data.len();
     data.extend_from_slice(&0u16.to_be_bytes());
-    
+
     // Remote F-TEID (if present)
     if let Some(ref f_teid) = report.remote_f_teid {
         build_f_teid_ie(data, f_teid);
     }
-    
+
     // Update length
     let ie_len = (data.len() - len_pos - 2) as u16;
     data[len_pos..len_pos + 2].copy_from_slice(&ie_len.to_be_bytes());
@@ -460,16 +457,14 @@ mod tests {
             ..Default::default()
         };
 
-        let created_pdrs = vec![
-            CreatedPdr {
-                pdr_id: 1,
-                local_f_teid: Some(LocalFTeid {
-                    teid: 0x12345678,
-                    ipv4: Some(Ipv4Addr::new(192, 168, 1, 1)),
-                    ipv6: None,
-                }),
-            },
-        ];
+        let created_pdrs = vec![CreatedPdr {
+            pdr_id: 1,
+            local_f_teid: Some(LocalFTeid {
+                teid: 0x12345678,
+                ipv4: Some(Ipv4Addr::new(192, 168, 1, 1)),
+                ipv6: None,
+            }),
+        }];
 
         let msg = build_session_establishment_response(&sess, &created_pdrs).unwrap();
         assert_eq!(msg.msg_type, pfcp_type::SESSION_ESTABLISHMENT_RESPONSE);

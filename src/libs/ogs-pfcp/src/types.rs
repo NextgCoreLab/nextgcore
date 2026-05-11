@@ -2,8 +2,8 @@
 //!
 //! Types and constants for PFCP protocol as specified in 3GPP TS 29.244.
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::error::{PfcpError, PfcpResult};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// PFCP Version
 pub const PFCP_VERSION: u8 = 1;
@@ -299,7 +299,6 @@ impl NodeId {
     }
 }
 
-
 /// F-SEID (Fully Qualified SEID) structure
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FSeid {
@@ -397,13 +396,12 @@ impl FSeid {
     }
 }
 
-
 /// F-TEID (Fully Qualified TEID) structure
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FTeid {
     pub ipv4: bool,
     pub ipv6: bool,
-    pub ch: bool,  // CHOOSE bit
+    pub ch: bool,   // CHOOSE bit
     pub chid: bool, // CHOOSE ID bit
     pub teid: u32,
     pub ipv4_addr: Option<[u8; 4]>,
@@ -456,8 +454,10 @@ impl FTeid {
 
     /// Encode to bytes
     pub fn encode(&self, buf: &mut BytesMut) {
-        let flags = ((self.chid as u8) << 3) | ((self.ch as u8) << 2) 
-            | ((self.ipv6 as u8) << 1) | (self.ipv4 as u8);
+        let flags = ((self.chid as u8) << 3)
+            | ((self.ch as u8) << 2)
+            | ((self.ipv6 as u8) << 1)
+            | (self.ipv4 as u8);
         buf.put_u8(flags);
         buf.put_u32(self.teid);
         if let Some(addr) = &self.ipv4_addr {
@@ -539,16 +539,15 @@ impl FTeid {
     }
 }
 
-
 /// UE IP Address structure
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UeIpAddress {
     pub ipv4: bool,
     pub ipv6: bool,
-    pub sd: bool,  // Source/Destination flag
+    pub sd: bool,    // Source/Destination flag
     pub ipv6d: bool, // IPv6 prefix delegation
-    pub chv4: bool, // CHOOSE IPv4
-    pub chv6: bool, // CHOOSE IPv6
+    pub chv4: bool,  // CHOOSE IPv4
+    pub chv6: bool,  // CHOOSE IPv6
     pub ipv4_addr: Option<[u8; 4]>,
     pub ipv6_addr: Option<[u8; 16]>,
     pub ipv6_prefix_delegation_bits: Option<u8>,
@@ -590,9 +589,12 @@ impl UeIpAddress {
 
     /// Encode to bytes
     pub fn encode(&self, buf: &mut BytesMut) {
-        let flags = ((self.chv6 as u8) << 5) | ((self.chv4 as u8) << 4)
-            | ((self.ipv6d as u8) << 3) | ((self.sd as u8) << 2)
-            | ((self.ipv6 as u8) << 1) | (self.ipv4 as u8);
+        let flags = ((self.chv6 as u8) << 5)
+            | ((self.chv4 as u8) << 4)
+            | ((self.ipv6d as u8) << 3)
+            | ((self.sd as u8) << 2)
+            | ((self.ipv6 as u8) << 1)
+            | (self.ipv4 as u8);
         buf.put_u8(flags);
         if let Some(addr) = &self.ipv4_addr {
             buf.put_slice(addr);
@@ -679,46 +681,59 @@ impl UeIpAddress {
     }
 }
 
-
 /// Apply Action flags
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ApplyAction {
     pub drop: bool,
-    pub forw: bool,  // Forward
-    pub buff: bool,  // Buffer
-    pub nocp: bool,  // Notify CP function
-    pub dupl: bool,  // Duplicate
-    pub ipma: bool,  // IP Multicast Accept
-    pub ipmd: bool,  // IP Multicast Deny
-    pub dfrt: bool,  // Duplicate for Redundant Transmission
-    pub edrt: bool,  // Eliminate Duplicate for Redundant Transmission
-    pub bdpn: bool,  // Buffered Downlink Packet Notification
-    pub ddpn: bool,  // Discarded Downlink Packet Notification
+    pub forw: bool, // Forward
+    pub buff: bool, // Buffer
+    pub nocp: bool, // Notify CP function
+    pub dupl: bool, // Duplicate
+    pub ipma: bool, // IP Multicast Accept
+    pub ipmd: bool, // IP Multicast Deny
+    pub dfrt: bool, // Duplicate for Redundant Transmission
+    pub edrt: bool, // Eliminate Duplicate for Redundant Transmission
+    pub bdpn: bool, // Buffered Downlink Packet Notification
+    pub ddpn: bool, // Discarded Downlink Packet Notification
 }
 
 impl ApplyAction {
     /// Create DROP action
     pub fn drop() -> Self {
-        Self { drop: true, ..Default::default() }
+        Self {
+            drop: true,
+            ..Default::default()
+        }
     }
 
     /// Create FORWARD action
     pub fn forward() -> Self {
-        Self { forw: true, ..Default::default() }
+        Self {
+            forw: true,
+            ..Default::default()
+        }
     }
 
     /// Create BUFFER action
     pub fn buffer() -> Self {
-        Self { buff: true, ..Default::default() }
+        Self {
+            buff: true,
+            ..Default::default()
+        }
     }
 
     /// Encode to bytes (2 bytes)
     pub fn encode(&self) -> u16 {
-        ((self.ddpn as u16) << 10) | ((self.bdpn as u16) << 9)
-            | ((self.edrt as u16) << 8) | ((self.dfrt as u16) << 7)
-            | ((self.ipmd as u16) << 6) | ((self.ipma as u16) << 5)
-            | ((self.dupl as u16) << 4) | ((self.nocp as u16) << 3)
-            | ((self.buff as u16) << 2) | ((self.forw as u16) << 1)
+        ((self.ddpn as u16) << 10)
+            | ((self.bdpn as u16) << 9)
+            | ((self.edrt as u16) << 8)
+            | ((self.dfrt as u16) << 7)
+            | ((self.ipmd as u16) << 6)
+            | ((self.ipma as u16) << 5)
+            | ((self.dupl as u16) << 4)
+            | ((self.nocp as u16) << 3)
+            | ((self.buff as u16) << 2)
+            | ((self.forw as u16) << 1)
             | (self.drop as u16)
     }
 
@@ -808,7 +823,6 @@ impl OuterHeaderRemoval {
         })
     }
 }
-
 
 /// Outer Header Creation description
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -999,21 +1013,26 @@ impl OuterHeaderCreation {
     }
 }
 
-
 /// Gate Status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GateStatus {
-    pub ul_gate: bool,  // true = open, false = closed
-    pub dl_gate: bool,  // true = open, false = closed
+    pub ul_gate: bool, // true = open, false = closed
+    pub dl_gate: bool, // true = open, false = closed
 }
 
 impl GateStatus {
     pub fn both_open() -> Self {
-        Self { ul_gate: true, dl_gate: true }
+        Self {
+            ul_gate: true,
+            dl_gate: true,
+        }
     }
 
     pub fn both_closed() -> Self {
-        Self { ul_gate: false, dl_gate: false }
+        Self {
+            ul_gate: false,
+            dl_gate: false,
+        }
     }
 
     pub fn encode(&self) -> u8 {
@@ -1033,8 +1052,8 @@ impl GateStatus {
 /// Bitrate structure (MBR/GBR)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Bitrate {
-    pub uplink: u64,    // bits per second
-    pub downlink: u64,  // bits per second
+    pub uplink: u64,   // bits per second
+    pub downlink: u64, // bits per second
 }
 
 impl Bitrate {
@@ -1047,7 +1066,7 @@ impl Bitrate {
         // Convert bps to kbps, rounding up
         let ul_kbps = (self.uplink / 1000) + if self.uplink % 1000 != 0 { 1 } else { 0 };
         let dl_kbps = (self.downlink / 1000) + if self.downlink % 1000 != 0 { 1 } else { 0 };
-        
+
         // Write as 5-byte big-endian values
         buf.put_u8((ul_kbps >> 32) as u8);
         buf.put_u32(ul_kbps as u32);
@@ -1066,11 +1085,11 @@ impl Bitrate {
         let ul_high = buf.get_u8() as u64;
         let ul_low = buf.get_u32() as u64;
         let ul_kbps = (ul_high << 32) | ul_low;
-        
+
         let dl_high = buf.get_u8() as u64;
         let dl_low = buf.get_u32() as u64;
         let dl_kbps = (dl_high << 32) | dl_low;
-        
+
         Ok(Self {
             uplink: ul_kbps * 1000,
             downlink: dl_kbps * 1000,
@@ -1081,9 +1100,9 @@ impl Bitrate {
 /// Volume Threshold/Quota structure
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VolumeThreshold {
-    pub tovol: bool,  // Total Volume present
-    pub ulvol: bool,  // Uplink Volume present
-    pub dlvol: bool,  // Downlink Volume present
+    pub tovol: bool, // Total Volume present
+    pub ulvol: bool, // Uplink Volume present
+    pub dlvol: bool, // Downlink Volume present
     pub total_volume: u64,
     pub uplink_volume: u64,
     pub downlink_volume: u64,
@@ -1171,16 +1190,15 @@ impl VolumeThreshold {
     }
 }
 
-
 /// Volume Measurement structure
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VolumeMeasurement {
     pub tovol: bool,
     pub ulvol: bool,
     pub dlvol: bool,
-    pub tonop: bool,  // Total Number of Packets
-    pub ulnop: bool,  // Uplink Number of Packets
-    pub dlnop: bool,  // Downlink Number of Packets
+    pub tonop: bool, // Total Number of Packets
+    pub ulnop: bool, // Uplink Number of Packets
+    pub dlnop: bool, // Downlink Number of Packets
     pub total_volume: u64,
     pub uplink_volume: u64,
     pub downlink_volume: u64,
@@ -1191,16 +1209,31 @@ pub struct VolumeMeasurement {
 
 impl VolumeMeasurement {
     pub fn encode(&self, buf: &mut BytesMut) {
-        let flags = ((self.dlnop as u8) << 5) | ((self.ulnop as u8) << 4)
-            | ((self.tonop as u8) << 3) | ((self.dlvol as u8) << 2)
-            | ((self.ulvol as u8) << 1) | (self.tovol as u8);
+        let flags = ((self.dlnop as u8) << 5)
+            | ((self.ulnop as u8) << 4)
+            | ((self.tonop as u8) << 3)
+            | ((self.dlvol as u8) << 2)
+            | ((self.ulvol as u8) << 1)
+            | (self.tovol as u8);
         buf.put_u8(flags);
-        if self.tovol { buf.put_u64(self.total_volume); }
-        if self.ulvol { buf.put_u64(self.uplink_volume); }
-        if self.dlvol { buf.put_u64(self.downlink_volume); }
-        if self.tonop { buf.put_u64(self.total_n_packets); }
-        if self.ulnop { buf.put_u64(self.uplink_n_packets); }
-        if self.dlnop { buf.put_u64(self.downlink_n_packets); }
+        if self.tovol {
+            buf.put_u64(self.total_volume);
+        }
+        if self.ulvol {
+            buf.put_u64(self.uplink_volume);
+        }
+        if self.dlvol {
+            buf.put_u64(self.downlink_volume);
+        }
+        if self.tonop {
+            buf.put_u64(self.total_n_packets);
+        }
+        if self.ulnop {
+            buf.put_u64(self.uplink_n_packets);
+        }
+        if self.dlnop {
+            buf.put_u64(self.downlink_n_packets);
+        }
     }
 
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
@@ -1220,12 +1253,24 @@ impl VolumeMeasurement {
             dlnop: (flags >> 5) & 0x01 != 0,
             ..Default::default()
         };
-        if result.tovol { result.total_volume = buf.get_u64(); }
-        if result.ulvol { result.uplink_volume = buf.get_u64(); }
-        if result.dlvol { result.downlink_volume = buf.get_u64(); }
-        if result.tonop { result.total_n_packets = buf.get_u64(); }
-        if result.ulnop { result.uplink_n_packets = buf.get_u64(); }
-        if result.dlnop { result.downlink_n_packets = buf.get_u64(); }
+        if result.tovol {
+            result.total_volume = buf.get_u64();
+        }
+        if result.ulvol {
+            result.uplink_volume = buf.get_u64();
+        }
+        if result.dlvol {
+            result.downlink_volume = buf.get_u64();
+        }
+        if result.tonop {
+            result.total_n_packets = buf.get_u64();
+        }
+        if result.ulnop {
+            result.uplink_n_packets = buf.get_u64();
+        }
+        if result.dlnop {
+            result.downlink_n_packets = buf.get_u64();
+        }
         Ok(result)
     }
 }
@@ -1233,47 +1278,83 @@ impl VolumeMeasurement {
 /// Reporting Triggers
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ReportingTriggers {
-    pub perio: bool,  // Periodic Reporting
-    pub volth: bool,  // Volume Threshold
-    pub timth: bool,  // Time Threshold
-    pub quhti: bool,  // Quota Holding Time
-    pub start: bool,  // Start of Traffic
-    pub stopt: bool,  // Stop of Traffic
-    pub droth: bool,  // Dropped DL Traffic Threshold
-    pub liusa: bool,  // Linked Usage Reporting
-    pub volqu: bool,  // Volume Quota
-    pub timqu: bool,  // Time Quota
-    pub envcl: bool,  // Envelope Closure
-    pub macar: bool,  // MAC Addresses Reporting
-    pub eveth: bool,  // Event Threshold
-    pub evequ: bool,  // Event Quota
-    pub ipmjl: bool,  // IP Multicast Join/Leave
-    pub quvti: bool,  // Quota Validity Time
-    pub reemr: bool,  // REport the End Marker Reception
-    pub upint: bool,  // User Plane Inactivity Timer
+    pub perio: bool, // Periodic Reporting
+    pub volth: bool, // Volume Threshold
+    pub timth: bool, // Time Threshold
+    pub quhti: bool, // Quota Holding Time
+    pub start: bool, // Start of Traffic
+    pub stopt: bool, // Stop of Traffic
+    pub droth: bool, // Dropped DL Traffic Threshold
+    pub liusa: bool, // Linked Usage Reporting
+    pub volqu: bool, // Volume Quota
+    pub timqu: bool, // Time Quota
+    pub envcl: bool, // Envelope Closure
+    pub macar: bool, // MAC Addresses Reporting
+    pub eveth: bool, // Event Threshold
+    pub evequ: bool, // Event Quota
+    pub ipmjl: bool, // IP Multicast Join/Leave
+    pub quvti: bool, // Quota Validity Time
+    pub reemr: bool, // REport the End Marker Reception
+    pub upint: bool, // User Plane Inactivity Timer
 }
 
 impl ReportingTriggers {
     pub fn encode(&self) -> u32 {
         let mut val: u32 = 0;
-        if self.perio { val |= 1 << 0; }
-        if self.volth { val |= 1 << 1; }
-        if self.timth { val |= 1 << 2; }
-        if self.quhti { val |= 1 << 3; }
-        if self.start { val |= 1 << 4; }
-        if self.stopt { val |= 1 << 5; }
-        if self.droth { val |= 1 << 6; }
-        if self.liusa { val |= 1 << 7; }
-        if self.volqu { val |= 1 << 8; }
-        if self.timqu { val |= 1 << 9; }
-        if self.envcl { val |= 1 << 10; }
-        if self.macar { val |= 1 << 11; }
-        if self.eveth { val |= 1 << 12; }
-        if self.evequ { val |= 1 << 13; }
-        if self.ipmjl { val |= 1 << 14; }
-        if self.quvti { val |= 1 << 15; }
-        if self.reemr { val |= 1 << 16; }
-        if self.upint { val |= 1 << 17; }
+        if self.perio {
+            val |= 1 << 0;
+        }
+        if self.volth {
+            val |= 1 << 1;
+        }
+        if self.timth {
+            val |= 1 << 2;
+        }
+        if self.quhti {
+            val |= 1 << 3;
+        }
+        if self.start {
+            val |= 1 << 4;
+        }
+        if self.stopt {
+            val |= 1 << 5;
+        }
+        if self.droth {
+            val |= 1 << 6;
+        }
+        if self.liusa {
+            val |= 1 << 7;
+        }
+        if self.volqu {
+            val |= 1 << 8;
+        }
+        if self.timqu {
+            val |= 1 << 9;
+        }
+        if self.envcl {
+            val |= 1 << 10;
+        }
+        if self.macar {
+            val |= 1 << 11;
+        }
+        if self.eveth {
+            val |= 1 << 12;
+        }
+        if self.evequ {
+            val |= 1 << 13;
+        }
+        if self.ipmjl {
+            val |= 1 << 14;
+        }
+        if self.quvti {
+            val |= 1 << 15;
+        }
+        if self.reemr {
+            val |= 1 << 16;
+        }
+        if self.upint {
+            val |= 1 << 17;
+        }
         val
     }
 
@@ -1304,20 +1385,23 @@ impl ReportingTriggers {
 /// Report Type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ReportType {
-    pub dldr: bool,  // Downlink Data Report
-    pub usar: bool,  // Usage Report
-    pub erir: bool,  // Error Indication Report
-    pub upir: bool,  // User Plane Inactivity Report
-    pub tmir: bool,  // TSC Management Information Report
-    pub sesr: bool,  // Session Report
-    pub uisr: bool,  // UE IP address usage Information Report
+    pub dldr: bool, // Downlink Data Report
+    pub usar: bool, // Usage Report
+    pub erir: bool, // Error Indication Report
+    pub upir: bool, // User Plane Inactivity Report
+    pub tmir: bool, // TSC Management Information Report
+    pub sesr: bool, // Session Report
+    pub uisr: bool, // UE IP address usage Information Report
 }
 
 impl ReportType {
     pub fn encode(&self) -> u8 {
-        ((self.uisr as u8) << 6) | ((self.sesr as u8) << 5)
-            | ((self.tmir as u8) << 4) | ((self.upir as u8) << 3)
-            | ((self.erir as u8) << 2) | ((self.usar as u8) << 1)
+        ((self.uisr as u8) << 6)
+            | ((self.sesr as u8) << 5)
+            | ((self.tmir as u8) << 4)
+            | ((self.upir as u8) << 3)
+            | ((self.erir as u8) << 2)
+            | ((self.usar as u8) << 1)
             | (self.dldr as u8)
     }
 
@@ -1334,87 +1418,100 @@ impl ReportType {
     }
 }
 
-
 /// UP Function Features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UpFunctionFeatures {
-    pub bucp: bool,   // Downlink Data Buffering in CP function
-    pub ddnd: bool,   // Buffered Downlink Data Notification Delay
-    pub dlbd: bool,   // DL Buffering Duration
-    pub trst: bool,   // Traffic Steering
-    pub ftup: bool,   // F-TEID allocation/release in the UP function
-    pub pfdm: bool,   // PFD Management procedure
-    pub heeu: bool,   // Header Enrichment of Uplink traffic
-    pub treu: bool,   // Traffic Redirection Enforcement in the UP function
-    pub empu: bool,   // Sending End Marker packets supported by UP function
-    pub pdiu: bool,   // Support of PDI optimised signalling
-    pub udbc: bool,   // Support of UL/DL Buffering Control
-    pub quoac: bool,  // Support of Quota Action
-    pub trace: bool,  // Support of Trace
-    pub frrt: bool,   // Support of Framed Routing
-    pub pfde: bool,   // Support of PFD for Ethernet
-    pub epfar: bool,  // Support of Extended PDR for Ethernet
-    pub dpdra: bool,  // Support of Deferred PDR Activation
-    pub adpdp: bool,  // Support of Activation and Deactivation of Pre-defined PDRs
-    pub ueip: bool,   // Support of UE IP address allocation
-    pub sset: bool,   // Support of PFCP sessions successively controlled by different SMFs
-    pub mnop: bool,   // Support of Measurement of Number of Packets
-    pub mte: bool,    // Support of Measurement of Time
-    pub bundl: bool,  // Support of PFCP Session Bundling
-    pub gcom: bool,   // Support of 5G VN Group Communication
-    pub mpas: bool,   // Support of Multiple PFCP Associations
-    pub rttl: bool,   // Support of Redundant Transmission at Transport Layer
-    pub vtime: bool,  // Support of quota validity time
-    pub norp: bool,   // Support of Number of Reports
-    pub iptv: bool,   // Support of IPTV
-    pub ip6pl: bool,  // Support of IPv6 prefix length
-    pub tscu: bool,   // Support of Time Sensitive Communication
-    pub mptcp: bool,  // Support of MPTCP Proxy functionality
+    pub bucp: bool,     // Downlink Data Buffering in CP function
+    pub ddnd: bool,     // Buffered Downlink Data Notification Delay
+    pub dlbd: bool,     // DL Buffering Duration
+    pub trst: bool,     // Traffic Steering
+    pub ftup: bool,     // F-TEID allocation/release in the UP function
+    pub pfdm: bool,     // PFD Management procedure
+    pub heeu: bool,     // Header Enrichment of Uplink traffic
+    pub treu: bool,     // Traffic Redirection Enforcement in the UP function
+    pub empu: bool,     // Sending End Marker packets supported by UP function
+    pub pdiu: bool,     // Support of PDI optimised signalling
+    pub udbc: bool,     // Support of UL/DL Buffering Control
+    pub quoac: bool,    // Support of Quota Action
+    pub trace: bool,    // Support of Trace
+    pub frrt: bool,     // Support of Framed Routing
+    pub pfde: bool,     // Support of PFD for Ethernet
+    pub epfar: bool,    // Support of Extended PDR for Ethernet
+    pub dpdra: bool,    // Support of Deferred PDR Activation
+    pub adpdp: bool,    // Support of Activation and Deactivation of Pre-defined PDRs
+    pub ueip: bool,     // Support of UE IP address allocation
+    pub sset: bool,     // Support of PFCP sessions successively controlled by different SMFs
+    pub mnop: bool,     // Support of Measurement of Number of Packets
+    pub mte: bool,      // Support of Measurement of Time
+    pub bundl: bool,    // Support of PFCP Session Bundling
+    pub gcom: bool,     // Support of 5G VN Group Communication
+    pub mpas: bool,     // Support of Multiple PFCP Associations
+    pub rttl: bool,     // Support of Redundant Transmission at Transport Layer
+    pub vtime: bool,    // Support of quota validity time
+    pub norp: bool,     // Support of Number of Reports
+    pub iptv: bool,     // Support of IPTV
+    pub ip6pl: bool,    // Support of IPv6 prefix length
+    pub tscu: bool,     // Support of Time Sensitive Communication
+    pub mptcp: bool,    // Support of MPTCP Proxy functionality
     pub atsss_ll: bool, // Support of ATSSS-LL steering functionality
-    pub qfqm: bool,   // Support of per QoS flow per UE QoS monitoring
-    pub gpqm: bool,   // Support of per GTP-U Path QoS monitoring
-    pub mt_edt: bool, // Support of MT-EDT
-    pub ciot: bool,   // Support of CIoT
-    pub ethar: bool,  // Support of Ethernet Address Reporting
-    pub ddds: bool,   // Support of Downlink Data Delivery Status
-    pub rds: bool,    // Support of Reliable Data Service
-    pub rttwp: bool,  // Support of RTT measurement without PMF
-    pub quasf: bool,  // Support of Quota Action to apply when SMF is restored
-    pub nspoc: bool,  // Support of Notify Start of Pause of Charging
-    pub l2tp: bool,   // Support of L2TP
-    pub upber: bool,  // Support of UP function sending of Buffer Error Report
-    pub resps: bool,  // Support of Restoration of PFCP Session association
-    pub iprep: bool,  // Support of IP Address and Port number Replacement
-    pub dnsts: bool,  // Support of DNS Server Address Reporting
-    pub drqos: bool,  // Support of Direct Reporting of QoS monitoring events
-    pub mbsn4: bool,  // Support of MBS N4
-    pub psuprm: bool, // Support of Per Slice UP Resource Management
-    pub eppi: bool,   // Support of Enhanced PDI for Paging Policy Indication
+    pub qfqm: bool,     // Support of per QoS flow per UE QoS monitoring
+    pub gpqm: bool,     // Support of per GTP-U Path QoS monitoring
+    pub mt_edt: bool,   // Support of MT-EDT
+    pub ciot: bool,     // Support of CIoT
+    pub ethar: bool,    // Support of Ethernet Address Reporting
+    pub ddds: bool,     // Support of Downlink Data Delivery Status
+    pub rds: bool,      // Support of Reliable Data Service
+    pub rttwp: bool,    // Support of RTT measurement without PMF
+    pub quasf: bool,    // Support of Quota Action to apply when SMF is restored
+    pub nspoc: bool,    // Support of Notify Start of Pause of Charging
+    pub l2tp: bool,     // Support of L2TP
+    pub upber: bool,    // Support of UP function sending of Buffer Error Report
+    pub resps: bool,    // Support of Restoration of PFCP Session association
+    pub iprep: bool,    // Support of IP Address and Port number Replacement
+    pub dnsts: bool,    // Support of DNS Server Address Reporting
+    pub drqos: bool,    // Support of Direct Reporting of QoS monitoring events
+    pub mbsn4: bool,    // Support of MBS N4
+    pub psuprm: bool,   // Support of Per Slice UP Resource Management
+    pub eppi: bool,     // Support of Enhanced PDI for Paging Policy Indication
 }
 
 impl UpFunctionFeatures {
     /// Encode to bytes (variable length, up to 8 bytes)
     pub fn encode(&self, buf: &mut BytesMut) {
         // First 2 bytes
-        let b0 = ((self.heeu as u8) << 7) | ((self.pfdm as u8) << 6)
-            | ((self.ftup as u8) << 5) | ((self.trst as u8) << 4)
-            | ((self.dlbd as u8) << 3) | ((self.ddnd as u8) << 2)
+        let b0 = ((self.heeu as u8) << 7)
+            | ((self.pfdm as u8) << 6)
+            | ((self.ftup as u8) << 5)
+            | ((self.trst as u8) << 4)
+            | ((self.dlbd as u8) << 3)
+            | ((self.ddnd as u8) << 2)
             | ((self.bucp as u8) << 1);
-        let b1 = ((self.epfar as u8) << 7) | ((self.pfde as u8) << 6)
-            | ((self.frrt as u8) << 5) | ((self.trace as u8) << 4)
-            | ((self.quoac as u8) << 3) | ((self.udbc as u8) << 2)
-            | ((self.pdiu as u8) << 1) | (self.empu as u8);
+        let b1 = ((self.epfar as u8) << 7)
+            | ((self.pfde as u8) << 6)
+            | ((self.frrt as u8) << 5)
+            | ((self.trace as u8) << 4)
+            | ((self.quoac as u8) << 3)
+            | ((self.udbc as u8) << 2)
+            | ((self.pdiu as u8) << 1)
+            | (self.empu as u8);
         buf.put_u8(b0);
         buf.put_u8(b1);
-        
+
         // Additional bytes if needed
-        let b2 = ((self.gcom as u8) << 7) | ((self.bundl as u8) << 6)
-            | ((self.mte as u8) << 5) | ((self.mnop as u8) << 4)
-            | ((self.sset as u8) << 3) | ((self.ueip as u8) << 2)
-            | ((self.adpdp as u8) << 1) | (self.dpdra as u8);
-        let b3 = ((self.ip6pl as u8) << 7) | ((self.iptv as u8) << 6)
-            | ((self.norp as u8) << 5) | ((self.vtime as u8) << 4)
-            | ((self.rttl as u8) << 3) | ((self.mpas as u8) << 2)
+        let b2 = ((self.gcom as u8) << 7)
+            | ((self.bundl as u8) << 6)
+            | ((self.mte as u8) << 5)
+            | ((self.mnop as u8) << 4)
+            | ((self.sset as u8) << 3)
+            | ((self.ueip as u8) << 2)
+            | ((self.adpdp as u8) << 1)
+            | (self.dpdra as u8);
+        let b3 = ((self.ip6pl as u8) << 7)
+            | ((self.iptv as u8) << 6)
+            | ((self.norp as u8) << 5)
+            | ((self.vtime as u8) << 4)
+            | ((self.rttl as u8) << 3)
+            | ((self.mpas as u8) << 2)
             | ((self.treu as u8) << 1);
         buf.put_u8(b2);
         buf.put_u8(b3);
@@ -1430,7 +1527,7 @@ impl UpFunctionFeatures {
         }
         let b0 = buf.get_u8();
         let b1 = buf.get_u8();
-        
+
         let mut features = Self {
             bucp: (b0 >> 1) & 0x01 != 0,
             ddnd: (b0 >> 2) & 0x01 != 0,
@@ -1477,15 +1574,15 @@ impl UpFunctionFeatures {
 /// CP Function Features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CpFunctionFeatures {
-    pub load: bool,   // Load Control
-    pub ovrl: bool,   // Overload Control
-    pub epfar: bool,  // Extended PDR for Ethernet
-    pub sset: bool,   // PFCP sessions successively controlled by different SMFs
-    pub bundl: bool,  // PFCP Session Bundling
-    pub mpas: bool,   // Multiple PFCP Associations
-    pub ardr: bool,   // Additional Redundant Transmission
-    pub uiaur: bool,  // UE IP Address Usage Reporting
-    pub psucc: bool,  // PFCP Session Update Continuation
+    pub load: bool,  // Load Control
+    pub ovrl: bool,  // Overload Control
+    pub epfar: bool, // Extended PDR for Ethernet
+    pub sset: bool,  // PFCP sessions successively controlled by different SMFs
+    pub bundl: bool, // PFCP Session Bundling
+    pub mpas: bool,  // Multiple PFCP Associations
+    pub ardr: bool,  // Additional Redundant Transmission
+    pub uiaur: bool, // UE IP Address Usage Reporting
+    pub psucc: bool, // PFCP Session Update Continuation
 }
 
 impl CpFunctionFeatures {
@@ -1505,9 +1602,9 @@ impl CpFunctionFeatures {
 /// Measurement Method flags (TS 29.244 Section 8.2.40)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MeasurementMethod {
-    pub durat: bool,  // Duration
-    pub volum: bool,  // Volume
-    pub event: bool,  // Event
+    pub durat: bool, // Duration
+    pub volum: bool, // Volume
+    pub event: bool, // Event
 }
 
 impl MeasurementMethod {
@@ -1548,7 +1645,7 @@ impl Pdi {
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
-        use crate::ie::{IeHeader, IeType, encode_u8_ie, encode_bytes_ie};
+        use crate::ie::{encode_bytes_ie, encode_u8_ie, IeHeader, IeType};
 
         encode_u8_ie(buf, IeType::SourceInterface, self.source_interface as u8);
 
@@ -1657,7 +1754,7 @@ impl CreatePdr {
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
-        use crate::ie::{IeHeader, IeType, encode_u16_ie, encode_u32_ie};
+        use crate::ie::{encode_u16_ie, encode_u32_ie, IeHeader, IeType};
 
         encode_u16_ie(buf, IeType::PdrId, self.pdr_id);
         encode_u32_ie(buf, IeType::Precedence, self.precedence);
@@ -1778,9 +1875,13 @@ impl ForwardingParameters {
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
-        use crate::ie::{IeHeader, IeType, encode_u8_ie, encode_bytes_ie};
+        use crate::ie::{encode_bytes_ie, encode_u8_ie, IeHeader, IeType};
 
-        encode_u8_ie(buf, IeType::DestinationInterface, self.destination_interface as u8);
+        encode_u8_ie(
+            buf,
+            IeType::DestinationInterface,
+            self.destination_interface as u8,
+        );
 
         if let Some(ni) = &self.network_instance {
             encode_bytes_ie(buf, IeType::NetworkInstance, ni.as_bytes());
@@ -1849,7 +1950,7 @@ impl CreateFar {
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
-        use crate::ie::{IeHeader, IeType, encode_u32_ie, encode_u16_ie, encode_u8_ie};
+        use crate::ie::{encode_u16_ie, encode_u32_ie, encode_u8_ie, IeHeader, IeType};
 
         encode_u32_ie(buf, IeType::FarId, self.far_id);
         encode_u16_ie(buf, IeType::ApplyAction, self.apply_action.encode());
@@ -1934,7 +2035,7 @@ impl CreateQer {
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
-        use crate::ie::{IeHeader, IeType, encode_u32_ie, encode_u8_ie};
+        use crate::ie::{encode_u32_ie, encode_u8_ie, IeHeader, IeType};
 
         encode_u32_ie(buf, IeType::QerId, self.qer_id);
         encode_u8_ie(buf, IeType::GateStatus, self.gate_status.encode());
@@ -2022,7 +2123,11 @@ pub struct CreateUrr {
 }
 
 impl CreateUrr {
-    pub fn new(urr_id: u32, measurement_method: MeasurementMethod, reporting_triggers: ReportingTriggers) -> Self {
+    pub fn new(
+        urr_id: u32,
+        measurement_method: MeasurementMethod,
+        reporting_triggers: ReportingTriggers,
+    ) -> Self {
         Self {
             urr_id,
             measurement_method,
@@ -2034,10 +2139,14 @@ impl CreateUrr {
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
-        use crate::ie::{IeHeader, IeType, encode_u8_ie, encode_u32_ie};
+        use crate::ie::{encode_u32_ie, encode_u8_ie, IeHeader, IeType};
 
         encode_u32_ie(buf, IeType::UrrId, self.urr_id);
-        encode_u8_ie(buf, IeType::MeasurementMethod, self.measurement_method.encode());
+        encode_u8_ie(
+            buf,
+            IeType::MeasurementMethod,
+            self.measurement_method.encode(),
+        );
 
         // Reporting Triggers is 3 bytes (24 bits used out of 32)
         let rt_val = self.reporting_triggers.encode();
@@ -2146,7 +2255,7 @@ impl CreateBar {
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
-        use crate::ie::{IeType, encode_u8_ie};
+        use crate::ie::{encode_u8_ie, IeType};
 
         encode_u8_ie(buf, IeType::BarId, self.bar_id);
 
@@ -2222,7 +2331,7 @@ impl UpdatePdr {
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
-        use crate::ie::{IeHeader, IeType, encode_u16_ie, encode_u32_ie};
+        use crate::ie::{encode_u16_ie, encode_u32_ie, IeHeader, IeType};
 
         encode_u16_ie(buf, IeType::PdrId, self.pdr_id);
 
@@ -2347,7 +2456,7 @@ impl UpdateFar {
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
-        use crate::ie::{IeHeader, IeType, encode_u32_ie, encode_u16_ie, encode_u8_ie};
+        use crate::ie::{encode_u16_ie, encode_u32_ie, encode_u8_ie, IeHeader, IeType};
 
         encode_u32_ie(buf, IeType::FarId, self.far_id);
 
@@ -2358,7 +2467,10 @@ impl UpdateFar {
         if let Some(fp) = &self.forwarding_parameters {
             let mut fp_buf = BytesMut::new();
             fp.encode(&mut fp_buf);
-            let header = IeHeader::new(IeType::UpdateForwardingParameters as u16, fp_buf.len() as u16);
+            let header = IeHeader::new(
+                IeType::UpdateForwardingParameters as u16,
+                fp_buf.len() as u16,
+            );
             header.encode(buf);
             buf.put_slice(&fp_buf);
         }
@@ -2425,7 +2537,7 @@ impl RemovePdr {
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
-        use crate::ie::{IeType, encode_u16_ie};
+        use crate::ie::{encode_u16_ie, IeType};
         encode_u16_ie(buf, IeType::PdrId, self.pdr_id);
     }
 
@@ -2455,7 +2567,7 @@ impl RemoveFar {
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
-        use crate::ie::{IeType, encode_u32_ie};
+        use crate::ie::{encode_u32_ie, IeType};
         encode_u32_ie(buf, IeType::FarId, self.far_id);
     }
 
@@ -2499,7 +2611,7 @@ impl UsageReportSrr {
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
-        use crate::ie::{IeHeader, IeType, encode_u32_ie};
+        use crate::ie::{encode_u32_ie, IeHeader, IeType};
 
         encode_u32_ie(buf, IeType::UrrId, self.urr_id);
 
@@ -2621,7 +2733,7 @@ impl DownlinkDataReport {
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
-        use crate::ie::{IeType, encode_u16_ie};
+        use crate::ie::{encode_u16_ie, IeType};
         encode_u16_ie(buf, IeType::PdrId, self.pdr_id);
     }
 

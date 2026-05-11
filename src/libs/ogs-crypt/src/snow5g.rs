@@ -19,7 +19,7 @@
 //! - 3GPP study on 256-bit algorithms for 5G
 //! - ETSI SAGE working group on next-gen stream ciphers
 
-use aes::cipher::{KeyInit, BlockEncrypt, generic_array::GenericArray};
+use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
 use aes::Aes256;
 use thiserror::Error;
 

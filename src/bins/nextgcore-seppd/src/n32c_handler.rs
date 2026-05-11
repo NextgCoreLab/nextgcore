@@ -191,7 +191,7 @@ mod tests {
     #[test]
     fn test_handle_security_capability_request_tls() {
         let mut node = SeppNode::new(1, "sepp.peer.example.com");
-        
+
         let req_data = SecNegotiateReqData {
             sender: "sepp.peer.example.com".to_string(),
             supported_sec_capability_list: vec![SecurityCapability::Tls],
@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn test_handle_security_capability_request_none() {
         let mut node = SeppNode::new(1, "sepp.peer.example.com");
-        
+
         let req_data = SecNegotiateReqData {
             sender: "sepp.peer.example.com".to_string(),
             supported_sec_capability_list: vec![SecurityCapability::None],
@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn test_handle_security_capability_request_sender_mismatch() {
         let mut node = SeppNode::new(1, "sepp.peer.example.com");
-        
+
         let req_data = SecNegotiateReqData {
             sender: "wrong.sender.com".to_string(),
             supported_sec_capability_list: vec![SecurityCapability::Tls],
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn test_handle_security_capability_response() {
         let mut node = SeppNode::new(1, "sepp.peer.example.com");
-        
+
         let rsp_data = SecNegotiateRspData {
             sender: "sepp.peer.example.com".to_string(),
             selected_sec_capability: SecurityCapability::Tls,

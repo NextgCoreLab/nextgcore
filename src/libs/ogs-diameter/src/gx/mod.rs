@@ -138,7 +138,6 @@ pub mod avp {
     pub const AN_TRUSTED: u32 = 1503;
 }
 
-
 /// IP-CAN Type values
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]

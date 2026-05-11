@@ -182,7 +182,8 @@ impl AnalyticsEngine {
             }
         }
 
-        let (next_cell, count) = next_counts.iter()
+        let (next_cell, count) = next_counts
+            .iter()
             .max_by_key(|(_, c)| *c)
             .map(|(c, n)| (Some(*c), *n))
             .unwrap_or((None, 0));
@@ -210,7 +211,10 @@ impl AnalyticsEngine {
 
     /// Returns recent anomaly records for a UE
     pub fn get_anomalies(&self, supi: &str) -> &[AbnormalBehaviourRecord] {
-        self.anomaly_scores.get(supi).map(|v| v.as_slice()).unwrap_or(&[])
+        self.anomaly_scores
+            .get(supi)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 }
 
@@ -222,12 +226,8 @@ mod tests {
     fn test_nf_load_analytics() {
         let mut engine = AnalyticsEngine::new();
         for i in 0..10 {
-            let sample = NfLoadSample::now(
-                "AMF", "amf-01",
-                0.3 + i as f64 * 0.05,
-                0.4,
-                100 + i * 10,
-            );
+            let sample =
+                NfLoadSample::now("AMF", "amf-01", 0.3 + i as f64 * 0.05, 0.4, 100 + i * 10);
             engine.ingest_nf_load(sample);
         }
         let analytics = engine.compute_nf_load("amf-01").unwrap();
@@ -246,7 +246,7 @@ mod tests {
         }
         let pred = engine.predict_mobility(supi).unwrap();
         assert_eq!(pred.current_cell, 2); // last cell is 2
-        // From cell 2, most transitions go to cell 1
+                                          // From cell 2, most transitions go to cell 1
         assert_eq!(pred.predicted_next_cell, Some(1));
     }
 

@@ -9,15 +9,15 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use nextgcore_ausfd::{
-    ausf_context_final, ausf_context_init, ausf_sbi_close, ausf_sbi_open, ausf_self,
-    timer_manager, AusfEvent, AusfSmContext, SbiServerConfig,
+    ausf_context_final, ausf_context_init, ausf_sbi_close, ausf_sbi_open, ausf_self, timer_manager,
+    AusfEvent, AusfSmContext, SbiServerConfig,
 };
-use serde::Deserialize;
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::server::{
-    send_bad_request, send_method_not_allowed, send_not_found,
-    SbiServer, SbiServerConfig as OgsSbiServerConfig,
+    send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
+    SbiServerConfig as OgsSbiServerConfig,
 };
+use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -115,11 +115,10 @@ async fn main() -> Result<()> {
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
-            .with_endpoint(
-                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
-            ),
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+        ),
     )
     .ok();
 
@@ -158,7 +157,9 @@ async fn main() -> Result<()> {
                                 if let Some(nrf_list) = client.nrf {
                                     if let Some(nrf) = nrf_list.first() {
                                         log::info!("NRF URI configured: {}", nrf.uri);
-                                        ogs_sbi::context::global_context().set_nrf_uri(&nrf.uri).await;
+                                        ogs_sbi::context::global_context()
+                                            .set_nrf_uri(&nrf.uri)
+                                            .await;
                                     }
                                 }
                             }
@@ -192,7 +193,9 @@ async fn main() -> Result<()> {
         .context("Invalid SBI address")?;
     let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
 
-    sbi_server.start(ausf_sbi_request_handler).await
+    sbi_server
+        .start(ausf_sbi_request_handler)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
@@ -222,7 +225,9 @@ async fn main() -> Result<()> {
     log::info!("Shutting down...");
 
     // Stop SBI server
-    sbi_server.stop().await
+    sbi_server
+        .stop()
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
     log::info!("SBI HTTP/2 server stopped");
 
@@ -270,7 +275,9 @@ async fn ausf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     match (service, resource, method) {
         // UE Authentication Service (nausf-auth)
         // Note: Order matters - more specific patterns first
-        ("nausf-auth", "ue-authentications", "POST") if parts.len() >= 5 && parts[4] == "eap-session" => {
+        ("nausf-auth", "ue-authentications", "POST")
+            if parts.len() >= 5 && parts[4] == "eap-session" =>
+        {
             // EAP Session
             let auth_ctx_id = parts[3];
             handle_eap_session(auth_ctx_id, &request).await
@@ -279,7 +286,9 @@ async fn ausf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             // UE Authentication (5G-AKA or EAP-AKA')
             handle_ue_authentication(&request).await
         }
-        ("nausf-auth", "ue-authentications", "PUT") if parts.len() >= 5 && parts[4] == "5g-aka-confirmation" => {
+        ("nausf-auth", "ue-authentications", "PUT")
+            if parts.len() >= 5 && parts[4] == "5g-aka-confirmation" =>
+        {
             // 5G-AKA Confirmation
             let auth_ctx_id = parts[3];
             handle_5g_aka_confirmation(auth_ctx_id, &request).await
@@ -312,11 +321,11 @@ async fn handle_ue_authentication(request: &SbiRequest) -> SbiResponse {
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let supi_or_suci = auth_info.get("supiOrSuci")
+    let supi_or_suci = auth_info
+        .get("supiOrSuci")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
-    let serving_network_name = auth_info.get("servingNetworkName")
-        .and_then(|v| v.as_str());
+    let serving_network_name = auth_info.get("servingNetworkName").and_then(|v| v.as_str());
 
     // Validate required fields
     if let Err(msg) = nextgcore_ausfd::nausf_handler::validate_authentication_info(
@@ -361,7 +370,8 @@ async fn handle_ue_authentication(request: &SbiRequest) -> SbiResponse {
     });
 
     // Try to get auth vector from UDM via SBI client
-    let udm_response = send_udm_generate_auth_data(supi_or_suci, serving_network_name, resync_info.as_ref()).await;
+    let udm_response =
+        send_udm_generate_auth_data(supi_or_suci, serving_network_name, resync_info.as_ref()).await;
 
     match udm_response {
         Ok(auth_vector) => {
@@ -439,8 +449,7 @@ async fn handle_5g_aka_confirmation(auth_ctx_id: &str, request: &SbiRequest) -> 
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let res_star_hex = confirmation.get("resStar")
-        .and_then(|v| v.as_str());
+    let res_star_hex = confirmation.get("resStar").and_then(|v| v.as_str());
 
     if let Err(msg) = nextgcore_ausfd::nausf_handler::validate_confirmation_data(res_star_hex) {
         return send_bad_request(msg, Some("INVALID_REQUEST"));
@@ -488,7 +497,10 @@ async fn handle_5g_aka_confirmation(auth_ctx_id: &str, request: &SbiRequest) -> 
         log::info!("[{}] 5G-AKA authentication succeeded", ausf_ue.suci);
     } else {
         ausf_ue.auth_result = nextgcore_ausfd::AuthResult::AuthenticationFailure;
-        log::warn!("[{}] 5G-AKA authentication failed (HRES* != HXRES*)", ausf_ue.suci);
+        log::warn!(
+            "[{}] 5G-AKA authentication failed (HRES* != HXRES*)",
+            ausf_ue.suci
+        );
     }
 
     // Calculate KSEAF for the response
@@ -502,7 +514,10 @@ async fn handle_5g_aka_confirmation(auth_ctx_id: &str, request: &SbiRequest) -> 
     // Notify UDM of authentication result (fire-and-forget)
     let supi = ausf_ue.supi.clone().expect("value expected");
     let auth_success = ausf_ue.auth_result == nextgcore_ausfd::AuthResult::AuthenticationSuccess;
-    let serving_network_name = ausf_ue.serving_network_name.clone().expect("value expected");
+    let serving_network_name = ausf_ue
+        .serving_network_name
+        .clone()
+        .expect("value expected");
     tokio::spawn(async move {
         if let Err(e) = send_udm_auth_result(&supi, auth_success, &serving_network_name).await {
             log::warn!("Failed to notify UDM of auth result: {e}");
@@ -539,7 +554,8 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let eap_payload = eap_session.get("eapPayload")
+    let eap_payload = eap_session
+        .get("eapPayload")
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
@@ -581,9 +597,7 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
     let eap_type = eap_bytes[4]; // 50 = EAP-AKA', 23 = EAP-AKA
     let eap_subtype = eap_bytes[5];
 
-    log::debug!(
-        "EAP-AKA': code={eap_code}, id={eap_id}, type={eap_type}, subtype={eap_subtype}"
-    );
+    log::debug!("EAP-AKA': code={eap_code}, id={eap_id}, type={eap_type}, subtype={eap_subtype}");
 
     // EAP-AKA' type = 50, EAP-AKA subtype: Challenge=1, Authentication-Reject=2,
     // Synchronization-Failure=4, Identity=5, Notification=12, Reauthentication=13
@@ -608,22 +622,30 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
                 while offset + 2 <= eap_bytes.len() {
                     let attr_type = eap_bytes[offset];
                     let attr_len_units = eap_bytes[offset + 1] as usize;
-                    if attr_len_units == 0 { break; }
+                    if attr_len_units == 0 {
+                        break;
+                    }
                     let attr_len = attr_len_units * 4;
-                    if offset + attr_len > eap_bytes.len() { break; }
+                    if offset + attr_len > eap_bytes.len() {
+                        break;
+                    }
 
                     match attr_type {
-                        3 => { // AT_RES
+                        3 => {
+                            // AT_RES
                             if attr_len >= 4 {
                                 let res_bits = ((eap_bytes[offset + 2] as usize) << 8)
                                     | (eap_bytes[offset + 3] as usize);
                                 let res_bytes = res_bits / 8;
                                 if offset + 4 + res_bytes <= eap_bytes.len() {
-                                    at_res = Some(eap_bytes[offset + 4..offset + 4 + res_bytes].to_vec());
+                                    at_res = Some(
+                                        eap_bytes[offset + 4..offset + 4 + res_bytes].to_vec(),
+                                    );
                                 }
                             }
                         }
-                        11 => { // AT_MAC
+                        11 => {
+                            // AT_MAC
                             if attr_len >= 4 && offset + 4 + 16 <= eap_bytes.len() {
                                 at_mac = Some(eap_bytes[offset + 4..offset + 4 + 16].to_vec());
                             }
@@ -636,7 +658,11 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
 
             // Verify RES* against XRES* per 3GPP TS 33.501
             let auth_success = if let Some(ref res_bytes) = at_res {
-                log::info!("[{}] EAP-AKA' AT_RES extracted ({} bytes)", ausf_ue.suci, res_bytes.len());
+                log::info!(
+                    "[{}] EAP-AKA' AT_RES extracted ({} bytes)",
+                    ausf_ue.suci,
+                    res_bytes.len()
+                );
                 // Compute HRES* = SHA-256(RAND || RES*) and compare with HXRES*
                 if res_bytes.len() >= 8 {
                     let mut res_star = [0u8; 16];
@@ -645,11 +671,18 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
                     let hres_star = ogs_crypt::kdf::ogs_kdf_hxres_star(&ausf_ue.rand, &res_star);
                     hres_star == ausf_ue.hxres_star
                 } else {
-                    log::warn!("[{}] AT_RES too short: {} bytes", ausf_ue.suci, res_bytes.len());
+                    log::warn!(
+                        "[{}] AT_RES too short: {} bytes",
+                        ausf_ue.suci,
+                        res_bytes.len()
+                    );
                     false
                 }
             } else {
-                log::warn!("[{}] No AT_RES in EAP-AKA' Challenge Response", ausf_ue.suci);
+                log::warn!(
+                    "[{}] No AT_RES in EAP-AKA' Challenge Response",
+                    ausf_ue.suci
+                );
                 // Fallback: accept if no AT_RES (compatibility with simple clients)
                 true
             };
@@ -704,7 +737,10 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
         }
         // Synchronization-Failure (subtype=4)
         4 => {
-            log::info!("[{}] EAP-AKA' synchronization failure, need resync", ausf_ue.suci);
+            log::info!(
+                "[{}] EAP-AKA' synchronization failure, need resync",
+                ausf_ue.suci
+            );
             // Need to request new auth vector from UDM with AUTS
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({
@@ -754,7 +790,9 @@ async fn send_udm_generate_auth_data(
         let udm_service = udm_instance
             .find_service(ogs_sbi::types::SbiServiceType::NudmUeau)
             .ok_or("UDM instance has no nudm-ueau service")?;
-        host_owned = udm_service.fqdn.clone()
+        host_owned = udm_service
+            .fqdn
+            .clone()
             .or(udm_instance.fqdn.clone())
             .or(udm_service.ip_addresses.first().cloned())
             .or(udm_instance.ipv4_addresses.first().cloned())
@@ -762,11 +800,12 @@ async fn send_udm_generate_auth_data(
         port = udm_service.port;
     } else {
         // Fallback: use UDM_SBI_ADDR/UDM_SBI_PORT env vars
-        host_owned = std::env::var("UDM_SBI_ADDR").map_err(|_| {
-            "No UDM instance available and UDM_SBI_ADDR not set".to_string()
-        })?;
+        host_owned = std::env::var("UDM_SBI_ADDR")
+            .map_err(|_| "No UDM instance available and UDM_SBI_ADDR not set".to_string())?;
         port = std::env::var("UDM_SBI_PORT")
-            .ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(7777);
         log::info!("Using UDM env var fallback: {host_owned}:{port}");
     }
 
@@ -785,9 +824,7 @@ async fn send_udm_generate_auth_data(
         });
     }
 
-    let path = format!(
-        "/nudm-ueau/v1/{supi_or_suci}/security-information/generate-auth-data"
-    );
+    let path = format!("/nudm-ueau/v1/{supi_or_suci}/security-information/generate-auth-data");
 
     log::debug!("Sending UDM request: POST {path}");
 
@@ -801,29 +838,40 @@ async fn send_udm_generate_auth_data(
     }
 
     // Parse UDM response
-    let response_body = response.http.content
-        .ok_or("Empty UDM response body")?;
+    let response_body = response.http.content.ok_or("Empty UDM response body")?;
     let json: serde_json::Value = serde_json::from_str(&response_body)
         .map_err(|e| format!("Invalid UDM response JSON: {e}"))?;
 
     // Extract authentication vector
     let supi = json.get("supi").and_then(|v| v.as_str()).map(String::from);
-    let auth_type = json.get("authType").and_then(|v| v.as_str()).unwrap_or("5G_AKA");
+    let auth_type = json
+        .get("authType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("5G_AKA");
 
     if auth_type != "5G_AKA" {
         return Err(format!("Unsupported auth type from UDM: {auth_type}"));
     }
 
-    let av = json.get("authenticationVector")
+    let av = json
+        .get("authenticationVector")
         .ok_or("No authenticationVector in UDM response")?;
 
-    let rand_hex = av.get("rand").and_then(|v| v.as_str())
+    let rand_hex = av
+        .get("rand")
+        .and_then(|v| v.as_str())
         .ok_or("No rand in authentication vector")?;
-    let xres_star_hex = av.get("xresStar").and_then(|v| v.as_str())
+    let xres_star_hex = av
+        .get("xresStar")
+        .and_then(|v| v.as_str())
         .ok_or("No xresStar in authentication vector")?;
-    let autn_hex = av.get("autn").and_then(|v| v.as_str())
+    let autn_hex = av
+        .get("autn")
+        .and_then(|v| v.as_str())
         .ok_or("No autn in authentication vector")?;
-    let kausf_hex = av.get("kausf").and_then(|v| v.as_str())
+    let kausf_hex = av
+        .get("kausf")
+        .and_then(|v| v.as_str())
         .ok_or("No kausf in authentication vector")?;
 
     let rand_bytes = nextgcore_ausfd::nudm_handler::hex_to_bytes(rand_hex);
@@ -836,8 +884,10 @@ async fn send_udm_generate_auth_data(
     let mut autn = [0u8; 16];
     let mut kausf = [0u8; 32];
 
-    if rand_bytes.len() != 16 || xres_star_bytes.len() != 16
-        || autn_bytes.len() != 16 || kausf_bytes.len() != 32
+    if rand_bytes.len() != 16
+        || xres_star_bytes.len() != 16
+        || autn_bytes.len() != 16
+        || kausf_bytes.len() != 32
     {
         return Err("Invalid authentication vector field lengths".to_string());
     }
@@ -880,7 +930,9 @@ async fn send_udm_auth_result(
         .find_service(ogs_sbi::types::SbiServiceType::NudmUeau)
         .ok_or("UDM instance has no nudm-ueau service")?;
 
-    let host = udm_service.fqdn.as_deref()
+    let host = udm_service
+        .fqdn
+        .as_deref()
         .or(udm_instance.fqdn.as_deref())
         .or(udm_service.ip_addresses.first().map(|s| s.as_str()))
         .or(udm_instance.ipv4_addresses.first().map(|s| s.as_str()))
@@ -905,7 +957,10 @@ async fn send_udm_auth_result(
         .map_err(|e| format!("UDM auth result request failed: {e}"))?;
 
     if response.status != 200 && response.status != 201 {
-        return Err(format!("UDM auth result returned status {}", response.status));
+        return Err(format!(
+            "UDM auth result returned status {}",
+            response.status
+        ));
     }
 
     Ok(())
@@ -970,10 +1025,8 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
             log::info!("AUSF registered with NRF successfully (id={nf_instance_id})");
 
             // Store self instance
-            let mut self_instance = ogs_sbi::context::NfInstance::new(
-                &nf_instance_id,
-                ogs_sbi::types::NfType::Ausf,
-            );
+            let mut self_instance =
+                ogs_sbi::context::NfInstance::new(&nf_instance_id, ogs_sbi::types::NfType::Ausf);
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
             let mut svc = ogs_sbi::context::NfService::new(
                 "nausf-auth",
@@ -995,7 +1048,10 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
 
             Ok(nf_instance_id)
         }
-        _ => Err(format!("NRF registration returned status {}", response.status)),
+        _ => Err(format!(
+            "NRF registration returned status {}",
+            response.status
+        )),
     }
 }
 
@@ -1017,22 +1073,33 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
         "/nnrf-disc/v1/nf-instances?target-nf-type={target_nf_type}&requester-nf-type=AUSF&service-names={service_name}"
     );
 
-    let response = client.get(&path).await
+    let response = client
+        .get(&path)
+        .await
         .map_err(|e| format!("NRF discovery failed: {e}"))?;
 
     if response.status != 200 {
         return Err(format!("NRF discovery returned status {}", response.status));
     }
 
-    let body = response.http.content.ok_or("Empty NRF discovery response")?;
-    let json: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|e| format!("Invalid NRF discovery response: {e}"))?;
+    let body = response
+        .http
+        .content
+        .ok_or("Empty NRF discovery response")?;
+    let json: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("Invalid NRF discovery response: {e}"))?;
 
     // Parse NF instances from discovery response
     if let Some(nf_instances) = json.get("nfInstances").and_then(|v| v.as_array()) {
         for nf_json in nf_instances {
-            let nf_id = nf_json.get("nfInstanceId").and_then(|v| v.as_str()).unwrap_or("unknown");
-            let nf_type_str = nf_json.get("nfType").and_then(|v| v.as_str()).unwrap_or("UDM");
+            let nf_id = nf_json
+                .get("nfInstanceId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let nf_type_str = nf_json
+                .get("nfType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("UDM");
 
             let nf_type = match nf_type_str {
                 "UDM" => ogs_sbi::types::NfType::Udm,
@@ -1046,7 +1113,8 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
                 instance.fqdn = Some(fqdn.to_string());
             }
             if let Some(addrs) = nf_json.get("ipv4Addresses").and_then(|v| v.as_array()) {
-                instance.ipv4_addresses = addrs.iter()
+                instance.ipv4_addresses = addrs
+                    .iter()
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect();
             }
@@ -1054,10 +1122,15 @@ async fn discover_nf_from_nrf(target_nf_type: &str, service_name: &str) -> Resul
             // Parse services
             if let Some(services) = nf_json.get("nfServices").and_then(|v| v.as_array()) {
                 for svc_json in services {
-                    let svc_name = svc_json.get("serviceName").and_then(|v| v.as_str()).unwrap_or("");
+                    let svc_name = svc_json
+                        .get("serviceName")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     if let Some(svc_type) = ogs_sbi::types::SbiServiceType::from_name(svc_name) {
                         let mut svc = ogs_sbi::context::NfService::new(svc_name, svc_type);
-                        if let Some(endpoints) = svc_json.get("ipEndPoints").and_then(|v| v.as_array()) {
+                        if let Some(endpoints) =
+                            svc_json.get("ipEndPoints").and_then(|v| v.as_array())
+                        {
                             if let Some(ep) = endpoints.first() {
                                 if let Some(addr) = ep.get("ipv4Address").and_then(|v| v.as_str()) {
                                     svc.ip_addresses.push(addr.to_string());
@@ -1086,7 +1159,9 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
         .strip_prefix("https://")
         .or_else(|| uri.strip_prefix("http://"))
         .unwrap_or(uri);
-    let (host_port, _path) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    let (host_port, _path) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
     if let Some((host, port_str)) = host_port.rsplit_once(':') {
         let port: u16 = port_str.parse().ok()?;
         Some((host.to_string(), port))
@@ -1137,7 +1212,10 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) -> Result<()> {
 }
 
 /// Async main event loop with timer integration
-async fn run_event_loop_async(ausf_sm: &mut AusfSmContext, shutdown: Arc<AtomicBool>) -> Result<()> {
+async fn run_event_loop_async(
+    ausf_sm: &mut AusfSmContext,
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
     log::debug!("Entering async main event loop");
 
     let timer_mgr = timer_manager();
@@ -1151,7 +1229,9 @@ async fn run_event_loop_async(ausf_sm: &mut AusfSmContext, shutdown: Arc<AtomicB
         for entry in expired {
             log::debug!(
                 "AUSF timer expired: id={} type={:?} data={:?}",
-                entry.id, entry.timer_type, entry.data
+                entry.id,
+                entry.timer_type,
+                entry.data
             );
 
             // Create timer event and dispatch to state machine

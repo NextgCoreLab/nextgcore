@@ -11,8 +11,8 @@ use clap::Parser;
 use ogs_sbi::context::global_context;
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::server::{
-    send_bad_request, send_method_not_allowed, send_not_found,
-    SbiServer, SbiServerConfig as OgsSbiServerConfig,
+    send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
+    SbiServerConfig as OgsSbiServerConfig,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -84,11 +84,10 @@ async fn main() -> Result<()> {
     init_logging(&args.log_level);
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
-            .with_endpoint(
-                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
-            ),
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+        ),
     )
     .ok();
 
@@ -108,14 +107,22 @@ async fn main() -> Result<()> {
 
     let mut sbi_server_config = OgsSbiServerConfig::new(addr);
     if args.tls {
-        let cert = args.tls_cert.as_deref().unwrap_or("/etc/nextgcore/tls/server.crt");
-        let key = args.tls_key.as_deref().unwrap_or("/etc/nextgcore/tls/server.key");
+        let cert = args
+            .tls_cert
+            .as_deref()
+            .unwrap_or("/etc/nextgcore/tls/server.crt");
+        let key = args
+            .tls_key
+            .as_deref()
+            .unwrap_or("/etc/nextgcore/tls/server.key");
         sbi_server_config = sbi_server_config.with_tls(key, cert);
     }
 
     let sbi_server = SbiServer::new(sbi_server_config);
     log::info!("Starting PIN Manager SBI server on {addr}");
-    sbi_server.start(pin_sbi_request_handler).await
+    sbi_server
+        .start(pin_sbi_request_handler)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
     // Register with NRF
@@ -134,7 +141,9 @@ async fn main() -> Result<()> {
     }
 
     log::info!("Shutting down...");
-    sbi_server.stop().await
+    sbi_server
+        .stop()
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
     pin_context_final();
     log::info!("PIN Manager shutdown complete");
@@ -154,42 +163,32 @@ async fn pin_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 
     match parts.as_slice() {
         // PIN Management
-        ["npin-pinmanagement", "v1", "pins"] => {
-            match method {
-                "POST" => handle_pin_create(&request).await,
-                "GET" => handle_pin_list().await,
-                _ => send_method_not_allowed(method, "pins"),
-            }
-        }
-        ["npin-pinmanagement", "v1", "pins", pin_id] => {
-            match method {
-                "GET" => handle_pin_get(pin_id).await,
-                "DELETE" => handle_pin_delete(pin_id).await,
-                _ => send_method_not_allowed(method, "pins/{id}"),
-            }
-        }
+        ["npin-pinmanagement", "v1", "pins"] => match method {
+            "POST" => handle_pin_create(&request).await,
+            "GET" => handle_pin_list().await,
+            _ => send_method_not_allowed(method, "pins"),
+        },
+        ["npin-pinmanagement", "v1", "pins", pin_id] => match method {
+            "GET" => handle_pin_get(pin_id).await,
+            "DELETE" => handle_pin_delete(pin_id).await,
+            _ => send_method_not_allowed(method, "pins/{id}"),
+        },
         // PIN Element Management
-        ["npin-pinmanagement", "v1", "pins", pin_id, "elements"] => {
-            match method {
-                "POST" => handle_element_register(pin_id, &request).await,
-                "GET" => handle_element_discover(pin_id, &request).await,
-                _ => send_method_not_allowed(method, "pins/{id}/elements"),
-            }
-        }
-        ["npin-pinmanagement", "v1", "pins", _pin_id, "elements", element_id] => {
-            match method {
-                "GET" => handle_element_get(element_id).await,
-                "DELETE" => handle_element_deregister(element_id).await,
-                _ => send_method_not_allowed(method, "pins/{id}/elements/{eid}"),
-            }
-        }
+        ["npin-pinmanagement", "v1", "pins", pin_id, "elements"] => match method {
+            "POST" => handle_element_register(pin_id, &request).await,
+            "GET" => handle_element_discover(pin_id, &request).await,
+            _ => send_method_not_allowed(method, "pins/{id}/elements"),
+        },
+        ["npin-pinmanagement", "v1", "pins", _pin_id, "elements", element_id] => match method {
+            "GET" => handle_element_get(element_id).await,
+            "DELETE" => handle_element_deregister(element_id).await,
+            _ => send_method_not_allowed(method, "pins/{id}/elements/{eid}"),
+        },
         // PIN Element Relay
-        ["npin-pinmanagement", "v1", "elements", element_id, "relay"] => {
-            match method {
-                "PUT" => handle_element_relay(element_id, &request).await,
-                _ => send_method_not_allowed(method, "elements/{id}/relay"),
-            }
-        }
+        ["npin-pinmanagement", "v1", "elements", element_id, "relay"] => match method {
+            "PUT" => handle_element_relay(element_id, &request).await,
+            _ => send_method_not_allowed(method, "elements/{id}/relay"),
+        },
         _ => send_not_found(&format!("Resource not found: {path}"), None),
     }
 }
@@ -204,8 +203,14 @@ async fn handle_pin_create(request: &SbiRequest) -> SbiResponse {
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("Unnamed PIN");
-    let owner = data.get("ownerSupi").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let name = data
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unnamed PIN");
+    let owner = data
+        .get("ownerSupi")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
 
     let ctx = pin_self();
     let result = if let Ok(context) = ctx.read() {
@@ -215,16 +220,14 @@ async fn handle_pin_create(request: &SbiRequest) -> SbiResponse {
     };
 
     match result {
-        Some(pin) => {
-            SbiResponse::with_status(201)
-                .with_json_body(&serde_json::json!({
-                    "pinId": pin.pin_id,
-                    "name": pin.name,
-                    "ownerSupi": pin.owner_supi,
-                    "active": pin.active,
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(201))
-        }
+        Some(pin) => SbiResponse::with_status(201)
+            .with_json_body(&serde_json::json!({
+                "pinId": pin.pin_id,
+                "name": pin.name,
+                "ownerSupi": pin.owner_supi,
+                "active": pin.active,
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(201)),
         None => send_bad_request("Failed to create PIN", Some("CREATION_FAILED")),
     }
 }
@@ -232,16 +235,20 @@ async fn handle_pin_create(request: &SbiRequest) -> SbiResponse {
 async fn handle_pin_list() -> SbiResponse {
     let ctx = pin_self();
     let pins: Vec<serde_json::Value> = if let Ok(context) = ctx.read() {
-        context.pin_list().iter().map(|p| {
-            serde_json::json!({
-                "pinId": p.pin_id,
-                "name": p.name,
-                "ownerSupi": p.owner_supi,
-                "memberCount": p.member_ids.len(),
-                "gatewayId": p.gateway_id,
-                "active": p.active,
+        context
+            .pin_list()
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "pinId": p.pin_id,
+                    "name": p.name,
+                    "ownerSupi": p.owner_supi,
+                    "memberCount": p.member_ids.len(),
+                    "gatewayId": p.gateway_id,
+                    "active": p.active,
+                })
             })
-        }).collect()
+            .collect()
     } else {
         vec![]
     };
@@ -260,18 +267,16 @@ async fn handle_pin_get(pin_id: &str) -> SbiResponse {
     };
 
     match pin {
-        Some(p) => {
-            SbiResponse::with_status(200)
-                .with_json_body(&serde_json::json!({
-                    "pinId": p.pin_id,
-                    "name": p.name,
-                    "ownerSupi": p.owner_supi,
-                    "gatewayId": p.gateway_id,
-                    "memberIds": p.member_ids,
-                    "active": p.active,
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(200))
-        }
+        Some(p) => SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({
+                "pinId": p.pin_id,
+                "name": p.name,
+                "ownerSupi": p.owner_supi,
+                "gatewayId": p.gateway_id,
+                "memberIds": p.member_ids,
+                "active": p.active,
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
         None => send_not_found(&format!("PIN {pin_id} not found"), Some("PIN_NOT_FOUND")),
     }
 }
@@ -300,17 +305,28 @@ async fn handle_element_register(pin_id: &str, request: &SbiRequest) -> SbiRespo
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let elem_type_str = data.get("elementType").and_then(|v| v.as_str()).unwrap_or("ELEMENT");
+    let elem_type_str = data
+        .get("elementType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("ELEMENT");
     let elem_type = match elem_type_str {
         "GATEWAY" => PinElementType::Gateway,
         "MANAGEMENT" => PinElementType::ManagementEntity,
         _ => PinElementType::Element,
     };
-    let capabilities: Vec<String> = data.get("capabilities")
+    let capabilities: Vec<String> = data
+        .get("capabilities")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
-    let host_supi = data.get("hostSupi").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let host_supi = data
+        .get("hostSupi")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
     let ctx = pin_self();
     let result = if let Ok(context) = ctx.read() {
@@ -320,17 +336,15 @@ async fn handle_element_register(pin_id: &str, request: &SbiRequest) -> SbiRespo
     };
 
     match result {
-        Some(elem) => {
-            SbiResponse::with_status(201)
-                .with_json_body(&serde_json::json!({
-                    "elementId": elem.element_id,
-                    "elementType": elem_type_str,
-                    "pinId": elem.pin_id,
-                    "status": "REGISTERED",
-                    "capabilities": elem.capabilities,
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(201))
-        }
+        Some(elem) => SbiResponse::with_status(201)
+            .with_json_body(&serde_json::json!({
+                "elementId": elem.element_id,
+                "elementType": elem_type_str,
+                "pinId": elem.pin_id,
+                "status": "REGISTERED",
+                "capabilities": elem.capabilities,
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(201)),
         None => send_bad_request(
             &format!("Failed to register element in PIN {pin_id}"),
             Some("REGISTRATION_FAILED"),
@@ -340,21 +354,26 @@ async fn handle_element_register(pin_id: &str, request: &SbiRequest) -> SbiRespo
 
 async fn handle_element_discover(pin_id: &str, request: &SbiRequest) -> SbiResponse {
     let uri = &request.header.uri;
-    let capability = uri.split("capability=")
+    let capability = uri
+        .split("capability=")
         .nth(1)
         .map(|s| s.split('&').next().unwrap_or(s));
 
     let ctx = pin_self();
     let elements: Vec<serde_json::Value> = if let Ok(context) = ctx.read() {
-        context.element_discover(pin_id, capability).iter().map(|e| {
-            serde_json::json!({
-                "elementId": e.element_id,
-                "elementType": format!("{:?}", e.element_type),
-                "capabilities": e.capabilities,
-                "status": format!("{:?}", e.status),
-                "gatewayId": e.gateway_id,
+        context
+            .element_discover(pin_id, capability)
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "elementId": e.element_id,
+                    "elementType": format!("{:?}", e.element_type),
+                    "capabilities": e.capabilities,
+                    "status": format!("{:?}", e.status),
+                    "gatewayId": e.gateway_id,
+                })
             })
-        }).collect()
+            .collect()
     } else {
         vec![]
     };
@@ -373,19 +392,20 @@ async fn handle_element_get(element_id: &str) -> SbiResponse {
     };
 
     match elem {
-        Some(e) => {
-            SbiResponse::with_status(200)
-                .with_json_body(&serde_json::json!({
-                    "elementId": e.element_id,
-                    "elementType": format!("{:?}", e.element_type),
-                    "pinId": e.pin_id,
-                    "capabilities": e.capabilities,
-                    "status": format!("{:?}", e.status),
-                    "relayPath": e.relay_path,
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(200))
-        }
-        None => send_not_found(&format!("Element {element_id} not found"), Some("ELEMENT_NOT_FOUND")),
+        Some(e) => SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({
+                "elementId": e.element_id,
+                "elementType": format!("{:?}", e.element_type),
+                "pinId": e.pin_id,
+                "capabilities": e.capabilities,
+                "status": format!("{:?}", e.status),
+                "relayPath": e.relay_path,
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("Element {element_id} not found"),
+            Some("ELEMENT_NOT_FOUND"),
+        ),
     }
 }
 
@@ -399,7 +419,10 @@ async fn handle_element_deregister(element_id: &str) -> SbiResponse {
 
     match removed {
         Some(_) => SbiResponse::with_status(204),
-        None => send_not_found(&format!("Element {element_id} not found"), Some("ELEMENT_NOT_FOUND")),
+        None => send_not_found(
+            &format!("Element {element_id} not found"),
+            Some("ELEMENT_NOT_FOUND"),
+        ),
     }
 }
 
@@ -413,9 +436,14 @@ async fn handle_element_relay(element_id: &str, request: &SbiRequest) -> SbiResp
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let relay_path: Vec<String> = data.get("relayPath")
+    let relay_path: Vec<String> = data
+        .get("relayPath")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
         .unwrap_or_default();
 
     let ctx = pin_self();
@@ -430,12 +458,19 @@ async fn handle_element_relay(element_id: &str, request: &SbiRequest) -> SbiResp
             .with_json_body(&serde_json::json!({"elementId": element_id, "result": "RELAY_SET"}))
             .unwrap_or_else(|_| SbiResponse::with_status(200))
     } else {
-        send_not_found(&format!("Element {element_id} not found"), Some("ELEMENT_NOT_FOUND"))
+        send_not_found(
+            &format!("Element {element_id} not found"),
+            Some("ELEMENT_NOT_FOUND"),
+        )
     }
 }
 
 /// Register PIN Manager with NRF
-async fn register_with_nrf(sbi_addr: &str, sbi_port: u16, nf_instance_id: &str) -> Result<(), String> {
+async fn register_with_nrf(
+    sbi_addr: &str,
+    sbi_port: u16,
+    nf_instance_id: &str,
+) -> Result<(), String> {
     let sbi_ctx = global_context();
     let nrf_uri = match sbi_ctx.get_nrf_uri().await {
         Some(uri) => uri,
@@ -461,7 +496,9 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16, nf_instance_id: &str) 
         "heartBeatTimer": 10
     });
     let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
-    let response = client.put_json(&path, &nf_profile).await
+    let response = client
+        .put_json(&path, &nf_profile)
+        .await
         .map_err(|e| format!("NRF registration failed: {e}"))?;
     match response.status {
         200 | 201 => {
@@ -473,12 +510,20 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16, nf_instance_id: &str) 
 }
 
 fn parse_host_port(uri: &str) -> Option<(String, u16)> {
-    let without_scheme = uri.strip_prefix("https://").or_else(|| uri.strip_prefix("http://")).unwrap_or(uri);
-    let (host_port, _) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    let without_scheme = uri
+        .strip_prefix("https://")
+        .or_else(|| uri.strip_prefix("http://"))
+        .unwrap_or(uri);
+    let (host_port, _) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
     if let Some((host, port_str)) = host_port.rsplit_once(':') {
         Some((host.to_string(), port_str.parse().ok()?))
     } else {
-        Some((host_port.to_string(), if uri.starts_with("https://") { 443 } else { 80 }))
+        Some((
+            host_port.to_string(),
+            if uri.starts_with("https://") { 443 } else { 80 },
+        ))
     }
 }
 

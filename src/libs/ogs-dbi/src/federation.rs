@@ -239,7 +239,8 @@ impl FederationClient {
         endpoint: String,
         policy: AccessPolicy,
     ) {
-        self.operator_endpoints.insert(operator_id.clone(), endpoint);
+        self.operator_endpoints
+            .insert(operator_id.clone(), endpoint);
         self.policies.insert(operator_id, policy);
     }
 
@@ -289,7 +290,10 @@ impl FederationClient {
     }
 
     /// Executes a federated query
-    pub fn execute_query(&mut self, query: FederatedQuery) -> FederationResult<Vec<FederatedResponse>> {
+    pub fn execute_query(
+        &mut self,
+        query: FederatedQuery,
+    ) -> FederationResult<Vec<FederatedResponse>> {
         // Check authorization
         self.check_authorization(&query)?;
 
@@ -328,9 +332,10 @@ impl FederationClient {
         // 3. Receive and validate response
         // 4. Apply privacy transformations if required
 
-        let policy = self.policies.get(target).ok_or_else(|| {
-            FederationError::OperatorNotFound(target.0.clone())
-        })?;
+        let policy = self
+            .policies
+            .get(target)
+            .ok_or_else(|| FederationError::OperatorNotFound(target.0.clone()))?;
 
         let mut data = HashMap::new();
         data.insert("status".to_string(), "success".to_string());
@@ -418,11 +423,7 @@ impl FederationClient {
     }
 
     /// Applies differential privacy noise
-    pub fn apply_differential_privacy(
-        &self,
-        value: f64,
-        epsilon: f64,
-    ) -> FederationResult<f64> {
+    pub fn apply_differential_privacy(&self, value: f64, epsilon: f64) -> FederationResult<f64> {
         if epsilon <= 0.0 {
             return Err(FederationError::PrivacyViolation {
                 constraint: "epsilon must be positive".to_string(),
@@ -453,10 +454,7 @@ impl FederationClient {
 
 impl Default for FederationClient {
     fn default() -> Self {
-        Self::new(
-            OperatorId::new("default"),
-            ExchangeProtocol::HttpsMutualTls,
-        )
+        Self::new(OperatorId::new("default"), ExchangeProtocol::HttpsMutualTls)
     }
 }
 
@@ -491,7 +489,11 @@ mod tests {
         let op = OperatorId::new("operator-b");
         let policy = AccessPolicy::default();
 
-        client.register_operator(op.clone(), "https://operator-b.example.com".to_string(), policy);
+        client.register_operator(
+            op.clone(),
+            "https://operator-b.example.com".to_string(),
+            policy,
+        );
         assert!(client.operator_endpoints.contains_key(&op));
         assert!(client.policies.contains_key(&op));
     }
@@ -508,7 +510,11 @@ mod tests {
         policy.allowed_operators.push(OperatorId::new("operator-a"));
         policy.require_consent = false;
 
-        client.register_operator(op_b.clone(), "https://operator-b.example.com".to_string(), policy);
+        client.register_operator(
+            op_b.clone(),
+            "https://operator-b.example.com".to_string(),
+            policy,
+        );
 
         let query = FederatedQuery {
             query_id: "query-1".to_string(),
@@ -533,7 +539,11 @@ mod tests {
         let op_b = OperatorId::new("operator-b");
         let policy = AccessPolicy::default(); // Empty allowed_operators
 
-        client.register_operator(op_b.clone(), "https://operator-b.example.com".to_string(), policy);
+        client.register_operator(
+            op_b.clone(),
+            "https://operator-b.example.com".to_string(),
+            policy,
+        );
 
         let query = FederatedQuery {
             query_id: "query-1".to_string(),
@@ -567,13 +577,19 @@ mod tests {
             });
         }
 
-        let sum = client.aggregate(responses.clone(), AggregationFunction::Sum, "value").unwrap();
+        let sum = client
+            .aggregate(responses.clone(), AggregationFunction::Sum, "value")
+            .unwrap();
         assert_eq!(sum, 100.0); // 0 + 10 + 20 + 30 + 40
 
-        let avg = client.aggregate(responses.clone(), AggregationFunction::Average, "value").unwrap();
+        let avg = client
+            .aggregate(responses.clone(), AggregationFunction::Average, "value")
+            .unwrap();
         assert_eq!(avg, 20.0);
 
-        let count = client.aggregate(responses.clone(), AggregationFunction::Count, "value").unwrap();
+        let count = client
+            .aggregate(responses.clone(), AggregationFunction::Count, "value")
+            .unwrap();
         assert_eq!(count, 5.0);
     }
 
@@ -582,7 +598,9 @@ mod tests {
         let client = FederationClient::default();
         let original_value = 100.0;
 
-        let noisy_value = client.apply_differential_privacy(original_value, 1.0).unwrap();
+        let noisy_value = client
+            .apply_differential_privacy(original_value, 1.0)
+            .unwrap();
 
         // Value should be different (with high probability)
         // But we can't assert exact value due to randomness

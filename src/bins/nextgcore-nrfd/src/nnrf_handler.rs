@@ -198,7 +198,8 @@ impl NfInstanceManager {
             if let Some(profile) = profiles.get_mut(id) {
                 log::warn!(
                     "[{}] NF status: {} -> SUSPENDED (missed heartbeat)",
-                    id, profile.nf_status
+                    id,
+                    profile.nf_status
                 );
                 profile.nf_status = "SUSPENDED".to_string();
                 return true;
@@ -225,7 +226,8 @@ impl NfInstanceManager {
 
     /// List all NF profiles
     pub fn list(&self) -> Vec<NfProfile> {
-        self.profiles.read()
+        self.profiles
+            .read()
             .map(|p| p.values().cloned().collect())
             .expect("value expected")
     }
@@ -300,11 +302,12 @@ pub fn nf_manager() -> Arc<NfInstanceManager> {
 }
 
 /// Handle NF registration (PUT /nf-instances/{nfInstanceId})
-pub fn nrf_nnrf_handle_nf_register(
-    nf_instance_id: &str,
-    profile: &NfProfile,
-) -> HandlerResult {
-    log::info!("[{}] NF registration request (type={})", nf_instance_id, profile.nf_type);
+pub fn nrf_nnrf_handle_nf_register(nf_instance_id: &str, profile: &NfProfile) -> HandlerResult {
+    log::info!(
+        "[{}] NF registration request (type={})",
+        nf_instance_id,
+        profile.nf_type
+    );
 
     // Validate profile
     if profile.nf_instance_id.is_empty() {
@@ -375,9 +378,7 @@ pub struct PatchItem {
 }
 
 /// Handle NF status subscribe (POST /subscriptions)
-pub fn nrf_nnrf_handle_nf_status_subscribe(
-    subscription: SubscriptionData,
-) -> HandlerResult {
+pub fn nrf_nnrf_handle_nf_status_subscribe(subscription: SubscriptionData) -> HandlerResult {
     log::info!("[{}] NF status subscribe request", subscription.id);
 
     // Validate subscription
@@ -459,9 +460,7 @@ pub fn nrf_nnrf_handle_nf_discover(
     requester_nf_type: &str,
     discovery_options: Option<&DiscoveryOptions>,
 ) -> HandlerResult {
-    log::debug!(
-        "NF discover request (target={target_nf_type}, requester={requester_nf_type})"
-    );
+    log::debug!("NF discover request (target={target_nf_type}, requester={requester_nf_type})");
 
     if target_nf_type.is_empty() {
         return HandlerResult::Error(400, "No target-nf-type".to_string());
@@ -500,9 +499,9 @@ pub fn nrf_nnrf_handle_nf_discover(
                 // Filter by service names
                 if !opts.service_names.is_empty() {
                     let has_service = profile.nf_services.iter().any(|svc| {
-                        opts.service_names.iter().any(|name|
-                            svc.service_name.to_lowercase() == name.to_lowercase()
-                        )
+                        opts.service_names
+                            .iter()
+                            .any(|name| svc.service_name.to_lowercase() == name.to_lowercase())
                     });
                     if !has_service {
                         return false;

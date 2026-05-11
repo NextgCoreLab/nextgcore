@@ -2,9 +2,9 @@
 //!
 //! Information Element types and encoding/decoding for GTPv2-C protocol.
 
-use std::fmt;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::error::{GtpError, GtpResult};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use std::fmt;
 
 /// GTPv2 IE Types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,9 +309,7 @@ impl Gtp2RatTypeIe {
                 available: 0,
             });
         }
-        Ok(Self {
-            rat_type: value[0],
-        })
+        Ok(Self { rat_type: value[0] })
     }
 }
 
@@ -385,7 +383,9 @@ pub struct Gtp2PdnTypeIe {
 
 impl Gtp2PdnTypeIe {
     pub fn new(pdn_type: u8) -> Self {
-        Self { pdn_type: pdn_type & 0x07 }
+        Self {
+            pdn_type: pdn_type & 0x07,
+        }
     }
 
     pub fn encode(&self, buf: &mut BytesMut, instance: u8) {
@@ -499,7 +499,12 @@ impl Gtp2FTeidIe {
                     available: value.len(),
                 });
             }
-            let addr = [value[offset], value[offset + 1], value[offset + 2], value[offset + 3]];
+            let addr = [
+                value[offset],
+                value[offset + 1],
+                value[offset + 2],
+                value[offset + 3],
+            ];
             offset += 4;
             Some(addr)
         } else {
@@ -595,10 +600,16 @@ impl Gtp2BearerQosIe {
         let qci = value[1];
 
         // Read 5-byte values as u64
-        let mbr_ul = u64::from_be_bytes([0, 0, 0, value[2], value[3], value[4], value[5], value[6]]);
-        let mbr_dl = u64::from_be_bytes([0, 0, 0, value[7], value[8], value[9], value[10], value[11]]);
-        let gbr_ul = u64::from_be_bytes([0, 0, 0, value[12], value[13], value[14], value[15], value[16]]);
-        let gbr_dl = u64::from_be_bytes([0, 0, 0, value[17], value[18], value[19], value[20], value[21]]);
+        let mbr_ul =
+            u64::from_be_bytes([0, 0, 0, value[2], value[3], value[4], value[5], value[6]]);
+        let mbr_dl =
+            u64::from_be_bytes([0, 0, 0, value[7], value[8], value[9], value[10], value[11]]);
+        let gbr_ul = u64::from_be_bytes([
+            0, 0, 0, value[12], value[13], value[14], value[15], value[16],
+        ]);
+        let gbr_dl = u64::from_be_bytes([
+            0, 0, 0, value[17], value[18], value[19], value[20], value[21],
+        ]);
 
         Ok(Self {
             pci,
@@ -693,9 +704,15 @@ impl Gtp2CauseIe {
         buf.put_u8(self.cause);
 
         let mut flags = 0u8;
-        if self.pce { flags |= 0x04; }
-        if self.bce { flags |= 0x02; }
-        if self.cs { flags |= 0x01; }
+        if self.pce {
+            flags |= 0x04;
+        }
+        if self.bce {
+            flags |= 0x02;
+        }
+        if self.cs {
+            flags |= 0x01;
+        }
         buf.put_u8(flags);
 
         if has_offending {
@@ -805,11 +822,7 @@ impl Gtp2ServingNetworkIe {
             });
         }
 
-        let mcc = [
-            value[0] & 0x0F,
-            (value[0] >> 4) & 0x0F,
-            value[1] & 0x0F,
-        ];
+        let mcc = [value[0] & 0x0F, (value[0] >> 4) & 0x0F, value[1] & 0x0F];
         let mnc = [
             value[2] & 0x0F,
             (value[2] >> 4) & 0x0F,
@@ -849,9 +862,10 @@ impl Gtp2ApnIe {
     }
 
     pub fn decode(value: &Bytes) -> GtpResult<Self> {
-        Ok(Self { apn: value.to_vec() })
+        Ok(Self {
+            apn: value.to_vec(),
+        })
     }
-
 }
 
 impl fmt::Display for Gtp2ApnIe {

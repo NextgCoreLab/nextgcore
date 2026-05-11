@@ -43,7 +43,14 @@ fn parse_uri_host_port(uri_str: &str) -> Result<(String, u16), String> {
     let (host, port_str) = if let Some(idx) = stripped.rfind(':') {
         (&stripped[..idx], &stripped[idx + 1..])
     } else {
-        (stripped, if uri_str.starts_with("https") { "443" } else { "80" })
+        (
+            stripped,
+            if uri_str.starts_with("https") {
+                "443"
+            } else {
+                "80"
+            },
+        )
     };
     let port: u16 = port_str
         .split('/')
@@ -88,10 +95,7 @@ async fn register_with_nrf(nrf_uri: &str, nf_instance: &NfInstance) -> Result<()
     let ctx = global_context();
     let client = ctx.get_client(&host, port).await;
 
-    let register_path = format!(
-        "/nnrf-nfm/v1/nf-instances/{}",
-        nf_instance.id
-    );
+    let register_path = format!("/nnrf-nfm/v1/nf-instances/{}", nf_instance.id);
 
     let body = serde_json::json!({
         "nfInstanceId": nf_instance.id,
@@ -111,10 +115,7 @@ async fn register_with_nrf(nrf_uri: &str, nf_instance: &NfInstance) -> Result<()
         }).collect::<Vec<_>>(),
     });
 
-    match client
-        .put_json(&register_path, &body)
-        .await
-    {
+    match client.put_json(&register_path, &body).await {
         Ok(response) => {
             let status = response.status;
             if status == 200 || status == 201 {
@@ -147,13 +148,9 @@ pub fn bsf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
         return Err("SBI server already running".to_string());
     }
 
-    let config = config.unwrap_or(SbiServerConfig::default());
+    let config = config.unwrap_or_default();
 
-    log::info!(
-        "Opening BSF SBI server on {}:{}",
-        config.addr,
-        config.port
-    );
+    log::info!("Opening BSF SBI server on {}:{}", config.addr, config.port);
 
     // Build and register the BSF NF instance
     let nf_instance = build_bsf_nf_instance(&config);
@@ -228,9 +225,9 @@ pub fn bsf_sbi_is_running() -> bool {
     SBI_SERVER_RUNNING.load(Ordering::SeqCst)
 }
 
-
 /// SBI request builder function type
-pub type PathSbiRequestBuilder = fn(sess_id: u64, data: &dyn std::any::Any) -> Option<PathSbiRequest>;
+pub type PathSbiRequestBuilder =
+    fn(sess_id: u64, data: &dyn std::any::Any) -> Option<PathSbiRequest>;
 
 /// Simplified SBI request for path operations
 #[derive(Debug, Clone)]

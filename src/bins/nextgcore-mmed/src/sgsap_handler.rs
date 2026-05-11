@@ -2,7 +2,7 @@
 //!
 //! Port of src/mme/sgsap-handler.c - SGsAP message handling functions
 
-use crate::sgsap_build::{message_type, ie_type, SgsapCause, ServiceIndicator};
+use crate::sgsap_build::{ie_type, message_type, ServiceIndicator, SgsapCause};
 
 /// Result type for SGsAP operations
 pub type SgsapResult<T> = Result<T, SgsapError>;
@@ -55,7 +55,6 @@ pub struct LocationUpdateRejectData {
     pub reject_cause: u8,
     pub lai: Option<LaiData>,
 }
-
 
 /// LAI data
 #[derive(Debug, Clone, Default)]
@@ -160,7 +159,6 @@ fn parse_lai(data: &[u8]) -> Option<LaiData> {
     let lac = u16::from_be_bytes([data[3], data[4]]);
     Some(LaiData { plmn, lac })
 }
-
 
 // ============================================================================
 // Handler Functions
@@ -322,7 +320,6 @@ pub fn handle_paging_request(data: &[u8]) -> SgsapResult<PagingRequestData> {
     Ok(result)
 }
 
-
 /// Handle Downlink Unitdata
 pub fn handle_downlink_unitdata(data: &[u8]) -> SgsapResult<DownlinkUnitdataData> {
     if data.is_empty() || data[0] != message_type::DOWNLINK_UNITDATA {
@@ -353,7 +350,9 @@ pub fn handle_downlink_unitdata(data: &[u8]) -> SgsapResult<DownlinkUnitdataData
         return Err(SgsapError::MandatoryIeMissing("IMSI".to_string()));
     }
     if result.nas_message_container.is_empty() {
-        return Err(SgsapError::MandatoryIeMissing("NAS Message Container".to_string()));
+        return Err(SgsapError::MandatoryIeMissing(
+            "NAS Message Container".to_string(),
+        ));
     }
 
     Ok(result)
@@ -462,7 +461,6 @@ pub fn handle_alert_request(data: &[u8]) -> SgsapResult<AlertRequestData> {
 
     Ok(result)
 }
-
 
 /// Handle MM Information Request
 pub fn handle_mm_information_request(data: &[u8]) -> SgsapResult<MmInformationRequestData> {
@@ -609,7 +607,10 @@ mod tests {
         let imsi = [0x09, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07];
         let msg = build_test_message(
             message_type::PAGING_REQUEST,
-            &[(ie_type::IMSI, &imsi), (ie_type::SERVICE_INDICATOR, &[0x01])],
+            &[
+                (ie_type::IMSI, &imsi),
+                (ie_type::SERVICE_INDICATOR, &[0x01]),
+            ],
         );
         let result = handle_paging_request(&msg).unwrap();
         assert_eq!(result.imsi, imsi);
@@ -622,7 +623,10 @@ mod tests {
         let nas_msg = [0x07, 0x41, 0x01];
         let msg = build_test_message(
             message_type::DOWNLINK_UNITDATA,
-            &[(ie_type::IMSI, &imsi), (ie_type::NAS_MESSAGE_CONTAINER, &nas_msg)],
+            &[
+                (ie_type::IMSI, &imsi),
+                (ie_type::NAS_MESSAGE_CONTAINER, &nas_msg),
+            ],
         );
         let result = handle_downlink_unitdata(&msg).unwrap();
         assert_eq!(result.imsi, imsi);

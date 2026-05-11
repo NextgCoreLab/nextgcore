@@ -3,8 +3,8 @@
 //! Port of src/amf/ngap-handler.c - NGAP message handling functions
 
 use crate::context::{
-    AmfContext, AmfGnb, RanUe, PlmnId, SNssai, Tai5gs, NrCgi,
-    SupportedTa, NgapCause, NgapUeCtxRelAction,
+    AmfContext, AmfGnb, NgapCause, NgapUeCtxRelAction, NrCgi, PlmnId, RanUe, SNssai, SupportedTa,
+    Tai5gs,
 };
 use crate::ngap_build::{cause_group, radio_network_cause};
 use crate::sbi_path;
@@ -325,7 +325,8 @@ pub fn handle_initial_ue_message(
 ) -> NgapHandlerResult {
     log::debug!(
         "[gNB:{}] Initial UE Message, RAN UE NGAP ID: {}",
-        gnb.gnb_id, message.ran_ue_ngap_id
+        gnb.gnb_id,
+        message.ran_ue_ngap_id
     );
 
     // Store RAN UE NGAP ID
@@ -351,14 +352,16 @@ pub fn handle_uplink_nas_transport(
 ) -> NgapHandlerResult {
     log::debug!(
         "Uplink NAS Transport, AMF UE NGAP ID: {}, RAN UE NGAP ID: {}",
-        message.amf_ue_ngap_id, message.ran_ue_ngap_id
+        message.amf_ue_ngap_id,
+        message.ran_ue_ngap_id
     );
 
     // Validate AMF UE NGAP ID
     if ran_ue.amf_ue_ngap_id != message.amf_ue_ngap_id {
         log::error!(
             "AMF UE NGAP ID mismatch: expected {}, got {}",
-            ran_ue.amf_ue_ngap_id, message.amf_ue_ngap_id
+            ran_ue.amf_ue_ngap_id,
+            message.amf_ue_ngap_id
         );
         return NgapHandlerResult::Failure(NgapCause {
             group: cause_group::RADIO_NETWORK,
@@ -445,13 +448,12 @@ pub fn handle_ue_context_release_request(
 ///
 /// This is called after handle_ue_context_release_request to send the
 /// release command to gNB and clean up AMF context
-pub fn perform_an_release(
-    ran_ue: &mut RanUe,
-    cause: &NgapCause,
-) -> Option<Vec<u8>> {
+pub fn perform_an_release(ran_ue: &mut RanUe, cause: &NgapCause) -> Option<Vec<u8>> {
     log::debug!(
         "Performing AN Release: AMF UE NGAP ID={}, RAN UE NGAP ID={}, action={:?}",
-        ran_ue.amf_ue_ngap_id, ran_ue.ran_ue_ngap_id, ran_ue.ue_ctx_rel_action
+        ran_ue.amf_ue_ngap_id,
+        ran_ue.ran_ue_ngap_id,
+        ran_ue.ue_ctx_rel_action
     );
 
     // Build UE Context Release Command
@@ -471,9 +473,7 @@ pub fn perform_an_release(
 ///
 /// This is called after receiving UEContextReleaseComplete from gNB
 pub fn transition_ue_to_cm_idle(amf_ue_ngap_id: u64) {
-    log::info!(
-        "Transitioning UE to CM-IDLE state: AMF UE NGAP ID={amf_ue_ngap_id}"
-    );
+    log::info!("Transitioning UE to CM-IDLE state: AMF UE NGAP ID={amf_ue_ngap_id}");
 
     // In a full implementation, this would:
     // 1. Update AMF UE state to CM-IDLE
@@ -492,7 +492,8 @@ pub fn handle_ue_context_release_complete(
 ) -> NgapHandlerResult {
     log::debug!(
         "UE Context Release Complete, AMF UE NGAP ID: {}, RAN UE NGAP ID: {}",
-        message.amf_ue_ngap_id, message.ran_ue_ngap_id
+        message.amf_ue_ngap_id,
+        message.ran_ue_ngap_id
     );
 
     // Update User Location Information if present
@@ -511,7 +512,8 @@ pub fn handle_initial_context_setup_response(
 ) -> NgapHandlerResult {
     log::debug!(
         "Initial Context Setup Response, AMF UE NGAP ID: {}, RAN UE NGAP ID: {}",
-        message.amf_ue_ngap_id, message.ran_ue_ngap_id
+        message.amf_ue_ngap_id,
+        message.ran_ue_ngap_id
     );
 
     // Mark initial context setup as complete
@@ -527,7 +529,9 @@ pub fn handle_initial_context_setup_response(
     for item in &message.pdu_session_failed_list {
         log::warn!(
             "PDU Session {} setup failed: cause group={}, cause={}",
-            item.psi, item.cause.group, item.cause.cause
+            item.psi,
+            item.cause.group,
+            item.cause.cause
         );
     }
 
@@ -541,7 +545,9 @@ pub fn handle_initial_context_setup_failure(
 ) -> NgapHandlerResult {
     log::warn!(
         "Initial Context Setup Failure, AMF UE NGAP ID: {}, cause: group={}, cause={}",
-        message.amf_ue_ngap_id, message.cause.group, message.cause.cause
+        message.amf_ue_ngap_id,
+        message.cause.group,
+        message.cause.cause
     );
 
     // Set release action
@@ -557,7 +563,8 @@ pub fn handle_handover_required(
 ) -> NgapHandlerResult {
     log::debug!(
         "Handover Required, AMF UE NGAP ID: {}, RAN UE NGAP ID: {}",
-        message.amf_ue_ngap_id, message.ran_ue_ngap_id
+        message.amf_ue_ngap_id,
+        message.ran_ue_ngap_id
     );
 
     // Validate handover type (only intra-5GS supported for now)
@@ -579,7 +586,8 @@ pub fn handle_handover_request_ack(
 ) -> NgapHandlerResult {
     log::debug!(
         "Handover Request Acknowledge, AMF UE NGAP ID: {}, RAN UE NGAP ID: {}",
-        message.amf_ue_ngap_id, message.ran_ue_ngap_id
+        message.amf_ue_ngap_id,
+        message.ran_ue_ngap_id
     );
 
     // Store RAN UE NGAP ID from target gNB
@@ -601,7 +609,8 @@ pub fn handle_path_switch_request(
 ) -> NgapHandlerResult {
     log::debug!(
         "Path Switch Request, RAN UE NGAP ID: {}, Source AMF UE NGAP ID: {}",
-        message.ran_ue_ngap_id, message.source_amf_ue_ngap_id
+        message.ran_ue_ngap_id,
+        message.source_amf_ue_ngap_id
     );
 
     // Store new RAN UE NGAP ID
@@ -648,7 +657,10 @@ pub fn handle_handover_cancel(
 ) -> NgapHandlerResult {
     log::debug!(
         "Handover Cancel, AMF UE NGAP ID: {}, RAN UE NGAP ID: {}, cause: group={}, cause={}",
-        amf_ue_ngap_id, ran_ue_ngap_id, cause.group, cause.cause
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        cause.group,
+        cause.cause
     );
 
     // Set release action for target UE
@@ -794,10 +806,10 @@ fn trigger_smf_session_release_for_ue(amf_ue_id: u64) {
         let host = smf_host.clone();
         let port = smf_port;
         tokio::spawn(async move {
-            if let Err(e) = sbi_path::call_smf_release_sm_context(&host, port, &sm_context_ref).await {
-                log::warn!(
-                    "SMF SM Context Release failed for ref={sm_context_ref}: {e}"
-                );
+            if let Err(e) =
+                sbi_path::call_smf_release_sm_context(&host, port, &sm_context_ref).await
+            {
+                log::warn!("SMF SM Context Release failed for ref={sm_context_ref}: {e}");
             }
         });
     }
@@ -1040,7 +1052,10 @@ mod tests {
         match result {
             NgapHandlerResult::ReleaseUeContext(cause) => {
                 assert_eq!(cause.cause, radio_network_cause::USER_INACTIVITY);
-                assert_eq!(ran_ue.ue_ctx_rel_action, NgapUeCtxRelAction::NgContextRemove);
+                assert_eq!(
+                    ran_ue.ue_ctx_rel_action,
+                    NgapUeCtxRelAction::NgContextRemove
+                );
             }
             _ => panic!("Expected ReleaseUeContext"),
         }
@@ -1054,8 +1069,14 @@ mod tests {
             amf_ue_ngap_id: 2001,
             ran_ue_ngap_id: 1001,
             pdu_session_setup_list: vec![
-                PduSessionSetupItem { psi: 5, transfer: vec![] },
-                PduSessionSetupItem { psi: 6, transfer: vec![] },
+                PduSessionSetupItem {
+                    psi: 5,
+                    transfer: vec![],
+                },
+                PduSessionSetupItem {
+                    psi: 6,
+                    transfer: vec![],
+                },
             ],
             pdu_session_failed_list: vec![],
         };
@@ -1089,8 +1110,14 @@ mod tests {
 
         match result {
             NgapHandlerResult::ReleaseUeContext(cause) => {
-                assert_eq!(cause.cause, radio_network_cause::RADIO_RESOURCES_NOT_AVAILABLE);
-                assert_eq!(ran_ue.ue_ctx_rel_action, NgapUeCtxRelAction::UeContextRemove);
+                assert_eq!(
+                    cause.cause,
+                    radio_network_cause::RADIO_RESOURCES_NOT_AVAILABLE
+                );
+                assert_eq!(
+                    ran_ue.ue_ctx_rel_action,
+                    NgapUeCtxRelAction::UeContextRemove
+                );
             }
             _ => panic!("Expected ReleaseUeContext"),
         }
@@ -1115,7 +1142,10 @@ mod tests {
 
     #[test]
     fn test_parse_cause() {
-        let cause = parse_cause(cause_group::RADIO_NETWORK, radio_network_cause::USER_INACTIVITY);
+        let cause = parse_cause(
+            cause_group::RADIO_NETWORK,
+            radio_network_cause::USER_INACTIVITY,
+        );
         assert_eq!(cause.group, cause_group::RADIO_NETWORK);
         assert_eq!(cause.cause, radio_network_cause::USER_INACTIVITY);
     }

@@ -3,8 +3,8 @@
 //! This module provides the HTTP server for exposing Prometheus metrics,
 //! mirroring lib/metrics/prometheus/context.c from the C implementation.
 
-use std::net::SocketAddr;
 use crate::types::ServerConfig;
+use std::net::SocketAddr;
 
 /// Metrics server state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +20,7 @@ pub enum ServerState {
 }
 
 /// Metrics HTTP server
-/// 
+///
 /// Provides HTTP endpoints for:
 /// - `/` - Health check
 /// - `/metrics` - Prometheus metrics
@@ -62,7 +62,7 @@ impl MetricsServer {
     }
 
     /// Start the metrics server
-    /// 
+    ///
     /// This starts an HTTP server that exposes:
     /// - `/` - Returns "OK" for health checks
     /// - `/metrics` - Returns Prometheus metrics in text format
@@ -82,7 +82,7 @@ impl MetricsServer {
         // 2. Handle GET requests to /
         // 3. Handle GET requests to /metrics
         // 4. Handle custom endpoints
-        
+
         log::info!(
             "metrics_server() [http://{}]:{}",
             self.config.addr.ip(),
@@ -124,7 +124,7 @@ impl ServerPool {
         if self.servers.len() >= self.capacity {
             return None;
         }
-        
+
         let server = MetricsServer::new(config);
         self.servers.push(server);
         self.servers.last()
@@ -156,10 +156,7 @@ impl ServerPool {
 
     /// Start all servers
     pub fn start_all(&mut self) -> Vec<Result<(), String>> {
-        self.servers
-            .iter_mut()
-            .map(|s| s.start())
-            .collect()
+        self.servers.iter_mut().map(|s| s.start()).collect()
     }
 
     /// Stop all servers

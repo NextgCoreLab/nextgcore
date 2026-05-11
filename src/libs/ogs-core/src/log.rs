@@ -6,8 +6,7 @@ pub use log::{debug, error, info, trace, warn};
 
 /// Log levels matching C implementation
 #[repr(i32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum OgsLogLevel {
     None = 0,
     Fatal = 1,
@@ -18,7 +17,6 @@ pub enum OgsLogLevel {
     Debug = 5,
     Trace = 6,
 }
-
 
 /// Initialize logging
 pub fn ogs_log_init() {
@@ -131,12 +129,30 @@ impl OtelSeverity {
     /// Get severity text
     pub fn to_text(&self) -> &'static str {
         match self {
-            OtelSeverity::Trace | OtelSeverity::Trace2 | OtelSeverity::Trace3 | OtelSeverity::Trace4 => "TRACE",
-            OtelSeverity::Debug | OtelSeverity::Debug2 | OtelSeverity::Debug3 | OtelSeverity::Debug4 => "DEBUG",
-            OtelSeverity::Info | OtelSeverity::Info2 | OtelSeverity::Info3 | OtelSeverity::Info4 => "INFO",
-            OtelSeverity::Warn | OtelSeverity::Warn2 | OtelSeverity::Warn3 | OtelSeverity::Warn4 => "WARN",
-            OtelSeverity::Error | OtelSeverity::Error2 | OtelSeverity::Error3 | OtelSeverity::Error4 => "ERROR",
-            OtelSeverity::Fatal | OtelSeverity::Fatal2 | OtelSeverity::Fatal3 | OtelSeverity::Fatal4 => "FATAL",
+            OtelSeverity::Trace
+            | OtelSeverity::Trace2
+            | OtelSeverity::Trace3
+            | OtelSeverity::Trace4 => "TRACE",
+            OtelSeverity::Debug
+            | OtelSeverity::Debug2
+            | OtelSeverity::Debug3
+            | OtelSeverity::Debug4 => "DEBUG",
+            OtelSeverity::Info
+            | OtelSeverity::Info2
+            | OtelSeverity::Info3
+            | OtelSeverity::Info4 => "INFO",
+            OtelSeverity::Warn
+            | OtelSeverity::Warn2
+            | OtelSeverity::Warn3
+            | OtelSeverity::Warn4 => "WARN",
+            OtelSeverity::Error
+            | OtelSeverity::Error2
+            | OtelSeverity::Error3
+            | OtelSeverity::Error4 => "ERROR",
+            OtelSeverity::Fatal
+            | OtelSeverity::Fatal2
+            | OtelSeverity::Fatal3
+            | OtelSeverity::Fatal4 => "FATAL",
         }
     }
 }
@@ -242,7 +258,8 @@ impl OtelLogRecord {
 
         if !self.resource_attributes.is_empty() {
             json.push_str(r#","resourceAttributes":{"#);
-            let attrs: Vec<String> = self.resource_attributes
+            let attrs: Vec<String> = self
+                .resource_attributes
                 .iter()
                 .map(|(k, v)| format!(r#""{k}":"{v}""#))
                 .collect();
@@ -252,7 +269,8 @@ impl OtelLogRecord {
 
         if !self.attributes.is_empty() {
             json.push_str(r#","attributes":{"#);
-            let attrs: Vec<String> = self.attributes
+            let attrs: Vec<String> = self
+                .attributes
                 .iter()
                 .map(|(k, v)| format!(r#""{k}":"{v}""#))
                 .collect();
@@ -281,29 +299,48 @@ impl OtelLogRecord {
             self.body,
             self.trace_id.as_deref().unwrap_or("none"),
             self.span_id.as_deref().unwrap_or("none"),
-            self.attributes.iter()
+            self.attributes
+                .iter()
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect::<Vec<_>>()
                 .join(" ")
         );
 
         match self.severity_number {
-            OtelSeverity::Trace | OtelSeverity::Trace2 | OtelSeverity::Trace3 | OtelSeverity::Trace4 => {
+            OtelSeverity::Trace
+            | OtelSeverity::Trace2
+            | OtelSeverity::Trace3
+            | OtelSeverity::Trace4 => {
                 log::trace!("{msg}");
             }
-            OtelSeverity::Debug | OtelSeverity::Debug2 | OtelSeverity::Debug3 | OtelSeverity::Debug4 => {
+            OtelSeverity::Debug
+            | OtelSeverity::Debug2
+            | OtelSeverity::Debug3
+            | OtelSeverity::Debug4 => {
                 log::debug!("{msg}");
             }
-            OtelSeverity::Info | OtelSeverity::Info2 | OtelSeverity::Info3 | OtelSeverity::Info4 => {
+            OtelSeverity::Info
+            | OtelSeverity::Info2
+            | OtelSeverity::Info3
+            | OtelSeverity::Info4 => {
                 log::info!("{msg}");
             }
-            OtelSeverity::Warn | OtelSeverity::Warn2 | OtelSeverity::Warn3 | OtelSeverity::Warn4 => {
+            OtelSeverity::Warn
+            | OtelSeverity::Warn2
+            | OtelSeverity::Warn3
+            | OtelSeverity::Warn4 => {
                 log::warn!("{msg}");
             }
-            OtelSeverity::Error | OtelSeverity::Error2 | OtelSeverity::Error3 | OtelSeverity::Error4 => {
+            OtelSeverity::Error
+            | OtelSeverity::Error2
+            | OtelSeverity::Error3
+            | OtelSeverity::Error4 => {
                 log::error!("{msg}");
             }
-            OtelSeverity::Fatal | OtelSeverity::Fatal2 | OtelSeverity::Fatal3 | OtelSeverity::Fatal4 => {
+            OtelSeverity::Fatal
+            | OtelSeverity::Fatal2
+            | OtelSeverity::Fatal3
+            | OtelSeverity::Fatal4 => {
                 log::error!("[FATAL] {msg}");
             }
         }
@@ -380,14 +417,16 @@ mod otel_tests {
 
     #[test]
     fn test_otel_log_record_with_trace_context() {
-        let record = OtelLogRecord::new(OtelSeverity::Debug, "Traced log")
-            .with_trace_context(
-                "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
-                "00f067aa0ba902b7".to_string(),
-                1,
-            );
+        let record = OtelLogRecord::new(OtelSeverity::Debug, "Traced log").with_trace_context(
+            "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
+            "00f067aa0ba902b7".to_string(),
+            1,
+        );
 
-        assert_eq!(record.trace_id, Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string()));
+        assert_eq!(
+            record.trace_id,
+            Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string())
+        );
         assert_eq!(record.span_id, Some("00f067aa0ba902b7".to_string()));
         assert_eq!(record.trace_flags, 1);
     }

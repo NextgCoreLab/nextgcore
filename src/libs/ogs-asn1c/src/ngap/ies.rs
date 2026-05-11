@@ -2,8 +2,10 @@
 //!
 //! Protocol IE containers and common IEs from NGAP-IEs (3GPP TS 38.413)
 
-use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerError, PerResult};
 use super::types::{Criticality, ProtocolIeId};
+use crate::per::{
+    AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerError, PerResult,
+};
 
 /// ProtocolIE-Field - Single IE with ID, criticality, and value
 /// ASN.1: ProtocolIE-Field ::= SEQUENCE { id, criticality, value }
@@ -18,11 +20,11 @@ impl AperEncode for ProtocolIeField {
     fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()> {
         self.id.encode_aper(encoder)?;
         self.criticality.encode_aper(encoder)?;
-        
+
         // Value is encoded as OPEN TYPE
         encoder.encode_length_determinant(self.value.len())?;
         encoder.write_bytes(&self.value);
-        
+
         Ok(())
     }
 }
@@ -31,10 +33,10 @@ impl AperDecode for ProtocolIeField {
     fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
         let id = ProtocolIeId::decode_aper(decoder)?;
         let criticality = Criticality::decode_aper(decoder)?;
-        
+
         let value_len = decoder.decode_length_determinant()?;
         let value = decoder.read_bytes(value_len)?;
-        
+
         Ok(ProtocolIeField {
             id,
             criticality,
@@ -42,7 +44,6 @@ impl AperDecode for ProtocolIeField {
         })
     }
 }
-
 
 /// ProtocolIE-Container - Sequence of IEs
 /// ASN.1: ProtocolIE-Container ::= SEQUENCE (SIZE (0..maxProtocolIEs)) OF ProtocolIE-Field
@@ -61,7 +62,9 @@ impl ProtocolIeContainer {
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { ies: Vec::with_capacity(capacity) }
+        Self {
+            ies: Vec::with_capacity(capacity),
+        }
     }
 
     pub fn push(&mut self, ie: ProtocolIeField) {
@@ -91,12 +94,12 @@ impl AperEncode for ProtocolIeContainer {
     fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()> {
         // Encode length (constrained to 0..65535)
         encoder.encode_constrained_length(self.ies.len(), 0, Self::MAX_PROTOCOL_IES)?;
-        
+
         // Encode each IE
         for ie in &self.ies {
             ie.encode_aper(encoder)?;
         }
-        
+
         Ok(())
     }
 }
@@ -104,16 +107,15 @@ impl AperEncode for ProtocolIeContainer {
 impl AperDecode for ProtocolIeContainer {
     fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
         let count = decoder.decode_constrained_length(0, Self::MAX_PROTOCOL_IES)?;
-        
+
         let mut ies = Vec::with_capacity(count);
         for _ in 0..count {
             ies.push(ProtocolIeField::decode_aper(decoder)?);
         }
-        
+
         Ok(ProtocolIeContainer { ies })
     }
 }
-
 
 /// AMF-UE-NGAP-ID - Unique identifier for UE in AMF
 /// ASN.1: AMF-UE-NGAP-ID ::= INTEGER (0..1099511627775)
@@ -205,13 +207,12 @@ impl AperDecode for TimeToWait {
             3 => Ok(TimeToWait::V10s),
             4 => Ok(TimeToWait::V20s),
             5 => Ok(TimeToWait::V60s),
-            _ => Err(crate::per::PerError::DecodeError(
-                format!("Unknown TimeToWait value: {value}")
-            )),
+            _ => Err(crate::per::PerError::DecodeError(format!(
+                "Unknown TimeToWait value: {value}"
+            ))),
         }
     }
 }
-
 
 /// RelativeAMFCapacity - Relative capacity of AMF
 /// ASN.1: RelativeAMFCapacity ::= INTEGER (0..255)
@@ -345,14 +346,20 @@ impl SNssai {
 /// ASN.1: UE-NGAP-IDs ::= CHOICE { uE-NGAP-ID-pair, aMF-UE-NGAP-ID, ... }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UeNgapIds {
-    UeNgapIdPair { amf_ue_ngap_id: AmfUeNgapId, ran_ue_ngap_id: RanUeNgapId },
+    UeNgapIdPair {
+        amf_ue_ngap_id: AmfUeNgapId,
+        ran_ue_ngap_id: RanUeNgapId,
+    },
     AmfUeNgapId(AmfUeNgapId),
 }
 
 impl AperEncode for UeNgapIds {
     fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()> {
         match self {
-            UeNgapIds::UeNgapIdPair { amf_ue_ngap_id, ran_ue_ngap_id } => {
+            UeNgapIds::UeNgapIdPair {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+            } => {
                 encoder.encode_choice_index(0, 2, true)?;
                 amf_ue_ngap_id.encode_aper(encoder)?;
                 ran_ue_ngap_id.encode_aper(encoder)?;
@@ -373,7 +380,10 @@ impl AperDecode for UeNgapIds {
             0 => {
                 let amf_ue_ngap_id = AmfUeNgapId::decode_aper(decoder)?;
                 let ran_ue_ngap_id = RanUeNgapId::decode_aper(decoder)?;
-                Ok(UeNgapIds::UeNgapIdPair { amf_ue_ngap_id, ran_ue_ngap_id })
+                Ok(UeNgapIds::UeNgapIdPair {
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                })
             }
             1 => {
                 let id = AmfUeNgapId::decode_aper(decoder)?;
@@ -422,9 +432,9 @@ impl AperDecode for PagingDrx {
             1 => Ok(PagingDrx::V64),
             2 => Ok(PagingDrx::V128),
             3 => Ok(PagingDrx::V256),
-            _ => Err(crate::per::PerError::DecodeError(
-                format!("Unknown PagingDrx value: {value}")
-            )),
+            _ => Err(crate::per::PerError::DecodeError(format!(
+                "Unknown PagingDrx value: {value}"
+            ))),
         }
     }
 }
@@ -467,7 +477,10 @@ impl AperEncode for SecurityIndication {
         encoder.encode_enumerated(self.integrity_protection_indication as i64, &constraint)?;
 
         // ConfidentialityProtectionIndication
-        encoder.encode_enumerated(self.confidentiality_protection_indication as i64, &constraint)?;
+        encoder.encode_enumerated(
+            self.confidentiality_protection_indication as i64,
+            &constraint,
+        )?;
 
         Ok(())
     }
@@ -483,14 +496,22 @@ impl AperDecode for SecurityIndication {
             0 => IntegrityProtectionIndication::Required,
             1 => IntegrityProtectionIndication::Preferred,
             2 => IntegrityProtectionIndication::NotNeeded,
-            v => return Err(PerError::DecodeError(format!("Invalid IntegrityProtectionIndication: {v}"))),
+            v => {
+                return Err(PerError::DecodeError(format!(
+                    "Invalid IntegrityProtectionIndication: {v}"
+                )))
+            }
         };
 
         let confidentiality = match decoder.decode_enumerated(&constraint)? {
             0 => ConfidentialityProtectionIndication::Required,
             1 => ConfidentialityProtectionIndication::Preferred,
             2 => ConfidentialityProtectionIndication::NotNeeded,
-            v => return Err(PerError::DecodeError(format!("Invalid ConfidentialityProtectionIndication: {v}"))),
+            v => {
+                return Err(PerError::DecodeError(format!(
+                    "Invalid ConfidentialityProtectionIndication: {v}"
+                )))
+            }
         };
 
         Ok(SecurityIndication {
@@ -505,9 +526,9 @@ impl AperDecode for SecurityIndication {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Guami {
     pub plmn_identity: PlmnIdentity,
-    pub amf_region_id: u8,      // BIT STRING (SIZE(8))
-    pub amf_set_id: u16,         // BIT STRING (SIZE(10))
-    pub amf_pointer: u8,         // BIT STRING (SIZE(6))
+    pub amf_region_id: u8, // BIT STRING (SIZE(8))
+    pub amf_set_id: u16,   // BIT STRING (SIZE(10))
+    pub amf_pointer: u8,   // BIT STRING (SIZE(6))
 }
 
 impl AperEncode for Guami {
@@ -579,7 +600,9 @@ impl AperDecode for HandoverType {
             0 => Ok(HandoverType::Intra5gs),
             1 => Ok(HandoverType::FivegsToEps),
             2 => Ok(HandoverType::EpsTo5gs),
-            _ => Err(PerError::DecodeError(format!("Unknown HandoverType value: {value}"))),
+            _ => Err(PerError::DecodeError(format!(
+                "Unknown HandoverType value: {value}"
+            ))),
         }
     }
 }
@@ -607,9 +630,9 @@ impl AperDecode for DirectForwardingPathAvailability {
         let value = decoder.decode_enumerated(&Self::CONSTRAINT)?;
         match value {
             0 => Ok(DirectForwardingPathAvailability::DirectPathAvailable),
-            _ => Err(PerError::DecodeError(
-                format!("Unknown DirectForwardingPathAvailability value: {value}")
-            )),
+            _ => Err(PerError::DecodeError(format!(
+                "Unknown DirectForwardingPathAvailability value: {value}"
+            ))),
         }
     }
 }
@@ -685,35 +708,35 @@ pub enum RrcEstablishmentCause {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per::{AperEncoder, AperDecoder};
+    use crate::per::{AperDecoder, AperEncoder};
 
     #[test]
     fn test_amf_ue_ngap_id_roundtrip() {
         let id = AmfUeNgapId(12345678);
-        
+
         let mut encoder = AperEncoder::new();
         id.encode_aper(&mut encoder).unwrap();
         encoder.align();
-        
+
         let bytes = encoder.into_bytes();
         let mut decoder = AperDecoder::new(&bytes);
         let decoded = AmfUeNgapId::decode_aper(&mut decoder).unwrap();
-        
+
         assert_eq!(id, decoded);
     }
 
     #[test]
     fn test_ran_ue_ngap_id_roundtrip() {
         let id = RanUeNgapId(0xDEADBEEF);
-        
+
         let mut encoder = AperEncoder::new();
         id.encode_aper(&mut encoder).unwrap();
         encoder.align();
-        
+
         let bytes = encoder.into_bytes();
         let mut decoder = AperDecoder::new(&bytes);
         let decoded = RanUeNgapId::decode_aper(&mut decoder).unwrap();
-        
+
         assert_eq!(id, decoded);
     }
 
@@ -730,15 +753,15 @@ mod tests {
             criticality: Criticality::Reject,
             value: vec![0xDE, 0xAD, 0xBE, 0xEF],
         });
-        
+
         let mut encoder = AperEncoder::new();
         container.encode_aper(&mut encoder).unwrap();
         encoder.align();
-        
+
         let bytes = encoder.into_bytes();
         let mut decoder = AperDecoder::new(&bytes);
         let decoded = ProtocolIeContainer::decode_aper(&mut decoder).unwrap();
-        
+
         assert_eq!(container.len(), decoded.len());
         assert_eq!(container.ies[0].id, decoded.ies[0].id);
         assert_eq!(container.ies[1].id, decoded.ies[1].id);

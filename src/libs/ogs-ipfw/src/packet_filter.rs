@@ -56,11 +56,7 @@ pub enum PfComponent {
     /// Single port
     SinglePort { port: u16, is_local: bool },
     /// Port range
-    PortRange {
-        low: u16,
-        high: u16,
-        is_local: bool,
-    },
+    PortRange { low: u16, high: u16, is_local: bool },
     /// Security Parameter Index
     SecurityParameterIndex(u32),
     /// ToS/Traffic Class
@@ -159,7 +155,7 @@ impl PfContent {
 }
 
 /// Generate packet filter content from an IPFW rule
-/// 
+///
 /// # Arguments
 /// * `direction` - Flow direction (DOWNLINK_ONLY, UPLINK_ONLY, BIDIRECTIONAL)
 /// * `rule` - The IPFW rule
@@ -180,7 +176,7 @@ pub fn pf_content_from_ipfw_rule(
     if rule.ipv4_src {
         let is_local = match direction {
             flow_direction::DOWNLINK_ONLY | flow_direction::BIDIRECTIONAL => false, // remote
-            flow_direction::UPLINK_ONLY => true,                                     // local
+            flow_direction::UPLINK_ONLY => true,                                    // local
             _ => false,
         };
 
@@ -197,7 +193,7 @@ pub fn pf_content_from_ipfw_rule(
     if rule.ipv4_dst {
         let is_local = match direction {
             flow_direction::DOWNLINK_ONLY | flow_direction::BIDIRECTIONAL => true, // local
-            flow_direction::UPLINK_ONLY => false,                                   // remote
+            flow_direction::UPLINK_ONLY => false,                                  // remote
             _ => false,
         };
 

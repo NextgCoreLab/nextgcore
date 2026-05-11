@@ -4,7 +4,9 @@
 
 use crate::context::{bsf_self, get_sess_load};
 use crate::event::{BsfEvent, BsfEventId, BsfTimerId};
-use crate::sbi_response::{send_error_response, send_not_found_response, send_gateway_timeout_response};
+use crate::sbi_response::{
+    send_error_response, send_gateway_timeout_response, send_not_found_response,
+};
 
 // Note: The state machine code below is a port from Open5GS C code
 // but is not currently used for HTTP response handling.
@@ -93,7 +95,6 @@ impl BsfSmContext {
         }
     }
 
-
     fn handle_sbi_server_event(&mut self, event: &mut BsfEvent) {
         let (stream_id, service_name, api_version, method, resource_components) = {
             let sbi = match &event.sbi {
@@ -132,7 +133,11 @@ impl BsfSmContext {
         // Check API version (BSF uses v1)
         if api_version != "v1" {
             log::error!("Not supported version [{api_version}], expected [v1]");
-            send_error_response(stream_id, 400, &format!("Unsupported API version: {api_version}"));
+            send_error_response(
+                stream_id,
+                400,
+                &format!("Unsupported API version: {api_version}"),
+            );
             return;
         }
 
@@ -142,7 +147,12 @@ impl BsfSmContext {
                 self.handle_nnrf_nfm_request(&method, &resource_components, stream_id);
             }
             "nbsf-management" => {
-                self.handle_nbsf_management_request(event, &method, &resource_components, stream_id);
+                self.handle_nbsf_management_request(
+                    event,
+                    &method,
+                    &resource_components,
+                    stream_id,
+                );
             }
             _ => {
                 log::error!("Invalid API name [{service_name}]");
@@ -151,7 +161,12 @@ impl BsfSmContext {
         }
     }
 
-    fn handle_nnrf_nfm_request(&mut self, method: &str, resource_components: &[String], _stream_id: u64) {
+    fn handle_nnrf_nfm_request(
+        &mut self,
+        method: &str,
+        resource_components: &[String],
+        _stream_id: u64,
+    ) {
         let resource = resource_components.first().map(|s| s.as_str());
 
         match resource {
@@ -184,11 +199,11 @@ impl BsfSmContext {
             Some("pcf-bindings") => {
                 // Check if binding_id is provided (resource_components[1])
                 let binding_id = resource_components.get(1).map(|s| s.as_str());
-                
+
                 if let Some(binding_id) = binding_id {
                     // Operations on existing binding
                     log::debug!("PCF binding operation: {method} on binding_id={binding_id} (stream_id={stream_id})");
-                    
+
                     let ctx = bsf_self();
                     let sess = {
                         if let Ok(context) = ctx.read() {
@@ -200,7 +215,10 @@ impl BsfSmContext {
 
                     if sess.is_none() {
                         log::error!("Session not found for binding_id={binding_id}");
-                        send_not_found_response(stream_id, &format!("PCF binding not found: {binding_id}"));
+                        send_not_found_response(
+                            stream_id,
+                            &format!("PCF binding not found: {binding_id}"),
+                        );
                         return;
                     }
 
@@ -244,7 +262,6 @@ impl BsfSmContext {
             }
         }
     }
-
 
     fn handle_sbi_client_event(&mut self, event: &mut BsfEvent) {
         let (service_name, api_version, resource_components, _res_status) = {

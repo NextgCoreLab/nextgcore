@@ -124,7 +124,11 @@ impl ScpSmContext {
         // Check API version (SCP uses v1)
         if api_version != "v1" {
             log::error!("Not supported version [{api_version}], expected [v1]");
-            send_error_response(stream_id, 400, &format!("Unsupported API version: {api_version}"));
+            send_error_response(
+                stream_id,
+                400,
+                &format!("Unsupported API version: {api_version}"),
+            );
             return;
         }
 

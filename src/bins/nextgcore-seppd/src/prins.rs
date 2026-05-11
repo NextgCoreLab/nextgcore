@@ -70,13 +70,23 @@ impl PrinsContext {
             id: "nudm-sdm-profile".to_string(),
             service_name: "nudm-sdm".to_string(),
             encrypt_ies: vec![
-                IeDescriptor { location: "body".to_string(), path: "$.supi".to_string() },
-                IeDescriptor { location: "body".to_string(), path: "$.pei".to_string() },
-                IeDescriptor { location: "body".to_string(), path: "$.gpsi".to_string() },
+                IeDescriptor {
+                    location: "body".to_string(),
+                    path: "$.supi".to_string(),
+                },
+                IeDescriptor {
+                    location: "body".to_string(),
+                    path: "$.pei".to_string(),
+                },
+                IeDescriptor {
+                    location: "body".to_string(),
+                    path: "$.gpsi".to_string(),
+                },
             ],
-            sign_ies: vec![
-                IeDescriptor { location: "body".to_string(), path: "$.nssai".to_string() },
-            ],
+            sign_ies: vec![IeDescriptor {
+                location: "body".to_string(),
+                path: "$.nssai".to_string(),
+            }],
         });
 
         // Profile for NAUSF (authentication)
@@ -84,8 +94,14 @@ impl PrinsContext {
             id: "nausf-auth-profile".to_string(),
             service_name: "nausf-auth".to_string(),
             encrypt_ies: vec![
-                IeDescriptor { location: "body".to_string(), path: "$.supiOrSuci".to_string() },
-                IeDescriptor { location: "body".to_string(), path: "$.authenticationVector".to_string() },
+                IeDescriptor {
+                    location: "body".to_string(),
+                    path: "$.supiOrSuci".to_string(),
+                },
+                IeDescriptor {
+                    location: "body".to_string(),
+                    path: "$.authenticationVector".to_string(),
+                },
             ],
             sign_ies: vec![],
         });
@@ -93,7 +109,9 @@ impl PrinsContext {
 
     /// Find applicable profile for a given service name
     pub fn find_profile(&self, service_name: &str) -> Option<&DataTypeProfile> {
-        self.profiles.iter().find(|p| p.service_name == service_name)
+        self.profiles
+            .iter()
+            .find(|p| p.service_name == service_name)
     }
 }
 
@@ -139,7 +157,8 @@ pub fn apply_prins_protection(
                                 if let Some(original_value) = obj.remove(field_name) {
                                     // Encrypt the IE value (simplified: XOR-based placeholder)
                                     let encrypted = encrypt_ie(
-                                        &serde_json::to_string(&original_value).expect("value expected"),
+                                        &serde_json::to_string(&original_value)
+                                            .expect("value expected"),
                                         &prins_ctx.shared_key,
                                     );
                                     obj.insert(
@@ -215,17 +234,20 @@ pub fn remove_prins_protection(
 
     let payload = message.payload.as_ref().ok_or("No payload to unprotect")?;
     let decoded = base64url_decode(payload).map_err(|e| format!("Base64 decode failed: {e}"))?;
-    let mut json: serde_json::Value = serde_json::from_slice(&decoded)
-        .map_err(|e| format!("JSON parse failed: {e}"))?;
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&decoded).map_err(|e| format!("JSON parse failed: {e}"))?;
 
     for modification in &message.modifications_block {
         if modification.ie_action == "encrypt" {
             if let Some(field_name) = modification.ie_path.strip_prefix("$.") {
                 if modification.ie_location == "body" {
                     if let Some(obj) = json.as_object_mut() {
-                        if let Some(encrypted_value) = obj.get(field_name).and_then(|v| v.as_str()) {
+                        if let Some(encrypted_value) = obj.get(field_name).and_then(|v| v.as_str())
+                        {
                             let decrypted = decrypt_ie(encrypted_value, &prins_ctx.shared_key);
-                            if let Ok(original_value) = serde_json::from_str::<serde_json::Value>(&decrypted) {
+                            if let Ok(original_value) =
+                                serde_json::from_str::<serde_json::Value>(&decrypted)
+                            {
                                 obj.insert(field_name.to_string(), original_value);
                             }
                         }
@@ -273,8 +295,7 @@ pub fn process_n32f_request(
         headers.insert(header.name.clone(), header.value.clone());
     }
 
-    let body = message.payload
-        .and_then(|p| base64url_decode(&p).ok());
+    let body = message.payload.and_then(|p| base64url_decode(&p).ok());
 
     Ok((method, url, headers, body))
 }
@@ -297,7 +318,7 @@ fn derive_aes128_key(raw_key: &[u8]) -> [u8; 16] {
         return k;
     }
     // Hash to get a well-distributed 16-byte key
-    use sha2::{Sha256, Digest};
+    use sha2::{Digest, Sha256};
     let hash = Sha256::digest(raw_key);
     let mut k = [0u8; 16];
     k.copy_from_slice(&hash[..16]);
@@ -309,12 +330,14 @@ fn derive_aes128_key(raw_key: &[u8]) -> [u8; 16] {
 /// Output format: base64url(nonce || ciphertext || tag)
 /// where nonce is 12 random bytes, ciphertext and tag are from AES-GCM.
 fn encrypt_ie(plaintext: &str, key: &[u8]) -> String {
-    use aes_gcm::{Aes128Gcm, KeyInit, aead::{Aead, Nonce}};
+    use aes_gcm::{
+        aead::{Aead, Nonce},
+        Aes128Gcm, KeyInit,
+    };
     use rand::Rng as _;
 
     let aes_key = derive_aes128_key(key);
-    let cipher = Aes128Gcm::new_from_slice(&aes_key)
-        .expect("AES-128 key is exactly 16 bytes");
+    let cipher = Aes128Gcm::new_from_slice(&aes_key).expect("AES-128 key is exactly 16 bytes");
 
     let nonce_bytes: [u8; AES_GCM_NONCE_LEN] = rand::rng().random();
     let nonce = Nonce::<Aes128Gcm>::from_slice(&nonce_bytes);
@@ -338,7 +361,10 @@ fn encrypt_ie(plaintext: &str, key: &[u8]) -> String {
 ///
 /// Expects base64url(nonce || ciphertext || tag) as produced by encrypt_ie.
 fn decrypt_ie(ciphertext_b64: &str, key: &[u8]) -> String {
-    use aes_gcm::{Aes128Gcm, KeyInit, aead::{Aead, Nonce}};
+    use aes_gcm::{
+        aead::{Aead, Nonce},
+        Aes128Gcm, KeyInit,
+    };
 
     let blob = match base64url_decode(ciphertext_b64) {
         Ok(b) => b,
@@ -353,8 +379,7 @@ fn decrypt_ie(ciphertext_b64: &str, key: &[u8]) -> String {
     let nonce = Nonce::<Aes128Gcm>::from_slice(nonce_bytes);
 
     let aes_key = derive_aes128_key(key);
-    let cipher = Aes128Gcm::new_from_slice(&aes_key)
-        .expect("AES-128 key is exactly 16 bytes");
+    let cipher = Aes128Gcm::new_from_slice(&aes_key).expect("AES-128 key is exactly 16 bytes");
 
     match cipher.decrypt(nonce, ct) {
         Ok(plaintext) => String::from_utf8(plaintext).unwrap_or_default(),
@@ -371,7 +396,9 @@ fn sign_ie(value: &str, key: &[u8]) -> String {
     let key_bytes = if key.is_empty() { &[0x42u8] } else { key };
     let mut hash: u64 = 0;
     for (i, b) in value.bytes().enumerate() {
-        hash = hash.wrapping_mul(31).wrapping_add((b ^ key_bytes[i % key_bytes.len()]) as u64);
+        hash = hash
+            .wrapping_mul(31)
+            .wrapping_add((b ^ key_bytes[i % key_bytes.len()]) as u64);
     }
     format!("{hash:016x}")
 }
@@ -380,7 +407,10 @@ fn sign_ie(value: &str, key: &[u8]) -> String {
 fn extract_service_name(url: &str) -> String {
     let path = url.split('?').next().unwrap_or(url);
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    parts.first().map(|s| s.to_string()).expect("value expected")
+    parts
+        .first()
+        .map(|s| s.to_string())
+        .expect("value expected")
 }
 
 /// Simple base64url encode (no padding)
@@ -438,7 +468,9 @@ fn base64url_decode(input: &str) -> Result<Vec<u8>, String> {
 /// Simple random u64 for context ID generation
 fn random_u64() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("value expected");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("value expected");
     now.as_nanos() as u64
 }
 
@@ -474,7 +506,10 @@ mod tests {
     #[test]
     fn test_extract_service_name() {
         assert_eq!(extract_service_name("/nudm-sdm/v1/supi"), "nudm-sdm");
-        assert_eq!(extract_service_name("/nausf-auth/v1/ue-authentications"), "nausf-auth");
+        assert_eq!(
+            extract_service_name("/nausf-auth/v1/ue-authentications"),
+            "nausf-auth"
+        );
         assert_eq!(extract_service_name(""), "");
     }
 
@@ -493,9 +528,7 @@ mod tests {
         });
         let body_bytes = serde_json::to_vec(&body).unwrap();
 
-        let headers = vec![
-            ("content-type".to_string(), "application/json".to_string()),
-        ];
+        let headers = vec![("content-type".to_string(), "application/json".to_string())];
         let mut message = build_n32f_prins_message(
             "POST",
             "/nudm-sdm/v1/supi",
@@ -535,9 +568,7 @@ mod tests {
         use crate::n32c_build::*;
 
         let body = b"{\"key\":\"value\"}";
-        let headers = vec![
-            ("content-type".to_string(), "application/json".to_string()),
-        ];
+        let headers = vec![("content-type".to_string(), "application/json".to_string())];
         let message = build_n32f_tls_message("GET", "/nudm-sdm/v1/supi", &headers, Some(body));
         let json_bytes = serde_json::to_vec(&message).unwrap();
 

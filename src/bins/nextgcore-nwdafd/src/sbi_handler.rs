@@ -135,10 +135,7 @@ pub async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
         subscription = subscription.with_target_supi(supi.to_string());
     }
 
-    if let Some(snssai_obj) = data
-        .get("targetOfAnalytics")
-        .and_then(|v| v.get("snssai"))
-    {
+    if let Some(snssai_obj) = data.get("targetOfAnalytics").and_then(|v| v.get("snssai")) {
         if let (Some(sst), sd) = (
             snssai_obj.get("sst").and_then(|v| v.as_u64()),
             snssai_obj.get("sd").and_then(|v| v.as_u64()),
@@ -170,10 +167,7 @@ pub async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
                 "expiryTime": expiry_seconds,
             }))
             .unwrap_or_else(|_| SbiResponse::with_status(201)),
-        None => send_bad_request(
-            "Failed to create subscription",
-            Some("SUBSCRIPTION_FAILED"),
-        ),
+        None => send_bad_request("Failed to create subscription", Some("SUBSCRIPTION_FAILED")),
     }
 }
 
@@ -260,10 +254,7 @@ pub async fn handle_model_provision(request: &SbiRequest) -> SbiResponse {
         }
     };
 
-    let model_id = data
-        .get("modelId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let model_id = data.get("modelId").and_then(|v| v.as_str()).unwrap_or("");
     let version = data
         .get("version")
         .and_then(|v| v.as_str())
@@ -305,7 +296,10 @@ pub async fn handle_model_provision(request: &SbiRequest) -> SbiResponse {
                 "status": "TRAINING",
             }))
             .unwrap_or_else(|_| SbiResponse::with_status(201)),
-        None => send_bad_request("Failed to register model", Some("MODEL_REGISTRATION_FAILED")),
+        None => send_bad_request(
+            "Failed to register model",
+            Some("MODEL_REGISTRATION_FAILED"),
+        ),
     }
 }
 

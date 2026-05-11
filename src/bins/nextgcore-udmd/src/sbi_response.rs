@@ -2,7 +2,9 @@
 //!
 //! Helper functions for sending SBI error responses in the UDM state machines.
 
-use ogs_sbi::server::{send_bad_request, send_forbidden, send_gateway_timeout, send_not_found, send_method_not_allowed};
+use ogs_sbi::server::{
+    send_bad_request, send_forbidden, send_gateway_timeout, send_method_not_allowed, send_not_found,
+};
 
 /// Send an error response for invalid API/service name
 pub fn send_error_response(stream_id: u64, status: u16, detail: &str) {
@@ -52,7 +54,6 @@ pub fn send_gateway_timeout_response(stream_id: u64, detail: &str) {
 
 #[cfg(test)]
 mod tests {
-    
 
     #[test]
     fn test_send_error_response_creates_correct_status() {

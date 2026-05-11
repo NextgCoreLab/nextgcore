@@ -145,7 +145,9 @@ pub struct EndpointHealth {
 impl EndpointHealth {
     /// Error rate (0.0-1.0).
     pub fn error_rate(&self) -> f64 {
-        if self.request_count == 0 { return 0.0; }
+        if self.request_count == 0 {
+            return 0.0;
+        }
         self.error_count as f64 / self.request_count as f64
     }
 
@@ -195,12 +197,14 @@ impl ServiceMesh {
         self.total_routed += 1;
 
         match self.routing_mode {
-            RoutingMode::LatencyBased => {
-                healthy.iter().min_by_key(|e| e.avg_latency_us).map(|e| e.address.as_str())
-            }
-            RoutingMode::WeightedLeastConn => {
-                healthy.iter().min_by_key(|e| e.request_count / (e.weight.max(1) as u64)).map(|e| e.address.as_str())
-            }
+            RoutingMode::LatencyBased => healthy
+                .iter()
+                .min_by_key(|e| e.avg_latency_us)
+                .map(|e| e.address.as_str()),
+            RoutingMode::WeightedLeastConn => healthy
+                .iter()
+                .min_by_key(|e| e.request_count / (e.weight.max(1) as u64))
+                .map(|e| e.address.as_str()),
             _ => {
                 // Round-robin: pick by index
                 let idx = (self.total_routed as usize) % healthy.len();
@@ -215,7 +219,9 @@ impl ServiceMesh {
     }
 
     /// Total routed requests.
-    pub fn total_routed(&self) -> u64 { self.total_routed }
+    pub fn total_routed(&self) -> u64 {
+        self.total_routed
+    }
 }
 
 // ============================================================================

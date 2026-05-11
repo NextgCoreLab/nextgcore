@@ -1,7 +1,7 @@
 //! SCP SBI Path Functions
 //!
 //! Port of src/scp/sbi-path.c - SBI server/client path functions
-//! 
+//!
 //! The SCP acts as a proxy that:
 //! - Receives requests from NF consumers
 //! - Performs NF discovery delegation when needed
@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::context::{scp_self, NfType, SbiServiceType, DiscoveryOption};
+use crate::context::{scp_self, DiscoveryOption, NfType, SbiServiceType};
 
 /// SBI server configuration
 #[derive(Debug, Clone)]
@@ -47,7 +47,8 @@ pub mod headers {
     pub const DISCOVERY_TARGET_NF_TYPE: &str = "3gpp-sbi-discovery-target-nf-type";
     pub const DISCOVERY_REQUESTER_NF_TYPE: &str = "3gpp-sbi-discovery-requester-nf-type";
     pub const DISCOVERY_TARGET_NF_INSTANCE_ID: &str = "3gpp-sbi-discovery-target-nf-instance-id";
-    pub const DISCOVERY_REQUESTER_NF_INSTANCE_ID: &str = "3gpp-sbi-discovery-requester-nf-instance-id";
+    pub const DISCOVERY_REQUESTER_NF_INSTANCE_ID: &str =
+        "3gpp-sbi-discovery-requester-nf-instance-id";
     pub const DISCOVERY_SERVICE_NAMES: &str = "3gpp-sbi-discovery-service-names";
     pub const DISCOVERY_SNSSAIS: &str = "3gpp-sbi-discovery-snssais";
     pub const DISCOVERY_GUAMI: &str = "3gpp-sbi-discovery-guami";
@@ -68,13 +69,9 @@ pub fn scp_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
         return Err("SBI server already running".to_string());
     }
 
-    let config = config.unwrap_or(SbiServerConfig::default());
+    let config = config.unwrap_or_default();
 
-    log::info!(
-        "Opening SCP SBI server on {}:{}",
-        config.addr,
-        config.port
-    );
+    log::info!("Opening SCP SBI server on {}:{}", config.addr, config.port);
 
     // Note: Initialize SELF NF instance
     // In C: ogs_sbi_nf_instance_build_default(nf_instance)
@@ -206,7 +203,12 @@ pub enum RequestHandlerResult {
 /// Port of header extraction in request_handler
 pub fn parse_discovery_headers(
     request: &SbiRequest,
-) -> (Option<NfType>, Option<NfType>, Option<SbiServiceType>, DiscoveryOption) {
+) -> (
+    Option<NfType>,
+    Option<NfType>,
+    Option<SbiServiceType>,
+    DiscoveryOption,
+) {
     let mut target_nf_type: Option<NfType> = None;
     let mut requester_nf_type: Option<NfType> = None;
     let mut service_type: Option<SbiServiceType> = None;
@@ -254,17 +256,23 @@ pub fn parse_discovery_headers(
         discovery_option.set_hnrf_uri(val);
     }
 
-    (target_nf_type, requester_nf_type, service_type, discovery_option)
+    (
+        target_nf_type,
+        requester_nf_type,
+        service_type,
+        discovery_option,
+    )
 }
 
 /// Handle incoming SBI request
 /// Port of request_handler from sbi-path.c
-pub fn handle_request(
-    stream_id: u64,
-    request: &SbiRequest,
-) -> RequestHandlerResult {
-    log::debug!("SCP handling request: {} {} (stream_id={})", 
-        request.method, request.uri, stream_id);
+pub fn handle_request(stream_id: u64, request: &SbiRequest) -> RequestHandlerResult {
+    log::debug!(
+        "SCP handling request: {} {} (stream_id={})",
+        request.method,
+        request.uri,
+        stream_id
+    );
 
     // Create association for this request
     let ctx = scp_self();
@@ -285,7 +293,7 @@ pub fn handle_request(
     };
 
     // Parse discovery headers
-    let (target_nf_type, requester_nf_type, service_type, discovery_option) = 
+    let (target_nf_type, requester_nf_type, service_type, discovery_option) =
         parse_discovery_headers(request);
 
     // Validate requester NF type (from User-Agent)
@@ -304,7 +312,7 @@ pub fn handle_request(
     // Check for Target-apiRoot header (direct routing)
     if let Some(target_apiroot) = request.get_header(headers::TARGET_APIROOT) {
         assoc.set_target_apiroot(target_apiroot);
-        
+
         // Note: Check if target is in VPLMN (requires SEPP)
         // In C: ogs_sbi_fqdn_in_vplmn(headers.target_apiroot)
         // VPLMN detection is handled by the SEPP integration when inter-PLMN routing is enabled
@@ -314,7 +322,7 @@ pub fn handle_request(
         // Note: Forward request to target
         // In C: send_request(client, response_handler, request, false, assoc)
         // Request forwarding is handled by the HTTP client module
-        
+
         return RequestHandlerResult::Forwarded;
     }
 
@@ -350,8 +358,11 @@ pub fn handle_request(
         }
 
         // Need to perform NF discovery
-        log::debug!("Initiating NF discovery for {} -> {}", 
-            requester_nf_type.to_string(), target_nf_type.to_string());
+        log::debug!(
+            "Initiating NF discovery for {} -> {}",
+            requester_nf_type.to_string(),
+            target_nf_type.to_string()
+        );
 
         // Store request for forwarding after discovery
         assoc.request = Some(crate::context::SbiRequest {
@@ -375,7 +386,7 @@ pub fn handle_request(
 
     // No discovery needed, this might be a notification from NRF
     log::debug!("No discovery parameters, handling as notification");
-    
+
     // Clean up association since we're handling locally
     remove_assoc(assoc.id);
 
@@ -384,10 +395,7 @@ pub fn handle_request(
 
 /// Handle response from forwarded request
 /// Port of response_handler from sbi-path.c
-pub fn handle_response(
-    assoc_id: u64,
-    response: &SbiResponse,
-) -> Result<(), String> {
+pub fn handle_response(assoc_id: u64, response: &SbiResponse) -> Result<(), String> {
     let ctx = scp_self();
     let assoc = {
         if let Ok(context) = ctx.read() {
@@ -404,8 +412,11 @@ pub fn handle_response(
         }
     };
 
-    log::debug!("SCP handling response for stream_id={}, status={}", 
-        assoc.stream_id, response.status);
+    log::debug!(
+        "SCP handling response for stream_id={}, status={}",
+        assoc.stream_id,
+        response.status
+    );
 
     // Add producer ID header if we have it
     let mut response = response.clone();
@@ -425,10 +436,7 @@ pub fn handle_response(
 
 /// Handle NF discovery response
 /// Port of nf_discover_handler from sbi-path.c
-pub fn handle_nf_discover_response(
-    assoc_id: u64,
-    response: &SbiResponse,
-) -> Result<(), String> {
+pub fn handle_nf_discover_response(assoc_id: u64, response: &SbiResponse) -> Result<(), String> {
     let ctx = scp_self();
     let assoc = {
         if let Ok(context) = ctx.read() {
@@ -451,9 +459,11 @@ pub fn handle_nf_discover_response(
         return Err(format!("NF-Discover failed [{}]", response.status));
     }
 
-    log::debug!("NF discovery successful for {} -> {}",
+    log::debug!(
+        "NF discovery successful for {} -> {}",
         assoc.requester_nf_type.to_string(),
-        assoc.target_nf_type.to_string());
+        assoc.target_nf_type.to_string()
+    );
 
     // Note: Parse SearchResult from response body
     // In C: ogs_nnrf_disc_handle_nf_discover_search_result(message.SearchResult)
@@ -489,10 +499,7 @@ pub fn handle_nf_discover_response(
 
 /// Handle SEPP discovery response
 /// Port of sepp_discover_handler from sbi-path.c
-pub fn handle_sepp_discover_response(
-    assoc_id: u64,
-    response: &SbiResponse,
-) -> Result<(), String> {
+pub fn handle_sepp_discover_response(assoc_id: u64, response: &SbiResponse) -> Result<(), String> {
     let ctx = scp_self();
     let assoc = {
         if let Ok(context) = ctx.read() {
@@ -600,20 +607,19 @@ pub fn select_nf_instance(candidates: &[NfInstanceCandidate]) -> Option<&NfInsta
     }
 
     // W1.27: Filter to healthy instances only
-    let healthy: Vec<&NfInstanceCandidate> = candidates
-        .iter()
-        .filter(|c| c.healthy)
-        .collect();
+    let healthy: Vec<&NfInstanceCandidate> = candidates.iter().filter(|c| c.healthy).collect();
 
     // Fall back to all candidates if none are marked healthy
-    let pool = if healthy.is_empty() { candidates.iter().collect() } else { healthy };
+    let pool = if healthy.is_empty() {
+        candidates.iter().collect()
+    } else {
+        healthy
+    };
 
     // Group by priority (lower is better)
     let min_priority = pool.iter().map(|c| c.priority).min().unwrap_or(0);
-    let top_priority: Vec<&&NfInstanceCandidate> = pool
-        .iter()
-        .filter(|c| c.priority == min_priority)
-        .collect();
+    let top_priority: Vec<&&NfInstanceCandidate> =
+        pool.iter().filter(|c| c.priority == min_priority).collect();
 
     if top_priority.len() == 1 {
         return Some(top_priority[0]);
@@ -622,9 +628,7 @@ pub fn select_nf_instance(candidates: &[NfInstanceCandidate]) -> Option<&NfInsta
     // Among same-priority candidates, pick by available capacity (capacity - load)
     top_priority
         .iter()
-        .max_by_key(|c| {
-            c.capacity.saturating_sub(c.load) as u32
-        })
+        .max_by_key(|c| c.capacity.saturating_sub(c.load) as u32)
         .map(|c| **c)
 }
 
@@ -635,16 +639,15 @@ static ROUND_ROBIN_INDEX: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 ///
 /// W1.27: Implements round-robin load balancing among NF instances with
 /// weighted distribution based on NF load/priority and health-check awareness.
-pub fn select_nf_instance_round_robin(candidates: &[NfInstanceCandidate]) -> Option<&NfInstanceCandidate> {
+pub fn select_nf_instance_round_robin(
+    candidates: &[NfInstanceCandidate],
+) -> Option<&NfInstanceCandidate> {
     if candidates.is_empty() {
         return None;
     }
 
     // Filter to healthy instances
-    let healthy: Vec<&NfInstanceCandidate> = candidates
-        .iter()
-        .filter(|c| c.healthy)
-        .collect();
+    let healthy: Vec<&NfInstanceCandidate> = candidates.iter().filter(|c| c.healthy).collect();
 
     let pool: Vec<&NfInstanceCandidate> = if healthy.is_empty() {
         candidates.iter().collect()
@@ -703,7 +706,11 @@ impl DiscoveryCache {
     }
 
     /// Look up a cached discovery result.
-    pub fn get(&self, target_nf_type: &str, service_name: &str) -> Option<Vec<NfInstanceCandidate>> {
+    pub fn get(
+        &self,
+        target_nf_type: &str,
+        service_name: &str,
+    ) -> Option<Vec<NfInstanceCandidate>> {
         let entries = self.entries.read().ok()?;
         let key = (target_nf_type.to_string(), service_name.to_string());
         entries.get(&key).and_then(|entry| {
@@ -725,11 +732,14 @@ impl DiscoveryCache {
     ) {
         if let Ok(mut entries) = self.entries.write() {
             let key = (target_nf_type.to_string(), service_name.to_string());
-            entries.insert(key, DiscoveryCacheEntry {
-                candidates,
-                cached_at: std::time::Instant::now(),
-                ttl,
-            });
+            entries.insert(
+                key,
+                DiscoveryCacheEntry {
+                    candidates,
+                    cached_at: std::time::Instant::now(),
+                    ttl,
+                },
+            );
         }
     }
 
@@ -779,19 +789,23 @@ pub fn parse_search_result(body: &[u8]) -> Vec<NfInstanceCandidate> {
 
     if let Some(instances) = value.get("nfInstances").and_then(|v| v.as_array()) {
         for inst in instances {
-            let nf_instance_id = inst.get("nfInstanceId")
+            let nf_instance_id = inst
+                .get("nfInstanceId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let nf_type_str = inst.get("nfType")
+            let nf_type_str = inst
+                .get("nfType")
                 .and_then(|v| v.as_str())
                 .unwrap_or("NULL");
-            let nf_status = inst.get("nfStatus")
+            let nf_status = inst
+                .get("nfStatus")
                 .and_then(|v| v.as_str())
                 .unwrap_or("REGISTERED");
 
             // Extract host/port from ipv4Addresses or fqdn
-            let host = inst.get("ipv4Addresses")
+            let host = inst
+                .get("ipv4Addresses")
                 .and_then(|v| v.as_array())
                 .and_then(|a| a.first())
                 .and_then(|v| v.as_str())
@@ -799,7 +813,8 @@ pub fn parse_search_result(body: &[u8]) -> Vec<NfInstanceCandidate> {
                 .unwrap_or("127.0.0.1")
                 .to_string();
 
-            let port = inst.get("nfServices")
+            let port = inst
+                .get("nfServices")
                 .and_then(|v| v.as_array())
                 .and_then(|services| services.first())
                 .and_then(|svc| svc.get("ipEndPoints"))
@@ -809,15 +824,9 @@ pub fn parse_search_result(body: &[u8]) -> Vec<NfInstanceCandidate> {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(7777) as u16;
 
-            let priority = inst.get("priority")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(50) as u16;
-            let capacity = inst.get("capacity")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(100) as u16;
-            let load = inst.get("load")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u16;
+            let priority = inst.get("priority").and_then(|v| v.as_u64()).unwrap_or(50) as u16;
+            let capacity = inst.get("capacity").and_then(|v| v.as_u64()).unwrap_or(100) as u16;
+            let load = inst.get("load").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
 
             candidates.push(NfInstanceCandidate {
                 nf_instance_id,
@@ -946,17 +955,20 @@ mod tests {
     fn test_sbi_request() {
         let mut request = SbiRequest::new("POST", "/test");
         request.set_header("Content-Type", "application/json");
-        
+
         assert_eq!(request.method, "POST");
         assert_eq!(request.uri, "/test");
-        assert_eq!(request.get_header("content-type"), Some(&"application/json".to_string()));
+        assert_eq!(
+            request.get_header("content-type"),
+            Some(&"application/json".to_string())
+        );
     }
 
     #[test]
     fn test_sbi_response() {
         let mut response = SbiResponse::new(200);
         response.set_header("Content-Type", "application/json");
-        
+
         assert_eq!(response.status, 200);
     }
 
@@ -968,7 +980,7 @@ mod tests {
         request.set_header(headers::DISCOVERY_SERVICE_NAMES, "nudm-uecm,nudm-sdm");
         request.set_header(headers::DISCOVERY_DNN, "internet");
 
-        let (target_nf_type, requester_nf_type, service_type, discovery_option) = 
+        let (target_nf_type, requester_nf_type, service_type, discovery_option) =
             parse_discovery_headers(&request);
 
         assert_eq!(target_nf_type, Some(NfType::Udm));
@@ -1131,8 +1143,14 @@ mod tests {
             },
         ];
         // Call twice to see round-robin switching
-        let first = select_nf_instance_round_robin(&candidates).unwrap().nf_instance_id.clone();
-        let second = select_nf_instance_round_robin(&candidates).unwrap().nf_instance_id.clone();
+        let first = select_nf_instance_round_robin(&candidates)
+            .unwrap()
+            .nf_instance_id
+            .clone();
+        let second = select_nf_instance_round_robin(&candidates)
+            .unwrap()
+            .nf_instance_id
+            .clone();
         // They should be different (round-robin)
         assert_ne!(first, second);
     }
@@ -1154,7 +1172,12 @@ mod tests {
             healthy: true,
         }];
 
-        cache.put("SMF", "nsmf-pdusession", candidates.clone(), std::time::Duration::from_secs(3600));
+        cache.put(
+            "SMF",
+            "nsmf-pdusession",
+            candidates.clone(),
+            std::time::Duration::from_secs(3600),
+        );
 
         let cached = cache.get("SMF", "nsmf-pdusession");
         assert!(cached.is_some());

@@ -151,13 +151,13 @@ impl RouteTrie {
     pub fn insert(&mut self, addr: &[u32; 4], prefix_len: u8, sess_id: u64, is_ipv6: bool) {
         let total_bits = if is_ipv6 { 128 } else { 32 };
         let bits_to_use = prefix_len.min(total_bits);
-        
+
         let mut node = self;
         for bit_idx in 0..bits_to_use {
             let word_idx = (bit_idx / 32) as usize;
             let bit_pos = 31 - (bit_idx % 32);
             let bit = (addr[word_idx] >> bit_pos) & 1;
-            
+
             if bit == 0 {
                 node = node.left.get_or_insert_with(|| Box::new(RouteTrie::new()));
             } else {
@@ -171,25 +171,25 @@ impl RouteTrie {
     pub fn remove(&mut self, addr: &[u32; 4], prefix_len: u8, is_ipv6: bool) -> bool {
         let total_bits = if is_ipv6 { 128 } else { 32 };
         let bits_to_use = prefix_len.min(total_bits);
-        
+
         let mut node = self;
         for bit_idx in 0..bits_to_use {
             let word_idx = (bit_idx / 32) as usize;
             let bit_pos = 31 - (bit_idx % 32);
             let bit = (addr[word_idx] >> bit_pos) & 1;
-            
+
             let next = if bit == 0 {
                 node.left.as_mut()
             } else {
                 node.right.as_mut()
             };
-            
+
             match next {
                 Some(n) => node = n,
                 None => return false,
             }
         }
-        
+
         if node.sess_id.is_some() {
             node.sess_id = None;
             true
@@ -201,21 +201,21 @@ impl RouteTrie {
     /// Find session by IP address (longest prefix match)
     pub fn find(&self, addr: &[u32; 4], is_ipv6: bool) -> Option<u64> {
         let total_bits = if is_ipv6 { 128 } else { 32 };
-        
+
         let mut node = self;
         let mut last_match = node.sess_id;
-        
+
         for bit_idx in 0..total_bits {
             let word_idx = (bit_idx / 32) as usize;
             let bit_pos = 31 - (bit_idx % 32);
             let bit = (addr[word_idx] >> bit_pos) & 1;
-            
+
             let next = if bit == 0 {
                 node.left.as_ref()
             } else {
                 node.right.as_ref()
             };
-            
+
             match next {
                 Some(n) => {
                     node = n;
@@ -226,7 +226,7 @@ impl RouteTrie {
                 None => break,
             }
         }
-        
+
         last_match
     }
 }
@@ -237,8 +237,7 @@ impl RouteTrie {
 
 /// URR (Usage Reporting Rule) accounting data
 /// Port of upf_sess_urr_acc_t from context.h
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct UrrAccounting {
     /// Reporting enabled
     pub reporting_enabled: bool,
@@ -326,7 +325,6 @@ pub enum UrrTriggerReason {
     ImmediateReport,
 }
 
-
 impl UrrAccounting {
     /// Add traffic to accounting
     pub fn add(&mut self, size: usize, is_uplink: bool) {
@@ -354,10 +352,13 @@ impl UrrAccounting {
         self.add(size, is_uplink);
 
         let now = Instant::now();
-        let flow = self.qos_flow_acc.entry(qfi).or_insert_with(|| QosFlowAccounting {
-            qfi,
-            ..Default::default()
-        });
+        let flow = self
+            .qos_flow_acc
+            .entry(qfi)
+            .or_insert_with(|| QosFlowAccounting {
+                qfi,
+                ..Default::default()
+            });
         flow.total_octets += size as u64;
         flow.total_pkts += 1;
         if is_uplink {
@@ -650,12 +651,21 @@ impl TsnCncInterface {
 
     /// Find stream by ID
     pub fn find_stream(&self, stream_id: u32) -> Option<&TsnStreamIdentification> {
-        self.stream_configs.iter().find(|s| s.stream_id == stream_id)
+        self.stream_configs
+            .iter()
+            .find(|s| s.stream_id == stream_id)
     }
 
     /// Find stream by packet characteristics
-    pub fn find_stream_by_packet(&self, src_mac: &[u8; 6], dst_mac: &[u8; 6], vlan_id: u16) -> Option<&TsnStreamIdentification> {
-        self.stream_configs.iter().find(|s| s.matches(src_mac, dst_mac, vlan_id))
+    pub fn find_stream_by_packet(
+        &self,
+        src_mac: &[u8; 6],
+        dst_mac: &[u8; 6],
+        vlan_id: u16,
+    ) -> Option<&TsnStreamIdentification> {
+        self.stream_configs
+            .iter()
+            .find(|s| s.matches(src_mac, dst_mac, vlan_id))
     }
 }
 
@@ -748,9 +758,17 @@ impl TsnBridge {
     }
 
     /// Map TSN stream to QoS Flow
-    pub fn map_stream_to_qos_flow(&self, src_mac: &[u8; 6], dst_mac: &[u8; 6], vlan_id: u16) -> Option<(u8, u8)> {
+    pub fn map_stream_to_qos_flow(
+        &self,
+        src_mac: &[u8; 6],
+        dst_mac: &[u8; 6],
+        vlan_id: u16,
+    ) -> Option<(u8, u8)> {
         // Find matching stream
-        let stream = self.streams.values().find(|s| s.matches(src_mac, dst_mac, vlan_id))?;
+        let stream = self
+            .streams
+            .values()
+            .find(|s| s.matches(src_mac, dst_mac, vlan_id))?;
 
         log::debug!(
             "[TSN Bridge] Mapped stream {} to QFI={}, 5QI={}",
@@ -772,9 +790,7 @@ impl TsnBridge {
     pub fn enable_time_aware_scheduling(&mut self, cycle_time_ns: u64) {
         self.time_aware_scheduling_enabled = true;
         self.cycle_time_ns = cycle_time_ns;
-        log::info!(
-            "[TSN Bridge] Time-aware scheduling enabled with cycle time {cycle_time_ns}ns"
-        );
+        log::info!("[TSN Bridge] Time-aware scheduling enabled with cycle time {cycle_time_ns}ns");
     }
 
     /// Get current gate state for a port and priority (IEEE 802.1Qbv)
@@ -810,7 +826,6 @@ impl TsnBridge {
         self.streams.len()
     }
 }
-
 
 // ============================================================================
 // PDR / FAR Structures for Rel-16 Completeness
@@ -1071,7 +1086,8 @@ impl RateLimiter {
         // Check if we have enough tokens for this packet
         if new_tokens >= packet_size as u64 {
             // Consume tokens
-            self.tokens.store(new_tokens - packet_size as u64, Ordering::Relaxed);
+            self.tokens
+                .store(new_tokens - packet_size as u64, Ordering::Relaxed);
             self.last_update.store(now, Ordering::Relaxed);
             true
         } else {
@@ -1352,7 +1368,10 @@ impl UpfContext {
         self.max_num_of_sess = max_sess;
         self.initialized.store(true, Ordering::SeqCst);
 
-        log::info!("UPF context initialized with max {} sessions", self.max_num_of_sess);
+        log::info!(
+            "UPF context initialized with max {} sessions",
+            self.max_num_of_sess
+        );
     }
 
     /// Finalize the UPF context
@@ -1388,13 +1407,16 @@ impl UpfContext {
         let mut upf_n4_seid_hash = self.upf_n4_seid_hash.write().ok()?;
 
         if sess_list.len() >= self.max_num_of_sess && self.max_num_of_sess > 0 {
-            log::error!("Maximum number of sessions [{}] reached", self.max_num_of_sess);
+            log::error!(
+                "Maximum number of sessions [{}] reached",
+                self.max_num_of_sess
+            );
             return None;
         }
 
         let id = self.next_sess_id.fetch_add(1, Ordering::SeqCst) as u64;
         let upf_n4_seid = self.next_n4_seid();
-        
+
         let mut sess = UpfSess::new(id, upf_n4_seid);
         sess.smf_n4_f_seid = f_seid.clone();
 
@@ -1402,12 +1424,14 @@ impl UpfContext {
         smf_n4_f_seid_hash.insert(f_seid.clone(), id);
         smf_n4_seid_hash.insert(f_seid.seid, id);
         upf_n4_seid_hash.insert(upf_n4_seid, id);
-        
+
         sess_list.insert(id, sess.clone());
 
         log::info!(
             "[Added] UPF Session (id={}, upf_seid={}, smf_seid={})",
-            id, upf_n4_seid, f_seid.seid
+            id,
+            upf_n4_seid,
+            f_seid.seid
         );
         Some(sess)
     }
@@ -1450,7 +1474,8 @@ impl UpfContext {
                         let prefix_len = (route.mask[0].leading_ones()
                             + route.mask[1].leading_ones()
                             + route.mask[2].leading_ones()
-                            + route.mask[3].leading_ones()) as u8;
+                            + route.mask[3].leading_ones())
+                            as u8;
                         trie.remove(&route.sub, prefix_len, true);
                     }
                 }
@@ -1559,7 +1584,12 @@ impl UpfContext {
     }
 
     /// Set UE IP for session
-    pub fn sess_set_ue_ip(&self, sess_id: u64, ipv4: Option<Ipv4Addr>, ipv6: Option<Ipv6Addr>) -> bool {
+    pub fn sess_set_ue_ip(
+        &self,
+        sess_id: u64,
+        ipv4: Option<Ipv4Addr>,
+        ipv6: Option<Ipv6Addr>,
+    ) -> bool {
         let mut sess_list = self.sess_list.write().unwrap();
         let mut ipv4_hash = self.ipv4_hash.write().unwrap();
         let mut ipv6_hash = self.ipv6_hash.write().unwrap();
@@ -1587,7 +1617,7 @@ impl UpfContext {
     /// Add framed route for session
     pub fn sess_add_framed_route(&self, sess_id: u64, subnet: IpSubnet, is_ipv6: bool) -> bool {
         let mut sess_list = self.sess_list.write().unwrap();
-        
+
         if let Some(sess) = sess_list.get_mut(&sess_id) {
             let prefix_len = if is_ipv6 {
                 (subnet.mask[0].leading_ones()
@@ -1694,19 +1724,19 @@ mod tests {
     #[test]
     fn test_route_trie_ipv4() {
         let mut trie = RouteTrie::new();
-        
+
         // Insert 192.168.1.0/24 -> session 1
         trie.insert(&[0xC0A80100, 0, 0, 0], 24, 1, false);
-        
+
         // Insert 192.168.0.0/16 -> session 2
         trie.insert(&[0xC0A80000, 0, 0, 0], 16, 2, false);
-        
+
         // Find 192.168.1.1 - should match /24 (longest prefix)
         assert_eq!(trie.find(&[0xC0A80101, 0, 0, 0], false), Some(1));
-        
+
         // Find 192.168.2.1 - should match /16
         assert_eq!(trie.find(&[0xC0A80201, 0, 0, 0], false), Some(2));
-        
+
         // Find 10.0.0.1 - no match
         assert_eq!(trie.find(&[0x0A000001, 0, 0, 0], false), None);
     }
@@ -1715,7 +1745,7 @@ mod tests {
     fn test_urr_accounting() {
         let mut acc = UrrAccounting::default();
 
-        acc.add(100, true);  // uplink
+        acc.add(100, true); // uplink
         acc.add(200, false); // downlink
 
         assert_eq!(acc.total_octets, 300);
@@ -1734,9 +1764,9 @@ mod tests {
     fn test_urr_per_qos_flow_accounting() {
         let mut acc = UrrAccounting::default();
 
-        acc.add_with_qfi(100, true, 5);   // QFI 5 uplink
-        acc.add_with_qfi(200, false, 5);  // QFI 5 downlink
-        acc.add_with_qfi(50, true, 9);    // QFI 9 uplink
+        acc.add_with_qfi(100, true, 5); // QFI 5 uplink
+        acc.add_with_qfi(200, false, 5); // QFI 5 downlink
+        acc.add_with_qfi(50, true, 9); // QFI 9 uplink
 
         // Overall accounting
         assert_eq!(acc.total_octets, 350);
@@ -1779,7 +1809,7 @@ mod tests {
         assert!(acc.consume_quota(100)); // 200 remaining
         assert!(acc.consume_quota(100)); // 100 remaining
         assert!(acc.consume_quota(100)); // 0 remaining
-        assert!(!acc.consume_quota(1));  // exhausted
+        assert!(!acc.consume_quota(1)); // exhausted
         assert!(acc.triggered);
 
         let reason = acc.check_thresholds();
@@ -1850,10 +1880,10 @@ mod tests {
     #[test]
     fn test_upf_sess_framed_routes() {
         let mut sess = UpfSess::new(1, 100);
-        
+
         let subnet = IpSubnet::new_ipv4(0xC0A80100, 24);
         sess.add_ipv4_framed_route(subnet);
-        
+
         assert!(sess.check_framed_routes(&[0xC0A80101, 0, 0, 0], false));
         assert!(!sess.check_framed_routes(&[0xC0A80201, 0, 0, 0], false));
     }
@@ -1861,25 +1891,25 @@ mod tests {
     #[test]
     fn test_upf_context_session_lifecycle() {
         let ctx = UpfContext::new();
-        
+
         let f_seid = FSeid::with_ipv4(1000, Ipv4Addr::new(10, 0, 0, 1));
-        
+
         // Add session
         let sess = ctx.sess_add(&f_seid).unwrap();
         assert_eq!(sess.smf_n4_f_seid.seid, 1000);
-        
+
         // Find by various keys
         assert!(ctx.sess_find_by_smf_n4_seid(1000).is_some());
         assert!(ctx.sess_find_by_upf_n4_seid(sess.upf_n4_seid).is_some());
         assert!(ctx.sess_find_by_smf_n4_f_seid(&f_seid).is_some());
-        
+
         // Set UE IP
         ctx.sess_set_ue_ip(sess.id, Some(Ipv4Addr::new(192, 168, 1, 100)), None);
-        
+
         // Find by IP
         let addr = u32::from_be_bytes([192, 168, 1, 100]);
         assert!(ctx.sess_find_by_ipv4(addr).is_some());
-        
+
         // Remove session
         ctx.sess_remove(sess.id);
         assert!(ctx.sess_find_by_smf_n4_seid(1000).is_none());
@@ -1891,7 +1921,7 @@ mod tests {
         let f_seid1 = FSeid::with_ipv4(100, Ipv4Addr::new(10, 0, 0, 1));
         let f_seid2 = FSeid::with_ipv4(100, Ipv4Addr::new(10, 0, 0, 1));
         let f_seid3 = FSeid::with_ipv4(101, Ipv4Addr::new(10, 0, 0, 1));
-        
+
         assert_eq!(f_seid1, f_seid2);
         assert_ne!(f_seid1, f_seid3);
     }

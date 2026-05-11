@@ -39,12 +39,7 @@ pub struct ScpBinding {
 
 impl ScpBinding {
     /// Create a new SCP binding
-    pub fn new(
-        instance_id: String,
-        fqdn: String,
-        addr: String,
-        port: u16,
-    ) -> Self {
+    pub fn new(instance_id: String, fqdn: String, addr: String, port: u16) -> Self {
         Self {
             scp_instance_id: instance_id,
             scp_fqdn: fqdn,
@@ -151,18 +146,16 @@ impl ScpRouter {
             return Err(SbiError::Internal("SCP routing disabled".to_string()));
         }
 
-        let binding = self.get_binding(target_nf_type)
+        let binding = self
+            .get_binding(target_nf_type)
             .ok_or_else(|| SbiError::Internal("No SCP binding found".to_string()))?;
 
         // Add 3gpp-Sbi-Target-apiRoot header
-        let target_api_root = format!(
-            "http://{}",
-            request.header.uri.trim_start_matches('/')
-        );
-        request.http.headers.insert(
-            "3gpp-Sbi-Target-apiRoot".to_string(),
-            target_api_root,
-        );
+        let target_api_root = format!("http://{}", request.header.uri.trim_start_matches('/'));
+        request
+            .http
+            .headers
+            .insert("3gpp-Sbi-Target-apiRoot".to_string(), target_api_root);
 
         // Update request URI to point to SCP
         let scp_uri = binding.uri();

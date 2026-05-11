@@ -116,8 +116,7 @@ impl OtelProvider {
 
         eprintln!(
             "Initializing OpenTelemetry for service '{}' (endpoint: {})",
-            self.config.service_name,
-            self.config.otlp_endpoint
+            self.config.service_name, self.config.otlp_endpoint
         );
 
         if self.config.enable_traces {
@@ -275,10 +274,10 @@ impl OtelSpanContext {
             return Err(OtelError::UnsupportedVersion(parts[0].to_string()));
         }
 
-        let trace_id = hex::decode(parts[1])
-            .map_err(|_| OtelError::InvalidTraceparent(header.to_string()))?;
-        let span_id = hex::decode(parts[2])
-            .map_err(|_| OtelError::InvalidTraceparent(header.to_string()))?;
+        let trace_id =
+            hex::decode(parts[1]).map_err(|_| OtelError::InvalidTraceparent(header.to_string()))?;
+        let span_id =
+            hex::decode(parts[2]).map_err(|_| OtelError::InvalidTraceparent(header.to_string()))?;
         let flags = u8::from_str_radix(parts[3], 16)
             .map_err(|_| OtelError::InvalidTraceparent(header.to_string()))?;
 
@@ -341,22 +340,58 @@ pub fn init_otel(config: OtelConfig) -> Result<Arc<std::sync::Mutex<OtelProvider
 /// NF type identifier for telemetry attributes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NfType {
-    Amf, Ausf, Bsf, Ees, Hss, Lmf, MbSmf, Mme, Nrf, Nsacf,
-    Nssf, Nwdaf, Pcf, Pcrf, Pin, Scp, Sepp, Sgwc, Sgwu, Smf, Udm, Udr, Upf,
+    Amf,
+    Ausf,
+    Bsf,
+    Ees,
+    Hss,
+    Lmf,
+    MbSmf,
+    Mme,
+    Nrf,
+    Nsacf,
+    Nssf,
+    Nwdaf,
+    Pcf,
+    Pcrf,
+    Pin,
+    Scp,
+    Sepp,
+    Sgwc,
+    Sgwu,
+    Smf,
+    Udm,
+    Udr,
+    Upf,
 }
 
 impl NfType {
     /// Get the string name of this NF type
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Amf => "AMF", Self::Ausf => "AUSF", Self::Bsf => "BSF",
-            Self::Ees => "EES", Self::Hss => "HSS", Self::Lmf => "LMF",
-            Self::MbSmf => "MB-SMF", Self::Mme => "MME", Self::Nrf => "NRF",
-            Self::Nsacf => "NSACF", Self::Nssf => "NSSF", Self::Nwdaf => "NWDAF",
-            Self::Pcf => "PCF", Self::Pcrf => "PCRF", Self::Pin => "PIN",
-            Self::Scp => "SCP", Self::Sepp => "SEPP", Self::Sgwc => "SGW-C",
-            Self::Sgwu => "SGW-U", Self::Smf => "SMF", Self::Udm => "UDM",
-            Self::Udr => "UDR", Self::Upf => "UPF",
+            Self::Amf => "AMF",
+            Self::Ausf => "AUSF",
+            Self::Bsf => "BSF",
+            Self::Ees => "EES",
+            Self::Hss => "HSS",
+            Self::Lmf => "LMF",
+            Self::MbSmf => "MB-SMF",
+            Self::Mme => "MME",
+            Self::Nrf => "NRF",
+            Self::Nsacf => "NSACF",
+            Self::Nssf => "NSSF",
+            Self::Nwdaf => "NWDAF",
+            Self::Pcf => "PCF",
+            Self::Pcrf => "PCRF",
+            Self::Pin => "PIN",
+            Self::Scp => "SCP",
+            Self::Sepp => "SEPP",
+            Self::Sgwc => "SGW-C",
+            Self::Sgwu => "SGW-U",
+            Self::Smf => "SMF",
+            Self::Udm => "UDM",
+            Self::Udr => "UDR",
+            Self::Upf => "UPF",
         }
     }
 }
@@ -462,9 +497,7 @@ impl SbiSpan {
 
     /// Inject trace context into HTTP headers (W3C traceparent)
     pub fn inject_headers(&self) -> Vec<(String, String)> {
-        let mut headers = vec![
-            ("traceparent".to_string(), self.context.to_traceparent()),
-        ];
+        let mut headers = vec![("traceparent".to_string(), self.context.to_traceparent())];
         if let Some(ref state) = self.context.trace_state {
             headers.push(("tracestate".to_string(), state.clone()));
         }
@@ -474,7 +507,8 @@ impl SbiSpan {
 
 /// Extract trace context from HTTP headers
 pub fn extract_trace_context(headers: &[(String, String)]) -> Option<OtelSpanContext> {
-    headers.iter()
+    headers
+        .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("traceparent"))
         .and_then(|(_, v)| OtelSpanContext::from_traceparent(v).ok())
 }
@@ -704,8 +738,10 @@ mod tests {
     #[test]
     fn test_traceparent_roundtrip() {
         let ctx = OtelSpanContext {
-            trace_id: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                       0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10],
+            trace_id: [
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+                0x0f, 0x10,
+            ],
             span_id: [0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8],
             trace_flags: 0x01,
             trace_state: None,

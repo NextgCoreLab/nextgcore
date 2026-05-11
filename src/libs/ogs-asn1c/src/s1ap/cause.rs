@@ -2,7 +2,9 @@
 //!
 //! Cause types from S1AP-IEs (3GPP TS 36.413)
 
-use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerResult, PerError};
+use crate::per::{
+    AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerError, PerResult,
+};
 
 /// CauseRadioNetwork - Radio network layer cause values
 /// ASN.1: CauseRadioNetwork ::= ENUMERATED { ... }
@@ -226,7 +228,6 @@ impl AperDecode for CauseMisc {
     }
 }
 
-
 /// Cause - CHOICE type for all cause categories
 /// ASN.1: Cause ::= CHOICE { radioNetwork, transport, nas, protocol, misc, choice-Extensions }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,7 +276,9 @@ impl AperDecode for Cause {
     fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
         let index = decoder.decode_choice_index(Self::NUM_ALTERNATIVES, Self::EXTENSIBLE)?;
         match index {
-            0 => Ok(Cause::RadioNetwork(CauseRadioNetwork::decode_aper(decoder)?)),
+            0 => Ok(Cause::RadioNetwork(CauseRadioNetwork::decode_aper(
+                decoder,
+            )?)),
             1 => Ok(Cause::Transport(CauseTransport::decode_aper(decoder)?)),
             2 => Ok(Cause::Nas(CauseNas::decode_aper(decoder)?)),
             3 => Ok(Cause::Protocol(CauseProtocol::decode_aper(decoder)?)),
@@ -291,80 +294,80 @@ impl AperDecode for Cause {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per::{AperEncoder, AperDecoder};
+    use crate::per::{AperDecoder, AperEncoder};
 
     #[test]
     fn test_cause_radio_network_roundtrip() {
         let cause = Cause::RadioNetwork(CauseRadioNetwork::UserInactivity);
-        
+
         let mut encoder = AperEncoder::new();
         cause.encode_aper(&mut encoder).unwrap();
         encoder.align();
-        
+
         let bytes = encoder.into_bytes();
         let mut decoder = AperDecoder::new(&bytes);
         let decoded = Cause::decode_aper(&mut decoder).unwrap();
-        
+
         assert_eq!(cause, decoded);
     }
 
     #[test]
     fn test_cause_misc_roundtrip() {
         let cause = Cause::Misc(CauseMisc::HardwareFailure);
-        
+
         let mut encoder = AperEncoder::new();
         cause.encode_aper(&mut encoder).unwrap();
         encoder.align();
-        
+
         let bytes = encoder.into_bytes();
         let mut decoder = AperDecoder::new(&bytes);
         let decoded = Cause::decode_aper(&mut decoder).unwrap();
-        
+
         assert_eq!(cause, decoded);
     }
 
     #[test]
     fn test_cause_nas_roundtrip() {
         let cause = Cause::Nas(CauseNas::Detach);
-        
+
         let mut encoder = AperEncoder::new();
         cause.encode_aper(&mut encoder).unwrap();
         encoder.align();
-        
+
         let bytes = encoder.into_bytes();
         let mut decoder = AperDecoder::new(&bytes);
         let decoded = Cause::decode_aper(&mut decoder).unwrap();
-        
+
         assert_eq!(cause, decoded);
     }
 
     #[test]
     fn test_cause_transport_roundtrip() {
         let cause = Cause::Transport(CauseTransport::TransportResourceUnavailable);
-        
+
         let mut encoder = AperEncoder::new();
         cause.encode_aper(&mut encoder).unwrap();
         encoder.align();
-        
+
         let bytes = encoder.into_bytes();
         let mut decoder = AperDecoder::new(&bytes);
         let decoded = Cause::decode_aper(&mut decoder).unwrap();
-        
+
         assert_eq!(cause, decoded);
     }
 
     #[test]
     fn test_cause_protocol_roundtrip() {
         let cause = Cause::Protocol(CauseProtocol::SemanticError);
-        
+
         let mut encoder = AperEncoder::new();
         cause.encode_aper(&mut encoder).unwrap();
         encoder.align();
-        
+
         let bytes = encoder.into_bytes();
         let mut decoder = AperDecoder::new(&bytes);
         let decoded = Cause::decode_aper(&mut decoder).unwrap();
-        
+
         assert_eq!(cause, decoded);
     }
 }

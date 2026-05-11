@@ -8,11 +8,11 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use ogs_sbi::message::{SbiRequest, SbiResponse};
-use serde::Deserialize;
 use ogs_sbi::server::{
-    send_bad_request, send_method_not_allowed, send_not_found,
-    SbiServer, SbiServerConfig as OgsSbiServerConfig,
+    send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
+    SbiServerConfig as OgsSbiServerConfig,
 };
+use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -29,7 +29,9 @@ mod timer;
 
 pub use bsf_sm::{BsfSmContext, BsfState};
 pub use context::*;
-pub use event::{BsfEvent, BsfEventId, BsfTimerId, SbiEventData, SbiMessage, EventSbiRequest, EventSbiResponse};
+pub use event::{
+    BsfEvent, BsfEventId, BsfTimerId, EventSbiRequest, EventSbiResponse, SbiEventData, SbiMessage,
+};
 pub use nbsf_handler::*;
 pub use nnrf_handler::*;
 pub use sbi_path::*;
@@ -131,11 +133,10 @@ async fn main() -> Result<()> {
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
-            .with_endpoint(
-                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
-            ),
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+        ),
     )
     .ok();
 
@@ -183,7 +184,9 @@ async fn main() -> Result<()> {
                                 if let Some(nrf_list) = client.nrf {
                                     if let Some(nrf) = nrf_list.first() {
                                         log::info!("NRF URI configured: {}", nrf.uri);
-                                        ogs_sbi::context::global_context().set_nrf_uri(&nrf.uri).await;
+                                        ogs_sbi::context::global_context()
+                                            .set_nrf_uri(&nrf.uri)
+                                            .await;
                                     }
                                 }
                             }
@@ -218,7 +221,9 @@ async fn main() -> Result<()> {
         .context("Invalid SBI address")?;
     let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
 
-    sbi_server.start(bsf_sbi_request_handler).await
+    sbi_server
+        .start(bsf_sbi_request_handler)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
@@ -243,7 +248,9 @@ async fn main() -> Result<()> {
     log::info!("Shutting down...");
 
     // Stop SBI server
-    sbi_server.stop().await
+    sbi_server
+        .stop()
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
     log::info!("SBI HTTP/2 server stopped");
 
@@ -336,13 +343,14 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
     };
 
     // Extract IP addresses from request
-    let ipv4addr = binding_data.get("ipv4Addr")
-        .and_then(|v| v.as_str());
-    let ipv6prefix = binding_data.get("ipv6Prefix")
-        .and_then(|v| v.as_str());
+    let ipv4addr = binding_data.get("ipv4Addr").and_then(|v| v.as_str());
+    let ipv6prefix = binding_data.get("ipv6Prefix").and_then(|v| v.as_str());
 
     if ipv4addr.is_none() && ipv6prefix.is_none() {
-        return send_bad_request("Either ipv4Addr or ipv6Prefix must be provided", Some("MISSING_IP"));
+        return send_bad_request(
+            "Either ipv4Addr or ipv6Prefix must be provided",
+            Some("MISSING_IP"),
+        );
     }
 
     // Add session to context
@@ -370,7 +378,9 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
             }
             if let Some(snssai) = binding_data.get("snssai") {
                 let sst = snssai.get("sst").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
-                let sd = snssai.get("sd").and_then(|v| v.as_str())
+                let sd = snssai
+                    .get("sd")
+                    .and_then(|v| v.as_str())
                     .and_then(|s| u32::from_str_radix(s, 16).ok());
                 sess.s_nssai = context::SNssai::new(sst, sd);
             }
@@ -383,7 +393,8 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
 
             // Start binding expiry timer (TTL)
             // Use expiry from request if provided, otherwise default 1 hour
-            let ttl_secs = binding_data.get("expiry")
+            let ttl_secs = binding_data
+                .get("expiry")
                 .and_then(|v| v.as_str())
                 .and_then(|s| {
                     // Parse ISO 8601 duration or seconds
@@ -397,13 +408,25 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
                 Duration::from_secs(ttl_secs),
                 Some(sess.binding_id.clone()),
             );
-            log::debug!("Binding expiry timer started for {} (TTL={}s)", sess.binding_id, ttl_secs);
+            log::debug!(
+                "Binding expiry timer started for {} (TTL={}s)",
+                sess.binding_id,
+                ttl_secs
+            );
 
-            log::info!("PCF Binding created (id={}, ipv4={:?}, ipv6={:?}, TTL={}s)",
-                sess.binding_id, ipv4addr, ipv6prefix, ttl_secs);
+            log::info!(
+                "PCF Binding created (id={}, ipv4={:?}, ipv6={:?}, TTL={}s)",
+                sess.binding_id,
+                ipv4addr,
+                ipv6prefix,
+                ttl_secs
+            );
 
             SbiResponse::with_status(201)
-                .with_header("Location", format!("/nbsf-management/v1/pcfBindings/{}", sess.binding_id))
+                .with_header(
+                    "Location",
+                    format!("/nbsf-management/v1/pcfBindings/{}", sess.binding_id),
+                )
                 .with_json_body(&serde_json::json!({
                     "pcfBindingId": sess.binding_id,
                     "ipv4Addr": ipv4addr,
@@ -418,9 +441,7 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(201))
         }
-        None => {
-            send_bad_request("Failed to create PCF binding", Some("CREATION_FAILED"))
-        }
+        None => send_bad_request("Failed to create PCF binding", Some("CREATION_FAILED")),
     }
 }
 
@@ -435,37 +456,37 @@ async fn handle_pcf_binding_get(binding_id: &str) -> SbiResponse {
     };
 
     match sess {
-        Some(sess) => {
-            SbiResponse::with_status(200)
-                .with_json_body(&serde_json::json!({
-                    "pcfBindingId": sess.binding_id,
-                    "ipv4Addr": sess.ipv4addr_string,
-                    "ipv6Prefix": sess.ipv6prefix_string,
-                    "supi": sess.supi,
-                    "gpsi": sess.gpsi,
-                    "dnn": sess.dnn,
-                    "pcfFqdn": sess.pcf_fqdn,
-                    "suppFeat": "1",
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(200))
-        }
-        None => {
-            send_not_found(&format!("PCF Binding {binding_id} not found"), Some("BINDING_NOT_FOUND"))
-        }
+        Some(sess) => SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({
+                "pcfBindingId": sess.binding_id,
+                "ipv4Addr": sess.ipv4addr_string,
+                "ipv6Prefix": sess.ipv6prefix_string,
+                "supi": sess.supi,
+                "gpsi": sess.gpsi,
+                "dnn": sess.dnn,
+                "pcfFqdn": sess.pcf_fqdn,
+                "suppFeat": "1",
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("PCF Binding {binding_id} not found"),
+            Some("BINDING_NOT_FOUND"),
+        ),
     }
 }
 
 async fn handle_pcf_binding_discovery(request: &SbiRequest) -> SbiResponse {
     // Parse query parameters
-    let ipv4addr = request.http.params.get("ipv4Addr")
-        .map(|s| s.as_str());
-    let ipv6prefix = request.http.params.get("ipv6Prefix")
-        .map(|s| s.as_str());
+    let ipv4addr = request.http.params.get("ipv4Addr").map(|s| s.as_str());
+    let ipv6prefix = request.http.params.get("ipv6Prefix").map(|s| s.as_str());
 
     log::info!("PCF Binding Discovery: ipv4={ipv4addr:?}, ipv6={ipv6prefix:?}");
 
     if ipv4addr.is_none() && ipv6prefix.is_none() {
-        return send_bad_request("Either ipv4Addr or ipv6Prefix query parameter required", Some("MISSING_PARAM"));
+        return send_bad_request(
+            "Either ipv4Addr or ipv6Prefix query parameter required",
+            Some("MISSING_PARAM"),
+        );
     }
 
     let ctx = bsf_self();
@@ -497,9 +518,10 @@ async fn handle_pcf_binding_discovery(request: &SbiRequest) -> SbiResponse {
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }
-        None => {
-            send_not_found("No PCF binding found for the specified IP address", Some("BINDING_NOT_FOUND"))
-        }
+        None => send_not_found(
+            "No PCF binding found for the specified IP address",
+            Some("BINDING_NOT_FOUND"),
+        ),
     }
 }
 
@@ -520,11 +542,12 @@ async fn handle_pcf_binding_delete(binding_id: &str) -> SbiResponse {
                     return SbiResponse::with_status(204);
                 }
             }
-            send_not_found(&format!("PCF Binding {binding_id} not found"), Some("BINDING_NOT_FOUND"))
+            send_not_found(
+                &format!("PCF Binding {binding_id} not found"),
+                Some("BINDING_NOT_FOUND"),
+            )
         }
-        None => {
-            send_bad_request("Invalid binding ID format", Some("INVALID_BINDING_ID"))
-        }
+        None => send_bad_request("Invalid binding ID format", Some("INVALID_BINDING_ID")),
     }
 }
 
@@ -571,29 +594,46 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
             }
             if let Some(snssai) = update_data.get("snssai") {
                 let sst = snssai.get("sst").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
-                let sd = snssai.get("sd").and_then(|v| v.as_str())
+                let sd = snssai
+                    .get("sd")
+                    .and_then(|v| v.as_str())
                     .and_then(|s| u32::from_str_radix(s, 16).ok());
                 sess.s_nssai = context::SNssai::new(sst, sd);
             }
-            if let Some(routes) = update_data.get("ipv4FrameRouteList").and_then(|v| v.as_array()) {
-                sess.ipv4_frame_route_list = routes.iter()
+            if let Some(routes) = update_data
+                .get("ipv4FrameRouteList")
+                .and_then(|v| v.as_array())
+            {
+                sess.ipv4_frame_route_list = routes
+                    .iter()
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect();
             }
-            if let Some(routes) = update_data.get("ipv6FrameRouteList").and_then(|v| v.as_array()) {
-                sess.ipv6_frame_route_list = routes.iter()
+            if let Some(routes) = update_data
+                .get("ipv6FrameRouteList")
+                .and_then(|v| v.as_array())
+            {
+                sess.ipv6_frame_route_list = routes
+                    .iter()
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect();
             }
             if let Some(endpoints) = update_data.get("pcfIpEndPoints").and_then(|v| v.as_array()) {
-                sess.pcf_ip = endpoints.iter().map(|ep| {
-                    context::PcfIpEndpoint {
-                        addr: ep.get("ipv4Address").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                        addr6: ep.get("ipv6Address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                sess.pcf_ip = endpoints
+                    .iter()
+                    .map(|ep| context::PcfIpEndpoint {
+                        addr: ep
+                            .get("ipv4Address")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
+                        addr6: ep
+                            .get("ipv6Address")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string()),
                         is_port: ep.get("port").is_some(),
                         port: ep.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16,
-                    }
-                }).collect();
+                    })
+                    .collect();
             }
 
             // Update session in context and persist to DB
@@ -621,9 +661,10 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }
-        None => {
-            send_not_found(&format!("PCF Binding {binding_id} not found"), Some("BINDING_NOT_FOUND"))
-        }
+        None => send_not_found(
+            &format!("PCF Binding {binding_id} not found"),
+            Some("BINDING_NOT_FOUND"),
+        ),
     }
 }
 
@@ -686,7 +727,9 @@ async fn run_event_loop_async(bsf_sm: &mut BsfSmContext, shutdown: Arc<AtomicBoo
         for entry in &expired {
             log::debug!(
                 "BSF timer expired: id={} type={:?} data={:?}",
-                entry.id, entry.timer_type, entry.data
+                entry.id,
+                entry.timer_type,
+                entry.data
             );
 
             // Handle binding expiry timer directly (TTL cleanup)
@@ -780,7 +823,10 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, Stri
             log::info!("BSF registered with NRF successfully (id={nf_instance_id})");
             Ok(nf_instance_id)
         }
-        _ => Err(format!("NRF registration returned status {}", response.status)),
+        _ => Err(format!(
+            "NRF registration returned status {}",
+            response.status
+        )),
     }
 }
 
@@ -790,7 +836,9 @@ fn parse_nrf_host_port(uri: &str) -> Option<(String, u16)> {
         .strip_prefix("https://")
         .or_else(|| uri.strip_prefix("http://"))
         .unwrap_or(uri);
-    let (host_port, _) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    let (host_port, _) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
     if let Some((host, port_str)) = host_port.rsplit_once(':') {
         let port: u16 = port_str.parse().ok()?;
         Some((host.to_string(), port))

@@ -84,18 +84,28 @@ impl GlobalMetric {
             Self::Gnb => "gNodeBs",
             Self::RmRegInitReq => "Number of initial registration requests received by the AMF",
             Self::RmRegInitSucc => "Number of successful initial registrations at the AMF",
-            Self::RmRegMobReq => "Number of mobility registration update requests received by the AMF",
+            Self::RmRegMobReq => {
+                "Number of mobility registration update requests received by the AMF"
+            }
             Self::RmRegMobSucc => "Number of successful mobility registration updates at the AMF",
-            Self::RmRegPeriodReq => "Number of periodic registration update requests received by the AMF",
-            Self::RmRegPeriodSucc => "Number of successful periodic registration update requests at the AMF",
+            Self::RmRegPeriodReq => {
+                "Number of periodic registration update requests received by the AMF"
+            }
+            Self::RmRegPeriodSucc => {
+                "Number of successful periodic registration update requests at the AMF"
+            }
             Self::RmRegEmergReq => "Number of emergency registration requests received by the AMF",
             Self::RmRegEmergSucc => "Number of successful emergency registrations at the AMF",
             Self::MmPaging5gReq => "Number of 5G paging procedures initiated at the AMF",
-            Self::MmPaging5gSucc => "Number of successful 5G paging procedures initiated at the AMF",
+            Self::MmPaging5gSucc => {
+                "Number of successful 5G paging procedures initiated at the AMF"
+            }
             Self::AmfAuthReq => "Number of authentication requests sent by the AMF",
             Self::AmfAuthReject => "Number of authentication rejections sent by the AMF",
             Self::MmConfUpdate => "Number of UE Configuration Update commands requested by the AMF",
-            Self::MmConfUpdateSucc => "Number of UE Configuration Update complete messages received by the AMF",
+            Self::MmConfUpdateSucc => {
+                "Number of UE Configuration Update complete messages received by the AMF"
+            }
         }
     }
 
@@ -177,7 +187,9 @@ impl CauseMetric {
         match self {
             Self::RmRegInitFail => "Number of failed initial registrations at the AMF",
             Self::RmRegMobFail => "Number of failed mobility registration updates at the AMF",
-            Self::RmRegPeriodFail => "Number of failed periodic registration update requests at the AMF",
+            Self::RmRegPeriodFail => {
+                "Number of failed periodic registration update requests at the AMF"
+            }
             Self::RmRegEmergFail => "Number of failed emergency registrations at the AMF",
             Self::AmfAuthFail => "Number of authentication failure messages received by the AMF",
         }
@@ -326,18 +338,18 @@ impl AmfMetrics {
         // Export global counters
         for (metric, counter) in &self.global_counters {
             let value = counter.load(Ordering::Relaxed);
-            let metric_type = if metric.is_gauge() { "gauge" } else { "counter" };
+            let metric_type = if metric.is_gauge() {
+                "gauge"
+            } else {
+                "counter"
+            };
 
             output.push_str(&format!(
                 "# HELP {} {}\n",
                 metric.name(),
                 metric.description()
             ));
-            output.push_str(&format!(
-                "# TYPE {} {}\n",
-                metric.name(),
-                metric_type
-            ));
+            output.push_str(&format!("# TYPE {} {}\n", metric.name(), metric_type));
             output.push_str(&format!("{} {}\n", metric.name(), value));
         }
 
@@ -387,14 +399,10 @@ impl AmfMetrics {
             total_ran_ues: self.get(GlobalMetric::RanUe),
             total_sessions: self.get(GlobalMetric::AmfSession),
             total_gnbs: self.get(GlobalMetric::Gnb),
-            reg_init_success_rate: self.calculate_success_rate(
-                GlobalMetric::RmRegInitReq,
-                GlobalMetric::RmRegInitSucc,
-            ),
-            reg_mob_success_rate: self.calculate_success_rate(
-                GlobalMetric::RmRegMobReq,
-                GlobalMetric::RmRegMobSucc,
-            ),
+            reg_init_success_rate: self
+                .calculate_success_rate(GlobalMetric::RmRegInitReq, GlobalMetric::RmRegInitSucc),
+            reg_mob_success_rate: self
+                .calculate_success_rate(GlobalMetric::RmRegMobReq, GlobalMetric::RmRegMobSucc),
             auth_success_rate: self.calculate_auth_success_rate(),
         }
     }
@@ -451,7 +459,10 @@ mod tests {
     #[test]
     fn test_global_metric_names() {
         assert_eq!(GlobalMetric::RanUe.name(), "ran_ue");
-        assert_eq!(GlobalMetric::RmRegInitReq.name(), "fivegs_amffunction_rm_reginitreq");
+        assert_eq!(
+            GlobalMetric::RmRegInitReq.name(),
+            "fivegs_amffunction_rm_reginitreq"
+        );
     }
 
     #[test]
@@ -471,7 +482,10 @@ mod tests {
 
     #[test]
     fn test_cause_metric_names() {
-        assert_eq!(CauseMetric::RmRegInitFail.name(), "fivegs_amffunction_rm_reginitfail");
+        assert_eq!(
+            CauseMetric::RmRegInitFail.name(),
+            "fivegs_amffunction_rm_reginitfail"
+        );
     }
 
     #[test]
@@ -511,10 +525,16 @@ mod tests {
         };
 
         metrics.add_slice_metric(key.clone(), SliceMetric::RegisteredSubNbr, 10);
-        assert_eq!(metrics.get_slice_metric(&key, SliceMetric::RegisteredSubNbr), 10);
+        assert_eq!(
+            metrics.get_slice_metric(&key, SliceMetric::RegisteredSubNbr),
+            10
+        );
 
         metrics.add_slice_metric(key.clone(), SliceMetric::RegisteredSubNbr, -3);
-        assert_eq!(metrics.get_slice_metric(&key, SliceMetric::RegisteredSubNbr), 7);
+        assert_eq!(
+            metrics.get_slice_metric(&key, SliceMetric::RegisteredSubNbr),
+            7
+        );
     }
 
     #[test]
@@ -542,7 +562,10 @@ mod tests {
 
         assert_eq!(metrics.get(GlobalMetric::RmRegInitReq), 0);
         assert_eq!(metrics.get(GlobalMetric::RanUe), 0);
-        assert_eq!(metrics.get_slice_metric(&key, SliceMetric::RegisteredSubNbr), 0);
+        assert_eq!(
+            metrics.get_slice_metric(&key, SliceMetric::RegisteredSubNbr),
+            0
+        );
     }
 
     #[test]
@@ -578,20 +601,16 @@ mod tests {
         metrics.add(GlobalMetric::RmRegMobReq, 200);
         metrics.add(GlobalMetric::RmRegMobSucc, 180);
 
-        let rate = metrics.calculate_success_rate(
-            GlobalMetric::RmRegMobReq,
-            GlobalMetric::RmRegMobSucc
-        );
+        let rate =
+            metrics.calculate_success_rate(GlobalMetric::RmRegMobReq, GlobalMetric::RmRegMobSucc);
         assert_eq!(rate, 90.0);
     }
 
     #[test]
     fn test_calculate_success_rate_zero_requests() {
         let metrics = AmfMetrics::new();
-        let rate = metrics.calculate_success_rate(
-            GlobalMetric::RmRegMobReq,
-            GlobalMetric::RmRegMobSucc
-        );
+        let rate =
+            metrics.calculate_success_rate(GlobalMetric::RmRegMobReq, GlobalMetric::RmRegMobSucc);
         assert_eq!(rate, 0.0);
     }
 

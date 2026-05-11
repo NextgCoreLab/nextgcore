@@ -117,10 +117,7 @@ fn build_nf_profile_json(profile: &NfProfile) -> Option<String> {
     let mut json = String::from("{");
 
     // Required fields
-    json.push_str(&format!(
-        "\"nfInstanceId\":\"{}\",",
-        profile.nf_instance_id
-    ));
+    json.push_str(&format!("\"nfInstanceId\":\"{}\",", profile.nf_instance_id));
     json.push_str(&format!("\"nfType\":\"{}\",", profile.nf_type));
     json.push_str(&format!("\"nfStatus\":\"{}\"", profile.nf_status));
 
@@ -299,7 +296,9 @@ mod tests {
         let json = json.unwrap();
 
         assert!(json.contains("\"event\":\"NF_REGISTERED\""));
-        assert!(json.contains("\"nfInstanceUri\":\"http://nrf.example.com/nf-instances/test-nf-123\""));
+        assert!(
+            json.contains("\"nfInstanceUri\":\"http://nrf.example.com/nf-instances/test-nf-123\"")
+        );
         assert!(json.contains("\"nfProfile\":{"));
     }
 }

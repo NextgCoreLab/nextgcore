@@ -83,21 +83,11 @@ impl AmfFsm {
                 log::debug!("amf_state_operational: FSM_EXIT");
                 AmfFsmResult::Handled
             }
-            AmfEventId::SbiServer => {
-                self.handle_sbi_server(event)
-            }
-            AmfEventId::SbiClient => {
-                self.handle_sbi_client(event)
-            }
-            AmfEventId::SbiTimer => {
-                self.handle_sbi_timer(event)
-            }
-            AmfEventId::NgapMessage => {
-                self.handle_ngap_message(event)
-            }
-            AmfEventId::NgapTimer => {
-                self.handle_ngap_timer(event)
-            }
+            AmfEventId::SbiServer => self.handle_sbi_server(event),
+            AmfEventId::SbiClient => self.handle_sbi_client(event),
+            AmfEventId::SbiTimer => self.handle_sbi_timer(event),
+            AmfEventId::NgapMessage => self.handle_ngap_message(event),
+            AmfEventId::NgapTimer => self.handle_ngap_timer(event),
             AmfEventId::GmmTimer => {
                 // GMM timer events are dispatched to the UE's GMM FSM
                 AmfFsmResult::Delegated
@@ -109,11 +99,7 @@ impl AmfFsm {
     fn handle_sbi_server(&mut self, event: &AmfEvent) -> AmfFsmResult {
         if let Some(ref sbi) = event.sbi {
             if let Some(ref request) = sbi.request {
-                log::debug!(
-                    "SBI Server: {} {}",
-                    request.method,
-                    request.uri
-                );
+                log::debug!("SBI Server: {} {}", request.method, request.uri);
                 // Note: Route to appropriate handler based on service name
                 // Service routing handled by namf_handler module:
                 // - NNRF_NFM: NF status notify -> nf_sm
@@ -281,7 +267,7 @@ mod tests {
     fn test_amf_fsm_dispatch_sbi_server() {
         let mut fsm = AmfFsm::new();
         fsm.init();
-        
+
         let request = crate::event::AmfSbiRequest {
             method: "POST".to_string(),
             uri: "/namf-comm/v1/ue-contexts".to_string(),
@@ -296,7 +282,7 @@ mod tests {
     fn test_amf_fsm_dispatch_ngap_message() {
         let mut fsm = AmfFsm::new();
         fsm.init();
-        
+
         let event = AmfEvent::ngap_message(456, vec![1, 2, 3]);
         let result = fsm.dispatch(&event);
         assert_eq!(result, AmfFsmResult::Handled);
@@ -306,7 +292,7 @@ mod tests {
     fn test_amf_fsm_is_state() {
         let mut fsm = AmfFsm::new();
         assert!(fsm.is_state(AmfState::Initial));
-        
+
         fsm.init();
         assert!(fsm.is_state(AmfState::Operational));
         assert!(!fsm.is_state(AmfState::Initial));

@@ -6,7 +6,7 @@
 //!
 //! Port of src/smf/gsm-build.c - GSM message building functions for 5G NAS
 
-use crate::context::{SmfSess, SmfBearer, SmfPf, FlowDirection};
+use crate::context::{FlowDirection, SmfBearer, SmfPf, SmfSess};
 use bytes::{BufMut, BytesMut};
 
 // ============================================================================
@@ -52,7 +52,6 @@ pub mod qos_flow_description_code {
     pub const DELETE_NEW_QOS_FLOW_DESCRIPTION: u8 = 2;
     pub const MODIFY_NEW_QOS_FLOW_DESCRIPTION: u8 = 3;
 }
-
 
 /// QoS flow parameter identifiers
 pub mod qos_flow_param_id {
@@ -104,7 +103,6 @@ pub mod pdu_session_type {
     pub const UNSTRUCTURED: u8 = 4;
     pub const ETHERNET: u8 = 5;
 }
-
 
 /// 5GSM cause codes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,7 +199,6 @@ impl From<u8> for GsmCause {
     }
 }
 
-
 // ============================================================================
 // QoS Rule Structure
 // ============================================================================
@@ -255,7 +252,6 @@ pub struct QosFlowDescription {
     pub params: Vec<QosFlowParam>,
 }
 
-
 // ============================================================================
 // NAS Message Builder
 // ============================================================================
@@ -277,7 +273,9 @@ impl GsmMessageBuilder {
     /// Create a new GSM message builder with header
     pub fn with_header(psi: u8, pti: u8, message_type: u8) -> Self {
         let mut builder = Self::new();
-        builder.buffer.put_u8(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
+        builder
+            .buffer
+            .put_u8(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
         builder.buffer.put_u8(psi);
         builder.buffer.put_u8(pti);
         builder.buffer.put_u8(message_type);
@@ -360,7 +358,6 @@ impl Default for GsmMessageBuilder {
     }
 }
 
-
 // ============================================================================
 // QoS Rule Encoding
 // ============================================================================
@@ -368,104 +365,102 @@ impl Default for GsmMessageBuilder {
 /// Encode QoS rules to bytes
 pub fn encode_qos_rules(rules: &[QosRule]) -> Vec<u8> {
     let mut buffer = BytesMut::with_capacity(256);
-    
+
     for rule in rules {
         let rule_bytes = encode_single_qos_rule(rule);
         buffer.put_slice(&rule_bytes);
     }
-    
+
     buffer.to_vec()
 }
 
 /// Encode a single QoS rule
 fn encode_single_qos_rule(rule: &QosRule) -> Vec<u8> {
     let mut buffer = BytesMut::with_capacity(64);
-    
+
     // QoS rule identifier
     buffer.put_u8(rule.identifier);
-    
+
     // Length placeholder - will be filled later
     let length_pos = buffer.len();
     buffer.put_u16(0);
-    
+
     // Rule operation code (3 bits) + DQR (1 bit) + number of packet filters (4 bits)
     let num_pf = rule.packet_filters.len().min(15) as u8;
-    let first_byte = ((rule.code & 0x07) << 5) | 
-                     (if rule.dqr_bit { 0x10 } else { 0 }) | 
-                     (num_pf & 0x0f);
+    let first_byte =
+        ((rule.code & 0x07) << 5) | (if rule.dqr_bit { 0x10 } else { 0 }) | (num_pf & 0x0f);
     buffer.put_u8(first_byte);
-    
+
     // Packet filters
     for pf in &rule.packet_filters {
         // Direction (2 bits) + identifier (4 bits)
         let pf_header = ((pf.direction & 0x03) << 4) | (pf.identifier & 0x0f);
         buffer.put_u8(pf_header);
-        
+
         // Packet filter content
         let content_bytes = encode_packet_filter_content(&pf.content);
         buffer.put_u8(content_bytes.len() as u8);
         buffer.put_slice(&content_bytes);
     }
-    
+
     // QoS rule precedence (if not delete operation)
-    if rule.code != qos_rule_code::DELETE_EXISTING_QOS_RULE &&
-       rule.code != qos_rule_code::MODIFY_EXISTING_QOS_RULE_AND_DELETE_PACKET_FILTERS &&
-       rule.code != qos_rule_code::MODIFY_EXISTING_QOS_RULE_WITHOUT_MODIFYING_PACKET_FILTERS {
+    if rule.code != qos_rule_code::DELETE_EXISTING_QOS_RULE
+        && rule.code != qos_rule_code::MODIFY_EXISTING_QOS_RULE_AND_DELETE_PACKET_FILTERS
+        && rule.code != qos_rule_code::MODIFY_EXISTING_QOS_RULE_WITHOUT_MODIFYING_PACKET_FILTERS
+    {
         buffer.put_u8(rule.precedence);
-        
+
         // QoS flow identifier (segregation bit + QFI)
         let qfi_byte = (if rule.segregation { 0x40 } else { 0 }) | (rule.qfi & 0x3f);
         buffer.put_u8(qfi_byte);
     }
-    
+
     // Update length field
     let total_len = buffer.len() - length_pos - 2;
     let mut result = buffer.to_vec();
     result[length_pos] = ((total_len >> 8) & 0xff) as u8;
     result[length_pos + 1] = (total_len & 0xff) as u8;
-    
+
     result
 }
 
 /// Encode packet filter content
 fn encode_packet_filter_content(content: &PacketFilterContent) -> Vec<u8> {
     let mut buffer = BytesMut::with_capacity(32);
-    
+
     for component in &content.components {
         buffer.put_u8(component.component_type);
         buffer.put_slice(&component.data);
     }
-    
+
     buffer.to_vec()
 }
-
 
 /// Encode QoS flow descriptions to bytes
 pub fn encode_qos_flow_descriptions(descriptions: &[QosFlowDescription]) -> Vec<u8> {
     let mut buffer = BytesMut::with_capacity(256);
-    
+
     for desc in descriptions {
         let desc_bytes = encode_single_qos_flow_description(desc);
         buffer.put_slice(&desc_bytes);
     }
-    
+
     buffer.to_vec()
 }
 
 /// Encode a single QoS flow description
 fn encode_single_qos_flow_description(desc: &QosFlowDescription) -> Vec<u8> {
     let mut buffer = BytesMut::with_capacity(32);
-    
+
     // QFI
     buffer.put_u8(desc.identifier);
-    
+
     // Operation code (3 bits) + spare (1 bit) + E bit (1 bit) + num params (3 bits)
     let num_params = desc.params.len().min(7) as u8;
-    let second_byte = ((desc.code & 0x07) << 5) | 
-                      (if desc.e_bit { 0x08 } else { 0 }) | 
-                      (num_params & 0x07);
+    let second_byte =
+        ((desc.code & 0x07) << 5) | (if desc.e_bit { 0x08 } else { 0 }) | (num_params & 0x07);
     buffer.put_u8(second_byte);
-    
+
     // Parameters
     if desc.e_bit {
         for param in &desc.params {
@@ -474,7 +469,7 @@ fn encode_single_qos_flow_description(desc: &QosFlowDescription) -> Vec<u8> {
             buffer.put_slice(&param.data);
         }
     }
-    
+
     buffer.to_vec()
 }
 
@@ -493,7 +488,7 @@ pub fn encode_default_qos_rule(qos_flow: &SmfBearer) -> QosRule {
         qfi: qos_flow.qfi,
         ..Default::default()
     };
-    
+
     // Add match-all packet filter
     let pf = QosRulePacketFilter {
         direction: pf_direction::BIDIRECTIONAL,
@@ -506,7 +501,7 @@ pub fn encode_default_qos_rule(qos_flow: &SmfBearer) -> QosRule {
         },
     };
     rule.packet_filters.push(pf);
-    
+
     rule
 }
 
@@ -518,16 +513,15 @@ pub fn encode_default_qos_flow_description(qos_flow: &SmfBearer) -> QosFlowDescr
         e_bit: true,
         ..Default::default()
     };
-    
+
     // Add 5QI parameter
     desc.params.push(QosFlowParam {
         identifier: qos_flow_param_id::FIVE_QI,
         data: vec![qos_flow.qos.index],
     });
-    
+
     desc
 }
-
 
 /// Encode QoS rule with packet filters from bearer
 pub fn encode_qos_rule(qos_flow: &SmfBearer, code: u8, pfs: &[SmfPf]) -> QosRule {
@@ -540,17 +534,18 @@ pub fn encode_qos_rule(qos_flow: &SmfBearer, code: u8, pfs: &[SmfPf]) -> QosRule
         qfi: qos_flow.qfi,
         ..Default::default()
     };
-    
+
     // Add packet filters based on operation code
-    if code != qos_rule_code::DELETE_EXISTING_QOS_RULE &&
-       code != qos_rule_code::MODIFY_EXISTING_QOS_RULE_WITHOUT_MODIFYING_PACKET_FILTERS {
+    if code != qos_rule_code::DELETE_EXISTING_QOS_RULE
+        && code != qos_rule_code::MODIFY_EXISTING_QOS_RULE_WITHOUT_MODIFYING_PACKET_FILTERS
+    {
         for pf in pfs {
             let direction = match pf.direction {
                 FlowDirection::DownlinkOnly => pf_direction::DOWNLINK_ONLY,
                 FlowDirection::UplinkOnly => pf_direction::UPLINK_ONLY,
                 FlowDirection::Bidirectional => pf_direction::BIDIRECTIONAL,
             };
-            
+
             let qos_pf = QosRulePacketFilter {
                 direction,
                 identifier: pf.identifier,
@@ -559,14 +554,14 @@ pub fn encode_qos_rule(qos_flow: &SmfBearer, code: u8, pfs: &[SmfPf]) -> QosRule
             rule.packet_filters.push(qos_pf);
         }
     }
-    
+
     rule
 }
 
 /// Encode IPFW rule to packet filter content
 fn encode_ipfw_rule_to_content(ipfw: &crate::context::IpfwRule) -> PacketFilterContent {
     let mut content = PacketFilterContent::default();
-    
+
     // Protocol
     if ipfw.proto != 0 {
         content.components.push(PacketFilterComponent {
@@ -574,7 +569,7 @@ fn encode_ipfw_rule_to_content(ipfw: &crate::context::IpfwRule) -> PacketFilterC
             data: vec![ipfw.proto],
         });
     }
-    
+
     // Source address
     if let Some(addr) = ipfw.src_addr {
         let mut data = addr.octets().to_vec();
@@ -588,7 +583,7 @@ fn encode_ipfw_rule_to_content(ipfw: &crate::context::IpfwRule) -> PacketFilterC
             data,
         });
     }
-    
+
     // Destination address
     if let Some(addr) = ipfw.dst_addr {
         let mut data = addr.octets().to_vec();
@@ -602,7 +597,7 @@ fn encode_ipfw_rule_to_content(ipfw: &crate::context::IpfwRule) -> PacketFilterC
             data,
         });
     }
-    
+
     // Source port range
     if ipfw.src_port_low != 0 || ipfw.src_port_high != 0 {
         if ipfw.src_port_low == ipfw.src_port_high {
@@ -619,7 +614,7 @@ fn encode_ipfw_rule_to_content(ipfw: &crate::context::IpfwRule) -> PacketFilterC
             });
         }
     }
-    
+
     // Destination port range
     if ipfw.dst_port_low != 0 || ipfw.dst_port_high != 0 {
         if ipfw.dst_port_low == ipfw.dst_port_high {
@@ -636,7 +631,7 @@ fn encode_ipfw_rule_to_content(ipfw: &crate::context::IpfwRule) -> PacketFilterC
             });
         }
     }
-    
+
     // If no components, add match-all
     if content.components.is_empty() {
         content.components.push(PacketFilterComponent {
@@ -644,10 +639,9 @@ fn encode_ipfw_rule_to_content(ipfw: &crate::context::IpfwRule) -> PacketFilterC
             data: vec![],
         });
     }
-    
+
     content
 }
-
 
 /// Encode QoS flow description with full parameters
 pub fn encode_qos_flow_description(qos_flow: &SmfBearer, code: u8) -> QosFlowDescription {
@@ -657,14 +651,14 @@ pub fn encode_qos_flow_description(qos_flow: &SmfBearer, code: u8) -> QosFlowDes
         e_bit: code != qos_flow_description_code::DELETE_NEW_QOS_FLOW_DESCRIPTION,
         ..Default::default()
     };
-    
+
     if code != qos_flow_description_code::DELETE_NEW_QOS_FLOW_DESCRIPTION {
         // 5QI
         desc.params.push(QosFlowParam {
             identifier: qos_flow_param_id::FIVE_QI,
             data: vec![qos_flow.qos.index],
         });
-        
+
         // GBR uplink
         if qos_flow.qos.gbr_uplink > 0 {
             desc.params.push(QosFlowParam {
@@ -672,7 +666,7 @@ pub fn encode_qos_flow_description(qos_flow: &SmfBearer, code: u8) -> QosFlowDes
                 data: encode_bitrate(qos_flow.qos.gbr_uplink),
             });
         }
-        
+
         // GBR downlink
         if qos_flow.qos.gbr_downlink > 0 {
             desc.params.push(QosFlowParam {
@@ -680,7 +674,7 @@ pub fn encode_qos_flow_description(qos_flow: &SmfBearer, code: u8) -> QosFlowDes
                 data: encode_bitrate(qos_flow.qos.gbr_downlink),
             });
         }
-        
+
         // MBR uplink
         if qos_flow.qos.mbr_uplink > 0 {
             desc.params.push(QosFlowParam {
@@ -688,7 +682,7 @@ pub fn encode_qos_flow_description(qos_flow: &SmfBearer, code: u8) -> QosFlowDes
                 data: encode_bitrate(qos_flow.qos.mbr_uplink),
             });
         }
-        
+
         // MBR downlink
         if qos_flow.qos.mbr_downlink > 0 {
             desc.params.push(QosFlowParam {
@@ -697,7 +691,7 @@ pub fn encode_qos_flow_description(qos_flow: &SmfBearer, code: u8) -> QosFlowDes
             });
         }
     }
-    
+
     desc
 }
 
@@ -726,12 +720,11 @@ fn encode_bitrate(bitrate: u64) -> Vec<u8> {
     } else {
         (7, 65535)
     };
-    
+
     let mut data = vec![unit];
     data.extend_from_slice(&value.to_be_bytes());
     data
 }
-
 
 // ============================================================================
 // GSM Message Building Functions
@@ -747,7 +740,7 @@ pub fn build_pdu_session_establishment_accept(
         sess.pti,
         message_type::PDU_SESSION_ESTABLISHMENT_ACCEPT,
     );
-    
+
     // Selected PDU session type (mandatory)
     // SSC mode (3 bits) + PDU session type (3 bits)
     let session_type = match sess.session_type {
@@ -758,16 +751,16 @@ pub fn build_pdu_session_establishment_accept(
         crate::context::PduSessionType::Ethernet => pdu_session_type::ETHERNET,
     };
     builder.write_u8(session_type);
-    
+
     // Authorized QoS rules (mandatory)
     let default_rule = encode_default_qos_rule(qos_flow);
     let qos_rules_bytes = encode_qos_rules(&[default_rule]);
     builder.write_lv_e(&qos_rules_bytes);
-    
+
     // Session AMBR (mandatory)
     let ambr_bytes = encode_session_ambr(sess.session_ambr.downlink, sess.session_ambr.uplink);
     builder.write_lv(&ambr_bytes);
-    
+
     // PDU address (optional, IEI = 0x29)
     if let Some(addr) = sess.ipv4_addr {
         let mut pdu_addr = vec![pdu_session_type::IPV4];
@@ -778,21 +771,21 @@ pub fn build_pdu_session_establishment_accept(
         pdu_addr.extend_from_slice(&addr.octets()[8..16]); // Interface identifier
         builder.write_tlv(0x29, &pdu_addr);
     }
-    
+
     // S-NSSAI (optional, IEI = 0x22)
     let snssai_bytes = encode_snssai(&sess.s_nssai);
     builder.write_tlv(0x22, &snssai_bytes);
-    
+
     // Authorized QoS flow descriptions (optional, IEI = 0x79)
     let default_desc = encode_default_qos_flow_description(qos_flow);
     let qos_desc_bytes = encode_qos_flow_descriptions(&[default_desc]);
     builder.write_tlv_e(0x79, &qos_desc_bytes);
-    
+
     // DNN (optional, IEI = 0x25)
     if let Some(ref dnn) = sess.session_name {
         builder.write_tlv(0x25, dnn.as_bytes());
     }
-    
+
     Some(builder.build())
 }
 
@@ -803,13 +796,12 @@ pub fn build_pdu_session_establishment_reject(sess: &SmfSess, cause: GsmCause) -
         sess.pti,
         message_type::PDU_SESSION_ESTABLISHMENT_REJECT,
     );
-    
+
     // 5GSM cause (mandatory)
     builder.write_u8(cause as u8);
-    
+
     builder.build()
 }
-
 
 /// Build PDU Session Modification Command message
 pub fn build_pdu_session_modification_command(
@@ -823,7 +815,7 @@ pub fn build_pdu_session_modification_command(
         sess.pti,
         message_type::PDU_SESSION_MODIFICATION_COMMAND,
     );
-    
+
     // Authorized QoS rules (optional, IEI = 0x7A)
     if qos_rule_code != 0 {
         let rules: Vec<QosRule> = qos_flows
@@ -833,7 +825,7 @@ pub fn build_pdu_session_modification_command(
         let qos_rules_bytes = encode_qos_rules(&rules);
         builder.write_tlv_e(0x7A, &qos_rules_bytes);
     }
-    
+
     // Authorized QoS flow descriptions (optional, IEI = 0x79)
     if qos_flow_desc_code != 0 {
         let descs: Vec<QosFlowDescription> = qos_flows
@@ -843,7 +835,7 @@ pub fn build_pdu_session_modification_command(
         let qos_desc_bytes = encode_qos_flow_descriptions(&descs);
         builder.write_tlv_e(0x79, &qos_desc_bytes);
     }
-    
+
     Some(builder.build())
 }
 
@@ -854,10 +846,10 @@ pub fn build_pdu_session_modification_reject(sess: &SmfSess, cause: GsmCause) ->
         sess.pti,
         message_type::PDU_SESSION_MODIFICATION_REJECT,
     );
-    
+
     // 5GSM cause (mandatory)
     builder.write_u8(cause as u8);
-    
+
     builder.build()
 }
 
@@ -868,10 +860,10 @@ pub fn build_pdu_session_release_command(sess: &SmfSess, cause: GsmCause) -> Vec
         sess.pti,
         message_type::PDU_SESSION_RELEASE_COMMAND,
     );
-    
+
     // 5GSM cause (mandatory)
     builder.write_u8(cause as u8);
-    
+
     builder.build()
 }
 
@@ -882,10 +874,10 @@ pub fn build_pdu_session_release_reject(sess: &SmfSess, cause: GsmCause) -> Vec<
         sess.pti,
         message_type::PDU_SESSION_RELEASE_REJECT,
     );
-    
+
     // 5GSM cause (mandatory)
     builder.write_u8(cause as u8);
-    
+
     builder.build()
 }
 
@@ -1033,18 +1025,13 @@ fn build_epco(dns_servers: &[std::net::Ipv4Addr], mtu: Option<u16>) -> Vec<u8> {
 
 /// Build 5GSM Status message
 pub fn build_gsm_status(sess: &SmfSess, cause: GsmCause) -> Vec<u8> {
-    let mut builder = GsmMessageBuilder::with_header(
-        sess.psi,
-        sess.pti,
-        message_type::GSM_STATUS,
-    );
-    
+    let mut builder = GsmMessageBuilder::with_header(sess.psi, sess.pti, message_type::GSM_STATUS);
+
     // 5GSM cause (mandatory)
     builder.write_u8(cause as u8);
-    
+
     builder.build()
 }
-
 
 // ============================================================================
 // Helper Functions
@@ -1053,18 +1040,18 @@ pub fn build_gsm_status(sess: &SmfSess, cause: GsmCause) -> Vec<u8> {
 /// Encode session AMBR to NAS format
 fn encode_session_ambr(downlink: u64, uplink: u64) -> Vec<u8> {
     let mut data = Vec::with_capacity(6);
-    
+
     // Length
     data.push(6);
-    
+
     // Downlink (unit + value)
     let dl_bytes = encode_ambr_value(downlink);
     data.extend_from_slice(&dl_bytes);
-    
+
     // Uplink (unit + value)
     let ul_bytes = encode_ambr_value(uplink);
     data.extend_from_slice(&ul_bytes);
-    
+
     data
 }
 
@@ -1098,7 +1085,7 @@ fn encode_ambr_value(bitrate: u64) -> Vec<u8> {
     } else {
         (11, 65535)
     };
-    
+
     let mut data = vec![unit];
     data.extend_from_slice(&value.to_be_bytes());
     data
@@ -1107,20 +1094,19 @@ fn encode_ambr_value(bitrate: u64) -> Vec<u8> {
 /// Encode S-NSSAI to NAS format
 fn encode_snssai(snssai: &crate::context::SNssai) -> Vec<u8> {
     let mut data = Vec::with_capacity(5);
-    
+
     // SST (mandatory)
     data.push(snssai.sst);
-    
+
     // SD (optional)
     if let Some(sd) = snssai.sd {
         data.push(((sd >> 16) & 0xff) as u8);
         data.push(((sd >> 8) & 0xff) as u8);
         data.push((sd & 0xff) as u8);
     }
-    
+
     data
 }
-
 
 // ============================================================================
 // Tests
@@ -1129,7 +1115,10 @@ fn encode_snssai(snssai: &crate::context::SNssai) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{SmfSess, SmfBearer, SmfPf, SNssai, SessionAmbr, PduSessionType, Qos, FlowDirection, IpfwRule};
+    use crate::context::{
+        FlowDirection, IpfwRule, PduSessionType, Qos, SNssai, SessionAmbr, SmfBearer, SmfPf,
+        SmfSess,
+    };
     use std::net::Ipv4Addr;
 
     fn create_test_sess() -> SmfSess {
@@ -1140,7 +1129,10 @@ mod tests {
             pti: 1,
             session_type: PduSessionType::Ipv4,
             session_name: Some("internet".to_string()),
-            s_nssai: SNssai { sst: 1, sd: Some(0x010203) },
+            s_nssai: SNssai {
+                sst: 1,
+                sd: Some(0x010203),
+            },
             session_ambr: SessionAmbr {
                 downlink: 100_000_000, // 100 Mbps
                 uplink: 50_000_000,    // 50 Mbps
@@ -1184,7 +1176,7 @@ mod tests {
         builder.write_u8(0x2e);
         builder.write_u16(0x1234);
         builder.write_u32(0xdeadbeef);
-        
+
         let result = builder.build();
         assert_eq!(result.len(), 7);
         assert_eq!(result[0], 0x2e);
@@ -1194,9 +1186,10 @@ mod tests {
 
     #[test]
     fn test_gsm_message_builder_with_header() {
-        let builder = GsmMessageBuilder::with_header(5, 1, message_type::PDU_SESSION_ESTABLISHMENT_ACCEPT);
+        let builder =
+            GsmMessageBuilder::with_header(5, 1, message_type::PDU_SESSION_ESTABLISHMENT_ACCEPT);
         let result = builder.build();
-        
+
         assert_eq!(result.len(), 4);
         assert_eq!(result[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
         assert_eq!(result[1], 5); // PSI
@@ -1208,7 +1201,7 @@ mod tests {
     fn test_gsm_message_builder_lv() {
         let mut builder = GsmMessageBuilder::new();
         builder.write_lv(&[0x01, 0x02, 0x03]);
-        
+
         let result = builder.build();
         assert_eq!(result.len(), 4);
         assert_eq!(result[0], 3); // Length
@@ -1221,34 +1214,40 @@ mod tests {
     fn test_gsm_message_builder_tlv() {
         let mut builder = GsmMessageBuilder::new();
         builder.write_tlv(0x29, &[0x01, 0x0a, 0x2d, 0x00, 0x01]);
-        
+
         let result = builder.build();
         assert_eq!(result.len(), 7);
         assert_eq!(result[0], 0x29); // IEI
-        assert_eq!(result[1], 5);    // Length
+        assert_eq!(result[1], 5); // Length
     }
 
     #[test]
     fn test_encode_default_qos_rule() {
         let bearer = create_test_bearer();
         let rule = encode_default_qos_rule(&bearer);
-        
+
         assert_eq!(rule.identifier, 1);
         assert_eq!(rule.code, qos_rule_code::CREATE_NEW_QOS_RULE);
         assert!(rule.dqr_bit);
         assert_eq!(rule.qfi, 1);
         assert_eq!(rule.precedence, 255);
         assert_eq!(rule.packet_filters.len(), 1);
-        assert_eq!(rule.packet_filters[0].direction, pf_direction::BIDIRECTIONAL);
+        assert_eq!(
+            rule.packet_filters[0].direction,
+            pf_direction::BIDIRECTIONAL
+        );
     }
 
     #[test]
     fn test_encode_default_qos_flow_description() {
         let bearer = create_test_bearer();
         let desc = encode_default_qos_flow_description(&bearer);
-        
+
         assert_eq!(desc.identifier, 1);
-        assert_eq!(desc.code, qos_flow_description_code::CREATE_NEW_QOS_FLOW_DESCRIPTION);
+        assert_eq!(
+            desc.code,
+            qos_flow_description_code::CREATE_NEW_QOS_FLOW_DESCRIPTION
+        );
         assert!(desc.e_bit);
         assert_eq!(desc.params.len(), 1);
         assert_eq!(desc.params[0].identifier, qos_flow_param_id::FIVE_QI);
@@ -1260,7 +1259,7 @@ mod tests {
         let bearer = create_test_bearer();
         let rule = encode_default_qos_rule(&bearer);
         let encoded = encode_qos_rules(&[rule]);
-        
+
         // Should have: identifier (1) + length (2) + content
         assert!(encoded.len() >= 3);
         assert_eq!(encoded[0], 1); // QoS rule identifier
@@ -1271,7 +1270,7 @@ mod tests {
         let bearer = create_test_bearer();
         let desc = encode_default_qos_flow_description(&bearer);
         let encoded = encode_qos_flow_descriptions(&[desc]);
-        
+
         // Should have: QFI (1) + operation code byte (1) + params
         assert!(encoded.len() >= 2);
         assert_eq!(encoded[0], 1); // QFI
@@ -1283,12 +1282,12 @@ mod tests {
         let result = encode_bitrate(0);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0], 0); // Unit
-        
+
         // Test 1 Mbps
         let result = encode_bitrate(1_000_000);
         assert_eq!(result.len(), 3);
         assert_eq!(result[0], 0); // Unit 0 = 1kbps
-        
+
         // Test 100 Mbps
         let result = encode_bitrate(100_000_000);
         assert_eq!(result.len(), 3);
@@ -1297,7 +1296,7 @@ mod tests {
     #[test]
     fn test_encode_session_ambr() {
         let ambr = encode_session_ambr(100_000_000, 50_000_000);
-        
+
         // Length (1) + DL unit (1) + DL value (2) + UL unit (1) + UL value (2) = 7
         assert_eq!(ambr.len(), 7);
         assert_eq!(ambr[0], 6); // Length field
@@ -1305,9 +1304,12 @@ mod tests {
 
     #[test]
     fn test_encode_snssai() {
-        let snssai = SNssai { sst: 1, sd: Some(0x010203) };
+        let snssai = SNssai {
+            sst: 1,
+            sd: Some(0x010203),
+        };
         let encoded = encode_snssai(&snssai);
-        
+
         assert_eq!(encoded.len(), 4);
         assert_eq!(encoded[0], 1); // SST
         assert_eq!(encoded[1], 0x01); // SD byte 1
@@ -1319,7 +1321,7 @@ mod tests {
     fn test_encode_snssai_no_sd() {
         let snssai = SNssai { sst: 1, sd: None };
         let encoded = encode_snssai(&snssai);
-        
+
         assert_eq!(encoded.len(), 1);
         assert_eq!(encoded[0], 1); // SST only
     }
@@ -1328,10 +1330,10 @@ mod tests {
     fn test_build_pdu_session_establishment_accept() {
         let sess = create_test_sess();
         let bearer = create_test_bearer();
-        
+
         let result = build_pdu_session_establishment_accept(&sess, &bearer);
         assert!(result.is_some());
-        
+
         let msg = result.unwrap();
         assert!(msg.len() > 4);
         assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
@@ -1344,9 +1346,9 @@ mod tests {
     #[test]
     fn test_build_pdu_session_establishment_reject() {
         let sess = create_test_sess();
-        
+
         let msg = build_pdu_session_establishment_reject(&sess, GsmCause::InsufficientResources);
-        
+
         assert_eq!(msg.len(), 5);
         assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GSM);
         assert_eq!(msg[1], 5); // PSI
@@ -1359,14 +1361,14 @@ mod tests {
     fn test_build_pdu_session_modification_command() {
         let sess = create_test_sess();
         let bearer = create_test_bearer();
-        
+
         let result = build_pdu_session_modification_command(
             &sess,
             &[bearer],
             qos_rule_code::MODIFY_EXISTING_QOS_RULE_WITHOUT_MODIFYING_PACKET_FILTERS,
             qos_flow_description_code::MODIFY_NEW_QOS_FLOW_DESCRIPTION,
         );
-        
+
         assert!(result.is_some());
         let msg = result.unwrap();
         assert!(msg.len() > 4);
@@ -1376,9 +1378,10 @@ mod tests {
     #[test]
     fn test_build_pdu_session_modification_reject() {
         let sess = create_test_sess();
-        
-        let msg = build_pdu_session_modification_reject(&sess, GsmCause::SemanticErrorInTheQosOperation);
-        
+
+        let msg =
+            build_pdu_session_modification_reject(&sess, GsmCause::SemanticErrorInTheQosOperation);
+
         assert_eq!(msg.len(), 5);
         assert_eq!(msg[3], message_type::PDU_SESSION_MODIFICATION_REJECT);
         assert_eq!(msg[4], GsmCause::SemanticErrorInTheQosOperation as u8);
@@ -1387,9 +1390,9 @@ mod tests {
     #[test]
     fn test_build_pdu_session_release_command() {
         let sess = create_test_sess();
-        
+
         let msg = build_pdu_session_release_command(&sess, GsmCause::RegularDeactivation);
-        
+
         assert_eq!(msg.len(), 5);
         assert_eq!(msg[3], message_type::PDU_SESSION_RELEASE_COMMAND);
         assert_eq!(msg[4], GsmCause::RegularDeactivation as u8);
@@ -1398,9 +1401,9 @@ mod tests {
     #[test]
     fn test_build_pdu_session_release_reject() {
         let sess = create_test_sess();
-        
+
         let msg = build_pdu_session_release_reject(&sess, GsmCause::PduSessionDoesNotExist);
-        
+
         assert_eq!(msg.len(), 5);
         assert_eq!(msg[3], message_type::PDU_SESSION_RELEASE_REJECT);
         assert_eq!(msg[4], GsmCause::PduSessionDoesNotExist as u8);
@@ -1409,9 +1412,9 @@ mod tests {
     #[test]
     fn test_build_gsm_status() {
         let sess = create_test_sess();
-        
+
         let msg = build_gsm_status(&sess, GsmCause::ProtocolErrorUnspecified);
-        
+
         assert_eq!(msg.len(), 5);
         assert_eq!(msg[3], message_type::GSM_STATUS);
         assert_eq!(msg[4], GsmCause::ProtocolErrorUnspecified as u8);
@@ -1443,9 +1446,9 @@ mod tests {
             },
             ..Default::default()
         };
-        
+
         let rule = encode_qos_rule(&bearer, qos_rule_code::CREATE_NEW_QOS_RULE, &[pf]);
-        
+
         assert_eq!(rule.identifier, 1);
         assert_eq!(rule.code, qos_rule_code::CREATE_NEW_QOS_RULE);
         assert_eq!(rule.packet_filters.len(), 1);
@@ -1454,13 +1457,16 @@ mod tests {
     #[test]
     fn test_encode_qos_flow_description_with_gbr() {
         let mut bearer = create_test_bearer();
-        bearer.qos.gbr_uplink = 10_000_000;   // 10 Mbps
+        bearer.qos.gbr_uplink = 10_000_000; // 10 Mbps
         bearer.qos.gbr_downlink = 20_000_000; // 20 Mbps
-        bearer.qos.mbr_uplink = 50_000_000;   // 50 Mbps
+        bearer.qos.mbr_uplink = 50_000_000; // 50 Mbps
         bearer.qos.mbr_downlink = 100_000_000; // 100 Mbps
-        
-        let desc = encode_qos_flow_description(&bearer, qos_flow_description_code::CREATE_NEW_QOS_FLOW_DESCRIPTION);
-        
+
+        let desc = encode_qos_flow_description(
+            &bearer,
+            qos_flow_description_code::CREATE_NEW_QOS_FLOW_DESCRIPTION,
+        );
+
         assert_eq!(desc.identifier, 1);
         assert!(desc.e_bit);
         // Should have 5QI + 4 bitrate params
@@ -1470,9 +1476,12 @@ mod tests {
     #[test]
     fn test_encode_qos_flow_description_delete() {
         let bearer = create_test_bearer();
-        
-        let desc = encode_qos_flow_description(&bearer, qos_flow_description_code::DELETE_NEW_QOS_FLOW_DESCRIPTION);
-        
+
+        let desc = encode_qos_flow_description(
+            &bearer,
+            qos_flow_description_code::DELETE_NEW_QOS_FLOW_DESCRIPTION,
+        );
+
         assert_eq!(desc.identifier, 1);
         assert!(!desc.e_bit);
         assert!(desc.params.is_empty());
@@ -1492,9 +1501,9 @@ mod tests {
                 },
             ],
         };
-        
+
         let encoded = encode_packet_filter_content(&content);
-        
+
         // Protocol (1 type + 1 data) + Port (1 type + 2 data) = 5
         assert_eq!(encoded.len(), 5);
         assert_eq!(encoded[0], pf_component_type::PROTOCOL_IDENTIFIER);
@@ -1548,9 +1557,8 @@ mod tests {
         let bearer = create_test_bearer();
         let dns = vec!["8.8.8.8".parse().unwrap(), "8.8.4.4".parse().unwrap()];
 
-        let result = build_pdu_session_establishment_accept_extended(
-            &sess, &bearer, &dns, Some(1400),
-        );
+        let result =
+            build_pdu_session_establishment_accept_extended(&sess, &bearer, &dns, Some(1400));
         assert!(result.is_some());
 
         let msg = result.unwrap();
@@ -1565,9 +1573,7 @@ mod tests {
         let sess = create_test_sess();
         let bearer = create_test_bearer();
 
-        let result = build_pdu_session_establishment_accept_extended(
-            &sess, &bearer, &[], None,
-        );
+        let result = build_pdu_session_establishment_accept_extended(&sess, &bearer, &[], None);
         assert!(result.is_some());
     }
 

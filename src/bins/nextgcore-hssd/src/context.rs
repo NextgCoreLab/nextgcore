@@ -185,8 +185,8 @@ impl HssContext {
         Self {
             diam_conf_path: None,
             diam_config: DiamConfig {
-                cnf_port: 3868,      // DIAMETER_PORT
-                cnf_port_tls: 5868,  // DIAMETER_SECURE_PORT
+                cnf_port: 3868,     // DIAMETER_PORT
+                cnf_port_tls: 5868, // DIAMETER_SECURE_PORT
                 ..Default::default()
             },
             sms_over_ims: None,
@@ -214,9 +214,7 @@ impl HssContext {
         self.max_impu.store(max_impu, Ordering::SeqCst);
         self.initialized.store(true, Ordering::SeqCst);
 
-        log::info!(
-            "HSS context initialized (max_impi={max_impi}, max_impu={max_impu})"
-        );
+        log::info!("HSS context initialized (max_impi={max_impi}, max_impu={max_impu})");
     }
 
     /// Finalize the HSS context
@@ -260,7 +258,7 @@ impl HssContext {
 
     /// Remove an IMSI by ID
     pub fn imsi_remove(&self, id: &str) -> bool {
-        let list = self.imsi_list.write().unwrap();
+        let list = self.imsi_list.read().unwrap();
         let mut hash = self.imsi_hash.write().unwrap();
 
         if let Some(&idx) = hash.get(id) {
@@ -317,7 +315,7 @@ impl HssContext {
 
     /// Remove an IMPI by ID
     pub fn impi_remove(&self, id: &str) -> bool {
-        let list = self.impi_list.write().unwrap();
+        let list = self.impi_list.read().unwrap();
         let mut hash = self.impi_hash.write().unwrap();
         let mut impu_hash = self.impu_hash.write().unwrap();
 
@@ -433,7 +431,12 @@ impl HssContext {
     }
 
     /// Set IMSI BCD for an IMPI
-    pub fn cx_set_imsi_bcd(&self, user_name: &str, imsi_bcd: &str, visited_network_identifier: &str) {
+    pub fn cx_set_imsi_bcd(
+        &self,
+        user_name: &str,
+        imsi_bcd: &str,
+        visited_network_identifier: &str,
+    ) {
         let _lock = self.cx_lock.lock().unwrap();
 
         // Find or create IMSI
@@ -589,7 +592,6 @@ pub fn hss_context_parse_config(_config_path: &str) -> Result<(), String> {
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,7 +703,10 @@ mod tests {
         assert!(imsi.visited_network_identifier.is_none());
 
         imsi.set_visited_network_identifier("example.com");
-        assert_eq!(imsi.visited_network_identifier, Some("example.com".to_string()));
+        assert_eq!(
+            imsi.visited_network_identifier,
+            Some("example.com".to_string())
+        );
     }
 
     #[test]

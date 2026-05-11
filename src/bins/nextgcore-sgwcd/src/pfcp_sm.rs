@@ -77,7 +77,10 @@ impl PfcpFsm {
         match event.id {
             SgwcEventId::FsmEntry => {
                 // Start association timer and send association setup request
-                log::debug!("PFCP[{}] will_associate entry - sending association setup", self.node_id);
+                log::debug!(
+                    "PFCP[{}] will_associate entry - sending association setup",
+                    self.node_id
+                );
                 // Note: Timer started via timer module with PfcpAssociation timer ID
                 // PFCP Association Setup Request sent via pfcp_handler::send_association_setup_request
             }
@@ -133,7 +136,7 @@ impl PfcpFsm {
                 log::info!("PFCP[{}] associated", self.node_id);
                 // Start no-heartbeat timer
                 // Send heartbeat request
-                
+
                 if self.restoration_required {
                     self.pfcp_restoration();
                     self.restoration_required = false;

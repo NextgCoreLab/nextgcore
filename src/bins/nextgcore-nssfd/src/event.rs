@@ -58,7 +58,9 @@ pub enum NssfTimerId {
 impl NssfTimerId {
     pub fn name(&self) -> &'static str {
         match self {
-            NssfTimerId::NfInstanceRegistrationInterval => "OGS_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL",
+            NssfTimerId::NfInstanceRegistrationInterval => {
+                "OGS_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
+            }
             NssfTimerId::NfInstanceHeartbeatInterval => "OGS_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL",
             NssfTimerId::NfInstanceNoHeartbeat => "OGS_TIMER_NF_INSTANCE_NO_HEARTBEAT",
             NssfTimerId::NfInstanceValidity => "OGS_TIMER_NF_INSTANCE_VALIDITY",
@@ -68,7 +70,6 @@ impl NssfTimerId {
         }
     }
 }
-
 
 /// SBI message data for events
 #[derive(Debug, Clone, Default)]

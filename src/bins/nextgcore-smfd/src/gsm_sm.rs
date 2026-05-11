@@ -123,7 +123,9 @@ impl GsmFsm {
         let result = match self.state {
             GsmState::Initial => self.handle_initial(event),
             GsmState::WaitEpcAuthInitial => self.handle_wait_epc_auth_initial(event),
-            GsmState::Wait5gcSmPolicyAssociation => self.handle_wait_5gc_sm_policy_association(event),
+            GsmState::Wait5gcSmPolicyAssociation => {
+                self.handle_wait_5gc_sm_policy_association(event)
+            }
             GsmState::WaitPfcpEstablishment => self.handle_wait_pfcp_establishment(event),
             GsmState::Operational => self.handle_operational(event),
             GsmState::WaitPfcpDeletion => self.handle_wait_pfcp_deletion(event),
@@ -195,12 +197,14 @@ impl GsmFsm {
             if let Some(ref message) = sbi.message {
                 // Check service name and resource
                 if message.service_name == "nsmf-pdusession"
-                    && message.resource_components.first().map(|s| s.as_str()) == Some("sm-contexts") {
-                        log::debug!("GSM: SM Context Create");
-                        // For home-routed roaming in V-SMF, go directly to PFCP establishment
-                        // Otherwise, go to SM policy association
-                        return GsmFsmResult::Transition(GsmState::Wait5gcSmPolicyAssociation);
-                    }
+                    && message.resource_components.first().map(|s| s.as_str())
+                        == Some("sm-contexts")
+                {
+                    log::debug!("GSM: SM Context Create");
+                    // For home-routed roaming in V-SMF, go directly to PFCP establishment
+                    // Otherwise, go to SM policy association
+                    return GsmFsmResult::Transition(GsmState::Wait5gcSmPolicyAssociation);
+                }
             }
         }
         GsmFsmResult::Handled
@@ -253,15 +257,21 @@ impl GsmFsm {
         {
             // All requests complete, check for errors
             let success = self.sm_data.s6b_aaa_err == 2001 || self.sm_data.s6b_aaa_err == 0;
-            let gx_success = self.sm_data.gx_cca_init_err == 2001 || self.sm_data.gx_cca_init_err == 0;
-            let gy_success = self.sm_data.gy_cca_init_err == 2001 || self.sm_data.gy_cca_init_err == 0;
+            let gx_success =
+                self.sm_data.gx_cca_init_err == 2001 || self.sm_data.gx_cca_init_err == 0;
+            let gy_success =
+                self.sm_data.gy_cca_init_err == 2001 || self.sm_data.gy_cca_init_err == 0;
 
             if success && gx_success && gy_success {
                 log::debug!("EPC auth complete, transitioning to PFCP establishment");
                 GsmFsmResult::Transition(GsmState::WaitPfcpEstablishment)
             } else {
-                log::warn!("EPC auth failed: s6b={}, gx={}, gy={}",
-                    self.sm_data.s6b_aaa_err, self.sm_data.gx_cca_init_err, self.sm_data.gy_cca_init_err);
+                log::warn!(
+                    "EPC auth failed: s6b={}, gx={}, gy={}",
+                    self.sm_data.s6b_aaa_err,
+                    self.sm_data.gx_cca_init_err,
+                    self.sm_data.gy_cca_init_err
+                );
                 GsmFsmResult::Transition(GsmState::Exception)
             }
         } else {
@@ -304,7 +314,9 @@ impl GsmFsm {
                     // PCF SM policy response
                     if let Some(status) = message.res_status {
                         if status == 201 {
-                            log::debug!("PCF SM policy created, transitioning to PFCP establishment");
+                            log::debug!(
+                                "PCF SM policy created, transitioning to PFCP establishment"
+                            );
                             return GsmFsmResult::Transition(GsmState::WaitPfcpEstablishment);
                         } else {
                             log::error!("PCF SM policy error: {status}");
@@ -743,7 +755,10 @@ mod tests {
     #[test]
     fn test_gsm_state_names() {
         assert_eq!(GsmState::Initial.name(), "GSM_STATE_INITIAL");
-        assert_eq!(GsmState::WaitEpcAuthInitial.name(), "GSM_STATE_WAIT_EPC_AUTH_INITIAL");
+        assert_eq!(
+            GsmState::WaitEpcAuthInitial.name(),
+            "GSM_STATE_WAIT_EPC_AUTH_INITIAL"
+        );
         assert_eq!(GsmState::Operational.name(), "GSM_STATE_OPERATIONAL");
         assert_eq!(GsmState::Exception.name(), "GSM_STATE_EXCEPTION");
     }
@@ -760,13 +775,13 @@ mod tests {
     #[test]
     fn test_gsm_fsm_set_in_flight() {
         let mut fsm = GsmFsm::new(123);
-        
+
         fsm.set_s6b_aar_in_flight(true);
         assert!(fsm.sm_data.s6b_aar_in_flight);
-        
+
         fsm.set_gx_ccr_init_in_flight(true);
         assert!(fsm.sm_data.gx_ccr_init_in_flight);
-        
+
         fsm.set_gy_ccr_init_in_flight(true);
         assert!(fsm.sm_data.gy_ccr_init_in_flight);
     }
@@ -775,26 +790,29 @@ mod tests {
     fn test_gsm_fsm_epc_auth_complete() {
         let mut fsm = GsmFsm::new(123);
         fsm.transition_to(GsmState::WaitEpcAuthInitial);
-        
+
         // Simulate all auth complete with success
         fsm.sm_data.s6b_aaa_err = 2001;
         fsm.sm_data.gx_cca_init_err = 2001;
         fsm.sm_data.gy_cca_init_err = 2001;
-        
+
         let result = fsm.check_epc_auth_complete();
-        assert_eq!(result, GsmFsmResult::Transition(GsmState::WaitPfcpEstablishment));
+        assert_eq!(
+            result,
+            GsmFsmResult::Transition(GsmState::WaitPfcpEstablishment)
+        );
     }
 
     #[test]
     fn test_gsm_fsm_epc_auth_in_progress() {
         let mut fsm = GsmFsm::new(123);
         fsm.transition_to(GsmState::WaitEpcAuthInitial);
-        
+
         // Simulate Gx still in flight
         fsm.sm_data.gx_ccr_init_in_flight = true;
         fsm.sm_data.s6b_aaa_err = 2001;
         fsm.sm_data.gy_cca_init_err = 2001;
-        
+
         let result = fsm.check_epc_auth_complete();
         assert_eq!(result, GsmFsmResult::Handled);
     }

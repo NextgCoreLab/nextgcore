@@ -150,11 +150,7 @@ fn handle_create_session_continue(imsi: &[u8], apn: &str, ebi: u8) -> HandlerRes
 
     // Check if session already exists
     if let Some(existing_sess) = ctx.sess_find_by_apn(ue.id, apn) {
-        log::info!(
-            "OLD Session Release [IMSI:{},APN:{}]",
-            ue.imsi_bcd,
-            apn
-        );
+        log::info!("OLD Session Release [IMSI:{},APN:{}]", ue.imsi_bcd, apn);
         ctx.sess_remove(existing_sess.id);
     }
 
@@ -608,15 +604,7 @@ mod tests {
     #[test]
     fn test_create_session_request_no_ue() {
         let imsi = vec![0x09, 0x10, 0x10, 0x00, 0x00, 0x00, 0x10];
-        let result = handle_create_session_request(
-            None,
-            1,
-            &[],
-            &imsi,
-            "internet",
-            12345,
-            5,
-        );
+        let result = handle_create_session_request(None, 1, &[], &imsi, "internet", 12345, 5);
         // Should create UE and session, return SendPfcp
         matches!(result, HandlerResult::SendPfcp);
     }

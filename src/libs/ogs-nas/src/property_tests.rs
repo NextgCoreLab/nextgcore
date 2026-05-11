@@ -9,8 +9,8 @@
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
     use bytes::BytesMut;
+    use proptest::prelude::*;
 
     // ========================================================================
     // 5GMM Message Property Tests
@@ -18,9 +18,9 @@ mod tests {
 
     mod fivegmm_props {
         use super::*;
-        use crate::fiveg::types::*;
-        use crate::fiveg::header::*;
         use crate::common::types::*;
+        use crate::fiveg::header::*;
+        use crate::fiveg::types::*;
 
         // Strategy for generating valid PLMN IDs
         fn arb_plmn_id() -> impl Strategy<Value = PlmnId> {
@@ -28,7 +28,8 @@ mod tests {
                 prop::array::uniform3(0u8..10),
                 prop::array::uniform3(0u8..10),
                 2u8..4,
-            ).prop_map(|(mcc, mnc, mnc_len)| PlmnId::new(mcc, mnc, mnc_len))
+            )
+                .prop_map(|(mcc, mnc, mnc_len)| PlmnId::new(mcc, mnc, mnc_len))
         }
 
         // Strategy for generating valid 5G-GUTI
@@ -39,25 +40,26 @@ mod tests {
                 0u16..1024,
                 0u8..64,
                 any::<u32>(),
-            ).prop_map(|(plmn_id, amf_region_id, amf_set_id, amf_pointer, tmsi)| {
-                FiveGGuti {
-                    plmn_id,
-                    amf_region_id,
-                    amf_set_id,
-                    amf_pointer,
-                    tmsi,
-                }
-            })
+            )
+                .prop_map(|(plmn_id, amf_region_id, amf_set_id, amf_pointer, tmsi)| {
+                    FiveGGuti {
+                        plmn_id,
+                        amf_region_id,
+                        amf_set_id,
+                        amf_pointer,
+                        tmsi,
+                    }
+                })
         }
 
         // Strategy for generating valid 5G-S-TMSI
         fn arb_five_g_s_tmsi() -> impl Strategy<Value = FiveGSTmsi> {
-            (
-                0u16..1024,
-                0u8..64,
-                any::<u32>(),
-            ).prop_map(|(amf_set_id, amf_pointer, tmsi)| {
-                FiveGSTmsi { amf_set_id, amf_pointer, tmsi }
+            (0u16..1024, 0u8..64, any::<u32>()).prop_map(|(amf_set_id, amf_pointer, tmsi)| {
+                FiveGSTmsi {
+                    amf_set_id,
+                    amf_pointer,
+                    tmsi,
+                }
             })
         }
 
@@ -71,9 +73,11 @@ mod tests {
                     RegistrationTypeValue::PeriodicRegistrationUpdating,
                     RegistrationTypeValue::EmergencyRegistration,
                 ]),
-            ).prop_map(|(follow_on_request, value)| {
-                RegistrationType { follow_on_request, value }
-            })
+            )
+                .prop_map(|(follow_on_request, value)| RegistrationType {
+                    follow_on_request,
+                    value,
+                })
         }
 
         // Feature: nextgcore-rust-conversion, Property 11: Protocol Message Round-Trip
@@ -84,13 +88,13 @@ mod tests {
             #[test]
             fn prop_five_g_guti_round_trip(guti in arb_five_g_guti()) {
                 let identity = MobileIdentity::FiveGGuti(guti.clone());
-                
+
                 let mut buf = BytesMut::new();
                 identity.encode(&mut buf);
-                
+
                 let mut bytes = buf.freeze();
                 let decoded = MobileIdentity::decode(&mut bytes).unwrap();
-                
+
                 if let MobileIdentity::FiveGGuti(decoded_guti) = decoded {
                     // PLMN ID comparison: MCC must match exactly
                     prop_assert_eq!(decoded_guti.plmn_id.mcc, guti.plmn_id.mcc);
@@ -114,13 +118,13 @@ mod tests {
             #[test]
             fn prop_five_g_s_tmsi_round_trip(tmsi in arb_five_g_s_tmsi()) {
                 let identity = MobileIdentity::FiveGSTmsi(tmsi.clone());
-                
+
                 let mut buf = BytesMut::new();
                 identity.encode(&mut buf);
-                
+
                 let mut bytes = buf.freeze();
                 let decoded = MobileIdentity::decode(&mut bytes).unwrap();
-                
+
                 if let MobileIdentity::FiveGSTmsi(decoded_tmsi) = decoded {
                     prop_assert_eq!(decoded_tmsi.amf_set_id, tmsi.amf_set_id);
                     prop_assert_eq!(decoded_tmsi.amf_pointer, tmsi.amf_pointer);
@@ -136,13 +140,13 @@ mod tests {
             fn prop_imei_round_trip(digits in prop::array::uniform15(0u8..10)) {
                 let imei = Imei { digits };
                 let identity = MobileIdentity::Imei(imei.clone());
-                
+
                 let mut buf = BytesMut::new();
                 identity.encode(&mut buf);
-                
+
                 let mut bytes = buf.freeze();
                 let decoded = MobileIdentity::decode(&mut bytes).unwrap();
-                
+
                 if let MobileIdentity::Imei(decoded_imei) = decoded {
                     prop_assert_eq!(decoded_imei.digits, imei.digits);
                 } else {
@@ -156,13 +160,13 @@ mod tests {
             fn prop_imeisv_round_trip(digits in prop::array::uniform16(0u8..10)) {
                 let imeisv = Imeisv { digits };
                 let identity = MobileIdentity::Imeisv(imeisv.clone());
-                
+
                 let mut buf = BytesMut::new();
                 identity.encode(&mut buf);
-                
+
                 let mut bytes = buf.freeze();
                 let decoded = MobileIdentity::decode(&mut bytes).unwrap();
-                
+
                 if let MobileIdentity::Imeisv(decoded_imeisv) = decoded {
                     prop_assert_eq!(decoded_imeisv.digits, imeisv.digits);
                 } else {
@@ -176,7 +180,7 @@ mod tests {
             fn prop_registration_type_round_trip(reg_type in arb_registration_type()) {
                 let encoded = reg_type.encode();
                 let decoded = RegistrationType::decode(encoded).unwrap();
-                
+
                 prop_assert_eq!(decoded.follow_on_request, reg_type.follow_on_request);
                 prop_assert_eq!(decoded.value, reg_type.value);
             }
@@ -193,13 +197,13 @@ mod tests {
                 ]),
             ) {
                 let result = RegistrationResult { sms_allowed, value };
-                
+
                 let mut buf = BytesMut::new();
                 result.encode(&mut buf);
-                
+
                 let mut bytes = buf.freeze();
                 let decoded = RegistrationResult::decode(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(decoded.sms_allowed, result.sms_allowed);
                 prop_assert_eq!(decoded.value, result.value);
             }
@@ -221,10 +225,10 @@ mod tests {
                     re_registration_required,
                     access_type,
                 };
-                
+
                 let encoded = dereg_type.encode();
                 let decoded = DeRegistrationType::decode(encoded);
-                
+
                 prop_assert_eq!(decoded.switch_off, dereg_type.switch_off);
                 prop_assert_eq!(decoded.re_registration_required, dereg_type.re_registration_required);
                 prop_assert_eq!(decoded.access_type, dereg_type.access_type);
@@ -247,13 +251,13 @@ mod tests {
                     security_header_type: SecurityHeaderType::PlainNas,
                     message_type,
                 };
-                
+
                 let mut buf = BytesMut::new();
                 header.encode(&mut buf);
-                
+
                 let mut bytes = buf.freeze();
                 let decoded = FiveGsNasHeader::decode(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(decoded.extended_protocol_discriminator, header.extended_protocol_discriminator);
                 prop_assert_eq!(decoded.security_header_type, header.security_header_type);
                 prop_assert_eq!(decoded.message_type, header.message_type);
@@ -264,13 +268,13 @@ mod tests {
             #[test]
             fn prop_mobile_identity_deterministic(guti in arb_five_g_guti()) {
                 let identity = MobileIdentity::FiveGGuti(guti);
-                
+
                 // Encode twice
                 let mut buf1 = BytesMut::new();
                 let mut buf2 = BytesMut::new();
                 identity.encode(&mut buf1);
                 identity.encode(&mut buf2);
-                
+
                 prop_assert_eq!(buf1, buf2, "Mobile identity encoding must be deterministic");
             }
 
@@ -293,13 +297,13 @@ mod tests {
                     scheme_output: scheme_output.clone(),
                 };
                 let identity = MobileIdentity::Suci(suci);
-                
+
                 let mut buf = BytesMut::new();
                 identity.encode(&mut buf);
-                
+
                 let mut bytes = buf.freeze();
                 let decoded = MobileIdentity::decode(&mut bytes).unwrap();
-                
+
                 if let MobileIdentity::Suci(decoded_suci) = decoded {
                     prop_assert_eq!(decoded_suci.supi_format, 0);
                     // PLMN ID comparison: MCC must match exactly
@@ -324,13 +328,13 @@ mod tests {
             #[test]
             fn prop_no_identity_round_trip(_dummy in Just(())) {
                 let identity = MobileIdentity::NoIdentity;
-                
+
                 let mut buf = BytesMut::new();
                 identity.encode(&mut buf);
-                
+
                 let mut bytes = buf.freeze();
                 let decoded = MobileIdentity::decode(&mut bytes).unwrap();
-                
+
                 prop_assert!(matches!(decoded, MobileIdentity::NoIdentity));
             }
         }
@@ -356,13 +360,13 @@ mod tests {
                 mnc_len in 2u8..4,
             ) {
                 let plmn_id = PlmnId::new(mcc, mnc, mnc_len);
-                
+
                 let mut buf = BytesMut::new();
                 plmn_id.encode(&mut buf);
-                
+
                 let mut bytes = buf.freeze();
                 let decoded = PlmnId::decode(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(decoded.mcc, plmn_id.mcc);
                 // MNC comparison depends on mnc_len
                 if mnc_len == 2 {
@@ -384,13 +388,13 @@ mod tests {
             ) {
                 let plmn_id = PlmnId::new(mcc, mnc, mnc_len);
                 let tai = Tai { plmn_id, tac };
-                
+
                 let mut buf = BytesMut::new();
                 tai.encode(&mut buf);
-                
+
                 let mut bytes = buf.freeze();
                 let decoded = Tai::decode(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(decoded.tac, tai.tac);
             }
 
@@ -406,13 +410,13 @@ mod tests {
                 } else {
                     SNssai::new(sst)
                 };
-                
+
                 let mut buf = BytesMut::new();
                 s_nssai.encode(&mut buf);
-                
+
                 let mut bytes = buf.freeze();
                 let decoded = SNssai::decode(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(decoded.sst, s_nssai.sst);
                 prop_assert_eq!(decoded.sd, s_nssai.sd);
             }
@@ -425,10 +429,10 @@ mod tests {
                 value in 0u8..8,
             ) {
                 let ksi = KeySetIdentifier::new(tsc, value);
-                
+
                 let encoded = ksi.encode();
                 let decoded = KeySetIdentifier::decode(encoded);
-                
+
                 prop_assert_eq!(decoded.tsc, ksi.tsc);
                 prop_assert_eq!(decoded.value, ksi.value);
             }
@@ -440,13 +444,13 @@ mod tests {
                 value in any::<u8>(),
             ) {
                 let timer = GprsTimer2::new(value);
-                
+
                 let mut buf = BytesMut::new();
                 timer.encode(&mut buf);
-                
+
                 let mut bytes = buf.freeze();
                 let decoded = GprsTimer2::decode(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(decoded.length, timer.length);
                 prop_assert_eq!(decoded.value, timer.value);
             }
@@ -459,13 +463,13 @@ mod tests {
                 value in 0u8..32,
             ) {
                 let timer = GprsTimer3::new(unit, value);
-                
+
                 let mut buf = BytesMut::new();
                 timer.encode(&mut buf);
-                
+
                 let mut bytes = buf.freeze();
                 let decoded = GprsTimer3::decode(&mut bytes).unwrap();
-                
+
                 prop_assert_eq!(decoded.unit, timer.unit);
                 prop_assert_eq!(decoded.value, timer.value);
             }
@@ -478,10 +482,10 @@ mod tests {
                 integrity in 0u8..8,
             ) {
                 let algs = SecurityAlgorithms { ciphering, integrity };
-                
+
                 let encoded = algs.encode();
                 let decoded = SecurityAlgorithms::decode(encoded);
-                
+
                 prop_assert_eq!(decoded.ciphering, algs.ciphering);
                 prop_assert_eq!(decoded.integrity, algs.integrity);
             }

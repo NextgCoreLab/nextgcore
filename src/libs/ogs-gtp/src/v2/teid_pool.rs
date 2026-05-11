@@ -2,9 +2,9 @@
 //!
 //! Manages allocation and release of Tunnel Endpoint Identifiers (TEIDs).
 
+use crate::error::{GtpError, GtpResult};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
-use crate::error::{GtpError, GtpResult};
 
 /// TEID Pool for allocating unique TEIDs
 #[derive(Debug, Clone)]

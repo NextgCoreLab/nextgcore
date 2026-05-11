@@ -12,7 +12,7 @@
 use bytes::Bytes;
 use sctp_proto::{
     Association, AssociationHandle, DatagramEvent, Endpoint, EndpointConfig, Event, Payload,
-    PayloadProtocolIdentifier, ServerConfig, TransportConfig, Transmit,
+    PayloadProtocolIdentifier, ServerConfig, Transmit, TransportConfig,
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -77,10 +77,7 @@ pub enum ServerEvent {
         remote_addr: SocketAddr,
     },
     /// Association closed
-    AssociationClosed {
-        association_id: u64,
-        reason: String,
-    },
+    AssociationClosed { association_id: u64, reason: String },
     /// Data received from an association
     DataReceived {
         association_id: u64,
@@ -133,7 +130,10 @@ impl SctpServer {
         let socket = UdpSocket::bind(addr).await?;
         let local_addr = socket.local_addr()?;
 
-        info!("SCTP server listening on {} (sctp-proto over UDP)", local_addr);
+        info!(
+            "SCTP server listening on {} (sctp-proto over UDP)",
+            local_addr
+        );
 
         // Create endpoint config
         let endpoint_config = EndpointConfig::new();
@@ -238,7 +238,8 @@ impl SctpServer {
         if let Some((handle, event)) = self.endpoint.handle(now, from, None, None, data) {
             match event {
                 DatagramEvent::NewAssociation(association) => {
-                    self.handle_new_association(handle, association, from).await?;
+                    self.handle_new_association(handle, association, from)
+                        .await?;
                 }
                 DatagramEvent::AssociationEvent(assoc_event) => {
                     self.handle_association_event(handle, assoc_event).await?;
@@ -823,9 +824,7 @@ mod tests {
 
     #[test]
     fn test_server_error_display() {
-        let io_err = ServerError::Io(std::io::Error::other(
-            "test error",
-        ));
+        let io_err = ServerError::Io(std::io::Error::other("test error"));
         assert!(io_err.to_string().contains("I/O error"));
 
         let not_running = ServerError::NotRunning;
@@ -856,7 +855,10 @@ mod tests {
             reason: "test".to_string(),
         };
         match closed {
-            ServerEvent::AssociationClosed { association_id, reason } => {
+            ServerEvent::AssociationClosed {
+                association_id,
+                reason,
+            } => {
                 assert_eq!(association_id, 2);
                 assert_eq!(reason, "test");
             }
@@ -872,7 +874,10 @@ mod tests {
             },
         };
         match data {
-            ServerEvent::DataReceived { association_id, message } => {
+            ServerEvent::DataReceived {
+                association_id,
+                message,
+            } => {
                 assert_eq!(association_id, 3);
                 assert_eq!(message.stream_id, 0);
                 assert_eq!(message.ppid, 60);

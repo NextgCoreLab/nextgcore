@@ -67,11 +67,13 @@ impl SecurityHeaderType {
                 new_security_context: true,
                 ..Default::default()
             },
-            security_header::INTEGRITY_PROTECTED_AND_CIPHERED_WITH_NEW_5G_NAS_SECURITY_CONTEXT => Self {
-                integrity_protected: true,
-                new_security_context: true,
-                ciphered: true,
-            },
+            security_header::INTEGRITY_PROTECTED_AND_CIPHERED_WITH_NEW_5G_NAS_SECURITY_CONTEXT => {
+                Self {
+                    integrity_protected: true,
+                    new_security_context: true,
+                    ciphered: true,
+                }
+            }
             _ => Self::default(),
         }
     }
@@ -247,8 +249,7 @@ pub fn nas_5gs_security_decode(
     }
 
     // Parse security header
-    let header = NasSecurityHeader::decode(message)
-        .ok_or(NasSecurityError::InvalidHeader)?;
+    let header = NasSecurityHeader::decode(message).ok_or(NasSecurityError::InvalidHeader)?;
 
     // Update UL count based on sequence number
     let sqn = header.sequence_number;
@@ -281,7 +282,8 @@ pub fn nas_5gs_security_decode(
         if calculated_mac != header.message_authentication_code {
             log::warn!(
                 "NAS MAC verification failed: expected {:02x?}, got {:02x?}",
-                calculated_mac, header.message_authentication_code
+                calculated_mac,
+                header.message_authentication_code
             );
             amf_ue.mac_failed = true;
         }
@@ -333,7 +335,11 @@ pub fn nas_encrypt(
     }
 
     // Bearer is derived from access type (1 for 3GPP, 2 for non-3GPP)
-    let bearer = if access_type == 0 { NAS_BEARER } else { access_type };
+    let bearer = if access_type == 0 {
+        NAS_BEARER
+    } else {
+        access_type
+    };
 
     match algorithm {
         0 => {
@@ -406,7 +412,11 @@ pub fn nas_mac_calculate(
     message: &[u8],
 ) -> [u8; 4] {
     // Bearer is derived from access type (1 for 3GPP, 2 for non-3GPP)
-    let bearer = if access_type == 0 { NAS_BEARER } else { access_type };
+    let bearer = if access_type == 0 {
+        NAS_BEARER
+    } else {
+        access_type
+    };
 
     match algorithm {
         0 => {
@@ -476,7 +486,7 @@ pub struct SecurityAlgorithmSet {
     /// Encryption algorithms (NEA0, NEA1, NEA2, NEA3)
     pub encryption: u8, // bit mask
     /// Integrity algorithms (NIA0, NIA1, NIA2, NIA3)
-    pub integrity: u8,  // bit mask
+    pub integrity: u8, // bit mask
 }
 
 /// PQC algorithm identifiers (Rel-20 research, using spare 5G-EA4/5G-IA4 slots)
@@ -501,10 +511,7 @@ pub struct PqcConfig {
 /// Returns algorithm ID (0=NEA0, 1=NEA1, 2=NEA2, 3=NEA3, 4=NEA4-PQC)
 /// Selection priority (PQC enabled): NEA4 > NEA2 > NEA1 > NEA3 > NEA0
 /// Selection priority (PQC disabled): NEA2 > NEA1 > NEA3 > NEA0
-pub fn select_encryption_algorithm(
-    ue_algos: u8,
-    amf_supported: u8,
-) -> u8 {
+pub fn select_encryption_algorithm(ue_algos: u8, amf_supported: u8) -> u8 {
     select_encryption_algorithm_with_pqc(ue_algos, amf_supported, &PqcConfig::default())
 }
 
@@ -540,19 +547,12 @@ pub fn select_encryption_algorithm_with_pqc(
 /// Returns algorithm ID (0=NIA0, 1=NIA1, 2=NIA2, 3=NIA3, 4=NIA4-PQC)
 /// Selection priority (PQC enabled): NIA4 > NIA2 > NIA1 > NIA3 > NIA0
 /// Selection priority (PQC disabled): NIA2 > NIA1 > NIA3 > NIA0
-pub fn select_integrity_algorithm(
-    ue_algos: u8,
-    amf_supported: u8,
-) -> u8 {
+pub fn select_integrity_algorithm(ue_algos: u8, amf_supported: u8) -> u8 {
     select_integrity_algorithm_with_pqc(ue_algos, amf_supported, &PqcConfig::default())
 }
 
 /// Select best integrity algorithm with PQC support
-pub fn select_integrity_algorithm_with_pqc(
-    ue_algos: u8,
-    amf_supported: u8,
-    pqc: &PqcConfig,
-) -> u8 {
+pub fn select_integrity_algorithm_with_pqc(ue_algos: u8, amf_supported: u8, pqc: &PqcConfig) -> u8 {
     let supported = ue_algos & amf_supported;
 
     // If PQC enabled + preferred, try NIA4 first
@@ -582,8 +582,7 @@ pub fn select_integrity_algorithm_with_pqc(
 /// Per 3GPP TS 33.501 §6.7.2, null integrity (NIA0) SHALL NOT be used
 /// for NAS signaling in production. Null ciphering (NEA0) MAY be used
 /// in limited contexts but is strongly discouraged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NasCipheringPolicy {
     /// Allow null algorithms (development/testing only)
     AllowNull,
@@ -593,7 +592,6 @@ pub enum NasCipheringPolicy {
     /// Reject all null algorithms (recommended for production)
     RejectAllNull,
 }
-
 
 /// Validate selected algorithms against the ciphering policy
 ///
@@ -648,17 +646,13 @@ pub fn select_security_algorithms_with_policy(
     policy: NasCipheringPolicy,
 ) {
     // Select encryption algorithm
-    let selected_enc = select_encryption_algorithm(
-        ue_security_capability.encryption,
-        amf_supported.encryption,
-    );
+    let selected_enc =
+        select_encryption_algorithm(ue_security_capability.encryption, amf_supported.encryption);
     amf_ue.selected_enc_algorithm = selected_enc;
 
     // Select integrity algorithm
-    let selected_int = select_integrity_algorithm(
-        ue_security_capability.integrity,
-        amf_supported.integrity,
-    );
+    let selected_int =
+        select_integrity_algorithm(ue_security_capability.integrity, amf_supported.integrity);
     amf_ue.selected_int_algorithm = selected_int;
 
     // Enforce ciphering policy
@@ -696,9 +690,17 @@ pub fn select_security_algorithms_with_policy(
     log::info!(
         "[{}] Selected security algorithms: enc={}EA{}, int={}IA{}",
         amf_ue.supi.as_deref().unwrap_or("unknown"),
-        if amf_ue.selected_enc_algorithm == 0 { "N" } else { "1" },
+        if amf_ue.selected_enc_algorithm == 0 {
+            "N"
+        } else {
+            "1"
+        },
         amf_ue.selected_enc_algorithm,
-        if amf_ue.selected_int_algorithm == 0 { "N" } else { "1" },
+        if amf_ue.selected_int_algorithm == 0 {
+            "N"
+        } else {
+            "1"
+        },
         amf_ue.selected_int_algorithm
     );
 }
@@ -766,7 +768,8 @@ mod tests {
 
     #[test]
     fn test_security_header_type_integrity_and_ciphered() {
-        let header_type = SecurityHeaderType::from_byte(security_header::INTEGRITY_PROTECTED_AND_CIPHERED);
+        let header_type =
+            SecurityHeaderType::from_byte(security_header::INTEGRITY_PROTECTED_AND_CIPHERED);
         assert!(header_type.integrity_protected);
         assert!(header_type.ciphered);
         assert!(!header_type.new_security_context);
@@ -775,7 +778,7 @@ mod tests {
     #[test]
     fn test_security_header_type_new_context() {
         let header_type = SecurityHeaderType::from_byte(
-            security_header::INTEGRITY_PROTECTED_WITH_NEW_5G_NAS_SECURITY_CONTEXT
+            security_header::INTEGRITY_PROTECTED_WITH_NEW_5G_NAS_SECURITY_CONTEXT,
         );
         assert!(header_type.integrity_protected);
         assert!(!header_type.ciphered);
@@ -801,7 +804,10 @@ mod tests {
         let decoded = NasSecurityHeader::decode(&encoded).unwrap();
         assert_eq!(decoded.extended_protocol_discriminator, 0x7e);
         assert_eq!(decoded.security_header_type, 0x02);
-        assert_eq!(decoded.message_authentication_code, [0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(
+            decoded.message_authentication_code,
+            [0x11, 0x22, 0x33, 0x44]
+        );
         assert_eq!(decoded.sequence_number, 0x05);
     }
 
@@ -816,11 +822,7 @@ mod tests {
         let mut ue = create_test_ue();
         let message = vec![0x7e, 0x00, 0x41]; // Plain registration request
 
-        let result = nas_5gs_security_encode(
-            &mut ue,
-            &message,
-            security_header::PLAIN_NAS_MESSAGE,
-        );
+        let result = nas_5gs_security_encode(&mut ue, &message, security_header::PLAIN_NAS_MESSAGE);
 
         assert!(result.is_some());
         let encoded = result.unwrap();
@@ -832,11 +834,8 @@ mod tests {
         let mut ue = create_test_ue();
         let message = vec![0x7e, 0x00, 0x41];
 
-        let result = nas_5gs_security_encode(
-            &mut ue,
-            &message,
-            security_header::INTEGRITY_PROTECTED,
-        );
+        let result =
+            nas_5gs_security_encode(&mut ue, &message, security_header::INTEGRITY_PROTECTED);
 
         assert!(result.is_some());
         let encoded = result.unwrap();
@@ -869,11 +868,8 @@ mod tests {
         ue.security_context_available = false;
         let message = vec![0x7e, 0x02, 0x11, 0x22, 0x33, 0x44, 0x00, 0xaa, 0xbb];
 
-        let result = nas_5gs_security_decode(
-            &mut ue,
-            security_header::INTEGRITY_PROTECTED,
-            &message,
-        );
+        let result =
+            nas_5gs_security_decode(&mut ue, security_header::INTEGRITY_PROTECTED, &message);
 
         assert!(result.is_ok());
         // Without security context, message returned as-is
@@ -885,11 +881,8 @@ mod tests {
         let mut ue = create_test_ue();
         let message = vec![0x7e, 0x02, 0x11]; // Too short
 
-        let result = nas_5gs_security_decode(
-            &mut ue,
-            security_header::INTEGRITY_PROTECTED,
-            &message,
-        );
+        let result =
+            nas_5gs_security_decode(&mut ue, security_header::INTEGRITY_PROTECTED, &message);
 
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), NasSecurityError::MessageTooShort);
@@ -954,7 +947,8 @@ mod tests {
             &mut sender_ue,
             &original_message,
             security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Receiver decodes (uses ul_count, but we need to match the sender's dl_count)
         // In real scenario, the receiver's ul_count tracks the sender's dl_count
@@ -969,7 +963,10 @@ mod tests {
         // Verify the encoded message has the correct structure
         assert!(encoded.len() > 7); // Security header + payload
         assert_eq!(encoded[0], 0x7e); // EPD
-        assert_eq!(encoded[1], security_header::INTEGRITY_PROTECTED_AND_CIPHERED);
+        assert_eq!(
+            encoded[1],
+            security_header::INTEGRITY_PROTECTED_AND_CIPHERED
+        );
 
         // Verify the sequence number is 0 (first message)
         assert_eq!(encoded[6], 0x00);
@@ -1030,12 +1027,12 @@ mod tests {
     fn test_select_security_algorithms() {
         let mut ue = create_test_ue();
         let ue_capability = SecurityAlgorithmSet {
-            encryption: 0b1110,  // NEA1, NEA2, NEA3
-            integrity: 0b1110,   // NIA1, NIA2, NIA3
+            encryption: 0b1110, // NEA1, NEA2, NEA3
+            integrity: 0b1110,  // NIA1, NIA2, NIA3
         };
         let amf_capability = SecurityAlgorithmSet {
-            encryption: 0b1111,  // All
-            integrity: 0b1111,   // All
+            encryption: 0b1111, // All
+            integrity: 0b1111,  // All
         };
 
         select_security_algorithms(&mut ue, &ue_capability, &amf_capability);
@@ -1139,6 +1136,9 @@ mod tests {
 
     #[test]
     fn test_default_policy_is_reject_null_integrity() {
-        assert_eq!(NasCipheringPolicy::default(), NasCipheringPolicy::RejectNullIntegrity);
+        assert_eq!(
+            NasCipheringPolicy::default(),
+            NasCipheringPolicy::RejectNullIntegrity
+        );
     }
 }

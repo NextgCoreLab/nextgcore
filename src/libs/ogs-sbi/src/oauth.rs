@@ -154,12 +154,7 @@ impl TokenCache {
     }
 
     /// Store a token in the cache.
-    pub async fn put(
-        &self,
-        target_nf_type: NfType,
-        scope: &str,
-        response: AccessTokenResponse,
-    ) {
+    pub async fn put(&self, target_nf_type: NfType, scope: &str, response: AccessTokenResponse) {
         let key = (target_nf_type.to_str().to_string(), scope.to_string());
         let cached = CachedToken {
             response,
@@ -290,11 +285,7 @@ impl OAuth2Client {
     ///
     /// Returns a cached token if available and not expired, otherwise
     /// requests a new one from the NRF.
-    pub async fn get_token(
-        &self,
-        target_nf_type: NfType,
-        scope: &str,
-    ) -> SbiResult<String> {
+    pub async fn get_token(&self, target_nf_type: NfType, scope: &str) -> SbiResult<String> {
         // Check cache first
         if let Some(cached) = self.cache.get(target_nf_type, scope).await {
             return Ok(cached.access_token);
@@ -316,12 +307,8 @@ impl OAuth2Client {
         target_nf_type: NfType,
         scope: &str,
     ) -> SbiResult<AccessTokenResponse> {
-        let request = AccessTokenRequest::new(
-            &self.nf_instance_id,
-            self.nf_type,
-            target_nf_type,
-            scope,
-        );
+        let request =
+            AccessTokenRequest::new(&self.nf_instance_id, self.nf_type, target_nf_type, scope);
 
         let body = request.to_form_body();
         let uri = format!("{}/nnrf-oauth2/v1/access-token", self.nrf_uri);
@@ -338,12 +325,10 @@ impl OAuth2Client {
         .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
 
         let io = hyper_util::rt::TokioIo::new(stream);
-        let (mut sender, conn) = hyper::client::conn::http2::handshake(
-            hyper_util::rt::TokioExecutor::new(),
-            io,
-        )
-        .await
-        .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
+        let (mut sender, conn) =
+            hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
+                .await
+                .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
 
         tokio::spawn(async move {
             if let Err(e) = conn.await {
@@ -358,13 +343,11 @@ impl OAuth2Client {
             .body(http_body_util::Full::new(bytes::Bytes::from(body)))
             .map_err(|e| SbiError::ClientError(e.to_string()))?;
 
-        let response = tokio::time::timeout(
-            Duration::from_secs(10),
-            sender.send_request(http_request),
-        )
-        .await
-        .map_err(|_| SbiError::Timeout)?
-        .map_err(|e| SbiError::HyperError(e.to_string()))?;
+        let response =
+            tokio::time::timeout(Duration::from_secs(10), sender.send_request(http_request))
+                .await
+                .map_err(|_| SbiError::Timeout)?
+                .map_err(|e| SbiError::HyperError(e.to_string()))?;
 
         let status = response.status().as_u16();
         let body_bytes = http_body_util::BodyExt::collect(response.into_body())
@@ -550,7 +533,9 @@ mod tests {
             expires_in: Some(3600),
             scope: Some("nsmf-pdusession".to_string()),
         };
-        cache.put(NfType::Smf, "nsmf-pdusession", response.clone()).await;
+        cache
+            .put(NfType::Smf, "nsmf-pdusession", response.clone())
+            .await;
 
         // Should be retrievable
         let cached = cache.get(NfType::Smf, "nsmf-pdusession").await;
@@ -633,11 +618,7 @@ mod tests {
 
     #[test]
     fn test_oauth2_client_creation() {
-        let client = OAuth2Client::new(
-            "http://127.0.0.10:7777",
-            "amf-instance-001",
-            NfType::Amf,
-        );
+        let client = OAuth2Client::new("http://127.0.0.10:7777", "amf-instance-001", NfType::Amf);
         assert_eq!(client.nrf_uri(), "http://127.0.0.10:7777");
     }
 }

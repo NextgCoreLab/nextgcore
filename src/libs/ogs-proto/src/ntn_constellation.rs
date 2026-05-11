@@ -149,12 +149,16 @@ pub fn coverage_radius_km(altitude_km: f64, min_elevation_deg: f64) -> f64 {
 
     // Nadir angle at satellite
     let sin_nadir = r_e * elev_rad.cos() / (r_e + h);
-    if sin_nadir.abs() > 1.0 { return 0.0; }
+    if sin_nadir.abs() > 1.0 {
+        return 0.0;
+    }
     let nadir_angle = sin_nadir.asin();
 
     // Earth central angle of coverage
     let lambda = PI / 2.0 - elev_rad - nadir_angle;
-    if lambda <= 0.0 { return 0.0; }
+    if lambda <= 0.0 {
+        return 0.0;
+    }
 
     // Ground distance = R_e * lambda
     r_e * lambda
@@ -163,7 +167,9 @@ pub fn coverage_radius_km(altitude_km: f64, min_elevation_deg: f64) -> f64 {
 /// Computes the number of satellites needed for continuous global coverage
 pub fn min_satellites_for_coverage(altitude_km: f64, min_elevation_deg: f64) -> u32 {
     let radius = coverage_radius_km(altitude_km, min_elevation_deg);
-    if radius <= 0.0 { return u32::MAX; }
+    if radius <= 0.0 {
+        return u32::MAX;
+    }
 
     // Earth surface area / single satellite coverage area
     let earth_area = 4.0 * PI * EARTH_RADIUS_KM.powi(2);
@@ -179,7 +185,8 @@ pub fn is_latitude_covered(constellation: &ConstellationDesign, latitude_deg: f6
     let lat = latitude_deg.abs();
     let max_lat = constellation.inclination_deg
         + coverage_radius_km(constellation.altitude_km, constellation.min_elevation_deg)
-            / EARTH_RADIUS_KM * (180.0 / PI);
+            / EARTH_RADIUS_KM
+            * (180.0 / PI);
     lat <= max_lat
 }
 
@@ -276,7 +283,9 @@ pub struct VisibilityWindow {
 /// Estimates the average visibility duration for a LEO satellite pass
 pub fn avg_visibility_duration_s(altitude_km: f64, min_elevation_deg: f64) -> f64 {
     let radius = coverage_radius_km(altitude_km, min_elevation_deg);
-    if radius <= 0.0 { return 0.0; }
+    if radius <= 0.0 {
+        return 0.0;
+    }
 
     let r = EARTH_RADIUS_KM + altitude_km;
     let orbital_velocity = (398600.4418 / r).sqrt(); // km/s
@@ -289,7 +298,9 @@ pub fn avg_visibility_duration_s(altitude_km: f64, min_elevation_deg: f64) -> f6
 /// Estimates handover frequency (handovers per hour)
 pub fn handover_frequency_per_hour(altitude_km: f64, min_elevation_deg: f64) -> f64 {
     let duration = avg_visibility_duration_s(altitude_km, min_elevation_deg);
-    if duration <= 0.0 { return 0.0; }
+    if duration <= 0.0 {
+        return 0.0;
+    }
     3600.0 / duration
 }
 
@@ -340,17 +351,15 @@ mod tests {
     #[test]
     fn test_latitude_coverage() {
         let c = ConstellationDesign::starlink_like();
-        assert!(is_latitude_covered(&c, 0.0));   // Equator
-        assert!(is_latitude_covered(&c, 45.0));  // Mid-latitude
-        // With 53° inclination, coverage extends beyond 53° with footprint
+        assert!(is_latitude_covered(&c, 0.0)); // Equator
+        assert!(is_latitude_covered(&c, 45.0)); // Mid-latitude
+                                                // With 53° inclination, coverage extends beyond 53° with footprint
         assert!(is_latitude_covered(&c, 53.0));
     }
 
     #[test]
     fn test_isl_topology() {
-        let c = ConstellationDesign::walker(
-            "test", WalkerPattern::Delta, 20, 4, 550.0, 53.0,
-        );
+        let c = ConstellationDesign::walker("test", WalkerPattern::Delta, 20, 4, 550.0, 53.0);
         let links = generate_isl_topology(&c);
 
         // Each satellite has 1 intra-plane + 1 inter-plane link
@@ -367,15 +376,20 @@ mod tests {
     #[test]
     fn test_isl_intra_plane_distance() {
         // Use a denser constellation (22 sats/plane like Starlink) for reasonable ISL distance
-        let c = ConstellationDesign::walker(
-            "test", WalkerPattern::Delta, 88, 4, 550.0, 53.0,
-        );
+        let c = ConstellationDesign::walker("test", WalkerPattern::Delta, 88, 4, 550.0, 53.0);
         let links = generate_isl_topology(&c);
-        let intra: Vec<_> = links.iter().filter(|l| l.isl_type == IslType::IntraPlane).collect();
+        let intra: Vec<_> = links
+            .iter()
+            .filter(|l| l.isl_type == IslType::IntraPlane)
+            .collect();
 
         // With 22 sats/plane: 360/22 ≈ 16.4° spacing, distance ≈ 1980 km
         for link in &intra {
-            assert!(link.distance_km < 5000.0, "Intra-plane distance = {}km", link.distance_km);
+            assert!(
+                link.distance_km < 5000.0,
+                "Intra-plane distance = {}km",
+                link.distance_km
+            );
         }
     }
 
@@ -383,7 +397,10 @@ mod tests {
     fn test_visibility_duration_leo() {
         let duration = avg_visibility_duration_s(550.0, 25.0);
         // LEO visibility: typically 3-10 minutes
-        assert!(duration > 100.0 && duration < 800.0, "Duration = {duration}s");
+        assert!(
+            duration > 100.0 && duration < 800.0,
+            "Duration = {duration}s"
+        );
     }
 
     #[test]
@@ -400,7 +417,10 @@ mod tests {
 
         // MEO at 8062 km: period ≈ 17256s (4.79 hours)
         let period = c.orbital_period_s();
-        assert!(period > 15000.0 && period < 20000.0, "MEO period = {period}s");
+        assert!(
+            period > 15000.0 && period < 20000.0,
+            "MEO period = {period}s"
+        );
     }
 
     #[test]

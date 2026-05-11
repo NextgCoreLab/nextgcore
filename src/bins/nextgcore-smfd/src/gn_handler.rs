@@ -17,10 +17,10 @@
 //!
 //! Reference: 3GPP TS 29.060 (GTPv1-C), 3GPP TS 23.401 Annex E
 
+use bytes::Bytes;
+use log::{debug, error, info, warn};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use log::{debug, error, info, warn};
-use bytes::Bytes;
 
 use crate::context::SmfContext;
 use crate::gn_build::{cause, ie_type, msg_type};
@@ -182,10 +182,7 @@ pub enum GnError {
 /// Handle Echo Request
 ///
 /// Responds to GTPv1 path management echo requests.
-pub fn handle_echo_request(
-    _smf_ctx: &Arc<SmfContext>,
-    recovery: u8,
-) -> Vec<u8> {
+pub fn handle_echo_request(_smf_ctx: &Arc<SmfContext>, recovery: u8) -> Vec<u8> {
     debug!("[GTPv1] Echo Request received, recovery={recovery}");
     crate::gn_build::build_echo_response(recovery)
 }
@@ -193,10 +190,7 @@ pub fn handle_echo_request(
 /// Handle Echo Response
 ///
 /// Processes GTPv1 echo responses for path management.
-pub fn handle_echo_response(
-    _smf_ctx: &Arc<SmfContext>,
-    recovery: u8,
-) {
+pub fn handle_echo_response(_smf_ctx: &Arc<SmfContext>, recovery: u8) {
     debug!("[GTPv1] Echo Response received, recovery={recovery}");
     // In a complete implementation, this would update path state
 }
@@ -259,16 +253,23 @@ pub fn handle_create_pdp_context_request(
         info!("[GTPv1] NSAPI: {nsapi}");
     }
     if let Some(ref qos) = req.qos_profile {
-        info!("[GTPv1] QoS: traffic_class={}, arp={}", qos.traffic_class, qos.arp);
+        info!(
+            "[GTPv1] QoS: traffic_class={}, arp={}",
+            qos.traffic_class, qos.arp
+        );
     }
 
     // Allocate TEID pair and UE IP from the SMF context pools.
     use std::sync::atomic::Ordering as AtomicOrdering;
-    let teid_u = smf_ctx.gn_teid_counter.fetch_add(2, AtomicOrdering::Relaxed);
+    let teid_u = smf_ctx
+        .gn_teid_counter
+        .fetch_add(2, AtomicOrdering::Relaxed);
     let teid_c = teid_u.wrapping_add(1);
     let charging_id = teid_u; // reuse counter value as charging ID
 
-    let allocated_ipv4 = smf_ctx.ipv4_pool.allocate()
+    let allocated_ipv4 = smf_ctx
+        .ipv4_pool
+        .allocate()
         .unwrap_or_else(|| Ipv4Addr::new(10, 45, 0, 100));
     let ggsn_addr = smf_ctx.gn_addr;
 
@@ -276,17 +277,20 @@ pub fn handle_create_pdp_context_request(
 
     let response = crate::gn_build::build_create_pdp_context_response(
         cause::REQUEST_ACCEPTED,
-        teid_u,  // GGSN TEID-U
-        teid_c,  // GGSN TEID-C
+        teid_u,                 // GGSN TEID-U
+        teid_c,                 // GGSN TEID-C
         req.nsapi.unwrap_or(5), // NSAPI
-        false, // reordering_required
-        Some(&ggsn_addr), // GGSN address for control
-        Some(&ggsn_addr), // GGSN address for user
-        &crate::gn_build::QosProfileDecoded::from_qci(9, req.qos_profile.as_ref().map(|q| q.arp).unwrap_or(1)),
-        charging_id, // Charging ID
-        None, // PCO
+        false,                  // reordering_required
+        Some(&ggsn_addr),       // GGSN address for control
+        Some(&ggsn_addr),       // GGSN address for user
+        &crate::gn_build::QosProfileDecoded::from_qci(
+            9,
+            req.qos_profile.as_ref().map(|q| q.arp).unwrap_or(1),
+        ),
+        charging_id,          // Charging ID
+        None,                 // PCO
         Some(allocated_ipv4), // Allocated IPv4
-        None, // IPv6
+        None,                 // IPv6
     );
 
     Ok((cause::REQUEST_ACCEPTED, Bytes::from(response)))
@@ -312,7 +316,9 @@ pub fn handle_update_pdp_context_request(
     info!("[GTPv1] Updating NSAPI: {nsapi}");
 
     use std::sync::atomic::Ordering as AtomicOrdering;
-    let teid_u = smf_ctx.gn_teid_counter.fetch_add(2, AtomicOrdering::Relaxed);
+    let teid_u = smf_ctx
+        .gn_teid_counter
+        .fetch_add(2, AtomicOrdering::Relaxed);
     let teid_c = teid_u.wrapping_add(1);
     let ggsn_addr = smf_ctx.gn_addr;
     let qos = crate::gn_build::QosProfileDecoded::from_qci(9, 1);
@@ -345,7 +351,10 @@ pub fn handle_delete_pdp_context_request(
             return Ok((cause::MANDATORY_IE_MISSING, Bytes::new()));
         }
     };
-    info!("[GTPv1] Deleting NSAPI: {}, teardown={}", nsapi, req.teardown_ind);
+    info!(
+        "[GTPv1] Deleting NSAPI: {}, teardown={}",
+        nsapi, req.teardown_ind
+    );
 
     // In a full implementation, would:
     // 1. Find the session by NSAPI
@@ -353,9 +362,7 @@ pub fn handle_delete_pdp_context_request(
     // 3. Release IP address
     // 4. Clean up state
 
-    let response = crate::gn_build::build_delete_pdp_context_response(
-        cause::REQUEST_ACCEPTED,
-    );
+    let response = crate::gn_build::build_delete_pdp_context_response(cause::REQUEST_ACCEPTED);
 
     Ok((cause::REQUEST_ACCEPTED, Bytes::from(response)))
 }

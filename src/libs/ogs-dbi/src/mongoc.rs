@@ -40,8 +40,7 @@ pub enum DbiError {
 pub type DbiResult<T> = Result<T, DbiError>;
 
 /// MongoDB connection state
-#[derive(Debug)]
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct OgsMongoc {
     pub initialized: bool,
     pub name: String,
@@ -50,15 +49,12 @@ pub struct OgsMongoc {
     pub masked_db_uri: Option<String>,
 }
 
-
 /// Database interface with subscriber collection
-#[derive(Debug)]
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct OgsDbi {
     pub mongoc: OgsMongoc,
     pub subscriber_collection: Option<Collection<Document>>,
 }
-
 
 /// Global singleton for database interface
 static OGS_DBI: OnceLock<Arc<Mutex<OgsDbi>>> = OnceLock::new();
@@ -159,7 +155,11 @@ pub fn ogs_mongoc_final() {
 pub async fn ogs_dbi_init_async(db_uri: String) -> DbiResult<()> {
     tokio::task::spawn_blocking(move || ogs_dbi_init(&db_uri))
         .await
-        .unwrap_or_else(|e| Err(DbiError::ParseError(format!("spawn_blocking panicked: {e}"))))
+        .unwrap_or_else(|e| {
+            Err(DbiError::ParseError(format!(
+                "spawn_blocking panicked: {e}"
+            )))
+        })
 }
 
 /// Initialize database interface with subscriber collection
@@ -276,7 +276,6 @@ mod tests {
 // B4.6: Distributed Database Support (6G Feature)
 //
 
-
 /// Database replication modes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplicationMode {
@@ -390,7 +389,8 @@ impl DistributedDbCoordinator {
 
     /// Remove a database node
     pub fn remove_node(&mut self, host: &str, port: u16) {
-        self.nodes.retain(|node| !(node.host == host && node.port == port));
+        self.nodes
+            .retain(|node| !(node.host == host && node.port == port));
     }
 
     /// Get all nodes
@@ -416,10 +416,7 @@ impl DistributedDbCoordinator {
 
     /// Get healthy nodes
     pub fn healthy_nodes(&self) -> Vec<&DbNode> {
-        self.nodes
-            .iter()
-            .filter(|node| node.healthy)
-            .collect()
+        self.nodes.iter().filter(|node| node.healthy).collect()
     }
 
     /// Set read preference
@@ -450,12 +447,14 @@ impl DistributedDbCoordinator {
     /// Select nodes for read operation based on preference
     pub fn select_read_nodes(&self) -> Vec<&DbNode> {
         match self.read_preference {
-            ReadPreference::Primary => self.primary_nodes()
+            ReadPreference::Primary => self
+                .primary_nodes()
                 .into_iter()
                 .filter(|n| n.healthy)
                 .collect(),
             ReadPreference::PrimaryPreferred => {
-                let primary = self.primary_nodes()
+                let primary = self
+                    .primary_nodes()
                     .into_iter()
                     .filter(|n| n.healthy)
                     .collect::<Vec<_>>();
@@ -468,12 +467,14 @@ impl DistributedDbCoordinator {
                         .collect()
                 }
             }
-            ReadPreference::Secondary => self.secondary_nodes()
+            ReadPreference::Secondary => self
+                .secondary_nodes()
                 .into_iter()
                 .filter(|n| n.healthy)
                 .collect(),
             ReadPreference::SecondaryPreferred => {
-                let secondary = self.secondary_nodes()
+                let secondary = self
+                    .secondary_nodes()
                     .into_iter()
                     .filter(|n| n.healthy)
                     .collect::<Vec<_>>();
@@ -493,13 +494,12 @@ impl DistributedDbCoordinator {
     /// Select nodes for write operation based on write concern
     pub fn select_write_nodes(&self) -> Vec<&DbNode> {
         match self.write_concern {
-            WriteConcern::Unacknowledged | WriteConcern::Acknowledged => {
-                self.primary_nodes()
-                    .into_iter()
-                    .filter(|n| n.healthy)
-                    .take(1)
-                    .collect()
-            }
+            WriteConcern::Unacknowledged | WriteConcern::Acknowledged => self
+                .primary_nodes()
+                .into_iter()
+                .filter(|n| n.healthy)
+                .take(1)
+                .collect(),
             WriteConcern::Majority => {
                 let all_nodes = self.healthy_nodes();
                 let majority_count = (all_nodes.len() / 2) + 1;
@@ -536,14 +536,22 @@ impl DistributedDbCoordinator {
 
     /// Mark node as healthy/unhealthy
     pub fn set_node_health(&mut self, host: &str, port: u16, healthy: bool) {
-        if let Some(node) = self.nodes.iter_mut().find(|n| n.host == host && n.port == port) {
+        if let Some(node) = self
+            .nodes
+            .iter_mut()
+            .find(|n| n.host == host && n.port == port)
+        {
             node.healthy = healthy;
         }
     }
 
     /// Update replication lag for a node
     pub fn set_replication_lag(&mut self, host: &str, port: u16, lag_sec: f64) {
-        if let Some(node) = self.nodes.iter_mut().find(|n| n.host == host && n.port == port) {
+        if let Some(node) = self
+            .nodes
+            .iter_mut()
+            .find(|n| n.host == host && n.port == port)
+        {
             node.replication_lag_sec = Some(lag_sec);
         }
     }

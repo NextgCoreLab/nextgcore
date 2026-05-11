@@ -59,7 +59,9 @@ pub enum PcfTimerId {
 impl PcfTimerId {
     pub fn name(&self) -> &'static str {
         match self {
-            PcfTimerId::NfInstanceRegistrationInterval => "OGS_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL",
+            PcfTimerId::NfInstanceRegistrationInterval => {
+                "OGS_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
+            }
             PcfTimerId::NfInstanceHeartbeatInterval => "OGS_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL",
             PcfTimerId::NfInstanceNoHeartbeat => "OGS_TIMER_NF_INSTANCE_NO_HEARTBEAT",
             PcfTimerId::NfInstanceValidity => "OGS_TIMER_NF_INSTANCE_VALIDITY",

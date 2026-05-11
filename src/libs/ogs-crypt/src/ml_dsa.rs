@@ -12,9 +12,9 @@
 //! - FIPS 204: Module-Lattice-Based Digital Signature Standard
 //! - 3GPP TR 33.831: Study on Post-Quantum Cryptography
 
-use ml_dsa::{MlDsa44, MlDsa65, MlDsa87};
-use ml_dsa::{SigningKey, VerifyingKey, Signature, EncodedVerifyingKey, EncodedSignature};
 use ml_dsa::signature::{Signer, Verifier};
+use ml_dsa::{EncodedSignature, EncodedVerifyingKey, Signature, SigningKey, VerifyingKey};
+use ml_dsa::{MlDsa44, MlDsa65, MlDsa87};
 use thiserror::Error;
 
 /// ML-DSA error types
@@ -101,16 +101,13 @@ pub fn ml_dsa_keygen(level: MlDsaLevel) -> MlDsaResult<(Vec<u8>, Vec<u8>)> {
 ///
 /// # Returns
 /// * Signature bytes on success
-pub fn ml_dsa_sign(
-    level: MlDsaLevel,
-    secret_key: &[u8],
-    message: &[u8],
-) -> MlDsaResult<Vec<u8>> {
+pub fn ml_dsa_sign(level: MlDsaLevel, secret_key: &[u8], message: &[u8]) -> MlDsaResult<Vec<u8>> {
     // Secret key is stored as the 32-byte seed
     if secret_key.len() != 32 {
         return Err(MlDsaError::InvalidSecretKey);
     }
-    let seed_bytes: [u8; 32] = secret_key.try_into()
+    let seed_bytes: [u8; 32] = secret_key
+        .try_into()
         .map_err(|_| MlDsaError::InvalidSecretKey)?;
     let seed = ml_dsa::Seed::from(seed_bytes);
 
@@ -156,8 +153,7 @@ pub fn ml_dsa_verify(
             let vk = VerifyingKey::<MlDsa44>::decode(&vk_enc);
             let sig_enc = EncodedSignature::<MlDsa44>::try_from(signature)
                 .map_err(|_| MlDsaError::InvalidSignature)?;
-            let sig = Signature::<MlDsa44>::decode(&sig_enc)
-                .ok_or(MlDsaError::InvalidSignature)?;
+            let sig = Signature::<MlDsa44>::decode(&sig_enc).ok_or(MlDsaError::InvalidSignature)?;
             match vk.verify(message, &sig) {
                 Ok(()) => Ok(true),
                 Err(_) => Ok(false),
@@ -169,8 +165,7 @@ pub fn ml_dsa_verify(
             let vk = VerifyingKey::<MlDsa65>::decode(&vk_enc);
             let sig_enc = EncodedSignature::<MlDsa65>::try_from(signature)
                 .map_err(|_| MlDsaError::InvalidSignature)?;
-            let sig = Signature::<MlDsa65>::decode(&sig_enc)
-                .ok_or(MlDsaError::InvalidSignature)?;
+            let sig = Signature::<MlDsa65>::decode(&sig_enc).ok_or(MlDsaError::InvalidSignature)?;
             match vk.verify(message, &sig) {
                 Ok(()) => Ok(true),
                 Err(_) => Ok(false),
@@ -182,8 +177,7 @@ pub fn ml_dsa_verify(
             let vk = VerifyingKey::<MlDsa87>::decode(&vk_enc);
             let sig_enc = EncodedSignature::<MlDsa87>::try_from(signature)
                 .map_err(|_| MlDsaError::InvalidSignature)?;
-            let sig = Signature::<MlDsa87>::decode(&sig_enc)
-                .ok_or(MlDsaError::InvalidSignature)?;
+            let sig = Signature::<MlDsa87>::decode(&sig_enc).ok_or(MlDsaError::InvalidSignature)?;
             match vk.verify(message, &sig) {
                 Ok(()) => Ok(true),
                 Err(_) => Ok(false),
@@ -382,7 +376,15 @@ mod tests {
         let mut sig = vec![0u8; 4000];
         let mut sig_len = 0;
 
-        let ret = ml_dsa_sign_c(65, &sk, sk_len, message, message.len(), &mut sig, &mut sig_len);
+        let ret = ml_dsa_sign_c(
+            65,
+            &sk,
+            sk_len,
+            message,
+            message.len(),
+            &mut sig,
+            &mut sig_len,
+        );
         assert_eq!(ret, 1);
 
         let ret = ml_dsa_verify_c(65, &pk, pk_len, message, message.len(), &sig, sig_len);

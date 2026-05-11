@@ -40,12 +40,16 @@ pub fn build_ul_nas_transport(_msg: &UlNasTransport) -> S1apResult<Vec<u8>> {
 }
 
 /// Build an Initial Context Setup Request PDU
-pub fn build_initial_context_setup_request(_msg: &InitialContextSetupRequest) -> S1apResult<Vec<u8>> {
+pub fn build_initial_context_setup_request(
+    _msg: &InitialContextSetupRequest,
+) -> S1apResult<Vec<u8>> {
     Ok(vec![])
 }
 
 /// Build an Initial Context Setup Response PDU
-pub fn build_initial_context_setup_response(_msg: &InitialContextSetupResponse) -> S1apResult<Vec<u8>> {
+pub fn build_initial_context_setup_response(
+    _msg: &InitialContextSetupResponse,
+) -> S1apResult<Vec<u8>> {
     Ok(vec![])
 }
 

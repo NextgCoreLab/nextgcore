@@ -363,22 +363,14 @@ mod tests {
 
     #[test]
     fn test_session_establishment_response_no_sess() {
-        let result = handle_session_establishment_response(
-            None,
-            1,
-            pfcp_cause::REQUEST_ACCEPTED,
-            0x1234,
-        );
+        let result =
+            handle_session_establishment_response(None, 1, pfcp_cause::REQUEST_ACCEPTED, 0x1234);
         matches!(result, HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND));
     }
 
     #[test]
     fn test_session_deletion_response_no_sess() {
-        let result = handle_session_deletion_response(
-            None,
-            1,
-            pfcp_cause::REQUEST_ACCEPTED,
-        );
+        let result = handle_session_deletion_response(None, 1, pfcp_cause::REQUEST_ACCEPTED);
         matches!(result, HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND));
     }
 }

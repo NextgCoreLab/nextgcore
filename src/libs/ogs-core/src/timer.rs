@@ -68,7 +68,7 @@ impl<T> OgsTimer<T> {
 /// Timer entry in the tree (for ordering by timeout)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct TimerKey {
-    timeout: u128, // nanoseconds since epoch for ordering
+    timeout: u128,  // nanoseconds since epoch for ordering
     id: OgsTimerId, // tie-breaker for same timeout
 }
 
@@ -93,12 +93,12 @@ impl<T> OgsTimerMgr<T> {
     pub fn new(capacity: usize) -> Self {
         let mut timers = Vec::with_capacity(capacity);
         let mut free_indices = Vec::with_capacity(capacity);
-        
+
         for i in (0..capacity).rev() {
             timers.push(None);
             free_indices.push(i);
         }
-        
+
         OgsTimerMgr {
             timers,
             free_indices,
@@ -112,26 +112,26 @@ impl<T> OgsTimerMgr<T> {
     /// Add a new timer (identical to ogs_timer_add)
     pub fn add(&mut self, callback: OgsTimerCallback<T>, data: T) -> Option<OgsTimerId> {
         let index = self.free_indices.pop()?;
-        
+
         let id = self.next_id;
         self.next_id += 1;
-        
+
         let timer = OgsTimer::new(id, Some(callback), Some(data));
         self.timers[index] = Some(timer);
-        
+
         Some(id)
     }
 
     /// Add a timer without callback (for testing)
     pub fn add_simple(&mut self) -> Option<OgsTimerId> {
         let index = self.free_indices.pop()?;
-        
+
         let id = self.next_id;
         self.next_id += 1;
-        
+
         let timer: OgsTimer<T> = OgsTimer::new(id, None, None);
         self.timers[index] = Some(timer);
-        
+
         Some(id)
     }
 
@@ -140,7 +140,7 @@ impl<T> OgsTimerMgr<T> {
         if let Some(index) = self.find_index(id) {
             // Stop the timer first (removes from tree)
             self.stop(id);
-            
+
             // Return to free list
             self.timers[index] = None;
             self.free_indices.push(index);
@@ -152,8 +152,7 @@ impl<T> OgsTimerMgr<T> {
         if let Some(index) = self.find_index(id) {
             // Get timer info for tree operations
             let (old_timeout_nanos, timer_id) = {
-                let timer = self.timers[index].as_ref()
-                    .expect("timer exists");
+                let timer = self.timers[index].as_ref().expect("timer exists");
                 (timer.timeout_nanos, timer.id)
             };
 
@@ -170,11 +169,10 @@ impl<T> OgsTimerMgr<T> {
             let timeout_nanos = self.instant_to_nanos(Instant::now() + duration);
 
             // Update timer
-            let timer = self.timers[index].as_mut()
-                .expect("timer exists");
+            let timer = self.timers[index].as_mut().expect("timer exists");
             timer.timeout_nanos = Some(timeout_nanos);
             timer.running = true;
-            
+
             // Add to tree
             let key = TimerKey {
                 timeout: timeout_nanos,
@@ -189,8 +187,7 @@ impl<T> OgsTimerMgr<T> {
         if let Some(index) = self.find_index(id) {
             // Get timer info for tree operations
             let (timeout_nanos, timer_id, running) = {
-                let timer = self.timers[index].as_ref()
-                    .expect("timer exists");
+                let timer = self.timers[index].as_ref().expect("timer exists");
                 (timer.timeout_nanos, timer.id, timer.running)
             };
 
@@ -208,8 +205,7 @@ impl<T> OgsTimerMgr<T> {
             }
 
             // Update timer
-            let timer = self.timers[index].as_mut()
-                .expect("timer exists");
+            let timer = self.timers[index].as_mut().expect("timer exists");
             timer.running = false;
             timer.timeout_nanos = None;
         }
@@ -219,7 +215,7 @@ impl<T> OgsTimerMgr<T> {
     pub fn next(&self) -> Duration {
         if let Some((key, _)) = self.tree.first_key_value() {
             let now_nanos = self.instant_to_nanos(Instant::now());
-            
+
             if key.timeout > now_nanos {
                 Duration::from_nanos((key.timeout - now_nanos) as u64)
             } else {
@@ -235,13 +231,19 @@ impl<T> OgsTimerMgr<T> {
     pub fn expire(&mut self) -> Vec<OgsTimerId> {
         let now_nanos = self.instant_to_nanos(Instant::now());
         let mut expired = Vec::new();
-        
+
         // Collect expired timer keys
-        let expired_keys: Vec<TimerKey> = self.tree
-            .range(..=TimerKey { timeout: now_nanos, id: OgsTimerId::MAX })
+        let expired_keys: Vec<TimerKey> = self
+            .tree
+            .range(
+                ..=TimerKey {
+                    timeout: now_nanos,
+                    id: OgsTimerId::MAX,
+                },
+            )
             .map(|(k, _)| *k)
             .collect();
-        
+
         // Process expired timers
         for key in expired_keys {
             if let Some(index) = self.tree.remove(&key) {
@@ -252,28 +254,34 @@ impl<T> OgsTimerMgr<T> {
                 }
             }
         }
-        
+
         expired
     }
 
     /// Expire and call callbacks
     pub fn expire_with_callbacks(&mut self) {
         let now_nanos = self.instant_to_nanos(Instant::now());
-        
+
         // Collect expired timer indices and keys
-        let expired_data: Vec<(TimerKey, usize)> = self.tree
-            .range(..=TimerKey { timeout: now_nanos, id: OgsTimerId::MAX })
+        let expired_data: Vec<(TimerKey, usize)> = self
+            .tree
+            .range(
+                ..=TimerKey {
+                    timeout: now_nanos,
+                    id: OgsTimerId::MAX,
+                },
+            )
             .map(|(k, &idx)| (*k, idx))
             .collect();
-        
+
         // Remove from tree and call callbacks
         for (key, index) in expired_data {
             self.tree.remove(&key);
-            
+
             if let Some(timer) = self.timers[index].as_mut() {
                 timer.running = false;
                 timer.timeout_nanos = None;
-                
+
                 // Call callback
                 if let (Some(cb), Some(data)) = (timer.callback, timer.data.as_mut()) {
                     cb(data);
@@ -311,9 +319,9 @@ impl<T> OgsTimerMgr<T> {
 
     /// Find timer index by ID
     fn find_index(&self, id: OgsTimerId) -> Option<usize> {
-        self.timers.iter().position(|t| {
-            t.as_ref().map(|timer| timer.id == id).unwrap_or(false)
-        })
+        self.timers
+            .iter()
+            .position(|t| t.as_ref().map(|timer| timer.id == id).unwrap_or(false))
     }
 
     /// Convert Instant to nanoseconds for ordering
@@ -431,7 +439,8 @@ impl DistributedTimerCoordinator {
     /// Get synchronized timer expiration
     pub fn get_sync_expiry(&self, timer_id: OgsTimerId) -> Option<u128> {
         let records = self.sync_records.lock().unwrap();
-        records.iter()
+        records
+            .iter()
             .find(|r| r.timer_id == timer_id)
             .map(|r| r.sync_expiry_nanos)
     }
@@ -465,7 +474,10 @@ impl DistributedTimerCoordinator {
 
 impl Default for DistributedTimerCoordinator {
     fn default() -> Self {
-        Self::new(DistributedTimerMode::Local, uuid::Uuid::new_v4().to_string())
+        Self::new(
+            DistributedTimerMode::Local,
+            uuid::Uuid::new_v4().to_string(),
+        )
     }
 }
 
@@ -485,12 +497,12 @@ mod tests {
     #[test]
     fn test_timer_add_delete() {
         let mut mgr: OgsTimerMgr<i32> = OgsTimerMgr::new(10);
-        
+
         fn callback(_data: &mut i32) {}
-        
+
         let id = mgr.add(callback, 42).unwrap();
         assert_eq!(mgr.available(), 9);
-        
+
         mgr.delete(id);
         assert_eq!(mgr.available(), 10);
     }
@@ -498,13 +510,13 @@ mod tests {
     #[test]
     fn test_timer_start_stop() {
         let mut mgr: OgsTimerMgr<()> = OgsTimerMgr::new(10);
-        
+
         let id = mgr.add_simple().unwrap();
-        
+
         mgr.start(id, Duration::from_millis(100));
         assert_eq!(mgr.count(), 1);
         assert!(mgr.get(id).unwrap().is_running());
-        
+
         mgr.stop(id);
         assert_eq!(mgr.count(), 0);
         assert!(!mgr.get(id).unwrap().is_running());
@@ -513,13 +525,13 @@ mod tests {
     #[test]
     fn test_timer_next() {
         let mut mgr: OgsTimerMgr<()> = OgsTimerMgr::new(10);
-        
+
         // No timers - should return infinite
         assert_eq!(mgr.next(), OGS_INFINITE_TIME);
-        
+
         let id = mgr.add_simple().unwrap();
         mgr.start(id, Duration::from_millis(100));
-        
+
         // Should return time until next timer
         let next = mgr.next();
         assert!(next <= Duration::from_millis(100));
@@ -529,20 +541,20 @@ mod tests {
     #[test]
     fn test_timer_expire() {
         let mut mgr: OgsTimerMgr<()> = OgsTimerMgr::new(10);
-        
+
         let id1 = mgr.add_simple().unwrap();
         let id2 = mgr.add_simple().unwrap();
-        
+
         mgr.start(id1, Duration::from_millis(10));
         mgr.start(id2, Duration::from_millis(1000));
-        
+
         // Wait for first timer to expire
         thread::sleep(Duration::from_millis(20));
-        
+
         let expired = mgr.expire();
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0], id1);
-        
+
         // Second timer should still be running
         assert!(mgr.get(id2).unwrap().is_running());
     }
@@ -550,12 +562,12 @@ mod tests {
     #[test]
     fn test_timer_restart() {
         let mut mgr: OgsTimerMgr<()> = OgsTimerMgr::new(10);
-        
+
         let id = mgr.add_simple().unwrap();
-        
+
         mgr.start(id, Duration::from_millis(100));
         assert_eq!(mgr.count(), 1);
-        
+
         // Restart with different duration
         mgr.start(id, Duration::from_millis(200));
         assert_eq!(mgr.count(), 1); // Should still be 1, not 2
@@ -564,16 +576,16 @@ mod tests {
     #[test]
     fn test_timer_ordering() {
         let mut mgr: OgsTimerMgr<()> = OgsTimerMgr::new(10);
-        
+
         let id1 = mgr.add_simple().unwrap();
         let id2 = mgr.add_simple().unwrap();
         let id3 = mgr.add_simple().unwrap();
-        
+
         // Start in reverse order
         mgr.start(id3, Duration::from_millis(300));
         mgr.start(id1, Duration::from_millis(100));
         mgr.start(id2, Duration::from_millis(200));
-        
+
         // First to expire should be id1
         thread::sleep(Duration::from_millis(150));
         let expired = mgr.expire();
@@ -598,12 +610,12 @@ mod tests {
                 add_count in 0..30usize
             ) {
                 let mut mgr: OgsTimerMgr<()> = OgsTimerMgr::new(capacity);
-                
+
                 let actual_adds = add_count.min(capacity);
                 for _ in 0..actual_adds {
                     mgr.add_simple();
                 }
-                
+
                 let allocated = capacity - mgr.available();
                 prop_assert_eq!(
                     mgr.available() + allocated,
@@ -617,7 +629,7 @@ mod tests {
             fn prop_unique_ids(count in 1..20usize) {
                 let mut mgr: OgsTimerMgr<()> = OgsTimerMgr::new(count + 10);
                 let mut ids: HashSet<OgsTimerId> = HashSet::new();
-                
+
                 for _ in 0..count {
                     if let Some(id) = mgr.add_simple() {
                         prop_assert!(!ids.contains(&id), "Timer ID should be unique");
@@ -631,20 +643,20 @@ mod tests {
             fn prop_start_stop_count(timer_count in 1..10usize) {
                 let mut mgr: OgsTimerMgr<()> = OgsTimerMgr::new(timer_count + 5);
                 let mut ids = Vec::new();
-                
+
                 // Add timers
                 for _ in 0..timer_count {
                     if let Some(id) = mgr.add_simple() {
                         ids.push(id);
                     }
                 }
-                
+
                 // Start all timers
                 for id in &ids {
                     mgr.start(*id, Duration::from_secs(100));
                 }
                 prop_assert_eq!(mgr.count(), ids.len(), "count should equal started timers");
-                
+
                 // Stop all timers
                 for id in &ids {
                     mgr.stop(*id);
@@ -658,21 +670,21 @@ mod tests {
                 let capacity = count + 5;
                 let mut mgr: OgsTimerMgr<()> = OgsTimerMgr::new(capacity);
                 let mut ids = Vec::new();
-                
+
                 // Add timers
                 for _ in 0..count {
                     if let Some(id) = mgr.add_simple() {
                         ids.push(id);
                     }
                 }
-                
+
                 let available_after_add = mgr.available();
-                
+
                 // Delete all timers
                 for id in ids {
                     mgr.delete(id);
                 }
-                
+
                 prop_assert_eq!(
                     mgr.available(),
                     available_after_add + count,
@@ -685,10 +697,10 @@ mod tests {
             fn prop_restart_no_count_increase(restarts in 1..10usize) {
                 let mut mgr: OgsTimerMgr<()> = OgsTimerMgr::new(10);
                 let id = mgr.add_simple().unwrap();
-                
+
                 mgr.start(id, Duration::from_secs(100));
                 prop_assert_eq!(mgr.count(), 1);
-                
+
                 // Restart multiple times
                 for i in 0..restarts {
                     mgr.start(id, Duration::from_secs(100 + i as u64));
@@ -701,9 +713,9 @@ mod tests {
             fn prop_stop_idempotent(stop_count in 1..5usize) {
                 let mut mgr: OgsTimerMgr<()> = OgsTimerMgr::new(10);
                 let id = mgr.add_simple().unwrap();
-                
+
                 mgr.start(id, Duration::from_secs(100));
-                
+
                 // Stop multiple times
                 for _ in 0..stop_count {
                     mgr.stop(id);
@@ -724,10 +736,10 @@ mod tests {
             fn prop_next_reasonable(duration_ms in 100..1000u64) {
                 let mut mgr: OgsTimerMgr<()> = OgsTimerMgr::new(10);
                 let id = mgr.add_simple().unwrap();
-                
+
                 let duration = Duration::from_millis(duration_ms);
                 mgr.start(id, duration);
-                
+
                 let next = mgr.next();
                 prop_assert!(next <= duration, "next should be <= duration");
                 prop_assert!(next > Duration::ZERO, "next should be > 0");
@@ -742,7 +754,7 @@ mod tests {
                 let mut mgr: OgsTimerMgr<()> = OgsTimerMgr::new(20);
                 let mut short_ids = Vec::new();
                 let mut long_ids = Vec::new();
-                
+
                 // Add short timers (will expire)
                 for _ in 0..short_count {
                     if let Some(id) = mgr.add_simple() {
@@ -750,7 +762,7 @@ mod tests {
                         short_ids.push(id);
                     }
                 }
-                
+
                 // Add long timers (won't expire)
                 for _ in 0..long_count {
                     if let Some(id) = mgr.add_simple() {
@@ -758,17 +770,17 @@ mod tests {
                         long_ids.push(id);
                     }
                 }
-                
+
                 // Wait for short timers to expire
                 thread::sleep(Duration::from_millis(20));
-                
+
                 let expired = mgr.expire();
-                
+
                 // All short timers should have expired
                 for id in &short_ids {
                     prop_assert!(expired.contains(id), "short timer should have expired");
                 }
-                
+
                 // No long timers should have expired
                 for id in &long_ids {
                     prop_assert!(!expired.contains(id), "long timer should not have expired");
@@ -791,10 +803,8 @@ mod tests {
 
     #[test]
     fn test_local_mode_passthrough() {
-        let coordinator = DistributedTimerCoordinator::new(
-            DistributedTimerMode::Local,
-            "instance-1".to_string(),
-        );
+        let coordinator =
+            DistributedTimerCoordinator::new(DistributedTimerMode::Local, "instance-1".to_string());
         let expiry = 1000000u128;
         let result = coordinator.sync_timer(1, expiry);
         assert_eq!(result, expiry); // Local mode returns unchanged

@@ -204,7 +204,9 @@ pub fn pcrf_gx_handle_ccr(
     pcrf_diam_stats().gx.inc_rx_ccr();
 
     let ctx = pcrf_self();
-    let context = ctx.read().map_err(|e| format!("Failed to read context: {e}"))?;
+    let context = ctx
+        .read()
+        .map_err(|e| format!("Failed to read context: {e}"))?;
 
     match cc_request_type {
         CcRequestType::Initial => {
@@ -292,7 +294,7 @@ pub fn pcrf_gx_handle_ccr(
 fn build_subscriber_session_data(imsi: &str, apn: &str) -> GxSessionData {
     // Default profile values (used as fallback or when DB returns no data)
     const DEFAULT_AMBR_DL: u64 = 100_000_000; // 100 Mbps
-    const DEFAULT_AMBR_UL: u64 =  50_000_000; //  50 Mbps
+    const DEFAULT_AMBR_UL: u64 = 50_000_000; //  50 Mbps
     const DEFAULT_QCI: u8 = 9;
 
     // Build a catch-all PCC rule for the APN.
@@ -308,14 +310,20 @@ fn build_subscriber_session_data(imsi: &str, apn: &str) -> GxSessionData {
         gbr_downlink: 0, // non-GBR
         gbr_uplink: 0,
         flows: vec![
-            FlowData { direction: 0, description: "permit out ip from any to assigned".to_string() },
-            FlowData { direction: 1, description: "permit in ip from any to assigned".to_string() },
+            FlowData {
+                direction: 0,
+                description: "permit out ip from any to assigned".to_string(),
+            },
+            FlowData {
+                direction: 1,
+                description: "permit in ip from any to assigned".to_string(),
+            },
         ],
     };
 
     // Attempt DB lookup to get subscriber-specific AMBR overrides.
-    let (ambr_dl, ambr_ul) = lookup_subscriber_ambr(imsi, apn)
-        .unwrap_or((DEFAULT_AMBR_DL, DEFAULT_AMBR_UL));
+    let (ambr_dl, ambr_ul) =
+        lookup_subscriber_ambr(imsi, apn).unwrap_or((DEFAULT_AMBR_DL, DEFAULT_AMBR_UL));
 
     build_session_data_with_rules(DEFAULT_QCI, ambr_dl, ambr_ul, vec![default_pcc_rule])
 }
@@ -323,23 +331,26 @@ fn build_subscriber_session_data(imsi: &str, apn: &str) -> GxSessionData {
 /// Query the DB for a subscriber's AMBR for the given APN.
 /// Returns None if the DB is not reachable or the subscriber has no explicit AMBR.
 fn lookup_subscriber_ambr(imsi: &str, apn: &str) -> Option<(u64, u64)> {
-    use ogs_dbi::{ogs_dbi_subscription_data};
+    use ogs_dbi::ogs_dbi_subscription_data;
     let supi = format!("imsi-{imsi}");
     let subscription_data = ogs_dbi_subscription_data(&supi).ok()?;
 
     // Try to find a session matching the APN.
     for slice in &subscription_data.slice {
         for session in &slice.session {
-            if session.name.as_deref().unwrap_or("") == apn {
-                if session.ambr.downlink > 0 || session.ambr.uplink > 0 {
-                    return Some((session.ambr.downlink, session.ambr.uplink));
-                }
+            if session.name.as_deref().unwrap_or("") == apn
+                && (session.ambr.downlink > 0 || session.ambr.uplink > 0)
+            {
+                return Some((session.ambr.downlink, session.ambr.uplink));
             }
         }
     }
     // Fall back to UE-level AMBR if present
     if subscription_data.ambr.downlink > 0 || subscription_data.ambr.uplink > 0 {
-        return Some((subscription_data.ambr.downlink, subscription_data.ambr.uplink));
+        return Some((
+            subscription_data.ambr.downlink,
+            subscription_data.ambr.uplink,
+        ));
     }
     None
 }
@@ -358,7 +369,9 @@ pub fn pcrf_gx_send_rar(
     );
 
     let ctx = pcrf_self();
-    let context = ctx.read().map_err(|e| format!("Failed to read context: {e}"))?;
+    let context = ctx
+        .read()
+        .map_err(|e| format!("Failed to read context: {e}"))?;
 
     // Find Gx session
     let gx_session = context
@@ -451,52 +464,88 @@ pub enum QciResourceType {
 pub fn qci_to_qos(qci: u8) -> QciQosMapping {
     match qci {
         1 => QciQosMapping {
-            qci: 1, resource_type: QciResourceType::Gbr,
-            priority: 2, packet_delay_budget_ms: 100, packet_error_loss_rate: 1e-2,
+            qci: 1,
+            resource_type: QciResourceType::Gbr,
+            priority: 2,
+            packet_delay_budget_ms: 100,
+            packet_error_loss_rate: 1e-2,
         },
         2 => QciQosMapping {
-            qci: 2, resource_type: QciResourceType::Gbr,
-            priority: 4, packet_delay_budget_ms: 150, packet_error_loss_rate: 1e-3,
+            qci: 2,
+            resource_type: QciResourceType::Gbr,
+            priority: 4,
+            packet_delay_budget_ms: 150,
+            packet_error_loss_rate: 1e-3,
         },
         3 => QciQosMapping {
-            qci: 3, resource_type: QciResourceType::Gbr,
-            priority: 3, packet_delay_budget_ms: 50, packet_error_loss_rate: 1e-3,
+            qci: 3,
+            resource_type: QciResourceType::Gbr,
+            priority: 3,
+            packet_delay_budget_ms: 50,
+            packet_error_loss_rate: 1e-3,
         },
         4 => QciQosMapping {
-            qci: 4, resource_type: QciResourceType::Gbr,
-            priority: 5, packet_delay_budget_ms: 300, packet_error_loss_rate: 1e-6,
+            qci: 4,
+            resource_type: QciResourceType::Gbr,
+            priority: 5,
+            packet_delay_budget_ms: 300,
+            packet_error_loss_rate: 1e-6,
         },
         5 => QciQosMapping {
-            qci: 5, resource_type: QciResourceType::NonGbr,
-            priority: 1, packet_delay_budget_ms: 100, packet_error_loss_rate: 1e-6,
+            qci: 5,
+            resource_type: QciResourceType::NonGbr,
+            priority: 1,
+            packet_delay_budget_ms: 100,
+            packet_error_loss_rate: 1e-6,
         },
         6 => QciQosMapping {
-            qci: 6, resource_type: QciResourceType::NonGbr,
-            priority: 6, packet_delay_budget_ms: 300, packet_error_loss_rate: 1e-6,
+            qci: 6,
+            resource_type: QciResourceType::NonGbr,
+            priority: 6,
+            packet_delay_budget_ms: 300,
+            packet_error_loss_rate: 1e-6,
         },
         7 => QciQosMapping {
-            qci: 7, resource_type: QciResourceType::NonGbr,
-            priority: 7, packet_delay_budget_ms: 100, packet_error_loss_rate: 1e-3,
+            qci: 7,
+            resource_type: QciResourceType::NonGbr,
+            priority: 7,
+            packet_delay_budget_ms: 100,
+            packet_error_loss_rate: 1e-3,
         },
         8 => QciQosMapping {
-            qci: 8, resource_type: QciResourceType::NonGbr,
-            priority: 8, packet_delay_budget_ms: 300, packet_error_loss_rate: 1e-6,
+            qci: 8,
+            resource_type: QciResourceType::NonGbr,
+            priority: 8,
+            packet_delay_budget_ms: 300,
+            packet_error_loss_rate: 1e-6,
         },
         9 => QciQosMapping {
-            qci: 9, resource_type: QciResourceType::NonGbr,
-            priority: 9, packet_delay_budget_ms: 300, packet_error_loss_rate: 1e-6,
+            qci: 9,
+            resource_type: QciResourceType::NonGbr,
+            priority: 9,
+            packet_delay_budget_ms: 300,
+            packet_error_loss_rate: 1e-6,
         },
         65 => QciQosMapping {
-            qci: 65, resource_type: QciResourceType::Gbr,
-            priority: 0, packet_delay_budget_ms: 75, packet_error_loss_rate: 1e-2,
+            qci: 65,
+            resource_type: QciResourceType::Gbr,
+            priority: 0,
+            packet_delay_budget_ms: 75,
+            packet_error_loss_rate: 1e-2,
         },
         66 => QciQosMapping {
-            qci: 66, resource_type: QciResourceType::Gbr,
-            priority: 2, packet_delay_budget_ms: 100, packet_error_loss_rate: 1e-2,
+            qci: 66,
+            resource_type: QciResourceType::Gbr,
+            priority: 2,
+            packet_delay_budget_ms: 100,
+            packet_error_loss_rate: 1e-2,
         },
         _ => QciQosMapping {
-            qci, resource_type: QciResourceType::NonGbr,
-            priority: 9, packet_delay_budget_ms: 300, packet_error_loss_rate: 1e-6,
+            qci,
+            resource_type: QciResourceType::NonGbr,
+            priority: 9,
+            packet_delay_budget_ms: 300,
+            packet_error_loss_rate: 1e-6,
         },
     }
 }
@@ -507,10 +556,7 @@ pub fn qci_to_qos(qci: u8) -> QciQosMapping {
 
 /// Derive PCC rules from IMS media components (Rx → Gx)
 /// Port of pcrf-gx-path logic that converts Rx media info to PCC rules
-pub fn derive_pcc_rules(
-    ims_data: &ImsData,
-    base_rule_name: &str,
-) -> Vec<PccRuleData> {
+pub fn derive_pcc_rules(ims_data: &ImsData, base_rule_name: &str) -> Vec<PccRuleData> {
     let mut rules = Vec::new();
 
     for (idx, mc) in ims_data.media_components.iter().enumerate() {
@@ -518,11 +564,11 @@ pub fn derive_pcc_rules(
 
         // Determine QCI from media type (TS 29.213 section 7.1.4)
         let qci = match mc.media_type {
-            media_type::AUDIO => 1,   // Conversational Voice
-            media_type::VIDEO => 2,   // Conversational Video (live)
+            media_type::AUDIO => 1,       // Conversational Voice
+            media_type::VIDEO => 2,       // Conversational Video (live)
             media_type::APPLICATION => 5, // IMS signalling
-            media_type::CONTROL => 5, // IMS signalling
-            _ => 9,                   // Default non-GBR
+            media_type::CONTROL => 5,     // IMS signalling
+            _ => 9,                       // Default non-GBR
         };
 
         // Determine flow status
@@ -569,16 +615,27 @@ pub fn derive_pcc_rules(
             precedence: (idx as u32 + 1) * 10,
             mbr_downlink: mc.max_requested_bandwidth_dl as u64,
             mbr_uplink: mc.max_requested_bandwidth_ul as u64,
-            gbr_downlink: if qci <= 4 { mc.max_requested_bandwidth_dl as u64 } else { 0 },
-            gbr_uplink: if qci <= 4 { mc.max_requested_bandwidth_ul as u64 } else { 0 },
+            gbr_downlink: if qci <= 4 {
+                mc.max_requested_bandwidth_dl as u64
+            } else {
+                0
+            },
+            gbr_uplink: if qci <= 4 {
+                mc.max_requested_bandwidth_ul as u64
+            } else {
+                0
+            },
             flows,
         };
 
         rules.push(rule);
     }
 
-    log::debug!("Derived {} PCC rules from {} media components",
-        rules.len(), ims_data.media_components.len());
+    log::debug!(
+        "Derived {} PCC rules from {} media components",
+        rules.len(),
+        ims_data.media_components.len()
+    );
 
     rules
 }
@@ -754,25 +811,21 @@ mod tests {
     #[test]
     fn test_derive_pcc_rules_audio() {
         let ims_data = ImsData {
-            media_components: vec![
-                MediaComponent {
-                    media_component_number: 1,
-                    media_type: media_type::AUDIO,
-                    max_requested_bandwidth_dl: 64000,
-                    max_requested_bandwidth_ul: 64000,
-                    flow_status: flow_status::ENABLED,
-                    sub_components: vec![
-                        MediaSubComponent {
-                            flow_number: 1,
-                            flow_usage: 0,
-                            flows: vec![
-                                "permit out 17 from 10.0.0.1 to 10.0.0.2".to_string(),
-                                "permit in 17 from 10.0.0.2 to 10.0.0.1".to_string(),
-                            ],
-                        },
+            media_components: vec![MediaComponent {
+                media_component_number: 1,
+                media_type: media_type::AUDIO,
+                max_requested_bandwidth_dl: 64000,
+                max_requested_bandwidth_ul: 64000,
+                flow_status: flow_status::ENABLED,
+                sub_components: vec![MediaSubComponent {
+                    flow_number: 1,
+                    flow_usage: 0,
+                    flows: vec![
+                        "permit out 17 from 10.0.0.1 to 10.0.0.2".to_string(),
+                        "permit in 17 from 10.0.0.2 to 10.0.0.1".to_string(),
                     ],
-                },
-            ],
+                }],
+            }],
         };
 
         let rules = derive_pcc_rules(&ims_data, "test-rule");

@@ -8,17 +8,17 @@ use std::collections::HashMap;
 /// URLLC slice profile constants (TS 22.261 Table 7.1-1)
 pub const URLLC_MAX_LATENCY_MS: u32 = 1;
 pub const URLLC_RELIABILITY: f64 = 0.999_999; // 10^-6 PER
-pub const URLLC_DEFAULT_5QI: u8 = 82;          // 5QI 82: URLLC, delay-critical GBR
+pub const URLLC_DEFAULT_5QI: u8 = 82; // 5QI 82: URLLC, delay-critical GBR
 
 /// V2X slice profile constants (TS 22.185)
 pub const V2X_MAX_LATENCY_MS: u32 = 3;
 pub const V2X_RELIABILITY: f64 = 0.9999;
-pub const V2X_DEFAULT_5QI: u8 = 85;            // 5QI 85: V2X messages
+pub const V2X_DEFAULT_5QI: u8 = 85; // 5QI 85: V2X messages
 
 /// eMBB slice profile constants
 pub const EMBB_MAX_LATENCY_MS: u32 = 20;
 pub const EMBB_RELIABILITY: f64 = 0.99;
-pub const EMBB_DEFAULT_5QI: u8 = 9;            // 5QI 9: default non-GBR
+pub const EMBB_DEFAULT_5QI: u8 = 9; // 5QI 9: default non-GBR
 
 /// mIoT (massive IoT) slice profile constants
 pub const MIOT_MAX_LATENCY_MS: u32 = 6000;
@@ -91,7 +91,7 @@ impl SliceProfile {
             max_latency_ms: URLLC_MAX_LATENCY_MS,
             reliability: URLLC_RELIABILITY,
             default_5qi: URLLC_DEFAULT_5QI,
-            max_ul_mbr_kbps: 10_000,  // 10 Mbps default GBR for URLLC
+            max_ul_mbr_kbps: 10_000, // 10 Mbps default GBR for URLLC
             max_dl_mbr_kbps: 10_000,
             dscp_marking_required: true,
             dscp_value: 46, // EF (Expedited Forwarding) per RFC 3246
@@ -119,7 +119,7 @@ impl SliceProfile {
             max_latency_ms: EMBB_MAX_LATENCY_MS,
             reliability: EMBB_RELIABILITY,
             default_5qi: EMBB_DEFAULT_5QI,
-            max_ul_mbr_kbps: 0,   // unlimited
+            max_ul_mbr_kbps: 0, // unlimited
             max_dl_mbr_kbps: 0,
             dscp_marking_required: false,
             dscp_value: 0,
@@ -133,7 +133,7 @@ impl SliceProfile {
             max_latency_ms: MIOT_MAX_LATENCY_MS,
             reliability: MIOT_RELIABILITY,
             default_5qi: MIOT_DEFAULT_5QI,
-            max_ul_mbr_kbps: 200,  // 200 kbps uplink typical mIoT
+            max_ul_mbr_kbps: 200, // 200 kbps uplink typical mIoT
             max_dl_mbr_kbps: 200,
             dscp_marking_required: false,
             dscp_value: 0,

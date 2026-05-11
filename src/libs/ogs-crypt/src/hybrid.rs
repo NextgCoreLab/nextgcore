@@ -11,7 +11,7 @@
 //! - 3GPP TR 33.831: Study on Post-Quantum Cryptography
 //! - IETF draft-ietf-tls-hybrid-design
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::ecc::{self, ECC_BYTES, ECC_PUBLIC_KEY_SIZE};
@@ -144,7 +144,11 @@ pub fn hybrid_decapsulate(
 ) -> HybridResult<[u8; HYBRID_SHARED_SECRET_SIZE]> {
     // 1. P-256 ECDH: compute shared secret using own private key + ephemeral public key
     let mut ecdh_ss = [0u8; ECC_BYTES];
-    ecc::ecdh_shared_secret(&ct.ecc_ephemeral_pub, &hybrid_kp.ecc_private_key, &mut ecdh_ss)?;
+    ecc::ecdh_shared_secret(
+        &ct.ecc_ephemeral_pub,
+        &hybrid_kp.ecc_private_key,
+        &mut ecdh_ss,
+    )?;
 
     // 2. ML-KEM-768 decapsulation
     let ml_kem_ss = ml_kem::ml_kem_decapsulate(

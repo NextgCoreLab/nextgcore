@@ -68,7 +68,9 @@ impl SeppTimerId {
     pub fn name(&self) -> &'static str {
         match self {
             SeppTimerId::PeerEstablish => "SEPP_TIMER_PEER_ESTABLISH",
-            SeppTimerId::NfInstanceRegistrationInterval => "OGS_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL",
+            SeppTimerId::NfInstanceRegistrationInterval => {
+                "OGS_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
+            }
             SeppTimerId::NfInstanceHeartbeatInterval => "OGS_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL",
             SeppTimerId::NfInstanceNoHeartbeat => "OGS_TIMER_NF_INSTANCE_NO_HEARTBEAT",
             SeppTimerId::NfInstanceValidity => "OGS_TIMER_NF_INSTANCE_VALIDITY",

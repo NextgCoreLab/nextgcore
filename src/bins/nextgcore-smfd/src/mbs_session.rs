@@ -155,12 +155,18 @@ impl SmfMbsContext {
 
     /// Handles a UE join request
     pub fn ue_join(&mut self, tmgi: &str, supi: String) -> bool {
-        self.sessions.get_mut(tmgi).map(|s| s.join(supi)).unwrap_or(false)
+        self.sessions
+            .get_mut(tmgi)
+            .map(|s| s.join(supi))
+            .unwrap_or(false)
     }
 
     /// Handles a UE leave request
     pub fn ue_leave(&mut self, tmgi: &str, supi: &str) -> bool {
-        self.sessions.get_mut(tmgi).map(|s| s.leave(supi)).unwrap_or(false)
+        self.sessions
+            .get_mut(tmgi)
+            .map(|s| s.leave(supi))
+            .unwrap_or(false)
     }
 
     /// Returns number of active sessions

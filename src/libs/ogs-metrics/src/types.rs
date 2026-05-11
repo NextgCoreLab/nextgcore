@@ -30,9 +30,7 @@ pub enum HistogramBucketType {
 #[derive(Debug, Clone)]
 pub enum HistogramBucketParams {
     /// Variable bucket boundaries - explicit list of bucket boundaries
-    Variable {
-        buckets: Vec<f64>,
-    },
+    Variable { buckets: Vec<f64> },
     /// Linear bucket boundaries
     Linear {
         start: f64,
@@ -55,12 +53,20 @@ impl HistogramBucketParams {
 
     /// Create linear histogram buckets
     pub fn linear(start: f64, width: f64, count: usize) -> Self {
-        HistogramBucketParams::Linear { start, width, count }
+        HistogramBucketParams::Linear {
+            start,
+            width,
+            count,
+        }
     }
 
     /// Create exponential histogram buckets
     pub fn exponential(start: f64, factor: f64, count: usize) -> Self {
-        HistogramBucketParams::Exponential { start, factor, count }
+        HistogramBucketParams::Exponential {
+            start,
+            factor,
+            count,
+        }
     }
 
     /// Get the bucket type
@@ -76,16 +82,16 @@ impl HistogramBucketParams {
     pub fn generate_buckets(&self) -> Vec<f64> {
         match self {
             HistogramBucketParams::Variable { buckets } => buckets.clone(),
-            HistogramBucketParams::Linear { start, width, count } => {
-                (0..*count)
-                    .map(|i| start + (i as f64) * width)
-                    .collect()
-            }
-            HistogramBucketParams::Exponential { start, factor, count } => {
-                (0..*count)
-                    .map(|i| start * factor.powi(i as i32))
-                    .collect()
-            }
+            HistogramBucketParams::Linear {
+                start,
+                width,
+                count,
+            } => (0..*count).map(|i| start + (i as f64) * width).collect(),
+            HistogramBucketParams::Exponential {
+                start,
+                factor,
+                count,
+            } => (0..*count).map(|i| start * factor.powi(i as i32)).collect(),
         }
     }
 }

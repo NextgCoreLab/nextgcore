@@ -175,7 +175,7 @@ pub fn nas_mac_calculate(
                 return [0u8; 4];
             }
             let key: [u8; 16] = knas_int[..16].try_into().unwrap_or([0u8; 16]);
-            
+
             // Build the input: COUNT || BEARER || DIRECTION || MESSAGE
             // COUNT is 32 bits, BEARER is 5 bits, DIRECTION is 1 bit, then 26 zero bits
             let mut input = Vec::with_capacity(8 + message.len());
@@ -183,7 +183,7 @@ pub fn nas_mac_calculate(
             input.push(((bearer << 3) | (direction << 2)) as u8);
             input.extend_from_slice(&[0u8; 3]); // Padding
             input.extend_from_slice(message);
-            
+
             let cmac = ogs_crypt::aes_cmac::aes_cmac_calculate(&key, &input);
             [cmac[0], cmac[1], cmac[2], cmac[3]]
         }
@@ -260,7 +260,7 @@ pub fn nas_encrypt(
                 return;
             }
             let key: [u8; 16] = knas_enc[..16].try_into().unwrap_or([0u8; 16]);
-            
+
             // Build IV/counter: COUNT || BEARER || DIRECTION || 0...0
             let mut iv = [0u8; 16];
             iv[0] = (count >> 24) as u8;
@@ -269,7 +269,7 @@ pub fn nas_encrypt(
             iv[3] = count as u8;
             iv[4] = ((bearer << 3) | (direction << 2)) as u8;
             // iv[5..16] are zeros
-            
+
             let mut output = vec![0u8; message.len()];
             if ogs_crypt::aes::aes_ctr128_encrypt(&key, &mut iv, message, &mut output).is_ok() {
                 message.copy_from_slice(&output);
@@ -401,8 +401,10 @@ pub fn nas_eps_security_encode(
             NAS_SECURITY_DOWNLINK_DIRECTION,
             &msg_with_sqn,
         );
-        header.message_authentication_code =
-            ((mac[0] as u32) << 24) | ((mac[1] as u32) << 16) | ((mac[2] as u32) << 8) | (mac[3] as u32);
+        header.message_authentication_code = ((mac[0] as u32) << 24)
+            | ((mac[1] as u32) << 16)
+            | ((mac[2] as u32) << 8)
+            | (mac[3] as u32);
     }
 
     // Increment dl_count (24-bit)
@@ -495,8 +497,8 @@ pub fn nas_eps_security_decode(
         }
 
         // Parse security header
-        let header = NasEpsSecurityHeader::decode(message)
-            .ok_or("Failed to decode security header")?;
+        let header =
+            NasEpsSecurityHeader::decode(message).ok_or("Failed to decode security header")?;
 
         // Update UL count
         let ul_count = UlCount::from_u32(mme_ue.ul_count);
@@ -511,7 +513,7 @@ pub fn nas_eps_security_decode(
         if flags.integrity_protected {
             // Build message for MAC calculation (sequence number + payload)
             let msg_for_mac = &message[5..]; // Skip first 5 bytes (header without sqn)
-            
+
             let calculated_mac = nas_mac_calculate(
                 mme_ue.selected_int_algorithm,
                 &mme_ue.knas_int,
@@ -675,7 +677,10 @@ mod tests {
 
     #[test]
     fn test_ul_count() {
-        let count = UlCount { sqn: 0x12, overflow: 0x0034 };
+        let count = UlCount {
+            sqn: 0x12,
+            overflow: 0x0034,
+        };
         assert_eq!(count.to_u32(), 0x003412);
 
         let count2 = UlCount::from_u32(0x003412);
@@ -704,11 +709,8 @@ mod tests {
         let mut mme_ue = MmeUe::default();
         let plain_message = vec![0x07, 0x41, 0x01, 0x02, 0x03];
 
-        let result = nas_eps_security_encode(
-            &mut mme_ue,
-            SecurityHeaderType::PlainNas,
-            &plain_message,
-        );
+        let result =
+            nas_eps_security_encode(&mut mme_ue, SecurityHeaderType::PlainNas, &plain_message);
 
         assert!(result.is_some());
         assert_eq!(result.unwrap(), plain_message);
@@ -719,7 +721,7 @@ mod tests {
         let mut mme_ue = MmeUe::default();
         mme_ue.selected_int_algorithm = 2; // EIA2
         mme_ue.knas_int = [0x11u8; 16];
-        
+
         let plain_message = vec![0x07, 0x41, 0x01, 0x02, 0x03];
 
         let result = nas_eps_security_encode(
@@ -730,16 +732,19 @@ mod tests {
 
         assert!(result.is_some());
         let encoded = result.unwrap();
-        
+
         // Should have 6-byte security header + original message
         assert_eq!(encoded.len(), 6 + plain_message.len());
-        
+
         // Check security header type
-        assert_eq!(encoded[0] >> 4, SecurityHeaderType::IntegrityProtected as u8);
-        
+        assert_eq!(
+            encoded[0] >> 4,
+            SecurityHeaderType::IntegrityProtected as u8
+        );
+
         // dl_count should be incremented
         assert_eq!(mme_ue.dl_count, 1);
-        
+
         // security_context_available should be set
         assert!(mme_ue.security_context_available);
     }

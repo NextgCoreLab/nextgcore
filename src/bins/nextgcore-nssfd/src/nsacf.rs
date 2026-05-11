@@ -56,7 +56,9 @@ impl SliceQuota {
 
     /// UE utilization ratio (0.0-1.0).
     pub fn ue_utilization(&self) -> f64 {
-        if self.max_ues == 0 { return 1.0; }
+        if self.max_ues == 0 {
+            return 1.0;
+        }
         self.current_ues as f64 / self.max_ues as f64
     }
 }
@@ -135,11 +137,17 @@ impl NsacfClient {
     }
 
     /// Total admission requests.
-    pub fn total_requests(&self) -> u64 { self.total_requests }
+    pub fn total_requests(&self) -> u64 {
+        self.total_requests
+    }
     /// Total admissions.
-    pub fn total_admitted(&self) -> u64 { self.total_admitted }
+    pub fn total_admitted(&self) -> u64 {
+        self.total_admitted
+    }
     /// Total denials.
-    pub fn total_denied(&self) -> u64 { self.total_denied }
+    pub fn total_denied(&self) -> u64 {
+        self.total_denied
+    }
 }
 
 // ============================================================================
@@ -153,9 +161,12 @@ mod tests {
     #[test]
     fn test_slice_quota_capacity() {
         let quota = SliceQuota {
-            sst: 1, sd: None,
-            max_ues: 100, current_ues: 50,
-            max_pdu_sessions: 200, current_pdu_sessions: 100,
+            sst: 1,
+            sd: None,
+            max_ues: 100,
+            current_ues: 50,
+            max_pdu_sessions: 200,
+            current_pdu_sessions: 100,
         };
         assert!(quota.has_ue_capacity());
         assert!(quota.has_session_capacity());
@@ -165,9 +176,12 @@ mod tests {
     #[test]
     fn test_slice_quota_full() {
         let quota = SliceQuota {
-            sst: 2, sd: Some(0x010203),
-            max_ues: 10, current_ues: 10,
-            max_pdu_sessions: 20, current_pdu_sessions: 15,
+            sst: 2,
+            sd: Some(0x010203),
+            max_ues: 10,
+            current_ues: 10,
+            max_pdu_sessions: 20,
+            current_pdu_sessions: 15,
         };
         assert!(!quota.has_ue_capacity());
         assert!(quota.has_session_capacity());
@@ -178,26 +192,38 @@ mod tests {
         let mut client = NsacfClient::new();
 
         client.update_quota(SliceQuota {
-            sst: 1, sd: None,
-            max_ues: 2, current_ues: 1,
-            max_pdu_sessions: 4, current_pdu_sessions: 0,
+            sst: 1,
+            sd: None,
+            max_ues: 2,
+            current_ues: 1,
+            max_pdu_sessions: 4,
+            current_pdu_sessions: 0,
         });
 
         assert_eq!(client.check_admission(1, None), AdmissionResult::Admitted);
         client.record_admission(1, None);
-        assert_eq!(client.check_admission(1, None), AdmissionResult::DeniedQuotaExceeded);
+        assert_eq!(
+            client.check_admission(1, None),
+            AdmissionResult::DeniedQuotaExceeded
+        );
     }
 
     #[test]
     fn test_nsacf_release() {
         let mut client = NsacfClient::new();
         client.update_quota(SliceQuota {
-            sst: 1, sd: None,
-            max_ues: 1, current_ues: 1,
-            max_pdu_sessions: 1, current_pdu_sessions: 0,
+            sst: 1,
+            sd: None,
+            max_ues: 1,
+            current_ues: 1,
+            max_pdu_sessions: 1,
+            current_pdu_sessions: 0,
         });
 
-        assert_eq!(client.check_admission(1, None), AdmissionResult::DeniedQuotaExceeded);
+        assert_eq!(
+            client.check_admission(1, None),
+            AdmissionResult::DeniedQuotaExceeded
+        );
         client.record_release(1, None);
         assert_eq!(client.check_admission(1, None), AdmissionResult::Admitted);
     }

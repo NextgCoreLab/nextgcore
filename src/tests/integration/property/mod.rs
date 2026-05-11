@@ -3,14 +3,13 @@
 //! Tests message sequence equivalence with C implementation.
 //! Validates: Requirements 15.1-15.6
 
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use bytes::Bytes;
 use proptest::prelude::*;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use crate::common::{
-    MessageType, MessageCapture, CapturedMessage, MessageField,
-    MockEnvironment, NfType, PlmnId,
+    CapturedMessage, MessageCapture, MessageField, MessageType, MockEnvironment, NfType, PlmnId,
 };
 
 // ============================================================================
@@ -46,11 +45,10 @@ fn arb_apn() -> impl Strategy<Value = String> {
 
 /// Strategy for generating valid PLMN IDs
 fn arb_plmn_id() -> impl Strategy<Value = PlmnId> {
-    (1u16..999, 1u16..999)
-        .prop_map(|(mcc, mnc)| {
-            let mnc_len = if mnc > 99 { 3 } else { 2 };
-            PlmnId::new(mcc, mnc, mnc_len)
-        })
+    (1u16..999, 1u16..999).prop_map(|(mcc, mnc)| {
+        let mnc_len = if mnc > 99 { 3 } else { 2 };
+        PlmnId::new(mcc, mnc, mnc_len)
+    })
 }
 
 /// Strategy for generating valid PDU session IDs (1-15)
@@ -99,7 +97,7 @@ fn arb_qci() -> impl Strategy<Value = i64> {
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
-    
+
     /// Property 15.1: Registration request with valid SUPI triggers authentication
     /// Feature: nextgcore-rust-conversion
     /// Validates: Requirement 15.3 - 5G UE registration
@@ -109,7 +107,7 @@ proptest! {
         rt.block_on(async {
             let mut env = MockEnvironment::new().with_amf();
             env.start_all().await.unwrap();
-            
+
             let reg_request = CapturedMessage::new(
                 MessageType::RegistrationRequest,
                 Bytes::new(),
@@ -117,17 +115,17 @@ proptest! {
                 "AMF",
             )
             .with_field("supi", MessageField::String(supi));
-            
+
             let response = env.send_message(NfType::Amf, reg_request).await.unwrap();
-            
+
             prop_assert!(response.is_some());
             prop_assert_eq!(response.unwrap().msg_type, MessageType::AuthenticationRequest);
-            
+
             env.stop_all().await.unwrap();
             Ok(())
         }).unwrap();
     }
-    
+
     /// Property 15.2: Attach request with valid IMSI triggers authentication
     /// Feature: nextgcore-rust-conversion
     /// Validates: Requirement 15.3 - 4G UE attach
@@ -137,7 +135,7 @@ proptest! {
         rt.block_on(async {
             let mut env = MockEnvironment::new().with_mme();
             env.start_all().await.unwrap();
-            
+
             let attach_request = CapturedMessage::new(
                 MessageType::AttachRequest,
                 Bytes::new(),
@@ -145,32 +143,32 @@ proptest! {
                 "MME",
             )
             .with_field("imsi", MessageField::String(imsi));
-            
+
             let response = env.send_message(NfType::Mme, attach_request).await.unwrap();
-            
+
             prop_assert!(response.is_some());
             prop_assert_eq!(response.unwrap().msg_type, MessageType::AuthenticationRequest);
-            
+
             env.stop_all().await.unwrap();
             Ok(())
         }).unwrap();
     }
-    
+
     /// Property 15.3: PLMN ID encoding produces valid 3-byte output
     /// Feature: nextgcore-rust-conversion
     /// Validates: Requirement 15.1 - Protocol encoding
     #[test]
     fn prop_plmn_encoding_valid(plmn in arb_plmn_id()) {
         let bytes = plmn.to_bytes();
-        
+
         // PLMN ID is always 3 bytes
         prop_assert_eq!(bytes.len(), 3);
-        
+
         // First nibble of first byte should be MCC digit 2
         // Second nibble of first byte should be MCC digit 1
         let mcc_digit1 = bytes[0] & 0x0F;
         let mcc_digit2 = (bytes[0] >> 4) & 0x0F;
-        
+
         prop_assert!(mcc_digit1 <= 9);
         prop_assert!(mcc_digit2 <= 9);
     }
@@ -182,7 +180,7 @@ proptest! {
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
-    
+
     /// Property 15.4: PDU session ID is preserved through establishment
     /// Feature: nextgcore-rust-conversion
     /// Validates: Requirement 15.4 - PDU session establishment
@@ -195,7 +193,7 @@ proptest! {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let capture = Arc::new(RwLock::new(MessageCapture::new()));
-            
+
             let session_request = CapturedMessage::new(
                 MessageType::CreateSessionRequest,
                 Bytes::new(),
@@ -205,22 +203,22 @@ proptest! {
             .with_field("supi", MessageField::String(supi))
             .with_field("dnn", MessageField::String(dnn))
             .with_field("pdu_session_id", MessageField::Number(pdu_session_id));
-            
+
             {
                 let mut cap = capture.write().await;
                 cap.capture(session_request);
             }
-            
+
             let cap = capture.read().await;
             let msgs = cap.messages_of_type(&MessageType::CreateSessionRequest);
-            
+
             prop_assert_eq!(msgs.len(), 1);
             prop_assert_eq!(msgs[0].get_number("pdu_session_id"), Some(pdu_session_id));
-            
+
             Ok(())
         }).unwrap();
     }
-    
+
     /// Property 15.5: PFCP SEID is preserved through session operations
     /// Feature: nextgcore-rust-conversion
     /// Validates: Requirement 15.4 - PFCP session handling
@@ -229,7 +227,7 @@ proptest! {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let capture = Arc::new(RwLock::new(MessageCapture::new()));
-            
+
             let pfcp_request = CapturedMessage::new(
                 MessageType::SessionEstablishmentRequest,
                 Bytes::new(),
@@ -237,22 +235,22 @@ proptest! {
                 "UPF",
             )
             .with_field("seid", MessageField::Number(seid));
-            
+
             {
                 let mut cap = capture.write().await;
                 cap.capture(pfcp_request);
             }
-            
+
             let cap = capture.read().await;
             let msgs = cap.messages_of_type(&MessageType::SessionEstablishmentRequest);
-            
+
             prop_assert_eq!(msgs.len(), 1);
             prop_assert_eq!(msgs[0].get_number("seid"), Some(seid));
-            
+
             Ok(())
         }).unwrap();
     }
-    
+
     /// Property 15.6: GTP TEID is valid 32-bit value
     /// Feature: nextgcore-rust-conversion
     /// Validates: Requirement 15.5 - GTP communication
@@ -261,7 +259,7 @@ proptest! {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let capture = Arc::new(RwLock::new(MessageCapture::new()));
-            
+
             let gtp_msg = CapturedMessage::new(
                 MessageType::CreateSessionResponse,
                 Bytes::new(),
@@ -269,22 +267,22 @@ proptest! {
                 "MME",
             )
             .with_field("s11_sgw_teid", MessageField::Number(teid));
-            
+
             {
                 let mut cap = capture.write().await;
                 cap.capture(gtp_msg);
             }
-            
+
             let cap = capture.read().await;
             let msgs = cap.messages_of_type(&MessageType::CreateSessionResponse);
-            
+
             prop_assert_eq!(msgs.len(), 1);
             let stored_teid = msgs[0].get_number("s11_sgw_teid").unwrap();
-            
+
             // TEID must be 32-bit
             prop_assert!(stored_teid >= 0);
             prop_assert!(stored_teid <= 0xFFFFFFFF);
-            
+
             Ok(())
         }).unwrap();
     }
@@ -296,7 +294,7 @@ proptest! {
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(100))]
-    
+
     /// Property 15.7: NF registration preserves NF type
     /// Feature: nextgcore-rust-conversion
     /// Validates: Requirement 15.5 - SBI communication
@@ -305,7 +303,7 @@ proptest! {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let capture = Arc::new(RwLock::new(MessageCapture::new()));
-            
+
             let nf_register = CapturedMessage::new(
                 MessageType::NfRegister,
                 Bytes::new(),
@@ -313,22 +311,22 @@ proptest! {
                 "NRF",
             )
             .with_field("nf_type", MessageField::String(nf_type.clone()));
-            
+
             {
                 let mut cap = capture.write().await;
                 cap.capture(nf_register);
             }
-            
+
             let cap = capture.read().await;
             let msgs = cap.messages_of_type(&MessageType::NfRegister);
-            
+
             prop_assert_eq!(msgs.len(), 1);
             prop_assert_eq!(msgs[0].get_string("nf_type"), Some(nf_type.as_str()));
-            
+
             Ok(())
         }).unwrap();
     }
-    
+
     /// Property 15.8: Diameter result codes are in valid range
     /// Feature: nextgcore-rust-conversion
     /// Validates: Requirement 15.5 - Diameter communication
@@ -337,7 +335,7 @@ proptest! {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let capture = Arc::new(RwLock::new(MessageCapture::new()));
-            
+
             let aia = CapturedMessage::new(
                 MessageType::AuthenticationInformationAnswer,
                 Bytes::new(),
@@ -345,27 +343,27 @@ proptest! {
                 "MME",
             )
             .with_field("result_code", MessageField::Number(result_code));
-            
+
             {
                 let mut cap = capture.write().await;
                 cap.capture(aia);
             }
-            
+
             let cap = capture.read().await;
             let msgs = cap.messages_of_type(&MessageType::AuthenticationInformationAnswer);
-            
+
             prop_assert_eq!(msgs.len(), 1);
             let stored_code = msgs[0].get_number("result_code").unwrap();
-            
-            // Diameter result codes: 1xxx (informational), 2xxx (success), 
+
+            // Diameter result codes: 1xxx (informational), 2xxx (success),
             // 3xxx (protocol errors), 4xxx (transient failures), 5xxx (permanent failures)
             prop_assert!(stored_code >= 1000);
             prop_assert!(stored_code < 6000);
-            
+
             Ok(())
         }).unwrap();
     }
-    
+
     /// Property 15.9: 5QI values are valid
     /// Feature: nextgcore-rust-conversion
     /// Validates: Requirement 15.4 - QoS handling
@@ -374,7 +372,7 @@ proptest! {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let capture = Arc::new(RwLock::new(MessageCapture::new()));
-            
+
             let session_msg = CapturedMessage::new(
                 MessageType::CreateSessionRequest,
                 Bytes::new(),
@@ -382,18 +380,18 @@ proptest! {
                 "SMF",
             )
             .with_field("qos_5qi", MessageField::Number(qos_5qi));
-            
+
             {
                 let mut cap = capture.write().await;
                 cap.capture(session_msg);
             }
-            
+
             let cap = capture.read().await;
             let msgs = cap.messages_of_type(&MessageType::CreateSessionRequest);
-            
+
             prop_assert_eq!(msgs.len(), 1);
             let stored_5qi = msgs[0].get_number("qos_5qi").unwrap();
-            
+
             // Valid 5QI ranges: 1-9 (standardized), 65-67, 69, 70, 75, 79, 80, 82-85 (standardized)
             // and 128-254 (operator-specific)
             prop_assert!(
@@ -402,7 +400,7 @@ proptest! {
                 (75..=85).contains(&stored_5qi) ||
                 (128..=254).contains(&stored_5qi)
             );
-            
+
             Ok(())
         }).unwrap();
     }
@@ -414,7 +412,7 @@ proptest! {
 
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(50))]
-    
+
     /// Property 15.10: Registration flow produces correct message sequence
     /// Feature: nextgcore-rust-conversion
     /// Validates: Requirement 15.6 - Message sequence equivalence
@@ -424,9 +422,9 @@ proptest! {
         rt.block_on(async {
             let mut env = MockEnvironment::new().with_amf();
             env.start_all().await.unwrap();
-            
+
             let capture = env.capture();
-            
+
             // Send registration request
             let reg_request = CapturedMessage::new(
                 MessageType::RegistrationRequest,
@@ -435,7 +433,7 @@ proptest! {
                 "AMF",
             );
             let _ = env.send_message(NfType::Amf, reg_request).await;
-            
+
             // Send auth response
             let auth_response = CapturedMessage::new(
                 MessageType::AuthenticationResponse,
@@ -444,7 +442,7 @@ proptest! {
                 "AMF",
             );
             let _ = env.send_message(NfType::Amf, auth_response).await;
-            
+
             // Send SMC complete
             let smc_complete = CapturedMessage::new(
                 MessageType::SecurityModeComplete,
@@ -453,7 +451,7 @@ proptest! {
                 "AMF",
             );
             let _ = env.send_message(NfType::Amf, smc_complete).await;
-            
+
             // Verify sequence
             let cap = capture.read().await;
             prop_assert!(cap.has_sequence(&[
@@ -461,12 +459,12 @@ proptest! {
                 MessageType::AuthenticationResponse,
                 MessageType::SecurityModeComplete,
             ]));
-            
+
             env.stop_all().await.unwrap();
             Ok(())
         }).unwrap();
     }
-    
+
     /// Property 15.11: Session establishment produces correct PFCP sequence
     /// Feature: nextgcore-rust-conversion
     /// Validates: Requirement 15.6 - Message sequence equivalence
@@ -475,7 +473,7 @@ proptest! {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let capture = Arc::new(RwLock::new(MessageCapture::new()));
-            
+
             // PFCP session establishment request
             let pfcp_req = CapturedMessage::new(
                 MessageType::SessionEstablishmentRequest,
@@ -484,12 +482,12 @@ proptest! {
                 "UPF",
             )
             .with_field("seid", MessageField::Number(seid));
-            
+
             {
                 let mut cap = capture.write().await;
                 cap.capture(pfcp_req);
             }
-            
+
             // PFCP session establishment response
             let pfcp_resp = CapturedMessage::new(
                 MessageType::SessionEstablishmentResponse,
@@ -498,27 +496,27 @@ proptest! {
                 "SMF",
             )
             .with_field("seid", MessageField::Number(seid));
-            
+
             {
                 let mut cap = capture.write().await;
                 cap.capture(pfcp_resp);
             }
-            
+
             // Verify sequence
             let cap = capture.read().await;
             prop_assert!(cap.has_sequence(&[
                 MessageType::SessionEstablishmentRequest,
                 MessageType::SessionEstablishmentResponse,
             ]));
-            
+
             // Verify SEID consistency
             let reqs = cap.messages_of_type(&MessageType::SessionEstablishmentRequest);
             let resps = cap.messages_of_type(&MessageType::SessionEstablishmentResponse);
-            
+
             prop_assert_eq!(reqs.len(), 1);
             prop_assert_eq!(resps.len(), 1);
             prop_assert_eq!(reqs[0].get_number("seid"), resps[0].get_number("seid"));
-            
+
             Ok(())
         }).unwrap();
     }
@@ -527,7 +525,7 @@ proptest! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_arb_imsi_format() {
         // Test that generated IMSIs have correct format using proptest runner
@@ -537,7 +535,7 @@ mod tests {
             assert!(imsi.chars().all(|c| c.is_ascii_digit()));
         });
     }
-    
+
     #[test]
     fn test_arb_supi_format() {
         proptest::proptest!(|(supi in arb_supi())| {

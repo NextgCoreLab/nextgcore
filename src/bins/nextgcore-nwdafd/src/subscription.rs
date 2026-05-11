@@ -126,11 +126,10 @@ impl AnalyticsSubscription {
             .as_secs();
         match self.notification_method {
             NotificationMethod::OneShot => self.notification_count == 0,
-            NotificationMethod::Periodic(interval) => {
-                self.last_notified_at
-                    .map(|last| now.saturating_sub(last) >= interval)
-                    .unwrap_or(true)
-            }
+            NotificationMethod::Periodic(interval) => self
+                .last_notified_at
+                .map(|last| now.saturating_sub(last) >= interval)
+                .unwrap_or(true),
             NotificationMethod::OnChange => false, // driven by events, not timer
         }
     }
@@ -163,10 +162,7 @@ impl SubscriptionManager {
     }
 
     /// Adds a new subscription. Returns Err if capacity exceeded.
-    pub fn create(
-        &mut self,
-        sub: AnalyticsSubscription,
-    ) -> Result<String, String> {
+    pub fn create(&mut self, sub: AnalyticsSubscription) -> Result<String, String> {
         if self.subscriptions.len() >= self.max_subscriptions {
             return Err(format!(
                 "Subscription capacity exceeded ({}/{})",
@@ -204,7 +200,9 @@ impl SubscriptionManager {
 
     /// Removes expired subscriptions, returns count removed
     pub fn cleanup_expired(&mut self) -> usize {
-        let expired: Vec<_> = self.subscriptions.values()
+        let expired: Vec<_> = self
+            .subscriptions
+            .values()
             .filter(|s| s.is_expired())
             .map(|s| s.subscription_id.clone())
             .collect();

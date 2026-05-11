@@ -2,8 +2,8 @@
 //!
 //! Types and constants for GTPv1 protocol as specified in 3GPP TS 29.060.
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::error::{GtpError, GtpResult};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// GTPv1 Extension Header Types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,7 +25,9 @@ impl TryFrom<u8> for ExtensionHeaderType {
             0x00 => Ok(ExtensionHeaderType::NoMoreExtensionHeaders),
             0x40 => Ok(ExtensionHeaderType::UdpPort),
             0x85 => Ok(ExtensionHeaderType::PduSessionContainer),
-            _ => Err(GtpError::InvalidFormat(format!("Unknown extension header type: {value:#x}"))),
+            _ => Err(GtpError::InvalidFormat(format!(
+                "Unknown extension header type: {value:#x}"
+            ))),
         }
     }
 }
@@ -47,7 +49,9 @@ impl TryFrom<u8> for PduType {
         match value {
             0 => Ok(PduType::DlPduSessionInformation),
             1 => Ok(PduType::UlPduSessionInformation),
-            _ => Err(GtpError::InvalidFormat(format!("Unknown PDU type: {value}"))),
+            _ => Err(GtpError::InvalidFormat(format!(
+                "Unknown PDU type: {value}"
+            ))),
         }
     }
 }
@@ -98,16 +102,16 @@ impl ExtensionHeader {
         buf.put_u8(self.n_pdu_number);
         buf.put_u8(self.header_type);
         buf.put_u8(self.length);
-        
+
         // PDU type (4 bits) | spare (4 bits)
         buf.put_u8((self.pdu_type & 0x0F) << 4);
-        
+
         // Paging policy presence (1 bit) | Reflective QoS indicator (1 bit) | QFI (6 bits)
         let byte = ((self.paging_policy_presence as u8) << 7)
             | ((self.reflective_qos_indicator as u8) << 6)
             | (self.qos_flow_identifier & 0x3F);
         buf.put_u8(byte);
-        
+
         buf.put_u8(self.next_type);
     }
 
@@ -124,15 +128,15 @@ impl ExtensionHeader {
         let n_pdu_number = buf.get_u8();
         let header_type = buf.get_u8();
         let length = buf.get_u8();
-        
+
         let pdu_byte = buf.get_u8();
         let pdu_type = (pdu_byte >> 4) & 0x0F;
-        
+
         let qfi_byte = buf.get_u8();
         let paging_policy_presence = (qfi_byte >> 7) & 0x01 != 0;
         let reflective_qos_indicator = (qfi_byte >> 6) & 0x01 != 0;
         let qos_flow_identifier = qfi_byte & 0x3F;
-        
+
         let next_type = buf.get_u8();
 
         Ok(Self {
@@ -197,12 +201,12 @@ pub enum Cause {
     PdpAddressInactivityTimerExp = 7,
     NetworkFailure = 8,
     QosParameterMismatch = 9,
-    
+
     // Acceptance causes (128-191)
     RequestAccepted = 128,
     NewPdpTypeDueToNetworkPreference = 129,
     NewPdpTypeDueToSingleAddressBearerOnly = 130,
-    
+
     // Rejection causes (192-255)
     NonExistent = 192,
     InvalidMessageFormat = 193,
@@ -402,7 +406,9 @@ impl TryFrom<u8> for RatType {
             4 => Ok(RatType::Gan),
             5 => Ok(RatType::HspaEvolution),
             6 => Ok(RatType::Eutran),
-            _ => Err(GtpError::InvalidFormat(format!("Unknown RAT type: {value}"))),
+            _ => Err(GtpError::InvalidFormat(format!(
+                "Unknown RAT type: {value}"
+            ))),
         }
     }
 }
@@ -527,10 +533,24 @@ impl Uli {
         let value = buf.get_u16();
 
         match geo_loc_type {
-            0 => Ok(Uli::Cgi(UliCgi { plmn_id, lac, ci: value })),
-            1 => Ok(Uli::Sai(UliSai { plmn_id, lac, sac: value })),
-            2 => Ok(Uli::Rai(UliRai { plmn_id, lac, rac: value })),
-            _ => Err(GtpError::InvalidFormat(format!("Unknown geo location type: {geo_loc_type}"))),
+            0 => Ok(Uli::Cgi(UliCgi {
+                plmn_id,
+                lac,
+                ci: value,
+            })),
+            1 => Ok(Uli::Sai(UliSai {
+                plmn_id,
+                lac,
+                sac: value,
+            })),
+            2 => Ok(Uli::Rai(UliRai {
+                plmn_id,
+                lac,
+                rac: value,
+            })),
+            _ => Err(GtpError::InvalidFormat(format!(
+                "Unknown geo location type: {geo_loc_type}"
+            ))),
         }
     }
 }
@@ -576,7 +596,9 @@ impl GsnAddress {
                 buf.copy_to_slice(&mut addr);
                 Ok(GsnAddress::Ipv6(addr))
             }
-            _ => Err(GtpError::InvalidFormat(format!("Invalid GSN address length: {len}"))),
+            _ => Err(GtpError::InvalidFormat(format!(
+                "Invalid GSN address length: {len}"
+            ))),
         }
     }
 }

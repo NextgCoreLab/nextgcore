@@ -128,11 +128,9 @@ impl UrspRule {
         Self {
             precedence: 255,
             traffic_descriptors: vec![
-                TrafficDescriptor::new(vec![]) // empty TD matches all
+                TrafficDescriptor::new(vec![]), // empty TD matches all
             ],
-            route_selection_descriptors: vec![
-                RouteSelectionDescriptor::default_internet()
-            ],
+            route_selection_descriptors: vec![RouteSelectionDescriptor::default_internet()],
         }
     }
 
@@ -140,12 +138,8 @@ impl UrspRule {
     pub fn ims_rule() -> Self {
         Self {
             precedence: 10,
-            traffic_descriptors: vec![
-                TrafficDescriptor::for_dnn("ims"),
-            ],
-            route_selection_descriptors: vec![
-                RouteSelectionDescriptor::ims_voice()
-            ],
+            traffic_descriptors: vec![TrafficDescriptor::for_dnn("ims")],
+            route_selection_descriptors: vec![RouteSelectionDescriptor::ims_voice()],
         }
     }
 }
@@ -171,16 +165,20 @@ impl UePolicyContext {
 
     /// Returns the URSP rules for a UE, or empty slice
     pub fn get_ursp(&self, supi: &str) -> &[UrspRule] {
-        self.ursp_rules.get(supi).map(|v| v.as_slice()).unwrap_or(&[])
+        self.ursp_rules
+            .get(supi)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Returns the first matching rule for a given DNN (simplified matching)
     pub fn find_rule_for_dnn<'a>(&'a self, supi: &str, dnn: &str) -> Option<&'a UrspRule> {
         self.ursp_rules.get(supi)?.iter().find(|rule| {
             rule.traffic_descriptors.iter().any(|td| {
-                td.components.iter().any(|c| {
-                    matches!(c, TrafficDescriptorComponent::Dnn(d) if d == dnn)
-                }) || td.components.is_empty() // catch-all
+                td.components
+                    .iter()
+                    .any(|c| matches!(c, TrafficDescriptorComponent::Dnn(d) if d == dnn))
+                    || td.components.is_empty() // catch-all
             })
         })
     }
@@ -214,21 +212,23 @@ mod tests {
     #[test]
     fn test_ue_policy_provision_and_find() {
         let mut ctx = UePolicyContext::new();
-        ctx.provision_ursp("imsi-001011234567890".into(), vec![
-            UrspRule::ims_rule(),
-            UrspRule::catch_all(),
-        ]);
-        let rule = ctx.find_rule_for_dnn("imsi-001011234567890", "ims").unwrap();
+        ctx.provision_ursp(
+            "imsi-001011234567890".into(),
+            vec![UrspRule::ims_rule(), UrspRule::catch_all()],
+        );
+        let rule = ctx
+            .find_rule_for_dnn("imsi-001011234567890", "ims")
+            .unwrap();
         assert_eq!(rule.precedence, 10);
     }
 
     #[test]
     fn test_find_catch_all_for_unknown_dnn() {
         let mut ctx = UePolicyContext::new();
-        ctx.provision_ursp("imsi-001011234567890".into(), vec![
-            UrspRule::catch_all(),
-        ]);
-        let rule = ctx.find_rule_for_dnn("imsi-001011234567890", "foobar").unwrap();
+        ctx.provision_ursp("imsi-001011234567890".into(), vec![UrspRule::catch_all()]);
+        let rule = ctx
+            .find_rule_for_dnn("imsi-001011234567890", "foobar")
+            .unwrap();
         assert_eq!(rule.precedence, 255);
     }
 
@@ -244,12 +244,15 @@ mod tests {
     #[test]
     fn test_rules_sorted_by_precedence() {
         let mut ctx = UePolicyContext::new();
-        ctx.provision_ursp("ue1".into(), vec![
-            UrspRule::catch_all(),    // precedence 255
-            UrspRule::ims_rule(),     // precedence 10
-        ]);
+        ctx.provision_ursp(
+            "ue1".into(),
+            vec![
+                UrspRule::catch_all(), // precedence 255
+                UrspRule::ims_rule(),  // precedence 10
+            ],
+        );
         let rules = ctx.get_ursp("ue1");
-        assert_eq!(rules[0].precedence, 10);  // lowest number first
+        assert_eq!(rules[0].precedence, 10); // lowest number first
         assert_eq!(rules[1].precedence, 255);
     }
 

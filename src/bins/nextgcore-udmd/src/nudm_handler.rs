@@ -262,12 +262,8 @@ pub fn udm_nudm_ueau_handle_get(
                 return (HandlerResult::bad_request("RAND conversion failed"), None);
             }
         };
-        let (sqn_ms, mac_s) = match kdf::ogs_auc_sqn(
-            &udm_ue.opc,
-            &udm_ue.k,
-            rand_arr,
-            &conc_sqn_ms,
-        ) {
+        let (sqn_ms, mac_s) = match kdf::ogs_auc_sqn(&udm_ue.opc, &udm_ue.k, rand_arr, &conc_sqn_ms)
+        {
             Ok(result) => result,
             Err(e) => {
                 log::error!("[{}] SQN extraction failed: {:?}", udm_ue.suci, e);
@@ -296,7 +292,11 @@ pub fn udm_nudm_ueau_handle_get(
         }
         drop(context);
 
-        log::debug!("[{}] SQN resynchronization completed (new SQN=0x{:012x})", udm_ue.suci, new_sqn);
+        log::debug!(
+            "[{}] SQN resynchronization completed (new SQN=0x{:012x})",
+            udm_ue.suci,
+            new_sqn
+        );
     }
 
     // Send request to UDR for authentication subscription
@@ -323,7 +323,10 @@ pub fn udm_nudm_ueau_handle_result_confirmation_inform(
     };
     drop(context);
 
-    log::debug!("[{}] Handle NUDM UEAU result confirmation inform", udm_ue.suci);
+    log::debug!(
+        "[{}] Handle NUDM UEAU result confirmation inform",
+        udm_ue.suci
+    );
 
     // Validate AuthEvent
     let nf_instance_id = match &request.nf_instance_id {
@@ -785,7 +788,11 @@ pub fn udm_nudm_uecm_handle_smf_deregistration(sess_id: u64, _stream_id: u64) ->
     drop(context);
 
     let supi = udm_ue.supi.clone().unwrap_or_else(|| udm_ue.suci.clone());
-    log::debug!("[{}:{}] Handle NUDM UECM SMF deregistration", supi, sess.psi);
+    log::debug!(
+        "[{}:{}] Handle NUDM UECM SMF deregistration",
+        supi,
+        sess.psi
+    );
 
     // Send request to UDR to delete SMF context
     HandlerResult::ok()
@@ -848,12 +855,24 @@ pub fn udm_nudm_sdm_handle_subscription_create(
     log::debug!("[{supi}] Handle NUDM SDM subscription create");
 
     // Validate SDMSubscription
-    if request.nf_instance_id.is_none() || request.nf_instance_id.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+    if request.nf_instance_id.is_none()
+        || request
+            .nf_instance_id
+            .as_ref()
+            .map(|s| s.is_empty())
+            .unwrap_or(true)
+    {
         log::error!("[{supi}] No nfInstanceId");
         return (HandlerResult::bad_request("No nfInstanceId"), None);
     }
 
-    if request.callback_reference.is_none() || request.callback_reference.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+    if request.callback_reference.is_none()
+        || request
+            .callback_reference
+            .as_ref()
+            .map(|s| s.is_empty())
+            .unwrap_or(true)
+    {
         log::error!("[{supi}] No callbackReference");
         return (HandlerResult::bad_request("No callbackReference"), None);
     }
@@ -872,7 +891,10 @@ pub fn udm_nudm_sdm_handle_subscription_create(
         }
         None => {
             log::error!("[{supi}] sdm_subscription_add() failed");
-            return (HandlerResult::bad_request("sdm_subscription_add() failed"), None);
+            return (
+                HandlerResult::bad_request("sdm_subscription_add() failed"),
+                None,
+            );
         }
     };
     drop(context);
@@ -977,7 +999,6 @@ fn guami_matches(a: &Guami, b: &Guami) -> bool {
         && a.amf_id.set == b.amf_id.set
         && a.amf_id.pointer == b.amf_id.pointer
 }
-
 
 #[cfg(test)]
 mod tests {

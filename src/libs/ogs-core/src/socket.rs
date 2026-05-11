@@ -117,7 +117,8 @@ pub fn ogs_sock_listen(sock: &OgsSock) -> i32 {
 /// Accept connection on socket (identical to ogs_sock_accept)
 pub fn ogs_sock_accept(sock: &OgsSock) -> Option<OgsSock> {
     let mut addr_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut addrlen: libc::socklen_t = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let mut addrlen: libc::socklen_t =
+        std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
 
     let new_fd = unsafe {
         libc::accept(
@@ -180,7 +181,8 @@ pub fn ogs_recv(fd: OgsSocket, buf: &mut [u8], flags: i32) -> isize {
 /// Receive data with source address (identical to ogs_recvfrom)
 pub fn ogs_recvfrom(fd: OgsSocket, buf: &mut [u8], flags: i32) -> (isize, Option<OgsSockaddr>) {
     let mut addr_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut addrlen: libc::socklen_t = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    let mut addrlen: libc::socklen_t =
+        std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
 
     let n = unsafe {
         libc::recvfrom(
@@ -225,7 +227,13 @@ fn sockaddr_to_raw(addr: &OgsSockaddr) -> ([u8; 128], libc::socklen_t) {
 
     match addr.addr {
         std::net::SocketAddr::V4(v4) => {
-            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            ))]
             let sin: libc::sockaddr_in = libc::sockaddr_in {
                 sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
                 sin_family: libc::AF_INET as libc::sa_family_t,
@@ -235,7 +243,13 @@ fn sockaddr_to_raw(addr: &OgsSockaddr) -> ([u8; 128], libc::socklen_t) {
                 },
                 sin_zero: [0; 8],
             };
-            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd")))]
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            )))]
             let sin: libc::sockaddr_in = libc::sockaddr_in {
                 sin_family: libc::AF_INET as libc::sa_family_t,
                 sin_port: v4.port().to_be(),
@@ -251,10 +265,19 @@ fn sockaddr_to_raw(addr: &OgsSockaddr) -> ([u8; 128], libc::socklen_t) {
                 )
             };
             storage[..sin_bytes.len()].copy_from_slice(sin_bytes);
-            (storage, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t)
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
         }
         std::net::SocketAddr::V6(v6) => {
-            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            ))]
             let sin6: libc::sockaddr_in6 = libc::sockaddr_in6 {
                 sin6_len: std::mem::size_of::<libc::sockaddr_in6>() as u8,
                 sin6_family: libc::AF_INET6 as libc::sa_family_t,
@@ -265,7 +288,13 @@ fn sockaddr_to_raw(addr: &OgsSockaddr) -> ([u8; 128], libc::socklen_t) {
                 },
                 sin6_scope_id: v6.scope_id(),
             };
-            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd")))]
+            #[cfg(not(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd"
+            )))]
             let sin6: libc::sockaddr_in6 = libc::sockaddr_in6 {
                 sin6_family: libc::AF_INET6 as libc::sa_family_t,
                 sin6_port: v6.port().to_be(),
@@ -282,13 +311,19 @@ fn sockaddr_to_raw(addr: &OgsSockaddr) -> ([u8; 128], libc::socklen_t) {
                 )
             };
             storage[..sin6_bytes.len()].copy_from_slice(sin6_bytes);
-            (storage, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t)
+            (
+                storage,
+                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+            )
         }
     }
 }
 
 /// Convert raw sockaddr to OgsSockaddr
-fn raw_to_sockaddr(storage: &libc::sockaddr_storage, _addrlen: libc::socklen_t) -> Option<OgsSockaddr> {
+fn raw_to_sockaddr(
+    storage: &libc::sockaddr_storage,
+    _addrlen: libc::socklen_t,
+) -> Option<OgsSockaddr> {
     let family = storage.ss_family as i32;
 
     match family {

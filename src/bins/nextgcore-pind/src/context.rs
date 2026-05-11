@@ -107,9 +107,15 @@ impl PinContext {
         if !self.initialized.load(Ordering::SeqCst) {
             return;
         }
-        if let Ok(mut pins) = self.pin_networks.write() { pins.clear(); }
-        if let Ok(mut elements) = self.elements.write() { elements.clear(); }
-        if let Ok(mut owners) = self.owner_index.write() { owners.clear(); }
+        if let Ok(mut pins) = self.pin_networks.write() {
+            pins.clear();
+        }
+        if let Ok(mut elements) = self.elements.write() {
+            elements.clear();
+        }
+        if let Ok(mut owners) = self.owner_index.write() {
+            owners.clear();
+        }
         self.initialized.store(false, Ordering::SeqCst);
         log::info!("PIN context finalized");
     }
@@ -143,7 +149,8 @@ impl PinContext {
             active: true,
         };
 
-        owners.entry(owner_supi.to_string())
+        owners
+            .entry(owner_supi.to_string())
             .or_default()
             .push(pin_id.clone());
         pins.insert(pin_id, pin.clone());
@@ -183,14 +190,16 @@ impl PinContext {
         let owners = self.owner_index.read().unwrap();
         let pins = self.pin_networks.read().unwrap();
 
-        owners.get(supi)
+        owners
+            .get(supi)
             .map(|ids| ids.iter().filter_map(|id| pins.get(id).cloned()).collect())
             .expect("value expected")
     }
 
     /// List all PINs
     pub fn pin_list(&self) -> Vec<PersonalIotNetwork> {
-        self.pin_networks.read()
+        self.pin_networks
+            .read()
             .map(|p| p.values().cloned().collect())
             .expect("value expected")
     }
@@ -232,7 +241,12 @@ impl PinContext {
         pin.member_ids.push(element_id.clone());
         elements.insert(element_id, element.clone());
 
-        log::info!("PIN Element registered: {} (type={:?}, pin={})", element.element_id, element_type, pin_id);
+        log::info!(
+            "PIN Element registered: {} (type={:?}, pin={})",
+            element.element_id,
+            element_type,
+            pin_id
+        );
         Some(element)
     }
 
@@ -269,13 +283,12 @@ impl PinContext {
             None => return vec![],
         };
 
-        pin.member_ids.iter()
+        pin.member_ids
+            .iter()
             .filter_map(|id| elements.get(id))
-            .filter(|e| {
-                match capability {
-                    Some(cap) => e.capabilities.iter().any(|c| c == cap),
-                    None => true,
-                }
+            .filter(|e| match capability {
+                Some(cap) => e.capabilities.iter().any(|c| c == cap),
+                None => true,
             })
             .cloned()
             .collect()
@@ -304,7 +317,8 @@ impl Default for PinContext {
 }
 
 /// Global PIN context
-static GLOBAL_PIN_CONTEXT: std::sync::OnceLock<Arc<RwLock<PinContext>>> = std::sync::OnceLock::new();
+static GLOBAL_PIN_CONTEXT: std::sync::OnceLock<Arc<RwLock<PinContext>>> =
+    std::sync::OnceLock::new();
 
 pub fn pin_self() -> Arc<RwLock<PinContext>> {
     GLOBAL_PIN_CONTEXT
@@ -342,7 +356,9 @@ mod tests {
         let mut ctx = PinContext::new();
         ctx.init(64);
 
-        let pin = ctx.pin_create("My Smart Home", "imsi-001010000000001").unwrap();
+        let pin = ctx
+            .pin_create("My Smart Home", "imsi-001010000000001")
+            .unwrap();
         assert!(pin.active);
         assert_eq!(ctx.pin_count(), 1);
 
@@ -371,14 +387,18 @@ mod tests {
         let mut ctx = PinContext::new();
         ctx.init(64);
 
-        let pin = ctx.pin_create("Smart Home", "imsi-001010000000001").unwrap();
+        let pin = ctx
+            .pin_create("Smart Home", "imsi-001010000000001")
+            .unwrap();
 
-        let gw = ctx.element_register(
-            &pin.pin_id,
-            PinElementType::Gateway,
-            vec!["relay".to_string(), "routing".to_string()],
-            Some("imsi-001010000000001".to_string()),
-        ).unwrap();
+        let gw = ctx
+            .element_register(
+                &pin.pin_id,
+                PinElementType::Gateway,
+                vec!["relay".to_string(), "routing".to_string()],
+                Some("imsi-001010000000001".to_string()),
+            )
+            .unwrap();
 
         assert_eq!(gw.element_type, PinElementType::Gateway);
         assert_eq!(ctx.element_count(), 1);
@@ -393,15 +413,19 @@ mod tests {
         let mut ctx = PinContext::new();
         ctx.init(64);
 
-        let pin = ctx.pin_create("Smart Home", "imsi-001010000000001").unwrap();
+        let pin = ctx
+            .pin_create("Smart Home", "imsi-001010000000001")
+            .unwrap();
 
         ctx.element_register(
-            &pin.pin_id, PinElementType::Element,
+            &pin.pin_id,
+            PinElementType::Element,
             vec!["temperature".to_string(), "humidity".to_string()],
             None,
         );
         ctx.element_register(
-            &pin.pin_id, PinElementType::Element,
+            &pin.pin_id,
+            PinElementType::Element,
             vec!["camera".to_string()],
             None,
         );
@@ -421,11 +445,17 @@ mod tests {
         let mut ctx = PinContext::new();
         ctx.init(64);
 
-        let pin = ctx.pin_create("Smart Home", "imsi-001010000000001").unwrap();
-        let elem = ctx.element_register(
-            &pin.pin_id, PinElementType::Element,
-            vec!["sensor".to_string()], None,
-        ).unwrap();
+        let pin = ctx
+            .pin_create("Smart Home", "imsi-001010000000001")
+            .unwrap();
+        let elem = ctx
+            .element_register(
+                &pin.pin_id,
+                PinElementType::Element,
+                vec!["sensor".to_string()],
+                None,
+            )
+            .unwrap();
 
         assert!(ctx.element_set_relay(&elem.element_id, vec!["pe-gw".to_string()]));
         let found = ctx.element_find(&elem.element_id).unwrap();

@@ -2,9 +2,9 @@
 //!
 //! PFCP message header as specified in 3GPP TS 29.244.
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::error::{PfcpError, PfcpResult};
 use crate::types::PFCP_VERSION;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// PFCP Header length without SEID (8 bytes)
 pub const PFCP_HEADER_LEN: usize = 8;
@@ -34,7 +34,7 @@ pub enum PfcpMessageType {
     SessionSetDeletionResponse = 15,
     SessionSetModificationRequest = 16,
     SessionSetModificationResponse = 17,
-    
+
     // Session related messages (with SEID)
     SessionEstablishmentRequest = 50,
     SessionEstablishmentResponse = 51,
@@ -129,9 +129,8 @@ impl PfcpMessageType {
     }
 }
 
-
 /// PFCP Header structure
-/// 
+///
 /// Format (without SEID - 8 bytes):
 /// ```text
 /// +-------+-------+-------+-------+-------+-------+-------+-------+
@@ -144,7 +143,7 @@ impl PfcpMessageType {
 /// |  Spare                                                        |
 /// +-------+-------+-------+-------+-------+-------+-------+-------+
 /// ```
-/// 
+///
 /// Format (with SEID - 16 bytes):
 /// ```text
 /// +-------+-------+-------+-------+-------+-------+-------+-------+
@@ -224,22 +223,22 @@ impl PfcpHeader {
             | ((self.seid_presence as u8) << 2)
             | ((self.message_priority as u8) << 1);
         buf.put_u8(first_byte);
-        
+
         // Message type
         buf.put_u8(self.message_type as u8);
-        
+
         // Message length
         buf.put_u16(self.length);
-        
+
         // SEID (if present)
         if let Some(seid) = self.seid {
             buf.put_u64(seid);
         }
-        
+
         // Sequence number (3 bytes) + spare/priority (1 byte)
         let seq_bytes = self.sequence_number.to_be_bytes();
         buf.put_slice(&seq_bytes[1..4]); // Only 3 bytes
-        
+
         // Priority or spare
         let last_byte = self.priority.unwrap_or(0) << 4;
         buf.put_u8(last_byte);
@@ -315,10 +314,10 @@ mod tests {
         let header = PfcpHeader::new(PfcpMessageType::HeartbeatRequest, 12345);
         let mut buf = BytesMut::new();
         header.encode(&mut buf);
-        
+
         let mut bytes = buf.freeze();
         let decoded = PfcpHeader::decode(&mut bytes).unwrap();
-        
+
         assert_eq!(decoded.version, PFCP_VERSION);
         assert_eq!(decoded.message_type, PfcpMessageType::HeartbeatRequest);
         assert_eq!(decoded.sequence_number, 12345);
@@ -335,12 +334,15 @@ mod tests {
         );
         let mut buf = BytesMut::new();
         header.encode(&mut buf);
-        
+
         let mut bytes = buf.freeze();
         let decoded = PfcpHeader::decode(&mut bytes).unwrap();
-        
+
         assert_eq!(decoded.version, PFCP_VERSION);
-        assert_eq!(decoded.message_type, PfcpMessageType::SessionEstablishmentRequest);
+        assert_eq!(
+            decoded.message_type,
+            PfcpMessageType::SessionEstablishmentRequest
+        );
         assert_eq!(decoded.sequence_number, 54321);
         assert!(decoded.seid_presence);
         assert_eq!(decoded.seid, Some(0x123456789ABCDEF0));

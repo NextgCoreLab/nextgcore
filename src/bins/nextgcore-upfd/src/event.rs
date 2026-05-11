@@ -235,8 +235,14 @@ mod tests {
 
     #[test]
     fn test_from_signal() {
-        assert_eq!(UpfEventId::from_signal(OGS_FSM_ENTRY_SIG), UpfEventId::FsmEntry);
-        assert_eq!(UpfEventId::from_signal(OGS_FSM_EXIT_SIG), UpfEventId::FsmExit);
+        assert_eq!(
+            UpfEventId::from_signal(OGS_FSM_ENTRY_SIG),
+            UpfEventId::FsmEntry
+        );
+        assert_eq!(
+            UpfEventId::from_signal(OGS_FSM_EXIT_SIG),
+            UpfEventId::FsmExit
+        );
         assert_eq!(UpfEventId::from_signal(99), UpfEventId::N4Message);
     }
 }

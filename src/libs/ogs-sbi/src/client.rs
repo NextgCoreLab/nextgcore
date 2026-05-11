@@ -195,13 +195,10 @@ impl SbiClient {
     async fn connect(&self) -> SbiResult<SendRequest<Full<Bytes>>> {
         let addr = format!("{}:{}", self.config.host, self.config.port);
 
-        let stream = tokio::time::timeout(
-            self.config.connect_timeout,
-            TcpStream::connect(&addr),
-        )
-        .await
-        .map_err(|_| SbiError::Timeout)?
-        .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
+        let stream = tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(&addr))
+            .await
+            .map_err(|_| SbiError::Timeout)?
+            .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
 
         if self.config.scheme == UriScheme::Https {
             let connector = self.build_tls_connector()?;
@@ -218,12 +215,10 @@ impl SbiClient {
 
             let io = TokioIo::new(tls_stream);
 
-            let (sender, conn) = hyper::client::conn::http2::handshake(
-                hyper_util::rt::TokioExecutor::new(),
-                io,
-            )
-            .await
-            .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
+            let (sender, conn) =
+                hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
+                    .await
+                    .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
 
             tokio::spawn(async move {
                 if let Err(e) = conn.await {
@@ -235,12 +230,10 @@ impl SbiClient {
         } else {
             let io = TokioIo::new(stream);
 
-            let (sender, conn) = hyper::client::conn::http2::handshake(
-                hyper_util::rt::TokioExecutor::new(),
-                io,
-            )
-            .await
-            .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
+            let (sender, conn) =
+                hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
+                    .await
+                    .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
 
             tokio::spawn(async move {
                 if let Err(e) = conn.await {
@@ -255,7 +248,7 @@ impl SbiClient {
     /// Get or create a connection
     async fn get_connection(&self) -> SbiResult<SendRequest<Full<Bytes>>> {
         let mut conn_guard = self.connection.lock().await;
-        
+
         if let Some(ref state) = *conn_guard {
             if state.sender.is_ready() {
                 return Ok(state.sender.clone());
@@ -264,7 +257,9 @@ impl SbiClient {
 
         // Create new connection
         let sender = self.connect().await?;
-        *conn_guard = Some(ConnectionState { sender: sender.clone() });
+        *conn_guard = Some(ConnectionState {
+            sender: sender.clone(),
+        });
         Ok(sender)
     }
 
@@ -300,15 +295,11 @@ impl SbiClient {
                 let ns = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .expect("value expected")
-                    .as_nanos() as u128;
+                    .as_nanos();
                 ns.to_be_bytes()
             };
             let span_id = new_span_id();
-            let traceparent = format!(
-                "00-{}-{}-01",
-                hex::encode(trace_id),
-                hex::encode(span_id),
-            );
+            let traceparent = format!("00-{}-{}-01", hex::encode(trace_id), hex::encode(span_id),);
             request.http.set_header("traceparent", traceparent);
         }
 
@@ -357,9 +348,7 @@ impl SbiClient {
             .unwrap_or_else(|| Full::new(Bytes::new()));
 
         // Build the HTTP request
-        let mut req_builder = Request::builder()
-            .method(method)
-            .uri(uri);
+        let mut req_builder = Request::builder().method(method).uri(uri);
 
         // Add headers
         for (key, value) in &request.http.headers {
@@ -389,7 +378,7 @@ impl SbiClient {
         response: hyper::Response<Incoming>,
     ) -> SbiResult<SbiResponse> {
         let status = response.status().as_u16();
-        
+
         // Extract headers
         let mut headers = HashMap::new();
         for (key, value) in response.headers() {
@@ -430,8 +419,7 @@ impl SbiClient {
         path: &str,
         body: &T,
     ) -> SbiResult<SbiResponse> {
-        let request = SbiRequest::post(path)
-            .with_json_body(body)?;
+        let request = SbiRequest::post(path).with_json_body(body)?;
         self.send_request(request).await
     }
 
@@ -441,8 +429,7 @@ impl SbiClient {
         path: &str,
         body: &T,
     ) -> SbiResult<SbiResponse> {
-        let request = SbiRequest::put(path)
-            .with_json_body(body)?;
+        let request = SbiRequest::put(path).with_json_body(body)?;
         self.send_request(request).await
     }
 
@@ -457,8 +444,7 @@ impl SbiClient {
         path: &str,
         body: &T,
     ) -> SbiResult<SbiResponse> {
-        let request = SbiRequest::patch(path)
-            .with_json_body(body)?;
+        let request = SbiRequest::patch(path).with_json_body(body)?;
         self.send_request(request).await
     }
 
@@ -479,11 +465,7 @@ pub type ClientCallback = Box<dyn Fn(SbiResult<SbiResponse>) + Send + Sync>;
 fn derive_scope_from_uri(uri: &str) -> String {
     let path = uri.split('?').next().unwrap_or(uri);
     let trimmed = path.trim_start_matches('/');
-    trimmed
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .to_string()
+    trimmed.split('/').next().unwrap_or("").to_string()
 }
 
 #[cfg(test)]

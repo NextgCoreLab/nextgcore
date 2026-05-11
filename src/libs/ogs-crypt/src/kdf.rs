@@ -11,8 +11,8 @@
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use crate::sha::{sha256, SHA256_DIGEST_SIZE};
 use crate::milenage;
+use crate::sha::{sha256, SHA256_DIGEST_SIZE};
 
 // Length constants
 pub const OGS_KEY_LEN: usize = 16;
@@ -54,7 +54,6 @@ struct KdfParam {
     len: u16,
 }
 
-
 /// Common KDF function as defined in TS 33.220 clause B.2.0
 ///
 /// This is the core key derivation function used by all other KDF functions.
@@ -87,7 +86,7 @@ fn ogs_kdf_common(key: &[u8], fc: u8, params: &[KdfParam]) -> [u8; SHA256_DIGEST
     let mut mac = HmacSha256::new_from_slice(key).expect("value expected");
     mac.update(&s);
     let result = mac.finalize();
-    
+
     let mut output = [0u8; SHA256_DIGEST_SIZE];
     output.copy_from_slice(&result.into_bytes());
     output
@@ -132,7 +131,11 @@ pub fn ogs_kdf_xres_star(
     key[..OGS_KEY_LEN].copy_from_slice(ck);
     key[OGS_KEY_LEN..].copy_from_slice(ik);
 
-    let mut params = [KdfParam::default(), KdfParam::default(), KdfParam::default()];
+    let mut params = [
+        KdfParam::default(),
+        KdfParam::default(),
+        KdfParam::default(),
+    ];
     params[0].buf = Some(serving_network_name.as_bytes().to_vec());
     params[0].len = serving_network_name.len() as u16;
     params[1].buf = Some(rand.to_vec());
@@ -266,7 +269,11 @@ pub fn ogs_kdf_nh_gnb(
 pub fn ogs_kdf_ansi_x963(
     z: &[u8],
     info: &[u8],
-) -> ([u8; OGS_KEY_LEN], [u8; OGS_IVEC_LEN], [u8; SHA256_DIGEST_SIZE]) {
+) -> (
+    [u8; OGS_KEY_LEN],
+    [u8; OGS_IVEC_LEN],
+    [u8; SHA256_DIGEST_SIZE],
+) {
     let counter_len = 4;
 
     // First iteration: counter = 1
@@ -326,10 +333,7 @@ pub fn ogs_auc_kasme(
 /// TS33.401 Annex A.3: KeNB derivation function
 ///
 /// Derives KeNB from KASME and uplink NAS COUNT.
-pub fn ogs_kdf_kenb(
-    kasme: &[u8; SHA256_DIGEST_SIZE],
-    ul_count: u32,
-) -> [u8; SHA256_DIGEST_SIZE] {
+pub fn ogs_kdf_kenb(kasme: &[u8; SHA256_DIGEST_SIZE], ul_count: u32) -> [u8; SHA256_DIGEST_SIZE] {
     let ul_count_be = ul_count.to_be_bytes();
 
     let mut params = [KdfParam::default()];
@@ -403,10 +407,7 @@ pub fn ogs_kdf_ck_ik_handover(
 ///
 /// Derives NAS token from KASME and uplink NAS COUNT.
 /// Returns the 2-byte NAS token.
-pub fn ogs_kdf_nas_token(
-    ul_count: u32,
-    kasme: &[u8; SHA256_DIGEST_SIZE],
-) -> [u8; 2] {
+pub fn ogs_kdf_nas_token(ul_count: u32, kasme: &[u8; SHA256_DIGEST_SIZE]) -> [u8; 2] {
     let ul_count_bytes = ul_count.to_ne_bytes(); // Note: C code uses native byte order here
 
     let mut params = [KdfParam::default()];

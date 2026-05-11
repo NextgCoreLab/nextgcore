@@ -21,10 +21,10 @@
 //! - Treiber, "Systems Programming: Coping with Parallelism"
 //! - Cliff Click, "A Lock-Free Hash Table"
 
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use std::ptr;
-use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
 // ============================================================================
 // Lock-Free Queue (Michael-Scott Queue)
@@ -91,12 +91,12 @@ impl<T> LockFreeQueue<T> {
             if tail == self.tail.load(Ordering::Acquire) {
                 if next.is_null() {
                     // Try to link node at the end
-                    if unsafe { (*tail).next.compare_exchange(
-                        next,
-                        node,
-                        Ordering::Release,
-                        Ordering::Acquire,
-                    ).is_ok() } {
+                    if unsafe {
+                        (*tail)
+                            .next
+                            .compare_exchange(next, node, Ordering::Release, Ordering::Acquire)
+                            .is_ok()
+                    } {
                         // Enqueue done, try to swing tail
                         let _ = self.tail.compare_exchange(
                             tail,
@@ -143,14 +143,15 @@ impl<T> LockFreeQueue<T> {
                     // Read value before CAS, otherwise another dequeue might free the next node
                     let value = unsafe { (*next).value.take() };
 
-                    if self.head.compare_exchange(
-                        head,
-                        next,
-                        Ordering::Release,
-                        Ordering::Acquire,
-                    ).is_ok() {
+                    if self
+                        .head
+                        .compare_exchange(head, next, Ordering::Release, Ordering::Acquire)
+                        .is_ok()
+                    {
                         // Free the old dummy node
-                        unsafe { drop(Box::from_raw(head)); }
+                        unsafe {
+                            drop(Box::from_raw(head));
+                        }
                         self.size.fetch_sub(1, Ordering::Relaxed);
                         return value;
                     }
@@ -186,7 +187,9 @@ impl<T> Drop for LockFreeQueue<T> {
         // Free the dummy node
         let head = self.head.load(Ordering::Acquire);
         if !head.is_null() {
-            unsafe { drop(Box::from_raw(head)); }
+            unsafe {
+                drop(Box::from_raw(head));
+            }
         }
     }
 }
@@ -247,14 +250,15 @@ impl<T> LockFreeStack<T> {
 
         loop {
             let old_head = self.head.load(Ordering::Acquire);
-            unsafe { (*node).next = old_head; }
+            unsafe {
+                (*node).next = old_head;
+            }
 
-            if self.head.compare_exchange(
-                old_head,
-                node,
-                Ordering::Release,
-                Ordering::Acquire,
-            ).is_ok() {
+            if self
+                .head
+                .compare_exchange(old_head, node, Ordering::Release, Ordering::Acquire)
+                .is_ok()
+            {
                 self.size.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -271,12 +275,11 @@ impl<T> LockFreeStack<T> {
 
             let next = unsafe { (*old_head).next };
 
-            if self.head.compare_exchange(
-                old_head,
-                next,
-                Ordering::Release,
-                Ordering::Acquire,
-            ).is_ok() {
+            if self
+                .head
+                .compare_exchange(old_head, next, Ordering::Release, Ordering::Acquire)
+                .is_ok()
+            {
                 self.size.fetch_sub(1, Ordering::Relaxed);
                 let value = unsafe { Box::from_raw(old_head).value };
                 return Some(value);
@@ -377,7 +380,10 @@ impl<K: Hash + Eq, V: Clone> LockFreeHashMap<K, V> {
     }
 
     /// Inserts a key-value pair (lock-free)
-    pub fn insert(&self, key: K, value: V) where K: Clone {
+    pub fn insert(&self, key: K, value: V)
+    where
+        K: Clone,
+    {
         let bucket_idx = self.hash_key(&key);
         let new_entry = Box::into_raw(Box::new(HashMapEntry {
             key: key.clone(),
@@ -394,13 +400,18 @@ impl<K: Hash + Eq, V: Clone> LockFreeHashMap<K, V> {
                 unsafe {
                     if (*current).key == key {
                         // Update existing value (simplified: just replace the node)
-                        (*new_entry).next.store((*current).next.load(Ordering::Acquire), Ordering::Release);
-                        if self.buckets[bucket_idx].compare_exchange(
-                            current,
-                            new_entry,
-                            Ordering::Release,
-                            Ordering::Acquire,
-                        ).is_ok() {
+                        (*new_entry)
+                            .next
+                            .store((*current).next.load(Ordering::Acquire), Ordering::Release);
+                        if self.buckets[bucket_idx]
+                            .compare_exchange(
+                                current,
+                                new_entry,
+                                Ordering::Release,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
                             drop(Box::from_raw(current));
                             return;
                         }
@@ -411,14 +422,14 @@ impl<K: Hash + Eq, V: Clone> LockFreeHashMap<K, V> {
             }
 
             // Insert new entry at head
-            unsafe { (*new_entry).next.store(head, Ordering::Release); }
+            unsafe {
+                (*new_entry).next.store(head, Ordering::Release);
+            }
 
-            if self.buckets[bucket_idx].compare_exchange(
-                head,
-                new_entry,
-                Ordering::Release,
-                Ordering::Acquire,
-            ).is_ok() {
+            if self.buckets[bucket_idx]
+                .compare_exchange(head, new_entry, Ordering::Release, Ordering::Acquire)
+                .is_ok()
+            {
                 self.size.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -458,24 +469,31 @@ impl<K: Hash + Eq, V: Clone> LockFreeHashMap<K, V> {
 
                         if prev.is_null() {
                             // Removing head
-                            if self.buckets[bucket_idx].compare_exchange(
-                                current,
-                                next,
-                                Ordering::Release,
-                                Ordering::Acquire,
-                            ).is_ok() {
+                            if self.buckets[bucket_idx]
+                                .compare_exchange(
+                                    current,
+                                    next,
+                                    Ordering::Release,
+                                    Ordering::Acquire,
+                                )
+                                .is_ok()
+                            {
                                 drop(Box::from_raw(current));
                                 self.size.fetch_sub(1, Ordering::Relaxed);
                                 return Some(value);
                             }
                         } else {
                             // Removing from middle/end
-                            if (*prev).next.compare_exchange(
-                                current,
-                                next,
-                                Ordering::Release,
-                                Ordering::Acquire,
-                            ).is_ok() {
+                            if (*prev)
+                                .next
+                                .compare_exchange(
+                                    current,
+                                    next,
+                                    Ordering::Release,
+                                    Ordering::Acquire,
+                                )
+                                .is_ok()
+                            {
                                 drop(Box::from_raw(current));
                                 self.size.fetch_sub(1, Ordering::Relaxed);
                                 return Some(value);
@@ -537,8 +555,8 @@ unsafe impl<K: Hash + Eq + Send, V: Clone + Send> Sync for LockFreeHashMap<K, V>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
     use std::sync::Arc;
+    use std::thread;
 
     #[test]
     fn test_queue_basic() {

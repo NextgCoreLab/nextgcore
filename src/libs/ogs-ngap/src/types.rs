@@ -322,7 +322,10 @@ pub struct UeContextReleaseRequest {
 #[derive(Debug, Clone)]
 pub enum UeNgapIds {
     /// Both AMF and RAN UE NGAP IDs
-    Pair { amf_ue_ngap_id: u64, ran_ue_ngap_id: u32 },
+    Pair {
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+    },
     /// AMF UE NGAP ID only
     AmfOnly { amf_ue_ngap_id: u64 },
 }
@@ -418,7 +421,6 @@ pub enum PagingDrx {
     V256 = 3,
 }
 
-
 /// Time to Wait values
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -478,7 +480,6 @@ pub enum RrcEstablishmentCause {
     McsPriorityAccess = 9,
     NotAvailable = 10,
 }
-
 
 /// UE Security Capabilities
 #[derive(Debug, Clone)]

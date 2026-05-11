@@ -75,12 +75,7 @@ pub struct XnPathSwitchContext {
 }
 
 impl XnPathSwitchContext {
-    pub fn new(
-        amf_ue_ngap_id: u64,
-        source_gnb_id: u32,
-        target_gnb_id: u32,
-        supi: String,
-    ) -> Self {
+    pub fn new(amf_ue_ngap_id: u64, source_gnb_id: u32, target_gnb_id: u32, supi: String) -> Self {
         Self {
             amf_ue_ngap_id,
             source_ran_ue_ngap_id: 0,
@@ -100,13 +95,12 @@ impl XnPathSwitchContext {
     }
 
     /// Updates target tunnel info for a PDU session
-    pub fn update_target_tunnel(
-        &mut self,
-        pdu_session_id: u8,
-        teid: u32,
-        ip: [u8; 4],
-    ) -> bool {
-        if let Some(s) = self.pdu_sessions.iter_mut().find(|s| s.pdu_session_id == pdu_session_id) {
+    pub fn update_target_tunnel(&mut self, pdu_session_id: u8, teid: u32, ip: [u8; 4]) -> bool {
+        if let Some(s) = self
+            .pdu_sessions
+            .iter_mut()
+            .find(|s| s.pdu_session_id == pdu_session_id)
+        {
             s.target_teid = Some(teid);
             s.target_ip = Some(ip);
             true

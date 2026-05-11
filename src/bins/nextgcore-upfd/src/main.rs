@@ -13,13 +13,13 @@ pub mod context;
 pub mod data_plane;
 pub mod event;
 pub mod gtp_path;
+pub mod mcast;
 pub mod n4_build;
 pub mod n4_handler;
 pub mod pfcp_path;
 pub mod pfcp_sm;
-pub mod rule_match;
-pub mod mcast;
 pub mod programmable_plane;
+pub mod rule_match;
 pub mod timer;
 pub mod tsn_bridge;
 pub mod upf_sm;
@@ -115,11 +115,10 @@ async fn main() -> Result<()> {
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
-            .with_endpoint(
-                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
-            ),
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+        ),
     )
     .ok();
 
@@ -137,7 +136,10 @@ async fn main() -> Result<()> {
 
     // Initialize UPF context
     upf_context_init(args.max_sessions);
-    log::info!("UPF context initialized (max_sessions={})", args.max_sessions);
+    log::info!(
+        "UPF context initialized (max_sessions={})",
+        args.max_sessions
+    );
 
     // Initialize GTP-U path
     upf_gtp_init().map_err(|e| anyhow::anyhow!("Failed to initialize GTP path: {e}"))?;
@@ -173,8 +175,7 @@ async fn main() -> Result<()> {
     let gtpu_addr: SocketAddr = format!("{}:{}", args.gtpu_addr, args.gtpu_port)
         .parse()
         .context("Invalid GTP-U address")?;
-    let tun_ip: Ipv4Addr = args.tun_ip.parse()
-        .context("Invalid TUN IP address")?;
+    let tun_ip: Ipv4Addr = args.tun_ip.parse().context("Invalid TUN IP address")?;
 
     // Initialize legacy PFCP path context (for compatibility)
     pfcp_open(&mut pfcp_ctx, pfcp_addr)
@@ -191,12 +192,10 @@ async fn main() -> Result<()> {
 
     if data_plane_enabled {
         // Initialize data plane (TUN + GTP-U socket)
-        data_plane.init(
-            &args.tun_ifname,
-            tun_ip,
-            args.tun_prefix,
-            gtpu_addr,
-        ).await.context("Failed to initialize data plane")?;
+        data_plane
+            .init(&args.tun_ifname, tun_ip, args.tun_prefix, gtpu_addr)
+            .await
+            .context("Failed to initialize data plane")?;
     } else {
         log::warn!("Data plane disabled (--no-dataplane flag set)");
         log::warn!("UPF running in control plane only mode - no user traffic forwarding");
@@ -209,7 +208,8 @@ async fn main() -> Result<()> {
     log::info!("NextGCore UPF ready");
 
     // Create PFCP session event channel
-    let (pfcp_session_tx, mut pfcp_session_rx) = tokio::sync::mpsc::channel::<PfcpSessionEvent>(100);
+    let (pfcp_session_tx, mut pfcp_session_rx) =
+        tokio::sync::mpsc::channel::<PfcpSessionEvent>(100);
 
     // Create async PFCP server
     let pfcp_server = PfcpServer::new(pfcp_addr, shutdown.clone(), pfcp_session_tx)
@@ -277,8 +277,10 @@ async fn main() -> Result<()> {
             }
 
             // Group reports by (upf_seid, smf_seid) for batching
-            let mut grouped: std::collections::HashMap<(u64, u64), Vec<data_plane::UrrReportEntry>> =
-                std::collections::HashMap::new();
+            let mut grouped: std::collections::HashMap<
+                (u64, u64),
+                Vec<data_plane::UrrReportEntry>,
+            > = std::collections::HashMap::new();
             for report in reports {
                 grouped
                     .entry((report.upf_seid, report.smf_seid))
@@ -475,12 +477,11 @@ async fn update_session_stats() {
 
 /// Handle PFCP session events (connect PFCP to data plane)
 fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
+    use data_plane::{
+        DataPlaneFar, DataPlanePdr, DataPlaneQer, DataPlaneUrr, GTPU_PORT, SRC_INTF_CORE,
+    };
     use std::net::IpAddr;
     use std::sync::Arc;
-    use data_plane::{
-        DataPlaneFar, DataPlanePdr, DataPlaneQer, DataPlaneUrr,
-        GTPU_PORT, SRC_INTF_CORE,
-    };
 
     match event {
         PfcpSessionEvent::SessionEstablished {
@@ -523,12 +524,14 @@ fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
                             .iter()
                             .map(|p| {
                                 // Compile SDF filter's flow description into an IpfwRule
-                                let sdf_rule = p.pdi.sdf_flow_description.as_ref()
-                                    .and_then(|desc| {
+                                let sdf_rule =
+                                    p.pdi.sdf_flow_description.as_ref().and_then(|desc| {
                                         match ogs_ipfw::compile_rule(desc) {
                                             Ok(rule) => Some(rule),
                                             Err(e) => {
-                                                log::warn!("Failed to compile SDF filter '{}': {}", desc, e);
+                                                log::warn!(
+                                                    "Failed to compile SDF filter '{desc}': {e}"
+                                                );
                                                 None
                                             }
                                         }
@@ -640,9 +643,10 @@ fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
                 if !updated_fars.is_empty() {
                     let mut dp_fars = session.fars.write().unwrap();
                     for f in &updated_fars {
-                        let ohc_teid = f.forwarding_parameters.as_ref().and_then(|fp| {
-                            fp.outer_header_creation.as_ref().map(|ohc| ohc.teid)
-                        });
+                        let ohc_teid = f
+                            .forwarding_parameters
+                            .as_ref()
+                            .and_then(|fp| fp.outer_header_creation.as_ref().map(|ohc| ohc.teid));
                         let ohc_addr = f.forwarding_parameters.as_ref().and_then(|fp| {
                             fp.outer_header_creation.as_ref().and_then(|ohc| ohc.ipv4)
                         });
@@ -683,7 +687,10 @@ fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
             }
         }
 
-        PfcpSessionEvent::SessionDeleted { upf_seid, ue_ipv4: _ } => {
+        PfcpSessionEvent::SessionDeleted {
+            upf_seid,
+            ue_ipv4: _,
+        } => {
             log::info!("PFCP Session Deleted: UPF_SEID={upf_seid:#x}");
             data_plane.remove_session_from_pfcp(upf_seid);
         }

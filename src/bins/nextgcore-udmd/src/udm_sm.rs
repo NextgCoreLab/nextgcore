@@ -4,7 +4,9 @@
 
 use crate::context::{udm_self, UdmUe};
 use crate::event::{UdmEvent, UdmEventId, UdmTimerId};
-use crate::sbi_response::{send_error_response, send_gateway_timeout_response, send_not_found_response};
+use crate::sbi_response::{
+    send_error_response, send_gateway_timeout_response, send_not_found_response,
+};
 use crate::sess_sm::{UdmSessSmContext, UdmSessState};
 use crate::ue_sm::{UdmUeSmContext, UdmUeState};
 
@@ -121,10 +123,16 @@ impl UdmSmContext {
         }
     }
 
-
     /// Handle SBI server events
     fn handle_sbi_server_event(&mut self, event: &mut UdmEvent) {
-        let (stream_id, service_name, api_version, method, resource_components, num_of_dataset_names) = {
+        let (
+            stream_id,
+            service_name,
+            api_version,
+            method,
+            resource_components,
+            num_of_dataset_names,
+        ) = {
             let sbi = match &event.sbi {
                 Some(sbi) => sbi,
                 None => {
@@ -160,10 +168,18 @@ impl UdmSmContext {
         };
 
         // Check API version based on service
-        let expected_version = if service_name == "nudm-sdm" { "v2" } else { "v1" };
+        let expected_version = if service_name == "nudm-sdm" {
+            "v2"
+        } else {
+            "v1"
+        };
         if api_version != expected_version {
             log::error!("Not supported version [{api_version}]");
-            send_error_response(stream_id, 400, &format!("Unsupported API version: {api_version}"));
+            send_error_response(
+                stream_id,
+                400,
+                &format!("Unsupported API version: {api_version}"),
+            );
             return;
         }
 
@@ -209,10 +225,7 @@ impl UdmSmContext {
                 }
             },
             _ => {
-                log::error!(
-                    "Invalid resource name [{:?}]",
-                    resource_components.first()
-                );
+                log::error!("Invalid resource name [{:?}]", resource_components.first());
             }
         }
     }
@@ -307,7 +320,6 @@ impl UdmSmContext {
         self.handle_ue_request(event, &udm_ue, stream_id);
     }
 
-
     /// Handle UE-level request
     fn handle_ue_request(&mut self, event: &mut UdmEvent, udm_ue: &UdmUe, stream_id: u64) {
         // Get or create UE state machine
@@ -355,7 +367,11 @@ impl UdmSmContext {
                 let context = ctx.read().unwrap();
                 match context.sess_add(udm_ue.id, psi) {
                     Some(s) => {
-                        log::debug!("[{}:{}] UDM session added", udm_ue.supi.as_deref().unwrap_or(&udm_ue.suci), psi);
+                        log::debug!(
+                            "[{}:{}] UDM session added",
+                            udm_ue.supi.as_deref().unwrap_or(&udm_ue.suci),
+                            psi
+                        );
                         s
                     }
                     None => {
@@ -420,7 +436,11 @@ impl UdmSmContext {
         };
 
         // Check API version
-        let expected_version = if service_name == "nudm-sdm" { "v2" } else { "v1" };
+        let expected_version = if service_name == "nudm-sdm" {
+            "v2"
+        } else {
+            "v1"
+        };
         if api_version != expected_version {
             log::error!("Not supported version [{api_version}]");
             return;
@@ -457,10 +477,7 @@ impl UdmSmContext {
                 // Note: Subscription handling requires NRF integration
             }
             _ => {
-                log::error!(
-                    "Invalid resource name [{:?}]",
-                    resource_components.first()
-                );
+                log::error!("Invalid resource name [{:?}]", resource_components.first());
             }
         }
     }
@@ -475,10 +492,7 @@ impl UdmSmContext {
                 // Note: NF discover handling requires NRF integration
             }
             _ => {
-                log::error!(
-                    "Invalid resource name [{:?}]",
-                    resource_components.first()
-                );
+                log::error!("Invalid resource name [{:?}]", resource_components.first());
             }
         }
     }
@@ -500,10 +514,7 @@ impl UdmSmContext {
                 self.handle_nudr_ue_response(event);
             }
             _ => {
-                log::error!(
-                    "Invalid resource name [{:?}]",
-                    resource_components.first()
-                );
+                log::error!("Invalid resource name [{:?}]", resource_components.first());
             }
         }
     }
@@ -597,7 +608,6 @@ impl UdmSmContext {
             context.sess_remove(sess_id);
         }
     }
-
 
     /// Handle SBI timer events
     fn handle_sbi_timer_event(&mut self, event: &mut UdmEvent) {

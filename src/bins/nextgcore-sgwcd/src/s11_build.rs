@@ -168,7 +168,10 @@ pub fn build_delete_session_response(sess: &SgwcSess, cause: u8) -> Option<GtpMe
 
 /// Build Downlink Data Notification
 /// Port of sgwc_s11_build_downlink_data_notification
-pub fn build_downlink_data_notification(cause_value: u8, bearer: &SgwcBearer) -> Option<GtpMessage> {
+pub fn build_downlink_data_notification(
+    cause_value: u8,
+    bearer: &SgwcBearer,
+) -> Option<GtpMessage> {
     let ctx = sgwc_self();
 
     let sgwc_ue = ctx.ue_find_by_id(bearer.sgwc_ue_id)?;
@@ -190,10 +193,7 @@ pub fn build_downlink_data_notification(cause_value: u8, bearer: &SgwcBearer) ->
 
     msg.data = data;
 
-    log::info!(
-        "Downlink Data Notification [bearer_id={}]",
-        bearer.id
-    );
+    log::info!("Downlink Data Notification [bearer_id={}]", bearer.id);
     log::info!(
         "    MME_S11_TEID[{}] SGW_S11_TEID[{}]",
         sgwc_ue.mme_s11_teid,
@@ -204,10 +204,7 @@ pub fn build_downlink_data_notification(cause_value: u8, bearer: &SgwcBearer) ->
 }
 
 /// Build Release Access Bearers Response
-pub fn build_release_access_bearers_response(
-    sgwc_ue_id: u64,
-    cause: u8,
-) -> Option<GtpMessage> {
+pub fn build_release_access_bearers_response(sgwc_ue_id: u64, cause: u8) -> Option<GtpMessage> {
     let ctx = sgwc_self();
 
     let sgwc_ue = ctx.ue_find_by_id(sgwc_ue_id)?;
@@ -508,7 +505,11 @@ pub fn build_s5c_create_bearer_response(sess: &SgwcSess, cause: u8) -> Option<Gt
         if let Some(bearer) = ctx.bearer_find_by_id(*bearer_id) {
             let mut bc = Vec::new();
             bc.extend_from_slice(&encode_ie(ie_type::EBI, 0, &[bearer.ebi]));
-            bc.extend_from_slice(&encode_ie(ie_type::CAUSE, 0, &[gtp_cause::REQUEST_ACCEPTED, 0]));
+            bc.extend_from_slice(&encode_ie(
+                ie_type::CAUSE,
+                0,
+                &[gtp_cause::REQUEST_ACCEPTED, 0],
+            ));
             if let Some(ul_tunnel) = ctx.ul_tunnel_in_bearer(bearer.id) {
                 let ft = encode_f_teid(
                     f_teid_interface::S5_S8_SGW_GTP_U,
@@ -557,7 +558,11 @@ mod tests {
 
     #[test]
     fn test_encode_f_teid() {
-        let ft = encode_f_teid(f_teid_interface::S5_S8_SGW_GTP_C, 0x1234, Some([10, 0, 0, 1]));
+        let ft = encode_f_teid(
+            f_teid_interface::S5_S8_SGW_GTP_C,
+            0x1234,
+            Some([10, 0, 0, 1]),
+        );
         assert_eq!(ft[0] & 0x80, 0x80); // V4 flag set
         assert_eq!(ft[0] & 0x3F, f_teid_interface::S5_S8_SGW_GTP_C);
         assert_eq!(u32::from_be_bytes([ft[1], ft[2], ft[3], ft[4]]), 0x1234);

@@ -37,7 +37,10 @@ pub enum AiMlHookPoint {
 #[derive(Debug, Clone)]
 pub enum AiMlHookAction {
     /// Emit analytics event to NWDAF.
-    EmitAnalytics { event_type: String, payload: Vec<u8> },
+    EmitAnalytics {
+        event_type: String,
+        payload: Vec<u8>,
+    },
     /// Request ML inference.
     RequestInference { model_id: String, input: Vec<f64> },
     /// Override NF decision with ML result.
@@ -88,7 +91,12 @@ impl AiMlHookRegistry {
     }
 
     /// Register a hook.
-    pub fn register(&mut self, hook_point: AiMlHookPoint, nf_type: impl Into<String>, priority: u8) -> u32 {
+    pub fn register(
+        &mut self,
+        hook_point: AiMlHookPoint,
+        nf_type: impl Into<String>,
+        priority: u8,
+    ) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
         self.hooks.push(AiMlHook {
@@ -112,13 +120,20 @@ impl AiMlHookRegistry {
     /// Get hooks for a given point.
     pub fn get_hooks(&mut self, point: AiMlHookPoint) -> Vec<&AiMlHook> {
         self.execution_count += 1;
-        self.hooks.iter().filter(|h| h.hook_point == point && h.enabled).collect()
+        self.hooks
+            .iter()
+            .filter(|h| h.hook_point == point && h.enabled)
+            .collect()
     }
 
     /// Total registered hooks.
-    pub fn hook_count(&self) -> usize { self.hooks.len() }
+    pub fn hook_count(&self) -> usize {
+        self.hooks.len()
+    }
     /// Total executions.
-    pub fn execution_count(&self) -> u64 { self.execution_count }
+    pub fn execution_count(&self) -> u64 {
+        self.execution_count
+    }
 }
 
 // ============================================================================
@@ -178,7 +193,11 @@ pub struct DigitalTwinExporter {
 
 impl DigitalTwinExporter {
     /// Creates a new digital twin exporter.
-    pub fn new(nf_instance_id: impl Into<String>, nf_type: impl Into<String>, sync_interval: Duration) -> Self {
+    pub fn new(
+        nf_instance_id: impl Into<String>,
+        nf_type: impl Into<String>,
+        sync_interval: Duration,
+    ) -> Self {
         Self {
             nf_instance_id: nf_instance_id.into(),
             nf_type: nf_type.into(),
@@ -189,13 +208,27 @@ impl DigitalTwinExporter {
     }
 
     /// Capture current NF state as a snapshot.
-    pub fn capture(&mut self, load: f64, active_sessions: u64, cpu: f64, memory: f64, kpis: HashMap<String, f64>) -> &NfStateSnapshot {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("value expected").as_millis() as u64;
+    pub fn capture(
+        &mut self,
+        load: f64,
+        active_sessions: u64,
+        cpu: f64,
+        memory: f64,
+        kpis: HashMap<String, f64>,
+    ) -> &NfStateSnapshot {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("value expected")
+            .as_millis() as u64;
         let snapshot = NfStateSnapshot {
             nf_instance_id: self.nf_instance_id.clone(),
             nf_type: self.nf_type.clone(),
             timestamp_ms: now,
-            status: if load > 0.9 { NfStatus::Overloaded } else { NfStatus::Registered },
+            status: if load > 0.9 {
+                NfStatus::Overloaded
+            } else {
+                NfStatus::Registered
+            },
             load,
             active_sessions,
             cpu_utilization: cpu,
@@ -208,11 +241,17 @@ impl DigitalTwinExporter {
     }
 
     /// Get latest snapshot.
-    pub fn latest(&self) -> Option<&NfStateSnapshot> { self.latest_snapshot.as_ref() }
+    pub fn latest(&self) -> Option<&NfStateSnapshot> {
+        self.latest_snapshot.as_ref()
+    }
     /// Export count.
-    pub fn export_count(&self) -> u64 { self.export_count }
+    pub fn export_count(&self) -> u64 {
+        self.export_count
+    }
     /// Sync interval.
-    pub fn sync_interval(&self) -> Duration { self.sync_interval }
+    pub fn sync_interval(&self) -> Duration {
+        self.sync_interval
+    }
 }
 
 // ============================================================================
@@ -291,11 +330,23 @@ impl EnergyCoordinator {
         let low_load = nf_load < 0.2;
 
         let (state, saving, reason) = if over_budget && low_load {
-            (NfEnergyState::DeepSleep, 50.0, "Over budget, low load → deep sleep".into())
+            (
+                NfEnergyState::DeepSleep,
+                50.0,
+                "Over budget, low load → deep sleep".into(),
+            )
         } else if over_budget {
-            (NfEnergyState::EnergySaving2, 25.0, "Over budget → ES level 2".into())
+            (
+                NfEnergyState::EnergySaving2,
+                25.0,
+                "Over budget → ES level 2".into(),
+            )
         } else if low_load && self.renewable_pct < 0.3 {
-            (NfEnergyState::EnergySaving1, 15.0, "Low load, low renewable → ES level 1".into())
+            (
+                NfEnergyState::EnergySaving1,
+                15.0,
+                "Low load, low renewable → ES level 1".into(),
+            )
         } else {
             (NfEnergyState::Normal, 0.0, "Normal operation".into())
         };
@@ -316,13 +367,20 @@ impl EnergyCoordinator {
 
     /// NFs in energy saving states.
     pub fn saving_count(&self) -> usize {
-        self.nf_states.values().filter(|s| **s != NfEnergyState::Normal).count()
+        self.nf_states
+            .values()
+            .filter(|s| **s != NfEnergyState::Normal)
+            .count()
     }
 
     /// Total registered NFs.
-    pub fn nf_count(&self) -> usize { self.nf_states.len() }
+    pub fn nf_count(&self) -> usize {
+        self.nf_states.len()
+    }
     /// Recommendation count.
-    pub fn recommendation_count(&self) -> u64 { self.recommendation_count }
+    pub fn recommendation_count(&self) -> u64 {
+        self.recommendation_count
+    }
 }
 
 // ============================================================================
@@ -405,17 +463,26 @@ impl CrossNfIntentCoordinator {
     }
 
     /// Submit a new cross-NF intent.
-    pub fn submit(&mut self, category: CrossNfIntentCategory, target_nf_types: Vec<String>, params: HashMap<String, String>, priority: u8) -> u64 {
+    pub fn submit(
+        &mut self,
+        category: CrossNfIntentCategory,
+        target_nf_types: Vec<String>,
+        params: HashMap<String, String>,
+        priority: u8,
+    ) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.intents.insert(id, CrossNfIntent {
+        self.intents.insert(
             id,
-            category,
-            target_nf_types,
-            params,
-            priority,
-            status: IntentStatus::Pending,
-        });
+            CrossNfIntent {
+                id,
+                category,
+                target_nf_types,
+                params,
+                priority,
+                status: IntentStatus::Pending,
+            },
+        );
         id
     }
 
@@ -439,13 +506,20 @@ impl CrossNfIntentCoordinator {
 
     /// Active (non-completed) intents.
     pub fn active_count(&self) -> usize {
-        self.intents.values().filter(|i| i.status != IntentStatus::Completed && i.status != IntentStatus::Failed).count()
+        self.intents
+            .values()
+            .filter(|i| i.status != IntentStatus::Completed && i.status != IntentStatus::Failed)
+            .count()
     }
 
     /// Total intents.
-    pub fn total_count(&self) -> usize { self.intents.len() }
+    pub fn total_count(&self) -> usize {
+        self.intents.len()
+    }
     /// Completed intents.
-    pub fn completed_count(&self) -> u64 { self.completed_count }
+    pub fn completed_count(&self) -> u64 {
+        self.completed_count
+    }
 }
 
 // ============================================================================
@@ -497,7 +571,12 @@ pub struct DigitalTwinSyncManager {
 
 impl DigitalTwinSyncManager {
     /// Creates a new sync manager wrapping an exporter.
-    pub fn new(nf_instance_id: impl Into<String>, nf_type: impl Into<String>, sync_interval: Duration, max_history: usize) -> Self {
+    pub fn new(
+        nf_instance_id: impl Into<String>,
+        nf_type: impl Into<String>,
+        sync_interval: Duration,
+        max_history: usize,
+    ) -> Self {
         Self {
             exporter: DigitalTwinExporter::new(nf_instance_id, nf_type, sync_interval),
             history: Vec::with_capacity(max_history),
@@ -509,8 +588,17 @@ impl DigitalTwinSyncManager {
     }
 
     /// Captures a snapshot and stores in history.
-    pub fn capture_with_history(&mut self, load: f64, active_sessions: u64, cpu: f64, memory: f64, kpis: HashMap<String, f64>) -> &NfStateSnapshot {
-        let snap = self.exporter.capture(load, active_sessions, cpu, memory, kpis);
+    pub fn capture_with_history(
+        &mut self,
+        load: f64,
+        active_sessions: u64,
+        cpu: f64,
+        memory: f64,
+        kpis: HashMap<String, f64>,
+    ) -> &NfStateSnapshot {
+        let snap = self
+            .exporter
+            .capture(load, active_sessions, cpu, memory, kpis);
         let entry = SnapshotHistoryEntry {
             sequence: self.next_sequence,
             snapshot: snap.clone(),
@@ -526,7 +614,10 @@ impl DigitalTwinSyncManager {
     /// Computes a delta between the current snapshot and a previous one.
     pub fn compute_delta(&mut self, previous_sequence: u64) -> Option<NfStateDelta> {
         let current = self.exporter.latest()?;
-        let previous = self.history.iter().find(|e| e.sequence == previous_sequence)?;
+        let previous = self
+            .history
+            .iter()
+            .find(|e| e.sequence == previous_sequence)?;
         self.delta_sync_count += 1;
 
         let mut changed_kpis = HashMap::new();
@@ -544,15 +635,21 @@ impl DigitalTwinSyncManager {
 
         let load_delta = if (current.load - previous.snapshot.load).abs() > 0.001 {
             Some(current.load)
-        } else { None };
+        } else {
+            None
+        };
 
         let session_delta = if current.active_sessions != previous.snapshot.active_sessions {
             Some(current.active_sessions as i64 - previous.snapshot.active_sessions as i64)
-        } else { None };
+        } else {
+            None
+        };
 
         let status_change = if current.status != previous.snapshot.status {
             Some(current.status)
-        } else { None };
+        } else {
+            None
+        };
 
         Some(NfStateDelta {
             nf_instance_id: current.nf_instance_id.clone(),
@@ -566,7 +663,8 @@ impl DigitalTwinSyncManager {
 
     /// Receives a peer NF snapshot for cross-NF digital twin view.
     pub fn receive_peer_snapshot(&mut self, snapshot: NfStateSnapshot) {
-        self.peer_snapshots.insert(snapshot.nf_instance_id.clone(), snapshot);
+        self.peer_snapshots
+            .insert(snapshot.nf_instance_id.clone(), snapshot);
     }
 
     /// Gets the full digital twin view (self + all peers).
@@ -582,15 +680,25 @@ impl DigitalTwinSyncManager {
     }
 
     /// Latest snapshot sequence number.
-    pub fn latest_sequence(&self) -> u64 { self.next_sequence.saturating_sub(1) }
+    pub fn latest_sequence(&self) -> u64 {
+        self.next_sequence.saturating_sub(1)
+    }
     /// History length.
-    pub fn history_len(&self) -> usize { self.history.len() }
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
     /// Peer count.
-    pub fn peer_count(&self) -> usize { self.peer_snapshots.len() }
+    pub fn peer_count(&self) -> usize {
+        self.peer_snapshots.len()
+    }
     /// Delta sync count.
-    pub fn delta_sync_count(&self) -> u64 { self.delta_sync_count }
+    pub fn delta_sync_count(&self) -> u64 {
+        self.delta_sync_count
+    }
     /// Access inner exporter.
-    pub fn exporter(&self) -> &DigitalTwinExporter { &self.exporter }
+    pub fn exporter(&self) -> &DigitalTwinExporter {
+        &self.exporter
+    }
 }
 
 // ============================================================================
@@ -643,12 +751,17 @@ impl ComponentPowerProfile {
     /// Updates power based on utilization using linear model.
     pub fn update_utilization(&mut self, utilization: f64) {
         self.utilization = utilization.clamp(0.0, 1.0);
-        self.current_watts = self.idle_watts + (self.peak_watts - self.idle_watts) * self.utilization;
+        self.current_watts =
+            self.idle_watts + (self.peak_watts - self.idle_watts) * self.utilization;
     }
 
     /// Energy efficiency ratio (throughput-equivalent per watt).
     pub fn efficiency(&self) -> f64 {
-        if self.current_watts > 0.0 { self.utilization / self.current_watts } else { 0.0 }
+        if self.current_watts > 0.0 {
+            self.utilization / self.current_watts
+        } else {
+            0.0
+        }
     }
 }
 
@@ -702,12 +815,30 @@ impl NfPowerProfiler {
     /// Creates a new profiler with default component profiles.
     pub fn new(nf_instance_id: impl Into<String>) -> Self {
         let mut components = HashMap::new();
-        components.insert(PowerComponent::Cpu, ComponentPowerProfile::new(PowerComponent::Cpu, 5.0, 65.0));
-        components.insert(PowerComponent::Memory, ComponentPowerProfile::new(PowerComponent::Memory, 2.0, 10.0));
-        components.insert(PowerComponent::NetworkIo, ComponentPowerProfile::new(PowerComponent::NetworkIo, 1.0, 15.0));
-        components.insert(PowerComponent::StorageIo, ComponentPowerProfile::new(PowerComponent::StorageIo, 0.5, 5.0));
-        components.insert(PowerComponent::CryptoAccel, ComponentPowerProfile::new(PowerComponent::CryptoAccel, 0.0, 20.0));
-        components.insert(PowerComponent::BaseIdle, ComponentPowerProfile::new(PowerComponent::BaseIdle, 3.0, 3.0));
+        components.insert(
+            PowerComponent::Cpu,
+            ComponentPowerProfile::new(PowerComponent::Cpu, 5.0, 65.0),
+        );
+        components.insert(
+            PowerComponent::Memory,
+            ComponentPowerProfile::new(PowerComponent::Memory, 2.0, 10.0),
+        );
+        components.insert(
+            PowerComponent::NetworkIo,
+            ComponentPowerProfile::new(PowerComponent::NetworkIo, 1.0, 15.0),
+        );
+        components.insert(
+            PowerComponent::StorageIo,
+            ComponentPowerProfile::new(PowerComponent::StorageIo, 0.5, 5.0),
+        );
+        components.insert(
+            PowerComponent::CryptoAccel,
+            ComponentPowerProfile::new(PowerComponent::CryptoAccel, 0.0, 20.0),
+        );
+        components.insert(
+            PowerComponent::BaseIdle,
+            ComponentPowerProfile::new(PowerComponent::BaseIdle, 3.0, 3.0),
+        );
 
         Self {
             nf_instance_id: nf_instance_id.into(),
@@ -729,7 +860,10 @@ impl NfPowerProfiler {
     /// Records a power measurement.
     pub fn record_measurement(&mut self) {
         let total = self.total_power_watts();
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("value expected").as_millis() as u64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("value expected")
+            .as_millis() as u64;
         if self.power_history.len() >= self.max_history {
             self.power_history.remove(0);
         }
@@ -743,7 +877,9 @@ impl NfPowerProfiler {
 
     /// Average power over the history window (watts).
     pub fn average_power_watts(&self) -> f64 {
-        if self.power_history.is_empty() { return 0.0; }
+        if self.power_history.is_empty() {
+            return 0.0;
+        }
         let sum: f64 = self.power_history.iter().map(|(_, w)| w).sum();
         sum / self.power_history.len() as f64
     }
@@ -765,30 +901,24 @@ impl NfPowerProfiler {
 
         for profile in self.components.values() {
             let opt = match profile.component {
-                PowerComponent::Cpu if profile.utilization < 0.2 => {
-                    Some(PowerOptimization {
-                        component: PowerComponent::Cpu,
-                        action: PowerAction::DisableIdleCores,
-                        estimated_saving_watts: (profile.current_watts - profile.idle_watts) * 0.5,
-                        latency_impact_ms: 0.5,
-                    })
-                }
-                PowerComponent::Cpu if profile.utilization < 0.5 => {
-                    Some(PowerOptimization {
-                        component: PowerComponent::Cpu,
-                        action: PowerAction::ReduceFrequency,
-                        estimated_saving_watts: (profile.current_watts - profile.idle_watts) * 0.3,
-                        latency_impact_ms: 1.0,
-                    })
-                }
-                PowerComponent::NetworkIo if profile.utilization < 0.3 => {
-                    Some(PowerOptimization {
-                        component: PowerComponent::NetworkIo,
-                        action: PowerAction::BatchIo,
-                        estimated_saving_watts: profile.current_watts * 0.2,
-                        latency_impact_ms: 2.0,
-                    })
-                }
+                PowerComponent::Cpu if profile.utilization < 0.2 => Some(PowerOptimization {
+                    component: PowerComponent::Cpu,
+                    action: PowerAction::DisableIdleCores,
+                    estimated_saving_watts: (profile.current_watts - profile.idle_watts) * 0.5,
+                    latency_impact_ms: 0.5,
+                }),
+                PowerComponent::Cpu if profile.utilization < 0.5 => Some(PowerOptimization {
+                    component: PowerComponent::Cpu,
+                    action: PowerAction::ReduceFrequency,
+                    estimated_saving_watts: (profile.current_watts - profile.idle_watts) * 0.3,
+                    latency_impact_ms: 1.0,
+                }),
+                PowerComponent::NetworkIo if profile.utilization < 0.3 => Some(PowerOptimization {
+                    component: PowerComponent::NetworkIo,
+                    action: PowerAction::BatchIo,
+                    estimated_saving_watts: profile.current_watts * 0.2,
+                    latency_impact_ms: 2.0,
+                }),
                 PowerComponent::CryptoAccel if profile.utilization > 0.5 => {
                     Some(PowerOptimization {
                         component: PowerComponent::CryptoAccel,
@@ -813,11 +943,17 @@ impl NfPowerProfiler {
     }
 
     /// NF instance ID.
-    pub fn nf_instance_id(&self) -> &str { &self.nf_instance_id }
+    pub fn nf_instance_id(&self) -> &str {
+        &self.nf_instance_id
+    }
     /// Total optimization recommendations generated.
-    pub fn optimization_count(&self) -> u64 { self.optimization_count }
+    pub fn optimization_count(&self) -> u64 {
+        self.optimization_count
+    }
     /// Power history length.
-    pub fn history_len(&self) -> usize { self.power_history.len() }
+    pub fn history_len(&self) -> usize {
+        self.power_history.len()
+    }
 }
 
 // ============================================================================
@@ -883,10 +1019,18 @@ impl ModelVersionRegistry {
     }
 
     /// Deploy a model version to an NF.
-    pub fn deploy(&mut self, model_id: impl Into<String>, version: impl Into<String>, nf_instance_id: impl Into<String>) {
+    pub fn deploy(
+        &mut self,
+        model_id: impl Into<String>,
+        version: impl Into<String>,
+        nf_instance_id: impl Into<String>,
+    ) {
         let model_id = model_id.into();
         let nf_instance_id = nf_instance_id.into();
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("value expected").as_millis() as u64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("value expected")
+            .as_millis() as u64;
         self.rollout_count += 1;
         self.deployments.insert(
             (model_id.clone(), nf_instance_id.clone()),
@@ -903,7 +1047,10 @@ impl ModelVersionRegistry {
 
     /// Activate a staged deployment.
     pub fn activate(&mut self, model_id: &str, nf_instance_id: &str) -> bool {
-        if let Some(dep) = self.deployments.get_mut(&(model_id.to_string(), nf_instance_id.to_string())) {
+        if let Some(dep) = self
+            .deployments
+            .get_mut(&(model_id.to_string(), nf_instance_id.to_string()))
+        {
             if dep.status == ModelDeploymentStatus::Staging {
                 dep.status = ModelDeploymentStatus::Active;
                 return true;
@@ -914,8 +1061,13 @@ impl ModelVersionRegistry {
 
     /// Roll back a deployment (marks as RollingBack, then Retired).
     pub fn rollback(&mut self, model_id: &str, nf_instance_id: &str) -> bool {
-        if let Some(dep) = self.deployments.get_mut(&(model_id.to_string(), nf_instance_id.to_string())) {
-            if dep.status == ModelDeploymentStatus::Active || dep.status == ModelDeploymentStatus::Staging {
+        if let Some(dep) = self
+            .deployments
+            .get_mut(&(model_id.to_string(), nf_instance_id.to_string()))
+        {
+            if dep.status == ModelDeploymentStatus::Active
+                || dep.status == ModelDeploymentStatus::Staging
+            {
                 dep.status = ModelDeploymentStatus::Retired;
                 self.rollback_count += 1;
                 return true;
@@ -926,7 +1078,10 @@ impl ModelVersionRegistry {
 
     /// Update accuracy metric after validation.
     pub fn update_accuracy(&mut self, model_id: &str, nf_instance_id: &str, accuracy: f64) -> bool {
-        if let Some(dep) = self.deployments.get_mut(&(model_id.to_string(), nf_instance_id.to_string())) {
+        if let Some(dep) = self
+            .deployments
+            .get_mut(&(model_id.to_string(), nf_instance_id.to_string()))
+        {
             dep.accuracy = accuracy;
             return true;
         }
@@ -935,28 +1090,39 @@ impl ModelVersionRegistry {
 
     /// Get all NFs running a specific model.
     pub fn nfs_with_model(&self, model_id: &str) -> Vec<&DeployedModel> {
-        self.deployments.values()
+        self.deployments
+            .values()
             .filter(|d| d.model_id == model_id && d.status == ModelDeploymentStatus::Active)
             .collect()
     }
 
     /// Get all models deployed on a specific NF.
     pub fn models_on_nf(&self, nf_instance_id: &str) -> Vec<&DeployedModel> {
-        self.deployments.values()
+        self.deployments
+            .values()
             .filter(|d| d.nf_instance_id == nf_instance_id)
             .collect()
     }
 
     /// Total deployments.
-    pub fn deployment_count(&self) -> usize { self.deployments.len() }
+    pub fn deployment_count(&self) -> usize {
+        self.deployments.len()
+    }
     /// Active deployments.
     pub fn active_count(&self) -> usize {
-        self.deployments.values().filter(|d| d.status == ModelDeploymentStatus::Active).count()
+        self.deployments
+            .values()
+            .filter(|d| d.status == ModelDeploymentStatus::Active)
+            .count()
     }
     /// Total rollouts.
-    pub fn rollout_count(&self) -> u64 { self.rollout_count }
+    pub fn rollout_count(&self) -> u64 {
+        self.rollout_count
+    }
     /// Total rollbacks.
-    pub fn rollback_count(&self) -> u64 { self.rollback_count }
+    pub fn rollback_count(&self) -> u64 {
+        self.rollback_count
+    }
 }
 
 // ============================================================================
@@ -1017,7 +1183,11 @@ impl ScenarioSimulator {
     }
 
     /// Simulate a what-if scenario against current twin state.
-    pub fn simulate(&mut self, snapshots: &[&NfStateSnapshot], scenario: &WhatIfScenario) -> ScenarioResult {
+    pub fn simulate(
+        &mut self,
+        snapshots: &[&NfStateSnapshot],
+        scenario: &WhatIfScenario,
+    ) -> ScenarioResult {
         self.simulation_count += 1;
         let mut projected_statuses = HashMap::new();
         let mut overloaded_nfs = Vec::new();
@@ -1061,7 +1231,9 @@ impl ScenarioSimulator {
     }
 
     /// Total simulations run.
-    pub fn simulation_count(&self) -> u64 { self.simulation_count }
+    pub fn simulation_count(&self) -> u64 {
+        self.simulation_count
+    }
 }
 
 // ============================================================================
@@ -1137,7 +1309,10 @@ mod tests {
         assert_eq!(coord.active_count(), 1);
 
         coord.update_status(id, IntentStatus::Executing);
-        assert_eq!(coord.get_intent(id).unwrap().status, IntentStatus::Executing);
+        assert_eq!(
+            coord.get_intent(id).unwrap().status,
+            IntentStatus::Executing
+        );
 
         coord.update_status(id, IntentStatus::Completed);
         assert_eq!(coord.completed_count(), 1);
@@ -1260,9 +1435,13 @@ mod tests {
         let recs = profiler.recommend_optimizations();
         assert!(!recs.is_empty());
         // Should recommend DisableIdleCores for CPU
-        assert!(recs.iter().any(|r| r.component == PowerComponent::Cpu && r.action == PowerAction::DisableIdleCores));
+        assert!(recs.iter().any(
+            |r| r.component == PowerComponent::Cpu && r.action == PowerAction::DisableIdleCores
+        ));
         // Should recommend BatchIo for NetworkIo
-        assert!(recs.iter().any(|r| r.component == PowerComponent::NetworkIo && r.action == PowerAction::BatchIo));
+        assert!(recs
+            .iter()
+            .any(|r| r.component == PowerComponent::NetworkIo && r.action == PowerAction::BatchIo));
         assert_eq!(profiler.optimization_count(), 1);
     }
 
@@ -1290,7 +1469,10 @@ mod tests {
         profiler.update_component(PowerComponent::Cpu, 0.7); // High CPU (no recommendation)
 
         let recs = profiler.recommend_optimizations();
-        assert!(recs.iter().any(|r| r.component == PowerComponent::CryptoAccel && r.action == PowerAction::EnableHwOffload));
+        assert!(recs
+            .iter()
+            .any(|r| r.component == PowerComponent::CryptoAccel
+                && r.action == PowerAction::EnableHwOffload));
     }
 
     // ---- B6.5: Model Version Registry tests ----

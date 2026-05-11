@@ -2,11 +2,12 @@
 //!
 //! Port of src/pcf/npcf-handler.c - Handlers for NPCF service requests
 
-use crate::context::{pcf_self, AccessType, Ambr, Guami, PcfApp, PcfSess, PcfUeAm, RatType, SNssai};
+use crate::context::{
+    pcf_self, AccessType, Ambr, Guami, PcfApp, PcfSess, PcfUeAm, RatType, SNssai,
+};
 use crate::sbi_path::{
-    pcf_sbi_send_smpolicycontrol_update_notify,
+    pcf_sbi_send_smpolicycontrol_update_notify, pcf_sess_sbi_discover_and_send,
     pcf_ue_am_sbi_discover_and_send,
-    pcf_sess_sbi_discover_and_send,
 };
 
 /// HTTP Status codes
@@ -32,7 +33,6 @@ pub struct PolicyAssociationRequest {
     pub ue_ambr: Option<Ambr>,
     pub allowed_snssais: Vec<SNssai>,
 }
-
 
 /// SM Policy Context Data
 #[derive(Debug, Clone, Default)]
@@ -127,7 +127,6 @@ pub enum FlowUsage {
     Af,
 }
 
-
 /// Handler result
 #[derive(Debug)]
 pub struct HandlerResult {
@@ -177,10 +176,7 @@ pub fn pcf_npcf_am_policy_control_handle_create(
     stream_id: u64,
     request: &PolicyAssociationRequest,
 ) -> HandlerResult {
-    log::debug!(
-        "[{}] AM Policy Control Create",
-        pcf_ue_am.supi
-    );
+    log::debug!("[{}] AM Policy Control Create", pcf_ue_am.supi);
 
     // Validate required fields
     if request.notification_uri.is_none() {
@@ -197,7 +193,6 @@ pub fn pcf_npcf_am_policy_control_handle_create(
         log::error!("[{}] No suppFeat", pcf_ue_am.supi);
         return HandlerResult::error(HTTP_STATUS_BAD_REQUEST, "No suppFeat");
     }
-
 
     // Store notification URI
     pcf_ue_am.notification_uri = request.notification_uri.clone();
@@ -242,7 +237,10 @@ pub fn pcf_npcf_am_policy_control_handle_create(
         log::debug!("[{}] HPLMN - querying UDR for AM data", pcf_ue_am.supi);
         if let Err(e) = pcf_ue_am_sbi_discover_and_send(pcf_ue_am.id, stream_id, "nudr-dr") {
             log::error!("[{}] Failed to discover UDR: {}", pcf_ue_am.supi, e);
-            return HandlerResult::error(HTTP_STATUS_INTERNAL_SERVER_ERROR, "Failed to discover UDR");
+            return HandlerResult::error(
+                HTTP_STATUS_INTERNAL_SERVER_ERROR,
+                "Failed to discover UDR",
+            );
         }
         HandlerResult::ok()
     }
@@ -253,16 +251,12 @@ pub fn pcf_npcf_am_policy_control_handle_delete(
     pcf_ue_am: &PcfUeAm,
     _stream_id: u64,
 ) -> HandlerResult {
-    log::debug!(
-        "[{}] AM Policy Control Delete",
-        pcf_ue_am.supi
-    );
+    log::debug!("[{}] AM Policy Control Delete", pcf_ue_am.supi);
 
     // In C: Just send NO_CONTENT response
     // The actual cleanup is done by the state machine
     HandlerResult::no_content()
 }
-
 
 /// Handle SM Policy Control Create request
 /// Port of pcf_npcf_smpolicycontrol_handle_create() from npcf-handler.c
@@ -272,11 +266,7 @@ pub fn pcf_npcf_smpolicycontrol_handle_create(
     stream_id: u64,
     request: &SmPolicyContextData,
 ) -> HandlerResult {
-    log::debug!(
-        "[{}:{}] SM Policy Control Create",
-        pcf_ue_sm_supi,
-        sess.psi
-    );
+    log::debug!("[{}:{}] SM Policy Control Create", pcf_ue_sm_supi, sess.psi);
 
     // Validate required fields
     if request.supi.is_none() {
@@ -317,7 +307,10 @@ pub fn pcf_npcf_smpolicycontrol_handle_create(
     if request.ipv4_address.is_none() && request.ipv6_address_prefix.is_none() {
         return HandlerResult::error(
             HTTP_STATUS_BAD_REQUEST,
-            &format!("[{}:{}] No IPv4 address or IPv6 prefix", pcf_ue_sm_supi, sess.psi),
+            &format!(
+                "[{}:{}] No IPv4 address or IPv6 prefix",
+                pcf_ue_sm_supi, sess.psi
+            ),
         );
     }
 
@@ -327,7 +320,6 @@ pub fn pcf_npcf_smpolicycontrol_handle_create(
             &format!("[{}:{}] No sliceInfo", pcf_ue_sm_supi, sess.psi),
         );
     }
-
 
     // Parse supported features
     if let Some(ref supp_feat) = request.supp_feat {
@@ -385,23 +377,46 @@ pub fn pcf_npcf_smpolicycontrol_handle_create(
 
     if is_vplmn {
         // Visited PLMN - register with BSF
-        log::debug!("[{}:{}] VPLMN - registering with BSF", pcf_ue_sm_supi, sess.psi);
+        log::debug!(
+            "[{}:{}] VPLMN - registering with BSF",
+            pcf_ue_sm_supi,
+            sess.psi
+        );
         if let Err(e) = pcf_sess_sbi_discover_and_send(sess.id, stream_id, "nbsf-management") {
-            log::error!("[{}:{}] Failed to discover BSF: {}", pcf_ue_sm_supi, sess.psi, e);
-            return HandlerResult::error(HTTP_STATUS_INTERNAL_SERVER_ERROR, "Failed to discover BSF");
+            log::error!(
+                "[{}:{}] Failed to discover BSF: {}",
+                pcf_ue_sm_supi,
+                sess.psi,
+                e
+            );
+            return HandlerResult::error(
+                HTTP_STATUS_INTERNAL_SERVER_ERROR,
+                "Failed to discover BSF",
+            );
         }
     } else {
         // Home PLMN - query UDR for SM data
-        log::debug!("[{}:{}] HPLMN - querying UDR for SM data", pcf_ue_sm_supi, sess.psi);
+        log::debug!(
+            "[{}:{}] HPLMN - querying UDR for SM data",
+            pcf_ue_sm_supi,
+            sess.psi
+        );
         if let Err(e) = pcf_sess_sbi_discover_and_send(sess.id, stream_id, "nudr-dr") {
-            log::error!("[{}:{}] Failed to discover UDR: {}", pcf_ue_sm_supi, sess.psi, e);
-            return HandlerResult::error(HTTP_STATUS_INTERNAL_SERVER_ERROR, "Failed to discover UDR");
+            log::error!(
+                "[{}:{}] Failed to discover UDR: {}",
+                pcf_ue_sm_supi,
+                sess.psi,
+                e
+            );
+            return HandlerResult::error(
+                HTTP_STATUS_INTERNAL_SERVER_ERROR,
+                "Failed to discover UDR",
+            );
         }
     }
 
     HandlerResult::ok()
 }
-
 
 /// Handle SM Policy Control Delete request
 /// Port of pcf_npcf_smpolicycontrol_handle_delete() from npcf-handler.c
@@ -411,16 +426,14 @@ pub fn pcf_npcf_smpolicycontrol_handle_delete(
     stream_id: u64,
     _request: &SmPolicyDeleteData,
 ) -> HandlerResult {
-    log::debug!(
-        "[{}:{}] SM Policy Control Delete",
-        pcf_ue_sm_supi,
-        sess.psi
-    );
+    log::debug!("[{}:{}] SM Policy Control Delete", pcf_ue_sm_supi, sess.psi);
 
     let ctx = pcf_self();
     let context = match ctx.read() {
         Ok(c) => c,
-        Err(_) => return HandlerResult::error(HTTP_STATUS_INTERNAL_SERVER_ERROR, "Context lock failed"),
+        Err(_) => {
+            return HandlerResult::error(HTTP_STATUS_INTERNAL_SERVER_ERROR, "Context lock failed")
+        }
     };
 
     // Send terminate notify to all app sessions
@@ -444,7 +457,12 @@ pub fn pcf_npcf_smpolicycontrol_handle_delete(
         // Last session with BSF binding - deregister from BSF
         log::debug!("[{}:{}] Deregistering from BSF", pcf_ue_sm_supi, sess.psi);
         if let Err(e) = pcf_sess_sbi_discover_and_send(sess.id, stream_id, "nbsf-management") {
-            log::error!("[{}:{}] Failed to discover BSF: {}", pcf_ue_sm_supi, sess.psi, e);
+            log::error!(
+                "[{}:{}] Failed to discover BSF: {}",
+                pcf_ue_sm_supi,
+                sess.psi,
+                e
+            );
         }
         HandlerResult::ok()
     } else {
@@ -488,7 +506,6 @@ pub fn pcf_npcf_policyauthorization_handle_create(
         );
     }
 
-
     // Parse supported features
     if let Some(ref supp_feat) = request.supp_feat {
         if let Ok(features) = u64::from_str_radix(supp_feat, 16) {
@@ -500,7 +517,9 @@ pub fn pcf_npcf_policyauthorization_handle_create(
     let ctx = pcf_self();
     let context = match ctx.read() {
         Ok(c) => c,
-        Err(_) => return HandlerResult::error(HTTP_STATUS_INTERNAL_SERVER_ERROR, "Context lock failed"),
+        Err(_) => {
+            return HandlerResult::error(HTTP_STATUS_INTERNAL_SERVER_ERROR, "Context lock failed")
+        }
     };
 
     let app_session = match context.app_add(sess.id) {
@@ -508,7 +527,10 @@ pub fn pcf_npcf_policyauthorization_handle_create(
         None => {
             return HandlerResult::error(
                 HTTP_STATUS_INTERNAL_SERVER_ERROR,
-                &format!("[{}:{}] Failed to create app session", pcf_ue_sm_supi, sess.psi),
+                &format!(
+                    "[{}:{}] Failed to create app session",
+                    pcf_ue_sm_supi, sess.psi
+                ),
             );
         }
     };
@@ -580,7 +602,6 @@ pub fn pcf_npcf_policyauthorization_handle_update(
 
     HandlerResult::ok()
 }
-
 
 /// Handle Policy Authorization Delete request
 /// Port of pcf_npcf_policyauthorization_handle_delete() from npcf-handler.c
