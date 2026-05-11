@@ -434,7 +434,7 @@ pub fn snow_3g_f9(
     let q: u64 = ((z[2] as u64) << 32) | (z[3] as u64);
 
     // Calculation
-    let d: u32 = if (length % 64) == 0 {
+    let d: u32 = if length.is_multiple_of(64) {
         (length >> 6) as u32 + 1
     } else {
         (length >> 6) as u32 + 2

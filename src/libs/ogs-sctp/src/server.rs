@@ -23,7 +23,7 @@ use std::{
 };
 use thiserror::Error;
 use tokio::{net::UdpSocket, sync::mpsc, time::timeout};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{ReceivedMessage, NGAP_PPID};
 

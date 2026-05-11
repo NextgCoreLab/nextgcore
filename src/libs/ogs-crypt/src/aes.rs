@@ -252,7 +252,7 @@ pub fn aes_cbc_decrypt(
         return Ok(0);
     }
 
-    if input.len() % AES_BLOCK_SIZE != 0 {
+    if !input.len().is_multiple_of(AES_BLOCK_SIZE) {
         return Err(AesError::InvalidInputLength);
     }
 

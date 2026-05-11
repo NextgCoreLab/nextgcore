@@ -193,9 +193,10 @@ impl TryFrom<u8> for MobileIdentityType {
 }
 
 /// 5GS mobile identity (TS 24.501 Section 9.11.3.4)
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum MobileIdentity {
     /// No identity
+    #[default]
     NoIdentity,
     /// SUCI (Subscription Concealed Identifier)
     Suci(Suci),
@@ -207,12 +208,6 @@ pub enum MobileIdentity {
     FiveGSTmsi(FiveGSTmsi),
     /// IMEISV
     Imeisv(Imeisv),
-}
-
-impl Default for MobileIdentity {
-    fn default() -> Self {
-        Self::NoIdentity
-    }
 }
 
 impl MobileIdentity {

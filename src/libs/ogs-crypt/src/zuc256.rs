@@ -109,7 +109,7 @@ fn mul_by_pow2(x: u32, k: u32) -> u32 {
 
 #[inline]
 fn rot(a: u32, k: u32) -> u32 {
-    (a << k) | (a >> (32 - k))
+    a.rotate_left(k)
 }
 
 #[inline]

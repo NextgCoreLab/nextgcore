@@ -1064,8 +1064,18 @@ impl Bitrate {
     /// Encode to bytes (10 bytes: 5 for uplink, 5 for downlink in kbps)
     pub fn encode(&self, buf: &mut BytesMut) {
         // Convert bps to kbps, rounding up
-        let ul_kbps = (self.uplink / 1000) + if self.uplink % 1000 != 0 { 1 } else { 0 };
-        let dl_kbps = (self.downlink / 1000) + if self.downlink % 1000 != 0 { 1 } else { 0 };
+        let ul_kbps = (self.uplink / 1000)
+            + if !self.uplink.is_multiple_of(1000) {
+                1
+            } else {
+                0
+            };
+        let dl_kbps = (self.downlink / 1000)
+            + if !self.downlink.is_multiple_of(1000) {
+                1
+            } else {
+                0
+            };
 
         // Write as 5-byte big-endian values
         buf.put_u8((ul_kbps >> 32) as u8);

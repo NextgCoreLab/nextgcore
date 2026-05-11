@@ -303,7 +303,8 @@ pub fn ogs_signal(signum: i32, handler: libc::sighandler_t) -> libc::sighandler_
                 extern "C" fn avoid_zombies(_signo: i32) {
                     unsafe { while libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) > 0 {} }
                 }
-                act.sa_sigaction = avoid_zombies as libc::sighandler_t;
+                let h: extern "C" fn(i32) = avoid_zombies;
+                act.sa_sigaction = h as usize as libc::sighandler_t;
             }
         }
 

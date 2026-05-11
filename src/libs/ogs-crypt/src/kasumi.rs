@@ -8,7 +8,7 @@
 /// 16-bit rotate left
 #[inline]
 fn rol16(a: u16, b: u32) -> u16 {
-    (a << b) | (a >> (16 - b))
+    a.rotate_left(b)
 }
 
 /// S7 substitution box
