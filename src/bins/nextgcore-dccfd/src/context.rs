@@ -167,6 +167,12 @@ pub fn dccf_context_final() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// Serialises tests that touch the global DCCF context. Without this
+    /// they race on subscriptions / fanout_count under cargo test's
+    /// default parallel runner.
+    static TEST_GUARD: StdMutex<()> = StdMutex::new(());
 
     fn init() {
         let _ = CONTEXT.get_or_init(|| {
@@ -201,6 +207,7 @@ mod tests {
 
     #[test]
     fn test_fanout_increments_by_subscriber_count() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         init();
         // Clean up any subs left by other tests that may have a URI
         dccf_context_remove_subscription("sub-uri-1");
@@ -222,6 +229,7 @@ mod tests {
 
     #[test]
     fn test_fanout_with_callback_uris() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         init();
         dccf_context_add_subscription_with_uri(
             "sub-uri-1".into(),
@@ -229,5 +237,7 @@ mod tests {
         );
         let targets = dccf_context_fanout_notify("{}");
         assert!(targets.iter().any(|(id, _)| id == "sub-uri-1"));
+        // Cleanup so we don't pollute other tests
+        dccf_context_remove_subscription("sub-uri-1");
     }
 }
