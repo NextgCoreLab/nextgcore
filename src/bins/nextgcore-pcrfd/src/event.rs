@@ -65,7 +65,10 @@ pub enum PcrfEventData {
     /// Session ID
     SessionId(String),
     /// Timer expiry data
-    Timer { timer_id: u32, context: Option<String> },
+    Timer {
+        timer_id: u32,
+        context: Option<String>,
+    },
 }
 
 impl PcrfEvent {

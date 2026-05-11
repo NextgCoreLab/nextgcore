@@ -7,11 +7,11 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::event::{SbiRequest, SmfEvent, SmfEventId, SmfTimerId};
+    use crate::gsm_sm::{GsmFsm, GsmFsmResult, GsmState};
+    use crate::pfcp_sm::{PfcpFsm, PfcpFsmResult, PfcpState};
+    use crate::smf_sm::{SmfFsm, SmfFsmResult, SmfState};
     use proptest::prelude::*;
-    use crate::smf_sm::{SmfFsm, SmfState, SmfFsmResult};
-    use crate::gsm_sm::{GsmFsm, GsmState, GsmFsmResult};
-    use crate::pfcp_sm::{PfcpFsm, PfcpState, PfcpFsmResult};
-    use crate::event::{SmfEvent, SmfEventId, SmfTimerId, SbiRequest};
 
     // ========================================================================
     // Strategies for generating test data
@@ -112,7 +112,7 @@ mod tests {
         fn prop_smf_fsm_init_transitions_to_operational(_seed in any::<u64>()) {
             let mut fsm = SmfFsm::new();
             prop_assert_eq!(fsm.state, SmfState::Initial);
-            
+
             fsm.init();
             prop_assert_eq!(fsm.state, SmfState::Operational);
         }
@@ -125,7 +125,7 @@ mod tests {
             let mut fsm = SmfFsm::new();
             fsm.init();
             prop_assert_eq!(fsm.state, SmfState::Operational);
-            
+
             fsm.fini();
             prop_assert_eq!(fsm.state, SmfState::Final);
         }
@@ -137,7 +137,7 @@ mod tests {
         fn prop_smf_fsm_entry_event_transitions(_seed in any::<u64>()) {
             let mut fsm = SmfFsm::new();
             let event = SmfEvent::entry();
-            
+
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, SmfFsmResult::Transition(SmfState::Operational));
             prop_assert_eq!(fsm.state, SmfState::Operational);
@@ -152,7 +152,7 @@ mod tests {
             fsm.init();
             fsm.fini();
             prop_assert_eq!(fsm.state, SmfState::Final);
-            
+
             let event = SmfEvent::new(event_id);
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, SmfFsmResult::Ignored);
@@ -166,7 +166,7 @@ mod tests {
         fn prop_smf_fsm_operational_handles_sbi(_seed in any::<u64>()) {
             let mut fsm = SmfFsm::new();
             fsm.init();
-            
+
             let request = SbiRequest {
                 method: "POST".to_string(),
                 uri: "/nsmf-pdusession/v1/sm-contexts".to_string(),
@@ -184,7 +184,7 @@ mod tests {
         fn prop_smf_fsm_operational_handles_n4(pfcp_node_id in 1u64..1000) {
             let mut fsm = SmfFsm::new();
             fsm.init();
-            
+
             let event = SmfEvent::n4_message(pfcp_node_id, 789, vec![1, 2, 3]);
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, SmfFsmResult::Delegated);
@@ -214,11 +214,11 @@ mod tests {
         #[test]
         fn prop_gsm_fsm_init_resets_sm_data(sess_id in 1u64..10000) {
             let mut fsm = GsmFsm::new(sess_id);
-            
+
             // Set some flags
             fsm.set_s6b_aar_in_flight(true);
             fsm.set_gx_ccr_init_in_flight(true);
-            
+
             // Init should reset
             fsm.init();
             prop_assert!(!fsm.sm_data.s6b_aar_in_flight);
@@ -232,7 +232,7 @@ mod tests {
         fn prop_gsm_fsm_fini_transitions_to_final(sess_id in 1u64..10000) {
             let mut fsm = GsmFsm::new(sess_id);
             fsm.init();
-            
+
             fsm.fini();
             prop_assert_eq!(fsm.state, GsmState::Final);
         }
@@ -244,7 +244,7 @@ mod tests {
         fn prop_gsm_fsm_entry_event_handled(sess_id in 1u64..10000) {
             let mut fsm = GsmFsm::new(sess_id);
             let event = SmfEvent::entry();
-            
+
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, GsmFsmResult::Handled);
         }
@@ -261,7 +261,7 @@ mod tests {
             fsm.init();
             fsm.fini();
             prop_assert_eq!(fsm.state, GsmState::Final);
-            
+
             let event = SmfEvent::new(event_id);
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, GsmFsmResult::Ignored);
@@ -276,14 +276,14 @@ mod tests {
             let mut fsm = GsmFsm::new(sess_id);
             fsm.init();
             prop_assert!(fsm.is_initial());
-            
+
             // Transition through session establishment flow
             fsm.transition_to(GsmState::WaitEpcAuthInitial);
             prop_assert_eq!(fsm.state, GsmState::WaitEpcAuthInitial);
-            
+
             fsm.transition_to(GsmState::WaitPfcpEstablishment);
             prop_assert_eq!(fsm.state, GsmState::WaitPfcpEstablishment);
-            
+
             fsm.transition_to(GsmState::Operational);
             prop_assert!(fsm.is_operational());
         }
@@ -294,20 +294,20 @@ mod tests {
         #[test]
         fn prop_gsm_fsm_state_helpers(sess_id in 1u64..10000) {
             let mut fsm = GsmFsm::new(sess_id);
-            
+
             // Test is_initial
             prop_assert!(fsm.is_initial());
             prop_assert!(!fsm.is_operational());
-            
+
             // Transition to operational
             fsm.transition_to(GsmState::Operational);
             prop_assert!(!fsm.is_initial());
             prop_assert!(fsm.is_operational());
-            
+
             // Test is_state
             prop_assert!(fsm.is_state(GsmState::Operational));
             prop_assert!(!fsm.is_state(GsmState::Initial));
-            
+
             // Test current_state
             prop_assert_eq!(fsm.current_state(), GsmState::Operational);
         }
@@ -328,24 +328,24 @@ mod tests {
         #[test]
         fn prop_gsm_fsm_in_flight_flags(sess_id in 1u64..10000) {
             let mut fsm = GsmFsm::new(sess_id);
-            
+
             fsm.set_s6b_aar_in_flight(true);
             prop_assert!(fsm.sm_data.s6b_aar_in_flight);
             fsm.set_s6b_aar_in_flight(false);
             prop_assert!(!fsm.sm_data.s6b_aar_in_flight);
-            
+
             fsm.set_gx_ccr_init_in_flight(true);
             prop_assert!(fsm.sm_data.gx_ccr_init_in_flight);
-            
+
             fsm.set_gy_ccr_init_in_flight(true);
             prop_assert!(fsm.sm_data.gy_ccr_init_in_flight);
-            
+
             fsm.set_gx_ccr_term_in_flight(true);
             prop_assert!(fsm.sm_data.gx_ccr_term_in_flight);
-            
+
             fsm.set_gy_ccr_term_in_flight(true);
             prop_assert!(fsm.sm_data.gy_ccr_term_in_flight);
-            
+
             fsm.set_s6b_str_in_flight(true);
             prop_assert!(fsm.sm_data.s6b_str_in_flight);
         }
@@ -376,7 +376,7 @@ mod tests {
         fn prop_pfcp_fsm_init_transitions_to_will_associate(pfcp_node_id in 1u64..10000) {
             let mut fsm = PfcpFsm::new(pfcp_node_id);
             prop_assert_eq!(fsm.state, PfcpState::Initial);
-            
+
             fsm.init();
             prop_assert_eq!(fsm.state, PfcpState::WillAssociate);
         }
@@ -388,7 +388,7 @@ mod tests {
         fn prop_pfcp_fsm_fini_transitions_to_final(pfcp_node_id in 1u64..10000) {
             let mut fsm = PfcpFsm::new(pfcp_node_id);
             fsm.init();
-            
+
             fsm.fini();
             prop_assert_eq!(fsm.state, PfcpState::Final);
         }
@@ -400,7 +400,7 @@ mod tests {
         fn prop_pfcp_fsm_entry_event_transitions(pfcp_node_id in 1u64..10000) {
             let mut fsm = PfcpFsm::new(pfcp_node_id);
             let event = SmfEvent::entry();
-            
+
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, PfcpFsmResult::Transition(PfcpState::WillAssociate));
             prop_assert_eq!(fsm.state, PfcpState::WillAssociate);
@@ -418,7 +418,7 @@ mod tests {
             fsm.init();
             fsm.fini();
             prop_assert_eq!(fsm.state, PfcpState::Final);
-            
+
             let event = SmfEvent::new(event_id);
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, PfcpFsmResult::Ignored);
@@ -496,7 +496,7 @@ mod tests {
         #[test]
         fn prop_timer_classification_consistent(timer_id in arb_smf_timer_id()) {
             let is_pfcp = timer_id.is_pfcp_timer();
-            
+
             // PFCP timers should be correctly identified
             let expected_pfcp = matches!(
                 timer_id,
@@ -506,7 +506,7 @@ mod tests {
                     | SmfTimerId::PfcpNoDeletionResponse
             );
             prop_assert_eq!(is_pfcp, expected_pfcp);
-            
+
             // Timer name should be non-empty
             prop_assert!(!timer_id.name().is_empty());
         }
@@ -520,8 +520,8 @@ mod tests {
             prop_assert!(!name.is_empty());
             // SMF events should have recognizable prefixes
             prop_assert!(
-                name.contains("FSM") || 
-                name.contains("SMF") || 
+                name.contains("FSM") ||
+                name.contains("SMF") ||
                 name.contains("SBI") ||
                 name.contains("EVENT")
             );
@@ -540,22 +540,22 @@ mod tests {
             let mut gsm_fsm1 = GsmFsm::new(sess_id1);
             let mut gsm_fsm2 = GsmFsm::new(sess_id2);
             let mut pfcp_fsm = PfcpFsm::new(pfcp_node_id);
-            
+
             // Initialize all FSMs
             smf_fsm.init();
             gsm_fsm1.init();
             gsm_fsm2.init();
             pfcp_fsm.init();
-            
+
             // Verify independent states
             prop_assert_eq!(smf_fsm.state, SmfState::Operational);
             prop_assert_eq!(gsm_fsm1.state, GsmState::Initial);
             prop_assert_eq!(gsm_fsm2.state, GsmState::Initial);
             prop_assert_eq!(pfcp_fsm.state, PfcpState::WillAssociate);
-            
+
             // Transition one GSM FSM
             gsm_fsm1.transition_to(GsmState::Operational);
-            
+
             // Verify other FSMs are unaffected
             prop_assert_eq!(gsm_fsm1.state, GsmState::Operational);
             prop_assert_eq!(gsm_fsm2.state, GsmState::Initial);
@@ -569,20 +569,20 @@ mod tests {
         #[test]
         fn prop_gsm_session_lifecycle(sess_id in 1u64..10000) {
             let mut fsm = GsmFsm::new(sess_id);
-            
+
             // Initial state
             prop_assert!(fsm.is_initial());
             prop_assert!(!fsm.is_operational());
-            
+
             // Transition to operational
             fsm.transition_to(GsmState::Operational);
             prop_assert!(fsm.is_operational());
             prop_assert!(!fsm.is_initial());
-            
+
             // Transition to deletion
             fsm.transition_to(GsmState::WaitPfcpDeletion);
             prop_assert!(!fsm.is_operational());
-            
+
             // Transition to release
             fsm.transition_to(GsmState::SessionWillRelease);
             prop_assert!(!fsm.is_operational());
@@ -594,19 +594,19 @@ mod tests {
         #[test]
         fn prop_pfcp_association_lifecycle(pfcp_node_id in 1u64..10000) {
             let mut fsm = PfcpFsm::new(pfcp_node_id);
-            
+
             // Initial state
             prop_assert!(!fsm.is_associated());
-            
+
             // Initialize - should go to WillAssociate
             fsm.init();
             prop_assert!(!fsm.is_associated());
             prop_assert_eq!(fsm.state, PfcpState::WillAssociate);
-            
+
             // Transition to Associated
             fsm.transition_to(PfcpState::Associated);
             prop_assert!(fsm.is_associated());
-            
+
             // Transition back to WillAssociate (e.g., after heartbeat failure)
             fsm.transition_to(PfcpState::WillAssociate);
             prop_assert!(!fsm.is_associated());

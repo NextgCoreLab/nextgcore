@@ -107,7 +107,9 @@ impl McastContext {
             teid_index.remove(&session.ingress_teid);
             log::info!(
                 "Multicast session deactivated: seid={} (forwarded {} pkts, {} bytes)",
-                n4mb_seid, session.packets_forwarded, session.bytes_forwarded
+                n4mb_seid,
+                session.packets_forwarded,
+                session.bytes_forwarded
             );
             return Some(session);
         }
@@ -131,7 +133,11 @@ impl McastContext {
                 });
                 log::info!(
                     "Multicast gNB added: seid={} gnb={} teid={:#x} addr={} (total={})",
-                    n4mb_seid, gnb_id, gnb_teid, gnb_addr, session.gnb_endpoints.len()
+                    n4mb_seid,
+                    gnb_id,
+                    gnb_teid,
+                    gnb_addr,
+                    session.gnb_endpoints.len()
                 );
                 return true;
             }
@@ -178,7 +184,8 @@ impl McastContext {
         };
 
         // Multicast replication: one incoming packet → multiple outgoing GTP-U tunnels
-        session.gnb_endpoints
+        session
+            .gnb_endpoints
             .iter()
             .map(|e| (e.gnb_addr, e.gnb_teid))
             .collect()
@@ -218,7 +225,8 @@ impl McastContext {
 
     /// Get all active multicast sessions
     pub fn active_sessions(&self) -> Vec<McastSession> {
-        self.sessions.read()
+        self.sessions
+            .read()
             .map(|s| s.values().filter(|s| s.active).cloned().collect())
             .expect("value expected")
     }
@@ -248,9 +256,9 @@ mod tests {
     fn test_session_activate_deactivate() {
         let ctx = McastContext::new();
 
-        let session = ctx.session_activate(
-            0x100, 1001, 2001, Ipv4Addr::new(10, 0, 0, 1),
-        ).unwrap();
+        let session = ctx
+            .session_activate(0x100, 1001, 2001, Ipv4Addr::new(10, 0, 0, 1))
+            .unwrap();
         assert!(session.active);
         assert_eq!(session.n4mb_seid, 0x100);
         assert_eq!(ctx.session_count(), 1);
@@ -281,9 +289,9 @@ mod tests {
     #[test]
     fn test_forward_lookup() {
         let ctx = McastContext::new();
-        let session = ctx.session_activate(
-            0x300, 1003, 2003, Ipv4Addr::new(10, 0, 0, 1),
-        ).unwrap();
+        let session = ctx
+            .session_activate(0x300, 1003, 2003, Ipv4Addr::new(10, 0, 0, 1))
+            .unwrap();
 
         ctx.add_gnb_endpoint(0x300, Ipv4Addr::new(10, 0, 1, 1), 0x4001, "gnb-001");
         ctx.add_gnb_endpoint(0x300, Ipv4Addr::new(10, 0, 1, 2), 0x4002, "gnb-002");

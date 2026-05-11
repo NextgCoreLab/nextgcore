@@ -42,7 +42,7 @@ mod tests {
             ) {
                 let result1 = milenage_f2345(&opc, &k, &rand);
                 let result2 = milenage_f2345(&opc, &k, &rand);
-                
+
                 prop_assert!(result1.is_ok() == result2.is_ok());
                 if let (Ok(r1), Ok(r2)) = (result1, result2) {
                     prop_assert_eq!(r1, r2, "f2345 must be deterministic");
@@ -73,15 +73,15 @@ mod tests {
                 data in prop::collection::vec(any::<u8>(), 1..256),
             ) {
                 let bit_length = data.len() * 8;
-                
+
                 // Encrypt
                 let mut encrypted = data.clone();
                 kasumi_f8(&key, count, bearer, direction, &mut encrypted, bit_length);
-                
+
                 // Decrypt (same operation for stream cipher)
                 let mut decrypted = encrypted.clone();
                 kasumi_f8(&key, count, bearer, direction, &mut decrypted, bit_length);
-                
+
                 prop_assert_eq!(data, decrypted, "f8 encrypt/decrypt round-trip must recover original");
             }
 
@@ -96,10 +96,10 @@ mod tests {
                 data in prop::collection::vec(any::<u8>(), 1..256),
             ) {
                 let bit_length = data.len() * 8;
-                
+
                 let mac1 = kasumi_f9(&key, count, fresh, direction, &data, bit_length);
                 let mac2 = kasumi_f9(&key, count, fresh, direction, &data, bit_length);
-                
+
                 prop_assert_eq!(mac1, mac2, "f9 MAC must be deterministic");
             }
         }
@@ -127,15 +127,15 @@ mod tests {
                 data in prop::collection::vec(any::<u8>(), 1..256),
             ) {
                 let bit_length = (data.len() * 8) as u32;
-                
+
                 // Encrypt
                 let mut encrypted = data.clone();
                 snow_3g_f8(&key, count, bearer, direction, &mut encrypted, bit_length);
-                
+
                 // Decrypt (same operation for stream cipher)
                 let mut decrypted = encrypted.clone();
                 snow_3g_f8(&key, count, bearer, direction, &mut decrypted, bit_length);
-                
+
                 prop_assert_eq!(data, decrypted, "SNOW 3G f8 round-trip must recover original");
             }
 
@@ -150,10 +150,10 @@ mod tests {
                 data in prop::collection::vec(any::<u8>(), 1..256),
             ) {
                 let bit_length = (data.len() * 8) as u64;
-                
+
                 let mac1 = snow_3g_f9(&key, count, fresh, direction, &data, bit_length);
                 let mac2 = snow_3g_f9(&key, count, fresh, direction, &data, bit_length);
-                
+
                 prop_assert_eq!(mac1, mac2, "SNOW 3G f9 MAC must be deterministic");
             }
         }
@@ -181,15 +181,15 @@ mod tests {
                 data in prop::collection::vec(any::<u8>(), 1..256),
             ) {
                 let bit_length = (data.len() * 8) as u32;
-                
+
                 // Encrypt
                 let mut encrypted = vec![0u8; data.len()];
                 zuc_eea3(&key, count, bearer, direction, bit_length, &data, &mut encrypted);
-                
+
                 // Decrypt (same operation for stream cipher)
                 let mut decrypted = vec![0u8; encrypted.len()];
                 zuc_eea3(&key, count, bearer, direction, bit_length, &encrypted, &mut decrypted);
-                
+
                 prop_assert_eq!(data, decrypted, "ZUC EEA3 round-trip must recover original");
             }
 
@@ -204,10 +204,10 @@ mod tests {
                 data in prop::collection::vec(any::<u8>(), 1..256),
             ) {
                 let bit_length = (data.len() * 8) as u32;
-                
+
                 let mac1 = zuc_eia3(&key, count, bearer, direction, bit_length, &data);
                 let mac2 = zuc_eia3(&key, count, bearer, direction, bit_length, &data);
-                
+
                 prop_assert_eq!(mac1, mac2, "ZUC EIA3 MAC must be deterministic");
             }
         }
@@ -233,13 +233,13 @@ mod tests {
             ) {
                 let enc_ctx = AesEncContext::new(&key, 128).unwrap();
                 let dec_ctx = AesDecContext::new(&key, 128).unwrap();
-                
+
                 let mut ciphertext = [0u8; 16];
                 enc_ctx.encrypt_block(&plaintext, &mut ciphertext);
-                
+
                 let mut decrypted = [0u8; 16];
                 dec_ctx.decrypt_block(&ciphertext, &mut decrypted);
-                
+
                 prop_assert_eq!(plaintext, decrypted, "AES ECB round-trip must recover original");
             }
 
@@ -253,15 +253,15 @@ mod tests {
                 blocks in 1usize..16,
             ) {
                 let plaintext: Vec<u8> = (0..(blocks * 16)).map(|i| i as u8).collect();
-                
+
                 let mut enc_iv = iv;
                 let mut ciphertext = vec![0u8; plaintext.len()];
                 aes_cbc_encrypt(&key, 128, &mut enc_iv, &plaintext, &mut ciphertext).unwrap();
-                
+
                 let mut dec_iv = iv;
                 let mut decrypted = vec![0u8; ciphertext.len()];
                 aes_cbc_decrypt(&key, 128, &mut dec_iv, &ciphertext, &mut decrypted).unwrap();
-                
+
                 prop_assert_eq!(plaintext, decrypted, "AES CBC round-trip must recover original");
             }
 
@@ -276,11 +276,11 @@ mod tests {
                 let mut enc_iv = iv;
                 let mut encrypted = vec![0u8; data.len()];
                 aes_ctr128_encrypt(&key, &mut enc_iv, &data, &mut encrypted).unwrap();
-                
+
                 let mut dec_iv = iv;
                 let mut decrypted = vec![0u8; encrypted.len()];
                 aes_ctr128_encrypt(&key, &mut dec_iv, &encrypted, &mut decrypted).unwrap();
-                
+
                 prop_assert_eq!(data, decrypted, "AES CTR round-trip must recover original");
             }
         }
@@ -306,7 +306,7 @@ mod tests {
             ) {
                 let mac1 = aes_cmac_calculate(&key, &data);
                 let mac2 = aes_cmac_calculate(&key, &data);
-                
+
                 prop_assert_eq!(mac1, mac2, "AES-CMAC must be deterministic");
             }
 
@@ -319,10 +319,10 @@ mod tests {
                 data2 in prop::collection::vec(any::<u8>(), 1..128),
             ) {
                 prop_assume!(data1 != data2);
-                
+
                 let mac1 = aes_cmac_calculate(&key, &data1);
                 let mac2 = aes_cmac_calculate(&key, &data2);
-                
+
                 // Different inputs should produce different MACs
                 prop_assert_ne!(mac1, mac2, "Different inputs should produce different MACs");
             }
@@ -348,7 +348,7 @@ mod tests {
             ) {
                 let hash1 = sha256(&data);
                 let hash2 = sha256(&data);
-                
+
                 prop_assert_eq!(hash1, hash2, "SHA-256 must be deterministic");
             }
 
@@ -358,7 +358,7 @@ mod tests {
             ) {
                 let hash1 = sha1(&data);
                 let hash2 = sha1(&data);
-                
+
                 prop_assert_eq!(hash1, hash2, "SHA-1 must be deterministic");
             }
 
@@ -373,14 +373,14 @@ mod tests {
                 let mut combined = part1.clone();
                 combined.extend(&part2);
                 let oneshot = sha256(&combined);
-                
+
                 // Incremental hash
                 let mut ctx = Sha256Context::new();
                 ctx.update(&part1);
                 ctx.update(&part2);
                 let mut incremental = [0u8; SHA256_DIGEST_SIZE];
                 ctx.finalize(&mut incremental);
-                
+
                 prop_assert_eq!(oneshot, incremental, "Incremental SHA-256 must match one-shot");
             }
         }
@@ -406,7 +406,7 @@ mod tests {
             ) {
                 let kseaf1 = ogs_kdf_kseaf(&serving_network, &kausf);
                 let kseaf2 = ogs_kdf_kseaf(&serving_network, &kausf);
-                
+
                 prop_assert_eq!(kseaf1, kseaf2, "Kseaf derivation must be deterministic");
             }
 
@@ -417,7 +417,7 @@ mod tests {
             ) {
                 let kenb1 = ogs_kdf_kenb(&kasme, ul_count);
                 let kenb2 = ogs_kdf_kenb(&kasme, ul_count);
-                
+
                 prop_assert_eq!(kenb1, kenb2, "KeNB derivation must be deterministic");
             }
 
@@ -430,7 +430,7 @@ mod tests {
             ) {
                 let (ek1, icb1, mk1) = ogs_kdf_ansi_x963(&z, &info);
                 let (ek2, icb2, mk2) = ogs_kdf_ansi_x963(&z, &info);
-                
+
                 prop_assert_eq!(ek1, ek2, "ANSI X9.63 encryption key must be deterministic");
                 prop_assert_eq!(icb1, icb2, "ANSI X9.63 ICB must be deterministic");
                 prop_assert_eq!(mk1, mk2, "ANSI X9.63 MAC key must be deterministic");
@@ -457,18 +457,18 @@ mod tests {
                 let mut pub1 = [0u8; ECC_PUBLIC_KEY_SIZE];
                 let mut priv1 = [0u8; ECC_BYTES];
                 ecc_make_key(&mut pub1, &mut priv1).unwrap();
-                
+
                 let mut pub2 = [0u8; ECC_PUBLIC_KEY_SIZE];
                 let mut priv2 = [0u8; ECC_BYTES];
                 ecc_make_key(&mut pub2, &mut priv2).unwrap();
-                
+
                 // Compute shared secrets both ways
                 let mut secret1 = [0u8; ECC_BYTES];
                 let mut secret2 = [0u8; ECC_BYTES];
-                
+
                 ecdh_shared_secret(&pub2, &priv1, &mut secret1).unwrap();
                 ecdh_shared_secret(&pub1, &priv2, &mut secret2).unwrap();
-                
+
                 prop_assert_eq!(secret1, secret2, "ECDH shared secret must be symmetric");
             }
 
@@ -481,10 +481,10 @@ mod tests {
                 let mut public_key = [0u8; ECC_PUBLIC_KEY_SIZE];
                 let mut private_key = [0u8; ECC_BYTES];
                 ecc_make_key(&mut public_key, &mut private_key).unwrap();
-                
+
                 let mut signature = [0u8; ECC_SIGNATURE_SIZE];
                 ecdsa_sign(&private_key, &hash, &mut signature).unwrap();
-                
+
                 let valid = ecdsa_verify(&public_key, &hash, &signature).unwrap();
                 prop_assert!(valid, "ECDSA signature must verify with correct key");
             }
@@ -497,14 +497,14 @@ mod tests {
                 hash2 in prop::array::uniform32(any::<u8>()),
             ) {
                 prop_assume!(hash1 != hash2);
-                
+
                 let mut public_key = [0u8; ECC_PUBLIC_KEY_SIZE];
                 let mut private_key = [0u8; ECC_BYTES];
                 ecc_make_key(&mut public_key, &mut private_key).unwrap();
-                
+
                 let mut signature = [0u8; ECC_SIGNATURE_SIZE];
                 ecdsa_sign(&private_key, &hash1, &mut signature).unwrap();
-                
+
                 let valid = ecdsa_verify(&public_key, &hash2, &signature).unwrap();
                 prop_assert!(!valid, "ECDSA signature must fail with wrong hash");
             }

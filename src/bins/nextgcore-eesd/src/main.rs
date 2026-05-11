@@ -12,8 +12,8 @@ use clap::Parser;
 use ogs_sbi::context::global_context;
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::server::{
-    send_bad_request, send_method_not_allowed, send_not_found,
-    SbiServer, SbiServerConfig as OgsSbiServerConfig,
+    send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
+    SbiServerConfig as OgsSbiServerConfig,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -97,11 +97,10 @@ async fn main() -> Result<()> {
     init_logging(&args.log_level);
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
-            .with_endpoint(
-                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
-            ),
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+        ),
     )
     .ok();
 
@@ -109,6 +108,8 @@ async fn main() -> Result<()> {
     log::info!("Edge Enabler Server (3GPP TS 23.558)");
 
     ees_context_init(args.max_eas);
+
+    let nf_instance_id = format!("ees-{}", uuid::Uuid::new_v4());
 
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());
@@ -119,32 +120,44 @@ async fn main() -> Result<()> {
 
     let mut sbi_server_config = OgsSbiServerConfig::new(addr);
     if args.tls {
-        let cert = args.tls_cert.as_deref().unwrap_or("/etc/nextgcore/tls/server.crt");
-        let key = args.tls_key.as_deref().unwrap_or("/etc/nextgcore/tls/server.key");
+        let cert = args
+            .tls_cert
+            .as_deref()
+            .unwrap_or("/etc/nextgcore/tls/server.crt");
+        let key = args
+            .tls_key
+            .as_deref()
+            .unwrap_or("/etc/nextgcore/tls/server.key");
         sbi_server_config = sbi_server_config.with_tls(key, cert);
     }
 
     let sbi_server = SbiServer::new(sbi_server_config);
 
     log::info!("Starting EES SBI server on {addr}");
-    sbi_server.start(ees_sbi_request_handler).await
+    sbi_server
+        .start(ees_sbi_request_handler)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
     // Register with NRF
     let sbi_ctx = global_context();
     sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
-    if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port).await {
+    if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port, &nf_instance_id).await {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
+    } else {
+        ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id.clone(), 5);
     }
 
-    log::info!("NextGCore EES ready");
+    log::info!("NextGCore EES ready (instance: {nf_instance_id})");
 
     while !shutdown.load(Ordering::SeqCst) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     log::info!("Shutting down...");
-    sbi_server.stop().await
+    sbi_server
+        .stop()
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
 
     ees_context_final();
@@ -165,44 +178,32 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 
     match parts.as_slice() {
         // EAS Registration (Nees_EASRegistration)
-        ["nees-easregistration", "v1", "registrations"] => {
-            match method {
-                "POST" => handle_eas_register(&request).await,
-                "GET" => handle_eas_list().await,
-                _ => send_method_not_allowed(method, "registrations"),
-            }
-        }
-        ["nees-easregistration", "v1", "registrations", eas_id] => {
-            match method {
-                "GET" => handle_eas_get(eas_id).await,
-                "DELETE" => handle_eas_deregister(eas_id).await,
-                _ => send_method_not_allowed(method, "registrations/{id}"),
-            }
-        }
+        ["nees-easregistration", "v1", "registrations"] => match method {
+            "POST" => handle_eas_register(&request).await,
+            "GET" => handle_eas_list().await,
+            _ => send_method_not_allowed(method, "registrations"),
+        },
+        ["nees-easregistration", "v1", "registrations", eas_id] => match method {
+            "GET" => handle_eas_get(eas_id).await,
+            "DELETE" => handle_eas_deregister(eas_id).await,
+            _ => send_method_not_allowed(method, "registrations/{id}"),
+        },
         // EAS Discovery (Nees_EASDiscovery)
-        ["nees-easdiscovery", "v1", "discover"] => {
-            match method {
-                "POST" => handle_eas_discover(&request).await,
-                _ => send_method_not_allowed(method, "discover"),
-            }
-        }
+        ["nees-easdiscovery", "v1", "discover"] => match method {
+            "POST" => handle_eas_discover(&request).await,
+            _ => send_method_not_allowed(method, "discover"),
+        },
         // UE Context Transfer (Nees_UEContextTransfer)
-        ["nees-uecontexttransfer", "v1", "contexts"] => {
-            match method {
-                "POST" => handle_ue_context_store(&request).await,
-                _ => send_method_not_allowed(method, "contexts"),
-            }
-        }
-        ["nees-uecontexttransfer", "v1", "contexts", supi] => {
-            match method {
-                "GET" => handle_ue_context_get(supi).await,
-                "PATCH" => handle_ue_context_transfer(supi, &request).await,
-                _ => send_method_not_allowed(method, "contexts/{supi}"),
-            }
-        }
-        _ => {
-            send_not_found(&format!("Resource not found: {path}"), None)
-        }
+        ["nees-uecontexttransfer", "v1", "contexts"] => match method {
+            "POST" => handle_ue_context_store(&request).await,
+            _ => send_method_not_allowed(method, "contexts"),
+        },
+        ["nees-uecontexttransfer", "v1", "contexts", supi] => match method {
+            "GET" => handle_ue_context_get(supi).await,
+            "PATCH" => handle_ue_context_transfer(supi, &request).await,
+            _ => send_method_not_allowed(method, "contexts/{supi}"),
+        },
+        _ => send_not_found(&format!("Resource not found: {path}"), None),
     }
 }
 
@@ -220,14 +221,31 @@ async fn handle_eas_register(request: &SbiRequest) -> SbiResponse {
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let endpoint = data.get("endpoint").and_then(|v| v.as_str()).unwrap_or("http://localhost:8080");
-    let app_id = data.get("appId").and_then(|v| v.as_str()).unwrap_or("default-app");
-    let eas_type = data.get("easType").and_then(|v| v.as_str()).unwrap_or("GENERIC");
-    let dns_name = data.get("dnsName").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let tacs: Vec<u32> = data.get("servingAreaTacs")
+    let endpoint = data
+        .get("endpoint")
+        .and_then(|v| v.as_str())
+        .unwrap_or("http://localhost:8080");
+    let app_id = data
+        .get("appId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default-app");
+    let eas_type = data
+        .get("easType")
+        .and_then(|v| v.as_str())
+        .unwrap_or("GENERIC");
+    let dns_name = data
+        .get("dnsName")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let tacs: Vec<u32> = data
+        .get("servingAreaTacs")
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as u32)).collect())
-        .expect("value expected");
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                .collect()
+        })
+        .unwrap_or_default();
 
     let profile = EasProfile {
         eas_id: String::new(),
@@ -248,18 +266,19 @@ async fn handle_eas_register(request: &SbiRequest) -> SbiResponse {
     };
 
     match result {
-        Some(profile) => {
-            SbiResponse::with_status(201)
-                .with_header("Location", format!("/nees-easregistration/v1/registrations/{}", profile.eas_id))
-                .with_json_body(&serde_json::json!({
-                    "easId": profile.eas_id,
-                    "endpoint": profile.endpoint,
-                    "appId": profile.app_id,
-                    "easType": profile.eas_type,
-                    "status": "REGISTERED",
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(201))
-        }
+        Some(profile) => SbiResponse::with_status(201)
+            .with_header(
+                "Location",
+                format!("/nees-easregistration/v1/registrations/{}", profile.eas_id),
+            )
+            .with_json_body(&serde_json::json!({
+                "easId": profile.eas_id,
+                "endpoint": profile.endpoint,
+                "appId": profile.app_id,
+                "easType": profile.eas_type,
+                "status": "REGISTERED",
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(201)),
         None => send_bad_request("Failed to register EAS", Some("REGISTRATION_FAILED")),
     }
 }
@@ -268,15 +287,19 @@ async fn handle_eas_register(request: &SbiRequest) -> SbiResponse {
 async fn handle_eas_list() -> SbiResponse {
     let ctx = ees_self();
     let profiles: Vec<serde_json::Value> = if let Ok(context) = ctx.read() {
-        context.eas_list().iter().map(|p| {
-            serde_json::json!({
-                "easId": p.eas_id,
-                "endpoint": p.endpoint,
-                "appId": p.app_id,
-                "easType": p.eas_type,
-                "status": format!("{:?}", p.status),
+        context
+            .eas_list()
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "easId": p.eas_id,
+                    "endpoint": p.endpoint,
+                    "appId": p.app_id,
+                    "easType": p.eas_type,
+                    "status": format!("{:?}", p.status),
+                })
             })
-        }).collect()
+            .collect()
     } else {
         vec![]
     };
@@ -296,19 +319,17 @@ async fn handle_eas_get(eas_id: &str) -> SbiResponse {
     };
 
     match profile {
-        Some(p) => {
-            SbiResponse::with_status(200)
-                .with_json_body(&serde_json::json!({
-                    "easId": p.eas_id,
-                    "endpoint": p.endpoint,
-                    "appId": p.app_id,
-                    "easType": p.eas_type,
-                    "dnsName": p.dns_name,
-                    "servingAreaTacs": p.serving_area_tacs,
-                    "status": format!("{:?}", p.status),
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(200))
-        }
+        Some(p) => SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({
+                "easId": p.eas_id,
+                "endpoint": p.endpoint,
+                "appId": p.app_id,
+                "easType": p.eas_type,
+                "dnsName": p.dns_name,
+                "servingAreaTacs": p.serving_area_tacs,
+                "status": format!("{:?}", p.status),
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
         None => send_not_found(&format!("EAS {eas_id} not found"), Some("EAS_NOT_FOUND")),
     }
 }
@@ -345,19 +366,26 @@ async fn handle_eas_discover(request: &SbiRequest) -> SbiResponse {
     };
 
     let app_id = data.get("appId").and_then(|v| v.as_str()).unwrap_or("");
-    let tac = data.get("servingTac").and_then(|v| v.as_u64()).map(|n| n as u32);
+    let tac = data
+        .get("servingTac")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32);
 
     let ctx = ees_self();
     let results: Vec<serde_json::Value> = if let Ok(context) = ctx.read() {
-        context.eas_discover(app_id, tac).iter().map(|r| {
-            serde_json::json!({
-                "easId": r.eas_id,
-                "endpoint": r.endpoint,
-                "appId": r.app_id,
-                "dnsName": r.dns_name,
-                "distanceScore": r.distance_score,
+        context
+            .eas_discover(app_id, tac)
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "easId": r.eas_id,
+                    "endpoint": r.endpoint,
+                    "appId": r.app_id,
+                    "dnsName": r.dns_name,
+                    "distanceScore": r.distance_score,
+                })
             })
-        }).collect()
+            .collect()
     } else {
         vec![]
     };
@@ -382,9 +410,18 @@ async fn handle_ue_context_store(request: &SbiRequest) -> SbiResponse {
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let supi = data.get("supi").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let eas_id = data.get("currentEasId").and_then(|v| v.as_str()).map(|s| s.to_string());
-    let app_data = data.get("appContextData").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let supi = data
+        .get("supi")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let eas_id = data
+        .get("currentEasId")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let app_data = data
+        .get("appContextData")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
     let tac = data.get("servingTac").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
     let ue_ctx = UeEdgeContext {
@@ -420,16 +457,17 @@ async fn handle_ue_context_get(supi: &str) -> SbiResponse {
     };
 
     match ue_ctx {
-        Some(c) => {
-            SbiResponse::with_status(200)
-                .with_json_body(&serde_json::json!({
-                    "supi": c.supi,
-                    "currentEasId": c.current_eas_id,
-                    "servingTac": c.serving_tac,
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(200))
-        }
-        None => send_not_found(&format!("UE context for {supi} not found"), Some("CONTEXT_NOT_FOUND")),
+        Some(c) => SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({
+                "supi": c.supi,
+                "currentEasId": c.current_eas_id,
+                "servingTac": c.serving_tac,
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("UE context for {supi} not found"),
+            Some("CONTEXT_NOT_FOUND"),
+        ),
     }
 }
 
@@ -447,7 +485,10 @@ async fn handle_ue_context_transfer(supi: &str, request: &SbiRequest) -> SbiResp
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let new_eas_id = data.get("targetEasId").and_then(|v| v.as_str()).unwrap_or("");
+    let new_eas_id = data
+        .get("targetEasId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     let ctx = ees_self();
     let transferred = if let Ok(context) = ctx.read() {
@@ -465,12 +506,19 @@ async fn handle_ue_context_transfer(supi: &str, request: &SbiRequest) -> SbiResp
             }))
             .unwrap_or_else(|_| SbiResponse::with_status(200))
     } else {
-        send_not_found(&format!("UE context for {supi} not found"), Some("CONTEXT_NOT_FOUND"))
+        send_not_found(
+            &format!("UE context for {supi} not found"),
+            Some("CONTEXT_NOT_FOUND"),
+        )
     }
 }
 
 /// Register EES with NRF
-async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> {
+async fn register_with_nrf(
+    sbi_addr: &str,
+    sbi_port: u16,
+    nf_instance_id: &str,
+) -> Result<(), String> {
     let sbi_ctx = global_context();
 
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
@@ -486,11 +534,10 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> 
 
     let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
     let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
-    let nf_instance_id = uuid::Uuid::new_v4().to_string();
 
     let nf_profile = serde_json::json!({
         "nfInstanceId": nf_instance_id,
-        "nfType": "EASDF",
+        "nfType": "EES",
         "nfStatus": "REGISTERED",
         "ipv4Addresses": [sbi_addr],
         "nfServices": [
@@ -527,23 +574,31 @@ async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<(), String> 
         200 | 201 => {
             log::info!("EES registered with NRF successfully (id={nf_instance_id})");
 
-            let mut self_instance = ogs_sbi::context::NfInstance::new(
-                &nf_instance_id,
-                ogs_sbi::types::NfType::Easdf,
-            );
+            let mut self_instance =
+                ogs_sbi::context::NfInstance::new(nf_instance_id, ogs_sbi::types::NfType::Ees);
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
             let mut svc = ogs_sbi::context::NfService::new(
                 "nees-easregistration",
-                ogs_sbi::types::SbiServiceType::Null,
+                ogs_sbi::types::SbiServiceType::NneesEasregistration,
             );
             svc.port = sbi_port;
             svc.ip_addresses = vec![sbi_addr.to_string()];
             self_instance.add_service(svc);
+            let mut svc2 = ogs_sbi::context::NfService::new(
+                "nees-easdiscovery",
+                ogs_sbi::types::SbiServiceType::NneesEasdiscovery,
+            );
+            svc2.port = sbi_port;
+            svc2.ip_addresses = vec![sbi_addr.to_string()];
+            self_instance.add_service(svc2);
             sbi_ctx.set_self_instance(self_instance).await;
 
             Ok(())
         }
-        _ => Err(format!("NRF registration returned status {}", response.status)),
+        _ => Err(format!(
+            "NRF registration returned status {}",
+            response.status
+        )),
     }
 }
 
@@ -553,7 +608,9 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
         .strip_prefix("https://")
         .or_else(|| uri.strip_prefix("http://"))
         .unwrap_or(uri);
-    let (host_port, _path) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    let (host_port, _path) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
     if let Some((host, port_str)) = host_port.rsplit_once(':') {
         let port: u16 = port_str.parse().ok()?;
         Some((host.to_string(), port))

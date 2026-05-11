@@ -2,12 +2,12 @@
 //!
 //! Based on 3GPP TS 24.501
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use crate::error::{NasError, NasResult};
-use crate::common::types::*;
-use super::types::*;
 use super::header::*;
 use super::ie::*;
+use super::types::*;
+use crate::common::types::*;
+use crate::error::{NasError, NasResult};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// 5GMM message
 #[derive(Debug, Clone, PartialEq)]
@@ -90,7 +90,10 @@ impl RegistrationRequest {
     /// Decode registration request from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
 
         let first_byte = buf.get_u8();
@@ -276,10 +279,16 @@ impl RegistrationReject {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let gmm_cause = buf.get_u8();
-        let mut msg = Self { gmm_cause, ..Default::default() };
+        let mut msg = Self {
+            gmm_cause,
+            ..Default::default()
+        };
 
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
@@ -347,7 +356,9 @@ impl RegistrationComplete {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -375,13 +386,20 @@ impl DeregistrationRequestFromUe {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let first_byte = buf.get_u8();
         let de_registration_type = DeRegistrationType::decode(first_byte & 0x0F);
         let ngksi = KeySetIdentifier::decode((first_byte >> 4) & 0x0F);
         let mobile_identity = MobileIdentity::decode(buf)?;
-        Ok(Self { de_registration_type, ngksi, mobile_identity })
+        Ok(Self {
+            de_registration_type,
+            ngksi,
+            mobile_identity,
+        })
     }
 }
 
@@ -411,11 +429,17 @@ impl DeregistrationRequestToUe {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let first_byte = buf.get_u8();
         let de_registration_type = DeRegistrationType::decode(first_byte & 0x0F);
-        let mut msg = Self { de_registration_type, ..Default::default() };
+        let mut msg = Self {
+            de_registration_type,
+            ..Default::default()
+        };
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
             match iei {
@@ -433,7 +457,9 @@ impl DeregistrationRequestToUe {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -485,7 +511,10 @@ impl ServiceRequest {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let first_byte = buf.get_u8();
         let ngksi = KeySetIdentifier::decode((first_byte >> 4) & 0x0F);
@@ -501,7 +530,12 @@ impl ServiceRequest {
             _ => ServiceType::UnusedFallback,
         };
         let s_tmsi = MobileIdentity::decode(buf)?;
-        let mut msg = Self { ngksi, service_type, s_tmsi, ..Default::default() };
+        let mut msg = Self {
+            ngksi,
+            service_type,
+            s_tmsi,
+            ..Default::default()
+        };
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
             match iei {
@@ -525,7 +559,9 @@ impl ServiceRequest {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -596,7 +632,9 @@ impl ServiceAccept {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -637,10 +675,16 @@ impl ServiceReject {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let gmm_cause = buf.get_u8();
-        let mut msg = Self { gmm_cause, ..Default::default() };
+        let mut msg = Self {
+            gmm_cause,
+            ..Default::default()
+        };
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
             match iei {
@@ -660,7 +704,9 @@ impl ServiceReject {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -707,12 +753,19 @@ impl AuthenticationRequest {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let ngksi = KeySetIdentifier::decode(buf.get_u8() & 0x0F);
         let abba = Abba::decode(buf)?;
 
-        let mut msg = Self { ngksi, abba, ..Default::default() };
+        let mut msg = Self {
+            ngksi,
+            abba,
+            ..Default::default()
+        };
 
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
@@ -782,7 +835,8 @@ impl AuthenticationResponse {
             match iei {
                 0x2D => {
                     buf.advance(1);
-                    msg.authentication_response_parameter = Some(AuthenticationResponseParameter::decode(buf)?);
+                    msg.authentication_response_parameter =
+                        Some(AuthenticationResponseParameter::decode(buf)?);
                 }
                 0x78 => {
                     buf.advance(1);
@@ -792,7 +846,9 @@ impl AuthenticationResponse {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -829,7 +885,9 @@ impl AuthenticationReject {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -859,10 +917,16 @@ impl AuthenticationFailure {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let gmm_cause = buf.get_u8();
-        let mut msg = Self { gmm_cause, ..Default::default() };
+        let mut msg = Self {
+            gmm_cause,
+            ..Default::default()
+        };
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
             match iei {
@@ -871,7 +935,8 @@ impl AuthenticationFailure {
                     if buf.remaining() >= 1 {
                         let len = buf.get_u8() as usize;
                         if buf.remaining() >= len {
-                            msg.authentication_failure_parameter = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.authentication_failure_parameter =
+                                Some(buf.copy_to_bytes(len).to_vec());
                         }
                     }
                 }
@@ -879,7 +944,9 @@ impl AuthenticationFailure {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -911,11 +978,18 @@ impl AuthenticationResult {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let ngksi = KeySetIdentifier::decode(buf.get_u8() & 0x0F);
         let eap_message = EapMessage::decode(buf)?;
-        let mut msg = Self { ngksi, eap_message, ..Default::default() };
+        let mut msg = Self {
+            ngksi,
+            eap_message,
+            ..Default::default()
+        };
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
             match iei {
@@ -927,7 +1001,9 @@ impl AuthenticationResult {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -950,7 +1026,10 @@ impl IdentityRequest {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let byte = buf.get_u8();
         let identity_type = match byte & 0x07 {
@@ -1038,7 +1117,10 @@ impl SecurityModeCommand {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 2 {
-            return Err(NasError::BufferTooShort { expected: 2, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 2,
+                actual: buf.remaining(),
+            });
         }
         let selected_nas_security_algorithms = SecurityAlgorithms::decode(buf.get_u8());
         let ngksi = KeySetIdentifier::decode(buf.get_u8() & 0x0F);
@@ -1061,7 +1143,8 @@ impl SecurityModeCommand {
                     buf.advance(1);
                     if buf.remaining() >= 2 {
                         let _len = buf.get_u8();
-                        msg.selected_eps_nas_security_algorithms = Some(SecurityAlgorithms::decode(buf.get_u8()));
+                        msg.selected_eps_nas_security_algorithms =
+                            Some(SecurityAlgorithms::decode(buf.get_u8()));
                     }
                 }
                 0x36 => {
@@ -1083,7 +1166,9 @@ impl SecurityModeCommand {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -1140,7 +1225,9 @@ impl SecurityModeComplete {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -1163,9 +1250,14 @@ impl SecurityModeReject {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
-        Ok(Self { gmm_cause: buf.get_u8() })
+        Ok(Self {
+            gmm_cause: buf.get_u8(),
+        })
     }
 }
 
@@ -1183,9 +1275,14 @@ impl FiveGmmStatus {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
-        Ok(Self { gmm_cause: buf.get_u8() })
+        Ok(Self {
+            gmm_cause: buf.get_u8(),
+        })
     }
 }
 
@@ -1237,7 +1334,10 @@ impl UlNasTransport {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let pct_byte = buf.get_u8();
         let payload_container_type = match pct_byte & 0x0F {
@@ -1253,7 +1353,11 @@ impl UlNasTransport {
             _ => PayloadContainerType::N1SmInformation,
         };
         let payload_container = PayloadContainer::decode(buf)?;
-        let mut msg = Self { payload_container_type, payload_container, ..Default::default() };
+        let mut msg = Self {
+            payload_container_type,
+            payload_container,
+            ..Default::default()
+        };
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
             let iei_type = if iei >= 0x80 { iei & 0xF0 } else { iei };
@@ -1297,7 +1401,9 @@ impl UlNasTransport {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -1349,7 +1455,10 @@ impl DlNasTransport {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let pct_byte = buf.get_u8();
         let payload_container_type = match pct_byte & 0x0F {
@@ -1365,7 +1474,11 @@ impl DlNasTransport {
             _ => PayloadContainerType::N1SmInformation,
         };
         let payload_container = PayloadContainer::decode(buf)?;
-        let mut msg = Self { payload_container_type, payload_container, ..Default::default() };
+        let mut msg = Self {
+            payload_container_type,
+            payload_container,
+            ..Default::default()
+        };
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
             match iei {
@@ -1399,7 +1512,9 @@ impl DlNasTransport {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -1596,7 +1711,9 @@ impl ConfigurationUpdateCommand {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -1619,9 +1736,14 @@ impl Notification {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
-        Ok(Self { access_type: buf.get_u8() & 0x03 })
+        Ok(Self {
+            access_type: buf.get_u8() & 0x03,
+        })
     }
 }
 
@@ -1653,7 +1775,9 @@ impl NotificationResponse {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -1708,12 +1832,19 @@ impl ControlPlaneServiceRequest {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let first_byte = buf.get_u8();
         let ngksi = KeySetIdentifier::decode((first_byte >> 4) & 0x0F);
         let control_plane_service_type = first_byte & 0x0F;
-        let mut msg = Self { ngksi, control_plane_service_type, ..Default::default() };
+        let mut msg = Self {
+            ngksi,
+            control_plane_service_type,
+            ..Default::default()
+        };
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
             let iei_type = if iei >= 0x80 { iei & 0xF0 } else { iei };
@@ -1747,7 +1878,9 @@ impl ControlPlaneServiceRequest {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -1774,7 +1907,10 @@ impl NetworkSliceSpecificAuthenticationCommand {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let s_nssai = SNssai::decode(buf)?;
         let eap_message = EapMessage::decode(buf)?;
-        Ok(Self { s_nssai, eap_message })
+        Ok(Self {
+            s_nssai,
+            eap_message,
+        })
     }
 }
 
@@ -1796,7 +1932,10 @@ impl NetworkSliceSpecificAuthenticationComplete {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let s_nssai = SNssai::decode(buf)?;
         let eap_message = EapMessage::decode(buf)?;
-        Ok(Self { s_nssai, eap_message })
+        Ok(Self {
+            s_nssai,
+            eap_message,
+        })
     }
 }
 
@@ -1818,7 +1957,10 @@ impl NetworkSliceSpecificAuthenticationResult {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let s_nssai = SNssai::decode(buf)?;
         let eap_message = EapMessage::decode(buf)?;
-        Ok(Self { s_nssai, eap_message })
+        Ok(Self {
+            s_nssai,
+            eap_message,
+        })
     }
 }
 
@@ -1831,9 +1973,15 @@ pub fn build_5gmm_message(msg: &FiveGmmMessage) -> BytesMut {
         FiveGmmMessage::RegistrationAccept(_) => FiveGmmMessageType::RegistrationAccept,
         FiveGmmMessage::RegistrationReject(_) => FiveGmmMessageType::RegistrationReject,
         FiveGmmMessage::RegistrationComplete(_) => FiveGmmMessageType::RegistrationComplete,
-        FiveGmmMessage::DeregistrationRequestFromUe(_) => FiveGmmMessageType::DeregistrationRequestFromUe,
-        FiveGmmMessage::DeregistrationAcceptFromUe => FiveGmmMessageType::DeregistrationAcceptFromUe,
-        FiveGmmMessage::DeregistrationRequestToUe(_) => FiveGmmMessageType::DeregistrationRequestToUe,
+        FiveGmmMessage::DeregistrationRequestFromUe(_) => {
+            FiveGmmMessageType::DeregistrationRequestFromUe
+        }
+        FiveGmmMessage::DeregistrationAcceptFromUe => {
+            FiveGmmMessageType::DeregistrationAcceptFromUe
+        }
+        FiveGmmMessage::DeregistrationRequestToUe(_) => {
+            FiveGmmMessageType::DeregistrationRequestToUe
+        }
         FiveGmmMessage::DeregistrationAcceptToUe => FiveGmmMessageType::DeregistrationAcceptToUe,
         FiveGmmMessage::ServiceRequest(_) => FiveGmmMessageType::ServiceRequest,
         FiveGmmMessage::ServiceAccept(_) => FiveGmmMessageType::ServiceAccept,
@@ -1851,14 +1999,26 @@ pub fn build_5gmm_message(msg: &FiveGmmMessage) -> BytesMut {
         FiveGmmMessage::FiveGmmStatus(_) => FiveGmmMessageType::FiveGmmStatus,
         FiveGmmMessage::UlNasTransport(_) => FiveGmmMessageType::UlNasTransport,
         FiveGmmMessage::DlNasTransport(_) => FiveGmmMessageType::DlNasTransport,
-        FiveGmmMessage::ConfigurationUpdateCommand(_) => FiveGmmMessageType::ConfigurationUpdateCommand,
-        FiveGmmMessage::ConfigurationUpdateComplete => FiveGmmMessageType::ConfigurationUpdateComplete,
+        FiveGmmMessage::ConfigurationUpdateCommand(_) => {
+            FiveGmmMessageType::ConfigurationUpdateCommand
+        }
+        FiveGmmMessage::ConfigurationUpdateComplete => {
+            FiveGmmMessageType::ConfigurationUpdateComplete
+        }
         FiveGmmMessage::Notification(_) => FiveGmmMessageType::Notification,
         FiveGmmMessage::NotificationResponse(_) => FiveGmmMessageType::NotificationResponse,
-        FiveGmmMessage::ControlPlaneServiceRequest(_) => FiveGmmMessageType::ControlPlaneServiceRequest,
-        FiveGmmMessage::NetworkSliceSpecificAuthenticationCommand(_) => FiveGmmMessageType::NetworkSliceSpecificAuthenticationCommand,
-        FiveGmmMessage::NetworkSliceSpecificAuthenticationComplete(_) => FiveGmmMessageType::NetworkSliceSpecificAuthenticationComplete,
-        FiveGmmMessage::NetworkSliceSpecificAuthenticationResult(_) => FiveGmmMessageType::NetworkSliceSpecificAuthenticationResult,
+        FiveGmmMessage::ControlPlaneServiceRequest(_) => {
+            FiveGmmMessageType::ControlPlaneServiceRequest
+        }
+        FiveGmmMessage::NetworkSliceSpecificAuthenticationCommand(_) => {
+            FiveGmmMessageType::NetworkSliceSpecificAuthenticationCommand
+        }
+        FiveGmmMessage::NetworkSliceSpecificAuthenticationComplete(_) => {
+            FiveGmmMessageType::NetworkSliceSpecificAuthenticationComplete
+        }
+        FiveGmmMessage::NetworkSliceSpecificAuthenticationResult(_) => {
+            FiveGmmMessageType::NetworkSliceSpecificAuthenticationResult
+        }
     };
 
     // Encode header
@@ -1910,27 +2070,27 @@ pub fn parse_5gmm_message(buf: &mut Bytes) -> NasResult<FiveGmmMessage> {
     let message_type = FiveGmmMessageType::try_from(header.message_type)?;
 
     match message_type {
-        FiveGmmMessageType::RegistrationRequest => {
-            Ok(FiveGmmMessage::RegistrationRequest(RegistrationRequest::decode(buf)?))
-        }
-        FiveGmmMessageType::RegistrationAccept => {
-            Ok(FiveGmmMessage::RegistrationAccept(RegistrationAccept::decode(buf)?))
-        }
-        FiveGmmMessageType::RegistrationReject => {
-            Ok(FiveGmmMessage::RegistrationReject(RegistrationReject::decode(buf)?))
-        }
-        FiveGmmMessageType::RegistrationComplete => {
-            Ok(FiveGmmMessage::RegistrationComplete(RegistrationComplete::decode(buf)?))
-        }
-        FiveGmmMessageType::DeregistrationRequestFromUe => {
-            Ok(FiveGmmMessage::DeregistrationRequestFromUe(DeregistrationRequestFromUe::decode(buf)?))
-        }
+        FiveGmmMessageType::RegistrationRequest => Ok(FiveGmmMessage::RegistrationRequest(
+            RegistrationRequest::decode(buf)?,
+        )),
+        FiveGmmMessageType::RegistrationAccept => Ok(FiveGmmMessage::RegistrationAccept(
+            RegistrationAccept::decode(buf)?,
+        )),
+        FiveGmmMessageType::RegistrationReject => Ok(FiveGmmMessage::RegistrationReject(
+            RegistrationReject::decode(buf)?,
+        )),
+        FiveGmmMessageType::RegistrationComplete => Ok(FiveGmmMessage::RegistrationComplete(
+            RegistrationComplete::decode(buf)?,
+        )),
+        FiveGmmMessageType::DeregistrationRequestFromUe => Ok(
+            FiveGmmMessage::DeregistrationRequestFromUe(DeregistrationRequestFromUe::decode(buf)?),
+        ),
         FiveGmmMessageType::DeregistrationAcceptFromUe => {
             Ok(FiveGmmMessage::DeregistrationAcceptFromUe)
         }
-        FiveGmmMessageType::DeregistrationRequestToUe => {
-            Ok(FiveGmmMessage::DeregistrationRequestToUe(DeregistrationRequestToUe::decode(buf)?))
-        }
+        FiveGmmMessageType::DeregistrationRequestToUe => Ok(
+            FiveGmmMessage::DeregistrationRequestToUe(DeregistrationRequestToUe::decode(buf)?),
+        ),
         FiveGmmMessageType::DeregistrationAcceptToUe => {
             Ok(FiveGmmMessage::DeregistrationAcceptToUe)
         }
@@ -1943,36 +2103,36 @@ pub fn parse_5gmm_message(buf: &mut Bytes) -> NasResult<FiveGmmMessage> {
         FiveGmmMessageType::ServiceReject => {
             Ok(FiveGmmMessage::ServiceReject(ServiceReject::decode(buf)?))
         }
-        FiveGmmMessageType::AuthenticationRequest => {
-            Ok(FiveGmmMessage::AuthenticationRequest(AuthenticationRequest::decode(buf)?))
-        }
-        FiveGmmMessageType::AuthenticationResponse => {
-            Ok(FiveGmmMessage::AuthenticationResponse(AuthenticationResponse::decode(buf)?))
-        }
-        FiveGmmMessageType::AuthenticationReject => {
-            Ok(FiveGmmMessage::AuthenticationReject(AuthenticationReject::decode(buf)?))
-        }
-        FiveGmmMessageType::AuthenticationFailure => {
-            Ok(FiveGmmMessage::AuthenticationFailure(AuthenticationFailure::decode(buf)?))
-        }
-        FiveGmmMessageType::AuthenticationResult => {
-            Ok(FiveGmmMessage::AuthenticationResult(AuthenticationResult::decode(buf)?))
-        }
-        FiveGmmMessageType::IdentityRequest => {
-            Ok(FiveGmmMessage::IdentityRequest(IdentityRequest::decode(buf)?))
-        }
-        FiveGmmMessageType::IdentityResponse => {
-            Ok(FiveGmmMessage::IdentityResponse(IdentityResponse::decode(buf)?))
-        }
-        FiveGmmMessageType::SecurityModeCommand => {
-            Ok(FiveGmmMessage::SecurityModeCommand(SecurityModeCommand::decode(buf)?))
-        }
-        FiveGmmMessageType::SecurityModeComplete => {
-            Ok(FiveGmmMessage::SecurityModeComplete(SecurityModeComplete::decode(buf)?))
-        }
-        FiveGmmMessageType::SecurityModeReject => {
-            Ok(FiveGmmMessage::SecurityModeReject(SecurityModeReject::decode(buf)?))
-        }
+        FiveGmmMessageType::AuthenticationRequest => Ok(FiveGmmMessage::AuthenticationRequest(
+            AuthenticationRequest::decode(buf)?,
+        )),
+        FiveGmmMessageType::AuthenticationResponse => Ok(FiveGmmMessage::AuthenticationResponse(
+            AuthenticationResponse::decode(buf)?,
+        )),
+        FiveGmmMessageType::AuthenticationReject => Ok(FiveGmmMessage::AuthenticationReject(
+            AuthenticationReject::decode(buf)?,
+        )),
+        FiveGmmMessageType::AuthenticationFailure => Ok(FiveGmmMessage::AuthenticationFailure(
+            AuthenticationFailure::decode(buf)?,
+        )),
+        FiveGmmMessageType::AuthenticationResult => Ok(FiveGmmMessage::AuthenticationResult(
+            AuthenticationResult::decode(buf)?,
+        )),
+        FiveGmmMessageType::IdentityRequest => Ok(FiveGmmMessage::IdentityRequest(
+            IdentityRequest::decode(buf)?,
+        )),
+        FiveGmmMessageType::IdentityResponse => Ok(FiveGmmMessage::IdentityResponse(
+            IdentityResponse::decode(buf)?,
+        )),
+        FiveGmmMessageType::SecurityModeCommand => Ok(FiveGmmMessage::SecurityModeCommand(
+            SecurityModeCommand::decode(buf)?,
+        )),
+        FiveGmmMessageType::SecurityModeComplete => Ok(FiveGmmMessage::SecurityModeComplete(
+            SecurityModeComplete::decode(buf)?,
+        )),
+        FiveGmmMessageType::SecurityModeReject => Ok(FiveGmmMessage::SecurityModeReject(
+            SecurityModeReject::decode(buf)?,
+        )),
         FiveGmmMessageType::FiveGmmStatus => {
             Ok(FiveGmmMessage::FiveGmmStatus(FiveGmmStatus::decode(buf)?))
         }
@@ -1982,29 +2142,35 @@ pub fn parse_5gmm_message(buf: &mut Bytes) -> NasResult<FiveGmmMessage> {
         FiveGmmMessageType::DlNasTransport => {
             Ok(FiveGmmMessage::DlNasTransport(DlNasTransport::decode(buf)?))
         }
-        FiveGmmMessageType::ConfigurationUpdateCommand => {
-            Ok(FiveGmmMessage::ConfigurationUpdateCommand(ConfigurationUpdateCommand::decode(buf)?))
-        }
+        FiveGmmMessageType::ConfigurationUpdateCommand => Ok(
+            FiveGmmMessage::ConfigurationUpdateCommand(ConfigurationUpdateCommand::decode(buf)?),
+        ),
         FiveGmmMessageType::ConfigurationUpdateComplete => {
             Ok(FiveGmmMessage::ConfigurationUpdateComplete)
         }
         FiveGmmMessageType::Notification => {
             Ok(FiveGmmMessage::Notification(Notification::decode(buf)?))
         }
-        FiveGmmMessageType::NotificationResponse => {
-            Ok(FiveGmmMessage::NotificationResponse(NotificationResponse::decode(buf)?))
-        }
-        FiveGmmMessageType::ControlPlaneServiceRequest => {
-            Ok(FiveGmmMessage::ControlPlaneServiceRequest(ControlPlaneServiceRequest::decode(buf)?))
-        }
+        FiveGmmMessageType::NotificationResponse => Ok(FiveGmmMessage::NotificationResponse(
+            NotificationResponse::decode(buf)?,
+        )),
+        FiveGmmMessageType::ControlPlaneServiceRequest => Ok(
+            FiveGmmMessage::ControlPlaneServiceRequest(ControlPlaneServiceRequest::decode(buf)?),
+        ),
         FiveGmmMessageType::NetworkSliceSpecificAuthenticationCommand => {
-            Ok(FiveGmmMessage::NetworkSliceSpecificAuthenticationCommand(NetworkSliceSpecificAuthenticationCommand::decode(buf)?))
+            Ok(FiveGmmMessage::NetworkSliceSpecificAuthenticationCommand(
+                NetworkSliceSpecificAuthenticationCommand::decode(buf)?,
+            ))
         }
         FiveGmmMessageType::NetworkSliceSpecificAuthenticationComplete => {
-            Ok(FiveGmmMessage::NetworkSliceSpecificAuthenticationComplete(NetworkSliceSpecificAuthenticationComplete::decode(buf)?))
+            Ok(FiveGmmMessage::NetworkSliceSpecificAuthenticationComplete(
+                NetworkSliceSpecificAuthenticationComplete::decode(buf)?,
+            ))
         }
         FiveGmmMessageType::NetworkSliceSpecificAuthenticationResult => {
-            Ok(FiveGmmMessage::NetworkSliceSpecificAuthenticationResult(NetworkSliceSpecificAuthenticationResult::decode(buf)?))
+            Ok(FiveGmmMessage::NetworkSliceSpecificAuthenticationResult(
+                NetworkSliceSpecificAuthenticationResult::decode(buf)?,
+            ))
         }
     }
 }
@@ -2069,11 +2235,17 @@ impl PduSessionEstablishmentRequest {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 2 {
-            return Err(NasError::BufferTooShort { expected: 2, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 2,
+                actual: buf.remaining(),
+            });
         }
         let mut ipmdr = [0u8; 2];
         buf.copy_to_slice(&mut ipmdr);
-        let mut msg = Self { integrity_protection_max_data_rate: ipmdr, ..Default::default() };
+        let mut msg = Self {
+            integrity_protection_max_data_rate: ipmdr,
+            ..Default::default()
+        };
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
             let iei_type = if iei >= 0x80 { iei & 0xF0 } else { iei };
@@ -2099,7 +2271,9 @@ impl PduSessionEstablishmentRequest {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -2161,7 +2335,10 @@ impl PduSessionEstablishmentAccept {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let type_byte = buf.get_u8();
         let selected_pdu_session_type = type_byte & 0x0F;
@@ -2209,7 +2386,9 @@ impl PduSessionEstablishmentAccept {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -2245,10 +2424,16 @@ impl PduSessionEstablishmentReject {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let gsm_cause = buf.get_u8();
-        let mut msg = Self { gsm_cause, ..Default::default() };
+        let mut msg = Self {
+            gsm_cause,
+            ..Default::default()
+        };
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
             match iei {
@@ -2269,7 +2454,9 @@ impl PduSessionEstablishmentReject {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -2332,7 +2519,9 @@ impl PduSessionModificationRequest {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -2401,7 +2590,9 @@ impl PduSessionModificationCommand {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -2437,10 +2628,16 @@ impl PduSessionModificationReject {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let gsm_cause = buf.get_u8();
-        let mut msg = Self { gsm_cause, ..Default::default() };
+        let mut msg = Self {
+            gsm_cause,
+            ..Default::default()
+        };
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
             match iei {
@@ -2461,7 +2658,9 @@ impl PduSessionModificationReject {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -2491,10 +2690,16 @@ impl PduSessionModificationCommandReject {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let gsm_cause = buf.get_u8();
-        let mut msg = Self { gsm_cause, ..Default::default() };
+        let mut msg = Self {
+            gsm_cause,
+            ..Default::default()
+        };
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
             match iei {
@@ -2511,7 +2716,9 @@ impl PduSessionModificationCommandReject {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -2566,7 +2773,9 @@ impl PduSessionReleaseRequest {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -2596,10 +2805,16 @@ impl PduSessionReleaseReject {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let gsm_cause = buf.get_u8();
-        let mut msg = Self { gsm_cause, ..Default::default() };
+        let mut msg = Self {
+            gsm_cause,
+            ..Default::default()
+        };
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
             match iei {
@@ -2616,7 +2831,9 @@ impl PduSessionReleaseReject {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -2652,10 +2869,16 @@ impl PduSessionReleaseCommand {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let gsm_cause = buf.get_u8();
-        let mut msg = Self { gsm_cause, ..Default::default() };
+        let mut msg = Self {
+            gsm_cause,
+            ..Default::default()
+        };
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
             match iei {
@@ -2676,7 +2899,9 @@ impl PduSessionReleaseCommand {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -2731,7 +2956,9 @@ impl PduSessionReleaseComplete {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -2754,9 +2981,14 @@ impl FiveGsmStatus {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
-        Ok(Self { gsm_cause: buf.get_u8() })
+        Ok(Self {
+            gsm_cause: buf.get_u8(),
+        })
     }
 }
 
@@ -2781,7 +3013,10 @@ impl PduSessionAuthenticationCommand {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let eap_message = EapMessage::decode(buf)?;
-        let mut msg = Self { eap_message, ..Default::default() };
+        let mut msg = Self {
+            eap_message,
+            ..Default::default()
+        };
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
             match iei {
@@ -2798,7 +3033,9 @@ impl PduSessionAuthenticationCommand {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -2828,7 +3065,10 @@ impl PduSessionAuthenticationComplete {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let eap_message = EapMessage::decode(buf)?;
-        let mut msg = Self { eap_message, ..Default::default() };
+        let mut msg = Self {
+            eap_message,
+            ..Default::default()
+        };
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
             match iei {
@@ -2845,7 +3085,9 @@ impl PduSessionAuthenticationComplete {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -2898,7 +3140,9 @@ impl PduSessionAuthenticationResult {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -2949,7 +3193,8 @@ impl RemoteUeReport {
                     if buf.remaining() >= 2 {
                         let len = buf.get_u16() as usize;
                         if buf.remaining() >= len {
-                            msg.remote_ue_context_disconnected = Some(buf.copy_to_bytes(len).to_vec());
+                            msg.remote_ue_context_disconnected =
+                                Some(buf.copy_to_bytes(len).to_vec());
                         }
                     }
                 }
@@ -2957,7 +3202,9 @@ impl RemoteUeReport {
                     buf.advance(1);
                     if buf.remaining() > 0 {
                         let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len { buf.advance(len); }
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
                     }
                 }
             }
@@ -2981,7 +3228,9 @@ impl RemoteUeReportResponse {
             buf.advance(1);
             if buf.remaining() > 0 {
                 let len = buf.get_u8() as usize;
-                if buf.remaining() >= len { buf.advance(len); }
+                if buf.remaining() >= len {
+                    buf.advance(len);
+                }
             }
         }
         Ok(Self)
@@ -2993,21 +3242,45 @@ pub fn build_5gsm_message(pdu_session_id: u8, pti: u8, msg: &FiveGsmMessage) -> 
     let mut buf = BytesMut::new();
 
     let message_type = match msg {
-        FiveGsmMessage::PduSessionEstablishmentRequest(_) => FiveGsmMessageType::PduSessionEstablishmentRequest,
-        FiveGsmMessage::PduSessionEstablishmentAccept(_) => FiveGsmMessageType::PduSessionEstablishmentAccept,
-        FiveGsmMessage::PduSessionEstablishmentReject(_) => FiveGsmMessageType::PduSessionEstablishmentReject,
-        FiveGsmMessage::PduSessionModificationRequest(_) => FiveGsmMessageType::PduSessionModificationRequest,
-        FiveGsmMessage::PduSessionModificationCommand(_) => FiveGsmMessageType::PduSessionModificationCommand,
-        FiveGsmMessage::PduSessionModificationComplete => FiveGsmMessageType::PduSessionModificationComplete,
-        FiveGsmMessage::PduSessionModificationReject(_) => FiveGsmMessageType::PduSessionModificationReject,
-        FiveGsmMessage::PduSessionModificationCommandReject(_) => FiveGsmMessageType::PduSessionModificationCommandReject,
+        FiveGsmMessage::PduSessionEstablishmentRequest(_) => {
+            FiveGsmMessageType::PduSessionEstablishmentRequest
+        }
+        FiveGsmMessage::PduSessionEstablishmentAccept(_) => {
+            FiveGsmMessageType::PduSessionEstablishmentAccept
+        }
+        FiveGsmMessage::PduSessionEstablishmentReject(_) => {
+            FiveGsmMessageType::PduSessionEstablishmentReject
+        }
+        FiveGsmMessage::PduSessionModificationRequest(_) => {
+            FiveGsmMessageType::PduSessionModificationRequest
+        }
+        FiveGsmMessage::PduSessionModificationCommand(_) => {
+            FiveGsmMessageType::PduSessionModificationCommand
+        }
+        FiveGsmMessage::PduSessionModificationComplete => {
+            FiveGsmMessageType::PduSessionModificationComplete
+        }
+        FiveGsmMessage::PduSessionModificationReject(_) => {
+            FiveGsmMessageType::PduSessionModificationReject
+        }
+        FiveGsmMessage::PduSessionModificationCommandReject(_) => {
+            FiveGsmMessageType::PduSessionModificationCommandReject
+        }
         FiveGsmMessage::PduSessionReleaseRequest(_) => FiveGsmMessageType::PduSessionReleaseRequest,
         FiveGsmMessage::PduSessionReleaseReject(_) => FiveGsmMessageType::PduSessionReleaseReject,
         FiveGsmMessage::PduSessionReleaseCommand(_) => FiveGsmMessageType::PduSessionReleaseCommand,
-        FiveGsmMessage::PduSessionReleaseComplete(_) => FiveGsmMessageType::PduSessionReleaseComplete,
-        FiveGsmMessage::PduSessionAuthenticationCommand(_) => FiveGsmMessageType::PduSessionAuthenticationCommand,
-        FiveGsmMessage::PduSessionAuthenticationComplete(_) => FiveGsmMessageType::PduSessionAuthenticationComplete,
-        FiveGsmMessage::PduSessionAuthenticationResult(_) => FiveGsmMessageType::PduSessionAuthenticationResult,
+        FiveGsmMessage::PduSessionReleaseComplete(_) => {
+            FiveGsmMessageType::PduSessionReleaseComplete
+        }
+        FiveGsmMessage::PduSessionAuthenticationCommand(_) => {
+            FiveGsmMessageType::PduSessionAuthenticationCommand
+        }
+        FiveGsmMessage::PduSessionAuthenticationComplete(_) => {
+            FiveGsmMessageType::PduSessionAuthenticationComplete
+        }
+        FiveGsmMessage::PduSessionAuthenticationResult(_) => {
+            FiveGsmMessageType::PduSessionAuthenticationResult
+        }
         FiveGsmMessage::FiveGsmStatus(_) => FiveGsmMessageType::FiveGsmStatus,
         FiveGsmMessage::RemoteUeReport(_) => FiveGsmMessageType::RemoteUeReport,
         FiveGsmMessage::RemoteUeReportResponse(_) => FiveGsmMessageType::RemoteUeReportResponse,
@@ -3047,19 +3320,29 @@ pub fn parse_5gsm_message(buf: &mut Bytes) -> NasResult<(u8, u8, FiveGsmMessage)
 
     let msg = match message_type {
         FiveGsmMessageType::PduSessionEstablishmentRequest => {
-            FiveGsmMessage::PduSessionEstablishmentRequest(PduSessionEstablishmentRequest::decode(buf)?)
+            FiveGsmMessage::PduSessionEstablishmentRequest(PduSessionEstablishmentRequest::decode(
+                buf,
+            )?)
         }
         FiveGsmMessageType::PduSessionEstablishmentAccept => {
-            FiveGsmMessage::PduSessionEstablishmentAccept(PduSessionEstablishmentAccept::decode(buf)?)
+            FiveGsmMessage::PduSessionEstablishmentAccept(PduSessionEstablishmentAccept::decode(
+                buf,
+            )?)
         }
         FiveGsmMessageType::PduSessionEstablishmentReject => {
-            FiveGsmMessage::PduSessionEstablishmentReject(PduSessionEstablishmentReject::decode(buf)?)
+            FiveGsmMessage::PduSessionEstablishmentReject(PduSessionEstablishmentReject::decode(
+                buf,
+            )?)
         }
         FiveGsmMessageType::PduSessionModificationRequest => {
-            FiveGsmMessage::PduSessionModificationRequest(PduSessionModificationRequest::decode(buf)?)
+            FiveGsmMessage::PduSessionModificationRequest(PduSessionModificationRequest::decode(
+                buf,
+            )?)
         }
         FiveGsmMessageType::PduSessionModificationCommand => {
-            FiveGsmMessage::PduSessionModificationCommand(PduSessionModificationCommand::decode(buf)?)
+            FiveGsmMessage::PduSessionModificationCommand(PduSessionModificationCommand::decode(
+                buf,
+            )?)
         }
         FiveGsmMessageType::PduSessionModificationComplete => {
             FiveGsmMessage::PduSessionModificationComplete
@@ -3068,7 +3351,9 @@ pub fn parse_5gsm_message(buf: &mut Bytes) -> NasResult<(u8, u8, FiveGsmMessage)
             FiveGsmMessage::PduSessionModificationReject(PduSessionModificationReject::decode(buf)?)
         }
         FiveGsmMessageType::PduSessionModificationCommandReject => {
-            FiveGsmMessage::PduSessionModificationCommandReject(PduSessionModificationCommandReject::decode(buf)?)
+            FiveGsmMessage::PduSessionModificationCommandReject(
+                PduSessionModificationCommandReject::decode(buf)?,
+            )
         }
         FiveGsmMessageType::PduSessionReleaseRequest => {
             FiveGsmMessage::PduSessionReleaseRequest(PduSessionReleaseRequest::decode(buf)?)
@@ -3083,13 +3368,19 @@ pub fn parse_5gsm_message(buf: &mut Bytes) -> NasResult<(u8, u8, FiveGsmMessage)
             FiveGsmMessage::PduSessionReleaseComplete(PduSessionReleaseComplete::decode(buf)?)
         }
         FiveGsmMessageType::PduSessionAuthenticationCommand => {
-            FiveGsmMessage::PduSessionAuthenticationCommand(PduSessionAuthenticationCommand::decode(buf)?)
+            FiveGsmMessage::PduSessionAuthenticationCommand(
+                PduSessionAuthenticationCommand::decode(buf)?,
+            )
         }
         FiveGsmMessageType::PduSessionAuthenticationComplete => {
-            FiveGsmMessage::PduSessionAuthenticationComplete(PduSessionAuthenticationComplete::decode(buf)?)
+            FiveGsmMessage::PduSessionAuthenticationComplete(
+                PduSessionAuthenticationComplete::decode(buf)?,
+            )
         }
         FiveGsmMessageType::PduSessionAuthenticationResult => {
-            FiveGsmMessage::PduSessionAuthenticationResult(PduSessionAuthenticationResult::decode(buf)?)
+            FiveGsmMessage::PduSessionAuthenticationResult(PduSessionAuthenticationResult::decode(
+                buf,
+            )?)
         }
         FiveGsmMessageType::FiveGsmStatus => {
             FiveGsmMessage::FiveGsmStatus(FiveGsmStatus::decode(buf)?)
@@ -3102,5 +3393,9 @@ pub fn parse_5gsm_message(buf: &mut Bytes) -> NasResult<(u8, u8, FiveGsmMessage)
         }
     };
 
-    Ok((header.pdu_session_id, header.procedure_transaction_identity, msg))
+    Ok((
+        header.pdu_session_id,
+        header.procedure_transaction_identity,
+        msg,
+    ))
 }

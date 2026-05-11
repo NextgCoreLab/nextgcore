@@ -7,10 +7,10 @@
 
 #[cfg(test)]
 mod tests {
+    use crate::event::{PfcpEventData, UpfEvent, UpfEventId, UpfTimerId};
+    use crate::pfcp_sm::{pfcp_msg_type, PfcpSmContext, PfcpSmResult, PfcpState};
+    use crate::upf_sm::{UpfSmContext, UpfSmResult, UpfState};
     use proptest::prelude::*;
-    use crate::upf_sm::{UpfSmContext, UpfState, UpfSmResult};
-    use crate::pfcp_sm::{PfcpSmContext, PfcpState, PfcpSmResult, pfcp_msg_type};
-    use crate::event::{UpfEvent, UpfEventId, UpfTimerId, PfcpEventData};
 
     // ========================================================================
     // Strategies for generating test data
@@ -29,10 +29,7 @@ mod tests {
 
     /// Strategy for generating UPF timer IDs
     fn arb_upf_timer_id() -> impl Strategy<Value = UpfTimerId> {
-        prop_oneof![
-            Just(UpfTimerId::Association),
-            Just(UpfTimerId::NoHeartbeat),
-        ]
+        prop_oneof![Just(UpfTimerId::Association), Just(UpfTimerId::NoHeartbeat),]
     }
 
     /// Strategy for generating UPF states
@@ -56,7 +53,6 @@ mod tests {
         ]
     }
 
-
     // ========================================================================
     // UPF FSM Property Tests
     // ========================================================================
@@ -71,7 +67,7 @@ mod tests {
         fn prop_upf_fsm_init_starts_in_initial(_seed in any::<u64>()) {
             let mut fsm = UpfSmContext::new();
             prop_assert_eq!(fsm.state, UpfState::Initial);
-            
+
             fsm.init();
             prop_assert_eq!(fsm.state, UpfState::Initial);
         }
@@ -82,12 +78,12 @@ mod tests {
         #[test]
         fn prop_upf_fsm_fini_transitions_to_final(_seed in any::<u64>()) {
             let mut fsm = UpfSmContext::new();
-            
+
             // Transition to operational first
             let entry = UpfEvent::entry();
             fsm.dispatch(&entry);
             prop_assert_eq!(fsm.state, UpfState::Operational);
-            
+
             fsm.fini();
             prop_assert_eq!(fsm.state, UpfState::Final);
             prop_assert!(fsm.is_final());
@@ -100,7 +96,7 @@ mod tests {
         fn prop_upf_fsm_entry_event_transitions(_seed in any::<u64>()) {
             let mut fsm = UpfSmContext::new();
             let event = UpfEvent::entry();
-            
+
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, UpfSmResult::Transition(UpfState::Operational));
             prop_assert_eq!(fsm.state, UpfState::Operational);
@@ -115,7 +111,7 @@ mod tests {
             let mut fsm = UpfSmContext::new();
             fsm.fini();
             prop_assert_eq!(fsm.state, UpfState::Final);
-            
+
             let event = UpfEvent::new(event_id);
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, UpfSmResult::Ok);
@@ -134,7 +130,7 @@ mod tests {
             let entry = UpfEvent::entry();
             fsm.dispatch(&entry);
             prop_assert!(fsm.is_operational());
-            
+
             let event = UpfEvent::n4_message(pfcp_node_id, pfcp_xact_id, vec![1, 2, 3]);
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, UpfSmResult::DispatchToPfcp);
@@ -152,7 +148,7 @@ mod tests {
             let entry = UpfEvent::entry();
             fsm.dispatch(&entry);
             prop_assert!(fsm.is_operational());
-            
+
             let event = UpfEvent::n4_timer(timer_id, Some(pfcp_node_id));
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, UpfSmResult::DispatchToPfcp);
@@ -167,13 +163,12 @@ mod tests {
             let entry = UpfEvent::entry();
             fsm.dispatch(&entry);
             prop_assert!(fsm.is_operational());
-            
+
             let event = UpfEvent::n4_no_heartbeat(pfcp_node_id);
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, UpfSmResult::DispatchToPfcp);
         }
     }
-
 
     // ========================================================================
     // PFCP FSM Property Tests
@@ -200,7 +195,7 @@ mod tests {
         fn prop_pfcp_fsm_entry_transitions_to_will_associate(node_id in 1u64..10000) {
             let mut fsm = PfcpSmContext::new(node_id);
             prop_assert_eq!(fsm.state, PfcpState::Initial);
-            
+
             let event = UpfEvent::entry();
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, PfcpSmResult::Transition(PfcpState::WillAssociate));
@@ -215,7 +210,7 @@ mod tests {
             let mut fsm = PfcpSmContext::new(node_id);
             let entry = UpfEvent::entry();
             fsm.dispatch(&entry);
-            
+
             fsm.fini();
             prop_assert_eq!(fsm.state, PfcpState::Final);
             prop_assert!(fsm.is_final());
@@ -230,10 +225,10 @@ mod tests {
             let mut fsm = PfcpSmContext::new(node_id);
             fsm.state = PfcpState::WillAssociate;
             fsm.has_association_timer = true;
-            
+
             let event = UpfEvent::entry();
             let result = fsm.dispatch(&event);
-            
+
             prop_assert_eq!(result, PfcpSmResult::SendAssociationSetupRequest);
             prop_assert!(fsm.association_timer_active);
         }
@@ -246,10 +241,10 @@ mod tests {
             let mut fsm = PfcpSmContext::new(node_id);
             fsm.state = PfcpState::Associated;
             prop_assert!(fsm.is_associated());
-            
+
             let event = UpfEvent::n4_no_heartbeat(node_id);
             let result = fsm.dispatch(&event);
-            
+
             prop_assert_eq!(result, PfcpSmResult::Transition(PfcpState::WillAssociate));
             prop_assert_eq!(fsm.state, PfcpState::WillAssociate);
             prop_assert!(!fsm.is_associated());
@@ -262,10 +257,10 @@ mod tests {
         fn prop_pfcp_fsm_restoration_required(node_id in 1u64..10000) {
             let mut fsm = PfcpSmContext::new(node_id);
             prop_assert!(!fsm.restoration_required);
-            
+
             fsm.set_restoration_required(true);
             prop_assert!(fsm.restoration_required);
-            
+
             fsm.set_restoration_required(false);
             prop_assert!(!fsm.restoration_required);
         }
@@ -278,10 +273,10 @@ mod tests {
             let mut fsm = PfcpSmContext::new(node_id);
             fsm.state = PfcpState::Associated;
             fsm.restoration_required = false;
-            
+
             let event = UpfEvent::entry();
             let result = fsm.dispatch(&event);
-            
+
             prop_assert_eq!(result, PfcpSmResult::SendHeartbeatRequest);
             prop_assert!(fsm.no_heartbeat_timer_active);
         }
@@ -294,15 +289,14 @@ mod tests {
             let mut fsm = PfcpSmContext::new(node_id);
             fsm.state = PfcpState::Associated;
             fsm.restoration_required = true;
-            
+
             let event = UpfEvent::entry();
             let result = fsm.dispatch(&event);
-            
+
             prop_assert_eq!(result, PfcpSmResult::PerformRestoration);
             prop_assert!(!fsm.restoration_required);
         }
     }
-
 
     // ========================================================================
     // Cross-FSM and Consistency Property Tests
@@ -355,23 +349,23 @@ mod tests {
             let mut upf_fsm = UpfSmContext::new();
             let mut pfcp_fsm1 = PfcpSmContext::new(node_id1);
             let mut pfcp_fsm2 = PfcpSmContext::new(node_id2);
-            
+
             // Initialize UPF FSM
             let entry = UpfEvent::entry();
             upf_fsm.dispatch(&entry);
-            
+
             // Initialize PFCP FSMs
             pfcp_fsm1.dispatch(&entry);
             pfcp_fsm2.dispatch(&entry);
-            
+
             // Verify independent states
             prop_assert_eq!(upf_fsm.state, UpfState::Operational);
             prop_assert_eq!(pfcp_fsm1.state, PfcpState::WillAssociate);
             prop_assert_eq!(pfcp_fsm2.state, PfcpState::WillAssociate);
-            
+
             // Transition one PFCP FSM to Associated
             pfcp_fsm1.state = PfcpState::Associated;
-            
+
             // Verify other FSMs are unaffected
             prop_assert_eq!(upf_fsm.state, UpfState::Operational);
             prop_assert!(pfcp_fsm1.is_associated());
@@ -410,14 +404,14 @@ mod tests {
         fn prop_pfcp_fsm_handles_session_establishment(node_id in 1u64..10000) {
             let mut fsm = PfcpSmContext::new(node_id);
             fsm.state = PfcpState::Associated;
-            
+
             let mut event = UpfEvent::new(UpfEventId::N4Message);
             event.pfcp = Some(PfcpEventData {
                 pfcp_node_id: Some(node_id),
                 pfcp_xact_id: Some(1),
                 pkbuf: Some(vec![pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST]),
             });
-            
+
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, PfcpSmResult::HandleSessionEstablishmentRequest);
         }
@@ -429,14 +423,14 @@ mod tests {
         fn prop_pfcp_fsm_handles_session_modification(node_id in 1u64..10000) {
             let mut fsm = PfcpSmContext::new(node_id);
             fsm.state = PfcpState::Associated;
-            
+
             let mut event = UpfEvent::new(UpfEventId::N4Message);
             event.pfcp = Some(PfcpEventData {
                 pfcp_node_id: Some(node_id),
                 pfcp_xact_id: Some(1),
                 pkbuf: Some(vec![pfcp_msg_type::SESSION_MODIFICATION_REQUEST]),
             });
-            
+
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, PfcpSmResult::HandleSessionModificationRequest);
         }
@@ -448,14 +442,14 @@ mod tests {
         fn prop_pfcp_fsm_handles_session_deletion(node_id in 1u64..10000) {
             let mut fsm = PfcpSmContext::new(node_id);
             fsm.state = PfcpState::Associated;
-            
+
             let mut event = UpfEvent::new(UpfEventId::N4Message);
             event.pfcp = Some(PfcpEventData {
                 pfcp_node_id: Some(node_id),
                 pfcp_xact_id: Some(1),
                 pkbuf: Some(vec![pfcp_msg_type::SESSION_DELETION_REQUEST]),
             });
-            
+
             let result = fsm.dispatch(&event);
             prop_assert_eq!(result, PfcpSmResult::HandleSessionDeletionRequest);
         }
@@ -466,25 +460,25 @@ mod tests {
         #[test]
         fn prop_upf_fsm_state_helpers(_seed in any::<u64>()) {
             let mut fsm = UpfSmContext::new();
-            
+
             // Initial state
             prop_assert!(!fsm.is_operational());
             prop_assert!(!fsm.is_final());
             prop_assert!(!fsm.is_exception());
-            
+
             // Transition to operational
             let entry = UpfEvent::entry();
             fsm.dispatch(&entry);
             prop_assert!(fsm.is_operational());
             prop_assert!(!fsm.is_final());
             prop_assert!(!fsm.is_exception());
-            
+
             // Transition to final
             fsm.fini();
             prop_assert!(!fsm.is_operational());
             prop_assert!(fsm.is_final());
             prop_assert!(!fsm.is_exception());
-            
+
             // Set to exception
             fsm.state = UpfState::Exception;
             prop_assert!(!fsm.is_operational());
@@ -498,24 +492,24 @@ mod tests {
         #[test]
         fn prop_pfcp_fsm_state_helpers(node_id in 1u64..10000) {
             let mut fsm = PfcpSmContext::new(node_id);
-            
+
             // Initial state
             prop_assert!(!fsm.is_associated());
             prop_assert!(!fsm.is_final());
             prop_assert!(!fsm.is_exception());
-            
+
             // Transition to associated
             fsm.state = PfcpState::Associated;
             prop_assert!(fsm.is_associated());
             prop_assert!(!fsm.is_final());
             prop_assert!(!fsm.is_exception());
-            
+
             // Transition to final
             fsm.fini();
             prop_assert!(!fsm.is_associated());
             prop_assert!(fsm.is_final());
             prop_assert!(!fsm.is_exception());
-            
+
             // Set to exception
             fsm.state = PfcpState::Exception;
             prop_assert!(!fsm.is_associated());

@@ -67,7 +67,7 @@ impl IpSubnet {
         } else {
             !((1u32 << (32 - prefix_len)) - 1)
         };
-        
+
         Self {
             family: libc::AF_INET,
             sub: [addr_u32.to_be(), 0, 0, 0],

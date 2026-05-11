@@ -77,9 +77,15 @@ pub struct PlmnId {
 
 impl PlmnId {
     pub fn new(mcc: &str, mnc: &str) -> Self {
-        let mcc_bytes: Vec<u8> = mcc.chars().filter_map(|c| c.to_digit(10).map(|d| d as u8)).collect();
-        let mnc_bytes: Vec<u8> = mnc.chars().filter_map(|c| c.to_digit(10).map(|d| d as u8)).collect();
-        
+        let mcc_bytes: Vec<u8> = mcc
+            .chars()
+            .filter_map(|c| c.to_digit(10).map(|d| d as u8))
+            .collect();
+        let mnc_bytes: Vec<u8> = mnc
+            .chars()
+            .filter_map(|c| c.to_digit(10).map(|d| d as u8))
+            .collect();
+
         Self {
             mcc1: mcc_bytes.first().copied().unwrap_or(0),
             mcc2: mcc_bytes.get(1).copied().unwrap_or(0),
@@ -206,7 +212,7 @@ pub struct IpAddr {
 /// QoS parameters
 #[derive(Debug, Clone, Default)]
 pub struct Qos {
-    pub index: u8,  // 5QI
+    pub index: u8, // 5QI
     pub arp_priority_level: u8,
     pub arp_preempt_cap: bool,
     pub arp_preempt_vuln: bool,
@@ -242,24 +248,136 @@ impl QosCharacteristics {
     pub fn from_5qi(five_qi: u8) -> Option<Self> {
         match five_qi {
             // Standard GBR 5QIs
-            1 => Some(Self { resource_type: 0, priority_level: 20, packet_delay_budget_ms: 100, packet_error_rate_exp: 2, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
-            2 => Some(Self { resource_type: 0, priority_level: 40, packet_delay_budget_ms: 150, packet_error_rate_exp: 3, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
-            3 => Some(Self { resource_type: 0, priority_level: 30, packet_delay_budget_ms: 50, packet_error_rate_exp: 3, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
-            4 => Some(Self { resource_type: 0, priority_level: 50, packet_delay_budget_ms: 300, packet_error_rate_exp: 6, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
-            65 => Some(Self { resource_type: 0, priority_level: 7, packet_delay_budget_ms: 75, packet_error_rate_exp: 2, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
-            66 => Some(Self { resource_type: 0, priority_level: 20, packet_delay_budget_ms: 100, packet_error_rate_exp: 2, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
-            67 => Some(Self { resource_type: 0, priority_level: 15, packet_delay_budget_ms: 100, packet_error_rate_exp: 3, max_data_burst_volume: 0, averaging_window_ms: 2000 }),
+            1 => Some(Self {
+                resource_type: 0,
+                priority_level: 20,
+                packet_delay_budget_ms: 100,
+                packet_error_rate_exp: 2,
+                max_data_burst_volume: 0,
+                averaging_window_ms: 2000,
+            }),
+            2 => Some(Self {
+                resource_type: 0,
+                priority_level: 40,
+                packet_delay_budget_ms: 150,
+                packet_error_rate_exp: 3,
+                max_data_burst_volume: 0,
+                averaging_window_ms: 2000,
+            }),
+            3 => Some(Self {
+                resource_type: 0,
+                priority_level: 30,
+                packet_delay_budget_ms: 50,
+                packet_error_rate_exp: 3,
+                max_data_burst_volume: 0,
+                averaging_window_ms: 2000,
+            }),
+            4 => Some(Self {
+                resource_type: 0,
+                priority_level: 50,
+                packet_delay_budget_ms: 300,
+                packet_error_rate_exp: 6,
+                max_data_burst_volume: 0,
+                averaging_window_ms: 2000,
+            }),
+            65 => Some(Self {
+                resource_type: 0,
+                priority_level: 7,
+                packet_delay_budget_ms: 75,
+                packet_error_rate_exp: 2,
+                max_data_burst_volume: 0,
+                averaging_window_ms: 2000,
+            }),
+            66 => Some(Self {
+                resource_type: 0,
+                priority_level: 20,
+                packet_delay_budget_ms: 100,
+                packet_error_rate_exp: 2,
+                max_data_burst_volume: 0,
+                averaging_window_ms: 2000,
+            }),
+            67 => Some(Self {
+                resource_type: 0,
+                priority_level: 15,
+                packet_delay_budget_ms: 100,
+                packet_error_rate_exp: 3,
+                max_data_burst_volume: 0,
+                averaging_window_ms: 2000,
+            }),
             // Standard Non-GBR 5QIs
-            5 => Some(Self { resource_type: 2, priority_level: 10, packet_delay_budget_ms: 100, packet_error_rate_exp: 6, max_data_burst_volume: 0, averaging_window_ms: 0 }),
-            6 => Some(Self { resource_type: 2, priority_level: 60, packet_delay_budget_ms: 300, packet_error_rate_exp: 6, max_data_burst_volume: 0, averaging_window_ms: 0 }),
-            7 => Some(Self { resource_type: 2, priority_level: 70, packet_delay_budget_ms: 100, packet_error_rate_exp: 3, max_data_burst_volume: 0, averaging_window_ms: 0 }),
-            8 => Some(Self { resource_type: 2, priority_level: 80, packet_delay_budget_ms: 300, packet_error_rate_exp: 6, max_data_burst_volume: 0, averaging_window_ms: 0 }),
-            9 => Some(Self { resource_type: 2, priority_level: 90, packet_delay_budget_ms: 300, packet_error_rate_exp: 6, max_data_burst_volume: 0, averaging_window_ms: 0 }),
+            5 => Some(Self {
+                resource_type: 2,
+                priority_level: 10,
+                packet_delay_budget_ms: 100,
+                packet_error_rate_exp: 6,
+                max_data_burst_volume: 0,
+                averaging_window_ms: 0,
+            }),
+            6 => Some(Self {
+                resource_type: 2,
+                priority_level: 60,
+                packet_delay_budget_ms: 300,
+                packet_error_rate_exp: 6,
+                max_data_burst_volume: 0,
+                averaging_window_ms: 0,
+            }),
+            7 => Some(Self {
+                resource_type: 2,
+                priority_level: 70,
+                packet_delay_budget_ms: 100,
+                packet_error_rate_exp: 3,
+                max_data_burst_volume: 0,
+                averaging_window_ms: 0,
+            }),
+            8 => Some(Self {
+                resource_type: 2,
+                priority_level: 80,
+                packet_delay_budget_ms: 300,
+                packet_error_rate_exp: 6,
+                max_data_burst_volume: 0,
+                averaging_window_ms: 0,
+            }),
+            9 => Some(Self {
+                resource_type: 2,
+                priority_level: 90,
+                packet_delay_budget_ms: 300,
+                packet_error_rate_exp: 6,
+                max_data_burst_volume: 0,
+                averaging_window_ms: 0,
+            }),
             // Rel-18 XR 5QI values (TS 23.501 Table 5.7.4-1)
-            82 => Some(Self { resource_type: 0, priority_level: 21, packet_delay_budget_ms: 10, packet_error_rate_exp: 3, max_data_burst_volume: 60_000, averaging_window_ms: 2000 }),
-            83 => Some(Self { resource_type: 0, priority_level: 20, packet_delay_budget_ms: 5, packet_error_rate_exp: 4, max_data_burst_volume: 1_500, averaging_window_ms: 2000 }),
-            84 => Some(Self { resource_type: 0, priority_level: 22, packet_delay_budget_ms: 15, packet_error_rate_exp: 3, max_data_burst_volume: 30_000, averaging_window_ms: 2000 }),
-            85 => Some(Self { resource_type: 0, priority_level: 19, packet_delay_budget_ms: 5, packet_error_rate_exp: 5, max_data_burst_volume: 500, averaging_window_ms: 2000 }),
+            82 => Some(Self {
+                resource_type: 0,
+                priority_level: 21,
+                packet_delay_budget_ms: 10,
+                packet_error_rate_exp: 3,
+                max_data_burst_volume: 60_000,
+                averaging_window_ms: 2000,
+            }),
+            83 => Some(Self {
+                resource_type: 0,
+                priority_level: 20,
+                packet_delay_budget_ms: 5,
+                packet_error_rate_exp: 4,
+                max_data_burst_volume: 1_500,
+                averaging_window_ms: 2000,
+            }),
+            84 => Some(Self {
+                resource_type: 0,
+                priority_level: 22,
+                packet_delay_budget_ms: 15,
+                packet_error_rate_exp: 3,
+                max_data_burst_volume: 30_000,
+                averaging_window_ms: 2000,
+            }),
+            85 => Some(Self {
+                resource_type: 0,
+                priority_level: 19,
+                packet_delay_budget_ms: 5,
+                packet_error_rate_exp: 5,
+                max_data_burst_volume: 500,
+                averaging_window_ms: 2000,
+            }),
             _ => None,
         }
     }
@@ -333,7 +451,13 @@ pub struct SliceQosProfile {
 
 impl SliceQosProfile {
     /// Create a new slice QoS profile
-    pub fn new(s_nssai: SNssai, max_ues: u32, max_ul_bps: u64, max_dl_bps: u64, priority: u8) -> Self {
+    pub fn new(
+        s_nssai: SNssai,
+        max_ues: u32,
+        max_ul_bps: u64,
+        max_dl_bps: u64,
+        priority: u8,
+    ) -> Self {
         Self {
             s_nssai,
             max_ues,
@@ -375,15 +499,19 @@ impl SliceQosProfile {
     /// Admit a new session to the slice
     pub fn admit_session(&self, ul_bandwidth: u64, dl_bandwidth: u64) {
         self.current_ues.fetch_add(1, Ordering::Relaxed);
-        self.current_ul_bandwidth.fetch_add(ul_bandwidth, Ordering::Relaxed);
-        self.current_dl_bandwidth.fetch_add(dl_bandwidth, Ordering::Relaxed);
+        self.current_ul_bandwidth
+            .fetch_add(ul_bandwidth, Ordering::Relaxed);
+        self.current_dl_bandwidth
+            .fetch_add(dl_bandwidth, Ordering::Relaxed);
     }
 
     /// Remove a session from the slice
     pub fn remove_session(&self, ul_bandwidth: u64, dl_bandwidth: u64) {
         self.current_ues.fetch_sub(1, Ordering::Relaxed);
-        self.current_ul_bandwidth.fetch_sub(ul_bandwidth, Ordering::Relaxed);
-        self.current_dl_bandwidth.fetch_sub(dl_bandwidth, Ordering::Relaxed);
+        self.current_ul_bandwidth
+            .fetch_sub(ul_bandwidth, Ordering::Relaxed);
+        self.current_dl_bandwidth
+            .fetch_sub(dl_bandwidth, Ordering::Relaxed);
     }
 }
 
@@ -425,7 +553,11 @@ impl UrllcConstraints {
 
     /// Enforce URLLC constraints on QoS flow
     /// Returns true if constraints are satisfied, false otherwise
-    pub fn enforce_urllc_constraints(five_qi: u8, priority_level: u8, packet_delay_budget_ms: u16) -> bool {
+    pub fn enforce_urllc_constraints(
+        five_qi: u8,
+        priority_level: u8,
+        packet_delay_budget_ms: u16,
+    ) -> bool {
         if !Self::is_urllc_5qi(five_qi) {
             return true; // Not URLLC, no constraints
         }
@@ -1147,7 +1279,6 @@ impl Default for SmfSess {
     }
 }
 
-
 // ============================================================================
 // Rel-17 MBS (Multicast/Broadcast Service) Types (TS 23.247)
 // ============================================================================
@@ -1291,7 +1422,10 @@ impl MbsSession {
             qos_flows: self.qos_flow_list.clone(),
         };
         self.n4mb_session = Some(n4mb);
-        log::info!("MBS Session {} N4mb establishment initiated with UPF", self.id);
+        log::info!(
+            "MBS Session {} N4mb establishment initiated with UPF",
+            self.id
+        );
     }
 
     /// Activate N4mb session after successful PFCP establishment
@@ -1300,8 +1434,12 @@ impl MbsSession {
             n4mb.state = N4mbSessionState::Active;
             n4mb.multicast_fteid = Some(fteid);
             n4mb.multicast_transport_ip = Some(transport_ip);
-            log::info!("MBS Session {} N4mb session activated (F-TEID: {}, IP: {})",
-                      self.id, fteid, transport_ip);
+            log::info!(
+                "MBS Session {} N4mb session activated (F-TEID: {}, IP: {})",
+                self.id,
+                fteid,
+                transport_ip
+            );
             return true;
         }
         false
@@ -1426,6 +1564,13 @@ pub struct SmfContext {
 
     /// Context initialized flag
     initialized: AtomicBool,
+
+    /// PFCP session map: sm_context_ref -> UPF SEID
+    ///
+    /// Previously a standalone global (`PFCP_SESSIONS`). Moved here so that
+    /// test code can construct isolated `SmfContext` instances and avoid
+    /// cross-test contamination from a process-wide singleton.
+    pub pfcp_sessions: RwLock<HashMap<String, u64>>,
 }
 
 impl SmfContext {
@@ -1470,6 +1615,7 @@ impl SmfContext {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(std::net::Ipv4Addr::new(127, 0, 0, 1)),
             initialized: AtomicBool::new(false),
+            pfcp_sessions: RwLock::new(HashMap::new()),
         }
     }
 
@@ -1641,14 +1787,18 @@ impl SmfContext {
     pub fn ue_find_by_supi(&self, supi: &str) -> Option<SmfUe> {
         let supi_hash = self.supi_hash.read().ok()?;
         let smf_ue_list = self.smf_ue_list.read().ok()?;
-        supi_hash.get(supi).and_then(|&id| smf_ue_list.get(&id).cloned())
+        supi_hash
+            .get(supi)
+            .and_then(|&id| smf_ue_list.get(&id).cloned())
     }
 
     /// Find UE by IMSI
     pub fn ue_find_by_imsi(&self, imsi: &[u8]) -> Option<SmfUe> {
         let imsi_hash = self.imsi_hash.read().ok()?;
         let smf_ue_list = self.smf_ue_list.read().ok()?;
-        imsi_hash.get(imsi).and_then(|&id| smf_ue_list.get(&id).cloned())
+        imsi_hash
+            .get(imsi)
+            .and_then(|&id| smf_ue_list.get(&id).cloned())
     }
 
     /// Find UE by ID
@@ -1684,7 +1834,10 @@ impl SmfContext {
         let mut smf_ue_list = self.smf_ue_list.write().ok()?;
 
         if sess_list.len() >= self.max_num_of_sess {
-            log::error!("Maximum number of sessions [{}] reached", self.max_num_of_sess);
+            log::error!(
+                "Maximum number of sessions [{}] reached",
+                self.max_num_of_sess
+            );
             return None;
         }
 
@@ -1719,7 +1872,10 @@ impl SmfContext {
         let mut smf_ue_list = self.smf_ue_list.write().ok()?;
 
         if sess_list.len() >= self.max_num_of_sess {
-            log::error!("Maximum number of sessions [{}] reached", self.max_num_of_sess);
+            log::error!(
+                "Maximum number of sessions [{}] reached",
+                self.max_num_of_sess
+            );
             return None;
         }
 
@@ -1762,7 +1918,7 @@ impl SmfContext {
 
         if let Some(sess) = sess_list.remove(&id) {
             smf_n4_seid_hash.remove(&sess.smf_n4_seid);
-            
+
             if let Some(addr) = sess.ipv4_addr {
                 ipv4_hash.remove(&u32::from(addr));
                 self.ipv4_pool.release(addr);
@@ -1790,7 +1946,8 @@ impl SmfContext {
     fn sess_remove_all_for_ue(&self, smf_ue_id: u64) {
         let sess_ids: Vec<u64> = {
             if let Ok(sess_list) = self.sess_list.read() {
-                sess_list.values()
+                sess_list
+                    .values()
                     .filter(|s| s.smf_ue_id == smf_ue_id)
                     .map(|s| s.id)
                     .collect()
@@ -1824,23 +1981,29 @@ impl SmfContext {
     pub fn sess_find_by_seid(&self, seid: u64) -> Option<SmfSess> {
         let smf_n4_seid_hash = self.smf_n4_seid_hash.read().ok()?;
         let sess_list = self.sess_list.read().ok()?;
-        smf_n4_seid_hash.get(&seid).and_then(|&id| sess_list.get(&id).cloned())
+        smf_n4_seid_hash
+            .get(&seid)
+            .and_then(|&id| sess_list.get(&id).cloned())
     }
 
     /// Find session by APN (EPC)
     pub fn sess_find_by_apn(&self, smf_ue_id: u64, apn: &str, rat_type: u8) -> Option<SmfSess> {
         let sess_list = self.sess_list.read().ok()?;
-        sess_list.values()
-            .find(|s| s.smf_ue_id == smf_ue_id 
-                && s.session_name.as_deref() == Some(apn)
-                && s.gtp_rat_type == rat_type)
+        sess_list
+            .values()
+            .find(|s| {
+                s.smf_ue_id == smf_ue_id
+                    && s.session_name.as_deref() == Some(apn)
+                    && s.gtp_rat_type == rat_type
+            })
             .cloned()
     }
 
     /// Find session by PSI (5GC)
     pub fn sess_find_by_psi(&self, smf_ue_id: u64, psi: u8) -> Option<SmfSess> {
         let sess_list = self.sess_list.read().ok()?;
-        sess_list.values()
+        sess_list
+            .values()
             .find(|s| s.smf_ue_id == smf_ue_id && s.psi == psi)
             .cloned()
     }
@@ -1870,21 +2033,27 @@ impl SmfContext {
     pub fn sess_find_by_ipv4(&self, addr: Ipv4Addr) -> Option<SmfSess> {
         let ipv4_hash = self.ipv4_hash.read().ok()?;
         let sess_list = self.sess_list.read().ok()?;
-        ipv4_hash.get(&u32::from(addr)).and_then(|&id| sess_list.get(&id).cloned())
+        ipv4_hash
+            .get(&u32::from(addr))
+            .and_then(|&id| sess_list.get(&id).cloned())
     }
 
     /// Find session by IPv6 prefix
     pub fn sess_find_by_ipv6(&self, addr: &[u8; 8]) -> Option<SmfSess> {
         let ipv6_hash = self.ipv6_hash.read().ok()?;
         let sess_list = self.sess_list.read().ok()?;
-        ipv6_hash.get(addr).and_then(|&id| sess_list.get(&id).cloned())
+        ipv6_hash
+            .get(addr)
+            .and_then(|&id| sess_list.get(&id).cloned())
     }
 
     /// Find session by paging N1N2 message location
     pub fn sess_find_by_paging_n1n2message_location(&self, location: &str) -> Option<SmfSess> {
         let n1n2message_hash = self.n1n2message_hash.read().ok()?;
         let sess_list = self.sess_list.read().ok()?;
-        n1n2message_hash.get(location).and_then(|&id| sess_list.get(&id).cloned())
+        n1n2message_hash
+            .get(location)
+            .and_then(|&id| sess_list.get(&id).cloned())
     }
 
     /// Update session in the context
@@ -1934,10 +2103,9 @@ impl SmfContext {
 
     /// Set paging N1N2 message location for session
     pub fn sess_set_paging_n1n2message_location(&self, sess_id: u64, location: &str) -> bool {
-        if let (Ok(mut sess_list), Ok(mut n1n2message_hash)) = (
-            self.sess_list.write(),
-            self.n1n2message_hash.write(),
-        ) {
+        if let (Ok(mut sess_list), Ok(mut n1n2message_hash)) =
+            (self.sess_list.write(), self.n1n2message_hash.write())
+        {
             if let Some(sess) = sess_list.get_mut(&sess_id) {
                 // Remove old location from hash
                 if let Some(ref old_loc) = sess.paging_n1n2message_location {
@@ -1962,7 +2130,6 @@ impl SmfContext {
         self.sess_index.fetch_add(1, Ordering::Relaxed)
     }
 
-
     // ========================================================================
     // Bearer/QoS Flow Management
     // ========================================================================
@@ -1973,7 +2140,10 @@ impl SmfContext {
         let mut sess_list = self.sess_list.write().ok()?;
 
         if bearer_list.len() >= self.max_num_of_bearer {
-            log::error!("Maximum number of bearers [{}] reached", self.max_num_of_bearer);
+            log::error!(
+                "Maximum number of bearers [{}] reached",
+                self.max_num_of_bearer
+            );
             return None;
         }
 
@@ -2021,7 +2191,8 @@ impl SmfContext {
     fn bearer_remove_all_for_sess(&self, sess_id: u64) {
         let bearer_ids: Vec<u64> = {
             if let Ok(bearer_list) = self.bearer_list.read() {
-                bearer_list.values()
+                bearer_list
+                    .values()
                     .filter(|b| b.sess_id == sess_id)
                     .map(|b| b.id)
                     .collect()
@@ -2048,15 +2219,21 @@ impl SmfContext {
     /// Find QoS flow by QFI within a session
     pub fn qos_flow_find_by_qfi(&self, sess_id: u64, qfi: u8) -> Option<SmfBearer> {
         let bearer_list = self.bearer_list.read().ok()?;
-        bearer_list.values()
+        bearer_list
+            .values()
             .find(|b| b.sess_id == sess_id && b.qfi == qfi)
             .cloned()
     }
 
     /// Find QoS flow by PCC rule ID within a session
-    pub fn qos_flow_find_by_pcc_rule_id(&self, sess_id: u64, pcc_rule_id: &str) -> Option<SmfBearer> {
+    pub fn qos_flow_find_by_pcc_rule_id(
+        &self,
+        sess_id: u64,
+        pcc_rule_id: &str,
+    ) -> Option<SmfBearer> {
         let bearer_list = self.bearer_list.read().ok()?;
-        bearer_list.values()
+        bearer_list
+            .values()
             .find(|b| b.sess_id == sess_id && b.pcc_rule_id.as_deref() == Some(pcc_rule_id))
             .cloned()
     }
@@ -2064,23 +2241,34 @@ impl SmfContext {
     /// Find bearer by EBI within a session
     pub fn bearer_find_by_ebi(&self, sess_id: u64, ebi: u8) -> Option<SmfBearer> {
         let bearer_list = self.bearer_list.read().ok()?;
-        bearer_list.values()
+        bearer_list
+            .values()
             .find(|b| b.sess_id == sess_id && b.ebi == ebi)
             .cloned()
     }
 
     /// Find bearer by PCC rule name within a session
-    pub fn bearer_find_by_pcc_rule_name(&self, sess_id: u64, pcc_rule_name: &str) -> Option<SmfBearer> {
+    pub fn bearer_find_by_pcc_rule_name(
+        &self,
+        sess_id: u64,
+        pcc_rule_name: &str,
+    ) -> Option<SmfBearer> {
         let bearer_list = self.bearer_list.read().ok()?;
-        bearer_list.values()
+        bearer_list
+            .values()
             .find(|b| b.sess_id == sess_id && b.pcc_rule_name.as_deref() == Some(pcc_rule_name))
             .cloned()
     }
 
     /// Find bearer by PGW S5U TEID within a session
-    pub fn bearer_find_by_pgw_s5u_teid(&self, sess_id: u64, pgw_s5u_teid: u32) -> Option<SmfBearer> {
+    pub fn bearer_find_by_pgw_s5u_teid(
+        &self,
+        sess_id: u64,
+        pgw_s5u_teid: u32,
+    ) -> Option<SmfBearer> {
         let bearer_list = self.bearer_list.read().ok()?;
-        bearer_list.values()
+        bearer_list
+            .values()
             .find(|b| b.sess_id == sess_id && b.pgw_s5u_teid == pgw_s5u_teid)
             .cloned()
     }
@@ -2089,7 +2277,7 @@ impl SmfContext {
     pub fn default_bearer_in_sess(&self, sess_id: u64) -> Option<SmfBearer> {
         let sess_list = self.sess_list.read().ok()?;
         let bearer_list = self.bearer_list.read().ok()?;
-        
+
         if let Some(sess) = sess_list.get(&sess_id) {
             if let Some(&first_bearer_id) = sess.bearer_ids.first() {
                 return bearer_list.get(&first_bearer_id).cloned();
@@ -2158,7 +2346,8 @@ impl SmfContext {
     fn pf_remove_all_for_bearer(&self, bearer_id: u64) {
         let pf_ids: Vec<u64> = {
             if let Ok(pf_list) = self.pf_list.read() {
-                pf_list.values()
+                pf_list
+                    .values()
                     .filter(|pf| pf.bearer_id == bearer_id)
                     .map(|pf| pf.id)
                     .collect()
@@ -2180,18 +2369,27 @@ impl SmfContext {
     /// Find PF by identifier within a bearer
     pub fn pf_find_by_identifier(&self, bearer_id: u64, identifier: u8) -> Option<SmfPf> {
         let pf_list = self.pf_list.read().ok()?;
-        pf_list.values()
+        pf_list
+            .values()
             .find(|pf| pf.bearer_id == bearer_id && pf.identifier == identifier)
             .cloned()
     }
 
     /// Find PF by flow description within a bearer
-    pub fn pf_find_by_flow(&self, bearer_id: u64, direction: FlowDirection, flow_description: &str) -> Option<SmfPf> {
+    pub fn pf_find_by_flow(
+        &self,
+        bearer_id: u64,
+        direction: FlowDirection,
+        flow_description: &str,
+    ) -> Option<SmfPf> {
         let pf_list = self.pf_list.read().ok()?;
-        pf_list.values()
-            .find(|pf| pf.bearer_id == bearer_id 
-                && pf.direction == direction 
-                && pf.flow_description.as_deref() == Some(flow_description))
+        pf_list
+            .values()
+            .find(|pf| {
+                pf.bearer_id == bearer_id
+                    && pf.direction == direction
+                    && pf.flow_description.as_deref() == Some(flow_description)
+            })
             .cloned()
     }
 
@@ -2219,7 +2417,9 @@ impl SmfContext {
     pub fn pcc_rule_find_by_id(&self, sess_id: u64, pcc_rule_id: &str) -> Option<PccRule> {
         let sess_list = self.sess_list.read().ok()?;
         if let Some(sess) = sess_list.get(&sess_id) {
-            return sess.pcc_rules.iter()
+            return sess
+                .pcc_rules
+                .iter()
                 .find(|r| r.id.as_deref() == Some(pcc_rule_id))
                 .cloned();
         }
@@ -2243,7 +2443,9 @@ impl SmfContext {
 
         log::info!(
             "[MBS] Session created: id={} session_id={} state={:?}",
-            id, session.session_id, session.state
+            id,
+            session.session_id,
+            session.state
         );
         Some(session)
     }
@@ -2290,7 +2492,9 @@ impl SmfContext {
             tmgi_hash.remove(&session.tmgi);
             log::info!(
                 "[MBS] Session released: id={} ue_count={} session_id={}",
-                mbs_sess_id, session.ue_count(), session.session_id
+                mbs_sess_id,
+                session.ue_count(),
+                session.session_id
             );
             return Some(session);
         }
@@ -2309,7 +2513,9 @@ impl SmfContext {
                         .as_secs();
                     log::debug!(
                         "[MBS] UE added to session: mbs_sess_id={} ue_id={} total_ues={}",
-                        mbs_sess_id, ue_id, session.ue_count()
+                        mbs_sess_id,
+                        ue_id,
+                        session.ue_count()
                     );
                     return true;
                 }
@@ -2331,7 +2537,9 @@ impl SmfContext {
                         .as_secs();
                     log::debug!(
                         "[MBS] UE removed from session: mbs_sess_id={} ue_id={} total_ues={}",
-                        mbs_sess_id, ue_id, session.ue_count()
+                        mbs_sess_id,
+                        ue_id,
+                        session.ue_count()
                     );
                     return true;
                 }
@@ -2350,19 +2558,16 @@ impl SmfContext {
     pub fn mbs_sess_find_by_tmgi(&self, tmgi: &Tmgi) -> Option<MbsSession> {
         let tmgi_hash = self.tmgi_hash.read().ok()?;
         let mbs_sess_list = self.mbs_sess_list.read().ok()?;
-        tmgi_hash.get(tmgi).and_then(|&id| mbs_sess_list.get(&id).cloned())
+        tmgi_hash
+            .get(tmgi)
+            .and_then(|&id| mbs_sess_list.get(&id).cloned())
     }
 
     /// Get all active MBS sessions
     pub fn mbs_sess_active_list(&self) -> Vec<MbsSession> {
         self.mbs_sess_list
             .read()
-            .map(|list| {
-                list.values()
-                    .filter(|s| s.is_active())
-                    .cloned()
-                    .collect()
-            })
+            .map(|list| list.values().filter(|s| s.is_active()).cloned().collect())
             .expect("value expected")
     }
 
@@ -2399,7 +2604,8 @@ impl Default for SmfContext {
 // ============================================================================
 
 /// Global SMF context
-static GLOBAL_SMF_CONTEXT: std::sync::OnceLock<Arc<RwLock<SmfContext>>> = std::sync::OnceLock::new();
+static GLOBAL_SMF_CONTEXT: std::sync::OnceLock<Arc<RwLock<SmfContext>>> =
+    std::sync::OnceLock::new();
 
 /// Get the global SMF context
 pub fn smf_self() -> Arc<RwLock<SmfContext>> {

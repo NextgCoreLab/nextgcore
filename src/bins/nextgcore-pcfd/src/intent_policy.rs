@@ -114,26 +114,33 @@ impl IntentPolicyTranslator {
         self.translation_count += 1;
 
         let (five_qi, arp, drx) = match intent.intent_type {
-            PolicyIntentType::MaxThroughput => (9, 10, 320),      // Non-GBR, default
-            PolicyIntentType::MinLatency => (1, 2, 10),            // GBR, short DRX
-            PolicyIntentType::EnsureReliability => (82, 1, 40),    // Delay-critical GBR
-            PolicyIntentType::MinEnergy => (9, 15, 2560),          // Non-GBR, long DRX
-            PolicyIntentType::LoadBalance => (9, 8, 320),          // Non-GBR, default
-            PolicyIntentType::XrOptimize => (2, 3, 20),            // GBR, short DRX
+            PolicyIntentType::MaxThroughput => (9, 10, 320), // Non-GBR, default
+            PolicyIntentType::MinLatency => (1, 2, 10),      // GBR, short DRX
+            PolicyIntentType::EnsureReliability => (82, 1, 40), // Delay-critical GBR
+            PolicyIntentType::MinEnergy => (9, 15, 2560),    // Non-GBR, long DRX
+            PolicyIntentType::LoadBalance => (9, 8, 320),    // Non-GBR, default
+            PolicyIntentType::XrOptimize => (2, 3, 20),      // GBR, short DRX
         };
 
         let energy_mode = match intent.intent_type {
             PolicyIntentType::MinEnergy => EnergyPolicyMode::FullOptimization,
             PolicyIntentType::MinLatency | PolicyIntentType::XrOptimize => EnergyPolicyMode::Normal,
             _ => {
-                let has_power_constraint = intent.constraints.iter().any(|c| matches!(c, PolicyConstraint::MaxPowerWatts(_)));
-                if has_power_constraint { EnergyPolicyMode::ExtendedDrx } else { EnergyPolicyMode::Normal }
+                let has_power_constraint = intent
+                    .constraints
+                    .iter()
+                    .any(|c| matches!(c, PolicyConstraint::MaxPowerWatts(_)));
+                if has_power_constraint {
+                    EnergyPolicyMode::ExtendedDrx
+                } else {
+                    EnergyPolicyMode::Normal
+                }
             }
         };
 
         // Apply constraints to tune values
         let mut mbr_dl = 1_000_000; // 1 Gbps default
-        let mut mbr_ul = 500_000;   // 500 Mbps default
+        let mut mbr_ul = 500_000; // 500 Mbps default
         let mut final_drx = drx;
 
         for constraint in &intent.constraints {
@@ -171,10 +178,14 @@ impl IntentPolicyTranslator {
     }
 
     /// Total translations performed.
-    pub fn translation_count(&self) -> u64 { self.translation_count }
+    pub fn translation_count(&self) -> u64 {
+        self.translation_count
+    }
 
     /// Active policies.
-    pub fn policy_count(&self) -> usize { self.policies.len() }
+    pub fn policy_count(&self) -> usize {
+        self.policies.len()
+    }
 }
 
 // ============================================================================

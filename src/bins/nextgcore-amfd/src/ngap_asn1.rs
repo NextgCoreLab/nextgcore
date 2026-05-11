@@ -4,7 +4,9 @@
 //! using the ogs-ngap crate. This ensures wire compatibility with
 //! the gNB (nextgsim-gnb) which also uses proper ASN.1 encoding.
 
-use ogs_asn1c::ngap::cause::{Cause, CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork, CauseTransport};
+use ogs_asn1c::ngap::cause::{
+    Cause, CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork, CauseTransport,
+};
 use ogs_ngap::{builder, parser, types::*, NgapMessage};
 
 use crate::context::AmfContext;
@@ -52,7 +54,10 @@ pub fn build_ng_setup_response_asn1(ctx: &AmfContext) -> Option<Vec<u8>> {
                             (sd_val & 0xFF) as u8,
                         ]
                     });
-                    SNssai { sst: s_nssai.sst, sd }
+                    SNssai {
+                        sst: s_nssai.sst,
+                        sd,
+                    }
                 })
                 .collect();
             PlmnSupportItem {
@@ -212,9 +217,7 @@ fn decode_plmn_id(bytes: &[u8]) -> crate::context::PlmnId {
 }
 
 /// Decode an NG Setup Request from ASN.1 APER bytes
-pub fn parse_ng_setup_request_asn1(
-    data: &[u8],
-) -> Option<crate::ngap_handler::NgSetupRequest> {
+pub fn parse_ng_setup_request_asn1(data: &[u8]) -> Option<crate::ngap_handler::NgSetupRequest> {
     let decoded = match parser::decode_ngap_pdu(data) {
         Ok(msg) => msg,
         Err(e) => {
@@ -235,7 +238,11 @@ pub fn parse_ng_setup_request_asn1(
     result.global_ran_node_id_present = true;
 
     match &req.global_ran_node_id {
-        GlobalRanNodeId::GlobalGnbId { plmn_identity, gnb_id, gnb_id_len } => {
+        GlobalRanNodeId::GlobalGnbId {
+            plmn_identity,
+            gnb_id,
+            gnb_id_len,
+        } => {
             result.plmn_id = decode_plmn_id(plmn_identity);
             result.gnb_id = *gnb_id;
             result.gnb_id_len = *gnb_id_len;
@@ -268,9 +275,7 @@ pub fn parse_ng_setup_request_asn1(
                         .map(|slice| crate::context::SNssai {
                             sst: slice.sst,
                             sd: slice.sd.map(|sd| {
-                                ((sd[0] as u32) << 16)
-                                    | ((sd[1] as u32) << 8)
-                                    | (sd[2] as u32)
+                                ((sd[0] as u32) << 16) | ((sd[1] as u32) << 8) | (sd[2] as u32)
                             }),
                         })
                         .collect();
@@ -340,9 +345,8 @@ pub fn parse_initial_ue_message_asn1(data: &[u8]) -> Option<InitialUeMessageData
             ..
         } => {
             let plmn_id = decode_plmn_id(nr_cgi_plmn);
-            let tac = ((tai_tac[0] as u32) << 16)
-                | ((tai_tac[1] as u32) << 8)
-                | (tai_tac[2] as u32);
+            let tac =
+                ((tai_tac[0] as u32) << 16) | ((tai_tac[1] as u32) << 8) | (tai_tac[2] as u32);
             (plmn_id, *nr_cell_identity, tac)
         }
     };
@@ -429,7 +433,10 @@ pub fn build_pdu_session_resource_setup_request_asn1(
     let item = PduSessionResourceSetupItem {
         pdu_session_id,
         nas_pdu: None,
-        s_nssai: SNssai { sst: s_nssai_sst, sd },
+        s_nssai: SNssai {
+            sst: s_nssai_sst,
+            sd,
+        },
         transfer: n2_sm_transfer.to_vec(),
     };
 
@@ -522,7 +529,9 @@ pub fn build_pdu_session_resource_modify_request_asn1(
         Ok(bytes) => {
             log::debug!(
                 "Built PDU Session Resource Modify Request: {} bytes, amf_ue_ngap_id={}, psi={}",
-                bytes.len(), amf_ue_ngap_id, pdu_session_id
+                bytes.len(),
+                amf_ue_ngap_id,
+                pdu_session_id
             );
             Some(bytes)
         }
@@ -610,7 +619,10 @@ pub fn build_paging_asn1(
         Ok(bytes) => {
             log::debug!(
                 "Built Paging: {} bytes, amf_set_id={}, tmsi=0x{:08x}, tac={}",
-                bytes.len(), amf_set_id, tmsi, tac
+                bytes.len(),
+                amf_set_id,
+                tmsi,
+                tac
             );
             Some(bytes)
         }
@@ -668,7 +680,9 @@ pub fn build_ue_context_release_command_asn1(
         Ok(bytes) => {
             log::debug!(
                 "Built UE Context Release Command: {} bytes, AMF UE NGAP ID={}, RAN UE NGAP ID={}",
-                bytes.len(), amf_ue_ngap_id, ran_ue_ngap_id
+                bytes.len(),
+                amf_ue_ngap_id,
+                ran_ue_ngap_id
             );
             Some(bytes)
         }

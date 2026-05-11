@@ -93,7 +93,6 @@ impl RoamingIndication {
     }
 }
 
-
 /// NSSF NSI (Network Slice Instance) context
 /// Port of nssf_nsi_t from context.h
 #[derive(Debug, Clone)]
@@ -192,7 +191,6 @@ pub struct NssfContext {
     initialized: AtomicBool,
 }
 
-
 impl NssfContext {
     pub fn new() -> Self {
         Self {
@@ -265,10 +263,9 @@ impl NssfContext {
     }
 
     pub fn nsi_remove_all(&self) {
-        if let (Ok(mut nsi_list), Ok(mut snssai_hash)) = (
-            self.nsi_list.write(),
-            self.snssai_hash.write(),
-        ) {
+        if let (Ok(mut nsi_list), Ok(mut snssai_hash)) =
+            (self.nsi_list.write(), self.snssai_hash.write())
+        {
             nsi_list.clear();
             snssai_hash.clear();
         }
@@ -297,7 +294,6 @@ impl NssfContext {
         false
     }
 
-
     // Home management
 
     pub fn home_add(&self, plmn_id: &PlmnId, s_nssai: &SNssai) -> Option<NssfHome> {
@@ -305,7 +301,10 @@ impl NssfContext {
         let mut home_hash = self.home_hash.write().ok()?;
 
         if home_list.len() >= self.max_num_of_nf {
-            log::error!("Maximum number of Home contexts [{}] reached", self.max_num_of_nf);
+            log::error!(
+                "Maximum number of Home contexts [{}] reached",
+                self.max_num_of_nf
+            );
             return None;
         }
 
@@ -323,7 +322,11 @@ impl NssfContext {
 
         log::debug!(
             "NSSF Home added (id={}, plmn={}{}, sst={}, sd={:?})",
-            id, plmn_id.mcc, plmn_id.mnc, s_nssai.sst, s_nssai.sd
+            id,
+            plmn_id.mcc,
+            plmn_id.mnc,
+            s_nssai.sst,
+            s_nssai.sd
         );
         Some(home)
     }
@@ -347,10 +350,9 @@ impl NssfContext {
     }
 
     pub fn home_remove_all(&self) {
-        if let (Ok(mut home_list), Ok(mut home_hash)) = (
-            self.home_list.write(),
-            self.home_hash.write(),
-        ) {
+        if let (Ok(mut home_list), Ok(mut home_hash)) =
+            (self.home_list.write(), self.home_hash.write())
+        {
             home_list.clear();
             home_hash.clear();
         }
@@ -365,7 +367,9 @@ impl NssfContext {
             s_nssai.sst,
             s_nssai.sd,
         );
-        home_hash.get(&key).and_then(|&id| home_list.get(&id).cloned())
+        home_hash
+            .get(&key)
+            .and_then(|&id| home_list.get(&id).cloned())
     }
 
     pub fn home_find_by_id(&self, id: u64) -> Option<NssfHome> {
@@ -409,13 +413,16 @@ impl NssfContext {
         if let Ok(avail) = self.nssai_availability.read() {
             for info in avail.values() {
                 let tai_match = info.tai_list.iter().any(|t| {
-                    t.plmn_id.mcc == tai.plmn_id.mcc &&
-                    t.plmn_id.mnc == tai.plmn_id.mnc &&
-                    t.tac == tai.tac
+                    t.plmn_id.mcc == tai.plmn_id.mcc
+                        && t.plmn_id.mnc == tai.plmn_id.mnc
+                        && t.tac == tai.tac
                 });
                 if tai_match {
                     for snssai in &info.supported_snssai_list {
-                        if !result.iter().any(|s: &SNssai| s.sst == snssai.sst && s.sd == snssai.sd) {
+                        if !result
+                            .iter()
+                            .any(|s: &SNssai| s.sst == snssai.sst && s.sd == snssai.sd)
+                        {
                             result.push(snssai.clone());
                         }
                     }
@@ -457,9 +464,9 @@ impl Default for NssfContext {
     }
 }
 
-
 /// Global NSSF context (thread-safe singleton)
-static GLOBAL_NSSF_CONTEXT: std::sync::OnceLock<Arc<RwLock<NssfContext>>> = std::sync::OnceLock::new();
+static GLOBAL_NSSF_CONTEXT: std::sync::OnceLock<Arc<RwLock<NssfContext>>> =
+    std::sync::OnceLock::new();
 
 /// Get the global NSSF context
 pub fn nssf_self() -> Arc<RwLock<NssfContext>> {
@@ -519,7 +526,9 @@ mod tests {
         let mut ctx = NssfContext::new();
         ctx.init(100);
 
-        let nsi = ctx.nsi_add("http://nrf.example.com", 1, Some(0x010203)).unwrap();
+        let nsi = ctx
+            .nsi_add("http://nrf.example.com", 1, Some(0x010203))
+            .unwrap();
         assert_eq!(nsi.s_nssai.sst, 1);
         assert_eq!(nsi.s_nssai.sd, Some(0x010203));
         assert_eq!(ctx.nsi_count(), 1);
@@ -576,9 +585,18 @@ mod tests {
 
     #[test]
     fn test_roaming_indication() {
-        assert_eq!(RoamingIndication::from_openapi(1), RoamingIndication::NonRoaming);
-        assert_eq!(RoamingIndication::from_openapi(2), RoamingIndication::LocalBreakout);
-        assert_eq!(RoamingIndication::from_openapi(3), RoamingIndication::HomeRouted);
+        assert_eq!(
+            RoamingIndication::from_openapi(1),
+            RoamingIndication::NonRoaming
+        );
+        assert_eq!(
+            RoamingIndication::from_openapi(2),
+            RoamingIndication::LocalBreakout
+        );
+        assert_eq!(
+            RoamingIndication::from_openapi(3),
+            RoamingIndication::HomeRouted
+        );
         assert_eq!(RoamingIndication::NonRoaming.to_openapi(), 1);
     }
 }

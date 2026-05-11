@@ -3,10 +3,9 @@
 //! Port of src/amf/gmm-handler.c - GMM message handling functions for 5G NAS
 
 use crate::context::{
-    AmfUe, RanUe, PlmnId, Guti5gs, UeSecurityCapability,
-    OGS_NAS_KSI_NO_KEY_IS_AVAILABLE,
+    AmfUe, Guti5gs, PlmnId, RanUe, UeSecurityCapability, OGS_NAS_KSI_NO_KEY_IS_AVAILABLE,
 };
-use crate::gmm_build::{GmmCause, mobile_identity_type};
+use crate::gmm_build::{mobile_identity_type, GmmCause};
 
 // ============================================================================
 // Constants
@@ -43,12 +42,11 @@ pub mod service_type {
 // ============================================================================
 
 /// Registration request cleartext presence mask
-const REGISTRATION_CLEARTEXT_PRESENT: u64 = 
-    (1 << 0) |  // UE_SECURITY_CAPABILITY
+const REGISTRATION_CLEARTEXT_PRESENT: u64 = (1 << 0) |  // UE_SECURITY_CAPABILITY
     (1 << 1) |  // UE_STATUS
     (1 << 2) |  // EPS_NAS_MESSAGE_CONTAINER
     (1 << 3) |  // NAS_MESSAGE_CONTAINER
-    (1 << 4);   // ADDITIONAL_GUTI
+    (1 << 4); // ADDITIONAL_GUTI
 
 /// Parsed registration request
 #[derive(Debug, Clone, Default)]
@@ -117,13 +115,20 @@ pub fn handle_registration_request(
         mobile_identity_type::GUTI => {
             if let Some(ref guti) = request.old_guti {
                 amf_ue.old_guti = guti.clone();
-                log::info!("5G-S_GUTI[AMF_ID:0x{:x},M_TMSI:0x{:x}]",
-                    (guti.amf_region_id as u32) << 16 | (guti.amf_set_id as u32) << 6 | guti.amf_pointer as u32,
-                    guti.tmsi);
+                log::info!(
+                    "5G-S_GUTI[AMF_ID:0x{:x},M_TMSI:0x{:x}]",
+                    (guti.amf_region_id as u32) << 16
+                        | (guti.amf_set_id as u32) << 6
+                        | guti.amf_pointer as u32,
+                    guti.tmsi
+                );
             }
         }
         _ => {
-            log::error!("Unknown mobile identity type: {}", request.mobile_identity_type);
+            log::error!(
+                "Unknown mobile identity type: {}",
+                request.mobile_identity_type
+            );
         }
     }
 
@@ -134,7 +139,7 @@ pub fn handle_registration_request(
     // Handle ngKSI
     amf_ue.nas_ue_tsc = request.tsc;
     amf_ue.nas_ue_ksi = request.ksi;
-    
+
     if amf_ue.nas_ue_ksi < OGS_NAS_KSI_NO_KEY_IS_AVAILABLE {
         amf_ue.nas_tsc = amf_ue.nas_ue_tsc;
         amf_ue.nas_ksi = amf_ue.nas_ue_ksi;
@@ -191,7 +196,11 @@ pub fn handle_registration_request(
     // In production: would query NSACF for each requested S-NSSAI
     amf_ue.slice_admission_granted = true;
     for snssai in &amf_ue.requested_nssai {
-        log::debug!("Slice admission check: SST={}, SD={:?}", snssai.sst, snssai.sd);
+        log::debug!(
+            "Slice admission check: SST={}, SD={:?}",
+            snssai.sst,
+            snssai.sd
+        );
     }
 
     GmmCause::RequestAccepted
@@ -253,7 +262,7 @@ pub fn handle_service_request(
     // Handle ngKSI
     amf_ue.nas_ue_tsc = request.tsc;
     amf_ue.nas_ue_ksi = request.ksi;
-    
+
     if amf_ue.nas_ue_ksi < OGS_NAS_KSI_NO_KEY_IS_AVAILABLE {
         amf_ue.nas_tsc = amf_ue.nas_ue_tsc;
         amf_ue.nas_ksi = amf_ue.nas_ue_ksi;
@@ -316,7 +325,7 @@ pub fn handle_deregistration_request(
     // Handle ngKSI
     amf_ue.nas_ue_tsc = request.tsc;
     amf_ue.nas_ue_ksi = request.ksi;
-    
+
     if amf_ue.nas_ue_ksi < OGS_NAS_KSI_NO_KEY_IS_AVAILABLE {
         amf_ue.nas_tsc = amf_ue.nas_ue_tsc;
         amf_ue.nas_ksi = amf_ue.nas_ue_ksi;
@@ -329,7 +338,10 @@ pub fn handle_deregistration_request(
         log::debug!("UE switch-off deregistration");
     }
 
-    log::info!("[{}] Deregistration request", amf_ue.supi.as_deref().unwrap_or("Unknown"));
+    log::info!(
+        "[{}] Deregistration request",
+        amf_ue.supi.as_deref().unwrap_or("Unknown")
+    );
 
     Ok(())
 }
@@ -350,7 +362,10 @@ pub fn handle_authentication_response(
     amf_ue: &mut AmfUe,
     response: &AuthenticationResponse,
 ) -> Result<(), GmmCause> {
-    log::debug!("[{}] Authentication response", amf_ue.suci.as_deref().unwrap_or("Unknown"));
+    log::debug!(
+        "[{}] Authentication response",
+        amf_ue.suci.as_deref().unwrap_or("Unknown")
+    );
 
     // Clear T3560 timer
     amf_ue.t3560_running = false;
@@ -363,7 +378,7 @@ pub fn handle_authentication_response(
 
     // Compute HXRES* and compare
     let hxres_star = compute_hxres_star(&amf_ue.rand, &response.res_star);
-    
+
     if hxres_star != amf_ue.hxres_star {
         log::error!("HXRES* mismatch - MAC failure");
         return Err(GmmCause::MacFailure);
@@ -377,13 +392,13 @@ pub fn handle_authentication_response(
 
 /// Compute HXRES* from RAND and RES*
 fn compute_hxres_star(rand: &[u8; 16], res_star: &[u8]) -> [u8; 16] {
-    use sha2::{Sha256, Digest};
-    
+    use sha2::{Digest, Sha256};
+
     let mut hasher = Sha256::new();
     hasher.update(rand);
     hasher.update(res_star);
     let result = hasher.finalize();
-    
+
     let mut hxres_star = [0u8; 16];
     hxres_star.copy_from_slice(&result[16..32]);
     hxres_star
@@ -405,10 +420,7 @@ pub struct IdentityResponse {
 }
 
 /// Handle identity response
-pub fn handle_identity_response(
-    amf_ue: &mut AmfUe,
-    response: &IdentityResponse,
-) -> GmmCause {
+pub fn handle_identity_response(amf_ue: &mut AmfUe, response: &IdentityResponse) -> GmmCause {
     match response.mobile_identity_type {
         mobile_identity_type::SUCI => {
             if let Some(ref suci) = response.suci {
@@ -420,7 +432,10 @@ pub fn handle_identity_response(
             }
         }
         _ => {
-            log::error!("Unsupported identity type: {}", response.mobile_identity_type);
+            log::error!(
+                "Unsupported identity type: {}",
+                response.mobile_identity_type
+            );
             return GmmCause::SemanticallyIncorrectMessage;
         }
     }
@@ -527,15 +542,21 @@ pub fn handle_ul_nas_transport(
     match transport.payload_container_type {
         payload_container_type::N1_SM_INFORMATION => {
             // Handle N1 SM information
-            log::debug!("[{}] UL NAS Transport - N1 SM Information, PSI={}", 
-                amf_ue.supi.as_deref().unwrap_or("Unknown"), psi);
-            
+            log::debug!(
+                "[{}] UL NAS Transport - N1 SM Information, PSI={}",
+                amf_ue.supi.as_deref().unwrap_or("Unknown"),
+                psi
+            );
+
             // Store payload for session handling
             amf_ue.pending_n1_sm_msg = Some(transport.payload_container.clone());
             amf_ue.pending_psi = Some(psi);
         }
         _ => {
-            log::error!("Unknown payload container type: {}", transport.payload_container_type);
+            log::error!(
+                "Unknown payload container type: {}",
+                transport.payload_container_type
+            );
             return Err(GmmCause::MessageTypeNonExistentOrNotImplemented);
         }
     }
@@ -558,7 +579,7 @@ pub fn registration_request_from_old_amf(
     }
 
     // Check for all-zero GUTI (invalid)
-    if amf_ue.old_guti.amf_region_id == 0 
+    if amf_ue.old_guti.amf_region_id == 0
         && amf_ue.old_guti.amf_set_id == 0
         && amf_ue.old_guti.plmn_id.mcc1 == 0
         && amf_ue.old_guti.plmn_id.mcc2 == 0
@@ -601,9 +622,16 @@ pub fn parse_suci(buffer: &[u8]) -> Option<(String, PlmnId)> {
     // Build SUCI string (simplified)
     let suci = format!(
         "suci-0-{}{}{}-{}{}{}-0-0-0",
-        plmn_id.mcc1, plmn_id.mcc2, plmn_id.mcc3,
-        plmn_id.mnc1, plmn_id.mnc2,
-        if plmn_id.mnc3 != 0xf { format!("{}", plmn_id.mnc3) } else { String::new() }
+        plmn_id.mcc1,
+        plmn_id.mcc2,
+        plmn_id.mcc3,
+        plmn_id.mnc1,
+        plmn_id.mnc2,
+        if plmn_id.mnc3 != 0xf {
+            format!("{}", plmn_id.mnc3)
+        } else {
+            String::new()
+        }
     );
 
     Some((suci, plmn_id))
@@ -648,7 +676,7 @@ pub fn parse_guti(buffer: &[u8]) -> Option<Guti5gs> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{Tai5gs, NrCgi};
+    use crate::context::{NrCgi, Tai5gs};
     use crate::gmm_build::registration_type;
 
     fn create_test_amf_ue() -> AmfUe {
@@ -682,7 +710,7 @@ mod tests {
     fn test_handle_registration_request_initial() {
         let mut amf_ue = create_test_amf_ue();
         let ran_ue = create_test_ran_ue();
-        
+
         let request = RegistrationRequest {
             registration_type: registration_type::INITIAL,
             tsc: 0,
@@ -694,9 +722,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = handle_registration_request(
-            &mut amf_ue, &ran_ue, &request, true, false
-        );
+        let result = handle_registration_request(&mut amf_ue, &ran_ue, &request, true, false);
 
         assert_eq!(result, GmmCause::RequestAccepted);
         assert!(amf_ue.suci.is_some());
@@ -707,7 +733,7 @@ mod tests {
     fn test_handle_registration_request_with_guti() {
         let mut amf_ue = create_test_amf_ue();
         let ran_ue = create_test_ran_ue();
-        
+
         let request = RegistrationRequest {
             registration_type: registration_type::MOBILITY_UPDATING,
             tsc: 0,
@@ -724,9 +750,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = handle_registration_request(
-            &mut amf_ue, &ran_ue, &request, true, false
-        );
+        let result = handle_registration_request(&mut amf_ue, &ran_ue, &request, true, false);
 
         assert_eq!(result, GmmCause::RequestAccepted);
         assert_eq!(amf_ue.old_guti.tmsi, 0x12345678);
@@ -736,16 +760,14 @@ mod tests {
     fn test_handle_registration_request_non_cleartext_rejected() {
         let mut amf_ue = create_test_amf_ue();
         let ran_ue = create_test_ran_ue();
-        
+
         let request = RegistrationRequest {
             registration_type: registration_type::INITIAL,
             presencemask: 0xFFFF, // Non-cleartext IEs
             ..Default::default()
         };
 
-        let result = handle_registration_request(
-            &mut amf_ue, &ran_ue, &request, true, false
-        );
+        let result = handle_registration_request(&mut amf_ue, &ran_ue, &request, true, false);
 
         assert_eq!(result, GmmCause::SemanticallyIncorrectMessage);
     }
@@ -754,7 +776,7 @@ mod tests {
     fn test_handle_service_request() {
         let mut amf_ue = create_test_amf_ue();
         let ran_ue = create_test_ran_ue();
-        
+
         let request = ServiceRequest {
             tsc: 0,
             ksi: 1,
@@ -764,9 +786,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = handle_service_request(
-            &mut amf_ue, &ran_ue, &request, true, false
-        );
+        let result = handle_service_request(&mut amf_ue, &ran_ue, &request, true, false);
 
         assert_eq!(result, GmmCause::RequestAccepted);
         assert!(amf_ue.pdu_session_status_present);
@@ -776,7 +796,7 @@ mod tests {
     fn test_handle_deregistration_request() {
         let mut amf_ue = create_test_amf_ue();
         amf_ue.supi = Some("imsi-001010000000001".to_string());
-        
+
         let request = DeregistrationRequest {
             switch_off: true,
             re_registration_required: false,
@@ -794,7 +814,7 @@ mod tests {
     #[test]
     fn test_handle_identity_response() {
         let mut amf_ue = create_test_amf_ue();
-        
+
         let response = IdentityResponse {
             mobile_identity_type: mobile_identity_type::SUCI,
             suci: Some("suci-0-001-01-0-0-0-0000000001".to_string()),
@@ -810,7 +830,7 @@ mod tests {
     #[test]
     fn test_handle_security_mode_complete() {
         let mut amf_ue = create_test_amf_ue();
-        
+
         let complete = SecurityModeComplete {
             imeisv: Some("3512340052143210".to_string()),
             nas_message_container_present: true,
@@ -827,7 +847,7 @@ mod tests {
     #[test]
     fn test_handle_security_mode_complete_no_container() {
         let mut amf_ue = create_test_amf_ue();
-        
+
         let complete = SecurityModeComplete {
             nas_message_container_present: false,
             ..Default::default()
@@ -842,7 +862,7 @@ mod tests {
     fn test_handle_ul_nas_transport() {
         let mut amf_ue = create_test_amf_ue();
         let ran_ue = create_test_ran_ue();
-        
+
         let transport = UlNasTransport {
             payload_container_type: payload_container_type::N1_SM_INFORMATION,
             payload_container: vec![0x2e, 0x01, 0xc1],
@@ -861,7 +881,7 @@ mod tests {
     fn test_handle_ul_nas_transport_no_psi() {
         let mut amf_ue = create_test_amf_ue();
         let ran_ue = create_test_ran_ue();
-        
+
         let transport = UlNasTransport {
             payload_container_type: payload_container_type::N1_SM_INFORMATION,
             payload_container: vec![0x2e, 0x01, 0xc1],
@@ -886,7 +906,7 @@ mod tests {
 
         let guti = parse_guti(&buffer);
         assert!(guti.is_some());
-        
+
         let guti = guti.unwrap();
         assert_eq!(guti.amf_region_id, 0x01);
         assert_eq!(guti.tmsi, 0x12345678);
@@ -903,16 +923,14 @@ mod tests {
             tmsi: 0x12345678,
         };
 
-        let served_guami = vec![
-            crate::context::Guami {
-                plmn_id: PlmnId::new("001", "01"),
-                amf_id: crate::context::AmfId {
-                    region: 1,
-                    set: 1,
-                    pointer: 1,
-                },
+        let served_guami = vec![crate::context::Guami {
+            plmn_id: PlmnId::new("001", "01"),
+            amf_id: crate::context::AmfId {
+                region: 1,
+                set: 1,
+                pointer: 1,
             },
-        ];
+        }];
 
         // GUTI doesn't match served GUAMI, so it's from old AMF
         assert!(registration_request_from_old_amf(&amf_ue, &served_guami));
@@ -929,16 +947,14 @@ mod tests {
             tmsi: 0x12345678,
         };
 
-        let served_guami = vec![
-            crate::context::Guami {
-                plmn_id: PlmnId::new("001", "01"),
-                amf_id: crate::context::AmfId {
-                    region: 1,
-                    set: 1,
-                    pointer: 1,
-                },
+        let served_guami = vec![crate::context::Guami {
+            plmn_id: PlmnId::new("001", "01"),
+            amf_id: crate::context::AmfId {
+                region: 1,
+                set: 1,
+                pointer: 1,
             },
-        ];
+        }];
 
         // GUTI matches served GUAMI, so it's from same AMF
         assert!(!registration_request_from_old_amf(&amf_ue, &served_guami));
@@ -948,9 +964,9 @@ mod tests {
     fn test_compute_hxres_star() {
         let rand = [0u8; 16];
         let res_star = [1u8; 16];
-        
+
         let hxres_star = compute_hxres_star(&rand, &res_star);
-        
+
         // Just verify it produces a 16-byte result
         assert_eq!(hxres_star.len(), 16);
     }

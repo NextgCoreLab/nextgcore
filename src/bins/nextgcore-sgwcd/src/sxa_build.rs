@@ -191,10 +191,7 @@ pub fn build_session_deletion_request(sess: &SgwcSess) -> Option<PfcpMessage> {
     let msg = PfcpMessage::new(pfcp_type::SESSION_DELETION_REQUEST, sess.sgwu_sxa_seid);
 
     // Session Deletion Request has no additional IEs beyond the header
-    log::debug!(
-        "Built Session Deletion Request: seid=0x{:x}",
-        msg.seid
-    );
+    log::debug!("Built Session Deletion Request: seid=0x{:x}", msg.seid);
 
     Some(msg)
 }

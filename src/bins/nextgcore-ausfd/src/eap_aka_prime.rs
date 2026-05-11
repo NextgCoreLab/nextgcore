@@ -488,7 +488,12 @@ impl EapAkaSession {
         self.ik_prime = ik_prime;
 
         // Derive KAUSF from CK', IK'
-        self.kausf = derive_kausf_eap(&ck_prime, &ik_prime, &self.serving_network_name, &sqn_xor_ak);
+        self.kausf = derive_kausf_eap(
+            &ck_prime,
+            &ik_prime,
+            &self.serving_network_name,
+            &sqn_xor_ak,
+        );
 
         // For K_aut, in a full implementation this would come from PRF' expansion.
         // Simplified: use HMAC-SHA-256(CK'||IK', "EAP-AKA'K_aut")

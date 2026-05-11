@@ -250,7 +250,10 @@ impl PcfUeAm {
                     dnn: Some("internet".to_string()),
                     pdu_session_type: Some(PduSessionType::Ipv4),
                     ssc_mode: Some(1),
-                    access_type: Some(vec![AccessType::ThreeGppAccess, AccessType::NonThreeGppAccess]),
+                    access_type: Some(vec![
+                        AccessType::ThreeGppAccess,
+                        AccessType::NonThreeGppAccess,
+                    ]),
                 }],
             },
             // Rule 3: V2X traffic → URLLC slice, V2X DNN
@@ -273,7 +276,11 @@ impl PcfUeAm {
                 }],
             },
         ];
-        log::info!("[PCF URSP] Generated {} default URSP rules for SUPI={}", self.ursp_rules.len(), self.supi);
+        log::info!(
+            "[PCF URSP] Generated {} default URSP rules for SUPI={}",
+            self.ursp_rules.len(),
+            self.supi
+        );
     }
 
     /// Provision UE policy (URSP) to AMF via UE Configuration Update
@@ -318,7 +325,6 @@ pub struct UrspRuleTemplate {
     /// Route selection descriptors
     pub route_selection_descriptors: Vec<RouteSelectionDescriptor>,
 }
-
 
 /// PCF UE SM (Session Management) context
 /// Port of pcf_ue_sm_t from context.h
@@ -467,7 +473,10 @@ impl PcfSess {
         if parts.len() != 2 {
             return false;
         }
-        if let (Ok(addr), Ok(len)) = (parts[0].parse::<std::net::Ipv6Addr>(), parts[1].parse::<u8>()) {
+        if let (Ok(addr), Ok(len)) = (
+            parts[0].parse::<std::net::Ipv6Addr>(),
+            parts[1].parse::<u8>(),
+        ) {
             self.ipv6prefix_string = Some(ipv6prefix.to_string());
             self.ipv6prefix = Some((len, addr.octets()));
             true
@@ -476,7 +485,6 @@ impl PcfSess {
         }
     }
 }
-
 
 // ============================================================================
 // Rel-18 PCF Analytics Integration (NWDAF)
@@ -820,8 +828,8 @@ impl UavPolicyAuthorization {
             flight_zones: Vec::new(),
             min_altitude_limit: 0.0,
             max_altitude_limit: 120.0,
-            max_uplink_rate_kbps: Some(1000), // Default 1 Mbps
-            max_downlink_rate_kbps: Some(5000), // Default 5 Mbps
+            max_uplink_rate_kbps: Some(1000),     // Default 1 Mbps
+            max_downlink_rate_kbps: Some(5000),   // Default 5 Mbps
             max_session_duration_sec: Some(3600), // Default 1 hour
             priority_level: 10,
             allowed_snssai: Vec::new(),
@@ -884,7 +892,13 @@ impl UavPolicyAuthorization {
     }
 
     /// Check if position is within authorized zones
-    pub fn check_position_authorized(&self, latitude: f64, longitude: f64, altitude: f64, timestamp: u64) -> bool {
+    pub fn check_position_authorized(
+        &self,
+        latitude: f64,
+        longitude: f64,
+        altitude: f64,
+        timestamp: u64,
+    ) -> bool {
         // Check global altitude limits
         if altitude < self.min_altitude_limit || altitude > self.max_altitude_limit {
             log::warn!(
@@ -934,7 +948,12 @@ impl UavPolicyAuthorization {
     }
 
     /// Set communication constraints
-    pub fn set_comm_constraints(&mut self, max_ul_kbps: u32, max_dl_kbps: u32, max_duration_sec: u32) {
+    pub fn set_comm_constraints(
+        &mut self,
+        max_ul_kbps: u32,
+        max_dl_kbps: u32,
+        max_duration_sec: u32,
+    ) {
         self.max_uplink_rate_kbps = Some(max_ul_kbps);
         self.max_downlink_rate_kbps = Some(max_dl_kbps);
         self.max_session_duration_sec = Some(max_duration_sec);
@@ -1104,13 +1123,17 @@ impl PcfContext {
     pub fn ue_am_find_by_supi(&self, supi: &str) -> Option<PcfUeAm> {
         let supi_am_hash = self.supi_am_hash.read().ok()?;
         let ue_am_list = self.ue_am_list.read().ok()?;
-        supi_am_hash.get(supi).and_then(|&id| ue_am_list.get(&id).cloned())
+        supi_am_hash
+            .get(supi)
+            .and_then(|&id| ue_am_list.get(&id).cloned())
     }
 
     pub fn ue_am_find_by_association_id(&self, association_id: &str) -> Option<PcfUeAm> {
         let association_id_hash = self.association_id_hash.read().ok()?;
         let ue_am_list = self.ue_am_list.read().ok()?;
-        association_id_hash.get(association_id).and_then(|&id| ue_am_list.get(&id).cloned())
+        association_id_hash
+            .get(association_id)
+            .and_then(|&id| ue_am_list.get(&id).cloned())
     }
 
     pub fn ue_am_find_by_id(&self, id: u64) -> Option<PcfUeAm> {
@@ -1127,7 +1150,6 @@ impl PcfContext {
         }
         false
     }
-
 
     // UE SM management
 
@@ -1165,10 +1187,9 @@ impl PcfContext {
     }
 
     pub fn ue_sm_remove_all(&self) {
-        if let (Ok(mut ue_sm_list), Ok(mut supi_sm_hash)) = (
-            self.ue_sm_list.write(),
-            self.supi_sm_hash.write(),
-        ) {
+        if let (Ok(mut ue_sm_list), Ok(mut supi_sm_hash)) =
+            (self.ue_sm_list.write(), self.supi_sm_hash.write())
+        {
             ue_sm_list.clear();
             supi_sm_hash.clear();
         }
@@ -1184,7 +1205,9 @@ impl PcfContext {
     pub fn ue_sm_find_by_supi(&self, supi: &str) -> Option<PcfUeSm> {
         let supi_sm_hash = self.supi_sm_hash.read().ok()?;
         let ue_sm_list = self.ue_sm_list.read().ok()?;
-        supi_sm_hash.get(supi).and_then(|&id| ue_sm_list.get(&id).cloned())
+        supi_sm_hash
+            .get(supi)
+            .and_then(|&id| ue_sm_list.get(&id).cloned())
     }
 
     pub fn ue_sm_find_by_id(&self, id: u64) -> Option<PcfUeSm> {
@@ -1210,7 +1233,10 @@ impl PcfContext {
         let mut ue_sm_list = self.ue_sm_list.write().ok()?;
 
         if sess_list.len() >= self.max_num_of_sess {
-            log::error!("Maximum number of sessions [{}] reached", self.max_num_of_sess);
+            log::error!(
+                "Maximum number of sessions [{}] reached",
+                self.max_num_of_sess
+            );
             return None;
         }
 
@@ -1258,7 +1284,8 @@ impl PcfContext {
 
     fn sess_remove_all_for_ue(&self, pcf_ue_sm_id: u64) {
         if let Ok(mut sess_list) = self.sess_list.write() {
-            let sess_ids: Vec<u64> = sess_list.values()
+            let sess_ids: Vec<u64> = sess_list
+                .values()
                 .filter(|s| s.pcf_ue_sm_id == pcf_ue_sm_id)
                 .map(|s| s.id)
                 .collect();
@@ -1276,12 +1303,17 @@ impl PcfContext {
     pub fn sess_find_by_sm_policy_id(&self, sm_policy_id: &str) -> Option<PcfSess> {
         let sm_policy_id_hash = self.sm_policy_id_hash.read().ok()?;
         let sess_list = self.sess_list.read().ok()?;
-        sm_policy_id_hash.get(sm_policy_id).and_then(|&id| sess_list.get(&id).cloned())
+        sm_policy_id_hash
+            .get(sm_policy_id)
+            .and_then(|&id| sess_list.get(&id).cloned())
     }
 
     pub fn sess_find_by_psi(&self, pcf_ue_sm_id: u64, psi: u8) -> Option<PcfSess> {
         let sess_list = self.sess_list.read().ok()?;
-        sess_list.values().find(|s| s.pcf_ue_sm_id == pcf_ue_sm_id && s.psi == psi).cloned()
+        sess_list
+            .values()
+            .find(|s| s.pcf_ue_sm_id == pcf_ue_sm_id && s.psi == psi)
+            .cloned()
     }
 
     pub fn sess_find_by_ipv4addr(&self, ipv4addr_string: &str) -> Option<PcfSess> {
@@ -1289,7 +1321,9 @@ impl PcfContext {
             let ipv4addr = u32::from(addr);
             let ipv4addr_hash = self.ipv4addr_hash.read().ok()?;
             let sess_list = self.sess_list.read().ok()?;
-            return ipv4addr_hash.get(&ipv4addr).and_then(|&id| sess_list.get(&id).cloned());
+            return ipv4addr_hash
+                .get(&ipv4addr)
+                .and_then(|&id| sess_list.get(&id).cloned());
         }
         None
     }
@@ -1297,7 +1331,9 @@ impl PcfContext {
     pub fn sess_find_by_ipv6addr(&self, ipv6prefix_string: &str) -> Option<PcfSess> {
         let ipv6prefix_hash = self.ipv6prefix_hash.read().ok()?;
         let sess_list = self.sess_list.read().ok()?;
-        ipv6prefix_hash.get(ipv6prefix_string).and_then(|&id| sess_list.get(&id).cloned())
+        ipv6prefix_hash
+            .get(ipv6prefix_string)
+            .and_then(|&id| sess_list.get(&id).cloned())
     }
 
     pub fn sess_update(&self, sess: &PcfSess) -> bool {
@@ -1332,15 +1368,24 @@ impl PcfContext {
         false
     }
 
-    pub fn sessions_number_by_snssai_and_dnn(&self, pcf_ue_sm_id: u64, s_nssai: &SNssai, dnn: &str) -> usize {
+    pub fn sessions_number_by_snssai_and_dnn(
+        &self,
+        pcf_ue_sm_id: u64,
+        s_nssai: &SNssai,
+        dnn: &str,
+    ) -> usize {
         if let Ok(sess_list) = self.sess_list.read() {
-            return sess_list.values()
-                .filter(|s| s.pcf_ue_sm_id == pcf_ue_sm_id && &s.s_nssai == s_nssai && s.dnn.as_deref() == Some(dnn))
+            return sess_list
+                .values()
+                .filter(|s| {
+                    s.pcf_ue_sm_id == pcf_ue_sm_id
+                        && &s.s_nssai == s_nssai
+                        && s.dnn.as_deref() == Some(dnn)
+                })
                 .count();
         }
         0
     }
-
 
     // App session management
 
@@ -1383,7 +1428,8 @@ impl PcfContext {
 
     fn app_remove_all_for_sess(&self, sess_id: u64) {
         if let Ok(mut app_list) = self.app_list.write() {
-            let app_ids: Vec<u64> = app_list.values()
+            let app_ids: Vec<u64> = app_list
+                .values()
                 .filter(|a| a.sess_id == sess_id)
                 .map(|a| a.id)
                 .collect();
@@ -1401,7 +1447,9 @@ impl PcfContext {
     pub fn app_find_by_app_session_id(&self, app_session_id: &str) -> Option<PcfApp> {
         let app_session_id_hash = self.app_session_id_hash.read().ok()?;
         let app_list = self.app_list.read().ok()?;
-        app_session_id_hash.get(app_session_id).and_then(|&id| app_list.get(&id).cloned())
+        app_session_id_hash
+            .get(app_session_id)
+            .and_then(|&id| app_list.get(&id).cloned())
     }
 
     pub fn app_update(&self, app: &PcfApp) -> bool {
@@ -1450,7 +1498,8 @@ impl Default for PcfContext {
 }
 
 /// Global PCF context (thread-safe singleton)
-static GLOBAL_PCF_CONTEXT: std::sync::OnceLock<Arc<RwLock<PcfContext>>> = std::sync::OnceLock::new();
+static GLOBAL_PCF_CONTEXT: std::sync::OnceLock<Arc<RwLock<PcfContext>>> =
+    std::sync::OnceLock::new();
 
 /// Get the global PCF context
 pub fn pcf_self() -> Arc<RwLock<PcfContext>> {

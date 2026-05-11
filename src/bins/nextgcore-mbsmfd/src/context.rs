@@ -240,7 +240,10 @@ pub fn process_n4mb_establishment_response(
     n4mb.state = N4mbSessionState::Established;
     log::info!(
         "N4mb session established: local_seid={} remote_seid={} dl_teid={:#x} transport={}",
-        n4mb.local_seid, remote_seid, dl_teid, transport_addr
+        n4mb.local_seid,
+        remote_seid,
+        dl_teid,
+        transport_addr
     );
 }
 
@@ -314,7 +317,10 @@ impl MbSmfContext {
         let mut tmgi_hash = self.tmgi_hash.write().ok()?;
 
         if session_list.len() >= self.max_sessions {
-            log::error!("Maximum number of MBS sessions [{}] reached", self.max_sessions);
+            log::error!(
+                "Maximum number of MBS sessions [{}] reached",
+                self.max_sessions
+            );
             return None;
         }
 
@@ -326,7 +332,10 @@ impl MbSmfContext {
         tmgi_hash.insert(tmgi, id);
         session_list.insert(id, session.clone());
 
-        log::info!("MBS session added (id={id}, type={session_type:?}, teid={:#x})", session.gtp_teid);
+        log::info!(
+            "MBS session added (id={id}, type={session_type:?}, teid={:#x})",
+            session.gtp_teid
+        );
         Some(session)
     }
 
@@ -350,10 +359,9 @@ impl MbSmfContext {
     }
 
     pub fn session_remove_all(&self) {
-        if let (Ok(mut session_list), Ok(mut tmgi_hash)) = (
-            self.session_list.write(),
-            self.tmgi_hash.write(),
-        ) {
+        if let (Ok(mut session_list), Ok(mut tmgi_hash)) =
+            (self.session_list.write(), self.tmgi_hash.write())
+        {
             session_list.clear();
             tmgi_hash.clear();
         }
@@ -387,11 +395,7 @@ impl MbSmfContext {
     }
 
     /// Activate a session with N4mb PFCP establishment to UPF
-    pub fn session_activate_n4mb(
-        &self,
-        session_id: u64,
-        upf_addr: Ipv4Addr,
-    ) -> Option<MbsSession> {
+    pub fn session_activate_n4mb(&self, session_id: u64, upf_addr: Ipv4Addr) -> Option<MbsSession> {
         let mut session_list = self.session_list.write().ok()?;
         let session = session_list.get_mut(&session_id)?;
 
@@ -442,7 +446,10 @@ impl MbSmfContext {
             .read()
             .map(|l| {
                 l.values()
-                    .filter(|s| s.state == MbsSessionState::Active && s.session_type == MbsSessionType::Multicast)
+                    .filter(|s| {
+                        s.state == MbsSessionState::Active
+                            && s.session_type == MbsSessionType::Multicast
+                    })
                     .cloned()
                     .collect()
             })
@@ -457,7 +464,8 @@ impl Default for MbSmfContext {
 }
 
 /// Global MB-SMF context (thread-safe singleton)
-static GLOBAL_MBSMF_CONTEXT: std::sync::OnceLock<Arc<RwLock<MbSmfContext>>> = std::sync::OnceLock::new();
+static GLOBAL_MBSMF_CONTEXT: std::sync::OnceLock<Arc<RwLock<MbSmfContext>>> =
+    std::sync::OnceLock::new();
 
 /// Get the global MB-SMF context
 pub fn mbsmf_self() -> Arc<RwLock<MbSmfContext>> {
@@ -489,7 +497,10 @@ mod tests {
     fn make_tmgi(id: u8) -> Tmgi {
         Tmgi {
             mbs_service_id: [id, 0x00, 0x00],
-            plmn_id: PlmnId { mcc: "001".to_string(), mnc: "01".to_string() },
+            plmn_id: PlmnId {
+                mcc: "001".to_string(),
+                mnc: "01".to_string(),
+            },
         }
     }
 
@@ -517,10 +528,15 @@ mod tests {
 
         let tmgi = Tmgi {
             mbs_service_id: [0x01, 0x02, 0x03],
-            plmn_id: PlmnId { mcc: "001".to_string(), mnc: "01".to_string() },
+            plmn_id: PlmnId {
+                mcc: "001".to_string(),
+                mnc: "01".to_string(),
+            },
         };
 
-        let session = ctx.session_add(tmgi.clone(), MbsSessionType::Multicast).unwrap();
+        let session = ctx
+            .session_add(tmgi.clone(), MbsSessionType::Multicast)
+            .unwrap();
         assert_eq!(session.session_type, MbsSessionType::Multicast);
         assert_eq!(session.state, MbsSessionState::Created);
         assert_ne!(session.gtp_teid, 0); // TEID should be allocated
@@ -540,7 +556,10 @@ mod tests {
 
         let tmgi = Tmgi {
             mbs_service_id: [0x0A, 0x0B, 0x0C],
-            plmn_id: PlmnId { mcc: "001".to_string(), mnc: "01".to_string() },
+            plmn_id: PlmnId {
+                mcc: "001".to_string(),
+                mnc: "01".to_string(),
+            },
         };
 
         let mut session = ctx.session_add(tmgi, MbsSessionType::Broadcast).unwrap();
@@ -558,11 +577,15 @@ mod tests {
         let mut ctx = MbSmfContext::new();
         ctx.init(256);
 
-        let mut s1 = ctx.session_add(make_tmgi(0x01), MbsSessionType::Multicast).unwrap();
+        let mut s1 = ctx
+            .session_add(make_tmgi(0x01), MbsSessionType::Multicast)
+            .unwrap();
         s1.state = MbsSessionState::Active;
         ctx.session_update(&s1);
 
-        let s2 = ctx.session_add(make_tmgi(0x02), MbsSessionType::Broadcast).unwrap();
+        let s2 = ctx
+            .session_add(make_tmgi(0x02), MbsSessionType::Broadcast)
+            .unwrap();
 
         let active = ctx.active_multicast_sessions();
         assert_eq!(active.len(), 1);
@@ -575,10 +598,14 @@ mod tests {
         let mut ctx = MbSmfContext::new();
         ctx.init(256);
 
-        let session = ctx.session_add(make_tmgi(0x10), MbsSessionType::Multicast).unwrap();
+        let session = ctx
+            .session_add(make_tmgi(0x10), MbsSessionType::Multicast)
+            .unwrap();
         assert!(session.n4mb_session.is_none());
 
-        let activated = ctx.session_activate_n4mb(session.id, Ipv4Addr::new(10, 0, 0, 7)).unwrap();
+        let activated = ctx
+            .session_activate_n4mb(session.id, Ipv4Addr::new(10, 0, 0, 7))
+            .unwrap();
         assert_eq!(activated.state, MbsSessionState::Active);
         let n4mb = activated.n4mb_session.unwrap();
         assert_eq!(n4mb.upf_addr, Ipv4Addr::new(10, 0, 0, 7));
@@ -612,7 +639,9 @@ mod tests {
         let mut ctx = MbSmfContext::new();
         ctx.init(256);
 
-        let session = ctx.session_add(make_tmgi(0x30), MbsSessionType::Multicast).unwrap();
+        let session = ctx
+            .session_add(make_tmgi(0x30), MbsSessionType::Multicast)
+            .unwrap();
 
         // Join
         assert!(ctx.session_member_join(session.id, "imsi-001010000000001"));

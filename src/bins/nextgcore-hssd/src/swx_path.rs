@@ -233,8 +233,8 @@ pub fn handle_mar(
     }
 
     // 1. Query database for auth info (K, OPc, SQN, AMF)
-    use ogs_dbi::{ogs_dbi_auth_info, ogs_dbi_increment_sqn};
     use ogs_crypt::milenage::{milenage_f1, milenage_f2345, milenage_opc};
+    use ogs_dbi::{ogs_dbi_auth_info, ogs_dbi_increment_sqn};
 
     let supi = format!("imsi-{imsi_bcd}");
     let auth_info = ogs_dbi_auth_info(&supi)?;
@@ -317,9 +317,7 @@ pub fn handle_sar(
     user_name: &str,
     server_assignment_type: ServerAssignmentType,
 ) -> Result<SarResponse> {
-    debug!(
-        "Rx Server-Assignment-Request for user: {user_name}, type: {server_assignment_type:?}"
-    );
+    debug!("Rx Server-Assignment-Request for user: {user_name}, type: {server_assignment_type:?}");
     swx_stats().inc_rx_sar();
 
     // Extract IMSI from user name
@@ -348,7 +346,10 @@ pub fn handle_sar(
                     apn_configurations.push(ApnConfiguration {
                         context_identifier: 1,
                         pdn_type: 3, // IPv4v6
-                        service_selection: session.name.clone().unwrap_or_else(|| "internet".to_string()),
+                        service_selection: session
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| "internet".to_string()),
                         qos_class_identifier: 9, // QCI 9 (default bearer)
                         priority_level: 8,
                         pre_emption_capability: false,
@@ -524,7 +525,8 @@ mod tests {
         // IMSI with realm - extracts all digits but fails length validation
         // because the realm contains additional digits (mnc001, mcc001)
         // This is expected behavior - the function extracts all digits
-        let result = extract_imsi_from_username("001010123456789@ims.mnc001.mcc001.3gppnetwork.org");
+        let result =
+            extract_imsi_from_username("001010123456789@ims.mnc001.mcc001.3gppnetwork.org");
         // This should fail because extracted digits exceed 15 chars
         assert!(result.is_err());
 

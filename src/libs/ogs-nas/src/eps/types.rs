@@ -2,9 +2,9 @@
 //!
 //! Based on 3GPP TS 24.301
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use crate::error::{NasError, NasResult};
 use crate::common::types::PlmnId;
+use crate::error::{NasError, NasResult};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// EMM cause values (TS 24.301 Section 9.9.3.9)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,7 +89,9 @@ impl TryFrom<u8> for EmmCause {
             100 => Ok(Self::ConditionalIeError),
             101 => Ok(Self::MessageNotCompatible),
             111 => Ok(Self::ProtocolErrorUnspecified),
-            _ => Err(NasError::DecodingError(format!("Unknown EMM cause: {value}"))),
+            _ => Err(NasError::DecodingError(format!(
+                "Unknown EMM cause: {value}"
+            ))),
         }
     }
 }
@@ -228,7 +230,11 @@ impl EpsImsi {
         // Remaining digits
         for i in (1..self.digits.len()).step_by(2) {
             let d1 = self.digits[i];
-            let d2 = if i + 1 < self.digits.len() { self.digits[i + 1] } else { 0x0F };
+            let d2 = if i + 1 < self.digits.len() {
+                self.digits[i + 1]
+            } else {
+                0x0F
+            };
             buf.put_u8((d2 << 4) | d1);
         }
     }
@@ -236,7 +242,10 @@ impl EpsImsi {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes, length: usize) -> NasResult<Self> {
         if length < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: length });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: length,
+            });
         }
 
         let first_byte = buf.get_u8();
@@ -295,7 +304,10 @@ impl EpsGuti {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes, length: usize) -> NasResult<Self> {
         if length < 11 {
-            return Err(NasError::BufferTooShort { expected: 11, actual: length });
+            return Err(NasError::BufferTooShort {
+                expected: 11,
+                actual: length,
+            });
         }
 
         let _type_byte = buf.get_u8();
@@ -304,7 +316,12 @@ impl EpsGuti {
         let mme_code = buf.get_u8();
         let m_tmsi = buf.get_u32();
 
-        Ok(Self { plmn_id, mme_gid, mme_code, m_tmsi })
+        Ok(Self {
+            plmn_id,
+            mme_gid,
+            mme_code,
+            m_tmsi,
+        })
     }
 }
 
@@ -321,12 +338,18 @@ impl EpsMobileIdentity {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
 
         let length = buf.get_u8() as usize;
         if buf.remaining() < length {
-            return Err(NasError::BufferTooShort { expected: length, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: length,
+                actual: buf.remaining(),
+            });
         }
 
         let type_byte = buf.chunk()[0];
@@ -375,7 +398,10 @@ impl UeNetworkCapability {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 3 {
-            return Err(NasError::BufferTooShort { expected: 3, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 3,
+                actual: buf.remaining(),
+            });
         }
 
         let length = buf.get_u8();
@@ -433,11 +459,17 @@ impl EsmMessageContainer {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 2 {
-            return Err(NasError::BufferTooShort { expected: 2, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 2,
+                actual: buf.remaining(),
+            });
         }
         let length = buf.get_u16();
         if buf.remaining() < length as usize {
-            return Err(NasError::BufferTooShort { expected: length as usize, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: length as usize,
+                actual: buf.remaining(),
+            });
         }
         let data = buf.copy_to_bytes(length as usize).to_vec();
         Ok(Self { length, data })
@@ -464,7 +496,10 @@ impl EpsTai {
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         let plmn_id = PlmnId::decode(buf)?;
         if buf.remaining() < 2 {
-            return Err(NasError::BufferTooShort { expected: 2, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 2,
+                actual: buf.remaining(),
+            });
         }
         let tac = buf.get_u16();
         Ok(Self { plmn_id, tac })
@@ -490,11 +525,17 @@ impl EpsTaiList {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let length = buf.get_u8();
         if buf.remaining() < length as usize {
-            return Err(NasError::BufferTooShort { expected: length as usize, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: length as usize,
+                actual: buf.remaining(),
+            });
         }
         let data = buf.copy_to_bytes(length as usize).to_vec();
         Ok(Self { length, data })

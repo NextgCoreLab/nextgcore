@@ -11,7 +11,10 @@ pub enum S1apError {
     /// ASN.1 encoding/decoding error
     AsnError(String),
     /// Invalid IE value
-    InvalidIeValue { ie_name: &'static str, reason: String },
+    InvalidIeValue {
+        ie_name: &'static str,
+        reason: String,
+    },
     /// Missing mandatory IE
     MissingMandatoryIe(&'static str),
     /// Protocol error

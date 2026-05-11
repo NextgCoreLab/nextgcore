@@ -178,11 +178,11 @@ impl OgsApp {
 
         // Reset context
         *self.context.write().unwrap() = OgsAppContext::new();
-        
+
         // Prepare global configuration
         let mut global = self.global_conf.write().unwrap();
         global.prepare();
-        
+
         // Prepare local configuration
         let mut local = self.local_conf.write().unwrap();
         local.prepare();
@@ -212,32 +212,32 @@ impl OgsApp {
     }
 
     /// Get application context (read-only)
-    pub fn context(&self) -> std::sync::RwLockReadGuard<OgsAppContext> {
+    pub fn context(&self) -> std::sync::RwLockReadGuard<'_, OgsAppContext> {
         self.context.read().unwrap()
     }
 
     /// Get application context (mutable)
-    pub fn context_mut(&self) -> std::sync::RwLockWriteGuard<OgsAppContext> {
+    pub fn context_mut(&self) -> std::sync::RwLockWriteGuard<'_, OgsAppContext> {
         self.context.write().unwrap()
     }
 
     /// Get global configuration (read-only)
-    pub fn global_conf(&self) -> std::sync::RwLockReadGuard<OgsGlobalConf> {
+    pub fn global_conf(&self) -> std::sync::RwLockReadGuard<'_, OgsGlobalConf> {
         self.global_conf.read().unwrap()
     }
 
     /// Get global configuration (mutable)
-    pub fn global_conf_mut(&self) -> std::sync::RwLockWriteGuard<OgsGlobalConf> {
+    pub fn global_conf_mut(&self) -> std::sync::RwLockWriteGuard<'_, OgsGlobalConf> {
         self.global_conf.write().unwrap()
     }
 
     /// Get local configuration (read-only)
-    pub fn local_conf(&self) -> std::sync::RwLockReadGuard<OgsLocalConf> {
+    pub fn local_conf(&self) -> std::sync::RwLockReadGuard<'_, OgsLocalConf> {
         self.local_conf.read().unwrap()
     }
 
     /// Get local configuration (mutable)
-    pub fn local_conf_mut(&self) -> std::sync::RwLockWriteGuard<OgsLocalConf> {
+    pub fn local_conf_mut(&self) -> std::sync::RwLockWriteGuard<'_, OgsLocalConf> {
         self.local_conf.write().unwrap()
     }
 
@@ -326,9 +326,9 @@ mod tests {
     fn test_pool_calculation() {
         let mut ctx = OgsAppContext::new();
         let global = OgsGlobalConf::new();
-        
+
         ctx.recalculate_pool_size(&global);
-        
+
         // With default 1024 UEs
         assert_eq!(ctx.pool.gtpu, 1024 * OGS_MAX_NUM_OF_GTPU_BUFFER);
         assert_eq!(ctx.pool.sess, 1024 * 4);
@@ -340,7 +340,7 @@ mod tests {
     fn test_ogs_app_singleton() {
         let app1 = ogs_app();
         let app2 = ogs_app();
-        
+
         // Should be the same instance
         assert!(std::ptr::eq(app1, app2));
     }

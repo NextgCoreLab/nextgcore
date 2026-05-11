@@ -8,11 +8,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use nextgcore_pcrfd::{
-    pcrf_context_final, pcrf_context_init, pcrf_context_parse_config,
-    pcrf_fd_final, pcrf_fd_init,
-    pcrf_gx_final, pcrf_gx_init,
-    pcrf_rx_final, pcrf_rx_init,
-    PcrfEvent, PcrfSmContext,
+    pcrf_context_final, pcrf_context_init, pcrf_context_parse_config, pcrf_fd_final, pcrf_fd_init,
+    pcrf_gx_final, pcrf_gx_init, pcrf_rx_final, pcrf_rx_init, PcrfEvent, PcrfSmContext,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -71,11 +68,10 @@ fn main() -> Result<()> {
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
-            .with_endpoint(
-                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
-            ),
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+        ),
     )
     .ok();
 
@@ -250,7 +246,10 @@ mod tests {
         let args = Args::parse_from(["nextgcore-pcrfd"]);
         assert_eq!(args.config, "/etc/nextgcore/pcrf.yaml");
         assert_eq!(args.log_level, "info");
-        assert_eq!(args.diameter_config, "/etc/nextgcore/freeDiameter/pcrf.conf");
+        assert_eq!(
+            args.diameter_config,
+            "/etc/nextgcore/freeDiameter/pcrf.conf"
+        );
         assert_eq!(args.max_sess, 1024);
         assert_eq!(args.db_name, "nextgcore");
         assert!(!args.kill);
@@ -260,12 +259,18 @@ mod tests {
     fn test_args_custom() {
         let args = Args::parse_from([
             "nextgcore-pcrfd",
-            "-c", "/custom/pcrf.yaml",
-            "-e", "debug",
-            "--diameter-config", "/custom/pcrf.conf",
-            "--max-sess", "2048",
-            "--db-uri", "mongodb://localhost:27017",
-            "--db-name", "custom_db",
+            "-c",
+            "/custom/pcrf.yaml",
+            "-e",
+            "debug",
+            "--diameter-config",
+            "/custom/pcrf.conf",
+            "--max-sess",
+            "2048",
+            "--db-uri",
+            "mongodb://localhost:27017",
+            "--db-name",
+            "custom_db",
         ]);
         assert_eq!(args.config, "/custom/pcrf.yaml");
         assert_eq!(args.log_level, "debug");
@@ -283,11 +288,7 @@ mod tests {
 
     #[test]
     fn test_args_log_options() {
-        let args = Args::parse_from([
-            "nextgcore-pcrfd",
-            "-l", "/var/log/pcrf.log",
-            "-m",
-        ]);
+        let args = Args::parse_from(["nextgcore-pcrfd", "-l", "/var/log/pcrf.log", "-m"]);
         assert_eq!(args.log_file, Some("/var/log/pcrf.log".to_string()));
         assert!(args.no_color);
     }

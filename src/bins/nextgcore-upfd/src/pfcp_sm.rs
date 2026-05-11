@@ -3,6 +3,7 @@
 //! Port of src/upf/pfcp-sm.c - PFCP state machine for UPF
 
 use crate::event::{UpfEvent, UpfEventId, UpfTimerId};
+use ogs_core::fsm::StateMachine;
 
 // ============================================================================
 // PFCP Message Types (from ogs-pfcp)
@@ -182,7 +183,10 @@ impl PfcpSmContext {
                     // Start association timer
                     self.association_timer_active = true;
                     // Send association setup request
-                    log::info!("PFCP: Sending association setup request to node {}", self.node_id);
+                    log::info!(
+                        "PFCP: Sending association setup request to node {}",
+                        self.node_id
+                    );
                     PfcpSmResult::SendAssociationSetupRequest
                 } else {
                     PfcpSmResult::Ok
@@ -252,7 +256,9 @@ impl PfcpSmContext {
                             PfcpSmResult::HandleAssociationSetupResponse
                         }
                         _ => {
-                            log::warn!("Cannot handle PFCP message type {msg_type} in will_associate");
+                            log::warn!(
+                                "Cannot handle PFCP message type {msg_type} in will_associate"
+                            );
                             PfcpSmResult::Ok
                         }
                     }
@@ -293,9 +299,7 @@ impl PfcpSmContext {
                 self.no_heartbeat_timer_active = false;
                 PfcpSmResult::Ok
             }
-            UpfEventId::N4Message => {
-                self.handle_associated_message(event)
-            }
+            UpfEventId::N4Message => self.handle_associated_message(event),
             UpfEventId::N4Timer => {
                 if let Some(timer_id) = event.timer_id {
                     match timer_id {
@@ -359,11 +363,15 @@ impl PfcpSmContext {
                             result
                         }
                         pfcp_msg_type::ASSOCIATION_SETUP_REQUEST => {
-                            log::warn!("PFCP: Already associated, handling association setup request");
+                            log::warn!(
+                                "PFCP: Already associated, handling association setup request"
+                            );
                             PfcpSmResult::HandleAssociationSetupRequest
                         }
                         pfcp_msg_type::ASSOCIATION_SETUP_RESPONSE => {
-                            log::warn!("PFCP: Already associated, handling association setup response");
+                            log::warn!(
+                                "PFCP: Already associated, handling association setup response"
+                            );
                             PfcpSmResult::HandleAssociationSetupResponse
                         }
                         pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST => {
@@ -435,6 +443,29 @@ impl PfcpSmContext {
 }
 
 // ============================================================================
+// StateMachine trait implementation
+// ============================================================================
+
+impl StateMachine for PfcpSmContext {
+    type State = PfcpState;
+    type Event = UpfEvent;
+    type Result = PfcpSmResult;
+
+    fn state(&self) -> &PfcpState {
+        &self.state
+    }
+
+    fn dispatch(&mut self, event: &UpfEvent) -> PfcpSmResult {
+        // Delegate to the existing method so all logic stays in one place.
+        PfcpSmContext::dispatch(self, event)
+    }
+
+    fn transition(&mut self, new_state: PfcpState) {
+        self.state = new_state;
+    }
+}
+
+// ============================================================================
 // State Machine Result
 // ============================================================================
 
@@ -484,7 +515,7 @@ mod tests {
     fn test_pfcp_sm_init() {
         let mut sm = PfcpSmContext::new(1);
         assert_eq!(sm.state, PfcpState::Initial);
-        
+
         sm.init();
         assert_eq!(sm.state, PfcpState::Initial);
     }
@@ -500,10 +531,10 @@ mod tests {
     #[test]
     fn test_pfcp_sm_initial_to_will_associate() {
         let mut sm = PfcpSmContext::new(1);
-        
+
         let event = UpfEvent::entry();
         let result = sm.dispatch(&event);
-        
+
         assert_eq!(result, PfcpSmResult::Transition(PfcpState::WillAssociate));
         assert_eq!(sm.state, PfcpState::WillAssociate);
     }
@@ -513,10 +544,10 @@ mod tests {
         let mut sm = PfcpSmContext::new(1);
         sm.state = PfcpState::WillAssociate;
         sm.has_association_timer = true;
-        
+
         let event = UpfEvent::entry();
         let result = sm.dispatch(&event);
-        
+
         assert_eq!(result, PfcpSmResult::SendAssociationSetupRequest);
         assert!(sm.association_timer_active);
     }
@@ -526,10 +557,10 @@ mod tests {
         let mut sm = PfcpSmContext::new(1);
         sm.state = PfcpState::WillAssociate;
         sm.has_association_timer = true;
-        
+
         let event = UpfEvent::n4_timer(UpfTimerId::Association, Some(1));
         let result = sm.dispatch(&event);
-        
+
         assert_eq!(result, PfcpSmResult::SendAssociationSetupRequest);
     }
 
@@ -537,7 +568,7 @@ mod tests {
     fn test_pfcp_sm_will_associate_to_associated() {
         let mut sm = PfcpSmContext::new(1);
         sm.state = PfcpState::WillAssociate;
-        
+
         // Simulate association setup response
         let mut event = UpfEvent::new(UpfEventId::N4Message);
         event.pfcp = Some(PfcpEventData {
@@ -545,9 +576,9 @@ mod tests {
             pfcp_xact_id: Some(1),
             pkbuf: Some(vec![pfcp_msg_type::ASSOCIATION_SETUP_RESPONSE]),
         });
-        
+
         let result = sm.dispatch(&event);
-        
+
         assert_eq!(result, PfcpSmResult::HandleAssociationSetupResponse);
         assert_eq!(sm.state, PfcpState::Associated);
     }
@@ -556,10 +587,10 @@ mod tests {
     fn test_pfcp_sm_associated_entry() {
         let mut sm = PfcpSmContext::new(1);
         sm.state = PfcpState::Associated;
-        
+
         let event = UpfEvent::entry();
         let result = sm.dispatch(&event);
-        
+
         assert_eq!(result, PfcpSmResult::SendHeartbeatRequest);
         assert!(sm.no_heartbeat_timer_active);
     }
@@ -568,10 +599,10 @@ mod tests {
     fn test_pfcp_sm_associated_no_heartbeat_timer() {
         let mut sm = PfcpSmContext::new(1);
         sm.state = PfcpState::Associated;
-        
+
         let event = UpfEvent::n4_timer(UpfTimerId::NoHeartbeat, Some(1));
         let result = sm.dispatch(&event);
-        
+
         assert_eq!(result, PfcpSmResult::SendHeartbeatRequest);
     }
 
@@ -579,10 +610,10 @@ mod tests {
     fn test_pfcp_sm_associated_no_heartbeat_event() {
         let mut sm = PfcpSmContext::new(1);
         sm.state = PfcpState::Associated;
-        
+
         let event = UpfEvent::n4_no_heartbeat(1);
         let result = sm.dispatch(&event);
-        
+
         assert_eq!(result, PfcpSmResult::Transition(PfcpState::WillAssociate));
         assert_eq!(sm.state, PfcpState::WillAssociate);
     }
@@ -591,16 +622,16 @@ mod tests {
     fn test_pfcp_sm_associated_session_establishment() {
         let mut sm = PfcpSmContext::new(1);
         sm.state = PfcpState::Associated;
-        
+
         let mut event = UpfEvent::new(UpfEventId::N4Message);
         event.pfcp = Some(PfcpEventData {
             pfcp_node_id: Some(1),
             pfcp_xact_id: Some(1),
             pkbuf: Some(vec![pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST]),
         });
-        
+
         let result = sm.dispatch(&event);
-        
+
         assert_eq!(result, PfcpSmResult::HandleSessionEstablishmentRequest);
     }
 
@@ -608,16 +639,16 @@ mod tests {
     fn test_pfcp_sm_associated_session_modification() {
         let mut sm = PfcpSmContext::new(1);
         sm.state = PfcpState::Associated;
-        
+
         let mut event = UpfEvent::new(UpfEventId::N4Message);
         event.pfcp = Some(PfcpEventData {
             pfcp_node_id: Some(1),
             pfcp_xact_id: Some(1),
             pkbuf: Some(vec![pfcp_msg_type::SESSION_MODIFICATION_REQUEST]),
         });
-        
+
         let result = sm.dispatch(&event);
-        
+
         assert_eq!(result, PfcpSmResult::HandleSessionModificationRequest);
     }
 
@@ -625,16 +656,16 @@ mod tests {
     fn test_pfcp_sm_associated_session_deletion() {
         let mut sm = PfcpSmContext::new(1);
         sm.state = PfcpState::Associated;
-        
+
         let mut event = UpfEvent::new(UpfEventId::N4Message);
         event.pfcp = Some(PfcpEventData {
             pfcp_node_id: Some(1),
             pfcp_xact_id: Some(1),
             pkbuf: Some(vec![pfcp_msg_type::SESSION_DELETION_REQUEST]),
         });
-        
+
         let result = sm.dispatch(&event);
-        
+
         assert_eq!(result, PfcpSmResult::HandleSessionDeletionRequest);
     }
 
@@ -643,10 +674,10 @@ mod tests {
         let mut sm = PfcpSmContext::new(1);
         sm.state = PfcpState::Associated;
         sm.restoration_required = true;
-        
+
         let event = UpfEvent::entry();
         let result = sm.dispatch(&event);
-        
+
         assert_eq!(result, PfcpSmResult::PerformRestoration);
         assert!(!sm.restoration_required);
     }
@@ -654,17 +685,17 @@ mod tests {
     #[test]
     fn test_pfcp_sm_state_checks() {
         let mut sm = PfcpSmContext::new(1);
-        
+
         sm.state = PfcpState::Associated;
         assert!(sm.is_associated());
         assert!(!sm.is_final());
         assert!(!sm.is_exception());
-        
+
         sm.state = PfcpState::Final;
         assert!(!sm.is_associated());
         assert!(sm.is_final());
         assert!(!sm.is_exception());
-        
+
         sm.state = PfcpState::Exception;
         assert!(!sm.is_associated());
         assert!(!sm.is_final());
@@ -675,10 +706,10 @@ mod tests {
     fn test_pfcp_sm_exception_state() {
         let mut sm = PfcpSmContext::new(1);
         sm.state = PfcpState::Exception;
-        
+
         let event = UpfEvent::entry();
         let result = sm.dispatch(&event);
-        
+
         assert_eq!(result, PfcpSmResult::Ok);
     }
 }

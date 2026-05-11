@@ -230,19 +230,23 @@ pub mod callback {
     pub const NSMF_PDUSESSION_STATUS_NOTIFY: &str = "Nsmf_PDUSession_StatusNotify";
     pub const NUDM_SDM_NOTIFICATION: &str = "Nudm_SDM_Notification";
     pub const NUDM_UECM_DEREGISTRATION_NOTIFICATION: &str = "Nudm_UECM_DeregistrationNotification";
-    pub const NUDM_UECM_PCSCF_RESTORATION_NOTIFICATION: &str = "Nudm_UECM_PCSCFRestorationNotification";
+    pub const NUDM_UECM_PCSCF_RESTORATION_NOTIFICATION: &str =
+        "Nudm_UECM_PCSCFRestorationNotification";
     pub const NNRF_NFMANAGEMENT_NF_STATUS_NOTIFY: &str = "Nnrf_NFManagement_NFStatusNotify";
     pub const NAMF_EVENTEXPOSURE_NOTIFY: &str = "Namf_EventExposure_Notify";
     pub const NPCF_UEPOLICYCONTROL_UPDATE_NOTIFY: &str = "Npcf_UEPolicyControl_UpdateNotify";
     pub const NNSSF_NSSAIAVAILABILITY_NOTIFICATION: &str = "Nnssf_NSSAIAvailability_Notification";
-    pub const NAMF_COMMUNICATION_AMF_STATUS_CHANGE_NOTIFY: &str = "Namf_Communication_AMFStatusChangeNotify";
+    pub const NAMF_COMMUNICATION_AMF_STATUS_CHANGE_NOTIFY: &str =
+        "Namf_Communication_AMFStatusChangeNotify";
     pub const NGMLC_LOCATION_EVENT_NOTIFY: &str = "Ngmlc_Location_EventNotify";
     pub const NCHF_CONVERGEDCHARGING_NOTIFY: &str = "Nchf_ConvergedCharging_Notify";
     pub const NNSSAAF_NSSAA_RE_AUTHENTICATION: &str = "Nnssaaf_NSSAA_ReAuthentication";
     pub const NNSSAAF_NSSAA_REVOCATION: &str = "Nnssaaf_NSSAA_Revocation";
-    pub const N5G_DDNMF_DISCOVERY_MONITOR_UPDATE_RESULT: &str = "N5g-ddnmf_Discovery_MonitorUpdateResult";
+    pub const N5G_DDNMF_DISCOVERY_MONITOR_UPDATE_RESULT: &str =
+        "N5g-ddnmf_Discovery_MonitorUpdateResult";
     pub const N5G_DDNMF_DISCOVERY_MATCH_INFORMATION: &str = "N5g-ddnmf_Discovery_MatchInformation";
-    pub const NAMF_COMMUNICATION_ON_N1N2_TRANSFER_FAILURE: &str = "Namf_Communication_onN1N2TransferFailure";
+    pub const NAMF_COMMUNICATION_ON_N1N2_TRANSFER_FAILURE: &str =
+        "Namf_Communication_onN1N2TransferFailure";
 }
 
 /// Content IDs for multipart messages

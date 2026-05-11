@@ -9,7 +9,6 @@
 //!
 //! Reference: 3GPP TS 23.401 (EPC), 3GPP TS 23.502 (5GS), 3GPP TS 36.413, 3GPP TS 38.413
 
-
 /// Handover types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandoverType {
@@ -430,8 +429,8 @@ struct HandoverEntry {
 }
 
 fn execute_x2_handover(config: &HandoverTestConfig) -> Result<HandoverResult, &'static str> {
-    use std::sync::Mutex;
     use std::collections::HashMap;
+    use std::sync::Mutex;
 
     // Track recent handovers per-UE for ping-pong detection
     static HANDOVER_HISTORY: Mutex<Option<HashMap<String, HandoverEntry>>> = Mutex::new(None);
@@ -448,20 +447,24 @@ fn execute_x2_handover(config: &HandoverTestConfig) -> Result<HandoverResult, &'
     // Check for ping-pong for THIS UE only
     if let Some(prev_entry) = history.get(&config.imsi) {
         // Ping-pong: target becomes source and source becomes target for SAME UE
-        if prev_entry.target_cell == config.source_cell_id &&
-           prev_entry.source_cell == config.target_cell_id {
+        if prev_entry.target_cell == config.source_cell_id
+            && prev_entry.source_cell == config.target_cell_id
+        {
             let elapsed = now.duration_since(prev_entry.timestamp);
             if elapsed.as_millis() < 5000 {
                 // Ping-pong detected for this UE, delay or block
-                history.insert(config.imsi.clone(), HandoverEntry {
-                    source_cell: config.source_cell_id,
-                    target_cell: config.target_cell_id,
-                    timestamp: now,
-                });
+                history.insert(
+                    config.imsi.clone(),
+                    HandoverEntry {
+                        source_cell: config.source_cell_id,
+                        target_cell: config.target_cell_id,
+                        timestamp: now,
+                    },
+                );
                 return Ok(HandoverResult {
                     success: false,
                     cell_id: config.source_cell_id, // Stay on source
-                    latency_ms: 2000, // Long delay due to ping-pong prevention
+                    latency_ms: 2000,               // Long delay due to ping-pong prevention
                     data_loss: false,
                     bearers_preserved: true,
                     failure_cause: Some("Ping-pong prevention".to_string()),
@@ -471,11 +474,14 @@ fn execute_x2_handover(config: &HandoverTestConfig) -> Result<HandoverResult, &'
     }
 
     // Record this handover for this UE
-    history.insert(config.imsi.clone(), HandoverEntry {
-        source_cell: config.source_cell_id,
-        target_cell: config.target_cell_id,
-        timestamp: now,
-    });
+    history.insert(
+        config.imsi.clone(),
+        HandoverEntry {
+            source_cell: config.source_cell_id,
+            target_cell: config.target_cell_id,
+            timestamp: now,
+        },
+    );
 
     Ok(HandoverResult {
         success: true,
@@ -549,7 +555,9 @@ fn verify_tau_after_handover(config: &HandoverTestConfig) -> Result<TauResult, &
     })
 }
 
-fn simulate_handover_failure_rlf(config: &HandoverTestConfig) -> Result<HandoverResult, &'static str> {
+fn simulate_handover_failure_rlf(
+    config: &HandoverTestConfig,
+) -> Result<HandoverResult, &'static str> {
     Ok(HandoverResult {
         success: false,
         cell_id: config.source_cell_id,

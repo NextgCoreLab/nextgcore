@@ -34,10 +34,10 @@ mod tests {
     fn test_ogs_random() {
         let mut buf1 = [0u8; 16];
         let mut buf2 = [0u8; 16];
-        
+
         ogs_random(&mut buf1);
         ogs_random(&mut buf2);
-        
+
         // Very unlikely to be equal
         assert_ne!(buf1, buf2);
         // Very unlikely to be all zeros
@@ -48,7 +48,7 @@ mod tests {
     fn test_ogs_random32() {
         let r1 = ogs_random32();
         let r2 = ogs_random32();
-        
+
         // Very unlikely to be equal
         assert_ne!(r1, r2);
     }

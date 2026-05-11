@@ -163,11 +163,7 @@ impl AusfUeSmContext {
     }
 
     /// Handle SBI server events in operational state
-    fn handle_sbi_server_event(
-        &mut self,
-        event: &mut AusfEvent,
-        ausf_ue: &crate::context::AusfUe,
-    ) {
+    fn handle_sbi_server_event(&mut self, event: &mut AusfEvent, ausf_ue: &crate::context::AusfUe) {
         let sbi = match &event.sbi {
             Some(sbi) => sbi,
             None => {
@@ -241,17 +237,16 @@ impl AusfUeSmContext {
                     ausf_ue.suci,
                     message.method
                 );
-                send_forbidden_response(stream_id, &format!("Method not allowed: {}", message.method));
+                send_forbidden_response(
+                    stream_id,
+                    &format!("Method not allowed: {}", message.method),
+                );
             }
         }
     }
 
     /// Handle SBI client events in operational state
-    fn handle_sbi_client_event(
-        &mut self,
-        event: &mut AusfEvent,
-        ausf_ue: &crate::context::AusfUe,
-    ) {
+    fn handle_sbi_client_event(&mut self, event: &mut AusfEvent, ausf_ue: &crate::context::AusfUe) {
         // Extract all needed data from event first to avoid borrow conflicts
         let (stream_id, service_name, method, resource_components, res_status) = {
             let sbi = match &event.sbi {
@@ -289,7 +284,13 @@ impl AusfUeSmContext {
 
         match service_name.as_str() {
             "nudm-ueau" => {
-                self.handle_nudm_ueau_response(ausf_ue, &method, &resource_components, res_status, stream_id);
+                self.handle_nudm_ueau_response(
+                    ausf_ue,
+                    &method,
+                    &resource_components,
+                    res_status,
+                    stream_id,
+                );
             }
             _ => {
                 log::error!("Invalid API name [{service_name}]");

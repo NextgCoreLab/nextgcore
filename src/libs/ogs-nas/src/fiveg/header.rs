@@ -2,9 +2,9 @@
 //!
 //! Based on 3GPP TS 24.501
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use crate::error::{NasError, NasResult};
 use crate::common::types::{ProtocolDiscriminator, SecurityHeaderType};
+use crate::error::{NasError, NasResult};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// 5GS NAS header length (plain message)
 pub const FIVEG_NAS_HEADER_LEN: usize = 2;
@@ -166,7 +166,11 @@ impl FiveGsNasHeader {
     }
 
     /// Create a new 5GSM header
-    pub fn new_gsm(pdu_session_id: u8, pti: u8, message_type: FiveGsmMessageType) -> FiveGsNasSmHeader {
+    pub fn new_gsm(
+        pdu_session_id: u8,
+        pti: u8,
+        message_type: FiveGsmMessageType,
+    ) -> FiveGsNasSmHeader {
         FiveGsNasSmHeader {
             extended_protocol_discriminator: ProtocolDiscriminator::FiveGsSessionManagement as u8,
             pdu_session_id,
@@ -185,7 +189,10 @@ impl FiveGsNasHeader {
     /// Decode header from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 3 {
-            return Err(NasError::BufferTooShort { expected: 3, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 3,
+                actual: buf.remaining(),
+            });
         }
 
         let extended_protocol_discriminator = buf.get_u8();
@@ -225,7 +232,10 @@ impl FiveGsNasSmHeader {
     /// Decode header from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 4 {
-            return Err(NasError::BufferTooShort { expected: 4, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 4,
+                actual: buf.remaining(),
+            });
         }
 
         Ok(Self {

@@ -94,7 +94,9 @@ pub struct OgsUint24 {
 
 impl OgsUint24 {
     pub fn new(value: u32) -> Self {
-        OgsUint24 { v: value & 0xFFFFFF }
+        OgsUint24 {
+            v: value & 0xFFFFFF,
+        }
     }
 
     pub fn to_be_bytes(&self) -> [u8; 3] {
@@ -402,13 +404,13 @@ pub fn ogs_bcd_to_buffer(bcd: &str, buf: &mut Vec<u8>) -> usize {
     buf.clear();
     let chars: Vec<char> = bcd.chars().collect();
     let len = chars.len();
-    
+
     for i in (0..len).step_by(2) {
         let high = chars.get(i).and_then(|c| c.to_digit(16)).unwrap_or(0) as u8;
         let low = chars.get(i + 1).and_then(|c| c.to_digit(16)).unwrap_or(0xF) as u8;
         buf.push((high << 4) | low);
     }
-    
+
     buf.len()
 }
 
@@ -432,11 +434,12 @@ pub fn ogs_ascii_to_hex(ascii: &str, buf: &mut [u8]) -> usize {
     let bytes: Vec<u8> = (0..ascii.len())
         .step_by(2)
         .filter_map(|i| {
-            ascii.get(i..i + 2)
+            ascii
+                .get(i..i + 2)
                 .and_then(|s| u8::from_str_radix(s, 16).ok())
         })
         .collect();
-    
+
     let len = bytes.len().min(buf.len());
     buf[..len].copy_from_slice(&bytes[..len]);
     len
@@ -450,13 +453,13 @@ mod tests {
     fn test_ogs_uint24() {
         let u = OgsUint24::new(0x123456);
         assert_eq!(u.v, 0x123456);
-        
+
         let bytes = u.to_be_bytes();
         assert_eq!(bytes, [0x12, 0x34, 0x56]);
-        
+
         let u2 = OgsUint24::from_be_bytes(bytes);
         assert_eq!(u2.v, 0x123456);
-        
+
         // Test overflow handling
         let u3 = OgsUint24::new(0xFFFFFFFF);
         assert_eq!(u3.v, 0xFFFFFF);
@@ -467,10 +470,13 @@ mod tests {
         let supi = "imsi-123456789012345";
         assert_eq!(ogs_id_get_type(supi), Some("imsi".to_string()));
         assert_eq!(ogs_id_get_value(supi), Some("123456789012345".to_string()));
-        
+
         let supi2 = "nai-user@example.com";
         assert_eq!(ogs_id_get_type(supi2), Some("nai".to_string()));
-        assert_eq!(ogs_id_get_value(supi2), Some("user@example.com".to_string()));
+        assert_eq!(
+            ogs_id_get_value(supi2),
+            Some("user@example.com".to_string())
+        );
     }
 
     #[test]
@@ -489,7 +495,7 @@ mod tests {
         assert_eq!(snssai.sst, 1);
         assert_eq!(snssai.sd.v, 0x000001);
         assert!(snssai.has_sd());
-        
+
         let snssai2 = OgsSNssai::new(1, None);
         assert!(!snssai2.has_sd());
     }

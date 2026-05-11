@@ -2,8 +2,8 @@
 //!
 //! Information Element types and encoding/decoding for GTPv1 protocol.
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::error::{GtpError, GtpResult};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// GTPv1 IE Types (TV format - Type-Value, fixed length)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -214,7 +214,7 @@ impl Gtp1Ie {
     /// Encode IE to bytes
     pub fn encode(&self, buf: &mut BytesMut) {
         buf.put_u8(self.ie_type);
-        
+
         if is_tv_ie(self.ie_type) {
             // TV format: Type + Value (fixed length)
             buf.put_slice(&self.value);
@@ -238,9 +238,7 @@ impl Gtp1Ie {
 
         if is_tv_ie(ie_type) {
             // TV format
-            let length = get_tv_ie_length(ie_type).ok_or({
-                GtpError::InvalidIeType(ie_type)
-            })?;
+            let length = get_tv_ie_length(ie_type).ok_or(GtpError::InvalidIeType(ie_type))?;
 
             if buf.remaining() < length {
                 return Err(GtpError::BufferTooShort {
@@ -379,7 +377,9 @@ pub struct NsapiIe {
 
 impl NsapiIe {
     pub fn new(nsapi: u8) -> Self {
-        Self { nsapi: nsapi & 0x0F }
+        Self {
+            nsapi: nsapi & 0x0F,
+        }
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {

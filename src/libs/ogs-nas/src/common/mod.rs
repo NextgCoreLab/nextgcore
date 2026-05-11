@@ -1,7 +1,7 @@
 //! Common NAS types shared between 5GS and EPS
 
-pub mod types;
 pub mod security;
+pub mod types;
 
-pub use types::*;
 pub use security::*;
+pub use types::*;

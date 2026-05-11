@@ -2,7 +2,7 @@
 //!
 //! Port of src/mme/esm-build.c - ESM message building functions
 
-use crate::context::{MmeSess, MmeBearer, Paa};
+use crate::context::{MmeBearer, MmeSess, Paa};
 use crate::emm_build::{NasBuffer, SecurityHeaderType, NAS_PROTOCOL_DISCRIMINATOR_EMM};
 
 // ============================================================================
@@ -119,8 +119,6 @@ pub enum EsmCause {
     MultipleAccessesToPdnConnectionNotAllowed = 113,
 }
 
-
-
 // ============================================================================
 // ESM Message Types (3GPP TS 24.301)
 // ============================================================================
@@ -200,7 +198,6 @@ pub enum PdnType {
     Ethernet = 6,
 }
 
-
 // ============================================================================
 // QCI Values (3GPP TS 23.203)
 // ============================================================================
@@ -259,21 +256,15 @@ pub enum CreateAction {
 // ============================================================================
 
 /// Build EPS QoS IE
-pub fn eps_qos_build(
-    qci: u8,
-    mbr_dl: u64,
-    mbr_ul: u64,
-    gbr_dl: u64,
-    gbr_ul: u64,
-) -> Vec<u8> {
+pub fn eps_qos_build(qci: u8, mbr_dl: u64, mbr_ul: u64, gbr_dl: u64, gbr_ul: u64) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // QCI
     buf.write_u8(qci);
-    
+
     // Check if GBR bearer (QCI 1-4)
     let is_gbr = (1..=4).contains(&qci);
-    
+
     if is_gbr {
         // MBR for uplink
         buf.write_u8(encode_bitrate(mbr_ul));
@@ -284,41 +275,39 @@ pub fn eps_qos_build(
         // GBR for downlink
         buf.write_u8(encode_bitrate(gbr_dl));
     }
-    
+
     // Extended values if needed
-    if (mbr_ul > 8640000 || mbr_dl > 8640000 || gbr_ul > 8640000 || gbr_dl > 8640000)
-        && is_gbr {
-            buf.write_u8(encode_bitrate_ext(mbr_ul));
-            buf.write_u8(encode_bitrate_ext(mbr_dl));
-            buf.write_u8(encode_bitrate_ext(gbr_ul));
-            buf.write_u8(encode_bitrate_ext(gbr_dl));
-        }
-    
+    if (mbr_ul > 8640000 || mbr_dl > 8640000 || gbr_ul > 8640000 || gbr_dl > 8640000) && is_gbr {
+        buf.write_u8(encode_bitrate_ext(mbr_ul));
+        buf.write_u8(encode_bitrate_ext(mbr_dl));
+        buf.write_u8(encode_bitrate_ext(gbr_ul));
+        buf.write_u8(encode_bitrate_ext(gbr_dl));
+    }
+
     buf.into_vec()
 }
-
 
 /// Encode bitrate value (3GPP TS 24.301 9.9.4.3)
 fn encode_bitrate(kbps: u64) -> u8 {
     if kbps == 0 {
         return 0xff; // 0 kbps
     }
-    
+
     // 1-63: value * 1 kbps
     if kbps <= 63 {
         return kbps as u8;
     }
-    
+
     // 64-127: 64 + (value - 64) * 8 kbps
     if kbps <= 568 {
         return (64 + (kbps - 64) / 8) as u8;
     }
-    
+
     // 128-254: 576 + (value - 128) * 64 kbps
     if kbps <= 8640 {
         return (128 + (kbps - 576) / 64) as u8;
     }
-    
+
     // Maximum value
     0xfe
 }
@@ -328,22 +317,22 @@ fn encode_bitrate_ext(kbps: u64) -> u8 {
     if kbps <= 8640 {
         return 0;
     }
-    
+
     // 1-74: 8600 + value * 100 kbps
     if kbps <= 16000 {
         return ((kbps - 8600) / 100) as u8;
     }
-    
+
     // 75-186: 16000 + (value - 74) * 1000 kbps
     if kbps <= 128000 {
         return (74 + (kbps - 16000) / 1000) as u8;
     }
-    
+
     // 187-250: 128000 + (value - 186) * 2000 kbps
     if kbps <= 256000 {
         return (186 + (kbps - 128000) / 2000) as u8;
     }
-    
+
     // Maximum
     0xfa
 }
@@ -355,30 +344,30 @@ fn encode_bitrate_ext(kbps: u64) -> u8 {
 /// Build APN-AMBR IE
 pub fn apn_ambr_build(dl: u64, ul: u64) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // APN-AMBR for downlink
     buf.write_u8(encode_apn_ambr(dl));
     // APN-AMBR for uplink
     buf.write_u8(encode_apn_ambr(ul));
-    
+
     // Extended values
     let dl_ext = encode_apn_ambr_ext(dl);
     let ul_ext = encode_apn_ambr_ext(ul);
-    
+
     if dl_ext > 0 || ul_ext > 0 {
         buf.write_u8(dl_ext);
         buf.write_u8(ul_ext);
-        
+
         // Extended-2 values
         let dl_ext2 = encode_apn_ambr_ext2(dl);
         let ul_ext2 = encode_apn_ambr_ext2(ul);
-        
+
         if dl_ext2 > 0 || ul_ext2 > 0 {
             buf.write_u8(dl_ext2);
             buf.write_u8(ul_ext2);
         }
     }
-    
+
     buf.into_vec()
 }
 
@@ -387,47 +376,46 @@ fn encode_apn_ambr(kbps: u64) -> u8 {
     if kbps == 0 {
         return 0xff;
     }
-    
+
     // 1-63: value * 1 kbps
     if kbps <= 63 {
         return kbps as u8;
     }
-    
+
     // 64-127: 64 + (value - 64) * 8 kbps
     if kbps <= 568 {
         return (64 + (kbps - 64) / 8) as u8;
     }
-    
+
     // 128-254: 576 + (value - 128) * 64 kbps
     if kbps <= 8640 {
         return (128 + (kbps - 576) / 64) as u8;
     }
-    
+
     0xfe
 }
-
 
 /// Encode APN-AMBR extended value
 fn encode_apn_ambr_ext(kbps: u64) -> u8 {
     if kbps <= 8640 {
         return 0;
     }
-    
+
     // 1-74: 8600 + value * 100 kbps
     if kbps <= 16000 {
         return ((kbps - 8600) / 100) as u8;
     }
-    
+
     // 75-186: 16000 + (value - 74) * 1000 kbps
     if kbps <= 128000 {
         return (74 + (kbps - 16000) / 1000) as u8;
     }
-    
+
     // 187-250: 128000 + (value - 186) * 2000 kbps
     if kbps <= 256000 {
         return (186 + (kbps - 128000) / 2000) as u8;
     }
-    
+
     0xfa
 }
 
@@ -436,12 +424,12 @@ fn encode_apn_ambr_ext2(kbps: u64) -> u8 {
     if kbps <= 256000 {
         return 0;
     }
-    
+
     // 1-254: 256 Mbps + value * 4 Mbps
     if kbps <= 1272000 {
         return ((kbps - 256000) / 4000) as u8;
     }
-    
+
     // 255: 1280 Mbps
     0xff
 }
@@ -458,7 +446,7 @@ pub const NAS_PDU_ADDRESS_IPV4V6_LEN: u8 = 13;
 /// Encode PDN address
 pub fn encode_pdn_address(paa: &Paa) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     match paa.pdn_type {
         PdnType::Ipv4 => {
             buf.write_u8(PdnType::Ipv4 as u8);
@@ -481,7 +469,7 @@ pub fn encode_pdn_address(paa: &Paa) -> Vec<u8> {
             buf.write_bytes(&[0, 0, 0, 0]);
         }
     }
-    
+
     buf.into_vec()
 }
 
@@ -496,49 +484,56 @@ pub fn build_pdn_connectivity_reject_with_params(
     create_action: CreateAction,
 ) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // Add security header if not in attach request
     if create_action != CreateAction::InAttachRequest {
-        buf.write_u8((SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4 
-                     | NAS_PROTOCOL_DISCRIMINATOR_EMM);
+        buf.write_u8(
+            (SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4
+                | NAS_PROTOCOL_DISCRIMINATOR_EMM,
+        );
         buf.write_u32(0); // MAC placeholder
-        buf.write_u8(0);  // Sequence number placeholder
+        buf.write_u8(0); // Sequence number placeholder
     }
-    
+
     // ESM header
     buf.write_u8(0); // EPS bearer identity (0 for this message)
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_ESM);
     buf.write_u8(pti);
     buf.write_u8(EsmMessageType::PdnConnectivityReject as u8);
-    
+
     // ESM cause
     buf.write_u8(esm_cause as u8);
-    
+
     buf.into_vec()
 }
 
 /// Build PDN connectivity reject (simplified - for nas_path.rs)
 pub fn build_pdn_connectivity_reject(esm_cause: EsmCause) -> Vec<u8> {
-    build_pdn_connectivity_reject_with_params(PTI_UNASSIGNED, esm_cause, CreateAction::InPdnConnectivityRequest)
+    build_pdn_connectivity_reject_with_params(
+        PTI_UNASSIGNED,
+        esm_cause,
+        CreateAction::InPdnConnectivityRequest,
+    )
 }
-
 
 /// Build ESM information request message
 pub fn build_esm_information_request(pti: u8) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // Security header
-    buf.write_u8((SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4 
-                 | NAS_PROTOCOL_DISCRIMINATOR_EMM);
+    buf.write_u8(
+        (SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4
+            | NAS_PROTOCOL_DISCRIMINATOR_EMM,
+    );
     buf.write_u32(0); // MAC placeholder
-    buf.write_u8(0);  // Sequence number placeholder
-    
+    buf.write_u8(0); // Sequence number placeholder
+
     // ESM header
     buf.write_u8(0); // EPS bearer identity
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_ESM);
     buf.write_u8(pti);
     buf.write_u8(EsmMessageType::EsmInformationRequest as u8);
-    
+
     buf.into_vec()
 }
 
@@ -549,21 +544,23 @@ pub fn build_activate_default_bearer_context_request_with_params(
     create_action: CreateAction,
 ) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // Add security header if not in attach request
     if create_action != CreateAction::InAttachRequest {
-        buf.write_u8((SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4 
-                     | NAS_PROTOCOL_DISCRIMINATOR_EMM);
+        buf.write_u8(
+            (SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4
+                | NAS_PROTOCOL_DISCRIMINATOR_EMM,
+        );
         buf.write_u32(0); // MAC placeholder
-        buf.write_u8(0);  // Sequence number placeholder
+        buf.write_u8(0); // Sequence number placeholder
     }
-    
+
     // ESM header
     buf.write_u8(bearer.ebi); // EPS bearer identity
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_ESM);
     buf.write_u8(sess.pti);
     buf.write_u8(EsmMessageType::ActivateDefaultEpsBearerContextRequest as u8);
-    
+
     // EPS QoS
     let eps_qos = eps_qos_build(
         bearer.qos.qci,
@@ -573,33 +570,33 @@ pub fn build_activate_default_bearer_context_request_with_params(
         bearer.qos.gbr.uplink,
     );
     buf.write_lv(&eps_qos);
-    
+
     // Access Point Name
     buf.write_lv(sess.apn.as_bytes());
-    
+
     // PDN address
     let pdn_addr = encode_pdn_address(&sess.paa);
     buf.write_lv(&pdn_addr);
-    
+
     // Optional: ESM cause (for PDN type restriction)
     if let Some(esm_cause) = get_pdn_type_restriction_cause(sess) {
         buf.write_u8(0x58); // ESM cause IEI
         buf.write_u8(esm_cause as u8);
     }
-    
+
     // Optional: APN-AMBR
     if sess.ambr.downlink > 0 || sess.ambr.uplink > 0 {
         buf.write_u8(0x5e); // APN-AMBR IEI
         let apn_ambr = apn_ambr_build(sess.ambr.downlink, sess.ambr.uplink);
         buf.write_lv(&apn_ambr);
     }
-    
+
     // Optional: Protocol configuration options
     if !sess.pgw_pco.is_empty() {
         buf.write_u8(0x27); // PCO IEI
         buf.write_lv(&sess.pgw_pco);
     }
-    
+
     buf.into_vec()
 }
 
@@ -612,18 +609,24 @@ pub fn build_activate_default_bearer_context_request(
     // Get default bearer from session (first bearer)
     let default_bearer = MmeBearer {
         ebi: 5, // Default EBI
-        qos: sess.session.as_ref().map(|s| s.qos.clone()).expect("value expected"),
+        qos: sess
+            .session
+            .as_ref()
+            .map(|s| s.qos.clone())
+            .expect("value expected"),
         ..Default::default()
     };
-    
+
     // Convert GtpCreateAction to CreateAction
     let action = match create_action {
         crate::nas_path::GtpCreateAction::InAttachRequest => CreateAction::InAttachRequest,
         crate::nas_path::GtpCreateAction::InTau => CreateAction::InTauRequest,
-        crate::nas_path::GtpCreateAction::InPdnConnectivity => CreateAction::InPdnConnectivityRequest,
+        crate::nas_path::GtpCreateAction::InPdnConnectivity => {
+            CreateAction::InPdnConnectivityRequest
+        }
         crate::nas_path::GtpCreateAction::InHandover => CreateAction::InHandover,
     };
-    
+
     build_activate_default_bearer_context_request_with_params(sess, &default_bearer, action)
 }
 
@@ -641,29 +644,30 @@ fn get_pdn_type_restriction_cause(sess: &MmeSess) -> Option<EsmCause> {
     }
 }
 
-
 /// Build activate dedicated EPS bearer context request message (with full parameters)
 pub fn build_activate_dedicated_bearer_context_request_with_params(
     bearer: &MmeBearer,
     linked_ebi: u8,
 ) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // Security header
-    buf.write_u8((SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4 
-                 | NAS_PROTOCOL_DISCRIMINATOR_EMM);
+    buf.write_u8(
+        (SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4
+            | NAS_PROTOCOL_DISCRIMINATOR_EMM,
+    );
     buf.write_u32(0); // MAC placeholder
-    buf.write_u8(0);  // Sequence number placeholder
-    
+    buf.write_u8(0); // Sequence number placeholder
+
     // ESM header
     buf.write_u8(bearer.ebi); // EPS bearer identity
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_ESM);
     buf.write_u8(PTI_UNASSIGNED); // PTI is unassigned for dedicated bearer
     buf.write_u8(EsmMessageType::ActivateDedicatedEpsBearerContextRequest as u8);
-    
+
     // Linked EPS bearer identity (4 bits) + spare (4 bits)
     buf.write_u8(linked_ebi & 0x0f);
-    
+
     // EPS QoS
     let eps_qos = eps_qos_build(
         bearer.qos.qci,
@@ -673,14 +677,14 @@ pub fn build_activate_dedicated_bearer_context_request_with_params(
         bearer.qos.gbr.uplink,
     );
     buf.write_lv(&eps_qos);
-    
+
     // TFT (Traffic Flow Template)
     if !bearer.tft.is_empty() {
         buf.write_lv(&bearer.tft);
     } else {
         buf.write_u8(0); // Empty TFT
     }
-    
+
     buf.into_vec()
 }
 
@@ -698,19 +702,21 @@ pub fn build_modify_bearer_context_request_with_params(
     tft_presence: bool,
 ) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // Security header
-    buf.write_u8((SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4 
-                 | NAS_PROTOCOL_DISCRIMINATOR_EMM);
+    buf.write_u8(
+        (SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4
+            | NAS_PROTOCOL_DISCRIMINATOR_EMM,
+    );
     buf.write_u32(0); // MAC placeholder
-    buf.write_u8(0);  // Sequence number placeholder
-    
+    buf.write_u8(0); // Sequence number placeholder
+
     // ESM header
     buf.write_u8(bearer.ebi); // EPS bearer identity
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_ESM);
     buf.write_u8(pti);
     buf.write_u8(EsmMessageType::ModifyEpsBearerContextRequest as u8);
-    
+
     // Optional: New EPS QoS
     if qos_presence {
         buf.write_u8(0x5b); // New EPS QoS IEI
@@ -723,13 +729,13 @@ pub fn build_modify_bearer_context_request_with_params(
         );
         buf.write_lv(&eps_qos);
     }
-    
+
     // Optional: TFT
     if tft_presence && !bearer.tft.is_empty() {
         buf.write_u8(0x36); // TFT IEI
         buf.write_lv(&bearer.tft);
     }
-    
+
     buf.into_vec()
 }
 
@@ -739,9 +745,13 @@ pub fn build_modify_bearer_context_request(
     qos_presence: bool,
     tft_presence: bool,
 ) -> Vec<u8> {
-    build_modify_bearer_context_request_with_params(bearer, PTI_UNASSIGNED, qos_presence, tft_presence)
+    build_modify_bearer_context_request_with_params(
+        bearer,
+        PTI_UNASSIGNED,
+        qos_presence,
+        tft_presence,
+    )
 }
-
 
 /// Build deactivate bearer context request (with explicit parameters)
 pub fn build_deactivate_bearer_context_request_with_params(
@@ -750,132 +760,125 @@ pub fn build_deactivate_bearer_context_request_with_params(
     esm_cause: EsmCause,
 ) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // Security header
-    buf.write_u8((SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4 
-                 | NAS_PROTOCOL_DISCRIMINATOR_EMM);
+    buf.write_u8(
+        (SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4
+            | NAS_PROTOCOL_DISCRIMINATOR_EMM,
+    );
     buf.write_u32(0); // MAC placeholder
-    buf.write_u8(0);  // Sequence number placeholder
-    
+    buf.write_u8(0); // Sequence number placeholder
+
     // ESM header
     buf.write_u8(ebi); // EPS bearer identity
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_ESM);
     buf.write_u8(pti);
     buf.write_u8(EsmMessageType::DeactivateEpsBearerContextRequest as u8);
-    
+
     // ESM cause
     buf.write_u8(esm_cause as u8);
-    
+
     buf.into_vec()
 }
 
 /// Build deactivate bearer context request (simplified - for nas_path.rs)
-pub fn build_deactivate_bearer_context_request(
-    bearer: &MmeBearer,
-    esm_cause: EsmCause,
-) -> Vec<u8> {
+pub fn build_deactivate_bearer_context_request(bearer: &MmeBearer, esm_cause: EsmCause) -> Vec<u8> {
     build_deactivate_bearer_context_request_with_params(bearer.ebi, PTI_UNASSIGNED, esm_cause)
 }
 
 /// Build bearer resource allocation reject message
-pub fn build_bearer_resource_allocation_reject(
-    pti: u8,
-    esm_cause: EsmCause,
-) -> Vec<u8> {
+pub fn build_bearer_resource_allocation_reject(pti: u8, esm_cause: EsmCause) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // Security header
-    buf.write_u8((SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4 
-                 | NAS_PROTOCOL_DISCRIMINATOR_EMM);
+    buf.write_u8(
+        (SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4
+            | NAS_PROTOCOL_DISCRIMINATOR_EMM,
+    );
     buf.write_u32(0); // MAC placeholder
-    buf.write_u8(0);  // Sequence number placeholder
-    
+    buf.write_u8(0); // Sequence number placeholder
+
     // ESM header
     buf.write_u8(0); // EPS bearer identity (0 for this message)
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_ESM);
     buf.write_u8(pti);
     buf.write_u8(EsmMessageType::BearerResourceAllocationReject as u8);
-    
+
     // ESM cause
     buf.write_u8(esm_cause as u8);
-    
+
     buf.into_vec()
 }
 
 /// Build bearer resource modification reject message
-pub fn build_bearer_resource_modification_reject(
-    pti: u8,
-    esm_cause: EsmCause,
-) -> Vec<u8> {
+pub fn build_bearer_resource_modification_reject(pti: u8, esm_cause: EsmCause) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // Security header
-    buf.write_u8((SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4 
-                 | NAS_PROTOCOL_DISCRIMINATOR_EMM);
+    buf.write_u8(
+        (SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4
+            | NAS_PROTOCOL_DISCRIMINATOR_EMM,
+    );
     buf.write_u32(0); // MAC placeholder
-    buf.write_u8(0);  // Sequence number placeholder
-    
+    buf.write_u8(0); // Sequence number placeholder
+
     // ESM header
     buf.write_u8(0); // EPS bearer identity (0 for this message)
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_ESM);
     buf.write_u8(pti);
     buf.write_u8(EsmMessageType::BearerResourceModificationReject as u8);
-    
+
     // ESM cause
     buf.write_u8(esm_cause as u8);
-    
+
     buf.into_vec()
 }
 
 /// Build PDN disconnect reject message
-pub fn build_pdn_disconnect_reject(
-    pti: u8,
-    esm_cause: EsmCause,
-) -> Vec<u8> {
+pub fn build_pdn_disconnect_reject(pti: u8, esm_cause: EsmCause) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // Security header
-    buf.write_u8((SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4 
-                 | NAS_PROTOCOL_DISCRIMINATOR_EMM);
+    buf.write_u8(
+        (SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4
+            | NAS_PROTOCOL_DISCRIMINATOR_EMM,
+    );
     buf.write_u32(0); // MAC placeholder
-    buf.write_u8(0);  // Sequence number placeholder
-    
+    buf.write_u8(0); // Sequence number placeholder
+
     // ESM header
     buf.write_u8(0); // EPS bearer identity
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_ESM);
     buf.write_u8(pti);
     buf.write_u8(EsmMessageType::PdnDisconnectReject as u8);
-    
+
     // ESM cause
     buf.write_u8(esm_cause as u8);
-    
+
     buf.into_vec()
 }
 
-
 /// Build ESM status message
-pub fn build_esm_status(
-    ebi: u8,
-    pti: u8,
-    esm_cause: EsmCause,
-) -> Vec<u8> {
+pub fn build_esm_status(ebi: u8, pti: u8, esm_cause: EsmCause) -> Vec<u8> {
     let mut buf = NasBuffer::new();
-    
+
     // Security header
-    buf.write_u8((SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4 
-                 | NAS_PROTOCOL_DISCRIMINATOR_EMM);
+    buf.write_u8(
+        (SecurityHeaderType::IntegrityProtectedAndCiphered as u8) << 4
+            | NAS_PROTOCOL_DISCRIMINATOR_EMM,
+    );
     buf.write_u32(0); // MAC placeholder
-    buf.write_u8(0);  // Sequence number placeholder
-    
+    buf.write_u8(0); // Sequence number placeholder
+
     // ESM header
     buf.write_u8(ebi); // EPS bearer identity
     buf.write_u8(NAS_PROTOCOL_DISCRIMINATOR_ESM);
     buf.write_u8(pti);
     buf.write_u8(EsmMessageType::EsmStatus as u8);
-    
+
     // ESM cause
     buf.write_u8(esm_cause as u8);
-    
+
     buf.into_vec()
 }
 
@@ -901,10 +904,19 @@ mod tests {
 
     #[test]
     fn test_esm_message_type_values() {
-        assert_eq!(EsmMessageType::ActivateDefaultEpsBearerContextRequest as u8, 0xc1);
-        assert_eq!(EsmMessageType::ActivateDedicatedEpsBearerContextRequest as u8, 0xc5);
+        assert_eq!(
+            EsmMessageType::ActivateDefaultEpsBearerContextRequest as u8,
+            0xc1
+        );
+        assert_eq!(
+            EsmMessageType::ActivateDedicatedEpsBearerContextRequest as u8,
+            0xc5
+        );
         assert_eq!(EsmMessageType::ModifyEpsBearerContextRequest as u8, 0xc9);
-        assert_eq!(EsmMessageType::DeactivateEpsBearerContextRequest as u8, 0xcd);
+        assert_eq!(
+            EsmMessageType::DeactivateEpsBearerContextRequest as u8,
+            0xcd
+        );
         assert_eq!(EsmMessageType::PdnConnectivityRequest as u8, 0xd0);
         assert_eq!(EsmMessageType::PdnConnectivityReject as u8, 0xd1);
         assert_eq!(EsmMessageType::EsmInformationRequest as u8, 0xd9);
@@ -915,33 +927,32 @@ mod tests {
     fn test_encode_bitrate() {
         // 0 kbps
         assert_eq!(encode_bitrate(0), 0xff);
-        
+
         // 1-63 kbps: direct value
         assert_eq!(encode_bitrate(1), 1);
         assert_eq!(encode_bitrate(63), 63);
-        
+
         // 64-568 kbps: 64 + (value - 64) / 8
         assert_eq!(encode_bitrate(64), 64);
         assert_eq!(encode_bitrate(128), 72);
-        
+
         // 576-8640 kbps: 128 + (value - 576) / 64
         assert_eq!(encode_bitrate(576), 128);
         assert_eq!(encode_bitrate(8640), 254);
     }
 
-
     #[test]
     fn test_encode_apn_ambr() {
         // 0 kbps
         assert_eq!(encode_apn_ambr(0), 0xff);
-        
+
         // 1-63 kbps
         assert_eq!(encode_apn_ambr(1), 1);
         assert_eq!(encode_apn_ambr(63), 63);
-        
+
         // 64-568 kbps
         assert_eq!(encode_apn_ambr(64), 64);
-        
+
         // 576-8640 kbps
         assert_eq!(encode_apn_ambr(576), 128);
     }
@@ -952,7 +963,7 @@ mod tests {
         let qos = eps_qos_build(9, 0, 0, 0, 0);
         assert_eq!(qos.len(), 1);
         assert_eq!(qos[0], 9);
-        
+
         // GBR bearer (QCI 1)
         let qos = eps_qos_build(1, 64, 64, 32, 32);
         assert_eq!(qos.len(), 5);
@@ -972,7 +983,7 @@ mod tests {
             EsmCause::MissingOrUnknownApn,
             CreateAction::InAttachRequest,
         );
-        
+
         // Without security header (in attach request)
         assert_eq!(msg[0], 0); // EBI
         assert_eq!(msg[1], NAS_PROTOCOL_DISCRIMINATOR_ESM);
@@ -984,7 +995,7 @@ mod tests {
     #[test]
     fn test_build_esm_information_request() {
         let msg = build_esm_information_request(5);
-        
+
         // With security header
         assert!(msg.len() > 6);
         // Check ESM header after security header
@@ -992,7 +1003,10 @@ mod tests {
         assert_eq!(msg[esm_start], 0); // EBI
         assert_eq!(msg[esm_start + 1], NAS_PROTOCOL_DISCRIMINATOR_ESM);
         assert_eq!(msg[esm_start + 2], 5); // PTI
-        assert_eq!(msg[esm_start + 3], EsmMessageType::EsmInformationRequest as u8);
+        assert_eq!(
+            msg[esm_start + 3],
+            EsmMessageType::EsmInformationRequest as u8
+        );
     }
 
     #[test]
@@ -1002,14 +1016,17 @@ mod tests {
             1, // PTI
             EsmCause::RegularDeactivation,
         );
-        
+
         // With security header
         assert!(msg.len() > 6);
         let esm_start = 6;
         assert_eq!(msg[esm_start], 5); // EBI
         assert_eq!(msg[esm_start + 1], NAS_PROTOCOL_DISCRIMINATOR_ESM);
         assert_eq!(msg[esm_start + 2], 1); // PTI
-        assert_eq!(msg[esm_start + 3], EsmMessageType::DeactivateEpsBearerContextRequest as u8);
+        assert_eq!(
+            msg[esm_start + 3],
+            EsmMessageType::DeactivateEpsBearerContextRequest as u8
+        );
         assert_eq!(msg[esm_start + 4], EsmCause::RegularDeactivation as u8);
     }
 
@@ -1019,12 +1036,15 @@ mod tests {
             3, // PTI
             EsmCause::NetworkFailure,
         );
-        
+
         let esm_start = 6;
         assert_eq!(msg[esm_start], 0); // EBI
         assert_eq!(msg[esm_start + 1], NAS_PROTOCOL_DISCRIMINATOR_ESM);
         assert_eq!(msg[esm_start + 2], 3); // PTI
-        assert_eq!(msg[esm_start + 3], EsmMessageType::BearerResourceAllocationReject as u8);
+        assert_eq!(
+            msg[esm_start + 3],
+            EsmMessageType::BearerResourceAllocationReject as u8
+        );
         assert_eq!(msg[esm_start + 4], EsmCause::NetworkFailure as u8);
     }
 
@@ -1034,12 +1054,18 @@ mod tests {
             4, // PTI
             EsmCause::ServiceOptionNotSupported,
         );
-        
+
         let esm_start = 6;
         assert_eq!(msg[esm_start], 0); // EBI
         assert_eq!(msg[esm_start + 1], NAS_PROTOCOL_DISCRIMINATOR_ESM);
         assert_eq!(msg[esm_start + 2], 4); // PTI
-        assert_eq!(msg[esm_start + 3], EsmMessageType::BearerResourceModificationReject as u8);
-        assert_eq!(msg[esm_start + 4], EsmCause::ServiceOptionNotSupported as u8);
+        assert_eq!(
+            msg[esm_start + 3],
+            EsmMessageType::BearerResourceModificationReject as u8
+        );
+        assert_eq!(
+            msg[esm_start + 4],
+            EsmCause::ServiceOptionNotSupported as u8
+        );
     }
 }

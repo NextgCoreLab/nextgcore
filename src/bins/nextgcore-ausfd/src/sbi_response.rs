@@ -4,14 +4,12 @@
 
 use ogs_sbi::message::SbiResponse;
 use ogs_sbi::server::{
-    send_bad_request, send_forbidden, send_gateway_timeout, send_not_found,
-    send_method_not_allowed,
+    send_bad_request, send_forbidden, send_gateway_timeout, send_method_not_allowed, send_not_found,
 };
 
 /// Response queue for pending SBI responses
-static RESPONSE_QUEUE: std::sync::LazyLock<
-    std::sync::Mutex<Vec<(u64, SbiResponse)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+static RESPONSE_QUEUE: std::sync::LazyLock<std::sync::Mutex<Vec<(u64, SbiResponse)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
 /// Send an error response for invalid API/service name
 pub fn send_error_response(stream_id: u64, status: u16, detail: &str) {
@@ -23,9 +21,7 @@ pub fn send_error_response(stream_id: u64, status: u16, detail: &str) {
         _ => send_bad_request(detail, None),
     };
 
-    log::debug!(
-        "Sending error response (stream_id={stream_id}, status={status}): {detail}"
-    );
+    log::debug!("Sending error response (stream_id={stream_id}, status={status}): {detail}");
 
     queue_sbi_response(stream_id, response);
 }

@@ -7,7 +7,7 @@
 //! - IPv6 Neighbor Solicitation detection and Neighbor Advertisement reply
 //! - Proxy ARP/ND for TAP devices
 
-use crate::gtp_path::{ETHER_ADDR_LEN, ETHER_HDR_LEN, ETHERTYPE_ARP, ETHERTYPE_IPV6};
+use crate::gtp_path::{ETHERTYPE_ARP, ETHERTYPE_IPV6, ETHER_ADDR_LEN, ETHER_HDR_LEN};
 
 // ============================================================================
 // Constants
@@ -45,7 +45,6 @@ pub const IPV6_HEADER_LEN: usize = 40;
 
 /// IPv6 next header: ICMPv6
 pub const IPV6_NEXT_HEADER_ICMPV6: u8 = 58;
-
 
 // ============================================================================
 // ARP Packet Structure
@@ -95,7 +94,6 @@ impl ArpPacket {
     }
 }
 
-
 // ============================================================================
 // Ethernet Header Structure
 // ============================================================================
@@ -141,7 +139,6 @@ pub struct Ipv6Header {
     /// Destination address
     pub dst_addr: [u8; 16],
 }
-
 
 // ============================================================================
 // ICMPv6 Neighbor Solicitation/Advertisement Structures
@@ -195,7 +192,6 @@ pub struct NdOptTargetLinkAddr {
     pub link_addr: [u8; ETHER_ADDR_LEN],
 }
 
-
 // ============================================================================
 // ARP Functions
 // ============================================================================
@@ -244,7 +240,6 @@ pub fn arp_parse_target_addr(data: &[u8]) -> u32 {
     arp.get_target_ip()
 }
 
-
 /// Generate ARP reply from ARP request
 ///
 /// Port of arp_reply() from arp-nd.cpp
@@ -272,7 +267,7 @@ pub fn arp_reply(reply_data: &mut [u8], request_data: &[u8], mac: &[u8; ETHER_AD
 
     // Build ARP reply
     let arp_offset = ETHER_HDR_LEN;
-    
+
     // Hardware type: Ethernet
     reply_data[arp_offset..arp_offset + 2].copy_from_slice(&ARP_HW_TYPE_ETHERNET.to_be_bytes());
     // Protocol type: IPv4
@@ -294,7 +289,6 @@ pub fn arp_reply(reply_data: &mut [u8], request_data: &[u8], mac: &[u8; ETHER_AD
 
     reply_len
 }
-
 
 // ============================================================================
 // Neighbor Discovery Functions
@@ -337,15 +331,10 @@ pub fn is_nd_req(data: &[u8]) -> bool {
     data[icmpv6_offset] == ICMPV6_NEIGHBOR_SOLICITATION
 }
 
-
 /// Calculate ICMPv6 checksum
 ///
 /// ICMPv6 checksum includes a pseudo-header with source/dest addresses
-fn calculate_icmpv6_checksum(
-    src_addr: &[u8; 16],
-    dst_addr: &[u8; 16],
-    icmpv6_data: &[u8],
-) -> u16 {
+fn calculate_icmpv6_checksum(src_addr: &[u8; 16], dst_addr: &[u8; 16], icmpv6_data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
 
     // Pseudo-header: source address
@@ -391,7 +380,6 @@ fn calculate_icmpv6_checksum(
     !sum as u16
 }
 
-
 /// Generate Neighbor Advertisement reply from Neighbor Solicitation
 ///
 /// Port of nd_reply() from arp-nd.cpp
@@ -405,7 +393,8 @@ pub fn nd_reply(reply_data: &mut [u8], request_data: &[u8], mac: &[u8; ETHER_ADD
     let req_eth = unsafe { &*(request_data.as_ptr() as *const EthernetHeader) };
     let req_ipv6 = unsafe { &*(request_data[ETHER_HDR_LEN..].as_ptr() as *const Ipv6Header) };
     let icmpv6_offset = ETHER_HDR_LEN + IPV6_HEADER_LEN;
-    let req_ns = unsafe { &*(request_data[icmpv6_offset..].as_ptr() as *const NeighborSolicitation) };
+    let req_ns =
+        unsafe { &*(request_data[icmpv6_offset..].as_ptr() as *const NeighborSolicitation) };
 
     // Calculate reply size
     // Ethernet header + IPv6 header + NA header (24 bytes) + Target Link-Layer Address option (8 bytes)
@@ -430,7 +419,8 @@ pub fn nd_reply(reply_data: &mut [u8], request_data: &[u8], mac: &[u8; ETHER_ADD
     // Version (6), Traffic Class (0), Flow Label (0)
     reply_data[ipv6_offset..ipv6_offset + 4].copy_from_slice(&0x60000000u32.to_be_bytes());
     // Payload length
-    reply_data[ipv6_offset + 4..ipv6_offset + 6].copy_from_slice(&(icmpv6_len as u16).to_be_bytes());
+    reply_data[ipv6_offset + 4..ipv6_offset + 6]
+        .copy_from_slice(&(icmpv6_len as u16).to_be_bytes());
     // Next header: ICMPv6
     reply_data[ipv6_offset + 6] = IPV6_NEXT_HEADER_ICMPV6;
     // Hop limit: 255 (required for ND)
@@ -460,8 +450,12 @@ pub fn nd_reply(reply_data: &mut [u8], request_data: &[u8], mac: &[u8; ETHER_ADD
     reply_data[opt_offset + 2..opt_offset + 8].copy_from_slice(mac);
 
     // Calculate and set checksum
-    let src_addr: [u8; 16] = reply_data[ipv6_offset + 8..ipv6_offset + 24].try_into().expect("value expected");
-    let dst_addr: [u8; 16] = reply_data[ipv6_offset + 24..ipv6_offset + 40].try_into().expect("value expected");
+    let src_addr: [u8; 16] = reply_data[ipv6_offset + 8..ipv6_offset + 24]
+        .try_into()
+        .expect("value expected");
+    let dst_addr: [u8; 16] = reply_data[ipv6_offset + 24..ipv6_offset + 40]
+        .try_into()
+        .expect("value expected");
     let checksum = calculate_icmpv6_checksum(
         &src_addr,
         &dst_addr,
@@ -471,7 +465,6 @@ pub fn nd_reply(reply_data: &mut [u8], request_data: &[u8], mac: &[u8; ETHER_ADD
 
     reply_len
 }
-
 
 // ============================================================================
 // Tests
@@ -484,7 +477,7 @@ mod tests {
     /// Create a valid ARP request packet
     fn create_arp_request(sender_ip: [u8; 4], target_ip: [u8; 4]) -> Vec<u8> {
         let mut pkt = vec![0u8; ETHER_HDR_LEN + ARP_PKT_LEN];
-        
+
         // Ethernet header
         // Destination: broadcast
         pkt[0..6].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
@@ -492,7 +485,7 @@ mod tests {
         pkt[6..12].copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
         // Ethertype: ARP
         pkt[12..14].copy_from_slice(&ETHERTYPE_ARP.to_be_bytes());
-        
+
         // ARP packet
         let arp_offset = ETHER_HDR_LEN;
         // Hardware type: Ethernet
@@ -510,10 +503,11 @@ mod tests {
         // Sender protocol address
         pkt[arp_offset + 14..arp_offset + 18].copy_from_slice(&sender_ip);
         // Target hardware address (zeros for request)
-        pkt[arp_offset + 18..arp_offset + 24].copy_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        pkt[arp_offset + 18..arp_offset + 24]
+            .copy_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
         // Target protocol address
         pkt[arp_offset + 24..arp_offset + 28].copy_from_slice(&target_ip);
-        
+
         pkt
     }
 
@@ -546,7 +540,6 @@ mod tests {
         assert!(!is_arp_req(&pkt));
     }
 
-
     #[test]
     fn test_arp_parse_target_addr() {
         let pkt = create_arp_request([192, 168, 1, 1], [192, 168, 1, 100]);
@@ -566,10 +559,10 @@ mod tests {
         let request = create_arp_request([192, 168, 1, 1], [192, 168, 1, 100]);
         let our_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
         let mut reply = vec![0u8; ETHER_HDR_LEN + ARP_PKT_LEN];
-        
+
         let len = arp_reply(&mut reply, &request, &our_mac);
         assert_eq!(len, ETHER_HDR_LEN + ARP_PKT_LEN);
-        
+
         // Check Ethernet header
         // Destination should be original sender
         assert_eq!(&reply[0..6], &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
@@ -577,17 +570,26 @@ mod tests {
         assert_eq!(&reply[6..12], &our_mac);
         // Ethertype should be ARP
         assert_eq!(&reply[12..14], &ETHERTYPE_ARP.to_be_bytes());
-        
+
         // Check ARP reply
         let arp_offset = ETHER_HDR_LEN;
         // Operation should be reply
-        assert_eq!(&reply[arp_offset + 6..arp_offset + 8], &ARP_OP_REPLY.to_be_bytes());
+        assert_eq!(
+            &reply[arp_offset + 6..arp_offset + 8],
+            &ARP_OP_REPLY.to_be_bytes()
+        );
         // Sender hardware address should be our MAC
         assert_eq!(&reply[arp_offset + 8..arp_offset + 14], &our_mac);
         // Sender protocol address should be target IP from request
-        assert_eq!(&reply[arp_offset + 14..arp_offset + 18], &[192, 168, 1, 100]);
+        assert_eq!(
+            &reply[arp_offset + 14..arp_offset + 18],
+            &[192, 168, 1, 100]
+        );
         // Target hardware address should be sender MAC from request
-        assert_eq!(&reply[arp_offset + 18..arp_offset + 24], &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        assert_eq!(
+            &reply[arp_offset + 18..arp_offset + 24],
+            &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]
+        );
         // Target protocol address should be sender IP from request
         assert_eq!(&reply[arp_offset + 24..arp_offset + 28], &[192, 168, 1, 1]);
     }
@@ -597,26 +599,32 @@ mod tests {
         let request = vec![0u8; 10]; // Too short
         let our_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
         let mut reply = vec![0u8; ETHER_HDR_LEN + ARP_PKT_LEN];
-        
+
         let len = arp_reply(&mut reply, &request, &our_mac);
         assert_eq!(len, 0);
     }
-
 
     /// Create a valid Neighbor Solicitation packet
     fn create_neighbor_solicitation(target_addr: [u8; 16]) -> Vec<u8> {
         let icmpv6_len = std::mem::size_of::<NeighborSolicitation>();
         let pkt_len = ETHER_HDR_LEN + IPV6_HEADER_LEN + icmpv6_len;
         let mut pkt = vec![0u8; pkt_len];
-        
+
         // Ethernet header
         // Destination: solicited-node multicast
-        pkt[0..6].copy_from_slice(&[0x33, 0x33, 0xFF, target_addr[13], target_addr[14], target_addr[15]]);
+        pkt[0..6].copy_from_slice(&[
+            0x33,
+            0x33,
+            0xFF,
+            target_addr[13],
+            target_addr[14],
+            target_addr[15],
+        ]);
         // Source: some MAC
         pkt[6..12].copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
         // Ethertype: IPv6
         pkt[12..14].copy_from_slice(&ETHERTYPE_IPV6.to_be_bytes());
-        
+
         // IPv6 header
         let ipv6_offset = ETHER_HDR_LEN;
         // Version (6), Traffic Class (0), Flow Label (0)
@@ -628,12 +636,31 @@ mod tests {
         // Hop limit
         pkt[ipv6_offset + 7] = 255;
         // Source address: link-local
-        let src_addr: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0x02, 0x11, 0x22, 0xFF, 0xFE, 0x33, 0x44, 0x55];
+        let src_addr: [u8; 16] = [
+            0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0x02, 0x11, 0x22, 0xFF, 0xFE, 0x33, 0x44, 0x55,
+        ];
         pkt[ipv6_offset + 8..ipv6_offset + 24].copy_from_slice(&src_addr);
         // Destination address: solicited-node multicast
-        let dst_addr: [u8; 16] = [0xFF, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xFF, target_addr[13], target_addr[14], target_addr[15]];
+        let dst_addr: [u8; 16] = [
+            0xFF,
+            0x02,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0x01,
+            0xFF,
+            target_addr[13],
+            target_addr[14],
+            target_addr[15],
+        ];
         pkt[ipv6_offset + 24..ipv6_offset + 40].copy_from_slice(&dst_addr);
-        
+
         // ICMPv6 Neighbor Solicitation
         let ns_offset = ETHER_HDR_LEN + IPV6_HEADER_LEN;
         // Type: Neighbor Solicitation
@@ -646,20 +673,24 @@ mod tests {
         pkt[ns_offset + 4..ns_offset + 8].copy_from_slice(&[0, 0, 0, 0]);
         // Target address
         pkt[ns_offset + 8..ns_offset + 24].copy_from_slice(&target_addr);
-        
+
         pkt
     }
 
     #[test]
     fn test_is_nd_req_valid() {
-        let target_addr: [u8; 16] = [0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        let target_addr: [u8; 16] = [
+            0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
         let pkt = create_neighbor_solicitation(target_addr);
         assert!(is_nd_req(&pkt));
     }
 
     #[test]
     fn test_is_nd_req_wrong_type() {
-        let target_addr: [u8; 16] = [0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        let target_addr: [u8; 16] = [
+            0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
         let mut pkt = create_neighbor_solicitation(target_addr);
         // Change ICMPv6 type to Neighbor Advertisement
         let ns_offset = ETHER_HDR_LEN + IPV6_HEADER_LEN;
@@ -680,21 +711,22 @@ mod tests {
         assert!(!is_nd_req(&pkt));
     }
 
-
     #[test]
     fn test_nd_reply() {
-        let target_addr: [u8; 16] = [0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        let target_addr: [u8; 16] = [
+            0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
         let request = create_neighbor_solicitation(target_addr);
         let our_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
-        
+
         let na_len = std::mem::size_of::<NeighborAdvertisement>();
         let opt_len = std::mem::size_of::<NdOptTargetLinkAddr>();
         let reply_len = ETHER_HDR_LEN + IPV6_HEADER_LEN + na_len + opt_len;
         let mut reply = vec![0u8; reply_len];
-        
+
         let len = nd_reply(&mut reply, &request, &our_mac);
         assert_eq!(len, reply_len);
-        
+
         // Check Ethernet header
         // Destination should be original sender MAC
         assert_eq!(&reply[0..6], &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
@@ -702,7 +734,7 @@ mod tests {
         assert_eq!(&reply[6..12], &our_mac);
         // Ethertype should be IPv6
         assert_eq!(&reply[12..14], &ETHERTYPE_IPV6.to_be_bytes());
-        
+
         // Check IPv6 header
         let ipv6_offset = ETHER_HDR_LEN;
         // Next header should be ICMPv6
@@ -711,7 +743,7 @@ mod tests {
         assert_eq!(reply[ipv6_offset + 7], 255);
         // Source address should be target address from solicitation
         assert_eq!(&reply[ipv6_offset + 8..ipv6_offset + 24], &target_addr);
-        
+
         // Check ICMPv6 Neighbor Advertisement
         let na_offset = ETHER_HDR_LEN + IPV6_HEADER_LEN;
         // Type should be Neighbor Advertisement
@@ -719,10 +751,13 @@ mod tests {
         // Code should be 0
         assert_eq!(reply[na_offset + 1], 0);
         // Flags should have S and O set (0x60000000)
-        assert_eq!(&reply[na_offset + 4..na_offset + 8], &0x60000000u32.to_be_bytes());
+        assert_eq!(
+            &reply[na_offset + 4..na_offset + 8],
+            &0x60000000u32.to_be_bytes()
+        );
         // Target address should match
         assert_eq!(&reply[na_offset + 8..na_offset + 24], &target_addr);
-        
+
         // Check Target Link-Layer Address option
         let opt_offset = na_offset + na_len;
         assert_eq!(reply[opt_offset], ICMPV6_OPT_TARGET_LINK_ADDR);
@@ -735,18 +770,20 @@ mod tests {
         let request = vec![0u8; 10]; // Too short
         let our_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
         let mut reply = vec![0u8; 200];
-        
+
         let len = nd_reply(&mut reply, &request, &our_mac);
         assert_eq!(len, 0);
     }
 
     #[test]
     fn test_nd_reply_buffer_too_small() {
-        let target_addr: [u8; 16] = [0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        let target_addr: [u8; 16] = [
+            0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
         let request = create_neighbor_solicitation(target_addr);
         let our_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
         let mut reply = vec![0u8; 10]; // Too small
-        
+
         let len = nd_reply(&mut reply, &request, &our_mac);
         assert_eq!(len, 0);
     }
@@ -758,12 +795,31 @@ mod tests {
         let dst_addr: [u8; 16] = [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02];
         let icmpv6_data = [
             ICMPV6_NEIGHBOR_ADVERTISEMENT, // Type
-            0, // Code
-            0, 0, // Checksum (zeroed for calculation)
-            0x60, 0, 0, 0, // Flags
-            0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, // Target
+            0,                             // Code
+            0,
+            0, // Checksum (zeroed for calculation)
+            0x60,
+            0,
+            0,
+            0, // Flags
+            0x20,
+            0x01,
+            0x0D,
+            0xB8,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0x01, // Target
         ];
-        
+
         let checksum = calculate_icmpv6_checksum(&src_addr, &dst_addr, &icmpv6_data);
         // Checksum should be non-zero
         assert_ne!(checksum, 0);

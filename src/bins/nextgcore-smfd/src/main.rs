@@ -22,25 +22,25 @@ use anyhow::{Context, Result};
 use ogs_sbi::context::{global_context, NfInstance, NfService};
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::server::{
-    send_bad_request, send_not_found,
-    SbiServer, SbiServerConfig as OgsSbiServerConfig,
+    send_bad_request, send_not_found, SbiServer, SbiServerConfig as OgsSbiServerConfig,
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 
 mod binding;
 mod context;
 mod event;
+mod gn_build;
+mod gn_handler;
 mod gsm_build;
 mod gsm_handler;
 mod gsm_sm;
 mod gtp_build;
 mod gtp_handler;
 mod gtp_path;
-mod gn_build;
-mod gn_handler;
+pub mod mbs_session; // Rel-17: MBS multicast/broadcast session
 mod n4_build;
 mod n4_handler;
 mod pfcp_path;
@@ -48,20 +48,15 @@ mod pfcp_sm;
 #[cfg(test)]
 mod property_tests;
 mod session_extensions; // #199-#201: IPv6 dual-stack, SSC modes, Ethernet PDU
-pub mod slicing;         // Rel-17: per-slice QoS profiles
-pub mod mbs_session;    // Rel-17: MBS multicast/broadcast session
+pub mod slicing; // Rel-17: per-slice QoS profiles
 mod smf_sm;
 mod timer;
 
-use context::{smf_context_init, smf_context_final, smf_self};
+use context::{smf_context_final, smf_context_init, smf_self};
 use smf_sm::SmfFsm;
 
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
-
-/// Session state: stores UPF SEID per sm_context_ref for PFCP modifications
-static PFCP_SESSIONS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Monotonically-increasing PFCP sequence number counter.
 /// Each transaction fetches-and-increments this so concurrent PDU sessions
@@ -166,16 +161,13 @@ fn load_config(path: &str) -> SmfConfig {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info")
-    ).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
-            .with_endpoint(
-                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
-            ),
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+        ),
     )
     .ok();
 
@@ -188,19 +180,57 @@ async fn main() -> Result<()> {
         log::info!("Received shutdown signal");
         shutdown_clone.store(true, Ordering::SeqCst);
         SHUTDOWN.store(true, Ordering::SeqCst);
-    }).expect("Failed to set Ctrl+C handler");
+    })
+    .expect("Failed to set Ctrl+C handler");
 
-    // Load configuration
-    let config_path = std::env::var("SMF_CONFIG")
-        .unwrap_or_else(|_| "/etc/nextgcore/nextgcore-smfd.yaml".to_string());
+    // Load configuration — respect -c/--config CLI arg first, then SMF_CONFIG env var
+    let config_path = std::env::args()
+        .zip(std::env::args().skip(1))
+        .find_map(|(a, b)| {
+            if a == "-c" || a == "--config" {
+                Some(b)
+            } else {
+                None
+            }
+        })
+        .or_else(|| std::env::var("SMF_CONFIG").ok())
+        .unwrap_or_else(|| "/etc/nextgcore/smf.yaml".to_string());
     let config = load_config(&config_path);
     log::info!("Loading configuration from {config_path}");
-    log::info!("SBI config: address={}, port={}", config.sbi_addr, config.sbi_port);
+    log::info!(
+        "SBI config: address={}, port={}",
+        config.sbi_addr,
+        config.sbi_port
+    );
+
+    // Seed NRF URI into SBI context for NF registration
+    if let Ok(content) = std::fs::read_to_string(&config_path) {
+        if let Ok(yaml) = serde_yaml::from_str::<SmfYaml>(&content) {
+            if let Some(smf) = yaml.smf {
+                if let Some(sbi) = smf.sbi {
+                    if let Some(client) = sbi.client {
+                        if let Some(nrf_list) = client.nrf {
+                            if let Some(nrf) = nrf_list.first() {
+                                if let Some(ref uri) = nrf.uri {
+                                    log::info!("NRF URI configured: {uri}");
+                                    global_context().set_nrf_uri(uri).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Initialize SMF context
     smf_context_init(config.max_ue, config.max_sess, config.max_bearer);
-    log::info!("SMF context initialized (max_ue={}, max_sess={}, max_bearer={})",
-        config.max_ue, config.max_sess, config.max_bearer);
+    log::info!(
+        "SMF context initialized (max_ue={}, max_sess={}, max_bearer={})",
+        config.max_ue,
+        config.max_sess,
+        config.max_bearer
+    );
 
     // Initialize SMF state machine
     let mut smf_sm = SmfFsm::new();
@@ -213,14 +243,22 @@ async fn main() -> Result<()> {
         .context("Invalid SBI address")?;
     let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
 
-    sbi_server.start(smf_sbi_request_handler).await
+    sbi_server
+        .start(smf_sbi_request_handler)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
 
     // Register with NRF (if configured)
-    if let Err(e) = smf_nrf_register(&config.sbi_addr, config.sbi_port).await {
-        log::warn!("NRF registration failed (will operate without NRF): {e}");
+    match smf_nrf_register(&config.sbi_addr, config.sbi_port).await {
+        Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
+            ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            log::warn!("NRF registration failed (will operate without NRF): {e}");
+        }
     }
 
     log::info!("NextGCore SMF ready");
@@ -230,8 +268,11 @@ async fn main() -> Result<()> {
     let pfcp_bind_addr: SocketAddr = {
         let addr = std::env::var("SMF_PFCP_ADDR").unwrap_or_else(|_| "0.0.0.0".to_string());
         let port: u16 = std::env::var("SMF_PFCP_PORT")
-            .ok().and_then(|p| p.parse().ok()).unwrap_or(8805);
-        format!("{addr}:{port}").parse()
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(8805);
+        format!("{addr}:{port}")
+            .parse()
             .context("Invalid SMF PFCP listen address")?
     };
     let shutdown_pfcp = shutdown.clone();
@@ -247,7 +288,9 @@ async fn main() -> Result<()> {
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(1),
                         sock.recv_from(&mut buf),
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(Ok((len, peer))) => {
                             handle_pfcp_incoming(&sock, &buf[..len], peer).await;
                         }
@@ -282,7 +325,9 @@ async fn main() -> Result<()> {
     log::info!("Shutting down...");
 
     // Stop SBI server
-    sbi_server.stop().await
+    sbi_server
+        .stop()
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
     log::info!("SBI HTTP/2 server stopped");
 
@@ -314,7 +359,10 @@ async fn handle_pfcp_incoming(
         return;
     }
     let msg_type = pkt[1];
-    log::debug!("PFCP message type={msg_type} from {peer} ({} bytes)", pkt.len());
+    log::debug!(
+        "PFCP message type={msg_type} from {peer} ({} bytes)",
+        pkt.len()
+    );
 
     match msg_type {
         56 => handle_pfcp_session_report(sock, pkt, peer).await,
@@ -335,7 +383,10 @@ async fn handle_pfcp_session_report(
     // Minimum PFCP header with SEID: 16 bytes
     // flags[1] + msg_type[1] + length[2] + seid[8] + seq[3] + spare[1]
     if pkt.len() < 16 {
-        log::warn!("PFCP Session Report Request from {peer} too short ({} bytes)", pkt.len());
+        log::warn!(
+            "PFCP Session Report Request from {peer} too short ({} bytes)",
+            pkt.len()
+        );
         return;
     }
 
@@ -343,9 +394,7 @@ async fn handle_pfcp_session_report(
     // Sequence number is 3 bytes at offset 12 (big-endian, upper byte = 0)
     let seq = u32::from_be_bytes([0, pkt[12], pkt[13], pkt[14]]);
 
-    log::info!(
-        "PFCP Session Report Request: SEID=0x{seid:016x}, seq={seq}, peer={peer}"
-    );
+    log::info!("PFCP Session Report Request: SEID=0x{seid:016x}, seq={seq}, peer={peer}");
 
     // Parse IEs from the payload (offset 16 onward) to extract usage reports.
     let payload = &pkt[16..];
@@ -371,23 +420,29 @@ async fn handle_pfcp_session_report(
                 let l = u16::from_be_bytes([ur[ur_off + 2], ur[ur_off + 3]]) as usize;
                 let s = ur_off + 4;
                 let e = s + l;
-                if e > ur.len() { break; }
+                if e > ur.len() {
+                    break;
+                }
                 match t {
                     // URR ID (IE type 81)
                     81 if l >= 4 => {
-                        urr_id = u32::from_be_bytes(ur[s..s+4].try_into().unwrap_or([0u8;4]));
+                        urr_id = u32::from_be_bytes(ur[s..s + 4].try_into().unwrap_or([0u8; 4]));
                     }
                     // Volume Measurement (IE type 42): flags(1) + total(8) + ul(8) + dl(8)
                     42 if l >= 1 => {
                         let flags = ur[s];
                         let mut v = s + 1;
-                        if flags & 0x01 != 0 && v + 8 <= e { v += 8; } // skip total
+                        if flags & 0x01 != 0 && v + 8 <= e {
+                            v += 8;
+                        } // skip total
                         if flags & 0x02 != 0 && v + 8 <= e {
-                            vol_ul = u64::from_be_bytes(ur[v..v+8].try_into().unwrap_or([0u8;8]));
+                            vol_ul =
+                                u64::from_be_bytes(ur[v..v + 8].try_into().unwrap_or([0u8; 8]));
                             v += 8;
                         }
                         if flags & 0x04 != 0 && v + 8 <= e {
-                            vol_dl = u64::from_be_bytes(ur[v..v+8].try_into().unwrap_or([0u8;8]));
+                            vol_dl =
+                                u64::from_be_bytes(ur[v..v + 8].try_into().unwrap_or([0u8; 8]));
                         }
                     }
                     _ => {}
@@ -412,7 +467,7 @@ async fn handle_pfcp_session_report(
 
     let mut resp = Vec::with_capacity(16 + payload_len);
     resp.push(0x21); // version=1, SEID present
-    resp.push(57);   // Session Report Response
+    resp.push(57); // Session Report Response
     resp.extend_from_slice(&total_len.to_be_bytes());
     resp.extend_from_slice(&seid.to_be_bytes()); // echo back the SEID
     resp.extend_from_slice(&seq.to_be_bytes()[1..4]); // 3-byte seq
@@ -422,25 +477,26 @@ async fn handle_pfcp_session_report(
     if let Err(e) = sock.send_to(&resp, peer).await {
         log::warn!("Failed to send PFCP Session Report Response to {peer}: {e}");
     } else {
-        log::info!(
-            "PFCP Session Report Response sent: SEID=0x{seid:016x}, seq={seq}, peer={peer}"
-        );
+        log::info!("PFCP Session Report Response sent: SEID=0x{seid:016x}, seq={seq}, peer={peer}");
     }
 }
 
 /// Register SMF NF instance with NRF
 ///
 /// Sends PUT /nnrf-nfm/v1/nf-instances/{nfInstanceId} to NRF
-async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<(), String> {
+async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<String, String> {
     let sbi_ctx = global_context();
 
-    let nrf_uri = std::env::var("NRF_URI").ok();
-    let nrf_uri = match nrf_uri {
+    // Prefer the URI seeded from YAML config; fall back to NRF_URI env var
+    let nrf_uri = match sbi_ctx.get_nrf_uri().await {
         Some(uri) => uri,
-        None => {
-            log::debug!("No NRF_URI configured, skipping NRF registration");
-            return Ok(());
-        }
+        None => match std::env::var("NRF_URI").ok() {
+            Some(uri) => uri,
+            None => {
+                log::debug!("No NRF URI configured, skipping NRF registration");
+                return Ok(String::new());
+            }
+        },
     };
 
     log::info!("Registering SMF with NRF at {nrf_uri}");
@@ -483,10 +539,7 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
             log::info!("SMF registered with NRF (id={nf_instance_id})");
 
             // Store self instance in SBI context
-            let mut self_instance = NfInstance::new(
-                &nf_instance_id,
-                ogs_sbi::types::NfType::Smf,
-            );
+            let mut self_instance = NfInstance::new(&nf_instance_id, ogs_sbi::types::NfType::Smf);
             self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
             let mut svc = NfService::new(
                 "nsmf-pdusession",
@@ -497,9 +550,12 @@ async fn smf_nrf_register(sbi_addr: &str, sbi_port: u16) -> std::result::Result<
             self_instance.add_service(svc);
             sbi_ctx.set_self_instance(self_instance).await;
 
-            Ok(())
+            Ok(nf_instance_id)
         }
-        _ => Err(format!("NRF registration returned status {}", response.status)),
+        _ => Err(format!(
+            "NRF registration returned status {}",
+            response.status
+        )),
     }
 }
 
@@ -509,7 +565,9 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
         .strip_prefix("https://")
         .or_else(|| uri.strip_prefix("http://"))
         .unwrap_or(uri);
-    let (host_port, _path) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    let (host_port, _path) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
     if let Some((host, port_str)) = host_port.rsplit_once(':') {
         let port: u16 = port_str.parse().ok()?;
         Some((host.to_string(), port))
@@ -566,7 +624,9 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 
         // Retrieve SM Context
         // POST /nsmf-pdusession/v1/sm-contexts/{smContextRef}/retrieve
-        ("nsmf-pdusession", "sm-contexts", "POST") if parts.len() >= 5 && parts[4] == "retrieve" => {
+        ("nsmf-pdusession", "sm-contexts", "POST")
+            if parts.len() >= 5 && parts[4] == "retrieve" =>
+        {
             let sm_context_ref = parts[3];
             handle_sm_context_retrieve(sm_context_ref).await
         }
@@ -586,7 +646,9 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 
         // Release PDU Session
         // POST /nsmf-pdusession/v1/pdu-sessions/{pduSessionRef}/release
-        ("nsmf-pdusession", "pdu-sessions", "POST") if parts.len() >= 5 && parts[4] == "release" => {
+        ("nsmf-pdusession", "pdu-sessions", "POST")
+            if parts.len() >= 5 && parts[4] == "release" =>
+        {
             let pdu_session_ref = parts[3];
             handle_pdu_session_release(pdu_session_ref).await
         }
@@ -597,9 +659,7 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 
         // Subscribe to events
         // POST /nsmf-event-exposure/v1/subscriptions
-        ("nsmf-event-exposure", "subscriptions", "POST") => {
-            handle_event_subscribe().await
-        }
+        ("nsmf-event-exposure", "subscriptions", "POST") => handle_event_subscribe().await,
 
         // Unsubscribe from events
         // DELETE /nsmf-event-exposure/v1/subscriptions/{subscriptionId}
@@ -670,18 +730,29 @@ async fn pfcp_session_establish(
     upf_addr: &str,
     upf_port: u16,
 ) -> Result<PfcpSessionResult> {
-    use n4_build::{PfcpMessageBuilder, PdrParams, FarParams, pfcp_ie};
-    use tokio::net::UdpSocket;
+    use n4_build::{pfcp_ie, FarParams, PdrParams, PfcpMessageBuilder};
     use std::time::Duration;
+    use tokio::net::UdpSocket;
 
-    log::info!("PFCP Session Establishment: UPF={}:{}, UE IP={}.{}.{}.{}",
-        upf_addr, upf_port, ue_ip[0], ue_ip[1], ue_ip[2], ue_ip[3]);
+    log::info!(
+        "PFCP Session Establishment: UPF={}:{}, UE IP={}.{}.{}.{}",
+        upf_addr,
+        upf_port,
+        ue_ip[0],
+        ue_ip[1],
+        ue_ip[2],
+        ue_ip[3]
+    );
 
     // Build PFCP payload: F-SEID + Node ID + Create PDR (uplink) + Create FAR (uplink) + Create PDR (downlink) + Create FAR (downlink)
     let smf_ip: [u8; 4] = {
         let s = std::env::var("SMF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
         let parts: Vec<u8> = s.split('.').filter_map(|p| p.parse().ok()).collect();
-        if parts.len() == 4 { [parts[0], parts[1], parts[2], parts[3]] } else { [127, 0, 0, 1] }
+        if parts.len() == 4 {
+            [parts[0], parts[1], parts[2], parts[3]]
+        } else {
+            [127, 0, 0, 1]
+        }
     };
     let mut builder = PfcpMessageBuilder::new();
 
@@ -701,10 +772,10 @@ async fn pfcp_session_establish(
     let ul_pdr = PdrParams {
         pdr_id: 1,
         precedence: 100,
-        source_interface: 0, // Access
-        f_teid: Some((0, None, None)), // teid=0: UPF allocates
+        source_interface: 0,                            // Access
+        f_teid: Some((0, None, None)),                  // teid=0: UPF allocates
         ue_ip_address: Some((Some(ue_ip), None, true)), // source
-        outer_header_removal: Some(0), // GTP-U/UDP/IPv4
+        outer_header_removal: Some(0),                  // GTP-U/UDP/IPv4
         far_id: Some(1),
         qfi: Some(9),
         ..Default::default()
@@ -715,7 +786,7 @@ async fn pfcp_session_establish(
     // Create FAR 1 (Uplink): Forward to DN
     let ul_far = FarParams {
         far_id: 1,
-        apply_action: 0x02, // FORW (forward)
+        apply_action: 0x02,             // FORW (forward)
         destination_interface: Some(6), // Core/SGi-LAN
         ..Default::default()
     };
@@ -726,7 +797,7 @@ async fn pfcp_session_establish(
     let dl_pdr = PdrParams {
         pdr_id: 2,
         precedence: 100,
-        source_interface: 6, // Core
+        source_interface: 6,                             // Core
         ue_ip_address: Some((Some(ue_ip), None, false)), // destination
         far_id: Some(2),
         qfi: Some(9),
@@ -738,7 +809,7 @@ async fn pfcp_session_establish(
     // Create FAR 2 (Downlink): Buffer initially (will be updated with gNB TEID)
     let dl_far = FarParams {
         far_id: 2,
-        apply_action: 0x04, // BUFF (buffer)
+        apply_action: 0x04,             // BUFF (buffer)
         destination_interface: Some(0), // Access
         ..Default::default()
     };
@@ -761,23 +832,29 @@ async fn pfcp_session_establish(
     packet.extend_from_slice(&payload);
 
     // Send via UDP
-    let socket = UdpSocket::bind("0.0.0.0:0").await
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .await
         .context("Failed to bind PFCP client socket")?;
-    let upf_endpoint: SocketAddr = format!("{upf_addr}:{upf_port}").parse()
+    let upf_endpoint: SocketAddr = format!("{upf_addr}:{upf_port}")
+        .parse()
         .context("Invalid UPF address")?;
 
-    socket.send_to(&packet, upf_endpoint).await
+    socket
+        .send_to(&packet, upf_endpoint)
+        .await
         .context("Failed to send PFCP to UPF")?;
-    log::info!("PFCP Session Establishment Request sent ({} bytes)", packet.len());
+    log::info!(
+        "PFCP Session Establishment Request sent ({} bytes)",
+        packet.len()
+    );
 
     // Receive response with timeout
     let mut resp_buf = vec![0u8; 4096];
-    let (resp_len, _) = tokio::time::timeout(
-        Duration::from_secs(5),
-        socket.recv_from(&mut resp_buf),
-    ).await
-        .context("PFCP response timeout")?
-        .context("PFCP recv error")?;
+    let (resp_len, _) =
+        tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut resp_buf))
+            .await
+            .context("PFCP response timeout")?
+            .context("PFCP recv error")?;
 
     log::info!("PFCP response received ({resp_len} bytes)");
 
@@ -797,36 +874,53 @@ async fn pfcp_session_establish(
     let mut offset = 0;
     while offset + 4 <= resp_payload.len() {
         let ie_type = u16::from_be_bytes([resp_payload[offset], resp_payload[offset + 1]]);
-        let ie_len = u16::from_be_bytes([resp_payload[offset + 2], resp_payload[offset + 3]]) as usize;
+        let ie_len =
+            u16::from_be_bytes([resp_payload[offset + 2], resp_payload[offset + 3]]) as usize;
         let ie_start = offset + 4;
         let ie_end = ie_start + ie_len;
-        if ie_end > resp_payload.len() { break; }
+        if ie_end > resp_payload.len() {
+            break;
+        }
 
         let ie_value = &resp_payload[ie_start..ie_end];
 
         match ie_type {
-            57 => { // F-SEID (0x0039)
+            57 => {
+                // F-SEID (0x0039)
                 if ie_value.len() >= 9 {
                     let flags = ie_value[0];
                     upf_seid = u64::from_be_bytes(ie_value[1..9].try_into().unwrap());
                     if flags & 0x02 != 0 && ie_value.len() >= 13 {
                         upf_ip = [ie_value[9], ie_value[10], ie_value[11], ie_value[12]];
                     }
-                    log::info!("UPF F-SEID: seid=0x{:016x}, ip={}.{}.{}.{}",
-                        upf_seid, upf_ip[0], upf_ip[1], upf_ip[2], upf_ip[3]);
+                    log::info!(
+                        "UPF F-SEID: seid=0x{:016x}, ip={}.{}.{}.{}",
+                        upf_seid,
+                        upf_ip[0],
+                        upf_ip[1],
+                        upf_ip[2],
+                        upf_ip[3]
+                    );
                 }
             }
-            8 => { // Created PDR (0x0008)
+            8 => {
+                // Created PDR (0x0008)
                 // Parse inner IEs of Created PDR group
                 let mut inner_off = 0;
                 while inner_off + 4 <= ie_value.len() {
-                    let inner_type = u16::from_be_bytes([ie_value[inner_off], ie_value[inner_off + 1]]);
-                    let inner_len = u16::from_be_bytes([ie_value[inner_off + 2], ie_value[inner_off + 3]]) as usize;
+                    let inner_type =
+                        u16::from_be_bytes([ie_value[inner_off], ie_value[inner_off + 1]]);
+                    let inner_len =
+                        u16::from_be_bytes([ie_value[inner_off + 2], ie_value[inner_off + 3]])
+                            as usize;
                     let inner_start = inner_off + 4;
                     let inner_end = inner_start + inner_len;
-                    if inner_end > ie_value.len() { break; }
+                    if inner_end > ie_value.len() {
+                        break;
+                    }
 
-                    if inner_type == 21 { // F-TEID (0x0015)
+                    if inner_type == 21 {
+                        // F-TEID (0x0015)
                         let fteid_val = &ie_value[inner_start..inner_end];
                         if fteid_val.len() >= 5 {
                             let fteid_flags = fteid_val[0];
@@ -870,13 +964,18 @@ async fn pfcp_session_modify(
     upf_addr: &str,
     upf_port: u16,
 ) -> Result<()> {
-    use n4_build::{SessionModificationParams, build_session_modification_request};
-    use tokio::net::UdpSocket;
+    use n4_build::{build_session_modification_request, SessionModificationParams};
     use std::time::Duration;
+    use tokio::net::UdpSocket;
 
     log::info!(
         "PFCP Session Modification: UPF SEID=0x{:016x}, gNB TEID=0x{:08x}, gNB addr={}.{}.{}.{}",
-        upf_seid, gnb_teid, gnb_addr[0], gnb_addr[1], gnb_addr[2], gnb_addr[3]
+        upf_seid,
+        gnb_teid,
+        gnb_addr[0],
+        gnb_addr[1],
+        gnb_addr[2],
+        gnb_addr[3]
     );
 
     // Build modification: update FAR 2 (downlink) from BUFF to FORW with outer header creation (GTP-U to gNB)
@@ -884,10 +983,10 @@ async fn pfcp_session_modify(
     // description 0x0100 = GTP-U/UDP/IPv4
     let params = SessionModificationParams {
         update_fars_activate: vec![(
-            2,                              // FAR ID 2 (downlink)
-            0,                              // destination_interface: Access
+            2,                                              // FAR ID 2 (downlink)
+            0,                                              // destination_interface: Access
             Some((0x0100, gnb_teid, Some(gnb_addr), None)), // outer header creation: GTP-U to gNB
-            true,                           // send end marker
+            true,                                           // send end marker
         )],
         ..Default::default()
     };
@@ -897,7 +996,7 @@ async fn pfcp_session_modify(
     // Build PFCP header with UPF SEID
     let mut packet = Vec::with_capacity(16 + payload.len());
     packet.push(0x21); // flags: version=1 + SEID present
-    packet.push(52);   // Session Modification Request
+    packet.push(52); // Session Modification Request
     let total_len = (12 + payload.len()) as u16;
     packet.extend_from_slice(&total_len.to_be_bytes());
     packet.extend_from_slice(&upf_seid.to_be_bytes());
@@ -907,23 +1006,29 @@ async fn pfcp_session_modify(
     packet.extend_from_slice(&payload);
 
     // Send via UDP
-    let socket = UdpSocket::bind("0.0.0.0:0").await
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .await
         .context("Failed to bind PFCP client socket")?;
-    let upf_endpoint: SocketAddr = format!("{upf_addr}:{upf_port}").parse()
+    let upf_endpoint: SocketAddr = format!("{upf_addr}:{upf_port}")
+        .parse()
         .context("Invalid UPF address")?;
 
-    socket.send_to(&packet, upf_endpoint).await
+    socket
+        .send_to(&packet, upf_endpoint)
+        .await
         .context("Failed to send PFCP modification to UPF")?;
-    log::info!("PFCP Session Modification Request sent ({} bytes)", packet.len());
+    log::info!(
+        "PFCP Session Modification Request sent ({} bytes)",
+        packet.len()
+    );
 
     // Receive response with timeout
     let mut resp_buf = vec![0u8; 4096];
-    let (resp_len, _) = tokio::time::timeout(
-        Duration::from_secs(5),
-        socket.recv_from(&mut resp_buf),
-    ).await
-        .context("PFCP modification response timeout")?
-        .context("PFCP modification recv error")?;
+    let (resp_len, _) =
+        tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut resp_buf))
+            .await
+            .context("PFCP modification response timeout")?
+            .context("PFCP modification recv error")?;
 
     log::info!("PFCP Session Modification Response received ({resp_len} bytes)");
 
@@ -941,13 +1046,9 @@ async fn pfcp_session_modify(
 }
 
 /// Send PFCP Session Deletion Request to UPF
-async fn pfcp_session_delete(
-    upf_seid: u64,
-    upf_addr: &str,
-    upf_port: u16,
-) -> Result<()> {
-    use tokio::net::UdpSocket;
+async fn pfcp_session_delete(upf_seid: u64, upf_addr: &str, upf_port: u16) -> Result<()> {
     use std::time::Duration;
+    use tokio::net::UdpSocket;
 
     log::info!("PFCP Session Deletion: UPF SEID=0x{upf_seid:016x}");
 
@@ -957,7 +1058,7 @@ async fn pfcp_session_delete(
     // Build PFCP header with UPF SEID
     let mut packet = Vec::with_capacity(16 + payload.len());
     packet.push(0x21); // flags: version=1 + SEID present
-    packet.push(54);   // Session Deletion Request (message type 54)
+    packet.push(54); // Session Deletion Request (message type 54)
     let total_len = (12 + payload.len()) as u16;
     packet.extend_from_slice(&total_len.to_be_bytes());
     packet.extend_from_slice(&upf_seid.to_be_bytes());
@@ -967,23 +1068,29 @@ async fn pfcp_session_delete(
     packet.extend_from_slice(&payload);
 
     // Send via UDP
-    let socket = UdpSocket::bind("0.0.0.0:0").await
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .await
         .context("Failed to bind PFCP client socket")?;
-    let upf_endpoint: SocketAddr = format!("{upf_addr}:{upf_port}").parse()
+    let upf_endpoint: SocketAddr = format!("{upf_addr}:{upf_port}")
+        .parse()
         .context("Invalid UPF address")?;
 
-    socket.send_to(&packet, upf_endpoint).await
+    socket
+        .send_to(&packet, upf_endpoint)
+        .await
         .context("Failed to send PFCP deletion to UPF")?;
-    log::info!("PFCP Session Deletion Request sent ({} bytes)", packet.len());
+    log::info!(
+        "PFCP Session Deletion Request sent ({} bytes)",
+        packet.len()
+    );
 
     // Receive response with timeout
     let mut resp_buf = vec![0u8; 4096];
-    let (resp_len, _) = tokio::time::timeout(
-        Duration::from_secs(5),
-        socket.recv_from(&mut resp_buf),
-    ).await
-        .context("PFCP deletion response timeout")?
-        .context("PFCP deletion recv error")?;
+    let (resp_len, _) =
+        tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut resp_buf))
+            .await
+            .context("PFCP deletion response timeout")?
+            .context("PFCP deletion recv error")?;
 
     log::info!("PFCP Session Deletion Response received ({resp_len} bytes)");
 
@@ -1049,7 +1156,11 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
 
     log::info!(
         "SMF allocated: ref={}, UE IP={}.{}.{}.{}",
-        sm_context_ref, ue_ip_octets[0], ue_ip_octets[1], ue_ip_octets[2], ue_ip_octets[3]
+        sm_context_ref,
+        ue_ip_octets[0],
+        ue_ip_octets[1],
+        ue_ip_octets[2],
+        ue_ip_octets[3]
     );
 
     // Build N1 SM message: NAS PDU Session Establishment Accept
@@ -1062,8 +1173,10 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     n1_sm_msg.push(0x01); // SSC mode 1
     n1_sm_msg.extend_from_slice(&[0x06, 0x01, 0x03, 0x01, 0x01, 0x09]); // QoS rules (QFI=9)
     n1_sm_msg.extend_from_slice(&[0x06, 0x06, 0x00, 0x64, 0x06, 0x00, 0x64]); // Session AMBR 100Mbps
-    // PDU address (IEI 0x29)
-    n1_sm_msg.push(0x29); n1_sm_msg.push(0x05); n1_sm_msg.push(0x01);
+                                                                              // PDU address (IEI 0x29)
+    n1_sm_msg.push(0x29);
+    n1_sm_msg.push(0x05);
+    n1_sm_msg.push(0x01);
     n1_sm_msg.extend_from_slice(&ue_ip_octets);
     // DNN (IEI 0x25)
     let dnn_bytes = dnn.as_bytes();
@@ -1075,21 +1188,41 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     // Establish PFCP session with UPF to get real UPF TEID
     let smf_n4_seid = (sm_context_ref.parse::<u64>().unwrap_or(1)) | 0x1000;
     let upf_addr_str = std::env::var("UPF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let upf_n4_port: u16 = std::env::var("UPF_PFCP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8805);
+    let upf_n4_port: u16 = std::env::var("UPF_PFCP_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8805);
 
     let (upf_teid, upf_addr) = match pfcp_session_establish(
-        smf_n4_seid, ue_ip_octets, dnn, sst, &upf_addr_str, upf_n4_port,
-    ).await {
+        smf_n4_seid,
+        ue_ip_octets,
+        dnn,
+        sst,
+        &upf_addr_str,
+        upf_n4_port,
+    )
+    .await
+    {
         Ok(result) => {
             log::info!(
                 "PFCP session established: UPF SEID=0x{:016x}, TEID=0x{:08x}, addr={}.{}.{}.{}",
-                result.upf_seid, result.upf_teid,
-                result.upf_addr[0], result.upf_addr[1], result.upf_addr[2], result.upf_addr[3]
+                result.upf_seid,
+                result.upf_teid,
+                result.upf_addr[0],
+                result.upf_addr[1],
+                result.upf_addr[2],
+                result.upf_addr[3]
             );
-            // Store UPF SEID for later PFCP modifications
-            if let Ok(mut sessions) = PFCP_SESSIONS.lock() {
-                sessions.insert(sm_context_ref.to_string(), result.upf_seid);
-                log::debug!("Stored UPF SEID=0x{:016x} for sm_context_ref={}", result.upf_seid, sm_context_ref);
+            // Store UPF SEID for later PFCP modifications (in SmfContext, not a global)
+            if let Ok(ctx) = smf_self().read() {
+                if let Ok(mut sessions) = ctx.pfcp_sessions.write() {
+                    sessions.insert(sm_context_ref.to_string(), result.upf_seid);
+                    log::debug!(
+                        "Stored UPF SEID=0x{:016x} for sm_context_ref={}",
+                        result.upf_seid,
+                        sm_context_ref
+                    );
+                }
             }
             (result.upf_teid, result.upf_addr)
         }
@@ -1126,7 +1259,10 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
 
     log::info!(
         "SM Context Created: ref={}, n1_len={}, n2_len={}, UPF TEID=0x{:08x}",
-        sm_context_ref, n1_sm_msg.len(), n2_sm_info.len(), upf_teid
+        sm_context_ref,
+        n1_sm_msg.len(),
+        n2_sm_info.len(),
+        upf_teid
     );
 
     SbiResponse::with_status(201)
@@ -1153,7 +1289,8 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             if let Ok(n2_bytes) = base64::engine::general_purpose::STANDARD.decode(n2_b64) {
                 if n2_bytes.len() >= 6 {
                     let qfi = n2_bytes[0];
-                    let gnb_teid = u32::from_be_bytes([n2_bytes[1], n2_bytes[2], n2_bytes[3], n2_bytes[4]]);
+                    let gnb_teid =
+                        u32::from_be_bytes([n2_bytes[1], n2_bytes[2], n2_bytes[3], n2_bytes[4]]);
                     let addr_type = n2_bytes[5];
 
                     let gnb_addr = if addr_type == 1 && n2_bytes.len() >= 10 {
@@ -1164,23 +1301,47 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
 
                     log::info!(
                         "SM Context Update: gNB TEID=0x{:08x}, addr={}.{}.{}.{}, QFI={}",
-                        gnb_teid, gnb_addr[0], gnb_addr[1], gnb_addr[2], gnb_addr[3], qfi
+                        gnb_teid,
+                        gnb_addr[0],
+                        gnb_addr[1],
+                        gnb_addr[2],
+                        gnb_addr[3],
+                        qfi
                     );
 
                     // Send PFCP Session Modification to UPF: activate DL FAR with gNB TEID
-                    // Retrieve the real UPF SEID stored during establishment
-                    let upf_seid = PFCP_SESSIONS.lock().ok()
-                        .and_then(|sessions| sessions.get(sm_context_ref).copied())
+                    // Retrieve the real UPF SEID stored during establishment (from SmfContext)
+                    let upf_seid = smf_self()
+                        .read()
+                        .ok()
+                        .and_then(|ctx| {
+                            ctx.pfcp_sessions
+                                .read()
+                                .ok()
+                                .and_then(|sessions| sessions.get(sm_context_ref).copied())
+                        })
                         .unwrap_or_else(|| {
-                            log::warn!("No stored UPF SEID for ref={sm_context_ref}, using fallback");
+                            log::warn!(
+                                "No stored UPF SEID for ref={sm_context_ref}, using fallback"
+                            );
                             sm_context_ref.parse::<u64>().unwrap_or(1)
                         });
                     log::info!("PFCP Session Modification: UPF SEID=0x{upf_seid:016x} for ref={sm_context_ref}");
-                    let upf_mod_addr = std::env::var("UPF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-                    let upf_mod_port: u16 = std::env::var("UPF_PFCP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8805);
+                    let upf_mod_addr =
+                        std::env::var("UPF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+                    let upf_mod_port: u16 = std::env::var("UPF_PFCP_PORT")
+                        .ok()
+                        .and_then(|p| p.parse().ok())
+                        .unwrap_or(8805);
                     match pfcp_session_modify(
-                        upf_seid, gnb_teid, gnb_addr, &upf_mod_addr, upf_mod_port,
-                    ).await {
+                        upf_seid,
+                        gnb_teid,
+                        gnb_addr,
+                        &upf_mod_addr,
+                        upf_mod_port,
+                    )
+                    .await
+                    {
                         Ok(()) => {
                             log::info!("PFCP Session Modified: DL FAR activated with gNB TEID=0x{gnb_teid:08x}");
                         }
@@ -1204,36 +1365,49 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
     if n2_sm_info_type == "PDU_RES_MOD_REQ" {
         use base64::Engine;
 
-        let n1_sm_msg = req_body["n1SmMsg"].as_str()
+        let n1_sm_msg = req_body["n1SmMsg"]
+            .as_str()
             .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
             .expect("value expected");
 
         if n1_sm_msg.len() < 4 {
-            log::warn!("SM Context Update: N1 SM msg too short ({} bytes)", n1_sm_msg.len());
+            log::warn!(
+                "SM Context Update: N1 SM msg too short ({} bytes)",
+                n1_sm_msg.len()
+            );
             return SbiResponse::with_status(400);
         }
 
         let psi: u8 = sm_context_ref.parse().unwrap_or(1);
         log::info!(
             "SM Context Update (Modification): PSI={}, N1 SM msg len={}",
-            psi, n1_sm_msg.len()
+            psi,
+            n1_sm_msg.len()
         );
 
-        // Look up UPF SEID for PFCP session modification with updated QoS
-        let upf_seid = PFCP_SESSIONS.lock().ok()
-            .and_then(|sessions| sessions.get(sm_context_ref).copied());
+        // Look up UPF SEID for PFCP session modification with updated QoS (from SmfContext)
+        let upf_seid = smf_self().read().ok().and_then(|ctx| {
+            ctx.pfcp_sessions
+                .read()
+                .ok()
+                .and_then(|sessions| sessions.get(sm_context_ref).copied())
+        });
 
         if let Some(seid) = upf_seid {
             // Send PFCP Session Modification to UPF with QoS update
             // Use existing gNB TEID (no tunnel change, just QoS parameters)
-            let upf_addr = std::env::var("UPF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-            let upf_port: u16 = std::env::var("UPF_PFCP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8805);
+            let upf_addr =
+                std::env::var("UPF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+            let upf_port: u16 = std::env::var("UPF_PFCP_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(8805);
 
             // Build PFCP modification with QoS update (modify QER on existing PDRs)
             let params = n4_build::SessionModificationParams {
                 update_qers: vec![n4_build::QerParams {
                     qer_id: 1,
-                    gate_status: (0, 0), // Both gates open
+                    gate_status: (0, 0),                   // Both gates open
                     mbr: Some((100_000_000, 100_000_000)), // 100 Mbps UL/DL
                     gbr: None,
                     qfi: Some(1),
@@ -1246,7 +1420,7 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             // Build PFCP header with UPF SEID
             let mut packet = Vec::with_capacity(16 + payload.len());
             packet.push(0x21); // flags: version=1 + SEID present
-            packet.push(52);   // Session Modification Request
+            packet.push(52); // Session Modification Request
             let total_len = (12 + payload.len()) as u16;
             packet.extend_from_slice(&total_len.to_be_bytes());
             packet.extend_from_slice(&seid.to_be_bytes());
@@ -1256,7 +1430,8 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             packet.extend_from_slice(&payload);
 
             // Send via UDP
-            let upf_endpoint: std::net::SocketAddr = match format!("{upf_addr}:{upf_port}").parse() {
+            let upf_endpoint: std::net::SocketAddr = match format!("{upf_addr}:{upf_port}").parse()
+            {
                 Ok(ep) => ep,
                 Err(e) => {
                     log::warn!("Invalid UPF address: {e}");
@@ -1273,7 +1448,9 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                         match tokio::time::timeout(
                             std::time::Duration::from_secs(5),
                             socket.recv_from(&mut resp_buf),
-                        ).await {
+                        )
+                        .await
+                        {
                             Ok(Ok((len, _))) => {
                                 log::info!("PFCP Session Modification (QoS) response: {len} bytes");
                             }
@@ -1294,7 +1471,7 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         // Build N1 SM message: PDU Session Modification Command (0xCB)
         let mut n1_mod_cmd = Vec::new();
         n1_mod_cmd.push(0x2E); // Extended protocol discriminator: 5GSM
-        n1_mod_cmd.push(psi);  // PDU session identity
+        n1_mod_cmd.push(psi); // PDU session identity
         n1_mod_cmd.push(0x01); // PTI
         n1_mod_cmd.push(0xCB); // PDU Session Modification Command message type
 
@@ -1320,8 +1497,7 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         "upCnxState": "ACTIVATED"
     });
 
-    SbiResponse::with_status(200)
-        .with_body(response_body.to_string(), "application/json")
+    SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
 }
 
 /// Handle SM Context Release
@@ -1331,14 +1507,21 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
 async fn handle_sm_context_release(sm_context_ref: &str) -> SbiResponse {
     log::info!("SM Context Release request for ref={sm_context_ref}");
 
-    // Look up UPF SEID for this session
-    let upf_seid = PFCP_SESSIONS.lock().ok()
-        .and_then(|sessions| sessions.get(sm_context_ref).copied());
+    // Look up UPF SEID for this session (from SmfContext, not a global)
+    let upf_seid = smf_self().read().ok().and_then(|ctx| {
+        ctx.pfcp_sessions
+            .read()
+            .ok()
+            .and_then(|sessions| sessions.get(sm_context_ref).copied())
+    });
 
     if let Some(seid) = upf_seid {
         // Send PFCP Session Deletion Request to UPF
         let upf_addr = std::env::var("UPF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-        let upf_port: u16 = std::env::var("UPF_PFCP_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8805);
+        let upf_port: u16 = std::env::var("UPF_PFCP_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(8805);
 
         match pfcp_session_delete(seid, &upf_addr, upf_port).await {
             Ok(()) => {
@@ -1350,8 +1533,10 @@ async fn handle_sm_context_release(sm_context_ref: &str) -> SbiResponse {
         }
 
         // Remove from PFCP sessions map
-        if let Ok(mut sessions) = PFCP_SESSIONS.lock() {
-            sessions.remove(sm_context_ref);
+        if let Ok(ctx) = smf_self().read() {
+            if let Ok(mut sessions) = ctx.pfcp_sessions.write() {
+                sessions.remove(sm_context_ref);
+            }
         }
     } else {
         log::warn!("No PFCP session found for sm_context_ref={sm_context_ref}");
@@ -1401,8 +1586,7 @@ async fn handle_sm_context_retrieve(sm_context_ref: &str) -> SbiResponse {
         "status": 404,
         "cause": "CONTEXT_NOT_FOUND"
     });
-    SbiResponse::with_status(404)
-        .with_body(error.to_string(), "application/json")
+    SbiResponse::with_status(404).with_body(error.to_string(), "application/json")
 }
 
 // =============================================================================
@@ -1432,7 +1616,10 @@ async fn handle_pdu_session_update(pdu_session_ref: &str) -> SbiResponse {
 
     let ctx = smf_self();
     if let Ok(context) = ctx.read() {
-        if context.sess_find_by_pdu_session_ref(pdu_session_ref).is_some() {
+        if context
+            .sess_find_by_pdu_session_ref(pdu_session_ref)
+            .is_some()
+        {
             return SbiResponse::with_status(200);
         }
     }

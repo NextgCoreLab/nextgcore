@@ -456,25 +456,14 @@ mod tests {
 
     #[test]
     fn test_create_session_response_no_sess() {
-        let result = handle_create_session_response(
-            None,
-            1,
-            &[],
-            gtp_cause::REQUEST_ACCEPTED,
-            100,
-            200,
-        );
+        let result =
+            handle_create_session_response(None, 1, &[], gtp_cause::REQUEST_ACCEPTED, 100, 200);
         matches!(result, HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND));
     }
 
     #[test]
     fn test_delete_session_response_no_sess() {
-        let result = handle_delete_session_response(
-            None,
-            1,
-            &[],
-            gtp_cause::REQUEST_ACCEPTED,
-        );
+        let result = handle_delete_session_response(None, 1, &[], gtp_cause::REQUEST_ACCEPTED);
         matches!(result, HandlerResult::Error(gtp_cause::CONTEXT_NOT_FOUND));
     }
 }

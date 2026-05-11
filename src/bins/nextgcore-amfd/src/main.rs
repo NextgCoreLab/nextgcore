@@ -2,25 +2,25 @@
 //!
 //! This is the main entry point for the AMF network function.
 
-pub mod context;
-pub mod event;
 pub mod amf_sm;
-pub mod gmm_sm;
-pub mod ngap_sm;
+pub mod context;
+pub mod emergency; // #203: Emergency services (TS 23.167)
+pub mod event;
 pub mod gmm_build;
 pub mod gmm_handler;
+pub mod gmm_sm;
+pub mod metrics;
+pub mod namf_handler;
+pub mod nas_security;
+pub mod ngap_asn1;
 pub mod ngap_build;
 pub mod ngap_handler;
-pub mod ngap_path;
-pub mod ngap_asn1;
-pub mod nas_security;
-pub mod sbi_path;
-pub mod namf_handler;
-pub mod timer;
-pub mod metrics;
-pub mod emergency; // #203: Emergency services (TS 23.167)
 pub mod ngap_mcast; // MBS: NGAP multicast session procedures (TS 38.413 / TS 23.247)
-pub mod snpn;       // Rel-16: SNPN authentication (TS 23.501 §5.30)
+pub mod ngap_path;
+pub mod ngap_sm;
+pub mod sbi_path;
+pub mod snpn; // Rel-16: SNPN authentication (TS 23.501 §5.30)
+pub mod timer;
 pub mod xn_handover; // Rel-15: Xn path switch and N2 handover (TS 23.502 §4.9)
 
 #[cfg(test)]
@@ -88,6 +88,21 @@ struct NetworkNameYaml {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct NrfClientYaml {
+    uri: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SbiClientYaml {
+    nrf: Option<Vec<NrfClientYaml>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SbiYaml {
+    client: Option<SbiClientYaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct AmfSection {
     amf_name: Option<String>,
     network_name: Option<NetworkNameYaml>,
@@ -95,6 +110,7 @@ struct AmfSection {
     tai: Option<Vec<TaiYaml>>,
     plmn_support: Option<Vec<PlmnSupportYaml>>,
     security: Option<SecurityYaml>,
+    sbi: Option<SbiYaml>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -205,6 +221,20 @@ impl AmfApp {
             }
         };
 
+        // Seed NRF URI into SBI context for NF registration
+        if let Some(sbi) = &amf_section.sbi {
+            if let Some(client) = &sbi.client {
+                if let Some(nrf_list) = &client.nrf {
+                    if let Some(nrf) = nrf_list.first() {
+                        log::info!("NRF URI configured: {}", nrf.uri);
+                        ogs_sbi::context::global_context()
+                            .set_nrf_uri(&nrf.uri)
+                            .await;
+                    }
+                }
+            }
+        }
+
         let mut ctx = self.amf_context.write().await;
 
         // AMF name
@@ -228,10 +258,18 @@ impl AmfApp {
             if let Some(guami) = Self::resolve_guami(entry) {
                 log::info!(
                     "Configured GUAMI: PLMN {}{}{}-{}{}{}, AMF Region={}, Set={}",
-                    guami.plmn_id.mcc1, guami.plmn_id.mcc2, guami.plmn_id.mcc3,
-                    guami.plmn_id.mnc1, guami.plmn_id.mnc2,
-                    if guami.plmn_id.mnc3 == 0xf { String::new() } else { guami.plmn_id.mnc3.to_string() },
-                    guami.amf_id.region, guami.amf_id.set
+                    guami.plmn_id.mcc1,
+                    guami.plmn_id.mcc2,
+                    guami.plmn_id.mcc3,
+                    guami.plmn_id.mnc1,
+                    guami.plmn_id.mnc2,
+                    if guami.plmn_id.mnc3 == 0xf {
+                        String::new()
+                    } else {
+                        guami.plmn_id.mnc3.to_string()
+                    },
+                    guami.amf_id.region,
+                    guami.amf_id.set
                 );
                 ctx.served_guami.push(guami);
                 ctx.num_of_served_guami += 1;
@@ -244,10 +282,16 @@ impl AmfApp {
                 let tac = served_tai.list0.tac.first().copied().unwrap_or(0);
                 log::info!(
                     "Configured TAI: PLMN {}{}{}-{}{}{}, TAC={}",
-                    served_tai.list0.plmn_id.mcc1, served_tai.list0.plmn_id.mcc2,
+                    served_tai.list0.plmn_id.mcc1,
+                    served_tai.list0.plmn_id.mcc2,
                     served_tai.list0.plmn_id.mcc3,
-                    served_tai.list0.plmn_id.mnc1, served_tai.list0.plmn_id.mnc2,
-                    if served_tai.list0.plmn_id.mnc3 == 0xf { String::new() } else { served_tai.list0.plmn_id.mnc3.to_string() },
+                    served_tai.list0.plmn_id.mnc1,
+                    served_tai.list0.plmn_id.mnc2,
+                    if served_tai.list0.plmn_id.mnc3 == 0xf {
+                        String::new()
+                    } else {
+                        served_tai.list0.plmn_id.mnc3.to_string()
+                    },
                     tac
                 );
                 ctx.served_tai.push(served_tai);
@@ -260,10 +304,16 @@ impl AmfApp {
             if let Some(plmn_support) = Self::resolve_plmn_support(entry) {
                 log::info!(
                     "Configured PLMN support: PLMN {}{}{}-{}{}{}, {} S-NSSAIs",
-                    plmn_support.plmn_id.mcc1, plmn_support.plmn_id.mcc2,
+                    plmn_support.plmn_id.mcc1,
+                    plmn_support.plmn_id.mcc2,
                     plmn_support.plmn_id.mcc3,
-                    plmn_support.plmn_id.mnc1, plmn_support.plmn_id.mnc2,
-                    if plmn_support.plmn_id.mnc3 == 0xf { String::new() } else { plmn_support.plmn_id.mnc3.to_string() },
+                    plmn_support.plmn_id.mnc1,
+                    plmn_support.plmn_id.mnc2,
+                    if plmn_support.plmn_id.mnc3 == 0xf {
+                        String::new()
+                    } else {
+                        plmn_support.plmn_id.mnc3.to_string()
+                    },
                     plmn_support.num_of_s_nssai
                 );
                 ctx.plmn_support.push(plmn_support);
@@ -287,7 +337,9 @@ impl AmfApp {
 
         log::info!(
             "AMF configuration loaded: {} GUAMI, {} TAI, {} PLMN support",
-            ctx.num_of_served_guami, ctx.num_of_served_tai, ctx.num_of_plmn_support
+            ctx.num_of_served_guami,
+            ctx.num_of_served_tai,
+            ctx.num_of_plmn_support
         );
 
         Ok(())
@@ -380,14 +432,12 @@ impl AmfApp {
     pub async fn init_ngap(&mut self, ngap_addr: SocketAddr) -> Result<()> {
         log::info!("Initializing NGAP server on {ngap_addr}...");
 
-        let event_tx = self.ngap_event_tx.take()
+        let event_tx = self
+            .ngap_event_tx
+            .take()
             .ok_or_else(|| anyhow::anyhow!("NGAP event sender already taken"))?;
 
-        ngap_path::amf_ngap_open(
-            Some(ngap_addr),
-            Arc::clone(&self.amf_context),
-            event_tx,
-        ).await?;
+        ngap_path::amf_ngap_open(Some(ngap_addr), Arc::clone(&self.amf_context), event_tx).await?;
 
         log::info!("NGAP server initialized on {ngap_addr}");
         Ok(())
@@ -582,16 +632,26 @@ async fn main() -> Result<()> {
     app.init(&args.config).await?;
 
     // Parse NGAP address and initialize NGAP server
-    let ngap_addr: SocketAddr = args.ngap_addr.parse()
+    let ngap_addr: SocketAddr = args
+        .ngap_addr
+        .parse()
         .map_err(|e| anyhow::anyhow!("Invalid NGAP address '{}': {}", args.ngap_addr, e))?;
     app.init_ngap(ngap_addr).await?;
 
     // Register with NRF (if configured)
     let sbi_addr = std::env::var("AMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
     let sbi_port: u16 = std::env::var("AMF_SBI_PORT")
-        .ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
-    if let Err(e) = sbi_path::amf_nrf_register(&sbi_addr, sbi_port).await {
-        log::warn!("NRF registration failed (will operate without NRF): {e}");
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(7777);
+    match sbi_path::amf_nrf_register(&sbi_addr, sbi_port).await {
+        Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
+            ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            log::warn!("NRF registration failed (will operate without NRF): {e}");
+        }
     }
 
     // Discover AUSF and SMF from NRF

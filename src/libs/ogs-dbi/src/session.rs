@@ -51,7 +51,8 @@ pub fn ogs_dbi_session_data(
 
             // Parse SD
             let sd = if let Ok(sd_str) = slice_doc.get_str(OGS_SD_STRING) {
-                OgsUint24::from_hex_string(sd_str).unwrap_or(OgsUint24::new(OGS_S_NSSAI_NO_SD_VALUE))
+                OgsUint24::from_hex_string(sd_str)
+                    .unwrap_or(OgsUint24::new(OGS_S_NSSAI_NO_SD_VALUE))
             } else {
                 OgsUint24::new(OGS_S_NSSAI_NO_SD_VALUE)
             };

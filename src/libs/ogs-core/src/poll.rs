@@ -121,7 +121,14 @@ impl OgsPollset {
                 udata: std::ptr::null_mut(),
             };
             unsafe {
-                libc::kevent(kqueue_fd, &event, 1, std::ptr::null_mut(), 0, std::ptr::null());
+                libc::kevent(
+                    kqueue_fd,
+                    &event,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                );
             }
 
             Some(OgsPollset {
@@ -148,7 +155,13 @@ impl OgsPollset {
     }
 
     /// Add a poll to the pollset (identical to ogs_pollset_add)
-    pub fn add<F>(&mut self, when: i16, fd: OgsSocket, handler: F, data: *mut std::ffi::c_void) -> Option<usize>
+    pub fn add<F>(
+        &mut self,
+        when: i16,
+        fd: OgsSocket,
+        handler: F,
+        data: *mut std::ffi::c_void,
+    ) -> Option<usize>
     where
         F: FnMut(i16, OgsSocket, *mut std::ffi::c_void) + Send + 'static,
     {
@@ -195,7 +208,14 @@ impl OgsPollset {
                     udata: id as *mut std::ffi::c_void,
                 };
                 unsafe {
-                    libc::kevent(self.kqueue_fd, &event, 1, std::ptr::null_mut(), 0, std::ptr::null());
+                    libc::kevent(
+                        self.kqueue_fd,
+                        &event,
+                        1,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null(),
+                    );
                 }
             }
             if (when & OGS_POLLOUT) != 0 {
@@ -208,7 +228,14 @@ impl OgsPollset {
                     udata: id as *mut std::ffi::c_void,
                 };
                 unsafe {
-                    libc::kevent(self.kqueue_fd, &event, 1, std::ptr::null_mut(), 0, std::ptr::null());
+                    libc::kevent(
+                        self.kqueue_fd,
+                        &event,
+                        1,
+                        std::ptr::null_mut(),
+                        0,
+                        std::ptr::null(),
+                    );
                 }
             }
         }
@@ -231,7 +258,12 @@ impl OgsPollset {
             #[cfg(target_os = "linux")]
             {
                 unsafe {
-                    libc::epoll_ctl(self.epoll_fd, libc::EPOLL_CTL_DEL, poll.fd, std::ptr::null_mut());
+                    libc::epoll_ctl(
+                        self.epoll_fd,
+                        libc::EPOLL_CTL_DEL,
+                        poll.fd,
+                        std::ptr::null_mut(),
+                    );
                 }
             }
 
@@ -247,7 +279,14 @@ impl OgsPollset {
                         udata: std::ptr::null_mut(),
                     };
                     unsafe {
-                        libc::kevent(self.kqueue_fd, &event, 1, std::ptr::null_mut(), 0, std::ptr::null());
+                        libc::kevent(
+                            self.kqueue_fd,
+                            &event,
+                            1,
+                            std::ptr::null_mut(),
+                            0,
+                            std::ptr::null(),
+                        );
                     }
                 }
                 if (poll.when & OGS_POLLOUT) != 0 {
@@ -260,7 +299,14 @@ impl OgsPollset {
                         udata: std::ptr::null_mut(),
                     };
                     unsafe {
-                        libc::kevent(self.kqueue_fd, &event, 1, std::ptr::null_mut(), 0, std::ptr::null());
+                        libc::kevent(
+                            self.kqueue_fd,
+                            &event,
+                            1,
+                            std::ptr::null_mut(),
+                            0,
+                            std::ptr::null(),
+                        );
                     }
                 }
             }
@@ -284,7 +330,12 @@ impl OgsPollset {
             let mut events: [libc::epoll_event; 64] = unsafe { std::mem::zeroed() };
 
             let nfds = unsafe {
-                libc::epoll_wait(self.epoll_fd, events.as_mut_ptr(), events.len() as i32, timeout_ms)
+                libc::epoll_wait(
+                    self.epoll_fd,
+                    events.as_mut_ptr(),
+                    events.len() as i32,
+                    timeout_ms,
+                )
             };
 
             if nfds < 0 {
@@ -305,7 +356,9 @@ impl OgsPollset {
                 if id == 0 {
                     // Drain the notify pipe
                     let mut buf = [0u8; 64];
-                    unsafe { libc::read(self.notify_read_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                    unsafe {
+                        libc::read(self.notify_read_fd, buf.as_mut_ptr() as *mut _, buf.len())
+                    };
                     continue;
                 }
 
@@ -370,7 +423,9 @@ impl OgsPollset {
                 if events[i].ident == self.notify_read_fd as usize {
                     // Drain the notify pipe
                     let mut buf = [0u8; 64];
-                    unsafe { libc::read(self.notify_read_fd, buf.as_mut_ptr() as *mut _, buf.len()) };
+                    unsafe {
+                        libc::read(self.notify_read_fd, buf.as_mut_ptr() as *mut _, buf.len())
+                    };
                     continue;
                 }
 
@@ -429,7 +484,11 @@ impl OgsPollset {
             }
 
             let nfds = unsafe {
-                libc::poll(self.poll_fds.as_mut_ptr(), self.poll_fds.len() as libc::nfds_t, timeout_ms)
+                libc::poll(
+                    self.poll_fds.as_mut_ptr(),
+                    self.poll_fds.len() as libc::nfds_t,
+                    timeout_ms,
+                )
             };
 
             if nfds < 0 {
@@ -513,8 +572,6 @@ pub fn ogs_pollset_destroy(pollset: OgsPollset) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    
 
     #[test]
     fn test_pollset_create() {

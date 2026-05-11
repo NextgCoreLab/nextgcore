@@ -3,13 +3,12 @@
 //! Implements NAS message authentication and ciphering as specified in
 //! 3GPP TS 33.401 (EPS) and TS 33.501 (5GS)
 
-use bytes::{BytesMut, BufMut};
-use crate::error::{NasError, NasResult};
 use crate::common::types::SecurityAlgorithms;
+use crate::error::{NasError, NasResult};
+use bytes::{BufMut, BytesMut};
 
 /// NAS security context
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct NasSecurityContext {
     /// Selected NAS security algorithms
     pub algorithms: SecurityAlgorithms,
@@ -23,14 +22,9 @@ pub struct NasSecurityContext {
     pub ul_count: NasCount,
 }
 
-
 impl NasSecurityContext {
     /// Create a new NAS security context
-    pub fn new(
-        algorithms: SecurityAlgorithms,
-        knas_enc: [u8; 16],
-        knas_int: [u8; 16],
-    ) -> Self {
+    pub fn new(algorithms: SecurityAlgorithms, knas_enc: [u8; 16], knas_int: [u8; 16]) -> Self {
         Self {
             algorithms,
             knas_enc,
@@ -351,7 +345,10 @@ pub fn unprotect_nas_message(
     ciphered: bool,
 ) -> NasResult<Vec<u8>> {
     if message.len() < 5 {
-        return Err(NasError::BufferTooShort { expected: 5, actual: message.len() });
+        return Err(NasError::BufferTooShort {
+            expected: 5,
+            actual: message.len(),
+        });
     }
 
     // Extract MAC and sequence number

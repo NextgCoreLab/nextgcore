@@ -59,7 +59,12 @@ impl UdrSessSmContext {
 
     /// Dispatch an event to the state machine
     pub fn dispatch(&mut self, event: &mut UdrEvent) {
-        log::trace!("[{}:{}] UDR Sess SM event: {}", self.supi, self.psi, event.name());
+        log::trace!(
+            "[{}:{}] UDR Sess SM event: {}",
+            self.supi,
+            self.psi,
+            event.name()
+        );
 
         match self.state {
             UdrSessState::Initial => {
@@ -101,7 +106,10 @@ impl UdrSessSmContext {
     fn transition(&mut self, new_state: UdrSessState) {
         log::debug!(
             "[{}:{}] UDR Sess SM: {:?} -> {:?}",
-            self.supi, self.psi, self.state, new_state
+            self.supi,
+            self.psi,
+            self.state,
+            new_state
         );
         self.state = new_state;
     }
@@ -110,10 +118,18 @@ impl UdrSessSmContext {
     fn handle_operational_state(&mut self, event: &mut UdrEvent) {
         match event.id {
             UdrEventId::FsmEntry => {
-                log::debug!("[{}:{}] UDR Session entering operational state", self.supi, self.psi);
+                log::debug!(
+                    "[{}:{}] UDR Session entering operational state",
+                    self.supi,
+                    self.psi
+                );
             }
             UdrEventId::FsmExit => {
-                log::debug!("[{}:{}] UDR Session exiting operational state", self.supi, self.psi);
+                log::debug!(
+                    "[{}:{}] UDR Session exiting operational state",
+                    self.supi,
+                    self.psi
+                );
             }
             UdrEventId::SbiServer => {
                 // Session-level server requests (SMF registrations, SM data queries)
@@ -132,15 +148,25 @@ impl UdrSessSmContext {
     fn handle_exception_state(&mut self, event: &mut UdrEvent) {
         match event.id {
             UdrEventId::FsmEntry => {
-                log::debug!("[{}:{}] UDR Session entering exception state", self.supi, self.psi);
+                log::debug!(
+                    "[{}:{}] UDR Session entering exception state",
+                    self.supi,
+                    self.psi
+                );
             }
             UdrEventId::FsmExit => {
-                log::debug!("[{}:{}] UDR Session exiting exception state", self.supi, self.psi);
+                log::debug!(
+                    "[{}:{}] UDR Session exiting exception state",
+                    self.supi,
+                    self.psi
+                );
             }
             _ => {
                 log::error!(
                     "[{}:{}] UDR Sess SM: Unexpected event in exception: {}",
-                    self.supi, self.psi, event.name()
+                    self.supi,
+                    self.psi,
+                    event.name()
                 );
             }
         }

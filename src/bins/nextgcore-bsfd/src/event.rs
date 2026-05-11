@@ -59,7 +59,9 @@ pub enum BsfTimerId {
 impl BsfTimerId {
     pub fn name(&self) -> &'static str {
         match self {
-            BsfTimerId::NfInstanceRegistrationInterval => "OGS_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL",
+            BsfTimerId::NfInstanceRegistrationInterval => {
+                "OGS_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
+            }
             BsfTimerId::NfInstanceHeartbeatInterval => "OGS_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL",
             BsfTimerId::NfInstanceNoHeartbeat => "OGS_TIMER_NF_INSTANCE_NO_HEARTBEAT",
             BsfTimerId::NfInstanceValidity => "OGS_TIMER_NF_INSTANCE_VALIDITY",
@@ -107,7 +109,6 @@ pub struct SbiMessage {
     pub res_status: Option<u16>,
     pub uri: Option<String>,
 }
-
 
 /// BSF Event structure
 /// Port of bsf_event_t from event.h

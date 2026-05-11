@@ -55,9 +55,8 @@ pub use server::{SctpServer, SctpServerConfig, ServerError, ServerEvent};
 pub mod quic;
 
 pub use quic::{
-    QuicTransport, QuicServer, QuicConfig, TlsConfig as QuicTlsConfig,
-    QuicConnectionState, QuicError, QuicResult, StreamMessage,
-    CongestionController, QuicStats,
+    CongestionController, QuicConfig, QuicConnectionState, QuicError, QuicResult, QuicServer,
+    QuicStats, QuicTransport, StreamMessage, TlsConfig as QuicTlsConfig,
 };
 
 // ============================================================================
@@ -264,7 +263,7 @@ mod sctp_proto_impl {
     use super::*;
     use sctp_proto::{
         Association, AssociationHandle, ClientConfig, DatagramEvent, Endpoint, EndpointConfig,
-        Event, Payload, PayloadProtocolIdentifier, TransportConfig, Transmit,
+        Event, Payload, PayloadProtocolIdentifier, Transmit, TransportConfig,
     };
     use std::collections::VecDeque;
     use tokio::net::UdpSocket;
@@ -400,13 +399,20 @@ mod sctp_proto_impl {
         /// Handle incoming UDP packets
         async fn handle_incoming(&mut self) -> Result<()> {
             let mut buf = vec![0u8; self.config.max_receive_buffer_size as usize];
-            let (len, from) = self.socket.recv_from(&mut buf).await.map_err(SctpError::ReceiveFailed)?;
+            let (len, from) = self
+                .socket
+                .recv_from(&mut buf)
+                .await
+                .map_err(SctpError::ReceiveFailed)?;
             buf.truncate(len);
 
             trace!("Received {} bytes from {}", len, from);
 
             let now = Instant::now();
-            if let Some((handle, event)) = self.endpoint.handle(now, from, None, None, Bytes::from(buf)) {
+            if let Some((handle, event)) =
+                self.endpoint
+                    .handle(now, from, None, None, Bytes::from(buf))
+            {
                 if handle == self.handle {
                     match event {
                         DatagramEvent::AssociationEvent(assoc_event) => {
@@ -471,7 +477,10 @@ mod sctp_proto_impl {
                 match &transmit.payload {
                     Payload::RawEncode(chunks) => {
                         for chunk in chunks {
-                            self.socket.send_to(chunk, transmit.remote).await.map_err(SctpError::SendFailed)?;
+                            self.socket
+                                .send_to(chunk, transmit.remote)
+                                .await
+                                .map_err(SctpError::SendFailed)?;
                             trace!("Sent {} bytes to {}", chunk.len(), transmit.remote);
                         }
                     }
@@ -490,7 +499,12 @@ mod sctp_proto_impl {
         }
 
         /// Send data on a specific stream with custom PPID
-        pub async fn send_with_ppid(&mut self, stream_id: u16, data: &[u8], ppid: u32) -> Result<()> {
+        pub async fn send_with_ppid(
+            &mut self,
+            stream_id: u16,
+            data: &[u8],
+            ppid: u32,
+        ) -> Result<()> {
             if self.state != AssociationState::Established {
                 return Err(SctpError::InvalidState(
                     "Cannot send: association not established".into(),
@@ -499,13 +513,21 @@ mod sctp_proto_impl {
 
             let ppi = PayloadProtocolIdentifier::from(ppid);
 
-            let mut stream = self.association.open_stream(stream_id, ppi)
+            let mut stream = self
+                .association
+                .open_stream(stream_id, ppi)
                 .map_err(|e| SctpError::StreamError(e.to_string()))?;
 
-            stream.write_with_ppi(data, ppi)
+            stream
+                .write_with_ppi(data, ppi)
                 .map_err(|e| SctpError::StreamError(e.to_string()))?;
 
-            debug!("Queued {} bytes on stream {} with PPID {}", data.len(), stream_id, ppid);
+            debug!(
+                "Queued {} bytes on stream {} with PPID {}",
+                data.len(),
+                stream_id,
+                ppid
+            );
 
             // Poll and flush
             self.poll_events();
@@ -569,7 +591,12 @@ mod sctp_proto_impl {
                                 data: Bytes::from(buf),
                                 ppid,
                             };
-                            debug!("Received {} bytes on stream {} with PPID {}", msg.data.len(), stream_id, msg.ppid);
+                            debug!(
+                                "Received {} bytes on stream {} with PPID {}",
+                                msg.data.len(),
+                                stream_id,
+                                msg.ppid
+                            );
 
                             if let Some(tx) = &self.event_tx {
                                 let _ = tx.send(SctpEvent::DataReceived(msg.clone()));
@@ -600,7 +627,10 @@ mod sctp_proto_impl {
             // Wait for shutdown to complete with timeout
             let deadline = Instant::now() + Duration::from_secs(5);
             while self.state == AssociationState::ShuttingDown && Instant::now() < deadline {
-                if let Ok(Ok(())) = timeout(Duration::from_millis(100), self.handle_incoming()).await {}
+                if let Ok(Ok(())) =
+                    timeout(Duration::from_millis(100), self.handle_incoming()).await
+                {
+                }
                 self.poll_events();
                 self.flush_transmits().await?;
 
@@ -1019,7 +1049,8 @@ mod tests {
 
     #[test]
     fn test_error_connect_failed() {
-        let err = SctpError::ConnectFailed(io::Error::new(io::ErrorKind::ConnectionRefused, "test"));
+        let err =
+            SctpError::ConnectFailed(io::Error::new(io::ErrorKind::ConnectionRefused, "test"));
         assert!(err.to_string().contains("Connect failed"));
     }
 

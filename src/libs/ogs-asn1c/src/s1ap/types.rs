@@ -31,9 +31,9 @@ impl AperDecode for Criticality {
             0 => Ok(Criticality::Reject),
             1 => Ok(Criticality::Ignore),
             2 => Ok(Criticality::Notify),
-            _ => Err(crate::per::PerError::DecodeError(
-                format!("Invalid Criticality value: {value}")
-            )),
+            _ => Err(crate::per::PerError::DecodeError(format!(
+                "Invalid Criticality value: {value}"
+            ))),
         }
     }
 }
@@ -115,7 +115,6 @@ impl ProcedureCode {
     pub const ENB_EARLY_STATUS_TRANSFER: Self = Self(65);
     pub const MME_EARLY_STATUS_TRANSFER: Self = Self(66);
 }
-
 
 impl AperEncode for ProcedureCode {
     fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()> {
@@ -278,9 +277,9 @@ impl AperDecode for TriggeringMessage {
             0 => Ok(TriggeringMessage::InitiatingMessage),
             1 => Ok(TriggeringMessage::SuccessfulOutcome),
             2 => Ok(TriggeringMessage::UnsuccessfulOutcome),
-            _ => Err(crate::per::PerError::DecodeError(
-                format!("Invalid TriggeringMessage value: {value}")
-            )),
+            _ => Err(crate::per::PerError::DecodeError(format!(
+                "Invalid TriggeringMessage value: {value}"
+            ))),
         }
     }
 }
@@ -312,9 +311,9 @@ impl AperDecode for Presence {
             0 => Ok(Presence::Optional),
             1 => Ok(Presence::Conditional),
             2 => Ok(Presence::Mandatory),
-            _ => Err(crate::per::PerError::DecodeError(
-                format!("Invalid Presence value: {value}")
-            )),
+            _ => Err(crate::per::PerError::DecodeError(format!(
+                "Invalid Presence value: {value}"
+            ))),
         }
     }
 }

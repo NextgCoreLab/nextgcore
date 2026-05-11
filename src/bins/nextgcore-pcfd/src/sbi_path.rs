@@ -90,7 +90,14 @@ fn parse_uri_host_port(uri_str: &str) -> Result<(String, u16), String> {
     let (host, port_str) = if let Some(idx) = stripped.rfind(':') {
         (&stripped[..idx], &stripped[idx + 1..])
     } else {
-        (stripped, if uri_str.starts_with("https") { "443" } else { "80" })
+        (
+            stripped,
+            if uri_str.starts_with("https") {
+                "443"
+            } else {
+                "80"
+            },
+        )
     };
     let port: u16 = port_str
         .split('/')
@@ -108,10 +115,7 @@ async fn register_with_nrf(nrf_uri: &str, nf_instance: &NfInstance) -> Result<()
     let ctx = global_context();
     let client = ctx.get_client(&host, port).await;
 
-    let register_path = format!(
-        "/nnrf-nfm/v1/nf-instances/{}",
-        nf_instance.id
-    );
+    let register_path = format!("/nnrf-nfm/v1/nf-instances/{}", nf_instance.id);
 
     let body = serde_json::json!({
         "nfInstanceId": nf_instance.id,
@@ -131,10 +135,7 @@ async fn register_with_nrf(nrf_uri: &str, nf_instance: &NfInstance) -> Result<()
         }).collect::<Vec<_>>(),
     });
 
-    match client
-        .put_json(&register_path, &body)
-        .await
-    {
+    match client.put_json(&register_path, &body).await {
         Ok(response) => {
             let status = response.status;
             if status == 200 || status == 201 {
@@ -147,8 +148,7 @@ async fn register_with_nrf(nrf_uri: &str, nf_instance: &NfInstance) -> Result<()
             } else {
                 let msg = format!(
                     "NRF registration returned status {}: {:?}",
-                    status,
-                    response.http.content
+                    status, response.http.content
                 );
                 log::warn!("{msg}");
                 // Non-fatal: PCF can operate without NRF
@@ -166,17 +166,13 @@ async fn register_with_nrf(nrf_uri: &str, nf_instance: &NfInstance) -> Result<()
 /// Open SBI server and register with NRF
 /// Port of pcf_sbi_open() from sbi-path.c
 pub fn pcf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
-    let config = config.unwrap_or(SbiServerConfig::default());
+    let config = config.unwrap_or_default();
 
     if SBI_SERVER_RUNNING.load(Ordering::SeqCst) {
         return Err("SBI server already running".to_string());
     }
 
-    log::info!(
-        "Opening PCF SBI server on {}:{}",
-        config.addr,
-        config.port
-    );
+    log::info!("Opening PCF SBI server on {}:{}", config.addr, config.port);
 
     // Build and register the PCF NF instance
     let nf_instance = build_pcf_nf_instance(&config);
@@ -257,9 +253,7 @@ pub fn pcf_sbi_is_running() -> bool {
 /// Send AM policy control notify to AMF
 /// Port of pcf_sbi_send_am_policy_control_notify() from sbi-path.c
 pub fn pcf_sbi_send_am_policy_control_notify(pcf_ue_am_id: u64) -> bool {
-    log::debug!(
-        "[ue_am_id={pcf_ue_am_id}] Sending AM policy control notify"
-    );
+    log::debug!("[ue_am_id={pcf_ue_am_id}] Sending AM policy control notify");
 
     // In C implementation:
     // 1. Get pcf_ue_am from ID
@@ -273,10 +267,7 @@ pub fn pcf_sbi_send_am_policy_control_notify(pcf_ue_am_id: u64) -> bool {
 
 /// Send SM policy control create response
 /// Port of pcf_sbi_send_smpolicycontrol_create_response() from sbi-path.c
-pub fn pcf_sbi_send_smpolicycontrol_create_response(
-    sess_id: u64,
-    stream_id: u64,
-) -> bool {
+pub fn pcf_sbi_send_smpolicycontrol_create_response(sess_id: u64, stream_id: u64) -> bool {
     log::debug!(
         "[sess_id={sess_id}, stream_id={stream_id}] Sending SM policy control create response"
     );
@@ -300,9 +291,7 @@ pub fn pcf_sbi_send_smpolicycontrol_create_response(
 /// Send SM policy control update notify to SMF
 /// Port of pcf_sbi_send_smpolicycontrol_update_notify() from sbi-path.c
 pub fn pcf_sbi_send_smpolicycontrol_update_notify(sess_id: u64) -> bool {
-    log::debug!(
-        "[sess_id={sess_id}] Sending SM policy control update notify"
-    );
+    log::debug!("[sess_id={sess_id}] Sending SM policy control update notify");
 
     // In C implementation:
     // 1. Get session from ID
@@ -316,10 +305,7 @@ pub fn pcf_sbi_send_smpolicycontrol_update_notify(sess_id: u64) -> bool {
 
 /// Send SM policy control delete notify to SMF
 /// Port of pcf_sbi_send_smpolicycontrol_delete_notify() from sbi-path.c
-pub fn pcf_sbi_send_smpolicycontrol_delete_notify(
-    sess_id: u64,
-    app_session_id: u64,
-) -> bool {
+pub fn pcf_sbi_send_smpolicycontrol_delete_notify(sess_id: u64, app_session_id: u64) -> bool {
     log::debug!(
         "[sess_id={sess_id}, app_id={app_session_id}] Sending SM policy control delete notify"
     );
@@ -338,9 +324,7 @@ pub fn pcf_sbi_send_smpolicycontrol_delete_notify(
 /// Send policy authorization terminate notify to AF
 /// Port of pcf_sbi_send_policyauthorization_terminate_notify() from sbi-path.c
 pub fn pcf_sbi_send_policyauthorization_terminate_notify(app_id: u64) -> bool {
-    log::debug!(
-        "[app_id={app_id}] Sending policy authorization terminate notify"
-    );
+    log::debug!("[app_id={app_id}] Sending policy authorization terminate notify");
 
     // In C implementation:
     // 1. Get app session from ID
@@ -379,9 +363,7 @@ pub fn pcf_sess_sbi_discover_and_send(
     stream_id: u64,
     service_type: &str,
 ) -> Result<(), String> {
-    log::debug!(
-        "[sess_id={sess_id}, stream_id={stream_id}] Discover and send to {service_type}"
-    );
+    log::debug!("[sess_id={sess_id}, stream_id={stream_id}] Discover and send to {service_type}");
 
     // In C implementation:
     // 1. Create SBI transaction

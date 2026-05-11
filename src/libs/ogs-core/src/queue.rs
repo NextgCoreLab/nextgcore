@@ -154,7 +154,10 @@ impl<T> OgsQueue<T> {
                     }
                 } else {
                     // Infinite wait
-                    guard = self.not_empty.wait(guard).unwrap_or_else(|e| e.into_inner());
+                    guard = self
+                        .not_empty
+                        .wait(guard)
+                        .unwrap_or_else(|e| e.into_inner());
                     guard.empty_waiters -= 1;
                 }
             }

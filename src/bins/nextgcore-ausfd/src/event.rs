@@ -81,8 +81,7 @@ impl AusfTimerId {
 }
 
 /// SBI message data for events
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SbiEventData {
     /// Request data (if any)
     pub request: Option<SbiRequest>,
@@ -95,7 +94,6 @@ pub struct SbiEventData {
     /// Generic data pointer (for xact, nf_instance, etc.)
     pub data: Option<u64>,
 }
-
 
 /// Simplified SBI request representation
 #[derive(Debug, Clone)]

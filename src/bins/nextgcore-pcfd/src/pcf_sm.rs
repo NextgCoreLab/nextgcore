@@ -5,7 +5,10 @@
 use crate::am_sm::{PcfAmSmContext, PcfAmState};
 use crate::context::{pcf_self, PcfApp, PcfSess, PcfUeAm, PcfUeSm};
 use crate::event::{PcfEvent, PcfEventId, PcfTimerId};
-use crate::sbi_response::{send_error_response, send_not_found_response, send_user_unknown_response, send_gateway_timeout_response};
+use crate::sbi_response::{
+    send_error_response, send_gateway_timeout_response, send_not_found_response,
+    send_user_unknown_response,
+};
 use crate::sm_sm::{PcfSmSmContext, PcfSmState};
 
 /// PCF state type
@@ -133,7 +136,11 @@ impl PcfSmContext {
         // Check API version
         if api_version != "v1" {
             log::error!("Not supported version [{api_version}]");
-            send_error_response(stream_id, 400, &format!("Unsupported API version: {api_version}"));
+            send_error_response(
+                stream_id,
+                400,
+                &format!("Unsupported API version: {api_version}"),
+            );
             return;
         }
 
@@ -143,13 +150,28 @@ impl PcfSmContext {
                 self.handle_nnrf_nfm_request(&method, &resource_components, stream_id);
             }
             "npcf-am-policy-control" => {
-                self.handle_am_policy_control_request(event, &method, &resource_components, stream_id);
+                self.handle_am_policy_control_request(
+                    event,
+                    &method,
+                    &resource_components,
+                    stream_id,
+                );
             }
             "npcf-smpolicycontrol" => {
-                self.handle_smpolicycontrol_request(event, &method, &resource_components, stream_id);
+                self.handle_smpolicycontrol_request(
+                    event,
+                    &method,
+                    &resource_components,
+                    stream_id,
+                );
             }
             "npcf-policyauthorization" => {
-                self.handle_policyauthorization_request(event, &method, &resource_components, stream_id);
+                self.handle_policyauthorization_request(
+                    event,
+                    &method,
+                    &resource_components,
+                    stream_id,
+                );
             }
             _ => {
                 log::error!("Invalid API name [{service_name}]");
@@ -158,7 +180,12 @@ impl PcfSmContext {
         }
     }
 
-    fn handle_nnrf_nfm_request(&mut self, method: &str, resource_components: &[String], _stream_id: u64) {
+    fn handle_nnrf_nfm_request(
+        &mut self,
+        method: &str,
+        resource_components: &[String],
+        _stream_id: u64,
+    ) {
         let resource = resource_components.first().map(|s| s.as_str());
 
         match resource {
@@ -192,15 +219,22 @@ impl PcfSmContext {
             "POST" => {
                 // Extract SUPI from PolicyAssociationRequest
                 // For now, use resource component as SUPI placeholder
-                let supi = resource_components.first().map(|s| s.as_str()).unwrap_or("unknown");
+                let supi = resource_components
+                    .first()
+                    .map(|s| s.as_str())
+                    .unwrap_or("unknown");
                 drop(context);
                 let ctx = pcf_self();
                 let context = ctx.read().unwrap();
-                context.ue_am_find_by_supi(supi).or_else(|| context.ue_am_add(supi))
+                context
+                    .ue_am_find_by_supi(supi)
+                    .or_else(|| context.ue_am_add(supi))
             }
             "DELETE" => {
                 // Find by association ID
-                resource_components.get(1).and_then(|assoc_id| context.ue_am_find_by_association_id(assoc_id))
+                resource_components
+                    .get(1)
+                    .and_then(|assoc_id| context.ue_am_find_by_association_id(assoc_id))
             }
             _ => None,
         };
@@ -215,7 +249,10 @@ impl PcfSmContext {
         };
 
         // Get or create AM state machine
-        let am_sm = self.am_sms.entry(pcf_ue_am.id).or_insert_with(|| PcfAmSmContext::new(pcf_ue_am.id));
+        let am_sm = self
+            .am_sms
+            .entry(pcf_ue_am.id)
+            .or_insert_with(|| PcfAmSmContext::new(pcf_ue_am.id));
 
         // Set event data
         event.pcf_ue_am_id = Some(pcf_ue_am.id);
@@ -242,7 +279,6 @@ impl PcfSmContext {
         }
     }
 
-
     fn handle_smpolicycontrol_request(
         &mut self,
         event: &mut PcfEvent,
@@ -251,51 +287,57 @@ impl PcfSmContext {
         stream_id: u64,
     ) {
         // Find or create session
-        let (sess, pcf_ue_sm): (Option<PcfSess>, Option<PcfUeSm>) = if resource_components.get(1).is_none() {
-            // POST /sm-policies - need SUPI and PSI from SmPolicyContextData
-            // For now, use placeholder
-            let supi = resource_components.first().map(|s| s.as_str()).unwrap_or("unknown");
-            let psi = 1u8; // Placeholder
+        let (sess, pcf_ue_sm): (Option<PcfSess>, Option<PcfUeSm>) =
+            if resource_components.get(1).is_none() {
+                // POST /sm-policies - need SUPI and PSI from SmPolicyContextData
+                // For now, use placeholder
+                let supi = resource_components
+                    .first()
+                    .map(|s| s.as_str())
+                    .unwrap_or("unknown");
+                let psi = 1u8; // Placeholder
 
-            // First try to find existing UE SM
-            let ctx = pcf_self();
-            let context = ctx.read().unwrap();
-            let mut pcf_ue_sm = context.ue_sm_find_by_supi(supi);
-            drop(context);
-
-            // Create if not found and method is POST
-            if pcf_ue_sm.is_none() && method == "POST" {
+                // First try to find existing UE SM
                 let ctx = pcf_self();
                 let context = ctx.read().unwrap();
-                pcf_ue_sm = context.ue_sm_add(supi);
-            }
-
-            if let Some(ref ue_sm) = pcf_ue_sm {
-                // First try to find existing session
-                let ctx = pcf_self();
-                let context = ctx.read().unwrap();
-                let mut sess = context.sess_find_by_psi(ue_sm.id, psi);
+                let mut pcf_ue_sm = context.ue_sm_find_by_supi(supi);
                 drop(context);
 
                 // Create if not found and method is POST
-                if sess.is_none() && method == "POST" {
+                if pcf_ue_sm.is_none() && method == "POST" {
                     let ctx = pcf_self();
                     let context = ctx.read().unwrap();
-                    sess = context.sess_add(ue_sm.id, psi);
+                    pcf_ue_sm = context.ue_sm_add(supi);
                 }
-                (sess, Some(ue_sm.clone()))
+
+                if let Some(ref ue_sm) = pcf_ue_sm {
+                    // First try to find existing session
+                    let ctx = pcf_self();
+                    let context = ctx.read().unwrap();
+                    let mut sess = context.sess_find_by_psi(ue_sm.id, psi);
+                    drop(context);
+
+                    // Create if not found and method is POST
+                    if sess.is_none() && method == "POST" {
+                        let ctx = pcf_self();
+                        let context = ctx.read().unwrap();
+                        sess = context.sess_add(ue_sm.id, psi);
+                    }
+                    (sess, Some(ue_sm.clone()))
+                } else {
+                    (None, None)
+                }
             } else {
-                (None, None)
-            }
-        } else {
-            // Operations on existing policy - find by sm_policy_id
-            let sm_policy_id = resource_components.get(1).expect("value expected");
-            let ctx = pcf_self();
-            let context = ctx.read().unwrap();
-            let sess = context.sess_find_by_sm_policy_id(sm_policy_id);
-            let pcf_ue_sm = sess.as_ref().and_then(|s| context.ue_sm_find_by_id(s.pcf_ue_sm_id));
-            (sess, pcf_ue_sm)
-        };
+                // Operations on existing policy - find by sm_policy_id
+                let sm_policy_id = resource_components.get(1).expect("value expected");
+                let ctx = pcf_self();
+                let context = ctx.read().unwrap();
+                let sess = context.sess_find_by_sm_policy_id(sm_policy_id);
+                let pcf_ue_sm = sess
+                    .as_ref()
+                    .and_then(|s| context.ue_sm_find_by_id(s.pcf_ue_sm_id));
+                (sess, pcf_ue_sm)
+            };
 
         let sess = match sess {
             Some(s) => s,
@@ -315,7 +357,10 @@ impl PcfSmContext {
         };
 
         // Get or create SM state machine
-        let sm_sm = self.sm_sms.entry(sess.id).or_insert_with(|| PcfSmSmContext::new(sess.id, pcf_ue_sm.id));
+        let sm_sm = self
+            .sm_sms
+            .entry(sess.id)
+            .or_insert_with(|| PcfSmSmContext::new(sess.id, pcf_ue_sm.id));
 
         // Set event data
         event.sess_id = Some(sess.id);
@@ -345,17 +390,20 @@ impl PcfSmContext {
         let context = ctx.read().unwrap();
 
         // Find session by IP address or app_session_id
-        let (sess, app_session): (Option<PcfSess>, Option<PcfApp>) = if resource_components.get(1).is_none() {
-            // POST /app-sessions - find by IP address
-            // For now, use placeholder
-            (None, None)
-        } else {
-            // Operations on existing app session
-            let app_session_id = resource_components.get(1).expect("value expected");
-            let app = context.app_find_by_app_session_id(app_session_id);
-            let sess = app.as_ref().and_then(|a| context.sess_find_by_id(a.sess_id));
-            (sess, app)
-        };
+        let (sess, app_session): (Option<PcfSess>, Option<PcfApp>) =
+            if resource_components.get(1).is_none() {
+                // POST /app-sessions - find by IP address
+                // For now, use placeholder
+                (None, None)
+            } else {
+                // Operations on existing app session
+                let app_session_id = resource_components.get(1).expect("value expected");
+                let app = context.app_find_by_app_session_id(app_session_id);
+                let sess = app
+                    .as_ref()
+                    .and_then(|a| context.sess_find_by_id(a.sess_id));
+                (sess, app)
+            };
 
         let sess = match sess {
             Some(s) => s,
@@ -375,7 +423,10 @@ impl PcfSmContext {
         };
 
         // Get or create SM state machine
-        let sm_sm = self.sm_sms.entry(sess.id).or_insert_with(|| PcfSmSmContext::new(sess.id, pcf_ue_sm.id));
+        let sm_sm = self
+            .sm_sms
+            .entry(sess.id)
+            .or_insert_with(|| PcfSmSmContext::new(sess.id, pcf_ue_sm.id));
 
         // Set event data
         event.sess_id = Some(sess.id);
@@ -497,7 +548,8 @@ impl PcfSmContext {
                                 if am_sm.state() == PcfAmState::Exception {
                                     let ctx = pcf_self();
                                     let context = ctx.read().unwrap();
-                                    if let Some(pcf_ue_am) = context.ue_am_find_by_id(pcf_ue_am_id) {
+                                    if let Some(pcf_ue_am) = context.ue_am_find_by_id(pcf_ue_am_id)
+                                    {
                                         log::error!("[{}] State machine exception", pcf_ue_am.supi);
                                     }
                                     self.am_sms.remove(&pcf_ue_am_id);
@@ -526,7 +578,11 @@ impl PcfSmContext {
         }
     }
 
-    fn handle_nbsf_management_response(&mut self, event: &mut PcfEvent, resource_components: &[String]) {
+    fn handle_nbsf_management_response(
+        &mut self,
+        event: &mut PcfEvent,
+        resource_components: &[String],
+    ) {
         let resource = resource_components.first().map(|s| s.as_str());
 
         match resource {
@@ -552,7 +608,11 @@ impl PcfSmContext {
                 if let Some(sess) = context.sess_find_by_id(sess_id) {
                     if let Some(pcf_ue_sm) = context.ue_sm_find_by_id(sess.pcf_ue_sm_id) {
                         if sm_sm.state() == PcfSmState::Exception {
-                            log::error!("[{}:{}] State machine exception", pcf_ue_sm.supi, sess.psi);
+                            log::error!(
+                                "[{}:{}] State machine exception",
+                                pcf_ue_sm.supi,
+                                sess.psi
+                            );
                         } else {
                             log::debug!("[{}:{}] PCF session removed", pcf_ue_sm.supi, sess.psi);
                         }

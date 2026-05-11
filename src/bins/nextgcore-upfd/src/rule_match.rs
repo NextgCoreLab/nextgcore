@@ -116,7 +116,12 @@ impl Ipv6Header {
             u32::from_be_bytes([self.daddr[0], self.daddr[1], self.daddr[2], self.daddr[3]]),
             u32::from_be_bytes([self.daddr[4], self.daddr[5], self.daddr[6], self.daddr[7]]),
             u32::from_be_bytes([self.daddr[8], self.daddr[9], self.daddr[10], self.daddr[11]]),
-            u32::from_be_bytes([self.daddr[12], self.daddr[13], self.daddr[14], self.daddr[15]]),
+            u32::from_be_bytes([
+                self.daddr[12],
+                self.daddr[13],
+                self.daddr[14],
+                self.daddr[15],
+            ]),
         ]
     }
 
@@ -127,7 +132,12 @@ impl Ipv6Header {
             u32::from_be_bytes([self.saddr[0], self.saddr[1], self.saddr[2], self.saddr[3]]),
             u32::from_be_bytes([self.saddr[4], self.saddr[5], self.saddr[6], self.saddr[7]]),
             u32::from_be_bytes([self.saddr[8], self.saddr[9], self.saddr[10], self.saddr[11]]),
-            u32::from_be_bytes([self.saddr[12], self.saddr[13], self.saddr[14], self.saddr[15]]),
+            u32::from_be_bytes([
+                self.saddr[12],
+                self.saddr[13],
+                self.saddr[14],
+                self.saddr[15],
+            ]),
         ]
     }
 }
@@ -171,7 +181,7 @@ pub fn upf_sess_find_by_ue_ip_address(data: &[u8]) -> Option<UpfSess> {
 
             // Safety: We've verified the buffer is large enough
             let ip_hdr = unsafe { &*(data.as_ptr() as *const Ipv4Header) };
-            
+
             // Verify version matches
             if ip_hdr.version() != IP_VERSION_4 {
                 log::error!("IPv4 version mismatch in header");
@@ -186,7 +196,10 @@ pub fn upf_sess_find_by_ue_ip_address(data: &[u8]) -> Option<UpfSess> {
                     let addr_bytes = ipv4.addr[0].to_be_bytes();
                     log::trace!(
                         "PAA IPv4:{}.{}.{}.{}",
-                        addr_bytes[0], addr_bytes[1], addr_bytes[2], addr_bytes[3]
+                        addr_bytes[0],
+                        addr_bytes[1],
+                        addr_bytes[2],
+                        addr_bytes[3]
                     );
                 }
             }
@@ -205,7 +218,7 @@ pub fn upf_sess_find_by_ue_ip_address(data: &[u8]) -> Option<UpfSess> {
 
             // Safety: We've verified the buffer is large enough
             let ip6_hdr = unsafe { &*(data.as_ptr() as *const Ipv6Header) };
-            
+
             let dst_addr = ip6_hdr.dst_addr();
             let sess = upf_self().sess_find_by_ipv6(&dst_addr);
 
@@ -373,7 +386,7 @@ mod tests {
     /// Create a minimal IPv4 packet for testing
     fn create_ipv4_packet(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
         let mut packet = vec![0u8; IPV4_MIN_HEADER_LEN];
-        
+
         // Version (4) and IHL (5 = 20 bytes)
         packet[0] = 0x45;
         // TOS
@@ -406,14 +419,14 @@ mod tests {
         packet[17] = dst_bytes[1];
         packet[18] = dst_bytes[2];
         packet[19] = dst_bytes[3];
-        
+
         packet
     }
 
     /// Create a minimal IPv6 packet for testing
     fn create_ipv6_packet(src: [u8; 16], dst: [u8; 16]) -> Vec<u8> {
         let mut packet = vec![0u8; IPV6_HEADER_LEN];
-        
+
         // Version (6), Traffic Class, Flow Label
         packet[0] = 0x60; // Version 6
         packet[1] = 0x00;
@@ -430,29 +443,27 @@ mod tests {
         packet[8..24].copy_from_slice(&src);
         // Destination address
         packet[24..40].copy_from_slice(&dst);
-        
+
         packet
     }
 
     #[test]
     fn test_ipv4_header_parsing() {
-        let packet = create_ipv4_packet(
-            Ipv4Addr::new(10, 0, 0, 1),
-            Ipv4Addr::new(192, 168, 1, 100),
-        );
-        
+        let packet =
+            create_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(192, 168, 1, 100));
+
         let ip_hdr = unsafe { &*(packet.as_ptr() as *const Ipv4Header) };
-        
+
         assert_eq!(ip_hdr.version(), 4);
         assert_eq!(ip_hdr.header_len(), 20);
-        
+
         // Check destination address - stored in network byte order
         // The raw u32 value is what we get from the header
         let dst = ip_hdr.dst_addr();
         // Convert to native byte order to get the expected IP
         let dst_native = u32::from_be(dst);
         assert_eq!(dst_native, u32::from_be_bytes([192, 168, 1, 100]));
-        
+
         // Check source address
         let src = ip_hdr.src_addr();
         let src_native = u32::from_be(src);
@@ -462,20 +473,20 @@ mod tests {
     #[test]
     fn test_ipv6_header_parsing() {
         let src = [
-            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
         ];
         let dst = [
-            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x02,
         ];
-        
+
         let packet = create_ipv6_packet(src, dst);
-        
+
         let ip6_hdr = unsafe { &*(packet.as_ptr() as *const Ipv6Header) };
-        
+
         assert_eq!(ip6_hdr.version(), 6);
-        
+
         // Check destination address
         let dst_addr = ip6_hdr.dst_addr();
         assert_eq!(dst_addr[0], 0x20010db8);
@@ -487,19 +498,17 @@ mod tests {
     #[test]
     fn test_get_ip_version() {
         // IPv4 packet
-        let ipv4_packet = create_ipv4_packet(
-            Ipv4Addr::new(10, 0, 0, 1),
-            Ipv4Addr::new(192, 168, 1, 100),
-        );
+        let ipv4_packet =
+            create_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(192, 168, 1, 100));
         assert_eq!(get_ip_version(&ipv4_packet), Some(4));
-        
+
         // IPv6 packet
         let ipv6_packet = create_ipv6_packet([0; 16], [0; 16]);
         assert_eq!(get_ip_version(&ipv6_packet), Some(6));
-        
+
         // Empty packet
         assert_eq!(get_ip_version(&[]), None);
-        
+
         // Invalid version
         let invalid = vec![0x30u8; 20]; // Version 3
         assert_eq!(get_ip_version(&invalid), None);
@@ -507,20 +516,18 @@ mod tests {
 
     #[test]
     fn test_get_ipv4_dst_addr() {
-        let packet = create_ipv4_packet(
-            Ipv4Addr::new(10, 0, 0, 1),
-            Ipv4Addr::new(192, 168, 1, 100),
-        );
-        
+        let packet =
+            create_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(192, 168, 1, 100));
+
         let dst = get_ipv4_dst_addr(&packet).unwrap();
         // The address is in network byte order (big-endian)
         // Convert to native to verify
         let dst_native = u32::from_be(dst);
         assert_eq!(dst_native, u32::from_be_bytes([192, 168, 1, 100]));
-        
+
         // Too short packet
         assert!(get_ipv4_dst_addr(&[0x45; 10]).is_none());
-        
+
         // Wrong version
         let ipv6_packet = create_ipv6_packet([0; 16], [0; 16]);
         assert!(get_ipv4_dst_addr(&ipv6_packet).is_none());
@@ -529,23 +536,21 @@ mod tests {
     #[test]
     fn test_get_ipv6_dst_addr() {
         let dst = [
-            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02,
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x02,
         ];
         let packet = create_ipv6_packet([0; 16], dst);
-        
+
         let dst_addr = get_ipv6_dst_addr(&packet).unwrap();
         assert_eq!(dst_addr[0], 0x20010db8);
         assert_eq!(dst_addr[3], 0x00000002);
-        
+
         // Too short packet
         assert!(get_ipv6_dst_addr(&[0x60; 20]).is_none());
-        
+
         // Wrong version
-        let ipv4_packet = create_ipv4_packet(
-            Ipv4Addr::new(10, 0, 0, 1),
-            Ipv4Addr::new(192, 168, 1, 100),
-        );
+        let ipv4_packet =
+            create_ipv4_packet(Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(192, 168, 1, 100));
         assert!(get_ipv6_dst_addr(&ipv4_packet).is_none());
     }
 
@@ -553,13 +558,13 @@ mod tests {
     fn test_invalid_packets() {
         // Empty packet
         assert!(upf_sess_find_by_ue_ip_address(&[]).is_none());
-        
+
         // Too short IPv4 packet
         assert!(upf_sess_find_by_ue_ip_address(&[0x45; 10]).is_none());
-        
+
         // Too short IPv6 packet
         assert!(upf_sess_find_by_ue_ip_address(&[0x60; 20]).is_none());
-        
+
         // Invalid IP version
         let invalid = vec![0x30u8; 40]; // Version 3
         assert!(upf_sess_find_by_ue_ip_address(&invalid).is_none());

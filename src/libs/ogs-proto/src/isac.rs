@@ -132,7 +132,7 @@ pub struct IsacResourceConfig {
 impl Default for IsacResourceConfig {
     fn default() -> Self {
         Self {
-            sensing_resource_ratio: 0.1,  // 10% for sensing
+            sensing_resource_ratio: 0.1, // 10% for sensing
             sensing_bandwidth_mhz: 100.0,
             symbols_per_burst: 14,
             periodicity_ms: 100,

@@ -3,15 +3,11 @@
 //! This module provides metric instances that hold actual metric values
 //! with specific label values.
 
+use crate::{spec::MetricsSpec, types::MetricType, MAX_LABELS};
 use std::sync::atomic::{AtomicI64, Ordering};
-use crate::{
-    MAX_LABELS,
-    types::MetricType,
-    spec::MetricsSpec,
-};
 
 /// Metric instance
-/// 
+///
 /// Represents a specific instance of a metric with concrete label values.
 /// For example, if a metric has labels ["method", "status"], an instance
 /// might have values ["GET", "200"].
@@ -34,14 +30,14 @@ pub struct MetricsInstance {
 
 impl MetricsInstance {
     /// Create a new metric instance
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `spec` - The metric specification
     /// * `label_values` - Values for each label defined in the spec
-    /// 
+    ///
     /// # Panics
-    /// 
+    ///
     /// Panics if the number of label values doesn't match the spec.
     pub fn new(spec: &MetricsSpec, label_values: &[&str]) -> Self {
         assert_eq!(
@@ -66,9 +62,7 @@ impl MetricsInstance {
             num_labels: label_values.len(),
             label_values: label_values.iter().map(|s| s.to_string()).collect(),
             value: AtomicI64::new(0),
-            histogram_observations: (0..histogram_buckets)
-                .map(|_| AtomicI64::new(0))
-                .collect(),
+            histogram_observations: (0..histogram_buckets).map(|_| AtomicI64::new(0)).collect(),
             histogram_sum: AtomicI64::new(0),
             histogram_count: AtomicI64::new(0),
         };
@@ -102,9 +96,9 @@ impl MetricsInstance {
     }
 
     /// Set the metric value (for gauges only)
-    /// 
+    ///
     /// # Panics
-    /// 
+    ///
     /// Panics if called on a non-gauge metric.
     pub fn set(&mut self, val: i64) {
         match self.spec.metric_type() {
@@ -140,7 +134,7 @@ impl MetricsInstance {
     }
 
     /// Add a value to the metric
-    /// 
+    ///
     /// For counters: adds the value (must be non-negative)
     /// For gauges: adds the value (can be negative)
     /// For histograms: observes the value
@@ -177,13 +171,12 @@ impl MetricsInstance {
 
         if let Some(params) = self.spec.histogram_params() {
             let buckets = params.generate_buckets();
-            
+
             // Increment the appropriate bucket(s)
             for (i, &upper_bound) in buckets.iter().enumerate() {
-                if val <= upper_bound
-                    && i < self.histogram_observations.len() {
-                        self.histogram_observations[i].fetch_add(1, Ordering::SeqCst);
-                    }
+                if val <= upper_bound && i < self.histogram_observations.len() {
+                    self.histogram_observations[i].fetch_add(1, Ordering::SeqCst);
+                }
             }
 
             // Update sum and count

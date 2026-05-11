@@ -55,7 +55,6 @@ pub enum PresenceState {
     Inactive,
 }
 
-
 /// SM Policy Data from UDR
 #[derive(Debug, Clone, Default)]
 pub struct SmPolicyData {
@@ -135,7 +134,6 @@ pub fn pcf_nudr_dr_handle_query_am_data(
                 log::error!("[{}] No UE-AMBR", pcf_ue_am.supi);
                 return NudrHandlerResult::error(HTTP_STATUS_NOT_FOUND, "No UE-AMBR");
             }
-
 
             // Build PolicyAssociation response
             // In C: This builds the full PolicyAssociation with:
@@ -219,10 +217,7 @@ pub fn pcf_nudr_dr_handle_query_sm_data(
                     sess.psi,
                     e
                 );
-                return NudrHandlerResult::error(
-                    HTTP_STATUS_FORBIDDEN,
-                    "POLICY_CONTEXT_DENIED",
-                );
+                return NudrHandlerResult::error(HTTP_STATUS_FORBIDDEN, "POLICY_CONTEXT_DENIED");
             }
 
             NudrHandlerResult::ok()
@@ -238,7 +233,6 @@ pub fn pcf_nudr_dr_handle_query_sm_data(
         }
     }
 }
-
 
 /// Public API for querying subscription data (used by AM policy handler)
 pub fn query_subscription_data_pub(supi: &str) -> Option<SubscriptionData> {
@@ -264,9 +258,7 @@ fn query_subscription_data(supi: &str) -> Option<SubscriptionData> {
             })
         }
         Err(e) => {
-            log::warn!(
-                "[{supi}] Failed to query subscription data from DB: {e}, using defaults"
-            );
+            log::warn!("[{supi}] Failed to query subscription data from DB: {e}, using defaults");
             // Fallback to default values when DB is unavailable
             Some(SubscriptionData {
                 ambr_uplink: 1000000000,   // 1 Gbps
@@ -284,9 +276,7 @@ pub fn pcf_get_session_data(
     s_nssai: &crate::context::SNssai,
     dnn: &str,
 ) -> Option<SessionData> {
-    log::debug!(
-        "Getting session data for SUPI={supi}, S-NSSAI={s_nssai:?}, DNN={dnn}"
-    );
+    log::debug!("Getting session data for SUPI={supi}, S-NSSAI={s_nssai:?}, DNN={dnn}");
 
     let ogs_snssai = ogs_dbi::OgsSNssai::new(s_nssai.sst, s_nssai.sd);
 
@@ -298,29 +288,24 @@ pub fn pcf_get_session_data(
             let pcc_rules = sess_data
                 .pcc_rule
                 .iter()
-                .map(|r| {
-                    PccRule {
-                        id: r.id.clone().expect("value expected"),
-                        precedence: r.precedence as u32,
-                        qos_index: r.qos.index,
-                        flow_status: crate::npcf_handler::FlowStatus::Enabled,
-                        flows: r
-                            .flow
-                            .iter()
-                            .map(|f| FlowDescription {
-                                direction: match f.direction {
-                                    1 => FlowDirection::Downlink,
-                                    2 => FlowDirection::Uplink,
-                                    3 => FlowDirection::Bidirectional,
-                                    _ => FlowDirection::Bidirectional,
-                                },
-                                description: f
-                                    .description
-                                    .clone()
-                                    .expect("value expected"),
-                            })
-                            .collect(),
-                    }
+                .map(|r| PccRule {
+                    id: r.id.clone().expect("value expected"),
+                    precedence: r.precedence as u32,
+                    qos_index: r.qos.index,
+                    flow_status: crate::npcf_handler::FlowStatus::Enabled,
+                    flows: r
+                        .flow
+                        .iter()
+                        .map(|f| FlowDescription {
+                            direction: match f.direction {
+                                1 => FlowDirection::Downlink,
+                                2 => FlowDirection::Uplink,
+                                3 => FlowDirection::Bidirectional,
+                                _ => FlowDirection::Bidirectional,
+                            },
+                            description: f.description.clone().expect("value expected"),
+                        })
+                        .collect(),
                 })
                 .collect();
 
@@ -345,9 +330,7 @@ pub fn pcf_get_session_data(
             })
         }
         Err(e) => {
-            log::warn!(
-                "[{supi}] Failed to query session data from DB: {e}, using defaults"
-            );
+            log::warn!("[{supi}] Failed to query session data from DB: {e}, using defaults");
             // Fallback to default values when DB is unavailable
             Some(SessionData {
                 qos_index: 9,

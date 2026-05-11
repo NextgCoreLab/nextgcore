@@ -97,7 +97,7 @@ pub fn ip_to_paa(ip: &IpAddr) -> Result<Paa, &'static str> {
 }
 
 /// Extract digits from a string
-/// 
+///
 /// Extracts the first contiguous sequence of digits from the string.
 pub fn extract_digit_from_string(string: &str) -> String {
     let mut result = String::new();
@@ -120,7 +120,7 @@ pub fn extract_digit_from_string(string: &str) -> String {
 }
 
 /// Build FQDN from labels
-/// 
+///
 /// Converts "example.com" to length-prefixed format: "\x07example\x03com"
 pub fn fqdn_build(src: &str) -> Vec<u8> {
     let mut result = Vec::new();
@@ -137,7 +137,7 @@ pub fn fqdn_build(src: &str) -> Vec<u8> {
 }
 
 /// Parse FQDN from length-prefixed format
-/// 
+///
 /// Converts "\x07example\x03com" to "example.com"
 pub fn fqdn_parse(data: &[u8]) -> Result<String, &'static str> {
     let mut result = String::new();
@@ -239,7 +239,9 @@ mod tests {
 
     #[test]
     fn test_fqdn_parse() {
-        let data = vec![7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm'];
+        let data = vec![
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm',
+        ];
         let result = fqdn_parse(&data).unwrap();
         assert_eq!(result, "example.com");
     }

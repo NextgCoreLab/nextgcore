@@ -314,7 +314,6 @@ impl SbiServiceType {
     }
 }
 
-
 /// Discovery option for NF discovery
 #[derive(Debug, Clone, Default)]
 pub struct DiscoveryOption {
@@ -513,7 +512,10 @@ impl ScpContext {
         let mut assoc_list = self.assoc_list.write().ok()?;
 
         if assoc_list.len() >= self.max_num_of_assoc {
-            log::error!("Maximum number of associations [{}] reached", self.max_num_of_assoc);
+            log::error!(
+                "Maximum number of associations [{}] reached",
+                self.max_num_of_assoc
+            );
             return None;
         }
 
@@ -587,7 +589,8 @@ impl Default for ScpContext {
 }
 
 /// Global SCP context (thread-safe singleton)
-static GLOBAL_SCP_CONTEXT: std::sync::OnceLock<Arc<RwLock<ScpContext>>> = std::sync::OnceLock::new();
+static GLOBAL_SCP_CONTEXT: std::sync::OnceLock<Arc<RwLock<ScpContext>>> =
+    std::sync::OnceLock::new();
 
 /// Get the global SCP context
 pub fn scp_self() -> Arc<RwLock<ScpContext>> {
@@ -674,7 +677,10 @@ mod tests {
 
     #[test]
     fn test_sbi_service_type_conversion() {
-        assert_eq!(SbiServiceType::from_name("nnrf-nfm"), SbiServiceType::NnrfNfm);
+        assert_eq!(
+            SbiServiceType::from_name("nnrf-nfm"),
+            SbiServiceType::NnrfNfm
+        );
         assert_eq!(SbiServiceType::NnrfNfm.to_name(), "nnrf-nfm");
     }
 

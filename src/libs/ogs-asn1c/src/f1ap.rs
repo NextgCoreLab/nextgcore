@@ -4,7 +4,7 @@
 //! gNB (O-RAN / RAN disaggregation). Supports UE context management,
 //! RRC message transfer, and DU resource coordination.
 
-use crate::per::{AperEncoder, AperDecoder, Constraint, PerError, PerResult};
+use crate::per::{AperDecoder, AperEncoder, Constraint, PerError, PerResult};
 
 // ============================================================================
 // F1AP Procedure Codes
@@ -165,7 +165,9 @@ pub struct RrcVersion {
 
 impl Default for RrcVersion {
     fn default() -> Self {
-        Self { latest_rrc_version: 16 } // NR Rel-16
+        Self {
+            latest_rrc_version: 16,
+        } // NR Rel-16
     }
 }
 
@@ -206,17 +208,20 @@ pub struct GtpTunnelInfo {
 pub fn encode_f1_setup_request(msg: &F1SetupRequest) -> PerResult<Vec<u8>> {
     let mut encoder = AperEncoder::new();
     // Procedure code
-    encoder.encode_constrained_whole_number(F1ApProcedure::F1Setup as i64, &Constraint::new(0, 255))?;
+    encoder
+        .encode_constrained_whole_number(F1ApProcedure::F1Setup as i64, &Constraint::new(0, 255))?;
     // Criticality: reject
     encoder.encode_constrained_whole_number(0, &Constraint::new(0, 2))?;
     // gNB-DU ID
     encoder.encode_unconstrained_whole_number(msg.gnb_du_id as i64)?;
     // Served cells count
-    encoder.encode_constrained_whole_number(msg.served_cells.len() as i64, &Constraint::new(1, 512))?;
+    encoder
+        .encode_constrained_whole_number(msg.served_cells.len() as i64, &Constraint::new(1, 512))?;
     for cell in &msg.served_cells {
         encoder.encode_unconstrained_whole_number(cell.nr_cgi as i64)?;
         encoder.encode_constrained_whole_number(cell.nr_pci as i64, &Constraint::new(0, 1007))?;
-        encoder.encode_constrained_whole_number(cell.nr_arfcn as i64, &Constraint::new(0, 3279165))?;
+        encoder
+            .encode_constrained_whole_number(cell.nr_arfcn as i64, &Constraint::new(0, 3279165))?;
     }
     Ok(encoder.into_bytes().to_vec())
 }
@@ -224,7 +229,10 @@ pub fn encode_f1_setup_request(msg: &F1SetupRequest) -> PerResult<Vec<u8>> {
 /// Encode a DL RRC Message Transfer.
 pub fn encode_dl_rrc_message_transfer(msg: &DlRrcMessageTransfer) -> PerResult<Vec<u8>> {
     let mut encoder = AperEncoder::new();
-    encoder.encode_constrained_whole_number(F1ApProcedure::DlRrcMessageTransfer as i64, &Constraint::new(0, 255))?;
+    encoder.encode_constrained_whole_number(
+        F1ApProcedure::DlRrcMessageTransfer as i64,
+        &Constraint::new(0, 255),
+    )?;
     encoder.encode_constrained_whole_number(0, &Constraint::new(0, 2))?;
     encoder.encode_unconstrained_whole_number(msg.gnb_cu_ue_f1ap_id as i64)?;
     encoder.encode_unconstrained_whole_number(msg.gnb_du_ue_f1ap_id as i64)?;
@@ -246,7 +254,9 @@ pub fn decode_f1ap_procedure(data: &[u8]) -> PerResult<F1ApProcedure> {
         11 => Ok(F1ApProcedure::DlRrcMessageTransfer),
         12 => Ok(F1ApProcedure::UlRrcMessageTransfer),
         20 => Ok(F1ApProcedure::Paging),
-        _ => Err(PerError::DecodeError(format!("Unknown F1AP procedure: {code}"))),
+        _ => Err(PerError::DecodeError(format!(
+            "Unknown F1AP procedure: {code}"
+        ))),
     }
 }
 

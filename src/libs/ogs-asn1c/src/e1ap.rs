@@ -3,7 +3,7 @@
 //! E1 Application Protocol for the CU-CP to CU-UP interface within a
 //! disaggregated gNB. Manages bearer context lifecycle and QoS flows.
 
-use crate::per::{AperEncoder, AperDecoder, Constraint, PerError, PerResult};
+use crate::per::{AperDecoder, AperEncoder, Constraint, PerError, PerResult};
 
 // ============================================================================
 // E1AP Procedure Codes
@@ -251,7 +251,10 @@ pub enum E1Cause {
 /// Encode a GNB-CU-UP E1 Setup Request.
 pub fn encode_gnb_cu_up_e1_setup_request(msg: &GnbCuUpE1SetupRequest) -> PerResult<Vec<u8>> {
     let mut encoder = AperEncoder::new();
-    encoder.encode_constrained_whole_number(E1ApProcedure::GnbCuUpE1Setup as i64, &Constraint::new(0, 255))?;
+    encoder.encode_constrained_whole_number(
+        E1ApProcedure::GnbCuUpE1Setup as i64,
+        &Constraint::new(0, 255),
+    )?;
     encoder.encode_constrained_whole_number(0, &Constraint::new(0, 2))?; // Criticality
     encoder.encode_unconstrained_whole_number(msg.gnb_cu_up_id as i64)?;
     let cn = match msg.cn_support {
@@ -260,7 +263,10 @@ pub fn encode_gnb_cu_up_e1_setup_request(msg: &GnbCuUpE1SetupRequest) -> PerResu
         CnSupport::EpcAnd5Gc => 2,
     };
     encoder.encode_constrained_whole_number(cn, &Constraint::new(0, 2))?;
-    encoder.encode_constrained_whole_number(msg.supported_plmns.len() as i64, &Constraint::new(1, 12))?;
+    encoder.encode_constrained_whole_number(
+        msg.supported_plmns.len() as i64,
+        &Constraint::new(1, 12),
+    )?;
     for plmn in &msg.supported_plmns {
         encoder.encode_octet_string(&plmn.plmn_id, Some(3), Some(3))?;
     }
@@ -270,12 +276,18 @@ pub fn encode_gnb_cu_up_e1_setup_request(msg: &GnbCuUpE1SetupRequest) -> PerResu
 /// Encode a Bearer Context Setup Request.
 pub fn encode_bearer_context_setup_request(msg: &BearerContextSetupRequest) -> PerResult<Vec<u8>> {
     let mut encoder = AperEncoder::new();
-    encoder.encode_constrained_whole_number(E1ApProcedure::BearerContextSetup as i64, &Constraint::new(0, 255))?;
+    encoder.encode_constrained_whole_number(
+        E1ApProcedure::BearerContextSetup as i64,
+        &Constraint::new(0, 255),
+    )?;
     encoder.encode_constrained_whole_number(0, &Constraint::new(0, 2))?;
     encoder.encode_unconstrained_whole_number(msg.gnb_cu_cp_ue_e1ap_id as i64)?;
     encoder.encode_unconstrained_whole_number(msg.ue_dl_aggregate_mbr as i64)?;
     encoder.encode_octet_string(&msg.serving_plmn, Some(3), Some(3))?;
-    encoder.encode_constrained_whole_number(msg.pdu_session_resources.len() as i64, &Constraint::new(1, 256))?;
+    encoder.encode_constrained_whole_number(
+        msg.pdu_session_resources.len() as i64,
+        &Constraint::new(1, 256),
+    )?;
     Ok(encoder.into_bytes().to_vec())
 }
 
@@ -289,7 +301,9 @@ pub fn decode_e1ap_procedure(data: &[u8]) -> PerResult<E1ApProcedure> {
         5 => Ok(E1ApProcedure::BearerContextSetup),
         6 => Ok(E1ApProcedure::BearerContextModification),
         7 => Ok(E1ApProcedure::BearerContextRelease),
-        _ => Err(PerError::DecodeError(format!("Unknown E1AP procedure: {code}"))),
+        _ => Err(PerError::DecodeError(format!(
+            "Unknown E1AP procedure: {code}"
+        ))),
     }
 }
 
@@ -349,7 +363,11 @@ mod tests {
                     drb_id: 1,
                     pdcp_sn_size_ul: 18,
                     pdcp_sn_size_dl: 18,
-                    qos_flows: vec![QosFlowInfo { qfi: 1, five_qi: 9, priority: 1 }],
+                    qos_flows: vec![QosFlowInfo {
+                        qfi: 1,
+                        five_qi: 9,
+                        priority: 1,
+                    }],
                 }],
             }],
         };

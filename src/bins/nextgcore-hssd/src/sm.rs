@@ -193,7 +193,10 @@ impl HssSmContext {
             }
         };
 
-        log::debug!("HSS SM: Processing change stream document ({} bytes)", document.len());
+        log::debug!(
+            "HSS SM: Processing change stream document ({} bytes)",
+            document.len()
+        );
         // Note: Call hss_handle_change_event(document)
         // Change event handling updates subscriber data in the context based on MongoDB notifications
     }

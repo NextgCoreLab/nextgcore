@@ -2,7 +2,6 @@
 //!
 //! Port of src/mme/sgsap-build.c - SGsAP message building functions
 
-
 // ============================================================================
 // SGsAP Message Types
 // ============================================================================
@@ -123,7 +122,6 @@ impl From<u8> for SgsapCause {
     }
 }
 
-
 // ============================================================================
 // EPS Location Update Type
 // ============================================================================
@@ -175,7 +173,9 @@ pub struct SgsapBuffer {
 
 impl SgsapBuffer {
     pub fn new() -> Self {
-        Self { data: Vec::with_capacity(512) }
+        Self {
+            data: Vec::with_capacity(512),
+        }
     }
 
     pub fn data(&self) -> &[u8] {
@@ -227,7 +227,6 @@ impl SgsapBuffer {
     pub fn write_eps_location_update_type(&mut self, update_type: EpsLocationUpdateType) {
         self.write_tlv(ie_type::EPS_LOCATION_UPDATE_TYPE, &[update_type as u8]);
     }
-
 
     /// Write LAI IE
     pub fn write_lai(&mut self, plmn: &[u8; 3], lac: u16) {
@@ -323,7 +322,6 @@ pub fn build_tmsi_reallocation_complete(imsi: &[u8]) -> Vec<u8> {
     buf.data().to_vec()
 }
 
-
 /// Build UE Activity Indication
 pub fn build_ue_activity_indication(imsi: &[u8]) -> Vec<u8> {
     let mut buf = SgsapBuffer::new();
@@ -333,11 +331,7 @@ pub fn build_ue_activity_indication(imsi: &[u8]) -> Vec<u8> {
 }
 
 /// Build EPS Detach Indication
-pub fn build_eps_detach_indication(
-    imsi: &[u8],
-    mme_name: &str,
-    detach_type: u8,
-) -> Vec<u8> {
+pub fn build_eps_detach_indication(imsi: &[u8], mme_name: &str, detach_type: u8) -> Vec<u8> {
     let mut buf = SgsapBuffer::new();
     buf.write_u8(message_type::EPS_DETACH_INDICATION);
     buf.write_imsi(imsi);
@@ -347,16 +341,15 @@ pub fn build_eps_detach_indication(
 }
 
 /// Build IMSI Detach Indication
-pub fn build_imsi_detach_indication(
-    imsi: &[u8],
-    mme_name: &str,
-    detach_type: u8,
-) -> Vec<u8> {
+pub fn build_imsi_detach_indication(imsi: &[u8], mme_name: &str, detach_type: u8) -> Vec<u8> {
     let mut buf = SgsapBuffer::new();
     buf.write_u8(message_type::IMSI_DETACH_INDICATION);
     buf.write_imsi(imsi);
     buf.write_mme_name(mme_name);
-    buf.write_tlv(ie_type::IMSI_DETACH_FROM_NON_EPS_SERVICE_TYPE, &[detach_type]);
+    buf.write_tlv(
+        ie_type::IMSI_DETACH_FROM_NON_EPS_SERVICE_TYPE,
+        &[detach_type],
+    );
     buf.data().to_vec()
 }
 
@@ -443,7 +436,6 @@ pub fn build_release_request(imsi: &[u8], cause: SgsapCause) -> Vec<u8> {
     buf.data().to_vec()
 }
 
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -518,7 +510,10 @@ mod tests {
     fn test_sgsap_cause_from_u8() {
         assert_eq!(SgsapCause::from(0x04), SgsapCause::ImsiUnknown);
         assert_eq!(SgsapCause::from(0x07), SgsapCause::UeUnreachable);
-        assert_eq!(SgsapCause::from(0xff), SgsapCause::ImsiDetachedForEpsServices);
+        assert_eq!(
+            SgsapCause::from(0xff),
+            SgsapCause::ImsiDetachedForEpsServices
+        );
     }
 
     #[test]

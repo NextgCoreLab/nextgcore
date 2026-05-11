@@ -13,7 +13,10 @@ pub struct OgsLnode {
 
 impl OgsLnode {
     pub const fn new() -> Self {
-        OgsLnode { prev: None, next: None }
+        OgsLnode {
+            prev: None,
+            next: None,
+        }
     }
 }
 
@@ -26,13 +29,16 @@ impl Default for OgsLnode {
 /// Doubly-linked list head
 #[repr(C)]
 pub struct OgsList {
-    pub prev: Option<NonNull<OgsLnode>>,  // Points to last element
-    pub next: Option<NonNull<OgsLnode>>,  // Points to first element
+    pub prev: Option<NonNull<OgsLnode>>, // Points to last element
+    pub next: Option<NonNull<OgsLnode>>, // Points to first element
 }
 
 impl OgsList {
     pub const fn new() -> Self {
-        OgsList { prev: None, next: None }
+        OgsList {
+            prev: None,
+            next: None,
+        }
     }
 
     pub fn init(&mut self) {
@@ -53,14 +59,14 @@ impl OgsList {
     }
 
     /// Add node to end of list (identical to ogs_list_add)
-    /// 
+    ///
     /// # Safety
     /// The caller must ensure the node pointer is valid and not already in a list.
     pub unsafe fn add(&mut self, node: NonNull<OgsLnode>) {
         let node_ptr = node.as_ptr();
         (*node_ptr).prev = self.prev;
         (*node_ptr).next = None;
-        
+
         if let Some(prev) = self.prev {
             (*prev.as_ptr()).next = Some(node);
         } else {
@@ -70,14 +76,14 @@ impl OgsList {
     }
 
     /// Add node to beginning of list (identical to ogs_list_prepend)
-    /// 
+    ///
     /// # Safety
     /// The caller must ensure the node pointer is valid and not already in a list.
     pub unsafe fn prepend(&mut self, node: NonNull<OgsLnode>) {
         let node_ptr = node.as_ptr();
         (*node_ptr).prev = None;
         (*node_ptr).next = self.next;
-        
+
         if let Some(next) = self.next {
             (*next.as_ptr()).prev = Some(node);
         } else {
@@ -87,7 +93,7 @@ impl OgsList {
     }
 
     /// Remove node from list (identical to ogs_list_remove)
-    /// 
+    ///
     /// # Safety
     /// The caller must ensure the node is actually in this list.
     pub unsafe fn remove(&mut self, node: NonNull<OgsLnode>) {
@@ -112,16 +118,16 @@ impl OgsList {
     }
 
     /// Insert node after another node (identical to ogs_list_insert_next)
-    /// 
+    ///
     /// # Safety
     /// The caller must ensure both nodes are valid and `after` is in this list.
     pub unsafe fn insert_next(&mut self, after: NonNull<OgsLnode>, node: NonNull<OgsLnode>) {
         let after_ptr = after.as_ptr();
         let node_ptr = node.as_ptr();
-        
+
         (*node_ptr).prev = Some(after);
         (*node_ptr).next = (*after_ptr).next;
-        
+
         if let Some(next) = (*after_ptr).next {
             (*next.as_ptr()).prev = Some(node);
         } else {
@@ -131,16 +137,16 @@ impl OgsList {
     }
 
     /// Insert node before another node (identical to ogs_list_insert_prev)
-    /// 
+    ///
     /// # Safety
     /// The caller must ensure both nodes are valid and `before` is in this list.
     pub unsafe fn insert_prev(&mut self, before: NonNull<OgsLnode>, node: NonNull<OgsLnode>) {
         let before_ptr = before.as_ptr();
         let node_ptr = node.as_ptr();
-        
+
         (*node_ptr).next = Some(before);
         (*node_ptr).prev = (*before_ptr).prev;
-        
+
         if let Some(prev) = (*before_ptr).prev {
             (*prev.as_ptr()).next = Some(node);
         } else {
@@ -189,7 +195,7 @@ impl OgsList {
     }
 
     /// Check if a node exists in the list (identical to ogs_list_exists)
-    /// 
+    ///
     /// # Safety
     /// The caller must ensure the node pointer is valid.
     pub unsafe fn exists(&self, node: NonNull<OgsLnode>) -> bool {
@@ -209,7 +215,7 @@ impl OgsList {
     }
 
     /// Get the next node after the given node (identical to ogs_list_next)
-    /// 
+    ///
     /// # Safety
     /// The caller must ensure the node pointer is valid.
     pub unsafe fn next_node(node: NonNull<OgsLnode>) -> Option<NonNull<OgsLnode>> {
@@ -217,7 +223,7 @@ impl OgsList {
     }
 
     /// Get the previous node before the given node (identical to ogs_list_prev)
-    /// 
+    ///
     /// # Safety
     /// The caller must ensure the node pointer is valid.
     pub unsafe fn prev_node(node: NonNull<OgsLnode>) -> Option<NonNull<OgsLnode>> {
@@ -226,7 +232,7 @@ impl OgsList {
 
     /// Insert node in sorted order using a comparison function
     /// (identical to ogs_list_insert_sorted)
-    /// 
+    ///
     /// # Safety
     /// The caller must ensure the node pointer is valid and not already in a list.
     pub unsafe fn insert_sorted<F>(&mut self, node: NonNull<OgsLnode>, compare: F)
@@ -372,12 +378,12 @@ mod tests {
             );
 
             assert_eq!(list.count(), 3);
-            
+
             // Verify order: node1 -> node2 -> node3
             let first = list.first().unwrap();
             let second = OgsList::next_node(first).unwrap();
             let third = OgsList::next_node(second).unwrap();
-            
+
             assert_eq!(first, NonNull::new(&mut node1.lnode).unwrap());
             assert_eq!(second, NonNull::new(&mut node2.lnode).unwrap());
             assert_eq!(third, NonNull::new(&mut node3.lnode).unwrap());
@@ -402,12 +408,12 @@ mod tests {
             );
 
             assert_eq!(list.count(), 3);
-            
+
             // Verify order: node1 -> node2 -> node3
             let first = list.first().unwrap();
             let second = OgsList::next_node(first).unwrap();
             let third = OgsList::next_node(second).unwrap();
-            
+
             assert_eq!(first, NonNull::new(&mut node1.lnode).unwrap());
             assert_eq!(second, NonNull::new(&mut node2.lnode).unwrap());
             assert_eq!(third, NonNull::new(&mut node3.lnode).unwrap());
@@ -466,13 +472,13 @@ mod tests {
             });
 
             assert_eq!(list.count(), 4);
-            
+
             // Verify order: 1 -> 2 -> 3 -> 4
             let first = list.first().unwrap();
             let second = OgsList::next_node(first).unwrap();
             let third = OgsList::next_node(second).unwrap();
             let fourth = OgsList::next_node(third).unwrap();
-            
+
             assert_eq!(first, NonNull::new(&mut node1.lnode).unwrap());
             assert_eq!(second, NonNull::new(&mut node2.lnode).unwrap());
             assert_eq!(third, NonNull::new(&mut node3.lnode).unwrap());
@@ -497,7 +503,6 @@ mod tests {
         assert_eq!(nodes.len(), 3);
     }
 }
-
 
 #[cfg(test)]
 mod proptests {
@@ -600,9 +605,9 @@ mod proptests {
         }
 
         fn get_node_ptr(&self, idx: usize) -> Option<NonNull<OgsLnode>> {
-            self.nodes.get(idx).map(|n| {
-                NonNull::new(&n.lnode as *const _ as *mut OgsLnode).unwrap()
-            })
+            self.nodes
+                .get(idx)
+                .map(|n| NonNull::new(&n.lnode as *const _ as *mut OgsLnode).unwrap())
         }
     }
 
@@ -684,7 +689,7 @@ mod proptests {
                     ListOp::InsertPrevAt(idx, val) => {
                         let node_ptr = storage.add_node(*val);
                         let new_node_idx = storage.nodes.len() - 1;
-                        
+
                         if list_node_indices.is_empty() {
                             unsafe { list.add(node_ptr); }
                             list_node_indices.push(new_node_idx);
@@ -701,7 +706,7 @@ mod proptests {
                     ListOp::InsertNextAt(idx, val) => {
                         let node_ptr = storage.add_node(*val);
                         let new_node_idx = storage.nodes.len() - 1;
-                        
+
                         if list_node_indices.is_empty() {
                             unsafe { list.add(node_ptr); }
                             list_node_indices.push(new_node_idx);
@@ -718,14 +723,14 @@ mod proptests {
                 }
 
                 // Verify count matches
-                prop_assert_eq!(list.count(), reference.len(), 
+                prop_assert_eq!(list.count(), reference.len(),
                     "Count mismatch after {:?}", op);
             }
 
             // Final verification: extract all values and compare
             let list_values = extract_list_values(&list, &storage);
             let reference_values: Vec<i32> = reference.iter().copied().collect();
-            prop_assert_eq!(list_values, reference_values, 
+            prop_assert_eq!(list_values, reference_values,
                 "Final list values don't match reference");
         }
 
@@ -779,7 +784,7 @@ mod proptests {
                     ListOp::InsertPrevAt(idx, val) | ListOp::InsertNextAt(idx, val) => {
                         let node_ptr = storage.add_node(*val);
                         let new_node_idx = storage.nodes.len() - 1;
-                        
+
                         if list_node_indices.is_empty() {
                             unsafe { list.add(node_ptr); }
                             list_node_indices.push(new_node_idx);
@@ -800,7 +805,7 @@ mod proptests {
                     }
                 }
 
-                prop_assert_eq!(list.count(), expected_count, 
+                prop_assert_eq!(list.count(), expected_count,
                     "Count invariant violated after {:?}", op);
                 prop_assert_eq!(list.is_empty(), expected_count == 0,
                     "is_empty() inconsistent with count after {:?}", op);
@@ -828,13 +833,13 @@ mod proptests {
             } else {
                 prop_assert!(list.first().is_some());
                 prop_assert!(list.last().is_some());
-                
+
                 // First node's prev should be None
                 if let Some(first) = list.first() {
                     let prev_is_none = unsafe { (*first.as_ptr()).prev.is_none() };
                     prop_assert!(prev_is_none, "First node's prev should be None");
                 }
-                
+
                 // Last node's next should be None
                 if let Some(last) = list.last() {
                     let next_is_none = unsafe { (*last.as_ptr()).next.is_none() };

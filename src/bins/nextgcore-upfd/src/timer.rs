@@ -200,15 +200,19 @@ impl TimerManager {
 
     /// Stop a timer for PFCP node
     pub fn stop_pfcp_node_timer(&mut self, timer_id: UpfTimerId, pfcp_node_id: u64) {
-        self.active_timers.retain(|t| {
-            !(t.timer_id == timer_id && t.pfcp_node_id == Some(pfcp_node_id))
-        });
-        log::debug!("Stopped timer {} for PFCP node {}", timer_id.name(), pfcp_node_id);
+        self.active_timers
+            .retain(|t| !(t.timer_id == timer_id && t.pfcp_node_id == Some(pfcp_node_id)));
+        log::debug!(
+            "Stopped timer {} for PFCP node {}",
+            timer_id.name(),
+            pfcp_node_id
+        );
     }
 
     /// Stop all timers for PFCP node
     pub fn stop_all_pfcp_node_timers(&mut self, pfcp_node_id: u64) {
-        self.active_timers.retain(|t| t.pfcp_node_id != Some(pfcp_node_id));
+        self.active_timers
+            .retain(|t| t.pfcp_node_id != Some(pfcp_node_id));
         log::debug!("Stopped all timers for PFCP node {pfcp_node_id}");
     }
 

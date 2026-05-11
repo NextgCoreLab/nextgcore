@@ -72,12 +72,7 @@ impl AusfTimerManager {
     }
 
     /// Start a new timer
-    pub fn start(
-        &self,
-        timer_type: AusfTimerId,
-        duration: Duration,
-        data: Option<String>,
-    ) -> u64 {
+    pub fn start(&self, timer_type: AusfTimerId, duration: Duration, data: Option<String>) -> u64 {
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -314,11 +309,7 @@ mod tests {
     fn test_timer_manager_process_expired() {
         let manager = AusfTimerManager::new();
 
-        manager.start(
-            AusfTimerId::SbiClientWait,
-            Duration::from_millis(10),
-            None,
-        );
+        manager.start(AusfTimerId::SbiClientWait, Duration::from_millis(10), None);
         assert_eq!(manager.count(), 1);
 
         thread::sleep(Duration::from_millis(20));
@@ -337,11 +328,7 @@ mod tests {
             Duration::from_secs(10),
             None,
         );
-        manager.start(
-            AusfTimerId::SbiClientWait,
-            Duration::from_secs(2),
-            None,
-        );
+        manager.start(AusfTimerId::SbiClientWait, Duration::from_secs(2), None);
 
         let next = manager.next_expiration();
         assert!(next.is_some());
@@ -357,11 +344,7 @@ mod tests {
             Duration::from_secs(10),
             None,
         );
-        manager.start(
-            AusfTimerId::SbiClientWait,
-            Duration::from_secs(2),
-            None,
-        );
+        manager.start(AusfTimerId::SbiClientWait, Duration::from_secs(2), None);
         assert_eq!(manager.count(), 2);
 
         manager.clear();

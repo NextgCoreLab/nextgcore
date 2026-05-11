@@ -2,12 +2,12 @@
 //!
 //! Functions for building common GTPv2-C messages.
 
-use bytes::{BufMut, BytesMut};
 use crate::error::GtpResult;
 use crate::v2::header::Gtp2Header;
+use crate::v2::header::Gtp2MessageType;
 use crate::v2::ie::{Gtp2Ie, Gtp2IeType};
 use crate::v2::message::Gtp2Message;
-use crate::v2::header::Gtp2MessageType;
+use bytes::{BufMut, BytesMut};
 
 /// Build a Create Session Request message
 pub fn build_create_session_request(
@@ -32,11 +32,9 @@ pub fn build_create_session_request(
     };
 
     // IE: IMSI (mandatory)
-    message.ies.push(Gtp2Ie::from_slice(
-        Gtp2IeType::Imsi as u8,
-        0,
-        imsi,
-    ));
+    message
+        .ies
+        .push(Gtp2Ie::from_slice(Gtp2IeType::Imsi as u8, 0, imsi));
 
     // IE: RAT Type (mandatory)
     message.ies.push(Gtp2Ie::from_slice(
@@ -47,11 +45,9 @@ pub fn build_create_session_request(
 
     // IE: APN (mandatory)
     let apn_bytes = encode_apn(apn);
-    message.ies.push(Gtp2Ie::from_slice(
-        Gtp2IeType::Apn as u8,
-        0,
-        &apn_bytes,
-    ));
+    message
+        .ies
+        .push(Gtp2Ie::from_slice(Gtp2IeType::Apn as u8, 0, &apn_bytes));
 
     // IE: Serving Network (mandatory)
     message.ies.push(Gtp2Ie::from_slice(
@@ -64,11 +60,7 @@ pub fn build_create_session_request(
 }
 
 /// Build a Modify Bearer Request message
-pub fn build_modify_bearer_request(
-    teid: u32,
-    seq: u32,
-    ebi: u8,
-) -> GtpResult<Gtp2Message> {
+pub fn build_modify_bearer_request(teid: u32, seq: u32, ebi: u8) -> GtpResult<Gtp2Message> {
     let mut message = Gtp2Message {
         header: Gtp2Header {
             version: 2,
@@ -83,21 +75,15 @@ pub fn build_modify_bearer_request(
     };
 
     // IE: EBI (EPS Bearer ID) (mandatory)
-    message.ies.push(Gtp2Ie::from_slice(
-        Gtp2IeType::Ebi as u8,
-        0,
-        &[ebi],
-    ));
+    message
+        .ies
+        .push(Gtp2Ie::from_slice(Gtp2IeType::Ebi as u8, 0, &[ebi]));
 
     Ok(message)
 }
 
 /// Build a Delete Session Request message
-pub fn build_delete_session_request(
-    teid: u32,
-    seq: u32,
-    ebi: u8,
-) -> GtpResult<Gtp2Message> {
+pub fn build_delete_session_request(teid: u32, seq: u32, ebi: u8) -> GtpResult<Gtp2Message> {
     let mut message = Gtp2Message {
         header: Gtp2Header {
             version: 2,
@@ -112,11 +98,9 @@ pub fn build_delete_session_request(
     };
 
     // IE: EBI (mandatory)
-    message.ies.push(Gtp2Ie::from_slice(
-        Gtp2IeType::Ebi as u8,
-        0,
-        &[ebi],
-    ));
+    message
+        .ies
+        .push(Gtp2Ie::from_slice(Gtp2IeType::Ebi as u8, 0, &[ebi]));
 
     Ok(message)
 }
@@ -186,7 +170,12 @@ impl FTeid {
                     available: data.len(),
                 });
             }
-            let addr = [data[offset], data[offset + 1], data[offset + 2], data[offset + 3]];
+            let addr = [
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ];
             offset += 4;
             Some(addr)
         } else {
@@ -332,8 +321,12 @@ mod tests {
             "internet",
             &[0x00, 0xF1, 0x10],
             6, // E-UTRAN
-        ).unwrap();
-        assert_eq!(msg.header.message_type, Gtp2MessageType::CreateSessionRequest as u8);
+        )
+        .unwrap();
+        assert_eq!(
+            msg.header.message_type,
+            Gtp2MessageType::CreateSessionRequest as u8
+        );
         assert!(msg.ies.len() >= 3);
     }
 

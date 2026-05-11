@@ -248,10 +248,21 @@ mod tests {
         let mut handler = EmergencyHandler::new();
         let plmn = [0x99, 0xF9, 0x07]; // 999/07
 
-        handler.register_plmn_numbers(plmn, vec![
-            EmergencyNumber { number: "112".to_string(), categories: 0xFF, sub_services_uri: None },
-            EmergencyNumber { number: "911".to_string(), categories: 0xFF, sub_services_uri: None },
-        ]);
+        handler.register_plmn_numbers(
+            plmn,
+            vec![
+                EmergencyNumber {
+                    number: "112".to_string(),
+                    categories: 0xFF,
+                    sub_services_uri: None,
+                },
+                EmergencyNumber {
+                    number: "911".to_string(),
+                    categories: 0xFF,
+                    sub_services_uri: None,
+                },
+            ],
+        );
 
         assert!(handler.is_emergency_number(&plmn, "112"));
         assert!(handler.is_emergency_number(&plmn, "911"));
@@ -310,8 +321,7 @@ mod tests {
 
     #[test]
     fn test_emergency_context_with_category() {
-        let ctx = EmergencyContext::unauthenticated()
-            .with_category(EmergencyCategory::Ambulance);
+        let ctx = EmergencyContext::unauthenticated().with_category(EmergencyCategory::Ambulance);
         assert_eq!(ctx.category, Some(EmergencyCategory::Ambulance));
     }
 

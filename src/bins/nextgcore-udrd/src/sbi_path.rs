@@ -23,7 +23,7 @@ impl Default for SbiServerConfig {
     fn default() -> Self {
         Self {
             addr: "0.0.0.0".to_string(),
-            port: 7777,  // Standard SBI port
+            port: 7777, // Standard SBI port
             tls_enabled: false,
             tls_cert: None,
             tls_key: None,
@@ -38,7 +38,7 @@ static SBI_RUNNING: AtomicBool = AtomicBool::new(false);
 ///
 /// Port of udr_sbi_open()
 pub fn udr_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
-    let config = config.unwrap_or(SbiServerConfig::default());
+    let config = config.unwrap_or_default();
 
     log::info!("Opening UDR SBI server on {}:{}", config.addr, config.port);
 

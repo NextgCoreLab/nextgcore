@@ -152,11 +152,11 @@ fn utun_open(unit: u32) -> TunResult<(i32, String)> {
 }
 
 /// Open a TUN device on macOS
-/// 
+///
 /// # Arguments
 /// * `_ifname` - Ignored on macOS (utun names are auto-assigned)
 /// * `_is_tap` - Ignored on macOS (only TUN is supported via utun)
-/// 
+///
 /// # Returns
 /// A `TunDevice` handle on success
 pub fn tun_open(_ifname: &str, _is_tap: bool) -> TunResult<TunDevice> {
@@ -174,7 +174,7 @@ pub fn tun_open(_ifname: &str, _is_tap: bool) -> TunResult<TunDevice> {
 }
 
 /// Set IP address on a TUN interface (macOS)
-/// 
+///
 /// Uses ifconfig command for IPv6 and ioctl for IPv4.
 pub fn tun_set_ip(ifname: &str, gw: &IpSubnet, sub: &IpSubnet) -> TunResult<()> {
     if gw.is_ipv4() {
@@ -182,7 +182,9 @@ pub fn tun_set_ip(ifname: &str, gw: &IpSubnet, sub: &IpSubnet) -> TunResult<()> 
     } else if gw.is_ipv6() {
         tun_set_ipv6(ifname, gw, sub)
     } else {
-        Err(TunError::InvalidPacket("Unknown address family".to_string()))
+        Err(TunError::InvalidPacket(
+            "Unknown address family".to_string(),
+        ))
     }
 }
 
@@ -336,7 +338,9 @@ pub fn tun_add_route(ifname: &str, dest: &IpSubnet, gateway: Option<&IpSubnet>) 
     } else if dest.is_ipv6() {
         tun_add_route_ipv6(ifname, dest, gateway)
     } else {
-        Err(TunError::InvalidPacket("Unknown address family".to_string()))
+        Err(TunError::InvalidPacket(
+            "Unknown address family".to_string(),
+        ))
     }
 }
 
@@ -439,7 +443,9 @@ pub fn tun_del_route(_ifname: &str, dest: &IpSubnet) -> TunResult<()> {
     } else if dest.is_ipv6() {
         tun_del_route_ipv6(dest)
     } else {
-        Err(TunError::InvalidPacket("Unknown address family".to_string()))
+        Err(TunError::InvalidPacket(
+            "Unknown address family".to_string(),
+        ))
     }
 }
 
@@ -455,7 +461,13 @@ fn tun_del_route_ipv4(dest: &IpSubnet) -> TunResult<()> {
     let prefix_len = mask.count_ones();
 
     let output = Command::new("/sbin/route")
-        .args(["delete", "-net", &dest_str, "-prefixlen", &prefix_len.to_string()])
+        .args([
+            "delete",
+            "-net",
+            &dest_str,
+            "-prefixlen",
+            &prefix_len.to_string(),
+        ])
         .output()
         .map_err(|e| TunError::IoError(format!("Failed to run route: {e}")))?;
 

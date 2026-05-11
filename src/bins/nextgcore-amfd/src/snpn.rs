@@ -134,7 +134,10 @@ impl AmfSnpnContext {
             return Err(format!("Invalid NID format: {}", snpn_id.nid));
         }
         if !self.config.is_served(snpn_id) {
-            return Err(format!("SNPN {} not served by this AMF", snpn_id.to_display()));
+            return Err(format!(
+                "SNPN {} not served by this AMF",
+                snpn_id.to_display()
+            ));
         }
         // Default to EAP-AKA' if CH URI is configured, else 5G-AKA
         let method = if self.config.credentials_holder_uri.is_some() {
@@ -185,7 +188,8 @@ impl AmfSnpnContext {
 
     /// Returns number of onboarded UEs
     pub fn onboarded_count(&self) -> usize {
-        self.auth_contexts.values()
+        self.auth_contexts
+            .values()
             .filter(|c| c.onboarding_state == OnboardingState::Onboarded)
             .count()
     }

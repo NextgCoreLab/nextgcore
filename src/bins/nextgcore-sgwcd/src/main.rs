@@ -204,7 +204,6 @@ impl SgwcApp {
         let ctx = sgwc_self();
         if let Ok(mut ctx_guard) = Arc::try_unwrap(ctx.clone()).map_err(|_| {
             log::debug!("Context cleanup via shared reference");
-            
         }) {
             ctx_guard.fini();
         }
@@ -250,11 +249,10 @@ fn main() -> Result<()> {
         .init();
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
-            .with_endpoint(
-                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
-            ),
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+        ),
     )
     .ok();
 
@@ -334,15 +332,8 @@ mod tests {
     #[test]
     fn test_s11_handler_create_session() {
         let imsi = vec![0x09, 0x10, 0x10, 0x00, 0x00, 0x00, 0x20];
-        let result = s11_handler::handle_create_session_request(
-            None,
-            1,
-            &[],
-            &imsi,
-            "internet",
-            12345,
-            5,
-        );
+        let result =
+            s11_handler::handle_create_session_request(None, 1, &[], &imsi, "internet", 12345, 5);
         // Should create UE and session
         matches!(result, s11_handler::HandlerResult::SendPfcp);
     }
@@ -381,13 +372,13 @@ mod tests {
     fn test_timer_manager() {
         let mut timer_mgr = timer::TimerManager::new();
         let timer_id = timer::SgwcTimerId::PfcpAssociation;
-        
+
         // Start a timer with very short duration
         timer_mgr.start(timer_id, std::time::Duration::from_millis(1));
-        
+
         // Wait for it to expire
         std::thread::sleep(std::time::Duration::from_millis(10));
-        
+
         // Check expired timers
         let expired = timer_mgr.check_expired();
         assert!(expired.contains(&timer_id));

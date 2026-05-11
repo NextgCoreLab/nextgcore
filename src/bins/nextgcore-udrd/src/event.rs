@@ -83,8 +83,7 @@ impl UdrTimerId {
 }
 
 /// SBI message data for events
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SbiEventData {
     /// Request data (if any)
     pub request: Option<SbiRequest>,
@@ -99,7 +98,6 @@ pub struct SbiEventData {
     /// State for multi-step operations
     pub state: Option<i32>,
 }
-
 
 /// Simplified SBI request representation
 #[derive(Debug, Clone)]
@@ -122,8 +120,7 @@ pub struct SbiResponse {
 }
 
 /// Simplified SBI message representation
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SbiMessage {
     /// Service name
     pub service_name: String,
@@ -136,7 +133,6 @@ pub struct SbiMessage {
     /// Response status (for client responses)
     pub res_status: Option<u16>,
 }
-
 
 /// UDR Event structure
 ///
@@ -345,8 +341,7 @@ mod tests {
 
     #[test]
     fn test_event_with_nf_instance() {
-        let event = UdrEvent::new(UdrEventId::SbiTimer)
-            .with_nf_instance("test-nf".to_string());
+        let event = UdrEvent::new(UdrEventId::SbiTimer).with_nf_instance("test-nf".to_string());
         assert_eq!(event.nf_instance_id, Some("test-nf".to_string()));
     }
 
@@ -377,8 +372,14 @@ mod tests {
 
     #[test]
     fn test_event_id_from_signal() {
-        assert_eq!(UdrEventId::from_signal(OGS_FSM_ENTRY_SIG), UdrEventId::FsmEntry);
-        assert_eq!(UdrEventId::from_signal(OGS_FSM_EXIT_SIG), UdrEventId::FsmExit);
+        assert_eq!(
+            UdrEventId::from_signal(OGS_FSM_ENTRY_SIG),
+            UdrEventId::FsmEntry
+        );
+        assert_eq!(
+            UdrEventId::from_signal(OGS_FSM_EXIT_SIG),
+            UdrEventId::FsmExit
+        );
         assert_eq!(UdrEventId::from_signal(99), UdrEventId::SbiServer);
     }
 }

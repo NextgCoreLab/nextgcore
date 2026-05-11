@@ -140,10 +140,7 @@ pub fn decode_relative_amf_capacity(field: &ProtocolIeField) -> NgapResult<u8> {
 // TimeToWait IE
 // ============================================================================
 
-pub fn encode_time_to_wait(
-    container: &mut ProtocolIeContainer,
-    ttw: TimeToWait,
-) -> NgapResult<()> {
+pub fn encode_time_to_wait(container: &mut ProtocolIeContainer, ttw: TimeToWait) -> NgapResult<()> {
     let asn_ttw = match ttw {
         TimeToWait::V1s => ogs_asn1c::ngap::ies::TimeToWait::V1s,
         TimeToWait::V2s => ogs_asn1c::ngap::ies::TimeToWait::V2s,
@@ -221,11 +218,9 @@ pub fn encode_amf_name(container: &mut ProtocolIeContainer, name: &str) -> NgapR
 pub fn decode_amf_name(field: &ProtocolIeField) -> NgapResult<String> {
     let mut decoder = AperDecoder::new(&field.value);
     let bytes = decoder.decode_octet_string(None, None)?;
-    String::from_utf8(bytes).map_err(|e| {
-        crate::error::NgapError::InvalidIeValue {
-            ie_name: "AMFName",
-            reason: e.to_string(),
-        }
+    String::from_utf8(bytes).map_err(|e| crate::error::NgapError::InvalidIeValue {
+        ie_name: "AMFName",
+        reason: e.to_string(),
     })
 }
 
@@ -400,7 +395,7 @@ pub fn encode_ue_security_capabilities(
     //   eUTRAencryptionAlgorithms, eUTRAintegrityProtectionAlgorithms, iE-Extensions OPTIONAL }
     encoder.write_bit(false); // extension
     encoder.write_bit(false); // no iE-Extensions
-    // Each is BIT STRING (SIZE (16))
+                              // Each is BIT STRING (SIZE (16))
     encoder.write_bits(caps.nr_encryption_algorithms as u64, 16);
     encoder.write_bits(caps.nr_integrity_algorithms as u64, 16);
     encoder.write_bits(caps.eutra_encryption_algorithms as u64, 16);
@@ -434,10 +429,7 @@ pub fn decode_ue_security_capabilities(
 }
 
 /// Encode Security Key IE (BIT STRING SIZE (256))
-pub fn encode_security_key(
-    container: &mut ProtocolIeContainer,
-    key: &[u8; 32],
-) -> NgapResult<()> {
+pub fn encode_security_key(container: &mut ProtocolIeContainer, key: &[u8; 32]) -> NgapResult<()> {
     let mut encoder = AperEncoder::new();
     // SecurityKey ::= BIT STRING (SIZE(256))
     // Fixed size = 256 bits = 32 bytes, no length determinant needed
@@ -464,15 +456,12 @@ pub fn decode_security_key(field: &ProtocolIeField) -> NgapResult<[u8; 32]> {
 }
 
 /// Encode UE Aggregate Maximum Bit Rate IE
-pub fn encode_ue_ambr(
-    container: &mut ProtocolIeContainer,
-    ambr: &UeAmbrInfo,
-) -> NgapResult<()> {
+pub fn encode_ue_ambr(container: &mut ProtocolIeContainer, ambr: &UeAmbrInfo) -> NgapResult<()> {
     let mut encoder = AperEncoder::new();
     // UEAggregateMaximumBitRate SEQUENCE { uEAggregateMaximumBitRateDL, uEAggregateMaximumBitRateUL, iE-Extensions OPTIONAL }
     encoder.write_bit(false); // extension
     encoder.write_bit(false); // no iE-Extensions
-    // BitRate ::= INTEGER (0..4000000000000, ...) - encoded as unconstrained
+                              // BitRate ::= INTEGER (0..4000000000000, ...) - encoded as unconstrained
     encoder.encode_unconstrained_whole_number(ambr.dl as i64)?;
     encoder.encode_unconstrained_whole_number(ambr.ul as i64)?;
     encoder.align();
@@ -511,7 +500,7 @@ pub fn encode_global_ran_node_id(
             // GlobalGNB-ID SEQUENCE { plmnIdentity, gNB-ID, iE-Extensions OPTIONAL }
             encoder.write_bit(false); // extension
             encoder.write_bit(false); // no iE-Extensions
-            // PLMN Identity
+                                      // PLMN Identity
             encoder.encode_octet_string(plmn_identity, Some(3), Some(3))?;
             // GNB-ID CHOICE: gNB-ID (BIT STRING (22..32)) is index 0 out of 1, extensible
             encoder.encode_choice_index(0, 1, true)?;
@@ -587,10 +576,7 @@ pub fn decode_global_ran_node_id(field: &ProtocolIeField) -> NgapResult<GlobalRa
 }
 
 /// Encode RAN Node Name IE
-pub fn encode_ran_node_name(
-    container: &mut ProtocolIeContainer,
-    name: &str,
-) -> NgapResult<()> {
+pub fn encode_ran_node_name(container: &mut ProtocolIeContainer, name: &str) -> NgapResult<()> {
     let mut encoder = AperEncoder::new();
     encoder.encode_octet_string(name.as_bytes(), None, None)?;
     encoder.align();
@@ -624,7 +610,7 @@ pub fn encode_supported_ta_list(
         // SupportedTAItem SEQUENCE { tAC, broadcastPLMNList, iE-Extensions OPTIONAL }
         encoder.write_bit(false); // extension
         encoder.write_bit(false); // no iE-Extensions
-        // TAC (3 bytes, fixed)
+                                  // TAC (3 bytes, fixed)
         encoder.encode_octet_string(&item.tac, Some(3), Some(3))?;
         // BroadcastPLMNList: SEQUENCE (SIZE (1..maxnoofBPLMNs=12)) OF BroadcastPLMNItem
         encoder.encode_constrained_length(item.broadcast_plmn_list.len(), 1, 12)?;
@@ -740,7 +726,7 @@ pub fn encode_user_location_info(
             encoder.write_bit(false); // extension
             encoder.write_bit(false); // timeStamp not present
             encoder.write_bit(false); // no iE-Extensions
-            // NR-CGI SEQUENCE { pLMNIdentity, nRCellIdentity, iE-Extensions OPTIONAL }
+                                      // NR-CGI SEQUENCE { pLMNIdentity, nRCellIdentity, iE-Extensions OPTIONAL }
             encoder.write_bit(false); // extension
             encoder.write_bit(false); // no iE-Extensions
             encoder.encode_octet_string(nr_cgi_plmn, Some(3), Some(3))?;
@@ -763,9 +749,7 @@ pub fn encode_user_location_info(
 }
 
 /// Decode User Location Information from IE field
-pub fn decode_user_location_info(
-    field: &ProtocolIeField,
-) -> NgapResult<UserLocationInformation> {
+pub fn decode_user_location_info(field: &ProtocolIeField) -> NgapResult<UserLocationInformation> {
     let mut decoder = AperDecoder::new(&field.value);
     let choice = decoder.decode_choice_index(2, true)?;
     match choice {
@@ -823,7 +807,9 @@ pub fn encode_rrc_establishment_cause(
 }
 
 /// Decode RRC Establishment Cause from IE field
-pub fn decode_rrc_establishment_cause(field: &ProtocolIeField) -> NgapResult<RrcEstablishmentCause> {
+pub fn decode_rrc_establishment_cause(
+    field: &ProtocolIeField,
+) -> NgapResult<RrcEstablishmentCause> {
     let mut decoder = AperDecoder::new(&field.value);
     let constraint = ogs_asn1c::per::Constraint::extensible(0, 9);
     let val = decoder.decode_enumerated(&constraint)?;
@@ -862,10 +848,7 @@ pub fn encode_ue_context_request(
 }
 
 /// Encode UE-NGAP-IDs IE (for UE Context Release Command)
-pub fn encode_ue_ngap_ids(
-    container: &mut ProtocolIeContainer,
-    ids: &UeNgapIds,
-) -> NgapResult<()> {
+pub fn encode_ue_ngap_ids(container: &mut ProtocolIeContainer, ids: &UeNgapIds) -> NgapResult<()> {
     let mut encoder = AperEncoder::new();
     // UE-NGAP-IDs CHOICE { uE-NGAP-ID-pair, aMF-UE-NGAP-ID, choice-Extensions }
     match ids {
@@ -943,11 +926,11 @@ fn encode_snssai_inline(encoder: &mut AperEncoder, snssai: &SNssai) -> NgapResul
     // SliceSupportItem SEQUENCE { s-NSSAI, iE-Extensions OPTIONAL }
     encoder.write_bit(false); // extension for SliceSupportItem
     encoder.write_bit(false); // no iE-Extensions for SliceSupportItem
-    // S-NSSAI SEQUENCE { sST, sD OPTIONAL, iE-Extensions OPTIONAL }
+                              // S-NSSAI SEQUENCE { sST, sD OPTIONAL, iE-Extensions OPTIONAL }
     encoder.write_bit(false); // extension
     encoder.write_bit(snssai.sd.is_some()); // SD present
     encoder.write_bit(false); // no iE-Extensions
-    // SST: OCTET STRING (SIZE (1))
+                              // SST: OCTET STRING (SIZE (1))
     encoder.encode_octet_string(&[snssai.sst], Some(1), Some(1))?;
     // SD: OCTET STRING (SIZE (3)), optional
     if let Some(ref sd) = snssai.sd {
@@ -997,7 +980,7 @@ pub fn encode_pdu_session_setup_list_su_req(
         encoder.write_bit(false); // extension
         encoder.write_bit(item.nas_pdu.is_some()); // NAS-PDU optional
         encoder.write_bit(false); // no iE-Extensions
-        // PDUSessionID ::= INTEGER (0..255)
+                                  // PDUSessionID ::= INTEGER (0..255)
         let pdu_constraint = ogs_asn1c::per::Constraint::new(0, 255);
         encoder.encode_constrained_whole_number(item.pdu_session_id as i64, &pdu_constraint)?;
         if let Some(ref nas_pdu) = item.nas_pdu {
@@ -1058,7 +1041,10 @@ pub fn decode_pdu_session_setup_list_su_req(
         result.push(PduSessionResourceSetupItem {
             pdu_session_id,
             nas_pdu,
-            s_nssai: SNssai { sst: sst_bytes[0], sd },
+            s_nssai: SNssai {
+                sst: sst_bytes[0],
+                sd,
+            },
             transfer,
         });
     }
@@ -1253,7 +1239,10 @@ pub fn encode_target_id(
     let mut encoder = AperEncoder::new();
     // TargetID ::= CHOICE { targetRANNodeID, targetHomeENB-ID, ... }
     match target_id {
-        TargetId::TargetRanNodeId { global_ran_node_id, selected_tai } => {
+        TargetId::TargetRanNodeId {
+            global_ran_node_id,
+            selected_tai,
+        } => {
             encoder.encode_choice_index(0, 2, true)?;
             // TargetRANNodeID SEQUENCE { globalRANNodeID, selectedTAI, iE-Extensions OPTIONAL }
             encoder.write_bit(false); // extension
@@ -1261,7 +1250,11 @@ pub fn encode_target_id(
             encode_global_ran_node_id_inline(&mut encoder, global_ran_node_id)?;
             encode_tai_inline(&mut encoder, selected_tai)?;
         }
-        TargetId::TargetGlobalNgEnbId { plmn_identity, ng_enb_id, selected_tai } => {
+        TargetId::TargetGlobalNgEnbId {
+            plmn_identity,
+            ng_enb_id,
+            selected_tai,
+        } => {
             encoder.encode_choice_index(1, 2, true)?;
             encoder.write_bit(false);
             encoder.write_bit(false);
@@ -1286,7 +1279,11 @@ fn encode_global_ran_node_id_inline(
     ran_id: &GlobalRanNodeId,
 ) -> NgapResult<()> {
     match ran_id {
-        GlobalRanNodeId::GlobalGnbId { plmn_identity, gnb_id, gnb_id_len } => {
+        GlobalRanNodeId::GlobalGnbId {
+            plmn_identity,
+            gnb_id,
+            gnb_id_len,
+        } => {
             encoder.encode_choice_index(0, 2, true)?;
             encoder.write_bit(false);
             encoder.write_bit(false);
@@ -1294,7 +1291,10 @@ fn encode_global_ran_node_id_inline(
             // gNB-ID is a BIT STRING (SIZE(22..32))
             encoder.write_bits(*gnb_id as u64, *gnb_id_len as usize);
         }
-        GlobalRanNodeId::GlobalNgEnbId { plmn_identity, ng_enb_id } => {
+        GlobalRanNodeId::GlobalNgEnbId {
+            plmn_identity,
+            ng_enb_id,
+        } => {
             encoder.encode_choice_index(1, 2, true)?;
             encoder.write_bit(false);
             encoder.write_bit(false);
@@ -1350,7 +1350,7 @@ pub fn encode_security_context(
     // SecurityContext SEQUENCE { nextHopChainingCount, nextHopNH, iE-Extensions OPTIONAL }
     encoder.write_bit(false); // extension
     encoder.write_bit(false); // no iE-Extensions
-    // nextHopChainingCount INTEGER (0..7)
+                              // nextHopChainingCount INTEGER (0..7)
     let constraint = ogs_asn1c::per::Constraint::new(0, 7);
     encoder.encode_constrained_whole_number(ctx.next_hop_chaining_count as i64, &constraint)?;
     // nextHopNH BIT STRING (SIZE(256))
@@ -1464,12 +1464,16 @@ pub fn encode_ue_paging_identity(
     let mut encoder = AperEncoder::new();
     // UEPagingIdentity ::= CHOICE { fiveG-S-TMSI, ... }
     match ue_paging_id {
-        UePagingIdentity::FiveGSTmsi { amf_set_id, amf_pointer, tmsi } => {
+        UePagingIdentity::FiveGSTmsi {
+            amf_set_id,
+            amf_pointer,
+            tmsi,
+        } => {
             encoder.encode_choice_index(0, 1, true)?;
             // FiveG-S-TMSI SEQUENCE { aMFSetID, aMFPointer, fiveG-TMSI, iE-Extensions OPTIONAL }
             encoder.write_bit(false); // extension
             encoder.write_bit(false); // no iE-Extensions
-            // AMFSetID BIT STRING (SIZE(10))
+                                      // AMFSetID BIT STRING (SIZE(10))
             encoder.write_bits(*amf_set_id as u64, 10);
             // AMFPointer BIT STRING (SIZE(6))
             encoder.write_bits(*amf_pointer as u64, 6);
@@ -1487,10 +1491,7 @@ pub fn encode_ue_paging_identity(
 }
 
 /// Encode PagingDRX IE (same as default paging DRX)
-pub fn encode_paging_drx(
-    container: &mut ProtocolIeContainer,
-    drx: PagingDrx,
-) -> NgapResult<()> {
+pub fn encode_paging_drx(container: &mut ProtocolIeContainer, drx: PagingDrx) -> NgapResult<()> {
     let mut encoder = AperEncoder::new();
     let constraint = ogs_asn1c::per::Constraint::extensible(0, 3);
     encoder.encode_enumerated(drx as i64, &constraint)?;

@@ -300,29 +300,29 @@ impl TimerManager {
 
     /// Stop a timer for UE
     pub fn stop_ue_timer(&mut self, timer_id: AmfTimerId, amf_ue_id: u64) {
-        self.active_timers.retain(|t| {
-            !(t.timer_id == timer_id && t.amf_ue_id == Some(amf_ue_id))
-        });
+        self.active_timers
+            .retain(|t| !(t.timer_id == timer_id && t.amf_ue_id == Some(amf_ue_id)));
         log::debug!("Stopped timer {} for UE {}", timer_id.name(), amf_ue_id);
     }
 
     /// Stop a timer for RAN UE
     pub fn stop_ran_ue_timer(&mut self, timer_id: AmfTimerId, ran_ue_id: u64) {
-        self.active_timers.retain(|t| {
-            !(t.timer_id == timer_id && t.ran_ue_id == Some(ran_ue_id))
-        });
+        self.active_timers
+            .retain(|t| !(t.timer_id == timer_id && t.ran_ue_id == Some(ran_ue_id)));
         log::debug!("Stopped timer {} for RAN UE {}", timer_id.name(), ran_ue_id);
     }
 
     /// Stop all timers for UE
     pub fn stop_all_ue_timers(&mut self, amf_ue_id: u64) {
-        self.active_timers.retain(|t| t.amf_ue_id != Some(amf_ue_id));
+        self.active_timers
+            .retain(|t| t.amf_ue_id != Some(amf_ue_id));
         log::debug!("Stopped all timers for UE {amf_ue_id}");
     }
 
     /// Stop all timers for RAN UE
     pub fn stop_all_ran_ue_timers(&mut self, ran_ue_id: u64) {
-        self.active_timers.retain(|t| t.ran_ue_id != Some(ran_ue_id));
+        self.active_timers
+            .retain(|t| t.ran_ue_id != Some(ran_ue_id));
         log::debug!("Stopped all timers for RAN UE {ran_ue_id}");
     }
 

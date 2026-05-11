@@ -22,10 +22,10 @@ use p256::{
 };
 use thiserror::Error;
 
-use aes::cipher::{KeyInit, generic_array::GenericArray};
+use aes::cipher::{generic_array::GenericArray, KeyInit};
 use aes::Aes128;
 use hmac::{Hmac, Mac};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 /// ECC key size in bytes for P-256 curve
 pub const ECC_BYTES: usize = 32;
@@ -89,24 +89,24 @@ pub fn ecc_make_key(
 ) -> EccResult<()> {
     // Generate a random private key using the OsRng from elliptic-curve crate
     let secret_key = SecretKey::random(&mut OsRng);
-    
+
     // Get the public key
     let public = secret_key.public_key();
-    
+
     // Encode private key as big-endian bytes
     let secret_bytes = secret_key.to_bytes();
     private_key.copy_from_slice(&secret_bytes);
-    
+
     // Encode public key in compressed format (matching C implementation)
     let encoded = public.to_encoded_point(true);
     let compressed = encoded.as_bytes();
-    
+
     // The compressed format is 33 bytes: 0x02 or 0x03 prefix + 32 bytes x-coordinate
     if compressed.len() != ECC_PUBLIC_KEY_SIZE {
         return Err(EccError::RandomGenerationFailed);
     }
     public_key.copy_from_slice(compressed);
-    
+
     Ok(())
 }
 
@@ -150,26 +150,24 @@ pub fn ecdh_shared_secret(
     secret: &mut [u8; ECC_BYTES],
 ) -> EccResult<()> {
     // Parse the public key from compressed format
-    let encoded_point = EncodedPoint::from_bytes(public_key)
-        .map_err(|_| EccError::InvalidPublicKey)?;
-    
+    let encoded_point =
+        EncodedPoint::from_bytes(public_key).map_err(|_| EccError::InvalidPublicKey)?;
+
     let public: PublicKey = Option::from(PublicKey::from_encoded_point(&encoded_point))
         .ok_or(EccError::InvalidPublicKey)?;
-    
+
     // Parse the private key
-    let secret_key = SecretKey::from_bytes(private_key.into())
-        .map_err(|_| EccError::InvalidPrivateKey)?;
-    
+    let secret_key =
+        SecretKey::from_bytes(private_key.into()).map_err(|_| EccError::InvalidPrivateKey)?;
+
     // Compute the shared secret using ECDH
     // The p256 crate's diffie_hellman returns the x-coordinate of the shared point
-    let shared_secret = p256::ecdh::diffie_hellman(
-        secret_key.to_nonzero_scalar(),
-        public.as_affine(),
-    );
-    
+    let shared_secret =
+        p256::ecdh::diffie_hellman(secret_key.to_nonzero_scalar(), public.as_affine());
+
     // Copy the raw shared secret bytes
     secret.copy_from_slice(shared_secret.raw_secret_bytes());
-    
+
     Ok(())
 }
 
@@ -205,16 +203,16 @@ pub fn ecdsa_sign(
     signature: &mut [u8; ECC_SIGNATURE_SIZE],
 ) -> EccResult<()> {
     // Parse the private key
-    let signing_key = SigningKey::from_bytes(private_key.into())
-        .map_err(|_| EccError::InvalidPrivateKey)?;
-    
+    let signing_key =
+        SigningKey::from_bytes(private_key.into()).map_err(|_| EccError::InvalidPrivateKey)?;
+
     // Sign the hash
     let sig: Signature = signing_key.sign(hash);
-    
+
     // Convert signature to bytes (r || s format)
     let sig_bytes = sig.to_bytes();
     signature.copy_from_slice(&sig_bytes);
-    
+
     Ok(())
 }
 
@@ -250,16 +248,15 @@ pub fn ecdsa_verify(
     signature: &[u8; ECC_SIGNATURE_SIZE],
 ) -> EccResult<bool> {
     // Parse the public key from compressed format
-    let encoded_point = EncodedPoint::from_bytes(public_key)
-        .map_err(|_| EccError::InvalidPublicKey)?;
-    
-    let verifying_key = VerifyingKey::from_encoded_point(&encoded_point)
-        .map_err(|_| EccError::InvalidPublicKey)?;
-    
+    let encoded_point =
+        EncodedPoint::from_bytes(public_key).map_err(|_| EccError::InvalidPublicKey)?;
+
+    let verifying_key =
+        VerifyingKey::from_encoded_point(&encoded_point).map_err(|_| EccError::InvalidPublicKey)?;
+
     // Parse the signature
-    let sig = Signature::from_bytes(signature.into())
-        .map_err(|_| EccError::InvalidSignature)?;
-    
+    let sig = Signature::from_bytes(signature.into()).map_err(|_| EccError::InvalidSignature)?;
+
     // Verify the signature
     match verifying_key.verify(hash, &sig) {
         Ok(()) => Ok(true),
@@ -488,7 +485,12 @@ pub fn ecies_profile_b_decrypt_c(
     if plaintext_out.len() < ciphertext_len {
         return 0;
     }
-    match ecies_profile_b_decrypt(priv_key, ephemeral_pub, &ciphertext[..ciphertext_len], mac_tag) {
+    match ecies_profile_b_decrypt(
+        priv_key,
+        ephemeral_pub,
+        &ciphertext[..ciphertext_len],
+        mac_tag,
+    ) {
         Ok(pt) => {
             plaintext_out[..pt.len()].copy_from_slice(&pt);
             1
@@ -561,12 +563,12 @@ mod tests {
     fn test_key_generation() {
         let mut public_key = [0u8; ECC_PUBLIC_KEY_SIZE];
         let mut private_key = [0u8; ECC_BYTES];
-        
+
         assert!(ecc_make_key(&mut public_key, &mut private_key).is_ok());
-        
+
         // Public key should start with 0x02 or 0x03 (compressed format)
         assert!(public_key[0] == 0x02 || public_key[0] == 0x03);
-        
+
         // Private key should not be all zeros
         assert!(private_key.iter().any(|&b| b != 0));
     }
@@ -585,13 +587,13 @@ mod tests {
         // Compute shared secrets
         let mut secret1 = [0u8; ECC_BYTES];
         let mut secret2 = [0u8; ECC_BYTES];
-        
+
         ecdh_shared_secret(&pub2, &priv1, &mut secret1).unwrap();
         ecdh_shared_secret(&pub1, &priv2, &mut secret2).unwrap();
 
         // Both parties should derive the same shared secret
         assert_eq!(secret1, secret2);
-        
+
         // Shared secret should not be all zeros
         assert!(secret1.iter().any(|&b| b != 0));
     }
@@ -604,7 +606,7 @@ mod tests {
 
         // Create a test hash (simulating SHA-256 output)
         let hash = [0x42u8; ECC_BYTES];
-        
+
         // Sign the hash
         let mut signature = [0u8; ECC_SIGNATURE_SIZE];
         ecdsa_sign(&private_key, &hash, &mut signature).unwrap();
@@ -621,7 +623,7 @@ mod tests {
 
         let hash = [0x42u8; ECC_BYTES];
         let wrong_hash = [0x43u8; ECC_BYTES];
-        
+
         let mut signature = [0u8; ECC_SIGNATURE_SIZE];
         ecdsa_sign(&private_key, &hash, &mut signature).unwrap();
 
@@ -640,7 +642,7 @@ mod tests {
         ecc_make_key(&mut public_key2, &mut private_key2).unwrap();
 
         let hash = [0x42u8; ECC_BYTES];
-        
+
         let mut signature = [0u8; ECC_SIGNATURE_SIZE];
         ecdsa_sign(&private_key1, &hash, &mut signature).unwrap();
 
@@ -652,18 +654,18 @@ mod tests {
     fn test_c_compatible_interface() {
         let mut public_key = [0u8; ECC_PUBLIC_KEY_SIZE];
         let mut private_key = [0u8; ECC_BYTES];
-        
+
         // Test key generation
         assert_eq!(ecc_make_key_c(&mut public_key, &mut private_key), 1);
-        
+
         // Test ECDH
         let mut pub2 = [0u8; ECC_PUBLIC_KEY_SIZE];
         let mut priv2 = [0u8; ECC_BYTES];
         assert_eq!(ecc_make_key_c(&mut pub2, &mut priv2), 1);
-        
+
         let mut secret = [0u8; ECC_BYTES];
         assert_eq!(ecdh_shared_secret_c(&pub2, &private_key, &mut secret), 1);
-        
+
         // Test ECDSA
         let hash = [0x42u8; ECC_BYTES];
         let mut signature = [0u8; ECC_SIGNATURE_SIZE];
@@ -676,7 +678,7 @@ mod tests {
         let invalid_public_key = [0u8; ECC_PUBLIC_KEY_SIZE]; // All zeros is invalid
         let private_key = [0x42u8; ECC_BYTES];
         let mut secret = [0u8; ECC_BYTES];
-        
+
         assert!(ecdh_shared_secret(&invalid_public_key, &private_key, &mut secret).is_err());
     }
 
@@ -709,8 +711,7 @@ mod tests {
         let plaintext = b"Hello, ECIES Profile B!";
 
         // Encrypt
-        let (eph_pub, ciphertext, mac_tag) =
-            ecies_profile_b_encrypt(&pub_key, plaintext).unwrap();
+        let (eph_pub, ciphertext, mac_tag) = ecies_profile_b_encrypt(&pub_key, plaintext).unwrap();
 
         // Ciphertext should differ from plaintext
         assert_ne!(&ciphertext[..], &plaintext[..]);
@@ -730,8 +731,7 @@ mod tests {
 
         let plaintext = b"";
 
-        let (eph_pub, ciphertext, mac_tag) =
-            ecies_profile_b_encrypt(&pub_key, plaintext).unwrap();
+        let (eph_pub, ciphertext, mac_tag) = ecies_profile_b_encrypt(&pub_key, plaintext).unwrap();
 
         assert!(ciphertext.is_empty());
 
@@ -750,8 +750,7 @@ mod tests {
         // Test with data larger than one AES block
         let plaintext = vec![0xABu8; 256];
 
-        let (eph_pub, ciphertext, mac_tag) =
-            ecies_profile_b_encrypt(&pub_key, &plaintext).unwrap();
+        let (eph_pub, ciphertext, mac_tag) = ecies_profile_b_encrypt(&pub_key, &plaintext).unwrap();
 
         let decrypted =
             ecies_profile_b_decrypt(&priv_key, &eph_pub, &ciphertext, &mac_tag).unwrap();
@@ -772,12 +771,10 @@ mod tests {
 
         let plaintext = b"Secret message";
 
-        let (eph_pub, ciphertext, mac_tag) =
-            ecies_profile_b_encrypt(&pub_key, plaintext).unwrap();
+        let (eph_pub, ciphertext, mac_tag) = ecies_profile_b_encrypt(&pub_key, plaintext).unwrap();
 
         // Decrypting with wrong private key should fail MAC verification
-        let result =
-            ecies_profile_b_decrypt(&wrong_priv, &eph_pub, &ciphertext, &mac_tag);
+        let result = ecies_profile_b_decrypt(&wrong_priv, &eph_pub, &ciphertext, &mac_tag);
 
         assert!(result.is_err());
     }
@@ -799,8 +796,7 @@ mod tests {
         }
 
         // MAC verification should fail
-        let result =
-            ecies_profile_b_decrypt(&priv_key, &eph_pub, &ciphertext, &mac_tag);
+        let result = ecies_profile_b_decrypt(&priv_key, &eph_pub, &ciphertext, &mac_tag);
 
         assert!(result.is_err());
     }
@@ -819,8 +815,7 @@ mod tests {
         // Tamper with MAC tag
         mac_tag[0] ^= 0xFF;
 
-        let result =
-            ecies_profile_b_decrypt(&priv_key, &eph_pub, &ciphertext, &mac_tag);
+        let result = ecies_profile_b_decrypt(&priv_key, &eph_pub, &ciphertext, &mac_tag);
 
         assert!(result.is_err());
     }

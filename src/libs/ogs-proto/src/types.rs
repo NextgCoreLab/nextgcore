@@ -175,7 +175,6 @@ impl PlmnId {
     pub fn as_bytes(&self) -> &[u8; 3] {
         &self.data
     }
-
 }
 
 impl fmt::Display for PlmnId {
@@ -815,8 +814,7 @@ impl TimingAdvance {
 /// AI/ML model metadata for network intelligence.
 ///
 /// Describes ML models used for network optimization and analytics.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ModelMetadata {
     /// Model identifier
     pub model_id: u64,
@@ -846,12 +844,10 @@ impl ModelMetadata {
     }
 }
 
-
 /// ML inference request for network functions.
 ///
 /// Request for ML inference at network elements.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct InferenceRequest {
     /// Request ID
     pub request_id: u64,
@@ -874,7 +870,6 @@ impl InferenceRequest {
         }
     }
 }
-
 
 /// ML inference response.
 ///
@@ -917,7 +912,7 @@ impl Default for InferenceResponse {
 // Helper module for hex encoding
 mod hex {
     pub fn decode(s: &str) -> Result<Vec<u8>, ()> {
-        if s.len() % 2 != 0 {
+        if !s.len().is_multiple_of(2) {
             return Err(());
         }
 

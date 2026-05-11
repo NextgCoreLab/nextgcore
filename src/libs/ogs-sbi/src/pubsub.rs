@@ -393,7 +393,13 @@ mod tests {
 
     #[test]
     fn test_event_creation() {
-        let event = SbiEvent::new(1, SbiEventCategory::Analytics, "UE_MOBILITY", "amf-001", "{}");
+        let event = SbiEvent::new(
+            1,
+            SbiEventCategory::Analytics,
+            "UE_MOBILITY",
+            "amf-001",
+            "{}",
+        );
         assert_eq!(event.event_id, 1);
         assert_eq!(event.category, SbiEventCategory::Analytics);
         assert!(event.timestamp_ms > 0);
@@ -415,7 +421,13 @@ mod tests {
         let event = SbiEvent::new(1, SbiEventCategory::Mobility, "UE_MOBILITY", "nf-1", "{}");
         assert!(filter.matches(&event));
 
-        let other = SbiEvent::new(2, SbiEventCategory::Mobility, "SESSION_CHANGE", "nf-1", "{}");
+        let other = SbiEvent::new(
+            2,
+            SbiEventCategory::Mobility,
+            "SESSION_CHANGE",
+            "nf-1",
+            "{}",
+        );
         assert!(!filter.matches(&other));
     }
 
@@ -477,7 +489,13 @@ mod tests {
     fn test_replay_buffer_store_and_replay() {
         let mut buf = EventReplayBuffer::new(5);
         for i in 1..=3 {
-            buf.store(SbiEvent::new(i, SbiEventCategory::Analytics, "TEST", "nf-1", "{}"));
+            buf.store(SbiEvent::new(
+                i,
+                SbiEventCategory::Analytics,
+                "TEST",
+                "nf-1",
+                "{}",
+            ));
         }
         assert_eq!(buf.len(), 3);
 

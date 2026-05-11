@@ -2,7 +2,7 @@
 //!
 //! Port of src/amf/gmm-build.c - GMM message building functions for 5G NAS
 
-use crate::context::{AmfUe, AmfSess, Guti5gs};
+use crate::context::{AmfSess, AmfUe, Guti5gs};
 use bytes::{BufMut, BytesMut};
 
 // ============================================================================
@@ -217,7 +217,9 @@ impl NasMessageBuilder {
     /// Create a new NAS message builder with security header
     pub fn with_security_header(security_header_type: u8) -> Self {
         let mut builder = Self::new();
-        builder.buffer.put_u8(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+        builder
+            .buffer
+            .put_u8(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
         builder.buffer.put_u8(security_header_type);
         builder
     }
@@ -309,9 +311,8 @@ impl Default for NasMessageBuilder {
 
 /// Build Registration Accept message
 pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
-    let mut builder = NasMessageBuilder::with_security_header(
-        security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
-    );
+    let mut builder =
+        NasMessageBuilder::with_security_header(security_header::INTEGRITY_PROTECTED_AND_CIPHERED);
 
     // GMM header
     builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
@@ -352,9 +353,8 @@ pub fn build_registration_reject(gmm_cause: GmmCause) -> Vec<u8> {
 
 /// Build Service Accept message
 pub fn build_service_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
-    let mut builder = NasMessageBuilder::with_security_header(
-        security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
-    );
+    let mut builder =
+        NasMessageBuilder::with_security_header(security_header::INTEGRITY_PROTECTED_AND_CIPHERED);
 
     // GMM header
     builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
@@ -364,7 +364,7 @@ pub fn build_service_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
     if amf_ue.pdu_session_status_present {
         let psi = get_pdu_session_status(amf_ue);
         builder.write_u8(0x50); // IEI
-        builder.write_u8(2);    // length
+        builder.write_u8(2); // length
         builder.write_u16(psi);
     }
 
@@ -387,7 +387,7 @@ pub fn build_service_reject(amf_ue: &AmfUe, gmm_cause: GmmCause) -> Vec<u8> {
     if amf_ue.pdu_session_status_present {
         let psi = get_pdu_session_status(amf_ue);
         builder.write_u8(0x50); // IEI
-        builder.write_u8(2);    // length
+        builder.write_u8(2); // length
         builder.write_u16(psi);
     }
 
@@ -396,9 +396,8 @@ pub fn build_service_reject(amf_ue: &AmfUe, gmm_cause: GmmCause) -> Vec<u8> {
 
 /// Build Deregistration Accept message (UE-initiated)
 pub fn build_deregistration_accept(_amf_ue: &AmfUe) -> Option<Vec<u8>> {
-    let mut builder = NasMessageBuilder::with_security_header(
-        security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
-    );
+    let mut builder =
+        NasMessageBuilder::with_security_header(security_header::INTEGRITY_PROTECTED_AND_CIPHERED);
 
     // GMM header
     builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
@@ -413,16 +412,16 @@ pub fn build_deregistration_request(
     dereg_reason: DeregistrationReason,
     gmm_cause: Option<GmmCause>,
 ) -> Option<Vec<u8>> {
-    let mut builder = NasMessageBuilder::with_security_header(
-        security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
-    );
+    let mut builder =
+        NasMessageBuilder::with_security_header(security_header::INTEGRITY_PROTECTED_AND_CIPHERED);
 
     // GMM header
     builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
     builder.write_message_type(message_type::DEREGISTRATION_REQUEST_TO_UE);
 
     // De-registration type
-    let re_registration_required = matches!(dereg_reason, DeregistrationReason::ReregistrationRequired);
+    let re_registration_required =
+        matches!(dereg_reason, DeregistrationReason::ReregistrationRequired);
     let dereg_type = if re_registration_required { 0x01 } else { 0x00 };
     builder.write_u8(dereg_type);
 
@@ -501,9 +500,8 @@ pub fn build_security_mode_command(amf_ue: &AmfUe) -> Option<Vec<u8>> {
     builder.write_message_type(message_type::SECURITY_MODE_COMMAND);
 
     // Selected NAS security algorithms
-    let security_algorithms = 
-        ((amf_ue.selected_int_algorithm & 0x0f) << 4) | 
-        (amf_ue.selected_enc_algorithm & 0x0f);
+    let security_algorithms =
+        ((amf_ue.selected_int_algorithm & 0x0f) << 4) | (amf_ue.selected_enc_algorithm & 0x0f);
     builder.write_u8(security_algorithms);
 
     // ngKSI
@@ -526,7 +524,7 @@ pub fn build_security_mode_command(amf_ue: &AmfUe) -> Option<Vec<u8>> {
 
     // Additional 5G security information (optional, IEI = 0x36)
     builder.write_u8(0x36); // IEI
-    builder.write_u8(1);    // length
+    builder.write_u8(1); // length
     builder.write_u8(0x01); // Retransmission of initial NAS message requested
 
     Some(builder.build())
@@ -537,9 +535,8 @@ pub fn build_configuration_update_command(
     amf_ue: &AmfUe,
     param: &ConfigurationUpdateCommandParam,
 ) -> Option<Vec<u8>> {
-    let mut builder = NasMessageBuilder::with_security_header(
-        security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
-    );
+    let mut builder =
+        NasMessageBuilder::with_security_header(security_header::INTEGRITY_PROTECTED_AND_CIPHERED);
 
     // GMM header
     builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
@@ -576,9 +573,8 @@ pub fn build_dl_nas_transport(
     gmm_cause: Option<GmmCause>,
     backoff_time: Option<u8>,
 ) -> Option<Vec<u8>> {
-    let mut builder = NasMessageBuilder::with_security_header(
-        security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
-    );
+    let mut builder =
+        NasMessageBuilder::with_security_header(security_header::INTEGRITY_PROTECTED_AND_CIPHERED);
 
     // GMM header
     builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
@@ -605,8 +601,8 @@ pub fn build_dl_nas_transport(
     if let Some(time) = backoff_time {
         if time >= 2 {
             builder.write_u8(0x37); // IEI
-            builder.write_u8(1);    // length
-            // Timer unit: multiples of 2 seconds (unit = 0)
+            builder.write_u8(1); // length
+                                 // Timer unit: multiples of 2 seconds (unit = 0)
             builder.write_u8(time / 2);
         }
     }
@@ -616,9 +612,8 @@ pub fn build_dl_nas_transport(
 
 /// Build 5GMM Status message
 pub fn build_gmm_status(gmm_cause: GmmCause) -> Option<Vec<u8>> {
-    let mut builder = NasMessageBuilder::with_security_header(
-        security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
-    );
+    let mut builder =
+        NasMessageBuilder::with_security_header(security_header::INTEGRITY_PROTECTED_AND_CIPHERED);
 
     // GMM header
     builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
@@ -742,7 +737,7 @@ mod tests {
     #[test]
     fn test_build_registration_reject() {
         let msg = build_registration_reject(GmmCause::IllegalUe);
-        
+
         assert!(!msg.is_empty());
         assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
         assert_eq!(msg[1], 0x00); // Plain NAS
@@ -753,7 +748,7 @@ mod tests {
     #[test]
     fn test_build_identity_request() {
         let msg = build_identity_request();
-        
+
         assert!(!msg.is_empty());
         assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
         assert_eq!(msg[1], 0x00); // Plain NAS
@@ -764,7 +759,7 @@ mod tests {
     #[test]
     fn test_build_authentication_reject() {
         let msg = build_authentication_reject();
-        
+
         assert!(!msg.is_empty());
         assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
         assert_eq!(msg[1], 0x00); // Plain NAS
@@ -775,7 +770,7 @@ mod tests {
     fn test_build_authentication_request() {
         let amf_ue = create_test_amf_ue();
         let msg = build_authentication_request(&amf_ue);
-        
+
         assert!(!msg.is_empty());
         assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
         assert_eq!(msg[1], 0x00); // Plain NAS
@@ -786,7 +781,7 @@ mod tests {
     fn test_build_security_mode_command() {
         let amf_ue = create_test_amf_ue();
         let msg = build_security_mode_command(&amf_ue);
-        
+
         assert!(msg.is_some());
         let msg = msg.unwrap();
         assert!(!msg.is_empty());
@@ -798,7 +793,7 @@ mod tests {
     fn test_build_registration_accept() {
         let amf_ue = create_test_amf_ue();
         let msg = build_registration_accept(&amf_ue);
-        
+
         assert!(msg.is_some());
         let msg = msg.unwrap();
         assert!(!msg.is_empty());
@@ -808,7 +803,7 @@ mod tests {
     fn test_build_service_reject() {
         let amf_ue = create_test_amf_ue();
         let msg = build_service_reject(&amf_ue, GmmCause::Congestion);
-        
+
         assert!(!msg.is_empty());
         assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
         assert_eq!(msg[2], message_type::SERVICE_REJECT);
@@ -820,7 +815,7 @@ mod tests {
         let sess = create_test_sess();
         let payload = vec![0x01, 0x02, 0x03];
         let msg = build_dl_nas_transport(&sess, 0x01, &payload, None, None);
-        
+
         assert!(msg.is_some());
         let msg = msg.unwrap();
         assert!(!msg.is_empty());
@@ -829,7 +824,7 @@ mod tests {
     #[test]
     fn test_build_gmm_status() {
         let msg = build_gmm_status(GmmCause::ProtocolErrorUnspecified);
-        
+
         assert!(msg.is_some());
         let msg = msg.unwrap();
         assert!(!msg.is_empty());
@@ -844,7 +839,7 @@ mod tests {
             amf_pointer: 1,
             tmsi: 0x12345678,
         };
-        
+
         let encoded = encode_guti(&guti);
         assert_eq!(encoded.len(), 11);
         assert_eq!(encoded[0] & 0x07, mobile_identity_type::GUTI);

@@ -85,7 +85,11 @@ impl PcfAmSmContext {
                 log::debug!("[{}] PCF AM exiting deleted state", pcf_ue_am.supi);
             }
             _ => {
-                log::error!("[{}] Unknown event {} in deleted state", pcf_ue_am.supi, event.name());
+                log::error!(
+                    "[{}] Unknown event {} in deleted state",
+                    pcf_ue_am.supi,
+                    event.name()
+                );
             }
         }
     }
@@ -107,7 +111,11 @@ impl PcfAmSmContext {
                 log::debug!("[{}] PCF AM exiting exception state", pcf_ue_am.supi);
             }
             _ => {
-                log::error!("[{}] Unknown event {} in exception state", pcf_ue_am.supi, event.name());
+                log::error!(
+                    "[{}] Unknown event {} in exception state",
+                    pcf_ue_am.supi,
+                    event.name()
+                );
             }
         }
     }
@@ -171,13 +179,21 @@ impl PcfAmSmContext {
 
         match method.as_str() {
             "POST" => {
-                log::debug!("[{}] Handling AM policy control create (stream={})", pcf_ue_am.supi, stream_id);
+                log::debug!(
+                    "[{}] Handling AM policy control create (stream={})",
+                    pcf_ue_am.supi,
+                    stream_id
+                );
                 // Note: pcf_npcf_am_policy_control_handle_create builds PolicyAssociation response
                 // The handler is invoked via the direct HTTP path in main.rs
                 log::info!("[{}] AM policy association created", pcf_ue_am.supi);
             }
             "DELETE" => {
-                log::debug!("[{}] Handling AM policy control delete (stream={})", pcf_ue_am.supi, stream_id);
+                log::debug!(
+                    "[{}] Handling AM policy control delete (stream={})",
+                    pcf_ue_am.supi,
+                    stream_id
+                );
                 // Note: HTTP 204 No Content response is sent by the HTTP handler in main.rs
                 log::info!("[{}] AM policy association deleted", pcf_ue_am.supi);
                 self.state = PcfAmState::Deleted;
@@ -219,7 +235,12 @@ impl PcfAmSmContext {
 
         match service_name.as_str() {
             "nudr-dr" => {
-                self.handle_nudr_dr_response(pcf_ue_am, stream_id, &resource_components, res_status);
+                self.handle_nudr_dr_response(
+                    pcf_ue_am,
+                    stream_id,
+                    &resource_components,
+                    res_status,
+                );
             }
             _ => {
                 log::error!("[{}] Invalid API name [{}]", pcf_ue_am.supi, service_name);
@@ -254,7 +275,11 @@ impl PcfAmSmContext {
                 log::debug!("[{}] NUDR DR AM data response received", pcf_ue_am.supi);
             }
             _ => {
-                log::error!("[{}] Invalid resource name [{:?}]", pcf_ue_am.supi, resource_components);
+                log::error!(
+                    "[{}] Invalid resource name [{:?}]",
+                    pcf_ue_am.supi,
+                    resource_components
+                );
             }
         }
     }

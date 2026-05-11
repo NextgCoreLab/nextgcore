@@ -26,19 +26,22 @@ pub mod zero_trust; // Zero-trust policy engine for inter-PLMN N32 (TS 33.501)
 
 // Re-export specific items to avoid ambiguous glob re-exports
 pub use context::{
-    sepp_self, sepp_context_init, sepp_context_final, SeppContext, SeppNode, SeppAssoc,
-    PlmnId, SecurityCapability, NfType, SbiServiceType, SecurityCapabilityConfig,
+    sepp_context_final, sepp_context_init, sepp_self, NfType, PlmnId, SbiServiceType,
+    SecurityCapability, SecurityCapabilityConfig, SeppAssoc, SeppContext, SeppNode,
 };
-pub use event::{SeppEventId, SeppTimerId, SeppEvent};
-pub use handshake_sm::{HandshakeState, HandshakeSmContext};
-pub use n32c_build::{build_security_capability_request, build_security_capability_response, build_security_capability_sbi_request};
+pub use event::{SeppEvent, SeppEventId, SeppTimerId};
+pub use handshake_sm::{HandshakeSmContext, HandshakeState};
+pub use n32c_build::{
+    build_security_capability_request, build_security_capability_response,
+    build_security_capability_sbi_request,
+};
 pub use n32c_handler::{handle_security_capability_request, handle_security_capability_response};
 pub use sbi_path::{
-    sepp_sbi_open, sepp_sbi_close, sepp_sbi_is_running, handle_request, handle_response,
-    SbiServerConfig, SbiRequest, SbiResponse, RequestHandlerResult,
+    handle_request, handle_response, sepp_sbi_close, sepp_sbi_is_running, sepp_sbi_open,
+    RequestHandlerResult, SbiRequest, SbiResponse, SbiServerConfig,
 };
 pub use sepp_sm::SeppSmContext;
-pub use timer::{TimerConfig, TimerManager, sepp_timer_get_name, timer_manager};
+pub use timer::{sepp_timer_get_name, timer_manager, TimerConfig, TimerManager};
 
 /// NextGCore SEPP - Security Edge Protection Proxy
 #[derive(Parser, Debug)]
@@ -119,11 +122,10 @@ async fn main() -> Result<()> {
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
-            .with_endpoint(
-                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
-            ),
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+        ),
     )
     .ok();
 
@@ -288,7 +290,9 @@ async fn run_event_loop_async(
         for entry in &expired {
             log::debug!(
                 "SEPP timer expired: id={} type={:?} data={:?}",
-                entry.id, entry.timer_type, entry.data
+                entry.id,
+                entry.timer_type,
+                entry.data
             );
 
             // Create timer event and dispatch to state machine

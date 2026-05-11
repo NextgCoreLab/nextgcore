@@ -3,13 +3,12 @@
 //! Port of src/upf/pfcp-path.c - PFCP path management for UPF
 
 use crate::n4_build::{
-    build_association_setup_response, build_heartbeat_response,
-    build_session_deletion_response, build_session_establishment_response,
-    build_session_modification_response, build_session_report_request,
-    parse_create_far, parse_create_pdr, parse_create_qer, parse_create_urr,
-    pfcp_ie, pfcp_type, CreatedPdr, FSeid, FTeid, NodeId,
-    ParsedCreateFar, ParsedCreatePdr, ParsedCreateQer, ParsedCreateUrr,
-    ParsedFSeid, ParsedIe, ParsedPfcpHeader, PfcpCause, UserPlaneReport,
+    build_association_setup_response, build_heartbeat_response, build_session_deletion_response,
+    build_session_establishment_response, build_session_modification_response,
+    build_session_report_request, parse_create_far, parse_create_pdr, parse_create_qer,
+    parse_create_urr, pfcp_ie, pfcp_type, CreatedPdr, FSeid, FTeid, NodeId, ParsedCreateFar,
+    ParsedCreatePdr, ParsedCreateQer, ParsedCreateUrr, ParsedFSeid, ParsedIe, ParsedPfcpHeader,
+    PfcpCause, UserPlaneReport,
 };
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -319,11 +318,9 @@ pub fn send_session_report_request(
     report: &UserPlaneReport,
 ) -> Result<(u32, Vec<u8>), &'static str> {
     let seq = ctx.create_local_xact(smf_n4_seid);
-    
-    let payload = build_session_report_request(
-        crate::n4_build::pfcp_type::SESSION_REPORT_REQUEST,
-        report,
-    );
+
+    let payload =
+        build_session_report_request(crate::n4_build::pfcp_type::SESSION_REPORT_REQUEST, report);
 
     let header = PfcpHeader::new(
         crate::n4_build::pfcp_type::SESSION_REPORT_REQUEST,
@@ -753,7 +750,12 @@ impl PfcpServer {
                 Ok(qer) => {
                     log::debug!(
                         "QER {}: ul_gate={}, dl_gate={}, ul_mbr={}, dl_mbr={}, qfi={:?}",
-                        qer.qer_id, qer.ul_gate, qer.dl_gate, qer.ul_mbr, qer.dl_mbr, qer.qfi
+                        qer.qer_id,
+                        qer.ul_gate,
+                        qer.dl_gate,
+                        qer.ul_mbr,
+                        qer.dl_mbr,
+                        qer.qfi
                     );
                     parsed_qers.push(qer);
                 }
@@ -770,7 +772,9 @@ impl PfcpServer {
                 Ok(urr) => {
                     log::debug!(
                         "URR {}: vol_thresh={:?}, time_thresh={:?}",
-                        urr.urr_id, urr.volume_threshold_total, urr.time_threshold_secs
+                        urr.urr_id,
+                        urr.volume_threshold_total,
+                        urr.time_threshold_secs
                     );
                     parsed_urrs.push(urr);
                 }
@@ -860,9 +864,7 @@ impl PfcpServer {
         src_addr: SocketAddr,
     ) -> Result<(), String> {
         let upf_seid = header.seid;
-        log::info!(
-            "Handling Session Modification Request for SEID {upf_seid:#x}"
-        );
+        log::info!("Handling Session Modification Request for SEID {upf_seid:#x}");
 
         let ies = ParsedIe::parse_all(payload);
 
@@ -875,7 +877,11 @@ impl PfcpServer {
         for far_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::UPDATE_FAR) {
             match parse_create_far(&far_ie.value) {
                 Ok(far) => {
-                    log::debug!("Update FAR {}: apply_action={:#x}", far.far_id, far.apply_action);
+                    log::debug!(
+                        "Update FAR {}: apply_action={:#x}",
+                        far.far_id,
+                        far.apply_action
+                    );
                     if let Some(ref fp) = far.forwarding_parameters {
                         if let Some(ref ohc) = fp.outer_header_creation {
                             updated_dl_teid = Some(ohc.teid);
@@ -984,10 +990,7 @@ impl PfcpServer {
             sessions.remove(&upf_seid)
         };
 
-        let smf_seid = session_info
-            .as_ref()
-            .map(|s| s.smf_seid)
-            .unwrap_or(0);
+        let smf_seid = session_info.as_ref().map(|s| s.smf_seid).unwrap_or(0);
         let ue_ipv4 = session_info.as_ref().and_then(|s| s.ue_ipv4);
 
         // Build response (no usage reports for now)
@@ -1031,9 +1034,7 @@ impl PfcpServer {
         // Look up the SMF address from the session
         let smf_addr = {
             let sessions = self.sessions.read().await;
-            sessions
-                .get(&upf_seid)
-                .map(|s| s.smf_addr)
+            sessions.get(&upf_seid).map(|s| s.smf_addr)
         };
 
         let smf_addr = match smf_addr {
@@ -1076,10 +1077,8 @@ impl PfcpServer {
             ..Default::default()
         };
 
-        let payload = build_session_report_request(
-            pfcp_type::SESSION_REPORT_REQUEST,
-            &user_plane_report,
-        );
+        let payload =
+            build_session_report_request(pfcp_type::SESSION_REPORT_REQUEST, &user_plane_report);
 
         // Use a simple sequence number (atomic counter)
         let seq = self.next_teid.fetch_add(1, Ordering::SeqCst); // reuse counter for seq
@@ -1167,8 +1166,8 @@ mod tests {
         let header = PfcpHeader::new(51, 0x1234, 1);
         let encoded = header.encode(10);
         assert_eq!(encoded[0], 0x21); // version=1, SEID present
-        assert_eq!(encoded[1], 51);   // msg_type
-        // length = 12 + 10 = 22
+        assert_eq!(encoded[1], 51); // msg_type
+                                    // length = 12 + 10 = 22
         assert_eq!(&encoded[2..4], &22u16.to_be_bytes());
     }
 
@@ -1195,7 +1194,7 @@ mod tests {
         let header = PfcpHeader::new(56, 0x1234, 1);
         xact.update_tx(&header, vec![1, 2, 3]);
         assert_eq!(xact.state, XactState::Pending);
-        
+
         let msg = xact.commit().unwrap();
         assert!(!msg.is_empty());
         assert_eq!(xact.state, XactState::Complete);
@@ -1259,9 +1258,9 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8805);
         pfcp_open(&mut ctx, addr).unwrap();
         ctx.create_local_xact(0x1234);
-        
+
         pfcp_close(&mut ctx);
-        
+
         assert!(ctx.local_addr.is_none());
         assert!(ctx.transactions.is_empty());
         assert!(ctx.peer_nodes.is_empty());
@@ -1272,26 +1271,24 @@ mod tests {
         let mut ctx = PfcpPathContext::new();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8805);
         pfcp_open(&mut ctx, addr).unwrap();
-        
+
         let seq = ctx.create_local_xact(0x1234);
         // Set up the xact first
         {
             let xact = ctx.find_xact(seq).unwrap();
             xact.local = false;
         }
-        
-        let created_pdrs = vec![
-            CreatedPdr {
-                pdr_id: 1,
-                local_f_teid: None,
-                ue_ip_address: None,
-            },
-        ];
-        
+
+        let created_pdrs = vec![CreatedPdr {
+            pdr_id: 1,
+            local_f_teid: None,
+            ue_ip_address: None,
+        }];
+
         // Now get xact again and call the function
         let xact = ctx.transactions.get_mut(&seq).unwrap();
         let node_id = ctx.local_node_id.clone();
-        
+
         let f_seid = FSeid {
             seid: 0x5678,
             ipv4: match &node_id {
@@ -1300,7 +1297,7 @@ mod tests {
             },
             ipv6: None,
         };
-        
+
         let payload = build_session_establishment_response(
             crate::n4_build::pfcp_type::SESSION_ESTABLISHMENT_RESPONSE,
             0x5678,
@@ -1308,16 +1305,16 @@ mod tests {
             &f_seid,
             &created_pdrs,
         );
-        
+
         let header = PfcpHeader::new(
             crate::n4_build::pfcp_type::SESSION_ESTABLISHMENT_RESPONSE,
             0x1234,
             xact.sequence_number,
         );
-        
+
         xact.update_tx(&header, payload);
         let result = xact.commit();
-        
+
         assert!(result.is_ok());
     }
 
@@ -1329,7 +1326,7 @@ mod tests {
             let xact = ctx.find_xact(seq).unwrap();
             xact.local = false;
         }
-        
+
         let xact = ctx.transactions.get_mut(&seq).unwrap();
         let payload = build_session_modification_response(
             crate::n4_build::pfcp_type::SESSION_MODIFICATION_RESPONSE,
@@ -1342,7 +1339,7 @@ mod tests {
         );
         xact.update_tx(&header, payload);
         let result = xact.commit();
-        
+
         assert!(result.is_ok());
     }
 
@@ -1354,7 +1351,7 @@ mod tests {
             let xact = ctx.find_xact(seq).unwrap();
             xact.local = false;
         }
-        
+
         let xact = ctx.transactions.get_mut(&seq).unwrap();
         let payload = build_session_deletion_response(
             crate::n4_build::pfcp_type::SESSION_DELETION_RESPONSE,
@@ -1367,7 +1364,7 @@ mod tests {
         );
         xact.update_tx(&header, payload);
         let result = xact.commit();
-        
+
         assert!(result.is_ok());
     }
 
@@ -1376,10 +1373,10 @@ mod tests {
         let mut ctx = PfcpPathContext::new();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8805);
         pfcp_open(&mut ctx, addr).unwrap();
-        
+
         let report = UserPlaneReport::default();
         let result = send_session_report_request(&mut ctx, 0x1234, &report);
-        
+
         assert!(result.is_ok());
         let (seq, msg) = result.unwrap();
         assert_eq!(seq, 1);

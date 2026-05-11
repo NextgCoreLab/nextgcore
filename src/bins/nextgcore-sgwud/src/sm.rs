@@ -97,9 +97,7 @@ impl SgwuStateMachine {
                 log::debug!("SGWU FSM: Initial -> Operational");
                 SgwuSmResult::StateChanged(SgwuState::Operational)
             }
-            SgwuEventId::FsmExit => {
-                SgwuSmResult::Ok
-            }
+            SgwuEventId::FsmExit => SgwuSmResult::Ok,
             _ => {
                 log::warn!("Unexpected event {} in initial state", event.name());
                 SgwuSmResult::Ok
@@ -111,9 +109,7 @@ impl SgwuStateMachine {
     /// Port of sgwu_state_final from sgwu-sm.c
     fn state_final(&mut self, event: &SgwuEvent) -> SgwuSmResult {
         match event.id {
-            SgwuEventId::FsmEntry | SgwuEventId::FsmExit => {
-                SgwuSmResult::Ok
-            }
+            SgwuEventId::FsmEntry | SgwuEventId::FsmExit => SgwuSmResult::Ok,
             _ => {
                 log::warn!("Unexpected event {} in final state", event.name());
                 SgwuSmResult::Ok
@@ -182,10 +178,7 @@ impl SgwuStateMachine {
     /// Handle SXA no heartbeat event
     fn handle_sxa_no_heartbeat(&self, event: &SgwuEvent) -> SgwuSmResult {
         if let Some(ref pfcp) = event.pfcp {
-            log::warn!(
-                "SGWU: No heartbeat from PFCP node {:?}",
-                pfcp.pfcp_node_id
-            );
+            log::warn!("SGWU: No heartbeat from PFCP node {:?}", pfcp.pfcp_node_id);
             SgwuSmResult::DispatchToPfcpNode(pfcp.pfcp_node_id.unwrap_or(0))
         } else {
             log::error!("SXA no heartbeat event without PFCP data");
@@ -256,7 +249,7 @@ mod tests {
     #[test]
     fn test_state_machine_operational() {
         let mut sm = SgwuStateMachine::new();
-        
+
         // Transition to operational
         sm.dispatch(&SgwuEvent::entry());
         assert!(sm.is_operational());
@@ -292,10 +285,10 @@ mod tests {
     #[test]
     fn test_state_machine_entry_exit() {
         let mut sm = SgwuStateMachine::new();
-        
+
         // Transition to operational
         sm.dispatch(&SgwuEvent::entry());
-        
+
         // Entry event in operational state
         let result = sm.dispatch(&SgwuEvent::entry());
         assert_eq!(result, SgwuSmResult::Ok);

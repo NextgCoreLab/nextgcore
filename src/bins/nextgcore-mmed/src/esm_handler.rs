@@ -2,8 +2,8 @@
 //!
 //! Port of src/mme/esm-handler.c - ESM message handling functions
 
-use crate::context::{MmeUe, MmeSess, MmeBearer, EnbUe};
-use crate::esm_build::{EsmCause, PdnType, CreateAction};
+use crate::context::{EnbUe, MmeBearer, MmeSess, MmeUe};
+use crate::esm_build::{CreateAction, EsmCause, PdnType};
 
 // ============================================================================
 // ESM Error Types
@@ -52,7 +52,6 @@ impl std::error::Error for EsmError {}
 
 /// ESM result type
 pub type EsmResult<T> = Result<T, EsmError>;
-
 
 // ============================================================================
 // PDN Connectivity Request Data
@@ -147,7 +146,6 @@ pub struct RequiredQos {
     pub mbr_dl: u64,
 }
 
-
 // ============================================================================
 // ESM Message Handling Functions
 // ============================================================================
@@ -165,15 +163,17 @@ pub fn handle_pdn_connectivity_request(
     if !mme_ue.security_context_available {
         return Err(EsmError::NoSecurityContext);
     }
-    
+
     // Minimum length check: request type (1) + PDN type (1)
     if data.len() < 2 {
-        return Err(EsmError::InvalidMessage("PDN connectivity request too short".to_string()));
+        return Err(EsmError::InvalidMessage(
+            "PDN connectivity request too short".to_string(),
+        ));
     }
-    
+
     let mut result = PdnConnectivityRequestData::default();
     let mut offset = 0;
-    
+
     // Request type (4 bits) + PDN type (4 bits)
     let request_type_pdn_type = data[offset];
     result.request_type = request_type_pdn_type & 0x0f;
@@ -186,16 +186,16 @@ pub fn handle_pdn_connectivity_request(
         _ => return Err(EsmError::InvalidPdnType(pdn_type_value)),
     };
     offset += 1;
-    
+
     // Parse optional IEs
     while offset < data.len() {
         if offset >= data.len() {
             break;
         }
-        
+
         let iei = data[offset];
         offset += 1;
-        
+
         match iei {
             // ESM information transfer flag (type 1)
             0xd0..=0xdf => {
@@ -250,10 +250,9 @@ pub fn handle_pdn_connectivity_request(
             }
         }
     }
-    
+
     Ok(result)
 }
-
 
 /// Handle ESM information response
 pub fn handle_esm_information_response(
@@ -264,16 +263,16 @@ pub fn handle_esm_information_response(
 ) -> EsmResult<EsmInformationResponseData> {
     let mut result = EsmInformationResponseData::default();
     let mut offset = 0;
-    
+
     // Parse optional IEs
     while offset < data.len() {
         if offset >= data.len() {
             break;
         }
-        
+
         let iei = data[offset];
         offset += 1;
-        
+
         match iei {
             // Access point name
             0x28 => {
@@ -324,7 +323,7 @@ pub fn handle_esm_information_response(
             }
         }
     }
-    
+
     Ok(result)
 }
 
@@ -338,37 +337,43 @@ pub fn handle_bearer_resource_allocation_request(
 ) -> EsmResult<BearerResourceAllocationRequestData> {
     // Minimum length: linked EBI (1) + TFA length (1)
     if data.len() < 2 {
-        return Err(EsmError::InvalidMessage("Bearer resource allocation request too short".to_string()));
+        return Err(EsmError::InvalidMessage(
+            "Bearer resource allocation request too short".to_string(),
+        ));
     }
-    
+
     let mut result = BearerResourceAllocationRequestData::default();
     let mut offset = 0;
-    
+
     // Linked EPS bearer identity (4 bits) + spare (4 bits)
     result.linked_ebi = data[offset] & 0x0f;
     offset += 1;
-    
+
     // Traffic flow aggregate
     if offset >= data.len() {
-        return Err(EsmError::MissingMandatoryIe("Traffic flow aggregate".to_string()));
+        return Err(EsmError::MissingMandatoryIe(
+            "Traffic flow aggregate".to_string(),
+        ));
     }
     let tfa_len = data[offset] as usize;
     offset += 1;
     if offset + tfa_len > data.len() {
-        return Err(EsmError::InvalidMessage("TFA length exceeds message".to_string()));
+        return Err(EsmError::InvalidMessage(
+            "TFA length exceeds message".to_string(),
+        ));
     }
     result.tfa = data[offset..offset + tfa_len].to_vec();
     offset += tfa_len;
-    
+
     // Parse optional IEs
     while offset < data.len() {
         if offset >= data.len() {
             break;
         }
-        
+
         let iei = data[offset];
         offset += 1;
-        
+
         match iei {
             // Required traffic flow QoS
             0x5b => {
@@ -393,10 +398,9 @@ pub fn handle_bearer_resource_allocation_request(
             }
         }
     }
-    
+
     Ok(result)
 }
-
 
 /// Handle bearer resource modification request
 pub fn handle_bearer_resource_modification_request(
@@ -408,37 +412,43 @@ pub fn handle_bearer_resource_modification_request(
 ) -> EsmResult<BearerResourceModificationRequestData> {
     // Minimum length: EBI for PF (1) + TFA length (1)
     if data.len() < 2 {
-        return Err(EsmError::InvalidMessage("Bearer resource modification request too short".to_string()));
+        return Err(EsmError::InvalidMessage(
+            "Bearer resource modification request too short".to_string(),
+        ));
     }
-    
+
     let mut result = BearerResourceModificationRequestData::default();
     let mut offset = 0;
-    
+
     // EPS bearer identity for packet filter (4 bits) + spare (4 bits)
     result.ebi_for_pf = data[offset] & 0x0f;
     offset += 1;
-    
+
     // Traffic flow aggregate
     if offset >= data.len() {
-        return Err(EsmError::MissingMandatoryIe("Traffic flow aggregate".to_string()));
+        return Err(EsmError::MissingMandatoryIe(
+            "Traffic flow aggregate".to_string(),
+        ));
     }
     let tfa_len = data[offset] as usize;
     offset += 1;
     if offset + tfa_len > data.len() {
-        return Err(EsmError::InvalidMessage("TFA length exceeds message".to_string()));
+        return Err(EsmError::InvalidMessage(
+            "TFA length exceeds message".to_string(),
+        ));
     }
     result.tfa = data[offset..offset + tfa_len].to_vec();
     offset += tfa_len;
-    
+
     // Parse optional IEs
     while offset < data.len() {
         if offset >= data.len() {
             break;
         }
-        
+
         let iei = data[offset];
         offset += 1;
-        
+
         match iei {
             // Required traffic flow QoS
             0x5b => {
@@ -472,7 +482,7 @@ pub fn handle_bearer_resource_modification_request(
             }
         }
     }
-    
+
     Ok(result)
 }
 
@@ -501,7 +511,7 @@ pub fn handle_activate_default_bearer_context_reject(
     if data.is_empty() {
         return Err(EsmError::MissingMandatoryIe("ESM cause".to_string()));
     }
-    
+
     Ok(esm_cause_from_u8(data[0]))
 }
 
@@ -529,10 +539,9 @@ pub fn handle_activate_dedicated_bearer_context_reject(
     if data.is_empty() {
         return Err(EsmError::MissingMandatoryIe("ESM cause".to_string()));
     }
-    
+
     Ok(esm_cause_from_u8(data[0]))
 }
-
 
 /// Handle modify EPS bearer context accept
 pub fn handle_modify_bearer_context_accept(
@@ -558,7 +567,7 @@ pub fn handle_modify_bearer_context_reject(
     if data.is_empty() {
         return Err(EsmError::MissingMandatoryIe("ESM cause".to_string()));
     }
-    
+
     Ok(esm_cause_from_u8(data[0]))
 }
 
@@ -583,43 +592,39 @@ pub fn handle_pdn_disconnect_request(
 ) -> EsmResult<u8> {
     // Linked EPS bearer identity is mandatory
     if data.is_empty() {
-        return Err(EsmError::MissingMandatoryIe("Linked EPS bearer identity".to_string()));
+        return Err(EsmError::MissingMandatoryIe(
+            "Linked EPS bearer identity".to_string(),
+        ));
     }
-    
+
     // Linked EBI (4 bits) + spare (4 bits)
     let linked_ebi = data[0] & 0x0f;
-    
+
     Ok(linked_ebi)
 }
 
 /// Handle ESM status message
-pub fn handle_esm_status(
-    _enb_ue: &EnbUe,
-    _mme_ue: &MmeUe,
-    data: &[u8],
-) -> EsmResult<EsmCause> {
+pub fn handle_esm_status(_enb_ue: &EnbUe, _mme_ue: &MmeUe, data: &[u8]) -> EsmResult<EsmCause> {
     // ESM cause is mandatory
     if data.is_empty() {
         return Err(EsmError::MissingMandatoryIe("ESM cause".to_string()));
     }
-    
+
     Ok(esm_cause_from_u8(data[0]))
 }
 
 /// Handle notification message
-pub fn handle_notification(
-    _enb_ue: &EnbUe,
-    _mme_ue: &MmeUe,
-    data: &[u8],
-) -> EsmResult<u8> {
+pub fn handle_notification(_enb_ue: &EnbUe, _mme_ue: &MmeUe, data: &[u8]) -> EsmResult<u8> {
     // Notification indicator is mandatory
     if data.is_empty() {
-        return Err(EsmError::MissingMandatoryIe("Notification indicator".to_string()));
+        return Err(EsmError::MissingMandatoryIe(
+            "Notification indicator".to_string(),
+        ));
     }
-    
+
     // Notification indicator value
     let notification_indicator = data[0];
-    
+
     Ok(notification_indicator)
 }
 
@@ -683,7 +688,7 @@ pub enum EsmMessageType {
 
 impl TryFrom<u8> for EsmMessageType {
     type Error = EsmError;
-    
+
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0xc1 => Ok(EsmMessageType::ActivateDefaultEpsBearerContextRequest),
@@ -710,7 +715,9 @@ impl TryFrom<u8> for EsmMessageType {
             0xdb => Ok(EsmMessageType::Notification),
             0xdc => Ok(EsmMessageType::EsmDummyMessage),
             0xe8 => Ok(EsmMessageType::EsmStatus),
-            _ => Err(EsmError::InvalidMessage(format!("Unknown ESM message type: 0x{value:02x}"))),
+            _ => Err(EsmError::InvalidMessage(format!(
+                "Unknown ESM message type: 0x{value:02x}"
+            ))),
         }
     }
 }
@@ -734,14 +741,14 @@ impl EsmHeader {
         if data.len() < 4 {
             return Err(EsmError::InvalidMessage("ESM header too short".to_string()));
         }
-        
+
         let header = EsmHeader {
             ebi: data[0] & 0x0f,
             protocol_discriminator: data[1],
             pti: data[2],
             message_type: data[3],
         };
-        
+
         Ok((header, &data[4..]))
     }
 }
@@ -770,30 +777,30 @@ impl ProtocolConfigurationOptions {
         if data.is_empty() {
             return Ok(Self::default());
         }
-        
+
         let mut pco = ProtocolConfigurationOptions {
             config_protocol: data[0] & 0x07,
             containers: Vec::new(),
         };
-        
+
         let mut offset = 1;
         while offset + 3 <= data.len() {
             let protocol_id = ((data[offset] as u16) << 8) | (data[offset + 1] as u16);
             let len = data[offset + 2] as usize;
             offset += 3;
-            
+
             if offset + len > data.len() {
                 break;
             }
-            
+
             pco.containers.push(PcoContainer {
                 protocol_id,
                 contents: data[offset..offset + len].to_vec(),
             });
-            
+
             offset += len;
         }
-        
+
         Ok(pco)
     }
 }
@@ -807,43 +814,43 @@ fn parse_apn(data: &[u8]) -> String {
     if data.is_empty() {
         return String::new();
     }
-    
+
     let mut result = String::new();
     let mut offset = 0;
-    
+
     while offset < data.len() {
         let label_len = data[offset] as usize;
         offset += 1;
-        
+
         if label_len == 0 || offset + label_len > data.len() {
             break;
         }
-        
+
         if !result.is_empty() {
             result.push('.');
         }
-        
+
         for &b in &data[offset..offset + label_len] {
             result.push(b as char);
         }
-        
+
         offset += label_len;
     }
-    
+
     result
 }
 
 /// Parse required QoS
 fn parse_required_qos(data: &[u8]) -> RequiredQos {
     let mut qos = RequiredQos::default();
-    
+
     if data.is_empty() {
         return qos;
     }
-    
+
     // QCI
     qos.qci = data[0];
-    
+
     // For GBR bearers (QCI 1-4), parse bitrates
     if data.len() >= 5 && qos.qci >= 1 && qos.qci <= 4 {
         qos.mbr_ul = decode_bitrate(data[1]);
@@ -851,7 +858,7 @@ fn parse_required_qos(data: &[u8]) -> RequiredQos {
         qos.gbr_ul = decode_bitrate(data[3]);
         qos.gbr_dl = decode_bitrate(data[4]);
     }
-    
+
     qos
 }
 
@@ -860,15 +867,15 @@ fn decode_bitrate(value: u8) -> u64 {
     if value == 0 || value == 0xff {
         return 0;
     }
-    
+
     if value <= 63 {
         return value as u64;
     }
-    
+
     if value <= 127 {
         return 64 + ((value - 64) as u64) * 8;
     }
-    
+
     // 128-254
     576 + ((value - 128) as u64) * 64
 }
@@ -905,7 +912,6 @@ fn esm_cause_from_u8(value: u8) -> EsmCause {
     }
 }
 
-
 // ============================================================================
 // Unit Tests
 // ============================================================================
@@ -918,13 +924,13 @@ mod tests {
     fn test_esm_error_display() {
         let err = EsmError::InvalidMessage("test".to_string());
         assert!(err.to_string().contains("Invalid message"));
-        
+
         let err = EsmError::MissingMandatoryIe("APN".to_string());
         assert!(err.to_string().contains("Missing mandatory IE"));
-        
+
         let err = EsmError::InvalidPdnType(99);
         assert!(err.to_string().contains("Invalid PDN type"));
-        
+
         let err = EsmError::NoSecurityContext;
         assert!(err.to_string().contains("No security context"));
     }
@@ -933,11 +939,11 @@ mod tests {
     fn test_parse_apn() {
         // Empty APN
         assert_eq!(parse_apn(&[]), "");
-        
+
         // Single label: "ims"
         let data = [3, b'i', b'm', b's'];
         assert_eq!(parse_apn(&data), "ims");
-        
+
         // Two labels: "ims.mnc001.mcc001.3gppnetwork.org"
         let data = [3, b'i', b'm', b's', 6, b'm', b'n', b'c', b'0', b'0', b'1'];
         assert_eq!(parse_apn(&data), "ims.mnc001");
@@ -948,16 +954,16 @@ mod tests {
         // 0 and 0xff = 0 kbps
         assert_eq!(decode_bitrate(0), 0);
         assert_eq!(decode_bitrate(0xff), 0);
-        
+
         // 1-63: direct value
         assert_eq!(decode_bitrate(1), 1);
         assert_eq!(decode_bitrate(63), 63);
-        
+
         // 64-127: 64 + (value - 64) * 8
         assert_eq!(decode_bitrate(64), 64);
         assert_eq!(decode_bitrate(65), 72);
         assert_eq!(decode_bitrate(127), 568);
-        
+
         // 128-254: 576 + (value - 128) * 64
         assert_eq!(decode_bitrate(128), 576);
         assert_eq!(decode_bitrate(129), 640);
@@ -973,7 +979,7 @@ mod tests {
         assert_eq!(esm_cause_from_u8(50), EsmCause::PdnTypeIpv4OnlyAllowed);
         assert_eq!(esm_cause_from_u8(51), EsmCause::PdnTypeIpv6OnlyAllowed);
         assert_eq!(esm_cause_from_u8(111), EsmCause::ProtocolErrorUnspecified);
-        
+
         // Unknown cause should map to protocol error
         assert_eq!(esm_cause_from_u8(200), EsmCause::ProtocolErrorUnspecified);
     }
@@ -983,12 +989,12 @@ mod tests {
         // Empty data
         let qos = parse_required_qos(&[]);
         assert_eq!(qos.qci, 0);
-        
+
         // Non-GBR bearer (QCI 9)
         let qos = parse_required_qos(&[9]);
         assert_eq!(qos.qci, 9);
         assert_eq!(qos.mbr_ul, 0);
-        
+
         // GBR bearer (QCI 1) with bitrates
         let qos = parse_required_qos(&[1, 64, 64, 32, 32]);
         assert_eq!(qos.qci, 1);

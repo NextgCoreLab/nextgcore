@@ -102,9 +102,15 @@ pub struct PlmnId {
 impl PlmnId {
     /// Create a new PLMN ID
     pub fn new(mcc: &str, mnc: &str) -> Self {
-        let mcc_bytes: Vec<u8> = mcc.chars().filter_map(|c| c.to_digit(10).map(|d| d as u8)).collect();
-        let mnc_bytes: Vec<u8> = mnc.chars().filter_map(|c| c.to_digit(10).map(|d| d as u8)).collect();
-        
+        let mcc_bytes: Vec<u8> = mcc
+            .chars()
+            .filter_map(|c| c.to_digit(10).map(|d| d as u8))
+            .collect();
+        let mnc_bytes: Vec<u8> = mnc
+            .chars()
+            .filter_map(|c| c.to_digit(10).map(|d| d as u8))
+            .collect();
+
         Self {
             mcc1: mcc_bytes.first().copied().unwrap_or(0),
             mcc2: mcc_bytes.get(1).copied().unwrap_or(0),
@@ -118,9 +124,15 @@ impl PlmnId {
     /// Convert to BCD string
     pub fn to_bcd(&self) -> String {
         if self.mnc3 == 0xf {
-            format!("{}{}{}{}{}", self.mcc1, self.mcc2, self.mcc3, self.mnc1, self.mnc2)
+            format!(
+                "{}{}{}{}{}",
+                self.mcc1, self.mcc2, self.mcc3, self.mnc1, self.mnc2
+            )
         } else {
-            format!("{}{}{}{}{}{}", self.mcc1, self.mcc2, self.mcc3, self.mnc1, self.mnc2, self.mnc3)
+            format!(
+                "{}{}{}{}{}{}",
+                self.mcc1, self.mcc2, self.mcc3, self.mnc1, self.mnc2, self.mnc3
+            )
         }
     }
 }
@@ -507,8 +519,6 @@ pub enum SgwRelocation {
     HasAlreadyBeenRelocated,
 }
 
-
-
 // ============================================================================
 // SGSN Route
 // ============================================================================
@@ -812,7 +822,6 @@ pub struct MmeUeMemento {
     /// Selected integrity algorithm
     pub selected_int_algorithm: u8,
 }
-
 
 // ============================================================================
 // NAS EPS Info
@@ -1121,7 +1130,6 @@ pub struct MmeUe {
     pub hssmap_id: u64,
 }
 
-
 // ============================================================================
 // MME Session Context
 // ============================================================================
@@ -1405,7 +1413,6 @@ pub struct MmeContext {
     pub initialized: AtomicBool,
 }
 
-
 use std::sync::atomic::AtomicU64;
 
 impl MmeContext {
@@ -1453,7 +1460,6 @@ impl MmeContext {
         }
     }
 }
-
 
 // ============================================================================
 // eNB Management
@@ -1506,7 +1512,6 @@ impl MmeContext {
     }
 }
 
-
 // ============================================================================
 // eNB UE Management
 // ============================================================================
@@ -1540,7 +1545,9 @@ impl MmeContext {
 
     /// Find eNB UE by MME UE S1AP ID
     pub fn enb_ue_find_by_mme_ue_s1ap_id(&self, mme_ue_s1ap_id: u32) -> Option<u64> {
-        self.enb_ue_pool.read().unwrap()
+        self.enb_ue_pool
+            .read()
+            .unwrap()
             .iter()
             .find(|(_, ue)| ue.mme_ue_s1ap_id == mme_ue_s1ap_id)
             .map(|(id, _)| *id)
@@ -1575,7 +1582,6 @@ impl MmeContext {
         self.sgw_ue_pool.read().unwrap().get(&id).cloned()
     }
 }
-
 
 // ============================================================================
 // MME UE Management
@@ -1634,14 +1640,16 @@ impl MmeContext {
         if let Some(ue) = self.mme_ue_pool.write().unwrap().get_mut(&id) {
             ue.imsi_bcd = imsi_bcd.to_string();
             ue.imsi_len = imsi_bcd.len().min(OGS_MAX_IMSI_LEN);
-            self.imsi_ue_hash.write().unwrap().insert(imsi_bcd.to_string(), id);
+            self.imsi_ue_hash
+                .write()
+                .unwrap()
+                .insert(imsi_bcd.to_string(), id);
             true
         } else {
             false
         }
     }
 }
-
 
 // ============================================================================
 // Session Management
@@ -1673,7 +1681,9 @@ impl MmeContext {
 
     /// Find session by PTI
     pub fn sess_find_by_pti(&self, mme_ue_id: u64, pti: u8) -> Option<u64> {
-        self.sess_pool.read().unwrap()
+        self.sess_pool
+            .read()
+            .unwrap()
             .iter()
             .find(|(_, s)| s.mme_ue_id == mme_ue_id && s.pti == pti)
             .map(|(id, _)| *id)
@@ -1710,13 +1720,14 @@ impl MmeContext {
 
     /// Find bearer by EBI
     pub fn bearer_find_by_ebi(&self, mme_ue_id: u64, ebi: u8) -> Option<u64> {
-        self.bearer_pool.read().unwrap()
+        self.bearer_pool
+            .read()
+            .unwrap()
             .iter()
             .find(|(_, b)| b.mme_ue_id == mme_ue_id && b.ebi == ebi)
             .map(|(id, _)| *id)
     }
 }
-
 
 // ============================================================================
 // SGW/PGW/VLR Management
@@ -1811,7 +1822,6 @@ impl MmeContext {
     }
 }
 
-
 // ============================================================================
 // Utility Functions
 // ============================================================================
@@ -1821,10 +1831,9 @@ impl MmeContext {
     pub fn find_served_tai(&self, tai: &EpsTai) -> Option<usize> {
         for (idx, served) in self.served_tai.iter().enumerate() {
             // Check TAI0 list
-            if served.list0.plmn_id == tai.plmn_id
-                && served.list0.tac.contains(&tai.tac) {
-                    return Some(idx);
-                }
+            if served.list0.plmn_id == tai.plmn_id && served.list0.tac.contains(&tai.tac) {
+                return Some(idx);
+            }
             // Check TAI2 list
             for t in &served.list2.tai {
                 if t == tai {
@@ -1842,8 +1851,11 @@ impl MmeContext {
                 if let Some(sess) = self.sess_find_by_id(*sess_id) {
                     for bearer_id in &sess.bearer_list {
                         if let Some(bearer) = self.bearer_find_by_id(*bearer_id) {
-                            if bearer.enb_dl_teid != 0 || bearer.enb_ul_teid != 0 ||
-                               bearer.sgw_dl_teid != 0 || bearer.sgw_ul_teid != 0 {
+                            if bearer.enb_dl_teid != 0
+                                || bearer.enb_ul_teid != 0
+                                || bearer.sgw_dl_teid != 0
+                                || bearer.sgw_ul_teid != 0
+                            {
                                 return true;
                             }
                         }

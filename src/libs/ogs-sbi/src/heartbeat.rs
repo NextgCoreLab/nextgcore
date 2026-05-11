@@ -117,10 +117,10 @@ pub struct HeartbeatConfig {
 impl Default for HeartbeatConfig {
     fn default() -> Self {
         Self {
-            default_interval: 10,      // 10 seconds
-            poll_interval_ms: 1000,     // 1 second
+            default_interval: 10,   // 10 seconds
+            poll_interval_ms: 1000, // 1 second
             max_concurrent: 100,
-            request_timeout: 5,         // 5 seconds
+            request_timeout: 5, // 5 seconds
         }
     }
 }
@@ -327,10 +327,22 @@ impl HeartbeatManager {
     pub fn get_stats(&self) -> HeartbeatStats {
         let records = self.records.lock().unwrap();
         let total = records.len();
-        let healthy = records.iter().filter(|(_, r)| r.status == HeartbeatStatus::Healthy).count();
-        let degraded = records.iter().filter(|(_, r)| r.status == HeartbeatStatus::Degraded).count();
-        let unreachable = records.iter().filter(|(_, r)| r.status == HeartbeatStatus::Unreachable).count();
-        let suspended = records.iter().filter(|(_, r)| r.status == HeartbeatStatus::Suspended).count();
+        let healthy = records
+            .iter()
+            .filter(|(_, r)| r.status == HeartbeatStatus::Healthy)
+            .count();
+        let degraded = records
+            .iter()
+            .filter(|(_, r)| r.status == HeartbeatStatus::Degraded)
+            .count();
+        let unreachable = records
+            .iter()
+            .filter(|(_, r)| r.status == HeartbeatStatus::Unreachable)
+            .count();
+        let suspended = records
+            .iter()
+            .filter(|(_, r)| r.status == HeartbeatStatus::Suspended)
+            .count();
 
         HeartbeatStats {
             total,
@@ -369,8 +381,7 @@ pub fn global_heartbeat_manager() -> &'static HeartbeatManager {
         MANAGER_INIT.call_once(|| {
             GLOBAL_HEARTBEAT_MANAGER = Some(HeartbeatManager::default());
         });
-        GLOBAL_HEARTBEAT_MANAGER.as_ref()
-            .expect("value expected")
+        GLOBAL_HEARTBEAT_MANAGER.as_ref().expect("value expected")
     }
 }
 
@@ -379,17 +390,105 @@ pub fn init_heartbeat_manager() {
     let _ = global_heartbeat_manager();
 }
 
+// ---------------------------------------------------------------------------
+// NF-side outbound heartbeat worker
+// ---------------------------------------------------------------------------
+
+/// Parse host and port from a URI string (e.g., "http://localhost:7777").
+fn parse_nrf_host_port(uri: &str) -> Option<(String, u16)> {
+    let without_scheme = uri
+        .strip_prefix("https://")
+        .or_else(|| uri.strip_prefix("http://"))
+        .unwrap_or(uri);
+    let (host_port, _path) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
+    if let Some((host, port_str)) = host_port.rsplit_once(':') {
+        let port: u16 = port_str.parse().ok()?;
+        Some((host.to_string(), port))
+    } else {
+        let default_port = if uri.starts_with("https://") { 443 } else { 80 };
+        Some((host_port.to_string(), default_port))
+    }
+}
+
+/// Spawn a background tokio task that periodically sends a heartbeat
+/// `PATCH /nnrf-nfm/v1/nf-instances/{nf_instance_id}` to the NRF.
+///
+/// The NRF URI is read from the global SBI context at each tick so it
+/// stays correct even if the context is updated after startup.
+///
+/// `interval_secs` is the fire interval (use `heartBeatTimer / 2`, e.g. 5).
+/// The task runs until the process exits; it logs warnings on failure but
+/// never panics, so a temporary NRF outage does not crash the NF.
+pub fn spawn_heartbeat_worker(nf_instance_id: String, interval_secs: u64) {
+    tokio::spawn(async move {
+        log::info!(
+            "Heartbeat worker started for NF instance {nf_instance_id} (interval={interval_secs}s)"
+        );
+
+        let interval = tokio::time::Duration::from_secs(interval_secs);
+        let mut ticker = tokio::time::interval(interval);
+        // First tick fires immediately — we want to send the first heartbeat
+        // right away to refresh NRF state before the suspension timer
+        // (typically 10s) elapses. Subsequent ticks fire every interval.
+
+        loop {
+            ticker.tick().await;
+
+            let ctx = crate::context::global_context();
+            let nrf_uri = ctx.get_nrf_uri().await;
+
+            let nrf_uri = match nrf_uri {
+                Some(u) => u,
+                None => {
+                    log::debug!("Heartbeat: no NRF URI configured, skipping");
+                    continue;
+                }
+            };
+
+            let (nrf_host, nrf_port) = match parse_nrf_host_port(&nrf_uri) {
+                Some(hp) => hp,
+                None => {
+                    log::warn!("Heartbeat: could not parse NRF URI '{nrf_uri}'");
+                    continue;
+                }
+            };
+
+            let client = SbiClient::with_host_port(&nrf_host, nrf_port);
+            let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
+            let body = serde_json::json!({"nfStatus": "REGISTERED"});
+
+            match client.patch_json(&path, &body).await {
+                Ok(resp) if resp.status == 200 || resp.status == 204 => {
+                    log::debug!(
+                        "Heartbeat OK for {} (status={})",
+                        nf_instance_id,
+                        resp.status
+                    );
+                }
+                Ok(resp) => {
+                    log::warn!(
+                        "Heartbeat got unexpected status {} for {}",
+                        resp.status,
+                        nf_instance_id
+                    );
+                }
+                Err(e) => {
+                    log::warn!("Heartbeat failed for {nf_instance_id}: {e}");
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_heartbeat_record_creation() {
-        let record = HeartbeatRecord::new(
-            "nf-001".to_string(),
-            "nf.example.com".to_string(),
-            10,
-        );
+        let record = HeartbeatRecord::new("nf-001".to_string(), "nf.example.com".to_string(), 10);
 
         assert_eq!(record.nf_instance_id, "nf-001");
         assert_eq!(record.interval, 10);
@@ -422,11 +521,7 @@ mod tests {
     fn test_heartbeat_manager_add_remove() {
         let manager = HeartbeatManager::default();
 
-        manager.add_nf(
-            "nf-001".to_string(),
-            "nf.example.com".to_string(),
-            Some(10),
-        );
+        manager.add_nf("nf-001".to_string(), "nf.example.com".to_string(), Some(10));
 
         let status = manager.get_status("nf-001");
         assert_eq!(status, Some(HeartbeatStatus::Healthy));
@@ -440,14 +535,13 @@ mod tests {
     fn test_heartbeat_suspend_resume() {
         let manager = HeartbeatManager::default();
 
-        manager.add_nf(
-            "nf-001".to_string(),
-            "nf.example.com".to_string(),
-            None,
-        );
+        manager.add_nf("nf-001".to_string(), "nf.example.com".to_string(), None);
 
         manager.suspend("nf-001");
-        assert_eq!(manager.get_status("nf-001"), Some(HeartbeatStatus::Suspended));
+        assert_eq!(
+            manager.get_status("nf-001"),
+            Some(HeartbeatStatus::Suspended)
+        );
 
         manager.resume("nf-001");
         assert_eq!(manager.get_status("nf-001"), Some(HeartbeatStatus::Healthy));

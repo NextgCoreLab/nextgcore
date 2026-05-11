@@ -3,14 +3,14 @@
 //! This crate provides MongoDB operations for subscriber data.
 //! Ported from lib/dbi/ in the C implementation.
 
-pub mod types;
-pub mod mongoc;
-pub mod subscription;
-pub mod session;
+pub mod federation;
+pub mod graphdb; // B4.4: Graph database support
 pub mod ims;
-pub mod graphdb;  // B4.4: Graph database support
-pub mod tsdb;     // B4.5: Time-series database support
-pub mod federation;  // B4.7: Data federation (cross-operator sharing)
+pub mod mongoc;
+pub mod session;
+pub mod subscription;
+pub mod tsdb; // B4.5: Time-series database support
+pub mod types; // B4.7: Data federation (cross-operator sharing)
 
 #[cfg(test)]
 mod property_tests;
@@ -19,29 +19,26 @@ mod property_tests;
 pub use mongodb;
 
 // Re-export commonly used types
-pub use types::*;
-pub use mongoc::{
-    OgsMongoc, OgsDbi, DbiError, DbiResult,
-    ogs_mongoc, ogs_mongoc_init, ogs_mongoc_final,
-    ogs_dbi_init, ogs_dbi_init_async, ogs_dbi_final,
+pub use federation::{
+    AccessPolicy, AggregationFunction, AnonymizationMethod, ExchangeProtocol, FederatedQuery,
+    FederatedResponse, FederationClient, FederationError, FederationResult, OperatorId, QueryType,
 };
-pub use subscription::{
-    OgsDbiAuthInfo, ogs_dbi_auth_info, ogs_dbi_update_sqn,
-    ogs_dbi_increment_sqn, ogs_dbi_update_imeisv, ogs_dbi_update_mme,
-    ogs_dbi_subscription_data,
+pub use graphdb::{
+    CypherQuery, GraphDbClient, GraphDbError, GraphDbResult, GraphNode, GraphRelationship,
+    NetworkTopology, PropertyValue,
+};
+pub use ims::{ogs_dbi_ims_data, ogs_dbi_msisdn_data, OgsMsisdnData};
+pub use mongoc::{
+    ogs_dbi_final, ogs_dbi_init, ogs_dbi_init_async, ogs_mongoc, ogs_mongoc_final, ogs_mongoc_init,
+    DbiError, DbiResult, OgsDbi, OgsMongoc,
 };
 pub use session::ogs_dbi_session_data;
-pub use ims::{OgsMsisdnData, ogs_dbi_msisdn_data, ogs_dbi_ims_data};
-pub use graphdb::{
-    GraphDbClient, GraphNode, GraphRelationship, PropertyValue, CypherQuery,
-    NetworkTopology, GraphDbError, GraphDbResult,
+pub use subscription::{
+    ogs_dbi_auth_info, ogs_dbi_increment_sqn, ogs_dbi_subscription_data, ogs_dbi_update_imeisv,
+    ogs_dbi_update_mme, ogs_dbi_update_sqn, OgsDbiAuthInfo,
 };
 pub use tsdb::{
-    TsDbClient, TimeSeries, DataPoint, Timestamp, NetworkMetricsCollector,
-    TsDbError, TsDbResult, MetricStats,
+    DataPoint, MetricStats, NetworkMetricsCollector, TimeSeries, Timestamp, TsDbClient, TsDbError,
+    TsDbResult,
 };
-pub use federation::{
-    FederationClient, FederatedQuery, FederatedResponse, OperatorId,
-    AccessPolicy, QueryType, AggregationFunction, AnonymizationMethod,
-    ExchangeProtocol, FederationError, FederationResult,
-};
+pub use types::*;

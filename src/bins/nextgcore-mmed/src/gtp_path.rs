@@ -4,8 +4,8 @@
 
 use crate::context::MmeContext;
 use crate::s11_build::{
-    self, GtpCause, GtpCreateAction, GtpDeleteAction,
-    GtpModifyAction, GtpReleaseAction, Gtp2BearerQos,
+    self, Gtp2BearerQos, GtpCause, GtpCreateAction, GtpDeleteAction, GtpModifyAction,
+    GtpReleaseAction,
 };
 use std::net::SocketAddr;
 
@@ -81,18 +81,26 @@ pub fn send_create_session_request(
 ) -> GtpPathResult<GtpXactData> {
     log::debug!("Sending Create Session Request");
 
-    let sess = ctx.sess_find_by_id(sess_id).ok_or(GtpPathError::ContextNotFound)?;
-    let mme_ue = ctx.mme_ue_find_by_id(sess.mme_ue_id).ok_or(GtpPathError::ContextNotFound)?;
-    let sgw_ue = ctx.sgw_ue_find_by_id(mme_ue.sgw_ue_id).ok_or(GtpPathError::ContextNotFound)?;
+    let sess = ctx
+        .sess_find_by_id(sess_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let mme_ue = ctx
+        .mme_ue_find_by_id(sess.mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sgw_ue = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
 
     let target_sgw_ue = if create_action == GtpCreateAction::PathSwitchRequest {
-        ctx.sgw_ue_find_by_id(sgw_ue.target_ue_id).ok_or(GtpPathError::ContextNotFound)?
+        ctx.sgw_ue_find_by_id(sgw_ue.target_ue_id)
+            .ok_or(GtpPathError::ContextNotFound)?
     } else {
         sgw_ue.clone()
     };
 
-    let _pkbuf = s11_build::build_create_session_request(&sess, &mme_ue, &target_sgw_ue, create_action)
-        .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
+    let _pkbuf =
+        s11_build::build_create_session_request(&sess, &mme_ue, &target_sgw_ue, create_action)
+            .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
 
     Ok(GtpXactData {
         xact_id: ctx.next_pool_id(),
@@ -112,8 +120,12 @@ pub fn send_modify_bearer_request(
 ) -> GtpPathResult<GtpXactData> {
     log::debug!("Sending Modify Bearer Request");
 
-    let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).ok_or(GtpPathError::ContextNotFound)?;
-    let sgw_ue = ctx.sgw_ue_find_by_id(mme_ue.sgw_ue_id).ok_or(GtpPathError::ContextNotFound)?;
+    let mme_ue = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sgw_ue = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
 
     let _pkbuf = s11_build::build_modify_bearer_request(&mme_ue, &sgw_ue, &[], uli_presence)
         .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
@@ -136,9 +148,15 @@ pub fn send_delete_session_request(
 ) -> GtpPathResult<GtpXactData> {
     log::debug!("Sending Delete Session Request");
 
-    let sess = ctx.sess_find_by_id(sess_id).ok_or(GtpPathError::ContextNotFound)?;
-    let mme_ue = ctx.mme_ue_find_by_id(sess.mme_ue_id).ok_or(GtpPathError::ContextNotFound)?;
-    let sgw_ue = ctx.sgw_ue_find_by_id(sgw_ue_id).ok_or(GtpPathError::ContextNotFound)?;
+    let sess = ctx
+        .sess_find_by_id(sess_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let mme_ue = ctx
+        .mme_ue_find_by_id(sess.mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sgw_ue = ctx
+        .sgw_ue_find_by_id(sgw_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
 
     let _pkbuf = s11_build::build_delete_session_request(&sess, &mme_ue, &sgw_ue, 5, action)
         .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
@@ -160,7 +178,9 @@ pub fn send_delete_all_sessions(
 ) -> GtpPathResult<Vec<GtpXactData>> {
     log::debug!("Sending Delete All Sessions");
 
-    let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).ok_or(GtpPathError::ContextNotFound)?;
+    let mme_ue = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
     let sgw_ue_id = mme_ue.sgw_ue_id;
 
     let mut xacts = Vec::new();
@@ -180,9 +200,15 @@ pub fn send_create_bearer_response(
 ) -> GtpPathResult<()> {
     log::debug!("Sending Create Bearer Response");
 
-    let bearer = ctx.bearer_find_by_id(bearer_id).ok_or(GtpPathError::ContextNotFound)?;
-    let mme_ue = ctx.mme_ue_find_by_id(bearer.mme_ue_id).ok_or(GtpPathError::ContextNotFound)?;
-    let sgw_ue = ctx.sgw_ue_find_by_id(mme_ue.sgw_ue_id).ok_or(GtpPathError::ContextNotFound)?;
+    let bearer = ctx
+        .bearer_find_by_id(bearer_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let mme_ue = ctx
+        .mme_ue_find_by_id(bearer.mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sgw_ue = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
 
     let _pkbuf = s11_build::build_create_bearer_response(&bearer, &mme_ue, &sgw_ue, cause_value)
         .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
@@ -196,9 +222,15 @@ pub fn send_update_bearer_response(
 ) -> GtpPathResult<()> {
     log::debug!("Sending Update Bearer Response");
 
-    let bearer = ctx.bearer_find_by_id(bearer_id).ok_or(GtpPathError::ContextNotFound)?;
-    let mme_ue = ctx.mme_ue_find_by_id(bearer.mme_ue_id).ok_or(GtpPathError::ContextNotFound)?;
-    let sgw_ue = ctx.sgw_ue_find_by_id(mme_ue.sgw_ue_id).ok_or(GtpPathError::ContextNotFound)?;
+    let bearer = ctx
+        .bearer_find_by_id(bearer_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let mme_ue = ctx
+        .mme_ue_find_by_id(bearer.mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sgw_ue = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
 
     let _pkbuf = s11_build::build_update_bearer_response(&bearer, &mme_ue, &sgw_ue, cause_value)
         .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
@@ -212,9 +244,15 @@ pub fn send_delete_bearer_response(
 ) -> GtpPathResult<()> {
     log::debug!("Sending Delete Bearer Response");
 
-    let bearer = ctx.bearer_find_by_id(bearer_id).ok_or(GtpPathError::ContextNotFound)?;
-    let mme_ue = ctx.mme_ue_find_by_id(bearer.mme_ue_id).ok_or(GtpPathError::ContextNotFound)?;
-    let sgw_ue = ctx.sgw_ue_find_by_id(mme_ue.sgw_ue_id).ok_or(GtpPathError::ContextNotFound)?;
+    let bearer = ctx
+        .bearer_find_by_id(bearer_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let mme_ue = ctx
+        .mme_ue_find_by_id(bearer.mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sgw_ue = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
 
     let _pkbuf = s11_build::build_delete_bearer_response(&bearer, &mme_ue, &sgw_ue, cause_value)
         .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
@@ -229,10 +267,17 @@ pub fn send_release_access_bearers_request(
 ) -> GtpPathResult<GtpXactData> {
     log::debug!("Sending Release Access Bearers Request");
 
-    let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).ok_or(GtpPathError::ContextNotFound)?;
-    let sgw_ue = ctx.sgw_ue_find_by_id(mme_ue.sgw_ue_id).ok_or(GtpPathError::ContextNotFound)?;
+    let mme_ue = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sgw_ue = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
 
-    let _pkbuf = s11_build::build_release_access_bearers_request(sgw_ue.sgw_s11_teid, ctx.next_pool_id() as u32);
+    let _pkbuf = s11_build::build_release_access_bearers_request(
+        sgw_ue.sgw_s11_teid,
+        ctx.next_pool_id() as u32,
+    );
 
     Ok(GtpXactData {
         xact_id: ctx.next_pool_id(),
@@ -250,13 +295,16 @@ pub fn send_release_all_ue_in_enb(
 ) -> GtpPathResult<Vec<GtpXactData>> {
     log::debug!("Sending Release All UE in eNB");
 
-    let enb = ctx.enb_find_by_id(enb_id).ok_or(GtpPathError::ContextNotFound)?;
+    let enb = ctx
+        .enb_find_by_id(enb_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
     let mut xacts = Vec::new();
 
     for enb_ue_id in &enb.enb_ue_list {
         if let Some(enb_ue) = ctx.enb_ue_find_by_id(*enb_ue_id) {
             if ctx.mme_ue_find_by_id(enb_ue.mme_ue_id).is_some() {
-                let xact = send_release_access_bearers_request(ctx, *enb_ue_id, enb_ue.mme_ue_id, action)?;
+                let xact =
+                    send_release_access_bearers_request(ctx, *enb_ue_id, enb_ue.mme_ue_id, action)?;
                 xacts.push(xact);
             }
         }
@@ -271,11 +319,21 @@ pub fn send_downlink_data_notification_ack(
 ) -> GtpPathResult<()> {
     log::debug!("Sending Downlink Data Notification Ack");
 
-    let bearer = ctx.bearer_find_by_id(bearer_id).ok_or(GtpPathError::ContextNotFound)?;
-    let mme_ue = ctx.mme_ue_find_by_id(bearer.mme_ue_id).ok_or(GtpPathError::ContextNotFound)?;
-    let sgw_ue = ctx.sgw_ue_find_by_id(mme_ue.sgw_ue_id).ok_or(GtpPathError::ContextNotFound)?;
+    let bearer = ctx
+        .bearer_find_by_id(bearer_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let mme_ue = ctx
+        .mme_ue_find_by_id(bearer.mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sgw_ue = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
 
-    let _pkbuf = s11_build::build_downlink_data_notification_ack(sgw_ue.sgw_s11_teid, ctx.next_pool_id() as u32, cause_value);
+    let _pkbuf = s11_build::build_downlink_data_notification_ack(
+        sgw_ue.sgw_s11_teid,
+        ctx.next_pool_id() as u32,
+        cause_value,
+    );
     Ok(())
 }
 
@@ -286,11 +344,16 @@ pub fn send_create_indirect_data_forwarding_tunnel_request(
 ) -> GtpPathResult<GtpXactData> {
     log::debug!("Sending Create Indirect Data Forwarding Tunnel Request");
 
-    let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).ok_or(GtpPathError::ContextNotFound)?;
-    let sgw_ue = ctx.sgw_ue_find_by_id(mme_ue.sgw_ue_id).ok_or(GtpPathError::ContextNotFound)?;
+    let mme_ue = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sgw_ue = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
 
-    let _pkbuf = s11_build::build_create_indirect_data_forwarding_tunnel_request(&mme_ue, &sgw_ue, &[])
-        .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
+    let _pkbuf =
+        s11_build::build_create_indirect_data_forwarding_tunnel_request(&mme_ue, &sgw_ue, &[])
+            .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
 
     Ok(GtpXactData {
         xact_id: ctx.next_pool_id(),
@@ -308,7 +371,9 @@ pub fn send_delete_indirect_data_forwarding_tunnel_request(
 ) -> GtpPathResult<GtpXactData> {
     log::debug!("Sending Delete Indirect Data Forwarding Tunnel Request");
 
-    let mme_ue = ctx.mme_ue_find_by_id(mme_ue_id).ok_or(GtpPathError::ContextNotFound)?;
+    let mme_ue = ctx
+        .mme_ue_find_by_id(mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
 
     Ok(GtpXactData {
         xact_id: ctx.next_pool_id(),
@@ -329,12 +394,26 @@ pub fn send_bearer_resource_command(
 ) -> GtpPathResult<GtpXactData> {
     log::debug!("Sending Bearer Resource Command");
 
-    let bearer = ctx.bearer_find_by_id(bearer_id).ok_or(GtpPathError::ContextNotFound)?;
-    let mme_ue = ctx.mme_ue_find_by_id(bearer.mme_ue_id).ok_or(GtpPathError::ContextNotFound)?;
-    let sgw_ue = ctx.sgw_ue_find_by_id(mme_ue.sgw_ue_id).ok_or(GtpPathError::ContextNotFound)?;
+    let bearer = ctx
+        .bearer_find_by_id(bearer_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let mme_ue = ctx
+        .mme_ue_find_by_id(bearer.mme_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
+    let sgw_ue = ctx
+        .sgw_ue_find_by_id(mme_ue.sgw_ue_id)
+        .ok_or(GtpPathError::ContextNotFound)?;
 
-    let _pkbuf = s11_build::build_bearer_resource_command(&bearer, &mme_ue, &sgw_ue, linked_bearer_ebi, pti, tad, qos)
-        .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
+    let _pkbuf = s11_build::build_bearer_resource_command(
+        &bearer,
+        &mme_ue,
+        &sgw_ue,
+        linked_bearer_ebi,
+        pti,
+        tad,
+        qos,
+    )
+    .map_err(|e| GtpPathError::BuildError(e.to_string()))?;
 
     Ok(GtpXactData {
         xact_id: ctx.next_pool_id() | GTP_CMD_XACT_ID_FLAG,
@@ -366,7 +445,10 @@ mod tests {
 
     #[test]
     fn test_delete_indirect_action() {
-        assert_eq!(DeleteIndirectAction::HandoverComplete, DeleteIndirectAction::HandoverComplete);
+        assert_eq!(
+            DeleteIndirectAction::HandoverComplete,
+            DeleteIndirectAction::HandoverComplete
+        );
     }
 
     #[test]

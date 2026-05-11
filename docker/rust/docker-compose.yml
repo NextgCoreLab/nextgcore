@@ -216,6 +216,8 @@ services:
     environment:
       <<: *common-env
       RUST_LOG: info,nextgcore_amfd=debug
+      AMF_SBI_ADDR: 172.23.0.5
+      AMF_SBI_PORT: "7777"
       SMF_SBI_ADDR: 172.23.0.4
       SMF_SBI_PORT: "7777"
       AUSF_SBI_ADDR: 172.23.0.11

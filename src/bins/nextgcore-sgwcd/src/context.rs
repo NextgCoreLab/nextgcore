@@ -418,7 +418,10 @@ impl SgwcContext {
 
         log::info!(
             "SGWC context initialized with max {} UEs, {} sessions, {} bearers, {} tunnels",
-            self.max_num_of_ue, self.max_num_of_sess, self.max_num_of_bearer, self.max_num_of_tunnel
+            self.max_num_of_ue,
+            self.max_num_of_sess,
+            self.max_num_of_bearer,
+            self.max_num_of_tunnel
         );
     }
 
@@ -472,7 +475,12 @@ impl SgwcContext {
         sgw_s11_teid_hash.insert(sgw_s11_teid, id);
         sgwc_ue_list.insert(id, ue.clone());
 
-        log::info!("[Added] SGWC UE IMSI[{}] (id={}, teid={})", ue.imsi_bcd, id, sgw_s11_teid);
+        log::info!(
+            "[Added] SGWC UE IMSI[{}] (id={}, teid={})",
+            ue.imsi_bcd,
+            id,
+            sgw_s11_teid
+        );
         Some(ue)
     }
 
@@ -554,7 +562,10 @@ impl SgwcContext {
         let mut sgwc_sxa_seid_hash = self.sgwc_sxa_seid_hash.write().ok()?;
 
         if self.max_num_of_sess > 0 && sess_list.len() >= self.max_num_of_sess {
-            log::error!("Maximum number of sessions [{}] reached", self.max_num_of_sess);
+            log::error!(
+                "Maximum number of sessions [{}] reached",
+                self.max_num_of_sess
+            );
             return None;
         }
 
@@ -640,7 +651,8 @@ impl SgwcContext {
     /// Find session by APN for a UE
     pub fn sess_find_by_apn(&self, sgwc_ue_id: u64, apn: &str) -> Option<SgwcSess> {
         let sess_list = self.sess_list.read().ok()?;
-        sess_list.values()
+        sess_list
+            .values()
             .find(|s| s.sgwc_ue_id == sgwc_ue_id && s.apn() == Some(apn))
             .cloned()
     }
@@ -678,7 +690,10 @@ impl SgwcContext {
         {
             let mut bearer_list = self.bearer_list.write().ok()?;
             if self.max_num_of_bearer > 0 && bearer_list.len() >= self.max_num_of_bearer {
-                log::error!("Maximum number of bearers [{}] reached", self.max_num_of_bearer);
+                log::error!(
+                    "Maximum number of bearers [{}] reached",
+                    self.max_num_of_bearer
+                );
                 return None;
             }
             bearer_list.insert(id, bearer.clone());
@@ -747,7 +762,8 @@ impl SgwcContext {
     /// Find bearer by session and EBI
     pub fn bearer_find_by_sess_ebi(&self, sess_id: u64, ebi: u8) -> Option<SgwcBearer> {
         let bearer_list = self.bearer_list.read().ok()?;
-        bearer_list.values()
+        bearer_list
+            .values()
             .find(|b| b.sess_id == sess_id && b.ebi == ebi)
             .cloned()
     }
@@ -755,7 +771,8 @@ impl SgwcContext {
     /// Find bearer by UE and EBI
     pub fn bearer_find_by_ue_ebi(&self, sgwc_ue_id: u64, ebi: u8) -> Option<SgwcBearer> {
         let bearer_list = self.bearer_list.read().ok()?;
-        bearer_list.values()
+        bearer_list
+            .values()
             .find(|b| b.sgwc_ue_id == sgwc_ue_id && b.ebi == ebi)
             .cloned()
     }
@@ -763,7 +780,9 @@ impl SgwcContext {
     /// Get default bearer in session
     pub fn default_bearer_in_sess(&self, sess_id: u64) -> Option<SgwcBearer> {
         let sess = self.sess_find_by_id(sess_id)?;
-        sess.bearer_ids.first().and_then(|&id| self.bearer_find_by_id(id))
+        sess.bearer_ids
+            .first()
+            .and_then(|&id| self.bearer_find_by_id(id))
     }
 
     /// Update bearer in context
@@ -788,7 +807,10 @@ impl SgwcContext {
         {
             let mut tunnel_list = self.tunnel_list.write().ok()?;
             if self.max_num_of_tunnel > 0 && tunnel_list.len() >= self.max_num_of_tunnel {
-                log::error!("Maximum number of tunnels [{}] reached", self.max_num_of_tunnel);
+                log::error!(
+                    "Maximum number of tunnels [{}] reached",
+                    self.max_num_of_tunnel
+                );
                 return None;
             }
             tunnel_list.insert(id, tunnel.clone());
@@ -848,9 +870,14 @@ impl SgwcContext {
     }
 
     /// Find tunnel by bearer and interface type
-    pub fn tunnel_find_by_interface_type(&self, bearer_id: u64, interface_type: u8) -> Option<SgwcTunnel> {
+    pub fn tunnel_find_by_interface_type(
+        &self,
+        bearer_id: u64,
+        interface_type: u8,
+    ) -> Option<SgwcTunnel> {
         let tunnel_list = self.tunnel_list.read().ok()?;
-        tunnel_list.values()
+        tunnel_list
+            .values()
             .find(|t| t.bearer_id == bearer_id && t.interface_type == interface_type)
             .cloned()
     }
@@ -891,7 +918,9 @@ static SGWC_CONTEXT: OnceLock<Arc<SgwcContext>> = OnceLock::new();
 
 /// Get the global SGWC context
 pub fn sgwc_self() -> Arc<SgwcContext> {
-    SGWC_CONTEXT.get_or_init(|| Arc::new(SgwcContext::new())).clone()
+    SGWC_CONTEXT
+        .get_or_init(|| Arc::new(SgwcContext::new()))
+        .clone()
 }
 
 // ============================================================================
@@ -906,17 +935,17 @@ mod tests {
     fn test_ue_add_remove() {
         let ctx = SgwcContext::new();
         let imsi = vec![0x09, 0x10, 0x10, 0x00, 0x00, 0x00, 0x01];
-        
+
         let ue = ctx.ue_add(&imsi).unwrap();
         assert!(!ue.imsi_bcd.is_empty());
         assert_eq!(ctx.ue_count(), 1);
-        
+
         let found = ctx.ue_find_by_imsi(&imsi).unwrap();
         assert_eq!(found.id, ue.id);
-        
+
         let found = ctx.ue_find_by_teid(ue.sgw_s11_teid).unwrap();
         assert_eq!(found.id, ue.id);
-        
+
         ctx.ue_remove(ue.id);
         assert_eq!(ctx.ue_count(), 0);
     }
@@ -925,18 +954,18 @@ mod tests {
     fn test_sess_add_remove() {
         let ctx = SgwcContext::new();
         let imsi = vec![0x09, 0x10, 0x10, 0x00, 0x00, 0x00, 0x02];
-        
+
         let ue = ctx.ue_add(&imsi).unwrap();
         let sess = ctx.sess_add(ue.id, "internet").unwrap();
         assert_eq!(sess.apn(), Some("internet"));
         assert_eq!(ctx.sess_count(), 1);
-        
+
         let found = ctx.sess_find_by_seid(sess.sgwc_sxa_seid).unwrap();
         assert_eq!(found.id, sess.id);
-        
+
         let found = ctx.sess_find_by_apn(ue.id, "internet").unwrap();
         assert_eq!(found.id, sess.id);
-        
+
         ctx.sess_remove(sess.id);
         assert_eq!(ctx.sess_count(), 0);
     }
@@ -945,17 +974,17 @@ mod tests {
     fn test_bearer_add_remove() {
         let ctx = SgwcContext::new();
         let imsi = vec![0x09, 0x10, 0x10, 0x00, 0x00, 0x00, 0x03];
-        
+
         let ue = ctx.ue_add(&imsi).unwrap();
         let sess = ctx.sess_add(ue.id, "internet").unwrap();
         let bearer = ctx.bearer_add(sess.id).unwrap();
-        
+
         // Bearer should have DL and UL tunnels
         let dl = ctx.dl_tunnel_in_bearer(bearer.id);
         let ul = ctx.ul_tunnel_in_bearer(bearer.id);
         assert!(dl.is_some());
         assert!(ul.is_some());
-        
+
         ctx.bearer_remove(bearer.id);
         assert!(ctx.dl_tunnel_in_bearer(bearer.id).is_none());
     }
@@ -964,11 +993,11 @@ mod tests {
     fn test_cascade_remove() {
         let ctx = SgwcContext::new();
         let imsi = vec![0x09, 0x10, 0x10, 0x00, 0x00, 0x00, 0x04];
-        
+
         let ue = ctx.ue_add(&imsi).unwrap();
         let sess = ctx.sess_add(ue.id, "internet").unwrap();
         let _bearer = ctx.bearer_add(sess.id).unwrap();
-        
+
         // Removing UE should cascade to sessions, bearers, tunnels
         ctx.ue_remove(ue.id);
         assert_eq!(ctx.ue_count(), 0);

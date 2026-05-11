@@ -51,7 +51,6 @@ pub mod gtp2_message_type {
     pub const DOWNLINK_DATA_NOTIFICATION_FAILURE_INDICATION: u8 = 70;
 }
 
-
 // ============================================================================
 // GTPv2-C IE Types
 // ============================================================================
@@ -199,7 +198,6 @@ pub mod gtp2_ie_type {
     pub const PC5_QOS_FLOW: u8 = 212;
     pub const SGI_PTP_TUNNEL_ADDRESS: u8 = 213;
 }
-
 
 // ============================================================================
 // GTPv2-C Cause Values
@@ -425,7 +423,6 @@ pub enum Gtp2Cause {
     UndefinedValue = 0,
 }
 
-
 impl From<u8> for Gtp2Cause {
     fn from(value: u8) -> Self {
         match value {
@@ -456,7 +453,6 @@ impl From<u8> for Gtp2Cause {
         }
     }
 }
-
 
 // ============================================================================
 // GTPv2-C RAT Types
@@ -530,7 +526,6 @@ pub mod gtp2_apn_restriction {
     pub const PRIVATE_2: u8 = 4;
 }
 
-
 // ============================================================================
 // GTPv2-C F-TEID Structure
 // ============================================================================
@@ -597,7 +592,7 @@ impl FTeid {
     /// Encode F-TEID to bytes
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = BytesMut::with_capacity(25);
-        
+
         // Flags byte: V4 | V6 | Interface Type (5 bits)
         let mut flags = self.interface_type & 0x1f;
         if self.teid_present {
@@ -610,22 +605,22 @@ impl FTeid {
             flags |= 0x40; // V6 flag
         }
         buf.put_u8(flags);
-        
+
         // TEID (4 bytes, big-endian)
         if self.teid_present {
             buf.put_u32(self.teid);
         }
-        
+
         // IPv4 address (4 bytes)
         if let Some(addr) = self.ipv4_addr {
             buf.put_slice(&addr.octets());
         }
-        
+
         // IPv6 address (16 bytes)
         if let Some(addr) = self.ipv6_addr {
             buf.put_slice(&addr.octets());
         }
-        
+
         buf.to_vec()
     }
 
@@ -649,7 +644,6 @@ impl FTeid {
         !self.teid_present && !self.ipv4_present && !self.ipv6_present
     }
 }
-
 
 // ============================================================================
 // Bearer QoS Structure
@@ -697,7 +691,7 @@ impl BearerQos {
     /// Encode Bearer QoS to bytes
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = BytesMut::with_capacity(BEARER_QOS_LEN);
-        
+
         // First byte: spare(1) | PCI(1) | PL(4) | spare(1) | PVI(1)
         let mut flags: u8 = 0;
         if self.pre_emption_capability {
@@ -708,26 +702,26 @@ impl BearerQos {
             flags |= 0x01;
         }
         buf.put_u8(flags);
-        
+
         // QCI (1 byte)
         buf.put_u8(self.qci);
-        
+
         // MBR Uplink (5 bytes)
         buf.put_u8(((self.ul_mbr >> 32) & 0xff) as u8);
         buf.put_u32((self.ul_mbr & 0xffffffff) as u32);
-        
+
         // MBR Downlink (5 bytes)
         buf.put_u8(((self.dl_mbr >> 32) & 0xff) as u8);
         buf.put_u32((self.dl_mbr & 0xffffffff) as u32);
-        
+
         // GBR Uplink (5 bytes)
         buf.put_u8(((self.ul_gbr >> 32) & 0xff) as u8);
         buf.put_u32((self.ul_gbr & 0xffffffff) as u32);
-        
+
         // GBR Downlink (5 bytes)
         buf.put_u8(((self.dl_gbr >> 32) & 0xff) as u8);
         buf.put_u32((self.dl_gbr & 0xffffffff) as u32);
-        
+
         buf.to_vec()
     }
 
@@ -736,37 +730,37 @@ impl BearerQos {
         if data.len() < BEARER_QOS_LEN {
             return None;
         }
-        
+
         let flags = data[0];
         let pre_emption_capability = (flags & 0x40) != 0;
         let priority_level = (flags >> 2) & 0x0f;
         let pre_emption_vulnerability = (flags & 0x01) != 0;
         let qci = data[1];
-        
-        let ul_mbr = ((data[2] as u64) << 32) | 
-                     ((data[3] as u64) << 24) |
-                     ((data[4] as u64) << 16) |
-                     ((data[5] as u64) << 8) |
-                     (data[6] as u64);
-        
-        let dl_mbr = ((data[7] as u64) << 32) |
-                     ((data[8] as u64) << 24) |
-                     ((data[9] as u64) << 16) |
-                     ((data[10] as u64) << 8) |
-                     (data[11] as u64);
-        
-        let ul_gbr = ((data[12] as u64) << 32) |
-                     ((data[13] as u64) << 24) |
-                     ((data[14] as u64) << 16) |
-                     ((data[15] as u64) << 8) |
-                     (data[16] as u64);
-        
-        let dl_gbr = ((data[17] as u64) << 32) |
-                     ((data[18] as u64) << 24) |
-                     ((data[19] as u64) << 16) |
-                     ((data[20] as u64) << 8) |
-                     (data[21] as u64);
-        
+
+        let ul_mbr = ((data[2] as u64) << 32)
+            | ((data[3] as u64) << 24)
+            | ((data[4] as u64) << 16)
+            | ((data[5] as u64) << 8)
+            | (data[6] as u64);
+
+        let dl_mbr = ((data[7] as u64) << 32)
+            | ((data[8] as u64) << 24)
+            | ((data[9] as u64) << 16)
+            | ((data[10] as u64) << 8)
+            | (data[11] as u64);
+
+        let ul_gbr = ((data[12] as u64) << 32)
+            | ((data[13] as u64) << 24)
+            | ((data[14] as u64) << 16)
+            | ((data[15] as u64) << 8)
+            | (data[16] as u64);
+
+        let dl_gbr = ((data[17] as u64) << 32)
+            | ((data[18] as u64) << 24)
+            | ((data[19] as u64) << 16)
+            | ((data[20] as u64) << 8)
+            | (data[21] as u64);
+
         Some(Self {
             pre_emption_capability,
             priority_level,
@@ -779,7 +773,6 @@ impl BearerQos {
         })
     }
 }
-
 
 // ============================================================================
 // AMBR Structure
@@ -880,7 +873,7 @@ impl Paa {
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = BytesMut::with_capacity(PAA_IPV4V6_LEN);
         buf.put_u8(self.pdn_type);
-        
+
         match self.pdn_type {
             pdn_type::IPV4 => {
                 if let Some(addr) = self.ipv4_addr {
@@ -904,7 +897,7 @@ impl Paa {
             }
             _ => {}
         }
-        
+
         buf.to_vec()
     }
 
@@ -923,7 +916,6 @@ impl Paa {
         self.pdn_type == 0
     }
 }
-
 
 // ============================================================================
 // GTPv2-C Message Builder
@@ -1079,37 +1071,36 @@ impl Gtp2MessageBuilder {
     pub fn build(self) -> Vec<u8> {
         let ie_len = self.ies.len();
         let msg_len = ie_len + 8; // 8 = TEID(4) + Seq(3) + Spare(1)
-        
+
         let mut buf = BytesMut::with_capacity(12 + ie_len);
-        
+
         // Version (3 bits) = 2, P (1 bit) = 0, T (1 bit) = 1, Spare (3 bits) = 0
         // = 0b01001000 = 0x48
         buf.put_u8(0x48);
-        
+
         // Message Type
         buf.put_u8(self.message_type);
-        
+
         // Message Length (excluding first 4 bytes)
         buf.put_u16(msg_len as u16);
-        
+
         // TEID
         buf.put_u32(self.teid);
-        
+
         // Sequence Number (3 bytes)
         buf.put_u8(((self.sequence >> 16) & 0xff) as u8);
         buf.put_u8(((self.sequence >> 8) & 0xff) as u8);
         buf.put_u8((self.sequence & 0xff) as u8);
-        
+
         // Spare
         buf.put_u8(0);
-        
+
         // IEs
         buf.put_slice(&self.ies);
-        
+
         buf.to_vec()
     }
 }
-
 
 // ============================================================================
 // Bearer Context Builder
@@ -1181,17 +1172,17 @@ impl BearerContextBuilder {
     /// End bearer context and return to parent builder
     pub fn end(mut self) -> Gtp2MessageBuilder {
         // Add the bearer context as a grouped IE to parent
-        self.parent.add_ie(gtp2_ie_type::BEARER_CONTEXT, self.instance, &self.ies);
+        self.parent
+            .add_ie(gtp2_ie_type::BEARER_CONTEXT, self.instance, &self.ies);
         self.parent
     }
 }
-
 
 // ============================================================================
 // High-Level Message Building Functions
 // ============================================================================
 
-use crate::context::{SmfSess, SmfBearer, Qos, PduSessionType};
+use crate::context::{PduSessionType, Qos, SmfBearer, SmfSess};
 
 /// Build Create Session Response message
 /// Port of smf_s5c_build_create_session_response
@@ -1206,8 +1197,8 @@ pub fn build_create_session_response(
     include_ambr: bool,
     include_bearer_qos: bool,
 ) -> Vec<u8> {
-    let mut builder = Gtp2MessageBuilder::new(gtp2_message_type::CREATE_SESSION_RESPONSE)
-        .teid(sess.sgw_s5c_teid);
+    let mut builder =
+        Gtp2MessageBuilder::new(gtp2_message_type::CREATE_SESSION_RESPONSE).teid(sess.sgw_s5c_teid);
 
     // Cause
     let cause = if sess.ue_session_type != sess.session_type as u8 {
@@ -1291,7 +1282,8 @@ pub fn build_create_session_response(
             _ => gtp2_f_teid_interface::S5_S8_PGW_GTP_U,
         };
 
-        let mut bc_builder = builder.start_bearer_context(0)
+        let mut bc_builder = builder
+            .start_bearer_context(0)
             .add_ebi(bearer.ebi)
             .add_cause(Gtp2Cause::RequestAccepted);
 
@@ -1327,7 +1319,6 @@ pub fn build_create_session_response(
 
     builder.build()
 }
-
 
 /// Build Delete Session Response message
 /// Port of smf_s5c_build_delete_session_response
@@ -1373,7 +1364,8 @@ pub fn build_modify_bearer_response(
 
         // Add bearer contexts modified
         for bearer in bearers {
-            let bc_builder = builder.start_bearer_context(0)
+            let bc_builder = builder
+                .start_bearer_context(0)
                 .add_ebi(bearer.ebi)
                 .add_charging_id(sess.charging.id);
             builder = bc_builder.end();
@@ -1413,7 +1405,8 @@ pub fn build_create_bearer_request(
         dl_gbr: bearer.qos.gbr_downlink,
     };
 
-    let mut bc_builder = builder.start_bearer_context(0)
+    let mut bc_builder = builder
+        .start_bearer_context(0)
         .add_ebi(bearer.ebi)
         .add_bearer_qos(&bearer_qos);
 
@@ -1444,8 +1437,8 @@ pub fn build_update_bearer_request(
     tft: Option<&[u8]>,
     include_qos: bool,
 ) -> Vec<u8> {
-    let mut builder = Gtp2MessageBuilder::new(gtp2_message_type::UPDATE_BEARER_REQUEST)
-        .teid(sess.sgw_s5c_teid);
+    let mut builder =
+        Gtp2MessageBuilder::new(gtp2_message_type::UPDATE_BEARER_REQUEST).teid(sess.sgw_s5c_teid);
 
     // AMBR
     if sess.session_ambr.uplink > 0 || sess.session_ambr.downlink > 0 {
@@ -1459,8 +1452,7 @@ pub fn build_update_bearer_request(
     }
 
     // Bearer Context
-    let mut bc_builder = builder.start_bearer_context(0)
-        .add_ebi(bearer.ebi);
+    let mut bc_builder = builder.start_bearer_context(0).add_ebi(bearer.ebi);
 
     // Bearer QoS
     if include_qos {
@@ -1495,8 +1487,8 @@ pub fn build_delete_bearer_request(
     pti: Option<u8>,
     cause: Option<Gtp2Cause>,
 ) -> Vec<u8> {
-    let mut builder = Gtp2MessageBuilder::new(gtp2_message_type::DELETE_BEARER_REQUEST)
-        .teid(sess.sgw_s5c_teid);
+    let mut builder =
+        Gtp2MessageBuilder::new(gtp2_message_type::DELETE_BEARER_REQUEST).teid(sess.sgw_s5c_teid);
 
     if bearer_ebi == linked_ebi {
         // Default bearer - use Linked EPS Bearer ID
@@ -1519,13 +1511,8 @@ pub fn build_delete_bearer_request(
     builder.build()
 }
 
-
 /// Build error message response
-pub fn build_error_message(
-    message_type: u8,
-    teid: u32,
-    cause: Gtp2Cause,
-) -> Vec<u8> {
+pub fn build_error_message(message_type: u8, teid: u32, cause: Gtp2Cause) -> Vec<u8> {
     Gtp2MessageBuilder::new(message_type)
         .teid(teid)
         .add_cause(cause)
@@ -1555,14 +1542,17 @@ mod tests {
             0x12345678,
             Ipv4Addr::new(192, 168, 1, 1),
         );
-        
-        assert_eq!(f_teid.interface_type, gtp2_f_teid_interface::S5_S8_PGW_GTP_C);
+
+        assert_eq!(
+            f_teid.interface_type,
+            gtp2_f_teid_interface::S5_S8_PGW_GTP_C
+        );
         assert!(f_teid.teid_present);
         assert!(f_teid.ipv4_present);
         assert!(!f_teid.ipv6_present);
         assert_eq!(f_teid.teid, 0x12345678);
         assert_eq!(f_teid.ipv4_addr, Some(Ipv4Addr::new(192, 168, 1, 1)));
-        
+
         let encoded = f_teid.encode();
         assert!(!encoded.is_empty());
     }
@@ -1574,7 +1564,7 @@ mod tests {
             0xabcdef00,
             Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
         );
-        
+
         assert!(f_teid.ipv6_present);
         assert!(!f_teid.ipv4_present);
         assert_eq!(f_teid.teid, 0xabcdef00);
@@ -1592,14 +1582,17 @@ mod tests {
             ul_gbr: 50000,
             dl_gbr: 100000,
         };
-        
+
         let encoded = qos.encode();
         assert_eq!(encoded.len(), BEARER_QOS_LEN);
-        
+
         let decoded = BearerQos::parse(&encoded).unwrap();
         assert_eq!(decoded.pre_emption_capability, qos.pre_emption_capability);
         assert_eq!(decoded.priority_level, qos.priority_level);
-        assert_eq!(decoded.pre_emption_vulnerability, qos.pre_emption_vulnerability);
+        assert_eq!(
+            decoded.pre_emption_vulnerability,
+            qos.pre_emption_vulnerability
+        );
         assert_eq!(decoded.qci, qos.qci);
         assert_eq!(decoded.ul_mbr, qos.ul_mbr);
         assert_eq!(decoded.dl_mbr, qos.dl_mbr);
@@ -1612,7 +1605,7 @@ mod tests {
         let ambr = Ambr::from_bps(100_000_000, 50_000_000);
         assert_eq!(ambr.uplink, 100_000);
         assert_eq!(ambr.downlink, 50_000);
-        
+
         let encoded = ambr.encode();
         assert_eq!(encoded.len(), 8);
     }
@@ -1622,7 +1615,7 @@ mod tests {
         let paa = Paa::ipv4(Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(paa.pdn_type, pdn_type::IPV4);
         assert_eq!(paa.len(), PAA_IPV4_LEN);
-        
+
         let encoded = paa.encode();
         assert_eq!(encoded.len(), PAA_IPV4_LEN);
         assert_eq!(encoded[0], pdn_type::IPV4);
@@ -1653,7 +1646,7 @@ mod tests {
             .sequence(1)
             .add_cause(Gtp2Cause::RequestAccepted)
             .build();
-        
+
         // Check header
         assert_eq!(msg[0], 0x48); // Version 2, T=1
         assert_eq!(msg[1], gtp2_message_type::CREATE_SESSION_RESPONSE);
@@ -1669,11 +1662,11 @@ mod tests {
         let msg = Gtp2MessageBuilder::new(gtp2_message_type::CREATE_SESSION_RESPONSE)
             .teid(0x12345678)
             .start_bearer_context(0)
-                .add_ebi(5)
-                .add_cause(Gtp2Cause::RequestAccepted)
+            .add_ebi(5)
+            .add_cause(Gtp2Cause::RequestAccepted)
             .end()
             .build();
-        
+
         assert!(!msg.is_empty());
         assert_eq!(msg[1], gtp2_message_type::CREATE_SESSION_RESPONSE);
     }
@@ -1689,7 +1682,7 @@ mod tests {
     #[test]
     fn test_build_delete_session_response() {
         let msg = build_delete_session_response(0x12345678, None, None);
-        
+
         assert!(!msg.is_empty());
         assert_eq!(msg[1], gtp2_message_type::DELETE_SESSION_RESPONSE);
     }
@@ -1701,7 +1694,7 @@ mod tests {
             0x12345678,
             Gtp2Cause::MandatoryIeMissing,
         );
-        
+
         assert!(!msg.is_empty());
         assert_eq!(msg[1], gtp2_message_type::CREATE_SESSION_RESPONSE);
     }
@@ -1709,7 +1702,7 @@ mod tests {
     #[test]
     fn test_build_echo_response() {
         let msg = build_echo_response(1);
-        
+
         assert!(!msg.is_empty());
         assert_eq!(msg[1], gtp2_message_type::ECHO_RESPONSE);
     }

@@ -58,7 +58,9 @@ pub enum ScpTimerId {
 impl ScpTimerId {
     pub fn name(&self) -> &'static str {
         match self {
-            ScpTimerId::NfInstanceRegistrationInterval => "OGS_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL",
+            ScpTimerId::NfInstanceRegistrationInterval => {
+                "OGS_TIMER_NF_INSTANCE_REGISTRATION_INTERVAL"
+            }
             ScpTimerId::NfInstanceHeartbeatInterval => "OGS_TIMER_NF_INSTANCE_HEARTBEAT_INTERVAL",
             ScpTimerId::NfInstanceNoHeartbeat => "OGS_TIMER_NF_INSTANCE_NO_HEARTBEAT",
             ScpTimerId::NfInstanceValidity => "OGS_TIMER_NF_INSTANCE_VALIDITY",

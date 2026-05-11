@@ -81,8 +81,7 @@ impl UdmTimerId {
 }
 
 /// SBI message data for events
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SbiEventData {
     /// Request data (if any)
     pub request: Option<SbiRequest>,
@@ -97,7 +96,6 @@ pub struct SbiEventData {
     /// State for multi-step operations
     pub state: Option<i32>,
 }
-
 
 /// Simplified SBI request representation
 #[derive(Debug, Clone)]
@@ -120,8 +118,7 @@ pub struct SbiResponse {
 }
 
 /// Simplified SBI message representation
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SbiMessage {
     /// Service name
     pub service_name: String,
@@ -136,8 +133,6 @@ pub struct SbiMessage {
     /// Number of dataset names (for SDM queries)
     pub num_of_dataset_names: usize,
 }
-
-
 
 /// UDM Event structure
 #[derive(Debug, Clone)]

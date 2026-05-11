@@ -41,16 +41,16 @@
 //! let decoded = parser::decode_ngap_pdu(&bytes).expect("value expected");
 //! ```
 
-pub mod error;
-pub mod types;
-pub mod ie;
 pub mod builder;
+pub mod error;
+pub mod ie;
 pub mod parser;
+pub mod types;
 
 // Re-export key types for convenience
 pub use error::{NgapError, NgapResult};
-pub use types::*;
 pub use parser::NgapMessage;
+pub use types::*;
 
 #[cfg(test)]
 mod tests {
@@ -238,10 +238,7 @@ mod tests {
             relative_amf_capacity: 255,
             plmn_support_list: vec![types::PlmnSupportItem {
                 plmn_identity: [0x99, 0xF9, 0x07],
-                slice_support_list: vec![types::SNssai {
-                    sst: 1,
-                    sd: None,
-                }],
+                slice_support_list: vec![types::SNssai { sst: 1, sd: None }],
             }],
         };
 

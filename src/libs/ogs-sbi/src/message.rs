@@ -69,7 +69,11 @@ impl SbiPart {
         Self::default()
     }
 
-    pub fn with_content(content_id: impl Into<String>, content_type: impl Into<String>, data: Bytes) -> Self {
+    pub fn with_content(
+        content_id: impl Into<String>,
+        content_type: impl Into<String>,
+        data: Bytes,
+    ) -> Self {
         Self {
             content_id: Some(content_id.into()),
             content_type: Some(content_type.into()),
@@ -197,7 +201,11 @@ impl SbiRequest {
     }
 
     /// Set raw body content
-    pub fn with_body(mut self, content: impl Into<String>, content_type: impl Into<String>) -> Self {
+    pub fn with_body(
+        mut self,
+        content: impl Into<String>,
+        content_type: impl Into<String>,
+    ) -> Self {
         self.http.set_content(content);
         self.http.set_header("Content-Type", content_type);
         self
@@ -279,7 +287,11 @@ impl SbiResponse {
     }
 
     /// Set raw body content
-    pub fn with_body(mut self, content: impl Into<String>, content_type: impl Into<String>) -> Self {
+    pub fn with_body(
+        mut self,
+        content: impl Into<String>,
+        content_type: impl Into<String>,
+    ) -> Self {
         self.http.set_content(content);
         self.http.set_header("Content-Type", content_type);
         self
@@ -524,7 +536,7 @@ mod tests {
         header.service_name = Some("nnrf-nfm".to_string());
         header.api_version = Some("v1".to_string());
         header.add_resource("nf-instances");
-        
+
         assert_eq!(header.method, "GET");
         assert_eq!(header.resource.len(), 1);
     }
@@ -534,16 +546,15 @@ mod tests {
         let request = SbiRequest::get("/test")
             .with_param("key", "value")
             .with_header("Accept", "application/json");
-        
+
         assert_eq!(request.header.method, "GET");
         assert_eq!(request.http.get_param("key"), Some(&"value".to_string()));
     }
 
     #[test]
     fn test_sbi_response() {
-        let response = SbiResponse::ok()
-            .with_body(r#"{"status":"ok"}"#, "application/json");
-        
+        let response = SbiResponse::ok().with_body(r#"{"status":"ok"}"#, "application/json");
+
         assert!(response.is_success());
         assert_eq!(response.status, 200);
     }
@@ -553,7 +564,7 @@ mod tests {
         let problem = ProblemDetails::with_status(404)
             .with_title("Not Found")
             .with_detail("The requested resource was not found");
-        
+
         let json = serde_json::to_string(&problem).unwrap();
         assert!(json.contains("404"));
         assert!(json.contains("Not Found"));

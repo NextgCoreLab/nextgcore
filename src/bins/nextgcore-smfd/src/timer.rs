@@ -266,18 +266,20 @@ impl TimerManager {
 
     /// Stop a timer for session
     pub fn stop_sess_timer(&mut self, timer_id: SmfTimerId, sess_id: u64) {
-        self.active_timers.retain(|t| {
-            !(t.timer_id == timer_id && t.sess_id == Some(sess_id))
-        });
+        self.active_timers
+            .retain(|t| !(t.timer_id == timer_id && t.sess_id == Some(sess_id)));
         log::debug!("Stopped timer {} for session {}", timer_id.name(), sess_id);
     }
 
     /// Stop a timer for PFCP node
     pub fn stop_pfcp_node_timer(&mut self, timer_id: SmfTimerId, pfcp_node_id: u64) {
-        self.active_timers.retain(|t| {
-            !(t.timer_id == timer_id && t.pfcp_node_id == Some(pfcp_node_id))
-        });
-        log::debug!("Stopped timer {} for PFCP node {}", timer_id.name(), pfcp_node_id);
+        self.active_timers
+            .retain(|t| !(t.timer_id == timer_id && t.pfcp_node_id == Some(pfcp_node_id)));
+        log::debug!(
+            "Stopped timer {} for PFCP node {}",
+            timer_id.name(),
+            pfcp_node_id
+        );
     }
 
     /// Stop all timers for session
@@ -288,7 +290,8 @@ impl TimerManager {
 
     /// Stop all timers for PFCP node
     pub fn stop_all_pfcp_node_timers(&mut self, pfcp_node_id: u64) {
-        self.active_timers.retain(|t| t.pfcp_node_id != Some(pfcp_node_id));
+        self.active_timers
+            .retain(|t| t.pfcp_node_id != Some(pfcp_node_id));
         log::debug!("Stopped all timers for PFCP node {pfcp_node_id}");
     }
 
@@ -326,8 +329,14 @@ mod tests {
 
     #[test]
     fn test_timer_id_names() {
-        assert_eq!(SmfTimerId::PfcpAssociation.name(), "SMF_TIMER_PFCP_ASSOCIATION");
-        assert_eq!(SmfTimerId::PfcpNoHeartbeat.name(), "SMF_TIMER_PFCP_NO_HEARTBEAT");
+        assert_eq!(
+            SmfTimerId::PfcpAssociation.name(),
+            "SMF_TIMER_PFCP_ASSOCIATION"
+        );
+        assert_eq!(
+            SmfTimerId::PfcpNoHeartbeat.name(),
+            "SMF_TIMER_PFCP_NO_HEARTBEAT"
+        );
         assert_eq!(
             SmfTimerId::PfcpNoEstablishmentResponse.name(),
             "SMF_TIMER_PFCP_NO_ESTABLISHMENT_RESPONSE"

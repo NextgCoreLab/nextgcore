@@ -207,7 +207,10 @@ mod tests {
         assert_eq!(SgwuEventId::FsmExit.name(), "OGS_FSM_EXIT_SIG");
         assert_eq!(SgwuEventId::SxaMessage.name(), "SGWU_EVT_SXA_MESSAGE");
         assert_eq!(SgwuEventId::SxaTimer.name(), "SGWU_EVT_SXA_TIMER");
-        assert_eq!(SgwuEventId::SxaNoHeartbeat.name(), "SGWU_EVT_SXA_NO_HEARTBEAT");
+        assert_eq!(
+            SgwuEventId::SxaNoHeartbeat.name(),
+            "SGWU_EVT_SXA_NO_HEARTBEAT"
+        );
     }
 
     #[test]
@@ -253,8 +256,14 @@ mod tests {
 
     #[test]
     fn test_from_signal() {
-        assert_eq!(SgwuEventId::from_signal(OGS_FSM_ENTRY_SIG), SgwuEventId::FsmEntry);
-        assert_eq!(SgwuEventId::from_signal(OGS_FSM_EXIT_SIG), SgwuEventId::FsmExit);
+        assert_eq!(
+            SgwuEventId::from_signal(OGS_FSM_ENTRY_SIG),
+            SgwuEventId::FsmEntry
+        );
+        assert_eq!(
+            SgwuEventId::from_signal(OGS_FSM_EXIT_SIG),
+            SgwuEventId::FsmExit
+        );
         assert_eq!(SgwuEventId::from_signal(99), SgwuEventId::SxaMessage);
     }
 }

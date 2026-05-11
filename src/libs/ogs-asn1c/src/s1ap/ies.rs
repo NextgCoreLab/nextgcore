@@ -2,8 +2,8 @@
 //!
 //! Protocol IE containers and common IEs from S1AP-IEs (3GPP TS 36.413)
 
-use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerResult};
 use super::types::{Criticality, ProtocolIeId};
+use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerResult};
 
 /// ProtocolIE-Field - Single IE with ID, criticality, and value
 /// ASN.1: ProtocolIE-Field ::= SEQUENCE { id, criticality, value }
@@ -18,11 +18,11 @@ impl AperEncode for ProtocolIeField {
     fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()> {
         self.id.encode_aper(encoder)?;
         self.criticality.encode_aper(encoder)?;
-        
+
         // Value is encoded as OPEN TYPE
         encoder.encode_length_determinant(self.value.len())?;
         encoder.write_bytes(&self.value);
-        
+
         Ok(())
     }
 }
@@ -31,10 +31,10 @@ impl AperDecode for ProtocolIeField {
     fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
         let id = ProtocolIeId::decode_aper(decoder)?;
         let criticality = Criticality::decode_aper(decoder)?;
-        
+
         let value_len = decoder.decode_length_determinant()?;
         let value = decoder.read_bytes(value_len)?;
-        
+
         Ok(ProtocolIeField {
             id,
             criticality,
@@ -60,7 +60,9 @@ impl ProtocolIeContainer {
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { ies: Vec::with_capacity(capacity) }
+        Self {
+            ies: Vec::with_capacity(capacity),
+        }
     }
 
     pub fn push(&mut self, ie: ProtocolIeField) {
@@ -90,12 +92,12 @@ impl AperEncode for ProtocolIeContainer {
     fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()> {
         // Encode length (constrained to 0..65535)
         encoder.encode_constrained_length(self.ies.len(), 0, Self::MAX_PROTOCOL_IES)?;
-        
+
         // Encode each IE
         for ie in &self.ies {
             ie.encode_aper(encoder)?;
         }
-        
+
         Ok(())
     }
 }
@@ -103,12 +105,12 @@ impl AperEncode for ProtocolIeContainer {
 impl AperDecode for ProtocolIeContainer {
     fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
         let count = decoder.decode_constrained_length(0, Self::MAX_PROTOCOL_IES)?;
-        
+
         let mut ies = Vec::with_capacity(count);
         for _ in 0..count {
             ies.push(ProtocolIeField::decode_aper(decoder)?);
         }
-        
+
         Ok(ProtocolIeContainer { ies })
     }
 }
@@ -157,7 +159,6 @@ impl AperDecode for EnbUeS1apId {
     }
 }
 
-
 /// TimeToWait - Time to wait before retrying
 /// ASN.1: TimeToWait ::= ENUMERATED { v1s, v2s, v5s, v10s, v20s, v60s, ... }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -203,9 +204,9 @@ impl AperDecode for TimeToWait {
             3 => Ok(TimeToWait::V10s),
             4 => Ok(TimeToWait::V20s),
             5 => Ok(TimeToWait::V60s),
-            _ => Err(crate::per::PerError::DecodeError(
-                format!("Unknown TimeToWait value: {value}")
-            )),
+            _ => Err(crate::per::PerError::DecodeError(format!(
+                "Unknown TimeToWait value: {value}"
+            ))),
         }
     }
 }
@@ -329,35 +330,35 @@ impl AperDecode for PriorityLevel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::per::{AperEncoder, AperDecoder};
+    use crate::per::{AperDecoder, AperEncoder};
 
     #[test]
     fn test_mme_ue_s1ap_id_roundtrip() {
         let id = MmeUeS1apId(12345678);
-        
+
         let mut encoder = AperEncoder::new();
         id.encode_aper(&mut encoder).unwrap();
         encoder.align();
-        
+
         let bytes = encoder.into_bytes();
         let mut decoder = AperDecoder::new(&bytes);
         let decoded = MmeUeS1apId::decode_aper(&mut decoder).unwrap();
-        
+
         assert_eq!(id, decoded);
     }
 
     #[test]
     fn test_enb_ue_s1ap_id_roundtrip() {
         let id = EnbUeS1apId(0xFFFFFF);
-        
+
         let mut encoder = AperEncoder::new();
         id.encode_aper(&mut encoder).unwrap();
         encoder.align();
-        
+
         let bytes = encoder.into_bytes();
         let mut decoder = AperDecoder::new(&bytes);
         let decoded = EnbUeS1apId::decode_aper(&mut decoder).unwrap();
-        
+
         assert_eq!(id, decoded);
     }
 
@@ -374,15 +375,15 @@ mod tests {
             criticality: Criticality::Reject,
             value: vec![0xDE, 0xAD, 0xBE, 0xEF],
         });
-        
+
         let mut encoder = AperEncoder::new();
         container.encode_aper(&mut encoder).unwrap();
         encoder.align();
-        
+
         let bytes = encoder.into_bytes();
         let mut decoder = AperDecoder::new(&bytes);
         let decoded = ProtocolIeContainer::decode_aper(&mut decoder).unwrap();
-        
+
         assert_eq!(container.len(), decoded.len());
         assert_eq!(container.ies[0].id, decoded.ies[0].id);
         assert_eq!(container.ies[1].id, decoded.ies[1].id);
@@ -391,15 +392,15 @@ mod tests {
     #[test]
     fn test_time_to_wait_roundtrip() {
         let ttw = TimeToWait::V10s;
-        
+
         let mut encoder = AperEncoder::new();
         ttw.encode_aper(&mut encoder).unwrap();
         encoder.align();
-        
+
         let bytes = encoder.into_bytes();
         let mut decoder = AperDecoder::new(&bytes);
         let decoded = TimeToWait::decode_aper(&mut decoder).unwrap();
-        
+
         assert_eq!(ttw, decoded);
         assert_eq!(decoded.seconds(), 10);
     }

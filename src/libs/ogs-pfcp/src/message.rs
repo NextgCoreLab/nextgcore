@@ -2,16 +2,15 @@
 //!
 //! PFCP message structures and encoding/decoding as specified in 3GPP TS 29.244.
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::error::{PfcpError, PfcpResult};
 use crate::header::{PfcpHeader, PfcpMessageType};
-use crate::ie::{IeHeader, IeType, RawIe, encode_u8_ie, encode_u32_ie};
+use crate::ie::{encode_u32_ie, encode_u8_ie, IeHeader, IeType, RawIe};
 use crate::types::{
-    NodeId, FSeid, PfcpCause, UpFunctionFeatures, CpFunctionFeatures,
-    CreatePdr, CreateFar, CreateQer, CreateUrr, CreateBar,
-    UpdatePdr, UpdateFar, RemovePdr, RemoveFar,
-    ReportType, UsageReportSrr, DownlinkDataReport,
+    CpFunctionFeatures, CreateBar, CreateFar, CreatePdr, CreateQer, CreateUrr, DownlinkDataReport,
+    FSeid, NodeId, PfcpCause, RemoveFar, RemovePdr, ReportType, UpFunctionFeatures, UpdateFar,
+    UpdatePdr, UsageReportSrr,
 };
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Heartbeat Request message
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,7 +20,9 @@ pub struct HeartbeatRequest {
 
 impl HeartbeatRequest {
     pub fn new(recovery_time_stamp: u32) -> Self {
-        Self { recovery_time_stamp }
+        Self {
+            recovery_time_stamp,
+        }
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
@@ -30,17 +31,18 @@ impl HeartbeatRequest {
 
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
         let mut recovery_time_stamp = 0u32;
-        
+
         while buf.remaining() >= IeHeader::LEN {
             let ie = RawIe::decode(buf)?;
-            if ie.ie_type == IeType::RecoveryTimeStamp as u16
-                && ie.data.len() >= 4 {
-                    let mut data = ie.data;
-                    recovery_time_stamp = data.get_u32();
-                }
+            if ie.ie_type == IeType::RecoveryTimeStamp as u16 && ie.data.len() >= 4 {
+                let mut data = ie.data;
+                recovery_time_stamp = data.get_u32();
+            }
         }
-        
-        Ok(Self { recovery_time_stamp })
+
+        Ok(Self {
+            recovery_time_stamp,
+        })
     }
 }
 
@@ -52,7 +54,9 @@ pub struct HeartbeatResponse {
 
 impl HeartbeatResponse {
     pub fn new(recovery_time_stamp: u32) -> Self {
-        Self { recovery_time_stamp }
+        Self {
+            recovery_time_stamp,
+        }
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
@@ -61,17 +65,18 @@ impl HeartbeatResponse {
 
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
         let mut recovery_time_stamp = 0u32;
-        
+
         while buf.remaining() >= IeHeader::LEN {
             let ie = RawIe::decode(buf)?;
-            if ie.ie_type == IeType::RecoveryTimeStamp as u16
-                && ie.data.len() >= 4 {
-                    let mut data = ie.data;
-                    recovery_time_stamp = data.get_u32();
-                }
+            if ie.ie_type == IeType::RecoveryTimeStamp as u16 && ie.data.len() >= 4 {
+                let mut data = ie.data;
+                recovery_time_stamp = data.get_u32();
+            }
         }
-        
-        Ok(Self { recovery_time_stamp })
+
+        Ok(Self {
+            recovery_time_stamp,
+        })
     }
 }
 
@@ -101,19 +106,20 @@ impl AssociationSetupRequest {
         let header = IeHeader::new(IeType::NodeId as u16, node_id_buf.len() as u16);
         header.encode(buf);
         buf.put_slice(&node_id_buf);
-        
+
         // Recovery Time Stamp
         encode_u32_ie(buf, IeType::RecoveryTimeStamp, self.recovery_time_stamp);
-        
+
         // UP Function Features (optional)
         if let Some(features) = &self.up_function_features {
             let mut features_buf = BytesMut::new();
             features.encode(&mut features_buf);
-            let header = IeHeader::new(IeType::UpFunctionFeatures as u16, features_buf.len() as u16);
+            let header =
+                IeHeader::new(IeType::UpFunctionFeatures as u16, features_buf.len() as u16);
             header.encode(buf);
             buf.put_slice(&features_buf);
         }
-        
+
         // CP Function Features (optional)
         if let Some(features) = &self.cp_function_features {
             encode_u8_ie(buf, IeType::CpFunctionFeatures, features.encode());
@@ -125,7 +131,7 @@ impl AssociationSetupRequest {
         let mut recovery_time_stamp = 0u32;
         let mut up_function_features = None;
         let mut cp_function_features = None;
-        
+
         while buf.remaining() >= IeHeader::LEN {
             let ie = RawIe::decode(buf)?;
             match ie.ie_type {
@@ -151,9 +157,10 @@ impl AssociationSetupRequest {
                 _ => {} // Skip unknown IEs
             }
         }
-        
-        let node_id = node_id.ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?;
-        
+
+        let node_id =
+            node_id.ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?;
+
         Ok(Self {
             node_id,
             recovery_time_stamp,
@@ -162,7 +169,6 @@ impl AssociationSetupRequest {
         })
     }
 }
-
 
 /// Association Setup Response message
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,22 +198,23 @@ impl AssociationSetupResponse {
         let header = IeHeader::new(IeType::NodeId as u16, node_id_buf.len() as u16);
         header.encode(buf);
         buf.put_slice(&node_id_buf);
-        
+
         // Cause
         encode_u8_ie(buf, IeType::Cause, self.cause as u8);
-        
+
         // Recovery Time Stamp
         encode_u32_ie(buf, IeType::RecoveryTimeStamp, self.recovery_time_stamp);
-        
+
         // UP Function Features (optional)
         if let Some(features) = &self.up_function_features {
             let mut features_buf = BytesMut::new();
             features.encode(&mut features_buf);
-            let header = IeHeader::new(IeType::UpFunctionFeatures as u16, features_buf.len() as u16);
+            let header =
+                IeHeader::new(IeType::UpFunctionFeatures as u16, features_buf.len() as u16);
             header.encode(buf);
             buf.put_slice(&features_buf);
         }
-        
+
         // CP Function Features (optional)
         if let Some(features) = &self.cp_function_features {
             encode_u8_ie(buf, IeType::CpFunctionFeatures, features.encode());
@@ -220,7 +227,7 @@ impl AssociationSetupResponse {
         let mut recovery_time_stamp = 0u32;
         let mut up_function_features = None;
         let mut cp_function_features = None;
-        
+
         while buf.remaining() >= IeHeader::LEN {
             let ie = RawIe::decode(buf)?;
             match ie.ie_type {
@@ -251,9 +258,10 @@ impl AssociationSetupResponse {
                 _ => {} // Skip unknown IEs
             }
         }
-        
-        let node_id = node_id.ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?;
-        
+
+        let node_id =
+            node_id.ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?;
+
         Ok(Self {
             node_id,
             cause,
@@ -285,7 +293,7 @@ impl AssociationReleaseRequest {
 
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
         let mut node_id = None;
-        
+
         while buf.remaining() >= IeHeader::LEN {
             let ie = RawIe::decode(buf)?;
             if ie.ie_type == IeType::NodeId as u16 {
@@ -293,8 +301,9 @@ impl AssociationReleaseRequest {
                 node_id = Some(NodeId::decode(&mut data)?);
             }
         }
-        
-        let node_id = node_id.ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?;
+
+        let node_id =
+            node_id.ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?;
         Ok(Self { node_id })
     }
 }
@@ -317,14 +326,14 @@ impl AssociationReleaseResponse {
         let header = IeHeader::new(IeType::NodeId as u16, node_id_buf.len() as u16);
         header.encode(buf);
         buf.put_slice(&node_id_buf);
-        
+
         encode_u8_ie(buf, IeType::Cause, self.cause as u8);
     }
 
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
         let mut node_id = None;
         let mut cause = PfcpCause::RequestAccepted;
-        
+
         while buf.remaining() >= IeHeader::LEN {
             let ie = RawIe::decode(buf)?;
             match ie.ie_type {
@@ -340,12 +349,12 @@ impl AssociationReleaseResponse {
                 _ => {}
             }
         }
-        
-        let node_id = node_id.ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?;
+
+        let node_id =
+            node_id.ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?;
         Ok(Self { node_id, cause })
     }
 }
-
 
 /// Session Establishment Request message (TS 29.244 Section 7.5.2)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -477,8 +486,10 @@ impl SessionEstablishmentRequest {
             }
         }
 
-        let node_id = node_id.ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?;
-        let cp_f_seid = cp_f_seid.ok_or_else(|| PfcpError::MissingMandatoryIe("CP F-SEID".to_string()))?;
+        let node_id =
+            node_id.ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?;
+        let cp_f_seid =
+            cp_f_seid.ok_or_else(|| PfcpError::MissingMandatoryIe("CP F-SEID".to_string()))?;
 
         Ok(Self {
             node_id,
@@ -518,10 +529,10 @@ impl SessionEstablishmentResponse {
             header.encode(buf);
             buf.put_slice(&node_id_buf);
         }
-        
+
         // Cause
         encode_u8_ie(buf, IeType::Cause, self.cause as u8);
-        
+
         // UP F-SEID (optional)
         if let Some(fseid) = &self.up_f_seid {
             let mut fseid_buf = BytesMut::new();
@@ -536,7 +547,7 @@ impl SessionEstablishmentResponse {
         let mut node_id = None;
         let mut cause = PfcpCause::RequestAccepted;
         let mut up_f_seid = None;
-        
+
         while buf.remaining() >= IeHeader::LEN {
             let ie = RawIe::decode(buf)?;
             match ie.ie_type {
@@ -556,8 +567,12 @@ impl SessionEstablishmentResponse {
                 _ => {}
             }
         }
-        
-        Ok(Self { node_id, cause, up_f_seid })
+
+        Ok(Self {
+            node_id,
+            cause,
+            up_f_seid,
+        })
     }
 }
 
@@ -598,18 +613,17 @@ impl SessionDeletionResponse {
 
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
         let mut cause = PfcpCause::RequestAccepted;
-        
+
         while buf.remaining() >= IeHeader::LEN {
             let ie = RawIe::decode(buf)?;
             if ie.ie_type == IeType::Cause as u16 && !ie.data.is_empty() {
                 cause = PfcpCause::try_from(ie.data[0])?;
             }
         }
-        
+
         Ok(Self { cause })
     }
 }
-
 
 /// Session Modification Request message (TS 29.244 Section 7.5.4)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -857,7 +871,11 @@ impl SessionModificationResponse {
             }
         }
 
-        Ok(Self { cause, offending_ie, created_pdrs })
+        Ok(Self {
+            cause,
+            offending_ie,
+            created_pdrs,
+        })
     }
 }
 
@@ -870,7 +888,10 @@ pub struct CreatedPdr {
 
 impl CreatedPdr {
     pub fn new(pdr_id: u16) -> Self {
-        Self { pdr_id, local_f_teid: None }
+        Self {
+            pdr_id,
+            local_f_teid: None,
+        }
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
@@ -908,7 +929,10 @@ impl CreatedPdr {
             }
         }
 
-        Ok(Self { pdr_id, local_f_teid })
+        Ok(Self {
+            pdr_id,
+            local_f_teid,
+        })
     }
 }
 
@@ -1041,10 +1065,13 @@ impl SessionReportResponse {
             }
         }
 
-        Ok(Self { cause, offending_ie, pfcp_srrsp_flags })
+        Ok(Self {
+            cause,
+            offending_ie,
+            pfcp_srrsp_flags,
+        })
     }
 }
-
 
 /// PFCP Message enum containing all message types
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1115,94 +1142,90 @@ impl PfcpMessage {
             PfcpMessageType::HeartbeatResponse => {
                 Ok(Self::HeartbeatResponse(HeartbeatResponse::decode(buf)?))
             }
-            PfcpMessageType::AssociationSetupRequest => {
-                Ok(Self::AssociationSetupRequest(AssociationSetupRequest::decode(buf)?))
-            }
-            PfcpMessageType::AssociationSetupResponse => {
-                Ok(Self::AssociationSetupResponse(AssociationSetupResponse::decode(buf)?))
-            }
-            PfcpMessageType::AssociationReleaseRequest => {
-                Ok(Self::AssociationReleaseRequest(AssociationReleaseRequest::decode(buf)?))
-            }
-            PfcpMessageType::AssociationReleaseResponse => {
-                Ok(Self::AssociationReleaseResponse(AssociationReleaseResponse::decode(buf)?))
-            }
-            PfcpMessageType::SessionEstablishmentRequest => {
-                Ok(Self::SessionEstablishmentRequest(SessionEstablishmentRequest::decode(buf)?))
-            }
-            PfcpMessageType::SessionEstablishmentResponse => {
-                Ok(Self::SessionEstablishmentResponse(SessionEstablishmentResponse::decode(buf)?))
-            }
-            PfcpMessageType::SessionModificationRequest => {
-                Ok(Self::SessionModificationRequest(SessionModificationRequest::decode(buf)?))
-            }
-            PfcpMessageType::SessionModificationResponse => {
-                Ok(Self::SessionModificationResponse(SessionModificationResponse::decode(buf)?))
-            }
-            PfcpMessageType::SessionDeletionRequest => {
-                Ok(Self::SessionDeletionRequest(SessionDeletionRequest::decode(buf)?))
-            }
-            PfcpMessageType::SessionDeletionResponse => {
-                Ok(Self::SessionDeletionResponse(SessionDeletionResponse::decode(buf)?))
-            }
-            PfcpMessageType::SessionReportRequest => {
-                Ok(Self::SessionReportRequest(SessionReportRequest::decode(buf)?))
-            }
-            PfcpMessageType::SessionReportResponse => {
-                Ok(Self::SessionReportResponse(SessionReportResponse::decode(buf)?))
-            }
+            PfcpMessageType::AssociationSetupRequest => Ok(Self::AssociationSetupRequest(
+                AssociationSetupRequest::decode(buf)?,
+            )),
+            PfcpMessageType::AssociationSetupResponse => Ok(Self::AssociationSetupResponse(
+                AssociationSetupResponse::decode(buf)?,
+            )),
+            PfcpMessageType::AssociationReleaseRequest => Ok(Self::AssociationReleaseRequest(
+                AssociationReleaseRequest::decode(buf)?,
+            )),
+            PfcpMessageType::AssociationReleaseResponse => Ok(Self::AssociationReleaseResponse(
+                AssociationReleaseResponse::decode(buf)?,
+            )),
+            PfcpMessageType::SessionEstablishmentRequest => Ok(Self::SessionEstablishmentRequest(
+                SessionEstablishmentRequest::decode(buf)?,
+            )),
+            PfcpMessageType::SessionEstablishmentResponse => Ok(
+                Self::SessionEstablishmentResponse(SessionEstablishmentResponse::decode(buf)?),
+            ),
+            PfcpMessageType::SessionModificationRequest => Ok(Self::SessionModificationRequest(
+                SessionModificationRequest::decode(buf)?,
+            )),
+            PfcpMessageType::SessionModificationResponse => Ok(Self::SessionModificationResponse(
+                SessionModificationResponse::decode(buf)?,
+            )),
+            PfcpMessageType::SessionDeletionRequest => Ok(Self::SessionDeletionRequest(
+                SessionDeletionRequest::decode(buf)?,
+            )),
+            PfcpMessageType::SessionDeletionResponse => Ok(Self::SessionDeletionResponse(
+                SessionDeletionResponse::decode(buf)?,
+            )),
+            PfcpMessageType::SessionReportRequest => Ok(Self::SessionReportRequest(
+                SessionReportRequest::decode(buf)?,
+            )),
+            PfcpMessageType::SessionReportResponse => Ok(Self::SessionReportResponse(
+                SessionReportResponse::decode(buf)?,
+            )),
             _ => Err(PfcpError::InvalidMessageType(message_type as u8)),
         }
     }
 }
 
 /// Build a complete PFCP message with header
-pub fn build_message(
-    message: &PfcpMessage,
-    sequence_number: u32,
-    seid: Option<u64>,
-) -> BytesMut {
+pub fn build_message(message: &PfcpMessage, sequence_number: u32, seid: Option<u64>) -> BytesMut {
     let message_type = message.message_type();
-    
+
     // Encode body first to get length
     let mut body = BytesMut::new();
     message.encode_body(&mut body);
-    
+
     // Create header
     let mut header = if let Some(seid) = seid {
         PfcpHeader::new_with_seid(message_type, seid, sequence_number)
     } else {
         PfcpHeader::new(message_type, sequence_number)
     };
-    
+
     // Set length (body length + remaining header bytes after length field)
     header.length = (body.len() + if header.seid_presence { 12 } else { 4 }) as u16;
-    
+
     // Encode complete message
     let mut buf = BytesMut::new();
     header.encode(&mut buf);
     buf.put_slice(&body);
-    
+
     buf
 }
 
 /// Parse a complete PFCP message
 pub fn parse_message(buf: &mut Bytes) -> PfcpResult<(PfcpHeader, PfcpMessage)> {
     let header = PfcpHeader::decode(buf)?;
-    
+
     // Calculate body length
     let body_len = header.length as usize - if header.seid_presence { 12 } else { 4 };
-    
+
     if buf.remaining() < body_len {
         return Err(PfcpError::BufferTooShort {
             needed: body_len,
             available: buf.remaining(),
         });
     }
-    
+
     let mut body = buf.copy_to_bytes(body_len);
     let message = PfcpMessage::decode_body(header.message_type, &mut body)?;
-    
+
     Ok((header, message))
 }
 
@@ -1279,8 +1302,14 @@ mod tests {
         msg.create_qers.push(qer);
 
         // Add a URR
-        let mm = MeasurementMethod { volum: true, ..Default::default() };
-        let rt = ReportingTriggers { volth: true, ..Default::default() };
+        let mm = MeasurementMethod {
+            volum: true,
+            ..Default::default()
+        };
+        let rt = ReportingTriggers {
+            volth: true,
+            ..Default::default()
+        };
         let urr = CreateUrr::new(1, mm, rt);
         msg.create_urrs.push(urr);
 
@@ -1296,7 +1325,10 @@ mod tests {
         let mut bytes = buf.freeze();
         let (header, decoded) = parse_message(&mut bytes).unwrap();
 
-        assert_eq!(header.message_type, PfcpMessageType::SessionEstablishmentRequest);
+        assert_eq!(
+            header.message_type,
+            PfcpMessageType::SessionEstablishmentRequest
+        );
         assert!(header.seid_presence);
 
         if let PfcpMessage::SessionEstablishmentRequest(req) = decoded {
@@ -1358,7 +1390,10 @@ mod tests {
         let mut bytes = buf.freeze();
         let (header, decoded) = parse_message(&mut bytes).unwrap();
 
-        assert_eq!(header.message_type, PfcpMessageType::SessionModificationRequest);
+        assert_eq!(
+            header.message_type,
+            PfcpMessageType::SessionModificationRequest
+        );
 
         if let PfcpMessage::SessionModificationRequest(req) = decoded {
             assert_eq!(req.remove_pdrs.len(), 1);
@@ -1389,7 +1424,10 @@ mod tests {
         let mut bytes = buf.freeze();
         let (header, decoded) = parse_message(&mut bytes).unwrap();
 
-        assert_eq!(header.message_type, PfcpMessageType::SessionModificationResponse);
+        assert_eq!(
+            header.message_type,
+            PfcpMessageType::SessionModificationResponse
+        );
         if let PfcpMessage::SessionModificationResponse(resp) = decoded {
             assert_eq!(resp.cause, PfcpCause::RequestAccepted);
         } else {
@@ -1399,7 +1437,10 @@ mod tests {
 
     #[test]
     fn test_session_report_request_round_trip() {
-        let rt = ReportType { dldr: true, ..Default::default() };
+        let rt = ReportType {
+            dldr: true,
+            ..Default::default()
+        };
         let mut msg = SessionReportRequest::new(rt);
         msg.downlink_data_report = Some(DownlinkDataReport::new(5));
 

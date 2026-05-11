@@ -39,14 +39,14 @@ impl SeppSmContext {
 
     pub fn fini(&mut self) {
         log::debug!("SEPP SM: Finalizing");
-        
+
         // Finalize all handshake state machines
         for (node_id, handshake_ctx) in self.handshake_contexts.iter_mut() {
             log::debug!("Finalizing handshake SM for node {node_id}");
             handshake_ctx.fini();
         }
         self.handshake_contexts.clear();
-        
+
         let mut event = SeppEvent::exit();
         self.dispatch(&mut event);
         self.state = SeppState::Final;
@@ -75,7 +75,9 @@ impl SeppSmContext {
         let mut handshake_ctx = HandshakeSmContext::new(node_id);
         handshake_ctx.init(try_to_establish);
         self.handshake_contexts.insert(node_id, handshake_ctx);
-        log::info!("Initialized handshake FSM for node {node_id} (try_to_establish={try_to_establish})");
+        log::info!(
+            "Initialized handshake FSM for node {node_id} (try_to_establish={try_to_establish})"
+        );
     }
 
     /// Finalize handshake FSM for a peer node
@@ -166,7 +168,11 @@ impl SeppSmContext {
         // Check API version
         if api_version != "v1" {
             log::error!("Not supported version [{api_version}], expected [v1]");
-            send_error_response(stream_id, 400, &format!("Unsupported API version: {api_version}"));
+            send_error_response(
+                stream_id,
+                400,
+                &format!("Unsupported API version: {api_version}"),
+            );
             return;
         }
 
@@ -223,13 +229,13 @@ impl SeppSmContext {
                 "POST" => {
                     // Find or create SEPP node based on sender in request
                     let node_id = self.find_or_create_sepp_node_from_request(event);
-                    
+
                     if let Some(node_id) = node_id {
                         // Dispatch to handshake state machine
                         if let Some(handshake_ctx) = self.handshake_contexts.get_mut(&node_id) {
                             let mut handshake_event = event.clone().with_sepp_node(node_id);
                             handshake_ctx.dispatch(&mut handshake_event);
-                            
+
                             if handshake_ctx.is_exception() {
                                 log::error!("Handshake state machine exception for node {node_id}");
                             }
@@ -315,7 +321,7 @@ impl SeppSmContext {
                 log::debug!("NF instances response received");
                 if let Some(ref nf_instance_id) = event.nf_instance_id {
                     log::debug!("[{nf_instance_id}] NF instance response");
-                    
+
                     // After successful NRF registration, initialize handshake FSMs for all peer nodes
                     self.initialize_peer_handshakes();
                 }
@@ -329,7 +335,11 @@ impl SeppSmContext {
         }
     }
 
-    fn handle_n32c_handshake_response(&mut self, event: &mut SeppEvent, resource_components: &[String]) {
+    fn handle_n32c_handshake_response(
+        &mut self,
+        event: &mut SeppEvent,
+        resource_components: &[String],
+    ) {
         let resource = resource_components.first().map(|s| s.as_str());
 
         match resource {
@@ -359,10 +369,10 @@ impl SeppSmContext {
             SeppTimerId::PeerEstablish => {
                 if let Some(node_id) = event.sepp_node_id {
                     log::warn!("Retry establishment with Peer SEPP (node_id={node_id})");
-                    
+
                     if let Some(handshake_ctx) = self.handshake_contexts.get_mut(&node_id) {
                         handshake_ctx.dispatch(event);
-                        
+
                         if handshake_ctx.is_exception() {
                             log::error!("State machine exception for node {node_id}");
                         }

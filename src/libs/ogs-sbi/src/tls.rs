@@ -308,7 +308,13 @@ pub fn build_client_config_mtls(
     ca_path: Option<&str>,
     insecure_skip_verify: bool,
 ) -> SbiResult<ClientConfig> {
-    build_client_config_mtls_with_pqc(certs, key, ca_path, insecure_skip_verify, &PqcTlsConfig::default())
+    build_client_config_mtls_with_pqc(
+        certs,
+        key,
+        ca_path,
+        insecure_skip_verify,
+        &PqcTlsConfig::default(),
+    )
 }
 
 /// Build a client-side TLS config with mTLS and PQC support.

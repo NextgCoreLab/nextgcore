@@ -142,12 +142,18 @@ impl EesContext {
         let eas_id = profile.eas_id.clone();
         let app_id = profile.app_id.clone();
 
-        index.entry(app_id.clone())
+        index
+            .entry(app_id.clone())
             .or_default()
             .push(eas_id.clone());
         profiles.insert(eas_id, profile.clone());
 
-        log::info!("EAS registered: {} (app={}, endpoint={})", profile.eas_id, app_id, profile.endpoint);
+        log::info!(
+            "EAS registered: {} (app={}, endpoint={})",
+            profile.eas_id,
+            app_id,
+            profile.endpoint
+        );
         Some(profile)
     }
 
@@ -176,18 +182,21 @@ impl EesContext {
             None => return vec![],
         };
 
-        eas_ids.iter()
+        eas_ids
+            .iter()
             .filter_map(|eas_id| profiles.get(eas_id))
             .filter(|p| p.status == EasStatus::Registered || p.status == EasStatus::Active)
-            .filter(|p| {
-                match tac {
-                    Some(t) => p.serving_area_tacs.is_empty() || p.serving_area_tacs.contains(&t),
-                    None => true,
-                }
+            .filter(|p| match tac {
+                Some(t) => p.serving_area_tacs.is_empty() || p.serving_area_tacs.contains(&t),
+                None => true,
             })
             .map(|p| {
                 let distance_score = if let Some(t) = tac {
-                    if p.serving_area_tacs.contains(&t) { 1.0 } else { 0.5 }
+                    if p.serving_area_tacs.contains(&t) {
+                        1.0
+                    } else {
+                        0.5
+                    }
                 } else {
                     0.5
                 };
@@ -209,7 +218,8 @@ impl EesContext {
 
     /// Get all registered EAS
     pub fn eas_list(&self) -> Vec<EasProfile> {
-        self.eas_profiles.read()
+        self.eas_profiles
+            .read()
             .map(|p| p.values().cloned().collect())
             .expect("value expected")
     }
@@ -238,7 +248,9 @@ impl EesContext {
             if let Some(ctx) = contexts.get_mut(supi) {
                 log::info!(
                     "UE {} edge context transfer: {:?} -> {}",
-                    supi, ctx.current_eas_id, new_eas_id
+                    supi,
+                    ctx.current_eas_id,
+                    new_eas_id
                 );
                 ctx.current_eas_id = Some(new_eas_id.to_string());
                 return true;
@@ -255,7 +267,8 @@ impl Default for EesContext {
 }
 
 /// Global EES context (thread-safe singleton)
-static GLOBAL_EES_CONTEXT: std::sync::OnceLock<Arc<RwLock<EesContext>>> = std::sync::OnceLock::new();
+static GLOBAL_EES_CONTEXT: std::sync::OnceLock<Arc<RwLock<EesContext>>> =
+    std::sync::OnceLock::new();
 
 /// Get the global EES context
 pub fn ees_self() -> Arc<RwLock<EesContext>> {

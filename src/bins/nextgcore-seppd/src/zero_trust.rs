@@ -151,7 +151,9 @@ impl ZeroTrustEngine {
             None => return PolicyDecision::Deny(format!("No policy for PLMN {plmn_id}")),
         };
 
-        let state = self.sessions.entry(plmn_id.to_string())
+        let state = self
+            .sessions
+            .entry(plmn_id.to_string())
             .or_insert_with(|| TrustSessionState::new(TrustLevel::Unknown));
 
         state.requests_total += 1;
@@ -167,7 +169,8 @@ impl ZeroTrustEngine {
             state.requests_rejected += 1;
             state.anomaly_score = state.anomaly_score.saturating_add(5);
             return PolicyDecision::Deny(format!(
-                "Trust level {:?} < required {:?}", state.trust_level, policy.min_trust_level
+                "Trust level {:?} < required {:?}",
+                state.trust_level, policy.min_trust_level
             ));
         }
 
@@ -253,19 +256,28 @@ mod tests {
     #[test]
     fn test_deny_missing_integrity() {
         let mut e = engine_with_strict_policy();
-        assert!(matches!(e.evaluate("001001", false, true), PolicyDecision::Deny(_)));
+        assert!(matches!(
+            e.evaluate("001001", false, true),
+            PolicyDecision::Deny(_)
+        ));
     }
 
     #[test]
     fn test_deny_missing_encryption() {
         let mut e = engine_with_strict_policy();
-        assert!(matches!(e.evaluate("001001", true, false), PolicyDecision::Deny(_)));
+        assert!(matches!(
+            e.evaluate("001001", true, false),
+            PolicyDecision::Deny(_)
+        ));
     }
 
     #[test]
     fn test_deny_unknown_plmn() {
         let mut e = ZeroTrustEngine::new();
-        assert!(matches!(e.evaluate("999999", true, true), PolicyDecision::Deny(_)));
+        assert!(matches!(
+            e.evaluate("999999", true, true),
+            PolicyDecision::Deny(_)
+        ));
     }
 
     #[test]
@@ -273,7 +285,10 @@ mod tests {
         let mut e = ZeroTrustEngine::new();
         e.register_policy(ZeroTrustPolicy::strict("001001".into()));
         // trust stays at Unknown
-        assert!(matches!(e.evaluate("001001", true, true), PolicyDecision::Deny(_)));
+        assert!(matches!(
+            e.evaluate("001001", true, true),
+            PolicyDecision::Deny(_)
+        ));
     }
 
     #[test]
@@ -303,7 +318,10 @@ mod tests {
         if let Some(s) = e.sessions.get_mut("001001") {
             s.blocked = true;
         }
-        assert!(matches!(e.evaluate("001001", true, true), PolicyDecision::Deny(_)));
+        assert!(matches!(
+            e.evaluate("001001", true, true),
+            PolicyDecision::Deny(_)
+        ));
         e.unblock("001001");
         assert_eq!(e.evaluate("001001", true, true), PolicyDecision::Allow);
     }

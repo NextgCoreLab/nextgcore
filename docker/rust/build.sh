@@ -70,8 +70,22 @@ echo "=== Building core runtime image ==="
 docker build -f "$SCRIPT_DIR/Dockerfile.core" -t nextgcore-core:latest "$SCRIPT_DIR"
 
 echo ""
-echo "=== Building NF images (from core) ==="
-for nf in amfd ausfd bsfd nrfd nssfd pcfd smfd udmd udrd upfd; do
+echo "=== Building 5GC NF images (from core) ==="
+for nf in amfd ausfd bsfd dccfd eesd lmfd mbsmfd nrfd nsacfd nssfd nwdafd pcfd pind scpd seppd smfd udmd udrd upfd; do
+    if [ -f "$BINARIES_DIR/nextgcore-$nf" ]; then
+        tag="${nf%d}"
+        echo "  nextgcore-rust/$tag"
+        docker build -q \
+            -f "$SCRIPT_DIR/Dockerfile.nf" \
+            --build-arg NF_NAME="nextgcore-$nf" \
+            -t "nextgcore-rust/$tag:latest" \
+            "$SCRIPT_DIR" >/dev/null
+    fi
+done
+
+echo ""
+echo "=== Building EPC NF images (from core) ==="
+for nf in mmed sgwcd sgwud hssd pcrfd; do
     if [ -f "$BINARIES_DIR/nextgcore-$nf" ]; then
         tag="${nf%d}"
         echo "  nextgcore-rust/$tag"

@@ -427,7 +427,10 @@ impl SeppContext {
 
     /// Get all nodes
     pub fn node_list(&self) -> Vec<SeppNode> {
-        self.peer_list.read().map(|l| l.values().cloned().collect()).expect("value expected")
+        self.peer_list
+            .read()
+            .map(|l| l.values().cloned().collect())
+            .expect("value expected")
     }
 
     /// Get node count
@@ -443,7 +446,10 @@ impl SeppContext {
         let mut assoc_list = self.assoc_list.write().ok()?;
 
         if assoc_list.len() >= self.max_num_of_assoc {
-            log::error!("Maximum number of associations [{}] reached", self.max_num_of_assoc);
+            log::error!(
+                "Maximum number of associations [{}] reached",
+                self.max_num_of_assoc
+            );
             return None;
         }
 
@@ -517,7 +523,8 @@ impl Default for SeppContext {
 }
 
 /// Global SEPP context (thread-safe singleton)
-static GLOBAL_SEPP_CONTEXT: std::sync::OnceLock<Arc<RwLock<SeppContext>>> = std::sync::OnceLock::new();
+static GLOBAL_SEPP_CONTEXT: std::sync::OnceLock<Arc<RwLock<SeppContext>>> =
+    std::sync::OnceLock::new();
 
 /// Get the global SEPP context
 pub fn sepp_self() -> Arc<RwLock<SeppContext>> {

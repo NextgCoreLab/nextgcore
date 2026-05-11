@@ -2,7 +2,7 @@
 //!
 //! Port of src/sgwu/sxa-handler.c - Handlers for PFCP messages from SGW-C
 
-use crate::context::{SgwuSess, FSeid};
+use crate::context::{FSeid, SgwuSess};
 use crate::sxa_build::{pfcp_cause, CreatedPdr, UserPlaneReport};
 
 // ============================================================================
@@ -242,7 +242,10 @@ pub fn handle_session_establishment_request(
         Some(s) => s,
         None => {
             log::error!("No Context");
-            return (HandlerResult::Error(pfcp_cause::MANDATORY_IE_MISSING), vec![]);
+            return (
+                HandlerResult::Error(pfcp_cause::MANDATORY_IE_MISSING),
+                vec![],
+            );
         }
     };
 
@@ -316,7 +319,10 @@ pub fn handle_session_modification_request(
         Some(s) => s,
         None => {
             log::error!("No Context");
-            return (HandlerResult::Error(pfcp_cause::SESSION_CONTEXT_NOT_FOUND), vec![]);
+            return (
+                HandlerResult::Error(pfcp_cause::SESSION_CONTEXT_NOT_FOUND),
+                vec![],
+            );
         }
     };
 
@@ -442,10 +448,7 @@ pub fn handle_session_modification_request(
 
 /// Handle Session Deletion Request from SGW-C
 /// Port of sgwu_sxa_handle_session_deletion_request
-pub fn handle_session_deletion_request(
-    sess: Option<&SgwuSess>,
-    _xact_id: u64,
-) -> HandlerResult {
+pub fn handle_session_deletion_request(sess: Option<&SgwuSess>, _xact_id: u64) -> HandlerResult {
     log::info!("Session Deletion Request");
 
     let sess = match sess {
@@ -698,7 +701,10 @@ mod tests {
     fn test_handle_session_establishment_request_no_sess() {
         let req = SessionEstablishmentRequest::default();
         let (result, _) = handle_session_establishment_request(None, 1, &req);
-        matches!(result, HandlerResult::Error(pfcp_cause::MANDATORY_IE_MISSING));
+        matches!(
+            result,
+            HandlerResult::Error(pfcp_cause::MANDATORY_IE_MISSING)
+        );
     }
 
     #[test]
@@ -735,7 +741,10 @@ mod tests {
     fn test_handle_session_modification_request_no_sess() {
         let req = SessionModificationRequest::default();
         let (result, _) = handle_session_modification_request(None, 1, &req);
-        matches!(result, HandlerResult::Error(pfcp_cause::SESSION_CONTEXT_NOT_FOUND));
+        matches!(
+            result,
+            HandlerResult::Error(pfcp_cause::SESSION_CONTEXT_NOT_FOUND)
+        );
     }
 
     #[test]
@@ -760,7 +769,10 @@ mod tests {
     #[test]
     fn test_handle_session_deletion_request_no_sess() {
         let result = handle_session_deletion_request(None, 1);
-        matches!(result, HandlerResult::Error(pfcp_cause::SESSION_CONTEXT_NOT_FOUND));
+        matches!(
+            result,
+            HandlerResult::Error(pfcp_cause::SESSION_CONTEXT_NOT_FOUND)
+        );
     }
 
     #[test]
@@ -775,7 +787,10 @@ mod tests {
         let sess = create_test_sess();
         let rsp = SessionReportResponse { cause: None };
         let result = handle_session_report_response(Some(&sess), 1, &rsp);
-        matches!(result, HandlerResult::Error(pfcp_cause::MANDATORY_IE_MISSING));
+        matches!(
+            result,
+            HandlerResult::Error(pfcp_cause::MANDATORY_IE_MISSING)
+        );
     }
 
     #[test]

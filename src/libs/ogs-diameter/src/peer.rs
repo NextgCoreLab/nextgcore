@@ -83,10 +83,7 @@ pub struct DiameterPeer {
 
 impl DiameterPeer {
     /// Create a new peer from an established transport (responder side)
-    pub fn new_responder(
-        transport: DiameterTransport,
-        config: &DiameterConfig,
-    ) -> Self {
+    pub fn new_responder(transport: DiameterTransport, config: &DiameterConfig) -> Self {
         Self {
             transport,
             state: PeerState::WaitCER,
@@ -101,10 +98,7 @@ impl DiameterPeer {
     }
 
     /// Create a new peer and initiate connection (initiator side)
-    pub fn new_initiator(
-        transport: DiameterTransport,
-        config: &DiameterConfig,
-    ) -> Self {
+    pub fn new_initiator(transport: DiameterTransport, config: &DiameterConfig) -> Self {
         Self {
             transport,
             state: PeerState::Closed,
@@ -188,17 +182,11 @@ impl DiameterPeer {
                 self.handle_cea(msg).await
             }
             // Open: received DWR (watchdog request)
-            (PeerState::Open, base_cmd::DEVICE_WATCHDOG, true) => {
-                self.handle_dwr(msg).await
-            }
+            (PeerState::Open, base_cmd::DEVICE_WATCHDOG, true) => self.handle_dwr(msg).await,
             // Open: received DWA (watchdog answer)
-            (PeerState::Open, base_cmd::DEVICE_WATCHDOG, false) => {
-                Ok(PeerEvent::WatchdogAck)
-            }
+            (PeerState::Open, base_cmd::DEVICE_WATCHDOG, false) => Ok(PeerEvent::WatchdogAck),
             // Open: received DPR (disconnect request)
-            (PeerState::Open, base_cmd::DISCONNECT_PEER, true) => {
-                self.handle_dpr(msg).await
-            }
+            (PeerState::Open, base_cmd::DISCONNECT_PEER, true) => self.handle_dpr(msg).await,
             // Closing: received DPA (disconnect answer)
             (PeerState::Closing, base_cmd::DISCONNECT_PEER, false) => {
                 self.state = PeerState::Closed;
@@ -206,9 +194,7 @@ impl DiameterPeer {
                 Ok(PeerEvent::Disconnected)
             }
             // Open: application message
-            (PeerState::Open, _, _) => {
-                Ok(PeerEvent::Message(msg))
-            }
+            (PeerState::Open, _, _) => Ok(PeerEvent::Message(msg)),
             // Unexpected message for current state
             _ => Err(DiameterError::Protocol(format!(
                 "unexpected command {} (request={}) in state {:?}",
@@ -230,10 +216,8 @@ impl DiameterPeer {
 
     /// Build and send Capabilities-Exchange-Request
     async fn send_cer(&mut self) -> DiameterResult<()> {
-        let mut msg = DiameterMessage::new_request(
-            base_cmd::CAPABILITIES_EXCHANGE,
-            BASE_APPLICATION_ID,
-        );
+        let mut msg =
+            DiameterMessage::new_request(base_cmd::CAPABILITIES_EXCHANGE, BASE_APPLICATION_ID);
         msg.header.hop_by_hop_id = self.next_hop_by_hop();
         msg.header.end_to_end_id = self.next_end_to_end();
 
@@ -367,10 +351,7 @@ impl DiameterPeer {
             )));
         }
 
-        let mut dwr = DiameterMessage::new_request(
-            base_cmd::DEVICE_WATCHDOG,
-            BASE_APPLICATION_ID,
-        );
+        let mut dwr = DiameterMessage::new_request(base_cmd::DEVICE_WATCHDOG, BASE_APPLICATION_ID);
         dwr.header.hop_by_hop_id = self.next_hop_by_hop();
         dwr.header.end_to_end_id = self.next_end_to_end();
         dwr.add_avp(Avp::mandatory(
@@ -420,10 +401,7 @@ impl DiameterPeer {
             )));
         }
 
-        let mut dpr = DiameterMessage::new_request(
-            base_cmd::DISCONNECT_PEER,
-            BASE_APPLICATION_ID,
-        );
+        let mut dpr = DiameterMessage::new_request(base_cmd::DISCONNECT_PEER, BASE_APPLICATION_ID);
         dpr.header.hop_by_hop_id = self.next_hop_by_hop();
         dpr.header.end_to_end_id = self.next_end_to_end();
         dpr.add_avp(Avp::mandatory(
@@ -647,8 +625,14 @@ mod tests {
         let listener = DiameterListener::bind(addr).await.unwrap();
         let listen_addr = listener.local_addr().unwrap();
 
-        let server_cfg = test_config("hss.epc.mnc001.mcc001.3gppnetwork.org", "epc.mnc001.mcc001.3gppnetwork.org");
-        let client_cfg = test_config("mme.epc.mnc001.mcc001.3gppnetwork.org", "epc.mnc001.mcc001.3gppnetwork.org");
+        let server_cfg = test_config(
+            "hss.epc.mnc001.mcc001.3gppnetwork.org",
+            "epc.mnc001.mcc001.3gppnetwork.org",
+        );
+        let client_cfg = test_config(
+            "mme.epc.mnc001.mcc001.3gppnetwork.org",
+            "epc.mnc001.mcc001.3gppnetwork.org",
+        );
 
         // Spawn server (responder)
         let handle = tokio::spawn(async move {
@@ -657,7 +641,10 @@ mod tests {
             peer.start().await.unwrap();
             let event = peer.next_event().await.unwrap();
             match event {
-                PeerEvent::Established { origin_host, origin_realm } => {
+                PeerEvent::Established {
+                    origin_host,
+                    origin_realm,
+                } => {
                     assert_eq!(origin_host, "mme.epc.mnc001.mcc001.3gppnetwork.org");
                     assert_eq!(origin_realm, "epc.mnc001.mcc001.3gppnetwork.org");
                 }
@@ -675,7 +662,10 @@ mod tests {
 
         let event = client.next_event().await.unwrap();
         match event {
-            PeerEvent::Established { origin_host, origin_realm } => {
+            PeerEvent::Established {
+                origin_host,
+                origin_realm,
+            } => {
                 assert_eq!(origin_host, "hss.epc.mnc001.mcc001.3gppnetwork.org");
                 assert_eq!(origin_realm, "epc.mnc001.mcc001.3gppnetwork.org");
             }
@@ -766,15 +756,25 @@ mod tests {
         let addr: std::net::SocketAddr = ([10, 0, 0, 1], 3868).into();
 
         table
-            .register("hss.example.com".into(), "example.com".into(), addr, PeerState::Open)
+            .register(
+                "hss.example.com".into(),
+                "example.com".into(),
+                addr,
+                PeerState::Open,
+            )
             .await;
 
         assert!(table.is_peer_open("hss.example.com").await);
         assert!(!table.is_peer_open("unknown.example.com").await);
         assert_eq!(table.connected_count().await, 1);
-        assert_eq!(table.connected_peers().await, vec!["hss.example.com".to_string()]);
+        assert_eq!(
+            table.connected_peers().await,
+            vec!["hss.example.com".to_string()]
+        );
 
-        table.update_state("hss.example.com", PeerState::Closing).await;
+        table
+            .update_state("hss.example.com", PeerState::Closing)
+            .await;
         assert!(!table.is_peer_open("hss.example.com").await);
         assert_eq!(table.connected_count().await, 0);
 

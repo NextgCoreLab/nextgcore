@@ -20,17 +20,17 @@ pub mod timer;
 pub mod ue_sm;
 
 // Re-export commonly used types
+pub use ausf_sm::{ausf_sm_debug, AusfSmContext, AusfState};
 pub use context::{
-    ausf_context_final, ausf_context_init, ausf_self, AuthEvent, AuthResult, AuthType, AusfContext,
-    AusfUe,
+    ausf_context_final, ausf_context_init, ausf_self, AusfContext, AusfUe, AuthEvent, AuthResult,
+    AuthType,
 };
 pub use event::{AusfEvent, AusfEventId, AusfTimerId};
-pub use ausf_sm::{ausf_sm_debug, AusfSmContext, AusfState};
-pub use ue_sm::{AusfUeSmContext, AusfUeState};
 pub use timer::{ausf_timer_get_name, timer_manager, AusfTimerManager};
+pub use ue_sm::{AusfUeSmContext, AusfUeState};
 
 // Re-export EAP-AKA' types
-pub use eap_aka_prime::{EapAkaSession, EapPacket, EapCode, EapType};
+pub use eap_aka_prime::{EapAkaSession, EapCode, EapPacket, EapType};
 
 // Re-export handler types
 pub use nausf_handler::{

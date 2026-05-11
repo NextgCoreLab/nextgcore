@@ -84,9 +84,7 @@ impl HssTimerManager {
 
         if let Ok(mut timers) = self.timers.write() {
             timers.insert(id, entry);
-            log::debug!(
-                "Timer added: id={id}, type={timer_type:?}, duration={duration:?}"
-            );
+            log::debug!("Timer added: id={id}, type={timer_type:?}, duration={duration:?}");
             Some(id)
         } else {
             None

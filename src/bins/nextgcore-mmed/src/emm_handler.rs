@@ -2,7 +2,7 @@
 //!
 //! Port of src/mme/emm-handler.c - EMM message handling functions
 
-use crate::context::{MmeUe, EnbUe, EpsTai, PlmnId};
+use crate::context::{EnbUe, EpsTai, MmeUe, PlmnId};
 use crate::emm_build::EmmCause;
 
 // ============================================================================
@@ -122,71 +122,79 @@ pub fn handle_attach_request(
     if data.len() < 10 {
         return Err(EmmError::InvalidMessage("Attach request too short".into()));
     }
-    
+
     let mut offset = 0;
-    
+
     // Skip protocol discriminator and message type (already parsed)
     // Parse EPS attach type and NAS key set identifier
     let attach_type_byte = data[offset];
     offset += 1;
-    
+
     let attach_type = attach_type_byte & 0x07;
     let nas_ksi = (attach_type_byte >> 4) & 0x07;
     let tsc = (attach_type_byte >> 7) & 0x01;
-    
+
     // Parse EPS mobile identity
     let identity_len = data[offset] as usize;
     offset += 1;
-    
+
     if offset + identity_len > data.len() {
         return Err(EmmError::InvalidMessage("Invalid identity length".into()));
     }
-    
+
     let identity_data = &data[offset..offset + identity_len];
     offset += identity_len;
-    
+
     let identity_type = identity_data[0] & 0x07;
     let (imsi, guti) = parse_mobile_identity(identity_data)?;
-    
+
     // Parse UE network capability
     if offset >= data.len() {
-        return Err(EmmError::InvalidMessage("Missing UE network capability".into()));
+        return Err(EmmError::InvalidMessage(
+            "Missing UE network capability".into(),
+        ));
     }
-    
+
     let ue_cap_len = data[offset] as usize;
     offset += 1;
-    
+
     if offset + ue_cap_len > data.len() {
-        return Err(EmmError::InvalidMessage("Invalid UE capability length".into()));
+        return Err(EmmError::InvalidMessage(
+            "Invalid UE capability length".into(),
+        ));
     }
-    
+
     let ue_network_capability = parse_ue_network_capability(&data[offset..offset + ue_cap_len]);
     offset += ue_cap_len;
-    
+
     // Parse ESM message container
     if offset + 2 > data.len() {
-        return Err(EmmError::InvalidMessage("Missing ESM message container".into()));
+        return Err(EmmError::InvalidMessage(
+            "Missing ESM message container".into(),
+        ));
     }
-    
+
     let esm_len = ((data[offset] as usize) << 8) | (data[offset + 1] as usize);
     offset += 2;
-    
+
     if offset + esm_len > data.len() {
-        return Err(EmmError::InvalidMessage("Invalid ESM message length".into()));
+        return Err(EmmError::InvalidMessage(
+            "Invalid ESM message length".into(),
+        ));
     }
-    
+
     let esm_message = data[offset..offset + esm_len].to_vec();
     offset += esm_len;
-    
+
     // Parse optional IEs
     let mut last_visited_tai = None;
     let mut ms_network_capability = None;
     let mut additional_security_capability = None;
-    
+
     while offset < data.len() {
         let iei = data[offset];
         offset += 1;
-        
+
         match iei {
             0x52 => {
                 // Last visited registered TAI
@@ -201,7 +209,8 @@ pub fn handle_attach_request(
                     let len = data[offset] as usize;
                     offset += 1;
                     if offset + len <= data.len() {
-                        ms_network_capability = Some(parse_ms_network_capability(&data[offset..offset + len]));
+                        ms_network_capability =
+                            Some(parse_ms_network_capability(&data[offset..offset + len]));
                         offset += len;
                     }
                 }
@@ -212,7 +221,9 @@ pub fn handle_attach_request(
                     let len = data[offset] as usize;
                     offset += 1;
                     if offset + len <= data.len() {
-                        additional_security_capability = Some(parse_additional_security_capability(&data[offset..offset + len]));
+                        additional_security_capability = Some(
+                            parse_additional_security_capability(&data[offset..offset + len]),
+                        );
                         offset += len;
                     }
                 }
@@ -231,7 +242,7 @@ pub fn handle_attach_request(
             }
         }
     }
-    
+
     // Update MME UE context
     mme_ue.nas_eps.attach_type = attach_type;
     mme_ue.nas_eps.mme_ksi.ksi = nas_ksi;
@@ -240,15 +251,15 @@ pub fn handle_attach_request(
     mme_ue.ue_network_capability.eia = ue_network_capability.eia;
     mme_ue.ue_network_capability.uea = ue_network_capability.uea;
     mme_ue.ue_network_capability.uia = ue_network_capability.uia;
-    
+
     if let Some(ref imsi_str) = imsi {
         mme_ue.imsi_bcd = imsi_str.clone();
     }
-    
+
     // Copy TAI and E-CGI from eNB UE
     mme_ue.tai = enb_ue.saved.tai.clone();
     mme_ue.e_cgi = enb_ue.saved.e_cgi.clone();
-    
+
     Ok(AttachRequestData {
         attach_type,
         nas_ksi,
@@ -278,17 +289,19 @@ pub fn handle_attach_complete(
     if data.len() < 2 {
         return Err(EmmError::InvalidMessage("Attach complete too short".into()));
     }
-    
+
     let esm_len = ((data[0] as usize) << 8) | (data[1] as usize);
-    
+
     if data.len() < 2 + esm_len {
-        return Err(EmmError::InvalidMessage("Invalid ESM message length".into()));
+        return Err(EmmError::InvalidMessage(
+            "Invalid ESM message length".into(),
+        ));
     }
-    
+
     let esm_message = data[2..2 + esm_len].to_vec();
-    
+
     log::info!("Attach complete received for IMSI[{}]", mme_ue.imsi_bcd);
-    
+
     Ok(esm_message)
 }
 
@@ -304,34 +317,36 @@ pub fn handle_authentication_response(
 ) -> EmmResult<bool> {
     // Parse authentication response parameter
     if data.is_empty() {
-        return Err(EmmError::InvalidMessage("Authentication response empty".into()));
+        return Err(EmmError::InvalidMessage(
+            "Authentication response empty".into(),
+        ));
     }
-    
+
     let res_len = data[0] as usize;
-    
+
     if data.len() < 1 + res_len {
         return Err(EmmError::InvalidMessage("Invalid RES length".into()));
     }
-    
+
     let res = &data[1..1 + res_len];
-    
+
     // Compare with expected response (XRES)
     if res_len == 0 || res_len > mme_ue.xres_len as usize {
         log::warn!("Authentication response length mismatch");
         return Ok(false);
     }
-    
+
     let xres = &mme_ue.xres[..res_len];
-    
+
     if res != xres {
         log::warn!("Authentication response mismatch");
         log::debug!("  RES: {res:02x?}");
         log::debug!("  XRES: {xres:02x?}");
         return Ok(false);
     }
-    
+
     log::info!("Authentication successful for IMSI[{}]", mme_ue.imsi_bcd);
-    
+
     Ok(true)
 }
 
@@ -348,16 +363,16 @@ pub fn handle_identity_response(
     if data.is_empty() {
         return Err(EmmError::InvalidMessage("Identity response empty".into()));
     }
-    
+
     let identity_len = data[0] as usize;
-    
+
     if data.len() < 1 + identity_len {
         return Err(EmmError::InvalidMessage("Invalid identity length".into()));
     }
-    
+
     let identity_data = &data[1..1 + identity_len];
     let identity_type = identity_data[0] & 0x07;
-    
+
     match identity_type {
         1 => {
             // IMSI
@@ -398,12 +413,12 @@ pub fn handle_security_mode_complete(
 ) -> EmmResult<Option<String>> {
     let mut offset = 0;
     let mut imeisv = None;
-    
+
     // Parse optional IEs
     while offset < data.len() {
         let iei = data[offset];
         offset += 1;
-        
+
         match iei {
             0x23 => {
                 // IMEISV
@@ -431,10 +446,10 @@ pub fn handle_security_mode_complete(
             }
         }
     }
-    
+
     mme_ue.security_context_available = true;
     log::info!("Security mode complete for IMSI[{}]", mme_ue.imsi_bcd);
-    
+
     Ok(imeisv)
 }
 
@@ -470,38 +485,38 @@ pub fn handle_tau_request(
     if data.len() < 12 {
         return Err(EmmError::InvalidMessage("TAU request too short".into()));
     }
-    
+
     let mut offset = 0;
-    
+
     // Parse EPS update type and NAS key set identifier
     let update_type_byte = data[offset];
     offset += 1;
-    
+
     let update_type = update_type_byte & 0x07;
     let active_flag = (update_type_byte & 0x08) != 0;
     let nas_ksi = (update_type_byte >> 4) & 0x07;
     let tsc = (update_type_byte >> 7) & 0x01;
-    
+
     // Parse old GUTI
     let guti_len = data[offset] as usize;
     offset += 1;
-    
+
     if offset + guti_len > data.len() {
         return Err(EmmError::InvalidMessage("Invalid GUTI length".into()));
     }
-    
+
     let guti_data = &data[offset..offset + guti_len];
     let (_, old_guti) = parse_mobile_identity(guti_data)?;
     offset += guti_len;
-    
+
     // Parse optional IEs
     let mut ue_network_capability = None;
     let mut last_visited_tai = None;
-    
+
     while offset < data.len() {
         let iei = data[offset];
         offset += 1;
-        
+
         match iei {
             0x31 => {
                 // UE network capability
@@ -509,7 +524,8 @@ pub fn handle_tau_request(
                     let len = data[offset] as usize;
                     offset += 1;
                     if offset + len <= data.len() {
-                        ue_network_capability = Some(parse_ue_network_capability(&data[offset..offset + len]));
+                        ue_network_capability =
+                            Some(parse_ue_network_capability(&data[offset..offset + len]));
                         offset += len;
                     }
                 }
@@ -532,14 +548,14 @@ pub fn handle_tau_request(
             }
         }
     }
-    
+
     // Update MME UE context
     mme_ue.nas_eps.update_type = update_type;
     mme_ue.nas_eps.mme_ksi.ksi = nas_ksi;
     mme_ue.nas_eps.mme_ksi.tsc = tsc;
     mme_ue.tai = enb_ue.saved.tai.clone();
     mme_ue.e_cgi = enb_ue.saved.e_cgi.clone();
-    
+
     Ok(TauRequestData {
         update_type,
         active_flag,
@@ -564,20 +580,24 @@ pub fn handle_service_request(
     if data.is_empty() {
         return Err(EmmError::InvalidMessage("Service request empty".into()));
     }
-    
+
     // Parse KSI and sequence number
     let ksi_seq = data[0];
     let ksi = (ksi_seq >> 5) & 0x07;
     let sequence_number = ksi_seq & 0x1f;
-    
+
     // Update context
     mme_ue.nas_eps.mme_ksi.ksi = ksi;
     mme_ue.tai = enb_ue.saved.tai.clone();
     mme_ue.e_cgi = enb_ue.saved.e_cgi.clone();
-    
-    log::info!("Service request from IMSI[{}] KSI[{}] SEQ[{}]",
-               mme_ue.imsi_bcd, ksi, sequence_number);
-    
+
+    log::info!(
+        "Service request from IMSI[{}] KSI[{}] SEQ[{}]",
+        mme_ue.imsi_bcd,
+        ksi,
+        sequence_number
+    );
+
     Ok((ksi, sequence_number))
 }
 
@@ -592,23 +612,28 @@ pub fn handle_extended_service_request(
     data: &[u8],
 ) -> EmmResult<u8> {
     if data.is_empty() {
-        return Err(EmmError::InvalidMessage("Extended service request empty".into()));
+        return Err(EmmError::InvalidMessage(
+            "Extended service request empty".into(),
+        ));
     }
-    
+
     // Parse service type and NAS key set identifier
     let service_type_byte = data[0];
     let service_type = service_type_byte & 0x0f;
     let nas_ksi = (service_type_byte >> 4) & 0x07;
-    
+
     // Update context
     mme_ue.nas_eps.service_type = service_type;
     mme_ue.nas_eps.mme_ksi.ksi = nas_ksi;
     mme_ue.tai = enb_ue.saved.tai.clone();
     mme_ue.e_cgi = enb_ue.saved.e_cgi.clone();
-    
-    log::info!("Extended service request from IMSI[{}] type[{}]",
-               mme_ue.imsi_bcd, service_type);
-    
+
+    log::info!(
+        "Extended service request from IMSI[{}] type[{}]",
+        mme_ue.imsi_bcd,
+        service_type
+    );
+
     Ok(service_type)
 }
 
@@ -625,20 +650,24 @@ pub fn handle_detach_request(
     if data.is_empty() {
         return Err(EmmError::InvalidMessage("Detach request empty".into()));
     }
-    
+
     // Parse detach type
     let detach_type_byte = data[0];
     let detach_type = detach_type_byte & 0x07;
     let switch_off = (detach_type_byte & 0x08) != 0;
     let nas_ksi = (detach_type_byte >> 4) & 0x07;
-    
+
     // Update context
     mme_ue.nas_eps.detach_type = detach_type;
     mme_ue.nas_eps.mme_ksi.ksi = nas_ksi;
-    
-    log::info!("Detach request from IMSI[{}] type[{}] switch_off[{}]",
-               mme_ue.imsi_bcd, detach_type, switch_off);
-    
+
+    log::info!(
+        "Detach request from IMSI[{}] type[{}] switch_off[{}]",
+        mme_ue.imsi_bcd,
+        detach_type,
+        switch_off
+    );
+
     Ok((detach_type, switch_off))
 }
 
@@ -651,9 +680,9 @@ fn parse_mobile_identity(data: &[u8]) -> EmmResult<(Option<String>, Option<Parse
     if data.is_empty() {
         return Err(EmmError::InvalidMessage("Empty mobile identity".into()));
     }
-    
+
     let identity_type = data[0] & 0x07;
-    
+
     match identity_type {
         1 => {
             // IMSI
@@ -665,13 +694,15 @@ fn parse_mobile_identity(data: &[u8]) -> EmmResult<(Option<String>, Option<Parse
             if data.len() < 11 {
                 return Err(EmmError::InvalidMessage("GUTI too short".into()));
             }
-            
+
             let guti = ParsedGuti {
                 plmn_id: decode_plmn_id(&data[1..4]),
                 mme_gid: ((data[4] as u16) << 8) | (data[5] as u16),
                 mme_code: data[6],
-                m_tmsi: ((data[7] as u32) << 24) | ((data[8] as u32) << 16) 
-                      | ((data[9] as u32) << 8) | (data[10] as u32),
+                m_tmsi: ((data[7] as u32) << 24)
+                    | ((data[8] as u32) << 16)
+                    | ((data[9] as u32) << 8)
+                    | (data[10] as u32),
             };
             Ok((None, Some(guti)))
         }
@@ -687,20 +718,20 @@ fn decode_imsi(data: &[u8]) -> EmmResult<String> {
     if data.is_empty() {
         return Err(EmmError::InvalidMessage("Empty IMSI data".into()));
     }
-    
+
     let mut imsi = String::with_capacity(15);
-    
+
     // First digit is in the high nibble of first byte (after type)
     let first_digit = (data[0] >> 4) & 0x0f;
     if first_digit < 10 {
         imsi.push((b'0' + first_digit) as char);
     }
-    
+
     // Remaining digits
     for &byte in &data[1..] {
         let low = byte & 0x0f;
         let high = (byte >> 4) & 0x0f;
-        
+
         if low < 10 {
             imsi.push((b'0' + low) as char);
         }
@@ -708,7 +739,7 @@ fn decode_imsi(data: &[u8]) -> EmmResult<String> {
             imsi.push((b'0' + high) as char);
         }
     }
-    
+
     Ok(imsi)
 }
 
@@ -727,7 +758,7 @@ fn decode_plmn_id(data: &[u8]) -> PlmnId {
     if data.len() < 3 {
         return PlmnId::default();
     }
-    
+
     PlmnId {
         mcc1: data[0] & 0x0f,
         mcc2: (data[0] >> 4) & 0x0f,
@@ -743,7 +774,7 @@ fn parse_tai(data: &[u8]) -> EpsTai {
     if data.len() < 5 {
         return EpsTai::default();
     }
-    
+
     EpsTai {
         plmn_id: decode_plmn_id(&data[0..3]),
         tac: ((data[3] as u16) << 8) | (data[4] as u16),
@@ -753,7 +784,7 @@ fn parse_tai(data: &[u8]) -> EpsTai {
 /// Parse UE network capability
 fn parse_ue_network_capability(data: &[u8]) -> UeNetworkCapability {
     let mut cap = UeNetworkCapability::default();
-    
+
     if !data.is_empty() {
         cap.eea = data[0];
     }
@@ -766,33 +797,33 @@ fn parse_ue_network_capability(data: &[u8]) -> UeNetworkCapability {
     if data.len() > 3 {
         cap.uia = data[3] & 0x7f;
     }
-    
+
     cap
 }
 
 /// Parse MS network capability
 fn parse_ms_network_capability(data: &[u8]) -> MsNetworkCapability {
     let mut cap = MsNetworkCapability::default();
-    
+
     if !data.is_empty() {
         cap.gea1 = (data[0] & 0x80) != 0;
         cap.extended_gea = data[0] & 0x7f;
     }
-    
+
     cap
 }
 
 /// Parse UE additional security capability
 fn parse_additional_security_capability(data: &[u8]) -> UeAdditionalSecurityCapability {
     let mut cap = UeAdditionalSecurityCapability::default();
-    
+
     if !data.is_empty() {
         cap.nea = data[0];
     }
     if data.len() > 1 {
         cap.nia = data[1];
     }
-    
+
     cap
 }
 
@@ -873,7 +904,7 @@ mod tests {
         let (imsi, guti) = parse_mobile_identity(&data).unwrap();
         assert!(imsi.is_none());
         assert!(guti.is_some());
-        
+
         let guti = guti.unwrap();
         assert_eq!(guti.mme_gid, 1);
         assert_eq!(guti.mme_code, 2);
@@ -884,7 +915,7 @@ mod tests {
     fn test_emm_error_display() {
         let err = EmmError::InvalidMessage("test".into());
         assert!(err.to_string().contains("Invalid message"));
-        
+
         let err = EmmError::ProtocolError(EmmCause::PlmnNotAllowed);
         assert!(err.to_string().contains("Protocol error"));
     }

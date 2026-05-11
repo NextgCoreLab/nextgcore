@@ -21,7 +21,7 @@ pub struct TimerConfig {
 impl Default for TimerConfig {
     fn default() -> Self {
         Self {
-            reconnect_interval: 3000,           // 3 seconds
+            reconnect_interval: 3000,               // 3 seconds
             reconnect_interval_in_exception: 10000, // 10 seconds
         }
     }
@@ -53,13 +53,9 @@ impl TimerManager {
     }
 
     /// Start a one-shot timer
-    pub fn start(
-        &self,
-        timer_type: SeppTimerId,
-        duration: Duration,
-        data: Option<String>,
-    ) -> u64 {
-        self.inner.start(timer_type, duration, TimerMode::OneShot, data)
+    pub fn start(&self, timer_type: SeppTimerId, duration: Duration, data: Option<String>) -> u64 {
+        self.inner
+            .start(timer_type, duration, TimerMode::OneShot, data)
     }
 
     /// Start a periodic timer
@@ -69,7 +65,8 @@ impl TimerManager {
         interval: Duration,
         data: Option<String>,
     ) -> u64 {
-        self.inner.start(timer_type, interval, TimerMode::Periodic, data)
+        self.inner
+            .start(timer_type, interval, TimerMode::Periodic, data)
     }
 
     /// Start peer establishment timer using config interval
@@ -192,11 +189,7 @@ mod tests {
     fn test_timer_manager_process_expired() {
         let mgr = TimerManager::default();
 
-        mgr.start(
-            SeppTimerId::SbiClientWait,
-            Duration::from_millis(10),
-            None,
-        );
+        mgr.start(SeppTimerId::SbiClientWait, Duration::from_millis(10), None);
 
         thread::sleep(Duration::from_millis(20));
 

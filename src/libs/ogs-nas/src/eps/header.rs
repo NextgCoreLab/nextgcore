@@ -2,9 +2,9 @@
 //!
 //! Based on 3GPP TS 24.301
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use crate::error::{NasError, NasResult};
 use crate::common::types::SecurityHeaderType;
+use crate::error::{NasError, NasResult};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// EPS NAS header length (plain EMM message)
 pub const EPS_NAS_EMM_HEADER_LEN: usize = 2;
@@ -177,7 +177,10 @@ impl EpsNasEmmHeader {
     /// Decode header from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 2 {
-            return Err(NasError::BufferTooShort { expected: 2, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 2,
+                actual: buf.remaining(),
+            });
         }
 
         let first_byte = buf.get_u8();
@@ -227,7 +230,10 @@ impl EpsNasEsmHeader {
     /// Decode header from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 3 {
-            return Err(NasError::BufferTooShort { expected: 3, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 3,
+                actual: buf.remaining(),
+            });
         }
 
         let first_byte = buf.get_u8();

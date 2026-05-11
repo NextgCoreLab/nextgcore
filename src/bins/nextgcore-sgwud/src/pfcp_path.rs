@@ -205,10 +205,7 @@ pub fn send_session_modification_response(
 
 /// Send Session Deletion Response to SGW-C
 /// Port of sgwu_pfcp_send_session_deletion_response
-pub fn send_session_deletion_response(
-    xact: &PfcpXact,
-    sess: &SgwuSess,
-) -> Result<(), String> {
+pub fn send_session_deletion_response(xact: &PfcpXact, sess: &SgwuSess) -> Result<(), String> {
     let msg = sxa_build::build_session_deletion_response(sess)
         .ok_or_else(|| "Failed to build Session Deletion Response".to_string())?;
 
@@ -257,17 +254,18 @@ pub fn send_error_message(
 
     // Build error response based on message type
     let mut msg = PfcpMessage::new(msg_type, seid);
-    
+
     // Add Cause IE
     msg.data.extend_from_slice(&19u16.to_be_bytes()); // Cause IE type
-    msg.data.extend_from_slice(&1u16.to_be_bytes());  // Length
+    msg.data.extend_from_slice(&1u16.to_be_bytes()); // Length
     msg.data.push(cause);
 
     // Add Offending IE if present
     if offending_ie != 0 {
         msg.data.extend_from_slice(&40u16.to_be_bytes()); // Offending IE type
-        msg.data.extend_from_slice(&2u16.to_be_bytes());  // Length
-        msg.data.extend_from_slice(&(offending_ie as u16).to_be_bytes());
+        msg.data.extend_from_slice(&2u16.to_be_bytes()); // Length
+        msg.data
+            .extend_from_slice(&(offending_ie as u16).to_be_bytes());
     }
 
     send_pfcp_response(&msg, xact)
@@ -362,10 +360,7 @@ pub enum PfcpRecvResult {
 
 /// Handle received PFCP message
 /// Port of pfcp_recv_cb
-pub fn handle_pfcp_recv(
-    data: &[u8],
-    from_addr: &str,
-) -> PfcpRecvResult {
+pub fn handle_pfcp_recv(data: &[u8], from_addr: &str) -> PfcpRecvResult {
     // In actual implementation:
     // 1. Parse PFCP message
     // 2. Extract node ID
@@ -379,21 +374,16 @@ pub fn handle_pfcp_recv(
     // Parse basic header
     let msg_type = data[1];
 
-    log::debug!(
-        "[RECV] PFCP message type={msg_type} from {from_addr}"
-    );
+    log::debug!("[RECV] PFCP message type={msg_type} from {from_addr}");
 
     match msg_type {
-        pfcp_msg_type::ASSOCIATION_SETUP_REQUEST |
-        pfcp_msg_type::ASSOCIATION_SETUP_RESPONSE => {
+        pfcp_msg_type::ASSOCIATION_SETUP_REQUEST | pfcp_msg_type::ASSOCIATION_SETUP_RESPONSE => {
             PfcpRecvResult::AssociationSetup
         }
-        pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST |
-        pfcp_msg_type::SESSION_MODIFICATION_REQUEST |
-        pfcp_msg_type::SESSION_DELETION_REQUEST |
-        pfcp_msg_type::SESSION_REPORT_RESPONSE => {
-            PfcpRecvResult::SessionMessage
-        }
+        pfcp_msg_type::SESSION_ESTABLISHMENT_REQUEST
+        | pfcp_msg_type::SESSION_MODIFICATION_REQUEST
+        | pfcp_msg_type::SESSION_DELETION_REQUEST
+        | pfcp_msg_type::SESSION_REPORT_RESPONSE => PfcpRecvResult::SessionMessage,
         pfcp_msg_type::HEARTBEAT_REQUEST => {
             log::debug!("Heartbeat Request received");
             PfcpRecvResult::Handled
@@ -402,9 +392,7 @@ pub fn handle_pfcp_recv(
             log::debug!("Heartbeat Response received");
             PfcpRecvResult::Handled
         }
-        _ => {
-            PfcpRecvResult::Error(format!("Unknown message type: {msg_type}"))
-        }
+        _ => PfcpRecvResult::Error(format!("Unknown message type: {msg_type}")),
     }
 }
 
@@ -437,9 +425,7 @@ pub fn timer_no_heartbeat(node_id: u64) {
 /// Session report timeout callback
 /// Port of sess_timeout
 pub fn sess_timeout(xact_id: u64, sess_id: u64, msg_type: u8) {
-    log::error!(
-        "PFCP session timeout: xact_id={xact_id}, sess_id={sess_id}, type={msg_type}"
-    );
+    log::error!("PFCP session timeout: xact_id={xact_id}, sess_id={sess_id}, type={msg_type}");
 
     match msg_type {
         pfcp_msg_type::SESSION_REPORT_REQUEST => {
@@ -494,7 +480,7 @@ mod tests {
     #[test]
     fn test_pfcp_node_fsm_init_fini() {
         let mut node = PfcpNode::new(1, "127.0.0.1", 8805);
-        
+
         pfcp_node_fsm_init(&mut node, false);
         assert_eq!(node.state, PfcpNodeState::Initial);
 

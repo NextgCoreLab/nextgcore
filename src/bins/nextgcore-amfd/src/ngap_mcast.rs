@@ -238,9 +238,7 @@ impl NgapMcastContext {
                 );
             } else {
                 gnb_ctx.state = MbsSessionState::Inactive;
-                log::warn!(
-                    "NGAP MBS gNB activation failed: session={session_id} gnb={gnb_id}"
-                );
+                log::warn!("NGAP MBS gNB activation failed: session={session_id} gnb={gnb_id}");
             }
         }
 
@@ -285,10 +283,7 @@ impl NgapMcastContext {
         for gnb_ctx in &mut session.gnb_sessions {
             if gnb_ctx.state == MbsSessionState::Active {
                 gnb_ctx.state = MbsSessionState::Deactivating;
-                let msg = build_mcast_session_deactivation_request(
-                    &session.tmgi,
-                    session_id,
-                );
+                let msg = build_mcast_session_deactivation_request(&session.tmgi, session_id);
                 messages.push((gnb_ctx.gnb_id, msg));
             }
         }
@@ -303,11 +298,7 @@ impl NgapMcastContext {
     }
 
     /// Process gNB deactivation response
-    pub fn session_deactivation_response(
-        &self,
-        session_id: u64,
-        gnb_id: u32,
-    ) -> bool {
+    pub fn session_deactivation_response(&self, session_id: u64, gnb_id: u32) -> bool {
         let mut sessions = match self.sessions.write().ok() {
             Some(s) => s,
             None => return false,
@@ -360,14 +351,15 @@ impl NgapMcastContext {
     }
 
     /// Build multicast group paging message for a set of TACs
-    pub fn build_group_paging(
-        &self,
-        session_id: u64,
-    ) -> Option<Vec<u8>> {
+    pub fn build_group_paging(&self, session_id: u64) -> Option<Vec<u8>> {
         let sessions = self.sessions.read().ok()?;
         let session = sessions.get(&session_id)?;
 
-        Some(build_mcast_group_paging(&session.tmgi, session_id, &session.area_tacs))
+        Some(build_mcast_group_paging(
+            &session.tmgi,
+            session_id,
+            &session.area_tacs,
+        ))
     }
 
     /// Get all active MBS sessions
@@ -442,10 +434,7 @@ fn build_mcast_session_activation_request(
 
 /// Build Multicast Session Deactivation Request (AMF -> gNB)
 /// TS 38.413 Section 9.2.9.3
-fn build_mcast_session_deactivation_request(
-    tmgi: &Tmgi,
-    session_id: u64,
-) -> Vec<u8> {
+fn build_mcast_session_deactivation_request(tmgi: &Tmgi, session_id: u64) -> Vec<u8> {
     let mut builder = NgapMessageBuilder::new();
 
     builder.write_u16(mbs_procedure_code::MULTICAST_SESSION_DEACTIVATION);
@@ -463,11 +452,7 @@ fn build_mcast_session_deactivation_request(
 
 /// Build Multicast Group Paging (AMF -> gNBs in MBS area)
 /// TS 38.413 Section 9.2.9.5
-fn build_mcast_group_paging(
-    tmgi: &Tmgi,
-    session_id: u64,
-    area_tacs: &[u32],
-) -> Vec<u8> {
+fn build_mcast_group_paging(tmgi: &Tmgi, session_id: u64, area_tacs: &[u32]) -> Vec<u8> {
     let mut builder = NgapMessageBuilder::new();
 
     builder.write_u16(mbs_procedure_code::MULTICAST_GROUP_PAGING);
@@ -596,9 +581,7 @@ mod tests {
     #[test]
     fn test_session_activation_partial_failure() {
         let ctx = NgapMcastContext::new();
-        let session = ctx
-            .session_create(test_tmgi(), 1, None, vec![1])
-            .unwrap();
+        let session = ctx.session_create(test_tmgi(), 1, None, vec![1]).unwrap();
         let sid = session.mbs_session_id;
 
         let transport = McastTransportInfo {
@@ -620,9 +603,7 @@ mod tests {
     #[test]
     fn test_session_activation_all_fail() {
         let ctx = NgapMcastContext::new();
-        let session = ctx
-            .session_create(test_tmgi(), 1, None, vec![1])
-            .unwrap();
+        let session = ctx.session_create(test_tmgi(), 1, None, vec![1]).unwrap();
         let sid = session.mbs_session_id;
 
         let transport = McastTransportInfo {
@@ -707,10 +688,7 @@ mod tests {
         assert!(!msg.is_empty());
 
         let proc_code = (msg[0] as u16) << 8 | msg[1] as u16;
-        assert_eq!(
-            proc_code,
-            mbs_procedure_code::MULTICAST_SESSION_ACTIVATION
-        );
+        assert_eq!(proc_code, mbs_procedure_code::MULTICAST_SESSION_ACTIVATION);
     }
 
     #[test]

@@ -12,28 +12,28 @@
 //! The implementation follows RFC 6733 (Diameter Base Protocol) and
 //! 3GPP specifications for each interface.
 
-pub mod common;
 pub mod avp;
-pub mod message;
-pub mod s6a;
-pub mod s6b;
+pub mod common;
+pub mod config;
+pub mod cx;
+pub mod error;
 pub mod gx;
 pub mod gy;
-pub mod rx;
-pub mod cx;
-pub mod swx;
-pub mod error;
-pub mod config;
-pub mod transport;
+pub mod message;
 pub mod peer;
+pub mod rx;
+pub mod s6a;
+pub mod s6b;
+pub mod swx;
+pub mod transport;
 
-pub use common::*;
 pub use avp::*;
-pub use message::*;
-pub use error::*;
+pub use common::*;
 pub use config::*;
-pub use transport::*;
+pub use error::*;
+pub use message::*;
 pub use peer::*;
+pub use transport::*;
 
 /// 3GPP Vendor ID
 pub const OGS_3GPP_VENDOR_ID: u32 = 10415;

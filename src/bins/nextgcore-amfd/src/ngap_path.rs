@@ -19,15 +19,13 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
-use ogs_sctp::{
-    OGS_NGAP_SCTP_PORT, OgsSctpInfo, SctpServer, SctpServerConfig, ServerEvent,
-};
+use ogs_sctp::{OgsSctpInfo, SctpServer, SctpServerConfig, ServerEvent, OGS_NGAP_SCTP_PORT};
 
 use crate::context::{AmfContext, AmfGnb};
 use crate::event::AmfEvent;
 use crate::ngap_asn1;
 use crate::ngap_build;
-use crate::ngap_handler::{self, NgapHandlerResult, NgSetupRequest};
+use crate::ngap_handler::{self, NgSetupRequest, NgapHandlerResult};
 use crate::ngap_sm::NgapFsm;
 
 // ============================================================================
@@ -134,7 +132,8 @@ impl NgapServer {
             receive_buffer_size: 262144,
         };
 
-        let mut sctp_server = SctpServer::bind(bind_addr, config).await
+        let mut sctp_server = SctpServer::bind(bind_addr, config)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to bind SCTP server: {e}"))?;
 
         let local_addr = sctp_server.local_addr();
@@ -192,21 +191,37 @@ impl NgapServer {
     /// Handle SCTP server events
     async fn handle_server_event(&mut self, event: ServerEvent) -> Result<()> {
         match event {
-            ServerEvent::NewAssociation { association_id, remote_addr } => {
-                self.handle_new_association(association_id, remote_addr).await?;
+            ServerEvent::NewAssociation {
+                association_id,
+                remote_addr,
+            } => {
+                self.handle_new_association(association_id, remote_addr)
+                    .await?;
             }
-            ServerEvent::AssociationClosed { association_id, reason } => {
-                self.handle_association_closed(association_id, &reason).await?;
+            ServerEvent::AssociationClosed {
+                association_id,
+                reason,
+            } => {
+                self.handle_association_closed(association_id, &reason)
+                    .await?;
             }
-            ServerEvent::DataReceived { association_id, message } => {
-                self.handle_data_received(association_id, &message.data).await?;
+            ServerEvent::DataReceived {
+                association_id,
+                message,
+            } => {
+                self.handle_data_received(association_id, &message.data)
+                    .await?;
             }
         }
         Ok(())
     }
 
     /// Handle new SCTP association (gNB connection)
-    async fn handle_new_association(&self, association_id: u64, remote_addr: SocketAddr) -> Result<()> {
+    async fn handle_new_association(
+        &self,
+        association_id: u64,
+        remote_addr: SocketAddr,
+    ) -> Result<()> {
         let gnb_id = {
             let mut id = self.next_gnb_id.lock().await;
             let current = *id;
@@ -220,7 +235,10 @@ impl NgapServer {
         session.fsm.init();
 
         self.sessions.write().await.insert(association_id, session);
-        self.assoc_to_addr.write().await.insert(association_id, remote_addr);
+        self.assoc_to_addr
+            .write()
+            .await
+            .insert(association_id, remote_addr);
 
         Ok(())
     }
@@ -228,8 +246,12 @@ impl NgapServer {
     /// Handle SCTP association closure
     async fn handle_association_closed(&self, association_id: u64, reason: &str) -> Result<()> {
         if let Some(session) = self.sessions.write().await.remove(&association_id) {
-            log::info!("gNB {} disconnected (association {}): {}",
-                      session.id, association_id, reason);
+            log::info!(
+                "gNB {} disconnected (association {}): {}",
+                session.id,
+                association_id,
+                reason
+            );
             self.assoc_to_addr.write().await.remove(&association_id);
         }
         Ok(())
@@ -237,11 +259,20 @@ impl NgapServer {
 
     /// Handle received NGAP data
     async fn handle_data_received(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
-        let addr = self.assoc_to_addr.read().await.get(&association_id).copied();
+        let addr = self
+            .assoc_to_addr
+            .read()
+            .await
+            .get(&association_id)
+            .copied();
 
         if let Some(addr) = addr {
-            log::debug!("Received {} bytes NGAP data from {} (association {})",
-                       data.len(), addr, association_id);
+            log::debug!(
+                "Received {} bytes NGAP data from {} (association {})",
+                data.len(),
+                addr,
+                association_id
+            );
 
             // Process the NGAP message
             self.process_ngap_message(association_id, data).await?;
@@ -260,13 +291,19 @@ impl NgapServer {
         }
 
         // Log raw message header for debugging
-        log::debug!("NGAP message from association {}: {} bytes, header: {:02x?}",
-                   association_id, data.len(), &data[..data.len().min(8)]);
+        log::debug!(
+            "NGAP message from association {}: {} bytes, header: {:02x?}",
+            association_id,
+            data.len(),
+            &data[..data.len().min(8)]
+        );
 
         // Check for NGAP message type
         let procedure_code = self.extract_procedure_code(data);
 
-        log::info!("NGAP message from association {association_id}: procedure_code={procedure_code:?}");
+        log::info!(
+            "NGAP message from association {association_id}: procedure_code={procedure_code:?}"
+        );
 
         match procedure_code {
             Some(21) => {
@@ -280,14 +317,16 @@ impl NgapServer {
             Some(46) => {
                 // UplinkNASTransport (procedure code 46)
                 log::info!("Dispatching to handle_uplink_nas_transport");
-                self.handle_uplink_nas_transport(association_id, data).await?;
+                self.handle_uplink_nas_transport(association_id, data)
+                    .await?;
             }
             Some(29) => {
                 // PDU Session Resource Setup (procedure code 29)
                 // SuccessfulOutcome = gNB response with gNB TEID
                 if data[0] == 0x20 {
                     log::info!("PDU Session Resource Setup Response from gNB");
-                    self.handle_pdu_session_resource_setup_response(association_id, data).await?;
+                    self.handle_pdu_session_resource_setup_response(association_id, data)
+                        .await?;
                 }
             }
             Some(26) => {
@@ -328,7 +367,9 @@ impl NgapServer {
                 if data[0] == 0x00 {
                     log::info!("HandoverRequired from association {association_id}");
                 } else if data[0] == 0x20 {
-                    log::info!("HandoverCommand SuccessfulOutcome from association {association_id}");
+                    log::info!(
+                        "HandoverCommand SuccessfulOutcome from association {association_id}"
+                    );
                 } else {
                     log::warn!("HandoverPreparationFailure from association {association_id}");
                 }
@@ -343,7 +384,9 @@ impl NgapServer {
                 // SuccessfulOutcome  = HandoverRequestAcknowledge from target gNB
                 // UnsuccessfulOutcome = HandoverFailure from target gNB
                 if data[0] == 0x00 {
-                    log::info!("HandoverRequest InitiatingMessage from association {association_id}");
+                    log::info!(
+                        "HandoverRequest InitiatingMessage from association {association_id}"
+                    );
                 } else if data[0] == 0x20 {
                     log::info!("HandoverRequestAcknowledge from association {association_id}");
                 } else {
@@ -419,15 +462,22 @@ impl NgapServer {
     /// - Byte 1: Procedure code (0-255)
     fn extract_procedure_code(&self, data: &[u8]) -> Option<u16> {
         if data.len() < 3 {
-            log::warn!("NGAP message too short to extract procedure code: {} bytes", data.len());
+            log::warn!(
+                "NGAP message too short to extract procedure code: {} bytes",
+                data.len()
+            );
             return None;
         }
 
         let byte0 = data[0];
         let procedure_code = data[1];
 
-        log::trace!("NGAP header bytes: [{:#04x}, {:#04x}, {:#04x}]",
-                   byte0, data[1], data[2]);
+        log::trace!(
+            "NGAP header bytes: [{:#04x}, {:#04x}, {:#04x}]",
+            byte0,
+            data[1],
+            data[2]
+        );
 
         // Check for valid NGAP PDU choice values
         match byte0 {
@@ -447,8 +497,11 @@ impl NgapServer {
                 Some(procedure_code as u16)
             }
             _ => {
-                log::warn!("Unknown NGAP PDU type: {:#04x}, bytes: {:02x?}",
-                          byte0, &data[..data.len().min(16)]);
+                log::warn!(
+                    "Unknown NGAP PDU type: {:#04x}, bytes: {:02x?}",
+                    byte0,
+                    &data[..data.len().min(16)]
+                );
                 None
             }
         }
@@ -456,16 +509,29 @@ impl NgapServer {
 
     /// Handle NG Setup Request
     async fn handle_ng_setup_request(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
-        log::info!("NG Setup Request from association {} ({} bytes)", association_id, data.len());
+        log::info!(
+            "NG Setup Request from association {} ({} bytes)",
+            association_id,
+            data.len()
+        );
 
         // Parse the NG Setup Request using proper ASN.1 decoding
         let request = match ngap_asn1::parse_ng_setup_request_asn1(data) {
             Some(req) => {
-                log::info!("Parsed NG Setup Request: gNB ID={}, PLMN={}{}{}-{}{}{}",
-                          req.gnb_id,
-                          req.plmn_id.mcc1, req.plmn_id.mcc2, req.plmn_id.mcc3,
-                          req.plmn_id.mnc1, req.plmn_id.mnc2,
-                          if req.plmn_id.mnc3 == 0xf { "".to_string() } else { req.plmn_id.mnc3.to_string() });
+                log::info!(
+                    "Parsed NG Setup Request: gNB ID={}, PLMN={}{}{}-{}{}{}",
+                    req.gnb_id,
+                    req.plmn_id.mcc1,
+                    req.plmn_id.mcc2,
+                    req.plmn_id.mcc3,
+                    req.plmn_id.mnc1,
+                    req.plmn_id.mnc2,
+                    if req.plmn_id.mnc3 == 0xf {
+                        "".to_string()
+                    } else {
+                        req.plmn_id.mnc3.to_string()
+                    }
+                );
                 req
             }
             None => {
@@ -481,21 +547,24 @@ impl NgapServer {
                 let ctx = self.amf_context.read().await;
 
                 // Handle the request
-                let result = ngap_handler::handle_ng_setup_request(
-                    &mut session.gnb,
-                    &ctx,
-                    &request,
-                );
+                let result =
+                    ngap_handler::handle_ng_setup_request(&mut session.gnb, &ctx, &request);
 
                 match result {
                     NgapHandlerResult::Success => {
-                        log::info!("NG Setup successful for gNB {} (association {})",
-                                  session.gnb.gnb_id, association_id);
+                        log::info!(
+                            "NG Setup successful for gNB {} (association {})",
+                            session.gnb.gnb_id,
+                            association_id
+                        );
 
                         // Build NG Setup Response with proper ASN.1 APER encoding
                         if let Some(response) = ngap_asn1::build_ng_setup_response_asn1(&ctx) {
-                            log::debug!("Built NG Setup Response: {} bytes, hex: {:02x?}",
-                                       response.len(), &response[..response.len().min(32)]);
+                            log::debug!(
+                                "Built NG Setup Response: {} bytes, hex: {:02x?}",
+                                response.len(),
+                                &response[..response.len().min(32)]
+                            );
                             Some(response)
                         } else {
                             log::error!("Failed to build NG Setup Response");
@@ -503,13 +572,21 @@ impl NgapServer {
                         }
                     }
                     NgapHandlerResult::Failure(cause) => {
-                        log::warn!("NG Setup failed for association {}: cause group={}, cause={}",
-                                  association_id, cause.group, cause.cause);
+                        log::warn!(
+                            "NG Setup failed for association {}: cause group={}, cause={}",
+                            association_id,
+                            cause.group,
+                            cause.cause
+                        );
 
                         // Build NG Setup Failure with proper ASN.1 encoding
-                        Some(ngap_asn1::build_ng_setup_failure_asn1(cause.group, cause.cause, None))
+                        Some(ngap_asn1::build_ng_setup_failure_asn1(
+                            cause.group,
+                            cause.cause,
+                            None,
+                        ))
                     }
-                    _ => None
+                    _ => None,
                 }
             } else {
                 None
@@ -519,8 +596,11 @@ impl NgapServer {
         // Now send the response with &mut self available
         if let Some(response) = response_data {
             self.send_to_association(association_id, &response).await?;
-            log::info!("Sent NG Setup Response to association {} ({} bytes)",
-                      association_id, response.len());
+            log::info!(
+                "Sent NG Setup Response to association {} ({} bytes)",
+                association_id,
+                response.len()
+            );
         }
 
         Ok(())
@@ -549,7 +629,11 @@ impl NgapServer {
 
     /// Handle Initial UE Message
     async fn handle_initial_ue_message(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
-        log::info!("Initial UE Message from association {} ({} bytes)", association_id, data.len());
+        log::info!(
+            "Initial UE Message from association {} ({} bytes)",
+            association_id,
+            data.len()
+        );
 
         // Parse the Initial UE Message using proper ASN.1 decoder
         let initial_ue = match crate::ngap_asn1::parse_initial_ue_message_asn1(data) {
@@ -621,7 +705,8 @@ impl NgapServer {
         );
 
         // Send to gNB
-        self.send_to_association(association_id, &dl_nas_transport).await?;
+        self.send_to_association(association_id, &dl_nas_transport)
+            .await?;
 
         // Forward to event handler for further NAS processing
         if let Some(session) = self.sessions.read().await.get(&association_id) {
@@ -639,8 +724,16 @@ impl NgapServer {
     }
 
     /// Handle Uplink NAS Transport
-    async fn handle_uplink_nas_transport(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
-        log::info!("Uplink NAS Transport from association {} ({} bytes)", association_id, data.len());
+    async fn handle_uplink_nas_transport(
+        &mut self,
+        association_id: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        log::info!(
+            "Uplink NAS Transport from association {} ({} bytes)",
+            association_id,
+            data.len()
+        );
 
         // Parse the Uplink NAS Transport
         let ul_nas = match crate::ngap_asn1::parse_uplink_nas_transport_asn1(data) {
@@ -684,60 +777,86 @@ impl NgapServer {
                 let pti = ul_nas.nas_pdu[2];
                 let sm_msg_type = ul_nas.nas_pdu[3];
 
-                log::info!(
-                    "5GSM message: PSI={psi}, PTI={pti}, msg_type=0x{sm_msg_type:02x}"
-                );
+                log::info!("5GSM message: PSI={psi}, PTI={pti}, msg_type=0x{sm_msg_type:02x}");
 
                 // PDU Session Establishment Request (0xC1)
                 if sm_msg_type == 0xC1 {
                     log::info!("PDU Session Establishment Request from UE: PSI={psi}, PTI={pti}");
 
                     // Call SMF via N11 SBI to create SM context
-                    let smf_host = std::env::var("SMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-                    let smf_port: u16 = std::env::var("SMF_SBI_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
+                    let smf_host =
+                        std::env::var("SMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+                    let smf_port: u16 = std::env::var("SMF_SBI_PORT")
+                        .ok()
+                        .and_then(|p| p.parse().ok())
+                        .unwrap_or(7777);
                     let sst = 1u8;
                     let dnn = "internet";
 
-                    let (pdu_session_accept, n2_sm_info) = match crate::sbi_path::call_smf_create_sm_context(
-                        &smf_host, smf_port, psi, sst, None, dnn, &ul_nas.nas_pdu,
-                    ).await {
-                        Ok(resp) => {
-                            log::info!(
-                                "SMF SM Context Created: ref={}, n1_len={}, n2_len={}",
-                                resp.sm_context_ref, resp.n1_sm_msg.len(), resp.n2_sm_info.len()
-                            );
-                            (resp.n1_sm_msg, resp.n2_sm_info)
-                        }
-                        Err(e) => {
-                            log::warn!("SMF unreachable ({e}), using local PDU Session Accept");
+                    let (pdu_session_accept, n2_sm_info) =
+                        match crate::sbi_path::call_smf_create_sm_context(
+                            &smf_host,
+                            smf_port,
+                            psi,
+                            sst,
+                            None,
+                            dnn,
+                            &ul_nas.nas_pdu,
+                        )
+                        .await
+                        {
+                            Ok(resp) => {
+                                log::info!(
+                                    "SMF SM Context Created: ref={}, n1_len={}, n2_len={}",
+                                    resp.sm_context_ref,
+                                    resp.n1_sm_msg.len(),
+                                    resp.n2_sm_info.len()
+                                );
+                                (resp.n1_sm_msg, resp.n2_sm_info)
+                            }
+                            Err(e) => {
+                                log::warn!("SMF unreachable ({e}), using local PDU Session Accept");
 
-                            // Fallback: build locally
-                            let ue_ip = [10u8, 45, 0, 2];
-                            let mut accept = Vec::new();
-                            accept.push(0x2E); accept.push(psi); accept.push(pti); accept.push(0xC2);
-                            accept.push(0x01); // PDU type: IPv4
-                            accept.push(0x01); // SSC mode 1
-                            // QoS rules
-                            accept.extend_from_slice(&[0x06, 0x01, 0x03, 0x01, 0x01, 0x09]);
-                            // Session AMBR
-                            accept.extend_from_slice(&[0x06, 0x06, 0x00, 0x64, 0x06, 0x00, 0x64]);
-                            // PDU address
-                            accept.push(0x29); accept.push(0x05); accept.push(0x01);
-                            accept.extend_from_slice(&ue_ip);
-                            // DNN
-                            let dnn_bytes = b"internet";
-                            accept.push(0x25); accept.push((dnn_bytes.len() + 1) as u8);
-                            accept.push(dnn_bytes.len() as u8);
-                            accept.extend_from_slice(dnn_bytes);
+                                // Fallback: build locally
+                                let ue_ip = [10u8, 45, 0, 2];
+                                let mut accept = Vec::new();
+                                accept.push(0x2E);
+                                accept.push(psi);
+                                accept.push(pti);
+                                accept.push(0xC2);
+                                accept.push(0x01); // PDU type: IPv4
+                                accept.push(0x01); // SSC mode 1
+                                                   // QoS rules
+                                accept.extend_from_slice(&[0x06, 0x01, 0x03, 0x01, 0x01, 0x09]);
+                                // Session AMBR
+                                accept
+                                    .extend_from_slice(&[0x06, 0x06, 0x00, 0x64, 0x06, 0x00, 0x64]);
+                                // PDU address
+                                accept.push(0x29);
+                                accept.push(0x05);
+                                accept.push(0x01);
+                                accept.extend_from_slice(&ue_ip);
+                                // DNN
+                                let dnn_bytes = b"internet";
+                                accept.push(0x25);
+                                accept.push((dnn_bytes.len() + 1) as u8);
+                                accept.push(dnn_bytes.len() as u8);
+                                accept.extend_from_slice(dnn_bytes);
 
-                            let n2 = ngap_build::build_n2_sm_information(0x00000001, &[127, 0, 0, 1], 9);
-                            (accept, n2)
-                        }
-                    };
+                                let n2 = ngap_build::build_n2_sm_information(
+                                    0x00000001,
+                                    &[127, 0, 0, 1],
+                                    9,
+                                );
+                                (accept, n2)
+                            }
+                        };
 
                     log::info!(
                         "PDU Session Accept: PSI={}, accept_len={}, n2_len={}",
-                        psi, pdu_session_accept.len(), n2_sm_info.len()
+                        psi,
+                        pdu_session_accept.len(),
+                        n2_sm_info.len()
                     );
 
                     // Send N1 (PDU Session Accept) to UE via DL NAS Transport
@@ -748,29 +867,33 @@ impl NgapServer {
                     ) {
                         Some(bytes) => bytes,
                         None => {
-                            log::error!("Failed to build Downlink NAS Transport for PDU Session Accept");
+                            log::error!(
+                                "Failed to build Downlink NAS Transport for PDU Session Accept"
+                            );
                             return Ok(());
                         }
                     };
-                    self.send_to_association(association_id, &dl_nas_transport).await?;
+                    self.send_to_association(association_id, &dl_nas_transport)
+                        .await?;
                     log::info!("PDU Session Establishment Accept sent to UE!");
 
                     // Send N2 (UPF tunnel info) to gNB via PDU Session Resource Setup Request
-                    let setup_req = match crate::ngap_asn1::build_pdu_session_resource_setup_request_asn1(
-                        ul_nas.amf_ue_ngap_id,
-                        ul_nas.ran_ue_ngap_id,
-                        psi,
-                        1, // SST
-                        None, // SD
-                        None, // NAS PDU already sent separately
-                        &n2_sm_info,
-                    ) {
-                        Some(bytes) => bytes,
-                        None => {
-                            log::error!("Failed to build PDU Session Resource Setup Request");
-                            return Ok(());
-                        }
-                    };
+                    let setup_req =
+                        match crate::ngap_asn1::build_pdu_session_resource_setup_request_asn1(
+                            ul_nas.amf_ue_ngap_id,
+                            ul_nas.ran_ue_ngap_id,
+                            psi,
+                            1,    // SST
+                            None, // SD
+                            None, // NAS PDU already sent separately
+                            &n2_sm_info,
+                        ) {
+                            Some(bytes) => bytes,
+                            None => {
+                                log::error!("Failed to build PDU Session Resource Setup Request");
+                                return Ok(());
+                            }
+                        };
                     self.send_to_association(association_id, &setup_req).await?;
                     log::info!("PDU Session Resource Setup Request sent to gNB: PSI={psi}");
                 }
@@ -780,23 +903,36 @@ impl NgapServer {
                     log::info!("PDU Session Modification Request from UE: PSI={psi}, PTI={pti}");
 
                     // Forward to SMF via SM Context Update with N1 SM info
-                    let smf_host = std::env::var("SMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-                    let smf_port: u16 = std::env::var("SMF_SBI_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
+                    let smf_host =
+                        std::env::var("SMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+                    let smf_port: u16 = std::env::var("SMF_SBI_PORT")
+                        .ok()
+                        .and_then(|p| p.parse().ok())
+                        .unwrap_or(7777);
                     let sm_context_ref = format!("{psi}");
 
                     match crate::sbi_path::call_smf_update_sm_context_with_n1(
-                        &smf_host, smf_port, &sm_context_ref, &ul_nas.nas_pdu,
-                    ).await {
+                        &smf_host,
+                        smf_port,
+                        &sm_context_ref,
+                        &ul_nas.nas_pdu,
+                    )
+                    .await
+                    {
                         Ok(resp) => {
                             log::info!("SMF SM Context Updated for modification: PSI={psi}");
 
                             // Send PDU Session Modification Command to UE (N1)
                             let mut mod_cmd = Vec::new();
-                            mod_cmd.push(0x2E); mod_cmd.push(psi); mod_cmd.push(pti);
+                            mod_cmd.push(0x2E);
+                            mod_cmd.push(psi);
+                            mod_cmd.push(pti);
                             mod_cmd.push(0xCB); // PDU Session Modification Command
 
                             let dl_nas = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
-                                ul_nas.amf_ue_ngap_id, ul_nas.ran_ue_ngap_id, &mod_cmd,
+                                ul_nas.amf_ue_ngap_id,
+                                ul_nas.ran_ue_ngap_id,
+                                &mod_cmd,
                             ) {
                                 Some(bytes) => bytes,
                                 None => return Ok(()),
@@ -819,19 +955,26 @@ impl NgapServer {
                                         return Ok(());
                                     }
                                 };
-                                self.send_to_association(association_id, &modify_req).await?;
-                                log::info!("PDU Session Resource Modify Request sent to gNB: PSI={psi}");
+                                self.send_to_association(association_id, &modify_req)
+                                    .await?;
+                                log::info!(
+                                    "PDU Session Resource Modify Request sent to gNB: PSI={psi}"
+                                );
                             }
                         }
                         Err(e) => {
                             log::warn!("SMF modification failed ({e}), sending reject");
                             let mut reject = Vec::new();
-                            reject.push(0x2E); reject.push(psi); reject.push(pti);
+                            reject.push(0x2E);
+                            reject.push(psi);
+                            reject.push(pti);
                             reject.push(0xCC); // PDU Session Modification Reject
                             reject.push(0x1A); // 5GSM cause: Insufficient resources
 
                             let dl_nas = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
-                                ul_nas.amf_ue_ngap_id, ul_nas.ran_ue_ngap_id, &reject,
+                                ul_nas.amf_ue_ngap_id,
+                                ul_nas.ran_ue_ngap_id,
+                                &reject,
                             ) {
                                 Some(bytes) => bytes,
                                 None => return Ok(()),
@@ -852,13 +995,21 @@ impl NgapServer {
                     log::info!("PDU Session Release Request from UE: PSI={psi}, PTI={pti}");
 
                     // Call SMF to release SM context
-                    let smf_host = std::env::var("SMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-                    let smf_port: u16 = std::env::var("SMF_SBI_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
+                    let smf_host =
+                        std::env::var("SMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+                    let smf_port: u16 = std::env::var("SMF_SBI_PORT")
+                        .ok()
+                        .and_then(|p| p.parse().ok())
+                        .unwrap_or(7777);
                     let sm_context_ref = format!("{psi}");
 
                     match crate::sbi_path::call_smf_release_sm_context(
-                        &smf_host, smf_port, &sm_context_ref,
-                    ).await {
+                        &smf_host,
+                        smf_port,
+                        &sm_context_ref,
+                    )
+                    .await
+                    {
                         Ok(()) => {
                             log::info!("SMF SM Context Released: PSI={psi}");
                         }
@@ -869,12 +1020,16 @@ impl NgapServer {
 
                     // Send PDU Session Release Command to UE
                     let mut release_cmd = Vec::new();
-                    release_cmd.push(0x2E); release_cmd.push(psi); release_cmd.push(pti);
+                    release_cmd.push(0x2E);
+                    release_cmd.push(psi);
+                    release_cmd.push(pti);
                     release_cmd.push(0xD4); // PDU Session Release Command
                     release_cmd.push(0x24); // 5GSM cause: Regular deactivation
 
                     let dl_nas = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
-                        ul_nas.amf_ue_ngap_id, ul_nas.ran_ue_ngap_id, &release_cmd,
+                        ul_nas.amf_ue_ngap_id,
+                        ul_nas.ran_ue_ngap_id,
+                        &release_cmd,
                     ) {
                         Some(bytes) => bytes,
                         None => return Ok(()),
@@ -883,18 +1038,20 @@ impl NgapServer {
                     log::info!("PDU Session Release Command sent to UE: PSI={psi}");
 
                     // Send PDU Session Resource Release Command to gNB
-                    let release_ngap = match crate::ngap_asn1::build_pdu_session_resource_release_command_asn1(
-                        ul_nas.amf_ue_ngap_id,
-                        ul_nas.ran_ue_ngap_id,
-                        &[psi],
-                    ) {
-                        Some(bytes) => bytes,
-                        None => {
-                            log::error!("Failed to build PDU Session Resource Release Command");
-                            return Ok(());
-                        }
-                    };
-                    self.send_to_association(association_id, &release_ngap).await?;
+                    let release_ngap =
+                        match crate::ngap_asn1::build_pdu_session_resource_release_command_asn1(
+                            ul_nas.amf_ue_ngap_id,
+                            ul_nas.ran_ue_ngap_id,
+                            &[psi],
+                        ) {
+                            Some(bytes) => bytes,
+                            None => {
+                                log::error!("Failed to build PDU Session Resource Release Command");
+                                return Ok(());
+                            }
+                        };
+                    self.send_to_association(association_id, &release_ngap)
+                        .await?;
                     log::info!("PDU Session Resource Release Command sent to gNB: PSI={psi}");
                 }
 
@@ -937,13 +1094,22 @@ impl NgapServer {
                 log::info!("SUCI: {suci_str}");
 
                 // Call AUSF to get authentication vectors
-                let ausf_host = std::env::var("AUSF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-                let ausf_port: u16 = std::env::var("AUSF_SBI_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
+                let ausf_host =
+                    std::env::var("AUSF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+                let ausf_port: u16 = std::env::var("AUSF_SBI_PORT")
+                    .ok()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(7777);
                 let serving_network_name = "5G:mnc070.mcc999.3gppnetwork.org";
 
                 match crate::sbi_path::call_ausf_authenticate(
-                    &ausf_host, ausf_port, &suci_str, serving_network_name,
-                ).await {
+                    &ausf_host,
+                    ausf_port,
+                    &suci_str,
+                    serving_network_name,
+                )
+                .await
+                {
                     Ok(auth_resp) => {
                         log::info!(
                             "AUSF auth success: ctx_id={}, RAND={}...",
@@ -952,14 +1118,17 @@ impl NgapServer {
                         );
 
                         // Store auth state for this UE
-                        self.ue_auth_state.insert(ul_nas.amf_ue_ngap_id, UeAuthState {
-                            auth_ctx_id: auth_resp.auth_ctx_id,
-                            rand: auth_resp.rand,
-                            hxres_star: auth_resp.hxres_star,
-                            ran_ue_ngap_id: ul_nas.ran_ue_ngap_id,
-                            association_id,
-                            suci: suci_str,
-                        });
+                        self.ue_auth_state.insert(
+                            ul_nas.amf_ue_ngap_id,
+                            UeAuthState {
+                                auth_ctx_id: auth_resp.auth_ctx_id,
+                                rand: auth_resp.rand,
+                                hxres_star: auth_resp.hxres_star,
+                                ran_ue_ngap_id: ul_nas.ran_ue_ngap_id,
+                                association_id,
+                                suci: suci_str,
+                            },
+                        );
 
                         // Build Authentication Request NAS message
                         // Format: EPD(0x7E) + SecHdr(0x00) + MsgType(0x56) + ngKSI(1) + ABBA(LV) + RAND(TV,IEI=0x21) + AUTN(TLV,IEI=0x20)
@@ -969,7 +1138,7 @@ impl NgapServer {
                         auth_request.push(0x56); // Message type: Authentication Request
                         auth_request.push(0x00); // ngKSI: TSC=0, KSI=0
                         auth_request.extend_from_slice(&[0x02, 0x00, 0x00]); // ABBA: length=2, value=0x0000
-                        // RAND (IEI 0x21, fixed 16 bytes)
+                                                                             // RAND (IEI 0x21, fixed 16 bytes)
                         auth_request.push(0x21);
                         auth_request.extend_from_slice(&auth_resp.rand);
                         // AUTN (IEI 0x20, TLV)
@@ -978,35 +1147,39 @@ impl NgapServer {
                         auth_request.extend_from_slice(&auth_resp.autn);
 
                         // Send via DL NAS Transport
-                        let dl_nas_transport = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
-                            ul_nas.amf_ue_ngap_id,
-                            ul_nas.ran_ue_ngap_id,
-                            &auth_request,
-                        ) {
-                            Some(bytes) => bytes,
-                            None => {
-                                log::error!("Failed to build DL NAS Transport for Authentication Request");
-                                return Ok(());
-                            }
-                        };
-                        self.send_to_association(association_id, &dl_nas_transport).await?;
+                        let dl_nas_transport =
+                            match crate::ngap_asn1::build_downlink_nas_transport_asn1(
+                                ul_nas.amf_ue_ngap_id,
+                                ul_nas.ran_ue_ngap_id,
+                                &auth_request,
+                            ) {
+                                Some(bytes) => bytes,
+                                None => {
+                                    log::error!("Failed to build DL NAS Transport for Authentication Request");
+                                    return Ok(());
+                                }
+                            };
+                        self.send_to_association(association_id, &dl_nas_transport)
+                            .await?;
                         log::info!("Authentication Request sent to UE");
                     }
                     Err(e) => {
-                        log::warn!("AUSF unreachable ({e}), falling back to direct Registration Accept");
+                        log::warn!(
+                            "AUSF unreachable ({e}), falling back to direct Registration Accept"
+                        );
                         // Fallback: send Registration Accept directly
-                        let registration_accept = vec![
-                            0x7e, 0x00, 0x42, 0x01, 0x01,
-                        ];
-                        let dl_nas_transport = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
-                            ul_nas.amf_ue_ngap_id,
-                            ul_nas.ran_ue_ngap_id,
-                            &registration_accept,
-                        ) {
-                            Some(bytes) => bytes,
-                            None => return Ok(()),
-                        };
-                        self.send_to_association(association_id, &dl_nas_transport).await?;
+                        let registration_accept = vec![0x7e, 0x00, 0x42, 0x01, 0x01];
+                        let dl_nas_transport =
+                            match crate::ngap_asn1::build_downlink_nas_transport_asn1(
+                                ul_nas.amf_ue_ngap_id,
+                                ul_nas.ran_ue_ngap_id,
+                                &registration_accept,
+                            ) {
+                                Some(bytes) => bytes,
+                                None => return Ok(()),
+                            };
+                        self.send_to_association(association_id, &dl_nas_transport)
+                            .await?;
                         log::info!("Registration Accept sent (AUSF fallback)");
                     }
                 }
@@ -1041,7 +1214,7 @@ impl NgapServer {
                     let auth_state = self.ue_auth_state.get(&ul_nas.amf_ue_ngap_id);
                     let verified = if let Some(state) = auth_state {
                         // Compute HRES* from RAND and RES* using SHA-256
-                        use sha2::{Sha256, Digest};
+                        use sha2::{Digest, Sha256};
                         let mut hasher = Sha256::new();
                         hasher.update(state.rand);
                         hasher.update(rs);
@@ -1059,16 +1232,26 @@ impl NgapServer {
                         // Call AUSF for 5G-AKA confirmation to get KSEAF
                         let auth_state = self.ue_auth_state.get(&ul_nas.amf_ue_ngap_id).cloned();
                         if let Some(state) = auth_state {
-                            let ausf_confirm_host = std::env::var("AUSF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-                            let ausf_confirm_port: u16 = std::env::var("AUSF_SBI_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
+                            let ausf_confirm_host = std::env::var("AUSF_SBI_ADDR")
+                                .unwrap_or_else(|_| "127.0.0.1".to_string());
+                            let ausf_confirm_port: u16 = std::env::var("AUSF_SBI_PORT")
+                                .ok()
+                                .and_then(|p| p.parse().ok())
+                                .unwrap_or(7777);
 
                             match crate::sbi_path::call_ausf_5g_aka_confirm(
-                                &ausf_confirm_host, ausf_confirm_port, &state.auth_ctx_id, &rs,
-                            ).await {
+                                &ausf_confirm_host,
+                                ausf_confirm_port,
+                                &state.auth_ctx_id,
+                                &rs,
+                            )
+                            .await
+                            {
                                 Ok(confirm) => {
                                     log::info!(
                                         "AUSF 5G-AKA confirmed: result={}, supi={:?}",
-                                        confirm.auth_result, confirm.supi
+                                        confirm.auth_result,
+                                        confirm.supi
                                     );
 
                                     // Derive NAS keys from KSEAF (simplified key derivation)
@@ -1089,41 +1272,45 @@ impl NgapServer {
                         smc.push(0x7E); // EPD: 5GMM
                         smc.push(0x00); // Security header: Plain NAS (simplified, production uses integrity-protected)
                         smc.push(0x5D); // Message type: Security Mode Command
-                        // Selected NAS security algorithms: EA0 + IA2 (NIA2 = SNOW3G)
+                                        // Selected NAS security algorithms: EA0 + IA2 (NIA2 = SNOW3G)
                         smc.push(0x20); // enc_alg=0 (EA0) | int_alg=2 (IA2) → (0x02 << 4) | 0x00 = 0x20
-                        // ngKSI: TSC=0, KSI=0
+                                        // ngKSI: TSC=0, KSI=0
                         smc.push(0x00);
                         // Replayed UE security capabilities (LV): EA0-EA3 + IA0-IA3
                         smc.push(0x02); // length
                         smc.push(0xF0); // EA0 + EA1 + EA2 + EA3
                         smc.push(0xF0); // IA0 + IA1 + IA2 + IA3
 
-                        let dl_nas_transport = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
-                            ul_nas.amf_ue_ngap_id,
-                            ul_nas.ran_ue_ngap_id,
-                            &smc,
-                        ) {
-                            Some(bytes) => bytes,
-                            None => {
-                                log::error!("Failed to build DL NAS Transport for Security Mode Command");
-                                return Ok(());
-                            }
-                        };
-                        self.send_to_association(association_id, &dl_nas_transport).await?;
+                        let dl_nas_transport =
+                            match crate::ngap_asn1::build_downlink_nas_transport_asn1(
+                                ul_nas.amf_ue_ngap_id,
+                                ul_nas.ran_ue_ngap_id,
+                                &smc,
+                            ) {
+                                Some(bytes) => bytes,
+                                None => {
+                                    log::error!("Failed to build DL NAS Transport for Security Mode Command");
+                                    return Ok(());
+                                }
+                            };
+                        self.send_to_association(association_id, &dl_nas_transport)
+                            .await?;
                         log::info!("Security Mode Command sent to UE");
                     } else {
                         log::error!("HXRES* verification failed - authentication failure");
                         // Send Authentication Reject
                         let auth_reject = vec![0x7E, 0x00, 0x58]; // EPD + SecHdr + MsgType(Auth Reject)
-                        let dl_nas_transport = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
-                            ul_nas.amf_ue_ngap_id,
-                            ul_nas.ran_ue_ngap_id,
-                            &auth_reject,
-                        ) {
-                            Some(bytes) => bytes,
-                            None => return Ok(()),
-                        };
-                        self.send_to_association(association_id, &dl_nas_transport).await?;
+                        let dl_nas_transport =
+                            match crate::ngap_asn1::build_downlink_nas_transport_asn1(
+                                ul_nas.amf_ue_ngap_id,
+                                ul_nas.ran_ue_ngap_id,
+                                &auth_reject,
+                            ) {
+                                Some(bytes) => bytes,
+                                None => return Ok(()),
+                            };
+                        self.send_to_association(association_id, &dl_nas_transport)
+                            .await?;
                         log::info!("Authentication Reject sent to UE");
                     }
                 }
@@ -1139,8 +1326,8 @@ impl NgapServer {
                 // Send Registration Accept with T3512 timer and 5G-GUTI
                 let mut registration_accept = vec![
                     0x7e, 0x00, 0x42, // EPD + Security header + Registration Accept
-                    0x01,             // Registration result length
-                    0x01,             // Registration result: 3GPP access
+                    0x01, // Registration result length
+                    0x01, // Registration result: 3GPP access
                 ];
 
                 // 5G-GUTI (IEI 0x77, TLV-E) - assign a GUTI to the UE
@@ -1150,7 +1337,7 @@ impl NgapServer {
                 registration_accept.push(0x77); // IEI
                 registration_accept.extend_from_slice(&[0x00, 0x0B]); // Length = 11
                 registration_accept.push(0xF2); // SUPI format=GUTI, odd/even
-                // PLMN: MCC=999, MNC=70
+                                                // PLMN: MCC=999, MNC=70
                 registration_accept.extend_from_slice(&[0x99, 0xF9, 0x07]);
                 // AMF Region ID
                 registration_accept.push(0x02);
@@ -1178,13 +1365,17 @@ impl NgapServer {
                         return Ok(());
                     }
                 };
-                self.send_to_association(association_id, &dl_nas_transport).await?;
+                self.send_to_association(association_id, &dl_nas_transport)
+                    .await?;
                 log::info!("Registration Accept sent to UE (with T3512=540s, 5G-GUTI assigned)");
             }
 
             // Check for Service Request (0x4C) - 5GMM message
             if epd == 0x7E && msg_type == 0x4C {
-                log::info!("Received Service Request from UE (amf_ue_ngap_id={})", ul_nas.amf_ue_ngap_id);
+                log::info!(
+                    "Received Service Request from UE (amf_ue_ngap_id={})",
+                    ul_nas.amf_ue_ngap_id
+                );
 
                 // Service Request indicates UE is transitioning from CM-IDLE to CM-CONNECTED
                 // Parse the Service Request to extract 5G-S-TMSI and service type
@@ -1212,7 +1403,8 @@ impl NgapServer {
                         return Ok(());
                     }
                 };
-                self.send_to_association(association_id, &dl_nas_transport).await?;
+                self.send_to_association(association_id, &dl_nas_transport)
+                    .await?;
                 log::info!("Service Accept sent to UE");
             }
 
@@ -1223,12 +1415,14 @@ impl NgapServer {
                     let reg_type = ul_nas.nas_pdu[3] & 0x07;
                     if reg_type == 0x03 {
                         // Periodic Registration Update (type 3)
-                        log::info!("Periodic Registration Update from UE (amf_ue_ngap_id={})", ul_nas.amf_ue_ngap_id);
+                        log::info!(
+                            "Periodic Registration Update from UE (amf_ue_ngap_id={})",
+                            ul_nas.amf_ue_ngap_id
+                        );
 
                         // Send Registration Accept with refreshed T3512
                         let mut reg_accept = vec![
-                            0x7e, 0x00, 0x42,
-                            0x01, 0x01, // Registration result: 3GPP access
+                            0x7e, 0x00, 0x42, 0x01, 0x01, // Registration result: 3GPP access
                         ];
                         // T3512 timer (refreshed)
                         reg_accept.push(0x5E);
@@ -1244,14 +1438,19 @@ impl NgapServer {
                             None => return Ok(()),
                         };
                         self.send_to_association(association_id, &dl_nas).await?;
-                        log::info!("Registration Accept sent for periodic update (T3512 refreshed)");
+                        log::info!(
+                            "Registration Accept sent for periodic update (T3512 refreshed)"
+                        );
                     }
                 }
             }
 
             // Check for Deregistration Request UE Originating (0x45) - 5GMM message
             if epd == 0x7E && msg_type == 0x45 {
-                log::info!("Received Deregistration Request from UE (amf_ue_ngap_id={})", ul_nas.amf_ue_ngap_id);
+                log::info!(
+                    "Received Deregistration Request from UE (amf_ue_ngap_id={})",
+                    ul_nas.amf_ue_ngap_id
+                );
 
                 // Send Deregistration Accept
                 let dereg_accept = vec![0x7E, 0x00, 0x46]; // EPD + SecHdr + Dereg Accept
@@ -1288,7 +1487,8 @@ impl NgapServer {
     ) -> Result<()> {
         log::info!(
             "PDU Session Resource Setup Response from association {} ({} bytes)",
-            association_id, data.len()
+            association_id,
+            data.len()
         );
 
         // Decode the APER-encoded PDU Session Resource Setup Response using ASN.1
@@ -1308,7 +1508,8 @@ impl NgapServer {
 
         log::info!(
             "Decoded Setup Response: amf_ue_ngap_id={}, ran_ue_ngap_id={}",
-            response_data.amf_ue_ngap_id, response_data.ran_ue_ngap_id
+            response_data.amf_ue_ngap_id,
+            response_data.ran_ue_ngap_id
         );
 
         let mut gnb_teid: Option<u32> = None;
@@ -1320,25 +1521,35 @@ impl NgapServer {
             // Parse transfer: QFI(1) + gNB TEID(4,BE) + addr_type(1) + gNB IPv4(4)
             if item.transfer.len() >= 10 {
                 let teid = u32::from_be_bytes([
-                    item.transfer[1], item.transfer[2],
-                    item.transfer[3], item.transfer[4],
+                    item.transfer[1],
+                    item.transfer[2],
+                    item.transfer[3],
+                    item.transfer[4],
                 ]);
                 if item.transfer[5] == 1 && item.transfer.len() >= 10 {
                     gnb_addr = [
-                        item.transfer[6], item.transfer[7],
-                        item.transfer[8], item.transfer[9],
+                        item.transfer[6],
+                        item.transfer[7],
+                        item.transfer[8],
+                        item.transfer[9],
                     ];
                 }
                 gnb_teid = Some(teid);
                 log::info!(
                     "Extracted gNB TEID=0x{:08x}, addr={}.{}.{}.{}, QFI={}, PSI={}",
-                    teid, gnb_addr[0], gnb_addr[1], gnb_addr[2], gnb_addr[3],
-                    item.transfer[0], pdu_session_id
+                    teid,
+                    gnb_addr[0],
+                    gnb_addr[1],
+                    gnb_addr[2],
+                    gnb_addr[3],
+                    item.transfer[0],
+                    pdu_session_id
                 );
             } else {
                 log::warn!(
                     "Transfer IE too short for PSI={}: {} bytes",
-                    item.pdu_session_id, item.transfer.len()
+                    item.pdu_session_id,
+                    item.transfer.len()
                 );
             }
         }
@@ -1358,13 +1569,22 @@ impl NgapServer {
             n2_sm_info.push(1); // Priority
 
             // Call SMF to update SM context with gNB TEID
-            let smf_update_host = std::env::var("SMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-            let smf_update_port: u16 = std::env::var("SMF_SBI_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(7777);
+            let smf_update_host =
+                std::env::var("SMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+            let smf_update_port: u16 = std::env::var("SMF_SBI_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(7777);
             let sm_context_ref = format!("{pdu_session_id}");
 
             match crate::sbi_path::call_smf_update_sm_context(
-                &smf_update_host, smf_update_port, &sm_context_ref, &n2_sm_info,
-            ).await {
+                &smf_update_host,
+                smf_update_port,
+                &sm_context_ref,
+                &n2_sm_info,
+            )
+            .await
+            {
                 Ok(()) => {
                     log::info!(
                         "SMF SM Context Updated with gNB TEID: ref={sm_context_ref}, TEID=0x{teid:08x}"
@@ -1384,14 +1604,11 @@ impl NgapServer {
     /// Handle UE Context Release Request from gNB
     ///
     /// Releases all PDU sessions at SMF and sends UEContextReleaseCommand back.
-    async fn handle_ue_context_release(
-        &mut self,
-        association_id: u64,
-        data: &[u8],
-    ) -> Result<()> {
+    async fn handle_ue_context_release(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
         log::info!(
             "UE Context Release Request from association {} ({} bytes)",
-            association_id, data.len()
+            association_id,
+            data.len()
         );
 
         // Parse AMF UE NGAP ID and RAN UE NGAP ID from the message
@@ -1401,8 +1618,7 @@ impl NgapServer {
         let ran_ue_ngap_id = crate::ngap_asn1::extract_ran_ue_ngap_id(data);
 
         log::info!(
-            "UE Context Release: AMF UE NGAP ID={:?}, RAN UE NGAP ID={:?}",
-            amf_ue_ngap_id, ran_ue_ngap_id
+            "UE Context Release: AMF UE NGAP ID={amf_ue_ngap_id:?}, RAN UE NGAP ID={ran_ue_ngap_id:?}"
         );
 
         // Release all PDU sessions at SMF
@@ -1440,9 +1656,9 @@ impl NgapServer {
         }
         for (psi, sm_context_ref) in &sm_context_refs {
             log::info!("Releasing SMF SM Context: PSI={psi}, ref={sm_context_ref}");
-            match crate::sbi_path::call_smf_release_sm_context(
-                &smf_host, smf_port, sm_context_ref,
-            ).await {
+            match crate::sbi_path::call_smf_release_sm_context(&smf_host, smf_port, sm_context_ref)
+                .await
+            {
                 Ok(()) => log::info!("SMF SM Context Released: PSI={psi}"),
                 Err(e) => log::warn!("SMF release failed for PSI={psi}: {e}"),
             }
@@ -1450,9 +1666,8 @@ impl NgapServer {
 
         // Build and send UEContextReleaseCommand
         if let (Some(amf_id), Some(ran_id)) = (amf_ue_ngap_id, ran_ue_ngap_id) {
-            let release_cmd = crate::ngap_asn1::build_ue_context_release_command_asn1(
-                amf_id, ran_id,
-            );
+            let release_cmd =
+                crate::ngap_asn1::build_ue_context_release_command_asn1(amf_id, ran_id);
             if let Some(cmd) = release_cmd {
                 self.send_to_association(association_id, &cmd).await?;
                 log::info!("UE Context Release Command sent to gNB");
@@ -1475,7 +1690,11 @@ impl NgapServer {
         tac: u32,
     ) -> Result<()> {
         let paging_bytes = match crate::ngap_asn1::build_paging_asn1(
-            amf_set_id, amf_pointer, tmsi, plmn_id, tac,
+            amf_set_id,
+            amf_pointer,
+            tmsi,
+            plmn_id,
+            tac,
         ) {
             Some(bytes) => bytes,
             None => {
@@ -1503,30 +1722,48 @@ impl NgapServer {
     /// Send message to a gNB by association ID
     /// NOTE: This method requires &mut self to access the SCTP server
     async fn send_to_association(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
-        log::debug!("Sending {} bytes to association {}", data.len(), association_id);
+        log::debug!(
+            "Sending {} bytes to association {}",
+            data.len(),
+            association_id
+        );
 
         // Use stream 0 for NGAP signaling
-        self.sctp_server.send(association_id, 0, data).await
+        self.sctp_server
+            .send(association_id, 0, data)
+            .await
             .map_err(|e| anyhow::anyhow!("SCTP send error: {e}"))
     }
 
     /// Send message to a gNB by ID
-    pub async fn send_by_id(&self, gnb_id: u64, data: &[u8]) -> Result<()> {
-        let sessions = self.sessions.read().await;
-        for (_assoc_id, session) in sessions.iter() {
-            if session.id == gnb_id {
+    pub async fn send_by_id(&mut self, gnb_id: u64, data: &[u8]) -> Result<()> {
+        // Find the association ID for this gNB ID, then drop the read lock
+        // before calling send_to_association (which needs &mut self).
+        let assoc_id = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .iter()
+                .find(|(_, session)| session.id == gnb_id)
+                .map(|(assoc_id, _)| *assoc_id)
+        };
+
+        match assoc_id {
+            Some(assoc_id) => {
                 log::debug!("Sending {} bytes to gNB {}", data.len(), gnb_id);
-                // Note: Same mutability issue as send_to_association
-                return Ok(());
+                self.send_to_association(assoc_id, data).await
             }
+            None => Err(anyhow::anyhow!("gNB {gnb_id} not found")),
         }
-        Err(anyhow::anyhow!("gNB {gnb_id} not found"))
     }
 
     /// Close a gNB session
     pub async fn close_session(&self, association_id: u64) -> Result<()> {
         if let Some(session) = self.sessions.write().await.remove(&association_id) {
-            log::info!("Closed gNB session {} (association {})", session.id, association_id);
+            log::info!(
+                "Closed gNB session {} (association {})",
+                session.id,
+                association_id
+            );
             self.assoc_to_addr.write().await.remove(&association_id);
         }
         Ok(())
@@ -1567,7 +1804,10 @@ impl NgapServerHandle {
 
     pub async fn send(&self, association_id: u64, stream_id: u16, data: &[u8]) -> Result<()> {
         let mut server = self.inner.lock().await;
-        server.sctp_server.send(association_id, stream_id, data).await
+        server
+            .sctp_server
+            .send(association_id, stream_id, data)
+            .await
             .map_err(|e| anyhow::anyhow!("SCTP send error: {e}"))
     }
 }
@@ -1577,8 +1817,7 @@ impl NgapServerHandle {
 // ============================================================================
 
 /// Global NGAP server instance
-static NGAP_SERVER: once_cell::sync::OnceCell<NgapServerHandle> =
-    once_cell::sync::OnceCell::new();
+static NGAP_SERVER: once_cell::sync::OnceCell<NgapServerHandle> = once_cell::sync::OnceCell::new();
 
 /// Initialize NGAP path
 pub async fn amf_ngap_open(

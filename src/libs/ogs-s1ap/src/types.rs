@@ -203,7 +203,10 @@ pub struct EutranCgi {
 #[derive(Debug, Clone)]
 pub enum UeS1apIds {
     /// MME and eNB UE S1AP IDs
-    Pair { mme_ue_s1ap_id: u32, enb_ue_s1ap_id: u32 },
+    Pair {
+        mme_ue_s1ap_id: u32,
+        enb_ue_s1ap_id: u32,
+    },
     /// MME UE S1AP ID only
     MmeOnly { mme_ue_s1ap_id: u32 },
 }

@@ -224,7 +224,10 @@ impl SgwuContext {
         self.max_num_of_sess = max_sess;
         self.initialized.store(true, Ordering::SeqCst);
 
-        log::info!("SGWU context initialized with max {} sessions", self.max_num_of_sess);
+        log::info!(
+            "SGWU context initialized with max {} sessions",
+            self.max_num_of_sess
+        );
     }
 
     /// Finalize the SGWU context
@@ -261,7 +264,10 @@ impl SgwuContext {
         let mut sgwc_sxa_f_seid_hash = self.sgwc_sxa_f_seid_hash.write().ok()?;
 
         if self.max_num_of_sess > 0 && sess_list.len() >= self.max_num_of_sess {
-            log::error!("Maximum number of sessions [{}] reached", self.max_num_of_sess);
+            log::error!(
+                "Maximum number of sessions [{}] reached",
+                self.max_num_of_sess
+            );
             return None;
         }
 
@@ -280,12 +286,10 @@ impl SgwuContext {
 
         log::info!(
             "UE F-SEID[UP:0x{:x} CP:0x{:x}]",
-            sgwu_sxa_seid, cp_f_seid.seid
+            sgwu_sxa_seid,
+            cp_f_seid.seid
         );
-        log::info!(
-            "[Added] Number of SGWU-Sessions is now {}",
-            sess_list.len()
-        );
+        log::info!("[Added] Number of SGWU-Sessions is now {}", sess_list.len());
 
         Some(sess)
     }
@@ -416,7 +420,8 @@ impl SgwuContext {
             if let Some(sess) = self.sess_find_by_id(id) {
                 log::info!(
                     "DELETION: F-SEID[UP:0x{:x} CP:0x{:x}]",
-                    sess.sgwu_sxa_seid, sess.sgwc_sxa_f_seid.seid
+                    sess.sgwu_sxa_seid,
+                    sess.sgwc_sxa_f_seid.seid
                 );
             }
             self.sess_remove(id);

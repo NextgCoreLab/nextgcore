@@ -2,7 +2,7 @@
 //!
 //! Port of src/nssf/nssf-sm.c - Main NSSF state machine implementation
 
-use crate::context::{nssf_self, get_nsi_load};
+use crate::context::{get_nsi_load, nssf_self};
 use crate::event::{NssfEvent, NssfEventId, NssfTimerId};
 use crate::sbi_response::{send_error_response, send_gateway_timeout_response};
 
@@ -66,7 +66,6 @@ impl NssfSmContext {
     fn handle_final_state(&mut self, _event: &mut NssfEvent) {
         log::debug!("NSSF SM: In final state");
     }
-
 
     fn handle_operational_state(&mut self, event: &mut NssfEvent) {
         match event.id {
@@ -132,7 +131,11 @@ impl NssfSmContext {
 
         if api_version != expected_version {
             log::error!("Not supported version [{api_version}], expected [{expected_version}]");
-            send_error_response(stream_id, 400, &format!("Unsupported API version: {api_version}"));
+            send_error_response(
+                stream_id,
+                400,
+                &format!("Unsupported API version: {api_version}"),
+            );
             return;
         }
 
@@ -142,7 +145,12 @@ impl NssfSmContext {
                 self.handle_nnrf_nfm_request(&method, &resource_components, stream_id);
             }
             "nnssf-nsselection" => {
-                self.handle_nnssf_nsselection_request(event, &method, &resource_components, stream_id);
+                self.handle_nnssf_nsselection_request(
+                    event,
+                    &method,
+                    &resource_components,
+                    stream_id,
+                );
             }
             _ => {
                 log::error!("Invalid API name [{service_name}]");
@@ -151,7 +159,12 @@ impl NssfSmContext {
         }
     }
 
-    fn handle_nnrf_nfm_request(&mut self, method: &str, resource_components: &[String], _stream_id: u64) {
+    fn handle_nnrf_nfm_request(
+        &mut self,
+        method: &str,
+        resource_components: &[String],
+        _stream_id: u64,
+    ) {
         let resource = resource_components.first().map(|s| s.as_str());
 
         match resource {
@@ -196,7 +209,6 @@ impl NssfSmContext {
             }
         }
     }
-
 
     fn handle_sbi_client_event(&mut self, event: &mut NssfEvent) {
         let (service_name, api_version, resource_components, _res_status) = {
@@ -294,14 +306,22 @@ impl NssfSmContext {
         }
     }
 
-    fn handle_nnssf_nsselection_response(&mut self, event: &mut NssfEvent, _resource_components: &[String]) {
+    fn handle_nnssf_nsselection_response(
+        &mut self,
+        event: &mut NssfEvent,
+        _resource_components: &[String],
+    ) {
         // Handle response from H-NSSF
         if let Some(home_id) = event.home_id {
             let ctx = nssf_self();
             let home_info = {
                 if let Ok(context) = ctx.read() {
                     context.home_find_by_id(home_id).map(|home| {
-                        (home.plmn_id.mcc.clone(), home.plmn_id.mnc.clone(), home.s_nssai.sst)
+                        (
+                            home.plmn_id.mcc.clone(),
+                            home.plmn_id.mnc.clone(),
+                            home.s_nssai.sst,
+                        )
                     })
                 } else {
                     None
@@ -309,9 +329,7 @@ impl NssfSmContext {
             };
 
             if let Some((mcc, mnc, sst)) = home_info {
-                log::debug!(
-                    "NS selection response for home (plmn={mcc}{mnc}, sst={sst})"
-                );
+                log::debug!("NS selection response for home (plmn={mcc}{mnc}, sst={sst})");
                 // Note: nssf_nnrf_nsselection_handle_get_from_hnssf handles H-NSSF response
                 // This is invoked when V-NSSF receives slice info from H-NSSF
             } else {
@@ -319,7 +337,6 @@ impl NssfSmContext {
             }
         }
     }
-
 
     fn handle_sbi_timer_event(&mut self, event: &mut NssfEvent) {
         let timer_id = match event.timer_id {

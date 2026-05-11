@@ -3,7 +3,7 @@
 //! Inter-gNB signalling protocol for Xn interface. Supports handover
 //! preparation, data forwarding, and dual connectivity procedures.
 
-use crate::per::{AperEncoder, AperDecoder, Constraint, PerError, PerResult};
+use crate::per::{AperDecoder, AperEncoder, Constraint, PerError, PerResult};
 
 // ============================================================================
 // XnAP Procedure Codes
@@ -226,26 +226,38 @@ pub struct EnergySavingIndication {
 /// Encode an ISAC Sensing Configuration Request.
 pub fn encode_isac_sensing_config(msg: &IsacSensingConfigRequest) -> PerResult<Vec<u8>> {
     let mut encoder = AperEncoder::new();
-    encoder.encode_constrained_whole_number(XnApProcedure::IsacSensingConfig as i64, &Constraint::new(0, 255))?;
+    encoder.encode_constrained_whole_number(
+        XnApProcedure::IsacSensingConfig as i64,
+        &Constraint::new(0, 255),
+    )?;
     encoder.encode_constrained_whole_number(0, &Constraint::new(0, 2))?; // Criticality
     encoder.encode_constrained_whole_number(msg.sensing_type as i64, &Constraint::new(0, 7))?;
     encoder.encode_constrained_whole_number(msg.sensing_mode as i64, &Constraint::new(0, 4))?;
-    encoder.encode_constrained_whole_number(msg.bandwidth_mhz as i64, &Constraint::new(1, 10000))?;
-    encoder.encode_constrained_whole_number(msg.periodicity_ms as i64, &Constraint::new(1, 10000))?;
+    encoder
+        .encode_constrained_whole_number(msg.bandwidth_mhz as i64, &Constraint::new(1, 10000))?;
+    encoder
+        .encode_constrained_whole_number(msg.periodicity_ms as i64, &Constraint::new(1, 10000))?;
     encoder.encode_constrained_whole_number(msg.max_range_m as i64, &Constraint::new(1, 65535))?;
-    encoder.encode_constrained_whole_number(msg.resource_ratio_pct as i64, &Constraint::new(0, 100))?;
+    encoder
+        .encode_constrained_whole_number(msg.resource_ratio_pct as i64, &Constraint::new(0, 100))?;
     Ok(encoder.into_bytes().to_vec())
 }
 
 /// Encode an Energy Saving Indication.
 pub fn encode_energy_saving_indication(msg: &EnergySavingIndication) -> PerResult<Vec<u8>> {
     let mut encoder = AperEncoder::new();
-    encoder.encode_constrained_whole_number(XnApProcedure::EnergySavingIndication as i64, &Constraint::new(0, 255))?;
+    encoder.encode_constrained_whole_number(
+        XnApProcedure::EnergySavingIndication as i64,
+        &Constraint::new(0, 255),
+    )?;
     encoder.encode_constrained_whole_number(0, &Constraint::new(0, 2))?; // Criticality
     encoder.encode_unconstrained_whole_number(msg.cell_id as i64)?;
     encoder.encode_constrained_whole_number(msg.action as i64, &Constraint::new(0, 2))?;
     encoder.encode_unconstrained_whole_number(msg.duration_secs as i64)?;
-    encoder.encode_constrained_whole_number(msg.power_reduction_pct as i64, &Constraint::new(0, 100))?;
+    encoder.encode_constrained_whole_number(
+        msg.power_reduction_pct as i64,
+        &Constraint::new(0, 100),
+    )?;
     Ok(encoder.into_bytes().to_vec())
 }
 
@@ -257,7 +269,10 @@ pub fn encode_energy_saving_indication(msg: &EnergySavingIndication) -> PerResul
 pub fn encode_xn_handover_request(msg: &XnHandoverRequest) -> PerResult<Vec<u8>> {
     let mut encoder = AperEncoder::new();
     // Procedure code
-    encoder.encode_constrained_whole_number(XnApProcedure::HandoverPreparation as i64, &Constraint::new(0, 255))?;
+    encoder.encode_constrained_whole_number(
+        XnApProcedure::HandoverPreparation as i64,
+        &Constraint::new(0, 255),
+    )?;
     // Criticality: reject
     encoder.encode_constrained_whole_number(0, &Constraint::new(0, 2))?;
     // Source UE XnAP ID
@@ -272,7 +287,8 @@ pub fn encode_xn_handover_request(msg: &XnHandoverRequest) -> PerResult<Vec<u8>>
 /// Encode an XnAP Xn Setup Request.
 pub fn encode_xn_setup_request(msg: &XnSetupRequest) -> PerResult<Vec<u8>> {
     let mut encoder = AperEncoder::new();
-    encoder.encode_constrained_whole_number(XnApProcedure::XnSetup as i64, &Constraint::new(0, 255))?;
+    encoder
+        .encode_constrained_whole_number(XnApProcedure::XnSetup as i64, &Constraint::new(0, 255))?;
     encoder.encode_constrained_whole_number(0, &Constraint::new(0, 2))?; // Criticality
     encoder.encode_octet_string(&msg.global_ng_ran_node_id, None, None)?;
     encoder.encode_constrained_whole_number(msg.plmn_list.len() as i64, &Constraint::new(1, 12))?;
@@ -296,7 +312,9 @@ pub fn decode_xnap_procedure(data: &[u8]) -> PerResult<XnApProcedure> {
         50 => Ok(XnApProcedure::IsacSensingConfig),
         51 => Ok(XnApProcedure::EnergySavingIndication),
         52 => Ok(XnApProcedure::AiMlModelTransfer),
-        _ => Err(PerError::DecodeError(format!("Unknown XnAP procedure: {code}"))),
+        _ => Err(PerError::DecodeError(format!(
+            "Unknown XnAP procedure: {code}"
+        ))),
     }
 }
 
@@ -359,14 +377,17 @@ mod tests {
     #[test]
     fn test_xn_cause() {
         let cause = XnCause::RadioNetwork(XnCauseRadioNetwork::ReduceLoad);
-        assert!(matches!(cause, XnCause::RadioNetwork(XnCauseRadioNetwork::ReduceLoad)));
+        assert!(matches!(
+            cause,
+            XnCause::RadioNetwork(XnCauseRadioNetwork::ReduceLoad)
+        ));
     }
 
     #[test]
     fn test_isac_sensing_config_encode_decode() {
         let msg = IsacSensingConfigRequest {
-            sensing_type: 0,   // TargetDetection
-            sensing_mode: 0,   // Monostatic
+            sensing_type: 0, // TargetDetection
+            sensing_mode: 0, // Monostatic
             bandwidth_mhz: 100,
             periodicity_ms: 100,
             max_range_m: 200,

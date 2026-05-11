@@ -59,7 +59,9 @@ pub fn nssf_nnrf_handle_nf_discover(
     for profile in &nf_profiles {
         log::debug!(
             "  NF Instance: {} (type={}, status={})",
-            profile.nf_instance_id, profile.nf_type, profile.nf_status
+            profile.nf_instance_id,
+            profile.nf_type,
+            profile.nf_status
         );
     }
 
@@ -67,7 +69,10 @@ pub fn nssf_nnrf_handle_nf_discover(
 }
 
 /// Select best NF instance from discovery results
-pub fn select_nf_instance<'a>(profiles: &'a [NfProfile], service_name: &str) -> Option<&'a NfProfile> {
+pub fn select_nf_instance<'a>(
+    profiles: &'a [NfProfile],
+    service_name: &str,
+) -> Option<&'a NfProfile> {
     // Find profile with the requested service
     for profile in profiles {
         if profile.nf_status != "REGISTERED" {
@@ -88,10 +93,15 @@ pub fn select_nf_instance<'a>(profiles: &'a [NfProfile], service_name: &str) -> 
 /// Build NRF URI from NF profile
 pub fn build_nrf_uri(profile: &NfProfile, service_name: &str) -> Option<String> {
     // Find the service
-    let service = profile.nf_services.iter().find(|s| s.service_name == service_name)?;
+    let service = profile
+        .nf_services
+        .iter()
+        .find(|s| s.service_name == service_name)?;
 
     let scheme = &service.scheme;
-    let port = service.port.unwrap_or(if scheme == "https" { 443 } else { 80 });
+    let port = service
+        .port
+        .unwrap_or(if scheme == "https" { 443 } else { 80 });
 
     // Prefer FQDN, then IPv4, then IPv6
     let host = if let Some(ref fqdn) = service.fqdn {

@@ -2,9 +2,9 @@
 //!
 //! Based on 3GPP TS 24.501 Section 9.11
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use crate::error::{NasError, NasResult};
 use crate::common::types::*;
+use crate::error::{NasError, NasResult};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// 5GMM capability (TS 24.501 Section 9.11.3.1)
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -26,9 +26,15 @@ impl FiveGmmCapability {
     pub fn encode(&self, buf: &mut BytesMut) {
         buf.put_u8(self.length);
         let mut byte = 0u8;
-        if self.s1_mode { byte |= 0x01; }
-        if self.ho_attach { byte |= 0x02; }
-        if self.lpp { byte |= 0x04; }
+        if self.s1_mode {
+            byte |= 0x01;
+        }
+        if self.ho_attach {
+            byte |= 0x02;
+        }
+        if self.lpp {
+            byte |= 0x04;
+        }
         buf.put_u8(byte);
         buf.put_slice(&self.additional);
     }
@@ -36,7 +42,10 @@ impl FiveGmmCapability {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 2 {
-            return Err(NasError::BufferTooShort { expected: 2, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 2,
+                actual: buf.remaining(),
+            });
         }
         let length = buf.get_u8();
         let byte = buf.get_u8();
@@ -80,11 +89,17 @@ impl Nssai {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 1 {
-            return Err(NasError::BufferTooShort { expected: 1, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 1,
+                actual: buf.remaining(),
+            });
         }
         let length = buf.get_u8();
         if buf.remaining() < length as usize {
-            return Err(NasError::BufferTooShort { expected: length as usize, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: length as usize,
+                actual: buf.remaining(),
+            });
         }
 
         let mut s_nssai_list = Vec::new();
@@ -95,7 +110,10 @@ impl Nssai {
             s_nssai_list.push(s_nssai);
         }
 
-        Ok(Self { length, s_nssai_list })
+        Ok(Self {
+            length,
+            s_nssai_list,
+        })
     }
 }
 
@@ -137,7 +155,10 @@ impl PduSessionStatus {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 3 {
-            return Err(NasError::BufferTooShort { expected: 3, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 3,
+                actual: buf.remaining(),
+            });
         }
         let length = buf.get_u8();
         let psi = buf.get_u16();
@@ -168,7 +189,10 @@ impl UplinkDataStatus {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 3 {
-            return Err(NasError::BufferTooShort { expected: 3, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 3,
+                actual: buf.remaining(),
+            });
         }
         let length = buf.get_u8();
         let psi = buf.get_u16();
@@ -198,7 +222,10 @@ impl AllowedPduSessionStatus {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 3 {
-            return Err(NasError::BufferTooShort { expected: 3, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 3,
+                actual: buf.remaining(),
+            });
         }
         let length = buf.get_u8();
         let psi = buf.get_u16();
@@ -236,11 +263,17 @@ impl NasMessageContainer {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 2 {
-            return Err(NasError::BufferTooShort { expected: 2, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 2,
+                actual: buf.remaining(),
+            });
         }
         let length = buf.get_u16();
         if buf.remaining() < length as usize {
-            return Err(NasError::BufferTooShort { expected: length as usize, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: length as usize,
+                actual: buf.remaining(),
+            });
         }
         let data = buf.copy_to_bytes(length as usize).to_vec();
         Ok(Self { length, data })
@@ -290,11 +323,17 @@ impl PayloadContainer {
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 2 {
-            return Err(NasError::BufferTooShort { expected: 2, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 2,
+                actual: buf.remaining(),
+            });
         }
         let length = buf.get_u16();
         if buf.remaining() < length as usize {
-            return Err(NasError::BufferTooShort { expected: length as usize, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: length as usize,
+                actual: buf.remaining(),
+            });
         }
         let data = buf.copy_to_bytes(length as usize).to_vec();
         Ok(Self { length, data })
@@ -344,8 +383,12 @@ impl MicoIndication {
     /// Encode to half-byte
     pub fn encode(&self) -> u8 {
         let mut byte = 0u8;
-        if self.raai { byte |= 0x01; }
-        if self.sprti { byte |= 0x02; }
+        if self.raai {
+            byte |= 0x01;
+        }
+        if self.sprti {
+            byte |= 0x02;
+        }
         byte
     }
 
@@ -371,8 +414,12 @@ impl NetworkSlicingIndication {
     /// Encode to half-byte
     pub fn encode(&self) -> u8 {
         let mut byte = 0u8;
-        if self.nssci { byte |= 0x01; }
-        if self.dcni { byte |= 0x02; }
+        if self.nssci {
+            byte |= 0x01;
+        }
+        if self.dcni {
+            byte |= 0x02;
+        }
         byte
     }
 
@@ -463,7 +510,10 @@ pub struct QosRules {
 
 impl QosRules {
     pub fn new(data: Vec<u8>) -> Self {
-        Self { length: data.len() as u16, data }
+        Self {
+            length: data.len() as u16,
+            data,
+        }
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
@@ -473,11 +523,17 @@ impl QosRules {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 2 {
-            return Err(NasError::BufferTooShort { expected: 2, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 2,
+                actual: buf.remaining(),
+            });
         }
         let length = buf.get_u16();
         if buf.remaining() < length as usize {
-            return Err(NasError::BufferTooShort { expected: length as usize, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: length as usize,
+                actual: buf.remaining(),
+            });
         }
         let data = buf.copy_to_bytes(length as usize).to_vec();
         Ok(Self { length, data })
@@ -493,7 +549,10 @@ pub struct QosFlowDescriptions {
 
 impl QosFlowDescriptions {
     pub fn new(data: Vec<u8>) -> Self {
-        Self { length: data.len() as u16, data }
+        Self {
+            length: data.len() as u16,
+            data,
+        }
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
@@ -503,11 +562,17 @@ impl QosFlowDescriptions {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 2 {
-            return Err(NasError::BufferTooShort { expected: 2, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 2,
+                actual: buf.remaining(),
+            });
         }
         let length = buf.get_u16();
         if buf.remaining() < length as usize {
-            return Err(NasError::BufferTooShort { expected: length as usize, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: length as usize,
+                actual: buf.remaining(),
+            });
         }
         let data = buf.copy_to_bytes(length as usize).to_vec();
         Ok(Self { length, data })
@@ -535,7 +600,10 @@ impl SessionAmbr {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 7 {
-            return Err(NasError::BufferTooShort { expected: 7, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 7,
+                actual: buf.remaining(),
+            });
         }
         let length = buf.get_u8();
         let dl_unit = buf.get_u8();
@@ -545,7 +613,13 @@ impl SessionAmbr {
         if length > 6 {
             buf.advance((length - 6) as usize);
         }
-        Ok(Self { length, dl_unit, dl_value, ul_unit, ul_value })
+        Ok(Self {
+            length,
+            dl_unit,
+            dl_value,
+            ul_unit,
+            ul_value,
+        })
     }
 }
 
@@ -566,11 +640,17 @@ impl PduAddress {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 2 {
-            return Err(NasError::BufferTooShort { expected: 2, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 2,
+                actual: buf.remaining(),
+            });
         }
         let length = buf.get_u8() as usize;
         if buf.remaining() < length {
-            return Err(NasError::BufferTooShort { expected: length, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: length,
+                actual: buf.remaining(),
+            });
         }
         let pdu_session_type = buf.get_u8() & 0x07;
         let address = if length > 1 {
@@ -578,7 +658,10 @@ impl PduAddress {
         } else {
             Vec::new()
         };
-        Ok(Self { pdu_session_type, address })
+        Ok(Self {
+            pdu_session_type,
+            address,
+        })
     }
 }
 
@@ -606,13 +689,21 @@ impl AiMlCapability {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 4 {
-            return Err(NasError::BufferTooShort { expected: 4, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 4,
+                actual: buf.remaining(),
+            });
         }
         let length = buf.get_u8() as usize;
         let capability_flags = buf.get_u8();
         let max_model_size_kb = buf.get_u16();
-        if length > 3 { buf.advance(length - 3); }
-        Ok(Self { capability_flags, max_model_size_kb })
+        if length > 3 {
+            buf.advance(length - 3);
+        }
+        Ok(Self {
+            capability_flags,
+            max_model_size_kb,
+        })
     }
 }
 
@@ -637,14 +728,23 @@ impl IsacParameter {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 4 {
-            return Err(NasError::BufferTooShort { expected: 4, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 4,
+                actual: buf.remaining(),
+            });
         }
         let length = buf.get_u8() as usize;
         let mode_flags = buf.get_u8();
         let sensing_resolution = buf.get_u8();
         let max_sensing_range = buf.get_u8();
-        if length > 3 { buf.advance(length - 3); }
-        Ok(Self { mode_flags, sensing_resolution, max_sensing_range })
+        if length > 3 {
+            buf.advance(length - 3);
+        }
+        Ok(Self {
+            mode_flags,
+            sensing_resolution,
+            max_sensing_range,
+        })
     }
 }
 
@@ -666,13 +766,21 @@ impl SemanticCommParameter {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 3 {
-            return Err(NasError::BufferTooShort { expected: 3, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 3,
+                actual: buf.remaining(),
+            });
         }
         let length = buf.get_u8() as usize;
         let capability_flags = buf.get_u8();
         let codec_type = buf.get_u8();
-        if length > 2 { buf.advance(length - 2); }
-        Ok(Self { capability_flags, codec_type })
+        if length > 2 {
+            buf.advance(length - 2);
+        }
+        Ok(Self {
+            capability_flags,
+            codec_type,
+        })
     }
 }
 
@@ -697,14 +805,23 @@ impl SubThzBandParameter {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 5 {
-            return Err(NasError::BufferTooShort { expected: 5, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 5,
+                actual: buf.remaining(),
+            });
         }
         let length = buf.get_u8() as usize;
         let band_flags = buf.get_u8();
         let max_bandwidth_mhz = buf.get_u16();
         let beam_tracking_interval_ms = buf.get_u8();
-        if length > 4 { buf.advance(length - 4); }
-        Ok(Self { band_flags, max_bandwidth_mhz, beam_tracking_interval_ms })
+        if length > 4 {
+            buf.advance(length - 4);
+        }
+        Ok(Self {
+            band_flags,
+            max_bandwidth_mhz,
+            beam_tracking_interval_ms,
+        })
     }
 }
 
@@ -726,13 +843,21 @@ impl NtnTimingAdvance {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 6 {
-            return Err(NasError::BufferTooShort { expected: 6, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 6,
+                actual: buf.remaining(),
+            });
         }
         let length = buf.get_u8() as usize;
         let timing_advance = buf.get_u32();
         let flags = buf.get_u8();
-        if length > 5 { buf.advance(length - 5); }
-        Ok(Self { timing_advance, ta_valid: (flags & 0x01) != 0 })
+        if length > 5 {
+            buf.advance(length - 5);
+        }
+        Ok(Self {
+            timing_advance,
+            ta_valid: (flags & 0x01) != 0,
+        })
     }
 }
 
@@ -757,13 +882,22 @@ impl NtnAccessBarring {
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
         if buf.remaining() < 6 {
-            return Err(NasError::BufferTooShort { expected: 6, actual: buf.remaining() });
+            return Err(NasError::BufferTooShort {
+                expected: 6,
+                actual: buf.remaining(),
+            });
         }
         let length = buf.get_u8() as usize;
         let barring_factor = buf.get_u8();
         let barring_time_seconds = buf.get_u16();
         let ac_barring_flags = buf.get_u16();
-        if length > 5 { buf.advance(length - 5); }
-        Ok(Self { barring_factor, barring_time_seconds, ac_barring_flags })
+        if length > 5 {
+            buf.advance(length - 5);
+        }
+        Ok(Self {
+            barring_factor,
+            barring_time_seconds,
+            ac_barring_flags,
+        })
     }
 }

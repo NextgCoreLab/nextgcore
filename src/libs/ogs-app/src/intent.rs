@@ -291,20 +291,38 @@ impl IntentTranslator {
         if let Some(slice) = &intent.slice {
             match slice {
                 SliceIntent::EMbb => {
-                    config.slice_config.insert("sst".to_string(), "1".to_string());
+                    config
+                        .slice_config
+                        .insert("sst".to_string(), "1".to_string());
                     config.qos_params.insert("5qi".to_string(), "9".to_string());
-                    config.qos_params.insert("target_throughput".to_string(), "1000".to_string());
+                    config
+                        .qos_params
+                        .insert("target_throughput".to_string(), "1000".to_string());
                 }
                 SliceIntent::URLlc => {
-                    config.slice_config.insert("sst".to_string(), "2".to_string());
-                    config.qos_params.insert("5qi".to_string(), "82".to_string());
-                    config.qos_params.insert("target_latency".to_string(), "1".to_string());
-                    config.qos_params.insert("reliability".to_string(), "99.999".to_string());
+                    config
+                        .slice_config
+                        .insert("sst".to_string(), "2".to_string());
+                    config
+                        .qos_params
+                        .insert("5qi".to_string(), "82".to_string());
+                    config
+                        .qos_params
+                        .insert("target_latency".to_string(), "1".to_string());
+                    config
+                        .qos_params
+                        .insert("reliability".to_string(), "99.999".to_string());
                 }
                 SliceIntent::MMtc => {
-                    config.slice_config.insert("sst".to_string(), "3".to_string());
-                    config.qos_params.insert("5qi".to_string(), "70".to_string());
-                    config.qos_params.insert("max_devices".to_string(), "1000000".to_string());
+                    config
+                        .slice_config
+                        .insert("sst".to_string(), "3".to_string());
+                    config
+                        .qos_params
+                        .insert("5qi".to_string(), "70".to_string());
+                    config
+                        .qos_params
+                        .insert("max_devices".to_string(), "1000000".to_string());
                 }
                 SliceIntent::Custom(name) => {
                     config.slice_config.insert("type".to_string(), name.clone());
@@ -315,47 +333,90 @@ impl IntentTranslator {
         // Translate QoS intent
         if let Some(qos) = &intent.qos {
             if let Some(latency) = qos.target_latency_ms {
-                config.qos_params.insert("max_latency_ms".to_string(), latency.to_string());
+                config
+                    .qos_params
+                    .insert("max_latency_ms".to_string(), latency.to_string());
             }
             if let Some(throughput) = qos.target_throughput_mbps {
-                config.qos_params.insert("min_throughput_mbps".to_string(), throughput.to_string());
+                config
+                    .qos_params
+                    .insert("min_throughput_mbps".to_string(), throughput.to_string());
             }
             if let Some(reliability) = qos.target_reliability_pct {
-                config.qos_params.insert("reliability_pct".to_string(), reliability.to_string());
+                config
+                    .qos_params
+                    .insert("reliability_pct".to_string(), reliability.to_string());
             }
             if let Some(jitter) = qos.jitter_tolerance_ms {
-                config.qos_params.insert("max_jitter_ms".to_string(), jitter.to_string());
+                config
+                    .qos_params
+                    .insert("max_jitter_ms".to_string(), jitter.to_string());
             }
             if let Some(loss) = qos.packet_loss_tolerance_pct {
-                config.qos_params.insert("max_packet_loss_pct".to_string(), loss.to_string());
+                config
+                    .qos_params
+                    .insert("max_packet_loss_pct".to_string(), loss.to_string());
             }
         }
 
         // Translate security intent
         if let Some(security) = &intent.security {
-            config.security_params.insert("e2e_encryption".to_string(), security.require_e2e_encryption.to_string());
-            config.security_params.insert("pqc_enabled".to_string(), security.require_pqc.to_string());
-            config.security_params.insert("zero_trust".to_string(), security.require_zero_trust.to_string());
-            config.security_params.insert("auth_strength".to_string(), security.auth_strength.to_string());
-            config.security_params.insert("monitoring".to_string(), security.enable_monitoring.to_string());
+            config.security_params.insert(
+                "e2e_encryption".to_string(),
+                security.require_e2e_encryption.to_string(),
+            );
+            config
+                .security_params
+                .insert("pqc_enabled".to_string(), security.require_pqc.to_string());
+            config.security_params.insert(
+                "zero_trust".to_string(),
+                security.require_zero_trust.to_string(),
+            );
+            config.security_params.insert(
+                "auth_strength".to_string(),
+                security.auth_strength.to_string(),
+            );
+            config.security_params.insert(
+                "monitoring".to_string(),
+                security.enable_monitoring.to_string(),
+            );
         }
 
         // Translate energy intent
         if let Some(energy) = &intent.energy {
             if let Some(efficiency) = energy.target_efficiency {
-                config.energy_params.insert("target_ops_per_watt".to_string(), efficiency.to_string());
+                config
+                    .energy_params
+                    .insert("target_ops_per_watt".to_string(), efficiency.to_string());
             }
-            config.energy_params.insert("power_saving".to_string(), energy.power_saving_enabled.to_string());
-            config.energy_params.insert("green_routing_pref".to_string(), energy.green_routing_preference.to_string());
-            config.energy_params.insert("dynamic_scaling".to_string(), energy.allow_dynamic_scaling.to_string());
+            config.energy_params.insert(
+                "power_saving".to_string(),
+                energy.power_saving_enabled.to_string(),
+            );
+            config.energy_params.insert(
+                "green_routing_pref".to_string(),
+                energy.green_routing_preference.to_string(),
+            );
+            config.energy_params.insert(
+                "dynamic_scaling".to_string(),
+                energy.allow_dynamic_scaling.to_string(),
+            );
         }
 
         // Translate AI/ML intent
         if let Some(ai_ml) = &intent.ai_ml {
-            config.nf_params.insert("ai_optimization".to_string(), ai_ml.enable_ai_optimization.to_string());
-            config.nf_params.insert("predictive_analytics".to_string(), ai_ml.enable_predictive_analytics.to_string());
+            config.nf_params.insert(
+                "ai_optimization".to_string(),
+                ai_ml.enable_ai_optimization.to_string(),
+            );
+            config.nf_params.insert(
+                "predictive_analytics".to_string(),
+                ai_ml.enable_predictive_analytics.to_string(),
+            );
             if let Some(locality) = &ai_ml.data_locality {
-                config.nf_params.insert("data_locality".to_string(), locality.clone());
+                config
+                    .nf_params
+                    .insert("data_locality".to_string(), locality.clone());
             }
         }
 
@@ -370,7 +431,9 @@ impl IntentTranslator {
     /// Translate multiple intents and merge configurations
     pub fn translate_multi(&self, intents: &[NetworkIntent]) -> IntentResult<DerivedConfig> {
         if intents.is_empty() {
-            return Err(IntentError::InvalidIntent("No intents provided".to_string()));
+            return Err(IntentError::InvalidIntent(
+                "No intents provided".to_string(),
+            ));
         }
 
         // Sort by priority
@@ -431,8 +494,7 @@ mod tests {
             packet_loss_tolerance_pct: Some(0.1),
         };
 
-        let intent = NetworkIntent::new("intent-1", "QoS Test")
-            .with_qos(qos.clone());
+        let intent = NetworkIntent::new("intent-1", "QoS Test").with_qos(qos.clone());
 
         assert!(intent.qos.is_some());
         assert_eq!(intent.qos.unwrap().target_latency_ms, qos.target_latency_ms);
@@ -440,28 +502,26 @@ mod tests {
 
     #[test]
     fn test_intent_validation_success() {
-        let intent = NetworkIntent::new("intent-1", "Valid Intent")
-            .with_qos(QosIntent {
-                target_latency_ms: Some(10),
-                target_throughput_mbps: Some(100),
-                target_reliability_pct: Some(99),
-                jitter_tolerance_ms: None,
-                packet_loss_tolerance_pct: Some(1.0),
-            });
+        let intent = NetworkIntent::new("intent-1", "Valid Intent").with_qos(QosIntent {
+            target_latency_ms: Some(10),
+            target_throughput_mbps: Some(100),
+            target_reliability_pct: Some(99),
+            jitter_tolerance_ms: None,
+            packet_loss_tolerance_pct: Some(1.0),
+        });
 
         assert!(intent.validate().is_ok());
     }
 
     #[test]
     fn test_intent_validation_invalid_reliability() {
-        let intent = NetworkIntent::new("intent-1", "Invalid Intent")
-            .with_qos(QosIntent {
-                target_latency_ms: None,
-                target_throughput_mbps: None,
-                target_reliability_pct: Some(150), // Invalid
-                jitter_tolerance_ms: None,
-                packet_loss_tolerance_pct: None,
-            });
+        let intent = NetworkIntent::new("intent-1", "Invalid Intent").with_qos(QosIntent {
+            target_latency_ms: None,
+            target_throughput_mbps: None,
+            target_reliability_pct: Some(150), // Invalid
+            jitter_tolerance_ms: None,
+            packet_loss_tolerance_pct: None,
+        });
 
         assert!(intent.validate().is_err());
     }
@@ -489,8 +549,7 @@ mod tests {
     #[test]
     fn test_intent_translation_embb() {
         let translator = IntentTranslator::new();
-        let intent = NetworkIntent::new("intent-1", "eMBB Slice")
-            .with_slice(SliceIntent::EMbb);
+        let intent = NetworkIntent::new("intent-1", "eMBB Slice").with_slice(SliceIntent::EMbb);
 
         let config = translator.translate(&intent).unwrap();
         assert_eq!(config.slice_config.get("sst"), Some(&"1".to_string()));
@@ -500,20 +559,25 @@ mod tests {
     #[test]
     fn test_intent_translation_urllc() {
         let translator = IntentTranslator::new();
-        let intent = NetworkIntent::new("intent-2", "URLLC Slice")
-            .with_slice(SliceIntent::URLlc);
+        let intent = NetworkIntent::new("intent-2", "URLLC Slice").with_slice(SliceIntent::URLlc);
 
         let config = translator.translate(&intent).unwrap();
         assert_eq!(config.slice_config.get("sst"), Some(&"2".to_string()));
-        assert_eq!(config.qos_params.get("target_latency"), Some(&"1".to_string()));
-        assert_eq!(config.qos_params.get("reliability"), Some(&"99.999".to_string()));
+        assert_eq!(
+            config.qos_params.get("target_latency"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            config.qos_params.get("reliability"),
+            Some(&"99.999".to_string())
+        );
     }
 
     #[test]
     fn test_intent_translation_with_security() {
         let translator = IntentTranslator::new();
-        let intent = NetworkIntent::new("intent-3", "Secure Service")
-            .with_security(SecurityIntent {
+        let intent =
+            NetworkIntent::new("intent-3", "Secure Service").with_security(SecurityIntent {
                 require_e2e_encryption: true,
                 require_pqc: true,
                 require_zero_trust: false,
@@ -522,9 +586,18 @@ mod tests {
             });
 
         let config = translator.translate(&intent).unwrap();
-        assert_eq!(config.security_params.get("e2e_encryption"), Some(&"true".to_string()));
-        assert_eq!(config.security_params.get("pqc_enabled"), Some(&"true".to_string()));
-        assert_eq!(config.security_params.get("auth_strength"), Some(&"5".to_string()));
+        assert_eq!(
+            config.security_params.get("e2e_encryption"),
+            Some(&"true".to_string())
+        );
+        assert_eq!(
+            config.security_params.get("pqc_enabled"),
+            Some(&"true".to_string())
+        );
+        assert_eq!(
+            config.security_params.get("auth_strength"),
+            Some(&"5".to_string())
+        );
     }
 
     #[test]
@@ -641,13 +714,16 @@ impl IntentLifecycleManager {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        let managed = self.intents.get_mut(id)
+        let managed = self
+            .intents
+            .get_mut(id)
             .ok_or_else(|| IntentError::InvalidIntent(format!("Intent {id} not found")))?;
 
         if managed.state != IntentState::Pending && managed.state != IntentState::Suspended {
-            return Err(IntentError::InvalidIntent(
-                format!("Intent {id} is in state {:?}, cannot activate", managed.state),
-            ));
+            return Err(IntentError::InvalidIntent(format!(
+                "Intent {id} is in state {:?}, cannot activate",
+                managed.state
+            )));
         }
 
         let config = self.translator.translate(&managed.intent)?;
@@ -657,19 +733,23 @@ impl IntentLifecycleManager {
         self.total_activated += 1;
 
         // Safe: we just set derived_config above
-        Ok(self.intents[id].derived_config.as_ref()
+        Ok(self.intents[id]
+            .derived_config
+            .as_ref()
             .expect("value expected"))
     }
 
     /// Suspend an active intent.
     pub fn suspend(&mut self, id: &str) -> IntentResult<()> {
-        let managed = self.intents.get_mut(id)
+        let managed = self
+            .intents
+            .get_mut(id)
             .ok_or_else(|| IntentError::InvalidIntent(format!("Intent {id} not found")))?;
 
         if managed.state != IntentState::Active {
-            return Err(IntentError::InvalidIntent(
-                format!("Intent {id} is not Active, cannot suspend"),
-            ));
+            return Err(IntentError::InvalidIntent(format!(
+                "Intent {id} is not Active, cannot suspend"
+            )));
         }
 
         managed.state = IntentState::Suspended;
@@ -682,7 +762,9 @@ impl IntentLifecycleManager {
 
     /// Mark an intent as fulfilled.
     pub fn fulfill(&mut self, id: &str) -> IntentResult<()> {
-        let managed = self.intents.get_mut(id)
+        let managed = self
+            .intents
+            .get_mut(id)
             .ok_or_else(|| IntentError::InvalidIntent(format!("Intent {id} not found")))?;
 
         managed.state = IntentState::Fulfilled;
@@ -695,7 +777,9 @@ impl IntentLifecycleManager {
 
     /// Fail an intent with a reason.
     pub fn fail(&mut self, id: &str, reason: impl Into<String>) -> IntentResult<()> {
-        let managed = self.intents.get_mut(id)
+        let managed = self
+            .intents
+            .get_mut(id)
             .ok_or_else(|| IntentError::InvalidIntent(format!("Intent {id} not found")))?;
 
         managed.state = IntentState::Failed;
@@ -720,7 +804,8 @@ impl IntentLifecycleManager {
         let mut expired = 0;
         for managed in self.intents.values_mut() {
             if (managed.state == IntentState::Active || managed.state == IntentState::Pending)
-                && now - managed.created_at > self.default_ttl_secs {
+                && now - managed.created_at > self.default_ttl_secs
+            {
                 managed.state = IntentState::Expired;
                 managed.updated_at = now;
                 expired += 1;
@@ -766,8 +851,7 @@ mod lifecycle_tests {
     use super::*;
 
     fn make_intent(id: &str) -> NetworkIntent {
-        NetworkIntent::new(id, format!("Test intent {id}"))
-            .with_slice(SliceIntent::EMbb)
+        NetworkIntent::new(id, format!("Test intent {id}")).with_slice(SliceIntent::EMbb)
     }
 
     #[test]
@@ -814,7 +898,10 @@ mod lifecycle_tests {
 
         let managed = mgr.get(&id).unwrap();
         assert_eq!(managed.state, IntentState::Failed);
-        assert_eq!(managed.failure_reason.as_deref(), Some("Resource unavailable"));
+        assert_eq!(
+            managed.failure_reason.as_deref(),
+            Some("Resource unavailable")
+        );
     }
 
     #[test]
@@ -845,14 +932,13 @@ mod lifecycle_tests {
     #[test]
     fn test_invalid_submit() {
         let mut mgr = IntentLifecycleManager::new(0);
-        let bad_intent = NetworkIntent::new("bad", "Bad")
-            .with_qos(QosIntent {
-                target_latency_ms: None,
-                target_throughput_mbps: None,
-                target_reliability_pct: Some(200), // Invalid
-                jitter_tolerance_ms: None,
-                packet_loss_tolerance_pct: None,
-            });
+        let bad_intent = NetworkIntent::new("bad", "Bad").with_qos(QosIntent {
+            target_latency_ms: None,
+            target_throughput_mbps: None,
+            target_reliability_pct: Some(200), // Invalid
+            jitter_tolerance_ms: None,
+            packet_loss_tolerance_pct: None,
+        });
         assert!(mgr.submit(bad_intent).is_err());
     }
 }

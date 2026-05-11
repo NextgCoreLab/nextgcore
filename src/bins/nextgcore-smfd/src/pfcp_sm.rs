@@ -120,12 +120,8 @@ impl PfcpFsm {
                 log::debug!("Stopping association timer");
                 PfcpFsmResult::Handled
             }
-            SmfEventId::N4Timer => {
-                self.handle_n4_timer_will_associate(event)
-            }
-            SmfEventId::N4Message => {
-                self.handle_n4_message_will_associate(event)
-            }
+            SmfEventId::N4Timer => self.handle_n4_timer_will_associate(event),
+            SmfEventId::N4Message => self.handle_n4_message_will_associate(event),
             _ => {
                 log::warn!("PFCP WillAssociate: Unknown event {}", event.name());
                 PfcpFsmResult::Ignored
@@ -198,12 +194,8 @@ impl PfcpFsm {
                 // Stop no heartbeat timer
                 PfcpFsmResult::Handled
             }
-            SmfEventId::N4Message => {
-                self.handle_n4_message_associated(event)
-            }
-            SmfEventId::N4Timer => {
-                self.handle_n4_timer_associated(event)
-            }
+            SmfEventId::N4Message => self.handle_n4_message_associated(event),
+            SmfEventId::N4Timer => self.handle_n4_timer_associated(event),
             SmfEventId::N4NoHeartbeat => {
                 log::warn!("No heartbeat from UPF (pfcp_node_id={})", self.pfcp_node_id);
                 // Trigger UPF reselection
@@ -219,10 +211,7 @@ impl PfcpFsm {
     /// Handle N4 message events in associated state
     fn handle_n4_message_associated(&mut self, event: &SmfEvent) -> PfcpFsmResult {
         if let Some(ref pfcp) = event.pfcp {
-            log::debug!(
-                "N4 message in associated: xact_id={:?}",
-                pfcp.pfcp_xact_id
-            );
+            log::debug!("N4 message in associated: xact_id={:?}", pfcp.pfcp_xact_id);
             // Note: PFCP message type parsed and dispatched by pfcp_handler module
             // Heartbeat Request/Response -> restart no-heartbeat timer
             // Association Setup Request/Response -> log warning if already associated
@@ -274,7 +263,10 @@ impl PfcpFsm {
 
         match event.id {
             SmfEventId::FsmEntry => {
-                log::error!("PFCP in exception state (pfcp_node_id={})", self.pfcp_node_id);
+                log::error!(
+                    "PFCP in exception state (pfcp_node_id={})",
+                    self.pfcp_node_id
+                );
                 PfcpFsmResult::Handled
             }
             SmfEventId::FsmExit => PfcpFsmResult::Handled,

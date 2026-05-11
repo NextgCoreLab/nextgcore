@@ -456,9 +456,7 @@ pub fn build_ue_context_release_command(msg: &UeContextReleaseCommand) -> NgapRe
 }
 
 /// Build a UE Context Release Complete PDU
-pub fn build_ue_context_release_complete(
-    msg: &UeContextReleaseComplete,
-) -> NgapResult<Vec<u8>> {
+pub fn build_ue_context_release_complete(msg: &UeContextReleaseComplete) -> NgapResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)

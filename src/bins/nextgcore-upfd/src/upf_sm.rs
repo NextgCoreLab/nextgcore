@@ -60,7 +60,11 @@ impl UpfSmContext {
 
     /// Dispatch an event to the state machine
     pub fn dispatch(&mut self, event: &UpfEvent) -> UpfSmResult {
-        log::debug!("UPF SM: dispatch event {:?} in state {:?}", event.id, self.state);
+        log::debug!(
+            "UPF SM: dispatch event {:?} in state {:?}",
+            event.id,
+            self.state
+        );
 
         match self.state {
             UpfState::Initial => self.state_initial(event),
@@ -210,7 +214,7 @@ mod tests {
     fn test_upf_sm_init() {
         let mut sm = UpfSmContext::new();
         assert_eq!(sm.state, UpfState::Initial);
-        
+
         sm.init();
         assert_eq!(sm.state, UpfState::Initial);
     }
@@ -225,10 +229,10 @@ mod tests {
     #[test]
     fn test_upf_sm_initial_to_operational() {
         let mut sm = UpfSmContext::new();
-        
+
         let event = UpfEvent::entry();
         let result = sm.dispatch(&event);
-        
+
         assert_eq!(result, UpfSmResult::Transition(UpfState::Operational));
         assert_eq!(sm.state, UpfState::Operational);
     }
@@ -237,10 +241,10 @@ mod tests {
     fn test_upf_sm_operational_entry_exit() {
         let mut sm = UpfSmContext::new();
         sm.state = UpfState::Operational;
-        
+
         let entry = UpfEvent::entry();
         assert_eq!(sm.dispatch(&entry), UpfSmResult::Ok);
-        
+
         let exit = UpfEvent::exit();
         assert_eq!(sm.dispatch(&exit), UpfSmResult::Ok);
     }
@@ -249,10 +253,10 @@ mod tests {
     fn test_upf_sm_operational_n4_message() {
         let mut sm = UpfSmContext::new();
         sm.state = UpfState::Operational;
-        
+
         let event = UpfEvent::n4_message(1, 2, vec![0x01, 0x02]);
         let result = sm.dispatch(&event);
-        
+
         assert_eq!(result, UpfSmResult::DispatchToPfcp);
     }
 
@@ -260,10 +264,10 @@ mod tests {
     fn test_upf_sm_operational_n4_timer() {
         let mut sm = UpfSmContext::new();
         sm.state = UpfState::Operational;
-        
+
         let event = UpfEvent::n4_timer(crate::event::UpfTimerId::Association, Some(1));
         let result = sm.dispatch(&event);
-        
+
         assert_eq!(result, UpfSmResult::DispatchToPfcp);
     }
 
@@ -271,10 +275,10 @@ mod tests {
     fn test_upf_sm_operational_n4_no_heartbeat() {
         let mut sm = UpfSmContext::new();
         sm.state = UpfState::Operational;
-        
+
         let event = UpfEvent::n4_no_heartbeat(1);
         let result = sm.dispatch(&event);
-        
+
         assert_eq!(result, UpfSmResult::DispatchToPfcp);
     }
 
@@ -282,10 +286,10 @@ mod tests {
     fn test_upf_sm_final_state() {
         let mut sm = UpfSmContext::new();
         sm.state = UpfState::Final;
-        
+
         let event = UpfEvent::entry();
         let result = sm.dispatch(&event);
-        
+
         assert_eq!(result, UpfSmResult::Ok);
         assert!(sm.is_final());
     }
@@ -294,10 +298,10 @@ mod tests {
     fn test_upf_sm_exception_state() {
         let mut sm = UpfSmContext::new();
         sm.state = UpfState::Exception;
-        
+
         let event = UpfEvent::entry();
         let result = sm.dispatch(&event);
-        
+
         assert_eq!(result, UpfSmResult::Ok);
         assert!(sm.is_exception());
     }
@@ -305,17 +309,17 @@ mod tests {
     #[test]
     fn test_upf_sm_state_checks() {
         let mut sm = UpfSmContext::new();
-        
+
         sm.state = UpfState::Operational;
         assert!(sm.is_operational());
         assert!(!sm.is_final());
         assert!(!sm.is_exception());
-        
+
         sm.state = UpfState::Final;
         assert!(!sm.is_operational());
         assert!(sm.is_final());
         assert!(!sm.is_exception());
-        
+
         sm.state = UpfState::Exception;
         assert!(!sm.is_operational());
         assert!(!sm.is_final());

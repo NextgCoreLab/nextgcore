@@ -9,11 +9,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use nextgcore_hssd::{
-    hss_context_final, hss_context_init, hss_context_parse_config,
-    hss_cx_final, hss_cx_init,
-    hss_fd_final, hss_fd_init,
-    hss_s6a_final, hss_s6a_init,
-    hss_swx_final, hss_swx_init,
+    hss_context_final, hss_context_init, hss_context_parse_config, hss_cx_final, hss_cx_init,
+    hss_fd_final, hss_fd_init, hss_s6a_final, hss_s6a_init, hss_swx_final, hss_swx_init,
     HssSmContext,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -73,11 +70,10 @@ fn main() -> Result<()> {
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
-            .with_endpoint(
-                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
-            ),
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+        ),
     )
     .ok();
 
@@ -96,7 +92,11 @@ fn main() -> Result<()> {
     // Initialize HSS context
     // max_impi = max_ue, max_impu = max_ue * 4 (typical ratio)
     hss_context_init(args.max_ue, args.max_ue * 4);
-    log::info!("HSS context initialized (max_impi={}, max_impu={})", args.max_ue, args.max_ue * 4);
+    log::info!(
+        "HSS context initialized (max_impi={}, max_impu={})",
+        args.max_ue,
+        args.max_ue * 4
+    );
 
     // Parse configuration file
     if std::path::Path::new(&args.config).exists() {
@@ -281,12 +281,18 @@ mod tests {
     fn test_args_custom() {
         let args = Args::parse_from([
             "nextgcore-hssd",
-            "-c", "/custom/hss.yaml",
-            "-e", "debug",
-            "--diameter-config", "/custom/hss.conf",
-            "--max-ue", "2048",
-            "--db-uri", "mongodb://localhost:27017",
-            "--db-name", "custom_db",
+            "-c",
+            "/custom/hss.yaml",
+            "-e",
+            "debug",
+            "--diameter-config",
+            "/custom/hss.conf",
+            "--max-ue",
+            "2048",
+            "--db-uri",
+            "mongodb://localhost:27017",
+            "--db-name",
+            "custom_db",
         ]);
         assert_eq!(args.config, "/custom/hss.yaml");
         assert_eq!(args.log_level, "debug");
@@ -304,11 +310,7 @@ mod tests {
 
     #[test]
     fn test_args_log_options() {
-        let args = Args::parse_from([
-            "nextgcore-hssd",
-            "-l", "/var/log/hss.log",
-            "-m",
-        ]);
+        let args = Args::parse_from(["nextgcore-hssd", "-l", "/var/log/hss.log", "-m"]);
         assert_eq!(args.log_file, Some("/var/log/hss.log".to_string()));
         assert!(args.no_color);
     }

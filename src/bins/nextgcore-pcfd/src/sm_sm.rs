@@ -4,7 +4,7 @@
 
 use crate::context::{pcf_self, PcfSess, PcfUeSm};
 use crate::event::{PcfEvent, PcfEventId};
-use crate::sbi_response::{send_user_unknown_response, send_policy_context_denied_response};
+use crate::sbi_response::{send_policy_context_denied_response, send_user_unknown_response};
 
 /// PCF SM state type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,14 +80,27 @@ impl PcfSmSmContext {
 
         match event.id {
             PcfEventId::FsmEntry => {
-                log::debug!("[{}:{}] PCF SM entering deleted state", pcf_ue_sm.supi, sess.psi);
+                log::debug!(
+                    "[{}:{}] PCF SM entering deleted state",
+                    pcf_ue_sm.supi,
+                    sess.psi
+                );
                 // Note: Update metrics - decrement session count when metrics integration is enabled
             }
             PcfEventId::FsmExit => {
-                log::debug!("[{}:{}] PCF SM exiting deleted state", pcf_ue_sm.supi, sess.psi);
+                log::debug!(
+                    "[{}:{}] PCF SM exiting deleted state",
+                    pcf_ue_sm.supi,
+                    sess.psi
+                );
             }
             _ => {
-                log::error!("[{}:{}] Unknown event {} in deleted state", pcf_ue_sm.supi, sess.psi, event.name());
+                log::error!(
+                    "[{}:{}] Unknown event {} in deleted state",
+                    pcf_ue_sm.supi,
+                    sess.psi,
+                    event.name()
+                );
             }
         }
     }
@@ -103,14 +116,27 @@ impl PcfSmSmContext {
 
         match event.id {
             PcfEventId::FsmEntry => {
-                log::debug!("[{}:{}] PCF SM entering exception state", pcf_ue_sm.supi, sess.psi);
+                log::debug!(
+                    "[{}:{}] PCF SM entering exception state",
+                    pcf_ue_sm.supi,
+                    sess.psi
+                );
                 // Note: Update metrics - decrement session count when metrics integration is enabled
             }
             PcfEventId::FsmExit => {
-                log::debug!("[{}:{}] PCF SM exiting exception state", pcf_ue_sm.supi, sess.psi);
+                log::debug!(
+                    "[{}:{}] PCF SM exiting exception state",
+                    pcf_ue_sm.supi,
+                    sess.psi
+                );
             }
             _ => {
-                log::error!("[{}:{}] Unknown event {} in exception state", pcf_ue_sm.supi, sess.psi, event.name());
+                log::error!(
+                    "[{}:{}] Unknown event {} in exception state",
+                    pcf_ue_sm.supi,
+                    sess.psi,
+                    event.name()
+                );
             }
         }
     }
@@ -126,10 +152,18 @@ impl PcfSmSmContext {
 
         match event.id {
             PcfEventId::FsmEntry => {
-                log::debug!("[{}:{}] PCF SM entering operational state", pcf_ue_sm.supi, sess.psi);
+                log::debug!(
+                    "[{}:{}] PCF SM entering operational state",
+                    pcf_ue_sm.supi,
+                    sess.psi
+                );
             }
             PcfEventId::FsmExit => {
-                log::debug!("[{}:{}] PCF SM exiting operational state", pcf_ue_sm.supi, sess.psi);
+                log::debug!(
+                    "[{}:{}] PCF SM exiting operational state",
+                    pcf_ue_sm.supi,
+                    sess.psi
+                );
             }
             PcfEventId::SbiServer => {
                 self.handle_sbi_server_event(event, &sess, &pcf_ue_sm);
@@ -138,17 +172,31 @@ impl PcfSmSmContext {
                 self.handle_sbi_client_event(event, &sess, &pcf_ue_sm);
             }
             _ => {
-                log::error!("[{}:{}] Unknown event {}", pcf_ue_sm.supi, sess.psi, event.name());
+                log::error!(
+                    "[{}:{}] Unknown event {}",
+                    pcf_ue_sm.supi,
+                    sess.psi,
+                    event.name()
+                );
             }
         }
     }
 
-    fn handle_sbi_server_event(&mut self, event: &mut PcfEvent, sess: &PcfSess, pcf_ue_sm: &PcfUeSm) {
+    fn handle_sbi_server_event(
+        &mut self,
+        event: &mut PcfEvent,
+        sess: &PcfSess,
+        pcf_ue_sm: &PcfUeSm,
+    ) {
         let (stream_id, service_name, method, resource_components) = {
             let sbi = match &event.sbi {
                 Some(sbi) => sbi,
                 None => {
-                    log::error!("[{}:{}] No SBI data in server event", pcf_ue_sm.supi, sess.psi);
+                    log::error!(
+                        "[{}:{}] No SBI data in server event",
+                        pcf_ue_sm.supi,
+                        sess.psi
+                    );
                     return;
                 }
             };
@@ -156,7 +204,11 @@ impl PcfSmSmContext {
             let stream_id = match sbi.stream_id {
                 Some(id) => id,
                 None => {
-                    log::error!("[{}:{}] No stream ID in SBI event", pcf_ue_sm.supi, sess.psi);
+                    log::error!(
+                        "[{}:{}] No stream ID in SBI event",
+                        pcf_ue_sm.supi,
+                        sess.psi
+                    );
                     return;
                 }
             };
@@ -179,13 +231,31 @@ impl PcfSmSmContext {
 
         match service_name.as_str() {
             "npcf-smpolicycontrol" => {
-                self.handle_smpolicycontrol_request(sess, pcf_ue_sm, stream_id, &method, &resource_components);
+                self.handle_smpolicycontrol_request(
+                    sess,
+                    pcf_ue_sm,
+                    stream_id,
+                    &method,
+                    &resource_components,
+                );
             }
             "npcf-policyauthorization" => {
-                self.handle_policyauthorization_request(event, sess, pcf_ue_sm, stream_id, &method, &resource_components);
+                self.handle_policyauthorization_request(
+                    event,
+                    sess,
+                    pcf_ue_sm,
+                    stream_id,
+                    &method,
+                    &resource_components,
+                );
             }
             _ => {
-                log::error!("[{}:{}] Invalid API name [{}]", pcf_ue_sm.supi, sess.psi, service_name);
+                log::error!(
+                    "[{}:{}] Invalid API name [{}]",
+                    pcf_ue_sm.supi,
+                    sess.psi,
+                    service_name
+                );
             }
         }
     }
@@ -202,19 +272,37 @@ impl PcfSmSmContext {
 
         if resource1.is_none() {
             // POST /sm-policies - Create SM policy
-            log::debug!("[{}:{}] Handling SM policy create (stream={})", pcf_ue_sm.supi, sess.psi, stream_id);
+            log::debug!(
+                "[{}:{}] Handling SM policy create (stream={})",
+                pcf_ue_sm.supi,
+                sess.psi,
+                stream_id
+            );
             // Note: pcf_npcf_smpolicycontrol_handle_create builds SmPolicyDecision response
             // The handler is invoked via the direct HTTP path in main.rs
-            log::info!("[{}:{}] SM policy association created", pcf_ue_sm.supi, sess.psi);
+            log::info!(
+                "[{}:{}] SM policy association created",
+                pcf_ue_sm.supi,
+                sess.psi
+            );
         } else {
             // Operations on existing policy
             let resource2 = resource_components.get(2).map(|s| s.as_str());
             match resource2 {
                 Some("delete") => {
-                    log::debug!("[{}:{}] Handling SM policy delete (stream={})", pcf_ue_sm.supi, sess.psi, stream_id);
+                    log::debug!(
+                        "[{}:{}] Handling SM policy delete (stream={})",
+                        pcf_ue_sm.supi,
+                        sess.psi,
+                        stream_id
+                    );
                     // Note: pcf_npcf_smpolicycontrol_handle_delete handles policy termination
                     // The handler is invoked via the direct HTTP path in main.rs
-                    log::info!("[{}:{}] SM policy association deleted", pcf_ue_sm.supi, sess.psi);
+                    log::info!(
+                        "[{}:{}] SM policy association deleted",
+                        pcf_ue_sm.supi,
+                        sess.psi
+                    );
                 }
                 _ => {
                     log::error!("[{}:{}] Invalid HTTP URI", pcf_ue_sm.supi, sess.psi);
@@ -237,42 +325,80 @@ impl PcfSmSmContext {
         if resource1.is_some() {
             let resource2 = resource_components.get(2).map(|s| s.as_str());
             if let Some("delete") = resource2 {
-                log::debug!("[{}:{}] Handling policy authorization delete (stream={})", pcf_ue_sm.supi, sess.psi, stream_id);
+                log::debug!(
+                    "[{}:{}] Handling policy authorization delete (stream={})",
+                    pcf_ue_sm.supi,
+                    sess.psi,
+                    stream_id
+                );
                 // Note: pcf_npcf_policyauthorization_handle_delete handles AF session termination
                 // The handler is invoked via the direct HTTP path in main.rs
             } else {
                 match method {
                     "PATCH" => {
-                        log::debug!("[{}:{}] Handling policy authorization update (stream={})", pcf_ue_sm.supi, sess.psi, stream_id);
+                        log::debug!(
+                            "[{}:{}] Handling policy authorization update (stream={})",
+                            pcf_ue_sm.supi,
+                            sess.psi,
+                            stream_id
+                        );
                         // Note: pcf_npcf_policyauthorization_handle_update handles AF session modification
                         // The handler is invoked via the direct HTTP path in main.rs
                     }
                     _ => {
-                        log::error!("[{}:{}] Unknown method [{}]", pcf_ue_sm.supi, sess.psi, method);
+                        log::error!(
+                            "[{}:{}] Unknown method [{}]",
+                            pcf_ue_sm.supi,
+                            sess.psi,
+                            method
+                        );
                     }
                 }
             }
         } else {
             match method {
                 "POST" => {
-                    log::debug!("[{}:{}] Handling policy authorization create (stream={})", pcf_ue_sm.supi, sess.psi, stream_id);
+                    log::debug!(
+                        "[{}:{}] Handling policy authorization create (stream={})",
+                        pcf_ue_sm.supi,
+                        sess.psi,
+                        stream_id
+                    );
                     // Note: pcf_npcf_policyauthorization_handle_create handles AF session creation
                     // The handler is invoked via the direct HTTP path in main.rs
-                    log::info!("[{}:{}] Policy authorization created", pcf_ue_sm.supi, sess.psi);
+                    log::info!(
+                        "[{}:{}] Policy authorization created",
+                        pcf_ue_sm.supi,
+                        sess.psi
+                    );
                 }
                 _ => {
-                    log::error!("[{}:{}] Unknown method [{}]", pcf_ue_sm.supi, sess.psi, method);
+                    log::error!(
+                        "[{}:{}] Unknown method [{}]",
+                        pcf_ue_sm.supi,
+                        sess.psi,
+                        method
+                    );
                 }
             }
         }
     }
 
-    fn handle_sbi_client_event(&mut self, event: &mut PcfEvent, sess: &PcfSess, pcf_ue_sm: &PcfUeSm) {
+    fn handle_sbi_client_event(
+        &mut self,
+        event: &mut PcfEvent,
+        sess: &PcfSess,
+        pcf_ue_sm: &PcfUeSm,
+    ) {
         let (stream_id, service_name, method, resource_components, res_status) = {
             let sbi = match &event.sbi {
                 Some(sbi) => sbi,
                 None => {
-                    log::error!("[{}:{}] No SBI data in client event", pcf_ue_sm.supi, sess.psi);
+                    log::error!(
+                        "[{}:{}] No SBI data in client event",
+                        pcf_ue_sm.supi,
+                        sess.psi
+                    );
                     return;
                 }
             };
@@ -282,7 +408,11 @@ impl PcfSmSmContext {
             let message = match &sbi.message {
                 Some(msg) => msg,
                 None => {
-                    log::error!("[{}:{}] No message in SBI client event", pcf_ue_sm.supi, sess.psi);
+                    log::error!(
+                        "[{}:{}] No message in SBI client event",
+                        pcf_ue_sm.supi,
+                        sess.psi
+                    );
                     return;
                 }
             };
@@ -298,13 +428,31 @@ impl PcfSmSmContext {
 
         match service_name.as_str() {
             "nudr-dr" => {
-                self.handle_nudr_dr_response(sess, pcf_ue_sm, stream_id, &resource_components, res_status);
+                self.handle_nudr_dr_response(
+                    sess,
+                    pcf_ue_sm,
+                    stream_id,
+                    &resource_components,
+                    res_status,
+                );
             }
             "nbsf-management" => {
-                self.handle_nbsf_management_response(sess, pcf_ue_sm, stream_id, &method, &resource_components, res_status);
+                self.handle_nbsf_management_response(
+                    sess,
+                    pcf_ue_sm,
+                    stream_id,
+                    &method,
+                    &resource_components,
+                    res_status,
+                );
             }
             _ => {
-                log::error!("[{}:{}] Invalid API name [{}]", pcf_ue_sm.supi, sess.psi, service_name);
+                log::error!(
+                    "[{}:{}] Invalid API name [{}]",
+                    pcf_ue_sm.supi,
+                    sess.psi,
+                    service_name
+                );
             }
         }
     }
@@ -325,20 +473,39 @@ impl PcfSmSmContext {
                 let status = res_status.unwrap_or(0);
                 if status != 200 && status != 204 {
                     if status == 404 {
-                        log::warn!("[{}:{}] Cannot find SUPI [{}]", pcf_ue_sm.supi, sess.psi, status);
+                        log::warn!(
+                            "[{}:{}] Cannot find SUPI [{}]",
+                            pcf_ue_sm.supi,
+                            sess.psi,
+                            status
+                        );
                         send_user_unknown_response(0); // stream_id would be tracked from request
                     } else {
-                        log::error!("[{}:{}] HTTP response error [{}]", pcf_ue_sm.supi, sess.psi, status);
+                        log::error!(
+                            "[{}:{}] HTTP response error [{}]",
+                            pcf_ue_sm.supi,
+                            sess.psi,
+                            status
+                        );
                         send_policy_context_denied_response(0); // stream_id would be tracked from request
                     }
                     return;
                 }
                 // Note: pcf_nudr_dr_handle_query_sm_data processes SM subscription data from UDR
                 // The handler is invoked by the nudr_handler module
-                log::debug!("[{}:{}] NUDR DR SM data response received", pcf_ue_sm.supi, sess.psi);
+                log::debug!(
+                    "[{}:{}] NUDR DR SM data response received",
+                    pcf_ue_sm.supi,
+                    sess.psi
+                );
             }
             _ => {
-                log::error!("[{}:{}] Invalid resource name [{:?}]", pcf_ue_sm.supi, sess.psi, resource_components);
+                log::error!(
+                    "[{}:{}] Invalid resource name [{:?}]",
+                    pcf_ue_sm.supi,
+                    sess.psi,
+                    resource_components
+                );
             }
         }
     }
@@ -363,15 +530,29 @@ impl PcfSmSmContext {
                         "DELETE" => {
                             let status = res_status.unwrap_or(0);
                             if status != 204 {
-                                log::warn!("[{}:{}] HTTP response error [{}]", pcf_ue_sm.supi, sess.psi, status);
+                                log::warn!(
+                                    "[{}:{}] HTTP response error [{}]",
+                                    pcf_ue_sm.supi,
+                                    sess.psi,
+                                    status
+                                );
                             }
                             // Note: pcf_nbsf_management_handle_de_register handles BSF deregistration
                             // The binding is cleared from BSF when session terminates
-                            log::debug!("[{}:{}] BSF de-register response received", pcf_ue_sm.supi, sess.psi);
+                            log::debug!(
+                                "[{}:{}] BSF de-register response received",
+                                pcf_ue_sm.supi,
+                                sess.psi
+                            );
                             self.state = PcfSmState::Deleted;
                         }
                         _ => {
-                            log::error!("[{}:{}] Unknown method [{}]", pcf_ue_sm.supi, sess.psi, method);
+                            log::error!(
+                                "[{}:{}] Unknown method [{}]",
+                                pcf_ue_sm.supi,
+                                sess.psi,
+                                method
+                            );
                         }
                     }
                 } else {
@@ -382,22 +563,41 @@ impl PcfSmSmContext {
                             if status == 201 {
                                 // Note: pcf_nbsf_management_handle_register handles BSF registration
                                 // The binding is stored in BSF for PCF discovery
-                                log::debug!("[{}:{}] BSF register response received", pcf_ue_sm.supi, sess.psi);
+                                log::debug!(
+                                    "[{}:{}] BSF register response received",
+                                    pcf_ue_sm.supi,
+                                    sess.psi
+                                );
                             } else {
-                                log::error!("[{}:{}] HTTP response error [{}]", pcf_ue_sm.supi, sess.psi, status);
+                                log::error!(
+                                    "[{}:{}] HTTP response error [{}]",
+                                    pcf_ue_sm.supi,
+                                    sess.psi,
+                                    status
+                                );
                                 // Still send SM policy response
                             }
                             // Note: SM policy create response is sent after BSF registration completes
                             // The response is built by npcf_handler and sent via HTTP server
                         }
                         _ => {
-                            log::error!("[{}:{}] Unknown method [{}]", pcf_ue_sm.supi, sess.psi, method);
+                            log::error!(
+                                "[{}:{}] Unknown method [{}]",
+                                pcf_ue_sm.supi,
+                                sess.psi,
+                                method
+                            );
                         }
                     }
                 }
             }
             _ => {
-                log::error!("[{}:{}] Invalid resource name [{:?}]", pcf_ue_sm.supi, sess.psi, resource_components);
+                log::error!(
+                    "[{}:{}] Invalid resource name [{:?}]",
+                    pcf_ue_sm.supi,
+                    sess.psi,
+                    resource_components
+                );
             }
         }
     }

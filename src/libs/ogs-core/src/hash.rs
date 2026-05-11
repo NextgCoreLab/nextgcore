@@ -39,14 +39,14 @@ impl OgsHash {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        
+
         let seed = ((now >> 32) ^ now) as u32;
-        
+
         let mut array = Vec::with_capacity(INITIAL_MAX + 1);
         for _ in 0..=INITIAL_MAX {
             array.push(None);
         }
-        
+
         OgsHash {
             array,
             count: 0,
@@ -66,7 +66,7 @@ impl OgsHash {
     /// The "times 33" hash algorithm (identical to hashfunc_default in C)
     fn hash_default(&self, key: &[u8], klen: &mut i32) -> u32 {
         let mut hash = self.seed;
-        
+
         if *klen == OGS_HASH_KEY_STRING {
             let mut len = 0i32;
             for &byte in key {
@@ -83,7 +83,7 @@ impl OgsHash {
                 hash = hash.wrapping_mul(33).wrapping_add(byte as u32);
             }
         }
-        
+
         hash
     }
 
@@ -126,10 +126,10 @@ impl OgsHash {
         let hash = self.compute_hash(key, &mut actual_klen);
         let index = (hash as usize) & self.max;
         let key_slice = &key[..actual_klen as usize];
-        
+
         // Search for existing entry
         let mut found = false;
-        
+
         {
             let mut current = self.array[index].as_mut();
             while let Some(entry) = current {
@@ -149,40 +149,42 @@ impl OgsHash {
                 current = entry.next.as_mut();
             }
         }
-        
+
         if found {
             // Delete entry - need to handle this separately due to borrow checker
             self.delete_entry(index, hash, actual_klen, key_slice);
             return;
         }
-        
+
         // If we didn't find an existing entry and val is Some, add new entry
-        if val.is_some() && !found {
-            // Check if we already handled it above
-            let mut current = self.array[index].as_ref();
-            let mut exists = false;
-            while let Some(entry) = current {
-                if entry.hash == hash && entry.klen == actual_klen && entry.key == key_slice {
-                    exists = true;
-                    break;
+        if !found {
+            if let Some(val) = val {
+                // Check if we already handled it above
+                let mut current = self.array[index].as_ref();
+                let mut exists = false;
+                while let Some(entry) = current {
+                    if entry.hash == hash && entry.klen == actual_klen && entry.key == key_slice {
+                        exists = true;
+                        break;
+                    }
+                    current = entry.next.as_ref();
                 }
-                current = entry.next.as_ref();
-            }
-            
-            if !exists {
-                let new_entry = Box::new(OgsHashEntry {
-                    next: self.array[index].take(),
-                    hash,
-                    key: key_slice.to_vec(),
-                    klen: actual_klen,
-                    val: val.expect("value expected"),
-                });
-                
-                self.array[index] = Some(new_entry);
-                self.count += 1;
-                
-                if self.count > self.max {
-                    self.expand_array();
+
+                if !exists {
+                    let new_entry = Box::new(OgsHashEntry {
+                        next: self.array[index].take(),
+                        hash,
+                        key: key_slice.to_vec(),
+                        klen: actual_klen,
+                        val,
+                    });
+
+                    self.array[index] = Some(new_entry);
+                    self.count += 1;
+
+                    if self.count > self.max {
+                        self.expand_array();
+                    }
                 }
             }
         }
@@ -191,7 +193,7 @@ impl OgsHash {
     /// Delete an entry from the hash table
     fn delete_entry(&mut self, index: usize, hash: u32, klen: i32, key: &[u8]) {
         let slot = &mut self.array[index];
-        
+
         // Check if it's the first entry
         if let Some(ref entry) = slot {
             if entry.hash == hash && entry.klen == klen && entry.key == key {
@@ -201,7 +203,7 @@ impl OgsHash {
                 return;
             }
         }
-        
+
         // Search in the chain
         let mut current = slot.as_mut();
         while let Some(entry) = current {
@@ -223,7 +225,7 @@ impl OgsHash {
         let hash = self.compute_hash_immut(key, &mut actual_klen);
         let index = (hash as usize) & self.max;
         let key_slice = &key[..actual_klen as usize];
-        
+
         let mut current = self.array[index].as_ref();
         while let Some(entry) = current {
             if entry.hash == hash && entry.klen == actual_klen && entry.key == key_slice {
@@ -231,7 +233,7 @@ impl OgsHash {
             }
             current = entry.next.as_ref();
         }
-        
+
         None
     }
 
@@ -241,7 +243,7 @@ impl OgsHash {
             hash_fn(key, klen)
         } else {
             let mut hash = self.seed;
-            
+
             if *klen == OGS_HASH_KEY_STRING {
                 let mut len = 0i32;
                 for &byte in key {
@@ -258,7 +260,7 @@ impl OgsHash {
                     hash = hash.wrapping_mul(33).wrapping_add(byte as u32);
                 }
             }
-            
+
             hash
         }
     }
@@ -269,7 +271,7 @@ impl OgsHash {
         let hash = self.compute_hash(key, &mut actual_klen);
         let index = (hash as usize) & self.max;
         let key_slice = &key[..actual_klen as usize];
-        
+
         // Search for existing entry
         let mut current = self.array[index].as_ref();
         while let Some(entry) = current {
@@ -281,7 +283,7 @@ impl OgsHash {
             }
             current = entry.next.as_ref();
         }
-        
+
         // Add new entry
         let new_entry = Box::new(OgsHashEntry {
             next: self.array[index].take(),
@@ -290,14 +292,14 @@ impl OgsHash {
             klen: actual_klen,
             val,
         });
-        
+
         self.array[index] = Some(new_entry);
         self.count += 1;
-        
+
         if self.count > self.max {
             self.expand_array();
         }
-        
+
         Some(val)
     }
 
@@ -373,7 +375,7 @@ impl<'a> Iterator for OgsHashIter<'a> {
 /// The default hash function exposed for external use (identical to ogs_hashfunc_default)
 pub fn ogs_hashfunc_default(key: &[u8], klen: &mut i32) -> u32 {
     let mut hash = 0u32;
-    
+
     if *klen == OGS_HASH_KEY_STRING {
         let mut len = 0i32;
         for &byte in key {
@@ -390,7 +392,7 @@ pub fn ogs_hashfunc_default(key: &[u8], klen: &mut i32) -> u32 {
             hash = hash.wrapping_mul(33).wrapping_add(byte as u32);
         }
     }
-    
+
     hash
 }
 
@@ -508,10 +510,10 @@ mod tests {
             fn prop_hash_deterministic(key in prop::collection::vec(any::<u8>(), 1..64)) {
                 let mut klen1 = key.len() as i32;
                 let mut klen2 = key.len() as i32;
-                
+
                 let hash1 = ogs_hashfunc_default(&key, &mut klen1);
                 let hash2 = ogs_hashfunc_default(&key, &mut klen2);
-                
+
                 prop_assert_eq!(hash1, hash2, "Hash should be deterministic");
                 prop_assert_eq!(klen1, klen2, "Key length should be consistent");
             }
@@ -525,10 +527,10 @@ mod tests {
             ) {
                 let mut ht = OgsHash::new();
                 let val_ptr = value as *mut ();
-                
+
                 ht.set(&key, key.len() as i32, Some(val_ptr));
                 let result = ht.get(&key, key.len() as i32);
-                
+
                 prop_assert!(result.is_some(), "Get should return Some after set");
                 prop_assert_eq!(result.unwrap(), val_ptr, "Get should return the set value");
             }
@@ -539,7 +541,7 @@ mod tests {
             fn prop_count_invariant(ops in prop::collection::vec(hash_op_strategy(), 0..50)) {
                 let mut ht = OgsHash::new();
                 let mut reference: HashMap<Vec<u8>, usize> = HashMap::new();
-                
+
                 for op in ops {
                     match op {
                         HashOp::Set(key, val) => {
@@ -556,10 +558,10 @@ mod tests {
                         }
                     }
                 }
-                
+
                 prop_assert_eq!(
-                    ht.count(), 
-                    reference.len(), 
+                    ht.count(),
+                    reference.len(),
                     "Count should match reference HashMap"
                 );
             }
@@ -573,14 +575,14 @@ mod tests {
             ) {
                 let mut ht = OgsHash::new();
                 let val_ptr = value as *mut ();
-                
+
                 // Set then delete
                 ht.set(&key, key.len() as i32, Some(val_ptr));
                 prop_assert_eq!(ht.count(), 1);
-                
+
                 ht.set(&key, key.len() as i32, None);
                 prop_assert_eq!(ht.count(), 0);
-                
+
                 let result = ht.get(&key, key.len() as i32);
                 prop_assert!(result.is_none(), "Get should return None after delete");
             }
@@ -596,22 +598,22 @@ mod tests {
             ) {
                 let mut ht = OgsHash::new();
                 let mut unique_keys: HashMap<Vec<u8>, usize> = HashMap::new();
-                
+
                 for (key, val) in entries {
                     let val_ptr = val as *mut ();
                     ht.set(&key, key.len() as i32, Some(val_ptr));
                     unique_keys.insert(key, val);
                 }
-                
+
                 let iter_count = ht.iter().count();
                 prop_assert_eq!(
-                    iter_count, 
-                    ht.count(), 
+                    iter_count,
+                    ht.count(),
                     "Iterator should visit count() entries"
                 );
                 prop_assert_eq!(
-                    iter_count, 
-                    unique_keys.len(), 
+                    iter_count,
+                    unique_keys.len(),
                     "Iterator count should match unique keys"
                 );
             }
@@ -625,13 +627,13 @@ mod tests {
                 val2 in any::<usize>()
             ) {
                 let mut ht = OgsHash::new();
-                
+
                 ht.set(&key, key.len() as i32, Some(val1 as *mut ()));
                 prop_assert_eq!(ht.count(), 1);
-                
+
                 ht.set(&key, key.len() as i32, Some(val2 as *mut ()));
                 prop_assert_eq!(ht.count(), 1, "Count should remain 1 after replace");
-                
+
                 let result = ht.get(&key, key.len() as i32);
                 prop_assert_eq!(result.unwrap(), val2 as *mut (), "Value should be updated");
             }
@@ -647,16 +649,16 @@ mod tests {
             ) {
                 let mut ht = OgsHash::new();
                 let keys: Vec<Vec<u8>> = entries.iter().map(|(k, _)| k.clone()).collect();
-                
+
                 for (key, val) in entries {
                     ht.set(&key, key.len() as i32, Some(val as *mut ()));
                 }
-                
+
                 ht.clear();
-                
+
                 prop_assert_eq!(ht.count(), 0, "Count should be 0 after clear");
                 prop_assert!(ht.is_empty(), "Table should be empty after clear");
-                
+
                 for key in keys {
                     let result = ht.get(&key, key.len() as i32);
                     prop_assert!(result.is_none(), "All gets should return None after clear");
@@ -672,12 +674,12 @@ mod tests {
                 val2 in any::<usize>()
             ) {
                 let mut ht = OgsHash::new();
-                
+
                 // First set
                 let result1 = ht.get_or_set(&key, key.len() as i32, val1 as *mut ());
                 prop_assert_eq!(result1.unwrap(), val1 as *mut ());
                 prop_assert_eq!(ht.count(), 1);
-                
+
                 // Second get_or_set should return first value
                 let result2 = ht.get_or_set(&key, key.len() as i32, val2 as *mut ());
                 prop_assert_eq!(result2.unwrap(), val1 as *mut (), "Should return existing value");
@@ -695,19 +697,19 @@ mod tests {
             ) {
                 let mut ht = OgsHash::new();
                 let mut reference: HashMap<Vec<u8>, usize> = HashMap::new();
-                
+
                 for (key, val) in &entries {
                     ht.set(key, key.len() as i32, Some(*val as *mut ()));
                     reference.insert(key.clone(), *val);
                 }
-                
+
                 // Verify all entries are retrievable
                 for (key, val) in &reference {
                     let result = ht.get(key, key.len() as i32);
                     prop_assert!(result.is_some(), "Entry should exist after expansion");
                     prop_assert_eq!(result.unwrap(), *val as *mut (), "Value should match");
                 }
-                
+
                 prop_assert_eq!(ht.count(), reference.len());
             }
         }
@@ -719,10 +721,10 @@ mod tests {
         let key = b"test_key";
         let value = 42usize;
         let val_ptr = &value as *const usize as *mut ();
-        
+
         ht.set(key, key.len() as i32, Some(val_ptr));
         assert_eq!(ht.count(), 1);
-        
+
         let result = ht.get(key, key.len() as i32);
         assert!(result.is_some());
         assert_eq!(result.unwrap(), val_ptr);
@@ -734,9 +736,9 @@ mod tests {
         let key = b"hello\0world";
         let value = 42usize;
         let val_ptr = &value as *const usize as *mut ();
-        
+
         ht.set(key, OGS_HASH_KEY_STRING, Some(val_ptr));
-        
+
         let result = ht.get(b"hello\0", OGS_HASH_KEY_STRING);
         assert!(result.is_some());
     }
@@ -746,10 +748,10 @@ mod tests {
         let key = b"test";
         let mut klen = key.len() as i32;
         let hash1 = ogs_hashfunc_default(key, &mut klen);
-        
+
         let mut klen2 = key.len() as i32;
         let hash2 = ogs_hashfunc_default(key, &mut klen2);
-        
+
         assert_eq!(hash1, hash2);
         assert_eq!(klen, klen2);
     }

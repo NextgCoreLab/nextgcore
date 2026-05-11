@@ -7,8 +7,8 @@
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
 // ============================================================================
 // Item #199: IPv6 Dual-Stack Address Allocation
@@ -53,15 +53,24 @@ pub struct UeAddress {
 
 impl UeAddress {
     pub fn ipv4_only(addr: Ipv4Addr) -> Self {
-        Self { ipv4: Some(addr), ipv6_prefix: None }
+        Self {
+            ipv4: Some(addr),
+            ipv6_prefix: None,
+        }
     }
 
     pub fn ipv6_only(prefix_len: u8, addr: Ipv6Addr) -> Self {
-        Self { ipv4: None, ipv6_prefix: Some((prefix_len, addr)) }
+        Self {
+            ipv4: None,
+            ipv6_prefix: Some((prefix_len, addr)),
+        }
     }
 
     pub fn dual_stack(ipv4: Ipv4Addr, prefix_len: u8, ipv6: Ipv6Addr) -> Self {
-        Self { ipv4: Some(ipv4), ipv6_prefix: Some((prefix_len, ipv6)) }
+        Self {
+            ipv4: Some(ipv4),
+            ipv6_prefix: Some((prefix_len, ipv6)),
+        }
     }
 
     pub fn is_dual_stack(&self) -> bool {
@@ -95,8 +104,10 @@ impl Ipv6PrefixPool {
     /// Creates default pool: fd00:cafe::/32 → /64 prefixes
     pub fn default_pool() -> Self {
         let mut base = [0u8; 16];
-        base[0] = 0xfd; base[1] = 0x00;
-        base[2] = 0xca; base[3] = 0xfe;
+        base[0] = 0xfd;
+        base[1] = 0x00;
+        base[2] = 0xca;
+        base[3] = 0xfe;
         Self::new(base, 32, 64)
     }
 
@@ -136,7 +147,7 @@ impl Ipv4Pool {
     /// Reserves .0.0 (network) and .0.1 (gateway).
     pub fn new(base_a: u8, base_b: u8) -> Self {
         let pool_size: u32 = 65536; // /16 = 2^16 addresses
-        let bitmap_words = ((pool_size + 63) / 64) as usize;
+        let bitmap_words = pool_size.div_ceil(64) as usize;
         let pool = Self {
             base: [base_a, base_b, 0, 0],
             pool_size,
@@ -217,7 +228,8 @@ impl Ipv4Pool {
 
     /// Number of available addresses in the pool.
     pub fn available_count(&self) -> u32 {
-        self.pool_size.saturating_sub(self.allocated_count.load(Ordering::Relaxed))
+        self.pool_size
+            .saturating_sub(self.allocated_count.load(Ordering::Relaxed))
     }
 }
 
@@ -240,33 +252,35 @@ impl DualStackAllocator {
     /// Allocates address based on PDU session type
     pub fn allocate(&self, pdu_type: PduSessionType) -> UeAddress {
         match pdu_type {
-            PduSessionType::Ipv4 => {
-                match self.ipv4_pool.allocate() {
-                    Some(addr) => UeAddress::ipv4_only(addr),
-                    None => {
-                        log::error!("IPv4 pool exhausted");
-                        UeAddress { ipv4: None, ipv6_prefix: None }
+            PduSessionType::Ipv4 => match self.ipv4_pool.allocate() {
+                Some(addr) => UeAddress::ipv4_only(addr),
+                None => {
+                    log::error!("IPv4 pool exhausted");
+                    UeAddress {
+                        ipv4: None,
+                        ipv6_prefix: None,
                     }
                 }
-            }
+            },
             PduSessionType::Ipv6 => {
                 let (prefix_len, addr) = self.ipv6_pool.allocate();
                 UeAddress::ipv6_only(prefix_len, addr)
             }
-            PduSessionType::Ipv4v6 => {
-                match self.ipv4_pool.allocate() {
-                    Some(ipv4) => {
-                        let (prefix_len, ipv6) = self.ipv6_pool.allocate();
-                        UeAddress::dual_stack(ipv4, prefix_len, ipv6)
-                    }
-                    None => {
-                        log::error!("IPv4 pool exhausted for dual-stack");
-                        let (prefix_len, addr) = self.ipv6_pool.allocate();
-                        UeAddress::ipv6_only(prefix_len, addr)
-                    }
+            PduSessionType::Ipv4v6 => match self.ipv4_pool.allocate() {
+                Some(ipv4) => {
+                    let (prefix_len, ipv6) = self.ipv6_pool.allocate();
+                    UeAddress::dual_stack(ipv4, prefix_len, ipv6)
                 }
-            }
-            _ => UeAddress { ipv4: None, ipv6_prefix: None },
+                None => {
+                    log::error!("IPv4 pool exhausted for dual-stack");
+                    let (prefix_len, addr) = self.ipv6_pool.allocate();
+                    UeAddress::ipv6_only(prefix_len, addr)
+                }
+            },
+            _ => UeAddress {
+                ipv4: None,
+                ipv6_prefix: None,
+            },
         }
     }
 
@@ -361,8 +375,9 @@ impl SscHandler {
             active: true,
         };
 
-        self.forwarding_tunnels.insert(session_id.to_string(), tunnel);
-        self.forwarding_tunnels.get(session_id).expect("value expected")
+        self.forwarding_tunnels
+            .entry(session_id.to_string())
+            .or_insert(tunnel)
     }
 
     /// Completes SSC Mode 3 handover (remove forwarding)
@@ -377,7 +392,10 @@ impl SscHandler {
 
     /// Returns number of active forwarding tunnels
     pub fn active_tunnel_count(&self) -> usize {
-        self.forwarding_tunnels.values().filter(|t| t.active).count()
+        self.forwarding_tunnels
+            .values()
+            .filter(|t| t.active)
+            .count()
     }
 }
 
@@ -448,13 +466,19 @@ impl EthernetPacketFilter {
     /// Checks if an Ethernet frame matches this filter
     pub fn matches_frame(&self, src_mac: &[u8; 6], dst_mac: &[u8; 6], ether_type: u16) -> bool {
         if let Some(ref filter_src) = self.source_mac {
-            if filter_src != src_mac { return false; }
+            if filter_src != src_mac {
+                return false;
+            }
         }
         if let Some(ref filter_dst) = self.dest_mac {
-            if filter_dst != dst_mac { return false; }
+            if filter_dst != dst_mac {
+                return false;
+            }
         }
         if let Some(filter_et) = self.ether_type {
-            if filter_et != ether_type { return false; }
+            if filter_et != ether_type {
+                return false;
+            }
         }
         true
     }
@@ -588,7 +612,9 @@ mod tests {
     fn test_ssc_mode3_forwarding() {
         let mut handler = SscHandler::new();
         let tunnel = handler.handle_mode3(
-            "sess-1", "upf-1", "upf-2",
+            "sess-1",
+            "upf-1",
+            "upf-2",
             Ipv4Addr::new(10, 0, 0, 1),
             Ipv4Addr::new(10, 0, 0, 2),
         );
@@ -602,7 +628,9 @@ mod tests {
     fn test_ssc_mode3_complete() {
         let mut handler = SscHandler::new();
         handler.handle_mode3(
-            "sess-1", "upf-1", "upf-2",
+            "sess-1",
+            "upf-1",
+            "upf-2",
             Ipv4Addr::new(10, 0, 0, 1),
             Ipv4Addr::new(10, 0, 0, 2),
         );
@@ -624,7 +652,10 @@ mod tests {
         let mut mgr = EthernetSessionManager::new();
         mgr.create_session(1, EthernetPduConfig::default());
         mgr.learn_mac([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], 1);
-        assert_eq!(mgr.lookup_session(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]), Some(1));
+        assert_eq!(
+            mgr.lookup_session(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]),
+            Some(1)
+        );
         assert_eq!(mgr.mac_table_size(), 1);
     }
 
@@ -693,7 +724,12 @@ mod tests {
         assert_eq!(octets[1], 45);
         // Must be .0.2 or higher, never .0.0 or .0.1
         let host = ((octets[2] as u16) << 8) | (octets[3] as u16);
-        assert!(host >= 2, "First allocation should skip reserved .0.0 and .0.1, got .{}.{}", octets[2], octets[3]);
+        assert!(
+            host >= 2,
+            "First allocation should skip reserved .0.0 and .0.1, got .{}.{}",
+            octets[2],
+            octets[3]
+        );
     }
 
     #[test]
@@ -715,7 +751,7 @@ mod tests {
     #[test]
     fn test_ipv4_pool_release_wrong_subnet_returns_false() {
         let pool = Ipv4Pool::default_pool(); // 10.45.0.0/16
-        // Try releasing an address from a different subnet
+                                             // Try releasing an address from a different subnet
         assert!(!pool.release(Ipv4Addr::new(192, 168, 1, 1)));
         assert!(!pool.release(Ipv4Addr::new(10, 46, 0, 2)));
     }

@@ -2,8 +2,8 @@
 //!
 //! Types and constants for GTPv2 protocol as specified in 3GPP TS 29.274.
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::error::{GtpError, GtpResult};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Maximum indirect tunnel count
 pub const GTP2_MAX_INDIRECT_TUNNEL: usize = 8;
@@ -39,7 +39,6 @@ impl TryFrom<u8> for Gtp2ExtensionHeaderType {
         }
     }
 }
-
 
 /// PDU Type for Extension Header
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,7 +230,6 @@ impl Gtp2Cause {
     }
 }
 
-
 /// GTPv2 Cause IE structure
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gtp2CauseIe {
@@ -340,7 +338,9 @@ impl TryFrom<u8> for Gtp2RatType {
             6 => Ok(Self::Eutran),
             7 => Ok(Self::Virtual),
             8 => Ok(Self::EutranNbIot),
-            _ => Err(GtpError::InvalidFormat(format!("Unknown RAT type: {value}"))),
+            _ => Err(GtpError::InvalidFormat(format!(
+                "Unknown RAT type: {value}"
+            ))),
         }
     }
 }
@@ -372,7 +372,6 @@ pub enum Gtp2NodeType {
     Mme = 0,
     Sgsn = 1,
 }
-
 
 /// PLMN ID (3 bytes)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -551,7 +550,8 @@ impl Gtp2FTeid {
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
-        let flags = ((self.ipv4 as u8) << 7) | ((self.ipv6 as u8) << 6) | (self.interface_type & 0x3F);
+        let flags =
+            ((self.ipv4 as u8) << 7) | ((self.ipv6 as u8) << 6) | (self.interface_type & 0x3F);
         buf.put_u8(flags);
         buf.put_u32(self.teid);
         if let Some(addr) = &self.ipv4_addr {

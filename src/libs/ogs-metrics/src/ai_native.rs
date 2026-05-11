@@ -459,7 +459,11 @@ impl SlaMonitor {
             let total = target.kpi_targets.len() as f64;
             let met = target.kpi_targets.iter().filter(|kt| kt.is_met()).count() as f64;
 
-            target.compliance_pct = if total > 0.0 { (met / total) * 100.0 } else { 100.0 };
+            target.compliance_pct = if total > 0.0 {
+                (met / total) * 100.0
+            } else {
+                100.0
+            };
             target.compliant = (target.compliance_pct - 100.0).abs() < f64::EPSILON;
 
             if !target.compliant {
@@ -524,8 +528,14 @@ mod tests {
 
     #[test]
     fn test_ai_metric_def() {
-        assert_eq!(NWDAF_INFERENCE_LATENCY.category, AiMetricCategory::NwdafAnalytics);
-        assert_eq!(FL_ROUND_PROGRESS.category, AiMetricCategory::FederatedLearning);
+        assert_eq!(
+            NWDAF_INFERENCE_LATENCY.category,
+            AiMetricCategory::NwdafAnalytics
+        );
+        assert_eq!(
+            FL_ROUND_PROGRESS.category,
+            AiMetricCategory::FederatedLearning
+        );
     }
 
     #[test]
@@ -730,7 +740,12 @@ impl AiPipelineTrace {
             return 0;
         }
         let earliest = self.segments.iter().map(|s| s.start_ms).min().unwrap_or(0);
-        let latest = self.segments.iter().map(|s| s.start_ms + s.duration_ms).max().unwrap_or(0);
+        let latest = self
+            .segments
+            .iter()
+            .map(|s| s.start_ms + s.duration_ms)
+            .max()
+            .unwrap_or(0);
         latest.saturating_sub(earliest)
     }
 
@@ -766,7 +781,11 @@ impl AiTraceCollector {
     }
 
     /// Start a new pipeline trace.
-    pub fn start_trace(&mut self, trace_id: impl Into<String>, pipeline_name: impl Into<String>) -> String {
+    pub fn start_trace(
+        &mut self,
+        trace_id: impl Into<String>,
+        pipeline_name: impl Into<String>,
+    ) -> String {
         let id: String = trace_id.into();
         let trace = AiPipelineTrace::new(id.clone(), pipeline_name);
         self.traces.insert(id.clone(), trace);
@@ -866,16 +885,19 @@ mod trace_tests {
         let trace_id = collector.start_trace("t1", "pipeline");
         assert_eq!(collector.active_count(), 1);
 
-        collector.add_segment(&trace_id, AiTraceSegment {
-            segment_id: "s1".into(),
-            parent_id: None,
-            nf_id: "amf-1".into(),
-            operation: "classify".into(),
-            start_ms: 100,
-            duration_ms: 20,
-            success: true,
-            attributes: HashMap::new(),
-        });
+        collector.add_segment(
+            &trace_id,
+            AiTraceSegment {
+                segment_id: "s1".into(),
+                parent_id: None,
+                nf_id: "amf-1".into(),
+                operation: "classify".into(),
+                start_ms: 100,
+                duration_ms: 20,
+                success: true,
+                attributes: HashMap::new(),
+            },
+        );
 
         collector.complete_trace(&trace_id);
         assert_eq!(collector.active_count(), 0);
@@ -986,7 +1008,10 @@ impl NwdafFeedbackManager {
         );
 
         // Store feedback
-        let history = self.feedback_history.entry(analytics_id.clone()).or_default();
+        let history = self
+            .feedback_history
+            .entry(analytics_id.clone())
+            .or_default();
         history.push(feedback.clone());
 
         // Limit history size
@@ -1013,7 +1038,10 @@ impl NwdafFeedbackManager {
         log::info!("[NWDAF Feedback] Adjusting model weights for analytics_id={analytics_id}");
 
         // Increment adjustment count
-        *self.adjustment_count.entry(analytics_id.to_string()).or_insert(0) += 1;
+        *self
+            .adjustment_count
+            .entry(analytics_id.to_string())
+            .or_insert(0) += 1;
 
         // In production, this would:
         // 1. Retrieve recent feedback for this model
@@ -1026,10 +1054,10 @@ impl NwdafFeedbackManager {
     fn update_accuracy(&mut self, analytics_id: &str) {
         if let Some(history) = self.feedback_history.get(analytics_id) {
             if !history.is_empty() {
-                let avg_accuracy = history.iter()
-                    .map(|f| f.accuracy)
-                    .sum::<f64>() / history.len() as f64;
-                self.model_accuracy.insert(analytics_id.to_string(), avg_accuracy);
+                let avg_accuracy =
+                    history.iter().map(|f| f.accuracy).sum::<f64>() / history.len() as f64;
+                self.model_accuracy
+                    .insert(analytics_id.to_string(), avg_accuracy);
             }
         }
     }
@@ -1041,24 +1069,25 @@ impl NwdafFeedbackManager {
 
     /// Get feedback count for a model
     pub fn feedback_count(&self, analytics_id: &str) -> usize {
-        self.feedback_history.get(analytics_id).map(|h| h.len()).unwrap_or(0)
+        self.feedback_history
+            .get(analytics_id)
+            .map(|h| h.len())
+            .unwrap_or(0)
     }
 
     /// Get adjustment count for a model
     pub fn adjustment_count(&self, analytics_id: &str) -> u64 {
-        self.adjustment_count.get(analytics_id).copied().unwrap_or(0)
+        self.adjustment_count
+            .get(analytics_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Get recent feedback for a model
     pub fn recent_feedback(&self, analytics_id: &str, limit: usize) -> Vec<&AnalyticsFeedback> {
         self.feedback_history
             .get(analytics_id)
-            .map(|history| {
-                history.iter()
-                    .rev()
-                    .take(limit)
-                    .collect()
-            })
+            .map(|history| history.iter().rev().take(limit).collect())
             .expect("value expected")
     }
 }
@@ -1227,7 +1256,11 @@ pub struct DistributedTrainingSession {
 
 impl DistributedTrainingSession {
     /// Create a new distributed training session
-    pub fn new(session_id: &str, model_id: &str, aggregation_method: FederatedAggregationMethod) -> Self {
+    pub fn new(
+        session_id: &str,
+        model_id: &str,
+        aggregation_method: FederatedAggregationMethod,
+    ) -> Self {
         Self {
             session_id: session_id.to_string(),
             model_id: model_id.to_string(),
@@ -1236,8 +1269,8 @@ impl DistributedTrainingSession {
             rounds: Vec::new(),
             current_round: 0,
             aggregation_method,
-            target_loss: 0.01, // Default convergence threshold
-            max_rounds: 100,   // Default max rounds
+            target_loss: 0.01,   // Default convergence threshold
+            max_rounds: 100,     // Default max rounds
             min_participants: 2, // Default minimum participants
             start_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1355,7 +1388,11 @@ impl DistributedTrainingSession {
             }
 
             // Update model version
-            self.model_version = format!("{}.{}.0", self.current_round / 10 + 1, self.current_round % 10);
+            self.model_version = format!(
+                "{}.{}.0",
+                self.current_round / 10 + 1,
+                self.current_round % 10
+            );
         }
     }
 

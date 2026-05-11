@@ -142,9 +142,7 @@ pub fn ogs_dbi_update_imeisv(supi: &str, imeisv: &str) -> DbiResult<()> {
     let supi_type = ogs_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
     let supi_id = ogs_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
 
-    log::debug!(
-        "SUPI type: {supi_type}, SUPI id: {supi_id}, imeisv: {imeisv}"
-    );
+    log::debug!("SUPI type: {supi_type}, SUPI id: {supi_id}, imeisv: {imeisv}");
 
     let collection = get_subscriber_collection()?;
     let query = doc! { &supi_type: &supi_id };

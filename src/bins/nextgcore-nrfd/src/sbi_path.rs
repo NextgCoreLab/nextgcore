@@ -74,7 +74,11 @@ impl SbiServer {
 
     /// Get server URI
     pub fn uri(&self) -> String {
-        let scheme = if self.config.tls_enabled { "https" } else { "http" };
+        let scheme = if self.config.tls_enabled {
+            "https"
+        } else {
+            "http"
+        };
         format!("{}://{}:{}", scheme, self.config.addr, self.config.port)
     }
 }
@@ -87,7 +91,7 @@ pub fn nrf_sbi_open(config: Option<SbiServerConfig>) -> Result<SbiServer, String
         return Err("SBI server already running".to_string());
     }
 
-    let config = config.unwrap_or(SbiServerConfig::default());
+    let config = config.unwrap_or_default();
     let mut server = SbiServer::new(config);
 
     // Add nnrf-nfm service (NF Management)
@@ -104,10 +108,7 @@ pub fn nrf_sbi_open(config: Option<SbiServerConfig>) -> Result<SbiServer, String
         full_version: "1.0.0".to_string(),
     });
 
-    log::info!(
-        "NRF SBI server opened at {}",
-        server.uri()
-    );
+    log::info!("NRF SBI server opened at {}", server.uri());
 
     SBI_SERVER_RUNNING.store(true, Ordering::SeqCst);
 
@@ -176,10 +177,7 @@ pub async fn nrf_nnrf_nfm_send_nf_status_notify_async(
     let (host, port, path, scheme) = match parse_notification_uri(&notify_request.uri) {
         Some(parts) => parts,
         None => {
-            log::error!(
-                "Failed to parse notification URI: {}",
-                notify_request.uri
-            );
+            log::error!("Failed to parse notification URI: {}", notify_request.uri);
             return NotifySendResult::Failed(format!(
                 "Invalid notification URI: {}",
                 notify_request.uri
@@ -323,13 +321,8 @@ pub async fn nrf_nnrf_nfm_send_nf_status_notify_all_async(
         }
 
         // Send notification asynchronously
-        match nrf_nnrf_nfm_send_nf_status_notify_async(
-            subscription,
-            event,
-            nf_instance,
-            server_uri,
-        )
-        .await
+        match nrf_nnrf_nfm_send_nf_status_notify_async(subscription, event, nf_instance, server_uri)
+            .await
         {
             NotifySendResult::Success => {
                 sent_count += 1;
@@ -343,10 +336,7 @@ pub async fn nrf_nnrf_nfm_send_nf_status_notify_all_async(
                 // Continue sending to other subscribers rather than aborting
             }
             NotifySendResult::NoClient => {
-                log::warn!(
-                    "No client for subscription {}",
-                    subscription.id
-                );
+                log::warn!("No client for subscription {}", subscription.id);
             }
         }
     }
@@ -392,10 +382,7 @@ pub fn nrf_nnrf_nfm_send_nf_status_notify_all(
                 return Err(err);
             }
             NotifySendResult::NoClient => {
-                log::warn!(
-                    "No client for subscription {}",
-                    subscription.id
-                );
+                log::warn!("No client for subscription {}", subscription.id);
             }
         }
     }

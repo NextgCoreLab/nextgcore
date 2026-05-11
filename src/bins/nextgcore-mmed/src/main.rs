@@ -8,24 +8,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 pub mod context;
-pub mod sm;
 pub mod emm_build;
 pub mod emm_handler;
 pub mod esm_build;
 pub mod esm_handler;
-pub mod s1ap_build;
-pub mod s1ap_handler;
+pub mod fd_path;
+pub mod gtp_path;
+pub mod nas_path;
+pub mod nas_security;
 pub mod s11_build;
 pub mod s11_handler;
-pub mod gtp_path;
-pub mod nas_security;
-pub mod nas_path;
+pub mod s1ap_build;
+pub mod s1ap_handler;
+pub mod s6a_handler;
+pub mod sbc_handler;
+pub mod sbc_message;
 pub mod sgsap_build;
 pub mod sgsap_handler;
-pub mod fd_path;
-pub mod s6a_handler;
-pub mod sbc_message;
-pub mod sbc_handler;
+pub mod sm;
 
 #[cfg(test)]
 mod property_tests;
@@ -188,11 +188,10 @@ fn main() -> Result<()> {
         .init();
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
-            .with_endpoint(
-                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
-            ),
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+        ),
     )
     .ok();
 

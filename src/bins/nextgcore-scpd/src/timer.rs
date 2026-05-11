@@ -22,13 +22,9 @@ impl ScpTimerManager {
     }
 
     /// Start a one-shot timer
-    pub fn start(
-        &self,
-        timer_type: ScpTimerId,
-        duration: Duration,
-        data: Option<String>,
-    ) -> u64 {
-        self.inner.start(timer_type, duration, TimerMode::OneShot, data)
+    pub fn start(&self, timer_type: ScpTimerId, duration: Duration, data: Option<String>) -> u64 {
+        self.inner
+            .start(timer_type, duration, TimerMode::OneShot, data)
     }
 
     /// Start a periodic timer
@@ -38,7 +34,8 @@ impl ScpTimerManager {
         interval: Duration,
         data: Option<String>,
     ) -> u64 {
-        self.inner.start(timer_type, interval, TimerMode::Periodic, data)
+        self.inner
+            .start(timer_type, interval, TimerMode::Periodic, data)
     }
 
     /// Stop/cancel a timer
@@ -134,11 +131,7 @@ mod tests {
     fn test_timer_manager_process_expired() {
         let mgr = ScpTimerManager::new();
 
-        mgr.start(
-            ScpTimerId::SbiClientWait,
-            Duration::from_millis(10),
-            None,
-        );
+        mgr.start(ScpTimerId::SbiClientWait, Duration::from_millis(10), None);
 
         thread::sleep(Duration::from_millis(20));
 

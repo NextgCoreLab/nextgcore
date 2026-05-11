@@ -4,11 +4,11 @@
 //!
 //! Implements NAS message transmission to eNB and UE.
 
-use crate::context::{MmeUe, EnbUe, MmeSess, MmeBearer, S1apCauseGroup};
+use crate::context::{EnbUe, MmeBearer, MmeSess, MmeUe, S1apCauseGroup};
 use crate::emm_build::{self, EmmCause, SecurityHeaderType};
 use crate::esm_build::{self, EsmCause};
-use crate::s1ap_build;
 use crate::nas_security;
+use crate::s1ap_build;
 
 // ============================================================================
 // Result Types
@@ -49,7 +49,6 @@ impl std::fmt::Display for NasError {
         }
     }
 }
-
 
 impl std::error::Error for NasError {}
 
@@ -102,11 +101,7 @@ pub enum S1apCauseNas {
 /// # Returns
 /// * `Ok(())` - Message sent successfully
 /// * `Err(NasError)` - On error
-pub fn nas_eps_send_to_enb(
-    _mme_ue: &MmeUe,
-    enb_ue: &EnbUe,
-    message: Vec<u8>,
-) -> NasResult<()> {
+pub fn nas_eps_send_to_enb(_mme_ue: &MmeUe, enb_ue: &EnbUe, message: Vec<u8>) -> NasResult<()> {
     if enb_ue.id == 0 {
         log::error!("S1 context has already been removed");
         return Err(NasError::EnbUeNotFound);
@@ -132,10 +127,7 @@ pub fn nas_eps_send_to_enb(
 /// # Returns
 /// * `Ok(())` - Message sent successfully
 /// * `Err(NasError)` - On error
-pub fn nas_eps_send_to_downlink_nas_transport(
-    enb_ue: &EnbUe,
-    message: Vec<u8>,
-) -> NasResult<()> {
+pub fn nas_eps_send_to_downlink_nas_transport(enb_ue: &EnbUe, message: Vec<u8>) -> NasResult<()> {
     if enb_ue.id == 0 {
         log::error!("S1 context has already been removed");
         return Err(NasError::EnbUeNotFound);
@@ -163,10 +155,7 @@ pub fn nas_eps_send_to_downlink_nas_transport(
 /// # Returns
 /// * `Ok(())` - Message forwarded successfully
 /// * `Err(NasError)` - On error
-pub fn nas_eps_send_emm_to_esm(
-    mme_ue: &MmeUe,
-    esm_message_container: &[u8],
-) -> NasResult<()> {
+pub fn nas_eps_send_emm_to_esm(mme_ue: &MmeUe, esm_message_container: &[u8]) -> NasResult<()> {
     if mme_ue.id == 0 {
         log::error!("UE(mme-ue) context has already been removed");
         return Err(NasError::UeNotFound);
@@ -186,7 +175,6 @@ pub fn nas_eps_send_emm_to_esm(
     // In actual implementation, this would create a pkbuf and send to ESM handler
     Ok(())
 }
-
 
 // ============================================================================
 // EMM Message Send Functions
@@ -232,14 +220,16 @@ pub fn nas_eps_send_attach_accept(
         &esm_message,
         3600, // T3412 value in seconds
         &tai_list,
-    ).map_err(|_| NasError::BuildFailed)?;
+    )
+    .map_err(|_| NasError::BuildFailed)?;
 
     // Apply security encoding
     let secured_message = nas_security::nas_eps_security_encode(
         mme_ue,
         SecurityHeaderType::IntegrityProtectedAndCiphered,
         &emm_message,
-    ).ok_or(NasError::BuildFailed)?;
+    )
+    .ok_or(NasError::BuildFailed)?;
 
     // Store for retransmission (T3450)
     mme_ue.t3450.pkbuf = Some(secured_message.clone());
@@ -280,18 +270,17 @@ pub fn nas_eps_send_attach_reject(
         return Err(NasError::EnbUeNotFound);
     }
 
-    log::debug!("[{}] Attach reject, Cause[{:?}]", mme_ue.imsi_bcd, emm_cause);
+    log::debug!(
+        "[{}] Attach reject, Cause[{:?}]",
+        mme_ue.imsi_bcd,
+        emm_cause
+    );
 
     // Build ESM PDN connectivity reject if ESM cause provided
-    let esm_message = esm_cause.map(|cause| {
-        esm_build::build_pdn_connectivity_reject(cause)
-    });
+    let esm_message = esm_cause.map(esm_build::build_pdn_connectivity_reject);
 
     // Build EMM attach reject
-    let emm_message = emm_build::build_attach_reject(
-        emm_cause,
-        esm_message.as_deref(),
-    );
+    let emm_message = emm_build::build_attach_reject(emm_cause, esm_message.as_deref());
 
     nas_eps_send_to_downlink_nas_transport(enb_ue, emm_message)
 }
@@ -305,10 +294,7 @@ pub fn nas_eps_send_attach_reject(
 /// # Returns
 /// * `Ok(())` - Message sent successfully
 /// * `Err(NasError)` - On error
-pub fn nas_eps_send_identity_request(
-    mme_ue: &mut MmeUe,
-    enb_ue: &EnbUe,
-) -> NasResult<()> {
+pub fn nas_eps_send_identity_request(mme_ue: &mut MmeUe, enb_ue: &EnbUe) -> NasResult<()> {
     if mme_ue.id == 0 {
         log::error!("UE(mme-ue) context has already been removed");
         return Err(NasError::UeNotFound);
@@ -334,7 +320,6 @@ pub fn nas_eps_send_identity_request(
     nas_eps_send_to_downlink_nas_transport(enb_ue, emm_message)
 }
 
-
 /// Send authentication request message
 ///
 /// # Arguments
@@ -344,10 +329,7 @@ pub fn nas_eps_send_identity_request(
 /// # Returns
 /// * `Ok(())` - Message sent successfully
 /// * `Err(NasError)` - On error
-pub fn nas_eps_send_authentication_request(
-    mme_ue: &mut MmeUe,
-    enb_ue: &EnbUe,
-) -> NasResult<()> {
+pub fn nas_eps_send_authentication_request(mme_ue: &mut MmeUe, enb_ue: &EnbUe) -> NasResult<()> {
     if mme_ue.id == 0 {
         log::error!("UE(mme-ue) context has already been removed");
         return Err(NasError::UeNotFound);
@@ -383,10 +365,7 @@ pub fn nas_eps_send_authentication_request(
 /// # Returns
 /// * `Ok(())` - Message sent successfully
 /// * `Err(NasError)` - On error
-pub fn nas_eps_send_authentication_reject(
-    mme_ue: &MmeUe,
-    enb_ue: &EnbUe,
-) -> NasResult<()> {
+pub fn nas_eps_send_authentication_reject(mme_ue: &MmeUe, enb_ue: &EnbUe) -> NasResult<()> {
     if mme_ue.id == 0 {
         log::error!("UE(mme-ue) context has already been removed");
         return Err(NasError::UeNotFound);
@@ -413,10 +392,7 @@ pub fn nas_eps_send_authentication_reject(
 /// # Returns
 /// * `Ok(())` - Message sent successfully
 /// * `Err(NasError)` - On error
-pub fn nas_eps_send_security_mode_command(
-    mme_ue: &mut MmeUe,
-    enb_ue: &EnbUe,
-) -> NasResult<()> {
+pub fn nas_eps_send_security_mode_command(mme_ue: &mut MmeUe, enb_ue: &EnbUe) -> NasResult<()> {
     if mme_ue.id == 0 {
         log::error!("UE(mme-ue) context has already been removed");
         return Err(NasError::UeNotFound);
@@ -446,7 +422,8 @@ pub fn nas_eps_send_security_mode_command(
             mme_ue,
             SecurityHeaderType::IntegrityProtectedNewContext,
             &plain_message,
-        ).ok_or(NasError::BuildFailed)?
+        )
+        .ok_or(NasError::BuildFailed)?
     };
 
     // Store for retransmission (T3460)
@@ -454,7 +431,6 @@ pub fn nas_eps_send_security_mode_command(
 
     nas_eps_send_to_downlink_nas_transport(enb_ue, emm_message)
 }
-
 
 /// Send detach request message (to UE)
 ///
@@ -465,10 +441,7 @@ pub fn nas_eps_send_security_mode_command(
 /// # Returns
 /// * `Ok(())` - Message sent successfully
 /// * `Err(NasError)` - On error
-pub fn nas_eps_send_detach_request(
-    mme_ue: &mut MmeUe,
-    enb_ue: &EnbUe,
-) -> NasResult<()> {
+pub fn nas_eps_send_detach_request(mme_ue: &mut MmeUe, enb_ue: &EnbUe) -> NasResult<()> {
     if mme_ue.id == 0 {
         log::error!("UE(mme-ue) context has already been removed");
         return Err(NasError::UeNotFound);
@@ -485,17 +458,16 @@ pub fn nas_eps_send_detach_request(
     let emm_message = if let Some(ref pkbuf) = mme_ue.t3422.pkbuf {
         pkbuf.clone()
     } else {
-        let plain_message = emm_build::build_detach_request(
-            mme_ue,
-            emm_build::DetachTypeToUe::ReAttachRequired,
-        );
+        let plain_message =
+            emm_build::build_detach_request(mme_ue, emm_build::DetachTypeToUe::ReAttachRequired);
 
         // Apply security encoding
         nas_security::nas_eps_security_encode(
             mme_ue,
             SecurityHeaderType::IntegrityProtectedAndCiphered,
             &plain_message,
-        ).ok_or(NasError::BuildFailed)?
+        )
+        .ok_or(NasError::BuildFailed)?
     };
 
     // Store for retransmission (T3422)
@@ -513,10 +485,7 @@ pub fn nas_eps_send_detach_request(
 /// # Returns
 /// * `Ok(())` - Message sent successfully
 /// * `Err(NasError)` - On error
-pub fn nas_eps_send_detach_accept(
-    mme_ue: &mut MmeUe,
-    enb_ue: &EnbUe,
-) -> NasResult<()> {
+pub fn nas_eps_send_detach_accept(mme_ue: &mut MmeUe, enb_ue: &EnbUe) -> NasResult<()> {
     if mme_ue.id == 0 {
         log::error!("UE(mme-ue) context has already been removed");
         return Err(NasError::UeNotFound);
@@ -538,7 +507,8 @@ pub fn nas_eps_send_detach_accept(
         mme_ue,
         SecurityHeaderType::IntegrityProtectedAndCiphered,
         &plain_message,
-    ).ok_or(NasError::BuildFailed)?;
+    )
+    .ok_or(NasError::BuildFailed)?;
 
     nas_eps_send_to_downlink_nas_transport(enb_ue, emm_message)
 }
@@ -572,10 +542,8 @@ pub fn nas_eps_send_tau_accept(
 
     let tai_list = vec![mme_ue.tai.clone()];
     let plain_message = emm_build::build_tau_accept(
-        mme_ue,
-        3600, // T3412 value
-        &tai_list,
-        0, // EPS bearer context status
+        mme_ue, 3600, // T3412 value
+        &tai_list, 0, // EPS bearer context status
     );
 
     // Apply security encoding
@@ -583,7 +551,8 @@ pub fn nas_eps_send_tau_accept(
         mme_ue,
         SecurityHeaderType::IntegrityProtectedAndCiphered,
         &plain_message,
-    ).ok_or(NasError::BuildFailed)?;
+    )
+    .ok_or(NasError::BuildFailed)?;
 
     // Store for retransmission (T3450)
     mme_ue.t3450.pkbuf = Some(emm_message.clone());
@@ -595,7 +564,6 @@ pub fn nas_eps_send_tau_accept(
         nas_eps_send_to_downlink_nas_transport(enb_ue, emm_message)
     }
 }
-
 
 /// Send TAU reject message
 ///
@@ -670,10 +638,7 @@ pub fn nas_eps_send_service_reject(
 /// # Returns
 /// * `Ok(())` - Message sent successfully
 /// * `Err(NasError)` - On error
-pub fn nas_eps_send_cs_service_notification(
-    mme_ue: &mut MmeUe,
-    enb_ue: &EnbUe,
-) -> NasResult<()> {
+pub fn nas_eps_send_cs_service_notification(mme_ue: &mut MmeUe, enb_ue: &EnbUe) -> NasResult<()> {
     if mme_ue.id == 0 {
         log::error!("UE(mme-ue) context has already been removed");
         return Err(NasError::UeNotFound);
@@ -693,7 +658,8 @@ pub fn nas_eps_send_cs_service_notification(
         mme_ue,
         SecurityHeaderType::IntegrityProtectedAndCiphered,
         &plain_message,
-    ).ok_or(NasError::BuildFailed)?;
+    )
+    .ok_or(NasError::BuildFailed)?;
 
     nas_eps_send_to_downlink_nas_transport(enb_ue, emm_message)
 }
@@ -733,19 +699,13 @@ pub fn nas_eps_send_pdn_connectivity_reject(
 
     if create_action == GtpCreateAction::InAttachRequest {
         // During attach, send attach reject with piggybacked PDN connectivity reject
-        return nas_eps_send_attach_reject(
-            enb_ue,
-            mme_ue,
-            EmmCause::EsmFailure,
-            Some(esm_cause),
-        );
+        return nas_eps_send_attach_reject(enb_ue, mme_ue, EmmCause::EsmFailure, Some(esm_cause));
     }
 
     let esm_message = esm_build::build_pdn_connectivity_reject(esm_cause);
 
     nas_eps_send_to_downlink_nas_transport(enb_ue, esm_message)
 }
-
 
 /// Send ESM information request message
 ///
@@ -815,10 +775,7 @@ pub fn nas_eps_send_activate_default_bearer_context_request(
         return Err(NasError::EnbUeNotFound);
     }
 
-    let esm_message = esm_build::build_activate_default_bearer_context_request(
-        sess,
-        create_action,
-    );
+    let esm_message = esm_build::build_activate_default_bearer_context_request(sess, create_action);
 
     // Build S1AP E-RAB setup request
     let _s1ap_message = s1ap_build::build_e_rab_setup_request_with_params(
@@ -906,11 +863,8 @@ pub fn nas_eps_send_modify_bearer_context_request(
         return Err(NasError::EnbUeNotFound);
     }
 
-    let esm_message = esm_build::build_modify_bearer_context_request(
-        bearer,
-        qos_presence,
-        tft_presence,
-    );
+    let esm_message =
+        esm_build::build_modify_bearer_context_request(bearer, qos_presence, tft_presence);
 
     if qos_presence {
         // Build S1AP E-RAB modify request
@@ -927,7 +881,6 @@ pub fn nas_eps_send_modify_bearer_context_request(
         nas_eps_send_to_downlink_nas_transport(enb_ue, esm_message)
     }
 }
-
 
 /// Send deactivate bearer context request message
 ///
@@ -954,10 +907,8 @@ pub fn nas_eps_send_deactivate_bearer_context_request(
         return Err(NasError::EnbUeNotFound);
     }
 
-    let esm_message = esm_build::build_deactivate_bearer_context_request(
-        bearer,
-        EsmCause::RegularDeactivation,
-    );
+    let esm_message =
+        esm_build::build_deactivate_bearer_context_request(bearer, EsmCause::RegularDeactivation);
 
     // Build S1AP E-RAB release command
     let _s1ap_message = s1ap_build::build_e_rab_release_command_with_params(
@@ -1079,16 +1030,15 @@ pub fn nas_eps_send_downlink_nas_transport(
     log::debug!("[{}] Downlink NAS transport", mme_ue.imsi_bcd);
 
     // Build EMM downlink NAS transport message
-    let emm_message = emm_build::build_emm_information(
-        None, None, None, None, None,
-    );
+    let emm_message = emm_build::build_emm_information(None, None, None, None, None);
 
     // Apply security encoding
     let secured_message = nas_security::nas_eps_security_encode(
         mme_ue,
         SecurityHeaderType::IntegrityProtectedAndCiphered,
         &emm_message,
-    ).ok_or(NasError::BuildFailed)?;
+    )
+    .ok_or(NasError::BuildFailed)?;
 
     nas_eps_send_to_downlink_nas_transport(enb_ue, secured_message)
 }
@@ -1104,7 +1054,10 @@ mod tests {
     #[test]
     fn test_nas_error_display() {
         assert_eq!(format!("{}", NasError::UeNotFound), "UE context not found");
-        assert_eq!(format!("{}", NasError::EnbUeNotFound), "eNB UE context not found");
+        assert_eq!(
+            format!("{}", NasError::EnbUeNotFound),
+            "eNB UE context not found"
+        );
         assert_eq!(format!("{}", NasError::BuildFailed), "Message build failed");
     }
 
@@ -1133,7 +1086,10 @@ mod tests {
 
     #[test]
     fn test_send_emm_to_esm_empty_container() {
-        let mme_ue = MmeUe { id: 1, ..Default::default() };
+        let mme_ue = MmeUe {
+            id: 1,
+            ..Default::default()
+        };
 
         let result = nas_eps_send_emm_to_esm(&mme_ue, &[]);
         assert_eq!(result, Err(NasError::InvalidParameter));

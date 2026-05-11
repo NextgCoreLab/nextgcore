@@ -75,8 +75,8 @@ impl OgsYamlIter {
 
     /// Initialize iterator from a YAML string
     pub fn from_str(yaml_str: &str) -> Result<Self, YamlError> {
-        let value: Value = serde_yaml::from_str(yaml_str)
-            .map_err(|e| YamlError::ParseError(e.to_string()))?;
+        let value: Value =
+            serde_yaml::from_str(yaml_str).map_err(|e| YamlError::ParseError(e.to_string()))?;
         Ok(Self::new(value))
     }
 
@@ -186,7 +186,11 @@ impl OgsYamlIter {
             Value::String(s) => Some(s.as_str()),
             Value::Bool(b) => {
                 // Return static strings for booleans
-                if *b { Some("true") } else { Some("false") }
+                if *b {
+                    Some("true")
+                } else {
+                    Some("false")
+                }
             }
             Value::Number(_n) => None, // Numbers need special handling
             Value::Mapping(map) => {
@@ -258,7 +262,10 @@ impl OgsYamlIter {
                 if let Some(ref key) = self.current_key {
                     let yaml_key = Value::String(key.clone());
                     if let Some(value) = map.get(&yaml_key) {
-                        return matches!(value, Value::String(_) | Value::Bool(_) | Value::Number(_));
+                        return matches!(
+                            value,
+                            Value::String(_) | Value::Bool(_) | Value::Number(_)
+                        );
                     }
                 }
                 false
@@ -266,7 +273,10 @@ impl OgsYamlIter {
             Value::Sequence(seq) => {
                 if let Some(idx) = self.sequence_index {
                     if idx < seq.len() {
-                        return matches!(&seq[idx], Value::String(_) | Value::Bool(_) | Value::Number(_));
+                        return matches!(
+                            &seq[idx],
+                            Value::String(_) | Value::Bool(_) | Value::Number(_)
+                        );
                     }
                 }
                 false
@@ -322,7 +332,10 @@ impl OgsYamlIter {
 
     /// Check if this is a scalar node
     pub fn is_scalar(&self) -> bool {
-        matches!(self.root, Value::String(_) | Value::Bool(_) | Value::Number(_))
+        matches!(
+            self.root,
+            Value::String(_) | Value::Bool(_) | Value::Number(_)
+        )
     }
 }
 
@@ -336,8 +349,8 @@ pub struct OgsYamlDocument {
 impl OgsYamlDocument {
     /// Parse YAML from a string
     pub fn from_str(yaml_str: &str) -> Result<Self, YamlError> {
-        let root: Value = serde_yaml::from_str(yaml_str)
-            .map_err(|e| YamlError::ParseError(e.to_string()))?;
+        let root: Value =
+            serde_yaml::from_str(yaml_str).map_err(|e| YamlError::ParseError(e.to_string()))?;
         Ok(OgsYamlDocument { root })
     }
 
@@ -361,7 +374,7 @@ impl OgsYamlDocument {
     pub fn get(&self, path: &str) -> Option<&Value> {
         let parts: Vec<&str> = path.split('.').collect();
         let mut current = &self.root;
-        
+
         for part in parts {
             match current {
                 Value::Mapping(map) => {
@@ -371,7 +384,7 @@ impl OgsYamlDocument {
                 _ => return None,
             }
         }
-        
+
         Some(current)
     }
 
@@ -382,51 +395,44 @@ impl OgsYamlDocument {
 
     /// Get a boolean value by key path
     pub fn get_bool(&self, path: &str) -> Option<bool> {
-        self.get(path).and_then(|v| {
-            match v {
-                Value::Bool(b) => Some(*b),
-                Value::String(s) => {
-                    let s_lower = s.to_lowercase();
-                    if s_lower == "true" || s_lower == "yes" {
-                        Some(true)
-                    } else if s_lower == "false" || s_lower == "no" {
-                        Some(false)
-                    } else {
-                        s.parse::<i64>().ok().map(|n| n != 0)
-                    }
+        self.get(path).and_then(|v| match v {
+            Value::Bool(b) => Some(*b),
+            Value::String(s) => {
+                let s_lower = s.to_lowercase();
+                if s_lower == "true" || s_lower == "yes" {
+                    Some(true)
+                } else if s_lower == "false" || s_lower == "no" {
+                    Some(false)
+                } else {
+                    s.parse::<i64>().ok().map(|n| n != 0)
                 }
-                Value::Number(n) => n.as_i64().map(|n| n != 0),
-                _ => None,
             }
+            Value::Number(n) => n.as_i64().map(|n| n != 0),
+            _ => None,
         })
     }
 
     /// Get an integer value by key path
     pub fn get_i64(&self, path: &str) -> Option<i64> {
-        self.get(path).and_then(|v| {
-            match v {
-                Value::Number(n) => n.as_i64(),
-                Value::String(s) => s.parse().ok(),
-                _ => None,
-            }
+        self.get(path).and_then(|v| match v {
+            Value::Number(n) => n.as_i64(),
+            Value::String(s) => s.parse().ok(),
+            _ => None,
         })
     }
 
     /// Get an unsigned integer value by key path
     pub fn get_u64(&self, path: &str) -> Option<u64> {
-        self.get(path).and_then(|v| {
-            match v {
-                Value::Number(n) => n.as_u64(),
-                Value::String(s) => s.parse().ok(),
-                _ => None,
-            }
+        self.get(path).and_then(|v| match v {
+            Value::Number(n) => n.as_u64(),
+            Value::String(s) => s.parse().ok(),
+            _ => None,
         })
     }
 
     /// Serialize the document back to YAML string
     pub fn to_string(&self) -> Result<String, YamlError> {
-        serde_yaml::to_string(&self.root)
-            .map_err(|e| YamlError::ParseError(e.to_string()))
+        serde_yaml::to_string(&self.root).map_err(|e| YamlError::ParseError(e.to_string()))
     }
 }
 
@@ -483,12 +489,15 @@ logger:
   level: info
 "#;
         let doc = OgsYamlDocument::from_str(yaml).unwrap();
-        
+
         assert_eq!(doc.get_bool("global.parameter.no_ipv4"), Some(false));
         assert_eq!(doc.get_bool("global.parameter.no_ipv6"), Some(true));
         assert_eq!(doc.get_i64("global.max.ue"), Some(1024));
         assert_eq!(doc.get_i64("global.max.peer"), Some(64));
-        assert_eq!(doc.get_str("logger.file"), Some("/var/log/nextgcore/amf.log"));
+        assert_eq!(
+            doc.get_str("logger.file"),
+            Some("/var/log/nextgcore/amf.log")
+        );
         assert_eq!(doc.get_str("logger.level"), Some("info"));
     }
 
@@ -500,14 +509,14 @@ key2: value2
 key3: value3
 "#;
         let mut iter = OgsYamlIter::from_str(yaml).unwrap();
-        
+
         let mut keys = Vec::new();
         while iter.next() {
             if let Some(key) = iter.key() {
                 keys.push(key.to_string());
             }
         }
-        
+
         assert!(keys.contains(&"key1".to_string()));
         assert!(keys.contains(&"key2".to_string()));
         assert!(keys.contains(&"key3".to_string()));
@@ -521,14 +530,14 @@ key3: value3
 - item3
 "#;
         let mut iter = OgsYamlIter::from_str(yaml).unwrap();
-        
+
         let mut items = Vec::new();
         while iter.next() {
             if let Some(value) = iter.value() {
                 items.push(value.to_string());
             }
         }
-        
+
         assert_eq!(items, vec!["item1", "item2", "item3"]);
     }
 
@@ -540,19 +549,19 @@ parent:
   child2: value2
 "#;
         let mut iter = OgsYamlIter::from_str(yaml).unwrap();
-        
+
         assert!(iter.next());
         assert_eq!(iter.key(), Some("parent"));
-        
+
         let mut child_iter = iter.recurse().unwrap();
-        
+
         let mut children = Vec::new();
         while child_iter.next() {
             if let Some(key) = child_iter.key() {
                 children.push(key.to_string());
             }
         }
-        
+
         assert!(children.contains(&"child1".to_string()));
         assert!(children.contains(&"child2".to_string()));
     }
@@ -568,11 +577,11 @@ bool_1: 1
 bool_0: 0
 "#;
         let mut iter = OgsYamlIter::from_str(yaml).unwrap();
-        
+
         while iter.next() {
             let key = iter.key().unwrap();
             let child = iter.recurse().unwrap();
-            
+
             match key {
                 "bool_true" | "bool_yes" | "bool_1" => {
                     assert!(child.bool_value(), "Expected true for {key}");
@@ -597,11 +606,11 @@ scalar: value
 "#;
         let mut iter = OgsYamlIter::from_str(yaml).unwrap();
         assert_eq!(iter.node_type(), YamlNodeType::Mapping);
-        
+
         while iter.next() {
             let key = iter.key().unwrap();
             let child = iter.recurse().unwrap();
-            
+
             match key {
                 "mapping" => assert_eq!(child.node_type(), YamlNodeType::Mapping),
                 "sequence" => assert_eq!(child.node_type(), YamlNodeType::Sequence),
@@ -622,7 +631,7 @@ scalar: value
 "#;
         let doc = OgsYamlDocument::from_str(yaml).unwrap();
         let output = doc.to_string().unwrap();
-        
+
         // Parse the output again and verify values
         let doc2 = OgsYamlDocument::from_str(&output).unwrap();
         assert_eq!(doc2.get_bool("global.parameter.no_ipv4"), Some(false));

@@ -7,8 +7,8 @@
 //! Port of src/smf/pfcp-path.c - PFCP path management for SMF
 //! Handles PFCP session establishment, modification, and deletion requests
 
-use crate::n4_build::{PfcpCause, PfcpMessageBuilder, apply_action, pfcp_ie};
-use crate::n4_handler::{DeleteTrigger, modify_flags};
+use crate::n4_build::{apply_action, pfcp_ie, PfcpCause, PfcpMessageBuilder};
+use crate::n4_handler::{modify_flags, DeleteTrigger};
 
 // ============================================================================
 // PFCP Message Types
@@ -66,7 +66,6 @@ impl PfcpHeader {
         }
     }
 }
-
 
 // ============================================================================
 // PFCP Transaction
@@ -144,11 +143,11 @@ pub enum PfcpNodeState {
 /// UP Function Features
 #[derive(Debug, Clone, Default)]
 pub struct UpFunctionFeatures {
-    pub ftup: bool,  // F-TEID allocation/release in the UP function
-    pub bucp: bool,  // Downlink Data Buffering in CP function
-    pub ddnd: bool,  // Buffering parameter 'Downlink Data Notification Delay'
-    pub dlbd: bool,  // DL Buffering Duration
-    pub trst: bool,  // Traffic Steering
+    pub ftup: bool, // F-TEID allocation/release in the UP function
+    pub bucp: bool, // Downlink Data Buffering in CP function
+    pub ddnd: bool, // Buffering parameter 'Downlink Data Notification Delay'
+    pub dlbd: bool, // DL Buffering Duration
+    pub trst: bool, // Traffic Steering
     pub ftup_ipv4: bool,
     pub ftup_ipv6: bool,
 }
@@ -179,40 +178,35 @@ impl PfcpNode {
     }
 }
 
-
 // ============================================================================
 // PFCP Path Manager
 // ============================================================================
 
 /// PFCP Path Manager
-/// Manages PFCP connections and transactions
+/// Manages PFCP connections and transactions.
+/// Sequence numbers are sourced from the global `PFCP_SEQ` counter in main.rs
+/// so that all code paths share a single monotonically-increasing counter and
+/// never produce duplicate sequence numbers.
 pub struct PfcpPathManager {
     next_xact_id: u64,
-    next_sequence_number: u32,
 }
 
 impl PfcpPathManager {
     pub fn new() -> Self {
-        Self {
-            next_xact_id: 1,
-            next_sequence_number: 1,
-        }
+        Self { next_xact_id: 1 }
     }
 
-    /// Create a new PFCP transaction
+    /// Create a new PFCP transaction using the global sequence counter.
     pub fn create_xact(&mut self) -> PfcpXact {
         let id = self.next_xact_id;
         self.next_xact_id += 1;
-        let seq = self.next_sequence_number;
-        self.next_sequence_number += 1;
+        let seq = crate::PFCP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         PfcpXact::new(id, seq)
     }
 
-    /// Get next sequence number
+    /// Get next sequence number from the global counter.
     pub fn next_sequence(&mut self) -> u32 {
-        let seq = self.next_sequence_number;
-        self.next_sequence_number += 1;
-        seq
+        crate::PFCP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -249,7 +243,7 @@ pub fn build_5gc_session_establishment_request(
 
     // Build message body using PfcpMessageBuilder
     let mut builder = PfcpMessageBuilder::new();
-    
+
     // Add F-SEID IE
     builder.add_f_seid(params.smf_n4_seid, None, None);
 
@@ -296,7 +290,11 @@ pub fn build_5gc_all_pdr_modification_request(
 
     // UPDATE_QER grouped IE: QER-ID + Gate-Status
     // DEACTIVATE → gates closed (1=CLOSED), otherwise open (0=OPEN)
-    let gate = if params.flags & modify_flags::DEACTIVATE != 0 { 1u8 } else { 0u8 };
+    let gate = if params.flags & modify_flags::DEACTIVATE != 0 {
+        1u8
+    } else {
+        0u8
+    };
     let mut qer_ie = PfcpMessageBuilder::new();
     qer_ie.add_qer_id(1); // QER ID 1 is the default QER
     qer_ie.add_gate_status(gate, gate);
@@ -334,7 +332,11 @@ pub fn build_5gc_qos_flow_modification_request(
 
     // UPDATE_QER: update gate status for the QoS flow.
     // QOS_MODIFY → gates open; DEACTIVATE → gates closed.
-    let gate = if params.flags & modify_flags::DEACTIVATE != 0 { 1u8 } else { 0u8 };
+    let gate = if params.flags & modify_flags::DEACTIVATE != 0 {
+        1u8
+    } else {
+        0u8
+    };
     let mut qer_ie = PfcpMessageBuilder::new();
     qer_ie.add_qer_id(1);
     qer_ie.add_gate_status(gate, gate);
@@ -342,7 +344,6 @@ pub fn build_5gc_qos_flow_modification_request(
 
     (header, builder.build())
 }
-
 
 /// Parameters for 5GC session deletion request
 #[derive(Debug, Clone, Default)]
@@ -397,7 +398,7 @@ pub fn build_epc_session_establishment_request(
     );
 
     let mut builder = PfcpMessageBuilder::new();
-    
+
     // Add F-SEID IE
     builder.add_f_seid(params.smf_n4_seid, None, None);
 
@@ -474,7 +475,6 @@ pub fn build_epc_session_deletion_request(
     (header, builder.build())
 }
 
-
 // ============================================================================
 // Session Report Response
 // ============================================================================
@@ -516,8 +516,8 @@ pub fn build_epc_deactivation_request(
     sequence_number: u32,
 ) -> Option<(PfcpHeader, Vec<u8>)> {
     match gtp_cause {
-        gtp2_handover_cause::ACCESS_CHANGED_FROM_NON_3GPP_TO_3GPP |
-        gtp2_handover_cause::RAT_CHANGED_FROM_3GPP_TO_NON_3GPP => {
+        gtp2_handover_cause::ACCESS_CHANGED_FROM_NON_3GPP_TO_3GPP
+        | gtp2_handover_cause::RAT_CHANGED_FROM_3GPP_TO_NON_3GPP => {
             let header = PfcpHeader::new(
                 pfcp_message_type::SESSION_MODIFICATION_REQUEST,
                 params.upf_n4_seid,
@@ -536,7 +536,6 @@ pub fn build_epc_deactivation_request(
     }
 }
 
-
 // ============================================================================
 // Unit Tests
 // ============================================================================
@@ -554,7 +553,10 @@ mod tests {
         );
 
         assert_eq!(header.version, 1);
-        assert_eq!(header.message_type, pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST);
+        assert_eq!(
+            header.message_type,
+            pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST
+        );
         assert_eq!(header.seid, 0x123456789ABCDEF0);
         assert_eq!(header.sequence_number, 42);
     }
@@ -617,7 +619,10 @@ mod tests {
 
         let (header, body) = build_5gc_session_establishment_request(&params, 1);
 
-        assert_eq!(header.message_type, pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST);
+        assert_eq!(
+            header.message_type,
+            pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST
+        );
         assert_eq!(header.seid, 0);
         assert_eq!(header.sequence_number, 1);
         assert!(!body.is_empty());
@@ -634,7 +639,10 @@ mod tests {
 
         let (header, _body) = build_5gc_session_deletion_request(&params, 5);
 
-        assert_eq!(header.message_type, pfcp_message_type::SESSION_DELETION_REQUEST);
+        assert_eq!(
+            header.message_type,
+            pfcp_message_type::SESSION_DELETION_REQUEST
+        );
         assert_eq!(header.seid, 0x2222222222222222);
         assert_eq!(header.sequence_number, 5);
     }
@@ -650,20 +658,23 @@ mod tests {
 
         let (header, body) = build_epc_session_establishment_request(&params, 10);
 
-        assert_eq!(header.message_type, pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST);
+        assert_eq!(
+            header.message_type,
+            pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST
+        );
         assert_eq!(header.sequence_number, 10);
         assert!(!body.is_empty());
     }
 
     #[test]
     fn test_build_session_report_response() {
-        let (header, body) = build_session_report_response(
-            0x123456789ABCDEF0,
-            42,
-            PfcpCause::RequestAccepted as u8,
-        );
+        let (header, body) =
+            build_session_report_response(0x123456789ABCDEF0, 42, PfcpCause::RequestAccepted as u8);
 
-        assert_eq!(header.message_type, pfcp_message_type::SESSION_REPORT_RESPONSE);
+        assert_eq!(
+            header.message_type,
+            pfcp_message_type::SESSION_REPORT_RESPONSE
+        );
         assert_eq!(header.seid, 0x123456789ABCDEF0);
         assert_eq!(header.sequence_number, 42);
         assert!(!body.is_empty());
@@ -688,7 +699,10 @@ mod tests {
 
         assert!(result.is_some());
         let (header, _body) = result.unwrap();
-        assert_eq!(header.message_type, pfcp_message_type::SESSION_MODIFICATION_REQUEST);
+        assert_eq!(
+            header.message_type,
+            pfcp_message_type::SESSION_MODIFICATION_REQUEST
+        );
     }
 
     #[test]

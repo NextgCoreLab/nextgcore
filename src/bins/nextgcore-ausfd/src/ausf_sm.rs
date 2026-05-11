@@ -4,7 +4,9 @@
 
 use crate::context::{ausf_self, AusfUe};
 use crate::event::{AusfEvent, AusfEventId, AusfTimerId};
-use crate::sbi_response::{send_error_response, send_not_found_response, send_gateway_timeout_response};
+use crate::sbi_response::{
+    send_error_response, send_gateway_timeout_response, send_not_found_response,
+};
 use crate::ue_sm::{AusfUeSmContext, AusfUeState};
 
 /// AUSF state type
@@ -156,7 +158,11 @@ impl AusfSmContext {
         // Check API version
         if api_version != "v1" {
             log::error!("Not supported version [{api_version}]");
-            send_error_response(stream_id, 400, &format!("Unsupported API version: {api_version}"));
+            send_error_response(
+                stream_id,
+                400,
+                &format!("Unsupported API version: {api_version}"),
+            );
             return;
         }
 
@@ -166,7 +172,12 @@ impl AusfSmContext {
                 self.handle_nnrf_nfm_request_simple(&method, &resource_components, stream_id);
             }
             "nausf-auth" => {
-                self.handle_nausf_auth_request_simple(event, &method, &resource_components, stream_id);
+                self.handle_nausf_auth_request_simple(
+                    event,
+                    &method,
+                    &resource_components,
+                    stream_id,
+                );
             }
             _ => {
                 log::error!("Invalid API name [{service_name}]");
@@ -176,7 +187,12 @@ impl AusfSmContext {
     }
 
     /// Handle NNRF NFM (NF Management) requests
-    fn handle_nnrf_nfm_request_simple(&mut self, method: &str, resource_components: &[String], _stream_id: u64) {
+    fn handle_nnrf_nfm_request_simple(
+        &mut self,
+        method: &str,
+        resource_components: &[String],
+        _stream_id: u64,
+    ) {
         let resource = resource_components.first().map(|s| s.as_str());
 
         match resource {
@@ -191,10 +207,7 @@ impl AusfSmContext {
                 }
             },
             _ => {
-                log::error!(
-                    "Invalid resource name [{:?}]",
-                    resource_components.first()
-                );
+                log::error!("Invalid resource name [{:?}]", resource_components.first());
             }
         }
     }
@@ -318,7 +331,13 @@ impl AusfSmContext {
                 self.handle_nnrf_disc_response_simple(&method, &resource_components, res_status);
             }
             "nudm-ueau" => {
-                self.handle_nudm_ueau_response_simple(event, &method, &resource_components, res_status, data);
+                self.handle_nudm_ueau_response_simple(
+                    event,
+                    &method,
+                    &resource_components,
+                    res_status,
+                    data,
+                );
             }
             _ => {
                 log::error!("Invalid API name [{service_name}]");
@@ -342,16 +361,18 @@ impl AusfSmContext {
                 // This is handled by the nnrf integration when NRF is enabled
             }
             _ => {
-                log::error!(
-                    "Invalid resource name [{:?}]",
-                    resource_components.first()
-                );
+                log::error!("Invalid resource name [{:?}]", resource_components.first());
             }
         }
     }
 
     /// Handle NNRF DISC responses (simplified)
-    fn handle_nnrf_disc_response_simple(&mut self, method: &str, resource_components: &[String], res_status: Option<u16>) {
+    fn handle_nnrf_disc_response_simple(
+        &mut self,
+        method: &str,
+        resource_components: &[String],
+        res_status: Option<u16>,
+    ) {
         let resource = resource_components.first().map(|s| s.as_str());
 
         match resource {
@@ -362,20 +383,14 @@ impl AusfSmContext {
                         // Note: ausf_nnrf_handle_nf_discover processes NF discovery results
                         // This is handled by the nnrf integration when NRF is enabled
                     } else {
-                        log::error!(
-                            "HTTP response error [{}]",
-                            res_status.unwrap_or(0)
-                        );
+                        log::error!("HTTP response error [{}]", res_status.unwrap_or(0));
                     }
                 } else {
                     log::error!("Invalid HTTP method [{method}]");
                 }
             }
             _ => {
-                log::error!(
-                    "Invalid resource name [{:?}]",
-                    resource_components.first()
-                );
+                log::error!("Invalid resource name [{:?}]", resource_components.first());
             }
         }
     }

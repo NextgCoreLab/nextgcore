@@ -40,8 +40,7 @@ pub enum DbiError {
 pub type DbiResult<T> = Result<T, DbiError>;
 
 /// MongoDB connection state
-#[derive(Debug)]
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct OgsMongoc {
     pub initialized: bool,
     pub name: String,
@@ -50,15 +49,12 @@ pub struct OgsMongoc {
     pub masked_db_uri: Option<String>,
 }
 
-
 /// Database interface with subscriber collection
-#[derive(Debug)]
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct OgsDbi {
     pub mongoc: OgsMongoc,
     pub subscriber_collection: Option<Collection<Document>>,
 }
-
 
 /// Global singleton for database interface
 static OGS_DBI: OnceLock<Arc<Mutex<OgsDbi>>> = OnceLock::new();
@@ -159,7 +155,11 @@ pub fn ogs_mongoc_final() {
 pub async fn ogs_dbi_init_async(db_uri: String) -> DbiResult<()> {
     tokio::task::spawn_blocking(move || ogs_dbi_init(&db_uri))
         .await
-        .unwrap_or_else(|e| Err(DbiError::ParseError(format!("spawn_blocking panicked: {e}"))))
+        .unwrap_or_else(|e| {
+            Err(DbiError::ParseError(format!(
+                "spawn_blocking panicked: {e}"
+            )))
+        })
 }
 
 /// Initialize database interface with subscriber collection
@@ -206,6 +206,56 @@ pub fn get_subscriber_collection() -> DbiResult<Collection<Document>> {
         .ok_or(DbiError::NotInitialized)
 }
 
+impl OgsDbi {
+    /// Construct a pre-initialised `OgsDbi` from an existing MongoDB `Client`.
+    ///
+    /// Intended for unit/integration tests: callers supply a real or mocked
+    /// client directly instead of going through the global `OnceLock`.  The
+    /// returned value is **not** injected into the global singleton, so it
+    /// provides full test isolation.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let client = Client::with_uri_str("mongodb://localhost:27017")?;
+    /// let dbi = OgsDbi::with_client(client, "test_db");
+    /// ```
+    pub fn with_client(client: Client, db_name: impl Into<String>) -> Self {
+        let db_name = db_name.into();
+        let database = client.database(&db_name);
+        let subscriber_collection = client
+            .database(&db_name)
+            .collection::<Document>("subscribers");
+        OgsDbi {
+            mongoc: OgsMongoc {
+                initialized: true,
+                name: db_name,
+                client: Some(client),
+                database: Some(database),
+                masked_db_uri: None,
+            },
+            subscriber_collection: Some(subscriber_collection),
+        }
+    }
+}
+
+/// Reset the global database interface to an uninitialised state.
+///
+/// **Only for use in tests.** Because `OnceLock` cannot be reset on stable
+/// Rust, this replaces the inner `OgsDbi` contents through the Mutex rather
+/// than re-creating the lock.  Call this in `#[cfg(test)]` teardown to prevent
+/// state from leaking between test cases.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn reset_for_tests() {
+    let dbi = ogs_mongoc();
+    let mut guard = dbi.lock().unwrap();
+    guard.subscriber_collection = None;
+    guard.mongoc.database = None;
+    guard.mongoc.client = None;
+    guard.mongoc.masked_db_uri = None;
+    guard.mongoc.initialized = false;
+    guard.mongoc.name = String::new();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,7 +275,6 @@ mod tests {
 //
 // B4.6: Distributed Database Support (6G Feature)
 //
-
 
 /// Database replication modes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,7 +389,8 @@ impl DistributedDbCoordinator {
 
     /// Remove a database node
     pub fn remove_node(&mut self, host: &str, port: u16) {
-        self.nodes.retain(|node| !(node.host == host && node.port == port));
+        self.nodes
+            .retain(|node| !(node.host == host && node.port == port));
     }
 
     /// Get all nodes
@@ -366,10 +416,7 @@ impl DistributedDbCoordinator {
 
     /// Get healthy nodes
     pub fn healthy_nodes(&self) -> Vec<&DbNode> {
-        self.nodes
-            .iter()
-            .filter(|node| node.healthy)
-            .collect()
+        self.nodes.iter().filter(|node| node.healthy).collect()
     }
 
     /// Set read preference
@@ -400,12 +447,14 @@ impl DistributedDbCoordinator {
     /// Select nodes for read operation based on preference
     pub fn select_read_nodes(&self) -> Vec<&DbNode> {
         match self.read_preference {
-            ReadPreference::Primary => self.primary_nodes()
+            ReadPreference::Primary => self
+                .primary_nodes()
                 .into_iter()
                 .filter(|n| n.healthy)
                 .collect(),
             ReadPreference::PrimaryPreferred => {
-                let primary = self.primary_nodes()
+                let primary = self
+                    .primary_nodes()
                     .into_iter()
                     .filter(|n| n.healthy)
                     .collect::<Vec<_>>();
@@ -418,12 +467,14 @@ impl DistributedDbCoordinator {
                         .collect()
                 }
             }
-            ReadPreference::Secondary => self.secondary_nodes()
+            ReadPreference::Secondary => self
+                .secondary_nodes()
                 .into_iter()
                 .filter(|n| n.healthy)
                 .collect(),
             ReadPreference::SecondaryPreferred => {
-                let secondary = self.secondary_nodes()
+                let secondary = self
+                    .secondary_nodes()
                     .into_iter()
                     .filter(|n| n.healthy)
                     .collect::<Vec<_>>();
@@ -443,13 +494,12 @@ impl DistributedDbCoordinator {
     /// Select nodes for write operation based on write concern
     pub fn select_write_nodes(&self) -> Vec<&DbNode> {
         match self.write_concern {
-            WriteConcern::Unacknowledged | WriteConcern::Acknowledged => {
-                self.primary_nodes()
-                    .into_iter()
-                    .filter(|n| n.healthy)
-                    .take(1)
-                    .collect()
-            }
+            WriteConcern::Unacknowledged | WriteConcern::Acknowledged => self
+                .primary_nodes()
+                .into_iter()
+                .filter(|n| n.healthy)
+                .take(1)
+                .collect(),
             WriteConcern::Majority => {
                 let all_nodes = self.healthy_nodes();
                 let majority_count = (all_nodes.len() / 2) + 1;
@@ -486,14 +536,22 @@ impl DistributedDbCoordinator {
 
     /// Mark node as healthy/unhealthy
     pub fn set_node_health(&mut self, host: &str, port: u16, healthy: bool) {
-        if let Some(node) = self.nodes.iter_mut().find(|n| n.host == host && n.port == port) {
+        if let Some(node) = self
+            .nodes
+            .iter_mut()
+            .find(|n| n.host == host && n.port == port)
+        {
             node.healthy = healthy;
         }
     }
 
     /// Update replication lag for a node
     pub fn set_replication_lag(&mut self, host: &str, port: u16, lag_sec: f64) {
-        if let Some(node) = self.nodes.iter_mut().find(|n| n.host == host && n.port == port) {
+        if let Some(node) = self
+            .nodes
+            .iter_mut()
+            .find(|n| n.host == host && n.port == port)
+        {
             node.replication_lag_sec = Some(lag_sec);
         }
     }

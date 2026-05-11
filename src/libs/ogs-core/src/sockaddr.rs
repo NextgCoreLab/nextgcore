@@ -391,7 +391,11 @@ pub fn ogs_ipsubnet(ipstr: &str, mask_or_numbits: Option<&str>) -> Result<OgsIps
 
     // Parse mask if provided
     if let Some(mask) = mask_or_numbits {
-        let maxbits = if ipsub.family == libc::AF_INET6 { 128 } else { 32 };
+        let maxbits = if ipsub.family == libc::AF_INET6 {
+            128
+        } else {
+            32
+        };
 
         if let Ok(bits) = mask.parse::<u32>() {
             if bits > 0 && bits <= maxbits {

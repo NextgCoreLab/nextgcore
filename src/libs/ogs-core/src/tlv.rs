@@ -75,11 +75,11 @@ impl OgsTlv {
     /// Get header size based on mode
     pub fn header_size(mode: u8) -> usize {
         match mode {
-            OGS_TLV_MODE_T1_L1 => 2,      // 1 + 1
-            OGS_TLV_MODE_T1_L2 => 3,      // 1 + 2
-            OGS_TLV_MODE_T1_L2_I1 => 4,   // 1 + 2 + 1
-            OGS_TLV_MODE_T2_L2 => 4,      // 2 + 2
-            OGS_TLV_MODE_T1 => 1,         // 1 (no length)
+            OGS_TLV_MODE_T1_L1 => 2,    // 1 + 1
+            OGS_TLV_MODE_T1_L2 => 3,    // 1 + 2
+            OGS_TLV_MODE_T1_L2_I1 => 4, // 1 + 2 + 1
+            OGS_TLV_MODE_T2_L2 => 4,    // 2 + 2
+            OGS_TLV_MODE_T1 => 1,       // 1 (no length)
             _ => 0,
         }
     }
@@ -88,7 +88,7 @@ impl OgsTlv {
     pub fn encode(&self, buf: &mut [u8]) -> Result<usize, TlvError> {
         let header_size = Self::header_size(self.mode);
         let total_len = header_size + self.value.len();
-        
+
         if buf.len() < total_len {
             return Err(TlvError::BufferTooSmall);
         }
@@ -142,7 +142,7 @@ impl OgsTlv {
     /// Decode TLV from bytes (identical to ogs_tlv_parse_block)
     pub fn decode(buf: &[u8], mode: u8) -> Result<(Self, usize), TlvError> {
         let header_size = Self::header_size(mode);
-        
+
         if buf.len() < header_size {
             return Err(TlvError::UnexpectedEnd);
         }
@@ -211,9 +211,13 @@ impl OgsTlv {
     }
 
     /// Decode TLV with fixed length (for T1 mode)
-    pub fn decode_fixed(buf: &[u8], mode: u8, fixed_length: u32) -> Result<(Self, usize), TlvError> {
+    pub fn decode_fixed(
+        buf: &[u8],
+        mode: u8,
+        fixed_length: u32,
+    ) -> Result<(Self, usize), TlvError> {
         let header_size = Self::header_size(mode);
-        
+
         if buf.len() < header_size + fixed_length as usize {
             return Err(TlvError::UnexpectedEnd);
         }
@@ -312,7 +316,8 @@ impl OgsTlvMsg {
 
     /// Add a TLV element with instance
     pub fn add_with_instance(&mut self, tlv_type: u32, instance: u8, value: Vec<u8>) {
-        self.elements.push(OgsTlv::with_instance(self.mode, tlv_type, instance, value));
+        self.elements
+            .push(OgsTlv::with_instance(self.mode, tlv_type, instance, value));
     }
 
     /// Encode all TLV elements (identical to ogs_tlv_render)
@@ -346,7 +351,9 @@ impl OgsTlvMsg {
 
     /// Find element by type and instance
     pub fn find_with_instance(&self, tlv_type: u32, instance: u8) -> Option<&OgsTlv> {
-        self.elements.iter().find(|e| e.tlv_type == tlv_type && e.instance == instance)
+        self.elements
+            .iter()
+            .find(|e| e.tlv_type == tlv_type && e.instance == instance)
     }
 
     /// Get total encoded size (identical to ogs_tlv_calc_length)
@@ -367,15 +374,15 @@ mod tests {
     #[test]
     fn test_tlv_t1_l1() {
         let tlv = OgsTlv::new(OGS_TLV_MODE_T1_L1, 0x42, vec![1, 2, 3, 4]);
-        
+
         let mut buf = [0u8; 100];
         let len = tlv.encode(&mut buf).unwrap();
-        
+
         assert_eq!(len, 6); // 1 + 1 + 4
         assert_eq!(buf[0], 0x42); // type
-        assert_eq!(buf[1], 4);    // length
+        assert_eq!(buf[1], 4); // length
         assert_eq!(&buf[2..6], &[1, 2, 3, 4]); // value
-        
+
         let (decoded, decoded_len) = OgsTlv::decode(&buf[..len], OGS_TLV_MODE_T1_L1).unwrap();
         assert_eq!(decoded_len, len);
         assert_eq!(decoded.tlv_type, 0x42);
@@ -386,15 +393,15 @@ mod tests {
     #[test]
     fn test_tlv_t1_l2() {
         let tlv = OgsTlv::new(OGS_TLV_MODE_T1_L2, 0x42, vec![1, 2, 3, 4]);
-        
+
         let mut buf = [0u8; 100];
         let len = tlv.encode(&mut buf).unwrap();
-        
+
         assert_eq!(len, 7); // 1 + 2 + 4
         assert_eq!(buf[0], 0x42); // type
-        assert_eq!(buf[1], 0);    // length high
-        assert_eq!(buf[2], 4);    // length low
-        
+        assert_eq!(buf[1], 0); // length high
+        assert_eq!(buf[2], 4); // length low
+
         let (decoded, _) = OgsTlv::decode(&buf[..len], OGS_TLV_MODE_T1_L2).unwrap();
         assert_eq!(decoded.tlv_type, 0x42);
         assert_eq!(decoded.length, 4);
@@ -403,14 +410,14 @@ mod tests {
     #[test]
     fn test_tlv_t1_l2_i1() {
         let tlv = OgsTlv::with_instance(OGS_TLV_MODE_T1_L2_I1, 0x42, 0x03, vec![1, 2, 3, 4]);
-        
+
         let mut buf = [0u8; 100];
         let len = tlv.encode(&mut buf).unwrap();
-        
+
         assert_eq!(len, 8); // 1 + 2 + 1 + 4
         assert_eq!(buf[0], 0x42); // type
         assert_eq!(buf[3], 0x03); // instance
-        
+
         let (decoded, _) = OgsTlv::decode(&buf[..len], OGS_TLV_MODE_T1_L2_I1).unwrap();
         assert_eq!(decoded.tlv_type, 0x42);
         assert_eq!(decoded.instance, 0x03);
@@ -419,14 +426,14 @@ mod tests {
     #[test]
     fn test_tlv_t2_l2() {
         let tlv = OgsTlv::new(OGS_TLV_MODE_T2_L2, 0x1234, vec![1, 2, 3, 4]);
-        
+
         let mut buf = [0u8; 100];
         let len = tlv.encode(&mut buf).unwrap();
-        
+
         assert_eq!(len, 8); // 2 + 2 + 4
         assert_eq!(buf[0], 0x12); // type high
         assert_eq!(buf[1], 0x34); // type low
-        
+
         let (decoded, _) = OgsTlv::decode(&buf[..len], OGS_TLV_MODE_T2_L2).unwrap();
         assert_eq!(decoded.tlv_type, 0x1234);
     }
@@ -437,15 +444,15 @@ mod tests {
         msg.add(0x01, vec![1, 2]);
         msg.add(0x02, vec![3, 4, 5]);
         msg.add(0x03, vec![6]);
-        
+
         assert_eq!(msg.count(), 3);
-        
+
         let mut buf = [0u8; 100];
         let len = msg.encode(&mut buf).unwrap();
-        
+
         let decoded = OgsTlvMsg::decode(&buf[..len], OGS_TLV_MODE_T1_L1).unwrap();
         assert_eq!(decoded.count(), 3);
-        
+
         let elem = decoded.find(0x02).unwrap();
         assert_eq!(elem.value, vec![3, 4, 5]);
     }
@@ -453,7 +460,7 @@ mod tests {
     #[test]
     fn test_tlv_value_helpers() {
         let tlv = OgsTlv::new(OGS_TLV_MODE_T1_L1, 0x01, vec![0x12, 0x34, 0x56, 0x78]);
-        
+
         assert_eq!(tlv.value_u8(), 0x12);
         assert_eq!(tlv.value_u16(), 0x1234);
         assert_eq!(tlv.value_u32(), 0x12345678);
@@ -467,20 +474,20 @@ mod tests {
             OGS_TLV_MODE_T1_L2_I1,
             OGS_TLV_MODE_T2_L2,
         ];
-        
+
         for mode in modes {
             let original = OgsTlv::with_instance(mode, 0x42, 0x05, vec![1, 2, 3, 4, 5]);
-            
+
             let mut buf = [0u8; 100];
             let len = original.encode(&mut buf).unwrap();
-            
+
             let (decoded, decoded_len) = OgsTlv::decode(&buf[..len], mode).unwrap();
-            
+
             assert_eq!(decoded_len, len);
             assert_eq!(decoded.tlv_type, original.tlv_type);
             assert_eq!(decoded.length, original.length);
             assert_eq!(decoded.value, original.value);
-            
+
             if mode == OGS_TLV_MODE_T1_L2_I1 {
                 assert_eq!(decoded.instance, original.instance);
             }
@@ -490,10 +497,10 @@ mod tests {
     #[test]
     fn test_tlv_buffer_too_small() {
         let tlv = OgsTlv::new(OGS_TLV_MODE_T1_L1, 0x42, vec![1, 2, 3, 4]);
-        
+
         let mut buf = [0u8; 3]; // Too small
         let result = tlv.encode(&mut buf);
-        
+
         assert!(matches!(result, Err(TlvError::BufferTooSmall)));
     }
 
@@ -501,7 +508,7 @@ mod tests {
     fn test_tlv_unexpected_end() {
         let buf = [0x42, 0x10]; // Type and length, but no value
         let result = OgsTlv::decode(&buf, OGS_TLV_MODE_T1_L1);
-        
+
         assert!(matches!(result, Err(TlvError::UnexpectedEnd)));
     }
 }

@@ -183,7 +183,8 @@ impl GraphDbClient {
         id: &str,
         properties: HashMap<String, PropertyValue>,
     ) -> GraphDbResult<()> {
-        let node = self.nodes
+        let node = self
+            .nodes
             .get_mut(id)
             .ok_or_else(|| GraphDbError::NodeNotFound(id.to_string()))?;
 
@@ -196,13 +197,13 @@ impl GraphDbClient {
 
     /// Delete node
     pub fn delete_node(&mut self, id: &str) -> GraphDbResult<()> {
-        self.nodes.remove(id)
+        self.nodes
+            .remove(id)
             .ok_or_else(|| GraphDbError::NodeNotFound(id.to_string()))?;
 
         // Remove relationships involving this node
-        self.relationships.retain(|_, rel| {
-            rel.from_node != id && rel.to_node != id
-        });
+        self.relationships
+            .retain(|_, rel| rel.from_node != id && rel.to_node != id);
 
         Ok(())
     }
@@ -243,7 +244,8 @@ impl GraphDbClient {
 
     /// Delete relationship
     pub fn delete_relationship(&mut self, id: &str) -> GraphDbResult<()> {
-        self.relationships.remove(id)
+        self.relationships
+            .remove(id)
             .ok_or_else(|| GraphDbError::RelationshipNotFound(id.to_string()))?;
         Ok(())
     }
@@ -311,7 +313,8 @@ impl GraphDbClient {
             if let Some(label_start) = query_lower.find("(n:") {
                 if let Some(label_end) = query_lower[label_start..].find(")") {
                     let label = &query.query[label_start + 3..label_start + label_end];
-                    let nodes: Vec<GraphNode> = self.find_nodes_by_label(label)
+                    let nodes: Vec<GraphNode> = self
+                        .find_nodes_by_label(label)
                         .into_iter()
                         .cloned()
                         .collect();
@@ -320,7 +323,9 @@ impl GraphDbClient {
             }
         }
 
-        Err(GraphDbError::InvalidQuery("Unsupported query format".to_string()))
+        Err(GraphDbError::InvalidQuery(
+            "Unsupported query format".to_string(),
+        ))
     }
 
     /// Get node count
@@ -406,7 +411,9 @@ impl GraphDbClient {
         let rels: Vec<&GraphRelationship> = self
             .relationships
             .values()
-            .filter(|r| node_ids.contains(r.from_node.as_str()) || node_ids.contains(r.to_node.as_str()))
+            .filter(|r| {
+                node_ids.contains(r.from_node.as_str()) || node_ids.contains(r.to_node.as_str())
+            })
             .collect();
 
         (nodes, rels)
@@ -436,9 +443,13 @@ impl NetworkTopology {
     /// Add NF node
     pub fn add_nf(&mut self, nf_type: &str, nf_instance_id: &str) -> GraphDbResult<GraphNode> {
         let mut props = HashMap::new();
-        props.insert("nf_instance_id".to_string(), PropertyValue::String(nf_instance_id.to_string()));
+        props.insert(
+            "nf_instance_id".to_string(),
+            PropertyValue::String(nf_instance_id.to_string()),
+        );
 
-        self.client.create_node(vec!["NF".to_string(), nf_type.to_string()], props)
+        self.client
+            .create_node(vec!["NF".to_string(), nf_type.to_string()], props)
     }
 
     /// Add slice node
@@ -456,12 +467,8 @@ impl NetworkTopology {
         ue_id: &str,
         nf_id: &str,
     ) -> GraphDbResult<GraphRelationship> {
-        self.client.create_relationship(
-            ue_id,
-            nf_id,
-            "REGISTERED_WITH",
-            HashMap::new(),
-        )
+        self.client
+            .create_relationship(ue_id, nf_id, "REGISTERED_WITH", HashMap::new())
     }
 
     /// Associate UE with slice
@@ -470,12 +477,8 @@ impl NetworkTopology {
         ue_id: &str,
         slice_id: &str,
     ) -> GraphDbResult<GraphRelationship> {
-        self.client.create_relationship(
-            ue_id,
-            slice_id,
-            "USES_SLICE",
-            HashMap::new(),
-        )
+        self.client
+            .create_relationship(ue_id, slice_id, "USES_SLICE", HashMap::new())
     }
 
     /// Get UEs for a slice
@@ -506,9 +509,14 @@ mod tests {
     fn test_create_node() {
         let mut client = GraphDbClient::in_memory();
         let mut props = HashMap::new();
-        props.insert("name".to_string(), PropertyValue::String("test".to_string()));
+        props.insert(
+            "name".to_string(),
+            PropertyValue::String("test".to_string()),
+        );
 
-        let node = client.create_node(vec!["TestNode".to_string()], props).unwrap();
+        let node = client
+            .create_node(vec!["TestNode".to_string()], props)
+            .unwrap();
         assert_eq!(node.labels, vec!["TestNode".to_string()]);
         assert!(node.properties.contains_key("name"));
     }
@@ -516,7 +524,9 @@ mod tests {
     #[test]
     fn test_get_node() {
         let mut client = GraphDbClient::in_memory();
-        let node = client.create_node(vec!["Test".to_string()], HashMap::new()).unwrap();
+        let node = client
+            .create_node(vec!["Test".to_string()], HashMap::new())
+            .unwrap();
 
         let retrieved = client.get_node(&node.id).unwrap();
         assert_eq!(retrieved.id, node.id);
@@ -525,15 +535,16 @@ mod tests {
     #[test]
     fn test_create_relationship() {
         let mut client = GraphDbClient::in_memory();
-        let node1 = client.create_node(vec!["Node1".to_string()], HashMap::new()).unwrap();
-        let node2 = client.create_node(vec!["Node2".to_string()], HashMap::new()).unwrap();
+        let node1 = client
+            .create_node(vec!["Node1".to_string()], HashMap::new())
+            .unwrap();
+        let node2 = client
+            .create_node(vec!["Node2".to_string()], HashMap::new())
+            .unwrap();
 
-        let rel = client.create_relationship(
-            &node1.id,
-            &node2.id,
-            "CONNECTS_TO",
-            HashMap::new(),
-        ).unwrap();
+        let rel = client
+            .create_relationship(&node1.id, &node2.id, "CONNECTS_TO", HashMap::new())
+            .unwrap();
 
         assert_eq!(rel.from_node, node1.id);
         assert_eq!(rel.to_node, node2.id);
@@ -543,9 +554,15 @@ mod tests {
     #[test]
     fn test_find_nodes_by_label() {
         let mut client = GraphDbClient::in_memory();
-        client.create_node(vec!["UE".to_string()], HashMap::new()).unwrap();
-        client.create_node(vec!["UE".to_string()], HashMap::new()).unwrap();
-        client.create_node(vec!["AMF".to_string()], HashMap::new()).unwrap();
+        client
+            .create_node(vec!["UE".to_string()], HashMap::new())
+            .unwrap();
+        client
+            .create_node(vec!["UE".to_string()], HashMap::new())
+            .unwrap();
+        client
+            .create_node(vec!["AMF".to_string()], HashMap::new())
+            .unwrap();
 
         let ues = client.find_nodes_by_label("UE");
         assert_eq!(ues.len(), 2);
@@ -556,17 +573,21 @@ mod tests {
         let mut client = GraphDbClient::in_memory();
 
         let mut props1 = HashMap::new();
-        props1.insert("status".to_string(), PropertyValue::String("active".to_string()));
+        props1.insert(
+            "status".to_string(),
+            PropertyValue::String("active".to_string()),
+        );
         client.create_node(vec!["UE".to_string()], props1).unwrap();
 
         let mut props2 = HashMap::new();
-        props2.insert("status".to_string(), PropertyValue::String("inactive".to_string()));
+        props2.insert(
+            "status".to_string(),
+            PropertyValue::String("inactive".to_string()),
+        );
         client.create_node(vec!["UE".to_string()], props2).unwrap();
 
-        let active_nodes = client.find_nodes_by_property(
-            "status",
-            &PropertyValue::String("active".to_string()),
-        );
+        let active_nodes =
+            client.find_nodes_by_property("status", &PropertyValue::String("active".to_string()));
         assert_eq!(active_nodes.len(), 1);
     }
 
@@ -588,12 +609,22 @@ mod tests {
     #[test]
     fn test_get_relationships() {
         let mut client = GraphDbClient::in_memory();
-        let node1 = client.create_node(vec!["N1".to_string()], HashMap::new()).unwrap();
-        let node2 = client.create_node(vec!["N2".to_string()], HashMap::new()).unwrap();
-        let node3 = client.create_node(vec!["N3".to_string()], HashMap::new()).unwrap();
+        let node1 = client
+            .create_node(vec!["N1".to_string()], HashMap::new())
+            .unwrap();
+        let node2 = client
+            .create_node(vec!["N2".to_string()], HashMap::new())
+            .unwrap();
+        let node3 = client
+            .create_node(vec!["N3".to_string()], HashMap::new())
+            .unwrap();
 
-        client.create_relationship(&node1.id, &node2.id, "REL1", HashMap::new()).unwrap();
-        client.create_relationship(&node2.id, &node3.id, "REL2", HashMap::new()).unwrap();
+        client
+            .create_relationship(&node1.id, &node2.id, "REL1", HashMap::new())
+            .unwrap();
+        client
+            .create_relationship(&node2.id, &node3.id, "REL2", HashMap::new())
+            .unwrap();
 
         let outgoing = client.get_outgoing_relationships(&node1.id);
         assert_eq!(outgoing.len(), 1);
@@ -608,7 +639,9 @@ mod tests {
     #[test]
     fn test_delete_node() {
         let mut client = GraphDbClient::in_memory();
-        let node = client.create_node(vec!["Test".to_string()], HashMap::new()).unwrap();
+        let node = client
+            .create_node(vec!["Test".to_string()], HashMap::new())
+            .unwrap();
 
         let node_id = node.id.clone();
         assert!(client.get_node(&node_id).is_ok());
@@ -634,13 +667,27 @@ mod tests {
     #[test]
     fn test_bfs_neighbors() {
         let mut client = GraphDbClient::in_memory();
-        let n1 = client.create_node(vec!["A".into()], HashMap::new()).unwrap();
-        let n2 = client.create_node(vec!["B".into()], HashMap::new()).unwrap();
-        let n3 = client.create_node(vec!["C".into()], HashMap::new()).unwrap();
-        let n4 = client.create_node(vec!["D".into()], HashMap::new()).unwrap();
-        client.create_relationship(&n1.id, &n2.id, "LINK", HashMap::new()).unwrap();
-        client.create_relationship(&n2.id, &n3.id, "LINK", HashMap::new()).unwrap();
-        client.create_relationship(&n3.id, &n4.id, "LINK", HashMap::new()).unwrap();
+        let n1 = client
+            .create_node(vec!["A".into()], HashMap::new())
+            .unwrap();
+        let n2 = client
+            .create_node(vec!["B".into()], HashMap::new())
+            .unwrap();
+        let n3 = client
+            .create_node(vec!["C".into()], HashMap::new())
+            .unwrap();
+        let n4 = client
+            .create_node(vec!["D".into()], HashMap::new())
+            .unwrap();
+        client
+            .create_relationship(&n1.id, &n2.id, "LINK", HashMap::new())
+            .unwrap();
+        client
+            .create_relationship(&n2.id, &n3.id, "LINK", HashMap::new())
+            .unwrap();
+        client
+            .create_relationship(&n3.id, &n4.id, "LINK", HashMap::new())
+            .unwrap();
 
         let path = client.shortest_path(&n1.id, &n4.id);
         assert!(path.is_some());
@@ -653,8 +700,12 @@ mod tests {
     #[test]
     fn test_bfs_no_path() {
         let mut client = GraphDbClient::in_memory();
-        let n1 = client.create_node(vec!["A".into()], HashMap::new()).unwrap();
-        let n2 = client.create_node(vec!["B".into()], HashMap::new()).unwrap();
+        let n1 = client
+            .create_node(vec!["A".into()], HashMap::new())
+            .unwrap();
+        let n2 = client
+            .create_node(vec!["B".into()], HashMap::new())
+            .unwrap();
         // No relationship between them
         assert!(client.shortest_path(&n1.id, &n2.id).is_none());
     }
@@ -662,7 +713,9 @@ mod tests {
     #[test]
     fn test_bfs_same_node() {
         let mut client = GraphDbClient::in_memory();
-        let n1 = client.create_node(vec!["A".into()], HashMap::new()).unwrap();
+        let n1 = client
+            .create_node(vec!["A".into()], HashMap::new())
+            .unwrap();
         let path = client.shortest_path(&n1.id, &n1.id).unwrap();
         assert_eq!(path, vec![n1.id]);
     }
@@ -670,11 +723,21 @@ mod tests {
     #[test]
     fn test_neighbors() {
         let mut client = GraphDbClient::in_memory();
-        let n1 = client.create_node(vec!["A".into()], HashMap::new()).unwrap();
-        let n2 = client.create_node(vec!["B".into()], HashMap::new()).unwrap();
-        let n3 = client.create_node(vec!["C".into()], HashMap::new()).unwrap();
-        client.create_relationship(&n1.id, &n2.id, "LINK", HashMap::new()).unwrap();
-        client.create_relationship(&n1.id, &n3.id, "LINK", HashMap::new()).unwrap();
+        let n1 = client
+            .create_node(vec!["A".into()], HashMap::new())
+            .unwrap();
+        let n2 = client
+            .create_node(vec!["B".into()], HashMap::new())
+            .unwrap();
+        let n3 = client
+            .create_node(vec!["C".into()], HashMap::new())
+            .unwrap();
+        client
+            .create_relationship(&n1.id, &n2.id, "LINK", HashMap::new())
+            .unwrap();
+        client
+            .create_relationship(&n1.id, &n3.id, "LINK", HashMap::new())
+            .unwrap();
 
         let neighbors = client.neighbors(&n1.id);
         assert_eq!(neighbors.len(), 2);
@@ -683,11 +746,21 @@ mod tests {
     #[test]
     fn test_subgraph_by_label() {
         let mut client = GraphDbClient::in_memory();
-        let n1 = client.create_node(vec!["UE".into()], HashMap::new()).unwrap();
-        let n2 = client.create_node(vec!["AMF".into()], HashMap::new()).unwrap();
-        let n3 = client.create_node(vec!["UE".into()], HashMap::new()).unwrap();
-        client.create_relationship(&n1.id, &n2.id, "REG", HashMap::new()).unwrap();
-        client.create_relationship(&n3.id, &n2.id, "REG", HashMap::new()).unwrap();
+        let n1 = client
+            .create_node(vec!["UE".into()], HashMap::new())
+            .unwrap();
+        let n2 = client
+            .create_node(vec!["AMF".into()], HashMap::new())
+            .unwrap();
+        let n3 = client
+            .create_node(vec!["UE".into()], HashMap::new())
+            .unwrap();
+        client
+            .create_relationship(&n1.id, &n2.id, "REG", HashMap::new())
+            .unwrap();
+        client
+            .create_relationship(&n3.id, &n2.id, "REG", HashMap::new())
+            .unwrap();
 
         let (nodes, rels) = client.subgraph_by_label("UE");
         assert_eq!(nodes.len(), 2);

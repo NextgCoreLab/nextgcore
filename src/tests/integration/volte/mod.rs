@@ -10,7 +10,6 @@
 //!
 //! Reference: 3GPP TS 23.228 (IMS), 3GPP TS 24.229, 3GPP TS 23.401
 
-
 /// QCI values for VoLTE
 pub mod qci {
     /// Conversational voice (guaranteed bit rate)
@@ -87,11 +86,17 @@ fn test_ims_registration() {
     assert!(attach_result.is_ok(), "IMS APN attach failed");
 
     let session_info = attach_result.unwrap();
-    assert!(!session_info.pcscf_addresses.is_empty(), "No P-CSCF addresses in PCO");
+    assert!(
+        !session_info.pcscf_addresses.is_empty(),
+        "No P-CSCF addresses in PCO"
+    );
 
     // Step 2: Verify P-CSCF was provided
     assert!(
-        session_info.pcscf_addresses.iter().any(|a| a.contains("pcscf")),
+        session_info
+            .pcscf_addresses
+            .iter()
+            .any(|a| a.contains("pcscf")),
         "P-CSCF not found in provided addresses"
     );
 
@@ -294,7 +299,10 @@ fn simulate_ims_registration(_config: &VolteTestConfig) -> Result<(), &'static s
     Ok(())
 }
 
-fn simulate_mo_voice_call(_config: &VolteTestConfig, _callee: &str) -> Result<CallInfo, &'static str> {
+fn simulate_mo_voice_call(
+    _config: &VolteTestConfig,
+    _callee: &str,
+) -> Result<CallInfo, &'static str> {
     // Stub - would trigger SIP INVITE and bearer setup
     Ok(CallInfo {
         state: VoiceCallState::Connected,
@@ -308,7 +316,10 @@ fn simulate_mo_voice_call(_config: &VolteTestConfig, _callee: &str) -> Result<Ca
     })
 }
 
-fn simulate_mt_voice_call(_config: &VolteTestConfig, _caller: &str) -> Result<CallInfo, &'static str> {
+fn simulate_mt_voice_call(
+    _config: &VolteTestConfig,
+    _caller: &str,
+) -> Result<CallInfo, &'static str> {
     Ok(CallInfo {
         state: VoiceCallState::Alerting,
         dedicated_bearer_established: true,
@@ -334,7 +345,10 @@ fn simulate_answer_call(_call: &CallInfo) -> Result<CallInfo, &'static str> {
     })
 }
 
-fn simulate_intra_lte_handover(call: &CallInfo, target_cell_id: u32) -> Result<CallInfo, &'static str> {
+fn simulate_intra_lte_handover(
+    call: &CallInfo,
+    target_cell_id: u32,
+) -> Result<CallInfo, &'static str> {
     Ok(CallInfo {
         state: VoiceCallState::Connected,
         dedicated_bearer_established: call.dedicated_bearer_established,
@@ -347,7 +361,10 @@ fn simulate_intra_lte_handover(call: &CallInfo, target_cell_id: u32) -> Result<C
     })
 }
 
-fn simulate_emergency_call(_config: &VolteTestConfig, _number: &str) -> Result<CallInfo, &'static str> {
+fn simulate_emergency_call(
+    _config: &VolteTestConfig,
+    _number: &str,
+) -> Result<CallInfo, &'static str> {
     Ok(CallInfo {
         state: VoiceCallState::Connected,
         dedicated_bearer_established: true,

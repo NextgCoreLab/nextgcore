@@ -91,11 +91,7 @@ pub fn send_create_session_response(sess: &SgwcSess, xact_id: u64) -> Result<(),
 }
 
 /// Send Modify Bearer Response to MME
-pub fn send_modify_bearer_response(
-    sess: &SgwcSess,
-    xact_id: u64,
-    cause: u8,
-) -> Result<(), String> {
+pub fn send_modify_bearer_response(sess: &SgwcSess, xact_id: u64, cause: u8) -> Result<(), String> {
     let msg = s11_build::build_modify_bearer_response(sess, cause)
         .ok_or_else(|| "Failed to build Modify Bearer Response".to_string())?;
 
@@ -130,10 +126,7 @@ pub fn send_delete_session_response(
 
 /// Send Downlink Data Notification to MME
 /// Port of sgwc_gtp_send_downlink_data_notification
-pub fn send_downlink_data_notification(
-    cause_value: u8,
-    bearer: &SgwcBearer,
-) -> Result<(), String> {
+pub fn send_downlink_data_notification(cause_value: u8, bearer: &SgwcBearer) -> Result<(), String> {
     let ctx = sgwc_self();
 
     let sgwc_ue = ctx
@@ -143,10 +136,7 @@ pub fn send_downlink_data_notification(
     let msg = s11_build::build_downlink_data_notification(cause_value, bearer)
         .ok_or_else(|| "Failed to build Downlink Data Notification".to_string())?;
 
-    log::info!(
-        "Downlink Data Notification [bearer_id={}]",
-        bearer.id
-    );
+    log::info!("Downlink Data Notification [bearer_id={}]", bearer.id);
     log::info!(
         "    MME_S11_TEID[{}] SGW_S11_TEID[{}]",
         sgwc_ue.mme_s11_teid,
@@ -187,7 +177,9 @@ pub fn send_create_indirect_data_forwarding_tunnel_response(
     cause: u8,
 ) -> Result<(), String> {
     let msg = s11_build::build_create_indirect_data_forwarding_tunnel_response(sgwc_ue_id, cause)
-        .ok_or_else(|| "Failed to build Create Indirect Data Forwarding Tunnel Response".to_string())?;
+        .ok_or_else(|| {
+        "Failed to build Create Indirect Data Forwarding Tunnel Response".to_string()
+    })?;
 
     log::info!(
         "Sending Create Indirect Data Forwarding Tunnel Response: teid={}, xact_id={}",
@@ -205,7 +197,9 @@ pub fn send_delete_indirect_data_forwarding_tunnel_response(
     cause: u8,
 ) -> Result<(), String> {
     let msg = s11_build::build_delete_indirect_data_forwarding_tunnel_response(sgwc_ue_id, cause)
-        .ok_or_else(|| "Failed to build Delete Indirect Data Forwarding Tunnel Response".to_string())?;
+        .ok_or_else(|| {
+        "Failed to build Delete Indirect Data Forwarding Tunnel Response".to_string()
+    })?;
 
     log::info!(
         "Sending Delete Indirect Data Forwarding Tunnel Response: teid={}, xact_id={}",
@@ -217,15 +211,8 @@ pub fn send_delete_indirect_data_forwarding_tunnel_response(
 }
 
 /// Send GTP error message
-pub fn send_error_message(
-    xact_id: u64,
-    teid: u32,
-    msg_type: u8,
-    cause: u8,
-) -> Result<(), String> {
-    log::error!(
-        "Sending GTP Error: type={msg_type}, teid={teid}, cause={cause}"
-    );
+pub fn send_error_message(xact_id: u64, teid: u32, msg_type: u8, cause: u8) -> Result<(), String> {
+    log::error!("Sending GTP Error: type={msg_type}, teid={teid}, cause={cause}");
 
     let mut msg = GtpMessage::new(msg_type, teid);
     msg.data.push(cause);

@@ -82,12 +82,10 @@ pub fn hss_s6a_send_clr(
     mme_realm: Option<&str>,
     cancellation_type: CancellationType,
 ) -> Result<(), String> {
-    log::info!(
-        "[{imsi_bcd}] Sending Cancel-Location-Request (type={cancellation_type:?})"
-    );
+    log::info!("[{imsi_bcd}] Sending Cancel-Location-Request (type={cancellation_type:?})");
 
-    use ogs_diameter::s6a::{S6A_APPLICATION_ID, cmd, avp};
-    use ogs_diameter::{DiameterMessage, Avp, AvpData, avp_code, OGS_3GPP_VENDOR_ID};
+    use ogs_diameter::s6a::{avp, cmd, S6A_APPLICATION_ID};
+    use ogs_diameter::{avp_code, Avp, AvpData, DiameterMessage, OGS_3GPP_VENDOR_ID};
 
     // 1. Look up MME host/realm from DB if not provided
     let (dest_host, dest_realm) = if let (Some(h), Some(r)) = (mme_host, mme_realm) {
@@ -100,14 +98,19 @@ pub fn hss_s6a_send_clr(
             .map_err(|e| format!("Failed to get subscriber collection: {e}"))?;
 
         let query = doc! { "imsi": imsi_bcd };
-        let doc = collection.find_one(query, None)
+        let doc = collection
+            .find_one(query, None)
             .map_err(|e| format!("Failed to query DB: {e}"))?
             .ok_or_else(|| format!("Subscriber not found: {imsi_bcd}"))?;
 
-        let host = doc.get_str("mme_host")
-            .unwrap_or("mme.epc.mnc001.mcc001.3gppnetwork.org").to_string();
-        let realm = doc.get_str("mme_realm")
-            .unwrap_or("epc.mnc001.mcc001.3gppnetwork.org").to_string();
+        let host = doc
+            .get_str("mme_host")
+            .unwrap_or("mme.epc.mnc001.mcc001.3gppnetwork.org")
+            .to_string();
+        let realm = doc
+            .get_str("mme_realm")
+            .unwrap_or("epc.mnc001.mcc001.3gppnetwork.org")
+            .to_string();
 
         (host, realm)
     };
@@ -116,31 +119,57 @@ pub fn hss_s6a_send_clr(
     let mut msg = DiameterMessage::new_request(cmd::CANCEL_LOCATION, S6A_APPLICATION_ID);
 
     // Session-Id
-    let session_id = format!("hss.session.{}.{}", imsi_bcd, std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).expect("value expected").as_secs());
-    msg.add_avp(Avp::mandatory(avp_code::SESSION_ID, AvpData::Utf8String(session_id)));
+    let session_id = format!(
+        "hss.session.{}.{}",
+        imsi_bcd,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("value expected")
+            .as_secs()
+    );
+    msg.add_avp(Avp::mandatory(
+        avp_code::SESSION_ID,
+        AvpData::Utf8String(session_id),
+    ));
 
     // Origin-Host and Origin-Realm (would come from HSS config)
-    msg.add_avp(Avp::mandatory(avp_code::ORIGIN_HOST,
-        AvpData::DiameterIdentity("hss.epc.mnc001.mcc001.3gppnetwork.org".to_string())));
-    msg.add_avp(Avp::mandatory(avp_code::ORIGIN_REALM,
-        AvpData::DiameterIdentity("epc.mnc001.mcc001.3gppnetwork.org".to_string())));
+    msg.add_avp(Avp::mandatory(
+        avp_code::ORIGIN_HOST,
+        AvpData::DiameterIdentity("hss.epc.mnc001.mcc001.3gppnetwork.org".to_string()),
+    ));
+    msg.add_avp(Avp::mandatory(
+        avp_code::ORIGIN_REALM,
+        AvpData::DiameterIdentity("epc.mnc001.mcc001.3gppnetwork.org".to_string()),
+    ));
 
     // Destination-Host and Destination-Realm
-    msg.add_avp(Avp::mandatory(avp_code::DESTINATION_HOST,
-        AvpData::DiameterIdentity(dest_host.clone())));
-    msg.add_avp(Avp::mandatory(avp_code::DESTINATION_REALM,
-        AvpData::DiameterIdentity(dest_realm)));
+    msg.add_avp(Avp::mandatory(
+        avp_code::DESTINATION_HOST,
+        AvpData::DiameterIdentity(dest_host.clone()),
+    ));
+    msg.add_avp(Avp::mandatory(
+        avp_code::DESTINATION_REALM,
+        AvpData::DiameterIdentity(dest_realm),
+    ));
 
     // User-Name (IMSI)
-    msg.add_avp(Avp::mandatory(avp_code::USER_NAME, AvpData::Utf8String(imsi_bcd.to_string())));
+    msg.add_avp(Avp::mandatory(
+        avp_code::USER_NAME,
+        AvpData::Utf8String(imsi_bcd.to_string()),
+    ));
 
     // Auth-Session-State (NO_STATE_MAINTAINED)
-    msg.add_avp(Avp::mandatory(avp_code::AUTH_SESSION_STATE, AvpData::Enumerated(1)));
+    msg.add_avp(Avp::mandatory(
+        avp_code::AUTH_SESSION_STATE,
+        AvpData::Enumerated(1),
+    ));
 
     // Cancellation-Type
-    msg.add_avp(Avp::vendor_mandatory(avp::CANCELLATION_TYPE, OGS_3GPP_VENDOR_ID,
-        AvpData::Enumerated(cancellation_type as i32)));
+    msg.add_avp(Avp::vendor_mandatory(
+        avp::CANCELLATION_TYPE,
+        OGS_3GPP_VENDOR_ID,
+        AvpData::Enumerated(cancellation_type as i32),
+    ));
 
     // 3. Send message and register CLA callback
     // Note: In full implementation, this would use the Diameter transport to send
@@ -157,33 +186,34 @@ pub fn hss_s6a_send_clr(
 /// * `imsi_bcd` - IMSI in BCD format
 /// * `idr_flags` - IDR flags
 /// * `subdata_mask` - Subscription data mask indicating which data to include
-pub fn hss_s6a_send_idr(
-    imsi_bcd: &str,
-    idr_flags: u32,
-    subdata_mask: u32,
-) -> Result<(), String> {
+pub fn hss_s6a_send_idr(imsi_bcd: &str, idr_flags: u32, subdata_mask: u32) -> Result<(), String> {
     log::info!(
         "[{imsi_bcd}] Sending Insert-Subscriber-Data-Request (flags={idr_flags}, mask={subdata_mask})"
     );
 
-    use ogs_diameter::s6a::{S6A_APPLICATION_ID, cmd, avp};
-    use ogs_diameter::{DiameterMessage, Avp, AvpData, avp_code, OGS_3GPP_VENDOR_ID};
-    use ogs_dbi::{mongoc::get_subscriber_collection, mongodb::bson::doc};
     use ogs_dbi::ogs_dbi_subscription_data;
+    use ogs_dbi::{mongoc::get_subscriber_collection, mongodb::bson::doc};
+    use ogs_diameter::s6a::{avp, cmd, S6A_APPLICATION_ID};
+    use ogs_diameter::{avp_code, Avp, AvpData, DiameterMessage, OGS_3GPP_VENDOR_ID};
 
     // 1. Look up MME host/realm from DB
     let collection = get_subscriber_collection()
         .map_err(|e| format!("Failed to get subscriber collection: {e}"))?;
 
     let query = doc! { "imsi": imsi_bcd };
-    let doc = collection.find_one(query, None)
+    let doc = collection
+        .find_one(query, None)
         .map_err(|e| format!("Failed to query DB: {e}"))?
         .ok_or_else(|| format!("Subscriber not found: {imsi_bcd}"))?;
 
-    let dest_host = doc.get_str("mme_host")
-        .unwrap_or("mme.epc.mnc001.mcc001.3gppnetwork.org").to_string();
-    let dest_realm = doc.get_str("mme_realm")
-        .unwrap_or("epc.mnc001.mcc001.3gppnetwork.org").to_string();
+    let dest_host = doc
+        .get_str("mme_host")
+        .unwrap_or("mme.epc.mnc001.mcc001.3gppnetwork.org")
+        .to_string();
+    let dest_realm = doc
+        .get_str("mme_realm")
+        .unwrap_or("epc.mnc001.mcc001.3gppnetwork.org")
+        .to_string();
 
     // 2. Get subscription data from DB
     let supi = format!("imsi-{imsi_bcd}");
@@ -194,31 +224,57 @@ pub fn hss_s6a_send_idr(
     let mut msg = DiameterMessage::new_request(cmd::INSERT_SUBSCRIBER_DATA, S6A_APPLICATION_ID);
 
     // Session-Id
-    let session_id = format!("hss.session.{}.{}", imsi_bcd, std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).expect("value expected").as_secs());
-    msg.add_avp(Avp::mandatory(avp_code::SESSION_ID, AvpData::Utf8String(session_id)));
+    let session_id = format!(
+        "hss.session.{}.{}",
+        imsi_bcd,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("value expected")
+            .as_secs()
+    );
+    msg.add_avp(Avp::mandatory(
+        avp_code::SESSION_ID,
+        AvpData::Utf8String(session_id),
+    ));
 
     // Origin-Host and Origin-Realm
-    msg.add_avp(Avp::mandatory(avp_code::ORIGIN_HOST,
-        AvpData::DiameterIdentity("hss.epc.mnc001.mcc001.3gppnetwork.org".to_string())));
-    msg.add_avp(Avp::mandatory(avp_code::ORIGIN_REALM,
-        AvpData::DiameterIdentity("epc.mnc001.mcc001.3gppnetwork.org".to_string())));
+    msg.add_avp(Avp::mandatory(
+        avp_code::ORIGIN_HOST,
+        AvpData::DiameterIdentity("hss.epc.mnc001.mcc001.3gppnetwork.org".to_string()),
+    ));
+    msg.add_avp(Avp::mandatory(
+        avp_code::ORIGIN_REALM,
+        AvpData::DiameterIdentity("epc.mnc001.mcc001.3gppnetwork.org".to_string()),
+    ));
 
     // Destination-Host and Destination-Realm
-    msg.add_avp(Avp::mandatory(avp_code::DESTINATION_HOST,
-        AvpData::DiameterIdentity(dest_host.clone())));
-    msg.add_avp(Avp::mandatory(avp_code::DESTINATION_REALM,
-        AvpData::DiameterIdentity(dest_realm)));
+    msg.add_avp(Avp::mandatory(
+        avp_code::DESTINATION_HOST,
+        AvpData::DiameterIdentity(dest_host.clone()),
+    ));
+    msg.add_avp(Avp::mandatory(
+        avp_code::DESTINATION_REALM,
+        AvpData::DiameterIdentity(dest_realm),
+    ));
 
     // User-Name (IMSI)
-    msg.add_avp(Avp::mandatory(avp_code::USER_NAME, AvpData::Utf8String(imsi_bcd.to_string())));
+    msg.add_avp(Avp::mandatory(
+        avp_code::USER_NAME,
+        AvpData::Utf8String(imsi_bcd.to_string()),
+    ));
 
     // Auth-Session-State (NO_STATE_MAINTAINED)
-    msg.add_avp(Avp::mandatory(avp_code::AUTH_SESSION_STATE, AvpData::Enumerated(1)));
+    msg.add_avp(Avp::mandatory(
+        avp_code::AUTH_SESSION_STATE,
+        AvpData::Enumerated(1),
+    ));
 
     // IDR-Flags
-    msg.add_avp(Avp::vendor_mandatory(avp::IDR_FLAGS, OGS_3GPP_VENDOR_ID,
-        AvpData::Unsigned32(idr_flags)));
+    msg.add_avp(Avp::vendor_mandatory(
+        avp::IDR_FLAGS,
+        OGS_3GPP_VENDOR_ID,
+        AvpData::Unsigned32(idr_flags),
+    ));
 
     // Subscription-Data (based on subdata_mask)
     // Note: In full implementation, this would build a complex grouped AVP
@@ -240,18 +296,22 @@ pub fn hss_s6a_send_idr(
 /// Handle Authentication-Information-Request (AIR)
 ///
 /// This is called when MME requests authentication vectors for a UE
-pub fn handle_air(imsi_bcd: &str, visited_plmn_id: &[u8], resync_info: Option<&[u8]>) -> Result<AirResponse, String> {
+pub fn handle_air(
+    imsi_bcd: &str,
+    visited_plmn_id: &[u8],
+    resync_info: Option<&[u8]>,
+) -> Result<AirResponse, String> {
     log::debug!("[{imsi_bcd}] Handling AIR");
     diam_stats().s6a.inc_rx_air();
 
-    use ogs_dbi::{ogs_dbi_auth_info, ogs_dbi_increment_sqn, ogs_dbi_update_sqn};
-    use ogs_crypt::milenage::{milenage_f1, milenage_f2345, milenage_opc};
     use ogs_crypt::kdf::ogs_auc_kasme;
+    use ogs_crypt::milenage::{milenage_f1, milenage_f2345, milenage_opc};
+    use ogs_dbi::{ogs_dbi_auth_info, ogs_dbi_increment_sqn, ogs_dbi_update_sqn};
 
     // 1. Get auth info from DB (K, OPc, SQN, AMF)
     let supi = format!("imsi-{imsi_bcd}");
-    let auth_info = ogs_dbi_auth_info(&supi)
-        .map_err(|e| format!("Failed to get auth info: {e}"))?;
+    let auth_info =
+        ogs_dbi_auth_info(&supi).map_err(|e| format!("Failed to get auth info: {e}"))?;
 
     let mut sqn = auth_info.sqn;
 
@@ -263,8 +323,7 @@ pub fn handle_air(imsi_bcd: &str, visited_plmn_id: &[u8], resync_info: Option<&[
             // Extract and verify MAC-S, then extract SQN_MS
             // For now, we'll increment SQN significantly on resync
             sqn = sqn.wrapping_add(0x10000); // Jump ahead on resync
-            ogs_dbi_update_sqn(&supi, sqn)
-                .map_err(|e| format!("Failed to update SQN: {e}"))?;
+            ogs_dbi_update_sqn(&supi, sqn).map_err(|e| format!("Failed to update SQN: {e}"))?;
         }
     }
 
@@ -316,8 +375,7 @@ pub fn handle_air(imsi_bcd: &str, visited_plmn_id: &[u8], resync_info: Option<&[
     let kasme = ogs_auc_kasme(&ck, &ik, &plmn_id, &sqn_bytes, &ak);
 
     // 4. Update SQN in DB (increment by 32)
-    ogs_dbi_increment_sqn(&supi)
-        .map_err(|e| format!("Failed to increment SQN: {e}"))?;
+    ogs_dbi_increment_sqn(&supi).map_err(|e| format!("Failed to increment SQN: {e}"))?;
 
     // 5. Return AIA with E-UTRAN-Vector
     let response = AirResponse {
@@ -345,7 +403,7 @@ pub fn handle_ulr(
     log::debug!("[{imsi_bcd}] Handling ULR from {mme_host}.{mme_realm}");
     diam_stats().s6a.inc_rx_ulr();
 
-    use ogs_dbi::{ogs_dbi_update_mme, ogs_dbi_subscription_data};
+    use ogs_dbi::{ogs_dbi_subscription_data, ogs_dbi_update_mme};
 
     // 1. Update MME info in DB
     let supi = format!("imsi-{imsi_bcd}");
@@ -396,7 +454,8 @@ pub fn handle_pur(imsi_bcd: &str, pur_flags: u32) -> Result<PurResponse, String>
         }
     };
 
-    collection.update_one(query, update, None)
+    collection
+        .update_one(query, update, None)
         .map_err(|e| format!("Failed to update purge flag: {e}"))?;
 
     // 2. Return PUA
@@ -467,11 +526,8 @@ pub fn serialize_subscription_data(data: &ogs_dbi::OgsSubscriptionData) -> Vec<u
     buf.extend_from_slice(&data.ambr.uplink.to_be_bytes());
 
     // Collect all sessions from all slices
-    let sessions: Vec<&ogs_dbi::OgsSession> = data
-        .slice
-        .iter()
-        .flat_map(|s| s.session.iter())
-        .collect();
+    let sessions: Vec<&ogs_dbi::OgsSession> =
+        data.slice.iter().flat_map(|s| s.session.iter()).collect();
 
     buf.push(sessions.len().min(255) as u8);
 
@@ -503,14 +559,17 @@ pub fn serialize_subscription_data(data: &ogs_dbi::OgsSubscriptionData) -> Vec<u
 pub fn dispatch_s6a_request(
     request: &ogs_diameter::DiameterMessage,
 ) -> Option<ogs_diameter::DiameterMessage> {
-    use ogs_diameter::s6a::{S6A_APPLICATION_ID, cmd, avp as s6a_avp};
-    use ogs_diameter::{DiameterMessage, Avp, AvpData, avp_code, OGS_3GPP_VENDOR_ID};
+    use ogs_diameter::s6a::{avp as s6a_avp, cmd, S6A_APPLICATION_ID};
+    use ogs_diameter::{avp_code, Avp, AvpData, DiameterMessage, OGS_3GPP_VENDOR_ID};
 
     let cmd_code = request.header.command_code;
 
     // Verify this is an S6a request
     if request.header.application_id != S6A_APPLICATION_ID {
-        log::warn!("Non-S6a message received: app_id={}", request.header.application_id);
+        log::warn!(
+            "Non-S6a message received: app_id={}",
+            request.header.application_id
+        );
         return None;
     }
     if !request.header.is_request() {
@@ -590,7 +649,9 @@ pub fn dispatch_s6a_request(
                             Avp::vendor_mandatory(
                                 s6a_avp::KASME,
                                 OGS_3GPP_VENDOR_ID,
-                                AvpData::OctetString(bytes::Bytes::copy_from_slice(&air_resp.kasme)),
+                                AvpData::OctetString(bytes::Bytes::copy_from_slice(
+                                    &air_resp.kasme,
+                                )),
                             ),
                         ]),
                     );
@@ -624,7 +685,13 @@ pub fn dispatch_s6a_request(
             let mme_host = request.origin_host().unwrap_or("unknown").to_string();
             let mme_realm = request.origin_realm().unwrap_or("unknown").to_string();
 
-            match handle_ulr(&imsi_bcd, &visited_plmn_id, ulr_flags_val, &mme_host, &mme_realm) {
+            match handle_ulr(
+                &imsi_bcd,
+                &visited_plmn_id,
+                ulr_flags_val,
+                &mme_host,
+                &mme_realm,
+            ) {
                 Ok(ulr_resp) => {
                     let mut answer = DiameterMessage::new_answer(request);
                     if let Some(sid) = request.session_id() {
@@ -719,7 +786,7 @@ fn build_error_answer(
     request: &ogs_diameter::DiameterMessage,
     result_code: u32,
 ) -> ogs_diameter::DiameterMessage {
-    use ogs_diameter::{DiameterMessage, Avp, AvpData, avp_code};
+    use ogs_diameter::{avp_code, Avp, AvpData, DiameterMessage};
 
     let mut answer = DiameterMessage::new_answer(request);
     if let Some(sid) = request.session_id() {
@@ -744,7 +811,7 @@ fn build_error_answer(
 
 /// Add Origin-Host and Origin-Realm AVPs from HSS config
 fn add_origin_avps(msg: &mut ogs_diameter::DiameterMessage) {
-    use ogs_diameter::{Avp, AvpData, avp_code};
+    use ogs_diameter::{avp_code, Avp, AvpData};
 
     // In production these come from the HSS context/config
     msg.add_avp(Avp::mandatory(
@@ -793,7 +860,11 @@ pub fn build_diameter_answer(
 
     // Encode each AVP
     for avp in avps {
-        let avp_len = if avp.vendor_id != 0 { 12 + avp.data.len() } else { 8 + avp.data.len() };
+        let avp_len = if avp.vendor_id != 0 {
+            12 + avp.data.len()
+        } else {
+            8 + avp.data.len()
+        };
         let padded_len = (avp_len + 3) & !3; // 4-byte aligned
 
         // AVP Code (4 bytes)
@@ -818,15 +889,20 @@ pub fn build_diameter_answer(
     // Fill header
     buf[0] = 1; // Version
     buf[1..4].copy_from_slice(&msg_len.to_be_bytes()[1..4]); // Length (3 bytes)
-    // Command Flags: Answer (no R-bit), Proxiable
+                                                             // Command Flags: Answer (no R-bit), Proxiable
     buf[4] = 0x40; // P-bit set (proxiable)
     buf[5..8].copy_from_slice(&command_code.to_be_bytes()[1..4]); // Command Code (3 bytes)
     buf[8..12].copy_from_slice(&application_id.to_be_bytes()); // Application-ID
     buf[12..16].copy_from_slice(&1u32.to_be_bytes()); // Hop-by-Hop (placeholder)
     buf[16..20].copy_from_slice(&1u32.to_be_bytes()); // End-to-End (placeholder)
 
-    log::debug!("Built Diameter answer: cmd={}, app_id={}, len={}, avps={}",
-        command_code, application_id, msg_len, avps.len());
+    log::debug!(
+        "Built Diameter answer: cmd={}, app_id={}, len={}, avps={}",
+        command_code,
+        application_id,
+        msg_len,
+        avps.len()
+    );
 
     buf
 }
@@ -837,19 +913,22 @@ pub fn build_aia_avps(auth_info: &AirResponse) -> Vec<DiameterAvpData> {
 
     // Session-Id (263)
     avps.push(DiameterAvpData {
-        code: 263, vendor_id: 0,
+        code: 263,
+        vendor_id: 0,
         data: b"hss.s6a.session.1".to_vec(),
     });
 
     // Result-Code (268) - DIAMETER_SUCCESS
     avps.push(DiameterAvpData {
-        code: 268, vendor_id: 0,
+        code: 268,
+        vendor_id: 0,
         data: 2001u32.to_be_bytes().to_vec(),
     });
 
     // Auth-Session-State (277) - NO_STATE_MAINTAINED
     avps.push(DiameterAvpData {
-        code: 277, vendor_id: 0,
+        code: 277,
+        vendor_id: 0,
         data: 1u32.to_be_bytes().to_vec(),
     });
 
@@ -860,7 +939,8 @@ pub fn build_aia_avps(auth_info: &AirResponse) -> Vec<DiameterAvpData> {
     auth_data.extend_from_slice(&auth_info.autn);
     auth_data.extend_from_slice(&auth_info.kasme);
     avps.push(DiameterAvpData {
-        code: 1413, vendor_id: 10415,
+        code: 1413,
+        vendor_id: 10415,
         data: auth_data,
     });
 
@@ -873,26 +953,30 @@ pub fn build_ula_avps(ulr_resp: &UlrResponse) -> Vec<DiameterAvpData> {
 
     // Session-Id (263)
     avps.push(DiameterAvpData {
-        code: 263, vendor_id: 0,
+        code: 263,
+        vendor_id: 0,
         data: b"hss.s6a.session.1".to_vec(),
     });
 
     // Result-Code (268)
     avps.push(DiameterAvpData {
-        code: 268, vendor_id: 0,
+        code: 268,
+        vendor_id: 0,
         data: ulr_resp.result_code.to_be_bytes().to_vec(),
     });
 
     // ULA-Flags (1406, 3GPP) - Separation Indication
     avps.push(DiameterAvpData {
-        code: 1406, vendor_id: 10415,
+        code: 1406,
+        vendor_id: 10415,
         data: 1u32.to_be_bytes().to_vec(),
     });
 
     // Subscription-Data (1400, 3GPP)
     if !ulr_resp.subscription_data.is_empty() {
         avps.push(DiameterAvpData {
-            code: 1400, vendor_id: 10415,
+            code: 1400,
+            vendor_id: 10415,
             data: ulr_resp.subscription_data.clone(),
         });
     }
@@ -906,9 +990,18 @@ mod tests {
 
     #[test]
     fn test_cancellation_type_from_u32() {
-        assert_eq!(CancellationType::from(0), CancellationType::MmeUpdateProcedure);
-        assert_eq!(CancellationType::from(2), CancellationType::SubscriptionWithdrawal);
-        assert_eq!(CancellationType::from(99), CancellationType::SubscriptionWithdrawal);
+        assert_eq!(
+            CancellationType::from(0),
+            CancellationType::MmeUpdateProcedure
+        );
+        assert_eq!(
+            CancellationType::from(2),
+            CancellationType::SubscriptionWithdrawal
+        );
+        assert_eq!(
+            CancellationType::from(99),
+            CancellationType::SubscriptionWithdrawal
+        );
     }
 
     #[test]
@@ -951,8 +1044,16 @@ mod tests {
     fn test_send_diameter_answer() {
         // Verify answer builder produces non-empty bytes
         let avps = vec![
-            DiameterAvpData { code: 263, vendor_id: 0, data: b"session-1".to_vec() },
-            DiameterAvpData { code: 268, vendor_id: 0, data: 2001u32.to_be_bytes().to_vec() },
+            DiameterAvpData {
+                code: 263,
+                vendor_id: 0,
+                data: b"session-1".to_vec(),
+            },
+            DiameterAvpData {
+                code: 268,
+                vendor_id: 0,
+                data: 2001u32.to_be_bytes().to_vec(),
+            },
         ];
         let answer = build_diameter_answer(272, OGS_DIAM_S6A_APPLICATION_ID, &avps);
         assert!(answer.len() > 20); // header + AVPs

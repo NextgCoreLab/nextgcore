@@ -2,7 +2,7 @@
 //!
 //! Port of src/amf/namf-handler.c - Namf-comm service handlers
 
-use crate::context::{AmfUe, AmfSess, RanUe, ResourceStatus, PagingContext, amf_self};
+use crate::context::{amf_self, AmfSess, AmfUe, PagingContext, RanUe, ResourceStatus};
 
 // ============================================================================
 // N1N2 Message Transfer Types
@@ -337,7 +337,8 @@ pub fn handle_n1_n2_message_transfer(
     );
 
     // Validate PDU session ID
-    let _psi = req_data.pdu_session_id
+    let _psi = req_data
+        .pdu_session_id
         .ok_or_else(|| NamfHandlerError::MissingField("pdu_session_id".to_string()))?;
 
     let mut cause = N1N2MessageTransferCause::N1N2TransferInitiated;
@@ -361,7 +362,8 @@ pub fn handle_n1_n2_message_transfer(
                         // UE is idle, need to page (TS 23.502 4.2.3.3)
                         cause = N1N2MessageTransferCause::AttemptingToReachUe;
                         initiate_paging_for_idle_ue(
-                            amf_ue, sess,
+                            amf_ue,
+                            sess,
                             req_data.n1_message.clone(),
                             n2_info.ngap_data.clone(),
                             req_data.pdu_session_id,
@@ -387,7 +389,8 @@ pub fn handle_n1_n2_message_transfer(
                     } else {
                         cause = N1N2MessageTransferCause::AttemptingToReachUe;
                         initiate_paging_for_idle_ue(
-                            amf_ue, sess,
+                            amf_ue,
+                            sess,
                             req_data.n1_message.clone(),
                             n2_info.ngap_data.clone(),
                             req_data.pdu_session_id,
@@ -435,8 +438,10 @@ pub fn handle_sm_context_status(
     sess.resource_status = notification.resource_status;
 
     // Check if session should be removed
-    if sess.n1_released && sess.n2_released &&
-       notification.resource_status == ResourceStatus::Released {
+    if sess.n1_released
+        && sess.n2_released
+        && notification.resource_status == ResourceStatus::Released
+    {
         log::info!(
             "[{}:{}] Session fully released",
             amf_ue.supi.as_deref().unwrap_or("unknown"),
@@ -452,10 +457,7 @@ pub fn handle_sm_context_status(
 /// Handle deregistration notification
 ///
 /// This is called when UDM notifies about deregistration
-pub fn handle_dereg_notify(
-    amf_ue: &AmfUe,
-    data: &DeregistrationData,
-) -> NamfHandlerResult<()> {
+pub fn handle_dereg_notify(amf_ue: &AmfUe, data: &DeregistrationData) -> NamfHandlerResult<()> {
     log::info!(
         "[{}] Deregistration notify: reason={:?}, access={:?}",
         amf_ue.supi.as_deref().unwrap_or("unknown"),
@@ -597,16 +599,16 @@ fn initiate_paging_for_idle_ue(
     log::info!(
         "[{}] Paging initiated: TMSI=0x{:08x}, TAC={}, PSI={:?}",
         amf_ue.supi.as_deref().unwrap_or("unknown"),
-        tmsi, tac, pdu_session_id
+        tmsi,
+        tac,
+        pdu_session_id
     );
 }
 
 /// Handle event unsubscribe (Namf_EventExposure_Unsubscribe)
 ///
 /// This is called when NF wants to cancel an event subscription
-pub fn handle_event_unsubscribe(
-    subscription_id: &str,
-) -> NamfHandlerResult<()> {
+pub fn handle_event_unsubscribe(subscription_id: &str) -> NamfHandlerResult<()> {
     log::info!("Event unsubscribe request: subscription={subscription_id}");
 
     // In real implementation, this would:
@@ -663,7 +665,10 @@ mod tests {
 
         let result = handle_n1_n2_message_transfer(&ue, &mut sess, None, &req);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), NamfHandlerError::MissingField(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            NamfHandlerError::MissingField(_)
+        ));
     }
 
     #[test]
@@ -752,7 +757,10 @@ mod tests {
 
         let result = handle_event_subscribe(&subscription, "");
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), NamfHandlerError::MissingField(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            NamfHandlerError::MissingField(_)
+        ));
     }
 
     #[test]
@@ -784,8 +792,14 @@ mod tests {
     #[test]
     fn test_event_type_as_str() {
         assert_eq!(AmfEventType::LocationReport.as_str(), "LOCATION_REPORT");
-        assert_eq!(AmfEventType::ReachabilityReport.as_str(), "REACHABILITY_REPORT");
-        assert_eq!(AmfEventType::PduSessStatusReport.as_str(), "PDU_SESS_STATUS_REPORT");
+        assert_eq!(
+            AmfEventType::ReachabilityReport.as_str(),
+            "REACHABILITY_REPORT"
+        );
+        assert_eq!(
+            AmfEventType::PduSessStatusReport.as_str(),
+            "PDU_SESS_STATUS_REPORT"
+        );
     }
 
     #[test]

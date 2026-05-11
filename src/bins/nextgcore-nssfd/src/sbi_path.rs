@@ -36,13 +36,9 @@ pub fn nssf_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
         return Err("SBI server already running".to_string());
     }
 
-    let config = config.unwrap_or(SbiServerConfig::default());
+    let config = config.unwrap_or_default();
 
-    log::info!(
-        "Opening NSSF SBI server on {}:{}",
-        config.addr,
-        config.port
-    );
+    log::info!("Opening NSSF SBI server on {}:{}", config.addr, config.port);
 
     // Note: Initialize SELF NF instance
     // In C: ogs_sbi_nf_instance_build_default(nf_instance)
@@ -88,9 +84,9 @@ pub fn nssf_sbi_is_running() -> bool {
     SBI_SERVER_RUNNING.load(Ordering::SeqCst)
 }
 
-
 /// SBI request builder function type
-pub type PathSbiRequestBuilder = fn(home_id: u64, data: &dyn std::any::Any) -> Option<PathSbiRequest>;
+pub type PathSbiRequestBuilder =
+    fn(home_id: u64, data: &dyn std::any::Any) -> Option<PathSbiRequest>;
 
 /// Simplified SBI request for path operations
 #[derive(Debug, Clone)]

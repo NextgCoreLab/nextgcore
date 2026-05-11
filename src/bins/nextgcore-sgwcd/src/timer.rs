@@ -164,7 +164,11 @@ impl TimerManager {
     pub fn start(&mut self, timer_id: SgwcTimerId, duration: Duration) {
         let expiration = Instant::now() + duration;
         self.expiration_times.insert(timer_id, expiration);
-        log::debug!("Started timer {} with duration {:?}", timer_id.name(), duration);
+        log::debug!(
+            "Started timer {} with duration {:?}",
+            timer_id.name(),
+            duration
+        );
     }
 
     /// Stop a timer
@@ -177,7 +181,7 @@ impl TimerManager {
     pub fn check_expired(&mut self) -> Vec<SgwcTimerId> {
         let now = Instant::now();
         let mut expired = Vec::new();
-        
+
         self.expiration_times.retain(|timer_id, expiration| {
             if now >= *expiration {
                 expired.push(*timer_id);
@@ -186,7 +190,7 @@ impl TimerManager {
                 true // Keep in map
             }
         });
-        
+
         expired
     }
 
@@ -205,10 +209,10 @@ impl TimerManager {
         let mut timer = TimerInstance::new_for_pfcp_node(timer_id, pfcp_node_id);
         timer.start();
         self.active_timers.push(timer);
-        
+
         // Also track expiration time
         self.start(timer_id, duration);
-        
+
         log::debug!(
             "Started timer {} for PFCP node {} (duration: {:?})",
             timer_id.name(),
@@ -220,28 +224,33 @@ impl TimerManager {
 
     /// Stop a timer for PFCP node
     pub fn stop_pfcp_node_timer(&mut self, timer_id: SgwcTimerId, pfcp_node_id: u64) {
-        self.active_timers.retain(|t| {
-            !(t.timer_id == timer_id && t.pfcp_node_id == Some(pfcp_node_id))
-        });
+        self.active_timers
+            .retain(|t| !(t.timer_id == timer_id && t.pfcp_node_id == Some(pfcp_node_id)));
         self.stop(timer_id);
-        log::debug!("Stopped timer {} for PFCP node {}", timer_id.name(), pfcp_node_id);
+        log::debug!(
+            "Stopped timer {} for PFCP node {}",
+            timer_id.name(),
+            pfcp_node_id
+        );
     }
 
     /// Stop all timers for PFCP node
     pub fn stop_all_pfcp_node_timers(&mut self, pfcp_node_id: u64) {
         // Collect timer IDs to stop
-        let timer_ids: Vec<SgwcTimerId> = self.active_timers
+        let timer_ids: Vec<SgwcTimerId> = self
+            .active_timers
             .iter()
             .filter(|t| t.pfcp_node_id == Some(pfcp_node_id))
             .map(|t| t.timer_id)
             .collect();
-        
-        self.active_timers.retain(|t| t.pfcp_node_id != Some(pfcp_node_id));
-        
+
+        self.active_timers
+            .retain(|t| t.pfcp_node_id != Some(pfcp_node_id));
+
         for timer_id in timer_ids {
             self.stop(timer_id);
         }
-        
+
         log::debug!("Stopped all timers for PFCP node {pfcp_node_id}");
     }
 
@@ -275,8 +284,14 @@ mod tests {
 
     #[test]
     fn test_timer_id_names() {
-        assert_eq!(SgwcTimerId::PfcpAssociation.name(), "SGWC_TIMER_PFCP_ASSOCIATION");
-        assert_eq!(SgwcTimerId::PfcpNoHeartbeat.name(), "SGWC_TIMER_PFCP_NO_HEARTBEAT");
+        assert_eq!(
+            SgwcTimerId::PfcpAssociation.name(),
+            "SGWC_TIMER_PFCP_ASSOCIATION"
+        );
+        assert_eq!(
+            SgwcTimerId::PfcpNoHeartbeat.name(),
+            "SGWC_TIMER_PFCP_NO_HEARTBEAT"
+        );
     }
 
     #[test]

@@ -169,7 +169,8 @@ impl FederationManager {
 
     /// Finds peers that can serve a given analytics ID
     pub fn find_peers_for(&self, analytics_id: AnalyticsId) -> Vec<&FederationPeer> {
-        self.peers.values()
+        self.peers
+            .values()
             .filter(|p| p.reachable && p.supports(analytics_id))
             .collect()
     }

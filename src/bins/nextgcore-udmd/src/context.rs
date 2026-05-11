@@ -8,8 +8,7 @@ use std::sync::{Arc, RwLock};
 use uuid::Uuid;
 
 /// Authentication type (from OpenAPI)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AuthType {
     /// 5G AKA authentication
     #[default]
@@ -20,10 +19,8 @@ pub enum AuthType {
     EapTls,
 }
 
-
 /// RAT type (from OpenAPI)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RatType {
     /// NR (New Radio)
     #[default]
@@ -35,7 +32,6 @@ pub enum RatType {
     /// Virtual
     Virtual,
 }
-
 
 /// GUAMI (Globally Unique AMF Identifier)
 #[derive(Debug, Clone, Default)]
@@ -108,7 +104,6 @@ pub struct SmfRegistration {
     /// PLMN ID
     pub plmn_id: Option<PlmnId>,
 }
-
 
 /// Key length constant
 pub const OGS_KEY_LEN: usize = 16;
@@ -274,7 +269,6 @@ impl UdmSdmSubscription {
         }
     }
 }
-
 
 /// Extract SUPI from SUCI or SUPI string
 fn supi_from_suci(suci_or_supi: &str) -> Option<String> {
@@ -511,7 +505,6 @@ impl UdmContext {
         false
     }
 
-
     // Session management methods
 
     /// Add a new session for a UE
@@ -604,9 +597,7 @@ impl UdmContext {
 
         sdm_list.insert(id.clone(), subscription.clone());
 
-        log::debug!(
-            "[ue_id={udm_ue_id}] SDM subscription added (id={id})"
-        );
+        log::debug!("[ue_id={udm_ue_id}] SDM subscription added (id={id})");
         Some(subscription)
     }
 
@@ -671,7 +662,10 @@ impl UdmContext {
 
     /// Get number of SDM subscriptions
     pub fn sdm_subscription_count(&self) -> usize {
-        self.sdm_subscription_list.read().map(|l| l.len()).unwrap_or(0)
+        self.sdm_subscription_list
+            .read()
+            .map(|l| l.len())
+            .unwrap_or(0)
     }
 }
 
@@ -682,7 +676,8 @@ impl Default for UdmContext {
 }
 
 /// Global UDM context (thread-safe singleton)
-static GLOBAL_UDM_CONTEXT: std::sync::OnceLock<Arc<RwLock<UdmContext>>> = std::sync::OnceLock::new();
+static GLOBAL_UDM_CONTEXT: std::sync::OnceLock<Arc<RwLock<UdmContext>>> =
+    std::sync::OnceLock::new();
 
 /// Get the global UDM context
 pub fn udm_self() -> Arc<RwLock<UdmContext>> {
@@ -715,7 +710,6 @@ pub fn get_ue_load() -> i32 {
     }
     0
 }
-
 
 #[cfg(test)]
 mod tests {

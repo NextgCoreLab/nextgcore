@@ -25,11 +25,11 @@ pub struct SctpOptions {
 impl Default for SctpOptions {
     fn default() -> Self {
         SctpOptions {
-            spp_hbinterval: 5000,      // 5 seconds
-            spp_sackdelay: 200,        // 200 ms
-            srto_initial: 3000,        // 3 seconds
-            srto_min: 1000,            // 1 second
-            srto_max: 5000,            // 5 seconds
+            spp_hbinterval: 5000, // 5 seconds
+            spp_sackdelay: 200,   // 200 ms
+            srto_initial: 3000,   // 3 seconds
+            srto_min: 1000,       // 1 second
+            srto_max: 5000,       // 5 seconds
             sinit_num_ostreams: OGS_DEFAULT_SCTP_MAX_NUM_OF_OSTREAMS,
             sinit_max_instreams: 65535,
             sinit_max_attempts: 4,
@@ -102,7 +102,7 @@ pub fn ogs_nonblocking(_fd: OgsSocket) -> i32 {
 /// Set close-on-exec flag (identical to ogs_closeonexec)
 #[cfg(unix)]
 pub fn ogs_closeonexec(fd: OgsSocket) -> i32 {
-    use libc::{fcntl, F_GETFD, F_SETFD, FD_CLOEXEC};
+    use libc::{fcntl, FD_CLOEXEC, F_GETFD, F_SETFD};
 
     unsafe {
         let flags = fcntl(fd, F_GETFD);

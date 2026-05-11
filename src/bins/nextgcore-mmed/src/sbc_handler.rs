@@ -8,11 +8,11 @@
 //!
 //! Reference: 3GPP TS 29.168 (SBc-AP), 3GPP TS 23.041 (CBS)
 
-use std::sync::Arc;
 use log::{debug, error, info, warn};
+use std::sync::Arc;
 
-use crate::context::{MmeContext, MmeEnb, EpsTai};
-use crate::sbc_message::{SbcPwsData, SbcCause, WriteReplaceWarningResponse, StopWarningResponse};
+use crate::context::{EpsTai, MmeContext, MmeEnb};
+use crate::sbc_message::{SbcCause, SbcPwsData, StopWarningResponse, WriteReplaceWarningResponse};
 
 // ============================================================================
 // S1AP Procedure Codes for PWS
@@ -74,10 +74,7 @@ pub fn handle_write_replace_warning_request(
             match send_write_replace_warning_to_enb(enb, sbc_pws) {
                 Ok(_) => {
                     enbs_notified += 1;
-                    debug!(
-                        "Sent Write-Replace-Warning to eNB {:08x}",
-                        enb.enb_id
-                    );
+                    debug!("Sent Write-Replace-Warning to eNB {:08x}", enb.enb_id);
                 }
                 Err(e) => {
                     warn!(
@@ -192,10 +189,7 @@ pub fn handle_stop_warning_request(
 ///
 /// Called when an eNB indicates it has restarted and lost PWS state.
 /// The MME should re-send any active warnings to the eNB.
-pub fn handle_pws_restart_indication(
-    _mme_ctx: &Arc<MmeContext>,
-    enb_id: u32,
-) {
+pub fn handle_pws_restart_indication(_mme_ctx: &Arc<MmeContext>, enb_id: u32) {
     info!("[PWS-Restart] eNB {enb_id:08x} restarted, re-sending active warnings");
 
     // In a full implementation:
@@ -257,10 +251,7 @@ fn is_tai_served_by_any_enb(
 }
 
 /// Send Write-Replace Warning Request to an eNB via S1AP
-fn send_write_replace_warning_to_enb(
-    enb: &MmeEnb,
-    sbc_pws: &SbcPwsData,
-) -> Result<(), SbcCause> {
+fn send_write_replace_warning_to_enb(enb: &MmeEnb, sbc_pws: &SbcPwsData) -> Result<(), SbcCause> {
     // In a full implementation, would:
     // 1. Build S1AP Write-Replace Warning Request message
     // 2. Send to eNB via SCTP
@@ -273,10 +264,7 @@ fn send_write_replace_warning_to_enb(
 }
 
 /// Send Kill Request to an eNB via S1AP
-fn send_kill_to_enb(
-    enb: &MmeEnb,
-    sbc_pws: &SbcPwsData,
-) -> Result<(), SbcCause> {
+fn send_kill_to_enb(enb: &MmeEnb, sbc_pws: &SbcPwsData) -> Result<(), SbcCause> {
     // In a full implementation, would:
     // 1. Build S1AP Kill Request message
     // 2. Send to eNB via SCTP

@@ -3,13 +3,13 @@
 //! This module provides the main context for metrics collection,
 //! mirroring lib/metrics/context.c from the C implementation.
 
-use std::sync::{Arc, RwLock, OnceLock};
 use crate::{
-    DEFAULT_PROMETHEUS_HTTP_PORT,
-    types::{CustomEndpoint, ServerConfig},
-    spec::MetricsSpec,
     server::MetricsServer,
+    spec::MetricsSpec,
+    types::{CustomEndpoint, ServerConfig},
+    DEFAULT_PROMETHEUS_HTTP_PORT,
 };
+use std::sync::{Arc, OnceLock, RwLock};
 
 /// Global metrics context singleton
 static METRICS_CONTEXT: OnceLock<Arc<RwLock<MetricsContext>>> = OnceLock::new();
@@ -42,10 +42,8 @@ impl MetricsContext {
 
     /// Initialize the global metrics context
     pub fn init() {
-        let ctx = METRICS_CONTEXT.get_or_init(|| {
-            Arc::new(RwLock::new(MetricsContext::new()))
-        });
-        
+        let ctx = METRICS_CONTEXT.get_or_init(|| Arc::new(RwLock::new(MetricsContext::new())));
+
         if let Ok(mut context) = ctx.write() {
             context.initialized = true;
         }
@@ -158,7 +156,7 @@ impl MetricsContext {
     }
 
     /// Parse configuration from YAML
-    /// 
+    ///
     /// This parses the metrics section from the configuration file.
     /// Expected format:
     /// ```yaml
@@ -167,7 +165,11 @@ impl MetricsContext {
     ///     - address: 127.0.0.1
     ///       port: 9090
     /// ```
-    pub fn parse_config(&mut self, config: &serde_yaml::Value, local: Option<&str>) -> Result<(), String> {
+    pub fn parse_config(
+        &mut self,
+        config: &serde_yaml::Value,
+        local: Option<&str>,
+    ) -> Result<(), String> {
         // Set default port
         self.metrics_port = DEFAULT_PROMETHEUS_HTTP_PORT;
 
@@ -192,7 +194,11 @@ impl MetricsContext {
     /// Parse server configuration from YAML
     fn parse_server_config(&mut self, config: &serde_yaml::Value) -> Result<(), String> {
         let servers = if config.is_sequence() {
-            config.as_sequence().expect("value expected").iter().collect::<Vec<_>>()
+            config
+                .as_sequence()
+                .expect("value expected")
+                .iter()
+                .collect::<Vec<_>>()
         } else if config.is_mapping() {
             vec![config]
         } else {

@@ -277,9 +277,9 @@ impl Avp {
     /// Get data as UTF8String
     pub fn as_utf8_string(&self) -> Option<&str> {
         match &self.data {
-            AvpData::Utf8String(s)
-            | AvpData::DiameterIdentity(s)
-            | AvpData::DiameterUri(s) => Some(s),
+            AvpData::Utf8String(s) | AvpData::DiameterIdentity(s) | AvpData::DiameterUri(s) => {
+                Some(s)
+            }
             AvpData::Raw(b) => std::str::from_utf8(b).ok(),
             _ => None,
         }
@@ -302,7 +302,8 @@ impl Avp {
                 let addr_type = buf.get_u16();
                 match addr_type {
                     1 if buf.remaining() >= 4 => {
-                        let octets: [u8; 4] = [buf.get_u8(), buf.get_u8(), buf.get_u8(), buf.get_u8()];
+                        let octets: [u8; 4] =
+                            [buf.get_u8(), buf.get_u8(), buf.get_u8(), buf.get_u8()];
                         Some(IpAddr::V4(Ipv4Addr::from(octets)))
                     }
                     2 if buf.remaining() >= 16 => {

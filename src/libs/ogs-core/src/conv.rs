@@ -5,13 +5,13 @@
 /// Convert hex string to bytes (identical to ogs_hex_from_string)
 pub fn ogs_hex_from_string(hex: &str) -> Option<Vec<u8>> {
     let hex = hex.trim();
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
-    
+
     let mut bytes = Vec::with_capacity(hex.len() / 2);
     for i in (0..hex.len()).step_by(2) {
-        let byte = u8::from_str_radix(&hex[i..i+2], 16).ok()?;
+        let byte = u8::from_str_radix(&hex[i..i + 2], 16).ok()?;
         bytes.push(byte);
     }
     Some(bytes)
@@ -80,15 +80,19 @@ pub struct OgsUint24 {
 
 impl OgsUint24 {
     pub fn new(value: u32) -> Self {
-        OgsUint24 { v: value & 0xFFFFFF }
+        OgsUint24 {
+            v: value & 0xFFFFFF,
+        }
     }
-    
+
     pub fn to_be_bytes(&self) -> [u8; 3] {
         ogs_uint24_to_bytes(self.v)
     }
-    
+
     pub fn from_be_bytes(bytes: [u8; 3]) -> Self {
-        OgsUint24 { v: ogs_bytes_to_uint24(&bytes) }
+        OgsUint24 {
+            v: ogs_bytes_to_uint24(&bytes),
+        }
     }
 }
 

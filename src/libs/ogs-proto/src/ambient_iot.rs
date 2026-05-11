@@ -60,7 +60,10 @@ pub struct SolarParams {
 
 impl Default for SolarParams {
     fn default() -> Self {
-        Self { area_cm2: 1.0, efficiency: 0.15 }
+        Self {
+            area_cm2: 1.0,
+            efficiency: 0.15,
+        }
     }
 }
 
@@ -123,7 +126,8 @@ impl EnergyHarvester {
 
     /// Computes solar harvested power (microwatts) from irradiance (mW/cm²)
     pub fn compute_solar_harvest_uw(&self, irradiance_mw_cm2: f64) -> f64 {
-        let power_mw = irradiance_mw_cm2 * self.solar_params.area_cm2 * self.solar_params.efficiency;
+        let power_mw =
+            irradiance_mw_cm2 * self.solar_params.area_cm2 * self.solar_params.efficiency;
         power_mw * 1000.0 // mW to µW
     }
 
@@ -158,7 +162,9 @@ impl EnergyHarvester {
 
     /// Returns charge level as fraction (0.0-1.0)
     pub fn charge_level(&self) -> f64 {
-        if self.capacity_uj == 0.0 { return 0.0; }
+        if self.capacity_uj == 0.0 {
+            return 0.0;
+        }
         self.stored_energy_uj / self.capacity_uj
     }
 
@@ -208,8 +214,8 @@ impl AmbientIotDevice {
             device_id: device_id.into(),
             harvester: EnergyHarvester::rf_harvester(RfHarvestParams::default(), 100.0),
             state: AmbientIotState::DeepSleep,
-            tx_energy_uj: 0.5,  // 0.5 µJ per backscatter transmission
-            rx_energy_uj: 0.1,  // 0.1 µJ per receive
+            tx_energy_uj: 0.5, // 0.5 µJ per backscatter transmission
+            rx_energy_uj: 0.1, // 0.1 µJ per receive
             tx_count: 0,
         }
     }
@@ -256,7 +262,9 @@ impl Default for AmbientIotFleet {
 
 impl AmbientIotFleet {
     pub fn new() -> Self {
-        Self { devices: HashMap::new() }
+        Self {
+            devices: HashMap::new(),
+        }
     }
 
     pub fn add_device(&mut self, device: AmbientIotDevice) {
@@ -268,7 +276,10 @@ impl AmbientIotFleet {
     }
 
     pub fn operational_count(&self) -> usize {
-        self.devices.values().filter(|d| d.harvester.is_operational()).count()
+        self.devices
+            .values()
+            .filter(|d| d.harvester.is_operational())
+            .count()
     }
 
     /// Tick all devices
@@ -313,9 +324,15 @@ mod tests {
 
     #[test]
     fn test_solar_harvest() {
-        let h = EnergyHarvester::solar_harvester(SolarParams { area_cm2: 2.0, efficiency: 0.2 }, 1000.0);
+        let h = EnergyHarvester::solar_harvester(
+            SolarParams {
+                area_cm2: 2.0,
+                efficiency: 0.2,
+            },
+            1000.0,
+        );
         let power = h.compute_solar_harvest_uw(10.0); // 10 mW/cm² (bright indoor)
-        // 10 * 2.0 * 0.2 = 4 mW = 4000 µW
+                                                      // 10 * 2.0 * 0.2 = 4 mW = 4000 µW
         assert!((power - 4000.0).abs() < 1.0);
     }
 

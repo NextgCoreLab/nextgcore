@@ -29,10 +29,7 @@ pub enum SbiError {
 
     /// HTTP error with status code
     #[error("HTTP error: {status} - {message}")]
-    HttpError {
-        status: u16,
-        message: String,
-    },
+    HttpError { status: u16, message: String },
 
     /// Server error
     #[error("Server error: {0}")]

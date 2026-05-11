@@ -2,8 +2,8 @@
 //!
 //! GTPv1 header structure as specified in 3GPP TS 29.060.
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::error::{GtpError, GtpResult};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// GTPv1-U header length (without optional fields)
 pub const GTPV1U_HEADER_LEN: usize = 8;
@@ -420,7 +420,7 @@ mod tests {
         let mut header = Gtp1Header::default();
         header.e = true;
         header.s = true;
-        
+
         let flags = header.flags();
         assert_eq!(flags & GTP1U_FLAGS_V, GTP1U_FLAGS_V); // Version 1
         assert_eq!(flags & GTP1U_FLAGS_PT, GTP1U_FLAGS_PT); // PT = 1

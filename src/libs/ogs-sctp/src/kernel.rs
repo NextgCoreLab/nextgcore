@@ -15,9 +15,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 use libc::{
-    self, c_int, c_void, sockaddr, sockaddr_in, sockaddr_in6, socklen_t,
-    AF_INET, AF_INET6, IPPROTO_SCTP, SOCK_SEQPACKET, SOCK_STREAM,
-    SOL_SOCKET, SO_REUSEADDR,
+    self, c_int, c_void, sockaddr, sockaddr_in, sockaddr_in6, socklen_t, AF_INET, AF_INET6,
+    IPPROTO_SCTP, SOCK_SEQPACKET, SOCK_STREAM, SOL_SOCKET, SO_REUSEADDR,
 };
 
 use super::{OgsSctpInfo, Result, SctpError};
@@ -135,9 +134,7 @@ impl KernelSctpSocket {
             SocketAddr::V6(_) => AF_INET6,
         };
 
-        let fd = unsafe {
-            libc::socket(family, sock_type, IPPROTO_SCTP)
-        };
+        let fd = unsafe { libc::socket(family, sock_type, IPPROTO_SCTP) };
 
         if fd < 0 {
             return Err(SctpError::SocketCreation(io::Error::last_os_error()));
@@ -307,13 +304,7 @@ impl KernelSctpSocket {
     fn bind(&mut self, addr: &SocketAddr) -> Result<()> {
         let (sockaddr_ptr, sockaddr_len) = socketaddr_to_sockaddr(addr);
 
-        let result = unsafe {
-            libc::bind(
-                self.fd.as_raw_fd(),
-                sockaddr_ptr,
-                sockaddr_len,
-            )
-        };
+        let result = unsafe { libc::bind(self.fd.as_raw_fd(), sockaddr_ptr, sockaddr_len) };
 
         if result < 0 {
             return Err(SctpError::BindFailed(io::Error::last_os_error()));
@@ -326,9 +317,7 @@ impl KernelSctpSocket {
     }
 
     fn listen(&self, backlog: c_int) -> Result<()> {
-        let result = unsafe {
-            libc::listen(self.fd.as_raw_fd(), backlog)
-        };
+        let result = unsafe { libc::listen(self.fd.as_raw_fd(), backlog) };
 
         if result < 0 {
             return Err(SctpError::ListenFailed(io::Error::last_os_error()));
@@ -340,13 +329,7 @@ impl KernelSctpSocket {
     fn connect(&mut self, addr: &SocketAddr) -> Result<()> {
         let (sockaddr_ptr, sockaddr_len) = socketaddr_to_sockaddr(addr);
 
-        let result = unsafe {
-            libc::connect(
-                self.fd.as_raw_fd(),
-                sockaddr_ptr,
-                sockaddr_len,
-            )
-        };
+        let result = unsafe { libc::connect(self.fd.as_raw_fd(), sockaddr_ptr, sockaddr_len) };
 
         if result < 0 {
             return Err(SctpError::ConnectFailed(io::Error::last_os_error()));
@@ -494,10 +477,7 @@ fn socketaddr_to_sockaddr(addr: &SocketAddr) -> (*const sockaddr, socklen_t) {
     }
 }
 
-fn sockaddr_to_socketaddr(
-    storage: &libc::sockaddr_storage,
-    len: socklen_t,
-) -> Result<SocketAddr> {
+fn sockaddr_to_socketaddr(storage: &libc::sockaddr_storage, len: socklen_t) -> Result<SocketAddr> {
     let family = storage.ss_family as c_int;
 
     if family == AF_INET && len >= mem::size_of::<sockaddr_in>() as socklen_t {

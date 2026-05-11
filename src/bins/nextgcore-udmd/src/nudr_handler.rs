@@ -4,13 +4,13 @@
 //! Handles responses from UDR for authentication, context, and provisioned data
 
 use crate::context::{
-    udm_self, AuthType, Amf3GppAccessRegistration, SmfRegistration, UdmUe,
-    OGS_KEY_LEN, OGS_AMF_LEN, OGS_RAND_LEN, OGS_SQN_LEN,
+    udm_self, Amf3GppAccessRegistration, AuthType, SmfRegistration, UdmUe, OGS_AMF_LEN,
+    OGS_KEY_LEN, OGS_RAND_LEN, OGS_SQN_LEN,
 };
 use crate::nudm_handler::{bytes_to_hex, hex_to_bytes, http_status, HandlerResult};
 
-use ogs_crypt::milenage;
 use ogs_crypt::kdf;
+use ogs_crypt::milenage;
 
 /// UDM SBI state for multi-step operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,7 +166,10 @@ pub fn udm_nudr_dr_handle_subscription_authentication(
     };
     drop(context);
 
-    log::debug!("[{}] Handle subscription authentication response", udm_ue.suci);
+    log::debug!(
+        "[{}] Handle subscription authentication response",
+        udm_ue.suci
+    );
 
     match resource_name {
         "authentication-subscription" => {
@@ -215,10 +218,7 @@ pub fn udm_nudr_dr_handle_subscription_authentication(
                         Some(k) if !k.is_empty() => k,
                         _ => {
                             log::error!("[{}] No encPermanentKey", udm_ue.suci);
-                            return (
-                                HandlerResult::bad_request("No encPermanentKey"),
-                                None,
-                            );
+                            return (HandlerResult::bad_request("No encPermanentKey"), None);
                         }
                     };
 
@@ -226,10 +226,7 @@ pub fn udm_nudr_dr_handle_subscription_authentication(
                         Some(k) if !k.is_empty() => k,
                         _ => {
                             log::error!("[{}] No encOpcKey", udm_ue.suci);
-                            return (
-                                HandlerResult::bad_request("No encOpcKey"),
-                                None,
-                            );
+                            return (HandlerResult::bad_request("No encOpcKey"), None);
                         }
                     };
 
@@ -249,18 +246,12 @@ pub fn udm_nudr_dr_handle_subscription_authentication(
                             Some(s) if !s.is_empty() => s,
                             _ => {
                                 log::error!("[{}] No SequenceNumber.sqn", udm_ue.suci);
-                                return (
-                                    HandlerResult::bad_request("No SequenceNumber.sqn"),
-                                    None,
-                                );
+                                return (HandlerResult::bad_request("No SequenceNumber.sqn"), None);
                             }
                         },
                         None => {
                             log::error!("[{}] No SequenceNumber", udm_ue.suci);
-                            return (
-                                HandlerResult::bad_request("No SequenceNumber"),
-                                None,
-                            );
+                            return (HandlerResult::bad_request("No SequenceNumber"), None);
                         }
                     };
 
@@ -321,7 +312,9 @@ pub fn udm_nudr_dr_handle_subscription_authentication(
                                 HandlerResult {
                                     success: false,
                                     status: http_status::INTERNAL_SERVER_ERROR,
-                                    error_message: Some(format!("Auth vector generation failed: {e}")),
+                                    error_message: Some(format!(
+                                        "Auth vector generation failed: {e}"
+                                    )),
                                     error_cause: None,
                                 },
                                 None,
@@ -371,7 +364,11 @@ pub fn udm_nudr_dr_handle_subscription_authentication(
         }
 
         _ => {
-            log::error!("[{}] Invalid resource name [{}]", udm_ue.supi.as_deref().unwrap_or(&udm_ue.suci), resource_name);
+            log::error!(
+                "[{}] Invalid resource name [{}]",
+                udm_ue.supi.as_deref().unwrap_or(&udm_ue.suci),
+                resource_name
+            );
             (HandlerResult::bad_request("Invalid resource name"), None)
         }
     }
@@ -435,7 +432,10 @@ pub fn udm_nudr_dr_handle_subscription_context(
 
                     if registration.is_none() {
                         log::error!("[{supi}] No Amf3GppAccessRegistration");
-                        return (HandlerResult::bad_request("No Amf3GppAccessRegistration"), None);
+                        return (
+                            HandlerResult::bad_request("No Amf3GppAccessRegistration"),
+                            None,
+                        );
                     }
 
                     // Determine status based on whether this is new or existing registration
@@ -602,7 +602,12 @@ pub fn udm_nudr_dr_handle_smf_registration(
     log::debug!("[{}:{}] Handle SMF registration response", supi, sess.psi);
 
     if res_status != http_status::NO_CONTENT {
-        log::error!("[{}:{}] HTTP response error [{}]", supi, sess.psi, res_status);
+        log::error!(
+            "[{}:{}] HTTP response error [{}]",
+            supi,
+            sess.psi,
+            res_status
+        );
         return (
             HandlerResult {
                 success: false,
@@ -674,14 +679,24 @@ pub fn udm_nudr_dr_handle_smf_registration(
                 }
 
                 _ => {
-                    log::error!("[{}:{}] Invalid HTTP method [{}]", supi, sess.psi, http_method);
+                    log::error!(
+                        "[{}:{}] Invalid HTTP method [{}]",
+                        supi,
+                        sess.psi,
+                        http_method
+                    );
                     (HandlerResult::forbidden("Invalid HTTP method", None), None)
                 }
             }
         }
 
         _ => {
-            log::error!("[{}:{}] Invalid resource name [{}]", supi, sess.psi, resource_name);
+            log::error!(
+                "[{}:{}] Invalid resource name [{}]",
+                supi,
+                sess.psi,
+                resource_name
+            );
             (HandlerResult::bad_request("Invalid resource name"), None)
         }
     }
@@ -701,16 +716,14 @@ fn generate_authentication_vector(udm_ue: &mut UdmUe) -> Result<AuthenticationIn
     udm_ue.rand = rand;
 
     // Run Milenage: produces AUTN, IK, CK, AK, RES
-    let (autn, ik, ck, _ak, res) = milenage::milenage_generate(
-        &udm_ue.opc,
-        &udm_ue.amf,
-        &udm_ue.k,
-        &udm_ue.sqn,
-        &rand,
-    ).map_err(|e| format!("Milenage generate failed: {e:?}"))?;
+    let (autn, ik, ck, _ak, res) =
+        milenage::milenage_generate(&udm_ue.opc, &udm_ue.amf, &udm_ue.k, &udm_ue.sqn, &rand)
+            .map_err(|e| format!("Milenage generate failed: {e:?}"))?;
 
     // Get serving network name (required for 5G KDF)
-    let serving_network_name = udm_ue.serving_network_name.as_deref()
+    let serving_network_name = udm_ue
+        .serving_network_name
+        .as_deref()
         .ok_or_else(|| "No serving network name".to_string())?;
 
     // TS 33.501 A.2: Derive KAUSF from CK, IK, serving network name, AUTN
@@ -719,21 +732,10 @@ fn generate_authentication_vector(udm_ue: &mut UdmUe) -> Result<AuthenticationIn
     let ik_arr = <&[u8; OGS_KEY_LEN]>::try_from(&ik[..OGS_KEY_LEN])
         .map_err(|_| "IK key length mismatch".to_string())?;
 
-    let kausf = kdf::ogs_kdf_kausf(
-        ck_arr,
-        ik_arr,
-        serving_network_name,
-        &autn,
-    );
+    let kausf = kdf::ogs_kdf_kausf(ck_arr, ik_arr, serving_network_name, &autn);
 
     // TS 33.501 A.4: Derive XRES* from CK, IK, serving network name, RAND, RES
-    let xres_star = kdf::ogs_kdf_xres_star(
-        ck_arr,
-        ik_arr,
-        serving_network_name,
-        &rand,
-        &res,
-    );
+    let xres_star = kdf::ogs_kdf_xres_star(ck_arr, ik_arr, serving_network_name, &rand, &res);
 
     // Build authentication info result
     Ok(AuthenticationInfoResult {

@@ -95,7 +95,7 @@ pub mod avp_code {
     pub const EXPERIMENTAL_RESULT: u32 = 297;
     pub const EXPERIMENTAL_RESULT_CODE: u32 = 298;
     pub const VENDOR_ID: u32 = 266;
-    
+
     // S6a specific AVPs
     pub const VISITED_PLMN_ID: u32 = 1407;
     pub const RAT_TYPE: u32 = 1032;
@@ -470,10 +470,7 @@ fn encode_plmn_id(plmn: &crate::context::PlmnId) -> [u8; 3] {
 /// # Arguments
 /// * `mme_ue` - MME UE context
 /// * `resync` - Whether this is a re-sync request (includes AUTS)
-pub async fn mme_s6a_send_air(
-    mme_ue: &MmeUe,
-    resync: bool,
-) -> DiameterResult<AiaMessage> {
+pub async fn mme_s6a_send_air(mme_ue: &MmeUe, resync: bool) -> DiameterResult<AiaMessage> {
     if mme_ue.imsi_bcd.is_empty() {
         log::error!("No IMSI for AIR");
         return Err(DiameterError::BuildFailed);
@@ -507,13 +504,14 @@ pub async fn mme_s6a_send_air(
         resync_data.extend_from_slice(&mme_ue.rand);
         // AUTS would come from the UE; for now use a placeholder
         // In practice, the caller should pass in the AUTS bytes
-        log::debug!("[{}] Adding Re-Synchronization-Info to AIR", mme_ue.imsi_bcd);
+        log::debug!(
+            "[{}] Adding Re-Synchronization-Info to AIR",
+            mme_ue.imsi_bcd
+        );
         let resync_avp = ogs_diameter::avp::Avp::vendor_mandatory(
             s6a::avp::RE_SYNC_INFO,
             ogs_diameter::OGS_3GPP_VENDOR_ID,
-            ogs_diameter::avp::AvpData::OctetString(
-                bytes::Bytes::copy_from_slice(&resync_data),
-            ),
+            ogs_diameter::avp::AvpData::OctetString(bytes::Bytes::copy_from_slice(&resync_data)),
         );
         // Find the Requested-EUTRAN-Authentication-Info grouped AVP and add resync into it
         // For simplicity, add it as a top-level AVP (HSS implementations accept both)
@@ -568,10 +566,7 @@ pub async fn mme_s6a_send_air(
 /// # Arguments
 /// * `mme_ue` - MME UE context
 /// * `initial_attach` - Whether this is initial attach
-pub async fn mme_s6a_send_ulr(
-    mme_ue: &MmeUe,
-    initial_attach: bool,
-) -> DiameterResult<UlaMessage> {
+pub async fn mme_s6a_send_ulr(mme_ue: &MmeUe, initial_attach: bool) -> DiameterResult<UlaMessage> {
     if mme_ue.imsi_bcd.is_empty() {
         log::error!("No IMSI for ULR");
         return Err(DiameterError::BuildFailed);
@@ -584,8 +579,7 @@ pub async fn mme_s6a_send_ulr(
     let visited_plmn = encode_plmn_id(&mme_ue.tai.plmn_id);
 
     // Build ULR flags
-    let mut flags = s6a::ulr_flags::S6A_S6D_INDICATOR
-        | s6a::ulr_flags::SINGLE_REGISTRATION_IND;
+    let mut flags = s6a::ulr_flags::S6A_S6D_INDICATOR | s6a::ulr_flags::SINGLE_REGISTRATION_IND;
     if initial_attach {
         flags |= s6a::ulr_flags::INITIAL_ATTACH_IND;
     }
@@ -768,8 +762,7 @@ fn parse_subscription_data(msg: &ogs_diameter::message::DiameterMessage) -> Subs
     }
 
     // APN-Configuration-Profile -> APN-Configuration(s)
-    if let Some(profile) = ogs_diameter::avp::find_avp(group, avp_code::APN_CONFIGURATION_PROFILE)
-    {
+    if let Some(profile) = ogs_diameter::avp::find_avp(group, avp_code::APN_CONFIGURATION_PROFILE) {
         if let Some(pg) = profile.as_grouped() {
             // Context-Identifier (default APN)
             if let Some(ci) = ogs_diameter::avp::find_avp(pg, avp_code::CONTEXT_IDENTIFIER) {
@@ -818,8 +811,7 @@ fn parse_apn_config(group: &[ogs_diameter::avp::Avp]) -> ApnConfiguration {
     }
 
     // EPS-Subscribed-QoS-Profile
-    if let Some(qos_avp) =
-        ogs_diameter::avp::find_avp(group, avp_code::EPS_SUBSCRIBED_QOS_PROFILE)
+    if let Some(qos_avp) = ogs_diameter::avp::find_avp(group, avp_code::EPS_SUBSCRIBED_QOS_PROFILE)
     {
         if let Some(qg) = qos_avp.as_grouped() {
             if let Some(a) = ogs_diameter::avp::find_avp(qg, avp_code::QOS_CLASS_IDENTIFIER) {
@@ -862,21 +854,15 @@ pub fn emm_cause_from_diameter(
     // Check experimental result first
     if let Some(exp_code) = experimental_result_code {
         return match exp_code {
-            experimental_result::DIAMETER_ERROR_USER_UNKNOWN => {
-                EmmCause::ImsiUnknownInHss
-            }
+            experimental_result::DIAMETER_ERROR_USER_UNKNOWN => EmmCause::ImsiUnknownInHss,
             experimental_result::DIAMETER_ERROR_ROAMING_NOT_ALLOWED => {
                 EmmCause::RoamingNotAllowedInTa
             }
             experimental_result::DIAMETER_ERROR_UNKNOWN_EPS_SUBSCRIPTION => {
                 EmmCause::NoSuitableCellsInTa
             }
-            experimental_result::DIAMETER_ERROR_RAT_NOT_ALLOWED => {
-                EmmCause::RoamingNotAllowedInTa
-            }
-            experimental_result::DIAMETER_ERROR_EQUIPMENT_UNKNOWN => {
-                EmmCause::IllegalUe
-            }
+            experimental_result::DIAMETER_ERROR_RAT_NOT_ALLOWED => EmmCause::RoamingNotAllowedInTa,
+            experimental_result::DIAMETER_ERROR_EQUIPMENT_UNKNOWN => EmmCause::IllegalUe,
             experimental_result::DIAMETER_AUTHENTICATION_DATA_UNAVAILABLE => {
                 EmmCause::NetworkFailure
             }
@@ -888,12 +874,8 @@ pub fn emm_cause_from_diameter(
     if let Some(code) = result_code {
         return match code {
             result_code::DIAMETER_SUCCESS => EmmCause::RequestAccepted,
-            result_code::DIAMETER_AUTHORIZATION_REJECTED => {
-                EmmCause::EpsServicesNotAllowed
-            }
-            result_code::DIAMETER_UNABLE_TO_COMPLY => {
-                EmmCause::NetworkFailure
-            }
+            result_code::DIAMETER_AUTHORIZATION_REJECTED => EmmCause::EpsServicesNotAllowed,
+            result_code::DIAMETER_UNABLE_TO_COMPLY => EmmCause::NetworkFailure,
             _ => EmmCause::NetworkFailure,
         };
     }
@@ -904,14 +886,16 @@ pub fn emm_cause_from_diameter(
 /// Encode PLMN ID for Diameter
 pub fn encode_visited_plmn_id(mcc: &str, mnc: &str) -> Vec<u8> {
     let mut plmn = vec![0u8; 3];
-    
-    let mcc_digits: Vec<u8> = mcc.chars()
+
+    let mcc_digits: Vec<u8> = mcc
+        .chars()
         .filter_map(|c| c.to_digit(10).map(|d| d as u8))
         .collect();
-    let mnc_digits: Vec<u8> = mnc.chars()
+    let mnc_digits: Vec<u8> = mnc
+        .chars()
         .filter_map(|c| c.to_digit(10).map(|d| d as u8))
         .collect();
-    
+
     if mcc_digits.len() >= 3 {
         plmn[0] = (mcc_digits[1] << 4) | mcc_digits[0];
         if mnc_digits.len() == 2 {
@@ -922,7 +906,7 @@ pub fn encode_visited_plmn_id(mcc: &str, mnc: &str) -> Vec<u8> {
             plmn[2] = (mnc_digits[1] << 4) | mnc_digits[0];
         }
     }
-    
+
     plmn
 }
 
@@ -948,19 +932,14 @@ mod tests {
 
     #[test]
     fn test_emm_cause_from_diameter_success() {
-        let cause = emm_cause_from_diameter(
-            Some(result_code::DIAMETER_SUCCESS),
-            None,
-        );
+        let cause = emm_cause_from_diameter(Some(result_code::DIAMETER_SUCCESS), None);
         assert_eq!(cause, EmmCause::RequestAccepted);
     }
 
     #[test]
     fn test_emm_cause_from_diameter_user_unknown() {
-        let cause = emm_cause_from_diameter(
-            None,
-            Some(experimental_result::DIAMETER_ERROR_USER_UNKNOWN),
-        );
+        let cause =
+            emm_cause_from_diameter(None, Some(experimental_result::DIAMETER_ERROR_USER_UNKNOWN));
         assert_eq!(cause, EmmCause::ImsiUnknownInHss);
     }
 
@@ -1047,19 +1026,18 @@ mod tests {
 
     #[test]
     fn test_diameter_error_from_ogs() {
-        let io_err = ogs_diameter::error::DiameterError::Io(
-            std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
-        );
+        let io_err = ogs_diameter::error::DiameterError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused",
+        ));
         let local: DiameterError = io_err.into();
         assert_eq!(local, DiameterError::ConnectionFailed);
 
-        let proto_err =
-            ogs_diameter::error::DiameterError::Protocol("test".to_string());
+        let proto_err = ogs_diameter::error::DiameterError::Protocol("test".to_string());
         let local: DiameterError = proto_err.into();
         assert_eq!(local, DiameterError::SendFailed);
 
-        let inv_err =
-            ogs_diameter::error::DiameterError::InvalidMessage("bad".to_string());
+        let inv_err = ogs_diameter::error::DiameterError::InvalidMessage("bad".to_string());
         let local: DiameterError = inv_err.into();
         assert_eq!(local, DiameterError::InvalidResponse);
     }

@@ -2,8 +2,8 @@
 //!
 //! GTPv2-C header structure as specified in 3GPP TS 29.274.
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
 use crate::error::{GtpError, GtpResult};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// GTPv2-C header length (with TEID)
 pub const GTPV2C_HEADER_LEN: usize = 12;
@@ -319,17 +319,17 @@ mod tests {
 
         assert_eq!(decoded.version, 2);
         assert!(decoded.teid_presence);
-        assert_eq!(decoded.message_type, Gtp2MessageType::CreateSessionRequest as u8);
+        assert_eq!(
+            decoded.message_type,
+            Gtp2MessageType::CreateSessionRequest as u8
+        );
         assert_eq!(decoded.teid, Some(0x12345678));
         assert_eq!(decoded.sequence_number, 0x123456);
     }
 
     #[test]
     fn test_header_encode_decode_without_teid() {
-        let header = Gtp2Header::new_no_teid(
-            Gtp2MessageType::EchoRequest as u8,
-            0x123456,
-        );
+        let header = Gtp2Header::new_no_teid(Gtp2MessageType::EchoRequest as u8, 0x123456);
 
         let mut buf = BytesMut::new();
         let mut h = header.clone();

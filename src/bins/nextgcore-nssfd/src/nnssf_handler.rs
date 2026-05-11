@@ -48,7 +48,6 @@ pub enum NsSelectionResult {
     Error(u16, String),
 }
 
-
 /// Handle NS selection GET request from AMF or V-NSSF
 /// Port of nssf_nnrf_nsselection_handle_get_from_amf_or_vnssf
 pub fn nssf_nnssf_nsselection_handle_get_from_amf_or_vnssf(
@@ -79,7 +78,10 @@ pub fn nssf_nnssf_nsselection_handle_get_from_amf_or_vnssf(
         && param.slice_info_for_pdu_session.roaming_indication == RoamingIndication::default()
     {
         // Check if roaming indication is actually set
-        log::debug!("Roaming indication: {:?}", param.slice_info_for_pdu_session.roaming_indication);
+        log::debug!(
+            "Roaming indication: {:?}",
+            param.slice_info_for_pdu_session.roaming_indication
+        );
     }
 
     // Find NSI by S-NSSAI
@@ -117,7 +119,9 @@ pub fn nssf_nnssf_nsselection_handle_get_from_amf_or_vnssf(
     }
 
     // Check if this is a roaming scenario requiring H-NSSF query
-    if let (Some(ref home_plmn_id), Some(ref home_snssai)) = (&param.home_plmn_id, &param.home_snssai) {
+    if let (Some(ref home_plmn_id), Some(ref home_snssai)) =
+        (&param.home_plmn_id, &param.home_snssai)
+    {
         let ctx = nssf_self();
         let context = match ctx.read() {
             Ok(c) => c,
@@ -161,7 +165,8 @@ pub fn nssf_nnssf_nsselection_handle_get_from_amf_or_vnssf(
             // Need to query H-NSSF
             log::debug!(
                 "Need to query H-NSSF for home network (stream_id={}, home_id={})",
-                stream_id, home.id
+                stream_id,
+                home.id
             );
             return NsSelectionResult::NeedHnssf(home.id);
         }
@@ -183,7 +188,6 @@ pub fn nssf_nnssf_nsselection_handle_get_from_amf_or_vnssf(
         }),
     })
 }
-
 
 /// Handle NS selection response from H-NSSF
 /// Port of nssf_nnrf_nsselection_handle_get_from_hnssf
@@ -226,7 +230,10 @@ pub fn nssf_nnssf_nsselection_handle_get_from_hnssf(
     let mut home = match context.home_find_by_id(home_id) {
         Some(h) => h,
         None => {
-            return NsSelectionResult::Error(500, "Home Network Context has already been removed".to_string());
+            return NsSelectionResult::Error(
+                500,
+                "Home Network Context has already been removed".to_string(),
+            );
         }
     };
 
@@ -235,7 +242,11 @@ pub fn nssf_nnssf_nsselection_handle_get_from_hnssf(
 
     log::debug!(
         "H-NSSF response: nrf_id={}, nsi_id={} for home (plmn={}{}, sst={})",
-        nrf_id, nsi_id, home.plmn_id.mcc, home.plmn_id.mnc, home.s_nssai.sst
+        nrf_id,
+        nsi_id,
+        home.plmn_id.mcc,
+        home.plmn_id.mnc,
+        home.s_nssai.sst
     );
 
     // Return authorized slice info
@@ -269,7 +280,10 @@ pub fn query_nrf_slice_availability(
 ) -> NrfSliceAvailability {
     log::debug!(
         "Querying NRF ({}) for {} instances serving S-NSSAI[SST:{} SD:{:?}]",
-        nrf_uri, target_nf_type, s_nssai.sst, s_nssai.sd
+        nrf_uri,
+        target_nf_type,
+        s_nssai.sst,
+        s_nssai.sd
     );
 
     // In a full implementation this would make an HTTP GET to:
@@ -292,7 +306,11 @@ pub fn query_nrf_slice_availability(
     let mut nf_count = 0;
     if let Ok(avail) = context.nssai_availability.read() {
         for info in avail.values() {
-            if info.supported_snssai_list.iter().any(|s| s.sst == s_nssai.sst && s.sd == s_nssai.sd) {
+            if info
+                .supported_snssai_list
+                .iter()
+                .any(|s| s.sst == s_nssai.sst && s.sd == s_nssai.sd)
+            {
                 nf_count += 1;
             }
         }
@@ -305,7 +323,9 @@ pub fn query_nrf_slice_availability(
 
     log::debug!(
         "NRF slice availability: {} NFs for S-NSSAI[SST:{} SD:{:?}]",
-        nf_count, s_nssai.sst, s_nssai.sd
+        nf_count,
+        s_nssai.sst,
+        s_nssai.sd
     );
 
     NrfSliceAvailability {
@@ -318,11 +338,7 @@ pub fn query_nrf_slice_availability(
 /// Validate a requested S-NSSAI against subscription data and NRF availability (TS 29.531)
 ///
 /// Returns true if the UE is subscribed to the slice AND the network can serve it.
-pub fn validate_slice_selection(
-    s_nssai: &SNssai,
-    supi: Option<&str>,
-    nrf_uri: &str,
-) -> bool {
+pub fn validate_slice_selection(s_nssai: &SNssai, supi: Option<&str>, nrf_uri: &str) -> bool {
     // Step 1: Check subscription if SUPI available
     if let Some(supi) = supi {
         match ogs_dbi::ogs_dbi_subscription_data(supi) {
@@ -330,13 +346,19 @@ pub fn validate_slice_selection(
                 let subscribed = sub_data.slice.iter().any(|s| {
                     s.s_nssai.sst == s_nssai.sst && {
                         let sd_val = s.s_nssai.sd.v;
-                        if sd_val == 0xFFFFFF { s_nssai.sd.is_none() } else { s_nssai.sd == Some(sd_val) }
+                        if sd_val == 0xFFFFFF {
+                            s_nssai.sd.is_none()
+                        } else {
+                            s_nssai.sd == Some(sd_val)
+                        }
                     }
                 });
                 if !subscribed {
                     log::info!(
                         "[{}] S-NSSAI[SST:{} SD:{:?}] not in subscription",
-                        supi, s_nssai.sst, s_nssai.sd
+                        supi,
+                        s_nssai.sst,
+                        s_nssai.sd
                     );
                     return false;
                 }
@@ -352,7 +374,8 @@ pub fn validate_slice_selection(
     if !availability.available {
         log::warn!(
             "S-NSSAI[SST:{} SD:{:?}] has no available NF instances in NRF",
-            s_nssai.sst, s_nssai.sd
+            s_nssai.sst,
+            s_nssai.sd
         );
         return false;
     }

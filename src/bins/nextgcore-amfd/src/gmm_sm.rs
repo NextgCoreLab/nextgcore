@@ -128,9 +128,7 @@ impl GmmFsm {
                 log::debug!("gmm_state_de_registered: FSM_EXIT");
                 GmmFsmResult::Handled
             }
-            AmfEventId::GmmTimer => {
-                self.handle_gmm_timer_de_registered(event)
-            }
+            AmfEventId::GmmTimer => self.handle_gmm_timer_de_registered(event),
             AmfEventId::SbiClient => {
                 // Handle SBI responses in de-registered state
                 GmmFsmResult::Handled
@@ -181,9 +179,7 @@ impl GmmFsm {
                 log::debug!("gmm_state_authentication: FSM_EXIT");
                 GmmFsmResult::Handled
             }
-            AmfEventId::GmmTimer => {
-                self.handle_gmm_timer_authentication(event)
-            }
+            AmfEventId::GmmTimer => self.handle_gmm_timer_authentication(event),
             AmfEventId::SbiClient => {
                 // Handle AUSF authentication response
                 // On success: transition to SecurityMode
@@ -223,9 +219,7 @@ impl GmmFsm {
                 log::debug!("gmm_state_security_mode: FSM_EXIT");
                 GmmFsmResult::Handled
             }
-            AmfEventId::GmmTimer => {
-                self.handle_gmm_timer_security_mode(event)
-            }
+            AmfEventId::GmmTimer => self.handle_gmm_timer_security_mode(event),
             _ => GmmFsmResult::Ignored,
         }
     }
@@ -259,9 +253,7 @@ impl GmmFsm {
                 log::debug!("gmm_state_initial_context_setup: FSM_EXIT");
                 GmmFsmResult::Handled
             }
-            AmfEventId::GmmTimer => {
-                self.handle_gmm_timer_initial_context_setup(event)
-            }
+            AmfEventId::GmmTimer => self.handle_gmm_timer_initial_context_setup(event),
             AmfEventId::SbiClient => {
                 // Handle UDM/PCF responses
                 // On success: transition to Registered
@@ -300,9 +292,7 @@ impl GmmFsm {
                 log::debug!("gmm_state_registered: FSM_EXIT");
                 GmmFsmResult::Handled
             }
-            AmfEventId::GmmTimer => {
-                self.handle_gmm_timer_registered(event)
-            }
+            AmfEventId::GmmTimer => self.handle_gmm_timer_registered(event),
             AmfEventId::SbiClient => {
                 // Handle various SBI responses in registered state
                 GmmFsmResult::Handled

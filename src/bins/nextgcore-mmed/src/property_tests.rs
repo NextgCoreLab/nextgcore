@@ -6,15 +6,11 @@
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
     use crate::sm::{
-        MmeFsm, MmeState, Fsm,
-        EmmFsm, EmmState,
-        EsmFsm, EsmState,
-        S1apFsm, S1apState,
-        SgsapFsm, SgsapState,
-        MmeEvent, MmeEventId, MmeTimerId,
+        EmmFsm, EmmState, EsmFsm, EsmState, Fsm, MmeEvent, MmeEventId, MmeFsm, MmeState,
+        MmeTimerId, S1apFsm, S1apState, SgsapFsm, SgsapState,
     };
+    use proptest::prelude::*;
 
     // ========================================================================
     // Strategies for generating test data
@@ -53,7 +49,6 @@ mod tests {
             Just(MmeTimerId::S1DelayedSend),
         ]
     }
-
 
     /// Strategy for generating EMM states
     fn arb_emm_state() -> impl Strategy<Value = EmmState> {
@@ -97,7 +92,7 @@ mod tests {
         fn prop_mme_fsm_init_transitions_to_operational(_seed in any::<u64>()) {
             let mut fsm = MmeFsm::new();
             prop_assert_eq!(fsm.state(), MmeState::Initial);
-            
+
             Fsm::init(&mut fsm);
             prop_assert_eq!(fsm.state(), MmeState::Operational);
         }
@@ -110,7 +105,7 @@ mod tests {
             let mut fsm = MmeFsm::new();
             Fsm::init(&mut fsm);
             prop_assert_eq!(fsm.state(), MmeState::Operational);
-            
+
             Fsm::fini(&mut fsm);
             prop_assert_eq!(fsm.state(), MmeState::Final);
         }
@@ -123,7 +118,7 @@ mod tests {
             let mut fsm = MmeFsm::new();
             Fsm::init(&mut fsm);
             prop_assert_eq!(fsm.state(), MmeState::Operational);
-            
+
             let event = MmeEvent::new(event_id);
             Fsm::dispatch(&mut fsm, &event);
             // Should remain in Operational state
@@ -139,14 +134,13 @@ mod tests {
             Fsm::init(&mut fsm);
             Fsm::fini(&mut fsm);
             prop_assert_eq!(fsm.state(), MmeState::Final);
-            
+
             let event = MmeEvent::new(event_id);
             Fsm::dispatch(&mut fsm, &event);
             // Should remain in Final state
             prop_assert_eq!(fsm.state(), MmeState::Final);
         }
     }
-
 
     // ========================================================================
     // EMM FSM Property Tests
@@ -162,7 +156,7 @@ mod tests {
         fn prop_emm_fsm_init_transitions_to_deregistered(mme_ue_id in 1u64..10000) {
             let mut fsm = EmmFsm::new(mme_ue_id);
             prop_assert_eq!(fsm.state(), EmmState::Initial);
-            
+
             Fsm::init(&mut fsm);
             prop_assert_eq!(fsm.state(), EmmState::DeRegistered);
         }
@@ -174,7 +168,7 @@ mod tests {
         fn prop_emm_fsm_fini_transitions_to_final(mme_ue_id in 1u64..10000) {
             let mut fsm = EmmFsm::new(mme_ue_id);
             Fsm::init(&mut fsm);
-            
+
             Fsm::fini(&mut fsm);
             prop_assert_eq!(fsm.state(), EmmState::Final);
         }
@@ -187,17 +181,17 @@ mod tests {
             let mut fsm = EmmFsm::new(mme_ue_id);
             Fsm::init(&mut fsm);
             prop_assert_eq!(fsm.state(), EmmState::DeRegistered);
-            
+
             // Transition through attach flow
             fsm.transition(EmmState::Authentication);
             prop_assert_eq!(fsm.state(), EmmState::Authentication);
-            
+
             fsm.transition(EmmState::SecurityMode);
             prop_assert_eq!(fsm.state(), EmmState::SecurityMode);
-            
+
             fsm.transition(EmmState::InitialContextSetup);
             prop_assert_eq!(fsm.state(), EmmState::InitialContextSetup);
-            
+
             fsm.transition(EmmState::Registered);
             prop_assert_eq!(fsm.state(), EmmState::Registered);
         }
@@ -221,12 +215,11 @@ mod tests {
         ) {
             let mut fsm = EmmFsm::new(mme_ue_id);
             Fsm::init(&mut fsm);
-            
+
             fsm.transition(target_state);
             prop_assert_eq!(fsm.state(), target_state);
         }
     }
-
 
     // ========================================================================
     // ESM FSM Property Tests
@@ -242,7 +235,7 @@ mod tests {
         fn prop_esm_fsm_init_transitions_to_inactive(bearer_id in 1u64..16) {
             let mut fsm = EsmFsm::new(bearer_id);
             prop_assert_eq!(fsm.state(), EsmState::Initial);
-            
+
             Fsm::init(&mut fsm);
             prop_assert_eq!(fsm.state(), EsmState::Inactive);
         }
@@ -254,7 +247,7 @@ mod tests {
         fn prop_esm_fsm_fini_transitions_to_final(bearer_id in 1u64..16) {
             let mut fsm = EsmFsm::new(bearer_id);
             Fsm::init(&mut fsm);
-            
+
             Fsm::fini(&mut fsm);
             prop_assert_eq!(fsm.state(), EsmState::Final);
         }
@@ -267,15 +260,15 @@ mod tests {
             let mut fsm = EsmFsm::new(bearer_id);
             Fsm::init(&mut fsm);
             prop_assert_eq!(fsm.state(), EsmState::Inactive);
-            
+
             // Activate bearer
             fsm.transition(EsmState::Active);
             prop_assert_eq!(fsm.state(), EsmState::Active);
-            
+
             // Deactivate bearer
             fsm.transition(EsmState::PdnWillDisconnect);
             prop_assert_eq!(fsm.state(), EsmState::PdnWillDisconnect);
-            
+
             fsm.transition(EsmState::Inactive);
             prop_assert_eq!(fsm.state(), EsmState::Inactive);
         }
@@ -289,7 +282,6 @@ mod tests {
             prop_assert!(!name.is_empty());
         }
     }
-
 
     // ========================================================================
     // S1AP FSM Property Tests
@@ -305,7 +297,7 @@ mod tests {
         fn prop_s1ap_fsm_init_transitions_to_operational(enb_id in 1u64..10000) {
             let mut fsm = S1apFsm::new(enb_id);
             prop_assert_eq!(fsm.state(), S1apState::Initial);
-            
+
             Fsm::init(&mut fsm);
             prop_assert_eq!(fsm.state(), S1apState::Operational);
         }
@@ -317,7 +309,7 @@ mod tests {
         fn prop_s1ap_fsm_fini_transitions_to_final(enb_id in 1u64..10000) {
             let mut fsm = S1apFsm::new(enb_id);
             Fsm::init(&mut fsm);
-            
+
             Fsm::fini(&mut fsm);
             prop_assert_eq!(fsm.state(), S1apState::Final);
         }
@@ -330,7 +322,7 @@ mod tests {
             let mut fsm = S1apFsm::new(enb_id);
             Fsm::init(&mut fsm);
             prop_assert_eq!(fsm.state(), S1apState::Operational);
-            
+
             let event = MmeEvent::new(MmeEventId::S1apMessage);
             Fsm::dispatch(&mut fsm, &event);
             // Should remain in Operational state
@@ -344,12 +336,11 @@ mod tests {
         fn prop_s1ap_fsm_can_transition_to_exception(enb_id in 1u64..10000) {
             let mut fsm = S1apFsm::new(enb_id);
             Fsm::init(&mut fsm);
-            
+
             fsm.transition(S1apState::Exception);
             prop_assert_eq!(fsm.state(), S1apState::Exception);
         }
     }
-
 
     // ========================================================================
     // SGsAP FSM Property Tests
@@ -365,7 +356,7 @@ mod tests {
         fn prop_sgsap_fsm_init_transitions_to_will_connect(vlr_id in 1u64..10000) {
             let mut fsm = SgsapFsm::new(vlr_id);
             prop_assert_eq!(fsm.state(), SgsapState::Initial);
-            
+
             Fsm::init(&mut fsm);
             prop_assert_eq!(fsm.state(), SgsapState::WillConnect);
         }
@@ -377,7 +368,7 @@ mod tests {
         fn prop_sgsap_fsm_fini_transitions_to_final(vlr_id in 1u64..10000) {
             let mut fsm = SgsapFsm::new(vlr_id);
             Fsm::init(&mut fsm);
-            
+
             Fsm::fini(&mut fsm);
             prop_assert_eq!(fsm.state(), SgsapState::Final);
         }
@@ -389,12 +380,11 @@ mod tests {
         fn prop_sgsap_fsm_can_transition_to_connected(vlr_id in 1u64..10000) {
             let mut fsm = SgsapFsm::new(vlr_id);
             Fsm::init(&mut fsm);
-            
+
             fsm.transition(SgsapState::Connected);
             prop_assert_eq!(fsm.state(), SgsapState::Connected);
         }
     }
-
 
     // ========================================================================
     // Cross-FSM Property Tests
@@ -437,24 +427,24 @@ mod tests {
             let mut emm_fsm2 = EmmFsm::new(mme_ue_id2);
             let mut s1ap_fsm = S1apFsm::new(enb_id);
             let mut esm_fsm = EsmFsm::new(bearer_id);
-            
+
             // Initialize all FSMs
             Fsm::init(&mut mme_fsm);
             Fsm::init(&mut emm_fsm1);
             Fsm::init(&mut emm_fsm2);
             Fsm::init(&mut s1ap_fsm);
             Fsm::init(&mut esm_fsm);
-            
+
             // Verify independent states
             prop_assert_eq!(mme_fsm.state(), MmeState::Operational);
             prop_assert_eq!(emm_fsm1.state(), EmmState::DeRegistered);
             prop_assert_eq!(emm_fsm2.state(), EmmState::DeRegistered);
             prop_assert_eq!(s1ap_fsm.state(), S1apState::Operational);
             prop_assert_eq!(esm_fsm.state(), EsmState::Inactive);
-            
+
             // Transition one EMM FSM
             emm_fsm1.transition(EmmState::Registered);
-            
+
             // Verify other FSMs are unaffected
             prop_assert_eq!(emm_fsm1.state(), EmmState::Registered);
             prop_assert_eq!(emm_fsm2.state(), EmmState::DeRegistered);
@@ -473,21 +463,21 @@ mod tests {
         ) {
             let mut emm_fsm = EmmFsm::new(mme_ue_id);
             let mut esm_fsm = EsmFsm::new(bearer_id);
-            
+
             Fsm::init(&mut emm_fsm);
             Fsm::init(&mut esm_fsm);
-            
+
             // EMM attach flow
             emm_fsm.transition(EmmState::Authentication);
             emm_fsm.transition(EmmState::SecurityMode);
             emm_fsm.transition(EmmState::InitialContextSetup);
-            
+
             // ESM bearer activation during attach
             esm_fsm.transition(EsmState::Active);
-            
+
             // Complete EMM attach
             emm_fsm.transition(EmmState::Registered);
-            
+
             // Verify both FSMs are in expected states
             prop_assert_eq!(emm_fsm.state(), EmmState::Registered);
             prop_assert_eq!(esm_fsm.state(), EsmState::Active);
@@ -499,14 +489,14 @@ mod tests {
         #[test]
         fn prop_fsm_lifecycle_consistent(mme_ue_id in 1u64..10000) {
             let mut emm_fsm = EmmFsm::new(mme_ue_id);
-            
+
             // Initial state
             prop_assert_eq!(emm_fsm.state(), EmmState::Initial);
-            
+
             // After init
             Fsm::init(&mut emm_fsm);
             prop_assert_eq!(emm_fsm.state(), EmmState::DeRegistered);
-            
+
             // After fini
             Fsm::fini(&mut emm_fsm);
             prop_assert_eq!(emm_fsm.state(), EmmState::Final);

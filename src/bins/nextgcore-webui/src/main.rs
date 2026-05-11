@@ -16,7 +16,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::{Html, IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::get,
     Json, Router,
 };
 use clap::Parser;
@@ -28,7 +28,10 @@ use tower_http::cors::CorsLayer;
 // ---------------------------------------------------------------------------
 
 #[derive(Parser, Debug)]
-#[command(name = "nextgcore-webui", about = "NextGCore Subscriber Management WebUI")]
+#[command(
+    name = "nextgcore-webui",
+    about = "NextGCore Subscriber Management WebUI"
+)]
 struct Args {
     /// MongoDB connection URI
     #[arg(long, default_value = "mongodb://localhost:27017")]
@@ -107,8 +110,12 @@ impl Default for BitrateValue {
     }
 }
 
-fn default_bitrate() -> u64 { 1 }
-fn default_unit() -> u8 { 3 }
+fn default_bitrate() -> u64 {
+    1
+}
+fn default_unit() -> u8 {
+    3
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SliceConfig {
@@ -121,7 +128,9 @@ pub struct SliceConfig {
     pub session: Vec<SessionConfig>,
 }
 
-fn default_slice_name() -> bool { true }
+fn default_slice_name() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
@@ -142,7 +151,9 @@ pub struct QosConfig {
     pub arp: ArpConfig,
 }
 
-fn default_qci() -> u8 { 9 }
+fn default_qci() -> u8 {
+    9
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArpConfig {
@@ -164,7 +175,9 @@ impl Default for ArpConfig {
     }
 }
 
-fn default_priority() -> u8 { 8 }
+fn default_priority() -> u8 {
+    8
+}
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -188,10 +201,7 @@ async fn list_subscribers(State(state): State<SharedState>) -> Response {
     }
 }
 
-async fn get_subscriber(
-    State(state): State<SharedState>,
-    Path(imsi): Path<String>,
-) -> Response {
+async fn get_subscriber(State(state): State<SharedState>, Path(imsi): Path<String>) -> Response {
     match db_get_subscriber(&state.db_uri, &state.db_name, &imsi) {
         Ok(Some(sub)) => Json(sub).into_response(),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
@@ -224,10 +234,7 @@ async fn update_subscriber(
     }
 }
 
-async fn delete_subscriber(
-    State(state): State<SharedState>,
-    Path(imsi): Path<String>,
-) -> Response {
+async fn delete_subscriber(State(state): State<SharedState>, Path(imsi): Path<String>) -> Response {
     match db_delete_subscriber(&state.db_uri, &state.db_name, &imsi) {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
@@ -247,12 +254,14 @@ async fn subscriber_count(State(state): State<SharedState>) -> Response {
 // ---------------------------------------------------------------------------
 
 fn db_list_subscribers(uri: &str, db_name: &str) -> Result<Vec<Subscriber>> {
-    let client = mongodb::sync::Client::with_uri_str(uri)
-        .context("failed to connect to MongoDB")?;
+    let client =
+        mongodb::sync::Client::with_uri_str(uri).context("failed to connect to MongoDB")?;
     let db = client.database(db_name);
     let coll = db.collection::<mongodb::bson::Document>("subscribers");
 
-    let cursor = coll.find(mongodb::bson::doc! {}, None).context("find failed")?;
+    let cursor = coll
+        .find(mongodb::bson::doc! {}, None)
+        .context("find failed")?;
     let mut subs = Vec::new();
     for doc_result in cursor {
         let doc = doc_result.context("cursor error")?;
@@ -264,8 +273,8 @@ fn db_list_subscribers(uri: &str, db_name: &str) -> Result<Vec<Subscriber>> {
 }
 
 fn db_get_subscriber(uri: &str, db_name: &str, imsi: &str) -> Result<Option<Subscriber>> {
-    let client = mongodb::sync::Client::with_uri_str(uri)
-        .context("failed to connect to MongoDB")?;
+    let client =
+        mongodb::sync::Client::with_uri_str(uri).context("failed to connect to MongoDB")?;
     let db = client.database(db_name);
     let coll = db.collection::<mongodb::bson::Document>("subscribers");
 
@@ -281,8 +290,8 @@ fn db_get_subscriber(uri: &str, db_name: &str, imsi: &str) -> Result<Option<Subs
 }
 
 fn db_create_subscriber(uri: &str, db_name: &str, sub: &Subscriber) -> Result<()> {
-    let client = mongodb::sync::Client::with_uri_str(uri)
-        .context("failed to connect to MongoDB")?;
+    let client =
+        mongodb::sync::Client::with_uri_str(uri).context("failed to connect to MongoDB")?;
     let db = client.database(db_name);
     let coll = db.collection::<mongodb::bson::Document>("subscribers");
 
@@ -291,14 +300,9 @@ fn db_create_subscriber(uri: &str, db_name: &str, sub: &Subscriber) -> Result<()
     Ok(())
 }
 
-fn db_update_subscriber(
-    uri: &str,
-    db_name: &str,
-    imsi: &str,
-    sub: &Subscriber,
-) -> Result<bool> {
-    let client = mongodb::sync::Client::with_uri_str(uri)
-        .context("failed to connect to MongoDB")?;
+fn db_update_subscriber(uri: &str, db_name: &str, imsi: &str, sub: &Subscriber) -> Result<bool> {
+    let client =
+        mongodb::sync::Client::with_uri_str(uri).context("failed to connect to MongoDB")?;
     let db = client.database(db_name);
     let coll = db.collection::<mongodb::bson::Document>("subscribers");
 
@@ -311,8 +315,8 @@ fn db_update_subscriber(
 }
 
 fn db_delete_subscriber(uri: &str, db_name: &str, imsi: &str) -> Result<bool> {
-    let client = mongodb::sync::Client::with_uri_str(uri)
-        .context("failed to connect to MongoDB")?;
+    let client =
+        mongodb::sync::Client::with_uri_str(uri).context("failed to connect to MongoDB")?;
     let db = client.database(db_name);
     let coll = db.collection::<mongodb::bson::Document>("subscribers");
 
@@ -322,12 +326,14 @@ fn db_delete_subscriber(uri: &str, db_name: &str, imsi: &str) -> Result<bool> {
 }
 
 fn db_count_subscribers(uri: &str, db_name: &str) -> Result<u64> {
-    let client = mongodb::sync::Client::with_uri_str(uri)
-        .context("failed to connect to MongoDB")?;
+    let client =
+        mongodb::sync::Client::with_uri_str(uri).context("failed to connect to MongoDB")?;
     let db = client.database(db_name);
     let coll = db.collection::<mongodb::bson::Document>("subscribers");
 
-    let count = coll.count_documents(mongodb::bson::doc! {}, None).context("count failed")?;
+    let count = coll
+        .count_documents(mongodb::bson::doc! {}, None)
+        .context("count failed")?;
     Ok(count)
 }
 
@@ -564,7 +570,10 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(serve_dashboard))
-        .route("/api/subscribers", get(list_subscribers).post(create_subscriber))
+        .route(
+            "/api/subscribers",
+            get(list_subscribers).post(create_subscriber),
+        )
         .route("/api/subscribers/count", get(subscriber_count))
         .route(
             "/api/subscribers/{imsi}",
@@ -579,12 +588,12 @@ async fn main() -> Result<()> {
         .parse()
         .context("invalid listen address")?;
 
-    log::info!("WebUI available at http://{}", addr);
+    log::info!("WebUI available at http://{addr}");
 
-    let listener = tokio::net::TcpListener::bind(addr).await.context("bind failed")?;
-    axum::serve(listener, app)
+    let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .context("server error")?;
+        .context("bind failed")?;
+    axum::serve(listener, app).await.context("server error")?;
 
     Ok(())
 }

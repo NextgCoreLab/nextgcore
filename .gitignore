@@ -3,3 +3,6 @@
 **/*.rs.bk
 *.pdb
 .DS_Store
+
+# Build artifacts — regenerate via docker/rust/build.sh
+docker/rust/binaries/

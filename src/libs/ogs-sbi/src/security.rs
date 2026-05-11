@@ -10,7 +10,7 @@
 //! all SBI communication between NFs SHALL use TLS with mutual authentication.
 
 use crate::error::{SbiError, SbiResult};
-use crate::oauth::{AccessTokenClaims, decode_jwt_parts};
+use crate::oauth::{decode_jwt_parts, AccessTokenClaims};
 use crate::types::NfType;
 
 // ============================================================================
@@ -197,9 +197,7 @@ impl NrfSecurityConfig {
 /// Extract Bearer token from Authorization header
 pub fn extract_bearer_token(auth_header: &str) -> Option<&str> {
     let trimmed = auth_header.trim();
-    if trimmed.len() > 7
-        && trimmed[..7].eq_ignore_ascii_case("bearer ")
-    {
+    if trimmed.len() > 7 && trimmed[..7].eq_ignore_ascii_case("bearer ") {
         Some(trimmed[7..].trim())
     } else {
         None
@@ -259,12 +257,13 @@ pub fn authorize_sbi_request(
         return Ok(None);
     }
 
-    let header = auth_header.ok_or_else(|| {
-        SbiError::AuthorizationFailed("Missing Authorization header".to_string())
-    })?;
+    let header = auth_header
+        .ok_or_else(|| SbiError::AuthorizationFailed("Missing Authorization header".to_string()))?;
 
     let token = extract_bearer_token(header).ok_or_else(|| {
-        SbiError::AuthorizationFailed("Invalid Authorization header: expected Bearer token".to_string())
+        SbiError::AuthorizationFailed(
+            "Invalid Authorization header: expected Bearer token".to_string(),
+        )
     })?;
 
     let now = std::time::SystemTime::now()
@@ -443,10 +442,7 @@ mod tests {
             extract_bearer_token("Bearer eyJhbGciOi"),
             Some("eyJhbGciOi")
         );
-        assert_eq!(
-            extract_bearer_token("bearer  token123  "),
-            Some("token123")
-        );
+        assert_eq!(extract_bearer_token("bearer  token123  "), Some("token123"));
         assert_eq!(extract_bearer_token("Basic dXNlcjpwYXNz"), None);
         assert_eq!(extract_bearer_token(""), None);
         assert_eq!(extract_bearer_token("Bearer"), None);
@@ -502,8 +498,7 @@ mod tests {
 
     #[test]
     fn test_nrf_security_config() {
-        let config = NrfSecurityConfig::new("nrf-001")
-            .with_token_lifetime(7200);
+        let config = NrfSecurityConfig::new("nrf-001").with_token_lifetime(7200);
         assert_eq!(config.nrf_instance_id, "nrf-001");
         assert_eq!(config.token_lifetime_secs, 7200);
         assert!(config.policy.tls_required);

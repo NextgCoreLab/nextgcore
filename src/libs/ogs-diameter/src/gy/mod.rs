@@ -8,7 +8,6 @@ use crate::avp::{Avp, AvpData};
 use crate::common::avp_code;
 use crate::message::DiameterMessage;
 
-
 /// Gy Application ID (Diameter Credit-Control Application)
 pub const GY_APPLICATION_ID: u32 = 4;
 
@@ -141,7 +140,6 @@ pub mod avp {
     /// Rating-Group
     pub const RATING_GROUP: u32 = 432;
 }
-
 
 /// Requested-Action values
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -47,7 +47,6 @@ pub mod gtp2_cause {
     pub const ALL_DYNAMIC_ADDRESSES_ARE_OCCUPIED: u8 = 84;
 }
 
-
 // ============================================================================
 // SBI HTTP Status Codes
 // ============================================================================
@@ -79,40 +78,63 @@ pub fn gtp_cause_from_pfcp(pfcp_cause: u8, gtp_version: u8) -> u8 {
             c if c == PfcpCause::ConditionalIeMissing as u8 => gtp1_cause::MANDATORY_IE_MISSING,
             c if c == PfcpCause::InvalidLength as u8 => gtp1_cause::INVALID_MESSAGE_FORMAT,
             c if c == PfcpCause::MandatoryIeIncorrect as u8 => gtp1_cause::MANDATORY_IE_MISSING,
-            c if c == PfcpCause::InvalidForwardingPolicy as u8 => gtp1_cause::INVALID_MESSAGE_FORMAT,
-            c if c == PfcpCause::InvalidFTeidAllocationOption as u8 => gtp1_cause::INVALID_MESSAGE_FORMAT,
-            c if c == PfcpCause::NoEstablishedPfcpAssociation as u8 => gtp1_cause::NO_RESOURCES_AVAILABLE,
-            c if c == PfcpCause::RuleCreationModificationFailure as u8 => gtp1_cause::SEMANTIC_ERR_TFT_OPERATION,
+            c if c == PfcpCause::InvalidForwardingPolicy as u8 => {
+                gtp1_cause::INVALID_MESSAGE_FORMAT
+            }
+            c if c == PfcpCause::InvalidFTeidAllocationOption as u8 => {
+                gtp1_cause::INVALID_MESSAGE_FORMAT
+            }
+            c if c == PfcpCause::NoEstablishedPfcpAssociation as u8 => {
+                gtp1_cause::NO_RESOURCES_AVAILABLE
+            }
+            c if c == PfcpCause::RuleCreationModificationFailure as u8 => {
+                gtp1_cause::SEMANTIC_ERR_TFT_OPERATION
+            }
             c if c == PfcpCause::PfcpEntityInCongestion as u8 => gtp1_cause::APN_CONGESTION,
             c if c == PfcpCause::NoResourcesAvailable as u8 => gtp1_cause::NO_RESOURCES_AVAILABLE,
             c if c == PfcpCause::ServiceNotSupported as u8 => gtp1_cause::SERVICE_NOT_SUPPORTED,
             c if c == PfcpCause::SystemFailure as u8 => gtp1_cause::SYSTEM_FAILURE,
-            c if c == PfcpCause::AllDynamicAddressAreOccupied as u8 => gtp1_cause::ALL_DYNAMIC_PDP_ADDRS_OCCUPIED,
+            c if c == PfcpCause::AllDynamicAddressAreOccupied as u8 => {
+                gtp1_cause::ALL_DYNAMIC_PDP_ADDRS_OCCUPIED
+            }
             _ => gtp1_cause::SYSTEM_FAILURE,
         },
         2 => match pfcp_cause {
             c if c == PfcpCause::RequestAccepted as u8 => gtp2_cause::REQUEST_ACCEPTED,
-            c if c == PfcpCause::RequestRejected as u8 => gtp2_cause::REQUEST_REJECTED_REASON_NOT_SPECIFIED,
+            c if c == PfcpCause::RequestRejected as u8 => {
+                gtp2_cause::REQUEST_REJECTED_REASON_NOT_SPECIFIED
+            }
             c if c == PfcpCause::SessionContextNotFound as u8 => gtp2_cause::CONTEXT_NOT_FOUND,
             c if c == PfcpCause::MandatoryIeMissing as u8 => gtp2_cause::MANDATORY_IE_MISSING,
             c if c == PfcpCause::ConditionalIeMissing as u8 => gtp2_cause::CONDITIONAL_IE_MISSING,
             c if c == PfcpCause::InvalidLength as u8 => gtp2_cause::INVALID_LENGTH,
             c if c == PfcpCause::MandatoryIeIncorrect as u8 => gtp2_cause::MANDATORY_IE_INCORRECT,
-            c if c == PfcpCause::InvalidForwardingPolicy as u8 => gtp2_cause::INVALID_MESSAGE_FORMAT,
-            c if c == PfcpCause::InvalidFTeidAllocationOption as u8 => gtp2_cause::INVALID_MESSAGE_FORMAT,
-            c if c == PfcpCause::NoEstablishedPfcpAssociation as u8 => gtp2_cause::REMOTE_PEER_NOT_RESPONDING,
-            c if c == PfcpCause::RuleCreationModificationFailure as u8 => gtp2_cause::SEMANTIC_ERROR_IN_THE_TFT_OPERATION,
-            c if c == PfcpCause::PfcpEntityInCongestion as u8 => gtp2_cause::GTP_C_ENTITY_CONGESTION,
+            c if c == PfcpCause::InvalidForwardingPolicy as u8 => {
+                gtp2_cause::INVALID_MESSAGE_FORMAT
+            }
+            c if c == PfcpCause::InvalidFTeidAllocationOption as u8 => {
+                gtp2_cause::INVALID_MESSAGE_FORMAT
+            }
+            c if c == PfcpCause::NoEstablishedPfcpAssociation as u8 => {
+                gtp2_cause::REMOTE_PEER_NOT_RESPONDING
+            }
+            c if c == PfcpCause::RuleCreationModificationFailure as u8 => {
+                gtp2_cause::SEMANTIC_ERROR_IN_THE_TFT_OPERATION
+            }
+            c if c == PfcpCause::PfcpEntityInCongestion as u8 => {
+                gtp2_cause::GTP_C_ENTITY_CONGESTION
+            }
             c if c == PfcpCause::NoResourcesAvailable as u8 => gtp2_cause::NO_RESOURCES_AVAILABLE,
             c if c == PfcpCause::ServiceNotSupported as u8 => gtp2_cause::SERVICE_NOT_SUPPORTED,
             c if c == PfcpCause::SystemFailure as u8 => gtp2_cause::SYSTEM_FAILURE,
-            c if c == PfcpCause::AllDynamicAddressAreOccupied as u8 => gtp2_cause::ALL_DYNAMIC_ADDRESSES_ARE_OCCUPIED,
+            c if c == PfcpCause::AllDynamicAddressAreOccupied as u8 => {
+                gtp2_cause::ALL_DYNAMIC_ADDRESSES_ARE_OCCUPIED
+            }
             _ => gtp2_cause::SYSTEM_FAILURE,
         },
         _ => gtp2_cause::SYSTEM_FAILURE,
     }
 }
-
 
 /// Convert PFCP cause to SBI HTTP status code
 /// Port of sbi_status_from_pfcp() from n4-handler.c
@@ -183,7 +205,6 @@ pub mod modify_flags {
     pub const URR: u64 = 1 << 22;
 }
 
-
 // ============================================================================
 // Session Establishment Response Handler (5GC)
 // ============================================================================
@@ -244,7 +265,7 @@ pub fn handle_5gc_session_establishment_response(
     // Process created PDRs
     for (pdr_id, f_teid, src_if) in created_pdrs {
         log::debug!("Processing created PDR: id={pdr_id}, src_if={src_if}");
-        
+
         // PFCP_INTERFACE_CORE = 1, PFCP_INTERFACE_ACCESS = 0
         if *src_if == 1 {
             // Core interface - downlink
@@ -272,7 +293,6 @@ pub fn handle_5gc_session_establishment_response(
 
     result
 }
-
 
 // ============================================================================
 // Session Modification Response Handler (5GC)
@@ -333,7 +353,7 @@ pub fn handle_5gc_session_modification_response(
     // Process created PDRs
     for (pdr_id, f_teid, src_if, dst_if) in created_pdrs {
         log::debug!("Processing created PDR: id={pdr_id}, src_if={src_if}, dst_if={dst_if}");
-        
+
         // PFCP_INTERFACE_CORE = 1, PFCP_INTERFACE_ACCESS = 0
         if *src_if == 1 {
             // Core interface - downlink
@@ -357,7 +377,6 @@ pub fn handle_5gc_session_modification_response(
     result.status = sbi_status::OK;
     result
 }
-
 
 // ============================================================================
 // Session Deletion Response Handler (5GC)
@@ -450,7 +469,7 @@ pub fn handle_epc_session_establishment_response(
     // Process created PDRs for bearer F-TEID
     for (pdr_id, f_teid, src_if) in created_pdrs {
         log::debug!("Processing created PDR: id={pdr_id}, src_if={src_if}");
-        
+
         // PFCP_INTERFACE_ACCESS = 0
         if *src_if == 0 {
             if let Some(teid) = f_teid {
@@ -472,7 +491,6 @@ pub fn handle_epc_session_establishment_response(
 
     result
 }
-
 
 // ============================================================================
 // Session Modification Response Handler (EPC)
@@ -503,7 +521,7 @@ pub fn handle_epc_session_modification_response(
     let mut pgw_s5u_teid = None;
     for (pdr_id, f_teid, src_if) in created_pdrs {
         log::debug!("Processing created PDR: id={pdr_id}, src_if={src_if}, flags={flags}");
-        
+
         // PFCP_INTERFACE_ACCESS = 0
         if *src_if == 0 {
             if let Some(teid) = f_teid {
@@ -552,7 +570,6 @@ pub fn handle_epc_session_deletion_response(
     // Return usage reports for Gy processing
     (PfcpCause::RequestAccepted as u8, usage_reports.to_vec())
 }
-
 
 // ============================================================================
 // Session Report Request Handler
@@ -652,9 +669,12 @@ pub fn handle_session_report_request(
     }
 
     // Check if at least one valid report type
-    if (report_type_value & (report_type::DOWNLINK_DATA_REPORT |
-                             report_type::ERROR_INDICATION_REPORT |
-                             report_type::USAGE_REPORT)) == 0 {
+    if (report_type_value
+        & (report_type::DOWNLINK_DATA_REPORT
+            | report_type::ERROR_INDICATION_REPORT
+            | report_type::USAGE_REPORT))
+        == 0
+    {
         log::error!("Not supported Report Type[{report_type_value}]");
         result.cause = PfcpCause::SystemFailure as u8;
         return result;
@@ -663,7 +683,6 @@ pub fn handle_session_report_request(
     result.cause = PfcpCause::RequestAccepted as u8;
     result
 }
-
 
 // ============================================================================
 // Gy Reporting Reason Conversion
@@ -724,21 +743,24 @@ pub fn usage_report_trigger_to_gy_reporting_reason(
     trigger_byte3: u8,
 ) -> u32 {
     // Check termination report
-    if (trigger_byte2 & usage_report_trigger2::TERMINATION_REPORT) != 0 ||
-       (trigger_byte3 & usage_report_trigger3::TERMINATION_BY_UP_FUNCTION_REPORT) != 0 {
+    if (trigger_byte2 & usage_report_trigger2::TERMINATION_REPORT) != 0
+        || (trigger_byte3 & usage_report_trigger3::TERMINATION_BY_UP_FUNCTION_REPORT) != 0
+    {
         return gy_reporting_reason::FINAL;
     }
 
     // Check threshold
-    if (trigger_byte1 & usage_report_trigger::TIME_THRESHOLD) != 0 ||
-       (trigger_byte1 & usage_report_trigger::VOLUME_THRESHOLD) != 0 {
+    if (trigger_byte1 & usage_report_trigger::TIME_THRESHOLD) != 0
+        || (trigger_byte1 & usage_report_trigger::VOLUME_THRESHOLD) != 0
+    {
         return gy_reporting_reason::THRESHOLD;
     }
 
     // Check quota exhausted
-    if (trigger_byte2 & usage_report_trigger2::TIME_QUOTA) != 0 ||
-       (trigger_byte2 & usage_report_trigger2::VOLUME_QUOTA) != 0 ||
-       (trigger_byte3 & usage_report_trigger3::EVENT_QUOTA) != 0 {
+    if (trigger_byte2 & usage_report_trigger2::TIME_QUOTA) != 0
+        || (trigger_byte2 & usage_report_trigger2::VOLUME_QUOTA) != 0
+        || (trigger_byte3 & usage_report_trigger3::EVENT_QUOTA) != 0
+    {
         return gy_reporting_reason::QUOTA_EXHAUSTED;
     }
 
@@ -750,7 +772,6 @@ pub fn usage_report_trigger_to_gy_reporting_reason(
     // Default
     gy_reporting_reason::UNUSED_QUOTA_TIMER
 }
-
 
 // ============================================================================
 // Unit Tests
@@ -875,7 +896,6 @@ mod tests {
         assert_eq!(result.cause, PfcpCause::NoResourcesAvailable as u8);
     }
 
-
     #[test]
     fn test_handle_5gc_session_modification_response_success() {
         let created_pdrs = vec![
@@ -952,9 +972,7 @@ mod tests {
 
     #[test]
     fn test_handle_epc_session_modification_response_success() {
-        let created_pdrs = vec![
-            (1, Some(0xCCCCDDDD), 0),
-        ];
+        let created_pdrs = vec![(1, Some(0xCCCCDDDD), 0)];
 
         let (cause, teid) = handle_epc_session_modification_response(
             modify_flags::ACTIVATE,
@@ -969,15 +987,13 @@ mod tests {
 
     #[test]
     fn test_handle_epc_session_deletion_response_success() {
-        let usage_reports = vec![
-            UsageReport {
-                urr_id: 1,
-                ul_octets: 1000,
-                dl_octets: 2000,
-                duration: 300,
-                reporting_reason: gy_reporting_reason::FINAL,
-            },
-        ];
+        let usage_reports = vec![UsageReport {
+            urr_id: 1,
+            ul_octets: 1000,
+            dl_octets: 2000,
+            duration: 300,
+            reporting_reason: gy_reporting_reason::FINAL,
+        }];
 
         let (cause, reports) = handle_epc_session_deletion_response(
             true,
@@ -1022,15 +1038,13 @@ mod tests {
 
     #[test]
     fn test_handle_session_report_request_usage_report() {
-        let usage_reports = vec![
-            UsageReport {
-                urr_id: 1,
-                ul_octets: 500,
-                dl_octets: 1500,
-                duration: 60,
-                reporting_reason: gy_reporting_reason::THRESHOLD,
-            },
-        ];
+        let usage_reports = vec![UsageReport {
+            urr_id: 1,
+            ul_octets: 500,
+            dl_octets: 1500,
+            duration: 60,
+            reporting_reason: gy_reporting_reason::THRESHOLD,
+        }];
 
         let result = handle_session_report_request(
             true,
@@ -1069,11 +1083,7 @@ mod tests {
 
         // Time quota
         assert_eq!(
-            usage_report_trigger_to_gy_reporting_reason(
-                0,
-                usage_report_trigger2::TIME_QUOTA,
-                0
-            ),
+            usage_report_trigger_to_gy_reporting_reason(0, usage_report_trigger2::TIME_QUOTA, 0),
             gy_reporting_reason::QUOTA_EXHAUSTED
         );
 

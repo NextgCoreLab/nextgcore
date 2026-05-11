@@ -3,21 +3,21 @@
 //! This crate provides Prometheus metrics collection for NextGCore network functions.
 //! It mirrors the interface of lib/metrics/ from the C implementation.
 
+pub mod ai_native;
 pub mod context;
+pub mod instance;
+pub mod otel;
 pub mod server;
 pub mod spec;
-pub mod instance;
 pub mod types;
-pub mod otel;
-pub mod ai_native;
 
+pub use ai_native::*;
 pub use context::*;
+pub use instance::*;
+pub use otel::*;
 pub use server::*;
 pub use spec::*;
-pub use instance::*;
 pub use types::*;
-pub use otel::*;
-pub use ai_native::*;
 
 /// Default Prometheus HTTP port
 pub const DEFAULT_PROMETHEUS_HTTP_PORT: u16 = 9090;
@@ -37,7 +37,7 @@ mod tests {
         let counter_type = MetricType::Counter;
         let gauge_type = MetricType::Gauge;
         let histogram_type = MetricType::Histogram;
-        
+
         assert!(matches!(counter_type, MetricType::Counter));
         assert!(matches!(gauge_type, MetricType::Gauge));
         assert!(matches!(histogram_type, MetricType::Histogram));
@@ -50,19 +50,22 @@ mod tests {
             width: 10.0,
             count: 5,
         };
-        
+
         let exponential = HistogramBucketParams::Exponential {
             start: 1.0,
             factor: 2.0,
             count: 5,
         };
-        
+
         let variable = HistogramBucketParams::Variable {
             buckets: vec![1.0, 5.0, 10.0, 50.0, 100.0],
         };
-        
+
         assert!(matches!(linear, HistogramBucketParams::Linear { .. }));
-        assert!(matches!(exponential, HistogramBucketParams::Exponential { .. }));
+        assert!(matches!(
+            exponential,
+            HistogramBucketParams::Exponential { .. }
+        ));
         assert!(matches!(variable, HistogramBucketParams::Variable { .. }));
     }
 
@@ -75,7 +78,7 @@ mod tests {
     #[test]
     fn test_spec_creation() {
         let ctx = MetricsContext::new();
-        
+
         let spec = MetricsSpec::new(
             MetricType::Counter,
             "test_counter",
@@ -84,7 +87,7 @@ mod tests {
             &[],
             None,
         );
-        
+
         assert_eq!(spec.name(), "test_counter");
         assert_eq!(spec.description(), "A test counter metric");
         assert_eq!(spec.metric_type(), MetricType::Counter);
@@ -100,7 +103,7 @@ mod tests {
             &["label1", "label2"],
             None,
         );
-        
+
         assert_eq!(spec.name(), "test_gauge");
         assert_eq!(spec.num_labels(), 2);
         assert_eq!(spec.labels(), &["label1".to_string(), "label2".to_string()]);
@@ -116,25 +119,25 @@ mod tests {
             &["env"],
             None,
         );
-        
+
         let mut inst = MetricsInstance::new(&spec, &["production"]);
-        
+
         // Test set
         inst.set(100);
         assert_eq!(inst.value(), 100);
-        
+
         // Test add
         inst.add(10);
         assert_eq!(inst.value(), 110);
-        
+
         // Test inc
         inst.inc();
         assert_eq!(inst.value(), 111);
-        
+
         // Test dec
         inst.dec();
         assert_eq!(inst.value(), 110);
-        
+
         // Test reset
         inst.reset();
         assert_eq!(inst.value(), 50); // Back to initial value
@@ -150,16 +153,16 @@ mod tests {
             &[],
             None,
         );
-        
+
         let mut inst = MetricsInstance::new(&spec, &[]);
-        
+
         // Counter starts at 0
         assert_eq!(inst.value(), 0);
-        
+
         // Add positive value
         inst.add(5);
         assert_eq!(inst.value(), 5);
-        
+
         // Inc
         inst.inc();
         assert_eq!(inst.value(), 6);

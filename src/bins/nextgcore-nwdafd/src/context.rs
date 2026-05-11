@@ -372,13 +372,7 @@ impl NwdafContext {
     pub fn get_data_sources(&self) -> Vec<DataSource> {
         self.data_sources
             .read()
-            .map(|sources| {
-                sources
-                    .values()
-                    .filter(|s| s.enabled)
-                    .cloned()
-                    .collect()
-            })
+            .map(|sources| sources.values().filter(|s| s.enabled).cloned().collect())
             .expect("value expected")
     }
 
@@ -439,10 +433,7 @@ mod tests {
     #[test]
     fn test_analytics_id_conversion() {
         assert_eq!(AnalyticsId::NfLoad.as_str(), "NF_LOAD");
-        assert_eq!(
-            AnalyticsId::from_str("NF_LOAD"),
-            Some(AnalyticsId::NfLoad)
-        );
+        assert_eq!(AnalyticsId::from_str("NF_LOAD"), Some(AnalyticsId::NfLoad));
         assert_eq!(AnalyticsId::from_str("INVALID"), None);
     }
 

@@ -2,8 +2,8 @@
 //!
 //! Port of src/hss/hss-fd-path.c - FreeDiameter initialization and stats tracking
 
-use crate::s6a_path;
 use crate::cx_path;
+use crate::s6a_path;
 use crate::swx_path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;

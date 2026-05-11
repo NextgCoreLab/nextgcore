@@ -48,10 +48,7 @@ pub type HandlerResult = Result<(u16, Option<PcfBindingResponse>), (u16, String)
 
 /// Handle PCF binding POST request (create new binding)
 /// Port of bsf_nbsf_management_handle_pcf_binding for POST method
-pub fn handle_pcf_binding_post(
-    request: &PcfBindingRequest,
-    server_uri: &str,
-) -> HandlerResult {
+pub fn handle_pcf_binding_post(request: &PcfBindingRequest, server_uri: &str) -> HandlerResult {
     // Validate required fields
     if request.snssai.is_none() {
         return Err((HTTP_STATUS_BAD_REQUEST, "No S-NSSAI".to_string()));
@@ -62,17 +59,20 @@ pub fn handle_pcf_binding_post(
     }
 
     if request.pcf_fqdn.is_none() && request.pcf_ip_end_points.is_empty() {
-        return Err((HTTP_STATUS_BAD_REQUEST, 
-            "No PCF address information".to_string()));
+        return Err((
+            HTTP_STATUS_BAD_REQUEST,
+            "No PCF address information".to_string(),
+        ));
     }
 
     let ctx = bsf_self();
-    
+
     // Try to find existing session or create new one
     let sess = {
-        let context = ctx.read().map_err(|_| 
-            (HTTP_STATUS_BAD_REQUEST, "Context lock error".to_string()))?;
-        
+        let context = ctx
+            .read()
+            .map_err(|_| (HTTP_STATUS_BAD_REQUEST, "Context lock error".to_string()))?;
+
         // Try to find by IPv4
         let mut found_sess = None;
         if let Some(ref ipv4) = request.ipv4_addr {
@@ -91,18 +91,23 @@ pub fn handle_pcf_binding_post(
         existing
     } else {
         // Create new session
-        let context = ctx.read().map_err(|_| 
-            (HTTP_STATUS_BAD_REQUEST, "Context lock error".to_string()))?;
-        
-        context.sess_add_by_ip_address(
-            request.ipv4_addr.as_deref(),
-            request.ipv6_prefix.as_deref(),
-        ).ok_or_else(|| (HTTP_STATUS_BAD_REQUEST, "Failed to create session".to_string()))?
+        let context = ctx
+            .read()
+            .map_err(|_| (HTTP_STATUS_BAD_REQUEST, "Context lock error".to_string()))?;
+
+        context
+            .sess_add_by_ip_address(request.ipv4_addr.as_deref(), request.ipv6_prefix.as_deref())
+            .ok_or_else(|| {
+                (
+                    HTTP_STATUS_BAD_REQUEST,
+                    "Failed to create session".to_string(),
+                )
+            })?
     };
 
     // Update session with request data
     let mut updated_sess = sess.clone();
-    
+
     // Set S-NSSAI
     if let Some(ref snssai) = request.snssai {
         updated_sess.s_nssai = snssai.clone();
@@ -144,14 +149,17 @@ pub fn handle_pcf_binding_post(
 
     // Update session in context
     {
-        let context = ctx.read().map_err(|_| 
-            (HTTP_STATUS_BAD_REQUEST, "Context lock error".to_string()))?;
+        let context = ctx
+            .read()
+            .map_err(|_| (HTTP_STATUS_BAD_REQUEST, "Context lock error".to_string()))?;
         context.sess_update(&updated_sess);
     }
 
     // Build response
-    let location = format!("{}/nbsf-management/v1/pcf-bindings/{}", 
-        server_uri, updated_sess.binding_id);
+    let location = format!(
+        "{}/nbsf-management/v1/pcf-bindings/{}",
+        server_uri, updated_sess.binding_id
+    );
 
     let response = PcfBindingResponse {
         binding_id: updated_sess.binding_id.clone(),
@@ -174,22 +182,20 @@ pub fn handle_pcf_binding_post(
     Ok((HTTP_STATUS_CREATED, Some(response)))
 }
 
-
 /// Handle PCF binding PATCH request (update binding)
 /// Port of bsf_nbsf_management_handle_pcf_binding for PATCH method
 /// Per 3GPP TS 29.521, PATCH supports partial updates of binding attributes:
 /// - pcfFqdn, pcfIpEndPoints, ipv4Addr, ipv6Prefix, ipv4FrameRouteList,
 ///   ipv6FrameRouteList, supi, gpsi, snssai, dnn
-pub fn handle_pcf_binding_patch(
-    binding_id: &str,
-    request: &PcfBindingRequest,
-) -> HandlerResult {
+pub fn handle_pcf_binding_patch(binding_id: &str, request: &PcfBindingRequest) -> HandlerResult {
     let ctx = bsf_self();
-    let context = ctx.read().map_err(|_|
-        (HTTP_STATUS_BAD_REQUEST, "Context lock error".to_string()))?;
+    let context = ctx
+        .read()
+        .map_err(|_| (HTTP_STATUS_BAD_REQUEST, "Context lock error".to_string()))?;
 
     // Find session by binding ID
-    let sess = context.sess_find_by_binding_id(binding_id)
+    let sess = context
+        .sess_find_by_binding_id(binding_id)
         .ok_or_else(|| (HTTP_STATUS_NOT_FOUND, "Session not found".to_string()))?;
 
     let mut updated_sess = sess.clone();
@@ -269,7 +275,7 @@ mod tests {
     #[test]
     fn test_handle_pcf_binding_post_missing_snssai() {
         setup_context();
-        
+
         let request = PcfBindingRequest {
             ipv4_addr: Some("192.168.1.1".to_string()),
             dnn: Some("internet".to_string()),
@@ -287,7 +293,7 @@ mod tests {
     #[test]
     fn test_handle_pcf_binding_post_missing_dnn() {
         setup_context();
-        
+
         let request = PcfBindingRequest {
             ipv4_addr: Some("192.168.1.1".to_string()),
             snssai: Some(SNssai::new(1, Some(0x010203))),
@@ -305,7 +311,7 @@ mod tests {
     #[test]
     fn test_handle_pcf_binding_post_missing_pcf_address() {
         setup_context();
-        
+
         let request = PcfBindingRequest {
             ipv4_addr: Some("192.168.1.1".to_string()),
             snssai: Some(SNssai::new(1, Some(0x010203))),

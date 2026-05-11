@@ -36,7 +36,10 @@ pub struct SNssai {
 impl SNssai {
     /// Create a new S-NSSAI
     pub fn new(sst: u8, sd: Option<u32>) -> Self {
-        Self { sst, sd: sd.map(|v| v & 0xFFFFFF) } // SD is 24 bits
+        Self {
+            sst,
+            sd: sd.map(|v| v & 0xFFFFFF),
+        } // SD is 24 bits
     }
 }
 
@@ -130,9 +133,7 @@ fn test_registration_with_nssai() {
 /// Tests NSSF selection of appropriate AMF for slice
 #[test]
 fn test_nssf_slice_selection() {
-    let requested = vec![
-        SNssai::new(sst::URLLC, Some(0x010203)),
-    ];
+    let requested = vec![SNssai::new(sst::URLLC, Some(0x010203))];
 
     let nssf_result = query_nssf(&requested);
     assert!(nssf_result.is_ok());
@@ -166,7 +167,9 @@ fn test_slice_not_available() {
     let result = reg_result.unwrap();
 
     // Requested slice should not be in allowed (not subscribed)
-    assert!(!result.allowed_nssai.contains(&SNssai::new(99, Some(0xFFFFFF))));
+    assert!(!result
+        .allowed_nssai
+        .contains(&SNssai::new(99, Some(0xFFFFFF))));
 }
 
 // ============================================================================
@@ -288,7 +291,10 @@ fn test_slice_isolation() {
 
     let latency_ms = urllc_latency.unwrap();
     // URLLC should maintain low latency even under eMBB load
-    assert!(latency_ms < 10, "URLLC latency should remain low: {latency_ms} ms");
+    assert!(
+        latency_ms < 10,
+        "URLLC latency should remain low: {latency_ms} ms"
+    );
 }
 
 /// Test: Slice Resource Allocation
@@ -299,8 +305,8 @@ fn test_slice_resource_allocation() {
     let slice_config = SliceConfig {
         s_nssai: SNssai::new(sst::URLLC, Some(0x010203)),
         dnn: "industrial".to_string(),
-        max_mbr: 1000,       // 1 Gbps max
-        guaranteed_br: 100,  // 100 Mbps guaranteed
+        max_mbr: 1000,      // 1 Gbps max
+        guaranteed_br: 100, // 100 Mbps guaranteed
         default_5qi: 80,
         allowed_5qis: vec![80, 81, 82],
         isolation_required: true,
@@ -413,9 +419,12 @@ struct SliceResources {
     dedicated_smf: bool,
 }
 
-fn simulate_registration_with_nssai(config: &SlicingTestConfig) -> Result<RegistrationResult, &'static str> {
+fn simulate_registration_with_nssai(
+    config: &SlicingTestConfig,
+) -> Result<RegistrationResult, &'static str> {
     // Compute allowed NSSAI (intersection of requested and subscribed)
-    let allowed: Vec<SNssai> = config.requested_nssai
+    let allowed: Vec<SNssai> = config
+        .requested_nssai
         .iter()
         .filter(|r| config.subscribed_nssai.contains(r))
         .cloned()

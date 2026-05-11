@@ -31,13 +31,12 @@ impl AperDecode for Criticality {
             0 => Ok(Criticality::Reject),
             1 => Ok(Criticality::Ignore),
             2 => Ok(Criticality::Notify),
-            _ => Err(crate::per::PerError::DecodeError(
-                format!("Invalid Criticality value: {value}")
-            )),
+            _ => Err(crate::per::PerError::DecodeError(format!(
+                "Invalid Criticality value: {value}"
+            ))),
         }
     }
 }
-
 
 /// ProcedureCode - identifies the NGAP procedure
 /// ASN.1: ProcedureCode ::= INTEGER (0..255)
@@ -103,7 +102,6 @@ impl ProcedureCode {
     pub const SECONDARY_RAT_DATA_USAGE_REPORT: Self = Self(52);
 }
 
-
 impl AperEncode for ProcedureCode {
     fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()> {
         encoder.encode_constrained_whole_number(self.0 as i64, &Self::CONSTRAINT)
@@ -162,7 +160,6 @@ impl AperDecode for ProtocolIeId {
     }
 }
 
-
 /// TriggeringMessage - indicates which message triggered the error
 /// ASN.1: TriggeringMessage ::= ENUMERATED { initiating-message, successful-outcome, unsuccessful-outcome }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -190,9 +187,9 @@ impl AperDecode for TriggeringMessage {
             0 => Ok(TriggeringMessage::InitiatingMessage),
             1 => Ok(TriggeringMessage::SuccessfulOutcome),
             2 => Ok(TriggeringMessage::UnsuccessfulOutcome),
-            _ => Err(crate::per::PerError::DecodeError(
-                format!("Invalid TriggeringMessage value: {value}")
-            )),
+            _ => Err(crate::per::PerError::DecodeError(format!(
+                "Invalid TriggeringMessage value: {value}"
+            ))),
         }
     }
 }
@@ -224,9 +221,9 @@ impl AperDecode for Presence {
             0 => Ok(Presence::Optional),
             1 => Ok(Presence::Conditional),
             2 => Ok(Presence::Mandatory),
-            _ => Err(crate::per::PerError::DecodeError(
-                format!("Invalid Presence value: {value}")
-            )),
+            _ => Err(crate::per::PerError::DecodeError(format!(
+                "Invalid Presence value: {value}"
+            ))),
         }
     }
 }

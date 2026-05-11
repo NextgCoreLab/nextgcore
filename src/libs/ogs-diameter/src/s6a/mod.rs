@@ -136,7 +136,6 @@ pub mod avp {
     pub const CHARGING_CHARACTERISTICS: u32 = 13;
 }
 
-
 /// ULR Flags
 pub mod ulr_flags {
     /// Single-Registration-Indication
@@ -255,8 +254,7 @@ pub mod exp_result {
 }
 
 /// E-UTRAN authentication vector
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct EUtranVector {
     /// RAND (16 bytes)
     pub rand: [u8; 16],
@@ -267,7 +265,6 @@ pub struct EUtranVector {
     /// KASME (32 bytes)
     pub kasme: [u8; 32],
 }
-
 
 /// AIA (Authentication-Information-Answer) message data
 #[derive(Debug, Clone, Default)]

@@ -55,13 +55,17 @@ pub struct OgsRbtree {
 
 impl Default for OgsRbtree {
     fn default() -> Self {
-        OgsRbtree { root: std::ptr::null_mut() }
+        OgsRbtree {
+            root: std::ptr::null_mut(),
+        }
     }
 }
 
 impl OgsRbtree {
     pub fn new() -> Self {
-        OgsRbtree { root: ptr::null_mut() }
+        OgsRbtree {
+            root: ptr::null_mut(),
+        }
     }
 
     /// Check if tree is empty
@@ -70,7 +74,7 @@ impl OgsRbtree {
     }
 
     /// Link a node into the tree at the specified position
-    /// 
+    ///
     /// # Safety
     /// - `node` must be a valid pointer to an OgsRbnode
     /// - `parent` must be null or a valid pointer to an OgsRbnode in this tree
@@ -88,16 +92,16 @@ impl OgsRbtree {
     }
 
     /// Rebalance tree after insertion
-    /// 
+    ///
     /// # Safety
     /// `node` must be a valid pointer to a node that was just linked into the tree
     pub unsafe fn insert_color(&mut self, node: *mut OgsRbnode) {
         let mut node = node;
-        
+
         while !(*node).parent.is_null() && (*(*node).parent).color == OgsRbtreeColor::Red {
             let parent = (*node).parent;
             let gparent = (*parent).parent;
-            
+
             if gparent.is_null() {
                 break;
             }
@@ -153,7 +157,7 @@ impl OgsRbtree {
     }
 
     /// Delete a node from the tree
-    /// 
+    ///
     /// # Safety
     /// `node` must be a valid pointer to a node in this tree
     pub unsafe fn delete(&mut self, node: *mut OgsRbnode) {
@@ -193,7 +197,7 @@ impl OgsRbtree {
 
             (*successor).color = (*node).color;
             self.replace_node(node, successor, (*node).parent);
-            
+
             // Use the correct parent for delete_color
             if color == OgsRbtreeColor::Black {
                 self.delete_color(child, new_parent);
@@ -223,7 +227,7 @@ impl OgsRbtree {
     }
 
     /// Get the next node in order
-    /// 
+    ///
     /// # Safety
     /// `node` must be a valid pointer to a node in this tree
     pub unsafe fn next(&self, node: *mut OgsRbnode) -> *mut OgsRbnode {
@@ -250,7 +254,7 @@ impl OgsRbtree {
     }
 
     /// Get the previous node in order
-    /// 
+    ///
     /// # Safety
     /// `node` must be a valid pointer to a node in this tree
     pub unsafe fn prev(&self, node: *mut OgsRbnode) -> *mut OgsRbnode {
@@ -483,15 +487,15 @@ mod tests {
     fn test_rbtree_insert_single() {
         let mut tree = OgsRbtree::new();
         let mut node = TestNode::new(10);
-        
+
         unsafe {
             OgsRbtree::link_node(&mut node.rb, ptr::null_mut(), &mut tree.root);
             tree.insert_color(&mut node.rb);
         }
-        
+
         assert!(!tree.is_empty());
         assert_eq!(tree.count(), 1);
-        
+
         // Root should be black
         unsafe {
             assert_eq!((*tree.root).color, OgsRbtreeColor::Black);
@@ -502,13 +506,13 @@ mod tests {
     fn test_rbtree_insert_multiple() {
         let mut tree = OgsRbtree::new();
         let mut nodes: Vec<Box<TestNode>> = (0..10).map(TestNode::new).collect();
-        
+
         for node in &mut nodes {
             unsafe {
                 // Find insertion point
                 let mut parent: *mut OgsRbnode = ptr::null_mut();
                 let mut link: *mut *mut OgsRbnode = &mut tree.root;
-                
+
                 while !(*link).is_null() {
                     parent = *link;
                     let parent_node = &*(parent as *const TestNode);
@@ -518,12 +522,12 @@ mod tests {
                         link = &mut (*parent).right;
                     }
                 }
-                
+
                 OgsRbtree::link_node(&mut node.rb, parent, link);
                 tree.insert_color(&mut node.rb);
             }
         }
-        
+
         assert_eq!(tree.count(), 10);
     }
 
@@ -532,12 +536,12 @@ mod tests {
         let mut tree = OgsRbtree::new();
         let keys = [5, 3, 7, 1, 9, 2, 8, 4, 6, 0];
         let mut nodes: Vec<Box<TestNode>> = keys.iter().map(|&k| TestNode::new(k)).collect();
-        
+
         for node in &mut nodes {
             unsafe {
                 let mut parent: *mut OgsRbnode = ptr::null_mut();
                 let mut link: *mut *mut OgsRbnode = &mut tree.root;
-                
+
                 while !(*link).is_null() {
                     parent = *link;
                     let parent_node = &*(parent as *const TestNode);
@@ -547,12 +551,12 @@ mod tests {
                         link = &mut (*parent).right;
                     }
                 }
-                
+
                 OgsRbtree::link_node(&mut node.rb, parent, link);
                 tree.insert_color(&mut node.rb);
             }
         }
-        
+
         // Iterate and verify sorted order
         let mut collected = Vec::new();
         let mut current = tree.first();
@@ -563,7 +567,7 @@ mod tests {
                 current = tree.next(current);
             }
         }
-        
+
         assert_eq!(collected, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
@@ -571,13 +575,13 @@ mod tests {
     fn test_rbtree_delete() {
         let mut tree = OgsRbtree::new();
         let mut nodes: Vec<Box<TestNode>> = (0..5).map(TestNode::new).collect();
-        
+
         // Insert all nodes
         for node in &mut nodes {
             unsafe {
                 let mut parent: *mut OgsRbnode = ptr::null_mut();
                 let mut link: *mut *mut OgsRbnode = &mut tree.root;
-                
+
                 while !(*link).is_null() {
                     parent = *link;
                     let parent_node = &*(parent as *const TestNode);
@@ -587,21 +591,21 @@ mod tests {
                         link = &mut (*parent).right;
                     }
                 }
-                
+
                 OgsRbtree::link_node(&mut node.rb, parent, link);
                 tree.insert_color(&mut node.rb);
             }
         }
-        
+
         assert_eq!(tree.count(), 5);
-        
+
         // Delete middle node (key=2)
         unsafe {
             tree.delete(&mut nodes[2].rb);
         }
-        
+
         assert_eq!(tree.count(), 4);
-        
+
         // Verify remaining nodes
         let mut collected = Vec::new();
         let mut current = tree.first();
@@ -612,7 +616,7 @@ mod tests {
                 current = tree.next(current);
             }
         }
-        
+
         assert_eq!(collected, vec![0, 1, 3, 4]);
     }
 }

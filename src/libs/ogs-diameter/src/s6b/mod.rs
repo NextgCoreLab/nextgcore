@@ -279,7 +279,9 @@ pub fn create_aar(
     msg.add_avp(Avp::vendor_mandatory(
         avp::VISITED_NETWORK_IDENTIFIER,
         OGS_3GPP_VENDOR_ID,
-        AvpData::OctetString(Bytes::copy_from_slice(visited_network_identifier.as_bytes())),
+        AvpData::OctetString(Bytes::copy_from_slice(
+            visited_network_identifier.as_bytes(),
+        )),
     ));
 
     // Service-Selection (APN)

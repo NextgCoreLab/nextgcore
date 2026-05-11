@@ -55,13 +55,13 @@ pub fn ogs_strjoin(parts: &[&str], delim: &str) -> String {
 pub fn ogs_strlcpy(dst: &mut [u8], src: &str) -> usize {
     let src_bytes = src.as_bytes();
     let copy_len = std::cmp::min(dst.len().saturating_sub(1), src_bytes.len());
-    
+
     if copy_len > 0 {
         dst[..copy_len].copy_from_slice(&src_bytes[..copy_len]);
     }
     if !dst.is_empty() {
         dst[copy_len] = 0; // Null terminate
     }
-    
+
     src_bytes.len()
 }

@@ -80,9 +80,15 @@ pub struct PlmnId {
 impl PlmnId {
     /// Create a new PLMN ID
     pub fn new(mcc: &str, mnc: &str) -> Self {
-        let mcc_bytes: Vec<u8> = mcc.chars().filter_map(|c| c.to_digit(10).map(|d| d as u8)).collect();
-        let mnc_bytes: Vec<u8> = mnc.chars().filter_map(|c| c.to_digit(10).map(|d| d as u8)).collect();
-        
+        let mcc_bytes: Vec<u8> = mcc
+            .chars()
+            .filter_map(|c| c.to_digit(10).map(|d| d as u8))
+            .collect();
+        let mnc_bytes: Vec<u8> = mnc
+            .chars()
+            .filter_map(|c| c.to_digit(10).map(|d| d as u8))
+            .collect();
+
         Self {
             mcc1: mcc_bytes.first().copied().unwrap_or(0),
             mcc2: mcc_bytes.get(1).copied().unwrap_or(0),
@@ -254,7 +260,6 @@ pub struct NgapCause {
     /// Cause value
     pub cause: i64,
 }
-
 
 // ============================================================================
 // TAI List Types (for served TAI)
@@ -556,7 +561,6 @@ impl AmfContext {
         self.amf_ue_ngap_id_generator.fetch_add(1, Ordering::SeqCst)
     }
 
-
     // ========================================================================
     // gNB Management
     // ========================================================================
@@ -691,7 +695,10 @@ impl AmfContext {
         let mut ran_ue_list = self.ran_ue_list.write().ok()?;
 
         if ran_ue_list.len() >= self.max_num_of_ran_ue {
-            log::error!("Maximum number of RAN UEs [{}] reached", self.max_num_of_ran_ue);
+            log::error!(
+                "Maximum number of RAN UEs [{}] reached",
+                self.max_num_of_ran_ue
+            );
             return None;
         }
 
@@ -715,7 +722,9 @@ impl AmfContext {
         if let Some(ran_ue) = ran_ue_list.remove(&id) {
             log::debug!(
                 "RAN UE removed (id={}, ran_ue_ngap_id={}, amf_ue_ngap_id={})",
-                id, ran_ue.ran_ue_ngap_id, ran_ue.amf_ue_ngap_id
+                id,
+                ran_ue.ran_ue_ngap_id,
+                ran_ue.amf_ue_ngap_id
             );
             return Some(ran_ue);
         }
@@ -792,7 +801,6 @@ impl AmfContext {
     pub fn ran_ue_count(&self) -> usize {
         self.ran_ue_list.read().map(|l| l.len()).unwrap_or(0)
     }
-
 
     // ========================================================================
     // AMF UE Management
@@ -966,7 +974,10 @@ impl AmfContext {
         let mut amf_ue_list = self.amf_ue_list.write().unwrap();
         let mut ran_ue_list = self.ran_ue_list.write().unwrap();
 
-        if let (Some(amf_ue), Some(ran_ue)) = (amf_ue_list.get_mut(&amf_ue_id), ran_ue_list.get_mut(&ran_ue_id)) {
+        if let (Some(amf_ue), Some(ran_ue)) = (
+            amf_ue_list.get_mut(&amf_ue_id),
+            ran_ue_list.get_mut(&ran_ue_id),
+        ) {
             amf_ue.ran_ue_id = ran_ue_id;
             ran_ue.amf_ue_id = amf_ue_id;
             return true;
@@ -1002,7 +1013,10 @@ impl AmfContext {
         let mut sess_list = self.sess_list.write().ok()?;
 
         if sess_list.len() >= self.max_num_of_sess {
-            log::error!("Maximum number of sessions [{}] reached", self.max_num_of_sess);
+            log::error!(
+                "Maximum number of sessions [{}] reached",
+                self.max_num_of_sess
+            );
             return None;
         }
 
@@ -1021,7 +1035,9 @@ impl AmfContext {
         if let Some(sess) = sess_list.remove(&id) {
             log::debug!(
                 "[ue_id={}, psi={}] AMF session removed (id={})",
-                sess.amf_ue_id, sess.psi, id
+                sess.amf_ue_id,
+                sess.psi,
+                id
             );
             return Some(sess);
         }
@@ -1098,7 +1114,9 @@ impl AmfContext {
             let id = ctx.amf_ue_ngap_id;
             log::info!(
                 "[UE NGAP ID: {}] Paging initiated (TMSI: 0x{:08x}, TAC: {})",
-                id, ctx.tmsi, ctx.tac
+                id,
+                ctx.tmsi,
+                ctx.tac
             );
             paging_map.insert(id, ctx);
             return true;
@@ -1112,7 +1130,8 @@ impl AmfContext {
             if let Some(ctx) = paging_map.remove(&amf_ue_ngap_id) {
                 log::info!(
                     "[UE NGAP ID: {}] Paging cancelled (retransmit_count: {})",
-                    amf_ue_ngap_id, ctx.retransmit_count
+                    amf_ue_ngap_id,
+                    ctx.retransmit_count
                 );
                 return Some(ctx);
             }
@@ -1135,14 +1154,17 @@ impl AmfContext {
                 if ctx.retransmit_count >= ctx.max_retransmit {
                     log::warn!(
                         "[UE NGAP ID: {}] Paging max retransmissions ({}) reached",
-                        amf_ue_ngap_id, ctx.max_retransmit
+                        amf_ue_ngap_id,
+                        ctx.max_retransmit
                     );
                     return false;
                 }
                 ctx.retransmit_count += 1;
                 log::debug!(
                     "[UE NGAP ID: {}] Paging retransmit {}/{}",
-                    amf_ue_ngap_id, ctx.retransmit_count, ctx.max_retransmit
+                    amf_ue_ngap_id,
+                    ctx.retransmit_count,
+                    ctx.max_retransmit
                 );
                 return true;
             }
@@ -1157,9 +1179,7 @@ impl AmfContext {
             let now = std::time::Instant::now();
             paging_map.retain(|id, ctx| {
                 if now.duration_since(ctx.initiated_at).as_secs() > timeout_secs {
-                    log::warn!(
-                        "[UE NGAP ID: {id}] Paging expired after {timeout_secs}s"
-                    );
+                    log::warn!("[UE NGAP ID: {id}] Paging expired after {timeout_secs}s");
                     expired.push(ctx.clone());
                     false
                 } else {
@@ -1231,7 +1251,6 @@ impl Default for AmfContext {
         Self::new()
     }
 }
-
 
 // ============================================================================
 // AmfGnb - gNB Context
@@ -1508,7 +1527,6 @@ pub struct ExplicitDeRegistered {
     pub sbi_done: bool,
 }
 
-
 // ============================================================================
 // AmfUe - AMF UE Context
 // ============================================================================
@@ -1642,7 +1660,6 @@ pub struct AmfUe {
     // ========================================================================
     // GMM Handler Fields (added for gmm_build.rs and gmm_handler.rs)
     // ========================================================================
-
     /// Access type (1 = 3GPP, 2 = Non-3GPP)
     pub access_type: u8,
     /// Registration type
@@ -1683,7 +1700,6 @@ pub struct AmfUe {
     // ========================================================================
     // Rel-17 Feature Fields
     // ========================================================================
-
     /// RedCap (Reduced Capability) UE indication (TS 38.101)
     pub redcap_indication: bool,
     /// SNPN NID if UE is registering via SNPN
@@ -1763,9 +1779,7 @@ impl AmfUe {
     pub fn start_snpn_auth(&mut self, nid: &str) -> bool {
         if self.snpn_nid.is_none() {
             self.snpn_nid = Some(nid.to_string());
-            log::info!(
-                "[SNPN Auth] Starting SNPN authentication for UE with NID={nid}"
-            );
+            log::info!("[SNPN Auth] Starting SNPN authentication for UE with NID={nid}");
             return true;
         }
         false
@@ -1773,11 +1787,13 @@ impl AmfUe {
 
     /// Handle SNPN onboarding process
     /// This provisions initial credentials for a new SNPN UE
-    pub fn handle_snpn_onboarding(&mut self, nid: &str, _credentials: SnpnSubscriptionCredentials) -> bool {
+    pub fn handle_snpn_onboarding(
+        &mut self,
+        nid: &str,
+        _credentials: SnpnSubscriptionCredentials,
+    ) -> bool {
         self.snpn_nid = Some(nid.to_string());
-        log::info!(
-            "[SNPN Onboarding] Provisioning credentials for UE in SNPN NID={nid}"
-        );
+        log::info!("[SNPN Onboarding] Provisioning credentials for UE in SNPN NID={nid}");
         // In production, this would contact DCS (Default Credential Server)
         // and provision initial K/OPc for the UE
         true
@@ -1921,7 +1937,13 @@ impl UavAuthorizationContext {
     }
 
     /// Update UAV position and check geofence violations
-    pub fn update_position(&mut self, latitude: f64, longitude: f64, altitude: f64, timestamp: u64) -> bool {
+    pub fn update_position(
+        &mut self,
+        latitude: f64,
+        longitude: f64,
+        altitude: f64,
+        timestamp: u64,
+    ) -> bool {
         self.last_latitude = latitude;
         self.last_longitude = longitude;
         self.last_altitude = altitude;
@@ -1942,8 +1964,10 @@ impl UavAuthorizationContext {
         }
 
         // Check geographic constraints
-        if latitude < self.min_latitude || latitude > self.max_latitude
-            || longitude < self.min_longitude || longitude > self.max_longitude
+        if latitude < self.min_latitude
+            || latitude > self.max_latitude
+            || longitude < self.min_longitude
+            || longitude > self.max_longitude
         {
             log::warn!(
                 "[UAV Tracking] Geofence violation: ({:.6}, {:.6}) outside permitted area for UAV {:?}",
@@ -1951,7 +1975,8 @@ impl UavAuthorizationContext {
                 longitude,
                 self.uav_id
             );
-            self.violations.push(UavGeofenceViolation::OutsidePermittedArea);
+            self.violations
+                .push(UavGeofenceViolation::OutsidePermittedArea);
             violation_detected = true;
         }
 
@@ -1959,7 +1984,15 @@ impl UavAuthorizationContext {
     }
 
     /// Set geofence boundaries
-    pub fn set_geofence(&mut self, min_lat: f64, max_lat: f64, min_lon: f64, max_lon: f64, min_alt: f64, max_alt: f64) {
+    pub fn set_geofence(
+        &mut self,
+        min_lat: f64,
+        max_lat: f64,
+        min_lon: f64,
+        max_lon: f64,
+        min_alt: f64,
+        max_alt: f64,
+    ) {
         self.min_latitude = min_lat;
         self.max_latitude = max_lat;
         self.min_longitude = min_lon;
@@ -1969,7 +2002,13 @@ impl UavAuthorizationContext {
     }
 
     /// Add waypoint to flight path
-    pub fn add_flight_waypoint(&mut self, latitude: f64, longitude: f64, altitude: f64, timestamp: u64) {
+    pub fn add_flight_waypoint(
+        &mut self,
+        latitude: f64,
+        longitude: f64,
+        altitude: f64,
+        timestamp: u64,
+    ) {
         self.flight_path.push(UavFlightPathPoint {
             latitude,
             longitude,
@@ -2091,7 +2130,9 @@ impl AmfUe {
 
     /// Check if security context is valid
     pub fn security_context_is_valid(&self) -> bool {
-        self.security_context_available && !self.mac_failed && self.nas.ue_ksi != OGS_NAS_KSI_NO_KEY_IS_AVAILABLE
+        self.security_context_available
+            && !self.mac_failed
+            && self.nas.ue_ksi != OGS_NAS_KSI_NO_KEY_IS_AVAILABLE
     }
 
     /// Clear security context
@@ -2209,7 +2250,7 @@ impl AmfUe {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0);
-        
+
         self.next_guti.tmsi = timestamp ^ (self.id as u32);
         self.next_m_tmsi = Some(self.next_guti.tmsi);
     }
@@ -2220,7 +2261,6 @@ impl Default for AmfUe {
         Self::new(0, 0)
     }
 }
-
 
 // ============================================================================
 // AmfSess - PDU Session Context
@@ -2465,7 +2505,12 @@ impl AmfSess {
     }
 
     /// Store 5GSM message
-    pub fn store_5gsm_message(&mut self, msg_type: u8, n1buf: Option<Vec<u8>>, n2buf: Option<Vec<u8>>) {
+    pub fn store_5gsm_message(
+        &mut self,
+        msg_type: u8,
+        n1buf: Option<Vec<u8>>,
+        n2buf: Option<Vec<u8>>,
+    ) {
         self.gsm_message.n1buf = n1buf;
         self.gsm_message.n2buf = n2buf;
         self.gsm_message.message_type = msg_type;
@@ -2500,7 +2545,8 @@ impl Default for AmfSess {
 // ============================================================================
 
 /// Global AMF context (thread-safe singleton)
-static GLOBAL_AMF_CONTEXT: std::sync::OnceLock<Arc<RwLock<AmfContext>>> = std::sync::OnceLock::new();
+static GLOBAL_AMF_CONTEXT: std::sync::OnceLock<Arc<RwLock<AmfContext>>> =
+    std::sync::OnceLock::new();
 
 /// Get the global AMF context
 pub fn amf_self() -> Arc<RwLock<AmfContext>> {

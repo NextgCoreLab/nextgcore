@@ -16,10 +16,7 @@ pub enum NgapError {
 
     /// Unexpected message type
     #[error("Unexpected message type: expected {expected}, got {got}")]
-    UnexpectedMessageType {
-        expected: &'static str,
-        got: String,
-    },
+    UnexpectedMessageType { expected: &'static str, got: String },
 
     /// Unexpected procedure code
     #[error("Unexpected procedure code: expected {expected}, got {got}")]

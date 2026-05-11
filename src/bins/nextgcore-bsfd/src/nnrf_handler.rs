@@ -71,7 +71,9 @@ pub fn bsf_nnrf_handle_nf_discover(
 
     // Find NF instance by discovery parameters
     // In C: ogs_sbi_nf_instance_find_by_discovery_param(...)
-    let nf_instance = search_result.nf_instances.first()
+    let nf_instance = search_result
+        .nf_instances
+        .first()
         .ok_or_else(|| "No suitable NF instance found".to_string())?;
 
     log::debug!(
@@ -95,13 +97,8 @@ pub fn bsf_nnrf_handle_nf_discover(
 }
 
 /// Handle NF status notify
-pub fn handle_nf_status_notify(
-    nf_instance_id: &str,
-    nf_status: &str,
-) -> Result<(), String> {
-    log::debug!(
-        "NF status notify: nf_instance_id={nf_instance_id}, status={nf_status}"
-    );
+pub fn handle_nf_status_notify(nf_instance_id: &str, nf_status: &str) -> Result<(), String> {
+    log::debug!("NF status notify: nf_instance_id={nf_instance_id}, status={nf_status}");
 
     match nf_status {
         "REGISTERED" => {

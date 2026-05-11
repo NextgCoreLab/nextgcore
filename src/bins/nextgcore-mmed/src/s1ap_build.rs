@@ -5,7 +5,9 @@
 //! Note: S1AP uses ASN.1 PER encoding. This module provides Rust structures
 //! and encoding functions for S1AP messages.
 
-use crate::context::{MmeContext, EnbUe, MmeUe, MmeBearer, PlmnId, EpsTai, ECgi, S1apCause, S1apCauseGroup};
+use crate::context::{
+    ECgi, EnbUe, EpsTai, MmeBearer, MmeContext, MmeUe, PlmnId, S1apCause, S1apCauseGroup,
+};
 
 // ============================================================================
 // S1AP Constants
@@ -63,7 +65,6 @@ pub mod procedure_code {
     pub const MME_CONFIGURATION_UPDATE: u8 = 30;
     pub const PAGING: u8 = 10;
 }
-
 
 /// S1AP Criticality
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,7 +176,6 @@ pub mod misc_cause {
     pub const UNKNOWN_PLMN: i64 = 5;
 }
 
-
 // ============================================================================
 // S1AP Message Buffer
 // ============================================================================
@@ -190,20 +190,22 @@ pub struct S1apBuffer {
 impl S1apBuffer {
     /// Create new buffer
     pub fn new() -> Self {
-        Self { data: Vec::with_capacity(1024) }
+        Self {
+            data: Vec::with_capacity(1024),
+        }
     }
-    
+
     /// Write byte
     pub fn write_u8(&mut self, value: u8) {
         self.data.push(value);
     }
-    
+
     /// Write 16-bit value (big endian)
     pub fn write_u16(&mut self, value: u16) {
         self.data.push((value >> 8) as u8);
         self.data.push(value as u8);
     }
-    
+
     /// Write 32-bit value (big endian)
     pub fn write_u32(&mut self, value: u32) {
         self.data.push((value >> 24) as u8);
@@ -211,34 +213,34 @@ impl S1apBuffer {
         self.data.push((value >> 8) as u8);
         self.data.push(value as u8);
     }
-    
+
     /// Write bytes
     pub fn write_bytes(&mut self, bytes: &[u8]) {
         self.data.extend_from_slice(bytes);
     }
-    
+
     /// Write length-prefixed bytes (1-byte length)
     pub fn write_lv(&mut self, bytes: &[u8]) {
         self.data.push(bytes.len() as u8);
         self.data.extend_from_slice(bytes);
     }
-    
+
     /// Write length-prefixed bytes (2-byte length)
     pub fn write_lv16(&mut self, bytes: &[u8]) {
         self.write_u16(bytes.len() as u16);
         self.data.extend_from_slice(bytes);
     }
-    
+
     /// Get data
     pub fn into_vec(self) -> Vec<u8> {
         self.data
     }
-    
+
     /// Get length
     pub fn len(&self) -> usize {
         self.data.len()
     }
-    
+
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
@@ -288,7 +290,7 @@ pub fn encode_ecgi(ecgi: &ECgi) -> Vec<u8> {
 /// Encode S1AP cause
 pub fn encode_cause(cause: &S1apCause) -> Vec<u8> {
     let mut buf = Vec::new();
-    
+
     // Cause choice (3 bits) + extension (1 bit) + cause value
     let choice = match cause.group {
         S1apCauseGroup::RadioNetwork => 0,
@@ -298,59 +300,58 @@ pub fn encode_cause(cause: &S1apCause) -> Vec<u8> {
         S1apCauseGroup::Misc => 4,
         S1apCauseGroup::Nothing => 0,
     };
-    
+
     // Simple encoding: choice byte + cause value
     buf.push(choice);
     buf.push(cause.cause as u8);
-    
+
     buf
 }
-
 
 // ============================================================================
 // S1AP Message Building Functions
 // ============================================================================
 
 /// Build S1 Setup Response
-/// 
+///
 /// This message is sent by MME to eNB in response to S1 Setup Request
 pub fn build_setup_response(ctx: &MmeContext) -> Vec<u8> {
     let mut buf = S1apBuffer::new();
-    
+
     // PDU type: Successful Outcome
     buf.write_u8(PduType::SuccessfulOutcome as u8);
-    
+
     // Procedure code: S1 Setup
     buf.write_u8(procedure_code::S1_SETUP);
-    
+
     // Criticality: Reject
     buf.write_u8(Criticality::Reject as u8);
-    
+
     // Build IEs
     let mut ies = S1apBuffer::new();
-    
+
     // MME Name (optional)
     if let Some(ref name) = ctx.mme_name {
         ies.write_u16(protocol_ie_id::MME_NAME);
         ies.write_u8(Criticality::Ignore as u8);
         ies.write_lv16(name.as_bytes());
     }
-    
+
     // Served GUMMEIs (mandatory)
     ies.write_u16(protocol_ie_id::SERVED_GUMMEIS);
     ies.write_u8(Criticality::Reject as u8);
     let gummeis = encode_served_gummeis(ctx);
     ies.write_lv16(&gummeis);
-    
+
     // Relative MME Capacity (mandatory)
     ies.write_u16(protocol_ie_id::RELATIVE_MME_CAPACITY);
     ies.write_u8(Criticality::Ignore as u8);
     ies.write_u16(1); // Length
     ies.write_u8(ctx.relative_capacity);
-    
+
     // Write IEs to main buffer
     buf.write_lv16(&ies.into_vec());
-    
+
     buf.into_vec()
 }
 
@@ -361,26 +362,29 @@ pub fn build_setup_failure(
     time_to_wait: Option<TimeToWait>,
 ) -> Vec<u8> {
     let mut buf = S1apBuffer::new();
-    
+
     // PDU type: Unsuccessful Outcome
     buf.write_u8(PduType::UnsuccessfulOutcome as u8);
-    
+
     // Procedure code: S1 Setup
     buf.write_u8(procedure_code::S1_SETUP);
-    
+
     // Criticality: Reject
     buf.write_u8(Criticality::Reject as u8);
-    
+
     // Build IEs
     let mut ies = S1apBuffer::new();
-    
+
     // Cause (mandatory)
     ies.write_u16(protocol_ie_id::CAUSE);
     ies.write_u8(Criticality::Ignore as u8);
-    let cause = S1apCause { group: cause_group, cause: cause_value };
+    let cause = S1apCause {
+        group: cause_group,
+        cause: cause_value,
+    };
     let cause_encoded = encode_cause(&cause);
     ies.write_lv16(&cause_encoded);
-    
+
     // Time to Wait (optional)
     if let Some(ttw) = time_to_wait {
         ies.write_u16(protocol_ie_id::TIME_TO_WAIT);
@@ -388,29 +392,29 @@ pub fn build_setup_failure(
         ies.write_u16(1); // Length
         ies.write_u8(ttw as u8);
     }
-    
+
     // Write IEs to main buffer
     buf.write_lv16(&ies.into_vec());
-    
+
     buf.into_vec()
 }
 
 /// Build eNB Configuration Update Acknowledge
 pub fn build_enb_configuration_update_ack() -> Vec<u8> {
     let mut buf = S1apBuffer::new();
-    
+
     // PDU type: Successful Outcome
     buf.write_u8(PduType::SuccessfulOutcome as u8);
-    
+
     // Procedure code: eNB Configuration Update
     buf.write_u8(procedure_code::ENB_CONFIGURATION_UPDATE);
-    
+
     // Criticality: Reject
     buf.write_u8(Criticality::Reject as u8);
-    
+
     // No IEs for this message
     buf.write_u16(0);
-    
+
     buf.into_vec()
 }
 
@@ -421,26 +425,29 @@ pub fn build_enb_configuration_update_failure(
     time_to_wait: Option<TimeToWait>,
 ) -> Vec<u8> {
     let mut buf = S1apBuffer::new();
-    
+
     // PDU type: Unsuccessful Outcome
     buf.write_u8(PduType::UnsuccessfulOutcome as u8);
-    
+
     // Procedure code: eNB Configuration Update
     buf.write_u8(procedure_code::ENB_CONFIGURATION_UPDATE);
-    
+
     // Criticality: Reject
     buf.write_u8(Criticality::Reject as u8);
-    
+
     // Build IEs
     let mut ies = S1apBuffer::new();
-    
+
     // Cause (mandatory)
     ies.write_u16(protocol_ie_id::CAUSE);
     ies.write_u8(Criticality::Ignore as u8);
-    let cause = S1apCause { group: cause_group, cause: cause_value };
+    let cause = S1apCause {
+        group: cause_group,
+        cause: cause_value,
+    };
     let cause_encoded = encode_cause(&cause);
     ies.write_lv16(&cause_encoded);
-    
+
     // Time to Wait (optional)
     if let Some(ttw) = time_to_wait {
         ies.write_u16(protocol_ie_id::TIME_TO_WAIT);
@@ -448,12 +455,11 @@ pub fn build_enb_configuration_update_failure(
         ies.write_u16(1);
         ies.write_u8(ttw as u8);
     }
-    
+
     buf.write_lv16(&ies.into_vec());
-    
+
     buf.into_vec()
 }
-
 
 /// Build Initial Context Setup Request (full version with all parameters)
 pub fn build_initial_context_setup_request_with_params(
@@ -463,64 +469,64 @@ pub fn build_initial_context_setup_request_with_params(
     security_key: &[u8; 32],
 ) -> Vec<u8> {
     let mut buf = S1apBuffer::new();
-    
+
     // PDU type: Initiating Message
     buf.write_u8(PduType::InitiatingMessage as u8);
-    
+
     // Procedure code: Initial Context Setup
     buf.write_u8(procedure_code::INITIAL_CONTEXT_SETUP);
-    
+
     // Criticality: Reject
     buf.write_u8(Criticality::Reject as u8);
-    
+
     // Build IEs
     let mut ies = S1apBuffer::new();
-    
+
     // MME UE S1AP ID (mandatory)
     ies.write_u16(protocol_ie_id::MME_UE_S1AP_ID);
     ies.write_u8(Criticality::Reject as u8);
     ies.write_u16(4);
     ies.write_u32(enb_ue.mme_ue_s1ap_id);
-    
+
     // eNB UE S1AP ID (mandatory)
     ies.write_u16(protocol_ie_id::ENB_UE_S1AP_ID);
     ies.write_u8(Criticality::Reject as u8);
     ies.write_u16(4);
     ies.write_u32(enb_ue.enb_ue_s1ap_id);
-    
+
     // UE Aggregate Maximum Bit Rate (mandatory)
     ies.write_u16(protocol_ie_id::UE_AGGREGATE_MAXIMUM_BITRATE);
     ies.write_u8(Criticality::Reject as u8);
     let ambr = encode_ue_ambr(mme_ue.ambr.downlink, mme_ue.ambr.uplink);
     ies.write_lv16(&ambr);
-    
+
     // E-RAB to Be Setup List (mandatory) - simplified
     ies.write_u16(protocol_ie_id::E_RAB_TO_BE_SETUP_LIST_CTXT_SU_REQ);
     ies.write_u8(Criticality::Reject as u8);
     // Placeholder for E-RAB list
     ies.write_u16(0);
-    
+
     // UE Security Capabilities (mandatory)
     ies.write_u16(protocol_ie_id::UE_SECURITY_CAPABILITIES);
     ies.write_u8(Criticality::Reject as u8);
     let sec_cap = encode_ue_security_capabilities(mme_ue);
     ies.write_lv16(&sec_cap);
-    
+
     // Security Key (mandatory)
     ies.write_u16(protocol_ie_id::SECURITY_KEY);
     ies.write_u8(Criticality::Reject as u8);
     ies.write_u16(32);
     ies.write_bytes(security_key);
-    
+
     // NAS PDU (optional)
     if let Some(pdu) = nas_pdu {
         ies.write_u16(protocol_ie_id::NAS_PDU);
         ies.write_u8(Criticality::Ignore as u8);
         ies.write_lv16(pdu);
     }
-    
+
     buf.write_lv16(&ies.into_vec());
-    
+
     buf.into_vec()
 }
 
@@ -532,19 +538,19 @@ pub fn build_ue_context_release_command(
     cause_value: i64,
 ) -> Vec<u8> {
     let mut buf = S1apBuffer::new();
-    
+
     // PDU type: Initiating Message
     buf.write_u8(PduType::InitiatingMessage as u8);
-    
+
     // Procedure code: UE Context Release
     buf.write_u8(procedure_code::UE_CONTEXT_RELEASE);
-    
+
     // Criticality: Reject
     buf.write_u8(Criticality::Reject as u8);
-    
+
     // Build IEs
     let mut ies = S1apBuffer::new();
-    
+
     // UE S1AP IDs - can be pair or just MME ID
     if let Some(enb_id) = enb_ue_s1ap_id {
         // UE S1AP ID pair
@@ -552,7 +558,7 @@ pub fn build_ue_context_release_command(
         ies.write_u8(Criticality::Reject as u8);
         ies.write_u16(4);
         ies.write_u32(mme_ue_s1ap_id);
-        
+
         ies.write_u16(protocol_ie_id::ENB_UE_S1AP_ID);
         ies.write_u8(Criticality::Reject as u8);
         ies.write_u16(4);
@@ -564,66 +570,64 @@ pub fn build_ue_context_release_command(
         ies.write_u16(4);
         ies.write_u32(mme_ue_s1ap_id);
     }
-    
+
     // Cause (mandatory)
     ies.write_u16(protocol_ie_id::CAUSE);
     ies.write_u8(Criticality::Ignore as u8);
-    let cause = S1apCause { group: cause_group, cause: cause_value };
+    let cause = S1apCause {
+        group: cause_group,
+        cause: cause_value,
+    };
     let cause_encoded = encode_cause(&cause);
     ies.write_lv16(&cause_encoded);
-    
+
     buf.write_lv16(&ies.into_vec());
-    
+
     buf.into_vec()
 }
 
-
 /// Build Paging message
-pub fn build_paging(
-    ue_identity: &[u8],
-    tai_list: &[EpsTai],
-    cn_domain: u8,
-) -> Vec<u8> {
+pub fn build_paging(ue_identity: &[u8], tai_list: &[EpsTai], cn_domain: u8) -> Vec<u8> {
     let mut buf = S1apBuffer::new();
-    
+
     // PDU type: Initiating Message
     buf.write_u8(PduType::InitiatingMessage as u8);
-    
+
     // Procedure code: Paging
     buf.write_u8(procedure_code::PAGING);
-    
+
     // Criticality: Ignore
     buf.write_u8(Criticality::Ignore as u8);
-    
+
     // Build IEs
     let mut ies = S1apBuffer::new();
-    
+
     // UE Identity Index Value (mandatory) - derived from IMSI
     // Simplified: just use first 10 bits
     ies.write_u16(0); // UE Identity Index Value IE ID
     ies.write_u8(Criticality::Ignore as u8);
     ies.write_u16(2);
     ies.write_u16(0); // Placeholder
-    
+
     // UE Paging Identity (mandatory)
     ies.write_u16(1); // UE Paging Identity IE ID
     ies.write_u8(Criticality::Ignore as u8);
     ies.write_lv16(ue_identity);
-    
+
     // CN Domain (mandatory)
     ies.write_u16(2); // CN Domain IE ID
     ies.write_u8(Criticality::Ignore as u8);
     ies.write_u16(1);
     ies.write_u8(cn_domain);
-    
+
     // TAI List (mandatory)
     ies.write_u16(protocol_ie_id::TAI);
     ies.write_u8(Criticality::Ignore as u8);
     let tai_encoded = encode_tai_list(tai_list);
     ies.write_lv16(&tai_encoded);
-    
+
     buf.write_lv16(&ies.into_vec());
-    
+
     buf.into_vec()
 }
 
@@ -635,19 +639,19 @@ pub fn build_error_indication(
     cause_value: i64,
 ) -> Vec<u8> {
     let mut buf = S1apBuffer::new();
-    
+
     // PDU type: Initiating Message
     buf.write_u8(PduType::InitiatingMessage as u8);
-    
+
     // Procedure code: Error Indication
     buf.write_u8(procedure_code::ERROR_INDICATION);
-    
+
     // Criticality: Ignore
     buf.write_u8(Criticality::Ignore as u8);
-    
+
     // Build IEs
     let mut ies = S1apBuffer::new();
-    
+
     // MME UE S1AP ID (optional)
     if let Some(id) = mme_ue_s1ap_id {
         ies.write_u16(protocol_ie_id::MME_UE_S1AP_ID);
@@ -655,7 +659,7 @@ pub fn build_error_indication(
         ies.write_u16(4);
         ies.write_u32(id);
     }
-    
+
     // eNB UE S1AP ID (optional)
     if let Some(id) = enb_ue_s1ap_id {
         ies.write_u16(protocol_ie_id::ENB_UE_S1AP_ID);
@@ -663,16 +667,19 @@ pub fn build_error_indication(
         ies.write_u16(4);
         ies.write_u32(id);
     }
-    
+
     // Cause (optional but usually included)
     ies.write_u16(protocol_ie_id::CAUSE);
     ies.write_u8(Criticality::Ignore as u8);
-    let cause = S1apCause { group: cause_group, cause: cause_value };
+    let cause = S1apCause {
+        group: cause_group,
+        cause: cause_value,
+    };
     let cause_encoded = encode_cause(&cause);
     ies.write_lv16(&cause_encoded);
-    
+
     buf.write_lv16(&ies.into_vec());
-    
+
     buf.into_vec()
 }
 
@@ -683,10 +690,10 @@ pub fn build_error_indication(
 /// Encode served GUMMEIs
 fn encode_served_gummeis(ctx: &MmeContext) -> Vec<u8> {
     let mut buf = S1apBuffer::new();
-    
+
     // Number of served GUMMEIs
     buf.write_u8(ctx.num_of_served_gummei as u8);
-    
+
     for gummei in &ctx.served_gummei {
         // Served PLMNs
         buf.write_u8(gummei.num_of_plmn_id as u8);
@@ -694,60 +701,60 @@ fn encode_served_gummeis(ctx: &MmeContext) -> Vec<u8> {
             let encoded = encode_plmn_id(plmn);
             buf.write_bytes(&encoded);
         }
-        
+
         // Served Group IDs
         buf.write_u8(gummei.num_of_mme_gid as u8);
         for gid in &gummei.mme_gid {
             buf.write_u16(*gid);
         }
-        
+
         // Served MMECs
         buf.write_u8(gummei.num_of_mme_code as u8);
         for code in &gummei.mme_code {
             buf.write_u8(*code);
         }
     }
-    
+
     buf.into_vec()
 }
 
 /// Encode UE AMBR
 fn encode_ue_ambr(dl: u64, ul: u64) -> Vec<u8> {
     let mut buf = S1apBuffer::new();
-    
+
     // Downlink (in bits per second, encoded as 32-bit)
     buf.write_u32((dl / 1000) as u32); // Convert to kbps
-    
+
     // Uplink
     buf.write_u32((ul / 1000) as u32);
-    
+
     buf.into_vec()
 }
 
 /// Encode UE security capabilities
 fn encode_ue_security_capabilities(mme_ue: &MmeUe) -> Vec<u8> {
     let mut buf = S1apBuffer::new();
-    
+
     // Encryption algorithms (16 bits)
     buf.write_u16(mme_ue.ue_network_capability.eea as u16);
-    
+
     // Integrity algorithms (16 bits)
     buf.write_u16(mme_ue.ue_network_capability.eia as u16);
-    
+
     buf.into_vec()
 }
 
 /// Encode TAI list
 fn encode_tai_list(tai_list: &[EpsTai]) -> Vec<u8> {
     let mut buf = S1apBuffer::new();
-    
+
     buf.write_u8(tai_list.len() as u8);
-    
+
     for tai in tai_list {
         let encoded = encode_tai(tai);
         buf.write_bytes(&encoded);
     }
-    
+
     buf.into_vec()
 }
 
@@ -756,15 +763,8 @@ fn encode_tai_list(tai_list: &[EpsTai]) -> Vec<u8> {
 // ============================================================================
 
 /// Build downlink NAS transport (wrapper for nas_path.rs)
-pub fn build_downlink_nas_transport(
-    enb_ue: &EnbUe,
-    nas_pdu: &[u8],
-) -> Vec<u8> {
-    build_downlink_nas_transport_with_ids(
-        enb_ue.enb_ue_s1ap_id,
-        enb_ue.mme_ue_s1ap_id,
-        nas_pdu,
-    )
+pub fn build_downlink_nas_transport(enb_ue: &EnbUe, nas_pdu: &[u8]) -> Vec<u8> {
+    build_downlink_nas_transport_with_ids(enb_ue.enb_ue_s1ap_id, enb_ue.mme_ue_s1ap_id, nas_pdu)
 }
 
 /// Build downlink NAS transport (full version with explicit IDs)
@@ -774,100 +774,89 @@ pub fn build_downlink_nas_transport_with_ids(
     nas_pdu: &[u8],
 ) -> Vec<u8> {
     let mut buf = S1apBuffer::new();
-    
+
     // PDU type: Initiating Message
     buf.write_u8(PduType::InitiatingMessage as u8);
-    
+
     // Procedure code: Downlink NAS Transport
     buf.write_u8(procedure_code::DOWNLINK_NAS_TRANSPORT);
-    
+
     // Criticality: Ignore
     buf.write_u8(Criticality::Ignore as u8);
-    
+
     // Build IEs
     let mut ies = S1apBuffer::new();
-    
+
     // MME UE S1AP ID (mandatory)
     ies.write_u16(protocol_ie_id::MME_UE_S1AP_ID);
     ies.write_u8(Criticality::Reject as u8);
     ies.write_u16(4); // Length
     ies.write_u32(mme_ue_s1ap_id);
-    
+
     // eNB UE S1AP ID (mandatory)
     ies.write_u16(protocol_ie_id::ENB_UE_S1AP_ID);
     ies.write_u8(Criticality::Reject as u8);
     ies.write_u16(4); // Length
     ies.write_u32(enb_ue_s1ap_id);
-    
+
     // NAS PDU (mandatory)
     ies.write_u16(protocol_ie_id::NAS_PDU);
     ies.write_u8(Criticality::Reject as u8);
     ies.write_lv16(nas_pdu);
-    
+
     buf.write_lv16(&ies.into_vec());
-    
+
     buf.into_vec()
 }
 
 /// Build initial context setup request (wrapper for nas_path.rs)
-pub fn build_initial_context_setup_request(
-    mme_ue: &MmeUe,
-    nas_pdu: &[u8],
-) -> Vec<u8> {
+pub fn build_initial_context_setup_request(mme_ue: &MmeUe, nas_pdu: &[u8]) -> Vec<u8> {
     // Create a minimal EnbUe from mme_ue info
     let enb_ue = EnbUe {
         mme_ue_s1ap_id: 0, // Will be filled from context
         enb_ue_s1ap_id: 0,
         ..Default::default()
     };
-    
-    build_initial_context_setup_request_with_params(
-        &enb_ue,
-        mme_ue,
-        Some(nas_pdu),
-        &mme_ue.kenb,
-    )
+
+    build_initial_context_setup_request_with_params(&enb_ue, mme_ue, Some(nas_pdu), &mme_ue.kenb)
 }
 
 /// Build E-RAB setup request (wrapper for nas_path.rs)
-pub fn build_e_rab_setup_request(
-    bearer: &MmeBearer,
-    nas_pdu: &[u8],
-) -> Vec<u8> {
+pub fn build_e_rab_setup_request(bearer: &MmeBearer, nas_pdu: &[u8]) -> Vec<u8> {
     let mut buf = S1apBuffer::new();
-    
+
     // PDU type: Initiating Message
     buf.write_u8(PduType::InitiatingMessage as u8);
-    
+
     // Procedure code: E-RAB Setup
     buf.write_u8(procedure_code::E_RAB_SETUP);
-    
+
     // Criticality: Reject
     buf.write_u8(Criticality::Reject as u8);
-    
+
     // Build IEs
     let mut ies = S1apBuffer::new();
-    
+
     // MME UE S1AP ID (mandatory) - placeholder
     ies.write_u16(protocol_ie_id::MME_UE_S1AP_ID);
     ies.write_u8(Criticality::Reject as u8);
     ies.write_u16(4);
     ies.write_u32(0); // Would come from context
-    
+
     // eNB UE S1AP ID (mandatory) - placeholder
     ies.write_u16(protocol_ie_id::ENB_UE_S1AP_ID);
     ies.write_u8(Criticality::Reject as u8);
     ies.write_u16(4);
     ies.write_u32(0); // Would come from context
-    
+
     // E-RAB to Be Setup List
     ies.write_u16(protocol_ie_id::E_RAB_TO_BE_SETUP_LIST_CTXT_SU_REQ);
     ies.write_u8(Criticality::Reject as u8);
-    
+
     // E-RAB item
     let mut erab = S1apBuffer::new();
     erab.write_u8(bearer.ebi); // E-RAB ID
-    // E-RAB Level QoS Parameters (simplified)
+                               // E-RAB Level QoS Parameters (simplified)
     erab.write_u8(bearer.qos.qci);
     erab.write_u8(bearer.qos.arp.priority_level);
     // Transport Layer Address (SGW S1-U IP)
@@ -876,110 +865,104 @@ pub fn build_e_rab_setup_request(
     erab.write_u32(bearer.sgw_s1u_teid);
     // NAS PDU
     erab.write_lv16(nas_pdu);
-    
+
     ies.write_lv16(&erab.into_vec());
-    
+
     buf.write_lv16(&ies.into_vec());
-    
+
     buf.into_vec()
 }
 
 /// Build E-RAB modify request (wrapper for nas_path.rs)
-pub fn build_e_rab_modify_request(
-    bearer: &MmeBearer,
-    nas_pdu: &[u8],
-) -> Vec<u8> {
+pub fn build_e_rab_modify_request(bearer: &MmeBearer, nas_pdu: &[u8]) -> Vec<u8> {
     let mut buf = S1apBuffer::new();
-    
+
     // PDU type: Initiating Message
     buf.write_u8(PduType::InitiatingMessage as u8);
-    
+
     // Procedure code: E-RAB Modify
     buf.write_u8(procedure_code::E_RAB_MODIFY);
-    
+
     // Criticality: Reject
     buf.write_u8(Criticality::Reject as u8);
-    
+
     // Build IEs
     let mut ies = S1apBuffer::new();
-    
+
     // MME UE S1AP ID (mandatory) - placeholder
     ies.write_u16(protocol_ie_id::MME_UE_S1AP_ID);
     ies.write_u8(Criticality::Reject as u8);
     ies.write_u16(4);
     ies.write_u32(0);
-    
+
     // eNB UE S1AP ID (mandatory) - placeholder
     ies.write_u16(protocol_ie_id::ENB_UE_S1AP_ID);
     ies.write_u8(Criticality::Reject as u8);
     ies.write_u16(4);
     ies.write_u32(0);
-    
+
     // E-RAB to Be Modified List
     let mut erab = S1apBuffer::new();
     erab.write_u8(bearer.ebi); // E-RAB ID
-    // E-RAB Level QoS Parameters
+                               // E-RAB Level QoS Parameters
     erab.write_u8(bearer.qos.qci);
     erab.write_u8(bearer.qos.arp.priority_level);
     // NAS PDU
     erab.write_lv16(nas_pdu);
-    
+
     ies.write_lv16(&erab.into_vec());
-    
+
     buf.write_lv16(&ies.into_vec());
-    
+
     buf.into_vec()
 }
 
 /// Build E-RAB release command (wrapper for nas_path.rs)
-pub fn build_e_rab_release_command(
-    bearer: &MmeBearer,
-    nas_pdu: &[u8],
-) -> Vec<u8> {
+pub fn build_e_rab_release_command(bearer: &MmeBearer, nas_pdu: &[u8]) -> Vec<u8> {
     let mut buf = S1apBuffer::new();
-    
+
     // PDU type: Initiating Message
     buf.write_u8(PduType::InitiatingMessage as u8);
-    
+
     // Procedure code: E-RAB Release
     buf.write_u8(procedure_code::E_RAB_RELEASE);
-    
+
     // Criticality: Reject
     buf.write_u8(Criticality::Reject as u8);
-    
+
     // Build IEs
     let mut ies = S1apBuffer::new();
-    
+
     // MME UE S1AP ID (mandatory) - placeholder
     ies.write_u16(protocol_ie_id::MME_UE_S1AP_ID);
     ies.write_u8(Criticality::Reject as u8);
     ies.write_u16(4);
     ies.write_u32(0);
-    
+
     // eNB UE S1AP ID (mandatory) - placeholder
     ies.write_u16(protocol_ie_id::ENB_UE_S1AP_ID);
     ies.write_u8(Criticality::Reject as u8);
     ies.write_u16(4);
     ies.write_u32(0);
-    
+
     // E-RAB to Be Released List
     let mut erab = S1apBuffer::new();
     erab.write_u8(bearer.ebi); // E-RAB ID
-    // Cause
+                               // Cause
     erab.write_u8(S1apCauseGroup::Nas as u8);
     erab.write_u8(nas_cause::NORMAL_RELEASE as u8);
-    
+
     ies.write_lv16(&erab.into_vec());
-    
+
     // NAS PDU (optional)
     if !nas_pdu.is_empty() {
         ies.write_u16(protocol_ie_id::NAS_PDU);
         ies.write_u8(Criticality::Ignore as u8);
         ies.write_lv16(nas_pdu);
     }
-    
+
     buf.write_lv16(&ies.into_vec());
-    
+
     buf.into_vec()
 }
 
@@ -1001,58 +984,58 @@ pub fn build_e_rab_setup_request_with_params(
     nas_pdu: &[u8],
 ) -> Vec<u8> {
     let mut buf = S1apBuffer::new();
-    
+
     // PDU type: Initiating Message
     buf.write_u8(PduType::InitiatingMessage as u8);
-    
+
     // Procedure code: E-RAB Setup
     buf.write_u8(procedure_code::E_RAB_SETUP);
-    
+
     // Criticality: Reject
     buf.write_u8(Criticality::Reject as u8);
-    
+
     // Build IEs
     let mut ies = S1apBuffer::new();
-    
+
     // MME UE S1AP ID
     ies.write_u16(protocol_ie_id::MME_UE_S1AP_ID);
     ies.write_u8(Criticality::Reject as u8);
     ies.write_u16(4);
     ies.write_u32(mme_ue_s1ap_id);
-    
+
     // eNB UE S1AP ID
     ies.write_u16(protocol_ie_id::ENB_UE_S1AP_ID);
     ies.write_u8(Criticality::Reject as u8);
     ies.write_u16(4);
     ies.write_u32(enb_ue_s1ap_id);
-    
+
     // E-RAB to be Setup List
     ies.write_u16(protocol_ie_id::E_RAB_TO_BE_SETUP_LIST_BEARER_SU_REQ);
     ies.write_u8(Criticality::Reject as u8);
-    
+
     // E-RAB to be Setup Item
     let mut erab_item = S1apBuffer::new();
     erab_item.write_u8(ebi); // E-RAB ID
-    
+
     // E-RAB Level QoS Parameters
     erab_item.write_u8(qci);
     erab_item.write_u8(arp_priority);
-    
+
     // Transport Layer Address (SGW S1-U)
     if let Some(addr) = sgw_s1u_addr {
         erab_item.write_bytes(&addr);
     }
-    
+
     // GTP-TEID
     erab_item.write_u32(sgw_s1u_teid);
-    
+
     // NAS-PDU
     erab_item.write_lv16(nas_pdu);
-    
+
     ies.write_lv16(&erab_item.into_vec());
-    
+
     buf.write_lv16(&ies.into_vec());
-    
+
     buf.into_vec()
 }
 
@@ -1068,50 +1051,50 @@ pub fn build_e_rab_modify_request_with_params(
     nas_pdu: &[u8],
 ) -> Vec<u8> {
     let mut buf = S1apBuffer::new();
-    
+
     // PDU type: Initiating Message
     buf.write_u8(PduType::InitiatingMessage as u8);
-    
+
     // Procedure code: E-RAB Modify
     buf.write_u8(procedure_code::E_RAB_MODIFY);
-    
+
     // Criticality: Reject
     buf.write_u8(Criticality::Reject as u8);
-    
+
     // Build IEs
     let mut ies = S1apBuffer::new();
-    
+
     // MME UE S1AP ID
     ies.write_u16(protocol_ie_id::MME_UE_S1AP_ID);
     ies.write_u8(Criticality::Reject as u8);
     ies.write_u16(4);
     ies.write_u32(mme_ue_s1ap_id);
-    
+
     // eNB UE S1AP ID
     ies.write_u16(protocol_ie_id::ENB_UE_S1AP_ID);
     ies.write_u8(Criticality::Reject as u8);
     ies.write_u16(4);
     ies.write_u32(enb_ue_s1ap_id);
-    
+
     // E-RAB to be Modified List
     ies.write_u16(protocol_ie_id::E_RAB_TO_BE_MODIFIED_LIST_BEARER_MOD_REQ);
     ies.write_u8(Criticality::Reject as u8);
-    
+
     // E-RAB to be Modified Item
     let mut erab_item = S1apBuffer::new();
     erab_item.write_u8(ebi); // E-RAB ID
-    
+
     // E-RAB Level QoS Parameters
     erab_item.write_u8(qci);
     erab_item.write_u8(arp_priority);
-    
+
     // NAS-PDU
     erab_item.write_lv16(nas_pdu);
-    
+
     ies.write_lv16(&erab_item.into_vec());
-    
+
     buf.write_lv16(&ies.into_vec());
-    
+
     buf.into_vec()
 }
 
@@ -1127,58 +1110,60 @@ pub fn build_e_rab_release_command_with_params(
     nas_pdu: Option<&[u8]>,
 ) -> Vec<u8> {
     let mut buf = S1apBuffer::new();
-    
+
     // PDU type: Initiating Message
     buf.write_u8(PduType::InitiatingMessage as u8);
-    
+
     // Procedure code: E-RAB Release
     buf.write_u8(procedure_code::E_RAB_RELEASE);
-    
+
     // Criticality: Reject
     buf.write_u8(Criticality::Reject as u8);
-    
+
     // Build IEs
     let mut ies = S1apBuffer::new();
-    
+
     // MME UE S1AP ID
     ies.write_u16(protocol_ie_id::MME_UE_S1AP_ID);
     ies.write_u8(Criticality::Reject as u8);
     ies.write_u16(4);
     ies.write_u32(mme_ue_s1ap_id);
-    
+
     // eNB UE S1AP ID
     ies.write_u16(protocol_ie_id::ENB_UE_S1AP_ID);
     ies.write_u8(Criticality::Reject as u8);
     ies.write_u16(4);
     ies.write_u32(enb_ue_s1ap_id);
-    
+
     // E-RAB to be Released List
     ies.write_u16(protocol_ie_id::E_RAB_TO_BE_RELEASED_LIST);
     ies.write_u8(Criticality::Ignore as u8);
-    
+
     // E-RAB to be Released Item
     let mut erab_item = S1apBuffer::new();
     erab_item.write_u8(ebi); // E-RAB ID
-    
+
     // Cause
-    let cause = S1apCause { group: cause_group, cause: cause_value };
+    let cause = S1apCause {
+        group: cause_group,
+        cause: cause_value,
+    };
     let cause_encoded = encode_cause(&cause);
     erab_item.write_bytes(&cause_encoded);
-    
+
     ies.write_lv16(&erab_item.into_vec());
-    
+
     // NAS-PDU (optional)
     if let Some(pdu) = nas_pdu {
         ies.write_u16(protocol_ie_id::NAS_PDU);
         ies.write_u8(Criticality::Ignore as u8);
         ies.write_lv16(pdu);
     }
-    
+
     buf.write_lv16(&ies.into_vec());
-    
+
     buf.into_vec()
 }
-
 
 // ============================================================================
 // Unit Tests
@@ -1194,7 +1179,7 @@ mod tests {
         buf.write_u8(0x01);
         buf.write_u16(0x0203);
         buf.write_u32(0x04050607);
-        
+
         let data = buf.into_vec();
         assert_eq!(data, vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07]);
     }
@@ -1247,7 +1232,7 @@ mod tests {
             misc_cause::UNSPECIFIED,
             Some(TimeToWait::V10s),
         );
-        
+
         assert!(!msg.is_empty());
         assert_eq!(msg[0], PduType::UnsuccessfulOutcome as u8);
         assert_eq!(msg[1], procedure_code::S1_SETUP);
@@ -1256,7 +1241,7 @@ mod tests {
     #[test]
     fn test_build_enb_configuration_update_ack() {
         let msg = build_enb_configuration_update_ack();
-        
+
         assert!(!msg.is_empty());
         assert_eq!(msg[0], PduType::SuccessfulOutcome as u8);
         assert_eq!(msg[1], procedure_code::ENB_CONFIGURATION_UPDATE);
@@ -1266,7 +1251,7 @@ mod tests {
     fn test_build_downlink_nas_transport() {
         let nas_pdu = vec![0x07, 0x41, 0x00]; // Sample NAS PDU
         let msg = build_downlink_nas_transport_with_ids(1, 2, &nas_pdu);
-        
+
         assert!(!msg.is_empty());
         assert_eq!(msg[0], PduType::InitiatingMessage as u8);
         assert_eq!(msg[1], procedure_code::DOWNLINK_NAS_TRANSPORT);
@@ -1280,7 +1265,7 @@ mod tests {
             S1apCauseGroup::Nas,
             nas_cause::NORMAL_RELEASE,
         );
-        
+
         assert!(!msg.is_empty());
         assert_eq!(msg[0], PduType::InitiatingMessage as u8);
         assert_eq!(msg[1], procedure_code::UE_CONTEXT_RELEASE);
@@ -1294,7 +1279,7 @@ mod tests {
             S1apCauseGroup::Protocol,
             protocol_cause::UNSPECIFIED,
         );
-        
+
         assert!(!msg.is_empty());
         assert_eq!(msg[0], PduType::InitiatingMessage as u8);
         assert_eq!(msg[1], procedure_code::ERROR_INDICATION);

@@ -107,12 +107,8 @@ impl NgapFsm {
                 log::debug!("ngap_state_operational: FSM_EXIT");
                 NgapFsmResult::Handled
             }
-            AmfEventId::NgapMessage => {
-                self.handle_ngap_message(event)
-            }
-            AmfEventId::NgapTimer => {
-                self.handle_ngap_timer(event)
-            }
+            AmfEventId::NgapMessage => self.handle_ngap_message(event),
+            AmfEventId::NgapTimer => self.handle_ngap_timer(event),
             _ => NgapFsmResult::Ignored,
         }
     }

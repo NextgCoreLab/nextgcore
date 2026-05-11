@@ -3,13 +3,13 @@
 //! This crate provides IP firewall rule parsing and encoding for flow descriptions
 //! used in 3GPP networks (GTP, PFCP, etc.).
 
-mod types;
-mod rule;
 mod packet_filter;
+mod rule;
+mod types;
 
-pub use types::*;
-pub use rule::*;
 pub use packet_filter::*;
+pub use rule::*;
+pub use types::*;
 
 #[cfg(test)]
 mod tests {
@@ -57,7 +57,7 @@ mod tests {
     fn test_encode_flow_description() {
         let mut rule = IpfwRule::default();
         rule.proto = 17; // UDP
-        
+
         let desc = encode_flow_description(&rule);
         assert!(desc.is_ok());
         let desc = desc.unwrap();

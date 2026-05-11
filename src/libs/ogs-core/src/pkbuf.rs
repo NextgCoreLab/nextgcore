@@ -35,7 +35,7 @@ impl OgsCluster {
 }
 
 /// Packet buffer for network data (identical to ogs_pkbuf_t)
-/// 
+///
 /// Memory layout:
 /// ```text
 /// |<-- headroom -->|<-- data (len) -->|<-- tailroom -->|
@@ -63,7 +63,7 @@ impl OgsPkbuf {
     pub fn new(size: usize) -> Self {
         let cluster_size = Self::select_cluster_size(size);
         let cluster = Arc::new(OgsCluster::new(cluster_size));
-        
+
         OgsPkbuf {
             cluster,
             len: 0,
@@ -113,10 +113,14 @@ impl OgsPkbuf {
     /// Must be called before any data is added
     #[inline]
     pub fn reserve(&mut self, len: usize) {
-        debug_assert!(self.data == self.head && self.tail == self.head,
-            "reserve must be called before adding data");
-        debug_assert!(self.head + len <= self.end,
-            "reserve exceeds buffer capacity");
+        debug_assert!(
+            self.data == self.head && self.tail == self.head,
+            "reserve must be called before adding data"
+        );
+        debug_assert!(
+            self.head + len <= self.end,
+            "reserve exceeds buffer capacity"
+        );
         self.data += len;
         self.tail += len;
     }
@@ -255,8 +259,7 @@ impl OgsPkbuf {
         // Safety: We have exclusive access to the pkbuf, and Arc::get_mut
         // would fail if there are other references. For simplicity, we use
         // unsafe here since the pkbuf owns exclusive write access.
-        let cluster = Arc::get_mut(&mut self.cluster)
-            .expect("exclusive access to cluster");
+        let cluster = Arc::get_mut(&mut self.cluster).expect("exclusive access to cluster");
         &mut cluster.buffer[start..end]
     }
 }
@@ -326,10 +329,10 @@ mod tests {
         let mut pkbuf = OgsPkbuf::new(100);
         pkbuf.reserve(20);
         pkbuf.put_data(&[5, 6, 7, 8]);
-        
+
         let header = pkbuf.push(4);
         header.copy_from_slice(&[1, 2, 3, 4]);
-        
+
         assert_eq!(pkbuf.len(), 8);
         assert_eq!(pkbuf.data(), &[1, 2, 3, 4, 5, 6, 7, 8]);
     }
@@ -338,7 +341,7 @@ mod tests {
     fn test_pkbuf_pull() {
         let mut pkbuf = OgsPkbuf::new(100);
         pkbuf.put_data(&[1, 2, 3, 4, 5, 6, 7, 8]);
-        
+
         let pulled = pkbuf.pull(4).unwrap();
         assert_eq!(pulled, &[1, 2, 3, 4]);
         assert_eq!(pkbuf.len(), 4);
@@ -349,7 +352,7 @@ mod tests {
     fn test_pkbuf_pull_too_much() {
         let mut pkbuf = OgsPkbuf::new(100);
         pkbuf.put_data(&[1, 2, 3, 4]);
-        
+
         assert!(pkbuf.pull(10).is_none());
         assert_eq!(pkbuf.len(), 4); // Unchanged
     }
@@ -358,7 +361,7 @@ mod tests {
     fn test_pkbuf_trim() {
         let mut pkbuf = OgsPkbuf::new(100);
         pkbuf.put_data(&[1, 2, 3, 4, 5, 6, 7, 8]);
-        
+
         pkbuf.trim(4).unwrap();
         assert_eq!(pkbuf.len(), 4);
         assert_eq!(pkbuf.data(), &[1, 2, 3, 4]);
@@ -368,7 +371,7 @@ mod tests {
     fn test_pkbuf_trim_error() {
         let mut pkbuf = OgsPkbuf::new(100);
         pkbuf.put_data(&[1, 2, 3, 4]);
-        
+
         assert!(pkbuf.trim(10).is_err());
     }
 
@@ -397,7 +400,7 @@ mod tests {
     fn test_pkbuf_copy() {
         let mut pkbuf = OgsPkbuf::new(100);
         pkbuf.put_data(&[1, 2, 3, 4, 5]);
-        
+
         let copy = pkbuf.copy();
         assert_eq!(copy.len(), pkbuf.len());
         assert_eq!(copy.data(), pkbuf.data());
@@ -407,7 +410,7 @@ mod tests {
     fn test_pkbuf_reset() {
         let mut pkbuf = OgsPkbuf::new(100);
         pkbuf.put_data(&[1, 2, 3, 4, 5]);
-        
+
         pkbuf.reset();
         assert_eq!(pkbuf.len(), 0);
         assert!(pkbuf.is_empty());
@@ -417,11 +420,11 @@ mod tests {
     fn test_pkbuf_headroom_tailroom() {
         let mut pkbuf = OgsPkbuf::new(100);
         let capacity = pkbuf.capacity();
-        
+
         pkbuf.reserve(20);
         assert_eq!(pkbuf.headroom(), 20);
         assert_eq!(pkbuf.tailroom(), capacity - 20);
-        
+
         pkbuf.put_data(&[1, 2, 3, 4, 5]);
         assert_eq!(pkbuf.headroom(), 20);
         assert_eq!(pkbuf.tailroom(), capacity - 25);
@@ -454,11 +457,11 @@ mod tests {
             ) {
                 let mut pkbuf = OgsPkbuf::new(capacity);
                 let actual_capacity = pkbuf.capacity();
-                
+
                 // Reserve some headroom
                 let safe_reserve = reserve_size.min(actual_capacity / 2);
                 pkbuf.reserve(safe_reserve);
-                
+
                 // Put some data
                 let mut total_put = 0;
                 for size in put_sizes {
@@ -467,7 +470,7 @@ mod tests {
                         total_put += size;
                     }
                 }
-                
+
                 prop_assert_eq!(pkbuf.len(), total_put, "len should equal total put data");
             }
 
@@ -480,15 +483,15 @@ mod tests {
             ) {
                 let mut pkbuf = OgsPkbuf::new(capacity);
                 let actual_capacity = pkbuf.capacity();
-                
+
                 let safe_reserve = reserve_size.min(actual_capacity / 2);
                 pkbuf.reserve(safe_reserve);
-                
+
                 let safe_data = data_size.min(pkbuf.tailroom());
                 if safe_data > 0 {
                     pkbuf.put(safe_data);
                 }
-                
+
                 prop_assert_eq!(
                     pkbuf.headroom() + pkbuf.len() + pkbuf.tailroom(),
                     actual_capacity,
@@ -501,7 +504,7 @@ mod tests {
             fn prop_put_data_retrievable(data in prop::collection::vec(any::<u8>(), 1..100)) {
                 let mut pkbuf = OgsPkbuf::new(data.len() + 50);
                 pkbuf.put_data(&data);
-                
+
                 prop_assert_eq!(pkbuf.data(), &data[..], "put data should be retrievable");
             }
 
@@ -513,21 +516,21 @@ mod tests {
             ) {
                 let total_size = header.len() + payload.len();
                 let mut pkbuf = OgsPkbuf::new(total_size + 50);
-                
+
                 // Reserve headroom for header
                 pkbuf.reserve(header.len() + 10);
-                
+
                 // Put payload
                 pkbuf.put_data(&payload);
-                
+
                 // Push header
                 let h = pkbuf.push(header.len());
                 h.copy_from_slice(&header);
-                
+
                 // Verify combined data
                 let mut expected = header.clone();
                 expected.extend_from_slice(&payload);
-                
+
                 prop_assert_eq!(pkbuf.data(), &expected[..], "push should prepend data");
             }
 
@@ -539,10 +542,10 @@ mod tests {
             ) {
                 let mut pkbuf = OgsPkbuf::new(data.len() + 50);
                 pkbuf.put_data(&data);
-                
+
                 let safe_pull = pull_size.min(data.len());
                 let pulled = pkbuf.pull(safe_pull).unwrap();
-                
+
                 prop_assert_eq!(pulled, &data[..safe_pull], "pulled data should match");
                 prop_assert_eq!(pkbuf.data(), &data[safe_pull..], "remaining data should be correct");
             }
@@ -555,10 +558,10 @@ mod tests {
             ) {
                 let mut pkbuf = OgsPkbuf::new(data.len() + 50);
                 pkbuf.put_data(&data);
-                
+
                 let safe_len = new_len.min(data.len());
                 pkbuf.trim(safe_len).unwrap();
-                
+
                 prop_assert_eq!(pkbuf.len(), safe_len, "length should be trimmed");
                 prop_assert_eq!(pkbuf.data(), &data[..safe_len], "data should be truncated");
             }
@@ -568,9 +571,9 @@ mod tests {
             fn prop_copy_independent(data in prop::collection::vec(any::<u8>(), 1..100)) {
                 let mut pkbuf = OgsPkbuf::new(data.len() + 50);
                 pkbuf.put_data(&data);
-                
+
                 let copy = pkbuf.copy();
-                
+
                 prop_assert_eq!(copy.len(), pkbuf.len(), "copy should have same length");
                 prop_assert_eq!(copy.data(), pkbuf.data(), "copy should have same data");
             }
@@ -580,9 +583,9 @@ mod tests {
             fn prop_reset_clears(data in prop::collection::vec(any::<u8>(), 1..100)) {
                 let mut pkbuf = OgsPkbuf::new(data.len() + 50);
                 pkbuf.put_data(&data);
-                
+
                 pkbuf.reset();
-                
+
                 prop_assert_eq!(pkbuf.len(), 0, "reset should clear length");
                 prop_assert!(pkbuf.is_empty(), "reset should make buffer empty");
             }
@@ -592,10 +595,10 @@ mod tests {
             fn prop_big_endian_encoding(val in any::<u32>()) {
                 let mut pkbuf = OgsPkbuf::new(100);
                 pkbuf.put_u32(val);
-                
+
                 let data = pkbuf.data();
                 let decoded = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-                
+
                 prop_assert_eq!(decoded, val, "big-endian encoding should round-trip");
             }
 

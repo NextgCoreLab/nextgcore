@@ -65,15 +65,15 @@ impl TsnBridgeConfig {
     pub fn default_5qi_pcp_mapping() -> HashMap<u8, Pcp> {
         let mut m = HashMap::new();
         // Non-GBR conversational
-        m.insert(1, 6u8);  // GBR conversational voice
-        m.insert(2, 5u8);  // GBR conversational video
-        m.insert(3, 4u8);  // GBR real-time gaming
-        m.insert(4, 4u8);  // GBR non-conv video
+        m.insert(1, 6u8); // GBR conversational voice
+        m.insert(2, 5u8); // GBR conversational video
+        m.insert(3, 4u8); // GBR real-time gaming
+        m.insert(4, 4u8); // GBR non-conv video
         m.insert(65, 7u8); // Mission critical push-to-talk
         m.insert(66, 6u8); // Non-mission critical push-to-talk
-        m.insert(7, 3u8);  // Non-GBR voice video, interactive gaming
-        m.insert(8, 2u8);  // Non-GBR video, TCP-based
-        m.insert(9, 0u8);  // Non-GBR (default bearer / best effort)
+        m.insert(7, 3u8); // Non-GBR voice video, interactive gaming
+        m.insert(8, 2u8); // Non-GBR video, TCP-based
+        m.insert(9, 0u8); // Non-GBR (default bearer / best effort)
         m
     }
 
@@ -95,8 +95,8 @@ pub fn insert_vlan_tag(frame: &[u8], vlan_id: VlanId, pcp: Pcp) -> Option<Vec<u8
     let tci = ((pcp as u16 & 0x07) << 13) | (vlan_id & 0x0FFF);
 
     let mut tagged = Vec::with_capacity(frame.len() + 4);
-    tagged.extend_from_slice(&frame[..12]);    // DST + SRC
-    tagged.extend_from_slice(&[0x81, 0x00]);  // 802.1Q EtherType
+    tagged.extend_from_slice(&frame[..12]); // DST + SRC
+    tagged.extend_from_slice(&[0x81, 0x00]); // 802.1Q EtherType
     tagged.extend_from_slice(&tci.to_be_bytes()); // TCI
     tagged.extend_from_slice(original_ether_type);
     tagged.extend_from_slice(&frame[14..]);
@@ -159,7 +159,8 @@ mod tests {
     #[test]
     fn test_insert_vlan_tag_basic() {
         let mut frame = vec![0u8; 14];
-        frame[12] = 0x08; frame[13] = 0x00; // IPv4 EtherType
+        frame[12] = 0x08;
+        frame[13] = 0x00; // IPv4 EtherType
         let tagged = insert_vlan_tag(&frame, 100, 5).unwrap();
         assert_eq!(tagged.len(), 18);
         assert_eq!(&tagged[12..14], &[0x81, 0x00]);
@@ -173,9 +174,12 @@ mod tests {
     #[test]
     fn test_strip_vlan_tag() {
         let mut frame = vec![0u8; 18];
-        frame[12] = 0x81; frame[13] = 0x00; // 802.1Q
-        frame[14] = 0xA0; frame[15] = 0x64; // TCI
-        frame[16] = 0x08; frame[17] = 0x00; // IPv4
+        frame[12] = 0x81;
+        frame[13] = 0x00; // 802.1Q
+        frame[14] = 0xA0;
+        frame[15] = 0x64; // TCI
+        frame[16] = 0x08;
+        frame[17] = 0x00; // IPv4
         let stripped = strip_vlan_tag(&frame);
         assert_eq!(stripped.len(), 14);
         assert_eq!(&stripped[12..14], &[0x08, 0x00]);

@@ -4,12 +4,11 @@
 //!
 //! Implements handlers for Diameter S6a messages from HSS.
 
-use crate::context::{MmeUe, MmeSess, MmeBearer, Qos, Arp, Bitrate};
+use crate::context::{Arp, Bitrate, MmeBearer, MmeSess, MmeUe, Qos};
 use crate::emm_build::EmmCause;
 use crate::fd_path::{
-    AiaMessage, UlaMessage, ClrMessage, IdrMessage,
-    ApnConfiguration,
-    result_code, experimental_result, cancellation_type,
+    cancellation_type, experimental_result, result_code, AiaMessage, ApnConfiguration, ClrMessage,
+    IdrMessage, UlaMessage,
 };
 
 // ============================================================================
@@ -75,10 +74,7 @@ pub mod subdata_mask {
 /// # Returns
 /// * `Ok(EmmCause)` - EMM cause code
 /// * `Err(S6aError)` - On error
-pub fn mme_s6a_handle_aia(
-    mme_ue: &mut MmeUe,
-    aia_message: &AiaMessage,
-) -> S6aResult<EmmCause> {
+pub fn mme_s6a_handle_aia(mme_ue: &mut MmeUe, aia_message: &AiaMessage) -> S6aResult<EmmCause> {
     // Check result code
     if aia_message.result_code != result_code::DIAMETER_SUCCESS {
         log::warn!(
@@ -93,12 +89,12 @@ pub fn mme_s6a_handle_aia(
 
     // Copy authentication vector
     let vector = &aia_message.e_utran_vector;
-    
+
     mme_ue.xres_len = vector.xres.len() as u8;
     if mme_ue.xres_len > 0 && mme_ue.xres_len <= 16 {
         mme_ue.xres[..mme_ue.xres_len as usize].copy_from_slice(&vector.xres);
     }
-    
+
     mme_ue.kasme.copy_from_slice(&vector.kasme);
     mme_ue.rand.copy_from_slice(&vector.rand);
     mme_ue.autn.copy_from_slice(&vector.autn);
@@ -132,16 +128,10 @@ pub fn mme_s6a_handle_aia(
 /// # Returns
 /// * `Ok(EmmCause)` - EMM cause code
 /// * `Err(S6aError)` - On error
-pub fn mme_s6a_handle_ula(
-    mme_ue: &mut MmeUe,
-    ula_message: &UlaMessage,
-) -> S6aResult<EmmCause> {
+pub fn mme_s6a_handle_ula(mme_ue: &mut MmeUe, ula_message: &UlaMessage) -> S6aResult<EmmCause> {
     // Check result code
     if ula_message.result_code != result_code::DIAMETER_SUCCESS {
-        log::error!(
-            "Update Location failed [{}]",
-            ula_message.result_code
-        );
+        log::error!("Update Location failed [{}]", ula_message.result_code);
         return Ok(emm_cause_from_diameter(
             Some(ula_message.result_code),
             ula_message.experimental_result_code,
@@ -202,10 +192,7 @@ pub fn mme_s6a_handle_ula(
 /// # Returns
 /// * `Ok(())` - Success
 /// * `Err(S6aError)` - On error
-pub fn mme_s6a_handle_clr(
-    mme_ue: &mut MmeUe,
-    clr_message: &ClrMessage,
-) -> S6aResult<()> {
+pub fn mme_s6a_handle_clr(mme_ue: &mut MmeUe, clr_message: &ClrMessage) -> S6aResult<()> {
     log::info!(
         "[{}] Cancel Location Request, type={}",
         mme_ue.imsi_bcd,
@@ -233,7 +220,10 @@ pub fn mme_s6a_handle_clr(
             log::debug!("CLR: Initial attach at another MME");
         }
         _ => {
-            log::warn!("Unknown cancellation type: {}", clr_message.cancellation_type);
+            log::warn!(
+                "Unknown cancellation type: {}",
+                clr_message.cancellation_type
+            );
         }
     }
 
@@ -249,10 +239,7 @@ pub fn mme_s6a_handle_clr(
 /// # Returns
 /// * `Ok(())` - Success
 /// * `Err(S6aError)` - On error
-pub fn mme_s6a_handle_idr(
-    mme_ue: &mut MmeUe,
-    idr_message: &IdrMessage,
-) -> S6aResult<()> {
+pub fn mme_s6a_handle_idr(mme_ue: &mut MmeUe, idr_message: &IdrMessage) -> S6aResult<()> {
     log::info!(
         "[{}] Insert Subscriber Data Request, flags={}",
         mme_ue.imsi_bcd,
@@ -300,21 +287,15 @@ fn emm_cause_from_diameter(
     // Check experimental result first
     if let Some(exp_code) = experimental_result_code {
         return match exp_code {
-            experimental_result::DIAMETER_ERROR_USER_UNKNOWN => {
-                EmmCause::ImsiUnknownInHss
-            }
+            experimental_result::DIAMETER_ERROR_USER_UNKNOWN => EmmCause::ImsiUnknownInHss,
             experimental_result::DIAMETER_ERROR_ROAMING_NOT_ALLOWED => {
                 EmmCause::RoamingNotAllowedInTa
             }
             experimental_result::DIAMETER_ERROR_UNKNOWN_EPS_SUBSCRIPTION => {
                 EmmCause::NoSuitableCellsInTa
             }
-            experimental_result::DIAMETER_ERROR_RAT_NOT_ALLOWED => {
-                EmmCause::RoamingNotAllowedInTa
-            }
-            experimental_result::DIAMETER_ERROR_EQUIPMENT_UNKNOWN => {
-                EmmCause::IllegalUe
-            }
+            experimental_result::DIAMETER_ERROR_RAT_NOT_ALLOWED => EmmCause::RoamingNotAllowedInTa,
+            experimental_result::DIAMETER_ERROR_EQUIPMENT_UNKNOWN => EmmCause::IllegalUe,
             experimental_result::DIAMETER_AUTHENTICATION_DATA_UNAVAILABLE => {
                 EmmCause::NetworkFailure
             }
@@ -326,12 +307,8 @@ fn emm_cause_from_diameter(
     if let Some(code) = result_code {
         return match code {
             result_code::DIAMETER_SUCCESS => EmmCause::RequestAccepted,
-            result_code::DIAMETER_AUTHORIZATION_REJECTED => {
-                EmmCause::EpsServicesNotAllowed
-            }
-            result_code::DIAMETER_UNABLE_TO_COMPLY => {
-                EmmCause::NetworkFailure
-            }
+            result_code::DIAMETER_AUTHORIZATION_REJECTED => EmmCause::EpsServicesNotAllowed,
+            result_code::DIAMETER_UNABLE_TO_COMPLY => EmmCause::NetworkFailure,
             _ => EmmCause::NetworkFailure,
         };
     }
@@ -340,10 +317,7 @@ fn emm_cause_from_diameter(
 }
 
 /// Process APN configurations from subscription data
-fn process_apn_configurations(
-    _mme_ue: &mut MmeUe,
-    apn_configs: &[ApnConfiguration],
-) -> usize {
+fn process_apn_configurations(_mme_ue: &mut MmeUe, apn_configs: &[ApnConfiguration]) -> usize {
     let mut num_sessions = 0;
 
     for apn_config in apn_configs {
@@ -372,8 +346,16 @@ fn process_apn_configurations(
                 qci: apn_config.qci,
                 arp: Arp {
                     priority_level: apn_config.arp_priority_level,
-                    pre_emption_capability: if apn_config.arp_pre_emption_capability { 1 } else { 0 },
-                    pre_emption_vulnerability: if apn_config.arp_pre_emption_vulnerability { 1 } else { 0 },
+                    pre_emption_capability: if apn_config.arp_pre_emption_capability {
+                        1
+                    } else {
+                        0
+                    },
+                    pre_emption_vulnerability: if apn_config.arp_pre_emption_vulnerability {
+                        1
+                    } else {
+                        0
+                    },
                 },
                 ..Default::default()
             },
@@ -397,11 +379,11 @@ fn process_apn_configurations(
 /// Convert buffer to BCD string
 fn buffer_to_bcd(buffer: &[u8]) -> String {
     let mut result = String::with_capacity(buffer.len() * 2);
-    
+
     for byte in buffer {
         let low = byte & 0x0f;
         let high = (byte >> 4) & 0x0f;
-        
+
         if low < 10 {
             result.push((b'0' + low) as char);
         }
@@ -409,7 +391,7 @@ fn buffer_to_bcd(buffer: &[u8]) -> String {
             result.push((b'0' + high) as char);
         }
     }
-    
+
     result
 }
 
@@ -425,14 +407,17 @@ mod tests {
     #[test]
     fn test_s6a_error_display() {
         assert_eq!(format!("{}", S6aError::UeNotFound), "UE not found");
-        assert_eq!(format!("{}", S6aError::AuthenticationFailed), "Authentication failed");
+        assert_eq!(
+            format!("{}", S6aError::AuthenticationFailed),
+            "Authentication failed"
+        );
     }
 
     #[test]
     fn test_handle_aia_success() {
         let mut mme_ue = MmeUe::default();
         mme_ue.imsi_bcd = "310260123456789".to_string();
-        
+
         let aia_message = AiaMessage {
             result_code: result_code::DIAMETER_SUCCESS,
             experimental_result_code: None,
@@ -456,7 +441,7 @@ mod tests {
     fn test_handle_aia_failure() {
         let mut mme_ue = MmeUe::default();
         mme_ue.imsi_bcd = "310260123456789".to_string();
-        
+
         let aia_message = AiaMessage {
             result_code: result_code::DIAMETER_UNABLE_TO_COMPLY,
             experimental_result_code: None,
@@ -472,7 +457,7 @@ mod tests {
     fn test_handle_ula_success() {
         let mut mme_ue = MmeUe::default();
         mme_ue.imsi_bcd = "310260123456789".to_string();
-        
+
         let ula_message = UlaMessage {
             result_code: result_code::DIAMETER_SUCCESS,
             experimental_result_code: None,
@@ -481,16 +466,14 @@ mod tests {
                 ambr_uplink: 50000000,
                 ambr_downlink: 100000000,
                 context_identifier: 1,
-                apn_configs: vec![
-                    ApnConfiguration {
-                        context_identifier: 1,
-                        service_selection: "internet".to_string(),
-                        pdn_type: 1, // IPv4
-                        qci: 9,
-                        arp_priority_level: 8,
-                        ..Default::default()
-                    },
-                ],
+                apn_configs: vec![ApnConfiguration {
+                    context_identifier: 1,
+                    service_selection: "internet".to_string(),
+                    pdn_type: 1, // IPv4
+                    qci: 9,
+                    arp_priority_level: 8,
+                    ..Default::default()
+                }],
                 ..Default::default()
             },
         };
@@ -506,7 +489,7 @@ mod tests {
     fn test_handle_clr() {
         let mut mme_ue = MmeUe::default();
         mme_ue.imsi_bcd = "310260123456789".to_string();
-        
+
         let clr_message = ClrMessage {
             cancellation_type: cancellation_type::MME_UPDATE_PROCEDURE,
             clr_flags: 0,
@@ -520,7 +503,7 @@ mod tests {
     fn test_handle_idr() {
         let mut mme_ue = MmeUe::default();
         mme_ue.imsi_bcd = "310260123456789".to_string();
-        
+
         let idr_message = IdrMessage {
             idr_flags: 0,
             subscription_data: SubscriptionData {
@@ -554,19 +537,14 @@ mod tests {
 
     #[test]
     fn test_emm_cause_from_diameter_user_unknown() {
-        let cause = emm_cause_from_diameter(
-            None,
-            Some(experimental_result::DIAMETER_ERROR_USER_UNKNOWN),
-        );
+        let cause =
+            emm_cause_from_diameter(None, Some(experimental_result::DIAMETER_ERROR_USER_UNKNOWN));
         assert_eq!(cause, EmmCause::ImsiUnknownInHss);
     }
 
     #[test]
     fn test_emm_cause_from_diameter_success() {
-        let cause = emm_cause_from_diameter(
-            Some(result_code::DIAMETER_SUCCESS),
-            None,
-        );
+        let cause = emm_cause_from_diameter(Some(result_code::DIAMETER_SUCCESS), None);
         assert_eq!(cause, EmmCause::RequestAccepted);
     }
 }

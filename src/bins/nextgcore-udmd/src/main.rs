@@ -9,14 +9,15 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use nextgcore_udmd::{
-    udm_context_final, udm_context_init, udm_sbi_close, udm_sbi_open, udm_self,
-    timer_manager, timer_type_to_timer_id, UdmEvent, UdmSmContext, SbiServerConfig,
+    timer_manager, timer_type_to_timer_id, udm_context_final, udm_context_init, udm_sbi_close,
+    udm_sbi_open, udm_self, SbiServerConfig, UdmEvent, UdmSmContext,
 };
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::server::{
-    send_bad_request, send_method_not_allowed, send_not_found,
-    SbiServer, SbiServerConfig as OgsSbiServerConfig,
+    send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
+    SbiServerConfig as OgsSbiServerConfig,
 };
+use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -78,6 +79,35 @@ struct Args {
     max_sess: usize,
 }
 
+// ---------------------------------------------------------------------------
+// Typed YAML configuration structs for NRF URI seeding
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize)]
+struct NrfClientYaml {
+    uri: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SbiClientYaml {
+    nrf: Option<Vec<NrfClientYaml>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SbiYaml {
+    client: Option<SbiClientYaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct UdmSection {
+    sbi: Option<SbiYaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct UdmYaml {
+    udm: Option<UdmSection>,
+}
+
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -89,11 +119,10 @@ async fn main() -> Result<()> {
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
-            .with_endpoint(
-                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
-            ),
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+        ),
     )
     .ok();
 
@@ -111,19 +140,40 @@ async fn main() -> Result<()> {
 
     // Initialize UDM context
     udm_context_init(args.max_ue, args.max_sess);
-    log::info!("UDM context initialized (max_ue={}, max_sess={})", args.max_ue, args.max_sess);
+    log::info!(
+        "UDM context initialized (max_ue={}, max_sess={})",
+        args.max_ue,
+        args.max_sess
+    );
 
     // Initialize UDM state machine
     let mut udm_sm = UdmSmContext::new();
     udm_sm.init();
     log::info!("UDM state machine initialized");
 
-    // Parse configuration (if file exists)
+    // Parse configuration (if file exists) and seed NRF URI
     if std::path::Path::new(&args.config).exists() {
         log::info!("Loading configuration from {}", args.config);
         match std::fs::read_to_string(&args.config) {
             Ok(content) => {
                 log::debug!("Configuration file loaded ({} bytes)", content.len());
+                // Seed NRF URI into SBI context for NF registration
+                if let Ok(yaml) = serde_yaml::from_str::<UdmYaml>(&content) {
+                    if let Some(udm) = yaml.udm {
+                        if let Some(sbi) = udm.sbi {
+                            if let Some(client) = sbi.client {
+                                if let Some(nrf_list) = client.nrf {
+                                    if let Some(nrf) = nrf_list.first() {
+                                        log::info!("NRF URI configured: {}", nrf.uri);
+                                        ogs_sbi::context::global_context()
+                                            .set_nrf_uri(&nrf.uri)
+                                            .await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
             Err(e) => {
                 log::warn!("Failed to read configuration file: {e}");
@@ -151,10 +201,24 @@ async fn main() -> Result<()> {
         .context("Invalid SBI address")?;
     let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
 
-    sbi_server.start(udm_sbi_request_handler).await
+    sbi_server
+        .start(udm_sbi_request_handler)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
     log::info!("SBI HTTP/2 server listening on {sbi_addr}");
+
+    // Register with NRF and start heartbeat worker
+    match register_with_nrf(&args.sbi_addr, args.sbi_port).await {
+        Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
+            ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
+        }
+        Ok(_) => {}
+        Err(e) => {
+            log::warn!("NRF registration failed (will operate without NRF): {e}");
+        }
+    }
+
     log::info!("NextGCore UDM ready");
 
     // Main event loop (async)
@@ -164,7 +228,9 @@ async fn main() -> Result<()> {
     log::info!("Shutting down...");
 
     // Stop SBI server
-    sbi_server.stop().await
+    sbi_server
+        .stop()
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
     log::info!("SBI HTTP/2 server stopped");
 
@@ -224,18 +290,22 @@ async fn udm_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                 ("registrations", "PATCH") if parts.len() >= 5 && parts[4] == "amf-3gpp-access" => {
                     handle_amf_registration_update(supi, &request).await
                 }
-                ("registrations", "DELETE") if parts.len() >= 5 && parts[4] == "amf-3gpp-access" => {
+                ("registrations", "DELETE")
+                    if parts.len() >= 5 && parts[4] == "amf-3gpp-access" =>
+                {
                     handle_amf_deregistration(supi).await
                 }
                 ("registrations", "PUT") if parts.len() >= 6 && parts[4] == "smf-registrations" => {
                     let pdu_session_id = parts[5];
                     handle_smf_registration(supi, pdu_session_id, &request).await
                 }
-                ("registrations", "DELETE") if parts.len() >= 6 && parts[4] == "smf-registrations" => {
+                ("registrations", "DELETE")
+                    if parts.len() >= 6 && parts[4] == "smf-registrations" =>
+                {
                     let pdu_session_id = parts[5];
                     handle_smf_deregistration(supi, pdu_session_id).await
                 }
-                _ => send_method_not_allowed(method, uri)
+                _ => send_method_not_allowed(method, uri),
             }
         }
 
@@ -245,26 +315,16 @@ async fn udm_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             let resource = parts.get(3).unwrap_or(&"");
 
             match (*resource, method) {
-                ("am-data", "GET") => {
-                    handle_get_am_data(supi, &request).await
-                }
-                ("smf-select-data", "GET") => {
-                    handle_get_smf_select_data(supi, &request).await
-                }
-                ("sm-data", "GET") => {
-                    handle_get_sm_data(supi, &request).await
-                }
-                ("nssai", "GET") => {
-                    handle_get_nssai(supi, &request).await
-                }
-                ("sdm-subscriptions", "POST") => {
-                    handle_sdm_subscribe(supi, &request).await
-                }
+                ("am-data", "GET") => handle_get_am_data(supi, &request).await,
+                ("smf-select-data", "GET") => handle_get_smf_select_data(supi, &request).await,
+                ("sm-data", "GET") => handle_get_sm_data(supi, &request).await,
+                ("nssai", "GET") => handle_get_nssai(supi, &request).await,
+                ("sdm-subscriptions", "POST") => handle_sdm_subscribe(supi, &request).await,
                 ("sdm-subscriptions", "DELETE") if parts.len() >= 5 => {
                     let subscription_id = parts[4];
                     handle_sdm_unsubscribe(supi, subscription_id).await
                 }
-                _ => send_method_not_allowed(method, uri)
+                _ => send_method_not_allowed(method, uri),
             }
         }
 
@@ -278,10 +338,8 @@ async fn udm_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                 ("security-information", "generate-auth-data", "POST") => {
                     handle_generate_auth_data(supi, &request).await
                 }
-                ("auth-events", _, "POST") => {
-                    handle_auth_event(supi, &request).await
-                }
-                _ => send_method_not_allowed(method, uri)
+                ("auth-events", _, "POST") => handle_auth_event(supi, &request).await,
+                _ => send_method_not_allowed(method, uri),
             }
         }
 
@@ -314,7 +372,10 @@ async fn handle_amf_registration(supi: &str, request: &SbiRequest) -> SbiRespons
     }
 
     SbiResponse::with_status(201)
-        .with_header("Location", format!("/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access"))
+        .with_header(
+            "Location",
+            format!("/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access"),
+        )
         .with_json_body(&serde_json::json!({
             "amfInstanceId": reg_data.get("amfInstanceId"),
             "deregCallbackUri": reg_data.get("deregCallbackUri"),
@@ -353,7 +414,11 @@ async fn handle_amf_deregistration(supi: &str) -> SbiResponse {
     SbiResponse::with_status(204)
 }
 
-async fn handle_smf_registration(supi: &str, pdu_session_id: &str, request: &SbiRequest) -> SbiResponse {
+async fn handle_smf_registration(
+    supi: &str,
+    pdu_session_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
     log::info!("SMF Registration: SUPI={supi}, PDU Session={pdu_session_id}");
 
     let body = match &request.http.content {
@@ -367,7 +432,10 @@ async fn handle_smf_registration(supi: &str, pdu_session_id: &str, request: &Sbi
     };
 
     SbiResponse::with_status(201)
-        .with_header("Location", format!("/nudm-uecm/v1/{supi}/registrations/smf-registrations/{pdu_session_id}"))
+        .with_header(
+            "Location",
+            format!("/nudm-uecm/v1/{supi}/registrations/smf-registrations/{pdu_session_id}"),
+        )
         .with_json_body(&serde_json::json!({
             "smfInstanceId": reg_data.get("smfInstanceId"),
             "pduSessionId": pdu_session_id,
@@ -398,7 +466,11 @@ async fn handle_get_am_data(supi: &str, _request: &SbiRequest) -> SbiResponse {
             response
         }
         Ok(udr_response) => {
-            log::warn!("[{}] UDR am-data query returned status {}", supi, udr_response.status);
+            log::warn!(
+                "[{}] UDR am-data query returned status {}",
+                supi,
+                udr_response.status
+            );
             SbiResponse::with_status(udr_response.status)
         }
         Err(e) => {
@@ -412,7 +484,14 @@ async fn handle_get_smf_select_data(supi: &str, _request: &SbiRequest) -> SbiRes
     log::info!("Get SMF Select Data: SUPI={supi}");
 
     // Query UDR for SMF selection subscription data
-    match nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get(supi, "smf-selection-subscription-data", 0, 0).await {
+    match nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get(
+        supi,
+        "smf-selection-subscription-data",
+        0,
+        0,
+    )
+    .await
+    {
         Ok(udr_response) if udr_response.is_success() => {
             let mut response = SbiResponse::with_status(200);
             if let Some(body) = udr_response.http.content {
@@ -421,7 +500,11 @@ async fn handle_get_smf_select_data(supi: &str, _request: &SbiRequest) -> SbiRes
             response
         }
         Ok(udr_response) => {
-            log::warn!("[{}] UDR smf-select query returned status {}", supi, udr_response.status);
+            log::warn!(
+                "[{}] UDR smf-select query returned status {}",
+                supi,
+                udr_response.status
+            );
             SbiResponse::with_status(udr_response.status)
         }
         Err(e) => {
@@ -432,7 +515,10 @@ async fn handle_get_smf_select_data(supi: &str, _request: &SbiRequest) -> SbiRes
 }
 
 async fn handle_get_sm_data(supi: &str, request: &SbiRequest) -> SbiResponse {
-    let dnn = request.http.params.get("dnn")
+    let dnn = request
+        .http
+        .params
+        .get("dnn")
         .map(|s| s.as_str())
         .unwrap_or("internet");
 
@@ -448,7 +534,11 @@ async fn handle_get_sm_data(supi: &str, request: &SbiRequest) -> SbiResponse {
             response
         }
         Ok(udr_response) => {
-            log::warn!("[{}] UDR sm-data query returned status {}", supi, udr_response.status);
+            log::warn!(
+                "[{}] UDR sm-data query returned status {}",
+                supi,
+                udr_response.status
+            );
             SbiResponse::with_status(udr_response.status)
         }
         Err(e) => {
@@ -477,7 +567,11 @@ async fn handle_get_nssai(supi: &str, _request: &SbiRequest) -> SbiResponse {
             SbiResponse::with_status(200)
         }
         Ok(udr_response) => {
-            log::warn!("[{}] UDR nssai query returned status {}", supi, udr_response.status);
+            log::warn!(
+                "[{}] UDR nssai query returned status {}",
+                supi,
+                udr_response.status
+            );
             SbiResponse::with_status(udr_response.status)
         }
         Err(e) => {
@@ -503,7 +597,10 @@ async fn handle_sdm_subscribe(supi: &str, request: &SbiRequest) -> SbiResponse {
     let subscription_id = uuid::Uuid::new_v4().to_string();
 
     SbiResponse::with_status(201)
-        .with_header("Location", format!("/nudm-sdm/v1/{supi}/sdm-subscriptions/{subscription_id}"))
+        .with_header(
+            "Location",
+            format!("/nudm-sdm/v1/{supi}/sdm-subscriptions/{subscription_id}"),
+        )
         .with_json_body(&serde_json::json!({
             "subscriptionId": subscription_id,
             "nfInstanceId": sub_data.get("nfInstanceId"),
@@ -533,28 +630,38 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let serving_network_name = auth_info.get("servingNetworkName")
+    let serving_network_name = auth_info
+        .get("servingNetworkName")
         .and_then(|v| v.as_str())
         .unwrap_or("5G:mnc001.mcc001.3gppnetwork.org");
 
     log::info!("Generate Auth Data: SNN={serving_network_name}");
 
     // Step 1: Query UDR for authentication subscription data
-    let udr_response = match nextgcore_udmd::udm_nudr_dr_send_auth_subscription_get(supi, 0, 0).await {
-        Ok(resp) if resp.is_success() => resp,
-        Ok(resp) => {
-            log::error!("[{}] UDR auth subscription query failed: status={}", supi, resp.status);
-            return ogs_sbi::server::send_service_unavailable("UDR query failed");
-        }
-        Err(e) => {
-            log::error!("[{supi}] UDR auth subscription query failed: {e}");
-            return ogs_sbi::server::send_service_unavailable("UDR unavailable");
-        }
-    };
+    let udr_response =
+        match nextgcore_udmd::udm_nudr_dr_send_auth_subscription_get(supi, 0, 0).await {
+            Ok(resp) if resp.is_success() => resp,
+            Ok(resp) => {
+                log::error!(
+                    "[{}] UDR auth subscription query failed: status={}",
+                    supi,
+                    resp.status
+                );
+                return ogs_sbi::server::send_service_unavailable("UDR query failed");
+            }
+            Err(e) => {
+                log::error!("[{supi}] UDR auth subscription query failed: {e}");
+                return ogs_sbi::server::send_service_unavailable("UDR unavailable");
+            }
+        };
 
     // Step 2: Parse authentication subscription from UDR response
-    let auth_sub_json: serde_json::Value = match udr_response.http.content.as_deref()
-        .and_then(|b| serde_json::from_str(b).ok()) {
+    let auth_sub_json: serde_json::Value = match udr_response
+        .http
+        .content
+        .as_deref()
+        .and_then(|b| serde_json::from_str(b).ok())
+    {
         Some(v) => v,
         None => {
             log::error!("[{supi}] Failed to parse UDR auth subscription response");
@@ -566,7 +673,10 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
     let mut ue = {
         let ctx = udm_self();
         let context = ctx.read().unwrap();
-        let ue = match context.ue_find_by_supi(supi).or_else(|| context.ue_add(supi)) {
+        let ue = match context
+            .ue_find_by_supi(supi)
+            .or_else(|| context.ue_add(supi))
+        {
             Some(ue) => ue,
             None => {
                 log::error!("[{supi}] Failed to create/find UE in context");
@@ -580,7 +690,10 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
     ue.serving_network_name = Some(serving_network_name.to_string());
 
     // Parse subscriber keys from UDR response
-    if let Some(k_hex) = auth_sub_json.get("encPermanentKey").and_then(|v| v.as_str()) {
+    if let Some(k_hex) = auth_sub_json
+        .get("encPermanentKey")
+        .and_then(|v| v.as_str())
+    {
         let k_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(k_hex);
         if k_bytes.len() >= 16 {
             ue.k.copy_from_slice(&k_bytes[..16]);
@@ -592,13 +705,20 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
             ue.opc.copy_from_slice(&opc_bytes[..16]);
         }
     }
-    if let Some(amf_hex) = auth_sub_json.get("authenticationManagementField").and_then(|v| v.as_str()) {
+    if let Some(amf_hex) = auth_sub_json
+        .get("authenticationManagementField")
+        .and_then(|v| v.as_str())
+    {
         let amf_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(amf_hex);
         if amf_bytes.len() >= 2 {
             ue.amf.copy_from_slice(&amf_bytes[..2]);
         }
     }
-    if let Some(sqn_hex) = auth_sub_json.get("sequenceNumber").and_then(|v| v.get("sqn")).and_then(|v| v.as_str()) {
+    if let Some(sqn_hex) = auth_sub_json
+        .get("sequenceNumber")
+        .and_then(|v| v.get("sqn"))
+        .and_then(|v| v.as_str())
+    {
         let sqn_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(sqn_hex);
         if sqn_bytes.len() >= 6 {
             ue.sqn.copy_from_slice(&sqn_bytes[..6]);
@@ -610,15 +730,14 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
     ogs_core::rand::ogs_random(&mut rand);
     ue.rand = rand;
 
-    let (autn, ik, ck, _ak, res) = match ogs_crypt::milenage::milenage_generate(
-        &ue.opc, &ue.amf, &ue.k, &ue.sqn, &rand,
-    ) {
-        Ok(result) => result,
-        Err(e) => {
-            log::error!("[{supi}] Milenage generate failed: {e:?}");
-            return ogs_sbi::server::send_internal_error("Milenage computation failed");
-        }
-    };
+    let (autn, ik, ck, _ak, res) =
+        match ogs_crypt::milenage::milenage_generate(&ue.opc, &ue.amf, &ue.k, &ue.sqn, &rand) {
+            Ok(result) => result,
+            Err(e) => {
+                log::error!("[{supi}] Milenage generate failed: {e:?}");
+                return ogs_sbi::server::send_internal_error("Milenage computation failed");
+            }
+        };
 
     // Step 5: Derive KAUSF and XRES* using 5G KDFs
     let kausf = ogs_crypt::kdf::ogs_kdf_kausf(&ck, &ik, serving_network_name, &autn);
@@ -634,14 +753,15 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
     // Step 7: Update SQN in UDR (increment for next auth)
     let sqn_val = {
         let mut v: u64 = 0;
-        for &b in ue.sqn.iter() { v = (v << 8) | (b as u64); }
+        for &b in ue.sqn.iter() {
+            v = (v << 8) | (b as u64);
+        }
         v
     };
     let new_sqn = (sqn_val + 32 + 1) & 0xFFFFFFFFFFFF;
     let new_sqn_hex = format!("{new_sqn:012x}");
-    let _ = nextgcore_udmd::udm_nudr_dr_send_auth_subscription_patch(
-        supi, &new_sqn_hex, 0, 0,
-    ).await;
+    let _ =
+        nextgcore_udmd::udm_nudr_dr_send_auth_subscription_patch(supi, &new_sqn_hex, 0, 0).await;
 
     // Step 8: Return authentication vector
     SbiResponse::with_status(200)
@@ -672,7 +792,8 @@ async fn handle_auth_event(supi: &str, request: &SbiRequest) -> SbiResponse {
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let success = auth_event.get("success")
+    let success = auth_event
+        .get("success")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
@@ -743,7 +864,9 @@ async fn run_event_loop_async(udm_sm: &mut UdmSmContext, shutdown: Arc<AtomicBoo
         for entry in expired {
             log::debug!(
                 "UDM timer expired: id={} type={:?} data={:?}",
-                entry.id, entry.timer_type, entry.data
+                entry.id,
+                entry.timer_type,
+                entry.data
             );
 
             // Convert UdmTimerType to UdmTimerId for event dispatch
@@ -767,6 +890,100 @@ async fn run_event_loop_async(udm_sm: &mut UdmSmContext, shutdown: Arc<AtomicBoo
     timer_mgr.clear();
     log::debug!("Exiting async main event loop");
     Ok(())
+}
+
+/// Register UDM with NRF.
+///
+/// Returns the NF instance ID on success so the caller can start a heartbeat
+/// worker.
+async fn register_with_nrf(sbi_addr: &str, sbi_port: u16) -> Result<String, String> {
+    let sbi_ctx = ogs_sbi::context::global_context();
+
+    let nrf_uri = sbi_ctx.get_nrf_uri().await;
+    let nrf_uri = match nrf_uri {
+        Some(uri) => uri,
+        None => {
+            log::debug!("No NRF URI configured, skipping NRF registration");
+            return Ok(String::new());
+        }
+    };
+
+    log::info!("Registering UDM with NRF at {nrf_uri}");
+
+    let (nrf_host, nrf_port) = parse_nrf_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
+    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
+
+    let nf_instance_id = uuid::Uuid::new_v4().to_string();
+
+    let nf_profile = serde_json::json!({
+        "nfInstanceId": nf_instance_id,
+        "nfType": "UDM",
+        "nfStatus": "REGISTERED",
+        "ipv4Addresses": [sbi_addr],
+        "nfServices": [
+            {
+                "serviceInstanceId": format!("{nf_instance_id}-nudm-sdm"),
+                "serviceName": "nudm-sdm",
+                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+            },
+            {
+                "serviceInstanceId": format!("{nf_instance_id}-nudm-uecm"),
+                "serviceName": "nudm-uecm",
+                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+            },
+            {
+                "serviceInstanceId": format!("{nf_instance_id}-nudm-ueau"),
+                "serviceName": "nudm-ueau",
+                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+            }
+        ],
+        "allowedNfTypes": ["AMF", "SMF", "AUSF", "PCF", "SCP"],
+        "heartBeatTimer": 10
+    });
+
+    let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
+    let response = client
+        .put_json(&path, &nf_profile)
+        .await
+        .map_err(|e| format!("NRF registration request failed: {e}"))?;
+
+    match response.status {
+        200 | 201 => {
+            log::info!("UDM registered with NRF successfully (id={nf_instance_id})");
+            Ok(nf_instance_id)
+        }
+        _ => Err(format!(
+            "NRF registration returned status {}",
+            response.status
+        )),
+    }
+}
+
+/// Parse host and port from a URI string (e.g., "http://localhost:7777").
+fn parse_nrf_host_port(uri: &str) -> Option<(String, u16)> {
+    let without_scheme = uri
+        .strip_prefix("https://")
+        .or_else(|| uri.strip_prefix("http://"))
+        .unwrap_or(uri);
+    let (host_port, _) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
+    if let Some((host, port_str)) = host_port.rsplit_once(':') {
+        let port: u16 = port_str.parse().ok()?;
+        Some((host.to_string(), port))
+    } else {
+        let default_port = if uri.starts_with("https://") { 443 } else { 80 };
+        Some((host_port.to_string(), default_port))
+    }
 }
 
 #[cfg(test)]

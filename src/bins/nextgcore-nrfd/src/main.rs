@@ -9,16 +9,15 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use nextgcore_nrfd::{
-    nf_manager, nrf_context_final, nrf_context_init, nrf_sbi_close, nrf_sbi_open,
-    nrf_nnrf_nfm_send_nf_status_notify_all_async,
-    timer_manager, NrfSmContext, SbiServerConfig,
-    NotificationEventType,
+    nf_manager, nrf_context_final, nrf_context_init, nrf_nnrf_nfm_send_nf_status_notify_all_async,
+    nrf_sbi_close, nrf_sbi_open, timer_manager, NotificationEventType, NrfSmContext,
+    SbiServerConfig,
 };
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::oauth::AccessTokenResponse;
 use ogs_sbi::server::{
-    send_bad_request, send_method_not_allowed, send_not_found, send_unauthorized,
-    SbiServer, SbiServerConfig as OgsSbiServerConfig,
+    send_bad_request, send_method_not_allowed, send_not_found, send_unauthorized, SbiServer,
+    SbiServerConfig as OgsSbiServerConfig,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +26,16 @@ use std::time::Duration;
 
 /// Per-process HMAC-SHA256 signing key, generated once at startup.
 static NRF_SIGNING_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+
+/// The NRF's own SBI URI, set once at startup from CLI args.
+static NRF_SELF_URI: OnceLock<String> = OnceLock::new();
+
+fn nrf_self_uri() -> &'static str {
+    NRF_SELF_URI
+        .get()
+        .map(|s| s.as_str())
+        .unwrap_or("http://127.0.0.1:7777")
+}
 
 fn nrf_signing_key() -> &'static [u8; 32] {
     NRF_SIGNING_KEY.get_or_init(|| {
@@ -106,11 +115,10 @@ async fn main() -> Result<()> {
     init_logging(&args)?;
     // G32/G43: Initialize OpenTelemetry tracing (Jaeger/OTLP exporter)
     let _otel = ogs_metrics::otel::init_otel(
-        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME"))
-            .with_endpoint(
-                std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                    .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
-            ),
+        ogs_metrics::otel::OtelConfig::new(env!("CARGO_PKG_NAME")).with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://jaeger:4317".to_string()),
+        ),
     )
     .ok();
 
@@ -129,6 +137,11 @@ async fn main() -> Result<()> {
     // Initialize NRF context
     nrf_context_init(args.max_ue);
     log::info!("NRF context initialized (max_ue={})", args.max_ue);
+
+    // Store the NRF's own SBI URI so notification handlers can use it
+    let scheme = if args.tls { "https" } else { "http" };
+    let self_uri = format!("{}://{}:{}", scheme, args.sbi_addr, args.sbi_port);
+    NRF_SELF_URI.set(self_uri).ok();
 
     // Initialize NRF state machine
     let mut nrf_sm = NrfSmContext::new();
@@ -170,13 +183,22 @@ async fn main() -> Result<()> {
 
     // Wire TLS/mTLS configuration from CLI args into the ogs-sbi server
     if args.tls {
-        let cert = args.tls_cert.as_deref().unwrap_or("/etc/nextgcore/tls/server.crt");
-        let key = args.tls_key.as_deref().unwrap_or("/etc/nextgcore/tls/server.key");
+        let cert = args
+            .tls_cert
+            .as_deref()
+            .unwrap_or("/etc/nextgcore/tls/server.crt");
+        let key = args
+            .tls_key
+            .as_deref()
+            .unwrap_or("/etc/nextgcore/tls/server.key");
         sbi_server_config = sbi_server_config.with_tls(key, cert);
         log::info!("TLS enabled: cert={cert}, key={key}");
 
         if args.mtls {
-            let ca = args.tls_ca_cert.as_deref().unwrap_or("/etc/nextgcore/tls/ca.crt");
+            let ca = args
+                .tls_ca_cert
+                .as_deref()
+                .unwrap_or("/etc/nextgcore/tls/ca.crt");
             sbi_server_config.verify_client = true;
             sbi_server_config.verify_client_cacert = Some(ca.to_string());
             log::info!("mTLS enabled: client CA={ca}");
@@ -185,7 +207,9 @@ async fn main() -> Result<()> {
 
     let sbi_server = SbiServer::new(sbi_server_config);
 
-    sbi_server.start(nrf_sbi_request_handler).await
+    sbi_server
+        .start(nrf_sbi_request_handler)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
     let scheme = if args.tls { "HTTPS" } else { "HTTP" };
@@ -199,7 +223,9 @@ async fn main() -> Result<()> {
     log::info!("Shutting down...");
 
     // Stop SBI server
-    sbi_server.stop().await
+    sbi_server
+        .stop()
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to stop SBI server: {e}"))?;
     log::info!("SBI HTTP/2 server stopped");
 
@@ -326,15 +352,18 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
     let manager = nf_manager();
 
     // Create NfProfile from JSON
-    let nf_type = profile.get("nfType")
+    let nf_type = profile
+        .get("nfType")
         .and_then(|v| v.as_str())
         .unwrap_or("UNKNOWN")
         .to_string();
-    let nf_status = profile.get("nfStatus")
+    let nf_status = profile
+        .get("nfStatus")
         .and_then(|v| v.as_str())
         .unwrap_or("REGISTERED")
         .to_string();
-    let heartbeat_timer = profile.get("heartBeatTimer")
+    let heartbeat_timer = profile
+        .get("heartBeatTimer")
         .and_then(|v| v.as_u64())
         .map(|v| v as u32);
 
@@ -371,12 +400,12 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
 
             // Send NF status notifications to all matching subscribers
             let notify_profile = nf_profile.clone();
+            let server_uri = nrf_self_uri().to_string();
             tokio::spawn(async move {
-                let server_uri = "http://127.0.0.1:7777"; // TODO: use configured URI
                 if let Err(e) = nrf_nnrf_nfm_send_nf_status_notify_all_async(
                     NotificationEventType::NfRegistered,
                     &notify_profile,
-                    server_uri,
+                    &server_uri,
                 )
                 .await
                 {
@@ -386,7 +415,10 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
 
             // Return 201 Created with the NF profile
             SbiResponse::with_status(201)
-                .with_header("Location", format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}"))
+                .with_header(
+                    "Location",
+                    format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}"),
+                )
                 .with_json_body(&profile)
                 .unwrap_or_else(|_| SbiResponse::with_status(201))
         }
@@ -404,19 +436,18 @@ async fn handle_nf_profile_retrieval(nf_instance_id: &str) -> SbiResponse {
     let manager = nf_manager();
 
     match manager.get(nf_instance_id) {
-        Some(profile) => {
-            SbiResponse::with_status(200)
-                .with_json_body(&serde_json::json!({
-                    "nfInstanceId": profile.nf_instance_id,
-                    "nfType": profile.nf_type,
-                    "nfStatus": profile.nf_status,
-                    "heartBeatTimer": profile.heartbeat_timer,
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(200))
-        }
-        None => {
-            send_not_found(&format!("NF instance {nf_instance_id} not found"), Some("NF_NOT_FOUND"))
-        }
+        Some(profile) => SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({
+                "nfInstanceId": profile.nf_instance_id,
+                "nfType": profile.nf_type,
+                "nfStatus": profile.nf_status,
+                "heartBeatTimer": profile.heartbeat_timer,
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("NF instance {nf_instance_id} not found"),
+            Some("NF_NOT_FOUND"),
+        ),
     }
 }
 
@@ -435,12 +466,12 @@ async fn handle_nf_deregister(nf_instance_id: &str) -> SbiResponse {
 
             // Send NF_DEREGISTERED notifications to matching subscribers
             if let Some(profile) = profile_for_notify {
+                let server_uri = nrf_self_uri().to_string();
                 tokio::spawn(async move {
-                    let server_uri = "http://127.0.0.1:7777"; // TODO: use configured URI
                     if let Err(e) = nrf_nnrf_nfm_send_nf_status_notify_all_async(
                         NotificationEventType::NfDeregistered,
                         &profile,
-                        server_uri,
+                        &server_uri,
                     )
                     .await
                     {
@@ -488,9 +519,7 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
                     Duration::from_secs(expiry_secs),
                     nf_instance_id.to_string(),
                 );
-                log::debug!(
-                    "Heartbeat timer refreshed for NF {nf_instance_id} ({expiry_secs}s)"
-                );
+                log::debug!("Heartbeat timer refreshed for NF {nf_instance_id} ({expiry_secs}s)");
             }
 
             SbiResponse::with_status(200)
@@ -501,9 +530,10 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }
-        None => {
-            send_not_found(&format!("NF instance {nf_instance_id} not found"), Some("NF_NOT_FOUND"))
-        }
+        None => send_not_found(
+            &format!("NF instance {nf_instance_id} not found"),
+            Some("NF_NOT_FOUND"),
+        ),
     }
 }
 
@@ -513,7 +543,11 @@ async fn handle_nf_list_retrieval(_request: &SbiRequest) -> SbiResponse {
 
     let manager = nf_manager();
 
-    let instances: Vec<String> = manager.list().iter().map(|p| p.nf_instance_id.clone()).collect();
+    let instances: Vec<String> = manager
+        .list()
+        .iter()
+        .map(|p| p.nf_instance_id.clone())
+        .collect();
 
     SbiResponse::with_status(200)
         .with_json_body(&serde_json::json!({
@@ -557,19 +591,23 @@ async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
     let subscription_id = uuid::Uuid::new_v4().to_string();
 
     // Parse subscription condition
-    let subscr_cond = subscription.get("subscrCond").map(|cond| {
-        nextgcore_nrfd::nnrf_handler::SubscrCond {
-            nf_type: cond.get("nfType").and_then(|v| v.as_str()).map(String::from),
-            service_name: cond
-                .get("serviceName")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-            nf_instance_id: cond
-                .get("nfInstanceId")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-        }
-    });
+    let subscr_cond =
+        subscription
+            .get("subscrCond")
+            .map(|cond| nextgcore_nrfd::nnrf_handler::SubscrCond {
+                nf_type: cond
+                    .get("nfType")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                service_name: cond
+                    .get("serviceName")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                nf_instance_id: cond
+                    .get("nfInstanceId")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+            });
 
     // Parse validity duration (default 86400 seconds = 24 hours)
     let validity_duration = subscription
@@ -605,9 +643,7 @@ async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
         subscription_id.clone(),
     );
 
-    log::info!(
-        "Created subscription: {subscription_id} (validity={validity_duration}s)"
-    );
+    log::info!("Created subscription: {subscription_id} (validity={validity_duration}s)");
 
     // Return 201 Created
     SbiResponse::with_status(201)
@@ -648,10 +684,16 @@ async fn handle_subscription_update(subscription_id: &str, _request: &SbiRequest
 /// Handle NF Discovery request
 async fn handle_nf_discover(request: &SbiRequest) -> SbiResponse {
     // Parse query parameters
-    let target_nf_type = request.http.params.get("target-nf-type")
+    let target_nf_type = request
+        .http
+        .params
+        .get("target-nf-type")
         .map(|s| s.as_str())
         .unwrap_or("");
-    let requester_nf_type = request.http.params.get("requester-nf-type")
+    let requester_nf_type = request
+        .http
+        .params
+        .get("requester-nf-type")
         .map(|s| s.as_str())
         .unwrap_or("");
 
@@ -664,25 +706,33 @@ async fn handle_nf_discover(request: &SbiRequest) -> SbiResponse {
     // Search for matching NF instances
     let manager = nf_manager();
 
-    let matching: Vec<_> = manager.list()
+    let matching: Vec<_> = manager
+        .list()
         .iter()
         .filter(|p| p.nf_type == target_nf_type && p.nf_status == "REGISTERED")
         .cloned()
         .collect();
 
-    log::info!("Found {} matching NF instances for type {}", matching.len(), target_nf_type);
+    log::info!(
+        "Found {} matching NF instances for type {}",
+        matching.len(),
+        target_nf_type
+    );
 
     // Build SearchResult response
-    let nf_instances: Vec<serde_json::Value> = matching.iter().map(|p| {
-        serde_json::json!({
-            "nfInstanceId": p.nf_instance_id,
-            "nfType": p.nf_type,
-            "nfStatus": p.nf_status,
-            "heartBeatTimer": p.heartbeat_timer,
-            "ipv4Addresses": p.ipv4_addresses,
-            "fqdn": p.fqdn,
+    let nf_instances: Vec<serde_json::Value> = matching
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "nfInstanceId": p.nf_instance_id,
+                "nfType": p.nf_type,
+                "nfStatus": p.nf_status,
+                "heartBeatTimer": p.heartbeat_timer,
+                "ipv4Addresses": p.ipv4_addresses,
+                "fqdn": p.fqdn,
+            })
         })
-    }).collect();
+        .collect();
 
     SbiResponse::with_status(200)
         .with_json_body(&serde_json::json!({
@@ -708,11 +758,31 @@ async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
     let (grant_type, nf_instance_id, nf_type, target_nf_type, scope) =
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
             (
-                parsed.get("grant_type").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                parsed.get("nfInstanceId").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                parsed.get("nfType").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                parsed.get("targetNfType").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                parsed.get("scope").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                parsed
+                    .get("grant_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                parsed
+                    .get("nfInstanceId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                parsed
+                    .get("nfType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                parsed
+                    .get("targetNfType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                parsed
+                    .get("scope")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
             )
         } else {
             // Try form-urlencoded
@@ -798,11 +868,11 @@ async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
     let signing_input = format!("{header_b64}.{payload_b64}");
-    let mut mac = Hmac::<Sha256>::new_from_slice(nrf_signing_key())
-        .expect("HMAC accepts any key length");
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(nrf_signing_key()).expect("HMAC accepts any key length");
     mac.update(signing_input.as_bytes());
     let signature_bytes = mac.finalize().into_bytes();
-    let signature_b64 = URL_SAFE_NO_PAD.encode(&signature_bytes);
+    let signature_b64 = URL_SAFE_NO_PAD.encode(signature_bytes);
 
     let access_token = format!("{header_b64}.{payload_b64}.{signature_b64}");
 
@@ -902,15 +972,14 @@ async fn run_event_loop_async(_nrf_sm: &mut NrfSmContext, shutdown: Arc<AtomicBo
 
                             // Send NF_DEREGISTERED notification
                             if let Some(profile) = profile {
-                                let server_uri = "http://127.0.0.1:7777".to_string();
+                                let server_uri = nrf_self_uri().to_string();
                                 tokio::spawn(async move {
-                                    if let Err(e) =
-                                        nrf_nnrf_nfm_send_nf_status_notify_all_async(
-                                            NotificationEventType::NfDeregistered,
-                                            &profile,
-                                            &server_uri,
-                                        )
-                                        .await
+                                    if let Err(e) = nrf_nnrf_nfm_send_nf_status_notify_all_async(
+                                        NotificationEventType::NfDeregistered,
+                                        &profile,
+                                        &server_uri,
+                                    )
+                                    .await
                                     {
                                         log::error!(
                                             "Failed to send NF_DEREGISTERED notifications: {e}"

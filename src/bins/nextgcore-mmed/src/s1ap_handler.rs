@@ -2,7 +2,7 @@
 //!
 //! Port of src/mme/s1ap-handler.c - S1AP message handling functions
 
-use crate::context::{MmeContext, MmeEnb, PlmnId, EpsTai, ECgi, S1apCause, S1apCauseGroup};
+use crate::context::{ECgi, EpsTai, MmeContext, MmeEnb, PlmnId, S1apCause, S1apCauseGroup};
 
 // ============================================================================
 // S1AP Error Types
@@ -45,7 +45,6 @@ impl std::error::Error for S1apError {}
 
 /// S1AP result type
 pub type S1apResult<T> = Result<T, S1apError>;
-
 
 // ============================================================================
 // S1 Setup Request Data
@@ -161,7 +160,6 @@ pub struct UeContextReleaseCompleteData {
     pub enb_ue_s1ap_id: u32,
 }
 
-
 // ============================================================================
 // S1AP Message Handling Functions
 // ============================================================================
@@ -173,23 +171,25 @@ pub fn handle_s1_setup_request(
     data: &[u8],
 ) -> S1apResult<S1SetupRequestData> {
     if data.len() < 4 {
-        return Err(S1apError::InvalidMessage("S1 Setup Request too short".to_string()));
+        return Err(S1apError::InvalidMessage(
+            "S1 Setup Request too short".to_string(),
+        ));
     }
-    
+
     let mut result = S1SetupRequestData::default();
     let mut offset = 0;
-    
+
     // Parse IEs
     while offset + 4 <= data.len() {
         let ie_id = ((data[offset] as u16) << 8) | (data[offset + 1] as u16);
         let _criticality = data[offset + 2];
         let ie_len = ((data[offset + 3] as usize) << 8) | (data[offset + 4] as usize);
         offset += 5;
-        
+
         if offset + ie_len > data.len() {
             break;
         }
-        
+
         match ie_id {
             // Global eNB ID
             59 => {
@@ -203,7 +203,8 @@ pub fn handle_s1_setup_request(
             }
             // eNB Name
             60 => {
-                result.enb_name = Some(String::from_utf8_lossy(&data[offset..offset + ie_len]).to_string());
+                result.enb_name =
+                    Some(String::from_utf8_lossy(&data[offset..offset + ie_len]).to_string());
             }
             // Supported TAs
             64 => {
@@ -219,10 +220,10 @@ pub fn handle_s1_setup_request(
                 // Skip unknown IE
             }
         }
-        
+
         offset += ie_len;
     }
-    
+
     Ok(result)
 }
 
@@ -233,23 +234,25 @@ pub fn handle_initial_ue_message(
     data: &[u8],
 ) -> S1apResult<InitialUeMessageData> {
     if data.len() < 4 {
-        return Err(S1apError::InvalidMessage("Initial UE Message too short".to_string()));
+        return Err(S1apError::InvalidMessage(
+            "Initial UE Message too short".to_string(),
+        ));
     }
-    
+
     let mut result = InitialUeMessageData::default();
     let mut offset = 0;
-    
+
     // Parse IEs
     while offset + 4 <= data.len() {
         let ie_id = ((data[offset] as u16) << 8) | (data[offset + 1] as u16);
         let _criticality = data[offset + 2];
         let ie_len = ((data[offset + 3] as usize) << 8) | (data[offset + 4] as usize);
         offset += 5;
-        
+
         if offset + ie_len > data.len() {
             break;
         }
-        
+
         match ie_id {
             // eNB UE S1AP ID
             8 => {
@@ -292,18 +295,17 @@ pub fn handle_initial_ue_message(
                 // Skip unknown IE
             }
         }
-        
+
         offset += ie_len;
     }
-    
+
     // Validate mandatory IEs
     if result.nas_pdu.is_empty() {
         return Err(S1apError::MissingMandatoryIe("NAS-PDU".to_string()));
     }
-    
+
     Ok(result)
 }
-
 
 /// Handle Uplink NAS Transport
 pub fn handle_uplink_nas_transport(
@@ -312,23 +314,25 @@ pub fn handle_uplink_nas_transport(
     data: &[u8],
 ) -> S1apResult<UplinkNasTransportData> {
     if data.len() < 4 {
-        return Err(S1apError::InvalidMessage("Uplink NAS Transport too short".to_string()));
+        return Err(S1apError::InvalidMessage(
+            "Uplink NAS Transport too short".to_string(),
+        ));
     }
-    
+
     let mut result = UplinkNasTransportData::default();
     let mut offset = 0;
-    
+
     // Parse IEs
     while offset + 4 <= data.len() {
         let ie_id = ((data[offset] as u16) << 8) | (data[offset + 1] as u16);
         let _criticality = data[offset + 2];
         let ie_len = ((data[offset + 3] as usize) << 8) | (data[offset + 4] as usize);
         offset += 5;
-        
+
         if offset + ie_len > data.len() {
             break;
         }
-        
+
         match ie_id {
             // MME UE S1AP ID
             0 => {
@@ -368,15 +372,15 @@ pub fn handle_uplink_nas_transport(
                 // Skip unknown IE
             }
         }
-        
+
         offset += ie_len;
     }
-    
+
     // Validate mandatory IEs
     if result.nas_pdu.is_empty() {
         return Err(S1apError::MissingMandatoryIe("NAS-PDU".to_string()));
     }
-    
+
     Ok(result)
 }
 
@@ -387,23 +391,25 @@ pub fn handle_ue_context_release_request(
     data: &[u8],
 ) -> S1apResult<UeContextReleaseRequestData> {
     if data.len() < 4 {
-        return Err(S1apError::InvalidMessage("UE Context Release Request too short".to_string()));
+        return Err(S1apError::InvalidMessage(
+            "UE Context Release Request too short".to_string(),
+        ));
     }
-    
+
     let mut result = UeContextReleaseRequestData::default();
     let mut offset = 0;
-    
+
     // Parse IEs
     while offset + 4 <= data.len() {
         let ie_id = ((data[offset] as u16) << 8) | (data[offset + 1] as u16);
         let _criticality = data[offset + 2];
         let ie_len = ((data[offset + 3] as usize) << 8) | (data[offset + 4] as usize);
         offset += 5;
-        
+
         if offset + ie_len > data.len() {
             break;
         }
-        
+
         match ie_id {
             // MME UE S1AP ID
             0 => {
@@ -433,10 +439,10 @@ pub fn handle_ue_context_release_request(
                 // Skip unknown IE
             }
         }
-        
+
         offset += ie_len;
     }
-    
+
     Ok(result)
 }
 
@@ -447,23 +453,25 @@ pub fn handle_ue_context_release_complete(
     data: &[u8],
 ) -> S1apResult<UeContextReleaseCompleteData> {
     if data.len() < 4 {
-        return Err(S1apError::InvalidMessage("UE Context Release Complete too short".to_string()));
+        return Err(S1apError::InvalidMessage(
+            "UE Context Release Complete too short".to_string(),
+        ));
     }
-    
+
     let mut result = UeContextReleaseCompleteData::default();
     let mut offset = 0;
-    
+
     // Parse IEs
     while offset + 4 <= data.len() {
         let ie_id = ((data[offset] as u16) << 8) | (data[offset + 1] as u16);
         let _criticality = data[offset + 2];
         let ie_len = ((data[offset + 3] as usize) << 8) | (data[offset + 4] as usize);
         offset += 5;
-        
+
         if offset + ie_len > data.len() {
             break;
         }
-        
+
         match ie_id {
             // MME UE S1AP ID
             0 => {
@@ -487,13 +495,12 @@ pub fn handle_ue_context_release_complete(
                 // Skip unknown IE
             }
         }
-        
+
         offset += ie_len;
     }
-    
+
     Ok(result)
 }
-
 
 // ============================================================================
 // Parsing Helper Functions
@@ -502,32 +509,32 @@ pub fn handle_ue_context_release_complete(
 /// Parse supported TA list
 fn parse_supported_ta_list(data: &[u8]) -> Vec<SupportedTa> {
     let mut list = Vec::new();
-    
+
     if data.is_empty() {
         return list;
     }
-    
+
     let num_items = data[0] as usize;
     let mut offset = 1;
-    
+
     for _ in 0..num_items {
         if offset + 2 > data.len() {
             break;
         }
-        
+
         let mut ta = SupportedTa::default();
-        
+
         // TAC (2 bytes)
         ta.tac = ((data[offset] as u16) << 8) | (data[offset + 1] as u16);
         offset += 2;
-        
+
         // Broadcast PLMNs
         if offset >= data.len() {
             break;
         }
         let num_plmns = data[offset] as usize;
         offset += 1;
-        
+
         for _ in 0..num_plmns {
             if offset + 3 > data.len() {
                 break;
@@ -536,10 +543,10 @@ fn parse_supported_ta_list(data: &[u8]) -> Vec<SupportedTa> {
             ta.broadcast_plmn_list.push(plmn);
             offset += 3;
         }
-        
+
         list.push(ta);
     }
-    
+
     list
 }
 
@@ -548,7 +555,7 @@ fn parse_plmn_id(data: &[u8]) -> PlmnId {
     if data.len() < 3 {
         return PlmnId::default();
     }
-    
+
     PlmnId {
         mcc1: data[0] & 0x0f,
         mcc2: (data[0] >> 4) & 0x0f,
@@ -564,7 +571,7 @@ fn parse_tai(data: &[u8]) -> EpsTai {
     if data.len() < 5 {
         return EpsTai::default();
     }
-    
+
     EpsTai {
         plmn_id: parse_plmn_id(&data[0..3]),
         tac: ((data[3] as u16) << 8) | (data[4] as u16),
@@ -576,7 +583,7 @@ fn parse_ecgi(data: &[u8]) -> ECgi {
     if data.len() < 7 {
         return ECgi::default();
     }
-    
+
     ECgi {
         plmn_id: parse_plmn_id(&data[0..3]),
         cell_id: ((data[3] as u32) << 24)
@@ -591,7 +598,7 @@ fn parse_s_tmsi(data: &[u8]) -> STmsi {
     if data.len() < 5 {
         return STmsi::default();
     }
-    
+
     STmsi {
         mme_code: data[0],
         m_tmsi: ((data[1] as u32) << 24)
@@ -606,7 +613,7 @@ fn parse_cause(data: &[u8]) -> S1apCause {
     if data.len() < 2 {
         return S1apCause::default();
     }
-    
+
     let group = match data[0] {
         0 => S1apCauseGroup::RadioNetwork,
         1 => S1apCauseGroup::Transport,
@@ -615,7 +622,7 @@ fn parse_cause(data: &[u8]) -> S1apCause {
         4 => S1apCauseGroup::Misc,
         _ => S1apCauseGroup::Nothing,
     };
-    
+
     S1apCause {
         group,
         cause: data[1] as i64,
@@ -634,10 +641,10 @@ mod tests {
     fn test_s1ap_error_display() {
         let err = S1apError::InvalidMessage("test".to_string());
         assert!(err.to_string().contains("Invalid message"));
-        
+
         let err = S1apError::MissingMandatoryIe("NAS-PDU".to_string());
         assert!(err.to_string().contains("Missing mandatory IE"));
-        
+
         let err = S1apError::UnknownProcedure(99);
         assert!(err.to_string().contains("Unknown procedure"));
     }

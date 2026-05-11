@@ -114,7 +114,9 @@ impl OgsAppInitializer {
         ogs_app().set_version(version);
 
         // Stage 2: Load configuration file
-        let config_file = opts.config_file.unwrap_or_else(|| default_config.to_string());
+        let config_file = opts
+            .config_file
+            .unwrap_or_else(|| default_config.to_string());
         ogs_app().set_file(&config_file);
 
         self.read_config(&config_file)?;
@@ -200,9 +202,7 @@ impl OgsAppInitializer {
                 }
                 _ => {
                     // Count NF configuration sections
-                    ogs_app()
-                        .global_conf_mut()
-                        .count_nf_conf_section(&root_key);
+                    ogs_app().global_conf_mut().count_nf_conf_section(&root_key);
                 }
             }
         }
@@ -398,11 +398,9 @@ pub fn nf_common_init(
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), InitError> {
     // 1. Logging — honour RUST_LOG env var; fall back to the supplied level.
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(log_level),
-    )
-    .format_timestamp_millis()
-    .init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
+        .format_timestamp_millis()
+        .init();
 
     // 2. OpenTelemetry — best-effort; failures are logged but not fatal.
     let otel_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
@@ -442,8 +440,14 @@ mod tests {
 
         let opts = CommandLineOptions::parse(&args);
 
-        assert_eq!(opts.config_file, Some("/etc/nextgcore/amf.yaml".to_string()));
-        assert_eq!(opts.log_file, Some("/var/log/nextgcore/amf.log".to_string()));
+        assert_eq!(
+            opts.config_file,
+            Some("/etc/nextgcore/amf.yaml".to_string())
+        );
+        assert_eq!(
+            opts.log_file,
+            Some("/var/log/nextgcore/amf.log".to_string())
+        );
         assert_eq!(opts.log_level, Some("debug".to_string()));
         assert_eq!(opts.domain_mask, Some("amf".to_string()));
         assert_eq!(opts.config_section_id, Some(1));

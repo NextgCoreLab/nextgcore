@@ -65,13 +65,19 @@ pub fn dccf_context_add_subscription(sub_id: String) -> bool {
 pub fn dccf_context_add_subscription_with_uri(sub_id: String, notify_uri: String) -> bool {
     let mut c = ctx().lock().unwrap();
     if c.subscriptions.len() >= c.max_subscriptions {
-        log::warn!("[DCCF] subscription capacity exhausted ({})", c.max_subscriptions);
+        log::warn!(
+            "[DCCF] subscription capacity exhausted ({})",
+            c.max_subscriptions
+        );
         return false;
     }
-    c.subscription_map.insert(sub_id.clone(), DccfSubscription {
-        id: sub_id.clone(),
-        notify_uri,
-    });
+    c.subscription_map.insert(
+        sub_id.clone(),
+        DccfSubscription {
+            id: sub_id.clone(),
+            notify_uri,
+        },
+    );
     c.subscriptions.insert(sub_id);
     true
 }
@@ -129,7 +135,7 @@ pub fn dccf_context_fanout_notify(body: &str) -> Vec<(String, String)> {
         .filter(|s| !s.notify_uri.is_empty())
         .map(|s| (s.id.clone(), s.notify_uri.clone()))
         .collect();
-    c.fanout_count += targets.len().max(c.subscriptions.len()) as u64;
+    c.fanout_count += targets.len() as u64;
     log::debug!(
         "[DCCF] fanout: {} subscribers ({} with callback URI), body_len={}, total_fanout={}",
         c.subscriptions.len(),
@@ -161,6 +167,12 @@ pub fn dccf_context_final() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// Serialises tests that touch the global DCCF context. Without this
+    /// they race on subscriptions / fanout_count under cargo test's
+    /// default parallel runner.
+    static TEST_GUARD: StdMutex<()> = StdMutex::new(());
 
     fn init() {
         let _ = CONTEXT.get_or_init(|| {
@@ -195,24 +207,37 @@ mod tests {
 
     #[test]
     fn test_fanout_increments_by_subscriber_count() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         init();
-        // Reset by starting fresh (can't reset OnceLock in tests cleanly; use stable count)
+        // Clean up any subs left by other tests that may have a URI
+        dccf_context_remove_subscription("sub-uri-1");
+        dccf_context_remove_subscription("sub-a");
+        dccf_context_remove_subscription("sub-b");
         let before = dccf_context_fanout_count();
         dccf_context_add_subscription("sub-a".into());
         dccf_context_add_subscription("sub-b".into());
         let targets = dccf_context_fanout_notify("{}");
         let after = dccf_context_fanout_count();
-        // Fanout counter should have increased (by subscriber count, at least)
-        assert!(after > before);
-        // Both subs have no URI so targets list is empty
+        // Both subs have no notify URI so no actual notifications are sent
         assert!(targets.is_empty());
+        // Counter only counts actual notifications sent, so it stays the same
+        assert_eq!(after, before);
+        // Cleanup
+        dccf_context_remove_subscription("sub-a");
+        dccf_context_remove_subscription("sub-b");
     }
 
     #[test]
     fn test_fanout_with_callback_uris() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|p| p.into_inner());
         init();
-        dccf_context_add_subscription_with_uri("sub-uri-1".into(), "http://nwdaf:8080/notify".into());
+        dccf_context_add_subscription_with_uri(
+            "sub-uri-1".into(),
+            "http://nwdaf:8080/notify".into(),
+        );
         let targets = dccf_context_fanout_notify("{}");
         assert!(targets.iter().any(|(id, _)| id == "sub-uri-1"));
+        // Cleanup so we don't pollute other tests
+        dccf_context_remove_subscription("sub-uri-1");
     }
 }

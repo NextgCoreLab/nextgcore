@@ -96,10 +96,7 @@ impl OgsThread {
     where
         F: FnOnce() + Send + 'static,
     {
-        let state = Arc::new((
-            Mutex::new(ThreadState { running: false }),
-            Condvar::new(),
-        ));
+        let state = Arc::new((Mutex::new(ThreadState { running: false }), Condvar::new()));
         let state_clone = Arc::clone(&state);
 
         // Lock before spawning to wait for signal
