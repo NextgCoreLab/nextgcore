@@ -67,15 +67,28 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout nextgcore
+        uses: actions/checkout@v4
+        with:
+          path: nextgcore
+
+      - name: Checkout nextgsim (sibling repo required by Dockerfile.builder)
+        uses: actions/checkout@v4
+        with:
+          repository: NextgCoreLab/nextgsim
+          ref: first_implementation
+          path: nextgsim
 
       - name: Build builder image
         run: |
-          cd docker/rust
-          docker build -f Dockerfile.builder -t nextg-builder ../../
+          cd nextgcore/docker/rust
+          # Build context = parent (./) so Dockerfile.builder can COPY both
+          # nextgcore/src and nextgsim subtrees.
+          docker build -f Dockerfile.builder -t nextg-builder ../../../
 
       - name: Extract binaries
         run: |
+          cd nextgcore
           docker create --name builder nextg-builder /bin/true
           mkdir -p docker/rust/binaries
           docker cp builder:/out/. docker/rust/binaries/
@@ -84,12 +97,12 @@ jobs:
 
       - name: Build core base image
         run: |
-          cd docker/rust
+          cd nextgcore/docker/rust
           docker build -f Dockerfile.core -t nextgcore-core:latest .
 
       - name: Build 5GC NF images
         run: |
-          cd docker/rust
+          cd nextgcore/docker/rust
           for nf in amfd ausfd bsfd dccfd eesd lmfd mbsmfd nrfd nsacfd nssfd nwdafd pcfd pind scpd seppd smfd udmd udrd upfd; do
             echo "Building 5GC nextgcore-${nf}..."
             docker build -f Dockerfile.nf \
@@ -100,7 +113,7 @@ jobs:
 
       - name: Build EPC NF images
         run: |
-          cd docker/rust
+          cd nextgcore/docker/rust
           for nf in mmed sgwcd sgwud hssd pcrfd; do
             echo "Building EPC nextgcore-${nf}..."
             docker build -f Dockerfile.nf \
@@ -119,12 +132,21 @@ jobs:
     runs-on: ubuntu-latest
     needs: docker-build
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout nextgcore
+        uses: actions/checkout@v4
+        with:
+          path: nextgcore
+      - name: Checkout nextgsim
+        uses: actions/checkout@v4
+        with:
+          repository: NextgCoreLab/nextgsim
+          ref: first_implementation
+          path: nextgsim
 
       - name: Build all images (repeat for job isolation)
         run: |
-          cd docker/rust
-          docker build -f Dockerfile.builder -t nextg-builder ../../
+          cd nextgcore/docker/rust
+          docker build -f Dockerfile.builder -t nextg-builder ../../../
           docker create --name builder nextg-builder /bin/true
           mkdir -p binaries
           docker cp builder:/out/. binaries/
@@ -139,7 +161,7 @@ jobs:
 
       - name: Start core network
         run: |
-          cd docker/rust
+          cd nextgcore/docker/rust
           docker compose up -d mongodb nrf
           sleep 5
           docker compose up -d ausf udm udr pcf nssf bsf
@@ -149,7 +171,7 @@ jobs:
 
       - name: Health check
         run: |
-          cd docker/rust
+          cd nextgcore/docker/rust
           echo "=== Container status ==="
           docker compose ps
           echo "=== NRF health ==="
@@ -160,13 +182,13 @@ jobs:
       - name: Collect logs on failure
         if: failure()
         run: |
-          cd docker/rust
+          cd nextgcore/docker/rust
           docker compose logs --tail=50
 
       - name: Teardown
         if: always()
         run: |
-          cd docker/rust
+          cd nextgcore/docker/rust
           docker compose down -v
 
   docker-e2e-epc:
@@ -174,12 +196,21 @@ jobs:
     runs-on: ubuntu-latest
     needs: docker-build
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout nextgcore
+        uses: actions/checkout@v4
+        with:
+          path: nextgcore
+      - name: Checkout nextgsim
+        uses: actions/checkout@v4
+        with:
+          repository: NextgCoreLab/nextgsim
+          ref: first_implementation
+          path: nextgsim
 
       - name: Build builder + extract binaries
         run: |
-          cd docker/rust
-          docker build -f Dockerfile.builder -t nextg-builder ../../
+          cd nextgcore/docker/rust
+          docker build -f Dockerfile.builder -t nextg-builder ../../../
           docker create --name builder nextg-builder /bin/true
           mkdir -p binaries
           docker cp builder:/out/. binaries/
@@ -188,7 +219,7 @@ jobs:
 
       - name: Build EPC NF images
         run: |
-          cd docker/rust
+          cd nextgcore/docker/rust
           for nf in mmed sgwcd sgwud hssd pcrfd; do
             docker build -f Dockerfile.nf \
               --build-arg CORE_IMAGE=nextgcore-core:latest \
@@ -198,7 +229,7 @@ jobs:
 
       - name: Start EPC network
         run: |
-          cd docker/rust
+          cd nextgcore/docker/rust
           docker compose -f docker-compose-epc.yml up -d mongodb-epc
           sleep 5
           docker compose -f docker-compose-epc.yml up -d hss pcrf sgwc sgwu
@@ -208,7 +239,7 @@ jobs:
 
       - name: Health check
         run: |
-          cd docker/rust
+          cd nextgcore/docker/rust
           echo "=== Container status ==="
           docker compose -f docker-compose-epc.yml ps
           echo "=== Container details ==="
@@ -220,11 +251,11 @@ jobs:
       - name: Collect logs on failure
         if: failure()
         run: |
-          cd docker/rust
+          cd nextgcore/docker/rust
           docker compose -f docker-compose-epc.yml logs --tail=50
 
       - name: Teardown
         if: always()
         run: |
-          cd docker/rust
+          cd nextgcore/docker/rust
           docker compose -f docker-compose-epc.yml down -v

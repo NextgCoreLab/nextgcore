@@ -157,32 +157,34 @@ impl OgsHash {
         }
 
         // If we didn't find an existing entry and val is Some, add new entry
-        if val.is_some() && !found {
-            // Check if we already handled it above
-            let mut current = self.array[index].as_ref();
-            let mut exists = false;
-            while let Some(entry) = current {
-                if entry.hash == hash && entry.klen == actual_klen && entry.key == key_slice {
-                    exists = true;
-                    break;
+        if !found {
+            if let Some(val) = val {
+                // Check if we already handled it above
+                let mut current = self.array[index].as_ref();
+                let mut exists = false;
+                while let Some(entry) = current {
+                    if entry.hash == hash && entry.klen == actual_klen && entry.key == key_slice {
+                        exists = true;
+                        break;
+                    }
+                    current = entry.next.as_ref();
                 }
-                current = entry.next.as_ref();
-            }
 
-            if !exists {
-                let new_entry = Box::new(OgsHashEntry {
-                    next: self.array[index].take(),
-                    hash,
-                    key: key_slice.to_vec(),
-                    klen: actual_klen,
-                    val: val.expect("value expected"),
-                });
+                if !exists {
+                    let new_entry = Box::new(OgsHashEntry {
+                        next: self.array[index].take(),
+                        hash,
+                        key: key_slice.to_vec(),
+                        klen: actual_klen,
+                        val,
+                    });
 
-                self.array[index] = Some(new_entry);
-                self.count += 1;
+                    self.array[index] = Some(new_entry);
+                    self.count += 1;
 
-                if self.count > self.max {
-                    self.expand_array();
+                    if self.count > self.max {
+                        self.expand_array();
+                    }
                 }
             }
         }

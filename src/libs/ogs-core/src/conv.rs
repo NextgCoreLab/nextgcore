@@ -5,7 +5,7 @@
 /// Convert hex string to bytes (identical to ogs_hex_from_string)
 pub fn ogs_hex_from_string(hex: &str) -> Option<Vec<u8>> {
     let hex = hex.trim();
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
 
