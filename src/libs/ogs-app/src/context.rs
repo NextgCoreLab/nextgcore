@@ -212,32 +212,32 @@ impl OgsApp {
     }
 
     /// Get application context (read-only)
-    pub fn context(&self) -> std::sync::RwLockReadGuard<OgsAppContext> {
+    pub fn context(&self) -> std::sync::RwLockReadGuard<'_, OgsAppContext> {
         self.context.read().unwrap()
     }
 
     /// Get application context (mutable)
-    pub fn context_mut(&self) -> std::sync::RwLockWriteGuard<OgsAppContext> {
+    pub fn context_mut(&self) -> std::sync::RwLockWriteGuard<'_, OgsAppContext> {
         self.context.write().unwrap()
     }
 
     /// Get global configuration (read-only)
-    pub fn global_conf(&self) -> std::sync::RwLockReadGuard<OgsGlobalConf> {
+    pub fn global_conf(&self) -> std::sync::RwLockReadGuard<'_, OgsGlobalConf> {
         self.global_conf.read().unwrap()
     }
 
     /// Get global configuration (mutable)
-    pub fn global_conf_mut(&self) -> std::sync::RwLockWriteGuard<OgsGlobalConf> {
+    pub fn global_conf_mut(&self) -> std::sync::RwLockWriteGuard<'_, OgsGlobalConf> {
         self.global_conf.write().unwrap()
     }
 
     /// Get local configuration (read-only)
-    pub fn local_conf(&self) -> std::sync::RwLockReadGuard<OgsLocalConf> {
+    pub fn local_conf(&self) -> std::sync::RwLockReadGuard<'_, OgsLocalConf> {
         self.local_conf.read().unwrap()
     }
 
     /// Get local configuration (mutable)
-    pub fn local_conf_mut(&self) -> std::sync::RwLockWriteGuard<OgsLocalConf> {
+    pub fn local_conf_mut(&self) -> std::sync::RwLockWriteGuard<'_, OgsLocalConf> {
         self.local_conf.write().unwrap()
     }
 
