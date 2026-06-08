@@ -24,8 +24,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-/// Per-process HMAC-SHA256 signing key, generated once at startup.
-static NRF_SIGNING_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+/// Per-process ES256 (ECDSA P-256) signing key, generated once at startup.
+/// Asymmetric so consumers can verify tokens with the public key (published via
+/// JWKS in a later stage) without sharing a secret.
+static NRF_SIGNING_KEY: OnceLock<p256::ecdsa::SigningKey> = OnceLock::new();
+
+/// Key id advertised in the JWT header and (later) the JWKS document.
+const NRF_KID: &str = "nrf-es256";
 
 /// The NRF's own SBI URI, set once at startup from CLI args.
 static NRF_SELF_URI: OnceLock<String> = OnceLock::new();
@@ -37,10 +42,16 @@ fn nrf_self_uri() -> &'static str {
         .unwrap_or("http://127.0.0.1:7777")
 }
 
-fn nrf_signing_key() -> &'static [u8; 32] {
+fn nrf_signing_key() -> &'static p256::ecdsa::SigningKey {
     NRF_SIGNING_KEY.get_or_init(|| {
         use rand::Rng;
-        rand::rng().random::<[u8; 32]>()
+        // Draw a random scalar; reject the (vanishingly rare) invalid ones.
+        loop {
+            let bytes = rand::rng().random::<[u8; 32]>();
+            if let Ok(sk) = p256::ecdsa::SigningKey::from_slice(&bytes) {
+                break sk;
+            }
+        }
     })
 }
 
@@ -838,16 +849,14 @@ async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
         );
     }
 
-    // Issue a JWT access token
-    // In production, this would use proper RSA/ECDSA signing.
-    // For now, build a base64-encoded JWT structure.
+    // Issue a JWT access token signed with ES256 (ECDSA P-256).
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("value expected")
         .as_secs();
     let expires_in = 3600u64; // 1 hour
 
-    let header_json = r#"{"alg":"HS256","typ":"JWT"}"#;
+    let header_json = format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{NRF_KID}"}}"#);
     let claims_json = serde_json::json!({
         "iss": "NRF",
         "sub": nf_instance_id,
@@ -864,15 +873,12 @@ async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
     let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
     let payload_b64 = URL_SAFE_NO_PAD.encode(claims_str.as_bytes());
 
-    // Sign header.payload with HMAC-SHA256 using the per-process key
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
+    // Sign header.payload with ES256 (ECDSA P-256). The JOSE signature is the
+    // raw r||s (64 bytes), base64url-encoded.
+    use p256::ecdsa::{signature::Signer, Signature};
     let signing_input = format!("{header_b64}.{payload_b64}");
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(nrf_signing_key()).expect("HMAC accepts any key length");
-    mac.update(signing_input.as_bytes());
-    let signature_bytes = mac.finalize().into_bytes();
-    let signature_b64 = URL_SAFE_NO_PAD.encode(signature_bytes);
+    let signature: Signature = nrf_signing_key().sign(signing_input.as_bytes());
+    let signature_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
     let access_token = format!("{header_b64}.{payload_b64}.{signature_b64}");
 
