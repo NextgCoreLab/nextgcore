@@ -502,6 +502,12 @@ async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
             // and filter out any S-NSSAIs that the UE is not subscribed to (TS 29.531 6.1.3.2.3.1)
             if let Some(ref _supi) = supi {
                 // Query subscribed S-NSSAIs from UDR via ogs-dbi
+                // NOTE: kept synchronous — the enclosing handler holds an
+                // RwLockReadGuard<NssfContext> across this point, so awaiting the
+                // async wrapper here would make the future non-Send (and holding
+                // a std lock across await risks deadlock). Migrate to the async
+                // wrapper only after the lock scope is refactored to drop the
+                // guard before the DB call. See DANGER-ZONES B1.
                 match ogs_dbi::ogs_dbi_subscription_data(_supi) {
                     Ok(sub_data) => {
                         let subscribed: Vec<(u8, Option<u32>)> = sub_data

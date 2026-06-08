@@ -300,6 +300,71 @@ pub fn ogs_dbi_subscription_data(supi: &str) -> DbiResult<OgsSubscriptionData> {
     Ok(subscription_data)
 }
 
+// ============================================================================
+// Async (non-blocking) wrappers
+// ============================================================================
+//
+// The functions above call the *synchronous* MongoDB driver (`find_one`,
+// `update_one`), which blocks the calling thread on network I/O. When invoked
+// from an `async fn` running on a tokio worker thread (e.g. UDR/NSSF SBI
+// handlers during the 5G-AKA auth flow), that blocks the whole runtime and
+// stalls every other task on the thread (DANGER-ZONES B1: `ogs_mongoc()`
+// reaches 18 modules).
+//
+// These wrappers offload the blocking call to `tokio::task::spawn_blocking`,
+// mirroring `ogs_dbi_init_async` in mongoc.rs. They take owned `String` args so
+// the closure is `'static`. Async call sites should prefer these; the sync
+// versions remain for non-async contexts (FSM handlers, tests, EPC paths).
+
+/// Async, non-blocking wrapper for [`ogs_dbi_auth_info`].
+pub async fn ogs_dbi_auth_info_async(supi: String) -> DbiResult<OgsDbiAuthInfo> {
+    tokio::task::spawn_blocking(move || ogs_dbi_auth_info(&supi))
+        .await
+        .unwrap_or_else(|e| Err(DbiError::ParseError(format!("spawn_blocking panicked: {e}"))))
+}
+
+/// Async, non-blocking wrapper for [`ogs_dbi_update_sqn`].
+pub async fn ogs_dbi_update_sqn_async(supi: String, sqn: u64) -> DbiResult<()> {
+    tokio::task::spawn_blocking(move || ogs_dbi_update_sqn(&supi, sqn))
+        .await
+        .unwrap_or_else(|e| Err(DbiError::ParseError(format!("spawn_blocking panicked: {e}"))))
+}
+
+/// Async, non-blocking wrapper for [`ogs_dbi_increment_sqn`].
+pub async fn ogs_dbi_increment_sqn_async(supi: String) -> DbiResult<()> {
+    tokio::task::spawn_blocking(move || ogs_dbi_increment_sqn(&supi))
+        .await
+        .unwrap_or_else(|e| Err(DbiError::ParseError(format!("spawn_blocking panicked: {e}"))))
+}
+
+/// Async, non-blocking wrapper for [`ogs_dbi_update_imeisv`].
+pub async fn ogs_dbi_update_imeisv_async(supi: String, imeisv: String) -> DbiResult<()> {
+    tokio::task::spawn_blocking(move || ogs_dbi_update_imeisv(&supi, &imeisv))
+        .await
+        .unwrap_or_else(|e| Err(DbiError::ParseError(format!("spawn_blocking panicked: {e}"))))
+}
+
+/// Async, non-blocking wrapper for [`ogs_dbi_subscription_data`].
+pub async fn ogs_dbi_subscription_data_async(supi: String) -> DbiResult<OgsSubscriptionData> {
+    tokio::task::spawn_blocking(move || ogs_dbi_subscription_data(&supi))
+        .await
+        .unwrap_or_else(|e| Err(DbiError::ParseError(format!("spawn_blocking panicked: {e}"))))
+}
+
+/// Async, non-blocking wrapper for [`ogs_dbi_subscription_data_5g`].
+pub async fn ogs_dbi_subscription_data_5g_async(supi: String) -> DbiResult<OgsSubscriptionData> {
+    tokio::task::spawn_blocking(move || ogs_dbi_subscription_data_5g(&supi))
+        .await
+        .unwrap_or_else(|e| Err(DbiError::ParseError(format!("spawn_blocking panicked: {e}"))))
+}
+
+/// Async, non-blocking wrapper for [`ogs_dbi_policy_subscription`].
+pub async fn ogs_dbi_policy_subscription_async(supi: String) -> DbiResult<OgsSubscriptionData> {
+    tokio::task::spawn_blocking(move || ogs_dbi_policy_subscription(&supi))
+        .await
+        .unwrap_or_else(|e| Err(DbiError::ParseError(format!("spawn_blocking panicked: {e}"))))
+}
+
 /// Parse AMBR from BSON document
 fn parse_ambr(doc: &Document) -> OgsAmbr {
     let mut ambr = OgsAmbr::default();

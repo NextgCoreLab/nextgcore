@@ -360,7 +360,7 @@ async fn handle_auth_data(
         ("authentication-subscription", "GET") => {
             log::info!("[{supi}] GET authentication-subscription");
 
-            match ogs_dbi::subscription::ogs_dbi_auth_info(supi) {
+            match ogs_dbi::subscription::ogs_dbi_auth_info_async(supi.to_string()).await {
                 Ok(auth_info) => {
                     let response_json = serde_json::json!({
                         "authenticationMethod": "5G_AKA",
@@ -395,7 +395,11 @@ async fn handle_auth_data(
                                 if let Some(sqn_hex) = patch.get("value").and_then(|v| v.as_str()) {
                                     let sqn = u64::from_str_radix(sqn_hex, 16).unwrap_or(0);
                                     if let Err(e) =
-                                        ogs_dbi::subscription::ogs_dbi_update_sqn(supi, sqn)
+                                        ogs_dbi::subscription::ogs_dbi_update_sqn_async(
+                                            supi.to_string(),
+                                            sqn,
+                                        )
+                                        .await
                                     {
                                         log::error!("[{supi}] DB update_sqn failed: {e:?}");
                                     }
@@ -407,7 +411,8 @@ async fn handle_auth_data(
             }
 
             // Increment SQN for next use
-            if let Err(e) = ogs_dbi::subscription::ogs_dbi_increment_sqn(supi) {
+            if let Err(e) = ogs_dbi::subscription::ogs_dbi_increment_sqn_async(supi.to_string()).await
+            {
                 log::error!("[{supi}] DB increment_sqn failed: {e:?}");
             }
 
@@ -416,7 +421,8 @@ async fn handle_auth_data(
         ("authentication-status", "PUT") | ("authentication-status", "DELETE") => {
             log::info!("[{supi}] {method} authentication-status");
 
-            if let Err(e) = ogs_dbi::subscription::ogs_dbi_increment_sqn(supi) {
+            if let Err(e) = ogs_dbi::subscription::ogs_dbi_increment_sqn_async(supi.to_string()).await
+            {
                 log::error!("[{supi}] DB increment_sqn failed: {e:?}");
             }
 
@@ -630,7 +636,7 @@ async fn handle_provisioned_data(
 
     log::info!("[{supi}] GET provisioned-data/{dataset}");
 
-    let subscription_data = match ogs_dbi::subscription::ogs_dbi_subscription_data(supi) {
+    let subscription_data = match ogs_dbi::subscription::ogs_dbi_subscription_data_async(supi.to_string()).await {
         Ok(data) => data,
         Err(e) => {
             log::error!("[{supi}] DB subscription_data query failed: {e:?}");
@@ -701,7 +707,7 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
             match method {
                 "GET" => {
                     log::debug!("[{supi}] GET policy sm-data");
-                    match ogs_dbi::subscription::ogs_dbi_subscription_data(supi) {
+                    match ogs_dbi::subscription::ogs_dbi_subscription_data_async(supi.to_string()).await {
                         Ok(data) => {
                             let sm_policy_snssai_data = build_sm_policy_data(&data);
                             let response =
@@ -730,7 +736,7 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
                     log::debug!("[{supi}] GET ue-policy-set");
                     // UePolicySet - contains URSP rules, ANDSP, etc.
                     // Per TS 29.519, return UE policy set from DB or defaults
-                    match ogs_dbi::subscription::ogs_dbi_subscription_data(supi) {
+                    match ogs_dbi::subscription::ogs_dbi_subscription_data_async(supi.to_string()).await {
                         Ok(data) => {
                             // Build a minimal UePolicySet with subscribed S-NSSAIs
                             let mut subscribed_ue_pol_sections = serde_json::Map::new();
