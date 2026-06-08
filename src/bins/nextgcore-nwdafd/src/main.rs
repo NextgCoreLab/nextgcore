@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ogs_sbi::context::global_context;
+use ogs_sbi::context::{global_context, SbiContext};
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::server::{
     send_method_not_allowed, send_not_found, SbiServer, SbiServerConfig as OgsSbiServerConfig,
@@ -149,10 +149,14 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
-    // Register with NRF
+    // Register with NRF. main() is the composition root: acquire the shared SBI
+    // context once here and inject it downstream, instead of each function
+    // reaching for the global_context() singleton.
     let sbi_ctx = global_context();
     sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
-    if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port, &nf_instance_id).await {
+    if let Err(e) =
+        register_with_nrf(sbi_ctx, &args.sbi_addr, args.sbi_port, &nf_instance_id).await
+    {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
     } else {
         ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id.clone(), 5);
@@ -220,12 +224,11 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 
 /// Register NWDAF with NRF
 async fn register_with_nrf(
+    sbi_ctx: Arc<SbiContext>,
     sbi_addr: &str,
     sbi_port: u16,
     nf_instance_id: &str,
 ) -> Result<(), String> {
-    let sbi_ctx = global_context();
-
     let nrf_uri = sbi_ctx.get_nrf_uri().await;
     let nrf_uri = match nrf_uri {
         Some(uri) => uri,
@@ -335,5 +338,37 @@ mod tests {
         assert_eq!(args.config, "/etc/nextgcore/nwdaf.yaml");
         assert_eq!(args.sbi_port, 7815);
         assert_eq!(args.max_subscriptions, 1024);
+    }
+
+    // --- SbiContext dependency-injection pilot (DANGER-ZONES #1) ---
+
+    #[tokio::test]
+    async fn test_register_with_nrf_uses_injected_context() {
+        // The injected context carries no NRF URI, so registration is skipped
+        // and returns Ok without any network access. This proves
+        // register_with_nrf reads the *injected* context rather than the
+        // global_context() singleton (which a parallel test might have set).
+        let ctx = SbiContext::new_isolated();
+        let result = register_with_nrf(ctx, "127.0.0.1", 7815, "nwdaf-test").await;
+        assert!(
+            result.is_ok(),
+            "no NRF URI on the injected context should skip registration: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_injected_contexts_are_isolated() {
+        // Two injected contexts must not share state — the whole point of DI.
+        let a = SbiContext::new_isolated();
+        let b = SbiContext::new_isolated();
+
+        a.set_nrf_uri("http://nrf-a:7777").await;
+
+        assert_eq!(a.get_nrf_uri().await.as_deref(), Some("http://nrf-a:7777"));
+        assert_eq!(
+            b.get_nrf_uri().await,
+            None,
+            "context b must not observe context a's NRF URI"
+        );
     }
 }
