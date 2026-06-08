@@ -470,45 +470,67 @@ async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
 
     match result {
         nnssf_handler::NsSelectionResult::Success(info) => {
-            // Build proper response
+            // Build proper response.
+            //
+            // Snapshot everything we need from the NSSF context into OWNED data
+            // and drop the read-lock BEFORE the async DB call below. Holding a
+            // std::sync::RwLockReadGuard across an `.await` would make this
+            // future non-Send (rejected by SbiServer::start) and risk a
+            // deadlock. See DANGER-ZONES B1.
             let ctx = nssf_self();
-            let context = ctx.read().unwrap();
+            let (mut allowed_snssai_list, supported_for_tai): (
+                Vec<serde_json::Value>,
+                Vec<(u8, Option<u32>)>,
+            ) = {
+                let context = ctx.read().unwrap();
 
-            // Build allowedNssaiList from configured NSIs
-            let all_nsi = context.nsi_get_all();
-            let mut allowed_snssai_list: Vec<serde_json::Value> = all_nsi
-                .iter()
-                .map(|nsi| {
-                    let mut snssai = serde_json::json!({"sst": nsi.s_nssai.sst});
-                    if let Some(sd) = nsi.s_nssai.sd {
-                        snssai["sd"] = serde_json::json!(format!("{:06x}", sd));
-                    }
-                    serde_json::json!({"allowedSnssai": snssai})
-                })
-                .collect();
+                // Build allowedNssaiList from configured NSIs
+                let mut list: Vec<serde_json::Value> = context
+                    .nsi_get_all()
+                    .iter()
+                    .map(|nsi| {
+                        let mut snssai = serde_json::json!({"sst": nsi.s_nssai.sst});
+                        if let Some(sd) = nsi.s_nssai.sd {
+                            snssai["sd"] = serde_json::json!(format!("{:06x}", sd));
+                        }
+                        serde_json::json!({"allowedSnssai": snssai})
+                    })
+                    .collect();
 
-            // If no NSIs configured, use the matched one from the request
-            if allowed_snssai_list.is_empty() {
-                if let Some(ref si) = param.slice_info_for_pdu_session.snssai {
-                    let mut snssai = serde_json::json!({"sst": si.sst});
-                    if let Some(sd) = si.sd {
-                        snssai["sd"] = serde_json::json!(format!("{:06x}", sd));
+                // If no NSIs configured, use the matched one from the request
+                if list.is_empty() {
+                    if let Some(ref si) = param.slice_info_for_pdu_session.snssai {
+                        let mut snssai = serde_json::json!({"sst": si.sst});
+                        if let Some(sd) = si.sd {
+                            snssai["sd"] = serde_json::json!(format!("{:06x}", sd));
+                        }
+                        list.push(serde_json::json!({"allowedSnssai": snssai}));
                     }
-                    allowed_snssai_list.push(serde_json::json!({"allowedSnssai": snssai}));
                 }
-            }
+
+                // Snapshot TAI-supported S-NSSAIs as owned (sst, sd) tuples
+                // (TS 29.531 6.1.3.2.3.2) so we can filter after dropping the lock.
+                let supported = if let Some(ref tai) = param.tai {
+                    context
+                        .get_supported_snssai_for_tai(&context::Tai {
+                            plmn_id: tai.plmn_id.clone(),
+                            tac: tai.tac,
+                        })
+                        .iter()
+                        .map(|s| (s.sst, s.sd))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
+                (list, supported)
+            }; // <- context read-lock released here, before any await
 
             // Subscription-based filtering: if SUPI provided, query UDR for subscribed NSSAIs
-            // and filter out any S-NSSAIs that the UE is not subscribed to (TS 29.531 6.1.3.2.3.1)
+            // and filter out any S-NSSAIs that the UE is not subscribed to (TS 29.531 6.1.3.2.3.1).
+            // Safe to await now — no context guard is held.
             if let Some(ref _supi) = supi {
-                // Query subscribed S-NSSAIs from UDR via ogs-dbi
-                // NOTE: kept synchronous — the enclosing handler holds an
-                // RwLockReadGuard<NssfContext> across this point, so awaiting the
-                // async wrapper here would make the future non-Send (and holding
-                // a std lock across await risks deadlock). Migrate to the async
-                // wrapper only after the lock scope is refactored to drop the
-                // guard before the DB call. See DANGER-ZONES B1.
-                match ogs_dbi::ogs_dbi_subscription_data(_supi) {
+                match ogs_dbi::ogs_dbi_subscription_data_async(_supi.to_string()).await {
                     Ok(sub_data) => {
                         let subscribed: Vec<(u8, Option<u32>)> = sub_data
                             .slice
@@ -560,32 +582,28 @@ async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
                 }
             }
 
-            // Also filter against NSSAI availability if TAI provided (TS 29.531 6.1.3.2.3.2)
-            if let Some(ref tai) = param.tai {
-                let supported = context.get_supported_snssai_for_tai(&context::Tai {
-                    plmn_id: tai.plmn_id.clone(),
-                    tac: tai.tac,
+            // Also filter against the NSSAI-availability snapshot taken above
+            // (TS 29.531 6.1.3.2.3.2).
+            if !supported_for_tai.is_empty() {
+                log::debug!(
+                    "Filtering against {} NSSAI availability entries for TAI",
+                    supported_for_tai.len()
+                );
+                allowed_snssai_list.retain(|item| {
+                    let sst = item
+                        .get("allowedSnssai")
+                        .and_then(|s| s.get("sst"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as u8;
+                    let sd = item
+                        .get("allowedSnssai")
+                        .and_then(|s| s.get("sd"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| u32::from_str_radix(s, 16).ok());
+                    supported_for_tai
+                        .iter()
+                        .any(|(s_sst, s_sd)| *s_sst == sst && *s_sd == sd)
                 });
-
-                if !supported.is_empty() {
-                    log::debug!(
-                        "Filtering against {} NSSAI availability entries for TAI",
-                        supported.len()
-                    );
-                    allowed_snssai_list.retain(|item| {
-                        let sst = item
-                            .get("allowedSnssai")
-                            .and_then(|s| s.get("sst"))
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as u8;
-                        let sd = item
-                            .get("allowedSnssai")
-                            .and_then(|s| s.get("sd"))
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| u32::from_str_radix(s, 16).ok());
-                        supported.iter().any(|s| s.sst == sst && s.sd == sd)
-                    });
-                }
             }
 
             let allowed_snssai_list = allowed_snssai_list;
