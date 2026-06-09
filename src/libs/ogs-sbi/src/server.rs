@@ -160,14 +160,17 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
             // OAuth2 enforcement (opt-in). Verify the bearer token against the
             // configured JWKS before dispatching to the NF handler.
             if let Some(jwks) = &oauth {
-                let auth = sbi_request.http.get_header("Authorization").map(|s| s.as_str());
+                let auth = sbi_request
+                    .http
+                    .get_header("Authorization")
+                    .map(|s| s.as_str());
                 if let Err(e) = crate::oauth::authorize_bearer(auth, jwks) {
                     let body = serde_json::json!({
                         "title": "Unauthorized", "status": 401, "detail": e.to_string()
                     })
                     .to_string();
-                    let resp = SbiResponse::with_status(401)
-                        .with_body(body, "application/problem+json");
+                    let resp =
+                        SbiResponse::with_status(401).with_body(body, "application/problem+json");
                     return Ok(convert_response(resp));
                 }
             }

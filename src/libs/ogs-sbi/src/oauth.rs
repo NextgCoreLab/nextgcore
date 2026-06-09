@@ -261,8 +261,12 @@ pub fn parse_es256_jwk(jwk: &serde_json::Value) -> SbiResult<p256::ecdsa::Verify
         .get("y")
         .and_then(|v| v.as_str())
         .ok_or_else(|| err("missing y".into()))?;
-    let x = URL_SAFE_NO_PAD.decode(x_b64).map_err(|e| err(format!("x: {e}")))?;
-    let y = URL_SAFE_NO_PAD.decode(y_b64).map_err(|e| err(format!("y: {e}")))?;
+    let x = URL_SAFE_NO_PAD
+        .decode(x_b64)
+        .map_err(|e| err(format!("x: {e}")))?;
+    let y = URL_SAFE_NO_PAD
+        .decode(y_b64)
+        .map_err(|e| err(format!("y: {e}")))?;
     if x.len() != 32 || y.len() != 32 {
         return Err(err("x/y must each be 32 bytes".into()));
     }
@@ -301,7 +305,9 @@ pub fn verify_access_token(
     let header: serde_json::Value = serde_json::from_slice(&header_bytes)
         .map_err(|e| SbiError::AuthorizationFailed(format!("Invalid JWT header JSON: {e}")))?;
     if header.get("alg").and_then(|v| v.as_str()) != Some("ES256") {
-        return Err(SbiError::AuthorizationFailed("token alg is not ES256".into()));
+        return Err(SbiError::AuthorizationFailed(
+            "token alg is not ES256".into(),
+        ));
     }
 
     let sig_bytes = URL_SAFE_NO_PAD
@@ -324,7 +330,9 @@ pub fn verify_access_token(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     if claims.exp <= now {
-        return Err(SbiError::AuthorizationFailed("access token has expired".into()));
+        return Err(SbiError::AuthorizationFailed(
+            "access token has expired".into(),
+        ));
     }
     Ok(claims)
 }
@@ -382,9 +390,7 @@ pub fn authorize_bearer(
         })
         .map(str::trim)
         .filter(|t| !t.is_empty())
-        .ok_or_else(|| {
-            SbiError::AuthorizationFailed("missing or malformed Bearer token".into())
-        })?;
+        .ok_or_else(|| SbiError::AuthorizationFailed("missing or malformed Bearer token".into()))?;
     verify_access_token_with_jwks(token, jwks)
 }
 

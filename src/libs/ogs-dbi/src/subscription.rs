@@ -320,49 +320,77 @@ pub fn ogs_dbi_subscription_data(supi: &str) -> DbiResult<OgsSubscriptionData> {
 pub async fn ogs_dbi_auth_info_async(supi: String) -> DbiResult<OgsDbiAuthInfo> {
     tokio::task::spawn_blocking(move || ogs_dbi_auth_info(&supi))
         .await
-        .unwrap_or_else(|e| Err(DbiError::ParseError(format!("spawn_blocking panicked: {e}"))))
+        .unwrap_or_else(|e| {
+            Err(DbiError::ParseError(format!(
+                "spawn_blocking panicked: {e}"
+            )))
+        })
 }
 
 /// Async, non-blocking wrapper for [`ogs_dbi_update_sqn`].
 pub async fn ogs_dbi_update_sqn_async(supi: String, sqn: u64) -> DbiResult<()> {
     tokio::task::spawn_blocking(move || ogs_dbi_update_sqn(&supi, sqn))
         .await
-        .unwrap_or_else(|e| Err(DbiError::ParseError(format!("spawn_blocking panicked: {e}"))))
+        .unwrap_or_else(|e| {
+            Err(DbiError::ParseError(format!(
+                "spawn_blocking panicked: {e}"
+            )))
+        })
 }
 
 /// Async, non-blocking wrapper for [`ogs_dbi_increment_sqn`].
 pub async fn ogs_dbi_increment_sqn_async(supi: String) -> DbiResult<()> {
     tokio::task::spawn_blocking(move || ogs_dbi_increment_sqn(&supi))
         .await
-        .unwrap_or_else(|e| Err(DbiError::ParseError(format!("spawn_blocking panicked: {e}"))))
+        .unwrap_or_else(|e| {
+            Err(DbiError::ParseError(format!(
+                "spawn_blocking panicked: {e}"
+            )))
+        })
 }
 
 /// Async, non-blocking wrapper for [`ogs_dbi_update_imeisv`].
 pub async fn ogs_dbi_update_imeisv_async(supi: String, imeisv: String) -> DbiResult<()> {
     tokio::task::spawn_blocking(move || ogs_dbi_update_imeisv(&supi, &imeisv))
         .await
-        .unwrap_or_else(|e| Err(DbiError::ParseError(format!("spawn_blocking panicked: {e}"))))
+        .unwrap_or_else(|e| {
+            Err(DbiError::ParseError(format!(
+                "spawn_blocking panicked: {e}"
+            )))
+        })
 }
 
 /// Async, non-blocking wrapper for [`ogs_dbi_subscription_data`].
 pub async fn ogs_dbi_subscription_data_async(supi: String) -> DbiResult<OgsSubscriptionData> {
     tokio::task::spawn_blocking(move || ogs_dbi_subscription_data(&supi))
         .await
-        .unwrap_or_else(|e| Err(DbiError::ParseError(format!("spawn_blocking panicked: {e}"))))
+        .unwrap_or_else(|e| {
+            Err(DbiError::ParseError(format!(
+                "spawn_blocking panicked: {e}"
+            )))
+        })
 }
 
 /// Async, non-blocking wrapper for [`ogs_dbi_subscription_data_5g`].
 pub async fn ogs_dbi_subscription_data_5g_async(supi: String) -> DbiResult<OgsSubscriptionData> {
     tokio::task::spawn_blocking(move || ogs_dbi_subscription_data_5g(&supi))
         .await
-        .unwrap_or_else(|e| Err(DbiError::ParseError(format!("spawn_blocking panicked: {e}"))))
+        .unwrap_or_else(|e| {
+            Err(DbiError::ParseError(format!(
+                "spawn_blocking panicked: {e}"
+            )))
+        })
 }
 
 /// Async, non-blocking wrapper for [`ogs_dbi_policy_subscription`].
 pub async fn ogs_dbi_policy_subscription_async(supi: String) -> DbiResult<OgsSubscriptionData> {
     tokio::task::spawn_blocking(move || ogs_dbi_policy_subscription(&supi))
         .await
-        .unwrap_or_else(|e| Err(DbiError::ParseError(format!("spawn_blocking panicked: {e}"))))
+        .unwrap_or_else(|e| {
+            Err(DbiError::ParseError(format!(
+                "spawn_blocking panicked: {e}"
+            )))
+        })
 }
 
 /// Parse AMBR from BSON document

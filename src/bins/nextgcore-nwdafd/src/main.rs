@@ -154,8 +154,7 @@ async fn main() -> Result<()> {
     // reaching for the global_context() singleton.
     let sbi_ctx = global_context();
     sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
-    if let Err(e) =
-        register_with_nrf(sbi_ctx, &args.sbi_addr, args.sbi_port, &nf_instance_id).await
+    if let Err(e) = register_with_nrf(sbi_ctx, &args.sbi_addr, args.sbi_port, &nf_instance_id).await
     {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
     } else {
