@@ -335,6 +335,9 @@ async fn nrf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             // Access Token Request: POST /nnrf-oauth2/v1/access-token
             handle_access_token_request(&request).await
         }
+        // JWKS: GET /nnrf-oauth2/v1/jwks — publishes the ES256 public key so
+        // consumers can verify access tokens (no shared secret needed).
+        ("nnrf-oauth2", "jwks", "GET") => handle_jwks(),
 
         _ => {
             log::warn!("Unknown NRF request: {method} {uri}");
@@ -757,6 +760,32 @@ async fn handle_nf_discover(request: &SbiRequest) -> SbiResponse {
 ///
 /// Implements the NRF's role as Authorization Server per 3GPP TS 29.510.
 /// Accepts client_credentials grant and issues Bearer tokens.
+/// Builds the JWK Set (RFC 7517) advertising the NRF's ES256 public key.
+fn nrf_jwks_json() -> serde_json::Value {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let point = nrf_signing_key().verifying_key().to_encoded_point(false);
+    let x = point.x().expect("P-256 public key has an x coordinate");
+    let y = point.y().expect("P-256 public key has a y coordinate");
+    serde_json::json!({
+        "keys": [{
+            "kty": "EC",
+            "crv": "P-256",
+            "use": "sig",
+            "alg": "ES256",
+            "kid": NRF_KID,
+            "x": URL_SAFE_NO_PAD.encode(x),
+            "y": URL_SAFE_NO_PAD.encode(y),
+        }]
+    })
+}
+
+/// Handles `GET /nnrf-oauth2/v1/jwks`.
+fn handle_jwks() -> SbiResponse {
+    SbiResponse::with_status(200).with_body(nrf_jwks_json().to_string(), "application/json")
+}
+
 async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
     log::info!("OAuth2 Access Token Request");
 
@@ -1085,5 +1114,37 @@ mod tests {
         assert!(args.tls);
         assert_eq!(args.tls_cert, Some("/path/to/cert.pem".to_string()));
         assert_eq!(args.tls_key, Some("/path/to/key.pem".to_string()));
+    }
+
+    #[test]
+    fn test_jwks_public_key_verifies_signed_token() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use p256::ecdsa::signature::{Signer, Verifier};
+        use p256::ecdsa::{Signature, VerifyingKey};
+        use p256::EncodedPoint;
+
+        // Sign as the token endpoint does.
+        let msg = b"header.payload";
+        let sig: Signature = nrf_signing_key().sign(msg);
+
+        // Reconstruct the public key purely from the published JWKS.
+        let jwks = nrf_jwks_json();
+        let key = &jwks["keys"][0];
+        assert_eq!(key["alg"], "ES256");
+        assert_eq!(key["kid"], NRF_KID);
+        let x = URL_SAFE_NO_PAD.decode(key["x"].as_str().unwrap()).unwrap();
+        let y = URL_SAFE_NO_PAD.decode(key["y"].as_str().unwrap()).unwrap();
+        let point = EncodedPoint::from_affine_coordinates(
+            p256::FieldBytes::from_slice(&x),
+            p256::FieldBytes::from_slice(&y),
+            false,
+        );
+        let vk = VerifyingKey::from_encoded_point(&point).expect("valid JWKS key");
+
+        // The JWKS key verifies the NRF signature — consumers can verify tokens.
+        assert!(vk.verify(msg, &sig).is_ok());
+        // A tampered signing input must fail verification.
+        assert!(vk.verify(b"header.tampered", &sig).is_err());
     }
 }
