@@ -42,6 +42,13 @@ pub struct SbiServerConfig {
     pub verify_client: bool,
     /// CA certificate for client verification
     pub verify_client_cacert: Option<String>,
+    /// Require a valid OAuth2 bearer token on incoming requests (default false).
+    /// When true, `oauth2_jwks` must hold the NRF's JWKS or all requests are
+    /// rejected.
+    pub require_oauth2: bool,
+    /// JWKS (NRF public keys) used to verify access tokens when
+    /// `require_oauth2` is enabled.
+    pub oauth2_jwks: Option<serde_json::Value>,
 }
 
 impl Default for SbiServerConfig {
@@ -54,6 +61,8 @@ impl Default for SbiServerConfig {
             cert: None,
             verify_client: false,
             verify_client_cacert: None,
+            require_oauth2: false,
+            oauth2_jwks: None,
         }
     }
 }
@@ -110,12 +119,16 @@ where
 /// Hyper service wrapper
 struct SbiService<H: SbiRequestHandler> {
     handler: Arc<H>,
+    /// When `Some`, every request must carry a valid OAuth2 bearer token
+    /// verifiable against this JWKS; otherwise it is rejected with 401.
+    oauth: Option<Arc<serde_json::Value>>,
 }
 
 impl<H: SbiRequestHandler> Clone for SbiService<H> {
     fn clone(&self) -> Self {
         Self {
             handler: self.handler.clone(),
+            oauth: self.oauth.clone(),
         }
     }
 }
@@ -127,6 +140,7 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let handler = self.handler.clone();
+        let oauth = self.oauth.clone();
         let path = req.uri().path().to_string();
 
         Box::pin(async move {
@@ -142,6 +156,21 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
 
             // Convert hyper request to SbiRequest
             let sbi_request = convert_request(req).await;
+
+            // OAuth2 enforcement (opt-in). Verify the bearer token against the
+            // configured JWKS before dispatching to the NF handler.
+            if let Some(jwks) = &oauth {
+                let auth = sbi_request.http.get_header("Authorization").map(|s| s.as_str());
+                if let Err(e) = crate::oauth::authorize_bearer(auth, jwks) {
+                    let body = serde_json::json!({
+                        "title": "Unauthorized", "status": 401, "detail": e.to_string()
+                    })
+                    .to_string();
+                    let resp = SbiResponse::with_status(401)
+                        .with_body(body, "application/problem+json");
+                    return Ok(convert_response(resp));
+                }
+            }
 
             // Call the handler
             let sbi_response = handler.handle(sbi_request).await;
@@ -303,6 +332,14 @@ impl SbiServer {
 
         let handler = Arc::new(handler);
 
+        // Resolve the OAuth2 verification material once: Some(jwks) enables
+        // per-request bearer verification, None leaves the server open.
+        let oauth: Option<Arc<serde_json::Value>> = if self.config.require_oauth2 {
+            self.config.oauth2_jwks.clone().map(Arc::new)
+        } else {
+            None
+        };
+
         // Spawn the server task
         tokio::spawn(async move {
             loop {
@@ -312,6 +349,7 @@ impl SbiServer {
                             Ok((stream, _)) => {
                                 let service = SbiService {
                                     handler: handler.clone(),
+                                    oauth: oauth.clone(),
                                 };
 
                                 if let Some(ref acceptor) = tls_acceptor {

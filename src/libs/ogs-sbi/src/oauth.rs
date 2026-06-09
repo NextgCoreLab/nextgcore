@@ -368,6 +368,26 @@ pub fn verify_access_token_with_jwks(
     verify_access_token(token, &key)
 }
 
+/// Extracts the bearer token from an `Authorization` header value and verifies
+/// it against the JWKS. A missing or non-`Bearer` header is an authorization
+/// failure. Used by the SBI server to enforce OAuth2 on incoming requests.
+pub fn authorize_bearer(
+    auth_header: Option<&str>,
+    jwks: &serde_json::Value,
+) -> SbiResult<AccessTokenClaims> {
+    let token = auth_header
+        .and_then(|h| {
+            h.strip_prefix("Bearer ")
+                .or_else(|| h.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| {
+            SbiError::AuthorizationFailed("missing or malformed Bearer token".into())
+        })?;
+    verify_access_token_with_jwks(token, jwks)
+}
+
 // ============================================================================
 // OAuth2 Client (W1.23: Token exchange with NRF)
 // ============================================================================
@@ -822,5 +842,21 @@ mod tests {
         let token = build_es256_token(&sk, "nrf-es256", 1); // exp in 1970
         let err = verify_access_token_with_jwks(&token, &jwks_for(&sk, "nrf-es256")).unwrap_err();
         assert!(format!("{err:?}").contains("expired"));
+    }
+
+    #[test]
+    fn test_authorize_bearer_header() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let token = build_es256_token(&sk, "nrf-es256", future_exp());
+        let jwks = jwks_for(&sk, "nrf-es256");
+
+        // Valid "Bearer <token>" authorizes.
+        let header = format!("Bearer {token}");
+        assert!(authorize_bearer(Some(&header), &jwks).is_ok());
+
+        // Missing header, non-bearer scheme, and a bad token are all rejected.
+        assert!(authorize_bearer(None, &jwks).is_err());
+        assert!(authorize_bearer(Some("Basic abc"), &jwks).is_err());
+        assert!(authorize_bearer(Some("Bearer not.a.jwt"), &jwks).is_err());
     }
 }
