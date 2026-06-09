@@ -29,6 +29,7 @@ rustls-pemfile.workspace = true
 webpki-roots.workspace = true
 base64.workspace = true
 hex.workspace = true
+p256 = { workspace = true, features = ["ecdsa"] }
 
 [dev-dependencies]
 proptest.workspace = true

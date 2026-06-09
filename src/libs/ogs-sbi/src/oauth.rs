@@ -199,9 +199,10 @@ pub fn validate_token_response(response: &AccessTokenResponse) -> SbiResult<()> 
     Ok(())
 }
 
-/// Decode and validate the three-part structure of a JWT access token.
+/// Decode the three-part structure of a JWT access token.
 /// Returns (header, payload, signature) as raw bytes.
-/// This does NOT verify the cryptographic signature; it only checks structure.
+/// This only checks structure — call [`verify_access_token`] (or
+/// [`verify_access_token_with_jwks`]) to cryptographically verify the signature.
 pub fn decode_jwt_parts(token: &str) -> SbiResult<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
@@ -239,6 +240,132 @@ pub struct AccessTokenClaims {
     pub scope: String,
     /// Expiration time (seconds since epoch)
     pub exp: u64,
+}
+
+/// Parses a single ES256 JWK (`kty=EC, crv=P-256`) into a P-256 verifying key.
+pub fn parse_es256_jwk(jwk: &serde_json::Value) -> SbiResult<p256::ecdsa::VerifyingKey> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let err = |m: String| SbiError::AuthorizationFailed(format!("Invalid ES256 JWK: {m}"));
+    if jwk.get("kty").and_then(|v| v.as_str()) != Some("EC")
+        || jwk.get("crv").and_then(|v| v.as_str()) != Some("P-256")
+    {
+        return Err(err("expected kty=EC, crv=P-256".into()));
+    }
+    let x_b64 = jwk
+        .get("x")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| err("missing x".into()))?;
+    let y_b64 = jwk
+        .get("y")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| err("missing y".into()))?;
+    let x = URL_SAFE_NO_PAD.decode(x_b64).map_err(|e| err(format!("x: {e}")))?;
+    let y = URL_SAFE_NO_PAD.decode(y_b64).map_err(|e| err(format!("y: {e}")))?;
+    if x.len() != 32 || y.len() != 32 {
+        return Err(err("x/y must each be 32 bytes".into()));
+    }
+    let point = p256::EncodedPoint::from_affine_coordinates(
+        p256::FieldBytes::from_slice(&x),
+        p256::FieldBytes::from_slice(&y),
+        false,
+    );
+    p256::ecdsa::VerifyingKey::from_encoded_point(&point)
+        .map_err(|e| err(format!("not a valid public key: {e}")))
+}
+
+/// Verifies an ES256 access token against a public key and returns its claims.
+///
+/// Checks: `alg=ES256`, the ECDSA signature over `header.payload`, and that the
+/// token has not expired (`exp`). This is the verification that was previously
+/// missing — [`decode_jwt_parts`] only checks structure.
+pub fn verify_access_token(
+    token: &str,
+    key: &p256::ecdsa::VerifyingKey,
+) -> SbiResult<AccessTokenClaims> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use p256::ecdsa::signature::Verifier;
+
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(SbiError::AuthorizationFailed(
+            "Access token is not a valid JWT".into(),
+        ));
+    }
+
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .map_err(|e| SbiError::AuthorizationFailed(format!("Invalid JWT header: {e}")))?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|e| SbiError::AuthorizationFailed(format!("Invalid JWT header JSON: {e}")))?;
+    if header.get("alg").and_then(|v| v.as_str()) != Some("ES256") {
+        return Err(SbiError::AuthorizationFailed("token alg is not ES256".into()));
+    }
+
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(parts[2])
+        .map_err(|e| SbiError::AuthorizationFailed(format!("Invalid JWT signature: {e}")))?;
+    let signature = p256::ecdsa::Signature::from_slice(&sig_bytes)
+        .map_err(|e| SbiError::AuthorizationFailed(format!("Malformed ES256 signature: {e}")))?;
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    key.verify(signing_input.as_bytes(), &signature)
+        .map_err(|_| SbiError::AuthorizationFailed("token signature verification failed".into()))?;
+
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|e| SbiError::AuthorizationFailed(format!("Invalid JWT payload: {e}")))?;
+    let claims: AccessTokenClaims = serde_json::from_slice(&payload_bytes)
+        .map_err(|e| SbiError::AuthorizationFailed(format!("Invalid token claims: {e}")))?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if claims.exp <= now {
+        return Err(SbiError::AuthorizationFailed("access token has expired".into()));
+    }
+    Ok(claims)
+}
+
+/// Verifies an access token against a JWKS document (as published by the NRF at
+/// `/nnrf-oauth2/v1/jwks`), selecting the key by the token header's `kid` (or
+/// the sole key when the header carries no `kid`).
+pub fn verify_access_token_with_jwks(
+    token: &str,
+    jwks: &serde_json::Value,
+) -> SbiResult<AccessTokenClaims> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(SbiError::AuthorizationFailed(
+            "Access token is not a valid JWT".into(),
+        ));
+    }
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .map_err(|e| SbiError::AuthorizationFailed(format!("Invalid JWT header: {e}")))?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|e| SbiError::AuthorizationFailed(format!("Invalid JWT header JSON: {e}")))?;
+    let want_kid = header.get("kid").and_then(|v| v.as_str());
+
+    let keys = jwks
+        .get("keys")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| SbiError::AuthorizationFailed("JWKS has no 'keys' array".into()))?;
+    let jwk = keys
+        .iter()
+        .find(|k| match want_kid {
+            Some(kid) => k.get("kid").and_then(|v| v.as_str()) == Some(kid),
+            None => true,
+        })
+        .ok_or_else(|| SbiError::AuthorizationFailed("no JWKS key matches token kid".into()))?;
+
+    let key = parse_es256_jwk(jwk)?;
+    verify_access_token(token, &key)
 }
 
 // ============================================================================
@@ -620,5 +747,80 @@ mod tests {
     fn test_oauth2_client_creation() {
         let client = OAuth2Client::new("http://127.0.0.10:7777", "amf-instance-001", NfType::Amf);
         assert_eq!(client.nrf_uri(), "http://127.0.0.10:7777");
+    }
+
+    // --- ES256 access-token verification (NRF auth stage 3) ---
+
+    fn build_es256_token(sk: &p256::ecdsa::SigningKey, kid: &str, exp: u64) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use p256::ecdsa::{signature::Signer, Signature};
+
+        let header = format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{kid}"}}"#);
+        let claims = serde_json::json!({
+            "iss": "NRF", "sub": "amf-1", "aud": "UDM", "scope": "nudm-sdm", "exp": exp, "iat": 0
+        })
+        .to_string();
+        let h = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let p = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        let sig: Signature = sk.sign(format!("{h}.{p}").as_bytes());
+        let s = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        format!("{h}.{p}.{s}")
+    }
+
+    fn jwks_for(sk: &p256::ecdsa::SigningKey, kid: &str) -> serde_json::Value {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let point = sk.verifying_key().to_encoded_point(false);
+        serde_json::json!({"keys":[{
+            "kty":"EC","crv":"P-256","use":"sig","alg":"ES256","kid":kid,
+            "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+            "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+        }]})
+    }
+
+    fn future_exp() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600
+    }
+
+    #[test]
+    fn test_verify_valid_token_against_jwks() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let token = build_es256_token(&sk, "nrf-es256", future_exp());
+        let claims = verify_access_token_with_jwks(&token, &jwks_for(&sk, "nrf-es256"))
+            .expect("valid token verifies");
+        assert_eq!(claims.iss, "NRF");
+        assert_eq!(claims.scope, "nudm-sdm");
+    }
+
+    #[test]
+    fn test_verify_rejects_tampered_token() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let token = build_es256_token(&sk, "nrf-es256", future_exp());
+        let jwks = jwks_for(&sk, "nrf-es256");
+        let mut parts: Vec<&str> = token.split('.').collect();
+        let tampered_payload = format!("{}x", parts[1]);
+        parts[1] = tampered_payload.as_str();
+        assert!(verify_access_token_with_jwks(&parts.join("."), &jwks).is_err());
+    }
+
+    #[test]
+    fn test_verify_rejects_wrong_key() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let other = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let token = build_es256_token(&sk, "nrf-es256", future_exp());
+        assert!(verify_access_token_with_jwks(&token, &jwks_for(&other, "nrf-es256")).is_err());
+    }
+
+    #[test]
+    fn test_verify_rejects_expired_token() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let token = build_es256_token(&sk, "nrf-es256", 1); // exp in 1970
+        let err = verify_access_token_with_jwks(&token, &jwks_for(&sk, "nrf-es256")).unwrap_err();
+        assert!(format!("{err:?}").contains("expired"));
     }
 }

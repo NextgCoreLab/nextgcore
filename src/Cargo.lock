@@ -2875,6 +2875,7 @@ dependencies = [
  "hyper-util",
  "log",
  "ogs-core",
+ "p256",
  "proptest",
  "rustls 0.23.36",
  "rustls-pemfile 2.2.0",
