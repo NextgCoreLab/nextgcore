@@ -107,6 +107,8 @@ struct SmfConfig {
     max_ue: usize,
     max_sess: usize,
     max_bearer: usize,
+    /// NRF URI parsed from `smf.sbi.client.nrf[0].uri` (if present).
+    nrf_uri: Option<String>,
 }
 
 impl Default for SmfConfig {
@@ -117,6 +119,7 @@ impl Default for SmfConfig {
             max_ue: 1024,
             max_sess: 4096,
             max_bearer: 8192,
+            nrf_uri: None,
         }
     }
 }
@@ -149,6 +152,15 @@ fn load_config(path: &str) -> SmfConfig {
                     }
                     if let Some(port) = first.port {
                         config.sbi_port = port;
+                    }
+                }
+            }
+            // Extract the NRF URI here so main() doesn't re-read and re-parse
+            // the same file just to seed it.
+            if let Some(client) = sbi.client {
+                if let Some(nrf_list) = client.nrf {
+                    if let Some(nrf) = nrf_list.into_iter().next() {
+                        config.nrf_uri = nrf.uri;
                     }
                 }
             }
@@ -203,24 +215,10 @@ async fn main() -> Result<()> {
         config.sbi_port
     );
 
-    // Seed NRF URI into SBI context for NF registration
-    if let Ok(content) = std::fs::read_to_string(&config_path) {
-        if let Ok(yaml) = serde_yaml::from_str::<SmfYaml>(&content) {
-            if let Some(smf) = yaml.smf {
-                if let Some(sbi) = smf.sbi {
-                    if let Some(client) = sbi.client {
-                        if let Some(nrf_list) = client.nrf {
-                            if let Some(nrf) = nrf_list.first() {
-                                if let Some(ref uri) = nrf.uri {
-                                    log::info!("NRF URI configured: {uri}");
-                                    global_context().set_nrf_uri(uri).await;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    // Seed NRF URI into SBI context for NF registration (parsed once in load_config).
+    if let Some(ref uri) = config.nrf_uri {
+        log::info!("NRF URI configured: {uri}");
+        global_context().set_nrf_uri(uri).await;
     }
 
     // Initialize SMF context
@@ -1698,5 +1696,25 @@ mod tests {
         let config = SmfConfig::default();
         assert_eq!(config.sbi_port, 7777);
         assert_eq!(config.max_ue, 1024);
+        assert!(config.nrf_uri.is_none());
+    }
+
+    #[test]
+    fn test_load_config_extracts_sbi_and_nrf_in_one_parse() {
+        use std::io::Write;
+        let yaml = "smf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        \
+                    port: 8888\n    client:\n      nrf:\n        - uri: http://nrf.example:7777\n";
+        let path = std::env::temp_dir().join(format!("smf-cfg-test-{}.yaml", std::process::id()));
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(yaml.as_bytes()))
+            .expect("write temp config");
+
+        let config = load_config(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(config.sbi_addr, "127.0.0.1");
+        assert_eq!(config.sbi_port, 8888);
+        // NRF URI now comes from the single load_config parse (no second read).
+        assert_eq!(config.nrf_uri.as_deref(), Some("http://nrf.example:7777"));
     }
 }
