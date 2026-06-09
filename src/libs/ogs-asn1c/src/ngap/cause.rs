@@ -76,7 +76,7 @@ impl AperDecode for CauseRadioNetwork {
     fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
         let value = decoder.decode_enumerated(&Self::CONSTRAINT)?;
         // For simplicity, we handle known values; unknown extension values return error
-        if value <= 46 {
+        if (0..=46).contains(&value) {
             // Safe because we've validated the range
             Ok(unsafe { std::mem::transmute(value as u8) })
         } else {
@@ -185,7 +185,7 @@ impl AperEncode for CauseProtocol {
 impl AperDecode for CauseProtocol {
     fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
         let value = decoder.decode_enumerated(&Self::CONSTRAINT)?;
-        if value <= 6 {
+        if (0..=6).contains(&value) {
             Ok(unsafe { std::mem::transmute(value as u8) })
         } else {
             Err(PerError::DecodeError(format!(
@@ -221,7 +221,7 @@ impl AperEncode for CauseMisc {
 impl AperDecode for CauseMisc {
     fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
         let value = decoder.decode_enumerated(&Self::CONSTRAINT)?;
-        if value <= 5 {
+        if (0..=5).contains(&value) {
             Ok(unsafe { std::mem::transmute(value as u8) })
         } else {
             Err(PerError::DecodeError(format!(

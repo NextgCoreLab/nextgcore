@@ -72,7 +72,7 @@ impl AperEncode for CauseRadioNetwork {
 impl AperDecode for CauseRadioNetwork {
     fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
         let value = decoder.decode_enumerated(&Self::CONSTRAINT)?;
-        if value <= 43 {
+        if (0..=43).contains(&value) {
             Ok(unsafe { std::mem::transmute(value as u8) })
         } else {
             Err(PerError::DecodeError(format!(
@@ -182,7 +182,7 @@ impl AperEncode for CauseProtocol {
 impl AperDecode for CauseProtocol {
     fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
         let value = decoder.decode_enumerated(&Self::CONSTRAINT)?;
-        if value <= 6 {
+        if (0..=6).contains(&value) {
             Ok(unsafe { std::mem::transmute(value as u8) })
         } else {
             Err(PerError::DecodeError(format!(
@@ -218,7 +218,7 @@ impl AperEncode for CauseMisc {
 impl AperDecode for CauseMisc {
     fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
         let value = decoder.decode_enumerated(&Self::CONSTRAINT)?;
-        if value <= 5 {
+        if (0..=5).contains(&value) {
             Ok(unsafe { std::mem::transmute(value as u8) })
         } else {
             Err(PerError::DecodeError(format!(
