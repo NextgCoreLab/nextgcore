@@ -1,0 +1,39 @@
+# UDR (Unified Data Repository) Configuration — OAuth2 enforcement variant
+# Same as udr.yaml but with SBI OAuth2 bearer-token enforcement enabled.
+# Used via docker-compose.oauth2.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.oauth2.yml up -d
+#
+# With oauth2.require true, every incoming SBI request must carry a Bearer
+# token issued by the NRF (POST /nnrf-oauth2/v1/access-token); the UDR
+# verifies it against the NRF's JWKS (GET /nnrf-oauth2/v1/jwks).
+# NOTE: NF consumers do not attach tokens yet, so this variant is for
+# validating enforcement, not for the default E2E data-plane deployment.
+
+db_uri: mongodb://172.23.0.2/nextgcore
+
+logger:
+  file:
+    path: /var/log/nextgcore/udr.log
+  level: info
+
+global:
+  max:
+    ue: 1024
+    peer: 64
+
+udr:
+  sbi:
+    server:
+      - address: 172.23.0.20
+        port: 7777
+    oauth2:
+      require: true
+    client:
+      nrf:
+        - uri: http://172.23.0.10:7777
+    tls:
+      enabled: false
+      cert: /etc/nextgcore/certs/udr.crt
+      key: /etc/nextgcore/certs/udr.key
+      ca: /etc/nextgcore/certs/ca.crt
+      min_version: "1.2"

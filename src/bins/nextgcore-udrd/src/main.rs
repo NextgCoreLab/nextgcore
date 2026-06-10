@@ -13,6 +13,7 @@ use nextgcore_udrd::{
     udr_context_final, udr_context_init, udr_sbi_close, udr_sbi_open, SbiServerConfig, UdrSmContext,
 };
 use ogs_sbi::message::{SbiRequest, SbiResponse};
+use ogs_sbi::oauth::JwksCache;
 use ogs_sbi::server::{
     send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
     SbiServerConfig as OgsSbiServerConfig,
@@ -85,8 +86,16 @@ struct SbiClientYaml {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct SbiOauth2Yaml {
+    /// Require a valid OAuth2 bearer token on every incoming SBI request.
+    /// Verification keys are fetched from the configured NRF's JWKS endpoint.
+    require: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct SbiYaml {
     client: Option<SbiClientYaml>,
+    oauth2: Option<SbiOauth2Yaml>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -149,24 +158,28 @@ async fn main() -> Result<()> {
         log::warn!("No db_uri configured, UDR will return hardcoded test data");
     }
 
-    // Seed NRF URI into SBI context for NF registration
+    // Seed NRF URI into SBI context for NF registration, and pick up the
+    // OAuth2 enforcement knob (udr.sbi.oauth2.require).
+    let mut nrf_uri_cfg: Option<String> = None;
+    let mut require_oauth2 = false;
     if let Ok(content) = std::fs::read_to_string(&args.config) {
         if let Ok(yaml) = serde_yaml::from_str::<UdrYaml>(&content) {
-            if let Some(udr) = yaml.udr {
-                if let Some(sbi) = udr.sbi {
-                    if let Some(client) = sbi.client {
-                        if let Some(nrf_list) = client.nrf {
-                            if let Some(nrf) = nrf_list.first() {
-                                log::info!("NRF URI configured: {}", nrf.uri);
-                                ogs_sbi::context::global_context()
-                                    .set_nrf_uri(&nrf.uri)
-                                    .await;
-                            }
-                        }
-                    }
-                }
+            if let Some(sbi) = yaml.udr.and_then(|udr| udr.sbi) {
+                nrf_uri_cfg = sbi
+                    .client
+                    .and_then(|client| client.nrf)
+                    .and_then(|nrf_list| nrf_list.into_iter().next())
+                    .map(|nrf| nrf.uri);
+                require_oauth2 = sbi
+                    .oauth2
+                    .and_then(|oauth2| oauth2.require)
+                    .unwrap_or(false);
             }
         }
+    }
+    if let Some(uri) = &nrf_uri_cfg {
+        log::info!("NRF URI configured: {uri}");
+        ogs_sbi::context::global_context().set_nrf_uri(uri).await;
     }
 
     // Build SBI server configuration (legacy, for context)
@@ -185,7 +198,23 @@ async fn main() -> Result<()> {
     let sbi_addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
         .parse()
         .context("Invalid SBI address")?;
-    let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
+    let mut sbi_server_config = OgsSbiServerConfig::new(sbi_addr);
+    if require_oauth2 {
+        // Verify bearer tokens against the NRF's published keys (auth stage
+        // 4b). With no NRF URI configured the server fails closed.
+        sbi_server_config.require_oauth2 = true;
+        sbi_server_config.oauth2_jwks_uri = nrf_uri_cfg
+            .as_deref()
+            .map(|uri| JwksCache::for_nrf(uri).jwks_uri().to_string());
+        log::info!(
+            "OAuth2 enforcement enabled (JWKS: {})",
+            sbi_server_config
+                .oauth2_jwks_uri
+                .as_deref()
+                .unwrap_or("UNCONFIGURED")
+        );
+    }
+    let sbi_server = SbiServer::new(sbi_server_config);
 
     sbi_server
         .start(udr_sbi_request_handler)
@@ -1151,6 +1180,40 @@ fn parse_nrf_host_port(uri: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_udr_yaml_oauth2_knob() {
+        let yaml = r#"
+udr:
+  sbi:
+    server:
+      - address: 127.0.0.1
+        port: 7777
+    oauth2:
+      require: true
+    client:
+      nrf:
+        - uri: http://nrf:7777
+"#;
+        let parsed: UdrYaml = serde_yaml::from_str(yaml).unwrap();
+        let sbi = parsed.udr.unwrap().sbi.unwrap();
+        assert_eq!(sbi.oauth2.unwrap().require, Some(true));
+        assert_eq!(sbi.client.unwrap().nrf.unwrap()[0].uri, "http://nrf:7777");
+    }
+
+    #[test]
+    fn test_udr_yaml_oauth2_defaults_off() {
+        let yaml = r#"
+udr:
+  sbi:
+    client:
+      nrf:
+        - uri: http://nrf:7777
+"#;
+        let parsed: UdrYaml = serde_yaml::from_str(yaml).unwrap();
+        let sbi = parsed.udr.unwrap().sbi.unwrap();
+        assert!(sbi.oauth2.is_none());
+    }
 
     #[test]
     fn test_args_default() {

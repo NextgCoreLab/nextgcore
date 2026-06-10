@@ -337,6 +337,10 @@ pub fn verify_access_token(
     Ok(claims)
 }
 
+/// Error detail emitted when a token's `kid` has no match in the JWKS.
+/// [`JwksCache::authorize`] keys its refresh-on-rotation retry off this text.
+const KID_MISMATCH_MSG: &str = "no JWKS key matches token kid";
+
 /// Verifies an access token against a JWKS document (as published by the NRF at
 /// `/nnrf-oauth2/v1/jwks`), selecting the key by the token header's `kid` (or
 /// the sole key when the header carries no `kid`).
@@ -370,7 +374,7 @@ pub fn verify_access_token_with_jwks(
             Some(kid) => k.get("kid").and_then(|v| v.as_str()) == Some(kid),
             None => true,
         })
-        .ok_or_else(|| SbiError::AuthorizationFailed("no JWKS key matches token kid".into()))?;
+        .ok_or_else(|| SbiError::AuthorizationFailed(KID_MISMATCH_MSG.into()))?;
 
     let key = parse_es256_jwk(jwk)?;
     verify_access_token(token, &key)
@@ -574,6 +578,164 @@ fn url_encode(s: &str) -> String {
         }
     }
     result
+}
+
+// ============================================================================
+// JWKS client (auth stage 4b): fetch + cache the NRF's public keys
+// ============================================================================
+
+/// Fetches and caches the NRF's JWKS so an SBI server can verify access
+/// tokens without a key provisioned at startup.
+///
+/// The document is fetched lazily on first use and reused until `ttl`
+/// expires. When a token carries a `kid` that is not in the cached document
+/// (NRF key rotation or restart), [`JwksCache::authorize`] re-fetches once
+/// before rejecting. Like [`OAuth2Client`], the fetch speaks cleartext
+/// HTTP/2 (h2c prior knowledge); `https` JWKS URIs are not supported yet.
+pub struct JwksCache {
+    /// Full JWKS URI, e.g. `http://nrf:7777/nnrf-oauth2/v1/jwks`.
+    jwks_uri: String,
+    /// Cached document and the instant it was fetched.
+    cached: RwLock<Option<(serde_json::Value, Instant)>>,
+    /// How long a fetched document is reused before re-fetching.
+    ttl: Duration,
+}
+
+impl JwksCache {
+    /// Default reuse window for a fetched JWKS document.
+    pub const DEFAULT_TTL: Duration = Duration::from_secs(300);
+    /// Path of the NRF's JWKS endpoint (3GPP-adjacent; see nrfd).
+    pub const NRF_JWKS_PATH: &'static str = "/nnrf-oauth2/v1/jwks";
+
+    /// Create a cache for an explicit JWKS URI.
+    pub fn new(jwks_uri: impl Into<String>) -> Self {
+        Self {
+            jwks_uri: jwks_uri.into(),
+            cached: RwLock::new(None),
+            ttl: Self::DEFAULT_TTL,
+        }
+    }
+
+    /// Create a cache pointing at the NRF's JWKS endpoint.
+    pub fn for_nrf(nrf_uri: &str) -> Self {
+        Self::new(format!(
+            "{}{}",
+            nrf_uri.trim_end_matches('/'),
+            Self::NRF_JWKS_PATH
+        ))
+    }
+
+    /// Override the cache TTL.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
+    /// The JWKS URI this cache fetches from.
+    pub fn jwks_uri(&self) -> &str {
+        &self.jwks_uri
+    }
+
+    /// Return the cached document, fetching it if absent or expired.
+    pub async fn get(&self) -> SbiResult<serde_json::Value> {
+        if let Some((doc, fetched_at)) = self.cached.read().await.as_ref() {
+            if fetched_at.elapsed() < self.ttl {
+                return Ok(doc.clone());
+            }
+        }
+        self.refresh().await
+    }
+
+    /// Force a re-fetch, replacing the cached document on success.
+    pub async fn refresh(&self) -> SbiResult<serde_json::Value> {
+        let doc = fetch_jwks(&self.jwks_uri).await?;
+        *self.cached.write().await = Some((doc.clone(), Instant::now()));
+        Ok(doc)
+    }
+
+    /// Seed the cache without fetching (static provisioning / tests).
+    pub async fn seed(&self, jwks: serde_json::Value) {
+        *self.cached.write().await = Some((jwks, Instant::now()));
+    }
+
+    /// Verify an `Authorization` header against the cached JWKS.
+    ///
+    /// On a `kid` miss the document is re-fetched once and verification
+    /// retried, so a rotated NRF key does not lock out fresh tokens for a
+    /// full TTL. Fetch failures surface as non-`AuthorizationFailed` errors
+    /// so callers can distinguish "bad token" (401) from "keys unavailable"
+    /// (503).
+    pub async fn authorize(&self, auth_header: Option<&str>) -> SbiResult<AccessTokenClaims> {
+        let jwks = self.get().await?;
+        match authorize_bearer(auth_header, &jwks) {
+            Err(SbiError::AuthorizationFailed(msg)) if msg == KID_MISMATCH_MSG => {
+                let fresh = self.refresh().await?;
+                authorize_bearer(auth_header, &fresh)
+            }
+            other => other,
+        }
+    }
+}
+
+/// Fetch a JWKS document over cleartext HTTP/2 and validate its shape.
+pub async fn fetch_jwks(jwks_uri: &str) -> SbiResult<serde_json::Value> {
+    let addr = parse_uri_to_addr(jwks_uri)?;
+
+    let stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    .map_err(|_| SbiError::Timeout)?
+    .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
+
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
+            .await
+            .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
+
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            log::error!("JWKS HTTP/2 connection error: {e}");
+        }
+    });
+
+    let http_request = hyper::Request::builder()
+        .method(hyper::Method::GET)
+        .uri(jwks_uri)
+        .body(http_body_util::Full::new(bytes::Bytes::new()))
+        .map_err(|e| SbiError::ClientError(e.to_string()))?;
+
+    let response = tokio::time::timeout(Duration::from_secs(10), sender.send_request(http_request))
+        .await
+        .map_err(|_| SbiError::Timeout)?
+        .map_err(|e| SbiError::HyperError(e.to_string()))?;
+
+    let status = response.status().as_u16();
+    let body_bytes = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .map_err(|e| SbiError::InvalidResponse(e.to_string()))?
+        .to_bytes();
+
+    if status != 200 {
+        return Err(SbiError::HttpError {
+            status,
+            message: format!(
+                "JWKS fetch failed: {}",
+                String::from_utf8_lossy(&body_bytes)
+            ),
+        });
+    }
+
+    let doc: serde_json::Value = serde_json::from_slice(&body_bytes)
+        .map_err(|e| SbiError::InvalidResponse(format!("Invalid JWKS JSON: {e}")))?;
+    if doc.get("keys").and_then(|k| k.as_array()).is_none() {
+        return Err(SbiError::InvalidResponse(
+            "JWKS document has no 'keys' array".into(),
+        ));
+    }
+    Ok(doc)
 }
 
 #[cfg(test)]
@@ -864,5 +1026,120 @@ mod tests {
         assert!(authorize_bearer(None, &jwks).is_err());
         assert!(authorize_bearer(Some("Basic abc"), &jwks).is_err());
         assert!(authorize_bearer(Some("Bearer not.a.jwt"), &jwks).is_err());
+    }
+
+    // --- JWKS fetch + cache (NRF auth stage 4b) ---
+
+    /// Serve `jwks` on every request over cleartext HTTP/2 from an ephemeral
+    /// local port.
+    async fn serve_jwks(jwks: serde_json::Value) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = jwks.to_string();
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let svc = hyper::service::service_fn(move |_req| {
+                        let body = body.clone();
+                        async move {
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                                http_body_util::Full::new(bytes::Bytes::from(body)),
+                            ))
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc)
+                    .await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn test_jwks_cache_uri_construction() {
+        assert_eq!(
+            JwksCache::for_nrf("http://nrf:7777").jwks_uri(),
+            "http://nrf:7777/nnrf-oauth2/v1/jwks"
+        );
+        assert_eq!(
+            JwksCache::for_nrf("http://nrf:7777/").jwks_uri(),
+            "http://nrf:7777/nnrf-oauth2/v1/jwks"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_jwks_cache_seeded_authorize() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let cache = JwksCache::new("http://127.0.0.1:1/unused");
+        cache.seed(jwks_for(&sk, "nrf-es256")).await;
+
+        let token = build_es256_token(&sk, "nrf-es256", future_exp());
+        let header = format!("Bearer {token}");
+        assert!(cache.authorize(Some(&header)).await.is_ok());
+        assert!(matches!(
+            cache.authorize(Some("Bearer not.a.jwt")).await,
+            Err(SbiError::AuthorizationFailed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_jwks_live() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let addr = serve_jwks(jwks_for(&sk, "nrf-es256")).await;
+        let doc = fetch_jwks(&format!("http://{addr}/nnrf-oauth2/v1/jwks"))
+            .await
+            .expect("live JWKS fetch succeeds");
+        assert_eq!(doc["keys"][0]["kid"], "nrf-es256");
+    }
+
+    #[tokio::test]
+    async fn test_jwks_cache_lazy_fetch_and_authorize() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let addr = serve_jwks(jwks_for(&sk, "nrf-es256")).await;
+        let cache = JwksCache::new(format!("http://{addr}/nnrf-oauth2/v1/jwks"));
+
+        let token = build_es256_token(&sk, "nrf-es256", future_exp());
+        let header = format!("Bearer {token}");
+        let claims = cache
+            .authorize(Some(&header))
+            .await
+            .expect("lazy fetch + verify succeeds");
+        assert_eq!(claims.iss, "NRF");
+    }
+
+    #[tokio::test]
+    async fn test_jwks_cache_refreshes_on_kid_rotation() {
+        // The NRF rotated its key: the cache holds the old document, the
+        // server publishes the new one, and a fresh token uses the new kid.
+        let old_sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let new_sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let addr = serve_jwks(jwks_for(&new_sk, "nrf-es256-v2")).await;
+
+        let cache = JwksCache::new(format!("http://{addr}/nnrf-oauth2/v1/jwks"));
+        cache.seed(jwks_for(&old_sk, "nrf-es256-v1")).await;
+
+        let token = build_es256_token(&new_sk, "nrf-es256-v2", future_exp());
+        let header = format!("Bearer {token}");
+        let claims = cache
+            .authorize(Some(&header))
+            .await
+            .expect("kid miss triggers refresh and the new key verifies");
+        assert_eq!(claims.iss, "NRF");
+    }
+
+    #[tokio::test]
+    async fn test_jwks_fetch_failure_is_not_authorization_failed() {
+        // Nothing listens on the target: the error must be a transport
+        // error, not AuthorizationFailed, so servers can answer 503 not 401.
+        let cache = JwksCache::new("http://127.0.0.1:1/nnrf-oauth2/v1/jwks");
+        let err = cache.authorize(Some("Bearer a.b.c")).await.unwrap_err();
+        assert!(!matches!(err, SbiError::AuthorizationFailed(_)));
     }
 }

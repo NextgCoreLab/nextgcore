@@ -43,12 +43,17 @@ pub struct SbiServerConfig {
     /// CA certificate for client verification
     pub verify_client_cacert: Option<String>,
     /// Require a valid OAuth2 bearer token on incoming requests (default false).
-    /// When true, `oauth2_jwks` must hold the NRF's JWKS or all requests are
-    /// rejected.
+    /// When true, verification keys come from `oauth2_jwks` (static) or
+    /// `oauth2_jwks_uri` (fetched live); with neither configured the server
+    /// fails closed and rejects every request with 503.
     pub require_oauth2: bool,
     /// JWKS (NRF public keys) used to verify access tokens when
-    /// `require_oauth2` is enabled.
+    /// `require_oauth2` is enabled. Takes precedence over `oauth2_jwks_uri`.
     pub oauth2_jwks: Option<serde_json::Value>,
+    /// URI of the NRF's JWKS endpoint (`http://<nrf>/nnrf-oauth2/v1/jwks`).
+    /// When `require_oauth2` is enabled and `oauth2_jwks` is unset, keys are
+    /// fetched from here on first use and cached (see [`JwksCache`]).
+    pub oauth2_jwks_uri: Option<String>,
 }
 
 impl Default for SbiServerConfig {
@@ -63,6 +68,7 @@ impl Default for SbiServerConfig {
             verify_client_cacert: None,
             require_oauth2: false,
             oauth2_jwks: None,
+            oauth2_jwks_uri: None,
         }
     }
 }
@@ -116,12 +122,55 @@ where
     }
 }
 
+/// Where the server gets OAuth2 verification keys when `require_oauth2` is
+/// enabled.
+enum OAuthVerifier {
+    /// A JWKS document provisioned in the server config.
+    Static(serde_json::Value),
+    /// Keys fetched live from the NRF's JWKS endpoint and cached.
+    Remote(crate::oauth::JwksCache),
+    /// `require_oauth2` is set but no JWKS or JWKS URI was configured:
+    /// fail closed, rejecting every request.
+    Unconfigured,
+}
+
+impl OAuthVerifier {
+    /// Resolve the verification source from the server config, or `None`
+    /// when OAuth2 enforcement is disabled.
+    fn from_config(config: &SbiServerConfig) -> Option<Self> {
+        if !config.require_oauth2 {
+            return None;
+        }
+        Some(match (&config.oauth2_jwks, &config.oauth2_jwks_uri) {
+            (Some(jwks), _) => Self::Static(jwks.clone()),
+            (None, Some(uri)) => Self::Remote(crate::oauth::JwksCache::new(uri.clone())),
+            (None, None) => {
+                log::error!(
+                    "require_oauth2 is enabled with no oauth2_jwks/oauth2_jwks_uri; \
+                     rejecting all requests"
+                );
+                Self::Unconfigured
+            }
+        })
+    }
+
+    async fn authorize(&self, auth_header: Option<&str>) -> SbiResult<()> {
+        match self {
+            Self::Static(jwks) => crate::oauth::authorize_bearer(auth_header, jwks).map(|_| ()),
+            Self::Remote(cache) => cache.authorize(auth_header).await.map(|_| ()),
+            Self::Unconfigured => Err(SbiError::ServerError(
+                "require_oauth2 is enabled but neither oauth2_jwks nor oauth2_jwks_uri is configured".into(),
+            )),
+        }
+    }
+}
+
 /// Hyper service wrapper
 struct SbiService<H: SbiRequestHandler> {
     handler: Arc<H>,
-    /// When `Some`, every request must carry a valid OAuth2 bearer token
-    /// verifiable against this JWKS; otherwise it is rejected with 401.
-    oauth: Option<Arc<serde_json::Value>>,
+    /// When `Some`, every request must carry a valid OAuth2 bearer token;
+    /// bad tokens are rejected with 401, unavailable keys with 503.
+    oauth: Option<Arc<OAuthVerifier>>,
 }
 
 impl<H: SbiRequestHandler> Clone for SbiService<H> {
@@ -158,19 +207,28 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
             let sbi_request = convert_request(req).await;
 
             // OAuth2 enforcement (opt-in). Verify the bearer token against the
-            // configured JWKS before dispatching to the NF handler.
-            if let Some(jwks) = &oauth {
+            // configured key material before dispatching to the NF handler.
+            // An invalid token is the caller's fault (401); not being able to
+            // obtain verification keys is ours (503).
+            if let Some(verifier) = &oauth {
+                // hyper delivers HTTP/2 header names lowercased; check both
+                // spellings for requests constructed in-process.
                 let auth = sbi_request
                     .http
-                    .get_header("Authorization")
+                    .get_header("authorization")
+                    .or_else(|| sbi_request.http.get_header("Authorization"))
                     .map(|s| s.as_str());
-                if let Err(e) = crate::oauth::authorize_bearer(auth, jwks) {
+                if let Err(e) = verifier.authorize(auth).await {
+                    let (status, title) = match e {
+                        SbiError::AuthorizationFailed(_) => (401, "Unauthorized"),
+                        _ => (503, "Service Unavailable"),
+                    };
                     let body = serde_json::json!({
-                        "title": "Unauthorized", "status": 401, "detail": e.to_string()
+                        "title": title, "status": status, "detail": e.to_string()
                     })
                     .to_string();
-                    let resp =
-                        SbiResponse::with_status(401).with_body(body, "application/problem+json");
+                    let resp = SbiResponse::with_status(status)
+                        .with_body(body, "application/problem+json");
                     return Ok(convert_response(resp));
                 }
             }
@@ -335,13 +393,10 @@ impl SbiServer {
 
         let handler = Arc::new(handler);
 
-        // Resolve the OAuth2 verification material once: Some(jwks) enables
+        // Resolve the OAuth2 verification source once: Some(_) enables
         // per-request bearer verification, None leaves the server open.
-        let oauth: Option<Arc<serde_json::Value>> = if self.config.require_oauth2 {
-            self.config.oauth2_jwks.clone().map(Arc::new)
-        } else {
-            None
-        };
+        let oauth: Option<Arc<OAuthVerifier>> =
+            OAuthVerifier::from_config(&self.config).map(Arc::new);
 
         // Spawn the server task
         tokio::spawn(async move {
@@ -514,6 +569,72 @@ mod tests {
 
         assert_eq!(config.addr.port(), 8080);
         assert_eq!(config.interface, Some("sbi".to_string()));
+    }
+
+    #[test]
+    fn test_oauth_verifier_resolution() {
+        let base = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], 7777)));
+
+        // Enforcement off: no verifier regardless of key material.
+        assert!(OAuthVerifier::from_config(&base).is_none());
+
+        // Static JWKS takes precedence over a configured URI.
+        let both = SbiServerConfig {
+            require_oauth2: true,
+            oauth2_jwks: Some(serde_json::json!({"keys": []})),
+            oauth2_jwks_uri: Some("http://nrf:7777/nnrf-oauth2/v1/jwks".into()),
+            ..base.clone()
+        };
+        assert!(matches!(
+            OAuthVerifier::from_config(&both),
+            Some(OAuthVerifier::Static(_))
+        ));
+
+        // URI alone resolves to the live-fetching cache.
+        let uri_only = SbiServerConfig {
+            require_oauth2: true,
+            oauth2_jwks_uri: Some("http://nrf:7777/nnrf-oauth2/v1/jwks".into()),
+            ..base.clone()
+        };
+        assert!(matches!(
+            OAuthVerifier::from_config(&uri_only),
+            Some(OAuthVerifier::Remote(_))
+        ));
+
+        // Enforcement with no key material fails closed.
+        let neither = SbiServerConfig {
+            require_oauth2: true,
+            ..base
+        };
+        assert!(matches!(
+            OAuthVerifier::from_config(&neither),
+            Some(OAuthVerifier::Unconfigured)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_oauth_verifier_error_classes() {
+        // Unconfigured rejects everything with a non-authorization error
+        // (mapped to 503), even a syntactically plausible bearer token.
+        let unconfigured = OAuthVerifier::Unconfigured;
+        let err = unconfigured
+            .authorize(Some("Bearer a.b.c"))
+            .await
+            .unwrap_err();
+        assert!(!matches!(err, SbiError::AuthorizationFailed(_)));
+
+        // A static JWKS that can't verify the token is the caller's fault
+        // (AuthorizationFailed, mapped to 401).
+        let static_v = OAuthVerifier::Static(serde_json::json!({"keys": []}));
+        let err = static_v.authorize(None).await.unwrap_err();
+        assert!(matches!(err, SbiError::AuthorizationFailed(_)));
+
+        // A remote source that can't be reached is our fault (mapped to 503).
+        let remote = OAuthVerifier::Remote(crate::oauth::JwksCache::new(
+            "http://127.0.0.1:1/nnrf-oauth2/v1/jwks",
+        ));
+        let err = remote.authorize(Some("Bearer a.b.c")).await.unwrap_err();
+        assert!(!matches!(err, SbiError::AuthorizationFailed(_)));
     }
 
     #[test]
