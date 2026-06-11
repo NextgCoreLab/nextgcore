@@ -19,6 +19,7 @@ pub mod pfcp_path;
 pub mod pfcp_sm;
 pub mod s11_build;
 pub mod s11_handler;
+pub mod s11_parse;
 pub mod s5c_handler;
 pub mod sm;
 pub mod sxa_build;
@@ -323,10 +324,19 @@ mod tests {
 
     #[test]
     fn test_sgwc_paths() {
-        assert!(gtp_path::gtp_open().is_ok());
+        // Bind an ephemeral loopback port directly (mutating process env in
+        // tests races with getenv in other threads); gtp_open() itself is
+        // exercised at process startup
+        let server = gtp_path::GtpcServer::open(
+            "127.0.0.1:0",
+            ogs_gtp::v2::xact::Gtp2XactConfig::default(),
+            1,
+        )
+        .unwrap();
+        assert_ne!(server.local_addr().port(), 0);
+        server.close();
         assert!(pfcp_path::pfcp_open().is_ok());
         pfcp_path::pfcp_close();
-        gtp_path::gtp_close();
     }
 
     #[test]

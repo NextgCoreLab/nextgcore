@@ -26,8 +26,9 @@ pub mod pfcp_message_type {
 // ============================================================================
 
 /// PFCP FSM state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PfcpState {
+    #[default]
     /// Initial state
     Initial,
     /// Final state
@@ -38,12 +39,6 @@ pub enum PfcpState {
     Associated,
     /// Exception state (error condition)
     Exception,
-}
-
-impl Default for PfcpState {
-    fn default() -> Self {
-        Self::Initial
-    }
 }
 
 // ============================================================================

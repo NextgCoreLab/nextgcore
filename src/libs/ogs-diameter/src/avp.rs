@@ -293,6 +293,30 @@ impl Avp {
         }
     }
 
+    /// Parse the AVP data as a Grouped AVP, decoding member AVPs from raw
+    /// bytes if necessary.
+    ///
+    /// `Avp::decode` returns data as `AvpData::Raw` because the wire format
+    /// does not distinguish data types. Use this to interpret a decoded AVP
+    /// as Grouped (RFC 6733 Section 4.4) and obtain its member AVPs.
+    pub fn parse_grouped(&self) -> DiameterResult<Vec<Avp>> {
+        match &self.data {
+            AvpData::Grouped(avps) => Ok(avps.clone()),
+            AvpData::OctetString(b) | AvpData::Raw(b) => {
+                let mut buf = b.clone();
+                let mut avps = Vec::new();
+                while buf.has_remaining() {
+                    avps.push(Avp::decode(&mut buf)?);
+                }
+                Ok(avps)
+            }
+            other => Err(DiameterError::InvalidAvp(format!(
+                "AVP {} data {:?} cannot be parsed as Grouped",
+                self.code, other
+            ))),
+        }
+    }
+
     /// Get data as Address
     pub fn as_address(&self) -> Option<IpAddr> {
         match &self.data {
@@ -424,5 +448,37 @@ mod tests {
         assert!(avp.is_vendor_specific());
         assert!(avp.is_mandatory());
         assert_eq!(avp.vendor_id, Some(10415));
+    }
+
+    #[test]
+    fn test_avp_parse_grouped_roundtrip() {
+        // Subscription-Id (443) grouped: type + data
+        let grouped = Avp::mandatory(
+            443,
+            AvpData::Grouped(vec![
+                Avp::mandatory(450, AvpData::Enumerated(1)),
+                Avp::mandatory(444, AvpData::Utf8String("001010123456789".to_string())),
+            ]),
+        );
+        let mut buf = BytesMut::new();
+        grouped.encode(&mut buf);
+
+        let mut bytes = buf.freeze();
+        let decoded = Avp::decode(&mut bytes).unwrap();
+        assert_eq!(decoded.code, 443);
+
+        // Decoded data is Raw; parse_grouped recovers the members
+        let members = decoded.parse_grouped().unwrap();
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].code, 450);
+        assert_eq!(members[0].as_i32(), Some(1));
+        assert_eq!(members[1].code, 444);
+        assert_eq!(members[1].as_utf8_string(), Some("001010123456789"));
+    }
+
+    #[test]
+    fn test_avp_parse_grouped_invalid() {
+        let avp = Avp::mandatory(268, AvpData::Unsigned32(2001));
+        assert!(avp.parse_grouped().is_err());
     }
 }

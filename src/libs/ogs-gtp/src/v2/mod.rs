@@ -8,6 +8,7 @@ pub mod ie;
 pub mod message;
 pub mod teid_pool;
 pub mod types;
+pub mod xact;
 
 // Re-export header types
 pub use header::{
@@ -51,3 +52,9 @@ pub use builder::{
 
 // Re-export TEID pool
 pub use teid_pool::TeidPool;
+
+// Re-export transaction layer
+pub use xact::{
+    triggered_message_type, Gtp2LocalXact, Gtp2XactConfig, Gtp2XactMgr, Gtp2XactPoll,
+    GTP2_MAX_SEQUENCE,
+};

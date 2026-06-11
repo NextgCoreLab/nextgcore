@@ -173,18 +173,10 @@ pub mod cancellation_type {
 // Diameter Message Structures
 // ============================================================================
 
-/// E-UTRAN Authentication Vector
-#[derive(Debug, Clone, Default)]
-pub struct EUtranVector {
-    /// Random challenge
-    pub rand: [u8; 16],
-    /// Expected response
-    pub xres: Vec<u8>,
-    /// Authentication token
-    pub autn: [u8; 16],
-    /// Key for ASME
-    pub kasme: [u8; 32],
-}
+// E-UTRAN authentication vector, Subscription-Data and APN-Configuration are
+// shared with the HSS via the S6a library module so both sides encode/parse
+// the same grouped-AVP wire format (TS 29.272 7.3.x).
+pub use ogs_diameter::s6a::{ApnConfiguration, EUtranVector, SubscriptionData};
 
 /// Authentication Information Answer message
 #[derive(Debug, Clone, Default)]
@@ -195,54 +187,6 @@ pub struct AiaMessage {
     pub experimental_result_code: Option<u32>,
     /// E-UTRAN vector
     pub e_utran_vector: EUtranVector,
-}
-
-/// Subscription Data
-#[derive(Debug, Clone, Default)]
-pub struct SubscriptionData {
-    /// MSISDN
-    pub msisdn: Vec<u8>,
-    /// A-MSISDN
-    pub a_msisdn: Vec<u8>,
-    /// Network access mode
-    pub network_access_mode: u32,
-    /// Subscribed RAU/TAU timer
-    pub subscribed_rau_tau_timer: u32,
-    /// AMBR uplink (bps)
-    pub ambr_uplink: u64,
-    /// AMBR downlink (bps)
-    pub ambr_downlink: u64,
-    /// Context identifier
-    pub context_identifier: u32,
-    /// APN configurations
-    pub apn_configs: Vec<ApnConfiguration>,
-    /// Charging characteristics
-    pub charging_characteristics: Option<[u8; 2]>,
-}
-
-/// APN Configuration
-#[derive(Debug, Clone, Default)]
-pub struct ApnConfiguration {
-    /// Context identifier
-    pub context_identifier: u32,
-    /// Service selection (APN name)
-    pub service_selection: String,
-    /// PDN type (1=IPv4, 2=IPv6, 3=IPv4v6)
-    pub pdn_type: u8,
-    /// QoS class identifier
-    pub qci: u8,
-    /// ARP priority level
-    pub arp_priority_level: u8,
-    /// ARP pre-emption capability
-    pub arp_pre_emption_capability: bool,
-    /// ARP pre-emption vulnerability
-    pub arp_pre_emption_vulnerability: bool,
-    /// AMBR uplink (bps)
-    pub ambr_uplink: u64,
-    /// AMBR downlink (bps)
-    pub ambr_downlink: u64,
-    /// Charging characteristics
-    pub charging_characteristics: Option<[u8; 2]>,
 }
 
 /// Update Location Answer message
@@ -454,6 +398,12 @@ pub async fn mme_fd_final_async() {
     *guard = None;
 }
 
+/// True when the ULR did not set Skip-Subscriber-Data, i.e. the ULA is
+/// expected to carry full subscription data.
+fn ulr_flags_has_subscriber_data(flags: u32) -> bool {
+    flags & s6a::ulr_flags::SKIP_SUBSCRIBER_DATA == 0
+}
+
 /// Encode a PlmnId to 3-byte BCD wire format for Diameter Visited-PLMN-Id AVP
 fn encode_plmn_id(plmn: &crate::context::PlmnId) -> [u8; 3] {
     let mut buf = [0u8; 3];
@@ -469,8 +419,14 @@ fn encode_plmn_id(plmn: &crate::context::PlmnId) -> [u8; 3] {
 ///
 /// # Arguments
 /// * `mme_ue` - MME UE context
-/// * `resync` - Whether this is a re-sync request (includes AUTS)
-pub async fn mme_s6a_send_air(mme_ue: &MmeUe, resync: bool) -> DiameterResult<AiaMessage> {
+/// * `resync_auts` - AUTS from the UE's synchronisation-failure response
+///   (TS 24.301 Authentication Failure, EMM cause #21). When present, a
+///   Re-Synchronization-Info AVP (RAND of the failed challenge || AUTS) is
+///   carried INSIDE Requested-EUTRAN-Authentication-Info per TS 29.272 7.3.11.
+pub async fn mme_s6a_send_air(
+    mme_ue: &MmeUe,
+    resync_auts: Option<&[u8; 14]>,
+) -> DiameterResult<AiaMessage> {
     if mme_ue.imsi_bcd.is_empty() {
         log::error!("No IMSI for AIR");
         return Err(DiameterError::BuildFailed);
@@ -485,7 +441,7 @@ pub async fn mme_s6a_send_air(mme_ue: &MmeUe, resync: bool) -> DiameterResult<Ai
     log::debug!(
         "[{}] Sending Authentication-Information-Request (resync={})",
         mme_ue.imsi_bcd,
-        resync
+        resync_auts.is_some()
     );
 
     let mut air = s6a::create_air(
@@ -498,52 +454,35 @@ pub async fn mme_s6a_send_air(mme_ue: &MmeUe, resync: bool) -> DiameterResult<Ai
         1, // request 1 vector
     );
 
-    // If resync, add Re-Synchronization-Info grouped AVP containing RAND+AUTS
-    if resync {
-        let mut resync_data = Vec::with_capacity(30);
-        resync_data.extend_from_slice(&mme_ue.rand);
-        // AUTS would come from the UE; for now use a placeholder
-        // In practice, the caller should pass in the AUTS bytes
+    if let Some(auts) = resync_auts {
         log::debug!(
-            "[{}] Adding Re-Synchronization-Info to AIR",
+            "[{}] Adding Re-Synchronization-Info inside Requested-EUTRAN-Authentication-Info",
             mme_ue.imsi_bcd
         );
-        let resync_avp = ogs_diameter::avp::Avp::vendor_mandatory(
-            s6a::avp::RE_SYNC_INFO,
-            ogs_diameter::OGS_3GPP_VENDOR_ID,
-            ogs_diameter::avp::AvpData::OctetString(bytes::Bytes::copy_from_slice(&resync_data)),
-        );
-        // Find the Requested-EUTRAN-Authentication-Info grouped AVP and add resync into it
-        // For simplicity, add it as a top-level AVP (HSS implementations accept both)
-        air.add_avp(resync_avp);
+        if !s6a::add_resync_info(&mut air, &mme_ue.rand, auts) {
+            log::error!("[{}] AIR has no Requested-EUTRAN-Authentication-Info", mme_ue.imsi_bcd);
+            return Err(DiameterError::BuildFailed);
+        }
     }
 
     let answer = state.client.send_request(&air).await?;
 
     // Parse the AIA response
     let result_code = answer.result_code().unwrap_or(0);
-    let experimental_result_code = answer
-        .find_avp(avp_code::EXPERIMENTAL_RESULT)
-        .and_then(|avp| avp.as_grouped())
-        .and_then(|g| ogs_diameter::avp::find_avp(g, avp_code::EXPERIMENTAL_RESULT_CODE))
-        .and_then(|a| a.as_u32());
+    let experimental_result_code = s6a::experimental_result_code(&answer);
 
-    let mut e_utran_vector = EUtranVector::default();
+    // Parse Authentication-Info -> E-UTRAN-Vector(s); we requested one vector
+    let e_utran_vector = s6a::parse_authentication_info(&answer)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
 
-    // Parse Authentication-Info -> E-UTRAN-Vector
-    if let Some(auth_info) = answer.find_avp(avp_code::AUTHENTICATION_INFO) {
-        if let Some(group) = auth_info.as_grouped() {
-            if let Some(vec_avp) = ogs_diameter::avp::find_avp(group, avp_code::E_UTRAN_VECTOR) {
-                if let Ok(vec) = s6a::parse_e_utran_vector(vec_avp) {
-                    e_utran_vector = EUtranVector {
-                        rand: vec.rand,
-                        xres: vec.xres,
-                        autn: vec.autn,
-                        kasme: vec.kasme,
-                    };
-                }
-            }
-        }
+    if result_code == result_code::DIAMETER_SUCCESS && e_utran_vector.xres.is_empty() {
+        log::error!(
+            "[{}] AIA claims success but carries no usable E-UTRAN vector",
+            mme_ue.imsi_bcd
+        );
+        return Err(DiameterError::InvalidResponse);
     }
 
     log::debug!(
@@ -606,19 +545,28 @@ pub async fn mme_s6a_send_ulr(mme_ue: &MmeUe, initial_attach: bool) -> DiameterR
 
     // Parse ULA
     let result_code = answer.result_code().unwrap_or(0);
-    let experimental_result_code = answer
-        .find_avp(avp_code::EXPERIMENTAL_RESULT)
-        .and_then(|avp| avp.as_grouped())
-        .and_then(|g| ogs_diameter::avp::find_avp(g, avp_code::EXPERIMENTAL_RESULT_CODE))
-        .and_then(|a| a.as_u32());
+    let experimental_result_code = s6a::experimental_result_code(&answer);
 
     let ula_flags = answer
         .find_avp(avp_code::ULA_FLAGS)
         .and_then(|a| a.as_u32())
         .unwrap_or(0);
 
-    // Parse subscription data from the answer
-    let subscription_data = parse_subscription_data(&answer);
+    // Parse the grouped Subscription-Data AVP (TS 29.272 7.3.2)
+    let subscription_data = answer
+        .find_avp(avp_code::SUBSCRIPTION_DATA)
+        .map(s6a::parse_subscription_data_avp)
+        .unwrap_or_default();
+
+    if result_code == result_code::DIAMETER_SUCCESS
+        && subscription_data.apn_configs.is_empty()
+        && ulr_flags_has_subscriber_data(flags)
+    {
+        log::warn!(
+            "[{}] ULA success without APN configuration in Subscription-Data",
+            mme_ue.imsi_bcd
+        );
+    }
 
     log::debug!(
         "[{}] Received ULA result_code={}, ula_flags=0x{:04x}",
@@ -692,12 +640,18 @@ pub async fn mme_s6a_send_pur(mme_ue: &MmeUe) -> DiameterResult<(u32, u32)> {
         ogs_diameter::common::avp_code::AUTH_SESSION_STATE,
         ogs_diameter::avp::AvpData::Enumerated(1),
     ));
+    // PUR-Flags: UE purged in the MME (TS 29.272 7.3.149)
+    pur.add_avp(ogs_diameter::avp::Avp::vendor_mandatory(
+        s6a::avp::PUR_FLAGS,
+        ogs_diameter::OGS_3GPP_VENDOR_ID,
+        ogs_diameter::avp::AvpData::Unsigned32(s6a::pur_flags::UE_PURGED_IN_MME),
+    ));
 
     let answer = state.client.send_request(&pur).await?;
 
     let result_code = answer.result_code().unwrap_or(0);
     let pua_flags = answer
-        .find_avp(avp_code::PUA_FLAGS)
+        .find_vendor_avp(avp_code::PUA_FLAGS, ogs_diameter::OGS_3GPP_VENDOR_ID)
         .and_then(|a| a.as_u32())
         .unwrap_or(0);
 
@@ -711,135 +665,148 @@ pub async fn mme_s6a_send_pur(mme_ue: &MmeUe) -> DiameterResult<(u32, u32)> {
     Ok((result_code, pua_flags))
 }
 
-/// Parse Subscription-Data from a ULA DiameterMessage
-fn parse_subscription_data(msg: &ogs_diameter::message::DiameterMessage) -> SubscriptionData {
-    let mut sub = SubscriptionData::default();
+// ============================================================================
+// Inbound HSS-initiated requests (CLR / IDR)
+// ============================================================================
 
-    let sub_avp = msg.find_avp(avp_code::SUBSCRIPTION_DATA);
-    let group = match sub_avp.and_then(|a| a.as_grouped()) {
-        Some(g) => g,
-        None => return sub,
-    };
-
-    // MSISDN
-    if let Some(a) = ogs_diameter::avp::find_avp(group, avp_code::MSISDN) {
-        if let Some(b) = a.as_octet_string() {
-            sub.msisdn = b.to_vec();
-        }
-    }
-
-    // A-MSISDN
-    if let Some(a) = ogs_diameter::avp::find_avp(group, avp_code::A_MSISDN) {
-        if let Some(b) = a.as_octet_string() {
-            sub.a_msisdn = b.to_vec();
-        }
-    }
-
-    // Network-Access-Mode
-    if let Some(a) = ogs_diameter::avp::find_avp(group, avp_code::NETWORK_ACCESS_MODE) {
-        sub.network_access_mode = a.as_u32().unwrap_or(0);
-    }
-
-    // Charging-Characteristics
-    if let Some(a) = ogs_diameter::avp::find_avp(group, avp_code::CHARGING_CHARACTERISTICS) {
-        if let Some(b) = a.as_octet_string() {
-            if b.len() >= 2 {
-                sub.charging_characteristics = Some([b[0], b[1]]);
-            }
-        }
-    }
-
-    // AMBR
-    if let Some(ambr) = ogs_diameter::avp::find_avp(group, avp_code::AMBR) {
-        if let Some(ag) = ambr.as_grouped() {
-            if let Some(ul) = ogs_diameter::avp::find_avp(ag, avp_code::MAX_BANDWIDTH_UL) {
-                sub.ambr_uplink = ul.as_u32().unwrap_or(0) as u64;
-            }
-            if let Some(dl) = ogs_diameter::avp::find_avp(ag, avp_code::MAX_BANDWIDTH_DL) {
-                sub.ambr_downlink = dl.as_u32().unwrap_or(0) as u64;
-            }
-        }
-    }
-
-    // APN-Configuration-Profile -> APN-Configuration(s)
-    if let Some(profile) = ogs_diameter::avp::find_avp(group, avp_code::APN_CONFIGURATION_PROFILE) {
-        if let Some(pg) = profile.as_grouped() {
-            // Context-Identifier (default APN)
-            if let Some(ci) = ogs_diameter::avp::find_avp(pg, avp_code::CONTEXT_IDENTIFIER) {
-                sub.context_identifier = ci.as_u32().unwrap_or(0);
-            }
-            // APN-Configuration entries
-            for inner in pg {
-                if inner.code == avp_code::APN_CONFIGURATION {
-                    if let Some(apn_group) = inner.as_grouped() {
-                        sub.apn_configs.push(parse_apn_config(apn_group));
-                    }
-                }
-            }
-        }
-    }
-
-    sub
+/// An HSS-initiated S6a request received on the MME's connection.
+#[derive(Debug, Clone)]
+pub struct InboundS6aRequest {
+    /// IMSI from the User-Name AVP
+    pub imsi_bcd: String,
+    /// Parsed message
+    pub message: S6aMessage,
 }
 
-/// Parse a single APN-Configuration grouped AVP
-fn parse_apn_config(group: &[ogs_diameter::avp::Avp]) -> ApnConfiguration {
-    let mut apn = ApnConfiguration::default();
+/// Poll the S6a connection for HSS-initiated requests (CLR/IDR).
+///
+/// Parses the request, sends the corresponding answer (CLA/IDA) and returns
+/// the parsed message so the caller can apply it to the UE context (e.g.
+/// trigger a network-initiated detach on CLR). Returns `Ok(None)` if nothing
+/// arrived within `timeout`.
+pub async fn mme_fd_recv_inbound(
+    timeout: std::time::Duration,
+) -> DiameterResult<Option<InboundS6aRequest>> {
+    let mut guard = s6a_client().lock().await;
+    let state = guard.as_mut().ok_or(DiameterError::NotInitialized)?;
 
-    if let Some(a) = ogs_diameter::avp::find_avp(group, avp_code::CONTEXT_IDENTIFIER) {
-        apn.context_identifier = a.as_u32().unwrap_or(0);
-    }
-    if let Some(a) = ogs_diameter::avp::find_avp(group, avp_code::SERVICE_SELECTION) {
-        if let Some(s) = a.as_utf8_string() {
-            apn.service_selection = s.to_string();
+    let Some(request) = state.client.recv_inbound_request(timeout).await? else {
+        return Ok(None);
+    };
+
+    let (origin_host, origin_realm) = (
+        state.config.diameter_id.clone(),
+        state.config.diameter_realm.clone(),
+    );
+
+    let build_answer = |req: &ogs_diameter::message::DiameterMessage,
+                        result: u32,
+                        protocol_error: bool| {
+        let mut answer = ogs_diameter::message::DiameterMessage::new_answer(req);
+        if let Some(sid) = req.session_id() {
+            answer.add_avp(ogs_diameter::avp::Avp::mandatory(
+                ogs_diameter::common::avp_code::SESSION_ID,
+                ogs_diameter::avp::AvpData::Utf8String(sid.to_string()),
+            ));
+        }
+        answer.add_avp(ogs_diameter::avp::Avp::mandatory(
+            ogs_diameter::common::avp_code::RESULT_CODE,
+            ogs_diameter::avp::AvpData::Unsigned32(result),
+        ));
+        answer.add_avp(ogs_diameter::avp::Avp::mandatory(
+            ogs_diameter::common::avp_code::AUTH_SESSION_STATE,
+            ogs_diameter::avp::AvpData::Enumerated(1),
+        ));
+        answer.add_avp(ogs_diameter::avp::Avp::mandatory(
+            ogs_diameter::common::avp_code::ORIGIN_HOST,
+            ogs_diameter::avp::AvpData::DiameterIdentity(origin_host.clone()),
+        ));
+        answer.add_avp(ogs_diameter::avp::Avp::mandatory(
+            ogs_diameter::common::avp_code::ORIGIN_REALM,
+            ogs_diameter::avp::AvpData::DiameterIdentity(origin_realm.clone()),
+        ));
+        if protocol_error {
+            answer.header.set_error();
+        }
+        answer
+    };
+
+    // User-Name is mandatory in CLR/IDR (TS 29.272 7.2.7 / 7.2.9)
+    let Some(imsi_bcd) = request.user_name().map(str::to_string) else {
+        log::error!("Inbound S6a request missing User-Name");
+        let answer = build_answer(&request, result_code::DIAMETER_MISSING_AVP, false);
+        state.client.send_answer(&answer).await?;
+        return Ok(None);
+    };
+
+    match request.header.command_code {
+        command_code::CANCEL_LOCATION => {
+            let cancellation_type = request
+                .find_vendor_avp(avp_code::CANCELLATION_TYPE, ogs_diameter::OGS_3GPP_VENDOR_ID)
+                .and_then(|a| a.as_u32());
+            // Cancellation-Type is mandatory in CLR (TS 29.272 Table 7.2.7/1)
+            let Some(cancellation_type) = cancellation_type else {
+                log::error!("[{imsi_bcd}] CLR missing Cancellation-Type");
+                let answer = build_answer(&request, result_code::DIAMETER_MISSING_AVP, false);
+                state.client.send_answer(&answer).await?;
+                return Ok(None);
+            };
+            let clr_flags = request
+                .find_vendor_avp(avp_code::CLR_FLAGS, ogs_diameter::OGS_3GPP_VENDOR_ID)
+                .and_then(|a| a.as_u32())
+                .unwrap_or(0);
+
+            log::info!(
+                "[{imsi_bcd}] Received CLR (type={cancellation_type}, flags={clr_flags:#x})"
+            );
+            let answer = build_answer(&request, result_code::DIAMETER_SUCCESS, false);
+            state.client.send_answer(&answer).await?;
+
+            Ok(Some(InboundS6aRequest {
+                imsi_bcd,
+                message: S6aMessage::Clr(ClrMessage {
+                    cancellation_type,
+                    clr_flags,
+                }),
+            }))
+        }
+        command_code::INSERT_SUBSCRIBER_DATA => {
+            // Subscription-Data is mandatory in IDR (TS 29.272 Table 7.2.9/1)
+            let Some(sub_avp) = request.find_avp(avp_code::SUBSCRIPTION_DATA) else {
+                log::error!("[{imsi_bcd}] IDR missing Subscription-Data");
+                let answer = build_answer(&request, result_code::DIAMETER_MISSING_AVP, false);
+                state.client.send_answer(&answer).await?;
+                return Ok(None);
+            };
+            let subscription_data = s6a::parse_subscription_data_avp(sub_avp);
+            let idr_flags = request
+                .find_vendor_avp(avp_code::IDR_FLAGS, ogs_diameter::OGS_3GPP_VENDOR_ID)
+                .and_then(|a| a.as_u32())
+                .unwrap_or(0);
+
+            log::info!("[{imsi_bcd}] Received IDR (flags={idr_flags:#x})");
+            let answer = build_answer(&request, result_code::DIAMETER_SUCCESS, false);
+            state.client.send_answer(&answer).await?;
+
+            Ok(Some(InboundS6aRequest {
+                imsi_bcd,
+                message: S6aMessage::Idr(IdrMessage {
+                    idr_flags,
+                    subscription_data,
+                }),
+            }))
+        }
+        other => {
+            log::warn!("[{imsi_bcd}] Unsupported inbound S6a command: {other}");
+            let answer = build_answer(
+                &request,
+                result_code::DIAMETER_COMMAND_UNSUPPORTED,
+                true, // protocol error: E-bit (RFC 6733 7.2)
+            );
+            state.client.send_answer(&answer).await?;
+            Ok(None)
         }
     }
-    if let Some(a) = ogs_diameter::avp::find_avp(group, avp_code::PDN_TYPE) {
-        apn.pdn_type = a.as_u32().unwrap_or(1) as u8;
-    }
-
-    // AMBR
-    if let Some(ambr) = ogs_diameter::avp::find_avp(group, avp_code::AMBR) {
-        if let Some(ag) = ambr.as_grouped() {
-            if let Some(ul) = ogs_diameter::avp::find_avp(ag, avp_code::MAX_BANDWIDTH_UL) {
-                apn.ambr_uplink = ul.as_u32().unwrap_or(0) as u64;
-            }
-            if let Some(dl) = ogs_diameter::avp::find_avp(ag, avp_code::MAX_BANDWIDTH_DL) {
-                apn.ambr_downlink = dl.as_u32().unwrap_or(0) as u64;
-            }
-        }
-    }
-
-    // EPS-Subscribed-QoS-Profile
-    if let Some(qos_avp) = ogs_diameter::avp::find_avp(group, avp_code::EPS_SUBSCRIBED_QOS_PROFILE)
-    {
-        if let Some(qg) = qos_avp.as_grouped() {
-            if let Some(a) = ogs_diameter::avp::find_avp(qg, avp_code::QOS_CLASS_IDENTIFIER) {
-                apn.qci = a.as_u32().unwrap_or(9) as u8;
-            }
-            if let Some(arp) =
-                ogs_diameter::avp::find_avp(qg, avp_code::ALLOCATION_RETENTION_PRIORITY)
-            {
-                if let Some(ag) = arp.as_grouped() {
-                    if let Some(a) = ogs_diameter::avp::find_avp(ag, avp_code::PRIORITY_LEVEL) {
-                        apn.arp_priority_level = a.as_u32().unwrap_or(8) as u8;
-                    }
-                    if let Some(a) =
-                        ogs_diameter::avp::find_avp(ag, avp_code::PRE_EMPTION_CAPABILITY)
-                    {
-                        apn.arp_pre_emption_capability = a.as_u32().unwrap_or(1) == 0;
-                    }
-                    if let Some(a) =
-                        ogs_diameter::avp::find_avp(ag, avp_code::PRE_EMPTION_VULNERABILITY)
-                    {
-                        apn.arp_pre_emption_vulnerability = a.as_u32().unwrap_or(1) == 0;
-                    }
-                }
-            }
-        }
-    }
-
-    apn
 }
 
 // ============================================================================
@@ -1056,7 +1023,7 @@ mod tests {
             imsi_bcd: "001010123456789".to_string(),
             ..Default::default()
         };
-        let result = mme_s6a_send_air(&mme_ue, false).await;
+        let result = mme_s6a_send_air(&mme_ue, None).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), DiameterError::NotInitialized);
     }
@@ -1086,7 +1053,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_air_empty_imsi() {
         let mme_ue = crate::context::MmeUe::default();
-        let result = mme_s6a_send_air(&mme_ue, false).await;
+        let result = mme_s6a_send_air(&mme_ue, None).await;
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), DiameterError::BuildFailed);
     }
@@ -1107,14 +1074,91 @@ mod tests {
         assert_eq!(result.unwrap_err(), DiameterError::BuildFailed);
     }
 
+    /// The MME must parse the grouped Subscription-Data exactly as the HSS
+    /// encodes it, across a real wire encode/decode cycle.
+    #[test]
+    fn test_parse_subscription_data_grouped_wire_roundtrip() {
+        let mut sub = SubscriptionData {
+            network_access_mode: 2,
+            subscribed_rau_tau_timer: 720,
+            ambr_uplink: 50_000_000,
+            ambr_downlink: 100_000_000,
+            context_identifier: 1,
+            all_apn_configs_included: true,
+            charging_characteristics: Some([0x0A, 0x00]),
+            ..Default::default()
+        };
+        sub.apn_configs.push(ApnConfiguration {
+            context_identifier: 1,
+            service_selection: "internet".to_string(),
+            pdn_type: 2, // IPv4v6
+            qci: 9,
+            arp_priority_level: 8,
+            arp_pre_emption_capability: false,
+            arp_pre_emption_vulnerability: true,
+            ambr_uplink: 50_000_000,
+            ambr_downlink: 100_000_000,
+            charging_characteristics: None,
+        });
+
+        // Simulate the HSS side: ULA with grouped Subscription-Data over the wire
+        let mut ula = ogs_diameter::message::DiameterMessage::new_request(316, 16777251);
+        ula.header.flags &= !ogs_diameter::message::cmd_flags::REQUEST;
+        ula.add_avp(s6a::build_subscription_data_avp(&sub));
+        let encoded = ula.encode();
+        let mut bytes = encoded.freeze();
+        let decoded = ogs_diameter::message::DiameterMessage::decode(&mut bytes).unwrap();
+
+        // MME side parse: AMBR and APN config must NOT be lost
+        let parsed = decoded
+            .find_avp(avp_code::SUBSCRIPTION_DATA)
+            .map(s6a::parse_subscription_data_avp)
+            .unwrap_or_default();
+        assert_eq!(parsed, sub);
+        assert_eq!(parsed.ambr_uplink, 50_000_000);
+        assert_eq!(parsed.apn_configs.len(), 1);
+        assert_eq!(parsed.apn_configs[0].service_selection, "internet");
+        assert_eq!(parsed.apn_configs[0].qci, 9);
+    }
+
+    /// Parsing a message without Subscription-Data yields empty defaults.
     #[test]
     fn test_parse_subscription_data_empty() {
-        // Parse subscription data from a message with no Subscription-Data AVP
         let msg = ogs_diameter::message::DiameterMessage::new_request(316, 16777251);
-        let sub = parse_subscription_data(&msg);
+        let sub = msg
+            .find_avp(avp_code::SUBSCRIPTION_DATA)
+            .map(s6a::parse_subscription_data_avp)
+            .unwrap_or_default();
         assert!(sub.msisdn.is_empty());
         assert!(sub.apn_configs.is_empty());
         assert_eq!(sub.ambr_uplink, 0);
         assert_eq!(sub.ambr_downlink, 0);
+    }
+
+    /// AIR re-sync must carry RAND||AUTS inside
+    /// Requested-EUTRAN-Authentication-Info (TS 29.272 7.3.11), not top-level.
+    #[test]
+    fn test_air_resync_inside_requested_eutran_auth_info() {
+        let mut air = s6a::create_air(
+            "sess-1",
+            "mme.example.org",
+            "example.org",
+            "example.org",
+            "001010123456789",
+            &[0x00, 0xF1, 0x10],
+            1,
+        );
+        let rand = [0x5A; 16];
+        let auts = [0xC3; 14];
+        assert!(s6a::add_resync_info(&mut air, &rand, &auts));
+
+        let encoded = air.encode();
+        let mut bytes = encoded.freeze();
+        let decoded = ogs_diameter::message::DiameterMessage::decode(&mut bytes).unwrap();
+
+        assert!(decoded.find_avp(s6a::avp::RE_SYNC_INFO).is_none());
+        let (r, a) = s6a::find_resync_info(&decoded).expect("resync info inside grouped AVP");
+        assert_eq!(r, rand);
+        assert_eq!(a, auts);
     }
 }

@@ -513,8 +513,19 @@ impl PfcpMessageBuilder {
     }
 
     /// Add Node ID IE
+    /// Add a pre-encoded Node ID IE value (must already start with the
+    /// Node ID Type octet per TS 29.244 8.2.38).
     pub fn add_node_id(&mut self, node_id: &[u8]) -> &mut Self {
         self.add_tlv(pfcp_ie::NODE_ID, node_id)
+    }
+
+    /// Add an IPv4 Node ID IE (TS 29.244 8.2.38: type octet 0 = IPv4,
+    /// followed by the 4 address octets).
+    pub fn add_node_id_ipv4(&mut self, ip: [u8; 4]) -> &mut Self {
+        let mut value = [0u8; 5];
+        value[0] = 0; // Node ID Type = IPv4 address
+        value[1..5].copy_from_slice(&ip);
+        self.add_tlv(pfcp_ie::NODE_ID, &value)
     }
 
     /// Add F-SEID IE
@@ -1072,6 +1083,16 @@ pub struct SessionModificationParams {
 pub fn build_session_modification_request(params: &SessionModificationParams) -> Vec<u8> {
     let mut builder = PfcpMessageBuilder::new();
 
+    // PFCPSMReq-Flags (TS 29.244 8.2.50): SNDEM (0x02) when any updated FAR
+    // requires End Marker packets on the old tunnel. Message-level IE.
+    if params
+        .update_fars_activate
+        .iter()
+        .any(|(_, _, _, send_em)| *send_em)
+    {
+        builder.add_u8(pfcp_ie::PFCPSMREQ_FLAGS, 0x02);
+    }
+
     // Create PDRs
     for pdr in &params.create_pdrs {
         let pdr_bytes = build_create_pdr(pdr);
@@ -1430,10 +1451,11 @@ pub fn build_update_far_activate(
         ufp_builder.add_outer_header_creation(desc, teid, ipv4, ipv6);
     }
 
-    // PFCPSMREQ Flags (send end marker)
-    if send_end_marker {
-        ufp_builder.add_u8(pfcp_ie::PFCPSMREQ_FLAGS, 0x01);
-    }
+    // NOTE: the End Marker request (SNDEM) is a message-level
+    // PFCPSMReq-Flags IE (type 49, bit 0x02), not part of Update
+    // Forwarding Parameters — it is added by
+    // build_session_modification_request().
+    let _ = send_end_marker;
 
     builder.add_tlv(pfcp_ie::UPDATE_FORWARDING_PARAMETERS, &ufp_builder.build());
 

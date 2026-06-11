@@ -336,8 +336,11 @@ impl FSeid {
     }
 
     /// Encode to bytes
+    ///
+    /// TS 29.244 Section 8.2.37: octet 5 carries V4 in bit 2 (0x02) and V6 in
+    /// bit 1 (0x01). Note this is the opposite bit order of F-TEID (8.2.3).
     pub fn encode(&self, buf: &mut BytesMut) {
-        let flags = ((self.ipv6 as u8) << 1) | (self.ipv4 as u8);
+        let flags = ((self.ipv4 as u8) << 1) | (self.ipv6 as u8);
         buf.put_u8(flags);
         buf.put_u64(self.seid);
         if let Some(addr) = &self.ipv4_addr {
@@ -357,8 +360,9 @@ impl FSeid {
             });
         }
         let flags = buf.get_u8();
-        let ipv4 = flags & 0x01 != 0;
-        let ipv6 = (flags >> 1) & 0x01 != 0;
+        // TS 29.244 Section 8.2.37: V4 is bit 2, V6 is bit 1
+        let ipv4 = (flags >> 1) & 0x01 != 0;
+        let ipv6 = flags & 0x01 != 0;
         let seid = buf.get_u64();
 
         let ipv4_addr = if ipv4 {
@@ -2856,6 +2860,37 @@ mod tests {
         let mut bytes = encoded.clone();
         let decoded = FTeid::decode(&mut bytes).unwrap();
         (encoded, decoded)
+    }
+
+    #[test]
+    fn test_fseid_v4_flag_is_bit2_per_ts29244() {
+        // TS 29.244 Section 8.2.37: octet 5 bit 2 = V4, bit 1 = V6
+        // (opposite of the F-TEID flag order in Section 8.2.3).
+        let fseid = FSeid::new_ipv4(0x0102030405060708, [10, 0, 0, 1]);
+        let mut buf = BytesMut::new();
+        fseid.encode(&mut buf);
+        assert_eq!(buf[0], 0x02, "V4 flag must be bit 2 (0x02)");
+        assert_eq!(&buf[1..9], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&buf[9..13], &[10, 0, 0, 1]);
+
+        let fseid6 = FSeid::new_ipv6(1, [0xAB; 16]);
+        let mut buf6 = BytesMut::new();
+        fseid6.encode(&mut buf6);
+        assert_eq!(buf6[0], 0x01, "V6 flag must be bit 1 (0x01)");
+    }
+
+    #[test]
+    fn test_fseid_round_trip() {
+        for fseid in [
+            FSeid::new_ipv4(0xCAFEBABE, [192, 168, 0, 1]),
+            FSeid::new_ipv6(0x42, [0x20; 16]),
+        ] {
+            let mut buf = BytesMut::new();
+            fseid.encode(&mut buf);
+            let mut bytes = buf.freeze();
+            let decoded = FSeid::decode(&mut bytes).unwrap();
+            assert_eq!(decoded, fseid);
+        }
     }
 
     #[test]

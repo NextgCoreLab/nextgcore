@@ -149,6 +149,26 @@ pub mod pfcp_ie {
     pub const FRAMED_IPV6_ROUTE: u16 = 155;
     pub const APN_DNN: u16 = 159;
     pub const PFCPSEREQ_FLAGS: u16 = 186;
+    /// PFCPSMReq-Flags (TS 29.244 8.2.50): DROBU / SNDEM / QAURR
+    pub const PFCPSMREQ_FLAGS: u16 = 49;
+    /// Downlink Data Notification Delay (TS 29.244 8.2.28)
+    pub const DOWNLINK_DATA_NOTIFICATION_DELAY: u16 = 46;
+    /// Update BAR within Session Modification Request (TS 29.244 7.5.4.11)
+    pub const UPDATE_BAR: u16 = 86;
+    /// UR-SEQN (TS 29.244 8.2.60)
+    pub const UR_SEQN: u16 = 104;
+    /// Suggested Buffering Packets Count (TS 29.244 8.2.103)
+    pub const SUGGESTED_BUFFERING_PACKETS_COUNT: u16 = 140;
+}
+
+/// PFCPSMReq-Flags bit values (TS 29.244 8.2.50)
+pub mod pfcpsmreq_flags {
+    /// DROBU — drop buffered packets
+    pub const DROBU: u8 = 0x01;
+    /// SNDEM — send End Marker packets
+    pub const SNDEM: u8 = 0x02;
+    /// QAURR — query all URRs
+    pub const QAURR: u8 = 0x04;
 }
 
 // ============================================================================
@@ -1630,6 +1650,32 @@ pub fn build_heartbeat_response(recovery_time_stamp: u32) -> Vec<u8> {
     builder.build()
 }
 
+/// Build Heartbeat Request (UPF → SMF direction, TS 29.244 7.4.2)
+pub fn build_heartbeat_request(recovery_time_stamp: u32) -> Vec<u8> {
+    let mut builder = PfcpMessageBuilder::new();
+    builder.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, recovery_time_stamp);
+    builder.build()
+}
+
+/// UP Function Features actually implemented by this UPF.
+///
+/// Only features with working code paths are advertised (TS 29.244 8.2.25):
+/// - FTUP: F-TEID allocation in the UP function (CHOOSE flag handling)
+/// - EMPU: sending of End Marker packets
+///
+/// Encoded with the ogs-pfcp library codec (full 8 feature octets, Wave 0).
+pub fn upf_function_features() -> Vec<u8> {
+    use bytes::BytesMut;
+    let features = ogs_pfcp::types::UpFunctionFeatures {
+        ftup: true,
+        empu: true,
+        ..Default::default()
+    };
+    let mut buf = BytesMut::with_capacity(ogs_pfcp::types::UpFunctionFeatures::ENCODED_LEN);
+    features.encode(&mut buf);
+    buf.to_vec()
+}
+
 /// Build Association Setup Response
 pub fn build_association_setup_response(
     node_id: &NodeId,
@@ -1640,10 +1686,88 @@ pub fn build_association_setup_response(
     builder.add_node_id(node_id);
     builder.add_cause(cause);
     builder.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, recovery_time_stamp);
-    // Add UP Function Features (simplified)
-    let features: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
-    builder.add_tlv(pfcp_ie::UP_FUNCTION_FEATURES, &features);
+    // UP Function Features — only the bits this UPF really implements
+    builder.add_tlv(pfcp_ie::UP_FUNCTION_FEATURES, &upf_function_features());
     builder.build()
+}
+
+/// Build Association Release Response (TS 29.244 7.4.4.2): Node ID + Cause
+pub fn build_association_release_response(node_id: &NodeId, cause: PfcpCause) -> Vec<u8> {
+    let mut builder = PfcpMessageBuilder::new();
+    builder.add_node_id(node_id);
+    builder.add_cause(cause);
+    builder.build()
+}
+
+/// Build a failure response body: Cause + Offending IE (TS 29.244 7.5.3/7.5.5)
+pub fn build_failure_response(cause: PfcpCause, offending_ie: Option<u16>) -> Vec<u8> {
+    let mut builder = PfcpMessageBuilder::new();
+    builder.add_cause(cause);
+    if let Some(ie_type) = offending_ie {
+        builder.add_u16(pfcp_ie::OFFENDING_IE, ie_type);
+    }
+    builder.build()
+}
+
+/// Parse the Recovery Time Stamp IE out of a node-level message payload.
+pub fn parse_recovery_time_stamp(payload: &[u8]) -> Option<u32> {
+    let ies = ParsedIe::parse_all(payload);
+    ParsedIe::find_ie(&ies, pfcp_ie::RECOVERY_TIME_STAMP).and_then(|ie| {
+        if ie.value.len() >= 4 {
+            Some(u32::from_be_bytes([
+                ie.value[0],
+                ie.value[1],
+                ie.value[2],
+                ie.value[3],
+            ]))
+        } else {
+            None
+        }
+    })
+}
+
+/// Parsed Create/Update BAR (TS 29.244 7.5.2.6)
+#[derive(Debug, Clone, Default)]
+pub struct ParsedCreateBar {
+    pub bar_id: u8,
+    pub suggested_buffering_packets_count: Option<u8>,
+    pub ddn_delay: Option<u8>,
+}
+
+/// Parse a Create BAR / Update BAR grouped IE
+pub fn parse_create_bar(data: &[u8]) -> Result<ParsedCreateBar, &'static str> {
+    let ies = ParsedIe::parse_all(data);
+    let mut bar = ParsedCreateBar::default();
+
+    // BAR ID (mandatory)
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::BAR_ID) {
+        if ie.value.is_empty() {
+            return Err("BAR ID empty");
+        }
+        bar.bar_id = ie.value[0];
+    } else {
+        return Err("BAR ID missing");
+    }
+
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::SUGGESTED_BUFFERING_PACKETS_COUNT) {
+        if !ie.value.is_empty() {
+            bar.suggested_buffering_packets_count = Some(ie.value[0]);
+        }
+    }
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::DOWNLINK_DATA_NOTIFICATION_DELAY) {
+        if !ie.value.is_empty() {
+            bar.ddn_delay = Some(ie.value[0]);
+        }
+    }
+
+    Ok(bar)
+}
+
+/// Parse the PFCPSMReq-Flags IE (TS 29.244 8.2.50) from a message payload.
+/// Returns the raw flags byte (DROBU/SNDEM/QAURR) or None when absent.
+pub fn parse_pfcpsmreq_flags(payload: &[u8]) -> Option<u8> {
+    let ies = ParsedIe::parse_all(payload);
+    ParsedIe::find_ie(&ies, pfcp_ie::PFCPSMREQ_FLAGS).and_then(|ie| ie.value.first().copied())
 }
 
 // ============================================================================

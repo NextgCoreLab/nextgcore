@@ -183,6 +183,21 @@ pub fn mme_s6a_handle_ula(mme_ue: &mut MmeUe, ula_message: &UlaMessage) -> S6aRe
     Ok(EmmCause::RequestAccepted)
 }
 
+/// Action required after handling a Cancel-Location-Request
+/// (TS 29.272 5.2.2.2 / TS 23.401 5.3.8.4)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClrAction {
+    /// Network-initiated detach: send NAS Detach Request to the UE
+    DetachUe {
+        /// Re-attach required (CLR-Flags bit 1)
+        reattach_required: bool,
+    },
+    /// Remove the UE context silently (UE moved to another MME/SGSN)
+    RemoveContext,
+    /// No action required
+    NoAction,
+}
+
 /// Handle Cancel Location Request
 ///
 /// # Arguments
@@ -190,44 +205,120 @@ pub fn mme_s6a_handle_ula(mme_ue: &mut MmeUe, ula_message: &UlaMessage) -> S6aRe
 /// * `clr_message` - CLR message from HSS
 ///
 /// # Returns
-/// * `Ok(())` - Success
+/// * `Ok(ClrAction)` - Follow-up action the caller must execute
 /// * `Err(S6aError)` - On error
-pub fn mme_s6a_handle_clr(mme_ue: &mut MmeUe, clr_message: &ClrMessage) -> S6aResult<()> {
+pub fn mme_s6a_handle_clr(mme_ue: &mut MmeUe, clr_message: &ClrMessage) -> S6aResult<ClrAction> {
     log::info!(
         "[{}] Cancel Location Request, type={}",
         mme_ue.imsi_bcd,
         clr_message.cancellation_type
     );
 
-    match clr_message.cancellation_type {
+    let reattach_required =
+        clr_message.clr_flags & ogs_diameter::s6a::clr_flags::REATTACH_REQUIRED != 0;
+
+    let action = match clr_message.cancellation_type {
         cancellation_type::MME_UPDATE_PROCEDURE => {
-            // MME update procedure - UE moved to another MME
+            // UE moved to another MME: old context is removed without NAS
+            // signalling (TS 23.401 5.3.3.1)
             log::debug!("CLR: MME update procedure");
-            // Mark UE for removal
             mme_ue.t3470.pkbuf = None; // Clear any pending identity request
+            ClrAction::RemoveContext
         }
         cancellation_type::SGSN_UPDATE_PROCEDURE => {
-            // SGSN update procedure - UE moved to SGSN
+            // UE moved to an SGSN
             log::debug!("CLR: SGSN update procedure");
+            ClrAction::RemoveContext
         }
         cancellation_type::SUBSCRIPTION_WITHDRAWAL => {
-            // Subscription withdrawal
-            log::debug!("CLR: Subscription withdrawal");
-            // Initiate detach
+            // Subscription withdrawal: network-initiated detach
+            // (TS 29.272 5.2.2.2.2)
+            log::debug!("CLR: Subscription withdrawal -> network-initiated detach");
+            ClrAction::DetachUe { reattach_required }
         }
         cancellation_type::INITIAL_ATTACH_PROCEDURE => {
-            // Initial attach procedure at another MME
+            // UE attached at another MME: remove the local context
             log::debug!("CLR: Initial attach at another MME");
+            ClrAction::RemoveContext
+        }
+        cancellation_type::UPDATE_PROCEDURE_IWF => {
+            log::debug!("CLR: Update procedure IWF");
+            ClrAction::RemoveContext
         }
         _ => {
             log::warn!(
                 "Unknown cancellation type: {}",
                 clr_message.cancellation_type
             );
+            ClrAction::NoAction
         }
-    }
+    };
 
-    Ok(())
+    Ok(action)
+}
+
+/// Apply an inbound HSS-initiated request (CLR/IDR) to the UE context.
+///
+/// For CLR this triggers the network-initiated detach (NAS Detach Request to
+/// the UE, T3422 armed) or silent context removal, per the cancellation type.
+pub fn mme_s6a_process_inbound(inbound: &crate::fd_path::InboundS6aRequest) -> S6aResult<()> {
+    use crate::fd_path::S6aMessage;
+
+    let ctx = crate::context::mme_self();
+    let ue_id = ctx
+        .mme_ue_find_by_imsi(&inbound.imsi_bcd)
+        .ok_or(S6aError::UeNotFound)?;
+
+    match &inbound.message {
+        S6aMessage::Clr(clr) => {
+            let (action, enb_ue_id) = {
+                let mut pool = ctx.mme_ue_pool.write().unwrap();
+                let mme_ue = pool.get_mut(&ue_id).ok_or(S6aError::UeNotFound)?;
+                (mme_s6a_handle_clr(mme_ue, clr)?, mme_ue.enb_ue_id)
+            };
+            match action {
+                ClrAction::DetachUe { reattach_required } => {
+                    log::info!(
+                        "[{}] Network-initiated detach (reattach_required={})",
+                        inbound.imsi_bcd,
+                        reattach_required
+                    );
+                    let enb_ue = ctx.enb_ue_find_by_id(enb_ue_id);
+                    if let Some(enb_ue) = enb_ue {
+                        let mut pool = ctx.mme_ue_pool.write().unwrap();
+                        if let Some(mme_ue) = pool.get_mut(&ue_id) {
+                            crate::nas_path::nas_eps_send_detach_request(mme_ue, &enb_ue)
+                                .map_err(|e| {
+                                    log::error!(
+                                        "[{}] Detach Request send failed: {e:?}",
+                                        inbound.imsi_bcd
+                                    );
+                                    S6aError::NetworkFailure
+                                })?;
+                        }
+                    } else {
+                        // UE not connected: implicit detach, remove context
+                        log::info!(
+                            "[{}] UE not connected; implicit detach",
+                            inbound.imsi_bcd
+                        );
+                        ctx.mme_ue_remove(ue_id);
+                    }
+                }
+                ClrAction::RemoveContext => {
+                    ctx.mme_ue_remove(ue_id);
+                }
+                ClrAction::NoAction => {}
+            }
+            Ok(())
+        }
+        S6aMessage::Idr(idr) => {
+            let mut pool = ctx.mme_ue_pool.write().unwrap();
+            let mme_ue = pool.get_mut(&ue_id).ok_or(S6aError::UeNotFound)?;
+            mme_s6a_handle_idr(mme_ue, idr)
+        }
+        _ => Err(S6aError::InvalidMessage),
+    }
 }
 
 /// Handle Insert Subscriber Data Request
@@ -486,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_clr() {
+    fn test_handle_clr_mme_update_removes_context() {
         let mut mme_ue = MmeUe::default();
         mme_ue.imsi_bcd = "310260123456789".to_string();
 
@@ -495,8 +586,56 @@ mod tests {
             clr_flags: 0,
         };
 
-        let result = mme_s6a_handle_clr(&mut mme_ue, &clr_message);
-        assert!(result.is_ok());
+        let action = mme_s6a_handle_clr(&mut mme_ue, &clr_message).unwrap();
+        assert_eq!(action, ClrAction::RemoveContext);
+    }
+
+    /// Subscription withdrawal must trigger a network-initiated detach.
+    #[test]
+    fn test_handle_clr_subscription_withdrawal_detaches() {
+        let mut mme_ue = MmeUe::default();
+        mme_ue.imsi_bcd = "310260123456789".to_string();
+
+        let clr_message = ClrMessage {
+            cancellation_type: cancellation_type::SUBSCRIPTION_WITHDRAWAL,
+            clr_flags: 0,
+        };
+        let action = mme_s6a_handle_clr(&mut mme_ue, &clr_message).unwrap();
+        assert_eq!(
+            action,
+            ClrAction::DetachUe {
+                reattach_required: false
+            }
+        );
+
+        // With CLR-Flags Reattach-Required set
+        let clr_message = ClrMessage {
+            cancellation_type: cancellation_type::SUBSCRIPTION_WITHDRAWAL,
+            clr_flags: ogs_diameter::s6a::clr_flags::REATTACH_REQUIRED,
+        };
+        let action = mme_s6a_handle_clr(&mut mme_ue, &clr_message).unwrap();
+        assert_eq!(
+            action,
+            ClrAction::DetachUe {
+                reattach_required: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_process_inbound_clr_unknown_ue() {
+        let inbound = crate::fd_path::InboundS6aRequest {
+            imsi_bcd: "999990000000001".to_string(),
+            message: crate::fd_path::S6aMessage::Clr(ClrMessage {
+                cancellation_type: cancellation_type::SUBSCRIPTION_WITHDRAWAL,
+                clr_flags: 0,
+            }),
+        };
+        // No such UE in the context: must report UeNotFound, not panic
+        assert_eq!(
+            mme_s6a_process_inbound(&inbound).unwrap_err(),
+            S6aError::UeNotFound
+        );
     }
 
     #[test]

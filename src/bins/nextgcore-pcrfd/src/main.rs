@@ -9,7 +9,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use nextgcore_pcrfd::{
     pcrf_context_final, pcrf_context_init, pcrf_context_parse_config, pcrf_fd_final, pcrf_fd_init,
-    pcrf_gx_final, pcrf_gx_init, pcrf_rx_final, pcrf_rx_init, PcrfEvent, PcrfSmContext,
+    pcrf_fd_listen, pcrf_gx_final, pcrf_gx_init, pcrf_rx_final, pcrf_rx_init, LocalIdentity,
+    PcrfEvent, PcrfSmContext,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -44,6 +45,18 @@ struct Args {
     /// FreeDiameter configuration file
     #[arg(long, default_value = "/etc/nextgcore/freeDiameter/pcrf.conf")]
     diameter_config: String,
+
+    /// Diameter Origin-Host identity of this PCRF
+    #[arg(long, default_value = "pcrf.localdomain")]
+    diameter_id: String,
+
+    /// Diameter Origin-Realm of this PCRF
+    #[arg(long, default_value = "localdomain")]
+    diameter_realm: String,
+
+    /// Diameter listen address (Gx and Rx share one listener)
+    #[arg(long, default_value = "0.0.0.0:3868")]
+    diameter_addr: String,
 
     /// Maximum number of sessions
     #[arg(long, default_value = "1024")]
@@ -106,13 +119,49 @@ fn main() -> Result<()> {
     pcrf_sm.init(false);
     log::info!("PCRF state machine initialized");
 
-    // Initialize FreeDiameter
+    // Initialize the Diameter stack
     if let Err(e) = pcrf_fd_init() {
-        log::error!("Failed to initialize FreeDiameter: {e}");
+        log::error!("Failed to initialize Diameter stack: {e}");
         cleanup(&mut pcrf_sm);
         return Err(anyhow::anyhow!(e));
     }
-    log::info!("FreeDiameter initialized");
+    log::info!("Diameter stack initialized");
+
+    // Start the Diameter listener (Gx + Rx) on a dedicated runtime thread
+    let identity = LocalIdentity {
+        host: args.diameter_id.clone(),
+        realm: args.diameter_realm.clone(),
+    };
+    let listen_addr: std::net::SocketAddr = args
+        .diameter_addr
+        .parse()
+        .context("Invalid --diameter-addr")?;
+    std::thread::Builder::new()
+        .name("pcrf-diameter".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    log::error!("Failed to build Diameter runtime: {e}");
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                match pcrf_fd_listen(identity, listen_addr).await {
+                    Ok(addr) => {
+                        log::info!("Diameter listener active on {addr}");
+                        // Keep the runtime alive to serve peer connections
+                        std::future::pending::<()>().await;
+                    }
+                    Err(e) => log::error!("Failed to start Diameter listener: {e}"),
+                }
+            });
+        })
+        .context("Failed to spawn Diameter thread")?;
 
     // Initialize Gx interface (P-GW communication)
     if let Err(e) = pcrf_gx_init() {

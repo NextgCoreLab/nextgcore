@@ -21,7 +21,9 @@ pub struct PcrfRxSession {
     pub sid: String,
     /// Associated Gx Session index
     pub gx_session_idx: usize,
-    /// PCC rules for this Rx session
+    /// Peer host (AF / P-CSCF Origin-Host) for PCRF-initiated ASR
+    pub peer_host: Option<String>,
+    /// PCC rules installed on behalf of this Rx session
     pub pcc_rules: Vec<PccRule>,
 }
 
@@ -31,6 +33,7 @@ impl PcrfRxSession {
         Self {
             sid: sid.to_string(),
             gx_session_idx,
+            peer_host: None,
             pcc_rules: Vec::new(),
         }
     }
@@ -403,6 +406,48 @@ impl PcrfContext {
         hash.get(sid).and_then(|&idx| sessions.get(idx).cloned())
     }
 
+    /// Find Rx session by index (as referenced from a Gx session binding)
+    pub fn rx_session_find_by_idx(&self, idx: usize) -> Option<PcrfRxSession> {
+        let sessions = self.rx_sessions.read().ok()?;
+        let hash = self.rx_sid_hash.read().ok()?;
+        let session = sessions.get(idx)?;
+        // Only return the session if it is still registered (not removed)
+        if hash.get(&session.sid) == Some(&idx) {
+            Some(session.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Update Rx session
+    pub fn rx_session_update<F>(&self, sid: &str, f: F) -> bool
+    where
+        F: FnOnce(&mut PcrfRxSession),
+    {
+        if let (Ok(mut sessions), Ok(hash)) = (self.rx_sessions.write(), self.rx_sid_hash.read()) {
+            if let Some(&idx) = hash.get(sid) {
+                if let Some(session) = sessions.get_mut(idx) {
+                    f(session);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Find Gx session by index (as referenced from an Rx session binding)
+    pub fn gx_session_find_by_idx(&self, idx: usize) -> Option<PcrfGxSession> {
+        let sessions = self.gx_sessions.read().ok()?;
+        let hash = self.gx_sid_hash.read().ok()?;
+        let session = sessions.get(idx)?;
+        // Only return the session if it is still registered (not removed)
+        if hash.get(&session.sid) == Some(&idx) {
+            Some(session.clone())
+        } else {
+            None
+        }
+    }
+
     /// Remove Rx session
     pub fn rx_session_remove(&self, sid: &str) -> bool {
         let mut hash = self.rx_sid_hash.write().unwrap();
@@ -556,7 +601,7 @@ mod tests {
         let mut ctx = PcrfContext::new();
         ctx.init(1024);
 
-        let idx = ctx.gx_session_add("gx-session-1").unwrap();
+        let _idx = ctx.gx_session_add("gx-session-1").unwrap();
         assert_eq!(ctx.gx_session_count(), 1);
 
         let session = ctx.gx_session_find_by_sid("gx-session-1");

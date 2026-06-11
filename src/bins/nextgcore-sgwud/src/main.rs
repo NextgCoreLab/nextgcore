@@ -180,25 +180,11 @@ mod tests {
     }
 
     #[test]
-    fn test_gtpu_header_parse_build() {
-        let header = gtp_path::GtpuHeader {
-            version: 1,
-            pt: true,
-            e: false,
-            s: false,
-            pn: false,
-            msg_type: gtp_path::gtpu_type::G_PDU,
-            length: 100,
-            teid: 0x12345678,
-            seq_num: None,
-            npdu_num: None,
-            next_ext_hdr_type: None,
-        };
-
-        let data = header.build();
-        let (parsed, _) = gtp_path::GtpuHeader::parse(&data).unwrap();
-        assert_eq!(parsed.version, 1);
-        assert_eq!(parsed.msg_type, gtp_path::gtpu_type::G_PDU);
-        assert_eq!(parsed.teid, 0x12345678);
+    fn test_gtpu_server_open_close() {
+        // Bind to an ephemeral loopback port so tests never collide with a
+        // live GTP-U endpoint on 2152
+        let server = gtp_path::GtpuServer::open("127.0.0.1:0", 2152).unwrap();
+        assert_ne!(server.local_addr().port(), 0);
+        server.close();
     }
 }

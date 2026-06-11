@@ -168,6 +168,72 @@ impl Default for SgwuSess {
 }
 
 // ============================================================================
+// User-Plane Rules (PDR / FAR / QER / BAR)
+// ============================================================================
+
+/// FAR Apply Action flags (TS 29.244 Section 8.2.26)
+pub mod apply_action {
+    pub const DROP: u8 = 0x01;
+    pub const FORW: u8 = 0x02;
+    pub const BUFF: u8 = 0x04;
+    pub const NOCP: u8 = 0x08;
+    pub const DUPL: u8 = 0x10;
+}
+
+/// Maximum packets buffered per FAR while the action is BUFF
+pub const MAX_BUFFERED_PACKETS: usize = 64;
+
+/// Packet Detection Rule installed by the SGW-C (TS 29.244 Section 7.5.2.2)
+#[derive(Debug, Clone, Default)]
+pub struct SgwuPdr {
+    pub sess_id: u64,
+    pub pdr_id: u16,
+    pub precedence: u32,
+    /// PDI Source Interface (0 = ACCESS, 1 = CORE, ...)
+    pub source_interface: u8,
+    /// Local F-TEID this PDR matches on
+    pub local_teid: u32,
+    pub local_addr: Option<Ipv4Addr>,
+    /// Outer Header Removal description, if requested
+    pub outer_header_removal: Option<u8>,
+    pub far_id: Option<u32>,
+    pub qer_id: Option<u32>,
+}
+
+/// Forwarding Action Rule installed by the SGW-C (TS 29.244 Section 7.5.2.3)
+#[derive(Debug, Clone, Default)]
+pub struct SgwuFar {
+    pub sess_id: u64,
+    pub far_id: u32,
+    /// Apply Action flags (DROP/FORW/BUFF/NOCP/DUPL)
+    pub apply_action: u8,
+    /// Destination Interface
+    pub destination_interface: u8,
+    /// Outer Header Creation: (TEID, peer IPv4, peer IPv6)
+    pub outer_header_creation: Option<(u32, Option<Ipv4Addr>, Option<Ipv6Addr>)>,
+    /// Packets buffered while the action is BUFF
+    pub buffered: Vec<Vec<u8>>,
+}
+
+/// QoS Enforcement Rule (stored; rate enforcement is a follow-up)
+#[derive(Debug, Clone, Default)]
+pub struct SgwuQer {
+    pub sess_id: u64,
+    pub qer_id: u32,
+    pub gate_status: Option<u8>,
+    pub mbr_ul: u64,
+    pub mbr_dl: u64,
+}
+
+/// Buffering Action Rule
+#[derive(Debug, Clone, Default)]
+pub struct SgwuBar {
+    pub sess_id: u64,
+    pub bar_id: u8,
+    pub downlink_data_notification_delay: Option<u8>,
+}
+
+// ============================================================================
 // SGWU Context
 // ============================================================================
 
@@ -186,11 +252,27 @@ pub struct SgwuContext {
     /// Session list (by pool ID)
     sess_list: RwLock<HashMap<u64, SgwuSess>>,
 
+    // User-plane rules
+    /// PDRs keyed by (session id, PDR ID)
+    pdr_list: RwLock<HashMap<(u64, u16), SgwuPdr>>,
+    /// FARs keyed by (session id, FAR ID)
+    far_list: RwLock<HashMap<(u64, u32), SgwuFar>>,
+    /// QERs keyed by (session id, QER ID)
+    qer_list: RwLock<HashMap<(u64, u32), SgwuQer>>,
+    /// BARs keyed by (session id, BAR ID)
+    bar_list: RwLock<HashMap<(u64, u8), SgwuBar>>,
+    /// Local GTP-U TEID -> (session id, PDR ID) for G-PDU matching
+    teid_hash: RwLock<HashMap<u32, (u64, u16)>>,
+    /// Local GTP-U address advertised in allocated F-TEIDs
+    gtpu_addr: RwLock<Option<Ipv4Addr>>,
+
     // ID generators
     /// Next session ID
     next_sess_id: AtomicUsize,
     /// SXA SEID generator
     sxa_seid_generator: AtomicU64,
+    /// GTP-U TEID allocator (CH flag handling)
+    teid_generator: AtomicU64,
 
     // Pool limits
     /// Maximum number of sessions
@@ -208,8 +290,15 @@ impl SgwuContext {
             sgwc_sxa_seid_hash: RwLock::new(HashMap::new()),
             sgwc_sxa_f_seid_hash: RwLock::new(HashMap::new()),
             sess_list: RwLock::new(HashMap::new()),
+            pdr_list: RwLock::new(HashMap::new()),
+            far_list: RwLock::new(HashMap::new()),
+            qer_list: RwLock::new(HashMap::new()),
+            bar_list: RwLock::new(HashMap::new()),
+            teid_hash: RwLock::new(HashMap::new()),
+            gtpu_addr: RwLock::new(None),
             next_sess_id: AtomicUsize::new(1),
             sxa_seid_generator: AtomicU64::new(1),
+            teid_generator: AtomicU64::new(1),
             max_num_of_sess: 0,
             initialized: AtomicBool::new(false),
         }
@@ -308,6 +397,23 @@ impl SgwuContext {
             sgwc_sxa_seid_hash.remove(&sess.sgwc_sxa_f_seid.seid);
             sgwc_sxa_f_seid_hash.remove(&sess.sgwc_sxa_f_seid);
 
+            // Drop all user-plane rules belonging to the session
+            if let Ok(mut pdrs) = self.pdr_list.write() {
+                if let Ok(mut teids) = self.teid_hash.write() {
+                    teids.retain(|_, (sess_id, _)| *sess_id != id);
+                }
+                pdrs.retain(|(sess_id, _), _| *sess_id != id);
+            }
+            if let Ok(mut fars) = self.far_list.write() {
+                fars.retain(|(sess_id, _), _| *sess_id != id);
+            }
+            if let Ok(mut qers) = self.qer_list.write() {
+                qers.retain(|(sess_id, _), _| *sess_id != id);
+            }
+            if let Ok(mut bars) = self.bar_list.write() {
+                bars.retain(|(sess_id, _), _| *sess_id != id);
+            }
+
             // Clear PFCP session
             sess.pfcp.clear();
 
@@ -338,28 +444,24 @@ impl SgwuContext {
     /// Find session by SGWC SXA SEID
     /// Port of sgwu_sess_find_by_sgwc_sxa_seid from context.c
     pub fn sess_find_by_sgwc_sxa_seid(&self, seid: u64) -> Option<SgwuSess> {
-        let sgwc_sxa_seid_hash = self.sgwc_sxa_seid_hash.read().ok()?;
-        let sess_id = sgwc_sxa_seid_hash.get(&seid)?;
-        let sess_list = self.sess_list.read().ok()?;
-        sess_list.get(sess_id).cloned()
+        // Drop the hash guard before locking sess_list: holding it inverts
+        // sess_add's lock order and can deadlock.
+        let sess_id = *self.sgwc_sxa_seid_hash.read().ok()?.get(&seid)?;
+        self.sess_find_by_id(sess_id)
     }
 
     /// Find session by SGWC SXA F-SEID
     /// Port of sgwu_sess_find_by_sgwc_sxa_f_seid from context.c
     pub fn sess_find_by_sgwc_sxa_f_seid(&self, f_seid: &FSeid) -> Option<SgwuSess> {
-        let sgwc_sxa_f_seid_hash = self.sgwc_sxa_f_seid_hash.read().ok()?;
-        let sess_id = sgwc_sxa_f_seid_hash.get(f_seid)?;
-        let sess_list = self.sess_list.read().ok()?;
-        sess_list.get(sess_id).cloned()
+        let sess_id = *self.sgwc_sxa_f_seid_hash.read().ok()?.get(f_seid)?;
+        self.sess_find_by_id(sess_id)
     }
 
     /// Find session by SGWU SXA SEID
     /// Port of sgwu_sess_find_by_sgwu_sxa_seid from context.c
     pub fn sess_find_by_sgwu_sxa_seid(&self, seid: u64) -> Option<SgwuSess> {
-        let sgwu_sxa_seid_hash = self.sgwu_sxa_seid_hash.read().ok()?;
-        let sess_id = sgwu_sxa_seid_hash.get(&seid)?;
-        let sess_list = self.sess_list.read().ok()?;
-        sess_list.get(sess_id).cloned()
+        let sess_id = *self.sgwu_sxa_seid_hash.read().ok()?.get(&seid)?;
+        self.sess_find_by_id(sess_id)
     }
 
     /// Find session by ID
@@ -402,6 +504,186 @@ impl SgwuContext {
             }
         }
         false
+    }
+
+    // ========================================================================
+    // GTP-U configuration and TEID allocation
+    // ========================================================================
+
+    /// Set the local GTP-U address advertised in allocated F-TEIDs
+    pub fn set_gtpu_address(&self, addr: Option<Ipv4Addr>) {
+        if let Ok(mut a) = self.gtpu_addr.write() {
+            *a = addr;
+        }
+    }
+
+    /// Local GTP-U address advertised in allocated F-TEIDs
+    pub fn gtpu_address(&self) -> Option<Ipv4Addr> {
+        self.gtpu_addr.read().ok().and_then(|a| *a)
+    }
+
+    /// Allocate a local GTP-U TEID (F-TEID CH flag handling)
+    pub fn alloc_teid(&self) -> u32 {
+        self.teid_generator.fetch_add(1, Ordering::SeqCst) as u32
+    }
+
+    // ========================================================================
+    // PDR Management
+    // ========================================================================
+
+    /// Install or replace a PDR; indexes its local TEID for G-PDU matching
+    pub fn pdr_install(&self, pdr: SgwuPdr) -> bool {
+        let key = (pdr.sess_id, pdr.pdr_id);
+        let (Ok(mut pdrs), Ok(mut teids)) = (self.pdr_list.write(), self.teid_hash.write())
+        else {
+            return false;
+        };
+        // Remove the previous TEID index when updating
+        if let Some(old) = pdrs.get(&key) {
+            if old.local_teid != 0 {
+                teids.remove(&old.local_teid);
+            }
+        }
+        if pdr.local_teid != 0 {
+            teids.insert(pdr.local_teid, key);
+        }
+        pdrs.insert(key, pdr);
+        true
+    }
+
+    /// Remove a PDR
+    pub fn pdr_remove(&self, sess_id: u64, pdr_id: u16) -> Option<SgwuPdr> {
+        let (Ok(mut pdrs), Ok(mut teids)) = (self.pdr_list.write(), self.teid_hash.write())
+        else {
+            return None;
+        };
+        let pdr = pdrs.remove(&(sess_id, pdr_id))?;
+        if pdr.local_teid != 0 {
+            teids.remove(&pdr.local_teid);
+        }
+        Some(pdr)
+    }
+
+    /// Find a PDR by its session and PDR ID
+    pub fn pdr_find(&self, sess_id: u64, pdr_id: u16) -> Option<SgwuPdr> {
+        self.pdr_list.read().ok()?.get(&(sess_id, pdr_id)).cloned()
+    }
+
+    /// Find the PDR matching an incoming G-PDU by its local TEID
+    pub fn pdr_find_by_teid(&self, teid: u32) -> Option<SgwuPdr> {
+        let key = *self.teid_hash.read().ok()?.get(&teid)?;
+        self.pdr_list.read().ok()?.get(&key).cloned()
+    }
+
+    // ========================================================================
+    // FAR Management
+    // ========================================================================
+
+    /// Install or replace a FAR
+    pub fn far_install(&self, far: SgwuFar) -> bool {
+        if let Ok(mut fars) = self.far_list.write() {
+            fars.insert((far.sess_id, far.far_id), far);
+            return true;
+        }
+        false
+    }
+
+    /// Remove a FAR
+    pub fn far_remove(&self, sess_id: u64, far_id: u32) -> Option<SgwuFar> {
+        self.far_list.write().ok()?.remove(&(sess_id, far_id))
+    }
+
+    /// Find a FAR
+    pub fn far_find(&self, sess_id: u64, far_id: u32) -> Option<SgwuFar> {
+        self.far_list.read().ok()?.get(&(sess_id, far_id)).cloned()
+    }
+
+    /// Find the FAR whose Outer Header Creation TEID matches (used to map a
+    /// received Error Indication back to a session)
+    pub fn far_find_by_ohc_teid(&self, teid: u32) -> Option<SgwuFar> {
+        self.far_list
+            .read()
+            .ok()?
+            .values()
+            .find(|far| matches!(far.outer_header_creation, Some((t, _, _)) if t == teid))
+            .cloned()
+    }
+
+    /// Update a FAR in place via a closure; returns false when not found
+    pub fn far_update_with<F: FnOnce(&mut SgwuFar)>(
+        &self,
+        sess_id: u64,
+        far_id: u32,
+        f: F,
+    ) -> bool {
+        if let Ok(mut fars) = self.far_list.write() {
+            if let Some(far) = fars.get_mut(&(sess_id, far_id)) {
+                f(far);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Buffer a packet on a FAR whose action is BUFF.
+    /// Returns Some(buffered_count) on success; the count lets the caller
+    /// send a Downlink Data Report only for the first buffered packet.
+    pub fn far_buffer_packet(&self, sess_id: u64, far_id: u32, packet: Vec<u8>) -> Option<usize> {
+        let mut fars = self.far_list.write().ok()?;
+        let far = fars.get_mut(&(sess_id, far_id))?;
+        if far.buffered.len() >= MAX_BUFFERED_PACKETS {
+            log::warn!("FAR {far_id}: buffer full, dropping packet");
+            return Some(far.buffered.len());
+        }
+        far.buffered.push(packet);
+        Some(far.buffered.len())
+    }
+
+    /// Take all buffered packets from a FAR (when transitioning BUFF -> FORW)
+    pub fn far_take_buffered(&self, sess_id: u64, far_id: u32) -> Vec<Vec<u8>> {
+        if let Ok(mut fars) = self.far_list.write() {
+            if let Some(far) = fars.get_mut(&(sess_id, far_id)) {
+                return std::mem::take(&mut far.buffered);
+            }
+        }
+        Vec::new()
+    }
+
+    // ========================================================================
+    // QER / BAR Management
+    // ========================================================================
+
+    /// Install or replace a QER
+    pub fn qer_install(&self, qer: SgwuQer) -> bool {
+        if let Ok(mut qers) = self.qer_list.write() {
+            qers.insert((qer.sess_id, qer.qer_id), qer);
+            return true;
+        }
+        false
+    }
+
+    /// Remove a QER
+    pub fn qer_remove(&self, sess_id: u64, qer_id: u32) -> Option<SgwuQer> {
+        self.qer_list.write().ok()?.remove(&(sess_id, qer_id))
+    }
+
+    /// Find a QER
+    pub fn qer_find(&self, sess_id: u64, qer_id: u32) -> Option<SgwuQer> {
+        self.qer_list.read().ok()?.get(&(sess_id, qer_id)).cloned()
+    }
+
+    /// Install or replace a BAR
+    pub fn bar_install(&self, bar: SgwuBar) -> bool {
+        if let Ok(mut bars) = self.bar_list.write() {
+            bars.insert((bar.sess_id, bar.bar_id), bar);
+            return true;
+        }
+        false
+    }
+
+    /// Remove a BAR
+    pub fn bar_remove(&self, sess_id: u64, bar_id: u8) -> Option<SgwuBar> {
+        self.bar_list.write().ok()?.remove(&(sess_id, bar_id))
     }
 
     /// Remove all sessions for a PFCP node (for restoration)

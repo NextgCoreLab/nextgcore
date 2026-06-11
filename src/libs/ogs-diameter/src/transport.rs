@@ -294,18 +294,44 @@ pub struct DiameterClient {
     peer_addr: SocketAddr,
     peer: Option<DiameterPeer>,
     reconnect_interval: Duration,
+    /// Inbound server-initiated requests (e.g. S6a CLR/IDR) received while
+    /// waiting for an answer; consumed via [`DiameterClient::recv_inbound_request`].
+    pending_requests: std::collections::VecDeque<DiameterMessage>,
+    /// Hop-by-Hop identifier counter (RFC 6733 Section 3: unique per connection)
+    hop_by_hop: u32,
+    /// End-to-End identifier counter (RFC 6733 Section 3)
+    end_to_end: u32,
 }
 
 impl DiameterClient {
     /// Create a new Diameter client
     pub fn new(config: DiameterConfig, peer_addr: SocketAddr) -> Self {
         let reconnect_interval = Duration::from_secs(config.timer_tc as u64);
+        // RFC 6733: End-to-End ID should be set to a value whose low 20 bits
+        // are derived from time on (re)start to avoid collisions.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let seed = (now.as_secs() as u32) << 20 | (now.subsec_nanos() & 0xFFFFF);
         Self {
             config,
             peer_addr,
             peer: None,
             reconnect_interval,
+            pending_requests: std::collections::VecDeque::new(),
+            hop_by_hop: seed,
+            end_to_end: seed,
         }
+    }
+
+    fn next_hop_by_hop(&mut self) -> u32 {
+        self.hop_by_hop = self.hop_by_hop.wrapping_add(1);
+        self.hop_by_hop
+    }
+
+    fn next_end_to_end(&mut self) -> u32 {
+        self.end_to_end = self.end_to_end.wrapping_add(1);
+        self.end_to_end
     }
 
     /// Connect and perform CER/CEA exchange
@@ -366,25 +392,42 @@ impl DiameterClient {
             .unwrap_or(false)
     }
 
-    /// Send an application-level Diameter request and wait for an answer
+    /// Send an application-level Diameter request and wait for an answer.
+    ///
+    /// Hop-by-Hop and End-to-End identifiers are assigned per RFC 6733 if the
+    /// message carries zero values; answers are matched on Hop-by-Hop ID.
+    /// Peer-initiated requests received while waiting (e.g. S6a CLR/IDR) are
+    /// queued and can be drained with [`DiameterClient::recv_inbound_request`].
     pub async fn send_request(&mut self, msg: &DiameterMessage) -> DiameterResult<DiameterMessage> {
+        let mut request = msg.clone();
+        if request.header.hop_by_hop_id == 0 {
+            request.header.hop_by_hop_id = self.next_hop_by_hop();
+        }
+        if request.header.end_to_end_id == 0 {
+            request.header.end_to_end_id = self.next_end_to_end();
+        }
+        let hop_by_hop_id = request.header.hop_by_hop_id;
+
         let peer = self
             .peer
             .as_mut()
             .ok_or(DiameterError::Protocol("not connected".into()))?;
 
-        peer.send_message(msg).await?;
+        peer.send_message(&request).await?;
 
         // Wait for the answer (handle any watchdog messages in between)
         loop {
             match peer.next_event().await? {
                 PeerEvent::Message(answer) => {
-                    if answer.header.is_answer()
-                        && answer.header.command_code == msg.header.command_code
-                    {
+                    if answer.header.is_answer() && answer.header.hop_by_hop_id == hop_by_hop_id {
                         return Ok(answer);
                     }
-                    // Ignore unmatched messages
+                    if answer.header.is_request() {
+                        // Peer-initiated request (e.g. CLR/IDR): queue for the
+                        // application instead of silently dropping it.
+                        self.pending_requests.push_back(answer);
+                    }
+                    // Unmatched answers are dropped
                 }
                 PeerEvent::WatchdogAck => continue,
                 PeerEvent::Disconnected => {
@@ -394,6 +437,50 @@ impl DiameterClient {
                 _ => {}
             }
         }
+    }
+
+    /// Receive a peer-initiated request (e.g. S6a CLR/IDR from the HSS).
+    ///
+    /// Returns a queued request immediately if one is pending; otherwise waits
+    /// up to `timeout` for one to arrive. Returns `Ok(None)` on timeout.
+    pub async fn recv_inbound_request(
+        &mut self,
+        timeout: Duration,
+    ) -> DiameterResult<Option<DiameterMessage>> {
+        if let Some(msg) = self.pending_requests.pop_front() {
+            return Ok(Some(msg));
+        }
+        let peer = self
+            .peer
+            .as_mut()
+            .ok_or(DiameterError::Protocol("not connected".into()))?;
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let event = match tokio::time::timeout_at(deadline, peer.next_event()).await {
+                Ok(ev) => ev?,
+                Err(_) => return Ok(None), // timeout
+            };
+            match event {
+                PeerEvent::Message(msg) if msg.header.is_request() => return Ok(Some(msg)),
+                PeerEvent::Message(_) => continue, // stale answer, drop
+                PeerEvent::WatchdogAck => continue,
+                PeerEvent::Disconnected => {
+                    self.peer = None;
+                    return Err(DiameterError::Protocol("peer disconnected".into()));
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    /// Send an answer to a peer-initiated request.
+    pub async fn send_answer(&mut self, msg: &DiameterMessage) -> DiameterResult<()> {
+        let peer = self
+            .peer
+            .as_mut()
+            .ok_or(DiameterError::Protocol("not connected".into()))?;
+        peer.send_message(msg).await
     }
 
     /// Send a watchdog request
@@ -572,6 +659,119 @@ mod tests {
         assert!(answer.header.is_answer());
         assert_eq!(answer.header.command_code, 318);
         assert_eq!(answer.result_code(), Some(2001));
+
+        handle.await.unwrap();
+    }
+
+    /// A server-initiated request (e.g. S6a CLR) must be deliverable to the
+    /// client application via recv_inbound_request, and answerable.
+    #[tokio::test]
+    async fn test_client_receives_server_initiated_request() {
+        use crate::config::DiameterConfig;
+
+        let server_cfg = DiameterConfig {
+            diameter_id: "hss.example.com".to_string(),
+            diameter_realm: "example.com".to_string(),
+            timer_tc: 30,
+            ..Default::default()
+        };
+
+        let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+        let listener = DiameterListener::bind(addr).await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        let cfg = server_cfg.clone();
+        let handle = tokio::spawn(async move {
+            let transport = listener.accept().await.unwrap();
+            let mut peer = crate::peer::DiameterPeer::new_responder(transport, &cfg);
+            peer.start().await.unwrap();
+            // CER/CEA
+            let _ = peer.next_event().await.unwrap();
+            // Send a CLR (cmd 317) to the client
+            let mut clr = DiameterMessage::new_request(317, 16777251);
+            clr.header.hop_by_hop_id = 77;
+            clr.header.end_to_end_id = 77;
+            clr.add_avp(Avp::mandatory(
+                1,
+                AvpData::Utf8String("001010123456789".to_string()),
+            ));
+            peer.send_message(&clr).await.unwrap();
+            // Expect the CLA
+            match peer.next_event().await.unwrap() {
+                PeerEvent::Message(msg) => {
+                    assert!(msg.header.is_answer());
+                    assert_eq!(msg.header.command_code, 317);
+                    assert_eq!(msg.header.hop_by_hop_id, 77);
+                    assert_eq!(msg.result_code(), Some(2001));
+                }
+                _ => panic!("expected CLA"),
+            }
+        });
+
+        let client_cfg = DiameterConfig {
+            diameter_id: "mme.example.com".to_string(),
+            diameter_realm: "example.com".to_string(),
+            timer_tc: 30,
+            ..Default::default()
+        };
+        let mut client = DiameterClient::new(client_cfg, listen_addr);
+        client.connect().await.unwrap();
+
+        let inbound = client
+            .recv_inbound_request(Duration::from_secs(5))
+            .await
+            .unwrap()
+            .expect("expected inbound CLR");
+        assert!(inbound.header.is_request());
+        assert_eq!(inbound.header.command_code, 317);
+
+        let mut cla = DiameterMessage::new_answer(&inbound);
+        cla.add_avp(Avp::mandatory(268, AvpData::Unsigned32(2001)));
+        client.send_answer(&cla).await.unwrap();
+
+        handle.await.unwrap();
+    }
+
+    /// recv_inbound_request must time out cleanly when nothing arrives.
+    #[tokio::test]
+    async fn test_recv_inbound_request_timeout() {
+        use crate::config::DiameterConfig;
+
+        let server_cfg = DiameterConfig {
+            diameter_id: "hss.example.com".to_string(),
+            diameter_realm: "example.com".to_string(),
+            timer_tc: 30,
+            ..Default::default()
+        };
+
+        let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+        let listener = DiameterListener::bind(addr).await.unwrap();
+        let listen_addr = listener.local_addr().unwrap();
+
+        let cfg = server_cfg.clone();
+        let handle = tokio::spawn(async move {
+            let transport = listener.accept().await.unwrap();
+            let mut peer = crate::peer::DiameterPeer::new_responder(transport, &cfg);
+            peer.start().await.unwrap();
+            let _ = peer.next_event().await.unwrap();
+            // Hold the connection open briefly, sending nothing
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        });
+
+        let client_cfg = DiameterConfig {
+            diameter_id: "mme.example.com".to_string(),
+            diameter_realm: "example.com".to_string(),
+            timer_tc: 30,
+            ..Default::default()
+        };
+        let mut client = DiameterClient::new(client_cfg, listen_addr);
+        client.connect().await.unwrap();
+
+        let inbound = client
+            .recv_inbound_request(Duration::from_millis(100))
+            .await
+            .unwrap();
+        assert!(inbound.is_none());
 
         handle.await.unwrap();
     }

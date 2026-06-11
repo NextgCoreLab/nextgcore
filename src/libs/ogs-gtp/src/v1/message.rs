@@ -90,9 +90,15 @@ impl Gtp1Message {
         Self::gpdu_with_pdu_session(teid, &PduSessionContainer::ul(qfi), payload)
     }
 
-    /// Create an Error Indication message
+    /// Create an Error Indication message.
+    ///
+    /// Per TS 29.281 Section 5.1 the S flag shall be set to 1 for Error
+    /// Indication; per Section 7.3.1 the header TEID shall be 0 and the
+    /// offending TEID travels in the Tunnel Endpoint Identifier Data I IE.
     pub fn error_indication(teid: u32, peer_teid: u32, peer_addr: &[u8]) -> Self {
-        let header = Gtp1Header::new(Gtp1uMessageType::ErrorIndication as u8, teid);
+        let mut header = Gtp1Header::new(Gtp1uMessageType::ErrorIndication as u8, teid);
+        header.s = true;
+        header.sequence_number = Some(0);
         let mut msg = Self::new(header);
 
         // Add TEID Data I IE
@@ -346,21 +352,28 @@ impl ErrorIndication {
     }
 
     pub fn decode(msg: &Gtp1Message) -> GtpResult<Self> {
-        let teid = msg
-            .get_ie(16) // TEID Data I
-            .map(|ie| {
-                if ie.value.len() >= 4 {
-                    u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]])
-                } else {
-                    0
-                }
-            })
-            .unwrap_or(0);
+        // Both IEs are mandatory in an Error Indication
+        // (TS 29.281 Section 7.3.1)
+        let teid_ie = msg.get_ie(16).ok_or_else(|| {
+            GtpError::MissingMandatoryIe("Tunnel Endpoint Identifier Data I".to_string())
+        })?;
+        if teid_ie.value.len() < 4 {
+            return Err(GtpError::InvalidIeLength {
+                expected: 4,
+                actual: teid_ie.value.len(),
+            });
+        }
+        let teid = u32::from_be_bytes([
+            teid_ie.value[0],
+            teid_ie.value[1],
+            teid_ie.value[2],
+            teid_ie.value[3],
+        ]);
 
         let gsn_address = msg
             .get_ie(133) // GSN Address
             .map(|ie| ie.value.to_vec())
-            .expect("value expected");
+            .ok_or_else(|| GtpError::MissingMandatoryIe("GTP-U Peer Address".to_string()))?;
 
         Ok(Self { teid, gsn_address })
     }

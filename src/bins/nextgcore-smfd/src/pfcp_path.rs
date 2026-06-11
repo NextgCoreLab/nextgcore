@@ -1,17 +1,38 @@
-//! PFCP Path Management
-
-#![allow(dead_code)]
-#![allow(unused_imports)]
-#![allow(unused_variables)]
+//! PFCP Path Management — the SMF's N4 transaction engine (TS 29.244)
 //!
-//! Port of src/smf/pfcp-path.c - PFCP path management for SMF
-//! Handles PFCP session establishment, modification, and deletion requests
+//! Replaces the former dead parallel-builder module: all PFCP messages now
+//! leave the SMF through exactly one code path. Session message bodies are
+//! built by `n4_build`; node-level messages (Heartbeat, Association
+//! Setup/Release) use the ogs-pfcp library codec directly.
+//!
+//! Responsibilities:
+//! - request/response transaction matching by sequence number
+//! - T1 retransmission up to N1 attempts, exhaustion = abnormal action
+//!   (TS 29.244 7.2.1; configured in `timer::SmfTimerConfigs`)
+//! - PFCP Association Setup / Release with the UPF
+//! - Heartbeat in both directions with Recovery Time Stamp staleness
+//!   detection (peer restart ⇒ local session state flushed)
 
-use crate::n4_build::{apply_action, pfcp_ie, PfcpCause, PfcpMessageBuilder};
-use crate::n4_handler::{modify_flags, DeleteTrigger};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
+use bytes::Bytes;
+use ogs_pfcp::message::{
+    build_message, AssociationReleaseRequest, AssociationSetupRequest, AssociationSetupResponse,
+    HeartbeatRequest, HeartbeatResponse, PfcpMessage,
+};
+use ogs_pfcp::types::{CpFunctionFeatures, NodeId, UpFunctionFeatures};
+use tokio::net::UdpSocket;
+use tokio::sync::{oneshot, Mutex, RwLock};
+
+use crate::context::smf_self;
+use crate::timer::SmfTimerConfigs;
 
 // ============================================================================
-// PFCP Message Types
+// PFCP Message Types (TS 29.244 Table 7.3-1)
 // ============================================================================
 
 /// PFCP Message types
@@ -41,499 +62,559 @@ pub mod pfcp_message_type {
     pub const SESSION_REPORT_RESPONSE: u8 = 57;
 }
 
+/// Is this message type a response (solicited by one of our requests)?
+fn is_response_type(msg_type: u8) -> bool {
+    matches!(msg_type, 2 | 4 | 6 | 8 | 10 | 11 | 13 | 15 | 51 | 53 | 55 | 57)
+}
+
 // ============================================================================
-// PFCP Header
+// Wire helpers
 // ============================================================================
 
-/// PFCP Header structure
-#[derive(Debug, Clone, Default)]
-pub struct PfcpHeader {
+/// Minimal decoded view of a PFCP datagram header
+#[derive(Debug, Clone, Copy)]
+pub struct WireHeader {
     pub version: u8,
-    pub message_type: u8,
-    pub length: u16,
+    pub msg_type: u8,
+    pub seid_present: bool,
     pub seid: u64,
     pub sequence_number: u32,
+    /// Offset of the IE payload within the datagram
+    pub body_offset: usize,
 }
 
-impl PfcpHeader {
-    pub fn new(message_type: u8, seid: u64, sequence_number: u32) -> Self {
-        Self {
-            version: 1,
-            message_type,
-            length: 0,
+/// Parse the PFCP header of a raw datagram (TS 29.244 7.2.2).
+pub fn parse_wire_header(pkt: &[u8]) -> Option<WireHeader> {
+    if pkt.len() < 8 {
+        return None;
+    }
+    let version = pkt[0] >> 5;
+    let seid_present = pkt[0] & 0x01 != 0;
+    let msg_type = pkt[1];
+    if seid_present {
+        if pkt.len() < 16 {
+            return None;
+        }
+        let seid = u64::from_be_bytes(pkt[4..12].try_into().ok()?);
+        let seq = u32::from_be_bytes([0, pkt[12], pkt[13], pkt[14]]);
+        Some(WireHeader {
+            version,
+            msg_type,
+            seid_present,
             seid,
-            sequence_number,
+            sequence_number: seq,
+            body_offset: 16,
+        })
+    } else {
+        let seq = u32::from_be_bytes([0, pkt[4], pkt[5], pkt[6]]);
+        Some(WireHeader {
+            version,
+            msg_type,
+            seid_present,
+            seid: 0,
+            sequence_number: seq,
+            body_offset: 8,
+        })
+    }
+}
+
+/// Encode a complete PFCP datagram from a message body built by `n4_build`.
+pub fn encode_wire_message(msg_type: u8, seid: Option<u64>, seq: u32, body: &[u8]) -> Vec<u8> {
+    let mut pkt = Vec::with_capacity(16 + body.len());
+    match seid {
+        Some(seid) => {
+            pkt.push(0x21); // version=1, S=1
+            pkt.push(msg_type);
+            pkt.extend_from_slice(&((12 + body.len()) as u16).to_be_bytes());
+            pkt.extend_from_slice(&seid.to_be_bytes());
+        }
+        None => {
+            pkt.push(0x20); // version=1, S=0
+            pkt.push(msg_type);
+            pkt.extend_from_slice(&((4 + body.len()) as u16).to_be_bytes());
+        }
+    }
+    pkt.extend_from_slice(&seq.to_be_bytes()[1..4]);
+    pkt.push(0); // spare
+    pkt.extend_from_slice(body);
+    pkt
+}
+
+/// Scan a PFCP message body for the Cause IE (type 19) and return its value.
+pub fn parse_cause(body: &[u8]) -> Option<u8> {
+    find_ie(body, 19).and_then(|v| v.first().copied())
+}
+
+/// Scan a flat TLV body for the first IE of the given type.
+pub fn find_ie(body: &[u8], ie_type: u16) -> Option<&[u8]> {
+    let mut off = 0usize;
+    while off + 4 <= body.len() {
+        let t = u16::from_be_bytes([body[off], body[off + 1]]);
+        let l = u16::from_be_bytes([body[off + 2], body[off + 3]]) as usize;
+        let start = off + 4;
+        let end = start + l;
+        if end > body.len() {
+            return None;
+        }
+        if t == ie_type {
+            return Some(&body[start..end]);
+        }
+        off = end;
+    }
+    None
+}
+
+/// PFCP cause values used on the N4 reply paths (TS 29.244 8.2.1)
+pub mod pfcp_cause {
+    pub const REQUEST_ACCEPTED: u8 = 1;
+    pub const REQUEST_REJECTED: u8 = 64;
+    pub const SESSION_CONTEXT_NOT_FOUND: u8 = 65;
+    pub const MANDATORY_IE_MISSING: u8 = 66;
+    pub const NO_ESTABLISHED_PFCP_ASSOCIATION: u8 = 72;
+}
+
+/// Human-readable PFCP cause name for error reporting
+pub fn cause_name(cause: u8) -> &'static str {
+    match cause {
+        1 => "Request accepted",
+        64 => "Request rejected",
+        65 => "Session context not found",
+        66 => "Mandatory IE missing",
+        67 => "Conditional IE missing",
+        68 => "Invalid length",
+        69 => "Mandatory IE incorrect",
+        70 => "Invalid Forwarding Policy",
+        71 => "Invalid F-TEID allocation option",
+        72 => "No established PFCP Association",
+        73 => "Rule creation/modification failure",
+        74 => "PFCP entity in congestion",
+        75 => "No resources available",
+        76 => "Service not supported",
+        77 => "System failure",
+        78 => "Redirection requested",
+        _ => "Unknown cause",
+    }
+}
+
+// ============================================================================
+// Errors
+// ============================================================================
+
+/// Failure modes of an N4 transaction
+#[derive(Debug)]
+pub enum PfcpRequestError {
+    /// No response after N1 retransmissions — peer unreachable
+    Timeout { attempts: u32 },
+    /// Peer answered with a non-accepted cause
+    Rejected { cause: u8 },
+    /// Local I/O or state error
+    Local(String),
+    /// No PFCP association established with the peer
+    NotAssociated,
+}
+
+impl std::fmt::Display for PfcpRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout { attempts } => {
+                write!(f, "no PFCP response after {attempts} attempts")
+            }
+            Self::Rejected { cause } => {
+                write!(f, "PFCP request rejected: cause {cause} ({})", cause_name(*cause))
+            }
+            Self::Local(e) => write!(f, "local PFCP error: {e}"),
+            Self::NotAssociated => write!(f, "no established PFCP association"),
         }
     }
 }
 
-// ============================================================================
-// PFCP Transaction
-// ============================================================================
-
-/// PFCP Transaction state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PfcpXactState {
-    Initial,
-    WaitingResponse,
-    Completed,
-    Timeout,
-}
-
-/// PFCP Transaction
-#[derive(Debug, Clone)]
-pub struct PfcpXact {
-    pub id: u64,
-    pub state: PfcpXactState,
-    pub sequence_number: u32,
-    pub local_seid: u64,
-    pub remote_seid: u64,
-    pub epc: bool,
-    pub create_flags: u64,
-    pub modify_flags: u64,
-    pub delete_trigger: Option<u8>,
-    pub assoc_stream_id: Option<u64>,
-    pub assoc_xact_id: Option<u64>,
-    pub gtp_pti: u8,
-    pub gtp_cause: u8,
-    pub data: Option<u64>,
-}
-
-impl PfcpXact {
-    pub fn new(id: u64, sequence_number: u32) -> Self {
-        Self {
-            id,
-            state: PfcpXactState::Initial,
-            sequence_number,
-            local_seid: 0,
-            remote_seid: 0,
-            epc: false,
-            create_flags: 0,
-            modify_flags: 0,
-            delete_trigger: None,
-            assoc_stream_id: None,
-            assoc_xact_id: None,
-            gtp_pti: 0,
-            gtp_cause: 0,
-            data: None,
-        }
-    }
-
-    pub fn commit(&mut self) {
-        self.state = PfcpXactState::Completed;
-    }
-
-    pub fn timeout(&mut self) {
-        self.state = PfcpXactState::Timeout;
-    }
-}
+impl std::error::Error for PfcpRequestError {}
 
 // ============================================================================
-// PFCP Node
+// Association state
 // ============================================================================
 
-/// PFCP Node state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PfcpNodeState {
-    Initial,
-    Associated,
-    Disconnected,
-}
-
-/// UP Function Features
+/// State of the N4 association with the UPF
 #[derive(Debug, Clone, Default)]
-pub struct UpFunctionFeatures {
-    pub ftup: bool, // F-TEID allocation/release in the UP function
-    pub bucp: bool, // Downlink Data Buffering in CP function
-    pub ddnd: bool, // Buffering parameter 'Downlink Data Notification Delay'
-    pub dlbd: bool, // DL Buffering Duration
-    pub trst: bool, // Traffic Steering
-    pub ftup_ipv4: bool,
-    pub ftup_ipv6: bool,
+pub struct AssociationState {
+    pub associated: bool,
+    /// Recovery Time Stamp the peer reported at association / heartbeat
+    pub peer_recovery_time_stamp: Option<u32>,
+    /// UP Function Features advertised by the UPF
+    pub up_function_features: Option<UpFunctionFeatures>,
 }
 
-/// PFCP Node
-#[derive(Debug, Clone)]
-pub struct PfcpNode {
-    pub id: u64,
-    pub state: PfcpNodeState,
-    pub node_id: Vec<u8>,
-    pub up_function_features: UpFunctionFeatures,
+// ============================================================================
+// PFCP client (transaction engine)
+// ============================================================================
+
+/// The SMF's PFCP endpoint: one shared socket for requests and responses,
+/// transactions matched on sequence number.
+pub struct PfcpClient {
+    socket: Arc<UdpSocket>,
+    peer: SocketAddr,
+    node_ip: [u8; 4],
+    /// Our own Recovery Time Stamp (seconds since the epoch at startup)
     pub recovery_time_stamp: u32,
+    pending: Mutex<HashMap<u32, oneshot::Sender<(u8, Vec<u8>)>>>,
+    assoc: RwLock<AssociationState>,
+    timers: SmfTimerConfigs,
 }
 
-impl PfcpNode {
-    pub fn new(id: u64) -> Self {
+static PFCP_CLIENT: OnceLock<Arc<PfcpClient>> = OnceLock::new();
+
+/// Install the process-wide PFCP client (once, at startup).
+pub fn set_global_client(client: Arc<PfcpClient>) {
+    let _ = PFCP_CLIENT.set(client);
+}
+
+/// The process-wide PFCP client, if initialised.
+pub fn global_client() -> Option<Arc<PfcpClient>> {
+    PFCP_CLIENT.get().cloned()
+}
+
+impl PfcpClient {
+    /// Create a client bound to an existing N4 socket.
+    pub fn new(socket: Arc<UdpSocket>, peer: SocketAddr, node_ip: [u8; 4]) -> Self {
+        let recovery_time_stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(1);
         Self {
-            id,
-            state: PfcpNodeState::Initial,
-            node_id: Vec::new(),
-            up_function_features: UpFunctionFeatures::default(),
-            recovery_time_stamp: 0,
+            socket,
+            peer,
+            node_ip,
+            recovery_time_stamp,
+            pending: Mutex::new(HashMap::new()),
+            assoc: RwLock::new(AssociationState::default()),
+            timers: SmfTimerConfigs::default(),
         }
     }
 
-    pub fn is_associated(&self) -> bool {
-        self.state == PfcpNodeState::Associated
-    }
-}
-
-// ============================================================================
-// PFCP Path Manager
-// ============================================================================
-
-/// PFCP Path Manager
-/// Manages PFCP connections and transactions.
-/// Sequence numbers are sourced from the global `PFCP_SEQ` counter in main.rs
-/// so that all code paths share a single monotonically-increasing counter and
-/// never produce duplicate sequence numbers.
-pub struct PfcpPathManager {
-    next_xact_id: u64,
-}
-
-impl PfcpPathManager {
-    pub fn new() -> Self {
-        Self { next_xact_id: 1 }
+    /// The UPF endpoint this client talks to.
+    pub fn peer(&self) -> SocketAddr {
+        self.peer
     }
 
-    /// Create a new PFCP transaction using the global sequence counter.
-    pub fn create_xact(&mut self) -> PfcpXact {
-        let id = self.next_xact_id;
-        self.next_xact_id += 1;
-        let seq = crate::PFCP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        PfcpXact::new(id, seq)
+    /// Our Node ID address.
+    pub fn node_ip(&self) -> [u8; 4] {
+        self.node_ip
     }
 
-    /// Get next sequence number from the global counter.
-    pub fn next_sequence(&mut self) -> u32 {
-        crate::PFCP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    /// Whether the N4 association is currently established.
+    pub async fn is_associated(&self) -> bool {
+        self.assoc.read().await.associated
     }
-}
 
-impl Default for PfcpPathManager {
-    fn default() -> Self {
-        Self::new()
+    /// Snapshot of the association state.
+    pub async fn association(&self) -> AssociationState {
+        self.assoc.read().await.clone()
     }
-}
 
-// ============================================================================
-// 5GC PFCP Send Functions
-// ============================================================================
+    /// T1/N1 parameters for a given request type.
+    fn retransmit_params(&self, msg_type: u8) -> (Duration, u32) {
+        let cfg = match msg_type {
+            pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST
+            | pfcp_message_type::SESSION_MODIFICATION_REQUEST => {
+                &self.timers.pfcp_no_establishment_response
+            }
+            pfcp_message_type::SESSION_DELETION_REQUEST => &self.timers.pfcp_no_deletion_response,
+            pfcp_message_type::HEARTBEAT_REQUEST => &self.timers.pfcp_no_heartbeat,
+            _ => &self.timers.pfcp_association,
+        };
+        (cfg.duration, cfg.max_count)
+    }
 
-/// Parameters for 5GC session establishment request
-#[derive(Debug, Clone, Default)]
-pub struct SessionEstablishmentParams {
-    pub smf_n4_seid: u64,
-    pub upf_n4_seid: u64,
-    pub stream_id: Option<u64>,
-    pub flags: u64,
-}
+    /// Send a request and wait for the matching response, retransmitting on
+    /// T1 expiry up to N1 times (TS 29.244 7.2.1). Returns the response
+    /// message type and body.
+    pub async fn request(
+        &self,
+        msg_type: u8,
+        seid: Option<u64>,
+        body: &[u8],
+    ) -> Result<(u8, Vec<u8>), PfcpRequestError> {
+        let seq = crate::PFCP_SEQ.fetch_add(1, Ordering::Relaxed) & 0x00FF_FFFF;
+        let pkt = encode_wire_message(msg_type, seid, seq, body);
+        let (t1, n1) = self.retransmit_params(msg_type);
 
-/// Build 5GC session establishment request
-/// Port of smf_5gc_pfcp_send_session_establishment_request() from pfcp-path.c
-pub fn build_5gc_session_establishment_request(
-    params: &SessionEstablishmentParams,
-    sequence_number: u32,
-) -> (PfcpHeader, Vec<u8>) {
-    let header = PfcpHeader::new(
-        pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST,
-        params.upf_n4_seid, // SEID=0 for establishment
-        sequence_number,
-    );
+        // attempts = first transmission + up to N1 retransmissions
+        let max_attempts = n1 + 1;
+        let mut attempt = 0u32;
 
-    // Build message body using PfcpMessageBuilder
-    let mut builder = PfcpMessageBuilder::new();
+        let result = loop {
+            attempt += 1;
 
-    // Add F-SEID IE
-    builder.add_f_seid(params.smf_n4_seid, None, None);
+            // (Re-)register the response slot for this sequence number
+            let (tx, rx) = oneshot::channel();
+            self.pending.lock().await.insert(seq, tx);
 
-    (header, builder.build())
-}
+            if let Err(e) = self.socket.send_to(&pkt, self.peer).await {
+                self.pending.lock().await.remove(&seq);
+                break Err(PfcpRequestError::Local(format!("send failed: {e}")));
+            }
+            if attempt > 1 {
+                log::warn!(
+                    "PFCP T1 expired: retransmitting type={msg_type} seq={seq} \
+                     (attempt {attempt}/{max_attempts})"
+                );
+            }
 
-/// Parameters for 5GC session modification request
-#[derive(Debug, Clone, Default)]
-pub struct SessionModificationParams {
-    pub smf_n4_seid: u64,
-    pub upf_n4_seid: u64,
-    pub stream_id: Option<u64>,
-    pub flags: u64,
-    pub trigger: Option<u8>,
-}
+            match tokio::time::timeout(t1, rx).await {
+                Ok(Ok((resp_type, resp_body))) => break Ok((resp_type, resp_body)),
+                Ok(Err(_)) => {
+                    break Err(PfcpRequestError::Local("response channel closed".into()))
+                }
+                Err(_) => {
+                    // T1 expired
+                    self.pending.lock().await.remove(&seq);
+                    if attempt >= max_attempts {
+                        log::error!(
+                            "PFCP request type={msg_type} seq={seq} exhausted \
+                             {max_attempts} attempts — peer {} unreachable",
+                            self.peer
+                        );
+                        break Err(PfcpRequestError::Timeout {
+                            attempts: max_attempts,
+                        });
+                    }
+                }
+            }
+        };
 
-/// Build 5GC all PDR modification request
-/// Port of smf_5gc_pfcp_send_all_pdr_modification_request() from pfcp-path.c
-pub fn build_5gc_all_pdr_modification_request(
-    params: &SessionModificationParams,
-    sequence_number: u32,
-) -> (PfcpHeader, Vec<u8>) {
-    let header = PfcpHeader::new(
-        pfcp_message_type::SESSION_MODIFICATION_REQUEST,
-        params.upf_n4_seid,
-        sequence_number,
-    );
+        // Exhaustion abnormal action: a node-level silence means the peer is
+        // gone — drop the association so new sessions are refused until the
+        // association is re-established.
+        if matches!(result, Err(PfcpRequestError::Timeout { .. })) {
+            let mut assoc = self.assoc.write().await;
+            if assoc.associated {
+                log::error!("Marking PFCP association with {} as DOWN", self.peer);
+                assoc.associated = false;
+            }
+        }
 
-    let mut builder = PfcpMessageBuilder::new();
+        result
+    }
 
-    // Update FAR: set Apply-Action based on modify flags.
-    // DEACTIVATE → BUFF+NOCP (buffer and notify CP), otherwise FORW (forward).
-    let far_action = if params.flags & modify_flags::DEACTIVATE != 0 {
-        apply_action::BUFF | apply_action::NOCP
-    } else {
-        apply_action::FORW
-    };
+    /// Feed an incoming datagram into the engine. Returns true when the
+    /// datagram was consumed (response to a pending request, or a node-level
+    /// request that was handled here).
+    pub async fn on_datagram(&self, pkt: &[u8], from: SocketAddr) -> bool {
+        let header = match parse_wire_header(pkt) {
+            Some(h) => h,
+            None => return false,
+        };
 
-    // UPDATE_FAR grouped IE: FAR-ID + Apply-Action
-    let mut far_ie = PfcpMessageBuilder::new();
-    far_ie.add_far_id(1); // FAR ID 1 is the default uplink/downlink FAR
-    far_ie.add_apply_action(far_action);
-    builder.add_tlv(pfcp_ie::UPDATE_FAR, &far_ie.build());
-
-    // UPDATE_QER grouped IE: QER-ID + Gate-Status
-    // DEACTIVATE → gates closed (1=CLOSED), otherwise open (0=OPEN)
-    let gate = if params.flags & modify_flags::DEACTIVATE != 0 {
-        1u8
-    } else {
-        0u8
-    };
-    let mut qer_ie = PfcpMessageBuilder::new();
-    qer_ie.add_qer_id(1); // QER ID 1 is the default QER
-    qer_ie.add_gate_status(gate, gate);
-    builder.add_tlv(pfcp_ie::UPDATE_QER, &qer_ie.build());
-
-    (header, builder.build())
-}
-
-/// Build 5GC QoS flow list modification request
-/// Port of smf_5gc_pfcp_send_qos_flow_list_modification_request() from pfcp-path.c
-pub fn build_5gc_qos_flow_modification_request(
-    params: &SessionModificationParams,
-    sequence_number: u32,
-) -> (PfcpHeader, Vec<u8>) {
-    let header = PfcpHeader::new(
-        pfcp_message_type::SESSION_MODIFICATION_REQUEST,
-        params.upf_n4_seid,
-        sequence_number,
-    );
-
-    let mut builder = PfcpMessageBuilder::new();
-
-    // UPDATE_FAR: update the forwarding action for the QoS flow FAR.
-    // QOS_MODIFY flag → keep forwarding but update QoS parameters.
-    let far_action = if params.flags & modify_flags::DEACTIVATE != 0 {
-        apply_action::BUFF | apply_action::NOCP
-    } else {
-        apply_action::FORW
-    };
-
-    let mut far_ie = PfcpMessageBuilder::new();
-    far_ie.add_far_id(1);
-    far_ie.add_apply_action(far_action);
-    builder.add_tlv(pfcp_ie::UPDATE_FAR, &far_ie.build());
-
-    // UPDATE_QER: update gate status for the QoS flow.
-    // QOS_MODIFY → gates open; DEACTIVATE → gates closed.
-    let gate = if params.flags & modify_flags::DEACTIVATE != 0 {
-        1u8
-    } else {
-        0u8
-    };
-    let mut qer_ie = PfcpMessageBuilder::new();
-    qer_ie.add_qer_id(1);
-    qer_ie.add_gate_status(gate, gate);
-    builder.add_tlv(pfcp_ie::UPDATE_QER, &qer_ie.build());
-
-    (header, builder.build())
-}
-
-/// Parameters for 5GC session deletion request
-#[derive(Debug, Clone, Default)]
-pub struct SessionDeletionParams {
-    pub smf_n4_seid: u64,
-    pub upf_n4_seid: u64,
-    pub stream_id: Option<u64>,
-    pub trigger: u8,
-}
-
-/// Build 5GC session deletion request
-/// Port of smf_5gc_pfcp_send_session_deletion_request() from pfcp-path.c
-pub fn build_5gc_session_deletion_request(
-    params: &SessionDeletionParams,
-    sequence_number: u32,
-) -> (PfcpHeader, Vec<u8>) {
-    let header = PfcpHeader::new(
-        pfcp_message_type::SESSION_DELETION_REQUEST,
-        params.upf_n4_seid,
-        sequence_number,
-    );
-
-    // Session deletion request has no mandatory IEs in the body
-    let builder = PfcpMessageBuilder::new();
-
-    (header, builder.build())
-}
-
-// ============================================================================
-// EPC PFCP Send Functions
-// ============================================================================
-
-/// Parameters for EPC session establishment request
-#[derive(Debug, Clone, Default)]
-pub struct EpcSessionEstablishmentParams {
-    pub smf_n4_seid: u64,
-    pub upf_n4_seid: u64,
-    pub gtp_xact_id: Option<u64>,
-    pub flags: u64,
-}
-
-/// Build EPC session establishment request
-/// Port of smf_epc_pfcp_send_session_establishment_request() from pfcp-path.c
-pub fn build_epc_session_establishment_request(
-    params: &EpcSessionEstablishmentParams,
-    sequence_number: u32,
-) -> (PfcpHeader, Vec<u8>) {
-    let header = PfcpHeader::new(
-        pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST,
-        params.upf_n4_seid,
-        sequence_number,
-    );
-
-    let mut builder = PfcpMessageBuilder::new();
-
-    // Add F-SEID IE
-    builder.add_f_seid(params.smf_n4_seid, None, None);
-
-    (header, builder.build())
-}
-
-/// Parameters for EPC session modification request
-#[derive(Debug, Clone, Default)]
-pub struct EpcSessionModificationParams {
-    pub smf_n4_seid: u64,
-    pub upf_n4_seid: u64,
-    pub gtp_xact_id: Option<u64>,
-    pub flags: u64,
-    pub gtp_pti: u8,
-    pub gtp_cause: u8,
-}
-
-/// Build EPC all PDR modification request
-/// Port of smf_epc_pfcp_send_all_pdr_modification_request() from pfcp-path.c
-pub fn build_epc_all_pdr_modification_request(
-    params: &EpcSessionModificationParams,
-    sequence_number: u32,
-) -> (PfcpHeader, Vec<u8>) {
-    let header = PfcpHeader::new(
-        pfcp_message_type::SESSION_MODIFICATION_REQUEST,
-        params.upf_n4_seid,
-        sequence_number,
-    );
-
-    let builder = PfcpMessageBuilder::new();
-
-    (header, builder.build())
-}
-
-/// Build EPC one bearer modification request
-/// Port of smf_epc_pfcp_send_one_bearer_modification_request() from pfcp-path.c
-pub fn build_epc_bearer_modification_request(
-    params: &EpcSessionModificationParams,
-    sequence_number: u32,
-) -> (PfcpHeader, Vec<u8>) {
-    let header = PfcpHeader::new(
-        pfcp_message_type::SESSION_MODIFICATION_REQUEST,
-        params.upf_n4_seid,
-        sequence_number,
-    );
-
-    let builder = PfcpMessageBuilder::new();
-
-    (header, builder.build())
-}
-
-/// Parameters for EPC session deletion request
-#[derive(Debug, Clone, Default)]
-pub struct EpcSessionDeletionParams {
-    pub smf_n4_seid: u64,
-    pub upf_n4_seid: u64,
-    pub gtp_xact_id: Option<u64>,
-}
-
-/// Build EPC session deletion request
-/// Port of smf_epc_pfcp_send_session_deletion_request() from pfcp-path.c
-pub fn build_epc_session_deletion_request(
-    params: &EpcSessionDeletionParams,
-    sequence_number: u32,
-) -> (PfcpHeader, Vec<u8>) {
-    let header = PfcpHeader::new(
-        pfcp_message_type::SESSION_DELETION_REQUEST,
-        params.upf_n4_seid,
-        sequence_number,
-    );
-
-    let builder = PfcpMessageBuilder::new();
-
-    (header, builder.build())
-}
-
-// ============================================================================
-// Session Report Response
-// ============================================================================
-
-/// Build session report response
-/// Port of smf_pfcp_send_session_report_response() from pfcp-path.c
-pub fn build_session_report_response(
-    upf_n4_seid: u64,
-    sequence_number: u32,
-    cause: u8,
-) -> (PfcpHeader, Vec<u8>) {
-    let header = PfcpHeader::new(
-        pfcp_message_type::SESSION_REPORT_RESPONSE,
-        upf_n4_seid,
-        sequence_number,
-    );
-
-    let mut builder = PfcpMessageBuilder::new();
-    builder.add_cause_raw(cause);
-
-    (header, builder.build())
-}
-
-// ============================================================================
-// EPC Deactivation
-// ============================================================================
-
-/// GTP2 Cause codes for handover
-pub mod gtp2_handover_cause {
-    pub const ACCESS_CHANGED_FROM_NON_3GPP_TO_3GPP: u8 = 113;
-    pub const RAT_CHANGED_FROM_3GPP_TO_NON_3GPP: u8 = 114;
-}
-
-/// Build EPC deactivation request for handover
-/// Port of smf_epc_pfcp_send_deactivation() from pfcp-path.c
-pub fn build_epc_deactivation_request(
-    params: &EpcSessionModificationParams,
-    gtp_cause: u8,
-    sequence_number: u32,
-) -> Option<(PfcpHeader, Vec<u8>)> {
-    match gtp_cause {
-        gtp2_handover_cause::ACCESS_CHANGED_FROM_NON_3GPP_TO_3GPP
-        | gtp2_handover_cause::RAT_CHANGED_FROM_3GPP_TO_NON_3GPP => {
-            let header = PfcpHeader::new(
-                pfcp_message_type::SESSION_MODIFICATION_REQUEST,
-                params.upf_n4_seid,
-                sequence_number,
+        // Version check (TS 29.244 7.2.2): only v1 is supported
+        if header.version != 1 {
+            log::warn!("PFCP version {} from {from} not supported", header.version);
+            let resp = encode_wire_message(
+                pfcp_message_type::VERSION_NOT_SUPPORTED_RESPONSE,
+                None,
+                header.sequence_number,
+                &[],
             );
-
-            let builder = PfcpMessageBuilder::new();
-            // Add deactivation flags
-
-            Some((header, builder.build()))
+            let _ = self.socket.send_to(&resp, from).await;
+            return true;
         }
-        _ => {
-            log::error!("Invalid GTP-Cause[{gtp_cause}]");
-            None
+
+        let body = &pkt[header.body_offset.min(pkt.len())..];
+
+        // Responses: complete the matching pending transaction
+        if is_response_type(header.msg_type) {
+            if let Some(tx) = self.pending.lock().await.remove(&header.sequence_number) {
+                let _ = tx.send((header.msg_type, body.to_vec()));
+                return true;
+            }
+            log::debug!(
+                "PFCP response type={} seq={} with no pending transaction",
+                header.msg_type,
+                header.sequence_number
+            );
+            return true;
+        }
+
+        // Node-level requests handled by the engine
+        match header.msg_type {
+            pfcp_message_type::HEARTBEAT_REQUEST => {
+                // Staleness detection on the peer's Recovery Time Stamp
+                if let Some(rts) = find_ie(body, 96)
+                    .filter(|v| v.len() >= 4)
+                    .map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
+                {
+                    self.check_peer_restart(rts).await;
+                }
+                let msg = PfcpMessage::HeartbeatResponse(HeartbeatResponse::new(
+                    self.recovery_time_stamp,
+                ));
+                let resp = build_message(&msg, header.sequence_number, None);
+                if let Err(e) = self.socket.send_to(&resp, from).await {
+                    log::warn!("Failed to send Heartbeat Response: {e}");
+                } else {
+                    log::debug!("Heartbeat Response sent to {from}");
+                }
+                true
+            }
+            pfcp_message_type::ASSOCIATION_RELEASE_REQUEST => {
+                log::warn!("PFCP Association Release Request from {from}");
+                // Respond Node ID + Cause accepted via the library codec
+                let msg = PfcpMessage::AssociationReleaseResponse(
+                    ogs_pfcp::message::AssociationReleaseResponse::new(
+                        NodeId::new_ipv4(self.node_ip),
+                        ogs_pfcp::types::PfcpCause::RequestAccepted,
+                    ),
+                );
+                let resp = build_message(&msg, header.sequence_number, None);
+                let _ = self.socket.send_to(&resp, from).await;
+                self.teardown_association("association released by peer")
+                    .await;
+                true
+            }
+            _ => false, // e.g. Session Report Request — handled by main.rs
         }
     }
+
+    /// Compare a peer Recovery Time Stamp with the stored value; a change
+    /// means the UPF restarted: all sessions on it are gone (TS 23.527 4.2).
+    pub async fn check_peer_restart(&self, rts: u32) {
+        let restarted = {
+            let assoc = self.assoc.read().await;
+            matches!(assoc.peer_recovery_time_stamp, Some(stored) if stored != rts)
+        };
+        if restarted {
+            log::error!(
+                "UPF {} restarted (recovery time stamp changed to {rts})",
+                self.peer
+            );
+            self.teardown_association("peer restarted").await;
+            // Remember the new incarnation so re-association succeeds
+            self.assoc.write().await.peer_recovery_time_stamp = Some(rts);
+        }
+    }
+
+    /// Mark the association down and flush all PFCP session state.
+    async fn teardown_association(&self, reason: &str) {
+        {
+            let mut assoc = self.assoc.write().await;
+            assoc.associated = false;
+        }
+        let cleared = clear_pfcp_sessions();
+        log::warn!("PFCP association torn down ({reason}); {cleared} stale sessions flushed");
+    }
+
+    /// Run the PFCP Association Setup procedure (TS 29.244 6.2.6).
+    pub async fn associate(&self) -> Result<(), PfcpRequestError> {
+        let mut req = AssociationSetupRequest::new(
+            NodeId::new_ipv4(self.node_ip),
+            self.recovery_time_stamp,
+        );
+        // CP Function Features: none of the optional CP features (LOAD,
+        // OVRL, …) are implemented, so all bits are honestly zero.
+        req.cp_function_features = Some(CpFunctionFeatures::default());
+        let msg = PfcpMessage::AssociationSetupRequest(req);
+        let mut buf = bytes::BytesMut::new();
+        msg.encode_body(&mut buf);
+
+        let (resp_type, resp_body) = self
+            .request(pfcp_message_type::ASSOCIATION_SETUP_REQUEST, None, &buf)
+            .await?;
+
+        if resp_type != pfcp_message_type::ASSOCIATION_SETUP_RESPONSE {
+            return Err(PfcpRequestError::Local(format!(
+                "unexpected response type {resp_type} to Association Setup"
+            )));
+        }
+
+        let mut body = Bytes::copy_from_slice(&resp_body);
+        let resp = AssociationSetupResponse::decode(&mut body)
+            .map_err(|e| PfcpRequestError::Local(format!("malformed response: {e}")))?;
+
+        if resp.cause != ogs_pfcp::types::PfcpCause::RequestAccepted {
+            return Err(PfcpRequestError::Rejected {
+                cause: resp.cause as u8,
+            });
+        }
+
+        // Restart detection against any previously stored timestamp
+        self.check_peer_restart(resp.recovery_time_stamp).await;
+
+        let mut assoc = self.assoc.write().await;
+        assoc.associated = true;
+        assoc.peer_recovery_time_stamp = Some(resp.recovery_time_stamp);
+        assoc.up_function_features = resp.up_function_features;
+        log::info!(
+            "PFCP association established with {} (peer RTS={}, UP features={:?})",
+            self.peer,
+            resp.recovery_time_stamp,
+            assoc.up_function_features.as_ref().map(|f| (f.ftup, f.empu, f.bucp))
+        );
+        Ok(())
+    }
+
+    /// Run the PFCP Association Release procedure (TS 29.244 6.2.9).
+    pub async fn release_association(&self) -> Result<(), PfcpRequestError> {
+        if !self.is_associated().await {
+            return Ok(());
+        }
+        let msg = PfcpMessage::AssociationReleaseRequest(AssociationReleaseRequest::new(
+            NodeId::new_ipv4(self.node_ip),
+        ));
+        let mut buf = bytes::BytesMut::new();
+        msg.encode_body(&mut buf);
+
+        let result = self
+            .request(pfcp_message_type::ASSOCIATION_RELEASE_REQUEST, None, &buf)
+            .await;
+
+        // Whether the peer answered or not, the association is gone locally
+        self.teardown_association("association release requested locally")
+            .await;
+
+        match result {
+            Ok((_, body)) => match parse_cause(&body) {
+                Some(pfcp_cause::REQUEST_ACCEPTED) | None => Ok(()),
+                Some(cause) => Err(PfcpRequestError::Rejected { cause }),
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Send one Heartbeat Request and validate the response (TS 29.244
+    /// 6.2.2). Returns Ok(true) if the peer is alive, Err on timeout.
+    pub async fn heartbeat_once(&self) -> Result<bool, PfcpRequestError> {
+        let msg =
+            PfcpMessage::HeartbeatRequest(HeartbeatRequest::new(self.recovery_time_stamp));
+        let mut buf = bytes::BytesMut::new();
+        msg.encode_body(&mut buf);
+
+        let (_, resp_body) = self
+            .request(pfcp_message_type::HEARTBEAT_REQUEST, None, &buf)
+            .await?;
+
+        // Recovery Time Stamp staleness detection
+        if let Some(rts) = find_ie(&resp_body, 96)
+            .filter(|v| v.len() >= 4)
+            .map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]))
+        {
+            self.check_peer_restart(rts).await;
+        } else {
+            log::warn!("Heartbeat Response missing Recovery Time Stamp (mandatory IE)");
+        }
+        Ok(true)
+    }
+}
+
+/// Flush all stored PFCP sessions (UPF restarted / association lost).
+/// Returns the number of sessions removed.
+pub fn clear_pfcp_sessions() -> usize {
+    if let Ok(ctx) = smf_self().read() {
+        if let Ok(mut sessions) = ctx.pfcp_sessions.write() {
+            let n = sessions.len();
+            sessions.clear();
+            return n;
+        }
+    }
+    0
 }
 
 // ============================================================================
@@ -544,182 +625,332 @@ pub fn build_epc_deactivation_request(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_pfcp_header_new() {
-        let header = PfcpHeader::new(
-            pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST,
-            0x123456789ABCDEF0,
-            42,
-        );
+    fn body_with_cause(cause: u8) -> Vec<u8> {
+        vec![0x00, 19, 0x00, 0x01, cause]
+    }
 
-        assert_eq!(header.version, 1);
+    #[test]
+    fn test_parse_wire_header_with_seid() {
+        let pkt = encode_wire_message(50, Some(0x1122334455667788), 0x00ABCDEF, &[1, 2, 3]);
+        let h = parse_wire_header(&pkt).unwrap();
+        assert_eq!(h.version, 1);
+        assert_eq!(h.msg_type, 50);
+        assert!(h.seid_present);
+        assert_eq!(h.seid, 0x1122334455667788);
+        assert_eq!(h.sequence_number, 0x00ABCDEF);
+        assert_eq!(&pkt[h.body_offset..], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn test_parse_wire_header_without_seid() {
+        let pkt = encode_wire_message(1, None, 42, &[]);
+        let h = parse_wire_header(&pkt).unwrap();
+        assert_eq!(h.msg_type, 1);
+        assert!(!h.seid_present);
+        assert_eq!(h.sequence_number, 42);
+        assert_eq!(h.body_offset, 8);
+    }
+
+    #[test]
+    fn test_parse_cause() {
+        assert_eq!(parse_cause(&body_with_cause(1)), Some(1));
+        assert_eq!(parse_cause(&body_with_cause(72)), Some(72));
+        assert_eq!(parse_cause(&[]), None);
+        // Truncated IE must not be mis-parsed
+        assert_eq!(parse_cause(&[0x00, 19, 0x00, 0x05, 1]), None);
+    }
+
+    #[test]
+    fn test_is_response_type() {
+        assert!(is_response_type(pfcp_message_type::HEARTBEAT_RESPONSE));
+        assert!(is_response_type(
+            pfcp_message_type::SESSION_ESTABLISHMENT_RESPONSE
+        ));
+        assert!(!is_response_type(pfcp_message_type::HEARTBEAT_REQUEST));
+        assert!(!is_response_type(
+            pfcp_message_type::SESSION_REPORT_REQUEST
+        ));
+    }
+
+    async fn make_client_with_peer() -> (Arc<PfcpClient>, UdpSocket) {
+        let peer_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer_sock.local_addr().unwrap();
+        let local = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = Arc::new(PfcpClient::new(Arc::new(local), peer_addr, [127, 0, 0, 1]));
+
+        // Pump incoming datagrams into the engine
+        let c = client.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let Ok((len, from)) = c.socket.recv_from(&mut buf).await else {
+                    break;
+                };
+                c.on_datagram(&buf[..len], from).await;
+            }
+        });
+        (client, peer_sock)
+    }
+
+    /// Association Setup round-trip against a fake UPF answering with the
+    /// library-encoded response (mandatory Node ID, Cause, Recovery TS, plus
+    /// UP Function Features).
+    #[tokio::test]
+    async fn test_association_setup_roundtrip() {
+        let (client, upf) = make_client_with_peer().await;
+
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let (len, from) = upf.recv_from(&mut buf).await.unwrap();
+            let h = parse_wire_header(&buf[..len]).unwrap();
+            assert_eq!(h.msg_type, pfcp_message_type::ASSOCIATION_SETUP_REQUEST);
+            // The request must carry Node ID (60) and Recovery Time Stamp (96)
+            let body = &buf[h.body_offset..len];
+            assert!(find_ie(body, 60).is_some(), "Node ID mandatory");
+            let node_id = find_ie(body, 60).unwrap();
+            assert_eq!(node_id[0], 0, "Node ID type octet = IPv4");
+            assert_eq!(&node_id[1..5], &[127, 0, 0, 1]);
+            assert!(find_ie(body, 96).is_some(), "Recovery Time Stamp mandatory");
+
+            let mut resp = AssociationSetupResponse::new(
+                NodeId::new_ipv4([127, 0, 0, 4]),
+                ogs_pfcp::types::PfcpCause::RequestAccepted,
+                777,
+            );
+            resp.up_function_features = Some(UpFunctionFeatures {
+                ftup: true,
+                empu: true,
+                ..Default::default()
+            });
+            let msg = PfcpMessage::AssociationSetupResponse(resp);
+            let pkt = build_message(&msg, h.sequence_number, None);
+            upf.send_to(&pkt, from).await.unwrap();
+        });
+
+        client.associate().await.expect("association must succeed");
+        assert!(client.is_associated().await);
+        let st = client.association().await;
+        assert_eq!(st.peer_recovery_time_stamp, Some(777));
+        assert!(st.up_function_features.unwrap().ftup);
+    }
+
+    /// A rejected Association Setup must surface the real cause value.
+    #[tokio::test]
+    async fn test_association_setup_rejected_cause() {
+        let (client, upf) = make_client_with_peer().await;
+
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let (len, from) = upf.recv_from(&mut buf).await.unwrap();
+            let h = parse_wire_header(&buf[..len]).unwrap();
+            let resp = AssociationSetupResponse::new(
+                NodeId::new_ipv4([127, 0, 0, 4]),
+                ogs_pfcp::types::PfcpCause::NoResourcesAvailable,
+                778,
+            );
+            let msg = PfcpMessage::AssociationSetupResponse(resp);
+            let pkt = build_message(&msg, h.sequence_number, None);
+            upf.send_to(&pkt, from).await.unwrap();
+        });
+
+        match client.associate().await {
+            Err(PfcpRequestError::Rejected { cause }) => {
+                assert_eq!(cause, ogs_pfcp::types::PfcpCause::NoResourcesAvailable as u8)
+            }
+            other => panic!("expected rejection, got {other:?}"),
+        }
+        assert!(!client.is_associated().await);
+    }
+
+    /// T1 retransmission: the fake UPF stays silent for the first two
+    /// transmissions and answers the third — the transaction must succeed
+    /// and exactly 3 datagrams must have hit the wire.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_t1_retransmission_then_success() {
+        let (client, upf) = make_client_with_peer().await;
+
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let mut count = 0u32;
+            loop {
+                let (len, from) = upf.recv_from(&mut buf).await.unwrap();
+                count += 1;
+                if count == 3 {
+                    let h = parse_wire_header(&buf[..len]).unwrap();
+                    let pkt = encode_wire_message(
+                        pfcp_message_type::SESSION_DELETION_RESPONSE,
+                        Some(7),
+                        h.sequence_number,
+                        &body_with_cause(1),
+                    );
+                    upf.send_to(&pkt, from).await.unwrap();
+                    return count;
+                }
+            }
+        });
+
+        let (resp_type, body) = client
+            .request(pfcp_message_type::SESSION_DELETION_REQUEST, Some(7), &[])
+            .await
+            .expect("3rd attempt must succeed");
+        assert_eq!(resp_type, pfcp_message_type::SESSION_DELETION_RESPONSE);
+        assert_eq!(parse_cause(&body), Some(1));
+        assert_eq!(handle.await.unwrap(), 3, "exactly 3 transmissions");
+    }
+
+    /// Retransmission exhaustion: a silent peer must produce a Timeout error
+    /// after 1 + N1 attempts, and the association must be marked down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_retransmission_exhaustion_marks_peer_down() {
+        let (client, upf) = make_client_with_peer().await;
+        // Pretend we were associated
+        {
+            let mut a = client.assoc.write().await;
+            a.associated = true;
+            a.peer_recovery_time_stamp = Some(1);
+        }
+
+        // Count datagrams without ever answering
+        let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let c2 = counter.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                if upf.recv_from(&mut buf).await.is_err() {
+                    break;
+                }
+                c2.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let start = std::time::Instant::now();
+        let res = client
+            .request(pfcp_message_type::SESSION_DELETION_REQUEST, Some(9), &[])
+            .await;
+        match res {
+            Err(PfcpRequestError::Timeout { attempts }) => assert_eq!(attempts, 4),
+            other => panic!("expected timeout, got {other:?}"),
+        }
+        // 4 attempts × T1 (3s) ≈ 12s — allow generous lower bound
+        assert!(start.elapsed() >= Duration::from_secs(9));
+        assert_eq!(counter.load(Ordering::SeqCst), 4, "1 initial + 3 retransmits");
+        assert!(
+            !client.is_associated().await,
+            "exhaustion must mark the association down"
+        );
+    }
+
+    /// Heartbeat staleness: a Heartbeat Response with a changed Recovery
+    /// Time Stamp must tear the association down (peer restarted).
+    #[tokio::test]
+    async fn test_heartbeat_detects_peer_restart() {
+        let (client, upf) = make_client_with_peer().await;
+        {
+            let mut a = client.assoc.write().await;
+            a.associated = true;
+            a.peer_recovery_time_stamp = Some(100);
+        }
+
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let (len, from) = upf.recv_from(&mut buf).await.unwrap();
+            let h = parse_wire_header(&buf[..len]).unwrap();
+            assert_eq!(h.msg_type, pfcp_message_type::HEARTBEAT_REQUEST);
+            // Respond with a NEW recovery time stamp → restart
+            let msg = PfcpMessage::HeartbeatResponse(HeartbeatResponse::new(200));
+            let pkt = build_message(&msg, h.sequence_number, None);
+            upf.send_to(&pkt, from).await.unwrap();
+        });
+
+        client.heartbeat_once().await.expect("heartbeat answered");
+        assert!(
+            !client.is_associated().await,
+            "restart must tear down the association"
+        );
         assert_eq!(
-            header.message_type,
-            pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST
+            client.association().await.peer_recovery_time_stamp,
+            Some(200),
+            "new incarnation timestamp stored"
         );
-        assert_eq!(header.seid, 0x123456789ABCDEF0);
-        assert_eq!(header.sequence_number, 42);
     }
 
-    #[test]
-    fn test_pfcp_xact_new() {
-        let xact = PfcpXact::new(1, 100);
+    /// Inbound Heartbeat Request must be answered with our recovery
+    /// timestamp via the library codec.
+    #[tokio::test]
+    async fn test_inbound_heartbeat_request_answered() {
+        let (client, upf) = make_client_with_peer().await;
+        let local_addr = client.socket.local_addr().unwrap();
 
-        assert_eq!(xact.id, 1);
-        assert_eq!(xact.sequence_number, 100);
-        assert_eq!(xact.state, PfcpXactState::Initial);
-        assert!(!xact.epc);
+        let msg = PfcpMessage::HeartbeatRequest(HeartbeatRequest::new(555));
+        let pkt = build_message(&msg, 33, None);
+        upf.send_to(&pkt, local_addr).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), upf.recv_from(&mut buf))
+            .await
+            .expect("heartbeat response expected")
+            .unwrap();
+        let h = parse_wire_header(&buf[..len]).unwrap();
+        assert_eq!(h.msg_type, pfcp_message_type::HEARTBEAT_RESPONSE);
+        assert_eq!(h.sequence_number, 33, "response echoes the request seq");
+        let rts = find_ie(&buf[h.body_offset..len], 96).expect("recovery TS mandatory");
+        let rts = u32::from_be_bytes([rts[0], rts[1], rts[2], rts[3]]);
+        assert_eq!(rts, client.recovery_time_stamp);
+        assert!(rts > 0, "recovery timestamp must be real");
     }
 
-    #[test]
-    fn test_pfcp_xact_commit() {
-        let mut xact = PfcpXact::new(1, 100);
-        xact.commit();
+    /// Inbound Association Release Request must be acknowledged and drop
+    /// the association.
+    #[tokio::test]
+    async fn test_inbound_association_release() {
+        let (client, upf) = make_client_with_peer().await;
+        client.assoc.write().await.associated = true;
+        let local_addr = client.socket.local_addr().unwrap();
 
-        assert_eq!(xact.state, PfcpXactState::Completed);
-    }
+        let msg = PfcpMessage::AssociationReleaseRequest(AssociationReleaseRequest::new(
+            NodeId::new_ipv4([127, 0, 0, 4]),
+        ));
+        let pkt = build_message(&msg, 44, None);
+        upf.send_to(&pkt, local_addr).await.unwrap();
 
-    #[test]
-    fn test_pfcp_xact_timeout() {
-        let mut xact = PfcpXact::new(1, 100);
-        xact.timeout();
-
-        assert_eq!(xact.state, PfcpXactState::Timeout);
-    }
-
-    #[test]
-    fn test_pfcp_node_new() {
-        let node = PfcpNode::new(1);
-
-        assert_eq!(node.id, 1);
-        assert_eq!(node.state, PfcpNodeState::Initial);
-        assert!(!node.is_associated());
-    }
-
-    #[test]
-    fn test_pfcp_path_manager_create_xact() {
-        let mut manager = PfcpPathManager::new();
-
-        let xact1 = manager.create_xact();
-        let xact2 = manager.create_xact();
-
-        assert_eq!(xact1.id, 1);
-        assert_eq!(xact2.id, 2);
-        assert_ne!(xact1.sequence_number, xact2.sequence_number);
-    }
-
-    #[test]
-    fn test_build_5gc_session_establishment_request() {
-        let params = SessionEstablishmentParams {
-            smf_n4_seid: 0x1234567890ABCDEF,
-            upf_n4_seid: 0,
-            stream_id: Some(1),
-            flags: 0,
-        };
-
-        let (header, body) = build_5gc_session_establishment_request(&params, 1);
-
+        let mut buf = vec![0u8; 4096];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), upf.recv_from(&mut buf))
+            .await
+            .expect("release response expected")
+            .unwrap();
+        let h = parse_wire_header(&buf[..len]).unwrap();
         assert_eq!(
-            header.message_type,
-            pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST
+            h.msg_type,
+            pfcp_message_type::ASSOCIATION_RELEASE_RESPONSE
         );
-        assert_eq!(header.seid, 0);
-        assert_eq!(header.sequence_number, 1);
-        assert!(!body.is_empty());
-    }
-
-    #[test]
-    fn test_build_5gc_session_deletion_request() {
-        let params = SessionDeletionParams {
-            smf_n4_seid: 0x1111111111111111,
-            upf_n4_seid: 0x2222222222222222,
-            stream_id: Some(1),
-            trigger: DeleteTrigger::UeRequested as u8,
-        };
-
-        let (header, _body) = build_5gc_session_deletion_request(&params, 5);
-
         assert_eq!(
-            header.message_type,
-            pfcp_message_type::SESSION_DELETION_REQUEST
+            parse_cause(&buf[h.body_offset..len]),
+            Some(pfcp_cause::REQUEST_ACCEPTED)
         );
-        assert_eq!(header.seid, 0x2222222222222222);
-        assert_eq!(header.sequence_number, 5);
+        assert!(!client.is_associated().await);
     }
 
-    #[test]
-    fn test_build_epc_session_establishment_request() {
-        let params = EpcSessionEstablishmentParams {
-            smf_n4_seid: 0xAAAABBBBCCCCDDDD,
-            upf_n4_seid: 0,
-            gtp_xact_id: Some(100),
-            flags: 0,
-        };
+    /// An unsupported PFCP version must be answered with Version Not
+    /// Supported Response (type 11).
+    #[tokio::test]
+    async fn test_version_not_supported() {
+        let (client, upf) = make_client_with_peer().await;
+        let local_addr = client.socket.local_addr().unwrap();
 
-        let (header, body) = build_epc_session_establishment_request(&params, 10);
+        // version=2 header
+        let mut pkt = encode_wire_message(pfcp_message_type::HEARTBEAT_REQUEST, None, 5, &[]);
+        pkt[0] = 2 << 5; // version 2
+        upf.send_to(&pkt, local_addr).await.unwrap();
 
+        let mut buf = vec![0u8; 256];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), upf.recv_from(&mut buf))
+            .await
+            .expect("version-not-supported expected")
+            .unwrap();
+        let h = parse_wire_header(&buf[..len]).unwrap();
         assert_eq!(
-            header.message_type,
-            pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST
+            h.msg_type,
+            pfcp_message_type::VERSION_NOT_SUPPORTED_RESPONSE
         );
-        assert_eq!(header.sequence_number, 10);
-        assert!(!body.is_empty());
-    }
-
-    #[test]
-    fn test_build_session_report_response() {
-        let (header, body) =
-            build_session_report_response(0x123456789ABCDEF0, 42, PfcpCause::RequestAccepted as u8);
-
-        assert_eq!(
-            header.message_type,
-            pfcp_message_type::SESSION_REPORT_RESPONSE
-        );
-        assert_eq!(header.seid, 0x123456789ABCDEF0);
-        assert_eq!(header.sequence_number, 42);
-        assert!(!body.is_empty());
-    }
-
-    #[test]
-    fn test_build_epc_deactivation_request_valid() {
-        let params = EpcSessionModificationParams {
-            smf_n4_seid: 0x1111,
-            upf_n4_seid: 0x2222,
-            gtp_xact_id: None,
-            flags: modify_flags::DEACTIVATE | modify_flags::DL_ONLY,
-            gtp_pti: 0,
-            gtp_cause: 0,
-        };
-
-        let result = build_epc_deactivation_request(
-            &params,
-            gtp2_handover_cause::ACCESS_CHANGED_FROM_NON_3GPP_TO_3GPP,
-            1,
-        );
-
-        assert!(result.is_some());
-        let (header, _body) = result.unwrap();
-        assert_eq!(
-            header.message_type,
-            pfcp_message_type::SESSION_MODIFICATION_REQUEST
-        );
-    }
-
-    #[test]
-    fn test_build_epc_deactivation_request_invalid_cause() {
-        let params = EpcSessionModificationParams::default();
-
-        let result = build_epc_deactivation_request(&params, 99, 1);
-
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn test_up_function_features_default() {
-        let features = UpFunctionFeatures::default();
-
-        assert!(!features.ftup);
-        assert!(!features.bucp);
-        assert!(!features.ddnd);
     }
 }

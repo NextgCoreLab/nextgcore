@@ -261,8 +261,10 @@ async fn main() -> Result<()> {
 
     log::info!("NextGCore SMF ready");
 
-    // Spawn N4 (PFCP) listener so the SMF can receive unsolicited messages
-    // from the UPF — most importantly Session Report Requests (type 56).
+    // Bind the single N4 (PFCP) socket. All SMF→UPF requests AND all
+    // unsolicited UPF→SMF messages (Session Report Requests, heartbeats)
+    // flow through this one socket so transactions can be matched by
+    // sequence number (TS 29.244 7.2.1).
     let pfcp_bind_addr: SocketAddr = {
         let addr = std::env::var("SMF_PFCP_ADDR").unwrap_or_else(|_| "0.0.0.0".to_string());
         let port: u16 = std::env::var("SMF_PFCP_PORT")
@@ -273,33 +275,113 @@ async fn main() -> Result<()> {
             .parse()
             .context("Invalid SMF PFCP listen address")?
     };
+    let upf_pfcp_addr: SocketAddr = {
+        let addr = std::env::var("UPF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let port: u16 = std::env::var("UPF_PFCP_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(8805);
+        format!("{addr}:{port}")
+            .parse()
+            .context("Invalid UPF PFCP address")?
+    };
+    let smf_node_ip: [u8; 4] = {
+        let s = std::env::var("SMF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
+        let parts: Vec<u8> = s.split('.').filter_map(|p| p.parse().ok()).collect();
+        if parts.len() == 4 {
+            [parts[0], parts[1], parts[2], parts[3]]
+        } else {
+            [127, 0, 0, 1]
+        }
+    };
+
+    let pfcp_socket = Arc::new(
+        tokio::net::UdpSocket::bind(pfcp_bind_addr)
+            .await
+            .with_context(|| format!("Failed to bind SMF PFCP socket on {pfcp_bind_addr}"))?,
+    );
+    log::info!("SMF N4 PFCP socket bound on {pfcp_bind_addr} (UPF peer: {upf_pfcp_addr})");
+
+    let pfcp_client = Arc::new(pfcp_path::PfcpClient::new(
+        pfcp_socket.clone(),
+        upf_pfcp_addr,
+        smf_node_ip,
+    ));
+    pfcp_path::set_global_client(pfcp_client.clone());
+
+    // PFCP receive/dispatch loop: responses complete pending transactions;
+    // node-level requests (heartbeat, association release) are answered by
+    // the engine; Session Report Requests are handled here.
     let shutdown_pfcp = shutdown.clone();
+    let client_rx = pfcp_client.clone();
+    let sock_rx = pfcp_socket.clone();
     let pfcp_listener_handle = tokio::spawn(async move {
-        match tokio::net::UdpSocket::bind(pfcp_bind_addr).await {
-            Ok(sock) => {
-                log::info!("SMF N4 PFCP listener bound on {pfcp_bind_addr}");
-                let mut buf = vec![0u8; 4096];
-                loop {
-                    if shutdown_pfcp.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst) {
-                        break;
+        let mut buf = vec![0u8; 8192];
+        loop {
+            if shutdown_pfcp.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst) {
+                break;
+            }
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                sock_rx.recv_from(&mut buf),
+            )
+            .await
+            {
+                Ok(Ok((len, peer))) => {
+                    let pkt = buf[..len].to_vec();
+                    if !client_rx.on_datagram(&pkt, peer).await {
+                        handle_pfcp_incoming(&sock_rx, &pkt, peer).await;
                     }
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(1),
-                        sock.recv_from(&mut buf),
-                    )
-                    .await
-                    {
-                        Ok(Ok((len, peer))) => {
-                            handle_pfcp_incoming(&sock, &buf[..len], peer).await;
-                        }
-                        Ok(Err(e)) => log::warn!("PFCP listener recv error: {e}"),
-                        Err(_) => {} // timeout — loop and re-check shutdown
+                }
+                Ok(Err(e)) => log::warn!("PFCP listener recv error: {e}"),
+                Err(_) => {} // timeout — loop and re-check shutdown
+            }
+        }
+        log::info!("SMF N4 PFCP listener stopped");
+    });
+
+    // N4 association maintenance: establish the PFCP association at startup
+    // (Node ID + Recovery Time Stamp, TS 29.244 6.2.6) and keep it alive
+    // with heartbeats. Heartbeat exhaustion or a changed peer Recovery Time
+    // Stamp tears the association down (stale sessions flushed) and
+    // triggers re-association.
+    let shutdown_assoc = shutdown.clone();
+    let client_assoc = pfcp_client.clone();
+    let pfcp_assoc_handle = tokio::spawn(async move {
+        let heartbeat_period = std::time::Duration::from_secs(10);
+        let reassociate_holdoff = std::time::Duration::from_secs(10);
+        loop {
+            if shutdown_assoc.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst) {
+                break;
+            }
+            if !client_assoc.is_associated().await {
+                match client_assoc.associate().await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        // Abnormal action on association failure: declare the
+                        // UPF unreachable and hold off before a new cycle.
+                        log::error!(
+                            "PFCP Association Setup with {} failed: {e}; retrying in {}s",
+                            client_assoc.peer(),
+                            reassociate_holdoff.as_secs()
+                        );
+                        tokio::time::sleep(reassociate_holdoff).await;
+                        continue;
                     }
                 }
             }
-            Err(e) => log::warn!("Failed to bind SMF PFCP listener on {pfcp_bind_addr}: {e}"),
+            tokio::time::sleep(heartbeat_period).await;
+            if shutdown_assoc.load(Ordering::SeqCst) || SHUTDOWN.load(Ordering::SeqCst) {
+                break;
+            }
+            if client_assoc.is_associated().await {
+                if let Err(e) = client_assoc.heartbeat_once().await {
+                    // Exhaustion already marked the association down inside
+                    // the engine; the next loop turn re-associates.
+                    log::error!("PFCP heartbeat to {} failed: {e}", client_assoc.peer());
+                }
+            }
         }
-        log::info!("SMF N4 PFCP listener stopped");
     });
 
     // Main async event loop
@@ -317,9 +399,18 @@ async fn main() -> Result<()> {
         // In a full implementation, this would check the timer manager
     }
 
+    pfcp_assoc_handle.abort();
+
+    // Graceful shutdown: release the N4 association before going down
+    // (TS 29.244 6.2.9 — Association Release initiated by the CP function)
+    if pfcp_client.is_associated().await {
+        match pfcp_client.release_association().await {
+            Ok(()) => log::info!("PFCP association released"),
+            Err(e) => log::warn!("PFCP Association Release failed: {e}"),
+        }
+    }
     pfcp_listener_handle.abort();
 
-    // Graceful shutdown
     log::info!("Shutting down...");
 
     // Stop SBI server
@@ -394,8 +485,71 @@ async fn handle_pfcp_session_report(
 
     log::info!("PFCP Session Report Request: SEID=0x{seid:016x}, seq={seq}, peer={peer}");
 
-    // Parse IEs from the payload (offset 16 onward) to extract usage reports.
+    // Parse IEs from the payload (offset 16 onward).
     let payload = &pkt[16..];
+
+    // Report Type (IE 39) is MANDATORY in a Session Report Request
+    // (TS 29.244 Table 7.5.8.1-1) — reject its absence with cause 66.
+    let report_type = pfcp_path::find_ie(payload, 39).and_then(|v| v.first().copied());
+    let Some(report_type) = report_type else {
+        log::warn!("Session Report Request missing mandatory Report Type IE — rejecting");
+        let mut body = n4_build::PfcpMessageBuilder::new();
+        body.add_cause_raw(66); // Mandatory IE missing
+        body.add_u16(n4_build::pfcp_ie::OFFENDING_IE, 39);
+        let resp = pfcp_path::encode_wire_message(
+            pfcp_path::pfcp_message_type::SESSION_REPORT_RESPONSE,
+            Some(seid),
+            seq,
+            &body.build(),
+        );
+        if let Err(e) = sock.send_to(&resp, peer).await {
+            log::warn!("Failed to send Session Report Response to {peer}: {e}");
+        }
+        return;
+    };
+
+    // Downlink Data Report (DLDR, bit 0x01): the UPF buffered the first DL
+    // packet for an idle session — in a full deployment this triggers the
+    // Network Triggered Service Request (N1N2 transfer / paging via AMF).
+    if report_type & 0x01 != 0 {
+        if let Some(dldr) = pfcp_path::find_ie(payload, 83) {
+            let pdr_id = pfcp_path::find_ie(dldr, 56)
+                .filter(|v| v.len() >= 2)
+                .map(|v| u16::from_be_bytes([v[0], v[1]]));
+            // Downlink Data Service Information (IE 45): flags + PPI/QFI
+            let qfi = pfcp_path::find_ie(dldr, 45).and_then(|v| {
+                if v.is_empty() {
+                    return None;
+                }
+                let flags = v[0];
+                let mut idx = 1;
+                if flags & 0x01 != 0 {
+                    idx += 1; // skip PPI
+                }
+                if flags & 0x02 != 0 {
+                    v.get(idx).map(|q| q & 0x3F)
+                } else {
+                    None
+                }
+            });
+            log::info!(
+                "Downlink Data Report: SEID=0x{seid:016x}, PDR={pdr_id:?}, QFI={qfi:?} — \
+                 triggering UP connection re-activation"
+            );
+        } else {
+            log::warn!("Report Type has DLDR set but no Downlink Data Report IE present");
+        }
+    }
+
+    // Error Indication Report (bit 0x04): a peer GTP-U node rejected one of
+    // the session's tunnels — the DL tunnel toward the gNB is stale.
+    if report_type & 0x04 != 0 {
+        log::warn!(
+            "Error Indication Report for SEID=0x{seid:016x}: remote GTP-U endpoint rejected \
+             the DL tunnel (stale gNB F-TEID)"
+        );
+    }
+
     let mut offset = 0;
     while offset + 4 <= payload.len() {
         let ie_type = u16::from_be_bytes([payload[offset], payload[offset + 1]]);
@@ -456,21 +610,16 @@ async fn handle_pfcp_session_report(
         offset = ie_end;
     }
 
-    // Build Session Report Response (type 57):
-    // flags(1) + type(1) + length(2) + seid(8) + seq(3) + spare(1) + Cause IE(6)
-    // Cause IE: type=19 (0x0013), length=1, value=1 (Request Accepted)
-    let cause_ie: [u8; 6] = [0x00, 19, 0x00, 0x01, 0x01, 0x00];
-    let payload_len = cause_ie.len();
-    let total_len = (12 + payload_len) as u16; // header after length field = 12 bytes
-
-    let mut resp = Vec::with_capacity(16 + payload_len);
-    resp.push(0x21); // version=1, SEID present
-    resp.push(57); // Session Report Response
-    resp.extend_from_slice(&total_len.to_be_bytes());
-    resp.extend_from_slice(&seid.to_be_bytes()); // echo back the SEID
-    resp.extend_from_slice(&seq.to_be_bytes()[1..4]); // 3-byte seq
-    resp.push(0); // spare
-    resp.extend_from_slice(&cause_ie);
+    // Build Session Report Response (type 57) with Cause = Request Accepted
+    // through the single builder/encoder path.
+    let mut body = n4_build::PfcpMessageBuilder::new();
+    body.add_cause_raw(1); // Request Accepted
+    let resp = pfcp_path::encode_wire_message(
+        pfcp_path::pfcp_message_type::SESSION_REPORT_RESPONSE,
+        Some(seid),
+        seq,
+        &body.build(),
+    );
 
     if let Err(e) = sock.send_to(&resp, peer).await {
         log::warn!("Failed to send PFCP Session Report Response to {peer}: {e}");
@@ -725,37 +874,33 @@ async fn pfcp_session_establish(
     ue_ip: [u8; 4],
     dnn: &str,
     sst: u8,
-    upf_addr: &str,
-    upf_port: u16,
 ) -> Result<PfcpSessionResult> {
     use n4_build::{pfcp_ie, FarParams, PdrParams, PfcpMessageBuilder};
-    use std::time::Duration;
-    use tokio::net::UdpSocket;
+
+    let client = pfcp_path::global_client()
+        .ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
+
+    // TS 29.244 6.2.6.2: no session signalling without an association
+    if !client.is_associated().await {
+        anyhow::bail!("no established PFCP association with {}", client.peer());
+    }
 
     log::info!(
-        "PFCP Session Establishment: UPF={}:{}, UE IP={}.{}.{}.{}",
-        upf_addr,
-        upf_port,
+        "PFCP Session Establishment: UPF={}, UE IP={}.{}.{}.{}",
+        client.peer(),
         ue_ip[0],
         ue_ip[1],
         ue_ip[2],
         ue_ip[3]
     );
 
-    // Build PFCP payload: F-SEID + Node ID + Create PDR (uplink) + Create FAR (uplink) + Create PDR (downlink) + Create FAR (downlink)
-    let smf_ip: [u8; 4] = {
-        let s = std::env::var("SMF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-        let parts: Vec<u8> = s.split('.').filter_map(|p| p.parse().ok()).collect();
-        if parts.len() == 4 {
-            [parts[0], parts[1], parts[2], parts[3]]
-        } else {
-            [127, 0, 0, 1]
-        }
-    };
+    // Build PFCP payload: Node ID + F-SEID + Create PDR (uplink) + Create FAR
+    // (uplink) + Create PDR (downlink) + Create FAR (downlink)
+    let smf_ip = client.node_ip();
     let mut builder = PfcpMessageBuilder::new();
 
-    // Node ID (IPv4)
-    builder.add_node_id(&smf_ip);
+    // Node ID (IPv4, with the mandatory Node ID Type octet — TS 29.244 8.2.38)
+    builder.add_node_id_ipv4(smf_ip);
 
     // F-SEID (SMF's SEID)
     builder.add_f_seid(smf_n4_seid, Some(smf_ip), None);
@@ -816,53 +961,34 @@ async fn pfcp_session_establish(
 
     let payload = builder.build();
 
-    // Build PFCP header
-    // Flags: version=1 (0x20) + SEID present (0x01) = 0x21
-    let mut packet = Vec::with_capacity(16 + payload.len());
-    packet.push(0x21); // flags
-    packet.push(50); // Session Establishment Request
-    let total_len = (12 + payload.len()) as u16;
-    packet.extend_from_slice(&total_len.to_be_bytes());
-    packet.extend_from_slice(&0u64.to_be_bytes()); // SEID=0 for new session
-    let seq: u32 = PFCP_SEQ.fetch_add(1, Ordering::Relaxed);
-    packet.extend_from_slice(&seq.to_be_bytes()[1..4]); // 3 bytes
-    packet.push(0); // spare
-    packet.extend_from_slice(&payload);
-
-    // Send via UDP
-    let socket = UdpSocket::bind("0.0.0.0:0")
+    // Send through the transaction engine: T1 retransmission up to N1
+    // attempts, exhaustion = error (TS 29.244 7.2.1). SEID=0 for a new
+    // session (TS 29.244 7.2.2.4.2).
+    let (resp_type, resp_body) = client
+        .request(
+            pfcp_path::pfcp_message_type::SESSION_ESTABLISHMENT_REQUEST,
+            Some(0),
+            &payload,
+        )
         .await
-        .context("Failed to bind PFCP client socket")?;
-    let upf_endpoint: SocketAddr = format!("{upf_addr}:{upf_port}")
-        .parse()
-        .context("Invalid UPF address")?;
+        .map_err(|e| anyhow::anyhow!("PFCP Session Establishment failed: {e}"))?;
 
-    socket
-        .send_to(&packet, upf_endpoint)
-        .await
-        .context("Failed to send PFCP to UPF")?;
-    log::info!(
-        "PFCP Session Establishment Request sent ({} bytes)",
-        packet.len()
-    );
-
-    // Receive response with timeout
-    let mut resp_buf = vec![0u8; 4096];
-    let (resp_len, _) =
-        tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut resp_buf))
-            .await
-            .context("PFCP response timeout")?
-            .context("PFCP recv error")?;
-
-    log::info!("PFCP response received ({resp_len} bytes)");
-
-    // Parse response header (16 bytes for SEID-present header)
-    if resp_len < 16 {
-        anyhow::bail!("PFCP response too short");
+    if resp_type != pfcp_path::pfcp_message_type::SESSION_ESTABLISHMENT_RESPONSE {
+        anyhow::bail!("unexpected PFCP response type {resp_type} to Session Establishment");
     }
 
-    let _resp_seid = u64::from_be_bytes(resp_buf[4..12].try_into().unwrap());
-    let resp_payload = &resp_buf[16..resp_len];
+    // Cause check: any non-accepted cause is a hard failure with the real
+    // cause value surfaced (no silent fallback)
+    match pfcp_path::parse_cause(&resp_body) {
+        Some(pfcp_path::pfcp_cause::REQUEST_ACCEPTED) => {}
+        Some(cause) => anyhow::bail!(
+            "PFCP Session Establishment rejected: cause {cause} ({})",
+            pfcp_path::cause_name(cause)
+        ),
+        None => anyhow::bail!("PFCP Session Establishment Response missing mandatory Cause IE"),
+    }
+
+    let resp_payload = &resp_body[..];
 
     // Parse response IEs to find UP F-SEID and Created PDR with F-TEID
     let mut upf_seid: u64 = 0;
@@ -940,9 +1066,13 @@ async fn pfcp_session_establish(
         offset = ie_end;
     }
 
+    if upf_seid == 0 {
+        anyhow::bail!("PFCP Session Establishment Response missing UP F-SEID (mandatory IE)");
+    }
     if upf_teid == 0 {
-        log::warn!("No UPF F-TEID in response, using SEID-based TEID");
-        upf_teid = (upf_seid & 0xFFFFFFFF) as u32;
+        // Conditional IE failure: with FTUP the UPF must return the
+        // allocated F-TEID in a Created PDR (TS 29.244 7.5.3.2)
+        anyhow::bail!("PFCP Session Establishment Response missing Created PDR F-TEID");
     }
 
     log::info!("PFCP Session Established: UPF SEID=0x{upf_seid:016x}, UPF TEID=0x{upf_teid:08x}");
@@ -955,16 +1085,14 @@ async fn pfcp_session_establish(
 }
 
 /// Send PFCP Session Modification Request to UPF to activate DL FAR with gNB TEID
-async fn pfcp_session_modify(
-    upf_seid: u64,
-    gnb_teid: u32,
-    gnb_addr: [u8; 4],
-    upf_addr: &str,
-    upf_port: u16,
-) -> Result<()> {
+async fn pfcp_session_modify(upf_seid: u64, gnb_teid: u32, gnb_addr: [u8; 4]) -> Result<()> {
     use n4_build::{build_session_modification_request, SessionModificationParams};
-    use std::time::Duration;
-    use tokio::net::UdpSocket;
+
+    let client = pfcp_path::global_client()
+        .ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
+    if !client.is_associated().await {
+        anyhow::bail!("no established PFCP association with {}", client.peer());
+    }
 
     log::info!(
         "PFCP Session Modification: UPF SEID=0x{:016x}, gNB TEID=0x{:08x}, gNB addr={}.{}.{}.{}",
@@ -984,125 +1112,74 @@ async fn pfcp_session_modify(
             2,                                              // FAR ID 2 (downlink)
             0,                                              // destination_interface: Access
             Some((0x0100, gnb_teid, Some(gnb_addr), None)), // outer header creation: GTP-U to gNB
-            true,                                           // send end marker
+            true, // SNDEM: End Marker packets on the old tunnel
         )],
         ..Default::default()
     };
 
     let payload = build_session_modification_request(&params);
 
-    // Build PFCP header with UPF SEID
-    let mut packet = Vec::with_capacity(16 + payload.len());
-    packet.push(0x21); // flags: version=1 + SEID present
-    packet.push(52); // Session Modification Request
-    let total_len = (12 + payload.len()) as u16;
-    packet.extend_from_slice(&total_len.to_be_bytes());
-    packet.extend_from_slice(&upf_seid.to_be_bytes());
-    let seq: u32 = PFCP_SEQ.fetch_add(1, Ordering::Relaxed);
-    packet.extend_from_slice(&seq.to_be_bytes()[1..4]);
-    packet.push(0); // spare
-    packet.extend_from_slice(&payload);
-
-    // Send via UDP
-    let socket = UdpSocket::bind("0.0.0.0:0")
+    let (resp_type, resp_body) = client
+        .request(
+            pfcp_path::pfcp_message_type::SESSION_MODIFICATION_REQUEST,
+            Some(upf_seid),
+            &payload,
+        )
         .await
-        .context("Failed to bind PFCP client socket")?;
-    let upf_endpoint: SocketAddr = format!("{upf_addr}:{upf_port}")
-        .parse()
-        .context("Invalid UPF address")?;
+        .map_err(|e| anyhow::anyhow!("PFCP Session Modification failed: {e}"))?;
 
-    socket
-        .send_to(&packet, upf_endpoint)
-        .await
-        .context("Failed to send PFCP modification to UPF")?;
-    log::info!(
-        "PFCP Session Modification Request sent ({} bytes)",
-        packet.len()
-    );
-
-    // Receive response with timeout
-    let mut resp_buf = vec![0u8; 4096];
-    let (resp_len, _) =
-        tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut resp_buf))
-            .await
-            .context("PFCP modification response timeout")?
-            .context("PFCP modification recv error")?;
-
-    log::info!("PFCP Session Modification Response received ({resp_len} bytes)");
-
-    // Check response header: verify it's a Session Modification Response (53)
-    if resp_len >= 16 {
-        let msg_type = resp_buf[1];
-        if msg_type == 53 {
-            log::info!("PFCP Session Modification successful");
-        } else {
-            log::warn!("Unexpected PFCP response type: {msg_type}");
-        }
+    if resp_type != pfcp_path::pfcp_message_type::SESSION_MODIFICATION_RESPONSE {
+        anyhow::bail!("unexpected PFCP response type {resp_type} to Session Modification");
     }
-
-    Ok(())
+    match pfcp_path::parse_cause(&resp_body) {
+        Some(pfcp_path::pfcp_cause::REQUEST_ACCEPTED) => {
+            log::info!("PFCP Session Modification successful");
+            Ok(())
+        }
+        Some(cause) => anyhow::bail!(
+            "PFCP Session Modification rejected: cause {cause} ({})",
+            pfcp_path::cause_name(cause)
+        ),
+        None => anyhow::bail!("PFCP Session Modification Response missing mandatory Cause IE"),
+    }
 }
 
 /// Send PFCP Session Deletion Request to UPF
-async fn pfcp_session_delete(upf_seid: u64, upf_addr: &str, upf_port: u16) -> Result<()> {
-    use std::time::Duration;
-    use tokio::net::UdpSocket;
+async fn pfcp_session_delete(upf_seid: u64) -> Result<()> {
+    let client = pfcp_path::global_client()
+        .ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
+    if !client.is_associated().await {
+        anyhow::bail!("no established PFCP association with {}", client.peer());
+    }
 
     log::info!("PFCP Session Deletion: UPF SEID=0x{upf_seid:016x}");
 
-    // PFCP Session Deletion Request has no IEs beyond the header
-    let payload: Vec<u8> = Vec::new();
+    // Session Deletion Request has no message-body IEs (TS 29.244 7.5.6)
+    let payload = n4_build::build_session_deletion_request();
 
-    // Build PFCP header with UPF SEID
-    let mut packet = Vec::with_capacity(16 + payload.len());
-    packet.push(0x21); // flags: version=1 + SEID present
-    packet.push(54); // Session Deletion Request (message type 54)
-    let total_len = (12 + payload.len()) as u16;
-    packet.extend_from_slice(&total_len.to_be_bytes());
-    packet.extend_from_slice(&upf_seid.to_be_bytes());
-    let seq: u32 = PFCP_SEQ.fetch_add(1, Ordering::Relaxed);
-    packet.extend_from_slice(&seq.to_be_bytes()[1..4]);
-    packet.push(0); // spare
-    packet.extend_from_slice(&payload);
-
-    // Send via UDP
-    let socket = UdpSocket::bind("0.0.0.0:0")
+    let (resp_type, resp_body) = client
+        .request(
+            pfcp_path::pfcp_message_type::SESSION_DELETION_REQUEST,
+            Some(upf_seid),
+            &payload,
+        )
         .await
-        .context("Failed to bind PFCP client socket")?;
-    let upf_endpoint: SocketAddr = format!("{upf_addr}:{upf_port}")
-        .parse()
-        .context("Invalid UPF address")?;
+        .map_err(|e| anyhow::anyhow!("PFCP Session Deletion failed: {e}"))?;
 
-    socket
-        .send_to(&packet, upf_endpoint)
-        .await
-        .context("Failed to send PFCP deletion to UPF")?;
-    log::info!(
-        "PFCP Session Deletion Request sent ({} bytes)",
-        packet.len()
-    );
-
-    // Receive response with timeout
-    let mut resp_buf = vec![0u8; 4096];
-    let (resp_len, _) =
-        tokio::time::timeout(Duration::from_secs(5), socket.recv_from(&mut resp_buf))
-            .await
-            .context("PFCP deletion response timeout")?
-            .context("PFCP deletion recv error")?;
-
-    log::info!("PFCP Session Deletion Response received ({resp_len} bytes)");
-
-    // Check response header: verify it's a Session Deletion Response (55)
-    if resp_len >= 16 {
-        let msg_type = resp_buf[1];
-        if msg_type == 55 {
-            log::info!("PFCP Session Deletion successful");
-        } else {
-            log::warn!("Unexpected PFCP deletion response type: {msg_type}");
-        }
+    if resp_type != pfcp_path::pfcp_message_type::SESSION_DELETION_RESPONSE {
+        anyhow::bail!("unexpected PFCP response type {resp_type} to Session Deletion");
     }
-
-    Ok(())
+    match pfcp_path::parse_cause(&resp_body) {
+        Some(pfcp_path::pfcp_cause::REQUEST_ACCEPTED) => {
+            log::info!("PFCP Session Deletion successful");
+            Ok(())
+        }
+        Some(cause) => anyhow::bail!(
+            "PFCP Session Deletion rejected: cause {cause} ({})",
+            pfcp_path::cause_name(cause)
+        ),
+        None => anyhow::bail!("PFCP Session Deletion Response missing mandatory Cause IE"),
+    }
 }
 
 // =============================================================================
@@ -1183,53 +1260,45 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     n1_sm_msg.push(dnn_bytes.len() as u8);
     n1_sm_msg.extend_from_slice(dnn_bytes);
 
-    // Establish PFCP session with UPF to get real UPF TEID
+    // Establish PFCP session with UPF to get the real UPF TEID. A failed N4
+    // establishment is a hard failure for the PDU session — no fabricated
+    // TEID fallback (the data path would be a black hole).
     let smf_n4_seid = (sm_context_ref.parse::<u64>().unwrap_or(1)) | 0x1000;
-    let upf_addr_str = std::env::var("UPF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let upf_n4_port: u16 = std::env::var("UPF_PFCP_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(8805);
 
-    let (upf_teid, upf_addr) = match pfcp_session_establish(
-        smf_n4_seid,
-        ue_ip_octets,
-        dnn,
-        sst,
-        &upf_addr_str,
-        upf_n4_port,
-    )
-    .await
-    {
-        Ok(result) => {
-            log::info!(
-                "PFCP session established: UPF SEID=0x{:016x}, TEID=0x{:08x}, addr={}.{}.{}.{}",
-                result.upf_seid,
-                result.upf_teid,
-                result.upf_addr[0],
-                result.upf_addr[1],
-                result.upf_addr[2],
-                result.upf_addr[3]
-            );
-            // Store UPF SEID for later PFCP modifications (in SmfContext, not a global)
-            if let Ok(ctx) = smf_self().read() {
-                if let Ok(mut sessions) = ctx.pfcp_sessions.write() {
-                    sessions.insert(sm_context_ref.to_string(), result.upf_seid);
-                    log::debug!(
-                        "Stored UPF SEID=0x{:016x} for sm_context_ref={}",
-                        result.upf_seid,
-                        sm_context_ref
-                    );
+    let (upf_teid, upf_addr) =
+        match pfcp_session_establish(smf_n4_seid, ue_ip_octets, dnn, sst).await {
+            Ok(result) => {
+                log::info!(
+                    "PFCP session established: UPF SEID=0x{:016x}, TEID=0x{:08x}, addr={}.{}.{}.{}",
+                    result.upf_seid,
+                    result.upf_teid,
+                    result.upf_addr[0],
+                    result.upf_addr[1],
+                    result.upf_addr[2],
+                    result.upf_addr[3]
+                );
+                // Store UPF SEID for later PFCP modifications (in SmfContext, not a global)
+                if let Ok(ctx) = smf_self().read() {
+                    if let Ok(mut sessions) = ctx.pfcp_sessions.write() {
+                        sessions.insert(sm_context_ref.to_string(), result.upf_seid);
+                        log::debug!(
+                            "Stored UPF SEID=0x{:016x} for sm_context_ref={}",
+                            result.upf_seid,
+                            sm_context_ref
+                        );
+                    }
                 }
+                (result.upf_teid, result.upf_addr)
             }
-            (result.upf_teid, result.upf_addr)
-        }
-        Err(e) => {
-            log::warn!("PFCP session establishment failed ({e}), using fallback TEID");
-            let fallback_teid = sm_context_ref.parse::<u32>().unwrap_or(1);
-            (fallback_teid, [127u8, 0, 0, 1])
-        }
-    };
+            Err(e) => {
+                log::error!("PFCP session establishment failed: {e} — rejecting SM context");
+                // Release the allocated UE IP before failing
+                if let Ok(ctx) = smf_self().read() {
+                    ctx.ipv4_pool.release(std::net::Ipv4Addr::from(ue_ip_octets));
+                }
+                return SbiResponse::with_status(504);
+            }
+        };
 
     // Build N2 SM Information: UPF tunnel endpoint
     // Format: QFI(1) + UPF TEID(4,BE) + addr_type(1) + IPv4(4) + 5QI(1) + priority(1)
@@ -1309,42 +1378,26 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
 
                     // Send PFCP Session Modification to UPF: activate DL FAR with gNB TEID
                     // Retrieve the real UPF SEID stored during establishment (from SmfContext)
-                    let upf_seid = smf_self()
-                        .read()
-                        .ok()
-                        .and_then(|ctx| {
-                            ctx.pfcp_sessions
-                                .read()
-                                .ok()
-                                .and_then(|sessions| sessions.get(sm_context_ref).copied())
-                        })
-                        .unwrap_or_else(|| {
-                            log::warn!(
-                                "No stored UPF SEID for ref={sm_context_ref}, using fallback"
-                            );
-                            sm_context_ref.parse::<u64>().unwrap_or(1)
-                        });
+                    let upf_seid = smf_self().read().ok().and_then(|ctx| {
+                        ctx.pfcp_sessions
+                            .read()
+                            .ok()
+                            .and_then(|sessions| sessions.get(sm_context_ref).copied())
+                    });
+                    let Some(upf_seid) = upf_seid else {
+                        // No N4 session exists for this context — fabricating
+                        // a SEID would target an unrelated session
+                        log::error!("No stored UPF SEID for ref={sm_context_ref}");
+                        return SbiResponse::with_status(404);
+                    };
                     log::info!("PFCP Session Modification: UPF SEID=0x{upf_seid:016x} for ref={sm_context_ref}");
-                    let upf_mod_addr =
-                        std::env::var("UPF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-                    let upf_mod_port: u16 = std::env::var("UPF_PFCP_PORT")
-                        .ok()
-                        .and_then(|p| p.parse().ok())
-                        .unwrap_or(8805);
-                    match pfcp_session_modify(
-                        upf_seid,
-                        gnb_teid,
-                        gnb_addr,
-                        &upf_mod_addr,
-                        upf_mod_port,
-                    )
-                    .await
-                    {
+                    match pfcp_session_modify(upf_seid, gnb_teid, gnb_addr).await {
                         Ok(()) => {
                             log::info!("PFCP Session Modified: DL FAR activated with gNB TEID=0x{gnb_teid:08x}");
                         }
                         Err(e) => {
-                            log::warn!("PFCP Session Modification failed: {e}");
+                            log::error!("PFCP Session Modification failed: {e}");
+                            return SbiResponse::with_status(504);
                         }
                     }
                 }
@@ -1392,16 +1445,8 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         });
 
         if let Some(seid) = upf_seid {
-            // Send PFCP Session Modification to UPF with QoS update
-            // Use existing gNB TEID (no tunnel change, just QoS parameters)
-            let upf_addr =
-                std::env::var("UPF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-            let upf_port: u16 = std::env::var("UPF_PFCP_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(8805);
-
-            // Build PFCP modification with QoS update (modify QER on existing PDRs)
+            // Build PFCP modification with QoS update (modify QER on existing
+            // PDRs) and send it through the single transaction engine
             let params = n4_build::SessionModificationParams {
                 update_qers: vec![n4_build::QerParams {
                     qer_id: 1,
@@ -1412,54 +1457,38 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
                 }],
                 ..Default::default()
             };
-
             let payload = n4_build::build_session_modification_request(&params);
 
-            // Build PFCP header with UPF SEID
-            let mut packet = Vec::with_capacity(16 + payload.len());
-            packet.push(0x21); // flags: version=1 + SEID present
-            packet.push(52); // Session Modification Request
-            let total_len = (12 + payload.len()) as u16;
-            packet.extend_from_slice(&total_len.to_be_bytes());
-            packet.extend_from_slice(&seid.to_be_bytes());
-            let seq: u32 = PFCP_SEQ.fetch_add(1, Ordering::Relaxed);
-            packet.extend_from_slice(&seq.to_be_bytes()[1..4]);
-            packet.push(0); // spare
-            packet.extend_from_slice(&payload);
-
-            // Send via UDP
-            let upf_endpoint: std::net::SocketAddr = match format!("{upf_addr}:{upf_port}").parse()
-            {
-                Ok(ep) => ep,
-                Err(e) => {
-                    log::warn!("Invalid UPF address: {e}");
-                    return SbiResponse::with_status(500);
-                }
-            };
-            match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-                Ok(socket) => {
-                    if let Err(e) = socket.send_to(&packet, upf_endpoint).await {
-                        log::warn!("PFCP modification send failed: {e}");
-                    } else {
-                        log::info!("PFCP Session Modification (QoS) sent: UPF SEID=0x{seid:016x}");
-                        let mut resp_buf = vec![0u8; 4096];
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            socket.recv_from(&mut resp_buf),
-                        )
-                        .await
-                        {
-                            Ok(Ok((len, _))) => {
-                                log::info!("PFCP Session Modification (QoS) response: {len} bytes");
-                            }
-                            _ => {
-                                log::warn!("PFCP modification response timeout or error");
-                            }
+            match pfcp_path::global_client() {
+                Some(client) => match client
+                    .request(
+                        pfcp_path::pfcp_message_type::SESSION_MODIFICATION_REQUEST,
+                        Some(seid),
+                        &payload,
+                    )
+                    .await
+                {
+                    Ok((_, resp_body)) => match pfcp_path::parse_cause(&resp_body) {
+                        Some(pfcp_path::pfcp_cause::REQUEST_ACCEPTED) => {
+                            log::info!(
+                                "PFCP Session Modification (QoS) accepted: UPF SEID=0x{seid:016x}"
+                            );
                         }
+                        cause => {
+                            log::error!(
+                                "PFCP Session Modification (QoS) rejected: cause={cause:?}"
+                            );
+                            return SbiResponse::with_status(504);
+                        }
+                    },
+                    Err(e) => {
+                        log::error!("PFCP Session Modification (QoS) failed: {e}");
+                        return SbiResponse::with_status(504);
                     }
-                }
-                Err(e) => {
-                    log::warn!("Failed to bind PFCP socket: {e}");
+                },
+                None => {
+                    log::error!("PFCP client not initialised");
+                    return SbiResponse::with_status(500);
                 }
             }
         } else {
@@ -1514,18 +1543,14 @@ async fn handle_sm_context_release(sm_context_ref: &str) -> SbiResponse {
     });
 
     if let Some(seid) = upf_seid {
-        // Send PFCP Session Deletion Request to UPF
-        let upf_addr = std::env::var("UPF_PFCP_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-        let upf_port: u16 = std::env::var("UPF_PFCP_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(8805);
-
-        match pfcp_session_delete(seid, &upf_addr, upf_port).await {
+        // Send PFCP Session Deletion Request to UPF (with retransmission)
+        match pfcp_session_delete(seid).await {
             Ok(()) => {
                 log::info!("PFCP Session Deleted: UPF SEID=0x{seid:016x} for ref={sm_context_ref}");
             }
             Err(e) => {
+                // The local context is removed anyway: keeping it would leak
+                // resources for a session the peer may no longer have
                 log::warn!("PFCP Session Deletion failed: {e} (continuing with release)");
             }
         }

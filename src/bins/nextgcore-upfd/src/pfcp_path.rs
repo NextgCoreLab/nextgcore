@@ -3,12 +3,15 @@
 //! Port of src/upf/pfcp-path.c - PFCP path management for UPF
 
 use crate::n4_build::{
-    build_association_setup_response, build_heartbeat_response, build_session_deletion_response,
+    build_association_release_response, build_association_setup_response, build_failure_response,
+    build_heartbeat_response, build_session_deletion_response,
     build_session_establishment_response, build_session_modification_response,
-    build_session_report_request, parse_create_far, parse_create_pdr, parse_create_qer,
-    parse_create_urr, pfcp_ie, pfcp_type, CreatedPdr, FSeid, FTeid, NodeId, ParsedCreateFar,
-    ParsedCreatePdr, ParsedCreateQer, ParsedCreateUrr, ParsedFSeid, ParsedIe, ParsedPfcpHeader,
-    PfcpCause, UserPlaneReport,
+    build_session_report_request, parse_create_bar, parse_create_far, parse_create_pdr,
+    parse_create_qer, parse_create_urr, parse_pfcpsmreq_flags, parse_recovery_time_stamp,
+    pfcp_ie, pfcp_type, pfcpsmreq_flags, CreatedPdr, DownlinkDataReport,
+    DownlinkDataServiceInfo, ErrorIndicationReport, FSeid, FTeid, NodeId, ParsedCreateBar,
+    ParsedCreateFar, ParsedCreatePdr, ParsedCreateQer, ParsedCreateUrr, ParsedFSeid, ParsedIe,
+    ParsedPfcpHeader, PfcpCause, ReportType, UserPlaneReport,
 };
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -394,6 +397,8 @@ pub enum PfcpSessionEvent {
         qers: Vec<ParsedCreateQer>,
         /// Parsed URR rules from PFCP
         urrs: Vec<ParsedCreateUrr>,
+        /// Parsed BAR rules from PFCP
+        bars: Vec<ParsedCreateBar>,
     },
     /// Session modified - update forwarding rules
     SessionModified {
@@ -406,17 +411,38 @@ pub enum PfcpSessionEvent {
         updated_fars: Vec<ParsedCreateFar>,
         /// Updated QERs
         updated_qers: Vec<ParsedCreateQer>,
+        /// Created/updated BARs
+        updated_bars: Vec<ParsedCreateBar>,
+        /// SMF requested End Marker packets on the old DL tunnel (SNDEM)
+        send_end_marker: bool,
+        /// SMF requested buffered packets to be dropped (DROBU)
+        drop_buffered: bool,
+        /// DL tunnel endpoint before this modification (TEID, gNB address)
+        old_dl_tunnel: Option<(u32, Ipv4Addr)>,
     },
     /// Session deleted - remove forwarding rules
     SessionDeleted {
         upf_seid: u64,
         ue_ipv4: Option<Ipv4Addr>,
     },
+    /// The control-plane peer restarted (Recovery Time Stamp changed) or the
+    /// association was released: all sessions belonging to it are stale and
+    /// must be removed (TS 23.527 4.2).
+    PeerFailure { peer: SocketAddr },
 }
 
 // ============================================================================
 // Async PFCP Server
 // ============================================================================
+
+/// State of the PFCP association with a control-plane peer (TS 29.244 6.2.6)
+#[derive(Debug, Clone)]
+pub struct PfcpAssociation {
+    pub peer_addr: SocketAddr,
+    /// The peer's Recovery Time Stamp from Association Setup / Heartbeat —
+    /// a change means the peer restarted and all its sessions are stale
+    pub recovery_time_stamp: u32,
+}
 
 /// Async PFCP server for handling SMF requests
 pub struct PfcpServer {
@@ -426,11 +452,17 @@ pub struct PfcpServer {
     recovery_time_stamp: u32,
     next_seid: AtomicU64,
     next_teid: AtomicU32,
+    /// Sequence numbers for UPF-initiated requests (Session Report, Heartbeat)
+    next_seq: AtomicU32,
     shutdown: Arc<AtomicBool>,
     /// Channel to send session events to data plane
     session_tx: mpsc::Sender<PfcpSessionEvent>,
     /// Active sessions: UPF SEID -> SessionInfo
     sessions: tokio::sync::RwLock<HashMap<u64, PfcpSessionInfo>>,
+    /// Current PFCP association (None until Association Setup succeeds)
+    association: tokio::sync::RwLock<Option<PfcpAssociation>>,
+    /// Data plane handle for pulling final URR counters on session deletion
+    data_plane: std::sync::RwLock<Option<Arc<crate::data_plane::DataPlane>>>,
 }
 
 /// PFCP session information stored in server
@@ -472,9 +504,12 @@ impl PfcpServer {
             recovery_time_stamp,
             next_seid: AtomicU64::new(1),
             next_teid: AtomicU32::new(0x10000), // Start TEIDs from 0x10000
+            next_seq: AtomicU32::new(1),
             shutdown,
             session_tx,
             sessions: tokio::sync::RwLock::new(HashMap::new()),
+            association: tokio::sync::RwLock::new(None),
+            data_plane: std::sync::RwLock::new(None),
         })
     }
 
@@ -486,6 +521,39 @@ impl PfcpServer {
     /// Allocate a new TEID
     fn alloc_teid(&self) -> u32 {
         self.next_teid.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Allocate the next sequence number for a UPF-initiated request
+    fn alloc_seq(&self) -> u32 {
+        let seq = self.next_seq.fetch_add(1, Ordering::SeqCst) & 0x00FF_FFFF;
+        if seq == 0 {
+            self.next_seq.fetch_add(1, Ordering::SeqCst) & 0x00FF_FFFF
+        } else {
+            seq
+        }
+    }
+
+    /// Whether a PFCP association with a CP function is currently up
+    pub async fn is_associated(&self) -> bool {
+        self.association.read().await.is_some()
+    }
+
+    /// Handle a peer restart or association teardown: drop the association,
+    /// clear all sessions, and tell the data plane to flush its state.
+    async fn declare_peer_failure(&self, peer: SocketAddr, reason: &str) {
+        log::warn!("PFCP peer {peer} failure ({reason}): clearing association and sessions");
+        *self.association.write().await = None;
+        let count = {
+            let mut sessions = self.sessions.write().await;
+            let n = sessions.len();
+            sessions.clear();
+            n
+        };
+        log::warn!("Cleared {count} PFCP sessions after peer failure");
+        let _ = self
+            .session_tx
+            .send(PfcpSessionEvent::PeerFailure { peer })
+            .await;
     }
 
     /// Run the PFCP server main loop
@@ -540,10 +608,22 @@ impl PfcpServer {
 
         match header.msg_type {
             pfcp_type::HEARTBEAT_REQUEST => {
-                self.handle_heartbeat_request(&header, src_addr).await?;
+                self.handle_heartbeat_request(&header, payload, src_addr)
+                    .await?;
+            }
+            pfcp_type::HEARTBEAT_RESPONSE => {
+                // Response to a UPF-initiated heartbeat: check the peer's
+                // recovery timestamp for restart detection
+                if let Some(rts) = parse_recovery_time_stamp(payload) {
+                    self.check_peer_recovery(src_addr, rts).await;
+                }
             }
             pfcp_type::ASSOCIATION_SETUP_REQUEST => {
                 self.handle_association_setup_request(&header, payload, src_addr)
+                    .await?;
+            }
+            pfcp_type::ASSOCIATION_RELEASE_REQUEST => {
+                self.handle_association_release_request(&header, src_addr)
                     .await?;
             }
             pfcp_type::SESSION_ESTABLISHMENT_REQUEST => {
@@ -558,6 +638,21 @@ impl PfcpServer {
                 self.handle_session_deletion_request(&header, payload, src_addr)
                     .await?;
             }
+            pfcp_type::SESSION_REPORT_RESPONSE => {
+                // Response to a UPF-initiated Session Report Request
+                let ies = ParsedIe::parse_all(payload);
+                let cause = ParsedIe::find_ie(&ies, pfcp_ie::CAUSE)
+                    .and_then(|ie| ie.value.first().copied())
+                    .unwrap_or(0);
+                if cause == PfcpCause::RequestAccepted as u8 {
+                    log::debug!("Session Report accepted (seq={})", header.sequence_number);
+                } else {
+                    log::warn!(
+                        "Session Report rejected: cause={cause} (seq={})",
+                        header.sequence_number
+                    );
+                }
+            }
             _ => {
                 log::warn!("Unhandled PFCP message type: {}", header.msg_type);
             }
@@ -566,13 +661,37 @@ impl PfcpServer {
         Ok(())
     }
 
+    /// Compare a peer-reported Recovery Time Stamp against the stored
+    /// association; a change means the peer restarted (TS 29.244 6.2.7.2).
+    async fn check_peer_recovery(&self, src_addr: SocketAddr, rts: u32) {
+        let restarted = {
+            let assoc = self.association.read().await;
+            match assoc.as_ref() {
+                Some(a) => a.recovery_time_stamp != rts,
+                None => false,
+            }
+        };
+        if restarted {
+            self.declare_peer_failure(src_addr, "recovery time stamp changed")
+                .await;
+        }
+    }
+
     /// Handle Heartbeat Request
     async fn handle_heartbeat_request(
         &self,
         header: &ParsedPfcpHeader,
+        payload: &[u8],
         src_addr: SocketAddr,
     ) -> Result<(), String> {
         log::debug!("Handling Heartbeat Request from {src_addr}");
+
+        // Peer restart detection from the Recovery Time Stamp (mandatory IE)
+        if let Some(rts) = parse_recovery_time_stamp(payload) {
+            self.check_peer_recovery(src_addr, rts).await;
+        } else {
+            log::warn!("Heartbeat Request from {src_addr} missing Recovery Time Stamp");
+        }
 
         let payload = build_heartbeat_response(self.recovery_time_stamp);
         let response = self.build_response(
@@ -601,11 +720,45 @@ impl PfcpServer {
     ) -> Result<(), String> {
         log::info!("Handling Association Setup Request from {src_addr}");
 
-        // Parse Node ID from request
+        // Node ID and Recovery Time Stamp are mandatory (TS 29.244 7.4.4.1)
         let ies = ParsedIe::parse_all(payload);
-        if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::NODE_ID) {
-            log::debug!("SMF Node ID: {:?}", ie.value);
+        let node_id_present = ParsedIe::find_ie(&ies, pfcp_ie::NODE_ID).is_some();
+        let rts = parse_recovery_time_stamp(payload);
+
+        if !node_id_present || rts.is_none() {
+            let offending = if node_id_present {
+                pfcp_ie::RECOVERY_TIME_STAMP
+            } else {
+                pfcp_ie::NODE_ID
+            };
+            log::warn!(
+                "Association Setup Request from {src_addr} missing mandatory IE {offending}"
+            );
+            let resp_payload =
+                build_failure_response(PfcpCause::MandatoryIeMissing, Some(offending));
+            let response = self.build_response(
+                pfcp_type::ASSOCIATION_SETUP_RESPONSE,
+                0,
+                header.sequence_number,
+                &resp_payload,
+                false,
+            );
+            self.socket
+                .send_to(&response, src_addr)
+                .await
+                .map_err(|e| format!("Send error: {e}"))?;
+            return Ok(());
         }
+        let rts = rts.unwrap();
+
+        // If we already had an association with a different recovery
+        // timestamp, the peer restarted — flush stale sessions first
+        self.check_peer_recovery(src_addr, rts).await;
+
+        *self.association.write().await = Some(PfcpAssociation {
+            peer_addr: src_addr,
+            recovery_time_stamp: rts,
+        });
 
         let resp_payload = build_association_setup_response(
             &self.local_node_id,
@@ -626,8 +779,56 @@ impl PfcpServer {
             .await
             .map_err(|e| format!("Send error: {e}"))?;
 
-        log::info!("PFCP Association established with {src_addr}");
+        log::info!("PFCP Association established with {src_addr} (peer RTS={rts})");
         Ok(())
+    }
+
+    /// Handle Association Release Request (TS 29.244 7.4.4.2): acknowledge,
+    /// drop the association, and delete all sessions belonging to the peer.
+    async fn handle_association_release_request(
+        &self,
+        header: &ParsedPfcpHeader,
+        src_addr: SocketAddr,
+    ) -> Result<(), String> {
+        log::info!("Handling Association Release Request from {src_addr}");
+
+        let resp_payload =
+            build_association_release_response(&self.local_node_id, PfcpCause::RequestAccepted);
+        let response = self.build_response(
+            pfcp_type::ASSOCIATION_RELEASE_RESPONSE,
+            0,
+            header.sequence_number,
+            &resp_payload,
+            false,
+        );
+        self.socket
+            .send_to(&response, src_addr)
+            .await
+            .map_err(|e| format!("Send error: {e}"))?;
+
+        self.declare_peer_failure(src_addr, "association released by peer")
+            .await;
+        Ok(())
+    }
+
+    /// Send a Heartbeat Request to the associated CP peer (UPF-initiated
+    /// direction, TS 29.244 7.4.2). Returns the peer address if one was sent.
+    pub async fn send_heartbeat_request(&self) -> Option<SocketAddr> {
+        let peer = self.association.read().await.as_ref()?.peer_addr;
+        let payload = crate::n4_build::build_heartbeat_request(self.recovery_time_stamp);
+        let seq = self.alloc_seq();
+        let message =
+            self.build_response(pfcp_type::HEARTBEAT_REQUEST, 0, seq, &payload, false);
+        match self.socket.send_to(&message, peer).await {
+            Ok(_) => {
+                log::debug!("Sent Heartbeat Request to {peer} (seq={seq})");
+                Some(peer)
+            }
+            Err(e) => {
+                log::warn!("Failed to send Heartbeat Request to {peer}: {e}");
+                None
+            }
+        }
     }
 
     /// Handle Session Establishment Request
@@ -641,13 +842,85 @@ impl PfcpServer {
 
         let ies = ParsedIe::parse_all(payload);
 
-        // Parse CP F-SEID (SMF's SEID)
-        let smf_seid = if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::F_SEID) {
-            let f_seid = ParsedFSeid::parse(&ie.value).map_err(|e| e.to_string())?;
-            log::debug!("SMF F-SEID: {:#x}", f_seid.seid);
-            f_seid.seid
+        // TS 29.244 6.2.6.2: session messages require an established
+        // PFCP association with the peer
+        if !self.is_associated().await {
+            log::warn!("Session Establishment from {src_addr} without PFCP association");
+            let resp_payload =
+                build_failure_response(PfcpCause::NoEstablishedPfcpAssociation, None);
+            let response = self.build_response(
+                pfcp_type::SESSION_ESTABLISHMENT_RESPONSE,
+                header.seid,
+                header.sequence_number,
+                &resp_payload,
+                true,
+            );
+            self.socket
+                .send_to(&response, src_addr)
+                .await
+                .map_err(|e| format!("Send error: {e}"))?;
+            return Ok(());
+        }
+
+        // Mandatory IEs per TS 29.244 Table 7.5.2.1-1: Node ID, CP F-SEID,
+        // Create PDR, Create FAR
+        let missing_ie = if ParsedIe::find_ie(&ies, pfcp_ie::NODE_ID).is_none() {
+            Some(pfcp_ie::NODE_ID)
+        } else if ParsedIe::find_ie(&ies, pfcp_ie::F_SEID).is_none() {
+            Some(pfcp_ie::F_SEID)
+        } else if ParsedIe::find_ie(&ies, pfcp_ie::CREATE_PDR).is_none() {
+            Some(pfcp_ie::CREATE_PDR)
+        } else if ParsedIe::find_ie(&ies, pfcp_ie::CREATE_FAR).is_none() {
+            Some(pfcp_ie::CREATE_FAR)
         } else {
-            return Err("Missing CP F-SEID".to_string());
+            None
+        };
+        if let Some(offending) = missing_ie {
+            log::warn!(
+                "Session Establishment from {src_addr} missing mandatory IE {offending} — rejecting"
+            );
+            let resp_payload =
+                build_failure_response(PfcpCause::MandatoryIeMissing, Some(offending));
+            let response = self.build_response(
+                pfcp_type::SESSION_ESTABLISHMENT_RESPONSE,
+                header.seid,
+                header.sequence_number,
+                &resp_payload,
+                true,
+            );
+            self.socket
+                .send_to(&response, src_addr)
+                .await
+                .map_err(|e| format!("Send error: {e}"))?;
+            return Ok(());
+        }
+
+        // Parse CP F-SEID (SMF's SEID) — presence checked above
+        let f_seid_ie = ParsedIe::find_ie(&ies, pfcp_ie::F_SEID).unwrap();
+        let smf_seid = match ParsedFSeid::parse(&f_seid_ie.value) {
+            Ok(f_seid) => {
+                log::debug!("SMF F-SEID: {:#x}", f_seid.seid);
+                f_seid.seid
+            }
+            Err(e) => {
+                log::warn!("Malformed CP F-SEID from {src_addr}: {e}");
+                let resp_payload = build_failure_response(
+                    PfcpCause::MandatoryIeIncorrect,
+                    Some(pfcp_ie::F_SEID),
+                );
+                let response = self.build_response(
+                    pfcp_type::SESSION_ESTABLISHMENT_RESPONSE,
+                    header.seid,
+                    header.sequence_number,
+                    &resp_payload,
+                    true,
+                );
+                self.socket
+                    .send_to(&response, src_addr)
+                    .await
+                    .map_err(|e| format!("Send error: {e}"))?;
+                return Ok(());
+            }
         };
 
         // Allocate UPF SEID
@@ -784,6 +1057,25 @@ impl PfcpServer {
             }
         }
 
+        // Parse Create BARs
+        let mut parsed_bars = Vec::new();
+        for bar_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::CREATE_BAR) {
+            match parse_create_bar(&bar_ie.value) {
+                Ok(bar) => {
+                    log::debug!(
+                        "BAR {}: suggested_pkts={:?}, ddn_delay={:?}",
+                        bar.bar_id,
+                        bar.suggested_buffering_packets_count,
+                        bar.ddn_delay
+                    );
+                    parsed_bars.push(bar);
+                }
+                Err(e) => {
+                    log::warn!("Failed to parse BAR: {e}");
+                }
+            }
+        }
+
         // Build response
         let f_seid = FSeid {
             seid: upf_seid,
@@ -843,6 +1135,7 @@ impl PfcpServer {
             fars: parsed_fars,
             qers: parsed_qers,
             urrs: parsed_urrs,
+            bars: parsed_bars,
         };
 
         if let Err(e) = self.session_tx.send(event).await {
@@ -915,19 +1208,61 @@ impl PfcpServer {
             }
         }
 
-        // Update session info
-        let smf_seid = {
+        // Parse Create/Update BARs
+        let mut mod_bars = Vec::new();
+        for bar_ie in ParsedIe::find_all_ies(&ies, pfcp_ie::CREATE_BAR)
+            .into_iter()
+            .chain(ParsedIe::find_all_ies(&ies, pfcp_ie::UPDATE_BAR))
+        {
+            match parse_create_bar(&bar_ie.value) {
+                Ok(bar) => mod_bars.push(bar),
+                Err(e) => log::warn!("Failed to parse BAR: {e}"),
+            }
+        }
+
+        // PFCPSMReq-Flags (TS 29.244 8.2.50): SNDEM → emit End Marker on the
+        // old DL tunnel; DROBU → discard buffered DL packets
+        let smreq_flags = parse_pfcpsmreq_flags(payload).unwrap_or(0);
+        let send_end_marker = smreq_flags & pfcpsmreq_flags::SNDEM != 0;
+        let drop_buffered = smreq_flags & pfcpsmreq_flags::DROBU != 0;
+
+        // Update session info; respond Session Context Not Found for an
+        // unknown SEID (TS 29.244 7.5.5, cause 65)
+        let lookup = {
             let mut sessions = self.sessions.write().await;
             if let Some(session) = sessions.get_mut(&upf_seid) {
+                let old_tunnel = session
+                    .gnb_addr
+                    .map(|addr| (session.dl_teid, addr));
                 if let Some(teid) = updated_dl_teid {
                     session.dl_teid = teid;
                 }
                 if let Some(addr) = updated_gnb_addr {
                     session.gnb_addr = Some(addr);
                 }
-                session.smf_seid
+                Some((session.smf_seid, old_tunnel))
             } else {
-                return Err(format!("Session {upf_seid:#x} not found"));
+                None
+            }
+        };
+        let (smf_seid, old_dl_tunnel) = match lookup {
+            Some(v) => v,
+            None => {
+                log::warn!("Session Modification for unknown SEID {upf_seid:#x} — rejecting");
+                let resp_payload =
+                    build_failure_response(PfcpCause::SessionContextNotFound, None);
+                let response = self.build_response(
+                    pfcp_type::SESSION_MODIFICATION_RESPONSE,
+                    0, // CP SEID unknown
+                    header.sequence_number,
+                    &resp_payload,
+                    true,
+                );
+                self.socket
+                    .send_to(&response, src_addr)
+                    .await
+                    .map_err(|e| format!("Send error: {e}"))?;
+                return Ok(());
             }
         };
 
@@ -954,7 +1289,10 @@ impl PfcpServer {
         let has_changes = updated_dl_teid.is_some()
             || updated_gnb_addr.is_some()
             || !mod_fars.is_empty()
-            || !mod_qers.is_empty();
+            || !mod_qers.is_empty()
+            || !mod_bars.is_empty()
+            || send_end_marker
+            || drop_buffered;
 
         if has_changes {
             let event = PfcpSessionEvent::SessionModified {
@@ -963,6 +1301,10 @@ impl PfcpServer {
                 gnb_addr: updated_gnb_addr,
                 updated_fars: mod_fars,
                 updated_qers: mod_qers,
+                updated_bars: mod_bars,
+                send_end_marker,
+                drop_buffered,
+                old_dl_tunnel,
             };
 
             if let Err(e) = self.session_tx.send(event).await {
@@ -990,14 +1332,36 @@ impl PfcpServer {
             sessions.remove(&upf_seid)
         };
 
-        let smf_seid = session_info.as_ref().map(|s| s.smf_seid).unwrap_or(0);
-        let ue_ipv4 = session_info.as_ref().and_then(|s| s.ue_ipv4);
+        // Unknown SEID → Session Context Not Found (TS 29.244 7.5.7, cause 65)
+        let session_info = match session_info {
+            Some(info) => info,
+            None => {
+                log::warn!("Session Deletion for unknown SEID {upf_seid:#x} — rejecting");
+                let resp_payload =
+                    build_failure_response(PfcpCause::SessionContextNotFound, None);
+                let response = self.build_response(
+                    pfcp_type::SESSION_DELETION_RESPONSE,
+                    0,
+                    header.sequence_number,
+                    &resp_payload,
+                    true,
+                );
+                self.socket
+                    .send_to(&response, src_addr)
+                    .await
+                    .map_err(|e| format!("Send error: {e}"))?;
+                return Ok(());
+            }
+        };
+        let smf_seid = session_info.smf_seid;
+        let ue_ipv4 = session_info.ue_ipv4;
 
-        // Build response (no usage reports for now)
-        let resp_payload = build_session_deletion_response(
-            pfcp_type::SESSION_DELETION_RESPONSE,
-            &[], // Usage reports would go here
-        );
+        // Final usage reports (TS 29.244 7.5.7.1: Usage Report within
+        // Session Deletion Response with the TERMR trigger) pulled from the
+        // data-plane URR accounting state
+        let usage_reports = self.collect_final_usage_reports(upf_seid);
+        let resp_payload =
+            build_session_deletion_response(pfcp_type::SESSION_DELETION_RESPONSE, &usage_reports);
 
         let response = self.build_response(
             pfcp_type::SESSION_DELETION_RESPONSE,
@@ -1020,6 +1384,152 @@ impl PfcpServer {
         }
 
         log::info!("Session {upf_seid:#x} deleted");
+        Ok(())
+    }
+
+    /// Attach the data plane so PFCP handlers can pull final URR counters
+    /// for Session Deletion Responses.
+    pub fn set_data_plane(&self, dp: Arc<crate::data_plane::DataPlane>) {
+        *self.data_plane.write().unwrap() = Some(dp);
+    }
+
+    /// Collect final usage reports (TERMR trigger) from the data-plane URRs
+    /// of a session that is being deleted.
+    fn collect_final_usage_reports(&self, upf_seid: u64) -> Vec<crate::n4_build::UsageReport> {
+        let dp = match self.data_plane.read().unwrap().clone() {
+            Some(dp) => dp,
+            None => return Vec::new(),
+        };
+        let session = match dp.sessions.find_by_seid(upf_seid) {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        let urrs = session.urrs.read().unwrap();
+        urrs.values()
+            .map(|urr| {
+                let mut trigger = crate::n4_build::UsageReportTrigger::default();
+                trigger.termination_report = true;
+                crate::n4_build::UsageReport {
+                    urr_id: urr.urr_id,
+                    ur_seqn: urr.next_ur_seqn(),
+                    trigger,
+                    volume_measurement: Some(crate::n4_build::VolumeMeasurement {
+                        total_volume: Some(
+                            urr.acc_total_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                        uplink_volume: Some(
+                            urr.acc_ul_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                        downlink_volume: Some(
+                            urr.acc_dl_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                        total_packets: Some(
+                            urr.acc_total_pkts.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                        uplink_packets: Some(
+                            urr.acc_ul_pkts.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                        downlink_packets: Some(
+                            urr.acc_dl_pkts.load(std::sync::atomic::Ordering::Relaxed),
+                        ),
+                    }),
+                    ..Default::default()
+                }
+            })
+            .collect()
+    }
+
+    /// Send a Session Report Request carrying a Downlink Data Report
+    /// (TS 29.244 7.5.8.2) when the first DL packet is buffered under a
+    /// BUFF+NOCP FAR.
+    pub async fn send_downlink_data_report(
+        &self,
+        upf_seid: u64,
+        smf_seid: u64,
+        pdr_id: u16,
+        qfi: Option<u8>,
+    ) -> Result<(), String> {
+        let smf_addr = {
+            let sessions = self.sessions.read().await;
+            sessions.get(&upf_seid).map(|s| s.smf_addr)
+        }
+        .ok_or_else(|| format!("Session {upf_seid:#x} not found for DL data report"))?;
+
+        let report = UserPlaneReport {
+            report_type: ReportType {
+                downlink_data_report: true,
+                ..Default::default()
+            },
+            downlink_data_report: Some(DownlinkDataReport {
+                pdr_id,
+                downlink_data_service_info: qfi.map(|q| DownlinkDataServiceInfo {
+                    ppi: None,
+                    qfi: Some(q),
+                }),
+            }),
+            ..Default::default()
+        };
+
+        let payload =
+            build_session_report_request(pfcp_type::SESSION_REPORT_REQUEST, &report);
+        let seq = self.alloc_seq();
+        let message =
+            self.build_response(pfcp_type::SESSION_REPORT_REQUEST, smf_seid, seq, &payload, true);
+        self.socket
+            .send_to(&message, smf_addr)
+            .await
+            .map_err(|e| format!("Failed to send Downlink Data Report: {e}"))?;
+        log::info!(
+            "Sent Downlink Data Report to {smf_addr}: SEID=0x{upf_seid:x}, PDR={pdr_id}, QFI={qfi:?}"
+        );
+        Ok(())
+    }
+
+    /// Send a Session Report Request carrying an Error Indication Report
+    /// (TS 29.244 7.5.8.4) after a GTP-U Error Indication was received on a
+    /// DL tunnel.
+    pub async fn send_error_indication_report(
+        &self,
+        upf_seid: u64,
+        smf_seid: u64,
+        remote_teid: u32,
+        peer_ipv4: Option<Ipv4Addr>,
+    ) -> Result<(), String> {
+        let smf_addr = {
+            let sessions = self.sessions.read().await;
+            sessions.get(&upf_seid).map(|s| s.smf_addr)
+        }
+        .ok_or_else(|| format!("Session {upf_seid:#x} not found for error indication report"))?;
+
+        let report = UserPlaneReport {
+            report_type: ReportType {
+                error_indication_report: true,
+                ..Default::default()
+            },
+            error_indication_report: Some(ErrorIndicationReport {
+                remote_f_teid: FTeid {
+                    teid: remote_teid,
+                    ipv4: peer_ipv4,
+                    ipv6: None,
+                    choose: false,
+                    choose_id: None,
+                },
+            }),
+            ..Default::default()
+        };
+
+        let payload =
+            build_session_report_request(pfcp_type::SESSION_REPORT_REQUEST, &report);
+        let seq = self.alloc_seq();
+        let message =
+            self.build_response(pfcp_type::SESSION_REPORT_REQUEST, smf_seid, seq, &payload, true);
+        self.socket
+            .send_to(&message, smf_addr)
+            .await
+            .map_err(|e| format!("Failed to send Error Indication Report: {e}"))?;
+        log::info!(
+            "Sent Error Indication Report to {smf_addr}: SEID=0x{upf_seid:x}, TEID=0x{remote_teid:x}"
+        );
         Ok(())
     }
 
@@ -1053,7 +1563,7 @@ impl PfcpServer {
 
                 crate::n4_build::UsageReport {
                     urr_id: r.urr_id,
-                    ur_seqn: 1,
+                    ur_seqn: r.ur_seqn,
                     trigger,
                     volume_measurement: Some(crate::n4_build::VolumeMeasurement {
                         total_volume: Some(r.total_bytes),
@@ -1080,8 +1590,8 @@ impl PfcpServer {
         let payload =
             build_session_report_request(pfcp_type::SESSION_REPORT_REQUEST, &user_plane_report);
 
-        // Use a simple sequence number (atomic counter)
-        let seq = self.next_teid.fetch_add(1, Ordering::SeqCst); // reuse counter for seq
+        // Dedicated PFCP request sequence counter (not the TEID allocator)
+        let seq = self.alloc_seq();
 
         let message = self.build_response(
             pfcp_type::SESSION_REPORT_REQUEST,
@@ -1151,6 +1661,273 @@ impl PfcpServer {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+
+    // ------------------------------------------------------------------
+    // Strict-peer test harness: a real PfcpServer on localhost plus a fake
+    // SMF socket that sends raw PFCP messages and inspects the responses.
+    // ------------------------------------------------------------------
+
+    async fn spawn_test_server() -> (
+        Arc<PfcpServer>,
+        UdpSocket,
+        SocketAddr,
+        mpsc::Receiver<PfcpSessionEvent>,
+    ) {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel(32);
+        let server = Arc::new(
+            PfcpServer::new("127.0.0.1:0".parse().unwrap(), shutdown, tx)
+                .await
+                .unwrap(),
+        );
+        let server_addr = server.socket.local_addr().unwrap();
+        let smf_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let srv = server.clone();
+        tokio::spawn(async move { srv.run().await });
+        (server, smf_sock, server_addr, rx)
+    }
+
+    fn encode_pfcp(msg_type: u8, seid: Option<u64>, seq: u32, payload: &[u8]) -> Vec<u8> {
+        let mut pkt = Vec::new();
+        match seid {
+            Some(seid) => {
+                pkt.push(0x21);
+                pkt.push(msg_type);
+                pkt.extend_from_slice(&((12 + payload.len()) as u16).to_be_bytes());
+                pkt.extend_from_slice(&seid.to_be_bytes());
+            }
+            None => {
+                pkt.push(0x20);
+                pkt.push(msg_type);
+                pkt.extend_from_slice(&((4 + payload.len()) as u16).to_be_bytes());
+            }
+        }
+        pkt.extend_from_slice(&seq.to_be_bytes()[1..4]);
+        pkt.push(0);
+        pkt.extend_from_slice(payload);
+        pkt
+    }
+
+    async fn exchange(sock: &UdpSocket, server: SocketAddr, pkt: &[u8]) -> Vec<u8> {
+        sock.send_to(pkt, server).await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            sock.recv_from(&mut buf),
+        )
+        .await
+        .expect("server must respond")
+        .unwrap();
+        buf.truncate(len);
+        buf
+    }
+
+    fn response_cause(resp: &[u8]) -> u8 {
+        let (header, payload) = ParsedPfcpHeader::parse(resp).unwrap();
+        let _ = header;
+        let ies = ParsedIe::parse_all(payload);
+        ParsedIe::find_ie(&ies, pfcp_ie::CAUSE)
+            .and_then(|ie| ie.value.first().copied())
+            .unwrap_or(0)
+    }
+
+    fn build_association_setup_request_payload(rts: Option<u32>) -> Vec<u8> {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        if let Some(rts) = rts {
+            b.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, rts);
+        }
+        b.build()
+    }
+
+    #[tokio::test]
+    async fn test_association_setup_roundtrip_and_features() {
+        let (server, smf, addr, _rx) = spawn_test_server().await;
+        let payload = build_association_setup_request_payload(Some(0x5000_0000));
+        let resp = exchange(&smf, addr, &encode_pfcp(5, None, 1, &payload)).await;
+        assert_eq!(resp[1], pfcp_type::ASSOCIATION_SETUP_RESPONSE);
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert!(server.is_associated().await);
+
+        // The response must advertise the real UP Function Features
+        // (8 feature octets; FTUP + EMPU set, nothing else)
+        let (_, body) = ParsedPfcpHeader::parse(&resp).unwrap();
+        let ies = ParsedIe::parse_all(body);
+        let feat = ParsedIe::find_ie(&ies, pfcp_ie::UP_FUNCTION_FEATURES)
+            .expect("UP Function Features must be present");
+        assert_eq!(feat.value.len(), 8, "full Rel-17 feature octets");
+        let mut bytes = bytes::Bytes::copy_from_slice(&feat.value);
+        let decoded = ogs_pfcp::types::UpFunctionFeatures::decode(&mut bytes).unwrap();
+        assert!(decoded.ftup, "FTUP must be advertised");
+        assert!(decoded.empu, "EMPU must be advertised");
+        assert!(!decoded.bucp && !decoded.udbc && !decoded.quoac && !decoded.trace,
+            "unimplemented features must not be advertised");
+        // Recovery Time Stamp must be present and non-zero
+        let rts = crate::n4_build::parse_recovery_time_stamp(body).unwrap();
+        assert!(rts > 0, "recovery time stamp must be real, not hardcoded 0");
+    }
+
+    #[tokio::test]
+    async fn test_association_setup_missing_recovery_ts_rejected() {
+        let (_server, smf, addr, _rx) = spawn_test_server().await;
+        let payload = build_association_setup_request_payload(None);
+        let resp = exchange(&smf, addr, &encode_pfcp(5, None, 2, &payload)).await;
+        assert_eq!(response_cause(&resp), PfcpCause::MandatoryIeMissing as u8);
+        let (_, body) = ParsedPfcpHeader::parse(&resp).unwrap();
+        let ies = ParsedIe::parse_all(body);
+        let off = ParsedIe::find_ie(&ies, pfcp_ie::OFFENDING_IE).unwrap();
+        assert_eq!(
+            u16::from_be_bytes([off.value[0], off.value[1]]),
+            pfcp_ie::RECOVERY_TIME_STAMP
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_establishment_without_association_rejected() {
+        let (_server, smf, addr, _rx) = spawn_test_server().await;
+        // Valid-looking establishment, but no association exists yet
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        b.add_f_seid(&FSeid {
+            seid: 0x42,
+            ipv4: Some(Ipv4Addr::new(127, 0, 0, 9)),
+            ipv6: None,
+        });
+        let resp = exchange(&smf, addr, &encode_pfcp(50, Some(0), 3, &b.build())).await;
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::NoEstablishedPfcpAssociation as u8
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_establishment_missing_mandatory_ie_rejected() {
+        let (_server, smf, addr, _rx) = spawn_test_server().await;
+        // Associate first
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+
+        // Establishment without CP F-SEID → cause 66 + Offending IE 57
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        let resp = exchange(&smf, addr, &encode_pfcp(50, Some(0), 4, &b.build())).await;
+        assert_eq!(resp[1], pfcp_type::SESSION_ESTABLISHMENT_RESPONSE);
+        assert_eq!(response_cause(&resp), PfcpCause::MandatoryIeMissing as u8);
+        let (_, body) = ParsedPfcpHeader::parse(&resp).unwrap();
+        let ies = ParsedIe::parse_all(body);
+        let off = ParsedIe::find_ie(&ies, pfcp_ie::OFFENDING_IE).unwrap();
+        assert_eq!(
+            u16::from_be_bytes([off.value[0], off.value[1]]),
+            pfcp_ie::F_SEID
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_modification_unknown_seid_rejected() {
+        let (_server, smf, addr, _rx) = spawn_test_server().await;
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+
+        let resp = exchange(&smf, addr, &encode_pfcp(52, Some(0xDEAD), 5, &[])).await;
+        assert_eq!(resp[1], pfcp_type::SESSION_MODIFICATION_RESPONSE);
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::SessionContextNotFound as u8
+        );
+    }
+
+    #[tokio::test]
+    async fn test_session_deletion_unknown_seid_rejected() {
+        let (_server, smf, addr, _rx) = spawn_test_server().await;
+        let assoc = build_association_setup_request_payload(Some(1));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+
+        let resp = exchange(&smf, addr, &encode_pfcp(54, Some(0xBEEF), 6, &[])).await;
+        assert_eq!(resp[1], pfcp_type::SESSION_DELETION_RESPONSE);
+        assert_eq!(
+            response_cause(&resp),
+            PfcpCause::SessionContextNotFound as u8
+        );
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_roundtrip_and_restart_detection() {
+        let (server, smf, addr, mut rx) = spawn_test_server().await;
+        // Associate with RTS=100
+        let assoc = build_association_setup_request_payload(Some(100));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+        assert!(server.is_associated().await);
+
+        // Heartbeat with the same RTS → plain response, association kept
+        let mut hb = crate::n4_build::PfcpMessageBuilder::new();
+        hb.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, 100);
+        let resp = exchange(&smf, addr, &encode_pfcp(1, None, 2, &hb.build())).await;
+        assert_eq!(resp[1], pfcp_type::HEARTBEAT_RESPONSE);
+        assert!(crate::n4_build::parse_recovery_time_stamp(
+            ParsedPfcpHeader::parse(&resp).unwrap().1
+        )
+        .is_some());
+        assert!(server.is_associated().await);
+
+        // Heartbeat with a NEW RTS → peer restarted: association dropped and
+        // a PeerFailure event raised so the data plane clears sessions
+        let mut hb2 = crate::n4_build::PfcpMessageBuilder::new();
+        hb2.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, 200);
+        let _ = exchange(&smf, addr, &encode_pfcp(1, None, 3, &hb2.build())).await;
+        assert!(!server.is_associated().await, "stale association must drop");
+        let evt = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(evt, PfcpSessionEvent::PeerFailure { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_association_release_clears_state() {
+        let (server, smf, addr, mut rx) = spawn_test_server().await;
+        let assoc = build_association_setup_request_payload(Some(7));
+        let _ = exchange(&smf, addr, &encode_pfcp(5, None, 1, &assoc)).await;
+
+        let mut rel = crate::n4_build::PfcpMessageBuilder::new();
+        rel.add_node_id(&NodeId::Ipv4(Ipv4Addr::new(127, 0, 0, 9)));
+        let resp = exchange(&smf, addr, &encode_pfcp(9, None, 2, &rel.build())).await;
+        assert_eq!(resp[1], pfcp_type::ASSOCIATION_RELEASE_RESPONSE);
+        assert_eq!(response_cause(&resp), PfcpCause::RequestAccepted as u8);
+        assert!(!server.is_associated().await);
+        let evt = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(evt, PfcpSessionEvent::PeerFailure { .. }));
+    }
+
+    #[test]
+    fn test_parse_create_bar_roundtrip() {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u8(pfcp_ie::BAR_ID, 3);
+        b.add_u8(pfcp_ie::SUGGESTED_BUFFERING_PACKETS_COUNT, 16);
+        b.add_u8(pfcp_ie::DOWNLINK_DATA_NOTIFICATION_DELAY, 2);
+        let bar = parse_create_bar(&b.build()).unwrap();
+        assert_eq!(bar.bar_id, 3);
+        assert_eq!(bar.suggested_buffering_packets_count, Some(16));
+        assert_eq!(bar.ddn_delay, Some(2));
+
+        // BAR without BAR ID must be rejected (mandatory IE)
+        let mut b2 = crate::n4_build::PfcpMessageBuilder::new();
+        b2.add_u8(pfcp_ie::SUGGESTED_BUFFERING_PACKETS_COUNT, 16);
+        assert!(parse_create_bar(&b2.build()).is_err());
+    }
+
+    #[test]
+    fn test_parse_pfcpsmreq_flags() {
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u8(pfcp_ie::PFCPSMREQ_FLAGS, pfcpsmreq_flags::SNDEM);
+        assert_eq!(
+            parse_pfcpsmreq_flags(&b.build()),
+            Some(pfcpsmreq_flags::SNDEM)
+        );
+        assert_eq!(parse_pfcpsmreq_flags(&[]), None);
+    }
 
     #[test]
     fn test_pfcp_header_new() {

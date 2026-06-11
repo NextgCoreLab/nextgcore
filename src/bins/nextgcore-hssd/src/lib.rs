@@ -26,7 +26,10 @@ pub use event::{HssEvent, HssEventId, HssTimerId};
 pub use fd_path::{
     hss_fd_final, hss_fd_init, HssDiamStats, HssDiamStatsCx, HssDiamStatsS6a, HssDiamStatsSwx,
 };
-pub use s6a_path::{hss_s6a_final, hss_s6a_init, hss_s6a_send_clr, hss_s6a_send_idr};
+pub use s6a_path::{
+    hss_s6a_final, hss_s6a_init, hss_s6a_run_server, hss_s6a_send_clr, hss_s6a_send_idr,
+    hss_s6a_set_identity,
+};
 pub use sm::{hss_sm_debug, HssSmContext, HssState};
 pub use swx_path::{hss_swx_final, hss_swx_init};
 pub use timer::{hss_timer_get_name, timer_manager, HssTimerManager};
