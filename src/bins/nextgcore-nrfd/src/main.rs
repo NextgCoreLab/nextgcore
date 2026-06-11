@@ -118,6 +118,44 @@ struct Args {
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// Active NfInstanceNoHeartbeat timer id per NF instance.
+///
+/// get_expired_events() fires every timer left in the manager, so a heartbeat
+/// refresh must DELETE the superseded expiry timer — merely starting a new one
+/// leaves the old timer armed and the NF gets suspended on schedule regardless
+/// of heartbeats.
+static HEARTBEAT_TIMERS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Arm (or re-arm) the no-heartbeat expiry timer for an NF instance,
+/// cancelling any previously armed timer for the same instance.
+fn arm_heartbeat_timer(nf_instance_id: &str, expiry: Duration) {
+    let timer_mgr = timer_manager();
+    let new_id = timer_mgr.start_timer(
+        nextgcore_nrfd::NrfTimerId::NfInstanceNoHeartbeat,
+        expiry,
+        nf_instance_id.to_string(),
+    );
+    if let Ok(mut timers) = HEARTBEAT_TIMERS.lock() {
+        let old = match new_id {
+            Some(id) => timers.insert(nf_instance_id.to_string(), id),
+            None => timers.remove(nf_instance_id),
+        };
+        if let Some(old_id) = old {
+            timer_mgr.delete_timer(old_id);
+        }
+    }
+}
+
+/// Cancel the no-heartbeat expiry timer for an NF instance (deregistration).
+fn disarm_heartbeat_timer(nf_instance_id: &str) {
+    if let Ok(mut timers) = HEARTBEAT_TIMERS.lock() {
+        if let Some(old_id) = timers.remove(nf_instance_id) {
+            timer_manager().delete_timer(old_id);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -399,14 +437,9 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
 
             // Start heartbeat expiry timer if NF has heartBeatTimer
             if let Some(hb_timer) = heartbeat_timer {
-                let timer_mgr = timer_manager();
                 // Use 2x heartbeat interval as tolerance before declaring missed heartbeat
                 let expiry_secs = (hb_timer as u64) * 2;
-                timer_mgr.start_timer(
-                    nextgcore_nrfd::NrfTimerId::NfInstanceNoHeartbeat,
-                    Duration::from_secs(expiry_secs),
-                    nf_instance_id.to_string(),
-                );
+                arm_heartbeat_timer(nf_instance_id, Duration::from_secs(expiry_secs));
                 log::info!(
                     "Heartbeat timer started for NF {nf_instance_id} ({expiry_secs} seconds, 2x {hb_timer}s interval)"
                 );
@@ -477,6 +510,7 @@ async fn handle_nf_deregister(nf_instance_id: &str) -> SbiResponse {
     match manager.deregister(nf_instance_id) {
         Ok(_) => {
             log::info!("NF {nf_instance_id} deregistered successfully");
+            disarm_heartbeat_timer(nf_instance_id);
 
             // Send NF_DEREGISTERED notifications to matching subscribers
             if let Some(profile) = profile_for_notify {
@@ -525,15 +559,16 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
         Some(profile) => {
             // Refresh heartbeat timer on any PATCH (serves as heartbeat)
             if let Some(hb_timer) = profile.heartbeat_timer {
-                let timer_mgr = timer_manager();
-                // Start new heartbeat timer (old one will expire harmlessly)
                 let expiry_secs = (hb_timer as u64) * 2;
-                timer_mgr.start_timer(
-                    nextgcore_nrfd::NrfTimerId::NfInstanceNoHeartbeat,
-                    Duration::from_secs(expiry_secs),
-                    nf_instance_id.to_string(),
-                );
+                arm_heartbeat_timer(nf_instance_id, Duration::from_secs(expiry_secs));
                 log::debug!("Heartbeat timer refreshed for NF {nf_instance_id} ({expiry_secs}s)");
+            }
+
+            // A heartbeat on a SUSPENDED NF restores it to REGISTERED (TS 29.510)
+            if manager.reactivate(nf_instance_id) {
+                log::info!(
+                    "NF {nf_instance_id} heartbeat received while SUSPENDED, back to REGISTERED"
+                );
             }
 
             SbiResponse::with_status(200)
@@ -1004,6 +1039,7 @@ async fn run_event_loop_async(_nrf_sm: &mut NrfSmContext, shutdown: Arc<AtomicBo
 
                             let profile = manager.get(nf_instance_id);
                             manager.deregister(nf_instance_id).ok();
+                            disarm_heartbeat_timer(nf_instance_id);
 
                             // Send NF_DEREGISTERED notification
                             if let Some(profile) = profile {
@@ -1033,10 +1069,9 @@ async fn run_event_loop_async(_nrf_sm: &mut NrfSmContext, shutdown: Arc<AtomicBo
                             // Use same interval as heartbeat for the grace period
                             if let Some(profile) = manager.get(nf_instance_id) {
                                 let grace_secs = profile.heartbeat_timer.unwrap_or(10) as u64;
-                                let _ = timer_manager().add_timer(
-                                    nextgcore_nrfd::NrfTimerId::NfInstanceNoHeartbeat,
+                                arm_heartbeat_timer(
+                                    nf_instance_id,
                                     std::time::Duration::from_secs(grace_secs),
-                                    nf_instance_id.clone(),
                                 );
                                 log::info!(
                                     "NF instance {nf_instance_id} grace period: {grace_secs}s before deregistration"

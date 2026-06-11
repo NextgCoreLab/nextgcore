@@ -208,6 +208,22 @@ impl NfInstanceManager {
         false
     }
 
+    /// Reactivate a SUSPENDED NF (heartbeat received within grace period, TS 29.510)
+    ///
+    /// Returns true only if the NF was SUSPENDED and is now REGISTERED again.
+    pub fn reactivate(&self, id: &str) -> bool {
+        if let Ok(mut profiles) = self.profiles.write() {
+            if let Some(profile) = profiles.get_mut(id) {
+                if profile.nf_status == "SUSPENDED" {
+                    log::info!("[{id}] NF status: SUSPENDED -> REGISTERED (heartbeat received)");
+                    profile.nf_status = "REGISTERED".to_string();
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Check if an NF is suspended
     pub fn is_suspended(&self, id: &str) -> bool {
         if let Ok(profiles) = self.profiles.read() {
