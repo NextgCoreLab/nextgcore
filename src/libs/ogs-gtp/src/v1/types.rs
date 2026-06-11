@@ -56,104 +56,418 @@ impl TryFrom<u8> for PduType {
     }
 }
 
-/// GTPv1 Extension Header
+/// GTPv1-U Extension Header (TS 29.281 Section 5.2.1)
+///
+/// Wire format: Length (1 octet, in 4-octet units covering the whole header)
+/// followed by content (4*length - 2 octets) and a Next Extension Header Type
+/// octet. The type of the header itself is carried by the *preceding* header
+/// (the GTP header's Next Extension Header Type field or the previous
+/// extension header's trailing octet), so it is kept alongside the content.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExtensionHeader {
-    /// Sequence number
-    pub sequence_number: u16,
-    /// N-PDU number
-    pub n_pdu_number: u8,
-    /// Extension header type
-    pub header_type: u8,
-    /// Extension header length (in 4-byte units)
-    pub length: u8,
-    /// PDU type (4 bits)
-    pub pdu_type: u8,
-    /// Paging policy presence (1 bit)
-    pub paging_policy_presence: bool,
-    /// Reflective QoS indicator (1 bit)
-    pub reflective_qos_indicator: bool,
-    /// QoS Flow Identifier (6 bits)
-    pub qos_flow_identifier: u8,
-    /// Next extension header type
-    pub next_type: u8,
+pub struct Gtp1ExtHeader {
+    /// Extension header type (e.g. 0x85 PDU Session Container)
+    pub ext_type: u8,
+    /// Content octets (length + content + next-type is a multiple of 4)
+    pub content: Bytes,
 }
 
-impl Default for ExtensionHeader {
-    fn default() -> Self {
+impl Gtp1ExtHeader {
+    /// Create a new extension header, zero-padding the content so the total
+    /// size (length octet + content + next-type octet) is a 4-octet multiple
+    pub fn new(ext_type: u8, content: &[u8]) -> Self {
+        let mut padded = content.to_vec();
+        while !(padded.len() + 2).is_multiple_of(4) {
+            padded.push(0);
+        }
         Self {
-            sequence_number: 0,
-            n_pdu_number: 0,
-            header_type: ExtensionHeaderType::NoMoreExtensionHeaders as u8,
-            length: 0,
-            pdu_type: 0,
-            paging_policy_presence: false,
-            reflective_qos_indicator: false,
-            qos_flow_identifier: 0,
-            next_type: 0,
+            ext_type,
+            content: Bytes::from(padded),
         }
     }
-}
 
-impl ExtensionHeader {
-    /// Encode extension header to bytes
-    pub fn encode(&self, buf: &mut BytesMut) {
-        buf.put_u16(self.sequence_number);
-        buf.put_u8(self.n_pdu_number);
-        buf.put_u8(self.header_type);
-        buf.put_u8(self.length);
-
-        // PDU type (4 bits) | spare (4 bits)
-        buf.put_u8((self.pdu_type & 0x0F) << 4);
-
-        // Paging policy presence (1 bit) | Reflective QoS indicator (1 bit) | QFI (6 bits)
-        let byte = ((self.paging_policy_presence as u8) << 7)
-            | ((self.reflective_qos_indicator as u8) << 6)
-            | (self.qos_flow_identifier & 0x3F);
-        buf.put_u8(byte);
-
-        buf.put_u8(self.next_type);
+    /// Create a PDU Session Container extension header (type 0x85)
+    pub fn pdu_session_container(container: &PduSessionContainer) -> Self {
+        Self::new(
+            ExtensionHeaderType::PduSessionContainer as u8,
+            &container.encode_content(),
+        )
     }
 
-    /// Decode extension header from bytes
-    pub fn decode(buf: &mut Bytes) -> GtpResult<Self> {
-        if buf.remaining() < 8 {
+    /// Length field value (total header size in 4-octet units)
+    pub fn length_units(&self) -> u8 {
+        ((self.content.len() + 2) / 4) as u8
+    }
+
+    /// Encoded size in bytes
+    pub fn encoded_len(&self) -> usize {
+        self.content.len() + 2
+    }
+
+    /// Encode this extension header followed by the type of the next
+    /// extension header in the chain (0 = no more extension headers)
+    pub fn encode(&self, buf: &mut BytesMut, next_type: u8) {
+        buf.put_u8(self.length_units());
+        buf.put_slice(&self.content);
+        buf.put_u8(next_type);
+    }
+
+    /// Decode one extension header of the given type from the buffer.
+    /// Returns the header and the next extension header type in the chain.
+    pub fn decode(ext_type: u8, buf: &mut Bytes) -> GtpResult<(Self, u8)> {
+        if buf.remaining() < 1 {
             return Err(GtpError::BufferTooShort {
-                needed: 8,
+                needed: 1,
                 available: buf.remaining(),
             });
         }
-
-        let sequence_number = buf.get_u16();
-        let n_pdu_number = buf.get_u8();
-        let header_type = buf.get_u8();
-        let length = buf.get_u8();
-
-        let pdu_byte = buf.get_u8();
-        let pdu_type = (pdu_byte >> 4) & 0x0F;
-
-        let qfi_byte = buf.get_u8();
-        let paging_policy_presence = (qfi_byte >> 7) & 0x01 != 0;
-        let reflective_qos_indicator = (qfi_byte >> 6) & 0x01 != 0;
-        let qos_flow_identifier = qfi_byte & 0x3F;
-
+        let length_units = buf.get_u8() as usize;
+        if length_units == 0 {
+            return Err(GtpError::InvalidFormat(
+                "Extension header length must be at least 1".to_string(),
+            ));
+        }
+        let content_len = length_units * 4 - 2;
+        if buf.remaining() < content_len + 1 {
+            return Err(GtpError::BufferTooShort {
+                needed: content_len + 1,
+                available: buf.remaining(),
+            });
+        }
+        let content = buf.copy_to_bytes(content_len);
         let next_type = buf.get_u8();
+        Ok((Self { ext_type, content }, next_type))
+    }
 
-        Ok(Self {
-            sequence_number,
-            n_pdu_number,
-            header_type,
-            length,
-            pdu_type,
-            paging_policy_presence,
-            reflective_qos_indicator,
-            qos_flow_identifier,
-            next_type,
-        })
+    /// Parse the content as a PDU Session Container frame (TS 38.415)
+    pub fn as_pdu_session_container(&self) -> GtpResult<PduSessionContainer> {
+        if self.ext_type != ExtensionHeaderType::PduSessionContainer as u8 {
+            return Err(GtpError::InvalidFormat(format!(
+                "Not a PDU Session Container extension header: {:#x}",
+                self.ext_type
+            )));
+        }
+        PduSessionContainer::decode_content(&self.content)
     }
 }
 
-impl ExtensionHeader {
+/// DL PDU SESSION INFORMATION frame (TS 38.415 Section 5.5.2.1, PDU Type 0)
+///
+/// Conditional fields are derived from their presence flags: PPI presence
+/// drives PPP, the DL sending timestamp drives QMP, the DL QFI sequence
+/// number drives SNP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DlPduSessionInformation {
+    /// QoS Flow Identifier (6 bits)
+    pub qfi: u8,
+    /// Reflective QoS Indicator
+    pub rqi: bool,
+    /// Paging Policy Indicator (3 bits, presence sets the PPP flag)
+    pub ppi: Option<u8>,
+    /// DL Sending Time Stamp (presence sets the QMP flag)
+    pub dl_sending_timestamp: Option<u64>,
+    /// DL QFI Sequence Number (24 bits, presence sets the SNP flag)
+    pub dl_qfi_sequence_number: Option<u32>,
+}
+
+/// UL QoS monitoring timestamps (TS 38.415, present when QMP is set)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UlQosMonitoringTimestamps {
+    /// DL Sending Time Stamp Repeated
+    pub dl_sending_timestamp_repeated: u64,
+    /// DL Received Time Stamp
+    pub dl_received_timestamp: u64,
+    /// UL Sending Time Stamp
+    pub ul_sending_timestamp: u64,
+}
+
+/// UL PDU SESSION INFORMATION frame (TS 38.415 Section 5.5.2.2, PDU Type 1)
+///
+/// Conditional fields are derived from their presence flags: the QoS
+/// monitoring timestamps drive QMP, the delay results drive the DL/UL/N3-N9
+/// delay indicators, the UL QFI sequence number drives SNP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct UlPduSessionInformation {
+    /// QoS Flow Identifier (6 bits)
+    pub qfi: u8,
+    /// QoS monitoring timestamps (presence sets the QMP flag)
+    pub qos_monitoring: Option<UlQosMonitoringTimestamps>,
+    /// DL Delay Result (presence sets the DL Delay Ind flag)
+    pub dl_delay_result: Option<u32>,
+    /// UL Delay Result (presence sets the UL Delay Ind flag)
+    pub ul_delay_result: Option<u32>,
+    /// UL QFI Sequence Number (24 bits, presence sets the SNP flag)
+    pub ul_qfi_sequence_number: Option<u32>,
+    /// N3/N9 Delay Result (presence sets the N3/N9 Delay Ind flag)
+    pub n3_n9_delay_result: Option<u32>,
+}
+
+/// PDU Session Container frame carried in the 0x85 extension header
+/// (TS 38.415 PDU Session user plane protocol)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PduSessionContainer {
+    /// DL PDU SESSION INFORMATION (PDU Type 0)
+    Dl(DlPduSessionInformation),
+    /// UL PDU SESSION INFORMATION (PDU Type 1)
+    Ul(UlPduSessionInformation),
+}
+
+impl PduSessionContainer {
+    /// Create a minimal DL PDU SESSION INFORMATION frame with the given QFI
+    pub fn dl(qfi: u8) -> Self {
+        Self::Dl(DlPduSessionInformation {
+            qfi: qfi & 0x3F,
+            ..Default::default()
+        })
+    }
+
+    /// Create a minimal UL PDU SESSION INFORMATION frame with the given QFI
+    pub fn ul(qfi: u8) -> Self {
+        Self::Ul(UlPduSessionInformation {
+            qfi: qfi & 0x3F,
+            ..Default::default()
+        })
+    }
+
+    /// Get the PDU type of this frame
+    pub fn pdu_type(&self) -> PduType {
+        match self {
+            Self::Dl(_) => PduType::DlPduSessionInformation,
+            Self::Ul(_) => PduType::UlPduSessionInformation,
+        }
+    }
+
+    /// Get the QoS Flow Identifier
+    pub fn qfi(&self) -> u8 {
+        match self {
+            Self::Dl(dl) => dl.qfi,
+            Self::Ul(ul) => ul.qfi,
+        }
+    }
+
+    /// Encode the frame to extension header content octets (unpadded)
+    pub fn encode_content(&self) -> Vec<u8> {
+        let mut buf = BytesMut::new();
+        match self {
+            Self::Dl(dl) => {
+                // PDU Type (4 bits) | QMP | SNP | spare (2 bits)
+                let octet0 = ((PduType::DlPduSessionInformation as u8) << 4)
+                    | ((dl.dl_sending_timestamp.is_some() as u8) << 3)
+                    | ((dl.dl_qfi_sequence_number.is_some() as u8) << 2);
+                buf.put_u8(octet0);
+                // PPP | RQI | QFI (6 bits)
+                let octet1 = ((dl.ppi.is_some() as u8) << 7)
+                    | ((dl.rqi as u8) << 6)
+                    | (dl.qfi & 0x3F);
+                buf.put_u8(octet1);
+                // PPI (3 bits) | spare (5 bits), present if PPP
+                if let Some(ppi) = dl.ppi {
+                    buf.put_u8((ppi & 0x07) << 5);
+                }
+                // DL Sending Time Stamp, present if QMP
+                if let Some(ts) = dl.dl_sending_timestamp {
+                    buf.put_u64(ts);
+                }
+                // DL QFI Sequence Number (24 bits), present if SNP
+                if let Some(sn) = dl.dl_qfi_sequence_number {
+                    buf.put_slice(&sn.to_be_bytes()[1..4]);
+                }
+            }
+            Self::Ul(ul) => {
+                // PDU Type (4 bits) | QMP | DL Delay Ind | UL Delay Ind | SNP
+                let octet0 = ((PduType::UlPduSessionInformation as u8) << 4)
+                    | ((ul.qos_monitoring.is_some() as u8) << 3)
+                    | ((ul.dl_delay_result.is_some() as u8) << 2)
+                    | ((ul.ul_delay_result.is_some() as u8) << 1)
+                    | (ul.ul_qfi_sequence_number.is_some() as u8);
+                buf.put_u8(octet0);
+                // N3/N9 Delay Ind | New IE Flag | QFI (6 bits)
+                let octet1 = ((ul.n3_n9_delay_result.is_some() as u8) << 7) | (ul.qfi & 0x3F);
+                buf.put_u8(octet1);
+                // QoS monitoring timestamps, present if QMP
+                if let Some(qm) = ul.qos_monitoring {
+                    buf.put_u64(qm.dl_sending_timestamp_repeated);
+                    buf.put_u64(qm.dl_received_timestamp);
+                    buf.put_u64(qm.ul_sending_timestamp);
+                }
+                // DL Delay Result, present if DL Delay Ind
+                if let Some(delay) = ul.dl_delay_result {
+                    buf.put_u32(delay);
+                }
+                // UL Delay Result, present if UL Delay Ind
+                if let Some(delay) = ul.ul_delay_result {
+                    buf.put_u32(delay);
+                }
+                // UL QFI Sequence Number (24 bits), present if SNP
+                if let Some(sn) = ul.ul_qfi_sequence_number {
+                    buf.put_slice(&sn.to_be_bytes()[1..4]);
+                }
+                // N3/N9 Delay Result, present if N3/N9 Delay Ind
+                if let Some(delay) = ul.n3_n9_delay_result {
+                    buf.put_u32(delay);
+                }
+            }
+        }
+        buf.to_vec()
+    }
+
+    /// Decode a frame from extension header content octets.
+    /// Trailing padding octets beyond the decoded fields are ignored.
+    pub fn decode_content(content: &[u8]) -> GtpResult<Self> {
+        if content.len() < 2 {
+            return Err(GtpError::BufferTooShort {
+                needed: 2,
+                available: content.len(),
+            });
+        }
+
+        let mut buf = Bytes::copy_from_slice(content);
+        let octet0 = buf.get_u8();
+        let pdu_type = PduType::try_from((octet0 >> 4) & 0x0F)?;
+
+        match pdu_type {
+            PduType::DlPduSessionInformation => {
+                let qmp = (octet0 >> 3) & 0x01 != 0;
+                let snp = (octet0 >> 2) & 0x01 != 0;
+                let octet1 = buf.get_u8();
+                let ppp = (octet1 >> 7) & 0x01 != 0;
+                let rqi = (octet1 >> 6) & 0x01 != 0;
+                let qfi = octet1 & 0x3F;
+
+                let ppi = if ppp {
+                    if buf.remaining() < 1 {
+                        return Err(GtpError::BufferTooShort {
+                            needed: 1,
+                            available: buf.remaining(),
+                        });
+                    }
+                    Some((buf.get_u8() >> 5) & 0x07)
+                } else {
+                    None
+                };
+                let dl_sending_timestamp = if qmp {
+                    if buf.remaining() < 8 {
+                        return Err(GtpError::BufferTooShort {
+                            needed: 8,
+                            available: buf.remaining(),
+                        });
+                    }
+                    Some(buf.get_u64())
+                } else {
+                    None
+                };
+                let dl_qfi_sequence_number = if snp {
+                    if buf.remaining() < 3 {
+                        return Err(GtpError::BufferTooShort {
+                            needed: 3,
+                            available: buf.remaining(),
+                        });
+                    }
+                    Some(u32::from_be_bytes([
+                        0,
+                        buf.get_u8(),
+                        buf.get_u8(),
+                        buf.get_u8(),
+                    ]))
+                } else {
+                    None
+                };
+
+                Ok(Self::Dl(DlPduSessionInformation {
+                    qfi,
+                    rqi,
+                    ppi,
+                    dl_sending_timestamp,
+                    dl_qfi_sequence_number,
+                }))
+            }
+            PduType::UlPduSessionInformation => {
+                let qmp = (octet0 >> 3) & 0x01 != 0;
+                let dl_delay_ind = (octet0 >> 2) & 0x01 != 0;
+                let ul_delay_ind = (octet0 >> 1) & 0x01 != 0;
+                let snp = octet0 & 0x01 != 0;
+                let octet1 = buf.get_u8();
+                let n3_n9_delay_ind = (octet1 >> 7) & 0x01 != 0;
+                // New IE Flag (bit 7): any not-comprehended trailing fields
+                // are skipped, bounded by the extension header length
+                let qfi = octet1 & 0x3F;
+
+                let qos_monitoring = if qmp {
+                    if buf.remaining() < 24 {
+                        return Err(GtpError::BufferTooShort {
+                            needed: 24,
+                            available: buf.remaining(),
+                        });
+                    }
+                    Some(UlQosMonitoringTimestamps {
+                        dl_sending_timestamp_repeated: buf.get_u64(),
+                        dl_received_timestamp: buf.get_u64(),
+                        ul_sending_timestamp: buf.get_u64(),
+                    })
+                } else {
+                    None
+                };
+                let dl_delay_result = if dl_delay_ind {
+                    if buf.remaining() < 4 {
+                        return Err(GtpError::BufferTooShort {
+                            needed: 4,
+                            available: buf.remaining(),
+                        });
+                    }
+                    Some(buf.get_u32())
+                } else {
+                    None
+                };
+                let ul_delay_result = if ul_delay_ind {
+                    if buf.remaining() < 4 {
+                        return Err(GtpError::BufferTooShort {
+                            needed: 4,
+                            available: buf.remaining(),
+                        });
+                    }
+                    Some(buf.get_u32())
+                } else {
+                    None
+                };
+                let ul_qfi_sequence_number = if snp {
+                    if buf.remaining() < 3 {
+                        return Err(GtpError::BufferTooShort {
+                            needed: 3,
+                            available: buf.remaining(),
+                        });
+                    }
+                    Some(u32::from_be_bytes([
+                        0,
+                        buf.get_u8(),
+                        buf.get_u8(),
+                        buf.get_u8(),
+                    ]))
+                } else {
+                    None
+                };
+                let n3_n9_delay_result = if n3_n9_delay_ind {
+                    if buf.remaining() < 4 {
+                        return Err(GtpError::BufferTooShort {
+                            needed: 4,
+                            available: buf.remaining(),
+                        });
+                    }
+                    Some(buf.get_u32())
+                } else {
+                    None
+                };
+
+                Ok(Self::Ul(UlPduSessionInformation {
+                    qfi,
+                    qos_monitoring,
+                    dl_delay_result,
+                    ul_delay_result,
+                    ul_qfi_sequence_number,
+                    n3_n9_delay_result,
+                }))
+            }
+        }
+    }
+
     /// Map QFI to DSCP value per 3GPP TS 23.501 Table 5.7.4-1 (Rel-18).
     ///
     /// Maps QoS Flow Identifier to DiffServ Code Point for transport-level
@@ -748,5 +1062,116 @@ impl TeidII {
             nsapi: buf.get_u8() & 0x0F,
             teid: buf.get_u32(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dl_pdu_session_container_minimal_round_trip() {
+        let container = PduSessionContainer::dl(9);
+        let content = container.encode_content();
+        // PDU Type 0, no QMP/SNP; PPP=0, RQI=0, QFI=9
+        assert_eq!(content, vec![0x00, 0x09]);
+
+        let decoded = PduSessionContainer::decode_content(&content).unwrap();
+        assert_eq!(decoded, container);
+        assert_eq!(decoded.qfi(), 9);
+        assert_eq!(decoded.pdu_type(), PduType::DlPduSessionInformation);
+    }
+
+    #[test]
+    fn test_dl_pdu_session_container_all_fields_round_trip() {
+        let container = PduSessionContainer::Dl(DlPduSessionInformation {
+            qfi: 0x3F,
+            rqi: true,
+            ppi: Some(5),
+            dl_sending_timestamp: Some(0x0123_4567_89AB_CDEF),
+            dl_qfi_sequence_number: Some(0x00AB_CDEF),
+        });
+        let content = container.encode_content();
+        let decoded = PduSessionContainer::decode_content(&content).unwrap();
+        assert_eq!(decoded, container);
+    }
+
+    #[test]
+    fn test_ul_pdu_session_container_minimal_round_trip() {
+        let container = PduSessionContainer::ul(1);
+        let content = container.encode_content();
+        // PDU Type 1, all indicators clear; QFI=1
+        assert_eq!(content, vec![0x10, 0x01]);
+
+        let decoded = PduSessionContainer::decode_content(&content).unwrap();
+        assert_eq!(decoded, container);
+        assert_eq!(decoded.pdu_type(), PduType::UlPduSessionInformation);
+    }
+
+    #[test]
+    fn test_ul_pdu_session_container_all_fields_round_trip() {
+        let container = PduSessionContainer::Ul(UlPduSessionInformation {
+            qfi: 7,
+            qos_monitoring: Some(UlQosMonitoringTimestamps {
+                dl_sending_timestamp_repeated: 1,
+                dl_received_timestamp: 2,
+                ul_sending_timestamp: 3,
+            }),
+            dl_delay_result: Some(100),
+            ul_delay_result: Some(200),
+            ul_qfi_sequence_number: Some(0x12_3456),
+            n3_n9_delay_result: Some(300),
+        });
+        let content = container.encode_content();
+        let decoded = PduSessionContainer::decode_content(&content).unwrap();
+        assert_eq!(decoded, container);
+    }
+
+    #[test]
+    fn test_pdu_session_container_rejects_invalid_pdu_type() {
+        // PDU Type 5 is not defined by TS 38.415
+        assert!(PduSessionContainer::decode_content(&[0x50, 0x09]).is_err());
+    }
+
+    #[test]
+    fn test_pdu_session_container_rejects_truncated_conditional_field() {
+        // DL frame with QMP set but no timestamp present
+        assert!(PduSessionContainer::decode_content(&[0x08, 0x09]).is_err());
+    }
+
+    #[test]
+    fn test_ext_header_padding_and_length_units() {
+        // 2 content octets fit exactly one 4-octet unit
+        let ext = Gtp1ExtHeader::new(ExtensionHeaderType::PduSessionContainer as u8, &[0x00, 0x09]);
+        assert_eq!(ext.length_units(), 1);
+        assert_eq!(ext.encoded_len(), 4);
+
+        // 3 content octets are padded up to the next 4-octet boundary
+        let ext = Gtp1ExtHeader::new(
+            ExtensionHeaderType::PduSessionContainer as u8,
+            &[0x00, 0x89, 0xA0],
+        );
+        assert_eq!(ext.content.len(), 6);
+        assert_eq!(ext.length_units(), 2);
+        assert_eq!(ext.encoded_len(), 8);
+    }
+
+    #[test]
+    fn test_ext_header_decode_rejects_zero_length() {
+        let mut buf = Bytes::from_static(&[0x00, 0x00, 0x09, 0x00]);
+        assert!(
+            Gtp1ExtHeader::decode(ExtensionHeaderType::PduSessionContainer as u8, &mut buf)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_ext_header_decode_rejects_truncated() {
+        // Length says 2 units (8 octets total) but only 4 octets present
+        let mut buf = Bytes::from_static(&[0x02, 0x00, 0x09, 0x00]);
+        assert!(
+            Gtp1ExtHeader::decode(ExtensionHeaderType::PduSessionContainer as u8, &mut buf)
+                .is_err()
+        );
     }
 }

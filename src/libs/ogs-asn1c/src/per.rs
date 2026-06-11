@@ -166,8 +166,22 @@ impl AperEncoder {
             self.align();
             self.write_bits(offset, 16);
         } else {
-            // Indefinite length case - encode as unconstrained
-            self.encode_unconstrained_whole_number(value)?;
+            // Range > 64K: length-of-length form (X.691 Section 13.2.6).
+            // The offset is encoded in the minimum number of octets, preceded by
+            // that octet count as a constrained length (1..=b, where b is the
+            // octet width of the whole range).
+            let max_octets = constraint.bits_needed().div_ceil(8);
+            let num_octets = if offset == 0 {
+                1
+            } else {
+                (64 - offset.leading_zeros() as usize).div_ceil(8)
+            };
+            let len_constraint = Constraint::new(1, max_octets as i64);
+            self.encode_constrained_whole_number(num_octets as i64, &len_constraint)?;
+            self.align();
+            for i in (0..num_octets).rev() {
+                self.write_bits((offset >> (i * 8)) & 0xFF, 8);
+            }
         }
 
         Ok(())
@@ -197,12 +211,13 @@ impl AperEncoder {
             let mut v = value;
             let mut buf = Vec::new();
             loop {
-                buf.push((v & 0xFF) as u8);
+                let byte = (v & 0xFF) as u8;
+                buf.push(byte);
                 v >>= 8;
-                if v == -1 && (buf.last().expect("value expected") & 0x80 != 0) {
+                if v == -1 && (byte & 0x80 != 0) {
                     break;
                 }
-                if v == 0 && (buf.last().expect("value expected") & 0x80 == 0) {
+                if v == 0 && (byte & 0x80 == 0) {
                     break;
                 }
             }
@@ -217,7 +232,11 @@ impl AperEncoder {
     }
 
     /// Encode length determinant (X.691 Section 11.9)
-    /// Now supports fragmented encoding for lengths > 16383 (B16.2)
+    ///
+    /// A single length determinant can only express up to 16383. Larger values
+    /// require fragmentation, where 16K-multiple length blocks interleave with
+    /// the data they describe (Section 11.9.3) — use `encode_fragmented_octets`
+    /// or `encode_fragmented_bits` for those.
     pub fn encode_length_determinant(&mut self, length: usize) -> PerResult<()> {
         self.align();
         if length <= 127 {
@@ -227,27 +246,49 @@ impl AperEncoder {
             // Long form: 10xxxxxx xxxxxxxx
             self.write_bits(0x8000 | length as u64, 16);
         } else {
-            // Fragmented form: 11xxxxxx for lengths > 16383
-            // Each fragment can encode up to 16384 octets
-            let mut remaining = length;
-            while remaining > 0 {
-                let fragment_size = std::cmp::min(remaining, 16384);
-                let multiplier = fragment_size / 16384;
+            // Lengths > 16383 cannot be expressed by a standalone determinant
+            return Err(PerError::InvalidLength { length });
+        }
+        Ok(())
+    }
 
-                if remaining > 16384 {
-                    // More fragments follow: 11xxxxxx (where xxxxxx is multiplier)
-                    self.write_bits(0xC0 | multiplier as u64, 8);
-                } else {
-                    // Last fragment
-                    if fragment_size <= 127 {
-                        self.write_bits(fragment_size as u64, 8);
-                    } else {
-                        self.write_bits(0x8000 | fragment_size as u64, 16);
-                    }
-                }
+    /// Write octets preceded by their length, fragmenting per X.691 Section 11.9.3.
+    ///
+    /// Lengths > 16383 are split into 16K-multiple fragments, each fragment
+    /// header (11xxxxxx, multiplier 1..=4) immediately followed by its data,
+    /// terminated by a final short/long-form block (possibly of length zero).
+    pub fn encode_fragmented_octets(&mut self, data: &[u8]) -> PerResult<()> {
+        let mut rest = data;
+        while rest.len() > 16383 {
+            let multiplier = std::cmp::min(rest.len() / 16384, 4);
+            let chunk = multiplier * 16384;
+            self.align();
+            self.write_bits(0xC0 | multiplier as u64, 8);
+            self.write_bytes(&rest[..chunk]);
+            rest = &rest[chunk..];
+        }
+        self.encode_length_determinant(rest.len())?;
+        self.write_bytes(rest);
+        Ok(())
+    }
 
-                remaining = remaining.saturating_sub(fragment_size);
+    /// Write bits preceded by their length, fragmenting per X.691 Section 11.9.3.
+    /// Fragments are counted in bits (16K-multiple blocks of bits).
+    pub fn encode_fragmented_bits(&mut self, bits: &BitSlice<u8, Msb0>) -> PerResult<()> {
+        let mut rest = bits;
+        while rest.len() > 16383 {
+            let multiplier = std::cmp::min(rest.len() / 16384, 4);
+            let chunk = multiplier * 16384;
+            self.align();
+            self.write_bits(0xC0 | multiplier as u64, 8);
+            for bit in &rest[..chunk] {
+                self.write_bit(*bit);
             }
+            rest = &rest[chunk..];
+        }
+        self.encode_length_determinant(rest.len())?;
+        for bit in rest {
+            self.write_bit(*bit);
         }
         Ok(())
     }
@@ -271,7 +312,16 @@ impl AperEncoder {
             if in_root {
                 self.encode_constrained_whole_number(value, constraint)?;
             } else {
-                self.encode_normally_small_non_negative(value as u64)?;
+                // Extension additions are encoded as their index within the
+                // extension list, not their absolute value (X.691 Section 14.6)
+                if value <= constraint.max {
+                    return Err(PerError::ConstraintViolation {
+                        value,
+                        min: constraint.min,
+                        max: constraint.max,
+                    });
+                }
+                self.encode_normally_small_non_negative((value - constraint.max - 1) as u64)?;
             }
         } else {
             self.encode_constrained_whole_number(value, constraint)?;
@@ -285,8 +335,19 @@ impl AperEncoder {
             self.write_bit(false);
             self.write_bits(value, 6);
         } else {
+            // Semi-constrained whole number with lower bound 0 (Section 11.6.2):
+            // length determinant followed by the minimum unsigned octets
             self.write_bit(true);
-            self.encode_unconstrained_whole_number(value as i64)?;
+            let mut buf = Vec::new();
+            let mut v = value;
+            while v > 0 {
+                buf.push((v & 0xFF) as u8);
+                v >>= 8;
+            }
+            buf.reverse();
+            self.encode_length_determinant(buf.len())?;
+            self.align();
+            self.write_bytes(&buf);
         }
         Ok(())
     }
@@ -349,9 +410,8 @@ impl AperEncoder {
                 self.write_bytes(data);
             }
             _ => {
-                // Unconstrained
-                self.encode_length_determinant(len)?;
-                self.write_bytes(data);
+                // Unconstrained - fragments interleave with data when > 16383
+                self.encode_fragmented_octets(data)?;
             }
         }
         Ok(())
@@ -389,10 +449,8 @@ impl AperEncoder {
                 }
             }
             _ => {
-                self.encode_length_determinant(len)?;
-                for bit in bits {
-                    self.write_bit(*bit);
-                }
+                // Unconstrained - fragments interleave with data when > 16383
+                self.encode_fragmented_bits(bits)?;
             }
         }
         Ok(())
@@ -469,6 +527,17 @@ impl<'a> AperDecoder<'a> {
 
     /// Read raw bytes
     pub fn read_bytes(&mut self, num_bytes: usize) -> PerResult<Vec<u8>> {
+        // Validate availability before allocating so malformed lengths cannot
+        // trigger huge allocations or arithmetic overflow
+        let needed = num_bytes.checked_mul(8).ok_or(PerError::InvalidLength {
+            length: num_bytes,
+        })?;
+        if needed > self.remaining_bits() {
+            return Err(PerError::BufferUnderflow {
+                needed,
+                available: self.remaining_bits(),
+            });
+        }
         let mut bytes = Vec::with_capacity(num_bytes);
         for _ in 0..num_bytes {
             bytes.push(self.read_bits(8)? as u8);
@@ -494,8 +563,25 @@ impl<'a> AperDecoder<'a> {
             self.align();
             self.read_bits(16)?
         } else {
-            return self.decode_unconstrained_whole_number();
+            // Range > 64K: length-of-length form (X.691 Section 13.2.6)
+            let max_octets = constraint.bits_needed().div_ceil(8);
+            let len_constraint = Constraint::new(1, max_octets as i64);
+            let num_octets = self.decode_constrained_whole_number(&len_constraint)? as usize;
+            self.align();
+            let mut value: u64 = 0;
+            for _ in 0..num_octets {
+                value = (value << 8) | self.read_bits(8)?;
+            }
+            value
         };
+
+        // Reject offsets outside the constraint so malformed input cannot
+        // produce out-of-range (or overflowing) values
+        if range != 0 && offset >= range {
+            return Err(PerError::DecodeError(format!(
+                "Decoded offset {offset} outside constraint range {range}"
+            )));
+        }
 
         Ok(constraint.min + offset as i64)
     }
@@ -503,12 +589,15 @@ impl<'a> AperDecoder<'a> {
     /// Decode unconstrained whole number (X.691 Section 12.2.6)
     pub fn decode_unconstrained_whole_number(&mut self) -> PerResult<i64> {
         let len = self.decode_length_determinant()?;
+        // A conformant encoder emits 1..=8 octets for an i64; anything else is
+        // malformed and would silently truncate
+        if len == 0 || len > 8 {
+            return Err(PerError::DecodeError(format!(
+                "Invalid unconstrained integer length: {len}"
+            )));
+        }
         self.align();
         let bytes = self.read_bytes(len)?;
-
-        if bytes.is_empty() {
-            return Ok(0);
-        }
 
         // Check sign bit
         let negative = bytes[0] & 0x80 != 0;
@@ -522,47 +611,48 @@ impl<'a> AperDecoder<'a> {
     }
 
     /// Decode length determinant (X.691 Section 11.9)
-    /// Now supports fragmented decoding for lengths > 16383 (B16.2)
+    ///
+    /// Fragment headers (11xxxxxx) are rejected here because fragmented lengths
+    /// interleave with the data they describe (Section 11.9.3) — callers that
+    /// support fragmentation must drive `decode_length_fragment` directly.
     pub fn decode_length_determinant(&mut self) -> PerResult<usize> {
+        let (length, fragmented) = self.decode_length_fragment()?;
+        if fragmented {
+            return Err(PerError::DecodeError(
+                "Fragmented length determinant not permitted in this context".to_string(),
+            ));
+        }
+        Ok(length)
+    }
+
+    /// Decode one length block (X.691 Section 11.9.3)
+    ///
+    /// Returns `(length, fragmented)`. When `fragmented` is true, `length`
+    /// items of data follow immediately, after which the caller must decode
+    /// the next length block; a non-fragmented block terminates the sequence.
+    pub fn decode_length_fragment(&mut self) -> PerResult<(usize, bool)> {
         self.align();
         let first_byte = self.read_bits(8)? as u8;
 
         if first_byte & 0x80 == 0 {
-            // Short form
-            Ok(first_byte as usize)
+            // Short form: 0xxxxxxx
+            Ok((first_byte as usize, false))
         } else if first_byte & 0x40 == 0 {
-            // Long form
+            // Long form: 10xxxxxx xxxxxxxx
             let second_byte = self.read_bits(8)? as u8;
-            Ok((((first_byte & 0x3F) as usize) << 8) | (second_byte as usize))
+            Ok((
+                (((first_byte & 0x3F) as usize) << 8) | (second_byte as usize),
+                false,
+            ))
         } else {
-            // Fragmented form: 11xxxxxx
-            let mut total_length = 0;
-            let mut current_byte = first_byte;
-
-            loop {
-                if current_byte & 0xC0 == 0xC0 {
-                    // Fragment header: 11xxxxxx
-                    let multiplier = (current_byte & 0x3F) as usize;
-                    total_length += multiplier * 16384;
-
-                    // Read next byte to check if more fragments follow
-                    current_byte = self.read_bits(8)? as u8;
-                } else {
-                    // Last fragment - decode as normal length
-                    if current_byte & 0x80 == 0 {
-                        // Short form
-                        total_length += current_byte as usize;
-                    } else if current_byte & 0x40 == 0 {
-                        // Long form
-                        let second_byte = self.read_bits(8)? as u8;
-                        total_length +=
-                            (((current_byte & 0x3F) as usize) << 8) | (second_byte as usize);
-                    }
-                    break;
-                }
+            // Fragment header: 11xxxxxx, multiplier of 16K in 1..=4
+            let multiplier = (first_byte & 0x3F) as usize;
+            if !(1..=4).contains(&multiplier) {
+                return Err(PerError::InvalidLength {
+                    length: multiplier * 16384,
+                });
             }
-
-            Ok(total_length)
+            Ok((multiplier * 16384, true))
         }
     }
 
@@ -580,8 +670,17 @@ impl<'a> AperDecoder<'a> {
             if !extended {
                 self.decode_constrained_whole_number(constraint)
             } else {
-                let value = self.decode_normally_small_non_negative()?;
-                Ok(value as i64)
+                // Extension additions carry their index within the extension
+                // list, offset from the end of the root (X.691 Section 14.6)
+                let index = self.decode_normally_small_non_negative()?;
+                i64::try_from(index)
+                    .ok()
+                    .and_then(|i| constraint.max.checked_add(1)?.checked_add(i))
+                    .ok_or_else(|| {
+                        PerError::DecodeError(format!(
+                            "Enumerated extension index {index} too large"
+                        ))
+                    })
             }
         } else {
             self.decode_constrained_whole_number(constraint)
@@ -594,7 +693,19 @@ impl<'a> AperDecoder<'a> {
         if !large {
             self.read_bits(6)
         } else {
-            self.decode_unconstrained_whole_number().map(|v| v as u64)
+            // Semi-constrained whole number with lower bound 0 (Section 11.6.2)
+            let len = self.decode_length_determinant()?;
+            if len == 0 || len > 8 {
+                return Err(PerError::DecodeError(format!(
+                    "Invalid normally-small number length: {len}"
+                )));
+            }
+            self.align();
+            let mut value: u64 = 0;
+            for _ in 0..len {
+                value = (value << 8) | self.read_bits(8)?;
+            }
+            Ok(value)
         }
     }
 
@@ -612,7 +723,14 @@ impl<'a> AperDecoder<'a> {
                     .map(|v| v as usize)
             } else {
                 let ext_index = self.decode_normally_small_non_negative()?;
-                Ok(num_alternatives + ext_index as usize)
+                usize::try_from(ext_index)
+                    .ok()
+                    .and_then(|i| num_alternatives.checked_add(i))
+                    .ok_or_else(|| {
+                        PerError::DecodeError(format!(
+                            "Choice extension index {ext_index} too large"
+                        ))
+                    })
             }
         } else {
             let constraint = Constraint::new(0, (num_alternatives - 1) as i64);
@@ -641,7 +759,17 @@ impl<'a> AperDecoder<'a> {
                 }
                 len
             }
-            _ => self.decode_length_determinant()?,
+            _ => {
+                // Unconstrained - data may be fragmented (X.691 Section 11.9.3)
+                let mut data = Vec::new();
+                loop {
+                    let (len, fragmented) = self.decode_length_fragment()?;
+                    data.extend_from_slice(&self.read_bytes(len)?);
+                    if !fragmented {
+                        return Ok(data);
+                    }
+                }
+            }
         };
 
         self.read_bytes(len)
@@ -667,9 +795,33 @@ impl<'a> AperDecoder<'a> {
                 }
                 len
             }
-            _ => self.decode_length_determinant()?,
+            _ => {
+                // Unconstrained - data may be fragmented (X.691 Section 11.9.3)
+                let mut bits = BitVec::new();
+                loop {
+                    let (len, fragmented) = self.decode_length_fragment()?;
+                    if len > self.remaining_bits() {
+                        return Err(PerError::BufferUnderflow {
+                            needed: len,
+                            available: self.remaining_bits(),
+                        });
+                    }
+                    for _ in 0..len {
+                        bits.push(self.read_bit()?);
+                    }
+                    if !fragmented {
+                        return Ok(bits);
+                    }
+                }
+            }
         };
 
+        if len > self.remaining_bits() {
+            return Err(PerError::BufferUnderflow {
+                needed: len,
+                available: self.remaining_bits(),
+            });
+        }
         let mut bits = BitVec::with_capacity(len);
         for _ in 0..len {
             bits.push(self.read_bit()?);
@@ -749,5 +901,119 @@ mod tests {
         let decoded = decoder.decode_octet_string(None, None).unwrap();
 
         assert_eq!(data, decoded);
+    }
+
+    #[test]
+    fn test_constrained_over_64k_byte_layout() {
+        // AMF-UE-NGAP-ID constraint: INTEGER (0..2^40-1), X.691 Section 13.2.6
+        let constraint = Constraint::new(0, 1099511627775);
+
+        // Small value: 1 octet, length-of-length offset 0 (3 bits) + align
+        let mut encoder = AperEncoder::new();
+        encoder
+            .encode_constrained_whole_number(1, &constraint)
+            .unwrap();
+        assert_eq!(encoder.into_bytes().as_ref(), &[0x00, 0x01]);
+
+        // 40-bit value with top bit set: 5 octets, offset 4 (0b100) + align
+        let mut encoder = AperEncoder::new();
+        encoder
+            .encode_constrained_whole_number(0x80_0000_0000, &constraint)
+            .unwrap();
+        assert_eq!(
+            encoder.into_bytes().as_ref(),
+            &[0x80, 0x80, 0x00, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn test_constrained_over_64k_roundtrip() {
+        let constraint = Constraint::new(0, 1099511627775);
+        for value in [0, 1, 255, 65536, 0x80_0000_0000, 1099511627775] {
+            let mut encoder = AperEncoder::new();
+            encoder
+                .encode_constrained_whole_number(value, &constraint)
+                .unwrap();
+            encoder.align();
+
+            let bytes = encoder.into_bytes();
+            let mut decoder = AperDecoder::new(&bytes);
+            let decoded = decoder
+                .decode_constrained_whole_number(&constraint)
+                .unwrap();
+
+            assert_eq!(value, decoded);
+        }
+    }
+
+    #[test]
+    fn test_length_determinant_over_16383_rejected() {
+        let mut encoder = AperEncoder::new();
+        let result = encoder.encode_length_determinant(16384);
+        assert_eq!(result, Err(PerError::InvalidLength { length: 16384 }));
+    }
+
+    #[test]
+    fn test_fragmented_octet_string_roundtrip() {
+        // Spans: long-form boundary, single 16K fragment with zero terminator,
+        // fragment + remainder, and a 4x16K fragment + remainder
+        for len in [16383usize, 16384, 20000, 70000] {
+            let data: Vec<u8> = (0..len).map(|i| i as u8).collect();
+
+            let mut encoder = AperEncoder::new();
+            encoder.encode_octet_string(&data, None, None).unwrap();
+
+            let bytes = encoder.into_bytes();
+            let mut decoder = AperDecoder::new(&bytes);
+            let decoded = decoder.decode_octet_string(None, None).unwrap();
+
+            assert_eq!(data, decoded);
+        }
+    }
+
+    #[test]
+    fn test_fragmented_octet_string_wire_layout() {
+        // 20000 octets: fragment header 0xC1 + 16384 octets of data,
+        // then long-form length 3616 (0x8E 0x20) + the remaining octets
+        let data = vec![0xAB; 20000];
+        let mut encoder = AperEncoder::new();
+        encoder.encode_octet_string(&data, None, None).unwrap();
+        let bytes = encoder.into_bytes();
+
+        assert_eq!(bytes.len(), 1 + 16384 + 2 + 3616);
+        assert_eq!(bytes[0], 0xC1);
+        assert_eq!(bytes[1], 0xAB);
+        assert_eq!(bytes[1 + 16384], 0x8E);
+        assert_eq!(bytes[1 + 16384 + 1], 0x20);
+        assert_eq!(bytes[1 + 16384 + 2], 0xAB);
+
+        // Exact 16K multiple terminates with a zero-length block
+        let data = vec![0xCD; 16384];
+        let mut encoder = AperEncoder::new();
+        encoder.encode_octet_string(&data, None, None).unwrap();
+        let bytes = encoder.into_bytes();
+        assert_eq!(bytes.len(), 1 + 16384 + 1);
+        assert_eq!(bytes[0], 0xC1);
+        assert_eq!(bytes[bytes.len() - 1], 0x00);
+    }
+
+    #[test]
+    fn test_malformed_decode_returns_err() {
+        // Length fragment header with invalid multiplier 0
+        let mut decoder = AperDecoder::new(&[0xC0]);
+        assert!(decoder.decode_length_determinant().is_err());
+
+        // Valid fragment header where a standalone determinant is required
+        let mut decoder = AperDecoder::new(&[0xC1]);
+        assert!(decoder.decode_length_determinant().is_err());
+
+        // Unconstrained integer claiming more octets than an i64 can hold
+        let mut decoder = AperDecoder::new(&[0x09, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+        assert!(decoder.decode_unconstrained_whole_number().is_err());
+
+        // Constrained offset outside the declared range
+        let constraint = Constraint::new(0, 300);
+        let mut decoder = AperDecoder::new(&[0xFF, 0xFF]);
+        assert!(decoder.decode_constrained_whole_number(&constraint).is_err());
     }
 }

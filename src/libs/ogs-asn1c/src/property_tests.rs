@@ -116,6 +116,23 @@ mod tests {
             }
 
             // Feature: nextgcore-rust-conversion, Property 9: ASN.1 Encoding Round-Trip
+            // X.691 Section 13.2.6: 40-bit values with the top bit set must survive
+            // the length-of-length constrained-integer form
+            #[test]
+            fn prop_ngap_amf_ue_ngap_id_top_bit_roundtrip(
+                value in (1u64 << 39)..=1099511627775u64,
+            ) {
+                let id = AmfUeNgapId(value);
+                let mut encoder = AperEncoder::new();
+                id.encode_aper(&mut encoder).unwrap();
+                encoder.align();
+                let bytes = encoder.into_bytes();
+                let mut decoder = AperDecoder::new(&bytes);
+                let decoded = AmfUeNgapId::decode_aper(&mut decoder).unwrap();
+                prop_assert_eq!(id, decoded);
+            }
+
+            // Feature: nextgcore-rust-conversion, Property 9: ASN.1 Encoding Round-Trip
             #[test]
             fn prop_ngap_ran_ue_ngap_id_roundtrip(value in any::<u32>()) {
                 let id = RanUeNgapId(value);
@@ -213,7 +230,7 @@ mod tests {
             // Feature: nextgcore-rust-conversion, Property 9: ASN.1 Encoding Round-Trip
             #[test]
             fn prop_ngap_cause_misc_roundtrip(value in 0u8..6) {
-                let cause_m: CauseMisc = unsafe { std::mem::transmute(value) };
+                let cause_m = CauseMisc::try_from(value as i64).unwrap();
                 let cause = Cause::Misc(cause_m);
                 let mut encoder = AperEncoder::new();
                 cause.encode_aper(&mut encoder).unwrap();
@@ -473,7 +490,7 @@ mod tests {
             // Feature: nextgcore-rust-conversion, Property 9: ASN.1 Encoding Round-Trip
             #[test]
             fn prop_s1ap_cause_misc_roundtrip(value in 0u8..6) {
-                let cause_m: CauseMisc = unsafe { std::mem::transmute(value) };
+                let cause_m = CauseMisc::try_from(value as i64).unwrap();
                 let cause = Cause::Misc(cause_m);
                 let mut encoder = AperEncoder::new();
                 cause.encode_aper(&mut encoder).unwrap();
@@ -577,13 +594,7 @@ mod tests {
             }
 
             // Feature: nextgcore-rust-conversion, Property 10: ASN.1 Error Handling Equivalence
-            //
-            // KNOWN ISSUE: s1ap_cause::Cause::decode_aper can panic on certain random
-            // inputs instead of returning Err. The decoder needs hardening to convert
-            // these panics into proper Err returns. Ignored until the decoder is fixed.
-            // Tracked as a Phase-8 follow-up — see TASKS.md.
             #[test]
-            #[ignore = "decode_aper panics on malformed input — needs hardening (Phase 8)"]
             fn prop_s1ap_random_data_does_not_panic(data in prop::collection::vec(any::<u8>(), 0..64)) {
                 use crate::s1ap::types as s1ap_types;
                 use crate::s1ap::cause as s1ap_cause;

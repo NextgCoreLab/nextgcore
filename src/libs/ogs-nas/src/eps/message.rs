@@ -78,6 +78,23 @@ impl AttachRequest {
         self.ue_network_capability.encode(buf);
         // ESM message container
         self.esm_message_container.encode(buf);
+        // Optional IEs (TS 24.301 Table 8.2.4.1)
+        if let Some(ref sig) = self.old_p_tmsi_signature {
+            buf.put_u8(0x19); // IEI (TV, 3-octet value)
+            buf.put_slice(sig);
+        }
+        if let Some(ref guti) = self.additional_guti {
+            buf.put_u8(0x50); // IEI (TLV)
+            guti.encode(buf);
+        }
+        if let Some(ref tai) = self.last_visited_tai {
+            buf.put_u8(0x52); // IEI (TV, 5-octet value)
+            tai.encode(buf);
+        }
+        if let Some(ref drx) = self.drx_parameter {
+            buf.put_u8(0x5C); // IEI (TV, 2-octet value)
+            buf.put_slice(drx);
+        }
     }
 
     /// Decode from bytes
@@ -96,14 +113,57 @@ impl AttachRequest {
         let ue_network_capability = UeNetworkCapability::decode(buf)?;
         let esm_message_container = EsmMessageContainer::decode(buf)?;
 
-        Ok(Self {
+        let mut msg = Self {
             eps_attach_type,
             nas_key_set_identifier,
             eps_mobile_identity,
             ue_network_capability,
             esm_message_container,
             ..Default::default()
-        })
+        };
+
+        // Decode optional IEs (TS 24.301 Table 8.2.4.1)
+        while buf.remaining() > 0 {
+            let iei = buf.chunk()[0];
+            match iei {
+                0x19 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 3 {
+                        let mut sig = [0u8; 3];
+                        buf.copy_to_slice(&mut sig);
+                        msg.old_p_tmsi_signature = Some(sig);
+                    }
+                }
+                0x50 => {
+                    buf.advance(1);
+                    msg.additional_guti = Some(EpsMobileIdentity::decode(buf)?);
+                }
+                0x52 => {
+                    buf.advance(1);
+                    msg.last_visited_tai = Some(EpsTai::decode(buf)?);
+                }
+                0x5C => {
+                    buf.advance(1);
+                    if buf.remaining() >= 2 {
+                        let mut drx = [0u8; 2];
+                        buf.copy_to_slice(&mut drx);
+                        msg.drx_parameter = Some(drx);
+                    }
+                }
+                _ => {
+                    // Skip unknown TLV IE
+                    buf.advance(1);
+                    if buf.remaining() > 0 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len {
+                            buf.advance(len);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(msg)
     }
 }
 
@@ -143,10 +203,38 @@ impl AttachAccept {
         buf.put_u8(self.t3412_value.encode());
         self.tai_list.encode(buf);
         self.esm_message_container.encode(buf);
-        // Optional IEs
+        // Optional IEs (TS 24.301 Table 8.2.1.1)
         if let Some(ref guti) = self.guti {
-            buf.put_u8(0x50); // IEI
+            buf.put_u8(0x50); // IEI (TLV)
             guti.encode(buf);
+        }
+        if let Some(ref lai) = self.lai {
+            buf.put_u8(0x13); // IEI (TV, 5-octet value)
+            buf.put_slice(lai);
+        }
+        if let Some(ref ms_id) = self.ms_identity {
+            buf.put_u8(0x23); // IEI (TLV)
+            buf.put_u8(ms_id.len() as u8);
+            buf.put_slice(ms_id);
+        }
+        if let Some(cause) = self.emm_cause {
+            buf.put_u8(0x53); // IEI (TV, 1-octet value)
+            buf.put_u8(cause);
+        }
+        if let Some(t3402) = self.t3402_value {
+            buf.put_u8(0x17); // IEI (TV, 1-octet value)
+            buf.put_u8(t3402.encode());
+        }
+        if let Some(t3423) = self.t3423_value {
+            buf.put_u8(0x59); // IEI (TV, 1-octet value)
+            buf.put_u8(t3423.encode());
+        }
+        if let Some(ref plmns) = self.equivalent_plmns {
+            buf.put_u8(0x4A); // IEI (TLV, 3 octets per PLMN)
+            buf.put_u8((plmns.len() * 3) as u8);
+            for plmn in plmns {
+                plmn.encode(buf);
+            }
         }
     }
 
@@ -172,7 +260,7 @@ impl AttachAccept {
             ..Default::default()
         };
 
-        // Decode optional IEs
+        // Decode optional IEs (TS 24.301 Table 8.2.1.1)
         while buf.remaining() > 0 {
             let iei = buf.chunk()[0];
             match iei {
@@ -180,9 +268,51 @@ impl AttachAccept {
                     buf.advance(1);
                     msg.guti = Some(EpsMobileIdentity::decode(buf)?);
                 }
+                0x13 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 5 {
+                        msg.lai = Some(buf.copy_to_bytes(5).to_vec());
+                    }
+                }
+                0x23 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 1 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len {
+                            msg.ms_identity = Some(buf.copy_to_bytes(len).to_vec());
+                        }
+                    }
+                }
                 0x53 => {
                     buf.advance(1);
-                    msg.emm_cause = Some(buf.get_u8());
+                    if buf.remaining() >= 1 {
+                        msg.emm_cause = Some(buf.get_u8());
+                    }
+                }
+                0x17 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 1 {
+                        msg.t3402_value = Some(GprsTimer::decode(buf.get_u8()));
+                    }
+                }
+                0x59 => {
+                    buf.advance(1);
+                    if buf.remaining() >= 1 {
+                        msg.t3423_value = Some(GprsTimer::decode(buf.get_u8()));
+                    }
+                }
+                0x4A => {
+                    buf.advance(1);
+                    if buf.remaining() >= 1 {
+                        let len = buf.get_u8() as usize;
+                        if buf.remaining() >= len {
+                            let mut plmns = Vec::with_capacity(len / 3);
+                            for _ in 0..(len / 3) {
+                                plmns.push(PlmnId::decode(buf)?);
+                            }
+                            msg.equivalent_plmns = Some(plmns);
+                        }
+                    }
                 }
                 _ => {
                     buf.advance(1);
@@ -550,11 +680,17 @@ impl TrackingAreaUpdateReject {
 
 impl EpsAuthenticationRequest {
     /// Encode to bytes
+    ///
+    /// Per TS 24.301 Table 8.2.7.1, RAND is a mandatory V-format IE (16 octets,
+    /// no IEI) and AUTN is a mandatory LV-format IE (length octet + 16 octets,
+    /// no IEI). The IEIs 0x21 (RAND) / 0x20 (AUTN) exist only for the optional
+    /// IEs of the 5GMM Authentication Request (TS 24.501 Table 8.2.1.1.1).
     pub fn encode(&self, buf: &mut BytesMut) {
+        // NAS key set identifier (bits 1-4) + spare half octet (bits 5-8)
         buf.put_u8(self.nas_key_set_identifier.encode());
-        // Spare half octet
+        // Authentication parameter RAND (V, 16 octets)
         buf.put_slice(&self.rand);
-        // AUTN with length
+        // Authentication parameter AUTN (LV, length + 16 octets)
         buf.put_u8(16);
         buf.put_slice(&self.autn);
     }
@@ -570,7 +706,14 @@ impl EpsAuthenticationRequest {
         let nas_key_set_identifier = KeySetIdentifier::decode(buf.get_u8() & 0x0F);
         let mut rand = [0u8; 16];
         buf.copy_to_slice(&mut rand);
-        let _autn_len = buf.get_u8();
+        // AUTN is LV with a fixed 16-octet value (TS 24.301 Section 9.9.3.2)
+        let autn_len = buf.get_u8() as usize;
+        if autn_len != 16 {
+            return Err(NasError::InvalidIeLength {
+                expected: 16,
+                actual: autn_len,
+            });
+        }
         let mut autn = [0u8; 16];
         buf.copy_to_slice(&mut autn);
         Ok(Self {

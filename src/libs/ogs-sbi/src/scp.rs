@@ -150,17 +150,30 @@ impl ScpRouter {
             .get_binding(target_nf_type)
             .ok_or_else(|| SbiError::Internal("No SCP binding found".to_string()))?;
 
-        // Add 3gpp-Sbi-Target-apiRoot header
-        let target_api_root = format!("http://{}", request.header.uri.trim_start_matches('/'));
-        request
-            .http
-            .headers
-            .insert("3gpp-Sbi-Target-apiRoot".to_string(), target_api_root);
-
-        // Update request URI to point to SCP
+        // Redirect the request to the SCP. When the original URI is absolute
+        // its apiRoot identifies the target producer: advertise it via
+        // 3gpp-Sbi-Target-apiRoot and send only the API path to the SCP
+        // (TS 29.500 §6.10.2). A relative URI carries no target apiRoot;
+        // the SCP then routes on the 3gpp-Sbi-Discovery-* headers instead.
         let scp_uri = binding.uri();
-        let new_uri = format!("{}{}", scp_uri, request.header.uri);
-        request.header.uri = new_uri;
+        let components = crate::message::UriComponents::parse(&request.header.uri);
+        match components.api_root.filter(|r| r.starts_with("http")) {
+            Some(api_root) => {
+                request.http.set_target_apiroot(api_root);
+                let mut segments: Vec<String> = Vec::new();
+                segments.extend(components.api_name);
+                segments.extend(components.api_version);
+                segments.extend(components.resource);
+                let mut path = format!("/{}", segments.join("/"));
+                if let Some(query) = components.query {
+                    path.push_str(&format!("?{query}"));
+                }
+                request.header.uri = format!("{scp_uri}{path}");
+            }
+            None => {
+                request.header.uri = format!("{}{}", scp_uri, request.header.uri);
+            }
+        }
 
         let routing_info = ScpRoutingInfo {
             target_nf_type,
@@ -174,8 +187,9 @@ impl ScpRouter {
 
     /// Extract target from response (for delegated routing)
     pub fn extract_scp_from_response(&self, response: &SbiResponse) -> Option<ScpBinding> {
-        // Check for 3gpp-Sbi-Routing-Binding header
-        if let Some(binding_header) = response.http.headers.get("3gpp-Sbi-Routing-Binding") {
+        // Check for 3gpp-Sbi-Routing-Binding header. The lookup is
+        // case-insensitive: hyper lowercases all HTTP/2 header names.
+        if let Some(binding_header) = response.http.routing_binding() {
             // Parse binding header (simplified)
             // Format: scp=<scp-fqdn>;<instance-id>=<id>
             return self.parse_routing_binding(binding_header);

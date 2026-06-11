@@ -298,6 +298,8 @@ impl SbiClient {
         // W1.23: Automatically attach Bearer token if OAuth2 is configured
         // and the request does not already carry an Authorization header
         if let (Some(oauth2), Some(target_nf_type)) = (&self.oauth2, &self.target_nf_type) {
+            // get_header() is case-insensitive: an "authorization" header
+            // copied from a hyper (lowercased HTTP/2) message also counts.
             if request.http.get_header("Authorization").is_none() {
                 // Derive scope from the request URI service name
                 let scope = derive_scope_from_uri(&request.header.uri);
@@ -370,12 +372,29 @@ impl SbiClient {
             other => return Err(SbiError::InvalidMethod(other.to_string())),
         };
 
-        // Build the request body
-        let body = request
-            .http
-            .content
-            .map(|c| Full::new(Bytes::from(c)))
-            .unwrap_or_else(|| Full::new(Bytes::new()));
+        // Build the request body. Binary N1/N2 parts are encoded as
+        // multipart/related with the JSON content as the root part
+        // (TS 29.500 §6.1.2.3).
+        let body_bytes: Bytes = if !request.http.parts.is_empty() {
+            let boundary = crate::multipart::generate_boundary();
+            request.http.set_header(
+                crate::constants::header::CONTENT_TYPE,
+                crate::multipart::content_type_with_boundary(&boundary),
+            );
+            Bytes::from(crate::multipart::encode(
+                request.http.content.as_deref(),
+                &request.http.parts,
+                &boundary,
+            ))
+        } else {
+            request
+                .http
+                .content
+                .as_deref()
+                .map(|c| Bytes::from(c.to_owned()))
+                .unwrap_or_default()
+        };
+        let body = Full::new(body_bytes);
 
         // Build the HTTP request
         let mut req_builder = Request::builder().method(method).uri(uri);
@@ -425,15 +444,32 @@ impl SbiClient {
             .map_err(|e| SbiError::InvalidResponse(e.to_string()))?
             .to_bytes();
 
-        let content = if body_bytes.is_empty() {
-            None
-        } else {
-            Some(String::from_utf8_lossy(&body_bytes).to_string())
-        };
-
         let mut sbi_response = SbiResponse::with_status(status);
         sbi_response.http.headers = headers;
-        sbi_response.http.content = content;
+
+        // multipart/related responses (N1/N2 binary containers, TS 29.500
+        // §6.1.2.3) are decoded into the JSON root + binary parts before any
+        // UTF-8 conversion so binary content survives byte-exact.
+        if !body_bytes.is_empty() {
+            let multipart_content_type = sbi_response
+                .http
+                .get_header(crate::constants::header::CONTENT_TYPE)
+                .filter(|ct| crate::multipart::is_multipart_related(ct))
+                .cloned();
+            match multipart_content_type {
+                Some(ct) => {
+                    let decoded = crate::multipart::decode(&ct, &body_bytes)?;
+                    sbi_response.http.content = decoded.json;
+                    for part in decoded.parts {
+                        sbi_response.http.add_part(part);
+                    }
+                }
+                None => {
+                    sbi_response.http.content =
+                        Some(String::from_utf8_lossy(&body_bytes).to_string());
+                }
+            }
+        }
 
         Ok(sbi_response)
     }
@@ -492,12 +528,13 @@ pub type ClientCallback = Box<dyn Fn(SbiResult<SbiResponse>) + Send + Sync>;
 
 /// Derive the OAuth2 scope from the request URI.
 ///
-/// The scope is the SBI service name, extracted from the first path component.
-/// For example, `/nsmf-pdusession/v1/sm-contexts` yields `nsmf-pdusession`.
+/// The scope is the SBI service name (the apiName of the TS 29.501 §4.4
+/// URI structure). For example, `/nsmf-pdusession/v1/sm-contexts` yields
+/// `nsmf-pdusession`.
 fn derive_scope_from_uri(uri: &str) -> String {
-    let path = uri.split('?').next().unwrap_or(uri);
-    let trimmed = path.trim_start_matches('/');
-    trimmed.split('/').next().unwrap_or("").to_string()
+    crate::message::UriComponents::parse(uri)
+        .api_name
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

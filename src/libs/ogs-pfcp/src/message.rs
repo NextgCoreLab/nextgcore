@@ -122,7 +122,12 @@ impl AssociationSetupRequest {
 
         // CP Function Features (optional)
         if let Some(features) = &self.cp_function_features {
-            encode_u8_ie(buf, IeType::CpFunctionFeatures, features.encode());
+            let mut features_buf = BytesMut::new();
+            features.encode(&mut features_buf);
+            let header =
+                IeHeader::new(IeType::CpFunctionFeatures as u16, features_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&features_buf);
         }
     }
 
@@ -150,9 +155,7 @@ impl AssociationSetupRequest {
                     up_function_features = Some(UpFunctionFeatures::decode(&mut data)?);
                 }
                 t if t == IeType::CpFunctionFeatures as u16 => {
-                    if !ie.data.is_empty() {
-                        cp_function_features = Some(CpFunctionFeatures::decode(ie.data[0]));
-                    }
+                    cp_function_features = Some(CpFunctionFeatures::decode(&ie.data)?);
                 }
                 _ => {} // Skip unknown IEs
             }
@@ -217,7 +220,12 @@ impl AssociationSetupResponse {
 
         // CP Function Features (optional)
         if let Some(features) = &self.cp_function_features {
-            encode_u8_ie(buf, IeType::CpFunctionFeatures, features.encode());
+            let mut features_buf = BytesMut::new();
+            features.encode(&mut features_buf);
+            let header =
+                IeHeader::new(IeType::CpFunctionFeatures as u16, features_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&features_buf);
         }
     }
 
@@ -251,9 +259,7 @@ impl AssociationSetupResponse {
                     up_function_features = Some(UpFunctionFeatures::decode(&mut data)?);
                 }
                 t if t == IeType::CpFunctionFeatures as u16 => {
-                    if !ie.data.is_empty() {
-                        cp_function_features = Some(CpFunctionFeatures::decode(ie.data[0]));
-                    }
+                    cp_function_features = Some(CpFunctionFeatures::decode(&ie.data)?);
                 }
                 _ => {} // Skip unknown IEs
             }

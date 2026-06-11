@@ -277,6 +277,44 @@ pub struct EpsImei {
     pub digits: [u8; 15],
 }
 
+impl EpsImei {
+    /// Encode to bytes (LV format, TS 24.301 Section 9.9.3.12 / TS 24.008 10.5.1.4)
+    pub fn encode(&self, buf: &mut BytesMut) {
+        // Length: 1 (odd/even + type + first digit) + 7 (remaining 14 digits as BCD) = 8
+        buf.put_u8(8);
+        // First byte: first digit + odd indicator (15 digits) + type = IMEI
+        buf.put_u8((self.digits[0] << 4) | 0x08 | EpsMobileIdentityType::Imei as u8);
+        // Remaining 14 digits packed as BCD pairs
+        for i in 0..7 {
+            let d1 = self.digits[1 + i * 2];
+            let d2 = self.digits[2 + i * 2];
+            buf.put_u8((d2 << 4) | d1);
+        }
+    }
+
+    /// Decode from bytes
+    pub fn decode(buf: &mut Bytes, length: usize) -> NasResult<Self> {
+        if length < 8 {
+            return Err(NasError::BufferTooShort {
+                expected: 8,
+                actual: length,
+            });
+        }
+
+        let mut digits = [0u8; 15];
+        let first_byte = buf.get_u8();
+        digits[0] = (first_byte >> 4) & 0x0F;
+
+        for i in 0..7 {
+            let byte = buf.get_u8();
+            digits[1 + i * 2] = byte & 0x0F;
+            digits[2 + i * 2] = (byte >> 4) & 0x0F;
+        }
+
+        Ok(Self { digits })
+    }
+}
+
 /// GUTI for EPS (TS 24.301 Section 9.9.3.12)
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EpsGuti {
@@ -330,8 +368,8 @@ impl EpsMobileIdentity {
     pub fn encode(&self, buf: &mut BytesMut) {
         match self {
             Self::Imsi(imsi) => imsi.encode(buf),
+            Self::Imei(imei) => imei.encode(buf),
             Self::Guti(guti) => guti.encode(buf),
-            Self::Imei(_) => {} // TODO
         }
     }
 
@@ -357,6 +395,7 @@ impl EpsMobileIdentity {
 
         match id_type {
             1 => Ok(Self::Imsi(EpsImsi::decode(buf, length)?)),
+            2 => Ok(Self::Imei(EpsImei::decode(buf, length)?)),
             6 => Ok(Self::Guti(EpsGuti::decode(buf, length)?)),
             _ => Err(NasError::InvalidMobileIdentityType(id_type)),
         }

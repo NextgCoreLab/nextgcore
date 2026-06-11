@@ -5,6 +5,10 @@
 //!
 //! In 3GPP Rel-18+, SBI evolves to support gRPC alongside HTTP/2+JSON,
 //! offering binary protobuf encoding for lower latency and higher throughput.
+//!
+//! NOTE: This module is a research stub and explicitly out of scope for the
+//! TS 29.500 conformance work (3GPP remediation plan, "Known not-in-scope"):
+//! it models service/metadata types but performs no wire-level gRPC I/O.
 
 use std::collections::HashMap;
 use std::time::Duration;

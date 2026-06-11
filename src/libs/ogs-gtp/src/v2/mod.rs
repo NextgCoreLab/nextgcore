@@ -26,9 +26,9 @@ pub use message::{
 
 // Re-export IE types
 pub use ie::{
-    Gtp2AmbrIe, Gtp2ApnIe, Gtp2ApnRestrictionIe, Gtp2BearerQosIe, Gtp2EbiIe, Gtp2FTeidIe, Gtp2Ie,
-    Gtp2IeType, Gtp2PaaIe, Gtp2PdnTypeIe, Gtp2RatTypeIe, Gtp2RecoveryIe, Gtp2SelectionModeIe,
-    Gtp2ServingNetworkIe, Gtp2UliIe,
+    Gtp2AmbrIe, Gtp2ApnIe, Gtp2ApnRestrictionIe, Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2EbiIe,
+    Gtp2FTeidIe, Gtp2Ie, Gtp2IeType, Gtp2IndicationIe, Gtp2PaaIe, Gtp2PdnTypeIe, Gtp2RatTypeIe,
+    Gtp2RecoveryIe, Gtp2SelectionModeIe, Gtp2ServingNetworkIe, Gtp2UliIe,
 };
 // Note: Gtp2CauseIe is in ie module, types module has a different Gtp2CauseIe
 pub use ie::Gtp2CauseIe;

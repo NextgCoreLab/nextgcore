@@ -29,6 +29,7 @@ pub fn build_create_session_request(
             sequence_number: seq,
         },
         ies: Vec::new(),
+        piggybacked: None,
     };
 
     // IE: IMSI (mandatory)
@@ -72,6 +73,7 @@ pub fn build_modify_bearer_request(teid: u32, seq: u32, ebi: u8) -> GtpResult<Gt
             sequence_number: seq,
         },
         ies: Vec::new(),
+        piggybacked: None,
     };
 
     // IE: EBI (EPS Bearer ID) (mandatory)
@@ -95,6 +97,7 @@ pub fn build_delete_session_request(teid: u32, seq: u32, ebi: u8) -> GtpResult<G
             sequence_number: seq,
         },
         ies: Vec::new(),
+        piggybacked: None,
     };
 
     // IE: EBI (mandatory)
