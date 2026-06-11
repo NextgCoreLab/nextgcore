@@ -11,6 +11,7 @@ pub mod gmm_handler;
 pub mod gmm_sm;
 pub mod metrics;
 pub mod namf_handler;
+pub mod namf_server;
 pub mod nas_security;
 pub mod ngap_asn1;
 pub mod ngap_handler;
@@ -646,12 +647,26 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Invalid NGAP address '{}': {}", args.ngap_addr, e))?;
     app.init_ngap(ngap_addr).await?;
 
-    // Register with NRF (if configured)
+    // Start the Namf SBI HTTP/2 server (TS 29.518: namf-comm, namf-evts,
+    // namf-mt, namf-loc) on the advertised SBI endpoint
     let sbi_addr = std::env::var("AMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
     let sbi_port: u16 = std::env::var("AMF_SBI_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(7777);
+    let sbi_sock: SocketAddr = format!("{sbi_addr}:{sbi_port}")
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid SBI address '{sbi_addr}:{sbi_port}': {e}"))?;
+    let sbi_server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+        sbi_sock,
+    ));
+    sbi_server
+        .start(namf_server::namf_request_handler)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to start Namf SBI server: {e}"))?;
+    log::info!("Namf SBI HTTP/2 server listening on {sbi_sock}");
+
+    // Register with NRF (if configured)
     match sbi_path::amf_nrf_register(&sbi_addr, sbi_port).await {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
             ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
@@ -674,6 +689,11 @@ async fn main() -> Result<()> {
 
     // Run async main loop
     app.run_async().await?;
+
+    // Stop the Namf SBI server before tearing the context down
+    if let Err(e) = sbi_server.stop().await {
+        log::warn!("Failed to stop Namf SBI server: {e}");
+    }
 
     // Shutdown (async version)
     app.shutdown_async().await;

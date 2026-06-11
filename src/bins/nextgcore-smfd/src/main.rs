@@ -45,6 +45,7 @@ mod n4_build;
 mod n4_handler;
 mod pfcp_path;
 mod pfcp_sm;
+mod policy;
 #[cfg(test)]
 mod property_tests;
 mod session_extensions; // #199-#201: IPv6 dual-stack, SSC modes, Ethernet PDU
@@ -62,6 +63,18 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// Each transaction fetches-and-increments this so concurrent PDU sessions
 /// never reuse the same sequence number.
 static PFCP_SEQ: AtomicU32 = AtomicU32::new(1);
+
+/// Externally-reachable base URI of this SMF's SBI server, used for the
+/// callback URIs handed to the PCF (notificationUri). Set once in `main`.
+static SELF_SBI_URI: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Base URI for callbacks (e.g. `http://10.0.0.5:7777`).
+fn self_sbi_uri() -> String {
+    SELF_SBI_URI
+        .get()
+        .cloned()
+        .unwrap_or_else(|| "http://127.0.0.1:7777".to_string())
+}
 
 // ---------------------------------------------------------------------------
 // Typed YAML configuration structs (serde_yaml Deserialize)
@@ -220,6 +233,20 @@ async fn main() -> Result<()> {
         log::info!("NRF URI configured: {uri}");
         global_context().set_nrf_uri(uri).await;
     }
+
+    // Advertised SBI base URI used for PCF callbacks (notificationUri).
+    // 0.0.0.0 is not reachable by peers, so fall back to loopback unless
+    // overridden with SMF_SBI_ADVERTISE_URI.
+    let advertise_uri = std::env::var("SMF_SBI_ADVERTISE_URI").unwrap_or_else(|_| {
+        let host = if config.sbi_addr == "0.0.0.0" {
+            "127.0.0.1"
+        } else {
+            config.sbi_addr.as_str()
+        };
+        format!("http://{host}:{}", config.sbi_port)
+    });
+    log::info!("SBI advertise URI for callbacks: {advertise_uri}");
+    let _ = SELF_SBI_URI.set(advertise_uri);
 
     // Initialize SMF context
     smf_context_init(config.max_ue, config.max_sess, config.max_bearer);
@@ -822,10 +849,18 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         // Callback handlers (from other NFs)
         // =====================================================================
 
-        // SM Policy Update Notification (from PCF)
+        // SM Policy Update/Terminate Notification (from PCF, TS 29.512
+        // §4.2.3/§4.2.4: POST {notificationUri}/update | /terminate)
         ("nsmf-callback", "sm-policy-notify", "POST") => {
             if let Some(sm_context_ref) = resource_id {
-                handle_sm_policy_notify(sm_context_ref).await
+                let action = parts.get(4).copied().unwrap_or("update");
+                match action {
+                    "update" => handle_sm_policy_notify(sm_context_ref, &request).await,
+                    "terminate" => handle_sm_policy_terminate(sm_context_ref).await,
+                    other => {
+                        send_bad_request(&format!("Unknown notify action '{other}'"), None)
+                    }
+                }
             } else {
                 send_bad_request("Missing SM context reference", None)
             }
@@ -868,14 +903,26 @@ struct PfcpSessionResult {
     upf_addr: [u8; 4],
 }
 
-/// Send PFCP Session Establishment Request to UPF and return UPF TEID
+/// QoS applied to the N4 session, derived from the PCF SM policy decision
+/// (or the documented config-default when no PCF is configured).
+struct SessionQos {
+    qfi: u8,
+    ambr_ul_bps: u64,
+    ambr_dl_bps: u64,
+}
+
+/// Send PFCP Session Establishment Request to UPF and return UPF TEID.
+///
+/// The QER enforcing the authorized Session-AMBR (TS 29.512 authSessAmbr →
+/// TS 29.244 MBR) and the QFI come from `qos` — no hardcoded values.
 async fn pfcp_session_establish(
     smf_n4_seid: u64,
     ue_ip: [u8; 4],
     dnn: &str,
     sst: u8,
+    qos: &SessionQos,
 ) -> Result<PfcpSessionResult> {
-    use n4_build::{pfcp_ie, FarParams, PdrParams, PfcpMessageBuilder};
+    use n4_build::{pfcp_ie, FarParams, PdrParams, PfcpMessageBuilder, QerParams};
 
     let client = pfcp_path::global_client()
         .ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
@@ -911,6 +958,18 @@ async fn pfcp_session_establish(
     // S-NSSAI
     builder.add_s_nssai(sst, None);
 
+    // Create QER 1: enforce the authorized Session-AMBR (MBR UL/DL) on the
+    // default QoS flow. Gates open in both directions.
+    let session_qer = QerParams {
+        qer_id: 1,
+        gate_status: (0, 0),
+        mbr: Some((qos.ambr_ul_bps, qos.ambr_dl_bps)),
+        gbr: None,
+        qfi: Some(qos.qfi),
+    };
+    let qer_bytes = n4_build::build_create_qer(&session_qer);
+    builder.add_tlv(pfcp_ie::CREATE_QER, &qer_bytes);
+
     // Create PDR 1 (Uplink): UE -> UPF -> DN
     let ul_pdr = PdrParams {
         pdr_id: 1,
@@ -920,7 +979,8 @@ async fn pfcp_session_establish(
         ue_ip_address: Some((Some(ue_ip), None, true)), // source
         outer_header_removal: Some(0),                  // GTP-U/UDP/IPv4
         far_id: Some(1),
-        qfi: Some(9),
+        qer_id: Some(1),
+        qfi: Some(qos.qfi),
         ..Default::default()
     };
     let ul_pdr_bytes = n4_build::build_create_pdr(&ul_pdr);
@@ -943,7 +1003,8 @@ async fn pfcp_session_establish(
         source_interface: 6,                             // Core
         ue_ip_address: Some((Some(ue_ip), None, false)), // destination
         far_id: Some(2),
-        qfi: Some(9),
+        qer_id: Some(1),
+        qfi: Some(qos.qfi),
         ..Default::default()
     };
     let dl_pdr_bytes = n4_build::build_create_pdr(&dl_pdr);
@@ -1186,7 +1247,55 @@ async fn pfcp_session_delete(upf_seid: u64) -> Result<()> {
 // SM Context Handlers
 // =============================================================================
 
-/// Handle SM Context Create (from AMF via N11)
+/// Build a ProblemDetails 400 response (TS 29.500 §5.2.7).
+fn problem_400(cause: &str, detail: &str) -> SbiResponse {
+    let body = serde_json::json!({
+        "status": 400,
+        "cause": cause,
+        "detail": detail,
+    });
+    SbiResponse::with_status(400).with_body(body.to_string(), "application/problem+json")
+}
+
+/// Build an SmContextCreateError (TS 29.502 §6.1.6.2.4) carrying a
+/// PDU Session Establishment Reject N1 SM container with a 5GSM cause.
+fn sm_context_create_error(
+    status: u16,
+    cause: &str,
+    psi: u8,
+    pti: u8,
+    gsm_cause_5gsm: u8,
+) -> SbiResponse {
+    use base64::Engine;
+    let n1 = policy::build_establishment_reject(psi, pti, gsm_cause_5gsm);
+    let body = serde_json::json!({
+        "error": { "status": status, "cause": cause },
+        "n1SmMsg": base64::engine::general_purpose::STANDARD.encode(&n1),
+    });
+    SbiResponse::with_status(status).with_body(body.to_string(), "application/json")
+}
+
+/// Dispatch an Npcf_SMPolicyControl client response into a session's GSM FSM
+/// (drives Wait5gcSmPolicyAssociation → WaitPfcpEstablishment / N1N2Reject5gc).
+fn fsm_dispatch_policy_response(fsm: &mut gsm_sm::GsmFsm, status: u16) {
+    let mut ev = event::SmfEvent::sbi_client(
+        event::SbiResponse {
+            status,
+            body: None,
+        },
+        0,
+    );
+    if let Some(ref mut sbi) = ev.sbi {
+        sbi.message = Some(event::SbiMessage {
+            service_name: "npcf-smpolicycontrol".to_string(),
+            res_status: Some(status),
+            ..Default::default()
+        });
+    }
+    fsm.dispatch(&ev);
+}
+
+/// Handle SM Context Create (from AMF via N11, TS 29.502 §5.2.2.2)
 async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     log::info!("SM Context Create request received");
 
@@ -1196,18 +1305,119 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
             Ok(v) => v,
             Err(e) => {
                 log::error!("Failed to parse SM Context Create request: {e}");
-                return send_bad_request("Invalid JSON", None);
+                return problem_400("INVALID_MSG_FORMAT", "request body is not valid JSON");
             }
         },
-        None => serde_json::json!({}),
+        None => return problem_400("MANDATORY_IE_MISSING", "SmContextCreateData body required"),
     };
 
-    let pdu_session_id = req_body["pduSessionId"].as_u64().unwrap_or(1) as u8;
-    let sst = req_body["sNssai"]["sst"].as_u64().unwrap_or(1) as u8;
-    let dnn = req_body["dnn"].as_str().unwrap_or("internet");
+    // ---- SmContextCreateData attributes (TS 29.502 Table 6.1.6.2.2-1) ----
+    let Some(pdu_session_id) = req_body["pduSessionId"]
+        .as_u64()
+        .filter(|p| (1..=15).contains(p))
+        .map(|p| p as u8)
+    else {
+        return problem_400("MANDATORY_IE_INCORRECT", "pduSessionId (1..15) is required");
+    };
+    let Some(dnn) = req_body["dnn"].as_str().map(str::to_string) else {
+        return problem_400("MANDATORY_IE_MISSING", "dnn is required");
+    };
+    let Some(sst) = req_body["sNssai"]["sst"].as_u64().map(|v| v as u8) else {
+        return problem_400("MANDATORY_IE_MISSING", "sNssai.sst is required");
+    };
+    let snssai_sd = req_body["sNssai"]["sd"].as_str().map(str::to_string);
+    // supi is conditional-mandatory (non-emergency registration); the current
+    // AMF does not send it yet (Wave 3.1), so warn instead of rejecting.
+    let supi = match req_body["supi"].as_str() {
+        Some(s) => s.to_string(),
+        None => {
+            log::warn!("SmContextCreateData without supi (lenient: AMF Wave 3.1 pending)");
+            "imsi-unknown".to_string()
+        }
+    };
+    let an_type = req_body["anType"].as_str().unwrap_or_else(|| {
+        log::warn!("SmContextCreateData without anType — assuming 3GPP_ACCESS");
+        "3GPP_ACCESS"
+    });
+    let sm_context_status_uri = req_body["smContextStatusUri"].as_str().map(str::to_string);
+    if sm_context_status_uri.is_none() {
+        log::warn!("SmContextCreateData without smContextStatusUri (status notifications disabled)");
+    }
+    let serving_nf_id = req_body["servingNfId"].as_str().unwrap_or("");
+    let rat_type = req_body["ratType"].as_str().unwrap_or("NR");
+    let guami = &req_body["guami"];
+    let serving_network = &req_body["servingNetwork"];
+    log::info!(
+        "SM Context Create: SUPI={supi}, PSI={pdu_session_id}, SST={sst}, DNN={dnn}, \
+         anType={an_type}, ratType={rat_type}, servingNfId={serving_nf_id}, \
+         guami={guami}, servingNetwork={serving_network}"
+    );
 
-    log::info!("SM Context Create: PSI={pdu_session_id}, SST={sst}, DNN={dnn}");
+    // ---- N1 SM container: PDU Session Establishment Request (TS 24.501) ----
+    let (pti, requested_type, requested_ssc) = match req_body["n1SmMsg"].as_str() {
+        Some(b64) => {
+            use base64::Engine;
+            let Ok(n1_bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+                return problem_400("N1_SM_ERROR", "n1SmMsg is not valid base64");
+            };
+            match policy::parse_establishment_request(&n1_bytes) {
+                Some(req) => {
+                    if req.psi != pdu_session_id {
+                        log::warn!(
+                            "N1 PSI {} differs from SmContextCreateData pduSessionId {}",
+                            req.psi,
+                            pdu_session_id
+                        );
+                    }
+                    log::info!(
+                        "N1 SM decoded: PTI={}, requested PDU type={:?}, SSC mode={:?}, \
+                         integrity max rate={:?}",
+                        req.pti,
+                        req.requested_pdu_session_type,
+                        req.requested_ssc_mode,
+                        req.integrity_max_rate
+                    );
+                    (
+                        req.pti,
+                        req.requested_pdu_session_type
+                            .unwrap_or(policy::pdu_session_type::IPV4),
+                        req.requested_ssc_mode.unwrap_or(1),
+                    )
+                }
+                None => {
+                    return problem_400(
+                        "N1_SM_ERROR",
+                        "n1SmMsg is not a PDU Session Establishment Request",
+                    )
+                }
+            }
+        }
+        None => {
+            log::warn!("SmContextCreateData without n1SmMsg — using defaults (PTI=0)");
+            (0u8, policy::pdu_session_type::IPV4, 1u8)
+        }
+    };
 
+    // Selected PDU session type: this SMF serves IPv4 (and the IPv4 leg of
+    // IPv4v6). IPv6-only/Ethernet/Unstructured → reject, 5GSM cause #50.
+    let selected_type = match requested_type {
+        policy::pdu_session_type::IPV4 | policy::pdu_session_type::IPV4V6 => {
+            policy::pdu_session_type::IPV4
+        }
+        other => {
+            log::warn!("Unsupported requested PDU session type {other} — rejecting (cause 50)");
+            return sm_context_create_error(
+                403,
+                "PDU_SESSION_TYPE_NOT_SUPPORTED",
+                pdu_session_id,
+                pti,
+                policy::gsm_cause::PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED,
+            );
+        }
+    };
+    let selected_ssc = if requested_ssc == 0 { 1 } else { requested_ssc };
+
+    // ---- Allocate session resources ----
     let ctx = smf_self();
     let sm_context_ref;
     let ue_ip_octets: [u8; 4];
@@ -1222,7 +1432,13 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
             }
             None => {
                 log::error!("IPv4 address pool exhausted");
-                return SbiResponse::with_status(500);
+                return sm_context_create_error(
+                    500,
+                    "INSUFFICIENT_RESOURCES",
+                    pdu_session_id,
+                    pti,
+                    policy::gsm_cause::INSUFFICIENT_RESOURCES,
+                );
             }
         }
     } else {
@@ -1238,35 +1454,108 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         ue_ip_octets[3]
     );
 
-    // Build N1 SM message: NAS PDU Session Establishment Accept
-    let mut n1_sm_msg = Vec::new();
-    n1_sm_msg.push(0x2E); // EPD: 5GSM
-    n1_sm_msg.push(pdu_session_id);
-    n1_sm_msg.push(0x00); // PTI
-    n1_sm_msg.push(0xC2); // Message Type: PDU Session Establishment Accept
-    n1_sm_msg.push(0x01); // PDU session type: IPv4
-    n1_sm_msg.push(0x01); // SSC mode 1
-    n1_sm_msg.extend_from_slice(&[0x06, 0x01, 0x03, 0x01, 0x01, 0x09]); // QoS rules (QFI=9)
-    n1_sm_msg.extend_from_slice(&[0x06, 0x06, 0x00, 0x64, 0x06, 0x00, 0x64]); // Session AMBR 100Mbps
-                                                                              // PDU address (IEI 0x29)
-    n1_sm_msg.push(0x29);
-    n1_sm_msg.push(0x05);
-    n1_sm_msg.push(0x01);
-    n1_sm_msg.extend_from_slice(&ue_ip_octets);
-    // DNN (IEI 0x25)
-    let dnn_bytes = dnn.as_bytes();
-    n1_sm_msg.push(0x25);
-    n1_sm_msg.push((dnn_bytes.len() + 1) as u8);
-    n1_sm_msg.push(dnn_bytes.len() as u8);
-    n1_sm_msg.extend_from_slice(dnn_bytes);
+    let release_ip = || {
+        if let Ok(ctx) = smf_self().read() {
+            ctx.ipv4_pool.release(std::net::Ipv4Addr::from(ue_ip_octets));
+        }
+    };
 
-    // Establish PFCP session with UPF to get the real UPF TEID. A failed N4
-    // establishment is a hard failure for the PDU session — no fabricated
-    // TEID fallback (the data path would be a black hole).
+    // ---- GSM FSM: Initial → Wait5gcSmPolicyAssociation ----
+    let sess_idx_u64 = sm_context_ref.parse::<u64>().unwrap_or(0);
+    let mut fsm = gsm_sm::GsmFsm::new(sess_idx_u64);
+    fsm.init();
+    fsm.dispatch(&event::SmfEvent::gsm_message(
+        sess_idx_u64,
+        policy::gsm_message_type::ESTABLISHMENT_REQUEST,
+        Vec::new(),
+    ));
+
+    // ---- Npcf_SMPolicyControl_Create (TS 29.512 §4.2.2) ----
+    let notification_uri = format!(
+        "{}/nsmf-callback/v1/sm-policy-notify/{}",
+        self_sbi_uri(),
+        sm_context_ref
+    );
+    let decision = match policy::resolve_pcf_endpoint().await {
+        None => {
+            // Documented config-default fallback: no PCF configured.
+            log::warn!(
+                "No PCF configured (PCF_URI / NRF) — applying config-default policy \
+                 (5QI=9, AMBR 100/100 Mbps)"
+            );
+            fsm.transition_to(gsm_sm::GsmState::WaitPfcpEstablishment);
+            policy::PolicyDecision::config_default()
+        }
+        Some(pcf) => {
+            let create_ctx = policy::SmPolicyCreateContext {
+                supi: &supi,
+                psi: pdu_session_id,
+                pdu_session_type: selected_type,
+                dnn: &dnn,
+                sst,
+                sd: snssai_sd.as_deref(),
+                ue_ipv4: ue_ip_octets,
+                notification_uri: &notification_uri,
+            };
+            match policy::sm_policy_create(&pcf, &create_ctx).await {
+                Ok(decision) => {
+                    log::info!(
+                        "SM policy created: id={}, 5QI={}, AMBR UL/DL={}/{} bps, {} PCC rule(s)",
+                        decision.sm_policy_id,
+                        decision.def_five_qi,
+                        decision.sess_ambr_ul_bps,
+                        decision.sess_ambr_dl_bps,
+                        decision.pcc_rules.len()
+                    );
+                    fsm_dispatch_policy_response(&mut fsm, 201);
+                    decision
+                }
+                Err(policy::PolicyError::Rejected { status, detail }) => {
+                    // Abnormal path: PCF policy rejection → session reject
+                    // with 5GSM cause #29 (TS 24.501).
+                    log::error!("PCF rejected SM policy (status={status}): {detail}");
+                    fsm_dispatch_policy_response(&mut fsm, status);
+                    release_ip();
+                    return sm_context_create_error(
+                        403,
+                        "POLICY_REJECTED",
+                        pdu_session_id,
+                        pti,
+                        policy::gsm_cause::USER_AUTHENTICATION_OR_AUTHORIZATION_FAILED,
+                    );
+                }
+                Err(e) => {
+                    // PCF configured but unreachable: hard failure (no
+                    // silent fallback) → 5GSM cause #38 network failure.
+                    log::error!("SM policy create failed: {e}");
+                    fsm.transition_to(gsm_sm::GsmState::Exception);
+                    release_ip();
+                    return sm_context_create_error(
+                        504,
+                        "PCF_NOT_RESPONDING",
+                        pdu_session_id,
+                        pti,
+                        policy::gsm_cause::NETWORK_FAILURE,
+                    );
+                }
+            }
+        }
+    };
+
+    let qfi = decision.default_qfi();
+    let session_qos = SessionQos {
+        qfi,
+        ambr_ul_bps: decision.sess_ambr_ul_bps,
+        ambr_dl_bps: decision.sess_ambr_dl_bps,
+    };
+
+    // ---- N4: PFCP Session Establishment with policy-derived QoS ----
+    // A failed N4 establishment is a hard failure for the PDU session — no
+    // fabricated TEID fallback (the data path would be a black hole).
     let smf_n4_seid = (sm_context_ref.parse::<u64>().unwrap_or(1)) | 0x1000;
 
     let (upf_teid, upf_addr) =
-        match pfcp_session_establish(smf_n4_seid, ue_ip_octets, dnn, sst).await {
+        match pfcp_session_establish(smf_n4_seid, ue_ip_octets, &dnn, sst, &session_qos).await {
             Ok(result) => {
                 log::info!(
                     "PFCP session established: UPF SEID=0x{:016x}, TEID=0x{:08x}, addr={}.{}.{}.{}",
@@ -1281,34 +1570,84 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 if let Ok(ctx) = smf_self().read() {
                     if let Ok(mut sessions) = ctx.pfcp_sessions.write() {
                         sessions.insert(sm_context_ref.to_string(), result.upf_seid);
-                        log::debug!(
-                            "Stored UPF SEID=0x{:016x} for sm_context_ref={}",
-                            result.upf_seid,
-                            sm_context_ref
-                        );
                     }
                 }
+                // FSM: WaitPfcpEstablishment → Operational
+                fsm.dispatch(&event::SmfEvent::n4_message(0, 0, Vec::new()));
                 (result.upf_teid, result.upf_addr)
             }
             Err(e) => {
                 log::error!("PFCP session establishment failed: {e} — rejecting SM context");
-                // Release the allocated UE IP before failing
-                if let Ok(ctx) = smf_self().read() {
-                    ctx.ipv4_pool.release(std::net::Ipv4Addr::from(ue_ip_octets));
+                fsm.transition_to(gsm_sm::GsmState::Exception);
+                // Roll back the PCF SM policy association (TS 29.512 §4.2.5)
+                if let Some(ref pol_id) = (!decision.is_config_default)
+                    .then_some(decision.sm_policy_id.clone())
+                {
+                    if let Some(pcf) = policy::resolve_pcf_endpoint().await {
+                        if let Err(e) = policy::sm_policy_delete(&pcf, pol_id).await {
+                            log::warn!("SM policy rollback delete failed: {e}");
+                        }
+                    }
                 }
-                return SbiResponse::with_status(504);
+                release_ip();
+                return sm_context_create_error(
+                    504,
+                    "UPF_NOT_RESPONDING",
+                    pdu_session_id,
+                    pti,
+                    policy::gsm_cause::INSUFFICIENT_RESOURCES,
+                );
             }
         };
 
-    // Build N2 SM Information: UPF tunnel endpoint
+    // ---- Store the policy binding (drives later update/release/notify) ----
+    if let Ok(context) = ctx.read() {
+        if let Ok(mut bindings) = context.policy_bindings.write() {
+            bindings.insert(
+                sm_context_ref.clone(),
+                context::PolicyBinding {
+                    sm_policy_id: (!decision.is_config_default)
+                        .then_some(decision.sm_policy_id.clone()),
+                    supi: supi.clone(),
+                    psi: pdu_session_id,
+                    pti,
+                    pdu_session_type: selected_type,
+                    ssc_mode: selected_ssc,
+                    ue_ip: ue_ip_octets,
+                    dnn: dnn.clone(),
+                    qfi,
+                    five_qi: decision.def_five_qi,
+                    ambr_ul_bps: decision.sess_ambr_ul_bps,
+                    ambr_dl_bps: decision.sess_ambr_dl_bps,
+                    sm_context_status_uri: sm_context_status_uri.clone(),
+                    fsm: fsm.clone(),
+                },
+            );
+        }
+    }
+
+    // ---- N1: PDU Session Establishment Accept with authorized QoS ----
+    let n1_sm_msg = policy::build_establishment_accept(
+        pdu_session_id,
+        pti,
+        selected_type,
+        selected_ssc,
+        qfi,
+        decision.sess_ambr_dl_bps,
+        decision.sess_ambr_ul_bps,
+        ue_ip_octets,
+        &dnn,
+    );
+
+    // ---- N2 SM Information: UPF tunnel endpoint + authorized 5QI ----
     // Format: QFI(1) + UPF TEID(4,BE) + addr_type(1) + IPv4(4) + 5QI(1) + priority(1)
     let mut n2_sm_info = Vec::with_capacity(12);
-    n2_sm_info.push(9u8); // QFI
+    n2_sm_info.push(qfi);
     n2_sm_info.extend_from_slice(&upf_teid.to_be_bytes());
     n2_sm_info.push(1); // IPv4
     n2_sm_info.extend_from_slice(&upf_addr);
-    n2_sm_info.push(9); // 5QI
-    n2_sm_info.push(1); // Priority
+    n2_sm_info.push(decision.def_five_qi);
+    n2_sm_info.push(decision.arp_priority_level);
 
     use base64::Engine;
     let n1_b64 = base64::engine::general_purpose::STANDARD.encode(&n1_sm_msg);
@@ -1319,16 +1658,19 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         "pduSessionId": pdu_session_id,
         "upCnxState": "ACTIVATING",
         "n1SmMsg": n1_b64,
-        "n2SmInfo": n2_b64
+        "n2SmInfo": n2_b64,
+        "n2SmInfoType": "PDU_RES_SETUP_REQ"
     });
 
     let location = format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}");
 
     log::info!(
-        "SM Context Created: ref={}, n1_len={}, n2_len={}, UPF TEID=0x{:08x}",
+        "SM Context Created: ref={}, 5QI={}, QFI={}, AMBR UL/DL={}/{} bps, UPF TEID=0x{:08x}",
         sm_context_ref,
-        n1_sm_msg.len(),
-        n2_sm_info.len(),
+        decision.def_five_qi,
+        qfi,
+        decision.sess_ambr_ul_bps,
+        decision.sess_ambr_dl_bps,
         upf_teid
     );
 
@@ -1337,216 +1679,382 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         .with_body(response_body.to_string(), "application/json")
 }
 
-/// Handle SM Context Update (gNB TEID from AMF after PDU Session Resource Setup Response)
+/// Look up the stored UPF SEID for an SM context (copy-then-drop the guards
+/// per the lock-order rule).
+fn lookup_upf_seid(sm_context_ref: &str) -> Option<u64> {
+    smf_self().read().ok().and_then(|ctx| {
+        ctx.pfcp_sessions
+            .read()
+            .ok()
+            .and_then(|sessions| sessions.get(sm_context_ref).copied())
+    })
+}
+
+/// Look up a clone of the policy binding for an SM context.
+fn lookup_policy_binding(sm_context_ref: &str) -> Option<context::PolicyBinding> {
+    smf_self().read().ok().and_then(|ctx| {
+        ctx.policy_bindings
+            .read()
+            .ok()
+            .and_then(|bindings| bindings.get(sm_context_ref).cloned())
+    })
+}
+
+/// Send a PFCP QER modification carrying an authorized Session-AMBR.
+async fn pfcp_update_session_qer(upf_seid: u64, qfi: u8, ambr_ul: u64, ambr_dl: u64) -> Result<()> {
+    let client = pfcp_path::global_client()
+        .ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
+    let params = n4_build::SessionModificationParams {
+        update_qers: vec![n4_build::QerParams {
+            qer_id: 1,
+            gate_status: (0, 0), // Both gates open
+            mbr: Some((ambr_ul, ambr_dl)),
+            gbr: None,
+            qfi: Some(qfi),
+        }],
+        ..Default::default()
+    };
+    let payload = n4_build::build_session_modification_request(&params);
+    let (_, resp_body) = client
+        .request(
+            pfcp_path::pfcp_message_type::SESSION_MODIFICATION_REQUEST,
+            Some(upf_seid),
+            &payload,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("PFCP Session Modification (QoS) failed: {e}"))?;
+    match pfcp_path::parse_cause(&resp_body) {
+        Some(pfcp_path::pfcp_cause::REQUEST_ACCEPTED) => Ok(()),
+        cause => anyhow::bail!("PFCP Session Modification (QoS) rejected: cause={cause:?}"),
+    }
+}
+
+/// Deactivate the downlink FAR (back to BUFF) — used when the AN-side
+/// resources failed or the UP connection is deactivated.
+async fn pfcp_deactivate_dl_far(upf_seid: u64) -> Result<()> {
+    let client = pfcp_path::global_client()
+        .ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
+    let params = n4_build::SessionModificationParams {
+        update_fars_deactivate: vec![2],
+        ..Default::default()
+    };
+    let payload = n4_build::build_session_modification_request(&params);
+    let (_, resp_body) = client
+        .request(
+            pfcp_path::pfcp_message_type::SESSION_MODIFICATION_REQUEST,
+            Some(upf_seid),
+            &payload,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("PFCP DL FAR deactivation failed: {e}"))?;
+    match pfcp_path::parse_cause(&resp_body) {
+        Some(pfcp_path::pfcp_cause::REQUEST_ACCEPTED) => Ok(()),
+        cause => anyhow::bail!("PFCP DL FAR deactivation rejected: cause={cause:?}"),
+    }
+}
+
+/// Handle SM Context Update (TS 29.502 §5.2.2.3) — dispatches on
+/// n2SmInfoType (all inbound values of TS 29.502 Table 6.1.6.3.3-1 that can
+/// arrive on /modify) and on upCnxState.
 async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("SM Context Update request for ref={sm_context_ref}");
 
     // Parse request body for N2 SM Info (gNB TEID)
     let req_body: serde_json::Value = match &request.http.content {
-        Some(content) => serde_json::from_str(content).unwrap_or(serde_json::json!({})),
+        Some(content) => match serde_json::from_str(content) {
+            Ok(v) => v,
+            Err(e) => {
+                return problem_400("INVALID_MSG_FORMAT", &format!("invalid JSON: {e}"));
+            }
+        },
         None => serde_json::json!({}),
     };
 
     let n2_sm_info_type = req_body["n2SmInfoType"].as_str().unwrap_or("");
 
-    if n2_sm_info_type == "PDU_RES_SETUP_RSP" {
-        // Decode N2 SM Info to extract gNB TEID and address
-        use base64::Engine;
-        if let Some(n2_b64) = req_body["n2SmInfo"].as_str() {
-            if let Ok(n2_bytes) = base64::engine::general_purpose::STANDARD.decode(n2_b64) {
-                if n2_bytes.len() >= 6 {
-                    let qfi = n2_bytes[0];
-                    let gnb_teid =
-                        u32::from_be_bytes([n2_bytes[1], n2_bytes[2], n2_bytes[3], n2_bytes[4]]);
-                    let addr_type = n2_bytes[5];
+    match n2_sm_info_type {
+        // gNB accepted the PDU session resources (initial setup) — or the UE
+        // moved and the target gNB took over (Xn path switch). Both carry the
+        // new DL F-TEID that the UPF must forward to.
+        "PDU_RES_SETUP_RSP" | "PATH_SWITCH_REQ" => {
+            use base64::Engine;
+            let Some(n2_bytes) = req_body["n2SmInfo"]
+                .as_str()
+                .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+            else {
+                return problem_400("N2_SM_ERROR", "n2SmInfo missing or not valid base64");
+            };
+            if n2_bytes.len() < 6 {
+                return problem_400("N2_SM_ERROR", "n2SmInfo too short");
+            }
+            let qfi = n2_bytes[0];
+            let gnb_teid = u32::from_be_bytes([n2_bytes[1], n2_bytes[2], n2_bytes[3], n2_bytes[4]]);
+            let addr_type = n2_bytes[5];
+            let gnb_addr = if addr_type == 1 && n2_bytes.len() >= 10 {
+                [n2_bytes[6], n2_bytes[7], n2_bytes[8], n2_bytes[9]]
+            } else {
+                [127, 0, 0, 1]
+            };
 
-                    let gnb_addr = if addr_type == 1 && n2_bytes.len() >= 10 {
-                        [n2_bytes[6], n2_bytes[7], n2_bytes[8], n2_bytes[9]]
-                    } else {
-                        [127, 0, 0, 1]
-                    };
+            log::info!(
+                "SM Context Update ({n2_sm_info_type}): gNB TEID=0x{:08x}, \
+                 addr={}.{}.{}.{}, QFI={}",
+                gnb_teid,
+                gnb_addr[0],
+                gnb_addr[1],
+                gnb_addr[2],
+                gnb_addr[3],
+                qfi
+            );
 
+            let Some(upf_seid) = lookup_upf_seid(sm_context_ref) else {
+                // No N4 session exists for this context — fabricating a SEID
+                // would target an unrelated session
+                log::error!("No stored UPF SEID for ref={sm_context_ref}");
+                return SbiResponse::with_status(404);
+            };
+            match pfcp_session_modify(upf_seid, gnb_teid, gnb_addr).await {
+                Ok(()) => {
                     log::info!(
-                        "SM Context Update: gNB TEID=0x{:08x}, addr={}.{}.{}.{}, QFI={}",
-                        gnb_teid,
-                        gnb_addr[0],
-                        gnb_addr[1],
-                        gnb_addr[2],
-                        gnb_addr[3],
-                        qfi
+                        "PFCP Session Modified: DL FAR activated with gNB TEID=0x{gnb_teid:08x}"
                     );
+                }
+                Err(e) => {
+                    log::error!("PFCP Session Modification failed: {e}");
+                    return SbiResponse::with_status(504);
+                }
+            }
 
-                    // Send PFCP Session Modification to UPF: activate DL FAR with gNB TEID
-                    // Retrieve the real UPF SEID stored during establishment (from SmfContext)
-                    let upf_seid = smf_self().read().ok().and_then(|ctx| {
-                        ctx.pfcp_sessions
-                            .read()
-                            .ok()
-                            .and_then(|sessions| sessions.get(sm_context_ref).copied())
-                    });
-                    let Some(upf_seid) = upf_seid else {
-                        // No N4 session exists for this context — fabricating
-                        // a SEID would target an unrelated session
-                        log::error!("No stored UPF SEID for ref={sm_context_ref}");
-                        return SbiResponse::with_status(404);
-                    };
-                    log::info!("PFCP Session Modification: UPF SEID=0x{upf_seid:016x} for ref={sm_context_ref}");
-                    match pfcp_session_modify(upf_seid, gnb_teid, gnb_addr).await {
-                        Ok(()) => {
-                            log::info!("PFCP Session Modified: DL FAR activated with gNB TEID=0x{gnb_teid:08x}");
+            let mut response_body = serde_json::json!({ "upCnxState": "ACTIVATED" });
+            if n2_sm_info_type == "PATH_SWITCH_REQ" {
+                // Echo the (unchanged) UL tunnel back to the target gNB
+                response_body["n2SmInfoType"] = serde_json::json!("PATH_SWITCH_REQ_ACK");
+            }
+            SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
+        }
+
+        // AN failed to set up (or path-switch / handover resource allocation
+        // failed): the DL tunnel is invalid — buffer downlink again.
+        "PDU_RES_SETUP_FAIL" | "PATH_SWITCH_SETUP_FAIL" | "HANDOVER_RES_ALLOC_FAIL" => {
+            log::warn!("SM Context Update ({n2_sm_info_type}): AN resource failure for ref={sm_context_ref}");
+            if let Some(upf_seid) = lookup_upf_seid(sm_context_ref) {
+                if let Err(e) = pfcp_deactivate_dl_far(upf_seid).await {
+                    log::warn!("DL FAR deactivation after AN failure failed: {e}");
+                }
+            }
+            let response_body = serde_json::json!({ "upCnxState": "DEACTIVATED" });
+            SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
+        }
+
+        // UE-initiated PDU Session Modification: AMF forwards the N1 SM
+        // container; QoS comes from an Npcf_SMPolicyControl_Update — not
+        // hardcoded values.
+        "PDU_RES_MOD_REQ" => {
+            use base64::Engine;
+            let Some(n1_sm_msg) = req_body["n1SmMsg"]
+                .as_str()
+                .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+            else {
+                return problem_400("N1_SM_ERROR", "n1SmMsg missing or not valid base64");
+            };
+            let Some(hdr) = policy::parse_n1_sm_header(&n1_sm_msg) else {
+                return problem_400("N1_SM_ERROR", "n1SmMsg is not a 5GSM message");
+            };
+            let binding = lookup_policy_binding(sm_context_ref);
+            let psi = binding
+                .as_ref()
+                .map(|b| b.psi)
+                .unwrap_or_else(|| sm_context_ref.parse().unwrap_or(1));
+            let pti = hdr.pti;
+            log::info!(
+                "SM Context Update (UE modification): PSI={psi}, PTI={pti}, msg=0x{:02x}",
+                hdr.message_type
+            );
+
+            // Re-authorize via PCF (trigger RES_MO_RE, TS 29.512 §4.2.4)
+            let (qfi, ambr_ul, ambr_dl) = match binding.as_ref() {
+                Some(b) => {
+                    let mut authorized = (b.qfi, b.ambr_ul_bps, b.ambr_dl_bps);
+                    if let Some(ref pol_id) = b.sm_policy_id {
+                        match policy::resolve_pcf_endpoint().await {
+                            Some(pcf) => {
+                                match policy::sm_policy_update(&pcf, pol_id, &["RES_MO_RE"], None)
+                                    .await
+                                {
+                                    Ok(dec) => {
+                                        authorized =
+                                            (b.qfi, dec.sess_ambr_ul_bps, dec.sess_ambr_dl_bps);
+                                    }
+                                    Err(policy::PolicyError::Rejected { status, detail }) => {
+                                        // Abnormal path: PCF rejects the
+                                        // modification → 403 + 5GSM cause 29
+                                        log::error!(
+                                            "PCF rejected SM policy update (status={status}): {detail}"
+                                        );
+                                        return sm_context_create_error(
+                                            403,
+                                            "POLICY_REJECTED",
+                                            psi,
+                                            pti,
+                                            policy::gsm_cause::USER_AUTHENTICATION_OR_AUTHORIZATION_FAILED,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        log::warn!(
+                                            "SM policy update failed ({e}) — keeping current QoS"
+                                        );
+                                    }
+                                }
+                            }
+                            None => log::warn!("PCF unresolved — keeping current QoS"),
                         }
-                        Err(e) => {
-                            log::error!("PFCP Session Modification failed: {e}");
-                            return SbiResponse::with_status(504);
+                    }
+                    authorized
+                }
+                None => {
+                    log::warn!(
+                        "No policy binding for ref={sm_context_ref} — applying config-default QoS"
+                    );
+                    let d = policy::PolicyDecision::config_default();
+                    (d.default_qfi(), d.sess_ambr_ul_bps, d.sess_ambr_dl_bps)
+                }
+            };
+
+            // Apply the authorized QoS to the N4 session QER
+            if let Some(seid) = lookup_upf_seid(sm_context_ref) {
+                if let Err(e) = pfcp_update_session_qer(seid, qfi, ambr_ul, ambr_dl).await {
+                    log::error!("{e}");
+                    return SbiResponse::with_status(504);
+                }
+                // Persist the new authorized AMBR in the binding
+                if let Ok(ctx) = smf_self().read() {
+                    if let Ok(mut bindings) = ctx.policy_bindings.write() {
+                        if let Some(b) = bindings.get_mut(sm_context_ref) {
+                            b.ambr_ul_bps = ambr_ul;
+                            b.ambr_dl_bps = ambr_dl;
                         }
                     }
                 }
+            } else {
+                log::warn!("No PFCP session found for modification: ref={sm_context_ref}");
             }
+
+            // N1: PDU Session Modification Command (PTI echoed, authorized AMBR)
+            let n1_mod_cmd = policy::build_modification_command(psi, pti, ambr_dl, ambr_ul);
+
+            // N2 SM Info: QoS flow modification for gNB (QFI + confirm)
+            let n2_sm_info = vec![qfi, 0x01];
+
+            let response_body = serde_json::json!({
+                "n1SmMsg": base64::engine::general_purpose::STANDARD.encode(&n1_mod_cmd),
+                "n2SmInfo": base64::engine::general_purpose::STANDARD.encode(&n2_sm_info),
+                "n2SmInfoType": "PDU_RES_MOD_REQ"
+            });
+            SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
         }
 
-        let response_body = serde_json::json!({
-            "upCnxState": "ACTIVATED"
-        });
-
-        return SbiResponse::with_status(200)
-            .with_body(response_body.to_string(), "application/json");
-    }
-
-    // UE-initiated PDU Session Modification: AMF forwards N1 SM info from UE
-    if n2_sm_info_type == "PDU_RES_MOD_REQ" {
-        use base64::Engine;
-
-        let n1_sm_msg = req_body["n1SmMsg"]
-            .as_str()
-            .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-            .expect("value expected");
-
-        if n1_sm_msg.len() < 4 {
-            log::warn!(
-                "SM Context Update: N1 SM msg too short ({} bytes)",
-                n1_sm_msg.len()
-            );
-            return SbiResponse::with_status(400);
+        // gNB confirmed a modification / released resources / reported
+        // secondary-RAT usage — acknowledge.
+        "PDU_RES_MOD_RSP" | "PDU_RES_REL_RSP" | "SECONDARY_RAT_USAGE" => {
+            log::info!("SM Context Update ({n2_sm_info_type}) acknowledged for ref={sm_context_ref}");
+            SbiResponse::with_status(200)
+                .with_body(serde_json::json!({}).to_string(), "application/json")
         }
 
-        let psi: u8 = sm_context_ref.parse().unwrap_or(1);
-        log::info!(
-            "SM Context Update (Modification): PSI={}, N1 SM msg len={}",
-            psi,
-            n1_sm_msg.len()
-        );
-
-        // Look up UPF SEID for PFCP session modification with updated QoS (from SmfContext)
-        let upf_seid = smf_self().read().ok().and_then(|ctx| {
-            ctx.pfcp_sessions
-                .read()
-                .ok()
-                .and_then(|sessions| sessions.get(sm_context_ref).copied())
-        });
-
-        if let Some(seid) = upf_seid {
-            // Build PFCP modification with QoS update (modify QER on existing
-            // PDRs) and send it through the single transaction engine
-            let params = n4_build::SessionModificationParams {
-                update_qers: vec![n4_build::QerParams {
-                    qer_id: 1,
-                    gate_status: (0, 0),                   // Both gates open
-                    mbr: Some((100_000_000, 100_000_000)), // 100 Mbps UL/DL
-                    gbr: None,
-                    qfi: Some(1),
-                }],
-                ..Default::default()
-            };
-            let payload = n4_build::build_session_modification_request(&params);
-
-            match pfcp_path::global_client() {
-                Some(client) => match client
-                    .request(
-                        pfcp_path::pfcp_message_type::SESSION_MODIFICATION_REQUEST,
-                        Some(seid),
-                        &payload,
-                    )
-                    .await
-                {
-                    Ok((_, resp_body)) => match pfcp_path::parse_cause(&resp_body) {
-                        Some(pfcp_path::pfcp_cause::REQUEST_ACCEPTED) => {
-                            log::info!(
-                                "PFCP Session Modification (QoS) accepted: UPF SEID=0x{seid:016x}"
-                            );
-                        }
-                        cause => {
-                            log::error!(
-                                "PFCP Session Modification (QoS) rejected: cause={cause:?}"
-                            );
-                            return SbiResponse::with_status(504);
-                        }
-                    },
-                    Err(e) => {
-                        log::error!("PFCP Session Modification (QoS) failed: {e}");
+        // No N2 payload: UP connection-state change request
+        "" => {
+            let up_cnx_state = req_body["upCnxState"].as_str().unwrap_or("");
+            if up_cnx_state == "DEACTIVATED" {
+                // UE went idle: buffer downlink traffic at the UPF
+                if let Some(upf_seid) = lookup_upf_seid(sm_context_ref) {
+                    if let Err(e) = pfcp_deactivate_dl_far(upf_seid).await {
+                        log::warn!("DL FAR deactivation failed: {e}");
                         return SbiResponse::with_status(504);
                     }
-                },
-                None => {
-                    log::error!("PFCP client not initialised");
-                    return SbiResponse::with_status(500);
                 }
+                let response_body = serde_json::json!({ "upCnxState": "DEACTIVATED" });
+                return SbiResponse::with_status(200)
+                    .with_body(response_body.to_string(), "application/json");
             }
-        } else {
-            log::warn!("No PFCP session found for modification: ref={sm_context_ref}");
+            // Default: treat as activation confirmation
+            let response_body = serde_json::json!({ "upCnxState": "ACTIVATED" });
+            SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
         }
 
-        // Build N1 SM message: PDU Session Modification Command (0xCB)
-        let mut n1_mod_cmd = Vec::new();
-        n1_mod_cmd.push(0x2E); // Extended protocol discriminator: 5GSM
-        n1_mod_cmd.push(psi); // PDU session identity
-        n1_mod_cmd.push(0x01); // PTI
-        n1_mod_cmd.push(0xCB); // PDU Session Modification Command message type
-
-        // Build N2 SM Info: QoS flow modification for gNB
-        // Format: QFI (1) + modification indicator
-        let qfi: u8 = 1; // Default QoS flow
-        let mut n2_sm_info = Vec::new();
-        n2_sm_info.push(qfi);
-        n2_sm_info.push(0x01); // Modification confirm indicator
-
-        let response_body = serde_json::json!({
-            "n1SmMsg": base64::engine::general_purpose::STANDARD.encode(&n1_mod_cmd),
-            "n2SmInfo": base64::engine::general_purpose::STANDARD.encode(&n2_sm_info),
-            "n2SmInfoType": "PDU_RES_MOD_REQ"
-        });
-
-        return SbiResponse::with_status(200)
-            .with_body(response_body.to_string(), "application/json");
+        other => {
+            log::warn!("SM Context Update: unsupported n2SmInfoType '{other}'");
+            problem_400("N2_SM_ERROR", &format!("unsupported n2SmInfoType {other}"))
+        }
     }
-
-    // Default response for unrecognized update types
-    let response_body = serde_json::json!({
-        "upCnxState": "ACTIVATED"
-    });
-
-    SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
 }
 
-/// Handle SM Context Release
+/// Handle SM Context Release (TS 29.502 §5.2.2.4)
 ///
-/// Sends PFCP Session Deletion Request to UPF to release the N4 session,
-/// then removes session state.
+/// Deletes the PCF SM policy association (Npcf_SMPolicyControl_Delete,
+/// TS 29.512 §4.2.5), sends PFCP Session Deletion to the UPF, releases the
+/// UE IP and removes session state. The GSM FSM is driven through
+/// WaitPfcpDeletion to release.
 async fn handle_sm_context_release(sm_context_ref: &str) -> SbiResponse {
     log::info!("SM Context Release request for ref={sm_context_ref}");
 
-    // Look up UPF SEID for this session (from SmfContext, not a global)
-    let upf_seid = smf_self().read().ok().and_then(|ctx| {
-        ctx.pfcp_sessions
-            .read()
+    // Take the policy binding (copy out, drop guards before any await)
+    let binding = smf_self().read().ok().and_then(|ctx| {
+        ctx.policy_bindings
+            .write()
             .ok()
-            .and_then(|sessions| sessions.get(sm_context_ref).copied())
+            .and_then(|mut bindings| bindings.remove(sm_context_ref))
     });
+
+    // Drive the GSM FSM: Operational → WaitPfcpDeletion
+    let mut fsm = binding.as_ref().map(|b| b.fsm.clone());
+    if let Some(ref mut f) = fsm {
+        let mut ev = event::SmfEvent::sbi_server(
+            0,
+            event::SbiRequest {
+                method: "POST".to_string(),
+                uri: format!("/nsmf-pdusession/v1/sm-contexts/{sm_context_ref}/release"),
+                body: None,
+            },
+        );
+        if let Some(ref mut sbi) = ev.sbi {
+            sbi.message = Some(event::SbiMessage {
+                service_name: "nsmf-pdusession".to_string(),
+                resource_components: vec![
+                    "sm-contexts".to_string(),
+                    sm_context_ref.to_string(),
+                    "release".to_string(),
+                ],
+                ..Default::default()
+            });
+        }
+        f.dispatch(&ev);
+    }
+
+    // N7: delete the SM policy association at the PCF
+    if let Some(ref b) = binding {
+        if let Some(ref pol_id) = b.sm_policy_id {
+            match policy::resolve_pcf_endpoint().await {
+                Some(pcf) => match policy::sm_policy_delete(&pcf, pol_id).await {
+                    Ok(()) => log::info!("SM policy association {pol_id} deleted at PCF"),
+                    Err(e) => log::warn!("SM policy delete failed: {e} (continuing release)"),
+                },
+                None => log::warn!("PCF unresolved — skipping SM policy delete"),
+            }
+        }
+    }
+
+    // Look up UPF SEID for this session (from SmfContext, not a global)
+    let upf_seid = lookup_upf_seid(sm_context_ref);
 
     if let Some(seid) = upf_seid {
         // Send PFCP Session Deletion Request to UPF (with retransmission)
         match pfcp_session_delete(seid).await {
             Ok(()) => {
                 log::info!("PFCP Session Deleted: UPF SEID=0x{seid:016x} for ref={sm_context_ref}");
+                if let Some(ref mut f) = fsm {
+                    // WaitPfcpDeletion → release path
+                    f.dispatch(&event::SmfEvent::n4_message(0, 0, Vec::new()));
+                }
             }
             Err(e) => {
                 // The local context is removed anyway: keeping it would leak
@@ -1563,6 +2071,13 @@ async fn handle_sm_context_release(sm_context_ref: &str) -> SbiResponse {
         }
     } else {
         log::warn!("No PFCP session found for sm_context_ref={sm_context_ref}");
+    }
+
+    // Release the UE IP allocated for this session
+    if let Some(ref b) = binding {
+        if let Ok(ctx) = smf_self().read() {
+            ctx.ipv4_pool.release(std::net::Ipv4Addr::from(b.ue_ip));
+        }
     }
 
     // Remove from SMF context
@@ -1694,9 +2209,79 @@ async fn handle_event_unsubscribe(subscription_id: &str) -> SbiResponse {
 // Callback Handlers
 // =============================================================================
 
-/// Handle SM Policy Notification (from PCF)
-async fn handle_sm_policy_notify(sm_context_ref: &str) -> SbiResponse {
-    log::info!("SM Policy notification for ref={sm_context_ref}");
+/// Handle SM Policy Update Notification (from PCF, TS 29.512 §4.2.3.2):
+/// the SmPolicyNotification carries an SmPolicyDecision whose authorized
+/// session AMBR / default QoS is applied to the session's N4 QER.
+async fn handle_sm_policy_notify(sm_context_ref: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("SM Policy update notification for ref={sm_context_ref}");
+
+    let Some(body) = request
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+    else {
+        return problem_400("INVALID_MSG_FORMAT", "SmPolicyNotification body required");
+    };
+
+    let Some(binding) = lookup_policy_binding(sm_context_ref) else {
+        return send_not_found(
+            &format!("No SM context for ref={sm_context_ref}"),
+            Some("CONTEXT_NOT_FOUND"),
+        );
+    };
+
+    // The decision may be nested (smPolicyDecision) or top-level
+    let decision_json = body.get("smPolicyDecision").unwrap_or(&body);
+    let pol_id = binding.sm_policy_id.clone().unwrap_or_default();
+    let dec = policy::parse_sm_policy_decision(&pol_id, decision_json);
+
+    log::info!(
+        "Applying PCF-updated policy to ref={sm_context_ref}: AMBR UL/DL={}/{} bps, 5QI={}",
+        dec.sess_ambr_ul_bps,
+        dec.sess_ambr_dl_bps,
+        dec.def_five_qi
+    );
+
+    // Apply to the N4 session QER (copy SEID out, no guards across await)
+    if let Some(seid) = lookup_upf_seid(sm_context_ref) {
+        if let Err(e) =
+            pfcp_update_session_qer(seid, binding.qfi, dec.sess_ambr_ul_bps, dec.sess_ambr_dl_bps)
+                .await
+        {
+            log::error!("Failed to apply PCF-updated QoS: {e}");
+            return SbiResponse::with_status(504);
+        }
+    }
+
+    // Persist the updated AMBR in the binding
+    if let Ok(ctx) = smf_self().read() {
+        if let Ok(mut bindings) = ctx.policy_bindings.write() {
+            if let Some(b) = bindings.get_mut(sm_context_ref) {
+                b.ambr_ul_bps = dec.sess_ambr_ul_bps;
+                b.ambr_dl_bps = dec.sess_ambr_dl_bps;
+                b.five_qi = dec.def_five_qi;
+            }
+        }
+    }
+
+    SbiResponse::with_status(204)
+}
+
+/// Handle SM Policy Termination Notification (from PCF, TS 29.512 §4.2.3.3):
+/// the PCF requests release of the policy association — the SMF tears the
+/// PDU session down (PFCP delete + resource release).
+async fn handle_sm_policy_terminate(sm_context_ref: &str) -> SbiResponse {
+    log::warn!("SM Policy termination requested by PCF for ref={sm_context_ref}");
+    if lookup_policy_binding(sm_context_ref).is_none() {
+        return send_not_found(
+            &format!("No SM context for ref={sm_context_ref}"),
+            Some("CONTEXT_NOT_FOUND"),
+        );
+    }
+    // Re-use the release path (PFCP deletion, IP release, FSM, binding drop).
+    // The SM policy delete inside is a no-op risk-wise: the PCF asked for it.
+    handle_sm_context_release(sm_context_ref).await;
     SbiResponse::with_status(204)
 }
 

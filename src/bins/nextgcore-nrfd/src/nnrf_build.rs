@@ -114,6 +114,12 @@ fn build_notification_json(data: &NotificationData) -> Option<String> {
 
 /// Build NF profile JSON
 fn build_nf_profile_json(profile: &NfProfile) -> Option<String> {
+    // Profiles registered through the SBI path carry the full NFProfile
+    // document — notify subscribers with every attribute, not a summary.
+    if profile.attributes.is_object() {
+        return Some(profile.to_json().to_string());
+    }
+
     let mut json = String::from("{");
 
     // Required fields
@@ -188,9 +194,8 @@ mod tests {
                 mnc: "01".to_string(),
             }],
             ipv4_addresses: vec!["192.168.1.1".to_string()],
-            ipv6_addresses: vec![],
             fqdn: Some("amf.example.com".to_string()),
-            nf_services: vec![],
+            ..Default::default()
         }
     }
 

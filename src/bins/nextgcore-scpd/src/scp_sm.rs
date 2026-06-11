@@ -251,8 +251,9 @@ impl ScpSmContext {
                 log::debug!("NF discover response received");
                 if let Some(sbi_xact_id) = event.sbi_xact_id {
                     log::debug!("SBI xact ID: {sbi_xact_id}");
-                    // Note: Handle NF discovery result and forward original request
-                    // Discovery result processing is handled by the sbi_path module's handle_nf_discover_response
+                    // Delegated discovery and request forwarding run inline
+                    // in the proxy data path (crate::proxy::ScpProxy), not
+                    // through the event machine.
                 }
             }
             _ => {

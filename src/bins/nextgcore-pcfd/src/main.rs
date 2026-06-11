@@ -300,8 +300,17 @@ async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let resource = parts[2];
 
     match (service, resource, method) {
-        // AM Policy Control Service (npcf-am-policy-control)
-        ("npcf-am-policy-control", "policies", "POST") => {
+        // AM Policy Control Service (npcf-am-policy-control, TS 29.507)
+        // Note: order matters — guarded sub-resource arms first. The update
+        // operation is POST /policies/{polAssoId}/update (TS 29.507 §4.2.4),
+        // NOT PATCH; the PATCH arm is kept only for backward compatibility.
+        ("npcf-am-policy-control", "policies", "POST")
+            if parts.len() >= 5 && parts[4] == "update" =>
+        {
+            let pol_asso_id = parts[3];
+            handle_am_policy_update(pol_asso_id, &request).await
+        }
+        ("npcf-am-policy-control", "policies", "POST") if parts.len() < 4 => {
             // Create AM Policy Association
             handle_am_policy_create(&request).await
         }
@@ -316,21 +325,28 @@ async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             handle_am_policy_delete(pol_asso_id).await
         }
         ("npcf-am-policy-control", "policies", "PATCH") if parts.len() >= 4 => {
-            // Update AM Policy Association
+            // Legacy update path (kept for backward compatibility)
             let pol_asso_id = parts[3];
             handle_am_policy_update(pol_asso_id, &request).await
         }
 
-        // SM Policy Control Service (npcf-smpolicycontrol)
+        // SM Policy Control Service (npcf-smpolicycontrol, TS 29.512)
         // Note: Order matters - more specific patterns first
         ("npcf-smpolicycontrol", "sm-policies", "POST")
             if parts.len() >= 5 && parts[4] == "update" =>
         {
-            // Update SM Policy (POST with update action)
+            // Update SM Policy (TS 29.512 §4.2.4: POST /sm-policies/{id}/update)
             let sm_policy_id = parts[3];
             handle_sm_policy_update_notify(sm_policy_id, &request).await
         }
-        ("npcf-smpolicycontrol", "sm-policies", "POST") => {
+        ("npcf-smpolicycontrol", "sm-policies", "POST")
+            if parts.len() >= 5 && parts[4] == "delete" =>
+        {
+            // Delete SM Policy (TS 29.512 §4.2.5: POST /sm-policies/{id}/delete)
+            let sm_policy_id = parts[3];
+            handle_sm_policy_delete(sm_policy_id).await
+        }
+        ("npcf-smpolicycontrol", "sm-policies", "POST") if parts.len() < 4 => {
             // Create SM Policy
             handle_sm_policy_create(&request).await
         }
@@ -340,7 +356,7 @@ async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             handle_sm_policy_get(sm_policy_id).await
         }
         ("npcf-smpolicycontrol", "sm-policies", "DELETE") if parts.len() >= 4 => {
-            // Delete SM Policy
+            // Legacy delete path (kept for backward compatibility)
             let sm_policy_id = parts[3];
             handle_sm_policy_delete(sm_policy_id).await
         }
@@ -568,30 +584,47 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let supi = policy_data
-        .get("supi")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let pdu_session_id = policy_data
+    // ---- SmPolicyContextData mandatory attributes (TS 29.512 §5.6.2.3) ----
+    let Some(supi) = policy_data.get("supi").and_then(|v| v.as_str()) else {
+        return send_bad_request("supi is required", Some("MANDATORY_IE_MISSING"));
+    };
+    let Some(pdu_session_id) = policy_data
         .get("pduSessionId")
         .and_then(|v| v.as_u64())
-        .unwrap_or(1) as u8;
-    let dnn = policy_data
-        .get("dnn")
-        .and_then(|v| v.as_str())
-        .unwrap_or("internet");
-    let sst = policy_data
-        .get("sliceInfo")
-        .and_then(|s| s.get("sNssai"))
+        .map(|v| v as u8)
+    else {
+        return send_bad_request("pduSessionId is required", Some("MANDATORY_IE_MISSING"));
+    };
+    let Some(dnn) = policy_data.get("dnn").and_then(|v| v.as_str()) else {
+        return send_bad_request("dnn is required", Some("MANDATORY_IE_MISSING"));
+    };
+    if policy_data.get("pduSessionType").and_then(|v| v.as_str()).is_none() {
+        return send_bad_request("pduSessionType is required", Some("MANDATORY_IE_MISSING"));
+    }
+    let Some(notification_uri) = policy_data.get("notificationUri").and_then(|v| v.as_str())
+    else {
+        return send_bad_request("notificationUri is required", Some("MANDATORY_IE_MISSING"));
+    };
+    // sliceInfo is an Snssai (TS 29.512: {"sst": N, "sd": "..."}); the legacy
+    // nested {"sNssai": {...}} form is still accepted for compatibility.
+    let slice_info = policy_data.get("sliceInfo");
+    let slice_obj = slice_info
+        .and_then(|s| if s.get("sst").is_some() { Some(s) } else { s.get("sNssai") });
+    let Some(sst) = slice_obj
         .and_then(|s| s.get("sst"))
         .and_then(|v| v.as_u64())
-        .unwrap_or(1) as u8;
-    let sd = policy_data
-        .get("sliceInfo")
-        .and_then(|s| s.get("sNssai"))
+        .map(|v| v as u8)
+    else {
+        return send_bad_request("sliceInfo.sst is required", Some("MANDATORY_IE_MISSING"));
+    };
+    let sd = slice_obj
         .and_then(|s| s.get("sd"))
         .and_then(|v| v.as_str())
         .and_then(|s| u32::from_str_radix(s, 16).ok());
+    let ipv4_address = policy_data
+        .get("ipv4Address")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
 
     let ctx = pcf_self();
 
@@ -614,7 +647,7 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
     });
 
     match sess {
-        Some(sess) => {
+        Some(mut sess) => {
             log::info!(
                 "SM Policy created for SUPI {} PDU Session {} (id={})",
                 supi,
@@ -622,20 +655,44 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
                 sess.sm_policy_id
             );
 
+            // Persist context data needed for outbound notifications
+            sess.notification_uri = Some(notification_uri.to_string());
+            sess.dnn = Some(dnn.to_string());
+            sess.s_nssai = SNssai { sst, sd };
+            if let Some(ref ip) = ipv4_address {
+                sess.set_ipv4addr(ip);
+            }
+            if let Ok(context) = ctx.read() {
+                context.sess_update(&sess);
+            }
+
             // Query real session data from UDR/database
             let s_nssai = SNssai { sst, sd };
             let session_data = pcf_get_session_data(supi, None, &s_nssai, dnn);
 
-            // Build policy decision from subscription data (TS 29.512)
-            let (sess_rules, pcc_rules, qos_decs, triggers) = if let Some(ref sd) = session_data {
-                build_sm_policy_decision(&sess.sm_policy_id, sd)
-            } else {
-                (
-                    serde_json::json!({}),
-                    serde_json::json!({}),
-                    serde_json::json!({}),
-                    vec![],
-                )
+            // Build policy decision from subscription data (TS 29.512).
+            // When the DB has no policy data for this DNN/slice, the
+            // config-default session data is used (documented fallback).
+            let decision = match session_data {
+                Some(ref sd) => build_sm_policy_decision(&sess.sm_policy_id, sd),
+                None => {
+                    log::warn!(
+                        "No subscription policy data for dnn={dnn} sst={sst} — \
+                         using config-default session data (5QI=9, AMBR 100/100 Mbps)"
+                    );
+                    build_sm_policy_decision(
+                        &sess.sm_policy_id,
+                        &nudr_handler::SessionData {
+                            qos_index: 9,
+                            arp_priority_level: 8,
+                            arp_preempt_cap: false,
+                            arp_preempt_vuln: true,
+                            ambr_uplink: 100_000_000,
+                            ambr_downlink: 100_000_000,
+                            pcc_rules: vec![],
+                        },
+                    )
+                }
             };
 
             SbiResponse::with_status(201)
@@ -647,10 +704,12 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
                     "smPolicyId": sess.sm_policy_id,
                     "supi": supi,
                     "pduSessionId": pdu_session_id,
-                    "sessRules": sess_rules,
-                    "pccRules": pcc_rules,
-                    "qosDecs": qos_decs,
-                    "policyCtrlReqTriggers": triggers,
+                    "sessRules": decision.sess_rules,
+                    "pccRules": decision.pcc_rules,
+                    "qosDecs": decision.qos_decs,
+                    "chgDecs": decision.chg_decs,
+                    "traffContDecs": decision.traff_cont_decs,
+                    "policyCtrlReqTriggers": decision.triggers,
                     "suppFeat": policy_data.get("suppFeat").and_then(|v| v.as_str()).unwrap_or(""),
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(201))
@@ -659,19 +718,29 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
     }
 }
 
+/// The parts of an SmPolicyDecision (TS 29.512 §5.6.2.4)
+pub struct SmPolicyDecisionParts {
+    pub sess_rules: serde_json::Value,
+    pub pcc_rules: serde_json::Value,
+    pub qos_decs: serde_json::Value,
+    /// Charging decisions referenced from PCC rules via refChgData
+    pub chg_decs: serde_json::Value,
+    /// Traffic-control decisions referenced from PCC rules via refTcData
+    pub traff_cont_decs: serde_json::Value,
+    pub triggers: Vec<String>,
+}
+
 /// Build a complete SM Policy Decision from session data (TS 29.512)
 ///
-/// Generates session rules, PCC rules, QoS decisions, and policy control
-/// request triggers based on subscription data from UDR.
+/// Generates session rules, PCC rules, QoS decisions, charging decisions
+/// (chgDecs), traffic-control decisions (traffContDecs) and policy control
+/// request triggers based on subscription data from UDR. When the
+/// subscription carries no PCC rules a default match-all rule is generated
+/// so that charging and traffic-control decisions always apply.
 fn build_sm_policy_decision(
     sm_policy_id: &str,
     session_data: &nudr_handler::SessionData,
-) -> (
-    serde_json::Value,
-    serde_json::Value,
-    serde_json::Value,
-    Vec<String>,
-) {
+) -> SmPolicyDecisionParts {
     let sess_rule_id = format!("SessRule-{sm_policy_id}");
     let def_qos_id = format!("QosDec-{sm_policy_id}");
 
@@ -707,16 +776,47 @@ fn build_sm_policy_decision(
         }),
     );
 
-    // PCC rules from database subscription data
     let mut pcc_map = serde_json::Map::new();
-    for rule in &session_data.pcc_rules {
+    let mut chg_map = serde_json::Map::new();
+    let mut tc_map = serde_json::Map::new();
+
+    // Closure: charging decision per rule (TS 29.512 §5.6.2.11 ChargingData)
+    let mut add_chg_dec = |rule_key: &str, rating_group: u32| -> String {
+        let chg_id = format!("ChgDec-{rule_key}");
+        chg_map.insert(
+            chg_id.clone(),
+            serde_json::json!({
+                "chgId": chg_id,
+                "ratingGroup": rating_group,
+                "meteringMethod": "VOLUME",
+                "offline": true,
+                "online": false,
+            }),
+        );
+        chg_id
+    };
+    // Closure: traffic-control decision per rule (TS 29.512 §5.6.2.10)
+    let mut add_tc_dec = |rule_key: &str, enabled: bool| -> String {
+        let tc_id = format!("TcDec-{rule_key}");
+        tc_map.insert(
+            tc_id.clone(),
+            serde_json::json!({
+                "tcId": tc_id,
+                "flowStatus": if enabled { "ENABLED" } else { "DISABLED" },
+            }),
+        );
+        tc_id
+    };
+
+    // PCC rules from database subscription data
+    for (i, rule) in session_data.pcc_rules.iter().enumerate() {
         let rule_qos_id = format!("QosDec-pcc-{}", rule.id);
 
         let flows: Vec<serde_json::Value> = rule
             .flows
             .iter()
             .enumerate()
-            .map(|(i, f)| {
+            .map(|(j, f)| {
                 serde_json::json!({
                     "flowDescription": f.description,
                     "flowDirection": match f.direction {
@@ -724,10 +824,17 @@ fn build_sm_policy_decision(
                         nudr_handler::FlowDirection::Downlink => "DOWNLINK",
                         _ => "BIDIRECTIONAL",
                     },
-                    "packFiltId": format!("pf-{}-{}", rule.id, i),
+                    "packFiltId": format!("pf-{}-{}", rule.id, j),
                 })
             })
             .collect();
+
+        let enabled = !matches!(
+            rule.flow_status,
+            npcf_handler::FlowStatus::Disabled | npcf_handler::FlowStatus::Removed
+        );
+        let chg_id = add_chg_dec(&rule.id, (i + 1) as u32);
+        let tc_id = add_tc_dec(&rule.id, enabled);
 
         pcc_map.insert(
             rule.id.clone(),
@@ -736,6 +843,8 @@ fn build_sm_policy_decision(
                 "precedence": rule.precedence,
                 "flowInfos": flows,
                 "refQosData": [&rule_qos_id],
+                "refChgData": [chg_id],
+                "refTcData": [tc_id],
             }),
         );
 
@@ -749,6 +858,30 @@ fn build_sm_policy_decision(
         );
     }
 
+    // Default match-all PCC rule (lowest precedence) so charging and
+    // traffic-control decisions always exist for the session.
+    if session_data.pcc_rules.is_empty() {
+        let rule_key = format!("default-{sm_policy_id}");
+        let rule_id = format!("PccRule-{rule_key}");
+        let chg_id = add_chg_dec(&rule_key, 1);
+        let tc_id = add_tc_dec(&rule_key, true);
+        pcc_map.insert(
+            rule_id.clone(),
+            serde_json::json!({
+                "pccRuleId": rule_id,
+                "precedence": 255,
+                "flowInfos": [{
+                    "flowDescription": "permit out ip from any to assigned",
+                    "flowDirection": "BIDIRECTIONAL",
+                    "packFiltId": format!("pf-{rule_key}-0"),
+                }],
+                "refQosData": [&def_qos_id],
+                "refChgData": [chg_id],
+                "refTcData": [tc_id],
+            }),
+        );
+    }
+
     // Policy control request triggers (TS 29.512 Table 5.6.2.6-1)
     let triggers = vec![
         "SE_AMBR_CH".to_string(), // Session AMBR change
@@ -757,23 +890,26 @@ fn build_sm_policy_decision(
         "PLMN_CH".to_string(),    // Serving network change
         "AC_TY_CH".to_string(),   // Access type change
         "RAT_TY_CH".to_string(),  // RAT type change
+        "RES_MO_RE".to_string(),  // UE-initiated resource modification
     ];
 
-    (
+    SmPolicyDecisionParts {
         sess_rules,
-        serde_json::Value::Object(pcc_map),
-        serde_json::Value::Object(qos_map),
+        pcc_rules: serde_json::Value::Object(pcc_map),
+        qos_decs: serde_json::Value::Object(qos_map),
+        chg_decs: serde_json::Value::Object(chg_map),
+        traff_cont_decs: serde_json::Value::Object(tc_map),
         triggers,
-    )
+    }
 }
 
 /// Format bitrate as a human-readable string per 3GPP TS 29.571
 fn format_bitrate(bps: u64) -> String {
-    if bps >= 1_000_000_000 && bps % 1_000_000_000 == 0 {
+    if bps >= 1_000_000_000 && bps.is_multiple_of(1_000_000_000) {
         format!("{} Gbps", bps / 1_000_000_000)
-    } else if bps >= 1_000_000 && bps % 1_000_000 == 0 {
+    } else if bps >= 1_000_000 && bps.is_multiple_of(1_000_000) {
         format!("{} Mbps", bps / 1_000_000)
-    } else if bps >= 1_000 && bps % 1_000 == 0 {
+    } else if bps >= 1_000 && bps.is_multiple_of(1_000) {
         format!("{} Kbps", bps / 1_000)
     } else {
         format!("{bps} bps")
@@ -854,7 +990,9 @@ async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest
 
     match sess {
         Some(sess) => {
-            // Process reported triggers from SMF
+            // Process reported triggers from SMF. repPolicyCtrlReqTriggers
+            // is optional in SmPolicyUpdateContextData (TS 29.512 §5.6.2.5)
+            // — its absence must NOT panic (was an .expect() 500/abort path).
             let triggers = update_data
                 .get("repPolicyCtrlReqTriggers")
                 .and_then(|v| v.as_array())
@@ -863,7 +1001,7 @@ async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest
                         .filter_map(|v| v.as_str().map(String::from))
                         .collect::<Vec<_>>()
                 })
-                .expect("value expected");
+                .unwrap_or_default();
 
             log::info!(
                 "SM Policy Update triggers: {:?} for session PSI={}",
@@ -890,6 +1028,8 @@ async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest
             // Build updated policy decision based on triggers
             let mut pcc_rules = serde_json::Map::new();
             let mut qos_decs = serde_json::Map::new();
+            let mut chg_decs = serde_json::Map::new();
+            let mut tc_decs = serde_json::Map::new();
 
             // If UE requested resource modification, generate new PCC rules
             if let Some(ue_req) = update_data.get("ueInitResReq") {
@@ -909,6 +1049,23 @@ async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest
 
                 let rule_id = format!("PccRule-ue-{}", sess.sm_policy_id);
                 let qos_ref = format!("QosDec-ue-{}", sess.sm_policy_id);
+                let chg_ref = format!("ChgDec-ue-{}", sess.sm_policy_id);
+                let tc_ref = format!("TcDec-ue-{}", sess.sm_policy_id);
+
+                chg_decs.insert(
+                    chg_ref.clone(),
+                    serde_json::json!({
+                        "chgId": chg_ref,
+                        "ratingGroup": 1,
+                        "meteringMethod": "VOLUME",
+                        "offline": true,
+                        "online": false,
+                    }),
+                );
+                tc_decs.insert(
+                    tc_ref.clone(),
+                    serde_json::json!({ "tcId": tc_ref, "flowStatus": "ENABLED" }),
+                );
 
                 pcc_rules.insert(
                     rule_id.clone(),
@@ -916,6 +1073,8 @@ async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest
                         "pccRuleId": rule_id,
                         "precedence": 100,
                         "refQosData": [&qos_ref],
+                        "refChgData": [&chg_ref],
+                        "refTcData": [&tc_ref],
                     }),
                 );
 
@@ -967,6 +1126,8 @@ async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest
                     "sessRules": sess_rules,
                     "pccRules": serde_json::Value::Object(pcc_rules),
                     "qosDecs": serde_json::Value::Object(qos_decs),
+                    "chgDecs": serde_json::Value::Object(chg_decs),
+                    "traffContDecs": serde_json::Value::Object(tc_decs),
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }
@@ -992,10 +1153,47 @@ async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    // For now, just create a dummy app session
-    let app_session_id = uuid::Uuid::new_v4().to_string();
+    let notif_uri = session_data
+        .get("notifUri")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
 
-    log::info!("App Session created (id={app_session_id})");
+    // Bind the AF session to the PCC session via the UE IP (TS 29.514
+    // AppSessionContextReqData.ueIpv4) so AF-triggered PCC rule changes can
+    // be pushed to the SMF.
+    let ue_ipv4 = session_data.get("ueIpv4").and_then(|v| v.as_str());
+    let ctx = pcf_self();
+    let bound_sess = ue_ipv4.and_then(|ip| {
+        ctx.read()
+            .ok()
+            .and_then(|context| context.sess_find_by_ipv4addr(ip))
+    });
+
+    let app = bound_sess.as_ref().and_then(|sess| {
+        ctx.read().ok().and_then(|context| {
+            context.app_add(sess.id).map(|app0| {
+                let mut app = app0;
+                app.notif_uri = notif_uri.clone();
+                context.app_update(&app);
+                app
+            })
+        })
+    });
+
+    let app_session_id = app
+        .as_ref()
+        .map(|a| a.app_session_id.clone())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // AF media components install PCC rules at the SMF: push the SM policy
+    // update notification (real HTTP POST, TS 29.512 §4.2.3.2).
+    if let Some(ref sess) = bound_sess {
+        pcf_sbi_send_smpolicycontrol_update_notify(sess.id);
+    } else if ue_ipv4.is_some() {
+        log::warn!("App session create: no PCC session bound to ueIpv4={ue_ipv4:?}");
+    }
+
+    log::info!("App Session created (id={app_session_id}, bound={})", bound_sess.is_some());
 
     SbiResponse::with_status(201)
         .with_header(
@@ -1047,6 +1245,9 @@ async fn handle_app_session_delete(app_session_id: &str) -> SbiResponse {
 
     match app {
         Some(app) => {
+            // Removing AF media components revokes their PCC rules at the
+            // SMF: push the SM policy delete/update notification.
+            pcf_sbi_send_smpolicycontrol_delete_notify(app.sess_id, app.id);
             if let Ok(context) = ctx.read() {
                 context.app_remove(app.id);
             }
@@ -1342,26 +1543,262 @@ mod tests {
             }],
         };
 
-        let (sess_rules, pcc_rules, qos_decs, triggers) =
-            build_sm_policy_decision("test-policy-1", &session_data);
+        let dec = build_sm_policy_decision("test-policy-1", &session_data);
 
         // Verify session rules
-        let sr = &sess_rules["SessRule-test-policy-1"];
+        let sr = &dec.sess_rules["SessRule-test-policy-1"];
         assert_eq!(sr["authDefQos"]["5qi"], 9);
         assert_eq!(sr["authSessAmbr"]["uplink"], "100 Mbps");
         assert_eq!(sr["authSessAmbr"]["downlink"], "200 Mbps");
 
         // Verify PCC rules from subscription
-        let pcc = &pcc_rules["rule-1"];
+        let pcc = &dec.pcc_rules["rule-1"];
         assert_eq!(pcc["precedence"], 50);
         assert!(!pcc["flowInfos"].as_array().unwrap().is_empty());
 
         // Verify QoS decisions (default + per-rule)
-        assert!(qos_decs.get("QosDec-test-policy-1").is_some());
-        assert!(qos_decs.get("QosDec-pcc-rule-1").is_some());
+        assert!(dec.qos_decs.get("QosDec-test-policy-1").is_some());
+        assert!(dec.qos_decs.get("QosDec-pcc-rule-1").is_some());
+
+        // Verify chgDecs + traffContDecs exist and are referenced
+        assert!(dec.chg_decs.get("ChgDec-rule-1").is_some());
+        assert!(dec.traff_cont_decs.get("TcDec-rule-1").is_some());
+        assert_eq!(pcc["refChgData"][0], "ChgDec-rule-1");
+        assert_eq!(pcc["refTcData"][0], "TcDec-rule-1");
+        assert_eq!(dec.chg_decs["ChgDec-rule-1"]["meteringMethod"], "VOLUME");
 
         // Verify triggers
-        assert!(triggers.contains(&"SE_AMBR_CH".to_string()));
-        assert!(triggers.contains(&"DEF_QOS_CH".to_string()));
+        assert!(dec.triggers.contains(&"SE_AMBR_CH".to_string()));
+        assert!(dec.triggers.contains(&"DEF_QOS_CH".to_string()));
+        assert!(dec.triggers.contains(&"RES_MO_RE".to_string()));
+    }
+
+    #[test]
+    fn test_decision_without_subscription_rules_gets_default_rule_with_chg_tc() {
+        let session_data = nudr_handler::SessionData {
+            qos_index: 9,
+            arp_priority_level: 8,
+            arp_preempt_cap: false,
+            arp_preempt_vuln: true,
+            ambr_uplink: 100_000_000,
+            ambr_downlink: 100_000_000,
+            pcc_rules: vec![],
+        };
+        let dec = build_sm_policy_decision("p2", &session_data);
+        let rule = &dec.pcc_rules["PccRule-default-p2"];
+        assert_eq!(rule["precedence"], 255);
+        assert!(dec.chg_decs.get("ChgDec-default-p2").is_some());
+        assert!(dec.traff_cont_decs.get("TcDec-default-p2").is_some());
+        assert_eq!(
+            rule["flowInfos"][0]["flowDescription"],
+            "permit out ip from any to assigned"
+        );
+    }
+
+    // ----- Handler-level tests (validation, panic regression, routing) -----
+
+    fn make_request(method: &str, uri: &str, body: Option<serde_json::Value>) -> SbiRequest {
+        let req = match method {
+            "GET" => SbiRequest::get(uri),
+            "DELETE" => SbiRequest::delete(uri),
+            _ => SbiRequest::post(uri),
+        };
+        match body {
+            Some(b) => req.with_json_body(&b).expect("encode test body"),
+            None => req,
+        }
+    }
+
+    fn full_create_body(supi: &str, psi: u8) -> serde_json::Value {
+        serde_json::json!({
+            "supi": supi,
+            "pduSessionId": psi,
+            "pduSessionType": "IPV4",
+            "dnn": "internet",
+            "notificationUri": "http://127.0.0.1:9/nsmf-callback/v1/sm-policy-notify/1",
+            "ipv4Address": "10.45.0.77",
+            "sliceInfo": { "sst": 1 },
+            "servingNetwork": { "mcc": "001", "mnc": "01" },
+            "suppFeat": "0"
+        })
+    }
+
+    #[tokio::test]
+    async fn sm_policy_create_missing_notification_uri_is_400() {
+        pcf_context_init(64, 64);
+        let mut body = full_create_body("imsi-001010000000050", 5);
+        body.as_object_mut().unwrap().remove("notificationUri");
+        let req = make_request("POST", "/npcf-smpolicycontrol/v1/sm-policies", Some(body));
+        let resp = pcf_sbi_request_handler(req).await;
+        assert_eq!(resp.status, 400);
+    }
+
+    #[tokio::test]
+    async fn sm_policy_update_without_triggers_does_not_panic() {
+        pcf_context_init(64, 64);
+        // Create
+        let req = make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(full_create_body("imsi-001010000000051", 6)),
+        );
+        let resp = pcf_sbi_request_handler(req).await;
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let pol_id = body["smPolicyId"].as_str().unwrap().to_string();
+        // chgDecs / traffContDecs present in the create decision
+        assert!(body["chgDecs"].as_object().is_some_and(|m| !m.is_empty()));
+        assert!(body["traffContDecs"].as_object().is_some_and(|m| !m.is_empty()));
+
+        // Update WITHOUT repPolicyCtrlReqTriggers (regression: .expect() panic)
+        let req = make_request(
+            "POST",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{pol_id}/update"),
+            Some(serde_json::json!({})),
+        );
+        let resp = pcf_sbi_request_handler(req).await;
+        assert_eq!(resp.status, 200);
+    }
+
+    #[tokio::test]
+    async fn sm_policy_delete_via_post_subresource() {
+        pcf_context_init(64, 64);
+        let req = make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(full_create_body("imsi-001010000000052", 7)),
+        );
+        let resp = pcf_sbi_request_handler(req).await;
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let pol_id = body["smPolicyId"].as_str().unwrap().to_string();
+
+        // TS 29.512 §4.2.5: POST /sm-policies/{id}/delete
+        let req = make_request(
+            "POST",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{pol_id}/delete"),
+            Some(serde_json::json!({})),
+        );
+        let resp = pcf_sbi_request_handler(req).await;
+        assert_eq!(resp.status, 204);
+
+        // Second delete → 404 (resource gone)
+        let req = make_request(
+            "POST",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{pol_id}/delete"),
+            Some(serde_json::json!({})),
+        );
+        let resp = pcf_sbi_request_handler(req).await;
+        assert_eq!(resp.status, 404);
+    }
+
+    /// Full smfd↔pcfd-shaped HTTP round trip against the REAL pcfd handler
+    /// served over a local ephemeral-port HTTP/2 server: SM policy
+    /// create → update → delete exactly as the SMF client drives them.
+    #[tokio::test]
+    async fn sm_policy_lifecycle_over_real_http() {
+        use ogs_sbi::client::{SbiClient, SbiClientConfig};
+        use ogs_sbi::server::{SbiServer, SbiServerConfig};
+
+        pcf_context_init(64, 64);
+
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .map(|a| a.port())
+            .expect("probe ephemeral port");
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let server = SbiServer::new(SbiServerConfig::new(addr));
+        server
+            .start(pcf_sbi_request_handler)
+            .await
+            .expect("start pcfd handler server");
+
+        let client = SbiClient::new(
+            SbiClientConfig::new("127.0.0.1", port)
+                .with_connect_timeout(Duration::from_secs(2))
+                .with_request_timeout(Duration::from_secs(3)),
+        );
+
+        let run = async {
+            // Create (success outcome, mandatory attrs per TS 29.512)
+            let resp = client
+                .post_json(
+                    "/npcf-smpolicycontrol/v1/sm-policies",
+                    &full_create_body("imsi-001010000000060", 8),
+                )
+                .await
+                .expect("create over HTTP");
+            assert_eq!(resp.status, 201);
+            let body: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            let pol_id = body["smPolicyId"].as_str().unwrap().to_string();
+            assert!(body["sessRules"].as_object().is_some_and(|m| !m.is_empty()));
+            assert!(body["chgDecs"].as_object().is_some_and(|m| !m.is_empty()));
+            assert!(body["traffContDecs"].as_object().is_some_and(|m| !m.is_empty()));
+
+            // Failure outcome: missing mandatory attribute → 400
+            let mut bad = full_create_body("imsi-001010000000061", 9);
+            bad.as_object_mut().unwrap().remove("dnn");
+            let resp = client
+                .post_json("/npcf-smpolicycontrol/v1/sm-policies", &bad)
+                .await
+                .expect("bad create over HTTP");
+            assert_eq!(resp.status, 400);
+
+            // Update (with triggers)
+            let resp = client
+                .post_json(
+                    &format!("/npcf-smpolicycontrol/v1/sm-policies/{pol_id}/update"),
+                    &serde_json::json!({ "repPolicyCtrlReqTriggers": ["RES_MO_RE"] }),
+                )
+                .await
+                .expect("update over HTTP");
+            assert_eq!(resp.status, 200);
+
+            // Delete (POST sub-resource per TS 29.512 §4.2.5)
+            let resp = client
+                .post_json(
+                    &format!("/npcf-smpolicycontrol/v1/sm-policies/{pol_id}/delete"),
+                    &serde_json::json!({}),
+                )
+                .await
+                .expect("delete over HTTP");
+            assert_eq!(resp.status, 204);
+        };
+        tokio::time::timeout(Duration::from_secs(15), run)
+            .await
+            .expect("HTTP round trip timed out");
+
+        server.stop().await.ok();
+    }
+
+    #[tokio::test]
+    async fn am_policy_update_via_post_subresource() {
+        pcf_context_init(64, 64);
+        let req = make_request(
+            "POST",
+            "/npcf-am-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000000053",
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/1",
+                "suppFeat": "0"
+            })),
+        );
+        let resp = pcf_sbi_request_handler(req).await;
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let pol_id = body["polAssoId"].as_str().unwrap().to_string();
+
+        // TS 29.507 §4.2.4: POST /policies/{polAssoId}/update
+        let req = make_request(
+            "POST",
+            &format!("/npcf-am-policy-control/v1/policies/{pol_id}/update"),
+            Some(serde_json::json!({ "triggers": ["LOC_CH"] })),
+        );
+        let resp = pcf_sbi_request_handler(req).await;
+        assert_eq!(resp.status, 200);
     }
 }

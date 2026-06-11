@@ -14,18 +14,22 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 use ogs_sctp::{OgsSctpInfo, SctpServer, SctpServerConfig, ServerEvent, OGS_NGAP_SCTP_PORT};
 
-use crate::context::{AmfContext, AmfGnb};
+use crate::context::{AmfContext, AmfGnb, AmfUe, Guti5gs, PlmnId, SNssai, UeSecurityCapability};
 use crate::event::AmfEvent;
+use crate::gmm_build::{self, message_type, mobile_identity_type, security_header, GmmCause};
+use crate::gmm_handler::payload_container_type;
+use crate::nas_security;
 use crate::ngap_asn1;
 use crate::ngap_handler::{self, time_to_wait, NgSetupRequest, NgapHandlerResult};
 use crate::ngap_sm::NgapFsm;
+use crate::timer::{AmfTimerConfigs, AmfTimerId};
 
 // ============================================================================
 // Constants
@@ -77,21 +81,98 @@ impl GnbSession {
     }
 }
 
-/// Per-UE authentication state stored between AUSF messages
+/// GMM procedure timers with retransmission (TS 24.501 Table 10.2.1)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NasProcTimer {
+    /// Registration Accept sent, waiting for Registration Complete
+    T3550,
+    /// Authentication Request / Security Mode Command sent
+    T3560,
+    /// Identity Request sent
+    T3570,
+    /// Network-initiated Deregistration Request sent
+    T3522,
+}
+
+impl NasProcTimer {
+    fn config(self, configs: &AmfTimerConfigs) -> (u32, Duration) {
+        let id = match self {
+            Self::T3550 => AmfTimerId::T3550,
+            Self::T3560 => AmfTimerId::T3560,
+            Self::T3570 => AmfTimerId::T3570,
+            Self::T3522 => AmfTimerId::T3522,
+        };
+        configs
+            .get(id)
+            .map(|c| (c.max_count, c.duration))
+            .unwrap_or((4, Duration::from_secs(6)))
+    }
+}
+
+/// Pending retransmission of a downlink NAS message
 #[derive(Debug, Clone)]
-struct UeAuthState {
-    /// AUSF auth context ID
+struct NasRetx {
+    /// Which procedure timer this is
+    timer: NasProcTimer,
+    /// When the timer expires next
+    deadline: Instant,
+    /// Number of retransmissions already performed
+    retries: u32,
+    /// The complete NGAP Downlink NAS Transport PDU to resend
+    ngap_pdu: Vec<u8>,
+}
+
+/// Per-UE NAS/registration state for the live NGAP path.
+///
+/// `amf_ue` carries the full 5G NAS security context (keys, COUNTs,
+/// replayed UE security capabilities, GUTI) so that all downlink NAS is
+/// built by gmm_build and protected by nas_security — there is no inline
+/// plain-NAS path.
+#[derive(Debug, Clone)]
+struct UeNasContext {
+    /// Full AMF UE context (security keys, capabilities, GUTI, NSSAI)
+    amf_ue: AmfUe,
+    /// AUSF auth context ID (for 5G-AKA confirmation)
     auth_ctx_id: String,
-    /// RAND (16 bytes)
-    rand: [u8; 16],
-    /// HXRES* (16 bytes)
-    hxres_star: [u8; 16],
     /// RAN UE NGAP ID (for building DL NAS Transport)
     ran_ue_ngap_id: u32,
     /// SCTP association ID
     association_id: u64,
     /// SUCI string
     suci: String,
+    /// AUTN of the last authentication vector (for resync bookkeeping)
+    autn: [u8; 16],
+    /// Registration procedure completed (Registration Complete received)
+    registered: bool,
+    /// Identity Request for PEI outstanding
+    pei_requested: bool,
+    /// Count of authentication failures (MAC #20 / sync #21) seen
+    auth_failure_count: u8,
+    /// Pending NAS retransmission (T3550/T3560/T3570/T3522)
+    retx: Option<NasRetx>,
+    /// UDM SDM subscription ID (from Nudm_SDM_Subscribe)
+    sdm_subscription_id: Option<String>,
+    /// PCF AM policy association ID (from Npcf_AMPolicyControl_Create)
+    policy_association_id: Option<String>,
+}
+
+impl UeNasContext {
+    fn new(amf_ue_ngap_id: u64, ran_ue_ngap_id: u32, association_id: u64) -> Self {
+        Self {
+            amf_ue: AmfUe::new(amf_ue_ngap_id, ran_ue_ngap_id as u64),
+            auth_ctx_id: String::new(),
+            ran_ue_ngap_id,
+            association_id,
+            suci: String::new(),
+            autn: [0u8; 16],
+            registered: false,
+            pei_requested: false,
+            auth_failure_count: 0,
+            retx: None,
+            sdm_subscription_id: None,
+            policy_association_id: None,
+        }
+    }
 }
 
 /// NGAP Server - handles all gNB connections via SCTP
@@ -112,8 +193,10 @@ pub struct NgapServer {
     event_tx: mpsc::Sender<AmfEvent>,
     /// Server event receiver
     server_event_rx: mpsc::UnboundedReceiver<ServerEvent>,
-    /// Per-UE auth state (keyed by AMF-UE-NGAP-ID)
-    ue_auth_state: HashMap<u64, UeAuthState>,
+    /// Per-UE NAS/registration state (keyed by AMF-UE-NGAP-ID)
+    ue_auth_state: HashMap<u64, UeNasContext>,
+    /// GMM procedure timer configuration (T3550/T3560/T3570/T3522)
+    timer_configs: AmfTimerConfigs,
 }
 
 impl NgapServer {
@@ -153,6 +236,7 @@ impl NgapServer {
             event_tx,
             server_event_rx,
             ue_auth_state: HashMap::new(),
+            timer_configs: AmfTimerConfigs::default(),
         })
     }
 
@@ -168,6 +252,9 @@ impl NgapServer {
 
     /// Poll for incoming NGAP messages and server events
     pub async fn poll(&mut self) -> Result<bool> {
+        // Check GMM procedure timers (T3550/T3560/T3570/T3522 retransmission)
+        self.process_nas_timers().await?;
+
         // Process any pending server events
         while let Ok(event) = self.server_event_rx.try_recv() {
             self.handle_server_event(event).await?;
@@ -706,6 +793,12 @@ impl NgapServer {
     }
 
     /// Handle Initial UE Message
+    ///
+    /// Parses the contained NAS PDU and starts the appropriate 5GMM
+    /// procedure (TS 24.501 Section 5.5.1 registration, Section 5.6.1
+    /// service request). No blanket Identity Request: identification is
+    /// only initiated when the UE identified itself with a GUTI unknown
+    /// to this AMF (TS 23.502 Section 4.2.2.2.2 step 4).
     async fn handle_initial_ue_message(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
         log::info!(
             "Initial UE Message from association {} ({} bytes)",
@@ -713,7 +806,6 @@ impl NgapServer {
             data.len()
         );
 
-        // Parse the Initial UE Message using proper ASN.1 decoder
         let initial_ue = match crate::ngap_asn1::parse_initial_ue_message_asn1(data) {
             Some(msg) => msg,
             None => {
@@ -730,14 +822,6 @@ impl NgapServer {
             initial_ue.nr_cell_identity
         );
 
-        // Log the NAS PDU hex for debugging
-        if !initial_ue.nas_pdu.is_empty() {
-            log::debug!(
-                "NAS PDU: {:02x?}",
-                &initial_ue.nas_pdu[..initial_ue.nas_pdu.len().min(32)]
-            );
-        }
-
         // Allocate AMF-UE-NGAP-ID for this UE
         let amf_ue_ngap_id = {
             let mut id = self.next_gnb_id.lock().await;
@@ -746,54 +830,58 @@ impl NgapServer {
             current
         };
 
-        log::info!(
-            "Allocated AMF-UE-NGAP-ID {} for RAN-UE-NGAP-ID {}",
-            amf_ue_ngap_id,
-            initial_ue.ran_ue_ngap_id
-        );
+        let nas = initial_ue.nas_pdu.clone();
+        if nas.len() < 3 || nas[0] != 0x7E {
+            log::warn!("Initial UE Message NAS PDU is not 5GMM, ignoring");
+            return Ok(());
+        }
+        let msg_type = nas[2];
 
-        // Build Identity Request NAS message
-        // Format: EPD (0x7E) + Security Header (0x00) + Message Type (0x5B) + Identity Type (0x01 = SUCI)
-        let identity_request = crate::gmm_build::build_identity_request();
+        match msg_type {
+            message_type::REGISTRATION_REQUEST => {
+                let mut state =
+                    UeNasContext::new(amf_ue_ngap_id, initial_ue.ran_ue_ngap_id, association_id);
+                state.amf_ue.nr_tai = crate::context::Tai5gs {
+                    plmn_id: initial_ue.plmn_id.clone(),
+                    tac: initial_ue.tac,
+                };
+                state.amf_ue.access_type = 1; // 3GPP access
+                self.ue_auth_state.insert(amf_ue_ngap_id, state);
 
-        log::info!(
-            "Sending Identity Request: amf_ue_ngap_id={}, ran_ue_ngap_id={}, nas_len={}",
-            amf_ue_ngap_id,
-            initial_ue.ran_ue_ngap_id,
-            identity_request.len()
-        );
-
-        // Build Downlink NAS Transport
-        let dl_nas_transport = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
-            amf_ue_ngap_id,
-            initial_ue.ran_ue_ngap_id,
-            &identity_request,
-        ) {
-            Some(bytes) => bytes,
-            None => {
-                log::error!("Failed to build Downlink NAS Transport");
-                return Ok(());
+                self.handle_registration_request_nas(
+                    association_id,
+                    amf_ue_ngap_id,
+                    initial_ue.ran_ue_ngap_id,
+                    &nas,
+                )
+                .await?;
             }
-        };
+            message_type::SERVICE_REQUEST => {
+                // UE context unknown (fresh NGAP IDs) -> the UE identity cannot
+                // be derived: Service Reject cause #9 forces re-registration
+                // (TS 24.501 Section 5.6.1.5).
+                log::warn!(
+                    "Service Request in Initial UE Message without stored context: rejecting (#9)"
+                );
+                let reject = gmm_build::build_service_reject(
+                    &AmfUe::default(),
+                    GmmCause::UeIdentityCannotBeDerivedByTheNetwork,
+                );
+                self.send_nas_pdu(
+                    association_id,
+                    amf_ue_ngap_id,
+                    initial_ue.ran_ue_ngap_id,
+                    &reject,
+                )
+                .await?;
+            }
+            other => {
+                log::warn!("Unhandled NAS message type 0x{other:02x} in Initial UE Message");
+            }
+        }
 
-        log::info!(
-            "Sending Downlink NAS Transport: {} bytes to association {}",
-            dl_nas_transport.len(),
-            association_id
-        );
-
-        // Send to gNB
-        self.send_to_association(association_id, &dl_nas_transport)
-            .await?;
-
-        // Forward to event handler for further NAS processing
+        // Forward to event handler for FSM bookkeeping
         if let Some(session) = self.sessions.read().await.get(&association_id) {
-            log::info!(
-                "Initial UE Message processed from gNB {} for RAN-UE {}",
-                session.id,
-                initial_ue.ran_ue_ngap_id
-            );
-
             let event = AmfEvent::ngap_message(session.id, data.to_vec());
             let _ = self.event_tx.send(event).await;
         }
@@ -801,19 +889,12 @@ impl NgapServer {
         Ok(())
     }
 
-    /// Handle Uplink NAS Transport
+    /// Handle Uplink NAS Transport: decode security (if any) and dispatch
     async fn handle_uplink_nas_transport(
         &mut self,
         association_id: u64,
         data: &[u8],
     ) -> Result<()> {
-        log::info!(
-            "Uplink NAS Transport from association {} ({} bytes)",
-            association_id,
-            data.len()
-        );
-
-        // Parse the Uplink NAS Transport
         let ul_nas = match crate::ngap_asn1::parse_uplink_nas_transport_asn1(data) {
             Some(msg) => msg,
             None => {
@@ -829,734 +910,1712 @@ impl NgapServer {
             ul_nas.nas_pdu.len()
         );
 
-        // Log the NAS PDU
-        if !ul_nas.nas_pdu.is_empty() {
-            log::debug!(
-                "NAS PDU: {:02x?}",
-                &ul_nas.nas_pdu[..ul_nas.nas_pdu.len().min(32)]
-            );
+        if ul_nas.nas_pdu.len() < 3 {
+            return Ok(());
         }
 
-        // Parse the NAS message type
-        if ul_nas.nas_pdu.len() >= 3 {
-            let epd = ul_nas.nas_pdu[0];
-            let security_header = ul_nas.nas_pdu[1];
-            let msg_type = ul_nas.nas_pdu[2];
+        let epd = ul_nas.nas_pdu[0];
 
-            log::info!(
-                "NAS message: EPD=0x{epd:02x}, security_header=0x{security_header:02x}, msg_type=0x{msg_type:02x}"
-            );
+        // Legacy compatibility: raw 5GSM PDU not wrapped in UL NAS TRANSPORT
+        if epd == 0x2E {
+            self.handle_5gsm_message(
+                association_id,
+                ul_nas.amf_ue_ngap_id,
+                ul_nas.ran_ue_ngap_id,
+                &ul_nas.nas_pdu,
+            )
+            .await?;
+            return Ok(());
+        }
 
-            // Check EPD to determine if this is 5GMM or 5GSM
-            if epd == 0x2E {
-                // 5GSM (Session Management) message
-                // Format: EPD (0x2E) + PSI + PTI + Message Type + IEs
-                let psi = ul_nas.nas_pdu[1];
-                let pti = ul_nas.nas_pdu[2];
-                let sm_msg_type = ul_nas.nas_pdu[3];
+        if epd != 0x7E {
+            log::warn!("Unknown NAS EPD 0x{epd:02x}, discarding");
+            return Ok(());
+        }
 
-                log::info!("5GSM message: PSI={psi}, PTI={pti}, msg_type=0x{sm_msg_type:02x}");
-
-                // PDU Session Establishment Request (0xC1)
-                if sm_msg_type == 0xC1 {
-                    log::info!("PDU Session Establishment Request from UE: PSI={psi}, PTI={pti}");
-
-                    // Call SMF via N11 SBI to create SM context
-                    let smf_host =
-                        std::env::var("SMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-                    let smf_port: u16 = std::env::var("SMF_SBI_PORT")
-                        .ok()
-                        .and_then(|p| p.parse().ok())
-                        .unwrap_or(7777);
-                    let sst = 1u8;
-                    let dnn = "internet";
-
-                    let (pdu_session_accept, n2_sm_info) =
-                        match crate::sbi_path::call_smf_create_sm_context(
-                            &smf_host,
-                            smf_port,
-                            psi,
-                            sst,
-                            None,
-                            dnn,
-                            &ul_nas.nas_pdu,
-                        )
-                        .await
-                        {
-                            Ok(resp) => {
-                                log::info!(
-                                    "SMF SM Context Created: ref={}, n1_len={}, n2_len={}",
-                                    resp.sm_context_ref,
-                                    resp.n1_sm_msg.len(),
-                                    resp.n2_sm_info.len()
-                                );
-                                (resp.n1_sm_msg, resp.n2_sm_info)
-                            }
-                            Err(e) => {
-                                log::warn!("SMF unreachable ({e}), using local PDU Session Accept");
-
-                                // Fallback: build locally
-                                let ue_ip = [10u8, 45, 0, 2];
-                                let mut accept = Vec::new();
-                                accept.push(0x2E);
-                                accept.push(psi);
-                                accept.push(pti);
-                                accept.push(0xC2);
-                                accept.push(0x01); // PDU type: IPv4
-                                accept.push(0x01); // SSC mode 1
-                                                   // QoS rules
-                                accept.extend_from_slice(&[0x06, 0x01, 0x03, 0x01, 0x01, 0x09]);
-                                // Session AMBR
-                                accept
-                                    .extend_from_slice(&[0x06, 0x06, 0x00, 0x64, 0x06, 0x00, 0x64]);
-                                // PDU address
-                                accept.push(0x29);
-                                accept.push(0x05);
-                                accept.push(0x01);
-                                accept.extend_from_slice(&ue_ip);
-                                // DNN
-                                let dnn_bytes = b"internet";
-                                accept.push(0x25);
-                                accept.push((dnn_bytes.len() + 1) as u8);
-                                accept.push(dnn_bytes.len() as u8);
-                                accept.extend_from_slice(dnn_bytes);
-
-                                // APER PDUSessionResourceSetupRequestTransfer
-                                // (TS 38.413 Section 9.3.4.1) with the local UPF
-                                // N3 endpoint, QFI 9 / 5QI 9 / ARP 8
-                                let n2 = ngap_asn1::build_n2_sm_setup_request_transfer(
-                                    0x00000001,
-                                    [127, 0, 0, 1],
-                                    9,
-                                    9,
-                                    8,
-                                )
-                                .unwrap_or_default();
-                                (accept, n2)
-                            }
-                        };
-
-                    log::info!(
-                        "PDU Session Accept: PSI={}, accept_len={}, n2_len={}",
-                        psi,
-                        pdu_session_accept.len(),
-                        n2_sm_info.len()
-                    );
-
-                    // Send N1 (PDU Session Accept) to UE via DL NAS Transport
-                    let dl_nas_transport = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
-                        ul_nas.amf_ue_ngap_id,
-                        ul_nas.ran_ue_ngap_id,
-                        &pdu_session_accept,
-                    ) {
-                        Some(bytes) => bytes,
-                        None => {
-                            log::error!(
-                                "Failed to build Downlink NAS Transport for PDU Session Accept"
-                            );
-                            return Ok(());
-                        }
-                    };
-                    self.send_to_association(association_id, &dl_nas_transport)
-                        .await?;
-                    log::info!("PDU Session Establishment Accept sent to UE!");
-
-                    // Send N2 (UPF tunnel info) to gNB via PDU Session Resource Setup Request
-                    let setup_req =
-                        match crate::ngap_asn1::build_pdu_session_resource_setup_request_asn1(
-                            ul_nas.amf_ue_ngap_id,
-                            ul_nas.ran_ue_ngap_id,
-                            psi,
-                            1,    // SST
-                            None, // SD
-                            None, // NAS PDU already sent separately
-                            &n2_sm_info,
-                        ) {
-                            Some(bytes) => bytes,
-                            None => {
-                                log::error!("Failed to build PDU Session Resource Setup Request");
-                                return Ok(());
-                            }
-                        };
-                    self.send_to_association(association_id, &setup_req).await?;
-                    log::info!("PDU Session Resource Setup Request sent to gNB: PSI={psi}");
-                }
-
-                // PDU Session Modification Request (0xC9)
-                if sm_msg_type == 0xC9 {
-                    log::info!("PDU Session Modification Request from UE: PSI={psi}, PTI={pti}");
-
-                    // Forward to SMF via SM Context Update with N1 SM info
-                    let smf_host =
-                        std::env::var("SMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-                    let smf_port: u16 = std::env::var("SMF_SBI_PORT")
-                        .ok()
-                        .and_then(|p| p.parse().ok())
-                        .unwrap_or(7777);
-                    let sm_context_ref = format!("{psi}");
-
-                    match crate::sbi_path::call_smf_update_sm_context_with_n1(
-                        &smf_host,
-                        smf_port,
-                        &sm_context_ref,
-                        &ul_nas.nas_pdu,
-                    )
-                    .await
-                    {
-                        Ok(resp) => {
-                            log::info!("SMF SM Context Updated for modification: PSI={psi}");
-
-                            // Send PDU Session Modification Command to UE (N1)
-                            let mut mod_cmd = Vec::new();
-                            mod_cmd.push(0x2E);
-                            mod_cmd.push(psi);
-                            mod_cmd.push(pti);
-                            mod_cmd.push(0xCB); // PDU Session Modification Command
-
-                            let dl_nas = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
-                                ul_nas.amf_ue_ngap_id,
-                                ul_nas.ran_ue_ngap_id,
-                                &mod_cmd,
-                            ) {
-                                Some(bytes) => bytes,
-                                None => return Ok(()),
-                            };
-                            self.send_to_association(association_id, &dl_nas).await?;
-                            log::info!("PDU Session Modification Command sent to UE: PSI={psi}");
-
-                            // Send PDU Session Resource Modify Request to gNB (N2) if N2 info present
-                            if !resp.n2_sm_info.is_empty() {
-                                let modify_req = match crate::ngap_asn1::build_pdu_session_resource_modify_request_asn1(
-                                    ul_nas.amf_ue_ngap_id,
-                                    ul_nas.ran_ue_ngap_id,
-                                    psi,
-                                    None,
-                                    &resp.n2_sm_info,
-                                ) {
-                                    Some(bytes) => bytes,
-                                    None => {
-                                        log::error!("Failed to build PDU Session Resource Modify Request");
-                                        return Ok(());
-                                    }
-                                };
-                                self.send_to_association(association_id, &modify_req)
-                                    .await?;
-                                log::info!(
-                                    "PDU Session Resource Modify Request sent to gNB: PSI={psi}"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            log::warn!("SMF modification failed ({e}), sending reject");
-                            let mut reject = Vec::new();
-                            reject.push(0x2E);
-                            reject.push(psi);
-                            reject.push(pti);
-                            reject.push(0xCC); // PDU Session Modification Reject
-                            reject.push(0x1A); // 5GSM cause: Insufficient resources
-
-                            let dl_nas = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
-                                ul_nas.amf_ue_ngap_id,
-                                ul_nas.ran_ue_ngap_id,
-                                &reject,
-                            ) {
-                                Some(bytes) => bytes,
-                                None => return Ok(()),
-                            };
-                            self.send_to_association(association_id, &dl_nas).await?;
-                        }
-                    }
-                }
-
-                // PDU Session Modification Complete (0xCD)
-                if sm_msg_type == 0xCD {
-                    log::info!("PDU Session Modification Complete from UE: PSI={psi}");
-                    // Modification procedure complete - no further action needed
-                }
-
-                // PDU Session Release Request (0xD1)
-                if sm_msg_type == 0xD1 {
-                    log::info!("PDU Session Release Request from UE: PSI={psi}, PTI={pti}");
-
-                    // Call SMF to release SM context
-                    let smf_host =
-                        std::env::var("SMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-                    let smf_port: u16 = std::env::var("SMF_SBI_PORT")
-                        .ok()
-                        .and_then(|p| p.parse().ok())
-                        .unwrap_or(7777);
-                    let sm_context_ref = format!("{psi}");
-
-                    match crate::sbi_path::call_smf_release_sm_context(
-                        &smf_host,
-                        smf_port,
-                        &sm_context_ref,
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            log::info!("SMF SM Context Released: PSI={psi}");
-                        }
-                        Err(e) => {
-                            log::warn!("SMF release failed: {e}");
-                        }
-                    }
-
-                    // Send PDU Session Release Command to UE
-                    let mut release_cmd = Vec::new();
-                    release_cmd.push(0x2E);
-                    release_cmd.push(psi);
-                    release_cmd.push(pti);
-                    release_cmd.push(0xD4); // PDU Session Release Command
-                    release_cmd.push(0x24); // 5GSM cause: Regular deactivation
-
-                    let dl_nas = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
-                        ul_nas.amf_ue_ngap_id,
-                        ul_nas.ran_ue_ngap_id,
-                        &release_cmd,
-                    ) {
-                        Some(bytes) => bytes,
-                        None => return Ok(()),
-                    };
-                    self.send_to_association(association_id, &dl_nas).await?;
-                    log::info!("PDU Session Release Command sent to UE: PSI={psi}");
-
-                    // Send PDU Session Resource Release Command to gNB
-                    let release_ngap =
-                        match crate::ngap_asn1::build_pdu_session_resource_release_command_asn1(
-                            ul_nas.amf_ue_ngap_id,
-                            ul_nas.ran_ue_ngap_id,
-                            &[psi],
-                        ) {
-                            Some(bytes) => bytes,
-                            None => {
-                                log::error!("Failed to build PDU Session Resource Release Command");
-                                return Ok(());
-                            }
-                        };
-                    self.send_to_association(association_id, &release_ngap)
-                        .await?;
-                    log::info!("PDU Session Resource Release Command sent to gNB: PSI={psi}");
-                }
-
-                // PDU Session Release Complete (0xD6)
-                if sm_msg_type == 0xD6 {
-                    log::info!("PDU Session Release Complete from UE: PSI={psi}");
-                    // Release procedure complete - session fully released
-                }
-
-                return Ok(());
-            }
-
-            // Check for Identity Response (0x5C) - 5GMM message
-            if epd == 0x7E && msg_type == crate::gmm_build::message_type::IDENTITY_RESPONSE {
-                log::info!("Received Identity Response from UE");
-
-                // Parse the Identity Response to extract SUCI
-                let mut suci_str = String::from("imsi-999700000000001");
-                if ul_nas.nas_pdu.len() >= 5 {
-                    let id_len = ((ul_nas.nas_pdu[3] as usize) << 8) | (ul_nas.nas_pdu[4] as usize);
-                    if ul_nas.nas_pdu.len() >= 5 + id_len && id_len > 0 {
-                        let id_type = ul_nas.nas_pdu[5] & 0x07;
-                        if id_type == crate::gmm_build::mobile_identity_type::SUCI {
-                            let suci_data = &ul_nas.nas_pdu[5..5 + id_len];
-                            log::info!("SUCI data: {suci_data:02x?}");
-                            // Build SUCI string from BCD-encoded PLMN + MSIN
-                            if suci_data.len() >= 4 {
-                                let mcc1 = suci_data[1] & 0x0f;
-                                let mcc2 = (suci_data[1] >> 4) & 0x0f;
-                                let mcc3 = suci_data[2] & 0x0f;
-                                let mnc1 = suci_data[3] & 0x0f;
-                                let mnc2 = (suci_data[3] >> 4) & 0x0f;
-                                suci_str = format!(
-                                    "suci-0-{mcc1}{mcc2}{mcc3}-{mnc1}{mnc2}-0-0-0000000001"
-                                );
-                            }
-                        }
-                    }
-                }
-                log::info!("SUCI: {suci_str}");
-
-                // Call AUSF to get authentication vectors
-                let ausf_host =
-                    std::env::var("AUSF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
-                let ausf_port: u16 = std::env::var("AUSF_SBI_PORT")
-                    .ok()
-                    .and_then(|p| p.parse().ok())
-                    .unwrap_or(7777);
-                let serving_network_name = "5G:mnc070.mcc999.3gppnetwork.org";
-
-                match crate::sbi_path::call_ausf_authenticate(
-                    &ausf_host,
-                    ausf_port,
-                    &suci_str,
-                    serving_network_name,
-                )
-                .await
-                {
-                    Ok(auth_resp) => {
-                        log::info!(
-                            "AUSF auth success: ctx_id={}, RAND={}...",
-                            auth_resp.auth_ctx_id,
-                            hex::encode(&auth_resp.rand[..4])
-                        );
-
-                        // Store auth state for this UE
-                        self.ue_auth_state.insert(
-                            ul_nas.amf_ue_ngap_id,
-                            UeAuthState {
-                                auth_ctx_id: auth_resp.auth_ctx_id,
-                                rand: auth_resp.rand,
-                                hxres_star: auth_resp.hxres_star,
-                                ran_ue_ngap_id: ul_nas.ran_ue_ngap_id,
-                                association_id,
-                                suci: suci_str,
-                            },
-                        );
-
-                        // Build Authentication Request NAS message
-                        // Format: EPD(0x7E) + SecHdr(0x00) + MsgType(0x56) + ngKSI(1) + ABBA(LV) + RAND(TV,IEI=0x21) + AUTN(TLV,IEI=0x20)
-                        let mut auth_request = Vec::new();
-                        auth_request.push(0x7E); // EPD: 5GMM
-                        auth_request.push(0x00); // Security header: Plain NAS
-                        auth_request.push(0x56); // Message type: Authentication Request
-                        auth_request.push(0x00); // ngKSI: TSC=0, KSI=0
-                        auth_request.extend_from_slice(&[0x02, 0x00, 0x00]); // ABBA: length=2, value=0x0000
-                                                                             // RAND (IEI 0x21, fixed 16 bytes)
-                        auth_request.push(0x21);
-                        auth_request.extend_from_slice(&auth_resp.rand);
-                        // AUTN (IEI 0x20, TLV)
-                        auth_request.push(0x20);
-                        auth_request.push(16); // length
-                        auth_request.extend_from_slice(&auth_resp.autn);
-
-                        // Send via DL NAS Transport
-                        let dl_nas_transport =
-                            match crate::ngap_asn1::build_downlink_nas_transport_asn1(
-                                ul_nas.amf_ue_ngap_id,
-                                ul_nas.ran_ue_ngap_id,
-                                &auth_request,
-                            ) {
-                                Some(bytes) => bytes,
-                                None => {
-                                    log::error!("Failed to build DL NAS Transport for Authentication Request");
-                                    return Ok(());
-                                }
-                            };
-                        self.send_to_association(association_id, &dl_nas_transport)
-                            .await?;
-                        log::info!("Authentication Request sent to UE");
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "AUSF unreachable ({e}), falling back to direct Registration Accept"
-                        );
-                        // Fallback: send Registration Accept directly
-                        let registration_accept = vec![0x7e, 0x00, 0x42, 0x01, 0x01];
-                        let dl_nas_transport =
-                            match crate::ngap_asn1::build_downlink_nas_transport_asn1(
-                                ul_nas.amf_ue_ngap_id,
-                                ul_nas.ran_ue_ngap_id,
-                                &registration_accept,
-                            ) {
-                                Some(bytes) => bytes,
-                                None => return Ok(()),
-                            };
-                        self.send_to_association(association_id, &dl_nas_transport)
-                            .await?;
-                        log::info!("Registration Accept sent (AUSF fallback)");
-                    }
-                }
-            }
-
-            // Check for Authentication Response (0x57) - 5GMM message
-            if epd == 0x7E && msg_type == crate::gmm_build::message_type::AUTHENTICATION_RESPONSE {
-                log::info!("Received Authentication Response from UE");
-
-                // Parse RES* from the NAS PDU
-                // Format: EPD(1) + SecHdr(1) + MsgType(1) + [IEI 0x2D] + Len(1) + RES*(16)
-                let mut res_star: Option<[u8; 16]> = None;
-
-                // Scan for Authentication Response Parameter (IEI 0x2D)
-                let mut pos = 3; // skip EPD + SecHdr + MsgType
-                while pos < ul_nas.nas_pdu.len() {
-                    if ul_nas.nas_pdu[pos] == 0x2D && pos + 1 < ul_nas.nas_pdu.len() {
-                        let len = ul_nas.nas_pdu[pos + 1] as usize;
-                        if len == 16 && pos + 2 + 16 <= ul_nas.nas_pdu.len() {
-                            let mut rs = [0u8; 16];
-                            rs.copy_from_slice(&ul_nas.nas_pdu[pos + 2..pos + 18]);
-                            res_star = Some(rs);
-                            log::info!("RES*: {:02x?}", &rs[..4]);
-                        }
-                        break;
-                    }
-                    pos += 1;
-                }
-
-                if let Some(rs) = res_star {
-                    // Verify HXRES* locally
-                    let auth_state = self.ue_auth_state.get(&ul_nas.amf_ue_ngap_id);
-                    let verified = if let Some(state) = auth_state {
-                        // Compute HRES* from RAND and RES* using SHA-256
-                        use sha2::{Digest, Sha256};
-                        let mut hasher = Sha256::new();
-                        hasher.update(state.rand);
-                        hasher.update(rs);
-                        let result = hasher.finalize();
-                        let mut hres_star = [0u8; 16];
-                        hres_star.copy_from_slice(&result[16..32]);
-                        hres_star == state.hxres_star
-                    } else {
-                        false
-                    };
-
-                    if verified {
-                        log::info!("HXRES* verification passed");
-
-                        // Call AUSF for 5G-AKA confirmation to get KSEAF
-                        let auth_state = self.ue_auth_state.get(&ul_nas.amf_ue_ngap_id).cloned();
-                        if let Some(state) = auth_state {
-                            let ausf_confirm_host = std::env::var("AUSF_SBI_ADDR")
-                                .unwrap_or_else(|_| "127.0.0.1".to_string());
-                            let ausf_confirm_port: u16 = std::env::var("AUSF_SBI_PORT")
-                                .ok()
-                                .and_then(|p| p.parse().ok())
-                                .unwrap_or(7777);
-
-                            match crate::sbi_path::call_ausf_5g_aka_confirm(
-                                &ausf_confirm_host,
-                                ausf_confirm_port,
-                                &state.auth_ctx_id,
-                                &rs,
-                            )
-                            .await
-                            {
-                                Ok(confirm) => {
-                                    log::info!(
-                                        "AUSF 5G-AKA confirmed: result={}, supi={:?}",
-                                        confirm.auth_result,
-                                        confirm.supi
-                                    );
-
-                                    // Derive NAS keys from KSEAF (simplified key derivation)
-                                    // In production, KSEAF → KAMF → KNASint/KNASenc
-                                    // For now, use KSEAF directly as KAMF
-                                    log::info!("NAS security context established");
-                                }
-                                Err(e) => {
-                                    log::warn!("AUSF 5G-AKA confirmation failed: {e}");
-                                }
-                            }
-                        }
-
-                        // Send Security Mode Command
-                        // Format: EPD(0x7E) + SecHdr(0x00) + MsgType(0x5D) + NAS security algorithms(1)
-                        //         + ngKSI(1/2) + Replayed UE security capabilities(LV)
-                        let mut smc = Vec::new();
-                        smc.push(0x7E); // EPD: 5GMM
-                        smc.push(0x00); // Security header: Plain NAS (simplified, production uses integrity-protected)
-                        smc.push(0x5D); // Message type: Security Mode Command
-                                        // Selected NAS security algorithms: EA0 + IA2 (NIA2 = SNOW3G)
-                        smc.push(0x20); // enc_alg=0 (EA0) | int_alg=2 (IA2) → (0x02 << 4) | 0x00 = 0x20
-                                        // ngKSI: TSC=0, KSI=0
-                        smc.push(0x00);
-                        // Replayed UE security capabilities (LV): EA0-EA3 + IA0-IA3
-                        smc.push(0x02); // length
-                        smc.push(0xF0); // EA0 + EA1 + EA2 + EA3
-                        smc.push(0xF0); // IA0 + IA1 + IA2 + IA3
-
-                        let dl_nas_transport =
-                            match crate::ngap_asn1::build_downlink_nas_transport_asn1(
-                                ul_nas.amf_ue_ngap_id,
-                                ul_nas.ran_ue_ngap_id,
-                                &smc,
-                            ) {
-                                Some(bytes) => bytes,
-                                None => {
-                                    log::error!("Failed to build DL NAS Transport for Security Mode Command");
-                                    return Ok(());
-                                }
-                            };
-                        self.send_to_association(association_id, &dl_nas_transport)
-                            .await?;
-                        log::info!("Security Mode Command sent to UE");
-                    } else {
-                        log::error!("HXRES* verification failed - authentication failure");
-                        // Send Authentication Reject
-                        let auth_reject = vec![0x7E, 0x00, 0x58]; // EPD + SecHdr + MsgType(Auth Reject)
-                        let dl_nas_transport =
-                            match crate::ngap_asn1::build_downlink_nas_transport_asn1(
-                                ul_nas.amf_ue_ngap_id,
-                                ul_nas.ran_ue_ngap_id,
-                                &auth_reject,
-                            ) {
-                                Some(bytes) => bytes,
-                                None => return Ok(()),
-                            };
-                        self.send_to_association(association_id, &dl_nas_transport)
-                            .await?;
-                        log::info!("Authentication Reject sent to UE");
-                    }
-                }
-            }
-
-            // Check for Security Mode Complete (0x5E) - 5GMM message
-            if epd == 0x7E && msg_type == crate::gmm_build::message_type::SECURITY_MODE_COMPLETE {
-                log::info!("Received Security Mode Complete from UE");
-
-                // Clean up auth state
-                self.ue_auth_state.remove(&ul_nas.amf_ue_ngap_id);
-
-                // Send Registration Accept with T3512 timer and 5G-GUTI
-                let mut registration_accept = vec![
-                    0x7e, 0x00, 0x42, // EPD + Security header + Registration Accept
-                    0x01, // Registration result length
-                    0x01, // Registration result: 3GPP access
-                ];
-
-                // 5G-GUTI (IEI 0x77, TLV-E) - assign a GUTI to the UE
-                let guti_amf_set_id: u16 = 1;
-                let guti_amf_pointer: u8 = 0;
-                let guti_tmsi: u32 = ul_nas.amf_ue_ngap_id as u32;
-                registration_accept.push(0x77); // IEI
-                registration_accept.extend_from_slice(&[0x00, 0x0B]); // Length = 11
-                registration_accept.push(0xF2); // SUPI format=GUTI, odd/even
-                                                // PLMN: MCC=999, MNC=70
-                registration_accept.extend_from_slice(&[0x99, 0xF9, 0x07]);
-                // AMF Region ID
-                registration_accept.push(0x02);
-                // AMF Set ID (10 bits) + AMF Pointer (6 bits) = 2 bytes
-                let set_ptr = ((guti_amf_set_id & 0x3FF) << 6) | (guti_amf_pointer as u16 & 0x3F);
-                registration_accept.extend_from_slice(&set_ptr.to_be_bytes());
-                // 5G-TMSI (4 bytes)
-                registration_accept.extend_from_slice(&guti_tmsi.to_be_bytes());
-
-                // T3512 timer (IEI 0x5E, GPRS Timer 3)
-                // Value: 540 seconds = 9 minutes → unit=multiples of 1 minute (010), value=9 (01001)
-                // Timer value byte: 010 01001 = 0x49
-                registration_accept.push(0x5E); // IEI
-                registration_accept.push(0x01); // Length
-                registration_accept.push(0x49); // 9 minutes (unit=010=1min, val=01001=9)
-
-                let dl_nas_transport = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
-                    ul_nas.amf_ue_ngap_id,
-                    ul_nas.ran_ue_ngap_id,
-                    &registration_accept,
-                ) {
-                    Some(bytes) => bytes,
-                    None => {
-                        log::error!("Failed to build DL NAS Transport for Registration Accept");
-                        return Ok(());
-                    }
-                };
-                self.send_to_association(association_id, &dl_nas_transport)
-                    .await?;
-                log::info!("Registration Accept sent to UE (with T3512=540s, 5G-GUTI assigned)");
-            }
-
-            // Check for Service Request (0x4C) - 5GMM message
-            if epd == 0x7E && msg_type == 0x4C {
-                log::info!(
-                    "Received Service Request from UE (amf_ue_ngap_id={})",
+        let sec_hdr = ul_nas.nas_pdu[1];
+        let inner: Vec<u8> = if sec_hdr == security_header::PLAIN_NAS_MESSAGE {
+            ul_nas.nas_pdu.clone()
+        } else {
+            // Security-protected: decode with the UE's NAS security context
+            let Some(mut state) = self.ue_auth_state.remove(&ul_nas.amf_ue_ngap_id) else {
+                log::warn!(
+                    "Protected NAS from unknown UE {} discarded",
                     ul_nas.amf_ue_ngap_id
                 );
-
-                // Service Request indicates UE is transitioning from CM-IDLE to CM-CONNECTED
-                // Parse the Service Request to extract 5G-S-TMSI and service type
-                // Format: EPD(0x7E) + SecHdr(0x00) + MsgType(0x4C) + ngKSI+ServiceType(1) + 5G-S-TMSI(TLV)
-                let service_type = if ul_nas.nas_pdu.len() > 3 {
-                    ul_nas.nas_pdu[3] & 0x0F // Lower nibble = service type
-                } else {
-                    0 // signalling
-                };
-
-                log::info!("Service Request: service_type={service_type}");
-
-                // Send Service Accept
-                // Format: EPD(0x7E) + SecHdr(0x00) + MsgType(0x4E)
-                let service_accept = vec![0x7E, 0x00, 0x4E];
-
-                let dl_nas_transport = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
-                    ul_nas.amf_ue_ngap_id,
-                    ul_nas.ran_ue_ngap_id,
-                    &service_accept,
-                ) {
-                    Some(bytes) => bytes,
-                    None => {
-                        log::error!("Failed to build DL NAS Transport for Service Accept");
-                        return Ok(());
-                    }
-                };
-                self.send_to_association(association_id, &dl_nas_transport)
-                    .await?;
-                log::info!("Service Accept sent to UE");
-            }
-
-            // Check for Registration Request (0x41) as periodic registration update
-            if epd == 0x7E && msg_type == 0x41 {
-                // Check registration type for periodic update
-                if ul_nas.nas_pdu.len() > 3 {
-                    let reg_type = ul_nas.nas_pdu[3] & 0x07;
-                    if reg_type == 0x03 {
-                        // Periodic Registration Update (type 3)
-                        log::info!(
-                            "Periodic Registration Update from UE (amf_ue_ngap_id={})",
+                return Ok(());
+            };
+            let decoded =
+                nas_security::nas_5gs_security_decode(&mut state.amf_ue, sec_hdr, &ul_nas.nas_pdu);
+            let mac_failed = state.amf_ue.mac_failed;
+            state.amf_ue.mac_failed = false;
+            self.ue_auth_state.insert(ul_nas.amf_ue_ngap_id, state);
+            match decoded {
+                Ok(plain) => {
+                    if mac_failed {
+                        // TS 24.501 Section 4.4.3.3: messages failing integrity
+                        // check are discarded (registration/dereg/service request
+                        // exceptions are handled before security establishment)
+                        log::warn!(
+                            "NAS MAC verification failed for UE {}, discarding message",
                             ul_nas.amf_ue_ngap_id
                         );
-
-                        // Send Registration Accept with refreshed T3512
-                        let mut reg_accept = vec![
-                            0x7e, 0x00, 0x42, 0x01, 0x01, // Registration result: 3GPP access
-                        ];
-                        // T3512 timer (refreshed)
-                        reg_accept.push(0x5E);
-                        reg_accept.push(0x01);
-                        reg_accept.push(0x49); // 9 minutes
-
-                        let dl_nas = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
-                            ul_nas.amf_ue_ngap_id,
-                            ul_nas.ran_ue_ngap_id,
-                            &reg_accept,
-                        ) {
-                            Some(bytes) => bytes,
-                            None => return Ok(()),
-                        };
-                        self.send_to_association(association_id, &dl_nas).await?;
-                        log::info!(
-                            "Registration Accept sent for periodic update (T3512 refreshed)"
-                        );
+                        return Ok(());
                     }
+                    plain
+                }
+                Err(e) => {
+                    log::warn!("NAS security decode failed: {e:?}, discarding");
+                    return Ok(());
                 }
             }
+        };
 
-            // Check for Deregistration Request UE Originating (0x45) - 5GMM message
-            if epd == 0x7E && msg_type == 0x45 {
-                log::info!(
-                    "Received Deregistration Request from UE (amf_ue_ngap_id={})",
-                    ul_nas.amf_ue_ngap_id
-                );
+        if inner.len() < 3 || inner[0] != 0x7E {
+            log::warn!("Decoded NAS message malformed, discarding");
+            return Ok(());
+        }
+        let msg_type = inner[2];
 
-                // Send Deregistration Accept
-                let dereg_accept = vec![0x7E, 0x00, 0x46]; // EPD + SecHdr + Dereg Accept
-                let dl_nas = match crate::ngap_asn1::build_downlink_nas_transport_asn1(
+        match msg_type {
+            message_type::REGISTRATION_REQUEST => {
+                // Mobility / periodic registration update over existing connection
+                self.handle_registration_request_nas(
+                    association_id,
                     ul_nas.amf_ue_ngap_id,
                     ul_nas.ran_ue_ngap_id,
-                    &dereg_accept,
-                ) {
-                    Some(bytes) => bytes,
-                    None => return Ok(()),
-                };
-                self.send_to_association(association_id, &dl_nas).await?;
-                log::info!("Deregistration Accept sent to UE");
+                    &inner,
+                )
+                .await?;
+            }
+            message_type::IDENTITY_RESPONSE => {
+                self.handle_identity_response_nas(
+                    association_id,
+                    ul_nas.amf_ue_ngap_id,
+                    ul_nas.ran_ue_ngap_id,
+                    &inner,
+                )
+                .await?;
+            }
+            message_type::AUTHENTICATION_RESPONSE => {
+                self.handle_authentication_response_nas(
+                    association_id,
+                    ul_nas.amf_ue_ngap_id,
+                    ul_nas.ran_ue_ngap_id,
+                    &inner,
+                )
+                .await?;
+            }
+            message_type::AUTHENTICATION_FAILURE => {
+                self.handle_authentication_failure_nas(
+                    association_id,
+                    ul_nas.amf_ue_ngap_id,
+                    ul_nas.ran_ue_ngap_id,
+                    &inner,
+                )
+                .await?;
+            }
+            message_type::SECURITY_MODE_COMPLETE => {
+                self.handle_security_mode_complete_nas(
+                    association_id,
+                    ul_nas.amf_ue_ngap_id,
+                    ul_nas.ran_ue_ngap_id,
+                    &inner,
+                )
+                .await?;
+            }
+            message_type::SECURITY_MODE_REJECT => {
+                let cause = inner.get(3).copied().unwrap_or(0);
+                log::error!(
+                    "Security Mode Reject from UE {} (5GMM cause #{cause}); aborting procedure",
+                    ul_nas.amf_ue_ngap_id
+                );
+                // TS 24.501 Section 5.4.2.5: abort the procedure; the network
+                // releases the N1 signalling connection.
+                self.release_ue(association_id, ul_nas.amf_ue_ngap_id, ul_nas.ran_ue_ngap_id, 1)
+                    .await?;
+            }
+            message_type::REGISTRATION_COMPLETE => {
+                if let Some(state) = self.ue_auth_state.get_mut(&ul_nas.amf_ue_ngap_id) {
+                    if matches!(
+                        state.retx,
+                        Some(NasRetx {
+                            timer: NasProcTimer::T3550,
+                            ..
+                        })
+                    ) {
+                        state.retx = None;
+                    }
+                    state.registered = true;
+                    state.amf_ue.current_guti = state.amf_ue.next_guti.clone();
+                    state.amf_ue.current_m_tmsi = Some(state.amf_ue.next_guti.tmsi);
+                    log::info!(
+                        "[{}] Registration Complete (5G-TMSI=0x{:08x})",
+                        state.suci,
+                        state.amf_ue.current_guti.tmsi
+                    );
+                }
+            }
+            message_type::SERVICE_REQUEST => {
+                self.handle_service_request_nas(
+                    association_id,
+                    ul_nas.amf_ue_ngap_id,
+                    ul_nas.ran_ue_ngap_id,
+                    &inner,
+                )
+                .await?;
+            }
+            message_type::DEREGISTRATION_REQUEST_FROM_UE => {
+                self.handle_deregistration_request_nas(
+                    association_id,
+                    ul_nas.amf_ue_ngap_id,
+                    ul_nas.ran_ue_ngap_id,
+                    &inner,
+                )
+                .await?;
+            }
+            message_type::DEREGISTRATION_ACCEPT_TO_UE => {
+                // UE acknowledged a network-initiated deregistration
+                log::info!(
+                    "Deregistration Accept from UE {} (network-initiated procedure done)",
+                    ul_nas.amf_ue_ngap_id
+                );
+                self.finish_deregistration(
+                    association_id,
+                    ul_nas.amf_ue_ngap_id,
+                    ul_nas.ran_ue_ngap_id,
+                )
+                .await?;
+            }
+            message_type::UL_NAS_TRANSPORT => {
+                self.handle_ul_nas_transport_nas(
+                    association_id,
+                    ul_nas.amf_ue_ngap_id,
+                    ul_nas.ran_ue_ngap_id,
+                    &inner,
+                )
+                .await?;
+            }
+            message_type::GMM_STATUS => {
+                let cause = inner.get(3).copied().unwrap_or(0);
+                log::warn!("5GMM Status from UE {}: cause #{cause}", ul_nas.amf_ue_ngap_id);
+            }
+            other => {
+                log::warn!("Unhandled 5GMM message type 0x{other:02x}");
             }
         }
 
-        // Forward to event handler
+        // Forward to event handler for FSM bookkeeping
         if let Some(session) = self.sessions.read().await.get(&association_id) {
             let event = AmfEvent::ngap_message(session.id, data.to_vec());
             let _ = self.event_tx.send(event).await;
         }
 
+        Ok(())
+    }
+
+    /// Handle a (plain) Registration Request NAS PDU
+    async fn handle_registration_request_nas(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        nas: &[u8],
+    ) -> Result<()> {
+        let Some(req) = parse_registration_request_pdu(nas) else {
+            log::error!("Malformed Registration Request: rejecting (#96)");
+            let reject =
+                gmm_build::build_registration_reject(GmmCause::InvalidMandatoryInformation);
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                .await?;
+            return Ok(());
+        };
+
+        log::info!(
+            "Registration Request: type={}, ngKSI={}/{}, identity_type={}, suci={:?}",
+            req.registration_type,
+            req.tsc,
+            req.ksi,
+            req.identity_type,
+            req.suci
+        );
+
+        // Periodic registration updating with live security context: refresh
+        if req.registration_type == crate::gmm_build::registration_type::PERIODIC_UPDATING {
+            if let Some(state) = self.ue_auth_state.get(&amf_ue_ngap_id) {
+                if state.amf_ue.security_context_available && state.registered {
+                    log::info!("Periodic Registration Update from UE {amf_ue_ngap_id}");
+                    self.send_registration_accept(association_id, amf_ue_ngap_id, ran_ue_ngap_id)
+                        .await?;
+                    return Ok(());
+                }
+            }
+            // No context: the UE identity cannot be derived (TS 24.501 5.5.1.3.5)
+            let reject = gmm_build::build_registration_reject(
+                GmmCause::UeIdentityCannotBeDerivedByTheNetwork,
+            );
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                .await?;
+            return Ok(());
+        }
+
+        let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) else {
+            // Mobility update on an unknown UE: reject so it re-registers
+            let reject = gmm_build::build_registration_reject(
+                GmmCause::UeIdentityCannotBeDerivedByTheNetwork,
+            );
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                .await?;
+            return Ok(());
+        };
+
+        state.amf_ue.registration_type = req.registration_type;
+        state.amf_ue.nas_ue_tsc = req.tsc;
+        state.amf_ue.nas_ue_ksi = req.ksi;
+        // Store the UE security capability EXACTLY as received so the
+        // Security Mode Command replays it (TS 33.501 Section 6.7.2)
+        if let Some(cap) = req.sec_cap {
+            state.amf_ue.ue_security_capability = cap;
+        } else {
+            log::warn!(
+                "Registration Request without UE security capability IE; \
+                 assuming null algorithms only (no capability fabrication)"
+            );
+            state.amf_ue.ue_security_capability = UeSecurityCapability {
+                ea: 0x80, // 5G-EA0 only
+                ia: 0x80, // 5G-IA0 only
+                eea: 0,
+                eia: 0,
+            };
+        }
+        state.amf_ue.requested_nssai = req.requested_nssai.clone();
+
+        match req.identity_type {
+            t if t == mobile_identity_type::SUCI => {
+                let Some(suci) = req.suci else {
+                    let reject = gmm_build::build_registration_reject(
+                        GmmCause::InvalidMandatoryInformation,
+                    );
+                    self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                        .await?;
+                    return Ok(());
+                };
+                state.suci = suci.clone();
+                state.amf_ue.suci = Some(suci);
+                if let Some(plmn) = req.plmn {
+                    state.amf_ue.home_plmn_id = plmn;
+                }
+                self.start_authentication(association_id, amf_ue_ngap_id, ran_ue_ngap_id, None)
+                    .await?;
+            }
+            t if t == mobile_identity_type::GUTI => {
+                if let Some(guti) = req.guti {
+                    state.amf_ue.old_guti = guti;
+                }
+                // GUTI unknown to this AMF instance: identify the UE by SUCI
+                // (TS 24.501 Section 5.4.3) and arm T3570
+                log::info!("Registration with unknown 5G-GUTI: requesting SUCI");
+                let identity_request =
+                    gmm_build::build_identity_request(mobile_identity_type::SUCI);
+                let ngap_pdu = self
+                    .send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &identity_request)
+                    .await?;
+                self.arm_retx(amf_ue_ngap_id, NasProcTimer::T3570, ngap_pdu);
+            }
+            other => {
+                log::error!("Unsupported mobile identity type {other} in Registration Request");
+                let reject =
+                    gmm_build::build_registration_reject(GmmCause::InvalidMandatoryInformation);
+                self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Start (or restart, on SQN resync) 5G-AKA via AUSF
+    /// (TS 23.502 Section 4.2.2.2.2 step 9 / TS 33.501 Section 6.1.3.2)
+    async fn start_authentication(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        resync: Option<([u8; 16], [u8; 14])>,
+    ) -> Result<()> {
+        let Some(mut state) = self.ue_auth_state.remove(&amf_ue_ngap_id) else {
+            return Ok(());
+        };
+
+        let (ausf_host, ausf_port) = crate::sbi_path::resolve_nf_endpoint_async(
+            crate::sbi_path::SbiServiceType::NausfAuth,
+        )
+        .await
+        .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
+
+        // Serving network name from the serving PLMN (TS 24.501 / TS 33.501 6.1.1.4)
+        let snn = serving_network_name_from_plmn(&state.amf_ue.nr_tai.plmn_id);
+
+        match crate::sbi_path::call_ausf_authenticate_with_resync(
+            &ausf_host,
+            ausf_port,
+            &state.suci,
+            &snn,
+            resync,
+        )
+        .await
+        {
+            Ok(auth_resp) => {
+                state.auth_ctx_id = auth_resp.auth_ctx_id;
+                state.amf_ue.rand = auth_resp.rand;
+                state.autn = auth_resp.autn;
+                state.amf_ue.autn = auth_resp.autn.to_vec();
+                state.amf_ue.hxres_star = auth_resp.hxres_star;
+                // Initial ABBA (TS 33.501 Annex A.7.1)
+                state.amf_ue.abba = [0x00, 0x00];
+                state.amf_ue.abba_len = 2;
+                state.amf_ue.nas_tsc = 0;
+                state.amf_ue.nas_ksi = 0;
+
+                let auth_request = gmm_build::build_authentication_request(&state.amf_ue);
+                self.ue_auth_state.insert(amf_ue_ngap_id, state);
+
+                let ngap_pdu = self
+                    .send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &auth_request)
+                    .await?;
+                self.arm_retx(amf_ue_ngap_id, NasProcTimer::T3560, ngap_pdu);
+                log::info!("Authentication Request sent to UE {amf_ue_ngap_id}");
+            }
+            Err(e) => {
+                log::error!("AUSF authentication failed for {}: {e}", state.suci);
+                let cause = gmm_cause_from_sbi_error(&e);
+                let reject = gmm_build::build_registration_reject(cause);
+                self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                    .await?;
+                self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle Authentication Response: verify HXRES*, confirm with AUSF,
+    /// derive the key hierarchy and send Security Mode Command
+    async fn handle_authentication_response_nas(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        nas: &[u8],
+    ) -> Result<()> {
+        // Authentication response parameter (IEI 0x2D, TLV, RES* 16 bytes)
+        let mut res_star: Option<[u8; 16]> = None;
+        let mut pos = 3;
+        while pos + 1 < nas.len() {
+            if nas[pos] == 0x2D {
+                let len = nas[pos + 1] as usize;
+                if len == 16 && pos + 2 + 16 <= nas.len() {
+                    let mut rs = [0u8; 16];
+                    rs.copy_from_slice(&nas[pos + 2..pos + 18]);
+                    res_star = Some(rs);
+                }
+                break;
+            }
+            pos += 1;
+        }
+
+        let Some(rs) = res_star else {
+            log::error!("Authentication Response without RES*");
+            return Ok(());
+        };
+
+        let Some(mut state) = self.ue_auth_state.remove(&amf_ue_ngap_id) else {
+            log::warn!("Authentication Response for unknown UE {amf_ue_ngap_id}");
+            return Ok(());
+        };
+
+        // Stop T3560
+        if matches!(
+            state.retx,
+            Some(NasRetx {
+                timer: NasProcTimer::T3560,
+                ..
+            })
+        ) {
+            state.retx = None;
+        }
+
+        // Verify HRES* against HXRES* (TS 33.501 Section 6.1.3.2.0)
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(state.amf_ue.rand);
+        hasher.update(rs);
+        let digest = hasher.finalize();
+        let mut hres_star = [0u8; 16];
+        hres_star.copy_from_slice(&digest[16..32]);
+        let mut expected = [0u8; 16];
+        expected.copy_from_slice(&state.amf_ue.hxres_star[..16]);
+
+        if hres_star != expected {
+            log::error!("HXRES* verification failed - sending Authentication Reject");
+            let auth_reject = gmm_build::build_authentication_reject();
+            self.ue_auth_state.insert(amf_ue_ngap_id, state);
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &auth_reject)
+                .await?;
+            self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                .await?;
+            return Ok(());
+        }
+
+        // 5G-AKA confirmation toward AUSF -> KSEAF + SUPI
+        let (ausf_host, ausf_port) = crate::sbi_path::resolve_nf_endpoint_async(
+            crate::sbi_path::SbiServiceType::NausfAuth,
+        )
+        .await
+        .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
+
+        let confirm = match crate::sbi_path::call_ausf_5g_aka_confirm(
+            &ausf_host,
+            ausf_port,
+            &state.auth_ctx_id,
+            &rs,
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                log::error!("AUSF 5G-AKA confirmation failed: {e}");
+                let auth_reject = gmm_build::build_authentication_reject();
+                self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &auth_reject)
+                    .await?;
+                self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                    .await?;
+                return Ok(());
+            }
+        };
+
+        if confirm.auth_result != "AUTHENTICATION_SUCCESS" {
+            log::error!("AUSF reports {}: Authentication Reject", confirm.auth_result);
+            let auth_reject = gmm_build::build_authentication_reject();
+            self.ue_auth_state.insert(amf_ue_ngap_id, state);
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &auth_reject)
+                .await?;
+            self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                .await?;
+            return Ok(());
+        }
+
+        // SUPI (from AUSF) and key hierarchy:
+        // KSEAF -> KAMF (A.7) -> KNASint/KNASenc (A.8)
+        let supi = confirm
+            .supi
+            .clone()
+            .unwrap_or_else(|| supi_from_suci(&state.suci));
+        state.amf_ue.supi = Some(supi.clone());
+
+        let abba_len = state.amf_ue.abba_len as usize;
+        let kamf = ogs_crypt::kdf::ogs_kdf_kamf(&supi, &state.amf_ue.abba[..abba_len], &confirm.kseaf);
+        state.amf_ue.kamf = kamf;
+
+        // Select NAS algorithms from the UE's replayed capabilities and the
+        // AMF-supported set (configured order; default NIA2/NEA2 preference)
+        let amf_int_mask = {
+            let ctx = self.amf_context.read().await;
+            algorithm_order_to_mask(&ctx.integrity_order, 0x0E) // NIA1-3, never NIA0 by preference
+        };
+        let amf_enc_mask = {
+            let ctx = self.amf_context.read().await;
+            algorithm_order_to_mask(&ctx.ciphering_order, 0x0F)
+        };
+        let ue_int_mask = wire_caps_to_mask(state.amf_ue.ue_security_capability.ia);
+        let ue_enc_mask = wire_caps_to_mask(state.amf_ue.ue_security_capability.ea);
+
+        state.amf_ue.selected_int_algorithm =
+            nas_security::select_integrity_algorithm(ue_int_mask, amf_int_mask);
+        state.amf_ue.selected_enc_algorithm =
+            nas_security::select_encryption_algorithm(ue_enc_mask, amf_enc_mask);
+
+        let knas_int = ogs_crypt::kdf::ogs_kdf_nas_5gs(
+            0x02, // N-NAS-int-alg (TS 33.501 Annex A.8)
+            state.amf_ue.selected_int_algorithm,
+            &kamf,
+        );
+        let knas_enc = ogs_crypt::kdf::ogs_kdf_nas_5gs(
+            0x01, // N-NAS-enc-alg
+            state.amf_ue.selected_enc_algorithm,
+            &kamf,
+        );
+        state.amf_ue.knas_int.copy_from_slice(&knas_int);
+        state.amf_ue.knas_enc.copy_from_slice(&knas_enc);
+
+        log::info!(
+            "[{supi}] keys derived; selected NIA{} / NEA{}",
+            state.amf_ue.selected_int_algorithm,
+            state.amf_ue.selected_enc_algorithm
+        );
+
+        // Security Mode Command: plain inner built by gmm_build (replaying the
+        // UE's actual capabilities), wrapped integrity-protected with the new
+        // 5G NAS security context (TS 24.501 Section 5.4.2.2)
+        let Some(smc_plain) = gmm_build::build_security_mode_command(&state.amf_ue) else {
+            self.ue_auth_state.insert(amf_ue_ngap_id, state);
+            return Ok(());
+        };
+        let Some(smc_protected) = nas_security::nas_5gs_security_encode(
+            &mut state.amf_ue,
+            &smc_plain,
+            security_header::INTEGRITY_PROTECTED_WITH_NEW_5G_NAS_SECURITY_CONTEXT,
+        ) else {
+            self.ue_auth_state.insert(amf_ue_ngap_id, state);
+            return Ok(());
+        };
+
+        self.ue_auth_state.insert(amf_ue_ngap_id, state);
+        let ngap_pdu = self
+            .send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &smc_protected)
+            .await?;
+        self.arm_retx(amf_ue_ngap_id, NasProcTimer::T3560, ngap_pdu);
+        log::info!("Security Mode Command sent to UE {amf_ue_ngap_id} (protected)");
+        Ok(())
+    }
+
+    /// Handle Authentication Failure (TS 24.501 Section 5.4.1.3.7):
+    /// - cause #20 (MAC failure): one re-authentication attempt, then reject
+    /// - cause #21 (synch failure): SQN resynchronisation toward AUSF using
+    ///   the AUTS parameter, then a fresh Authentication Request
+    async fn handle_authentication_failure_nas(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        nas: &[u8],
+    ) -> Result<()> {
+        let cause = nas.get(3).copied().unwrap_or(0);
+        log::warn!("Authentication Failure from UE {amf_ue_ngap_id}: 5GMM cause #{cause}");
+
+        // Authentication failure parameter (IEI 0x30, TLV, AUTS 14 bytes)
+        let mut auts: Option<[u8; 14]> = None;
+        let mut pos = 4;
+        while pos + 1 < nas.len() {
+            if nas[pos] == 0x30 {
+                let len = nas[pos + 1] as usize;
+                if len == 14 && pos + 2 + 14 <= nas.len() {
+                    let mut a = [0u8; 14];
+                    a.copy_from_slice(&nas[pos + 2..pos + 16]);
+                    auts = Some(a);
+                }
+                break;
+            }
+            pos += 1;
+        }
+
+        let (failure_count, rand) = match self.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+            Some(state) => {
+                state.auth_failure_count += 1;
+                if matches!(
+                    state.retx,
+                    Some(NasRetx {
+                        timer: NasProcTimer::T3560,
+                        ..
+                    })
+                ) {
+                    state.retx = None;
+                }
+                (state.auth_failure_count, state.amf_ue.rand)
+            }
+            None => return Ok(()),
+        };
+
+        if failure_count > 1 {
+            log::error!("Repeated authentication failure: Authentication Reject");
+            let auth_reject = gmm_build::build_authentication_reject();
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &auth_reject)
+                .await?;
+            self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                .await?;
+            return Ok(());
+        }
+
+        match cause {
+            21 => {
+                // Synch failure: re-resolve the vector with AUTS (resync)
+                let Some(auts) = auts else {
+                    log::error!("Synch failure without AUTS parameter: Authentication Reject");
+                    let auth_reject = gmm_build::build_authentication_reject();
+                    self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &auth_reject)
+                        .await?;
+                    self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                        .await?;
+                    return Ok(());
+                };
+                self.start_authentication(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    Some((rand, auts)),
+                )
+                .await?;
+            }
+            20 | 26 | 71 => {
+                // MAC failure / non-5G auth unacceptable / ngKSI in use:
+                // one fresh authentication attempt
+                self.start_authentication(association_id, amf_ue_ngap_id, ran_ue_ngap_id, None)
+                    .await?;
+            }
+            _ => {
+                log::error!("Unhandled auth failure cause #{cause}: Authentication Reject");
+                let auth_reject = gmm_build::build_authentication_reject();
+                self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &auth_reject)
+                    .await?;
+                self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle Identity Response (TS 24.501 Section 5.4.3): SUCI before
+    /// authentication, or PEI (IMEI/IMEISV) after security establishment
+    async fn handle_identity_response_nas(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        nas: &[u8],
+    ) -> Result<()> {
+        if nas.len() < 5 {
+            return Ok(());
+        }
+        let id_len = ((nas[3] as usize) << 8) | (nas[4] as usize);
+        if id_len == 0 || nas.len() < 5 + id_len {
+            log::error!("Malformed Identity Response");
+            return Ok(());
+        }
+        let content = &nas[5..5 + id_len];
+        let id_type = content[0] & 0x07;
+
+        let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) else {
+            return Ok(());
+        };
+        // Stop T3570
+        if matches!(
+            state.retx,
+            Some(NasRetx {
+                timer: NasProcTimer::T3570,
+                ..
+            })
+        ) {
+            state.retx = None;
+        }
+
+        match id_type {
+            t if t == mobile_identity_type::SUCI => {
+                if let Some((suci, plmn)) = parse_suci_identity(content) {
+                    log::info!("Identity Response: SUCI {suci}");
+                    state.suci = suci.clone();
+                    state.amf_ue.suci = Some(suci);
+                    state.amf_ue.home_plmn_id = plmn;
+                    self.start_authentication(association_id, amf_ue_ngap_id, ran_ue_ngap_id, None)
+                        .await?;
+                } else {
+                    log::error!("Failed to parse SUCI from Identity Response");
+                }
+            }
+            t if t == mobile_identity_type::IMEISV || t == mobile_identity_type::IMEI => {
+                let pei = decode_bcd_digits(&content[1..]);
+                log::info!("Identity Response: PEI {pei}");
+                state.amf_ue.pei = Some(format!("imeisv-{pei}"));
+                state.amf_ue.imeisv = Some(pei);
+                if state.pei_requested {
+                    state.pei_requested = false;
+                    self.complete_registration(association_id, amf_ue_ngap_id, ran_ue_ngap_id)
+                        .await?;
+                }
+            }
+            other => {
+                log::error!("Unsupported identity type {other} in Identity Response");
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle Security Mode Complete (TS 24.501 Section 5.4.2.4):
+    /// extract IMEISV if present (it was requested in the SMC), request PEI
+    /// via Identity Request otherwise, then run the registration SBI calls
+    async fn handle_security_mode_complete_nas(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        nas: &[u8],
+    ) -> Result<()> {
+        log::info!("Security Mode Complete from UE {amf_ue_ngap_id}");
+
+        let mut need_pei = false;
+        {
+            let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) else {
+                return Ok(());
+            };
+            // Stop T3560
+            if matches!(
+                state.retx,
+                Some(NasRetx {
+                    timer: NasProcTimer::T3560,
+                    ..
+                })
+            ) {
+                state.retx = None;
+            }
+
+            // IMEISV (mobile identity IEI 0x77, TLV-E) — requested in the SMC
+            let mut pos = 3;
+            while pos + 2 < nas.len() {
+                if nas[pos] == 0x77 {
+                    let len = ((nas[pos + 1] as usize) << 8) | (nas[pos + 2] as usize);
+                    if len > 0 && pos + 3 + len <= nas.len() {
+                        let content = &nas[pos + 3..pos + 3 + len];
+                        if content[0] & 0x07 == mobile_identity_type::IMEISV {
+                            let imeisv = decode_bcd_digits(&content[1..]);
+                            log::info!("IMEISV from Security Mode Complete: {imeisv}");
+                            state.amf_ue.imeisv = Some(imeisv.clone());
+                            state.amf_ue.pei = Some(format!("imeisv-{imeisv}"));
+                        }
+                    }
+                    break;
+                }
+                pos += 1;
+            }
+
+            if state.amf_ue.pei.is_none() {
+                need_pei = true;
+                state.pei_requested = true;
+            }
+        }
+
+        if need_pei {
+            // PEI not provided: Identity Request for IMEISV (protected),
+            // TS 24.501 Section 5.4.3 / TS 23.502 step 11
+            log::info!("No PEI yet: sending Identity Request (IMEISV)");
+            let plain = gmm_build::build_identity_request(mobile_identity_type::IMEISV);
+            let Some(protected) = self.protect_nas(amf_ue_ngap_id, &plain) else {
+                return Ok(());
+            };
+            let ngap_pdu = self
+                .send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
+                .await?;
+            self.arm_retx(amf_ue_ngap_id, NasProcTimer::T3570, ngap_pdu);
+            return Ok(());
+        }
+
+        self.complete_registration(association_id, amf_ue_ngap_id, ran_ue_ngap_id)
+            .await
+    }
+
+    /// Run the three mandatory registration SBI calls and, only if all
+    /// succeed, send the protected Registration Accept
+    /// (TS 23.502 Section 4.2.2.2.2 steps 14a/14b/14c/16)
+    async fn complete_registration(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+    ) -> Result<()> {
+        let Some(mut state) = self.ue_auth_state.remove(&amf_ue_ngap_id) else {
+            return Ok(());
+        };
+
+        let supi = state
+            .amf_ue
+            .supi
+            .clone()
+            .unwrap_or_else(|| supi_from_suci(&state.suci));
+
+        let (serving_mcc, serving_mnc) = plmn_mcc_mnc_strings(&state.amf_ue.nr_tai.plmn_id);
+
+        // GUAMI of this AMF (for UECM registration)
+        let (guami_plmn, amf_region, amf_set, amf_pointer) = {
+            let ctx = self.amf_context.read().await;
+            match ctx.served_guami.first() {
+                Some(g) => (
+                    g.plmn_id.clone(),
+                    g.amf_id.region,
+                    g.amf_id.set,
+                    g.amf_id.pointer,
+                ),
+                None => (state.amf_ue.nr_tai.plmn_id.clone(), 2, 1, 0),
+            }
+        };
+        let amf_id_hex = format!(
+            "{:06x}",
+            ((amf_region as u32) << 16) | ((amf_set as u32) << 6) | (amf_pointer as u32)
+        );
+        let (guami_mcc, guami_mnc) = plmn_mcc_mnc_strings(&guami_plmn);
+
+        let (udm_host, udm_port) = crate::sbi_path::resolve_nf_endpoint_async(
+            crate::sbi_path::SbiServiceType::NudmUecm,
+        )
+        .await
+        .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
+
+        // 1) Nudm_UECM_Registration (amf-3gpp-access)
+        if let Err(e) = crate::sbi_path::call_udm_uecm_registration(
+            &udm_host,
+            udm_port,
+            &supi,
+            &amf_instance_id(),
+            &guami_mcc,
+            &guami_mnc,
+            &amf_id_hex,
+        )
+        .await
+        {
+            log::error!("[{supi}] Nudm_UECM_Registration failed: {e}");
+            let reject = gmm_build::build_registration_reject(gmm_cause_from_sbi_error(&e));
+            self.ue_auth_state.insert(amf_ue_ngap_id, state);
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                .await?;
+            self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                .await?;
+            return Ok(());
+        }
+
+        // 2) Nudm_SDM_Get (am-data) + Nudm_SDM_Subscribe
+        let am_data = match crate::sbi_path::call_udm_sdm_get_am_data(&udm_host, udm_port, &supi)
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                log::error!("[{supi}] Nudm_SDM_Get failed: {e}");
+                let reject = gmm_build::build_registration_reject(gmm_cause_from_sbi_error(&e));
+                self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                    .await?;
+                self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                    .await?;
+                return Ok(());
+            }
+        };
+        match crate::sbi_path::call_udm_sdm_subscribe(&udm_host, udm_port, &supi, &amf_instance_id())
+            .await
+        {
+            Ok(sub_id) => state.sdm_subscription_id = Some(sub_id),
+            Err(e) => {
+                log::error!("[{supi}] Nudm_SDM_Subscribe failed: {e}");
+                let reject = gmm_build::build_registration_reject(gmm_cause_from_sbi_error(&e));
+                self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                    .await?;
+                self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                    .await?;
+                return Ok(());
+            }
+        }
+
+        // 3) Npcf_AMPolicyControl_Create
+        let (pcf_host, pcf_port) = crate::sbi_path::resolve_nf_endpoint_async(
+            crate::sbi_path::SbiServiceType::NpcfAmPolicyControl,
+        )
+        .await
+        .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
+        match crate::sbi_path::call_pcf_am_policy_create(
+            &pcf_host,
+            pcf_port,
+            &supi,
+            &serving_mcc,
+            &serving_mnc,
+        )
+        .await
+        {
+            Ok(assoc) => {
+                state.policy_association_id = Some(assoc.clone());
+                state.amf_ue.policy_association.id = Some(assoc);
+            }
+            Err(e) => {
+                log::error!("[{supi}] Npcf_AMPolicyControl_Create failed: {e}");
+                let reject = gmm_build::build_registration_reject(gmm_cause_from_sbi_error(&e));
+                self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                    .await?;
+                self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                    .await?;
+                return Ok(());
+            }
+        }
+
+        // Allowed NSSAI: subscribed (UDM) > requested > PLMN support config
+        let mut allowed: Vec<SNssai> = am_data
+            .nssai
+            .iter()
+            .map(|(sst, sd)| SNssai { sst: *sst, sd: *sd })
+            .collect();
+        if allowed.is_empty() {
+            allowed = state.amf_ue.requested_nssai.clone();
+        }
+        if allowed.is_empty() {
+            let ctx = self.amf_context.read().await;
+            if let Some(ps) = ctx.plmn_support.first() {
+                allowed = ps.s_nssai.clone();
+            }
+        }
+        state.amf_ue.allowed_nssai = allowed;
+
+        // New 5G-GUTI: GUAMI of this AMF + CSPRNG 5G-TMSI (TS 23.003 2.10.1)
+        state.amf_ue.generate_new_guti();
+        state.amf_ue.next_guti.plmn_id = guami_plmn;
+        state.amf_ue.next_guti.amf_region_id = amf_region;
+        state.amf_ue.next_guti.amf_set_id = amf_set;
+        state.amf_ue.next_guti.amf_pointer = amf_pointer;
+
+        self.ue_auth_state.insert(amf_ue_ngap_id, state);
+        self.send_registration_accept(association_id, amf_ue_ngap_id, ran_ue_ngap_id)
+            .await
+    }
+
+    /// Build and send the protected Registration Accept and arm T3550
+    async fn send_registration_accept(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+    ) -> Result<()> {
+        let Some(mut state) = self.ue_auth_state.remove(&amf_ue_ngap_id) else {
+            return Ok(());
+        };
+
+        let Some(plain) = gmm_build::build_registration_accept(&state.amf_ue) else {
+            self.ue_auth_state.insert(amf_ue_ngap_id, state);
+            return Ok(());
+        };
+        let Some(protected) = nas_security::nas_5gs_security_encode(
+            &mut state.amf_ue,
+            &plain,
+            security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
+        ) else {
+            log::error!("Failed to protect Registration Accept (no security context?)");
+            self.ue_auth_state.insert(amf_ue_ngap_id, state);
+            return Ok(());
+        };
+
+        let tmsi = state.amf_ue.next_guti.tmsi;
+        self.ue_auth_state.insert(amf_ue_ngap_id, state);
+
+        let ngap_pdu = self
+            .send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
+            .await?;
+        self.arm_retx(amf_ue_ngap_id, NasProcTimer::T3550, ngap_pdu);
+        log::info!(
+            "Registration Accept sent to UE {amf_ue_ngap_id} (protected, TAI list + Allowed NSSAI, 5G-TMSI=0x{tmsi:08x})"
+        );
+        Ok(())
+    }
+
+    /// Handle Service Request (TS 24.501 Section 5.6.1)
+    async fn handle_service_request_nas(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        nas: &[u8],
+    ) -> Result<()> {
+        let service_type = nas.get(3).map(|b| (b >> 4) & 0x0F).unwrap_or(0);
+        log::info!("Service Request from UE {amf_ue_ngap_id}: service_type={service_type}");
+
+        let has_context = self
+            .ue_auth_state
+            .get(&amf_ue_ngap_id)
+            .map(|s| s.amf_ue.security_context_available && s.registered)
+            .unwrap_or(false);
+
+        if !has_context {
+            // TS 24.501 Section 5.6.1.5: cause #9 forces re-registration
+            let reject = gmm_build::build_service_reject(
+                &AmfUe::default(),
+                GmmCause::UeIdentityCannotBeDerivedByTheNetwork,
+            );
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                .await?;
+            return Ok(());
+        }
+
+        // PDU session status (IEI 0x50, TLV) if present
+        if let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+            let mut pos = 4;
+            state.amf_ue.pdu_session_status_present = false;
+            while pos + 1 < nas.len() {
+                if nas[pos] == 0x50 {
+                    let len = nas[pos + 1] as usize;
+                    if len >= 2 && pos + 2 + len <= nas.len() {
+                        state.amf_ue.pdu_session_status_present = true;
+                        state.amf_ue.pdu_session_status =
+                            ((nas[pos + 2] as u16) << 8) | nas[pos + 3] as u16;
+                    }
+                    break;
+                }
+                pos += 1;
+            }
+        }
+
+        let plain = {
+            let state = self.ue_auth_state.get(&amf_ue_ngap_id).expect("checked");
+            gmm_build::build_service_accept(&state.amf_ue).unwrap_or_default()
+        };
+        let Some(protected) = self.protect_nas(amf_ue_ngap_id, &plain) else {
+            return Ok(());
+        };
+        self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
+            .await?;
+        log::info!("Service Accept sent to UE {amf_ue_ngap_id} (protected)");
+        Ok(())
+    }
+
+    /// Handle UE-initiated Deregistration Request (TS 24.501 Section 5.5.2.2):
+    /// release all PDU sessions at the SMF, purge the UDM registration, send
+    /// Deregistration Accept (unless switch-off) and release the NG context
+    async fn handle_deregistration_request_nas(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        nas: &[u8],
+    ) -> Result<()> {
+        // De-registration type (low nibble of octet 4): bit4 (0x08) = switch off
+        let dereg_type = nas.get(3).copied().unwrap_or(0);
+        let switch_off = dereg_type & 0x08 != 0;
+        log::info!(
+            "Deregistration Request from UE {amf_ue_ngap_id} (switch_off={switch_off})"
+        );
+
+        // Release every PDU session at the SMF (TS 23.502 Section 4.2.2.3.2
+        // step 5: Nsmf_PDUSession_ReleaseSMContext)
+        self.release_all_pdu_sessions(amf_ue_ngap_id).await;
+
+        // Purge the AMF registration at UDM
+        if let Some(state) = self.ue_auth_state.get(&amf_ue_ngap_id) {
+            if let Some(supi) = state.amf_ue.supi.clone() {
+                let (udm_host, udm_port) = crate::sbi_path::resolve_nf_endpoint_async(
+                    crate::sbi_path::SbiServiceType::NudmUecm,
+                )
+                .await
+                .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
+                if let Err(e) =
+                    crate::sbi_path::call_udm_uecm_deregistration(&udm_host, udm_port, &supi).await
+                {
+                    log::warn!("[{supi}] UDM purge on deregistration failed: {e}");
+                }
+            }
+        }
+
+        // Deregistration Accept (not sent when the UE switched off,
+        // TS 24.501 Section 5.5.2.2.2)
+        if !switch_off {
+            let plain = gmm_build::build_deregistration_accept(&AmfUe::default())
+                .unwrap_or_else(|| vec![0x7E, 0x00, 0x46]);
+            let pdu = self
+                .protect_nas(amf_ue_ngap_id, &plain)
+                .unwrap_or(plain);
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &pdu)
+                .await?;
+            log::info!("Deregistration Accept sent to UE {amf_ue_ngap_id}");
+        }
+
+        self.finish_deregistration(association_id, amf_ue_ngap_id, ran_ue_ngap_id)
+            .await
+    }
+
+    /// Common tail of both deregistration directions: drop the NAS state and
+    /// release the NG UE context (Cause NAS deregister)
+    async fn finish_deregistration(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+    ) -> Result<()> {
+        self.ue_auth_state.remove(&amf_ue_ngap_id);
+        // Cause: NAS deregister (TS 38.413 Section 9.3.1.2, CauseNas value 2)
+        self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 2)
+            .await
+    }
+
+    /// Network-initiated Deregistration Request (TS 24.501 Section 5.5.2.3).
+    ///
+    /// Sends a protected DEREGISTRATION REQUEST (0x47) and arms T3522.
+    /// PDU sessions are released when the Deregistration Accept arrives (or
+    /// on T3522 exhaustion, the implicit-deregistration abnormal action).
+    pub async fn send_network_initiated_deregistration(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        reregistration_required: bool,
+        gmm_cause: Option<GmmCause>,
+    ) -> Result<()> {
+        let Some(state) = self.ue_auth_state.get(&amf_ue_ngap_id) else {
+            return Err(anyhow::anyhow!("UE {amf_ue_ngap_id} not found"));
+        };
+        let association_id = state.association_id;
+        let ran_ue_ngap_id = state.ran_ue_ngap_id;
+
+        let reason = if reregistration_required {
+            crate::gmm_build::DeregistrationReason::ReregistrationRequired
+        } else {
+            crate::gmm_build::DeregistrationReason::UeNotSwitchOff
+        };
+        let plain = gmm_build::build_deregistration_request(&AmfUe::default(), reason, gmm_cause)
+            .unwrap_or_default();
+        let Some(protected) = self.protect_nas(amf_ue_ngap_id, &plain) else {
+            return Err(anyhow::anyhow!("no security context for UE {amf_ue_ngap_id}"));
+        };
+        let ngap_pdu = self
+            .send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
+            .await?;
+        self.arm_retx(amf_ue_ngap_id, NasProcTimer::T3522, ngap_pdu);
+        log::info!("Network-initiated Deregistration Request sent to UE {amf_ue_ngap_id}");
+        Ok(())
+    }
+
+    /// Handle UL NAS TRANSPORT (0x67, TS 24.501 Section 5.4.5): route N1 SM
+    /// to the SMF; reply with cause #90 for container types without a
+    /// forwarding target; 5GMM Status on protocol errors
+    async fn handle_ul_nas_transport_nas(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        nas: &[u8],
+    ) -> Result<()> {
+        if nas.len() < 6 {
+            return Ok(());
+        }
+        let container_type = nas[3] & 0x0F;
+        let container_len = ((nas[4] as usize) << 8) | (nas[5] as usize);
+        if nas.len() < 6 + container_len {
+            log::error!("UL NAS Transport container truncated");
+            return Ok(());
+        }
+        let container = nas[6..6 + container_len].to_vec();
+
+        // Optional IEs after the container: PDU session ID (IEI 0x12, TV)
+        let mut psi: Option<u8> = None;
+        let mut pos = 6 + container_len;
+        while pos < nas.len() {
+            match nas[pos] {
+                0x12 if pos + 1 < nas.len() => {
+                    psi = Some(nas[pos + 1]);
+                    pos += 2;
+                }
+                0x59 if pos + 1 < nas.len() => pos += 2, // Old PDU session ID (TV)
+                0x22 if pos + 1 < nas.len() => {
+                    // S-NSSAI (TLV)
+                    pos += 2 + nas[pos + 1] as usize;
+                }
+                0x25 if pos + 1 < nas.len() => {
+                    // DNN (TLV)
+                    pos += 2 + nas[pos + 1] as usize;
+                }
+                b if b & 0x80 != 0 => pos += 1, // type-1 TV (e.g. request type 0x8-)
+                _ => break,
+            }
+        }
+
+        let transport = crate::gmm_handler::UlNasTransport {
+            payload_container_type: container_type,
+            payload_container: container.clone(),
+            pdu_session_id: psi,
+            ..Default::default()
+        };
+
+        // Parse/validate via the GMM handler
+        let action = {
+            let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) else {
+                return Ok(());
+            };
+            let ran_ue = crate::context::RanUe::default();
+            crate::gmm_handler::handle_ul_nas_transport(&mut state.amf_ue, &ran_ue, &transport)
+        };
+
+        match action {
+            Ok(crate::gmm_handler::UlTransportAction::RouteToSmf { .. }) => {
+                self.handle_5gsm_message(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &container)
+                    .await?;
+            }
+            Ok(crate::gmm_handler::UlTransportAction::PayloadNotForwarded) => {
+                // DL NAS TRANSPORT with the original payload + cause #90
+                // (TS 24.501 Section 5.4.5.3.1)
+                let plain = gmm_build::build_dl_nas_transport(
+                    None,
+                    container_type,
+                    &container,
+                    Some(GmmCause::PayloadWasNotForwarded),
+                    None,
+                )
+                .unwrap_or_default();
+                if let Some(protected) = self.protect_nas(amf_ue_ngap_id, &plain) {
+                    self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
+                        .await?;
+                }
+            }
+            Err(cause) => {
+                // Protocol error: 5GMM STATUS (TS 24.501 Section 5.4.7)
+                let plain = gmm_build::build_gmm_status(cause).unwrap_or_default();
+                if let Some(protected) = self.protect_nas(amf_ue_ngap_id, &plain) {
+                    self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle a 5GSM PDU (from an UL NAS TRANSPORT N1 SM container, or a
+    /// legacy raw 5GSM NAS PDU): SBI toward the SMF + N1/N2 distribution
+    async fn handle_5gsm_message(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        sm_pdu: &[u8],
+    ) -> Result<()> {
+        if sm_pdu.len() < 4 {
+            return Ok(());
+        }
+        let psi = sm_pdu[1];
+        let pti = sm_pdu[2];
+        let sm_msg_type = sm_pdu[3];
+        log::info!("5GSM message: PSI={psi}, PTI={pti}, msg_type=0x{sm_msg_type:02x}");
+
+        let (smf_host, smf_port) = crate::sbi_path::resolve_nf_endpoint_async(
+            crate::sbi_path::SbiServiceType::NsmfPdusession,
+        )
+        .await
+        .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
+
+        match sm_msg_type {
+            // PDU Session Establishment Request
+            0xC1 => {
+                log::info!("PDU Session Establishment Request from UE: PSI={psi}, PTI={pti}");
+
+                // S-NSSAI/DNN: from the UE's allowed slice when known
+                let (sst, sd) = self
+                    .ue_auth_state
+                    .get(&amf_ue_ngap_id)
+                    .and_then(|s| s.amf_ue.allowed_nssai.first().map(|n| (n.sst, n.sd)))
+                    .unwrap_or((1, None));
+                let dnn = "internet";
+
+                match crate::sbi_path::call_smf_create_sm_context(
+                    &smf_host, smf_port, psi, sst, sd, dnn, sm_pdu,
+                )
+                .await
+                {
+                    Ok(resp) => {
+                        log::info!(
+                            "SMF SM Context Created: ref={}, n1_len={}, n2_len={}",
+                            resp.sm_context_ref,
+                            resp.n1_sm_msg.len(),
+                            resp.n2_sm_info.len()
+                        );
+
+                        // N1: PDU Session Establishment Accept via DL NAS
+                        // TRANSPORT (protected when a context exists)
+                        self.send_n1_sm_to_ue(
+                            association_id,
+                            amf_ue_ngap_id,
+                            ran_ue_ngap_id,
+                            psi,
+                            &resp.n1_sm_msg,
+                        )
+                        .await?;
+
+                        // N2: PDU Session Resource Setup Request toward the gNB
+                        let setup_req =
+                            match crate::ngap_asn1::build_pdu_session_resource_setup_request_asn1(
+                                amf_ue_ngap_id,
+                                ran_ue_ngap_id,
+                                psi,
+                                sst,
+                                sd,
+                                None,
+                                &resp.n2_sm_info,
+                            ) {
+                                Some(bytes) => bytes,
+                                None => {
+                                    log::error!(
+                                        "Failed to build PDU Session Resource Setup Request"
+                                    );
+                                    return Ok(());
+                                }
+                            };
+                        self.send_to_association(association_id, &setup_req).await?;
+                        log::info!("PDU Session Resource Setup Request sent to gNB: PSI={psi}");
+                    }
+                    Err(e) => {
+                        // No local fabrication of sessions: PDU SESSION
+                        // ESTABLISHMENT REJECT, 5GSM cause #26 insufficient
+                        // resources (TS 24.501 Section 8.3.3)
+                        log::warn!("SMF SM Context Create failed ({e}); rejecting PSI={psi}");
+                        let reject = vec![0x2E, psi, pti, 0xC3, 0x1A];
+                        self.send_n1_sm_to_ue(
+                            association_id,
+                            amf_ue_ngap_id,
+                            ran_ue_ngap_id,
+                            psi,
+                            &reject,
+                        )
+                        .await?;
+                    }
+                }
+            }
+            // PDU Session Modification Request
+            0xC9 => {
+                log::info!("PDU Session Modification Request from UE: PSI={psi}, PTI={pti}");
+                let sm_context_ref = format!("{psi}");
+
+                match crate::sbi_path::call_smf_update_sm_context_with_n1(
+                    &smf_host,
+                    smf_port,
+                    &sm_context_ref,
+                    sm_pdu,
+                )
+                .await
+                {
+                    Ok(resp) => {
+                        // PDU Session Modification Command to UE (from SMF N1
+                        // when provided)
+                        let n1 = if resp.n1_sm_msg.is_empty() {
+                            vec![0x2E, psi, pti, 0xCB]
+                        } else {
+                            resp.n1_sm_msg.clone()
+                        };
+                        self.send_n1_sm_to_ue(
+                            association_id,
+                            amf_ue_ngap_id,
+                            ran_ue_ngap_id,
+                            psi,
+                            &n1,
+                        )
+                        .await?;
+
+                        if !resp.n2_sm_info.is_empty() {
+                            let modify_req = match crate::ngap_asn1::build_pdu_session_resource_modify_request_asn1(
+                                amf_ue_ngap_id,
+                                ran_ue_ngap_id,
+                                psi,
+                                None,
+                                &resp.n2_sm_info,
+                            ) {
+                                Some(bytes) => bytes,
+                                None => {
+                                    log::error!("Failed to build PDU Session Resource Modify Request");
+                                    return Ok(());
+                                }
+                            };
+                            self.send_to_association(association_id, &modify_req).await?;
+                            log::info!(
+                                "PDU Session Resource Modify Request sent to gNB: PSI={psi}"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("SMF modification failed ({e}), sending reject");
+                        // PDU SESSION MODIFICATION REJECT, cause #26
+                        let reject = vec![0x2E, psi, pti, 0xCC, 0x1A];
+                        self.send_n1_sm_to_ue(
+                            association_id,
+                            amf_ue_ngap_id,
+                            ran_ue_ngap_id,
+                            psi,
+                            &reject,
+                        )
+                        .await?;
+                    }
+                }
+            }
+            // PDU Session Modification Complete
+            0xCD => {
+                log::info!("PDU Session Modification Complete from UE: PSI={psi}");
+            }
+            // PDU Session Release Request
+            0xD1 => {
+                log::info!("PDU Session Release Request from UE: PSI={psi}, PTI={pti}");
+                let sm_context_ref = format!("{psi}");
+
+                match crate::sbi_path::call_smf_release_sm_context(
+                    &smf_host,
+                    smf_port,
+                    &sm_context_ref,
+                )
+                .await
+                {
+                    Ok(()) => log::info!("SMF SM Context Released: PSI={psi}"),
+                    Err(e) => log::warn!("SMF release failed: {e}"),
+                }
+
+                // PDU Session Release Command (cause #36 regular deactivation)
+                let release_cmd = vec![0x2E, psi, pti, 0xD3, 0x24];
+                self.send_n1_sm_to_ue(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    psi,
+                    &release_cmd,
+                )
+                .await?;
+
+                let release_ngap =
+                    match crate::ngap_asn1::build_pdu_session_resource_release_command_asn1(
+                        amf_ue_ngap_id,
+                        ran_ue_ngap_id,
+                        &[psi],
+                    ) {
+                        Some(bytes) => bytes,
+                        None => {
+                            log::error!("Failed to build PDU Session Resource Release Command");
+                            return Ok(());
+                        }
+                    };
+                self.send_to_association(association_id, &release_ngap).await?;
+                log::info!("PDU Session Resource Release Command sent to gNB: PSI={psi}");
+            }
+            // PDU Session Release Complete
+            0xD6 => {
+                log::info!("PDU Session Release Complete from UE: PSI={psi}");
+            }
+            other => {
+                log::warn!("Unhandled 5GSM message type 0x{other:02x}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Send an N1 SM payload to the UE inside a protected DL NAS TRANSPORT
+    /// (TS 24.501 Section 5.4.5.2). Falls back to the bare container only if
+    /// no security context exists (pre-Rel-15 sim compatibility).
+    async fn send_n1_sm_to_ue(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        psi: u8,
+        n1_sm: &[u8],
+    ) -> Result<()> {
+        let plain = gmm_build::build_dl_nas_transport(
+            Some(psi),
+            payload_container_type::N1_SM_INFORMATION,
+            n1_sm,
+            None,
+            None,
+        )
+        .unwrap_or_default();
+
+        let pdu = match self.protect_nas(amf_ue_ngap_id, &plain) {
+            Some(p) => p,
+            None => {
+                log::warn!(
+                    "No NAS security context for UE {amf_ue_ngap_id}: sending bare N1 SM (legacy peer)"
+                );
+                n1_sm.to_vec()
+            }
+        };
+        self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &pdu)
+            .await?;
+        Ok(())
+    }
+
+    /// Protect a plain inner NAS message with the UE's security context
+    /// (integrity protected + ciphered). Returns None without a context.
+    fn protect_nas(&mut self, amf_ue_ngap_id: u64, plain: &[u8]) -> Option<Vec<u8>> {
+        let state = self.ue_auth_state.get_mut(&amf_ue_ngap_id)?;
+        if !state.amf_ue.security_context_available {
+            return None;
+        }
+        nas_security::nas_5gs_security_encode(
+            &mut state.amf_ue,
+            plain,
+            security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
+        )
+    }
+
+    /// Build a Downlink NAS Transport NGAP PDU and send it.
+    /// Returns the NGAP PDU bytes for retransmission arming.
+    async fn send_nas_pdu(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        nas: &[u8],
+    ) -> Result<Vec<u8>> {
+        let pdu = crate::ngap_asn1::build_downlink_nas_transport_asn1(
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            nas,
+        )
+        .ok_or_else(|| anyhow::anyhow!("Failed to build Downlink NAS Transport"))?;
+        self.send_to_association(association_id, &pdu).await?;
+        Ok(pdu)
+    }
+
+    /// Arm a GMM procedure retransmission timer for a UE
+    fn arm_retx(&mut self, amf_ue_ngap_id: u64, timer: NasProcTimer, ngap_pdu: Vec<u8>) {
+        let (_max, duration) = timer.config(&self.timer_configs);
+        if let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+            state.retx = Some(NasRetx {
+                timer,
+                deadline: Instant::now() + duration,
+                retries: 0,
+                ngap_pdu,
+            });
+        }
+    }
+
+    /// Process GMM procedure timers: retransmit up to the configured maximum,
+    /// then apply the per-timer abnormal action (TS 24.501 Sections 5.4.1.3.7,
+    /// 5.4.3.7, 5.5.1.2.8, 5.5.2.3.6)
+    async fn process_nas_timers(&mut self) -> Result<()> {
+        let now = Instant::now();
+        let due: Vec<u64> = self
+            .ue_auth_state
+            .iter()
+            .filter(|(_, s)| s.retx.as_ref().is_some_and(|r| r.deadline <= now))
+            .map(|(id, _)| *id)
+            .collect();
+
+        for amf_ue_ngap_id in due {
+            let Some(mut state) = self.ue_auth_state.remove(&amf_ue_ngap_id) else {
+                continue;
+            };
+            let Some(mut retx) = state.retx.take() else {
+                self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                continue;
+            };
+            let (max_count, duration) = retx.timer.config(&self.timer_configs);
+
+            if retx.retries < max_count {
+                retx.retries += 1;
+                retx.deadline = now + duration;
+                log::info!(
+                    "{:?} expired for UE {amf_ue_ngap_id}: retransmission {}/{max_count}",
+                    retx.timer,
+                    retx.retries
+                );
+                let association_id = state.association_id;
+                let pdu = retx.ngap_pdu.clone();
+                state.retx = Some(retx);
+                self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                let _ = self.send_to_association(association_id, &pdu).await;
+                continue;
+            }
+
+            // Maximum retransmissions reached: abnormal action
+            log::warn!(
+                "{:?} max retransmissions reached for UE {amf_ue_ngap_id}: aborting procedure",
+                retx.timer
+            );
+            let association_id = state.association_id;
+            let ran_ue_ngap_id = state.ran_ue_ngap_id;
+            match retx.timer {
+                NasProcTimer::T3550 => {
+                    // Abort; the network considers the new GUTI valid
+                    // (TS 24.501 Section 5.5.1.2.8 case c)
+                    state.registered = true;
+                    state.amf_ue.current_guti = state.amf_ue.next_guti.clone();
+                    self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                }
+                NasProcTimer::T3560 => {
+                    // Abort authentication/SMC and release the N1 connection
+                    self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                    self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                        .await?;
+                    self.ue_auth_state.remove(&amf_ue_ngap_id);
+                }
+                NasProcTimer::T3570 => {
+                    if state.pei_requested {
+                        // PEI identification aborted: continue registration
+                        state.pei_requested = false;
+                        self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                        self.complete_registration(
+                            association_id,
+                            amf_ue_ngap_id,
+                            ran_ue_ngap_id,
+                        )
+                        .await?;
+                    } else {
+                        // SUCI identification aborted: release
+                        self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                        self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                            .await?;
+                        self.ue_auth_state.remove(&amf_ue_ngap_id);
+                    }
+                }
+                NasProcTimer::T3522 => {
+                    // Implicit deregistration (TS 24.501 Section 5.5.2.3.6)
+                    self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                    self.release_all_pdu_sessions(amf_ue_ngap_id).await;
+                    self.ue_auth_state.remove(&amf_ue_ngap_id);
+                    self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 2)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Release every PDU session of a UE at the SMF
+    /// (Nsmf_PDUSession_ReleaseSMContext)
+    async fn release_all_pdu_sessions(&mut self, amf_ue_ngap_id: u64) {
+        let (smf_host, smf_port) = crate::sbi_path::resolve_nf_endpoint_async(
+            crate::sbi_path::SbiServiceType::NsmfPdusession,
+        )
+        .await
+        .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
+
+        // Collect SM context refs from the global AMF context (copy out under
+        // the lock, then call SBI without holding it)
+        let sm_context_refs: Vec<(u8, String)> = {
+            let mut refs = Vec::new();
+            let ctx = crate::context::amf_self();
+            if let Ok(context) = ctx.read() {
+                let amf_ue_id = context
+                    .ran_ue_find_by_amf_ue_ngap_id(amf_ue_ngap_id)
+                    .map(|ran_ue| ran_ue.amf_ue_id)
+                    .unwrap_or(amf_ue_ngap_id);
+                for sess in context.sess_list_for_ue(amf_ue_id).iter() {
+                    if let Some(ref r) = sess.sm_context_ref {
+                        refs.push((sess.psi, r.clone()));
+                    }
+                }
+            }
+            refs
+        };
+
+        for (psi, sm_context_ref) in &sm_context_refs {
+            match crate::sbi_path::call_smf_release_sm_context(&smf_host, smf_port, sm_context_ref)
+                .await
+            {
+                Ok(()) => log::info!("SMF SM Context Released: PSI={psi}"),
+                Err(e) => log::warn!("SMF release failed for PSI={psi}: {e}"),
+            }
+        }
+    }
+
+    /// Send a UEContextReleaseCommand with a NAS cause and drop the UE's
+    /// NAS state (0 = normal-release, 1 = authentication-failure,
+    /// 2 = deregister)
+    async fn release_ue(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        nas_cause: u8,
+    ) -> Result<()> {
+        self.ue_auth_state.remove(&amf_ue_ngap_id);
+        if let Some(cmd) = crate::ngap_asn1::build_ue_context_release_command_asn1(
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            ngap_handler::cause_group::NAS,
+            nas_cause as i64,
+        ) {
+            self.send_to_association(association_id, &cmd).await?;
+            log::info!("UE Context Release Command sent (UE {amf_ue_ngap_id}, NAS cause {nas_cause})");
+        }
         Ok(())
     }
 
@@ -1841,6 +2900,280 @@ impl NgapServer {
     }
 }
 
+// ============================================================================
+// NAS parsing / helper functions (TS 24.501)
+// ============================================================================
+
+/// Stable AMF NF instance ID for SBI registrations/subscriptions
+fn amf_instance_id() -> String {
+    static ID: once_cell::sync::Lazy<String> =
+        once_cell::sync::Lazy::new(|| uuid::Uuid::new_v4().to_string());
+    ID.clone()
+}
+
+/// Parsed Registration Request (TS 24.501 Section 8.2.6)
+#[derive(Debug, Clone, Default)]
+struct ParsedRegistrationRequest {
+    registration_type: u8,
+    tsc: u8,
+    ksi: u8,
+    identity_type: u8,
+    suci: Option<String>,
+    guti: Option<Guti5gs>,
+    plmn: Option<PlmnId>,
+    sec_cap: Option<UeSecurityCapability>,
+    requested_nssai: Vec<SNssai>,
+}
+
+/// Parse a plain Registration Request NAS PDU
+fn parse_registration_request_pdu(nas: &[u8]) -> Option<ParsedRegistrationRequest> {
+    // EPD + sec hdr + msg type + (ngKSI | 5GS registration type) + LV-E identity
+    if nas.len() < 6 {
+        return None;
+    }
+    let mut req = ParsedRegistrationRequest {
+        registration_type: nas[3] & 0x07,
+        tsc: (nas[3] >> 7) & 0x01,
+        ksi: (nas[3] >> 4) & 0x07,
+        ..Default::default()
+    };
+
+    // 5GS mobile identity (LV-E: 2-byte length)
+    let id_len = ((nas[4] as usize) << 8) | (nas[5] as usize);
+    if id_len == 0 || nas.len() < 6 + id_len {
+        return None;
+    }
+    let identity = &nas[6..6 + id_len];
+    req.identity_type = identity[0] & 0x07;
+    match req.identity_type {
+        t if t == mobile_identity_type::SUCI => {
+            if let Some((suci, plmn)) = parse_suci_identity(identity) {
+                req.suci = Some(suci);
+                req.plmn = Some(plmn);
+            }
+        }
+        t if t == mobile_identity_type::GUTI => {
+            req.guti = crate::gmm_handler::parse_guti(identity);
+        }
+        _ => {}
+    }
+
+    // Optional IEs
+    let mut pos = 6 + id_len;
+    while pos < nas.len() {
+        let iei = nas[pos];
+        match iei {
+            // UE security capability (IEI 0x2E, TLV)
+            0x2E => {
+                if pos + 1 >= nas.len() {
+                    break;
+                }
+                let len = nas[pos + 1] as usize;
+                if len >= 2 && pos + 2 + len <= nas.len() {
+                    req.sec_cap = Some(UeSecurityCapability {
+                        ea: nas[pos + 2],
+                        ia: nas[pos + 3],
+                        eea: if len >= 3 { nas[pos + 4] } else { 0 },
+                        eia: if len >= 4 { nas[pos + 5] } else { 0 },
+                    });
+                }
+                pos += 2 + len;
+            }
+            // Requested NSSAI (IEI 0x2F, TLV)
+            0x2F => {
+                if pos + 1 >= nas.len() {
+                    break;
+                }
+                let len = nas[pos + 1] as usize;
+                if pos + 2 + len <= nas.len() {
+                    req.requested_nssai = parse_nssai_value(&nas[pos + 2..pos + 2 + len]);
+                }
+                pos += 2 + len;
+            }
+            // Last visited registered TAI (IEI 0x52, TV, 7 bytes total)
+            0x52 => pos += 7,
+            // TLV-E IEs (2-byte length): EPS NAS container (0x70),
+            // NAS message container (0x71), additional GUTI (0x77),
+            // payload containers (0x7B/0x7C)
+            0x70 | 0x71 | 0x77 | 0x7B | 0x7C => {
+                if pos + 2 >= nas.len() {
+                    break;
+                }
+                let len = ((nas[pos + 1] as usize) << 8) | (nas[pos + 2] as usize);
+                pos += 3 + len;
+            }
+            // Type-1 TV (IEI in high nibble)
+            b if b & 0x80 != 0 => pos += 1,
+            // Default: assume TLV
+            _ => {
+                if pos + 1 >= nas.len() {
+                    break;
+                }
+                let len = nas[pos + 1] as usize;
+                pos += 2 + len;
+            }
+        }
+    }
+
+    Some(req)
+}
+
+/// Parse an NSSAI IE value into S-NSSAIs (TS 24.501 Section 9.11.3.37)
+fn parse_nssai_value(data: &[u8]) -> Vec<SNssai> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos < data.len() {
+        let len = data[pos] as usize;
+        if len == 0 || pos + 1 + len > data.len() {
+            break;
+        }
+        let sst = data[pos + 1];
+        let sd = if len >= 4 {
+            Some(
+                ((data[pos + 2] as u32) << 16)
+                    | ((data[pos + 3] as u32) << 8)
+                    | data[pos + 4] as u32,
+            )
+        } else {
+            None
+        };
+        out.push(SNssai { sst, sd });
+        pos += 1 + len;
+    }
+    out
+}
+
+/// Parse a SUCI mobile identity content (TS 24.501 Section 9.11.3.4)
+///
+/// Returns the SUCI in the string form
+/// `suci-0-<mcc>-<mnc>-<routing>-<scheme>-<hnkey>-<schemeoutput>` plus the
+/// home PLMN.
+fn parse_suci_identity(content: &[u8]) -> Option<(String, PlmnId)> {
+    if content.len() < 9 {
+        return None;
+    }
+    let supi_format = (content[0] >> 4) & 0x07;
+    if supi_format != 0 {
+        // Only IMSI-format SUCI supported here (network-specific NAI deferred)
+        return None;
+    }
+    let plmn = PlmnId {
+        mcc1: content[1] & 0x0f,
+        mcc2: (content[1] >> 4) & 0x0f,
+        mcc3: content[2] & 0x0f,
+        mnc3: (content[2] >> 4) & 0x0f,
+        mnc1: content[3] & 0x0f,
+        mnc2: (content[3] >> 4) & 0x0f,
+    };
+    let (mcc, mnc) = plmn_mcc_mnc_strings(&plmn);
+    let routing = decode_bcd_digits(&content[4..6]);
+    let scheme = content[6] & 0x0f;
+    let hn_key = content[7];
+    let scheme_output = decode_bcd_digits(&content[8..]);
+
+    let suci = format!("suci-0-{mcc}-{mnc}-{routing}-{scheme}-{hn_key}-{scheme_output}");
+    Some((suci, plmn))
+}
+
+/// Derive a SUPI string from a null-scheme SUCI
+/// ("suci-0-mcc-mnc-routing-0-0-msin" -> "imsi-mccmncmsin")
+fn supi_from_suci(suci: &str) -> String {
+    let parts: Vec<&str> = suci.split('-').collect();
+    if parts.len() >= 8 && parts[0] == "suci" {
+        format!("imsi-{}{}{}", parts[2], parts[3], parts[7])
+    } else {
+        suci.to_string()
+    }
+}
+
+/// Decode (nibble-swapped) BCD digits, skipping 0xF fillers
+fn decode_bcd_digits(data: &[u8]) -> String {
+    let mut s = String::with_capacity(data.len() * 2);
+    for b in data {
+        let lo = b & 0x0f;
+        let hi = (b >> 4) & 0x0f;
+        if lo <= 9 {
+            s.push((b'0' + lo) as char);
+        }
+        if hi <= 9 {
+            s.push((b'0' + hi) as char);
+        }
+    }
+    s
+}
+
+/// MCC/MNC digit strings from a PLMN ID
+fn plmn_mcc_mnc_strings(plmn: &PlmnId) -> (String, String) {
+    let mcc = format!("{}{}{}", plmn.mcc1, plmn.mcc2, plmn.mcc3);
+    let mnc = if plmn.mnc3 == 0xf {
+        format!("{}{}", plmn.mnc1, plmn.mnc2)
+    } else {
+        format!("{}{}{}", plmn.mnc1, plmn.mnc2, plmn.mnc3)
+    };
+    (mcc, mnc)
+}
+
+/// Serving network name (TS 24.501 Section 9.12.1 / TS 33.501 Section 6.1.1.4)
+fn serving_network_name_from_plmn(plmn: &PlmnId) -> String {
+    let (mcc, mnc) = plmn_mcc_mnc_strings(plmn);
+    format!("5G:mnc{mnc:0>3}.mcc{mcc:0>3}.3gppnetwork.org")
+}
+
+/// Convert a wire-format security capability octet (bit 8 = algorithm 0,
+/// TS 24.501 Section 9.11.3.54) into the bit-N = algorithm-N mask used by
+/// the algorithm selection helpers
+fn wire_caps_to_mask(wire: u8) -> u8 {
+    let mut mask = 0u8;
+    for n in 0..8 {
+        if wire & (0x80 >> n) != 0 {
+            mask |= 1 << n;
+        }
+    }
+    mask
+}
+
+/// Convert a configured algorithm preference order into a support mask;
+/// `default_mask` when no order is configured
+fn algorithm_order_to_mask(order: &[u8], default_mask: u8) -> u8 {
+    if order.is_empty() {
+        return default_mask;
+    }
+    let mut mask = 0u8;
+    for alg in order {
+        if *alg < 8 {
+            mask |= 1 << *alg;
+        }
+    }
+    mask
+}
+
+/// Map an SBI error to a 5GMM reject cause (TS 24.501 Annex A; mirrors the
+/// Open5GS gmm_cause_from_sbi mapping — no blanket "unspecified")
+fn gmm_cause_from_sbi_error(err: &crate::sbi_path::SbiError) -> GmmCause {
+    use crate::sbi_path::SbiError;
+    match err {
+        SbiError::RequestFailed(msg) => {
+            if msg.contains("404") {
+                // Subscriber unknown
+                GmmCause::UeIdentityCannotBeDerivedByTheNetwork
+            } else if msg.contains("403") {
+                GmmCause::FiveGsServicesNotAllowed
+            } else if msg.contains("400") {
+                GmmCause::SemanticallyIncorrectMessage
+            } else {
+                // Peer unreachable / 5xx: the payload could not be forwarded
+                GmmCause::PayloadWasNotForwarded
+            }
+        }
+        SbiError::Timeout | SbiError::GatewayTimeout => GmmCause::PayloadWasNotForwarded,
+        SbiError::NfInstanceNotFound | SbiError::ServiceNotFound(_) => {
+            GmmCause::PayloadWasNotForwarded
+        }
+        SbiError::ResponseParseError(_) => GmmCause::SemanticallyIncorrectMessage,
+        SbiError::InvalidState => GmmCause::MessageNotCompatibleWithTheProtocolState,
+    }
+}
+
 /// NGAP server wrapper with mutable SCTP access
 pub struct NgapServerHandle {
     inner: Arc<Mutex<NgapServer>>,
@@ -1962,5 +3295,281 @@ mod tests {
         assert_eq!(session.id, 1);
         assert_eq!(session.association_id, 100);
         assert_eq!(session.addr, addr);
+    }
+
+    // ------------------------------------------------------------------
+    // NAS parsing round-trips (TS 24.501)
+    // ------------------------------------------------------------------
+
+    /// Synthetic Registration Request: SUCI (mcc 999 / mnc 70), UE security
+    /// capability EA0-3/IA0-3, requested NSSAI SST=1
+    fn sample_registration_request() -> Vec<u8> {
+        let mut nas = vec![
+            0x7E, 0x00, 0x41, // 5GMM plain Registration Request
+            0x09, // ngKSI=0 (native), 5GS registration type = initial(1) + FOR
+        ];
+        // 5GS mobile identity (LV-E): SUCI, IMSI format
+        let suci = vec![
+            0x01, // SUPI format IMSI, type SUCI
+            0x99, 0xF9, 0x07, // PLMN 999/70 (mcc 999, 2-digit mnc 70, filler F)
+            0xF0, 0xFF, // routing indicator "0"
+            0x00, // protection scheme: null
+            0x00, // home network public key id
+            0x00, 0x00, 0x00, 0x00, 0x10, // MSIN BCD
+        ];
+        nas.extend_from_slice(&(suci.len() as u16).to_be_bytes());
+        nas.extend_from_slice(&suci);
+        // UE security capability (IEI 0x2E): EA0-3, IA0-3
+        nas.extend_from_slice(&[0x2E, 0x02, 0xF0, 0xF0]);
+        // Requested NSSAI (IEI 0x2F): one S-NSSAI, SST=1
+        nas.extend_from_slice(&[0x2F, 0x02, 0x01, 0x01]);
+        nas
+    }
+
+    #[test]
+    fn test_parse_registration_request_suci_caps_nssai() {
+        let nas = sample_registration_request();
+        let req = parse_registration_request_pdu(&nas).expect("parse");
+
+        assert_eq!(req.registration_type, 1); // initial
+        assert_eq!(req.identity_type, mobile_identity_type::SUCI);
+        let suci = req.suci.expect("suci");
+        assert!(suci.starts_with("suci-0-999-70-"), "{suci}");
+        let cap = req.sec_cap.expect("sec cap");
+        assert_eq!(cap.ea, 0xF0);
+        assert_eq!(cap.ia, 0xF0);
+        assert_eq!(req.requested_nssai.len(), 1);
+        assert_eq!(req.requested_nssai[0].sst, 1);
+    }
+
+    #[test]
+    fn test_parse_registration_request_rejects_truncated() {
+        // Strict peer behaviour: missing mandatory mobile identity -> None
+        assert!(parse_registration_request_pdu(&[0x7E, 0x00, 0x41, 0x09]).is_none());
+        // Identity length larger than buffer -> None
+        assert!(parse_registration_request_pdu(&[0x7E, 0x00, 0x41, 0x09, 0x00, 0x20, 0x01])
+            .is_none());
+    }
+
+    #[test]
+    fn test_registration_accept_mandatory_ies_and_protection() {
+        let mut amf_ue = AmfUe::new(1, 1);
+        amf_ue.access_type = 1;
+        amf_ue.nr_tai = crate::context::Tai5gs {
+            plmn_id: PlmnId::new("999", "70"),
+            tac: 1,
+        };
+        amf_ue.allowed_nssai = vec![SNssai { sst: 1, sd: None }];
+        amf_ue.generate_new_guti();
+        let tmsi = amf_ue.next_guti.tmsi;
+        assert_ne!(tmsi, 0);
+
+        let plain = gmm_build::build_registration_accept(&amf_ue).expect("accept");
+        // Plain inner: EPD + plain hdr + msg type + result LV
+        assert_eq!(&plain[..3], &[0x7E, 0x00, 0x42]);
+        assert_eq!(plain[3], 1); // result length
+        assert_eq!(plain[4] & 0x07, 1); // 3GPP access
+
+        // Mandatory registration-area IEs present
+        assert!(plain.contains(&0x54), "TAI list IEI missing");
+        assert!(plain.contains(&0x15), "Allowed NSSAI IEI missing");
+        assert!(plain.contains(&0x77), "5G-GUTI IEI missing");
+
+        // Strict peer: protect with NIA2/NEA2 and verify the security header
+        amf_ue.selected_int_algorithm = 2;
+        amf_ue.selected_enc_algorithm = 2;
+        amf_ue.knas_int = [0x11; 16];
+        amf_ue.knas_enc = [0x22; 16];
+        let protected = nas_security::nas_5gs_security_encode(
+            &mut amf_ue,
+            &plain,
+            security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
+        )
+        .expect("protected");
+
+        assert_eq!(protected[0], 0x7E);
+        assert_eq!(
+            protected[1],
+            security_header::INTEGRITY_PROTECTED_AND_CIPHERED
+        );
+        assert_eq!(protected.len(), plain.len() + 7);
+        // MAC must be non-zero with NIA2
+        assert_ne!(&protected[2..6], &[0, 0, 0, 0]);
+        // Ciphered payload must differ from the plain message
+        assert_ne!(&protected[7..], &plain[..]);
+    }
+
+    #[test]
+    fn test_smc_replays_actual_ue_capabilities() {
+        let mut amf_ue = AmfUe::new(1, 1);
+        // Deliberately unusual capability pattern: must be replayed verbatim
+        amf_ue.ue_security_capability = UeSecurityCapability {
+            ea: 0x55,
+            ia: 0xAA,
+            eea: 0,
+            eia: 0,
+        };
+        amf_ue.selected_int_algorithm = 2;
+        amf_ue.selected_enc_algorithm = 0;
+
+        let smc = gmm_build::build_security_mode_command(&amf_ue).expect("smc");
+        assert_eq!(&smc[..3], &[0x7E, 0x00, 0x5D]);
+        // Selected NAS security algorithms (TS 24.501 9.11.3.34):
+        // ciphering high nibble (NEA0), integrity low nibble (NIA2)
+        assert_eq!(smc[3], 0x02);
+        // Replayed capability LV: find [len, 0x55, 0xAA]
+        assert!(
+            smc.windows(3).any(|w| w == [0x02, 0x55, 0xAA]),
+            "SMC must replay the UE's actual security capabilities: {smc:02x?}"
+        );
+        // The hardcoded 0xF0/0xF0 pattern must NOT appear
+        assert!(!smc.windows(2).any(|w| w == [0xF0, 0xF0]));
+    }
+
+    #[test]
+    fn test_strict_peer_rejects_tampered_mac() {
+        // Build an uplink-protected message the way the UE would, then check
+        // that the AMF-side decode flags a tampered MAC
+        let mut ue_side = AmfUe::new(1, 1);
+        ue_side.selected_int_algorithm = 2;
+        ue_side.selected_enc_algorithm = 0;
+        ue_side.knas_int = [0x11; 16];
+        ue_side.security_context_available = true;
+        ue_side.access_type = 1;
+
+        let inner = vec![0x7E, 0x00, 0x43]; // Registration Complete
+        let sqn: u8 = 0;
+        let mut mac_data = vec![sqn];
+        mac_data.extend_from_slice(&inner);
+        let mac = nas_security::nas_mac_calculate(
+            2,
+            &ue_side.knas_int,
+            0,
+            1,
+            nas_security::direction::UPLINK,
+            &mac_data,
+        );
+
+        let mut protected = vec![0x7E, security_header::INTEGRITY_PROTECTED];
+        protected.extend_from_slice(&mac);
+        protected.push(sqn);
+        protected.extend_from_slice(&inner);
+
+        // Valid MAC decodes without mac_failed
+        let mut amf_side = ue_side.clone();
+        amf_side.ul_count = 0;
+        let out =
+            nas_security::nas_5gs_security_decode(&mut amf_side, protected[1], &protected)
+                .expect("decode");
+        assert_eq!(out, inner);
+        assert!(!amf_side.mac_failed, "valid MAC must pass");
+
+        // Tampered MAC must be flagged (and the dispatcher discards it)
+        let mut tampered = protected.clone();
+        tampered[2] ^= 0xFF;
+        let mut amf_side2 = ue_side.clone();
+        amf_side2.ul_count = 0;
+        let _ = nas_security::nas_5gs_security_decode(&mut amf_side2, tampered[1], &tampered)
+            .expect("decode");
+        assert!(amf_side2.mac_failed, "tampered MAC must be detected");
+    }
+
+    #[test]
+    fn test_random_tmsi_is_not_ngap_id() {
+        let a = crate::context::generate_random_tmsi();
+        let b = crate::context::generate_random_tmsi();
+        assert_ne!(a, 0);
+        assert_ne!(a, u32::MAX);
+        // Two consecutive draws colliding is a 2^-32 event
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_wire_caps_to_mask() {
+        assert_eq!(wire_caps_to_mask(0xF0), 0x0F); // EA0-3 -> algorithms 0..3
+        assert_eq!(wire_caps_to_mask(0x80), 0x01); // EA0 only
+        assert_eq!(wire_caps_to_mask(0x20), 0x04); // EA2 only
+        // Selection from EA0-3 with default AMF mask prefers NEA2/NIA2
+        assert_eq!(
+            nas_security::select_integrity_algorithm(wire_caps_to_mask(0xF0), 0x0E),
+            2
+        );
+    }
+
+    #[test]
+    fn test_supi_from_suci() {
+        assert_eq!(
+            supi_from_suci("suci-0-999-70-0-0-0-0000000001"),
+            "imsi-999700000000001"
+        );
+        // Non-SUCI strings pass through
+        assert_eq!(supi_from_suci("imsi-001010000000001"), "imsi-001010000000001");
+    }
+
+    #[test]
+    fn test_serving_network_name() {
+        let plmn = PlmnId::new("999", "70");
+        assert_eq!(
+            serving_network_name_from_plmn(&plmn),
+            "5G:mnc070.mcc999.3gppnetwork.org"
+        );
+    }
+
+    #[test]
+    fn test_gmm_cause_from_sbi_error_mapping() {
+        use crate::sbi_path::SbiError;
+        // No "protocol error unspecified" blanket defaults
+        assert_eq!(
+            gmm_cause_from_sbi_error(&SbiError::RequestFailed("status 404".into())),
+            GmmCause::UeIdentityCannotBeDerivedByTheNetwork
+        );
+        assert_eq!(
+            gmm_cause_from_sbi_error(&SbiError::RequestFailed("status 403".into())),
+            GmmCause::FiveGsServicesNotAllowed
+        );
+        assert_eq!(
+            gmm_cause_from_sbi_error(&SbiError::GatewayTimeout),
+            GmmCause::PayloadWasNotForwarded
+        );
+    }
+
+    #[test]
+    fn test_tai_list_and_nssai_encoding_roundtrip() {
+        let tai = crate::context::Tai5gs {
+            plmn_id: PlmnId::new("999", "70"),
+            tac: 0x000001,
+        };
+        let encoded = gmm_build::encode_tai_list(&tai);
+        assert_eq!(encoded.len(), 7);
+        assert_eq!(encoded[0], 0x00); // list type 00, 1 element
+        assert_eq!(&encoded[4..7], &[0x00, 0x00, 0x01]); // TAC
+
+        let nssai = gmm_build::encode_nssai_value(&[
+            SNssai { sst: 1, sd: None },
+            SNssai {
+                sst: 2,
+                sd: Some(0x010203),
+            },
+        ]);
+        // [1, sst1] + [4, sst2, sd...]
+        assert_eq!(nssai, vec![1, 1, 4, 2, 0x01, 0x02, 0x03]);
+        // Round-trip through the registration-request NSSAI parser
+        let parsed = parse_nssai_value(&nssai);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].sst, 1);
+        assert_eq!(parsed[1].sd, Some(0x010203));
+    }
+
+    #[test]
+    fn test_nas_proc_timer_configs() {
+        let configs = AmfTimerConfigs::default();
+        let (max, dur) = NasProcTimer::T3560.config(&configs);
+        assert_eq!(max, 4); // 4 retransmissions = 5 transmissions total
+        assert_eq!(dur, Duration::from_secs(6));
+        let (max550, _) = NasProcTimer::T3550.config(&configs);
+        assert_eq!(max550, 4);
+        let (max522, dur522) = NasProcTimer::T3522.config(&configs);
+        assert_eq!(max522, 4);
+        assert_eq!(dur522, Duration::from_secs(3));
     }
 }

@@ -86,8 +86,8 @@ pub use scp::{
     global_scp_router, init_scp_router, ScpBinding, ScpRouter, ScpRoutingInfo, ScpRoutingMode,
 };
 pub use security::{
-    authorize_sbi_request, extract_bearer_token, validate_bearer_token, NrfSecurityConfig,
-    PqcKeyExchange, PqcSignature, PqcTlsConfig, SbiSecurityPolicy, TlsPaths, TlsVersion,
+    authorize_sbi_request, extract_bearer_token, NrfSecurityConfig, PqcKeyExchange, PqcSignature,
+    PqcTlsConfig, SbiSecurityPolicy, TlsPaths, TlsVersion,
 };
 pub use server::{
     send_bad_request, send_error, send_forbidden, send_gateway_timeout, send_internal_error,

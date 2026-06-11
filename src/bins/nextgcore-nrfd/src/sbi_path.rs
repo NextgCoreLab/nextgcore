@@ -493,9 +493,8 @@ mod tests {
                 mnc: "01".to_string(),
             }],
             ipv4_addresses: vec!["192.168.1.1".to_string()],
-            ipv6_addresses: vec![],
             fqdn: Some("amf.example.com".to_string()),
-            nf_services: vec![],
+            ..Default::default()
         }
     }
 

@@ -250,19 +250,88 @@ pub fn pcf_sbi_is_running() -> bool {
     SBI_SERVER_RUNNING.load(Ordering::SeqCst)
 }
 
-/// Send AM policy control notify to AMF
-/// Port of pcf_sbi_send_am_policy_control_notify() from sbi-path.c
+// ---------------------------------------------------------------------------
+// Outbound notification delivery (real HTTP POST — TS 29.507/29.512/29.514)
+// ---------------------------------------------------------------------------
+
+/// Extract the path component of a URI ("/a/b" from "http://h:p/a/b").
+fn uri_path(uri: &str) -> String {
+    let stripped = uri
+        .strip_prefix("https://")
+        .or_else(|| uri.strip_prefix("http://"))
+        .unwrap_or(uri);
+    match stripped.find('/') {
+        Some(idx) => stripped[idx..].to_string(),
+        None => String::new(),
+    }
+}
+
+/// POST a notification body to `{notification_uri}{suffix}` with bounded
+/// connect/request timeouts. Returns the HTTP status on success.
+pub async fn send_notification_post(
+    notification_uri: &str,
+    suffix: &str,
+    body: &serde_json::Value,
+) -> Result<u16, String> {
+    use ogs_sbi::client::{SbiClient, SbiClientConfig};
+    use std::time::Duration;
+
+    let (host, port) = parse_uri_host_port(notification_uri)?;
+    let path = format!("{}{}", uri_path(notification_uri), suffix);
+    let client = SbiClient::new(
+        SbiClientConfig::new(host, port)
+            .with_connect_timeout(Duration::from_secs(2))
+            .with_request_timeout(Duration::from_secs(3)),
+    );
+    let resp = client
+        .post_json(&path, body)
+        .await
+        .map_err(|e| format!("notification POST {path} failed: {e}"))?;
+    Ok(resp.status)
+}
+
+/// Spawn an async notification POST (fire-and-forget for sync call sites).
+fn spawn_notification(uri: String, suffix: &'static str, body: serde_json::Value, what: &'static str) -> bool {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                match send_notification_post(&uri, suffix, &body).await {
+                    Ok(status) if (200..300).contains(&status) => {
+                        log::info!("{what} notification delivered ({status}) to {uri}{suffix}");
+                    }
+                    Ok(status) => {
+                        log::warn!("{what} notification rejected ({status}) by {uri}{suffix}");
+                    }
+                    Err(e) => log::warn!("{what} notification failed: {e}"),
+                }
+            });
+            true
+        }
+        Err(_) => {
+            log::warn!("{what} notification skipped: no async runtime");
+            false
+        }
+    }
+}
+
+/// Send AM policy control update notify to the AMF over HTTP
+/// (TS 29.507 §4.2.3: POST {notificationUri}/update with PolicyUpdate).
 pub fn pcf_sbi_send_am_policy_control_notify(pcf_ue_am_id: u64) -> bool {
-    log::debug!("[ue_am_id={pcf_ue_am_id}] Sending AM policy control notify");
+    // Copy out what we need, then drop the guards (lock-order rule).
+    let info = crate::context::pcf_self().read().ok().and_then(|ctx| {
+        ctx.ue_am_find_by_id(pcf_ue_am_id)
+            .and_then(|ue| ue.notification_uri.clone().map(|uri| (uri, ue.association_id)))
+    });
+    let Some((uri, association_id)) = info else {
+        log::warn!("[ue_am_id={pcf_ue_am_id}] AM policy notify: no notification URI stored");
+        return false;
+    };
 
-    // In C implementation:
-    // 1. Get pcf_ue_am from ID
-    // 2. Get client from pcf_ue_am->namf
-    // 3. Build request using pcf_namf_callback_build_am_policy_control()
-    // 4. Send request to client with client_notify_cb callback
-
-    // Note: Notification sending requires HTTP client integration
-    true
+    let body = serde_json::json!({
+        "resourceUri": format!("/npcf-am-policy-control/v1/policies/{association_id}"),
+        "triggers": [],
+    });
+    spawn_notification(uri, "/update", body, "AM policy update")
 }
 
 /// Send SM policy control create response
@@ -271,69 +340,94 @@ pub fn pcf_sbi_send_smpolicycontrol_create_response(sess_id: u64, stream_id: u64
     log::debug!(
         "[sess_id={sess_id}, stream_id={stream_id}] Sending SM policy control create response"
     );
-
-    // In C implementation:
-    // 1. Get session and UE SM from IDs
-    // 2. Get session data from database
-    // 3. Build SmPolicyDecision with:
-    //    - Session rules (auth_sess_ambr, auth_def_qos)
-    //    - PCC rules
-    //    - QoS decisions
-    //    - Policy control request triggers
-    //    - Supported features
-    // 4. Build response with location header
-    // 5. Send response to stream
-
-    // Note: Response building and sending is handled by the HTTP handler in main.rs
+    // Response building and sending is handled by the HTTP handler in main.rs
     true
 }
 
-/// Send SM policy control update notify to SMF
-/// Port of pcf_sbi_send_smpolicycontrol_update_notify() from sbi-path.c
+/// Build the SmPolicyNotification body for a session (TS 29.512 §5.6.2.7).
+fn build_sm_policy_notification(sess: &crate::context::PcfSess) -> serde_json::Value {
+    // Re-evaluate the policy decision for the session from subscription data
+    let dnn = sess.dnn.clone().unwrap_or_else(|| "internet".to_string());
+    let decision = crate::nudr_handler::pcf_get_session_data("", None, &sess.s_nssai, &dnn)
+        .map(|sd| {
+            let parts = crate::build_sm_policy_decision(&sess.sm_policy_id, &sd);
+            serde_json::json!({
+                "sessRules": parts.sess_rules,
+                "pccRules": parts.pcc_rules,
+                "qosDecs": parts.qos_decs,
+                "chgDecs": parts.chg_decs,
+                "traffContDecs": parts.traff_cont_decs,
+            })
+        })
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    serde_json::json!({
+        "resourceUri": format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id),
+        "smPolicyDecision": decision,
+    })
+}
+
+/// Send SM policy control update notify to the SMF over HTTP
+/// (TS 29.512 §4.2.3.2: POST {notificationUri}/update with
+/// SmPolicyNotification).
 pub fn pcf_sbi_send_smpolicycontrol_update_notify(sess_id: u64) -> bool {
-    log::debug!("[sess_id={sess_id}] Sending SM policy control update notify");
-
-    // In C implementation:
-    // 1. Get session from ID
-    // 2. Get client from sess->nsmf
-    // 3. Build request using pcf_nsmf_callback_build_smpolicycontrol_update()
-    // 4. Send request to client with client_notify_cb callback
-
-    // Note: Notification sending requires HTTP client integration
-    true
+    // Copy out the session, then drop the guard (lock-order rule).
+    let sess = crate::context::pcf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.sess_find_by_id(sess_id));
+    let Some(sess) = sess else {
+        log::warn!("[sess_id={sess_id}] SM policy update notify: session not found");
+        return false;
+    };
+    let Some(uri) = sess.notification_uri.clone() else {
+        log::warn!("[sess_id={sess_id}] SM policy update notify: no notification URI stored");
+        return false;
+    };
+    let body = build_sm_policy_notification(&sess);
+    spawn_notification(uri, "/update", body, "SM policy update")
 }
 
-/// Send SM policy control delete notify to SMF
-/// Port of pcf_sbi_send_smpolicycontrol_delete_notify() from sbi-path.c
+/// Send SM policy control delete notify to the SMF over HTTP: an update
+/// notification removing the PCC rules installed for the app session
+/// (TS 29.512 — a null PCC-rule entry means removal).
 pub fn pcf_sbi_send_smpolicycontrol_delete_notify(sess_id: u64, app_session_id: u64) -> bool {
-    log::debug!(
-        "[sess_id={sess_id}, app_id={app_session_id}] Sending SM policy control delete notify"
-    );
-
-    // In C implementation:
-    // 1. Get session from ID
-    // 2. Get client from sess->nsmf
-    // 3. Build request using pcf_nsmf_callback_build_smpolicycontrol_update()
-    // 4. Send request to client with client_delete_notify_cb callback
-    //    (which removes app_session after callback)
-
-    // Note: Notification sending requires HTTP client integration
-    true
+    let sess = crate::context::pcf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.sess_find_by_id(sess_id));
+    let Some(sess) = sess else {
+        log::warn!("[sess_id={sess_id}] SM policy delete notify: session not found");
+        return false;
+    };
+    let Some(uri) = sess.notification_uri.clone() else {
+        log::warn!("[sess_id={sess_id}] SM policy delete notify: no notification URI stored");
+        return false;
+    };
+    let rule_id = format!("PccRule-app-{app_session_id}");
+    let body = serde_json::json!({
+        "resourceUri": format!("/npcf-smpolicycontrol/v1/sm-policies/{}", sess.sm_policy_id),
+        "smPolicyDecision": { "pccRules": { rule_id: null } },
+    });
+    spawn_notification(uri, "/update", body, "SM policy delete")
 }
 
-/// Send policy authorization terminate notify to AF
-/// Port of pcf_sbi_send_policyauthorization_terminate_notify() from sbi-path.c
+/// Send policy authorization terminate notify to the AF over HTTP
+/// (TS 29.514 §4.2.5.2: POST {notifUri}/terminate with TerminationInfo).
 pub fn pcf_sbi_send_policyauthorization_terminate_notify(app_id: u64) -> bool {
-    log::debug!("[app_id={app_id}] Sending policy authorization terminate notify");
-
-    // In C implementation:
-    // 1. Get app session from ID
-    // 2. Get client from app->naf
-    // 3. Build request using pcf_naf_callback_build_policyauthorization_terminate()
-    // 4. Send request to client with client_notify_cb callback
-
-    // Note: Notification sending requires HTTP client integration
-    true
+    let info = crate::context::pcf_self().read().ok().and_then(|ctx| {
+        ctx.app_find_by_id(app_id)
+            .and_then(|app| app.notif_uri.clone().map(|uri| (uri, app.app_session_id)))
+    });
+    let Some((uri, app_session_id)) = info else {
+        log::warn!("[app_id={app_id}] AF terminate notify: no notification URI stored");
+        return false;
+    };
+    let body = serde_json::json!({
+        "resUri": format!("/npcf-policyauthorization/v1/app-sessions/{app_session_id}"),
+        "termCause": "PDU_SESSION_TERMINATION",
+    });
+    spawn_notification(uri, "/terminate", body, "AF terminate")
 }
 
 /// Discover and send request to UDR for UE AM
@@ -428,5 +522,98 @@ mod tests {
         let (host, port) = parse_uri_host_port("https://nrf.example.com:443").unwrap();
         assert_eq!(host, "nrf.example.com");
         assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn test_uri_path_extraction() {
+        assert_eq!(
+            uri_path("http://1.2.3.4:7777/nsmf-callback/v1/sm-policy-notify/3"),
+            "/nsmf-callback/v1/sm-policy-notify/3"
+        );
+        assert_eq!(uri_path("http://1.2.3.4:7777"), "");
+    }
+
+    /// The notify callbacks are real HTTP POSTs: a stub "SMF" server on an
+    /// ephemeral port receives POST {notificationUri}/update with the
+    /// SmPolicyNotification body (bounded timeouts both directions).
+    #[tokio::test]
+    async fn notification_post_round_trip() {
+        use ogs_sbi::message::{SbiRequest as Req, SbiResponse as Resp};
+        use ogs_sbi::server::{SbiServer, SbiServerConfig};
+        use std::time::Duration;
+
+        async fn stub_smf(req: Req) -> Resp {
+            let path = req.header.uri.split('?').next().unwrap_or("").to_string();
+            if req.header.method == "POST"
+                && path == "/nsmf-callback/v1/sm-policy-notify/42/update"
+            {
+                // Body must be an SmPolicyNotification with resourceUri
+                let ok = req
+                    .http
+                    .content
+                    .as_deref()
+                    .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+                    .map(|v| v.get("resourceUri").is_some())
+                    .unwrap_or(false);
+                return if ok {
+                    Resp::with_status(204)
+                } else {
+                    Resp::with_status(400)
+                };
+            }
+            if req.header.method == "POST" && path.ends_with("/terminate") {
+                return Resp::with_status(204);
+            }
+            Resp::with_status(404)
+        }
+
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .map(|a| a.port())
+            .expect("probe ephemeral port");
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let server = SbiServer::new(SbiServerConfig::new(addr));
+        server.start(stub_smf).await.expect("start stub SMF");
+
+        let uri = format!("http://127.0.0.1:{port}/nsmf-callback/v1/sm-policy-notify/42");
+        let body = serde_json::json!({
+            "resourceUri": "/npcf-smpolicycontrol/v1/sm-policies/42",
+            "smPolicyDecision": {}
+        });
+
+        let status = tokio::time::timeout(
+            Duration::from_secs(8),
+            send_notification_post(&uri, "/update", &body),
+        )
+        .await
+        .expect("bounded")
+        .expect("notification delivered");
+        assert_eq!(status, 204);
+
+        // Terminate suffix path
+        let status = tokio::time::timeout(
+            Duration::from_secs(8),
+            send_notification_post(&uri, "/terminate", &body),
+        )
+        .await
+        .expect("bounded")
+        .expect("terminate delivered");
+        assert_eq!(status, 204);
+
+        // Unreachable receiver → bounded error, not a hang
+        let dead_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .map(|a| a.port())
+            .unwrap();
+        let dead_uri = format!("http://127.0.0.1:{dead_port}/cb");
+        let res = tokio::time::timeout(
+            Duration::from_secs(8),
+            send_notification_post(&dead_uri, "/update", &body),
+        )
+        .await
+        .expect("bounded");
+        assert!(res.is_err());
+
+        server.stop().await.ok();
     }
 }
