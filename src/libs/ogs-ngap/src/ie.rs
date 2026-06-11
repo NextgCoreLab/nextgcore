@@ -180,7 +180,7 @@ pub const IE_ID_PLMN_SUPPORT_LIST: u16 = 80;
 pub const IE_ID_GLOBAL_RAN_NODE_ID: u16 = 27;
 pub const IE_ID_RAN_NODE_NAME: u16 = 82;
 pub const IE_ID_SUPPORTED_TA_LIST: u16 = 102;
-pub const IE_ID_DEFAULT_PAGING_DRX: u16 = 18;
+pub const IE_ID_DEFAULT_PAGING_DRX: u16 = 21;
 pub const IE_ID_UE_SECURITY_CAPABILITIES: u16 = 119;
 pub const IE_ID_SECURITY_KEY: u16 = 94;
 pub const IE_ID_UE_AGGREGATE_MAXIMUM_BIT_RATE: u16 = 110;
@@ -198,6 +198,25 @@ pub const IE_ID_UE_NGAP_IDS: u16 = 114;
 pub const IE_ID_USER_LOCATION_INFORMATION: u16 = 121;
 pub const IE_ID_RRC_ESTABLISHMENT_CAUSE: u16 = 90;
 pub const IE_ID_UE_CONTEXT_REQUEST: u16 = 112;
+pub const IE_ID_CRITICALITY_DIAGNOSTICS: u16 = 19;
+pub const IE_ID_RESET_TYPE: u16 = 88;
+pub const IE_ID_UE_ASSOCIATED_LOGICAL_NG_CONNECTION_LIST: u16 = 111;
+pub const IE_ID_UNAVAILABLE_GUAMI_LIST: u16 = 120;
+pub const IE_ID_PDU_SESSION_RESOURCE_NOTIFY_LIST: u16 = 66;
+pub const IE_ID_PDU_SESSION_RESOURCE_RELEASED_LIST_NOT: u16 = 67;
+pub const IE_ID_PDU_SESSION_RESOURCE_MODIFY_LIST_MOD_IND: u16 = 63;
+pub const IE_ID_PDU_SESSION_RESOURCE_MODIFY_LIST_MOD_CFM: u16 = 62;
+pub const IE_ID_PDU_SESSION_RESOURCE_FAILED_TO_MODIFY_LIST_MOD_CFM: u16 = 131;
+pub const IE_ID_SOURCE_AMF_UE_NGAP_ID: u16 = 100;
+pub const IE_ID_PDU_SESSION_RESOURCE_TO_BE_SWITCHED_DL_LIST: u16 = 76;
+pub const IE_ID_PDU_SESSION_RESOURCE_SWITCHED_LIST: u16 = 77;
+pub const IE_ID_PDU_SESSION_RESOURCE_RELEASED_LIST_PS_ACK: u16 = 68;
+pub const IE_ID_PDU_SESSION_RESOURCE_RELEASED_LIST_PS_FAIL: u16 = 69;
+pub const IE_ID_PDU_SESSION_RESOURCE_FAILED_TO_SETUP_LIST_PS_REQ: u16 = 57;
+pub const IE_ID_PDU_SESSION_RESOURCE_LIST_HO_RQD: u16 = 61;
+pub const IE_ID_PDU_SESSION_RESOURCE_SETUP_LIST_HO_REQ: u16 = 73;
+pub const IE_ID_PDU_SESSION_RESOURCE_ADMITTED_LIST: u16 = 53;
+pub const IE_ID_PDU_SESSION_RESOURCE_HANDOVER_LIST: u16 = 59;
 
 /// Encode AMF Name as a PrintableString IE
 pub fn encode_amf_name(container: &mut ProtocolIeContainer, name: &str) -> NgapResult<()> {
@@ -1216,13 +1235,13 @@ pub fn encode_handover_type(
     Ok(())
 }
 
-pub const IE_ID_HANDOVER_TYPE: u16 = 28;
-pub const IE_ID_TARGET_ID: u16 = 39;
-pub const IE_ID_DIRECT_FORWARDING_PATH_AVAILABILITY: u16 = 27;
-pub const IE_ID_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER: u16 = 104;
-pub const IE_ID_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER: u16 = 105;
-pub const IE_ID_SECURITY_CONTEXT: u16 = 99;
-pub const IE_ID_PDU_SESSION_RESOURCE_FAILED_TO_SETUP_LIST_HO_ACK: u16 = 82;
+pub const IE_ID_HANDOVER_TYPE: u16 = 29;
+pub const IE_ID_TARGET_ID: u16 = 105;
+pub const IE_ID_DIRECT_FORWARDING_PATH_AVAILABILITY: u16 = 22;
+pub const IE_ID_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER: u16 = 101;
+pub const IE_ID_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER: u16 = 106;
+pub const IE_ID_SECURITY_CONTEXT: u16 = 93;
+pub const IE_ID_PDU_SESSION_RESOURCE_FAILED_TO_SETUP_LIST_HO_ACK: u16 = 56;
 pub const IE_ID_UE_PAGING_IDENTITY: u16 = 112;
 pub const IE_ID_PAGING_DRX: u16 = 70;
 pub const IE_ID_TAI_LIST_FOR_PAGING: u16 = 106;
@@ -1288,8 +1307,11 @@ fn encode_global_ran_node_id_inline(
             encoder.write_bit(false);
             encoder.write_bit(false);
             encoder.encode_octet_string(plmn_identity, Some(3), Some(3))?;
-            // gNB-ID is a BIT STRING (SIZE(22..32))
-            encoder.write_bits(*gnb_id as u64, *gnb_id_len as usize);
+            // GNB-ID CHOICE: gNB-ID is a BIT STRING (SIZE(22..32))
+            encoder.encode_choice_index(0, 1, true)?;
+            let len = *gnb_id_len as usize;
+            encoder.encode_constrained_length(len, 22, 32)?;
+            encoder.write_bits(*gnb_id as u64, len);
         }
         GlobalRanNodeId::GlobalNgEnbId {
             plmn_identity,
@@ -1299,7 +1321,9 @@ fn encode_global_ran_node_id_inline(
             encoder.write_bit(false);
             encoder.write_bit(false);
             encoder.encode_octet_string(plmn_identity, Some(3), Some(3))?;
-            encoder.write_bits(*ng_enb_id as u64, 32);
+            // NgENB-ID CHOICE: macroNgENB-ID is a BIT STRING (SIZE(20))
+            encoder.encode_choice_index(0, 2, true)?;
+            encoder.write_bits(*ng_enb_id as u64, 20);
         }
     }
     Ok(())
@@ -1366,90 +1390,282 @@ pub fn encode_security_context(
     Ok(())
 }
 
-/// Encode PDU Session Resource list for Handover Required
+// ============================================================================
+// Generic { pDUSessionID, <transfer> OCTET STRING } list helpers
+//
+// Many TS 38.413 list IEs share the item shape
+//   SEQUENCE { pDUSessionID, <something>Transfer OCTET STRING, iE-Extensions OPTIONAL }
+// inside SEQUENCE (SIZE (1..maxnoofPDUSessions=256)) OF <item>.
+// ============================================================================
+
+/// Encode a list of (pdu_session_id, transfer) pairs as a single IE
+pub fn encode_id_transfer_list_ie<'a>(
+    container: &mut ProtocolIeContainer,
+    ie_id: u16,
+    criticality: Criticality,
+    items: impl ExactSizeIterator<Item = (u8, &'a [u8])>,
+) -> NgapResult<()> {
+    let mut encoder = AperEncoder::new();
+    encoder.encode_constrained_length(items.len(), 1, 256)?;
+    for (pdu_session_id, transfer) in items {
+        encoder.write_bit(false); // extension
+        encoder.write_bit(false); // no iE-Extensions
+        let pdu_constraint = ogs_asn1c::per::Constraint::new(0, 255);
+        encoder.encode_constrained_whole_number(pdu_session_id as i64, &pdu_constraint)?;
+        encoder.encode_octet_string(transfer, None, None)?;
+    }
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(ie_id),
+        criticality,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Decode a list of (pdu_session_id, transfer) pairs from an IE field
+pub fn decode_id_transfer_list(field: &ProtocolIeField) -> NgapResult<Vec<(u8, Vec<u8>)>> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let count = decoder.decode_constrained_length(1, 256)?;
+    let mut result = Vec::with_capacity(count);
+    for _ in 0..count {
+        let _ext = decoder.read_bit()?;
+        let _ie_ext = decoder.read_bit()?;
+        let pdu_constraint = ogs_asn1c::per::Constraint::new(0, 255);
+        let pdu_session_id = decoder.decode_constrained_whole_number(&pdu_constraint)? as u8;
+        let transfer = decoder.decode_octet_string(None, None)?;
+        result.push((pdu_session_id, transfer));
+    }
+    Ok(result)
+}
+
+/// Encode PDU Session Resource List HO Rqd (TS 38.413 Section 9.2.3.1)
 pub fn encode_pdu_session_ho_required_list(
     container: &mut ProtocolIeContainer,
-    _list: &[PduSessionResourceSetupItem],
+    list: &[PduSessionResourceItemHoRqd],
 ) -> NgapResult<()> {
-    // Stub: reuse setup list encoding for now
-    let mut encoder = AperEncoder::new();
-    encoder.encode_constrained_length(0, 1, 256)?;
-    encoder.align();
-    container.push(ProtocolIeField {
-        id: ProtocolIeId(75), // PDUSessionResourceListHORqd
-        criticality: Criticality::Reject,
-        value: encoder.into_bytes().to_vec(),
-    });
-    Ok(())
+    encode_id_transfer_list_ie(
+        container,
+        IE_ID_PDU_SESSION_RESOURCE_LIST_HO_RQD,
+        Criticality::Reject,
+        list.iter()
+            .map(|item| (item.pdu_session_id, item.transfer.as_slice())),
+    )
 }
 
-/// Encode PDU Session Resource list for Handover Request
+/// Decode PDU Session Resource List HO Rqd
+pub fn decode_pdu_session_ho_required_list(
+    field: &ProtocolIeField,
+) -> NgapResult<Vec<PduSessionResourceItemHoRqd>> {
+    Ok(decode_id_transfer_list(field)?
+        .into_iter()
+        .map(|(pdu_session_id, transfer)| PduSessionResourceItemHoRqd {
+            pdu_session_id,
+            transfer,
+        })
+        .collect())
+}
+
+/// Encode PDU Session Resource Setup List HO Req (TS 38.413 Section 9.2.3.4)
+///
+/// Items carry an S-NSSAI in addition to the transfer:
+/// SEQUENCE { pDUSessionID, s-NSSAI, handoverRequestTransfer, iE-Extensions OPTIONAL }
 pub fn encode_pdu_session_ho_request_list(
     container: &mut ProtocolIeContainer,
-    _list: &[PduSessionResourceSetupItemHoReq],
+    list: &[PduSessionResourceSetupItemHoReq],
 ) -> NgapResult<()> {
-    // Stub: similar structure
     let mut encoder = AperEncoder::new();
-    encoder.encode_constrained_length(0, 1, 256)?;
+    encoder.encode_constrained_length(list.len(), 1, 256)?;
+    for item in list {
+        encoder.write_bit(false); // extension
+        encoder.write_bit(false); // no iE-Extensions
+        let pdu_constraint = ogs_asn1c::per::Constraint::new(0, 255);
+        encoder.encode_constrained_whole_number(item.pdu_session_id as i64, &pdu_constraint)?;
+        // S-NSSAI SEQUENCE { sST, sD OPTIONAL, iE-Extensions OPTIONAL }
+        encoder.write_bit(false); // extension
+        encoder.write_bit(item.s_nssai.sd.is_some());
+        encoder.write_bit(false); // no iE-Extensions
+        encoder.encode_octet_string(&[item.s_nssai.sst], Some(1), Some(1))?;
+        if let Some(ref sd) = item.s_nssai.sd {
+            encoder.encode_octet_string(sd, Some(3), Some(3))?;
+        }
+        encoder.encode_octet_string(&item.transfer, None, None)?;
+    }
     encoder.align();
     container.push(ProtocolIeField {
-        id: ProtocolIeId(74), // PDUSessionResourceSetupListHOReq
+        id: ProtocolIeId(IE_ID_PDU_SESSION_RESOURCE_SETUP_LIST_HO_REQ),
         criticality: Criticality::Reject,
         value: encoder.into_bytes().to_vec(),
     });
     Ok(())
 }
 
-/// Encode PDU Session Resource Admitted List
+/// Decode PDU Session Resource Setup List HO Req
+pub fn decode_pdu_session_ho_request_list(
+    field: &ProtocolIeField,
+) -> NgapResult<Vec<PduSessionResourceSetupItemHoReq>> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let count = decoder.decode_constrained_length(1, 256)?;
+    let mut result = Vec::with_capacity(count);
+    for _ in 0..count {
+        let _ext = decoder.read_bit()?;
+        let _ie_ext = decoder.read_bit()?;
+        let pdu_constraint = ogs_asn1c::per::Constraint::new(0, 255);
+        let pdu_session_id = decoder.decode_constrained_whole_number(&pdu_constraint)? as u8;
+        let _snssai_ext = decoder.read_bit()?;
+        let sd_present = decoder.read_bit()?;
+        let _snssai_ie_ext = decoder.read_bit()?;
+        let sst_bytes = decoder.decode_octet_string(Some(1), Some(1))?;
+        let sd = if sd_present {
+            let sd_bytes = decoder.decode_octet_string(Some(3), Some(3))?;
+            let mut sd = [0u8; 3];
+            sd.copy_from_slice(&sd_bytes);
+            Some(sd)
+        } else {
+            None
+        };
+        let transfer = decoder.decode_octet_string(None, None)?;
+        result.push(PduSessionResourceSetupItemHoReq {
+            pdu_session_id,
+            s_nssai: SNssai {
+                sst: sst_bytes[0],
+                sd,
+            },
+            transfer,
+        });
+    }
+    Ok(result)
+}
+
+/// Encode PDU Session Resource Admitted List (TS 38.413 Section 9.2.3.5)
 pub fn encode_pdu_session_admitted_list(
     container: &mut ProtocolIeContainer,
-    _list: &[PduSessionResourceAdmittedItemHoAck],
+    list: &[PduSessionResourceAdmittedItemHoAck],
 ) -> NgapResult<()> {
-    // Stub
-    let mut encoder = AperEncoder::new();
-    encoder.encode_constrained_length(0, 1, 256)?;
-    encoder.align();
-    container.push(ProtocolIeField {
-        id: ProtocolIeId(81), // PDUSessionResourceAdmittedList
-        criticality: Criticality::Ignore,
-        value: encoder.into_bytes().to_vec(),
-    });
-    Ok(())
+    encode_id_transfer_list_ie(
+        container,
+        IE_ID_PDU_SESSION_RESOURCE_ADMITTED_LIST,
+        Criticality::Ignore,
+        list.iter()
+            .map(|item| (item.pdu_session_id, item.transfer.as_slice())),
+    )
 }
 
-/// Encode PDU Session Resource Handover List
+/// Decode PDU Session Resource Admitted List
+pub fn decode_pdu_session_admitted_list(
+    field: &ProtocolIeField,
+) -> NgapResult<Vec<PduSessionResourceAdmittedItemHoAck>> {
+    Ok(decode_id_transfer_list(field)?
+        .into_iter()
+        .map(
+            |(pdu_session_id, transfer)| PduSessionResourceAdmittedItemHoAck {
+                pdu_session_id,
+                transfer,
+            },
+        )
+        .collect())
+}
+
+/// Encode PDU Session Resource Handover List (TS 38.413 Section 9.2.3.10)
 pub fn encode_pdu_session_handover_list(
     container: &mut ProtocolIeContainer,
-    _list: &[PduSessionResourceHandoverItem],
+    list: &[PduSessionResourceHandoverItem],
 ) -> NgapResult<()> {
-    // Stub
+    encode_id_transfer_list_ie(
+        container,
+        IE_ID_PDU_SESSION_RESOURCE_HANDOVER_LIST,
+        Criticality::Reject,
+        list.iter()
+            .map(|item| (item.pdu_session_id, item.transfer.as_slice())),
+    )
+}
+
+/// Encode CriticalityDiagnostics IE (TS 38.413 Section 9.3.1.3)
+pub fn encode_criticality_diagnostics(
+    container: &mut ProtocolIeContainer,
+    diag: &CriticalityDiagnostics,
+) -> NgapResult<()> {
     let mut encoder = AperEncoder::new();
-    encoder.encode_constrained_length(0, 1, 256)?;
+    // CriticalityDiagnostics ::= SEQUENCE { procedureCode OPTIONAL,
+    //   triggeringMessage OPTIONAL, procedureCriticality OPTIONAL,
+    //   iEsCriticalityDiagnostics OPTIONAL, iE-Extensions OPTIONAL }
+    encoder.write_bit(false); // extension
+    encoder.write_bit(diag.procedure_code.is_some());
+    encoder.write_bit(diag.triggering_message.is_some());
+    encoder.write_bit(diag.procedure_criticality.is_some());
+    encoder.write_bit(false); // iEsCriticalityDiagnostics not present
+    encoder.write_bit(false); // no iE-Extensions
+    if let Some(code) = diag.procedure_code {
+        let constraint = ogs_asn1c::per::Constraint::new(0, 255);
+        encoder.encode_constrained_whole_number(code as i64, &constraint)?;
+    }
+    if let Some(tm) = diag.triggering_message {
+        let constraint = ogs_asn1c::per::Constraint::new(0, 2);
+        encoder.encode_enumerated(tm as i64, &constraint)?;
+    }
+    if let Some(crit) = diag.procedure_criticality {
+        let constraint = ogs_asn1c::per::Constraint::new(0, 2);
+        encoder.encode_enumerated(crit as i64, &constraint)?;
+    }
     encoder.align();
     container.push(ProtocolIeField {
-        id: ProtocolIeId(83), // PDUSessionResourceHandoverList
-        criticality: Criticality::Reject,
+        id: ProtocolIeId(IE_ID_CRITICALITY_DIAGNOSTICS),
+        criticality: Criticality::Ignore,
         value: encoder.into_bytes().to_vec(),
     });
     Ok(())
 }
 
-/// Encode CriticalityDiagnostics IE
-pub fn encode_criticality_diagnostics(
-    container: &mut ProtocolIeContainer,
-    _diag: &CriticalityDiagnostics,
-) -> NgapResult<()> {
-    // Stub: empty CriticalityDiagnostics
-    let mut encoder = AperEncoder::new();
-    encoder.write_bit(false); // extension
-    encoder.write_bit(false); // no optionals
-    encoder.align();
-    container.push(ProtocolIeField {
-        id: ProtocolIeId(7), // CriticalityDiagnostics
-        criticality: Criticality::Ignore,
-        value: encoder.into_bytes().to_vec(),
-    });
-    Ok(())
+/// Decode CriticalityDiagnostics from IE field
+pub fn decode_criticality_diagnostics(
+    field: &ProtocolIeField,
+) -> NgapResult<CriticalityDiagnostics> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let _ext = decoder.read_bit()?;
+    let pc_present = decoder.read_bit()?;
+    let tm_present = decoder.read_bit()?;
+    let crit_present = decoder.read_bit()?;
+    let ies_present = decoder.read_bit()?;
+    let _ie_ext = decoder.read_bit()?;
+    let procedure_code = if pc_present {
+        let constraint = ogs_asn1c::per::Constraint::new(0, 255);
+        Some(decoder.decode_constrained_whole_number(&constraint)? as u8)
+    } else {
+        None
+    };
+    let triggering_message = if tm_present {
+        let constraint = ogs_asn1c::per::Constraint::new(0, 2);
+        Some(decoder.decode_enumerated(&constraint)? as u8)
+    } else {
+        None
+    };
+    let procedure_criticality = if crit_present {
+        let constraint = ogs_asn1c::per::Constraint::new(0, 2);
+        Some(decoder.decode_enumerated(&constraint)? as u8)
+    } else {
+        None
+    };
+    if ies_present {
+        // IEsCriticalityDiagnostics ::= SEQUENCE (SIZE (1..512)) OF
+        //   CriticalityDiagnostics-IE-Item { iECriticality, iE-ID, typeOfError, ... }
+        // Consume the items to stay bit-aligned; the contents are not retained.
+        let count = decoder.decode_constrained_length(1, 512)?;
+        for _ in 0..count {
+            let _item_ext = decoder.read_bit()?;
+            let _item_ie_ext = decoder.read_bit()?;
+            let crit_constraint = ogs_asn1c::per::Constraint::new(0, 2);
+            let _ie_criticality = decoder.decode_enumerated(&crit_constraint)?;
+            let id_constraint = ogs_asn1c::per::Constraint::new(0, 65535);
+            let _ie_id = decoder.decode_constrained_whole_number(&id_constraint)?;
+            let err_constraint = ogs_asn1c::per::Constraint::extensible(0, 1);
+            let _type_of_error = decoder.decode_enumerated(&err_constraint)?;
+        }
+    }
+    Ok(CriticalityDiagnostics {
+        procedure_code,
+        triggering_message,
+        procedure_criticality,
+    })
 }
 
 // ============================================================================
@@ -1584,4 +1800,685 @@ pub fn encode_assistance_data_for_paging(
         Criticality::Ignore,
         assistance,
     )
+}
+
+// ============================================================================
+// Handover / Path Switch decode helpers
+// ============================================================================
+
+/// Decode HandoverType from IE field
+pub fn decode_handover_type(field: &ProtocolIeField) -> NgapResult<HandoverType> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let constraint = ogs_asn1c::per::Constraint::extensible(0, 2);
+    let val = decoder.decode_enumerated(&constraint)?;
+    match val {
+        0 => Ok(HandoverType::Intra5gs),
+        1 => Ok(HandoverType::FivegsToEps),
+        2 => Ok(HandoverType::EpsTo5gs),
+        _ => Err(crate::error::NgapError::InvalidIeValue {
+            ie_name: "HandoverType",
+            reason: format!("Unknown value: {val}"),
+        }),
+    }
+}
+
+/// Decode GlobalRANNodeID inline (mirrors `encode_global_ran_node_id_inline`)
+fn decode_global_ran_node_id_inline(decoder: &mut AperDecoder) -> NgapResult<GlobalRanNodeId> {
+    let choice = decoder.decode_choice_index(2, true)?;
+    let _ext = decoder.read_bit()?;
+    let _ie_ext = decoder.read_bit()?;
+    let plmn_bytes = decoder.decode_octet_string(Some(3), Some(3))?;
+    let mut plmn_identity = [0u8; 3];
+    plmn_identity.copy_from_slice(&plmn_bytes);
+    match choice {
+        0 => {
+            let _gnb_choice = decoder.decode_choice_index(1, true)?;
+            let gnb_id_len = decoder.decode_constrained_length(22, 32)?;
+            let gnb_id = decoder.read_bits(gnb_id_len)? as u32;
+            Ok(GlobalRanNodeId::GlobalGnbId {
+                plmn_identity,
+                gnb_id,
+                gnb_id_len: gnb_id_len as u8,
+            })
+        }
+        1 => {
+            let _enb_choice = decoder.decode_choice_index(2, true)?;
+            let ng_enb_id = decoder.read_bits(20)? as u32;
+            Ok(GlobalRanNodeId::GlobalNgEnbId {
+                plmn_identity,
+                ng_enb_id,
+            })
+        }
+        _ => Err(crate::error::NgapError::InvalidIeValue {
+            ie_name: "GlobalRANNodeID",
+            reason: format!("Unknown choice index: {choice}"),
+        }),
+    }
+}
+
+/// Decode TAI inline (mirrors `encode_tai_inline`)
+fn decode_tai_inline(decoder: &mut AperDecoder) -> NgapResult<TaiListItem> {
+    let _ext = decoder.read_bit()?;
+    let _ie_ext = decoder.read_bit()?;
+    let plmn_bytes = decoder.decode_octet_string(Some(3), Some(3))?;
+    let mut tai_plmn = [0u8; 3];
+    tai_plmn.copy_from_slice(&plmn_bytes);
+    let tac_bytes = decoder.decode_octet_string(Some(3), Some(3))?;
+    let mut tai_tac = [0u8; 3];
+    tai_tac.copy_from_slice(&tac_bytes);
+    Ok(TaiListItem { tai_plmn, tai_tac })
+}
+
+/// Decode TargetID from IE field
+pub fn decode_target_id(field: &ProtocolIeField) -> NgapResult<TargetId> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let choice = decoder.decode_choice_index(2, true)?;
+    match choice {
+        0 => {
+            let _ext = decoder.read_bit()?;
+            let _ie_ext = decoder.read_bit()?;
+            let global_ran_node_id = decode_global_ran_node_id_inline(&mut decoder)?;
+            let selected_tai = decode_tai_inline(&mut decoder)?;
+            Ok(TargetId::TargetRanNodeId {
+                global_ran_node_id,
+                selected_tai,
+            })
+        }
+        1 => {
+            let _ext = decoder.read_bit()?;
+            let _ie_ext = decoder.read_bit()?;
+            let plmn_bytes = decoder.decode_octet_string(Some(3), Some(3))?;
+            let mut plmn_identity = [0u8; 3];
+            plmn_identity.copy_from_slice(&plmn_bytes);
+            let ng_enb_id = decoder.read_bits(32)? as u32;
+            let selected_tai = decode_tai_inline(&mut decoder)?;
+            Ok(TargetId::TargetGlobalNgEnbId {
+                plmn_identity,
+                ng_enb_id,
+                selected_tai,
+            })
+        }
+        _ => Err(crate::error::NgapError::InvalidIeValue {
+            ie_name: "TargetID",
+            reason: format!("Unknown choice index: {choice}"),
+        }),
+    }
+}
+
+/// Decode SecurityContext from IE field
+pub fn decode_security_context(field: &ProtocolIeField) -> NgapResult<SecurityContext> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let _ext = decoder.read_bit()?;
+    let _ie_ext = decoder.read_bit()?;
+    let constraint = ogs_asn1c::per::Constraint::new(0, 7);
+    let next_hop_chaining_count = decoder.decode_constrained_whole_number(&constraint)? as u8;
+    let mut next_hop = [0u8; 32];
+    for byte in next_hop.iter_mut() {
+        *byte = decoder.read_bits(8)? as u8;
+    }
+    Ok(SecurityContext {
+        next_hop_chaining_count,
+        next_hop,
+    })
+}
+
+/// Encode SourceAMF-UE-NGAP-ID IE (used in Path Switch Request)
+pub fn encode_source_amf_ue_ngap_id(
+    container: &mut ProtocolIeContainer,
+    id: u64,
+) -> NgapResult<()> {
+    container.push(make_ie_field(
+        ProtocolIeId(IE_ID_SOURCE_AMF_UE_NGAP_ID),
+        Criticality::Reject,
+        &AmfUeNgapId(id),
+    )?);
+    Ok(())
+}
+
+// ============================================================================
+// NG Reset IEs
+// ============================================================================
+
+/// Encode ResetType IE (TS 38.413 Section 9.3.1.95)
+pub fn encode_reset_type(
+    container: &mut ProtocolIeContainer,
+    reset_type: &ResetType,
+) -> NgapResult<()> {
+    let mut encoder = AperEncoder::new();
+    // ResetType ::= CHOICE { nG-Interface ResetAll,
+    //   partOfNG-Interface UE-associatedLogicalNG-connectionList, choice-Extensions }
+    match reset_type {
+        ResetType::NgInterface => {
+            encoder.encode_choice_index(0, 3, false)?;
+            // ResetAll ::= ENUMERATED { reset-all, ... }
+            let constraint = ogs_asn1c::per::Constraint::extensible(0, 0);
+            encoder.encode_enumerated(0, &constraint)?;
+        }
+        ResetType::PartOfNgInterface(connections) => {
+            encoder.encode_choice_index(1, 3, false)?;
+            encode_ng_connection_list_inline(&mut encoder, connections)?;
+        }
+    }
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(IE_ID_RESET_TYPE),
+        criticality: Criticality::Reject,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Decode ResetType from IE field
+pub fn decode_reset_type(field: &ProtocolIeField) -> NgapResult<ResetType> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let choice = decoder.decode_choice_index(3, false)?;
+    match choice {
+        0 => {
+            let constraint = ogs_asn1c::per::Constraint::extensible(0, 0);
+            let _reset_all = decoder.decode_enumerated(&constraint)?;
+            Ok(ResetType::NgInterface)
+        }
+        1 => Ok(ResetType::PartOfNgInterface(
+            decode_ng_connection_list_inline(&mut decoder)?,
+        )),
+        _ => Err(crate::error::NgapError::InvalidIeValue {
+            ie_name: "ResetType",
+            reason: format!("Unsupported choice index: {choice}"),
+        }),
+    }
+}
+
+/// Encode UE-associatedLogicalNG-connectionList inline
+fn encode_ng_connection_list_inline(
+    encoder: &mut AperEncoder,
+    connections: &[UeAssociatedLogicalNgConnectionItem],
+) -> NgapResult<()> {
+    // SEQUENCE (SIZE (1..maxnoofNGConnectionsToReset=65536)) OF item
+    encoder.encode_constrained_length(connections.len(), 1, 65536)?;
+    for item in connections {
+        // SEQUENCE { aMF-UE-NGAP-ID OPTIONAL, rAN-UE-NGAP-ID OPTIONAL, iE-Extensions OPTIONAL }
+        encoder.write_bit(false); // extension
+        encoder.write_bit(item.amf_ue_ngap_id.is_some());
+        encoder.write_bit(item.ran_ue_ngap_id.is_some());
+        encoder.write_bit(false); // no iE-Extensions
+        if let Some(amf_id) = item.amf_ue_ngap_id {
+            AmfUeNgapId(amf_id).encode_aper(encoder)?;
+        }
+        if let Some(ran_id) = item.ran_ue_ngap_id {
+            RanUeNgapId(ran_id).encode_aper(encoder)?;
+        }
+    }
+    Ok(())
+}
+
+/// Decode UE-associatedLogicalNG-connectionList inline
+fn decode_ng_connection_list_inline(
+    decoder: &mut AperDecoder,
+) -> NgapResult<Vec<UeAssociatedLogicalNgConnectionItem>> {
+    let count = decoder.decode_constrained_length(1, 65536)?;
+    let mut result = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let _ext = decoder.read_bit()?;
+        let amf_present = decoder.read_bit()?;
+        let ran_present = decoder.read_bit()?;
+        let _ie_ext = decoder.read_bit()?;
+        let amf_ue_ngap_id = if amf_present {
+            Some(AmfUeNgapId::decode_aper(decoder)?.0)
+        } else {
+            None
+        };
+        let ran_ue_ngap_id = if ran_present {
+            Some(RanUeNgapId::decode_aper(decoder)?.0)
+        } else {
+            None
+        };
+        result.push(UeAssociatedLogicalNgConnectionItem {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+        });
+    }
+    Ok(result)
+}
+
+/// Encode UE-associatedLogicalNG-connectionList IE (NG Reset Acknowledge)
+pub fn encode_ng_connection_list(
+    container: &mut ProtocolIeContainer,
+    connections: &[UeAssociatedLogicalNgConnectionItem],
+) -> NgapResult<()> {
+    let mut encoder = AperEncoder::new();
+    encode_ng_connection_list_inline(&mut encoder, connections)?;
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(IE_ID_UE_ASSOCIATED_LOGICAL_NG_CONNECTION_LIST),
+        criticality: Criticality::Ignore,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Decode UE-associatedLogicalNG-connectionList from IE field
+pub fn decode_ng_connection_list(
+    field: &ProtocolIeField,
+) -> NgapResult<Vec<UeAssociatedLogicalNgConnectionItem>> {
+    let mut decoder = AperDecoder::new(&field.value);
+    decode_ng_connection_list_inline(&mut decoder)
+}
+
+// ============================================================================
+// AMF Status Indication IEs
+// ============================================================================
+
+/// Encode UnavailableGUAMIList IE (TS 38.413 Section 9.3.3.18)
+pub fn encode_unavailable_guami_list(
+    container: &mut ProtocolIeContainer,
+    list: &[UnavailableGuamiItem],
+) -> NgapResult<()> {
+    let mut encoder = AperEncoder::new();
+    // SEQUENCE (SIZE (1..maxnoofServedGUAMIs=256)) OF UnavailableGUAMIItem
+    encoder.encode_constrained_length(list.len(), 1, 256)?;
+    for item in list {
+        // SEQUENCE { gUAMI, timerApproachForGUAMIRemoval OPTIONAL,
+        //   backupAMFName OPTIONAL, iE-Extensions OPTIONAL }
+        encoder.write_bit(false); // extension
+        encoder.write_bit(item.timer_approach_for_guami_removal);
+        encoder.write_bit(item.backup_amf_name.is_some());
+        encoder.write_bit(false); // no iE-Extensions
+        encode_guami_inline(&mut encoder, &item.guami)?;
+        if item.timer_approach_for_guami_removal {
+            // TimerApproachForGuamiRemoval ::= ENUMERATED { apply-timer, ... }
+            let constraint = ogs_asn1c::per::Constraint::extensible(0, 0);
+            encoder.encode_enumerated(0, &constraint)?;
+        }
+        if let Some(ref name) = item.backup_amf_name {
+            encoder.encode_octet_string(name.as_bytes(), None, None)?;
+        }
+    }
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(IE_ID_UNAVAILABLE_GUAMI_LIST),
+        criticality: Criticality::Reject,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Decode UnavailableGUAMIList from IE field
+pub fn decode_unavailable_guami_list(
+    field: &ProtocolIeField,
+) -> NgapResult<Vec<UnavailableGuamiItem>> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let count = decoder.decode_constrained_length(1, 256)?;
+    let mut result = Vec::with_capacity(count);
+    for _ in 0..count {
+        let _ext = decoder.read_bit()?;
+        let timer_present = decoder.read_bit()?;
+        let backup_present = decoder.read_bit()?;
+        let _ie_ext = decoder.read_bit()?;
+        let guami = decode_guami_inline(&mut decoder)?;
+        if timer_present {
+            let constraint = ogs_asn1c::per::Constraint::extensible(0, 0);
+            let _timer = decoder.decode_enumerated(&constraint)?;
+        }
+        let backup_amf_name = if backup_present {
+            let bytes = decoder.decode_octet_string(None, None)?;
+            Some(String::from_utf8(bytes).map_err(|e| {
+                crate::error::NgapError::InvalidIeValue {
+                    ie_name: "BackupAMFName",
+                    reason: e.to_string(),
+                }
+            })?)
+        } else {
+            None
+        };
+        result.push(UnavailableGuamiItem {
+            guami,
+            timer_approach_for_guami_removal: timer_present,
+            backup_amf_name,
+        });
+    }
+    Ok(result)
+}
+
+// ============================================================================
+// List decode helpers for setup/configuration responses
+// ============================================================================
+
+/// Decode GUAMI inline (mirrors `encode_guami_inline`)
+fn decode_guami_inline(decoder: &mut AperDecoder) -> NgapResult<Guami> {
+    let _ext = decoder.read_bit()?;
+    let _ie_ext = decoder.read_bit()?;
+    let plmn_bytes = decoder.decode_octet_string(Some(3), Some(3))?;
+    let mut plmn_identity = [0u8; 3];
+    plmn_identity.copy_from_slice(&plmn_bytes);
+    let amf_region_id = decoder.read_bits(8)? as u8;
+    let amf_set_id = decoder.read_bits(10)? as u16;
+    let amf_pointer = decoder.read_bits(6)? as u8;
+    Ok(Guami {
+        plmn_identity,
+        amf_region_id,
+        amf_set_id,
+        amf_pointer,
+    })
+}
+
+/// Decode Served GUAMI List from IE field
+pub fn decode_served_guami_list(field: &ProtocolIeField) -> NgapResult<Vec<ServedGuamiItem>> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let count = decoder.decode_constrained_length(1, 256)?;
+    let mut result = Vec::with_capacity(count);
+    for _ in 0..count {
+        let _ext = decoder.read_bit()?;
+        let backup_present = decoder.read_bit()?;
+        let _ie_ext = decoder.read_bit()?;
+        let guami = decode_guami_inline(&mut decoder)?;
+        let backup_amf_name = if backup_present {
+            let bytes = decoder.decode_octet_string(None, None)?;
+            Some(String::from_utf8(bytes).map_err(|e| {
+                crate::error::NgapError::InvalidIeValue {
+                    ie_name: "BackupAMFName",
+                    reason: e.to_string(),
+                }
+            })?)
+        } else {
+            None
+        };
+        result.push(ServedGuamiItem {
+            guami,
+            backup_amf_name,
+        });
+    }
+    Ok(result)
+}
+
+/// Decode PLMN Support List from IE field
+pub fn decode_plmn_support_list(field: &ProtocolIeField) -> NgapResult<Vec<PlmnSupportItem>> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let count = decoder.decode_constrained_length(1, 12)?;
+    let mut result = Vec::with_capacity(count);
+    for _ in 0..count {
+        let _ext = decoder.read_bit()?;
+        let _ie_ext = decoder.read_bit()?;
+        let plmn_bytes = decoder.decode_octet_string(Some(3), Some(3))?;
+        let mut plmn_identity = [0u8; 3];
+        plmn_identity.copy_from_slice(&plmn_bytes);
+        let slice_count = decoder.decode_constrained_length(1, 1024)?;
+        let mut slice_support_list = Vec::with_capacity(slice_count);
+        for _ in 0..slice_count {
+            slice_support_list.push(decode_snssai_inline(&mut decoder)?);
+        }
+        result.push(PlmnSupportItem {
+            plmn_identity,
+            slice_support_list,
+        });
+    }
+    Ok(result)
+}
+
+/// Decode Allowed NSSAI from IE field (mirrors `encode_allowed_nssai`)
+pub fn decode_allowed_nssai(field: &ProtocolIeField) -> NgapResult<Vec<SNssai>> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let count = decoder.decode_constrained_length(1, 8)?;
+    let mut result = Vec::with_capacity(count);
+    for _ in 0..count {
+        // AllowedNSSAI-Item SEQUENCE { s-NSSAI, iE-Extensions OPTIONAL }
+        let _item_ext = decoder.read_bit()?;
+        let _item_ie_ext = decoder.read_bit()?;
+        result.push(decode_snssai_inline(&mut decoder)?);
+    }
+    Ok(result)
+}
+
+/// Decode PDU Session Resource Setup Response List from IE field
+pub fn decode_pdu_session_setup_list_su_res(
+    field: &ProtocolIeField,
+) -> NgapResult<Vec<PduSessionResourceSetupResponseItem>> {
+    Ok(decode_id_transfer_list(field)?
+        .into_iter()
+        .map(
+            |(pdu_session_id, transfer)| PduSessionResourceSetupResponseItem {
+                pdu_session_id,
+                transfer,
+            },
+        )
+        .collect())
+}
+
+/// Decode a PDU Session Resource Failed List from IE field
+pub fn decode_pdu_session_failed_list(
+    field: &ProtocolIeField,
+) -> NgapResult<Vec<PduSessionResourceFailedItem>> {
+    Ok(decode_id_transfer_list(field)?
+        .into_iter()
+        .map(|(pdu_session_id, transfer)| PduSessionResourceFailedItem {
+            pdu_session_id,
+            transfer,
+        })
+        .collect())
+}
+
+/// Decode PDU Session Resource to Release List from IE field
+pub fn decode_pdu_session_release_list(
+    field: &ProtocolIeField,
+) -> NgapResult<Vec<PduSessionResourceReleaseItem>> {
+    Ok(decode_id_transfer_list(field)?
+        .into_iter()
+        .map(|(pdu_session_id, transfer)| PduSessionResourceReleaseItem {
+            pdu_session_id,
+            transfer,
+        })
+        .collect())
+}
+
+/// Decode PDU Session Resource Released List from IE field
+pub fn decode_pdu_session_released_list(
+    field: &ProtocolIeField,
+) -> NgapResult<Vec<PduSessionResourceReleasedItem>> {
+    Ok(decode_id_transfer_list(field)?
+        .into_iter()
+        .map(|(pdu_session_id, transfer)| PduSessionResourceReleasedItem {
+            pdu_session_id,
+            transfer,
+        })
+        .collect())
+}
+
+/// Decode PDU Session Resource Modify Response List from IE field
+pub fn decode_pdu_session_modify_list_res(
+    field: &ProtocolIeField,
+) -> NgapResult<Vec<PduSessionResourceModifyResponseItem>> {
+    Ok(decode_id_transfer_list(field)?
+        .into_iter()
+        .map(
+            |(pdu_session_id, transfer)| PduSessionResourceModifyResponseItem {
+                pdu_session_id,
+                transfer,
+            },
+        )
+        .collect())
+}
+
+/// Decode PDU Session Resource Modify List from Modify Request IE field
+pub fn decode_pdu_session_modify_list_req(
+    field: &ProtocolIeField,
+) -> NgapResult<Vec<PduSessionResourceModifyItem>> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let count = decoder.decode_constrained_length(1, 256)?;
+    let mut result = Vec::with_capacity(count);
+    for _ in 0..count {
+        let _ext = decoder.read_bit()?;
+        let nas_pdu_present = decoder.read_bit()?;
+        let _ie_ext = decoder.read_bit()?;
+        let pdu_constraint = ogs_asn1c::per::Constraint::new(0, 255);
+        let pdu_session_id = decoder.decode_constrained_whole_number(&pdu_constraint)? as u8;
+        let nas_pdu = if nas_pdu_present {
+            Some(decoder.decode_octet_string(None, None)?)
+        } else {
+            None
+        };
+        let transfer = decoder.decode_octet_string(None, None)?;
+        result.push(PduSessionResourceModifyItem {
+            pdu_session_id,
+            nas_pdu,
+            transfer,
+        });
+    }
+    Ok(result)
+}
+
+// ============================================================================
+// PDU Session Resource Notify / Modify Indication / Path Switch list IEs
+// ============================================================================
+
+/// Encode PDU Session Resource Notify List IE
+pub fn encode_pdu_session_notify_list(
+    container: &mut ProtocolIeContainer,
+    list: &[PduSessionResourceNotifyItem],
+) -> NgapResult<()> {
+    encode_id_transfer_list_ie(
+        container,
+        IE_ID_PDU_SESSION_RESOURCE_NOTIFY_LIST,
+        Criticality::Reject,
+        list.iter()
+            .map(|item| (item.pdu_session_id, item.transfer.as_slice())),
+    )
+}
+
+/// Decode PDU Session Resource Notify List from IE field
+pub fn decode_pdu_session_notify_list(
+    field: &ProtocolIeField,
+) -> NgapResult<Vec<PduSessionResourceNotifyItem>> {
+    Ok(decode_id_transfer_list(field)?
+        .into_iter()
+        .map(|(pdu_session_id, transfer)| PduSessionResourceNotifyItem {
+            pdu_session_id,
+            transfer,
+        })
+        .collect())
+}
+
+/// Encode a PDU Session Resource Released List under the given IE ID
+pub fn encode_pdu_session_released_list_with_id(
+    container: &mut ProtocolIeContainer,
+    ie_id: u16,
+    list: &[PduSessionResourceReleasedItem],
+) -> NgapResult<()> {
+    encode_id_transfer_list_ie(
+        container,
+        ie_id,
+        Criticality::Ignore,
+        list.iter()
+            .map(|item| (item.pdu_session_id, item.transfer.as_slice())),
+    )
+}
+
+/// Encode PDU Session Resource Modify List Mod Ind IE
+pub fn encode_pdu_session_modify_list_mod_ind(
+    container: &mut ProtocolIeContainer,
+    list: &[PduSessionResourceModifyIndicationItem],
+) -> NgapResult<()> {
+    encode_id_transfer_list_ie(
+        container,
+        IE_ID_PDU_SESSION_RESOURCE_MODIFY_LIST_MOD_IND,
+        Criticality::Reject,
+        list.iter()
+            .map(|item| (item.pdu_session_id, item.transfer.as_slice())),
+    )
+}
+
+/// Decode PDU Session Resource Modify List Mod Ind from IE field
+pub fn decode_pdu_session_modify_list_mod_ind(
+    field: &ProtocolIeField,
+) -> NgapResult<Vec<PduSessionResourceModifyIndicationItem>> {
+    Ok(decode_id_transfer_list(field)?
+        .into_iter()
+        .map(
+            |(pdu_session_id, transfer)| PduSessionResourceModifyIndicationItem {
+                pdu_session_id,
+                transfer,
+            },
+        )
+        .collect())
+}
+
+/// Encode PDU Session Resource Modify List Mod Cfm IE
+pub fn encode_pdu_session_modify_list_mod_cfm(
+    container: &mut ProtocolIeContainer,
+    list: &[PduSessionResourceModifyConfirmItem],
+) -> NgapResult<()> {
+    encode_id_transfer_list_ie(
+        container,
+        IE_ID_PDU_SESSION_RESOURCE_MODIFY_LIST_MOD_CFM,
+        Criticality::Ignore,
+        list.iter()
+            .map(|item| (item.pdu_session_id, item.transfer.as_slice())),
+    )
+}
+
+/// Decode PDU Session Resource Modify List Mod Cfm from IE field
+pub fn decode_pdu_session_modify_list_mod_cfm(
+    field: &ProtocolIeField,
+) -> NgapResult<Vec<PduSessionResourceModifyConfirmItem>> {
+    Ok(decode_id_transfer_list(field)?
+        .into_iter()
+        .map(
+            |(pdu_session_id, transfer)| PduSessionResourceModifyConfirmItem {
+                pdu_session_id,
+                transfer,
+            },
+        )
+        .collect())
+}
+
+/// Encode PDU Session Resource To Be Switched DL List IE
+pub fn encode_pdu_session_to_be_switched_list(
+    container: &mut ProtocolIeContainer,
+    list: &[PduSessionResourceSwitchItem],
+) -> NgapResult<()> {
+    encode_id_transfer_list_ie(
+        container,
+        IE_ID_PDU_SESSION_RESOURCE_TO_BE_SWITCHED_DL_LIST,
+        Criticality::Reject,
+        list.iter()
+            .map(|item| (item.pdu_session_id, item.transfer.as_slice())),
+    )
+}
+
+/// Decode PDU Session Resource To Be Switched DL List from IE field
+pub fn decode_pdu_session_to_be_switched_list(
+    field: &ProtocolIeField,
+) -> NgapResult<Vec<PduSessionResourceSwitchItem>> {
+    Ok(decode_id_transfer_list(field)?
+        .into_iter()
+        .map(|(pdu_session_id, transfer)| PduSessionResourceSwitchItem {
+            pdu_session_id,
+            transfer,
+        })
+        .collect())
+}
+
+/// Encode PDU Session Resource Switched List IE
+pub fn encode_pdu_session_switched_list(
+    container: &mut ProtocolIeContainer,
+    list: &[PduSessionResourceSwitchedItem],
+) -> NgapResult<()> {
+    encode_id_transfer_list_ie(
+        container,
+        IE_ID_PDU_SESSION_RESOURCE_SWITCHED_LIST,
+        Criticality::Reject,
+        list.iter()
+            .map(|item| (item.pdu_session_id, item.transfer.as_slice())),
+    )
+}
+
+/// Decode PDU Session Resource Switched List from IE field
+pub fn decode_pdu_session_switched_list(
+    field: &ProtocolIeField,
+) -> NgapResult<Vec<PduSessionResourceSwitchedItem>> {
+    Ok(decode_id_transfer_list(field)?
+        .into_iter()
+        .map(|(pdu_session_id, transfer)| PduSessionResourceSwitchedItem {
+            pdu_session_id,
+            transfer,
+        })
+        .collect())
 }

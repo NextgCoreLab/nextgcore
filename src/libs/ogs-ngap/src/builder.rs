@@ -519,10 +519,8 @@ pub fn build_handover_required(msg: &HandoverRequired) -> NgapResult<Vec<u8>> {
     // IE: TargetID (mandatory)
     ie::encode_target_id(&mut container, &msg.target_id)?;
 
-    // IE: PDUSessionResourceListHORqd (optional)
-    if let Some(ref list) = msg.pdu_session_list {
-        ie::encode_pdu_session_ho_required_list(&mut container, list)?;
-    }
+    // IE: PDUSessionResourceListHORqd (mandatory)
+    ie::encode_pdu_session_ho_required_list(&mut container, &msg.pdu_session_list)?;
 
     // IE: SourceToTarget-TransparentContainer (mandatory)
     ie::encode_source_to_target_container(&mut container, &msg.source_to_target_container)?;
@@ -740,6 +738,564 @@ pub fn build_paging(msg: &Paging) -> NgapResult<Vec<u8>> {
         procedure_code: ProcedureCode::PAGING,
         criticality: Criticality::Ignore,
         value: InitiatingMessageValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+// ============================================================================
+// NG Reset Procedure (Section 8.7.4)
+// ============================================================================
+
+/// Build an NG Reset PDU
+pub fn build_ng_reset(msg: &NgReset) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: Cause (mandatory)
+    ie::encode_cause(&mut container, &msg.cause)?;
+
+    // IE: ResetType (mandatory)
+    ie::encode_reset_type(&mut container, &msg.reset_type)?;
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::NG_RESET,
+        criticality: Criticality::Reject,
+        value: InitiatingMessageValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+/// Build an NG Reset Acknowledge PDU
+pub fn build_ng_reset_acknowledge(msg: &NgResetAcknowledge) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: UE-associatedLogicalNG-connectionList (optional)
+    if let Some(ref connections) = msg.connections {
+        ie::encode_ng_connection_list(&mut container, connections)?;
+    }
+
+    // IE: CriticalityDiagnostics (optional)
+    if let Some(ref diag) = msg.criticality_diagnostics {
+        ie::encode_criticality_diagnostics(&mut container, diag)?;
+    }
+
+    let pdu = NgapPdu::SuccessfulOutcome(SuccessfulOutcome {
+        procedure_code: ProcedureCode::NG_RESET,
+        criticality: Criticality::Reject,
+        value: SuccessfulOutcomeValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+// ============================================================================
+// Error Indication Procedure (Section 8.7.5)
+// ============================================================================
+
+/// Build an Error Indication PDU
+pub fn build_error_indication(msg: &ErrorIndication) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: AMF-UE-NGAP-ID (optional)
+    if let Some(amf_id) = msg.amf_ue_ngap_id {
+        ie::encode_amf_ue_ngap_id(&mut container, amf_id)?;
+    }
+
+    // IE: RAN-UE-NGAP-ID (optional)
+    if let Some(ran_id) = msg.ran_ue_ngap_id {
+        ie::encode_ran_ue_ngap_id(&mut container, ran_id)?;
+    }
+
+    // IE: Cause (optional)
+    if let Some(ref cause) = msg.cause {
+        ie::encode_cause(&mut container, cause)?;
+    }
+
+    // IE: CriticalityDiagnostics (optional)
+    if let Some(ref diag) = msg.criticality_diagnostics {
+        ie::encode_criticality_diagnostics(&mut container, diag)?;
+    }
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::ERROR_INDICATION,
+        criticality: Criticality::Ignore,
+        value: InitiatingMessageValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+// ============================================================================
+// RAN Configuration Update Procedure (Section 8.7.2)
+// ============================================================================
+
+/// Build a RAN Configuration Update PDU
+pub fn build_ran_configuration_update(msg: &RanConfigurationUpdate) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: RANNodeName (optional)
+    if let Some(ref name) = msg.ran_node_name {
+        ie::encode_ran_node_name(&mut container, name)?;
+    }
+
+    // IE: SupportedTAList (optional)
+    if let Some(ref ta_list) = msg.supported_ta_list {
+        ie::encode_supported_ta_list(&mut container, ta_list)?;
+    }
+
+    // IE: DefaultPagingDRX (optional)
+    if let Some(drx) = msg.default_paging_drx {
+        ie::encode_default_paging_drx(&mut container, drx)?;
+    }
+
+    // IE: GlobalRANNodeID (optional)
+    if let Some(ref ran_node_id) = msg.global_ran_node_id {
+        ie::encode_global_ran_node_id(&mut container, ran_node_id)?;
+    }
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::RAN_CONFIGURATION_UPDATE,
+        criticality: Criticality::Reject,
+        value: InitiatingMessageValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+/// Build a RAN Configuration Update Acknowledge PDU
+pub fn build_ran_configuration_update_acknowledge(
+    msg: &RanConfigurationUpdateAcknowledge,
+) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: CriticalityDiagnostics (optional)
+    if let Some(ref diag) = msg.criticality_diagnostics {
+        ie::encode_criticality_diagnostics(&mut container, diag)?;
+    }
+
+    let pdu = NgapPdu::SuccessfulOutcome(SuccessfulOutcome {
+        procedure_code: ProcedureCode::RAN_CONFIGURATION_UPDATE,
+        criticality: Criticality::Reject,
+        value: SuccessfulOutcomeValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+/// Build a RAN Configuration Update Failure PDU
+pub fn build_ran_configuration_update_failure(
+    msg: &RanConfigurationUpdateFailure,
+) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: Cause (mandatory)
+    ie::encode_cause(&mut container, &msg.cause)?;
+
+    // IE: TimeToWait (optional)
+    if let Some(ttw) = msg.time_to_wait {
+        ie::encode_time_to_wait(&mut container, ttw)?;
+    }
+
+    // IE: CriticalityDiagnostics (optional)
+    if let Some(ref diag) = msg.criticality_diagnostics {
+        ie::encode_criticality_diagnostics(&mut container, diag)?;
+    }
+
+    let pdu = NgapPdu::UnsuccessfulOutcome(UnsuccessfulOutcome {
+        procedure_code: ProcedureCode::RAN_CONFIGURATION_UPDATE,
+        criticality: Criticality::Reject,
+        value: UnsuccessfulOutcomeValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+// ============================================================================
+// AMF Configuration Update Procedure (Section 8.7.3)
+// ============================================================================
+
+/// Build an AMF Configuration Update PDU
+pub fn build_amf_configuration_update(msg: &AmfConfigurationUpdate) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: AMFName (optional)
+    if let Some(ref name) = msg.amf_name {
+        ie::encode_amf_name(&mut container, name)?;
+    }
+
+    // IE: ServedGUAMIList (optional)
+    if let Some(ref guami_list) = msg.served_guami_list {
+        ie::encode_served_guami_list(&mut container, guami_list)?;
+    }
+
+    // IE: RelativeAMFCapacity (optional)
+    if let Some(capacity) = msg.relative_amf_capacity {
+        ie::encode_relative_amf_capacity(&mut container, capacity)?;
+    }
+
+    // IE: PLMNSupportList (optional)
+    if let Some(ref plmn_list) = msg.plmn_support_list {
+        ie::encode_plmn_support_list(&mut container, plmn_list)?;
+    }
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::AMF_CONFIGURATION_UPDATE,
+        criticality: Criticality::Reject,
+        value: InitiatingMessageValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+/// Build an AMF Configuration Update Acknowledge PDU
+pub fn build_amf_configuration_update_acknowledge(
+    msg: &AmfConfigurationUpdateAcknowledge,
+) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: CriticalityDiagnostics (optional)
+    if let Some(ref diag) = msg.criticality_diagnostics {
+        ie::encode_criticality_diagnostics(&mut container, diag)?;
+    }
+
+    let pdu = NgapPdu::SuccessfulOutcome(SuccessfulOutcome {
+        procedure_code: ProcedureCode::AMF_CONFIGURATION_UPDATE,
+        criticality: Criticality::Reject,
+        value: SuccessfulOutcomeValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+/// Build an AMF Configuration Update Failure PDU
+pub fn build_amf_configuration_update_failure(
+    msg: &AmfConfigurationUpdateFailure,
+) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: Cause (mandatory)
+    ie::encode_cause(&mut container, &msg.cause)?;
+
+    // IE: TimeToWait (optional)
+    if let Some(ttw) = msg.time_to_wait {
+        ie::encode_time_to_wait(&mut container, ttw)?;
+    }
+
+    // IE: CriticalityDiagnostics (optional)
+    if let Some(ref diag) = msg.criticality_diagnostics {
+        ie::encode_criticality_diagnostics(&mut container, diag)?;
+    }
+
+    let pdu = NgapPdu::UnsuccessfulOutcome(UnsuccessfulOutcome {
+        procedure_code: ProcedureCode::AMF_CONFIGURATION_UPDATE,
+        criticality: Criticality::Reject,
+        value: UnsuccessfulOutcomeValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+// ============================================================================
+// AMF Status Indication Procedure (Section 8.7.6)
+// ============================================================================
+
+/// Build an AMF Status Indication PDU
+pub fn build_amf_status_indication(msg: &AmfStatusIndication) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: UnavailableGUAMIList (mandatory)
+    ie::encode_unavailable_guami_list(&mut container, &msg.unavailable_guami_list)?;
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::AMF_STATUS_INDICATION,
+        criticality: Criticality::Ignore,
+        value: InitiatingMessageValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+// ============================================================================
+// PDU Session Resource Notify Procedure (Section 8.2.5)
+// ============================================================================
+
+/// Build a PDU Session Resource Notify PDU
+pub fn build_pdu_session_resource_notify(msg: &PduSessionResourceNotify) -> NgapResult<Vec<u8>> {
+    if msg.notify_list.is_empty() && msg.released_list.is_empty() {
+        return Err(crate::error::NgapError::EncodingError(
+            "PDUSessionResourceNotify requires at least one of notify/released lists".to_string(),
+        ));
+    }
+
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory)
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+
+    // IE: RAN-UE-NGAP-ID (mandatory)
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+
+    // IE: PDUSessionResourceNotifyList (optional)
+    if !msg.notify_list.is_empty() {
+        ie::encode_pdu_session_notify_list(&mut container, &msg.notify_list)?;
+    }
+
+    // IE: PDUSessionResourceReleasedListNot (optional)
+    if !msg.released_list.is_empty() {
+        ie::encode_pdu_session_released_list_with_id(
+            &mut container,
+            ie::IE_ID_PDU_SESSION_RESOURCE_RELEASED_LIST_NOT,
+            &msg.released_list,
+        )?;
+    }
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::PDU_SESSION_RESOURCE_NOTIFY,
+        criticality: Criticality::Ignore,
+        value: InitiatingMessageValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+// ============================================================================
+// PDU Session Resource Modify Indication Procedure (Section 8.2.4)
+// ============================================================================
+
+/// Build a PDU Session Resource Modify Indication PDU
+pub fn build_pdu_session_resource_modify_indication(
+    msg: &PduSessionResourceModifyIndication,
+) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory)
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+
+    // IE: RAN-UE-NGAP-ID (mandatory)
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+
+    // IE: PDUSessionResourceModifyListModInd (mandatory)
+    ie::encode_pdu_session_modify_list_mod_ind(&mut container, &msg.modify_list)?;
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::PDU_SESSION_RESOURCE_MODIFY_INDICATION,
+        criticality: Criticality::Reject,
+        value: InitiatingMessageValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+/// Build a PDU Session Resource Modify Confirm PDU
+pub fn build_pdu_session_resource_modify_confirm(
+    msg: &PduSessionResourceModifyConfirm,
+) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory)
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+
+    // IE: RAN-UE-NGAP-ID (mandatory)
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+
+    // IE: PDUSessionResourceModifyListModCfm (optional)
+    if !msg.confirm_list.is_empty() {
+        ie::encode_pdu_session_modify_list_mod_cfm(&mut container, &msg.confirm_list)?;
+    }
+
+    // IE: PDUSessionResourceFailedToModifyListModCfm (optional)
+    if !msg.failed_list.is_empty() {
+        ie::encode_pdu_session_failed_list(
+            &mut container,
+            ie::IE_ID_PDU_SESSION_RESOURCE_FAILED_TO_MODIFY_LIST_MOD_CFM,
+            &msg.failed_list,
+        )?;
+    }
+
+    let pdu = NgapPdu::SuccessfulOutcome(SuccessfulOutcome {
+        procedure_code: ProcedureCode::PDU_SESSION_RESOURCE_MODIFY_INDICATION,
+        criticality: Criticality::Reject,
+        value: SuccessfulOutcomeValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+// ============================================================================
+// NAS Non Delivery Indication Procedure (Section 8.6.5)
+// ============================================================================
+
+/// Build a NAS Non Delivery Indication PDU
+pub fn build_nas_non_delivery_indication(msg: &NasNonDeliveryIndication) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory)
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+
+    // IE: RAN-UE-NGAP-ID (mandatory)
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+
+    // IE: NAS-PDU (mandatory)
+    ie::encode_nas_pdu(&mut container, &msg.nas_pdu)?;
+
+    // IE: Cause (mandatory)
+    ie::encode_cause(&mut container, &msg.cause)?;
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::NAS_NON_DELIVERY_INDICATION,
+        criticality: Criticality::Ignore,
+        value: InitiatingMessageValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+// ============================================================================
+// Path Switch Request Procedure (Section 8.4.4)
+// ============================================================================
+
+/// Build a Path Switch Request PDU
+pub fn build_path_switch_request(msg: &PathSwitchRequest) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: RAN-UE-NGAP-ID (mandatory)
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+
+    // IE: SourceAMF-UE-NGAP-ID (mandatory)
+    ie::encode_source_amf_ue_ngap_id(&mut container, msg.source_amf_ue_ngap_id)?;
+
+    // IE: UserLocationInformation (mandatory)
+    ie::encode_user_location_info(&mut container, &msg.user_location_info)?;
+
+    // IE: UESecurityCapabilities (mandatory)
+    ie::encode_ue_security_capabilities(&mut container, &msg.ue_security_capabilities)?;
+
+    // IE: PDUSessionResourceToBeSwitchedDLList (mandatory)
+    ie::encode_pdu_session_to_be_switched_list(&mut container, &msg.pdu_session_list)?;
+
+    // IE: PDUSessionResourceFailedToSetupListPSReq (optional)
+    if let Some(ref failed) = msg.failed_list {
+        ie::encode_pdu_session_failed_list(
+            &mut container,
+            ie::IE_ID_PDU_SESSION_RESOURCE_FAILED_TO_SETUP_LIST_PS_REQ,
+            failed,
+        )?;
+    }
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::PATH_SWITCH_REQUEST,
+        criticality: Criticality::Reject,
+        value: InitiatingMessageValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+/// Build a Path Switch Request Acknowledge PDU
+pub fn build_path_switch_request_acknowledge(
+    msg: &PathSwitchRequestAcknowledge,
+) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory)
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+
+    // IE: RAN-UE-NGAP-ID (mandatory)
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+
+    // IE: UESecurityCapabilities (optional)
+    if let Some(ref caps) = msg.ue_security_capabilities {
+        ie::encode_ue_security_capabilities(&mut container, caps)?;
+    }
+
+    // IE: SecurityContext (mandatory)
+    ie::encode_security_context(&mut container, &msg.security_context)?;
+
+    // IE: PDUSessionResourceSwitchedList (mandatory)
+    ie::encode_pdu_session_switched_list(&mut container, &msg.switched_list)?;
+
+    // IE: PDUSessionResourceReleasedListPSAck (optional)
+    if let Some(ref released) = msg.released_list {
+        ie::encode_pdu_session_released_list_with_id(
+            &mut container,
+            ie::IE_ID_PDU_SESSION_RESOURCE_RELEASED_LIST_PS_ACK,
+            released,
+        )?;
+    }
+
+    // IE: AllowedNSSAI (mandatory)
+    ie::encode_allowed_nssai(&mut container, &msg.allowed_nssai)?;
+
+    let pdu = NgapPdu::SuccessfulOutcome(SuccessfulOutcome {
+        procedure_code: ProcedureCode::PATH_SWITCH_REQUEST,
+        criticality: Criticality::Reject,
+        value: SuccessfulOutcomeValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+/// Build a Path Switch Request Failure PDU
+pub fn build_path_switch_request_failure(msg: &PathSwitchRequestFailure) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory)
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+
+    // IE: RAN-UE-NGAP-ID (mandatory)
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+
+    // IE: Cause (mandatory)
+    ie::encode_cause(&mut container, &msg.cause)?;
+
+    // IE: PDUSessionResourceReleasedListPSFail (optional)
+    if let Some(ref released) = msg.released_list {
+        ie::encode_pdu_session_released_list_with_id(
+            &mut container,
+            ie::IE_ID_PDU_SESSION_RESOURCE_RELEASED_LIST_PS_FAIL,
+            released,
+        )?;
+    }
+
+    // IE: CriticalityDiagnostics (optional)
+    if let Some(ref diag) = msg.criticality_diagnostics {
+        ie::encode_criticality_diagnostics(&mut container, diag)?;
+    }
+
+    let pdu = NgapPdu::UnsuccessfulOutcome(UnsuccessfulOutcome {
+        procedure_code: ProcedureCode::PATH_SWITCH_REQUEST,
+        criticality: Criticality::Reject,
+        value: UnsuccessfulOutcomeValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+/// Build a Handover Preparation Failure PDU
+pub fn build_handover_preparation_failure(
+    msg: &HandoverPreparationFailure,
+) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory)
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+
+    // IE: RAN-UE-NGAP-ID (mandatory)
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+
+    // IE: Cause (mandatory)
+    ie::encode_cause(&mut container, &msg.cause)?;
+
+    // IE: CriticalityDiagnostics (optional)
+    if let Some(ref diag) = msg.criticality_diagnostics {
+        ie::encode_criticality_diagnostics(&mut container, diag)?;
+    }
+
+    let pdu = NgapPdu::UnsuccessfulOutcome(UnsuccessfulOutcome {
+        procedure_code: ProcedureCode::HANDOVER_PREPARATION,
+        criticality: Criticality::Reject,
+        value: UnsuccessfulOutcomeValue::Other(container),
     });
 
     encode_pdu(&pdu)

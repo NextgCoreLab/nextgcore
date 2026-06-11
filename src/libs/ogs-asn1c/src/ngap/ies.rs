@@ -21,9 +21,10 @@ impl AperEncode for ProtocolIeField {
         self.id.encode_aper(encoder)?;
         self.criticality.encode_aper(encoder)?;
 
-        // Value is encoded as OPEN TYPE
-        encoder.encode_length_determinant(self.value.len())?;
-        encoder.write_bytes(&self.value);
+        // Value is encoded as OPEN TYPE; open-type lengths follow the
+        // unconstrained length rules, fragmenting per X.691 Section 11.9.3
+        // when the content exceeds 16383 octets (e.g. large NAS-PDUs)
+        encoder.encode_fragmented_octets(&self.value)?;
 
         Ok(())
     }
@@ -34,8 +35,15 @@ impl AperDecode for ProtocolIeField {
         let id = ProtocolIeId::decode_aper(decoder)?;
         let criticality = Criticality::decode_aper(decoder)?;
 
-        let value_len = decoder.decode_length_determinant()?;
-        let value = decoder.read_bytes(value_len)?;
+        // OPEN TYPE content may arrive fragmented (X.691 Section 11.9.3)
+        let mut value = Vec::new();
+        loop {
+            let (len, fragmented) = decoder.decode_length_fragment()?;
+            value.extend_from_slice(&decoder.read_bytes(len)?);
+            if !fragmented {
+                break;
+            }
+        }
 
         Ok(ProtocolIeField {
             id,

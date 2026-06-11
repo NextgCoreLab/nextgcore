@@ -24,8 +24,7 @@ use ogs_sctp::{OgsSctpInfo, SctpServer, SctpServerConfig, ServerEvent, OGS_NGAP_
 use crate::context::{AmfContext, AmfGnb};
 use crate::event::AmfEvent;
 use crate::ngap_asn1;
-use crate::ngap_build;
-use crate::ngap_handler::{self, NgSetupRequest, NgapHandlerResult};
+use crate::ngap_handler::{self, time_to_wait, NgSetupRequest, NgapHandlerResult};
 use crate::ngap_sm::NgapFsm;
 
 // ============================================================================
@@ -359,6 +358,26 @@ impl NgapServer {
                     log::info!("UE Context Release Complete from gNB");
                 }
             }
+            Some(20) => {
+                // NGReset (procedure code 20)
+                if data[0] == 0x00 {
+                    // InitiatingMessage = NGReset from gNB
+                    self.handle_ng_reset(association_id, data).await?;
+                } else if data[0] == 0x20 {
+                    // SuccessfulOutcome = NGResetAcknowledge for an AMF-initiated reset
+                    log::info!("NG Reset Acknowledge from association {association_id}");
+                }
+            }
+            Some(22) | Some(23) => {
+                // OverloadStart (22) / OverloadStop (23) are AMF->gNB procedures
+                // (TS 38.413 Sections 8.7.6/8.7.7); receiving one from a gNB is a
+                // logical error. ogs-ngap does not expose a codec for them, so the
+                // PDU is ignored after logging.
+                log::warn!(
+                    "Overload{} received from association {association_id}: not applicable in gNB->AMF direction, ignoring",
+                    if procedure_code == Some(22) { "Start" } else { "Stop" }
+                );
+            }
             Some(0) => {
                 // HandoverPreparation (procedure code 0)
                 // InitiatingMessage = HandoverRequired from source gNB
@@ -579,11 +598,12 @@ impl NgapServer {
                             cause.cause
                         );
 
-                        // Build NG Setup Failure with proper ASN.1 encoding
+                        // Build NG Setup Failure with proper ASN.1 encoding and
+                        // the real cause group/value from the handler
                         Some(ngap_asn1::build_ng_setup_failure_asn1(
                             cause.group,
                             cause.cause,
-                            None,
+                            Some(time_to_wait::V1S),
                         ))
                     }
                     _ => None,
@@ -601,6 +621,64 @@ impl NgapServer {
                 association_id,
                 response.len()
             );
+        }
+
+        Ok(())
+    }
+
+    /// Handle NG Reset from a gNB (TS 38.413 Section 8.7.4.2)
+    ///
+    /// Releases the affected UE contexts and responds with NG Reset Acknowledge.
+    async fn handle_ng_reset(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
+        use ogs_ngap::types::ResetType;
+        use ogs_ngap::{parser::decode_ngap_pdu, NgapMessage};
+
+        let reset = match decode_ngap_pdu(data) {
+            Ok(NgapMessage::NgReset(reset)) => reset,
+            Ok(other) => {
+                log::warn!("Expected NgReset, got {other:?}");
+                return Ok(());
+            }
+            Err(e) => {
+                log::warn!("Failed to decode NG Reset: {e:?}");
+                return Ok(());
+            }
+        };
+
+        let gnb_pool_id = self
+            .sessions
+            .read()
+            .await
+            .get(&association_id)
+            .map(|s| s.id);
+        let Some(gnb_pool_id) = gnb_pool_id else {
+            log::warn!("NG Reset from unknown association {association_id}");
+            return Ok(());
+        };
+
+        // Drop pending authentication state for the affected UEs
+        match &reset.reset_type {
+            ResetType::NgInterface => {
+                self.ue_auth_state
+                    .retain(|_, state| state.association_id != association_id);
+            }
+            ResetType::PartOfNgInterface(connections) => {
+                for item in connections {
+                    if let Some(amf_ue_ngap_id) = item.amf_ue_ngap_id {
+                        self.ue_auth_state.remove(&amf_ue_ngap_id);
+                    }
+                }
+            }
+        }
+
+        // Release the affected UE contexts and get the list to echo in the Ack
+        let ack_connections = ngap_handler::handle_ng_reset(gnb_pool_id, &reset);
+
+        if let Some(ack) = ngap_asn1::build_ng_reset_acknowledge_asn1(ack_connections) {
+            self.send_to_association(association_id, &ack).await?;
+            log::info!("NG Reset Acknowledge sent to association {association_id}");
+        } else {
+            log::error!("Failed to build NG Reset Acknowledge");
         }
 
         Ok(())
@@ -843,11 +921,17 @@ impl NgapServer {
                                 accept.push(dnn_bytes.len() as u8);
                                 accept.extend_from_slice(dnn_bytes);
 
-                                let n2 = ngap_build::build_n2_sm_information(
+                                // APER PDUSessionResourceSetupRequestTransfer
+                                // (TS 38.413 Section 9.3.4.1) with the local UPF
+                                // N3 endpoint, QFI 9 / 5QI 9 / ARP 8
+                                let n2 = ngap_asn1::build_n2_sm_setup_request_transfer(
                                     0x00000001,
-                                    &[127, 0, 0, 1],
+                                    [127, 0, 0, 1],
                                     9,
-                                );
+                                    9,
+                                    8,
+                                )
+                                .unwrap_or_default();
                                 (accept, n2)
                             }
                         };
@@ -1512,61 +1596,42 @@ impl NgapServer {
             response_data.ran_ue_ngap_id
         );
 
-        let mut gnb_teid: Option<u32> = None;
-        let mut gnb_addr: [u8; 4] = [127, 0, 0, 1];
-        let mut pdu_session_id: u8 = 1;
+        let mut gnb_endpoint: Option<(u8, ngap_asn1::GnbN3Endpoint, Vec<u8>)> = None;
 
         for item in &response_data.setup_list {
-            pdu_session_id = item.pdu_session_id;
-            // Parse transfer: QFI(1) + gNB TEID(4,BE) + addr_type(1) + gNB IPv4(4)
-            if item.transfer.len() >= 10 {
-                let teid = u32::from_be_bytes([
-                    item.transfer[1],
-                    item.transfer[2],
-                    item.transfer[3],
-                    item.transfer[4],
-                ]);
-                if item.transfer[5] == 1 && item.transfer.len() >= 10 {
-                    gnb_addr = [
-                        item.transfer[6],
-                        item.transfer[7],
-                        item.transfer[8],
-                        item.transfer[9],
-                    ];
+            // APER PDUSessionResourceSetupResponseTransfer (TS 38.413 Section 9.3.4.2)
+            match ngap_asn1::parse_n2_sm_setup_response_transfer(&item.transfer) {
+                Some(endpoint) => {
+                    log::info!(
+                        "Extracted gNB TEID=0x{:08x}, addr={:?}, QFIs={:?}, PSI={}",
+                        endpoint.teid,
+                        endpoint.address,
+                        endpoint.qfis,
+                        item.pdu_session_id
+                    );
+                    gnb_endpoint =
+                        Some((item.pdu_session_id, endpoint, item.transfer.clone()));
                 }
-                gnb_teid = Some(teid);
-                log::info!(
-                    "Extracted gNB TEID=0x{:08x}, addr={}.{}.{}.{}, QFI={}, PSI={}",
-                    teid,
-                    gnb_addr[0],
-                    gnb_addr[1],
-                    gnb_addr[2],
-                    gnb_addr[3],
-                    item.transfer[0],
-                    pdu_session_id
-                );
-            } else {
-                log::warn!(
-                    "Transfer IE too short for PSI={}: {} bytes",
-                    item.pdu_session_id,
-                    item.transfer.len()
-                );
+                None => {
+                    log::warn!(
+                        "Failed to decode setup-response transfer for PSI={} ({} bytes)",
+                        item.pdu_session_id,
+                        item.transfer.len()
+                    );
+                }
             }
         }
 
-        if let Some(teid) = gnb_teid {
+        if let Some((pdu_session_id, endpoint, raw_transfer)) = gnb_endpoint {
             log::info!(
-                "PDU Session Resource Setup Response: PSI={pdu_session_id}, gNB TEID=0x{teid:08x}"
+                "PDU Session Resource Setup Response: PSI={}, gNB TEID=0x{:08x}",
+                pdu_session_id,
+                endpoint.teid
             );
 
-            // Build N2 SM Info (gNB tunnel endpoint) in the same 12-byte format
-            let mut n2_sm_info = Vec::with_capacity(12);
-            n2_sm_info.push(9u8); // QFI
-            n2_sm_info.extend_from_slice(&teid.to_be_bytes());
-            n2_sm_info.push(1); // IPv4
-            n2_sm_info.extend_from_slice(&gnb_addr);
-            n2_sm_info.push(9); // 5QI
-            n2_sm_info.push(1); // Priority
+            // Forward the received N2 SM information container to the SMF
+            // opaquely (the AMF does not re-encode N2 SM info, TS 23.502)
+            let n2_sm_info = raw_transfer;
 
             // Call SMF to update SM context with gNB TEID
             let smf_update_host =
@@ -1587,7 +1652,9 @@ impl NgapServer {
             {
                 Ok(()) => {
                     log::info!(
-                        "SMF SM Context Updated with gNB TEID: ref={sm_context_ref}, TEID=0x{teid:08x}"
+                        "SMF SM Context Updated with gNB TEID: ref={}, TEID=0x{:08x}",
+                        sm_context_ref,
+                        endpoint.teid
                     );
                 }
                 Err(e) => {
@@ -1664,10 +1731,14 @@ impl NgapServer {
             }
         }
 
-        // Build and send UEContextReleaseCommand
+        // Build and send UEContextReleaseCommand (Cause: NAS normal-release)
         if let (Some(amf_id), Some(ran_id)) = (amf_ue_ngap_id, ran_ue_ngap_id) {
-            let release_cmd =
-                crate::ngap_asn1::build_ue_context_release_command_asn1(amf_id, ran_id);
+            let release_cmd = crate::ngap_asn1::build_ue_context_release_command_asn1(
+                amf_id,
+                ran_id,
+                ngap_handler::cause_group::NAS,
+                0, // CauseNas normal-release
+            );
             if let Some(cmd) = release_cmd {
                 self.send_to_association(association_id, &cmd).await?;
                 log::info!("UE Context Release Command sent to gNB");

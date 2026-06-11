@@ -13,7 +13,6 @@ pub mod metrics;
 pub mod namf_handler;
 pub mod nas_security;
 pub mod ngap_asn1;
-pub mod ngap_build;
 pub mod ngap_handler;
 pub mod ngap_mcast; // MBS: NGAP multicast session procedures (TS 38.413 / TS 23.247)
 pub mod ngap_path;
@@ -450,8 +449,11 @@ impl AmfApp {
         // Take the event receiver
         let mut event_rx = self.ngap_event_rx.take();
 
-        // Periodic heartbeat interval (replaces the 10ms sleep)
-        let mut heartbeat = tokio::time::interval(tokio::time::Duration::from_secs(10));
+        // NGAP socket poll cadence: amf_ngap_poll() drives SCTP accept/handshake
+        // and reads at most one datagram per call, so this interval bounds the
+        // NG Setup handshake latency — it must stay in the milliseconds (a 10s
+        // tick made the gNB's SCTP handshake time out).
+        let mut ngap_poll = tokio::time::interval(tokio::time::Duration::from_millis(10));
 
         loop {
             // Drain all pending events without sleeping between them, then
@@ -471,14 +473,20 @@ impl AmfApp {
                 }
 
                 // Periodic tick: run NGAP poll and check the shutdown flag.
-                _ = heartbeat.tick() => {
+                _ = ngap_poll.tick() => {
                     if !self.running.load(Ordering::SeqCst) {
                         break;
                     }
-                    match ngap_path::amf_ngap_poll().await {
-                        Ok(true) => log::debug!("Processed NGAP message"),
-                        Ok(false) => {}
-                        Err(e) => log::warn!("NGAP poll error: {e}"),
+                    // Drain everything ready on the socket before yielding.
+                    loop {
+                        match ngap_path::amf_ngap_poll().await {
+                            Ok(true) => log::debug!("Processed NGAP message"),
+                            Ok(false) => break,
+                            Err(e) => {
+                                log::warn!("NGAP poll error: {e}");
+                                break;
+                            }
+                        }
                     }
                 }
             }

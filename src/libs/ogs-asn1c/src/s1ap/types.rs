@@ -205,6 +205,8 @@ impl ProtocolIeId {
     pub const UE_ASSOCIATED_LOGICAL_S1_CONNECTION_ITEM: Self = Self(91);
     pub const RESET_TYPE: Self = Self(92);
     pub const UE_ASSOCIATED_LOGICAL_S1_CONNECTION_LIST_RES_ACK: Self = Self(93);
+    pub const E_RAB_TO_BE_SWITCHED_UL_ITEM: Self = Self(94);
+    pub const E_RAB_TO_BE_SWITCHED_UL_LIST: Self = Self(95);
     pub const S_TMSI: Self = Self(96);
     pub const UE_S1AP_IDS: Self = Self(99);
     pub const EUTRAN_CGI: Self = Self(100);

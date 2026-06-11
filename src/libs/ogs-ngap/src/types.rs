@@ -531,8 +531,8 @@ pub struct HandoverRequired {
     pub cause: Cause,
     /// Target ID
     pub target_id: TargetId,
-    /// PDU Session Resource List (optional)
-    pub pdu_session_list: Option<Vec<PduSessionResourceSetupItem>>,
+    /// PDU Session Resource List HO Rqd (mandatory)
+    pub pdu_session_list: Vec<PduSessionResourceItemHoRqd>,
     /// Source to Target Transparent Container
     pub source_to_target_container: Vec<u8>,
 }
@@ -666,6 +666,8 @@ pub struct PathSwitchRequest {
     pub ue_security_capabilities: UeSecurityCapabilities,
     /// PDU Session Resource To Be Switched In Downlink List
     pub pdu_session_list: Vec<PduSessionResourceSwitchItem>,
+    /// PDU Session Resource Failed To Setup List PS Req (optional)
+    pub failed_list: Option<Vec<PduSessionResourceFailedItem>>,
 }
 
 /// Path Switch Request Acknowledge - sent by AMF to target gNB (TS 38.413 Section 9.2.3.11)
@@ -683,8 +685,8 @@ pub struct PathSwitchRequestAcknowledge {
     pub switched_list: Vec<PduSessionResourceSwitchedItem>,
     /// PDU Session Resource Released List (optional)
     pub released_list: Option<Vec<PduSessionResourceReleasedItem>>,
-    /// Allowed NSSAI (optional)
-    pub allowed_nssai: Option<Vec<SNssai>>,
+    /// Allowed NSSAI (mandatory per TS 38.413 Section 9.2.3.22)
+    pub allowed_nssai: Vec<SNssai>,
 }
 
 /// Path Switch Request Failure - sent by AMF to target gNB (TS 38.413 Section 9.2.3.12)
@@ -694,7 +696,9 @@ pub struct PathSwitchRequestFailure {
     pub amf_ue_ngap_id: u64,
     /// RAN UE NGAP ID
     pub ran_ue_ngap_id: u32,
-    /// PDU Session Resource Released List (optional)
+    /// Cause (mandatory)
+    pub cause: Cause,
+    /// PDU Session Resource Released List PS Fail (optional)
     pub released_list: Option<Vec<PduSessionResourceReleasedItem>>,
     /// Criticality Diagnostics (optional)
     pub criticality_diagnostics: Option<CriticalityDiagnostics>,
@@ -855,4 +859,252 @@ pub enum PagingPriority {
 #[repr(u8)]
 pub enum PagingOrigin {
     Non3gpp = 0,
+}
+
+/// PDU Session Resource Item for Handover Required (TS 38.413 Section 9.2.3.1)
+#[derive(Debug, Clone)]
+pub struct PduSessionResourceItemHoRqd {
+    /// PDU Session ID
+    pub pdu_session_id: u8,
+    /// Handover Required Transfer (opaque)
+    pub transfer: Vec<u8>,
+}
+
+// ============================================================================
+// NG Reset (Section 8.7.4 / 9.2.6.11-12)
+// ============================================================================
+
+/// Reset Type - scope of an NG Reset (TS 38.413 Section 9.3.1.95)
+#[derive(Debug, Clone, PartialEq)]
+pub enum ResetType {
+    /// Reset the whole NG interface
+    NgInterface,
+    /// Reset only the listed UE-associated logical NG-connections
+    PartOfNgInterface(Vec<UeAssociatedLogicalNgConnectionItem>),
+}
+
+/// UE-associated Logical NG-connection Item (TS 38.413 Section 9.3.1.96)
+#[derive(Debug, Clone, PartialEq)]
+pub struct UeAssociatedLogicalNgConnectionItem {
+    /// AMF UE NGAP ID (optional)
+    pub amf_ue_ngap_id: Option<u64>,
+    /// RAN UE NGAP ID (optional)
+    pub ran_ue_ngap_id: Option<u32>,
+}
+
+/// NG Reset - sent by either AMF or NG-RAN node (TS 38.413 Section 9.2.6.11)
+#[derive(Debug, Clone)]
+pub struct NgReset {
+    /// Cause (mandatory)
+    pub cause: Cause,
+    /// Reset Type (mandatory)
+    pub reset_type: ResetType,
+}
+
+/// NG Reset Acknowledge (TS 38.413 Section 9.2.6.12)
+#[derive(Debug, Clone)]
+pub struct NgResetAcknowledge {
+    /// UE-associated Logical NG-connection List (optional)
+    pub connections: Option<Vec<UeAssociatedLogicalNgConnectionItem>>,
+    /// Criticality Diagnostics (optional)
+    pub criticality_diagnostics: Option<CriticalityDiagnostics>,
+}
+
+// ============================================================================
+// Error Indication (Section 8.7.5 / 9.2.6.13)
+// ============================================================================
+
+/// Error Indication - sent by either peer (TS 38.413 Section 9.2.6.13)
+#[derive(Debug, Clone)]
+pub struct ErrorIndication {
+    /// AMF UE NGAP ID (optional)
+    pub amf_ue_ngap_id: Option<u64>,
+    /// RAN UE NGAP ID (optional)
+    pub ran_ue_ngap_id: Option<u32>,
+    /// Cause (optional)
+    pub cause: Option<Cause>,
+    /// Criticality Diagnostics (optional)
+    pub criticality_diagnostics: Option<CriticalityDiagnostics>,
+}
+
+// ============================================================================
+// RAN Configuration Update (Section 8.7.2 / 9.2.6.7-9)
+// ============================================================================
+
+/// RAN Configuration Update - sent by gNB to AMF (TS 38.413 Section 9.2.6.7)
+#[derive(Debug, Clone)]
+pub struct RanConfigurationUpdate {
+    /// RAN Node Name (optional)
+    pub ran_node_name: Option<String>,
+    /// Supported TA List (optional)
+    pub supported_ta_list: Option<Vec<SupportedTaItem>>,
+    /// Default Paging DRX (optional)
+    pub default_paging_drx: Option<PagingDrx>,
+    /// Global RAN Node ID (optional)
+    pub global_ran_node_id: Option<GlobalRanNodeId>,
+}
+
+/// RAN Configuration Update Acknowledge (TS 38.413 Section 9.2.6.8)
+#[derive(Debug, Clone)]
+pub struct RanConfigurationUpdateAcknowledge {
+    /// Criticality Diagnostics (optional)
+    pub criticality_diagnostics: Option<CriticalityDiagnostics>,
+}
+
+/// RAN Configuration Update Failure (TS 38.413 Section 9.2.6.9)
+#[derive(Debug, Clone)]
+pub struct RanConfigurationUpdateFailure {
+    /// Cause (mandatory)
+    pub cause: Cause,
+    /// Time to Wait (optional)
+    pub time_to_wait: Option<TimeToWait>,
+    /// Criticality Diagnostics (optional)
+    pub criticality_diagnostics: Option<CriticalityDiagnostics>,
+}
+
+// ============================================================================
+// AMF Configuration Update (Section 8.7.3 / 9.2.6.4-6)
+// ============================================================================
+
+/// AMF Configuration Update - sent by AMF to gNB (TS 38.413 Section 9.2.6.4)
+///
+/// TNL association add/remove/update lists are deliberately deferred (all
+/// IEs of this message are optional per the spec table).
+#[derive(Debug, Clone)]
+pub struct AmfConfigurationUpdate {
+    /// AMF Name (optional)
+    pub amf_name: Option<String>,
+    /// Served GUAMI List (optional)
+    pub served_guami_list: Option<Vec<ServedGuamiItem>>,
+    /// Relative AMF Capacity (optional)
+    pub relative_amf_capacity: Option<u8>,
+    /// PLMN Support List (optional)
+    pub plmn_support_list: Option<Vec<PlmnSupportItem>>,
+}
+
+/// AMF Configuration Update Acknowledge (TS 38.413 Section 9.2.6.5)
+#[derive(Debug, Clone)]
+pub struct AmfConfigurationUpdateAcknowledge {
+    /// Criticality Diagnostics (optional)
+    pub criticality_diagnostics: Option<CriticalityDiagnostics>,
+}
+
+/// AMF Configuration Update Failure (TS 38.413 Section 9.2.6.6)
+#[derive(Debug, Clone)]
+pub struct AmfConfigurationUpdateFailure {
+    /// Cause (mandatory)
+    pub cause: Cause,
+    /// Time to Wait (optional)
+    pub time_to_wait: Option<TimeToWait>,
+    /// Criticality Diagnostics (optional)
+    pub criticality_diagnostics: Option<CriticalityDiagnostics>,
+}
+
+// ============================================================================
+// AMF Status Indication (Section 8.7.6 / 9.2.6.10)
+// ============================================================================
+
+/// AMF Status Indication - sent by AMF to gNB (TS 38.413 Section 9.2.6.10)
+#[derive(Debug, Clone)]
+pub struct AmfStatusIndication {
+    /// Unavailable GUAMI List (mandatory)
+    pub unavailable_guami_list: Vec<UnavailableGuamiItem>,
+}
+
+/// Unavailable GUAMI Item (TS 38.413 Section 9.3.3.18)
+#[derive(Debug, Clone)]
+pub struct UnavailableGuamiItem {
+    /// GUAMI
+    pub guami: Guami,
+    /// Timer Approach for GUAMI Removal (optional, ENUMERATED apply-timer)
+    pub timer_approach_for_guami_removal: bool,
+    /// Backup AMF Name (optional)
+    pub backup_amf_name: Option<String>,
+}
+
+// ============================================================================
+// PDU Session Resource Notify / Modify Indication (Sections 8.2.5 / 8.2.4)
+// ============================================================================
+
+/// PDU Session Resource Notify - sent by gNB to AMF (TS 38.413 Section 8.2.5)
+///
+/// At least one of `notify_list` / `released_list` shall be present.
+#[derive(Debug, Clone)]
+pub struct PduSessionResourceNotify {
+    /// AMF UE NGAP ID
+    pub amf_ue_ngap_id: u64,
+    /// RAN UE NGAP ID
+    pub ran_ue_ngap_id: u32,
+    /// PDU Session Resource Notify List (optional)
+    pub notify_list: Vec<PduSessionResourceNotifyItem>,
+    /// PDU Session Resource Released List Not (optional)
+    pub released_list: Vec<PduSessionResourceReleasedItem>,
+}
+
+/// Single notified PDU session (TS 38.413 Section 9.2.1.16)
+#[derive(Debug, Clone)]
+pub struct PduSessionResourceNotifyItem {
+    /// PDU Session ID
+    pub pdu_session_id: u8,
+    /// PDU Session Resource Notify Transfer (opaque)
+    pub transfer: Vec<u8>,
+}
+
+/// PDU Session Resource Modify Indication - sent by gNB to AMF (TS 38.413 Section 8.2.4)
+#[derive(Debug, Clone)]
+pub struct PduSessionResourceModifyIndication {
+    /// AMF UE NGAP ID
+    pub amf_ue_ngap_id: u64,
+    /// RAN UE NGAP ID
+    pub ran_ue_ngap_id: u32,
+    /// PDU Session Resource Modify List Mod Ind (mandatory)
+    pub modify_list: Vec<PduSessionResourceModifyIndicationItem>,
+}
+
+/// Single PDU session in Modify Indication
+#[derive(Debug, Clone)]
+pub struct PduSessionResourceModifyIndicationItem {
+    /// PDU Session ID
+    pub pdu_session_id: u8,
+    /// Modify Indication Transfer (opaque)
+    pub transfer: Vec<u8>,
+}
+
+/// PDU Session Resource Modify Confirm - sent by AMF to gNB (TS 38.413 Section 8.2.4)
+#[derive(Debug, Clone)]
+pub struct PduSessionResourceModifyConfirm {
+    /// AMF UE NGAP ID
+    pub amf_ue_ngap_id: u64,
+    /// RAN UE NGAP ID
+    pub ran_ue_ngap_id: u32,
+    /// PDU Session Resource Modify List Mod Cfm
+    pub confirm_list: Vec<PduSessionResourceModifyConfirmItem>,
+    /// PDU Session Resource Failed To Modify List Mod Cfm
+    pub failed_list: Vec<PduSessionResourceFailedItem>,
+}
+
+/// Single confirmed PDU session in Modify Confirm
+#[derive(Debug, Clone)]
+pub struct PduSessionResourceModifyConfirmItem {
+    /// PDU Session ID
+    pub pdu_session_id: u8,
+    /// Modify Confirm Transfer (opaque)
+    pub transfer: Vec<u8>,
+}
+
+// ============================================================================
+// NAS Non Delivery Indication (Section 8.6.5)
+// ============================================================================
+
+/// NAS Non Delivery Indication - sent by gNB to AMF (TS 38.413 Section 8.6.5)
+#[derive(Debug, Clone)]
+pub struct NasNonDeliveryIndication {
+    /// AMF UE NGAP ID
+    pub amf_ue_ngap_id: u64,
+    /// RAN UE NGAP ID
+    pub ran_ue_ngap_id: u32,
+    /// NAS-PDU that could not be delivered (mandatory)
+    pub nas_pdu: Vec<u8>,
+    /// Cause (mandatory)
+    pub cause: Cause,
 }

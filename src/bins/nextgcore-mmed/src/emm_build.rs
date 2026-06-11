@@ -793,24 +793,42 @@ fn encode_plmn_id(plmn: &PlmnId) -> [u8; 3] {
     bytes
 }
 
-/// Encode TAI list
+/// Encode TAI list (TS 24.301 §9.9.3.33, partial tracking area identity list).
+///
+/// Octet 1 of each partial list: spare (bit 8) + type of list (bits 7-6) +
+/// number of elements minus one (bits 5-1).
+/// - Type "00": one PLMN, list of TACs (used when all TAIs share a PLMN)
+/// - Type "10": explicit list of TAIs (used for mixed PLMNs)
 fn encode_tai_list(tai_list: &[EpsTai]) -> Vec<u8> {
     if tai_list.is_empty() {
         return vec![];
     }
 
     let mut buf = Vec::new();
+    let count = tai_list.len().min(16);
+    let entries = &tai_list[..count];
 
-    // Type 0 list: same PLMN, different TACs
-    // For simplicity, encode as type 1 (list of TAIs)
-    let num_tai = tai_list.len().min(16) as u8;
-    buf.push(0x20 | (num_tai - 1)); // Type 1 + number of elements
+    let first_plmn = encode_plmn_id(&entries[0].plmn_id);
+    let same_plmn = entries
+        .iter()
+        .all(|tai| encode_plmn_id(&tai.plmn_id) == first_plmn);
 
-    for tai in tai_list.iter().take(16) {
-        let plmn = encode_plmn_id(&tai.plmn_id);
-        buf.extend_from_slice(&plmn);
-        buf.push((tai.tac >> 8) as u8);
-        buf.push(tai.tac as u8);
+    if same_plmn {
+        // Type of list "00": one PLMN, non-consecutive TAC values
+        buf.push((count as u8) - 1);
+        buf.extend_from_slice(&first_plmn);
+        for tai in entries {
+            buf.push((tai.tac >> 8) as u8);
+            buf.push(tai.tac as u8);
+        }
+    } else {
+        // Type of list "10": explicit list of TAIs
+        buf.push(0x40 | ((count as u8) - 1));
+        for tai in entries {
+            buf.extend_from_slice(&encode_plmn_id(&tai.plmn_id));
+            buf.push((tai.tac >> 8) as u8);
+            buf.push(tai.tac as u8);
+        }
     }
 
     buf
@@ -849,6 +867,70 @@ fn encode_time_zone(offset_quarters: i8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_encode_tai_list_type0_single_plmn() {
+        // TS 24.301 §9.9.3.33 type "00": one PLMN + list of TACs
+        let plmn = PlmnId::new("310", "410");
+        let tai_list = vec![
+            EpsTai {
+                plmn_id: plmn.clone(),
+                tac: 0x0001,
+            },
+            EpsTai {
+                plmn_id: plmn.clone(),
+                tac: 0x1234,
+            },
+        ];
+        let encoded = encode_tai_list(&tai_list);
+        let plmn_bytes = encode_plmn_id(&plmn);
+        // Octet 1: spare=0, type=00, number of elements = 2-1 = 1
+        assert_eq!(encoded[0], 0x01);
+        assert_eq!(&encoded[1..4], &plmn_bytes);
+        assert_eq!(&encoded[4..6], &[0x00, 0x01]);
+        assert_eq!(&encoded[6..8], &[0x12, 0x34]);
+        assert_eq!(encoded.len(), 8);
+    }
+
+    #[test]
+    fn test_encode_tai_list_type2_mixed_plmn() {
+        // TS 24.301 §9.9.3.33 type "10": explicit list of TAIs
+        let plmn_a = PlmnId::new("310", "410");
+        let plmn_b = PlmnId::new("001", "01");
+        let tai_list = vec![
+            EpsTai {
+                plmn_id: plmn_a.clone(),
+                tac: 0x0001,
+            },
+            EpsTai {
+                plmn_id: plmn_b.clone(),
+                tac: 0x0002,
+            },
+        ];
+        let encoded = encode_tai_list(&tai_list);
+        // Octet 1: spare=0, type=10, number of elements = 2-1 = 1
+        assert_eq!(encoded[0], 0x41);
+        assert_eq!(&encoded[1..4], &encode_plmn_id(&plmn_a));
+        assert_eq!(&encoded[4..6], &[0x00, 0x01]);
+        assert_eq!(&encoded[6..9], &encode_plmn_id(&plmn_b));
+        assert_eq!(&encoded[9..11], &[0x00, 0x02]);
+        assert_eq!(encoded.len(), 11);
+    }
+
+    #[test]
+    fn test_encode_tai_list_empty_and_single() {
+        assert!(encode_tai_list(&[]).is_empty());
+
+        let tai_list = vec![EpsTai {
+            plmn_id: PlmnId::new("310", "410"),
+            tac: 0x0007,
+        }];
+        let encoded = encode_tai_list(&tai_list);
+        // Single element type 0: header 0x00, PLMN, one TAC
+        assert_eq!(encoded[0], 0x00);
+        assert_eq!(encoded.len(), 6);
+        assert_eq!(&encoded[4..6], &[0x00, 0x07]);
+    }
 
     #[test]
     fn test_gprs_timer_from_sec() {

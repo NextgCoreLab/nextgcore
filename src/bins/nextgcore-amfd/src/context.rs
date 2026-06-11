@@ -732,10 +732,23 @@ impl AmfContext {
     }
 
     /// Remove all RAN UEs for a gNB
-    fn ran_ue_remove_all_for_gnb(&self, gnb_id: u64) {
+    pub fn ran_ue_remove_all_for_gnb(&self, gnb_id: u64) {
         if let Ok(mut ran_ue_list) = self.ran_ue_list.write() {
             ran_ue_list.retain(|_, ran_ue| ran_ue.gnb_id != gnb_id);
         }
+    }
+
+    /// List all RAN UEs attached to a gNB
+    pub fn ran_ue_list_for_gnb(&self, gnb_id: u64) -> Vec<RanUe> {
+        self.ran_ue_list
+            .read()
+            .map(|list| {
+                list.values()
+                    .filter(|ran_ue| ran_ue.gnb_id == gnb_id)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Find RAN UE by pool ID

@@ -6,6 +6,20 @@ use super::ies::ProtocolIeContainer;
 use super::types::{Criticality, ProcedureCode};
 use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, PerError, PerResult};
 
+/// Read the OPEN TYPE value of a PDU wrapper, reassembling fragmented
+/// lengths per X.691 Section 11.9.3 (message values can exceed 16383
+/// octets when they carry large NAS-PDUs or transparent containers).
+fn read_open_type_value(decoder: &mut AperDecoder) -> PerResult<Vec<u8>> {
+    let mut value = Vec::new();
+    loop {
+        let (len, fragmented) = decoder.decode_length_fragment()?;
+        value.extend_from_slice(&decoder.read_bytes(len)?);
+        if !fragmented {
+            return Ok(value);
+        }
+    }
+}
+
 /// NGAP-PDU - Top-level PDU for all NGAP messages
 /// ASN.1: NGAP-PDU ::= CHOICE { initiatingMessage, successfulOutcome, unsuccessfulOutcome }
 #[derive(Debug, Clone, PartialEq)]
@@ -102,8 +116,7 @@ impl AperEncode for InitiatingMessage {
         value_encoder.align();
         let value_bytes = value_encoder.into_bytes();
 
-        encoder.encode_length_determinant(value_bytes.len())?;
-        encoder.write_bytes(&value_bytes);
+        encoder.encode_fragmented_octets(&value_bytes)?;
 
         Ok(())
     }
@@ -115,8 +128,7 @@ impl AperDecode for InitiatingMessage {
         let criticality = Criticality::decode_aper(decoder)?;
 
         // Decode OPEN TYPE
-        let value_len = decoder.decode_length_determinant()?;
-        let value_bytes = decoder.read_bytes(value_len)?;
+        let value_bytes = read_open_type_value(decoder)?;
         let mut value_decoder = AperDecoder::new(&value_bytes);
 
         let value = match procedure_code {
@@ -216,8 +228,7 @@ impl AperEncode for SuccessfulOutcome {
         value_encoder.align();
         let value_bytes = value_encoder.into_bytes();
 
-        encoder.encode_length_determinant(value_bytes.len())?;
-        encoder.write_bytes(&value_bytes);
+        encoder.encode_fragmented_octets(&value_bytes)?;
 
         Ok(())
     }
@@ -228,8 +239,7 @@ impl AperDecode for SuccessfulOutcome {
         let procedure_code = ProcedureCode::decode_aper(decoder)?;
         let criticality = Criticality::decode_aper(decoder)?;
 
-        let value_len = decoder.decode_length_determinant()?;
-        let value_bytes = decoder.read_bytes(value_len)?;
+        let value_bytes = read_open_type_value(decoder)?;
         let mut value_decoder = AperDecoder::new(&value_bytes);
 
         let value = match procedure_code {
@@ -308,8 +318,7 @@ impl AperEncode for UnsuccessfulOutcome {
         value_encoder.align();
         let value_bytes = value_encoder.into_bytes();
 
-        encoder.encode_length_determinant(value_bytes.len())?;
-        encoder.write_bytes(&value_bytes);
+        encoder.encode_fragmented_octets(&value_bytes)?;
 
         Ok(())
     }
@@ -320,8 +329,7 @@ impl AperDecode for UnsuccessfulOutcome {
         let procedure_code = ProcedureCode::decode_aper(decoder)?;
         let criticality = Criticality::decode_aper(decoder)?;
 
-        let value_len = decoder.decode_length_determinant()?;
-        let value_bytes = decoder.read_bytes(value_len)?;
+        let value_bytes = read_open_type_value(decoder)?;
         let mut value_decoder = AperDecoder::new(&value_bytes);
 
         let value = match procedure_code {
