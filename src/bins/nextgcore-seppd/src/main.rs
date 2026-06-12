@@ -15,6 +15,8 @@ use std::time::Duration;
 mod context;
 mod event;
 mod handshake_sm;
+mod jose;
+mod n32_server;
 mod n32c_build;
 mod n32c_handler;
 mod prins;
@@ -109,6 +111,46 @@ struct Args {
     /// Maximum number of associations
     #[arg(long, default_value = "8192")]
     max_assoc: usize,
+
+    /// Serving PLMN IDs as "mcc:mnc" (repeatable, e.g. --serving-plmn 999:70)
+    #[arg(long = "serving-plmn")]
+    serving_plmn: Vec<String>,
+
+    /// Enable PRINS security capability (in addition to TLS)
+    #[arg(long)]
+    prins: bool,
+
+    /// Peer SEPP to handshake with, as "fqdn=apiroot"
+    /// (repeatable, e.g. --peer-sepp sepp.visited.com=http://10.0.0.2:7778)
+    #[arg(long = "peer-sepp")]
+    peer_sepp: Vec<String>,
+
+    /// CA bundle for verifying peer-SEPP client certificates on the N32
+    /// listener (enables mTLS; requires --tls/--tls-cert/--tls-key)
+    #[arg(long)]
+    n32_mtls_cacert: Option<String>,
+
+    /// Client certificate presented on outgoing N32 connections (mTLS)
+    #[arg(long)]
+    n32_client_cert: Option<String>,
+
+    /// Client private key for outgoing N32 connections (mTLS)
+    #[arg(long)]
+    n32_client_key: Option<String>,
+
+    /// CA bundle for verifying peer-SEPP server certificates
+    #[arg(long)]
+    n32_ca_cert: Option<String>,
+}
+
+/// Parse "mcc:mnc" into a PlmnId
+fn parse_plmn(spec: &str) -> Option<PlmnId> {
+    let (mcc, mnc) = spec.split_once(':')?;
+    Some(PlmnId::new(
+        mcc.parse().ok()?,
+        mnc.parse().ok()?,
+        mnc.len() as u8,
+    ))
 }
 
 /// Global shutdown flag
@@ -158,6 +200,32 @@ async fn main() -> Result<()> {
         };
     }
 
+    // Serving PLMN list and security capabilities (from configuration)
+    {
+        let plmn_ids: Vec<PlmnId> = args
+            .serving_plmn
+            .iter()
+            .filter_map(|s| {
+                let p = parse_plmn(s);
+                if p.is_none() {
+                    log::warn!("Ignoring malformed --serving-plmn [{s}] (want mcc:mnc)");
+                }
+                p
+            })
+            .collect();
+        let ctx = sepp_self();
+        if let Ok(mut context) = ctx.write() {
+            if !plmn_ids.is_empty() {
+                log::info!("Serving PLMNs: {plmn_ids:?}");
+                context.set_serving_plmn_ids(plmn_ids);
+            }
+            if args.prins {
+                context.security_capability.prins = true;
+                log::info!("PRINS security capability enabled");
+            }
+        };
+    }
+
     // Initialize SEPP state machine
     let mut sepp_sm = SeppSmContext::new();
     sepp_sm.init();
@@ -199,8 +267,52 @@ async fn main() -> Result<()> {
         args.sbi_port
     );
 
+    // N32 TLS/mTLS settings shared by the listener and the N32-c client
+    let n32_tls = n32_server::N32TlsConfig {
+        cert: args.tls_cert.clone(),
+        key: args.tls_key.clone(),
+        verify_client_cacert: args.n32_mtls_cacert.clone(),
+        client_cert: args.n32_client_cert.clone(),
+        client_key: args.n32_client_key.clone(),
+        ca_cert: args.n32_ca_cert.clone(),
+    };
+    let n32_tls_opt = if args.tls { Some(&n32_tls) } else { None };
+
+    // Start the N32 listener (N32-c handshake + N32-f forwarding endpoints)
+    let mut n32_listener = None;
     if let (Some(n32_addr), Some(n32_port)) = (&args.n32_addr, args.n32_port) {
+        let server = n32_server::start_n32_listener(n32_addr, n32_port, n32_tls_opt)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
         log::info!("N32 interface listening on {n32_addr}:{n32_port}");
+        n32_listener = Some(server);
+    }
+
+    // Initiate the N32-c handshake towards configured peer SEPPs
+    for peer in &args.peer_sepp {
+        let Some((fqdn, api_root)) = peer.split_once('=') else {
+            log::warn!("Ignoring malformed --peer-sepp [{peer}] (want fqdn=apiroot)");
+            continue;
+        };
+        let local_api_root = match (&args.n32_addr, args.n32_port) {
+            (Some(addr), Some(port)) => Some(format!(
+                "{}://{}:{}",
+                if args.tls { "https" } else { "http" },
+                addr,
+                port
+            )),
+            _ => None,
+        };
+        match n32_server::initiate_n32c_handshake(fqdn, api_root, local_api_root.as_deref(), n32_tls_opt)
+            .await
+        {
+            Ok(outcome) => log::info!(
+                "Peer SEPP [{fqdn}] established (node={}, security={:?})",
+                outcome.node_id,
+                outcome.security
+            ),
+            Err(e) => log::error!("Peer SEPP [{fqdn}] handshake failed: {e}"),
+        }
     }
 
     log::info!("NextGCore SEPP ready");
@@ -210,6 +322,12 @@ async fn main() -> Result<()> {
 
     // Graceful shutdown
     log::info!("Shutting down...");
+
+    // Stop the N32 listener
+    if let Some(server) = n32_listener.take() {
+        let _ = server.stop().await;
+        log::info!("N32 listener stopped");
+    }
 
     // Close SBI server
     sepp_sbi_close();

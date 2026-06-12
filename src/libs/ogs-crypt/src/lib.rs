@@ -7,6 +7,7 @@ pub mod aes; // AES operations
 pub mod aes_cmac; // AES-CMAC
 pub mod base64; // Base64 encoding/decoding
 pub mod ecc; // Elliptic Curve Cryptography (P-256 + ECIES Profile B)
+pub mod ecies; // ECIES Profile A (X25519) + SUCI scheme-output helpers (TS 33.501 Annex C)
 pub mod hybrid; // Hybrid key exchange (P-256 + ML-KEM-768)
 pub mod kasumi; // KASUMI block cipher (f8/f9)
 pub mod kdf; // Key Derivation Functions

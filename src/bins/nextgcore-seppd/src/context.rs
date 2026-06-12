@@ -161,6 +161,24 @@ impl PlmnId {
     }
 }
 
+/// N32-f security material established via the N32-c exchange-params
+/// handshake (TS 29.573 sec 6.1.5.3, TS 33.501 sec 13.2)
+#[derive(Debug, Clone)]
+pub struct N32fSecurityInfo {
+    /// N32-f context ID allocated by the local SEPP (peer addresses us with it)
+    pub local_context_id: String,
+    /// N32-f context ID allocated by the peer SEPP (we address the peer with it)
+    pub peer_context_id: String,
+    /// Established session key (HKDF-SHA256-derived, A256GCM)
+    pub session_key: [u8; 32],
+    /// Key identifier for JOSE headers
+    pub kid: String,
+    /// Selected JWE cipher suite (e.g. "A256GCM")
+    pub jwe_cipher_suite: String,
+    /// Selected JWS cipher suite (e.g. "HS256")
+    pub jws_cipher_suite: String,
+}
+
 /// SEPP Node structure - represents a peer SEPP
 /// Port of sepp_node_t from context.h
 #[derive(Debug, Clone)]
@@ -187,6 +205,10 @@ pub struct SeppNode {
     pub client_id: Option<u64>,
     /// Client ID for N32f interface
     pub n32f_client_id: Option<u64>,
+    /// Peer N32-c API root (e.g. "http://host:port") for n32f-error reports
+    pub peer_api_root: Option<String>,
+    /// N32-f security material (PRINS), established via exchange-params
+    pub n32f_security: Option<N32fSecurityInfo>,
 }
 
 impl SeppNode {
@@ -203,6 +225,8 @@ impl SeppNode {
             establish_timer_active: false,
             client_id: None,
             n32f_client_id: None,
+            peer_api_root: None,
+            n32f_security: None,
         }
     }
 
@@ -280,6 +304,8 @@ pub struct SeppContext {
     pub security_capability: SecurityCapabilityConfig,
     /// Whether target API root is supported
     pub target_apiroot_supported: bool,
+    /// PLMN IDs served by this SEPP (sent in N32-c handshake messages)
+    pub serving_plmn_ids: Vec<PlmnId>,
     /// Peer SEPP node list (by ID)
     peer_list: RwLock<HashMap<u64, SeppNode>>,
     /// Association list (by ID)
@@ -305,6 +331,7 @@ impl SeppContext {
                 prins: false,
             },
             target_apiroot_supported: true,
+            serving_plmn_ids: Vec::new(),
             peer_list: RwLock::new(HashMap::new()),
             assoc_list: RwLock::new(HashMap::new()),
             next_node_id: AtomicUsize::new(1),
@@ -341,6 +368,18 @@ impl SeppContext {
 
     pub fn set_sender(&mut self, sender: &str) {
         self.sender = Some(sender.to_string());
+    }
+
+    /// Set the serving PLMN ID list (from configuration)
+    pub fn set_serving_plmn_ids(&mut self, plmn_ids: Vec<PlmnId>) {
+        self.serving_plmn_ids = plmn_ids;
+    }
+
+    /// Check whether a PLMN is served by this SEPP
+    pub fn serves_plmn(&self, mcc: u16, mnc: u16) -> bool {
+        self.serving_plmn_ids
+            .iter()
+            .any(|p| p.mcc == mcc && p.mnc == mnc)
     }
 
     // Node management functions
@@ -412,6 +451,20 @@ impl SeppContext {
     pub fn node_find(&self, id: u64) -> Option<SeppNode> {
         let peer_list = self.peer_list.read().ok()?;
         peer_list.get(&id).cloned()
+    }
+
+    /// Find node by the locally-allocated N32-f context ID (the ID the
+    /// peer uses in the metaData of N32-f messages it sends to us)
+    pub fn node_find_by_n32f_context_id(&self, context_id: &str) -> Option<SeppNode> {
+        let peer_list = self.peer_list.read().ok()?;
+        peer_list
+            .values()
+            .find(|n| {
+                n.n32f_security
+                    .as_ref()
+                    .is_some_and(|s| s.local_context_id == context_id)
+            })
+            .cloned()
     }
 
     /// Update node in the context

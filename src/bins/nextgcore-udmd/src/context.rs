@@ -270,11 +270,104 @@ impl UdmSdmSubscription {
     }
 }
 
-/// Extract SUPI from SUCI or SUPI string
+/// SUCI protection scheme identifiers (TS 23.003 Annex C / TS 33.501 Annex C)
+pub const PROTECTION_SCHEME_NULL: u8 = 0;
+/// ECIES Profile A (Curve25519)
+pub const PROTECTION_SCHEME_PROFILE_A: u8 = 1;
+/// ECIES Profile B (secp256r1)
+pub const PROTECTION_SCHEME_PROFILE_B: u8 = 2;
+
+/// Home network private key provisioned for SUCI deconcealment (TS 33.501 §6.12)
+#[derive(Debug, Clone)]
+pub struct HnetKey {
+    /// Protection scheme this key serves (1 = Profile A, 2 = Profile B)
+    pub scheme: u8,
+    /// Raw private key bytes (32 bytes for both X25519 and P-256)
+    pub key: Vec<u8>,
+}
+
+/// Parsed SUCI components (TS 23.003 §28.7.3):
+/// `suci-<supiType>-<mcc>-<mnc>-<routingIndicator>-<protectionScheme>-<keyId>-<schemeOutput>`
+#[derive(Debug, Clone)]
+pub struct ParsedSuci {
+    /// SUPI type (0 = IMSI)
+    pub supi_type: u8,
+    /// Mobile country code
+    pub mcc: String,
+    /// Mobile network code
+    pub mnc: String,
+    /// Protection scheme identifier
+    pub protection_scheme: u8,
+    /// Home network public key identifier
+    pub key_id: u8,
+    /// Scheme output (MSIN digits for null scheme, hex blob for profiles A/B)
+    pub scheme_output: String,
+}
+
+/// Parse a SUCI string into its components.
+pub fn parse_suci(suci: &str) -> Option<ParsedSuci> {
+    let parts: Vec<&str> = suci.split('-').collect();
+    if parts.len() != 8 || parts[0] != "suci" {
+        return None;
+    }
+    Some(ParsedSuci {
+        supi_type: parts[1].parse().ok()?,
+        mcc: parts[2].to_string(),
+        mnc: parts[3].to_string(),
+        protection_scheme: parts[5].parse().ok()?,
+        key_id: parts[6].parse().ok()?,
+        scheme_output: parts[7].to_string(),
+    })
+}
+
+/// Strict hex decode: rejects odd length and non-hex characters.
+fn hex_str_to_bytes(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// Decode an MSIN plaintext block (TBCD, swapped nibbles, 0xF filler) into digits.
+fn msin_bcd_to_digits(bcd: &[u8]) -> String {
+    let mut digits = String::with_capacity(bcd.len() * 2);
+    for &byte in bcd {
+        let low = byte & 0x0F;
+        let high = (byte >> 4) & 0x0F;
+        if low <= 9 {
+            digits.push(char::from(b'0' + low));
+        }
+        if high <= 9 {
+            digits.push(char::from(b'0' + high));
+        }
+    }
+    digits
+}
+
+/// Extract SUPI from a SUCI or SUPI string without key material.
+///
+/// Handles the null protection scheme (the scheme output IS the MSIN) and the
+/// `imsi-` passthrough. Returns None for ECIES-protected SUCIs — those require
+/// the home network private key (see [`UdmContext::deconceal_suci`]).
 fn supi_from_suci(suci_or_supi: &str) -> Option<String> {
     if suci_or_supi.starts_with("suci-") {
-        // Parse SUCI format: suci-0-MCC-MNC-MSIN...
-        // For now, return None - actual implementation would decode SUCI
+        let parsed = parse_suci(suci_or_supi)?;
+        if parsed.supi_type != 0 {
+            return None;
+        }
+        if parsed.protection_scheme == PROTECTION_SCHEME_NULL {
+            // Null scheme: scheme output is the MSIN in cleartext digits
+            if !parsed.scheme_output.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            return Some(format!(
+                "imsi-{}{}{}",
+                parsed.mcc, parsed.mnc, parsed.scheme_output
+            ));
+        }
         None
     } else if suci_or_supi.starts_with("imsi-") {
         Some(suci_or_supi.to_string())
@@ -295,6 +388,8 @@ pub struct UdmContext {
     suci_hash: RwLock<HashMap<String, u64>>,
     /// SUPI hash (SUPI -> pool ID)
     supi_hash: RwLock<HashMap<String, u64>>,
+    /// Home network private keys for SUCI deconcealment (key id -> key)
+    hnet_keys: RwLock<HashMap<u8, HnetKey>>,
     /// Next UE ID
     next_ue_id: AtomicUsize,
     /// Next session ID
@@ -318,6 +413,7 @@ impl UdmContext {
             sdm_subscription_list: RwLock::new(HashMap::new()),
             suci_hash: RwLock::new(HashMap::new()),
             supi_hash: RwLock::new(HashMap::new()),
+            hnet_keys: RwLock::new(HashMap::new()),
             next_ue_id: AtomicUsize::new(1),
             next_sess_id: AtomicUsize::new(1),
             max_num_of_ue: 0,
@@ -364,8 +460,98 @@ impl UdmContext {
         self.initialized.load(Ordering::SeqCst)
     }
 
+    /// Provision a home network private key for SUCI deconcealment.
+    pub fn hnet_key_add(&self, key_id: u8, scheme: u8, key: Vec<u8>) {
+        if let Ok(mut keys) = self.hnet_keys.write() {
+            keys.insert(key_id, HnetKey { scheme, key });
+            log::info!("Home network key provisioned (id={key_id}, scheme={scheme})");
+        }
+    }
+
+    /// Deconceal a SUCI into the SUPI (TS 33.501 §6.12.5).
+    ///
+    /// - Null scheme (0): scheme output is the cleartext MSIN.
+    /// - Profile A (1): ECIES X25519 deconcealment with the provisioned key.
+    /// - Profile B (2): ECIES P-256 deconcealment with the provisioned key.
+    /// - `imsi-...` strings pass through unchanged.
+    pub fn deconceal_suci(&self, suci_or_supi: &str) -> Option<String> {
+        // Null scheme / imsi passthrough require no key material
+        if let Some(supi) = supi_from_suci(suci_or_supi) {
+            return Some(supi);
+        }
+        if !suci_or_supi.starts_with("suci-") {
+            return None;
+        }
+
+        let parsed = parse_suci(suci_or_supi)?;
+        if parsed.supi_type != 0 {
+            log::warn!("[{suci_or_supi}] Unsupported SUPI type {}", parsed.supi_type);
+            return None;
+        }
+
+        // Copy the key out of the map; do not hold the guard across crypto calls
+        let hnet_key = {
+            let keys = self.hnet_keys.read().ok()?;
+            keys.get(&parsed.key_id).cloned()
+        };
+        let hnet_key = match hnet_key {
+            Some(k) => k,
+            None => {
+                log::error!(
+                    "[{suci_or_supi}] No home network key for key id {}",
+                    parsed.key_id
+                );
+                return None;
+            }
+        };
+        if hnet_key.scheme != parsed.protection_scheme {
+            log::error!(
+                "[{suci_or_supi}] Key id {} is scheme {} but SUCI uses scheme {}",
+                parsed.key_id,
+                hnet_key.scheme,
+                parsed.protection_scheme
+            );
+            return None;
+        }
+
+        let scheme_output = hex_str_to_bytes(&parsed.scheme_output)?;
+
+        let plaintext = match parsed.protection_scheme {
+            PROTECTION_SCHEME_PROFILE_A => {
+                let priv_key: [u8; 32] = hnet_key.key.as_slice().try_into().ok()?;
+                ogs_crypt::ecies::suci_deconceal_profile_a(&priv_key, &scheme_output)
+                    .map_err(|e| {
+                        log::error!("[{suci_or_supi}] Profile A deconcealment failed: {e}");
+                    })
+                    .ok()?
+            }
+            PROTECTION_SCHEME_PROFILE_B => {
+                let priv_key: [u8; 32] = hnet_key.key.as_slice().try_into().ok()?;
+                ogs_crypt::ecies::suci_deconceal_profile_b(&priv_key, &scheme_output)
+                    .map_err(|e| {
+                        log::error!("[{suci_or_supi}] Profile B deconcealment failed: {e}");
+                    })
+                    .ok()?
+            }
+            other => {
+                log::error!("[{suci_or_supi}] Unsupported protection scheme {other}");
+                return None;
+            }
+        };
+
+        let msin = msin_bcd_to_digits(&plaintext);
+        if msin.is_empty() {
+            return None;
+        }
+        Some(format!("imsi-{}{}{}", parsed.mcc, parsed.mnc, msin))
+    }
+
     /// Add a new UE by SUCI
     pub fn ue_add(&self, suci: &str) -> Option<UdmUe> {
+        // Deconceal before taking any write guards (deconceal_suci locks the
+        // hnet key map; never hold one map guard while locking another).
+        let supi = self.deconceal_suci(suci);
+
         let mut ue_list = self.ue_list.write().ok()?;
         let mut suci_hash = self.suci_hash.write().ok()?;
         let mut supi_hash = self.supi_hash.write().ok()?;
@@ -376,7 +562,8 @@ impl UdmContext {
         }
 
         let id = self.next_ue_id.fetch_add(1, Ordering::SeqCst) as u64;
-        let ue = UdmUe::new(id, suci);
+        let mut ue = UdmUe::new(id, suci);
+        ue.supi = supi;
 
         suci_hash.insert(suci.to_string(), id);
         if let Some(ref supi) = ue.supi {
@@ -384,7 +571,7 @@ impl UdmContext {
         }
         ue_list.insert(id, ue.clone());
 
-        log::debug!("[{suci}] UDM UE added (id={id})");
+        log::debug!("[{suci}] UDM UE added (id={id}, supi={:?})", ue.supi);
         Some(ue)
     }
 
@@ -831,5 +1018,136 @@ mod tests {
             ctx.ue_add(&format!("suci-0-001-01-0000-0-0-{i:010}"));
         }
         assert_eq!(ctx.get_ue_load(), 50);
+    }
+
+    // ========================================================================
+    // SUCI deconcealment (TS 33.501 §6.12 / TS 23.003 §28.7.3)
+    // ========================================================================
+
+    #[test]
+    fn test_parse_suci() {
+        let parsed = parse_suci("suci-0-001-01-0000-1-2-deadbeef").unwrap();
+        assert_eq!(parsed.supi_type, 0);
+        assert_eq!(parsed.mcc, "001");
+        assert_eq!(parsed.mnc, "01");
+        assert_eq!(parsed.protection_scheme, 1);
+        assert_eq!(parsed.key_id, 2);
+        assert_eq!(parsed.scheme_output, "deadbeef");
+
+        assert!(parse_suci("imsi-001010000000001").is_none());
+        assert!(parse_suci("suci-0-001-01-0000-0-0").is_none()); // too few parts
+    }
+
+    #[test]
+    fn test_null_scheme_deconcealment() {
+        let mut ctx = UdmContext::new();
+        ctx.init(100, 200);
+
+        // Null scheme requires no key material
+        let supi = ctx
+            .deconceal_suci("suci-0-001-01-0000-0-0-0000000001")
+            .unwrap();
+        assert_eq!(supi, "imsi-001010000000001");
+
+        // imsi passthrough
+        assert_eq!(
+            ctx.deconceal_suci("imsi-001010000000001").unwrap(),
+            "imsi-001010000000001"
+        );
+
+        // Non-digit scheme output is rejected for the null scheme
+        assert!(ctx.deconceal_suci("suci-0-001-01-0000-0-0-00abc1").is_none());
+    }
+
+    /// Encode digits as TBCD (swapped nibbles, 0xF filler) like the UE side.
+    fn msin_to_bcd(msin: &str) -> Vec<u8> {
+        let digits: Vec<u8> = msin.bytes().map(|b| b - b'0').collect();
+        let mut out = Vec::with_capacity(digits.len().div_ceil(2));
+        for pair in digits.chunks(2) {
+            let low = pair[0];
+            let high = if pair.len() > 1 { pair[1] } else { 0xF };
+            out.push((high << 4) | low);
+        }
+        out
+    }
+
+    #[test]
+    fn test_profile_a_deconcealment() {
+        let mut ctx = UdmContext::new();
+        ctx.init(100, 200);
+
+        let hn_priv = [0x42u8; 32];
+        let hn_pub = ogs_crypt::ecies::x25519_public_key(&hn_priv);
+        ctx.hnet_key_add(1, PROTECTION_SCHEME_PROFILE_A, hn_priv.to_vec());
+
+        let msin = "0123456789";
+        let bcd = msin_to_bcd(msin);
+        let (eph_pub, ct, tag) = ogs_crypt::ecies::ecies_profile_a_encrypt(&hn_pub, &bcd).unwrap();
+        let mut scheme_output = Vec::new();
+        scheme_output.extend_from_slice(&eph_pub);
+        scheme_output.extend_from_slice(&ct);
+        scheme_output.extend_from_slice(&tag);
+        let hex: String = scheme_output.iter().map(|b| format!("{b:02x}")).collect();
+
+        let suci = format!("suci-0-001-01-0000-1-1-{hex}");
+        let supi = ctx.deconceal_suci(&suci).unwrap();
+        assert_eq!(supi, format!("imsi-00101{msin}"));
+
+        // ue_add picks up the deconcealed SUPI and indexes it
+        let ue = ctx.ue_add(&suci).unwrap();
+        assert_eq!(ue.supi.as_deref(), Some(supi.as_str()));
+        assert!(ctx.ue_find_by_supi(&supi).is_some());
+    }
+
+    #[test]
+    fn test_profile_b_deconcealment() {
+        let mut ctx = UdmContext::new();
+        ctx.init(100, 200);
+
+        let mut hn_pub = [0u8; 33];
+        let mut hn_priv = [0u8; 32];
+        ogs_crypt::ecc::ecc_make_key(&mut hn_pub, &mut hn_priv).unwrap();
+        ctx.hnet_key_add(2, PROTECTION_SCHEME_PROFILE_B, hn_priv.to_vec());
+
+        let msin = "0123456789";
+        let bcd = msin_to_bcd(msin);
+        let (eph_pub, ct, tag) = ogs_crypt::ecc::ecies_profile_b_encrypt(&hn_pub, &bcd).unwrap();
+        let mut scheme_output = Vec::new();
+        scheme_output.extend_from_slice(&eph_pub);
+        scheme_output.extend_from_slice(&ct);
+        scheme_output.extend_from_slice(&tag);
+        let hex: String = scheme_output.iter().map(|b| format!("{b:02x}")).collect();
+
+        let suci = format!("suci-0-001-01-0000-2-2-{hex}");
+        let supi = ctx.deconceal_suci(&suci).unwrap();
+        assert_eq!(supi, format!("imsi-00101{msin}"));
+    }
+
+    #[test]
+    fn test_deconcealment_failures() {
+        let mut ctx = UdmContext::new();
+        ctx.init(100, 200);
+
+        // No key provisioned for key id 7
+        assert!(ctx.deconceal_suci("suci-0-001-01-0000-1-7-00").is_none());
+
+        // Scheme mismatch: key 1 is Profile A but SUCI claims Profile B
+        ctx.hnet_key_add(1, PROTECTION_SCHEME_PROFILE_A, vec![0x42u8; 32]);
+        assert!(ctx.deconceal_suci("suci-0-001-01-0000-2-1-00").is_none());
+
+        // Tampered ciphertext: MAC verification must fail
+        let hn_priv = [0x42u8; 32];
+        let hn_pub = ogs_crypt::ecies::x25519_public_key(&hn_priv);
+        let bcd = msin_to_bcd("0123456789");
+        let (eph_pub, ct, tag) = ogs_crypt::ecies::ecies_profile_a_encrypt(&hn_pub, &bcd).unwrap();
+        let mut scheme_output = Vec::new();
+        scheme_output.extend_from_slice(&eph_pub);
+        scheme_output.extend_from_slice(&ct);
+        scheme_output.extend_from_slice(&tag);
+        scheme_output[40] ^= 0xFF; // flip a MAC byte
+        let hex: String = scheme_output.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(ctx
+            .deconceal_suci(&format!("suci-0-001-01-0000-1-1-{hex}"))
+            .is_none());
     }
 }

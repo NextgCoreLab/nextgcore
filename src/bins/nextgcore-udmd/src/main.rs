@@ -99,8 +99,16 @@ struct SbiYaml {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct HnetYaml {
+    id: u8,
+    scheme: u8,
+    key: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct UdmSection {
     sbi: Option<SbiYaml>,
+    hnet: Option<Vec<HnetYaml>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -168,6 +176,31 @@ async fn main() -> Result<()> {
                                         ogs_sbi::context::global_context()
                                             .set_nrf_uri(&nrf.uri)
                                             .await;
+                                    }
+                                }
+                            }
+                        }
+                        // Provision home network keys for SUCI deconcealment
+                        // (TS 33.501 §6.12). The `key` value is either a hex
+                        // string or a path to a file containing the hex key.
+                        if let Some(hnet) = udm.hnet {
+                            for entry in hnet {
+                                match load_hnet_key(&entry.key) {
+                                    Some(key) => {
+                                        let ctx = udm_self();
+                                        if let Ok(context) = ctx.read() {
+                                            context.hnet_key_add(entry.id, entry.scheme, key);
+                                        };
+                                    }
+                                    None => {
+                                        log::warn!(
+                                            "hnet key id={} scheme={} could not be loaded \
+                                             from '{}' (expected 64 hex chars inline or in file); \
+                                             SUCIs using this key will be rejected",
+                                            entry.id,
+                                            entry.scheme,
+                                            entry.key
+                                        );
                                     }
                                 }
                             }
@@ -329,12 +362,12 @@ async fn udm_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         }
 
         // UE Authentication Service (nudm-ueau)
-        "nudm-ueau" if parts.len() >= 5 => {
+        "nudm-ueau" if parts.len() >= 4 => {
             let supi = parts[2];
             let resource = parts.get(3).unwrap_or(&"");
-            let action = parts.get(4).unwrap_or(&"");
+            let action = parts.get(4).copied().unwrap_or("");
 
-            match (*resource, *action, method) {
+            match (*resource, action, method) {
                 ("security-information", "generate-auth-data", "POST") => {
                     handle_generate_auth_data(supi, &request).await
                 }
@@ -617,8 +650,64 @@ async fn handle_sdm_unsubscribe(supi: &str, subscription_id: &str) -> SbiRespons
 
 // UE Authentication handlers
 
-async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("Generate Auth Data: SUPI={supi}");
+/// Build an RFC 7807 / TS 29.500 ProblemDetails response.
+fn send_problem(status: u16, cause: &str, detail: &str) -> SbiResponse {
+    SbiResponse::with_status(status)
+        .with_json_body(&serde_json::json!({
+            "status": status,
+            "cause": cause,
+            "detail": detail
+        }))
+        .unwrap_or_else(|_| SbiResponse::with_status(status))
+}
+
+/// Validate the serving network name format (TS 24.501 §9.12.1 / TS 33.501
+/// §6.1.1.4): `5G:mnc<3-digit MNC>.mcc<3-digit MCC>.3gppnetwork.org`.
+fn validate_serving_network_name(snn: &str) -> bool {
+    let rest = match snn.strip_prefix("5G:mnc") {
+        Some(r) => r,
+        None => return false,
+    };
+    let (mnc, rest) = match rest.split_once(".mcc") {
+        Some(p) => p,
+        None => return false,
+    };
+    // Allow an optional NID suffix for SNPN (TS 33.501 §5.30):
+    // "...3gppnetwork.org:NID"
+    let (mcc, tail) = match rest.split_once('.') {
+        Some(p) => p,
+        None => return false,
+    };
+    let tail_ok = tail == "3gppnetwork.org" || tail.starts_with("3gppnetwork.org:");
+    mnc.len() == 3
+        && mcc.len() == 3
+        && mnc.bytes().all(|b| b.is_ascii_digit())
+        && mcc.bytes().all(|b| b.is_ascii_digit())
+        && tail_ok
+}
+
+/// Load a home network private key: either a 64-hex-char string inline or a
+/// path to a file containing the hex key.
+fn load_hnet_key(value: &str) -> Option<Vec<u8>> {
+    let parse_hex = |s: &str| -> Option<Vec<u8>> {
+        let s = s.trim();
+        if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+            .collect()
+    };
+    if let Some(key) = parse_hex(value) {
+        return Some(key);
+    }
+    let content = std::fs::read_to_string(value).ok()?;
+    parse_hex(&content)
+}
+
+async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("Generate Auth Data: supiOrSuci={supi_or_suci}");
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -630,17 +719,70 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let serving_network_name = auth_info
-        .get("servingNetworkName")
+    // TS 29.503: servingNetworkName and ausfInstanceId are mandatory in
+    // AuthenticationInfoRequest.
+    let serving_network_name = match auth_info.get("servingNetworkName").and_then(|v| v.as_str()) {
+        Some(snn) if !snn.is_empty() => snn,
+        _ => {
+            return send_problem(
+                400,
+                "MANDATORY_IE_MISSING",
+                "AuthenticationInfoRequest.servingNetworkName is missing",
+            )
+        }
+    };
+    if auth_info
+        .get("ausfInstanceId")
         .and_then(|v| v.as_str())
-        .unwrap_or("5G:mnc001.mcc001.3gppnetwork.org");
+        .map(|s| s.is_empty())
+        .unwrap_or(true)
+    {
+        return send_problem(
+            400,
+            "MANDATORY_IE_MISSING",
+            "AuthenticationInfoRequest.ausfInstanceId is missing",
+        );
+    }
+
+    // TS 33.501 §6.1.2: verify the serving network name is well-formed before
+    // generating any authentication material (anti-bidding-down: a malformed
+    // or non-5G SNN must not yield a 5G AV).
+    if !validate_serving_network_name(serving_network_name) {
+        return send_problem(
+            403,
+            "SERVING_NETWORK_NOT_AUTHORIZED",
+            &format!("Invalid serving network name '{serving_network_name}'"),
+        );
+    }
 
     log::info!("Generate Auth Data: SNN={serving_network_name}");
 
-    // Step 1: Query UDR for authentication subscription data
+    // SUCI deconcealment (TS 33.501 §6.12.5): resolve the SUPI before any UDR
+    // interaction. Null scheme and imsi- passthrough need no key material.
+    let supi = {
+        let ctx = udm_self();
+        let context = ctx.read().unwrap();
+        context.deconceal_suci(supi_or_suci)
+    };
+    let supi = match supi {
+        Some(s) => s,
+        None => {
+            log::error!("[{supi_or_suci}] SUCI deconcealment failed");
+            return send_problem(
+                403,
+                "AUTHENTICATION_REJECTED",
+                "SUCI deconcealment failed (unknown key id, scheme, or MAC failure)",
+            );
+        }
+    };
+
+    // Step 1: Query UDR for authentication subscription data (by SUPI)
     let udr_response =
-        match nextgcore_udmd::udm_nudr_dr_send_auth_subscription_get(supi, 0, 0).await {
+        match nextgcore_udmd::udm_nudr_dr_send_auth_subscription_get(&supi, 0, 0).await {
             Ok(resp) if resp.is_success() => resp,
+            Ok(resp) if resp.status == 404 => {
+                return send_problem(404, "USER_NOT_FOUND", "No authentication subscription");
+            }
             Ok(resp) => {
                 log::error!(
                     "[{}] UDR auth subscription query failed: status={}",
@@ -665,7 +807,42 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
         Some(v) => v,
         None => {
             log::error!("[{supi}] Failed to parse UDR auth subscription response");
-            return send_bad_request("Invalid UDR response", None);
+            return send_problem(500, "UNSPECIFIED", "Invalid UDR response");
+        }
+    };
+
+    // Authentication method selects 5G-AKA or EAP-AKA' (TS 33.501 §6.1.2)
+    let auth_method = auth_sub_json
+        .get("authenticationMethod")
+        .and_then(|v| v.as_str())
+        .unwrap_or("5G_AKA");
+    if auth_method != "5G_AKA" && auth_method != "EAP_AKA_PRIME" {
+        return send_problem(
+            501,
+            "UNSUPPORTED_AUTHENTICATION_METHOD",
+            &format!("Authentication method '{auth_method}' is not supported"),
+        );
+    }
+
+    // Mandatory subscription material (TS 29.505 AuthenticationSubscription)
+    let k_hex = auth_sub_json.get("encPermanentKey").and_then(|v| v.as_str());
+    let opc_hex = auth_sub_json.get("encOpcKey").and_then(|v| v.as_str());
+    let amf_hex = auth_sub_json
+        .get("authenticationManagementField")
+        .and_then(|v| v.as_str());
+    let sqn_hex = auth_sub_json
+        .get("sequenceNumber")
+        .and_then(|v| v.get("sqn"))
+        .and_then(|v| v.as_str());
+    let (k_hex, opc_hex, amf_hex, sqn_hex) = match (k_hex, opc_hex, amf_hex, sqn_hex) {
+        (Some(k), Some(o), Some(a), Some(s)) => (k, o, a, s),
+        _ => {
+            log::error!("[{supi}] Authentication subscription missing mandatory fields");
+            return send_problem(
+                500,
+                "UNSPECIFIED",
+                "Authentication subscription incomplete (K/OPc/AMF/SQN)",
+            );
         }
     };
 
@@ -674,8 +851,9 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
         let ctx = udm_self();
         let context = ctx.read().unwrap();
         let ue = match context
-            .ue_find_by_supi(supi)
-            .or_else(|| context.ue_add(supi))
+            .ue_find_by_suci(supi_or_suci)
+            .or_else(|| context.ue_find_by_supi(&supi))
+            .or_else(|| context.ue_add(supi_or_suci))
         {
             Some(ue) => ue,
             None => {
@@ -686,46 +864,90 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
         ue.clone()
     };
 
-    // Store serving network name
     ue.serving_network_name = Some(serving_network_name.to_string());
+    ue.supi = Some(supi.clone());
 
-    // Parse subscriber keys from UDR response
-    if let Some(k_hex) = auth_sub_json
-        .get("encPermanentKey")
-        .and_then(|v| v.as_str())
-    {
-        let k_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(k_hex);
-        if k_bytes.len() >= 16 {
-            ue.k.copy_from_slice(&k_bytes[..16]);
-        }
+    let k_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(k_hex);
+    let opc_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(opc_hex);
+    let amf_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(amf_hex);
+    let sqn_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(sqn_hex);
+    if k_bytes.len() < 16 || opc_bytes.len() < 16 || amf_bytes.len() < 2 || sqn_bytes.len() < 6 {
+        return send_problem(500, "UNSPECIFIED", "Malformed subscription key material");
     }
-    if let Some(opc_hex) = auth_sub_json.get("encOpcKey").and_then(|v| v.as_str()) {
-        let opc_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(opc_hex);
-        if opc_bytes.len() >= 16 {
-            ue.opc.copy_from_slice(&opc_bytes[..16]);
-        }
-    }
-    if let Some(amf_hex) = auth_sub_json
-        .get("authenticationManagementField")
-        .and_then(|v| v.as_str())
-    {
-        let amf_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(amf_hex);
-        if amf_bytes.len() >= 2 {
-            ue.amf.copy_from_slice(&amf_bytes[..2]);
-        }
-    }
-    if let Some(sqn_hex) = auth_sub_json
-        .get("sequenceNumber")
-        .and_then(|v| v.get("sqn"))
-        .and_then(|v| v.as_str())
-    {
-        let sqn_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(sqn_hex);
-        if sqn_bytes.len() >= 6 {
-            ue.sqn.copy_from_slice(&sqn_bytes[..6]);
-        }
+    ue.k.copy_from_slice(&k_bytes[..16]);
+    ue.opc.copy_from_slice(&opc_bytes[..16]);
+    ue.amf.copy_from_slice(&amf_bytes[..2]);
+    ue.sqn.copy_from_slice(&sqn_bytes[..6]);
+
+    // TS 33.501 §6.1.3 / TS 33.102 Annex H: the AMF "separation bit" (bit 0 of
+    // the Authentication Management Field) shall be set to 1 for AVs usable in
+    // 5G (EPS/5GS separation). Refuse to generate 5G AVs otherwise.
+    if ue.amf[0] & 0x80 == 0 {
+        log::error!("[{supi}] AMF separation bit not set in subscription (amf={amf_hex})");
+        return send_problem(
+            403,
+            "AUTHENTICATION_REJECTED",
+            "AMF separation bit (TS 33.102 Annex H) not set for 5G authentication",
+        );
     }
 
-    // Step 4: Generate RAND and compute auth vector using Milenage
+    // Resynchronization (TS 33.102 §6.3.5): verify AUTS with f1*/f5* and
+    // resume from SQN_MS.
+    if let Some(resync) = auth_info.get("resynchronizationInfo") {
+        let rand_hex = resync.get("rand").and_then(|v| v.as_str());
+        let auts_hex = resync.get("auts").and_then(|v| v.as_str());
+        let (rand_hex, auts_hex) = match (rand_hex, auts_hex) {
+            (Some(r), Some(a)) if !r.is_empty() && !a.is_empty() => (r, a),
+            _ => {
+                return send_problem(
+                    400,
+                    "MANDATORY_IE_MISSING",
+                    "resynchronizationInfo requires both rand and auts",
+                )
+            }
+        };
+        let rand_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(rand_hex);
+        let auts_bytes = nextgcore_udmd::nudm_handler::hex_to_bytes(auts_hex);
+        if rand_bytes.len() != 16 || auts_bytes.len() != ogs_crypt::milenage::OGS_AUTS_LEN {
+            return send_problem(400, "INVALID_FORMAT", "Invalid RAND/AUTS length");
+        }
+        // The RAND echoed by the UE must be the one we sent
+        if rand_bytes != ue.rand {
+            log::error!("[{supi}] Resync RAND does not match stored RAND");
+            return send_problem(400, "INVALID_FORMAT", "RAND mismatch in resynchronization");
+        }
+        let rand_arr: [u8; 16] = rand_bytes.as_slice().try_into().expect("len checked");
+        let mut conc_sqn_ms = [0u8; 6];
+        conc_sqn_ms.copy_from_slice(&auts_bytes[..6]);
+        let (sqn_ms, mac_s) =
+            match ogs_crypt::kdf::ogs_auc_sqn(&ue.opc, &ue.k, &rand_arr, &conc_sqn_ms) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("[{supi}] SQN extraction failed: {e:?}");
+                    return send_problem(500, "UNSPECIFIED", "SQN extraction failed");
+                }
+            };
+        if mac_s != auts_bytes[6..ogs_crypt::milenage::OGS_AUTS_LEN] {
+            log::error!("[{supi}] AUTS MAC-S verification failed");
+            return send_problem(
+                403,
+                "AUTHENTICATION_REJECTED",
+                "AUTS MAC-S verification failed",
+            );
+        }
+        // Resume from SQN_MS + 1 (prevents replay)
+        let mut sqn_val: u64 = 0;
+        for &b in sqn_ms.iter() {
+            sqn_val = (sqn_val << 8) | (b as u64);
+        }
+        let new_sqn = (sqn_val + 1) & 0xFFFF_FFFF_FFFF;
+        for (i, b) in ue.sqn.iter_mut().enumerate() {
+            *b = ((new_sqn >> ((5 - i) * 8)) & 0xFF) as u8;
+        }
+        log::info!("[{supi}] SQN resynchronized (new SQN=0x{new_sqn:012x})");
+    }
+
+    // Step 4: Generate RAND and compute the AV with Milenage
     let mut rand = [0u8; 16];
     ogs_core::rand::ogs_random(&mut rand);
     ue.rand = rand;
@@ -739,18 +961,15 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
             }
         };
 
-    // Step 5: Derive KAUSF and XRES* using 5G KDFs
-    let kausf = ogs_crypt::kdf::ogs_kdf_kausf(&ck, &ik, serving_network_name, &autn);
-    let xres_star = ogs_crypt::kdf::ogs_kdf_xres_star(&ck, &ik, serving_network_name, &rand, &res);
-
-    // Step 6: Update UE context
+    // Step 5: Update UE context
     {
         let ctx = udm_self();
         let context = ctx.read().unwrap();
         context.ue_update(&ue);
+        context.ue_set_supi(ue.id, &supi);
     }
 
-    // Step 7: Update SQN in UDR (increment for next auth)
+    // Step 6: Update SQN in UDR (increment for next auth)
     let sqn_val = {
         let mut v: u64 = 0;
         for &b in ue.sqn.iter() {
@@ -758,25 +977,60 @@ async fn handle_generate_auth_data(supi: &str, request: &SbiRequest) -> SbiRespo
         }
         v
     };
-    let new_sqn = (sqn_val + 32 + 1) & 0xFFFFFFFFFFFF;
+    let new_sqn = (sqn_val + 32 + 1) & 0xFFFF_FFFF_FFFF;
     let new_sqn_hex = format!("{new_sqn:012x}");
     let _ =
-        nextgcore_udmd::udm_nudr_dr_send_auth_subscription_patch(supi, &new_sqn_hex, 0, 0).await;
+        nextgcore_udmd::udm_nudr_dr_send_auth_subscription_patch(&supi, &new_sqn_hex, 0, 0).await;
 
-    // Step 8: Return authentication vector
-    SbiResponse::with_status(200)
-        .with_json_body(&serde_json::json!({
-            "authType": "5G_AKA",
-            "authenticationVector": {
-                "avType": "5G_HE_AKA",
-                "rand": nextgcore_udmd::nudm_handler::bytes_to_hex(&rand),
-                "autn": nextgcore_udmd::nudm_handler::bytes_to_hex(&autn),
-                "xresStar": nextgcore_udmd::nudm_handler::bytes_to_hex(&xres_star),
-                "kausf": nextgcore_udmd::nudm_handler::bytes_to_hex(&kausf)
-            },
-            "supi": supi
-        }))
-        .unwrap_or_else(|_| SbiResponse::with_status(200))
+    // Step 7: Build the AuthenticationInfoResult (TS 29.503 §6.3.6.2.2)
+    use nextgcore_udmd::nudm_handler::bytes_to_hex;
+    match auth_method {
+        "EAP_AKA_PRIME" => {
+            // TS 33.501 §6.1.3.1: the UDM/ARPF derives CK'/IK' and returns the
+            // transformed AV (RAND, AUTN, XRES, CK', IK') to the AUSF.
+            let mut sqn_xor_ak = [0u8; 6];
+            sqn_xor_ak.copy_from_slice(&autn[..6]);
+            let (ck_prime, ik_prime) = ogs_crypt::kdf::ogs_kdf_ck_ik_prime(
+                &ck,
+                &ik,
+                serving_network_name,
+                &sqn_xor_ak,
+            );
+            SbiResponse::with_status(200)
+                .with_json_body(&serde_json::json!({
+                    "authType": "EAP_AKA_PRIME",
+                    "authenticationVector": {
+                        "avType": "EAP_AKA_PRIME",
+                        "rand": bytes_to_hex(&rand),
+                        "autn": bytes_to_hex(&autn),
+                        "xres": bytes_to_hex(&res),
+                        "ckPrime": bytes_to_hex(&ck_prime),
+                        "ikPrime": bytes_to_hex(&ik_prime)
+                    },
+                    "supi": supi
+                }))
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
+        _ => {
+            // 5G-AKA: derive KAUSF and XRES* (TS 33.501 Annex A.2/A.4)
+            let kausf = ogs_crypt::kdf::ogs_kdf_kausf(&ck, &ik, serving_network_name, &autn);
+            let xres_star =
+                ogs_crypt::kdf::ogs_kdf_xres_star(&ck, &ik, serving_network_name, &rand, &res);
+            SbiResponse::with_status(200)
+                .with_json_body(&serde_json::json!({
+                    "authType": "5G_AKA",
+                    "authenticationVector": {
+                        "avType": "5G_HE_AKA",
+                        "rand": bytes_to_hex(&rand),
+                        "autn": bytes_to_hex(&autn),
+                        "xresStar": bytes_to_hex(&xres_star),
+                        "kausf": bytes_to_hex(&kausf)
+                    },
+                    "supi": supi
+                }))
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
+    }
 }
 
 async fn handle_auth_event(supi: &str, request: &SbiRequest) -> SbiResponse {
@@ -792,12 +1046,62 @@ async fn handle_auth_event(supi: &str, request: &SbiRequest) -> SbiResponse {
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let success = auth_event
-        .get("success")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // TS 29.503: AuthEvent mandatory attributes are nfInstanceId, success,
+    // timeStamp, authType and servingNetworkName.
+    for attr in [
+        "nfInstanceId",
+        "timeStamp",
+        "authType",
+        "servingNetworkName",
+    ] {
+        if auth_event
+            .get(attr)
+            .and_then(|v| v.as_str())
+            .map(|s| s.is_empty())
+            .unwrap_or(true)
+        {
+            return send_problem(
+                400,
+                "MANDATORY_IE_MISSING",
+                &format!("AuthEvent.{attr} is missing"),
+            );
+        }
+    }
+    let success = match auth_event.get("success").and_then(|v| v.as_bool()) {
+        Some(s) => s,
+        None => {
+            return send_problem(400, "MANDATORY_IE_MISSING", "AuthEvent.success is missing")
+        }
+    };
 
     log::info!("Auth Event: success={success}");
+
+    // Record the auth event against the UE context (auth status would be
+    // persisted to UDR's authentication-status resource).
+    {
+        let ctx = udm_self();
+        if let Ok(context) = ctx.read() {
+            if let Some(mut ue) = context.ue_find_by_supi(supi) {
+                ue.set_auth_event(nextgcore_udmd::AuthEvent {
+                    nf_instance_id: auth_event
+                        .get("nfInstanceId")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    success,
+                    time_stamp: auth_event
+                        .get("timeStamp")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    auth_type: None,
+                    serving_network_name: auth_event
+                        .get("servingNetworkName")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                });
+                context.ue_update(&ue);
+            }
+        };
+    }
 
     SbiResponse::with_status(201)
         .with_json_body(&serde_json::json!({
@@ -805,6 +1109,7 @@ async fn handle_auth_event(supi: &str, request: &SbiRequest) -> SbiResponse {
             "success": success,
             "timeStamp": auth_event.get("timeStamp"),
             "authType": auth_event.get("authType"),
+            "servingNetworkName": auth_event.get("servingNetworkName"),
         }))
         .unwrap_or_else(|_| SbiResponse::with_status(201))
 }
@@ -1040,5 +1345,411 @@ mod tests {
         assert!(args.tls);
         assert_eq!(args.tls_cert, Some("/path/to/cert.pem".to_string()));
         assert_eq!(args.tls_key, Some("/path/to/key.pem".to_string()));
+    }
+
+    #[test]
+    fn test_validate_serving_network_name() {
+        assert!(validate_serving_network_name(
+            "5G:mnc001.mcc001.3gppnetwork.org"
+        ));
+        assert!(!validate_serving_network_name(
+            "mnc001.mcc001.3gppnetwork.org"
+        ));
+        assert!(!validate_serving_network_name(
+            "5G:mnc01.mcc001.3gppnetwork.org"
+        ));
+        assert!(!validate_serving_network_name("5G:mnc001.mcc001.evil.org"));
+    }
+
+    #[test]
+    fn test_load_hnet_key() {
+        // Inline hex
+        let key = load_hnet_key(
+            "c53c22208b61860b06c62e5406a7b330c2b577aa5558981510d128247d38bd1d",
+        )
+        .unwrap();
+        assert_eq!(key.len(), 32);
+        // Bad hex / wrong length / missing file
+        assert!(load_hnet_key("deadbeef").is_none());
+        assert!(load_hnet_key("/nonexistent/path/key.hex").is_none());
+        // Hex in file
+        let dir = std::env::temp_dir().join("udm-hnet-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("k1.key");
+        std::fs::write(
+            &f,
+            "c53c22208b61860b06c62e5406a7b330c2b577aa5558981510d128247d38bd1d\n",
+        )
+        .unwrap();
+        assert_eq!(load_hnet_key(f.to_str().unwrap()).unwrap().len(), 32);
+    }
+
+    // ========================================================================
+    // HTTP-level UDM auth flow against a spec-shaped mock UDR
+    // (TS 29.503 generate-auth-data; SUCI deconcealment; resync; ProblemDetails)
+    // ========================================================================
+
+    const TEST_K_HEX: &str = "465B5CE8B199B49FAA5F0A2EE238A6BC";
+    const TEST_OPC_HEX: &str = "E8ED289DEBA952E4283B54E88E6183CA";
+    const SUPI_AKA: &str = "imsi-001010000000001";
+    const SUPI_EAP: &str = "imsi-001010000000002";
+    const SUPI_BAD_AMF: &str = "imsi-001010000000003";
+    const TEST_SNN: &str = "5G:mnc001.mcc001.3gppnetwork.org";
+
+    /// Mock UDR: serves authentication-subscription GET/PATCH per TS 29.505.
+    async fn mock_udr_handler(request: SbiRequest) -> SbiResponse {
+        let method = request.header.method.clone();
+        let uri = request.header.uri.clone();
+        let path = uri.split('?').next().unwrap_or(&uri).to_string();
+
+        if !path.contains("authentication-subscription") {
+            return SbiResponse::with_status(404);
+        }
+        if method == "PATCH" {
+            return SbiResponse::with_status(204);
+        }
+
+        // /nudr-dr/v1/subscription-data/{supi}/authentication-data/...
+        let supi = path
+            .trim_start_matches('/')
+            .split('/')
+            .nth(3)
+            .unwrap_or("")
+            .to_string();
+        if !supi.starts_with("imsi-00101") {
+            return SbiResponse::with_status(404);
+        }
+
+        let auth_method = if supi == SUPI_EAP {
+            "EAP_AKA_PRIME"
+        } else {
+            "5G_AKA"
+        };
+        // SUPI_BAD_AMF is provisioned without the AMF separation bit
+        let amf = if supi == SUPI_BAD_AMF { "0000" } else { "8000" };
+
+        SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({
+                "authenticationMethod": auth_method,
+                "encPermanentKey": TEST_K_HEX,
+                "encOpcKey": TEST_OPC_HEX,
+                "authenticationManagementField": amf,
+                "sequenceNumber": { "sqn": "000000000021", "sqnScheme": "NON_TIME_BASED" }
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(500))
+    }
+
+    fn free_port() -> u16 {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        port
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        nextgcore_udmd::nudm_handler::hex_to_bytes(s)
+    }
+
+    /// Full HTTP-level UDM auth flow: strict rejections, null-scheme + Profile
+    /// A SUCI deconcealment, 5G-AKA + EAP-AKA' AV generation, AMF separation
+    /// bit enforcement, and AUTS resynchronization.
+    #[tokio::test]
+    async fn test_http_generate_auth_data_flows() {
+        let _ = env_logger::try_init();
+        tokio::time::timeout(Duration::from_secs(60), async {
+            udm_context_init(64, 64);
+
+            // Provision a Profile A home network key (id=1)
+            let hn_priv = [0x42u8; 32];
+            {
+                let ctx = udm_self();
+                let context = ctx.read().unwrap();
+                context.hnet_key_add(1, 1, hn_priv.to_vec());
+            }
+
+            // --- mock UDR on an ephemeral port ---
+            let udr_port = free_port();
+            let udr_server = SbiServer::new(OgsSbiServerConfig::new(SocketAddr::from((
+                [127, 0, 0, 1],
+                udr_port,
+            ))));
+            udr_server.start(mock_udr_handler).await.expect("udr start");
+            std::env::set_var("UDR_SBI_ADDR", "127.0.0.1");
+            std::env::set_var("UDR_SBI_PORT", udr_port.to_string());
+
+            // --- real UDM handler on an ephemeral port ---
+            let udm_port = free_port();
+            let udm_server = SbiServer::new(OgsSbiServerConfig::new(SocketAddr::from((
+                [127, 0, 0, 1],
+                udm_port,
+            ))));
+            udm_server
+                .start(udm_sbi_request_handler)
+                .await
+                .expect("udm start");
+
+            let client = ogs_sbi::client::SbiClient::with_host_port("127.0.0.1", udm_port);
+            let gen_path = |id: &str| {
+                format!("/nudm-ueau/v1/{id}/security-information/generate-auth-data")
+            };
+
+            // ---- strict-peer rejections ----
+            // Missing servingNetworkName -> 400 MANDATORY_IE_MISSING
+            let resp = client
+                .post_json(
+                    &gen_path(SUPI_AKA),
+                    &serde_json::json!({"ausfInstanceId": "test-ausf"}),
+                )
+                .await
+                .expect("send");
+            assert_eq!(resp.status, 400);
+            let pd: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap();
+            assert_eq!(
+                pd.get("cause").and_then(|v| v.as_str()),
+                Some("MANDATORY_IE_MISSING")
+            );
+
+            // Missing ausfInstanceId -> 400 MANDATORY_IE_MISSING
+            let resp = client
+                .post_json(
+                    &gen_path(SUPI_AKA),
+                    &serde_json::json!({"servingNetworkName": TEST_SNN}),
+                )
+                .await
+                .expect("send");
+            assert_eq!(resp.status, 400);
+
+            // Malformed SNN -> 403 SERVING_NETWORK_NOT_AUTHORIZED
+            let resp = client
+                .post_json(
+                    &gen_path(SUPI_AKA),
+                    &serde_json::json!({
+                        "servingNetworkName": "5G:mnc001.mcc001.evil.org",
+                        "ausfInstanceId": "test-ausf"
+                    }),
+                )
+                .await
+                .expect("send");
+            assert_eq!(resp.status, 403);
+            let pd: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap();
+            assert_eq!(
+                pd.get("cause").and_then(|v| v.as_str()),
+                Some("SERVING_NETWORK_NOT_AUTHORIZED")
+            );
+
+            let good_body = serde_json::json!({
+                "servingNetworkName": TEST_SNN,
+                "ausfInstanceId": "test-ausf"
+            });
+
+            // ---- 5G-AKA via null-scheme SUCI ----
+            let null_suci = "suci-0-001-01-0000-0-0-0000000001";
+            let resp = client
+                .post_json(&gen_path(null_suci), &good_body)
+                .await
+                .expect("send");
+            assert_eq!(resp.status, 200);
+            let air: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().expect("body")).unwrap();
+            assert_eq!(air.get("authType").and_then(|v| v.as_str()), Some("5G_AKA"));
+            assert_eq!(
+                air.get("supi").and_then(|v| v.as_str()),
+                Some(SUPI_AKA),
+                "null-scheme SUCI must deconceal to the SUPI"
+            );
+            let av = air.get("authenticationVector").expect("av");
+            assert_eq!(av.get("avType").and_then(|v| v.as_str()), Some("5G_HE_AKA"));
+            for field in ["rand", "autn", "xresStar", "kausf"] {
+                assert!(av.get(field).is_some(), "missing {field}");
+            }
+
+            // Cross-check XRES*: recompute from RAND with the same credentials
+            let rand_v = unhex(av.get("rand").and_then(|v| v.as_str()).unwrap());
+            let mut rand = [0u8; 16];
+            rand.copy_from_slice(&rand_v);
+            let mut k = [0u8; 16];
+            k.copy_from_slice(&unhex(TEST_K_HEX));
+            let mut opc = [0u8; 16];
+            opc.copy_from_slice(&unhex(TEST_OPC_HEX));
+            let (res, ck, ik, _ak, _akstar) =
+                ogs_crypt::milenage::milenage_f2345(&opc, &k, &rand).unwrap();
+            let xres_star = ogs_crypt::kdf::ogs_kdf_xres_star(&ck, &ik, TEST_SNN, &rand, &res);
+            assert_eq!(
+                av.get("xresStar").and_then(|v| v.as_str()),
+                Some(nextgcore_udmd::nudm_handler::bytes_to_hex(&xres_star).as_str())
+            );
+
+            // ---- AUTS resynchronization (uses the RAND from the AV above) ----
+            // UE side: SQN_MS=0x000000000050, AUTS = (SQN_MS xor AK*) || MAC-S
+            let sqn_ms = [0u8, 0, 0, 0, 0, 0x50];
+            let (_r, _c, _i, _a, akstar) =
+                ogs_crypt::milenage::milenage_f2345(&opc, &k, &rand).unwrap();
+            let mut conc = [0u8; 6];
+            for i in 0..6 {
+                conc[i] = sqn_ms[i] ^ akstar[i];
+            }
+            let (_mac_a, mac_s) =
+                ogs_crypt::milenage::milenage_f1(&opc, &k, &rand, &sqn_ms, &[0, 0]).unwrap();
+            let mut auts = Vec::new();
+            auts.extend_from_slice(&conc);
+            auts.extend_from_slice(&mac_s);
+
+            let resync_body = serde_json::json!({
+                "servingNetworkName": TEST_SNN,
+                "ausfInstanceId": "test-ausf",
+                "resynchronizationInfo": {
+                    "rand": nextgcore_udmd::nudm_handler::bytes_to_hex(&rand),
+                    "auts": nextgcore_udmd::nudm_handler::bytes_to_hex(&auts)
+                }
+            });
+            let resp = client
+                .post_json(&gen_path(null_suci), &resync_body)
+                .await
+                .expect("send");
+            assert_eq!(resp.status, 200, "valid AUTS resync must succeed");
+
+            // Tampered AUTS (MAC-S broken) -> 403 AUTHENTICATION_REJECTED
+            // (use the new RAND from the resync response)
+            let air2: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            let rand2 = unhex(
+                air2.pointer("/authenticationVector/rand")
+                    .and_then(|v| v.as_str())
+                    .unwrap(),
+            );
+            let mut bad_auts = auts.clone();
+            bad_auts[13] ^= 0xFF;
+            let bad_resync = serde_json::json!({
+                "servingNetworkName": TEST_SNN,
+                "ausfInstanceId": "test-ausf",
+                "resynchronizationInfo": {
+                    "rand": nextgcore_udmd::nudm_handler::bytes_to_hex(&rand2),
+                    "auts": nextgcore_udmd::nudm_handler::bytes_to_hex(&bad_auts)
+                }
+            });
+            let resp = client
+                .post_json(&gen_path(null_suci), &bad_resync)
+                .await
+                .expect("send");
+            assert_eq!(resp.status, 403, "broken AUTS MAC-S must be rejected");
+
+            // ---- Profile A concealed SUCI ----
+            // Conceal MSIN 0000000001 with the provisioned key (TBCD nibbles)
+            let msin_bcd = [0x00u8, 0x00, 0x00, 0x00, 0x10]; // "0000000001" swapped nibbles
+            let hn_pub = ogs_crypt::ecies::x25519_public_key(&hn_priv);
+            let (eph_pub, ct, tag) =
+                ogs_crypt::ecies::ecies_profile_a_encrypt(&hn_pub, &msin_bcd).unwrap();
+            let mut scheme_output = Vec::new();
+            scheme_output.extend_from_slice(&eph_pub);
+            scheme_output.extend_from_slice(&ct);
+            scheme_output.extend_from_slice(&tag);
+            let so_hex = nextgcore_udmd::nudm_handler::bytes_to_hex(&scheme_output);
+            let prof_a_suci = format!("suci-0-001-01-0000-1-1-{so_hex}");
+
+            let resp = client
+                .post_json(&gen_path(&prof_a_suci), &good_body)
+                .await
+                .expect("send");
+            assert_eq!(resp.status, 200);
+            let air: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                air.get("supi").and_then(|v| v.as_str()),
+                Some(SUPI_AKA),
+                "Profile A SUCI must deconceal to the SUPI"
+            );
+
+            // Unknown key id -> 403 AUTHENTICATION_REJECTED
+            let unknown_key_suci = format!("suci-0-001-01-0000-1-9-{so_hex}");
+            let resp = client
+                .post_json(&gen_path(&unknown_key_suci), &good_body)
+                .await
+                .expect("send");
+            assert_eq!(resp.status, 403);
+
+            // ---- EAP-AKA' AV ----
+            let resp = client
+                .post_json(&gen_path(SUPI_EAP), &good_body)
+                .await
+                .expect("send");
+            assert_eq!(resp.status, 200);
+            let air: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                air.get("authType").and_then(|v| v.as_str()),
+                Some("EAP_AKA_PRIME")
+            );
+            let av = air.get("authenticationVector").expect("av");
+            assert_eq!(
+                av.get("avType").and_then(|v| v.as_str()),
+                Some("EAP_AKA_PRIME")
+            );
+            for field in ["rand", "autn", "xres", "ckPrime", "ikPrime"] {
+                assert!(av.get(field).is_some(), "missing {field}");
+            }
+            // Cross-check CK': recompute from RAND/AUTN
+            let rand_v = unhex(av.get("rand").and_then(|v| v.as_str()).unwrap());
+            let autn_v = unhex(av.get("autn").and_then(|v| v.as_str()).unwrap());
+            let mut rand = [0u8; 16];
+            rand.copy_from_slice(&rand_v);
+            let (_res, ck, ik, _ak, _akstar) =
+                ogs_crypt::milenage::milenage_f2345(&opc, &k, &rand).unwrap();
+            let mut sqn_xor_ak = [0u8; 6];
+            sqn_xor_ak.copy_from_slice(&autn_v[..6]);
+            let (ck_prime, _ik_prime) =
+                ogs_crypt::kdf::ogs_kdf_ck_ik_prime(&ck, &ik, TEST_SNN, &sqn_xor_ak);
+            assert_eq!(
+                av.get("ckPrime").and_then(|v| v.as_str()),
+                Some(nextgcore_udmd::nudm_handler::bytes_to_hex(&ck_prime).as_str())
+            );
+
+            // ---- AMF separation bit not set -> 403 ----
+            let resp = client
+                .post_json(&gen_path(SUPI_BAD_AMF), &good_body)
+                .await
+                .expect("send");
+            assert_eq!(
+                resp.status, 403,
+                "subscription without AMF separation bit must be rejected"
+            );
+
+            // ---- auth-events strict validation ----
+            let resp = client
+                .post_json(
+                    &format!("/nudm-ueau/v1/{SUPI_AKA}/auth-events"),
+                    &serde_json::json!({
+                        "nfInstanceId": "test-ausf",
+                        "success": true,
+                        "authType": "5G_AKA",
+                        "servingNetworkName": TEST_SNN
+                        // timeStamp missing
+                    }),
+                )
+                .await
+                .expect("send");
+            assert_eq!(resp.status, 400, "AuthEvent without timeStamp -> 400");
+
+            let resp = client
+                .post_json(
+                    &format!("/nudm-ueau/v1/{SUPI_AKA}/auth-events"),
+                    &serde_json::json!({
+                        "nfInstanceId": "test-ausf",
+                        "success": true,
+                        "timeStamp": "2026-01-01T00:00:00Z",
+                        "authType": "5G_AKA",
+                        "servingNetworkName": TEST_SNN
+                    }),
+                )
+                .await
+                .expect("send");
+            assert_eq!(resp.status, 201);
+
+            udm_server.stop().await.expect("stop udm");
+            udr_server.stop().await.expect("stop udr");
+        })
+        .await
+        .expect("test timed out");
     }
 }

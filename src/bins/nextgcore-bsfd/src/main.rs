@@ -156,14 +156,9 @@ async fn main() -> Result<()> {
     bsf_context_init(args.max_sess);
     log::info!("BSF context initialized (max_sess={})", args.max_sess);
 
-    // Load persisted bindings from database (if available)
-    {
-        let ctx = bsf_self();
-        let guard = ctx.read();
-        if let Ok(context) = guard {
-            context.load_persisted_bindings();
-        }
-    }
+    // Load persisted bindings from database (if available) without blocking
+    // the async runtime (W4.2: sync -> async Mongo).
+    context::load_persisted_bindings_async().await;
 
     // Initialize BSF state machine
     let mut bsf_sm = BsfSmContext::new();
@@ -329,96 +324,275 @@ async fn bsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 
 // PCF Binding handlers
 
+/// 400 ProblemDetails for a missing mandatory PcfBinding attribute.
+fn missing_mandatory(attr: &str) -> SbiResponse {
+    ogs_sbi::server::send_error(
+        400,
+        "Bad Request",
+        &format!("Missing mandatory attribute: {attr}"),
+        Some("MANDATORY_IE_MISSING"),
+    )
+}
+
+/// Build the TS 29.521 PcfBinding representation of a session.
+///
+/// `dnn` and `snssai` are mandatory in the schema and always emitted;
+/// optional attributes are emitted only when present (incl. the persisted
+/// pcfIpEndPoints, W4.2).
+fn binding_json(sess: &BsfSess) -> serde_json::Value {
+    let mut b = serde_json::Map::new();
+    b.insert(
+        "pcfBindingId".to_string(),
+        serde_json::Value::String(sess.binding_id.clone()),
+    );
+    b.insert(
+        "dnn".to_string(),
+        serde_json::Value::String(sess.dnn.clone().unwrap_or_default()),
+    );
+    let mut snssai = serde_json::Map::new();
+    snssai.insert(
+        "sst".to_string(),
+        serde_json::Value::Number(sess.s_nssai.sst.into()),
+    );
+    if let Some(sd) = sess.s_nssai.sd_to_string() {
+        snssai.insert("sd".to_string(), serde_json::Value::String(sd));
+    }
+    b.insert("snssai".to_string(), serde_json::Value::Object(snssai));
+    if let Some(ref v) = sess.ipv4addr_string {
+        b.insert("ipv4Addr".to_string(), serde_json::Value::String(v.clone()));
+    }
+    if let Some(ref v) = sess.ipv6prefix_string {
+        b.insert(
+            "ipv6Prefix".to_string(),
+            serde_json::Value::String(v.clone()),
+        );
+    }
+    if let Some(ref v) = sess.mac_addr48 {
+        b.insert(
+            "macAddr48".to_string(),
+            serde_json::Value::String(v.clone()),
+        );
+    }
+    if let Some(ref v) = sess.ip_domain {
+        b.insert("ipDomain".to_string(), serde_json::Value::String(v.clone()));
+    }
+    if let Some(ref v) = sess.supi {
+        b.insert("supi".to_string(), serde_json::Value::String(v.clone()));
+    }
+    if let Some(ref v) = sess.gpsi {
+        b.insert("gpsi".to_string(), serde_json::Value::String(v.clone()));
+    }
+    if let Some(ref v) = sess.pcf_fqdn {
+        b.insert("pcfFqdn".to_string(), serde_json::Value::String(v.clone()));
+    }
+    if let Some(ref v) = sess.expiry {
+        b.insert("expiry".to_string(), serde_json::Value::String(v.clone()));
+    }
+    if !sess.pcf_ip.is_empty() {
+        let endpoints: Vec<serde_json::Value> = sess
+            .pcf_ip
+            .iter()
+            .map(|ep| {
+                let mut e = serde_json::Map::new();
+                if let Some(ref a) = ep.addr {
+                    e.insert(
+                        "ipv4Address".to_string(),
+                        serde_json::Value::String(a.clone()),
+                    );
+                }
+                if let Some(ref a6) = ep.addr6 {
+                    e.insert(
+                        "ipv6Address".to_string(),
+                        serde_json::Value::String(a6.clone()),
+                    );
+                }
+                if ep.is_port {
+                    e.insert(
+                        "port".to_string(),
+                        serde_json::Value::Number(ep.port.into()),
+                    );
+                }
+                serde_json::Value::Object(e)
+            })
+            .collect();
+        b.insert(
+            "pcfIpEndPoints".to_string(),
+            serde_json::Value::Array(endpoints),
+        );
+    }
+    if !sess.ipv4_frame_route_list.is_empty() {
+        b.insert(
+            "ipv4FrameRouteList".to_string(),
+            serde_json::Value::Array(
+                sess.ipv4_frame_route_list
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    if !sess.ipv6_frame_route_list.is_empty() {
+        b.insert(
+            "ipv6FrameRouteList".to_string(),
+            serde_json::Value::Array(
+                sess.ipv6_frame_route_list
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+    }
+    b.insert(
+        "suppFeat".to_string(),
+        serde_json::Value::String("1".to_string()),
+    );
+    serde_json::Value::Object(b)
+}
+
+/// Parse a TS 29.510 IpEndPoint array into PcfIpEndpoint records.
+fn parse_pcf_ip_endpoints(v: &serde_json::Value) -> Vec<context::PcfIpEndpoint> {
+    v.as_array()
+        .map(|endpoints| {
+            endpoints
+                .iter()
+                .map(|ep| context::PcfIpEndpoint {
+                    addr: ep
+                        .get("ipv4Address")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    addr6: ep
+                        .get("ipv6Address")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
+                    is_port: ep.get("port").is_some(),
+                    port: ep.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
     log::info!("PCF Binding Create");
 
     let body = match &request.http.content {
         Some(content) => content,
-        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+        None => return send_bad_request("Missing request body", Some("MANDATORY_IE_MISSING")),
     };
 
     let binding_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+        Err(e) => {
+            return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_MSG_FORMAT"))
+        }
     };
 
-    // Extract IP addresses from request
+    // Mandatory attributes per TS 29.521 PcfBinding: dnn + snssai.
+    let Some(dnn) = binding_data.get("dnn").and_then(|v| v.as_str()) else {
+        return missing_mandatory("dnn");
+    };
+    let Some(sst) = binding_data
+        .get("snssai")
+        .and_then(|s| s.get("sst"))
+        .and_then(|v| v.as_u64())
+    else {
+        return missing_mandatory("snssai");
+    };
+
+    // UE address: at least one of ipv4Addr / ipv6Prefix / macAddr48
+    // (MAC-only bindings for Ethernet PDU sessions are valid, W4.2).
     let ipv4addr = binding_data.get("ipv4Addr").and_then(|v| v.as_str());
     let ipv6prefix = binding_data.get("ipv6Prefix").and_then(|v| v.as_str());
+    let mac_addr48 = binding_data.get("macAddr48").and_then(|v| v.as_str());
+    if ipv4addr.is_none() && ipv6prefix.is_none() && mac_addr48.is_none() {
+        return missing_mandatory("ipv4Addr|ipv6Prefix|macAddr48");
+    }
+    if let Some(mac) = mac_addr48 {
+        if context::normalize_mac(mac).is_none() {
+            return ogs_sbi::server::send_error(
+                400,
+                "Bad Request",
+                &format!("Invalid macAddr48: {mac}"),
+                Some("MANDATORY_IE_INCORRECT"),
+            );
+        }
+    }
 
-    if ipv4addr.is_none() && ipv6prefix.is_none() {
-        return send_bad_request(
-            "Either ipv4Addr or ipv6Prefix must be provided",
-            Some("MISSING_IP"),
-        );
+    // Optional expiry: must be a valid RFC 3339 DateTime when present.
+    let expiry = binding_data.get("expiry").and_then(|v| v.as_str());
+    if let Some(e) = expiry {
+        if context::rfc3339_to_epoch(e).is_none() {
+            return ogs_sbi::server::send_error(
+                400,
+                "Bad Request",
+                &format!("expiry is not a valid RFC 3339 DateTime: {e}"),
+                Some("MANDATORY_IE_INCORRECT"),
+            );
+        }
     }
 
     // Add session to context
     let ctx = bsf_self();
     let sess = if let Ok(context) = ctx.read() {
-        context.sess_add_by_ip_address(ipv4addr, ipv6prefix)
+        context.sess_add_binding(ipv4addr, ipv6prefix, mac_addr48)
     } else {
         None
     };
 
     match sess {
         Some(mut sess) => {
-            // Apply additional fields from request
+            sess.dnn = Some(dnn.to_string());
+            let sd = binding_data
+                .get("snssai")
+                .and_then(|s| s.get("sd"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| u32::from_str_radix(s, 16).ok());
+            sess.s_nssai = context::SNssai::new(sst as u8, sd);
             if let Some(supi) = binding_data.get("supi").and_then(|v| v.as_str()) {
                 sess.supi = Some(supi.to_string());
             }
             if let Some(gpsi) = binding_data.get("gpsi").and_then(|v| v.as_str()) {
                 sess.gpsi = Some(gpsi.to_string());
             }
-            if let Some(dnn) = binding_data.get("dnn").and_then(|v| v.as_str()) {
-                sess.dnn = Some(dnn.to_string());
+            if let Some(ip_domain) = binding_data.get("ipDomain").and_then(|v| v.as_str()) {
+                sess.ip_domain = Some(ip_domain.to_string());
             }
             if let Some(pcf_fqdn) = binding_data.get("pcfFqdn").and_then(|v| v.as_str()) {
                 sess.pcf_fqdn = Some(pcf_fqdn.to_string());
             }
-            if let Some(snssai) = binding_data.get("snssai") {
-                let sst = snssai.get("sst").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
-                let sd = snssai
-                    .get("sd")
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| u32::from_str_radix(s, 16).ok());
-                sess.s_nssai = context::SNssai::new(sst, sd);
+            if let Some(endpoints) = binding_data.get("pcfIpEndPoints") {
+                sess.pcf_ip = parse_pcf_ip_endpoints(endpoints);
+            }
+            if let Some(e) = expiry {
+                sess.set_expiry(e);
             }
 
-            // Update session in context and persist to DB
+            // Update session in context, then persist off-thread (guard
+            // dropped before any await).
             if let Ok(context) = ctx.read() {
                 context.sess_update(&sess);
-                context.sess_persist(&sess);
             }
+            context::persist_binding_async(sess.clone()).await;
 
-            // Start binding expiry timer (TTL)
-            // Use expiry from request if provided, otherwise default 1 hour
-            let ttl_secs = binding_data
-                .get("expiry")
-                .and_then(|v| v.as_str())
-                .and_then(|s| {
-                    // Parse ISO 8601 duration or seconds
-                    s.parse::<u64>().ok()
-                })
+            // Arm the expiry timer: from the RFC 3339 expiry when given,
+            // otherwise the default TTL.
+            let ttl_secs = sess
+                .expiry_epoch
+                .map(|e| (e - context::now_epoch()).max(0) as u64)
                 .unwrap_or(timer::defaults::BINDING_EXPIRY.as_secs());
-
             let timer_mgr = timer_manager();
             timer_mgr.start(
                 BsfTimerId::BindingExpiry,
                 Duration::from_secs(ttl_secs),
                 Some(sess.binding_id.clone()),
             );
-            log::debug!(
-                "Binding expiry timer started for {} (TTL={}s)",
-                sess.binding_id,
-                ttl_secs
-            );
 
             log::info!(
-                "PCF Binding created (id={}, ipv4={:?}, ipv6={:?}, TTL={}s)",
+                "PCF Binding created (id={}, ipv4={:?}, ipv6={:?}, mac={:?}, TTL={}s)",
                 sess.binding_id,
                 ipv4addr,
                 ipv6prefix,
+                mac_addr48,
                 ttl_secs
             );
 
@@ -427,21 +601,10 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
                     "Location",
                     format!("/nbsf-management/v1/pcfBindings/{}", sess.binding_id),
                 )
-                .with_json_body(&serde_json::json!({
-                    "pcfBindingId": sess.binding_id,
-                    "ipv4Addr": ipv4addr,
-                    "ipv6Prefix": ipv6prefix,
-                    "supi": sess.supi,
-                    "gpsi": sess.gpsi,
-                    "dnn": sess.dnn,
-                    "snssai": binding_data.get("snssai"),
-                    "pcfFqdn": sess.pcf_fqdn,
-                    "pcfIpEndPoints": binding_data.get("pcfIpEndPoints"),
-                    "suppFeat": "1",
-                }))
+                .with_json_body(&binding_json(&sess))
                 .unwrap_or_else(|_| SbiResponse::with_status(201))
         }
-        None => send_bad_request("Failed to create PCF binding", Some("CREATION_FAILED")),
+        None => send_bad_request("Failed to create PCF binding", Some("SYSTEM_FAILURE")),
     }
 }
 
@@ -456,19 +619,11 @@ async fn handle_pcf_binding_get(binding_id: &str) -> SbiResponse {
     };
 
     match sess {
-        Some(sess) => SbiResponse::with_status(200)
-            .with_json_body(&serde_json::json!({
-                "pcfBindingId": sess.binding_id,
-                "ipv4Addr": sess.ipv4addr_string,
-                "ipv6Prefix": sess.ipv6prefix_string,
-                "supi": sess.supi,
-                "gpsi": sess.gpsi,
-                "dnn": sess.dnn,
-                "pcfFqdn": sess.pcf_fqdn,
-                "suppFeat": "1",
-            }))
+        // Expired bindings are not served (swept by the event loop).
+        Some(sess) if !sess.is_expired(context::now_epoch()) => SbiResponse::with_status(200)
+            .with_json_body(&binding_json(&sess))
             .unwrap_or_else(|_| SbiResponse::with_status(200)),
-        None => send_not_found(
+        _ => send_not_found(
             &format!("PCF Binding {binding_id} not found"),
             Some("BINDING_NOT_FOUND"),
         ),
@@ -476,53 +631,90 @@ async fn handle_pcf_binding_get(binding_id: &str) -> SbiResponse {
 }
 
 async fn handle_pcf_binding_discovery(request: &SbiRequest) -> SbiResponse {
-    // Parse query parameters
-    let ipv4addr = request.http.params.get("ipv4Addr").map(|s| s.as_str());
-    let ipv6prefix = request.http.params.get("ipv6Prefix").map(|s| s.as_str());
+    // TS 29.521 GET /pcfBindings query parameters (W4.2: + macAddr48, supi,
+    // gpsi, dnn, ipDomain, snssai on top of the existing ipv4/ipv6).
+    let params = &request.http.params;
+    let snssai = params.get("snssai").and_then(|raw| {
+        let decoded = pct_decode(raw);
+        let v: serde_json::Value = serde_json::from_str(&decoded).ok()?;
+        let sst = v.get("sst")?.as_u64()? as u8;
+        let sd = v
+            .get("sd")
+            .and_then(|s| s.as_str())
+            .and_then(|s| u32::from_str_radix(s, 16).ok());
+        Some(context::SNssai::new(sst, sd))
+    });
+    let filter = context::BindingFilter {
+        ipv4addr: params.get("ipv4Addr").cloned(),
+        ipv6prefix: params.get("ipv6Prefix").map(|s| pct_decode(s)),
+        mac_addr48: params.get("macAddr48").cloned(),
+        supi: params.get("supi").cloned(),
+        gpsi: params.get("gpsi").cloned(),
+        dnn: params.get("dnn").cloned(),
+        ip_domain: params.get("ipDomain").cloned(),
+        snssai,
+    };
 
-    log::info!("PCF Binding Discovery: ipv4={ipv4addr:?}, ipv6={ipv6prefix:?}");
+    log::info!(
+        "PCF Binding Discovery: ipv4={:?}, ipv6={:?}, mac={:?}, supi={:?}, dnn={:?}",
+        filter.ipv4addr,
+        filter.ipv6prefix,
+        filter.mac_addr48,
+        filter.supi,
+        filter.dnn
+    );
 
-    if ipv4addr.is_none() && ipv6prefix.is_none() {
+    if !filter.has_ue_identifier() {
         return send_bad_request(
-            "Either ipv4Addr or ipv6Prefix query parameter required",
-            Some("MISSING_PARAM"),
+            "At least one of ipv4Addr, ipv6Prefix, macAddr48, supi or gpsi is required",
+            Some("MANDATORY_QUERY_PARAM_MISSING"),
         );
     }
 
     let ctx = bsf_self();
-    let sess = if let Ok(context) = ctx.read() {
-        if let Some(ipv4) = ipv4addr {
-            context.sess_find_by_ipv4addr(ipv4)
-        } else if let Some(ipv6) = ipv6prefix {
-            context.sess_find_by_ipv6prefix(ipv6)
-        } else {
-            None
-        }
+    let matches = if let Ok(context) = ctx.read() {
+        context.sess_find_matching(&filter, context::now_epoch())
     } else {
-        None
+        Vec::new()
     };
 
-    match sess {
-        Some(sess) => {
-            log::info!("PCF Binding found: {}", sess.binding_id);
-            SbiResponse::with_status(200)
-                .with_json_body(&serde_json::json!({
-                    "pcfBindingId": sess.binding_id,
-                    "ipv4Addr": sess.ipv4addr_string,
-                    "ipv6Prefix": sess.ipv6prefix_string,
-                    "supi": sess.supi,
-                    "gpsi": sess.gpsi,
-                    "dnn": sess.dnn,
-                    "pcfFqdn": sess.pcf_fqdn,
-                    "suppFeat": "1",
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(200))
-        }
-        None => send_not_found(
-            "No PCF binding found for the specified IP address",
+    match matches.as_slice() {
+        [] => send_not_found(
+            "No PCF binding found for the specified parameters",
             Some("BINDING_NOT_FOUND"),
         ),
+        [sess] => {
+            log::info!("PCF Binding found: {}", sess.binding_id);
+            SbiResponse::with_status(200)
+                .with_json_body(&binding_json(sess))
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
+        _ => ogs_sbi::server::send_error(
+            400,
+            "Bad Request",
+            "Multiple PCF bindings match the query parameter combination",
+            Some("MULTIPLE_BINDING_INFO_FOUND"),
+        ),
     }
+}
+
+/// Minimal percent-decoding for query parameter values.
+fn pct_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 async fn handle_pcf_binding_delete(binding_id: &str) -> SbiResponse {
@@ -535,12 +727,15 @@ async fn handle_pcf_binding_delete(binding_id: &str) -> SbiResponse {
 
     match sess_id {
         Some(id) => {
-            if let Ok(context) = ctx.read() {
-                if context.sess_remove(id).is_some() {
-                    context.sess_unpersist(binding_id);
-                    log::info!("PCF Binding {binding_id} deleted");
-                    return SbiResponse::with_status(204);
-                }
+            let removed = ctx
+                .read()
+                .map(|context| context.sess_remove(id).is_some())
+                .unwrap_or(false);
+            if removed {
+                // Guard dropped above; unpersist off-thread.
+                context::unpersist_binding_async(binding_id.to_string()).await;
+                log::info!("PCF Binding {binding_id} deleted");
+                return SbiResponse::with_status(204);
             }
             send_not_found(
                 &format!("PCF Binding {binding_id} not found"),
@@ -583,6 +778,29 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
             if let Some(ipv6) = update_data.get("ipv6Prefix").and_then(|v| v.as_str()) {
                 sess.set_ipv6prefix(ipv6);
             }
+            if let Some(mac) = update_data.get("macAddr48").and_then(|v| v.as_str()) {
+                if !sess.set_mac_addr48(mac) {
+                    return ogs_sbi::server::send_error(
+                        400,
+                        "Bad Request",
+                        &format!("Invalid macAddr48: {mac}"),
+                        Some("MANDATORY_IE_INCORRECT"),
+                    );
+                }
+            }
+            if let Some(ip_domain) = update_data.get("ipDomain").and_then(|v| v.as_str()) {
+                sess.ip_domain = Some(ip_domain.to_string());
+            }
+            if let Some(expiry) = update_data.get("expiry").and_then(|v| v.as_str()) {
+                if !sess.set_expiry(expiry) {
+                    return ogs_sbi::server::send_error(
+                        400,
+                        "Bad Request",
+                        &format!("expiry is not a valid RFC 3339 DateTime: {expiry}"),
+                        Some("MANDATORY_IE_INCORRECT"),
+                    );
+                }
+            }
             if let Some(supi) = update_data.get("supi").and_then(|v| v.as_str()) {
                 sess.supi = Some(supi.to_string());
             }
@@ -618,47 +836,21 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect();
             }
-            if let Some(endpoints) = update_data.get("pcfIpEndPoints").and_then(|v| v.as_array()) {
-                sess.pcf_ip = endpoints
-                    .iter()
-                    .map(|ep| context::PcfIpEndpoint {
-                        addr: ep
-                            .get("ipv4Address")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                        addr6: ep
-                            .get("ipv6Address")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string()),
-                        is_port: ep.get("port").is_some(),
-                        port: ep.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16,
-                    })
-                    .collect();
+            if let Some(endpoints) = update_data.get("pcfIpEndPoints") {
+                sess.pcf_ip = parse_pcf_ip_endpoints(endpoints);
             }
 
-            // Update session in context and persist to DB
+            // Update session in context, then persist off-thread (guard
+            // dropped before the await).
             if let Ok(context) = ctx.read() {
                 context.sess_update(&sess);
-                context.sess_persist(&sess);
             }
+            context::persist_binding_async(sess.clone()).await;
 
             log::info!("PCF Binding {binding_id} updated");
 
             SbiResponse::with_status(200)
-                .with_json_body(&serde_json::json!({
-                    "pcfBindingId": sess.binding_id,
-                    "ipv4Addr": sess.ipv4addr_string,
-                    "ipv6Prefix": sess.ipv6prefix_string,
-                    "supi": sess.supi,
-                    "gpsi": sess.gpsi,
-                    "dnn": sess.dnn,
-                    "pcfFqdn": sess.pcf_fqdn,
-                    "snssai": {
-                        "sst": sess.s_nssai.sst,
-                        "sd": sess.s_nssai.sd_to_string(),
-                    },
-                    "suppFeat": "1",
-                }))
+                .with_json_body(&binding_json(&sess))
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
         }
         None => send_not_found(
@@ -738,11 +930,14 @@ async fn run_event_loop_async(bsf_sm: &mut BsfSmContext, shutdown: Arc<AtomicBoo
                     log::info!("PCF Binding {binding_id} expired (TTL), removing");
                     let ctx = bsf_self();
                     if let Ok(sess_id) = binding_id.parse::<u64>() {
-                        if let Ok(context) = ctx.read() {
-                            if context.sess_remove(sess_id).is_some() {
-                                context.sess_unpersist(binding_id);
-                                log::info!("PCF Binding {binding_id} auto-removed on TTL expiry");
-                            }
+                        let removed = ctx
+                            .read()
+                            .map(|context| context.sess_remove(sess_id).is_some())
+                            .unwrap_or(false);
+                        if removed {
+                            // Guard dropped above; unpersist off-thread.
+                            context::unpersist_binding_async(binding_id.clone()).await;
+                            log::info!("PCF Binding {binding_id} auto-removed on TTL expiry");
                         }
                     }
                 }
@@ -756,6 +951,18 @@ async fn run_event_loop_async(bsf_sm: &mut BsfSmContext, shutdown: Arc<AtomicBoo
             }
 
             bsf_sm.dispatch(&mut event);
+        }
+
+        // Sweep bindings whose RFC 3339 expiry has passed (W4.2: expired
+        // bindings excluded from discovery and removed from storage).
+        let swept = {
+            let ctx = bsf_self();
+            ctx.read()
+                .map(|context| context.sweep_expired(context::now_epoch()))
+                .unwrap_or_default()
+        };
+        for binding_id in swept {
+            context::unpersist_binding_async(binding_id).await;
         }
 
         // Check for shutdown
@@ -898,5 +1105,294 @@ mod tests {
         assert!(args.tls);
         assert_eq!(args.tls_cert, Some("/path/to/cert.pem".to_string()));
         assert_eq!(args.tls_key, Some("/path/to/key.pem".to_string()));
+    }
+
+    #[test]
+    fn test_pct_decode() {
+        assert_eq!(pct_decode("a%2Cb"), "a,b");
+        assert_eq!(pct_decode("plain"), "plain");
+        assert_eq!(
+            pct_decode("%7B%22sst%22%3A1%2C%22sd%22%3A%22010203%22%7D"),
+            "{\"sst\":1,\"sd\":\"010203\"}"
+        );
+        assert_eq!(pct_decode("2001%3Adb8%3A%3A1%2F128"), "2001:db8::1/128");
+    }
+
+    #[test]
+    fn test_binding_json_shape() {
+        let mut sess = BsfSess::new(9);
+        sess.binding_id = "9".to_string();
+        sess.dnn = Some("internet".to_string());
+        sess.s_nssai = context::SNssai::new(1, Some(0x010203));
+        sess.set_mac_addr48("aa:bb:cc:dd:ee:ff");
+        sess.pcf_ip = vec![context::PcfIpEndpoint {
+            addr: Some("10.0.0.10".to_string()),
+            addr6: None,
+            is_port: true,
+            port: 7777,
+        }];
+        let j = binding_json(&sess);
+        // Mandatory PcfBinding attributes always present
+        assert_eq!(j["dnn"], "internet");
+        assert_eq!(j["snssai"]["sst"], 1);
+        assert_eq!(j["snssai"]["sd"], "010203");
+        // MAC canonical form, persisted endpoints echoed
+        assert_eq!(j["macAddr48"], "aa-bb-cc-dd-ee-ff");
+        assert_eq!(j["pcfIpEndPoints"][0]["ipv4Address"], "10.0.0.10");
+        assert_eq!(j["pcfIpEndPoints"][0]["port"], 7777);
+        // Absent optionals are omitted, not null
+        assert!(j.get("ipv4Addr").is_none());
+        assert!(j.get("expiry").is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // HTTP-level lifecycle tests over a real HTTP/2 SBI server on an
+    // ephemeral port (strict-peer rejections + discovery matrix + expiry).
+    // ------------------------------------------------------------------
+
+    use ogs_sbi::client::SbiClient;
+    use serde_json::json;
+
+    fn ephemeral_addr() -> SocketAddr {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
+        let addr = probe.local_addr().expect("probe addr");
+        drop(probe);
+        addr
+    }
+
+    async fn start_bsf() -> (SbiServer, SbiClient) {
+        // The handlers consult the global BSF context: initialize it once.
+        bsf_context_init(1024);
+        let addr = ephemeral_addr();
+        let server = SbiServer::new(OgsSbiServerConfig::new(addr));
+        server
+            .start(bsf_sbi_request_handler)
+            .await
+            .expect("BSF SBI server starts");
+        (server, SbiClient::with_host_port("127.0.0.1", addr.port()))
+    }
+
+    fn problem(resp: &SbiResponse) -> serde_json::Value {
+        serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap()
+    }
+
+    /// Strict-peer rejections: missing mandatory attrs and malformed values
+    /// produce 400 ProblemDetails with the spec cause.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_create_rejects_missing_mandatory() {
+        let (server, client) = start_bsf().await;
+
+        // Missing dnn
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({"snssai": {"sst": 1}, "ipv4Addr": "10.45.9.1"}),
+            )
+            .await
+            .expect("POST no dnn");
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem(&resp)["cause"], "MANDATORY_IE_MISSING");
+        assert!(problem(&resp)["detail"].as_str().unwrap().contains("dnn"));
+
+        // Missing snssai
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({"dnn": "internet", "ipv4Addr": "10.45.9.1"}),
+            )
+            .await
+            .expect("POST no snssai");
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem(&resp)["cause"], "MANDATORY_IE_MISSING");
+
+        // No UE address at all
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({"dnn": "internet", "snssai": {"sst": 1}}),
+            )
+            .await
+            .expect("POST no address");
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem(&resp)["cause"], "MANDATORY_IE_MISSING");
+
+        // Malformed MAC
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({"dnn": "internet", "snssai": {"sst": 1}, "macAddr48": "nope"}),
+            )
+            .await
+            .expect("POST bad mac");
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem(&resp)["cause"], "MANDATORY_IE_INCORRECT");
+
+        // Malformed expiry (integer seconds, not RFC 3339)
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({"dnn": "internet", "snssai": {"sst": 1},
+                        "ipv4Addr": "10.45.9.1", "expiry": "3600"}),
+            )
+            .await
+            .expect("POST bad expiry");
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem(&resp)["cause"], "MANDATORY_IE_INCORRECT");
+
+        server.stop().await.expect("server stops");
+    }
+
+    /// Full lifecycle: MAC-only create with pcfIpEndPoints, discovery by
+    /// mac/supi/dnn/ipv4, multiple-match rejection, PATCH, expiry exclusion,
+    /// DELETE.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_binding_lifecycle_discovery_and_expiry() {
+        let (server, client) = start_bsf().await;
+
+        // MAC-only binding (Ethernet PDU session, no UE IP) with endpoints.
+        let create = json!({
+            "dnn": "internet",
+            "snssai": {"sst": 1, "sd": "010203"},
+            "macAddr48": "AA:BB:CC:00:11:22",
+            "supi": "imsi-001019900100001",
+            "pcfFqdn": "pcf.example.com",
+            "pcfIpEndPoints": [
+                {"ipv4Address": "10.0.0.10", "port": 7777},
+                {"ipv6Address": "2001:db8::10"}
+            ]
+        });
+        let resp = client
+            .post_json("/nbsf-management/v1/pcfBindings", &create)
+            .await
+            .expect("POST create");
+        assert_eq!(resp.status, 201);
+        let location = resp.http.get_header("Location").expect("Location").clone();
+        let binding_id = location.rsplit('/').next().unwrap().to_string();
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        // pcfIpEndPoints persisted and returned (not echoed from raw input)
+        assert_eq!(body["pcfIpEndPoints"][0]["ipv4Address"], "10.0.0.10");
+        assert_eq!(body["pcfIpEndPoints"][0]["port"], 7777);
+        assert_eq!(body["pcfIpEndPoints"][1]["ipv6Address"], "2001:db8::10");
+        assert_eq!(body["macAddr48"], "aa-bb-cc-00-11-22");
+        assert!(body.get("ipv4Addr").is_none());
+
+        // Second binding for the same SUPI on another DNN (IPv4-keyed).
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "dnn": "ims",
+                    "snssai": {"sst": 1},
+                    "ipv4Addr": "10.45.9.7",
+                    "supi": "imsi-001019900100001"
+                }),
+            )
+            .await
+            .expect("POST second");
+        assert_eq!(resp.status, 201);
+        let second_body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let second_id = second_body["pcfBindingId"].as_str().unwrap().to_string();
+
+        // Discovery without any UE identifier -> 400.
+        let req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
+        let resp = client.send_request(req).await.expect("discover none");
+        assert_eq!(resp.status, 400);
+
+        // Discovery by MAC (different separator/case) -> the MAC binding.
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
+        req.http.set_param("macAddr48", "aa-bb-cc-00-11-22");
+        let resp = client.send_request(req).await.expect("discover mac");
+        assert_eq!(resp.status, 200);
+        let found: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(found["pcfBindingId"].as_str().unwrap(), binding_id);
+        assert_eq!(found["pcfIpEndPoints"][0]["port"], 7777);
+
+        // Discovery by SUPI alone -> two matches -> 400 MULTIPLE_BINDING_INFO_FOUND.
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
+        req.http.set_param("supi", "imsi-001019900100001");
+        let resp = client.send_request(req).await.expect("discover supi");
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem(&resp)["cause"], "MULTIPLE_BINDING_INFO_FOUND");
+
+        // Discovery by SUPI + DNN narrows to one.
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
+        req.http.set_param("supi", "imsi-001019900100001");
+        req.http.set_param("dnn", "ims");
+        let resp = client.send_request(req).await.expect("discover supi+dnn");
+        assert_eq!(resp.status, 200);
+        let found: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(found["pcfBindingId"].as_str().unwrap(), second_id);
+
+        // Discovery by ipv4Addr still works.
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
+        req.http.set_param("ipv4Addr", "10.45.9.7");
+        let resp = client.send_request(req).await.expect("discover ipv4");
+        assert_eq!(resp.status, 200);
+
+        // PATCH the MAC binding's endpoints; echoed in the response and GET.
+        let mut req = SbiRequest::patch(format!("/nbsf-management/v1/pcfBindings/{binding_id}"));
+        req.http.set_content(
+            json!({"pcfIpEndPoints": [{"ipv4Address": "10.0.0.20", "port": 8888}]}).to_string(),
+        );
+        req.http.set_header("Content-Type", "application/json");
+        let resp = client.send_request(req).await.expect("PATCH");
+        assert_eq!(resp.status, 200);
+        let patched: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(patched["pcfIpEndPoints"][0]["ipv4Address"], "10.0.0.20");
+        let resp = client
+            .get(&format!("/nbsf-management/v1/pcfBindings/{binding_id}"))
+            .await
+            .expect("GET after PATCH");
+        assert_eq!(resp.status, 200);
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(got["pcfIpEndPoints"][0]["port"], 8888);
+
+        // A binding with an already-past RFC 3339 expiry is excluded from
+        // discovery and GET (expired -> not served).
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "dnn": "expired",
+                    "snssai": {"sst": 1},
+                    "ipv4Addr": "10.45.9.99",
+                    "expiry": "2000-01-01T00:00:00Z"
+                }),
+            )
+            .await
+            .expect("POST expired");
+        assert_eq!(resp.status, 201);
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
+        req.http.set_param("ipv4Addr", "10.45.9.99");
+        let resp = client.send_request(req).await.expect("discover expired");
+        assert_eq!(resp.status, 404);
+
+        // DELETE both live bindings -> 204; GET -> 404 afterwards.
+        for id in [&binding_id, &second_id] {
+            let resp = client
+                .delete(&format!("/nbsf-management/v1/pcfBindings/{id}"))
+                .await
+                .expect("DELETE");
+            assert_eq!(resp.status, 204);
+            let resp = client
+                .get(&format!("/nbsf-management/v1/pcfBindings/{id}"))
+                .await
+                .expect("GET deleted");
+            assert_eq!(resp.status, 404);
+        }
+        // Deleting again -> 404.
+        let resp = client
+            .delete(&format!("/nbsf-management/v1/pcfBindings/{binding_id}"))
+            .await
+            .expect("DELETE again");
+        assert_eq!(resp.status, 404);
+
+        server.stop().await.expect("server stops");
     }
 }

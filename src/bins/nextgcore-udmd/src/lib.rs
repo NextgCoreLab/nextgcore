@@ -17,7 +17,8 @@ pub mod ue_sm;
 
 // Re-export commonly used types
 pub use context::{
-    udm_context_final, udm_context_init, udm_self, UdmContext, UdmSdmSubscription, UdmSess, UdmUe,
+    udm_context_final, udm_context_init, udm_self, AuthEvent, UdmContext, UdmSdmSubscription,
+    UdmSess, UdmUe,
 };
 pub use event::{UdmEvent, UdmEventId, UdmTimerId};
 pub use sess_sm::{UdmSessSmContext, UdmSessState};

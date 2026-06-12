@@ -156,6 +156,77 @@ pub fn ogs_dbi_update_imeisv(supi: &str, imeisv: &str) -> DbiResult<()> {
     Ok(())
 }
 
+/// Authentication credentials for provisioning a subscriber (W4.2).
+///
+/// Used by the UDR `PUT
+/// /subscription-data/{ueId}/authentication-data/authentication-subscription`
+/// provisioning path (TS 29.505) to create or replace the stored
+/// AuthenticationSubscription credentials.
+#[derive(Debug, Clone, Default)]
+pub struct OgsDbiAuthProvision {
+    /// Permanent key K as a hex string (32 hex chars)
+    pub k_hex: String,
+    /// OPc as a hex string, if provisioned
+    pub opc_hex: Option<String>,
+    /// OP as a hex string, if provisioned
+    pub op_hex: Option<String>,
+    /// Authentication Management Field as a hex string (4 hex chars)
+    pub amf_hex: String,
+    /// Initial sequence number
+    pub sqn: u64,
+}
+
+/// Create or replace the authentication subscription for a subscriber.
+///
+/// Upserts the `security` sub-document of the subscriber document. Returns
+/// `Ok(true)` when a new subscriber document was created (HTTP 201 path) and
+/// `Ok(false)` when an existing document was updated (HTTP 204 path).
+pub fn ogs_dbi_provision_auth_info(supi: &str, p: &OgsDbiAuthProvision) -> DbiResult<bool> {
+    let supi_type = ogs_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let supi_id = ogs_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+
+    let collection = get_subscriber_collection()?;
+    let query = doc! { &supi_type: &supi_id };
+
+    let mut set = doc! {
+        format!("{}.{}", OGS_SECURITY_STRING, OGS_K_STRING): &p.k_hex,
+        format!("{}.{}", OGS_SECURITY_STRING, OGS_AMF_STRING): &p.amf_hex,
+        format!("{}.{}", OGS_SECURITY_STRING, OGS_SQN_STRING): p.sqn as i64,
+    };
+    if let Some(opc) = &p.opc_hex {
+        set.insert(
+            format!("{}.{}", OGS_SECURITY_STRING, OGS_OPC_STRING),
+            opc.as_str(),
+        );
+    }
+    if let Some(op) = &p.op_hex {
+        set.insert(
+            format!("{}.{}", OGS_SECURITY_STRING, OGS_OP_STRING),
+            op.as_str(),
+        );
+    }
+
+    let opts = mongodb::options::UpdateOptions::builder()
+        .upsert(true)
+        .build();
+    let result = collection.update_one(query, doc! { "$set": set }, opts)?;
+    Ok(result.upserted_id.is_some())
+}
+
+/// Async, non-blocking wrapper for [`ogs_dbi_provision_auth_info`].
+pub async fn ogs_dbi_provision_auth_info_async(
+    supi: String,
+    p: OgsDbiAuthProvision,
+) -> DbiResult<bool> {
+    tokio::task::spawn_blocking(move || ogs_dbi_provision_auth_info(&supi, &p))
+        .await
+        .unwrap_or_else(|e| {
+            Err(DbiError::ParseError(format!(
+                "spawn_blocking panicked: {e}"
+            )))
+        })
+}
+
 /// Update MME information for a subscriber
 ///
 /// # Arguments

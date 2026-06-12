@@ -24,6 +24,7 @@ pub const OGS_HASH_MME_LEN: usize = 8;
 pub const ECC_BYTES: usize = 32; // secp256r1
 
 // FC (Function Code) values for KDF
+const FC_FOR_CK_PRIME_IK_PRIME_DERIVATION: u8 = 0x20;
 const FC_FOR_5GS_ALGORITHM_KEY_DERIVATION: u8 = 0x69;
 const FC_FOR_KAUSF_DERIVATION: u8 = 0x6A;
 const FC_FOR_RES_STAR_XRES_STAR_DERIVATION: u8 = 0x6B;
@@ -113,6 +114,39 @@ pub fn ogs_kdf_kausf(
     params[1].len = OGS_SQN_XOR_AK_LEN as u16;
 
     ogs_kdf_common(&key, FC_FOR_KAUSF_DERIVATION, &params)
+}
+
+/// TS 33.501 Annex A.3: CK' and IK' derivation function (EAP-AKA', RFC 5448 §3.3)
+///
+/// Derives CK' and IK' from CK, IK, the serving network name and SQN xor AK:
+/// `CK' || IK' = KDF(CK || IK, FC=0x20, SN name, SQN xor AK)`.
+///
+/// Used by the UDM/ARPF when producing an EAP-AKA' transformed authentication
+/// vector (TS 33.501 §6.1.3.1) and by the AUSF for verification.
+pub fn ogs_kdf_ck_ik_prime(
+    ck: &[u8; OGS_KEY_LEN],
+    ik: &[u8; OGS_KEY_LEN],
+    serving_network_name: &str,
+    sqn_xor_ak: &[u8; OGS_SQN_XOR_AK_LEN],
+) -> ([u8; OGS_KEY_LEN], [u8; OGS_KEY_LEN]) {
+    // Key = CK || IK
+    let mut key = [0u8; OGS_KEY_LEN * 2];
+    key[..OGS_KEY_LEN].copy_from_slice(ck);
+    key[OGS_KEY_LEN..].copy_from_slice(ik);
+
+    let mut params = [KdfParam::default(), KdfParam::default()];
+    params[0].buf = Some(serving_network_name.as_bytes().to_vec());
+    params[0].len = serving_network_name.len() as u16;
+    params[1].buf = Some(sqn_xor_ak.to_vec());
+    params[1].len = OGS_SQN_XOR_AK_LEN as u16;
+
+    let output = ogs_kdf_common(&key, FC_FOR_CK_PRIME_IK_PRIME_DERIVATION, &params);
+
+    let mut ck_prime = [0u8; OGS_KEY_LEN];
+    let mut ik_prime = [0u8; OGS_KEY_LEN];
+    ck_prime.copy_from_slice(&output[..OGS_KEY_LEN]);
+    ik_prime.copy_from_slice(&output[OGS_KEY_LEN..]);
+    (ck_prime, ik_prime)
 }
 
 /// TS33.501 Annex A.4: RES* and XRES* derivation function
@@ -526,5 +560,55 @@ fn ogs_id_get_value(id: &str) -> String {
         parts[1].to_string()
     } else {
         id.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// RFC 5448 (EAP-AKA') test vector 1: CK'/IK' derivation.
+    ///
+    /// Network name "WLAN"; SQN xor AK = AUTN[0..6].
+    #[test]
+    fn test_ck_ik_prime_rfc5448_vector1() {
+        let ck_v = unhex("5349fbe098649f948f5d2e973a81c00f");
+        let ik_v = unhex("9744871ad32bf9bbd1dd5ce54e3e2e5a");
+        let autn = unhex("bb52e91c747ac3ab2a5c23d15ee351d5");
+
+        let mut ck = [0u8; 16];
+        ck.copy_from_slice(&ck_v);
+        let mut ik = [0u8; 16];
+        ik.copy_from_slice(&ik_v);
+        let mut sqn_xor_ak = [0u8; 6];
+        sqn_xor_ak.copy_from_slice(&autn[..6]);
+
+        let (ck_prime, ik_prime) = ogs_kdf_ck_ik_prime(&ck, &ik, "WLAN", &sqn_xor_ak);
+
+        assert_eq!(&ck_prime[..], &unhex("0093962d0dd84aa5684b045c9edffa04")[..]);
+        assert_eq!(&ik_prime[..], &unhex("ccfc230ca74fcc96c0a5d61164f5a76c")[..]);
+    }
+
+    /// Determinism + sensitivity checks for CK'/IK'.
+    #[test]
+    fn test_ck_ik_prime_properties() {
+        let ck = [0x11u8; 16];
+        let ik = [0x22u8; 16];
+        let sqn_xor_ak = [0x33u8; 6];
+
+        let (c1, i1) = ogs_kdf_ck_ik_prime(&ck, &ik, "5G:mnc001.mcc001.3gppnetwork.org", &sqn_xor_ak);
+        let (c2, i2) = ogs_kdf_ck_ik_prime(&ck, &ik, "5G:mnc001.mcc001.3gppnetwork.org", &sqn_xor_ak);
+        assert_eq!(c1, c2);
+        assert_eq!(i1, i2);
+
+        let (c3, _) = ogs_kdf_ck_ik_prime(&ck, &ik, "5G:mnc002.mcc002.3gppnetwork.org", &sqn_xor_ak);
+        assert_ne!(c1, c3);
     }
 }

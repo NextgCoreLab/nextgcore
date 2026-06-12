@@ -256,15 +256,18 @@ pub fn forward_n32f_request(
 
     let n32f_body = match client.security_scheme {
         SecurityCapability::Prins => {
-            // PRINS: build message with modification blocks for sensitive IEs
-            let modifications = identify_prins_modifications(request);
-            let msg = crate::n32c_build::build_n32f_prins_message(
+            // PRINS: JWE/JWS protection per TS 29.573 sec 6.3 using the
+            // session key established via the N32-c exchange-params handshake
+            let prins_ctx = build_prins_context(node_id)
+                .ok_or("PRINS negotiated but no N32-f security context established")?;
+            let msg = crate::prins::protect_message(
+                &prins_ctx,
                 &request.method,
                 &request.uri,
                 &header_pairs,
                 request.body.as_deref(),
-                modifications,
-            );
+            )
+            .map_err(|e| format!("PRINS protection failed: {e}"))?;
             serde_json::to_vec(&msg).ok()
         }
         _ => {
@@ -295,47 +298,25 @@ pub fn forward_n32f_request(
     })
 }
 
-/// Identify IEs that need PRINS protection based on data-type profile.
-/// Per TS 29.573 sec 5.3.3: sensitive IEs like SUPI, PEI are protected.
-fn identify_prins_modifications(request: &SbiRequest) -> Vec<crate::n32c_build::N32fModification> {
-    let mut modifications = Vec::new();
-
-    // If body contains SUPI, mark it for protection
-    if let Some(body) = &request.body {
-        if let Ok(body_str) = std::str::from_utf8(body) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(body_str) {
-                // Protect SUPI if present
-                if json.get("supi").is_some() {
-                    modifications.push(crate::n32c_build::N32fModification {
-                        ie_location: "body".to_string(),
-                        ie_path: "$.supi".to_string(),
-                        ie_value: None,
-                        ie_action: "encrypt".to_string(),
-                    });
-                }
-                // Protect PEI (IMEI/IMEISV) if present
-                if json.get("pei").is_some() {
-                    modifications.push(crate::n32c_build::N32fModification {
-                        ie_location: "body".to_string(),
-                        ie_path: "$.pei".to_string(),
-                        ie_value: None,
-                        ie_action: "encrypt".to_string(),
-                    });
-                }
-                // Protect GPSI if present
-                if json.get("gpsi").is_some() {
-                    modifications.push(crate::n32c_build::N32fModification {
-                        ie_location: "body".to_string(),
-                        ie_path: "$.gpsi".to_string(),
-                        ie_value: None,
-                        ie_action: "encrypt".to_string(),
-                    });
-                }
-            }
-        }
-    }
-
-    modifications
+/// Build a PRINS protection context for a peer node from the N32-f
+/// security material established during the N32-c handshake.
+/// Copies the data out of the context locks (no guard is held afterwards).
+pub fn build_prins_context(node_id: u64) -> Option<crate::prins::PrinsContext> {
+    let ctx = sepp_self();
+    let (security, local_fqdn) = {
+        let context = ctx.read().ok()?;
+        let node = context.node_find(node_id)?;
+        let security = node.n32f_security.clone()?;
+        let local_fqdn = context.sender.clone().unwrap_or_default();
+        (security, local_fqdn)
+    };
+    Some(crate::prins::PrinsContext::new(
+        security.local_context_id,
+        security.peer_context_id,
+        security.session_key,
+        security.kid,
+        local_fqdn,
+    ))
 }
 
 /// Async N32f forwarding - sends the request via HTTP/2 to the peer SEPP.
@@ -669,8 +650,16 @@ fn is_fqdn_in_vplmn(fqdn: &str) -> bool {
         return false;
     }
 
-    // Note: Comparison with local serving PLMN IDs done via context.serving_plmn_ids
-    // For now, assume any 3gppnetwork.org FQDN is in VPLMN
+    let (mcc, mnc) = extract_plmn_from_fqdn(fqdn);
+
+    // An FQDN naming one of our own serving PLMNs is not in a VPLMN
+    let ctx = sepp_self();
+    if let Ok(context) = ctx.read() {
+        if context.serves_plmn(mcc, mnc) {
+            return false;
+        }
+    }
+
     true
 }
 

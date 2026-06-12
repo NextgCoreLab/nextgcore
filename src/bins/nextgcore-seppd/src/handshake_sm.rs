@@ -12,7 +12,6 @@
 
 use crate::context::{sepp_self, SecurityCapability};
 use crate::event::{SeppEvent, SeppEventId, SeppTimerId};
-use crate::sbi_response::send_not_implemented_response;
 
 /// Handshake state type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -122,6 +121,16 @@ impl HandshakeSmContext {
         self.state == HandshakeState::Exception
     }
 
+    /// Called when the N32-f exchange-params step completes (PRINS phase 2):
+    /// the security context is established, transition to Established.
+    pub fn on_params_exchanged(&mut self) {
+        log::info!(
+            "[node_id={}] N32-f params exchanged, transitioning to Established",
+            self.node_id
+        );
+        self.state = HandshakeState::Established;
+    }
+
     fn handle_initial_state(&mut self, _event: &mut SeppEvent) {
         log::debug!(
             "[node_id={}] Transitioning from Initial to WillEstablish",
@@ -219,11 +228,13 @@ impl HandshakeSmContext {
                             self.state = HandshakeState::Established;
                         }
                         SecurityCapability::Prins => {
-                            log::error!("[node_id={}] PRINS is not supported", self.node_id);
-                            send_not_implemented_response(
-                                stream_id,
-                                "PRINS security scheme is not supported",
+                            log::info!(
+                                "[node_id={}] PRINS negotiated, awaiting exchange-params (stream_id={})",
+                                self.node_id,
+                                stream_id
                             );
+                            self.send_security_capability_response();
+                            // Stay in WillEstablish until N32-f params are exchanged
                         }
                         SecurityCapability::None => {
                             log::warn!(
@@ -305,7 +316,13 @@ impl HandshakeSmContext {
                                 self.state = HandshakeState::Established;
                             }
                             SecurityCapability::Prins => {
-                                log::error!("[node_id={}] PRINS is not supported", self.node_id);
+                                log::info!(
+                                    "[node_id={}] PRINS selected, initiating exchange-params",
+                                    self.node_id
+                                );
+                                // n32_server::initiate_n32c_handshake drives the
+                                // exchange-params request; Established follows via
+                                // on_params_exchanged()
                             }
                             SecurityCapability::None => {
                                 log::warn!(
@@ -427,11 +444,12 @@ impl HandshakeSmContext {
                             self.send_security_capability_response();
                         }
                         SecurityCapability::Prins => {
-                            log::error!("[node_id={}] PRINS is not supported", self.node_id);
-                            send_not_implemented_response(
-                                stream_id,
-                                "PRINS security scheme is not supported",
+                            log::warn!(
+                                "[node_id={}] PRINS re-negotiated while established (stream_id={})",
+                                self.node_id,
+                                stream_id
                             );
+                            self.send_security_capability_response();
                         }
                         SecurityCapability::None => {
                             log::info!("[node_id={}] Transitioning to Terminated", self.node_id);
@@ -578,11 +596,13 @@ impl HandshakeSmContext {
                             self.state = HandshakeState::Established;
                         }
                         SecurityCapability::Prins => {
-                            log::error!("[node_id={}] PRINS is not supported", self.node_id);
-                            send_not_implemented_response(
-                                stream_id,
-                                "PRINS security scheme is not supported",
+                            log::info!(
+                                "[node_id={}] PRINS negotiated, awaiting exchange-params (stream_id={})",
+                                self.node_id,
+                                stream_id
                             );
+                            self.send_security_capability_response();
+                            self.state = HandshakeState::WillEstablish;
                         }
                         SecurityCapability::None => {
                             log::warn!(
