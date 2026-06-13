@@ -1861,6 +1861,10 @@ pub struct AmfUe {
     pub prose_capable: bool,
     /// PIN (Personal IoT Network) role
     pub pin_role: Option<String>,
+    /// UAV (aerial UE) flight authorization context (Rel-18, TS 23.256). Set
+    /// when the UE registers as an aerial UE (UAV indication IE); drives the
+    /// geofence on UAV tracking reports.
+    pub uav_auth: Option<UavAuthorizationContext>,
 }
 
 /// URSP policy rule for UE policy delivery (TS 24.526)
@@ -2272,6 +2276,7 @@ impl AmfUe {
             ursp_rules: Vec::new(),
             prose_capable: false,
             pin_role: None,
+            uav_auth: None,
         }
     }
 

@@ -100,10 +100,64 @@ impl PolicyDecision {
         }
     }
 
+    /// DNN-aware config-default fallback (no PCF configured).
+    ///
+    /// Starts from [`Self::config_default`] and, when the requested DNN maps to
+    /// an XR/URLLC service, upgrades the default flow to a delay-critical GBR
+    /// XR 5QI (TS 23.501 Table 5.7.4-1, Rel-18) with a populated PCC rule so the
+    /// XR-aware QoS-flow binding and PFCP QER/PDR setup get an XR flow to act on.
+    ///
+    /// This is the local (PCF-less) equivalent of a PCF authorising an XR 5QI;
+    /// the DNN is the only XR signal a standard UE conveys at establishment.
+    pub fn config_default_for_dnn(dnn: &str) -> Self {
+        let mut dec = Self::config_default();
+        if let Some(five_qi) = xr_5qi_for_dnn(dnn) {
+            // XR is delay-critical GBR: provision a GBR equal to a fraction of
+            // the session AMBR so the UPF installs guaranteed-rate buckets and
+            // never starves the XR flow.
+            let gbr_dl = dec.sess_ambr_dl_bps / 2;
+            let gbr_ul = dec.sess_ambr_ul_bps / 4;
+            dec.def_five_qi = five_qi;
+            // XR flows get a higher ARP priority than the best-effort default.
+            dec.arp_priority_level = 4;
+            dec.pcc_rules.push(PccRule {
+                id: format!("xr-default-{five_qi}"),
+                precedence: 10,
+                five_qi,
+                mbr_ul_bps: Some(dec.sess_ambr_ul_bps),
+                mbr_dl_bps: Some(dec.sess_ambr_dl_bps),
+                gbr_ul_bps: Some(gbr_ul),
+                gbr_dl_bps: Some(gbr_dl),
+                flow_descriptions: vec!["permit out ip from any to assigned".to_string()],
+                flow_enabled: true,
+                has_charging: false,
+            });
+        }
+        dec
+    }
+
     /// Default QFI: for the default non-GBR rule the QFI equals the 5QI
     /// (standardized 5QI-to-QFI mapping used for the default flow).
     pub fn default_qfi(&self) -> u8 {
         self.def_five_qi & 0x3F
+    }
+}
+
+/// Map a requested DNN to an XR/URLLC 5QI when the DNN names an XR service.
+///
+/// Standardised XR 5QIs are 82-85 (TS 23.501 Table 5.7.4-1). With no PCF this
+/// is the deterministic DNN-to-5QI mapping the SMF applies locally:
+/// - `xr` / `xr-cloud` → 82 (XR/cloud gaming DL, PDB 10 ms)
+/// - `xr-split`        → 84 (XR split rendering DL, PDB 30 ms)
+/// - `xr-haptic`       → 85 (XR haptic / split rendering UL, PDB 5 ms)
+///
+/// Any other DNN returns `None` (best-effort default 5QI applies).
+pub fn xr_5qi_for_dnn(dnn: &str) -> Option<u8> {
+    match dnn.to_ascii_lowercase().as_str() {
+        "xr" | "xr-cloud" | "xr-gaming" => Some(82),
+        "xr-split" => Some(84),
+        "xr-haptic" => Some(85),
+        _ => None,
     }
 }
 
@@ -848,6 +902,36 @@ mod tests {
         assert!(dec.is_config_default);
         assert_eq!(dec.def_five_qi, 9);
         assert_eq!(dec.default_qfi(), 9);
+    }
+
+    #[test]
+    fn xr_5qi_for_dnn_maps_xr_services() {
+        assert_eq!(xr_5qi_for_dnn("xr"), Some(82));
+        assert_eq!(xr_5qi_for_dnn("XR"), Some(82));
+        assert_eq!(xr_5qi_for_dnn("xr-cloud"), Some(82));
+        assert_eq!(xr_5qi_for_dnn("xr-split"), Some(84));
+        assert_eq!(xr_5qi_for_dnn("xr-haptic"), Some(85));
+        assert_eq!(xr_5qi_for_dnn("internet"), None);
+    }
+
+    #[test]
+    fn config_default_for_xr_dnn_yields_xr_gbr_rule() {
+        // Non-XR DNN behaves exactly like config_default (best-effort 5QI 9,
+        // no PCC rules).
+        let plain = PolicyDecision::config_default_for_dnn("internet");
+        assert_eq!(plain.def_five_qi, 9);
+        assert!(plain.pcc_rules.is_empty());
+
+        // XR DNN upgrades the default flow to a delay-critical GBR XR 5QI and
+        // emits a GBR PCC rule the XR-aware binding can act on.
+        let xr = PolicyDecision::config_default_for_dnn("xr");
+        assert_eq!(xr.def_five_qi, 82);
+        assert!(xr.is_config_default);
+        assert_eq!(xr.pcc_rules.len(), 1);
+        let rule = &xr.pcc_rules[0];
+        assert_eq!(rule.five_qi, 82);
+        assert!(rule.gbr_dl_bps.unwrap_or(0) > 0);
+        assert!(rule.gbr_ul_bps.unwrap_or(0) > 0);
     }
 
     #[test]

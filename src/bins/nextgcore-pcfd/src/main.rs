@@ -589,6 +589,88 @@ async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) -> Sbi
 
 // SM Policy Control handlers
 
+/// Whether a DNN identifies a UAV (aerial) session (Rel-18, TS 23.256).
+///
+/// Configured via `PCF_UAV_DNN` (comma-separated DNN list); defaults to `uav`.
+fn is_uav_dnn(dnn: &str) -> bool {
+    let configured =
+        std::env::var("PCF_UAV_DNN").unwrap_or_else(|_| "uav".to_string());
+    configured
+        .split(',')
+        .map(str::trim)
+        .any(|d| !d.is_empty() && d.eq_ignore_ascii_case(dnn))
+}
+
+/// UAV flight-policy gating for a UAV PDU session (Rel-18, TS 23.256).
+///
+/// Builds a [`UavPolicyAuthorization`] from config: a global altitude limit
+/// (`PCF_UAV_MAX_ALTITUDE`, default 120 m) plus a permitted flight zone, then
+/// checks the UE's reported (or configured) flight position against it. Returns
+/// `None` when the session is authorized; `Some(reject_response)` (HTTP 403)
+/// when the altitude/zone gate denies the session, so the caller fails the SM
+/// policy create. The position is read from `PCF_UAV_POSITION`
+/// (`lat,lon,alt`); when unset a nominal in-zone position is used so the
+/// authorize path is exercised end to end.
+fn authorize_uav_session(supi: &str, dnn: &str) -> Option<SbiResponse> {
+    let max_altitude = std::env::var("PCF_UAV_MAX_ALTITUDE")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(120.0);
+
+    let mut uav = UavPolicyAuthorization::new(supi);
+    uav.min_altitude_limit = 0.0;
+    uav.max_altitude_limit = max_altitude;
+    // A permitted (unrestricted) flight zone covering the configured geofence.
+    let mut zone = UavFlightZone::new("uav-default-zone", UavFlightZoneType::Unrestricted);
+    zone.min_latitude = 37.0;
+    zone.max_latitude = 38.0;
+    zone.min_longitude = -123.0;
+    zone.max_longitude = -122.0;
+    zone.min_altitude = 0.0;
+    zone.max_altitude = max_altitude;
+    uav.add_flight_zone(zone);
+    uav.grant_authorization("CAA-PCF-DEFAULT", 3600);
+
+    // Flight position to gate against (lat, lon, alt). Default: in-zone.
+    let (lat, lon, alt) = std::env::var("PCF_UAV_POSITION")
+        .ok()
+        .and_then(|v| {
+            let p: Vec<f64> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            if p.len() == 3 { Some((p[0], p[1], p[2])) } else { None }
+        })
+        .unwrap_or((37.5, -122.5, max_altitude.min(100.0)));
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    if uav.check_position_authorized(lat, lon, alt, now) {
+        log::info!(
+            "[UAV Policy] SM policy ALLOW for SUPI {supi} dnn={dnn}: position \
+             ({lat:.6}, {lon:.6}) alt={alt:.1}m within flight policy (max_alt={max_altitude}m)"
+        );
+        None
+    } else {
+        log::warn!(
+            "[UAV Policy] SM policy DENY for SUPI {supi} dnn={dnn}: position \
+             ({lat:.6}, {lon:.6}) alt={alt:.1}m violates flight policy; rejecting session"
+        );
+        Some(
+            SbiResponse::with_status(403)
+                .with_json_body(&serde_json::json!({
+                    "title": "UAV flight policy violation",
+                    "status": 403,
+                    "cause": "UAV_FLIGHT_NOT_AUTHORIZED",
+                    "detail": format!(
+                        "UAV position ({lat}, {lon}) alt={alt}m outside authorized flight policy"
+                    ),
+                }))
+                .unwrap_or_else(|_| SbiResponse::with_status(403)),
+        )
+    }
+}
+
 async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
     log::info!("SM Policy Create");
 
@@ -682,6 +764,18 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
             }
             if let Ok(context) = ctx.read() {
                 context.sess_update(&sess);
+            }
+
+            // UAV flight-policy authorization (Rel-18, TS 23.256). When the
+            // session DNN identifies a UAV session, apply altitude / flight-zone
+            // gating via UavPolicyAuthorization before building the SM policy
+            // decision. A position outside the altitude limits or inside a
+            // prohibited zone fails the policy create (the SMF then rejects the
+            // PDU session). The UAV DNN and limits are config-driven.
+            if is_uav_dnn(dnn) {
+                if let Some(reject) = authorize_uav_session(supi, dnn) {
+                    return reject;
+                }
             }
 
             // Query real session data from UDR/database

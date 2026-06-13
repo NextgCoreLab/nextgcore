@@ -675,6 +675,12 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                             if let Some(qfi_val) = q.qfi {
                                 qer.set_qfi(qfi_val);
                             }
+                            if qer.is_xr {
+                                log::info!(
+                                    "Installed XR QER {} (5QI={:?}, DSCP={}, GBR UL/DL={}/{} kbps) for SEID={upf_seid:#x}",
+                                    qer.qer_id, qer.qfi, qer.dscp, qer.ul_gbr, qer.dl_gbr
+                                );
+                            }
                             dp_qers.insert(q.qer_id, qer);
                         }
                         *session.qers.write().unwrap() = dp_qers;
@@ -781,6 +787,12 @@ async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEve
                         qer.set_gbr(q.ul_gbr, q.dl_gbr);
                         if let Some(qfi_val) = q.qfi {
                             qer.set_qfi(qfi_val);
+                        }
+                        if qer.is_xr {
+                            log::info!(
+                                "Updated XR QER {} (5QI={:?}, DSCP={}, GBR UL/DL={}/{} kbps) for SEID={upf_seid:#x}",
+                                qer.qer_id, qer.qfi, qer.dscp, qer.ul_gbr, qer.dl_gbr
+                            );
                         }
                         dp_qers.insert(q.qer_id, qer);
                     }

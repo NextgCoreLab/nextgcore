@@ -503,10 +503,31 @@ async fn handle_smf_deregistration(supi: &str, pdu_session_id: &str) -> SbiRespo
 
 // Subscriber Data Management handlers
 
-async fn handle_get_am_data(supi: &str, _request: &SbiRequest) -> SbiResponse {
-    log::info!("Get AM Data: SUPI={supi}");
+/// Split an optionally SNPN-scoped SUPI into the base SUPI and the SNPN NID.
+///
+/// SNPN-scoped identifiers (Rel-17, TS 23.501 §5.30 / TS 23.003) may carry the
+/// Network Identifier as a `:nid-<NID>` suffix. UDR is keyed by the base SUPI,
+/// so the subscription/credential lookup uses the base while the NID scopes the
+/// SNPN. This is the minimal SNPN-aware lookup: it resolves the standard
+/// subscription for an SNPN SUPI so registration completes. The full
+/// credentials-holder model (separate SNPN credential store / external DCS per
+/// TS 33.501 Annex I) is deferred.
+fn split_snpn_supi(supi: &str) -> (&str, Option<&str>) {
+    match supi.split_once(":nid-") {
+        Some((base, nid)) => (base, Some(nid)),
+        None => (supi, None),
+    }
+}
 
-    // Query UDR for provisioned access and mobility data
+async fn handle_get_am_data(supi: &str, _request: &SbiRequest) -> SbiResponse {
+    let (supi, snpn_nid) = split_snpn_supi(supi);
+    if let Some(nid) = snpn_nid {
+        log::info!("Get AM Data: SUPI={supi} (SNPN NID={nid})");
+    } else {
+        log::info!("Get AM Data: SUPI={supi}");
+    }
+
+    // Query UDR for provisioned access and mobility data (keyed by base SUPI)
     match nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get(supi, "am-data", 0, 0).await {
         Ok(udr_response) if udr_response.is_success() => {
             // Forward UDR response body directly
@@ -1312,6 +1333,20 @@ fn parse_nrf_host_port(uri: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_split_snpn_supi() {
+        // SNPN (Rel-17, TS 23.501 §5.30): a NID-scoped SUPI splits into the
+        // base SUPI (UDR key) and the NID; a plain SUPI is unchanged.
+        assert_eq!(
+            split_snpn_supi("imsi-999700000000001:nid-7AB01234567"),
+            ("imsi-999700000000001", Some("7AB01234567"))
+        );
+        assert_eq!(
+            split_snpn_supi("imsi-999700000000001"),
+            ("imsi-999700000000001", None)
+        );
+    }
 
     #[test]
     fn test_args_default() {

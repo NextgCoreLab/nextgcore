@@ -909,6 +909,71 @@ struct SessionQos {
     qfi: u8,
     ambr_ul_bps: u64,
     ambr_dl_bps: u64,
+    /// When the authorized flow is an XR delay-critical GBR 5QI (82-85), the
+    /// XR flow parameters that drive a dedicated XR QER in the PFCP session.
+    xr_flow: Option<XrSessionFlow>,
+}
+
+/// XR delay-critical GBR flow carried into the PFCP QER/PDR setup.
+struct XrSessionFlow {
+    five_qi: u8,
+    gbr_ul_bps: u64,
+    gbr_dl_bps: u64,
+}
+
+/// Build a `binding::SessionPolicy` from a parsed `PolicyDecision` so the
+/// XR-aware QoS-flow binding can inspect the authorized 5QI/GBR.
+///
+/// The decision's PCC rules carry per-rule 5QI + GBR; when none are present
+/// (config-default), a synthetic rule from the default 5QI is emitted so an XR
+/// default 5QI still produces an XR flow.
+fn decision_to_session_policy(decision: &policy::PolicyDecision) -> binding::SessionPolicy {
+    let mut sp = binding::SessionPolicy::new();
+    let mk_rule = |id: &str, five_qi: u8, arp: u8, gbr_ul: u64, gbr_dl: u64, mbr_ul: u64, mbr_dl: u64| {
+        let mut rule = binding::PccRule::new_5gc_install(id);
+        rule.set_qos(binding::PccQos {
+            qci: five_qi,
+            arp: binding::ArpParams {
+                priority_level: arp,
+                pre_emption_capability: binding::is_xr_5qi(five_qi),
+                pre_emption_vulnerability: false,
+            },
+            mbr: binding::BitRate {
+                uplink: mbr_ul,
+                downlink: mbr_dl,
+            },
+            gbr: binding::BitRate {
+                uplink: gbr_ul,
+                downlink: gbr_dl,
+            },
+        });
+        rule
+    };
+
+    if decision.pcc_rules.is_empty() {
+        sp.add_rule(mk_rule(
+            "default",
+            decision.def_five_qi,
+            decision.arp_priority_level,
+            0,
+            0,
+            decision.sess_ambr_ul_bps,
+            decision.sess_ambr_dl_bps,
+        ));
+    } else {
+        for r in &decision.pcc_rules {
+            sp.add_rule(mk_rule(
+                &r.id,
+                r.five_qi,
+                decision.arp_priority_level,
+                r.gbr_ul_bps.unwrap_or(0),
+                r.gbr_dl_bps.unwrap_or(0),
+                r.mbr_ul_bps.unwrap_or(decision.sess_ambr_ul_bps),
+                r.mbr_dl_bps.unwrap_or(decision.sess_ambr_dl_bps),
+            ));
+        }
+    }
+    sp
 }
 
 /// Send PFCP Session Establishment Request to UPF and return UPF TEID.
@@ -970,6 +1035,34 @@ async fn pfcp_session_establish(
     let qer_bytes = n4_build::build_create_qer(&session_qer);
     builder.add_tlv(pfcp_ie::CREATE_QER, &qer_bytes);
 
+    // Create QER 2 (XR delay-critical GBR, TS 23.501 §5.7.4 / TS 29.244 5.4.1):
+    // when the authorized flow is an XR 5QI (82-85), install a dedicated QER
+    // carrying the guaranteed bit rate so the UPF arms guaranteed-rate buckets
+    // and never starves the XR flow. The XR QFI tags the GTP-U packets for
+    // DSCP marking (EF/AF41) at the UPF. Gates open in both directions.
+    let xr_qer_id: u32 = 2;
+    if let Some(ref xr) = qos.xr_flow {
+        let xr_qer = QerParams {
+            qer_id: xr_qer_id,
+            gate_status: (0, 0),
+            mbr: Some((qos.ambr_ul_bps, qos.ambr_dl_bps)),
+            gbr: Some((xr.gbr_ul_bps, xr.gbr_dl_bps)),
+            qfi: Some(xr.five_qi & 0x3F),
+        };
+        let xr_qer_bytes = n4_build::build_create_qer(&xr_qer);
+        builder.add_tlv(pfcp_ie::CREATE_QER, &xr_qer_bytes);
+        log::info!(
+            "PFCP: installing XR QER {} (5QI={}, GBR UL/DL={}/{} bps)",
+            xr_qer_id,
+            xr.five_qi,
+            xr.gbr_ul_bps,
+            xr.gbr_dl_bps
+        );
+    }
+    // PDRs bind to the XR QER when present, otherwise the Session-AMBR QER.
+    let flow_qer_id = if qos.xr_flow.is_some() { xr_qer_id } else { 1 };
+    let flow_qfi = qos.xr_flow.as_ref().map(|x| x.five_qi & 0x3F).unwrap_or(qos.qfi);
+
     // Create PDR 1 (Uplink): UE -> UPF -> DN
     let ul_pdr = PdrParams {
         pdr_id: 1,
@@ -979,8 +1072,8 @@ async fn pfcp_session_establish(
         ue_ip_address: Some((Some(ue_ip), None, true)), // source
         outer_header_removal: Some(0),                  // GTP-U/UDP/IPv4
         far_id: Some(1),
-        qer_id: Some(1),
-        qfi: Some(qos.qfi),
+        qer_id: Some(flow_qer_id),
+        qfi: Some(flow_qfi),
         ..Default::default()
     };
     let ul_pdr_bytes = n4_build::build_create_pdr(&ul_pdr);
@@ -1003,8 +1096,8 @@ async fn pfcp_session_establish(
         source_interface: 1,                             // Core (TS 29.244 8.2.24)
         ue_ip_address: Some((Some(ue_ip), None, false)), // destination
         far_id: Some(2),
-        qer_id: Some(1),
-        qfi: Some(qos.qfi),
+        qer_id: Some(flow_qer_id),
+        qfi: Some(flow_qfi),
         ..Default::default()
     };
     let dl_pdr_bytes = n4_build::build_create_pdr(&dl_pdr);
@@ -1449,6 +1542,10 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     }
     let serving_nf_id = req_body["servingNfId"].as_str().unwrap_or("");
     let rat_type = req_body["ratType"].as_str().unwrap_or("NR");
+    // RedCap (Reduced Capability) UE indication (Rel-17, TS 29.502): drives a
+    // reduced session-AMBR cap below so a RedCap device's data path is policed
+    // to its narrowband capability.
+    let redcap_indication = req_body["redcapIndication"].as_bool().unwrap_or(false);
     let guami = &req_body["guami"];
     let serving_network = &req_body["servingNetwork"];
     log::info!(
@@ -1580,15 +1677,18 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         self_sbi_uri(),
         sm_context_ref
     );
-    let decision = match policy::resolve_pcf_endpoint().await {
+    let mut decision = match policy::resolve_pcf_endpoint().await {
         None => {
             // Documented config-default fallback: no PCF configured.
             log::warn!(
                 "No PCF configured (PCF_URI / NRF) — applying config-default policy \
-                 (5QI=9, AMBR 100/100 Mbps)"
+                 (DNN-derived 5QI, AMBR 100/100 Mbps)"
             );
             fsm.transition_to(gsm_sm::GsmState::WaitPfcpEstablishment);
-            policy::PolicyDecision::config_default()
+            // DNN-aware default: an XR DNN (e.g. "xr") yields a delay-critical
+            // GBR XR 5QI (82-85) with a populated PCC rule, exercising the
+            // XR-aware QoS-flow binding + PFCP QER setup below even without a PCF.
+            policy::PolicyDecision::config_default_for_dnn(&dnn)
         }
         Some(pcf) => {
             let create_ctx = policy::SmPolicyCreateContext {
@@ -1646,11 +1746,83 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         }
     };
 
+    // ---- RedCap session-AMBR reduction (Rel-17, TS 23.501 §5.7.1) ----
+    // A RedCap UE's narrowband RF cannot sustain a normal-UE session-AMBR, so
+    // cap the authorized Session-AMBR to the configured RedCap ceiling. This
+    // single reduction propagates to the N1 PDU Session Establishment Accept,
+    // the PFCP QER MBR (and thus the UPF data-plane policing), and the stored
+    // policy binding below — no separate enforcement site needed.
+    if redcap_indication {
+        // RedCap session-AMBR ceiling (TS 38.101-1 RedCap peak-rate envelope):
+        // 150 Mbps DL / 50 Mbps UL. Configurable via REDCAP_SESS_AMBR_*_BPS.
+        let redcap_dl_cap = std::env::var("REDCAP_SESS_AMBR_DL_BPS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(150_000_000);
+        let redcap_ul_cap = std::env::var("REDCAP_SESS_AMBR_UL_BPS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(50_000_000);
+
+        let orig_dl = decision.sess_ambr_dl_bps;
+        let orig_ul = decision.sess_ambr_ul_bps;
+        // A zero AMBR means "unset/unlimited" in the authorized policy; treat
+        // it as exceeding the cap so the RedCap ceiling still applies.
+        decision.sess_ambr_dl_bps = if orig_dl == 0 {
+            redcap_dl_cap
+        } else {
+            orig_dl.min(redcap_dl_cap)
+        };
+        decision.sess_ambr_ul_bps = if orig_ul == 0 {
+            redcap_ul_cap
+        } else {
+            orig_ul.min(redcap_ul_cap)
+        };
+
+        log::info!(
+            "RedCap UE: session-AMBR reduced from UL/DL {}/{} to {}/{} bps \
+             (RedCap cap UL/DL {}/{} bps)",
+            orig_ul,
+            orig_dl,
+            decision.sess_ambr_ul_bps,
+            decision.sess_ambr_dl_bps,
+            redcap_ul_cap,
+            redcap_dl_cap,
+        );
+    }
+
     let qfi = decision.default_qfi();
+
+    // ---- XR-aware QoS flow binding (TS 23.501 §5.7.4, Rel-18) ----
+    // Run the XR-aware binding over the authorized policy. When the authorized
+    // default 5QI or any installed PCC rule is an XR delay-critical GBR 5QI
+    // (82-85), this yields XR flow metadata (delay budget, GBR) that drives a
+    // dedicated XR QER in the PFCP session below. For non-XR sessions the
+    // metadata is empty and the default Session-AMBR QER is used unchanged.
+    let xr_policy = decision_to_session_policy(&decision);
+    let (_xr_results, _xr_flags, xr_meta) =
+        binding::process_xr_qos_flow_binding(&xr_policy, &[]);
+    let xr_flow = xr_meta.into_iter().next();
+    if let Some(ref xr) = xr_flow {
+        log::info!(
+            "XR QoS flow bound: 5QI={}, PDB={}ms, GBR UL/DL={}/{} bps, PDB-enforcement={}",
+            xr.five_qi,
+            xr.delay_budget_ms,
+            xr.gbr_ul_bps,
+            xr.gbr_dl_bps,
+            xr.requires_pdb_enforcement
+        );
+    }
+
     let session_qos = SessionQos {
         qfi,
         ambr_ul_bps: decision.sess_ambr_ul_bps,
         ambr_dl_bps: decision.sess_ambr_dl_bps,
+        xr_flow: xr_flow.map(|xr| XrSessionFlow {
+            five_qi: xr.five_qi,
+            gbr_ul_bps: xr.gbr_ul_bps,
+            gbr_dl_bps: xr.gbr_dl_bps,
+        }),
     };
 
     // ---- N4: PFCP Session Establishment with policy-derived QoS ----

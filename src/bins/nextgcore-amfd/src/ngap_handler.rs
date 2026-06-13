@@ -4,6 +4,7 @@
 
 use crate::context::{
     AmfContext, AmfGnb, NgapCause, NgapUeCtxRelAction, NrCgi, PlmnId, RanUe, SNssai, SupportedTa,
+    UavAuthorizationContext,
     Tai5gs,
 };
 use crate::sbi_path;
@@ -863,11 +864,18 @@ pub struct UavTrackingReport {
 }
 
 /// Handle UAV Tracking Report (Rel-18 TS 23.256)
-/// Processes position updates from UAV UEs and checks geofence violations
+///
+/// Processes a position update from a UAV UE and checks it against the UAV
+/// authorization context's geofence. Returns `true` when the position is
+/// allowed (within the geofence and still authorized) and `false` on a
+/// geofence violation; on a violation the caller revokes authorization and
+/// notifies the USS/UTM and PCF. This is invoked from the live NGAP uplink
+/// dispatch (see `ngap_path::handle_uav_tracking_report_nas`).
 pub fn handle_uav_tracking_report(
-    ran_ue: &mut RanUe,
+    uav_auth: &mut UavAuthorizationContext,
     report: &UavTrackingReport,
-) -> NgapHandlerResult {
+    now: u64,
+) -> bool {
     log::info!(
         "[UAV Tracking] Report received: UAV ID={}, position=({:.6}, {:.6}), altitude={:.1}m, status={}",
         report.uav_id,
@@ -877,32 +885,26 @@ pub fn handle_uav_tracking_report(
         report.flight_status
     );
 
-    // Verify NGAP IDs match
-    if ran_ue.amf_ue_ngap_id != report.amf_ue_ngap_id {
-        log::warn!(
-            "[UAV Tracking] AMF UE NGAP ID mismatch: expected {}, got {}",
-            ran_ue.amf_ue_ngap_id,
-            report.amf_ue_ngap_id
-        );
-        return NgapHandlerResult::Success;
-    }
-
-    // In production, this would:
-    // 1. Retrieve AMF UE context and UAV authorization context
-    // 2. Call uav_auth_ctx.update_position() to check geofence violations
-    // 3. If violation detected, trigger authorization revocation and notify PCF
-    // 4. Log position update for flight path tracking
-    // 5. Forward position to LCS/GMLC if location services are subscribed
-
-    log::info!(
-        "[UAV Tracking] Position update processed for UAV ID={} at ({:.6}, {:.6}), alt={:.1}m",
-        report.uav_id,
+    // Run the geofence: update_position returns true when within bounds.
+    let within_bounds = uav_auth.update_position(
         report.latitude,
         report.longitude,
-        report.altitude
+        report.altitude,
+        report.timestamp,
     );
 
-    NgapHandlerResult::Success
+    if within_bounds && uav_auth.is_authorized(now) {
+        log::info!(
+            "[UAV Tracking] Position update processed for UAV ID={} at ({:.6}, {:.6}), alt={:.1}m",
+            report.uav_id,
+            report.latitude,
+            report.longitude,
+            report.altitude
+        );
+        true
+    } else {
+        false
+    }
 }
 
 // ============================================================================

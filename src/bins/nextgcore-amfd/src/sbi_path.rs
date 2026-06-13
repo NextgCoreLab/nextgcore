@@ -751,13 +751,18 @@ pub async fn call_smf_create_sm_context(
     sd: Option<u32>,
     dnn: &str,
     n1_sm_msg_from_ue: &[u8],
+    redcap_indication: bool,
 ) -> SbiResult<SmContextCreateResponse> {
     log::info!(
-        "Calling SMF SM Context Create: {smf_host}:{smf_port}, PSI={pdu_session_id}, SST={sst}, DNN={dnn}"
+        "Calling SMF SM Context Create: {smf_host}:{smf_port}, PSI={pdu_session_id}, SST={sst}, \
+         DNN={dnn}, redcap={redcap_indication}"
     );
 
     let client = SbiClient::with_host_port(smf_host, smf_port);
 
+    // redcapIndication propagates the UE's Reduced-Capability status to the SMF
+    // (TS 29.502 SmContextCreateData) so the SMF can apply a reduced
+    // session-AMBR for RedCap devices (Rel-17).
     let body = serde_json::json!({
         "pduSessionId": pdu_session_id,
         "sNssai": {
@@ -766,6 +771,7 @@ pub async fn call_smf_create_sm_context(
         },
         "dnn": dnn,
         "n1SmMsg": base64::engine::general_purpose::STANDARD.encode(n1_sm_msg_from_ue),
+        "redcapIndication": redcap_indication,
         "servingNetwork": {
             "mcc": "001",
             "mnc": "01"

@@ -596,6 +596,12 @@ pub fn qfi_to_dscp(qfi: u8) -> u8 {
     }
 }
 
+/// Whether a 5QI/QFI is an XR delay-critical GBR type (82-85, Rel-18,
+/// TS 23.501 Table 5.7.4-1).
+pub fn is_xr_5qi(qfi: u8) -> bool {
+    (82..=85).contains(&qfi)
+}
+
 /// Apply DSCP marking to an IP packet's TOS/Traffic Class field.
 pub fn apply_dscp_to_ip_packet(packet: &mut [u8], dscp: u8) -> bool {
     if packet.is_empty() {
@@ -692,6 +698,10 @@ pub struct DataPlaneQer {
     pub qfi: Option<u8>,
     /// DSCP value for outer GTP-U IP header (computed from QFI)
     pub dscp: u8,
+    /// True when this QER carries an XR delay-critical GBR 5QI (82-85,
+    /// TS 23.501 Table 5.7.4-1, Rel-18). XR flows are GBR-guaranteed and
+    /// must never be silently gate-dropped on the guaranteed share.
+    pub is_xr: bool,
     /// MBR policing bucket (uplink); None = unlimited
     ul_mbr_bucket: std::sync::Mutex<Option<TokenBucket>>,
     /// MBR policing bucket (downlink); None = unlimited
@@ -709,6 +719,7 @@ impl Clone for DataPlaneQer {
         qer.dl_gate_open = self.dl_gate_open;
         qer.qfi = self.qfi;
         qer.dscp = self.dscp;
+        qer.is_xr = self.is_xr;
         qer.set_mbr(self.ul_mbr, self.dl_mbr);
         qer.set_gbr(self.ul_gbr, self.dl_gbr);
         qer
@@ -727,6 +738,7 @@ impl DataPlaneQer {
             dl_gbr: 0,
             qfi: None,
             dscp: 0,
+            is_xr: false,
             ul_mbr_bucket: std::sync::Mutex::new(None),
             dl_mbr_bucket: std::sync::Mutex::new(None),
             ul_gbr_bucket: std::sync::Mutex::new(None),
@@ -734,10 +746,12 @@ impl DataPlaneQer {
         }
     }
 
-    /// Set QFI and automatically compute DSCP mapping.
+    /// Set QFI and automatically compute DSCP mapping. Also flags the QER as
+    /// XR when the QFI corresponds to an XR delay-critical GBR 5QI (82-85).
     pub fn set_qfi(&mut self, qfi: u8) {
         self.qfi = Some(qfi);
         self.dscp = qfi_to_dscp(qfi);
+        self.is_xr = is_xr_5qi(qfi);
     }
 
     /// Set MBR (kbps) and arm the policing token buckets.
@@ -794,6 +808,12 @@ impl DataPlaneQer {
                 }
                 return true;
             }
+        } else if self.is_xr {
+            // XR delay-critical GBR flow installed without a provisioned GBR
+            // bucket: never silently drop it on the guaranteed share — fall
+            // through to MBR policing (or unlimited) rather than treating it
+            // as best-effort with no guarantee.
+            log::trace!("XR QER {} has no GBR bucket; relying on MBR policing", self.qer_id);
         }
 
         // Above GBR (or no GBR): police against MBR
@@ -3319,6 +3339,37 @@ mod tests {
         assert!(qer.check_rate(1000, true));
         // GBR bucket nearly empty; MBR also consumed — large packet dropped
         assert!(!qer.check_rate(5000, true));
+    }
+
+    #[test]
+    fn test_qer_xr_qfi_flags_and_dscp() {
+        // XR 5QI (82-85) flags the QER as XR and applies an EF/AF41 DSCP.
+        let mut xr = DataPlaneQer::new(2);
+        xr.set_qfi(82);
+        assert!(xr.is_xr);
+        assert_eq!(xr.dscp, 46); // EF
+        let mut xr_split = DataPlaneQer::new(3);
+        xr_split.set_qfi(84);
+        assert!(xr_split.is_xr);
+        assert_eq!(xr_split.dscp, 34); // AF41
+
+        // A non-XR 5QI is not flagged.
+        let mut be = DataPlaneQer::new(1);
+        be.set_qfi(9);
+        assert!(!be.is_xr);
+        assert!(is_xr_5qi(85));
+        assert!(!is_xr_5qi(9));
+    }
+
+    #[test]
+    fn test_xr_qer_gbr_guaranteed_share_passes() {
+        // An XR delay-critical GBR flow forwards its guaranteed share.
+        let mut xr = DataPlaneQer::new(2);
+        xr.set_qfi(82);
+        xr.set_mbr(1000, 1000);
+        xr.set_gbr(500, 500);
+        assert!(xr.is_xr);
+        assert!(xr.check_rate(1000, false));
     }
 
     #[test]

@@ -53,6 +53,12 @@ pub mod message_type {
     pub const NOTIFICATION_RESPONSE: u8 = 0x66;
     pub const UL_NAS_TRANSPORT: u8 = 0x67;
     pub const DL_NAS_TRANSPORT: u8 = 0x68;
+    /// UAV tracking report (Rel-18, TS 23.256). AMF-private 5GMM message type
+    /// for a UE-originated UAV position / Remote-ID report. 3GPP does not
+    /// assign a UE-originated tracking-report 5GMM message type, so this uses
+    /// an unassigned code kept in sync with the nextgsim UE
+    /// (`UAV_TRACKING_REPORT_MSG_TYPE`).
+    pub const UAV_TRACKING_REPORT: u8 = 0x6a;
 }
 
 /// 5GMM cause codes

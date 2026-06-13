@@ -1100,6 +1100,16 @@ impl NgapServer {
                 let cause = inner.get(3).copied().unwrap_or(0);
                 log::warn!("5GMM Status from UE {}: cause #{cause}", ul_nas.amf_ue_ngap_id);
             }
+            message_type::UAV_TRACKING_REPORT => {
+                // UAV tracking report (Rel-18, TS 23.256): an aerial UE's
+                // position / Remote-ID report. Run the geofence against the
+                // stored UAV authorization context.
+                self.handle_uav_tracking_report_nas(
+                    ul_nas.amf_ue_ngap_id,
+                    ul_nas.ran_ue_ngap_id,
+                    &inner,
+                );
+            }
             other => {
                 log::warn!("Unhandled 5GMM message type 0x{other:02x}");
             }
@@ -1112,6 +1122,82 @@ impl NgapServer {
         }
 
         Ok(())
+    }
+
+    /// Handle a UAV tracking report (Rel-18, TS 23.256).
+    ///
+    /// Parses the UE-originated position report (CAA-level ID + lat/lon/alt +
+    /// flight status, see the nextgsim UE `build_uav_tracking_report`) and runs
+    /// it through the stored UAV authorization context's geofence. A position
+    /// inside the geofence is allowed; an altitude or area violation produces a
+    /// deny and revokes the flight authorization (TS 23.256: the network
+    /// withdraws UAV authorization on a geofence breach).
+    fn handle_uav_tracking_report_nas(
+        &mut self,
+        amf_ue_ngap_id: u64,
+        ran_ue_ngap_id: u32,
+        inner: &[u8],
+    ) {
+        let Some(report) = parse_uav_tracking_report(amf_ue_ngap_id, ran_ue_ngap_id, inner) else {
+            log::warn!("Malformed UAV tracking report from UE {amf_ue_ngap_id}; discarding");
+            return;
+        };
+
+        // Dispatch to the NGAP-layer tracking-report handler for logging /
+        // bookkeeping (it verifies the NGAP IDs and records the position).
+        log::info!(
+            "[UAV Tracking] Dispatching report from UE {amf_ue_ngap_id} to handler: \
+             CAA-ID={}, pos=({:.6}, {:.6}), alt={:.1}m, status={}",
+            report.uav_id,
+            report.latitude,
+            report.longitude,
+            report.altitude,
+            report.flight_status
+        );
+
+        let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) else {
+            log::warn!("UAV tracking report from unknown UE {amf_ue_ngap_id}; discarding");
+            return;
+        };
+        let Some(uav) = state.amf_ue.uav_auth.as_mut() else {
+            log::warn!(
+                "UAV tracking report from UE {amf_ue_ngap_id} that is not UAV-authorized; \
+                 discarding (no UAV authorization context)"
+            );
+            return;
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(report.timestamp);
+
+        // Geofence check via the NGAP-layer UAV handler: returns true when the
+        // position is within bounds and still authorized (allow), false on an
+        // altitude/area violation or expired authorization (deny).
+        let allowed = crate::ngap_handler::handle_uav_tracking_report(uav, &report, now);
+        if allowed {
+            log::info!(
+                "[UAV Tracking] Geofence ALLOW: UAV {} at ({:.6}, {:.6}) alt={:.1}m within bounds",
+                report.uav_id,
+                report.latitude,
+                report.longitude,
+                report.altitude
+            );
+        } else {
+            log::warn!(
+                "[UAV Tracking] Geofence DENY: UAV {} at ({:.6}, {:.6}) alt={:.1}m violates \
+                 flight authorization; revoking",
+                report.uav_id,
+                report.latitude,
+                report.longitude,
+                report.altitude
+            );
+            uav.revoke_authorization("geofence violation");
+            // TS 23.256: a real deployment would notify the USS/UTM and PCF of
+            // the withdrawn authorization here (documented stub).
+            notify_uss_authorization(&report.uav_id, "REVOKED");
+        }
     }
 
     /// Handle a (plain) Registration Request NAS PDU
@@ -1139,6 +1225,20 @@ impl NgapServer {
             req.identity_type,
             req.suci
         );
+
+        // MINT (Rel-18, TS 23.761 §4.2): a UE may register more than one
+        // subscription (multi-SUPI). Each distinct registration arrives with
+        // its own RAN/AMF UE NGAP ID and is handled as a separate AMF UE
+        // context with its own 5G-GUTI — the second SUPI is NOT rejected. The
+        // disaster-roaming indication, when present, marks the registration for
+        // minimization-of-service-interruption handling.
+        if req.disaster_roaming {
+            log::info!(
+                "MINT disaster-roaming indication present (amf_ue_ngap_id={amf_ue_ngap_id}, \
+                 suci={:?}); accepting as a distinct multi-SUPI registration",
+                req.suci
+            );
+        }
 
         // Periodic registration updating with live security context: refresh
         if req.registration_type == crate::gmm_build::registration_type::PERIODIC_UPDATING {
@@ -1201,10 +1301,70 @@ impl NgapServer {
                     return Ok(());
                 };
                 state.suci = suci.clone();
-                state.amf_ue.suci = Some(suci);
+                state.amf_ue.suci = Some(suci.clone());
                 if let Some(plmn) = req.plmn {
                     state.amf_ue.home_plmn_id = plmn;
                 }
+
+                // SNPN access authorization (Rel-17, TS 23.501 §5.30 / TS 24.501).
+                // When the UE advertised an SNPN NID, validate it against the
+                // AMF's configured allowed-NID list. A non-allowed NID is
+                // rejected with the SNPN-specific 5GMM cause (#75, permanently
+                // not authorized for this SNPN). An allowed NID drives the
+                // SNPN auth context; an onboarding SUCI drives onboarding.
+                if let Some(ref nid) = req.snpn_nid {
+                    let allowed_nids = snpn_allowed_nids();
+                    if !state.amf_ue.validate_nid(nid, &allowed_nids) {
+                        log::warn!(
+                            "SNPN registration rejected: NID={nid} not in allowed list {allowed_nids:?}"
+                        );
+                        let reject = gmm_build::build_registration_reject(
+                            GmmCause::PermanentlyNotAuthorized,
+                        );
+                        self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                            .await?;
+                        self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                            .await?;
+                        return Ok(());
+                    }
+                    if is_snpn_onboarding_suci(&suci) {
+                        // Onboarding SUCI (TS 23.003): provision initial
+                        // credentials via the SNPN onboarding flow.
+                        let creds = crate::context::SnpnSubscriptionCredentials::default();
+                        state.amf_ue.handle_snpn_onboarding(nid, creds);
+                        log::info!("SNPN onboarding registration accepted for NID={nid}");
+                    } else {
+                        state.amf_ue.start_snpn_auth(nid);
+                        log::info!("SNPN registration authorized for NID={nid}");
+                    }
+                }
+
+                // UAV flight authorization (Rel-18, TS 23.256). When the UE
+                // registered as an aerial UE, create and grant a UAV
+                // authorization context with the AMF's configured geofence so
+                // subsequent UAV tracking reports are checked against it. UTM /
+                // USS authorization is represented by the local grant here; an
+                // external USS interface is a documented stub (see
+                // `notify_uss_authorization`).
+                if let Some(ref caa_id) = req.uav_indication {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let mut uav = crate::context::UavAuthorizationContext::new(caa_id, &suci);
+                    let (min_lat, max_lat, min_lon, max_lon, min_alt, max_alt) =
+                        uav_geofence_config();
+                    uav.set_geofence(min_lat, max_lat, min_lon, max_lon, min_alt, max_alt);
+                    // Authorize for a 1-hour flight window from now.
+                    uav.grant_authorization(now, now + 3600);
+                    notify_uss_authorization(caa_id, &suci);
+                    log::info!(
+                        "UAV registration: aerial UE authorized (CAA-ID={caa_id}); geofence \
+                         lat=[{min_lat},{max_lat}] lon=[{min_lon},{max_lon}] alt=[{min_alt},{max_alt}]"
+                    );
+                    state.amf_ue.uav_auth = Some(uav);
+                }
+
                 self.start_authentication(association_id, amf_ue_ngap_id, ran_ue_ngap_id, None)
                     .await?;
             }
@@ -2201,8 +2361,17 @@ impl NgapServer {
                     .unwrap_or((1, None));
                 let dnn = "internet";
 
+                // RedCap indication: propagate the UE's Reduced-Capability
+                // status (parsed at registration in gmm_handler) to the SMF so
+                // it can apply a reduced session-AMBR (Rel-17, TS 38.101).
+                let redcap_indication = self
+                    .ue_auth_state
+                    .get(&amf_ue_ngap_id)
+                    .map(|s| s.amf_ue.redcap_indication)
+                    .unwrap_or(false);
+
                 match crate::sbi_path::call_smf_create_sm_context(
-                    &smf_host, smf_port, psi, sst, sd, dnn, sm_pdu,
+                    &smf_host, smf_port, psi, sst, sd, dnn, sm_pdu, redcap_indication,
                 )
                 .await
                 {
@@ -2923,6 +3092,79 @@ struct ParsedRegistrationRequest {
     plmn: Option<PlmnId>,
     sec_cap: Option<UeSecurityCapability>,
     requested_nssai: Vec<SNssai>,
+    /// SNPN NID (Rel-17, TS 23.501 §5.30) included by the UE, if any.
+    snpn_nid: Option<String>,
+    /// MINT disaster-roaming indication (Rel-18, TS 23.761 §4.2). Set when the
+    /// UE requests disaster-roaming / minimization-of-service-interruption
+    /// handling for this (e.g. secondary multi-SUPI) registration.
+    disaster_roaming: bool,
+    /// UAV indication (Rel-18, TS 23.256). `Some(caa_id)` when the UE
+    /// registered as an aerial UE; the AMF then creates a UAV flight
+    /// authorization (geofence) context. The string is the UAV CAA-level ID
+    /// (may be empty when only the aerial-UE capability is signalled).
+    uav_indication: Option<String>,
+}
+
+/// SNPN allowed-NID list for this AMF (Rel-17, TS 23.501 §5.30).
+///
+/// Read from `AMF_SNPN_ALLOWED_NIDS` as a comma-separated list of 11-hex-char
+/// NIDs. Empty/unset means no NID restriction (accept any SNPN NID), matching
+/// `AmfUe::validate_nid`'s empty-list semantics. Sourcing from an env var keeps
+/// the SNPN gate modular and consistent with the AMF's other runtime config.
+fn snpn_allowed_nids() -> Vec<String> {
+    std::env::var("AMF_SNPN_ALLOWED_NIDS")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// UAV geofence configuration for this AMF (Rel-18, TS 23.256).
+///
+/// Returns `(min_lat, max_lat, min_lon, max_lon, min_alt, max_alt)` read from
+/// `AMF_UAV_GEOFENCE` as six comma-separated decimals. Defaults to a permissive
+/// area capped at 120 m altitude (the common regulatory ceiling) when unset, so
+/// a UAV reporting above 120 m or outside the area triggers a geofence deny.
+/// Sourcing from an env var keeps the UAV gate modular and consistent with the
+/// AMF's other runtime config (e.g. `AMF_SNPN_ALLOWED_NIDS`).
+fn uav_geofence_config() -> (f64, f64, f64, f64, f64, f64) {
+    let default = (37.0_f64, 38.0_f64, -123.0_f64, -122.0_f64, 0.0_f64, 120.0_f64);
+    let Ok(raw) = std::env::var("AMF_UAV_GEOFENCE") else {
+        return default;
+    };
+    let vals: Vec<f64> = raw
+        .split(',')
+        .filter_map(|s| s.trim().parse::<f64>().ok())
+        .collect();
+    if vals.len() == 6 {
+        (vals[0], vals[1], vals[2], vals[3], vals[4], vals[5])
+    } else {
+        default
+    }
+}
+
+/// Notify the UTM / USS (UAS Service Supplier) of a UAV authorization
+/// (Rel-18, TS 23.256). The external USS / UTM interface (e.g. over the UAV
+/// flight authorization API) is a documented stub in this stack: it logs the
+/// authorization rather than calling an external NF. Replace with a real USS
+/// client when the UTM interface is productionized.
+fn notify_uss_authorization(caa_id: &str, suci: &str) {
+    log::info!(
+        "[UAV UTM stub] USS authorization accepted (stub): CAA-ID={caa_id}, SUCI={suci}"
+    );
+}
+
+/// Whether a SUCI belongs to an SNPN onboarding subscription (TS 23.003).
+///
+/// Onboarding SUPIs use the reserved onboarding routing/credential indicator;
+/// a minimal heuristic flags the configured onboarding marker. Replace with the
+/// full onboarding-SUCI parse when onboarding credentials are productionized.
+fn is_snpn_onboarding_suci(suci: &str) -> bool {
+    suci.contains("onboarding")
 }
 
 /// Parse a plain Registration Request NAS PDU
@@ -2990,6 +3232,49 @@ fn parse_registration_request_pdu(nas: &[u8]) -> Option<ParsedRegistrationReques
                 }
                 pos += 2 + len;
             }
+            // SNPN NID (IEI 0xA6, TLV): UE-included SNPN Network Identifier
+            // (Rel-17, TS 23.501 §5.30). Parse before the generic Type-1 arm.
+            0xA6 => {
+                if pos + 1 >= nas.len() {
+                    break;
+                }
+                let len = nas[pos + 1] as usize;
+                if pos + 2 + len <= nas.len() {
+                    if let Ok(nid) = std::str::from_utf8(&nas[pos + 2..pos + 2 + len]) {
+                        req.snpn_nid = Some(nid.to_string());
+                    }
+                }
+                pos += 2 + len;
+            }
+            // MINT disaster-roaming indication (IEI 0xA7, TLV): Rel-18,
+            // TS 23.761 §4.2. A single value octet whose bit 1 is the
+            // disaster-roaming flag. Parse before the generic Type-1 arm.
+            0xA7 => {
+                if pos + 1 >= nas.len() {
+                    break;
+                }
+                let len = nas[pos + 1] as usize;
+                if len >= 1 && pos + 2 + len <= nas.len() {
+                    req.disaster_roaming = nas[pos + 2] & 0x01 == 0x01;
+                }
+                pos += 2 + len;
+            }
+            // UAV indication (IEI 0xA8, TLV): Rel-18, TS 23.256. Flags octet
+            // (bit 1 = aerial UE) followed by the UAV CAA-level ID string.
+            // Parse before the generic Type-1 arm.
+            0xA8 => {
+                if pos + 1 >= nas.len() {
+                    break;
+                }
+                let len = nas[pos + 1] as usize;
+                if len >= 1 && pos + 2 + len <= nas.len() && nas[pos + 2] & 0x01 == 0x01 {
+                    let caa_id = std::str::from_utf8(&nas[pos + 3..pos + 2 + len])
+                        .unwrap_or("")
+                        .to_string();
+                    req.uav_indication = Some(caa_id);
+                }
+                pos += 2 + len;
+            }
             // Last visited registered TAI (IEI 0x52, TV, 7 bytes total)
             0x52 => pos += 7,
             // TLV-E IEs (2-byte length): EPS NAS container (0x70),
@@ -3016,6 +3301,48 @@ fn parse_registration_request_pdu(nas: &[u8]) -> Option<ParsedRegistrationReques
     }
 
     Some(req)
+}
+
+/// Parse a UAV tracking report NAS PDU (Rel-18, TS 23.256).
+///
+/// Layout (matching the nextgsim UE `build_uav_tracking_report`): 5GMM header
+/// (EPD, sec-hdr, msg-type = 3 octets), then a length-prefixed CAA-level ID,
+/// then latitude/longitude as i32 1e-7-degree fixed point, altitude as i32
+/// 0.1 m fixed point, and a flight-status octet.
+fn parse_uav_tracking_report(
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    inner: &[u8],
+) -> Option<crate::ngap_handler::UavTrackingReport> {
+    // 3-octet header + 1-octet ID length
+    if inner.len() < 4 {
+        return None;
+    }
+    let id_len = inner[3] as usize;
+    let pos = 4 + id_len;
+    // CAA ID + 4 (lat) + 4 (lon) + 4 (alt) + 1 (status)
+    if inner.len() < pos + 13 {
+        return None;
+    }
+    let uav_id = std::str::from_utf8(&inner[4..4 + id_len]).ok()?.to_string();
+    let lat_raw = i32::from_be_bytes(inner[pos..pos + 4].try_into().ok()?);
+    let lon_raw = i32::from_be_bytes(inner[pos + 4..pos + 8].try_into().ok()?);
+    let alt_raw = i32::from_be_bytes(inner[pos + 8..pos + 12].try_into().ok()?);
+    let flight_status = inner[pos + 12];
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Some(crate::ngap_handler::UavTrackingReport {
+        amf_ue_ngap_id,
+        ran_ue_ngap_id: ran_ue_ngap_id as u64,
+        uav_id,
+        latitude: lat_raw as f64 / 1e7,
+        longitude: lon_raw as f64 / 1e7,
+        altitude: alt_raw as f64 / 10.0,
+        timestamp,
+        flight_status,
+    })
 }
 
 /// Parse an NSSAI IE value into S-NSSAIs (TS 24.501 Section 9.11.3.37)
@@ -3340,6 +3667,38 @@ mod tests {
         assert_eq!(cap.ia, 0xF0);
         assert_eq!(req.requested_nssai.len(), 1);
         assert_eq!(req.requested_nssai[0].sst, 1);
+    }
+
+    #[test]
+    fn test_parse_registration_request_snpn_nid() {
+        // SNPN (Rel-17, TS 23.501 §5.30): the AMF parser extracts the NID IE.
+        let mut nas = sample_registration_request();
+        let nid = b"7AB01234567";
+        nas.push(0xA6); // SNPN NID IEI
+        nas.push(nid.len() as u8);
+        nas.extend_from_slice(nid);
+
+        let req = parse_registration_request_pdu(&nas).expect("parse");
+        assert_eq!(req.snpn_nid.as_deref(), Some("7AB01234567"));
+        // The other IEs still parse correctly after the NID IE.
+        assert_eq!(req.requested_nssai.len(), 1);
+    }
+
+    #[test]
+    fn test_snpn_allowed_nids_and_validation() {
+        // Empty allowed list accepts any NID (validate_nid empty-list semantics).
+        let amf_ue = AmfUe::new(1, 1);
+        assert!(amf_ue.validate_nid("7AB01234567", &[]));
+        // Non-empty list gates on membership.
+        let allowed = vec!["7AB01234567".to_string()];
+        assert!(amf_ue.validate_nid("7AB01234567", &allowed));
+        assert!(!amf_ue.validate_nid("FFFFFFFFFFF", &allowed));
+    }
+
+    #[test]
+    fn test_is_snpn_onboarding_suci() {
+        assert!(is_snpn_onboarding_suci("suci-0-999-70-onboarding-1"));
+        assert!(!is_snpn_onboarding_suci("suci-0-999-70-0-0-1"));
     }
 
     #[test]
