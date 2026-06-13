@@ -22,9 +22,7 @@ use clap::Parser;
 use ogs_sbi::client::{SbiClient, SbiClientConfig};
 use ogs_sbi::context::global_context;
 use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::server::{
-    send_method_not_allowed, SbiServer, SbiServerConfig as OgsSbiServerConfig,
-};
+use ogs_sbi::server::{send_method_not_allowed, SbiServer, SbiServerConfig as OgsSbiServerConfig};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -375,11 +373,7 @@ fn parse_ac_request(
     ))
 }
 
-fn admission_response(
-    s_nssai: &SNssai,
-    supi: &str,
-    result: AdmissionResult,
-) -> SbiResponse {
+fn admission_response(s_nssai: &SNssai, supi: &str, result: AdmissionResult) -> SbiResponse {
     let body = match result {
         AdmissionResult::Admitted => serde_json::json!({
             "admittedFlag": true,
@@ -419,7 +413,11 @@ async fn handle_ue_ac_update(snssai_seg: &str, request: &SbiRequest) -> SbiRespo
                 .unwrap_or((AdmissionResult::RejectedSliceNotAvailable, None));
             match result {
                 AdmissionResult::Admitted => {
-                    log::info!("[{supi}] admitted to S-NSSAI[SST:{} SD:{:?}]", s_nssai.sst, s_nssai.sd)
+                    log::info!(
+                        "[{supi}] admitted to S-NSSAI[SST:{} SD:{:?}]",
+                        s_nssai.sst,
+                        s_nssai.sd
+                    )
                 }
                 _ => log::warn!(
                     "[{supi}] NOT admitted to S-NSSAI[SST:{} SD:{:?}]: {result:?}",
@@ -546,8 +544,7 @@ async fn handle_slice_quota_create(request: &SbiRequest) -> SbiResponse {
         .and_then(|v| v.as_u64())
         .unwrap_or(50000);
 
-    let quota =
-        with_nsacf_context(|c| c.quota_add(s_nssai.clone(), max_ues, max_pdu)).flatten();
+    let quota = with_nsacf_context(|c| c.quota_add(s_nssai.clone(), max_ues, max_pdu)).flatten();
 
     match quota {
         Some(quota) => {
@@ -612,8 +609,7 @@ async fn handle_slice_quota_get(quota_id: &str) -> SbiResponse {
         .strip_prefix("quota-")
         .and_then(|s| s.parse::<u64>().ok());
 
-    let quota =
-        pool_id.and_then(|id| with_nsacf_context(|c| c.quota_find_by_id(id)).flatten());
+    let quota = pool_id.and_then(|id| with_nsacf_context(|c| c.quota_find_by_id(id)).flatten());
 
     match quota {
         Some(quota) => SbiResponse::with_status(200)
@@ -759,7 +755,10 @@ async fn handle_slice_ee_subscribe(request: &SbiRequest) -> SbiResponse {
         notification_uri: notification_uri.expect("checked above").to_string(),
         events: events.clone(),
         snssais,
-        expiry: data.get("expiry").and_then(|v| v.as_str()).map(String::from),
+        expiry: data
+            .get("expiry")
+            .and_then(|v| v.as_str())
+            .map(String::from),
     };
     with_nsacf_context(|c| c.subscription_add(sub));
 
@@ -783,8 +782,7 @@ async fn handle_slice_ee_subscribe(request: &SbiRequest) -> SbiResponse {
 async fn handle_slice_ee_unsubscribe(subscription_id: &str) -> SbiResponse {
     log::info!("SliceEventExposure Unsubscribe: {subscription_id}");
 
-    let removed =
-        with_nsacf_context(|c| c.subscription_remove(subscription_id)).unwrap_or(false);
+    let removed = with_nsacf_context(|c| c.subscription_remove(subscription_id)).unwrap_or(false);
 
     if removed {
         SbiResponse::with_status(204)
@@ -834,7 +832,10 @@ async fn deliver_notification(notification_uri: String, body: serde_json::Value)
             log::debug!("Notification delivered to {notification_uri}");
         }
         Ok(resp) => {
-            log::warn!("Notification to {notification_uri} returned {}", resp.status);
+            log::warn!(
+                "Notification to {notification_uri} returned {}",
+                resp.status
+            );
         }
         Err(e) => {
             log::warn!("Notification to {notification_uri} failed: {e}");
@@ -846,12 +847,15 @@ async fn deliver_notification(notification_uri: String, body: serde_json::Value)
 /// Fire EAC (early admission control) mode notifications to all subscribers
 /// interested in the slice (TS 23.502 §4.2.9.5).
 fn spawn_eac_notifications(eac: EacTransition) {
-    let subs =
-        with_nsacf_context(|c| c.subscriptions_matching(&eac.s_nssai)).unwrap_or_default();
+    let subs = with_nsacf_context(|c| c.subscriptions_matching(&eac.s_nssai)).unwrap_or_default();
     if subs.is_empty() {
         return;
     }
-    let mode = if eac.activated { "EAC_ACTIVE" } else { "EAC_INACTIVE" };
+    let mode = if eac.activated {
+        "EAC_ACTIVE"
+    } else {
+        "EAC_INACTIVE"
+    };
     log::info!(
         "EAC mode {} for S-NSSAI[SST:{} SD:{:?}] -> notifying {} subscriber(s)",
         mode,
@@ -884,9 +888,10 @@ fn spawn_event_reports(s_nssai: &SNssai) {
         return;
     };
     for sub in subs {
-        let wants_counts = sub.events.iter().any(|e| {
-            e == "NUM_OF_REGISTERED_UES" || e == "NUM_OF_ESTABLISHED_PDU_SESSIONS"
-        });
+        let wants_counts = sub
+            .events
+            .iter()
+            .any(|e| e == "NUM_OF_REGISTERED_UES" || e == "NUM_OF_ESTABLISHED_PDU_SESSIONS");
         if !wants_counts {
             continue;
         }
@@ -1155,7 +1160,10 @@ mod tests {
 
         // Missing supi -> 400 ProblemDetails
         let resp = client
-            .post_json("/nnsacf-nsac/v1/slices/72/ues", &json!({"updateFlag": "INCREASE"}))
+            .post_json(
+                "/nnsacf-nsac/v1/slices/72/ues",
+                &json!({"updateFlag": "INCREASE"}),
+            )
             .await
             .expect("response");
         assert_eq!(resp.status, 400);
@@ -1172,7 +1180,12 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(resp.status, 400);
-        assert!(resp.http.content.as_deref().unwrap().contains("INVALID_IE_VALUE"));
+        assert!(resp
+            .http
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("INVALID_IE_VALUE"));
 
         // Invalid snssai path segment -> 400
         let resp = client
@@ -1203,7 +1216,12 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(resp.status, 400);
-        assert!(resp.http.content.as_deref().unwrap().contains("pduSessionId"));
+        assert!(resp
+            .http
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("pduSessionId"));
 
         // INCREASE within quota
         let resp = client
@@ -1330,8 +1348,7 @@ mod tests {
         // arrive first; scan until found, bounded by timeout per recv)
         let mut saw_eac_active = false;
         for _ in 0..8 {
-            let Ok(Some(notif)) =
-                tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
+            let Ok(Some(notif)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
             else {
                 break;
             };
@@ -1356,8 +1373,7 @@ mod tests {
 
         let mut saw_eac_inactive = false;
         for _ in 0..8 {
-            let Ok(Some(notif)) =
-                tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
+            let Ok(Some(notif)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
             else {
                 break;
             };

@@ -592,8 +592,14 @@ mod tests {
 
         let (ck_prime, ik_prime) = ogs_kdf_ck_ik_prime(&ck, &ik, "WLAN", &sqn_xor_ak);
 
-        assert_eq!(&ck_prime[..], &unhex("0093962d0dd84aa5684b045c9edffa04")[..]);
-        assert_eq!(&ik_prime[..], &unhex("ccfc230ca74fcc96c0a5d61164f5a76c")[..]);
+        assert_eq!(
+            &ck_prime[..],
+            &unhex("0093962d0dd84aa5684b045c9edffa04")[..]
+        );
+        assert_eq!(
+            &ik_prime[..],
+            &unhex("ccfc230ca74fcc96c0a5d61164f5a76c")[..]
+        );
     }
 
     /// Determinism + sensitivity checks for CK'/IK'.
@@ -603,12 +609,15 @@ mod tests {
         let ik = [0x22u8; 16];
         let sqn_xor_ak = [0x33u8; 6];
 
-        let (c1, i1) = ogs_kdf_ck_ik_prime(&ck, &ik, "5G:mnc001.mcc001.3gppnetwork.org", &sqn_xor_ak);
-        let (c2, i2) = ogs_kdf_ck_ik_prime(&ck, &ik, "5G:mnc001.mcc001.3gppnetwork.org", &sqn_xor_ak);
+        let (c1, i1) =
+            ogs_kdf_ck_ik_prime(&ck, &ik, "5G:mnc001.mcc001.3gppnetwork.org", &sqn_xor_ak);
+        let (c2, i2) =
+            ogs_kdf_ck_ik_prime(&ck, &ik, "5G:mnc001.mcc001.3gppnetwork.org", &sqn_xor_ak);
         assert_eq!(c1, c2);
         assert_eq!(i1, i2);
 
-        let (c3, _) = ogs_kdf_ck_ik_prime(&ck, &ik, "5G:mnc002.mcc002.3gppnetwork.org", &sqn_xor_ak);
+        let (c3, _) =
+            ogs_kdf_ck_ik_prime(&ck, &ik, "5G:mnc002.mcc002.3gppnetwork.org", &sqn_xor_ak);
         assert_ne!(c1, c3);
     }
 }

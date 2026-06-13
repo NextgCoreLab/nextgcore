@@ -18,9 +18,7 @@
 
 use std::collections::HashMap;
 
-use crate::jose::{
-    self, b64url_decode, b64url_encode, FlatJwe, FlatJws, JoseError, JWE_KEY_LEN,
-};
+use crate::jose::{self, b64url_decode, b64url_encode, FlatJwe, FlatJws, JoseError, JWE_KEY_LEN};
 
 // ============================================================================
 // Data-type / protection-policy profiles (TS 29.573 sec 6.1.5.3.4)
@@ -290,7 +288,11 @@ pub struct N32fUnprotectError {
 }
 
 impl N32fUnprotectError {
-    fn new(error_type: N32fErrorType, message_id: Option<String>, detail: impl Into<String>) -> Self {
+    fn new(
+        error_type: N32fErrorType,
+        message_id: Option<String>,
+        detail: impl Into<String>,
+    ) -> Self {
         Self {
             error_type,
             message_id,
@@ -469,10 +471,14 @@ pub fn unprotect_message(
         )
     })?;
     let aad_bytes = b64url_decode(aad_b64).map_err(|e| {
-        N32fUnprotectError::new(N32fErrorType::MessageReconstructionFailed, None, e.to_string())
+        N32fUnprotectError::new(
+            N32fErrorType::MessageReconstructionFailed,
+            None,
+            e.to_string(),
+        )
     })?;
-    let integrity_block: DataToIntegrityProtectBlock = serde_json::from_slice(&aad_bytes)
-        .map_err(|e| {
+    let integrity_block: DataToIntegrityProtectBlock =
+        serde_json::from_slice(&aad_bytes).map_err(|e| {
             N32fUnprotectError::new(
                 N32fErrorType::MessageReconstructionFailed,
                 None,
@@ -513,8 +519,8 @@ pub fn unprotect_message(
             err.failed_modifications.push(format!("entry-{i}"));
             err
         })?;
-        let payload: ModificationsBlockPayload = serde_json::from_slice(&payload_bytes)
-            .map_err(|e| {
+        let payload: ModificationsBlockPayload =
+            serde_json::from_slice(&payload_bytes).map_err(|e| {
                 N32fUnprotectError::new(
                     N32fErrorType::IntegrityCheckOnModificationsFailed,
                     Some(message_id.clone()),
@@ -590,7 +596,10 @@ pub fn unprotect_message(
                             N32fUnprotectError::new(
                                 N32fErrorType::MessageReconstructionFailed,
                                 Some(message_id.clone()),
-                                format!("payload element [{}] missing encBlockIndex", element.ie_path),
+                                format!(
+                                    "payload element [{}] missing encBlockIndex",
+                                    element.ie_path
+                                ),
                             )
                         })? as usize;
                     let value = cipher_block.data_to_encrypt.get(idx).ok_or_else(|| {
@@ -797,8 +806,14 @@ mod tests {
     fn tampered_aad_detected_as_integrity_failure() {
         let sender = test_ctx();
         let receiver = receiver_ctx();
-        let mut msg = protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body()))
-            .unwrap();
+        let mut msg = protect_message(
+            &sender,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
 
         // Tamper with a cleartext field inside the integrity block
         let aad = b64url_decode(msg.reformatted_data.aad.as_ref().unwrap()).unwrap();
@@ -814,8 +829,14 @@ mod tests {
     fn tampered_ciphertext_detected() {
         let sender = test_ctx();
         let receiver = receiver_ctx();
-        let mut msg = protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body()))
-            .unwrap();
+        let mut msg = protect_message(
+            &sender,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
         let mut ct = b64url_decode(&msg.reformatted_data.ciphertext).unwrap();
         ct[0] ^= 0xff;
         msg.reformatted_data.ciphertext = b64url_encode(&ct);
@@ -828,8 +849,14 @@ mod tests {
     fn tampered_modifications_chain_detected() {
         let sender = test_ctx();
         let receiver = receiver_ctx();
-        let mut msg = protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body()))
-            .unwrap();
+        let mut msg = protect_message(
+            &sender,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
 
         // Forge the modification entry payload without a valid signature
         msg.modifications_block[0].payload = b64url_encode(
@@ -856,8 +883,14 @@ mod tests {
         let mut receiver = receiver_ctx();
         receiver.modification_policy.allowed_paths = vec!["/nssai/sst".to_string()];
 
-        let mut msg = protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body()))
-            .unwrap();
+        let mut msg = protect_message(
+            &sender,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
 
         // A (key-holding) intermediary appends a chained, signed patch entry
         let prev_sig = msg.modifications_block[0].signature.clone();
@@ -886,8 +919,14 @@ mod tests {
         let sender = test_ctx();
         let receiver = receiver_ctx(); // empty policy: nothing modifiable
 
-        let mut msg = protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body()))
-            .unwrap();
+        let mut msg = protect_message(
+            &sender,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
         let prev_sig = msg.modifications_block[0].signature.clone();
         let patch_payload = ModificationsBlockPayload {
             identity: "ipx1.example.com".to_string(),
@@ -912,8 +951,14 @@ mod tests {
         let mut receiver = receiver_ctx();
         receiver.session_key = [0x43u8; 32];
 
-        let msg = protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body()))
-            .unwrap();
+        let msg = protect_message(
+            &sender,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
         let err = unprotect_message(&receiver, &msg).unwrap_err();
         // JWS chain is checked first and fails under the wrong key
         assert_eq!(
@@ -928,8 +973,14 @@ mod tests {
         let mut receiver = receiver_ctx();
         receiver.local_context_id = "ctx-other-9999".to_string();
 
-        let msg = protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body()))
-            .unwrap();
+        let msg = protect_message(
+            &sender,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
         let err = unprotect_message(&receiver, &msg).unwrap_err();
         assert_eq!(err.error_type, N32fErrorType::UnavailablePrinsContext);
     }

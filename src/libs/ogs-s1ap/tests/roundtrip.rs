@@ -291,8 +291,14 @@ fn initial_context_setup_request_roundtrip() {
             assert_eq!(item.transport_layer_address, vec![10, 45, 0, 1]);
             assert_eq!(item.gtp_teid, 0xDEAD_BEEF);
             assert_eq!(item.nas_pdu.as_deref(), Some(&[0x27, 0x01][..]));
-            assert_eq!(decoded.ue_security_capabilities.encryption_algorithms, 0xE000);
-            assert_eq!(decoded.ue_security_capabilities.integrity_algorithms, 0xC000);
+            assert_eq!(
+                decoded.ue_security_capabilities.encryption_algorithms,
+                0xE000
+            );
+            assert_eq!(
+                decoded.ue_security_capabilities.integrity_algorithms,
+                0xC000
+            );
             assert_eq!(decoded.security_key, [0xAB; 32]);
         }
         other => panic!("unexpected message: {other:?}"),
@@ -447,7 +453,10 @@ fn erab_setup_request_roundtrip() {
             assert_eq!(decoded.ue_ambr, msg.ue_ambr);
             assert_eq!(decoded.erab_list.len(), 1);
             assert_eq!(decoded.erab_list[0].erab_id, 6);
-            assert_eq!(decoded.erab_list[0].nas_pdu.as_deref(), Some(&[0x27, 0xC1][..]));
+            assert_eq!(
+                decoded.erab_list[0].nas_pdu.as_deref(),
+                Some(&[0x27, 0xC1][..])
+            );
         }
         other => panic!("unexpected message: {other:?}"),
     }
@@ -598,10 +607,13 @@ fn paging_s_tmsi_roundtrip() {
         }),
         paging_drx: Some(PagingDrx::V256),
         cn_domain: CnDomain::Ps,
-        tai_list: vec![sample_tai(), Tai {
-            plmn_identity: PLMN,
-            tac: 0x0002,
-        }],
+        tai_list: vec![
+            sample_tai(),
+            Tai {
+                plmn_identity: PLMN,
+                tac: 0x0002,
+            },
+        ],
     };
     let bytes = build_paging(&msg).unwrap();
     match decode_s1ap_pdu(&bytes).unwrap() {
@@ -727,7 +739,10 @@ fn error_indication_roundtrip() {
         S1apMessage::ErrorIndication(decoded) => {
             assert_eq!(decoded.mme_ue_s1ap_id, Some(99));
             assert!(decoded.enb_ue_s1ap_id.is_none());
-            assert_eq!(decoded.cause, Some(Cause::Protocol(CauseProtocol::SemanticError)));
+            assert_eq!(
+                decoded.cause,
+                Some(Cause::Protocol(CauseProtocol::SemanticError))
+            );
         }
         other => panic!("unexpected message: {other:?}"),
     }
@@ -836,7 +851,10 @@ fn handover_command_roundtrip() {
         S1apMessage::HandoverCommand(decoded) => {
             assert_eq!(decoded.erab_subject_to_forwarding_list.len(), 1);
             let fwd = &decoded.erab_subject_to_forwarding_list[0];
-            assert_eq!(fwd.dl_transport_layer_address.as_deref(), Some(&[10, 0, 0, 1][..]));
+            assert_eq!(
+                fwd.dl_transport_layer_address.as_deref(),
+                Some(&[10, 0, 0, 1][..])
+            );
             assert_eq!(fwd.dl_gtp_teid, Some(0x1111_2222));
             assert!(fwd.ul_gtp_teid.is_none());
             assert_eq!(decoded.erab_to_release_list.len(), 1);

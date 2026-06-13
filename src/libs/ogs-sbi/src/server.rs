@@ -726,10 +726,7 @@ mod tests {
         for response in responses {
             assert!(response.status >= 400);
             assert_eq!(
-                response
-                    .http
-                    .get_header("content-type")
-                    .map(String::as_str),
+                response.http.get_header("content-type").map(String::as_str),
                 Some(crate::constants::content_type::APPLICATION_PROBLEM_JSON),
                 "status {} missing problem+json content type",
                 response.status
@@ -878,7 +875,10 @@ mod tests {
         // The binary part survived client encode -> server decode -> server
         // encode -> client decode byte-exact.
         assert_eq!(response.http.parts.len(), 1);
-        assert_eq!(response.http.parts[0].content_id.as_deref(), Some("5gnas-sm"));
+        assert_eq!(
+            response.http.parts[0].content_id.as_deref(),
+            Some("5gnas-sm")
+        );
         assert_eq!(response.http.parts[0].data.as_ref(), nas_bytes);
 
         server.stop().await.expect("value expected");

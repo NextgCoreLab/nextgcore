@@ -63,7 +63,13 @@ async fn next_message(peer: &mut DiameterPeer) -> DiameterMessage {
     }
 }
 
-fn build_ccr(session_id: &str, host: &str, cc_type: u32, cc_number: u32, ue_ip: [u8; 4]) -> DiameterMessage {
+fn build_ccr(
+    session_id: &str,
+    host: &str,
+    cc_type: u32,
+    cc_number: u32,
+    ue_ip: [u8; 4],
+) -> DiameterMessage {
     let mut ccr = DiameterMessage::new_request(gx_cmd::CREDIT_CONTROL, GX_APPLICATION_ID);
     ccr.header.hop_by_hop_id = 0x1000 + cc_number;
     ccr.header.end_to_end_id = 0x2000 + cc_number;
@@ -200,8 +206,7 @@ fn build_aar(session_id: &str, host: &str, ue_ip: [u8; 4]) -> DiameterMessage {
 }
 
 fn build_str_msg(session_id: &str, host: &str) -> DiameterMessage {
-    let mut str_msg =
-        DiameterMessage::new_request(rx_cmd::SESSION_TERMINATION, RX_APPLICATION_ID);
+    let mut str_msg = DiameterMessage::new_request(rx_cmd::SESSION_TERMINATION, RX_APPLICATION_ID);
     str_msg.header.hop_by_hop_id = 0x5000;
     str_msg.header.end_to_end_id = 0x6000;
     str_msg.add_avp(Avp::mandatory(
@@ -286,7 +291,8 @@ async fn test_gx_rx_full_wire_flow() {
     assert_eq!(cca.result_code(), Some(2001));
     assert_eq!(cca.session_id(), Some(gx_sid));
     assert_eq!(
-        cca.find_avp(gx_avp::CC_REQUEST_TYPE).and_then(|a| a.as_u32()),
+        cca.find_avp(gx_avp::CC_REQUEST_TYPE)
+            .and_then(|a| a.as_u32()),
         Some(1)
     );
     // Full provisioning present on the wire

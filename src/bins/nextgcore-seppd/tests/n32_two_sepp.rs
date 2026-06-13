@@ -23,7 +23,7 @@ use std::time::Duration;
 use nextgcore_seppd::context::{sepp_self, SecurityCapability};
 use nextgcore_seppd::jose::{b64url_decode, b64url_encode};
 use nextgcore_seppd::n32_server::{
-    initiate_n32c_handshake, forward_via_n32f, start_n32_listener, take_received_n32f_errors,
+    forward_via_n32f, initiate_n32c_handshake, start_n32_listener, take_received_n32f_errors,
 };
 use nextgcore_seppd::prins::{protect_message, N32fErrorType};
 
@@ -231,8 +231,7 @@ async fn two_sepp_n32_handshake_and_forwarding() {
         // Phase 3: tampered message -> 400 + n32f-error report back to A
         // ------------------------------------------------------------------
         let _ = take_received_n32f_errors(); // drain
-        let prins_ctx =
-            nextgcore_seppd::sbi_path::build_prins_context(outcome.node_id).unwrap();
+        let prins_ctx = nextgcore_seppd::sbi_path::build_prins_context(outcome.node_id).unwrap();
         let mut msg = protect_message(
             &prins_ctx,
             "POST",
@@ -357,7 +356,10 @@ async fn two_sepp_n32_handshake_and_forwarding() {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         };
-        assert_eq!(node_b3.negotiated_security_scheme, SecurityCapability::Prins);
+        assert_eq!(
+            node_b3.negotiated_security_scheme,
+            SecurityCapability::Prins
+        );
         let sec_b3 = node_b3.n32f_security.unwrap();
         assert_eq!(sec_b3.jwe_cipher_suite, "A256GCM");
         assert_eq!(sec_b3.jws_cipher_suite, "HS256");

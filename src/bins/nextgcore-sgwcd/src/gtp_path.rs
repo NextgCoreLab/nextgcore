@@ -87,11 +87,7 @@ pub struct GtpcServer {
 
 impl GtpcServer {
     /// Bind the S11 socket and start the receive and retransmission loops
-    pub fn open(
-        bind: &str,
-        config: Gtp2XactConfig,
-        restart_counter: u8,
-    ) -> Result<Self, String> {
+    pub fn open(bind: &str, config: Gtp2XactConfig, restart_counter: u8) -> Result<Self, String> {
         let socket = UdpSocket::bind(bind).map_err(|e| format!("bind {bind}: {e}"))?;
         socket
             .set_read_timeout(Some(Duration::from_millis(100)))
@@ -895,12 +891,12 @@ fn dispatch_delete_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
             // remove the control-plane context
             let sess = ue.sess_ids.iter().find_map(|sid| {
                 ctx.sess_find_by_id(*sid).filter(|s| {
-                    ctx.bearer_find_by_sess_ebi(s.id, parsed.linked_ebi).is_some()
+                    ctx.bearer_find_by_sess_ebi(s.id, parsed.linked_ebi)
+                        .is_some()
                 })
             });
             if let Some(sess) = sess {
-                if let Err(e) = pfcp_path::send_session_deletion_request(&sess, seq as u64, None)
-                {
+                if let Err(e) = pfcp_path::send_session_deletion_request(&sess, seq as u64, None) {
                     log::error!("PFCP session deletion failed: {e}");
                 }
                 ctx.sess_remove(sess.id);
@@ -1009,7 +1005,14 @@ fn dispatch_indirect_tunnel_request(
     };
 
     let Some(ue) = ue_from_header(msg) else {
-        send_cause_response(server, peer, response_type, 0, seq, gtp_cause::CONTEXT_NOT_FOUND);
+        send_cause_response(
+            server,
+            peer,
+            response_type,
+            0,
+            seq,
+            gtp_cause::CONTEXT_NOT_FOUND,
+        );
         return;
     };
 
@@ -1153,13 +1156,31 @@ fn dispatch_bearer_response(
     use Gtp2MessageType as T;
     match msg.header.message_type {
         t if t == T::CreateBearerResponse as u8 => {
-            s11_handler::handle_create_bearer_response(ue.as_ref(), seq as u64, raw, ebi, parsed.cause);
+            s11_handler::handle_create_bearer_response(
+                ue.as_ref(),
+                seq as u64,
+                raw,
+                ebi,
+                parsed.cause,
+            );
         }
         t if t == T::UpdateBearerResponse as u8 => {
-            s11_handler::handle_update_bearer_response(ue.as_ref(), seq as u64, raw, ebi, parsed.cause);
+            s11_handler::handle_update_bearer_response(
+                ue.as_ref(),
+                seq as u64,
+                raw,
+                ebi,
+                parsed.cause,
+            );
         }
         t if t == T::DeleteBearerResponse as u8 => {
-            s11_handler::handle_delete_bearer_response(ue.as_ref(), seq as u64, raw, ebi, parsed.cause);
+            s11_handler::handle_delete_bearer_response(
+                ue.as_ref(),
+                seq as u64,
+                raw,
+                ebi,
+                parsed.cause,
+            );
         }
         _ => {}
     }
@@ -1172,9 +1193,7 @@ fn dispatch_bearer_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ogs_gtp::v2::ie::{
-        Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2CauseIe, Gtp2FTeidIe, Gtp2Ie,
-    };
+    use ogs_gtp::v2::ie::{Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2CauseIe, Gtp2FTeidIe, Gtp2Ie};
     use std::net::UdpSocket;
 
     fn test_server(t3_ms: u64, n3: u32) -> GtpcServer {
@@ -1263,17 +1282,15 @@ mod tests {
         // MME TEID from the Sender F-TEID we put in the request
         assert_eq!(response.header.teid, Some(0xAA01));
 
-        let cause = Gtp2CauseIe::decode(
-            &response.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value,
-        )
-        .unwrap();
+        let cause =
+            Gtp2CauseIe::decode(&response.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                .unwrap();
         assert_eq!(cause.cause, gtp_cause::REQUEST_ACCEPTED);
 
         // Sender F-TEID + bearer context with allocated S1-U SGW endpoint
-        let sender = Gtp2FTeidIe::decode(
-            &response.get_ie(Gtp2IeType::FTeid as u8, 0).unwrap().value,
-        )
-        .unwrap();
+        let sender =
+            Gtp2FTeidIe::decode(&response.get_ie(Gtp2IeType::FTeid as u8, 0).unwrap().value)
+                .unwrap();
         assert_ne!(sender.teid, 0);
         let bc = response.bearer_context(0).unwrap().unwrap();
         assert_eq!(bc.ebi().unwrap(), 5);
@@ -1298,10 +1315,9 @@ mod tests {
             response.header.message_type,
             Gtp2MessageType::CreateSessionResponse as u8
         );
-        let cause = Gtp2CauseIe::decode(
-            &response.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value,
-        )
-        .unwrap();
+        let cause =
+            Gtp2CauseIe::decode(&response.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                .unwrap();
         assert_eq!(cause.cause, gtp_cause::MANDATORY_IE_MISSING);
         assert_eq!(cause.offending_ie_type, Some(Gtp2IeType::Imsi as u8));
 
@@ -1325,10 +1341,9 @@ mod tests {
             response.header.message_type,
             Gtp2MessageType::ModifyBearerResponse as u8
         );
-        let cause = Gtp2CauseIe::decode(
-            &response.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value,
-        )
-        .unwrap();
+        let cause =
+            Gtp2CauseIe::decode(&response.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+                .unwrap();
         assert_eq!(cause.cause, gtp_cause::CONTEXT_NOT_FOUND);
 
         server.close();
@@ -1367,11 +1382,10 @@ mod tests {
         sock.send_to(&csr(0x2001, &imsi).encode(), server.local_addr())
             .unwrap();
         let csrsp = recv_msg(&sock);
-        let sgw_teid = Gtp2FTeidIe::decode(
-            &csrsp.get_ie(Gtp2IeType::FTeid as u8, 0).unwrap().value,
-        )
-        .unwrap()
-        .teid;
+        let sgw_teid =
+            Gtp2FTeidIe::decode(&csrsp.get_ie(Gtp2IeType::FTeid as u8, 0).unwrap().value)
+                .unwrap()
+                .teid;
 
         // Modify with eNB S1-U F-TEID
         let mut mbr = Gtp2Message::new(ogs_gtp::v2::header::Gtp2Header::new(

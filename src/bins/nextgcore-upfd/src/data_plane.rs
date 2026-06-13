@@ -338,7 +338,10 @@ pub fn build_gtpu_header_with_qfi(teid: u32, payload_len: u16, qfi: u8) -> Vec<u
     header.push(0); // N-PDU number
     header.push(ExtensionHeaderType::PduSessionContainer as u8);
     let mut ext_buf = BytesMut::with_capacity(ext_len);
-    ext.encode(&mut ext_buf, ExtensionHeaderType::NoMoreExtensionHeaders as u8);
+    ext.encode(
+        &mut ext_buf,
+        ExtensionHeaderType::NoMoreExtensionHeaders as u8,
+    );
     header.extend_from_slice(&ext_buf);
     header
 }
@@ -820,7 +823,10 @@ impl DataPlaneQer {
             // bucket: never silently drop it on the guaranteed share — fall
             // through to MBR policing (or unlimited) rather than treating it
             // as best-effort with no guarantee.
-            log::trace!("XR QER {} has no GBR bucket; relying on MBR policing", self.qer_id);
+            log::trace!(
+                "XR QER {} has no GBR bucket; relying on MBR policing",
+                self.qer_id
+            );
         }
 
         // Above GBR (or no GBR): police against MBR
@@ -1864,7 +1870,9 @@ impl DataPlane {
                     FarDecision::Buffer { .. } => {
                         // Buffering is a DL concept; an UL FAR with BUFF is
                         // treated as not-forward (TS 29.244 8.2.26)
-                        log::debug!("UL packet buffered-action FAR (far_id={fid}) — not forwarding");
+                        log::debug!(
+                            "UL packet buffered-action FAR (far_id={fid}) — not forwarding"
+                        );
                         self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                         return;
                     }
@@ -2297,12 +2305,14 @@ impl DataPlane {
                 session.pdu_session_id,
                 session.qfi,
             );
-            new_session
-                .ul_packets
-                .store(session.ul_packets.load(Ordering::Relaxed), Ordering::Relaxed);
-            new_session
-                .dl_packets
-                .store(session.dl_packets.load(Ordering::Relaxed), Ordering::Relaxed);
+            new_session.ul_packets.store(
+                session.ul_packets.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            new_session.dl_packets.store(
+                session.dl_packets.load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
             new_session
                 .ul_bytes
                 .store(session.ul_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -3221,10 +3231,9 @@ mod tests {
 
         // 2. FAR resolves to Forward with the gNB DL tunnel
         let (teid, addr) = match session.apply_far(far_id.unwrap()) {
-            FarDecision::Forward { ohc_teid, ohc_addr } => (
-                ohc_teid.unwrap_or(session.dl_teid),
-                ohc_addr.unwrap_or(gnb),
-            ),
+            FarDecision::Forward { ohc_teid, ohc_addr } => {
+                (ohc_teid.unwrap_or(session.dl_teid), ohc_addr.unwrap_or(gnb))
+            }
             other => panic!("expected Forward, got {other:?}"),
         };
         assert_eq!(teid, dl_teid);
@@ -3342,7 +3351,7 @@ mod tests {
         let mut qer = DataPlaneQer::new(1);
         qer.set_mbr(8, 8); // tiny MBR: burst 1500 bytes
         qer.set_gbr(8, 8); // equal GBR
-        // First packet passes via the GBR bucket
+                           // First packet passes via the GBR bucket
         assert!(qer.check_rate(1000, true));
         // GBR bucket nearly empty; MBR also consumed — large packet dropped
         assert!(!qer.check_rate(5000, true));
@@ -3589,7 +3598,13 @@ mod tests {
         assert!(rx.try_recv().is_err(), "no duplicate DDN for 2nd packet");
 
         // FAR switches to FORW → buffered packets flush to the gNB
-        session.fars.write().unwrap().get_mut(&2).unwrap().apply_action = FAR_ACTION_FORW;
+        session
+            .fars
+            .write()
+            .unwrap()
+            .get_mut(&2)
+            .unwrap()
+            .apply_action = FAR_ACTION_FORW;
         let flushed = dp.flush_buffered_dl(0x77).await;
         assert_eq!(flushed, 2);
         assert!(session.dl_buffer.lock().unwrap().is_empty());

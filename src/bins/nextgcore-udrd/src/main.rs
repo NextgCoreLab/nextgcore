@@ -9,12 +9,12 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use nextgcore_udrd::{
-    udr_context_final, udr_context_init, udr_sbi_close, udr_sbi_open, SbiServerConfig, UdrSmContext,
-};
 use nextgcore_udrd::data_store::{
     self, merge_patch, notify_application_data_change, notify_exposure_data_change,
     notify_influence_data_change, notify_subscription_data_change, SubKind,
+};
+use nextgcore_udrd::{
+    udr_context_final, udr_context_init, udr_sbi_close, udr_sbi_open, SbiServerConfig, UdrSmContext,
 };
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::oauth::JwksCache;
@@ -497,7 +497,11 @@ async fn handle_auth_data(
                 Ok(v) => v,
                 Err(resp) => return *resp,
             };
-            if body.get("authenticationMethod").and_then(|v| v.as_str()).is_none() {
+            if body
+                .get("authenticationMethod")
+                .and_then(|v| v.as_str())
+                .is_none()
+            {
                 return missing_mandatory("authenticationMethod");
             }
             let k_hex = match body.get("encPermanentKey").and_then(|v| v.as_str()) {
@@ -1125,8 +1129,10 @@ async fn handle_subscription_data_subs(
                     s.body.get("ueId").and_then(|v| v.as_str()) == Some(ue_id.as_str())
                 });
                 let list: Vec<serde_json::Value> = subs.into_iter().map(|s| s.body).collect();
-                SbiResponse::with_status(200)
-                    .with_body(serde_json::Value::Array(list).to_string(), "application/json")
+                SbiResponse::with_status(200).with_body(
+                    serde_json::Value::Array(list).to_string(),
+                    "application/json",
+                )
             }
             "DELETE" => {
                 let Some(ue_id) = request.http.params.get("ue-id").cloned() else {
@@ -1143,9 +1149,8 @@ async fn handle_subscription_data_subs(
         // Document: /subscription-data/subs-to-notify/{subsId}
         Some(subs_id) => match method {
             "GET" => match ds.sub_get(subs_id) {
-                Some(sub) if sub.kind == SubKind::SubscriptionData => {
-                    SbiResponse::with_status(200).with_body(sub.body.to_string(), "application/json")
-                }
+                Some(sub) if sub.kind == SubKind::SubscriptionData => SbiResponse::with_status(200)
+                    .with_body(sub.body.to_string(), "application/json"),
                 _ => send_not_found("Subscription not found", Some("DATA_NOT_FOUND")),
             },
             "PATCH" => {
@@ -1287,12 +1292,12 @@ async fn handle_exposure_data(parts: &[&str], method: &str, request: &SbiRequest
                     }
                 }
                 "GET" => match ds.exposure_am_get(ue_id) {
-                    Some(doc) => SbiResponse::with_status(200)
-                        .with_body(doc.to_string(), "application/json"),
-                    None => send_not_found(
-                        "Access and mobility data not found",
-                        Some("DATA_NOT_FOUND"),
-                    ),
+                    Some(doc) => {
+                        SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+                    }
+                    None => {
+                        send_not_found("Access and mobility data not found", Some("DATA_NOT_FOUND"))
+                    }
                 },
                 "PATCH" => {
                     let Some(mut doc) = ds.exposure_am_get(ue_id) else {
@@ -1323,10 +1328,7 @@ async fn handle_exposure_data(parts: &[&str], method: &str, request: &SbiRequest
                         );
                         SbiResponse::with_status(204)
                     } else {
-                        send_not_found(
-                            "Access and mobility data not found",
-                            Some("DATA_NOT_FOUND"),
-                        )
+                        send_not_found("Access and mobility data not found", Some("DATA_NOT_FOUND"))
                     }
                 }
                 _ => send_method_not_allowed(method, "exposure-data/access-and-mobility-data"),
@@ -1336,8 +1338,7 @@ async fn handle_exposure_data(parts: &[&str], method: &str, request: &SbiRequest
             let Some(psi) = parts.get(5).copied() else {
                 return send_bad_request("Missing pduSessionId", Some("MANDATORY_IE_MISSING"));
             };
-            let path =
-                format!("/nudr-dr/v1/exposure-data/{ue_id}/session-management-data/{psi}");
+            let path = format!("/nudr-dr/v1/exposure-data/{ue_id}/session-management-data/{psi}");
             match method {
                 "PUT" => {
                     let body = match parse_json_body(request) {
@@ -1360,8 +1361,9 @@ async fn handle_exposure_data(parts: &[&str], method: &str, request: &SbiRequest
                     }
                 }
                 "GET" => match ds.exposure_sm_get(ue_id, psi) {
-                    Some(doc) => SbiResponse::with_status(200)
-                        .with_body(doc.to_string(), "application/json"),
+                    Some(doc) => {
+                        SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+                    }
                     None => {
                         send_not_found("Session management data not found", Some("DATA_NOT_FOUND"))
                     }
@@ -1411,11 +1413,13 @@ async fn handle_application_data(
         // --- /application-data/pfds[/{appId}] -----------------------------
         Some("pfds") => match (parts.get(4).copied(), method) {
             (None, "GET") => {
-                let app_ids = csv_param(request, "appId")
-                    .or_else(|| csv_param(request, "application-ids"));
+                let app_ids =
+                    csv_param(request, "appId").or_else(|| csv_param(request, "application-ids"));
                 let list = ds.pfd_list(app_ids.as_deref());
-                SbiResponse::with_status(200)
-                    .with_body(serde_json::Value::Array(list).to_string(), "application/json")
+                SbiResponse::with_status(200).with_body(
+                    serde_json::Value::Array(list).to_string(),
+                    "application/json",
+                )
             }
             (Some(app_id), "GET") => match ds.pfd_get(app_id) {
                 Some(doc) => {
@@ -1474,8 +1478,10 @@ async fn handle_application_data(
                         dnns.as_deref(),
                         supis.as_deref(),
                     );
-                    SbiResponse::with_status(200)
-                        .with_body(serde_json::Value::Array(list).to_string(), "application/json")
+                    SbiResponse::with_status(200).with_body(
+                        serde_json::Value::Array(list).to_string(),
+                        "application/json",
+                    )
                 }
                 _ => send_method_not_allowed(method, "application-data/influenceData"),
             },
@@ -1509,10 +1515,11 @@ async fn handle_application_data(
                 }
                 (None, "GET") => {
                     let subs = ds.subs_matching(SubKind::AppInfluence, |_| true);
-                    let list: Vec<serde_json::Value> =
-                        subs.into_iter().map(|s| s.body).collect();
-                    SbiResponse::with_status(200)
-                        .with_body(serde_json::Value::Array(list).to_string(), "application/json")
+                    let list: Vec<serde_json::Value> = subs.into_iter().map(|s| s.body).collect();
+                    SbiResponse::with_status(200).with_body(
+                        serde_json::Value::Array(list).to_string(),
+                        "application/json",
+                    )
                 }
                 (Some(sub_id), "GET") => match ds.sub_get(sub_id) {
                     Some(sub) if sub.kind == SubKind::AppInfluence => SbiResponse::with_status(200)
@@ -1545,8 +1552,7 @@ async fn handle_application_data(
             },
             // /influenceData/{influenceId}
             Some(influence_id) => {
-                let path =
-                    format!("/nudr-dr/v1/application-data/influenceData/{influence_id}");
+                let path = format!("/nudr-dr/v1/application-data/influenceData/{influence_id}");
                 match method {
                     "PUT" => {
                         let body = match parse_json_body(request) {
@@ -1581,8 +1587,7 @@ async fn handle_application_data(
                         merge_patch(&mut doc, &patch);
                         ds.influence_put(influence_id, doc.clone());
                         notify_influence_data_change(&path, Some(&doc));
-                        SbiResponse::with_status(200)
-                            .with_body(doc.to_string(), "application/json")
+                        SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
                     }
                     "DELETE" => {
                         if ds.influence_remove(influence_id).is_some() {
@@ -2290,9 +2295,11 @@ udr:
         let _ = recv_notification(&mut rx).await; // replace notification
 
         let mut req = SbiRequest::patch(&resource);
+        req.http.set_content(
+            json!([{"op": "replace", "path": "/purgeFlag", "value": true}]).to_string(),
+        );
         req.http
-            .set_content(json!([{"op": "replace", "path": "/purgeFlag", "value": true}]).to_string());
-        req.http.set_header("Content-Type", "application/json-patch+json");
+            .set_header("Content-Type", "application/json-patch+json");
         let resp = client.send_request(req).await.expect("PATCH");
         assert_eq!(resp.status, 204);
         let _ = recv_notification(&mut rx).await; // patch notification
@@ -2413,12 +2420,16 @@ udr:
 
         // Remove the subscription -> 204; second delete -> 404.
         let resp = client
-            .delete(&format!("/nudr-dr/v1/exposure-data/subs-to-notify/{sub_id}"))
+            .delete(&format!(
+                "/nudr-dr/v1/exposure-data/subs-to-notify/{sub_id}"
+            ))
             .await
             .expect("DELETE sub");
         assert_eq!(resp.status, 204);
         let resp = client
-            .delete(&format!("/nudr-dr/v1/exposure-data/subs-to-notify/{sub_id}"))
+            .delete(&format!(
+                "/nudr-dr/v1/exposure-data/subs-to-notify/{sub_id}"
+            ))
             .await
             .expect("DELETE sub again");
         assert_eq!(resp.status, 404);
@@ -2576,7 +2587,10 @@ udr:
 
         // Missing authenticationMethod -> 400 MANDATORY_IE_MISSING.
         let resp = client
-            .put_json(&auth_path, &json!({"encPermanentKey": "00112233445566778899aabbccddeeff"}))
+            .put_json(
+                &auth_path,
+                &json!({"encPermanentKey": "00112233445566778899aabbccddeeff"}),
+            )
             .await
             .expect("PUT no method");
         assert_eq!(resp.status, 400);

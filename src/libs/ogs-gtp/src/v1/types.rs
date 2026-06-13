@@ -255,9 +255,8 @@ impl PduSessionContainer {
                     | ((dl.dl_qfi_sequence_number.is_some() as u8) << 2);
                 buf.put_u8(octet0);
                 // PPP | RQI | QFI (6 bits)
-                let octet1 = ((dl.ppi.is_some() as u8) << 7)
-                    | ((dl.rqi as u8) << 6)
-                    | (dl.qfi & 0x3F);
+                let octet1 =
+                    ((dl.ppi.is_some() as u8) << 7) | ((dl.rqi as u8) << 6) | (dl.qfi & 0x3F);
                 buf.put_u8(octet1);
                 // PPI (3 bits) | spare (5 bits), present if PPP
                 if let Some(ppi) = dl.ppi {
@@ -1142,7 +1141,10 @@ mod tests {
     #[test]
     fn test_ext_header_padding_and_length_units() {
         // 2 content octets fit exactly one 4-octet unit
-        let ext = Gtp1ExtHeader::new(ExtensionHeaderType::PduSessionContainer as u8, &[0x00, 0x09]);
+        let ext = Gtp1ExtHeader::new(
+            ExtensionHeaderType::PduSessionContainer as u8,
+            &[0x00, 0x09],
+        );
         assert_eq!(ext.length_units(), 1);
         assert_eq!(ext.encoded_len(), 4);
 

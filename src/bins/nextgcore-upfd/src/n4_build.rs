@@ -2201,11 +2201,11 @@ mod tests {
         //    require non-zero TEID and an IPv4 (V4 flag 0x02). The outer bytes
         //    here are the Created PDR IE itself (type 8).
         let ies = ParsedIe::parse_all(&created_pdr_ie_value);
-        let created_ie = ParsedIe::find_ie(&ies, pfcp_ie::CREATED_PDR)
-            .expect("Created PDR IE must be present");
+        let created_ie =
+            ParsedIe::find_ie(&ies, pfcp_ie::CREATED_PDR).expect("Created PDR IE must be present");
         let inner = ParsedIe::parse_all(&created_ie.value);
-        let fteid_ie = ParsedIe::find_ie(&inner, pfcp_ie::F_TEID)
-            .expect("Created PDR must carry an F-TEID");
+        let fteid_ie =
+            ParsedIe::find_ie(&inner, pfcp_ie::F_TEID).expect("Created PDR must carry an F-TEID");
         let fteid_val = &fteid_ie.value;
         assert!(fteid_val.len() >= 5);
         let flags = fteid_val[0];

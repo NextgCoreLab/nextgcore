@@ -175,24 +175,24 @@ fn decode_initiating(
         )),
         ProcedureCode::PAGING => Ok(S1apMessage::Paging(parse_paging(ies)?)),
         ProcedureCode::RESET => Ok(S1apMessage::Reset(parse_reset(ies)?)),
-        ProcedureCode::ERROR_INDICATION => Ok(S1apMessage::ErrorIndication(parse_error_indication(
-            ies,
-        )?)),
-        ProcedureCode::HANDOVER_PREPARATION => Ok(S1apMessage::HandoverRequired(
-            parse_handover_required(ies)?,
-        )),
-        ProcedureCode::HANDOVER_RESOURCE_ALLOCATION => Ok(S1apMessage::HandoverRequest(
-            parse_handover_request(ies)?,
-        )),
-        ProcedureCode::HANDOVER_NOTIFICATION => Ok(S1apMessage::HandoverNotify(
-            parse_handover_notify(ies)?,
-        )),
+        ProcedureCode::ERROR_INDICATION => {
+            Ok(S1apMessage::ErrorIndication(parse_error_indication(ies)?))
+        }
+        ProcedureCode::HANDOVER_PREPARATION => {
+            Ok(S1apMessage::HandoverRequired(parse_handover_required(ies)?))
+        }
+        ProcedureCode::HANDOVER_RESOURCE_ALLOCATION => {
+            Ok(S1apMessage::HandoverRequest(parse_handover_request(ies)?))
+        }
+        ProcedureCode::HANDOVER_NOTIFICATION => {
+            Ok(S1apMessage::HandoverNotify(parse_handover_notify(ies)?))
+        }
         ProcedureCode::PATH_SWITCH_REQUEST => Ok(S1apMessage::PathSwitchRequest(
             parse_path_switch_request(ies)?,
         )),
-        ProcedureCode::HANDOVER_CANCEL => Ok(S1apMessage::HandoverCancel(parse_handover_cancel(
-            ies,
-        )?)),
+        ProcedureCode::HANDOVER_CANCEL => {
+            Ok(S1apMessage::HandoverCancel(parse_handover_cancel(ies)?))
+        }
         ProcedureCode::UE_CAPABILITY_INFO_INDICATION => Ok(
             S1apMessage::UeCapabilityInfoIndication(parse_ue_capability_info_indication(ies)?),
         ),
@@ -225,12 +225,12 @@ fn decode_successful(
             parse_erab_release_response(ies)?,
         )),
         ProcedureCode::RESET => Ok(S1apMessage::ResetAcknowledge(parse_reset_acknowledge(ies)?)),
-        ProcedureCode::HANDOVER_PREPARATION => Ok(S1apMessage::HandoverCommand(
-            parse_handover_command(ies)?,
+        ProcedureCode::HANDOVER_PREPARATION => {
+            Ok(S1apMessage::HandoverCommand(parse_handover_command(ies)?))
+        }
+        ProcedureCode::HANDOVER_RESOURCE_ALLOCATION => Ok(S1apMessage::HandoverRequestAcknowledge(
+            parse_handover_request_acknowledge(ies)?,
         )),
-        ProcedureCode::HANDOVER_RESOURCE_ALLOCATION => Ok(
-            S1apMessage::HandoverRequestAcknowledge(parse_handover_request_acknowledge(ies)?),
-        ),
         ProcedureCode::PATH_SWITCH_REQUEST => Ok(S1apMessage::PathSwitchRequestAcknowledge(
             parse_path_switch_request_acknowledge(ies)?,
         )),
@@ -256,9 +256,9 @@ fn decode_unsuccessful(
         ProcedureCode::HANDOVER_PREPARATION => Ok(S1apMessage::HandoverPreparationFailure(
             parse_handover_preparation_failure(ies)?,
         )),
-        ProcedureCode::HANDOVER_RESOURCE_ALLOCATION => Ok(S1apMessage::HandoverFailure(
-            parse_handover_failure(ies)?,
-        )),
+        ProcedureCode::HANDOVER_RESOURCE_ALLOCATION => {
+            Ok(S1apMessage::HandoverFailure(parse_handover_failure(ies)?))
+        }
         ProcedureCode::PATH_SWITCH_REQUEST => Ok(S1apMessage::PathSwitchRequestFailure(
             parse_path_switch_request_failure(ies)?,
         )),
@@ -543,9 +543,7 @@ fn parse_initial_context_setup_request(
         mme_ue_s1ap_id: mme_ue_s1ap_id.ok_or(S1apError::MissingMandatoryIe("MME-UE-S1AP-ID"))?,
         enb_ue_s1ap_id: enb_ue_s1ap_id.ok_or(S1apError::MissingMandatoryIe("eNB-UE-S1AP-ID"))?,
         ue_ambr: ue_ambr.ok_or(S1apError::MissingMandatoryIe("uEaggregateMaximumBitrate"))?,
-        erab_list: erab_list.ok_or(S1apError::MissingMandatoryIe(
-            "E-RABToBeSetupListCtxtSUReq",
-        ))?,
+        erab_list: erab_list.ok_or(S1apError::MissingMandatoryIe("E-RABToBeSetupListCtxtSUReq"))?,
         ue_security_capabilities: ue_security_capabilities
             .ok_or(S1apError::MissingMandatoryIe("UESecurityCapabilities"))?,
         security_key: security_key.ok_or(S1apError::MissingMandatoryIe("SecurityKey"))?,

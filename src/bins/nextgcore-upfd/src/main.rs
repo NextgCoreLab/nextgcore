@@ -225,8 +225,7 @@ async fn main() -> Result<()> {
 
     // Data plane → PFCP report channel (Downlink Data Reports on first
     // buffered packet, Error Indication Reports from GTP-U)
-    let (report_tx, mut report_rx) =
-        tokio::sync::mpsc::channel::<data_plane::UpfReportEvent>(100);
+    let (report_tx, mut report_rx) = tokio::sync::mpsc::channel::<data_plane::UpfReportEvent>(100);
     data_plane.set_report_channel(report_tx);
     let pfcp_for_reports = pfcp_server.clone();
     let report_handle = tokio::spawn(async move {

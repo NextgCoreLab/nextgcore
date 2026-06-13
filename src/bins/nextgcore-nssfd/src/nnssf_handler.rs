@@ -710,16 +710,16 @@ mod tests {
     // Registration-scenario selection (pure logic, no context needed)
     // ------------------------------------------------------------------
 
-    fn reg_info(
-        subscribed: Vec<(u8, bool)>,
-        requested: Vec<u8>,
-    ) -> RegistrationSliceInfo {
+    fn reg_info(subscribed: Vec<(u8, bool)>, requested: Vec<u8>) -> RegistrationSliceInfo {
         RegistrationSliceInfo {
             subscribed: subscribed
                 .into_iter()
                 .map(|(sst, d)| (SNssai::new(sst, None), d))
                 .collect(),
-            requested: requested.into_iter().map(|s| SNssai::new(s, None)).collect(),
+            requested: requested
+                .into_iter()
+                .map(|s| SNssai::new(s, None))
+                .collect(),
             ..Default::default()
         }
     }

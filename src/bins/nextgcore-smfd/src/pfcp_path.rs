@@ -64,7 +64,10 @@ pub mod pfcp_message_type {
 
 /// Is this message type a response (solicited by one of our requests)?
 fn is_response_type(msg_type: u8) -> bool {
-    matches!(msg_type, 2 | 4 | 6 | 8 | 10 | 11 | 13 | 15 | 51 | 53 | 55 | 57)
+    matches!(
+        msg_type,
+        2 | 4 | 6 | 8 | 10 | 11 | 13 | 15 | 51 | 53 | 55 | 57
+    )
 }
 
 // ============================================================================
@@ -220,7 +223,11 @@ impl std::fmt::Display for PfcpRequestError {
                 write!(f, "no PFCP response after {attempts} attempts")
             }
             Self::Rejected { cause } => {
-                write!(f, "PFCP request rejected: cause {cause} ({})", cause_name(*cause))
+                write!(
+                    f,
+                    "PFCP request rejected: cause {cause} ({})",
+                    cause_name(*cause)
+                )
             }
             Self::Local(e) => write!(f, "local PFCP error: {e}"),
             Self::NotAssociated => write!(f, "no established PFCP association"),
@@ -362,9 +369,7 @@ impl PfcpClient {
 
             match tokio::time::timeout(t1, rx).await {
                 Ok(Ok((resp_type, resp_body))) => break Ok((resp_type, resp_body)),
-                Ok(Err(_)) => {
-                    break Err(PfcpRequestError::Local("response channel closed".into()))
-                }
+                Ok(Err(_)) => break Err(PfcpRequestError::Local("response channel closed".into())),
                 Err(_) => {
                     // T1 expired
                     self.pending.lock().await.remove(&seq);
@@ -504,10 +509,8 @@ impl PfcpClient {
 
     /// Run the PFCP Association Setup procedure (TS 29.244 6.2.6).
     pub async fn associate(&self) -> Result<(), PfcpRequestError> {
-        let mut req = AssociationSetupRequest::new(
-            NodeId::new_ipv4(self.node_ip),
-            self.recovery_time_stamp,
-        );
+        let mut req =
+            AssociationSetupRequest::new(NodeId::new_ipv4(self.node_ip), self.recovery_time_stamp);
         // CP Function Features: none of the optional CP features (LOAD,
         // OVRL, …) are implemented, so all bits are honestly zero.
         req.cp_function_features = Some(CpFunctionFeatures::default());
@@ -546,7 +549,10 @@ impl PfcpClient {
             "PFCP association established with {} (peer RTS={}, UP features={:?})",
             self.peer,
             resp.recovery_time_stamp,
-            assoc.up_function_features.as_ref().map(|f| (f.ftup, f.empu, f.bucp))
+            assoc
+                .up_function_features
+                .as_ref()
+                .map(|f| (f.ftup, f.empu, f.bucp))
         );
         Ok(())
     }
@@ -582,8 +588,7 @@ impl PfcpClient {
     /// Send one Heartbeat Request and validate the response (TS 29.244
     /// 6.2.2). Returns Ok(true) if the peer is alive, Err on timeout.
     pub async fn heartbeat_once(&self) -> Result<bool, PfcpRequestError> {
-        let msg =
-            PfcpMessage::HeartbeatRequest(HeartbeatRequest::new(self.recovery_time_stamp));
+        let msg = PfcpMessage::HeartbeatRequest(HeartbeatRequest::new(self.recovery_time_stamp));
         let mut buf = bytes::BytesMut::new();
         msg.encode_body(&mut buf);
 
@@ -667,9 +672,7 @@ mod tests {
             pfcp_message_type::SESSION_ESTABLISHMENT_RESPONSE
         ));
         assert!(!is_response_type(pfcp_message_type::HEARTBEAT_REQUEST));
-        assert!(!is_response_type(
-            pfcp_message_type::SESSION_REPORT_REQUEST
-        ));
+        assert!(!is_response_type(pfcp_message_type::SESSION_REPORT_REQUEST));
     }
 
     async fn make_client_with_peer() -> (Arc<PfcpClient>, UdpSocket) {
@@ -755,7 +758,10 @@ mod tests {
 
         match client.associate().await {
             Err(PfcpRequestError::Rejected { cause }) => {
-                assert_eq!(cause, ogs_pfcp::types::PfcpCause::NoResourcesAvailable as u8)
+                assert_eq!(
+                    cause,
+                    ogs_pfcp::types::PfcpCause::NoResourcesAvailable as u8
+                )
             }
             other => panic!("expected rejection, got {other:?}"),
         }
@@ -833,7 +839,11 @@ mod tests {
         }
         // 4 attempts × T1 (3s) ≈ 12s — allow generous lower bound
         assert!(start.elapsed() >= Duration::from_secs(9));
-        assert_eq!(counter.load(Ordering::SeqCst), 4, "1 initial + 3 retransmits");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            4,
+            "1 initial + 3 retransmits"
+        );
         assert!(
             !client.is_associated().await,
             "exhaustion must mark the association down"
@@ -919,10 +929,7 @@ mod tests {
             .expect("release response expected")
             .unwrap();
         let h = parse_wire_header(&buf[..len]).unwrap();
-        assert_eq!(
-            h.msg_type,
-            pfcp_message_type::ASSOCIATION_RELEASE_RESPONSE
-        );
+        assert_eq!(h.msg_type, pfcp_message_type::ASSOCIATION_RELEASE_RESPONSE);
         assert_eq!(
             parse_cause(&buf[h.body_offset..len]),
             Some(pfcp_cause::REQUEST_ACCEPTED)

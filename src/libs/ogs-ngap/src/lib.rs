@@ -567,10 +567,7 @@ mod tests {
                 let guamis = update.served_guami_list.expect("GUAMI list expected");
                 assert_eq!(guamis[0].backup_amf_name.as_deref(), Some("backup-amf"));
                 let plmns = update.plmn_support_list.expect("PLMN list expected");
-                assert_eq!(
-                    plmns[0].slice_support_list[0].sd,
-                    Some([0x00, 0x00, 0x01])
-                );
+                assert_eq!(plmns[0].slice_support_list[0].sd, Some([0x00, 0x00, 0x01]));
             }
             other => panic!("Expected AmfConfigurationUpdate, got {other:?}"),
         }
@@ -703,8 +700,10 @@ mod tests {
         let mut container = ProtocolIeContainer::new();
         ie::encode_amf_ue_ngap_id(&mut container, 10).unwrap();
         ie::encode_ran_ue_ngap_id(&mut container, 20).unwrap();
-        let bytes =
-            encode_initiating_pdu(ProcedureCode::PDU_SESSION_RESOURCE_MODIFY_INDICATION, container);
+        let bytes = encode_initiating_pdu(
+            ProcedureCode::PDU_SESSION_RESOURCE_MODIFY_INDICATION,
+            container,
+        );
 
         let result = parser::decode_ngap_pdu(&bytes);
         assert!(matches!(
@@ -947,7 +946,10 @@ mod tests {
             NgapMessage::PathSwitchRequest(psr) => {
                 assert_eq!(psr.ran_ue_ngap_id, 100);
                 assert_eq!(psr.source_amf_ue_ngap_id, 200);
-                assert_eq!(psr.ue_security_capabilities.nr_encryption_algorithms, 0xE000);
+                assert_eq!(
+                    psr.ue_security_capabilities.nr_encryption_algorithms,
+                    0xE000
+                );
                 assert_eq!(psr.pdu_session_list.len(), 1);
                 assert_eq!(psr.pdu_session_list[0].transfer, vec![0x55, 0x66]);
             }

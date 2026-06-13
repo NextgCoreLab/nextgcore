@@ -144,8 +144,14 @@ fn main() -> Result<()> {
                 diam.cnf_diamrlm
                     .clone()
                     .unwrap_or_else(|| "epc.mnc001.mcc001.3gppnetwork.org".to_string()),
-                diam.cnf_addr.clone().unwrap_or_else(|| "0.0.0.0".to_string()),
-                if diam.cnf_port == 0 { 3868 } else { diam.cnf_port },
+                diam.cnf_addr
+                    .clone()
+                    .unwrap_or_else(|| "0.0.0.0".to_string()),
+                if diam.cnf_port == 0 {
+                    3868
+                } else {
+                    diam.cnf_port
+                },
                 diam.cnf_timer_tc.max(1) as u32,
             )
         };

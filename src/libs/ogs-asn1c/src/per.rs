@@ -529,9 +529,9 @@ impl<'a> AperDecoder<'a> {
     pub fn read_bytes(&mut self, num_bytes: usize) -> PerResult<Vec<u8>> {
         // Validate availability before allocating so malformed lengths cannot
         // trigger huge allocations or arithmetic overflow
-        let needed = num_bytes.checked_mul(8).ok_or(PerError::InvalidLength {
-            length: num_bytes,
-        })?;
+        let needed = num_bytes
+            .checked_mul(8)
+            .ok_or(PerError::InvalidLength { length: num_bytes })?;
         if needed > self.remaining_bits() {
             return Err(PerError::BufferUnderflow {
                 needed,
@@ -1014,6 +1014,8 @@ mod tests {
         // Constrained offset outside the declared range
         let constraint = Constraint::new(0, 300);
         let mut decoder = AperDecoder::new(&[0xFF, 0xFF]);
-        assert!(decoder.decode_constrained_whole_number(&constraint).is_err());
+        assert!(decoder
+            .decode_constrained_whole_number(&constraint)
+            .is_err());
     }
 }

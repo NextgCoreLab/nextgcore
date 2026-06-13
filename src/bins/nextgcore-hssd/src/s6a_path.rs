@@ -97,14 +97,12 @@ impl S6aFailure {
             S6aFailure::MissingAvp => (Some(5005), None),
             S6aFailure::UnsupportedCommand => (Some(3001), None),
             S6aFailure::UserUnknown => (None, Some(s6a::exp_result::ERROR_USER_UNKNOWN)),
-            S6aFailure::AuthDataUnavailable => (
-                None,
-                Some(s6a::exp_result::AUTHENTICATION_DATA_UNAVAILABLE),
-            ),
-            S6aFailure::UnknownEpsSubscription => (
-                None,
-                Some(s6a::exp_result::ERROR_UNKNOWN_EPS_SUBSCRIPTION),
-            ),
+            S6aFailure::AuthDataUnavailable => {
+                (None, Some(s6a::exp_result::AUTHENTICATION_DATA_UNAVAILABLE))
+            }
+            S6aFailure::UnknownEpsSubscription => {
+                (None, Some(s6a::exp_result::ERROR_UNKNOWN_EPS_SUBSCRIPTION))
+            }
             S6aFailure::UnableToComply(_) => (Some(5012), None),
         }
     }
@@ -210,9 +208,7 @@ pub fn unregister_mme_peer(origin_host: &str) {
 
 /// Send an HSS-initiated request to a connected MME peer.
 fn send_to_mme(dest_host: &str, msg: DiameterMessage) -> Result<(), String> {
-    let registry = peer_registry()
-        .read()
-        .expect("peer registry lock poisoned");
+    let registry = peer_registry().read().expect("peer registry lock poisoned");
     let sender = registry
         .get(dest_host)
         .ok_or_else(|| format!("no connected S6a peer for {dest_host}"))?;
@@ -1384,8 +1380,10 @@ mod tests {
 
     #[test]
     fn test_build_pua_answer_has_pua_flags() {
-        let mut pur =
-            DiameterMessage::new_request(ogs_diameter::s6a::cmd::PURGE_UE, OGS_DIAM_S6A_APPLICATION_ID);
+        let mut pur = DiameterMessage::new_request(
+            ogs_diameter::s6a::cmd::PURGE_UE,
+            OGS_DIAM_S6A_APPLICATION_ID,
+        );
         pur.add_avp(Avp::mandatory(
             avp_code::SESSION_ID,
             AvpData::Utf8String("pur-session".to_string()),
@@ -1538,7 +1536,10 @@ mod tests {
         assert_eq!(clr.destination_host(), Some("mme.example.com"));
         assert_eq!(clr.destination_realm(), Some("example.com"));
         let ct = clr
-            .find_vendor_avp(ogs_diameter::s6a::avp::CANCELLATION_TYPE, OGS_3GPP_VENDOR_ID)
+            .find_vendor_avp(
+                ogs_diameter::s6a::avp::CANCELLATION_TYPE,
+                OGS_3GPP_VENDOR_ID,
+            )
             .and_then(|a| a.as_i32());
         assert_eq!(ct, Some(2));
         let flags = clr
@@ -1585,7 +1586,8 @@ mod tests {
             subscribed_rau_tau_timer: 720,
             ..Default::default()
         };
-        sub.apn_configs.push(ogs_diameter::s6a::ApnConfiguration::default());
+        sub.apn_configs
+            .push(ogs_diameter::s6a::ApnConfiguration::default());
         let idr = build_idr_request(
             "001010123456789",
             "mme.example.com",
@@ -1750,7 +1752,10 @@ mod tests {
         assert_eq!(inbound.header.command_code, 317);
         assert_eq!(inbound.user_name(), Some("001010000000042"));
         let ct = inbound
-            .find_vendor_avp(ogs_diameter::s6a::avp::CANCELLATION_TYPE, OGS_3GPP_VENDOR_ID)
+            .find_vendor_avp(
+                ogs_diameter::s6a::avp::CANCELLATION_TYPE,
+                OGS_3GPP_VENDOR_ID,
+            )
             .and_then(|a| a.as_i32());
         assert_eq!(ct, Some(CancellationType::SubscriptionWithdrawal as i32));
 

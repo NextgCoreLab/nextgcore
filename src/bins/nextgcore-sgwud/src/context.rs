@@ -534,8 +534,7 @@ impl SgwuContext {
     /// Install or replace a PDR; indexes its local TEID for G-PDU matching
     pub fn pdr_install(&self, pdr: SgwuPdr) -> bool {
         let key = (pdr.sess_id, pdr.pdr_id);
-        let (Ok(mut pdrs), Ok(mut teids)) = (self.pdr_list.write(), self.teid_hash.write())
-        else {
+        let (Ok(mut pdrs), Ok(mut teids)) = (self.pdr_list.write(), self.teid_hash.write()) else {
             return false;
         };
         // Remove the previous TEID index when updating
@@ -553,8 +552,7 @@ impl SgwuContext {
 
     /// Remove a PDR
     pub fn pdr_remove(&self, sess_id: u64, pdr_id: u16) -> Option<SgwuPdr> {
-        let (Ok(mut pdrs), Ok(mut teids)) = (self.pdr_list.write(), self.teid_hash.write())
-        else {
+        let (Ok(mut pdrs), Ok(mut teids)) = (self.pdr_list.write(), self.teid_hash.write()) else {
             return None;
         };
         let pdr = pdrs.remove(&(sess_id, pdr_id))?;

@@ -467,8 +467,7 @@ mod tests {
         tampered.replace_range(0..1, "f");
         let tampered_auth = format!("Bearer {tampered}");
         assert!(
-            authorize_sbi_request(Some(&tampered_auth), "nsmf-pdusession", &policy, &jwks)
-                .is_err()
+            authorize_sbi_request(Some(&tampered_auth), "nsmf-pdusession", &policy, &jwks).is_err()
         );
 
         // An unsigned/garbage-signature token is rejected too.
@@ -490,8 +489,7 @@ mod tests {
         let (expired, jwks2) = signed_token_and_jwks("nsmf-pdusession", 1);
         let expired_auth = format!("Bearer {expired}");
         assert!(
-            authorize_sbi_request(Some(&expired_auth), "nsmf-pdusession", &policy, &jwks2)
-                .is_err()
+            authorize_sbi_request(Some(&expired_auth), "nsmf-pdusession", &policy, &jwks2).is_err()
         );
     }
 

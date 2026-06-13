@@ -592,7 +592,10 @@ pub fn build_reset_acknowledge(msg: &ResetAcknowledge) -> S1apResult<Vec<u8>> {
 
     // IE: UE-associatedLogicalS1-ConnectionListResAck (optional)
     if !msg.ue_associated_connections.is_empty() {
-        ie::encode_ue_associated_connection_list_ack(&mut container, &msg.ue_associated_connections)?;
+        ie::encode_ue_associated_connection_list_ack(
+            &mut container,
+            &msg.ue_associated_connections,
+        )?;
     }
 
     encode_pdu(&successful(
@@ -692,9 +695,7 @@ pub fn build_handover_command(msg: &HandoverCommand) -> S1apResult<Vec<u8>> {
 }
 
 /// Build a Handover Preparation Failure PDU
-pub fn build_handover_preparation_failure(
-    msg: &HandoverPreparationFailure,
-) -> S1apResult<Vec<u8>> {
+pub fn build_handover_preparation_failure(msg: &HandoverPreparationFailure) -> S1apResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
 
     ie::encode_mme_ue_s1ap_id(&mut container, msg.mme_ue_s1ap_id, Criticality::Reject)?;
@@ -736,9 +737,7 @@ pub fn build_handover_request(msg: &HandoverRequest) -> S1apResult<Vec<u8>> {
 }
 
 /// Build a Handover Request Acknowledge PDU
-pub fn build_handover_request_acknowledge(
-    msg: &HandoverRequestAcknowledge,
-) -> S1apResult<Vec<u8>> {
+pub fn build_handover_request_acknowledge(msg: &HandoverRequestAcknowledge) -> S1apResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
 
     ie::encode_mme_ue_s1ap_id(&mut container, msg.mme_ue_s1ap_id, Criticality::Ignore)?;

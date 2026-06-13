@@ -8,9 +8,9 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use ogs_gtp::v2::header::{Gtp2Header, Gtp2MessageType};
 use ogs_gtp::v2::ie::{
-    Gtp2AmbrIe, Gtp2ApnIe, Gtp2ApnRestrictionIe, Gtp2BearerContextIe, Gtp2BearerQosIe,
-    Gtp2CauseIe, Gtp2EbiIe, Gtp2FTeidIe, Gtp2IeType, Gtp2IndicationIe, Gtp2PaaIe, Gtp2PdnTypeIe,
-    Gtp2RatTypeIe, Gtp2RecoveryIe, Gtp2SelectionModeIe,
+    Gtp2AmbrIe, Gtp2ApnIe, Gtp2ApnRestrictionIe, Gtp2BearerContextIe, Gtp2BearerQosIe, Gtp2CauseIe,
+    Gtp2EbiIe, Gtp2FTeidIe, Gtp2IeType, Gtp2IndicationIe, Gtp2PaaIe, Gtp2PdnTypeIe, Gtp2RatTypeIe,
+    Gtp2RecoveryIe, Gtp2SelectionModeIe,
 };
 use ogs_gtp::v2::message::Gtp2Message;
 
@@ -758,8 +758,7 @@ mod tests {
     #[test]
     fn test_modify_bearer_response_round_trip() {
         let (_, sess) = provision(&[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x02]);
-        let msg =
-            build_modify_bearer_response(&sess, 2, gtp_cause::REQUEST_ACCEPTED).unwrap();
+        let msg = build_modify_bearer_response(&sess, 2, gtp_cause::REQUEST_ACCEPTED).unwrap();
         let decoded = round_trip(&msg);
 
         assert_eq!(
@@ -779,8 +778,7 @@ mod tests {
     #[test]
     fn test_modify_bearer_response_reject_has_no_bearer_context() {
         let (_, sess) = provision(&[0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x03]);
-        let msg =
-            build_modify_bearer_response(&sess, 3, gtp_cause::CONTEXT_NOT_FOUND).unwrap();
+        let msg = build_modify_bearer_response(&sess, 3, gtp_cause::CONTEXT_NOT_FOUND).unwrap();
         let decoded = round_trip(&msg);
         assert_eq!(
             Gtp2CauseIe::decode(&decoded.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
@@ -886,9 +884,8 @@ mod tests {
             Some(Gtp2IeType::Imsi as u8),
         );
         let decoded = round_trip(&msg);
-        let cause =
-            Gtp2CauseIe::decode(&decoded.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
-                .unwrap();
+        let cause = Gtp2CauseIe::decode(&decoded.get_ie(Gtp2IeType::Cause as u8, 0).unwrap().value)
+            .unwrap();
         assert_eq!(cause.cause, gtp_cause::MANDATORY_IE_MISSING);
         assert_eq!(cause.offending_ie_type, Some(Gtp2IeType::Imsi as u8));
     }
@@ -944,8 +941,7 @@ mod tests {
         );
         assert!(decoded.bearer_context(0).unwrap().is_some());
 
-        let msg =
-            build_s5c_create_bearer_response(&sess, 14, gtp_cause::REQUEST_ACCEPTED).unwrap();
+        let msg = build_s5c_create_bearer_response(&sess, 14, gtp_cause::REQUEST_ACCEPTED).unwrap();
         let decoded = round_trip(&msg);
         assert_eq!(
             decoded.header.message_type,

@@ -78,8 +78,8 @@ fn aes128_ctr(key: &[u8; 16], icb: &[u8; 16], data: &[u8]) -> Vec<u8> {
 
 /// HMAC-SHA-256 over `data`, truncated to the 8-byte ECIES MAC tag.
 fn hmac_tag(mac_key: &[u8; 32], data: &[u8]) -> EciesResult<[u8; ECIES_MAC_TAG_SIZE]> {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(mac_key)
-        .map_err(|_| EciesError::EncryptionFailed)?;
+    let mut mac =
+        <Hmac<Sha256> as Mac>::new_from_slice(mac_key).map_err(|_| EciesError::EncryptionFailed)?;
     mac.update(data);
     let result = mac.finalize().into_bytes();
     let mut tag = [0u8; ECIES_MAC_TAG_SIZE];
@@ -98,7 +98,11 @@ fn hmac_tag(mac_key: &[u8; 32], data: &[u8]) -> EciesResult<[u8; ECIES_MAC_TAG_S
 pub fn ecies_profile_a_encrypt(
     hn_pub_key: &[u8; ECIES_X25519_KEY_SIZE],
     plaintext: &[u8],
-) -> EciesResult<([u8; ECIES_X25519_KEY_SIZE], Vec<u8>, [u8; ECIES_MAC_TAG_SIZE])> {
+) -> EciesResult<(
+    [u8; ECIES_X25519_KEY_SIZE],
+    Vec<u8>,
+    [u8; ECIES_MAC_TAG_SIZE],
+)> {
     let mut eph_priv = [0u8; ECIES_X25519_KEY_SIZE];
     ogs_core::rand::ogs_random(&mut eph_priv);
     ecies_profile_a_encrypt_with_ephemeral(hn_pub_key, plaintext, &eph_priv)
@@ -112,7 +116,11 @@ pub fn ecies_profile_a_encrypt_with_ephemeral(
     hn_pub_key: &[u8; ECIES_X25519_KEY_SIZE],
     plaintext: &[u8],
     eph_priv: &[u8; ECIES_X25519_KEY_SIZE],
-) -> EciesResult<([u8; ECIES_X25519_KEY_SIZE], Vec<u8>, [u8; ECIES_MAC_TAG_SIZE])> {
+) -> EciesResult<(
+    [u8; ECIES_X25519_KEY_SIZE],
+    Vec<u8>,
+    [u8; ECIES_MAC_TAG_SIZE],
+)> {
     let secret = StaticSecret::from(*eph_priv);
     let eph_pub = X25519PublicKey::from(&secret);
     let shared = secret.diffie_hellman(&X25519PublicKey::from(*hn_pub_key));

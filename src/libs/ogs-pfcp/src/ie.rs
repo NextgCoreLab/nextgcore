@@ -841,5 +841,4 @@ mod tests {
         assert_eq!(decoded.ie_type, IeType::Cause as u16);
         assert_eq!(decoded.data.as_ref(), &[0x01]);
     }
-
 }

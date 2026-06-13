@@ -234,8 +234,7 @@ struct JwsHeader {
 /// HMAC-SHA-256 over a raw JWS signing input (`protected.payload`).
 /// Exposed for RFC 7515 Appendix A.1 known-answer tests.
 pub fn hs256_sign_input(key: &[u8], signing_input: &[u8]) -> Vec<u8> {
-    let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(signing_input);
     mac.finalize().into_bytes().to_vec()
 }
@@ -276,7 +275,8 @@ pub fn jws_verify(key: &[u8], jws: &FlatJws) -> Result<Vec<u8>, JoseError> {
     let mut mac =
         <Hmac<Sha256> as Mac>::new_from_slice(key).map_err(|e| JoseError::Crypto(e.to_string()))?;
     mac.update(signing_input.as_bytes());
-    mac.verify_slice(&signature).map_err(|_| JoseError::Tampered)?;
+    mac.verify_slice(&signature)
+        .map_err(|_| JoseError::Tampered)?;
 
     b64url_decode(&jws.payload)
 }
@@ -381,8 +381,7 @@ mod tests {
     #[test]
     fn jwe_unsupported_alg_rejected() {
         let mut jwe = jwe_encrypt(&KEY, b"secret", None, None).unwrap();
-        jwe.protected =
-            b64url_encode(br#"{"alg":"RSA-OAEP","enc":"A256GCM"}"#);
+        jwe.protected = b64url_encode(br#"{"alg":"RSA-OAEP","enc":"A256GCM"}"#);
         assert!(matches!(
             jwe_decrypt(&KEY, &jwe),
             Err(JoseError::UnsupportedAlgorithm(_))

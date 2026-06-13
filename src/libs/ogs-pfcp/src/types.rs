@@ -1590,7 +1590,11 @@ impl UpFunctionFeatures {
         let b3 = buf.get_u8();
         let b4 = buf.get_u8();
         let b5 = buf.get_u8();
-        let b6 = if buf.remaining() >= 1 { buf.get_u8() } else { 0 };
+        let b6 = if buf.remaining() >= 1 {
+            buf.get_u8()
+        } else {
+            0
+        };
 
         Ok(Self {
             bucp: b0 & 0x01 != 0,

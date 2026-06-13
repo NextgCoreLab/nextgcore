@@ -1339,7 +1339,10 @@ impl AmfContext {
 
     /// Number of stored event-exposure subscriptions
     pub fn event_subscription_count(&self) -> usize {
-        self.event_subscriptions.read().map(|m| m.len()).unwrap_or(0)
+        self.event_subscriptions
+            .read()
+            .map(|m| m.len())
+            .unwrap_or(0)
     }
 
     // ========================================================================

@@ -823,7 +823,10 @@ mod tests {
         assert_eq!(a.nsi_id.len(), 36);
         assert_eq!(a.nsi_id.matches('-').count(), 4);
         assert_ne!(a.nsi_id, b.nsi_id);
-        assert!(a.nsi_id.parse::<u64>().is_err(), "nsiId must not be a pool index");
+        assert!(
+            a.nsi_id.parse::<u64>().is_err(),
+            "nsiId must not be a pool index"
+        );
     }
 
     #[test]

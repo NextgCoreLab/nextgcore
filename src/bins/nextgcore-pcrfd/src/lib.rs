@@ -22,8 +22,8 @@ pub use context::{
 pub use event::{PcrfEvent, PcrfEventId};
 pub use fd_path::{
     pcrf_fd_final, pcrf_fd_init, pcrf_fd_listen, pcrf_fd_peer_connected, pcrf_fd_send_request,
-    pcrf_fd_set_local_identity, pcrf_local_identity, LocalIdentity, PcrfDiamStats,
-    PcrfDiamStatsGx, PcrfDiamStatsRx,
+    pcrf_fd_set_local_identity, pcrf_local_identity, LocalIdentity, PcrfDiamStats, PcrfDiamStatsGx,
+    PcrfDiamStatsRx,
 };
 pub use gx_path::{pcrf_gx_final, pcrf_gx_init, pcrf_gx_send_rar, RarAction};
 pub use rx_path::{pcrf_rx_final, pcrf_rx_init, pcrf_rx_send_asr_for_target};

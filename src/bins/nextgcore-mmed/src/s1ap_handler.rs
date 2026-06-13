@@ -16,15 +16,14 @@ use crate::s1ap_build::{
     radio_network_cause, tai_from_s1ap, transport_address_to_ip, ue_security_capabilities_from,
 };
 use ogs_s1ap::{
-    builder, decode_s1ap_pdu, Cause, EnbId, ErabSwitchedItem,
-    ErabToBeSetupItemHoReq, HandoverCancel, HandoverCancelAcknowledge, HandoverCommand,
-    HandoverFailure, HandoverNotify, HandoverPreparationFailure, HandoverRequest,
-    HandoverRequestAcknowledge, HandoverRequired, HandoverType as S1apHandoverType,
-    InitialContextSetupResponse, InitialUeMessage, NasNonDeliveryIndication, PathSwitchRequest,
-    PathSwitchRequestAcknowledge, PathSwitchRequestFailure, Reset, ResetAcknowledge, ResetType,
-    S1SetupRequest, S1apMessage, SecurityContext, TargetId, TimeToWait, UeAmbr,
-    UeCapabilityInfoIndication, UeContextReleaseComplete, UeContextReleaseRequest,
-    UlNasTransport,
+    builder, decode_s1ap_pdu, Cause, EnbId, ErabSwitchedItem, ErabToBeSetupItemHoReq,
+    HandoverCancel, HandoverCancelAcknowledge, HandoverCommand, HandoverFailure, HandoverNotify,
+    HandoverPreparationFailure, HandoverRequest, HandoverRequestAcknowledge, HandoverRequired,
+    HandoverType as S1apHandoverType, InitialContextSetupResponse, InitialUeMessage,
+    NasNonDeliveryIndication, PathSwitchRequest, PathSwitchRequestAcknowledge,
+    PathSwitchRequestFailure, Reset, ResetAcknowledge, ResetType, S1SetupRequest, S1apMessage,
+    SecurityContext, TargetId, TimeToWait, UeAmbr, UeCapabilityInfoIndication,
+    UeContextReleaseComplete, UeContextReleaseRequest, UlNasTransport,
 };
 
 // ============================================================================
@@ -296,7 +295,9 @@ pub fn handle_s1_setup_request(
 
     // At least one broadcast TAI must be served by this MME (TS 36.413 §8.7.3.4)
     if ctx.num_of_served_tai > 0
-        && !supported_tais.iter().any(|tai| ctx.find_served_tai(tai).is_some())
+        && !supported_tais
+            .iter()
+            .any(|tai| ctx.find_served_tai(tai).is_some())
     {
         log::error!("S1 Setup Request from eNB 0x{enb_id_value:x}: no served TAI matches");
         return setup_failure(
@@ -541,9 +542,7 @@ pub fn handle_reset(ctx: &MmeContext, enb_id: u64, msg: &Reset) -> Vec<S1apSend>
                                 .read()
                                 .unwrap()
                                 .iter()
-                                .find(|(_, ue)| {
-                                    ue.enb_id == enb_id && ue.enb_ue_s1ap_id == id
-                                })
+                                .find(|(_, ue)| ue.enb_id == enb_id && ue.enb_ue_s1ap_id == id)
                                 .map(|(pool_id, _)| *pool_id)
                         })
                     });
@@ -928,7 +927,12 @@ pub fn handle_handover_notify(
     }
 
     // The UE now lives on the target context
-    if let Some(mme_ue) = ctx.mme_ue_pool.write().unwrap().get_mut(&target_ue.mme_ue_id) {
+    if let Some(mme_ue) = ctx
+        .mme_ue_pool
+        .write()
+        .unwrap()
+        .get_mut(&target_ue.mme_ue_id)
+    {
         mme_ue.enb_ue_id = target_ue_id;
     }
 
@@ -1295,8 +1299,8 @@ mod tests {
     use super::*;
     use crate::context::{Bitrate, MmeUe, PlmnId, ServedGummei};
     use ogs_s1ap::{
-        CauseRadioNetwork, GlobalEnbId, STmsi, SupportedTaItem,
-        UeAssociatedLogicalS1Connection, UeSecurityCapabilities,
+        CauseRadioNetwork, GlobalEnbId, STmsi, SupportedTaItem, UeAssociatedLogicalS1Connection,
+        UeSecurityCapabilities,
     };
 
     fn test_ctx() -> MmeContext {
@@ -1327,10 +1331,7 @@ mod tests {
         let enb_ue_id = ctx.enb_ue_add(enb_id, 100);
         let mme_ue_id = ctx.mme_ue_add(enb_ue_id);
         ctx.enb_ue_associate_mme_ue(enb_ue_id, mme_ue_id);
-        let mme_ue_s1ap_id = ctx
-            .enb_ue_find_by_id(enb_ue_id)
-            .unwrap()
-            .mme_ue_s1ap_id;
+        let mme_ue_s1ap_id = ctx.enb_ue_find_by_id(enb_ue_id).unwrap().mme_ue_s1ap_id;
         {
             let mut pool = ctx.mme_ue_pool.write().unwrap();
             let mme_ue: &mut MmeUe = pool.get_mut(&mme_ue_id).unwrap();
@@ -1477,8 +1478,7 @@ mod tests {
         let (enb_id, _, mme_ue_id, mme_ue_s1ap_id) = add_ue(&ctx);
         {
             let mut pool = ctx.mme_ue_pool.write().unwrap();
-            pool.get_mut(&mme_ue_id).unwrap().paging.type_ =
-                PagingType::DownlinkDataNotification;
+            pool.get_mut(&mme_ue_id).unwrap().paging.type_ = PagingType::DownlinkDataNotification;
         }
 
         let bytes = builder::build_nas_non_delivery_indication(&NasNonDeliveryIndication {
@@ -1544,8 +1544,7 @@ mod tests {
                 // Fresh security context: NCC advanced from 0 to 1, NH
                 // derived from KeNB per TS 33.401 Annex A.4
                 assert_eq!(ack.security_context.next_hop_chaining_count, 1);
-                let expected_nh =
-                    ogs_crypt::kdf::ogs_kdf_nh_enb(&[0x11; 32], &[0x22; 32]);
+                let expected_nh = ogs_crypt::kdf::ogs_kdf_nh_enb(&[0x11; 32], &[0x22; 32]);
                 assert_eq!(ack.security_context.next_hop_parameter, expected_nh);
                 assert_eq!(ack.erab_switched_ul_list.len(), 1);
                 assert_eq!(ack.erab_switched_ul_list[0].gtp_teid, 0x5555);
@@ -1817,7 +1816,10 @@ mod tests {
         assert_ne!(mme_ue.enb_ue_id, source_ue_id);
         // Source release action recorded for the release procedure
         let source_ue = ctx.enb_ue_find_by_id(source_ue_id).unwrap();
-        assert_eq!(source_ue.ue_ctx_rel_action, UeCtxRelAction::S1HandoverComplete);
+        assert_eq!(
+            source_ue.ue_ctx_rel_action,
+            UeCtxRelAction::S1HandoverComplete
+        );
     }
 
     #[test]

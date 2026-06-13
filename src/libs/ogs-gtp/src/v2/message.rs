@@ -917,10 +917,7 @@ mod tests {
         let decoded_bearer = decoded.bearer_context(0).unwrap().unwrap();
         assert_eq!(decoded_bearer, bearer);
         assert_eq!(decoded_bearer.ebi().unwrap(), 5);
-        assert_eq!(
-            decoded_bearer.fteid(0).unwrap().unwrap().teid,
-            0x22222222
-        );
+        assert_eq!(decoded_bearer.fteid(0).unwrap().unwrap().teid, 0x22222222);
         assert_eq!(decoded_bearer.bearer_qos().unwrap().unwrap().qci, 9);
 
         let indication = crate::v2::ie::Gtp2IndicationIe::decode(

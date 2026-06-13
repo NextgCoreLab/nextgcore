@@ -864,7 +864,9 @@ async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest) -> 
     }
 
     // Mandatory subscription material (TS 29.505 AuthenticationSubscription)
-    let k_hex = auth_sub_json.get("encPermanentKey").and_then(|v| v.as_str());
+    let k_hex = auth_sub_json
+        .get("encPermanentKey")
+        .and_then(|v| v.as_str());
     let opc_hex = auth_sub_json.get("encOpcKey").and_then(|v| v.as_str());
     let amf_hex = auth_sub_json
         .get("authenticationManagementField")
@@ -1029,12 +1031,8 @@ async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest) -> 
             // transformed AV (RAND, AUTN, XRES, CK', IK') to the AUSF.
             let mut sqn_xor_ak = [0u8; 6];
             sqn_xor_ak.copy_from_slice(&autn[..6]);
-            let (ck_prime, ik_prime) = ogs_crypt::kdf::ogs_kdf_ck_ik_prime(
-                &ck,
-                &ik,
-                serving_network_name,
-                &sqn_xor_ak,
-            );
+            let (ck_prime, ik_prime) =
+                ogs_crypt::kdf::ogs_kdf_ck_ik_prime(&ck, &ik, serving_network_name, &sqn_xor_ak);
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({
                     "authType": "EAP_AKA_PRIME",
@@ -1108,9 +1106,7 @@ async fn handle_auth_event(supi: &str, request: &SbiRequest) -> SbiResponse {
     }
     let success = match auth_event.get("success").and_then(|v| v.as_bool()) {
         Some(s) => s,
-        None => {
-            return send_problem(400, "MANDATORY_IE_MISSING", "AuthEvent.success is missing")
-        }
+        None => return send_problem(400, "MANDATORY_IE_MISSING", "AuthEvent.success is missing"),
     };
 
     log::info!("Auth Event: success={success}");
@@ -1417,10 +1413,8 @@ mod tests {
     #[test]
     fn test_load_hnet_key() {
         // Inline hex
-        let key = load_hnet_key(
-            "c53c22208b61860b06c62e5406a7b330c2b577aa5558981510d128247d38bd1d",
-        )
-        .unwrap();
+        let key = load_hnet_key("c53c22208b61860b06c62e5406a7b330c2b577aa5558981510d128247d38bd1d")
+            .unwrap();
         assert_eq!(key.len(), 32);
         // Bad hex / wrong length / missing file
         assert!(load_hnet_key("deadbeef").is_none());
@@ -1542,9 +1536,8 @@ mod tests {
                 .expect("udm start");
 
             let client = ogs_sbi::client::SbiClient::with_host_port("127.0.0.1", udm_port);
-            let gen_path = |id: &str| {
-                format!("/nudm-ueau/v1/{id}/security-information/generate-auth-data")
-            };
+            let gen_path =
+                |id: &str| format!("/nudm-ueau/v1/{id}/security-information/generate-auth-data");
 
             // ---- strict-peer rejections ----
             // Missing servingNetworkName -> 400 MANDATORY_IE_MISSING

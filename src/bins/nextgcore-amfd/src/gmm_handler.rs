@@ -964,7 +964,10 @@ mod tests {
         };
 
         let result = handle_ul_nas_transport(&mut amf_ue, &ran_ue, &transport);
-        assert_eq!(result, Err(GmmCause::MessageTypeNonExistentOrNotImplemented));
+        assert_eq!(
+            result,
+            Err(GmmCause::MessageTypeNonExistentOrNotImplemented)
+        );
     }
 
     #[test]

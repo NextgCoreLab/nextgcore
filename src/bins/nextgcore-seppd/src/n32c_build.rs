@@ -449,10 +449,16 @@ mod tests {
 
         let mut node = SeppNode::new(2, "sepp.peer.example.com");
         let req_data = build_security_capability_request(&mut node, false).unwrap();
-        assert!(req_data.plmn_id_list.iter().any(|p| p.mcc == 999 && p.mnc == 70));
+        assert!(req_data
+            .plmn_id_list
+            .iter()
+            .any(|p| p.mcc == 999 && p.mnc == 70));
 
         let rsp_data = build_security_capability_response(&node).unwrap();
-        assert!(rsp_data.plmn_id_list.iter().any(|p| p.mcc == 999 && p.mnc == 70));
+        assert!(rsp_data
+            .plmn_id_list
+            .iter()
+            .any(|p| p.mcc == 999 && p.mnc == 70));
 
         // Reset to avoid leaking into parallel tests
         if let Ok(mut context) = ctx.write() {

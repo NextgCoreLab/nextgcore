@@ -12,12 +12,11 @@ use crate::context::{
 };
 use ogs_s1ap::{
     builder, AllocationRetentionPriority, Cause, CauseMisc, CauseNas, CauseProtocol,
-    CauseRadioNetwork, CauseTransport, CnDomain, DlNasTransport, ErabItem,
-    ErabLevelQosParameters, ErabModifyRequest, ErabReleaseCommand, ErabSetupRequest,
-    ErabToBeModifiedItem, ErabToBeSetupItem, ErrorIndication, EutranCgi, GbrQosInformation,
-    InitialContextSetupRequest, Paging, PagingDrx, S1SetupFailure, S1SetupResponse, S1apResult,
-    STmsi, ServedGummeiItem, Tai, TimeToWait, UeAmbr, UeContextReleaseCommand, UePagingId,
-    UeS1apIds, UeSecurityCapabilities,
+    CauseRadioNetwork, CauseTransport, CnDomain, DlNasTransport, ErabItem, ErabLevelQosParameters,
+    ErabModifyRequest, ErabReleaseCommand, ErabSetupRequest, ErabToBeModifiedItem,
+    ErabToBeSetupItem, ErrorIndication, EutranCgi, GbrQosInformation, InitialContextSetupRequest,
+    Paging, PagingDrx, S1SetupFailure, S1SetupResponse, S1apResult, STmsi, ServedGummeiItem, Tai,
+    TimeToWait, UeAmbr, UeContextReleaseCommand, UePagingId, UeS1apIds, UeSecurityCapabilities,
 };
 
 // ============================================================================
@@ -183,9 +182,9 @@ pub fn cause_to_s1ap(group: S1apCauseGroup, value: i64) -> Cause {
             nas_cause::CSG_SUBSCRIPTION_EXPIRY => CauseNas::CsgSubscriptionExpiry,
             _ => CauseNas::Unspecified,
         }),
-        S1apCauseGroup::Protocol => Cause::Protocol(
-            CauseProtocol::try_from(value).unwrap_or(CauseProtocol::Unspecified),
-        ),
+        S1apCauseGroup::Protocol => {
+            Cause::Protocol(CauseProtocol::try_from(value).unwrap_or(CauseProtocol::Unspecified))
+        }
         S1apCauseGroup::Misc => {
             Cause::Misc(CauseMisc::try_from(value).unwrap_or(CauseMisc::Unspecified))
         }
@@ -664,7 +663,10 @@ mod tests {
                 assert_eq!(rsp.mme_name.as_deref(), Some("nextg-mme"));
                 assert_eq!(rsp.relative_mme_capacity, 100);
                 assert_eq!(rsp.served_gummeis.len(), 1);
-                assert_eq!(rsp.served_gummeis[0].served_plmns[0], encode_plmn_id(&test_plmn()));
+                assert_eq!(
+                    rsp.served_gummeis[0].served_plmns[0],
+                    encode_plmn_id(&test_plmn())
+                );
                 assert_eq!(rsp.served_gummeis[0].served_group_ids, vec![2]);
                 assert_eq!(rsp.served_gummeis[0].served_mmec_codes, vec![1]);
             }
@@ -726,7 +728,10 @@ mod tests {
                 assert_eq!(req.erab_list[0].transport_layer_address, vec![10, 0, 0, 1]);
                 assert_eq!(req.erab_list[0].erab_qos.qci, 9);
                 assert!(req.erab_list[0].erab_qos.arp.pre_emption_capability);
-                assert_eq!(req.erab_list[0].nas_pdu.as_deref(), Some(nas_pdu.as_slice()));
+                assert_eq!(
+                    req.erab_list[0].nas_pdu.as_deref(),
+                    Some(nas_pdu.as_slice())
+                );
                 // NAS EEA/EIA bitmap (EEA0 at MSB) shifted past EA0 for S1AP
                 assert_eq!(req.ue_security_capabilities.encryption_algorithms, 0xE000);
                 assert_eq!(req.ue_security_capabilities.integrity_algorithms, 0xE000);
@@ -738,13 +743,9 @@ mod tests {
 
     #[test]
     fn test_build_ue_context_release_command_roundtrip() {
-        let bytes = build_ue_context_release_command(
-            Some(7),
-            42,
-            S1apCauseGroup::Nas,
-            nas_cause::DETACH,
-        )
-        .unwrap();
+        let bytes =
+            build_ue_context_release_command(Some(7), 42, S1apCauseGroup::Nas, nas_cause::DETACH)
+                .unwrap();
         match decode_s1ap_pdu(&bytes).unwrap() {
             S1apMessage::UeContextReleaseCommand(cmd) => {
                 assert_eq!(
@@ -782,7 +783,10 @@ mod tests {
                 assert_eq!(req.mme_ue_s1ap_id, 42);
                 assert_eq!(req.erab_list.len(), 1);
                 assert_eq!(req.erab_list[0].erab_id, 5);
-                assert_eq!(req.erab_list[0].nas_pdu.as_deref(), Some(nas_pdu.as_slice()));
+                assert_eq!(
+                    req.erab_list[0].nas_pdu.as_deref(),
+                    Some(nas_pdu.as_slice())
+                );
             }
             other => panic!("unexpected message: {other:?}"),
         }
@@ -841,8 +845,7 @@ mod tests {
             tac: 0x0001,
         };
 
-        let bytes =
-            build_paging(&mme_ue, CnDomain::Ps, std::slice::from_ref(&tai), None).unwrap();
+        let bytes = build_paging(&mme_ue, CnDomain::Ps, std::slice::from_ref(&tai), None).unwrap();
         match decode_s1ap_pdu(&bytes).unwrap() {
             S1apMessage::Paging(paging) => {
                 assert_eq!(
@@ -897,7 +900,10 @@ mod tests {
             S1apMessage::ErrorIndication(ind) => {
                 assert_eq!(ind.mme_ue_s1ap_id, Some(42));
                 assert_eq!(ind.enb_ue_s1ap_id, Some(7));
-                assert_eq!(ind.cause, Some(Cause::Protocol(CauseProtocol::SemanticError)));
+                assert_eq!(
+                    ind.cause,
+                    Some(Cause::Protocol(CauseProtocol::SemanticError))
+                );
             }
             other => panic!("unexpected message: {other:?}"),
         }
@@ -909,7 +915,10 @@ mod tests {
             S1apCauseGroup::RadioNetwork,
             radio_network_cause::X2_HANDOVER_TRIGGERED,
         );
-        assert_eq!(cause, Cause::RadioNetwork(CauseRadioNetwork::X2HandoverTriggered));
+        assert_eq!(
+            cause,
+            Cause::RadioNetwork(CauseRadioNetwork::X2HandoverTriggered)
+        );
         let back = cause_from_s1ap(&cause);
         assert_eq!(back.group, S1apCauseGroup::RadioNetwork);
         assert_eq!(back.cause, radio_network_cause::X2_HANDOVER_TRIGGERED);

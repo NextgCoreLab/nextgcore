@@ -595,7 +595,11 @@ pub fn build_e_utran_vector_avp(item_number: Option<u32>, v: &EUtranVector) -> A
         OGS_3GPP_VENDOR_ID,
         AvpData::OctetString(Bytes::copy_from_slice(&v.kasme)),
     ));
-    Avp::vendor_mandatory(avp::E_UTRAN_VECTOR, OGS_3GPP_VENDOR_ID, AvpData::Grouped(group))
+    Avp::vendor_mandatory(
+        avp::E_UTRAN_VECTOR,
+        OGS_3GPP_VENDOR_ID,
+        AvpData::Grouped(group),
+    )
 }
 
 /// Parse all E-UTRAN-Vectors from the Authentication-Info AVP of an AIA.
@@ -683,10 +687,7 @@ pub fn experimental_result_avp(code: u32) -> Avp {
     Avp::mandatory(
         avp_code::EXPERIMENTAL_RESULT,
         AvpData::Grouped(vec![
-            Avp::mandatory(
-                avp_code::VENDOR_ID,
-                AvpData::Unsigned32(OGS_3GPP_VENDOR_ID),
-            ),
+            Avp::mandatory(avp_code::VENDOR_ID, AvpData::Unsigned32(OGS_3GPP_VENDOR_ID)),
             Avp::mandatory(
                 avp_code::EXPERIMENTAL_RESULT_CODE,
                 AvpData::Unsigned32(code),
@@ -863,7 +864,11 @@ pub fn build_apn_configuration_avp(apn: &ApnConfiguration) -> Avp {
             AvpData::OctetString(Bytes::copy_from_slice(&cc)),
         ));
     }
-    Avp::vendor_mandatory(avp::APN_CONFIGURATION, OGS_3GPP_VENDOR_ID, AvpData::Grouped(group))
+    Avp::vendor_mandatory(
+        avp::APN_CONFIGURATION,
+        OGS_3GPP_VENDOR_ID,
+        AvpData::Grouped(group),
+    )
 }
 
 /// Build the Subscription-Data grouped AVP (TS 29.272 7.3.2) for ULA/IDR.
@@ -949,7 +954,11 @@ pub fn build_subscription_data_avp(sub: &SubscriptionData) -> Avp {
         ));
     }
 
-    Avp::vendor_mandatory(avp::SUBSCRIPTION_DATA, OGS_3GPP_VENDOR_ID, AvpData::Grouped(group))
+    Avp::vendor_mandatory(
+        avp::SUBSCRIPTION_DATA,
+        OGS_3GPP_VENDOR_ID,
+        AvpData::Grouped(group),
+    )
 }
 
 /// Parse an AMBR grouped AVP into (uplink, downlink) bps.
@@ -1003,15 +1012,13 @@ pub fn parse_apn_configuration_avp(avp_in: &Avp) -> ApnConfiguration {
                     if let Some(a) = crate::avp::find_avp(&qg, avp::QOS_CLASS_IDENTIFIER) {
                         apn.qci = a.as_u32().unwrap_or(9) as u8;
                     }
-                    if let Some(arp) =
-                        crate::avp::find_avp(&qg, avp::ALLOCATION_RETENTION_PRIORITY)
+                    if let Some(arp) = crate::avp::find_avp(&qg, avp::ALLOCATION_RETENTION_PRIORITY)
                     {
                         if let Ok(ag) = arp.parse_grouped() {
                             if let Some(a) = crate::avp::find_avp(&ag, avp::PRIORITY_LEVEL) {
                                 apn.arp_priority_level = a.as_u32().unwrap_or(8) as u8;
                             }
-                            if let Some(a) =
-                                crate::avp::find_avp(&ag, avp::PRE_EMPTION_CAPABILITY)
+                            if let Some(a) = crate::avp::find_avp(&ag, avp::PRE_EMPTION_CAPABILITY)
                             {
                                 apn.arp_pre_emption_capability = a.as_u32().unwrap_or(1) == 0;
                             }
@@ -1221,7 +1228,8 @@ mod tests {
 
     #[test]
     fn test_resync_info_requires_grouped_avp() {
-        let mut msg = DiameterMessage::new_request(cmd::AUTHENTICATION_INFORMATION, S6A_APPLICATION_ID);
+        let mut msg =
+            DiameterMessage::new_request(cmd::AUTHENTICATION_INFORMATION, S6A_APPLICATION_ID);
         assert!(!add_resync_info(&mut msg, &[0u8; 16], &[0u8; 14]));
         assert!(find_resync_info(&msg).is_none());
     }
@@ -1256,7 +1264,8 @@ mod tests {
             kasme: [8; 32],
         };
 
-        let mut aia = DiameterMessage::new_request(cmd::AUTHENTICATION_INFORMATION, S6A_APPLICATION_ID);
+        let mut aia =
+            DiameterMessage::new_request(cmd::AUTHENTICATION_INFORMATION, S6A_APPLICATION_ID);
         aia.header.flags &= !crate::message::cmd_flags::REQUEST;
         aia.add_avp(Avp::vendor_mandatory(
             avp::AUTHENTICATION_INFO,

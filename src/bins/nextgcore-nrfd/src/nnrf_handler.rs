@@ -65,11 +65,7 @@ impl NfProfile {
             return Err(missing);
         }
 
-        let str_at = |key: &str| {
-            doc.get(key)
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        };
+        let str_at = |key: &str| doc.get(key).and_then(|v| v.as_str()).map(|s| s.to_string());
         let str_vec = |key: &str| -> Vec<String> {
             doc.get(key)
                 .and_then(|v| v.as_array())
@@ -104,10 +100,7 @@ impl NfProfile {
                 a.iter()
                     .filter_map(|s| {
                         Some(NfService {
-                            service_instance_id: s
-                                .get("serviceInstanceId")?
-                                .as_str()?
-                                .to_string(),
+                            service_instance_id: s.get("serviceInstanceId")?.as_str()?.to_string(),
                             service_name: s.get("serviceName")?.as_str()?.to_string(),
                             versions: s
                                 .get("versions")
@@ -796,10 +789,7 @@ pub fn json_merge_patch(target: &mut serde_json::Value, patch: &serde_json::Valu
             if value.is_null() {
                 target_obj.remove(key);
             } else {
-                json_merge_patch(
-                    target_obj.entry(key.clone()).or_insert(Value::Null),
-                    value,
-                );
+                json_merge_patch(target_obj.entry(key.clone()).or_insert(Value::Null), value);
             }
         }
     } else {
@@ -926,7 +916,10 @@ fn pointer_add(
 }
 
 /// RFC 6902 `remove` semantics; returns the removed value (used by `move`).
-fn pointer_remove(doc: &mut serde_json::Value, path: &str) -> Result<serde_json::Value, PatchError> {
+fn pointer_remove(
+    doc: &mut serde_json::Value,
+    path: &str,
+) -> Result<serde_json::Value, PatchError> {
     let (parent, token) = pointer_parent(doc, path)?;
     match parent {
         serde_json::Value::Object(map) => map.remove(&token).ok_or_else(|| {
@@ -1103,7 +1096,10 @@ fn advertised_dnns(doc: &serde_json::Value) -> Vec<String> {
 /// "serves any".
 fn profile_matches(doc: &serde_json::Value, status: &str, query: &DiscoveryQuery) -> bool {
     // target-nf-type and REGISTERED status are always required.
-    if doc.get("nfType").and_then(|v| v.as_str()).map(str::to_uppercase)
+    if doc
+        .get("nfType")
+        .and_then(|v| v.as_str())
+        .map(str::to_uppercase)
         != Some(query.target_nf_type.to_uppercase())
     {
         return false;
@@ -1383,9 +1379,9 @@ mod tests {
             requester_nf_type: "AMF".to_string(),
             ..Default::default()
         };
-        assert!(!discover_profiles(&query).iter().any(
-            |p| p.get("nfInstanceId").and_then(|v| v.as_str()) == Some("nf-suspend-test")
-        ));
+        assert!(!discover_profiles(&query)
+            .iter()
+            .any(|p| p.get("nfInstanceId").and_then(|v| v.as_str()) == Some("nf-suspend-test")));
 
         // Auto-deregister after grace period
         manager.deregister("nf-suspend-test").unwrap();
@@ -1474,7 +1470,10 @@ mod tests {
     fn test_from_json_rejects_missing_mandatory_attrs() {
         // Strict-peer rejections: each mandatory attr absent/empty -> error.
         let missing_type = serde_json::json!({"nfInstanceId": "x", "nfStatus": "REGISTERED"});
-        assert_eq!(NfProfile::from_json(&missing_type).unwrap_err(), vec!["nfType"]);
+        assert_eq!(
+            NfProfile::from_json(&missing_type).unwrap_err(),
+            vec!["nfType"]
+        );
 
         let missing_status = serde_json::json!({"nfInstanceId": "x", "nfType": "AMF"});
         assert_eq!(
@@ -1482,8 +1481,12 @@ mod tests {
             vec!["nfStatus"]
         );
 
-        let empty_id = serde_json::json!({"nfInstanceId": "", "nfType": "AMF", "nfStatus": "REGISTERED"});
-        assert_eq!(NfProfile::from_json(&empty_id).unwrap_err(), vec!["nfInstanceId"]);
+        let empty_id =
+            serde_json::json!({"nfInstanceId": "", "nfType": "AMF", "nfStatus": "REGISTERED"});
+        assert_eq!(
+            NfProfile::from_json(&empty_id).unwrap_err(),
+            vec!["nfInstanceId"]
+        );
 
         let all_missing = serde_json::json!({"capacity": 100});
         assert_eq!(
@@ -1492,8 +1495,12 @@ mod tests {
         );
 
         // Non-string mandatory attr is also rejected.
-        let wrong_type = serde_json::json!({"nfInstanceId": 42, "nfType": "AMF", "nfStatus": "REGISTERED"});
-        assert_eq!(NfProfile::from_json(&wrong_type).unwrap_err(), vec!["nfInstanceId"]);
+        let wrong_type =
+            serde_json::json!({"nfInstanceId": 42, "nfType": "AMF", "nfStatus": "REGISTERED"});
+        assert_eq!(
+            NfProfile::from_json(&wrong_type).unwrap_err(),
+            vec!["nfInstanceId"]
+        );
     }
 
     // ------------------------------------------------------------------
@@ -1508,7 +1515,11 @@ mod tests {
             (json!({"a":"b"}), json!({"a":"c"}), json!({"a":"c"})),
             (json!({"a":"b"}), json!({"b":"c"}), json!({"a":"b","b":"c"})),
             (json!({"a":"b"}), json!({"a":null}), json!({})),
-            (json!({"a":"b","b":"c"}), json!({"a":null}), json!({"b":"c"})),
+            (
+                json!({"a":"b","b":"c"}),
+                json!({"a":null}),
+                json!({"b":"c"}),
+            ),
             (json!({"a":["b"]}), json!({"a":"c"}), json!({"a":"c"})),
             (json!({"a":"c"}), json!({"a":["b"]}), json!({"a":["b"]})),
             (
@@ -1517,13 +1528,17 @@ mod tests {
                 json!({"a":{"b":"d"}}),
             ),
             (json!({"a":[{"b":"c"}]}), json!({"a":[1]}), json!({"a":[1]})),
-            (json!(["a","b"]), json!(["c","d"]), json!(["c","d"])),
+            (json!(["a", "b"]), json!(["c", "d"]), json!(["c", "d"])),
             (json!({"a":"b"}), json!(["c"]), json!(["c"])),
             (json!({"a":"foo"}), json!(null), json!(null)),
             (json!({"a":"foo"}), json!("bar"), json!("bar")),
             (json!({"e":null}), json!({"a":1}), json!({"e":null,"a":1})),
-            (json!([1,2]), json!({"a":"b","c":null}), json!({"a":"b"})),
-            (json!({}), json!({"a":{"bb":{"ccc":null}}}), json!({"a":{"bb":{}}})),
+            (json!([1, 2]), json!({"a":"b","c":null}), json!({"a":"b"})),
+            (
+                json!({}),
+                json!({"a":{"bb":{"ccc":null}}}),
+                json!({"a":{"bb":{}}}),
+            ),
         ];
         for (i, (mut original, patch, expected)) in cases.into_iter().enumerate() {
             json_merge_patch(&mut original, &patch);
@@ -1588,12 +1603,18 @@ mod tests {
         ));
         // replace on a non-existent member.
         assert!(matches!(
-            apply_json_patch(&mut doc, &json!([{"op": "replace", "path": "/zzz", "value": 1}])),
+            apply_json_patch(
+                &mut doc,
+                &json!([{"op": "replace", "path": "/zzz", "value": 1}])
+            ),
             Err(PatchError::Malformed(_))
         ));
         // Unknown op.
         assert!(matches!(
-            apply_json_patch(&mut doc, &json!([{"op": "merge", "path": "/a", "value": 1}])),
+            apply_json_patch(
+                &mut doc,
+                &json!([{"op": "merge", "path": "/a", "value": 1}])
+            ),
             Err(PatchError::Malformed(_))
         ));
         // Failed test -> distinct error class (mapped to 409 by the server).

@@ -1221,9 +1221,7 @@ pub async fn resolve_nf_endpoint_async(service_type: SbiServiceType) -> SbiResul
     };
 
     let sbi_ctx = global_context();
-    let instances = sbi_ctx
-        .find_nf_instances_by_service(ogs_service_type)
-        .await;
+    let instances = sbi_ctx.find_nf_instances_by_service(ogs_service_type).await;
     if let Some(inst) = instances.first() {
         if let Some(svc) = inst.find_service(ogs_service_type) {
             let host = svc
@@ -1337,7 +1335,10 @@ pub async fn call_udm_sdm_get_am_data(
             }
         }
     }
-    log::info!("[{supi}] Nudm_SDM_Get am-data OK ({} S-NSSAI)", out.nssai.len());
+    log::info!(
+        "[{supi}] Nudm_SDM_Get am-data OK ({} S-NSSAI)",
+        out.nssai.len()
+    );
     Ok(out)
 }
 

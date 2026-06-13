@@ -756,8 +756,7 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
                 if let Some(snn) = ausf_ue.serving_network_name.clone() {
                     let ok = auth_success;
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            send_udm_auth_result(&supi, ok, &snn, "EAP_AKA_PRIME").await
+                        if let Err(e) = send_udm_auth_result(&supi, ok, &snn, "EAP_AKA_PRIME").await
                         {
                             log::warn!("Failed to notify UDM of EAP auth result: {e}");
                         }
@@ -828,10 +827,7 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
                 rand: nextgcore_ausfd::nudm_handler::bytes_to_hex(&session.rand),
                 auts: nextgcore_ausfd::nudm_handler::bytes_to_hex(&auts),
             };
-            let identity = ausf_ue
-                .supi
-                .clone()
-                .unwrap_or_else(|| ausf_ue.suci.clone());
+            let identity = ausf_ue.supi.clone().unwrap_or_else(|| ausf_ue.suci.clone());
             let snn = session.serving_network_name.clone();
 
             match send_udm_generate_auth_data(&identity, &snn, Some(&resync)).await {
@@ -1627,17 +1623,23 @@ mod tests {
             // ---- strict-peer rejections ----
             // Missing servingNetworkName -> 400
             let resp = client
-                .post_json("/nausf-auth/v1/ue-authentications", &serde_json::json!({"supiOrSuci": SUPI_5G_AKA}))
+                .post_json(
+                    "/nausf-auth/v1/ue-authentications",
+                    &serde_json::json!({"supiOrSuci": SUPI_5G_AKA}),
+                )
                 .await
                 .expect("send");
             assert_eq!(resp.status, 400, "missing SNN must be rejected");
 
             // Malformed serving network name -> 403 SERVING_NETWORK_NOT_AUTHORIZED
             let resp = client
-                .post_json("/nausf-auth/v1/ue-authentications", &serde_json::json!({
-                            "supiOrSuci": SUPI_5G_AKA,
-                            "servingNetworkName": "EPS:mnc001.mcc001.3gppnetwork.org"
-                        }))
+                .post_json(
+                    "/nausf-auth/v1/ue-authentications",
+                    &serde_json::json!({
+                        "supiOrSuci": SUPI_5G_AKA,
+                        "servingNetworkName": "EPS:mnc001.mcc001.3gppnetwork.org"
+                    }),
+                )
                 .await
                 .expect("send");
             assert_eq!(resp.status, 403);
@@ -1650,10 +1652,13 @@ mod tests {
 
             // ---- 5G-AKA success ----
             let resp = client
-                .post_json("/nausf-auth/v1/ue-authentications", &serde_json::json!({
-                            "supiOrSuci": SUPI_5G_AKA,
-                            "servingNetworkName": TEST_SNN
-                        }))
+                .post_json(
+                    "/nausf-auth/v1/ue-authentications",
+                    &serde_json::json!({
+                        "supiOrSuci": SUPI_5G_AKA,
+                        "servingNetworkName": TEST_SNN
+                    }),
+                )
                 .await
                 .expect("send");
             assert_eq!(resp.status, 201);
@@ -1679,14 +1684,16 @@ mod tests {
             rand.copy_from_slice(&rand_bytes);
             let (res, ck, ik, _ak, _akstar) =
                 ogs_crypt::milenage::milenage_f2345(&TEST_OPC, &TEST_K, &rand).unwrap();
-            let res_star =
-                ogs_crypt::kdf::ogs_kdf_xres_star(&ck, &ik, TEST_SNN, &rand, &res);
+            let res_star = ogs_crypt::kdf::ogs_kdf_xres_star(&ck, &ik, TEST_SNN, &rand, &res);
 
             // Wrong RES* first -> AUTHENTICATION_FAILURE
             let resp = client
-                .put_json(href, &serde_json::json!({
-                            "resStar": "00000000000000000000000000000000"
-                        }))
+                .put_json(
+                    href,
+                    &serde_json::json!({
+                        "resStar": "00000000000000000000000000000000"
+                    }),
+                )
                 .await
                 .expect("send");
             assert_eq!(resp.status, 200);
@@ -1699,9 +1706,12 @@ mod tests {
 
             // Correct RES* -> AUTHENTICATION_SUCCESS with KSEAF
             let resp = client
-                .put_json(href, &serde_json::json!({
-                            "resStar": nextgcore_ausfd::nudm_handler::bytes_to_hex(&res_star)
-                        }))
+                .put_json(
+                    href,
+                    &serde_json::json!({
+                        "resStar": nextgcore_ausfd::nudm_handler::bytes_to_hex(&res_star)
+                    }),
+                )
                 .await
                 .expect("send");
             assert_eq!(resp.status, 200);
@@ -1711,19 +1721,19 @@ mod tests {
                 conf.get("authResult").and_then(|v| v.as_str()),
                 Some("AUTHENTICATION_SUCCESS")
             );
-            assert_eq!(
-                conf.get("supi").and_then(|v| v.as_str()),
-                Some(SUPI_5G_AKA)
-            );
+            assert_eq!(conf.get("supi").and_then(|v| v.as_str()), Some(SUPI_5G_AKA));
             let kseaf_hex = conf.get("kseaf").and_then(|v| v.as_str()).expect("kseaf");
             assert_eq!(kseaf_hex.len(), 64);
 
             // ---- EAP-AKA' success ----
             let resp = client
-                .post_json("/nausf-auth/v1/ue-authentications", &serde_json::json!({
-                            "supiOrSuci": SUPI_EAP,
-                            "servingNetworkName": TEST_SNN
-                        }))
+                .post_json(
+                    "/nausf-auth/v1/ue-authentications",
+                    &serde_json::json!({
+                        "supiOrSuci": SUPI_EAP,
+                        "servingNetworkName": TEST_SNN
+                    }),
+                )
                 .await
                 .expect("send");
             assert_eq!(resp.status, 201);
@@ -1808,9 +1818,12 @@ mod tests {
             // Failure first: wrong RES (valid MAC over that packet)
             let bad_response = build_eap_response(&[0xFFu8; 8], challenge.identifier);
             let resp = client
-                .post_json(&eap_href, &serde_json::json!({
-                            "eapPayload": ogs_crypt::base64::encode(&bad_response)
-                        }))
+                .post_json(
+                    &eap_href,
+                    &serde_json::json!({
+                        "eapPayload": ogs_crypt::base64::encode(&bad_response)
+                    }),
+                )
                 .await
                 .expect("send");
             assert_eq!(resp.status, 200);
@@ -1826,19 +1839,19 @@ mod tests {
 
             // Re-arm: a failed EAP exchange ends the session; start a new one
             let resp = client
-                .post_json("/nausf-auth/v1/ue-authentications", &serde_json::json!({
-                            "supiOrSuci": SUPI_EAP,
-                            "servingNetworkName": TEST_SNN
-                        }))
+                .post_json(
+                    "/nausf-auth/v1/ue-authentications",
+                    &serde_json::json!({
+                        "supiOrSuci": SUPI_EAP,
+                        "servingNetworkName": TEST_SNN
+                    }),
+                )
                 .await
                 .expect("send");
             assert_eq!(resp.status, 201);
             let ctx_json: serde_json::Value =
                 serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
-            let eap_b64 = ctx_json
-                .get("5gAuthData")
-                .and_then(|v| v.as_str())
-                .unwrap();
+            let eap_b64 = ctx_json.get("5gAuthData").and_then(|v| v.as_str()).unwrap();
             let eap_href = ctx_json
                 .pointer("/_links/eap-session/href")
                 .and_then(|v| v.as_str())
@@ -1884,9 +1897,12 @@ mod tests {
             };
             let good_response = build_eap_response2(&res, challenge.identifier);
             let resp = client
-                .post_json(&eap_href, &serde_json::json!({
-                            "eapPayload": ogs_crypt::base64::encode(&good_response)
-                        }))
+                .post_json(
+                    &eap_href,
+                    &serde_json::json!({
+                        "eapPayload": ogs_crypt::base64::encode(&good_response)
+                    }),
+                )
                 .await
                 .expect("send");
             assert_eq!(resp.status, 200);

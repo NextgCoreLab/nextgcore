@@ -138,7 +138,10 @@ impl ApiRoot {
     /// Canonical `scheme://host:port[/prefix]` form (used as client-cache and
     /// binding-cache value).
     pub fn to_uri(&self) -> String {
-        format!("{}://{}:{}{}", self.scheme, self.host, self.port, self.prefix)
+        format!(
+            "{}://{}:{}{}",
+            self.scheme, self.host, self.port, self.prefix
+        )
     }
 }
 
@@ -603,10 +606,22 @@ mod tests {
         assert!(!fwd.contains_key("3gpp-sbi-target-apiroot"));
         assert!(!fwd.contains_key("3GPP-SBI-DISCOVERY-TARGET-NF-TYPE"));
         assert!(!fwd.contains_key("3gpp-Sbi-Routing-Binding"));
-        assert_eq!(fwd.get("content-type").map(String::as_str), Some("application/json"));
-        assert_eq!(fwd.get("3gpp-sbi-oci").map(String::as_str), Some("Timestamp: x; oci"));
-        assert_eq!(fwd.get("3gpp-Sbi-Lci").map(String::as_str), Some("Timestamp: y; lci"));
-        assert_eq!(fwd.get("authorization").map(String::as_str), Some("Bearer tok"));
+        assert_eq!(
+            fwd.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            fwd.get("3gpp-sbi-oci").map(String::as_str),
+            Some("Timestamp: x; oci")
+        );
+        assert_eq!(
+            fwd.get("3gpp-Sbi-Lci").map(String::as_str),
+            Some("Timestamp: y; lci")
+        );
+        assert_eq!(
+            fwd.get("authorization").map(String::as_str),
+            Some("Bearer tok")
+        );
     }
 
     #[test]
@@ -629,8 +644,14 @@ mod tests {
             relayed.get("3gpp-sbi-binding").map(String::as_str),
             Some("bl=nf-instance; nfinst=abc")
         );
-        assert_eq!(relayed.get("3gpp-sbi-oci").map(String::as_str), Some("oci-val"));
-        assert_eq!(relayed.get("3gpp-sbi-lci").map(String::as_str), Some("lci-val"));
+        assert_eq!(
+            relayed.get("3gpp-sbi-oci").map(String::as_str),
+            Some("oci-val")
+        );
+        assert_eq!(
+            relayed.get("3gpp-sbi-lci").map(String::as_str),
+            Some("lci-val")
+        );
     }
 
     #[test]
@@ -644,7 +665,9 @@ mod tests {
         let target = ApiRoot::parse("http://smf1:7778").unwrap();
         proxy.binding_store("bl=nf-instance; nfinst=54804518", &target);
         // Lookup with different casing/whitespace still hits.
-        let hit = proxy.binding_lookup("BL=nf-instance;NFINST=54804518").unwrap();
+        let hit = proxy
+            .binding_lookup("BL=nf-instance;NFINST=54804518")
+            .unwrap();
         assert_eq!(hit, target);
         assert!(proxy.binding_lookup("bl=nf-set;nfset=other").is_none());
     }
@@ -656,22 +679,18 @@ mod tests {
         // Target-apiRoot wins even when discovery headers are present.
         let mut req = SbiRequest::get("/nudm-sdm/v1/x");
         req.http.set_target_apiroot("http://udm:7777");
-        req.http
-            .set_header(discovery_header::TARGET_NF_TYPE, "UDM");
-        assert!(matches!(
-            proxy.route(&req),
-            RouteDecision::TargetApiRoot(_)
-        ));
+        req.http.set_header(discovery_header::TARGET_NF_TYPE, "UDM");
+        assert!(matches!(proxy.route(&req), RouteDecision::TargetApiRoot(_)));
 
         // Discovery headers alone -> Discover.
         let mut req = SbiRequest::get("/nudm-sdm/v1/x");
-        req.http
-            .set_header(discovery_header::TARGET_NF_TYPE, "UDM");
+        req.http.set_header(discovery_header::TARGET_NF_TYPE, "UDM");
         assert_eq!(proxy.route(&req), RouteDecision::Discover);
 
         // Unknown Routing-Binding with no discovery headers -> Reject.
         let mut req = SbiRequest::get("/nudm-sdm/v1/x");
-        req.http.set_routing_binding("bl=nf-instance; nfinst=unknown");
+        req.http
+            .set_routing_binding("bl=nf-instance; nfinst=unknown");
         assert_eq!(proxy.route(&req), RouteDecision::Reject);
 
         // Known Routing-Binding -> StickyBinding.
@@ -711,8 +730,7 @@ mod tests {
             ..Default::default()
         });
         let mut req = SbiRequest::get("/nudm-sdm/v1/x");
-        req.http
-            .set_header(discovery_header::TARGET_NF_TYPE, "UDM");
+        req.http.set_header(discovery_header::TARGET_NF_TYPE, "UDM");
         let response = proxy.handle(req).await;
         assert_eq!(response.status, 400);
         let problem: ProblemDetails = response.json_body().unwrap();
@@ -728,8 +746,7 @@ mod tests {
     async fn test_discovery_without_nrf_configured_is_503() {
         let proxy = ScpProxy::new(ScpProxyConfig::default());
         let mut req = SbiRequest::get("/nudm-sdm/v1/x");
-        req.http
-            .set_header(discovery_header::TARGET_NF_TYPE, "UDM");
+        req.http.set_header(discovery_header::TARGET_NF_TYPE, "UDM");
         req.http
             .set_header(discovery_header::REQUESTER_NF_TYPE, "AMF");
         let response = proxy.handle(req).await;
@@ -950,7 +967,10 @@ mod tests {
             .with_header("3gpp-Sbi-Discovery-service-names", "nudm-uecm");
 
         let client = fast_client(scp_port);
-        let response = client.send_request(request).await.expect("model D roundtrip");
+        let response = client
+            .send_request(request)
+            .await
+            .expect("model D roundtrip");
 
         assert_eq!(response.status, 200);
         assert_eq!(nrf_hits.load(Ordering::SeqCst), 1);
@@ -1095,8 +1115,7 @@ mod tests {
             request_timeout: Duration::from_millis(500),
         });
         let mut req = SbiRequest::get("/nudm-sdm/v1/x");
-        req.http
-            .set_header(discovery_header::TARGET_NF_TYPE, "UDM");
+        req.http.set_header(discovery_header::TARGET_NF_TYPE, "UDM");
         req.http
             .set_header(discovery_header::REQUESTER_NF_TYPE, "AMF");
         let response = proxy.handle(req).await;

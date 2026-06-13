@@ -1273,9 +1273,7 @@ pub fn build_path_switch_request_failure(msg: &PathSwitchRequestFailure) -> Ngap
 }
 
 /// Build a Handover Preparation Failure PDU
-pub fn build_handover_preparation_failure(
-    msg: &HandoverPreparationFailure,
-) -> NgapResult<Vec<u8>> {
+pub fn build_handover_preparation_failure(msg: &HandoverPreparationFailure) -> NgapResult<Vec<u8>> {
     let mut container = ProtocolIeContainer::new();
 
     // IE: AMF-UE-NGAP-ID (mandatory)
@@ -1506,7 +1504,10 @@ mod ng_setup_cross_codec {
             crate::parser::NgapMessage::InitialContextSetupRequest(req) => {
                 assert_eq!(req.ue_ambr.as_ref().unwrap().dl, 1_000_000_000);
                 assert_eq!(req.ue_ambr.as_ref().unwrap().ul, 500_000_000);
-                assert_eq!(req.ue_security_capabilities.nr_encryption_algorithms, 0x8000);
+                assert_eq!(
+                    req.ue_security_capabilities.nr_encryption_algorithms,
+                    0x8000
+                );
                 assert_eq!(req.allowed_nssai.len(), 1);
                 assert_eq!(req.allowed_nssai[0].sst, 1);
             }

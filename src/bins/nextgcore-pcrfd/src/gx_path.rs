@@ -260,9 +260,7 @@ impl GxRequestError {
         match self {
             GxRequestError::MissingAvp(_) => result_code::DIAMETER_MISSING_AVP,
             GxRequestError::InvalidAvpValue(_) => result_code::DIAMETER_INVALID_AVP_VALUE,
-            GxRequestError::ApplicationUnsupported => {
-                result_code::DIAMETER_APPLICATION_UNSUPPORTED
-            }
+            GxRequestError::ApplicationUnsupported => result_code::DIAMETER_APPLICATION_UNSUPPORTED,
             GxRequestError::UnknownSession => result_code::DIAMETER_UNKNOWN_SESSION_ID,
         }
     }
@@ -723,7 +721,9 @@ pub fn build_cca_error(
         cca.header.set_error();
     }
 
-    let cc_request_type = ccr.find_avp(gx_avp::CC_REQUEST_TYPE).and_then(|a| a.as_u32());
+    let cc_request_type = ccr
+        .find_avp(gx_avp::CC_REQUEST_TYPE)
+        .and_then(|a| a.as_u32());
     let cc_request_number = ccr
         .find_avp(gx_avp::CC_REQUEST_NUMBER)
         .and_then(|a| a.as_u32());
@@ -737,7 +737,10 @@ pub fn build_cca_error(
         // Failed-AVP carries the offending AVP (with empty data when absent)
         cca.add_avp(Avp::mandatory(
             base_avp::FAILED_AVP,
-            AvpData::Grouped(vec![Avp::mandatory(code, AvpData::OctetString(Bytes::new()))]),
+            AvpData::Grouped(vec![Avp::mandatory(
+                code,
+                AvpData::OctetString(Bytes::new()),
+            )]),
         ));
     }
     cca
@@ -1011,8 +1014,8 @@ pub fn parse_raa(msg: &DiameterMessage) -> Result<u32, String> {
     }
     if let Some(exp) = msg.find_avp(avp_code::EXPERIMENTAL_RESULT) {
         if let Ok(members) = exp.parse_grouped() {
-            if let Some(code) = find_avp(&members, avp_code::EXPERIMENTAL_RESULT_CODE)
-                .and_then(|a| a.as_u32())
+            if let Some(code) =
+                find_avp(&members, avp_code::EXPERIMENTAL_RESULT_CODE).and_then(|a| a.as_u32())
             {
                 return Ok(code);
             }
@@ -1025,10 +1028,7 @@ pub fn parse_raa(msg: &DiameterMessage) -> Result<u32, String> {
 ///
 /// Returns the RAA result code. Used by the Rx path to push / remove PCC
 /// rules (AAR -> RAR install, STR -> RAR remove).
-pub async fn pcrf_gx_send_rar(
-    gx_sid: &str,
-    action: RarAction,
-) -> Result<u32, String> {
+pub async fn pcrf_gx_send_rar(gx_sid: &str, action: RarAction) -> Result<u32, String> {
     let local = crate::fd_path::pcrf_local_identity();
 
     // Look up the Gx session to learn the PCEF peer identity
@@ -1499,10 +1499,7 @@ mod tests {
         assert_eq!(info.imsi.as_deref(), Some("001010123456789"));
         assert_eq!(info.apn.as_deref(), Some("internet"));
         assert_eq!(info.framed_ipv4, Some([10, 45, 0, 2]));
-        assert_eq!(
-            info.origin_host,
-            "pgw.epc.mnc001.mcc001.3gppnetwork.org"
-        );
+        assert_eq!(info.origin_host, "pgw.epc.mnc001.mcc001.3gppnetwork.org");
     }
 
     #[test]
@@ -1564,7 +1561,10 @@ mod tests {
     fn test_parse_ccr_event_request_rejected() {
         let ccr = roundtrip(&build_test_ccr("gx-event-1", 4, 0));
         let err = parse_ccr(&ccr).unwrap_err();
-        assert_eq!(err, GxRequestError::InvalidAvpValue(gx_avp::CC_REQUEST_TYPE));
+        assert_eq!(
+            err,
+            GxRequestError::InvalidAvpValue(gx_avp::CC_REQUEST_TYPE)
+        );
         assert_eq!(err.result_code(), result_code::DIAMETER_INVALID_AVP_VALUE);
     }
 
@@ -1590,7 +1590,8 @@ mod tests {
         assert_eq!(cca.session_id(), Some("gx-cca-initial"));
         assert_eq!(cca.result_code(), Some(result_code::DIAMETER_SUCCESS));
         assert_eq!(
-            cca.find_avp(gx_avp::CC_REQUEST_TYPE).and_then(|a| a.as_u32()),
+            cca.find_avp(gx_avp::CC_REQUEST_TYPE)
+                .and_then(|a| a.as_u32()),
             Some(cc_request_type::INITIAL_REQUEST)
         );
         assert_eq!(
@@ -1609,8 +1610,8 @@ mod tests {
             .and_then(|a| a.as_u32())
             .expect("QCI");
         assert!(qci >= 1);
-        let arp = find_avp(&deq_members, gx_avp::ALLOCATION_RETENTION_PRIORITY)
-            .expect("ARP present");
+        let arp =
+            find_avp(&deq_members, gx_avp::ALLOCATION_RETENTION_PRIORITY).expect("ARP present");
         assert_eq!(arp.vendor_id, Some(OGS_3GPP_VENDOR_ID));
         let arp_members = arp.parse_grouped().unwrap();
         assert!(find_avp(&arp_members, gx_avp::PRIORITY_LEVEL).is_some());

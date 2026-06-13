@@ -1001,8 +1001,8 @@ mod tests {
 
     #[test]
     fn test_n2_sm_setup_request_transfer_roundtrip() {
-        let bytes =
-            build_n2_sm_setup_request_transfer(0x0000_0001, [127, 0, 0, 1], 9, 9, 8).expect("build");
+        let bytes = build_n2_sm_setup_request_transfer(0x0000_0001, [127, 0, 0, 1], 9, 9, 8)
+            .expect("build");
         let decoded =
             PduSessionResourceSetupRequestTransfer::decode(&bytes).expect("transfer decode");
 

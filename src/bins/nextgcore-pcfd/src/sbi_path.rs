@@ -291,7 +291,12 @@ pub async fn send_notification_post(
 }
 
 /// Spawn an async notification POST (fire-and-forget for sync call sites).
-fn spawn_notification(uri: String, suffix: &'static str, body: serde_json::Value, what: &'static str) -> bool {
+fn spawn_notification(
+    uri: String,
+    suffix: &'static str,
+    body: serde_json::Value,
+    what: &'static str,
+) -> bool {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             handle.spawn(async move {
@@ -319,8 +324,11 @@ fn spawn_notification(uri: String, suffix: &'static str, body: serde_json::Value
 pub fn pcf_sbi_send_am_policy_control_notify(pcf_ue_am_id: u64) -> bool {
     // Copy out what we need, then drop the guards (lock-order rule).
     let info = crate::context::pcf_self().read().ok().and_then(|ctx| {
-        ctx.ue_am_find_by_id(pcf_ue_am_id)
-            .and_then(|ue| ue.notification_uri.clone().map(|uri| (uri, ue.association_id)))
+        ctx.ue_am_find_by_id(pcf_ue_am_id).and_then(|ue| {
+            ue.notification_uri
+                .clone()
+                .map(|uri| (uri, ue.association_id))
+        })
     });
     let Some((uri, association_id)) = info else {
         log::warn!("[ue_am_id={pcf_ue_am_id}] AM policy notify: no notification URI stored");
@@ -544,8 +552,7 @@ mod tests {
 
         async fn stub_smf(req: Req) -> Resp {
             let path = req.header.uri.split('?').next().unwrap_or("").to_string();
-            if req.header.method == "POST"
-                && path == "/nsmf-callback/v1/sm-policy-notify/42/update"
+            if req.header.method == "POST" && path == "/nsmf-callback/v1/sm-policy-notify/42/update"
             {
                 // Body must be an SmPolicyNotification with resourceUri
                 let ok = req

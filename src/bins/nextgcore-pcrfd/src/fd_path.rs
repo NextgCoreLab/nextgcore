@@ -400,9 +400,7 @@ async fn dispatch_request(msg: DiameterMessage, local: &LocalIdentity) -> Diamet
             )
         }
         (RX_APPLICATION_ID, rx_cmd::AA) => rx_path::handle_aar(&msg, local).await,
-        (RX_APPLICATION_ID, rx_cmd::SESSION_TERMINATION) => {
-            rx_path::handle_str(&msg, local).await
-        }
+        (RX_APPLICATION_ID, rx_cmd::SESSION_TERMINATION) => rx_path::handle_str(&msg, local).await,
         (RX_APPLICATION_ID, _) => {
             pcrf_diam_stats().rx.inc_rx_unknown();
             gx_path::build_unsupported_answer(

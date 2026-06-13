@@ -460,7 +460,10 @@ pub async fn mme_s6a_send_air(
             mme_ue.imsi_bcd
         );
         if !s6a::add_resync_info(&mut air, &mme_ue.rand, auts) {
-            log::error!("[{}] AIR has no Requested-EUTRAN-Authentication-Info", mme_ue.imsi_bcd);
+            log::error!(
+                "[{}] AIR has no Requested-EUTRAN-Authentication-Info",
+                mme_ue.imsi_bcd
+            );
             return Err(DiameterError::BuildFailed);
         }
     }
@@ -699,37 +702,36 @@ pub async fn mme_fd_recv_inbound(
         state.config.diameter_realm.clone(),
     );
 
-    let build_answer = |req: &ogs_diameter::message::DiameterMessage,
-                        result: u32,
-                        protocol_error: bool| {
-        let mut answer = ogs_diameter::message::DiameterMessage::new_answer(req);
-        if let Some(sid) = req.session_id() {
+    let build_answer =
+        |req: &ogs_diameter::message::DiameterMessage, result: u32, protocol_error: bool| {
+            let mut answer = ogs_diameter::message::DiameterMessage::new_answer(req);
+            if let Some(sid) = req.session_id() {
+                answer.add_avp(ogs_diameter::avp::Avp::mandatory(
+                    ogs_diameter::common::avp_code::SESSION_ID,
+                    ogs_diameter::avp::AvpData::Utf8String(sid.to_string()),
+                ));
+            }
             answer.add_avp(ogs_diameter::avp::Avp::mandatory(
-                ogs_diameter::common::avp_code::SESSION_ID,
-                ogs_diameter::avp::AvpData::Utf8String(sid.to_string()),
+                ogs_diameter::common::avp_code::RESULT_CODE,
+                ogs_diameter::avp::AvpData::Unsigned32(result),
             ));
-        }
-        answer.add_avp(ogs_diameter::avp::Avp::mandatory(
-            ogs_diameter::common::avp_code::RESULT_CODE,
-            ogs_diameter::avp::AvpData::Unsigned32(result),
-        ));
-        answer.add_avp(ogs_diameter::avp::Avp::mandatory(
-            ogs_diameter::common::avp_code::AUTH_SESSION_STATE,
-            ogs_diameter::avp::AvpData::Enumerated(1),
-        ));
-        answer.add_avp(ogs_diameter::avp::Avp::mandatory(
-            ogs_diameter::common::avp_code::ORIGIN_HOST,
-            ogs_diameter::avp::AvpData::DiameterIdentity(origin_host.clone()),
-        ));
-        answer.add_avp(ogs_diameter::avp::Avp::mandatory(
-            ogs_diameter::common::avp_code::ORIGIN_REALM,
-            ogs_diameter::avp::AvpData::DiameterIdentity(origin_realm.clone()),
-        ));
-        if protocol_error {
-            answer.header.set_error();
-        }
-        answer
-    };
+            answer.add_avp(ogs_diameter::avp::Avp::mandatory(
+                ogs_diameter::common::avp_code::AUTH_SESSION_STATE,
+                ogs_diameter::avp::AvpData::Enumerated(1),
+            ));
+            answer.add_avp(ogs_diameter::avp::Avp::mandatory(
+                ogs_diameter::common::avp_code::ORIGIN_HOST,
+                ogs_diameter::avp::AvpData::DiameterIdentity(origin_host.clone()),
+            ));
+            answer.add_avp(ogs_diameter::avp::Avp::mandatory(
+                ogs_diameter::common::avp_code::ORIGIN_REALM,
+                ogs_diameter::avp::AvpData::DiameterIdentity(origin_realm.clone()),
+            ));
+            if protocol_error {
+                answer.header.set_error();
+            }
+            answer
+        };
 
     // User-Name is mandatory in CLR/IDR (TS 29.272 7.2.7 / 7.2.9)
     let Some(imsi_bcd) = request.user_name().map(str::to_string) else {
@@ -742,7 +744,10 @@ pub async fn mme_fd_recv_inbound(
     match request.header.command_code {
         command_code::CANCEL_LOCATION => {
             let cancellation_type = request
-                .find_vendor_avp(avp_code::CANCELLATION_TYPE, ogs_diameter::OGS_3GPP_VENDOR_ID)
+                .find_vendor_avp(
+                    avp_code::CANCELLATION_TYPE,
+                    ogs_diameter::OGS_3GPP_VENDOR_ID,
+                )
                 .and_then(|a| a.as_u32());
             // Cancellation-Type is mandatory in CLR (TS 29.272 Table 7.2.7/1)
             let Some(cancellation_type) = cancellation_type else {

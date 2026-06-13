@@ -359,12 +359,7 @@ impl Dynamic5qiDescriptor {
             match decoder.decode_enumerated(&constraint)? {
                 0 => Some(DelayCritical::DelayCritical),
                 1 => Some(DelayCritical::NonDelayCritical),
-                v => {
-                    return Err(invalid(
-                        "DelayCritical",
-                        format!("Unknown value: {v}"),
-                    ))
-                }
+                v => return Err(invalid("DelayCritical", format!("Unknown value: {v}"))),
             }
         } else {
             None
@@ -419,9 +414,9 @@ impl QosCharacteristics {
             0 => Ok(QosCharacteristics::NonDynamic5qi(
                 NonDynamic5qiDescriptor::decode(decoder)?,
             )),
-            1 => Ok(QosCharacteristics::Dynamic5qi(Dynamic5qiDescriptor::decode(
-                decoder,
-            )?)),
+            1 => Ok(QosCharacteristics::Dynamic5qi(
+                Dynamic5qiDescriptor::decode(decoder)?,
+            )),
             _ => Err(invalid(
                 "QosCharacteristics",
                 format!("Unsupported choice index: {choice}"),
@@ -1732,9 +1727,7 @@ mod tests {
 
     fn sample_qos_params() -> QosFlowLevelQosParameters {
         QosFlowLevelQosParameters {
-            qos_characteristics: QosCharacteristics::NonDynamic5qi(NonDynamic5qiDescriptor::new(
-                9,
-            )),
+            qos_characteristics: QosCharacteristics::NonDynamic5qi(NonDynamic5qiDescriptor::new(9)),
             allocation_and_retention_priority: AllocationAndRetentionPriority {
                 priority_level_arp: 8,
                 pre_emption_capability: PreEmptionCapability::ShallNotTriggerPreEmption,

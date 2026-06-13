@@ -244,11 +244,11 @@ impl Gtp1Message {
                 let start_pos = buf.remaining();
                 let (ext, next) = Gtp1ExtHeader::decode(next_type, buf)?;
                 let consumed = start_pos - buf.remaining();
-                payload_len = payload_len.checked_sub(consumed).ok_or(
-                    GtpError::InvalidHeader(
+                payload_len = payload_len
+                    .checked_sub(consumed)
+                    .ok_or(GtpError::InvalidHeader(
                         "Extension headers exceed message length".to_string(),
-                    ),
-                )?;
+                    ))?;
                 msg.extension_headers.push(ext);
                 next_type = next;
             }

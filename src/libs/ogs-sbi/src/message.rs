@@ -657,7 +657,10 @@ impl SbiDiscoveryOption {
             http.set_header(discovery_header::REQUESTER_NF_INSTANCE_ID, id.clone());
         }
         if !self.service_names.is_empty() {
-            http.set_header(discovery_header::SERVICE_NAMES, self.service_names.join(","));
+            http.set_header(
+                discovery_header::SERVICE_NAMES,
+                self.service_names.join(","),
+            );
         }
         if !self.snssais.is_empty() {
             if let Ok(json) = serde_json::to_string(&self.snssais) {
@@ -1009,12 +1012,14 @@ mod tests {
         // the form hyper delivers for HTTP/2.
         http.set_header("3gpp-Sbi-Target-apiRoot", "https://amf.example:7777");
         assert_eq!(
-            http.get_header("3gpp-sbi-target-apiroot").map(String::as_str),
+            http.get_header("3gpp-sbi-target-apiroot")
+                .map(String::as_str),
             Some("https://amf.example:7777")
         );
         // Mixed-case lookup of a lowercased (wire-form) header.
         assert_eq!(
-            http.get_header("3GPP-SBI-TARGET-APIROOT").map(String::as_str),
+            http.get_header("3GPP-SBI-TARGET-APIROOT")
+                .map(String::as_str),
             Some("https://amf.example:7777")
         );
 
@@ -1088,13 +1093,17 @@ mod tests {
 
         // Lookups survive any casing (hyper lowercases on the wire).
         assert_eq!(
-            http.get_header("3GPP-SBI-DISCOVERY-DNN").map(String::as_str),
+            http.get_header("3GPP-SBI-DISCOVERY-DNN")
+                .map(String::as_str),
             Some("internet")
         );
 
         let parsed = SbiDiscoveryOption::from_headers(&http).unwrap();
         assert_eq!(parsed.target_nf_instance_id, option.target_nf_instance_id);
-        assert_eq!(parsed.requester_nf_instance_id, option.requester_nf_instance_id);
+        assert_eq!(
+            parsed.requester_nf_instance_id,
+            option.requester_nf_instance_id
+        );
         assert_eq!(parsed.service_names, vec!["nudm-uecm", "nudm-sdm"]);
         assert_eq!(parsed.snssais, option.snssais);
         assert_eq!(parsed.dnn.as_deref(), Some("internet"));
@@ -1122,16 +1131,14 @@ mod tests {
         // apiRoot may carry a deployment-specific path prefix; the version
         // segment anchors the apiName split (TS 29.501 §4.4.1).
         let c = UriComponents::parse("https://nrf.5gc:7777/prefix/a/nnrf-disc/v2/nf-instances");
-        assert_eq!(
-            c.api_root.as_deref(),
-            Some("https://nrf.5gc:7777/prefix/a")
-        );
+        assert_eq!(c.api_root.as_deref(), Some("https://nrf.5gc:7777/prefix/a"));
         assert_eq!(c.api_name.as_deref(), Some("nnrf-disc"));
         assert_eq!(c.api_version.as_deref(), Some("v2"));
         assert_eq!(c.resource, vec!["nf-instances"]);
         assert_eq!(c.query, None);
 
-        let c = UriComponents::parse("http://amf:80/namf-comm/v1/ue-contexts/imsi-1/n1-n2-messages");
+        let c =
+            UriComponents::parse("http://amf:80/namf-comm/v1/ue-contexts/imsi-1/n1-n2-messages");
         assert_eq!(c.api_root.as_deref(), Some("http://amf:80"));
         assert_eq!(c.api_name.as_deref(), Some("namf-comm"));
         assert_eq!(c.api_version.as_deref(), Some("v1"));
@@ -1197,6 +1204,10 @@ mod tests {
             response.http.get_header("content-type").map(String::as_str),
             Some(crate::constants::content_type::APPLICATION_PROBLEM_JSON)
         );
-        assert!(response.http.content.unwrap().contains("RESOURCE_NOT_FOUND"));
+        assert!(response
+            .http
+            .content
+            .unwrap()
+            .contains("RESOURCE_NOT_FOUND"));
     }
 }

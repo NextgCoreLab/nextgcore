@@ -914,7 +914,9 @@ mod tests {
     /// payload, COUNT 0, BEARER 1 (3GPP), DIRECTION downlink.
     #[test]
     fn test_cross_stack_nas_security_reference_vector() {
-        use ogs_crypt::kdf::{ogs_kdf_kamf, ogs_kdf_nas_5gs, OGS_KDF_NAS_ENC_ALG, OGS_KDF_NAS_INT_ALG};
+        use ogs_crypt::kdf::{
+            ogs_kdf_kamf, ogs_kdf_nas_5gs, OGS_KDF_NAS_ENC_ALG, OGS_KDF_NAS_INT_ALG,
+        };
 
         // -- fixed inputs (shared with the sim) --
         let kseaf: [u8; 32] = [

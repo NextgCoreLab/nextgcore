@@ -240,7 +240,11 @@ impl UdrDataStore {
     }
 
     /// List subscriptions of a kind matching a predicate (copies out).
-    pub fn subs_matching<F: Fn(&StoredSub) -> bool>(&self, kind: SubKind, pred: F) -> Vec<StoredSub> {
+    pub fn subs_matching<F: Fn(&StoredSub) -> bool>(
+        &self,
+        kind: SubKind,
+        pred: F,
+    ) -> Vec<StoredSub> {
         self.subs
             .read()
             .expect("lock")
@@ -436,10 +440,7 @@ pub fn notify_influence_data_change(res_uri: &str, data: Option<&Value>) {
             s.body
                 .get(filter)
                 .and_then(Value::as_array)
-                .is_some_and(|list| {
-                    d.get(field)
-                        .is_some_and(|v| list.iter().any(|f| f == v))
-                })
+                .is_some_and(|list| d.get(field).is_some_and(|v| list.iter().any(|f| f == v)))
         };
         arr_match("dnns", "dnn")
             || arr_match("snssais", "snssai")
@@ -603,7 +604,8 @@ mod tests {
             1
         );
         assert_eq!(
-            s.influence_list(Some(&["inf-1".to_string()]), None, None).len(),
+            s.influence_list(Some(&["inf-1".to_string()]), None, None)
+                .len(),
             1
         );
     }

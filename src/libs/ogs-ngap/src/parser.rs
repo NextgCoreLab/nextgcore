@@ -136,12 +136,12 @@ fn decode_initiating_message(msg: InitiatingMessage) -> NgapResult<NgapMessage> 
                 ProcedureCode::ERROR_INDICATION => {
                     Ok(NgapMessage::ErrorIndication(parse_error_indication(ies)?))
                 }
-                ProcedureCode::RAN_CONFIGURATION_UPDATE => Ok(
-                    NgapMessage::RanConfigurationUpdate(parse_ran_configuration_update(ies)?),
-                ),
-                ProcedureCode::AMF_CONFIGURATION_UPDATE => Ok(
-                    NgapMessage::AmfConfigurationUpdate(parse_amf_configuration_update(ies)?),
-                ),
+                ProcedureCode::RAN_CONFIGURATION_UPDATE => Ok(NgapMessage::RanConfigurationUpdate(
+                    parse_ran_configuration_update(ies)?,
+                )),
+                ProcedureCode::AMF_CONFIGURATION_UPDATE => Ok(NgapMessage::AmfConfigurationUpdate(
+                    parse_amf_configuration_update(ies)?,
+                )),
                 ProcedureCode::AMF_STATUS_INDICATION => Ok(NgapMessage::AmfStatusIndication(
                     parse_amf_status_indication(ies)?,
                 )),
@@ -208,11 +208,9 @@ fn decode_successful_outcome(msg: SuccessfulOutcome) -> NgapResult<NgapMessage> 
         SuccessfulOutcomeValue::NgResetAcknowledge(ies) => Ok(NgapMessage::NgResetAcknowledge(
             parse_ng_reset_acknowledge(ies)?,
         )),
-        SuccessfulOutcomeValue::PathSwitchRequestAcknowledge(ies) => {
-            Ok(NgapMessage::PathSwitchRequestAcknowledge(
-                parse_path_switch_request_acknowledge(ies)?,
-            ))
-        }
+        SuccessfulOutcomeValue::PathSwitchRequestAcknowledge(ies) => Ok(
+            NgapMessage::PathSwitchRequestAcknowledge(parse_path_switch_request_acknowledge(ies)?),
+        ),
         // Handle messages that the low-level decoder maps to Other
         SuccessfulOutcomeValue::Other(ies) => {
             use ogs_asn1c::ngap::types::ProcedureCode;
@@ -280,11 +278,9 @@ fn decode_unsuccessful_outcome(msg: UnsuccessfulOutcome) -> NgapResult<NgapMessa
         UnsuccessfulOutcomeValue::InitialContextSetupFailure(ies) => Ok(
             NgapMessage::InitialContextSetupFailure(parse_initial_context_setup_failure(ies)?),
         ),
-        UnsuccessfulOutcomeValue::HandoverPreparationFailure(ies) => {
-            Ok(NgapMessage::HandoverPreparationFailure(
-                parse_handover_preparation_failure(ies)?,
-            ))
-        }
+        UnsuccessfulOutcomeValue::HandoverPreparationFailure(ies) => Ok(
+            NgapMessage::HandoverPreparationFailure(parse_handover_preparation_failure(ies)?),
+        ),
         UnsuccessfulOutcomeValue::PathSwitchRequestFailure(ies) => Ok(
             NgapMessage::PathSwitchRequestFailure(parse_path_switch_request_failure(ies)?),
         ),
@@ -301,11 +297,9 @@ fn decode_unsuccessful_outcome(msg: UnsuccessfulOutcome) -> NgapResult<NgapMessa
                         parse_amf_configuration_update_failure(ies)?,
                     ))
                 }
-                ProcedureCode::HANDOVER_PREPARATION => {
-                    Ok(NgapMessage::HandoverPreparationFailure(
-                        parse_handover_preparation_failure(ies)?,
-                    ))
-                }
+                ProcedureCode::HANDOVER_PREPARATION => Ok(NgapMessage::HandoverPreparationFailure(
+                    parse_handover_preparation_failure(ies)?,
+                )),
                 ProcedureCode::PATH_SWITCH_REQUEST => Ok(NgapMessage::PathSwitchRequestFailure(
                     parse_path_switch_request_failure(ies)?,
                 )),

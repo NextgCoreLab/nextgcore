@@ -986,7 +986,11 @@ mod tests {
 
         let keys = derive_keys_aka_prime(&ck_prime, &ik_prime, "0555444333222111");
 
-        assert_eq!(&keys.k_encr[..], &unhex("766fa0a6c317174b812d52fbcd11a179")[..], "K_encr");
+        assert_eq!(
+            &keys.k_encr[..],
+            &unhex("766fa0a6c317174b812d52fbcd11a179")[..],
+            "K_encr"
+        );
         assert_eq!(
             &keys.k_aut[..],
             &unhex("0842ea722ff6835bfa2032499fc3ec23c2f0e388b4f07543ffc677f1696d71ea")[..],

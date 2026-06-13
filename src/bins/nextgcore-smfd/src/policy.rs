@@ -259,8 +259,9 @@ pub async fn resolve_pcf_endpoint() -> Option<PcfEndpoint> {
         .get("nfServices")
         .and_then(|s| s.as_array())
         .and_then(|svcs| {
-            svcs.iter()
-                .find(|s| s.get("serviceName").and_then(|n| n.as_str()) == Some("npcf-smpolicycontrol"))
+            svcs.iter().find(|s| {
+                s.get("serviceName").and_then(|n| n.as_str()) == Some("npcf-smpolicycontrol")
+            })
         })
         .and_then(|s| s.get("ipEndPoints"))
         .and_then(|e| e.as_array())
@@ -364,7 +365,9 @@ pub async fn sm_policy_create(
         .map(str::to_string)
         .or_else(|| json["smPolicyId"].as_str().map(str::to_string))
         .ok_or_else(|| {
-            PolicyError::Transport("SmPolicyControl Create response missing Location/smPolicyId".into())
+            PolicyError::Transport(
+                "SmPolicyControl Create response missing Location/smPolicyId".into(),
+            )
         })?;
 
     Ok(parse_sm_policy_decision(&sm_policy_id, &json))
@@ -470,7 +473,10 @@ pub fn parse_sm_policy_decision(sm_policy_id: &str, json: &serde_json::Value) ->
             }
             let mut r = PccRule {
                 id: id.clone(),
-                precedence: rule.get("precedence").and_then(|v| v.as_u64()).unwrap_or(255) as u32,
+                precedence: rule
+                    .get("precedence")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(255) as u32,
                 five_qi: dec.def_five_qi,
                 flow_enabled: true,
                 ..Default::default()
@@ -495,10 +501,22 @@ pub fn parse_sm_policy_decision(sm_policy_id: &str, json: &serde_json::Value) ->
                     if let Some(v) = q.get("5qi").and_then(|v| v.as_u64()) {
                         r.five_qi = v as u8;
                     }
-                    r.mbr_ul_bps = q.get("maxbrUl").and_then(|v| v.as_str()).and_then(parse_bitrate);
-                    r.mbr_dl_bps = q.get("maxbrDl").and_then(|v| v.as_str()).and_then(parse_bitrate);
-                    r.gbr_ul_bps = q.get("gbrUl").and_then(|v| v.as_str()).and_then(parse_bitrate);
-                    r.gbr_dl_bps = q.get("gbrDl").and_then(|v| v.as_str()).and_then(parse_bitrate);
+                    r.mbr_ul_bps = q
+                        .get("maxbrUl")
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_bitrate);
+                    r.mbr_dl_bps = q
+                        .get("maxbrDl")
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_bitrate);
+                    r.gbr_ul_bps = q
+                        .get("gbrUl")
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_bitrate);
+                    r.gbr_dl_bps = q
+                        .get("gbrDl")
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_bitrate);
                 }
             }
             if let Some(tref) = rule
@@ -840,14 +858,24 @@ mod tests {
         let ambr_off = 12; // after QoS rules
         assert_eq!(msg[ambr_off], 0x06); // length
         assert_eq!(msg[ambr_off + 1], 0x06); // unit 1 Mbps
-        assert_eq!(u16::from_be_bytes([msg[ambr_off + 2], msg[ambr_off + 3]]), 200);
+        assert_eq!(
+            u16::from_be_bytes([msg[ambr_off + 2], msg[ambr_off + 3]]),
+            200
+        );
         assert_eq!(msg[ambr_off + 4], 0x06);
-        assert_eq!(u16::from_be_bytes([msg[ambr_off + 5], msg[ambr_off + 6]]), 50);
+        assert_eq!(
+            u16::from_be_bytes([msg[ambr_off + 5], msg[ambr_off + 6]]),
+            50
+        );
     }
 
     #[test]
     fn reject_message_has_cause() {
-        let msg = build_establishment_reject(1, 2, gsm_cause::USER_AUTHENTICATION_OR_AUTHORIZATION_FAILED);
+        let msg = build_establishment_reject(
+            1,
+            2,
+            gsm_cause::USER_AUTHENTICATION_OR_AUTHORIZATION_FAILED,
+        );
         assert_eq!(msg, vec![0x2E, 1, 2, 0xC3, 29]);
     }
 
@@ -955,9 +983,15 @@ mod tests {
 
     #[test]
     fn split_host_port_variants() {
-        assert_eq!(split_host_port("http://1.2.3.4:7777"), Some(("1.2.3.4".into(), 7777)));
+        assert_eq!(
+            split_host_port("http://1.2.3.4:7777"),
+            Some(("1.2.3.4".into(), 7777))
+        );
         assert_eq!(split_host_port("https://pcf"), Some(("pcf".into(), 443)));
-        assert_eq!(split_host_port("http://pcf:80/extra/path"), Some(("pcf".into(), 80)));
+        assert_eq!(
+            split_host_port("http://pcf:80/extra/path"),
+            Some(("pcf".into(), 80))
+        );
     }
 
     // --------------- HTTP round-trip against a stub PCF -----------------
@@ -989,7 +1023,10 @@ mod tests {
                 );
             }
             return ogs_sbi::message::SbiResponse::with_status(201)
-                .with_header("Location", "/npcf-smpolicycontrol/v1/sm-policies/stub-pol-1")
+                .with_header(
+                    "Location",
+                    "/npcf-smpolicycontrol/v1/sm-policies/stub-pol-1",
+                )
                 .with_body(decision.to_string(), "application/json");
         }
         if path.ends_with("/update") {
@@ -1014,7 +1051,10 @@ mod tests {
         let port = free_port();
         let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(addr));
-        server.start(stub_pcf_handler).await.expect("start stub PCF");
+        server
+            .start(stub_pcf_handler)
+            .await
+            .expect("start stub PCF");
 
         let pcf = PcfEndpoint {
             host: "127.0.0.1".into(),

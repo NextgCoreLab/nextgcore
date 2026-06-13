@@ -283,9 +283,7 @@ pub fn handle_gtpu_packet(server: &GtpuServer, data: &[u8], peer: SocketAddr) ->
             log::debug!("[RECV] GTP-U Echo Response from {peer}");
             GtpuRecvResult::Handled
         }
-        t if t == Gtp1uMessageType::ErrorIndication as u8 => {
-            handle_error_indication(&msg, peer)
-        }
+        t if t == Gtp1uMessageType::ErrorIndication as u8 => handle_error_indication(&msg, peer),
         t if t == Gtp1uMessageType::EndMarker as u8 => handle_end_marker(server, &msg, peer),
         t if t == Gtp1uMessageType::GPdu as u8 => handle_gpdu(server, &msg, peer),
         other => {
@@ -638,20 +636,14 @@ mod tests {
 
         // First buffered packet triggers a Downlink Data Report
         let gpdu1 = Gtp1Message::gpdu(0x1002, Bytes::from_static(&[1, 1]));
-        let result = handle_gtpu_packet(
-            &server,
-            &gpdu1.encode(),
-            "127.0.0.1:9999".parse().unwrap(),
-        );
+        let result =
+            handle_gtpu_packet(&server, &gpdu1.encode(), "127.0.0.1:9999".parse().unwrap());
         assert!(matches!(result, GtpuRecvResult::SessionReport(_)));
 
         // Second packet is buffered silently
         let gpdu2 = Gtp1Message::gpdu(0x1002, Bytes::from_static(&[2, 2]));
-        let result = handle_gtpu_packet(
-            &server,
-            &gpdu2.encode(),
-            "127.0.0.1:9999".parse().unwrap(),
-        );
+        let result =
+            handle_gtpu_packet(&server, &gpdu2.encode(), "127.0.0.1:9999".parse().unwrap());
         assert!(matches!(result, GtpuRecvResult::Buffered));
 
         let far = ctx.far_find(sess_id, far_id).unwrap();
@@ -722,11 +714,7 @@ mod tests {
         );
 
         let gpdu = Gtp1Message::gpdu(0x1004, Bytes::from_static(&[9]));
-        let result = handle_gtpu_packet(
-            &server,
-            &gpdu.encode(),
-            "127.0.0.1:9999".parse().unwrap(),
-        );
+        let result = handle_gtpu_packet(&server, &gpdu.encode(), "127.0.0.1:9999".parse().unwrap());
         assert!(matches!(result, GtpuRecvResult::Dropped(_)));
 
         server.close();

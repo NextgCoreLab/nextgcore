@@ -485,7 +485,10 @@ impl UdmContext {
 
         let parsed = parse_suci(suci_or_supi)?;
         if parsed.supi_type != 0 {
-            log::warn!("[{suci_or_supi}] Unsupported SUPI type {}", parsed.supi_type);
+            log::warn!(
+                "[{suci_or_supi}] Unsupported SUPI type {}",
+                parsed.supi_type
+            );
             return None;
         }
 
@@ -1056,7 +1059,9 @@ mod tests {
         );
 
         // Non-digit scheme output is rejected for the null scheme
-        assert!(ctx.deconceal_suci("suci-0-001-01-0000-0-0-00abc1").is_none());
+        assert!(ctx
+            .deconceal_suci("suci-0-001-01-0000-0-0-00abc1")
+            .is_none());
     }
 
     /// Encode digits as TBCD (swapped nibbles, 0xF filler) like the UE side.

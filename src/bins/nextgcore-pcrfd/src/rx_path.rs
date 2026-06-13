@@ -122,9 +122,7 @@ impl RxRequestError {
                 Some(gx_result_code::DIAMETER_APPLICATION_UNSUPPORTED)
             }
             RxRequestError::UnknownSession => Some(result_code::DIAMETER_UNKNOWN_SESSION_ID),
-            RxRequestError::IpCanSessionNotAvailable | RxRequestError::ServiceNotAuthorized => {
-                None
-            }
+            RxRequestError::IpCanSessionNotAvailable | RxRequestError::ServiceNotAuthorized => None,
         }
     }
 
@@ -430,7 +428,10 @@ pub fn build_rx_answer_error(
     if let Some(code) = error.failed_avp_code() {
         answer.add_avp(Avp::mandatory(
             base_avp::FAILED_AVP,
-            AvpData::Grouped(vec![Avp::mandatory(code, AvpData::OctetString(Bytes::new()))]),
+            AvpData::Grouped(vec![Avp::mandatory(
+                code,
+                AvpData::OctetString(Bytes::new()),
+            )]),
         ));
     }
 
@@ -536,10 +537,7 @@ pub async fn handle_aar(msg: &DiameterMessage, local: &LocalIdentity) -> Diamete
                 return build_rx_answer_error(msg, local, &RxRequestError::ServiceNotAuthorized);
             }
             Err(e) => {
-                log::warn!(
-                    "RAR install for Rx session {} failed: {e}",
-                    info.session_id
-                );
+                log::warn!("RAR install for Rx session {} failed: {e}", info.session_id);
                 remove_rx_session(&info.session_id);
                 pcrf_diam_stats().rx.inc_rx_aar_error();
                 return build_rx_answer_error(msg, local, &RxRequestError::ServiceNotAuthorized);
@@ -599,8 +597,11 @@ pub async fn handle_str(msg: &DiameterMessage, local: &LocalIdentity) -> Diamete
         let gx_sid = context
             .gx_session_find_by_idx(rx_session.gx_session_idx)
             .map(|s| s.sid);
-        let rule_names: Vec<String> =
-            rx_session.pcc_rules.iter().map(|r| r.name.clone()).collect();
+        let rule_names: Vec<String> = rx_session
+            .pcc_rules
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
         (gx_sid, rule_names)
     };
 
@@ -619,18 +620,12 @@ pub async fn handle_str(msg: &DiameterMessage, local: &LocalIdentity) -> Diamete
                     );
                 }
                 Err(e) => {
-                    log::warn!(
-                        "RAR remove for Rx session {} failed: {e}",
-                        info.session_id
-                    );
+                    log::warn!("RAR remove for Rx session {} failed: {e}", info.session_id);
                 }
             }
         }
     } else {
-        log::warn!(
-            "STR {}: bound Gx session no longer exists",
-            info.session_id
-        );
+        log::warn!("STR {}: bound Gx session no longer exists", info.session_id);
     }
 
     remove_rx_session(&info.session_id);
@@ -655,8 +650,7 @@ pub fn build_asr(
     dest_realm: &str,
     abort_cause: AbortCause,
 ) -> DiameterMessage {
-    let mut asr =
-        DiameterMessage::new_request(rx_cmd::ABORT_SESSION, RX_APPLICATION_ID);
+    let mut asr = DiameterMessage::new_request(rx_cmd::ABORT_SESSION, RX_APPLICATION_ID);
     asr.add_avp(Avp::mandatory(
         avp_code::SESSION_ID,
         AvpData::Utf8String(rx_sid.to_string()),
@@ -696,10 +690,7 @@ pub fn parse_asa(msg: &DiameterMessage) -> Result<u32, String> {
 }
 
 /// Send an ASR for an Rx session whose IP-CAN session terminated.
-pub async fn pcrf_rx_send_asr_for_target(
-    target: &gx_path::RxAbortTarget,
-    local: &LocalIdentity,
-) {
+pub async fn pcrf_rx_send_asr_for_target(target: &gx_path::RxAbortTarget, local: &LocalIdentity) {
     let Some(ref peer_host) = target.peer_host else {
         log::warn!("Cannot send ASR for {}: no AF peer host", target.rx_sid);
         return;
@@ -862,10 +853,7 @@ mod tests {
         let aar = roundtrip(&build_test_aar("rx-parse-1", [10, 45, 0, 2]));
         let info = parse_aar(&aar).expect("parse_aar");
         assert_eq!(info.session_id, "rx-parse-1");
-        assert_eq!(
-            info.origin_host,
-            "pcscf.ims.mnc001.mcc001.3gppnetwork.org"
-        );
+        assert_eq!(info.origin_host, "pcscf.ims.mnc001.mcc001.3gppnetwork.org");
         assert_eq!(info.framed_ipv4, Some([10, 45, 0, 2]));
         assert_eq!(info.media_components.len(), 1);
         let mc = &info.media_components[0];
@@ -910,10 +898,7 @@ mod tests {
             .avps
             .retain(|a| a.code != avp_code::TERMINATION_CAUSE);
         let err = parse_str(&roundtrip(&str_msg)).unwrap_err();
-        assert_eq!(
-            err,
-            RxRequestError::MissingAvp(avp_code::TERMINATION_CAUSE)
-        );
+        assert_eq!(err, RxRequestError::MissingAvp(avp_code::TERMINATION_CAUSE));
     }
 
     // ------------------------------------------------------------------
@@ -998,7 +983,10 @@ mod tests {
         let abort_cause = asr
             .find_vendor_avp(rx_avp::ABORT_CAUSE, OGS_3GPP_VENDOR_ID)
             .expect("Abort-Cause");
-        assert_eq!(abort_cause.as_i32(), Some(AbortCause::BearerReleased as i32));
+        assert_eq!(
+            abort_cause.as_i32(),
+            Some(AbortCause::BearerReleased as i32)
+        );
     }
 
     #[test]

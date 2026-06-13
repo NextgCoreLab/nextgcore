@@ -49,7 +49,10 @@ pub async fn namf_request_handler(request: SbiRequest) -> SbiResponse {
         .collect();
 
     if parts.len() < 3 {
-        return send_not_found("Invalid resource path", Some("RESOURCE_URI_STRUCTURE_NOT_FOUND"));
+        return send_not_found(
+            "Invalid resource path",
+            Some("RESOURCE_URI_STRUCTURE_NOT_FOUND"),
+        );
     }
 
     let service = parts[0];
@@ -296,9 +299,7 @@ fn rfc3339_to_system_time(s: &str) -> Option<std::time::SystemTime> {
     if bytes.len() < 20 {
         return None;
     }
-    let num = |range: std::ops::Range<usize>| -> Option<i64> {
-        s.get(range)?.parse::<i64>().ok()
-    };
+    let num = |range: std::ops::Range<usize>| -> Option<i64> { s.get(range)?.parse::<i64>().ok() };
     if bytes[4] != b'-' || bytes[7] != b'-' || (bytes[10] != b'T' && bytes[10] != b't') {
         return None;
     }
@@ -877,10 +878,7 @@ fn find_binary_part(request: &SbiRequest, content_id: &str) -> Option<Vec<u8>> {
 /// 504 N1N2MessageTransferError with cause UE_NOT_REACHABLE
 /// (TS 29.518 Table 6.1.7.3-1) + asynchronous failure notification when
 /// the consumer supplied n1n2FailureTxfNotifURI.
-fn ue_not_reachable_error(
-    ue_context_id: &str,
-    failure_uri: Option<&str>,
-) -> SbiResponse {
+fn ue_not_reachable_error(ue_context_id: &str, failure_uri: Option<&str>) -> SbiResponse {
     if let Some(uri) = failure_uri {
         send_n1n2_failure_notification(
             uri.to_string(),
@@ -935,10 +933,7 @@ pub fn send_n1n2_failure_notification(notify_uri: String, cause: &str, n1n2_msg_
 
 /// POST /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages —
 /// Namf_Communication_N1N2MessageTransfer (TS 29.518 §5.2.2.3.1).
-fn handle_n1_n2_message_transfer_request(
-    ue_context_id: &str,
-    request: &SbiRequest,
-) -> SbiResponse {
+fn handle_n1_n2_message_transfer_request(ue_context_id: &str, request: &SbiRequest) -> SbiResponse {
     let Some(ue) = find_ue_by_context_id(ue_context_id) else {
         return context_not_found(ue_context_id);
     };
@@ -1019,7 +1014,10 @@ fn handle_n1_n2_message_transfer_request(
         .and_then(Value::as_u64)
         .and_then(|v| u8::try_from(v).ok())
         .or(sm_psi);
-    let skip_ind = body.get("skipInd").and_then(Value::as_bool).unwrap_or(false);
+    let skip_ind = body
+        .get("skipInd")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let failure_uri = body
         .get("n1n2FailureTxfNotifURI")
         .and_then(Value::as_str)
@@ -1066,7 +1064,8 @@ fn handle_n1_n2_message_transfer_request(
         skip_ind,
     };
 
-    let result = namf_handler::handle_n1_n2_message_transfer(&ue, &mut sess, ran_ue.as_ref(), &req_data);
+    let result =
+        namf_handler::handle_n1_n2_message_transfer(&ue, &mut sess, ran_ue.as_ref(), &req_data);
 
     // Persist any session mutations (paging state, release flags)
     {
@@ -1484,7 +1483,10 @@ fn handle_provide_positioning_info(ue_context_id: &str, request: &SbiRequest) ->
             json!(now.saturating_sub(ue.ue_location_timestamp).min(32_767));
     }
 
-    log::info!("[{ue_context_id}] ProvidePositioningInfo: NCGI cell=0x{:09X}", ue.nr_cgi.cell_id);
+    log::info!(
+        "[{ue_context_id}] ProvidePositioningInfo: NCGI cell=0x{:09X}",
+        ue.nr_cgi.cell_id
+    );
     match SbiResponse::ok().with_json_body(&response_body) {
         Ok(resp) => resp,
         Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
@@ -1775,7 +1777,11 @@ mod tests {
         let resp = namf_request_handler(req).await;
         assert_eq!(resp.status, 200);
         let ctx = amf_self();
-        let stored = ctx.read().unwrap().event_subscription_find(&sub_id).unwrap();
+        let stored = ctx
+            .read()
+            .unwrap()
+            .event_subscription_find(&sub_id)
+            .unwrap();
         assert_eq!(stored.notify_uri, "http://127.0.0.1:9/notify-new");
 
         // Unsupported patch op rejected with 400
@@ -1977,48 +1983,40 @@ mod tests {
         setup_sess(&ue, 7);
 
         // Neither n1MessageContainer nor n2InfoContainer
-        let req = SbiRequest::post(format!(
-            "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"
-        ))
-        .with_json_body(&json!({ "pduSessionId": 7 }))
-        .expect("json");
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&json!({ "pduSessionId": 7 }))
+            .expect("json");
         let resp = namf_request_handler(req).await;
         assert_eq!(resp.status, 400);
         assert_eq!(problem_cause(&resp), "MANDATORY_IE_MISSING");
 
         // n2InfoContainer without smInfo.pduSessionId
-        let req = SbiRequest::post(format!(
-            "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"
-        ))
-        .with_json_body(&json!({
-            "n2InfoContainer": { "n2InformationClass": "SM", "smInfo": {
-                "n2InfoContent": { "ngapIeType": "PDU_RES_SETUP_REQ" } } }
-        }))
-        .expect("json");
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&json!({
+                "n2InfoContainer": { "n2InformationClass": "SM", "smInfo": {
+                    "n2InfoContent": { "ngapIeType": "PDU_RES_SETUP_REQ" } } }
+            }))
+            .expect("json");
         let resp = namf_request_handler(req).await;
         assert_eq!(resp.status, 400);
         assert_eq!(problem_cause(&resp), "MANDATORY_IE_MISSING");
 
         // Referenced binary part missing
-        let req = SbiRequest::post(format!(
-            "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"
-        ))
-        .with_json_body(&json!({
-            "pduSessionId": 7,
-            "n1MessageContainer": {
-                "n1MessageClass": "SM",
-                "n1MessageContent": { "contentId": "no-such-part" },
-            },
-        }))
-        .expect("json");
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"))
+            .with_json_body(&json!({
+                "pduSessionId": 7,
+                "n1MessageContainer": {
+                    "n1MessageClass": "SM",
+                    "n1MessageContent": { "contentId": "no-such-part" },
+                },
+            }))
+            .expect("json");
         let resp = namf_request_handler(req).await;
         assert_eq!(resp.status, 400);
         assert_eq!(problem_cause(&resp), "MANDATORY_IE_INCORRECT");
 
         // Malformed body never panics
-        let mut req = SbiRequest::post(format!(
-            "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"
-        ));
+        let mut req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"));
         req.http.set_content("{{{{");
         let resp = namf_request_handler(req).await;
         assert_eq!(resp.status, 400);
@@ -2028,8 +2026,7 @@ mod tests {
     async fn test_n1n2_transfer_unknown_ue_404() {
         amf_context_init(64, 1024, 4096);
         let body = n1n2_body(1, false, false, None);
-        let resp =
-            namf_request_handler(n1n2_request("imsi-001019999999999", &body, false)).await;
+        let resp = namf_request_handler(n1n2_request("imsi-001019999999999", &body, false)).await;
         assert_eq!(resp.status, 404);
         assert_eq!(problem_cause(&resp), "CONTEXT_NOT_FOUND");
     }
@@ -2103,7 +2100,9 @@ mod tests {
         // mmContextList mandatory attrs are encoded
         let mm = &ue_context["mmContextList"][0];
         assert_eq!(mm["accessType"].as_str(), Some("3GPP_ACCESS"));
-        assert!(mm["nasSecurityMode"]["integrityAlgorithm"].as_str().is_some());
+        assert!(mm["nasSecurityMode"]["integrityAlgorithm"]
+            .as_str()
+            .is_some());
         // session context carries its mandatory attrs
         let sess_ctx = &ue_context["sessionContextList"][0];
         assert_eq!(sess_ctx["pduSessionId"].as_u64(), Some(9));
@@ -2182,14 +2181,12 @@ mod tests {
         let _sess = setup_sess(&ue, 10);
 
         // TRANSFERRED with a session to release
-        let req = SbiRequest::post(format!(
-            "/namf-comm/v1/ue-contexts/{supi}/transfer-update"
-        ))
-        .with_json_body(&json!({
-            "transferStatus": "TRANSFERRED",
-            "toReleaseSessionList": [10],
-        }))
-        .expect("json");
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/transfer-update"))
+            .with_json_body(&json!({
+                "transferStatus": "TRANSFERRED",
+                "toReleaseSessionList": [10],
+            }))
+            .expect("json");
         let resp = namf_request_handler(req).await;
         assert_eq!(resp.status, 200);
         assert_eq!(
@@ -2209,21 +2206,17 @@ mod tests {
         }
 
         // Missing mandatory transferStatus
-        let req = SbiRequest::post(format!(
-            "/namf-comm/v1/ue-contexts/{supi}/transfer-update"
-        ))
-        .with_json_body(&json!({}))
-        .expect("json");
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/transfer-update"))
+            .with_json_body(&json!({}))
+            .expect("json");
         let resp = namf_request_handler(req).await;
         assert_eq!(resp.status, 400);
         assert_eq!(problem_cause(&resp), "MANDATORY_IE_MISSING");
 
         // Invalid enum value
-        let req = SbiRequest::post(format!(
-            "/namf-comm/v1/ue-contexts/{supi}/transfer-update"
-        ))
-        .with_json_body(&json!({ "transferStatus": "MAYBE" }))
-        .expect("json");
+        let req = SbiRequest::post(format!("/namf-comm/v1/ue-contexts/{supi}/transfer-update"))
+            .with_json_body(&json!({ "transferStatus": "MAYBE" }))
+            .expect("json");
         let resp = namf_request_handler(req).await;
         assert_eq!(resp.status, 400);
         assert_eq!(problem_cause(&resp), "MANDATORY_IE_INCORRECT");
@@ -2258,11 +2251,9 @@ mod tests {
         assert_eq!(body_json(&resp)["reachability"].as_str(), Some("REACHABLE"));
 
         // CM-IDLE UE: 504 UE_NOT_REACHABLE per TS 29.518 §6.3.7.3
-        let req = SbiRequest::post(format!(
-            "/namf-mt/v1/ue-contexts/{idle_supi}/ue-reachind"
-        ))
-        .with_json_body(&json!({ "reachability": "REACHABLE" }))
-        .expect("json");
+        let req = SbiRequest::post(format!("/namf-mt/v1/ue-contexts/{idle_supi}/ue-reachind"))
+            .with_json_body(&json!({ "reachability": "REACHABLE" }))
+            .expect("json");
         let resp = namf_request_handler(req).await;
         assert_eq!(resp.status, 504);
         assert_eq!(problem_cause(&resp), "UE_NOT_REACHABLE");

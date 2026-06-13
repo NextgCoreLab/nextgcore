@@ -95,19 +95,11 @@ pub fn triggered_message_type(request_type: u8) -> Option<u8> {
             T::DeleteIndirectDataForwardingTunnelResponse as u8
         }
         x if x == T::ReleaseAccessBearersRequest as u8 => T::ReleaseAccessBearersResponse as u8,
-        x if x == T::DownlinkDataNotification as u8 => {
-            T::DownlinkDataNotificationAcknowledge as u8
-        }
+        x if x == T::DownlinkDataNotification as u8 => T::DownlinkDataNotificationAcknowledge as u8,
         x if x == T::ModifyAccessBearersRequest as u8 => T::ModifyAccessBearersResponse as u8,
-        x if x == T::CreateForwardingTunnelRequest as u8 => {
-            T::CreateForwardingTunnelResponse as u8
-        }
-        x if x == T::DeletePdnConnectionSetRequest as u8 => {
-            T::DeletePdnConnectionSetResponse as u8
-        }
-        x if x == T::UpdatePdnConnectionSetRequest as u8 => {
-            T::UpdatePdnConnectionSetResponse as u8
-        }
+        x if x == T::CreateForwardingTunnelRequest as u8 => T::CreateForwardingTunnelResponse as u8,
+        x if x == T::DeletePdnConnectionSetRequest as u8 => T::DeletePdnConnectionSetResponse as u8,
+        x if x == T::UpdatePdnConnectionSetRequest as u8 => T::UpdatePdnConnectionSetResponse as u8,
         _ => return None,
     };
     Some(t)

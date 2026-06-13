@@ -303,8 +303,13 @@ async fn main() -> Result<()> {
             )),
             _ => None,
         };
-        match n32_server::initiate_n32c_handshake(fqdn, api_root, local_api_root.as_deref(), n32_tls_opt)
-            .await
+        match n32_server::initiate_n32c_handshake(
+            fqdn,
+            api_root,
+            local_api_root.as_deref(),
+            n32_tls_opt,
+        )
+        .await
         {
             Ok(outcome) => log::info!(
                 "Peer SEPP [{fqdn}] established (node={}, security={:?})",

@@ -377,9 +377,9 @@ impl BsfSess {
             && f.ipv6prefix
                 .as_deref()
                 .is_none_or(|v| self.ipv6prefix_string.as_deref() == Some(v))
-            && f.mac_addr48.as_deref().is_none_or(|v| {
-                normalize_mac(v).as_deref() == self.mac_addr48.as_deref()
-            })
+            && f.mac_addr48
+                .as_deref()
+                .is_none_or(|v| normalize_mac(v).as_deref() == self.mac_addr48.as_deref())
             && f.supi
                 .as_deref()
                 .is_none_or(|v| self.supi.as_deref() == Some(v))
@@ -1266,9 +1266,7 @@ mod tests {
         let mut ctx = BsfContext::new();
         ctx.init(100);
 
-        let sess = ctx
-            .sess_add_binding(Some("10.45.0.3"), None, None)
-            .unwrap();
+        let sess = ctx.sess_add_binding(Some("10.45.0.3"), None, None).unwrap();
         let mut sess = sess;
         assert!(sess.set_expiry("2026-01-01T00:00:00Z"));
         ctx.sess_update(&sess);
@@ -1361,7 +1359,9 @@ mod tests {
         assert!(ctx.sess_find_by_mac("aa-aa-aa-aa-aa-01").is_some());
 
         // Next allocated id must not collide with the restored one.
-        let fresh = ctx.sess_add_binding(Some("10.45.0.10"), None, None).unwrap();
+        let fresh = ctx
+            .sess_add_binding(Some("10.45.0.10"), None, None)
+            .unwrap();
         assert!(fresh.id > 7);
     }
 }

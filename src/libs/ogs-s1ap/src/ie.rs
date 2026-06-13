@@ -110,7 +110,10 @@ fn encode_seq_preamble(encoder: &mut AperEncoder, optionals: &[bool]) {
 }
 
 /// Read the SEQUENCE preamble: extension bit plus optional-field bitmap.
-fn decode_seq_preamble(decoder: &mut AperDecoder, num_optionals: usize) -> S1apResult<(bool, Vec<bool>)> {
+fn decode_seq_preamble(
+    decoder: &mut AperDecoder,
+    num_optionals: usize,
+) -> S1apResult<(bool, Vec<bool>)> {
     let ext = decoder.read_bit()?;
     let mut opts = Vec::with_capacity(num_optionals);
     for _ in 0..num_optionals {
@@ -400,7 +403,8 @@ fn encode_arp_inline(
     // AllocationAndRetentionPriority ::= SEQUENCE { priorityLevel, pre-emptionCapability,
     //   pre-emptionVulnerability, iE-Extensions OPTIONAL, ... }
     encode_seq_preamble(encoder, &[false]);
-    encoder.encode_constrained_whole_number(arp.priority_level as i64, &PRIORITY_LEVEL_CONSTRAINT)?;
+    encoder
+        .encode_constrained_whole_number(arp.priority_level as i64, &PRIORITY_LEVEL_CONSTRAINT)?;
     encoder.encode_enumerated(arp.pre_emption_capability as i64, &BOOL_ENUM_CONSTRAINT)?;
     encoder.encode_enumerated(arp.pre_emption_vulnerability as i64, &BOOL_ENUM_CONSTRAINT)?;
     Ok(())
@@ -431,8 +435,14 @@ fn encode_erab_qos_inline(
     if let Some(ref gbr) = qos.gbr_qos_info {
         // GBR-QosInformation ::= SEQUENCE { 4x BitRate, iE-Extensions OPTIONAL, ... }
         encode_seq_preamble(encoder, &[false]);
-        encoder.encode_constrained_whole_number(gbr.erab_max_bitrate_dl as i64, &BIT_RATE_CONSTRAINT)?;
-        encoder.encode_constrained_whole_number(gbr.erab_max_bitrate_ul as i64, &BIT_RATE_CONSTRAINT)?;
+        encoder.encode_constrained_whole_number(
+            gbr.erab_max_bitrate_dl as i64,
+            &BIT_RATE_CONSTRAINT,
+        )?;
+        encoder.encode_constrained_whole_number(
+            gbr.erab_max_bitrate_ul as i64,
+            &BIT_RATE_CONSTRAINT,
+        )?;
         encoder.encode_constrained_whole_number(
             gbr.erab_guaranteed_bitrate_dl as i64,
             &BIT_RATE_CONSTRAINT,
@@ -671,10 +681,9 @@ fn encode_erab_to_be_setup_item_bearer(
     encoder: &mut AperEncoder,
     item: &ErabToBeSetupItem,
 ) -> S1apResult<()> {
-    let nas_pdu = item
-        .nas_pdu
-        .as_ref()
-        .ok_or(S1apError::MissingMandatoryIe("NAS-PDU (E-RABToBeSetupItemBearerSUReq)"))?;
+    let nas_pdu = item.nas_pdu.as_ref().ok_or(S1apError::MissingMandatoryIe(
+        "NAS-PDU (E-RABToBeSetupItemBearerSUReq)",
+    ))?;
     encode_seq_preamble(encoder, &[false]);
     encode_erab_id(encoder, item.erab_id)?;
     encode_erab_qos_inline(encoder, &item.erab_qos)?;
@@ -816,10 +825,7 @@ fn decode_erab_to_be_setup_item_ho_req(
 /// E-RABAdmittedItem ::= SEQUENCE { e-RAB-ID, transportLayerAddress, gTP-TEID,
 ///   dL-transportLayerAddress OPTIONAL, dL-gTP-TEID OPTIONAL,
 ///   uL-TransportLayerAddress OPTIONAL, uL-GTP-TEID OPTIONAL, iE-Ext OPTIONAL, ... }
-fn encode_erab_admitted_item(
-    encoder: &mut AperEncoder,
-    item: &ErabAdmittedItem,
-) -> S1apResult<()> {
+fn encode_erab_admitted_item(encoder: &mut AperEncoder, item: &ErabAdmittedItem) -> S1apResult<()> {
     encode_seq_preamble(
         encoder,
         &[
@@ -993,7 +999,10 @@ pub fn decode_enb_ue_s1ap_id(field: &ProtocolIeField) -> S1apResult<u32> {
     Ok(id.0)
 }
 
-pub fn encode_source_mme_ue_s1ap_id(container: &mut ProtocolIeContainer, id: u32) -> S1apResult<()> {
+pub fn encode_source_mme_ue_s1ap_id(
+    container: &mut ProtocolIeContainer,
+    id: u32,
+) -> S1apResult<()> {
     container.push(make_ie_field(
         ProtocolIeId::SOURCE_MME_UE_S1AP_ID,
         Criticality::Reject,
@@ -1026,7 +1035,11 @@ pub fn decode_nas_pdu(field: &ProtocolIeField) -> S1apResult<Vec<u8>> {
 }
 
 pub fn encode_cause(container: &mut ProtocolIeContainer, cause: &Cause) -> S1apResult<()> {
-    container.push(make_ie_field(ProtocolIeId::CAUSE, Criticality::Ignore, cause)?);
+    container.push(make_ie_field(
+        ProtocolIeId::CAUSE,
+        Criticality::Ignore,
+        cause,
+    )?);
     Ok(())
 }
 
@@ -1240,8 +1253,11 @@ pub fn encode_served_gummeis(
                 // ServedGUMMEIsItem ::= SEQUENCE { servedPLMNs, servedGroupIDs, servedMMECs,
                 //   iE-Extensions OPTIONAL, ... }
                 encode_seq_preamble(encoder, &[false]);
-                encoder
-                    .encode_constrained_length(item.served_plmns.len(), 1, MAX_NO_OF_PLMNS_PER_MME)?;
+                encoder.encode_constrained_length(
+                    item.served_plmns.len(),
+                    1,
+                    MAX_NO_OF_PLMNS_PER_MME,
+                )?;
                 for plmn in &item.served_plmns {
                     encode_plmn(encoder, plmn)?;
                 }
@@ -1253,7 +1269,11 @@ pub fn encode_served_gummeis(
                 for group_id in &item.served_group_ids {
                     encode_fixed_u16(encoder, *group_id)?;
                 }
-                encoder.encode_constrained_length(item.served_mmec_codes.len(), 1, MAX_NO_OF_MMECS)?;
+                encoder.encode_constrained_length(
+                    item.served_mmec_codes.len(),
+                    1,
+                    MAX_NO_OF_MMECS,
+                )?;
                 for mmec in &item.served_mmec_codes {
                     encoder.encode_octet_string(&[*mmec], Some(1), Some(1))?;
                 }
@@ -1551,10 +1571,7 @@ pub fn decode_ue_radio_capability(field: &ProtocolIeField) -> S1apResult<Vec<u8>
 // Paging IEs
 // ============================================================================
 
-pub fn encode_ue_identity_index(
-    container: &mut ProtocolIeContainer,
-    index: u16,
-) -> S1apResult<()> {
+pub fn encode_ue_identity_index(container: &mut ProtocolIeContainer, index: u16) -> S1apResult<()> {
     push_ie(
         container,
         ProtocolIeId::UE_IDENTITY_INDEX_VALUE,
@@ -1572,10 +1589,7 @@ pub fn decode_ue_identity_index(field: &ProtocolIeField) -> S1apResult<u16> {
     Ok(decoder.read_bits(10)? as u16)
 }
 
-pub fn encode_ue_paging_id(
-    container: &mut ProtocolIeContainer,
-    id: &UePagingId,
-) -> S1apResult<()> {
+pub fn encode_ue_paging_id(container: &mut ProtocolIeContainer, id: &UePagingId) -> S1apResult<()> {
     push_ie(
         container,
         ProtocolIeId::UE_PAGING_ID,

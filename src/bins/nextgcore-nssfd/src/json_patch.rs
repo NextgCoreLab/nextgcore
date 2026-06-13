@@ -42,10 +42,7 @@ fn apply_op(doc: &mut Value, op: &Value) -> Result<(), String> {
             add_value(doc, &tokens, value)
         }
         "replace" => {
-            let value = op
-                .get("value")
-                .ok_or("'replace' requires 'value'")?
-                .clone();
+            let value = op.get("value").ok_or("'replace' requires 'value'")?.clone();
             if get_value(doc, &tokens).is_none() {
                 return Err(format!("'replace' target does not exist: {path}"));
             }
@@ -269,6 +266,10 @@ mod tests {
         assert!(apply_patch(&mut doc, &json!([])).is_err());
         assert!(apply_patch(&mut doc, &json!([{"op": "bogus", "path": "/a"}])).is_err());
         assert!(apply_patch(&mut doc, &json!([{"op": "add", "value": 1}])).is_err());
-        assert!(apply_patch(&mut doc, &json!([{"op": "add", "path": "no-slash", "value": 1}])).is_err());
+        assert!(apply_patch(
+            &mut doc,
+            &json!([{"op": "add", "path": "no-slash", "value": 1}])
+        )
+        .is_err());
     }
 }

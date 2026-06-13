@@ -287,21 +287,19 @@ pub fn mme_s6a_process_inbound(inbound: &crate::fd_path::InboundS6aRequest) -> S
                     if let Some(enb_ue) = enb_ue {
                         let mut pool = ctx.mme_ue_pool.write().unwrap();
                         if let Some(mme_ue) = pool.get_mut(&ue_id) {
-                            crate::nas_path::nas_eps_send_detach_request(mme_ue, &enb_ue)
-                                .map_err(|e| {
+                            crate::nas_path::nas_eps_send_detach_request(mme_ue, &enb_ue).map_err(
+                                |e| {
                                     log::error!(
                                         "[{}] Detach Request send failed: {e:?}",
                                         inbound.imsi_bcd
                                     );
                                     S6aError::NetworkFailure
-                                })?;
+                                },
+                            )?;
                         }
                     } else {
                         // UE not connected: implicit detach, remove context
-                        log::info!(
-                            "[{}] UE not connected; implicit detach",
-                            inbound.imsi_bcd
-                        );
+                        log::info!("[{}] UE not connected; implicit detach", inbound.imsi_bcd);
                         ctx.mme_ue_remove(ue_id);
                     }
                 }

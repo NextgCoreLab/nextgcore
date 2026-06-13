@@ -160,8 +160,9 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 /// refresh must DELETE the superseded expiry timer — merely starting a new one
 /// leaves the old timer armed and the NF gets suspended on schedule regardless
 /// of heartbeats.
-static HEARTBEAT_TIMERS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static HEARTBEAT_TIMERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 /// Arm (or re-arm) the no-heartbeat expiry timer for an NF instance,
 /// cancelling any previously armed timer for the same instance.
@@ -449,7 +450,10 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
         Ok(p) => p,
         Err(missing) => {
             return send_bad_request(
-                &format!("Missing mandatory NFProfile attribute(s): {}", missing.join(", ")),
+                &format!(
+                    "Missing mandatory NFProfile attribute(s): {}",
+                    missing.join(", ")
+                ),
                 Some("MANDATORY_IE_MISSING"),
             )
         }
@@ -1481,10 +1485,10 @@ mod tests {
             let result: serde_json::Value =
                 serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
             let instances = result["nfInstances"].as_array().unwrap();
-            assert!(instances
-                .iter()
-                .any(|p| p["nfInstanceId"] == nf_id),
-                "registered SMF must be discoverable: {result}");
+            assert!(
+                instances.iter().any(|p| p["nfInstanceId"] == nf_id),
+                "registered SMF must be discoverable: {result}"
+            );
 
             // --- Discover: no match -> 200 with EMPTY SearchResult, not 404 ---
             let mut req = SbiRequest::get("/nnrf-disc/v1/nf-instances");
@@ -1553,7 +1557,10 @@ mod tests {
             req.http
                 .set_header("Content-Type", "application/json-patch+json");
             req.http.set_content(patch.to_string());
-            let resp = client.send_request(req).await.expect("PATCH remove mandatory");
+            let resp = client
+                .send_request(req)
+                .await
+                .expect("PATCH remove mandatory");
             assert_eq!(resp.status, 400);
 
             // --- PATCH on unknown NF -> 404 ---

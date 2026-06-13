@@ -439,7 +439,7 @@ pub fn encode_allowed_nssai(
         // AllowedNSSAI-Item SEQUENCE { s-NSSAI, iE-Extensions OPTIONAL }
         encoder.write_bit(false); // extension
         encoder.write_bit(false); // no iE-Extensions
-        // The only field is the bare S-NSSAI (no SliceSupportItem wrapper)
+                                  // The only field is the bare S-NSSAI (no SliceSupportItem wrapper)
         encode_snssai_only(&mut encoder, snssai)?;
     }
     encoder.align();
@@ -2217,7 +2217,10 @@ pub fn decode_unavailable_guami_list(
             let _timer = decoder.decode_enumerated(&constraint)?;
         }
         let backup_amf_name = if backup_present {
-            Some(decode_printable_string_1_150(&mut decoder, "BackupAMFName")?)
+            Some(decode_printable_string_1_150(
+                &mut decoder,
+                "BackupAMFName",
+            )?)
         } else {
             None
         };
@@ -2263,7 +2266,10 @@ pub fn decode_served_guami_list(field: &ProtocolIeField) -> NgapResult<Vec<Serve
         let _ie_ext = decoder.read_bit()?;
         let guami = decode_guami_inline(&mut decoder)?;
         let backup_amf_name = if backup_present {
-            Some(decode_printable_string_1_150(&mut decoder, "BackupAMFName")?)
+            Some(decode_printable_string_1_150(
+                &mut decoder,
+                "BackupAMFName",
+            )?)
         } else {
             None
         };
@@ -2361,10 +2367,12 @@ pub fn decode_pdu_session_released_list(
 ) -> NgapResult<Vec<PduSessionResourceReleasedItem>> {
     Ok(decode_id_transfer_list(field)?
         .into_iter()
-        .map(|(pdu_session_id, transfer)| PduSessionResourceReleasedItem {
-            pdu_session_id,
-            transfer,
-        })
+        .map(
+            |(pdu_session_id, transfer)| PduSessionResourceReleasedItem {
+                pdu_session_id,
+                transfer,
+            },
+        )
         .collect())
 }
 
@@ -2562,9 +2570,11 @@ pub fn decode_pdu_session_switched_list(
 ) -> NgapResult<Vec<PduSessionResourceSwitchedItem>> {
     Ok(decode_id_transfer_list(field)?
         .into_iter()
-        .map(|(pdu_session_id, transfer)| PduSessionResourceSwitchedItem {
-            pdu_session_id,
-            transfer,
-        })
+        .map(
+            |(pdu_session_id, transfer)| PduSessionResourceSwitchedItem {
+                pdu_session_id,
+                transfer,
+            },
+        )
         .collect())
 }

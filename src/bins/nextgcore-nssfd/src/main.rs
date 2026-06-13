@@ -13,9 +13,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use ogs_sbi::client::{SbiClient, SbiClientConfig};
 use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::server::{
-    send_method_not_allowed, SbiServer, SbiServerConfig as OgsSbiServerConfig,
-};
+use ogs_sbi::server::{send_method_not_allowed, SbiServer, SbiServerConfig as OgsSbiServerConfig};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -479,9 +477,7 @@ async fn nssf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                 // Subscriptions collection
                 (4, Some("subscriptions"), "POST") => handle_subscription_create(&request).await,
                 (4, Some("subscriptions"), m) => send_method_not_allowed(m, "subscriptions"),
-                (5, Some("subscriptions"), "DELETE") => {
-                    handle_subscription_delete(parts[4]).await
-                }
+                (5, Some("subscriptions"), "DELETE") => handle_subscription_delete(parts[4]).await,
                 (5, Some("subscriptions"), "PATCH") => {
                     handle_subscription_patch(parts[4], &request).await
                 }
@@ -493,13 +489,23 @@ async fn nssf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                 (4, Some(nf_id), "PATCH") => handle_nssai_availability_patch(nf_id, &request).await,
                 (4, Some(nf_id), "DELETE") => handle_nssai_availability_delete(nf_id).await,
                 (4, Some(_), m) => send_method_not_allowed(m, "nssai-availability/{nfId}"),
-                _ => problem_details(404, "Not Found", "Unknown nssai-availability resource", None),
+                _ => problem_details(
+                    404,
+                    "Not Found",
+                    "Unknown nssai-availability resource",
+                    None,
+                ),
             }
         }
 
         _ => {
             log::warn!("Unknown NSSF request: {method} {uri}");
-            problem_details(404, "Not Found", &format!("Unknown service: {service}"), None)
+            problem_details(
+                404,
+                "Not Found",
+                &format!("Unknown service: {service}"),
+                None,
+            )
         }
     }
 }
@@ -535,7 +541,10 @@ async fn handle_ns_selection(request: &SbiRequest) -> SbiResponse {
         return problem_details(
             400,
             "Bad Request",
-            &format!("Missing mandatory query parameter(s): {}", missing.join(", ")),
+            &format!(
+                "Missing mandatory query parameter(s): {}",
+                missing.join(", ")
+            ),
             Some("MANDATORY_QUERY_PARAM_MISSING"),
         );
     }
@@ -607,7 +616,10 @@ fn parse_registration_slice_info(v: &serde_json::Value) -> nnssf_handler::Regist
 
     if let Some(subs) = v.get("subscribedNssai").and_then(|x| x.as_array()) {
         for s in subs {
-            if let Some(snssai) = s.get("subscribedSnssai").and_then(context::snssai_from_json) {
+            if let Some(snssai) = s
+                .get("subscribedSnssai")
+                .and_then(context::snssai_from_json)
+            {
                 let default_ind = s
                     .get("defaultIndication")
                     .and_then(|d| d.as_bool())
@@ -835,7 +847,10 @@ async fn handle_ns_selection_pdu_session(
             param.home_plmn_id = Some(context::PlmnId::new(mcc, mnc));
         }
     }
-    if let Some(hs) = si_json.get("homeSnssai").and_then(context::snssai_from_json) {
+    if let Some(hs) = si_json
+        .get("homeSnssai")
+        .and_then(context::snssai_from_json)
+    {
         param.home_snssai = Some(hs);
     }
 
@@ -1064,7 +1079,9 @@ fn validate_availability_doc(doc: &serde_json::Value) -> Result<Vec<context::Tai
             })?;
         for (j, s) in snssai_list.iter().enumerate() {
             context::snssai_from_json(s).ok_or_else(|| {
-                format!("supportedNssaiAvailabilityData[{i}].supportedSnssaiList[{j}]: invalid S-NSSAI")
+                format!(
+                    "supportedNssaiAvailabilityData[{i}].supportedSnssaiList[{j}]: invalid S-NSSAI"
+                )
             })?;
         }
         tais.push(tai);
@@ -1121,7 +1138,10 @@ async fn handle_nssai_availability_update(nf_id: &str, request: &SbiRequest) -> 
     let info = context::availability_info_from_doc(nf_id, doc.clone());
     with_nssf_context(|context| context.set_nssai_availability(nf_id, info));
 
-    log::info!("Stored NSSAI availability for NF {nf_id} ({} TA entries)", affected_tais.len());
+    log::info!(
+        "Stored NSSAI availability for NF {nf_id} ({} TA entries)",
+        affected_tais.len()
+    );
 
     spawn_availability_notifications(affected_tais, Some(nf_id.to_string()));
 
@@ -1323,8 +1343,8 @@ fn collect_authorized_data_for(sub_tais: &[context::Tai]) -> Vec<serde_json::Val
 /// Fire NssfEventNotification POSTs to all subscriptions matching the
 /// affected TAIs. Runs each delivery on its own task with bounded timeouts.
 fn spawn_availability_notifications(affected_tais: Vec<context::Tai>, changed_by: Option<String>) {
-    let subs =
-        with_nssf_context(|context| context.subscriptions_matching(&affected_tais)).unwrap_or_default();
+    let subs = with_nssf_context(|context| context.subscriptions_matching(&affected_tais))
+        .unwrap_or_default();
 
     for sub in subs {
         // Don't notify the AMF whose own update caused the change; it gets
@@ -1438,7 +1458,9 @@ async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
     SbiResponse::with_status(201)
         .with_header(
             "Location",
-            format!("/nnssf-nssaiavailability/v1/nssai-availability/subscriptions/{subscription_id}"),
+            format!(
+                "/nnssf-nssaiavailability/v1/nssai-availability/subscriptions/{subscription_id}"
+            ),
         )
         .with_json_body(&created)
         .unwrap_or_else(|_| SbiResponse::with_status(201))
@@ -1465,8 +1487,7 @@ async fn handle_subscription_delete(subscription_id: &str) -> SbiResponse {
 async fn handle_subscription_patch(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("NSSAI Availability Subscription Patch: {subscription_id}");
 
-    let existing =
-        with_nssf_context(|context| context.subscription_get(subscription_id)).flatten();
+    let existing = with_nssf_context(|context| context.subscription_get(subscription_id)).flatten();
     let existing = match existing {
         Some(s) => s,
         None => {
@@ -2017,8 +2038,7 @@ mod tests {
     fn test_percent_decode_and_query_parse() {
         assert_eq!(percent_decode("a%20b%7B%22x%22%3A1%7D"), "a b{\"x\":1}");
         assert_eq!(percent_decode("plain"), "plain");
-        let params =
-            parse_query_params("/x/y?nf-type=AMF&nf-id=abc&j=%7B%22sst%22%3A1%7D&empty");
+        let params = parse_query_params("/x/y?nf-type=AMF&nf-id=abc&j=%7B%22sst%22%3A1%7D&empty");
         assert_eq!(params.get("nf-type").map(String::as_str), Some("AMF"));
         assert_eq!(params.get("j").map(String::as_str), Some(r#"{"sst":1}"#));
         assert_eq!(params.get("empty").map(String::as_str), Some(""));

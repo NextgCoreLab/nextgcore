@@ -593,8 +593,7 @@ async fn handle_am_policy_update(pol_asso_id: &str, request: &SbiRequest) -> Sbi
 ///
 /// Configured via `PCF_UAV_DNN` (comma-separated DNN list); defaults to `uav`.
 fn is_uav_dnn(dnn: &str) -> bool {
-    let configured =
-        std::env::var("PCF_UAV_DNN").unwrap_or_else(|_| "uav".to_string());
+    let configured = std::env::var("PCF_UAV_DNN").unwrap_or_else(|_| "uav".to_string());
     configured
         .split(',')
         .map(str::trim)
@@ -636,7 +635,11 @@ fn authorize_uav_session(supi: &str, dnn: &str) -> Option<SbiResponse> {
         .ok()
         .and_then(|v| {
             let p: Vec<f64> = v.split(',').filter_map(|s| s.trim().parse().ok()).collect();
-            if p.len() == 3 { Some((p[0], p[1], p[2])) } else { None }
+            if p.len() == 3 {
+                Some((p[0], p[1], p[2]))
+            } else {
+                None
+            }
         })
         .unwrap_or((37.5, -122.5, max_altitude.min(100.0)));
 
@@ -698,18 +701,26 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
     let Some(dnn) = policy_data.get("dnn").and_then(|v| v.as_str()) else {
         return send_bad_request("dnn is required", Some("MANDATORY_IE_MISSING"));
     };
-    if policy_data.get("pduSessionType").and_then(|v| v.as_str()).is_none() {
+    if policy_data
+        .get("pduSessionType")
+        .and_then(|v| v.as_str())
+        .is_none()
+    {
         return send_bad_request("pduSessionType is required", Some("MANDATORY_IE_MISSING"));
     }
-    let Some(notification_uri) = policy_data.get("notificationUri").and_then(|v| v.as_str())
-    else {
+    let Some(notification_uri) = policy_data.get("notificationUri").and_then(|v| v.as_str()) else {
         return send_bad_request("notificationUri is required", Some("MANDATORY_IE_MISSING"));
     };
     // sliceInfo is an Snssai (TS 29.512: {"sst": N, "sd": "..."}); the legacy
     // nested {"sNssai": {...}} form is still accepted for compatibility.
     let slice_info = policy_data.get("sliceInfo");
-    let slice_obj = slice_info
-        .and_then(|s| if s.get("sst").is_some() { Some(s) } else { s.get("sNssai") });
+    let slice_obj = slice_info.and_then(|s| {
+        if s.get("sst").is_some() {
+            Some(s)
+        } else {
+            s.get("sNssai")
+        }
+    });
     let Some(sst) = slice_obj
         .and_then(|s| s.get("sst"))
         .and_then(|v| v.as_u64())
@@ -1305,7 +1316,10 @@ async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
         log::warn!("App session create: no PCC session bound to ueIpv4={ue_ipv4:?}");
     }
 
-    log::info!("App Session created (id={app_session_id}, bound={})", bound_sess.is_some());
+    log::info!(
+        "App Session created (id={app_session_id}, bound={})",
+        bound_sess.is_some()
+    );
 
     SbiResponse::with_status(201)
         .with_header(
@@ -1761,7 +1775,9 @@ mod tests {
         let pol_id = body["smPolicyId"].as_str().unwrap().to_string();
         // chgDecs / traffContDecs present in the create decision
         assert!(body["chgDecs"].as_object().is_some_and(|m| !m.is_empty()));
-        assert!(body["traffContDecs"].as_object().is_some_and(|m| !m.is_empty()));
+        assert!(body["traffContDecs"]
+            .as_object()
+            .is_some_and(|m| !m.is_empty()));
 
         // Update WITHOUT repPolicyCtrlReqTriggers (regression: .expect() panic)
         let req = make_request(
@@ -1848,7 +1864,9 @@ mod tests {
             let pol_id = body["smPolicyId"].as_str().unwrap().to_string();
             assert!(body["sessRules"].as_object().is_some_and(|m| !m.is_empty()));
             assert!(body["chgDecs"].as_object().is_some_and(|m| !m.is_empty()));
-            assert!(body["traffContDecs"].as_object().is_some_and(|m| !m.is_empty()));
+            assert!(body["traffContDecs"]
+                .as_object()
+                .is_some_and(|m| !m.is_empty()));
 
             // Failure outcome: missing mandatory attribute → 400
             let mut bad = full_create_body("imsi-001010000000061", 9);

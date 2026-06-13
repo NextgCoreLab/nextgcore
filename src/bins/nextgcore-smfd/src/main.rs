@@ -857,9 +857,7 @@ async fn smf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                 match action {
                     "update" => handle_sm_policy_notify(sm_context_ref, &request).await,
                     "terminate" => handle_sm_policy_terminate(sm_context_ref).await,
-                    other => {
-                        send_bad_request(&format!("Unknown notify action '{other}'"), None)
-                    }
+                    other => send_bad_request(&format!("Unknown notify action '{other}'"), None),
                 }
             } else {
                 send_bad_request("Missing SM context reference", None)
@@ -929,26 +927,27 @@ struct XrSessionFlow {
 /// default 5QI still produces an XR flow.
 fn decision_to_session_policy(decision: &policy::PolicyDecision) -> binding::SessionPolicy {
     let mut sp = binding::SessionPolicy::new();
-    let mk_rule = |id: &str, five_qi: u8, arp: u8, gbr_ul: u64, gbr_dl: u64, mbr_ul: u64, mbr_dl: u64| {
-        let mut rule = binding::PccRule::new_5gc_install(id);
-        rule.set_qos(binding::PccQos {
-            qci: five_qi,
-            arp: binding::ArpParams {
-                priority_level: arp,
-                pre_emption_capability: binding::is_xr_5qi(five_qi),
-                pre_emption_vulnerability: false,
-            },
-            mbr: binding::BitRate {
-                uplink: mbr_ul,
-                downlink: mbr_dl,
-            },
-            gbr: binding::BitRate {
-                uplink: gbr_ul,
-                downlink: gbr_dl,
-            },
-        });
-        rule
-    };
+    let mk_rule =
+        |id: &str, five_qi: u8, arp: u8, gbr_ul: u64, gbr_dl: u64, mbr_ul: u64, mbr_dl: u64| {
+            let mut rule = binding::PccRule::new_5gc_install(id);
+            rule.set_qos(binding::PccQos {
+                qci: five_qi,
+                arp: binding::ArpParams {
+                    priority_level: arp,
+                    pre_emption_capability: binding::is_xr_5qi(five_qi),
+                    pre_emption_vulnerability: false,
+                },
+                mbr: binding::BitRate {
+                    uplink: mbr_ul,
+                    downlink: mbr_dl,
+                },
+                gbr: binding::BitRate {
+                    uplink: gbr_ul,
+                    downlink: gbr_dl,
+                },
+            });
+            rule
+        };
 
     if decision.pcc_rules.is_empty() {
         sp.add_rule(mk_rule(
@@ -989,8 +988,8 @@ async fn pfcp_session_establish(
 ) -> Result<PfcpSessionResult> {
     use n4_build::{pfcp_ie, FarParams, PdrParams, PfcpMessageBuilder, QerParams};
 
-    let client = pfcp_path::global_client()
-        .ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
+    let client =
+        pfcp_path::global_client().ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
 
     // TS 29.244 6.2.6.2: no session signalling without an association
     if !client.is_associated().await {
@@ -1064,7 +1063,11 @@ async fn pfcp_session_establish(
     }
     // PDRs bind to the XR QER when present, otherwise the Session-AMBR QER.
     let flow_qer_id = if qos.xr_flow.is_some() { xr_qer_id } else { 1 };
-    let flow_qfi = qos.xr_flow.as_ref().map(|x| x.five_qi & 0x3F).unwrap_or(qos.qfi);
+    let flow_qfi = qos
+        .xr_flow
+        .as_ref()
+        .map(|x| x.five_qi & 0x3F)
+        .unwrap_or(qos.qfi);
 
     // Create PDR 1 (Uplink): UE -> UPF -> DN
     let ul_pdr = PdrParams {
@@ -1096,7 +1099,7 @@ async fn pfcp_session_establish(
     let dl_pdr = PdrParams {
         pdr_id: 2,
         precedence: 100,
-        source_interface: 1,                             // Core (TS 29.244 8.2.24)
+        source_interface: 1, // Core (TS 29.244 8.2.24)
         ue_ip_address: Some((Some(ue_ip), None, false)), // destination
         far_id: Some(2),
         qer_id: Some(flow_qer_id),
@@ -1245,8 +1248,8 @@ async fn pfcp_session_establish(
 async fn pfcp_session_modify(upf_seid: u64, gnb_teid: u32, gnb_addr: [u8; 4]) -> Result<()> {
     use n4_build::{build_session_modification_request, SessionModificationParams};
 
-    let client = pfcp_path::global_client()
-        .ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
+    let client =
+        pfcp_path::global_client().ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
     if !client.is_associated().await {
         anyhow::bail!("no established PFCP association with {}", client.peer());
     }
@@ -1303,8 +1306,8 @@ async fn pfcp_session_modify(upf_seid: u64, gnb_teid: u32, gnb_addr: [u8; 4]) ->
 
 /// Send PFCP Session Deletion Request to UPF
 async fn pfcp_session_delete(upf_seid: u64) -> Result<()> {
-    let client = pfcp_path::global_client()
-        .ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
+    let client =
+        pfcp_path::global_client().ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
     if !client.is_associated().await {
         anyhow::bail!("no established PFCP association with {}", client.peer());
     }
@@ -1364,10 +1367,10 @@ fn build_setup_request_transfer(
     arp_priority_level: u8,
 ) -> ogs_ngap::NgapResult<Vec<u8>> {
     use ogs_ngap::transfer::{
-        AllocationAndRetentionPriority, GtpTunnel, NonDynamic5qiDescriptor, PduSessionType,
-        PduSessionResourceSetupRequestTransfer, PreEmptionCapability, PreEmptionVulnerability,
-        QosCharacteristics, QosFlowLevelQosParameters, QosFlowSetupRequestItem,
-        TransportLayerAddress, UpTransportLayerInformation,
+        AllocationAndRetentionPriority, GtpTunnel, NonDynamic5qiDescriptor,
+        PduSessionResourceSetupRequestTransfer, PduSessionType, PreEmptionCapability,
+        PreEmptionVulnerability, QosCharacteristics, QosFlowLevelQosParameters,
+        QosFlowSetupRequestItem, TransportLayerAddress, UpTransportLayerInformation,
     };
 
     let transfer = PduSessionResourceSetupRequestTransfer {
@@ -1404,7 +1407,9 @@ fn build_setup_request_transfer(
 /// Extract the gNB DL GTP-U endpoint (TEID, IPv4 address, first QFI) from a
 /// real-APER `PDUSessionResourceSetupResponseTransfer` (TS 38.413 §9.3.4.2).
 fn decode_setup_response_dl_endpoint(data: &[u8]) -> Option<(u32, [u8; 4], u8)> {
-    use ogs_ngap::transfer::{PduSessionResourceSetupResponseTransfer, UpTransportLayerInformation};
+    use ogs_ngap::transfer::{
+        PduSessionResourceSetupResponseTransfer, UpTransportLayerInformation,
+    };
 
     let transfer = match PduSessionResourceSetupResponseTransfer::decode(data) {
         Ok(t) => t,
@@ -1442,7 +1447,11 @@ fn decode_path_switch_dl_endpoint(data: &[u8]) -> Option<(u32, [u8; 4], u8)> {
     let UpTransportLayerInformation::GtpTunnel(tunnel) = &transfer.dl_ngu_up_tnl_information;
     let teid = u32::from_be_bytes(tunnel.gtp_teid);
     let addr = ipv4_from_octets(&tunnel.transport_layer_address.octets)?;
-    let qfi = transfer.qos_flow_accepted_list.first().copied().unwrap_or(0);
+    let qfi = transfer
+        .qos_flow_accepted_list
+        .first()
+        .copied()
+        .unwrap_or(0);
     Some((teid, addr, qfi))
 }
 
@@ -1452,7 +1461,10 @@ fn ipv4_from_octets(octets: &[u8]) -> Option<[u8; 4]> {
         Some([octets[0], octets[1], octets[2], octets[3]])
     } else {
         // IPv6 (16) or other widths are not supported for the GTP-U DL path here
-        log::warn!("gNB transport address is not IPv4 ({} octets)", octets.len());
+        log::warn!(
+            "gNB transport address is not IPv4 ({} octets)",
+            octets.len()
+        );
         None
     }
 }
@@ -1478,13 +1490,7 @@ fn sm_context_create_error(
 /// Dispatch an Npcf_SMPolicyControl client response into a session's GSM FSM
 /// (drives Wait5gcSmPolicyAssociation → WaitPfcpEstablishment / N1N2Reject5gc).
 fn fsm_dispatch_policy_response(fsm: &mut gsm_sm::GsmFsm, status: u16) {
-    let mut ev = event::SmfEvent::sbi_client(
-        event::SbiResponse {
-            status,
-            body: None,
-        },
-        0,
-    );
+    let mut ev = event::SmfEvent::sbi_client(event::SbiResponse { status, body: None }, 0);
     if let Some(ref mut sbi) = ev.sbi {
         sbi.message = Some(event::SbiMessage {
             service_name: "npcf-smpolicycontrol".to_string(),
@@ -1541,7 +1547,9 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     });
     let sm_context_status_uri = req_body["smContextStatusUri"].as_str().map(str::to_string);
     if sm_context_status_uri.is_none() {
-        log::warn!("SmContextCreateData without smContextStatusUri (status notifications disabled)");
+        log::warn!(
+            "SmContextCreateData without smContextStatusUri (status notifications disabled)"
+        );
     }
     let serving_nf_id = req_body["servingNfId"].as_str().unwrap_or("");
     let rat_type = req_body["ratType"].as_str().unwrap_or("NR");
@@ -1660,7 +1668,8 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
 
     let release_ip = || {
         if let Ok(ctx) = smf_self().read() {
-            ctx.ipv4_pool.release(std::net::Ipv4Addr::from(ue_ip_octets));
+            ctx.ipv4_pool
+                .release(std::net::Ipv4Addr::from(ue_ip_octets));
         }
     };
 
@@ -1810,8 +1819,7 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     // dedicated XR QER in the PFCP session below. For non-XR sessions the
     // metadata is empty and the default Session-AMBR QER is used unchanged.
     let xr_policy = decision_to_session_policy(&decision);
-    let (_xr_results, _xr_flags, xr_meta) =
-        binding::process_xr_qos_flow_binding(&xr_policy, &[]);
+    let (_xr_results, _xr_flags, xr_meta) = binding::process_xr_qos_flow_binding(&xr_policy, &[]);
     let xr_flow = xr_meta.into_iter().next();
     if let Some(ref xr) = xr_flow {
         log::info!(
@@ -1866,8 +1874,8 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                 log::error!("PFCP session establishment failed: {e} — rejecting SM context");
                 fsm.transition_to(gsm_sm::GsmState::Exception);
                 // Roll back the PCF SM policy association (TS 29.512 §4.2.5)
-                if let Some(ref pol_id) = (!decision.is_config_default)
-                    .then_some(decision.sm_policy_id.clone())
+                if let Some(ref pol_id) =
+                    (!decision.is_config_default).then_some(decision.sm_policy_id.clone())
                 {
                     if let Some(pcf) = policy::resolve_pcf_endpoint().await {
                         if let Err(e) = policy::sm_policy_delete(&pcf, pol_id).await {
@@ -2003,8 +2011,8 @@ fn lookup_policy_binding(sm_context_ref: &str) -> Option<context::PolicyBinding>
 
 /// Send a PFCP QER modification carrying an authorized Session-AMBR.
 async fn pfcp_update_session_qer(upf_seid: u64, qfi: u8, ambr_ul: u64, ambr_dl: u64) -> Result<()> {
-    let client = pfcp_path::global_client()
-        .ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
+    let client =
+        pfcp_path::global_client().ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
     let params = n4_build::SessionModificationParams {
         update_qers: vec![n4_build::QerParams {
             qer_id: 1,
@@ -2033,8 +2041,8 @@ async fn pfcp_update_session_qer(upf_seid: u64, qfi: u8, ambr_ul: u64, ambr_dl: 
 /// Deactivate the downlink FAR (back to BUFF) — used when the AN-side
 /// resources failed or the UP connection is deactivated.
 async fn pfcp_deactivate_dl_far(upf_seid: u64) -> Result<()> {
-    let client = pfcp_path::global_client()
-        .ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
+    let client =
+        pfcp_path::global_client().ok_or_else(|| anyhow::anyhow!("PFCP client not initialised"))?;
     let params = n4_build::SessionModificationParams {
         update_fars_deactivate: vec![2],
         ..Default::default()
@@ -2261,7 +2269,9 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         // gNB confirmed a modification / released resources / reported
         // secondary-RAT usage — acknowledge.
         "PDU_RES_MOD_RSP" | "PDU_RES_REL_RSP" | "SECONDARY_RAT_USAGE" => {
-            log::info!("SM Context Update ({n2_sm_info_type}) acknowledged for ref={sm_context_ref}");
+            log::info!(
+                "SM Context Update ({n2_sm_info_type}) acknowledged for ref={sm_context_ref}"
+            );
             SbiResponse::with_status(200)
                 .with_body(serde_json::json!({}).to_string(), "application/json")
         }
@@ -2550,9 +2560,13 @@ async fn handle_sm_policy_notify(sm_context_ref: &str, request: &SbiRequest) -> 
 
     // Apply to the N4 session QER (copy SEID out, no guards across await)
     if let Some(seid) = lookup_upf_seid(sm_context_ref) {
-        if let Err(e) =
-            pfcp_update_session_qer(seid, binding.qfi, dec.sess_ambr_ul_bps, dec.sess_ambr_dl_bps)
-                .await
+        if let Err(e) = pfcp_update_session_qer(
+            seid,
+            binding.qfi,
+            dec.sess_ambr_ul_bps,
+            dec.sess_ambr_dl_bps,
+        )
+        .await
         {
             log::error!("Failed to apply PCF-updated QoS: {e}");
             return SbiResponse::with_status(504);

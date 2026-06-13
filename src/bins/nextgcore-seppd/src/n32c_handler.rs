@@ -337,8 +337,8 @@ pub fn handle_exchange_params_request(
     let local_context_id = crate::prins::generate_n32f_context_id();
     let local_nonce = generate_key_nonce();
 
-    let peer_nonce = crate::jose::b64url_decode(&req.key_nonce)
-        .map_err(|e| format!("bad keyNonce: {e}"))?;
+    let peer_nonce =
+        crate::jose::b64url_decode(&req.key_nonce).map_err(|e| format!("bad keyNonce: {e}"))?;
     let our_nonce = crate::jose::b64url_decode(&local_nonce).expect("locally generated");
 
     // Requester is the initiator
@@ -449,7 +449,9 @@ pub fn handle_exchange_params_response(
 /// Get this SEPP's sender FQDN from the global context
 fn local_identity() -> Result<(String, ()), String> {
     let ctx = sepp_self();
-    let context = ctx.read().map_err(|_| "context lock poisoned".to_string())?;
+    let context = ctx
+        .read()
+        .map_err(|_| "context lock poisoned".to_string())?;
     let sender = context
         .sender
         .clone()

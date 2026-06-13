@@ -63,8 +63,7 @@ pub async fn start_n32_listener(
     port: u16,
     tls: Option<&N32TlsConfig>,
 ) -> Result<SbiServer, String> {
-    let mut config =
-        SbiServerConfig::with_host_port(host, port).map_err(|e| e.to_string())?;
+    let mut config = SbiServerConfig::with_host_port(host, port).map_err(|e| e.to_string())?;
     config = config.with_interface("n32");
 
     if let Some(tls_cfg) = tls {
@@ -83,8 +82,10 @@ pub async fn start_n32_listener(
         .start(n32_request_handler)
         .await
         .map_err(|e| format!("N32 listener start failed: {e}"))?;
-    log::info!("N32 listener on {host}:{port} (mTLS={})",
-        tls.is_some_and(|t| t.verify_client_cacert.is_some()));
+    log::info!(
+        "N32 listener on {host}:{port} (mTLS={})",
+        tls.is_some_and(|t| t.verify_client_cacert.is_some())
+    );
     Ok(server)
 }
 
@@ -97,9 +98,7 @@ async fn n32_request_handler(request: HttpRequest) -> HttpResponse {
     log::debug!("N32 request: {method} {path} ({}B)", body.len());
 
     match (method.as_str(), path.as_str()) {
-        ("POST", "/n32c-handshake/v1/exchange-capability") => {
-            handle_exchange_capability(&body)
-        }
+        ("POST", "/n32c-handshake/v1/exchange-capability") => handle_exchange_capability(&body),
         ("POST", "/n32c-handshake/v1/exchange-params") => handle_exchange_params(&body),
         ("POST", "/n32c-handshake/v1/n32f-error") => handle_n32f_error_report(&body),
         ("POST", "/n32f-forward/v1/n32f-process") => handle_n32f_process(&body).await,
@@ -224,12 +223,7 @@ fn handle_exchange_capability(body: &str) -> HttpResponse {
         Err(e) => {
             // Capability mismatch => negotiation failure per TS 29.573
             log::warn!("exchange-capability rejected: {e}");
-            send_error(
-                400,
-                "Bad Request",
-                &e,
-                Some("NEGOTIATION_NOT_ALLOWED"),
-            )
+            send_error(400, "Bad Request", &e, Some("NEGOTIATION_NOT_ALLOWED"))
         }
     }
 }
@@ -368,7 +362,11 @@ async fn handle_n32f_process(body: &str) -> HttpResponse {
                     body: msg.payload,
                     message_id: None,
                 };
-                log::info!("N32-f TLS-mode message accepted: {} {}", rec.method, rec.url);
+                log::info!(
+                    "N32-f TLS-mode message accepted: {} {}",
+                    rec.method,
+                    rec.url
+                );
                 HttpResponse::ok()
                     .with_json_body(&rec)
                     .unwrap_or_else(|_| HttpResponse::internal_error())
@@ -409,10 +407,7 @@ async fn handle_prins_message(msg: &N32fReformattedMessage) -> HttpResponse {
     });
 
     let Some(node) = node else {
-        log::error!(
-            "N32-f PRINS message for unknown context [{:?}]",
-            context_id
-        );
+        log::error!("N32-f PRINS message for unknown context [{:?}]", context_id);
         return send_error(
             400,
             "Bad Request",
@@ -509,7 +504,10 @@ fn parse_api_root(api_root: &str) -> Result<(bool, String, u16), String> {
     Ok((https, host, port))
 }
 
-fn n32_client(api_root: &str, tls: Option<&N32TlsConfig>) -> Result<ogs_sbi::client::SbiClient, String> {
+fn n32_client(
+    api_root: &str,
+    tls: Option<&N32TlsConfig>,
+) -> Result<ogs_sbi::client::SbiClient, String> {
     let (https, host, port) = parse_api_root(api_root)?;
     let mut config = ogs_sbi::client::SbiClientConfig::new(&host, port)
         .with_connect_timeout(N32_CONNECT_TIMEOUT)
@@ -568,12 +566,8 @@ pub async fn initiate_n32c_handshake(
         .map_err(|e| e.to_string())?;
 
     let client = n32_client(peer_api_root, tls)?;
-    let (status, body) = post_json(
-        &client,
-        "/n32c-handshake/v1/exchange-capability",
-        req_json,
-    )
-    .await?;
+    let (status, body) =
+        post_json(&client, "/n32c-handshake/v1/exchange-capability", req_json).await?;
     if status != 200 {
         update_node(&node);
         return Err(format!(
@@ -688,10 +682,7 @@ pub async fn forward_via_n32f(
 }
 
 /// POST an N32fErrorInfo report to the peer SEPP (TS 29.573 sec 6.1.5.4)
-pub async fn send_n32f_error(
-    peer_api_root: &str,
-    info: &N32fErrorInfo,
-) -> Result<(), String> {
+pub async fn send_n32f_error(peer_api_root: &str, info: &N32fErrorInfo) -> Result<(), String> {
     let body = serde_json::to_string(info).map_err(|e| e.to_string())?;
     let client = n32_client(peer_api_root, None)?;
     let (status, _) = post_json(&client, "/n32c-handshake/v1/n32f-error", body).await?;

@@ -347,7 +347,11 @@ impl NsacfContext {
 
     /// Admit a UE (idempotent per SUPI). Returns the admission result and an
     /// EAC transition when the registered-UE count crosses the threshold.
-    pub fn admit_ue(&self, s_nssai: &SNssai, supi: &str) -> (AdmissionResult, Option<EacTransition>) {
+    pub fn admit_ue(
+        &self,
+        s_nssai: &SNssai,
+        supi: &str,
+    ) -> (AdmissionResult, Option<EacTransition>) {
         let Some(id) = self.quota_id_for(s_nssai) else {
             log::warn!(
                 "No quota configured for S-NSSAI[SST:{} SD:{:?}]",
@@ -548,8 +552,8 @@ impl NsacfContext {
             "quotas": quotas,
         });
         let tmp = path.with_extension("tmp");
-        let result = std::fs::write(&tmp, state.to_string())
-            .and_then(|_| std::fs::rename(&tmp, &path));
+        let result =
+            std::fs::write(&tmp, state.to_string()).and_then(|_| std::fs::rename(&tmp, &path));
         if let Err(e) = result {
             log::warn!("Failed to persist NSACF state to {}: {e}", path.display());
         }
@@ -620,10 +624,7 @@ impl NsacfContext {
             self.next_quota_id.store(next as usize, Ordering::SeqCst);
         }
         if restored > 0 {
-            log::info!(
-                "Restored {restored} slice quota(s) from {}",
-                path.display()
-            );
+            log::info!("Restored {restored} slice quota(s) from {}", path.display());
         }
         restored > 0
     }
@@ -635,8 +636,7 @@ fn update_eac(quota: &mut SliceQuota, threshold_percent: u8) -> Option<EacTransi
     if quota.max_ues == 0 {
         return None;
     }
-    let should_be_active =
-        quota.current_ues() * 100 >= quota.max_ues * threshold_percent as u64;
+    let should_be_active = quota.current_ues() * 100 >= quota.max_ues * threshold_percent as u64;
     if should_be_active != quota.eac_active {
         quota.eac_active = should_be_active;
         Some(EacTransition {
@@ -729,10 +729,7 @@ mod tests {
         // Same SUPI again: idempotent, still counted once
         let (result, _) = ctx.admit_ue(&s_nssai, "imsi-1");
         assert_eq!(result, AdmissionResult::Admitted);
-        assert_eq!(
-            ctx.quota_find_by_snssai(&s_nssai).unwrap().current_ues(),
-            1
-        );
+        assert_eq!(ctx.quota_find_by_snssai(&s_nssai).unwrap().current_ues(), 1);
     }
 
     #[test]
@@ -743,14 +740,23 @@ mod tests {
         let s_nssai = SNssai::new(2, None);
         ctx.quota_add(s_nssai.clone(), 2, 10);
 
-        assert_eq!(ctx.admit_ue(&s_nssai, "imsi-1").0, AdmissionResult::Admitted);
-        assert_eq!(ctx.admit_ue(&s_nssai, "imsi-2").0, AdmissionResult::Admitted);
+        assert_eq!(
+            ctx.admit_ue(&s_nssai, "imsi-1").0,
+            AdmissionResult::Admitted
+        );
+        assert_eq!(
+            ctx.admit_ue(&s_nssai, "imsi-2").0,
+            AdmissionResult::Admitted
+        );
         assert_eq!(
             ctx.admit_ue(&s_nssai, "imsi-3").0,
             AdmissionResult::RejectedQuotaExceeded
         );
         // imsi-1 was already admitted: not rejected
-        assert_eq!(ctx.admit_ue(&s_nssai, "imsi-1").0, AdmissionResult::Admitted);
+        assert_eq!(
+            ctx.admit_ue(&s_nssai, "imsi-1").0,
+            AdmissionResult::Admitted
+        );
     }
 
     #[test]
@@ -779,7 +785,10 @@ mod tests {
         );
 
         ctx.release_ue(&s_nssai, "imsi-2");
-        assert_eq!(ctx.admit_ue(&s_nssai, "imsi-3").0, AdmissionResult::Admitted);
+        assert_eq!(
+            ctx.admit_ue(&s_nssai, "imsi-3").0,
+            AdmissionResult::Admitted
+        );
     }
 
     #[test]
@@ -855,10 +864,8 @@ mod tests {
 
     #[test]
     fn test_state_persistence_roundtrip() {
-        let path = std::env::temp_dir().join(format!(
-            "nsacf-state-test-{}.json",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("nsacf-state-test-{}.json", uuid::Uuid::new_v4()));
 
         let mut ctx = NsacfContext::new();
         ctx.init(64);

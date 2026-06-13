@@ -7,11 +7,11 @@ use crate::n4_build::{
     build_heartbeat_response, build_session_deletion_response,
     build_session_establishment_response, build_session_modification_response,
     build_session_report_request, parse_create_bar, parse_create_far, parse_create_pdr,
-    parse_create_qer, parse_create_urr, parse_pfcpsmreq_flags, parse_recovery_time_stamp,
-    pfcp_ie, pfcp_type, pfcpsmreq_flags, CreatedPdr, DownlinkDataReport,
-    DownlinkDataServiceInfo, ErrorIndicationReport, FSeid, FTeid, NodeId, ParsedCreateBar,
-    ParsedCreateFar, ParsedCreatePdr, ParsedCreateQer, ParsedCreateUrr, ParsedFSeid, ParsedIe,
-    ParsedPfcpHeader, PfcpCause, ReportType, UserPlaneReport,
+    parse_create_qer, parse_create_urr, parse_pfcpsmreq_flags, parse_recovery_time_stamp, pfcp_ie,
+    pfcp_type, pfcpsmreq_flags, CreatedPdr, DownlinkDataReport, DownlinkDataServiceInfo,
+    ErrorIndicationReport, FSeid, FTeid, NodeId, ParsedCreateBar, ParsedCreateFar, ParsedCreatePdr,
+    ParsedCreateQer, ParsedCreateUrr, ParsedFSeid, ParsedIe, ParsedPfcpHeader, PfcpCause,
+    ReportType, UserPlaneReport,
 };
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -817,8 +817,7 @@ impl PfcpServer {
         let peer = self.association.read().await.as_ref()?.peer_addr;
         let payload = crate::n4_build::build_heartbeat_request(self.recovery_time_stamp);
         let seq = self.alloc_seq();
-        let message =
-            self.build_response(pfcp_type::HEARTBEAT_REQUEST, 0, seq, &payload, false);
+        let message = self.build_response(pfcp_type::HEARTBEAT_REQUEST, 0, seq, &payload, false);
         match self.socket.send_to(&message, peer).await {
             Ok(_) => {
                 log::debug!("Sent Heartbeat Request to {peer} (seq={seq})");
@@ -904,10 +903,8 @@ impl PfcpServer {
             }
             Err(e) => {
                 log::warn!("Malformed CP F-SEID from {src_addr}: {e}");
-                let resp_payload = build_failure_response(
-                    PfcpCause::MandatoryIeIncorrect,
-                    Some(pfcp_ie::F_SEID),
-                );
+                let resp_payload =
+                    build_failure_response(PfcpCause::MandatoryIeIncorrect, Some(pfcp_ie::F_SEID));
                 let response = self.build_response(
                     pfcp_type::SESSION_ESTABLISHMENT_RESPONSE,
                     header.seid,
@@ -1244,9 +1241,7 @@ impl PfcpServer {
         let lookup = {
             let mut sessions = self.sessions.write().await;
             if let Some(session) = sessions.get_mut(&upf_seid) {
-                let old_tunnel = session
-                    .gnb_addr
-                    .map(|addr| (session.dl_teid, addr));
+                let old_tunnel = session.gnb_addr.map(|addr| (session.dl_teid, addr));
                 if let Some(teid) = updated_dl_teid {
                     session.dl_teid = teid;
                 }
@@ -1262,8 +1257,7 @@ impl PfcpServer {
             Some(v) => v,
             None => {
                 log::warn!("Session Modification for unknown SEID {upf_seid:#x} — rejecting");
-                let resp_payload =
-                    build_failure_response(PfcpCause::SessionContextNotFound, None);
+                let resp_payload = build_failure_response(PfcpCause::SessionContextNotFound, None);
                 let response = self.build_response(
                     pfcp_type::SESSION_MODIFICATION_RESPONSE,
                     0, // CP SEID unknown
@@ -1350,8 +1344,7 @@ impl PfcpServer {
             Some(info) => info,
             None => {
                 log::warn!("Session Deletion for unknown SEID {upf_seid:#x} — rejecting");
-                let resp_payload =
-                    build_failure_response(PfcpCause::SessionContextNotFound, None);
+                let resp_payload = build_failure_response(PfcpCause::SessionContextNotFound, None);
                 let response = self.build_response(
                     pfcp_type::SESSION_DELETION_RESPONSE,
                     0,
@@ -1428,7 +1421,8 @@ impl PfcpServer {
                     trigger,
                     volume_measurement: Some(crate::n4_build::VolumeMeasurement {
                         total_volume: Some(
-                            urr.acc_total_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                            urr.acc_total_bytes
+                                .load(std::sync::atomic::Ordering::Relaxed),
                         ),
                         uplink_volume: Some(
                             urr.acc_ul_bytes.load(std::sync::atomic::Ordering::Relaxed),
@@ -1437,7 +1431,8 @@ impl PfcpServer {
                             urr.acc_dl_bytes.load(std::sync::atomic::Ordering::Relaxed),
                         ),
                         total_packets: Some(
-                            urr.acc_total_pkts.load(std::sync::atomic::Ordering::Relaxed),
+                            urr.acc_total_pkts
+                                .load(std::sync::atomic::Ordering::Relaxed),
                         ),
                         uplink_packets: Some(
                             urr.acc_ul_pkts.load(std::sync::atomic::Ordering::Relaxed),
@@ -1483,11 +1478,15 @@ impl PfcpServer {
             ..Default::default()
         };
 
-        let payload =
-            build_session_report_request(pfcp_type::SESSION_REPORT_REQUEST, &report);
+        let payload = build_session_report_request(pfcp_type::SESSION_REPORT_REQUEST, &report);
         let seq = self.alloc_seq();
-        let message =
-            self.build_response(pfcp_type::SESSION_REPORT_REQUEST, smf_seid, seq, &payload, true);
+        let message = self.build_response(
+            pfcp_type::SESSION_REPORT_REQUEST,
+            smf_seid,
+            seq,
+            &payload,
+            true,
+        );
         self.socket
             .send_to(&message, smf_addr)
             .await
@@ -1531,11 +1530,15 @@ impl PfcpServer {
             ..Default::default()
         };
 
-        let payload =
-            build_session_report_request(pfcp_type::SESSION_REPORT_REQUEST, &report);
+        let payload = build_session_report_request(pfcp_type::SESSION_REPORT_REQUEST, &report);
         let seq = self.alloc_seq();
-        let message =
-            self.build_response(pfcp_type::SESSION_REPORT_REQUEST, smf_seid, seq, &payload, true);
+        let message = self.build_response(
+            pfcp_type::SESSION_REPORT_REQUEST,
+            smf_seid,
+            seq,
+            &payload,
+            true,
+        );
         self.socket
             .send_to(&message, smf_addr)
             .await
@@ -1724,13 +1727,11 @@ mod tests {
     async fn exchange(sock: &UdpSocket, server: SocketAddr, pkt: &[u8]) -> Vec<u8> {
         sock.send_to(pkt, server).await.unwrap();
         let mut buf = vec![0u8; 4096];
-        let (len, _) = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            sock.recv_from(&mut buf),
-        )
-        .await
-        .expect("server must respond")
-        .unwrap();
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), sock.recv_from(&mut buf))
+                .await
+                .expect("server must respond")
+                .unwrap();
         buf.truncate(len);
         buf
     }
@@ -1773,8 +1774,10 @@ mod tests {
         let decoded = ogs_pfcp::types::UpFunctionFeatures::decode(&mut bytes).unwrap();
         assert!(decoded.ftup, "FTUP must be advertised");
         assert!(decoded.empu, "EMPU must be advertised");
-        assert!(!decoded.bucp && !decoded.udbc && !decoded.quoac && !decoded.trace,
-            "unimplemented features must not be advertised");
+        assert!(
+            !decoded.bucp && !decoded.udbc && !decoded.quoac && !decoded.trace,
+            "unimplemented features must not be advertised"
+        );
         // Recovery Time Stamp must be present and non-zero
         let rts = crate::n4_build::parse_recovery_time_stamp(body).unwrap();
         assert!(rts > 0, "recovery time stamp must be real, not hardcoded 0");

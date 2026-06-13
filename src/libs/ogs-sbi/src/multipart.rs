@@ -130,12 +130,10 @@ pub fn decode(content_type_value: &str, body: &[u8]) -> SbiResult<MultipartBody>
             .map(|(_, v)| v.clone());
 
         let is_json_root = result.json.is_none()
-            && part_type
-                .as_deref()
-                .is_some_and(|t| {
-                    t.get(..content_type::APPLICATION_JSON.len())
-                        .is_some_and(|p| p.eq_ignore_ascii_case(content_type::APPLICATION_JSON))
-                });
+            && part_type.as_deref().is_some_and(|t| {
+                t.get(..content_type::APPLICATION_JSON.len())
+                    .is_some_and(|p| p.eq_ignore_ascii_case(content_type::APPLICATION_JSON))
+            });
 
         if is_json_root {
             result.json = Some(String::from_utf8_lossy(&data).to_string());
@@ -304,7 +302,9 @@ mod tests {
     #[test]
     fn test_decode_unquoted_boundary() {
         assert_eq!(
-            boundary_from_content_type("multipart/related; boundary=abc; type=\"application/json\""),
+            boundary_from_content_type(
+                "multipart/related; boundary=abc; type=\"application/json\""
+            ),
             Some("abc".to_string())
         );
         assert_eq!(
