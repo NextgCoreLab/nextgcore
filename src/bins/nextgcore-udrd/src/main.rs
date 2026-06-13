@@ -490,7 +490,7 @@ async fn handle_auth_data(
             }
         }
         ("authentication-subscription", "PUT") => {
-            // Provisioning path (W4.2): create/replace the stored
+            // Provisioning path: create/replace the stored
             // AuthenticationSubscription credentials.
             log::info!("[{supi}] PUT authentication-subscription");
             let body = match parse_json_body(request) {
@@ -671,8 +671,8 @@ fn amf_3gpp_access_path(supi: &str) -> String {
 
 /// Handle AMF 3GPP access registration context (TS 29.505).
 ///
-/// Stores and returns the full Amf3GppAccessRegistration document (W4.2): the
-/// shape PUT here by udmd (forwarding the amfd Nudm registration, W3.1) is
+/// Stores and returns the full Amf3GppAccessRegistration document: the
+/// shape PUT here by udmd (forwarding the amfd Nudm registration) is
 /// preserved verbatim and echoed on GET.
 async fn handle_amf_3gpp_access(supi: &str, method: &str, request: &SbiRequest) -> SbiResponse {
     let udr_ctx = nextgcore_udrd::context::udr_self();
@@ -699,7 +699,7 @@ async fn handle_amf_3gpp_access(supi: &str, method: &str, request: &SbiRequest) 
                     return missing_mandatory(attr);
                 }
             }
-            // Persist the PEI (IMEISV) claim off-thread (W4.2: last live
+            // Persist the PEI (IMEISV) claim off-thread (last live
             // blocking Mongo call moved to the spawn_blocking wrapper).
             if let Some(pei) = reg_data.get("pei").and_then(|v| v.as_str()) {
                 let imeisv = pei.strip_prefix("imeisv-").unwrap_or(pei).to_string();

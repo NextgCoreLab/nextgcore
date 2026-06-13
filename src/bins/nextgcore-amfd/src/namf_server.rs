@@ -1338,7 +1338,7 @@ fn handle_registration_status_update(ue_context_id: &str, request: &SbiRequest) 
                     continue;
                 };
                 // Copy out, mutate, write back — never hold a lock across
-                // a second context call (Wave 2 lock-order rule)
+                // a second context call (the documented lock-order rule)
                 let sess = {
                     let Ok(guard) = ctx.read() else {
                         break;

@@ -10,6 +10,7 @@ NextGCore is a pure Rust implementation of a 5G/LTE mobile core network, derived
 - **Async/Await** - Modern async runtime using Tokio
 - **Container-Ready** - Optimized Docker images with minimal footprint
 - **Complete 5GC** - All core network functions implemented
+- **Rel-17/18 features** - RedCap reduced-AMBR, XR delay-critical GBR 5QI (82-85), SNPN NID authorization, MINT/disaster-roaming multi-SUPI, and UAV geofence authorization wired end-to-end (see `docker/rust/README.md` → Rel-17/18 Feature Knobs / End-to-End Tests)
 
 ## Quickstart
 

@@ -212,7 +212,7 @@ pub fn extract_bearer_token(auth_header: &str) -> Option<&str> {
 /// signature-skipping variant: 3GPP TS 33.501 §13.4.1 requires NF service
 /// producers to validate the token's signature before serving a request.
 /// (The former `validate_bearer_token`, which decoded the JWT without
-/// verifying the signature, was removed in the Wave 3 nrfd remediation.)
+/// verifying the signature, was removed in the nrfd remediation.)
 ///
 /// Returns Ok(Some(claims)) when authorized, Ok(None) when the policy does
 /// not require OAuth2, Err otherwise.

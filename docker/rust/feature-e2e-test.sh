@@ -1,11 +1,12 @@
 #!/bin/bash
-# NextG Wave-6 Feature E2E Test
+# NextG Rel-17/18 Feature E2E Test
 #
-# Exercises the 6 integrated Rel-17/18 features end-to-end against a running
-# stack and asserts on the exact log signatures each feature emits. Unlike
-# e2e-test.sh (which drives a plain null-scheme UE), this script swaps the UE
-# (and, for SNPN, the gNB + AMF) config per scenario via docker-compose.w6.yml
-# and config/w6/*.yaml, then greps the relevant container logs.
+# Exercises the integrated Rel-17/18 features (RedCap, XR 5QI, SNPN, MINT, UAV)
+# end-to-end against a running stack and asserts on the exact log signatures
+# each feature emits. Unlike e2e-test.sh (which drives a plain null-scheme UE),
+# this script swaps the UE (and, for SNPN, the gNB + AMF) config per scenario
+# via docker-compose.features.yml and config/features/*.yaml, then greps the
+# relevant container logs.
 #
 # PREREQUISITE: the baseline stack must already be built and UP, e.g.
 #   ./e2e-test.sh --keep
@@ -13,9 +14,9 @@
 # rebuilds images.
 #
 # Usage:
-#   ./w6-feature-test.sh                 # run all scenarios
-#   ./w6-feature-test.sh redcap xr       # run only the named scenarios
-#   ./w6-feature-test.sh --down          # tear the stack down after running
+#   ./feature-e2e-test.sh                 # run all scenarios
+#   ./feature-e2e-test.sh redcap xr       # run only the named scenarios
+#   ./feature-e2e-test.sh --down          # tear the stack down after running
 #
 # Scenario names: redcap xr uav-allow uav-deny mint snpn-accept snpn-reject
 #
@@ -24,8 +25,8 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-COMPOSE=(docker compose -f "$SCRIPT_DIR/docker-compose.yml" -f "$SCRIPT_DIR/docker-compose.w6.yml")
-NEXTGSIM_CFG="/etc/nextgsim/w6"        # in-container path (config dir is mounted at /etc/nextgsim)
+COMPOSE=(docker compose -f "$SCRIPT_DIR/docker-compose.yml" -f "$SCRIPT_DIR/docker-compose.features.yml")
+FEATURE_CFG="/etc/nextgsim/features"   # in-container path (config dir is mounted at /etc/nextgsim)
 
 WAIT_TIMEOUT=75        # seconds to wait for a scenario's key log to appear
 SETTLE=4               # seconds to let a freshly recreated container boot before polling
@@ -33,12 +34,11 @@ SETTLE=4               # seconds to let a freshly recreated container boot befor
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 PASS=0; FAIL=0; TOTAL=0
 TEARDOWN=false
-# UTC timestamp set at each scenario start; assertions only look at logs since
-# then, so a stale line from an earlier scenario (core NFs are not recreated
-# between UE-only scenarios) can't produce a false match.
+# Unix epoch set at each scenario start; assertions only look at logs since then,
+# so a stale line from an earlier scenario (core NFs are not recreated between
+# UE-only scenarios) can't produce a false match. Epoch is unambiguous for
+# `docker logs --since` (a naive RFC3339 string would be read in the host TZ).
 SCN_SINCE=""
-# Unix epoch (unambiguous for `docker logs --since`; a naive RFC3339 string
-# would be interpreted in the host TZ and could land in the future).
 begin_scenario() { SCN_SINCE="$(date +%s)"; }
 
 log_info()  { echo -e "${BLUE}[INFO]${NC}  $*"; }
@@ -124,7 +124,7 @@ ensure_stack_up() {
 # Reset AMF/gNB to baseline (no SNPN/UAV env, baseline gNB config). Called
 # before UE-only scenarios in case a prior SNPN scenario mutated them.
 reset_core_baseline() {
-    export W6_GNB_CONFIG="/etc/nextgsim/gnb.yaml"
+    export FEATURE_GNB_CONFIG="/etc/nextgsim/gnb.yaml"
     export AMF_SNPN_ALLOWED_NIDS=""
     export AMF_UAV_GEOFENCE=""
 }
@@ -136,7 +136,7 @@ reset_core_baseline() {
 scn_redcap() {
     log_scn "RedCap (Rel-17, TS 38.101) — reduced bandwidth + reduced session-AMBR"
     reset_core_baseline
-    export W6_UE_CONFIG="$NEXTGSIM_CFG/ue-redcap.yaml"
+    export FEATURE_UE_CONFIG="$FEATURE_CFG/ue-redcap.yaml"
     recreate gnb ue
     wait_for_log nextgcore-smf "RedCap UE: session-AMBR reduced from UL/DL"
     # RedCap rides the NAS Registration Request (IEI 0xA9) in the simulator's
@@ -155,7 +155,7 @@ scn_redcap() {
 scn_xr() {
     log_scn "XR 5QI (Rel-18, TS 23.501 5.7.4) — delay-critical GBR flow 5QI 82"
     reset_core_baseline
-    export W6_UE_CONFIG="$NEXTGSIM_CFG/ue-xr.yaml"
+    export FEATURE_UE_CONFIG="$FEATURE_CFG/ue-xr.yaml"
     recreate gnb ue
     wait_for_log nextgcore-upf "Installed XR QER"
     assert_log nextgsim-ue   "XR PDU session requested"      "UE requests XR 5QI session"
@@ -167,7 +167,7 @@ scn_xr() {
 scn_uav_allow() {
     log_scn "UAV geofence ALLOW (Rel-18, TS 23.256) — altitude 100m within 120m ceiling"
     reset_core_baseline
-    export W6_UE_CONFIG="$NEXTGSIM_CFG/ue-uav-allow.yaml"
+    export FEATURE_UE_CONFIG="$FEATURE_CFG/ue-uav-allow.yaml"
     recreate gnb ue
     wait_for_log nextgcore-amf "[UAV Tracking] Geofence ALLOW: UAV"
     assert_log nextgsim-ue   "UAV registration: including aerial-UE indication (CAA-ID=" "UE includes UAV indication (IEI 0xA8)"
@@ -179,7 +179,7 @@ scn_uav_allow() {
 scn_uav_deny() {
     log_scn "UAV geofence DENY (Rel-18, TS 23.256) — altitude 200m above 120m ceiling"
     reset_core_baseline
-    export W6_UE_CONFIG="$NEXTGSIM_CFG/ue-uav-deny.yaml"
+    export FEATURE_UE_CONFIG="$FEATURE_CFG/ue-uav-deny.yaml"
     recreate gnb ue
     wait_for_log nextgcore-amf "[UAV Tracking] Geofence DENY: UAV"
     assert_log nextgsim-ue   "UAV registration: including aerial-UE indication (CAA-ID=" "UE includes UAV indication (IEI 0xA8)"
@@ -190,7 +190,7 @@ scn_uav_deny() {
 scn_mint() {
     log_scn "MINT / disaster roaming (Rel-18, TS 23.761) — secondary SUPI 999700000000002"
     reset_core_baseline
-    export W6_UE_CONFIG="$NEXTGSIM_CFG/ue-mint.yaml"
+    export FEATURE_UE_CONFIG="$FEATURE_CFG/ue-mint.yaml"
     recreate gnb ue
     wait_for_log nextgcore-amf "MINT disaster-roaming indication present"
     assert_log nextgsim-ue   "MINT task spawned"                                       "UE spawns MINT task (Rel-18)"
@@ -202,10 +202,10 @@ scn_mint() {
 
 scn_snpn_accept() {
     log_scn "SNPN accept (Rel-17, TS 23.501 §5.30) — served NID 7AB01234567"
-    export W6_GNB_CONFIG="$NEXTGSIM_CFG/gnb-snpn-accept.yaml"
+    export FEATURE_GNB_CONFIG="$FEATURE_CFG/gnb-snpn-accept.yaml"
     export AMF_SNPN_ALLOWED_NIDS="7AB01234567"
     export AMF_UAV_GEOFENCE=""
-    export W6_UE_CONFIG="$NEXTGSIM_CFG/ue-snpn-accept.yaml"
+    export FEATURE_UE_CONFIG="$FEATURE_CFG/ue-snpn-accept.yaml"
     recreate amf
     wait_for_log nextgcore-amf "NGAP server listening"
     recreate gnb
@@ -218,10 +218,10 @@ scn_snpn_accept() {
 
 scn_snpn_reject() {
     log_scn "SNPN reject (Rel-17, TS 23.501 §5.30) — NID 00000000000 not in allowed list"
-    export W6_GNB_CONFIG="$NEXTGSIM_CFG/gnb-snpn-reject.yaml"
+    export FEATURE_GNB_CONFIG="$FEATURE_CFG/gnb-snpn-reject.yaml"
     export AMF_SNPN_ALLOWED_NIDS="7AB01234567"
     export AMF_UAV_GEOFENCE=""
-    export W6_UE_CONFIG="$NEXTGSIM_CFG/ue-snpn-reject.yaml"
+    export FEATURE_UE_CONFIG="$FEATURE_CFG/ue-snpn-reject.yaml"
     recreate amf
     wait_for_log nextgcore-amf "NGAP server listening"
     recreate gnb
@@ -265,7 +265,7 @@ done
 
 echo
 echo "========================================"
-echo "  W6 feature assertions"
+echo "  Rel-17/18 feature assertions"
 echo "  Total:  $TOTAL"
 echo "  Passed: $PASS"
 echo "  Failed: $FAIL"

@@ -1203,7 +1203,7 @@ fn profile_matches(doc: &serde_json::Value, status: &str, query: &DiscoveryQuery
 /// returns 200 OK with an empty list when nothing matches.
 pub fn discover_profiles(query: &DiscoveryQuery) -> Vec<serde_json::Value> {
     // Copy the profile list out of the manager (no lock is held while we
-    // evaluate filters — Wave 2 lock-order rule).
+    // evaluate filters — the documented lock-order rule).
     let profiles = nf_manager().list();
 
     let mut matches: Vec<serde_json::Value> = profiles

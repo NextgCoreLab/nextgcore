@@ -164,7 +164,7 @@ async fn main() -> Result<()> {
     log::info!("BSF context initialized (max_sess={})", args.max_sess);
 
     // Load persisted bindings from database (if available) without blocking
-    // the async runtime (W4.2: sync -> async Mongo).
+    // the async runtime (sync -> async Mongo).
     context::load_persisted_bindings_async().await;
 
     // Initialize BSF state machine
@@ -356,7 +356,7 @@ fn missing_mandatory(attr: &str) -> SbiResponse {
 ///
 /// `dnn` and `snssai` are mandatory in the schema and always emitted;
 /// optional attributes are emitted only when present (incl. the persisted
-/// pcfIpEndPoints, W4.2).
+/// pcfIpEndPoints).
 fn binding_json(sess: &BsfSess) -> serde_json::Value {
     let mut b = serde_json::Map::new();
     b.insert(
@@ -518,7 +518,7 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
     };
 
     // UE address: at least one of ipv4Addr / ipv6Prefix / macAddr48
-    // (MAC-only bindings for Ethernet PDU sessions are valid, W4.2).
+    // (MAC-only bindings for Ethernet PDU sessions are valid).
     let ipv4addr = binding_data.get("ipv4Addr").and_then(|v| v.as_str());
     let ipv6prefix = binding_data.get("ipv6Prefix").and_then(|v| v.as_str());
     let mac_addr48 = binding_data.get("macAddr48").and_then(|v| v.as_str());
@@ -649,7 +649,7 @@ async fn handle_pcf_binding_get(binding_id: &str) -> SbiResponse {
 }
 
 async fn handle_pcf_binding_discovery(request: &SbiRequest) -> SbiResponse {
-    // TS 29.521 GET /pcfBindings query parameters (W4.2: + macAddr48, supi,
+    // TS 29.521 GET /pcfBindings query parameters (+ macAddr48, supi,
     // gpsi, dnn, ipDomain, snssai on top of the existing ipv4/ipv6).
     let params = &request.http.params;
     let snssai = params.get("snssai").and_then(|raw| {
@@ -971,7 +971,7 @@ async fn run_event_loop_async(bsf_sm: &mut BsfSmContext, shutdown: Arc<AtomicBoo
             bsf_sm.dispatch(&mut event);
         }
 
-        // Sweep bindings whose RFC 3339 expiry has passed (W4.2: expired
+        // Sweep bindings whose RFC 3339 expiry has passed (expired
         // bindings excluded from discovery and removed from storage).
         let swept = {
             let ctx = bsf_self();

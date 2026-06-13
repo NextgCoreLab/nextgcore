@@ -156,7 +156,7 @@ pub fn ogs_dbi_update_imeisv(supi: &str, imeisv: &str) -> DbiResult<()> {
     Ok(())
 }
 
-/// Authentication credentials for provisioning a subscriber (W4.2).
+/// Authentication credentials for provisioning a subscriber.
 ///
 /// Used by the UDR `PUT
 /// /subscription-data/{ueId}/authentication-data/authentication-subscription`

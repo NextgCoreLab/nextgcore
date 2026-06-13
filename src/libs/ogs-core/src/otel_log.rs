@@ -266,7 +266,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 // ============================================================================
-// Batch Log Exporter (W4.30: Async I/O + OTel logging)
+// Batch Log Exporter (Async I/O + OTel logging)
 // ============================================================================
 
 /// Batch log export configuration.
@@ -379,7 +379,7 @@ impl BatchLogExporter {
 }
 
 // ============================================================================
-// Resource Auto-Detection (W4.30)
+// Resource Auto-Detection
 // ============================================================================
 
 /// Auto-detect OTel resource attributes from the runtime environment.

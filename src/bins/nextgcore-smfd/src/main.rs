@@ -1533,11 +1533,11 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     };
     let snssai_sd = req_body["sNssai"]["sd"].as_str().map(str::to_string);
     // supi is conditional-mandatory (non-emergency registration); the current
-    // AMF does not send it yet (Wave 3.1), so warn instead of rejecting.
+    // AMF does not send it yet, so warn instead of rejecting.
     let supi = match req_body["supi"].as_str() {
         Some(s) => s.to_string(),
         None => {
-            log::warn!("SmContextCreateData without supi (lenient: AMF Wave 3.1 pending)");
+            log::warn!("SmContextCreateData without supi (lenient: AMF support pending)");
             "imsi-unknown".to_string()
         }
     };
@@ -2648,13 +2648,13 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // N2 SM transfer cross-codec guards (W5 PDU-session data-plane)
+    // N2 SM transfer cross-codec guards (PDU-session data-plane)
     // ------------------------------------------------------------------
     //
     // The smfd builds the N2 SM PDUSessionResourceSetupRequestTransfer with the
     // real-APER ogs-ngap codec and decodes the gNB's SetupResponseTransfer with
     // it. These pin the wire bytes against the independent nextgsim-ngap codec
-    // (the gNB), mirroring the W5 NG-Setup/ICS reconciliation: the request
+    // (the gNB), mirroring the NG-Setup/ICS reconciliation: the request
     // bytes are byte-identical to the gNB's decoder vector, and the gNB's
     // response bytes decode here.
 

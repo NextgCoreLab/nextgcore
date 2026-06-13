@@ -315,7 +315,7 @@ pub fn build_gtpu_header_with_seq(
 /// Build a GTP-U header for a G-PDU carrying a PDU Session Container
 /// extension header with the given QFI (TS 29.281 5.2.1 / TS 38.415).
 ///
-/// Uses the ogs-gtp library extension-header codec (Wave 0) so the bit
+/// Uses the ogs-gtp library extension-header codec so the bit
 /// layout (E flag, length units, padding, next-type chaining) is shared
 /// with the rest of the stack.
 pub fn build_gtpu_header_with_qfi(teid: u32, payload_len: u16, qfi: u8) -> Vec<u8> {

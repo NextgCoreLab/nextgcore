@@ -257,7 +257,7 @@ pub fn copy_request_headers(
 }
 
 // ============================================================================
-// NF Instance Selection & Request Routing (W1.25, W1.27)
+// NF Instance Selection & Request Routing
 // ============================================================================
 
 /// NF instance candidate for load-balanced routing
@@ -276,7 +276,7 @@ pub struct NfInstanceCandidate {
 
 /// Select the best NF instance from a list of candidates using weighted round-robin.
 ///
-/// W1.27: Supports health-check awareness (skips unhealthy instances) and
+/// Supports health-check awareness (skips unhealthy instances) and
 /// weighted distribution based on NF load/priority.
 ///
 /// Selection algorithm:
@@ -288,7 +288,7 @@ pub fn select_nf_instance(candidates: &[NfInstanceCandidate]) -> Option<&NfInsta
         return None;
     }
 
-    // W1.27: Filter to healthy instances only
+    // Filter to healthy instances only
     let healthy: Vec<&NfInstanceCandidate> = candidates.iter().filter(|c| c.healthy).collect();
 
     // Fall back to all candidates if none are marked healthy
@@ -319,7 +319,7 @@ static ROUND_ROBIN_INDEX: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 /// Select an NF instance using round-robin among healthy, same-priority candidates.
 ///
-/// W1.27: Implements round-robin load balancing among NF instances with
+/// Implements round-robin load balancing among NF instances with
 /// weighted distribution based on NF load/priority and health-check awareness.
 pub fn select_nf_instance_round_robin(
     candidates: &[NfInstanceCandidate],
@@ -355,7 +355,7 @@ pub fn select_nf_instance_round_robin(
 }
 
 // ============================================================================
-// NF Discovery Cache (W1.26)
+// NF Discovery Cache
 // ============================================================================
 
 /// Cached NF discovery result with TTL.
@@ -374,7 +374,7 @@ impl DiscoveryCacheEntry {
 
 /// NF discovery result cache.
 ///
-/// W1.26: Caches NF discovery results with TTL to avoid repeated NRF queries.
+/// Caches NF discovery results with TTL to avoid repeated NRF queries.
 /// Cache key is (target_nf_type, service_name).
 pub struct DiscoveryCache {
     entries: std::sync::RwLock<HashMap<(String, String), DiscoveryCacheEntry>>,
@@ -456,7 +456,7 @@ pub fn discovery_cache() -> &'static DiscoveryCache {
 
 /// Parse NF discovery search result JSON into NfInstanceCandidate list.
 ///
-/// W1.26: Parses the SearchResult response from NRF discovery
+/// Parses the SearchResult response from NRF discovery
 /// (TS 29.510 Section 6.2.3.2.3.1).
 pub fn parse_search_result(body: &[u8]) -> Vec<NfInstanceCandidate> {
     let value: serde_json::Value = match serde_json::from_slice(body) {

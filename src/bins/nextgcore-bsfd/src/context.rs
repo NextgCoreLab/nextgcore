@@ -477,7 +477,7 @@ impl BsfContext {
     /// Add a session keyed by any combination of UE addresses.
     ///
     /// MAC-only bindings (Ethernet PDU sessions, no UE IP) are supported per
-    /// TS 29.521 PcfBinding (W4.2). At least one of ipv4/ipv6/MAC is required.
+    /// TS 29.521 PcfBinding. At least one of ipv4/ipv6/MAC is required.
     pub fn sess_add_binding(
         &self,
         ipv4addr_string: Option<&str>,
@@ -609,7 +609,7 @@ impl BsfContext {
     }
 
     /// Remove every expired binding; returns the removed binding ids so the
-    /// caller can unpersist them (W4.2: expired bindings excluded + swept).
+    /// caller can unpersist them (expired bindings excluded + swept).
     pub fn sweep_expired(&self, now: i64) -> Vec<String> {
         let expired: Vec<(u64, String)> = match self.sess_list.read() {
             Ok(list) => list
@@ -760,7 +760,7 @@ fn get_bsf_bindings_collection(
 /// Convert a session to its MongoDB document representation.
 ///
 /// Pure function (no I/O) so the round-trip can be unit-tested without a
-/// database. Persists pcfIpEndPoints, MAC, ipDomain, and expiry (W4.2) so
+/// database. Persists pcfIpEndPoints, MAC, ipDomain, and expiry so
 /// bindings survive BSF restarts intact.
 pub fn sess_to_doc(sess: &BsfSess) -> ogs_dbi::mongodb::bson::Document {
     use ogs_dbi::mongodb::bson::{doc, Bson, Document};
@@ -916,7 +916,7 @@ fn bsf_db_load_all_bindings() -> DbiResult<Vec<BsfSess>> {
 }
 
 // ---------------------------------------------------------------------------
-// Async persistence wrappers (W4.2: sync -> async Mongo)
+// Async persistence wrappers (sync -> async Mongo)
 //
 // The mongodb sync driver blocks; calling it from SBI handlers stalls the
 // tokio runtime. These wrappers offload to `tokio::task::spawn_blocking`,

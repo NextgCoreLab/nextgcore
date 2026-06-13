@@ -399,7 +399,7 @@ pub fn authorize_bearer(
 }
 
 // ============================================================================
-// OAuth2 Client (W1.23: Token exchange with NRF)
+// OAuth2 Client (Token exchange with NRF)
 // ============================================================================
 
 /// OAuth2 client for requesting tokens from the NRF (Authorization Server).

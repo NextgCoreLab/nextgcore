@@ -151,7 +151,7 @@ pub struct SbiClient {
     pool: Arc<Vec<Mutex<Option<ConnectionState>>>>,
     /// Round-robin cursor for slot selection.
     next_slot: Arc<AtomicUsize>,
-    /// OAuth2 client for automatic token attachment (W1.23)
+    /// OAuth2 client for automatic token attachment
     oauth2: Option<Arc<OAuth2Client>>,
     /// Target NF type for OAuth2 scope resolution
     target_nf_type: Option<NfType>,
@@ -176,7 +176,7 @@ impl SbiClient {
         Self::new(SbiClientConfig::new(host, port))
     }
 
-    /// Attach an OAuth2 client for automatic Bearer token attachment (W1.23).
+    /// Attach an OAuth2 client for automatic Bearer token attachment.
     ///
     /// When set, the client will request a token from the NRF before each
     /// SBI request that does not already carry an Authorization header.
@@ -295,7 +295,7 @@ impl SbiClient {
 
     /// Send an SBI request and receive a response
     pub async fn send_request(&self, mut request: SbiRequest) -> SbiResult<SbiResponse> {
-        // W1.23: Automatically attach Bearer token if OAuth2 is configured
+        // Automatically attach Bearer token if OAuth2 is configured
         // and the request does not already carry an Authorization header
         if let (Some(oauth2), Some(target_nf_type)) = (&self.oauth2, &self.target_nf_type) {
             // get_header() is case-insensitive: an "authorization" header

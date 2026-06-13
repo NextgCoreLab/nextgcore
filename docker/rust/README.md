@@ -202,6 +202,23 @@ Key configuration options:
 | `MAX_UE` | Maximum UEs | `1024` |
 | `SBI_TLS_ENABLED` | Enable TLS for SBI | `false` |
 
+#### Rel-17/18 Feature Knobs
+
+These tune the integrated Rel-17/18 features (set on the relevant NF container):
+
+| Variable | NF | Description | Default |
+|----------|----|-------------|---------|
+| `REDCAP_SESS_AMBR_DL_BPS` | smf | RedCap session-AMBR downlink cap (Rel-17) | `150000000` (150 Mbps) |
+| `REDCAP_SESS_AMBR_UL_BPS` | smf | RedCap session-AMBR uplink cap | `50000000` (50 Mbps) |
+| `AMF_SNPN_ALLOWED_NIDS` | amf | Comma-separated served SNPN NIDs; a UE NID not in this list is rejected (5GMM #75). Unset = accept any NID (Rel-17, TS 23.501 §5.30) | _(unset)_ |
+| `AMF_UAV_GEOFENCE` | amf | UAV geofence `min_lat,max_lat,min_lon,max_lon,min_alt,max_alt`; a tracking report outside it is denied (Rel-18, TS 23.256) | `0,0,0,0,0,120` (0-120 m ceiling) |
+| `PCF_UAV_DNN` | pcf | DNN that triggers UAV policy authorization | `uav` |
+
+Notes:
+- **XR 5QI** (Rel-18) needs no env var: a PDU session on an XR DNN (`xr`/`xr-cloud`/`xr-gaming` → 5QI 82, `xr-split` → 84, `xr-haptic` → 85) makes the SMF install a dedicated GBR XR QER and the UPF mark it EF/AF41. The DNN reaches the SMF via the UE's UL NAS Transport DNN IE.
+- **MINT** (Rel-18) needs no env var; the secondary SUPI(s) the UE registers must exist in the subscriber DB.
+- See `nextgsim/docs/configuration.md` for the matching UE-side config knobs and `config/features/` for ready-to-run per-feature example configs.
+
 ### Configuration Files
 
 Configuration files are mounted from `configs/` directory:
@@ -355,6 +372,23 @@ services:
 ```
 
 See [VALIDATION.md](VALIDATION.md) for detailed validation procedures.
+
+### End-to-End Tests
+
+```bash
+# Full baseline E2E: build + deploy + UE registration → PDU session → GTP-U ping
+./e2e-test.sh                 # add --no-build to reuse images, --keep to leave the stack up
+
+# Rel-17/18 feature E2E (assumes a built stack is up, e.g. after ./e2e-test.sh --keep)
+./feature-e2e-test.sh                       # all scenarios
+./feature-e2e-test.sh redcap xr uav-allow   # selected scenarios
+```
+
+`feature-e2e-test.sh` drives each integrated Rel-17/18 feature with a dedicated UE/gNB
+config (under `../../../nextgsim/config/features/`) via the `docker-compose.features.yml` overlay and
+asserts the exact per-NF log signatures. Scenarios: `redcap`, `xr`, `uav-allow`,
+`uav-deny`, `mint`, `snpn-accept`, `snpn-reject`. It recreates only the containers each
+scenario needs and scopes log assertions per-scenario; pass `--down` to tear down after.
 
 ### Manual Validation
 

@@ -1,4 +1,4 @@
-//! UDR resource trees and change-notification subscriptions (W4.2)
+//! UDR resource trees and change-notification subscriptions
 //!
 //! Implements the storage backing for the TS 29.504 resource trees that are
 //! not subscriber-database backed:
@@ -11,7 +11,7 @@
 //!
 //! Locking: every accessor copies data out and drops the guard before any
 //! other lock or any `.await` (no guard is ever held across an await or a
-//! second map lock — see Wave 2/3 ABBA lock-order rule).
+//! second map lock — see the documented ABBA lock-order rule).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -713,7 +713,7 @@ fn dispatch_create_session_request(server: &GtpcServer, msg: &Gtp2Message, peer:
     }
 
     // NOTE: the triggered response is sent once the local provisioning is
-    // complete. When the Sxa transport (W2.3) delivers asynchronous PFCP
+    // complete. When the Sxa transport delivers asynchronous PFCP
     // responses, this send moves to the Session Establishment Response
     // handler in sxa_handler.
     match s11_build::build_create_session_response(&sess, seq, server.restart_counter()) {

@@ -1673,7 +1673,7 @@ pub fn build_heartbeat_request(recovery_time_stamp: u32) -> Vec<u8> {
 /// - FTUP: F-TEID allocation in the UP function (CHOOSE flag handling)
 /// - EMPU: sending of End Marker packets
 ///
-/// Encoded with the ogs-pfcp library codec (full 8 feature octets, Wave 0).
+/// Encoded with the ogs-pfcp library codec (full 8 feature octets).
 pub fn upf_function_features() -> Vec<u8> {
     use bytes::BytesMut;
     let features = ogs_pfcp::types::UpFunctionFeatures {

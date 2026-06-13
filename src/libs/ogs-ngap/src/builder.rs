@@ -1301,7 +1301,7 @@ pub fn build_handover_preparation_failure(msg: &HandoverPreparationFailure) -> N
 
 #[cfg(test)]
 mod ng_setup_cross_codec {
-    //! Cross-codec NG Setup regression guards (W5 E2E NGAP reconciliation).
+    //! Cross-codec NG Setup regression guards (E2E NGAP reconciliation).
     //!
     //! These pin the wire bytes ogs-ngap produces for the NG Setup Request and
     //! Response against the byte vectors that the independent nextgsim-ngap
@@ -1413,7 +1413,7 @@ mod ng_setup_cross_codec {
 
     /// Downlink NAS Transport (AMF → gNB) — the first procedure after NG Setup.
     /// Verified to round-trip through the sim's nextgsim-ngap decoder during the
-    /// W5 reconciliation; pinned here as a self round-trip so the core side does
+    /// NGAP reconciliation; pinned here as a self round-trip so the core side does
     /// not regress the framing the sim depends on.
     #[test]
     fn downlink_nas_transport_self_roundtrip() {
@@ -1434,7 +1434,7 @@ mod ng_setup_cross_codec {
     }
 
     // ------------------------------------------------------------------
-    // ICS Request cross-codec guard (W5 ICS reconciliation)
+    // ICS Request cross-codec guard (ICS reconciliation)
     // ------------------------------------------------------------------
     //
     // Pins the wire bytes ogs-ngap produces for an InitialContextSetupRequest

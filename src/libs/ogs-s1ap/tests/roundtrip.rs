@@ -1310,7 +1310,7 @@ fn unknown_procedure_code_is_reported_not_rejected() {
 }
 
 proptest! {
-    /// Decoding arbitrary bytes must never panic (Wave 0 made the APER
+    /// Decoding arbitrary bytes must never panic (the APER
     /// primitives panic-free; this layer must stay panic-free too).
     #[test]
     fn random_data_does_not_panic(data in proptest::collection::vec(any::<u8>(), 0..512)) {
