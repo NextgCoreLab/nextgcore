@@ -90,7 +90,14 @@ struct SbiClientYaml {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct SbiServerYaml {
+    address: Option<String>,
+    port: Option<u16>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct SbiYaml {
+    server: Option<Vec<SbiServerYaml>>,
     client: Option<SbiClientYaml>,
 }
 
@@ -109,7 +116,7 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     // Initialize logging
     init_logging(&args)?;
@@ -153,6 +160,17 @@ async fn main() -> Result<()> {
                 if let Ok(yaml) = serde_yaml::from_str::<AusfYaml>(&content) {
                     if let Some(ausf) = yaml.ausf {
                         if let Some(sbi) = ausf.sbi {
+                            // Override the advertised/bind SBI address with the
+                            // routable address from config so the NRF NFProfile
+                            // advertises a reachable endpoint (not 0.0.0.0).
+                            if let Some(server) = sbi.server.as_ref().and_then(|s| s.first()) {
+                                if let Some(addr) = &server.address {
+                                    args.sbi_addr = addr.clone();
+                                }
+                                if let Some(port) = server.port {
+                                    args.sbi_port = port;
+                                }
+                            }
                             if let Some(client) = sbi.client {
                                 if let Some(nrf_list) = client.nrf {
                                     if let Some(nrf) = nrf_list.first() {

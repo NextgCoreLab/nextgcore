@@ -992,11 +992,21 @@ impl ParsedFTeid {
         let chid = (flags & 0x08) != 0;
 
         let mut cursor = &data[1..];
-        if cursor.len() < 4 {
-            return Err("F-TEID too short for TEID");
-        }
-        let teid = u32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
-        cursor = &cursor[4..];
+
+        // TS 29.244 8.2.3: when the CH (CHOOSE) flag is set the SMF is asking
+        // the UPF to allocate the F-TEID, so the TEID and address fields are
+        // omitted on the wire (only the optional CHOOSE ID may follow). Only
+        // read the TEID/addresses when CH is clear.
+        let teid = if ch {
+            0
+        } else {
+            if cursor.len() < 4 {
+                return Err("F-TEID too short for TEID");
+            }
+            let t = u32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
+            cursor = &cursor[4..];
+            t
+        };
 
         let ipv4 = if v4 && !ch {
             if cursor.len() < 4 {
@@ -2120,5 +2130,90 @@ mod tests {
         let pdi = parse_pdi(&pdi_data).unwrap();
         assert_eq!(pdi.source_interface, 0);
         assert!(pdi.sdf_flow_description.is_none());
+    }
+
+    // -- Uplink F-TEID allocation round-trip (CH / teid==0 request) --
+
+    /// A CH=1 (CHOOSE) request F-TEID omits the TEID and address fields on the
+    /// wire (TS 29.244 8.2.3); the UPF parser must accept it without error.
+    #[test]
+    fn test_parse_f_teid_choose_flag_no_teid_bytes() {
+        // flags = CH (0x04) only, no TEID / address bytes follow.
+        let data = [0x04u8];
+        let fteid = ParsedFTeid::parse(&data).expect("CH=1 F-TEID must parse");
+        assert!(fteid.ch);
+        assert_eq!(fteid.teid, 0);
+        assert!(fteid.ipv4.is_none());
+    }
+
+    /// CH + CHID: CHOOSE ID byte follows the flags, still no TEID/address.
+    #[test]
+    fn test_parse_f_teid_choose_with_choose_id() {
+        let data = [0x0Cu8, 0x07]; // CH (0x04) | CHID (0x08), choose_id = 7
+        let fteid = ParsedFTeid::parse(&data).expect("CH+CHID F-TEID must parse");
+        assert!(fteid.ch);
+        assert!(fteid.chid);
+        assert_eq!(fteid.choose_id, Some(7));
+        assert_eq!(fteid.teid, 0);
+    }
+
+    /// Our SMF signals "UPF allocates" with a concrete-looking F-TEID whose
+    /// TEID is 0 (flags = 0, teid = 0). The parser must yield teid == 0 so the
+    /// establishment handler triggers allocation.
+    #[test]
+    fn test_parse_f_teid_zero_teid_request() {
+        let data = [0x00u8, 0x00, 0x00, 0x00, 0x00]; // flags=0, teid=0
+        let fteid = ParsedFTeid::parse(&data).expect("teid=0 F-TEID must parse");
+        assert!(!fteid.ch);
+        assert_eq!(fteid.teid, 0);
+    }
+
+    /// End-to-end: a "please allocate" request F-TEID yields a Created PDR
+    /// carrying a non-zero allocated Local F-TEID (CH=0, real TEID + IPv4)
+    /// that the SMF-side decoder accepts.
+    #[test]
+    fn test_uplink_alloc_round_trip_created_pdr() {
+        // 1. SMF sends an uplink PDI F-TEID asking the UPF to allocate.
+        let req = [0x04u8]; // CH=1
+        let parsed = ParsedFTeid::parse(&req).unwrap();
+        assert!(parsed.ch || parsed.teid == 0, "should request allocation");
+
+        // 2. UPF allocates a fresh non-zero TEID + its N3 GTP-U address and
+        //    builds a Created PDR (this mirrors the establishment handler).
+        let allocated_teid: u32 = 0x10001;
+        let upf_n3 = Ipv4Addr::new(172, 23, 0, 7);
+        let created = CreatedPdr {
+            pdr_id: 1,
+            local_f_teid: Some(FTeid {
+                teid: allocated_teid,
+                ipv4: Some(upf_n3),
+                ipv6: None,
+                choose: false,
+                choose_id: None,
+            }),
+            ue_ip_address: None,
+        };
+        let mut builder = PfcpMessageBuilder::new();
+        builder.add_created_pdr(&created);
+        let created_pdr_ie_value = builder.build();
+
+        // 3. Decode exactly as the SMF does: find inner F-TEID (type 21),
+        //    require non-zero TEID and an IPv4 (V4 flag 0x02). The outer bytes
+        //    here are the Created PDR IE itself (type 8).
+        let ies = ParsedIe::parse_all(&created_pdr_ie_value);
+        let created_ie = ParsedIe::find_ie(&ies, pfcp_ie::CREATED_PDR)
+            .expect("Created PDR IE must be present");
+        let inner = ParsedIe::parse_all(&created_ie.value);
+        let fteid_ie = ParsedIe::find_ie(&inner, pfcp_ie::F_TEID)
+            .expect("Created PDR must carry an F-TEID");
+        let fteid_val = &fteid_ie.value;
+        assert!(fteid_val.len() >= 5);
+        let flags = fteid_val[0];
+        let teid = u32::from_be_bytes(fteid_val[1..5].try_into().unwrap());
+        assert_ne!(teid, 0, "SMF requires a non-zero allocated F-TEID");
+        assert_eq!(teid, allocated_teid);
+        assert_eq!(flags & 0x04, 0, "response F-TEID must have CH cleared");
+        assert_ne!(flags & 0x02, 0, "response F-TEID must carry IPv4");
+        assert_eq!(&fteid_val[5..9], &upf_n3.octets());
     }
 }

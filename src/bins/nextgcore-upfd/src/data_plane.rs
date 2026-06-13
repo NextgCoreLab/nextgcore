@@ -1927,18 +1927,23 @@ impl DataPlane {
             Some(s) => s,
             None => {
                 // No PFCP session for this destination — discard
-                log::trace!("No session for DL packet to {dst_ip:?} — dropped");
+                log::debug!("DL: no session for packet to {dst_ip:?} — dropped");
                 self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                 return;
             }
         };
 
-        // --- PDR matching (downlink: source_interface = Core) ---
+        // --- PDR matching (downlink: source_interface = Core, TS 29.244
+        // 8.2.24). The CP function (SMF) must signal the standard Core value
+        // for the downlink PDR or it will not match here. ---
         let matched = session.match_pdr_with_packet(SRC_INTF_CORE, dl_pkt_tuple.as_ref(), None);
         let (far_id, qer_id, urr_ids) = match matched {
             Some((far_id, qer_id, urr_ids, _ohr)) => (far_id, qer_id, urr_ids),
             None => {
-                log::debug!("DL packet to {dst_ip:?} matched no PDR — dropped");
+                log::debug!(
+                    "DL: packet to {dst_ip:?} (SEID 0x{:x}) matched no Core PDR — dropped",
+                    session.upf_seid
+                );
                 self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -2045,7 +2050,9 @@ impl DataPlane {
                 self.stats
                     .dl_bytes
                     .fetch_add(payload_len, Ordering::Relaxed);
-                log::trace!("DL: {payload_len} bytes to {gnb_addr} TEID=0x{dl_teid:x}");
+                log::debug!(
+                    "DL forwarded: {payload_len}B to gNB {gnb_addr} TEID=0x{dl_teid:x} QFI={qfi_to_apply:?}"
+                );
             }
             Err(e) => {
                 log::error!("GTP-U send failed: {e}");
@@ -3136,6 +3143,98 @@ mod tests {
                 bar_id: Some(1)
             }
         );
+    }
+
+    /// Downlink forwarding chain: a packet arriving from the Core interface
+    /// destined for the UE IP must (1) match the Core PDR, (2) resolve a
+    /// Forward FAR carrying the gNB DL TEID + address, and (3) GTP-U
+    /// encapsulate under that TEID. This is the path that was silently
+    /// dropping packets when the CP signalled a non-standard Core source
+    /// interface value (it must be SRC_INTF_CORE == 1, TS 29.244 8.2.24).
+    #[test]
+    fn test_downlink_core_pdr_match_and_gtpu_encap() {
+        let gnb = Ipv4Addr::new(172, 23, 0, 100);
+        let dl_teid: u32 = 0x1;
+
+        // Session with a downlink (Core) PDR + Forward FAR to Access carrying
+        // the gNB tunnel, exactly as installed after PFCP modification.
+        let session = make_test_session(vec![DataPlanePdr {
+            pdr_id: 2,
+            precedence: 100,
+            source_interface: SRC_INTF_CORE,
+            far_id: Some(2),
+            qer_id: None,
+            urr_ids: vec![],
+            outer_header_removal: None,
+            sdf_rule: None,
+            qfi: None,
+        }]);
+        session.fars.write().unwrap().insert(
+            2,
+            DataPlaneFar {
+                far_id: 2,
+                apply_action: FAR_ACTION_FORW,
+                destination_interface: SRC_INTF_ACCESS,
+                ohc_teid: Some(dl_teid),
+                ohc_addr: Some(gnb),
+                bar_id: None,
+            },
+        );
+
+        // Downlink ICMP reply: src = gateway, dst = UE IP 10.45.0.2
+        let mut dl_pkt = make_ipv4_tcp_packet([10, 45, 0, 1], [10, 45, 0, 2], 0, 0);
+        dl_pkt[9] = 1; // ICMP
+        let tuple = PacketTuple::from_ipv4_packet(&dl_pkt);
+
+        // 1. Core PDR matches
+        let matched = session.match_pdr_with_packet(SRC_INTF_CORE, tuple.as_ref(), None);
+        let (far_id, _qer, _urr, _ohr) =
+            matched.expect("downlink Core PDR must match the UE-destined packet");
+        assert_eq!(far_id, Some(2));
+
+        // 2. FAR resolves to Forward with the gNB DL tunnel
+        let (teid, addr) = match session.apply_far(far_id.unwrap()) {
+            FarDecision::Forward { ohc_teid, ohc_addr } => (
+                ohc_teid.unwrap_or(session.dl_teid),
+                ohc_addr.unwrap_or(gnb),
+            ),
+            other => panic!("expected Forward, got {other:?}"),
+        };
+        assert_eq!(teid, dl_teid);
+        assert_eq!(addr, gnb);
+
+        // 3. GTP-U encapsulation produces a G-PDU under the gNB DL TEID
+        let gpdu = encapsulate_dl_gpdu(&dl_pkt, teid, Some(9));
+        let parsed = parse_gtpu_header(&gpdu).expect("encapsulated G-PDU must parse");
+        assert_eq!(parsed.msg_type, gtpu_msg_type::GPDU);
+        assert_eq!(parsed.teid, dl_teid);
+        // Inner IP packet must follow the GTP-U (+ extension) header intact
+        assert_eq!(&gpdu[parsed.header_len..], &dl_pkt[..]);
+    }
+
+    /// Guard against the regression: a downlink packet must NOT match an
+    /// uplink (Access) PDR, and a Core PDR must NOT match an uplink lookup.
+    #[test]
+    fn test_downlink_does_not_match_access_pdr() {
+        let session = make_test_session(vec![DataPlanePdr {
+            pdr_id: 2,
+            precedence: 100,
+            source_interface: SRC_INTF_CORE,
+            far_id: Some(2),
+            qer_id: None,
+            urr_ids: vec![],
+            outer_header_removal: None,
+            sdf_rule: None,
+            qfi: None,
+        }]);
+        // A Core PDR is invisible to an Access (uplink) lookup.
+        assert!(session
+            .match_pdr_with_packet(SRC_INTF_ACCESS, None, None)
+            .is_none());
+        // And visible to a Core (downlink) lookup.
+        assert!(session
+            .match_pdr_with_packet(SRC_INTF_CORE, None, None)
+            .is_some());
     }
 
     // -- Buffering (BUFF/BAR) tests --

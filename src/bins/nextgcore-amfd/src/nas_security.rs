@@ -363,7 +363,10 @@ pub fn nas_encrypt(
             // 128-NEA2 (AES-CTR)
             let mut iv = [0u8; 16];
             iv[0..4].copy_from_slice(&count.to_be_bytes());
-            iv[4] = (bearer << 3) | (direction & 0x01);
+            // TS 33.401 Annex B.2.3 (reused by TS 33.501 Annex D.3 / TS
+            // 35.215): octet 4 = BEARER (bits 7-3) | DIRECTION (bit 2) | 00.
+            // DIRECTION must occupy bit 2, not bit 0.
+            iv[4] = (bearer << 3) | ((direction & 0x01) << 2);
 
             let mut key_arr = [0u8; 16];
             key_arr.copy_from_slice(&key[..16.min(key.len())]);
@@ -443,9 +446,12 @@ pub fn nas_mac_calculate(
             key_arr.copy_from_slice(&key[..16.min(key.len())]);
 
             // Build input: COUNT || BEARER || DIRECTION || MESSAGE
+            // TS 33.401 Annex B.2.3 (reused by TS 33.501 Annex D.3 / TS
+            // 35.215): octet 4 = BEARER (bits 7-3) | DIRECTION (bit 2) | 00.
+            // DIRECTION must occupy bit 2, not bit 0.
             let mut input = Vec::with_capacity(8 + message.len());
             input.extend_from_slice(&count.to_be_bytes());
-            input.push((bearer << 3) | (direction & 0x01));
+            input.push((bearer << 3) | ((direction & 0x01) << 2));
             input.extend_from_slice(&[0u8; 3]); // Padding
             input.extend_from_slice(message);
 
@@ -893,6 +899,74 @@ mod tests {
         let key = [0u8; 16];
         let mac = nas_mac_calculate(0, &key, 0, 1, direction::DOWNLINK, &[0x01, 0x02, 0x03]);
         assert_eq!(mac, [0u8; 4]);
+    }
+
+    /// Cross-stack NAS-security regression vector (TS 33.501 + TS 33.401
+    /// Annex B.2.3). This vector is MIRRORED BYTE-FOR-BYTE in the nextgsim
+    /// UE at nextgsim-nas/src/security.rs
+    /// (`test_cross_stack_nas_security_reference_vector`). If either side's
+    /// KAMF / KNAS_int derivation or NAS-MAC/NEA2 input layout drifts, one
+    /// of the two repos' tests fails and the divergence is caught here
+    /// instead of in a Docker E2E run.
+    ///
+    /// Inputs: fixed KSEAF, SUPI 999700000000001, ABBA [0,0], ngKSI 0,
+    /// NIA2/NEA2, a representative integrity-only Security Mode Command
+    /// payload, COUNT 0, BEARER 1 (3GPP), DIRECTION downlink.
+    #[test]
+    fn test_cross_stack_nas_security_reference_vector() {
+        use ogs_crypt::kdf::{ogs_kdf_kamf, ogs_kdf_nas_5gs, OGS_KDF_NAS_ENC_ALG, OGS_KDF_NAS_INT_ALG};
+
+        // -- fixed inputs (shared with the sim) --
+        let kseaf: [u8; 32] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+        let supi = "imsi-999700000000001";
+        let abba = [0x00u8, 0x00];
+
+        // -- KAMF (TS 33.501 Annex A.7) --
+        let kamf = ogs_kdf_kamf(supi, &abba, &kseaf);
+        let expected_kamf: [u8; 32] = [
+            84, 220, 101, 65, 23, 243, 138, 4, 80, 226, 49, 139, 229, 104, 34, 238, 12, 174, 245,
+            76, 108, 223, 167, 207, 103, 220, 31, 103, 8, 43, 231, 105,
+        ];
+        assert_eq!(kamf, expected_kamf, "KAMF derivation drifted");
+
+        // -- KNAS_int / KNAS_enc (TS 33.501 Annex A.8, NIA2/NEA2 = 0x02) --
+        let knas_int = ogs_kdf_nas_5gs(OGS_KDF_NAS_INT_ALG, 0x02, &kamf);
+        let knas_enc = ogs_kdf_nas_5gs(OGS_KDF_NAS_ENC_ALG, 0x02, &kamf);
+        let expected_knas_int: [u8; 16] = [
+            38, 115, 160, 80, 204, 200, 220, 83, 104, 212, 33, 203, 134, 23, 71, 52,
+        ];
+        let expected_knas_enc: [u8; 16] = [
+            68, 137, 172, 160, 32, 35, 251, 95, 219, 157, 215, 44, 26, 246, 150, 231,
+        ];
+        assert_eq!(knas_int, expected_knas_int, "KNAS_int derivation drifted");
+        assert_eq!(knas_enc, expected_knas_enc, "KNAS_enc derivation drifted");
+
+        // -- NAS-MAC over a representative SMC payload (TS 33.401 B.2.3) --
+        // COUNT 0, BEARER 1 (3GPP access), DIRECTION downlink, NIA2. The
+        // integrity-protected NAS message the MAC covers is
+        // SQN || inner-message (TS 24.501 Section 4.4.3.3); here SQN = 0,
+        // matching how the sim's `compute_nas_mac(sqn=0, payload)` builds
+        // its input.
+        let smc_payload: [u8; 8] = [0x7e, 0x03, 0x02, 0x00, 0x02, 0xe0, 0xe0, 0xe1];
+        let mut mac_input = vec![0x00u8]; // SQN
+        mac_input.extend_from_slice(&smc_payload);
+        let mac = nas_mac_calculate(2, &knas_int, 0, 1, direction::DOWNLINK, &mac_input);
+        let expected_mac: [u8; 4] = [197, 118, 67, 44];
+        assert_eq!(mac, expected_mac, "NAS-MAC (NIA2) input layout drifted");
+
+        // -- NEA2 ciphering of the same payload (TS 33.501 Annex D.3) --
+        let mut ciphered = smc_payload.to_vec();
+        nas_encrypt(2, &knas_enc, 0, 1, direction::DOWNLINK, &mut ciphered);
+        let expected_ciphered: [u8; 8] = [231, 2, 38, 222, 206, 212, 137, 8];
+        assert_eq!(
+            ciphered.as_slice(),
+            &expected_ciphered,
+            "NEA2 IV layout drifted"
+        );
     }
 
     #[test]

@@ -461,7 +461,9 @@ impl AllocationAndRetentionPriority {
         encoder.write_bit(false); // no iE-Extensions
         let constraint = Constraint::new(1, 15);
         encoder.encode_constrained_whole_number(self.priority_level_arp as i64, &constraint)?;
-        let two = Constraint::new(0, 1);
+        // Pre-emptionCapability / Pre-emptionVulnerability ::= ENUMERATED { ..., ... }
+        // are extensible (TS 38.413 §9.3.1.19): each carries an extension marker.
+        let two = Constraint::extensible(0, 1);
         encoder.encode_enumerated(self.pre_emption_capability as i64, &two)?;
         encoder.encode_enumerated(self.pre_emption_vulnerability as i64, &two)?;
         Ok(())
@@ -472,7 +474,7 @@ impl AllocationAndRetentionPriority {
         let _ie_ext = decoder.read_bit()?;
         let constraint = Constraint::new(1, 15);
         let priority_level_arp = decoder.decode_constrained_whole_number(&constraint)? as u8;
-        let two = Constraint::new(0, 1);
+        let two = Constraint::extensible(0, 1);
         let pre_emption_capability = match decoder.decode_enumerated(&two)? {
             0 => PreEmptionCapability::ShallNotTriggerPreEmption,
             _ => PreEmptionCapability::MayTriggerPreEmption,
@@ -1657,6 +1659,65 @@ impl PduSessionResourceReleaseResponseTransfer {
     }
 }
 
+// ============================================================================
+// Path Switch Request Transfer (TS 38.413 Section 9.3.4.8)
+// ============================================================================
+
+/// PathSwitchRequestTransfer - built by the target gNB, consumed by SMF.
+///
+/// Carries the new DL NG-U F-TEID the UPF must forward to after an Xn handover,
+/// plus the accepted QoS flows. Only the fields the SMF needs (DL tunnel +
+/// accepted QFIs) are modelled; the optional reused-TNL and user-plane-security
+/// fields are skipped on decode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathSwitchRequestTransfer {
+    /// DL NG-U UP TNL information (mandatory) - the target gNB N3 endpoint
+    pub dl_ngu_up_tnl_information: UpTransportLayerInformation,
+    /// QoS Flow Accepted List (mandatory, at least one) - accepted QFIs
+    pub qos_flow_accepted_list: Vec<u8>,
+}
+
+impl PathSwitchRequestTransfer {
+    pub fn decode(data: &[u8]) -> NgapResult<Self> {
+        let mut decoder = AperDecoder::new(data);
+        // SEQUENCE preamble: extension marker + 3 optional-field present bits
+        // (dL-NGU-TNLInformationReused, userPlaneSecurityInformation,
+        // iE-Extensions). The DL tunnel and accepted list are mandatory.
+        let _ext = decoder.read_bit()?;
+        let reused_present = decoder.read_bit()?;
+        let security_present = decoder.read_bit()?;
+        let _ie_ext = decoder.read_bit()?;
+
+        let dl_ngu_up_tnl_information = UpTransportLayerInformation::decode(&mut decoder)?;
+
+        // The reused-TNL and user-plane-security fields are not consumed by the
+        // SMF DL-path activation; reject transfers that carry them rather than
+        // silently mis-parse the following QoS list.
+        if reused_present || security_present {
+            return Err(invalid(
+                "PathSwitchRequestTransfer",
+                "dL-NGU-TNLInformationReused / userPlaneSecurityInformation not supported"
+                    .to_string(),
+            ));
+        }
+
+        // QosFlowAcceptedList ::= SEQUENCE (SIZE(1..64)) OF QosFlowAcceptedItem
+        let count = decoder.decode_constrained_length(1, 64)?;
+        let mut qos_flow_accepted_list = Vec::with_capacity(count);
+        for _ in 0..count {
+            // QosFlowAcceptedItem ::= SEQUENCE { qosFlowIdentifier, iE-Ext OPT }
+            let _item_ext = decoder.read_bit()?;
+            let _item_ie_ext = decoder.read_bit()?;
+            qos_flow_accepted_list.push(decode_qfi(&mut decoder)?);
+        }
+
+        Ok(Self {
+            dl_ngu_up_tnl_information,
+            qos_flow_accepted_list,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1916,5 +1977,25 @@ mod tests {
         let truncated = &bytes[..bytes.len() / 2];
         assert!(PduSessionResourceSetupResponseTransfer::decode(truncated).is_err());
         assert!(PduSessionResourceSetupRequestTransfer::decode(&[0xFF]).is_err());
+    }
+
+    /// Cross-codec: the target gNB (nextgsim-ngap) emits this
+    /// PathSwitchRequestTransfer (DL F-TEID 0x00020002 / 10.46.0.1 / QFI 1);
+    /// the SMF must decode it to re-point the UPF DL FAR after an Xn handover.
+    #[test]
+    fn test_path_switch_request_transfer_decodes_gnb_vector() {
+        const GNB_PATH_SWITCH_TRANSFER: [u8; 12] = [
+            0x00, 0x1f, 0x0a, 0x2e, 0x00, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x02,
+        ];
+        let t = PathSwitchRequestTransfer::decode(&GNB_PATH_SWITCH_TRANSFER).unwrap();
+        let UpTransportLayerInformation::GtpTunnel(tun) = &t.dl_ngu_up_tnl_information;
+        assert_eq!(u32::from_be_bytes(tun.gtp_teid), 0x0002_0002);
+        assert_eq!(tun.transport_layer_address.octets, vec![10, 46, 0, 1]);
+        assert_eq!(t.qos_flow_accepted_list, vec![1]);
+    }
+
+    #[test]
+    fn test_path_switch_request_transfer_rejects_truncated() {
+        assert!(PathSwitchRequestTransfer::decode(&[0x00]).is_err());
     }
 }

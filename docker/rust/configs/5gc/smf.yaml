@@ -14,7 +14,7 @@ global:
 smf:
   sbi:
     server:
-      - address: 0.0.0.0
+      - address: 172.23.0.4
         port: 7777
     client:
       nrf:

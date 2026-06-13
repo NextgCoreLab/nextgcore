@@ -946,12 +946,25 @@ impl PfcpServer {
                         pdr.urr_ids,
                     );
 
-                    // Check if this PDR needs a local F-TEID (uplink PDR)
+                    // Check if this PDR needs a local F-TEID (uplink PDR).
+                    //
+                    // The SMF asks the UPF to allocate the N3 uplink F-TEID in
+                    // one of two ways (TS 29.244 8.2.3 / 7.5.3.2):
+                    //   * CH (CHOOSE) flag set — the canonical "UP function
+                    //     shall assign the F-TEID" request, with TEID/address
+                    //     omitted on the wire; or
+                    //   * a PDI F-TEID with TEID == 0 (no concrete tunnel to
+                    //     bind to). Our SMF signals allocation this way.
+                    // In either case the UPF allocates a fresh non-zero TEID +
+                    // its N3 GTP-U address and returns it in the Created PDR so
+                    // uplink GTP-U traffic matches.
                     let local_f_teid = if let Some(ref fteid) = pdr.pdi.local_f_teid {
-                        if fteid.ch {
-                            // CHOOSE flag - allocate TEID
+                        if fteid.ch || fteid.teid == 0 {
                             ul_teid = self.alloc_teid();
-                            log::debug!("Allocated uplink TEID: {ul_teid:#x}");
+                            log::debug!(
+                                "Allocated uplink F-TEID: teid={ul_teid:#x} (ch={})",
+                                fteid.ch
+                            );
                             Some(FTeid {
                                 teid: ul_teid,
                                 ipv4: match &self.local_node_id {

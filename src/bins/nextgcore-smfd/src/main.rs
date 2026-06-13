@@ -990,7 +990,7 @@ async fn pfcp_session_establish(
     let ul_far = FarParams {
         far_id: 1,
         apply_action: 0x02,             // FORW (forward)
-        destination_interface: Some(6), // Core/SGi-LAN
+        destination_interface: Some(2), // SGi-LAN/N6 (TS 29.244 8.2.25)
         ..Default::default()
     };
     let ul_far_bytes = n4_build::build_create_far(&ul_far);
@@ -1000,7 +1000,7 @@ async fn pfcp_session_establish(
     let dl_pdr = PdrParams {
         pdr_id: 2,
         precedence: 100,
-        source_interface: 6,                             // Core
+        source_interface: 1,                             // Core (TS 29.244 8.2.24)
         ue_ip_address: Some((Some(ue_ip), None, false)), // destination
         far_id: Some(2),
         qer_id: Some(1),
@@ -1255,6 +1255,110 @@ fn problem_400(cause: &str, detail: &str) -> SbiResponse {
         "detail": detail,
     });
     SbiResponse::with_status(400).with_body(body.to_string(), "application/problem+json")
+}
+
+/// Build the N2 SM `PDUSessionResourceSetupRequestTransfer` (TS 38.413
+/// §9.3.4.1) carrying the UPF N3 GTP-U F-TEID and the QoS flow setup list,
+/// using the real-APER `ogs-ngap` transfer codec (not bespoke bytes).
+fn build_setup_request_transfer(
+    upf_teid: u32,
+    upf_addr: [u8; 4],
+    qfi: u8,
+    five_qi: u16,
+    arp_priority_level: u8,
+) -> ogs_ngap::NgapResult<Vec<u8>> {
+    use ogs_ngap::transfer::{
+        AllocationAndRetentionPriority, GtpTunnel, NonDynamic5qiDescriptor, PduSessionType,
+        PduSessionResourceSetupRequestTransfer, PreEmptionCapability, PreEmptionVulnerability,
+        QosCharacteristics, QosFlowLevelQosParameters, QosFlowSetupRequestItem,
+        TransportLayerAddress, UpTransportLayerInformation,
+    };
+
+    let transfer = PduSessionResourceSetupRequestTransfer {
+        pdu_session_aggregate_maximum_bit_rate: None,
+        ul_ngu_up_tnl_information: UpTransportLayerInformation::GtpTunnel(GtpTunnel {
+            transport_layer_address: TransportLayerAddress::from_ipv4(upf_addr),
+            gtp_teid: upf_teid.to_be_bytes(),
+        }),
+        data_forwarding_not_possible: false,
+        pdu_session_type: PduSessionType::Ipv4,
+        security_indication: None,
+        network_instance: None,
+        qos_flow_setup_request_list: vec![QosFlowSetupRequestItem {
+            qos_flow_identifier: qfi,
+            qos_flow_level_qos_parameters: QosFlowLevelQosParameters {
+                qos_characteristics: QosCharacteristics::NonDynamic5qi(
+                    NonDynamic5qiDescriptor::new(five_qi),
+                ),
+                allocation_and_retention_priority: AllocationAndRetentionPriority {
+                    priority_level_arp: arp_priority_level,
+                    pre_emption_capability: PreEmptionCapability::ShallNotTriggerPreEmption,
+                    pre_emption_vulnerability: PreEmptionVulnerability::NotPreEmptable,
+                },
+                gbr_qos_information: None,
+                reflective_qos_attribute: false,
+                additional_qos_flow_information: false,
+            },
+            e_rab_id: None,
+        }],
+    };
+    transfer.encode()
+}
+
+/// Extract the gNB DL GTP-U endpoint (TEID, IPv4 address, first QFI) from a
+/// real-APER `PDUSessionResourceSetupResponseTransfer` (TS 38.413 §9.3.4.2).
+fn decode_setup_response_dl_endpoint(data: &[u8]) -> Option<(u32, [u8; 4], u8)> {
+    use ogs_ngap::transfer::{PduSessionResourceSetupResponseTransfer, UpTransportLayerInformation};
+
+    let transfer = match PduSessionResourceSetupResponseTransfer::decode(data) {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!("Failed to decode PDUSessionResourceSetupResponseTransfer: {e:?}");
+            return None;
+        }
+    };
+    let UpTransportLayerInformation::GtpTunnel(tunnel) = &transfer
+        .dl_qos_flow_per_tnl_information
+        .up_transport_layer_information;
+    let teid = u32::from_be_bytes(tunnel.gtp_teid);
+    let addr = ipv4_from_octets(&tunnel.transport_layer_address.octets)?;
+    let qfi = transfer
+        .dl_qos_flow_per_tnl_information
+        .associated_qos_flow_list
+        .first()
+        .map(|f| f.qos_flow_identifier)
+        .unwrap_or(0);
+    Some((teid, addr, qfi))
+}
+
+/// Extract the target-gNB DL GTP-U endpoint from a real-APER
+/// `PathSwitchRequestTransfer` (TS 38.413 §9.3.4.8) during an Xn handover.
+fn decode_path_switch_dl_endpoint(data: &[u8]) -> Option<(u32, [u8; 4], u8)> {
+    use ogs_ngap::transfer::{PathSwitchRequestTransfer, UpTransportLayerInformation};
+
+    let transfer = match PathSwitchRequestTransfer::decode(data) {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!("Failed to decode PathSwitchRequestTransfer: {e:?}");
+            return None;
+        }
+    };
+    let UpTransportLayerInformation::GtpTunnel(tunnel) = &transfer.dl_ngu_up_tnl_information;
+    let teid = u32::from_be_bytes(tunnel.gtp_teid);
+    let addr = ipv4_from_octets(&tunnel.transport_layer_address.octets)?;
+    let qfi = transfer.qos_flow_accepted_list.first().copied().unwrap_or(0);
+    Some((teid, addr, qfi))
+}
+
+/// Coerce a TransportLayerAddress octet vector to an IPv4 quad (None if not 4).
+fn ipv4_from_octets(octets: &[u8]) -> Option<[u8; 4]> {
+    if octets.len() == 4 {
+        Some([octets[0], octets[1], octets[2], octets[3]])
+    } else {
+        // IPv6 (16) or other widths are not supported for the GTP-U DL path here
+        log::warn!("gNB transport address is not IPv4 ({} octets)", octets.len());
+        None
+    }
 }
 
 /// Build an SmContextCreateError (TS 29.502 §6.1.6.2.4) carrying a
@@ -1639,15 +1743,30 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         &dnn,
     );
 
-    // ---- N2 SM Information: UPF tunnel endpoint + authorized 5QI ----
-    // Format: QFI(1) + UPF TEID(4,BE) + addr_type(1) + IPv4(4) + 5QI(1) + priority(1)
-    let mut n2_sm_info = Vec::with_capacity(12);
-    n2_sm_info.push(qfi);
-    n2_sm_info.extend_from_slice(&upf_teid.to_be_bytes());
-    n2_sm_info.push(1); // IPv4
-    n2_sm_info.extend_from_slice(&upf_addr);
-    n2_sm_info.push(decision.def_five_qi);
-    n2_sm_info.push(decision.arp_priority_level);
+    // ---- N2 SM Information: real-APER PDUSessionResourceSetupRequestTransfer ----
+    // TS 38.413 §9.3.4.1, carrying the UPF N3 GTP-U F-TEID + QoS flow setup list.
+    // The AMF relays this opaquely to the gNB; the gNB's strict APER decoder
+    // rejects the legacy hand-rolled byte layout, so it must be real APER.
+    let n2_sm_info = match build_setup_request_transfer(
+        upf_teid,
+        upf_addr,
+        qfi,
+        decision.def_five_qi as u16,
+        decision.arp_priority_level,
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log::error!("Failed to encode PDUSessionResourceSetupRequestTransfer: {e:?}");
+            release_ip();
+            return sm_context_create_error(
+                500,
+                "SYSTEM_FAILURE",
+                pdu_session_id,
+                pti,
+                policy::gsm_cause::NETWORK_FAILURE,
+            );
+        }
+    };
 
     use base64::Engine;
     let n1_b64 = base64::engine::general_purpose::STANDARD.encode(&n1_sm_msg);
@@ -1775,7 +1894,8 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
     match n2_sm_info_type {
         // gNB accepted the PDU session resources (initial setup) — or the UE
         // moved and the target gNB took over (Xn path switch). Both carry the
-        // new DL F-TEID that the UPF must forward to.
+        // new DL F-TEID that the UPF must forward to, but in different APER
+        // transfer containers (TS 38.413 §9.3.4.2 vs §9.3.4.8).
         "PDU_RES_SETUP_RSP" | "PATH_SWITCH_REQ" => {
             use base64::Engine;
             let Some(n2_bytes) = req_body["n2SmInfo"]
@@ -1784,16 +1904,19 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             else {
                 return problem_400("N2_SM_ERROR", "n2SmInfo missing or not valid base64");
             };
-            if n2_bytes.len() < 6 {
-                return problem_400("N2_SM_ERROR", "n2SmInfo too short");
-            }
-            let qfi = n2_bytes[0];
-            let gnb_teid = u32::from_be_bytes([n2_bytes[1], n2_bytes[2], n2_bytes[3], n2_bytes[4]]);
-            let addr_type = n2_bytes[5];
-            let gnb_addr = if addr_type == 1 && n2_bytes.len() >= 10 {
-                [n2_bytes[6], n2_bytes[7], n2_bytes[8], n2_bytes[9]]
+
+            // Real-APER decode of the gNB DL N3 endpoint via the ogs-ngap
+            // transfer codec (the gNB now emits real APER, not legacy bytes).
+            let endpoint = if n2_sm_info_type == "PATH_SWITCH_REQ" {
+                decode_path_switch_dl_endpoint(&n2_bytes)
             } else {
-                [127, 0, 0, 1]
+                decode_setup_response_dl_endpoint(&n2_bytes)
+            };
+            let Some((gnb_teid, gnb_addr, qfi)) = endpoint else {
+                return problem_400(
+                    "N2_SM_ERROR",
+                    "could not decode gNB DL F-TEID from N2 SM transfer",
+                );
             };
 
             log::info!(
@@ -2326,5 +2449,66 @@ mod tests {
         assert_eq!(config.sbi_port, 8888);
         // NRF URI now comes from the single load_config parse (no second read).
         assert_eq!(config.nrf_uri.as_deref(), Some("http://nrf.example:7777"));
+    }
+
+    // ------------------------------------------------------------------
+    // N2 SM transfer cross-codec guards (W5 PDU-session data-plane)
+    // ------------------------------------------------------------------
+    //
+    // The smfd builds the N2 SM PDUSessionResourceSetupRequestTransfer with the
+    // real-APER ogs-ngap codec and decodes the gNB's SetupResponseTransfer with
+    // it. These pin the wire bytes against the independent nextgsim-ngap codec
+    // (the gNB), mirroring the W5 NG-Setup/ICS reconciliation: the request
+    // bytes are byte-identical to the gNB's decoder vector, and the gNB's
+    // response bytes decode here.
+
+    /// smfd's emitted SetupRequestTransfer for UPF F-TEID 0x00010001 /
+    /// 10.45.0.1 / QFI 1 / 5QI 9 / ARP 8 — must equal the vector the gNB
+    /// (nextgsim-ngap) decodes (capture_tests.rs::SMFD_SETUP_REQUEST_TRANSFER).
+    const GNB_EXPECTED_SETUP_REQUEST: [u8; 32] = [
+        0x00, 0x03, 0x00, 0x8b, 0x00, 0x0a, 0x01, 0xf0, 0x0a, 0x2d, 0x00, 0x01, 0x00, 0x01, 0x00,
+        0x01, 0x00, 0x86, 0x00, 0x01, 0x00, 0x00, 0x88, 0x00, 0x07, 0x00, 0x01, 0x00, 0x00, 0x09,
+        0x1c, 0x00,
+    ];
+
+    #[test]
+    fn setup_request_transfer_matches_gnb_wire_bytes() {
+        let bytes = build_setup_request_transfer(0x0001_0001, [10, 45, 0, 1], 1, 9, 8).unwrap();
+        assert_eq!(
+            bytes,
+            GNB_EXPECTED_SETUP_REQUEST.to_vec(),
+            "smfd SetupRequestTransfer must be byte-identical to the gNB decoder vector"
+        );
+    }
+
+    #[test]
+    fn setup_request_transfer_self_roundtrips() {
+        use ogs_ngap::transfer::{
+            PduSessionResourceSetupRequestTransfer, UpTransportLayerInformation,
+        };
+        let bytes = build_setup_request_transfer(0x0001_0001, [10, 45, 0, 1], 1, 9, 8).unwrap();
+        let t = PduSessionResourceSetupRequestTransfer::decode(&bytes).expect("decode");
+        let UpTransportLayerInformation::GtpTunnel(tun) = &t.ul_ngu_up_tnl_information;
+        assert_eq!(u32::from_be_bytes(tun.gtp_teid), 0x0001_0001);
+        assert_eq!(tun.transport_layer_address.octets, vec![10, 45, 0, 1]);
+        assert_eq!(t.qos_flow_setup_request_list.len(), 1);
+        assert_eq!(t.qos_flow_setup_request_list[0].qos_flow_identifier, 1);
+    }
+
+    /// The gNB (nextgsim-ngap) produces this SetupResponseTransfer for gNB DL
+    /// F-TEID 0x00020002 / 10.46.0.1 / QFI 1 (pinned in the gNB test
+    /// capture_tests.rs::gnb_setup_response_transfer_roundtrips). smfd must
+    /// decode it to extract the gNB DL F-TEID for the PFCP DL FAR.
+    const GNB_SETUP_RESPONSE_TRANSFER: [u8; 13] = [
+        0x00, 0x03, 0xe0, 0x0a, 0x2e, 0x00, 0x01, 0x00, 0x02, 0x00, 0x02, 0x00, 0x01,
+    ];
+
+    #[test]
+    fn gnb_setup_response_transfer_decodes_in_smfd() {
+        let (teid, addr, qfi) =
+            decode_setup_response_dl_endpoint(&GNB_SETUP_RESPONSE_TRANSFER).expect("smfd decodes");
+        assert_eq!(teid, 0x0002_0002);
+        assert_eq!(addr, [10, 46, 0, 1]);
+        assert_eq!(qfi, 1);
     }
 }

@@ -170,7 +170,7 @@ pub fn decode_time_to_wait(field: &ProtocolIeField) -> NgapResult<TimeToWait> {
 }
 
 // ============================================================================
-// AMFName IE (PrintableString, encoded as unconstrained OCTET STRING)
+// AMFName IE (PrintableString SIZE(1..150, ...))
 // ============================================================================
 
 /// IE ID for additional IDs not in the base types module
@@ -218,11 +218,60 @@ pub const IE_ID_PDU_SESSION_RESOURCE_SETUP_LIST_HO_REQ: u16 = 73;
 pub const IE_ID_PDU_SESSION_RESOURCE_ADMITTED_LIST: u16 = 53;
 pub const IE_ID_PDU_SESSION_RESOURCE_HANDOVER_LIST: u16 = 59;
 
+// AMFName / RANNodeName ::= PrintableString (SIZE(1..150, ...)) — TS 38.413 §9.3.3
+const NAME_SIZE_MIN: usize = 1;
+const NAME_SIZE_MAX: usize = 150;
+
+/// Encode an extensible constrained-size PrintableString (SIZE(1..150, ...))
+/// per X.691: size-extension bit, constrained length determinant over the
+/// root size range, octet alignment, then one octet per character.
+fn encode_printable_string_1_150(
+    encoder: &mut AperEncoder,
+    s: &str,
+    ie_name: &'static str,
+) -> NgapResult<()> {
+    let bytes = s.as_bytes();
+    if bytes.len() < NAME_SIZE_MIN || bytes.len() > NAME_SIZE_MAX {
+        return Err(crate::error::NgapError::InvalidIeValue {
+            ie_name,
+            reason: format!("length {} outside 1..150", bytes.len()),
+        });
+    }
+    // Size is extensible: write the extension bit (0 = within the root range)
+    encoder.write_bit(false);
+    // Constrained length determinant over the root size range [1..150]
+    encoder.encode_constrained_length(bytes.len(), NAME_SIZE_MIN, NAME_SIZE_MAX)?;
+    // Known-multiplier character string with ub > 2 octets: octet-aligned content
+    encoder.align();
+    encoder.write_bytes(bytes);
+    Ok(())
+}
+
+/// Decode an extensible constrained-size PrintableString (SIZE(1..150, ...)).
+fn decode_printable_string_1_150(
+    decoder: &mut AperDecoder,
+    ie_name: &'static str,
+) -> NgapResult<String> {
+    let extended = decoder.read_bit()?;
+    if extended {
+        return Err(crate::error::NgapError::InvalidIeValue {
+            ie_name,
+            reason: "size extension beyond 150 not supported".to_string(),
+        });
+    }
+    let len = decoder.decode_constrained_length(NAME_SIZE_MIN, NAME_SIZE_MAX)?;
+    decoder.align();
+    let bytes = decoder.read_bytes(len)?;
+    String::from_utf8(bytes).map_err(|e| crate::error::NgapError::InvalidIeValue {
+        ie_name,
+        reason: e.to_string(),
+    })
+}
+
 /// Encode AMF Name as a PrintableString IE
 pub fn encode_amf_name(container: &mut ProtocolIeContainer, name: &str) -> NgapResult<()> {
     let mut encoder = AperEncoder::new();
-    // PrintableString (1..150, ...) - encode as unconstrained for simplicity
-    encoder.encode_octet_string(name.as_bytes(), None, None)?;
+    encode_printable_string_1_150(&mut encoder, name, "AMFName")?;
     encoder.align();
     let value = encoder.into_bytes().to_vec();
     container.push(ProtocolIeField {
@@ -236,11 +285,7 @@ pub fn encode_amf_name(container: &mut ProtocolIeContainer, name: &str) -> NgapR
 /// Decode AMF Name from a raw IE field
 pub fn decode_amf_name(field: &ProtocolIeField) -> NgapResult<String> {
     let mut decoder = AperDecoder::new(&field.value);
-    let bytes = decoder.decode_octet_string(None, None)?;
-    String::from_utf8(bytes).map_err(|e| crate::error::NgapError::InvalidIeValue {
-        ie_name: "AMFName",
-        reason: e.to_string(),
-    })
+    decode_printable_string_1_150(&mut decoder, "AMFName")
 }
 
 // ============================================================================
@@ -338,7 +383,8 @@ pub fn encode_served_guami_list(
         encode_guami_inline(&mut encoder, &item.guami)?;
 
         if let Some(ref name) = item.backup_amf_name {
-            encoder.encode_octet_string(name.as_bytes(), None, None)?;
+            // BackupAMFName ::= AMFName (PrintableString SIZE(1..150, ...))
+            encode_printable_string_1_150(&mut encoder, name, "BackupAMFName")?;
         }
     }
     encoder.align();
@@ -393,7 +439,8 @@ pub fn encode_allowed_nssai(
         // AllowedNSSAI-Item SEQUENCE { s-NSSAI, iE-Extensions OPTIONAL }
         encoder.write_bit(false); // extension
         encoder.write_bit(false); // no iE-Extensions
-        encode_snssai_inline(&mut encoder, snssai)?;
+        // The only field is the bare S-NSSAI (no SliceSupportItem wrapper)
+        encode_snssai_only(&mut encoder, snssai)?;
     }
     encoder.align();
     container.push(ProtocolIeField {
@@ -414,11 +461,19 @@ pub fn encode_ue_security_capabilities(
     //   eUTRAencryptionAlgorithms, eUTRAintegrityProtectionAlgorithms, iE-Extensions OPTIONAL }
     encoder.write_bit(false); // extension
     encoder.write_bit(false); // no iE-Extensions
-                              // Each is BIT STRING (SIZE (16))
-    encoder.write_bits(caps.nr_encryption_algorithms as u64, 16);
-    encoder.write_bits(caps.nr_integrity_algorithms as u64, 16);
-    encoder.write_bits(caps.eutra_encryption_algorithms as u64, 16);
-    encoder.write_bits(caps.eutra_integrity_algorithms as u64, 16);
+                              // Each field is BIT STRING (SIZE(16, ...)) — extensible.
+                              // X.691 §16: a size-extensible BIT STRING prepends a
+                              // 1-bit extension marker (0 = within root size). The
+                              // root size range is fixed (16) so no length follows.
+    for value in [
+        caps.nr_encryption_algorithms,
+        caps.nr_integrity_algorithms,
+        caps.eutra_encryption_algorithms,
+        caps.eutra_integrity_algorithms,
+    ] {
+        encoder.write_bit(false); // BIT STRING size-extension marker
+        encoder.write_bits(value as u64, 16);
+    }
     encoder.align();
     container.push(ProtocolIeField {
         id: ProtocolIeId(IE_ID_UE_SECURITY_CAPABILITIES),
@@ -435,10 +490,15 @@ pub fn decode_ue_security_capabilities(
     let mut decoder = AperDecoder::new(&field.value);
     let _ext = decoder.read_bit()?;
     let _ie_ext_present = decoder.read_bit()?;
-    let nr_enc = decoder.read_bits(16)? as u16;
-    let nr_int = decoder.read_bits(16)? as u16;
-    let eutra_enc = decoder.read_bits(16)? as u16;
-    let eutra_int = decoder.read_bits(16)? as u16;
+    // Each field: BIT STRING (SIZE(16, ...)) extension marker, then 16 bits.
+    let mut read_algs = || -> NgapResult<u16> {
+        let _size_ext = decoder.read_bit()?;
+        Ok(decoder.read_bits(16)? as u16)
+    };
+    let nr_enc = read_algs()?;
+    let nr_int = read_algs()?;
+    let eutra_enc = read_algs()?;
+    let eutra_int = read_algs()?;
     Ok(UeSecurityCapabilities {
         nr_encryption_algorithms: nr_enc,
         nr_integrity_algorithms: nr_int,
@@ -474,15 +534,43 @@ pub fn decode_security_key(field: &ProtocolIeField) -> NgapResult<[u8; 32]> {
     Ok(key)
 }
 
+// BitRate ::= INTEGER (0..4000000000000, ...) — TS 38.413 §9.3.1.4
+const BIT_RATE_MAX: i64 = 4_000_000_000_000;
+
+/// Encode an extensible constrained INTEGER (X.691 §12): the extension marker
+/// bit (0 = value within the root range) followed by the constrained encoding.
+fn encode_ext_constrained_int(
+    encoder: &mut AperEncoder,
+    value: i64,
+    min: i64,
+    max: i64,
+) -> NgapResult<()> {
+    encoder.write_bit(false);
+    let constraint = ogs_asn1c::per::Constraint::new(min, max);
+    encoder.encode_constrained_whole_number(value, &constraint)?;
+    Ok(())
+}
+
+/// Decode an extensible constrained INTEGER.
+fn decode_ext_constrained_int(decoder: &mut AperDecoder, min: i64, max: i64) -> NgapResult<i64> {
+    let extended = decoder.read_bit()?;
+    if extended {
+        Ok(decoder.decode_unconstrained_whole_number()?)
+    } else {
+        let constraint = ogs_asn1c::per::Constraint::new(min, max);
+        Ok(decoder.decode_constrained_whole_number(&constraint)?)
+    }
+}
+
 /// Encode UE Aggregate Maximum Bit Rate IE
 pub fn encode_ue_ambr(container: &mut ProtocolIeContainer, ambr: &UeAmbrInfo) -> NgapResult<()> {
     let mut encoder = AperEncoder::new();
     // UEAggregateMaximumBitRate SEQUENCE { uEAggregateMaximumBitRateDL, uEAggregateMaximumBitRateUL, iE-Extensions OPTIONAL }
     encoder.write_bit(false); // extension
     encoder.write_bit(false); // no iE-Extensions
-                              // BitRate ::= INTEGER (0..4000000000000, ...) - encoded as unconstrained
-    encoder.encode_unconstrained_whole_number(ambr.dl as i64)?;
-    encoder.encode_unconstrained_whole_number(ambr.ul as i64)?;
+                              // BitRate ::= INTEGER (0..4000000000000, ...) — extensible constrained
+    encode_ext_constrained_int(&mut encoder, ambr.dl as i64, 0, BIT_RATE_MAX)?;
+    encode_ext_constrained_int(&mut encoder, ambr.ul as i64, 0, BIT_RATE_MAX)?;
     encoder.align();
     container.push(ProtocolIeField {
         id: ProtocolIeId(IE_ID_UE_AGGREGATE_MAXIMUM_BIT_RATE),
@@ -497,8 +585,8 @@ pub fn decode_ue_ambr(field: &ProtocolIeField) -> NgapResult<UeAmbrInfo> {
     let mut decoder = AperDecoder::new(&field.value);
     let _ext = decoder.read_bit()?;
     let _ie_ext = decoder.read_bit()?;
-    let dl = decoder.decode_unconstrained_whole_number()? as u64;
-    let ul = decoder.decode_unconstrained_whole_number()? as u64;
+    let dl = decode_ext_constrained_int(&mut decoder, 0, BIT_RATE_MAX)? as u64;
+    let ul = decode_ext_constrained_int(&mut decoder, 0, BIT_RATE_MAX)? as u64;
     Ok(UeAmbrInfo { dl, ul })
 }
 
@@ -597,7 +685,7 @@ pub fn decode_global_ran_node_id(field: &ProtocolIeField) -> NgapResult<GlobalRa
 /// Encode RAN Node Name IE
 pub fn encode_ran_node_name(container: &mut ProtocolIeContainer, name: &str) -> NgapResult<()> {
     let mut encoder = AperEncoder::new();
-    encoder.encode_octet_string(name.as_bytes(), None, None)?;
+    encode_printable_string_1_150(&mut encoder, name, "RANNodeName")?;
     encoder.align();
     container.push(ProtocolIeField {
         id: ProtocolIeId(IE_ID_RAN_NODE_NAME),
@@ -610,11 +698,7 @@ pub fn encode_ran_node_name(container: &mut ProtocolIeContainer, name: &str) -> 
 /// Decode RAN Node Name from IE field
 pub fn decode_ran_node_name(field: &ProtocolIeField) -> NgapResult<String> {
     let mut decoder = AperDecoder::new(&field.value);
-    let bytes = decoder.decode_octet_string(None, None)?;
-    String::from_utf8(bytes).map_err(|e| crate::error::NgapError::InvalidIeValue {
-        ie_name: "RANNodeName",
-        reason: e.to_string(),
-    })
+    decode_printable_string_1_150(&mut decoder, "RANNodeName")
 }
 
 /// Encode Supported TA List IE
@@ -940,12 +1024,12 @@ fn encode_guami_inline(encoder: &mut AperEncoder, guami: &Guami) -> NgapResult<(
     Ok(())
 }
 
-/// Encode S-NSSAI inline
-fn encode_snssai_inline(encoder: &mut AperEncoder, snssai: &SNssai) -> NgapResult<()> {
-    // SliceSupportItem SEQUENCE { s-NSSAI, iE-Extensions OPTIONAL }
-    encoder.write_bit(false); // extension for SliceSupportItem
-    encoder.write_bit(false); // no iE-Extensions for SliceSupportItem
-                              // S-NSSAI SEQUENCE { sST, sD OPTIONAL, iE-Extensions OPTIONAL }
+/// Encode a bare S-NSSAI SEQUENCE { sST, sD OPTIONAL, iE-Extensions OPTIONAL }.
+///
+/// This is the S-NSSAI itself, WITHOUT any enclosing list-item preamble. Used
+/// directly by AllowedNSSAI-Item (whose only field is the s-NSSAI) and via
+/// `encode_snssai_inline` for SliceSupportItem (which adds its own preamble).
+fn encode_snssai_only(encoder: &mut AperEncoder, snssai: &SNssai) -> NgapResult<()> {
     encoder.write_bit(false); // extension
     encoder.write_bit(snssai.sd.is_some()); // SD present
     encoder.write_bit(false); // no iE-Extensions
@@ -958,12 +1042,8 @@ fn encode_snssai_inline(encoder: &mut AperEncoder, snssai: &SNssai) -> NgapResul
     Ok(())
 }
 
-/// Decode S-NSSAI inline (from within a SliceSupportItem)
-fn decode_snssai_inline(decoder: &mut AperDecoder) -> NgapResult<SNssai> {
-    // SliceSupportItem
-    let _ext = decoder.read_bit()?;
-    let _ie_ext = decoder.read_bit()?;
-    // S-NSSAI
+/// Decode a bare S-NSSAI SEQUENCE (no enclosing list-item preamble).
+fn decode_snssai_only(decoder: &mut AperDecoder) -> NgapResult<SNssai> {
     let _snssai_ext = decoder.read_bit()?;
     let sd_present = decoder.read_bit()?;
     let _snssai_ie_ext = decoder.read_bit()?;
@@ -978,6 +1058,22 @@ fn decode_snssai_inline(decoder: &mut AperDecoder) -> NgapResult<SNssai> {
         None
     };
     Ok(SNssai { sst, sd })
+}
+
+/// Encode S-NSSAI inside a SliceSupportItem (SEQUENCE { s-NSSAI, iE-Ext OPT }).
+fn encode_snssai_inline(encoder: &mut AperEncoder, snssai: &SNssai) -> NgapResult<()> {
+    // SliceSupportItem SEQUENCE { s-NSSAI, iE-Extensions OPTIONAL }
+    encoder.write_bit(false); // extension for SliceSupportItem
+    encoder.write_bit(false); // no iE-Extensions for SliceSupportItem
+    encode_snssai_only(encoder, snssai)
+}
+
+/// Decode S-NSSAI from within a SliceSupportItem.
+fn decode_snssai_inline(decoder: &mut AperDecoder) -> NgapResult<SNssai> {
+    // SliceSupportItem
+    let _ext = decoder.read_bit()?;
+    let _ie_ext = decoder.read_bit()?;
+    decode_snssai_only(decoder)
 }
 
 // ============================================================================
@@ -2090,7 +2186,8 @@ pub fn encode_unavailable_guami_list(
             encoder.encode_enumerated(0, &constraint)?;
         }
         if let Some(ref name) = item.backup_amf_name {
-            encoder.encode_octet_string(name.as_bytes(), None, None)?;
+            // BackupAMFName ::= AMFName (PrintableString SIZE(1..150, ...))
+            encode_printable_string_1_150(&mut encoder, name, "BackupAMFName")?;
         }
     }
     encoder.align();
@@ -2120,13 +2217,7 @@ pub fn decode_unavailable_guami_list(
             let _timer = decoder.decode_enumerated(&constraint)?;
         }
         let backup_amf_name = if backup_present {
-            let bytes = decoder.decode_octet_string(None, None)?;
-            Some(String::from_utf8(bytes).map_err(|e| {
-                crate::error::NgapError::InvalidIeValue {
-                    ie_name: "BackupAMFName",
-                    reason: e.to_string(),
-                }
-            })?)
+            Some(decode_printable_string_1_150(&mut decoder, "BackupAMFName")?)
         } else {
             None
         };
@@ -2172,13 +2263,7 @@ pub fn decode_served_guami_list(field: &ProtocolIeField) -> NgapResult<Vec<Serve
         let _ie_ext = decoder.read_bit()?;
         let guami = decode_guami_inline(&mut decoder)?;
         let backup_amf_name = if backup_present {
-            let bytes = decoder.decode_octet_string(None, None)?;
-            Some(String::from_utf8(bytes).map_err(|e| {
-                crate::error::NgapError::InvalidIeValue {
-                    ie_name: "BackupAMFName",
-                    reason: e.to_string(),
-                }
-            })?)
+            Some(decode_printable_string_1_150(&mut decoder, "BackupAMFName")?)
         } else {
             None
         };
@@ -2223,7 +2308,8 @@ pub fn decode_allowed_nssai(field: &ProtocolIeField) -> NgapResult<Vec<SNssai>> 
         // AllowedNSSAI-Item SEQUENCE { s-NSSAI, iE-Extensions OPTIONAL }
         let _item_ext = decoder.read_bit()?;
         let _item_ie_ext = decoder.read_bit()?;
-        result.push(decode_snssai_inline(&mut decoder)?);
+        // The only field is the bare S-NSSAI (no SliceSupportItem wrapper)
+        result.push(decode_snssai_only(&mut decoder)?);
     }
     Ok(result)
 }
