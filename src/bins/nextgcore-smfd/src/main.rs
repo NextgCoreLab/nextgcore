@@ -1046,6 +1046,9 @@ async fn pfcp_session_establish(
             qer_id: xr_qer_id,
             gate_status: (0, 0),
             mbr: Some((qos.ambr_ul_bps, qos.ambr_dl_bps)),
+            // GBR set marks this as a delay-critical guaranteed-rate (XR) flow;
+            // the UPF recognizes XR from the GBR (the XR 5QI 82-85 cannot
+            // survive the 6-bit PFCP QFI, so GBR is the wire-stable signal).
             gbr: Some((xr.gbr_ul_bps, xr.gbr_dl_bps)),
             qfi: Some(xr.five_qi & 0x3F),
         };
@@ -1745,6 +1748,13 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
             }
         }
     };
+
+    // ---- XR DNN → XR 5QI upgrade (Rel-18, TS 23.501 §5.7.4) ----
+    // The DNN is the only XR signal a standard UE conveys at establishment, so
+    // apply the XR delay-critical GBR 5QI here for an XR DNN regardless of the
+    // policy source. Idempotent for the config-default path (already XR) and a
+    // no-op for non-XR DNNs; it upgrades a PCF decision that doesn't model XR.
+    decision.ensure_xr_for_dnn(&dnn);
 
     // ---- RedCap session-AMBR reduction (Rel-17, TS 23.501 §5.7.1) ----
     // A RedCap UE's narrowband RF cannot sustain a normal-UE session-AMBR, so

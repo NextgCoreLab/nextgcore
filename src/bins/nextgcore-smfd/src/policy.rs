@@ -111,21 +111,41 @@ impl PolicyDecision {
     /// the DNN is the only XR signal a standard UE conveys at establishment.
     pub fn config_default_for_dnn(dnn: &str) -> Self {
         let mut dec = Self::config_default();
-        if let Some(five_qi) = xr_5qi_for_dnn(dnn) {
-            // XR is delay-critical GBR: provision a GBR equal to a fraction of
-            // the session AMBR so the UPF installs guaranteed-rate buckets and
-            // never starves the XR flow.
-            let gbr_dl = dec.sess_ambr_dl_bps / 2;
-            let gbr_ul = dec.sess_ambr_ul_bps / 4;
-            dec.def_five_qi = five_qi;
-            // XR flows get a higher ARP priority than the best-effort default.
-            dec.arp_priority_level = 4;
-            dec.pcc_rules.push(PccRule {
-                id: format!("xr-default-{five_qi}"),
+        dec.ensure_xr_for_dnn(dnn);
+        dec
+    }
+
+    /// Upgrade this decision to the XR delay-critical GBR 5QI (82-85) when the
+    /// DNN names an XR service and the decision does not already carry it.
+    ///
+    /// The DNN is the only XR signal a standard UE conveys at session
+    /// establishment, so the SMF owns this mapping regardless of whether the
+    /// authorized policy came from the config-default path or from a PCF (which
+    /// may not model XR DNNs). Idempotent: a no-op for a non-XR DNN or when the
+    /// decision already carries the matching XR 5QI.
+    pub fn ensure_xr_for_dnn(&mut self, dnn: &str) {
+        let Some(five_qi) = xr_5qi_for_dnn(dnn) else {
+            return;
+        };
+        if self.def_five_qi == five_qi {
+            return;
+        }
+        // XR is delay-critical GBR: provision a GBR equal to a fraction of the
+        // session AMBR so the UPF installs guaranteed-rate buckets and never
+        // starves the XR flow.
+        let gbr_dl = self.sess_ambr_dl_bps / 2;
+        let gbr_ul = self.sess_ambr_ul_bps / 4;
+        self.def_five_qi = five_qi;
+        // XR flows get a higher ARP priority than the best-effort default.
+        self.arp_priority_level = 4;
+        let rule_id = format!("xr-default-{five_qi}");
+        if !self.pcc_rules.iter().any(|r| r.id == rule_id) {
+            self.pcc_rules.push(PccRule {
+                id: rule_id,
                 precedence: 10,
                 five_qi,
-                mbr_ul_bps: Some(dec.sess_ambr_ul_bps),
-                mbr_dl_bps: Some(dec.sess_ambr_dl_bps),
+                mbr_ul_bps: Some(self.sess_ambr_ul_bps),
+                mbr_dl_bps: Some(self.sess_ambr_dl_bps),
                 gbr_ul_bps: Some(gbr_ul),
                 gbr_dl_bps: Some(gbr_dl),
                 flow_descriptions: vec!["permit out ip from any to assigned".to_string()],
@@ -133,7 +153,6 @@ impl PolicyDecision {
                 has_charging: false,
             });
         }
-        dec
     }
 
     /// Default QFI: for the default non-GBR rule the QFI equals the 5QI

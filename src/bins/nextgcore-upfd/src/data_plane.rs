@@ -751,7 +751,14 @@ impl DataPlaneQer {
     pub fn set_qfi(&mut self, qfi: u8) {
         self.qfi = Some(qfi);
         self.dscp = qfi_to_dscp(qfi);
-        self.is_xr = is_xr_5qi(qfi);
+        // XR / delay-critical GBR flow: either the QFI maps to an XR 5QI (82-85)
+        // or — since the XR 5QI cannot survive the 6-bit PFCP QFI field — the
+        // QER carries a guaranteed bit rate. GBR presence is the wire-stable
+        // signal that this flow needs guaranteed buckets + priority DSCP.
+        self.is_xr = is_xr_5qi(qfi) || self.ul_gbr > 0 || self.dl_gbr > 0;
+        if self.is_xr && self.dscp == 0 {
+            self.dscp = 46; // EF (expedited forwarding) for delay-critical GBR
+        }
     }
 
     /// Set MBR (kbps) and arm the policing token buckets.

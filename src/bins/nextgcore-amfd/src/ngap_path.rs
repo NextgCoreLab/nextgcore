@@ -923,6 +923,7 @@ impl NgapServer {
                 ul_nas.amf_ue_ngap_id,
                 ul_nas.ran_ue_ngap_id,
                 &ul_nas.nas_pdu,
+                None,
             )
             .await?;
             return Ok(());
@@ -1363,6 +1364,20 @@ impl NgapServer {
                          lat=[{min_lat},{max_lat}] lon=[{min_lon},{max_lon}] alt=[{min_alt},{max_alt}]"
                     );
                     state.amf_ue.uav_auth = Some(uav);
+                }
+
+                // RedCap (Rel-17, TS 38.101): a reduced-capability UE gets a
+                // capped UE-AMBR, and the indication is propagated to the SMF on
+                // the N11 SM Context Create so the session-AMBR is reduced too.
+                if req.redcap_indication {
+                    state.amf_ue.redcap_indication = true;
+                    if state.amf_ue.ue_ambr.downlink > 150_000_000 {
+                        state.amf_ue.ue_ambr.downlink = 150_000_000; // 150 Mbps DL
+                    }
+                    if state.amf_ue.ue_ambr.uplink > 50_000_000 {
+                        state.amf_ue.ue_ambr.uplink = 50_000_000; // 50 Mbps UL
+                    }
+                    log::info!("UE indicates RedCap (Reduced Capability) device");
                 }
 
                 self.start_authentication(association_id, amf_ue_ngap_id, ran_ue_ngap_id, None)
@@ -2255,6 +2270,7 @@ impl NgapServer {
 
         // Optional IEs after the container: PDU session ID (IEI 0x12, TV)
         let mut psi: Option<u8> = None;
+        let mut dnn_value: Option<String> = None;
         let mut pos = 6 + container_len;
         while pos < nas.len() {
             match nas[pos] {
@@ -2268,8 +2284,14 @@ impl NgapServer {
                     pos += 2 + nas[pos + 1] as usize;
                 }
                 0x25 if pos + 1 < nas.len() => {
-                    // DNN (TLV)
-                    pos += 2 + nas[pos + 1] as usize;
+                    // DNN (TLV, TS 24.501 9.11.2.1A): length-prefixed labels.
+                    // Capture it so the requested DNN (e.g. "xr") reaches the
+                    // SMF instead of being forced to "internet" below.
+                    let l = nas[pos + 1] as usize;
+                    if pos + 2 + l <= nas.len() {
+                        dnn_value = decode_dnn_labels(&nas[pos + 2..pos + 2 + l]);
+                    }
+                    pos += 2 + l;
                 }
                 b if b & 0x80 != 0 => pos += 1, // type-1 TV (e.g. request type 0x8-)
                 _ => break,
@@ -2294,8 +2316,14 @@ impl NgapServer {
 
         match action {
             Ok(crate::gmm_handler::UlTransportAction::RouteToSmf { .. }) => {
-                self.handle_5gsm_message(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &container)
-                    .await?;
+                self.handle_5gsm_message(
+                    association_id,
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id,
+                    &container,
+                    dnn_value.as_deref(),
+                )
+                .await?;
             }
             Ok(crate::gmm_handler::UlTransportAction::PayloadNotForwarded) => {
                 // DL NAS TRANSPORT with the original payload + cause #90
@@ -2333,6 +2361,7 @@ impl NgapServer {
         amf_ue_ngap_id: u64,
         ran_ue_ngap_id: u32,
         sm_pdu: &[u8],
+        dnn_override: Option<&str>,
     ) -> Result<()> {
         if sm_pdu.len() < 4 {
             return Ok(());
@@ -2359,7 +2388,10 @@ impl NgapServer {
                     .get(&amf_ue_ngap_id)
                     .and_then(|s| s.amf_ue.allowed_nssai.first().map(|n| (n.sst, n.sd)))
                     .unwrap_or((1, None));
-                let dnn = "internet";
+                // DNN from the UE's UL NAS Transport DNN IE (e.g. "xr" for an
+                // XR session); fall back to "internet" for the legacy raw-5GSM
+                // path or when the UE omits the IE.
+                let dnn = dnn_override.unwrap_or("internet");
 
                 // RedCap indication: propagate the UE's Reduced-Capability
                 // status (parsed at registration in gmm_handler) to the SMF so
@@ -3103,6 +3135,10 @@ struct ParsedRegistrationRequest {
     /// authorization (geofence) context. The string is the UAV CAA-level ID
     /// (may be empty when only the aerial-UE capability is signalled).
     uav_indication: Option<String>,
+    /// RedCap (Reduced Capability) indication (Rel-17, TS 38.101). Set when the
+    /// UE signals a reduced-capability device (NAS IEI 0xA9) so the AMF caps
+    /// UE-AMBR and forwards the indication to the SMF for a reduced session-AMBR.
+    redcap_indication: bool,
 }
 
 /// SNPN allowed-NID list for this AMF (Rel-17, TS 23.501 §5.30).
@@ -3111,6 +3147,27 @@ struct ParsedRegistrationRequest {
 /// NIDs. Empty/unset means no NID restriction (accept any SNPN NID), matching
 /// `AmfUe::validate_nid`'s empty-list semantics. Sourcing from an env var keeps
 /// the SNPN gate modular and consistent with the AMF's other runtime config.
+/// Decode a DNN IE value (TS 24.501 9.11.2.1A / TS 23.003): a sequence of
+/// labels each prefixed by a 1-byte length, joined with '.'. Returns None for
+/// an empty/malformed value so the caller falls back to the default DNN.
+fn decode_dnn_labels(bytes: &[u8]) -> Option<String> {
+    let mut labels = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let len = bytes[i] as usize;
+        if len == 0 || i + 1 + len > bytes.len() {
+            break;
+        }
+        labels.push(String::from_utf8_lossy(&bytes[i + 1..i + 1 + len]).to_string());
+        i += 1 + len;
+    }
+    if labels.is_empty() {
+        None
+    } else {
+        Some(labels.join("."))
+    }
+}
+
 fn snpn_allowed_nids() -> Vec<String> {
     std::env::var("AMF_SNPN_ALLOWED_NIDS")
         .ok()
@@ -3272,6 +3329,19 @@ fn parse_registration_request_pdu(nas: &[u8]) -> Option<ParsedRegistrationReques
                         .unwrap_or("")
                         .to_string();
                     req.uav_indication = Some(caa_id);
+                }
+                pos += 2 + len;
+            }
+            // RedCap indication (IEI 0xA9, TLV): Rel-17, TS 38.101. A single
+            // value octet whose bit 0 marks a reduced-capability device. Parse
+            // before the generic Type-1 arm.
+            0xA9 => {
+                if pos + 1 >= nas.len() {
+                    break;
+                }
+                let len = nas[pos + 1] as usize;
+                if len >= 1 && pos + 2 + len <= nas.len() {
+                    req.redcap_indication = nas[pos + 2] & 0x01 == 0x01;
                 }
                 pos += 2 + len;
             }

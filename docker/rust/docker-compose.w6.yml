@@ -1,0 +1,25 @@
+# W6 feature-test overlay for docker-compose.yml.
+#
+# Used by w6-feature-test.sh on top of the baseline stack:
+#   docker compose -f docker-compose.yml -f docker-compose.w6.yml ...
+#
+# It parameterizes the UE/gNB config file (so each scenario can run a different
+# feature config under config/w6/) and exposes the AMF SNPN/UAV knobs. All
+# values come from environment variables the test script exports per scenario;
+# every one has a default so plain `up` still behaves like the baseline.
+#
+#   W6_UE_CONFIG          UE config filename under /etc/nextgsim/w6/ (default ue.yaml in parent)
+#   W6_GNB_CONFIG         absolute in-container gNB config path (default baseline)
+#   AMF_SNPN_ALLOWED_NIDS comma-separated served NIDs ("" = accept any)
+#   AMF_UAV_GEOFENCE      "min_lat,max_lat,min_lon,max_lon,min_alt,max_alt" ("" = default 0-120m box)
+services:
+  gnb:
+    command: ["-c", "${W6_GNB_CONFIG:-/etc/nextgsim/gnb.yaml}"]
+
+  ue:
+    command: ["-c", "${W6_UE_CONFIG:-/etc/nextgsim/ue.yaml}"]
+
+  amf:
+    environment:
+      AMF_SNPN_ALLOWED_NIDS: "${AMF_SNPN_ALLOWED_NIDS:-}"
+      AMF_UAV_GEOFENCE: "${AMF_UAV_GEOFENCE:-}"
