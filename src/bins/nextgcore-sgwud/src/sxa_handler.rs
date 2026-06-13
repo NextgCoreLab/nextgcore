@@ -847,6 +847,15 @@ mod tests {
     #[test]
     fn test_handle_session_modification_request_ok() {
         let sess = create_test_sess();
+        // Install the FAR the request updates. sgwu_self() is a process-global
+        // shared across tests, so set up our own state rather than relying on
+        // another test having created FAR (sess 1, id 1) — that ordering
+        // dependency made this test pass or fail by test-execution order.
+        sgwu_self().far_install(crate::context::SgwuFar {
+            sess_id: sess.id,
+            far_id: 1,
+            ..Default::default()
+        });
         let req = SessionModificationRequest {
             update_fars: vec![UpdateFarRequest {
                 far_id: 1,
