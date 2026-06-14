@@ -19,6 +19,7 @@ ogs-app = { workspace = true }
 ogs-metrics = { workspace = true }
 bytes.workspace = true
 log.workspace = true
+rand = { workspace = true }
 env_logger.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

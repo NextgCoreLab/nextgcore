@@ -134,6 +134,12 @@ pub mod avp {
     pub const FEATURE_LIST: u32 = 630;
     /// 3GPP-Charging-Characteristics
     pub const CHARGING_CHARACTERISTICS: u32 = 13;
+    /// PUR-Flags
+    pub const PUR_FLAGS: u32 = 1635;
+    /// Item-Number (3GPP TS 29.272, orders E-UTRAN-Vectors)
+    pub const ITEM_NUMBER: u32 = 1419;
+    /// Service-Selection (RFC 5778, no vendor)
+    pub const SERVICE_SELECTION: u32 = 493;
 }
 
 /// ULR Flags
@@ -198,6 +204,26 @@ pub mod pua_flags {
     pub const FREEZE_MTMSI: u32 = 1;
     /// Freeze-P-TMSI
     pub const FREEZE_PTMSI: u32 = 1 << 1;
+}
+
+/// PUR Flags (TS 29.272 7.3.149)
+pub mod pur_flags {
+    /// UE-Purged-In-MME
+    pub const UE_PURGED_IN_MME: u32 = 1;
+    /// UE-Purged-In-SGSN
+    pub const UE_PURGED_IN_SGSN: u32 = 1 << 1;
+}
+
+/// PDN-Type values (TS 29.272 7.3.62)
+pub mod pdn_type {
+    /// IPv4 only
+    pub const IPV4: u32 = 0;
+    /// IPv6 only
+    pub const IPV6: u32 = 1;
+    /// IPv4v6 dual-stack
+    pub const IPV4V6: u32 = 2;
+    /// IPv4 or IPv6
+    pub const IPV4_OR_IPV6: u32 = 3;
 }
 
 /// Cancellation Type values
@@ -493,12 +519,14 @@ pub fn create_ulr(
     msg
 }
 
-/// Parse E-UTRAN vector from grouped AVP
+/// Parse E-UTRAN vector from grouped AVP.
+///
+/// Works on both in-memory grouped AVPs and wire-decoded AVPs (raw payload).
 pub fn parse_e_utran_vector(avp: &Avp) -> DiameterResult<EUtranVector> {
     let mut vector = EUtranVector::default();
 
-    if let Some(grouped) = avp.as_grouped() {
-        for inner in grouped {
+    if let Ok(grouped) = avp.parse_grouped() {
+        for inner in &grouped {
             match inner.code {
                 avp::RAND => {
                     if let Some(data) = inner.as_octet_string() {
@@ -534,6 +562,550 @@ pub fn parse_e_utran_vector(avp: &Avp) -> DiameterResult<EUtranVector> {
     Ok(vector)
 }
 
+/// Build an E-UTRAN-Vector grouped AVP from an authentication vector.
+///
+/// Per TS 29.272 7.3.18: Item-Number is included when more than one vector
+/// is carried so the MME can order them.
+pub fn build_e_utran_vector_avp(item_number: Option<u32>, v: &EUtranVector) -> Avp {
+    let mut group = Vec::with_capacity(5);
+    if let Some(n) = item_number {
+        group.push(Avp::vendor_mandatory(
+            avp::ITEM_NUMBER,
+            OGS_3GPP_VENDOR_ID,
+            AvpData::Unsigned32(n),
+        ));
+    }
+    group.push(Avp::vendor_mandatory(
+        avp::RAND,
+        OGS_3GPP_VENDOR_ID,
+        AvpData::OctetString(Bytes::copy_from_slice(&v.rand)),
+    ));
+    group.push(Avp::vendor_mandatory(
+        avp::XRES,
+        OGS_3GPP_VENDOR_ID,
+        AvpData::OctetString(Bytes::copy_from_slice(&v.xres)),
+    ));
+    group.push(Avp::vendor_mandatory(
+        avp::AUTN,
+        OGS_3GPP_VENDOR_ID,
+        AvpData::OctetString(Bytes::copy_from_slice(&v.autn)),
+    ));
+    group.push(Avp::vendor_mandatory(
+        avp::KASME,
+        OGS_3GPP_VENDOR_ID,
+        AvpData::OctetString(Bytes::copy_from_slice(&v.kasme)),
+    ));
+    Avp::vendor_mandatory(
+        avp::E_UTRAN_VECTOR,
+        OGS_3GPP_VENDOR_ID,
+        AvpData::Grouped(group),
+    )
+}
+
+/// Parse all E-UTRAN-Vectors from the Authentication-Info AVP of an AIA.
+pub fn parse_authentication_info(msg: &DiameterMessage) -> Vec<EUtranVector> {
+    let mut vectors = Vec::new();
+    if let Some(auth_info) = msg.find_avp(avp::AUTHENTICATION_INFO) {
+        if let Ok(group) = auth_info.parse_grouped() {
+            for inner in &group {
+                if inner.code == avp::E_UTRAN_VECTOR {
+                    if let Ok(v) = parse_e_utran_vector(inner) {
+                        vectors.push(v);
+                    }
+                }
+            }
+        }
+    }
+    vectors
+}
+
+// ============================================================================
+// Re-Synchronization-Info helpers (TS 29.272 7.3.15)
+// ============================================================================
+
+/// Insert Re-Synchronization-Info (RAND || AUTS, 30 octets) inside the
+/// Requested-EUTRAN-Authentication-Info grouped AVP of an AIR.
+///
+/// Per TS 29.272 7.3.11, Re-Synchronization-Info is a member of
+/// Requested-EUTRAN-Authentication-Info, NOT a top-level AVP.
+///
+/// Returns `false` if the AIR has no Requested-EUTRAN-Authentication-Info AVP.
+pub fn add_resync_info(msg: &mut DiameterMessage, rand: &[u8; 16], auts: &[u8; 14]) -> bool {
+    let Some(req) = msg
+        .avps
+        .iter_mut()
+        .find(|a| a.code == avp::REQ_EUTRAN_AUTH_INFO)
+    else {
+        return false;
+    };
+    let Ok(mut group) = req.parse_grouped() else {
+        return false;
+    };
+    let mut payload = Vec::with_capacity(30);
+    payload.extend_from_slice(rand);
+    payload.extend_from_slice(auts);
+    group.push(Avp::vendor_mandatory(
+        avp::RE_SYNC_INFO,
+        OGS_3GPP_VENDOR_ID,
+        AvpData::OctetString(Bytes::from(payload)),
+    ));
+    req.data = AvpData::Grouped(group);
+    true
+}
+
+/// Extract Re-Synchronization-Info (RAND, AUTS) from inside the
+/// Requested-EUTRAN-Authentication-Info grouped AVP of an AIR.
+pub fn find_resync_info(msg: &DiameterMessage) -> Option<([u8; 16], [u8; 14])> {
+    let req = msg.find_avp(avp::REQ_EUTRAN_AUTH_INFO)?;
+    let group = req.parse_grouped().ok()?;
+    let resync = crate::avp::find_avp(&group, avp::RE_SYNC_INFO)?;
+    let data = resync.as_octet_string()?;
+    if data.len() != 30 {
+        return None;
+    }
+    let mut rand = [0u8; 16];
+    let mut auts = [0u8; 14];
+    rand.copy_from_slice(&data[..16]);
+    auts.copy_from_slice(&data[16..30]);
+    Some((rand, auts))
+}
+
+/// Extract Number-Of-Requested-Vectors from inside
+/// Requested-EUTRAN-Authentication-Info (TS 29.272 7.3.14).
+pub fn find_num_requested_vectors(msg: &DiameterMessage) -> Option<u32> {
+    let req = msg.find_avp(avp::REQ_EUTRAN_AUTH_INFO)?;
+    let group = req.parse_grouped().ok()?;
+    crate::avp::find_avp(&group, avp::NUM_REQUESTED_VECTORS).and_then(|a| a.as_u32())
+}
+
+// ============================================================================
+// Experimental-Result helpers (RFC 6733 7.6 / TS 29.272 7.4)
+// ============================================================================
+
+/// Build an Experimental-Result grouped AVP carrying a 3GPP result code.
+pub fn experimental_result_avp(code: u32) -> Avp {
+    Avp::mandatory(
+        avp_code::EXPERIMENTAL_RESULT,
+        AvpData::Grouped(vec![
+            Avp::mandatory(avp_code::VENDOR_ID, AvpData::Unsigned32(OGS_3GPP_VENDOR_ID)),
+            Avp::mandatory(
+                avp_code::EXPERIMENTAL_RESULT_CODE,
+                AvpData::Unsigned32(code),
+            ),
+        ]),
+    )
+}
+
+/// Extract the Experimental-Result-Code from a message (works on wire-decoded
+/// messages where the grouped payload is raw bytes).
+pub fn experimental_result_code(msg: &DiameterMessage) -> Option<u32> {
+    let exp = msg.find_avp(avp_code::EXPERIMENTAL_RESULT)?;
+    let group = exp.parse_grouped().ok()?;
+    crate::avp::find_avp(&group, avp_code::EXPERIMENTAL_RESULT_CODE).and_then(|a| a.as_u32())
+}
+
+// ============================================================================
+// Subscription-Data (TS 29.272 7.3.2)
+// ============================================================================
+
+/// EPS subscription data carried in the ULA/IDR Subscription-Data AVP.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubscriptionData {
+    /// MSISDN (TBCD-encoded)
+    pub msisdn: Vec<u8>,
+    /// A-MSISDN (TBCD-encoded)
+    pub a_msisdn: Vec<u8>,
+    /// Subscriber-Status (0 = SERVICE_GRANTED, 1 = OPERATOR_DETERMINED_BARRING)
+    pub subscriber_status: u32,
+    /// Operator-Determined-Barring bitmask (present when subscriber_status = 1)
+    pub operator_determined_barring: Option<u32>,
+    /// Access-Restriction-Data bitmask
+    pub access_restriction_data: Option<u32>,
+    /// Network-Access-Mode (0 = PACKET_AND_CIRCUIT, 2 = ONLY_PACKET)
+    pub network_access_mode: u32,
+    /// Subscribed-Periodic-RAU-TAU-Timer (seconds)
+    pub subscribed_rau_tau_timer: u32,
+    /// UE-AMBR uplink (bps)
+    pub ambr_uplink: u64,
+    /// UE-AMBR downlink (bps)
+    pub ambr_downlink: u64,
+    /// Default APN Context-Identifier
+    pub context_identifier: u32,
+    /// All-APN-Configurations-Included-Indicator
+    pub all_apn_configs_included: bool,
+    /// APN configurations
+    pub apn_configs: Vec<ApnConfiguration>,
+    /// 3GPP-Charging-Characteristics
+    pub charging_characteristics: Option<[u8; 2]>,
+}
+
+/// A single APN-Configuration (TS 29.272 7.3.35)
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApnConfiguration {
+    /// Context-Identifier
+    pub context_identifier: u32,
+    /// Service-Selection (APN name)
+    pub service_selection: String,
+    /// PDN-Type (Diameter encoding: 0=IPv4, 1=IPv6, 2=IPv4v6, 3=IPv4_OR_IPv6)
+    pub pdn_type: u8,
+    /// QoS-Class-Identifier
+    pub qci: u8,
+    /// ARP Priority-Level (1..15)
+    pub arp_priority_level: u8,
+    /// ARP Pre-emption-Capability (true = PRE-EMPTION_CAPABILITY_ENABLED = 0)
+    pub arp_pre_emption_capability: bool,
+    /// ARP Pre-emption-Vulnerability (true = PRE-EMPTION_VULNERABILITY_ENABLED = 0)
+    pub arp_pre_emption_vulnerability: bool,
+    /// APN-AMBR uplink (bps)
+    pub ambr_uplink: u64,
+    /// APN-AMBR downlink (bps)
+    pub ambr_downlink: u64,
+    /// 3GPP-Charging-Characteristics
+    pub charging_characteristics: Option<[u8; 2]>,
+}
+
+/// Build an AMBR grouped AVP (TS 29.272 7.3.41).
+///
+/// Max-Requested-Bandwidth-UL/DL (TS 29.214 5.3.14/5.3.15) are Unsigned32;
+/// rates above u32::MAX are clamped.
+pub fn build_ambr_avp(uplink_bps: u64, downlink_bps: u64) -> Avp {
+    Avp::vendor_mandatory(
+        avp::AMBR,
+        OGS_3GPP_VENDOR_ID,
+        AvpData::Grouped(vec![
+            Avp::vendor_mandatory(
+                avp::MAX_BANDWIDTH_UL,
+                OGS_3GPP_VENDOR_ID,
+                AvpData::Unsigned32(uplink_bps.min(u32::MAX as u64) as u32),
+            ),
+            Avp::vendor_mandatory(
+                avp::MAX_BANDWIDTH_DL,
+                OGS_3GPP_VENDOR_ID,
+                AvpData::Unsigned32(downlink_bps.min(u32::MAX as u64) as u32),
+            ),
+        ]),
+    )
+}
+
+/// Build an EPS-Subscribed-QoS-Profile grouped AVP (TS 29.272 7.3.37).
+pub fn build_eps_subscribed_qos_profile_avp(
+    qci: u8,
+    priority_level: u8,
+    pre_emption_capability: bool,
+    pre_emption_vulnerability: bool,
+) -> Avp {
+    // Pre-emption enums per TS 29.212: ENABLED = 0, DISABLED = 1
+    let pec = if pre_emption_capability { 0 } else { 1 };
+    let pev = if pre_emption_vulnerability { 0 } else { 1 };
+    Avp::vendor_mandatory(
+        avp::EPS_SUBSCRIBED_QOS_PROFILE,
+        OGS_3GPP_VENDOR_ID,
+        AvpData::Grouped(vec![
+            Avp::vendor_mandatory(
+                avp::QOS_CLASS_IDENTIFIER,
+                OGS_3GPP_VENDOR_ID,
+                AvpData::Enumerated(qci as i32),
+            ),
+            Avp::vendor_mandatory(
+                avp::ALLOCATION_RETENTION_PRIORITY,
+                OGS_3GPP_VENDOR_ID,
+                AvpData::Grouped(vec![
+                    Avp::vendor_mandatory(
+                        avp::PRIORITY_LEVEL,
+                        OGS_3GPP_VENDOR_ID,
+                        AvpData::Unsigned32(priority_level as u32),
+                    ),
+                    Avp::vendor_mandatory(
+                        avp::PRE_EMPTION_CAPABILITY,
+                        OGS_3GPP_VENDOR_ID,
+                        AvpData::Enumerated(pec),
+                    ),
+                    Avp::vendor_mandatory(
+                        avp::PRE_EMPTION_VULNERABILITY,
+                        OGS_3GPP_VENDOR_ID,
+                        AvpData::Enumerated(pev),
+                    ),
+                ]),
+            ),
+        ]),
+    )
+}
+
+/// Build a single APN-Configuration grouped AVP (TS 29.272 7.3.35).
+pub fn build_apn_configuration_avp(apn: &ApnConfiguration) -> Avp {
+    let mut group = vec![
+        Avp::vendor_mandatory(
+            avp::CONTEXT_IDENTIFIER,
+            OGS_3GPP_VENDOR_ID,
+            AvpData::Unsigned32(apn.context_identifier),
+        ),
+        Avp::vendor_mandatory(
+            avp::PDN_TYPE,
+            OGS_3GPP_VENDOR_ID,
+            AvpData::Enumerated(apn.pdn_type as i32),
+        ),
+        // Service-Selection is an IETF AVP (RFC 5778): no Vendor-Id
+        Avp::mandatory(
+            avp::SERVICE_SELECTION,
+            AvpData::Utf8String(apn.service_selection.clone()),
+        ),
+        build_eps_subscribed_qos_profile_avp(
+            apn.qci,
+            apn.arp_priority_level,
+            apn.arp_pre_emption_capability,
+            apn.arp_pre_emption_vulnerability,
+        ),
+        build_ambr_avp(apn.ambr_uplink, apn.ambr_downlink),
+    ];
+    if let Some(cc) = apn.charging_characteristics {
+        group.push(Avp::vendor_mandatory(
+            avp::CHARGING_CHARACTERISTICS,
+            OGS_3GPP_VENDOR_ID,
+            AvpData::OctetString(Bytes::copy_from_slice(&cc)),
+        ));
+    }
+    Avp::vendor_mandatory(
+        avp::APN_CONFIGURATION,
+        OGS_3GPP_VENDOR_ID,
+        AvpData::Grouped(group),
+    )
+}
+
+/// Build the Subscription-Data grouped AVP (TS 29.272 7.3.2) for ULA/IDR.
+pub fn build_subscription_data_avp(sub: &SubscriptionData) -> Avp {
+    let mut group: Vec<Avp> = Vec::new();
+
+    if !sub.msisdn.is_empty() {
+        group.push(Avp::vendor_mandatory(
+            avp::MSISDN,
+            OGS_3GPP_VENDOR_ID,
+            AvpData::OctetString(Bytes::copy_from_slice(&sub.msisdn)),
+        ));
+    }
+    if !sub.a_msisdn.is_empty() {
+        group.push(Avp::vendor_mandatory(
+            avp::A_MSISDN,
+            OGS_3GPP_VENDOR_ID,
+            AvpData::OctetString(Bytes::copy_from_slice(&sub.a_msisdn)),
+        ));
+    }
+    group.push(Avp::vendor_mandatory(
+        avp::SUBSCRIBER_STATUS,
+        OGS_3GPP_VENDOR_ID,
+        AvpData::Enumerated(sub.subscriber_status as i32),
+    ));
+    if let Some(odb) = sub.operator_determined_barring {
+        group.push(Avp::vendor_mandatory(
+            avp::OPERATOR_DETERMINED_BARRING,
+            OGS_3GPP_VENDOR_ID,
+            AvpData::Unsigned32(odb),
+        ));
+    }
+    if let Some(ard) = sub.access_restriction_data {
+        group.push(Avp::vendor_mandatory(
+            avp::ACCESS_RESTRICTION_DATA,
+            OGS_3GPP_VENDOR_ID,
+            AvpData::Unsigned32(ard),
+        ));
+    }
+    group.push(Avp::vendor_mandatory(
+        avp::NETWORK_ACCESS_MODE,
+        OGS_3GPP_VENDOR_ID,
+        AvpData::Enumerated(sub.network_access_mode as i32),
+    ));
+    if sub.subscribed_rau_tau_timer > 0 {
+        group.push(Avp::vendor_mandatory(
+            avp::SUBSCRIBED_RAU_TAU_TIMER,
+            OGS_3GPP_VENDOR_ID,
+            AvpData::Unsigned32(sub.subscribed_rau_tau_timer),
+        ));
+    }
+    group.push(build_ambr_avp(sub.ambr_uplink, sub.ambr_downlink));
+    if let Some(cc) = sub.charging_characteristics {
+        group.push(Avp::vendor_mandatory(
+            avp::CHARGING_CHARACTERISTICS,
+            OGS_3GPP_VENDOR_ID,
+            AvpData::OctetString(Bytes::copy_from_slice(&cc)),
+        ));
+    }
+
+    // APN-Configuration-Profile (TS 29.272 7.3.34)
+    if !sub.apn_configs.is_empty() {
+        let mut profile: Vec<Avp> = vec![
+            Avp::vendor_mandatory(
+                avp::CONTEXT_IDENTIFIER,
+                OGS_3GPP_VENDOR_ID,
+                AvpData::Unsigned32(sub.context_identifier),
+            ),
+            Avp::vendor_mandatory(
+                avp::ALL_APN_CONFIG_INC_IND,
+                OGS_3GPP_VENDOR_ID,
+                // 0 = All_APN_CONFIGURATIONS_INCLUDED, 1 = MODIFIED/ADDED ONLY
+                AvpData::Enumerated(if sub.all_apn_configs_included { 0 } else { 1 }),
+            ),
+        ];
+        for apn in &sub.apn_configs {
+            profile.push(build_apn_configuration_avp(apn));
+        }
+        group.push(Avp::vendor_mandatory(
+            avp::APN_CONFIGURATION_PROFILE,
+            OGS_3GPP_VENDOR_ID,
+            AvpData::Grouped(profile),
+        ));
+    }
+
+    Avp::vendor_mandatory(
+        avp::SUBSCRIPTION_DATA,
+        OGS_3GPP_VENDOR_ID,
+        AvpData::Grouped(group),
+    )
+}
+
+/// Parse an AMBR grouped AVP into (uplink, downlink) bps.
+fn parse_ambr(avp_in: &Avp) -> (u64, u64) {
+    let mut ul = 0u64;
+    let mut dl = 0u64;
+    if let Ok(group) = avp_in.parse_grouped() {
+        if let Some(a) = crate::avp::find_avp(&group, avp::MAX_BANDWIDTH_UL) {
+            ul = a.as_u32().unwrap_or(0) as u64;
+        }
+        if let Some(a) = crate::avp::find_avp(&group, avp::MAX_BANDWIDTH_DL) {
+            dl = a.as_u32().unwrap_or(0) as u64;
+        }
+    }
+    (ul, dl)
+}
+
+/// Parse a single APN-Configuration grouped AVP.
+pub fn parse_apn_configuration_avp(avp_in: &Avp) -> ApnConfiguration {
+    let mut apn = ApnConfiguration::default();
+    let Ok(group) = avp_in.parse_grouped() else {
+        return apn;
+    };
+    for inner in &group {
+        match inner.code {
+            avp::CONTEXT_IDENTIFIER => {
+                apn.context_identifier = inner.as_u32().unwrap_or(0);
+            }
+            avp::PDN_TYPE => {
+                apn.pdn_type = inner.as_u32().unwrap_or(pdn_type::IPV4) as u8;
+            }
+            avp::SERVICE_SELECTION => {
+                if let Some(s) = inner.as_utf8_string() {
+                    apn.service_selection = s.to_string();
+                }
+            }
+            avp::CHARGING_CHARACTERISTICS => {
+                if let Some(b) = inner.as_octet_string() {
+                    if b.len() >= 2 {
+                        apn.charging_characteristics = Some([b[0], b[1]]);
+                    }
+                }
+            }
+            avp::AMBR => {
+                let (ul, dl) = parse_ambr(inner);
+                apn.ambr_uplink = ul;
+                apn.ambr_downlink = dl;
+            }
+            avp::EPS_SUBSCRIBED_QOS_PROFILE => {
+                if let Ok(qg) = inner.parse_grouped() {
+                    if let Some(a) = crate::avp::find_avp(&qg, avp::QOS_CLASS_IDENTIFIER) {
+                        apn.qci = a.as_u32().unwrap_or(9) as u8;
+                    }
+                    if let Some(arp) = crate::avp::find_avp(&qg, avp::ALLOCATION_RETENTION_PRIORITY)
+                    {
+                        if let Ok(ag) = arp.parse_grouped() {
+                            if let Some(a) = crate::avp::find_avp(&ag, avp::PRIORITY_LEVEL) {
+                                apn.arp_priority_level = a.as_u32().unwrap_or(8) as u8;
+                            }
+                            if let Some(a) = crate::avp::find_avp(&ag, avp::PRE_EMPTION_CAPABILITY)
+                            {
+                                apn.arp_pre_emption_capability = a.as_u32().unwrap_or(1) == 0;
+                            }
+                            if let Some(a) =
+                                crate::avp::find_avp(&ag, avp::PRE_EMPTION_VULNERABILITY)
+                            {
+                                apn.arp_pre_emption_vulnerability = a.as_u32().unwrap_or(1) == 0;
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    apn
+}
+
+/// Parse a Subscription-Data grouped AVP (in-memory or wire-decoded).
+pub fn parse_subscription_data_avp(avp_in: &Avp) -> SubscriptionData {
+    let mut sub = SubscriptionData::default();
+    let Ok(group) = avp_in.parse_grouped() else {
+        return sub;
+    };
+    for inner in &group {
+        match inner.code {
+            avp::MSISDN => {
+                if let Some(b) = inner.as_octet_string() {
+                    sub.msisdn = b.to_vec();
+                }
+            }
+            avp::A_MSISDN => {
+                if let Some(b) = inner.as_octet_string() {
+                    sub.a_msisdn = b.to_vec();
+                }
+            }
+            avp::SUBSCRIBER_STATUS => {
+                sub.subscriber_status = inner.as_u32().unwrap_or(0);
+            }
+            avp::OPERATOR_DETERMINED_BARRING => {
+                sub.operator_determined_barring = inner.as_u32();
+            }
+            avp::ACCESS_RESTRICTION_DATA => {
+                sub.access_restriction_data = inner.as_u32();
+            }
+            avp::NETWORK_ACCESS_MODE => {
+                sub.network_access_mode = inner.as_u32().unwrap_or(0);
+            }
+            avp::SUBSCRIBED_RAU_TAU_TIMER => {
+                sub.subscribed_rau_tau_timer = inner.as_u32().unwrap_or(0);
+            }
+            avp::CHARGING_CHARACTERISTICS => {
+                if let Some(b) = inner.as_octet_string() {
+                    if b.len() >= 2 {
+                        sub.charging_characteristics = Some([b[0], b[1]]);
+                    }
+                }
+            }
+            avp::AMBR => {
+                let (ul, dl) = parse_ambr(inner);
+                sub.ambr_uplink = ul;
+                sub.ambr_downlink = dl;
+            }
+            avp::APN_CONFIGURATION_PROFILE => {
+                if let Ok(pg) = inner.parse_grouped() {
+                    for p in &pg {
+                        match p.code {
+                            avp::CONTEXT_IDENTIFIER => {
+                                sub.context_identifier = p.as_u32().unwrap_or(0);
+                            }
+                            avp::ALL_APN_CONFIG_INC_IND => {
+                                sub.all_apn_configs_included = p.as_u32().unwrap_or(0) == 0;
+                            }
+                            avp::APN_CONFIGURATION => {
+                                sub.apn_configs.push(parse_apn_configuration_avp(p));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    sub
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,6 +1125,179 @@ mod tests {
         assert_eq!(msg.header.command_code, cmd::AUTHENTICATION_INFORMATION);
         assert_eq!(msg.header.application_id, S6A_APPLICATION_ID);
         assert!(msg.header.is_request());
+    }
+
+    fn sample_subscription_data() -> SubscriptionData {
+        SubscriptionData {
+            msisdn: vec![0x21, 0x43, 0x65],
+            a_msisdn: vec![],
+            subscriber_status: 0,
+            operator_determined_barring: None,
+            access_restriction_data: Some(0x20),
+            network_access_mode: 2, // ONLY_PACKET
+            subscribed_rau_tau_timer: 12 * 60,
+            ambr_uplink: 50_000_000,
+            ambr_downlink: 100_000_000,
+            context_identifier: 1,
+            all_apn_configs_included: true,
+            apn_configs: vec![
+                ApnConfiguration {
+                    context_identifier: 1,
+                    service_selection: "internet".to_string(),
+                    pdn_type: pdn_type::IPV4V6 as u8,
+                    qci: 9,
+                    arp_priority_level: 8,
+                    arp_pre_emption_capability: false,
+                    arp_pre_emption_vulnerability: true,
+                    ambr_uplink: 50_000_000,
+                    ambr_downlink: 100_000_000,
+                    charging_characteristics: Some([0x0A, 0x00]),
+                },
+                ApnConfiguration {
+                    context_identifier: 2,
+                    service_selection: "ims".to_string(),
+                    pdn_type: pdn_type::IPV4 as u8,
+                    qci: 5,
+                    arp_priority_level: 1,
+                    arp_pre_emption_capability: true,
+                    arp_pre_emption_vulnerability: false,
+                    ambr_uplink: 1_000_000,
+                    ambr_downlink: 2_000_000,
+                    charging_characteristics: None,
+                },
+            ],
+            charging_characteristics: Some([0x0A, 0x00]),
+        }
+    }
+
+    /// Subscription-Data must survive a full wire round-trip:
+    /// build -> encode message -> decode message (raw AVPs) -> parse.
+    #[test]
+    fn test_subscription_data_wire_roundtrip() {
+        let sub = sample_subscription_data();
+
+        let mut ula = DiameterMessage::new_request(cmd::UPDATE_LOCATION, S6A_APPLICATION_ID);
+        ula.header.flags &= !crate::message::cmd_flags::REQUEST;
+        ula.add_avp(build_subscription_data_avp(&sub));
+
+        let encoded = ula.encode();
+        let mut bytes = encoded.freeze();
+        let decoded = DiameterMessage::decode(&mut bytes).unwrap();
+
+        let sub_avp = decoded.find_avp(avp::SUBSCRIPTION_DATA).unwrap();
+        // Wire conformance: V+M flags and 3GPP vendor id
+        assert!(sub_avp.is_vendor_specific());
+        assert!(sub_avp.is_mandatory());
+        assert_eq!(sub_avp.vendor_id, Some(OGS_3GPP_VENDOR_ID));
+
+        let parsed = parse_subscription_data_avp(sub_avp);
+        assert_eq!(parsed, sub);
+    }
+
+    /// A strict peer must see Re-Synchronization-Info INSIDE
+    /// Requested-EUTRAN-Authentication-Info, not at top level.
+    #[test]
+    fn test_resync_info_inside_requested_eutran_auth_info() {
+        let mut air = create_air(
+            "session-resync",
+            "mme.example.org",
+            "example.org",
+            "example.org",
+            "001010123456789",
+            &[0x00, 0xF1, 0x10],
+            1,
+        );
+        let rand = [0xAA; 16];
+        let auts = [0xBB; 14];
+        assert!(add_resync_info(&mut air, &rand, &auts));
+
+        // Encode/decode to simulate the wire
+        let encoded = air.encode();
+        let mut bytes = encoded.freeze();
+        let decoded = DiameterMessage::decode(&mut bytes).unwrap();
+
+        // Not top-level
+        assert!(decoded.find_avp(avp::RE_SYNC_INFO).is_none());
+        // Inside the grouped AVP
+        let (r, a) = find_resync_info(&decoded).unwrap();
+        assert_eq!(r, rand);
+        assert_eq!(a, auts);
+        // Number-Of-Requested-Vectors still present alongside
+        assert_eq!(find_num_requested_vectors(&decoded), Some(1));
+    }
+
+    #[test]
+    fn test_resync_info_requires_grouped_avp() {
+        let mut msg =
+            DiameterMessage::new_request(cmd::AUTHENTICATION_INFORMATION, S6A_APPLICATION_ID);
+        assert!(!add_resync_info(&mut msg, &[0u8; 16], &[0u8; 14]));
+        assert!(find_resync_info(&msg).is_none());
+    }
+
+    #[test]
+    fn test_experimental_result_roundtrip() {
+        let mut msg = DiameterMessage::new_request(cmd::UPDATE_LOCATION, S6A_APPLICATION_ID);
+        msg.add_avp(experimental_result_avp(exp_result::ERROR_USER_UNKNOWN));
+
+        let encoded = msg.encode();
+        let mut bytes = encoded.freeze();
+        let decoded = DiameterMessage::decode(&mut bytes).unwrap();
+
+        assert_eq!(
+            experimental_result_code(&decoded),
+            Some(exp_result::ERROR_USER_UNKNOWN)
+        );
+    }
+
+    #[test]
+    fn test_authentication_info_multi_vector_wire_roundtrip() {
+        let v1 = EUtranVector {
+            rand: [1; 16],
+            xres: vec![2; 8],
+            autn: [3; 16],
+            kasme: [4; 32],
+        };
+        let v2 = EUtranVector {
+            rand: [5; 16],
+            xres: vec![6; 8],
+            autn: [7; 16],
+            kasme: [8; 32],
+        };
+
+        let mut aia =
+            DiameterMessage::new_request(cmd::AUTHENTICATION_INFORMATION, S6A_APPLICATION_ID);
+        aia.header.flags &= !crate::message::cmd_flags::REQUEST;
+        aia.add_avp(Avp::vendor_mandatory(
+            avp::AUTHENTICATION_INFO,
+            OGS_3GPP_VENDOR_ID,
+            AvpData::Grouped(vec![
+                build_e_utran_vector_avp(Some(1), &v1),
+                build_e_utran_vector_avp(Some(2), &v2),
+            ]),
+        ));
+
+        let encoded = aia.encode();
+        let mut bytes = encoded.freeze();
+        let decoded = DiameterMessage::decode(&mut bytes).unwrap();
+
+        let vectors = parse_authentication_info(&decoded);
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(vectors[0].rand, v1.rand);
+        assert_eq!(vectors[0].xres, v1.xres);
+        assert_eq!(vectors[0].autn, v1.autn);
+        assert_eq!(vectors[0].kasme, v1.kasme);
+        assert_eq!(vectors[1].rand, v2.rand);
+    }
+
+    /// Service-Selection must be encoded without a Vendor-Id (RFC 5778).
+    #[test]
+    fn test_service_selection_is_not_vendor_specific() {
+        let apn = sample_subscription_data().apn_configs[0].clone();
+        let apn_avp = build_apn_configuration_avp(&apn);
+        let group = apn_avp.parse_grouped().unwrap();
+        let ss = crate::avp::find_avp(&group, avp::SERVICE_SELECTION).unwrap();
+        assert!(!ss.is_vendor_specific());
+        assert!(ss.is_mandatory());
     }
 
     #[test]

@@ -74,7 +74,7 @@ pub enum SbiServiceType {
     NmbsmfMbssession,
     NnsacfNsac,
     NdccfDatamanagement,
-    NpinEventexposure,
+    NpinPinmanagement,
 }
 
 impl SbiServiceType {
@@ -148,7 +148,7 @@ impl SbiServiceType {
             Self::NmbsmfMbssession => "nmbsmf-mbssession",
             Self::NnsacfNsac => "nnsacf-nsac",
             Self::NdccfDatamanagement => "ndccf-datamanagement",
-            Self::NpinEventexposure => "npin-eventexposure",
+            Self::NpinPinmanagement => "npin-pinmanagement",
         }
     }
 
@@ -218,7 +218,7 @@ impl SbiServiceType {
             "nmbsmf-mbssession" => Some(Self::NmbsmfMbssession),
             "nnsacf-nsac" => Some(Self::NnsacfNsac),
             "ndccf-datamanagement" => Some(Self::NdccfDatamanagement),
-            "npin-eventexposure" => Some(Self::NpinEventexposure),
+            "npin-pinmanagement" => Some(Self::NpinPinmanagement),
             _ => None,
         }
     }

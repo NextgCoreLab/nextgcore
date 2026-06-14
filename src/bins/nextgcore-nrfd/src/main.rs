@@ -9,14 +9,15 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use nextgcore_nrfd::{
-    nf_manager, nrf_context_final, nrf_context_init, nrf_nnrf_nfm_send_nf_status_notify_all_async,
-    nrf_sbi_close, nrf_sbi_open, timer_manager, NotificationEventType, NrfSmContext,
+    apply_json_patch, discover_profiles, json_merge_patch, nf_manager, nrf_context_final,
+    nrf_context_init, nrf_nnrf_nfm_send_nf_status_notify_all_async, nrf_sbi_close, nrf_sbi_open,
+    timer_manager, DiscoveryQuery, NfProfile, NotificationEventType, NrfSmContext, PatchError,
     SbiServerConfig,
 };
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::oauth::AccessTokenResponse;
 use ogs_sbi::server::{
-    send_bad_request, send_method_not_allowed, send_not_found, send_unauthorized, SbiServer,
+    send_bad_request, send_error, send_method_not_allowed, send_not_found, SbiServer,
     SbiServerConfig as OgsSbiServerConfig,
 };
 use std::net::SocketAddr;
@@ -24,11 +25,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-/// Per-process HMAC-SHA256 signing key, generated once at startup.
-static NRF_SIGNING_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+/// Per-process ES256 (ECDSA P-256) signing key, generated once at startup.
+/// Asymmetric so consumers can verify tokens with the public key (published via
+/// JWKS in a later stage) without sharing a secret.
+static NRF_SIGNING_KEY: OnceLock<p256::ecdsa::SigningKey> = OnceLock::new();
+
+/// Key id advertised in the JWT header and (later) the JWKS document.
+const NRF_KID: &str = "nrf-es256";
 
 /// The NRF's own SBI URI, set once at startup from CLI args.
 static NRF_SELF_URI: OnceLock<String> = OnceLock::new();
+
+/// The NRF's own NF Instance ID (UUID). Used as the OAuth2 `iss` claim per
+/// TS 29.510 §6.3.5.2.4 (issuer = NF Instance ID of the NRF). Set from
+/// `--nf-instance-id` at startup; auto-generated otherwise.
+static NRF_INSTANCE_ID: OnceLock<String> = OnceLock::new();
+
+fn nrf_instance_id() -> &'static str {
+    NRF_INSTANCE_ID.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
 
 fn nrf_self_uri() -> &'static str {
     NRF_SELF_URI
@@ -37,10 +52,37 @@ fn nrf_self_uri() -> &'static str {
         .unwrap_or("http://127.0.0.1:7777")
 }
 
-fn nrf_signing_key() -> &'static [u8; 32] {
+/// Decodes percent-encoding (and `+` as space) in a query parameter value.
+/// Discovery parameters like `snssais` and `target-plmn-list` carry JSON in
+/// the query string (TS 29.510 §6.2.3.2.3.1, content: application/json).
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn nrf_signing_key() -> &'static p256::ecdsa::SigningKey {
     NRF_SIGNING_KEY.get_or_init(|| {
         use rand::Rng;
-        rand::rng().random::<[u8; 32]>()
+        // Draw a random scalar; reject the (vanishingly rare) invalid ones.
+        loop {
+            let bytes = rand::rng().random::<[u8; 32]>();
+            if let Ok(sk) = p256::ecdsa::SigningKey::from_slice(&bytes) {
+                break sk;
+            }
+        }
     })
 }
 
@@ -102,10 +144,54 @@ struct Args {
     /// Maximum number of UEs
     #[arg(long, default_value = "1024")]
     max_ue: usize,
+
+    /// NF Instance ID of this NRF (UUID, used as OAuth2 token issuer).
+    /// Auto-generated when not given.
+    #[arg(long)]
+    nf_instance_id: Option<String>,
 }
 
 /// Global shutdown flag
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Active NfInstanceNoHeartbeat timer id per NF instance.
+///
+/// get_expired_events() fires every timer left in the manager, so a heartbeat
+/// refresh must DELETE the superseded expiry timer — merely starting a new one
+/// leaves the old timer armed and the NF gets suspended on schedule regardless
+/// of heartbeats.
+static HEARTBEAT_TIMERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Arm (or re-arm) the no-heartbeat expiry timer for an NF instance,
+/// cancelling any previously armed timer for the same instance.
+fn arm_heartbeat_timer(nf_instance_id: &str, expiry: Duration) {
+    let timer_mgr = timer_manager();
+    let new_id = timer_mgr.start_timer(
+        nextgcore_nrfd::NrfTimerId::NfInstanceNoHeartbeat,
+        expiry,
+        nf_instance_id.to_string(),
+    );
+    if let Ok(mut timers) = HEARTBEAT_TIMERS.lock() {
+        let old = match new_id {
+            Some(id) => timers.insert(nf_instance_id.to_string(), id),
+            None => timers.remove(nf_instance_id),
+        };
+        if let Some(old_id) = old {
+            timer_mgr.delete_timer(old_id);
+        }
+    }
+}
+
+/// Cancel the no-heartbeat expiry timer for an NF instance (deregistration).
+fn disarm_heartbeat_timer(nf_instance_id: &str) {
+    if let Ok(mut timers) = HEARTBEAT_TIMERS.lock() {
+        if let Some(old_id) = timers.remove(nf_instance_id) {
+            timer_manager().delete_timer(old_id);
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -142,6 +228,13 @@ async fn main() -> Result<()> {
     let scheme = if args.tls { "https" } else { "http" };
     let self_uri = format!("{}://{}:{}", scheme, args.sbi_addr, args.sbi_port);
     NRF_SELF_URI.set(self_uri).ok();
+
+    // The NRF's NF Instance ID is the OAuth2 token issuer (TS 29.510
+    // §6.3.5.2.4): configured UUID or generated per process.
+    if let Some(ref id) = args.nf_instance_id {
+        NRF_INSTANCE_ID.set(id.clone()).ok();
+    }
+    log::info!("NRF NF Instance ID: {}", nrf_instance_id());
 
     // Initialize NRF state machine
     let mut nrf_sm = NrfSmContext::new();
@@ -324,6 +417,9 @@ async fn nrf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             // Access Token Request: POST /nnrf-oauth2/v1/access-token
             handle_access_token_request(&request).await
         }
+        // JWKS: GET /nnrf-oauth2/v1/jwks — publishes the ES256 public key so
+        // consumers can verify access tokens (no shared secret needed).
+        ("nnrf-oauth2", "jwks", "GET") => handle_jwks(),
 
         _ => {
             log::warn!("Unknown NRF request: {method} {uri}");
@@ -348,36 +444,39 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    // Register the NF instance
-    let manager = nf_manager();
-
-    // Create NfProfile from JSON
-    let nf_type = profile
-        .get("nfType")
-        .and_then(|v| v.as_str())
-        .unwrap_or("UNKNOWN")
-        .to_string();
-    let nf_status = profile
-        .get("nfStatus")
-        .and_then(|v| v.as_str())
-        .unwrap_or("REGISTERED")
-        .to_string();
-    let heartbeat_timer = profile
-        .get("heartBeatTimer")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
-
-    let nf_profile = nextgcore_nrfd::NfProfile {
-        nf_instance_id: nf_instance_id.to_string(),
-        nf_type: nf_type.clone(),
-        nf_status,
-        heartbeat_timer,
-        plmn_list: vec![],
-        ipv4_addresses: vec![],
-        ipv6_addresses: vec![],
-        fqdn: None,
-        nf_services: vec![],
+    // Mandatory attribute validation (TS 29.510 Table 6.1.6.2.2-1:
+    // nfInstanceId, nfType, nfStatus) -> 400 ProblemDetails.
+    let nf_profile = match NfProfile::from_json(&profile) {
+        Ok(p) => p,
+        Err(missing) => {
+            return send_bad_request(
+                &format!(
+                    "Missing mandatory NFProfile attribute(s): {}",
+                    missing.join(", ")
+                ),
+                Some("MANDATORY_IE_MISSING"),
+            )
+        }
     };
+
+    // The nfInstanceId in the body must match the resource URI (TS 29.510
+    // §5.2.2.2.1: the NF registers under its own NF Instance ID).
+    if nf_profile.nf_instance_id != nf_instance_id {
+        return send_bad_request(
+            &format!(
+                "Body nfInstanceId {:?} does not match resource URI {:?}",
+                nf_profile.nf_instance_id, nf_instance_id
+            ),
+            Some("MANDATORY_IE_INCORRECT"),
+        );
+    }
+
+    let nf_type = nf_profile.nf_type.clone();
+    let heartbeat_timer = nf_profile.heartbeat_timer;
+    let manager = nf_manager();
+    // 201 Created on first registration, 200 OK on profile replacement
+    // (TS 29.510 PUT response codes).
+    let is_new = manager.get(nf_instance_id).is_none();
 
     match manager.register(nf_profile.clone()) {
         Ok(_) => {
@@ -385,14 +484,9 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
 
             // Start heartbeat expiry timer if NF has heartBeatTimer
             if let Some(hb_timer) = heartbeat_timer {
-                let timer_mgr = timer_manager();
                 // Use 2x heartbeat interval as tolerance before declaring missed heartbeat
                 let expiry_secs = (hb_timer as u64) * 2;
-                timer_mgr.start_timer(
-                    nextgcore_nrfd::NrfTimerId::NfInstanceNoHeartbeat,
-                    Duration::from_secs(expiry_secs),
-                    nf_instance_id.to_string(),
-                );
+                arm_heartbeat_timer(nf_instance_id, Duration::from_secs(expiry_secs));
                 log::info!(
                     "Heartbeat timer started for NF {nf_instance_id} ({expiry_secs} seconds, 2x {hb_timer}s interval)"
                 );
@@ -413,18 +507,25 @@ async fn handle_nf_register(nf_instance_id: &str, request: &SbiRequest) -> SbiRe
                 }
             });
 
-            // Return 201 Created with the NF profile
-            SbiResponse::with_status(201)
-                .with_header(
+            // 201 Created (Location header mandatory) or 200 OK, both with the
+            // full stored NF profile.
+            let status = if is_new { 201 } else { 200 };
+            let response = SbiResponse::with_status(status);
+            let response = if is_new {
+                response.with_header(
                     "Location",
                     format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}"),
                 )
-                .with_json_body(&profile)
-                .unwrap_or_else(|_| SbiResponse::with_status(201))
+            } else {
+                response
+            };
+            response
+                .with_json_body(&nf_profile.to_json())
+                .unwrap_or_else(|_| SbiResponse::with_status(status))
         }
         Err(e) => {
             log::error!("Failed to register NF {nf_instance_id}: {e}");
-            send_bad_request(&e, Some("REGISTRATION_FAILED"))
+            send_error(500, "Internal Server Error", &e, Some("SYSTEM_FAILURE"))
         }
     }
 }
@@ -436,13 +537,10 @@ async fn handle_nf_profile_retrieval(nf_instance_id: &str) -> SbiResponse {
     let manager = nf_manager();
 
     match manager.get(nf_instance_id) {
+        // Return the complete stored NFProfile (TS 29.510 GetNFInstance:
+        // 200 OK with NFProfile) — full register -> GET fidelity.
         Some(profile) => SbiResponse::with_status(200)
-            .with_json_body(&serde_json::json!({
-                "nfInstanceId": profile.nf_instance_id,
-                "nfType": profile.nf_type,
-                "nfStatus": profile.nf_status,
-                "heartBeatTimer": profile.heartbeat_timer,
-            }))
+            .with_json_body(&profile.to_json())
             .unwrap_or_else(|_| SbiResponse::with_status(200)),
         None => send_not_found(
             &format!("NF instance {nf_instance_id} not found"),
@@ -463,6 +561,7 @@ async fn handle_nf_deregister(nf_instance_id: &str) -> SbiResponse {
     match manager.deregister(nf_instance_id) {
         Ok(_) => {
             log::info!("NF {nf_instance_id} deregistered successfully");
+            disarm_heartbeat_timer(nf_instance_id);
 
             // Send NF_DEREGISTERED notifications to matching subscribers
             if let Some(profile) = profile_for_notify {
@@ -490,6 +589,15 @@ async fn handle_nf_deregister(nf_instance_id: &str) -> SbiResponse {
 }
 
 /// Handle NF Update request (PATCH)
+///
+/// TS 29.510 §5.2.2.3 mandates `application/json-patch+json` (RFC 6902
+/// PatchItem array) for NFUpdate. `application/merge-patch+json` (RFC 7396)
+/// is additionally accepted for lenient peers; bodies without a recognized
+/// content type are dispatched on shape (array => JSON Patch, object =>
+/// merge patch). Success returns 200 OK with the full updated NFProfile
+/// (TS 29.510 also allows 204; we return the profile for visibility).
+/// A failed RFC 6902 `test` op maps to 409 Conflict (RFC 5789 §2.2);
+/// malformed/inapplicable patches map to 400 ProblemDetails.
 async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("NF Update: {nf_instance_id}");
 
@@ -498,43 +606,102 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
     };
 
-    // Parse patch items
-    let _patch: serde_json::Value = match serde_json::from_str(body) {
+    let patch: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    // Verify the NF exists and refresh heartbeat timer
     let manager = nf_manager();
 
-    match manager.get(nf_instance_id) {
-        Some(profile) => {
-            // Refresh heartbeat timer on any PATCH (serves as heartbeat)
-            if let Some(hb_timer) = profile.heartbeat_timer {
-                let timer_mgr = timer_manager();
-                // Start new heartbeat timer (old one will expire harmlessly)
-                let expiry_secs = (hb_timer as u64) * 2;
-                timer_mgr.start_timer(
-                    nextgcore_nrfd::NrfTimerId::NfInstanceNoHeartbeat,
-                    Duration::from_secs(expiry_secs),
-                    nf_instance_id.to_string(),
-                );
-                log::debug!("Heartbeat timer refreshed for NF {nf_instance_id} ({expiry_secs}s)");
-            }
-
-            SbiResponse::with_status(200)
-                .with_json_body(&serde_json::json!({
-                    "nfInstanceId": profile.nf_instance_id,
-                    "nfType": profile.nf_type,
-                    "nfStatus": profile.nf_status,
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(200))
+    // Copy the stored profile out; no lock is held during patch application.
+    let profile = match manager.get(nf_instance_id) {
+        Some(p) => p,
+        None => {
+            return send_not_found(
+                &format!("NF instance {nf_instance_id} not found"),
+                Some("NF_NOT_FOUND"),
+            )
         }
-        None => send_not_found(
-            &format!("NF instance {nf_instance_id} not found"),
-            Some("NF_NOT_FOUND"),
-        ),
+    };
+
+    // Apply the patch to a copy of the full stored document.
+    let mut doc = profile.to_json();
+    let content_type = request
+        .http
+        .get_header("content-type")
+        .cloned()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let patch_result = if content_type.contains("json-patch+json") {
+        apply_json_patch(&mut doc, &patch)
+    } else if content_type.contains("merge-patch+json") {
+        json_merge_patch(&mut doc, &patch);
+        Ok(())
+    } else if patch.is_array() {
+        apply_json_patch(&mut doc, &patch)
+    } else {
+        json_merge_patch(&mut doc, &patch);
+        Ok(())
+    };
+
+    match patch_result {
+        Ok(()) => {}
+        Err(PatchError::TestFailed(msg)) => {
+            return send_error(409, "Conflict", &msg, Some("PATCH_TEST_FAILED"))
+        }
+        Err(PatchError::Malformed(msg)) => {
+            return send_bad_request(&msg, Some("INVALID_MSG_FORMAT"))
+        }
     }
+
+    // The patched document must still be a valid NFProfile with the same
+    // identity (nfInstanceId is read-only for the resource).
+    let updated = match NfProfile::from_json(&doc) {
+        Ok(p) => p,
+        Err(missing) => {
+            return send_bad_request(
+                &format!(
+                    "Patch removes mandatory NFProfile attribute(s): {}",
+                    missing.join(", ")
+                ),
+                Some("MANDATORY_IE_MISSING"),
+            )
+        }
+    };
+    if updated.nf_instance_id != nf_instance_id {
+        return send_bad_request(
+            "Patch must not change nfInstanceId",
+            Some("MANDATORY_IE_INCORRECT"),
+        );
+    }
+
+    if let Err(e) = manager.register(updated.clone()) {
+        log::error!("Failed to store patched NF profile {nf_instance_id}: {e}");
+        return send_error(500, "Internal Server Error", &e, Some("SYSTEM_FAILURE"));
+    }
+
+    // Refresh heartbeat timer on any PATCH (serves as heartbeat, TS 29.510
+    // §5.2.2.3.2) using the updated heartBeatTimer value.
+    if let Some(hb_timer) = updated.heartbeat_timer {
+        let expiry_secs = (hb_timer as u64) * 2;
+        arm_heartbeat_timer(nf_instance_id, Duration::from_secs(expiry_secs));
+        log::debug!("Heartbeat timer refreshed for NF {nf_instance_id} ({expiry_secs}s)");
+    }
+
+    // A heartbeat on a SUSPENDED NF restores it to REGISTERED (TS 29.510)
+    if manager.reactivate(nf_instance_id) {
+        log::info!("NF {nf_instance_id} heartbeat received while SUSPENDED, back to REGISTERED");
+    }
+
+    // Re-read so the response reflects the live nfStatus after reactivation.
+    let response_doc = manager
+        .get(nf_instance_id)
+        .map(|p| p.to_json())
+        .unwrap_or_else(|| updated.to_json());
+
+    SbiResponse::with_status(200)
+        .with_json_body(&response_doc)
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
 /// Handle NF List Retrieval request
@@ -681,58 +848,87 @@ async fn handle_subscription_update(subscription_id: &str, _request: &SbiRequest
     SbiResponse::with_status(200)
 }
 
-/// Handle NF Discovery request
+/// Handle NF Discovery request (TS 29.510 §6.2.3.2.3.1 SearchNFInstances)
+///
+/// Implements the query parameter matrix: target-nf-type + requester-nf-type
+/// (both mandatory per the OpenAPI, missing => 400 MANDATORY_QUERY_PARAM_MISSING),
+/// service-names (comma-separated), snssais / target-plmn-list (JSON in query),
+/// dnn, target-nf-instance-id, target-nf-fqdn, limit.
+///
+/// No match => 200 OK with an empty SearchResult (`nfInstances: []`): the
+/// SearchResult schema (TS 29.510 Table 6.2.6.2.2) requires the array but
+/// permits it to be empty, and the reference NRF (Open5GS) answers 200 OK
+/// with an empty list. 404 is NOT mandated for "target NF type unregistered".
 async fn handle_nf_discover(request: &SbiRequest) -> SbiResponse {
-    // Parse query parameters
-    let target_nf_type = request
-        .http
-        .params
-        .get("target-nf-type")
-        .map(|s| s.as_str())
-        .unwrap_or("");
-    let requester_nf_type = request
-        .http
-        .params
-        .get("requester-nf-type")
-        .map(|s| s.as_str())
-        .unwrap_or("");
+    let param = |name: &str| {
+        request
+            .http
+            .params
+            .get(name)
+            .map(|s| percent_decode(s))
+            .filter(|s| !s.is_empty())
+    };
+
+    let target_nf_type = param("target-nf-type").unwrap_or_default();
+    let requester_nf_type = param("requester-nf-type").unwrap_or_default();
 
     log::info!("NF Discovery: target={target_nf_type}, requester={requester_nf_type}");
 
+    // Both target-nf-type and requester-nf-type are `required: true`
+    // (TS 29.510 SearchNFInstances).
     if target_nf_type.is_empty() {
-        return send_bad_request("Missing target-nf-type parameter", Some("MISSING_PARAM"));
+        return send_bad_request(
+            "Missing target-nf-type parameter",
+            Some("MANDATORY_QUERY_PARAM_MISSING"),
+        );
+    }
+    if requester_nf_type.is_empty() {
+        return send_bad_request(
+            "Missing requester-nf-type parameter",
+            Some("MANDATORY_QUERY_PARAM_MISSING"),
+        );
     }
 
-    // Search for matching NF instances
-    let manager = nf_manager();
+    // JSON-valued query parameters (content: application/json in the spec).
+    let json_array_param = |name: &str| -> Result<Vec<serde_json::Value>, String> {
+        match param(name) {
+            None => Ok(vec![]),
+            Some(raw) => serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|v| v.as_array().cloned())
+                .ok_or_else(|| format!("{name} must be a JSON array")),
+        }
+    };
+    let snssais = match json_array_param("snssais") {
+        Ok(v) => v,
+        Err(e) => return send_bad_request(&e, Some("INVALID_QUERY_PARAM")),
+    };
+    let target_plmn_list = match json_array_param("target-plmn-list") {
+        Ok(v) => v,
+        Err(e) => return send_bad_request(&e, Some("INVALID_QUERY_PARAM")),
+    };
 
-    let matching: Vec<_> = manager
-        .list()
-        .iter()
-        .filter(|p| p.nf_type == target_nf_type && p.nf_status == "REGISTERED")
-        .cloned()
-        .collect();
+    let query = DiscoveryQuery {
+        target_nf_type,
+        requester_nf_type,
+        // style: form, explode: false => comma-separated list.
+        service_names: param("service-names")
+            .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+            .unwrap_or_default(),
+        snssais,
+        dnn: param("dnn"),
+        target_plmn_list,
+        target_nf_instance_id: param("target-nf-instance-id"),
+        target_nf_fqdn: param("target-nf-fqdn"),
+        limit: param("limit").and_then(|v| v.parse().ok()),
+    };
 
+    let nf_instances = discover_profiles(&query);
     log::info!(
         "Found {} matching NF instances for type {}",
-        matching.len(),
-        target_nf_type
+        nf_instances.len(),
+        query.target_nf_type
     );
-
-    // Build SearchResult response
-    let nf_instances: Vec<serde_json::Value> = matching
-        .iter()
-        .map(|p| {
-            serde_json::json!({
-                "nfInstanceId": p.nf_instance_id,
-                "nfType": p.nf_type,
-                "nfStatus": p.nf_status,
-                "heartBeatTimer": p.heartbeat_timer,
-                "ipv4Addresses": p.ipv4_addresses,
-                "fqdn": p.fqdn,
-            })
-        })
-        .collect();
 
     SbiResponse::with_status(200)
         .with_json_body(&serde_json::json!({
@@ -746,6 +942,49 @@ async fn handle_nf_discover(request: &SbiRequest) -> SbiResponse {
 ///
 /// Implements the NRF's role as Authorization Server per 3GPP TS 29.510.
 /// Accepts client_credentials grant and issues Bearer tokens.
+/// Builds the JWK Set (RFC 7517) advertising the NRF's ES256 public key.
+fn nrf_jwks_json() -> serde_json::Value {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let point = nrf_signing_key().verifying_key().to_encoded_point(false);
+    let x = point.x().expect("P-256 public key has an x coordinate");
+    let y = point.y().expect("P-256 public key has a y coordinate");
+    serde_json::json!({
+        "keys": [{
+            "kty": "EC",
+            "crv": "P-256",
+            "use": "sig",
+            "alg": "ES256",
+            "kid": NRF_KID,
+            "x": URL_SAFE_NO_PAD.encode(x),
+            "y": URL_SAFE_NO_PAD.encode(y),
+        }]
+    })
+}
+
+/// Handles `GET /nnrf-oauth2/v1/jwks`.
+fn handle_jwks() -> SbiResponse {
+    SbiResponse::with_status(200).with_body(nrf_jwks_json().to_string(), "application/json")
+}
+
+/// Builds an RFC 6749 §5.2 / TS 29.510 AccessTokenErr error response.
+///
+/// TS 29.510 (TS29510_Nnrf_AccessToken.yaml) maps token request failures to
+/// 400 Bad Request with an AccessTokenErr body (`{"error": "..."}`) as
+/// `application/json`, with mandatory `Cache-Control: no-store` and
+/// `Pragma: no-cache` headers.
+fn token_error(error: &str, description: &str) -> SbiResponse {
+    let body = serde_json::json!({
+        "error": error,
+        "error_description": description,
+    });
+    SbiResponse::with_status(400)
+        .with_header("Cache-Control", "no-store")
+        .with_header("Pragma", "no-cache")
+        .with_body(body.to_string(), "application/json")
+}
+
 async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
     log::info!("OAuth2 Access Token Request");
 
@@ -807,49 +1046,50 @@ async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
             (grant_type, nf_instance_id, nf_type, target_nf_type, scope)
         };
 
-    // Validate grant_type
+    // RFC 6749 §5.2 error responses, carried as TS 29.510 AccessTokenErr.
     if grant_type != "client_credentials" {
-        return send_bad_request(
-            &format!("Unsupported grant_type: {grant_type}"),
-            Some("UNSUPPORTED_GRANT_TYPE"),
+        return token_error(
+            "unsupported_grant_type",
+            &format!("Unsupported grant_type: {grant_type:?} (expected client_credentials)"),
         );
     }
 
-    // Validate required fields
     if nf_instance_id.is_empty() {
-        return send_bad_request("Missing nfInstanceId", Some("INVALID_REQUEST"));
+        return token_error("invalid_request", "Missing nfInstanceId");
     }
     if nf_type.is_empty() {
-        return send_bad_request("Missing nfType", Some("INVALID_REQUEST"));
+        return token_error("invalid_request", "Missing nfType");
     }
     if target_nf_type.is_empty() {
-        return send_bad_request("Missing targetNfType", Some("INVALID_REQUEST"));
+        return token_error("invalid_request", "Missing targetNfType");
     }
     if scope.is_empty() {
-        return send_bad_request("Missing scope", Some("INVALID_SCOPE"));
+        return token_error("invalid_scope", "Missing scope");
     }
 
-    // Verify that the requesting NF is registered
+    // Verify that the requesting NF is registered: an unknown client is an
+    // invalid_client error (RFC 6749 §5.2; TS 29.510 carries it in a 400
+    // AccessTokenErr rather than a bare 401).
     let manager = nf_manager();
     if manager.get(&nf_instance_id).is_none() {
-        return send_unauthorized(
-            &format!("NF instance {nf_instance_id} not registered"),
-            Some("UNAUTHORIZED_NF"),
+        return token_error(
+            "invalid_client",
+            &format!("NF instance {nf_instance_id} is not registered with this NRF"),
         );
     }
 
-    // Issue a JWT access token
-    // In production, this would use proper RSA/ECDSA signing.
-    // For now, build a base64-encoded JWT structure.
+    // Issue a JWT access token signed with ES256 (ECDSA P-256).
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("value expected")
         .as_secs();
     let expires_in = 3600u64; // 1 hour
 
-    let header_json = r#"{"alg":"HS256","typ":"JWT"}"#;
+    let header_json = format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{NRF_KID}"}}"#);
+    // `iss` is the NF Instance ID of the NRF (TS 29.510 §6.3.5.2.4
+    // AccessTokenClaims), not a placeholder string.
     let claims_json = serde_json::json!({
-        "iss": "NRF",
+        "iss": nrf_instance_id(),
         "sub": nf_instance_id,
         "aud": target_nf_type,
         "scope": scope,
@@ -864,15 +1104,12 @@ async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
     let header_b64 = URL_SAFE_NO_PAD.encode(header_json.as_bytes());
     let payload_b64 = URL_SAFE_NO_PAD.encode(claims_str.as_bytes());
 
-    // Sign header.payload with HMAC-SHA256 using the per-process key
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
+    // Sign header.payload with ES256 (ECDSA P-256). The JOSE signature is the
+    // raw r||s (64 bytes), base64url-encoded.
+    use p256::ecdsa::{signature::Signer, Signature};
     let signing_input = format!("{header_b64}.{payload_b64}");
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(nrf_signing_key()).expect("HMAC accepts any key length");
-    mac.update(signing_input.as_bytes());
-    let signature_bytes = mac.finalize().into_bytes();
-    let signature_b64 = URL_SAFE_NO_PAD.encode(signature_bytes);
+    let signature: Signature = nrf_signing_key().sign(signing_input.as_bytes());
+    let signature_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
     let access_token = format!("{header_b64}.{payload_b64}.{signature_b64}");
 
@@ -887,7 +1124,11 @@ async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
         scope: Some(scope),
     };
 
+    // Cache-Control: no-store and Pragma: no-cache are mandatory on the
+    // token response (TS29510_Nnrf_AccessToken.yaml response headers).
     SbiResponse::with_status(200)
+        .with_header("Cache-Control", "no-store")
+        .with_header("Pragma", "no-cache")
         .with_json_body(&response)
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
@@ -969,6 +1210,7 @@ async fn run_event_loop_async(_nrf_sm: &mut NrfSmContext, shutdown: Arc<AtomicBo
 
                             let profile = manager.get(nf_instance_id);
                             manager.deregister(nf_instance_id).ok();
+                            disarm_heartbeat_timer(nf_instance_id);
 
                             // Send NF_DEREGISTERED notification
                             if let Some(profile) = profile {
@@ -998,10 +1240,9 @@ async fn run_event_loop_async(_nrf_sm: &mut NrfSmContext, shutdown: Arc<AtomicBo
                             // Use same interval as heartbeat for the grace period
                             if let Some(profile) = manager.get(nf_instance_id) {
                                 let grace_secs = profile.heartbeat_timer.unwrap_or(10) as u64;
-                                let _ = timer_manager().add_timer(
-                                    nextgcore_nrfd::NrfTimerId::NfInstanceNoHeartbeat,
+                                arm_heartbeat_timer(
+                                    nf_instance_id,
                                     std::time::Duration::from_secs(grace_secs),
-                                    nf_instance_id.clone(),
                                 );
                                 log::info!(
                                     "NF instance {nf_instance_id} grace period: {grace_secs}s before deregistration"
@@ -1079,5 +1320,337 @@ mod tests {
         assert!(args.tls);
         assert_eq!(args.tls_cert, Some("/path/to/cert.pem".to_string()));
         assert_eq!(args.tls_key, Some("/path/to/key.pem".to_string()));
+    }
+
+    #[test]
+    fn test_jwks_public_key_verifies_signed_token() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use p256::ecdsa::signature::{Signer, Verifier};
+        use p256::ecdsa::{Signature, VerifyingKey};
+        use p256::EncodedPoint;
+
+        // Sign as the token endpoint does.
+        let msg = b"header.payload";
+        let sig: Signature = nrf_signing_key().sign(msg);
+
+        // Reconstruct the public key purely from the published JWKS.
+        let jwks = nrf_jwks_json();
+        let key = &jwks["keys"][0];
+        assert_eq!(key["alg"], "ES256");
+        assert_eq!(key["kid"], NRF_KID);
+        let x = URL_SAFE_NO_PAD.decode(key["x"].as_str().unwrap()).unwrap();
+        let y = URL_SAFE_NO_PAD.decode(key["y"].as_str().unwrap()).unwrap();
+        let point = EncodedPoint::from_affine_coordinates(
+            p256::FieldBytes::from_slice(&x),
+            p256::FieldBytes::from_slice(&y),
+            false,
+        );
+        let vk = VerifyingKey::from_encoded_point(&point).expect("valid JWKS key");
+
+        // The JWKS key verifies the NRF signature — consumers can verify tokens.
+        assert!(vk.verify(msg, &sig).is_ok());
+        // A tampered signing input must fail verification.
+        assert!(vk.verify(b"header.tampered", &sig).is_err());
+    }
+
+    #[test]
+    fn test_percent_decode() {
+        assert_eq!(percent_decode("plain"), "plain");
+        assert_eq!(percent_decode("a+b"), "a b");
+        assert_eq!(
+            percent_decode("%5B%7B%22sst%22%3A1%7D%5D"),
+            r#"[{"sst":1}]"#
+        );
+        // Malformed escapes pass through unchanged.
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("%zz"), "%zz");
+    }
+
+    #[test]
+    fn test_token_error_shape() {
+        // RFC 6749 §5.2 / TS 29.510 AccessTokenErr: 400 + {"error": ...},
+        // Cache-Control: no-store, Pragma: no-cache, application/json.
+        let resp = token_error("invalid_client", "nope");
+        assert_eq!(resp.status, 400);
+        assert_eq!(
+            resp.http.get_header("Cache-Control").map(String::as_str),
+            Some("no-store")
+        );
+        assert_eq!(
+            resp.http.get_header("Pragma").map(String::as_str),
+            Some("no-cache")
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["error"], "invalid_client");
+    }
+
+    /// Full HTTP-level lifecycle over a real HTTP/2 SBI server on an
+    /// ephemeral port: register -> GET (fidelity) -> discover (filter
+    /// matrix) -> PATCH (RFC 6902 + RFC 7396) -> token -> deregister.
+    /// Everything is bounded by a 30s timeout; the server is stopped at the
+    /// end so no blocking threads leak.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_lifecycle_register_discover_patch_deregister() {
+        use serde_json::json;
+
+        // Ephemeral port: bind a probe listener, reuse its address.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
+        let addr = probe.local_addr().expect("probe addr");
+        drop(probe);
+
+        let server = SbiServer::new(OgsSbiServerConfig::new(addr));
+        server
+            .start(nrf_sbi_request_handler)
+            .await
+            .expect("SBI server starts");
+
+        let client = ogs_sbi::client::SbiClient::with_host_port("127.0.0.1", addr.port());
+        let nf_id = "5e9b1c0a-1111-4f6a-8888-0123456789ab";
+
+        let lifecycle = async {
+            // --- Register: missing mandatory attrs -> 400 ProblemDetails ---
+            let bad = json!({"nfInstanceId": nf_id, "nfStatus": "REGISTERED"});
+            let resp = client
+                .put_json(&format!("/nnrf-nfm/v1/nf-instances/{nf_id}"), &bad)
+                .await
+                .expect("PUT (invalid)");
+            assert_eq!(resp.status, 400);
+            let problem: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(problem["status"], 400);
+            assert_eq!(problem["cause"], "MANDATORY_IE_MISSING");
+            assert!(problem["detail"].as_str().unwrap().contains("nfType"));
+
+            // --- Register: full profile -> 201 + Location + full echo ---
+            let profile = json!({
+                "nfInstanceId": nf_id,
+                "nfType": "SMF",
+                "nfStatus": "REGISTERED",
+                "heartBeatTimer": 10,
+                "plmnList": [{"mcc": "001", "mnc": "01"}],
+                "sNssais": [{"sst": 1, "sd": "010203"}],
+                "ipv4Addresses": ["10.1.2.3"],
+                "fqdn": "smf.example.com",
+                "capacity": 100,
+                "nfServices": [{
+                    "serviceInstanceId": "svc-0",
+                    "serviceName": "nsmf-pdusession",
+                    "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                    "scheme": "http",
+                    "ipEndPoints": [{"ipv4Address": "10.1.2.3", "port": 7777}]
+                }],
+                "smfInfo": {
+                    "sNssaiSmfInfoList": [{
+                        "sNssai": {"sst": 1, "sd": "010203"},
+                        "dnnSmfInfoList": [{"dnn": "internet"}]
+                    }]
+                }
+            });
+            let resp = client
+                .put_json(&format!("/nnrf-nfm/v1/nf-instances/{nf_id}"), &profile)
+                .await
+                .expect("PUT register");
+            assert_eq!(resp.status, 201);
+            assert!(resp
+                .http
+                .get_header("Location")
+                .expect("Location header on 201")
+                .ends_with(&format!("/nnrf-nfm/v1/nf-instances/{nf_id}")));
+
+            // --- GET: round-trip preserves every attribute ---
+            let resp = client
+                .get(&format!("/nnrf-nfm/v1/nf-instances/{nf_id}"))
+                .await
+                .expect("GET profile");
+            assert_eq!(resp.status, 200);
+            let stored: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(stored, profile, "register -> GET must be lossless");
+
+            // --- Discover: matching filters ---
+            let mut req = SbiRequest::get("/nnrf-disc/v1/nf-instances");
+            req.http.set_param("target-nf-type", "SMF");
+            req.http.set_param("requester-nf-type", "AMF");
+            req.http.set_param("service-names", "nsmf-pdusession");
+            req.http.set_param("dnn", "internet");
+            // [{"sst":1,"sd":"010203"}] percent-encoded
+            req.http.set_param(
+                "snssais",
+                "%5B%7B%22sst%22%3A1%2C%22sd%22%3A%22010203%22%7D%5D",
+            );
+            let resp = client.send_request(req).await.expect("discover");
+            assert_eq!(resp.status, 200);
+            let result: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            let instances = result["nfInstances"].as_array().unwrap();
+            assert!(
+                instances.iter().any(|p| p["nfInstanceId"] == nf_id),
+                "registered SMF must be discoverable: {result}"
+            );
+
+            // --- Discover: no match -> 200 with EMPTY SearchResult, not 404 ---
+            let mut req = SbiRequest::get("/nnrf-disc/v1/nf-instances");
+            req.http.set_param("target-nf-type", "AUSF");
+            req.http.set_param("requester-nf-type", "AMF");
+            let resp = client.send_request(req).await.expect("discover empty");
+            assert_eq!(resp.status, 200);
+            let result: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(result["nfInstances"], json!([]));
+
+            // --- Discover: missing mandatory requester-nf-type -> 400 ---
+            let mut req = SbiRequest::get("/nnrf-disc/v1/nf-instances");
+            req.http.set_param("target-nf-type", "SMF");
+            let resp = client.send_request(req).await.expect("discover invalid");
+            assert_eq!(resp.status, 400);
+            let problem: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(problem["cause"], "MANDATORY_QUERY_PARAM_MISSING");
+
+            // --- PATCH: RFC 6902 json-patch+json (the TS 29.510 format) ---
+            let patch = json!([
+                {"op": "test", "path": "/nfStatus", "value": "REGISTERED"},
+                {"op": "replace", "path": "/capacity", "value": 55},
+                {"op": "add", "path": "/load", "value": 12}
+            ]);
+            let mut req = SbiRequest::patch(format!("/nnrf-nfm/v1/nf-instances/{nf_id}"));
+            req.http
+                .set_header("Content-Type", "application/json-patch+json");
+            req.http.set_content(patch.to_string());
+            let resp = client.send_request(req).await.expect("PATCH json-patch");
+            assert_eq!(resp.status, 200);
+            let updated: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(updated["capacity"], 55);
+            assert_eq!(updated["load"], 12);
+            // Untouched attributes survive the patch.
+            assert_eq!(updated["smfInfo"], profile["smfInfo"]);
+
+            // --- PATCH: failed RFC 6902 test op -> 409 Conflict ---
+            let patch = json!([{"op": "test", "path": "/capacity", "value": 1}]);
+            let mut req = SbiRequest::patch(format!("/nnrf-nfm/v1/nf-instances/{nf_id}"));
+            req.http
+                .set_header("Content-Type", "application/json-patch+json");
+            req.http.set_content(patch.to_string());
+            let resp = client.send_request(req).await.expect("PATCH failing test");
+            assert_eq!(resp.status, 409);
+
+            // --- PATCH: RFC 7396 merge-patch+json ---
+            let merge = json!({"load": 70, "priority": 3});
+            let mut req = SbiRequest::patch(format!("/nnrf-nfm/v1/nf-instances/{nf_id}"));
+            req.http
+                .set_header("Content-Type", "application/merge-patch+json");
+            req.http.set_content(merge.to_string());
+            let resp = client.send_request(req).await.expect("PATCH merge-patch");
+            assert_eq!(resp.status, 200);
+            let updated: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(updated["load"], 70);
+            assert_eq!(updated["priority"], 3);
+            assert_eq!(updated["capacity"], 55, "merge patch keeps earlier patch");
+
+            // --- PATCH: removing a mandatory attribute -> 400 ---
+            let patch = json!([{"op": "remove", "path": "/nfType"}]);
+            let mut req = SbiRequest::patch(format!("/nnrf-nfm/v1/nf-instances/{nf_id}"));
+            req.http
+                .set_header("Content-Type", "application/json-patch+json");
+            req.http.set_content(patch.to_string());
+            let resp = client
+                .send_request(req)
+                .await
+                .expect("PATCH remove mandatory");
+            assert_eq!(resp.status, 400);
+
+            // --- PATCH on unknown NF -> 404 ---
+            let resp = client
+                .patch_json(
+                    "/nnrf-nfm/v1/nf-instances/00000000-dead-beef-0000-000000000000",
+                    &json!([{"op": "replace", "path": "/load", "value": 1}]),
+                )
+                .await
+                .expect("PATCH unknown NF");
+            assert_eq!(resp.status, 404);
+
+            // --- OAuth2 token: success has iss = NRF instance UUID ---
+            let resp = client
+                .post_json(
+                    "/nnrf-oauth2/v1/access-token",
+                    &json!({
+                        "grant_type": "client_credentials",
+                        "nfInstanceId": nf_id,
+                        "nfType": "SMF",
+                        "targetNfType": "UDM",
+                        "scope": "nudm-sdm"
+                    }),
+                )
+                .await
+                .expect("token request");
+            assert_eq!(resp.status, 200);
+            let token_resp: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            let token = token_resp["access_token"].as_str().unwrap();
+            let payload_b64 = token.split('.').nth(1).unwrap();
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+            use base64::Engine;
+            let claims: serde_json::Value =
+                serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload_b64).unwrap()).unwrap();
+            assert_eq!(claims["iss"], nrf_instance_id(), "iss must be NRF UUID");
+            assert_ne!(claims["iss"], "NRF");
+
+            // --- OAuth2 token: RFC 6749 §5.2 error JSON, not bare statuses ---
+            let resp = client
+                .post_json(
+                    "/nnrf-oauth2/v1/access-token",
+                    &json!({"grant_type": "password", "nfInstanceId": nf_id,
+                            "nfType": "SMF", "targetNfType": "UDM", "scope": "x"}),
+                )
+                .await
+                .expect("token bad grant");
+            assert_eq!(resp.status, 400);
+            let err: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(err["error"], "unsupported_grant_type");
+
+            let resp = client
+                .post_json(
+                    "/nnrf-oauth2/v1/access-token",
+                    &json!({"grant_type": "client_credentials",
+                            "nfInstanceId": "11111111-2222-3333-4444-555555555555",
+                            "nfType": "SMF", "targetNfType": "UDM", "scope": "nudm-sdm"}),
+                )
+                .await
+                .expect("token unknown client");
+            assert_eq!(resp.status, 400);
+            let err: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(err["error"], "invalid_client");
+
+            // --- Deregister -> 204, heartbeat timer disarmed, GET -> 404 ---
+            assert!(
+                HEARTBEAT_TIMERS.lock().unwrap().contains_key(nf_id),
+                "registration must arm the heartbeat timer"
+            );
+            let resp = client
+                .delete(&format!("/nnrf-nfm/v1/nf-instances/{nf_id}"))
+                .await
+                .expect("DELETE deregister");
+            assert_eq!(resp.status, 204);
+            assert!(
+                !HEARTBEAT_TIMERS.lock().unwrap().contains_key(nf_id),
+                "explicit deregister must cancel the heartbeat timer"
+            );
+            let resp = client
+                .get(&format!("/nnrf-nfm/v1/nf-instances/{nf_id}"))
+                .await
+                .expect("GET after deregister");
+            assert_eq!(resp.status, 404);
+        };
+
+        let outcome = tokio::time::timeout(Duration::from_secs(30), lifecycle).await;
+        client.close().await;
+        server.stop().await.expect("server stops");
+        outcome.expect("lifecycle test timed out");
     }
 }

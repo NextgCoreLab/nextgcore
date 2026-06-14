@@ -485,8 +485,11 @@ async fn register_with_nrf(
         "nfStatus": "REGISTERED",
         "ipv4Addresses": [sbi_addr],
         "nfServices": [{
-            "serviceInstanceId": format!("{}-npin-eventexposure", nf_instance_id),
-            "serviceName": "npin-eventexposure",
+            // TS 23.542: pind implements the Npin_PINManagement service
+            // (PIN CRUD, element register/discover/deregister, and the
+            // element relay operation, all routed under npin-pinmanagement).
+            "serviceInstanceId": format!("{}-npin-pinmanagement", nf_instance_id),
+            "serviceName": "npin-pinmanagement",
             "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
             "scheme": "http",
             "nfServiceStatus": "REGISTERED",

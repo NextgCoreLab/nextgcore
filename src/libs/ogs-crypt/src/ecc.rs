@@ -25,7 +25,7 @@ use thiserror::Error;
 use aes::cipher::{generic_array::GenericArray, KeyInit};
 use aes::Aes128;
 use hmac::{Hmac, Mac};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 /// ECC key size in bytes for P-256 curve
 pub const ECC_BYTES: usize = 32;
@@ -267,54 +267,34 @@ pub fn ecdsa_verify(
 // ============================================================================
 // ECIES Profile B (3GPP TS 33.501 Annex C.3.4.2)
 //
-// Uses P-256 ECDH, X9.63 KDF with SHA-256, AES-128-CTR, HMAC-SHA256 (8 bytes)
+// Uses P-256 ECDH, ANSI X9.63 KDF with SHA-256 (SharedInfo = ephemeral public
+// key per SECG SEC 1 §3.6.1 / TS 33.501 Annex C.3.3), AES-128-CTR keyed with
+// the derived initial counter block (ICB), HMAC-SHA-256 truncated to 8 bytes.
 // ============================================================================
 
-/// X9.63 KDF for ECIES Profile B.
+/// X9.63 KDF for ECIES Profiles A/B (TS 33.501 Annex C.3.3 / C.3.4).
 ///
-/// Derives enc_key (16 bytes) and mac_key (32 bytes) from the shared secret
-/// using ANSI X9.63 KDF with SHA-256.
+/// Derives the 64-byte key data block from the ECDH shared secret with
+/// SharedInfo = the ephemeral public key of the initiating party:
+/// - bytes 0..16  -> AES-128 encryption key
+/// - bytes 16..32 -> initial counter block (ICB) for AES-CTR
+/// - bytes 32..64 -> MAC key (HMAC-SHA-256)
 ///
-/// KDF output = SHA-256(Z || counter || SharedInfo)
-/// - First 16 bytes -> encryption key (AES-128)
-/// - Next 32 bytes -> MAC key (HMAC-SHA256)
-fn x963_kdf_profile_b(shared_secret: &[u8; ECC_BYTES]) -> ([u8; 16], [u8; 32]) {
-    // We need 48 bytes total: 16 (enc_key) + 32 (mac_key)
-    // SHA-256 produces 32 bytes per iteration, so we need 2 iterations.
-
-    // Iteration 1: counter = 0x00000001
-    let mut hasher1 = Sha256::new();
-    hasher1.update(shared_secret);
-    hasher1.update(1u32.to_be_bytes());
-    let output1 = hasher1.finalize();
-
-    // Iteration 2: counter = 0x00000002
-    let mut hasher2 = Sha256::new();
-    hasher2.update(shared_secret);
-    hasher2.update(2u32.to_be_bytes());
-    let output2 = hasher2.finalize();
-
-    let mut enc_key = [0u8; 16];
-    let mut mac_key = [0u8; 32];
-
-    // First 16 bytes of output1 -> enc_key
-    enc_key.copy_from_slice(&output1[..16]);
-    // Last 16 bytes of output1 + first 16 bytes of output2 -> mac_key
-    mac_key[..16].copy_from_slice(&output1[16..32]);
-    mac_key[16..].copy_from_slice(&output2[..16]);
-
-    (enc_key, mac_key)
+/// Delegates to [`crate::kdf::ogs_kdf_ansi_x963`].
+fn x963_kdf_ecies(shared_secret: &[u8], ephemeral_pub: &[u8]) -> ([u8; 16], [u8; 16], [u8; 32]) {
+    crate::kdf::ogs_kdf_ansi_x963(shared_secret, ephemeral_pub)
 }
 
 /// AES-128-CTR encryption/decryption (symmetric operation).
 ///
-/// Uses a zero IV (all zeros) as the initial counter block per Profile B.
-fn aes128_ctr(key: &[u8; 16], data: &[u8]) -> Vec<u8> {
+/// Uses the X9.63-derived initial counter block (ICB) as the initial counter
+/// per TS 33.501 Annex C.3.3.
+fn aes128_ctr(key: &[u8; 16], icb: &[u8; 16], data: &[u8]) -> Vec<u8> {
     use aes::cipher::BlockEncrypt;
 
     let cipher = Aes128::new(GenericArray::from_slice(key));
     let mut output = vec![0u8; data.len()];
-    let mut counter = [0u8; 16]; // zero IV for Profile B
+    let mut counter = *icb;
     let mut pos = 0;
 
     while pos < data.len() {
@@ -351,8 +331,8 @@ fn aes128_ctr(key: &[u8; 16], data: &[u8]) -> Vec<u8> {
 /// Encrypts plaintext using ECIES Profile B as defined in 3GPP TS 33.501:
 /// 1. Generate ephemeral P-256 key pair
 /// 2. Compute ECDH shared secret with recipient's public key
-/// 3. Derive enc_key + mac_key via X9.63 KDF
-/// 4. Encrypt with AES-128-CTR
+/// 3. Derive enc_key + ICB + mac_key via X9.63 KDF (SharedInfo = ephemeral public key)
+/// 4. Encrypt with AES-128-CTR keyed with the derived ICB
 /// 5. Compute HMAC-SHA256 over ciphertext, truncated to 8 bytes
 ///
 /// # Arguments
@@ -370,17 +350,41 @@ pub fn ecies_profile_b_encrypt(
     let mut eph_priv = [0u8; ECC_BYTES];
     ecc_make_key(&mut eph_pub, &mut eph_priv)?;
 
-    // 2. Compute ECDH shared secret
+    ecies_profile_b_encrypt_with_ephemeral(pub_key, plaintext, &eph_priv)
+}
+
+/// ECIES Profile B encryption with a caller-supplied ephemeral private key.
+///
+/// Deterministic variant of [`ecies_profile_b_encrypt`] used for the
+/// TS 33.501 Annex C.4 test vectors. Production callers should use
+/// [`ecies_profile_b_encrypt`], which generates a fresh ephemeral key.
+pub fn ecies_profile_b_encrypt_with_ephemeral(
+    pub_key: &[u8; ECC_PUBLIC_KEY_SIZE],
+    plaintext: &[u8],
+    eph_priv: &[u8; ECC_BYTES],
+) -> EccResult<([u8; ECC_PUBLIC_KEY_SIZE], Vec<u8>, [u8; ECIES_MAC_TAG_SIZE])> {
+    // Derive the compressed ephemeral public key from the private key
+    let secret_key =
+        SecretKey::from_bytes(eph_priv.into()).map_err(|_| EccError::InvalidPrivateKey)?;
+    let encoded = secret_key.public_key().to_encoded_point(true);
+    let compressed = encoded.as_bytes();
+    if compressed.len() != ECC_PUBLIC_KEY_SIZE {
+        return Err(EccError::EciesEncryptionFailed);
+    }
+    let mut eph_pub = [0u8; ECC_PUBLIC_KEY_SIZE];
+    eph_pub.copy_from_slice(compressed);
+
+    // Compute ECDH shared secret
     let mut shared_secret = [0u8; ECC_BYTES];
-    ecdh_shared_secret(pub_key, &eph_priv, &mut shared_secret)?;
+    ecdh_shared_secret(pub_key, eph_priv, &mut shared_secret)?;
 
-    // 3. Derive enc_key and mac_key via X9.63 KDF
-    let (enc_key, mac_key) = x963_kdf_profile_b(&shared_secret);
+    // Derive enc_key, ICB and mac_key via X9.63 KDF (SharedInfo = ephemeral public key)
+    let (enc_key, icb, mac_key) = x963_kdf_ecies(&shared_secret, &eph_pub);
 
-    // 4. Encrypt with AES-128-CTR
-    let ciphertext = aes128_ctr(&enc_key, plaintext);
+    // Encrypt with AES-128-CTR (initial counter = ICB)
+    let ciphertext = aes128_ctr(&enc_key, &icb, plaintext);
 
-    // 5. Compute HMAC-SHA256 over ciphertext, truncated to 8 bytes
+    // Compute HMAC-SHA256 over ciphertext, truncated to 8 bytes
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&mac_key)
         .map_err(|_| EccError::EciesEncryptionFailed)?;
     mac.update(&ciphertext);
@@ -396,9 +400,9 @@ pub fn ecies_profile_b_encrypt(
 ///
 /// Decrypts ciphertext using ECIES Profile B as defined in 3GPP TS 33.501:
 /// 1. Compute ECDH shared secret using own private key + ephemeral public key
-/// 2. Derive enc_key + mac_key via X9.63 KDF
+/// 2. Derive enc_key + ICB + mac_key via X9.63 KDF (SharedInfo = ephemeral public key)
 /// 3. Verify HMAC-SHA256 MAC tag
-/// 4. Decrypt with AES-128-CTR
+/// 4. Decrypt with AES-128-CTR keyed with the derived ICB
 ///
 /// # Arguments
 /// * `priv_key` - Recipient's P-256 private key (32 bytes)
@@ -418,8 +422,8 @@ pub fn ecies_profile_b_decrypt(
     let mut shared_secret = [0u8; ECC_BYTES];
     ecdh_shared_secret(ephemeral_pub, priv_key, &mut shared_secret)?;
 
-    // 2. Derive enc_key and mac_key via X9.63 KDF
-    let (enc_key, mac_key) = x963_kdf_profile_b(&shared_secret);
+    // 2. Derive enc_key, ICB and mac_key via X9.63 KDF (SharedInfo = ephemeral public key)
+    let (enc_key, icb, mac_key) = x963_kdf_ecies(&shared_secret, ephemeral_pub);
 
     // 3. Verify MAC tag
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&mac_key)
@@ -435,8 +439,8 @@ pub fn ecies_profile_b_decrypt(
         return Err(EccError::EciesMacVerificationFailed);
     }
 
-    // 4. Decrypt with AES-128-CTR (symmetric operation)
-    let plaintext = aes128_ctr(&enc_key, ciphertext);
+    // 4. Decrypt with AES-128-CTR (symmetric operation, initial counter = ICB)
+    let plaintext = aes128_ctr(&enc_key, &icb, ciphertext);
 
     Ok(plaintext)
 }
@@ -818,6 +822,57 @@ mod tests {
         let result = ecies_profile_b_decrypt(&priv_key, &eph_pub, &ciphertext, &mac_tag);
 
         assert!(result.is_err());
+    }
+
+    /// TS 33.501 Annex C.4.4 ECIES Profile B test data.
+    ///
+    /// Verifies the X9.63 KDF (with SharedInfo = compressed ephemeral public
+    /// key) + AES-128-CTR (derived ICB) + HMAC-SHA-256/64 construction against
+    /// the published 3GPP test vector (compressed ephemeral key variant).
+    #[test]
+    fn test_ecies_profile_b_ts33501_annex_c4_vector() {
+        fn unhex(s: &str) -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        }
+
+        // Home network key pair
+        let hn_priv_v = unhex("F1AB1074477EBCC7F554EA1C5FC368B1616730155E0041AC447D6301975FECDA");
+        let mut hn_priv = [0u8; ECC_BYTES];
+        hn_priv.copy_from_slice(&hn_priv_v);
+
+        // UE ephemeral key pair
+        let eph_priv_v = unhex("99798858A1DC6A2C68637149A4B1DBFD1FDFF5ADDD62A2142F06699ED7602529");
+        let mut eph_priv = [0u8; ECC_BYTES];
+        eph_priv.copy_from_slice(&eph_priv_v);
+
+        let expected_eph_pub =
+            unhex("039AAB8376597021E855679A9778EA0B67396E68C66DF32C0F41E9ACCA2DA9B9D1");
+
+        // Plaintext block (MSIN in BCD)
+        let plaintext = unhex("00012080F6");
+        let expected_ciphertext = unhex("46A33FC271");
+        let expected_mac = unhex("6AC7DAE96AA30A4D");
+
+        // Derive HN public key from the HN private key
+        let hn_secret = SecretKey::from_bytes((&hn_priv).into()).unwrap();
+        let hn_pub_encoded = hn_secret.public_key().to_encoded_point(true);
+        let mut hn_pub = [0u8; ECC_PUBLIC_KEY_SIZE];
+        hn_pub.copy_from_slice(hn_pub_encoded.as_bytes());
+
+        // UE-side encryption with the fixed ephemeral key
+        let (eph_pub, ciphertext, mac_tag) =
+            ecies_profile_b_encrypt_with_ephemeral(&hn_pub, &plaintext, &eph_priv).unwrap();
+
+        assert_eq!(&eph_pub[..], &expected_eph_pub[..], "ephemeral public key");
+        assert_eq!(&ciphertext[..], &expected_ciphertext[..], "ciphertext");
+        assert_eq!(&mac_tag[..], &expected_mac[..], "MAC tag");
+
+        // Home-network-side decryption recovers the plaintext
+        let decrypted = ecies_profile_b_decrypt(&hn_priv, &eph_pub, &ciphertext, &mac_tag).unwrap();
+        assert_eq!(decrypted, plaintext);
     }
 
     #[test]

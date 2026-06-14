@@ -115,6 +115,7 @@ hkdf = "0.12"
 zuc = "0.1"                    # ZUC cipher (3GPP EEA3/EIA3)
 p256 = "0.13"                  # NIST P-256 elliptic curve
 elliptic-curve = "0.13"        # Generic elliptic curve traits
+x25519-dalek = { version = "2", features = ["static_secrets"] } # Curve25519 (ECIES Profile A, TS 33.501 Annex C.3.2)
 base64 = "0.22"
 hex = "0.4"                    # Hex encoding/decoding
 

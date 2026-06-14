@@ -75,6 +75,69 @@ db.subscribers.insertOne({
     created: new Date()
 });
 
+// Insert MINT secondary subscriber (Rel-18, TS 23.761) for nextgsim multi-SUPI.
+// Same home PLMN (999-70) as the primary so both register over one gNB. The UE
+// routes its "enterprise" DNN to this SUPI (mint_config.dnn_subscription_map in
+// config/ue.yaml); the SMF resolves THIS subscriber's session for SUPI-2.
+db.subscribers.insertOne({
+    imsi: "999700000000002",
+    msisdn: ["821000000002"],
+    security: {
+        k: "465B5CE8B199B49FAA5F0A2EE238A6BC",
+        opc: "E8ED289DEBA952E4283B54E88E6D834D",
+        amf: "8000"
+    },
+    ambr: {
+        uplink: { value: 1, unit: 3 },
+        downlink: { value: 1, unit: 3 }
+    },
+    slice: [
+        {
+            sst: 1,
+            default_indicator: true,
+            session: [
+                {
+                    name: "internet",
+                    type: 3,
+                    qos: {
+                        index: 9,
+                        arp: {
+                            priority_level: 8,
+                            pre_emption_capability: 1,
+                            pre_emption_vulnerability: 1
+                        }
+                    },
+                    ambr: {
+                        uplink: { value: 1, unit: 3 },
+                        downlink: { value: 1, unit: 3 }
+                    }
+                },
+                {
+                    name: "enterprise",
+                    type: 3,
+                    qos: {
+                        index: 9,
+                        arp: {
+                            priority_level: 8,
+                            pre_emption_capability: 1,
+                            pre_emption_vulnerability: 1
+                        }
+                    },
+                    ambr: {
+                        uplink: { value: 1, unit: 3 },
+                        downlink: { value: 1, unit: 3 }
+                    }
+                }
+            ]
+        }
+    ],
+    access_restriction_data: 32,
+    subscriber_status: 0,
+    network_access_mode: 0,
+    subscribed_rau_tau_timer: 12,
+    created: new Date()
+});
+
 // Insert additional test subscriber (IMSI: 001010123456789)
 db.subscribers.insertOne({
     imsi: "001010123456789",

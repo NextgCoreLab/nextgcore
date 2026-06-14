@@ -319,18 +319,58 @@ impl EapPacket {
             .find(|(t, _)| *t == type_val)
             .map(|(_, data)| data.as_slice())
     }
+
+    /// Replace the value of the AT_MAC attribute (bytes 2..18 of the attribute
+    /// data: 2 reserved bytes followed by the 16-byte MAC).
+    pub fn set_mac(&mut self, mac: &[u8; 16]) {
+        let mac_type = AkaPrimeAttribute::AtMac as u8;
+        for (t, data) in self.attributes.iter_mut() {
+            if *t == mac_type && data.len() >= 18 {
+                data[2..18].copy_from_slice(mac);
+            }
+        }
+    }
+}
+
+/// Zero out the AT_MAC value inside a raw encoded EAP-AKA' packet.
+///
+/// Per RFC 4187 §10.15 / RFC 5448 §3.3, AT_MAC is computed over the entire
+/// EAP packet with the MAC value field set to zero. Returns a copy of the
+/// packet with the MAC field zeroed, or `None` if no AT_MAC is present.
+pub fn zero_at_mac(raw: &[u8]) -> Option<Vec<u8>> {
+    if raw.len() < 8 {
+        return None;
+    }
+    let length = u16::from_be_bytes([raw[2], raw[3]]) as usize;
+    if raw.len() < length {
+        return None;
+    }
+    let mut out = raw.to_vec();
+    let mut offset = 8;
+    while offset + 2 <= length {
+        let attr_type = raw[offset];
+        let attr_len = (raw[offset + 1] as usize) * 4;
+        if attr_len == 0 || offset + attr_len > length {
+            return None;
+        }
+        if attr_type == AkaPrimeAttribute::AtMac as u8 && attr_len >= 20 {
+            // type(1) len(1) reserved(2) mac(16)
+            for b in out[offset + 4..offset + 20].iter_mut() {
+                *b = 0;
+            }
+            return Some(out);
+        }
+        offset += attr_len;
+    }
+    None
 }
 
 // ============================================================================
 // EAP-AKA' Key Derivation (CK', IK')
 // ============================================================================
 
-/// Derive CK' and IK' from CK, IK, and serving network name per TS 33.501 Annex A.
-///
-/// Uses HMAC-SHA-256 based KDF as specified in RFC 5448 Section 3.3.
-/// Key = CK || IK
-/// S = FC || SN_name || len(SN_name) || SQN xor AK || len(SQN xor AK)
-/// where FC = 0x20 for EAP-AKA'
+/// Derive CK' and IK' from CK, IK, and serving network name per TS 33.501
+/// Annex A.3 (FC = 0x20). Delegates to [`ogs_crypt::kdf::ogs_kdf_ck_ik_prime`].
 ///
 /// Returns (CK', IK') each 16 bytes.
 pub fn derive_ck_ik_prime(
@@ -339,46 +379,90 @@ pub fn derive_ck_ik_prime(
     serving_network_name: &str,
     sqn_xor_ak: &[u8; 6],
 ) -> ([u8; 16], [u8; 16]) {
-    // Key = CK || IK
-    let mut key = [0u8; 32];
-    key[..16].copy_from_slice(ck);
-    key[16..].copy_from_slice(ik);
-
-    // Build S parameter: FC(1) || SN_name || len(SN_name)(2) || SQN_xor_AK || len(SQN_xor_AK)(2)
-    let sn_bytes = serving_network_name.as_bytes();
-    let sn_len = sn_bytes.len() as u16;
-
-    let mut s = Vec::with_capacity(1 + sn_bytes.len() + 2 + 6 + 2);
-    s.push(0x20); // FC for EAP-AKA' CK'/IK' derivation
-    s.extend_from_slice(sn_bytes);
-    s.extend_from_slice(&sn_len.to_be_bytes());
-    s.extend_from_slice(sqn_xor_ak);
-    s.extend_from_slice(&6u16.to_be_bytes());
-
-    // HMAC-SHA-256
-    let mut mac = HmacSha256::new_from_slice(&key).expect("value expected");
-    mac.update(&s);
-    let result = mac.finalize().into_bytes();
-
-    // CK' = first 16 bytes, IK' = last 16 bytes
-    let mut ck_prime = [0u8; 16];
-    let mut ik_prime = [0u8; 16];
-    ck_prime.copy_from_slice(&result[..16]);
-    ik_prime.copy_from_slice(&result[16..]);
-
-    (ck_prime, ik_prime)
+    ogs_crypt::kdf::ogs_kdf_ck_ik_prime(ck, ik, serving_network_name, sqn_xor_ak)
 }
 
-/// Derive KAUSF from CK' and IK' for EAP-AKA' per TS 33.501 Annex A.2.
+/// PRF' as specified in RFC 5448 §3.4.1 (also RFC 9048 §3.4.1).
 ///
-/// For EAP-AKA': KAUSF = KDF(CK'||IK', FC=0x6A, SN name, SQN xor AK)
-pub fn derive_kausf_eap(
+/// `PRF'(K, S) = T1 | T2 | T3 | ...` where
+/// `T1 = HMAC-SHA-256(K, S | 0x01)` and
+/// `Tn = HMAC-SHA-256(K, Tn-1 | S | n)`.
+pub fn prf_prime(key: &[u8], s: &[u8], out_len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(out_len.div_ceil(32) * 32);
+    let mut prev: Vec<u8> = Vec::new();
+    let mut counter: u8 = 1;
+    while out.len() < out_len {
+        let mut mac = HmacSha256::new_from_slice(key).expect("value expected");
+        mac.update(&prev);
+        mac.update(s);
+        mac.update(&[counter]);
+        prev = mac.finalize().into_bytes().to_vec();
+        out.extend_from_slice(&prev);
+        counter = counter.wrapping_add(1);
+    }
+    out.truncate(out_len);
+    out
+}
+
+/// EAP-AKA' key material derived from the master key (RFC 5448 §3.3).
+#[derive(Debug, Clone)]
+pub struct EapAkaPrimeKeys {
+    /// Encryption key for AT_ENCR_DATA (16 bytes)
+    pub k_encr: [u8; 16],
+    /// Authentication key for AT_MAC (32 bytes)
+    pub k_aut: [u8; 32],
+    /// Re-authentication key (32 bytes)
+    pub k_re: [u8; 32],
+    /// Master Session Key (64 bytes)
+    pub msk: [u8; 64],
+    /// Extended Master Session Key (64 bytes)
+    pub emsk: [u8; 64],
+}
+
+/// Derive the full EAP-AKA' key hierarchy per RFC 5448 §3.3:
+///
+/// `MK = PRF'(IK' | CK', "EAP-AKA'" | Identity)` and
+/// `K_encr(16) | K_aut(32) | K_re(32) | MSK(64) | EMSK(64) = MK` (208 bytes).
+///
+/// In 5G the peer identity used for key derivation is the SUPI
+/// (TS 33.501 Annex F).
+pub fn derive_keys_aka_prime(
     ck_prime: &[u8; 16],
     ik_prime: &[u8; 16],
-    serving_network_name: &str,
-    sqn_xor_ak: &[u8; 6],
-) -> [u8; 32] {
-    ogs_crypt::kdf::ogs_kdf_kausf(ck_prime, ik_prime, serving_network_name, sqn_xor_ak)
+    identity: &str,
+) -> EapAkaPrimeKeys {
+    // Key = IK' | CK' (note the order per RFC 5448 §3.3)
+    let mut key = [0u8; 32];
+    key[..16].copy_from_slice(ik_prime);
+    key[16..].copy_from_slice(ck_prime);
+
+    let mut s = Vec::with_capacity(8 + identity.len());
+    s.extend_from_slice(b"EAP-AKA'");
+    s.extend_from_slice(identity.as_bytes());
+
+    let mk = prf_prime(&key, &s, 208);
+
+    let mut keys = EapAkaPrimeKeys {
+        k_encr: [0u8; 16],
+        k_aut: [0u8; 32],
+        k_re: [0u8; 32],
+        msk: [0u8; 64],
+        emsk: [0u8; 64],
+    };
+    keys.k_encr.copy_from_slice(&mk[0..16]);
+    keys.k_aut.copy_from_slice(&mk[16..48]);
+    keys.k_re.copy_from_slice(&mk[48..80]);
+    keys.msk.copy_from_slice(&mk[80..144]);
+    keys.emsk.copy_from_slice(&mk[144..208]);
+    keys
+}
+
+/// Derive KAUSF for EAP-AKA' per TS 33.501 §6.1.3.1 / Annex F:
+/// KAUSF is the most significant 256 bits of the EMSK.
+pub fn kausf_from_emsk(emsk: &[u8; 64]) -> [u8; 32] {
+    let mut kausf = [0u8; 32];
+    kausf.copy_from_slice(&emsk[..32]);
+    kausf
 }
 
 /// Compute AT_MAC for EAP-AKA' message using K_aut.
@@ -432,14 +516,16 @@ pub struct EapAkaSession {
     pub autn: [u8; 16],
     /// XRES value for verification
     pub xres: Vec<u8>,
-    /// CK' (derived from CK, IK via EAP-AKA' KDF)
+    /// CK' (from the UDM transformed AV)
     pub ck_prime: [u8; 16],
-    /// IK' (derived from CK, IK via EAP-AKA' KDF)
+    /// IK' (from the UDM transformed AV)
     pub ik_prime: [u8; 16],
-    /// KAUSF (derived from CK', IK')
+    /// KAUSF (MSB 256 bits of EMSK per TS 33.501 Annex F)
     pub kausf: [u8; 32],
-    /// K_aut for MAC computation (from EAP-AKA' key hierarchy)
+    /// K_aut for AT_MAC computation (RFC 5448 key hierarchy)
     pub k_aut: [u8; 32],
+    /// Peer identity used in the RFC 5448 key derivation (the SUPI in 5G)
+    pub identity: String,
     /// Serving network name
     pub serving_network_name: String,
 }
@@ -457,14 +543,43 @@ impl EapAkaSession {
             ik_prime: [0u8; 16],
             kausf: [0u8; 32],
             k_aut: [0u8; 32],
+            identity: String::new(),
             serving_network_name: serving_network_name.to_string(),
         }
     }
 
-    /// Initialize session with authentication vector from UDM.
+    /// Initialize session with the EAP-AKA' transformed authentication vector
+    /// received from the UDM (TS 33.501 §6.1.3.1: RAND, AUTN, XRES, CK', IK').
     ///
-    /// Derives CK', IK' from CK, IK per EAP-AKA' specification,
-    /// then derives KAUSF from CK', IK'.
+    /// Derives the RFC 5448 key hierarchy from CK'/IK' and the peer identity
+    /// (the SUPI), sets K_aut for AT_MAC and KAUSF = MSB256(EMSK).
+    pub fn init_from_transformed_av(
+        &mut self,
+        rand: &[u8; 16],
+        autn: &[u8; 16],
+        xres: &[u8],
+        ck_prime: &[u8; 16],
+        ik_prime: &[u8; 16],
+        identity: &str,
+    ) {
+        self.rand = *rand;
+        self.autn = *autn;
+        self.xres = xres.to_vec();
+        self.ck_prime = *ck_prime;
+        self.ik_prime = *ik_prime;
+        self.identity = identity.to_string();
+
+        let keys = derive_keys_aka_prime(ck_prime, ik_prime, identity);
+        self.k_aut = keys.k_aut;
+        self.kausf = kausf_from_emsk(&keys.emsk);
+
+        self.state = EapAkaState::Challenge;
+        self.identifier = self.identifier.wrapping_add(1);
+    }
+
+    /// Initialize session with a non-transformed authentication vector
+    /// (CK/IK). Derives CK'/IK' per TS 33.501 Annex A.3 first, then proceeds
+    /// as [`Self::init_from_transformed_av`].
     pub fn init_from_av(
         &mut self,
         rand: &[u8; 16],
@@ -473,52 +588,78 @@ impl EapAkaSession {
         ck: &[u8; 16],
         ik: &[u8; 16],
     ) {
-        self.rand = *rand;
-        self.autn = *autn;
-        self.xres = xres.to_vec();
-
         // Extract SQN xor AK from AUTN[0..6]
         let mut sqn_xor_ak = [0u8; 6];
         sqn_xor_ak.copy_from_slice(&autn[..6]);
 
-        // Derive CK', IK' per RFC 5448
-        let (ck_prime, ik_prime) =
-            derive_ck_ik_prime(ck, ik, &self.serving_network_name, &sqn_xor_ak);
-        self.ck_prime = ck_prime;
-        self.ik_prime = ik_prime;
-
-        // Derive KAUSF from CK', IK'
-        self.kausf = derive_kausf_eap(
-            &ck_prime,
-            &ik_prime,
-            &self.serving_network_name,
-            &sqn_xor_ak,
-        );
-
-        // For K_aut, in a full implementation this would come from PRF' expansion.
-        // Simplified: use HMAC-SHA-256(CK'||IK', "EAP-AKA'K_aut")
-        let mut key = [0u8; 32];
-        key[..16].copy_from_slice(&ck_prime);
-        key[16..].copy_from_slice(&ik_prime);
-        let mut mac = HmacSha256::new_from_slice(&key).expect("value expected");
-        mac.update(b"EAP-AKA'K_aut");
-        let result = mac.finalize().into_bytes();
-        self.k_aut.copy_from_slice(&result);
-
-        self.state = EapAkaState::Challenge;
-        self.identifier = self.identifier.wrapping_add(1);
+        let snn = self.serving_network_name.clone();
+        let identity = self.identity.clone();
+        let (ck_prime, ik_prime) = derive_ck_ik_prime(ck, ik, &snn, &sqn_xor_ak);
+        self.init_from_transformed_av(rand, autn, xres, &ck_prime, &ik_prime, &identity);
     }
 
     /// Generate EAP-Request/AKA'-Challenge message.
+    ///
+    /// AT_MAC is computed with K_aut over the entire encoded EAP packet with
+    /// the MAC field zeroed (RFC 4187 §10.15 / RFC 5448 §3.3).
     pub fn generate_challenge(&self) -> EapPacket {
-        let mac = compute_mac(&self.k_aut, &self.rand);
-        EapPacket::new_aka_challenge(
+        let mut packet = EapPacket::new_aka_challenge(
             self.identifier,
             &self.rand,
             &self.autn,
             &self.serving_network_name,
-            &mac,
-        )
+            &[0u8; 16],
+        );
+        let encoded = packet.encode();
+        let mac = compute_mac(&self.k_aut, &encoded);
+        packet.set_mac(&mac);
+        packet
+    }
+
+    /// Process a raw EAP-Response/AKA'-Challenge: verifies AT_MAC over the
+    /// packet (with the MAC field zeroed) and then the RES against XRES.
+    ///
+    /// Returns true if authentication succeeds.
+    pub fn process_challenge_response_bytes(&mut self, raw: &[u8]) -> bool {
+        let packet = match EapPacket::decode(raw) {
+            Some(p) => p,
+            None => {
+                log::error!("EAP-AKA': failed to decode response packet");
+                self.state = EapAkaState::Failure;
+                return false;
+            }
+        };
+
+        // AT_MAC is mandatory in AKA'-Challenge responses (RFC 4187 §9.4)
+        if packet.code == EapCode::Response && packet.subtype == Some(AkaPrimeSubtype::Challenge) {
+            let zeroed = match zero_at_mac(raw) {
+                Some(z) => z,
+                None => {
+                    log::error!("EAP-AKA': response has no AT_MAC");
+                    self.state = EapAkaState::Failure;
+                    return false;
+                }
+            };
+            let received_mac = match packet.find_attribute(AkaPrimeAttribute::AtMac) {
+                Some(data) if data.len() >= 18 => {
+                    let mut mac = [0u8; 16];
+                    mac.copy_from_slice(&data[2..18]);
+                    mac
+                }
+                _ => {
+                    log::error!("EAP-AKA': malformed AT_MAC");
+                    self.state = EapAkaState::Failure;
+                    return false;
+                }
+            };
+            if !verify_mac(&self.k_aut, &zeroed, &received_mac) {
+                log::warn!("EAP-AKA': AT_MAC verification failed");
+                self.state = EapAkaState::Failure;
+                return false;
+            }
+        }
+
+        self.process_challenge_response(&packet)
     }
 
     /// Process EAP-Response/AKA'-Challenge from UE.
@@ -821,6 +962,156 @@ mod tests {
 
         let eap_result = session.generate_result();
         assert_eq!(eap_result.code, EapCode::Failure);
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// RFC 5448 test vector 1: full PRF' key schedule from CK'/IK'.
+    ///
+    /// Identity "0555444333222111"; CK'/IK' as derived for network name "WLAN"
+    /// (the CK'/IK' derivation itself is vector-tested in ogs-crypt kdf).
+    #[test]
+    fn test_rfc5448_key_schedule_vector1() {
+        let ck_prime_v = unhex("0093962d0dd84aa5684b045c9edffa04");
+        let ik_prime_v = unhex("ccfc230ca74fcc96c0a5d61164f5a76c");
+        let mut ck_prime = [0u8; 16];
+        ck_prime.copy_from_slice(&ck_prime_v);
+        let mut ik_prime = [0u8; 16];
+        ik_prime.copy_from_slice(&ik_prime_v);
+
+        let keys = derive_keys_aka_prime(&ck_prime, &ik_prime, "0555444333222111");
+
+        assert_eq!(
+            &keys.k_encr[..],
+            &unhex("766fa0a6c317174b812d52fbcd11a179")[..],
+            "K_encr"
+        );
+        assert_eq!(
+            &keys.k_aut[..],
+            &unhex("0842ea722ff6835bfa2032499fc3ec23c2f0e388b4f07543ffc677f1696d71ea")[..],
+            "K_aut"
+        );
+        assert_eq!(
+            &keys.k_re[..],
+            &unhex("cf83aa8bc7e0aced892acc98e76a9b2095b558c7795c7094715cb3393aa7d17a")[..],
+            "K_re"
+        );
+        assert_eq!(
+            &keys.msk[..],
+            &unhex(
+                "67c42d9aa56c1b79e295e3459fc3d187d42be0bf818d3070e362c5e967a4d544\
+                 e8ecfe19358ab3039aff03b7c930588c055babee58a02650b067ec4e9347c75a"
+            )[..],
+            "MSK"
+        );
+        assert_eq!(
+            &keys.emsk[..],
+            &unhex(
+                "f861703cd775590e16c7679ea3874ada866311de290764d760cf76df647ea01c\
+                 313f69924bdd7650ca9bac141ea075c4ef9e8029c0e290cdbad5638b63bc23fb"
+            )[..],
+            "EMSK"
+        );
+
+        // KAUSF = MSB 256 bits of EMSK (TS 33.501 Annex F)
+        let kausf = kausf_from_emsk(&keys.emsk);
+        assert_eq!(&kausf[..], &keys.emsk[..32]);
+    }
+
+    /// Challenge AT_MAC is computed over the full packet with a zeroed MAC
+    /// field and verifies via zero_at_mac + verify_mac.
+    #[test]
+    fn test_challenge_at_mac_over_packet() {
+        let mut session = EapAkaSession::new("5G:mnc001.mcc001.3gppnetwork.org");
+        session.init_from_transformed_av(
+            &[0x10u8; 16],
+            &[0x20u8; 16],
+            &[0x30u8; 8],
+            &[0x40u8; 16],
+            &[0x50u8; 16],
+            "imsi-001010000000001",
+        );
+
+        let challenge = session.generate_challenge();
+        let encoded = challenge.encode();
+
+        // Extract AT_MAC from encoded packet and verify over zeroed packet
+        let decoded = EapPacket::decode(&encoded).unwrap();
+        let at_mac = decoded.find_attribute(AkaPrimeAttribute::AtMac).unwrap();
+        let mut mac = [0u8; 16];
+        mac.copy_from_slice(&at_mac[2..18]);
+        assert_ne!(mac, [0u8; 16]);
+
+        let zeroed = zero_at_mac(&encoded).unwrap();
+        assert!(verify_mac(&session.k_aut, &zeroed, &mac));
+        // MAC over the un-zeroed packet must NOT match
+        assert!(!verify_mac(&session.k_aut, &encoded, &mac));
+    }
+
+    /// Full response processing from raw bytes: correct AT_MAC + RES succeeds;
+    /// tampered MAC or missing MAC fails.
+    #[test]
+    fn test_process_challenge_response_bytes() {
+        let xres = vec![0x30u8; 8];
+        let mut session = EapAkaSession::new("5G:mnc001.mcc001.3gppnetwork.org");
+        session.init_from_transformed_av(
+            &[0x10u8; 16],
+            &[0x20u8; 16],
+            &xres,
+            &[0x40u8; 16],
+            &[0x50u8; 16],
+            "imsi-001010000000001",
+        );
+
+        // Build a UE response: AT_RES + AT_MAC (computed like a real peer)
+        let build_response = |xres: &[u8], k_aut: &[u8; 32], identifier: u8| -> Vec<u8> {
+            let mut response = EapPacket {
+                code: EapCode::Response,
+                identifier,
+                eap_type: Some(EapType::AkaPrime),
+                subtype: Some(AkaPrimeSubtype::Challenge),
+                attributes: Vec::new(),
+            };
+            let res_bits = (xres.len() * 8) as u16;
+            let mut res_attr = Vec::new();
+            res_attr.extend_from_slice(&res_bits.to_be_bytes());
+            res_attr.extend_from_slice(xres);
+            response
+                .attributes
+                .push((AkaPrimeAttribute::AtRes as u8, res_attr));
+            response
+                .attributes
+                .push((AkaPrimeAttribute::AtMac as u8, vec![0u8; 18]));
+            let encoded = response.encode();
+            let mac = compute_mac(k_aut, &encoded);
+            response.set_mac(&mac);
+            response.encode()
+        };
+
+        // Correct response
+        let raw = build_response(&xres, &session.k_aut, session.identifier);
+        let mut s1 = session.clone();
+        assert!(s1.process_challenge_response_bytes(&raw));
+        assert_eq!(s1.state, EapAkaState::Success);
+
+        // Tampered MAC
+        let mut tampered = raw.clone();
+        let len = tampered.len();
+        tampered[len - 1] ^= 0xFF;
+        let mut s2 = session.clone();
+        assert!(!s2.process_challenge_response_bytes(&tampered));
+        assert_eq!(s2.state, EapAkaState::Failure);
+
+        // Wrong RES (recompute MAC so only RES check fails)
+        let raw_wrong_res = build_response(&[0xFFu8; 8], &session.k_aut, session.identifier);
+        let mut s3 = session.clone();
+        assert!(!s3.process_challenge_response_bytes(&raw_wrong_res));
+        assert_eq!(s3.state, EapAkaState::Failure);
     }
 
     #[test]

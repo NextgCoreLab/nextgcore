@@ -231,11 +231,14 @@ impl NodeId {
             }
             NodeIdType::Fqdn => {
                 if let Some(fqdn) = &self.fqdn {
-                    // Encode FQDN as DNS-style labels
-                    for label in fqdn.split('.') {
+                    // Encode FQDN as RFC 1035 length-prefixed labels followed
+                    // by the zero-length root label terminator (TS 29.244
+                    // Section 8.2.38)
+                    for label in fqdn.split('.').filter(|l| !l.is_empty()) {
                         buf.put_u8(label.len() as u8);
                         buf.put_slice(label.as_bytes());
                     }
+                    buf.put_u8(0);
                 }
             }
         }
@@ -333,8 +336,11 @@ impl FSeid {
     }
 
     /// Encode to bytes
+    ///
+    /// TS 29.244 Section 8.2.37: octet 5 carries V4 in bit 2 (0x02) and V6 in
+    /// bit 1 (0x01). Note this is the opposite bit order of F-TEID (8.2.3).
     pub fn encode(&self, buf: &mut BytesMut) {
-        let flags = ((self.ipv6 as u8) << 1) | (self.ipv4 as u8);
+        let flags = ((self.ipv4 as u8) << 1) | (self.ipv6 as u8);
         buf.put_u8(flags);
         buf.put_u64(self.seid);
         if let Some(addr) = &self.ipv4_addr {
@@ -354,8 +360,9 @@ impl FSeid {
             });
         }
         let flags = buf.get_u8();
-        let ipv4 = flags & 0x01 != 0;
-        let ipv6 = (flags >> 1) & 0x01 != 0;
+        // TS 29.244 Section 8.2.37: V4 is bit 2, V6 is bit 1
+        let ipv4 = (flags >> 1) & 0x01 != 0;
+        let ipv6 = flags & 0x01 != 0;
         let seid = buf.get_u64();
 
         let ipv4_addr = if ipv4 {
@@ -452,30 +459,35 @@ impl FTeid {
         }
     }
 
-    /// Encode to bytes
+    /// Encode to bytes (TS 29.244 Section 8.2.3)
+    ///
+    /// When the CH (CHOOSE) flag is set, the TEID and address fields are
+    /// omitted entirely; the CHOOSE ID field is present only when CHID is set.
     pub fn encode(&self, buf: &mut BytesMut) {
         let flags = ((self.chid as u8) << 3)
             | ((self.ch as u8) << 2)
             | ((self.ipv6 as u8) << 1)
             | (self.ipv4 as u8);
         buf.put_u8(flags);
-        buf.put_u32(self.teid);
-        if let Some(addr) = &self.ipv4_addr {
-            buf.put_slice(addr);
+        if !self.ch {
+            buf.put_u32(self.teid);
+            if let Some(addr) = &self.ipv4_addr {
+                buf.put_slice(addr);
+            }
+            if let Some(addr) = &self.ipv6_addr {
+                buf.put_slice(addr);
+            }
         }
-        if let Some(addr) = &self.ipv6_addr {
-            buf.put_slice(addr);
-        }
-        if let Some(id) = self.choose_id {
-            buf.put_u8(id);
+        if self.chid {
+            buf.put_u8(self.choose_id.unwrap_or(0));
         }
     }
 
     /// Decode from bytes
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
-        if buf.remaining() < 5 {
+        if buf.remaining() < 1 {
             return Err(PfcpError::BufferTooShort {
-                needed: 5,
+                needed: 1,
                 available: buf.remaining(),
             });
         }
@@ -484,7 +496,23 @@ impl FTeid {
         let ipv6 = (flags >> 1) & 0x01 != 0;
         let ch = (flags >> 2) & 0x01 != 0;
         let chid = (flags >> 3) & 0x01 != 0;
-        let teid = buf.get_u32();
+        if chid && !ch {
+            return Err(PfcpError::InvalidFormat(
+                "F-TEID: CHID flag set without CH flag".to_string(),
+            ));
+        }
+        let teid = if ch {
+            // CH=1: the TEID field is not present on the wire
+            0
+        } else {
+            if buf.remaining() < 4 {
+                return Err(PfcpError::BufferTooShort {
+                    needed: 4,
+                    available: buf.remaining(),
+                });
+            }
+            buf.get_u32()
+        };
 
         let ipv4_addr = if ipv4 && !ch {
             if buf.remaining() < 4 {
@@ -1263,23 +1291,32 @@ impl VolumeMeasurement {
             dlnop: (flags >> 5) & 0x01 != 0,
             ..Default::default()
         };
+        let get_field = |buf: &mut Bytes| -> PfcpResult<u64> {
+            if buf.remaining() < 8 {
+                return Err(PfcpError::BufferTooShort {
+                    needed: 8,
+                    available: buf.remaining(),
+                });
+            }
+            Ok(buf.get_u64())
+        };
         if result.tovol {
-            result.total_volume = buf.get_u64();
+            result.total_volume = get_field(buf)?;
         }
         if result.ulvol {
-            result.uplink_volume = buf.get_u64();
+            result.uplink_volume = get_field(buf)?;
         }
         if result.dlvol {
-            result.downlink_volume = buf.get_u64();
+            result.downlink_volume = get_field(buf)?;
         }
         if result.tonop {
-            result.total_n_packets = buf.get_u64();
+            result.total_n_packets = get_field(buf)?;
         }
         if result.ulnop {
-            result.uplink_n_packets = buf.get_u64();
+            result.uplink_n_packets = get_field(buf)?;
         }
         if result.dlnop {
-            result.downlink_n_packets = buf.get_u64();
+            result.downlink_n_packets = get_field(buf)?;
         }
         Ok(result)
     }
@@ -1309,86 +1346,63 @@ pub struct ReportingTriggers {
 }
 
 impl ReportingTriggers {
-    pub fn encode(&self) -> u32 {
-        let mut val: u32 = 0;
-        if self.perio {
-            val |= 1 << 0;
-        }
-        if self.volth {
-            val |= 1 << 1;
-        }
-        if self.timth {
-            val |= 1 << 2;
-        }
-        if self.quhti {
-            val |= 1 << 3;
-        }
-        if self.start {
-            val |= 1 << 4;
-        }
-        if self.stopt {
-            val |= 1 << 5;
-        }
-        if self.droth {
-            val |= 1 << 6;
-        }
-        if self.liusa {
-            val |= 1 << 7;
-        }
-        if self.volqu {
-            val |= 1 << 8;
-        }
-        if self.timqu {
-            val |= 1 << 9;
-        }
-        if self.envcl {
-            val |= 1 << 10;
-        }
-        if self.macar {
-            val |= 1 << 11;
-        }
-        if self.eveth {
-            val |= 1 << 12;
-        }
-        if self.evequ {
-            val |= 1 << 13;
-        }
-        if self.ipmjl {
-            val |= 1 << 14;
-        }
-        if self.quvti {
-            val |= 1 << 15;
-        }
-        if self.reemr {
-            val |= 1 << 16;
-        }
-        if self.upint {
-            val |= 1 << 17;
-        }
-        val
+    /// Encode to the 3-octet bitmask of TS 29.244 Section 8.2.19 (Rel-16)
+    ///
+    /// Octet 5: LIUSA DROTH STOPT START QUHTI TIMTH VOLTH PERIO
+    /// Octet 6: QUVTI IPMJL EVEQU EVETH MACAR ENVCL TIMQU VOLQU
+    /// Octet 7: spare(6) UPINT REEMR
+    pub fn encode(&self) -> [u8; 3] {
+        let b0 = ((self.liusa as u8) << 7)
+            | ((self.droth as u8) << 6)
+            | ((self.stopt as u8) << 5)
+            | ((self.start as u8) << 4)
+            | ((self.quhti as u8) << 3)
+            | ((self.timth as u8) << 2)
+            | ((self.volth as u8) << 1)
+            | (self.perio as u8);
+        let b1 = ((self.quvti as u8) << 7)
+            | ((self.ipmjl as u8) << 6)
+            | ((self.evequ as u8) << 5)
+            | ((self.eveth as u8) << 4)
+            | ((self.macar as u8) << 3)
+            | ((self.envcl as u8) << 2)
+            | ((self.timqu as u8) << 1)
+            | (self.volqu as u8);
+        let b2 = ((self.upint as u8) << 1) | (self.reemr as u8);
+        [b0, b1, b2]
     }
 
-    pub fn decode(val: u32) -> Self {
-        Self {
-            perio: val & (1 << 0) != 0,
-            volth: val & (1 << 1) != 0,
-            timth: val & (1 << 2) != 0,
-            quhti: val & (1 << 3) != 0,
-            start: val & (1 << 4) != 0,
-            stopt: val & (1 << 5) != 0,
-            droth: val & (1 << 6) != 0,
-            liusa: val & (1 << 7) != 0,
-            volqu: val & (1 << 8) != 0,
-            timqu: val & (1 << 9) != 0,
-            envcl: val & (1 << 10) != 0,
-            macar: val & (1 << 11) != 0,
-            eveth: val & (1 << 12) != 0,
-            evequ: val & (1 << 13) != 0,
-            ipmjl: val & (1 << 14) != 0,
-            quvti: val & (1 << 15) != 0,
-            reemr: val & (1 << 16) != 0,
-            upint: val & (1 << 17) != 0,
+    /// Decode from the wire bitmask (2 octets for Rel-15 peers, 3 for Rel-16+)
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        if data.len() < 2 {
+            return Err(PfcpError::BufferTooShort {
+                needed: 2,
+                available: data.len(),
+            });
         }
+        let b0 = data[0];
+        let b1 = data[1];
+        let b2 = if data.len() >= 3 { data[2] } else { 0 };
+        Ok(Self {
+            perio: b0 & 0x01 != 0,
+            volth: (b0 >> 1) & 0x01 != 0,
+            timth: (b0 >> 2) & 0x01 != 0,
+            quhti: (b0 >> 3) & 0x01 != 0,
+            start: (b0 >> 4) & 0x01 != 0,
+            stopt: (b0 >> 5) & 0x01 != 0,
+            droth: (b0 >> 6) & 0x01 != 0,
+            liusa: (b0 >> 7) & 0x01 != 0,
+            volqu: b1 & 0x01 != 0,
+            timqu: (b1 >> 1) & 0x01 != 0,
+            envcl: (b1 >> 2) & 0x01 != 0,
+            macar: (b1 >> 3) & 0x01 != 0,
+            eveth: (b1 >> 4) & 0x01 != 0,
+            evequ: (b1 >> 5) & 0x01 != 0,
+            ipmjl: (b1 >> 6) & 0x01 != 0,
+            quvti: (b1 >> 7) & 0x01 != 0,
+            reemr: b2 & 0x01 != 0,
+            upint: (b2 >> 1) & 0x01 != 0,
+        })
     }
 }
 
@@ -1486,16 +1500,31 @@ pub struct UpFunctionFeatures {
 }
 
 impl UpFunctionFeatures {
-    /// Encode to bytes (variable length, up to 8 bytes)
+    /// Number of feature octets emitted on the wire (octets 5-12 of the IE)
+    pub const ENCODED_LEN: usize = 8;
+
+    /// Minimum feature octets accepted from a peer (octets 5-10, Rel-16)
+    pub const MIN_LEN: usize = 6;
+
+    /// Encode the full 8-octet bitmask (TS 29.244 Section 8.2.25)
+    ///
+    /// Octet 5:  TREU HEEU PFDM FTUP TRST DLBD DDND BUCP
+    /// Octet 6:  EPFAR PFDE FRRT TRACE QUOAC UDBC PDIU EMPU
+    /// Octet 7:  GCOM BUNDL MTE MNOP SSET UEIP ADPDP DPDRA
+    /// Octet 8:  MPTCP TSCU IP6PL IPTV NORP VTIME RTTL MPAS
+    /// Octet 9:  RDS DDDS ETHAR CIOT MT-EDT GPQM QFQM ATSSS-LL
+    /// Octet 10: DNSTS IPREP RESPS UPBER L2TP NSPOC QUASF RTTWP
+    /// Octet 11: spare(4) EPPI PSUPRM MBSN4 DRQOS
+    /// Octet 12: spare
     pub fn encode(&self, buf: &mut BytesMut) {
-        // First 2 bytes
-        let b0 = ((self.heeu as u8) << 7)
-            | ((self.pfdm as u8) << 6)
-            | ((self.ftup as u8) << 5)
-            | ((self.trst as u8) << 4)
-            | ((self.dlbd as u8) << 3)
-            | ((self.ddnd as u8) << 2)
-            | ((self.bucp as u8) << 1);
+        let b0 = ((self.treu as u8) << 7)
+            | ((self.heeu as u8) << 6)
+            | ((self.pfdm as u8) << 5)
+            | ((self.ftup as u8) << 4)
+            | ((self.trst as u8) << 3)
+            | ((self.dlbd as u8) << 2)
+            | ((self.ddnd as u8) << 1)
+            | (self.bucp as u8);
         let b1 = ((self.epfar as u8) << 7)
             | ((self.pfde as u8) << 6)
             | ((self.frrt as u8) << 5)
@@ -1504,10 +1533,6 @@ impl UpFunctionFeatures {
             | ((self.udbc as u8) << 2)
             | ((self.pdiu as u8) << 1)
             | (self.empu as u8);
-        buf.put_u8(b0);
-        buf.put_u8(b1);
-
-        // Additional bytes if needed
         let b2 = ((self.gcom as u8) << 7)
             | ((self.bundl as u8) << 6)
             | ((self.mte as u8) << 5)
@@ -1516,36 +1541,70 @@ impl UpFunctionFeatures {
             | ((self.ueip as u8) << 2)
             | ((self.adpdp as u8) << 1)
             | (self.dpdra as u8);
-        let b3 = ((self.ip6pl as u8) << 7)
-            | ((self.iptv as u8) << 6)
-            | ((self.norp as u8) << 5)
-            | ((self.vtime as u8) << 4)
-            | ((self.rttl as u8) << 3)
-            | ((self.mpas as u8) << 2)
-            | ((self.treu as u8) << 1);
-        buf.put_u8(b2);
-        buf.put_u8(b3);
+        let b3 = ((self.mptcp as u8) << 7)
+            | ((self.tscu as u8) << 6)
+            | ((self.ip6pl as u8) << 5)
+            | ((self.iptv as u8) << 4)
+            | ((self.norp as u8) << 3)
+            | ((self.vtime as u8) << 2)
+            | ((self.rttl as u8) << 1)
+            | (self.mpas as u8);
+        let b4 = ((self.rds as u8) << 7)
+            | ((self.ddds as u8) << 6)
+            | ((self.ethar as u8) << 5)
+            | ((self.ciot as u8) << 4)
+            | ((self.mt_edt as u8) << 3)
+            | ((self.gpqm as u8) << 2)
+            | ((self.qfqm as u8) << 1)
+            | (self.atsss_ll as u8);
+        let b5 = ((self.dnsts as u8) << 7)
+            | ((self.iprep as u8) << 6)
+            | ((self.resps as u8) << 5)
+            | ((self.upber as u8) << 4)
+            | ((self.l2tp as u8) << 3)
+            | ((self.nspoc as u8) << 2)
+            | ((self.quasf as u8) << 1)
+            | (self.rttwp as u8);
+        let b6 = ((self.eppi as u8) << 3)
+            | ((self.psuprm as u8) << 2)
+            | ((self.mbsn4 as u8) << 1)
+            | (self.drqos as u8);
+        buf.put_slice(&[b0, b1, b2, b3, b4, b5, b6, 0]);
     }
 
     /// Decode from bytes
+    ///
+    /// Strict on length: at least the 6 octets of the Rel-16 bitmask are
+    /// required; legacy 2/4-octet encodings are rejected. The Rel-17
+    /// additional octets (11-12) are parsed when present.
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
-        if buf.remaining() < 2 {
+        if buf.remaining() < Self::MIN_LEN {
             return Err(PfcpError::BufferTooShort {
-                needed: 2,
+                needed: Self::MIN_LEN,
                 available: buf.remaining(),
             });
         }
         let b0 = buf.get_u8();
         let b1 = buf.get_u8();
+        let b2 = buf.get_u8();
+        let b3 = buf.get_u8();
+        let b4 = buf.get_u8();
+        let b5 = buf.get_u8();
+        let b6 = if buf.remaining() >= 1 {
+            buf.get_u8()
+        } else {
+            0
+        };
 
-        let mut features = Self {
-            bucp: (b0 >> 1) & 0x01 != 0,
-            ddnd: (b0 >> 2) & 0x01 != 0,
-            dlbd: (b0 >> 3) & 0x01 != 0,
-            trst: (b0 >> 4) & 0x01 != 0,
-            ftup: (b0 >> 5) & 0x01 != 0,
-            pfdm: (b0 >> 6) & 0x01 != 0,
-            heeu: (b0 >> 7) & 0x01 != 0,
+        Ok(Self {
+            bucp: b0 & 0x01 != 0,
+            ddnd: (b0 >> 1) & 0x01 != 0,
+            dlbd: (b0 >> 2) & 0x01 != 0,
+            trst: (b0 >> 3) & 0x01 != 0,
+            ftup: (b0 >> 4) & 0x01 != 0,
+            pfdm: (b0 >> 5) & 0x01 != 0,
+            heeu: (b0 >> 6) & 0x01 != 0,
+            treu: (b0 >> 7) & 0x01 != 0,
             empu: b1 & 0x01 != 0,
             pdiu: (b1 >> 1) & 0x01 != 0,
             udbc: (b1 >> 2) & 0x01 != 0,
@@ -1554,30 +1613,43 @@ impl UpFunctionFeatures {
             frrt: (b1 >> 5) & 0x01 != 0,
             pfde: (b1 >> 6) & 0x01 != 0,
             epfar: (b1 >> 7) & 0x01 != 0,
-            ..Default::default()
-        };
-
-        if buf.remaining() >= 2 {
-            let b2 = buf.get_u8();
-            let b3 = buf.get_u8();
-            features.dpdra = b2 & 0x01 != 0;
-            features.adpdp = (b2 >> 1) & 0x01 != 0;
-            features.ueip = (b2 >> 2) & 0x01 != 0;
-            features.sset = (b2 >> 3) & 0x01 != 0;
-            features.mnop = (b2 >> 4) & 0x01 != 0;
-            features.mte = (b2 >> 5) & 0x01 != 0;
-            features.bundl = (b2 >> 6) & 0x01 != 0;
-            features.gcom = (b2 >> 7) & 0x01 != 0;
-            features.treu = (b3 >> 1) & 0x01 != 0;
-            features.mpas = (b3 >> 2) & 0x01 != 0;
-            features.rttl = (b3 >> 3) & 0x01 != 0;
-            features.vtime = (b3 >> 4) & 0x01 != 0;
-            features.norp = (b3 >> 5) & 0x01 != 0;
-            features.iptv = (b3 >> 6) & 0x01 != 0;
-            features.ip6pl = (b3 >> 7) & 0x01 != 0;
-        }
-
-        Ok(features)
+            dpdra: b2 & 0x01 != 0,
+            adpdp: (b2 >> 1) & 0x01 != 0,
+            ueip: (b2 >> 2) & 0x01 != 0,
+            sset: (b2 >> 3) & 0x01 != 0,
+            mnop: (b2 >> 4) & 0x01 != 0,
+            mte: (b2 >> 5) & 0x01 != 0,
+            bundl: (b2 >> 6) & 0x01 != 0,
+            gcom: (b2 >> 7) & 0x01 != 0,
+            mpas: b3 & 0x01 != 0,
+            rttl: (b3 >> 1) & 0x01 != 0,
+            vtime: (b3 >> 2) & 0x01 != 0,
+            norp: (b3 >> 3) & 0x01 != 0,
+            iptv: (b3 >> 4) & 0x01 != 0,
+            ip6pl: (b3 >> 5) & 0x01 != 0,
+            tscu: (b3 >> 6) & 0x01 != 0,
+            mptcp: (b3 >> 7) & 0x01 != 0,
+            atsss_ll: b4 & 0x01 != 0,
+            qfqm: (b4 >> 1) & 0x01 != 0,
+            gpqm: (b4 >> 2) & 0x01 != 0,
+            mt_edt: (b4 >> 3) & 0x01 != 0,
+            ciot: (b4 >> 4) & 0x01 != 0,
+            ethar: (b4 >> 5) & 0x01 != 0,
+            ddds: (b4 >> 6) & 0x01 != 0,
+            rds: (b4 >> 7) & 0x01 != 0,
+            rttwp: b5 & 0x01 != 0,
+            quasf: (b5 >> 1) & 0x01 != 0,
+            nspoc: (b5 >> 2) & 0x01 != 0,
+            l2tp: (b5 >> 3) & 0x01 != 0,
+            upber: (b5 >> 4) & 0x01 != 0,
+            resps: (b5 >> 5) & 0x01 != 0,
+            iprep: (b5 >> 6) & 0x01 != 0,
+            dnsts: (b5 >> 7) & 0x01 != 0,
+            drqos: b6 & 0x01 != 0,
+            mbsn4: (b6 >> 1) & 0x01 != 0,
+            psuprm: (b6 >> 2) & 0x01 != 0,
+            eppi: (b6 >> 3) & 0x01 != 0,
+        })
     }
 }
 
@@ -1596,16 +1668,44 @@ pub struct CpFunctionFeatures {
 }
 
 impl CpFunctionFeatures {
-    pub fn encode(&self) -> u8 {
-        ((self.ovrl as u8) << 1) | (self.load as u8)
+    /// Encode the 2-octet bitmask (TS 29.244 Section 8.2.58)
+    ///
+    /// Octet 5: UIAUR ARDR MPAS BUNDL SSET EPFAR OVRL LOAD
+    /// Octet 6: spare(7) PSUCC
+    pub fn encode(&self, buf: &mut BytesMut) {
+        let b0 = ((self.uiaur as u8) << 7)
+            | ((self.ardr as u8) << 6)
+            | ((self.mpas as u8) << 5)
+            | ((self.bundl as u8) << 4)
+            | ((self.sset as u8) << 3)
+            | ((self.epfar as u8) << 2)
+            | ((self.ovrl as u8) << 1)
+            | (self.load as u8);
+        let b1 = self.psucc as u8;
+        buf.put_slice(&[b0, b1]);
     }
 
-    pub fn decode(val: u8) -> Self {
-        Self {
-            load: val & 0x01 != 0,
-            ovrl: (val >> 1) & 0x01 != 0,
-            ..Default::default()
+    /// Decode from bytes (octet 6 is absent on Rel-15 peers)
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        if data.is_empty() {
+            return Err(PfcpError::BufferTooShort {
+                needed: 1,
+                available: 0,
+            });
         }
+        let b0 = data[0];
+        let b1 = if data.len() >= 2 { data[1] } else { 0 };
+        Ok(Self {
+            load: b0 & 0x01 != 0,
+            ovrl: (b0 >> 1) & 0x01 != 0,
+            epfar: (b0 >> 2) & 0x01 != 0,
+            sset: (b0 >> 3) & 0x01 != 0,
+            bundl: (b0 >> 4) & 0x01 != 0,
+            mpas: (b0 >> 5) & 0x01 != 0,
+            ardr: (b0 >> 6) & 0x01 != 0,
+            uiaur: (b0 >> 7) & 0x01 != 0,
+            psucc: b1 & 0x01 != 0,
+        })
     }
 }
 
@@ -2158,13 +2258,11 @@ impl CreateUrr {
             self.measurement_method.encode(),
         );
 
-        // Reporting Triggers is 3 bytes (24 bits used out of 32)
-        let rt_val = self.reporting_triggers.encode();
-        let header = IeHeader::new(IeType::ReportingTriggers as u16, 3);
+        // Reporting Triggers is a 3-octet bitmask (TS 29.244 Section 8.2.19)
+        let rt = self.reporting_triggers.encode();
+        let header = IeHeader::new(IeType::ReportingTriggers as u16, rt.len() as u16);
         header.encode(buf);
-        buf.put_u8((rt_val >> 16) as u8);
-        buf.put_u8((rt_val >> 8) as u8);
-        buf.put_u8(rt_val as u8);
+        buf.put_slice(&rt);
 
         if let Some(period) = self.measurement_period {
             encode_u32_ie(buf, IeType::MeasurementPeriod, period);
@@ -2208,13 +2306,7 @@ impl CreateUrr {
                     }
                 }
                 t if t == IeType::ReportingTriggers as u16 => {
-                    let data = &ie.data;
-                    let val = match data.len() {
-                        1 => data[0] as u32,
-                        2 => ((data[0] as u32) << 8) | (data[1] as u32),
-                        _ => ((data[0] as u32) << 16) | ((data[1] as u32) << 8) | (data[2] as u32),
-                    };
-                    reporting_triggers = ReportingTriggers::decode(val);
+                    reporting_triggers = ReportingTriggers::decode(&ie.data)?;
                 }
                 t if t == IeType::MeasurementPeriod as u16 => {
                     if ie.data.len() >= 4 {
@@ -2758,5 +2850,335 @@ impl DownlinkDataReport {
             }
         }
         Ok(Self { pdr_id })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn round_trip_fteid(fteid: &FTeid) -> (Bytes, FTeid) {
+        let mut buf = BytesMut::new();
+        fteid.encode(&mut buf);
+        let encoded = buf.freeze();
+        let mut bytes = encoded.clone();
+        let decoded = FTeid::decode(&mut bytes).unwrap();
+        (encoded, decoded)
+    }
+
+    #[test]
+    fn test_fseid_v4_flag_is_bit2_per_ts29244() {
+        // TS 29.244 Section 8.2.37: octet 5 bit 2 = V4, bit 1 = V6
+        // (opposite of the F-TEID flag order in Section 8.2.3).
+        let fseid = FSeid::new_ipv4(0x0102030405060708, [10, 0, 0, 1]);
+        let mut buf = BytesMut::new();
+        fseid.encode(&mut buf);
+        assert_eq!(buf[0], 0x02, "V4 flag must be bit 2 (0x02)");
+        assert_eq!(&buf[1..9], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(&buf[9..13], &[10, 0, 0, 1]);
+
+        let fseid6 = FSeid::new_ipv6(1, [0xAB; 16]);
+        let mut buf6 = BytesMut::new();
+        fseid6.encode(&mut buf6);
+        assert_eq!(buf6[0], 0x01, "V6 flag must be bit 1 (0x01)");
+    }
+
+    #[test]
+    fn test_fseid_round_trip() {
+        for fseid in [
+            FSeid::new_ipv4(0xCAFEBABE, [192, 168, 0, 1]),
+            FSeid::new_ipv6(0x42, [0x20; 16]),
+        ] {
+            let mut buf = BytesMut::new();
+            fseid.encode(&mut buf);
+            let mut bytes = buf.freeze();
+            let decoded = FSeid::decode(&mut bytes).unwrap();
+            assert_eq!(decoded, fseid);
+        }
+    }
+
+    #[test]
+    fn test_fteid_ch0_ipv4_round_trip() {
+        let fteid = FTeid::new_ipv4(0x12345678, [10, 0, 0, 1]);
+        let (encoded, decoded) = round_trip_fteid(&fteid);
+        // flags + TEID + IPv4 address
+        assert_eq!(encoded.len(), 9);
+        assert_eq!(decoded, fteid);
+    }
+
+    #[test]
+    fn test_fteid_ch0_ipv6_round_trip() {
+        let fteid = FTeid::new_ipv6(0xDEADBEEF, [0xFE; 16]);
+        let (encoded, decoded) = round_trip_fteid(&fteid);
+        // flags + TEID + IPv6 address
+        assert_eq!(encoded.len(), 21);
+        assert_eq!(decoded, fteid);
+    }
+
+    #[test]
+    fn test_fteid_ch1_omits_teid() {
+        let fteid = FTeid::new_choose(true, false, None);
+        let (encoded, decoded) = round_trip_fteid(&fteid);
+        // CH=1: only the flags octet is present on the wire
+        assert_eq!(encoded.as_ref(), &[0x05]);
+        assert_eq!(decoded, fteid);
+    }
+
+    #[test]
+    fn test_fteid_ch1_chid_round_trip() {
+        let fteid = FTeid::new_choose(true, true, Some(7));
+        let (encoded, decoded) = round_trip_fteid(&fteid);
+        // CH=1 + CHID: flags octet followed only by the CHOOSE ID
+        assert_eq!(encoded.as_ref(), &[0x0F, 0x07]);
+        assert_eq!(decoded, fteid);
+    }
+
+    #[test]
+    fn test_fteid_chid_without_ch_rejected() {
+        // CHID flag set without CH is invalid per TS 29.244 Section 8.2.3
+        let mut bytes = Bytes::from_static(&[0x09, 0x00, 0x00, 0x00, 0x01, 0x07]);
+        assert!(FTeid::decode(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn test_fteid_ch0_truncated_teid_rejected() {
+        let mut bytes = Bytes::from_static(&[0x01, 0x00, 0x00]);
+        assert!(FTeid::decode(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn test_reporting_triggers_all_bits_round_trip() {
+        let rt = ReportingTriggers {
+            perio: true,
+            volth: true,
+            timth: true,
+            quhti: true,
+            start: true,
+            stopt: true,
+            droth: true,
+            liusa: true,
+            volqu: true,
+            timqu: true,
+            envcl: true,
+            macar: true,
+            eveth: true,
+            evequ: true,
+            ipmjl: true,
+            quvti: true,
+            reemr: true,
+            upint: true,
+        };
+        let encoded = rt.encode();
+        // 3 octets, spare bits of octet 7 zero
+        assert_eq!(encoded, [0xFF, 0xFF, 0x03]);
+        assert_eq!(ReportingTriggers::decode(&encoded).unwrap(), rt);
+    }
+
+    #[test]
+    fn test_reporting_triggers_octet_order() {
+        // PERIO is bit 1 of the FIRST wire octet (TS 29.244 Section 8.2.19)
+        let rt = ReportingTriggers {
+            perio: true,
+            ..Default::default()
+        };
+        assert_eq!(rt.encode(), [0x01, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_reporting_triggers_rel15_two_octets() {
+        let rt = ReportingTriggers::decode(&[0x03, 0x01]).unwrap();
+        assert!(rt.perio && rt.volth && rt.volqu);
+        assert!(!rt.reemr && !rt.upint);
+    }
+
+    #[test]
+    fn test_reporting_triggers_short_rejected() {
+        assert!(ReportingTriggers::decode(&[0x01]).is_err());
+    }
+
+    #[test]
+    fn test_up_function_features_all_bits_round_trip() {
+        let features = UpFunctionFeatures {
+            bucp: true,
+            ddnd: true,
+            dlbd: true,
+            trst: true,
+            ftup: true,
+            pfdm: true,
+            heeu: true,
+            treu: true,
+            empu: true,
+            pdiu: true,
+            udbc: true,
+            quoac: true,
+            trace: true,
+            frrt: true,
+            pfde: true,
+            epfar: true,
+            dpdra: true,
+            adpdp: true,
+            ueip: true,
+            sset: true,
+            mnop: true,
+            mte: true,
+            bundl: true,
+            gcom: true,
+            mpas: true,
+            rttl: true,
+            vtime: true,
+            norp: true,
+            iptv: true,
+            ip6pl: true,
+            tscu: true,
+            mptcp: true,
+            atsss_ll: true,
+            qfqm: true,
+            gpqm: true,
+            mt_edt: true,
+            ciot: true,
+            ethar: true,
+            ddds: true,
+            rds: true,
+            rttwp: true,
+            quasf: true,
+            nspoc: true,
+            l2tp: true,
+            upber: true,
+            resps: true,
+            iprep: true,
+            dnsts: true,
+            drqos: true,
+            mbsn4: true,
+            psuprm: true,
+            eppi: true,
+        };
+        let mut buf = BytesMut::new();
+        features.encode(&mut buf);
+        let encoded = buf.freeze();
+        assert_eq!(encoded.len(), UpFunctionFeatures::ENCODED_LEN);
+        assert_eq!(
+            encoded.as_ref(),
+            &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x00]
+        );
+        let mut bytes = encoded;
+        assert_eq!(UpFunctionFeatures::decode(&mut bytes).unwrap(), features);
+    }
+
+    #[test]
+    fn test_up_function_features_wire_bit_positions() {
+        let features = UpFunctionFeatures {
+            ftup: true,
+            empu: true,
+            mnop: true,
+            mpas: true,
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        features.encode(&mut buf);
+        // FTUP = octet 5 bit 5, EMPU = octet 6 bit 1,
+        // MNOP = octet 7 bit 5, MPAS = octet 8 bit 1
+        assert_eq!(
+            buf.as_ref(),
+            &[0x10, 0x01, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn test_strict_peer_rejects_four_byte_up_function_features() {
+        // The legacy truncated 4-octet encoding must be rejected
+        let mut bytes = Bytes::from_static(&[0x22, 0x01, 0x10, 0x00]);
+        assert!(UpFunctionFeatures::decode(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn test_up_function_features_six_octets_accepted() {
+        // Rel-16 peers send 6 feature octets (no additional octets 11-12)
+        let mut bytes = Bytes::from_static(&[0x10, 0x01, 0x00, 0x00, 0x00, 0x00]);
+        let features = UpFunctionFeatures::decode(&mut bytes).unwrap();
+        assert!(features.ftup && features.empu);
+        assert!(!features.drqos);
+    }
+
+    #[test]
+    fn test_cp_function_features_all_bits_round_trip() {
+        let features = CpFunctionFeatures {
+            load: true,
+            ovrl: true,
+            epfar: true,
+            sset: true,
+            bundl: true,
+            mpas: true,
+            ardr: true,
+            uiaur: true,
+            psucc: true,
+        };
+        let mut buf = BytesMut::new();
+        features.encode(&mut buf);
+        assert_eq!(buf.as_ref(), &[0xFF, 0x01]);
+        assert_eq!(CpFunctionFeatures::decode(&buf).unwrap(), features);
+    }
+
+    #[test]
+    fn test_cp_function_features_rel15_single_octet() {
+        let features = CpFunctionFeatures::decode(&[0x03]).unwrap();
+        assert!(features.load && features.ovrl);
+        assert!(!features.psucc);
+    }
+
+    #[test]
+    fn test_node_id_fqdn_round_trip() {
+        let node_id = NodeId::new_fqdn("smf.example.com".to_string());
+        let mut buf = BytesMut::new();
+        node_id.encode(&mut buf);
+        // Type octet + RFC 1035 labels + zero-length root label terminator
+        assert_eq!(
+            buf.as_ref(),
+            &[
+                0x02, 3, b's', b'm', b'f', 7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c',
+                b'o', b'm', 0,
+            ]
+        );
+        let mut bytes = buf.freeze();
+        assert_eq!(NodeId::decode(&mut bytes).unwrap(), node_id);
+    }
+
+    #[test]
+    fn test_node_id_ipv4_round_trip() {
+        let node_id = NodeId::new_ipv4([192, 168, 1, 1]);
+        let mut buf = BytesMut::new();
+        node_id.encode(&mut buf);
+        let mut bytes = buf.freeze();
+        assert_eq!(NodeId::decode(&mut bytes).unwrap(), node_id);
+    }
+
+    #[test]
+    fn test_volume_measurement_round_trip() {
+        let vm = VolumeMeasurement {
+            tovol: true,
+            ulvol: true,
+            dlvol: true,
+            tonop: true,
+            ulnop: true,
+            dlnop: true,
+            total_volume: 1000,
+            uplink_volume: 400,
+            downlink_volume: 600,
+            total_n_packets: 100,
+            uplink_n_packets: 40,
+            downlink_n_packets: 60,
+        };
+        let mut buf = BytesMut::new();
+        vm.encode(&mut buf);
+        // flags + 6 x u64
+        assert_eq!(buf.len(), 49);
+        let mut bytes = buf.freeze();
+        assert_eq!(VolumeMeasurement::decode(&mut bytes).unwrap(), vm);
+    }
+
+    #[test]
+    fn test_volume_measurement_truncated_rejected() {
+        // TOVOL flag set but only 2 of the 8 volume octets present
+        let mut bytes = Bytes::from_static(&[0x01, 0x00, 0x01]);
+        assert!(VolumeMeasurement::decode(&mut bytes).is_err());
     }
 }

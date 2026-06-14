@@ -88,6 +88,33 @@ mod tests {
             }
 
             // Feature: nextgcore-rust-conversion, Property 11: Protocol Message Round-Trip
+            // Test: GTPv1-U DL G-PDU with PDU Session Container QFI round-trip
+            #[test]
+            fn prop_gtpv1_gpdu_dl_qfi_round_trip(
+                teid in any::<u32>(),
+                qfi in 0u8..0x40,
+                payload in prop::collection::vec(any::<u8>(), 1..256),
+            ) {
+                use crate::v1::types::PduSessionContainer;
+
+                let payload_bytes = Bytes::from(payload.clone());
+                let msg = Gtp1Message::gpdu_dl(teid, qfi, payload_bytes);
+                let encoded = msg.encode();
+
+                let mut bytes = encoded.freeze();
+                let decoded = Gtp1Message::decode(&mut bytes).unwrap();
+
+                prop_assert_eq!(decoded.header.message_type, Gtp1uMessageType::GPdu as u8);
+                prop_assert_eq!(decoded.header.teid, teid);
+                prop_assert!(decoded.header.e);
+                prop_assert_eq!(decoded.payload.clone().unwrap().to_vec(), payload);
+
+                let container = decoded.pdu_session_container().unwrap().unwrap();
+                prop_assert_eq!(container, PduSessionContainer::dl(qfi));
+                prop_assert_eq!(container.qfi(), qfi);
+            }
+
+            // Feature: nextgcore-rust-conversion, Property 11: Protocol Message Round-Trip
             // Test: GTPv1-U Error Indication round-trip
             #[test]
             fn prop_gtpv1_error_indication_round_trip(

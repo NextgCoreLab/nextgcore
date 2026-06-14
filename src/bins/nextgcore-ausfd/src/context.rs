@@ -90,6 +90,8 @@ pub struct AusfUe {
     pub autn: [u8; 16],
     /// RES* hex string from confirmation data
     pub res_star_hex: Option<String>,
+    /// EAP-AKA' session state (TS 33.501 §6.1.3.1); None for 5G-AKA
+    pub eap_session: Option<crate::eap_aka_prime::EapAkaSession>,
     /// Associated stream ID
     pub stream_id: Option<u64>,
     /// SNPN NID (Network Identifier) - Rel-17
@@ -115,6 +117,7 @@ impl AusfUe {
             kseaf: [0u8; 32],
             autn: [0u8; 16],
             res_star_hex: None,
+            eap_session: None,
             stream_id: None,
             snpn_nid: None,
         }

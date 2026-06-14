@@ -29,6 +29,7 @@ ctrlc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+ogs-asn1c = { workspace = true }
 
 [lints]
 workspace = true

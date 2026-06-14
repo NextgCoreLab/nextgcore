@@ -9,6 +9,9 @@ use crate::context::{sgwc_self, SgwcSess, SgwcUe};
 // ============================================================================
 
 pub mod gtp_cause {
+    /// Request-initial cause: DDN triggered by Error Indication
+    /// (TS 29.274 Section 8.4, value 6)
+    pub const ERROR_INDICATION_FROM_RNC_ENODEB: u8 = 6;
     pub const REQUEST_ACCEPTED: u8 = 16;
     pub const REQUEST_ACCEPTED_PARTIALLY: u8 = 17;
     pub const NEW_PDN_TYPE_DUE_TO_NETWORK_PREFERENCE: u8 = 18;
@@ -21,6 +24,8 @@ pub mod gtp_cause {
     pub const MANDATORY_IE_INCORRECT: u8 = 73;
     pub const SYSTEM_FAILURE: u8 = 75;
     pub const NO_RESOURCES_AVAILABLE: u8 = 76;
+    pub const SERVICE_NOT_SUPPORTED: u8 = 68;
+    pub const REQUEST_REJECTED: u8 = 94;
     pub const REMOTE_PEER_NOT_RESPONDING: u8 = 100;
     pub const GRE_KEY_NOT_FOUND: u8 = 80;
 }

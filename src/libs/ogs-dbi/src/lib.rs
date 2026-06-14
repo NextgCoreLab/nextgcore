@@ -34,8 +34,11 @@ pub use mongoc::{
 };
 pub use session::ogs_dbi_session_data;
 pub use subscription::{
-    ogs_dbi_auth_info, ogs_dbi_increment_sqn, ogs_dbi_subscription_data, ogs_dbi_update_imeisv,
-    ogs_dbi_update_mme, ogs_dbi_update_sqn, OgsDbiAuthInfo,
+    ogs_dbi_auth_info, ogs_dbi_auth_info_async, ogs_dbi_increment_sqn, ogs_dbi_increment_sqn_async,
+    ogs_dbi_policy_subscription_async, ogs_dbi_subscription_data,
+    ogs_dbi_subscription_data_5g_async, ogs_dbi_subscription_data_async, ogs_dbi_update_imeisv,
+    ogs_dbi_update_imeisv_async, ogs_dbi_update_mme, ogs_dbi_update_sqn, ogs_dbi_update_sqn_async,
+    OgsDbiAuthInfo,
 };
 pub use tsdb::{
     DataPoint, MetricStats, NetworkMetricsCollector, TimeSeries, Timestamp, TsDbClient, TsDbError,

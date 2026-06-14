@@ -84,7 +84,43 @@ impl RegistrationRequest {
         buf.put_u8((self.ngksi.encode() << 4) | self.registration_type.encode());
         // Mobile identity
         self.mobile_identity.encode(buf);
-        // Optional IEs would be encoded here based on presencemask
+        // Optional IEs (TS 24.501 Table 8.2.6.1.1), emitted in spec order
+        if let Some(ref ngksi) = self.non_current_native_ngksi {
+            buf.put_u8(0xC0 | ngksi.encode()); // IEI C- (half-byte)
+        }
+        if let Some(ref cap) = self.gmm_capability {
+            buf.put_u8(0x10); // IEI
+            cap.encode(buf);
+        }
+        if let Some(ref sec_cap) = self.ue_security_capability {
+            buf.put_u8(0x2E); // IEI
+            sec_cap.encode(buf);
+        }
+        if let Some(ref nssai) = self.requested_nssai {
+            buf.put_u8(0x2F); // IEI
+            nssai.encode(buf);
+        }
+        if let Some(ref tai) = self.last_visited_tai {
+            buf.put_u8(0x52); // IEI (TV, 6-octet value)
+            tai.encode(buf);
+        }
+        if let Some(ref uds) = self.uplink_data_status {
+            buf.put_u8(0x40); // IEI
+            uds.encode(buf);
+        }
+        if let Some(ref pss) = self.pdu_session_status {
+            buf.put_u8(0x50); // IEI
+            pss.encode(buf);
+        }
+        if let Some(status) = self.ue_status {
+            buf.put_u8(0x2B); // IEI
+            buf.put_u8(1); // Length
+            buf.put_u8(status);
+        }
+        if let Some(ref guti) = self.additional_guti {
+            buf.put_u8(0x77); // IEI (TLV-E)
+            guti.encode(buf);
+        }
     }
 
     /// Decode registration request from bytes
@@ -114,6 +150,11 @@ impl RegistrationRequest {
             let iei_type = if iei >= 0x80 { iei & 0xF0 } else { iei };
 
             match iei_type {
+                0xC0 => {
+                    // Non-current native NAS key set identifier (half-byte)
+                    buf.advance(1);
+                    msg.non_current_native_ngksi = Some(KeySetIdentifier::decode(iei & 0x0F));
+                }
                 0x10 => {
                     // 5GMM capability
                     buf.advance(1);
@@ -143,6 +184,19 @@ impl RegistrationRequest {
                     // PDU session status
                     buf.advance(1);
                     msg.pdu_session_status = Some(PduSessionStatus::decode(buf)?);
+                }
+                0x2B => {
+                    // UE status
+                    buf.advance(1);
+                    if buf.remaining() >= 2 {
+                        let _len = buf.get_u8();
+                        msg.ue_status = Some(buf.get_u8());
+                    }
+                }
+                0x77 => {
+                    // Additional GUTI
+                    buf.advance(1);
+                    msg.additional_guti = Some(MobileIdentity::decode(buf)?);
                 }
                 _ => {
                     // Skip unknown IE
@@ -203,6 +257,18 @@ impl RegistrationAccept {
             buf.put_u8(0x15); // IEI
             allowed_nssai.encode(buf);
         }
+        if let Some(ref pss) = self.pdu_session_status {
+            buf.put_u8(0x50); // IEI
+            pss.encode(buf);
+        }
+        if let Some(ref t3512) = self.t3512_value {
+            buf.put_u8(0x5E); // IEI
+            t3512.encode(buf);
+        }
+        if let Some(ref t3502) = self.t3502_value {
+            buf.put_u8(0x16); // IEI
+            t3502.encode(buf);
+        }
     }
 
     /// Decode registration accept from bytes
@@ -236,6 +302,10 @@ impl RegistrationAccept {
                 0x5E => {
                     buf.advance(1);
                     msg.t3512_value = Some(GprsTimer3::decode(buf)?);
+                }
+                0x16 => {
+                    buf.advance(1);
+                    msg.t3502_value = Some(GprsTimer2::decode(buf)?);
                 }
                 _ => {
                     buf.advance(1);
@@ -273,6 +343,14 @@ impl RegistrationReject {
         if let Some(ref t3346) = self.t3346_value {
             buf.put_u8(0x5F);
             t3346.encode(buf);
+        }
+        if let Some(ref t3502) = self.t3502_value {
+            buf.put_u8(0x16);
+            t3502.encode(buf);
+        }
+        if let Some(ref eap) = self.eap_message {
+            buf.put_u8(0x78);
+            eap.encode(buf);
         }
     }
 

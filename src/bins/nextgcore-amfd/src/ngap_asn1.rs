@@ -7,6 +7,13 @@
 use ogs_asn1c::ngap::cause::{
     Cause, CauseMisc, CauseNas, CauseProtocol, CauseRadioNetwork, CauseTransport,
 };
+use ogs_ngap::transfer::{
+    AllocationAndRetentionPriority, GtpTunnel, NonDynamic5qiDescriptor,
+    PduSessionResourceReleaseCommandTransfer, PduSessionResourceSetupRequestTransfer,
+    PduSessionResourceSetupResponseTransfer, PduSessionType, PreEmptionCapability,
+    PreEmptionVulnerability, QosCharacteristics, QosFlowLevelQosParameters,
+    QosFlowSetupRequestItem, TransportLayerAddress, UpTransportLayerInformation,
+};
 use ogs_ngap::{builder, parser, types::*, NgapMessage};
 
 use crate::context::AmfContext;
@@ -472,11 +479,24 @@ pub fn build_pdu_session_resource_release_command_asn1(
     ran_ue_ngap_id: u32,
     pdu_session_ids: &[u8],
 ) -> Option<Vec<u8>> {
+    // Per-session PDUSessionResourceReleaseCommandTransfer with mandatory Cause
+    // (TS 38.413 Section 9.3.4.11), APER-encoded via ogs-ngap::transfer
+    let release_transfer = PduSessionResourceReleaseCommandTransfer {
+        cause: Cause::Nas(CauseNas::NormalRelease),
+    };
+    let transfer_bytes = match release_transfer.encode() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            log::error!("Failed to encode PDUSessionResourceReleaseCommandTransfer: {e:?}");
+            return None;
+        }
+    };
+
     let pdu_session_list = pdu_session_ids
         .iter()
         .map(|&psi| PduSessionResourceReleaseItem {
             pdu_session_id: psi,
-            transfer: vec![],
+            transfer: transfer_bytes.clone(),
         })
         .collect();
 
@@ -664,16 +684,21 @@ pub fn extract_ran_ue_ngap_id(data: &[u8]) -> Option<u32> {
 }
 
 /// Build a UE Context Release Command with proper ASN.1 APER encoding
+///
+/// `cause_group`/`cause_value` follow the TS 38.413 Section 9.3.1.2 cause groups
+/// (0=RadioNetwork, 1=Transport, 2=NAS, 3=Protocol, 4=Misc).
 pub fn build_ue_context_release_command_asn1(
     amf_ue_ngap_id: u64,
     ran_ue_ngap_id: u32,
+    cause_group: u8,
+    cause_value: i64,
 ) -> Option<Vec<u8>> {
     let msg = UeContextReleaseCommand {
         ue_ngap_ids: UeNgapIds::Pair {
             amf_ue_ngap_id,
             ran_ue_ngap_id,
         },
-        cause: Cause::Nas(CauseNas::NormalRelease),
+        cause: build_cause(cause_group, cause_value),
     };
 
     match builder::build_ue_context_release_command(&msg) {
@@ -691,6 +716,119 @@ pub fn build_ue_context_release_command_asn1(
             None
         }
     }
+}
+
+/// Build an NG Reset Acknowledge with proper ASN.1 APER encoding
+///
+/// `connections` echoes the UE-associated logical NG-connection list of a
+/// partial NG Reset (TS 38.413 Section 8.7.4.2.2); `None` for a full reset.
+pub fn build_ng_reset_acknowledge_asn1(
+    connections: Option<Vec<UeAssociatedLogicalNgConnectionItem>>,
+) -> Option<Vec<u8>> {
+    let msg = NgResetAcknowledge {
+        connections,
+        criticality_diagnostics: None,
+    };
+
+    match builder::build_ng_reset_acknowledge(&msg) {
+        Ok(bytes) => {
+            log::debug!("Built NG Reset Acknowledge: {} bytes", bytes.len());
+            Some(bytes)
+        }
+        Err(e) => {
+            log::error!("Failed to encode NG Reset Acknowledge: {e:?}");
+            None
+        }
+    }
+}
+
+/// Build an APER-encoded PDUSessionResourceSetupRequestTransfer
+/// (TS 38.413 Section 9.3.4.1) carrying the UPF N3 tunnel endpoint.
+///
+/// Used as the N2 SM information container when the AMF must synthesize
+/// the transfer itself (SMF-unreachable fallback). The normal path forwards
+/// the SMF-produced transfer opaquely.
+pub fn build_n2_sm_setup_request_transfer(
+    upf_teid: u32,
+    upf_addr: [u8; 4],
+    qfi: u8,
+    five_qi: u16,
+    arp_priority_level: u8,
+) -> Option<Vec<u8>> {
+    let transfer = PduSessionResourceSetupRequestTransfer {
+        pdu_session_aggregate_maximum_bit_rate: None,
+        ul_ngu_up_tnl_information: UpTransportLayerInformation::GtpTunnel(GtpTunnel {
+            transport_layer_address: TransportLayerAddress::from_ipv4(upf_addr),
+            gtp_teid: upf_teid.to_be_bytes(),
+        }),
+        data_forwarding_not_possible: false,
+        pdu_session_type: PduSessionType::Ipv4,
+        security_indication: None,
+        network_instance: None,
+        qos_flow_setup_request_list: vec![QosFlowSetupRequestItem {
+            qos_flow_identifier: qfi,
+            qos_flow_level_qos_parameters: QosFlowLevelQosParameters {
+                qos_characteristics: QosCharacteristics::NonDynamic5qi(
+                    NonDynamic5qiDescriptor::new(five_qi),
+                ),
+                allocation_and_retention_priority: AllocationAndRetentionPriority {
+                    priority_level_arp: arp_priority_level,
+                    pre_emption_capability: PreEmptionCapability::ShallNotTriggerPreEmption,
+                    pre_emption_vulnerability: PreEmptionVulnerability::NotPreEmptable,
+                },
+                gbr_qos_information: None,
+                reflective_qos_attribute: false,
+                additional_qos_flow_information: false,
+            },
+            e_rab_id: None,
+        }],
+    };
+
+    match transfer.encode() {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::error!("Failed to encode PDUSessionResourceSetupRequestTransfer: {e:?}");
+            None
+        }
+    }
+}
+
+/// gNB DL tunnel endpoint extracted from a setup-response transfer
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GnbN3Endpoint {
+    /// gNB GTP-U TEID
+    pub teid: u32,
+    /// gNB transport address (IPv4 when 4 octets)
+    pub address: Vec<u8>,
+    /// Associated QoS flow identifiers
+    pub qfis: Vec<u8>,
+}
+
+/// Decode an APER PDUSessionResourceSetupResponseTransfer
+/// (TS 38.413 Section 9.3.4.2) and extract the gNB DL N3 endpoint.
+pub fn parse_n2_sm_setup_response_transfer(data: &[u8]) -> Option<GnbN3Endpoint> {
+    let transfer = match PduSessionResourceSetupResponseTransfer::decode(data) {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!("Failed to decode PDUSessionResourceSetupResponseTransfer: {e:?}");
+            return None;
+        }
+    };
+
+    let UpTransportLayerInformation::GtpTunnel(tunnel) = &transfer
+        .dl_qos_flow_per_tnl_information
+        .up_transport_layer_information;
+
+    Some(GnbN3Endpoint {
+        teid: u32::from_be_bytes(tunnel.gtp_teid),
+        address: tunnel.transport_layer_address.octets.clone(),
+        qfis: transfer
+            .dl_qos_flow_per_tnl_information
+            .associated_qos_flow_list
+            .iter()
+            .map(|f| f.qos_flow_identifier)
+            .collect(),
+    })
 }
 
 #[cfg(test)]
@@ -780,5 +918,171 @@ mod tests {
         assert_eq!(plmn.mnc1, 0);
         assert_eq!(plmn.mnc2, 7);
         assert_eq!(plmn.mnc3, 0xF); // 2-digit MNC indicator
+    }
+
+    #[test]
+    fn test_ng_setup_failure_real_causes_roundtrip() {
+        // Protocol / semantic-error (missing mandatory IE)
+        let bytes = build_ng_setup_failure_asn1(3, 4, Some(0));
+        match parser::decode_ngap_pdu(&bytes).expect("decode") {
+            NgapMessage::NgSetupFailure(f) => {
+                assert_eq!(f.cause, Cause::Protocol(CauseProtocol::SemanticError));
+                assert_eq!(f.time_to_wait, Some(TimeToWait::V1s));
+            }
+            other => panic!("Expected NgSetupFailure, got {other:?}"),
+        }
+
+        // Misc / unknown-PLMN-or-SNPN (no served TAI overlap)
+        let bytes = build_ng_setup_failure_asn1(4, 4, Some(0));
+        match parser::decode_ngap_pdu(&bytes).expect("decode") {
+            NgapMessage::NgSetupFailure(f) => {
+                assert_eq!(f.cause, Cause::Misc(CauseMisc::UnknownPlmnOrSnpn));
+            }
+            other => panic!("Expected NgSetupFailure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_ue_context_release_command_cause_roundtrip() {
+        // group 0 = RadioNetwork, value 20 = user-inactivity
+        let bytes = build_ue_context_release_command_asn1(42, 1001, 0, 20).expect("build");
+        match parser::decode_ngap_pdu(&bytes).expect("decode") {
+            NgapMessage::UeContextReleaseCommand(cmd) => {
+                assert_eq!(
+                    cmd.cause,
+                    Cause::RadioNetwork(CauseRadioNetwork::UserInactivity)
+                );
+                match cmd.ue_ngap_ids {
+                    UeNgapIds::Pair {
+                        amf_ue_ngap_id,
+                        ran_ue_ngap_id,
+                    } => {
+                        assert_eq!(amf_ue_ngap_id, 42);
+                        assert_eq!(ran_ue_ngap_id, 1001);
+                    }
+                    other => panic!("Expected Pair, got {other:?}"),
+                }
+            }
+            other => panic!("Expected UeContextReleaseCommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_ng_reset_acknowledge_full_roundtrip() {
+        let bytes = build_ng_reset_acknowledge_asn1(None).expect("build");
+        match parser::decode_ngap_pdu(&bytes).expect("decode") {
+            NgapMessage::NgResetAcknowledge(ack) => {
+                assert!(ack.connections.is_none());
+            }
+            other => panic!("Expected NgResetAcknowledge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_ng_reset_acknowledge_partial_roundtrip() {
+        let connections = vec![
+            UeAssociatedLogicalNgConnectionItem {
+                amf_ue_ngap_id: Some(7),
+                ran_ue_ngap_id: Some(70),
+            },
+            UeAssociatedLogicalNgConnectionItem {
+                amf_ue_ngap_id: Some(8),
+                ran_ue_ngap_id: None,
+            },
+        ];
+        let bytes = build_ng_reset_acknowledge_asn1(Some(connections.clone())).expect("build");
+        match parser::decode_ngap_pdu(&bytes).expect("decode") {
+            NgapMessage::NgResetAcknowledge(ack) => {
+                assert_eq!(ack.connections, Some(connections));
+            }
+            other => panic!("Expected NgResetAcknowledge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_n2_sm_setup_request_transfer_roundtrip() {
+        let bytes = build_n2_sm_setup_request_transfer(0x0000_0001, [127, 0, 0, 1], 9, 9, 8)
+            .expect("build");
+        let decoded =
+            PduSessionResourceSetupRequestTransfer::decode(&bytes).expect("transfer decode");
+
+        let UpTransportLayerInformation::GtpTunnel(tunnel) = &decoded.ul_ngu_up_tnl_information;
+        assert_eq!(tunnel.gtp_teid, [0, 0, 0, 1]);
+        assert_eq!(tunnel.transport_layer_address.octets, vec![127, 0, 0, 1]);
+        assert_eq!(tunnel.transport_layer_address.bit_len, 32);
+        assert_eq!(decoded.pdu_session_type, PduSessionType::Ipv4);
+        assert_eq!(decoded.qos_flow_setup_request_list.len(), 1);
+        let flow = &decoded.qos_flow_setup_request_list[0];
+        assert_eq!(flow.qos_flow_identifier, 9);
+        match &flow.qos_flow_level_qos_parameters.qos_characteristics {
+            QosCharacteristics::NonDynamic5qi(desc) => assert_eq!(desc.five_qi, 9),
+            other => panic!("Expected NonDynamic5qi, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_n2_sm_setup_response_transfer() {
+        use ogs_ngap::transfer::{AssociatedQosFlowItem, QosFlowPerTnlInformation};
+
+        let response = PduSessionResourceSetupResponseTransfer {
+            dl_qos_flow_per_tnl_information: QosFlowPerTnlInformation {
+                up_transport_layer_information: UpTransportLayerInformation::GtpTunnel(GtpTunnel {
+                    transport_layer_address: TransportLayerAddress::from_ipv4([10, 45, 0, 3]),
+                    gtp_teid: [0xde, 0xad, 0xbe, 0xef],
+                }),
+                associated_qos_flow_list: vec![AssociatedQosFlowItem {
+                    qos_flow_identifier: 9,
+                    qos_flow_mapping_indication: None,
+                }],
+            },
+            additional_dl_qos_flow_per_tnl_information: None,
+            security_result: None,
+            qos_flow_failed_to_setup_list: Vec::new(),
+        };
+        let bytes = response.encode().expect("encode");
+
+        let endpoint = parse_n2_sm_setup_response_transfer(&bytes).expect("parse");
+        assert_eq!(endpoint.teid, 0xdeadbeef);
+        assert_eq!(endpoint.address, vec![10, 45, 0, 3]);
+        assert_eq!(endpoint.qfis, vec![9]);
+
+        // Strict: garbage bytes are rejected, not best-effort parsed
+        assert!(parse_n2_sm_setup_response_transfer(&[0x09, 0x00, 0x00]).is_none());
+    }
+
+    #[test]
+    fn test_release_command_carries_release_transfer() {
+        use ogs_asn1c::ngap::pdu::{InitiatingMessageValue, NgapPdu};
+        use ogs_asn1c::per::{AperDecode, AperDecoder};
+
+        let bytes = build_pdu_session_resource_release_command_asn1(42, 1001, &[5]).expect("build");
+
+        // ogs-asn1c maps InitiatingMessage procedure code 28 to the generic
+        // `Other` container and the ogs-ngap dispatch does not cover it (lib
+        // gap, reported); re-tag the value so the typed release-command parse
+        // path is exercised via decode_ngap_pdu_raw.
+        let mut decoder = AperDecoder::new(&bytes);
+        let pdu = NgapPdu::decode_aper(&mut decoder).expect("pdu decode");
+        let pdu = match pdu {
+            NgapPdu::InitiatingMessage(mut msg) => {
+                if let InitiatingMessageValue::Other(ies) = msg.value {
+                    msg.value = InitiatingMessageValue::PduSessionResourceReleaseCommand(ies);
+                }
+                NgapPdu::InitiatingMessage(msg)
+            }
+            other => other,
+        };
+
+        match parser::decode_ngap_pdu_raw(pdu).expect("decode") {
+            NgapMessage::PduSessionResourceReleaseCommand(cmd) => {
+                assert_eq!(cmd.pdu_session_list.len(), 1);
+                let item = &cmd.pdu_session_list[0];
+                assert_eq!(item.pdu_session_id, 5);
+                let transfer = PduSessionResourceReleaseCommandTransfer::decode(&item.transfer)
+                    .expect("transfer decode");
+                assert_eq!(transfer.cause, Cause::Nas(CauseNas::NormalRelease));
+            }
+            other => panic!("Expected PduSessionResourceReleaseCommand, got {other:?}"),
+        }
     }
 }

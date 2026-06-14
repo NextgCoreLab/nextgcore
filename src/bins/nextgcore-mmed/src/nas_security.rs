@@ -696,6 +696,25 @@ mod tests {
     }
 
     #[test]
+    fn test_eia2_ts33401_test_set_2() {
+        // 128-EIA2 Test Set 2 from TS 33.401 Annex C.2:
+        // the CMAC input block must be laid out as
+        // COUNT[32] || BEARER[5] || DIRECTION[1] || 0^26 || MESSAGE
+        // (octet 4 = bearer<<3 | direction<<2) per Annex B.2.3.
+        let key: [u8; 16] = [
+            0xd3, 0xc5, 0xd5, 0x92, 0x32, 0x7f, 0xb1, 0x1c, 0x40, 0x35, 0xc6, 0x68, 0x0a, 0xf8,
+            0xc6, 0xd1,
+        ];
+        let count = 0x398a_59b4;
+        let bearer = 0x1a;
+        let direction = 1;
+        let message: [u8; 8] = [0x48, 0x45, 0x83, 0xd5, 0xaf, 0xe0, 0x82, 0xae];
+
+        let mac = nas_mac_calculate(2, &key, count, bearer, direction, &message);
+        assert_eq!(mac, [0xb9, 0x37, 0x87, 0xe6]);
+    }
+
+    #[test]
     fn test_nas_encrypt_null_algorithm() {
         let key = [0u8; 16];
         let mut message = vec![1, 2, 3, 4];

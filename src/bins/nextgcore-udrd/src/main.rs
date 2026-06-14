@@ -9,12 +9,17 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use nextgcore_udrd::data_store::{
+    self, merge_patch, notify_application_data_change, notify_exposure_data_change,
+    notify_influence_data_change, notify_subscription_data_change, SubKind,
+};
 use nextgcore_udrd::{
     udr_context_final, udr_context_init, udr_sbi_close, udr_sbi_open, SbiServerConfig, UdrSmContext,
 };
 use ogs_sbi::message::{SbiRequest, SbiResponse};
+use ogs_sbi::oauth::JwksCache;
 use ogs_sbi::server::{
-    send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
+    send_bad_request, send_error, send_method_not_allowed, send_not_found, SbiServer,
     SbiServerConfig as OgsSbiServerConfig,
 };
 use serde::Deserialize;
@@ -85,8 +90,23 @@ struct SbiClientYaml {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct SbiOauth2Yaml {
+    /// Require a valid OAuth2 bearer token on every incoming SBI request.
+    /// Verification keys are fetched from the configured NRF's JWKS endpoint.
+    require: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SbiServerYaml {
+    address: Option<String>,
+    port: Option<u16>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct SbiYaml {
+    server: Option<Vec<SbiServerYaml>>,
     client: Option<SbiClientYaml>,
+    oauth2: Option<SbiOauth2Yaml>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -104,7 +124,7 @@ static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
 
     // Initialize logging
     init_logging(&args)?;
@@ -149,24 +169,39 @@ async fn main() -> Result<()> {
         log::warn!("No db_uri configured, UDR will return hardcoded test data");
     }
 
-    // Seed NRF URI into SBI context for NF registration
+    // Seed NRF URI into SBI context for NF registration, and pick up the
+    // OAuth2 enforcement knob (udr.sbi.oauth2.require).
+    let mut nrf_uri_cfg: Option<String> = None;
+    let mut require_oauth2 = false;
     if let Ok(content) = std::fs::read_to_string(&args.config) {
         if let Ok(yaml) = serde_yaml::from_str::<UdrYaml>(&content) {
-            if let Some(udr) = yaml.udr {
-                if let Some(sbi) = udr.sbi {
-                    if let Some(client) = sbi.client {
-                        if let Some(nrf_list) = client.nrf {
-                            if let Some(nrf) = nrf_list.first() {
-                                log::info!("NRF URI configured: {}", nrf.uri);
-                                ogs_sbi::context::global_context()
-                                    .set_nrf_uri(&nrf.uri)
-                                    .await;
-                            }
-                        }
+            if let Some(sbi) = yaml.udr.and_then(|udr| udr.sbi) {
+                // Override the advertised/bind SBI address with the routable
+                // address from config so the NRF NFProfile advertises a
+                // reachable endpoint (not 0.0.0.0).
+                if let Some(server) = sbi.server.as_ref().and_then(|s| s.first()) {
+                    if let Some(addr) = &server.address {
+                        args.sbi_addr = addr.clone();
+                    }
+                    if let Some(port) = server.port {
+                        args.sbi_port = port;
                     }
                 }
+                nrf_uri_cfg = sbi
+                    .client
+                    .and_then(|client| client.nrf)
+                    .and_then(|nrf_list| nrf_list.into_iter().next())
+                    .map(|nrf| nrf.uri);
+                require_oauth2 = sbi
+                    .oauth2
+                    .and_then(|oauth2| oauth2.require)
+                    .unwrap_or(false);
             }
         }
+    }
+    if let Some(uri) = &nrf_uri_cfg {
+        log::info!("NRF URI configured: {uri}");
+        ogs_sbi::context::global_context().set_nrf_uri(uri).await;
     }
 
     // Build SBI server configuration (legacy, for context)
@@ -185,7 +220,23 @@ async fn main() -> Result<()> {
     let sbi_addr: SocketAddr = format!("{}:{}", args.sbi_addr, args.sbi_port)
         .parse()
         .context("Invalid SBI address")?;
-    let sbi_server = SbiServer::new(OgsSbiServerConfig::new(sbi_addr));
+    let mut sbi_server_config = OgsSbiServerConfig::new(sbi_addr);
+    if require_oauth2 {
+        // Verify bearer tokens against the NRF's published keys (auth stage
+        // 4b). With no NRF URI configured the server fails closed.
+        sbi_server_config.require_oauth2 = true;
+        sbi_server_config.oauth2_jwks_uri = nrf_uri_cfg
+            .as_deref()
+            .map(|uri| JwksCache::for_nrf(uri).jwks_uri().to_string());
+        log::info!(
+            "OAuth2 enforcement enabled (JWKS: {})",
+            sbi_server_config
+                .oauth2_jwks_uri
+                .as_deref()
+                .unwrap_or("UNCONFIGURED")
+        );
+    }
+    let sbi_server = SbiServer::new(sbi_server_config);
 
     sbi_server
         .start(udr_sbi_request_handler)
@@ -272,13 +323,63 @@ async fn udr_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let resource_type = parts.get(2).copied().unwrap_or("");
 
     match resource_type {
+        "subscription-data" if parts.get(3).copied() == Some("subs-to-notify") => {
+            handle_subscription_data_subs(&parts, method, &request).await
+        }
         "subscription-data" => handle_subscription_data(&parts, method, &request).await,
         "policy-data" => handle_policy_data(&parts, method, &request).await,
+        "exposure-data" => handle_exposure_data(&parts, method, &request).await,
+        "application-data" => handle_application_data(&parts, method, &request).await,
         _ => {
             log::warn!("Unknown UDR resource: {method} {uri}");
             send_not_found(&format!("Unknown resource: {resource_type}"), None)
         }
     }
+}
+
+/// 400 ProblemDetails for a missing mandatory attribute.
+fn missing_mandatory(attr: &str) -> SbiResponse {
+    send_error(
+        400,
+        "Bad Request",
+        &format!("Missing mandatory attribute: {attr}"),
+        Some("MANDATORY_IE_MISSING"),
+    )
+}
+
+/// Parse a JSON request body, or produce a 400 ProblemDetails.
+fn parse_json_body(request: &SbiRequest) -> Result<serde_json::Value, Box<SbiResponse>> {
+    let content = request.http.content.as_deref().ok_or_else(|| {
+        Box::new(send_bad_request(
+            "Missing request body",
+            Some("MANDATORY_IE_MISSING"),
+        ))
+    })?;
+    serde_json::from_str(content).map_err(|e| {
+        Box::new(send_bad_request(
+            &format!("Invalid JSON: {e}"),
+            Some("INVALID_MSG_FORMAT"),
+        ))
+    })
+}
+
+/// Minimal percent-decoding for query parameter values.
+fn pct_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Handle subscription-data requests
@@ -334,7 +435,17 @@ async fn handle_subscription_data(
         "context-data" => handle_context_data(supi, parts, method, request).await,
         _ => {
             // Check if parts[4] is a PLMN ID and parts[5] = "provisioned-data"
+            // (PLMN-scoped layout per TS 29.504:
+            //  /subscription-data/{ueId}/{servingPlmnId}/provisioned-data/...)
             if parts.get(5).copied() == Some("provisioned-data") {
+                if !is_valid_plmn_id(sub_resource) {
+                    return send_error(
+                        400,
+                        "Bad Request",
+                        &format!("Invalid servingPlmnId: {sub_resource}"),
+                        Some("MANDATORY_IE_INCORRECT"),
+                    );
+                }
                 handle_provisioned_data(supi, parts, 6, method).await
             } else if parts.get(5).copied() == Some("context-data") {
                 handle_context_data(supi, parts, method, request).await
@@ -344,6 +455,11 @@ async fn handle_subscription_data(
             }
         }
     }
+}
+
+/// VarPlmnId per TS 29.505: 5 or 6 digits (MCC+MNC).
+fn is_valid_plmn_id(s: &str) -> bool {
+    (s.len() == 5 || s.len() == 6) && s.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Handle authentication-data requests
@@ -360,18 +476,9 @@ async fn handle_auth_data(
         ("authentication-subscription", "GET") => {
             log::info!("[{supi}] GET authentication-subscription");
 
-            match ogs_dbi::subscription::ogs_dbi_auth_info(supi) {
+            match ogs_dbi::subscription::ogs_dbi_auth_info_async(supi.to_string()).await {
                 Ok(auth_info) => {
-                    let response_json = serde_json::json!({
-                        "authenticationMethod": "5G_AKA",
-                        "encPermanentKey": bytes_to_hex(&auth_info.k),
-                        "encOpcKey": bytes_to_hex(if auth_info.use_opc { &auth_info.opc } else { &auth_info.op }),
-                        "authenticationManagementField": bytes_to_hex(&auth_info.amf),
-                        "sequenceNumber": {
-                            "sqn": format!("{:012x}", auth_info.sqn & 0xFFFFFFFFFFFF)
-                        }
-                    });
-
+                    let response_json = build_auth_subscription_json(supi, &auth_info);
                     log::info!("[{supi}] Returning auth subscription data");
                     SbiResponse::with_status(200)
                         .with_body(response_json.to_string(), "application/json")
@@ -379,6 +486,90 @@ async fn handle_auth_data(
                 Err(e) => {
                     log::error!("[{supi}] DB auth_info query failed: {e:?}");
                     send_not_found("Subscriber not found", Some("NOT_FOUND"))
+                }
+            }
+        }
+        ("authentication-subscription", "PUT") => {
+            // Provisioning path: create/replace the stored
+            // AuthenticationSubscription credentials.
+            log::info!("[{supi}] PUT authentication-subscription");
+            let body = match parse_json_body(request) {
+                Ok(v) => v,
+                Err(resp) => return *resp,
+            };
+            if body
+                .get("authenticationMethod")
+                .and_then(|v| v.as_str())
+                .is_none()
+            {
+                return missing_mandatory("authenticationMethod");
+            }
+            let k_hex = match body.get("encPermanentKey").and_then(|v| v.as_str()) {
+                Some(k) if k.len() == 32 && k.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                    k.to_string()
+                }
+                Some(_) => {
+                    return send_error(
+                        400,
+                        "Bad Request",
+                        "encPermanentKey must be 32 hex characters",
+                        Some("MANDATORY_IE_INCORRECT"),
+                    )
+                }
+                None => return missing_mandatory("encPermanentKey"),
+            };
+            let provision = ogs_dbi::subscription::OgsDbiAuthProvision {
+                k_hex,
+                opc_hex: body
+                    .get("encOpcKey")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                op_hex: None,
+                amf_hex: body
+                    .get("authenticationManagementField")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("8000")
+                    .to_string(),
+                sqn: body
+                    .get("sequenceNumber")
+                    .and_then(|v| v.get("sqn"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| u64::from_str_radix(s, 16).ok())
+                    .unwrap_or(0),
+            };
+            match ogs_dbi::subscription::ogs_dbi_provision_auth_info_async(
+                supi.to_string(),
+                provision,
+            )
+            .await
+            {
+                Ok(created) => {
+                    let path = format!(
+                        "/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-subscription"
+                    );
+                    notify_subscription_data_change(supi, &path, Some(&body));
+                    if created {
+                        SbiResponse::with_status(201)
+                            .with_header("Location", path)
+                            .with_body(body.to_string(), "application/json")
+                    } else {
+                        SbiResponse::with_status(204)
+                    }
+                }
+                Err(ogs_dbi::DbiError::NotInitialized) => send_error(
+                    503,
+                    "Service Unavailable",
+                    "Subscriber database unavailable",
+                    Some("SYSTEM_FAILURE"),
+                ),
+                Err(e) => {
+                    log::error!("[{supi}] DB provision failed: {e:?}");
+                    send_error(
+                        500,
+                        "Internal Server Error",
+                        "Failed to provision authentication subscription",
+                        Some("SYSTEM_FAILURE"),
+                    )
                 }
             }
         }
@@ -394,8 +585,11 @@ async fn handle_auth_data(
                             if path == "/sequenceNumber/sqn" {
                                 if let Some(sqn_hex) = patch.get("value").and_then(|v| v.as_str()) {
                                     let sqn = u64::from_str_radix(sqn_hex, 16).unwrap_or(0);
-                                    if let Err(e) =
-                                        ogs_dbi::subscription::ogs_dbi_update_sqn(supi, sqn)
+                                    if let Err(e) = ogs_dbi::subscription::ogs_dbi_update_sqn_async(
+                                        supi.to_string(),
+                                        sqn,
+                                    )
+                                    .await
                                     {
                                         log::error!("[{supi}] DB update_sqn failed: {e:?}");
                                     }
@@ -407,7 +601,9 @@ async fn handle_auth_data(
             }
 
             // Increment SQN for next use
-            if let Err(e) = ogs_dbi::subscription::ogs_dbi_increment_sqn(supi) {
+            if let Err(e) =
+                ogs_dbi::subscription::ogs_dbi_increment_sqn_async(supi.to_string()).await
+            {
                 log::error!("[{supi}] DB increment_sqn failed: {e:?}");
             }
 
@@ -416,7 +612,9 @@ async fn handle_auth_data(
         ("authentication-status", "PUT") | ("authentication-status", "DELETE") => {
             log::info!("[{supi}] {method} authentication-status");
 
-            if let Err(e) = ogs_dbi::subscription::ogs_dbi_increment_sqn(supi) {
+            if let Err(e) =
+                ogs_dbi::subscription::ogs_dbi_increment_sqn_async(supi.to_string()).await
+            {
                 log::error!("[{supi}] DB increment_sqn failed: {e:?}");
             }
 
@@ -454,7 +652,7 @@ async fn handle_context_data(
     log::info!("[{supi}] {method} context-data/{resource}");
 
     match resource {
-        "amf-3gpp-access" => handle_amf_3gpp_access(supi, method, request),
+        "amf-3gpp-access" => handle_amf_3gpp_access(supi, method, request).await,
         "smf-registrations" => {
             let pdu_session_id = parts.get(resource_idx + 1).copied().unwrap_or("");
             handle_smf_registrations(supi, method, request, pdu_session_id)
@@ -466,69 +664,124 @@ async fn handle_context_data(
     }
 }
 
-/// Handle AMF 3GPP access registration context
-fn handle_amf_3gpp_access(supi: &str, method: &str, request: &SbiRequest) -> SbiResponse {
+/// Path of the amf-3gpp-access resource for a SUPI (notification resourceId).
+fn amf_3gpp_access_path(supi: &str) -> String {
+    format!("/nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access")
+}
+
+/// Handle AMF 3GPP access registration context (TS 29.505).
+///
+/// Stores and returns the full Amf3GppAccessRegistration document: the
+/// shape PUT here by udmd (forwarding the amfd Nudm registration) is
+/// preserved verbatim and echoed on GET.
+async fn handle_amf_3gpp_access(supi: &str, method: &str, request: &SbiRequest) -> SbiResponse {
     let udr_ctx = nextgcore_udrd::context::udr_self();
+    let ds = data_store::store();
     match method {
-        "GET" => {
-            let found = udr_ctx
-                .read()
-                .ok()
-                .and_then(|ctx| ctx.ue_find(supi).map(|_| true))
-                .unwrap_or(false);
-            if found {
-                log::debug!("[{supi}] GET amf-3gpp-access - UE context found");
-                let response = serde_json::json!({
-                    "amfInstanceId": "00000000-0000-0000-0000-000000000000",
-                    "supi": supi,
-                    "dereguCallbackUri": "",
-                    "ratType": "NR",
-                    "initialRegistrationInd": false
-                });
-                SbiResponse::with_status(200).with_body(response.to_string(), "application/json")
-            } else {
-                send_not_found(
-                    "AMF registration context not found",
-                    Some("CONTEXT_NOT_FOUND"),
-                )
+        "GET" => match ds.amf_3gpp_get(supi) {
+            Some(doc) => {
+                log::debug!("[{supi}] GET amf-3gpp-access - registration found");
+                SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
             }
-        }
+            None => send_not_found(
+                "AMF registration context not found",
+                Some("CONTEXT_NOT_FOUND"),
+            ),
+        },
         "PUT" => {
-            if let Some(content) = &request.http.content {
-                if let Ok(reg_data) = serde_json::from_str::<serde_json::Value>(content) {
-                    if let Some(pei) = reg_data.get("pei").and_then(|v| v.as_str()) {
-                        let imeisv = pei.strip_prefix("imeisv-").unwrap_or(pei);
-                        if let Err(e) = ogs_dbi::subscription::ogs_dbi_update_imeisv(supi, imeisv) {
-                            log::error!("[{supi}] DB update_imeisv failed: {e:?}");
-                        }
-                    }
+            let reg_data = match parse_json_body(request) {
+                Ok(v) => v,
+                Err(resp) => return *resp,
+            };
+            // Mandatory attributes per TS 29.503 Amf3GppAccessRegistration
+            for attr in ["amfInstanceId", "deregCallbackUri", "guami", "ratType"] {
+                if reg_data.get(attr).is_none() {
+                    return missing_mandatory(attr);
+                }
+            }
+            // Persist the PEI (IMEISV) claim off-thread (last live
+            // blocking Mongo call moved to the spawn_blocking wrapper).
+            if let Some(pei) = reg_data.get("pei").and_then(|v| v.as_str()) {
+                let imeisv = pei.strip_prefix("imeisv-").unwrap_or(pei).to_string();
+                if let Err(e) =
+                    ogs_dbi::subscription::ogs_dbi_update_imeisv_async(supi.to_string(), imeisv)
+                        .await
+                {
+                    log::debug!("[{supi}] DB update_imeisv unavailable: {e:?}");
                 }
             }
             if let Ok(mut ctx) = udr_ctx.write() {
                 ctx.ue_find_or_add(supi);
             }
-            SbiResponse::with_status(204)
+            let created = ds.amf_3gpp_put(supi, reg_data.clone());
+            let path = amf_3gpp_access_path(supi);
+            notify_subscription_data_change(supi, &path, Some(&reg_data));
+            if created {
+                SbiResponse::with_status(201)
+                    .with_header("Location", path)
+                    .with_body(reg_data.to_string(), "application/json")
+            } else {
+                SbiResponse::with_status(204)
+            }
         }
         "PATCH" => {
-            if let Some(content) = &request.http.content {
-                if let Ok(patches) = serde_json::from_str::<serde_json::Value>(content) {
-                    if let Some(arr) = patches.as_array() {
-                        for patch in arr {
-                            let path = patch.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                            if path == "/purgeFlag" {
-                                if let Some(purge) = patch.get("value").and_then(|v| v.as_bool()) {
-                                    log::debug!("[{supi}] Setting purge flag to {purge}");
-                                }
+            let Some(mut doc) = ds.amf_3gpp_get(supi) else {
+                return send_not_found(
+                    "AMF registration context not found",
+                    Some("CONTEXT_NOT_FOUND"),
+                );
+            };
+            let patch_body = match parse_json_body(request) {
+                Ok(v) => v,
+                Err(resp) => return *resp,
+            };
+            if let Some(items) = patch_body.as_array() {
+                // PatchItemList (application/json-patch+json)
+                for patch in items {
+                    let op = patch.get("op").and_then(|v| v.as_str()).unwrap_or("");
+                    let path = patch.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                    let key = path.trim_start_matches('/');
+                    if key.is_empty() || key.contains('/') {
+                        continue; // only top-level attributes are patchable here
+                    }
+                    match op {
+                        "replace" | "add" => {
+                            if let (Some(obj), Some(value)) =
+                                (doc.as_object_mut(), patch.get("value"))
+                            {
+                                obj.insert(key.to_string(), value.clone());
                             }
+                        }
+                        "remove" => {
+                            if let Some(obj) = doc.as_object_mut() {
+                                obj.remove(key);
+                            }
+                        }
+                        _ => {
+                            return send_bad_request(
+                                &format!("Unsupported patch op: {op}"),
+                                Some("INVALID_MSG_FORMAT"),
+                            )
                         }
                     }
                 }
+            } else if patch_body.is_object() {
+                // Amf3GppAccessRegistrationModification-style merge
+                merge_patch(&mut doc, &patch_body);
+            } else {
+                return send_bad_request("Invalid patch document", Some("INVALID_MSG_FORMAT"));
             }
+            ds.amf_3gpp_put(supi, doc.clone());
+            notify_subscription_data_change(supi, &amf_3gpp_access_path(supi), Some(&doc));
             SbiResponse::with_status(204)
         }
         "DELETE" => {
+            let existed = ds.amf_3gpp_remove(supi).is_some();
             if let Ok(mut ctx) = udr_ctx.write() {
                 ctx.ue_remove(supi);
+            }
+            if existed {
+                notify_subscription_data_change(supi, &amf_3gpp_access_path(supi), None);
             }
             SbiResponse::with_status(204)
         }
@@ -630,13 +883,14 @@ async fn handle_provisioned_data(
 
     log::info!("[{supi}] GET provisioned-data/{dataset}");
 
-    let subscription_data = match ogs_dbi::subscription::ogs_dbi_subscription_data(supi) {
-        Ok(data) => data,
-        Err(e) => {
-            log::error!("[{supi}] DB subscription_data query failed: {e:?}");
-            return send_not_found("Subscriber not found", Some("NOT_FOUND"));
-        }
-    };
+    let subscription_data =
+        match ogs_dbi::subscription::ogs_dbi_subscription_data_async(supi.to_string()).await {
+            Ok(data) => data,
+            Err(e) => {
+                log::error!("[{supi}] DB subscription_data query failed: {e:?}");
+                return send_not_found("Subscriber not found", Some("NOT_FOUND"));
+            }
+        };
 
     let response = match dataset {
         "am-data" => build_am_data(&subscription_data),
@@ -701,7 +955,9 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
             match method {
                 "GET" => {
                     log::debug!("[{supi}] GET policy sm-data");
-                    match ogs_dbi::subscription::ogs_dbi_subscription_data(supi) {
+                    match ogs_dbi::subscription::ogs_dbi_subscription_data_async(supi.to_string())
+                        .await
+                    {
                         Ok(data) => {
                             let sm_policy_snssai_data = build_sm_policy_data(&data);
                             let response =
@@ -730,7 +986,9 @@ async fn handle_policy_data(parts: &[&str], method: &str, request: &SbiRequest) 
                     log::debug!("[{supi}] GET ue-policy-set");
                     // UePolicySet - contains URSP rules, ANDSP, etc.
                     // Per TS 29.519, return UE policy set from DB or defaults
-                    match ogs_dbi::subscription::ogs_dbi_subscription_data(supi) {
+                    match ogs_dbi::subscription::ogs_dbi_subscription_data_async(supi.to_string())
+                        .await
+                    {
                         Ok(data) => {
                             // Build a minimal UePolicySet with subscribed S-NSSAIs
                             let mut subscribed_ue_pol_sections = serde_json::Map::new();
@@ -812,6 +1070,591 @@ fn build_sm_policy_data(
         sm_policy_snssai_data.insert(snssai_key, serde_json::Value::Object(snssai_data));
     }
     sm_policy_snssai_data
+}
+
+// ============================================================================
+// subscription-data/subs-to-notify (TS 29.505)
+// ============================================================================
+
+/// Handle /nudr-dr/v1/subscription-data/subs-to-notify[/{subsId}]
+async fn handle_subscription_data_subs(
+    parts: &[&str],
+    method: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    let ds = data_store::store();
+    match parts.get(4).copied() {
+        // Collection: /subscription-data/subs-to-notify
+        None => match method {
+            "POST" => {
+                let body = match parse_json_body(request) {
+                    Ok(v) => v,
+                    Err(resp) => return *resp,
+                };
+                let Some(cb) = body.get("callbackReference").and_then(|v| v.as_str()) else {
+                    return missing_mandatory("callbackReference");
+                };
+                if body
+                    .get("monitoredResourceUris")
+                    .and_then(|v| v.as_array())
+                    .is_none()
+                {
+                    return missing_mandatory("monitoredResourceUris");
+                }
+                let cb = cb.to_string();
+                let mut stored_body = body;
+                let sub = ds.sub_create(SubKind::SubscriptionData, &cb, serde_json::Value::Null);
+                if let Some(obj) = stored_body.as_object_mut() {
+                    obj.insert(
+                        "subscriptionId".to_string(),
+                        serde_json::Value::String(sub.id.clone()),
+                    );
+                }
+                ds.sub_set_body(&sub.id, stored_body.clone(), None);
+                SbiResponse::with_status(201)
+                    .with_header(
+                        "Location",
+                        format!("/nudr-dr/v1/subscription-data/subs-to-notify/{}", sub.id),
+                    )
+                    .with_body(stored_body.to_string(), "application/json")
+            }
+            "GET" => {
+                let Some(ue_id) = request.http.params.get("ue-id").cloned() else {
+                    return send_bad_request(
+                        "Missing mandatory query parameter: ue-id",
+                        Some("MANDATORY_QUERY_PARAM_MISSING"),
+                    );
+                };
+                let subs = ds.subs_matching(SubKind::SubscriptionData, |s| {
+                    s.body.get("ueId").and_then(|v| v.as_str()) == Some(ue_id.as_str())
+                });
+                let list: Vec<serde_json::Value> = subs.into_iter().map(|s| s.body).collect();
+                SbiResponse::with_status(200).with_body(
+                    serde_json::Value::Array(list).to_string(),
+                    "application/json",
+                )
+            }
+            "DELETE" => {
+                let Some(ue_id) = request.http.params.get("ue-id").cloned() else {
+                    return send_bad_request(
+                        "Missing mandatory query parameter: ue-id",
+                        Some("MANDATORY_QUERY_PARAM_MISSING"),
+                    );
+                };
+                ds.subs_remove_by_ue(&ue_id);
+                SbiResponse::with_status(204)
+            }
+            _ => send_method_not_allowed(method, "subscription-data/subs-to-notify"),
+        },
+        // Document: /subscription-data/subs-to-notify/{subsId}
+        Some(subs_id) => match method {
+            "GET" => match ds.sub_get(subs_id) {
+                Some(sub) if sub.kind == SubKind::SubscriptionData => SbiResponse::with_status(200)
+                    .with_body(sub.body.to_string(), "application/json"),
+                _ => send_not_found("Subscription not found", Some("DATA_NOT_FOUND")),
+            },
+            "PATCH" => {
+                let Some(sub) = ds.sub_get(subs_id) else {
+                    return send_not_found("Subscription not found", Some("DATA_NOT_FOUND"));
+                };
+                if sub.kind != SubKind::SubscriptionData {
+                    return send_not_found("Subscription not found", Some("DATA_NOT_FOUND"));
+                }
+                let patch_body = match parse_json_body(request) {
+                    Ok(v) => v,
+                    Err(resp) => return *resp,
+                };
+                let Some(items) = patch_body.as_array() else {
+                    return send_bad_request(
+                        "PATCH body must be a PatchItem array",
+                        Some("INVALID_MSG_FORMAT"),
+                    );
+                };
+                let mut body = sub.body;
+                for patch in items {
+                    let op = patch.get("op").and_then(|v| v.as_str()).unwrap_or("");
+                    let path = patch.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                    let key = path.trim_start_matches('/');
+                    if !matches!(op, "replace" | "add") || key.is_empty() || key.contains('/') {
+                        return send_bad_request(
+                            &format!("Unsupported patch: {op} {path}"),
+                            Some("INVALID_MSG_FORMAT"),
+                        );
+                    }
+                    if let (Some(obj), Some(value)) = (body.as_object_mut(), patch.get("value")) {
+                        obj.insert(key.to_string(), value.clone());
+                    }
+                }
+                let notify_uri = body
+                    .get("callbackReference")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                ds.sub_set_body(subs_id, body, notify_uri);
+                SbiResponse::with_status(204)
+            }
+            "DELETE" => {
+                if ds.sub_remove(subs_id).is_some() {
+                    SbiResponse::with_status(204)
+                } else {
+                    send_not_found("Subscription not found", Some("DATA_NOT_FOUND"))
+                }
+            }
+            _ => send_method_not_allowed(method, "subscription-data/subs-to-notify/{subsId}"),
+        },
+    }
+}
+
+// ============================================================================
+// exposure-data (TS 29.519 shapes via TS 29.504 paths)
+// ============================================================================
+
+/// Handle /nudr-dr/v1/exposure-data/...
+async fn handle_exposure_data(parts: &[&str], method: &str, request: &SbiRequest) -> SbiResponse {
+    let ds = data_store::store();
+
+    // /exposure-data/subs-to-notify[/{subId}]
+    if parts.get(3).copied() == Some("subs-to-notify") {
+        return match (parts.get(4).copied(), method) {
+            (None, "POST") => {
+                let body = match parse_json_body(request) {
+                    Ok(v) => v,
+                    Err(resp) => return *resp,
+                };
+                let Some(uri) = body.get("notificationUri").and_then(|v| v.as_str()) else {
+                    return missing_mandatory("notificationUri");
+                };
+                if body
+                    .get("monitoredResourceUris")
+                    .and_then(|v| v.as_array())
+                    .is_none_or(|a| a.is_empty())
+                {
+                    return missing_mandatory("monitoredResourceUris");
+                }
+                let sub = ds.sub_create(SubKind::ExposureData, uri, body.clone());
+                SbiResponse::with_status(201)
+                    .with_header(
+                        "Location",
+                        format!("/nudr-dr/v1/exposure-data/subs-to-notify/{}", sub.id),
+                    )
+                    .with_body(body.to_string(), "application/json")
+            }
+            (Some(sub_id), "PUT") => {
+                let body = match parse_json_body(request) {
+                    Ok(v) => v,
+                    Err(resp) => return *resp,
+                };
+                let Some(uri) = body.get("notificationUri").and_then(|v| v.as_str()) else {
+                    return missing_mandatory("notificationUri");
+                };
+                if ds.sub_replace(sub_id, SubKind::ExposureData, uri, body.clone()) {
+                    SbiResponse::with_status(200).with_body(body.to_string(), "application/json")
+                } else {
+                    send_not_found("Subscription not found", Some("DATA_NOT_FOUND"))
+                }
+            }
+            (Some(sub_id), "DELETE") => {
+                if ds.sub_remove(sub_id).is_some() {
+                    SbiResponse::with_status(204)
+                } else {
+                    send_not_found("Subscription not found", Some("DATA_NOT_FOUND"))
+                }
+            }
+            _ => send_method_not_allowed(method, "exposure-data/subs-to-notify"),
+        };
+    }
+
+    // /exposure-data/{ueId}/...
+    let Some(ue_id) = parts.get(3).copied() else {
+        return send_bad_request("Missing ueId", Some("MANDATORY_IE_MISSING"));
+    };
+    match parts.get(4).copied() {
+        Some("access-and-mobility-data") => {
+            let path = format!("/nudr-dr/v1/exposure-data/{ue_id}/access-and-mobility-data");
+            match method {
+                "PUT" => {
+                    let body = match parse_json_body(request) {
+                        Ok(v) => v,
+                        Err(resp) => return *resp,
+                    };
+                    let created = ds.exposure_am_put(ue_id, body.clone());
+                    notify_exposure_data_change(
+                        ue_id,
+                        &path,
+                        serde_json::json!({"accessAndMobilityData": body}),
+                    );
+                    if created {
+                        SbiResponse::with_status(201)
+                            .with_header("Location", path)
+                            .with_body(body.to_string(), "application/json")
+                    } else {
+                        SbiResponse::with_status(200)
+                            .with_body(body.to_string(), "application/json")
+                    }
+                }
+                "GET" => match ds.exposure_am_get(ue_id) {
+                    Some(doc) => {
+                        SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+                    }
+                    None => {
+                        send_not_found("Access and mobility data not found", Some("DATA_NOT_FOUND"))
+                    }
+                },
+                "PATCH" => {
+                    let Some(mut doc) = ds.exposure_am_get(ue_id) else {
+                        return send_not_found(
+                            "Access and mobility data not found",
+                            Some("DATA_NOT_FOUND"),
+                        );
+                    };
+                    let patch = match parse_json_body(request) {
+                        Ok(v) => v,
+                        Err(resp) => return *resp,
+                    };
+                    merge_patch(&mut doc, &patch);
+                    ds.exposure_am_put(ue_id, doc.clone());
+                    notify_exposure_data_change(
+                        ue_id,
+                        &path,
+                        serde_json::json!({"accessAndMobilityData": doc}),
+                    );
+                    SbiResponse::with_status(204)
+                }
+                "DELETE" => {
+                    if ds.exposure_am_remove(ue_id).is_some() {
+                        notify_exposure_data_change(
+                            ue_id,
+                            &path,
+                            serde_json::json!({"delResources": [path]}),
+                        );
+                        SbiResponse::with_status(204)
+                    } else {
+                        send_not_found("Access and mobility data not found", Some("DATA_NOT_FOUND"))
+                    }
+                }
+                _ => send_method_not_allowed(method, "exposure-data/access-and-mobility-data"),
+            }
+        }
+        Some("session-management-data") => {
+            let Some(psi) = parts.get(5).copied() else {
+                return send_bad_request("Missing pduSessionId", Some("MANDATORY_IE_MISSING"));
+            };
+            let path = format!("/nudr-dr/v1/exposure-data/{ue_id}/session-management-data/{psi}");
+            match method {
+                "PUT" => {
+                    let body = match parse_json_body(request) {
+                        Ok(v) => v,
+                        Err(resp) => return *resp,
+                    };
+                    let created = ds.exposure_sm_put(ue_id, psi, body.clone());
+                    notify_exposure_data_change(
+                        ue_id,
+                        &path,
+                        serde_json::json!({"pduSessionManagementData": [body]}),
+                    );
+                    if created {
+                        SbiResponse::with_status(201)
+                            .with_header("Location", path)
+                            .with_body(body.to_string(), "application/json")
+                    } else {
+                        SbiResponse::with_status(200)
+                            .with_body(body.to_string(), "application/json")
+                    }
+                }
+                "GET" => match ds.exposure_sm_get(ue_id, psi) {
+                    Some(doc) => {
+                        SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+                    }
+                    None => {
+                        send_not_found("Session management data not found", Some("DATA_NOT_FOUND"))
+                    }
+                },
+                "DELETE" => {
+                    if ds.exposure_sm_remove(ue_id, psi).is_some() {
+                        notify_exposure_data_change(
+                            ue_id,
+                            &path,
+                            serde_json::json!({"delResources": [path]}),
+                        );
+                        SbiResponse::with_status(204)
+                    } else {
+                        send_not_found("Session management data not found", Some("DATA_NOT_FOUND"))
+                    }
+                }
+                _ => send_method_not_allowed(method, "exposure-data/session-management-data"),
+            }
+        }
+        _ => send_not_found("Unknown exposure-data resource", None),
+    }
+}
+
+// ============================================================================
+// application-data (TS 29.519 shapes via TS 29.504 paths)
+// ============================================================================
+
+/// Split a comma-separated query parameter into owned strings.
+fn csv_param(request: &SbiRequest, name: &str) -> Option<Vec<String>> {
+    request.http.params.get(name).map(|v| {
+        pct_decode(v)
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+}
+
+/// Handle /nudr-dr/v1/application-data/...
+async fn handle_application_data(
+    parts: &[&str],
+    method: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    let ds = data_store::store();
+    match parts.get(3).copied() {
+        // --- /application-data/pfds[/{appId}] -----------------------------
+        Some("pfds") => match (parts.get(4).copied(), method) {
+            (None, "GET") => {
+                let app_ids =
+                    csv_param(request, "appId").or_else(|| csv_param(request, "application-ids"));
+                let list = ds.pfd_list(app_ids.as_deref());
+                SbiResponse::with_status(200).with_body(
+                    serde_json::Value::Array(list).to_string(),
+                    "application/json",
+                )
+            }
+            (Some(app_id), "GET") => match ds.pfd_get(app_id) {
+                Some(doc) => {
+                    SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+                }
+                None => send_not_found("PFD data not found", Some("DATA_NOT_FOUND")),
+            },
+            (Some(app_id), "PUT") => {
+                let body = match parse_json_body(request) {
+                    Ok(v) => v,
+                    Err(resp) => return *resp,
+                };
+                // PfdDataForApp mandatory attributes (TS 29.551)
+                if body.get("applicationId").and_then(|v| v.as_str()).is_none() {
+                    return missing_mandatory("applicationId");
+                }
+                if body
+                    .get("pfds")
+                    .and_then(|v| v.as_array())
+                    .is_none_or(|a| a.is_empty())
+                {
+                    return missing_mandatory("pfds");
+                }
+                let path = format!("/nudr-dr/v1/application-data/pfds/{app_id}");
+                let created = ds.pfd_put(app_id, body.clone());
+                notify_application_data_change(&path, app_id, false);
+                if created {
+                    SbiResponse::with_status(201)
+                        .with_header("Location", path)
+                        .with_body(body.to_string(), "application/json")
+                } else {
+                    SbiResponse::with_status(200).with_body(body.to_string(), "application/json")
+                }
+            }
+            (Some(app_id), "DELETE") => {
+                if ds.pfd_remove(app_id).is_some() {
+                    let path = format!("/nudr-dr/v1/application-data/pfds/{app_id}");
+                    notify_application_data_change(&path, app_id, true);
+                    SbiResponse::with_status(204)
+                } else {
+                    send_not_found("PFD data not found", Some("DATA_NOT_FOUND"))
+                }
+            }
+            _ => send_method_not_allowed(method, "application-data/pfds"),
+        },
+        // --- /application-data/influenceData... ---------------------------
+        Some("influenceData") => match parts.get(4).copied() {
+            // Collection read with TS 29.519 query filters
+            None => match method {
+                "GET" => {
+                    let influence_ids = csv_param(request, "influence-Ids");
+                    let dnns = csv_param(request, "dnns");
+                    let supis = csv_param(request, "supis");
+                    let list = ds.influence_list(
+                        influence_ids.as_deref(),
+                        dnns.as_deref(),
+                        supis.as_deref(),
+                    );
+                    SbiResponse::with_status(200).with_body(
+                        serde_json::Value::Array(list).to_string(),
+                        "application/json",
+                    )
+                }
+                _ => send_method_not_allowed(method, "application-data/influenceData"),
+            },
+            // /influenceData/subs-to-notify[/{subscriptionId}]
+            Some("subs-to-notify") => match (parts.get(5).copied(), method) {
+                (None, "POST") => {
+                    let body = match parse_json_body(request) {
+                        Ok(v) => v,
+                        Err(resp) => return *resp,
+                    };
+                    let Some(uri) = body.get("notificationUri").and_then(|v| v.as_str()) else {
+                        return missing_mandatory("notificationUri");
+                    };
+                    // oneOf: dnns / snssais / internalGroupIds / supis
+                    if !["dnns", "snssais", "internalGroupIds", "supis"]
+                        .iter()
+                        .any(|k| body.get(*k).and_then(|v| v.as_array()).is_some())
+                    {
+                        return missing_mandatory("dnns|snssais|internalGroupIds|supis");
+                    }
+                    let sub = ds.sub_create(SubKind::AppInfluence, uri, body.clone());
+                    SbiResponse::with_status(201)
+                        .with_header(
+                            "Location",
+                            format!(
+                                "/nudr-dr/v1/application-data/influenceData/subs-to-notify/{}",
+                                sub.id
+                            ),
+                        )
+                        .with_body(body.to_string(), "application/json")
+                }
+                (None, "GET") => {
+                    let subs = ds.subs_matching(SubKind::AppInfluence, |_| true);
+                    let list: Vec<serde_json::Value> = subs.into_iter().map(|s| s.body).collect();
+                    SbiResponse::with_status(200).with_body(
+                        serde_json::Value::Array(list).to_string(),
+                        "application/json",
+                    )
+                }
+                (Some(sub_id), "GET") => match ds.sub_get(sub_id) {
+                    Some(sub) if sub.kind == SubKind::AppInfluence => SbiResponse::with_status(200)
+                        .with_body(sub.body.to_string(), "application/json"),
+                    _ => send_not_found("Subscription not found", Some("DATA_NOT_FOUND")),
+                },
+                (Some(sub_id), "PUT") => {
+                    let body = match parse_json_body(request) {
+                        Ok(v) => v,
+                        Err(resp) => return *resp,
+                    };
+                    let Some(uri) = body.get("notificationUri").and_then(|v| v.as_str()) else {
+                        return missing_mandatory("notificationUri");
+                    };
+                    if ds.sub_replace(sub_id, SubKind::AppInfluence, uri, body.clone()) {
+                        SbiResponse::with_status(200)
+                            .with_body(body.to_string(), "application/json")
+                    } else {
+                        send_not_found("Subscription not found", Some("DATA_NOT_FOUND"))
+                    }
+                }
+                (Some(sub_id), "DELETE") => {
+                    if ds.sub_remove(sub_id).is_some() {
+                        SbiResponse::with_status(204)
+                    } else {
+                        send_not_found("Subscription not found", Some("DATA_NOT_FOUND"))
+                    }
+                }
+                _ => send_method_not_allowed(method, "influenceData/subs-to-notify"),
+            },
+            // /influenceData/{influenceId}
+            Some(influence_id) => {
+                let path = format!("/nudr-dr/v1/application-data/influenceData/{influence_id}");
+                match method {
+                    "PUT" => {
+                        let body = match parse_json_body(request) {
+                            Ok(v) => v,
+                            Err(resp) => return *resp,
+                        };
+                        if body.get("afAppId").and_then(|v| v.as_str()).is_none() {
+                            return missing_mandatory("afAppId");
+                        }
+                        let created = ds.influence_put(influence_id, body.clone());
+                        notify_influence_data_change(&path, Some(&body));
+                        if created {
+                            SbiResponse::with_status(201)
+                                .with_header("Location", path)
+                                .with_body(body.to_string(), "application/json")
+                        } else {
+                            SbiResponse::with_status(200)
+                                .with_body(body.to_string(), "application/json")
+                        }
+                    }
+                    "PATCH" => {
+                        let Some(mut doc) = ds.influence_get(influence_id) else {
+                            return send_not_found(
+                                "Traffic influence data not found",
+                                Some("DATA_NOT_FOUND"),
+                            );
+                        };
+                        let patch = match parse_json_body(request) {
+                            Ok(v) => v,
+                            Err(resp) => return *resp,
+                        };
+                        merge_patch(&mut doc, &patch);
+                        ds.influence_put(influence_id, doc.clone());
+                        notify_influence_data_change(&path, Some(&doc));
+                        SbiResponse::with_status(200).with_body(doc.to_string(), "application/json")
+                    }
+                    "DELETE" => {
+                        if ds.influence_remove(influence_id).is_some() {
+                            notify_influence_data_change(&path, None);
+                            SbiResponse::with_status(204)
+                        } else {
+                            send_not_found(
+                                "Traffic influence data not found",
+                                Some("DATA_NOT_FOUND"),
+                            )
+                        }
+                    }
+                    "GET" => match ds.influence_get(influence_id) {
+                        Some(doc) => SbiResponse::with_status(200)
+                            .with_body(doc.to_string(), "application/json"),
+                        None => send_not_found(
+                            "Traffic influence data not found",
+                            Some("DATA_NOT_FOUND"),
+                        ),
+                    },
+                    _ => send_method_not_allowed(method, "application-data/influenceData"),
+                }
+            }
+        },
+        // --- /application-data/subs-to-notify[/{subsId}] -------------------
+        Some("subs-to-notify") => match (parts.get(4).copied(), method) {
+            (None, "POST") => {
+                let body = match parse_json_body(request) {
+                    Ok(v) => v,
+                    Err(resp) => return *resp,
+                };
+                let Some(uri) = body.get("notificationUri").and_then(|v| v.as_str()) else {
+                    return missing_mandatory("notificationUri");
+                };
+                let sub = ds.sub_create(SubKind::AppData, uri, body.clone());
+                SbiResponse::with_status(201)
+                    .with_header(
+                        "Location",
+                        format!("/nudr-dr/v1/application-data/subs-to-notify/{}", sub.id),
+                    )
+                    .with_body(body.to_string(), "application/json")
+            }
+            (Some(sub_id), "PUT") => {
+                let body = match parse_json_body(request) {
+                    Ok(v) => v,
+                    Err(resp) => return *resp,
+                };
+                let Some(uri) = body.get("notificationUri").and_then(|v| v.as_str()) else {
+                    return missing_mandatory("notificationUri");
+                };
+                if ds.sub_replace(sub_id, SubKind::AppData, uri, body.clone()) {
+                    SbiResponse::with_status(200).with_body(body.to_string(), "application/json")
+                } else {
+                    send_not_found("Subscription not found", Some("DATA_NOT_FOUND"))
+                }
+            }
+            (Some(sub_id), "DELETE") => {
+                if ds.sub_remove(sub_id).is_some() {
+                    SbiResponse::with_status(204)
+                } else {
+                    send_not_found("Subscription not found", Some("DATA_NOT_FOUND"))
+                }
+            }
+            _ => send_method_not_allowed(method, "application-data/subs-to-notify"),
+        },
+        _ => send_not_found("Unknown application-data resource", None),
+    }
 }
 
 // ============================================================================
@@ -954,6 +1797,29 @@ fn build_sm_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Valu
 
 fn bytes_to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Build a TS 29.505 AuthenticationSubscription document.
+///
+/// The SequenceNumber object carries `sqnScheme` and `indLength` alongside the
+/// 12-hex-digit `sqn` per the TS 29.505 SequenceNumber shape (the UE-side IND
+/// is 5 bits per TS 33.102 SQN array management).
+fn build_auth_subscription_json(
+    supi: &str,
+    auth_info: &ogs_dbi::subscription::OgsDbiAuthInfo,
+) -> serde_json::Value {
+    serde_json::json!({
+        "authenticationMethod": "5G_AKA",
+        "encPermanentKey": bytes_to_hex(&auth_info.k),
+        "encOpcKey": bytes_to_hex(if auth_info.use_opc { &auth_info.opc } else { &auth_info.op }),
+        "authenticationManagementField": bytes_to_hex(&auth_info.amf),
+        "supi": supi,
+        "sequenceNumber": {
+            "sqnScheme": "NON_TIME_BASED",
+            "sqn": format!("{:012x}", auth_info.sqn & 0xFFFFFFFFFFFF),
+            "indLength": 5
+        }
+    })
 }
 
 fn format_ambr(bps: u64) -> String {
@@ -1141,6 +2007,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_udr_yaml_oauth2_knob() {
+        let yaml = r#"
+udr:
+  sbi:
+    server:
+      - address: 127.0.0.1
+        port: 7777
+    oauth2:
+      require: true
+    client:
+      nrf:
+        - uri: http://nrf:7777
+"#;
+        let parsed: UdrYaml = serde_yaml::from_str(yaml).unwrap();
+        let sbi = parsed.udr.unwrap().sbi.unwrap();
+        assert_eq!(sbi.oauth2.unwrap().require, Some(true));
+        assert_eq!(sbi.client.unwrap().nrf.unwrap()[0].uri, "http://nrf:7777");
+    }
+
+    #[test]
+    fn test_udr_yaml_oauth2_defaults_off() {
+        let yaml = r#"
+udr:
+  sbi:
+    client:
+      nrf:
+        - uri: http://nrf:7777
+"#;
+        let parsed: UdrYaml = serde_yaml::from_str(yaml).unwrap();
+        let sbi = parsed.udr.unwrap().sbi.unwrap();
+        assert!(sbi.oauth2.is_none());
+    }
+
+    #[test]
     fn test_args_default() {
         let args = Args::parse_from(["nextgcore-udrd"]);
         assert_eq!(args.config, "/etc/nextgcore/udr.yaml");
@@ -1191,5 +2091,563 @@ mod tests {
             "mongodb://***@host/db"
         );
         assert_eq!(mask_uri("mongodb://host/db"), "mongodb://host/db");
+    }
+
+    #[test]
+    fn test_is_valid_plmn_id() {
+        assert!(is_valid_plmn_id("00101"));
+        assert!(is_valid_plmn_id("310410"));
+        assert!(!is_valid_plmn_id("0010"));
+        assert!(!is_valid_plmn_id("0010100"));
+        assert!(!is_valid_plmn_id("00a01"));
+    }
+
+    #[test]
+    fn test_auth_subscription_sequence_number_shape() {
+        // TS 29.505 AuthenticationSubscription / SequenceNumber round-trip:
+        // sqnScheme + indLength + 12-hex-digit sqn must be present.
+        let mut info = ogs_dbi::subscription::OgsDbiAuthInfo::default();
+        info.sqn = 0x1F21;
+        info.use_opc = true;
+        let doc = build_auth_subscription_json("imsi-001010000000001", &info);
+        assert_eq!(doc["authenticationMethod"], "5G_AKA");
+        let seq = &doc["sequenceNumber"];
+        assert_eq!(seq["sqnScheme"], "NON_TIME_BASED");
+        assert_eq!(seq["indLength"], 5);
+        let sqn = seq["sqn"].as_str().unwrap();
+        assert_eq!(sqn.len(), 12);
+        assert!(sqn.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(sqn, "000000001f21");
+        assert_eq!(doc["supi"], "imsi-001010000000001");
+    }
+
+    #[test]
+    fn test_pct_decode() {
+        assert_eq!(pct_decode("a%2Cb"), "a,b");
+        assert_eq!(pct_decode("plain"), "plain");
+        assert_eq!(pct_decode("%5B%7B%22sst%22%3A1%7D%5D"), "[{\"sst\":1}]");
+    }
+
+    // ------------------------------------------------------------------
+    // HTTP-level tests over a real HTTP/2 SBI server on ephemeral ports.
+    // ------------------------------------------------------------------
+
+    use ogs_sbi::client::SbiClient;
+    use serde_json::json;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    /// Bind an ephemeral port (probe-and-release) for an SBI server.
+    fn ephemeral_addr() -> SocketAddr {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
+        let addr = probe.local_addr().expect("probe addr");
+        drop(probe);
+        addr
+    }
+
+    /// Start the UDR SBI server plus a local notification listener that
+    /// forwards (path, body) of every received POST into a channel.
+    async fn start_udr_and_listener() -> (
+        SbiServer,
+        SbiClient,
+        SbiServer,
+        u16,
+        mpsc::UnboundedReceiver<(String, String)>,
+    ) {
+        let udr_addr = ephemeral_addr();
+        let udr_server = SbiServer::new(OgsSbiServerConfig::new(udr_addr));
+        udr_server
+            .start(udr_sbi_request_handler)
+            .await
+            .expect("UDR SBI server starts");
+
+        let listener_addr = ephemeral_addr();
+        let (tx, rx) = mpsc::unbounded_channel::<(String, String)>();
+        let listener = SbiServer::new(OgsSbiServerConfig::new(listener_addr));
+        listener
+            .start(move |req: SbiRequest| {
+                let tx = tx.clone();
+                async move {
+                    let body = req.http.content.clone().unwrap_or_default();
+                    let _ = tx.send((req.header.uri.clone(), body));
+                    SbiResponse::with_status(204)
+                }
+            })
+            .await
+            .expect("listener starts");
+
+        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
+        (udr_server, client, listener, listener_addr.port(), rx)
+    }
+
+    async fn recv_notification(
+        rx: &mut mpsc::UnboundedReceiver<(String, String)>,
+    ) -> (String, serde_json::Value) {
+        let (path, body) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("notification within 5s")
+            .expect("channel open");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("notification JSON");
+        (path, value)
+    }
+
+    /// amf-3gpp-access: strict-peer rejection, full registration round-trip,
+    /// PATCH, DELETE, and DataChangeNotify delivery to a subs-to-notify
+    /// subscriber over a real local listener.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_amf3gpp_lifecycle_and_notify() {
+        let (udr, client, listener, cb_port, mut rx) = start_udr_and_listener().await;
+        let supi = "imsi-001019900000001";
+        let resource = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access");
+
+        // Subscribe to changes for this UE.
+        let cb_uri = format!("http://127.0.0.1:{cb_port}/cb/data-change");
+        let sub_body = json!({
+            "ueId": supi,
+            "callbackReference": cb_uri,
+            "monitoredResourceUris": [format!("http://udr{resource}")]
+        });
+        let resp = client
+            .post_json("/nudr-dr/v1/subscription-data/subs-to-notify", &sub_body)
+            .await
+            .expect("POST sub");
+        assert_eq!(resp.status, 201);
+        let loc = resp.http.get_header("Location").expect("Location").clone();
+        assert!(loc.contains("/subscription-data/subs-to-notify/"));
+
+        // Missing mandatory callbackReference -> 400 ProblemDetails
+        let resp = client
+            .post_json(
+                "/nudr-dr/v1/subscription-data/subs-to-notify",
+                &json!({"monitoredResourceUris": ["/x"]}),
+            )
+            .await
+            .expect("POST bad sub");
+        assert_eq!(resp.status, 400);
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(problem["cause"], "MANDATORY_IE_MISSING");
+
+        // Strict-peer: PUT registration missing mandatory guami -> 400
+        let resp = client
+            .put_json(
+                &resource,
+                &json!({
+                    "amfInstanceId": "9f7d5a3e-0000-4000-8000-000000000001",
+                    "deregCallbackUri": "http://amf/dereg",
+                    "ratType": "NR"
+                }),
+            )
+            .await
+            .expect("PUT invalid");
+        assert_eq!(resp.status, 400);
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(problem["cause"], "MANDATORY_IE_MISSING");
+        assert!(problem["detail"].as_str().unwrap().contains("guami"));
+
+        // Full registration -> 201 + Location + lossless echo
+        let registration = json!({
+            "amfInstanceId": "9f7d5a3e-0000-4000-8000-000000000001",
+            "deregCallbackUri": "http://amf.example.com/namf-callback/v1/dereg",
+            "guami": {"plmnId": {"mcc": "001", "mnc": "01"}, "amfId": "020040"},
+            "ratType": "NR",
+            "initialRegistrationInd": true,
+            "pei": "imeisv-3512340000000101"
+        });
+        let resp = client
+            .put_json(&resource, &registration)
+            .await
+            .expect("PUT registration");
+        assert_eq!(resp.status, 201);
+        assert!(resp
+            .http
+            .get_header("Location")
+            .expect("Location on 201")
+            .ends_with("amf-3gpp-access"));
+
+        // Notification for the PUT must be delivered to the listener.
+        let (path, notify) = recv_notification(&mut rx).await;
+        assert_eq!(path, "/cb/data-change");
+        assert_eq!(notify["ueId"], supi);
+        assert!(notify["notifyItems"][0]["resourceId"]
+            .as_str()
+            .unwrap()
+            .ends_with("amf-3gpp-access"));
+        assert_eq!(
+            notify["notifyItems"][0]["changes"][0]["newValue"]["ratType"],
+            "NR"
+        );
+
+        // GET returns the full stored registration (not a stub).
+        let resp = client.get(&resource).await.expect("GET registration");
+        assert_eq!(resp.status, 200);
+        let stored: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(stored, registration, "PUT -> GET must be lossless");
+
+        // Replace -> 204, PATCH purgeFlag -> 204 and visible on GET.
+        let resp = client
+            .put_json(&resource, &registration)
+            .await
+            .expect("PUT replace");
+        assert_eq!(resp.status, 204);
+        let _ = recv_notification(&mut rx).await; // replace notification
+
+        let mut req = SbiRequest::patch(&resource);
+        req.http.set_content(
+            json!([{"op": "replace", "path": "/purgeFlag", "value": true}]).to_string(),
+        );
+        req.http
+            .set_header("Content-Type", "application/json-patch+json");
+        let resp = client.send_request(req).await.expect("PATCH");
+        assert_eq!(resp.status, 204);
+        let _ = recv_notification(&mut rx).await; // patch notification
+        let resp = client.get(&resource).await.expect("GET after PATCH");
+        let stored: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(stored["purgeFlag"], true);
+
+        // DELETE -> 204, then GET -> 404 ProblemDetails.
+        let resp = client.delete(&resource).await.expect("DELETE");
+        assert_eq!(resp.status, 204);
+        let (_, notify) = recv_notification(&mut rx).await;
+        assert_eq!(notify["notifyItems"][0]["changes"][0]["op"], "REMOVE");
+        let resp = client.get(&resource).await.expect("GET after DELETE");
+        assert_eq!(resp.status, 404);
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(problem["status"], 404);
+
+        // Unsubscribe by ue-id.
+        let mut req = SbiRequest::delete("/nudr-dr/v1/subscription-data/subs-to-notify");
+        req.http.set_param("ue-id", supi);
+        let resp = client.send_request(req).await.expect("DELETE subs");
+        assert_eq!(resp.status, 204);
+
+        udr.stop().await.expect("udr stops");
+        listener.stop().await.expect("listener stops");
+    }
+
+    /// exposure-data: subscription validation, AM/SM lifecycle with RFC 7396
+    /// merge-patch, and ExposureDataChangeNotification delivery.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_exposure_data_lifecycle_and_notify() {
+        let (udr, client, listener, cb_port, mut rx) = start_udr_and_listener().await;
+        let ue = "imsi-001019900000002";
+        let am_path = format!("/nudr-dr/v1/exposure-data/{ue}/access-and-mobility-data");
+        let sm_path = format!("/nudr-dr/v1/exposure-data/{ue}/session-management-data/5");
+
+        // Strict-peer: subscription without notificationUri -> 400.
+        let resp = client
+            .post_json(
+                "/nudr-dr/v1/exposure-data/subs-to-notify",
+                &json!({"monitoredResourceUris": [am_path]}),
+            )
+            .await
+            .expect("POST bad sub");
+        assert_eq!(resp.status, 400);
+
+        // Valid subscription -> 201 + Location.
+        let resp = client
+            .post_json(
+                "/nudr-dr/v1/exposure-data/subs-to-notify",
+                &json!({
+                    "notificationUri": format!("http://127.0.0.1:{cb_port}/cb/exposure"),
+                    "monitoredResourceUris": [format!("/nudr-dr/v1/exposure-data/{ue}")]
+                }),
+            )
+            .await
+            .expect("POST sub");
+        assert_eq!(resp.status, 201);
+        let sub_loc = resp.http.get_header("Location").expect("Location").clone();
+        let sub_id = sub_loc.rsplit('/').next().unwrap().to_string();
+
+        // PUT AM data -> 201; notification array with ueId + data.
+        let am_data = json!({"roamingStatus": false, "timeZone": "+02:00"});
+        let resp = client.put_json(&am_path, &am_data).await.expect("PUT am");
+        assert_eq!(resp.status, 201);
+        let (path, notify) = recv_notification(&mut rx).await;
+        assert_eq!(path, "/cb/exposure");
+        assert!(notify.is_array());
+        assert_eq!(notify[0]["ueId"], ue);
+        assert_eq!(notify[0]["accessAndMobilityData"]["roamingStatus"], false);
+
+        // GET -> 200 lossless.
+        let resp = client.get(&am_path).await.expect("GET am");
+        assert_eq!(resp.status, 200);
+        let stored: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(stored, am_data);
+
+        // PATCH (merge-patch) -> 204 and merged result on GET.
+        let mut req = SbiRequest::patch(&am_path);
+        req.http
+            .set_content(json!({"roamingStatus": true, "timeZone": null}).to_string());
+        req.http
+            .set_header("Content-Type", "application/merge-patch+json");
+        let resp = client.send_request(req).await.expect("PATCH am");
+        assert_eq!(resp.status, 204);
+        let _ = recv_notification(&mut rx).await;
+        let resp = client.get(&am_path).await.expect("GET merged");
+        let stored: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(stored, json!({"roamingStatus": true}));
+
+        // SM data lifecycle: PUT -> 201, GET, DELETE -> 204 with delResources.
+        let sm_data = json!({"pduSessionStatus": "ACTIVE", "dnn": "internet",
+                             "ipv4Addr": "10.45.0.2", "pduSessionId": 5});
+        let resp = client.put_json(&sm_path, &sm_data).await.expect("PUT sm");
+        assert_eq!(resp.status, 201);
+        let (_, notify) = recv_notification(&mut rx).await;
+        assert_eq!(notify[0]["pduSessionManagementData"][0]["dnn"], "internet");
+        let resp = client.get(&sm_path).await.expect("GET sm");
+        assert_eq!(resp.status, 200);
+        let resp = client.delete(&sm_path).await.expect("DELETE sm");
+        assert_eq!(resp.status, 204);
+        let (_, notify) = recv_notification(&mut rx).await;
+        assert!(notify[0]["delResources"][0]
+            .as_str()
+            .unwrap()
+            .ends_with("session-management-data/5"));
+
+        // DELETE AM -> 204; GET -> 404.
+        let resp = client.delete(&am_path).await.expect("DELETE am");
+        assert_eq!(resp.status, 204);
+        let _ = recv_notification(&mut rx).await;
+        let resp = client.get(&am_path).await.expect("GET deleted");
+        assert_eq!(resp.status, 404);
+
+        // Remove the subscription -> 204; second delete -> 404.
+        let resp = client
+            .delete(&format!(
+                "/nudr-dr/v1/exposure-data/subs-to-notify/{sub_id}"
+            ))
+            .await
+            .expect("DELETE sub");
+        assert_eq!(resp.status, 204);
+        let resp = client
+            .delete(&format!(
+                "/nudr-dr/v1/exposure-data/subs-to-notify/{sub_id}"
+            ))
+            .await
+            .expect("DELETE sub again");
+        assert_eq!(resp.status, 404);
+
+        udr.stop().await.expect("udr stops");
+        listener.stop().await.expect("listener stops");
+    }
+
+    /// application-data: pfds + influenceData lifecycle, query filters, and
+    /// TrafficInfluDataNotif delivery.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_application_data_lifecycle_and_notify() {
+        let (udr, client, listener, cb_port, mut rx) = start_udr_and_listener().await;
+
+        // Strict-peer: PFD data without pfds -> 400.
+        let resp = client
+            .put_json(
+                "/nudr-dr/v1/application-data/pfds/app-w42",
+                &json!({"applicationId": "app-w42"}),
+            )
+            .await
+            .expect("PUT bad pfd");
+        assert_eq!(resp.status, 400);
+
+        // Valid PFD -> 201 + Location; list contains it.
+        let pfd = json!({
+            "applicationId": "app-w42",
+            "pfds": [{"pfdId": "pfd-1", "flowDescriptions": ["permit out ip from any to any"]}]
+        });
+        let resp = client
+            .put_json("/nudr-dr/v1/application-data/pfds/app-w42", &pfd)
+            .await
+            .expect("PUT pfd");
+        assert_eq!(resp.status, 201);
+        let resp = client
+            .get("/nudr-dr/v1/application-data/pfds")
+            .await
+            .expect("GET pfds");
+        assert_eq!(resp.status, 200);
+        let list: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(list
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["applicationId"] == "app-w42"));
+
+        // Influence subscription (supis filter) -> 201.
+        let resp = client
+            .post_json(
+                "/nudr-dr/v1/application-data/influenceData/subs-to-notify",
+                &json!({
+                    "notificationUri": format!("http://127.0.0.1:{cb_port}/cb/influence"),
+                    "supis": ["imsi-001019900000003"]
+                }),
+            )
+            .await
+            .expect("POST influence sub");
+        assert_eq!(resp.status, 201);
+
+        // Strict-peer: subscription without any oneOf filter -> 400.
+        let resp = client
+            .post_json(
+                "/nudr-dr/v1/application-data/influenceData/subs-to-notify",
+                &json!({"notificationUri": "http://x/cb"}),
+            )
+            .await
+            .expect("POST bad influence sub");
+        assert_eq!(resp.status, 400);
+
+        // Strict-peer: influence data without afAppId -> 400.
+        let resp = client
+            .put_json(
+                "/nudr-dr/v1/application-data/influenceData/inf-w42",
+                &json!({"dnn": "internet"}),
+            )
+            .await
+            .expect("PUT bad influence");
+        assert_eq!(resp.status, 400);
+
+        // Valid influence data matching the subscription -> 201 + notify.
+        let influ = json!({
+            "afAppId": "app-w42",
+            "dnn": "internet",
+            "supi": "imsi-001019900000003",
+            "trafficRoutes": [{"dnai": "edge-1"}]
+        });
+        let resp = client
+            .put_json("/nudr-dr/v1/application-data/influenceData/inf-w42", &influ)
+            .await
+            .expect("PUT influence");
+        assert_eq!(resp.status, 201);
+        let (path, notify) = recv_notification(&mut rx).await;
+        assert_eq!(path, "/cb/influence");
+        assert!(notify.is_array());
+        assert!(notify[0]["resUri"].as_str().unwrap().ends_with("inf-w42"));
+        assert_eq!(notify[0]["trafficInfluData"]["afAppId"], "app-w42");
+
+        // Collection read with filters.
+        let mut req = SbiRequest::get("/nudr-dr/v1/application-data/influenceData");
+        req.http.set_param("supis", "imsi-001019900000003");
+        let resp = client.send_request(req).await.expect("GET influence");
+        assert_eq!(resp.status, 200);
+        let list: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        let mut req = SbiRequest::get("/nudr-dr/v1/application-data/influenceData");
+        req.http.set_param("dnns", "no-such-dnn");
+        let resp = client.send_request(req).await.expect("GET influence empty");
+        let list: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(list.as_array().unwrap().is_empty());
+
+        // DELETE influence -> 204 + deletion notification (resUri only).
+        let resp = client
+            .delete("/nudr-dr/v1/application-data/influenceData/inf-w42")
+            .await
+            .expect("DELETE influence");
+        assert_eq!(resp.status, 204);
+        let (_, notify) = recv_notification(&mut rx).await;
+        assert!(notify[0]["resUri"].as_str().unwrap().ends_with("inf-w42"));
+        assert!(notify[0].get("trafficInfluData").is_none());
+
+        // DELETE pfd -> 204; GET -> 404.
+        let resp = client
+            .delete("/nudr-dr/v1/application-data/pfds/app-w42")
+            .await
+            .expect("DELETE pfd");
+        assert_eq!(resp.status, 204);
+        let resp = client
+            .get("/nudr-dr/v1/application-data/pfds/app-w42")
+            .await
+            .expect("GET deleted pfd");
+        assert_eq!(resp.status, 404);
+
+        udr.stop().await.expect("udr stops");
+        listener.stop().await.expect("listener stops");
+    }
+
+    /// PUT authentication-subscription provisioning path and PLMN-scoped
+    /// provisioned-data validation (strict-peer rejections; the DB-backed
+    /// success path requires MongoDB and is covered by E2E).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_auth_provisioning_and_plmn_validation() {
+        let udr_addr = ephemeral_addr();
+        let udr = SbiServer::new(OgsSbiServerConfig::new(udr_addr));
+        udr.start(udr_sbi_request_handler)
+            .await
+            .expect("UDR SBI server starts");
+        let client = SbiClient::with_host_port("127.0.0.1", udr_addr.port());
+        let supi = "imsi-001019900000004";
+        let auth_path = format!(
+            "/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-subscription"
+        );
+
+        // Missing authenticationMethod -> 400 MANDATORY_IE_MISSING.
+        let resp = client
+            .put_json(
+                &auth_path,
+                &json!({"encPermanentKey": "00112233445566778899aabbccddeeff"}),
+            )
+            .await
+            .expect("PUT no method");
+        assert_eq!(resp.status, 400);
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(problem["cause"], "MANDATORY_IE_MISSING");
+
+        // Malformed key -> 400 MANDATORY_IE_INCORRECT.
+        let resp = client
+            .put_json(
+                &auth_path,
+                &json!({"authenticationMethod": "5G_AKA", "encPermanentKey": "zz"}),
+            )
+            .await
+            .expect("PUT bad key");
+        assert_eq!(resp.status, 400);
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(problem["cause"], "MANDATORY_IE_INCORRECT");
+
+        // Valid body without a database -> 503 ProblemDetails (fail closed).
+        let resp = client
+            .put_json(
+                &auth_path,
+                &json!({
+                    "authenticationMethod": "5G_AKA",
+                    "encPermanentKey": "00112233445566778899aabbccddeeff",
+                    "encOpcKey": "ffeeddccbbaa99887766554433221100",
+                    "authenticationManagementField": "8000",
+                    "sequenceNumber": {"sqnScheme": "NON_TIME_BASED", "sqn": "000000000020", "indLength": 5}
+                }),
+            )
+            .await
+            .expect("PUT valid");
+        assert_eq!(resp.status, 503);
+
+        // Invalid servingPlmnId in the PLMN-scoped provisioned-data layout -> 400.
+        let resp = client
+            .get(&format!(
+                "/nudr-dr/v1/subscription-data/{supi}/12a45/provisioned-data/am-data"
+            ))
+            .await
+            .expect("GET bad plmn");
+        assert_eq!(resp.status, 400);
+        let problem: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(problem["cause"], "MANDATORY_IE_INCORRECT");
+
+        // Valid PLMN routes through (404 without a subscriber DB, not 400).
+        let resp = client
+            .get(&format!(
+                "/nudr-dr/v1/subscription-data/{supi}/00101/provisioned-data/am-data"
+            ))
+            .await
+            .expect("GET good plmn");
+        assert_eq!(resp.status, 404);
+
+        udr.stop().await.expect("udr stops");
     }
 }

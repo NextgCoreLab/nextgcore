@@ -1260,6 +1260,28 @@ mod tests {
     }
 
     #[test]
+    fn test_aiml_hook_fire_order_is_deterministic() {
+        // Fire order must be priority-ascending, with ties broken by
+        // registration order. `register` uses a *stable* sort, so equal-priority
+        // hooks keep insertion order — guard that invariant against refactors.
+        let mut registry = AiMlHookRegistry::new();
+        let a = registry.register(AiMlHookPoint::PreRequest, "AMF", 5);
+        let b = registry.register(AiMlHookPoint::PreRequest, "SMF", 1);
+        let c = registry.register(AiMlHookPoint::PreRequest, "UDM", 5); // tie with `a`
+        let d = registry.register(AiMlHookPoint::PreRequest, "PCF", 1); // tie with `b`
+
+        let ids: Vec<u32> = registry
+            .get_hooks(AiMlHookPoint::PreRequest)
+            .iter()
+            .map(|h| h.id)
+            .collect();
+
+        // priority 1 first (b before d — registration order), then priority 5
+        // (a before c — registration order).
+        assert_eq!(ids, vec![b, d, a, c]);
+    }
+
+    #[test]
     fn test_digital_twin_capture() {
         let mut exporter = DigitalTwinExporter::new("amf-1", "AMF", Duration::from_secs(5));
         assert!(exporter.latest().is_none());

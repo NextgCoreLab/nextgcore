@@ -112,6 +112,10 @@ pub struct SgwcUe {
     pub sess_ids: Vec<u64>,
     /// GTP node ID (for MME connection)
     pub gnode_id: Option<u64>,
+    /// RAT Type received in Create Session Request (TS 29.274 Section 8.17)
+    pub rat_type: u8,
+    /// MME S11 peer address (learned from the received UDP datagram)
+    pub mme_addr: Option<std::net::SocketAddr>,
 }
 
 impl SgwcUe {
@@ -127,6 +131,8 @@ impl SgwcUe {
             e_cgi: ECgi::default(),
             sess_ids: Vec::new(),
             gnode_id: None,
+            rat_type: 0,
+            mme_addr: None,
         }
     }
 
@@ -176,10 +182,16 @@ pub struct SgwcSess {
     pub sgwc_sxa_seid: u64,
     /// SGWU-SXA-SEID (received from peer)
     pub sgwu_sxa_seid: u64,
+    /// PGW S5/S8 control-plane address (learned from PGW F-TEID)
+    pub pgw_addr: Option<Ipv4Addr>,
     /// APN Configuration
     pub session: SessionConfig,
     /// PDN Address Allocation
     pub paa: Paa,
+    /// APN-AMBR uplink (bps, TS 29.274 Section 8.7)
+    pub ambr_ul: u32,
+    /// APN-AMBR downlink (bps)
+    pub ambr_dl: u32,
     /// Bearer IDs belonging to this session
     pub bearer_ids: Vec<u64>,
     /// GTP node ID (for PGW connection)
@@ -198,8 +210,11 @@ impl SgwcSess {
             pgw_s5c_teid: 0,
             sgwc_sxa_seid: 0,
             sgwu_sxa_seid: 0,
+            pgw_addr: None,
             session: SessionConfig::default(),
             paa: Paa::default(),
+            ambr_ul: 0,
+            ambr_dl: 0,
             bearer_ids: Vec::new(),
             gnode_id: None,
             pfcp_node_id: None,
@@ -235,6 +250,22 @@ pub struct SgwcBearer {
     pub id: u64,
     /// EPS Bearer ID
     pub ebi: u8,
+    /// QoS Class Identifier (TS 29.274 Section 8.15 Bearer QoS)
+    pub qci: u8,
+    /// ARP priority level (1..15)
+    pub arp_priority_level: u8,
+    /// ARP pre-emption capability
+    pub arp_pci: bool,
+    /// ARP pre-emption vulnerability
+    pub arp_pvi: bool,
+    /// Maximum bit rate uplink (bps)
+    pub mbr_ul: u64,
+    /// Maximum bit rate downlink (bps)
+    pub mbr_dl: u64,
+    /// Guaranteed bit rate uplink (bps)
+    pub gbr_ul: u64,
+    /// Guaranteed bit rate downlink (bps)
+    pub gbr_dl: u64,
     /// Tunnel IDs belonging to this bearer
     pub tunnel_ids: Vec<u64>,
     /// Parent session ID
@@ -248,6 +279,14 @@ impl SgwcBearer {
         Self {
             id,
             ebi: 0,
+            qci: 0,
+            arp_priority_level: 0,
+            arp_pci: false,
+            arp_pvi: false,
+            mbr_ul: 0,
+            mbr_dl: 0,
+            gbr_ul: 0,
+            gbr_dl: 0,
             tunnel_ids: Vec::new(),
             sess_id,
             sgwc_ue_id,
@@ -364,6 +403,12 @@ pub struct SgwcContext {
     s11_teid_generator: AtomicU64,
     /// SXA SEID generator
     sxa_seid_generator: AtomicU64,
+    /// GTP-U TEID generator (for SGW user-plane endpoints)
+    gtpu_teid_generator: AtomicU64,
+    /// Local S11/S5-C control-plane IPv4 address
+    s11_addr: RwLock<Option<Ipv4Addr>>,
+    /// Advertised SGW-U GTP-U IPv4 address (user-plane endpoints)
+    gtpu_addr: RwLock<Option<Ipv4Addr>>,
 
     // Pool limits
     /// Maximum number of UEs
@@ -396,6 +441,9 @@ impl SgwcContext {
             next_tunnel_id: AtomicUsize::new(1),
             s11_teid_generator: AtomicU64::new(1),
             sxa_seid_generator: AtomicU64::new(1),
+            gtpu_teid_generator: AtomicU64::new(1),
+            s11_addr: RwLock::new(None),
+            gtpu_addr: RwLock::new(None),
             max_num_of_ue: 0,
             max_num_of_sess: 0,
             max_num_of_bearer: 0,
@@ -449,6 +497,35 @@ impl SgwcContext {
     /// Generate next SXA SEID
     fn next_sxa_seid(&self) -> u64 {
         self.sxa_seid_generator.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Allocate a GTP-U TEID for an SGW user-plane endpoint
+    pub fn next_gtpu_teid(&self) -> u32 {
+        self.gtpu_teid_generator.fetch_add(1, Ordering::SeqCst) as u32
+    }
+
+    /// Set the local S11/S5-C control-plane address
+    pub fn set_s11_address(&self, addr: Option<Ipv4Addr>) {
+        if let Ok(mut a) = self.s11_addr.write() {
+            *a = addr;
+        }
+    }
+
+    /// Local S11/S5-C control-plane address
+    pub fn s11_address(&self) -> Option<Ipv4Addr> {
+        self.s11_addr.read().ok().and_then(|a| *a)
+    }
+
+    /// Set the advertised SGW-U GTP-U address
+    pub fn set_gtpu_address(&self, addr: Option<Ipv4Addr>) {
+        if let Ok(mut a) = self.gtpu_addr.write() {
+            *a = addr;
+        }
+    }
+
+    /// Advertised SGW-U GTP-U address
+    pub fn gtpu_address(&self) -> Option<Ipv4Addr> {
+        self.gtpu_addr.read().ok().and_then(|a| *a)
     }
 
     // ========================================================================
@@ -526,16 +603,16 @@ impl SgwcContext {
 
     /// Find UE by IMSI
     pub fn ue_find_by_imsi(&self, imsi: &[u8]) -> Option<SgwcUe> {
-        let imsi_hash = self.imsi_hash.read().ok()?;
-        let id = imsi_hash.get(imsi)?;
-        self.ue_find_by_id(*id)
+        // Drop the hash guard before locking the UE list: holding it across
+        // ue_find_by_id inverts ue_add's lock order and can deadlock.
+        let id = *self.imsi_hash.read().ok()?.get(imsi)?;
+        self.ue_find_by_id(id)
     }
 
     /// Find UE by S11 TEID
     pub fn ue_find_by_teid(&self, teid: u32) -> Option<SgwcUe> {
-        let sgw_s11_teid_hash = self.sgw_s11_teid_hash.read().ok()?;
-        let id = sgw_s11_teid_hash.get(&teid)?;
-        self.ue_find_by_id(*id)
+        let id = *self.sgw_s11_teid_hash.read().ok()?.get(&teid)?;
+        self.ue_find_by_id(id)
     }
 
     /// Update UE in context
@@ -638,9 +715,9 @@ impl SgwcContext {
 
     /// Find session by SEID
     pub fn sess_find_by_seid(&self, seid: u64) -> Option<SgwcSess> {
-        let sgwc_sxa_seid_hash = self.sgwc_sxa_seid_hash.read().ok()?;
-        let id = sgwc_sxa_seid_hash.get(&seid)?;
-        self.sess_find_by_id(*id)
+        // Guard dropped before sess_find_by_id locks the session list (lock order).
+        let id = *self.sgwc_sxa_seid_hash.read().ok()?.get(&seid)?;
+        self.sess_find_by_id(id)
     }
 
     /// Find session by TEID (same as SEID for SGWC)
@@ -713,7 +790,8 @@ impl SgwcContext {
         self.tunnel_add(id, gtp_interface::S1_U_SGW_GTP_U);
 
         log::debug!("[Added] SGWC Bearer (id={id})");
-        Some(bearer)
+        // Re-fetch so the returned bearer carries the tunnel ids added above
+        self.bearer_find_by_id(id).or(Some(bearer))
     }
 
     /// Remove a bearer by ID

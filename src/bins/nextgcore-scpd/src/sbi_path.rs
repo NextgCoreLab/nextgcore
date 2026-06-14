@@ -7,12 +7,16 @@
 //! - Performs NF discovery delegation when needed
 //! - Forwards requests to target NFs
 //! - Routes responses back to original requesters
-//! - Handles SEPP routing for inter-PLMN communication
+//!
+//! The actual HTTP/2 forwarding data path (Model C / Model D per TS 29.500
+//! §6.10, binding stickiness per §6.12, ProblemDetails error semantics) lives
+//! in [`crate::proxy::ScpProxy`]; this module keeps the parsing and
+//! producer-selection helpers it builds on.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::context::{scp_self, DiscoveryOption, NfType, SbiServiceType};
+use crate::context::{DiscoveryOption, NfType, SbiServiceType};
 
 /// SBI server configuration
 #[derive(Debug, Clone)]
@@ -73,28 +77,9 @@ pub fn scp_sbi_open(config: Option<SbiServerConfig>) -> Result<(), String> {
 
     log::info!("Opening SCP SBI server on {}:{}", config.addr, config.port);
 
-    // Note: Initialize SELF NF instance
-    // In C: ogs_sbi_nf_instance_build_default(nf_instance)
-    // - Build NF instance information for NRF registration
-    // This is handled by the ogs_sbi module when NRF integration is enabled
-
-    // Note: Initialize NRF NF Instance if configured (Model D)
-    // In C: ogs_sbi_nf_fsm_init(nf_instance)
-    // This is handled by the nnrf integration when NRF is enabled
-
-    // Note: Check if Next-SCP's client is configured
-    // In C: NF_INSTANCE_CLIENT(ogs_sbi_self()->scp_instance)
-    // Next-SCP support is configured via scp.yaml configuration file
-
-    // Note: Setup subscription data for NF types
-    // In C: ogs_sbi_subscription_spec_add(OpenAPI_nf_type_SEPP, NULL)
-    //       ogs_sbi_subscription_spec_add(OpenAPI_nf_type_AMF, NULL)
-    // Subscription setup is handled by the nnrf integration when NRF is enabled
-
-    // Note: Start SBI server with request_handler
-    // In C: ogs_sbi_server_start_all(request_handler)
-    // Server startup is handled by the HTTP server module in main.rs
-
+    // The HTTP/2 listener itself is started in main.rs
+    // (ogs_sbi::server::SbiServer fronting crate::proxy::ScpProxy); this
+    // function tracks the lifecycle state used by the state machine.
     SBI_SERVER_RUNNING.store(true, Ordering::SeqCst);
 
     log::info!("SCP SBI server opened successfully");
@@ -110,14 +95,8 @@ pub fn scp_sbi_close() {
 
     log::info!("Closing SCP SBI server");
 
-    // Note: Stop SBI client
-    // In C: ogs_sbi_client_stop_all()
-    // Client cleanup is handled by the HTTP client module
-
-    // Note: Stop SBI server
-    // In C: ogs_sbi_server_stop_all()
-    // Server cleanup is handled by the HTTP server module in main.rs
-
+    // The HTTP/2 listener is stopped in main.rs (SbiServer::stop); this
+    // function tracks the lifecycle state used by the state machine.
     SBI_SERVER_RUNNING.store(false, Ordering::SeqCst);
 
     log::info!("SCP SBI server closed");
@@ -184,21 +163,6 @@ impl SbiResponse {
     }
 }
 
-/// Request handler result
-#[derive(Debug)]
-pub enum RequestHandlerResult {
-    /// Request forwarded to target NF
-    Forwarded,
-    /// Request forwarded to Next-SCP
-    ForwardedToNextScp,
-    /// Discovery initiated, waiting for response
-    DiscoveryPending,
-    /// Request handled locally (e.g., NRF notification)
-    Handled,
-    /// Error occurred
-    Error(String),
-}
-
 /// Parse discovery parameters from request headers
 /// Port of header extraction in request_handler
 pub fn parse_discovery_headers(
@@ -214,12 +178,10 @@ pub fn parse_discovery_headers(
     let mut service_type: Option<SbiServiceType> = None;
     let mut discovery_option = DiscoveryOption::new();
 
-    // Parse User-Agent to get requester NF type
-    if let Some(user_agent) = request.get_header(headers::USER_AGENT) {
-        // User-Agent format: "NF_TYPE-additional_info"
-        if let Some(nf_type_str) = user_agent.split('-').next() {
-            requester_nf_type = Some(NfType::from_string(nf_type_str));
-        }
+    // Requester identity comes from 3gpp-Sbi-Discovery-requester-nf-type
+    // (TS 29.500 §5.2.3.2.7) — NOT from User-Agent.
+    if let Some(val) = request.get_header(headers::DISCOVERY_REQUESTER_NF_TYPE) {
+        requester_nf_type = Some(NfType::from_string(val));
     }
 
     // Parse target NF type
@@ -264,286 +226,6 @@ pub fn parse_discovery_headers(
     )
 }
 
-/// Handle incoming SBI request
-/// Port of request_handler from sbi-path.c
-pub fn handle_request(stream_id: u64, request: &SbiRequest) -> RequestHandlerResult {
-    log::debug!(
-        "SCP handling request: {} {} (stream_id={})",
-        request.method,
-        request.uri,
-        stream_id
-    );
-
-    // Create association for this request
-    let ctx = scp_self();
-    let assoc = {
-        if let Ok(context) = ctx.read() {
-            context.assoc_add(stream_id)
-        } else {
-            None
-        }
-    };
-
-    let mut assoc = match assoc {
-        Some(a) => a,
-        None => {
-            log::error!("Failed to create association");
-            return RequestHandlerResult::Error("Failed to create association".to_string());
-        }
-    };
-
-    // Parse discovery headers
-    let (target_nf_type, requester_nf_type, service_type, discovery_option) =
-        parse_discovery_headers(request);
-
-    // Validate requester NF type (from User-Agent)
-    let requester_nf_type = match requester_nf_type {
-        Some(nf_type) if nf_type != NfType::Null => nf_type,
-        _ => {
-            log::error!("[{}] No User-Agent", request.uri);
-            remove_assoc(assoc.id);
-            return RequestHandlerResult::Error("No User-Agent header".to_string());
-        }
-    };
-
-    assoc.requester_nf_type = requester_nf_type;
-    assoc.discovery_option = discovery_option;
-
-    // Check for Target-apiRoot header (direct routing)
-    if let Some(target_apiroot) = request.get_header(headers::TARGET_APIROOT) {
-        assoc.set_target_apiroot(target_apiroot);
-
-        // Note: Check if target is in VPLMN (requires SEPP)
-        // In C: ogs_sbi_fqdn_in_vplmn(headers.target_apiroot)
-        // VPLMN detection is handled by the SEPP integration when inter-PLMN routing is enabled
-
-        log::debug!("Forwarding to target apiroot: {target_apiroot}");
-
-        // Note: Forward request to target
-        // In C: send_request(client, response_handler, request, false, assoc)
-        // Request forwarding is handled by the HTTP client module
-
-        return RequestHandlerResult::Forwarded;
-    }
-
-    // Check for discovery parameters
-    let discovery_presence = target_nf_type.is_some() && service_type.is_some();
-
-    if discovery_presence {
-        let target_nf_type = match target_nf_type {
-            Some(t) => t,
-            None => return RequestHandlerResult::Error("Missing target NF type".to_string()),
-        };
-        let service_type = match service_type {
-            Some(s) => s,
-            None => return RequestHandlerResult::Error("Missing service type".to_string()),
-        };
-
-        assoc.target_nf_type = target_nf_type;
-        assoc.service_type = service_type;
-
-        // If target is NRF, route directly
-        if target_nf_type == NfType::Nrf {
-            log::debug!("Routing directly to NRF");
-            // Note: Get NRF client and forward
-            // NRF client lookup is handled by the nnrf integration module
-            return RequestHandlerResult::Forwarded;
-        }
-
-        // Check if we already know the target NF instance
-        if assoc.discovery_option.target_nf_instance_id.is_some() {
-            // Note: Look up NF instance and forward if found
-            // NF instance lookup is handled by the ogs_sbi module's NF instance cache
-            log::debug!("Target NF instance ID provided, looking up...");
-        }
-
-        // Need to perform NF discovery
-        log::debug!(
-            "Initiating NF discovery for {} -> {}",
-            requester_nf_type.to_string(),
-            target_nf_type.to_string()
-        );
-
-        // Store request for forwarding after discovery
-        assoc.request = Some(crate::context::SbiRequest {
-            method: request.method.clone(),
-            uri: request.uri.clone(),
-            headers: request.headers.clone(),
-            body: request.body.clone(),
-        });
-
-        // Update association
-        if let Ok(context) = ctx.read() {
-            context.assoc_update(&assoc);
-        }
-
-        // Note: Send discovery request to NRF
-        // In C: send_discover(nrf_client, nf_discover_handler, assoc)
-        // Discovery requests are sent via the nnrf integration module
-
-        return RequestHandlerResult::DiscoveryPending;
-    }
-
-    // No discovery needed, this might be a notification from NRF
-    log::debug!("No discovery parameters, handling as notification");
-
-    // Clean up association since we're handling locally
-    remove_assoc(assoc.id);
-
-    RequestHandlerResult::Handled
-}
-
-/// Handle response from forwarded request
-/// Port of response_handler from sbi-path.c
-pub fn handle_response(assoc_id: u64, response: &SbiResponse) -> Result<(), String> {
-    let ctx = scp_self();
-    let assoc = {
-        if let Ok(context) = ctx.read() {
-            context.assoc_find(assoc_id)
-        } else {
-            None
-        }
-    };
-
-    let assoc = match assoc {
-        Some(a) => a,
-        None => {
-            return Err(format!("Association not found: {assoc_id}"));
-        }
-    };
-
-    log::debug!(
-        "SCP handling response for stream_id={}, status={}",
-        assoc.stream_id,
-        response.status
-    );
-
-    // Add producer ID header if we have it
-    let mut response = response.clone();
-    if let Some(ref producer_id) = assoc.nf_service_producer_id {
-        response.set_header(headers::PRODUCER_ID, producer_id);
-    }
-
-    // Note: Send response back to original requester
-    // In C: ogs_sbi_server_send_response(stream, response)
-    // Response sending is handled by the HTTP server module
-
-    // Clean up association
-    remove_assoc(assoc.id);
-
-    Ok(())
-}
-
-/// Handle NF discovery response
-/// Port of nf_discover_handler from sbi-path.c
-pub fn handle_nf_discover_response(assoc_id: u64, response: &SbiResponse) -> Result<(), String> {
-    let ctx = scp_self();
-    let assoc = {
-        if let Ok(context) = ctx.read() {
-            context.assoc_find(assoc_id)
-        } else {
-            None
-        }
-    };
-
-    let assoc = match assoc {
-        Some(a) => a,
-        None => {
-            return Err(format!("Association not found: {assoc_id}"));
-        }
-    };
-
-    if response.status != 200 {
-        log::error!("NF-Discover failed [{}]", response.status);
-        remove_assoc(assoc.id);
-        return Err(format!("NF-Discover failed [{}]", response.status));
-    }
-
-    log::debug!(
-        "NF discovery successful for {} -> {}",
-        assoc.requester_nf_type.to_string(),
-        assoc.target_nf_type.to_string()
-    );
-
-    // Note: Parse SearchResult from response body
-    // In C: ogs_nnrf_disc_handle_nf_discover_search_result(message.SearchResult)
-    // SearchResult parsing is handled by the nnrf integration module
-
-    // Note: Find NF instance by discovery parameters
-    // In C: ogs_sbi_nf_instance_find_by_discovery_param(...)
-    // NF instance lookup is handled by the ogs_sbi module's NF instance cache
-
-    // Note: Store NF service producer
-    // assoc.nf_service_producer_id = Some(nf_instance.id);
-    // Producer ID is stored when the NF instance is selected
-
-    // Note: Get client for the discovered NF
-    // In C: ogs_sbi_client_find_by_service_type(nf_instance, service_type)
-    // Client lookup is handled by the HTTP client module
-
-    // Note: Check if SEPP is needed for VPLMN routing
-    // In C: ogs_sbi_fqdn_in_vplmn(client->fqdn)
-    // VPLMN detection is handled by the SEPP integration when inter-PLMN routing is enabled
-
-    // Note: Forward original request to discovered NF
-    // In C: send_request(client, response_handler, request, false, assoc)
-    // Request forwarding is handled by the HTTP client module
-
-    // Update association
-    if let Ok(context) = ctx.read() {
-        context.assoc_update(&assoc);
-    }
-
-    Ok(())
-}
-
-/// Handle SEPP discovery response
-/// Port of sepp_discover_handler from sbi-path.c
-pub fn handle_sepp_discover_response(assoc_id: u64, response: &SbiResponse) -> Result<(), String> {
-    let ctx = scp_self();
-    let assoc = {
-        if let Ok(context) = ctx.read() {
-            context.assoc_find(assoc_id)
-        } else {
-            None
-        }
-    };
-
-    let assoc = match assoc {
-        Some(a) => a,
-        None => {
-            return Err(format!("Association not found: {assoc_id}"));
-        }
-    };
-
-    if response.status != 200 {
-        log::error!("SEPP-Discover failed [{}]", response.status);
-        remove_assoc(assoc.id);
-        return Err(format!("SEPP-Discover failed [{}]", response.status));
-    }
-
-    log::debug!("SEPP discovery successful");
-
-    // Note: Parse SearchResult and get SEPP client
-    // In C: ogs_nnrf_disc_handle_nf_discover_search_result(message.SearchResult)
-    // In C: NF_INSTANCE_CLIENT(ogs_sbi_self()->sepp_instance)
-    // SEPP client lookup is handled by the SEPP integration module
-
-    // Note: Forward original request via SEPP
-    // In C: send_request(sepp_client, response_handler, request, false, assoc)
-    // Request forwarding via SEPP is handled by the HTTP client module
-
-    Ok(())
-}
-
-/// Remove association helper
-fn remove_assoc(assoc_id: u64) {
-    let ctx = scp_self();
-    let _ = ctx.read().map(|context| {
-        context.assoc_remove(assoc_id);
-    });
-}
-
 /// Copy request headers, optionally removing custom discovery headers
 /// Port of copy_request from sbi-path.c
 pub fn copy_request_headers(
@@ -575,7 +257,7 @@ pub fn copy_request_headers(
 }
 
 // ============================================================================
-// NF Instance Selection & Request Routing (W1.25, W1.27)
+// NF Instance Selection & Request Routing
 // ============================================================================
 
 /// NF instance candidate for load-balanced routing
@@ -594,7 +276,7 @@ pub struct NfInstanceCandidate {
 
 /// Select the best NF instance from a list of candidates using weighted round-robin.
 ///
-/// W1.27: Supports health-check awareness (skips unhealthy instances) and
+/// Supports health-check awareness (skips unhealthy instances) and
 /// weighted distribution based on NF load/priority.
 ///
 /// Selection algorithm:
@@ -606,7 +288,7 @@ pub fn select_nf_instance(candidates: &[NfInstanceCandidate]) -> Option<&NfInsta
         return None;
     }
 
-    // W1.27: Filter to healthy instances only
+    // Filter to healthy instances only
     let healthy: Vec<&NfInstanceCandidate> = candidates.iter().filter(|c| c.healthy).collect();
 
     // Fall back to all candidates if none are marked healthy
@@ -637,7 +319,7 @@ static ROUND_ROBIN_INDEX: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 /// Select an NF instance using round-robin among healthy, same-priority candidates.
 ///
-/// W1.27: Implements round-robin load balancing among NF instances with
+/// Implements round-robin load balancing among NF instances with
 /// weighted distribution based on NF load/priority and health-check awareness.
 pub fn select_nf_instance_round_robin(
     candidates: &[NfInstanceCandidate],
@@ -673,7 +355,7 @@ pub fn select_nf_instance_round_robin(
 }
 
 // ============================================================================
-// NF Discovery Cache (W1.26)
+// NF Discovery Cache
 // ============================================================================
 
 /// Cached NF discovery result with TTL.
@@ -692,7 +374,7 @@ impl DiscoveryCacheEntry {
 
 /// NF discovery result cache.
 ///
-/// W1.26: Caches NF discovery results with TTL to avoid repeated NRF queries.
+/// Caches NF discovery results with TTL to avoid repeated NRF queries.
 /// Cache key is (target_nf_type, service_name).
 pub struct DiscoveryCache {
     entries: std::sync::RwLock<HashMap<(String, String), DiscoveryCacheEntry>>,
@@ -774,7 +456,7 @@ pub fn discovery_cache() -> &'static DiscoveryCache {
 
 /// Parse NF discovery search result JSON into NfInstanceCandidate list.
 ///
-/// W1.26: Parses the SearchResult response from NRF discovery
+/// Parses the SearchResult response from NRF discovery
 /// (TS 29.510 Section 6.2.3.2.3.1).
 pub fn parse_search_result(body: &[u8]) -> Vec<NfInstanceCandidate> {
     let value: serde_json::Value = match serde_json::from_slice(body) {
@@ -975,7 +657,9 @@ mod tests {
     #[test]
     fn test_parse_discovery_headers() {
         let mut request = SbiRequest::new("GET", "/test");
-        request.set_header(headers::USER_AGENT, "AMF-nextgcore");
+        // Requester identity is carried in the Discovery-requester-nf-type
+        // header (TS 29.500 §5.2.3.2.7), not in User-Agent.
+        request.set_header(headers::DISCOVERY_REQUESTER_NF_TYPE, "AMF");
         request.set_header(headers::DISCOVERY_TARGET_NF_TYPE, "UDM");
         request.set_header(headers::DISCOVERY_SERVICE_NAMES, "nudm-uecm,nudm-sdm");
         request.set_header(headers::DISCOVERY_DNN, "internet");

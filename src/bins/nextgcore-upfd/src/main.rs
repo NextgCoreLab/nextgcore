@@ -219,6 +219,64 @@ async fn main() -> Result<()> {
 
     // Run data plane (if enabled)
     let data_plane = Arc::new(data_plane);
+
+    // Let the PFCP server read final URR counters on session deletion
+    pfcp_server.set_data_plane(data_plane.clone());
+
+    // Data plane → PFCP report channel (Downlink Data Reports on first
+    // buffered packet, Error Indication Reports from GTP-U)
+    let (report_tx, mut report_rx) = tokio::sync::mpsc::channel::<data_plane::UpfReportEvent>(100);
+    data_plane.set_report_channel(report_tx);
+    let pfcp_for_reports = pfcp_server.clone();
+    let report_handle = tokio::spawn(async move {
+        while let Some(event) = report_rx.recv().await {
+            match event {
+                data_plane::UpfReportEvent::DownlinkDataReport {
+                    upf_seid,
+                    smf_seid,
+                    pdr_id,
+                    qfi,
+                } => {
+                    if let Err(e) = pfcp_for_reports
+                        .send_downlink_data_report(upf_seid, smf_seid, pdr_id, qfi)
+                        .await
+                    {
+                        log::error!("Failed to send Downlink Data Report: {e}");
+                    }
+                }
+                data_plane::UpfReportEvent::ErrorIndicationReport {
+                    upf_seid,
+                    smf_seid,
+                    remote_teid,
+                    peer_ipv4,
+                } => {
+                    if let Err(e) = pfcp_for_reports
+                        .send_error_indication_report(upf_seid, smf_seid, remote_teid, peer_ipv4)
+                        .await
+                    {
+                        log::error!("Failed to send Error Indication Report: {e}");
+                    }
+                }
+            }
+        }
+    });
+
+    // UPF-initiated PFCP heartbeats toward the associated CP function
+    // (TS 29.244 6.2.2: either node may initiate heartbeats)
+    let pfcp_for_hb = pfcp_server.clone();
+    let shutdown_hb = shutdown.clone();
+    let heartbeat_handle = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            if shutdown_hb.load(Ordering::SeqCst) {
+                break;
+            }
+            if pfcp_for_hb.is_associated().await {
+                pfcp_for_hb.send_heartbeat_request().await;
+            }
+        }
+    });
     let data_plane_handle = if data_plane_enabled {
         log::info!("Starting data plane task...");
         let dp_clone = data_plane.clone();
@@ -254,7 +312,7 @@ async fn main() -> Result<()> {
             if shutdown_events.load(Ordering::SeqCst) {
                 break;
             }
-            handle_pfcp_session_event(&dp_for_pfcp, event);
+            handle_pfcp_session_event(&dp_for_pfcp, event).await;
         }
         log::info!("PFCP session event handler finished");
     });
@@ -310,6 +368,8 @@ async fn main() -> Result<()> {
     pfcp_server_handle.abort();
     pfcp_event_handle.abort();
     urr_check_handle.abort();
+    report_handle.abort();
+    heartbeat_handle.abort();
 
     // Stop data plane (if enabled)
     if let Some(handle) = data_plane_handle {
@@ -476,9 +536,10 @@ async fn update_session_stats() {
 }
 
 /// Handle PFCP session events (connect PFCP to data plane)
-fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
+async fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
     use data_plane::{
-        DataPlaneFar, DataPlanePdr, DataPlaneQer, DataPlaneUrr, GTPU_PORT, SRC_INTF_CORE,
+        DataPlaneBar, DataPlaneFar, DataPlanePdr, DataPlaneQer, DataPlaneUrr, FAR_ACTION_FORW,
+        GTPU_PORT, SRC_INTF_CORE,
     };
     use std::net::IpAddr;
     use std::sync::Arc;
@@ -495,6 +556,7 @@ fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
             fars,
             qers,
             urrs,
+            bars,
         } => {
             log::info!(
                 "PFCP Session Established: UPF_SEID={upf_seid:#x}, SMF_SEID={smf_seid:#x}, UE={ue_ipv4:?}, UL_TEID={ul_teid:#x}, DL_TEID={dl_teid:#x}"
@@ -545,6 +607,7 @@ fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
                                     urr_ids: p.urr_ids.clone(),
                                     outer_header_removal: p.outer_header_removal,
                                     sdf_rule,
+                                    qfi: p.pdi.qfi,
                                 }
                             })
                             .collect();
@@ -575,10 +638,28 @@ fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
                                     destination_interface: dest_if,
                                     ohc_teid,
                                     ohc_addr,
+                                    bar_id: f.bar_id,
                                 },
                             );
                         }
                         *session.fars.write().unwrap() = dp_fars;
+                    }
+
+                    // Install BARs from PFCP
+                    if !bars.is_empty() {
+                        let mut dp_bars = std::collections::HashMap::new();
+                        for b in &bars {
+                            dp_bars.insert(
+                                b.bar_id,
+                                DataPlaneBar {
+                                    bar_id: b.bar_id,
+                                    suggested_buffering_packets_count: b
+                                        .suggested_buffering_packets_count,
+                                    ddn_delay: b.ddn_delay,
+                                },
+                            );
+                        }
+                        *session.bars.write().unwrap() = dp_bars;
                     }
 
                     // Install QERs from PFCP
@@ -588,10 +669,16 @@ fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
                             let mut qer = DataPlaneQer::new(q.qer_id);
                             qer.ul_gate_open = q.ul_gate == 0;
                             qer.dl_gate_open = q.dl_gate == 0;
-                            qer.ul_mbr = q.ul_mbr;
-                            qer.dl_mbr = q.dl_mbr;
+                            qer.set_mbr(q.ul_mbr, q.dl_mbr);
+                            qer.set_gbr(q.ul_gbr, q.dl_gbr);
                             if let Some(qfi_val) = q.qfi {
                                 qer.set_qfi(qfi_val);
+                            }
+                            if qer.is_xr {
+                                log::info!(
+                                    "Installed XR QER {} (5QI={:?}, DSCP={}, GBR UL/DL={}/{} kbps) for SEID={upf_seid:#x}",
+                                    qer.qer_id, qer.qfi, qer.dscp, qer.ul_gbr, qer.dl_gbr
+                                );
                             }
                             dp_qers.insert(q.qer_id, qer);
                         }
@@ -628,10 +715,25 @@ fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
             gnb_addr,
             updated_fars,
             updated_qers,
+            updated_bars,
+            send_end_marker,
+            drop_buffered,
+            old_dl_tunnel,
         } => {
             log::info!("PFCP Session Modified: UPF_SEID={upf_seid:#x}");
 
             let gnb_socket = gnb_addr.map(|addr| SocketAddr::new(IpAddr::V4(addr), GTPU_PORT));
+
+            // SNDEM (TS 29.244 8.2.50): send End Marker packets on the OLD
+            // DL tunnel before switching to the new endpoint
+            if send_end_marker {
+                if let Some((old_teid, old_ip)) = old_dl_tunnel {
+                    let old_addr = SocketAddr::new(IpAddr::V4(old_ip), GTPU_PORT);
+                    data_plane.send_end_marker(old_teid, old_addr).await;
+                } else {
+                    log::warn!("SNDEM set but no previous DL tunnel known for {upf_seid:#x}");
+                }
+            }
 
             // Update basic session info
             if dl_teid.is_some() || gnb_socket.is_some() {
@@ -639,6 +741,7 @@ fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
             }
 
             // Update FAR rules in the data plane session
+            let mut any_far_forwards = false;
             if let Some(session) = data_plane.sessions.find_by_seid(upf_seid) {
                 if !updated_fars.is_empty() {
                     let mut dp_fars = session.fars.write().unwrap();
@@ -655,6 +758,9 @@ fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
                             .as_ref()
                             .map(|fp| fp.destination_interface)
                             .unwrap_or(SRC_INTF_CORE);
+                        if f.apply_action & FAR_ACTION_FORW != 0 {
+                            any_far_forwards = true;
+                        }
                         dp_fars.insert(
                             f.far_id,
                             DataPlaneFar {
@@ -663,6 +769,7 @@ fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
                                 destination_interface: dest_if,
                                 ohc_teid,
                                 ohc_addr,
+                                bar_id: f.bar_id,
                             },
                         );
                     }
@@ -675,15 +782,53 @@ fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
                         let mut qer = DataPlaneQer::new(q.qer_id);
                         qer.ul_gate_open = q.ul_gate == 0;
                         qer.dl_gate_open = q.dl_gate == 0;
-                        qer.ul_mbr = q.ul_mbr;
-                        qer.dl_mbr = q.dl_mbr;
+                        qer.set_mbr(q.ul_mbr, q.dl_mbr);
+                        qer.set_gbr(q.ul_gbr, q.dl_gbr);
                         if let Some(qfi_val) = q.qfi {
                             qer.set_qfi(qfi_val);
+                        }
+                        if qer.is_xr {
+                            log::info!(
+                                "Updated XR QER {} (5QI={:?}, DSCP={}, GBR UL/DL={}/{} kbps) for SEID={upf_seid:#x}",
+                                qer.qer_id, qer.qfi, qer.dscp, qer.ul_gbr, qer.dl_gbr
+                            );
                         }
                         dp_qers.insert(q.qer_id, qer);
                     }
                     log::info!("Updated {} QERs for SEID={upf_seid:#x}", updated_qers.len());
                 }
+
+                if !updated_bars.is_empty() {
+                    let mut dp_bars = session.bars.write().unwrap();
+                    for b in &updated_bars {
+                        dp_bars.insert(
+                            b.bar_id,
+                            DataPlaneBar {
+                                bar_id: b.bar_id,
+                                suggested_buffering_packets_count: b
+                                    .suggested_buffering_packets_count,
+                                ddn_delay: b.ddn_delay,
+                            },
+                        );
+                    }
+                }
+
+                // DROBU: discard buffered DL packets without forwarding
+                if drop_buffered {
+                    let dropped = session.drain_dl_buffer().len();
+                    if dropped > 0 {
+                        log::info!(
+                            "DROBU: discarded {dropped} buffered DL packets for SEID={upf_seid:#x}"
+                        );
+                    }
+                }
+            }
+
+            // FAR switched to FORW → flush packets buffered under BUFF
+            // (the session may have been re-created by update_session_from_pfcp,
+            // so re-resolve it inside flush_buffered_dl)
+            if any_far_forwards && !drop_buffered {
+                data_plane.flush_buffered_dl(upf_seid).await;
             }
         }
 
@@ -693,6 +838,23 @@ fn handle_pfcp_session_event(data_plane: &DataPlane, event: PfcpSessionEvent) {
         } => {
             log::info!("PFCP Session Deleted: UPF_SEID={upf_seid:#x}");
             data_plane.remove_session_from_pfcp(upf_seid);
+        }
+
+        PfcpSessionEvent::PeerFailure { peer } => {
+            // CP peer restarted or released the association: every session
+            // it controlled is stale (TS 23.527 4.2) — remove them all
+            let seids: Vec<u64> = data_plane
+                .get_all_session_stats()
+                .iter()
+                .map(|(seid, ..)| *seid)
+                .collect();
+            log::warn!(
+                "PFCP peer {peer} failed — removing {} stale sessions",
+                seids.len()
+            );
+            for seid in seids {
+                data_plane.remove_session_from_pfcp(seid);
+            }
         }
     }
 }

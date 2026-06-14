@@ -11,9 +11,9 @@ pub mod gmm_handler;
 pub mod gmm_sm;
 pub mod metrics;
 pub mod namf_handler;
+pub mod namf_server;
 pub mod nas_security;
 pub mod ngap_asn1;
-pub mod ngap_build;
 pub mod ngap_handler;
 pub mod ngap_mcast; // MBS: NGAP multicast session procedures (TS 38.413 / TS 23.247)
 pub mod ngap_path;
@@ -450,8 +450,11 @@ impl AmfApp {
         // Take the event receiver
         let mut event_rx = self.ngap_event_rx.take();
 
-        // Periodic heartbeat interval (replaces the 10ms sleep)
-        let mut heartbeat = tokio::time::interval(tokio::time::Duration::from_secs(10));
+        // NGAP socket poll cadence: amf_ngap_poll() drives SCTP accept/handshake
+        // and reads at most one datagram per call, so this interval bounds the
+        // NG Setup handshake latency — it must stay in the milliseconds (a 10s
+        // tick made the gNB's SCTP handshake time out).
+        let mut ngap_poll = tokio::time::interval(tokio::time::Duration::from_millis(10));
 
         loop {
             // Drain all pending events without sleeping between them, then
@@ -471,14 +474,20 @@ impl AmfApp {
                 }
 
                 // Periodic tick: run NGAP poll and check the shutdown flag.
-                _ = heartbeat.tick() => {
+                _ = ngap_poll.tick() => {
                     if !self.running.load(Ordering::SeqCst) {
                         break;
                     }
-                    match ngap_path::amf_ngap_poll().await {
-                        Ok(true) => log::debug!("Processed NGAP message"),
-                        Ok(false) => {}
-                        Err(e) => log::warn!("NGAP poll error: {e}"),
+                    // Drain everything ready on the socket before yielding.
+                    loop {
+                        match ngap_path::amf_ngap_poll().await {
+                            Ok(true) => log::debug!("Processed NGAP message"),
+                            Ok(false) => break,
+                            Err(e) => {
+                                log::warn!("NGAP poll error: {e}");
+                                break;
+                            }
+                        }
                     }
                 }
             }
@@ -638,12 +647,25 @@ async fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Invalid NGAP address '{}': {}", args.ngap_addr, e))?;
     app.init_ngap(ngap_addr).await?;
 
-    // Register with NRF (if configured)
+    // Start the Namf SBI HTTP/2 server (TS 29.518: namf-comm, namf-evts,
+    // namf-mt, namf-loc) on the advertised SBI endpoint
     let sbi_addr = std::env::var("AMF_SBI_ADDR").unwrap_or_else(|_| "127.0.0.1".to_string());
     let sbi_port: u16 = std::env::var("AMF_SBI_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(7777);
+    let sbi_sock: SocketAddr = format!("{sbi_addr}:{sbi_port}")
+        .parse()
+        .map_err(|e| anyhow::anyhow!("Invalid SBI address '{sbi_addr}:{sbi_port}': {e}"))?;
+    let sbi_server =
+        ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(sbi_sock));
+    sbi_server
+        .start(namf_server::namf_request_handler)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to start Namf SBI server: {e}"))?;
+    log::info!("Namf SBI HTTP/2 server listening on {sbi_sock}");
+
+    // Register with NRF (if configured)
     match sbi_path::amf_nrf_register(&sbi_addr, sbi_port).await {
         Ok(nf_instance_id) if !nf_instance_id.is_empty() => {
             ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id, 5);
@@ -666,6 +688,11 @@ async fn main() -> Result<()> {
 
     // Run async main loop
     app.run_async().await?;
+
+    // Stop the Namf SBI server before tearing the context down
+    if let Err(e) = sbi_server.stop().await {
+        log::warn!("Failed to stop Namf SBI server: {e}");
+    }
 
     // Shutdown (async version)
     app.shutdown_async().await;

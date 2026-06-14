@@ -25,9 +25,10 @@ pub use timer::{nrf_timer_get_name, timer_manager, NrfTimerManager};
 
 // Re-export handler types
 pub use nnrf_handler::{
-    nf_manager, nrf_nnrf_handle_nf_discover, nrf_nnrf_handle_nf_register,
-    nrf_nnrf_handle_nf_status_subscribe, nrf_nnrf_handle_nf_status_unsubscribe, DiscoveryOptions,
-    HandlerResult, NfInstanceManager, NfProfile, SubscriptionData,
+    apply_json_patch, discover_profiles, json_merge_patch, nf_manager, nrf_nnrf_handle_nf_discover,
+    nrf_nnrf_handle_nf_register, nrf_nnrf_handle_nf_status_subscribe,
+    nrf_nnrf_handle_nf_status_unsubscribe, DiscoveryOptions, DiscoveryQuery, HandlerResult,
+    NfInstanceManager, NfProfile, PatchError, SubscriptionData,
 };
 
 // Re-export build types

@@ -149,9 +149,12 @@ impl NasSecurityContext {
         use ogs_crypt::aes_cmac;
 
         // Build input: COUNT || BEARER || DIRECTION || MESSAGE
+        // TS 33.401 Annex B.2.3 (reused by TS 33.501 Annex D.3 / TS 35.215):
+        // octet 4 = BEARER (bits 7-3) | DIRECTION (bit 2) | 00. DIRECTION
+        // must occupy bit 2, not bit 0.
         let mut input = BytesMut::with_capacity(8 + message.len());
         input.put_u32(count);
-        input.put_u8((bearer << 3) | (direction & 0x01));
+        input.put_u8((bearer << 3) | ((direction & 0x01) << 2));
         input.put_slice(&[0u8; 3]); // Padding
         input.put_slice(message);
 
@@ -217,9 +220,12 @@ impl NasSecurityContext {
         use ogs_crypt::aes;
 
         // Build IV: COUNT || BEARER || DIRECTION || 0...0
+        // TS 33.401 Annex B.2.3 (reused by TS 33.501 Annex D.3 / TS 35.215):
+        // octet 4 = BEARER (bits 7-3) | DIRECTION (bit 2) | 00. DIRECTION
+        // must occupy bit 2, not bit 0.
         let mut iv = [0u8; 16];
         iv[0..4].copy_from_slice(&count.to_be_bytes());
-        iv[4] = (bearer << 3) | (direction & 0x01);
+        iv[4] = (bearer << 3) | ((direction & 0x01) << 2);
 
         let mut output = vec![0u8; message.len()];
         aes::aes_ctr128_encrypt(&self.knas_enc, &mut iv, message, &mut output)

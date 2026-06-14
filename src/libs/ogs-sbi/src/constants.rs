@@ -150,7 +150,11 @@ pub mod content_type {
     pub const MULTIPART_RELATED: &str = "multipart/related";
 }
 
-/// Custom 3GPP Headers
+/// Custom 3GPP Headers (TS 29.500 Section 5.2.3)
+///
+/// Header names are listed in their spec-canonical mixed-case spelling.
+/// On the wire HTTP/2 (hyper) carries them lowercased, so all lookups MUST
+/// go through the case-insensitive accessors on `SbiHttpMessage`.
 pub mod custom_header {
     pub const PREFIX: &str = "3gpp-Sbi-";
     pub const MESSAGE_PRIORITY: &str = "3gpp-Sbi-Message-Priority";
@@ -160,13 +164,25 @@ pub mod custom_header {
     pub const BINDING: &str = "3gpp-Sbi-Binding";
     pub const PRODUCER_ID: &str = "3gpp-Sbi-Producer-Id";
     pub const OCI: &str = "3gpp-Sbi-Oci";
+    pub const LCI: &str = "3gpp-Sbi-Lci";
     pub const CLIENT_CREDENTIALS: &str = "3gpp-Sbi-Client-Credentials";
     pub const NRF_URI: &str = "3gpp-Sbi-Nrf-Uri";
     pub const TARGET_NF_ID: &str = "3gpp-Sbi-Target-Nf-Id";
+    pub const TARGET_NF_GROUP_ID: &str = "3gpp-Sbi-Target-Nf-Group-Id";
     pub const ACCESS_SCOPE: &str = "3gpp-Sbi-Access-Scope";
     pub const ACCESS_TOKEN: &str = "3gpp-Sbi-Access-Token";
     pub const SENDER_TIMESTAMP: &str = "3gpp-Sbi-Sender-Timestamp";
     pub const MAX_RSP_TIME: &str = "3gpp-Sbi-Max-Rsp-Time";
+    pub const CORRELATION_INFO: &str = "3gpp-Sbi-Correlation-Info";
+    pub const NF_PEER_INFO: &str = "3gpp-Sbi-NF-Peer-Info";
+    pub const SELECTION_INFO: &str = "3gpp-Sbi-Selection-Info";
+    pub const ALTERNATE_CHF_ID: &str = "3gpp-Sbi-Alternate-Chf-Id";
+    pub const REQUEST_INFO: &str = "3gpp-Sbi-Request-Info";
+    pub const RESPONSE_INFO: &str = "3gpp-Sbi-Response-Info";
+    pub const CONSUMER_INFO: &str = "3gpp-Sbi-Consumer-Info";
+    pub const SOURCE_NF_CLIENT_CREDENTIALS: &str = "3gpp-Sbi-Source-Nf-Client-Credentials";
+    pub const ORIGINATING_NETWORK_ID: &str = "3gpp-Sbi-Originating-Network-Id";
+    pub const INTERPLMN_PURPOSE: &str = "3gpp-Sbi-Interplmn-Purpose";
 }
 
 /// Discovery Custom Headers

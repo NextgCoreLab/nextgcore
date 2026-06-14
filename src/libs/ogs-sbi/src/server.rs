@@ -42,6 +42,18 @@ pub struct SbiServerConfig {
     pub verify_client: bool,
     /// CA certificate for client verification
     pub verify_client_cacert: Option<String>,
+    /// Require a valid OAuth2 bearer token on incoming requests (default false).
+    /// When true, verification keys come from `oauth2_jwks` (static) or
+    /// `oauth2_jwks_uri` (fetched live); with neither configured the server
+    /// fails closed and rejects every request with 503.
+    pub require_oauth2: bool,
+    /// JWKS (NRF public keys) used to verify access tokens when
+    /// `require_oauth2` is enabled. Takes precedence over `oauth2_jwks_uri`.
+    pub oauth2_jwks: Option<serde_json::Value>,
+    /// URI of the NRF's JWKS endpoint (`http://<nrf>/nnrf-oauth2/v1/jwks`).
+    /// When `require_oauth2` is enabled and `oauth2_jwks` is unset, keys are
+    /// fetched from here on first use and cached (see [`JwksCache`]).
+    pub oauth2_jwks_uri: Option<String>,
 }
 
 impl Default for SbiServerConfig {
@@ -54,6 +66,9 @@ impl Default for SbiServerConfig {
             cert: None,
             verify_client: false,
             verify_client_cacert: None,
+            require_oauth2: false,
+            oauth2_jwks: None,
+            oauth2_jwks_uri: None,
         }
     }
 }
@@ -107,15 +122,62 @@ where
     }
 }
 
+/// Where the server gets OAuth2 verification keys when `require_oauth2` is
+/// enabled.
+enum OAuthVerifier {
+    /// A JWKS document provisioned in the server config.
+    Static(serde_json::Value),
+    /// Keys fetched live from the NRF's JWKS endpoint and cached.
+    Remote(crate::oauth::JwksCache),
+    /// `require_oauth2` is set but no JWKS or JWKS URI was configured:
+    /// fail closed, rejecting every request.
+    Unconfigured,
+}
+
+impl OAuthVerifier {
+    /// Resolve the verification source from the server config, or `None`
+    /// when OAuth2 enforcement is disabled.
+    fn from_config(config: &SbiServerConfig) -> Option<Self> {
+        if !config.require_oauth2 {
+            return None;
+        }
+        Some(match (&config.oauth2_jwks, &config.oauth2_jwks_uri) {
+            (Some(jwks), _) => Self::Static(jwks.clone()),
+            (None, Some(uri)) => Self::Remote(crate::oauth::JwksCache::new(uri.clone())),
+            (None, None) => {
+                log::error!(
+                    "require_oauth2 is enabled with no oauth2_jwks/oauth2_jwks_uri; \
+                     rejecting all requests"
+                );
+                Self::Unconfigured
+            }
+        })
+    }
+
+    async fn authorize(&self, auth_header: Option<&str>) -> SbiResult<()> {
+        match self {
+            Self::Static(jwks) => crate::oauth::authorize_bearer(auth_header, jwks).map(|_| ()),
+            Self::Remote(cache) => cache.authorize(auth_header).await.map(|_| ()),
+            Self::Unconfigured => Err(SbiError::ServerError(
+                "require_oauth2 is enabled but neither oauth2_jwks nor oauth2_jwks_uri is configured".into(),
+            )),
+        }
+    }
+}
+
 /// Hyper service wrapper
 struct SbiService<H: SbiRequestHandler> {
     handler: Arc<H>,
+    /// When `Some`, every request must carry a valid OAuth2 bearer token;
+    /// bad tokens are rejected with 401, unavailable keys with 503.
+    oauth: Option<Arc<OAuthVerifier>>,
 }
 
 impl<H: SbiRequestHandler> Clone for SbiService<H> {
     fn clone(&self) -> Self {
         Self {
             handler: self.handler.clone(),
+            oauth: self.oauth.clone(),
         }
     }
 }
@@ -127,6 +189,7 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
 
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let handler = self.handler.clone();
+        let oauth = self.oauth.clone();
         let path = req.uri().path().to_string();
 
         Box::pin(async move {
@@ -142,6 +205,32 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
 
             // Convert hyper request to SbiRequest
             let sbi_request = convert_request(req).await;
+
+            // OAuth2 enforcement (opt-in). Verify the bearer token against the
+            // configured key material before dispatching to the NF handler.
+            // An invalid token is the caller's fault (401); not being able to
+            // obtain verification keys is ours (503).
+            if let Some(verifier) = &oauth {
+                // get_header() is case-insensitive, covering both hyper's
+                // lowercased HTTP/2 names and in-process constructed requests.
+                let auth = sbi_request
+                    .http
+                    .get_header("authorization")
+                    .map(|s| s.as_str());
+                if let Err(e) = verifier.authorize(auth).await {
+                    let (status, title) = match e {
+                        SbiError::AuthorizationFailed(_) => (401, "Unauthorized"),
+                        _ => (503, "Service Unavailable"),
+                    };
+                    let body = serde_json::json!({
+                        "title": title, "status": status, "detail": e.to_string()
+                    })
+                    .to_string();
+                    let resp = SbiResponse::with_status(status)
+                        .with_body(body, "application/problem+json");
+                    return Ok(convert_response(resp));
+                }
+            }
 
             // Call the handler
             let sbi_response = handler.handle(sbi_request).await;
@@ -176,22 +265,82 @@ async fn convert_request(req: Request<Incoming>) -> SbiRequest {
         }
     }
 
-    // Read body
+    // Read body. multipart/related bodies (N1/N2 binary containers, TS
+    // 29.500 §6.1.2.3) are decoded into the JSON root + binary parts before
+    // any UTF-8 conversion so binary content survives byte-exact.
     if let Ok(body) = req.into_body().collect().await {
         let bytes = body.to_bytes();
         if !bytes.is_empty() {
-            http.set_content(String::from_utf8_lossy(&bytes).to_string());
+            let multipart_content_type = http
+                .get_header(crate::constants::header::CONTENT_TYPE)
+                .filter(|ct| crate::multipart::is_multipart_related(ct))
+                .cloned();
+            match multipart_content_type {
+                Some(ct) => match crate::multipart::decode(&ct, &bytes) {
+                    Ok(decoded) => {
+                        http.content = decoded.json;
+                        for part in decoded.parts {
+                            http.add_part(part);
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to decode multipart request body: {e}");
+                        http.set_content(String::from_utf8_lossy(&bytes).to_string());
+                    }
+                },
+                None => http.set_content(String::from_utf8_lossy(&bytes).to_string()),
+            }
         }
     }
 
-    SbiRequest {
-        header: crate::message::SbiHeader::with_method_uri(method, uri),
-        http,
-    }
+    // Decompose the URI per TS 29.501 §4.4 so handlers get service name,
+    // API version and resource components without re-parsing the path.
+    let mut header = crate::message::SbiHeader::with_method_uri(method, uri);
+    header.decompose_uri();
+
+    SbiRequest { header, http }
 }
 
 /// Convert SbiResponse to hyper response
-fn convert_response(sbi_response: SbiResponse) -> Response<Full<Bytes>> {
+fn convert_response(mut sbi_response: SbiResponse) -> Response<Full<Bytes>> {
+    // TS 29.500 §5.2.7: 4xx/5xx bodies carry ProblemDetails as
+    // application/problem+json. Fill in the content type when the handler
+    // attached an error body without declaring one.
+    if sbi_response.status >= 400
+        && sbi_response.http.content.is_some()
+        && sbi_response
+            .http
+            .get_header(crate::constants::header::CONTENT_TYPE)
+            .is_none()
+    {
+        sbi_response.http.set_header(
+            crate::constants::header::CONTENT_TYPE,
+            crate::constants::content_type::APPLICATION_PROBLEM_JSON,
+        );
+    }
+
+    // Encode binary parts as multipart/related (TS 29.500 §6.1.2.3) with the
+    // JSON content as the root part.
+    let body_bytes: Bytes = if !sbi_response.http.parts.is_empty() {
+        let boundary = crate::multipart::generate_boundary();
+        sbi_response.http.set_header(
+            crate::constants::header::CONTENT_TYPE,
+            crate::multipart::content_type_with_boundary(&boundary),
+        );
+        Bytes::from(crate::multipart::encode(
+            sbi_response.http.content.as_deref(),
+            &sbi_response.http.parts,
+            &boundary,
+        ))
+    } else {
+        sbi_response
+            .http
+            .content
+            .as_deref()
+            .map(|c| Bytes::from(c.to_owned()))
+            .unwrap_or_default()
+    };
+
     let mut builder = Response::builder().status(sbi_response.status);
 
     // Add headers
@@ -199,17 +348,16 @@ fn convert_response(sbi_response: SbiResponse) -> Response<Full<Bytes>> {
         builder = builder.header(key.as_str(), value.as_str());
     }
 
-    // Build body
-    let body = sbi_response
-        .http
-        .content
-        .map(|c| Full::new(Bytes::from(c)))
-        .unwrap_or_else(|| Full::new(Bytes::new()));
-
-    builder.body(body).unwrap_or_else(|_| {
+    builder.body(Full::new(body_bytes)).unwrap_or_else(|_| {
         Response::builder()
             .status(500)
-            .body(Full::new(Bytes::from("Internal Server Error")))
+            .header(
+                "content-type",
+                crate::constants::content_type::APPLICATION_PROBLEM_JSON,
+            )
+            .body(Full::new(Bytes::from(
+                r#"{"title":"Internal Server Error","status":500}"#,
+            )))
             .expect("value expected")
     })
 }
@@ -303,6 +451,11 @@ impl SbiServer {
 
         let handler = Arc::new(handler);
 
+        // Resolve the OAuth2 verification source once: Some(_) enables
+        // per-request bearer verification, None leaves the server open.
+        let oauth: Option<Arc<OAuthVerifier>> =
+            OAuthVerifier::from_config(&self.config).map(Arc::new);
+
         // Spawn the server task
         tokio::spawn(async move {
             loop {
@@ -312,6 +465,7 @@ impl SbiServer {
                             Ok((stream, _)) => {
                                 let service = SbiService {
                                     handler: handler.clone(),
+                                    oauth: oauth.clone(),
                                 };
 
                                 if let Some(ref acceptor) = tls_acceptor {
@@ -393,7 +547,10 @@ impl StreamId {
     }
 }
 
-/// Helper function to send an error response
+/// Helper function to send an error response.
+///
+/// The ProblemDetails body is carried as `application/problem+json` per
+/// TS 29.500 §5.2.7.
 pub fn send_error(status: u16, title: &str, detail: &str, cause: Option<&str>) -> SbiResponse {
     use crate::message::ProblemDetails;
 
@@ -407,9 +564,7 @@ pub fn send_error(status: u16, title: &str, detail: &str, cause: Option<&str>) -
         problem
     };
 
-    SbiResponse::with_status(status)
-        .with_json_body(&problem)
-        .unwrap_or_else(|_| SbiResponse::with_status(status))
+    SbiResponse::with_status(status).with_problem(&problem)
 }
 
 /// Send a 400 Bad Request error response
@@ -476,6 +631,72 @@ mod tests {
     }
 
     #[test]
+    fn test_oauth_verifier_resolution() {
+        let base = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], 7777)));
+
+        // Enforcement off: no verifier regardless of key material.
+        assert!(OAuthVerifier::from_config(&base).is_none());
+
+        // Static JWKS takes precedence over a configured URI.
+        let both = SbiServerConfig {
+            require_oauth2: true,
+            oauth2_jwks: Some(serde_json::json!({"keys": []})),
+            oauth2_jwks_uri: Some("http://nrf:7777/nnrf-oauth2/v1/jwks".into()),
+            ..base.clone()
+        };
+        assert!(matches!(
+            OAuthVerifier::from_config(&both),
+            Some(OAuthVerifier::Static(_))
+        ));
+
+        // URI alone resolves to the live-fetching cache.
+        let uri_only = SbiServerConfig {
+            require_oauth2: true,
+            oauth2_jwks_uri: Some("http://nrf:7777/nnrf-oauth2/v1/jwks".into()),
+            ..base.clone()
+        };
+        assert!(matches!(
+            OAuthVerifier::from_config(&uri_only),
+            Some(OAuthVerifier::Remote(_))
+        ));
+
+        // Enforcement with no key material fails closed.
+        let neither = SbiServerConfig {
+            require_oauth2: true,
+            ..base
+        };
+        assert!(matches!(
+            OAuthVerifier::from_config(&neither),
+            Some(OAuthVerifier::Unconfigured)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_oauth_verifier_error_classes() {
+        // Unconfigured rejects everything with a non-authorization error
+        // (mapped to 503), even a syntactically plausible bearer token.
+        let unconfigured = OAuthVerifier::Unconfigured;
+        let err = unconfigured
+            .authorize(Some("Bearer a.b.c"))
+            .await
+            .unwrap_err();
+        assert!(!matches!(err, SbiError::AuthorizationFailed(_)));
+
+        // A static JWKS that can't verify the token is the caller's fault
+        // (AuthorizationFailed, mapped to 401).
+        let static_v = OAuthVerifier::Static(serde_json::json!({"keys": []}));
+        let err = static_v.authorize(None).await.unwrap_err();
+        assert!(matches!(err, SbiError::AuthorizationFailed(_)));
+
+        // A remote source that can't be reached is our fault (mapped to 503).
+        let remote = OAuthVerifier::Remote(crate::oauth::JwksCache::new(
+            "http://127.0.0.1:1/nnrf-oauth2/v1/jwks",
+        ));
+        let err = remote.authorize(Some("Bearer a.b.c")).await.unwrap_err();
+        assert!(!matches!(err, SbiError::AuthorizationFailed(_)));
+    }
+
+    #[test]
     fn test_stream_id() {
         let id = StreamId::new(42);
         assert_eq!(id.0, 42);
@@ -485,5 +706,181 @@ mod tests {
     fn test_send_error() {
         let response = send_error(404, "Not Found", "Resource not found", None);
         assert_eq!(response.status, 404);
+    }
+
+    #[test]
+    fn test_all_error_helpers_carry_problem_json() {
+        // TS 29.500 §5.2.7: every ProblemDetails-bearing 4xx/5xx the server
+        // path emits must use application/problem+json.
+        let responses = vec![
+            send_bad_request("d", None),
+            send_unauthorized("d", None),
+            send_forbidden("d", Some("CAUSE")),
+            send_not_found("d", None),
+            send_method_not_allowed("TRACE", "/x"),
+            send_internal_error("d"),
+            send_service_unavailable("d"),
+            send_gateway_timeout("d"),
+            send_error(409, "Conflict", "d", Some("DUPLICATE")),
+        ];
+        for response in responses {
+            assert!(response.status >= 400);
+            assert_eq!(
+                response.http.get_header("content-type").map(String::as_str),
+                Some(crate::constants::content_type::APPLICATION_PROBLEM_JSON),
+                "status {} missing problem+json content type",
+                response.status
+            );
+            // Body parses back into ProblemDetails with the right status.
+            let problem: crate::message::ProblemDetails =
+                serde_json::from_str(response.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(problem.status, Some(response.status as i32));
+        }
+    }
+
+    #[test]
+    fn test_convert_response_defaults_problem_json_on_errors() {
+        // A handler that attaches an error body without a content type gets
+        // application/problem+json filled in.
+        let response = SbiResponse::with_status(500);
+        let mut response = response;
+        response.http.set_content(r#"{"status":500}"#);
+        let hyper_response = convert_response(response);
+        assert_eq!(
+            hyper_response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some(crate::constants::content_type::APPLICATION_PROBLEM_JSON)
+        );
+
+        // An explicitly declared content type is left alone (e.g. RFC 6749
+        // token-endpoint errors use plain application/json).
+        let response = SbiResponse::with_status(400)
+            .with_body(r#"{"error":"invalid_request"}"#, "application/json");
+        let hyper_response = convert_response(response);
+        assert_eq!(
+            hyper_response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+
+        // 2xx responses are never touched.
+        let response = SbiResponse::ok().with_body("{}", "application/json");
+        let hyper_response = convert_response(response);
+        assert_eq!(
+            hyper_response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn test_convert_response_encodes_multipart_parts() {
+        use crate::message::SbiPart;
+
+        let response = SbiResponse::ok()
+            .with_body(r#"{"n2InfoContainer":{}}"#, "application/json")
+            .with_part(SbiPart::with_content(
+                "ngap-sm",
+                crate::constants::content_type::APPLICATION_NGAP,
+                Bytes::from_static(&[0x00, 0x15, 0xff]),
+            ));
+        let hyper_response = convert_response(response);
+
+        let content_type = hyper_response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap()
+            .to_string();
+        assert!(crate::multipart::is_multipart_related(&content_type));
+
+        // The encoded body decodes back to the JSON root + the binary part.
+        let body = hyper_response.into_body();
+        let bytes = futures_body_bytes(body);
+        let decoded = crate::multipart::decode(&content_type, &bytes).unwrap();
+        assert_eq!(decoded.json.as_deref(), Some(r#"{"n2InfoContainer":{}}"#));
+        assert_eq!(decoded.parts.len(), 1);
+        assert_eq!(decoded.parts[0].content_id.as_deref(), Some("ngap-sm"));
+        assert_eq!(decoded.parts[0].data.as_ref(), &[0x00, 0x15, 0xff]);
+    }
+
+    /// Collect a Full<Bytes> body synchronously for tests.
+    fn futures_body_bytes(body: Full<Bytes>) -> Bytes {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("value expected")
+            .block_on(async move { body.collect().await.expect("value expected").to_bytes() })
+    }
+
+    #[tokio::test]
+    async fn test_multipart_and_custom_headers_over_http2() {
+        use crate::client::SbiClient;
+        use crate::message::SbiPart;
+
+        // Find a free localhost port for the test server.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("value expected");
+        let port = probe.local_addr().expect("value expected").port();
+        drop(probe);
+
+        let server = SbiServer::new(SbiServerConfig::new(SocketAddr::from((
+            [127, 0, 0, 1],
+            port,
+        ))));
+        server
+            .start(|request: SbiRequest| async move {
+                // hyper delivered the custom header lowercased; the
+                // case-insensitive accessor must still find it.
+                let api_root = request.http.target_apiroot().cloned().unwrap_or_default();
+                // The server glue decomposed the URI per TS 29.501 §4.4.
+                let service = request.header.service_name.clone().unwrap_or_default();
+                // Echo the decoded binary part straight back.
+                let part = request.http.parts.first().cloned();
+                let mut response = SbiResponse::ok().with_body(
+                    format!(r#"{{"apiRoot":"{api_root}","svc":"{service}"}}"#),
+                    "application/json",
+                );
+                if let Some(part) = part {
+                    response = response.with_part(part);
+                }
+                response
+            })
+            .await
+            .expect("value expected");
+
+        let nas_bytes: &[u8] = &[0x7e, 0x00, 0xff, 0x0d, 0x0a, 0x00];
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        let request = SbiRequest::post("/namf-comm/v1/ue-contexts/imsi-1/n1-n2-messages")
+            .with_json_body(&serde_json::json!({
+                "n1MessageContainer": {"n1MessageContent": {"contentId": "5gnas-sm"}}
+            }))
+            .expect("value expected")
+            .with_header("3gpp-Sbi-Target-apiRoot", "https://amf.example:7777")
+            .with_part(SbiPart::with_content(
+                "5gnas-sm",
+                crate::constants::content_type::APPLICATION_5GNAS,
+                Bytes::copy_from_slice(nas_bytes),
+            ));
+
+        let response = client.send_request(request).await.expect("value expected");
+        assert!(response.is_success());
+        let body = response.http.content.as_deref().expect("value expected");
+        assert!(body.contains("https://amf.example:7777"));
+        assert!(body.contains("namf-comm"));
+        // The binary part survived client encode -> server decode -> server
+        // encode -> client decode byte-exact.
+        assert_eq!(response.http.parts.len(), 1);
+        assert_eq!(
+            response.http.parts[0].content_id.as_deref(),
+            Some("5gnas-sm")
+        );
+        assert_eq!(response.http.parts[0].data.as_ref(), nas_bytes);
+
+        server.stop().await.expect("value expected");
     }
 }

@@ -108,15 +108,18 @@ pub struct SmfTimerConfigs {
 
 impl Default for SmfTimerConfigs {
     fn default() -> Self {
+        // TS 29.244 7.2.1: requests are retransmitted on T1 expiry up to N1
+        // times; exhaustion is an abnormal event (peer declared unreachable).
+        // T1 = 3s, N1 = 3 (Open5GS defaults). No retry-forever entries.
         Self {
-            // PFCP association - retry every 3 seconds
-            pfcp_association: TimerConfig::new(0, 3),
-            // PFCP no heartbeat - 10 seconds
-            pfcp_no_heartbeat: TimerConfig::new(0, 10),
-            // PFCP no establishment response - 3 seconds
-            pfcp_no_establishment_response: TimerConfig::new(0, 3),
-            // PFCP no deletion response - 3 seconds
-            pfcp_no_deletion_response: TimerConfig::new(0, 3),
+            // PFCP association setup: 3 retransmits per attempt cycle
+            pfcp_association: TimerConfig::new(3, 3),
+            // PFCP heartbeat: 3 lost heartbeats (10s apart) → peer down
+            pfcp_no_heartbeat: TimerConfig::new(3, 10),
+            // PFCP no establishment response: T1=3s, N1=3
+            pfcp_no_establishment_response: TimerConfig::new(3, 3),
+            // PFCP no deletion response: T1=3s, N1=3
+            pfcp_no_deletion_response: TimerConfig::new(3, 3),
         }
     }
 }

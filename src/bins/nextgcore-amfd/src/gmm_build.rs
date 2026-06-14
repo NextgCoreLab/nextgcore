@@ -2,7 +2,7 @@
 //!
 //! Port of src/amf/gmm-build.c - GMM message building functions for 5G NAS
 
-use crate::context::{AmfSess, AmfUe, Guti5gs};
+use crate::context::{AmfUe, Guti5gs};
 use bytes::{BufMut, BytesMut};
 
 // ============================================================================
@@ -53,6 +53,12 @@ pub mod message_type {
     pub const NOTIFICATION_RESPONSE: u8 = 0x66;
     pub const UL_NAS_TRANSPORT: u8 = 0x67;
     pub const DL_NAS_TRANSPORT: u8 = 0x68;
+    /// UAV tracking report (Rel-18, TS 23.256). AMF-private 5GMM message type
+    /// for a UE-originated UAV position / Remote-ID report. 3GPP does not
+    /// assign a UE-originated tracking-report 5GMM message type, so this uses
+    /// an unassigned code kept in sync with the nextgsim UE
+    /// (`UAV_TRACKING_REPORT_MSG_TYPE`).
+    pub const UAV_TRACKING_REPORT: u8 = 0x6a;
 }
 
 /// 5GMM cause codes
@@ -309,31 +315,91 @@ impl Default for NasMessageBuilder {
 // GMM Message Building Functions
 // ============================================================================
 
-/// Build Registration Accept message
+/// Build Registration Accept message (TS 24.501 Section 8.2.7)
+///
+/// Produces the PLAIN inner NAS message (EPD + plain security header).
+/// Callers MUST wrap it with `nas_security::nas_5gs_security_encode`
+/// (integrity protected + ciphered) before sending — there is no
+/// unprotected Registration Accept path.
+///
+/// Includes: 5GS registration result (mandatory), 5G-GUTI (0x77),
+/// TAI list (0x54), Allowed NSSAI (0x15) and T3512 (0x5E).
 pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
-    let mut builder =
-        NasMessageBuilder::with_security_header(security_header::INTEGRITY_PROTECTED_AND_CIPHERED);
+    let mut builder = NasMessageBuilder::new();
 
-    // GMM header
+    // GMM header (plain inner message)
     builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+    builder.write_u8(security_header::PLAIN_NAS_MESSAGE);
     builder.write_message_type(message_type::REGISTRATION_ACCEPT);
 
-    // Registration result (mandatory)
-    // Length (1 byte) + value (access type)
+    // 5GS registration result (mandatory, LV): bits 1-3 = access type
     builder.write_u8(1); // length
-    builder.write_u8(amf_ue.access_type);
+    builder.write_u8(amf_ue.access_type & 0x07);
 
-    // 5G-GUTI (optional, IEI = 0x77)
+    // 5G-GUTI (optional, IEI = 0x77, TLV-E)
     if amf_ue.next_guti.tmsi != 0 {
         let guti_data = encode_guti(&amf_ue.next_guti);
         builder.write_tlv_e(0x77, &guti_data);
     }
 
-    // TAI list would be added here (IEI = 0x54)
-    // Allowed NSSAI would be added here (IEI = 0x15)
-    // Network feature support would be added here (IEI = 0x21)
+    // TAI list (IEI = 0x54, TLV) — registration area assigned to the UE
+    let tai_list = encode_tai_list(&amf_ue.nr_tai);
+    builder.write_tlv(0x54, &tai_list);
+
+    // Allowed NSSAI (IEI = 0x15, TLV)
+    let nssai_source: &[crate::context::SNssai] = if !amf_ue.allowed_nssai.is_empty() {
+        &amf_ue.allowed_nssai
+    } else {
+        &amf_ue.requested_nssai
+    };
+    let nssai = encode_nssai_value(nssai_source);
+    if !nssai.is_empty() {
+        builder.write_tlv(0x15, &nssai);
+    }
+
+    // T3512 value (IEI = 0x5E, GPRS timer 3 TLV): 9 minutes
+    // unit = multiples of 1 minute (010), value = 9 → 0b010_01001
+    builder.write_tlv(0x5E, &[0x49]);
 
     Some(builder.build())
+}
+
+/// Encode a single-TAI "TAI list" per TS 24.501 Section 9.11.3.9
+/// (list type 00 = one PLMN, non-consecutive TAC values).
+pub fn encode_tai_list(tai: &crate::context::Tai5gs) -> Vec<u8> {
+    let mut data = Vec::with_capacity(7);
+    // Type of list = 00, number of elements = 1 (encoded as 0)
+    data.push(0x00);
+    // PLMN
+    data.push((tai.plmn_id.mcc2 << 4) | tai.plmn_id.mcc1);
+    data.push((tai.plmn_id.mnc3 << 4) | tai.plmn_id.mcc3);
+    data.push((tai.plmn_id.mnc2 << 4) | tai.plmn_id.mnc1);
+    // TAC (24 bits)
+    data.push((tai.tac >> 16) as u8);
+    data.push((tai.tac >> 8) as u8);
+    data.push(tai.tac as u8);
+    data
+}
+
+/// Encode an NSSAI IE value (list of S-NSSAIs) per TS 24.501 Section 9.11.3.37
+pub fn encode_nssai_value(snssais: &[crate::context::SNssai]) -> Vec<u8> {
+    let mut data = Vec::new();
+    for snssai in snssais {
+        match snssai.sd {
+            Some(sd) => {
+                data.push(4); // length of S-NSSAI contents: SST + SD
+                data.push(snssai.sst);
+                data.push((sd >> 16) as u8);
+                data.push((sd >> 8) as u8);
+                data.push(sd as u8);
+            }
+            None => {
+                data.push(1); // SST only
+                data.push(snssai.sst);
+            }
+        }
+    }
+    data
 }
 
 /// Build Registration Reject message
@@ -351,13 +417,13 @@ pub fn build_registration_reject(gmm_cause: GmmCause) -> Vec<u8> {
     builder.build()
 }
 
-/// Build Service Accept message
+/// Build Service Accept message (plain inner; wrap with nas_5gs_security_encode)
 pub fn build_service_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
-    let mut builder =
-        NasMessageBuilder::with_security_header(security_header::INTEGRITY_PROTECTED_AND_CIPHERED);
+    let mut builder = NasMessageBuilder::new();
 
-    // GMM header
+    // GMM header (plain inner message)
     builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+    builder.write_u8(security_header::PLAIN_NAS_MESSAGE);
     builder.write_message_type(message_type::SERVICE_ACCEPT);
 
     // PDU session status (optional, IEI = 0x50)
@@ -394,29 +460,30 @@ pub fn build_service_reject(amf_ue: &AmfUe, gmm_cause: GmmCause) -> Vec<u8> {
     builder.build()
 }
 
-/// Build Deregistration Accept message (UE-initiated)
+/// Build Deregistration Accept message (UE-initiated; plain inner)
 pub fn build_deregistration_accept(_amf_ue: &AmfUe) -> Option<Vec<u8>> {
-    let mut builder =
-        NasMessageBuilder::with_security_header(security_header::INTEGRITY_PROTECTED_AND_CIPHERED);
+    let mut builder = NasMessageBuilder::new();
 
-    // GMM header
+    // GMM header (plain inner message)
     builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+    builder.write_u8(security_header::PLAIN_NAS_MESSAGE);
     builder.write_message_type(message_type::DEREGISTRATION_ACCEPT_FROM_UE);
 
     Some(builder.build())
 }
 
-/// Build Deregistration Request message (network-initiated)
+/// Build Deregistration Request message (network-initiated; plain inner,
+/// TS 24.501 Section 8.2.11; wrap with nas_5gs_security_encode)
 pub fn build_deregistration_request(
     _amf_ue: &AmfUe,
     dereg_reason: DeregistrationReason,
     gmm_cause: Option<GmmCause>,
 ) -> Option<Vec<u8>> {
-    let mut builder =
-        NasMessageBuilder::with_security_header(security_header::INTEGRITY_PROTECTED_AND_CIPHERED);
+    let mut builder = NasMessageBuilder::new();
 
-    // GMM header
+    // GMM header (plain inner message)
     builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+    builder.write_u8(security_header::PLAIN_NAS_MESSAGE);
     builder.write_message_type(message_type::DEREGISTRATION_REQUEST_TO_UE);
 
     // De-registration type
@@ -434,8 +501,11 @@ pub fn build_deregistration_request(
     Some(builder.build())
 }
 
-/// Build Identity Request message
-pub fn build_identity_request() -> Vec<u8> {
+/// Build Identity Request message (TS 24.501 Section 8.2.21)
+///
+/// `identity_type` is one of `mobile_identity_type::*` (SUCI for the
+/// subscription identity before authentication, IMEI/IMEISV for PEI).
+pub fn build_identity_request(identity_type: u8) -> Vec<u8> {
     let mut builder = NasMessageBuilder::new();
 
     // GMM header (plain NAS message)
@@ -443,8 +513,8 @@ pub fn build_identity_request() -> Vec<u8> {
     builder.write_u8(0); // Security header type (plain)
     builder.write_message_type(message_type::IDENTITY_REQUEST);
 
-    // Identity type (SUCI)
-    builder.write_u8(mobile_identity_type::SUCI);
+    // Identity type (mandatory, V)
+    builder.write_u8(identity_type & 0x07);
 
     builder.build()
 }
@@ -458,8 +528,9 @@ pub fn build_authentication_request(amf_ue: &AmfUe) -> Vec<u8> {
     builder.write_u8(0); // Security header type (plain)
     builder.write_message_type(message_type::AUTHENTICATION_REQUEST);
 
-    // ngKSI (4 bits TSC + 4 bits KSI)
-    let ngksi = ((amf_ue.nas_tsc & 0x01) << 4) | (amf_ue.nas_ksi & 0x07);
+    // ngKSI (TS 24.501 9.11.3.32: bit 4 = TSC, bits 1-3 = key set id;
+    // spare half octet in bits 5-8)
+    let ngksi = ((amf_ue.nas_tsc & 0x01) << 3) | (amf_ue.nas_ksi & 0x07);
     builder.write_u8(ngksi);
 
     // ABBA (mandatory)
@@ -489,23 +560,28 @@ pub fn build_authentication_reject() -> Vec<u8> {
     builder.build()
 }
 
-/// Build Security Mode Command message
+/// Build Security Mode Command message (TS 24.501 Section 8.2.25)
+///
+/// Plain inner message; callers MUST wrap it with
+/// `nas_5gs_security_encode(.., INTEGRITY_PROTECTED_WITH_NEW_5G_NAS_SECURITY_CONTEXT)`.
+/// Replays the UE security capability exactly as received in the
+/// Registration Request (anti-bidding-down, TS 33.501 Section 6.7.2).
 pub fn build_security_mode_command(amf_ue: &AmfUe) -> Option<Vec<u8>> {
-    let mut builder = NasMessageBuilder::with_security_header(
-        security_header::INTEGRITY_PROTECTED_WITH_NEW_5G_NAS_SECURITY_CONTEXT,
-    );
+    let mut builder = NasMessageBuilder::new();
 
-    // GMM header
+    // GMM header (plain inner message)
     builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+    builder.write_u8(security_header::PLAIN_NAS_MESSAGE);
     builder.write_message_type(message_type::SECURITY_MODE_COMMAND);
 
-    // Selected NAS security algorithms
+    // Selected NAS security algorithms (TS 24.501 9.11.3.34:
+    // bits 8-5 = type of ciphering algorithm, bits 4-1 = type of integrity)
     let security_algorithms =
-        ((amf_ue.selected_int_algorithm & 0x0f) << 4) | (amf_ue.selected_enc_algorithm & 0x0f);
+        ((amf_ue.selected_enc_algorithm & 0x0f) << 4) | (amf_ue.selected_int_algorithm & 0x0f);
     builder.write_u8(security_algorithms);
 
-    // ngKSI
-    let ngksi = ((amf_ue.nas_tsc & 0x01) << 4) | (amf_ue.nas_ksi & 0x07);
+    // ngKSI (bit 4 = TSC, bits 1-3 = key set id)
+    let ngksi = ((amf_ue.nas_tsc & 0x01) << 3) | (amf_ue.nas_ksi & 0x07);
     builder.write_u8(ngksi);
 
     // Replayed UE security capabilities
@@ -535,11 +611,11 @@ pub fn build_configuration_update_command(
     amf_ue: &AmfUe,
     param: &ConfigurationUpdateCommandParam,
 ) -> Option<Vec<u8>> {
-    let mut builder =
-        NasMessageBuilder::with_security_header(security_header::INTEGRITY_PROTECTED_AND_CIPHERED);
+    let mut builder = NasMessageBuilder::new();
 
-    // GMM header
+    // GMM header (plain inner message)
     builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+    builder.write_u8(security_header::PLAIN_NAS_MESSAGE);
     builder.write_message_type(message_type::CONFIGURATION_UPDATE_COMMAND);
 
     // Configuration update indication (optional, IEI = 0xD)
@@ -567,29 +643,31 @@ pub fn build_configuration_update_command(
 
 /// Build DL NAS Transport message
 pub fn build_dl_nas_transport(
-    sess: &AmfSess,
+    psi: Option<u8>,
     payload_container_type: u8,
     payload_container: &[u8],
     gmm_cause: Option<GmmCause>,
     backoff_time: Option<u8>,
 ) -> Option<Vec<u8>> {
-    let mut builder =
-        NasMessageBuilder::with_security_header(security_header::INTEGRITY_PROTECTED_AND_CIPHERED);
+    let mut builder = NasMessageBuilder::new();
 
-    // GMM header
+    // GMM header (plain inner message)
     builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+    builder.write_u8(security_header::PLAIN_NAS_MESSAGE);
     builder.write_message_type(message_type::DL_NAS_TRANSPORT);
 
     // Payload container type (mandatory)
     builder.write_u8(payload_container_type);
 
-    // Payload container (mandatory)
+    // Payload container (mandatory, LV-E)
     builder.write_u16(payload_container.len() as u16);
     builder.write_bytes(payload_container);
 
-    // PDU session ID (optional, IEI = 0x12)
-    builder.write_u8(0x12); // IEI
-    builder.write_u8(sess.psi);
+    // PDU session ID (optional, IEI = 0x12) — only for N1 SM payloads
+    if let Some(psi) = psi {
+        builder.write_u8(0x12); // IEI
+        builder.write_u8(psi);
+    }
 
     // 5GMM cause (optional, IEI = 0x58)
     if let Some(cause) = gmm_cause {
@@ -610,13 +688,13 @@ pub fn build_dl_nas_transport(
     Some(builder.build())
 }
 
-/// Build 5GMM Status message
+/// Build 5GMM Status message (plain inner; wrap with nas_5gs_security_encode)
 pub fn build_gmm_status(gmm_cause: GmmCause) -> Option<Vec<u8>> {
-    let mut builder =
-        NasMessageBuilder::with_security_header(security_header::INTEGRITY_PROTECTED_AND_CIPHERED);
+    let mut builder = NasMessageBuilder::new();
 
-    // GMM header
+    // GMM header (plain inner message)
     builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+    builder.write_u8(security_header::PLAIN_NAS_MESSAGE);
     builder.write_message_type(message_type::GMM_STATUS);
 
     // 5GMM cause (mandatory)
@@ -710,16 +788,6 @@ mod tests {
         }
     }
 
-    fn create_test_sess() -> AmfSess {
-        AmfSess {
-            id: 1,
-            amf_ue_id: 1,
-            psi: 5,
-            sm_context_in_smf: true,
-            ..Default::default()
-        }
-    }
-
     #[test]
     fn test_nas_message_builder() {
         let mut builder = NasMessageBuilder::new();
@@ -747,13 +815,16 @@ mod tests {
 
     #[test]
     fn test_build_identity_request() {
-        let msg = build_identity_request();
+        let msg = build_identity_request(mobile_identity_type::SUCI);
 
         assert!(!msg.is_empty());
         assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
         assert_eq!(msg[1], 0x00); // Plain NAS
         assert_eq!(msg[2], message_type::IDENTITY_REQUEST);
         assert_eq!(msg[3], mobile_identity_type::SUCI);
+
+        let pei_msg = build_identity_request(mobile_identity_type::IMEISV);
+        assert_eq!(pei_msg[3], mobile_identity_type::IMEISV);
     }
 
     #[test]
@@ -812,13 +883,30 @@ mod tests {
 
     #[test]
     fn test_build_dl_nas_transport() {
-        let sess = create_test_sess();
         let payload = vec![0x01, 0x02, 0x03];
-        let msg = build_dl_nas_transport(&sess, 0x01, &payload, None, None);
+        let msg = build_dl_nas_transport(Some(5), 0x01, &payload, None, None);
 
         assert!(msg.is_some());
         let msg = msg.unwrap();
-        assert!(!msg.is_empty());
+        assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+        assert_eq!(msg[1], 0x00); // plain inner
+        assert_eq!(msg[2], message_type::DL_NAS_TRANSPORT);
+        assert_eq!(msg[3], 0x01); // container type
+        assert_eq!(msg[4], 0x00); // container len high
+        assert_eq!(msg[5], 0x03); // container len low
+
+        // Without PSI (e.g. cause-90 reflection of an SMS container)
+        let msg2 = build_dl_nas_transport(
+            None,
+            0x02,
+            &payload,
+            Some(GmmCause::PayloadWasNotForwarded),
+            None,
+        )
+        .unwrap();
+        // 0x58 cause IEI must be present, no 0x12 PSI IEI
+        assert!(msg2.windows(2).any(|w| w == [0x58, 90]));
+        assert!(!msg2[6..].starts_with(&[0x12]));
     }
 
     #[test]

@@ -110,7 +110,9 @@ pub fn handle_subscription_authentication(event: &UdrEvent, stream_id: u64) {
                         "encOpcKey": bytes_to_hex(if auth_info.use_opc { &auth_info.opc } else { &auth_info.op }),
                         "authenticationManagementField": bytes_to_hex(&auth_info.amf),
                         "sequenceNumber": {
-                            "sqn": sqn_to_hex(auth_info.sqn)
+                            "sqnScheme": "NON_TIME_BASED",
+                            "sqn": sqn_to_hex(auth_info.sqn),
+                            "indLength": 5
                         }
                     });
 

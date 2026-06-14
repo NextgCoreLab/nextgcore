@@ -6,6 +6,49 @@ use super::ies::ProtocolIeContainer;
 use super::types::{Criticality, ProcedureCode};
 use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, PerError, PerResult};
 
+/// Read the OPEN TYPE value of a PDU wrapper, reassembling fragmented
+/// lengths per X.691 Section 11.9.3 (message values can exceed 16383
+/// octets when they carry large NAS-PDUs or transparent containers).
+fn read_open_type_value(decoder: &mut AperDecoder) -> PerResult<Vec<u8>> {
+    let mut value = Vec::new();
+    loop {
+        let (len, fragmented) = decoder.decode_length_fragment()?;
+        value.extend_from_slice(&decoder.read_bytes(len)?);
+        if !fragmented {
+            return Ok(value);
+        }
+    }
+}
+
+/// Encode the body of an NGAP elementary-procedure message value.
+///
+/// Every NGAP message is defined as an extensible SEQUENCE
+/// `{ protocolIEs ProtocolIE-Container {...}, ... }` (TS 38.413). Per X.691
+/// the extensible SEQUENCE prepends a single extension-marker bit (0 = no
+/// extension present) before its root field — the IE container. The open-type
+/// framing then octet-aligns the content.
+fn encode_message_value<F>(encode_ies: F) -> PerResult<Vec<u8>>
+where
+    F: FnOnce(&mut AperEncoder) -> PerResult<()>,
+{
+    let mut value_encoder = AperEncoder::new();
+    // SEQUENCE extension marker: no extension additions present
+    value_encoder.write_bit(false);
+    encode_ies(&mut value_encoder)?;
+    value_encoder.align();
+    Ok(value_encoder.into_bytes().to_vec())
+}
+
+/// Decode the body of an NGAP elementary-procedure message value, consuming the
+/// extensible-SEQUENCE extension-marker bit before the IE container.
+fn decode_message_container(value_bytes: &[u8]) -> PerResult<ProtocolIeContainer> {
+    let mut value_decoder = AperDecoder::new(value_bytes);
+    // SEQUENCE extension marker (ignored: NGAP messages carry their additions
+    // as further ProtocolIE-Container entries, not SEQUENCE extension fields)
+    let _ext = value_decoder.read_bit()?;
+    ProtocolIeContainer::decode_aper(&mut value_decoder)
+}
+
 /// NGAP-PDU - Top-level PDU for all NGAP messages
 /// ASN.1: NGAP-PDU ::= CHOICE { initiatingMessage, successfulOutcome, unsuccessfulOutcome }
 #[derive(Debug, Clone, PartialEq)]
@@ -96,14 +139,10 @@ impl AperEncode for InitiatingMessage {
         self.procedure_code.encode_aper(encoder)?;
         self.criticality.encode_aper(encoder)?;
 
-        // Value is encoded as OPEN TYPE (length + content)
-        let mut value_encoder = AperEncoder::new();
-        self.value.encode_aper(&mut value_encoder)?;
-        value_encoder.align();
-        let value_bytes = value_encoder.into_bytes();
-
-        encoder.encode_length_determinant(value_bytes.len())?;
-        encoder.write_bytes(&value_bytes);
+        // Value is encoded as OPEN TYPE (length + content); the inner message
+        // SEQUENCE carries its own extension-marker preamble bit.
+        let value_bytes = encode_message_value(|enc| self.value.encode_aper(enc))?;
+        encoder.encode_fragmented_octets(&value_bytes)?;
 
         Ok(())
     }
@@ -114,40 +153,28 @@ impl AperDecode for InitiatingMessage {
         let procedure_code = ProcedureCode::decode_aper(decoder)?;
         let criticality = Criticality::decode_aper(decoder)?;
 
-        // Decode OPEN TYPE
-        let value_len = decoder.decode_length_determinant()?;
-        let value_bytes = decoder.read_bytes(value_len)?;
-        let mut value_decoder = AperDecoder::new(&value_bytes);
+        // Decode OPEN TYPE; the inner message SEQUENCE carries its own
+        // extension-marker preamble bit before the IE container.
+        let value_bytes = read_open_type_value(decoder)?;
+        let ies = decode_message_container(&value_bytes)?;
 
         let value = match procedure_code {
-            ProcedureCode::NG_SETUP => InitiatingMessageValue::NgSetupRequest(
-                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
-            ),
-            ProcedureCode::INITIAL_UE_MESSAGE => InitiatingMessageValue::InitialUeMessage(
-                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
-            ),
-            ProcedureCode::UPLINK_NAS_TRANSPORT => InitiatingMessageValue::UplinkNasTransport(
-                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
-            ),
-            ProcedureCode::DOWNLINK_NAS_TRANSPORT => InitiatingMessageValue::DownlinkNasTransport(
-                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
-            ),
+            ProcedureCode::NG_SETUP => InitiatingMessageValue::NgSetupRequest(ies),
+            ProcedureCode::INITIAL_UE_MESSAGE => InitiatingMessageValue::InitialUeMessage(ies),
+            ProcedureCode::UPLINK_NAS_TRANSPORT => InitiatingMessageValue::UplinkNasTransport(ies),
+            ProcedureCode::DOWNLINK_NAS_TRANSPORT => {
+                InitiatingMessageValue::DownlinkNasTransport(ies)
+            }
             ProcedureCode::INITIAL_CONTEXT_SETUP => {
-                InitiatingMessageValue::InitialContextSetupRequest(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?,
-                )
+                InitiatingMessageValue::InitialContextSetupRequest(ies)
             }
-            ProcedureCode::UE_CONTEXT_RELEASE => InitiatingMessageValue::UeContextReleaseCommand(
-                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
-            ),
+            ProcedureCode::UE_CONTEXT_RELEASE => {
+                InitiatingMessageValue::UeContextReleaseCommand(ies)
+            }
             ProcedureCode::UE_CONTEXT_RELEASE_REQUEST => {
-                InitiatingMessageValue::UeContextReleaseRequest(ProtocolIeContainer::decode_aper(
-                    &mut value_decoder,
-                )?)
+                InitiatingMessageValue::UeContextReleaseRequest(ies)
             }
-            _ => {
-                InitiatingMessageValue::Other(ProtocolIeContainer::decode_aper(&mut value_decoder)?)
-            }
+            _ => InitiatingMessageValue::Other(ies),
         };
 
         Ok(InitiatingMessage {
@@ -211,13 +238,8 @@ impl AperEncode for SuccessfulOutcome {
         self.procedure_code.encode_aper(encoder)?;
         self.criticality.encode_aper(encoder)?;
 
-        let mut value_encoder = AperEncoder::new();
-        self.value.encode_aper(&mut value_encoder)?;
-        value_encoder.align();
-        let value_bytes = value_encoder.into_bytes();
-
-        encoder.encode_length_determinant(value_bytes.len())?;
-        encoder.write_bytes(&value_bytes);
+        let value_bytes = encode_message_value(|enc| self.value.encode_aper(enc))?;
+        encoder.encode_fragmented_octets(&value_bytes)?;
 
         Ok(())
     }
@@ -228,25 +250,18 @@ impl AperDecode for SuccessfulOutcome {
         let procedure_code = ProcedureCode::decode_aper(decoder)?;
         let criticality = Criticality::decode_aper(decoder)?;
 
-        let value_len = decoder.decode_length_determinant()?;
-        let value_bytes = decoder.read_bytes(value_len)?;
-        let mut value_decoder = AperDecoder::new(&value_bytes);
+        let value_bytes = read_open_type_value(decoder)?;
+        let ies = decode_message_container(&value_bytes)?;
 
         let value = match procedure_code {
-            ProcedureCode::NG_SETUP => SuccessfulOutcomeValue::NgSetupResponse(
-                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
-            ),
+            ProcedureCode::NG_SETUP => SuccessfulOutcomeValue::NgSetupResponse(ies),
             ProcedureCode::INITIAL_CONTEXT_SETUP => {
-                SuccessfulOutcomeValue::InitialContextSetupResponse(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?,
-                )
+                SuccessfulOutcomeValue::InitialContextSetupResponse(ies)
             }
-            ProcedureCode::UE_CONTEXT_RELEASE => SuccessfulOutcomeValue::UeContextReleaseComplete(
-                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
-            ),
-            _ => {
-                SuccessfulOutcomeValue::Other(ProtocolIeContainer::decode_aper(&mut value_decoder)?)
+            ProcedureCode::UE_CONTEXT_RELEASE => {
+                SuccessfulOutcomeValue::UeContextReleaseComplete(ies)
             }
+            _ => SuccessfulOutcomeValue::Other(ies),
         };
 
         Ok(SuccessfulOutcome {
@@ -303,13 +318,8 @@ impl AperEncode for UnsuccessfulOutcome {
         self.procedure_code.encode_aper(encoder)?;
         self.criticality.encode_aper(encoder)?;
 
-        let mut value_encoder = AperEncoder::new();
-        self.value.encode_aper(&mut value_encoder)?;
-        value_encoder.align();
-        let value_bytes = value_encoder.into_bytes();
-
-        encoder.encode_length_determinant(value_bytes.len())?;
-        encoder.write_bytes(&value_bytes);
+        let value_bytes = encode_message_value(|enc| self.value.encode_aper(enc))?;
+        encoder.encode_fragmented_octets(&value_bytes)?;
 
         Ok(())
     }
@@ -320,22 +330,15 @@ impl AperDecode for UnsuccessfulOutcome {
         let procedure_code = ProcedureCode::decode_aper(decoder)?;
         let criticality = Criticality::decode_aper(decoder)?;
 
-        let value_len = decoder.decode_length_determinant()?;
-        let value_bytes = decoder.read_bytes(value_len)?;
-        let mut value_decoder = AperDecoder::new(&value_bytes);
+        let value_bytes = read_open_type_value(decoder)?;
+        let ies = decode_message_container(&value_bytes)?;
 
         let value = match procedure_code {
-            ProcedureCode::NG_SETUP => UnsuccessfulOutcomeValue::NgSetupFailure(
-                ProtocolIeContainer::decode_aper(&mut value_decoder)?,
-            ),
+            ProcedureCode::NG_SETUP => UnsuccessfulOutcomeValue::NgSetupFailure(ies),
             ProcedureCode::INITIAL_CONTEXT_SETUP => {
-                UnsuccessfulOutcomeValue::InitialContextSetupFailure(
-                    ProtocolIeContainer::decode_aper(&mut value_decoder)?,
-                )
+                UnsuccessfulOutcomeValue::InitialContextSetupFailure(ies)
             }
-            _ => UnsuccessfulOutcomeValue::Other(ProtocolIeContainer::decode_aper(
-                &mut value_decoder,
-            )?),
+            _ => UnsuccessfulOutcomeValue::Other(ies),
         };
 
         Ok(UnsuccessfulOutcome {

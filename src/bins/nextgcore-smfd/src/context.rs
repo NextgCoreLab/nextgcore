@@ -1481,6 +1481,36 @@ impl MbsSession {
 
 /// SMF Context - main context structure for SMF
 /// Port of smf_context_t from context.h
+/// Per-PDU-session policy binding: ties the SBI SM context to its PCF SM
+/// policy association, the UE-requested N1 parameters and the QoS the PCF
+/// authorized (applied to N1 NAS and N4 QERs/PDRs). Drives the GSM FSM.
+#[derive(Debug, Clone)]
+pub struct PolicyBinding {
+    /// smPolicyId returned by the PCF (None = config-default fallback)
+    pub sm_policy_id: Option<String>,
+    pub supi: String,
+    pub psi: u8,
+    /// PTI from the UE's N1 SM container (echoed in network responses)
+    pub pti: u8,
+    /// Selected PDU session type (TS 24.501 §9.11.4.11)
+    pub pdu_session_type: u8,
+    /// Selected SSC mode
+    pub ssc_mode: u8,
+    pub ue_ip: [u8; 4],
+    pub dnn: String,
+    /// QFI of the default QoS flow
+    pub qfi: u8,
+    /// Authorized default 5QI
+    pub five_qi: u8,
+    /// Authorized session AMBR (bps)
+    pub ambr_ul_bps: u64,
+    pub ambr_dl_bps: u64,
+    /// SM context status URI provided by the AMF (TS 29.502)
+    pub sm_context_status_uri: Option<String>,
+    /// GSM (5G session management) FSM for this session
+    pub fsm: crate::gsm_sm::GsmFsm,
+}
+
 pub struct SmfContext {
     /// CTF configuration
     pub ctf_config: CtfConfig,
@@ -1571,6 +1601,9 @@ pub struct SmfContext {
     /// test code can construct isolated `SmfContext` instances and avoid
     /// cross-test contamination from a process-wide singleton.
     pub pfcp_sessions: RwLock<HashMap<String, u64>>,
+
+    /// SM policy bindings: sm_context_ref -> PCF policy association + GSM FSM
+    pub policy_bindings: RwLock<HashMap<String, PolicyBinding>>,
 }
 
 impl SmfContext {
@@ -1616,6 +1649,7 @@ impl SmfContext {
                 .unwrap_or(std::net::Ipv4Addr::new(127, 0, 0, 1)),
             initialized: AtomicBool::new(false),
             pfcp_sessions: RwLock::new(HashMap::new()),
+            policy_bindings: RwLock::new(HashMap::new()),
         }
     }
 

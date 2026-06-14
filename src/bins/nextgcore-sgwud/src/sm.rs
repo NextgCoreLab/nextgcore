@@ -9,20 +9,15 @@ use crate::event::{SgwuEvent, SgwuEventId};
 // ============================================================================
 
 /// SGWU FSM state
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SgwuState {
+    #[default]
     /// Initial state
     Initial,
     /// Final state
     Final,
     /// Operational state
     Operational,
-}
-
-impl Default for SgwuState {
-    fn default() -> Self {
-        Self::Initial
-    }
 }
 
 // ============================================================================

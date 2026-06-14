@@ -5,6 +5,7 @@
 //! and application data to other network functions like UDM and PCF.
 
 pub mod context;
+pub mod data_store;
 pub mod event;
 pub mod nudr_handler;
 pub mod sbi_path;

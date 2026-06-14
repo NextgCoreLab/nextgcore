@@ -258,6 +258,182 @@ pub fn nssf_nnssf_nsselection_handle_get_from_hnssf(
     })
 }
 
+// ============================================================================
+// Registration-scenario NS Selection (TS 29.531 §5.2.3.2, SliceInfoForRegistration)
+// ============================================================================
+
+/// Parsed SliceInfoForRegistration content relevant to slice authorization
+#[derive(Debug, Clone, Default)]
+pub struct RegistrationSliceInfo {
+    /// subscribedNssai: (S-NSSAI, defaultIndication)
+    pub subscribed: Vec<(SNssai, bool)>,
+    /// requestedNssai
+    pub requested: Vec<SNssai>,
+    /// defaultConfiguredSnssaiInd
+    pub default_configured_ind: bool,
+    /// mappingOfNssai: (servingSnssai, homeSnssai)
+    pub mapping_of_nssai: Vec<(SNssai, SNssai)>,
+}
+
+/// Context snapshots needed to authorize a registration request without
+/// holding any lock across the computation.
+#[derive(Debug, Clone, Default)]
+pub struct RegistrationContextSnapshot {
+    /// Supported S-NSSAIs in the UE's TAI (None = no TAI given or no
+    /// availability data at all -> skip TA filtering)
+    pub supported_for_tai: Option<Vec<SNssai>>,
+    /// Per-AMF supported S-NSSAIs (nfId, list) from NSSAI availability store
+    pub per_nf_support: Vec<(String, Vec<SNssai>)>,
+    /// NSI info per S-NSSAI: (S-NSSAI, nrfId, nsiId)
+    pub nsi_info: Vec<(SNssai, String, String)>,
+    /// Configured target AMF set (used when re-selection is needed)
+    pub target_amf_set: Option<String>,
+}
+
+/// Result of registration-scenario slice authorization
+#[derive(Debug, Clone, Default)]
+pub struct RegistrationSelection {
+    /// (allowed S-NSSAI, optional (nrfId, nsiId), optional mapped home S-NSSAI)
+    pub allowed: Vec<(SNssai, Option<(String, String)>, Option<SNssai>)>,
+    /// (configured S-NSSAI, optional mapped home S-NSSAI)
+    pub configured: Vec<(SNssai, Option<SNssai>)>,
+    pub rejected_in_plmn: Vec<SNssai>,
+    pub rejected_in_ta: Vec<SNssai>,
+    pub target_amf_set: Option<String>,
+    pub candidate_amf_list: Vec<String>,
+}
+
+/// Authorize the registration-scenario NSSAIs (TS 29.531 §5.2.3.2.3).
+///
+/// - allowed = requested NSSAIs restricted to the subscription and to the
+///   S-NSSAIs available in the UE's TA; when the AMF sends no requestedNssai
+///   the default subscribed S-NSSAIs are used.
+/// - configured = subscribed S-NSSAIs supported in the serving PLMN.
+/// - requested-but-unsubscribed -> rejectedNssaiInPlmn;
+///   subscribed-but-unavailable-in-TA -> rejectedNssaiInTa.
+/// - If the requesting AMF (nf-id) reported availability that cannot serve
+///   the allowed NSSAI while other AMFs can, targetAmfSet/candidateAmfList
+///   are populated for AMF re-selection.
+pub fn nssf_nsselection_handle_registration(
+    requesting_nf_id: &str,
+    info: &RegistrationSliceInfo,
+    snapshot: &RegistrationContextSnapshot,
+) -> RegistrationSelection {
+    let mut sel = RegistrationSelection::default();
+
+    let subscribed: Vec<SNssai> = info.subscribed.iter().map(|(s, _)| s.clone()).collect();
+
+    // Candidate set: requested NSSAIs, or the default subscribed ones when
+    // the UE/AMF did not request anything specific.
+    let candidates: Vec<SNssai> = if !info.requested.is_empty() {
+        info.requested.clone()
+    } else {
+        let defaults: Vec<SNssai> = info
+            .subscribed
+            .iter()
+            .filter(|(_, def)| *def)
+            .map(|(s, _)| s.clone())
+            .collect();
+        if defaults.is_empty() {
+            subscribed.clone()
+        } else {
+            defaults
+        }
+    };
+
+    // Subscription check (only meaningful when the AMF supplied the
+    // subscription; otherwise authorize against availability only).
+    let mut allowed: Vec<SNssai> = Vec::new();
+    for c in &candidates {
+        if subscribed.is_empty() || subscribed.contains(c) {
+            if !allowed.contains(c) {
+                allowed.push(c.clone());
+            }
+        } else if !sel.rejected_in_plmn.contains(c) {
+            sel.rejected_in_plmn.push(c.clone());
+        }
+    }
+
+    // TA availability check (TS 29.531: rejectedNssaiInTa)
+    if let Some(ref supported) = snapshot.supported_for_tai {
+        let (in_ta, out_of_ta): (Vec<SNssai>, Vec<SNssai>) =
+            allowed.into_iter().partition(|s| supported.contains(s));
+        allowed = in_ta;
+        sel.rejected_in_ta = out_of_ta;
+    }
+
+    let mapped = |s: &SNssai| -> Option<SNssai> {
+        info.mapping_of_nssai
+            .iter()
+            .find(|(serving, _)| serving == s)
+            .map(|(_, home)| home.clone())
+    };
+
+    // Attach NSI information where an NSI is configured for the slice
+    for s in &allowed {
+        let nsi = snapshot
+            .nsi_info
+            .iter()
+            .find(|(n, _, _)| n == s)
+            .map(|(_, nrf, nsi)| (nrf.clone(), nsi.clone()));
+        sel.allowed.push((s.clone(), nsi, mapped(s)));
+    }
+
+    // configuredNssai: subscribed S-NSSAIs supported somewhere in the serving
+    // PLMN (when availability data exists), else the full subscription.
+    let plmn_supported: Vec<SNssai> = {
+        let mut acc: Vec<SNssai> = Vec::new();
+        for (_, list) in &snapshot.per_nf_support {
+            for s in list {
+                if !acc.contains(s) {
+                    acc.push(s.clone());
+                }
+            }
+        }
+        acc
+    };
+    let configured_src: Vec<SNssai> = if subscribed.is_empty() {
+        allowed.clone()
+    } else {
+        subscribed.clone()
+    };
+    for s in &configured_src {
+        let supported_in_plmn = plmn_supported.is_empty() || plmn_supported.contains(s);
+        if supported_in_plmn && !sel.configured.iter().any(|(c, _)| c == s) {
+            sel.configured.push((s.clone(), mapped(s)));
+        }
+    }
+
+    // AMF re-selection: only when the requesting AMF reported availability
+    // that does NOT cover the allowed NSSAI, and at least one other AMF does.
+    if !allowed.is_empty() {
+        let requester_support = snapshot
+            .per_nf_support
+            .iter()
+            .find(|(id, _)| id == requesting_nf_id)
+            .map(|(_, list)| list.clone());
+        if let Some(requester_support) = requester_support {
+            let requester_serves_all = allowed.iter().all(|s| requester_support.contains(s));
+            if !requester_serves_all {
+                let candidates_amf: Vec<String> = snapshot
+                    .per_nf_support
+                    .iter()
+                    .filter(|(id, list)| {
+                        id != requesting_nf_id && allowed.iter().all(|s| list.contains(s))
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                if !candidates_amf.is_empty() {
+                    sel.candidate_amf_list = candidates_amf;
+                    sel.target_amf_set = snapshot.target_amf_set.clone();
+                }
+            }
+        }
+    }
+
+    sel
+}
+
 /// NRF-based slice availability query result
 #[derive(Debug, Clone)]
 pub struct NrfSliceAvailability {
@@ -528,5 +704,111 @@ mod tests {
         let result = query_nrf_slice_availability("http://nrf.example.com", &s_nssai, "SMF");
         assert!(!result.available);
         assert_eq!(result.nf_instance_count, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Registration-scenario selection (pure logic, no context needed)
+    // ------------------------------------------------------------------
+
+    fn reg_info(subscribed: Vec<(u8, bool)>, requested: Vec<u8>) -> RegistrationSliceInfo {
+        RegistrationSliceInfo {
+            subscribed: subscribed
+                .into_iter()
+                .map(|(sst, d)| (SNssai::new(sst, None), d))
+                .collect(),
+            requested: requested
+                .into_iter()
+                .map(|s| SNssai::new(s, None))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_registration_allowed_and_rejected_in_plmn() {
+        let info = reg_info(vec![(1, true), (2, false)], vec![1, 9]);
+        let snap = RegistrationContextSnapshot::default();
+        let sel = nssf_nsselection_handle_registration("amf-1", &info, &snap);
+        assert_eq!(sel.allowed.len(), 1);
+        assert_eq!(sel.allowed[0].0, SNssai::new(1, None));
+        assert_eq!(sel.rejected_in_plmn, vec![SNssai::new(9, None)]);
+        assert!(sel.rejected_in_ta.is_empty());
+        // configured = full subscription (no availability data)
+        assert_eq!(sel.configured.len(), 2);
+        assert!(sel.candidate_amf_list.is_empty());
+    }
+
+    #[test]
+    fn test_registration_defaults_when_no_requested() {
+        let info = reg_info(vec![(1, true), (2, false)], vec![]);
+        let snap = RegistrationContextSnapshot::default();
+        let sel = nssf_nsselection_handle_registration("amf-1", &info, &snap);
+        // Only the default-indication subscribed slice is allowed
+        assert_eq!(sel.allowed.len(), 1);
+        assert_eq!(sel.allowed[0].0, SNssai::new(1, None));
+    }
+
+    #[test]
+    fn test_registration_rejected_in_ta() {
+        let info = reg_info(vec![(1, true), (2, false)], vec![1, 2]);
+        let snap = RegistrationContextSnapshot {
+            supported_for_tai: Some(vec![SNssai::new(2, None)]),
+            ..Default::default()
+        };
+        let sel = nssf_nsselection_handle_registration("amf-1", &info, &snap);
+        assert_eq!(sel.allowed.len(), 1);
+        assert_eq!(sel.allowed[0].0, SNssai::new(2, None));
+        assert_eq!(sel.rejected_in_ta, vec![SNssai::new(1, None)]);
+    }
+
+    #[test]
+    fn test_registration_amf_reselection() {
+        let info = reg_info(vec![(1, true)], vec![1]);
+        let snap = RegistrationContextSnapshot {
+            per_nf_support: vec![
+                ("amf-a".to_string(), vec![SNssai::new(2, None)]),
+                ("amf-b".to_string(), vec![SNssai::new(1, None)]),
+            ],
+            target_amf_set: Some("999-70-01-001".to_string()),
+            ..Default::default()
+        };
+        // amf-a cannot serve sst=1 but amf-b can -> re-selection info present
+        let sel = nssf_nsselection_handle_registration("amf-a", &info, &snap);
+        assert_eq!(sel.allowed.len(), 1);
+        assert_eq!(sel.candidate_amf_list, vec!["amf-b".to_string()]);
+        assert_eq!(sel.target_amf_set.as_deref(), Some("999-70-01-001"));
+
+        // amf-b serves it itself -> no re-selection
+        let sel = nssf_nsselection_handle_registration("amf-b", &info, &snap);
+        assert!(sel.candidate_amf_list.is_empty());
+        assert!(sel.target_amf_set.is_none());
+    }
+
+    #[test]
+    fn test_registration_nsi_information_attached() {
+        let info = reg_info(vec![(1, true)], vec![1]);
+        let snap = RegistrationContextSnapshot {
+            nsi_info: vec![(
+                SNssai::new(1, None),
+                "http://nrf.example.com".to_string(),
+                "9f8d7c6b-uuid".to_string(),
+            )],
+            ..Default::default()
+        };
+        let sel = nssf_nsselection_handle_registration("amf-1", &info, &snap);
+        let (_, nsi, _) = &sel.allowed[0];
+        let (nrf_id, nsi_id) = nsi.as_ref().expect("nsi info attached");
+        assert_eq!(nrf_id, "http://nrf.example.com");
+        assert_eq!(nsi_id, "9f8d7c6b-uuid");
+    }
+
+    #[test]
+    fn test_registration_mapped_home_snssai() {
+        let mut info = reg_info(vec![(1, true)], vec![1]);
+        info.mapping_of_nssai = vec![(SNssai::new(1, None), SNssai::new(11, Some(0xABCDEF)))];
+        let snap = RegistrationContextSnapshot::default();
+        let sel = nssf_nsselection_handle_registration("amf-1", &info, &snap);
+        assert_eq!(sel.allowed[0].2, Some(SNssai::new(11, Some(0xABCDEF))));
+        assert_eq!(sel.configured[0].1, Some(SNssai::new(11, Some(0xABCDEF))));
     }
 }

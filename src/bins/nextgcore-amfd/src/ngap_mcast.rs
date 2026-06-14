@@ -14,7 +14,54 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
-use crate::ngap_build::NgapMessageBuilder;
+use bytes::{BufMut, BytesMut};
+
+/// Minimal byte-buffer builder for the simplified MBS NGAP messages below.
+///
+/// The MBS procedures (TS 38.413 Section 9.2.9) are not exposed by ogs-ngap
+/// yet, so these messages keep their simplified internal layout. This builder
+/// is private to this module so it cannot leak into the NGAP wire path.
+#[derive(Debug, Default)]
+struct McastMessageBuilder {
+    buffer: BytesMut,
+}
+
+impl McastMessageBuilder {
+    fn new() -> Self {
+        Self {
+            buffer: BytesMut::with_capacity(256),
+        }
+    }
+
+    fn write_u8(&mut self, value: u8) -> &mut Self {
+        self.buffer.put_u8(value);
+        self
+    }
+
+    fn write_u16(&mut self, value: u16) -> &mut Self {
+        self.buffer.put_u16(value);
+        self
+    }
+
+    fn write_u32(&mut self, value: u32) -> &mut Self {
+        self.buffer.put_u32(value);
+        self
+    }
+
+    fn write_u64(&mut self, value: u64) -> &mut Self {
+        self.buffer.put_u64(value);
+        self
+    }
+
+    fn write_bytes(&mut self, data: &[u8]) -> &mut Self {
+        self.buffer.put_slice(data);
+        self
+    }
+
+    fn build(self) -> Vec<u8> {
+        self.buffer.to_vec()
+    }
+}
 
 /// NGAP procedure codes for MBS (TS 38.413 Section 9.2.9)
 pub mod mbs_procedure_code {
@@ -399,7 +446,7 @@ fn build_mcast_session_activation_request(
     sst: u8,
     sd: Option<u32>,
 ) -> Vec<u8> {
-    let mut builder = NgapMessageBuilder::new();
+    let mut builder = McastMessageBuilder::new();
 
     // Procedure code
     builder.write_u16(mbs_procedure_code::MULTICAST_SESSION_ACTIVATION);
@@ -435,7 +482,7 @@ fn build_mcast_session_activation_request(
 /// Build Multicast Session Deactivation Request (AMF -> gNB)
 /// TS 38.413 Section 9.2.9.3
 fn build_mcast_session_deactivation_request(tmgi: &Tmgi, session_id: u64) -> Vec<u8> {
-    let mut builder = NgapMessageBuilder::new();
+    let mut builder = McastMessageBuilder::new();
 
     builder.write_u16(mbs_procedure_code::MULTICAST_SESSION_DEACTIVATION);
     builder.write_u8(0); // criticality: reject
@@ -453,7 +500,7 @@ fn build_mcast_session_deactivation_request(tmgi: &Tmgi, session_id: u64) -> Vec
 /// Build Multicast Group Paging (AMF -> gNBs in MBS area)
 /// TS 38.413 Section 9.2.9.5
 fn build_mcast_group_paging(tmgi: &Tmgi, session_id: u64, area_tacs: &[u32]) -> Vec<u8> {
-    let mut builder = NgapMessageBuilder::new();
+    let mut builder = McastMessageBuilder::new();
 
     builder.write_u16(mbs_procedure_code::MULTICAST_GROUP_PAGING);
     builder.write_u8(1); // criticality: ignore

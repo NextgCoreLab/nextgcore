@@ -4,10 +4,10 @@
 
 use crate::context::{
     AmfContext, AmfGnb, NgapCause, NgapUeCtxRelAction, NrCgi, PlmnId, RanUe, SNssai, SupportedTa,
-    Tai5gs,
+    Tai5gs, UavAuthorizationContext,
 };
-use crate::ngap_build::{cause_group, radio_network_cause};
 use crate::sbi_path;
+use ogs_ngap::types::{NgReset, ResetType, UeAssociatedLogicalNgConnectionItem};
 
 // ============================================================================
 // Constants
@@ -15,6 +15,85 @@ use crate::sbi_path;
 
 /// Maximum number of cells in reset
 pub const MAX_NUM_OF_CELLS_IN_RESET: usize = 256;
+
+/// NGAP cause groups (TS 38.413 Section 9.3.1.2)
+pub mod cause_group {
+    pub const RADIO_NETWORK: u8 = 0;
+    pub const TRANSPORT: u8 = 1;
+    pub const NAS: u8 = 2;
+    pub const PROTOCOL: u8 = 3;
+    pub const MISC: u8 = 4;
+}
+
+/// NGAP CauseRadioNetwork values (TS 38.413 Section 9.3.1.2)
+pub mod radio_network_cause {
+    pub const UNSPECIFIED: i64 = 0;
+    pub const TXNRELOCOVERALL_EXPIRY: i64 = 1;
+    pub const SUCCESSFUL_HANDOVER: i64 = 2;
+    pub const RELEASE_DUE_TO_NGRAN_GENERATED_REASON: i64 = 3;
+    pub const RELEASE_DUE_TO_5GC_GENERATED_REASON: i64 = 4;
+    pub const HANDOVER_CANCELLED: i64 = 5;
+    pub const PARTIAL_HANDOVER: i64 = 6;
+    pub const HO_FAILURE_IN_TARGET_5GC_NGRAN_NODE_OR_TARGET_SYSTEM: i64 = 7;
+    pub const HO_TARGET_NOT_ALLOWED: i64 = 8;
+    pub const TNGRELOCOVERALL_EXPIRY: i64 = 9;
+    pub const TNGRELOCPREP_EXPIRY: i64 = 10;
+    pub const CELL_NOT_AVAILABLE: i64 = 11;
+    pub const UNKNOWN_TARGET_ID: i64 = 12;
+    pub const NO_RADIO_RESOURCES_AVAILABLE_IN_TARGET_CELL: i64 = 13;
+    pub const UNKNOWN_LOCAL_UE_NGAP_ID: i64 = 14;
+    pub const INCONSISTENT_REMOTE_UE_NGAP_ID: i64 = 15;
+    pub const HANDOVER_DESIRABLE_FOR_RADIO_REASON: i64 = 16;
+    pub const TIME_CRITICAL_HANDOVER: i64 = 17;
+    pub const RESOURCE_OPTIMISATION_HANDOVER: i64 = 18;
+    pub const REDUCE_LOAD_IN_SERVING_CELL: i64 = 19;
+    pub const USER_INACTIVITY: i64 = 20;
+    pub const RADIO_CONNECTION_WITH_UE_LOST: i64 = 21;
+    pub const RADIO_RESOURCES_NOT_AVAILABLE: i64 = 22;
+    pub const INVALID_QOS_COMBINATION: i64 = 23;
+    pub const FAILURE_IN_RADIO_INTERFACE_PROCEDURE: i64 = 24;
+    pub const INTERACTION_WITH_OTHER_PROCEDURE: i64 = 25;
+    pub const UNKNOWN_PDU_SESSION_ID: i64 = 26;
+    pub const UNKNOWN_QOS_FLOW_ID: i64 = 27;
+    pub const MULTIPLE_PDU_SESSION_ID_INSTANCES: i64 = 28;
+    pub const MULTIPLE_QOS_FLOW_ID_INSTANCES: i64 = 29;
+    pub const ENCRYPTION_AND_OR_INTEGRITY_PROTECTION_ALGORITHMS_NOT_SUPPORTED: i64 = 30;
+    pub const NG_INTRA_SYSTEM_HANDOVER_TRIGGERED: i64 = 31;
+    pub const NG_INTER_SYSTEM_HANDOVER_TRIGGERED: i64 = 32;
+    pub const XN_HANDOVER_TRIGGERED: i64 = 33;
+    pub const NOT_SUPPORTED_5QI_VALUE: i64 = 34;
+    pub const UE_CONTEXT_TRANSFER: i64 = 35;
+    pub const IMS_VOICE_EPS_FALLBACK_OR_RAT_FALLBACK_TRIGGERED: i64 = 36;
+    pub const UP_INTEGRITY_PROTECTION_NOT_POSSIBLE: i64 = 37;
+    pub const UP_CONFIDENTIALITY_PROTECTION_NOT_POSSIBLE: i64 = 38;
+    pub const SLICE_NOT_SUPPORTED: i64 = 39;
+    pub const UE_IN_RRC_INACTIVE_STATE_NOT_REACHABLE: i64 = 40;
+    pub const REDIRECTION: i64 = 41;
+    pub const RESOURCES_NOT_AVAILABLE_FOR_THE_SLICE: i64 = 42;
+    pub const UE_MAX_INTEGRITY_PROTECTED_DATA_RATE_REASON: i64 = 43;
+    pub const RELEASE_DUE_TO_CN_DETECTED_MOBILITY: i64 = 44;
+}
+
+/// NGAP CauseProtocol values (TS 38.413 Section 9.3.1.2)
+pub mod protocol_cause {
+    pub const TRANSFER_SYNTAX_ERROR: i64 = 0;
+    pub const ABSTRACT_SYNTAX_ERROR_REJECT: i64 = 1;
+    pub const ABSTRACT_SYNTAX_ERROR_IGNORE_AND_NOTIFY: i64 = 2;
+    pub const MESSAGE_NOT_COMPATIBLE_WITH_RECEIVER_STATE: i64 = 3;
+    pub const SEMANTIC_ERROR: i64 = 4;
+    pub const ABSTRACT_SYNTAX_ERROR_FALSELY_CONSTRUCTED_MESSAGE: i64 = 5;
+    pub const UNSPECIFIED: i64 = 6;
+}
+
+/// NGAP CauseMisc values (TS 38.413 Section 9.3.1.2)
+pub mod misc_cause {
+    pub const CONTROL_PROCESSING_OVERLOAD: i64 = 0;
+    pub const NOT_ENOUGH_USER_PLANE_PROCESSING_RESOURCES: i64 = 1;
+    pub const HARDWARE_FAILURE: i64 = 2;
+    pub const OM_INTERVENTION: i64 = 3;
+    pub const UNKNOWN_PLMN_OR_SNPN: i64 = 4;
+    pub const UNSPECIFIED: i64 = 5;
+}
 
 /// Time to wait values (in seconds)
 pub mod time_to_wait {
@@ -259,9 +338,10 @@ pub fn handle_ng_setup_request(
     // Validate Global RAN Node ID
     if !request.global_ran_node_id_present {
         log::error!("No Global RAN Node ID");
+        // Missing mandatory IE -> Cause: Protocol / semantic-error (TS 38.413 Section 9.3.1.2)
         return NgapHandlerResult::Failure(NgapCause {
-            group: cause_group::MISC,
-            cause: 0, // Unspecified
+            group: cause_group::PROTOCOL,
+            cause: protocol_cause::SEMANTIC_ERROR,
         });
     }
 
@@ -273,9 +353,10 @@ pub fn handle_ng_setup_request(
     // Validate Supported TA List
     if request.supported_ta_list.is_empty() {
         log::error!("No Supported TA List");
+        // Missing mandatory IE -> Cause: Protocol / semantic-error (TS 38.413 Section 9.3.1.2)
         return NgapHandlerResult::Failure(NgapCause {
-            group: cause_group::MISC,
-            cause: 0,
+            group: cause_group::PROTOCOL,
+            cause: protocol_cause::SEMANTIC_ERROR,
         });
     }
 
@@ -299,9 +380,10 @@ pub fn handle_ng_setup_request(
 
     if !tai_match_found {
         log::error!("No matching TAI found");
+        // No served TAI overlap -> Cause: Misc / unknown-PLMN-or-SNPN (TS 38.413 Section 9.3.1.2)
         return NgapHandlerResult::Failure(NgapCause {
             group: cause_group::MISC,
-            cause: 0, // Unknown PLMN or TAC
+            cause: misc_cause::UNKNOWN_PLMN_OR_SNPN,
         });
     }
 
@@ -456,9 +538,13 @@ pub fn perform_an_release(ran_ue: &mut RanUe, cause: &NgapCause) -> Option<Vec<u
         ran_ue.ue_ctx_rel_action
     );
 
-    // Build UE Context Release Command
-    use crate::ngap_build::build_ue_context_release_command;
-    let release_cmd = build_ue_context_release_command(ran_ue, cause)?;
+    // Build UE Context Release Command (APER via ogs-ngap)
+    let release_cmd = crate::ngap_asn1::build_ue_context_release_command_asn1(
+        ran_ue.amf_ue_ngap_id,
+        ran_ue.ran_ue_ngap_id as u32,
+        cause.group,
+        cause.cause,
+    )?;
 
     // After sending this message:
     // 1. gNB will respond with UEContextReleaseComplete
@@ -684,6 +770,73 @@ pub fn handle_error_indication(
     NgapHandlerResult::Success
 }
 
+/// Handle NG Reset from a gNB (TS 38.413 Section 8.7.4.2)
+///
+/// Releases the UE contexts affected by the reset and returns the list of
+/// UE-associated logical NG-connections to echo back in NG Reset Acknowledge.
+/// A full NG-interface reset returns `None` (no connection list in the Ack);
+/// a partial reset returns the received list per Section 8.7.4.2.2.
+pub fn handle_ng_reset(
+    gnb_pool_id: u64,
+    reset: &NgReset,
+) -> Option<Vec<UeAssociatedLogicalNgConnectionItem>> {
+    log::info!(
+        "[gNB pool id:{}] NG Reset received, cause: {:?}",
+        gnb_pool_id,
+        reset.cause
+    );
+
+    let amf_ctx = crate::context::amf_self();
+    let Ok(context) = amf_ctx.read() else {
+        log::error!("AMF context lock poisoned while handling NG Reset");
+        return None;
+    };
+
+    match &reset.reset_type {
+        ResetType::NgInterface => {
+            // Release every UE-associated logical NG-connection on this gNB
+            let affected = context.ran_ue_list_for_gnb(gnb_pool_id);
+            log::info!(
+                "NG Reset (NG interface): releasing {} UE context(s)",
+                affected.len()
+            );
+            for ran_ue in &affected {
+                trigger_smf_session_release_for_ue(ran_ue.amf_ue_id);
+            }
+            context.ran_ue_remove_all_for_gnb(gnb_pool_id);
+            None
+        }
+        ResetType::PartOfNgInterface(connections) => {
+            log::info!(
+                "NG Reset (part of NG interface): {} connection(s) listed",
+                connections.len()
+            );
+            for item in connections {
+                let ran_ue = item
+                    .amf_ue_ngap_id
+                    .and_then(|id| context.ran_ue_find_by_amf_ue_ngap_id(id))
+                    .or_else(|| {
+                        item.ran_ue_ngap_id.and_then(|id| {
+                            context.ran_ue_find_by_ran_ue_ngap_id(gnb_pool_id, id as u64)
+                        })
+                    });
+                if let Some(ran_ue) = ran_ue {
+                    trigger_smf_session_release_for_ue(ran_ue.amf_ue_id);
+                    context.ran_ue_remove(ran_ue.id);
+                } else {
+                    log::warn!(
+                        "NG Reset: no UE context for AMF-UE-NGAP-ID={:?}, RAN-UE-NGAP-ID={:?}",
+                        item.amf_ue_ngap_id,
+                        item.ran_ue_ngap_id
+                    );
+                }
+            }
+            // Echo the received list in the acknowledge (Section 8.7.4.2.2)
+            Some(connections.clone())
+        }
+    }
+}
+
 // ============================================================================
 // Rel-18 UAV Support (TS 23.256)
 // ============================================================================
@@ -710,11 +863,18 @@ pub struct UavTrackingReport {
 }
 
 /// Handle UAV Tracking Report (Rel-18 TS 23.256)
-/// Processes position updates from UAV UEs and checks geofence violations
+///
+/// Processes a position update from a UAV UE and checks it against the UAV
+/// authorization context's geofence. Returns `true` when the position is
+/// allowed (within the geofence and still authorized) and `false` on a
+/// geofence violation; on a violation the caller revokes authorization and
+/// notifies the USS/UTM and PCF. This is invoked from the live NGAP uplink
+/// dispatch (see `ngap_path::handle_uav_tracking_report_nas`).
 pub fn handle_uav_tracking_report(
-    ran_ue: &mut RanUe,
+    uav_auth: &mut UavAuthorizationContext,
     report: &UavTrackingReport,
-) -> NgapHandlerResult {
+    now: u64,
+) -> bool {
     log::info!(
         "[UAV Tracking] Report received: UAV ID={}, position=({:.6}, {:.6}), altitude={:.1}m, status={}",
         report.uav_id,
@@ -724,32 +884,26 @@ pub fn handle_uav_tracking_report(
         report.flight_status
     );
 
-    // Verify NGAP IDs match
-    if ran_ue.amf_ue_ngap_id != report.amf_ue_ngap_id {
-        log::warn!(
-            "[UAV Tracking] AMF UE NGAP ID mismatch: expected {}, got {}",
-            ran_ue.amf_ue_ngap_id,
-            report.amf_ue_ngap_id
-        );
-        return NgapHandlerResult::Success;
-    }
-
-    // In production, this would:
-    // 1. Retrieve AMF UE context and UAV authorization context
-    // 2. Call uav_auth_ctx.update_position() to check geofence violations
-    // 3. If violation detected, trigger authorization revocation and notify PCF
-    // 4. Log position update for flight path tracking
-    // 5. Forward position to LCS/GMLC if location services are subscribed
-
-    log::info!(
-        "[UAV Tracking] Position update processed for UAV ID={} at ({:.6}, {:.6}), alt={:.1}m",
-        report.uav_id,
+    // Run the geofence: update_position returns true when within bounds.
+    let within_bounds = uav_auth.update_position(
         report.latitude,
         report.longitude,
-        report.altitude
+        report.altitude,
+        report.timestamp,
     );
 
-    NgapHandlerResult::Success
+    if within_bounds && uav_auth.is_authorized(now) {
+        log::info!(
+            "[UAV Tracking] Position update processed for UAV ID={} at ({:.6}, {:.6}), alt={:.1}m",
+            report.uav_id,
+            report.latitude,
+            report.longitude,
+            report.altitude
+        );
+        true
+    } else {
+        false
+    }
 }
 
 // ============================================================================
@@ -1148,5 +1302,64 @@ mod tests {
         );
         assert_eq!(cause.group, cause_group::RADIO_NETWORK);
         assert_eq!(cause.cause, radio_network_cause::USER_INACTIVITY);
+    }
+
+    #[test]
+    fn test_handle_ng_reset_full_interface_releases_all_gnb_ues() {
+        use ogs_asn1c::ngap::cause::{Cause, CauseMisc};
+
+        let gnb_pool_id = 987_001u64;
+        let ctx = crate::context::amf_self();
+        let (ue_a, ue_b) = {
+            let context = ctx.read().unwrap();
+            let a = context.ran_ue_add(gnb_pool_id, 11).unwrap();
+            let b = context.ran_ue_add(gnb_pool_id, 12).unwrap();
+            (a, b)
+        };
+
+        let reset = NgReset {
+            cause: Cause::Misc(CauseMisc::HardwareFailure),
+            reset_type: ResetType::NgInterface,
+        };
+        let ack_connections = handle_ng_reset(gnb_pool_id, &reset);
+
+        // Full reset: no connection list echoed, all UE contexts released
+        assert!(ack_connections.is_none());
+        let context = ctx.read().unwrap();
+        assert!(context.ran_ue_find_by_id(ue_a.id).is_none());
+        assert!(context.ran_ue_find_by_id(ue_b.id).is_none());
+    }
+
+    #[test]
+    fn test_handle_ng_reset_partial_releases_listed_ues_only() {
+        use ogs_asn1c::ngap::cause::{Cause, CauseRadioNetwork};
+
+        let gnb_pool_id = 987_002u64;
+        let ctx = crate::context::amf_self();
+        let (target, untouched) = {
+            let context = ctx.read().unwrap();
+            let a = context.ran_ue_add(gnb_pool_id, 21).unwrap();
+            let b = context.ran_ue_add(gnb_pool_id, 22).unwrap();
+            (a, b)
+        };
+
+        let connections = vec![UeAssociatedLogicalNgConnectionItem {
+            amf_ue_ngap_id: Some(target.amf_ue_ngap_id),
+            ran_ue_ngap_id: Some(target.ran_ue_ngap_id as u32),
+        }];
+        let reset = NgReset {
+            cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+            reset_type: ResetType::PartOfNgInterface(connections.clone()),
+        };
+        let ack_connections = handle_ng_reset(gnb_pool_id, &reset);
+
+        // Partial reset: listed connections echoed, only listed UE released
+        assert_eq!(ack_connections, Some(connections));
+        let context = ctx.read().unwrap();
+        assert!(context.ran_ue_find_by_id(target.id).is_none());
+        assert!(context.ran_ue_find_by_id(untouched.id).is_some());
+
+        // Cleanup so other tests using the global context are unaffected
+        context.ran_ue_remove(untouched.id);
     }
 }

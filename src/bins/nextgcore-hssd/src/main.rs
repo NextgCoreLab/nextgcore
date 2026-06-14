@@ -130,6 +130,60 @@ fn main() -> Result<()> {
     }
     log::info!("S6a interface initialized");
 
+    // Start the S6a Diameter server (accepts MME connections; answers
+    // AIR/ULR/PUR and carries HSS-initiated CLR/IDR on the same connections)
+    {
+        let (diam_id, diam_realm, diam_addr, diam_port, timer_tc) = {
+            let ctx = nextgcore_hssd::hss_self();
+            let ctx = ctx.read().expect("HSS context lock poisoned");
+            let diam = &ctx.diam_config;
+            (
+                diam.cnf_diamid
+                    .clone()
+                    .unwrap_or_else(|| "hss.epc.mnc001.mcc001.3gppnetwork.org".to_string()),
+                diam.cnf_diamrlm
+                    .clone()
+                    .unwrap_or_else(|| "epc.mnc001.mcc001.3gppnetwork.org".to_string()),
+                diam.cnf_addr
+                    .clone()
+                    .unwrap_or_else(|| "0.0.0.0".to_string()),
+                if diam.cnf_port == 0 {
+                    3868
+                } else {
+                    diam.cnf_port
+                },
+                diam.cnf_timer_tc.max(1) as u32,
+            )
+        };
+        let diameter_config = ogs_diameter::config::DiameterConfig {
+            diameter_id: diam_id,
+            diameter_realm: diam_realm,
+            port: diam_port,
+            timer_tc,
+            ..Default::default()
+        };
+        let listen_addr: std::net::SocketAddr = format!("{diam_addr}:{diam_port}")
+            .parse()
+            .unwrap_or_else(|_| ([0, 0, 0, 0], diam_port).into());
+
+        std::thread::Builder::new()
+            .name("hss-s6a-diameter".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build S6a tokio runtime");
+                if let Err(e) = runtime.block_on(nextgcore_hssd::hss_s6a_run_server(
+                    listen_addr,
+                    diameter_config,
+                )) {
+                    log::error!("S6a Diameter server terminated: {e}");
+                }
+            })
+            .context("failed to spawn S6a Diameter server thread")?;
+        log::info!("S6a Diameter server started on {listen_addr}");
+    }
+
     // Initialize Cx interface (IMS communication)
     if let Err(e) = hss_cx_init() {
         log::error!("Failed to initialize Cx interface: {e}");

@@ -66,6 +66,65 @@ impl CauseRadioNetwork {
     pub const CONSTRAINT: Constraint = Constraint::extensible(0, 44);
 }
 
+impl TryFrom<i64> for CauseRadioNetwork {
+    type Error = PerError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Unspecified),
+            1 => Ok(Self::TxnrelocoverallExpiry),
+            2 => Ok(Self::SuccessfulHandover),
+            3 => Ok(Self::ReleaseDueToNgranGeneratedReason),
+            4 => Ok(Self::ReleaseDueTo5gcGeneratedReason),
+            5 => Ok(Self::HandoverCancelled),
+            6 => Ok(Self::PartialHandover),
+            7 => Ok(Self::HoFailureInTarget5gcNgranNodeOrTargetSystem),
+            8 => Ok(Self::HoTargetNotAllowed),
+            9 => Ok(Self::TngrelocoverallExpiry),
+            10 => Ok(Self::TngrelocprepExpiry),
+            11 => Ok(Self::CellNotAvailable),
+            12 => Ok(Self::UnknownTargetId),
+            13 => Ok(Self::NoRadioResourcesAvailableInTargetCell),
+            14 => Ok(Self::UnknownLocalUeNgapId),
+            15 => Ok(Self::InconsistentRemoteUeNgapId),
+            16 => Ok(Self::HandoverDesirableForRadioReason),
+            17 => Ok(Self::TimeCriticalHandover),
+            18 => Ok(Self::ResourceOptimisationHandover),
+            19 => Ok(Self::ReduceLoadInServingCell),
+            20 => Ok(Self::UserInactivity),
+            21 => Ok(Self::RadioConnectionWithUeLost),
+            22 => Ok(Self::RadioResourcesNotAvailable),
+            23 => Ok(Self::InvalidQosCombination),
+            24 => Ok(Self::FailureInRadioInterfaceProcedure),
+            25 => Ok(Self::InteractionWithOtherProcedure),
+            26 => Ok(Self::UnknownPduSessionId),
+            27 => Ok(Self::UnknownQosFlowId),
+            28 => Ok(Self::MultiplePduSessionIdInstances),
+            29 => Ok(Self::MultipleQosFlowIdInstances),
+            30 => Ok(Self::EncryptionAndOrIntegrityProtectionAlgorithmsNotSupported),
+            31 => Ok(Self::NgIntraSystemHandoverTriggered),
+            32 => Ok(Self::NgInterSystemHandoverTriggered),
+            33 => Ok(Self::XnHandoverTriggered),
+            34 => Ok(Self::NotSupported5qiValue),
+            35 => Ok(Self::UeContextTransfer),
+            36 => Ok(Self::ImsVoiceEpsFallbackOrRatFallbackTriggered),
+            37 => Ok(Self::UpIntegrityProtectionNotPossible),
+            38 => Ok(Self::UpConfidentialityProtectionNotPossible),
+            39 => Ok(Self::SliceNotSupported),
+            40 => Ok(Self::UeInRrcInactiveStateNotReachable),
+            41 => Ok(Self::Redirection),
+            42 => Ok(Self::ResourcesNotAvailableForTheSlice),
+            43 => Ok(Self::UeMaxIntegrityProtectedDataRateReason),
+            44 => Ok(Self::ReleaseDueToCnDetectedMobility),
+            45 => Ok(Self::N26InterfaceNotAvailable),
+            46 => Ok(Self::ReleaseDueToPreEmption),
+            _ => Err(PerError::DecodeError(format!(
+                "Unknown CauseRadioNetwork value: {value}"
+            ))),
+        }
+    }
+}
+
 impl AperEncode for CauseRadioNetwork {
     fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()> {
         encoder.encode_enumerated(*self as i64, &Self::CONSTRAINT)
@@ -75,15 +134,7 @@ impl AperEncode for CauseRadioNetwork {
 impl AperDecode for CauseRadioNetwork {
     fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
         let value = decoder.decode_enumerated(&Self::CONSTRAINT)?;
-        // For simplicity, we handle known values; unknown extension values return error
-        if value <= 46 {
-            // Safe because we've validated the range
-            Ok(unsafe { std::mem::transmute(value as u8) })
-        } else {
-            Err(PerError::DecodeError(format!(
-                "Unknown CauseRadioNetwork value: {value}"
-            )))
-        }
+        Self::try_from(value)
     }
 }
 
@@ -176,6 +227,25 @@ impl CauseProtocol {
     pub const CONSTRAINT: Constraint = Constraint::extensible(0, 6);
 }
 
+impl TryFrom<i64> for CauseProtocol {
+    type Error = PerError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::TransferSyntaxError),
+            1 => Ok(Self::AbstractSyntaxErrorReject),
+            2 => Ok(Self::AbstractSyntaxErrorIgnoreAndNotify),
+            3 => Ok(Self::MessageNotCompatibleWithReceiverState),
+            4 => Ok(Self::SemanticError),
+            5 => Ok(Self::AbstractSyntaxErrorFalselyConstructedMessage),
+            6 => Ok(Self::Unspecified),
+            _ => Err(PerError::DecodeError(format!(
+                "Unknown CauseProtocol value: {value}"
+            ))),
+        }
+    }
+}
+
 impl AperEncode for CauseProtocol {
     fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()> {
         encoder.encode_enumerated(*self as i64, &Self::CONSTRAINT)
@@ -185,13 +255,7 @@ impl AperEncode for CauseProtocol {
 impl AperDecode for CauseProtocol {
     fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
         let value = decoder.decode_enumerated(&Self::CONSTRAINT)?;
-        if value <= 6 {
-            Ok(unsafe { std::mem::transmute(value as u8) })
-        } else {
-            Err(PerError::DecodeError(format!(
-                "Unknown CauseProtocol value: {value}"
-            )))
-        }
+        Self::try_from(value)
     }
 }
 
@@ -212,6 +276,24 @@ impl CauseMisc {
     pub const CONSTRAINT: Constraint = Constraint::extensible(0, 5);
 }
 
+impl TryFrom<i64> for CauseMisc {
+    type Error = PerError;
+
+    fn try_from(value: i64) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::ControlProcessingOverload),
+            1 => Ok(Self::NotEnoughUserPlaneProcessingResources),
+            2 => Ok(Self::HardwareFailure),
+            3 => Ok(Self::OmIntervention),
+            4 => Ok(Self::UnknownPlmnOrSnpn),
+            5 => Ok(Self::Unspecified),
+            _ => Err(PerError::DecodeError(format!(
+                "Unknown CauseMisc value: {value}"
+            ))),
+        }
+    }
+}
+
 impl AperEncode for CauseMisc {
     fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()> {
         encoder.encode_enumerated(*self as i64, &Self::CONSTRAINT)
@@ -221,13 +303,7 @@ impl AperEncode for CauseMisc {
 impl AperDecode for CauseMisc {
     fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
         let value = decoder.decode_enumerated(&Self::CONSTRAINT)?;
-        if value <= 5 {
-            Ok(unsafe { std::mem::transmute(value as u8) })
-        } else {
-            Err(PerError::DecodeError(format!(
-                "Unknown CauseMisc value: {value}"
-            )))
-        }
+        Self::try_from(value)
     }
 }
 

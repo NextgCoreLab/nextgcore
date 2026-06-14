@@ -4,6 +4,7 @@
 
 use super::header::{Gtp1Header, Gtp1cMessageType, Gtp1uMessageType};
 use super::ie::Gtp1Ie;
+use super::types::{ExtensionHeaderType, Gtp1ExtHeader, PduSessionContainer};
 use crate::error::{GtpError, GtpResult};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -12,6 +13,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 pub struct Gtp1Message {
     /// Message header
     pub header: Gtp1Header,
+    /// Extension headers (TS 29.281 Section 5.2), chained after the header
+    pub extension_headers: Vec<Gtp1ExtHeader>,
     /// Information Elements
     pub ies: Vec<Gtp1Ie>,
     /// Payload (for G-PDU)
@@ -23,6 +26,7 @@ impl Gtp1Message {
     pub fn new(header: Gtp1Header) -> Self {
         Self {
             header,
+            extension_headers: Vec::new(),
             ies: Vec::new(),
             payload: None,
         }
@@ -57,14 +61,44 @@ impl Gtp1Message {
         let header = Gtp1Header::new_gpdu(teid);
         Self {
             header,
+            extension_headers: Vec::new(),
             ies: Vec::new(),
             payload: Some(payload),
         }
     }
 
-    /// Create an Error Indication message
+    /// Create a G-PDU with a PDU Session Container extension header
+    /// (TS 38.415 frame in the 0x85 extension header)
+    pub fn gpdu_with_pdu_session(
+        teid: u32,
+        container: &PduSessionContainer,
+        payload: Bytes,
+    ) -> Self {
+        let mut msg = Self::gpdu(teid, payload);
+        msg.extension_headers
+            .push(Gtp1ExtHeader::pdu_session_container(container));
+        msg
+    }
+
+    /// Create a DL G-PDU carrying DL PDU SESSION INFORMATION with the given QFI
+    pub fn gpdu_dl(teid: u32, qfi: u8, payload: Bytes) -> Self {
+        Self::gpdu_with_pdu_session(teid, &PduSessionContainer::dl(qfi), payload)
+    }
+
+    /// Create an UL G-PDU carrying UL PDU SESSION INFORMATION with the given QFI
+    pub fn gpdu_ul(teid: u32, qfi: u8, payload: Bytes) -> Self {
+        Self::gpdu_with_pdu_session(teid, &PduSessionContainer::ul(qfi), payload)
+    }
+
+    /// Create an Error Indication message.
+    ///
+    /// Per TS 29.281 Section 5.1 the S flag shall be set to 1 for Error
+    /// Indication; per Section 7.3.1 the header TEID shall be 0 and the
+    /// offending TEID travels in the Tunnel Endpoint Identifier Data I IE.
     pub fn error_indication(teid: u32, peer_teid: u32, peer_addr: &[u8]) -> Self {
-        let header = Gtp1Header::new(Gtp1uMessageType::ErrorIndication as u8, teid);
+        let mut header = Gtp1Header::new(Gtp1uMessageType::ErrorIndication as u8, teid);
+        header.s = true;
+        header.sequence_number = Some(0);
         let mut msg = Self::new(header);
 
         // Add TEID Data I IE
@@ -87,6 +121,26 @@ impl Gtp1Message {
     /// Add an IE to the message
     pub fn add_ie(&mut self, ie: Gtp1Ie) {
         self.ies.push(ie);
+    }
+
+    /// Add an extension header to the chain
+    pub fn add_extension_header(&mut self, ext: Gtp1ExtHeader) {
+        self.extension_headers.push(ext);
+    }
+
+    /// Get an extension header by type
+    pub fn get_extension_header(&self, ext_type: u8) -> Option<&Gtp1ExtHeader> {
+        self.extension_headers
+            .iter()
+            .find(|ext| ext.ext_type == ext_type)
+    }
+
+    /// Get the PDU Session Container frame, if present (TS 38.415)
+    pub fn pdu_session_container(&self) -> GtpResult<Option<PduSessionContainer>> {
+        match self.get_extension_header(ExtensionHeaderType::PduSessionContainer as u8) {
+            Some(ext) => Ok(Some(ext.as_pdu_session_container()?)),
+            None => Ok(None),
+        }
     }
 
     /// Get an IE by type
@@ -116,21 +170,43 @@ impl Gtp1Message {
         length
     }
 
+    /// Total encoded size of the extension header chain
+    fn extension_headers_len(&self) -> usize {
+        self.extension_headers
+            .iter()
+            .map(|ext| ext.encoded_len())
+            .sum()
+    }
+
     /// Encode message to bytes
     pub fn encode(&self) -> BytesMut {
         let mut buf = BytesMut::new();
 
         // Calculate and set length
         let mut header = self.header.clone();
+        if !self.extension_headers.is_empty() {
+            header.e = true;
+            header.next_extension_header_type = Some(self.extension_headers[0].ext_type);
+        }
         header.length = self.calculate_length();
 
-        // If we have optional fields, add 4 bytes to length
+        // If we have optional fields, add 4 bytes plus the extension chain
         if header.has_optional_fields() {
-            header.length += 4;
+            header.length += 4 + self.extension_headers_len() as u16;
         }
 
         // Encode header
         header.encode(&mut buf);
+
+        // Encode extension header chain (each carries the next header's type)
+        for (i, ext) in self.extension_headers.iter().enumerate() {
+            let next_type = self
+                .extension_headers
+                .get(i + 1)
+                .map(|next| next.ext_type)
+                .unwrap_or(ExtensionHeaderType::NoMoreExtensionHeaders as u8);
+            ext.encode(&mut buf, next_type);
+        }
 
         // Encode IEs
         for ie in &self.ies {
@@ -154,7 +230,29 @@ impl Gtp1Message {
 
         // Calculate remaining payload length
         let header_extra = if header.has_optional_fields() { 4 } else { 0 };
-        let payload_len = header.length as usize - header_extra;
+        let mut payload_len =
+            (header.length as usize)
+                .checked_sub(header_extra)
+                .ok_or(GtpError::InvalidHeader(
+                    "Length shorter than optional header fields".to_string(),
+                ))?;
+
+        // Decode extension header chain if the E flag is set
+        if header.e {
+            let mut next_type = header.next_extension_header_type.unwrap_or(0);
+            while next_type != ExtensionHeaderType::NoMoreExtensionHeaders as u8 {
+                let start_pos = buf.remaining();
+                let (ext, next) = Gtp1ExtHeader::decode(next_type, buf)?;
+                let consumed = start_pos - buf.remaining();
+                payload_len = payload_len
+                    .checked_sub(consumed)
+                    .ok_or(GtpError::InvalidHeader(
+                        "Extension headers exceed message length".to_string(),
+                    ))?;
+                msg.extension_headers.push(ext);
+                next_type = next;
+            }
+        }
 
         if buf.remaining() < payload_len {
             return Err(GtpError::BufferTooShort {
@@ -254,21 +352,28 @@ impl ErrorIndication {
     }
 
     pub fn decode(msg: &Gtp1Message) -> GtpResult<Self> {
-        let teid = msg
-            .get_ie(16) // TEID Data I
-            .map(|ie| {
-                if ie.value.len() >= 4 {
-                    u32::from_be_bytes([ie.value[0], ie.value[1], ie.value[2], ie.value[3]])
-                } else {
-                    0
-                }
-            })
-            .unwrap_or(0);
+        // Both IEs are mandatory in an Error Indication
+        // (TS 29.281 Section 7.3.1)
+        let teid_ie = msg.get_ie(16).ok_or_else(|| {
+            GtpError::MissingMandatoryIe("Tunnel Endpoint Identifier Data I".to_string())
+        })?;
+        if teid_ie.value.len() < 4 {
+            return Err(GtpError::InvalidIeLength {
+                expected: 4,
+                actual: teid_ie.value.len(),
+            });
+        }
+        let teid = u32::from_be_bytes([
+            teid_ie.value[0],
+            teid_ie.value[1],
+            teid_ie.value[2],
+            teid_ie.value[3],
+        ]);
 
         let gsn_address = msg
             .get_ie(133) // GSN Address
             .map(|ie| ie.value.to_vec())
-            .expect("value expected");
+            .ok_or_else(|| GtpError::MissingMandatoryIe("GTP-U Peer Address".to_string()))?;
 
         Ok(Self { teid, gsn_address })
     }
@@ -357,5 +462,121 @@ mod tests {
             Gtp1uMessageType::EndMarker as u8
         );
         assert_eq!(decoded.header.teid, 0x12345678);
+    }
+
+    #[test]
+    fn test_gpdu_dl_qfi_round_trip() {
+        let payload = Bytes::from_static(&[0x45, 0x00, 0x00, 0x14, 1, 2, 3, 4]);
+        let msg = Gtp1Message::gpdu_dl(0x12345678, 9, payload.clone());
+        let encoded = msg.encode();
+
+        let mut bytes = encoded.freeze();
+        let decoded = Gtp1Message::decode(&mut bytes).unwrap();
+
+        assert_eq!(decoded.header.message_type, Gtp1uMessageType::GPdu as u8);
+        assert_eq!(decoded.header.teid, 0x12345678);
+        assert!(decoded.header.e);
+        assert_eq!(decoded.extension_headers.len(), 1);
+        assert_eq!(decoded.payload, Some(payload));
+
+        let container = decoded.pdu_session_container().unwrap().unwrap();
+        assert_eq!(container, PduSessionContainer::dl(9));
+        assert_eq!(container.qfi(), 9);
+    }
+
+    #[test]
+    fn test_gpdu_ul_qfi_round_trip() {
+        let payload = Bytes::from_static(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let msg = Gtp1Message::gpdu_ul(0xABCDEF01, 5, payload.clone());
+        let encoded = msg.encode();
+
+        let mut bytes = encoded.freeze();
+        let decoded = Gtp1Message::decode(&mut bytes).unwrap();
+
+        assert_eq!(decoded.payload, Some(payload));
+        let container = decoded.pdu_session_container().unwrap().unwrap();
+        assert_eq!(container, PduSessionContainer::ul(5));
+    }
+
+    #[test]
+    fn test_gpdu_dl_qfi_known_vector() {
+        // Spec-derived wire image (TS 29.281 Section 5.2.1 + TS 38.415
+        // Section 5.5.2.1); no public capture is bundled with the repo, so
+        // the bytes are hand-derived from the spec figures and match what
+        // Wireshark dissects for Open5GS/UERANSIM DL G-PDUs.
+        let payload = Bytes::from_static(&[0xCA, 0xFE]);
+        let msg = Gtp1Message::gpdu_dl(0x00000001, 9, payload);
+        let encoded = msg.encode();
+
+        let expected: &[u8] = &[
+            0x34, // version 1, PT=1, E=1
+            0xFF, // G-PDU
+            0x00, 0x0A, // length = 4 (opt fields) + 4 (ext header) + 2 (payload)
+            0x00, 0x00, 0x00, 0x01, // TEID
+            0x00, 0x00, // sequence number (present, not meaningful)
+            0x00, // N-PDU number (present, not meaningful)
+            0x85, // next extension header: PDU Session Container
+            0x01, // extension header length (1 * 4 octets)
+            0x00, // PDU Type 0 (DL), no QMP/SNP
+            0x09, // PPP=0, RQI=0, QFI=9
+            0x00, // next extension header: none
+            0xCA, 0xFE, // payload
+        ];
+        assert_eq!(&encoded[..], expected);
+    }
+
+    #[test]
+    fn test_gpdu_extension_header_chain_round_trip() {
+        // UDP Port (0x40) chained before the PDU Session Container (0x85)
+        let payload = Bytes::from_static(&[1, 2, 3, 4]);
+        let mut msg = Gtp1Message::gpdu(0x11223344, payload.clone());
+        msg.add_extension_header(Gtp1ExtHeader::new(
+            ExtensionHeaderType::UdpPort as u8,
+            &2152u16.to_be_bytes(),
+        ));
+        msg.add_extension_header(Gtp1ExtHeader::pdu_session_container(
+            &PduSessionContainer::dl(1),
+        ));
+
+        let encoded = msg.encode();
+        let mut bytes = encoded.freeze();
+        let decoded = Gtp1Message::decode(&mut bytes).unwrap();
+
+        assert_eq!(decoded.extension_headers.len(), 2);
+        assert_eq!(
+            decoded.extension_headers[0].ext_type,
+            ExtensionHeaderType::UdpPort as u8
+        );
+        assert_eq!(
+            decoded.extension_headers[1].ext_type,
+            ExtensionHeaderType::PduSessionContainer as u8
+        );
+        assert_eq!(decoded.payload, Some(payload));
+        assert_eq!(
+            decoded.pdu_session_container().unwrap(),
+            Some(PduSessionContainer::dl(1))
+        );
+    }
+
+    #[test]
+    fn test_gpdu_truncated_extension_header_rejected() {
+        let msg = Gtp1Message::gpdu_dl(0x12345678, 9, Bytes::from_static(&[1, 2]));
+        let encoded = msg.encode();
+
+        // Cut the message inside the extension header
+        let mut bytes = encoded.freeze().slice(0..13);
+        assert!(Gtp1Message::decode(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn test_gpdu_header_length_underflow_rejected() {
+        // E flag set but header length (0) cannot cover the optional fields
+        let bytes: &[u8] = &[
+            0x34, 0xFF, 0x00, 0x00, // length = 0 with optional fields present
+            0x00, 0x00, 0x00, 0x01, // TEID
+            0x00, 0x00, 0x00, 0x85, // seq/N-PDU/next ext
+        ];
+        let mut buf = Bytes::copy_from_slice(bytes);
+        assert!(Gtp1Message::decode(&mut buf).is_err());
     }
 }

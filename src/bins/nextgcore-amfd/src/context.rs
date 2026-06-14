@@ -468,6 +468,32 @@ pub struct AmfContext {
 
     /// Paging context map: AMF-UE-NGAP-ID -> PagingContext (TS 23.502 4.2.3.3)
     paging_map: RwLock<HashMap<u64, PagingContext>>,
+
+    /// Namf_EventExposure subscriptions: subscriptionId -> EventSubscription
+    /// (TS 29.518 §5.3). Persisted across requests; expiry-aware.
+    event_subscriptions: RwLock<HashMap<String, EventSubscription>>,
+}
+
+/// Namf_EventExposure subscription stored in the AMF context
+/// (TS 29.518 §6.2.6.2.2 AmfEventSubscription)
+#[derive(Debug, Clone)]
+pub struct EventSubscription {
+    /// Subscription ID (assigned by AMF, returned in Location header)
+    pub subscription_id: String,
+    /// Event notification URI (mandatory `eventNotifyUri`)
+    pub notify_uri: String,
+    /// Notify correlation ID (mandatory `notifyCorrelationId`)
+    pub notify_correlation_id: String,
+    /// Subscribing NF instance ID (mandatory `nfId`)
+    pub nf_id: String,
+    /// Subscribed event types (mandatory `eventList`, at least one entry)
+    pub event_types: Vec<String>,
+    /// Single-UE subscription filter (`supi`)
+    pub supi: Option<String>,
+    /// Any-UE subscription (`anyUE`)
+    pub any_ue: bool,
+    /// Optional subscription expiry (`expiry`, DateTime)
+    pub expiry: Option<std::time::SystemTime>,
 }
 
 impl AmfContext {
@@ -515,6 +541,7 @@ impl AmfContext {
             max_num_of_sess: 0,
             initialized: AtomicBool::new(false),
             paging_map: RwLock::new(HashMap::new()),
+            event_subscriptions: RwLock::new(HashMap::new()),
         }
     }
 
@@ -624,26 +651,28 @@ impl AmfContext {
         }
     }
 
+    // Lock-order note: gnb_set_gnb_id acquires gnb_list BEFORE gnb_id_hash;
+    // finders must not hold a hash guard while locking gnb_list (ABBA).
+    // Copy the id, drop the hash guard, then lock the list.
+
     /// Find gNB by address
     pub fn gnb_find_by_addr(&self, addr: &str) -> Option<AmfGnb> {
-        let gnb_addr_hash = self.gnb_addr_hash.read().ok()?;
+        let id = {
+            let gnb_addr_hash = self.gnb_addr_hash.read().ok()?;
+            gnb_addr_hash.get(addr).copied()
+        }?;
         let gnb_list = self.gnb_list.read().ok()?;
-
-        if let Some(&id) = gnb_addr_hash.get(addr) {
-            return gnb_list.get(&id).cloned();
-        }
-        None
+        gnb_list.get(&id).cloned()
     }
 
     /// Find gNB by gNB ID
     pub fn gnb_find_by_gnb_id(&self, gnb_id: u32) -> Option<AmfGnb> {
-        let gnb_id_hash = self.gnb_id_hash.read().ok()?;
+        let id = {
+            let gnb_id_hash = self.gnb_id_hash.read().ok()?;
+            gnb_id_hash.get(&gnb_id).copied()
+        }?;
         let gnb_list = self.gnb_list.read().ok()?;
-
-        if let Some(&id) = gnb_id_hash.get(&gnb_id) {
-            return gnb_list.get(&id).cloned();
-        }
-        None
+        gnb_list.get(&id).cloned()
     }
 
     /// Find gNB by pool ID
@@ -732,10 +761,23 @@ impl AmfContext {
     }
 
     /// Remove all RAN UEs for a gNB
-    fn ran_ue_remove_all_for_gnb(&self, gnb_id: u64) {
+    pub fn ran_ue_remove_all_for_gnb(&self, gnb_id: u64) {
         if let Ok(mut ran_ue_list) = self.ran_ue_list.write() {
             ran_ue_list.retain(|_, ran_ue| ran_ue.gnb_id != gnb_id);
         }
+    }
+
+    /// List all RAN UEs attached to a gNB
+    pub fn ran_ue_list_for_gnb(&self, gnb_id: u64) -> Vec<RanUe> {
+        self.ran_ue_list
+            .read()
+            .map(|list| {
+                list.values()
+                    .filter(|ran_ue| ran_ue.gnb_id == gnb_id)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Find RAN UE by pool ID
@@ -874,37 +916,40 @@ impl AmfContext {
         amf_ue_list.get(&id).cloned()
     }
 
+    // Lock-order note: the setters (amf_ue_set_suci/set_supi/update_guti)
+    // acquire amf_ue_list BEFORE the hash map. The finders below must never
+    // hold the hash lock while acquiring amf_ue_list (ABBA deadlock observed
+    // under concurrent SBI handlers): copy the id out, drop the hash guard,
+    // then lock the list.
+
     /// Find AMF UE by SUCI
     pub fn amf_ue_find_by_suci(&self, suci: &str) -> Option<AmfUe> {
-        let suci_hash = self.suci_hash.read().ok()?;
+        let id = {
+            let suci_hash = self.suci_hash.read().ok()?;
+            suci_hash.get(suci).copied()
+        }?;
         let amf_ue_list = self.amf_ue_list.read().ok()?;
-
-        if let Some(&id) = suci_hash.get(suci) {
-            return amf_ue_list.get(&id).cloned();
-        }
-        None
+        amf_ue_list.get(&id).cloned()
     }
 
     /// Find AMF UE by SUPI
     pub fn amf_ue_find_by_supi(&self, supi: &str) -> Option<AmfUe> {
-        let supi_hash = self.supi_hash.read().ok()?;
+        let id = {
+            let supi_hash = self.supi_hash.read().ok()?;
+            supi_hash.get(supi).copied()
+        }?;
         let amf_ue_list = self.amf_ue_list.read().ok()?;
-
-        if let Some(&id) = supi_hash.get(supi) {
-            return amf_ue_list.get(&id).cloned();
-        }
-        None
+        amf_ue_list.get(&id).cloned()
     }
 
     /// Find AMF UE by GUTI
     pub fn amf_ue_find_by_guti(&self, guti: &Guti5gs) -> Option<AmfUe> {
-        let guti_ue_hash = self.guti_ue_hash.read().ok()?;
+        let id = {
+            let guti_ue_hash = self.guti_ue_hash.read().ok()?;
+            guti_ue_hash.get(guti).copied()
+        }?;
         let amf_ue_list = self.amf_ue_list.read().ok()?;
-
-        if let Some(&id) = guti_ue_hash.get(guti) {
-            return amf_ue_list.get(&id).cloned();
-        }
-        None
+        amf_ue_list.get(&id).cloned()
     }
 
     /// Set SUCI for an AMF UE
@@ -1193,6 +1238,111 @@ impl AmfContext {
     /// Get number of active paging entries
     pub fn paging_count(&self) -> usize {
         self.paging_map.read().map(|m| m.len()).unwrap_or(0)
+    }
+
+    // ========================================================================
+    // Namf_EventExposure Subscription Management (TS 29.518 §5.3)
+    //
+    // Subscriptions are persisted in the AMF context so they survive across
+    // requests. Lock-order rule: these methods only ever take the
+    // `event_subscriptions` lock and never call into other lock-taking
+    // methods while holding it.
+    // ========================================================================
+
+    /// Store an event-exposure subscription. Returns false if the
+    /// subscription ID already exists.
+    pub fn event_subscription_add(&self, sub: EventSubscription) -> bool {
+        if let Ok(mut subs) = self.event_subscriptions.write() {
+            if subs.contains_key(&sub.subscription_id) {
+                return false;
+            }
+            subs.insert(sub.subscription_id.clone(), sub);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Remove an event-exposure subscription by ID
+    pub fn event_subscription_remove(&self, subscription_id: &str) -> Option<EventSubscription> {
+        self.event_subscriptions
+            .write()
+            .ok()
+            .and_then(|mut subs| subs.remove(subscription_id))
+    }
+
+    /// Find an event-exposure subscription by ID (clone-out, lock dropped)
+    pub fn event_subscription_find(&self, subscription_id: &str) -> Option<EventSubscription> {
+        self.event_subscriptions
+            .read()
+            .ok()
+            .and_then(|subs| subs.get(subscription_id).cloned())
+    }
+
+    /// Replace an existing subscription (modify). Returns false when the
+    /// subscription does not exist.
+    pub fn event_subscription_update(&self, sub: EventSubscription) -> bool {
+        if let Ok(mut subs) = self.event_subscriptions.write() {
+            if let std::collections::hash_map::Entry::Occupied(mut e) =
+                subs.entry(sub.subscription_id.clone())
+            {
+                e.insert(sub);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Collect subscriptions matching an event type and (optionally) a SUPI.
+    /// Expired subscriptions are skipped. Results are cloned out so no lock
+    /// is held by the caller.
+    pub fn event_subscriptions_matching(
+        &self,
+        event_type: &str,
+        supi: Option<&str>,
+    ) -> Vec<EventSubscription> {
+        let now = std::time::SystemTime::now();
+        self.event_subscriptions
+            .read()
+            .map(|subs| {
+                subs.values()
+                    .filter(|s| {
+                        if let Some(expiry) = s.expiry {
+                            if expiry <= now {
+                                return false;
+                            }
+                        }
+                        if !s.event_types.iter().any(|t| t == event_type) {
+                            return false;
+                        }
+                        // UE filter: any-UE subscriptions match everything;
+                        // single-UE subscriptions must match the SUPI.
+                        s.any_ue || (s.supi.is_some() && s.supi.as_deref() == supi)
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Remove expired subscriptions; returns how many were removed.
+    pub fn event_subscriptions_remove_expired(&self) -> usize {
+        let now = std::time::SystemTime::now();
+        if let Ok(mut subs) = self.event_subscriptions.write() {
+            let before = subs.len();
+            subs.retain(|_, s| s.expiry.map(|e| e > now).unwrap_or(true));
+            before - subs.len()
+        } else {
+            0
+        }
+    }
+
+    /// Number of stored event-exposure subscriptions
+    pub fn event_subscription_count(&self) -> usize {
+        self.event_subscriptions
+            .read()
+            .map(|m| m.len())
+            .unwrap_or(0)
     }
 
     // ========================================================================
@@ -1714,6 +1864,10 @@ pub struct AmfUe {
     pub prose_capable: bool,
     /// PIN (Personal IoT Network) role
     pub pin_role: Option<String>,
+    /// UAV (aerial UE) flight authorization context (Rel-18, TS 23.256). Set
+    /// when the UE registers as an aerial UE (UAV indication IE); drives the
+    /// geofence on UAV tracking reports.
+    pub uav_auth: Option<UavAuthorizationContext>,
 }
 
 /// URSP policy rule for UE policy delivery (TS 24.526)
@@ -2125,6 +2279,7 @@ impl AmfUe {
             ursp_rules: Vec::new(),
             prose_capable: false,
             pin_role: None,
+            uav_auth: None,
         }
     }
 
@@ -2242,17 +2397,27 @@ impl AmfUe {
         // Clear other timers as needed
     }
 
-    /// Generate new GUTI
+    /// Generate new GUTI with a cryptographically random 5G-TMSI
+    /// (TS 23.003 Section 2.10.1: the M-TMSI must not be predictable —
+    /// never an NGAP-ID cast or a timestamp).
     pub fn generate_new_guti(&mut self) {
-        // Generate new M-TMSI and GUTI
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(0);
-
-        self.next_guti.tmsi = timestamp ^ (self.id as u32);
+        self.next_guti.tmsi = generate_random_tmsi();
         self.next_m_tmsi = Some(self.next_guti.tmsi);
+    }
+}
+
+/// Generate a cryptographically random 5G-TMSI (CSPRNG via the OS RNG).
+///
+/// Avoids the reserved all-zeros / all-ones values (TS 23.003).
+pub fn generate_random_tmsi() -> u32 {
+    loop {
+        // uuid::Uuid::new_v4 sources its bytes from the OS CSPRNG (getrandom)
+        let bytes = uuid::Uuid::new_v4();
+        let b = bytes.as_bytes();
+        let tmsi = u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+        if tmsi != 0 && tmsi != u32::MAX {
+            return tmsi;
+        }
     }
 }
 
@@ -2558,6 +2723,17 @@ pub fn amf_self() -> Arc<RwLock<AmfContext>> {
 /// Initialize the global AMF context
 pub fn amf_context_init(max_gnb: usize, max_ue: usize, max_sess: usize) {
     let ctx = amf_self();
+    // Fast path: already initialized. Never queue a writer in that case —
+    // the std queued RwLock gives writers priority, so a steady stream of
+    // (no-op) writers blocks every new reader and can wedge concurrent
+    // callers (observed as a deadlock under parallel tests).
+    if ctx
+        .read()
+        .map(|context| context.is_initialized())
+        .unwrap_or(false)
+    {
+        return;
+    }
     if let Ok(mut context) = ctx.write() {
         context.init(max_gnb, max_ue, max_sess);
     };

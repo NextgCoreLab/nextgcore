@@ -7,8 +7,97 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::constants::limits;
+use crate::constants::{custom_header, discovery_header, limits};
 use crate::types::NfType;
+
+/// Decomposed API URI per TS 29.501 Section 4.4.1:
+/// `{apiRoot}/{apiName}/{apiVersion}/{apiSpecificResourceUriPart}`
+///
+/// `apiRoot` is `scheme://host[:port]` plus an optional deployment-specific
+/// path prefix; the version segment (`v1`, `v2`, ...) anchors the split so a
+/// prefix never gets mistaken for the apiName.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UriComponents {
+    /// `scheme://authority[/prefix]` — None for relative URIs without prefix
+    pub api_root: Option<String>,
+    /// Service API name, e.g. `nnrf-disc`
+    pub api_name: Option<String>,
+    /// Major-version segment, e.g. `v1`
+    pub api_version: Option<String>,
+    /// Resource path segments after the version
+    pub resource: Vec<String>,
+    /// Raw query string (without `?`), if present
+    pub query: Option<String>,
+}
+
+impl UriComponents {
+    /// Decompose an absolute or relative SBI request URI.
+    pub fn parse(uri: &str) -> Self {
+        let (uri, query) = match uri.split_once('?') {
+            Some((u, q)) => (u, Some(q.to_string())),
+            None => (uri, None),
+        };
+
+        // Split off scheme://authority when the URI is absolute.
+        let (authority, path) = if let Some(rest) = uri
+            .strip_prefix("http://")
+            .map(|r| ("http://", r))
+            .or_else(|| uri.strip_prefix("https://").map(|r| ("https://", r)))
+        {
+            let (scheme, rest) = rest;
+            match rest.split_once('/') {
+                Some((auth, path)) => (Some(format!("{scheme}{auth}")), path),
+                None => (Some(format!("{scheme}{rest}")), ""),
+            }
+        } else {
+            (None, uri.trim_start_matches('/'))
+        };
+
+        let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+        // The version segment anchors the apiName: everything before
+        // `{apiName}/{apiVersion}` belongs to the apiRoot prefix.
+        let version_idx = segments
+            .iter()
+            .position(|s| Self::is_version_segment(s))
+            .filter(|&i| i >= 1);
+
+        match version_idx {
+            Some(i) => {
+                let prefix = &segments[..i - 1];
+                let api_root = match (&authority, prefix.is_empty()) {
+                    (Some(auth), true) => Some(auth.clone()),
+                    (Some(auth), false) => Some(format!("{}/{}", auth, prefix.join("/"))),
+                    (None, true) => None,
+                    (None, false) => Some(format!("/{}", prefix.join("/"))),
+                };
+                Self {
+                    api_root,
+                    api_name: Some(segments[i - 1].to_string()),
+                    api_version: Some(segments[i].to_string()),
+                    resource: segments[i + 1..].iter().map(|s| s.to_string()).collect(),
+                    query,
+                }
+            }
+            None => Self {
+                // No version segment: treat the first segment as the apiName
+                // and the remainder as resource components.
+                api_root: authority,
+                api_name: segments.first().map(|s| s.to_string()),
+                api_version: None,
+                resource: segments.iter().skip(1).map(|s| s.to_string()).collect(),
+                query,
+            },
+        }
+    }
+
+    /// True for an apiVersion path segment: `v` followed by digits.
+    fn is_version_segment(s: &str) -> bool {
+        s.len() >= 2
+            && (s.starts_with('v') || s.starts_with('V'))
+            && s[1..].chars().all(|c| c.is_ascii_digit())
+    }
+}
 
 /// SBI Header - matches ogs_sbi_header_t
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -49,6 +138,18 @@ impl SbiHeader {
     /// Build the resource path from components
     pub fn resource_path(&self) -> String {
         self.resource.join("/")
+    }
+
+    /// Decompose `self.uri` per TS 29.501 Section 4.4.1 and populate
+    /// `service_name`, `api_version` and `resource` from it.
+    /// Returns the full decomposition (including the apiRoot, which has no
+    /// field on the header itself).
+    pub fn decompose_uri(&mut self) -> UriComponents {
+        let components = UriComponents::parse(&self.uri);
+        self.service_name = components.api_name.clone();
+        self.api_version = components.api_version.clone();
+        self.resource = components.resource.clone();
+        components
     }
 }
 
@@ -110,14 +211,47 @@ impl SbiHttpMessage {
         self.params.get(key)
     }
 
-    /// Set a header
+    /// Set a header.
+    ///
+    /// Header names are case-insensitive (RFC 9110) and hyper lowercases all
+    /// HTTP/2 header names on the wire, so the key is normalized to lowercase
+    /// on insert and any case-variant duplicate already in the map is
+    /// replaced. Lookups via [`get_header`](Self::get_header) accept any
+    /// spelling.
     pub fn set_header(&mut self, key: impl Into<String>, value: impl Into<String>) {
-        self.headers.insert(key.into(), value.into());
+        let key = key.into().to_ascii_lowercase();
+        self.headers.retain(|k, _| !k.eq_ignore_ascii_case(&key));
+        self.headers.insert(key, value.into());
     }
 
-    /// Get a header
+    /// Get a header by name, case-insensitively.
+    ///
+    /// Tries the normalized (lowercase) spelling first, then falls back to a
+    /// case-insensitive scan so keys inserted directly into the `headers` map
+    /// (bypassing [`set_header`](Self::set_header)) are still found.
     pub fn get_header(&self, key: &str) -> Option<&String> {
-        self.headers.get(key)
+        if let Some(v) = self.headers.get(key) {
+            return Some(v);
+        }
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v)
+    }
+
+    /// Remove a header by name, case-insensitively.
+    /// Returns the removed value (the last one, if duplicates existed).
+    pub fn remove_header(&mut self, key: &str) -> Option<String> {
+        let mut removed = None;
+        self.headers.retain(|k, v| {
+            if k.eq_ignore_ascii_case(key) {
+                removed = Some(v.clone());
+                false
+            } else {
+                true
+            }
+        });
+        removed
     }
 
     /// Set the body content
@@ -135,6 +269,106 @@ impl SbiHttpMessage {
         if self.parts.len() < limits::MAX_NUM_OF_PART {
             self.parts.push(part);
         }
+    }
+
+    /// Iterate over all `3gpp-Sbi-*` custom headers (TS 29.500 Section 5.2.3)
+    /// present on this message, regardless of the stored case.
+    pub fn custom_sbi_headers(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.headers.iter().filter(|(k, _)| {
+            k.get(..custom_header::PREFIX.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(custom_header::PREFIX))
+        })
+    }
+
+    /// Get the `3gpp-Sbi-Target-apiRoot` header (TS 29.500 Section 5.2.3.2.4)
+    pub fn target_apiroot(&self) -> Option<&String> {
+        self.get_header(custom_header::TARGET_APIROOT)
+    }
+
+    /// Set the `3gpp-Sbi-Target-apiRoot` header for indirect communication
+    /// via SCP/SEPP.
+    pub fn set_target_apiroot(&mut self, api_root: impl Into<String>) {
+        self.set_header(custom_header::TARGET_APIROOT, api_root);
+    }
+
+    /// Get the `3gpp-Sbi-Callback` header (TS 29.500 Section 5.2.3.2.3)
+    pub fn callback(&self) -> Option<&String> {
+        self.get_header(custom_header::CALLBACK)
+    }
+
+    /// Set the `3gpp-Sbi-Callback` header identifying a notification callback.
+    pub fn set_callback(&mut self, callback: impl Into<String>) {
+        self.set_header(custom_header::CALLBACK, callback);
+    }
+
+    /// Get the `3gpp-Sbi-Message-Priority` header (TS 29.500 Section
+    /// 5.2.3.2.2) parsed as its 0..=31 priority value. Returns None when the
+    /// header is absent or out of range.
+    pub fn message_priority(&self) -> Option<u8> {
+        self.get_header(custom_header::MESSAGE_PRIORITY)?
+            .trim()
+            .parse::<u8>()
+            .ok()
+            .filter(|p| *p <= 31)
+    }
+
+    /// Set the `3gpp-Sbi-Message-Priority` header (clamped to the spec
+    /// maximum of 31).
+    pub fn set_message_priority(&mut self, priority: u8) {
+        self.set_header(
+            custom_header::MESSAGE_PRIORITY,
+            priority.min(31).to_string(),
+        );
+    }
+
+    /// Get the `3gpp-Sbi-Routing-Binding` header (TS 29.500 Section 6.12)
+    pub fn routing_binding(&self) -> Option<&String> {
+        self.get_header(custom_header::ROUTING_BINDING)
+    }
+
+    /// Set the `3gpp-Sbi-Routing-Binding` header.
+    pub fn set_routing_binding(&mut self, binding: impl Into<String>) {
+        self.set_header(custom_header::ROUTING_BINDING, binding);
+    }
+
+    /// Get the `3gpp-Sbi-Binding` header (TS 29.500 Section 6.12)
+    pub fn binding(&self) -> Option<&String> {
+        self.get_header(custom_header::BINDING)
+    }
+
+    /// Set the `3gpp-Sbi-Binding` header.
+    pub fn set_binding(&mut self, binding: impl Into<String>) {
+        self.set_header(custom_header::BINDING, binding);
+    }
+
+    /// Get the `3gpp-Sbi-Producer-Id` header.
+    pub fn producer_id(&self) -> Option<&String> {
+        self.get_header(custom_header::PRODUCER_ID)
+    }
+
+    /// Set the `3gpp-Sbi-Producer-Id` header.
+    pub fn set_producer_id(&mut self, producer_id: impl Into<String>) {
+        self.set_header(custom_header::PRODUCER_ID, producer_id);
+    }
+
+    /// Get the `3gpp-Sbi-Discovery-target-nf-type` header value.
+    pub fn discovery_target_nf_type(&self) -> Option<&String> {
+        self.get_header(discovery_header::TARGET_NF_TYPE)
+    }
+
+    /// Set the `3gpp-Sbi-Discovery-target-nf-type` header.
+    pub fn set_discovery_target_nf_type(&mut self, nf_type: NfType) {
+        self.set_header(discovery_header::TARGET_NF_TYPE, nf_type.to_str());
+    }
+
+    /// Get the `3gpp-Sbi-Discovery-requester-nf-type` header value.
+    pub fn discovery_requester_nf_type(&self) -> Option<&String> {
+        self.get_header(discovery_header::REQUESTER_NF_TYPE)
+    }
+
+    /// Set the `3gpp-Sbi-Discovery-requester-nf-type` header.
+    pub fn set_discovery_requester_nf_type(&mut self, nf_type: NfType) {
+        self.set_header(discovery_header::REQUESTER_NF_TYPE, nf_type.to_str());
     }
 }
 
@@ -222,6 +456,20 @@ impl SbiRequest {
         self.http.set_header(key, value);
         self
     }
+
+    /// Attach a binary multipart part (e.g. an N1 NAS or N2 NGAP container).
+    /// The body is sent as `multipart/related` with the JSON content as the
+    /// root part (TS 29.500 Section 6.1.2.3).
+    pub fn with_part(mut self, part: SbiPart) -> Self {
+        self.http.add_part(part);
+        self
+    }
+
+    /// Decompose the request URI per TS 29.501 Section 4.4.1, populating the
+    /// header's `service_name`, `api_version` and `resource` fields.
+    pub fn decompose_uri(&mut self) -> UriComponents {
+        self.header.decompose_uri()
+    }
 }
 
 /// SBI Response - matches ogs_sbi_response_t
@@ -303,6 +551,34 @@ impl SbiResponse {
         self
     }
 
+    /// Set a ProblemDetails body with the `application/problem+json` content
+    /// type required for SBI error responses (TS 29.500 Section 5.2.7).
+    /// When the problem carries a status it also becomes the response status.
+    pub fn with_problem(mut self, problem: &ProblemDetails) -> Self {
+        if let Some(status) = problem.status {
+            self.status = status as u16;
+        }
+        match serde_json::to_string(problem) {
+            Ok(json) => {
+                self.http.set_content(json);
+                self.http.set_header(
+                    crate::constants::header::CONTENT_TYPE,
+                    crate::constants::content_type::APPLICATION_PROBLEM_JSON,
+                );
+            }
+            Err(e) => log::error!("Failed to serialize ProblemDetails: {e}"),
+        }
+        self
+    }
+
+    /// Attach a binary multipart part (e.g. an N1 NAS or N2 NGAP container).
+    /// The body is sent as `multipart/related` with the JSON content as the
+    /// root part (TS 29.500 Section 6.1.2.3).
+    pub fn with_part(mut self, part: SbiPart) -> Self {
+        self.http.add_part(part);
+        self
+    }
+
     /// Check if response is successful (2xx)
     pub fn is_success(&self) -> bool {
         (200..300).contains(&self.status)
@@ -364,6 +640,133 @@ impl SbiDiscoveryOption {
     pub fn with_dnn(mut self, dnn: impl Into<String>) -> Self {
         self.dnn = Some(dnn.into());
         self
+    }
+
+    /// Inject this discovery option as `3gpp-Sbi-Discovery-*` headers
+    /// (TS 29.500 Section 5.2.3.2.7, delegated discovery via SCP).
+    ///
+    /// Structured values (S-NSSAIs, TAI, GUAMI, PLMN lists) are carried as
+    /// their JSON representation; list-valued simple parameters are
+    /// comma-separated; requester-features is the hexadecimal
+    /// SupportedFeatures form.
+    pub fn inject_headers(&self, http: &mut SbiHttpMessage) {
+        if let Some(ref id) = self.target_nf_instance_id {
+            http.set_header(discovery_header::TARGET_NF_INSTANCE_ID, id.clone());
+        }
+        if let Some(ref id) = self.requester_nf_instance_id {
+            http.set_header(discovery_header::REQUESTER_NF_INSTANCE_ID, id.clone());
+        }
+        if !self.service_names.is_empty() {
+            http.set_header(
+                discovery_header::SERVICE_NAMES,
+                self.service_names.join(","),
+            );
+        }
+        if !self.snssais.is_empty() {
+            if let Ok(json) = serde_json::to_string(&self.snssais) {
+                http.set_header(discovery_header::SNSSAIS, json);
+            }
+        }
+        if let Some(ref dnn) = self.dnn {
+            http.set_header(discovery_header::DNN, dnn.clone());
+        }
+        if self.tai_presence {
+            if let Some(ref tai) = self.tai {
+                if let Ok(json) = serde_json::to_string(tai) {
+                    http.set_header(discovery_header::TAI, json);
+                }
+            }
+        }
+        if self.guami_presence {
+            if let Some(ref guami) = self.guami {
+                if let Ok(json) = serde_json::to_string(guami) {
+                    http.set_header(discovery_header::GUAMI, json);
+                }
+            }
+        }
+        if !self.target_plmn_list.is_empty() {
+            if let Ok(json) = serde_json::to_string(&self.target_plmn_list) {
+                http.set_header(discovery_header::TARGET_PLMN_LIST, json);
+            }
+        }
+        if !self.requester_plmn_list.is_empty() {
+            if let Ok(json) = serde_json::to_string(&self.requester_plmn_list) {
+                http.set_header(discovery_header::REQUESTER_PLMN_LIST, json);
+            }
+        }
+        if let Some(ref uri) = self.hnrf_uri {
+            http.set_header(discovery_header::HNRF_URI, uri.clone());
+        }
+        if self.requester_features != 0 {
+            http.set_header(
+                discovery_header::REQUESTER_FEATURES,
+                format!("{:x}", self.requester_features),
+            );
+        }
+    }
+
+    /// Parse the `3gpp-Sbi-Discovery-*` headers from a message,
+    /// case-insensitively. Returns None when no discovery header is present.
+    pub fn from_headers(http: &SbiHttpMessage) -> Option<Self> {
+        if !http.headers.keys().any(|k| {
+            k.get(..discovery_header::PREFIX.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(discovery_header::PREFIX))
+        }) {
+            return None;
+        }
+
+        let mut option = Self::new();
+        if let Some(id) = http.get_header(discovery_header::TARGET_NF_INSTANCE_ID) {
+            option.target_nf_instance_id = Some(id.clone());
+        }
+        if let Some(id) = http.get_header(discovery_header::REQUESTER_NF_INSTANCE_ID) {
+            option.requester_nf_instance_id = Some(id.clone());
+        }
+        if let Some(names) = http.get_header(discovery_header::SERVICE_NAMES) {
+            option.service_names = names
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        if let Some(json) = http.get_header(discovery_header::SNSSAIS) {
+            if let Ok(snssais) = serde_json::from_str(json) {
+                option.snssais = snssais;
+            }
+        }
+        if let Some(dnn) = http.get_header(discovery_header::DNN) {
+            option.dnn = Some(dnn.clone());
+        }
+        if let Some(json) = http.get_header(discovery_header::TAI) {
+            if let Ok(tai) = serde_json::from_str(json) {
+                option.tai = Some(tai);
+                option.tai_presence = true;
+            }
+        }
+        if let Some(json) = http.get_header(discovery_header::GUAMI) {
+            if let Ok(guami) = serde_json::from_str(json) {
+                option.guami = Some(guami);
+                option.guami_presence = true;
+            }
+        }
+        if let Some(json) = http.get_header(discovery_header::TARGET_PLMN_LIST) {
+            if let Ok(list) = serde_json::from_str(json) {
+                option.target_plmn_list = list;
+            }
+        }
+        if let Some(json) = http.get_header(discovery_header::REQUESTER_PLMN_LIST) {
+            if let Ok(list) = serde_json::from_str(json) {
+                option.requester_plmn_list = list;
+            }
+        }
+        if let Some(uri) = http.get_header(discovery_header::HNRF_URI) {
+            option.hnrf_uri = Some(uri.clone());
+        }
+        if let Some(features) = http.get_header(discovery_header::REQUESTER_FEATURES) {
+            option.requester_features =
+                u64::from_str_radix(features.trim(), 16).unwrap_or_default();
+        }
+        Some(option)
     }
 }
 
@@ -486,6 +889,15 @@ pub struct ProblemDetails {
     /// Invalid parameters
     #[serde(rename = "invalidParams", skip_serializing_if = "Option::is_none")]
     pub invalid_params: Option<Vec<InvalidParam>>,
+    /// Features supported by the producer (TS 29.571 SupportedFeatures)
+    #[serde(rename = "supportedFeatures", skip_serializing_if = "Option::is_none")]
+    pub supported_features: Option<String>,
+    /// NF instance ID of the NF that generated the problem
+    #[serde(rename = "nfId", skip_serializing_if = "Option::is_none")]
+    pub nf_id: Option<String>,
+    /// OAuth2 access token error details (TS 29.510 AccessTokenErr)
+    #[serde(rename = "accessTokenError", skip_serializing_if = "Option::is_none")]
+    pub access_token_error: Option<crate::oauth::AccessTokenError>,
 }
 
 impl ProblemDetails {
@@ -512,6 +924,21 @@ impl ProblemDetails {
 
     pub fn with_cause(mut self, cause: impl Into<String>) -> Self {
         self.cause = Some(cause.into());
+        self
+    }
+
+    pub fn with_supported_features(mut self, features: impl Into<String>) -> Self {
+        self.supported_features = Some(features.into());
+        self
+    }
+
+    pub fn with_nf_id(mut self, nf_id: impl Into<String>) -> Self {
+        self.nf_id = Some(nf_id.into());
+        self
+    }
+
+    pub fn with_access_token_error(mut self, error: crate::oauth::AccessTokenError) -> Self {
+        self.access_token_error = Some(error);
         self
     }
 }
@@ -575,5 +1002,212 @@ mod tests {
         let snssai = SNssai::with_sd(1, [0x00, 0x00, 0x01]);
         assert_eq!(snssai.sst, 1);
         assert_eq!(snssai.sd, Some([0x00, 0x00, 0x01]));
+    }
+
+    #[test]
+    fn test_header_lookup_case_insensitive() {
+        let mut http = SbiHttpMessage::new();
+
+        // Canonical mixed-case spelling on insert, lowercase on lookup —
+        // the form hyper delivers for HTTP/2.
+        http.set_header("3gpp-Sbi-Target-apiRoot", "https://amf.example:7777");
+        assert_eq!(
+            http.get_header("3gpp-sbi-target-apiroot")
+                .map(String::as_str),
+            Some("https://amf.example:7777")
+        );
+        // Mixed-case lookup of a lowercased (wire-form) header.
+        assert_eq!(
+            http.get_header("3GPP-SBI-TARGET-APIROOT")
+                .map(String::as_str),
+            Some("https://amf.example:7777")
+        );
+
+        // set_header replaces case-variant duplicates instead of stacking.
+        http.set_header("3GPP-Sbi-Target-APIROOT", "https://other:80");
+        assert_eq!(http.headers.len(), 1);
+        assert_eq!(
+            http.target_apiroot().map(String::as_str),
+            Some("https://other:80")
+        );
+
+        // Keys inserted directly into the map (bypassing set_header) are
+        // still found case-insensitively via the fallback scan.
+        http.headers
+            .insert("Content-Type".to_string(), "application/json".to_string());
+        assert_eq!(
+            http.get_header("content-type").map(String::as_str),
+            Some("application/json")
+        );
+
+        // remove_header is case-insensitive too.
+        assert!(http.remove_header("CONTENT-TYPE").is_some());
+        assert!(http.get_header("Content-Type").is_none());
+    }
+
+    #[test]
+    fn test_custom_sbi_header_accessors() {
+        let mut http = SbiHttpMessage::new();
+        http.set_callback("Nsmf_PDUSession_StatusNotify");
+        http.set_message_priority(40); // clamped to 31
+        http.set_routing_binding("bl=nf-instance; nfinst=54804518");
+        http.set_binding("bl=nf-set; nfset=set1.smfset.5gc.mnc012.mcc345");
+        http.set_producer_id("3fa85f64-5717-4562-b3fc-2c963f66afa6");
+
+        assert_eq!(
+            http.callback().map(String::as_str),
+            Some("Nsmf_PDUSession_StatusNotify")
+        );
+        assert_eq!(http.message_priority(), Some(31));
+        assert!(http.routing_binding().is_some());
+        assert!(http.binding().is_some());
+        assert!(http.producer_id().is_some());
+
+        // All five are enumerable through the generic 3gpp-Sbi-* iterator.
+        assert_eq!(http.custom_sbi_headers().count(), 5);
+
+        // Out-of-range priorities parse to None.
+        http.set_header("3gpp-Sbi-Message-Priority", "99");
+        assert_eq!(http.message_priority(), None);
+    }
+
+    #[test]
+    fn test_discovery_option_header_round_trip() {
+        let mut option = SbiDiscoveryOption::new()
+            .with_target_nf_instance_id("9e1e2b3c-0001-4a7e-9f00-aaaabbbbcccc")
+            .with_service_name("nudm-uecm")
+            .with_service_name("nudm-sdm")
+            .with_dnn("internet");
+        option.requester_nf_instance_id = Some("9e1e2b3c-0002-4a7e-9f00-ddddeeeeffff".into());
+        option.snssais.push(SNssai::with_sd(1, [0x00, 0x00, 0x01]));
+        option.tai = Some(Tai {
+            plmn_id: PlmnId::new([9, 9, 9], vec![7, 0]),
+            tac: [0, 0, 1],
+        });
+        option.tai_presence = true;
+        option.hnrf_uri = Some("https://nrf.hplmn:7777".into());
+        option.requester_features = 0x2b;
+
+        let mut http = SbiHttpMessage::new();
+        option.inject_headers(&mut http);
+
+        // Lookups survive any casing (hyper lowercases on the wire).
+        assert_eq!(
+            http.get_header("3GPP-SBI-DISCOVERY-DNN")
+                .map(String::as_str),
+            Some("internet")
+        );
+
+        let parsed = SbiDiscoveryOption::from_headers(&http).unwrap();
+        assert_eq!(parsed.target_nf_instance_id, option.target_nf_instance_id);
+        assert_eq!(
+            parsed.requester_nf_instance_id,
+            option.requester_nf_instance_id
+        );
+        assert_eq!(parsed.service_names, vec!["nudm-uecm", "nudm-sdm"]);
+        assert_eq!(parsed.snssais, option.snssais);
+        assert_eq!(parsed.dnn.as_deref(), Some("internet"));
+        assert!(parsed.tai_presence);
+        assert_eq!(parsed.tai, option.tai);
+        assert_eq!(parsed.hnrf_uri, option.hnrf_uri);
+        assert_eq!(parsed.requester_features, 0x2b);
+
+        // No discovery headers -> None.
+        assert!(SbiDiscoveryOption::from_headers(&SbiHttpMessage::new()).is_none());
+    }
+
+    #[test]
+    fn test_uri_components_relative() {
+        let c = UriComponents::parse("/nsmf-pdusession/v1/sm-contexts/123/modify?k=v");
+        assert_eq!(c.api_root, None);
+        assert_eq!(c.api_name.as_deref(), Some("nsmf-pdusession"));
+        assert_eq!(c.api_version.as_deref(), Some("v1"));
+        assert_eq!(c.resource, vec!["sm-contexts", "123", "modify"]);
+        assert_eq!(c.query.as_deref(), Some("k=v"));
+    }
+
+    #[test]
+    fn test_uri_components_absolute_with_prefix() {
+        // apiRoot may carry a deployment-specific path prefix; the version
+        // segment anchors the apiName split (TS 29.501 §4.4.1).
+        let c = UriComponents::parse("https://nrf.5gc:7777/prefix/a/nnrf-disc/v2/nf-instances");
+        assert_eq!(c.api_root.as_deref(), Some("https://nrf.5gc:7777/prefix/a"));
+        assert_eq!(c.api_name.as_deref(), Some("nnrf-disc"));
+        assert_eq!(c.api_version.as_deref(), Some("v2"));
+        assert_eq!(c.resource, vec!["nf-instances"]);
+        assert_eq!(c.query, None);
+
+        let c =
+            UriComponents::parse("http://amf:80/namf-comm/v1/ue-contexts/imsi-1/n1-n2-messages");
+        assert_eq!(c.api_root.as_deref(), Some("http://amf:80"));
+        assert_eq!(c.api_name.as_deref(), Some("namf-comm"));
+        assert_eq!(c.api_version.as_deref(), Some("v1"));
+        assert_eq!(c.resource, vec!["ue-contexts", "imsi-1", "n1-n2-messages"]);
+    }
+
+    #[test]
+    fn test_uri_components_no_version_segment() {
+        let c = UriComponents::parse("/health");
+        assert_eq!(c.api_name.as_deref(), Some("health"));
+        assert_eq!(c.api_version, None);
+        assert!(c.resource.is_empty());
+
+        let c = UriComponents::parse("");
+        assert_eq!(c.api_name, None);
+    }
+
+    #[test]
+    fn test_header_decompose_uri() {
+        let mut request = SbiRequest::get("/nausf-auth/v1/ue-authentications");
+        let components = request.decompose_uri();
+        assert_eq!(request.header.service_name.as_deref(), Some("nausf-auth"));
+        assert_eq!(request.header.api_version.as_deref(), Some("v1"));
+        assert_eq!(request.header.resource, vec!["ue-authentications"]);
+        assert_eq!(components.api_root, None);
+    }
+
+    #[test]
+    fn test_problem_details_extended_fields() {
+        let problem = ProblemDetails::with_status(403)
+            .with_cause("OAUTH2_REQUIRED")
+            .with_supported_features("2b")
+            .with_nf_id("3fa85f64-5717-4562-b3fc-2c963f66afa6")
+            .with_access_token_error(crate::oauth::AccessTokenError {
+                error: "invalid_scope".to_string(),
+                error_description: Some("scope not granted".to_string()),
+                error_uri: None,
+            });
+
+        let json = serde_json::to_string(&problem).unwrap();
+        assert!(json.contains("\"supportedFeatures\":\"2b\""));
+        assert!(json.contains("\"nfId\""));
+        assert!(json.contains("\"accessTokenError\""));
+        assert!(json.contains("invalid_scope"));
+
+        let parsed: ProblemDetails = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.supported_features.as_deref(), Some("2b"));
+        assert_eq!(parsed.access_token_error.unwrap().error, "invalid_scope");
+
+        // Absent optional fields are skipped entirely.
+        let bare = serde_json::to_string(&ProblemDetails::with_status(404)).unwrap();
+        assert!(!bare.contains("supportedFeatures"));
+        assert!(!bare.contains("nfId"));
+        assert!(!bare.contains("accessTokenError"));
+    }
+
+    #[test]
+    fn test_response_with_problem_content_type() {
+        let problem = ProblemDetails::with_status(404).with_cause("RESOURCE_NOT_FOUND");
+        let response = SbiResponse::new().with_problem(&problem);
+        assert_eq!(response.status, 404);
+        assert_eq!(
+            response.http.get_header("content-type").map(String::as_str),
+            Some(crate::constants::content_type::APPLICATION_PROBLEM_JSON)
+        );
+        assert!(response
+            .http
+            .content
+            .unwrap()
+            .contains("RESOURCE_NOT_FOUND"));
     }
 }

@@ -222,6 +222,10 @@ services:
       SMF_SBI_PORT: "7777"
       AUSF_SBI_ADDR: 172.23.0.11
       AUSF_SBI_PORT: "7777"
+      UDM_SBI_ADDR: 172.23.0.12
+      UDM_SBI_PORT: "7777"
+      PCF_SBI_ADDR: 172.23.0.13
+      PCF_SBI_PORT: "7777"
       TLS_CERT: /etc/nextgcore/certs/amf.crt
       TLS_KEY: /etc/nextgcore/certs/amf.key
       TLS_CA: /etc/nextgcore/certs/ca.crt
@@ -378,7 +382,7 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
-    command: ["--sbi-addr", "0.0.0.0", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
+    command: ["--sbi-addr", "172.23.0.30", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
     volumes:
       - ./configs/5gc/nwdaf.yaml:/etc/nextgcore/nwdaf.yaml:ro
     networks:
@@ -394,7 +398,7 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
-    command: ["--sbi-addr", "0.0.0.0", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
+    command: ["--sbi-addr", "172.23.0.31", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
     volumes:
       - ./configs/5gc/ees.yaml:/etc/nextgcore/ees.yaml:ro
     networks:
@@ -410,7 +414,7 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
-    command: ["--sbi-addr", "0.0.0.0", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
+    command: ["--sbi-addr", "172.23.0.32", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
     volumes:
       - ./configs/5gc/lmf.yaml:/etc/nextgcore/lmf.yaml:ro
     networks:
@@ -426,7 +430,7 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
-    command: ["--sbi-addr", "0.0.0.0", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
+    command: ["--sbi-addr", "172.23.0.33", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
     volumes:
       - ./configs/5gc/mbsmf.yaml:/etc/nextgcore/mbsmf.yaml:ro
     networks:
@@ -442,7 +446,7 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
-    command: ["--sbi-addr", "0.0.0.0", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
+    command: ["--sbi-addr", "172.23.0.34", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
     volumes:
       - ./configs/5gc/nsacf.yaml:/etc/nextgcore/nsacf.yaml:ro
     networks:
@@ -458,7 +462,7 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
-    command: ["--sbi-addr", "0.0.0.0", "--sbi-port", "7815", "--nrf-uri", "http://172.23.0.10:7777"]
+    command: ["--sbi-addr", "172.23.0.35", "--sbi-port", "7815", "--nrf-uri", "http://172.23.0.10:7777"]
     volumes:
       - ./configs/5gc/pin.yaml:/etc/nextgcore/pin.yaml:ro
     networks:
@@ -474,7 +478,7 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
-    command: ["--sbi-addr", "0.0.0.0", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
+    command: ["--sbi-addr", "172.23.0.36", "--sbi-port", "7777", "--nrf-uri", "http://172.23.0.10:7777"]
     volumes:
       - ./configs/5gc/dccf.yaml:/etc/nextgcore/dccf.yaml:ro
     networks:
@@ -490,7 +494,7 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
-    command: ["--sbi-addr", "0.0.0.0", "--sbi-port", "7777"]
+    command: ["--sbi-addr", "172.23.0.37", "--sbi-port", "7777"]
     networks:
       core:
         ipv4_address: 172.23.0.37
@@ -504,7 +508,7 @@ services:
     <<: [*common, *nf-healthcheck]
     environment:
       <<: *common-env
-    command: ["--sbi-addr", "0.0.0.0", "--sbi-port", "7777"]
+    command: ["--sbi-addr", "172.23.0.38", "--sbi-port", "7777"]
     networks:
       core:
         ipv4_address: 172.23.0.38

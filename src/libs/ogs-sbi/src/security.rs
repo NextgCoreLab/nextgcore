@@ -10,7 +10,7 @@
 //! all SBI communication between NFs SHALL use TLS with mutual authentication.
 
 use crate::error::{SbiError, SbiResult};
-use crate::oauth::{decode_jwt_parts, AccessTokenClaims};
+use crate::oauth::{authorize_bearer, AccessTokenClaims};
 use crate::types::NfType;
 
 // ============================================================================
@@ -204,36 +204,32 @@ pub fn extract_bearer_token(auth_header: &str) -> Option<&str> {
     }
 }
 
-/// Validate a Bearer token for SBI request authorization
+/// OAuth2 middleware for SBI request handling.
 ///
-/// Checks:
-/// 1. Token is well-formed JWT (3 parts)
-/// 2. Claims contain required fields (iss, sub, aud, scope, exp)
-/// 3. Token is not expired
-/// 4. Scope matches the requested service
+/// Cryptographically verifies the Bearer token against the NRF's JWKS
+/// (signature, `alg=ES256`, expiry — via [`crate::oauth::authorize_bearer`])
+/// and then enforces the required scope. There is intentionally NO
+/// signature-skipping variant: 3GPP TS 33.501 §13.4.1 requires NF service
+/// producers to validate the token's signature before serving a request.
+/// (The former `validate_bearer_token`, which decoded the JWT without
+/// verifying the signature, was removed in the nrfd remediation.)
 ///
-/// Note: Cryptographic signature verification requires the NRF's public key,
-/// which should be done at the NRF or via a shared secret.
-pub fn validate_bearer_token(
-    token: &str,
+/// Returns Ok(Some(claims)) when authorized, Ok(None) when the policy does
+/// not require OAuth2, Err otherwise.
+pub fn authorize_sbi_request(
+    auth_header: Option<&str>,
     required_scope: &str,
-    current_time_secs: u64,
-) -> SbiResult<AccessTokenClaims> {
-    // Decode JWT structure
-    let (_header, payload, _signature) = decode_jwt_parts(token)?;
-
-    // Parse claims
-    let claims: AccessTokenClaims = serde_json::from_slice(&payload)
-        .map_err(|e| SbiError::AuthorizationFailed(format!("Invalid JWT claims: {e}")))?;
-
-    // Check expiration
-    if claims.exp < current_time_secs {
-        return Err(SbiError::AuthorizationFailed(
-            "Access token has expired".to_string(),
-        ));
+    policy: &SbiSecurityPolicy,
+    jwks: &serde_json::Value,
+) -> SbiResult<Option<AccessTokenClaims>> {
+    if !policy.oauth2_required {
+        return Ok(None);
     }
 
-    // Check scope
+    // Signature + expiry verification against the NRF public key set.
+    let claims = authorize_bearer(auth_header, jwks)?;
+
+    // Scope enforcement (TS 29.510 §6.3.5.2.4: space-delimited service names).
     let scopes: Vec<&str> = claims.scope.split_whitespace().collect();
     if !scopes.contains(&required_scope) {
         return Err(SbiError::AuthorizationFailed(format!(
@@ -242,36 +238,6 @@ pub fn validate_bearer_token(
         )));
     }
 
-    Ok(claims)
-}
-
-/// OAuth2 middleware for SBI request handling
-///
-/// Returns Ok(claims) if the request is authorized, Err if not.
-pub fn authorize_sbi_request(
-    auth_header: Option<&str>,
-    required_scope: &str,
-    policy: &SbiSecurityPolicy,
-) -> SbiResult<Option<AccessTokenClaims>> {
-    if !policy.oauth2_required {
-        return Ok(None);
-    }
-
-    let header = auth_header
-        .ok_or_else(|| SbiError::AuthorizationFailed("Missing Authorization header".to_string()))?;
-
-    let token = extract_bearer_token(header).ok_or_else(|| {
-        SbiError::AuthorizationFailed(
-            "Invalid Authorization header: expected Bearer token".to_string(),
-        )
-    })?;
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("value expected")
-        .as_secs();
-
-    let claims = validate_bearer_token(token, required_scope, now)?;
     Ok(Some(claims))
 }
 
@@ -448,43 +414,90 @@ mod tests {
         assert_eq!(extract_bearer_token("Bearer"), None);
     }
 
-    #[test]
-    fn test_validate_bearer_token() {
+    /// Builds an ES256-signed token + matching JWKS for middleware tests.
+    fn signed_token_and_jwks(scope: &str, exp: u64) -> (String, serde_json::Value) {
         use base64::engine::general_purpose::URL_SAFE_NO_PAD;
         use base64::Engine;
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 
-        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256"}"#);
+        let key = SigningKey::from_slice(&[7u8; 32]).expect("valid P-256 scalar");
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","kid":"test-key"}"#);
         let claims = serde_json::json!({
             "iss": "nrf-instance-1",
             "sub": "amf-instance-1",
             "aud": "SMF",
-            "scope": "nsmf-pdusession nsmf-event",
-            "exp": 9999999999u64
+            "scope": scope,
+            "exp": exp,
         });
         let payload = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
-        let sig = URL_SAFE_NO_PAD.encode(b"fakesig");
-        let token = format!("{header}.{payload}.{sig}");
+        let signing_input = format!("{header}.{payload}");
+        let sig: Signature = key.sign(signing_input.as_bytes());
+        let token = format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()));
 
-        // Valid token
-        let result = validate_bearer_token(&token, "nsmf-pdusession", 1000000000);
-        assert!(result.is_ok());
-        let c = result.unwrap();
-        assert_eq!(c.iss, "nrf-instance-1");
-        assert_eq!(c.sub, "amf-instance-1");
+        let point = key.verifying_key().to_encoded_point(false);
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kty": "EC", "crv": "P-256", "alg": "ES256", "kid": "test-key",
+                "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+                "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+            }]
+        });
+        (token, jwks)
+    }
 
-        // Wrong scope
-        let result = validate_bearer_token(&token, "nausf-auth", 1000000000);
-        assert!(result.is_err());
+    #[test]
+    fn test_authorize_sbi_request_verifies_signature_and_scope() {
+        let policy = SbiSecurityPolicy::production();
+        let (token, jwks) = signed_token_and_jwks("nsmf-pdusession nsmf-event", 9999999999);
+        let auth = format!("Bearer {token}");
 
-        // Expired
-        let result = validate_bearer_token(&token, "nsmf-pdusession", 99999999999);
-        assert!(result.is_err());
+        // Properly signed token with the right scope is accepted.
+        let claims = authorize_sbi_request(Some(&auth), "nsmf-pdusession", &policy, &jwks)
+            .expect("signed token authorizes")
+            .expect("claims returned");
+        assert_eq!(claims.iss, "nrf-instance-1");
+        assert_eq!(claims.sub, "amf-instance-1");
+
+        // Wrong scope is rejected even with a valid signature.
+        assert!(authorize_sbi_request(Some(&auth), "nausf-auth", &policy, &jwks).is_err());
+
+        // A token whose signature does not verify is rejected: there is no
+        // signature-skipping path anymore.
+        let mut tampered = token.clone();
+        tampered.replace_range(0..1, "f");
+        let tampered_auth = format!("Bearer {tampered}");
+        assert!(
+            authorize_sbi_request(Some(&tampered_auth), "nsmf-pdusession", &policy, &jwks).is_err()
+        );
+
+        // An unsigned/garbage-signature token is rejected too.
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let parts: Vec<&str> = token.split('.').collect();
+        let forged = format!(
+            "{}.{}.{}",
+            parts[0],
+            parts[1],
+            URL_SAFE_NO_PAD.encode([0u8; 64])
+        );
+        let forged_auth = format!("Bearer {forged}");
+        assert!(
+            authorize_sbi_request(Some(&forged_auth), "nsmf-pdusession", &policy, &jwks).is_err()
+        );
+
+        // Expired token is rejected.
+        let (expired, jwks2) = signed_token_and_jwks("nsmf-pdusession", 1);
+        let expired_auth = format!("Bearer {expired}");
+        assert!(
+            authorize_sbi_request(Some(&expired_auth), "nsmf-pdusession", &policy, &jwks2).is_err()
+        );
     }
 
     #[test]
     fn test_authorize_sbi_request_not_required() {
         let policy = SbiSecurityPolicy::development();
-        let result = authorize_sbi_request(None, "any-scope", &policy);
+        let jwks = serde_json::json!({"keys": []});
+        let result = authorize_sbi_request(None, "any-scope", &policy, &jwks);
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
     }
@@ -492,7 +505,8 @@ mod tests {
     #[test]
     fn test_authorize_sbi_request_missing_header() {
         let policy = SbiSecurityPolicy::production();
-        let result = authorize_sbi_request(None, "nsmf-pdusession", &policy);
+        let jwks = serde_json::json!({"keys": []});
+        let result = authorize_sbi_request(None, "nsmf-pdusession", &policy, &jwks);
         assert!(result.is_err());
     }
 

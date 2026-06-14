@@ -23,6 +23,8 @@ thiserror.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
+tokio.workspace = true
+bytes.workspace = true
 
 # Internal crates
 ogs-core = { path = "../../libs/ogs-core" }

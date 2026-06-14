@@ -161,6 +161,35 @@ pub fn validate_authentication_info(
     Ok(())
 }
 
+/// Validate the serving network name format (TS 24.501 §9.12.1 / TS 33.501
+/// §6.1.1.4): `5G:mnc<3-digit MNC>.mcc<3-digit MCC>.3gppnetwork.org`, with an
+/// optional `:NID` suffix for SNPN.
+///
+/// TS 33.501 §6.1.2: the AUSF shall check that the requesting AMF is entitled
+/// to use the serving network name. The "5G:" prefix is the authentication
+/// separation prefix that binds the AV to 5G (anti-bidding-down between
+/// EPS and 5GS at AV level).
+pub fn validate_serving_network_name(snn: &str) -> bool {
+    let rest = match snn.strip_prefix("5G:mnc") {
+        Some(r) => r,
+        None => return false,
+    };
+    let (mnc, rest) = match rest.split_once(".mcc") {
+        Some(p) => p,
+        None => return false,
+    };
+    let (mcc, tail) = match rest.split_once('.') {
+        Some(p) => p,
+        None => return false,
+    };
+    let tail_ok = tail == "3gppnetwork.org" || tail.starts_with("3gppnetwork.org:");
+    mnc.len() == 3
+        && mcc.len() == 3
+        && mnc.bytes().all(|b| b.is_ascii_digit())
+        && mcc.bytes().all(|b| b.is_ascii_digit())
+        && tail_ok
+}
+
 /// Validate confirmation data from request
 pub fn validate_confirmation_data(res_star: Option<&str>) -> Result<(), &'static str> {
     if res_star.is_none() || res_star.expect("value expected").is_empty() {
@@ -212,6 +241,40 @@ mod tests {
             validate_authentication_info(Some("suci-0-001-01-0000-0-0-0000000001"), Some(""))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_validate_serving_network_name() {
+        assert!(validate_serving_network_name(
+            "5G:mnc001.mcc001.3gppnetwork.org"
+        ));
+        assert!(validate_serving_network_name(
+            "5G:mnc093.mcc208.3gppnetwork.org"
+        ));
+        // SNPN NID suffix
+        assert!(validate_serving_network_name(
+            "5G:mnc001.mcc001.3gppnetwork.org:000000125"
+        ));
+
+        // Missing 5G: separation prefix (anti-bidding-down)
+        assert!(!validate_serving_network_name(
+            "mnc001.mcc001.3gppnetwork.org"
+        ));
+        // EPS-style SNN must be rejected
+        assert!(!validate_serving_network_name(
+            "EPS:mnc001.mcc001.3gppnetwork.org"
+        ));
+        // 2-digit MNC (must be 0-padded to 3)
+        assert!(!validate_serving_network_name(
+            "5G:mnc01.mcc001.3gppnetwork.org"
+        ));
+        // Non-digit MCC
+        assert!(!validate_serving_network_name(
+            "5G:mnc001.mccABC.3gppnetwork.org"
+        ));
+        // Wrong domain
+        assert!(!validate_serving_network_name("5G:mnc001.mcc001.evil.org"));
+        assert!(!validate_serving_network_name(""));
     }
 
     #[test]

@@ -156,6 +156,77 @@ pub fn ogs_dbi_update_imeisv(supi: &str, imeisv: &str) -> DbiResult<()> {
     Ok(())
 }
 
+/// Authentication credentials for provisioning a subscriber.
+///
+/// Used by the UDR `PUT
+/// /subscription-data/{ueId}/authentication-data/authentication-subscription`
+/// provisioning path (TS 29.505) to create or replace the stored
+/// AuthenticationSubscription credentials.
+#[derive(Debug, Clone, Default)]
+pub struct OgsDbiAuthProvision {
+    /// Permanent key K as a hex string (32 hex chars)
+    pub k_hex: String,
+    /// OPc as a hex string, if provisioned
+    pub opc_hex: Option<String>,
+    /// OP as a hex string, if provisioned
+    pub op_hex: Option<String>,
+    /// Authentication Management Field as a hex string (4 hex chars)
+    pub amf_hex: String,
+    /// Initial sequence number
+    pub sqn: u64,
+}
+
+/// Create or replace the authentication subscription for a subscriber.
+///
+/// Upserts the `security` sub-document of the subscriber document. Returns
+/// `Ok(true)` when a new subscriber document was created (HTTP 201 path) and
+/// `Ok(false)` when an existing document was updated (HTTP 204 path).
+pub fn ogs_dbi_provision_auth_info(supi: &str, p: &OgsDbiAuthProvision) -> DbiResult<bool> {
+    let supi_type = ogs_id_get_type(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+    let supi_id = ogs_id_get_value(supi).ok_or_else(|| DbiError::InvalidSupi(supi.to_string()))?;
+
+    let collection = get_subscriber_collection()?;
+    let query = doc! { &supi_type: &supi_id };
+
+    let mut set = doc! {
+        format!("{}.{}", OGS_SECURITY_STRING, OGS_K_STRING): &p.k_hex,
+        format!("{}.{}", OGS_SECURITY_STRING, OGS_AMF_STRING): &p.amf_hex,
+        format!("{}.{}", OGS_SECURITY_STRING, OGS_SQN_STRING): p.sqn as i64,
+    };
+    if let Some(opc) = &p.opc_hex {
+        set.insert(
+            format!("{}.{}", OGS_SECURITY_STRING, OGS_OPC_STRING),
+            opc.as_str(),
+        );
+    }
+    if let Some(op) = &p.op_hex {
+        set.insert(
+            format!("{}.{}", OGS_SECURITY_STRING, OGS_OP_STRING),
+            op.as_str(),
+        );
+    }
+
+    let opts = mongodb::options::UpdateOptions::builder()
+        .upsert(true)
+        .build();
+    let result = collection.update_one(query, doc! { "$set": set }, opts)?;
+    Ok(result.upserted_id.is_some())
+}
+
+/// Async, non-blocking wrapper for [`ogs_dbi_provision_auth_info`].
+pub async fn ogs_dbi_provision_auth_info_async(
+    supi: String,
+    p: OgsDbiAuthProvision,
+) -> DbiResult<bool> {
+    tokio::task::spawn_blocking(move || ogs_dbi_provision_auth_info(&supi, &p))
+        .await
+        .unwrap_or_else(|e| {
+            Err(DbiError::ParseError(format!(
+                "spawn_blocking panicked: {e}"
+            )))
+        })
+}
+
 /// Update MME information for a subscriber
 ///
 /// # Arguments
@@ -298,6 +369,99 @@ pub fn ogs_dbi_subscription_data(supi: &str) -> DbiResult<OgsSubscriptionData> {
     }
 
     Ok(subscription_data)
+}
+
+// ============================================================================
+// Async (non-blocking) wrappers
+// ============================================================================
+//
+// The functions above call the *synchronous* MongoDB driver (`find_one`,
+// `update_one`), which blocks the calling thread on network I/O. When invoked
+// from an `async fn` running on a tokio worker thread (e.g. UDR/NSSF SBI
+// handlers during the 5G-AKA auth flow), that blocks the whole runtime and
+// stalls every other task on the thread (DANGER-ZONES B1: `ogs_mongoc()`
+// reaches 18 modules).
+//
+// These wrappers offload the blocking call to `tokio::task::spawn_blocking`,
+// mirroring `ogs_dbi_init_async` in mongoc.rs. They take owned `String` args so
+// the closure is `'static`. Async call sites should prefer these; the sync
+// versions remain for non-async contexts (FSM handlers, tests, EPC paths).
+
+/// Async, non-blocking wrapper for [`ogs_dbi_auth_info`].
+pub async fn ogs_dbi_auth_info_async(supi: String) -> DbiResult<OgsDbiAuthInfo> {
+    tokio::task::spawn_blocking(move || ogs_dbi_auth_info(&supi))
+        .await
+        .unwrap_or_else(|e| {
+            Err(DbiError::ParseError(format!(
+                "spawn_blocking panicked: {e}"
+            )))
+        })
+}
+
+/// Async, non-blocking wrapper for [`ogs_dbi_update_sqn`].
+pub async fn ogs_dbi_update_sqn_async(supi: String, sqn: u64) -> DbiResult<()> {
+    tokio::task::spawn_blocking(move || ogs_dbi_update_sqn(&supi, sqn))
+        .await
+        .unwrap_or_else(|e| {
+            Err(DbiError::ParseError(format!(
+                "spawn_blocking panicked: {e}"
+            )))
+        })
+}
+
+/// Async, non-blocking wrapper for [`ogs_dbi_increment_sqn`].
+pub async fn ogs_dbi_increment_sqn_async(supi: String) -> DbiResult<()> {
+    tokio::task::spawn_blocking(move || ogs_dbi_increment_sqn(&supi))
+        .await
+        .unwrap_or_else(|e| {
+            Err(DbiError::ParseError(format!(
+                "spawn_blocking panicked: {e}"
+            )))
+        })
+}
+
+/// Async, non-blocking wrapper for [`ogs_dbi_update_imeisv`].
+pub async fn ogs_dbi_update_imeisv_async(supi: String, imeisv: String) -> DbiResult<()> {
+    tokio::task::spawn_blocking(move || ogs_dbi_update_imeisv(&supi, &imeisv))
+        .await
+        .unwrap_or_else(|e| {
+            Err(DbiError::ParseError(format!(
+                "spawn_blocking panicked: {e}"
+            )))
+        })
+}
+
+/// Async, non-blocking wrapper for [`ogs_dbi_subscription_data`].
+pub async fn ogs_dbi_subscription_data_async(supi: String) -> DbiResult<OgsSubscriptionData> {
+    tokio::task::spawn_blocking(move || ogs_dbi_subscription_data(&supi))
+        .await
+        .unwrap_or_else(|e| {
+            Err(DbiError::ParseError(format!(
+                "spawn_blocking panicked: {e}"
+            )))
+        })
+}
+
+/// Async, non-blocking wrapper for [`ogs_dbi_subscription_data_5g`].
+pub async fn ogs_dbi_subscription_data_5g_async(supi: String) -> DbiResult<OgsSubscriptionData> {
+    tokio::task::spawn_blocking(move || ogs_dbi_subscription_data_5g(&supi))
+        .await
+        .unwrap_or_else(|e| {
+            Err(DbiError::ParseError(format!(
+                "spawn_blocking panicked: {e}"
+            )))
+        })
+}
+
+/// Async, non-blocking wrapper for [`ogs_dbi_policy_subscription`].
+pub async fn ogs_dbi_policy_subscription_async(supi: String) -> DbiResult<OgsSubscriptionData> {
+    tokio::task::spawn_blocking(move || ogs_dbi_policy_subscription(&supi))
+        .await
+        .unwrap_or_else(|e| {
+            Err(DbiError::ParseError(format!(
+                "spawn_blocking panicked: {e}"
+            )))
+        })
 }
 
 /// Parse AMBR from BSON document

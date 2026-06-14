@@ -4,6 +4,7 @@
 //! Matches the interface in lib/sbi/client.h
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,6 +39,13 @@ fn new_span_id() -> [u8; 8] {
 const DEFAULT_CONNECT_TIMEOUT: u64 = 5;
 /// Default request timeout in seconds
 const DEFAULT_REQUEST_TIMEOUT: u64 = 30;
+/// Default number of pooled HTTP/2 connections per target.
+///
+/// Each connection multiplexes many concurrent streams, so a small pool is
+/// plenty. The pool's purpose is not raw stream throughput (HTTP/2 already
+/// multiplexes) but to ensure a (re)connect on one slot does not serialize
+/// every concurrent request behind a single mutex during connection churn.
+const DEFAULT_POOL_SIZE: usize = 4;
 
 /// SBI Client configuration
 #[derive(Debug, Clone)]
@@ -60,6 +68,8 @@ pub struct SbiClientConfig {
     pub client_cert: Option<String>,
     /// Client private key path
     pub client_key: Option<String>,
+    /// Number of pooled HTTP/2 connections to the target (min 1).
+    pub pool_size: usize,
 }
 
 impl Default for SbiClientConfig {
@@ -74,6 +84,7 @@ impl Default for SbiClientConfig {
             ca_cert: None,
             client_cert: None,
             client_key: None,
+            pool_size: DEFAULT_POOL_SIZE,
         }
     }
 }
@@ -112,6 +123,12 @@ impl SbiClientConfig {
         self
     }
 
+    /// Set the connection pool size (clamped to a minimum of 1).
+    pub fn with_pool_size(mut self, pool_size: usize) -> Self {
+        self.pool_size = pool_size.max(1);
+        self
+    }
+
     /// Build the base URI
     pub fn base_uri(&self) -> String {
         format!("{}://{}:{}", self.scheme, self.host, self.port)
@@ -128,9 +145,13 @@ struct ConnectionState {
 pub struct SbiClient {
     /// Client configuration
     config: SbiClientConfig,
-    /// Connection state (lazily initialized)
-    connection: Arc<Mutex<Option<ConnectionState>>>,
-    /// OAuth2 client for automatic token attachment (W1.23)
+    /// Pool of lazily-initialized HTTP/2 connections. Each slot is an
+    /// independent multiplexed connection; requests round-robin across slots so
+    /// a (re)connect on one slot does not block requests routed to others.
+    pool: Arc<Vec<Mutex<Option<ConnectionState>>>>,
+    /// Round-robin cursor for slot selection.
+    next_slot: Arc<AtomicUsize>,
+    /// OAuth2 client for automatic token attachment
     oauth2: Option<Arc<OAuth2Client>>,
     /// Target NF type for OAuth2 scope resolution
     target_nf_type: Option<NfType>,
@@ -139,9 +160,12 @@ pub struct SbiClient {
 impl SbiClient {
     /// Create a new SBI client
     pub fn new(config: SbiClientConfig) -> Self {
+        let pool_size = config.pool_size.max(1);
+        let pool = (0..pool_size).map(|_| Mutex::new(None)).collect();
         Self {
             config,
-            connection: Arc::new(Mutex::new(None)),
+            pool: Arc::new(pool),
+            next_slot: Arc::new(AtomicUsize::new(0)),
             oauth2: None,
             target_nf_type: None,
         }
@@ -152,7 +176,7 @@ impl SbiClient {
         Self::new(SbiClientConfig::new(host, port))
     }
 
-    /// Attach an OAuth2 client for automatic Bearer token attachment (W1.23).
+    /// Attach an OAuth2 client for automatic Bearer token attachment.
     ///
     /// When set, the client will request a token from the NRF before each
     /// SBI request that does not already carry an Authorization header.
@@ -245,9 +269,15 @@ impl SbiClient {
         }
     }
 
-    /// Get or create a connection
+    /// Get or create a connection from the pool.
+    ///
+    /// Picks a slot round-robin, reuses its cached multiplexed connection when
+    /// the sender is still ready, and otherwise (re)connects that slot. Only the
+    /// chosen slot's mutex is held across the connect, so concurrent requests
+    /// routed to other slots are not blocked during connection establishment.
     async fn get_connection(&self) -> SbiResult<SendRequest<Full<Bytes>>> {
-        let mut conn_guard = self.connection.lock().await;
+        let slot = self.next_slot.fetch_add(1, Ordering::Relaxed) % self.pool.len();
+        let mut conn_guard = self.pool[slot].lock().await;
 
         if let Some(ref state) = *conn_guard {
             if state.sender.is_ready() {
@@ -255,7 +285,7 @@ impl SbiClient {
             }
         }
 
-        // Create new connection
+        // Slot empty or its connection is no longer usable — (re)connect it.
         let sender = self.connect().await?;
         *conn_guard = Some(ConnectionState {
             sender: sender.clone(),
@@ -265,9 +295,11 @@ impl SbiClient {
 
     /// Send an SBI request and receive a response
     pub async fn send_request(&self, mut request: SbiRequest) -> SbiResult<SbiResponse> {
-        // W1.23: Automatically attach Bearer token if OAuth2 is configured
+        // Automatically attach Bearer token if OAuth2 is configured
         // and the request does not already carry an Authorization header
         if let (Some(oauth2), Some(target_nf_type)) = (&self.oauth2, &self.target_nf_type) {
+            // get_header() is case-insensitive: an "authorization" header
+            // copied from a hyper (lowercased HTTP/2) message also counts.
             if request.http.get_header("Authorization").is_none() {
                 // Derive scope from the request URI service name
                 let scope = derive_scope_from_uri(&request.header.uri);
@@ -340,12 +372,29 @@ impl SbiClient {
             other => return Err(SbiError::InvalidMethod(other.to_string())),
         };
 
-        // Build the request body
-        let body = request
-            .http
-            .content
-            .map(|c| Full::new(Bytes::from(c)))
-            .unwrap_or_else(|| Full::new(Bytes::new()));
+        // Build the request body. Binary N1/N2 parts are encoded as
+        // multipart/related with the JSON content as the root part
+        // (TS 29.500 §6.1.2.3).
+        let body_bytes: Bytes = if !request.http.parts.is_empty() {
+            let boundary = crate::multipart::generate_boundary();
+            request.http.set_header(
+                crate::constants::header::CONTENT_TYPE,
+                crate::multipart::content_type_with_boundary(&boundary),
+            );
+            Bytes::from(crate::multipart::encode(
+                request.http.content.as_deref(),
+                &request.http.parts,
+                &boundary,
+            ))
+        } else {
+            request
+                .http
+                .content
+                .as_deref()
+                .map(|c| Bytes::from(c.to_owned()))
+                .unwrap_or_default()
+        };
+        let body = Full::new(body_bytes);
 
         // Build the HTTP request
         let mut req_builder = Request::builder().method(method).uri(uri);
@@ -395,15 +444,32 @@ impl SbiClient {
             .map_err(|e| SbiError::InvalidResponse(e.to_string()))?
             .to_bytes();
 
-        let content = if body_bytes.is_empty() {
-            None
-        } else {
-            Some(String::from_utf8_lossy(&body_bytes).to_string())
-        };
-
         let mut sbi_response = SbiResponse::with_status(status);
         sbi_response.http.headers = headers;
-        sbi_response.http.content = content;
+
+        // multipart/related responses (N1/N2 binary containers, TS 29.500
+        // §6.1.2.3) are decoded into the JSON root + binary parts before any
+        // UTF-8 conversion so binary content survives byte-exact.
+        if !body_bytes.is_empty() {
+            let multipart_content_type = sbi_response
+                .http
+                .get_header(crate::constants::header::CONTENT_TYPE)
+                .filter(|ct| crate::multipart::is_multipart_related(ct))
+                .cloned();
+            match multipart_content_type {
+                Some(ct) => {
+                    let decoded = crate::multipart::decode(&ct, &body_bytes)?;
+                    sbi_response.http.content = decoded.json;
+                    for part in decoded.parts {
+                        sbi_response.http.add_part(part);
+                    }
+                }
+                None => {
+                    sbi_response.http.content =
+                        Some(String::from_utf8_lossy(&body_bytes).to_string());
+                }
+            }
+        }
 
         Ok(sbi_response)
     }
@@ -448,10 +514,12 @@ impl SbiClient {
         self.send_request(request).await
     }
 
-    /// Close the connection
+    /// Close all pooled connections.
     pub async fn close(&self) {
-        let mut conn_guard = self.connection.lock().await;
-        *conn_guard = None;
+        for slot in self.pool.iter() {
+            let mut conn_guard = slot.lock().await;
+            *conn_guard = None;
+        }
     }
 }
 
@@ -460,12 +528,13 @@ pub type ClientCallback = Box<dyn Fn(SbiResult<SbiResponse>) + Send + Sync>;
 
 /// Derive the OAuth2 scope from the request URI.
 ///
-/// The scope is the SBI service name, extracted from the first path component.
-/// For example, `/nsmf-pdusession/v1/sm-contexts` yields `nsmf-pdusession`.
+/// The scope is the SBI service name (the apiName of the TS 29.501 §4.4
+/// URI structure). For example, `/nsmf-pdusession/v1/sm-contexts` yields
+/// `nsmf-pdusession`.
 fn derive_scope_from_uri(uri: &str) -> String {
-    let path = uri.split('?').next().unwrap_or(uri);
-    let trimmed = path.trim_start_matches('/');
-    trimmed.split('/').next().unwrap_or("").to_string()
+    crate::message::UriComponents::parse(uri)
+        .api_name
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -489,6 +558,20 @@ mod tests {
         let client = SbiClient::with_host_port("127.0.0.1", 7777);
         assert_eq!(client.config().host, "127.0.0.1");
         assert_eq!(client.config().port, 7777);
+        // Default pool is created with DEFAULT_POOL_SIZE slots.
+        assert_eq!(client.pool.len(), DEFAULT_POOL_SIZE);
+    }
+
+    #[test]
+    fn test_pool_size_config() {
+        // Explicit pool size is honored.
+        let client = SbiClient::new(SbiClientConfig::new("h", 1).with_pool_size(2));
+        assert_eq!(client.pool.len(), 2);
+
+        // pool_size of 0 is clamped to a single slot (never an empty pool,
+        // which would panic on the modulo in get_connection).
+        let client0 = SbiClient::new(SbiClientConfig::new("h", 1).with_pool_size(0));
+        assert_eq!(client0.pool.len(), 1);
     }
 
     #[test]

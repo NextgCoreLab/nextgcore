@@ -154,6 +154,10 @@ pub fn handle_registration_request(
     amf_ue.nr_cgi = ran_ue.saved_nr_cgi.clone();
     amf_ue.gnb_ostream_id = ran_ue.gnb_ostream_id;
 
+    // Namf_EventExposure: registration-state + location reports (TS 29.518)
+    crate::namf_server::fire_registration_state_report(amf_ue, true);
+    crate::namf_server::fire_location_report(amf_ue);
+
     // Set UE security capability
     if let Some(ref sec_cap) = request.ue_security_capability {
         amf_ue.ue_security_capability = sec_cap.clone();
@@ -276,6 +280,10 @@ pub fn handle_service_request(
     amf_ue.nr_cgi = ran_ue.saved_nr_cgi.clone();
     amf_ue.gnb_ostream_id = ran_ue.gnb_ostream_id;
 
+    // Namf_EventExposure: the UE became reachable + location update
+    crate::namf_server::fire_reachability_report(amf_ue, true);
+    crate::namf_server::fire_location_report(amf_ue);
+
     // Handle PDU session status
     if let Some(psi) = request.pdu_session_status {
         amf_ue.pdu_session_status_present = true;
@@ -337,6 +345,9 @@ pub fn handle_deregistration_request(
     if request.switch_off {
         log::debug!("UE switch-off deregistration");
     }
+
+    // Namf_EventExposure: the UE is deregistering (TS 29.518)
+    crate::namf_server::fire_registration_state_report(amf_ue, false);
 
     log::info!(
         "[{}] Deregistration request",
@@ -510,38 +521,54 @@ pub struct UlNasTransport {
     pub dnn: Option<String>,
 }
 
-/// Handle UL NAS transport
+/// Action the caller must take after parsing an UL NAS Transport
+/// (TS 24.501 Section 5.4.5.2.3 receiver behaviour per container type)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UlTransportAction {
+    /// Route the N1 SM container to the SMF (PSI included)
+    RouteToSmf { psi: u8 },
+    /// Container accepted, no routing target available in this deployment:
+    /// reply with DL NAS Transport echoing the container with
+    /// 5GMM cause #90 "payload was not forwarded" (Section 5.4.5.3.1)
+    PayloadNotForwarded,
+}
+
+/// Handle UL NAS transport (TS 24.501 Section 8.2.10)
+///
+/// All payload container types are accepted. The PDU session ID is only
+/// mandatory for N1 SM information containers; SMS / LPP / SOR /
+/// UE policy / UE parameters update / multiple payloads have no SMSF /
+/// LMF / PCF forwarding paths in this deployment, so the spec-mandated
+/// abnormal action (DL NAS Transport with cause #90) is requested.
 pub fn handle_ul_nas_transport(
     amf_ue: &mut AmfUe,
     _ran_ue: &RanUe,
     transport: &UlNasTransport,
-) -> Result<(), GmmCause> {
-    // Validate payload container type
+) -> Result<UlTransportAction, GmmCause> {
+    // Validate payload container type (mandatory, non-zero)
     if transport.payload_container_type == 0 {
         log::error!("No payload container type");
         return Err(GmmCause::InvalidMandatoryInformation);
     }
 
-    // Validate payload container
+    // Validate payload container (mandatory, non-empty)
     if transport.payload_container.is_empty() {
         log::error!("Empty payload container");
         return Err(GmmCause::InvalidMandatoryInformation);
     }
 
-    // Validate PDU session ID
-    let psi = transport.pdu_session_id.ok_or_else(|| {
-        log::error!("No PDU session ID");
-        GmmCause::InvalidMandatoryInformation
-    })?;
-
-    if psi == 0 {
-        log::error!("PDU session identity is unassigned");
-        return Err(GmmCause::InvalidMandatoryInformation);
-    }
-
     match transport.payload_container_type {
         payload_container_type::N1_SM_INFORMATION => {
-            // Handle N1 SM information
+            // PDU session ID is mandatory for N1 SM (Section 5.4.5.2.4)
+            let psi = transport.pdu_session_id.ok_or_else(|| {
+                log::error!("No PDU session ID with N1 SM container");
+                GmmCause::InvalidMandatoryInformation
+            })?;
+            if psi == 0 {
+                log::error!("PDU session identity is unassigned");
+                return Err(GmmCause::InvalidMandatoryInformation);
+            }
+
             log::debug!(
                 "[{}] UL NAS Transport - N1 SM Information, PSI={}",
                 amf_ue.supi.as_deref().unwrap_or("Unknown"),
@@ -551,17 +578,30 @@ pub fn handle_ul_nas_transport(
             // Store payload for session handling
             amf_ue.pending_n1_sm_msg = Some(transport.payload_container.clone());
             amf_ue.pending_psi = Some(psi);
+            Ok(UlTransportAction::RouteToSmf { psi })
+        }
+        payload_container_type::SMS
+        | payload_container_type::LPP
+        | payload_container_type::SOR_TRANSPARENT_CONTAINER
+        | payload_container_type::UE_POLICY_CONTAINER
+        | payload_container_type::UE_PARAMETERS_UPDATE
+        | payload_container_type::MULTIPLE_PAYLOADS => {
+            log::info!(
+                "[{}] UL NAS Transport container type {} has no forwarding target; \
+                 responding with 5GMM cause #90 (payload was not forwarded)",
+                amf_ue.supi.as_deref().unwrap_or("Unknown"),
+                transport.payload_container_type
+            );
+            Ok(UlTransportAction::PayloadNotForwarded)
         }
         _ => {
             log::error!(
                 "Unknown payload container type: {}",
                 transport.payload_container_type
             );
-            return Err(GmmCause::MessageTypeNonExistentOrNotImplemented);
+            Err(GmmCause::MessageTypeNonExistentOrNotImplemented)
         }
     }
-
-    Ok(())
 }
 
 // ============================================================================
@@ -875,6 +915,59 @@ mod tests {
         assert!(result.is_ok());
         assert!(amf_ue.pending_n1_sm_msg.is_some());
         assert_eq!(amf_ue.pending_psi, Some(5));
+    }
+
+    #[test]
+    fn test_handle_ul_nas_transport_n1_sm_routes_to_smf() {
+        let mut amf_ue = create_test_amf_ue();
+        let ran_ue = create_test_ran_ue();
+
+        let transport = UlNasTransport {
+            payload_container_type: payload_container_type::N1_SM_INFORMATION,
+            payload_container: vec![0x2e, 0x05, 0x01, 0xc1],
+            pdu_session_id: Some(5),
+            ..Default::default()
+        };
+
+        let result = handle_ul_nas_transport(&mut amf_ue, &ran_ue, &transport);
+        assert_eq!(result, Ok(UlTransportAction::RouteToSmf { psi: 5 }));
+    }
+
+    #[test]
+    fn test_handle_ul_nas_transport_sms_payload_not_forwarded() {
+        let mut amf_ue = create_test_amf_ue();
+        let ran_ue = create_test_ran_ue();
+
+        // SMS container: no PSI required, no SMSF in this deployment ->
+        // spec abnormal action is DL NAS Transport with cause #90
+        let transport = UlNasTransport {
+            payload_container_type: payload_container_type::SMS,
+            payload_container: vec![0x01, 0x02],
+            pdu_session_id: None,
+            ..Default::default()
+        };
+
+        let result = handle_ul_nas_transport(&mut amf_ue, &ran_ue, &transport);
+        assert_eq!(result, Ok(UlTransportAction::PayloadNotForwarded));
+    }
+
+    #[test]
+    fn test_handle_ul_nas_transport_unknown_container_rejected() {
+        let mut amf_ue = create_test_amf_ue();
+        let ran_ue = create_test_ran_ue();
+
+        let transport = UlNasTransport {
+            payload_container_type: 0x0B, // not assigned
+            payload_container: vec![0x01],
+            pdu_session_id: None,
+            ..Default::default()
+        };
+
+        let result = handle_ul_nas_transport(&mut amf_ue, &ran_ue, &transport);
+        assert_eq!(
+            result,
+            Err(GmmCause::MessageTypeNonExistentOrNotImplemented)
+        );
     }
 
     #[test]

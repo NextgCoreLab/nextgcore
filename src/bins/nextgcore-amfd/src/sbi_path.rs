@@ -751,13 +751,18 @@ pub async fn call_smf_create_sm_context(
     sd: Option<u32>,
     dnn: &str,
     n1_sm_msg_from_ue: &[u8],
+    redcap_indication: bool,
 ) -> SbiResult<SmContextCreateResponse> {
     log::info!(
-        "Calling SMF SM Context Create: {smf_host}:{smf_port}, PSI={pdu_session_id}, SST={sst}, DNN={dnn}"
+        "Calling SMF SM Context Create: {smf_host}:{smf_port}, PSI={pdu_session_id}, SST={sst}, \
+         DNN={dnn}, redcap={redcap_indication}"
     );
 
     let client = SbiClient::with_host_port(smf_host, smf_port);
 
+    // redcapIndication propagates the UE's Reduced-Capability status to the SMF
+    // (TS 29.502 SmContextCreateData) so the SMF can apply a reduced
+    // session-AMBR for RedCap devices (Rel-17).
     let body = serde_json::json!({
         "pduSessionId": pdu_session_id,
         "sNssai": {
@@ -766,6 +771,7 @@ pub async fn call_smf_create_sm_context(
         },
         "dnn": dnn,
         "n1SmMsg": base64::engine::general_purpose::STANDARD.encode(n1_sm_msg_from_ue),
+        "redcapIndication": redcap_indication,
         "servingNetwork": {
             "mcc": "001",
             "mnc": "01"
@@ -1000,16 +1006,39 @@ pub async fn call_ausf_authenticate(
     suci: &str,
     serving_network_name: &str,
 ) -> SbiResult<AusfAuthResponse> {
+    call_ausf_authenticate_with_resync(ausf_host, ausf_port, suci, serving_network_name, None).await
+}
+
+/// Call AUSF to authenticate UE with optional resynchronization info
+/// (POST /nausf-auth/v1/ue-authentications with resynchronizationInfo,
+/// TS 29.509 Section 5.2.2.2.2 / TS 24.501 Section 5.4.1.3.7 case e: SQN failure).
+///
+/// `resync` carries (RAND, AUTS) from the UE's Authentication Failure
+/// (cause #21 "synch failure", Authentication failure parameter IE).
+pub async fn call_ausf_authenticate_with_resync(
+    ausf_host: &str,
+    ausf_port: u16,
+    suci: &str,
+    serving_network_name: &str,
+    resync: Option<([u8; 16], [u8; 14])>,
+) -> SbiResult<AusfAuthResponse> {
     log::info!(
-        "Calling AUSF authenticate: {ausf_host}:{ausf_port}, SUCI={suci}, SNN={serving_network_name}"
+        "Calling AUSF authenticate: {ausf_host}:{ausf_port}, SUCI={suci}, SNN={serving_network_name}, resync={}",
+        resync.is_some()
     );
 
     let client = SbiClient::with_host_port(ausf_host, ausf_port);
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "supiOrSuci": suci,
         "servingNetworkName": serving_network_name
     });
+    if let Some((rand, auts)) = resync {
+        body["resynchronizationInfo"] = serde_json::json!({
+            "rand": hex::encode(rand),
+            "auts": hex::encode(auts),
+        });
+    }
 
     let response = client
         .post_json("/nausf-auth/v1/ue-authentications", &body)
@@ -1140,6 +1169,300 @@ pub async fn call_ausf_5g_aka_confirm(
         kseaf,
         supi,
     })
+}
+
+// ============================================================================
+// UDM / PCF SBI Client Functions (registration procedure, TS 23.502 4.2.2.2.2)
+// ============================================================================
+
+/// Async NF endpoint resolution: SbiContext discovery cache first, env fallback.
+///
+/// Unlike `resolve_nf_endpoint`, this is safe to call from async context
+/// (no `Handle::block_on`).
+pub async fn resolve_nf_endpoint_async(service_type: SbiServiceType) -> SbiResult<(String, u16)> {
+    let (ogs_service_type, env_addr, env_port, default_port) = match service_type {
+        SbiServiceType::NausfAuth => (
+            ogs_sbi::types::SbiServiceType::NausfAuth,
+            "AUSF_SBI_ADDR",
+            "AUSF_SBI_PORT",
+            7777u16,
+        ),
+        SbiServiceType::NudmUecm => (
+            ogs_sbi::types::SbiServiceType::NudmUecm,
+            "UDM_SBI_ADDR",
+            "UDM_SBI_PORT",
+            7777,
+        ),
+        SbiServiceType::NudmSdm => (
+            ogs_sbi::types::SbiServiceType::NudmSdm,
+            "UDM_SBI_ADDR",
+            "UDM_SBI_PORT",
+            7777,
+        ),
+        SbiServiceType::NsmfPdusession => (
+            ogs_sbi::types::SbiServiceType::NsmfPdusession,
+            "SMF_SBI_ADDR",
+            "SMF_SBI_PORT",
+            7777,
+        ),
+        SbiServiceType::NnssfNsselection => (
+            ogs_sbi::types::SbiServiceType::NnssfNsselection,
+            "NSSF_SBI_ADDR",
+            "NSSF_SBI_PORT",
+            7777,
+        ),
+        SbiServiceType::NpcfAmPolicyControl => (
+            ogs_sbi::types::SbiServiceType::NpcfAmPolicyControl,
+            "PCF_SBI_ADDR",
+            "PCF_SBI_PORT",
+            7777,
+        ),
+        _ => return Err(SbiError::ServiceNotFound(format!("{service_type:?}"))),
+    };
+
+    let sbi_ctx = global_context();
+    let instances = sbi_ctx.find_nf_instances_by_service(ogs_service_type).await;
+    if let Some(inst) = instances.first() {
+        if let Some(svc) = inst.find_service(ogs_service_type) {
+            let host = svc
+                .ip_addresses
+                .first()
+                .or(inst.ipv4_addresses.first())
+                .or(svc.fqdn.as_ref())
+                .or(inst.fqdn.as_ref());
+            if let Some(h) = host {
+                return Ok((h.clone(), svc.port));
+            }
+        }
+    }
+
+    let host = std::env::var(env_addr).map_err(|_| SbiError::NfInstanceNotFound)?;
+    let port = std::env::var(env_port)
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(default_port);
+    Ok((host, port))
+}
+
+/// Nudm_UECM_Registration (amf3gpp-access):
+/// PUT /nudm-uecm/v1/{supi}/registrations/amf-3gpp-access (TS 29.503 5.3.2.2.2)
+pub async fn call_udm_uecm_registration(
+    udm_host: &str,
+    udm_port: u16,
+    supi: &str,
+    amf_instance_id: &str,
+    guami_plmn_mcc: &str,
+    guami_plmn_mnc: &str,
+    amf_id_hex: &str,
+) -> SbiResult<()> {
+    let client = SbiClient::with_host_port(udm_host, udm_port);
+
+    let body = serde_json::json!({
+        "amfInstanceId": amf_instance_id,
+        "deregCallbackUri": format!("/namf-callback/v1/{supi}/dereg-notify"),
+        "guami": {
+            "plmnId": { "mcc": guami_plmn_mcc, "mnc": guami_plmn_mnc },
+            "amfId": amf_id_hex,
+        },
+        "ratType": "NR"
+    });
+
+    let path = format!("/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access");
+    let response = client
+        .put_json(&path, &body)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("UECM registration failed: {e}")))?;
+
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "UECM registration returned status {}",
+            response.status
+        )));
+    }
+    log::info!("[{supi}] Nudm_UECM_Registration (amf-3gpp-access) OK");
+    Ok(())
+}
+
+/// Subscribed AM data returned by Nudm_SDM_Get (am-data)
+#[derive(Debug, Clone, Default)]
+pub struct AmDataResponse {
+    /// Subscribed UE-AMBR uplink (e.g. "1 Gbps") if present
+    pub ue_ambr_uplink: Option<String>,
+    /// Subscribed UE-AMBR downlink if present
+    pub ue_ambr_downlink: Option<String>,
+    /// Subscribed S-NSSAIs (SST, optional SD)
+    pub nssai: Vec<(u8, Option<u32>)>,
+}
+
+/// Nudm_SDM_Get (am-data): GET /nudm-sdm/v1/{supi}/am-data (TS 29.503 5.2.2.2.1)
+pub async fn call_udm_sdm_get_am_data(
+    udm_host: &str,
+    udm_port: u16,
+    supi: &str,
+) -> SbiResult<AmDataResponse> {
+    let client = SbiClient::with_host_port(udm_host, udm_port);
+    let path = format!("/nudm-sdm/v1/{supi}/am-data");
+    let response = client
+        .get(&path)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("SDM am-data failed: {e}")))?;
+
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "SDM am-data returned status {}",
+            response.status
+        )));
+    }
+
+    let mut out = AmDataResponse::default();
+    if let Some(content) = &response.http.content {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
+            out.ue_ambr_uplink = json["subscribedUeAmbr"]["uplink"]
+                .as_str()
+                .map(String::from);
+            out.ue_ambr_downlink = json["subscribedUeAmbr"]["downlink"]
+                .as_str()
+                .map(String::from);
+            if let Some(list) = json["nssai"]["defaultSingleNssais"].as_array() {
+                for s in list {
+                    if let Some(sst) = s["sst"].as_u64() {
+                        let sd = s["sd"]
+                            .as_str()
+                            .and_then(|h| u32::from_str_radix(h, 16).ok());
+                        out.nssai.push((sst as u8, sd));
+                    }
+                }
+            }
+        }
+    }
+    log::info!(
+        "[{supi}] Nudm_SDM_Get am-data OK ({} S-NSSAI)",
+        out.nssai.len()
+    );
+    Ok(out)
+}
+
+/// Nudm_SDM_Subscribe: POST /nudm-sdm/v1/{supi}/sdm-subscriptions (TS 29.503 5.2.2.3.2)
+///
+/// Returns the subscription ID assigned by UDM.
+pub async fn call_udm_sdm_subscribe(
+    udm_host: &str,
+    udm_port: u16,
+    supi: &str,
+    amf_instance_id: &str,
+) -> SbiResult<String> {
+    let client = SbiClient::with_host_port(udm_host, udm_port);
+
+    let body = serde_json::json!({
+        "nfInstanceId": amf_instance_id,
+        "callbackReference": format!("/namf-callback/v1/{supi}/sdmsubscription-notify"),
+        "monitoredResourceUris": [format!("/nudm-sdm/v1/{supi}/am-data")],
+        "implicitUnsubscribe": true
+    });
+
+    let path = format!("/nudm-sdm/v1/{supi}/sdm-subscriptions");
+    let response = client
+        .post_json(&path, &body)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("SDM subscribe failed: {e}")))?;
+
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "SDM subscribe returned status {}",
+            response.status
+        )));
+    }
+
+    let sub_id = response
+        .http
+        .headers
+        .get("location")
+        .and_then(|loc| loc.rsplit('/').next().map(String::from))
+        .or_else(|| {
+            response.http.content.as_ref().and_then(|c| {
+                serde_json::from_str::<serde_json::Value>(c)
+                    .ok()
+                    .and_then(|j| j["subscriptionId"].as_str().map(String::from))
+            })
+        })
+        .unwrap_or_else(|| "1".to_string());
+
+    log::info!("[{supi}] Nudm_SDM_Subscribe OK (subscriptionId={sub_id})");
+    Ok(sub_id)
+}
+
+/// Npcf_AMPolicyControl_Create: POST /npcf-am-policy-control/v1/policies
+/// (TS 29.507 4.2.2.2). Returns the policy association ID.
+pub async fn call_pcf_am_policy_create(
+    pcf_host: &str,
+    pcf_port: u16,
+    supi: &str,
+    serving_plmn_mcc: &str,
+    serving_plmn_mnc: &str,
+) -> SbiResult<String> {
+    let client = SbiClient::with_host_port(pcf_host, pcf_port);
+
+    let body = serde_json::json!({
+        "notificationUri": format!("/namf-callback/v1/{supi}/am-policy-notify"),
+        "supi": supi,
+        "servingPlmn": { "mcc": serving_plmn_mcc, "mnc": serving_plmn_mnc },
+        "suppFeat": ""
+    });
+
+    let response = client
+        .post_json("/npcf-am-policy-control/v1/policies", &body)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("AM policy create failed: {e}")))?;
+
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "AM policy create returned status {}",
+            response.status
+        )));
+    }
+
+    let assoc_id = response
+        .http
+        .headers
+        .get("location")
+        .and_then(|loc| loc.rsplit('/').next().map(String::from))
+        .or_else(|| {
+            response.http.content.as_ref().and_then(|c| {
+                serde_json::from_str::<serde_json::Value>(c)
+                    .ok()
+                    .and_then(|j| j["polAssoId"].as_str().map(String::from))
+            })
+        })
+        .unwrap_or_else(|| "1".to_string());
+
+    log::info!("[{supi}] Npcf_AMPolicyControl_Create OK (polAssoId={assoc_id})");
+    Ok(assoc_id)
+}
+
+/// Nudm_UECM_DeregistrationNotification cleanup: PATCH purge on deregistration
+/// (TS 29.503 5.3.2.4: AMF sets purgeFlag when the UE deregisters).
+pub async fn call_udm_uecm_deregistration(
+    udm_host: &str,
+    udm_port: u16,
+    supi: &str,
+) -> SbiResult<()> {
+    let client = SbiClient::with_host_port(udm_host, udm_port);
+
+    let body = serde_json::json!({ "purgeFlag": true });
+    let path = format!("/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access");
+    let response = client
+        .patch_json(&path, &body)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("UECM deregistration failed: {e}")))?;
+
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "UECM deregistration returned status {}",
+            response.status
+        )));
+    }
+    log::info!("[{supi}] Nudm_UECM amf-3gpp-access purge OK");
+    Ok(())
 }
 
 /// Helper: convert hex string to [u8; 16]

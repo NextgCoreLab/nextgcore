@@ -199,9 +199,10 @@ pub fn validate_token_response(response: &AccessTokenResponse) -> SbiResult<()> 
     Ok(())
 }
 
-/// Decode and validate the three-part structure of a JWT access token.
+/// Decode the three-part structure of a JWT access token.
 /// Returns (header, payload, signature) as raw bytes.
-/// This does NOT verify the cryptographic signature; it only checks structure.
+/// This only checks structure — call [`verify_access_token`] (or
+/// [`verify_access_token_with_jwks`]) to cryptographically verify the signature.
 pub fn decode_jwt_parts(token: &str) -> SbiResult<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
@@ -241,8 +242,164 @@ pub struct AccessTokenClaims {
     pub exp: u64,
 }
 
+/// Parses a single ES256 JWK (`kty=EC, crv=P-256`) into a P-256 verifying key.
+pub fn parse_es256_jwk(jwk: &serde_json::Value) -> SbiResult<p256::ecdsa::VerifyingKey> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let err = |m: String| SbiError::AuthorizationFailed(format!("Invalid ES256 JWK: {m}"));
+    if jwk.get("kty").and_then(|v| v.as_str()) != Some("EC")
+        || jwk.get("crv").and_then(|v| v.as_str()) != Some("P-256")
+    {
+        return Err(err("expected kty=EC, crv=P-256".into()));
+    }
+    let x_b64 = jwk
+        .get("x")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| err("missing x".into()))?;
+    let y_b64 = jwk
+        .get("y")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| err("missing y".into()))?;
+    let x = URL_SAFE_NO_PAD
+        .decode(x_b64)
+        .map_err(|e| err(format!("x: {e}")))?;
+    let y = URL_SAFE_NO_PAD
+        .decode(y_b64)
+        .map_err(|e| err(format!("y: {e}")))?;
+    if x.len() != 32 || y.len() != 32 {
+        return Err(err("x/y must each be 32 bytes".into()));
+    }
+    let point = p256::EncodedPoint::from_affine_coordinates(
+        p256::FieldBytes::from_slice(&x),
+        p256::FieldBytes::from_slice(&y),
+        false,
+    );
+    p256::ecdsa::VerifyingKey::from_encoded_point(&point)
+        .map_err(|e| err(format!("not a valid public key: {e}")))
+}
+
+/// Verifies an ES256 access token against a public key and returns its claims.
+///
+/// Checks: `alg=ES256`, the ECDSA signature over `header.payload`, and that the
+/// token has not expired (`exp`). This is the verification that was previously
+/// missing — [`decode_jwt_parts`] only checks structure.
+pub fn verify_access_token(
+    token: &str,
+    key: &p256::ecdsa::VerifyingKey,
+) -> SbiResult<AccessTokenClaims> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use p256::ecdsa::signature::Verifier;
+
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(SbiError::AuthorizationFailed(
+            "Access token is not a valid JWT".into(),
+        ));
+    }
+
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .map_err(|e| SbiError::AuthorizationFailed(format!("Invalid JWT header: {e}")))?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|e| SbiError::AuthorizationFailed(format!("Invalid JWT header JSON: {e}")))?;
+    if header.get("alg").and_then(|v| v.as_str()) != Some("ES256") {
+        return Err(SbiError::AuthorizationFailed(
+            "token alg is not ES256".into(),
+        ));
+    }
+
+    let sig_bytes = URL_SAFE_NO_PAD
+        .decode(parts[2])
+        .map_err(|e| SbiError::AuthorizationFailed(format!("Invalid JWT signature: {e}")))?;
+    let signature = p256::ecdsa::Signature::from_slice(&sig_bytes)
+        .map_err(|e| SbiError::AuthorizationFailed(format!("Malformed ES256 signature: {e}")))?;
+    let signing_input = format!("{}.{}", parts[0], parts[1]);
+    key.verify(signing_input.as_bytes(), &signature)
+        .map_err(|_| SbiError::AuthorizationFailed("token signature verification failed".into()))?;
+
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(parts[1])
+        .map_err(|e| SbiError::AuthorizationFailed(format!("Invalid JWT payload: {e}")))?;
+    let claims: AccessTokenClaims = serde_json::from_slice(&payload_bytes)
+        .map_err(|e| SbiError::AuthorizationFailed(format!("Invalid token claims: {e}")))?;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if claims.exp <= now {
+        return Err(SbiError::AuthorizationFailed(
+            "access token has expired".into(),
+        ));
+    }
+    Ok(claims)
+}
+
+/// Error detail emitted when a token's `kid` has no match in the JWKS.
+/// [`JwksCache::authorize`] keys its refresh-on-rotation retry off this text.
+const KID_MISMATCH_MSG: &str = "no JWKS key matches token kid";
+
+/// Verifies an access token against a JWKS document (as published by the NRF at
+/// `/nnrf-oauth2/v1/jwks`), selecting the key by the token header's `kid` (or
+/// the sole key when the header carries no `kid`).
+pub fn verify_access_token_with_jwks(
+    token: &str,
+    jwks: &serde_json::Value,
+) -> SbiResult<AccessTokenClaims> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let parts: Vec<&str> = token.split('.').collect();
+    if parts.len() != 3 {
+        return Err(SbiError::AuthorizationFailed(
+            "Access token is not a valid JWT".into(),
+        ));
+    }
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(parts[0])
+        .map_err(|e| SbiError::AuthorizationFailed(format!("Invalid JWT header: {e}")))?;
+    let header: serde_json::Value = serde_json::from_slice(&header_bytes)
+        .map_err(|e| SbiError::AuthorizationFailed(format!("Invalid JWT header JSON: {e}")))?;
+    let want_kid = header.get("kid").and_then(|v| v.as_str());
+
+    let keys = jwks
+        .get("keys")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| SbiError::AuthorizationFailed("JWKS has no 'keys' array".into()))?;
+    let jwk = keys
+        .iter()
+        .find(|k| match want_kid {
+            Some(kid) => k.get("kid").and_then(|v| v.as_str()) == Some(kid),
+            None => true,
+        })
+        .ok_or_else(|| SbiError::AuthorizationFailed(KID_MISMATCH_MSG.into()))?;
+
+    let key = parse_es256_jwk(jwk)?;
+    verify_access_token(token, &key)
+}
+
+/// Extracts the bearer token from an `Authorization` header value and verifies
+/// it against the JWKS. A missing or non-`Bearer` header is an authorization
+/// failure. Used by the SBI server to enforce OAuth2 on incoming requests.
+pub fn authorize_bearer(
+    auth_header: Option<&str>,
+    jwks: &serde_json::Value,
+) -> SbiResult<AccessTokenClaims> {
+    let token = auth_header
+        .and_then(|h| {
+            h.strip_prefix("Bearer ")
+                .or_else(|| h.strip_prefix("bearer "))
+        })
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| SbiError::AuthorizationFailed("missing or malformed Bearer token".into()))?;
+    verify_access_token_with_jwks(token, jwks)
+}
+
 // ============================================================================
-// OAuth2 Client (W1.23: Token exchange with NRF)
+// OAuth2 Client (Token exchange with NRF)
 // ============================================================================
 
 /// OAuth2 client for requesting tokens from the NRF (Authorization Server).
@@ -421,6 +578,164 @@ fn url_encode(s: &str) -> String {
         }
     }
     result
+}
+
+// ============================================================================
+// JWKS client (auth stage 4b): fetch + cache the NRF's public keys
+// ============================================================================
+
+/// Fetches and caches the NRF's JWKS so an SBI server can verify access
+/// tokens without a key provisioned at startup.
+///
+/// The document is fetched lazily on first use and reused until `ttl`
+/// expires. When a token carries a `kid` that is not in the cached document
+/// (NRF key rotation or restart), [`JwksCache::authorize`] re-fetches once
+/// before rejecting. Like [`OAuth2Client`], the fetch speaks cleartext
+/// HTTP/2 (h2c prior knowledge); `https` JWKS URIs are not supported yet.
+pub struct JwksCache {
+    /// Full JWKS URI, e.g. `http://nrf:7777/nnrf-oauth2/v1/jwks`.
+    jwks_uri: String,
+    /// Cached document and the instant it was fetched.
+    cached: RwLock<Option<(serde_json::Value, Instant)>>,
+    /// How long a fetched document is reused before re-fetching.
+    ttl: Duration,
+}
+
+impl JwksCache {
+    /// Default reuse window for a fetched JWKS document.
+    pub const DEFAULT_TTL: Duration = Duration::from_secs(300);
+    /// Path of the NRF's JWKS endpoint (3GPP-adjacent; see nrfd).
+    pub const NRF_JWKS_PATH: &'static str = "/nnrf-oauth2/v1/jwks";
+
+    /// Create a cache for an explicit JWKS URI.
+    pub fn new(jwks_uri: impl Into<String>) -> Self {
+        Self {
+            jwks_uri: jwks_uri.into(),
+            cached: RwLock::new(None),
+            ttl: Self::DEFAULT_TTL,
+        }
+    }
+
+    /// Create a cache pointing at the NRF's JWKS endpoint.
+    pub fn for_nrf(nrf_uri: &str) -> Self {
+        Self::new(format!(
+            "{}{}",
+            nrf_uri.trim_end_matches('/'),
+            Self::NRF_JWKS_PATH
+        ))
+    }
+
+    /// Override the cache TTL.
+    pub fn with_ttl(mut self, ttl: Duration) -> Self {
+        self.ttl = ttl;
+        self
+    }
+
+    /// The JWKS URI this cache fetches from.
+    pub fn jwks_uri(&self) -> &str {
+        &self.jwks_uri
+    }
+
+    /// Return the cached document, fetching it if absent or expired.
+    pub async fn get(&self) -> SbiResult<serde_json::Value> {
+        if let Some((doc, fetched_at)) = self.cached.read().await.as_ref() {
+            if fetched_at.elapsed() < self.ttl {
+                return Ok(doc.clone());
+            }
+        }
+        self.refresh().await
+    }
+
+    /// Force a re-fetch, replacing the cached document on success.
+    pub async fn refresh(&self) -> SbiResult<serde_json::Value> {
+        let doc = fetch_jwks(&self.jwks_uri).await?;
+        *self.cached.write().await = Some((doc.clone(), Instant::now()));
+        Ok(doc)
+    }
+
+    /// Seed the cache without fetching (static provisioning / tests).
+    pub async fn seed(&self, jwks: serde_json::Value) {
+        *self.cached.write().await = Some((jwks, Instant::now()));
+    }
+
+    /// Verify an `Authorization` header against the cached JWKS.
+    ///
+    /// On a `kid` miss the document is re-fetched once and verification
+    /// retried, so a rotated NRF key does not lock out fresh tokens for a
+    /// full TTL. Fetch failures surface as non-`AuthorizationFailed` errors
+    /// so callers can distinguish "bad token" (401) from "keys unavailable"
+    /// (503).
+    pub async fn authorize(&self, auth_header: Option<&str>) -> SbiResult<AccessTokenClaims> {
+        let jwks = self.get().await?;
+        match authorize_bearer(auth_header, &jwks) {
+            Err(SbiError::AuthorizationFailed(msg)) if msg == KID_MISMATCH_MSG => {
+                let fresh = self.refresh().await?;
+                authorize_bearer(auth_header, &fresh)
+            }
+            other => other,
+        }
+    }
+}
+
+/// Fetch a JWKS document over cleartext HTTP/2 and validate its shape.
+pub async fn fetch_jwks(jwks_uri: &str) -> SbiResult<serde_json::Value> {
+    let addr = parse_uri_to_addr(jwks_uri)?;
+
+    let stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    .map_err(|_| SbiError::Timeout)?
+    .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
+
+    let io = hyper_util::rt::TokioIo::new(stream);
+    let (mut sender, conn) =
+        hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
+            .await
+            .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
+
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            log::error!("JWKS HTTP/2 connection error: {e}");
+        }
+    });
+
+    let http_request = hyper::Request::builder()
+        .method(hyper::Method::GET)
+        .uri(jwks_uri)
+        .body(http_body_util::Full::new(bytes::Bytes::new()))
+        .map_err(|e| SbiError::ClientError(e.to_string()))?;
+
+    let response = tokio::time::timeout(Duration::from_secs(10), sender.send_request(http_request))
+        .await
+        .map_err(|_| SbiError::Timeout)?
+        .map_err(|e| SbiError::HyperError(e.to_string()))?;
+
+    let status = response.status().as_u16();
+    let body_bytes = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .map_err(|e| SbiError::InvalidResponse(e.to_string()))?
+        .to_bytes();
+
+    if status != 200 {
+        return Err(SbiError::HttpError {
+            status,
+            message: format!(
+                "JWKS fetch failed: {}",
+                String::from_utf8_lossy(&body_bytes)
+            ),
+        });
+    }
+
+    let doc: serde_json::Value = serde_json::from_slice(&body_bytes)
+        .map_err(|e| SbiError::InvalidResponse(format!("Invalid JWKS JSON: {e}")))?;
+    if doc.get("keys").and_then(|k| k.as_array()).is_none() {
+        return Err(SbiError::InvalidResponse(
+            "JWKS document has no 'keys' array".into(),
+        ));
+    }
+    Ok(doc)
 }
 
 #[cfg(test)]
@@ -620,5 +935,211 @@ mod tests {
     fn test_oauth2_client_creation() {
         let client = OAuth2Client::new("http://127.0.0.10:7777", "amf-instance-001", NfType::Amf);
         assert_eq!(client.nrf_uri(), "http://127.0.0.10:7777");
+    }
+
+    // --- ES256 access-token verification (NRF auth stage 3) ---
+
+    fn build_es256_token(sk: &p256::ecdsa::SigningKey, kid: &str, exp: u64) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use p256::ecdsa::{signature::Signer, Signature};
+
+        let header = format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{kid}"}}"#);
+        let claims = serde_json::json!({
+            "iss": "NRF", "sub": "amf-1", "aud": "UDM", "scope": "nudm-sdm", "exp": exp, "iat": 0
+        })
+        .to_string();
+        let h = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let p = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        let sig: Signature = sk.sign(format!("{h}.{p}").as_bytes());
+        let s = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        format!("{h}.{p}.{s}")
+    }
+
+    fn jwks_for(sk: &p256::ecdsa::SigningKey, kid: &str) -> serde_json::Value {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let point = sk.verifying_key().to_encoded_point(false);
+        serde_json::json!({"keys":[{
+            "kty":"EC","crv":"P-256","use":"sig","alg":"ES256","kid":kid,
+            "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+            "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+        }]})
+    }
+
+    fn future_exp() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600
+    }
+
+    #[test]
+    fn test_verify_valid_token_against_jwks() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let token = build_es256_token(&sk, "nrf-es256", future_exp());
+        let claims = verify_access_token_with_jwks(&token, &jwks_for(&sk, "nrf-es256"))
+            .expect("valid token verifies");
+        assert_eq!(claims.iss, "NRF");
+        assert_eq!(claims.scope, "nudm-sdm");
+    }
+
+    #[test]
+    fn test_verify_rejects_tampered_token() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let token = build_es256_token(&sk, "nrf-es256", future_exp());
+        let jwks = jwks_for(&sk, "nrf-es256");
+        let mut parts: Vec<&str> = token.split('.').collect();
+        let tampered_payload = format!("{}x", parts[1]);
+        parts[1] = tampered_payload.as_str();
+        assert!(verify_access_token_with_jwks(&parts.join("."), &jwks).is_err());
+    }
+
+    #[test]
+    fn test_verify_rejects_wrong_key() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let other = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let token = build_es256_token(&sk, "nrf-es256", future_exp());
+        assert!(verify_access_token_with_jwks(&token, &jwks_for(&other, "nrf-es256")).is_err());
+    }
+
+    #[test]
+    fn test_verify_rejects_expired_token() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let token = build_es256_token(&sk, "nrf-es256", 1); // exp in 1970
+        let err = verify_access_token_with_jwks(&token, &jwks_for(&sk, "nrf-es256")).unwrap_err();
+        assert!(format!("{err:?}").contains("expired"));
+    }
+
+    #[test]
+    fn test_authorize_bearer_header() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let token = build_es256_token(&sk, "nrf-es256", future_exp());
+        let jwks = jwks_for(&sk, "nrf-es256");
+
+        // Valid "Bearer <token>" authorizes.
+        let header = format!("Bearer {token}");
+        assert!(authorize_bearer(Some(&header), &jwks).is_ok());
+
+        // Missing header, non-bearer scheme, and a bad token are all rejected.
+        assert!(authorize_bearer(None, &jwks).is_err());
+        assert!(authorize_bearer(Some("Basic abc"), &jwks).is_err());
+        assert!(authorize_bearer(Some("Bearer not.a.jwt"), &jwks).is_err());
+    }
+
+    // --- JWKS fetch + cache (NRF auth stage 4b) ---
+
+    /// Serve `jwks` on every request over cleartext HTTP/2 from an ephemeral
+    /// local port.
+    async fn serve_jwks(jwks: serde_json::Value) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = jwks.to_string();
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let svc = hyper::service::service_fn(move |_req| {
+                        let body = body.clone();
+                        async move {
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                                http_body_util::Full::new(bytes::Bytes::from(body)),
+                            ))
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc)
+                    .await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn test_jwks_cache_uri_construction() {
+        assert_eq!(
+            JwksCache::for_nrf("http://nrf:7777").jwks_uri(),
+            "http://nrf:7777/nnrf-oauth2/v1/jwks"
+        );
+        assert_eq!(
+            JwksCache::for_nrf("http://nrf:7777/").jwks_uri(),
+            "http://nrf:7777/nnrf-oauth2/v1/jwks"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_jwks_cache_seeded_authorize() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let cache = JwksCache::new("http://127.0.0.1:1/unused");
+        cache.seed(jwks_for(&sk, "nrf-es256")).await;
+
+        let token = build_es256_token(&sk, "nrf-es256", future_exp());
+        let header = format!("Bearer {token}");
+        assert!(cache.authorize(Some(&header)).await.is_ok());
+        assert!(matches!(
+            cache.authorize(Some("Bearer not.a.jwt")).await,
+            Err(SbiError::AuthorizationFailed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_jwks_live() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let addr = serve_jwks(jwks_for(&sk, "nrf-es256")).await;
+        let doc = fetch_jwks(&format!("http://{addr}/nnrf-oauth2/v1/jwks"))
+            .await
+            .expect("live JWKS fetch succeeds");
+        assert_eq!(doc["keys"][0]["kid"], "nrf-es256");
+    }
+
+    #[tokio::test]
+    async fn test_jwks_cache_lazy_fetch_and_authorize() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let addr = serve_jwks(jwks_for(&sk, "nrf-es256")).await;
+        let cache = JwksCache::new(format!("http://{addr}/nnrf-oauth2/v1/jwks"));
+
+        let token = build_es256_token(&sk, "nrf-es256", future_exp());
+        let header = format!("Bearer {token}");
+        let claims = cache
+            .authorize(Some(&header))
+            .await
+            .expect("lazy fetch + verify succeeds");
+        assert_eq!(claims.iss, "NRF");
+    }
+
+    #[tokio::test]
+    async fn test_jwks_cache_refreshes_on_kid_rotation() {
+        // The NRF rotated its key: the cache holds the old document, the
+        // server publishes the new one, and a fresh token uses the new kid.
+        let old_sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let new_sk = p256::ecdsa::SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let addr = serve_jwks(jwks_for(&new_sk, "nrf-es256-v2")).await;
+
+        let cache = JwksCache::new(format!("http://{addr}/nnrf-oauth2/v1/jwks"));
+        cache.seed(jwks_for(&old_sk, "nrf-es256-v1")).await;
+
+        let token = build_es256_token(&new_sk, "nrf-es256-v2", future_exp());
+        let header = format!("Bearer {token}");
+        let claims = cache
+            .authorize(Some(&header))
+            .await
+            .expect("kid miss triggers refresh and the new key verifies");
+        assert_eq!(claims.iss, "NRF");
+    }
+
+    #[tokio::test]
+    async fn test_jwks_fetch_failure_is_not_authorization_failed() {
+        // Nothing listens on the target: the error must be a transport
+        // error, not AuthorizationFailed, so servers can answer 503 not 401.
+        let cache = JwksCache::new("http://127.0.0.1:1/nnrf-oauth2/v1/jwks");
+        let err = cache.authorize(Some("Bearer a.b.c")).await.unwrap_err();
+        assert!(!matches!(err, SbiError::AuthorizationFailed(_)));
     }
 }

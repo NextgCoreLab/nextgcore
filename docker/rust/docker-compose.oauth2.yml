@@ -1,0 +1,17 @@
+# OAuth2 enforcement overlay (NRF auth stage 4b validation)
+#
+# Swaps the UDR's config for one with `udr.sbi.oauth2.require: true`, so the
+# UDR rejects SBI requests without a valid NRF-issued bearer token (401) and
+# answers 503 while the NRF's JWKS is unreachable.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.oauth2.yml up -d nrf udr
+#
+# Keep this an overlay: NF consumers do not attach OAuth2 tokens yet, so
+# enabling enforcement in the default deployment would break UDM/AUSF→UDR
+# traffic.
+
+services:
+  udr:
+    volumes:
+      - ./configs/5gc/udr-oauth2.yaml:/etc/nextgcore/udr.yaml:ro
+      - ./certs:/etc/nextgcore/certs:ro

@@ -367,6 +367,7 @@ pub fn handle_n1_n2_message_transfer(
                             req_data.n1_message.clone(),
                             n2_info.ngap_data.clone(),
                             req_data.pdu_session_id,
+                            req_data.n1n2_failure_txf_notif_uri.as_deref(),
                         );
                     } else {
                         // UE is connected
@@ -394,6 +395,7 @@ pub fn handle_n1_n2_message_transfer(
                             req_data.n1_message.clone(),
                             n2_info.ngap_data.clone(),
                             req_data.pdu_session_id,
+                            req_data.n1n2_failure_txf_notif_uri.as_deref(),
                         );
                     }
                 } else {
@@ -482,7 +484,10 @@ pub fn handle_dereg_notify(amf_ue: &AmfUe, data: &DeregistrationData) -> NamfHan
 
 /// Handle event subscription (Namf_EventExposure_Subscribe)
 ///
-/// This is called when NF subscribes to AMF events
+/// Persists the subscription in the AMF context (survives across requests)
+/// and returns the assigned subscription ID. HTTP-level subscriptions are
+/// handled by `namf_server::handle_event_subscription_create`, which uses
+/// the same context store.
 pub fn handle_event_subscribe(
     subscription: &AmfEventSubscription,
     callback_uri: &str,
@@ -498,11 +503,30 @@ pub fn handle_event_subscribe(
         return Err(NamfHandlerError::MissingField("callback_uri".to_string()));
     }
 
-    // Generate subscription ID
+    // Generate subscription ID and persist in the AMF context
     let subscription_id = format!("sub-{}", uuid::Uuid::new_v4());
+    let stored = crate::context::EventSubscription {
+        subscription_id: subscription_id.clone(),
+        notify_uri: callback_uri.to_string(),
+        notify_correlation_id: subscription_id.clone(),
+        nf_id: String::new(),
+        event_types: vec![subscription.event_type.as_str().to_string()],
+        supi: None,
+        any_ue: true,
+        expiry: None,
+    };
 
-    // Store subscription (in real implementation, this would be persisted)
-    // For now, just log and return subscription ID
+    let ctx = amf_self();
+    let added = ctx
+        .read()
+        .map(|context| context.event_subscription_add(stored))
+        .unwrap_or(false);
+    if !added {
+        return Err(NamfHandlerError::InternalError(
+            "failed to persist event subscription".to_string(),
+        ));
+    }
+
     log::debug!(
         "Created event subscription: id={}, type={:?}",
         subscription_id,
@@ -514,7 +538,9 @@ pub fn handle_event_subscribe(
 
 /// Handle event notification (send to subscriber)
 ///
-/// This is called when an event occurs and needs to be notified
+/// Looks up the persisted subscription and delivers the notification via
+/// HTTP POST to its notify URI on a background task (bounded timeouts).
+/// Returns an error when the subscription does not exist.
 pub fn send_event_notification(
     subscription_id: &str,
     notification: &AmfEventNotification,
@@ -526,18 +552,52 @@ pub fn send_event_notification(
         notification.state
     );
 
-    // In real implementation, this would:
-    // 1. Look up subscription by ID
-    // 2. Build HTTP POST request with notification data
-    // 3. Send to callback_uri from subscription
-    // 4. Handle response/retries
+    let ctx = amf_self();
+    let sub = ctx
+        .read()
+        .ok()
+        .and_then(|context| context.event_subscription_find(subscription_id));
+    let Some(_sub) = sub else {
+        return Err(NamfHandlerError::UeNotFound(format!(
+            "subscription {subscription_id}"
+        )));
+    };
 
-    // For now, just log the notification
-    log::debug!(
-        "Event notification: subscription={}, event={}, timestamp={:?}",
-        subscription_id,
+    // Delegate the actual HTTP delivery to the namf_server event path so
+    // both the legacy and HTTP entry points share one delivery pipeline.
+    // PLMN strings in the legacy types are combined MCC+MNC digits
+    let split_plmn = |plmn: &str| {
+        let mcc: String = plmn.chars().take(3).collect();
+        let mnc: String = plmn.chars().skip(3).collect();
+        serde_json::json!({ "mcc": mcc, "mnc": mnc })
+    };
+    let extra = match &notification.state {
+        AmfEventState::Location { tai, ncgi } => {
+            let mut location = serde_json::json!({
+                "nrLocation": {
+                    "tai": {
+                        "plmnId": split_plmn(&tai.plmn_id),
+                        "tac": format!("{:04X}", tai.tac),
+                    },
+                }
+            });
+            if let Some(ncgi) = ncgi {
+                location["nrLocation"]["ncgi"] = serde_json::json!({
+                    "plmnId": split_plmn(&ncgi.plmn_id),
+                    "nrCellId": format!("{:09X}", ncgi.cell_id),
+                });
+            }
+            serde_json::json!({ "location": location })
+        }
+        AmfEventState::Active | AmfEventState::Connected => {
+            serde_json::json!({ "reachability": "REACHABLE" })
+        }
+        AmfEventState::Idle => serde_json::json!({ "reachability": "UNREACHABLE" }),
+    };
+    crate::namf_server::fire_amf_event(
         notification.event_type.as_str(),
-        notification.timestamp
+        Some(notification.supi.as_str()),
+        extra,
     );
 
     Ok(())
@@ -558,6 +618,7 @@ fn initiate_paging_for_idle_ue(
     pending_n1: Option<Vec<u8>>,
     pending_n2: Option<Vec<u8>>,
     pdu_session_id: Option<u8>,
+    failure_notify_uri: Option<&str>,
 ) {
     // Extract 5G-S-TMSI components from current GUTI
     let tmsi = amf_ue.current_guti.tmsi;
@@ -589,12 +650,13 @@ fn initiate_paging_for_idle_ue(
         context.paging_add(paging_ctx);
     }
 
-    // Mark session as paging ongoing
+    // Mark session as paging ongoing; keep the consumer's failure-notify
+    // URI so a paging timeout can trigger N1N2MsgTxfrFailureNotification
     let location = format!(
         "/namf-comm/v1/ue-contexts/{}/n1-n2-messages",
         amf_ue.supi.as_deref().unwrap_or("unknown")
     );
-    sess.store_paging_info(&location, None);
+    sess.store_paging_info(&location, failure_notify_uri);
 
     log::info!(
         "[{}] Paging initiated: TMSI=0x{:08x}, TAC={}, PSI={:?}",
@@ -607,18 +669,23 @@ fn initiate_paging_for_idle_ue(
 
 /// Handle event unsubscribe (Namf_EventExposure_Unsubscribe)
 ///
-/// This is called when NF wants to cancel an event subscription
+/// Removes the persisted subscription; returns an error when the
+/// subscription does not exist (mapped to 404 at the HTTP layer).
 pub fn handle_event_unsubscribe(subscription_id: &str) -> NamfHandlerResult<()> {
     log::info!("Event unsubscribe request: subscription={subscription_id}");
 
-    // In real implementation, this would:
-    // 1. Look up subscription by ID
-    // 2. Remove from storage
-    // 3. Stop sending notifications
+    let ctx = amf_self();
+    let removed = ctx
+        .read()
+        .ok()
+        .and_then(|context| context.event_subscription_remove(subscription_id));
+    if removed.is_none() {
+        return Err(NamfHandlerError::UeNotFound(format!(
+            "subscription {subscription_id}"
+        )));
+    }
 
-    // For now, just log
     log::debug!("Removed event subscription: {subscription_id}");
-
     Ok(())
 }
 
@@ -765,6 +832,16 @@ mod tests {
 
     #[test]
     fn test_send_event_notification() {
+        // Subscription must exist for delivery to be attempted
+        let subscription = AmfEventSubscription {
+            event_type: AmfEventType::LocationReport,
+            immediate_flag: false,
+            area_list: None,
+            location_filter_list: None,
+        };
+        let sub_id = handle_event_subscribe(&subscription, "http://127.0.0.1:9/notify")
+            .expect("subscribe failed");
+
         let notification = AmfEventNotification {
             event_type: AmfEventType::LocationReport,
             state: AmfEventState::Location {
@@ -779,14 +856,32 @@ mod tests {
             additional_info: None,
         };
 
-        let result = send_event_notification("sub-12345", &notification);
+        let result = send_event_notification(&sub_id, &notification);
         assert!(result.is_ok());
+
+        // Unknown subscription is an error (maps to 404 at HTTP level)
+        let result = send_event_notification("sub-does-not-exist", &notification);
+        assert!(result.is_err());
+
+        let _ = handle_event_unsubscribe(&sub_id);
     }
 
     #[test]
     fn test_event_unsubscribe() {
-        let result = handle_event_unsubscribe("sub-12345");
-        assert!(result.is_ok());
+        // Removing a non-existent subscription is an error
+        assert!(handle_event_unsubscribe("sub-12345-missing").is_err());
+
+        // Subscribe then unsubscribe round-trips
+        let subscription = AmfEventSubscription {
+            event_type: AmfEventType::ReachabilityReport,
+            immediate_flag: false,
+            area_list: None,
+            location_filter_list: None,
+        };
+        let sub_id = handle_event_subscribe(&subscription, "http://127.0.0.1:9/notify")
+            .expect("subscribe failed");
+        assert!(handle_event_unsubscribe(&sub_id).is_ok());
+        assert!(handle_event_unsubscribe(&sub_id).is_err());
     }
 
     #[test]

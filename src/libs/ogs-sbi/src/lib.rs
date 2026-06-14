@@ -29,6 +29,7 @@
 //! - [`types`] - Service types, NF types, and enumerations
 //! - [`constants`] - HTTP status codes, methods, headers, and other constants
 //! - [`message`] - SBI message structures (request, response, headers)
+//! - [`multipart`] - multipart/related N1/N2 binary containers (TS 29.500 §6.1.2.3)
 //! - [`client`] - HTTP/2 client implementation
 //! - [`server`] - HTTP/2 server implementation
 //! - [`context`] - NF instance and service discovery context
@@ -43,6 +44,7 @@ pub mod error;
 pub mod grpc; // SBI 2.0 gRPC support (B6.1)
 pub mod heartbeat;
 pub mod message;
+pub mod multipart;
 pub mod oauth;
 #[cfg(feature = "6g-extensions")]
 pub mod pubsub;
@@ -68,8 +70,9 @@ pub use heartbeat::{
 };
 pub use message::{
     Guami, InvalidParam, PlmnId, ProblemDetails, SNssai, SbiDiscoveryOption, SbiHeader,
-    SbiHttpMessage, SbiMessageParams, SbiPart, SbiRequest, SbiResponse, Tai,
+    SbiHttpMessage, SbiMessageParams, SbiPart, SbiRequest, SbiResponse, Tai, UriComponents,
 };
+pub use multipart::MultipartBody;
 pub use oauth::{
     AccessTokenClaims, AccessTokenError, AccessTokenRequest, AccessTokenResponse, OAuth2Client,
     TokenCache,
@@ -83,8 +86,8 @@ pub use scp::{
     global_scp_router, init_scp_router, ScpBinding, ScpRouter, ScpRoutingInfo, ScpRoutingMode,
 };
 pub use security::{
-    authorize_sbi_request, extract_bearer_token, validate_bearer_token, NrfSecurityConfig,
-    PqcKeyExchange, PqcSignature, PqcTlsConfig, SbiSecurityPolicy, TlsPaths, TlsVersion,
+    authorize_sbi_request, extract_bearer_token, NrfSecurityConfig, PqcKeyExchange, PqcSignature,
+    PqcTlsConfig, SbiSecurityPolicy, TlsPaths, TlsVersion,
 };
 pub use server::{
     send_bad_request, send_error, send_forbidden, send_gateway_timeout, send_internal_error,

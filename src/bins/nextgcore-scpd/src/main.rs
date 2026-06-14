@@ -14,6 +14,7 @@ use std::time::Duration;
 
 mod context;
 mod event;
+mod proxy;
 mod sbi_path;
 mod sbi_response;
 mod scp_sm;
@@ -25,12 +26,14 @@ pub use context::{
     SNssai, SbiServiceType, ScpAssoc, ScpContext, Tai,
 };
 pub use event::{SbiEventData, SbiMessage, SbiResponse, ScpEvent, ScpEventId, ScpTimerId};
+pub use proxy::{
+    forwardable_request_headers, relayable_response_headers, ApiRoot, ScpProxy, ScpProxyConfig,
+};
 pub use sbi_path::{
-    build_forwarded_request, copy_request_headers, discovery_cache, handle_nf_discover_response,
-    handle_request, handle_response, handle_sepp_discover_response, headers,
+    build_forwarded_request, copy_request_headers, discovery_cache, headers,
     parse_discovery_headers, parse_search_result, route_request, scp_sbi_close, scp_sbi_is_running,
     scp_sbi_open, select_nf_instance, select_nf_instance_round_robin, DiscoveryCache,
-    NfInstanceCandidate, RequestHandlerResult, SbiRequest, SbiServerConfig,
+    NfInstanceCandidate, SbiRequest, SbiServerConfig,
 };
 pub use scp_sm::{ScpSmContext, ScpState};
 pub use timer::{timer_manager, ScpTimerManager};
@@ -85,6 +88,11 @@ struct Args {
     /// Maximum number of associations
     #[arg(long, default_value = "8192")]
     max_assoc: usize,
+
+    /// NRF base URI for Model D delegated discovery
+    /// (falls back to the NRF_URI environment variable)
+    #[arg(long)]
+    nrf_uri: Option<String>,
 }
 
 /// Global shutdown flag
@@ -152,8 +160,44 @@ async fn main() -> Result<()> {
         tls_key: args.tls_key.clone(),
     };
 
-    // Open SBI server
+    // Open SBI server (lifecycle state)
     scp_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
+
+    // Start the actual HTTP/2 proxy (TS 29.500 §6.10: Model C + Model D)
+    let nrf_uri = args
+        .nrf_uri
+        .clone()
+        .or_else(|| std::env::var("NRF_URI").ok());
+    if nrf_uri.is_none() {
+        log::warn!(
+            "No NRF URI configured (--nrf-uri / NRF_URI): \
+             Model D delegated discovery is disabled"
+        );
+    }
+    let scp_proxy = Arc::new(ScpProxy::new(ScpProxyConfig {
+        nrf_uri,
+        ..Default::default()
+    }));
+    let mut http_config =
+        ogs_sbi::server::SbiServerConfig::with_host_port(&args.sbi_addr, args.sbi_port)
+            .map_err(|e| anyhow::anyhow!("Invalid SBI listen address: {e}"))?;
+    if args.tls {
+        match (&args.tls_key, &args.tls_cert) {
+            (Some(key), Some(cert)) => {
+                http_config = http_config.with_tls(key.clone(), cert.clone());
+            }
+            _ => anyhow::bail!("--tls requires both --tls-cert and --tls-key"),
+        }
+    }
+    let http_server = ogs_sbi::server::SbiServer::new(http_config);
+    let handler_proxy = scp_proxy.clone();
+    http_server
+        .start(move |request: ogs_sbi::message::SbiRequest| {
+            let proxy = handler_proxy.clone();
+            async move { proxy.handle(request).await }
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to start SBI HTTP/2 server: {e}"))?;
     log::info!(
         "SBI server listening on {}:{}",
         args.sbi_addr,
@@ -168,7 +212,10 @@ async fn main() -> Result<()> {
     // Graceful shutdown
     log::info!("Shutting down...");
 
-    // Close SBI server
+    // Stop the HTTP/2 proxy server, then the lifecycle state
+    if let Err(e) = http_server.stop().await {
+        log::warn!("Error stopping SBI HTTP/2 server: {e}");
+    }
     scp_sbi_close();
     log::info!("SBI server closed");
 

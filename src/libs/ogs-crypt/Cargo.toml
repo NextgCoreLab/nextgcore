@@ -16,6 +16,7 @@ cmac.workspace = true
 zuc.workspace = true
 p256 = { workspace = true, features = ["ecdh", "ecdsa"] }
 elliptic-curve = { workspace = true, features = ["sec1"] }
+x25519-dalek = { workspace = true }
 rand = { workspace = true }
 thiserror.workspace = true
 ml-kem = "0.2"

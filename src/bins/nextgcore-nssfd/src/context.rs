@@ -111,7 +111,9 @@ impl NssfNsi {
         Self {
             id,
             nrf_id: nrf_id.to_string(),
-            nsi_id: id.to_string(),
+            // TS 29.531: nsiId is an opaque slice-instance identifier, not a
+            // pool index. Use a UUID so identifiers are not guessable/sequential.
+            nsi_id: uuid::Uuid::new_v4().to_string(),
             s_nssai: SNssai::new(sst, sd),
             roaming_indication: RoamingIndication::default(),
             tai_presence: false,
@@ -161,11 +163,143 @@ impl NssfHome {
 }
 
 /// NSSAI Availability info stored per NF
+///
+/// `doc` is the canonical TS 29.531 `NssaiAvailabilityInfo` JSON document as
+/// last PUT/PATCHed by the consumer (AMF); the flattened lists are derived
+/// from it for fast lookup.
 #[derive(Debug, Clone)]
 pub struct NssaiAvailabilityInfo {
     pub nf_id: String,
     pub supported_snssai_list: Vec<SNssai>,
     pub tai_list: Vec<Tai>,
+    pub doc: serde_json::Value,
+}
+
+/// NSSAI availability change subscription (TS 29.531 NssfEventSubscriptionCreateData)
+#[derive(Debug, Clone)]
+pub struct NssfSubscription {
+    pub subscription_id: String,
+    /// Callback URI for NssfEventNotification POSTs (mandatory)
+    pub nf_nssai_availability_uri: String,
+    /// TAIs of interest (mandatory, may be empty array per schema)
+    pub tai_list: Vec<Tai>,
+    /// Subscribed event (mandatory), e.g. SNSSAI_STATUS_CHANGE_REPORT
+    pub event: String,
+    pub expiry: Option<String>,
+    pub amf_id: Option<String>,
+    pub amf_set_id: Option<String>,
+}
+
+impl NssfSubscription {
+    /// Serialize as NssfEventSubscriptionCreatedData-compatible JSON (without
+    /// authorizedNssaiAvailabilityData, which the caller appends).
+    pub fn to_created_json(&self) -> serde_json::Value {
+        let mut v = serde_json::json!({ "subscriptionId": self.subscription_id });
+        if let Some(ref e) = self.expiry {
+            v["expiry"] = serde_json::json!(e);
+        }
+        v
+    }
+}
+
+/// Parse an S-NSSAI from TS 29.571 Snssai JSON (`{"sst": 1, "sd": "010203"}`)
+pub fn snssai_from_json(v: &serde_json::Value) -> Option<SNssai> {
+    let sst = v.get("sst")?.as_u64()?;
+    if sst > 255 {
+        return None;
+    }
+    let sd = match v.get("sd") {
+        Some(serde_json::Value::String(s)) => Some(u32::from_str_radix(s, 16).ok()?),
+        Some(serde_json::Value::Null) | None => None,
+        _ => return None,
+    };
+    Some(SNssai::new(sst as u8, sd))
+}
+
+/// Serialize an S-NSSAI as TS 29.571 Snssai JSON
+pub fn snssai_to_json(s: &SNssai) -> serde_json::Value {
+    let mut v = serde_json::json!({ "sst": s.sst });
+    if let Some(sd) = s.sd {
+        v["sd"] = serde_json::json!(format!("{sd:06x}"));
+    }
+    v
+}
+
+/// Parse a TAI from TS 29.571 Tai JSON
+pub fn tai_from_json(v: &serde_json::Value) -> Option<Tai> {
+    let plmn = v.get("plmnId")?;
+    let mcc = plmn.get("mcc")?.as_str()?;
+    let mnc = plmn.get("mnc")?.as_str()?;
+    let tac = u32::from_str_radix(v.get("tac")?.as_str()?, 16).ok()?;
+    Some(Tai {
+        plmn_id: PlmnId::new(mcc, mnc),
+        tac,
+    })
+}
+
+/// Serialize a TAI as TS 29.571 Tai JSON
+pub fn tai_to_json(t: &Tai) -> serde_json::Value {
+    serde_json::json!({
+        "plmnId": { "mcc": t.plmn_id.mcc, "mnc": t.plmn_id.mnc },
+        "tac": format!("{:06x}", t.tac),
+    })
+}
+
+fn tai_eq(a: &Tai, b: &Tai) -> bool {
+    a.plmn_id.mcc == b.plmn_id.mcc && a.plmn_id.mnc == b.plmn_id.mnc && a.tac == b.tac
+}
+
+/// Decompose a TS 29.531 NssaiAvailabilityInfo doc into per-entry
+/// (TAIs, supported S-NSSAIs) tuples. Each `supportedNssaiAvailabilityData`
+/// entry contributes its mandatory `tai` plus any optional `taiList` members.
+pub fn availability_entries(doc: &serde_json::Value) -> Vec<(Vec<Tai>, Vec<SNssai>)> {
+    let mut result = Vec::new();
+    let Some(entries) = doc
+        .get("supportedNssaiAvailabilityData")
+        .and_then(|v| v.as_array())
+    else {
+        return result;
+    };
+    for entry in entries {
+        let mut tais = Vec::new();
+        if let Some(tai) = entry.get("tai").and_then(tai_from_json) {
+            tais.push(tai);
+        }
+        if let Some(extra) = entry.get("taiList").and_then(|v| v.as_array()) {
+            tais.extend(extra.iter().filter_map(tai_from_json));
+        }
+        let snssais: Vec<SNssai> = entry
+            .get("supportedSnssaiList")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(snssai_from_json).collect())
+            .unwrap_or_default();
+        result.push((tais, snssais));
+    }
+    result
+}
+
+/// Build a derived NssaiAvailabilityInfo (flattened lists) from a stored doc.
+pub fn availability_info_from_doc(nf_id: &str, doc: serde_json::Value) -> NssaiAvailabilityInfo {
+    let mut supported = Vec::new();
+    let mut tais = Vec::new();
+    for (entry_tais, entry_snssais) in availability_entries(&doc) {
+        for t in entry_tais {
+            if !tais.iter().any(|x| tai_eq(x, &t)) {
+                tais.push(t);
+            }
+        }
+        for s in entry_snssais {
+            if !supported.contains(&s) {
+                supported.push(s);
+            }
+        }
+    }
+    NssaiAvailabilityInfo {
+        nf_id: nf_id.to_string(),
+        supported_snssai_list: supported,
+        tai_list: tais,
+        doc,
+    }
 }
 
 /// NSSF Context - main context structure for NSSF
@@ -181,6 +315,10 @@ pub struct NssfContext {
     home_hash: RwLock<HashMap<(String, String, u8, Option<u32>), u64>>,
     /// NSSAI availability per NF instance ID (B24.4)
     pub(crate) nssai_availability: RwLock<HashMap<String, NssaiAvailabilityInfo>>,
+    /// Availability-change subscriptions by subscriptionId (TS 29.531 §5.2.2.5)
+    subscriptions: RwLock<HashMap<String, NssfSubscription>>,
+    /// Configured target AMF Set ID for AMF re-selection (TS 29.531 targetAmfSet)
+    target_amf_set: RwLock<Option<String>>,
     /// Next NSI ID
     next_nsi_id: AtomicUsize,
     /// Next Home ID
@@ -199,6 +337,8 @@ impl NssfContext {
             snssai_hash: RwLock::new(HashMap::new()),
             home_hash: RwLock::new(HashMap::new()),
             nssai_availability: RwLock::new(HashMap::new()),
+            subscriptions: RwLock::new(HashMap::new()),
+            target_amf_set: RwLock::new(None),
             next_nsi_id: AtomicUsize::new(1),
             next_home_id: AtomicUsize::new(1),
             max_num_of_nf: 0,
@@ -407,23 +547,113 @@ impl NssfContext {
         false
     }
 
-    /// Get supported S-NSSAIs for a specific TAI from NSSAI availability data
+    /// Snapshot all stored availability docs (nfId, doc)
+    pub fn all_nssai_availability(&self) -> Vec<NssaiAvailabilityInfo> {
+        self.nssai_availability
+            .read()
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// True if any availability data has been provided by any NF
+    pub fn has_availability_data(&self) -> bool {
+        self.nssai_availability
+            .read()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false)
+    }
+
+    /// Per-AMF supported S-NSSAIs snapshot: (nfId, supported list)
+    pub fn per_nf_supported_snssais(&self) -> Vec<(String, Vec<SNssai>)> {
+        self.nssai_availability
+            .read()
+            .map(|m| {
+                m.values()
+                    .map(|i| (i.nf_id.clone(), i.supported_snssai_list.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    // Availability-change subscription management (TS 29.531 §5.2.2.5)
+
+    pub fn subscription_add(&self, sub: NssfSubscription) {
+        if let Ok(mut subs) = self.subscriptions.write() {
+            subs.insert(sub.subscription_id.clone(), sub);
+        }
+    }
+
+    pub fn subscription_get(&self, id: &str) -> Option<NssfSubscription> {
+        self.subscriptions.read().ok()?.get(id).cloned()
+    }
+
+    pub fn subscription_remove(&self, id: &str) -> bool {
+        self.subscriptions
+            .write()
+            .map(|mut subs| subs.remove(id).is_some())
+            .unwrap_or(false)
+    }
+
+    pub fn subscription_update(&self, sub: NssfSubscription) -> bool {
+        if let Ok(mut subs) = self.subscriptions.write() {
+            if subs.contains_key(&sub.subscription_id) {
+                subs.insert(sub.subscription_id.clone(), sub);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn subscription_count(&self) -> usize {
+        self.subscriptions.read().map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Subscriptions whose TAI list intersects `affected_tais`
+    /// (a subscription with an empty TAI list matches everything).
+    pub fn subscriptions_matching(&self, affected_tais: &[Tai]) -> Vec<NssfSubscription> {
+        self.subscriptions
+            .read()
+            .map(|subs| {
+                subs.values()
+                    .filter(|s| {
+                        s.tai_list.is_empty()
+                            || s.tai_list
+                                .iter()
+                                .any(|st| affected_tais.iter().any(|at| tai_eq(st, at)))
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    // Target AMF set configuration
+
+    pub fn set_target_amf_set(&self, set_id: &str) {
+        if let Ok(mut t) = self.target_amf_set.write() {
+            *t = Some(set_id.to_string());
+        }
+    }
+
+    pub fn get_target_amf_set(&self) -> Option<String> {
+        self.target_amf_set.read().ok()?.clone()
+    }
+
+    /// Get supported S-NSSAIs for a specific TAI from NSSAI availability data.
+    ///
+    /// Walks the per-TA `supportedNssaiAvailabilityData` entries of each
+    /// stored doc so the TAI -> S-NSSAI association is preserved (an AMF may
+    /// support different slices in different TAs).
     pub fn get_supported_snssai_for_tai(&self, tai: &Tai) -> Vec<SNssai> {
-        let mut result = Vec::new();
+        let mut result: Vec<SNssai> = Vec::new();
         if let Ok(avail) = self.nssai_availability.read() {
             for info in avail.values() {
-                let tai_match = info.tai_list.iter().any(|t| {
-                    t.plmn_id.mcc == tai.plmn_id.mcc
-                        && t.plmn_id.mnc == tai.plmn_id.mnc
-                        && t.tac == tai.tac
-                });
-                if tai_match {
-                    for snssai in &info.supported_snssai_list {
-                        if !result
-                            .iter()
-                            .any(|s: &SNssai| s.sst == snssai.sst && s.sd == snssai.sd)
-                        {
-                            result.push(snssai.clone());
+                for (entry_tais, entry_snssais) in availability_entries(&info.doc) {
+                    if entry_tais.iter().any(|t| tai_eq(t, tai)) {
+                        for snssai in entry_snssais {
+                            if !result.contains(&snssai) {
+                                result.push(snssai);
+                            }
                         }
                     }
                 }
@@ -581,6 +811,108 @@ mod tests {
 
         let s3 = SNssai::from_sst_sd(1, 0xFFFFFF);
         assert_eq!(s3.sd, None);
+    }
+
+    #[test]
+    fn test_nsi_id_is_uuid_not_sequential() {
+        let mut ctx = NssfContext::new();
+        ctx.init(100);
+        let a = ctx.nsi_add("http://nrf", 1, None).unwrap();
+        let b = ctx.nsi_add("http://nrf", 2, None).unwrap();
+        // UUID v4 string form: 36 chars with 4 hyphens
+        assert_eq!(a.nsi_id.len(), 36);
+        assert_eq!(a.nsi_id.matches('-').count(), 4);
+        assert_ne!(a.nsi_id, b.nsi_id);
+        assert!(
+            a.nsi_id.parse::<u64>().is_err(),
+            "nsiId must not be a pool index"
+        );
+    }
+
+    #[test]
+    fn test_subscription_store() {
+        let mut ctx = NssfContext::new();
+        ctx.init(100);
+
+        let tai = Tai {
+            plmn_id: PlmnId::new("999", "70"),
+            tac: 200,
+        };
+        let sub = NssfSubscription {
+            subscription_id: "sub-1".to_string(),
+            nf_nssai_availability_uri: "http://127.0.0.1:9999/cb".to_string(),
+            tai_list: vec![tai.clone()],
+            event: "SNSSAI_STATUS_CHANGE_REPORT".to_string(),
+            expiry: None,
+            amf_id: None,
+            amf_set_id: None,
+        };
+        ctx.subscription_add(sub);
+        assert_eq!(ctx.subscription_count(), 1);
+        assert!(ctx.subscription_get("sub-1").is_some());
+
+        // Matching: same TAI matches, different TAC does not
+        assert_eq!(
+            ctx.subscriptions_matching(std::slice::from_ref(&tai)).len(),
+            1
+        );
+        let other = Tai {
+            plmn_id: PlmnId::new("999", "70"),
+            tac: 999,
+        };
+        assert!(ctx.subscriptions_matching(&[other]).is_empty());
+
+        assert!(ctx.subscription_remove("sub-1"));
+        assert!(!ctx.subscription_remove("sub-1"));
+    }
+
+    #[test]
+    fn test_availability_entries_per_ta() {
+        let doc = serde_json::json!({
+            "supportedNssaiAvailabilityData": [
+                {
+                    "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "000001"},
+                    "supportedSnssaiList": [{"sst": 1}]
+                },
+                {
+                    "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "000002"},
+                    "supportedSnssaiList": [{"sst": 2, "sd": "0a0b0c"}]
+                }
+            ]
+        });
+        let entries = availability_entries(&doc);
+        assert_eq!(entries.len(), 2);
+
+        // get_supported_snssai_for_tai must NOT flatten across TAs
+        let mut ctx = NssfContext::new();
+        ctx.init(100);
+        ctx.set_nssai_availability("amf-x", availability_info_from_doc("amf-x", doc));
+        let tai1 = Tai {
+            plmn_id: PlmnId::new("999", "70"),
+            tac: 1,
+        };
+        let supported = ctx.get_supported_snssai_for_tai(&tai1);
+        assert_eq!(supported, vec![SNssai::new(1, None)]);
+    }
+
+    #[test]
+    fn test_snssai_tai_json_roundtrip() {
+        let s = SNssai::new(7, Some(0x0A0B0C));
+        let parsed = snssai_from_json(&snssai_to_json(&s)).unwrap();
+        assert_eq!(parsed, s);
+
+        let t = Tai {
+            plmn_id: PlmnId::new("001", "01"),
+            tac: 0xABC,
+        };
+        let parsed = tai_from_json(&tai_to_json(&t)).unwrap();
+        assert_eq!(parsed.tac, 0xABC);
+        assert_eq!(parsed.plmn_id.mcc, "001");
+
+        // Invalid inputs are rejected, not defaulted
+        assert!(snssai_from_json(&serde_json::json!({"sd": "010203"})).is_none());
+        assert!(snssai_from_json(&serde_json::json!({"sst": 1, "sd": 42})).is_none());
+        assert!(tai_from_json(&serde_json::json!({"tac": "000001"})).is_none());
     }
 
     #[test]

@@ -144,7 +144,7 @@ pub fn ausf_nudm_ueau_build_auth_removal_ind(ausf_ue_id: u64) -> Option<SbiReque
 }
 
 /// Get current timestamp in ISO 8601 format
-fn get_current_timestamp() -> String {
+pub fn get_current_timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let duration = SystemTime::now()

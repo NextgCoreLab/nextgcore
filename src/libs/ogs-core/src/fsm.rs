@@ -161,12 +161,11 @@ impl<S, E> OgsFsm<S, E> {
         self.state = None;
     }
 
-    /// Check current state (identical to OGS_FSM_CHECK macro)
-    /// Note: Function pointer comparison may not be reliable across compilation units
-    #[allow(unpredictable_function_pointer_comparisons)]
-    pub fn check(&self, target: OgsFsmHandler<S, E>) -> bool {
-        self.state == Some(target)
-    }
+    // NOTE: The legacy `check()` method (OGS_FSM_CHECK macro) was removed — it
+    // compared function pointers, which is unreliable in optimised builds (LLVM
+    // may merge identical functions), so it could silently return the wrong
+    // answer. Use the [`StateMachine`] trait's enum-based `is_in()` instead, or
+    // compare `get_state()` explicitly if you must stay on the deprecated FSM.
 
     /// Get current state (identical to OGS_FSM_STATE macro)
     #[inline]
@@ -377,19 +376,6 @@ mod tests {
 
         assert!(!fsm.has_state());
         assert!(ctx.transitions.borrow().contains(&"fini".to_string()));
-    }
-
-    #[test]
-    fn test_fsm_check() {
-        let mut fsm: OgsFsm<TestContext, TestEvent> = OgsFsm::new();
-
-        fsm.tran(state_a);
-        assert!(fsm.check(state_a));
-        assert!(!fsm.check(state_b));
-
-        fsm.tran(state_b);
-        assert!(!fsm.check(state_a));
-        assert!(fsm.check(state_b));
     }
 
     #[test]

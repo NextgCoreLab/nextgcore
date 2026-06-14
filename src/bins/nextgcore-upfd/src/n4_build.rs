@@ -149,6 +149,26 @@ pub mod pfcp_ie {
     pub const FRAMED_IPV6_ROUTE: u16 = 155;
     pub const APN_DNN: u16 = 159;
     pub const PFCPSEREQ_FLAGS: u16 = 186;
+    /// PFCPSMReq-Flags (TS 29.244 8.2.50): DROBU / SNDEM / QAURR
+    pub const PFCPSMREQ_FLAGS: u16 = 49;
+    /// Downlink Data Notification Delay (TS 29.244 8.2.28)
+    pub const DOWNLINK_DATA_NOTIFICATION_DELAY: u16 = 46;
+    /// Update BAR within Session Modification Request (TS 29.244 7.5.4.11)
+    pub const UPDATE_BAR: u16 = 86;
+    /// UR-SEQN (TS 29.244 8.2.60)
+    pub const UR_SEQN: u16 = 104;
+    /// Suggested Buffering Packets Count (TS 29.244 8.2.103)
+    pub const SUGGESTED_BUFFERING_PACKETS_COUNT: u16 = 140;
+}
+
+/// PFCPSMReq-Flags bit values (TS 29.244 8.2.50)
+pub mod pfcpsmreq_flags {
+    /// DROBU — drop buffered packets
+    pub const DROBU: u8 = 0x01;
+    /// SNDEM — send End Marker packets
+    pub const SNDEM: u8 = 0x02;
+    /// QAURR — query all URRs
+    pub const QAURR: u8 = 0x04;
 }
 
 // ============================================================================
@@ -972,11 +992,21 @@ impl ParsedFTeid {
         let chid = (flags & 0x08) != 0;
 
         let mut cursor = &data[1..];
-        if cursor.len() < 4 {
-            return Err("F-TEID too short for TEID");
-        }
-        let teid = u32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
-        cursor = &cursor[4..];
+
+        // TS 29.244 8.2.3: when the CH (CHOOSE) flag is set the SMF is asking
+        // the UPF to allocate the F-TEID, so the TEID and address fields are
+        // omitted on the wire (only the optional CHOOSE ID may follow). Only
+        // read the TEID/addresses when CH is clear.
+        let teid = if ch {
+            0
+        } else {
+            if cursor.len() < 4 {
+                return Err("F-TEID too short for TEID");
+            }
+            let t = u32::from_be_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]);
+            cursor = &cursor[4..];
+            t
+        };
 
         let ipv4 = if v4 && !ch {
             if cursor.len() < 4 {
@@ -1630,6 +1660,32 @@ pub fn build_heartbeat_response(recovery_time_stamp: u32) -> Vec<u8> {
     builder.build()
 }
 
+/// Build Heartbeat Request (UPF → SMF direction, TS 29.244 7.4.2)
+pub fn build_heartbeat_request(recovery_time_stamp: u32) -> Vec<u8> {
+    let mut builder = PfcpMessageBuilder::new();
+    builder.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, recovery_time_stamp);
+    builder.build()
+}
+
+/// UP Function Features actually implemented by this UPF.
+///
+/// Only features with working code paths are advertised (TS 29.244 8.2.25):
+/// - FTUP: F-TEID allocation in the UP function (CHOOSE flag handling)
+/// - EMPU: sending of End Marker packets
+///
+/// Encoded with the ogs-pfcp library codec (full 8 feature octets).
+pub fn upf_function_features() -> Vec<u8> {
+    use bytes::BytesMut;
+    let features = ogs_pfcp::types::UpFunctionFeatures {
+        ftup: true,
+        empu: true,
+        ..Default::default()
+    };
+    let mut buf = BytesMut::with_capacity(ogs_pfcp::types::UpFunctionFeatures::ENCODED_LEN);
+    features.encode(&mut buf);
+    buf.to_vec()
+}
+
 /// Build Association Setup Response
 pub fn build_association_setup_response(
     node_id: &NodeId,
@@ -1640,10 +1696,88 @@ pub fn build_association_setup_response(
     builder.add_node_id(node_id);
     builder.add_cause(cause);
     builder.add_u32(pfcp_ie::RECOVERY_TIME_STAMP, recovery_time_stamp);
-    // Add UP Function Features (simplified)
-    let features: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
-    builder.add_tlv(pfcp_ie::UP_FUNCTION_FEATURES, &features);
+    // UP Function Features — only the bits this UPF really implements
+    builder.add_tlv(pfcp_ie::UP_FUNCTION_FEATURES, &upf_function_features());
     builder.build()
+}
+
+/// Build Association Release Response (TS 29.244 7.4.4.2): Node ID + Cause
+pub fn build_association_release_response(node_id: &NodeId, cause: PfcpCause) -> Vec<u8> {
+    let mut builder = PfcpMessageBuilder::new();
+    builder.add_node_id(node_id);
+    builder.add_cause(cause);
+    builder.build()
+}
+
+/// Build a failure response body: Cause + Offending IE (TS 29.244 7.5.3/7.5.5)
+pub fn build_failure_response(cause: PfcpCause, offending_ie: Option<u16>) -> Vec<u8> {
+    let mut builder = PfcpMessageBuilder::new();
+    builder.add_cause(cause);
+    if let Some(ie_type) = offending_ie {
+        builder.add_u16(pfcp_ie::OFFENDING_IE, ie_type);
+    }
+    builder.build()
+}
+
+/// Parse the Recovery Time Stamp IE out of a node-level message payload.
+pub fn parse_recovery_time_stamp(payload: &[u8]) -> Option<u32> {
+    let ies = ParsedIe::parse_all(payload);
+    ParsedIe::find_ie(&ies, pfcp_ie::RECOVERY_TIME_STAMP).and_then(|ie| {
+        if ie.value.len() >= 4 {
+            Some(u32::from_be_bytes([
+                ie.value[0],
+                ie.value[1],
+                ie.value[2],
+                ie.value[3],
+            ]))
+        } else {
+            None
+        }
+    })
+}
+
+/// Parsed Create/Update BAR (TS 29.244 7.5.2.6)
+#[derive(Debug, Clone, Default)]
+pub struct ParsedCreateBar {
+    pub bar_id: u8,
+    pub suggested_buffering_packets_count: Option<u8>,
+    pub ddn_delay: Option<u8>,
+}
+
+/// Parse a Create BAR / Update BAR grouped IE
+pub fn parse_create_bar(data: &[u8]) -> Result<ParsedCreateBar, &'static str> {
+    let ies = ParsedIe::parse_all(data);
+    let mut bar = ParsedCreateBar::default();
+
+    // BAR ID (mandatory)
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::BAR_ID) {
+        if ie.value.is_empty() {
+            return Err("BAR ID empty");
+        }
+        bar.bar_id = ie.value[0];
+    } else {
+        return Err("BAR ID missing");
+    }
+
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::SUGGESTED_BUFFERING_PACKETS_COUNT) {
+        if !ie.value.is_empty() {
+            bar.suggested_buffering_packets_count = Some(ie.value[0]);
+        }
+    }
+    if let Some(ie) = ParsedIe::find_ie(&ies, pfcp_ie::DOWNLINK_DATA_NOTIFICATION_DELAY) {
+        if !ie.value.is_empty() {
+            bar.ddn_delay = Some(ie.value[0]);
+        }
+    }
+
+    Ok(bar)
+}
+
+/// Parse the PFCPSMReq-Flags IE (TS 29.244 8.2.50) from a message payload.
+/// Returns the raw flags byte (DROBU/SNDEM/QAURR) or None when absent.
+pub fn parse_pfcpsmreq_flags(payload: &[u8]) -> Option<u8> {
+    let ies = ParsedIe::parse_all(payload);
+    ParsedIe::find_ie(&ies, pfcp_ie::PFCPSMREQ_FLAGS).and_then(|ie| ie.value.first().copied())
 }
 
 // ============================================================================
@@ -1996,5 +2130,90 @@ mod tests {
         let pdi = parse_pdi(&pdi_data).unwrap();
         assert_eq!(pdi.source_interface, 0);
         assert!(pdi.sdf_flow_description.is_none());
+    }
+
+    // -- Uplink F-TEID allocation round-trip (CH / teid==0 request) --
+
+    /// A CH=1 (CHOOSE) request F-TEID omits the TEID and address fields on the
+    /// wire (TS 29.244 8.2.3); the UPF parser must accept it without error.
+    #[test]
+    fn test_parse_f_teid_choose_flag_no_teid_bytes() {
+        // flags = CH (0x04) only, no TEID / address bytes follow.
+        let data = [0x04u8];
+        let fteid = ParsedFTeid::parse(&data).expect("CH=1 F-TEID must parse");
+        assert!(fteid.ch);
+        assert_eq!(fteid.teid, 0);
+        assert!(fteid.ipv4.is_none());
+    }
+
+    /// CH + CHID: CHOOSE ID byte follows the flags, still no TEID/address.
+    #[test]
+    fn test_parse_f_teid_choose_with_choose_id() {
+        let data = [0x0Cu8, 0x07]; // CH (0x04) | CHID (0x08), choose_id = 7
+        let fteid = ParsedFTeid::parse(&data).expect("CH+CHID F-TEID must parse");
+        assert!(fteid.ch);
+        assert!(fteid.chid);
+        assert_eq!(fteid.choose_id, Some(7));
+        assert_eq!(fteid.teid, 0);
+    }
+
+    /// Our SMF signals "UPF allocates" with a concrete-looking F-TEID whose
+    /// TEID is 0 (flags = 0, teid = 0). The parser must yield teid == 0 so the
+    /// establishment handler triggers allocation.
+    #[test]
+    fn test_parse_f_teid_zero_teid_request() {
+        let data = [0x00u8, 0x00, 0x00, 0x00, 0x00]; // flags=0, teid=0
+        let fteid = ParsedFTeid::parse(&data).expect("teid=0 F-TEID must parse");
+        assert!(!fteid.ch);
+        assert_eq!(fteid.teid, 0);
+    }
+
+    /// End-to-end: a "please allocate" request F-TEID yields a Created PDR
+    /// carrying a non-zero allocated Local F-TEID (CH=0, real TEID + IPv4)
+    /// that the SMF-side decoder accepts.
+    #[test]
+    fn test_uplink_alloc_round_trip_created_pdr() {
+        // 1. SMF sends an uplink PDI F-TEID asking the UPF to allocate.
+        let req = [0x04u8]; // CH=1
+        let parsed = ParsedFTeid::parse(&req).unwrap();
+        assert!(parsed.ch || parsed.teid == 0, "should request allocation");
+
+        // 2. UPF allocates a fresh non-zero TEID + its N3 GTP-U address and
+        //    builds a Created PDR (this mirrors the establishment handler).
+        let allocated_teid: u32 = 0x10001;
+        let upf_n3 = Ipv4Addr::new(172, 23, 0, 7);
+        let created = CreatedPdr {
+            pdr_id: 1,
+            local_f_teid: Some(FTeid {
+                teid: allocated_teid,
+                ipv4: Some(upf_n3),
+                ipv6: None,
+                choose: false,
+                choose_id: None,
+            }),
+            ue_ip_address: None,
+        };
+        let mut builder = PfcpMessageBuilder::new();
+        builder.add_created_pdr(&created);
+        let created_pdr_ie_value = builder.build();
+
+        // 3. Decode exactly as the SMF does: find inner F-TEID (type 21),
+        //    require non-zero TEID and an IPv4 (V4 flag 0x02). The outer bytes
+        //    here are the Created PDR IE itself (type 8).
+        let ies = ParsedIe::parse_all(&created_pdr_ie_value);
+        let created_ie =
+            ParsedIe::find_ie(&ies, pfcp_ie::CREATED_PDR).expect("Created PDR IE must be present");
+        let inner = ParsedIe::parse_all(&created_ie.value);
+        let fteid_ie =
+            ParsedIe::find_ie(&inner, pfcp_ie::F_TEID).expect("Created PDR must carry an F-TEID");
+        let fteid_val = &fteid_ie.value;
+        assert!(fteid_val.len() >= 5);
+        let flags = fteid_val[0];
+        let teid = u32::from_be_bytes(fteid_val[1..5].try_into().unwrap());
+        assert_ne!(teid, 0, "SMF requires a non-zero allocated F-TEID");
+        assert_eq!(teid, allocated_teid);
+        assert_eq!(flags & 0x04, 0, "response F-TEID must have CH cleared");
+        assert_ne!(flags & 0x02, 0, "response F-TEID must carry IPv4");
+        assert_eq!(&fteid_val[5..9], &upf_n3.octets());
     }
 }
