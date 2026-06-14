@@ -417,6 +417,25 @@ pub fn build_registration_reject(gmm_cause: GmmCause) -> Vec<u8> {
     builder.build()
 }
 
+/// Build Security Mode Reject message (TS 24.501 Section 8.2.27).
+///
+/// Sent as a plain NAS message when the AMF aborts the security-mode procedure,
+/// e.g. on detection of a UE-security-capabilities mismatch / bidding-down
+/// attack (TS 33.501 Section 6.7.2 → 5GMM cause #23).
+pub fn build_security_mode_reject(gmm_cause: GmmCause) -> Vec<u8> {
+    let mut builder = NasMessageBuilder::new();
+
+    // GMM header (plain NAS message)
+    builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
+    builder.write_u8(security_header::PLAIN_NAS_MESSAGE);
+    builder.write_message_type(message_type::SECURITY_MODE_REJECT);
+
+    // 5GMM cause (mandatory)
+    builder.write_u8(gmm_cause as u8);
+
+    builder.build()
+}
+
 /// Build Service Accept message (plain inner; wrap with nas_5gs_security_encode)
 pub fn build_service_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
     let mut builder = NasMessageBuilder::new();

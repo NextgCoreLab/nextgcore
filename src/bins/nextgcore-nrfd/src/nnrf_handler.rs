@@ -4,6 +4,7 @@
 
 use crate::nf_sm::{nrf_nf_fsm_fini, nrf_nf_fsm_init, NfSmContext, NfState};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 /// NF Profile data structure
@@ -290,6 +291,11 @@ pub enum HandlerResult {
 }
 
 /// NF Instance manager
+///
+/// When a `state_path` is configured, registered NFProfiles and subscriptions
+/// are snapshotted to a JSON file on every change (atomic temp+rename) and
+/// reloaded on startup, so they survive an NRF restart. With no path the
+/// manager is purely in-memory (the previous behaviour and the E2E default).
 pub struct NfInstanceManager {
     /// NF instances by ID (state machine context)
     instances: RwLock<HashMap<String, NfSmContext>>,
@@ -297,15 +303,124 @@ pub struct NfInstanceManager {
     profiles: RwLock<HashMap<String, NfProfile>>,
     /// Subscriptions by ID
     subscriptions: RwLock<HashMap<String, SubscriptionData>>,
+    /// Optional on-disk snapshot path. `None` => purely in-memory.
+    state_path: Option<PathBuf>,
 }
 
 impl NfInstanceManager {
-    /// Create a new NF instance manager
+    /// Create a new in-memory NF instance manager (no persistence).
     pub fn new() -> Self {
         Self {
             instances: RwLock::new(HashMap::new()),
             profiles: RwLock::new(HashMap::new()),
             subscriptions: RwLock::new(HashMap::new()),
+            state_path: None,
+        }
+    }
+
+    /// Create a manager that snapshots to `path`, loading any prior state.
+    pub fn with_state_path(path: impl Into<PathBuf>) -> Self {
+        let mut mgr = Self::new();
+        mgr.state_path = Some(path.into());
+        mgr.load();
+        mgr
+    }
+
+    // -- persistence -------------------------------------------------------
+
+    /// Serialize registered profiles (full NFProfile docs, reflecting live
+    /// status) and subscriptions to a single snapshot document.
+    fn snapshot(&self) -> serde_json::Value {
+        let profiles: Vec<serde_json::Value> = self
+            .profiles
+            .read()
+            .map(|p| p.values().map(|prof| prof.to_json()).collect())
+            .unwrap_or_default();
+        let subscriptions: Vec<serde_json::Value> = self
+            .subscriptions
+            .read()
+            .map(|s| s.values().map(subscription_to_json).collect())
+            .unwrap_or_default();
+        serde_json::json!({
+            "version": 1,
+            "profiles": profiles,
+            "subscriptions": subscriptions,
+        })
+    }
+
+    /// Persist the current manager state. No-op without a configured path.
+    fn persist(&self) {
+        let Some(path) = self.state_path.as_ref() else {
+            return;
+        };
+        let doc = self.snapshot();
+        if let Err(e) = write_atomic(path, &doc) {
+            log::warn!("NRF state persist to {} failed: {e}", path.display());
+        }
+    }
+
+    /// Load state from the configured path (no-op when unset/not-yet-created).
+    fn load(&mut self) {
+        let Some(path) = self.state_path.clone() else {
+            return;
+        };
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                log::warn!("NRF state load from {} failed: {e}", path.display());
+                return;
+            }
+        };
+        let doc: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("NRF state file {} is not valid JSON: {e}", path.display());
+                return;
+            }
+        };
+        self.restore_from(&doc);
+    }
+
+    /// Restore profiles (re-instantiating their FSMs) and subscriptions from a
+    /// snapshot document. Tolerates malformed entries (skips them).
+    fn restore_from(&self, doc: &serde_json::Value) {
+        if let Some(arr) = doc.get("profiles").and_then(|v| v.as_array()) {
+            for pd in arr {
+                let Ok(mut profile) = NfProfile::from_json(pd) else {
+                    log::warn!("Skipping malformed persisted NFProfile");
+                    continue;
+                };
+                // Preserve the live status that `to_json` folded back in.
+                if let Some(status) = pd.get("nfStatus").and_then(|v| v.as_str()) {
+                    profile.nf_status = status.to_string();
+                }
+                let id = profile.nf_instance_id.clone();
+                if id.is_empty() {
+                    continue;
+                }
+                // Re-create the per-instance FSM and store the profile without
+                // re-persisting (we are loading, not mutating).
+                if let Ok(mut instances) = self.instances.write() {
+                    if !instances.contains_key(&id) {
+                        let mut ctx = NfSmContext::new(id.clone());
+                        nrf_nf_fsm_init(&mut ctx);
+                        instances.insert(id.clone(), ctx);
+                    }
+                }
+                if let Ok(mut profiles) = self.profiles.write() {
+                    profiles.insert(id, profile);
+                }
+            }
+        }
+        if let Some(arr) = doc.get("subscriptions").and_then(|v| v.as_array()) {
+            for sd in arr {
+                if let Some(sub) = subscription_from_json(sd) {
+                    if let Ok(mut subs) = self.subscriptions.write() {
+                        subs.insert(sub.id.clone(), sub);
+                    }
+                }
+            }
         }
     }
 
@@ -332,17 +447,26 @@ impl NfInstanceManager {
 
     /// Remove an NF instance
     pub fn remove_instance(&self, id: &str) -> bool {
-        if let Ok(mut instances) = self.instances.write() {
-            if let Some(mut ctx) = instances.remove(id) {
-                nrf_nf_fsm_fini(&mut ctx);
-                // Also remove profile
-                if let Ok(mut profiles) = self.profiles.write() {
-                    profiles.remove(id);
+        let removed = {
+            if let Ok(mut instances) = self.instances.write() {
+                if let Some(mut ctx) = instances.remove(id) {
+                    nrf_nf_fsm_fini(&mut ctx);
+                    // Also remove profile
+                    if let Ok(mut profiles) = self.profiles.write() {
+                        profiles.remove(id);
+                    }
+                    true
+                } else {
+                    false
                 }
-                return true;
+            } else {
+                false
             }
+        };
+        if removed {
+            self.persist();
         }
-        false
+        removed
     }
 
     /// Get instance count
@@ -358,8 +482,16 @@ impl NfInstanceManager {
         self.add_instance(id.clone());
 
         // Store profile
-        if let Ok(mut profiles) = self.profiles.write() {
-            profiles.insert(id, profile);
+        let stored = {
+            if let Ok(mut profiles) = self.profiles.write() {
+                profiles.insert(id, profile);
+                true
+            } else {
+                false
+            }
+        };
+        if stored {
+            self.persist();
             Ok(())
         } else {
             Err("Failed to acquire write lock".to_string())
@@ -380,34 +512,56 @@ impl NfInstanceManager {
     /// The NF is not deregistered yet - it will be auto-deregistered if no
     /// heartbeat is received within the grace period.
     pub fn suspend(&self, id: &str) -> bool {
-        if let Ok(mut profiles) = self.profiles.write() {
-            if let Some(profile) = profiles.get_mut(id) {
-                log::warn!(
-                    "[{}] NF status: {} -> SUSPENDED (missed heartbeat)",
-                    id,
-                    profile.nf_status
-                );
-                profile.nf_status = "SUSPENDED".to_string();
-                return true;
+        let changed = {
+            if let Ok(mut profiles) = self.profiles.write() {
+                if let Some(profile) = profiles.get_mut(id) {
+                    log::warn!(
+                        "[{}] NF status: {} -> SUSPENDED (missed heartbeat)",
+                        id,
+                        profile.nf_status
+                    );
+                    profile.nf_status = "SUSPENDED".to_string();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
             }
+        };
+        if changed {
+            self.persist();
         }
-        false
+        changed
     }
 
     /// Reactivate a SUSPENDED NF (heartbeat received within grace period, TS 29.510)
     ///
     /// Returns true only if the NF was SUSPENDED and is now REGISTERED again.
     pub fn reactivate(&self, id: &str) -> bool {
-        if let Ok(mut profiles) = self.profiles.write() {
-            if let Some(profile) = profiles.get_mut(id) {
-                if profile.nf_status == "SUSPENDED" {
-                    log::info!("[{id}] NF status: SUSPENDED -> REGISTERED (heartbeat received)");
-                    profile.nf_status = "REGISTERED".to_string();
-                    return true;
+        let changed = {
+            if let Ok(mut profiles) = self.profiles.write() {
+                if let Some(profile) = profiles.get_mut(id) {
+                    if profile.nf_status == "SUSPENDED" {
+                        log::info!(
+                            "[{id}] NF status: SUSPENDED -> REGISTERED (heartbeat received)"
+                        );
+                        profile.nf_status = "REGISTERED".to_string();
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
                 }
+            } else {
+                false
             }
+        };
+        if changed {
+            self.persist();
         }
-        false
+        changed
     }
 
     /// Check if an NF is suspended
@@ -436,12 +590,18 @@ impl NfInstanceManager {
 
     /// Add a subscription
     pub fn add_subscription(&self, subscription: SubscriptionData) -> bool {
-        if let Ok(mut subscriptions) = self.subscriptions.write() {
-            subscriptions.insert(subscription.id.clone(), subscription);
-            true
-        } else {
-            false
+        let added = {
+            if let Ok(mut subscriptions) = self.subscriptions.write() {
+                subscriptions.insert(subscription.id.clone(), subscription);
+                true
+            } else {
+                false
+            }
+        };
+        if added {
+            self.persist();
         }
+        added
     }
 
     /// Find a subscription by ID
@@ -452,11 +612,17 @@ impl NfInstanceManager {
 
     /// Remove a subscription
     pub fn remove_subscription(&self, id: &str) -> bool {
-        if let Ok(mut subscriptions) = self.subscriptions.write() {
-            subscriptions.remove(id).is_some()
-        } else {
-            false
+        let removed = {
+            if let Ok(mut subscriptions) = self.subscriptions.write() {
+                subscriptions.remove(id).is_some()
+            } else {
+                false
+            }
+        };
+        if removed {
+            self.persist();
         }
+        removed
     }
 
     /// Get subscription count
@@ -483,8 +649,86 @@ impl NfInstanceManager {
                 }
             }
         }
+        if removed > 0 {
+            self.persist();
+        }
         removed
     }
+}
+
+/// Serialize a `SubscriptionData` to JSON for the on-disk snapshot.
+fn subscription_to_json(sub: &SubscriptionData) -> serde_json::Value {
+    let mut obj = serde_json::json!({
+        "id": sub.id,
+        "notificationUri": sub.notification_uri,
+        "validityDuration": sub.validity_duration,
+    });
+    let map = obj.as_object_mut().expect("object");
+    if let Some(ref t) = sub.req_nf_type {
+        map.insert("reqNfType".into(), t.clone().into());
+    }
+    if let Some(ref iid) = sub.req_nf_instance_id {
+        map.insert("reqNfInstanceId".into(), iid.clone().into());
+    }
+    if let Some(ref cond) = sub.subscr_cond {
+        let mut c = serde_json::Map::new();
+        if let Some(ref v) = cond.nf_type {
+            c.insert("nfType".into(), v.clone().into());
+        }
+        if let Some(ref v) = cond.service_name {
+            c.insert("serviceName".into(), v.clone().into());
+        }
+        if let Some(ref v) = cond.nf_instance_id {
+            c.insert("nfInstanceId".into(), v.clone().into());
+        }
+        map.insert("subscrCond".into(), serde_json::Value::Object(c));
+    }
+    obj
+}
+
+/// Reconstruct a `SubscriptionData` from a persisted JSON object.
+fn subscription_from_json(v: &serde_json::Value) -> Option<SubscriptionData> {
+    let id = v.get("id")?.as_str()?.to_string();
+    let notification_uri = v.get("notificationUri")?.as_str()?.to_string();
+    let validity_duration = v
+        .get("validityDuration")
+        .and_then(|d| d.as_u64())
+        .unwrap_or(0);
+    let str_at = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|s| s.to_string());
+    let subscr_cond = v.get("subscrCond").map(|c| SubscrCond {
+        nf_type: c.get("nfType").and_then(|x| x.as_str()).map(String::from),
+        service_name: c
+            .get("serviceName")
+            .and_then(|x| x.as_str())
+            .map(String::from),
+        nf_instance_id: c
+            .get("nfInstanceId")
+            .and_then(|x| x.as_str())
+            .map(String::from),
+    });
+    Some(SubscriptionData {
+        id,
+        req_nf_type: str_at("reqNfType"),
+        req_nf_instance_id: str_at("reqNfInstanceId"),
+        notification_uri,
+        subscr_cond,
+        validity_duration,
+    })
+}
+
+/// Atomically write `doc` to `path` (temp file + rename) so a crash mid-write
+/// cannot leave a truncated snapshot. Creates parent directories as needed.
+fn write_atomic(path: &Path, doc: &serde_json::Value) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let serialized = serde_json::to_vec_pretty(doc)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &serialized)?;
+    std::fs::rename(&tmp, path)
 }
 
 impl Default for NfInstanceManager {
@@ -497,10 +741,27 @@ impl Default for NfInstanceManager {
 static GLOBAL_NF_MANAGER: std::sync::OnceLock<Arc<NfInstanceManager>> = std::sync::OnceLock::new();
 
 /// Get the global NF instance manager
+///
+/// Lazily initialises a purely in-memory manager when [`init_nf_manager`] has
+/// not been called, preserving the previous behaviour.
 pub fn nf_manager() -> Arc<NfInstanceManager> {
     GLOBAL_NF_MANAGER
         .get_or_init(|| Arc::new(NfInstanceManager::new()))
         .clone()
+}
+
+/// Initialise the global NF instance manager with an on-disk snapshot path,
+/// restoring any previously persisted profiles/subscriptions. Must be called
+/// before the first [`nf_manager`] use to take effect; returns `false` if the
+/// manager was already initialised.
+///
+/// Passing `None` leaves the manager purely in-memory (the default).
+pub fn init_nf_manager(state_path: Option<PathBuf>) -> bool {
+    let mgr = match state_path {
+        Some(p) => NfInstanceManager::with_state_path(p),
+        None => NfInstanceManager::new(),
+    };
+    GLOBAL_NF_MANAGER.set(Arc::new(mgr)).is_ok()
 }
 
 /// Handle NF registration (PUT /nf-instances/{nfInstanceId})
@@ -1763,5 +2024,132 @@ mod tests {
         manager.deregister(smf_id).ok();
         manager.deregister(upf_id).ok();
         manager.deregister(suspended_id).ok();
+    }
+
+    fn temp_state_path(tag: &str) -> PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("nrfd-test-{tag}-{pid}-{nanos}.json"))
+    }
+
+    /// Register a profile + a subscription on a persisting manager, then re-open
+    /// from the same file (simulated restart) and confirm both are retained,
+    /// including the full NFProfile attributes (services / PLMNs / addresses).
+    #[test]
+    fn test_nrf_persistence_survives_restart() {
+        let path = temp_state_path("restart");
+        let _ = std::fs::remove_file(&path);
+
+        let doc = serde_json::json!({
+            "nfInstanceId": "11111111-1111-1111-1111-111111111111",
+            "nfType": "SMF",
+            "nfStatus": "REGISTERED",
+            "heartBeatTimer": 10,
+            "plmnList": [{"mcc": "001", "mnc": "01"}],
+            "ipv4Addresses": ["10.0.0.5"],
+            "fqdn": "smf.example.com",
+            "nfServices": [{
+                "serviceInstanceId": "smf-svc-1",
+                "serviceName": "nsmf-pdusession",
+                "versions": [{"apiVersionInUri": "v1"}],
+                "scheme": "http"
+            }]
+        });
+        let profile = NfProfile::from_json(&doc).expect("valid profile");
+
+        // First lifetime: register + subscribe, then drop the manager.
+        {
+            let mgr = NfInstanceManager::with_state_path(&path);
+            mgr.register(profile.clone()).expect("register");
+            assert!(mgr.add_subscription(SubscriptionData {
+                id: "sub-9".to_string(),
+                req_nf_type: Some("AMF".to_string()),
+                req_nf_instance_id: Some("amf-1".to_string()),
+                notification_uri: "http://amf:8080/cb".to_string(),
+                subscr_cond: Some(SubscrCond {
+                    nf_type: Some("SMF".to_string()),
+                    service_name: Some("nsmf-pdusession".to_string()),
+                    nf_instance_id: None,
+                }),
+                validity_duration: 3600,
+            }));
+        }
+
+        // Second lifetime: a fresh manager re-opened from the same file.
+        {
+            let mgr = NfInstanceManager::with_state_path(&path);
+            let restored = mgr
+                .get("11111111-1111-1111-1111-111111111111")
+                .expect("profile retained across restart");
+            assert_eq!(restored.nf_type, "SMF");
+            assert_eq!(restored.nf_status, "REGISTERED");
+            assert_eq!(restored.plmn_list.len(), 1);
+            assert_eq!(restored.plmn_list[0].mcc, "001");
+            assert_eq!(restored.ipv4_addresses, vec!["10.0.0.5".to_string()]);
+            assert_eq!(restored.fqdn.as_deref(), Some("smf.example.com"));
+            assert_eq!(restored.nf_services.len(), 1);
+            assert_eq!(restored.nf_services[0].service_name, "nsmf-pdusession");
+            // The verbatim attributes document is preserved too.
+            assert_eq!(
+                restored.attributes.get("nfInstanceId").and_then(|v| v.as_str()),
+                Some("11111111-1111-1111-1111-111111111111")
+            );
+
+            let sub = mgr
+                .find_subscription("sub-9")
+                .expect("subscription retained across restart");
+            assert_eq!(sub.notification_uri, "http://amf:8080/cb");
+            assert_eq!(sub.req_nf_type.as_deref(), Some("AMF"));
+            assert_eq!(
+                sub.subscr_cond.as_ref().and_then(|c| c.service_name.as_deref()),
+                Some("nsmf-pdusession")
+            );
+            assert_eq!(sub.validity_duration, 3600);
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A deregistration must also be persisted (restart must not resurrect it).
+    #[test]
+    fn test_nrf_persistence_deregister_survives_restart() {
+        let path = temp_state_path("deregister");
+        let _ = std::fs::remove_file(&path);
+        let doc = serde_json::json!({
+            "nfInstanceId": "22222222-2222-2222-2222-222222222222",
+            "nfType": "UPF",
+            "nfStatus": "REGISTERED"
+        });
+        let profile = NfProfile::from_json(&doc).expect("valid");
+        {
+            let mgr = NfInstanceManager::with_state_path(&path);
+            mgr.register(profile).expect("register");
+            assert!(mgr.deregister("22222222-2222-2222-2222-222222222222").is_ok());
+        }
+        {
+            let mgr = NfInstanceManager::with_state_path(&path);
+            assert!(
+                mgr.get("22222222-2222-2222-2222-222222222222").is_none(),
+                "deregistered NF must not reappear after restart"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// No path configured => no file written, manager stays in-memory.
+    #[test]
+    fn test_nrf_no_path_is_pure_memory() {
+        let mgr = NfInstanceManager::new();
+        let doc = serde_json::json!({
+            "nfInstanceId": "33333333-3333-3333-3333-333333333333",
+            "nfType": "PCF",
+            "nfStatus": "REGISTERED"
+        });
+        mgr.register(NfProfile::from_json(&doc).unwrap()).unwrap();
+        mgr.persist(); // no-op without a path
+        assert!(mgr.state_path.is_none());
     }
 }

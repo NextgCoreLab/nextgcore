@@ -102,6 +102,12 @@ struct Args {
     /// (format <MCC>-<MNC>-<RegionId>-<SetId>, TS 29.531 targetAmfSet)
     #[arg(long)]
     target_amf_set: Option<String>,
+
+    /// Path to the JSON snapshot file for NSSAI-availability subscriptions and
+    /// availability data. When unset (the default) these are purely in-memory
+    /// and lost on restart. Also settable via NEXTGCORE_NSSF_STATE_FILE.
+    #[arg(long)]
+    state_file: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +211,27 @@ async fn main() -> Result<()> {
     // Set up signal handlers
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone())?;
+
+    // Initialise the NSSF context, optionally restoring persisted
+    // NSSAI-availability subscriptions and availability data. Path precedence:
+    // --state-file, then NEXTGCORE_NSSF_STATE_FILE. With neither set the
+    // context stays purely in-memory (previous behaviour). This must run before
+    // nssf_context_init() so the persisting context backs the singleton.
+    let nssf_state_file = args
+        .state_file
+        .clone()
+        .or_else(|| std::env::var("NEXTGCORE_NSSF_STATE_FILE").ok())
+        .filter(|s| !s.is_empty());
+    match &nssf_state_file {
+        Some(path) => {
+            nssf_context_init_with_state(Some(std::path::PathBuf::from(path)));
+            log::info!("NSSF availability persistence enabled: {path}");
+        }
+        None => {
+            nssf_context_init_with_state(None);
+            log::info!("NSSF availability persistence disabled (in-memory only)");
+        }
+    }
 
     // Initialize NSSF context
     nssf_context_init(args.max_nf);

@@ -2275,7 +2275,9 @@ impl AmfUe {
             redcap_indication: false,
             snpn_nid: None,
             cag_id: None,
-            slice_admission_granted: true,
+            // Default deny: slice admission is granted only by an explicit
+            // Nnsacf_NSAC admittedFlag=true response (TS 29.536), never assumed.
+            slice_admission_granted: false,
             ursp_rules: Vec::new(),
             prose_capable: false,
             pin_role: None,

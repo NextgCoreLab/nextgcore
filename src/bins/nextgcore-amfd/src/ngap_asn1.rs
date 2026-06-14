@@ -860,6 +860,32 @@ pub fn build_ng_reset_acknowledge_asn1(
     }
 }
 
+/// Build an AMF-initiated OverloadStart (TS 38.413 Section 9.2.6.10) carrying a
+/// percentage traffic-load reduction request (1..99).
+pub fn build_overload_start_asn1(reduce_percent: u8) -> Option<Vec<u8>> {
+    let msg = OverloadStart {
+        traffic_load_reduction: Some(reduce_percent.clamp(1, 99)),
+    };
+    match builder::build_overload_start(&msg) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::error!("Failed to encode OverloadStart: {e:?}");
+            None
+        }
+    }
+}
+
+/// Build an AMF-initiated OverloadStop (TS 38.413 Section 9.2.6.11).
+pub fn build_overload_stop_asn1() -> Option<Vec<u8>> {
+    match builder::build_overload_stop(&OverloadStop {}) {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            log::error!("Failed to encode OverloadStop: {e:?}");
+            None
+        }
+    }
+}
+
 /// Build an APER-encoded PDUSessionResourceSetupRequestTransfer
 /// (TS 38.413 Section 9.3.4.1) carrying the UPF N3 tunnel endpoint.
 ///

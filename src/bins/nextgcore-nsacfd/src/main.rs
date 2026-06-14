@@ -361,15 +361,19 @@ async fn nsacf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 
     match parts.as_slice() {
         // ------------------------------------------------------------------
-        // Nnsacf_NSAC admission control (TS 29.536)
+        // Nnsacf_NSAC admission control (TS 29.536 §6.1.3.2)
+        //
+        // S-NSSAI is carried in the request body (UeACRequestData /
+        // PduSessionACRequestData), NOT in the URI path. Rejection is a 200
+        // response with admittedFlag=false, not an HTTP 4xx.
         // ------------------------------------------------------------------
-        ["nnsacf-nsac", "v1", "slices", snssai_seg, "ues"] => match method {
-            "POST" => handle_ue_ac_update(snssai_seg, &request).await,
-            _ => send_method_not_allowed(method, "slices/{snssai}/ues"),
+        ["nnsacf-nsac", "v1", "slices", "ues"] => match method {
+            "POST" => handle_ue_ac_update(&request).await,
+            _ => send_method_not_allowed(method, "slices/ues"),
         },
-        ["nnsacf-nsac", "v1", "slices", snssai_seg, "pdu-sessions"] => match method {
-            "POST" => handle_pdu_ac_update(snssai_seg, &request).await,
-            _ => send_method_not_allowed(method, "slices/{snssai}/pdu-sessions"),
+        ["nnsacf-nsac", "v1", "slices", "pdu-sessions"] => match method {
+            "POST" => handle_pdu_ac_update(&request).await,
+            _ => send_method_not_allowed(method, "slices/pdu-sessions"),
         },
 
         // ------------------------------------------------------------------
@@ -420,22 +424,21 @@ async fn nsacf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 // Admission control handlers (TS 29.536: rejection = 200 + admittedFlag=false)
 // ---------------------------------------------------------------------------
 
-/// Common request validation for the AC update operations.
-/// Returns (s_nssai, update_flag, supi, body) or an error response.
-#[allow(clippy::result_large_err)] // SbiResponse is the natural error type here
-fn parse_ac_request(
-    snssai_seg: &str,
-    request: &SbiRequest,
-) -> Result<(SNssai, String, String, serde_json::Value), SbiResponse> {
-    let s_nssai = SNssai::from_path_segment(snssai_seg).ok_or_else(|| {
-        problem_details(
-            400,
-            "Bad Request",
-            &format!("Invalid S-NSSAI path segment '{snssai_seg}' (use {{sst}} or {{sst}}-{{sd}})"),
-            Some("INVALID_QUERY_PARAM"),
-        )
-    })?;
+/// Parsed common fields of a TS 29.536 admission-control request body.
+///
+/// `snssai` and `updateFlag` are mandatory; `nfId` identifies the requesting
+/// consumer (AMF for UE admission, SMF for PDU-session admission).
+struct AcRequestCommon {
+    s_nssai: SNssai,
+    update_flag: String,
+    data: serde_json::Value,
+}
 
+/// Common request validation for the AC update operations (TS 29.536
+/// UeACRequestData / PduSessionACRequestData). The S-NSSAI is read from the
+/// request body's mandatory `snssai` attribute (not the URI path).
+#[allow(clippy::result_large_err)] // SbiResponse is the natural error type here
+fn parse_ac_request(request: &SbiRequest) -> Result<AcRequestCommon, SbiResponse> {
     let body = request.http.content.as_deref().ok_or_else(|| {
         problem_details(
             400,
@@ -455,13 +458,22 @@ fn parse_ac_request(
     })?;
 
     let mut missing = Vec::new();
+    // S-NSSAI is the mandatory `snssai` attribute of UeACRequestData /
+    // PduSessionACRequestData (TS 29.536 §6.1.6.2.x). Accept both `snssai`
+    // and the TS 29.571 camelCase `sNssai` spelling defensively.
+    let snssai_json = data.get("snssai").or_else(|| data.get("sNssai"));
+    let s_nssai = snssai_json.and_then(SNssai::from_json);
+    if s_nssai.is_none() {
+        missing.push("snssai");
+    }
     let update_flag = data.get("updateFlag").and_then(|v| v.as_str());
     if update_flag.is_none() {
         missing.push("updateFlag");
     }
-    let supi = data.get("supi").and_then(|v| v.as_str());
-    if supi.is_none() {
-        missing.push("supi");
+    // nfId is mandatory in TS 29.536 (the consumer NF instance id). Accept it
+    // leniently to keep older callers working, but flag its absence.
+    if data.get("nfId").and_then(|v| v.as_str()).is_none() {
+        log::warn!("AC request without nfId (lenient)");
     }
     if !missing.is_empty() {
         return Err(problem_details(
@@ -481,34 +493,40 @@ fn parse_ac_request(
         ));
     }
 
-    Ok((
-        s_nssai,
-        update_flag.to_string(),
-        supi.expect("checked above").to_string(),
+    Ok(AcRequestCommon {
+        s_nssai: s_nssai.expect("checked above"),
+        update_flag: update_flag.to_string(),
         data,
-    ))
+    })
 }
 
-fn admission_response(s_nssai: &SNssai, supi: &str, result: AdmissionResult) -> SbiResponse {
-    let body = match result {
-        AdmissionResult::Admitted => serde_json::json!({
-            "admittedFlag": true,
-            "supi": supi,
-            "sNssai": s_nssai.to_json(),
-        }),
-        AdmissionResult::RejectedQuotaExceeded => serde_json::json!({
-            "admittedFlag": false,
-            "rejectCause": "QUOTA_EXCEEDED",
-            "supi": supi,
-            "sNssai": s_nssai.to_json(),
-        }),
-        AdmissionResult::RejectedSliceNotAvailable => serde_json::json!({
-            "admittedFlag": false,
-            "rejectCause": "SLICE_NOT_AVAILABLE",
-            "supi": supi,
-            "sNssai": s_nssai.to_json(),
-        }),
-    };
+/// Build a TS 29.536 UeACResponseData / PduSessionACResponseData body.
+///
+/// On rejection the response is still HTTP 200 with `admittedFlag=false`
+/// (TS 29.536 §6.1.3.2), carrying the resource ceiling so the consumer can
+/// surface it. `max_num` is the slice's configured `maxNumUEs` /
+/// `maxNumPduSessions`.
+fn admission_response(
+    s_nssai: &SNssai,
+    result: AdmissionResult,
+    max_field: &str,
+    max_num: Option<u64>,
+) -> SbiResponse {
+    let admitted = result == AdmissionResult::Admitted;
+    let mut body = serde_json::json!({
+        "snssai": s_nssai.to_json(),
+        "admittedFlag": admitted,
+    });
+    if let Some(max) = max_num {
+        body[max_field] = serde_json::json!(max);
+    }
+    if !admitted {
+        let cause = match result {
+            AdmissionResult::RejectedQuotaExceeded => "QUOTA_EXCEEDED",
+            _ => "SLICE_NOT_AVAILABLE",
+        };
+        body["rejectCause"] = serde_json::json!(cause);
+    }
     // TS 29.536: admission rejection is reported with 200 + admittedFlag=false,
     // NOT an HTTP error status.
     SbiResponse::with_status(200)
@@ -516,27 +534,59 @@ fn admission_response(s_nssai: &SNssai, supi: &str, result: AdmissionResult) -> 
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
-/// POST /nnsacf-nsac/v1/slices/{snssai}/ues  (NumOfUEsUpdate)
-async fn handle_ue_ac_update(snssai_seg: &str, request: &SbiRequest) -> SbiResponse {
-    let (s_nssai, update_flag, supi, _data) = match parse_ac_request(snssai_seg, request) {
+/// Resolve the membership key for a UE admission request. TS 29.536 counts
+/// distinct UEs per slice; we key on `supi` when present (precise, idempotent),
+/// otherwise on the consumer `nfId` plus a per-request token so counts stay
+/// well-defined. Returns `None` when no usable identity is present.
+fn ue_membership_key(data: &serde_json::Value) -> Option<String> {
+    if let Some(supi) = data.get("supi").and_then(|v| v.as_str()) {
+        return Some(supi.to_string());
+    }
+    // Fall back to the first updateList anchor identifier if provided.
+    data.get("updateList")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|e| e.get("anchorOrPdu").or_else(|| e.get("ueId")))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
+/// POST /nnsacf-nsac/v1/slices/ues  (NumOfUEsUpdate, TS 29.536 §6.1.3.2)
+async fn handle_ue_ac_update(request: &SbiRequest) -> SbiResponse {
+    let common = match parse_ac_request(request) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    let AcRequestCommon {
+        s_nssai,
+        update_flag,
+        data,
+    } = common;
+
+    let Some(key) = ue_membership_key(&data) else {
+        return problem_details(
+            400,
+            "Bad Request",
+            "Missing UE identity (supi or updateList.anchorOrPdu)",
+            Some("MANDATORY_IE_MISSING"),
+        );
+    };
+    let max_num = with_nsacf_context(|c| c.quota_find_by_snssai(&s_nssai))
+        .flatten()
+        .map(|q| q.max_ues);
 
     match update_flag.as_str() {
         "INCREASE" => {
-            let (result, eac) = with_nsacf_context(|c| c.admit_ue(&s_nssai, &supi))
+            let (result, eac) = with_nsacf_context(|c| c.admit_ue(&s_nssai, &key))
                 .unwrap_or((AdmissionResult::RejectedSliceNotAvailable, None));
             match result {
-                AdmissionResult::Admitted => {
-                    log::info!(
-                        "[{supi}] admitted to S-NSSAI[SST:{} SD:{:?}]",
-                        s_nssai.sst,
-                        s_nssai.sd
-                    )
-                }
+                AdmissionResult::Admitted => log::info!(
+                    "[{key}] admitted to S-NSSAI[SST:{} SD:{:?}]",
+                    s_nssai.sst,
+                    s_nssai.sd
+                ),
                 _ => log::warn!(
-                    "[{supi}] NOT admitted to S-NSSAI[SST:{} SD:{:?}]: {result:?}",
+                    "[{key}] NOT admitted to S-NSSAI[SST:{} SD:{:?}]: {result:?}",
                     s_nssai.sst,
                     s_nssai.sd
                 ),
@@ -547,32 +597,31 @@ async fn handle_ue_ac_update(snssai_seg: &str, request: &SbiRequest) -> SbiRespo
             if result == AdmissionResult::Admitted {
                 spawn_event_reports(&s_nssai);
             }
-            admission_response(&s_nssai, &supi, result)
+            admission_response(&s_nssai, result, "maxNumUEs", max_num)
         }
         _ => {
-            // DECREASE: idempotent release, always acknowledged
-            let eac = with_nsacf_context(|c| c.release_ue(&s_nssai, &supi)).flatten();
+            // DECREASE: idempotent release, always acknowledged (admittedFlag=true)
+            let eac = with_nsacf_context(|c| c.release_ue(&s_nssai, &key)).flatten();
             if let Some(eac) = eac {
                 spawn_eac_notifications(eac);
             }
             spawn_event_reports(&s_nssai);
-            SbiResponse::with_status(200)
-                .with_json_body(&serde_json::json!({
-                    "admittedFlag": true,
-                    "supi": supi,
-                    "sNssai": s_nssai.to_json(),
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(200))
+            admission_response(&s_nssai, AdmissionResult::Admitted, "maxNumUEs", max_num)
         }
     }
 }
 
-/// POST /nnsacf-nsac/v1/slices/{snssai}/pdu-sessions  (NumOfPDUsUpdate)
-async fn handle_pdu_ac_update(snssai_seg: &str, request: &SbiRequest) -> SbiResponse {
-    let (s_nssai, update_flag, supi, data) = match parse_ac_request(snssai_seg, request) {
+/// POST /nnsacf-nsac/v1/slices/pdu-sessions  (NumOfPDUsUpdate, TS 29.536 §6.1.3.2)
+async fn handle_pdu_ac_update(request: &SbiRequest) -> SbiResponse {
+    let common = match parse_ac_request(request) {
         Ok(v) => v,
         Err(resp) => return resp,
     };
+    let AcRequestCommon {
+        s_nssai,
+        update_flag,
+        data,
+    } = common;
 
     let pdu_session_id = match data.get("pduSessionId").and_then(|v| v.as_u64()) {
         Some(id) => id,
@@ -585,7 +634,17 @@ async fn handle_pdu_ac_update(snssai_seg: &str, request: &SbiRequest) -> SbiResp
             )
         }
     };
-    let session_key = format!("{supi}:{pdu_session_id}");
+    // Distinct PDU-session key: prefer supi when present so two UEs may reuse
+    // the same pduSessionId; otherwise key on the consumer nfId.
+    let owner = data
+        .get("supi")
+        .and_then(|v| v.as_str())
+        .or_else(|| data.get("nfId").and_then(|v| v.as_str()))
+        .unwrap_or("unknown");
+    let session_key = format!("{owner}:{pdu_session_id}");
+    let max_num = with_nsacf_context(|c| c.quota_find_by_snssai(&s_nssai))
+        .flatten()
+        .map(|q| q.max_pdu_sessions);
 
     match update_flag.as_str() {
         "INCREASE" => {
@@ -594,19 +653,17 @@ async fn handle_pdu_ac_update(snssai_seg: &str, request: &SbiRequest) -> SbiResp
             if result == AdmissionResult::Admitted {
                 spawn_event_reports(&s_nssai);
             }
-            admission_response(&s_nssai, &supi, result)
+            admission_response(&s_nssai, result, "maxNumPduSessions", max_num)
         }
         _ => {
             with_nsacf_context(|c| c.release_pdu_session(&s_nssai, &session_key));
             spawn_event_reports(&s_nssai);
-            SbiResponse::with_status(200)
-                .with_json_body(&serde_json::json!({
-                    "admittedFlag": true,
-                    "supi": supi,
-                    "pduSessionId": pdu_session_id,
-                    "sNssai": s_nssai.to_json(),
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(200))
+            admission_response(
+                &s_nssai,
+                AdmissionResult::Admitted,
+                "maxNumPduSessions",
+                max_num,
+            )
         }
     }
 }
@@ -1358,23 +1415,31 @@ mod tests {
 
         create_quota(&client, 71, 2, 100).await;
 
+        // S-NSSAI is carried in the body (TS 29.536 UeACRequestData), not the URI.
         let post_ue = |supi: &str, flag: &str| {
-            let body = json!({"updateFlag": flag, "supi": supi, "nfId": "amf-1"});
+            let body = json!({
+                "snssai": {"sst": 71},
+                "updateFlag": flag,
+                "supi": supi,
+                "nfId": "amf-1"
+            });
             let client = SbiClient::with_host_port("127.0.0.1", port);
             async move {
                 client
-                    .post_json("/nnsacf-nsac/v1/slices/71/ues", &body)
+                    .post_json("/nnsacf-nsac/v1/slices/ues", &body)
                     .await
                     .expect("response")
             }
         };
 
-        // INCREASE within quota -> admittedFlag=true
+        // INCREASE within quota -> admittedFlag=true, echoes snssai + maxNumUEs
         let resp = post_ue("imsi-71-1", "INCREASE").await;
         assert_eq!(resp.status, 200);
         let body: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(body["admittedFlag"], true);
+        assert_eq!(body["snssai"]["sst"], 71);
+        assert_eq!(body["maxNumUEs"], 2);
 
         // Idempotent INCREASE for same SUPI
         let resp = post_ue("imsi-71-1", "INCREASE").await;
@@ -1391,10 +1456,14 @@ mod tests {
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(body["admittedFlag"], false);
         assert_eq!(body["rejectCause"], "QUOTA_EXCEEDED");
+        assert_eq!(body["maxNumUEs"], 2);
 
-        // DECREASE then INCREASE succeeds again
+        // DECREASE then INCREASE succeeds again (decrease frees capacity)
         let resp = post_ue("imsi-71-2", "DECREASE").await;
         assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["admittedFlag"], true, "DECREASE is always acknowledged");
         let resp = post_ue("imsi-71-3", "INCREASE").await;
         let body: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
@@ -1403,8 +1472,8 @@ mod tests {
         // Unknown slice -> 200 admittedFlag=false SLICE_NOT_AVAILABLE
         let resp = client
             .post_json(
-                "/nnsacf-nsac/v1/slices/99/ues",
-                &json!({"updateFlag": "INCREASE", "supi": "imsi-x"}),
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({"snssai": {"sst": 99}, "updateFlag": "INCREASE", "supi": "imsi-x", "nfId": "amf-1"}),
             )
             .await
             .expect("response");
@@ -1422,24 +1491,40 @@ mod tests {
         let (server, port) = start_nsacf_server().await;
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
-        // Missing supi -> 400 ProblemDetails
+        // Missing snssai -> 400 ProblemDetails
         let resp = client
             .post_json(
-                "/nnsacf-nsac/v1/slices/72/ues",
-                &json!({"updateFlag": "INCREASE"}),
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({"updateFlag": "INCREASE", "supi": "imsi-1", "nfId": "amf-1"}),
             )
             .await
             .expect("response");
         assert_eq!(resp.status, 400);
         let body = resp.http.content.as_deref().unwrap();
-        assert!(body.contains("supi"));
+        assert!(body.contains("snssai"));
         assert!(body.contains("MANDATORY_IE_MISSING"));
+
+        // Missing UE identity (no supi / updateList) -> 400
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({"snssai": {"sst": 72}, "updateFlag": "INCREASE", "nfId": "amf-1"}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 400);
+        assert!(resp
+            .http
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("MANDATORY_IE_MISSING"));
 
         // Invalid updateFlag -> 400
         let resp = client
             .post_json(
-                "/nnsacf-nsac/v1/slices/72/ues",
-                &json!({"updateFlag": "BOGUS", "supi": "imsi-1"}),
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({"snssai": {"sst": 72}, "updateFlag": "BOGUS", "supi": "imsi-1", "nfId": "amf-1"}),
             )
             .await
             .expect("response");
@@ -1451,11 +1536,11 @@ mod tests {
             .unwrap()
             .contains("INVALID_IE_VALUE"));
 
-        // Invalid snssai path segment -> 400
+        // Invalid snssai value (sst > 255) -> 400
         let resp = client
             .post_json(
-                "/nnsacf-nsac/v1/slices/not-a-slice/ues",
-                &json!({"updateFlag": "INCREASE", "supi": "imsi-1"}),
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({"snssai": {"sst": 9999}, "updateFlag": "INCREASE", "supi": "imsi-1", "nfId": "amf-1"}),
             )
             .await
             .expect("response");
@@ -1474,8 +1559,8 @@ mod tests {
         // Missing pduSessionId -> 400
         let resp = client
             .post_json(
-                "/nnsacf-nsac/v1/slices/73/pdu-sessions",
-                &json!({"updateFlag": "INCREASE", "supi": "imsi-73-1"}),
+                "/nnsacf-nsac/v1/slices/pdu-sessions",
+                &json!({"snssai": {"sst": 73}, "updateFlag": "INCREASE", "supi": "imsi-73-1", "nfId": "smf-1"}),
             )
             .await
             .expect("response");
@@ -1487,11 +1572,11 @@ mod tests {
             .unwrap()
             .contains("pduSessionId"));
 
-        // INCREASE within quota
+        // INCREASE within quota -> echoes snssai + maxNumPduSessions
         let resp = client
             .post_json(
-                "/nnsacf-nsac/v1/slices/73/pdu-sessions",
-                &json!({"updateFlag": "INCREASE", "supi": "imsi-73-1", "pduSessionId": 1}),
+                "/nnsacf-nsac/v1/slices/pdu-sessions",
+                &json!({"snssai": {"sst": 73}, "updateFlag": "INCREASE", "supi": "imsi-73-1", "nfId": "smf-1", "pduSessionId": 1}),
             )
             .await
             .expect("response");
@@ -1499,12 +1584,14 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(body["admittedFlag"], true);
+        assert_eq!(body["snssai"]["sst"], 73);
+        assert_eq!(body["maxNumPduSessions"], 1);
 
         // Quota full -> 200 admittedFlag=false
         let resp = client
             .post_json(
-                "/nnsacf-nsac/v1/slices/73/pdu-sessions",
-                &json!({"updateFlag": "INCREASE", "supi": "imsi-73-2", "pduSessionId": 5}),
+                "/nnsacf-nsac/v1/slices/pdu-sessions",
+                &json!({"snssai": {"sst": 73}, "updateFlag": "INCREASE", "supi": "imsi-73-2", "nfId": "smf-1", "pduSessionId": 5}),
             )
             .await
             .expect("response");
@@ -1516,16 +1603,16 @@ mod tests {
         // DECREASE frees the slot
         let resp = client
             .post_json(
-                "/nnsacf-nsac/v1/slices/73/pdu-sessions",
-                &json!({"updateFlag": "DECREASE", "supi": "imsi-73-1", "pduSessionId": 1}),
+                "/nnsacf-nsac/v1/slices/pdu-sessions",
+                &json!({"snssai": {"sst": 73}, "updateFlag": "DECREASE", "supi": "imsi-73-1", "nfId": "smf-1", "pduSessionId": 1}),
             )
             .await
             .expect("response");
         assert_eq!(resp.status, 200);
         let resp = client
             .post_json(
-                "/nnsacf-nsac/v1/slices/73/pdu-sessions",
-                &json!({"updateFlag": "INCREASE", "supi": "imsi-73-2", "pduSessionId": 5}),
+                "/nnsacf-nsac/v1/slices/pdu-sessions",
+                &json!({"snssai": {"sst": 73}, "updateFlag": "INCREASE", "supi": "imsi-73-2", "nfId": "smf-1", "pduSessionId": 5}),
             )
             .await
             .expect("response");
@@ -1600,8 +1687,8 @@ mod tests {
         for i in 1..=4 {
             let resp = client
                 .post_json(
-                    "/nnsacf-nsac/v1/slices/74/ues",
-                    &json!({"updateFlag": "INCREASE", "supi": format!("imsi-74-{i}")}),
+                    "/nnsacf-nsac/v1/slices/ues",
+                    &json!({"snssai": {"sst": 74}, "updateFlag": "INCREASE", "supi": format!("imsi-74-{i}"), "nfId": "amf-1"}),
                 )
                 .await
                 .expect("response");
@@ -1628,8 +1715,8 @@ mod tests {
         // Release below threshold -> EAC_INACTIVE notification
         let resp = client
             .post_json(
-                "/nnsacf-nsac/v1/slices/74/ues",
-                &json!({"updateFlag": "DECREASE", "supi": "imsi-74-4"}),
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({"snssai": {"sst": 74}, "updateFlag": "DECREASE", "supi": "imsi-74-4", "nfId": "amf-1"}),
             )
             .await
             .expect("response");

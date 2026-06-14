@@ -3,6 +3,7 @@
 //! Port of src/nssf/context.c - NSSF context with NSI list and Home list
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -200,6 +201,50 @@ impl NssfSubscription {
         }
         v
     }
+
+    /// Serialize the full subscription for the on-disk snapshot (lossless),
+    /// using the canonical TS 29.571 Tai JSON encoding for the TAI list.
+    fn to_persist_json(&self) -> serde_json::Value {
+        let mut v = serde_json::json!({
+            "subscriptionId": self.subscription_id,
+            "nfNssaiAvailabilityUri": self.nf_nssai_availability_uri,
+            "taiList": self.tai_list.iter().map(tai_to_json).collect::<Vec<_>>(),
+            "event": self.event,
+        });
+        let obj = v.as_object_mut().expect("object");
+        if let Some(ref e) = self.expiry {
+            obj.insert("expiry".into(), serde_json::json!(e));
+        }
+        if let Some(ref a) = self.amf_id {
+            obj.insert("amfId".into(), serde_json::json!(a));
+        }
+        if let Some(ref a) = self.amf_set_id {
+            obj.insert("amfSetId".into(), serde_json::json!(a));
+        }
+        v
+    }
+
+    /// Reconstruct a subscription from its persisted JSON form.
+    fn from_persist_json(v: &serde_json::Value) -> Option<NssfSubscription> {
+        let subscription_id = v.get("subscriptionId")?.as_str()?.to_string();
+        let nf_nssai_availability_uri = v.get("nfNssaiAvailabilityUri")?.as_str()?.to_string();
+        let event = v.get("event")?.as_str()?.to_string();
+        let tai_list = v
+            .get("taiList")
+            .and_then(|a| a.as_array())
+            .map(|arr| arr.iter().filter_map(tai_from_json).collect())
+            .unwrap_or_default();
+        let str_at = |k: &str| v.get(k).and_then(|x| x.as_str()).map(|s| s.to_string());
+        Some(NssfSubscription {
+            subscription_id,
+            nf_nssai_availability_uri,
+            tai_list,
+            event,
+            expiry: str_at("expiry"),
+            amf_id: str_at("amfId"),
+            amf_set_id: str_at("amfSetId"),
+        })
+    }
 }
 
 /// Parse an S-NSSAI from TS 29.571 Snssai JSON (`{"sst": 1, "sd": "010203"}`)
@@ -327,6 +372,9 @@ pub struct NssfContext {
     max_num_of_nf: usize,
     /// Context initialized flag
     initialized: AtomicBool,
+    /// Optional on-disk snapshot path for NSSAI-availability subscriptions and
+    /// availability data. `None` => purely in-memory (previous behaviour).
+    state_path: Option<PathBuf>,
 }
 
 impl NssfContext {
@@ -343,6 +391,103 @@ impl NssfContext {
             next_home_id: AtomicUsize::new(1),
             max_num_of_nf: 0,
             initialized: AtomicBool::new(false),
+            state_path: None,
+        }
+    }
+
+    /// Create a context that snapshots availability subscriptions / data to
+    /// `path`, restoring any prior state on construction.
+    pub fn with_state_path(path: impl Into<PathBuf>) -> Self {
+        let mut ctx = Self::new();
+        ctx.state_path = Some(path.into());
+        ctx.load();
+        ctx
+    }
+
+    // -- persistence (NSSAI-availability subscriptions + availability data) --
+
+    /// Serialize availability subscriptions and per-NF availability docs to a
+    /// single snapshot document.
+    fn snapshot(&self) -> serde_json::Value {
+        let subscriptions: Vec<serde_json::Value> = self
+            .subscriptions
+            .read()
+            .map(|s| s.values().map(|sub| sub.to_persist_json()).collect())
+            .unwrap_or_default();
+        // Availability is fully reconstructible from (nfId, canonical doc).
+        let availability: Vec<serde_json::Value> = self
+            .nssai_availability
+            .read()
+            .map(|m| {
+                m.values()
+                    .map(|i| serde_json::json!({ "nfId": i.nf_id, "doc": i.doc }))
+                    .collect()
+            })
+            .unwrap_or_default();
+        serde_json::json!({
+            "version": 1,
+            "subscriptions": subscriptions,
+            "availability": availability,
+        })
+    }
+
+    /// Persist the current context. No-op without a configured path.
+    fn persist(&self) {
+        let Some(path) = self.state_path.as_ref() else {
+            return;
+        };
+        let doc = self.snapshot();
+        if let Err(e) = write_atomic(path, &doc) {
+            log::warn!("NSSF state persist to {} failed: {e}", path.display());
+        }
+    }
+
+    /// Load state from the configured path (no-op when unset/not-yet-created).
+    fn load(&mut self) {
+        let Some(path) = self.state_path.clone() else {
+            return;
+        };
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                log::warn!("NSSF state load from {} failed: {e}", path.display());
+                return;
+            }
+        };
+        let doc: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("NSSF state file {} is not valid JSON: {e}", path.display());
+                return;
+            }
+        };
+        self.restore_from(&doc);
+    }
+
+    /// Restore subscriptions and availability data from a snapshot document.
+    fn restore_from(&self, doc: &serde_json::Value) {
+        if let Some(arr) = doc.get("subscriptions").and_then(|v| v.as_array()) {
+            if let Ok(mut subs) = self.subscriptions.write() {
+                for sd in arr {
+                    if let Some(sub) = NssfSubscription::from_persist_json(sd) {
+                        subs.insert(sub.subscription_id.clone(), sub);
+                    }
+                }
+            }
+        }
+        if let Some(arr) = doc.get("availability").and_then(|v| v.as_array()) {
+            if let Ok(mut avail) = self.nssai_availability.write() {
+                for ad in arr {
+                    let (Some(nf_id), Some(av_doc)) =
+                        (ad.get("nfId").and_then(|v| v.as_str()), ad.get("doc"))
+                    else {
+                        continue;
+                    };
+                    let info = availability_info_from_doc(nf_id, av_doc.clone());
+                    avail.insert(nf_id.to_string(), info);
+                }
+            }
         }
     }
 
@@ -530,9 +675,12 @@ impl NssfContext {
     // NSSAI Availability management (B24.4)
 
     pub fn set_nssai_availability(&self, nf_id: &str, info: NssaiAvailabilityInfo) {
-        if let Ok(mut avail) = self.nssai_availability.write() {
-            avail.insert(nf_id.to_string(), info);
+        {
+            if let Ok(mut avail) = self.nssai_availability.write() {
+                avail.insert(nf_id.to_string(), info);
+            }
         }
+        self.persist();
     }
 
     pub fn get_nssai_availability(&self, nf_id: &str) -> Option<NssaiAvailabilityInfo> {
@@ -541,10 +689,17 @@ impl NssfContext {
     }
 
     pub fn remove_nssai_availability(&self, nf_id: &str) -> bool {
-        if let Ok(mut avail) = self.nssai_availability.write() {
-            return avail.remove(nf_id).is_some();
+        let removed = {
+            if let Ok(mut avail) = self.nssai_availability.write() {
+                avail.remove(nf_id).is_some()
+            } else {
+                false
+            }
+        };
+        if removed {
+            self.persist();
         }
-        false
+        removed
     }
 
     /// Snapshot all stored availability docs (nfId, doc)
@@ -578,9 +733,12 @@ impl NssfContext {
     // Availability-change subscription management (TS 29.531 §5.2.2.5)
 
     pub fn subscription_add(&self, sub: NssfSubscription) {
-        if let Ok(mut subs) = self.subscriptions.write() {
-            subs.insert(sub.subscription_id.clone(), sub);
+        {
+            if let Ok(mut subs) = self.subscriptions.write() {
+                subs.insert(sub.subscription_id.clone(), sub);
+            }
         }
+        self.persist();
     }
 
     pub fn subscription_get(&self, id: &str) -> Option<NssfSubscription> {
@@ -588,20 +746,34 @@ impl NssfContext {
     }
 
     pub fn subscription_remove(&self, id: &str) -> bool {
-        self.subscriptions
+        let removed = self
+            .subscriptions
             .write()
             .map(|mut subs| subs.remove(id).is_some())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if removed {
+            self.persist();
+        }
+        removed
     }
 
     pub fn subscription_update(&self, sub: NssfSubscription) -> bool {
-        if let Ok(mut subs) = self.subscriptions.write() {
-            if subs.contains_key(&sub.subscription_id) {
-                subs.insert(sub.subscription_id.clone(), sub);
-                return true;
+        let updated = {
+            if let Ok(mut subs) = self.subscriptions.write() {
+                if subs.contains_key(&sub.subscription_id) {
+                    subs.insert(sub.subscription_id.clone(), sub);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
             }
+        };
+        if updated {
+            self.persist();
         }
-        false
+        updated
     }
 
     pub fn subscription_count(&self) -> usize {
@@ -694,6 +866,21 @@ impl Default for NssfContext {
     }
 }
 
+/// Atomically write `doc` to `path` (temp file + rename) so a crash mid-write
+/// cannot leave a truncated snapshot. Creates parent directories as needed.
+fn write_atomic(path: &Path, doc: &serde_json::Value) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let serialized = serde_json::to_vec_pretty(doc)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &serialized)?;
+    std::fs::rename(&tmp, path)
+}
+
 /// Global NSSF context (thread-safe singleton)
 static GLOBAL_NSSF_CONTEXT: std::sync::OnceLock<Arc<RwLock<NssfContext>>> =
     std::sync::OnceLock::new();
@@ -703,6 +890,22 @@ pub fn nssf_self() -> Arc<RwLock<NssfContext>> {
     GLOBAL_NSSF_CONTEXT
         .get_or_init(|| Arc::new(RwLock::new(NssfContext::new())))
         .clone()
+}
+
+/// Initialise the global NSSF context with an on-disk snapshot path for
+/// NSSAI-availability subscriptions and availability data, restoring any
+/// previously persisted state. Must be called before the first [`nssf_self`]
+/// use to take effect; returns `false` if the context was already initialised.
+///
+/// Passing `None` leaves the context purely in-memory (the default).
+pub fn nssf_context_init_with_state(state_path: Option<PathBuf>) -> bool {
+    let ctx = match state_path {
+        Some(p) => NssfContext::with_state_path(p),
+        None => NssfContext::new(),
+    };
+    GLOBAL_NSSF_CONTEXT
+        .set(Arc::new(RwLock::new(ctx)))
+        .is_ok()
 }
 
 /// Initialize the global NSSF context
@@ -864,6 +1067,128 @@ mod tests {
 
         assert!(ctx.subscription_remove("sub-1"));
         assert!(!ctx.subscription_remove("sub-1"));
+    }
+
+    fn temp_state_path(tag: &str) -> PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("nssfd-test-{tag}-{pid}-{nanos}.json"))
+    }
+
+    /// Add an NSSAI-availability subscription (and availability data) on a
+    /// persisting context, then re-open from the same file (simulated restart)
+    /// and confirm both are retained, including the TAI list and matching.
+    #[test]
+    fn test_nssf_persistence_survives_restart() {
+        let path = temp_state_path("restart");
+        let _ = std::fs::remove_file(&path);
+
+        let tai = Tai {
+            plmn_id: PlmnId::new("999", "70"),
+            tac: 200,
+        };
+        let avail_doc = serde_json::json!({
+            "supportedNssaiAvailabilityData": [{
+                "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "000001"},
+                "supportedSnssaiList": [{"sst": 1}]
+            }]
+        });
+
+        // First lifetime: subscribe + set availability, then drop the context.
+        {
+            let ctx = NssfContext::with_state_path(&path);
+            ctx.subscription_add(NssfSubscription {
+                subscription_id: "sub-restart".to_string(),
+                nf_nssai_availability_uri: "http://amf:9999/cb".to_string(),
+                tai_list: vec![tai.clone()],
+                event: "SNSSAI_STATUS_CHANGE_REPORT".to_string(),
+                expiry: Some("2030-01-01T00:00:00Z".to_string()),
+                amf_id: Some("amf-1".to_string()),
+                amf_set_id: None,
+            });
+            ctx.set_nssai_availability(
+                "amf-1",
+                availability_info_from_doc("amf-1", avail_doc.clone()),
+            );
+        }
+
+        // Second lifetime: a fresh context re-opened from the same file.
+        {
+            let ctx = NssfContext::with_state_path(&path);
+            assert_eq!(ctx.subscription_count(), 1);
+            let sub = ctx
+                .subscription_get("sub-restart")
+                .expect("subscription retained across restart");
+            assert_eq!(sub.nf_nssai_availability_uri, "http://amf:9999/cb");
+            assert_eq!(sub.event, "SNSSAI_STATUS_CHANGE_REPORT");
+            assert_eq!(sub.expiry.as_deref(), Some("2030-01-01T00:00:00Z"));
+            assert_eq!(sub.amf_id.as_deref(), Some("amf-1"));
+            assert_eq!(sub.tai_list.len(), 1);
+            assert_eq!(sub.tai_list[0].tac, 200);
+            assert_eq!(sub.tai_list[0].plmn_id.mcc, "999");
+            // TAI matching still works after restore.
+            assert_eq!(
+                ctx.subscriptions_matching(std::slice::from_ref(&tai)).len(),
+                1
+            );
+            // Availability data was retained and is reconstructible.
+            let info = ctx
+                .get_nssai_availability("amf-1")
+                .expect("availability retained across restart");
+            assert_eq!(info.supported_snssai_list, vec![SNssai::new(1, None)]);
+            assert_eq!(info.doc, avail_doc);
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A subscription removal must also be persisted (no resurrection).
+    #[test]
+    fn test_nssf_persistence_remove_survives_restart() {
+        let path = temp_state_path("remove");
+        let _ = std::fs::remove_file(&path);
+        {
+            let ctx = NssfContext::with_state_path(&path);
+            ctx.subscription_add(NssfSubscription {
+                subscription_id: "sub-x".to_string(),
+                nf_nssai_availability_uri: "http://amf:1/cb".to_string(),
+                tai_list: vec![],
+                event: "SNSSAI_STATUS_CHANGE_REPORT".to_string(),
+                expiry: None,
+                amf_id: None,
+                amf_set_id: None,
+            });
+            assert!(ctx.subscription_remove("sub-x"));
+        }
+        {
+            let ctx = NssfContext::with_state_path(&path);
+            assert!(
+                ctx.subscription_get("sub-x").is_none(),
+                "removed subscription must not reappear after restart"
+            );
+            assert_eq!(ctx.subscription_count(), 0);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// No path configured => no file written, context stays in-memory.
+    #[test]
+    fn test_nssf_no_path_is_pure_memory() {
+        let ctx = NssfContext::new();
+        ctx.subscription_add(NssfSubscription {
+            subscription_id: "s".to_string(),
+            nf_nssai_availability_uri: "http://a/cb".to_string(),
+            tai_list: vec![],
+            event: "E".to_string(),
+            expiry: None,
+            amf_id: None,
+            amf_set_id: None,
+        });
+        ctx.persist(); // no-op without a path
+        assert!(ctx.state_path.is_none());
     }
 
     #[test]

@@ -36,6 +36,10 @@ pub mod gsm_cause {
     pub const REQUEST_REJECTED_UNSPECIFIED: u8 = 31;
     pub const NETWORK_FAILURE: u8 = 38;
     pub const PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED: u8 = 50;
+    /// #67 Insufficient resources for specific slice (TS 24.501 §9.11.4.2).
+    /// Used when the NSACF declines a PDU-session admission for the S-NSSAI
+    /// (slice PDU-session quota exhausted, admittedFlag=false).
+    pub const INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE: u8 = 67;
 }
 
 /// PDU session type values (TS 24.501 §9.11.4.11)
@@ -285,6 +289,199 @@ fn split_host_port(uri: &str) -> Option<(String, u16)> {
         let default = if uri.starts_with("https://") { 443 } else { 80 };
         Some((host_port.to_string(), default))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Nnsacf_NSAC PDU-session admission (TS 29.536 §5.3 / §6.1.3.2)
+// ---------------------------------------------------------------------------
+
+/// Resolved NSACF endpoint.
+#[derive(Debug, Clone)]
+pub struct NsacfEndpoint {
+    pub host: String,
+    pub port: u16,
+}
+
+impl NsacfEndpoint {
+    fn client(&self) -> SbiClient {
+        SbiClient::new(
+            SbiClientConfig::new(self.host.clone(), self.port)
+                .with_connect_timeout(Duration::from_secs(2))
+                .with_request_timeout(Duration::from_secs(3)),
+        )
+    }
+}
+
+/// Resolve the NSACF endpoint: `NSACF_URI` env var first, then NRF discovery
+/// (GET /nnrf-disc/v1/nf-instances?target-nf-type=NSACF&requester-nf-type=SMF).
+/// Returns `None` when no NSACF is configured/discoverable, so the caller can
+/// treat slice admission control as not deployed (skip the check).
+pub async fn resolve_nsacf_endpoint() -> Option<NsacfEndpoint> {
+    if let Ok(uri) = std::env::var("NSACF_URI") {
+        if let Some((host, port)) = split_host_port(&uri) {
+            return Some(NsacfEndpoint { host, port });
+        }
+        log::warn!("NSACF_URI '{uri}' is not a valid URI — ignoring");
+    }
+
+    // NRF discovery
+    let nrf_uri = ogs_sbi::context::global_context().get_nrf_uri().await?;
+    let (nrf_host, nrf_port) = split_host_port(&nrf_uri)?;
+    let client = SbiClient::new(
+        SbiClientConfig::new(nrf_host, nrf_port)
+            .with_connect_timeout(Duration::from_secs(2))
+            .with_request_timeout(Duration::from_secs(3)),
+    );
+    let resp = client
+        .get("/nnrf-disc/v1/nf-instances?target-nf-type=NSACF&requester-nf-type=SMF")
+        .await
+        .ok()?;
+    if resp.status != 200 {
+        log::debug!("NRF NSACF discovery returned status {}", resp.status);
+        return None;
+    }
+    let body: serde_json::Value = serde_json::from_str(resp.http.content.as_deref()?).ok()?;
+    let inst = body.get("nfInstances")?.as_array()?.first()?;
+    let host = inst
+        .get("ipv4Addresses")
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let port = inst
+        .get("nfServices")
+        .and_then(|s| s.as_array())
+        .and_then(|svcs| {
+            svcs.iter()
+                .find(|s| s.get("serviceName").and_then(|n| n.as_str()) == Some("nnsacf-nsac"))
+        })
+        .and_then(|s| s.get("ipEndPoints"))
+        .and_then(|e| e.as_array())
+        .and_then(|e| e.first())
+        .and_then(|e| e.get("port"))
+        .and_then(|p| p.as_u64())
+        .map(|p| p as u16)
+        .unwrap_or(7813);
+    Some(NsacfEndpoint { host, port })
+}
+
+/// Outcome of an Nnsacf_NSAC PDU-session admission query (TS 29.536).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NsacAdmission {
+    /// PDU session admitted (admittedFlag=true) — proceed with establishment.
+    Admitted,
+    /// PDU session rejected (admittedFlag=false) — reject with 5GSM cause #67.
+    Rejected,
+    /// NSACF could not be reached / returned an error. The caller decides the
+    /// fail-open vs fail-closed policy.
+    Unavailable,
+}
+
+/// Query the NSACF whether a new PDU session may be established on `s_nssai`
+/// for `psi` (TS 29.536 §6.1.3.2, POST /nnsacf-nsac/v1/slices/pdu-sessions).
+///
+/// Per the contract, a rejection is an HTTP 200 with `admittedFlag=false`
+/// (NOT a 4xx), so we distinguish [`NsacAdmission::Rejected`] (200 +
+/// admittedFlag=false) from [`NsacAdmission::Unavailable`] (transport/HTTP
+/// error). `nf_id` is this SMF's NF instance id (the request's `nfId`).
+pub async fn nsac_pdu_session_admit(
+    nsacf: &NsacfEndpoint,
+    nf_id: &str,
+    supi: &str,
+    psi: u8,
+    sst: u8,
+    sd: Option<&str>,
+) -> NsacAdmission {
+    let mut snssai = serde_json::json!({ "sst": sst });
+    if let Some(sd) = sd {
+        snssai["sd"] = serde_json::json!(sd);
+    }
+    let body = serde_json::json!({
+        "snssai": snssai,
+        "nfId": nf_id,
+        "updateFlag": "INCREASE",
+        "pduSessionId": psi,
+        "supi": supi,
+    });
+
+    let client = nsacf.client();
+    let resp = match client
+        .post_json("/nnsacf-nsac/v1/slices/pdu-sessions", &body)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("NSACF PDU-session admission query failed: {e}");
+            client.close().await;
+            return NsacAdmission::Unavailable;
+        }
+    };
+    client.close().await;
+
+    if resp.status != 200 {
+        log::warn!(
+            "NSACF PDU-session admission returned HTTP {} (expected 200)",
+            resp.status
+        );
+        return NsacAdmission::Unavailable;
+    }
+    let parsed: Option<serde_json::Value> = resp
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str(c).ok());
+    let Some(parsed) = parsed else {
+        log::warn!("NSACF PDU-session admission response had no/invalid JSON body");
+        return NsacAdmission::Unavailable;
+    };
+    match parsed.get("admittedFlag").and_then(|v| v.as_bool()) {
+        Some(true) => NsacAdmission::Admitted,
+        Some(false) => {
+            let cause = parsed
+                .get("rejectCause")
+                .and_then(|v| v.as_str())
+                .unwrap_or("UNSPECIFIED");
+            log::info!(
+                "NSACF rejected PDU session for S-NSSAI[SST:{sst} SD:{sd:?}] (cause={cause})"
+            );
+            NsacAdmission::Rejected
+        }
+        None => {
+            log::warn!("NSACF PDU-session admission response missing admittedFlag");
+            NsacAdmission::Unavailable
+        }
+    }
+}
+
+/// Release a NSACF PDU-session count (DECREASE) for rollback when a later
+/// establishment step fails after the slot was admitted. Best-effort.
+pub async fn nsac_pdu_session_release(
+    nsacf: &NsacfEndpoint,
+    nf_id: &str,
+    supi: &str,
+    psi: u8,
+    sst: u8,
+    sd: Option<&str>,
+) {
+    let mut snssai = serde_json::json!({ "sst": sst });
+    if let Some(sd) = sd {
+        snssai["sd"] = serde_json::json!(sd);
+    }
+    let body = serde_json::json!({
+        "snssai": snssai,
+        "nfId": nf_id,
+        "updateFlag": "DECREASE",
+        "pduSessionId": psi,
+        "supi": supi,
+    });
+    let client = nsacf.client();
+    if let Err(e) = client
+        .post_json("/nnsacf-nsac/v1/slices/pdu-sessions", &body)
+        .await
+    {
+        log::warn!("NSACF PDU-session release (rollback) failed: {e}");
+    }
+    client.close().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1199,5 +1396,101 @@ mod tests {
             .await
             .expect("bounded");
         assert!(matches!(res, Err(PolicyError::Transport(_))));
+    }
+
+    // ------------------- Nnsacf_NSAC PDU-session admission ----------------
+
+    /// Stub NSACF: admits unless `pduSessionId == 99` (the over-limit marker),
+    /// in which case it returns the TS 29.536 200 + admittedFlag=false body.
+    async fn stub_nsacf_handler(req: ogs_sbi::message::SbiRequest) -> ogs_sbi::message::SbiResponse {
+        let path = req.header.uri.split('?').next().unwrap_or("").to_string();
+        if !path.ends_with("/nnsacf-nsac/v1/slices/pdu-sessions") {
+            return ogs_sbi::message::SbiResponse::with_status(404);
+        }
+        let body: serde_json::Value = req
+            .http
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str(c).ok())
+            .unwrap_or(serde_json::Value::Null);
+        // Mandatory fields must be present (snssai, nfId, updateFlag, pduSessionId).
+        assert_eq!(body["snssai"]["sst"], 1, "request must carry snssai");
+        assert!(body["nfId"].is_string(), "request must carry nfId");
+        assert!(
+            body["updateFlag"] == "INCREASE" || body["updateFlag"] == "DECREASE",
+            "updateFlag must be INCREASE/DECREASE"
+        );
+        let psi = body["pduSessionId"].as_u64().unwrap_or(0);
+        let admitted = psi != 99;
+        let mut resp = serde_json::json!({
+            "snssai": {"sst": 1},
+            "admittedFlag": admitted,
+            "maxNumPduSessions": 100,
+        });
+        if !admitted {
+            resp["rejectCause"] = serde_json::json!("QUOTA_EXCEEDED");
+        }
+        // TS 29.536: even a rejection is HTTP 200.
+        ogs_sbi::message::SbiResponse::with_status(200)
+            .with_json_body(&resp)
+            .unwrap_or_else(|_| ogs_sbi::message::SbiResponse::with_status(200))
+    }
+
+    #[tokio::test]
+    async fn nsac_pdu_session_admit_admitted_and_rejected() {
+        let port = free_port();
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(addr));
+        server
+            .start(stub_nsacf_handler)
+            .await
+            .expect("start stub NSACF");
+
+        let nsacf = NsacfEndpoint {
+            host: "127.0.0.1".into(),
+            port,
+        };
+
+        let run = async {
+            // Within quota -> Admitted
+            let res =
+                nsac_pdu_session_admit(&nsacf, "smf-1", "imsi-1", 5, 1, None).await;
+            assert_eq!(res, NsacAdmission::Admitted);
+
+            // Over-limit marker (psi 99) -> Rejected (200 + admittedFlag=false)
+            let res =
+                nsac_pdu_session_admit(&nsacf, "smf-1", "imsi-2", 99, 1, None).await;
+            assert_eq!(res, NsacAdmission::Rejected);
+
+            // DECREASE release is best-effort and must not panic
+            nsac_pdu_session_release(&nsacf, "smf-1", "imsi-1", 5, 1, None).await;
+        };
+        tokio::time::timeout(Duration::from_secs(10), run)
+            .await
+            .expect("round trip timed out");
+
+        server.stop().await.ok();
+    }
+
+    #[tokio::test]
+    async fn nsac_pdu_session_admit_unavailable_on_transport_error() {
+        // Nothing listening -> Unavailable (fail-open at the call site)
+        let nsacf = NsacfEndpoint {
+            host: "127.0.0.1".into(),
+            port: free_port(),
+        };
+        let res = tokio::time::timeout(
+            Duration::from_secs(8),
+            nsac_pdu_session_admit(&nsacf, "smf-1", "imsi-1", 5, 1, None),
+        )
+        .await
+        .expect("bounded");
+        assert_eq!(res, NsacAdmission::Unavailable);
+    }
+
+    #[test]
+    fn nsac_reject_uses_slice_specific_5gsm_cause() {
+        // TS 24.501 §9.11.4.2 cause #67 (insufficient resources for slice).
+        assert_eq!(gsm_cause::INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE, 67);
     }
 }

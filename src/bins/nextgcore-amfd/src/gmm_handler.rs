@@ -196,12 +196,19 @@ pub fn handle_registration_request(
         log::info!("UE indicates ProSe/Sidelink capability");
     }
 
-    // Network slice admission control (NSACF, TS 29.536)
-    // In production: would query NSACF for each requested S-NSSAI
-    amf_ue.slice_admission_granted = true;
+    // Network slice admission control (NSACF, TS 29.536 / TS 23.501 §5.15.11).
+    //
+    // The authoritative admission decision is taken on the live registration
+    // path (`ngap_path::complete_registration`), which performs the asynchronous
+    // Nnsacf_NSAC UE-admission query per Allowed S-NSSAI and gates Registration
+    // Accept on `admittedFlag`. This synchronous handler runs before the SBI
+    // calls and cannot issue the network query itself, so it leaves
+    // `slice_admission_granted` unset (false) here; the live path sets it from
+    // the NSACF response. No admission is fabricated.
+    amf_ue.slice_admission_granted = false;
     for snssai in &amf_ue.requested_nssai {
         log::debug!(
-            "Slice admission check: SST={}, SD={:?}",
+            "Slice pending NSACF admission: SST={}, SD={:?}",
             snssai.sst,
             snssai.sd
         );

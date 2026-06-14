@@ -3,7 +3,7 @@
 //! Strongly-typed representations of NGAP procedure messages per 3GPP TS 38.413.
 //! These types abstract over the raw ProtocolIeContainer and provide a convenient API.
 
-use ogs_asn1c::ngap::cause::Cause;
+pub use ogs_asn1c::ngap::cause::Cause;
 
 // ============================================================================
 // NG Setup (Section 9.2.6)
@@ -926,6 +926,21 @@ pub struct ErrorIndication {
     /// Criticality Diagnostics (optional)
     pub criticality_diagnostics: Option<CriticalityDiagnostics>,
 }
+
+/// Overload Start - sent by AMF to gNB (TS 38.413 Section 9.2.6.10).
+///
+/// All IEs are optional; the common deployment carries only a percentage
+/// traffic reduction request via TrafficLoadReductionIndication (1..99).
+#[derive(Debug, Clone, Default)]
+pub struct OverloadStart {
+    /// Traffic Load Reduction Indication (percentage 1..99, optional)
+    pub traffic_load_reduction: Option<u8>,
+}
+
+/// Overload Stop - sent by AMF to gNB (TS 38.413 Section 9.2.6.11).
+/// Carries only an optional OverloadStartNSSAIList, omitted here.
+#[derive(Debug, Clone, Default)]
+pub struct OverloadStop {}
 
 // ============================================================================
 // RAN Configuration Update (Section 8.7.2 / 9.2.6.7-9)

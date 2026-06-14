@@ -49,7 +49,16 @@ pub enum NgapMessage {
     AmfStatusIndication(AmfStatusIndication),
     NasNonDeliveryIndication(NasNonDeliveryIndication),
     HandoverRequired(HandoverRequired),
+    HandoverRequest(HandoverRequest),
+    HandoverRequestAcknowledge(HandoverRequestAcknowledge),
+    HandoverFailure(HandoverFailure),
+    HandoverCommand(HandoverCommand),
     HandoverPreparationFailure(HandoverPreparationFailure),
+    HandoverNotify(HandoverNotify),
+    HandoverCancel(HandoverCancel),
+    HandoverCancelAcknowledge(HandoverCancelAcknowledge),
+    OverloadStart(OverloadStart),
+    OverloadStop(OverloadStop),
     PathSwitchRequest(PathSwitchRequest),
     PathSwitchRequestAcknowledge(PathSwitchRequestAcknowledge),
     PathSwitchRequestFailure(PathSwitchRequestFailure),
@@ -164,6 +173,19 @@ fn decode_initiating_message(msg: InitiatingMessage) -> NgapResult<NgapMessage> 
                 ProcedureCode::HANDOVER_PREPARATION => {
                     Ok(NgapMessage::HandoverRequired(parse_handover_required(ies)?))
                 }
+                ProcedureCode::HANDOVER_RESOURCE_ALLOCATION => {
+                    Ok(NgapMessage::HandoverRequest(parse_handover_request(ies)?))
+                }
+                ProcedureCode::HANDOVER_NOTIFICATION => {
+                    Ok(NgapMessage::HandoverNotify(parse_handover_notify(ies)?))
+                }
+                ProcedureCode::HANDOVER_CANCEL => {
+                    Ok(NgapMessage::HandoverCancel(parse_handover_cancel(ies)?))
+                }
+                ProcedureCode::OVERLOAD_START => {
+                    Ok(NgapMessage::OverloadStart(parse_overload_start(ies)?))
+                }
+                ProcedureCode::OVERLOAD_STOP => Ok(NgapMessage::OverloadStop(OverloadStop {})),
                 ProcedureCode::PATH_SWITCH_REQUEST => Ok(NgapMessage::PathSwitchRequest(
                     parse_path_switch_request(ies)?,
                 )),
@@ -253,6 +275,17 @@ fn decode_successful_outcome(msg: SuccessfulOutcome) -> NgapResult<NgapMessage> 
                         parse_path_switch_request_acknowledge(ies)?,
                     ))
                 }
+                ProcedureCode::HANDOVER_PREPARATION => {
+                    Ok(NgapMessage::HandoverCommand(parse_handover_command(ies)?))
+                }
+                ProcedureCode::HANDOVER_RESOURCE_ALLOCATION => {
+                    Ok(NgapMessage::HandoverRequestAcknowledge(
+                        parse_handover_request_acknowledge(ies)?,
+                    ))
+                }
+                ProcedureCode::HANDOVER_CANCEL => Ok(NgapMessage::HandoverCancelAcknowledge(
+                    parse_handover_cancel_acknowledge(ies)?,
+                )),
                 _ => Ok(NgapMessage::Unknown {
                     procedure_code: msg.procedure_code.0,
                     message_type: "SuccessfulOutcome",
@@ -300,6 +333,9 @@ fn decode_unsuccessful_outcome(msg: UnsuccessfulOutcome) -> NgapResult<NgapMessa
                 ProcedureCode::HANDOVER_PREPARATION => Ok(NgapMessage::HandoverPreparationFailure(
                     parse_handover_preparation_failure(ies)?,
                 )),
+                ProcedureCode::HANDOVER_RESOURCE_ALLOCATION => {
+                    Ok(NgapMessage::HandoverFailure(parse_handover_failure(ies)?))
+                }
                 ProcedureCode::PATH_SWITCH_REQUEST => Ok(NgapMessage::PathSwitchRequestFailure(
                     parse_path_switch_request_failure(ies)?,
                 )),
@@ -1787,5 +1823,391 @@ fn parse_path_switch_request_failure(
         })?,
         released_list,
         criticality_diagnostics,
+    })
+}
+
+// ============================================================================
+// N2 Handover resource-allocation / notification / cancel parsers
+// (TS 38.413 Section 9.2.3)
+// ============================================================================
+
+/// Parse a HandoverRequest (HANDOVER_RESOURCE_ALLOCATION, InitiatingMessage).
+fn parse_handover_request(container: ProtocolIeContainer) -> NgapResult<HandoverRequest> {
+    let mut amf_ue_ngap_id = None;
+    let mut handover_type = None;
+    let mut cause = None;
+    let mut ue_ambr = None;
+    let mut ue_security_capabilities = None;
+    let mut security_context = None;
+    let mut pdu_session_list = None;
+    let mut allowed_nssai = None;
+    let mut source_to_target_container = None;
+    let mut guami = None;
+
+    for field in &container.ies {
+        match field.id {
+            ProtocolIeId::AMF_UE_NGAP_ID => {
+                amf_ue_ngap_id = Some(ie::decode_amf_ue_ngap_id(field)?);
+            }
+            ProtocolIeId::CAUSE => {
+                cause = Some(ie::decode_cause(field)?);
+            }
+            _ if field.id.0 == ie::IE_ID_HANDOVER_TYPE => {
+                handover_type = Some(ie::decode_handover_type(field)?);
+            }
+            _ if field.id.0 == ie::IE_ID_UE_AGGREGATE_MAXIMUM_BIT_RATE => {
+                ue_ambr = Some(ie::decode_ue_ambr(field)?);
+            }
+            _ if field.id.0 == ie::IE_ID_UE_SECURITY_CAPABILITIES => {
+                ue_security_capabilities = Some(ie::decode_ue_security_capabilities(field)?);
+            }
+            _ if field.id.0 == ie::IE_ID_SECURITY_CONTEXT => {
+                security_context = Some(ie::decode_security_context(field)?);
+            }
+            _ if field.id.0 == ie::IE_ID_PDU_SESSION_RESOURCE_SETUP_LIST_HO_REQ => {
+                pdu_session_list = Some(ie::decode_pdu_session_ho_request_list(field)?);
+            }
+            _ if field.id.0 == ie::IE_ID_ALLOWED_NSSAI => {
+                allowed_nssai = Some(ie::decode_allowed_nssai(field)?);
+            }
+            _ if field.id.0 == ie::IE_ID_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER => {
+                source_to_target_container = Some(ie::decode_raw_octet_ie(field)?);
+            }
+            _ if field.id.0 == ie::IE_ID_GUAMI => {
+                guami = Some(ie::decode_guami_ie(field)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(HandoverRequest {
+        amf_ue_ngap_id: amf_ue_ngap_id.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "AMF-UE-NGAP-ID",
+            ie_id: ProtocolIeId::AMF_UE_NGAP_ID.0,
+        })?,
+        handover_type: handover_type.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "HandoverType",
+            ie_id: ie::IE_ID_HANDOVER_TYPE,
+        })?,
+        cause: cause.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "Cause",
+            ie_id: ProtocolIeId::CAUSE.0,
+        })?,
+        ue_ambr: ue_ambr.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "UEAggregateMaximumBitRate",
+            ie_id: ie::IE_ID_UE_AGGREGATE_MAXIMUM_BIT_RATE,
+        })?,
+        ue_security_capabilities: ue_security_capabilities.ok_or(
+            NgapError::MissingMandatoryIe {
+                ie_name: "UESecurityCapabilities",
+                ie_id: ie::IE_ID_UE_SECURITY_CAPABILITIES,
+            },
+        )?,
+        security_context: security_context.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "SecurityContext",
+            ie_id: ie::IE_ID_SECURITY_CONTEXT,
+        })?,
+        pdu_session_list: pdu_session_list.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "PDUSessionResourceSetupListHOReq",
+            ie_id: ie::IE_ID_PDU_SESSION_RESOURCE_SETUP_LIST_HO_REQ,
+        })?,
+        allowed_nssai: allowed_nssai.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "AllowedNSSAI",
+            ie_id: ie::IE_ID_ALLOWED_NSSAI,
+        })?,
+        source_to_target_container: source_to_target_container.ok_or(
+            NgapError::MissingMandatoryIe {
+                ie_name: "SourceToTarget-TransparentContainer",
+                ie_id: ie::IE_ID_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER,
+            },
+        )?,
+        guami: guami.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "GUAMI",
+            ie_id: ie::IE_ID_GUAMI,
+        })?,
+    })
+}
+
+/// Parse a HandoverRequestAcknowledge (HANDOVER_RESOURCE_ALLOCATION, SuccessfulOutcome).
+fn parse_handover_request_acknowledge(
+    container: ProtocolIeContainer,
+) -> NgapResult<HandoverRequestAcknowledge> {
+    let mut amf_ue_ngap_id = None;
+    let mut ran_ue_ngap_id = None;
+    let mut admitted_list = None;
+    let mut failed_list = None;
+    let mut target_to_source_container = None;
+
+    for field in &container.ies {
+        match field.id {
+            ProtocolIeId::AMF_UE_NGAP_ID => {
+                amf_ue_ngap_id = Some(ie::decode_amf_ue_ngap_id(field)?);
+            }
+            ProtocolIeId::RAN_UE_NGAP_ID => {
+                ran_ue_ngap_id = Some(ie::decode_ran_ue_ngap_id(field)?);
+            }
+            _ if field.id.0 == ie::IE_ID_PDU_SESSION_RESOURCE_ADMITTED_LIST => {
+                admitted_list = Some(ie::decode_pdu_session_admitted_list(field)?);
+            }
+            _ if field.id.0 == ie::IE_ID_PDU_SESSION_RESOURCE_FAILED_TO_SETUP_LIST_HO_ACK => {
+                failed_list = Some(ie::decode_pdu_session_failed_list(field)?);
+            }
+            _ if field.id.0 == ie::IE_ID_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER => {
+                target_to_source_container = Some(ie::decode_raw_octet_ie(field)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(HandoverRequestAcknowledge {
+        amf_ue_ngap_id: amf_ue_ngap_id.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "AMF-UE-NGAP-ID",
+            ie_id: ProtocolIeId::AMF_UE_NGAP_ID.0,
+        })?,
+        ran_ue_ngap_id: ran_ue_ngap_id.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "RAN-UE-NGAP-ID",
+            ie_id: ProtocolIeId::RAN_UE_NGAP_ID.0,
+        })?,
+        admitted_list: admitted_list.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "PDUSessionResourceAdmittedList",
+            ie_id: ie::IE_ID_PDU_SESSION_RESOURCE_ADMITTED_LIST,
+        })?,
+        failed_list,
+        target_to_source_container: target_to_source_container.ok_or(
+            NgapError::MissingMandatoryIe {
+                ie_name: "TargetToSource-TransparentContainer",
+                ie_id: ie::IE_ID_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER,
+            },
+        )?,
+    })
+}
+
+/// Parse a HandoverFailure (HANDOVER_RESOURCE_ALLOCATION, UnsuccessfulOutcome).
+fn parse_handover_failure(container: ProtocolIeContainer) -> NgapResult<HandoverFailure> {
+    let mut amf_ue_ngap_id = None;
+    let mut cause = None;
+    let mut criticality_diagnostics = None;
+
+    for field in &container.ies {
+        match field.id {
+            ProtocolIeId::AMF_UE_NGAP_ID => {
+                amf_ue_ngap_id = Some(ie::decode_amf_ue_ngap_id(field)?);
+            }
+            ProtocolIeId::CAUSE => {
+                cause = Some(ie::decode_cause(field)?);
+            }
+            ProtocolIeId::CRITICALITY_DIAGNOSTICS => {
+                criticality_diagnostics = Some(ie::decode_criticality_diagnostics(field)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(HandoverFailure {
+        amf_ue_ngap_id: amf_ue_ngap_id.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "AMF-UE-NGAP-ID",
+            ie_id: ProtocolIeId::AMF_UE_NGAP_ID.0,
+        })?,
+        cause: cause.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "Cause",
+            ie_id: ProtocolIeId::CAUSE.0,
+        })?,
+        criticality_diagnostics,
+    })
+}
+
+/// Parse a HandoverCommand (HANDOVER_PREPARATION, SuccessfulOutcome).
+fn parse_handover_command(container: ProtocolIeContainer) -> NgapResult<HandoverCommand> {
+    let mut amf_ue_ngap_id = None;
+    let mut ran_ue_ngap_id = None;
+    let mut handover_type = None;
+    let mut nas_pdu = None;
+    let mut pdu_session_list = None;
+    let mut release_list = None;
+    let mut target_to_source_container = None;
+
+    for field in &container.ies {
+        match field.id {
+            ProtocolIeId::AMF_UE_NGAP_ID => {
+                amf_ue_ngap_id = Some(ie::decode_amf_ue_ngap_id(field)?);
+            }
+            ProtocolIeId::RAN_UE_NGAP_ID => {
+                ran_ue_ngap_id = Some(ie::decode_ran_ue_ngap_id(field)?);
+            }
+            ProtocolIeId::NAS_PDU => {
+                nas_pdu = Some(ie::decode_nas_pdu(field)?);
+            }
+            _ if field.id.0 == ie::IE_ID_HANDOVER_TYPE => {
+                handover_type = Some(ie::decode_handover_type(field)?);
+            }
+            _ if field.id.0 == ie::IE_ID_PDU_SESSION_RESOURCE_HANDOVER_LIST => {
+                pdu_session_list = Some(
+                    ie::decode_id_transfer_list(field)?
+                        .into_iter()
+                        .map(|(pdu_session_id, transfer)| PduSessionResourceHandoverItem {
+                            pdu_session_id,
+                            transfer,
+                        })
+                        .collect(),
+                );
+            }
+            _ if field.id.0 == ie::IE_ID_PDU_SESSION_RESOURCE_TO_RELEASE_LIST_REL_CMD => {
+                release_list = Some(ie::decode_pdu_session_release_list(field)?);
+            }
+            _ if field.id.0 == ie::IE_ID_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER => {
+                target_to_source_container = Some(ie::decode_raw_octet_ie(field)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(HandoverCommand {
+        amf_ue_ngap_id: amf_ue_ngap_id.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "AMF-UE-NGAP-ID",
+            ie_id: ProtocolIeId::AMF_UE_NGAP_ID.0,
+        })?,
+        ran_ue_ngap_id: ran_ue_ngap_id.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "RAN-UE-NGAP-ID",
+            ie_id: ProtocolIeId::RAN_UE_NGAP_ID.0,
+        })?,
+        handover_type: handover_type.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "HandoverType",
+            ie_id: ie::IE_ID_HANDOVER_TYPE,
+        })?,
+        nas_pdu,
+        pdu_session_list: pdu_session_list.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "PDUSessionResourceHandoverList",
+            ie_id: ie::IE_ID_PDU_SESSION_RESOURCE_HANDOVER_LIST,
+        })?,
+        release_list,
+        target_to_source_container: target_to_source_container.ok_or(
+            NgapError::MissingMandatoryIe {
+                ie_name: "TargetToSource-TransparentContainer",
+                ie_id: ie::IE_ID_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER,
+            },
+        )?,
+    })
+}
+
+/// Parse a HandoverNotify (HANDOVER_NOTIFICATION, InitiatingMessage).
+fn parse_handover_notify(container: ProtocolIeContainer) -> NgapResult<HandoverNotify> {
+    let mut amf_ue_ngap_id = None;
+    let mut ran_ue_ngap_id = None;
+    let mut user_location_info = None;
+
+    for field in &container.ies {
+        match field.id {
+            ProtocolIeId::AMF_UE_NGAP_ID => {
+                amf_ue_ngap_id = Some(ie::decode_amf_ue_ngap_id(field)?);
+            }
+            ProtocolIeId::RAN_UE_NGAP_ID => {
+                ran_ue_ngap_id = Some(ie::decode_ran_ue_ngap_id(field)?);
+            }
+            ProtocolIeId::USER_LOCATION_INFORMATION => {
+                user_location_info = Some(ie::decode_user_location_info(field)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(HandoverNotify {
+        amf_ue_ngap_id: amf_ue_ngap_id.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "AMF-UE-NGAP-ID",
+            ie_id: ProtocolIeId::AMF_UE_NGAP_ID.0,
+        })?,
+        ran_ue_ngap_id: ran_ue_ngap_id.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "RAN-UE-NGAP-ID",
+            ie_id: ProtocolIeId::RAN_UE_NGAP_ID.0,
+        })?,
+        user_location_info: user_location_info.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "UserLocationInformation",
+            ie_id: ProtocolIeId::USER_LOCATION_INFORMATION.0,
+        })?,
+    })
+}
+
+/// Parse a HandoverCancel (HANDOVER_CANCEL, InitiatingMessage).
+fn parse_handover_cancel(container: ProtocolIeContainer) -> NgapResult<HandoverCancel> {
+    let mut amf_ue_ngap_id = None;
+    let mut ran_ue_ngap_id = None;
+    let mut cause = None;
+
+    for field in &container.ies {
+        match field.id {
+            ProtocolIeId::AMF_UE_NGAP_ID => {
+                amf_ue_ngap_id = Some(ie::decode_amf_ue_ngap_id(field)?);
+            }
+            ProtocolIeId::RAN_UE_NGAP_ID => {
+                ran_ue_ngap_id = Some(ie::decode_ran_ue_ngap_id(field)?);
+            }
+            ProtocolIeId::CAUSE => {
+                cause = Some(ie::decode_cause(field)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(HandoverCancel {
+        amf_ue_ngap_id: amf_ue_ngap_id.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "AMF-UE-NGAP-ID",
+            ie_id: ProtocolIeId::AMF_UE_NGAP_ID.0,
+        })?,
+        ran_ue_ngap_id: ran_ue_ngap_id.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "RAN-UE-NGAP-ID",
+            ie_id: ProtocolIeId::RAN_UE_NGAP_ID.0,
+        })?,
+        cause: cause.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "Cause",
+            ie_id: ProtocolIeId::CAUSE.0,
+        })?,
+    })
+}
+
+/// Parse a HandoverCancelAcknowledge (HANDOVER_CANCEL, SuccessfulOutcome).
+fn parse_handover_cancel_acknowledge(
+    container: ProtocolIeContainer,
+) -> NgapResult<HandoverCancelAcknowledge> {
+    let mut amf_ue_ngap_id = None;
+    let mut ran_ue_ngap_id = None;
+    let mut criticality_diagnostics = None;
+
+    for field in &container.ies {
+        match field.id {
+            ProtocolIeId::AMF_UE_NGAP_ID => {
+                amf_ue_ngap_id = Some(ie::decode_amf_ue_ngap_id(field)?);
+            }
+            ProtocolIeId::RAN_UE_NGAP_ID => {
+                ran_ue_ngap_id = Some(ie::decode_ran_ue_ngap_id(field)?);
+            }
+            ProtocolIeId::CRITICALITY_DIAGNOSTICS => {
+                criticality_diagnostics = Some(ie::decode_criticality_diagnostics(field)?);
+            }
+            _ => {}
+        }
+    }
+
+    Ok(HandoverCancelAcknowledge {
+        amf_ue_ngap_id: amf_ue_ngap_id.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "AMF-UE-NGAP-ID",
+            ie_id: ProtocolIeId::AMF_UE_NGAP_ID.0,
+        })?,
+        ran_ue_ngap_id: ran_ue_ngap_id.ok_or(NgapError::MissingMandatoryIe {
+            ie_name: "RAN-UE-NGAP-ID",
+            ie_id: ProtocolIeId::RAN_UE_NGAP_ID.0,
+        })?,
+        criticality_diagnostics,
+    })
+}
+
+/// Parse an OverloadStart (OVERLOAD_START, InitiatingMessage). All IEs optional.
+fn parse_overload_start(container: ProtocolIeContainer) -> NgapResult<OverloadStart> {
+    let mut traffic_load_reduction = None;
+    for field in &container.ies {
+        if field.id.0 == ie::IE_ID_TRAFFIC_LOAD_REDUCTION_INDICATION {
+            traffic_load_reduction = Some(ie::decode_traffic_load_reduction(field)?);
+        }
+    }
+    Ok(OverloadStart {
+        traffic_load_reduction,
     })
 }

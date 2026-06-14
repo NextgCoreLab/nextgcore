@@ -76,6 +76,30 @@ fn self_sbi_uri() -> String {
         .unwrap_or_else(|| "http://127.0.0.1:7777".to_string())
 }
 
+/// This SMF's NF instance id, used as the `nfId` in Nnsacf_NSAC requests
+/// (TS 29.536). Falls back to a fixed label when the self-instance has not
+/// been registered (e.g. NRF-less dev runs).
+async fn self_nf_id() -> String {
+    global_context()
+        .get_self_instance()
+        .await
+        .map(|i| i.id)
+        .unwrap_or_else(|| "nextgcore-smf".to_string())
+}
+
+/// Roll back a previously-admitted NSACF PDU-session count (DECREASE) when a
+/// later establishment step fails after admission. No-op when `admitted` is
+/// false (no count was taken). Resolves the NSACF endpoint afresh; best-effort.
+async fn rollback_nsac(admitted: bool, supi: &str, psi: u8, sst: u8, sd: Option<&str>) {
+    if !admitted {
+        return;
+    }
+    if let Some(nsacf) = policy::resolve_nsacf_endpoint().await {
+        let nf_id = self_nf_id().await;
+        policy::nsac_pdu_session_release(&nsacf, &nf_id, supi, psi, sst, sd).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Typed YAML configuration structs (serde_yaml Deserialize)
 // ---------------------------------------------------------------------------
@@ -1673,6 +1697,61 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         }
     };
 
+    // ---- Nnsacf_NSAC: per-S-NSSAI PDU-session admission (TS 29.536 §5.3) ----
+    // Before committing PCF/PFCP resources, ask the NSACF (if deployed) whether
+    // a new PDU session may be admitted for this S-NSSAI. A rejection
+    // (admittedFlag=false) is a slice-quota exhaustion → reject the session
+    // with 5GSM cause #67 (insufficient resources for specific slice). The
+    // NSACF is optional: when none is configured/discoverable we skip the check
+    // (fail-open), and a transport/HTTP failure also fails open so a missing
+    // NSACF never blocks the basic data path.
+    let nsac_admitted = match policy::resolve_nsacf_endpoint().await {
+        None => {
+            log::debug!("No NSACF configured/discoverable — skipping slice admission control");
+            false
+        }
+        Some(nsacf) => {
+            let nf_id = self_nf_id().await;
+            match policy::nsac_pdu_session_admit(
+                &nsacf,
+                &nf_id,
+                &supi,
+                pdu_session_id,
+                sst,
+                snssai_sd.as_deref(),
+            )
+            .await
+            {
+                policy::NsacAdmission::Admitted => {
+                    log::info!(
+                        "NSACF admitted PDU session for S-NSSAI[SST:{sst} SD:{snssai_sd:?}]"
+                    );
+                    true
+                }
+                policy::NsacAdmission::Rejected => {
+                    log::warn!(
+                        "NSACF rejected PDU session for S-NSSAI[SST:{sst}] — \
+                         rejecting (5GSM cause 67)"
+                    );
+                    release_ip();
+                    return sm_context_create_error(
+                        403,
+                        "NSAC_PDU_SESSION_REJECTED",
+                        pdu_session_id,
+                        pti,
+                        policy::gsm_cause::INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE,
+                    );
+                }
+                policy::NsacAdmission::Unavailable => {
+                    log::warn!(
+                        "NSACF unreachable for slice admission — proceeding (fail-open)"
+                    );
+                    false
+                }
+            }
+        }
+    };
+
     // ---- GSM FSM: Initial → Wait5gcSmPolicyAssociation ----
     let sess_idx_u64 = sm_context_ref.parse::<u64>().unwrap_or(0);
     let mut fsm = gsm_sm::GsmFsm::new(sess_idx_u64);
@@ -1732,6 +1811,14 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     log::error!("PCF rejected SM policy (status={status}): {detail}");
                     fsm_dispatch_policy_response(&mut fsm, status);
                     release_ip();
+                    rollback_nsac(
+                        nsac_admitted,
+                        &supi,
+                        pdu_session_id,
+                        sst,
+                        snssai_sd.as_deref(),
+                    )
+                    .await;
                     return sm_context_create_error(
                         403,
                         "POLICY_REJECTED",
@@ -1746,6 +1833,14 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     log::error!("SM policy create failed: {e}");
                     fsm.transition_to(gsm_sm::GsmState::Exception);
                     release_ip();
+                    rollback_nsac(
+                        nsac_admitted,
+                        &supi,
+                        pdu_session_id,
+                        sst,
+                        snssai_sd.as_deref(),
+                    )
+                    .await;
                     return sm_context_create_error(
                         504,
                         "PCF_NOT_RESPONDING",
@@ -1884,6 +1979,14 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
                     }
                 }
                 release_ip();
+                rollback_nsac(
+                    nsac_admitted,
+                    &supi,
+                    pdu_session_id,
+                    sst,
+                    snssai_sd.as_deref(),
+                )
+                .await;
                 return sm_context_create_error(
                     504,
                     "UPF_NOT_RESPONDING",
@@ -1948,6 +2051,14 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         Err(e) => {
             log::error!("Failed to encode PDUSessionResourceSetupRequestTransfer: {e:?}");
             release_ip();
+            rollback_nsac(
+                nsac_admitted,
+                &supi,
+                pdu_session_id,
+                sst,
+                snssai_sd.as_deref(),
+            )
+            .await;
             return sm_context_create_error(
                 500,
                 "SYSTEM_FAILURE",

@@ -52,6 +52,23 @@ const SCTP_RECV_TIMEOUT: Duration = Duration::from_millis(100);
 /// Non-3GPP access uses 0x02; both match the stored `AmfUe::access_type`.
 const ACCESS_TYPE_3GPP: u8 = 0x01;
 
+/// NGAP elementary-procedure codes (TS 38.413 Section 9.3.1.2) used by the
+/// procedure dispatch. Sourced from the ogs-asn1c `ProcedureCode` table so
+/// the wire byte we read at `data[1]` is matched against spec constants, not
+/// magic numbers.
+mod proc_code {
+    use ogs_asn1c::ngap::types::ProcedureCode;
+    pub const ERROR_INDICATION: u16 = ProcedureCode::ERROR_INDICATION.0 as u16;
+    pub const HANDOVER_CANCEL: u16 = ProcedureCode::HANDOVER_CANCEL.0 as u16;
+    pub const HANDOVER_NOTIFICATION: u16 = ProcedureCode::HANDOVER_NOTIFICATION.0 as u16;
+    pub const HANDOVER_PREPARATION: u16 = ProcedureCode::HANDOVER_PREPARATION.0 as u16;
+    pub const HANDOVER_RESOURCE_ALLOCATION: u16 =
+        ProcedureCode::HANDOVER_RESOURCE_ALLOCATION.0 as u16;
+    pub const OVERLOAD_START: u16 = ProcedureCode::OVERLOAD_START.0 as u16;
+    pub const OVERLOAD_STOP: u16 = ProcedureCode::OVERLOAD_STOP.0 as u16;
+    pub const PATH_SWITCH_REQUEST: u16 = ProcedureCode::PATH_SWITCH_REQUEST.0 as u16;
+}
+
 // ============================================================================
 // NGAP Server State
 // ============================================================================
@@ -485,101 +502,110 @@ impl NgapServer {
                     log::info!("NG Reset Acknowledge from association {association_id}");
                 }
             }
-            Some(22) | Some(23) => {
-                // OverloadStart (22) / OverloadStop (23) are AMF->gNB procedures
-                // (TS 38.413 Sections 8.7.6/8.7.7); receiving one from a gNB is a
-                // logical error. ogs-ngap does not expose a codec for them, so the
-                // PDU is ignored after logging.
+            Some(proc_code::OVERLOAD_START) | Some(proc_code::OVERLOAD_STOP) => {
+                // OverloadStart/OverloadStop are AMF->gNB procedures (TS 38.413
+                // Sections 8.7.6/8.7.7); receiving one from a gNB is a logical
+                // error. Acknowledge with an ErrorIndication carrying
+                // protocol/message-not-compatible (TS 38.413 Section 8.7.5).
                 log::warn!(
-                    "Overload{} received from association {association_id}: not applicable in gNB->AMF direction, ignoring",
-                    if procedure_code == Some(22) { "Start" } else { "Stop" }
+                    "Overload{} received from association {association_id}: not applicable in gNB->AMF direction",
+                    if procedure_code == Some(proc_code::OVERLOAD_START) {
+                        "Start"
+                    } else {
+                        "Stop"
+                    }
                 );
+                self.send_error_indication(
+                    association_id,
+                    None,
+                    None,
+                    ogs_ngap::types::Cause::Protocol(
+                        ogs_asn1c::ngap::cause::CauseProtocol::MessageNotCompatibleWithReceiverState,
+                    ),
+                )
+                .await?;
             }
-            Some(0) => {
-                // HandoverPreparation (procedure code 0)
-                // InitiatingMessage = HandoverRequired from source gNB
-                // SuccessfulOutcome  = HandoverCommand to source gNB (AMF-initiated)
-                // UnsuccessfulOutcome = HandoverPreparationFailure
+            Some(proc_code::ERROR_INDICATION) => {
+                // ErrorIndication from the gNB (TS 38.413 Section 8.7.5). The AMF
+                // never replies to an ErrorIndication; it logs the diagnosis.
+                self.handle_error_indication(association_id, data).await?;
+            }
+            Some(proc_code::HANDOVER_PREPARATION) => {
+                // HandoverPreparation: InitiatingMessage = HandoverRequired from
+                // the source gNB (TS 38.413 Section 8.4.1). HandoverCommand /
+                // HandoverPreparationFailure are AMF->gNB.
                 if data[0] == 0x00 {
-                    log::info!("HandoverRequired from association {association_id}");
-                } else if data[0] == 0x20 {
-                    log::info!(
-                        "HandoverCommand SuccessfulOutcome from association {association_id}"
+                    self.handle_handover_required(association_id, data).await?;
+                } else {
+                    log::warn!(
+                        "Unexpected HandoverPreparation outcome from association {association_id}"
                     );
-                } else {
-                    log::warn!("HandoverPreparationFailure from association {association_id}");
-                }
-                if let Some(session) = self.sessions.read().await.get(&association_id) {
-                    let event = AmfEvent::ngap_message(session.id, data.to_vec());
-                    let _ = self.event_tx.send(event).await;
                 }
             }
-            Some(1) => {
-                // HandoverResourceAllocation (procedure code 1)
-                // InitiatingMessage = HandoverRequest to target gNB (AMF-initiated)
-                // SuccessfulOutcome  = HandoverRequestAcknowledge from target gNB
-                // UnsuccessfulOutcome = HandoverFailure from target gNB
-                if data[0] == 0x00 {
-                    log::info!(
-                        "HandoverRequest InitiatingMessage from association {association_id}"
+            Some(proc_code::HANDOVER_RESOURCE_ALLOCATION) => {
+                // HandoverResourceAllocation: SuccessfulOutcome =
+                // HandoverRequestAcknowledge, UnsuccessfulOutcome =
+                // HandoverFailure, both from the target gNB (TS 38.413 8.4.2).
+                if data[0] == 0x20 {
+                    self.handle_handover_request_acknowledge(association_id, data)
+                        .await?;
+                } else if data[0] == 0x40 {
+                    self.handle_handover_failure(association_id, data).await?;
+                } else {
+                    log::warn!(
+                        "HandoverRequest InitiatingMessage is AMF->gNB; unexpected from association {association_id}"
                     );
-                } else if data[0] == 0x20 {
-                    log::info!("HandoverRequestAcknowledge from association {association_id}");
-                } else {
-                    log::warn!("HandoverFailure from association {association_id}");
-                }
-                if let Some(session) = self.sessions.read().await.get(&association_id) {
-                    let event = AmfEvent::ngap_message(session.id, data.to_vec());
-                    let _ = self.event_tx.send(event).await;
                 }
             }
-            Some(3) => {
-                // PathSwitchRequest (procedure code 3)
-                // InitiatingMessage = PathSwitchRequest from target gNB (Xn-based HO)
-                // SuccessfulOutcome  = PathSwitchRequestAcknowledge
-                // UnsuccessfulOutcome = PathSwitchRequestFailure
+            Some(proc_code::PATH_SWITCH_REQUEST) => {
+                // PathSwitchRequest: InitiatingMessage from the target gNB for
+                // an Xn-based handover (TS 38.413 Section 8.4.4).
                 if data[0] == 0x00 {
-                    log::info!("PathSwitchRequest from association {association_id}");
-                } else if data[0] == 0x20 {
-                    log::info!("PathSwitchRequestAcknowledge from association {association_id}");
+                    self.handle_path_switch_request(association_id, data)
+                        .await?;
                 } else {
-                    log::warn!("PathSwitchRequestFailure from association {association_id}");
-                }
-                if let Some(session) = self.sessions.read().await.get(&association_id) {
-                    let event = AmfEvent::ngap_message(session.id, data.to_vec());
-                    let _ = self.event_tx.send(event).await;
+                    log::warn!(
+                        "PathSwitch ack/failure are AMF->gNB; unexpected from association {association_id}"
+                    );
                 }
             }
-            Some(25) => {
-                // HandoverCancel (procedure code 25)
-                // InitiatingMessage = HandoverCancel from source gNB
-                // SuccessfulOutcome  = HandoverCancelAcknowledge
+            Some(proc_code::HANDOVER_CANCEL) => {
+                // HandoverCancel: InitiatingMessage = HandoverCancel from the
+                // source gNB (TS 38.413 Section 8.4.5).
                 if data[0] == 0x00 {
-                    log::info!("HandoverCancel from association {association_id}");
-                } else if data[0] == 0x20 {
-                    log::info!("HandoverCancelAcknowledge from association {association_id}");
-                }
-                if let Some(session) = self.sessions.read().await.get(&association_id) {
-                    let event = AmfEvent::ngap_message(session.id, data.to_vec());
-                    let _ = self.event_tx.send(event).await;
+                    self.handle_handover_cancel(association_id, data).await?;
+                } else {
+                    log::info!(
+                        "HandoverCancelAcknowledge is AMF->gNB; ignoring from association {association_id}"
+                    );
                 }
             }
-            Some(27) => {
-                // HandoverNotification (procedure code 27)
-                // InitiatingMessage = HandoverNotify from target gNB
-                log::info!("HandoverNotify from association {association_id}");
-                if let Some(session) = self.sessions.read().await.get(&association_id) {
-                    let event = AmfEvent::ngap_message(session.id, data.to_vec());
-                    let _ = self.event_tx.send(event).await;
-                }
+            Some(proc_code::HANDOVER_NOTIFICATION) => {
+                // HandoverNotification: HandoverNotify from the target gNB
+                // confirms the UE arrived (TS 38.413 Section 8.4.3).
+                self.handle_handover_notify(association_id, data).await?;
             }
             _ => {
-                log::debug!("Unknown procedure code, forwarding to FSM");
-                // Create NGAP event for FSM processing
-                if let Some(session) = self.sessions.read().await.get(&association_id) {
-                    let event = AmfEvent::ngap_message(session.id, data.to_vec());
-                    let _ = self.event_tx.send(event).await;
-                }
+                // Unknown / unsupported procedure: the PDU is either undecodable
+                // or for a procedure the AMF does not implement. Per TS 38.413
+                // Section 10.3, respond with an ErrorIndication carrying the
+                // appropriate protocol cause rather than silently dropping it.
+                log::warn!(
+                    "Unhandled NGAP procedure_code={procedure_code:?} from association {association_id}; emitting ErrorIndication"
+                );
+                let cause = match procedure_code {
+                    Some(_) => ogs_ngap::types::Cause::Protocol(
+                        ogs_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+                    ),
+                    None => ogs_ngap::types::Cause::Protocol(
+                        ogs_asn1c::ngap::cause::CauseProtocol::TransferSyntaxError,
+                    ),
+                };
+                // Best-effort: include the UE NGAP IDs if they can be located.
+                let amf_ue_ngap_id = crate::ngap_asn1::extract_amf_ue_ngap_id(data);
+                let ran_ue_ngap_id = crate::ngap_asn1::extract_ran_ue_ngap_id(data);
+                self.send_error_indication(association_id, amf_ue_ngap_id, ran_ue_ngap_id, cause)
+                    .await?;
             }
         }
 
@@ -1881,6 +1907,80 @@ impl NgapServer {
     ) -> Result<()> {
         log::info!("Security Mode Complete from UE {amf_ue_ngap_id}");
 
+        // Anti-bidding-down check (TS 24.501 Section 4.4.2.4 / TS 33.501
+        // Section 6.7.2): the UE replays its complete initial RegistrationRequest
+        // inside the (now integrity-protected) NAS message container of the
+        // Security Mode Complete. The AMF re-parses the UE security capabilities
+        // from that protected copy and compares them against the capabilities it
+        // received in the cleartext initial RegistrationRequest. A mismatch means
+        // an attacker tampered with the unprotected initial message to downgrade
+        // the algorithms; the AMF aborts with 5GMM cause #23.
+        if let Some(replayed) = extract_nas_message_container(nas) {
+            if let Some(inner) = parse_registration_request_pdu(&replayed) {
+                if let Some(replayed_caps) = inner.sec_cap {
+                    let stored = self
+                        .ue_auth_state
+                        .get(&amf_ue_ngap_id)
+                        .map(|s| s.amf_ue.ue_security_capability.clone());
+                    if let Some(stored) = stored {
+                        if replayed_caps.ea != stored.ea
+                            || replayed_caps.ia != stored.ia
+                            || replayed_caps.eea != stored.eea
+                            || replayed_caps.eia != stored.eia
+                        {
+                            log::error!(
+                                "Bidding-down detected for UE {amf_ue_ngap_id}: replayed caps \
+                                 (EA={:#04x},IA={:#04x},EEA={:#04x},EIA={:#04x}) != initial \
+                                 (EA={:#04x},IA={:#04x},EEA={:#04x},EIA={:#04x})",
+                                replayed_caps.ea,
+                                replayed_caps.ia,
+                                replayed_caps.eea,
+                                replayed_caps.eia,
+                                stored.ea,
+                                stored.ia,
+                                stored.eea,
+                                stored.eia
+                            );
+                            // Security Mode Reject (#23), then abort the
+                            // registration and release the UE context.
+                            let reject = gmm_build::build_security_mode_reject(
+                                GmmCause::UeSecurityCapabilitiesMismatch,
+                            );
+                            self.send_nas_pdu(
+                                association_id,
+                                amf_ue_ngap_id,
+                                ran_ue_ngap_id,
+                                &reject,
+                            )
+                            .await?;
+                            let reg_reject = gmm_build::build_registration_reject(
+                                GmmCause::UeSecurityCapabilitiesMismatch,
+                            );
+                            self.send_nas_pdu(
+                                association_id,
+                                amf_ue_ngap_id,
+                                ran_ue_ngap_id,
+                                &reg_reject,
+                            )
+                            .await?;
+                            self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 23)
+                                .await?;
+                            return Ok(());
+                        }
+                        log::info!(
+                            "UE {amf_ue_ngap_id} security capabilities verified against replayed \
+                             RegistrationRequest (no bidding-down)"
+                        );
+                    }
+                }
+            } else {
+                log::warn!(
+                    "Security Mode Complete NAS message container did not contain a \
+                     parseable RegistrationRequest for UE {amf_ue_ngap_id}"
+                );
+            }
+        }
+
         let mut need_pei = false;
         {
             let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) else {
@@ -2091,6 +2191,76 @@ impl NgapServer {
             }
         }
         state.amf_ue.allowed_nssai = allowed;
+
+        // Network Slice Admission Control (TS 29.536 / TS 23.501 §5.15.11):
+        // query the NSACF for each Allowed S-NSSAI subject to admission control
+        // before accepting the registration. The NSACF returns HTTP 200 with
+        // admittedFlag=false when the per-slice UE quota is exhausted; in that
+        // case the registration is rejected with 5GMM cause #69 (insufficient
+        // resources for the specific slice, TS 24.501 Annex A).
+        {
+            let (nsacf_host, nsacf_port) = crate::sbi_path::resolve_nf_endpoint_async(
+                crate::sbi_path::SbiServiceType::NnsacfNsac,
+            )
+            .await
+            .unwrap_or_else(|_| ("127.0.0.1".to_string(), 7777));
+            let access_type = if state.amf_ue.access_type == 0 || state.amf_ue.access_type == 1 {
+                "3GPP_ACCESS"
+            } else {
+                "NON_3GPP_ACCESS"
+            };
+            let nf_id = amf_instance_id();
+            let mut admission_denied: Option<SNssai> = None;
+            for snssai in state.amf_ue.allowed_nssai.clone() {
+                match crate::sbi_path::call_nsacf_ue_admission(
+                    &nsacf_host,
+                    nsacf_port,
+                    &nf_id,
+                    snssai.sst,
+                    snssai.sd,
+                    access_type,
+                    true, // updateFlag: enforce/increase the per-slice UE count
+                )
+                .await
+                {
+                    Ok(res) => {
+                        state.amf_ue.slice_admission_granted = res.admitted;
+                        if !res.admitted {
+                            admission_denied = Some(snssai);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        // NSACF unreachable: admission control cannot be
+                        // performed. Per TS 23.501 §5.15.11 the AMF treats the
+                        // slice as not-admitted to avoid exceeding quotas.
+                        log::error!(
+                            "[{supi}] NSACF UE admission query failed for SST={}: {e}",
+                            snssai.sst
+                        );
+                        state.amf_ue.slice_admission_granted = false;
+                        admission_denied = Some(snssai);
+                        break;
+                    }
+                }
+            }
+            if let Some(denied) = admission_denied {
+                log::warn!(
+                    "[{supi}] Slice admission denied by NSACF (SST={}, SD={:?}); rejecting registration",
+                    denied.sst,
+                    denied.sd
+                );
+                let reject = gmm_build::build_registration_reject(
+                    GmmCause::InsufficientResourcesForSpecificSlice,
+                );
+                self.ue_auth_state.insert(amf_ue_ngap_id, state);
+                self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                    .await?;
+                self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                    .await?;
+                return Ok(());
+            }
+        }
 
         // Subscribed UE-AMBR (UDM am-data, TS 29.571 BitRate strings) — carried
         // to the gNB in the Initial Context Setup Request (TS 38.413 §9.3.1.58).
@@ -2994,6 +3164,675 @@ impl NgapServer {
         Ok(())
     }
 
+    // ========================================================================
+    // Error Indication (TS 38.413 Section 8.7.5)
+    // ========================================================================
+
+    /// Send an NGAP ErrorIndication to a gNB (TS 38.413 Section 8.7.5).
+    ///
+    /// Emitted when the AMF receives an undecodable PDU, a PDU for an
+    /// unimplemented/unexpected procedure, or a UE-associated message it cannot
+    /// process. The AMF-UE-NGAP-ID / RAN-UE-NGAP-ID are included when known so
+    /// the gNB can correlate the indication to a UE association.
+    async fn send_error_indication(
+        &mut self,
+        association_id: u64,
+        amf_ue_ngap_id: Option<u64>,
+        ran_ue_ngap_id: Option<u32>,
+        cause: ogs_ngap::types::Cause,
+    ) -> Result<()> {
+        let msg = ogs_ngap::types::ErrorIndication {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            cause: Some(cause),
+            criticality_diagnostics: None,
+        };
+        match ogs_ngap::builder::build_error_indication(&msg) {
+            Ok(bytes) => {
+                self.send_to_association(association_id, &bytes).await?;
+                log::info!(
+                    "ErrorIndication sent to association {association_id} \
+                     (amf_ue_ngap_id={amf_ue_ngap_id:?}, ran_ue_ngap_id={ran_ue_ngap_id:?})"
+                );
+            }
+            Err(e) => log::error!("Failed to build ErrorIndication: {e}"),
+        }
+        Ok(())
+    }
+
+    /// Handle an inbound ErrorIndication from a gNB (TS 38.413 Section 8.7.5).
+    /// The AMF never replies; it logs the reported cause/diagnostics for the
+    /// affected UE association so operators can trace the protocol error.
+    async fn handle_error_indication(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
+        match ogs_ngap::parser::decode_ngap_pdu(data) {
+            Ok(ogs_ngap::NgapMessage::ErrorIndication(ei)) => {
+                log::warn!(
+                    "ErrorIndication from association {association_id}: \
+                     amf_ue_ngap_id={:?}, ran_ue_ngap_id={:?}, cause={:?}",
+                    ei.amf_ue_ngap_id,
+                    ei.ran_ue_ngap_id,
+                    ei.cause
+                );
+            }
+            Ok(other) => {
+                log::warn!("Expected ErrorIndication, decoded {other:?}");
+            }
+            Err(e) => {
+                log::error!("Failed to decode ErrorIndication: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    // ========================================================================
+    // AMF-initiated Overload Start / Stop (TS 38.413 Sections 8.7.6/8.7.7)
+    // ========================================================================
+
+    /// Broadcast an AMF-initiated Overload Start to every connected gNB
+    /// (TS 38.413 Section 8.7.6). `reduce_percent` is the requested traffic
+    /// reduction (OverloadResponse = Overload Action, here the percentage
+    /// variant `OverloadStartNSSAIList`-less form via OverloadResponse).
+    pub async fn send_overload_start(&mut self, reduce_percent: u8) -> Result<()> {
+        let bytes = match crate::ngap_asn1::build_overload_start_asn1(reduce_percent) {
+            Some(b) => b,
+            None => {
+                log::error!("Failed to build OverloadStart");
+                return Ok(());
+            }
+        };
+        let assoc_ids: Vec<u64> = self.sessions.read().await.keys().copied().collect();
+        for assoc_id in assoc_ids {
+            self.send_to_association(assoc_id, &bytes).await?;
+        }
+        log::info!("OverloadStart broadcast (reduce {reduce_percent}%)");
+        Ok(())
+    }
+
+    /// Broadcast an AMF-initiated Overload Stop to every connected gNB
+    /// (TS 38.413 Section 8.7.7).
+    pub async fn send_overload_stop(&mut self) -> Result<()> {
+        let bytes = match crate::ngap_asn1::build_overload_stop_asn1() {
+            Some(b) => b,
+            None => {
+                log::error!("Failed to build OverloadStop");
+                return Ok(());
+            }
+        };
+        let assoc_ids: Vec<u64> = self.sessions.read().await.keys().copied().collect();
+        for assoc_id in assoc_ids {
+            self.send_to_association(assoc_id, &bytes).await?;
+        }
+        log::info!("OverloadStop broadcast");
+        Ok(())
+    }
+
+    // ========================================================================
+    // N2 Handover (TS 38.413 Section 8.4) and Xn Path Switch (Section 8.4.4)
+    // ========================================================================
+
+    /// Handle a HandoverRequired from the source gNB (TS 38.413 Section 8.4.1).
+    ///
+    /// For an intra-AMF / Xn-less N2 handover the AMF would forward the
+    /// SourceToTarget container to the target gNB in a HandoverRequest. Reaching
+    /// the target requires resolving its NG association from the TargetID, which
+    /// is cross-gNB state. When the target cannot be resolved on this AMF the
+    /// preparation is rejected with HandoverPreparationFailure carrying the
+    /// spec cause (TS 38.413 Section 9.2.3.6), rather than being dropped.
+    async fn handle_handover_required(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
+        let required = match ogs_ngap::parser::decode_ngap_pdu(data) {
+            Ok(ogs_ngap::NgapMessage::HandoverRequired(r)) => r,
+            Ok(other) => {
+                log::warn!("Expected HandoverRequired, decoded {other:?}");
+                return Ok(());
+            }
+            Err(e) => {
+                log::error!("Failed to decode HandoverRequired: {e}");
+                self.send_error_indication(
+                    association_id,
+                    None,
+                    None,
+                    ogs_ngap::types::Cause::Protocol(
+                        ogs_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        log::info!(
+            "HandoverRequired (amf_ue_ngap_id={}, ran_ue_ngap_id={}, type={:?})",
+            required.amf_ue_ngap_id,
+            required.ran_ue_ngap_id,
+            required.handover_type
+        );
+
+        // Locate the target gNB association from the TargetID's Global RAN Node
+        // ID. Without a matching connected gNB the AMF cannot allocate handover
+        // resources (inter-AMF / N2 relocation needs Namf_Communication, which
+        // is out of scope here).
+        let target_assoc = self
+            .find_association_for_target(&required.target_id)
+            .await;
+
+        if target_assoc.is_none() {
+            log::warn!(
+                "HandoverRequired: target gNB not reachable on this AMF; \
+                 rejecting with HandoverPreparationFailure"
+            );
+            let failure = ogs_ngap::types::HandoverPreparationFailure {
+                amf_ue_ngap_id: required.amf_ue_ngap_id,
+                ran_ue_ngap_id: required.ran_ue_ngap_id,
+                cause: ogs_ngap::types::Cause::RadioNetwork(
+                    ogs_asn1c::ngap::cause::CauseRadioNetwork::UnknownTargetId,
+                ),
+                criticality_diagnostics: None,
+            };
+            if let Ok(bytes) = ogs_ngap::builder::build_handover_preparation_failure(&failure) {
+                self.send_to_association(association_id, &bytes).await?;
+            }
+            return Ok(());
+        }
+
+        // Intra-AMF path: forward a HandoverRequest to the target gNB built from
+        // the source UE context. Cross-gNB UE-context relocation (new
+        // RAN-UE-NGAP-ID allocation at the target, T304 supervision, the
+        // HandoverRequestAcknowledge->HandoverCommand stitching) is tracked as
+        // future work; we emit the HandoverRequest with the source container so
+        // the target can begin admission.
+        let target_assoc = target_assoc.expect("checked is_some");
+        let Some(state) = self.ue_auth_state.get(&required.amf_ue_ngap_id) else {
+            log::warn!(
+                "HandoverRequired for unknown UE {}; rejecting",
+                required.amf_ue_ngap_id
+            );
+            let failure = ogs_ngap::types::HandoverPreparationFailure {
+                amf_ue_ngap_id: required.amf_ue_ngap_id,
+                ran_ue_ngap_id: required.ran_ue_ngap_id,
+                cause: ogs_ngap::types::Cause::RadioNetwork(
+                    ogs_asn1c::ngap::cause::CauseRadioNetwork::UnknownLocalUeNgapId,
+                ),
+                criticality_diagnostics: None,
+            };
+            if let Ok(bytes) = ogs_ngap::builder::build_handover_preparation_failure(&failure) {
+                self.send_to_association(association_id, &bytes).await?;
+            }
+            return Ok(());
+        };
+
+        let (guami_plmn, amf_region, amf_set, amf_pointer) = {
+            let ctx = self.amf_context.read().await;
+            match ctx.served_guami.first() {
+                Some(g) => (
+                    g.plmn_id.clone(),
+                    g.amf_id.region,
+                    g.amf_id.set,
+                    g.amf_id.pointer,
+                ),
+                None => (state.amf_ue.nr_tai.plmn_id.clone(), 2u8, 1u16, 0u8),
+            }
+        };
+
+        let ho_request = ogs_ngap::types::HandoverRequest {
+            amf_ue_ngap_id: required.amf_ue_ngap_id,
+            handover_type: required.handover_type,
+            cause: required.cause,
+            ue_ambr: ogs_ngap::types::UeAmbrInfo {
+                dl: state.amf_ue.ue_ambr.downlink.max(1),
+                ul: state.amf_ue.ue_ambr.uplink.max(1),
+            },
+            ue_security_capabilities: ue_caps_to_ngap(&state.amf_ue.ue_security_capability),
+            security_context: ogs_ngap::types::SecurityContext {
+                next_hop_chaining_count: state.amf_ue.nhcc,
+                next_hop: state.amf_ue.nh,
+            },
+            pdu_session_list: required
+                .pdu_session_list
+                .iter()
+                .map(|p| ogs_ngap::types::PduSessionResourceSetupItemHoReq {
+                    pdu_session_id: p.pdu_session_id,
+                    s_nssai: state
+                        .amf_ue
+                        .allowed_nssai
+                        .first()
+                        .map(|s| ogs_ngap::types::SNssai {
+                            sst: s.sst,
+                            sd: s.sd.map(|sd| sd.to_be_bytes()[1..4].try_into().unwrap()),
+                        })
+                        .unwrap_or(ogs_ngap::types::SNssai { sst: 1, sd: None }),
+                    transfer: p.transfer.clone(),
+                })
+                .collect(),
+            allowed_nssai: state
+                .amf_ue
+                .allowed_nssai
+                .iter()
+                .map(|s| ogs_ngap::types::SNssai {
+                    sst: s.sst,
+                    sd: s.sd.map(|sd| sd.to_be_bytes()[1..4].try_into().unwrap()),
+                })
+                .collect(),
+            source_to_target_container: required.source_to_target_container.clone(),
+            guami: ogs_ngap::types::Guami {
+                plmn_identity: plmn_id_to_ngap_bytes(&guami_plmn),
+                amf_region_id: amf_region,
+                amf_set_id: amf_set,
+                amf_pointer,
+            },
+        };
+
+        match ogs_ngap::builder::build_handover_request(&ho_request) {
+            Ok(bytes) => {
+                self.send_to_association(target_assoc, &bytes).await?;
+                log::info!(
+                    "HandoverRequest forwarded to target association {target_assoc} \
+                     for UE {}",
+                    required.amf_ue_ngap_id
+                );
+            }
+            Err(e) => {
+                log::error!("Failed to build HandoverRequest: {e}");
+                let failure = ogs_ngap::types::HandoverPreparationFailure {
+                    amf_ue_ngap_id: required.amf_ue_ngap_id,
+                    ran_ue_ngap_id: required.ran_ue_ngap_id,
+                    cause: ogs_ngap::types::Cause::Protocol(
+                        ogs_asn1c::ngap::cause::CauseProtocol::Unspecified,
+                    ),
+                    criticality_diagnostics: None,
+                };
+                if let Ok(b) = ogs_ngap::builder::build_handover_preparation_failure(&failure) {
+                    self.send_to_association(association_id, &b).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle a HandoverRequestAcknowledge from the target gNB
+    /// (TS 38.413 Section 8.4.2). The AMF stitches the TargetToSource container
+    /// into a HandoverCommand back to the source gNB.
+    async fn handle_handover_request_acknowledge(
+        &mut self,
+        association_id: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        let ack = match ogs_ngap::parser::decode_ngap_pdu(data) {
+            Ok(ogs_ngap::NgapMessage::HandoverRequestAcknowledge(a)) => a,
+            Ok(other) => {
+                log::warn!("Expected HandoverRequestAcknowledge, decoded {other:?}");
+                return Ok(());
+            }
+            Err(e) => {
+                log::error!("Failed to decode HandoverRequestAcknowledge: {e}");
+                return Ok(());
+            }
+        };
+        log::info!(
+            "HandoverRequestAcknowledge from association {association_id} \
+             (amf_ue_ngap_id={}, admitted {} sessions)",
+            ack.amf_ue_ngap_id,
+            ack.admitted_list.len()
+        );
+
+        // Resolve the source gNB association for this UE. The source is the gNB
+        // that issued the original HandoverRequired (its NG association is the
+        // one currently holding the UE auth state).
+        let source_assoc = self
+            .ue_auth_state
+            .get(&ack.amf_ue_ngap_id)
+            .map(|s| s.association_id);
+        let Some(source_assoc) = source_assoc else {
+            log::warn!(
+                "HandoverRequestAcknowledge for unknown UE {}; cannot send HandoverCommand",
+                ack.amf_ue_ngap_id
+            );
+            return Ok(());
+        };
+        let (ran_ue_ngap_id, handover_type) = {
+            let state = self
+                .ue_auth_state
+                .get(&ack.amf_ue_ngap_id)
+                .expect("checked");
+            (state.ran_ue_ngap_id, ogs_ngap::types::HandoverType::Intra5gs)
+        };
+
+        let command = ogs_ngap::types::HandoverCommand {
+            amf_ue_ngap_id: ack.amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            handover_type,
+            nas_pdu: None,
+            pdu_session_list: ack
+                .admitted_list
+                .iter()
+                .map(|a| ogs_ngap::types::PduSessionResourceHandoverItem {
+                    pdu_session_id: a.pdu_session_id,
+                    transfer: a.transfer.clone(),
+                })
+                .collect(),
+            release_list: None,
+            target_to_source_container: ack.target_to_source_container.clone(),
+        };
+        match ogs_ngap::builder::build_handover_command(&command) {
+            Ok(bytes) => {
+                self.send_to_association(source_assoc, &bytes).await?;
+                log::info!(
+                    "HandoverCommand sent to source association {source_assoc} for UE {}",
+                    ack.amf_ue_ngap_id
+                );
+            }
+            Err(e) => log::error!("Failed to build HandoverCommand: {e}"),
+        }
+        Ok(())
+    }
+
+    /// Handle a HandoverFailure from the target gNB (TS 38.413 Section 8.4.2).
+    /// Resource allocation failed at the target; relay a
+    /// HandoverPreparationFailure to the source gNB so it aborts T304.
+    async fn handle_handover_failure(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
+        let failure = match ogs_ngap::parser::decode_ngap_pdu(data) {
+            Ok(ogs_ngap::NgapMessage::HandoverFailure(f)) => f,
+            Ok(other) => {
+                log::warn!("Expected HandoverFailure, decoded {other:?}");
+                return Ok(());
+            }
+            Err(e) => {
+                log::error!("Failed to decode HandoverFailure: {e}");
+                return Ok(());
+            }
+        };
+        log::warn!(
+            "HandoverFailure from association {association_id} (amf_ue_ngap_id={}, cause={:?})",
+            failure.amf_ue_ngap_id,
+            failure.cause
+        );
+        let source = self
+            .ue_auth_state
+            .get(&failure.amf_ue_ngap_id)
+            .map(|s| (s.association_id, s.ran_ue_ngap_id));
+        if let Some((source_assoc, ran_ue_ngap_id)) = source {
+            let prep_failure = ogs_ngap::types::HandoverPreparationFailure {
+                amf_ue_ngap_id: failure.amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                cause: failure.cause,
+                criticality_diagnostics: None,
+            };
+            if let Ok(bytes) =
+                ogs_ngap::builder::build_handover_preparation_failure(&prep_failure)
+            {
+                self.send_to_association(source_assoc, &bytes).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle a HandoverNotify from the target gNB (TS 38.413 Section 8.4.3):
+    /// the UE has successfully arrived. The AMF updates the UE's serving cell
+    /// location and (in a full deployment) releases the source-side resources.
+    async fn handle_handover_notify(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
+        let notify = match ogs_ngap::parser::decode_ngap_pdu(data) {
+            Ok(ogs_ngap::NgapMessage::HandoverNotify(n)) => n,
+            Ok(other) => {
+                log::warn!("Expected HandoverNotify, decoded {other:?}");
+                return Ok(());
+            }
+            Err(e) => {
+                log::error!("Failed to decode HandoverNotify: {e}");
+                return Ok(());
+            }
+        };
+        log::info!(
+            "HandoverNotify from association {association_id} (amf_ue_ngap_id={}, ran_ue_ngap_id={})",
+            notify.amf_ue_ngap_id,
+            notify.ran_ue_ngap_id
+        );
+        if let Some(state) = self.ue_auth_state.get_mut(&notify.amf_ue_ngap_id) {
+            // Move the serving association/RAN-UE-NGAP-ID and location to the
+            // target now that the UE has arrived (TS 23.502 Section 4.9.1.3).
+            state.association_id = association_id;
+            state.ran_ue_ngap_id = notify.ran_ue_ngap_id;
+            let ogs_ngap::types::UserLocationInformation::Nr {
+                nr_cgi_plmn,
+                nr_cell_identity,
+                tai_plmn,
+                tai_tac,
+            } = &notify.user_location_info;
+            state.amf_ue.nr_cgi.plmn_id = plmn_id_from_ngap_bytes(nr_cgi_plmn);
+            state.amf_ue.nr_cgi.cell_id = *nr_cell_identity;
+            state.amf_ue.nr_tai.plmn_id = plmn_id_from_ngap_bytes(tai_plmn);
+            state.amf_ue.nr_tai.tac =
+                ((tai_tac[0] as u32) << 16) | ((tai_tac[1] as u32) << 8) | tai_tac[2] as u32;
+            log::info!(
+                "UE {} relocated to target gNB (association {association_id})",
+                notify.amf_ue_ngap_id
+            );
+        } else {
+            log::warn!(
+                "HandoverNotify for unknown UE {}; ignoring",
+                notify.amf_ue_ngap_id
+            );
+        }
+        Ok(())
+    }
+
+    /// Handle a HandoverCancel from the source gNB (TS 38.413 Section 8.4.5).
+    /// The AMF acknowledges with a HandoverCancelAcknowledge.
+    async fn handle_handover_cancel(&mut self, association_id: u64, data: &[u8]) -> Result<()> {
+        let cancel = match ogs_ngap::parser::decode_ngap_pdu(data) {
+            Ok(ogs_ngap::NgapMessage::HandoverCancel(c)) => c,
+            Ok(other) => {
+                log::warn!("Expected HandoverCancel, decoded {other:?}");
+                return Ok(());
+            }
+            Err(e) => {
+                log::error!("Failed to decode HandoverCancel: {e}");
+                self.send_error_indication(
+                    association_id,
+                    None,
+                    None,
+                    ogs_ngap::types::Cause::Protocol(
+                        ogs_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        log::info!(
+            "HandoverCancel from association {association_id} (amf_ue_ngap_id={}, cause={:?})",
+            cancel.amf_ue_ngap_id,
+            cancel.cause
+        );
+        let ack = ogs_ngap::types::HandoverCancelAcknowledge {
+            amf_ue_ngap_id: cancel.amf_ue_ngap_id,
+            ran_ue_ngap_id: cancel.ran_ue_ngap_id,
+            criticality_diagnostics: None,
+        };
+        match ogs_ngap::builder::build_handover_cancel_acknowledge(&ack) {
+            Ok(bytes) => {
+                self.send_to_association(association_id, &bytes).await?;
+                log::info!(
+                    "HandoverCancelAcknowledge sent for UE {}",
+                    cancel.amf_ue_ngap_id
+                );
+            }
+            Err(e) => log::error!("Failed to build HandoverCancelAcknowledge: {e}"),
+        }
+        Ok(())
+    }
+
+    /// Handle a PathSwitchRequest from the target gNB after an Xn handover
+    /// (TS 38.413 Section 8.4.4). The AMF updates the UE's RAN-UE-NGAP-ID and
+    /// serving association, derives a fresh NH (TS 33.501 Section 6.9.2.3.3),
+    /// and replies with PathSwitchRequestAcknowledge; on any inconsistency it
+    /// replies with PathSwitchRequestFailure (TS 38.413 Section 9.2.3.12).
+    async fn handle_path_switch_request(
+        &mut self,
+        association_id: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        let req = match ogs_ngap::parser::decode_ngap_pdu(data) {
+            Ok(ogs_ngap::NgapMessage::PathSwitchRequest(r)) => r,
+            Ok(other) => {
+                log::warn!("Expected PathSwitchRequest, decoded {other:?}");
+                return Ok(());
+            }
+            Err(e) => {
+                log::error!("Failed to decode PathSwitchRequest: {e}");
+                self.send_error_indication(
+                    association_id,
+                    None,
+                    None,
+                    ogs_ngap::types::Cause::Protocol(
+                        ogs_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let amf_ue_ngap_id = req.source_amf_ue_ngap_id;
+        log::info!(
+            "PathSwitchRequest (amf_ue_ngap_id={amf_ue_ngap_id}, new ran_ue_ngap_id={})",
+            req.ran_ue_ngap_id
+        );
+
+        // Unknown UE → PathSwitchRequestFailure with unknown-local-UE cause.
+        if !self.ue_auth_state.contains_key(&amf_ue_ngap_id) {
+            log::warn!("PathSwitchRequest for unknown UE {amf_ue_ngap_id}; failing");
+            let failure = ogs_ngap::types::PathSwitchRequestFailure {
+                amf_ue_ngap_id,
+                ran_ue_ngap_id: req.ran_ue_ngap_id,
+                cause: ogs_ngap::types::Cause::RadioNetwork(
+                    ogs_asn1c::ngap::cause::CauseRadioNetwork::UnknownLocalUeNgapId,
+                ),
+                released_list: None,
+                criticality_diagnostics: None,
+            };
+            if let Ok(bytes) = ogs_ngap::builder::build_path_switch_request_failure(&failure) {
+                self.send_to_association(association_id, &bytes).await?;
+            }
+            return Ok(());
+        }
+
+        // Derive a fresh NH from KAMF (vertical key derivation) and increment
+        // the NHCC (TS 33.501 Section 6.9.2.3.3 / 6.9.4.1).
+        let (ncc, switched_list, allowed_nssai, ue_caps) = {
+            let state = self
+                .ue_auth_state
+                .get_mut(&amf_ue_ngap_id)
+                .expect("checked");
+            let new_nh = ogs_crypt::kdf::ogs_kdf_nh_gnb(&state.amf_ue.kamf, &state.amf_ue.nh);
+            state.amf_ue.nh = new_nh;
+            state.amf_ue.nhcc = state.amf_ue.nhcc.wrapping_add(1) & 0x07;
+            // Move the UE's serving RAN association and RAN-UE-NGAP-ID to the
+            // target gNB; this is the N3 tunnel/RAN identity update.
+            state.ran_ue_ngap_id = req.ran_ue_ngap_id;
+            state.association_id = association_id;
+
+            let switched_list: Vec<ogs_ngap::types::PduSessionResourceSwitchedItem> = req
+                .pdu_session_list
+                .iter()
+                .map(|p| ogs_ngap::types::PduSessionResourceSwitchedItem {
+                    pdu_session_id: p.pdu_session_id,
+                    // Echo the gNB's path-switch transfer back as the ack
+                    // transfer; in a full deployment the SMF supplies the UL
+                    // F-TEID via Nsmf_PDUSession_UpdateSMContext.
+                    transfer: p.transfer.clone(),
+                })
+                .collect();
+
+            let allowed_nssai = state
+                .amf_ue
+                .allowed_nssai
+                .iter()
+                .map(|s| ogs_ngap::types::SNssai {
+                    sst: s.sst,
+                    sd: s.sd.map(|sd| sd.to_be_bytes()[1..4].try_into().unwrap()),
+                })
+                .collect::<Vec<_>>();
+
+            (
+                state.amf_ue.nhcc,
+                switched_list,
+                allowed_nssai,
+                ue_caps_to_ngap(&state.amf_ue.ue_security_capability),
+            )
+        };
+
+        let nh = self
+            .ue_auth_state
+            .get(&amf_ue_ngap_id)
+            .expect("checked")
+            .amf_ue
+            .nh;
+
+        let allowed_for_ack = if allowed_nssai.is_empty() {
+            vec![ogs_ngap::types::SNssai { sst: 1, sd: None }]
+        } else {
+            allowed_nssai
+        };
+
+        let ack = ogs_ngap::types::PathSwitchRequestAcknowledge {
+            amf_ue_ngap_id,
+            ran_ue_ngap_id: req.ran_ue_ngap_id,
+            ue_security_capabilities: Some(ue_caps),
+            security_context: ogs_ngap::types::SecurityContext {
+                next_hop_chaining_count: ncc,
+                next_hop: nh,
+            },
+            switched_list,
+            released_list: None,
+            allowed_nssai: allowed_for_ack,
+        };
+        match ogs_ngap::builder::build_path_switch_request_acknowledge(&ack) {
+            Ok(bytes) => {
+                self.send_to_association(association_id, &bytes).await?;
+                log::info!(
+                    "PathSwitchRequestAcknowledge sent for UE {amf_ue_ngap_id} \
+                     (new ran_ue_ngap_id={}, NCC={ncc})",
+                    req.ran_ue_ngap_id
+                );
+            }
+            Err(e) => {
+                log::error!("Failed to build PathSwitchRequestAcknowledge: {e}");
+                let failure = ogs_ngap::types::PathSwitchRequestFailure {
+                    amf_ue_ngap_id,
+                    ran_ue_ngap_id: req.ran_ue_ngap_id,
+                    cause: ogs_ngap::types::Cause::Protocol(
+                        ogs_asn1c::ngap::cause::CauseProtocol::Unspecified,
+                    ),
+                    released_list: None,
+                    criticality_diagnostics: None,
+                };
+                if let Ok(b) = ogs_ngap::builder::build_path_switch_request_failure(&failure) {
+                    self.send_to_association(association_id, &b).await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve the SCTP association of the gNB named by a handover TargetID by
+    /// matching its Global RAN Node ID against connected gNB contexts.
+    async fn find_association_for_target(
+        &self,
+        target_id: &ogs_ngap::types::TargetId,
+    ) -> Option<u64> {
+        let target_gnb_id = match target_id {
+            ogs_ngap::types::TargetId::TargetRanNodeId {
+                global_ran_node_id, ..
+            } => match global_ran_node_id {
+                ogs_ngap::types::GlobalRanNodeId::GlobalGnbId { gnb_id, .. } => Some(*gnb_id as u64),
+                _ => None,
+            },
+            ogs_ngap::types::TargetId::TargetGlobalNgEnbId { .. } => None,
+        }?;
+        let sessions = self.sessions.read().await;
+        sessions
+            .iter()
+            .find(|(_, s)| s.gnb.gnb_id as u64 == target_gnb_id)
+            .map(|(assoc, _)| *assoc)
+    }
+
     /// Handle Initial Context Setup Response from the gNB (TS 38.413 §8.3.1.2).
     ///
     /// The gNB has set up AS-layer security and delivered the piggybacked
@@ -3473,6 +4312,43 @@ fn is_snpn_onboarding_suci(suci: &str) -> bool {
 }
 
 /// Parse a plain Registration Request NAS PDU
+/// Extract the value of the NAS message container IE (IEI 0x71, TLV-E format:
+/// IEI(1) | length(2, big-endian) | value) from a 5GMM plain message body such
+/// as Security Mode Complete (TS 24.501 Section 9.11.3.33). Returns the
+/// contained NAS message (the replayed initial RegistrationRequest).
+fn extract_nas_message_container(nas: &[u8]) -> Option<Vec<u8>> {
+    // 5GMM header: EPD(1) | security-header-type(1) | message-type(1).
+    let mut pos = 3;
+    while pos < nas.len() {
+        let iei = nas[pos];
+        match iei {
+            // NAS message container (0x71) — TLV-E
+            0x71 => {
+                if pos + 3 > nas.len() {
+                    return None;
+                }
+                let len = ((nas[pos + 1] as usize) << 8) | (nas[pos + 2] as usize);
+                if pos + 3 + len > nas.len() {
+                    return None;
+                }
+                return Some(nas[pos + 3..pos + 3 + len].to_vec());
+            }
+            // IMEISV (0x77) — TLV-E: skip over it
+            0x77 => {
+                if pos + 3 > nas.len() {
+                    return None;
+                }
+                let len = ((nas[pos + 1] as usize) << 8) | (nas[pos + 2] as usize);
+                pos += 3 + len;
+            }
+            // Any other IE: cannot reliably skip an unknown format, so advance
+            // by one octet and keep scanning for the container IEI.
+            _ => pos += 1,
+        }
+    }
+    None
+}
+
 fn parse_registration_request_pdu(nas: &[u8]) -> Option<ParsedRegistrationRequest> {
     // EPD + sec hdr + msg type + (ngKSI | 5GS registration type) + LV-E identity
     if nas.len() < 6 {
@@ -3826,6 +4702,41 @@ fn wire_caps_to_mask(wire: u8) -> u8 {
         }
     }
     mask
+}
+
+/// Map the stored NAS UE security-capability octets (5G/EPS EA/IA bitmaps,
+/// MSB = algorithm 0) to the 16-bit NGAP UESecurityCapabilities bitstrings
+/// (TS 38.413 Section 9.3.1.86); the NAS octet occupies the high 8 bits.
+fn ue_caps_to_ngap(caps: &UeSecurityCapability) -> ogs_ngap::types::UeSecurityCapabilities {
+    let to_bits = |octet: u8| -> u16 { (octet as u16) << 8 };
+    ogs_ngap::types::UeSecurityCapabilities {
+        nr_encryption_algorithms: to_bits(caps.ea),
+        nr_integrity_algorithms: to_bits(caps.ia),
+        eutra_encryption_algorithms: to_bits(caps.eea),
+        eutra_integrity_algorithms: to_bits(caps.eia),
+    }
+}
+
+/// Encode a PlmnId into the 3-byte NGAP PLMN Identity (TS 23.003 / TS 38.413).
+fn plmn_id_to_ngap_bytes(plmn: &PlmnId) -> [u8; 3] {
+    [
+        (plmn.mcc2 << 4) | plmn.mcc1,
+        (plmn.mnc3 << 4) | plmn.mcc3,
+        (plmn.mnc2 << 4) | plmn.mnc1,
+    ]
+}
+
+/// Decode a 3-byte NGAP PLMN Identity into a PlmnId (inverse of
+/// `plmn_id_to_ngap_bytes`).
+fn plmn_id_from_ngap_bytes(bytes: &[u8; 3]) -> PlmnId {
+    PlmnId {
+        mcc1: bytes[0] & 0x0F,
+        mcc2: bytes[0] >> 4,
+        mcc3: bytes[1] & 0x0F,
+        mnc1: bytes[2] & 0x0F,
+        mnc2: bytes[2] >> 4,
+        mnc3: bytes[1] >> 4,
+    }
 }
 
 /// Convert a configured algorithm preference order into a support mask;
@@ -4472,5 +5383,197 @@ mod tests {
         let (max522, dur522) = NasProcTimer::T3522.config(&configs);
         assert_eq!(max522, 4);
         assert_eq!(dur522, Duration::from_secs(3));
+    }
+
+    // ------------------------------------------------------------------
+    // T3.1 — NGAP procedure dispatch / ErrorIndication
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_proc_codes_match_3gpp() {
+        // The dispatch must use the genuine TS 38.413 procedure codes, not the
+        // legacy bogus values (0/1/3/24/25/27).
+        assert_eq!(proc_code::ERROR_INDICATION, 9);
+        assert_eq!(proc_code::HANDOVER_CANCEL, 10);
+        assert_eq!(proc_code::HANDOVER_NOTIFICATION, 11);
+        assert_eq!(proc_code::HANDOVER_PREPARATION, 12);
+        assert_eq!(proc_code::HANDOVER_RESOURCE_ALLOCATION, 13);
+        assert_eq!(proc_code::OVERLOAD_START, 22);
+        assert_eq!(proc_code::OVERLOAD_STOP, 23);
+        assert_eq!(proc_code::PATH_SWITCH_REQUEST, 25);
+    }
+
+    #[test]
+    fn test_unknown_pdu_yields_error_indication() {
+        // An undecodable / unknown-procedure PDU must produce a decodable
+        // ErrorIndication carrying a protocol cause (TS 38.413 Section 10.3).
+        // This mirrors the `_` dispatch arm's behaviour.
+        let unknown_pdu = [0x00u8, 99, 0x00]; // InitiatingMessage, procedure 99
+        let parsed = ogs_ngap::parser::decode_ngap_pdu(&unknown_pdu);
+        // Either decodes to Unknown or fails to decode; both drive ErrorIndication.
+        let is_unknown_or_err = matches!(
+            parsed,
+            Ok(ogs_ngap::NgapMessage::Unknown { .. }) | Err(_)
+        );
+        assert!(is_unknown_or_err, "got {parsed:?}");
+
+        // Build the ErrorIndication the dispatch would emit and confirm it is a
+        // valid, decodable PDU with the protocol cause.
+        let ei = ogs_ngap::types::ErrorIndication {
+            amf_ue_ngap_id: None,
+            ran_ue_ngap_id: None,
+            cause: Some(ogs_ngap::types::Cause::Protocol(
+                ogs_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+            )),
+            criticality_diagnostics: None,
+        };
+        let bytes = ogs_ngap::builder::build_error_indication(&ei).unwrap();
+        assert_eq!(bytes[0], 0x00); // InitiatingMessage
+        assert_eq!(bytes[1], proc_code::ERROR_INDICATION as u8);
+        match ogs_ngap::parser::decode_ngap_pdu(&bytes).unwrap() {
+            ogs_ngap::NgapMessage::ErrorIndication(e) => {
+                assert!(matches!(
+                    e.cause,
+                    Some(ogs_ngap::types::Cause::Protocol(_))
+                ));
+            }
+            other => panic!("expected ErrorIndication, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_overload_start_stop_roundtrip() {
+        let start = crate::ngap_asn1::build_overload_start_asn1(40).expect("overload start");
+        assert_eq!(start[0], 0x00);
+        assert_eq!(start[1], proc_code::OVERLOAD_START as u8);
+        match ogs_ngap::parser::decode_ngap_pdu(&start).unwrap() {
+            ogs_ngap::NgapMessage::OverloadStart(o) => {
+                assert_eq!(o.traffic_load_reduction, Some(40));
+            }
+            other => panic!("expected OverloadStart, got {other:?}"),
+        }
+
+        let stop = crate::ngap_asn1::build_overload_stop_asn1().expect("overload stop");
+        assert_eq!(stop[1], proc_code::OVERLOAD_STOP as u8);
+        match ogs_ngap::parser::decode_ngap_pdu(&stop).unwrap() {
+            ogs_ngap::NgapMessage::OverloadStop(_) => {}
+            other => panic!("expected OverloadStop, got {other:?}"),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // T3.2 — SMC anti-bidding-down check
+    // ------------------------------------------------------------------
+
+    /// Build a Security Mode Complete carrying a NAS message container (0x71,
+    /// TLV-E) that holds a replayed RegistrationRequest with the given caps.
+    fn smc_with_replayed_caps(ea: u8, ia: u8) -> Vec<u8> {
+        let mut reg = sample_registration_request();
+        // Overwrite the UE security capability octets in the replayed reg req.
+        // sample_registration_request encodes [.. 0x2E, 0x02, EA, IA ..]; find it.
+        if let Some(p) = reg.windows(2).position(|w| w == [0x2E, 0x02]) {
+            reg[p + 2] = ea;
+            reg[p + 3] = ia;
+        }
+        let mut smc = vec![0x7E, 0x00, 0x5E]; // 5GMM Security Mode Complete
+        smc.push(0x71); // NAS message container IEI
+        smc.extend_from_slice(&(reg.len() as u16).to_be_bytes());
+        smc.extend_from_slice(&reg);
+        smc
+    }
+
+    #[test]
+    fn test_extract_nas_message_container_and_caps() {
+        let smc = smc_with_replayed_caps(0xF0, 0xF0);
+        let inner = extract_nas_message_container(&smc).expect("container");
+        let parsed = parse_registration_request_pdu(&inner).expect("inner reg req");
+        let caps = parsed.sec_cap.expect("caps");
+        assert_eq!(caps.ea, 0xF0);
+        assert_eq!(caps.ia, 0xF0);
+    }
+
+    #[test]
+    fn test_bidding_down_caps_mismatch_detected() {
+        // Stored (cleartext-initial) caps EA=0xF0 / IA=0xF0; replayed (protected)
+        // caps EA=0x80 / IA=0x80 (downgraded to null algorithms). The mismatch
+        // is the bidding-down signature the AMF must detect (TS 33.501 §6.7.2).
+        let stored = UeSecurityCapability {
+            ea: 0xF0,
+            ia: 0xF0,
+            eea: 0,
+            eia: 0,
+        };
+        let smc = smc_with_replayed_caps(0x80, 0x80);
+        let inner = extract_nas_message_container(&smc).unwrap();
+        let replayed = parse_registration_request_pdu(&inner)
+            .unwrap()
+            .sec_cap
+            .unwrap();
+        let mismatch = replayed.ea != stored.ea
+            || replayed.ia != stored.ia
+            || replayed.eea != stored.eea
+            || replayed.eia != stored.eia;
+        assert!(mismatch, "downgraded caps must be detected as a mismatch");
+
+        // The reject the AMF sends carries 5GMM cause #23.
+        let reject = gmm_build::build_security_mode_reject(GmmCause::UeSecurityCapabilitiesMismatch);
+        assert_eq!(reject[2], gmm_build::message_type::SECURITY_MODE_REJECT);
+        assert_eq!(
+            *reject.last().unwrap(),
+            GmmCause::UeSecurityCapabilitiesMismatch as u8
+        );
+    }
+
+    #[test]
+    fn test_bidding_down_matching_caps_accepted() {
+        let stored = UeSecurityCapability {
+            ea: 0xF0,
+            ia: 0xF0,
+            eea: 0,
+            eia: 0,
+        };
+        let smc = smc_with_replayed_caps(0xF0, 0xF0);
+        let inner = extract_nas_message_container(&smc).unwrap();
+        let replayed = parse_registration_request_pdu(&inner)
+            .unwrap()
+            .sec_cap
+            .unwrap();
+        let mismatch = replayed.ea != stored.ea
+            || replayed.ia != stored.ia
+            || replayed.eea != stored.eea
+            || replayed.eia != stored.eia;
+        assert!(!mismatch, "identical caps must NOT be flagged as bidding-down");
+    }
+
+    // ------------------------------------------------------------------
+    // T3.1/T3.2 helper round-trips
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_plmn_id_ngap_bytes_roundtrip() {
+        let plmn = PlmnId::new("999", "70");
+        let bytes = plmn_id_to_ngap_bytes(&plmn);
+        let back = plmn_id_from_ngap_bytes(&bytes);
+        assert_eq!(back.mcc1, plmn.mcc1);
+        assert_eq!(back.mcc2, plmn.mcc2);
+        assert_eq!(back.mcc3, plmn.mcc3);
+        assert_eq!(back.mnc1, plmn.mnc1);
+        assert_eq!(back.mnc2, plmn.mnc2);
+        assert_eq!(back.mnc3, plmn.mnc3);
+    }
+
+    #[test]
+    fn test_ue_caps_to_ngap_high_octet() {
+        let caps = UeSecurityCapability {
+            ea: 0xE0,
+            ia: 0xC0,
+            eea: 0x80,
+            eia: 0x40,
+        };
+        let ngap = ue_caps_to_ngap(&caps);
+        assert_eq!(ngap.nr_encryption_algorithms, 0xE000);
+        assert_eq!(ngap.nr_integrity_algorithms, 0xC000);
+        assert_eq!(ngap.eutra_encryption_algorithms, 0x8000);
+        assert_eq!(ngap.eutra_integrity_algorithms, 0x4000);
     }
 }

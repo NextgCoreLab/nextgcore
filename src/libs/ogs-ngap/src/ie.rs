@@ -217,6 +217,8 @@ pub const IE_ID_PDU_SESSION_RESOURCE_LIST_HO_RQD: u16 = 61;
 pub const IE_ID_PDU_SESSION_RESOURCE_SETUP_LIST_HO_REQ: u16 = 73;
 pub const IE_ID_PDU_SESSION_RESOURCE_ADMITTED_LIST: u16 = 53;
 pub const IE_ID_PDU_SESSION_RESOURCE_HANDOVER_LIST: u16 = 59;
+/// TrafficLoadReductionIndication (TS 38.413 §9.3.1.99), carried in OverloadStart.
+pub const IE_ID_TRAFFIC_LOAD_REDUCTION_INDICATION: u16 = 281;
 
 // AMFName / RANNodeName ::= PrintableString (SIZE(1..150, ...)) — TS 38.413 §9.3.3
 const NAME_SIZE_MIN: usize = 1;
@@ -588,6 +590,31 @@ pub fn decode_ue_ambr(field: &ProtocolIeField) -> NgapResult<UeAmbrInfo> {
     let dl = decode_ext_constrained_int(&mut decoder, 0, BIT_RATE_MAX)? as u64;
     let ul = decode_ext_constrained_int(&mut decoder, 0, BIT_RATE_MAX)? as u64;
     Ok(UeAmbrInfo { dl, ul })
+}
+
+/// Encode TrafficLoadReductionIndication IE (TS 38.413 §9.3.1.99).
+/// `TrafficLoadReductionIndication ::= INTEGER (1..99)` (not extensible).
+pub fn encode_traffic_load_reduction(
+    container: &mut ProtocolIeContainer,
+    percent: u8,
+) -> NgapResult<()> {
+    let mut encoder = AperEncoder::new();
+    let constraint = ogs_asn1c::per::Constraint::new(1, 99);
+    encoder.encode_constrained_whole_number(percent.clamp(1, 99) as i64, &constraint)?;
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(IE_ID_TRAFFIC_LOAD_REDUCTION_INDICATION),
+        criticality: Criticality::Ignore,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Decode TrafficLoadReductionIndication IE (TS 38.413 §9.3.1.99).
+pub fn decode_traffic_load_reduction(field: &ProtocolIeField) -> NgapResult<u8> {
+    let mut decoder = AperDecoder::new(&field.value);
+    let constraint = ogs_asn1c::per::Constraint::new(1, 99);
+    Ok(decoder.decode_constrained_whole_number(&constraint)? as u8)
 }
 
 /// Encode Global RAN Node ID IE

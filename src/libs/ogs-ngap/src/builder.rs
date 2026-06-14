@@ -695,6 +695,90 @@ pub fn build_handover_notify(msg: &HandoverNotify) -> NgapResult<Vec<u8>> {
     encode_pdu(&pdu)
 }
 
+/// Build a Handover Cancel PDU (TS 38.413 Section 9.2.3.8).
+///
+/// Source-gNB-initiated procedure; provided here so the AMF codec can
+/// round-trip it (and for intra-AMF synthesis in tests).
+pub fn build_handover_cancel(msg: &HandoverCancel) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory)
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+
+    // IE: RAN-UE-NGAP-ID (mandatory)
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+
+    // IE: Cause (mandatory)
+    ie::encode_cause(&mut container, &msg.cause)?;
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::HANDOVER_CANCEL,
+        criticality: Criticality::Reject,
+        value: InitiatingMessageValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+/// Build a Handover Cancel Acknowledge PDU (TS 38.413 Section 9.2.3.9)
+pub fn build_handover_cancel_acknowledge(
+    msg: &HandoverCancelAcknowledge,
+) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: AMF-UE-NGAP-ID (mandatory)
+    ie::encode_amf_ue_ngap_id(&mut container, msg.amf_ue_ngap_id)?;
+
+    // IE: RAN-UE-NGAP-ID (mandatory)
+    ie::encode_ran_ue_ngap_id(&mut container, msg.ran_ue_ngap_id)?;
+
+    // IE: CriticalityDiagnostics (optional)
+    if let Some(ref diag) = msg.criticality_diagnostics {
+        ie::encode_criticality_diagnostics(&mut container, diag)?;
+    }
+
+    let pdu = NgapPdu::SuccessfulOutcome(SuccessfulOutcome {
+        procedure_code: ProcedureCode::HANDOVER_CANCEL,
+        criticality: Criticality::Reject,
+        value: SuccessfulOutcomeValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+// ============================================================================
+// Overload Start / Stop (TS 38.413 Sections 8.7.6 / 8.7.7)
+// ============================================================================
+
+/// Build an AMF-initiated Overload Start PDU (TS 38.413 Section 9.2.6.10).
+pub fn build_overload_start(msg: &OverloadStart) -> NgapResult<Vec<u8>> {
+    let mut container = ProtocolIeContainer::new();
+
+    // IE: TrafficLoadReductionIndication (optional, INTEGER 1..99)
+    if let Some(percent) = msg.traffic_load_reduction {
+        ie::encode_traffic_load_reduction(&mut container, percent)?;
+    }
+
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::OVERLOAD_START,
+        criticality: Criticality::Ignore,
+        value: InitiatingMessageValue::Other(container),
+    });
+
+    encode_pdu(&pdu)
+}
+
+/// Build an AMF-initiated Overload Stop PDU (TS 38.413 Section 9.2.6.11).
+pub fn build_overload_stop(_msg: &OverloadStop) -> NgapResult<Vec<u8>> {
+    let container = ProtocolIeContainer::new();
+    let pdu = NgapPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::OVERLOAD_STOP,
+        criticality: Criticality::Reject,
+        value: InitiatingMessageValue::Other(container),
+    });
+    encode_pdu(&pdu)
+}
+
 // ============================================================================
 // B10.8: Paging Procedure
 // ============================================================================
@@ -1565,6 +1649,336 @@ mod ng_setup_cross_codec {
                 assert_eq!(r.ran_ue_ngap_id, 1);
             }
             other => panic!("expected InitialContextSetupResponse, got {other:?}"),
+        }
+    }
+
+    use ogs_asn1c::ngap::cause::{Cause, CauseRadioNetwork};
+
+    fn sample_caps() -> UeSecurityCapabilities {
+        UeSecurityCapabilities {
+            nr_encryption_algorithms: 0xE000,
+            nr_integrity_algorithms: 0xC000,
+            eutra_encryption_algorithms: 0x8000,
+            eutra_integrity_algorithms: 0x8000,
+        }
+    }
+
+    fn sample_uli() -> UserLocationInformation {
+        UserLocationInformation::Nr {
+            nr_cgi_plmn: [0x00, 0xF1, 0x10],
+            nr_cell_identity: 0x0000_0001,
+            tai_plmn: [0x00, 0xF1, 0x10],
+            tai_tac: [0x00, 0x00, 0x01],
+        }
+    }
+
+    #[test]
+    fn error_indication_roundtrip() {
+        let msg = ErrorIndication {
+            amf_ue_ngap_id: Some(7),
+            ran_ue_ngap_id: Some(3),
+            cause: Some(Cause::Protocol(
+                ogs_asn1c::ngap::cause::CauseProtocol::AbstractSyntaxErrorReject,
+            )),
+            criticality_diagnostics: None,
+        };
+        let bytes = build_error_indication(&msg).unwrap();
+        // procedure code 9 = ErrorIndication (TS 38.413)
+        assert_eq!(bytes[0], 0x00);
+        assert_eq!(bytes[1], 9);
+        match crate::parser::decode_ngap_pdu(&bytes).unwrap() {
+            crate::parser::NgapMessage::ErrorIndication(e) => {
+                assert_eq!(e.amf_ue_ngap_id, Some(7));
+                assert_eq!(e.ran_ue_ngap_id, Some(3));
+                assert!(e.cause.is_some());
+            }
+            other => panic!("expected ErrorIndication, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_switch_request_acknowledge_roundtrip() {
+        let msg = PathSwitchRequestAcknowledge {
+            amf_ue_ngap_id: 12,
+            ran_ue_ngap_id: 34,
+            ue_security_capabilities: Some(sample_caps()),
+            security_context: SecurityContext {
+                next_hop_chaining_count: 1,
+                next_hop: [0xAB; 32],
+            },
+            switched_list: vec![PduSessionResourceSwitchedItem {
+                pdu_session_id: 5,
+                transfer: vec![0x01, 0x02, 0x03],
+            }],
+            released_list: None,
+            allowed_nssai: vec![SNssai { sst: 1, sd: None }],
+        };
+        let bytes = build_path_switch_request_acknowledge(&msg).unwrap();
+        assert_eq!(bytes[0], 0x20); // SuccessfulOutcome
+        assert_eq!(bytes[1], 25); // PathSwitchRequest
+        match crate::parser::decode_ngap_pdu(&bytes).unwrap() {
+            crate::parser::NgapMessage::PathSwitchRequestAcknowledge(a) => {
+                assert_eq!(a.amf_ue_ngap_id, 12);
+                assert_eq!(a.ran_ue_ngap_id, 34);
+                assert_eq!(a.switched_list.len(), 1);
+                assert_eq!(a.switched_list[0].pdu_session_id, 5);
+                assert_eq!(a.security_context.next_hop_chaining_count, 1);
+                assert_eq!(a.allowed_nssai.len(), 1);
+            }
+            other => panic!("expected PathSwitchRequestAcknowledge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn path_switch_request_failure_roundtrip() {
+        let msg = PathSwitchRequestFailure {
+            amf_ue_ngap_id: 99,
+            ran_ue_ngap_id: 88,
+            cause: Cause::RadioNetwork(CauseRadioNetwork::UnknownLocalUeNgapId),
+            released_list: None,
+            criticality_diagnostics: None,
+        };
+        let bytes = build_path_switch_request_failure(&msg).unwrap();
+        assert_eq!(bytes[0], 0x40); // UnsuccessfulOutcome
+        assert_eq!(bytes[1], 25);
+        match crate::parser::decode_ngap_pdu(&bytes).unwrap() {
+            crate::parser::NgapMessage::PathSwitchRequestFailure(f) => {
+                assert_eq!(f.amf_ue_ngap_id, 99);
+                assert_eq!(f.ran_ue_ngap_id, 88);
+                assert!(matches!(
+                    f.cause,
+                    Cause::RadioNetwork(CauseRadioNetwork::UnknownLocalUeNgapId)
+                ));
+            }
+            other => panic!("expected PathSwitchRequestFailure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handover_command_roundtrip() {
+        let msg = HandoverCommand {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            handover_type: HandoverType::Intra5gs,
+            nas_pdu: Some(vec![0x7e, 0x00]),
+            pdu_session_list: vec![PduSessionResourceHandoverItem {
+                pdu_session_id: 1,
+                transfer: vec![0xAA, 0xBB],
+            }],
+            release_list: None,
+            target_to_source_container: vec![0x01, 0x02, 0x03, 0x04],
+        };
+        let bytes = build_handover_command(&msg).unwrap();
+        assert_eq!(bytes[0], 0x20); // SuccessfulOutcome
+        assert_eq!(bytes[1], 12); // HandoverPreparation
+        match crate::parser::decode_ngap_pdu(&bytes).unwrap() {
+            crate::parser::NgapMessage::HandoverCommand(c) => {
+                assert_eq!(c.amf_ue_ngap_id, 1);
+                assert_eq!(c.ran_ue_ngap_id, 2);
+                assert_eq!(c.nas_pdu.as_deref(), Some(&[0x7e, 0x00][..]));
+                assert_eq!(c.pdu_session_list.len(), 1);
+                assert_eq!(c.target_to_source_container, vec![0x01, 0x02, 0x03, 0x04]);
+            }
+            other => panic!("expected HandoverCommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handover_preparation_failure_roundtrip() {
+        let msg = HandoverPreparationFailure {
+            amf_ue_ngap_id: 4,
+            ran_ue_ngap_id: 5,
+            cause: Cause::RadioNetwork(CauseRadioNetwork::HoTargetNotAllowed),
+            criticality_diagnostics: None,
+        };
+        let bytes = build_handover_preparation_failure(&msg).unwrap();
+        assert_eq!(bytes[0], 0x40);
+        assert_eq!(bytes[1], 12);
+        match crate::parser::decode_ngap_pdu(&bytes).unwrap() {
+            crate::parser::NgapMessage::HandoverPreparationFailure(f) => {
+                assert_eq!(f.amf_ue_ngap_id, 4);
+                assert_eq!(f.ran_ue_ngap_id, 5);
+            }
+            other => panic!("expected HandoverPreparationFailure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handover_request_roundtrip() {
+        let msg = HandoverRequest {
+            amf_ue_ngap_id: 10,
+            handover_type: HandoverType::Intra5gs,
+            cause: Cause::RadioNetwork(CauseRadioNetwork::HandoverDesirableForRadioReason),
+            ue_ambr: UeAmbrInfo {
+                dl: 1_000_000_000,
+                ul: 1_000_000_000,
+            },
+            ue_security_capabilities: sample_caps(),
+            security_context: SecurityContext {
+                next_hop_chaining_count: 0,
+                next_hop: [0x11; 32],
+            },
+            pdu_session_list: vec![PduSessionResourceSetupItemHoReq {
+                pdu_session_id: 1,
+                s_nssai: SNssai { sst: 1, sd: None },
+                transfer: vec![0x01, 0x02],
+            }],
+            allowed_nssai: vec![SNssai { sst: 1, sd: None }],
+            source_to_target_container: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            guami: Guami {
+                plmn_identity: [0x00, 0xF1, 0x10],
+                amf_region_id: 0x02,
+                amf_set_id: 0x001,
+                amf_pointer: 0x01,
+            },
+        };
+        let bytes = build_handover_request(&msg).unwrap();
+        assert_eq!(bytes[0], 0x00); // InitiatingMessage
+        assert_eq!(bytes[1], 13); // HandoverResourceAllocation
+        match crate::parser::decode_ngap_pdu(&bytes).unwrap() {
+            crate::parser::NgapMessage::HandoverRequest(r) => {
+                assert_eq!(r.amf_ue_ngap_id, 10);
+                assert_eq!(r.ue_ambr.dl, 1_000_000_000);
+                assert_eq!(r.pdu_session_list.len(), 1);
+                assert_eq!(r.allowed_nssai.len(), 1);
+                assert_eq!(r.source_to_target_container, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+                assert_eq!(r.guami.amf_region_id, 0x02);
+            }
+            other => panic!("expected HandoverRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handover_request_acknowledge_roundtrip() {
+        let msg = HandoverRequestAcknowledge {
+            amf_ue_ngap_id: 10,
+            ran_ue_ngap_id: 20,
+            admitted_list: vec![PduSessionResourceAdmittedItemHoAck {
+                pdu_session_id: 1,
+                transfer: vec![0xCA, 0xFE],
+            }],
+            failed_list: None,
+            target_to_source_container: vec![0x99, 0x88],
+        };
+        let bytes = build_handover_request_acknowledge(&msg).unwrap();
+        assert_eq!(bytes[0], 0x20);
+        assert_eq!(bytes[1], 13);
+        match crate::parser::decode_ngap_pdu(&bytes).unwrap() {
+            crate::parser::NgapMessage::HandoverRequestAcknowledge(a) => {
+                assert_eq!(a.amf_ue_ngap_id, 10);
+                assert_eq!(a.ran_ue_ngap_id, 20);
+                assert_eq!(a.admitted_list.len(), 1);
+                assert_eq!(a.target_to_source_container, vec![0x99, 0x88]);
+            }
+            other => panic!("expected HandoverRequestAcknowledge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handover_failure_roundtrip() {
+        let msg = HandoverFailure {
+            amf_ue_ngap_id: 10,
+            cause: Cause::RadioNetwork(CauseRadioNetwork::NoRadioResourcesAvailableInTargetCell),
+            criticality_diagnostics: None,
+        };
+        let bytes = build_handover_failure(&msg).unwrap();
+        assert_eq!(bytes[0], 0x40);
+        assert_eq!(bytes[1], 13);
+        match crate::parser::decode_ngap_pdu(&bytes).unwrap() {
+            crate::parser::NgapMessage::HandoverFailure(f) => {
+                assert_eq!(f.amf_ue_ngap_id, 10);
+            }
+            other => panic!("expected HandoverFailure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handover_notify_roundtrip() {
+        let msg = HandoverNotify {
+            amf_ue_ngap_id: 10,
+            ran_ue_ngap_id: 20,
+            user_location_info: sample_uli(),
+        };
+        let bytes = build_handover_notify(&msg).unwrap();
+        assert_eq!(bytes[0], 0x00);
+        assert_eq!(bytes[1], 11); // HandoverNotification
+        match crate::parser::decode_ngap_pdu(&bytes).unwrap() {
+            crate::parser::NgapMessage::HandoverNotify(n) => {
+                assert_eq!(n.amf_ue_ngap_id, 10);
+                assert_eq!(n.ran_ue_ngap_id, 20);
+            }
+            other => panic!("expected HandoverNotify, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handover_cancel_acknowledge_roundtrip() {
+        let msg = HandoverCancelAcknowledge {
+            amf_ue_ngap_id: 10,
+            ran_ue_ngap_id: 20,
+            criticality_diagnostics: None,
+        };
+        let bytes = build_handover_cancel_acknowledge(&msg).unwrap();
+        assert_eq!(bytes[0], 0x20);
+        assert_eq!(bytes[1], 10); // HandoverCancel
+        match crate::parser::decode_ngap_pdu(&bytes).unwrap() {
+            crate::parser::NgapMessage::HandoverCancelAcknowledge(a) => {
+                assert_eq!(a.amf_ue_ngap_id, 10);
+                assert_eq!(a.ran_ue_ngap_id, 20);
+            }
+            other => panic!("expected HandoverCancelAcknowledge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn handover_required_to_cancel_roundtrip() {
+        // HandoverRequired is built by the source gNB; the AMF must decode it.
+        let req = HandoverRequired {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            handover_type: HandoverType::Intra5gs,
+            cause: Cause::RadioNetwork(CauseRadioNetwork::TimeCriticalHandover),
+            target_id: TargetId::TargetRanNodeId {
+                global_ran_node_id: GlobalRanNodeId::GlobalGnbId {
+                    plmn_identity: [0x00, 0xF1, 0x10],
+                    gnb_id: 2,
+                    gnb_id_len: 32,
+                },
+                selected_tai: TaiListItem {
+                    tai_plmn: [0x00, 0xF1, 0x10],
+                    tai_tac: [0x00, 0x00, 0x02],
+                },
+            },
+            pdu_session_list: vec![PduSessionResourceItemHoRqd {
+                pdu_session_id: 1,
+                transfer: vec![0x01],
+            }],
+            source_to_target_container: vec![0x0A, 0x0B],
+        };
+        let bytes = build_handover_required(&req).unwrap();
+        assert_eq!(bytes[1], 12);
+        match crate::parser::decode_ngap_pdu(&bytes).unwrap() {
+            crate::parser::NgapMessage::HandoverRequired(r) => {
+                assert_eq!(r.amf_ue_ngap_id, 1);
+                assert_eq!(r.ran_ue_ngap_id, 2);
+                assert_eq!(r.pdu_session_list.len(), 1);
+            }
+            other => panic!("expected HandoverRequired, got {other:?}"),
+        }
+
+        // And a HandoverCancel from the source gNB decodes too.
+        let cancel = HandoverCancel {
+            amf_ue_ngap_id: 1,
+            ran_ue_ngap_id: 2,
+            cause: Cause::RadioNetwork(CauseRadioNetwork::HandoverCancelled),
+        };
+        let cbytes = crate::builder::build_handover_cancel(&cancel).unwrap();
+        match crate::parser::decode_ngap_pdu(&cbytes).unwrap() {
+            crate::parser::NgapMessage::HandoverCancel(c) => {
+                assert_eq!(c.amf_ue_ngap_id, 1);
+                assert_eq!(c.ran_ue_ngap_id, 2);
+            }
+            other => panic!("expected HandoverCancel, got {other:?}"),
         }
     }
 }

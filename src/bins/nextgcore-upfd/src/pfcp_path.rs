@@ -444,6 +444,32 @@ pub struct PfcpAssociation {
     pub recovery_time_stamp: u32,
 }
 
+/// PFCP request retransmission timer T1 (TS 29.244 / Open5GS default 3s).
+/// A request message (e.g. a Session Report Request carrying a Downlink Data
+/// Report) is retransmitted if no response arrives within this window.
+pub const PFCP_T1_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// PFCP maximum retransmission count N1 (TS 29.244 / Open5GS default 3).
+/// After the original transmission plus N1 retransmissions go unanswered, the
+/// request is abandoned and the peer is treated as unresponsive.
+pub const PFCP_N1_MAX_RETRANSMIT: u32 = 3;
+
+/// A request message awaiting a response, tracked for T1/N1 retransmission
+/// (TS 29.244 §7.2.2.3). Keyed by PFCP sequence number.
+#[derive(Debug, Clone)]
+pub struct PendingReport {
+    /// Fully encoded PFCP request message (resent verbatim with same seq).
+    pub message: Vec<u8>,
+    /// Destination (the CP function / SMF address).
+    pub dest: SocketAddr,
+    /// UPF SEID of the owning session (for diagnostics / give-up cleanup).
+    pub upf_seid: u64,
+    /// Number of retransmissions performed so far (0 = only the original sent).
+    pub attempts: u32,
+    /// When the current (re)transmission was sent.
+    pub last_sent: std::time::Instant,
+}
+
 /// Async PFCP server for handling SMF requests
 pub struct PfcpServer {
     socket: Arc<UdpSocket>,
@@ -463,6 +489,10 @@ pub struct PfcpServer {
     association: tokio::sync::RwLock<Option<PfcpAssociation>>,
     /// Data plane handle for pulling final URR counters on session deletion
     data_plane: std::sync::RwLock<Option<Arc<crate::data_plane::DataPlane>>>,
+    /// UPF-initiated requests awaiting a response, tracked by sequence number
+    /// for T1/N1 retransmission (TS 29.244 §7.2.2.3). Currently used for
+    /// Session Report Requests (Downlink Data / Error Indication Reports).
+    pending_reports: tokio::sync::Mutex<HashMap<u32, PendingReport>>,
 }
 
 /// PFCP session information stored in server
@@ -510,6 +540,7 @@ impl PfcpServer {
             sessions: tokio::sync::RwLock::new(HashMap::new()),
             association: tokio::sync::RwLock::new(None),
             data_plane: std::sync::RwLock::new(None),
+            pending_reports: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -590,6 +621,12 @@ impl PfcpServer {
                     // Timeout - continue loop
                 }
             }
+
+            // Drive PFCP request retransmission (T1) / give-up (N1) for any
+            // outstanding Session Report Requests (TS 29.244 §7.2.2.3). The
+            // 100ms recv timeout gives this a sub-second polling cadence,
+            // well under the multi-second T1 window.
+            self.retransmit_pending_reports().await;
         }
 
         Ok(())
@@ -639,13 +676,24 @@ impl PfcpServer {
                     .await?;
             }
             pfcp_type::SESSION_REPORT_RESPONSE => {
-                // Response to a UPF-initiated Session Report Request
+                // Response to a UPF-initiated Session Report Request: clear the
+                // matching pending request so T1/N1 retransmission stops
+                // (TS 29.244 §7.2.2.3).
+                let removed = self
+                    .pending_reports
+                    .lock()
+                    .await
+                    .remove(&header.sequence_number)
+                    .is_some();
                 let ies = ParsedIe::parse_all(payload);
                 let cause = ParsedIe::find_ie(&ies, pfcp_ie::CAUSE)
                     .and_then(|ie| ie.value.first().copied())
                     .unwrap_or(0);
                 if cause == PfcpCause::RequestAccepted as u8 {
-                    log::debug!("Session Report accepted (seq={})", header.sequence_number);
+                    log::debug!(
+                        "Session Report accepted (seq={}, tracked={removed})",
+                        header.sequence_number
+                    );
                 } else {
                     log::warn!(
                         "Session Report rejected: cause={cause} (seq={})",
@@ -1479,18 +1527,14 @@ impl PfcpServer {
         };
 
         let payload = build_session_report_request(pfcp_type::SESSION_REPORT_REQUEST, &report);
-        let seq = self.alloc_seq();
-        let message = self.build_response(
-            pfcp_type::SESSION_REPORT_REQUEST,
+        self.send_and_track_report(
+            upf_seid,
             smf_seid,
-            seq,
+            smf_addr,
             &payload,
-            true,
-        );
-        self.socket
-            .send_to(&message, smf_addr)
-            .await
-            .map_err(|e| format!("Failed to send Downlink Data Report: {e}"))?;
+            "Downlink Data Report",
+        )
+        .await?;
         log::info!(
             "Sent Downlink Data Report to {smf_addr}: SEID=0x{upf_seid:x}, PDR={pdr_id}, QFI={qfi:?}"
         );
@@ -1531,18 +1575,14 @@ impl PfcpServer {
         };
 
         let payload = build_session_report_request(pfcp_type::SESSION_REPORT_REQUEST, &report);
-        let seq = self.alloc_seq();
-        let message = self.build_response(
-            pfcp_type::SESSION_REPORT_REQUEST,
+        self.send_and_track_report(
+            upf_seid,
             smf_seid,
-            seq,
+            smf_addr,
             &payload,
-            true,
-        );
-        self.socket
-            .send_to(&message, smf_addr)
-            .await
-            .map_err(|e| format!("Failed to send Error Indication Report: {e}"))?;
+            "Error Indication Report",
+        )
+        .await?;
         log::info!(
             "Sent Error Indication Report to {smf_addr}: SEID=0x{upf_seid:x}, TEID=0x{remote_teid:x}"
         );
@@ -1606,27 +1646,107 @@ impl PfcpServer {
         let payload =
             build_session_report_request(pfcp_type::SESSION_REPORT_REQUEST, &user_plane_report);
 
-        // Dedicated PFCP request sequence counter (not the TEID allocator)
-        let seq = self.alloc_seq();
-
-        let message = self.build_response(
-            pfcp_type::SESSION_REPORT_REQUEST,
+        self.send_and_track_report(
+            upf_seid,
             smf_seid,
-            seq,
+            smf_addr,
             &payload,
-            true,
-        );
-
-        self.socket
-            .send_to(&message, smf_addr)
-            .await
-            .map_err(|e| format!("Failed to send Session Report Request: {e}"))?;
+            "Session Report Request (URR)",
+        )
+        .await?;
 
         log::info!(
             "Sent Session Report Request to {smf_addr} for SEID={upf_seid:#x} ({} URR reports)",
             reports.len()
         );
         Ok(())
+    }
+
+    /// Build a Session Report Request from a pre-built payload, send it, and
+    /// register it for T1/N1 retransmission (TS 29.244 §7.2.2.3). The request
+    /// is removed from the pending set when the matching Session Report
+    /// Response arrives (see `handle_message`) or abandoned after N1 retries
+    /// (see `retransmit_pending_reports`).
+    async fn send_and_track_report(
+        &self,
+        upf_seid: u64,
+        smf_seid: u64,
+        smf_addr: SocketAddr,
+        payload: &[u8],
+        what: &str,
+    ) -> Result<(), String> {
+        let seq = self.alloc_seq();
+        let message =
+            self.build_response(pfcp_type::SESSION_REPORT_REQUEST, smf_seid, seq, payload, true);
+
+        // Register BEFORE sending so a fast response cannot race the insert.
+        {
+            let mut pending = self.pending_reports.lock().await;
+            pending.insert(
+                seq,
+                PendingReport {
+                    message: message.clone(),
+                    dest: smf_addr,
+                    upf_seid,
+                    attempts: 0,
+                    last_sent: std::time::Instant::now(),
+                },
+            );
+        }
+
+        if let Err(e) = self.socket.send_to(&message, smf_addr).await {
+            // Send failed outright: drop the pending entry, nothing to retry on.
+            self.pending_reports.lock().await.remove(&seq);
+            return Err(format!("Failed to send {what}: {e}"));
+        }
+        Ok(())
+    }
+
+    /// Retransmit any Session Report Requests whose T1 timer has expired and
+    /// abandon those that have exhausted N1 retransmissions (TS 29.244
+    /// §7.2.2.3). Called periodically from the server run loop.
+    async fn retransmit_pending_reports(&self) {
+        // Collect work under the lock, then send without holding it.
+        let now = std::time::Instant::now();
+        let mut to_send: Vec<(u32, Vec<u8>, SocketAddr)> = Vec::new();
+        let mut gave_up: Vec<(u32, u64)> = Vec::new();
+        {
+            let mut pending = self.pending_reports.lock().await;
+            pending.retain(|&seq, p| {
+                if now.duration_since(p.last_sent) < PFCP_T1_DURATION {
+                    return true; // T1 not yet expired
+                }
+                if p.attempts >= PFCP_N1_MAX_RETRANSMIT {
+                    // N1 exhausted: give up on this request.
+                    gave_up.push((seq, p.upf_seid));
+                    return false;
+                }
+                p.attempts += 1;
+                p.last_sent = now;
+                to_send.push((seq, p.message.clone(), p.dest));
+                true
+            });
+        }
+        for (seq, msg, dest) in to_send {
+            match self.socket.send_to(&msg, dest).await {
+                Ok(_) => log::warn!(
+                    "Retransmitting Session Report Request (seq={seq}) to {dest} (T1 expired)"
+                ),
+                Err(e) => log::error!("Failed to retransmit Session Report (seq={seq}): {e}"),
+            }
+        }
+        for (seq, upf_seid) in gave_up {
+            log::error!(
+                "Session Report Request (seq={seq}, SEID=0x{upf_seid:x}) abandoned after {} retransmissions (N1) — peer unresponsive",
+                PFCP_N1_MAX_RETRANSMIT
+            );
+        }
+    }
+
+    /// Number of Session Report Requests currently awaiting a response
+    /// (test/diagnostic accessor).
+    pub async fn pending_report_count(&self) -> usize {
+        self.pending_reports.lock().await.len()
     }
 
     /// Build PFCP response message
@@ -1666,6 +1786,37 @@ impl PfcpServer {
         response.extend_from_slice(payload);
 
         response
+    }
+}
+
+#[cfg(test)]
+impl PfcpServer {
+    /// Test hook: insert a session so UPF-initiated reports can resolve the
+    /// CP function (SMF) address.
+    async fn test_insert_session(&self, info: PfcpSessionInfo) {
+        self.sessions
+            .write()
+            .await
+            .insert(info.upf_seid, info);
+    }
+
+    /// Test hook: force every pending report's T1 timer to be considered
+    /// expired so the next `retransmit_pending_reports` acts immediately
+    /// (avoids waiting the real multi-second T1 window).
+    async fn test_expire_pending_t1(&self) {
+        let past = std::time::Instant::now() - PFCP_T1_DURATION - std::time::Duration::from_secs(1);
+        let mut pending = self.pending_reports.lock().await;
+        for p in pending.values_mut() {
+            p.last_sent = past;
+        }
+    }
+
+    /// Test hook: the sequence number of the single pending report (panics if
+    /// not exactly one).
+    async fn test_only_pending_seq(&self) -> u32 {
+        let pending = self.pending_reports.lock().await;
+        assert_eq!(pending.len(), 1, "expected exactly one pending report");
+        *pending.keys().next().unwrap()
     }
 }
 
@@ -2174,5 +2325,149 @@ mod tests {
         let (seq, msg) = result.unwrap();
         assert_eq!(seq, 1);
         assert!(!msg.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // T1/N1 retransmission of Session Report Requests (TS 29.244 §7.2.2.3)
+    // ------------------------------------------------------------------
+
+    /// Build a standalone PfcpServer (no run loop) plus a fake SMF socket, and
+    /// register one session pointing at the SMF.
+    async fn server_with_session() -> (Arc<PfcpServer>, UdpSocket, u64, u64) {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (tx, _rx) = mpsc::channel(32);
+        let server = Arc::new(
+            PfcpServer::new("127.0.0.1:0".parse().unwrap(), shutdown, tx)
+                .await
+                .unwrap(),
+        );
+        let smf = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let smf_addr = smf.local_addr().unwrap();
+        let (upf_seid, smf_seid) = (0x77u64, 0x1077u64);
+        server
+            .test_insert_session(PfcpSessionInfo {
+                upf_seid,
+                smf_seid,
+                smf_addr,
+                ue_ipv4: Some(Ipv4Addr::new(10, 45, 0, 7)),
+                ul_teid: 0x100,
+                dl_teid: 0x200,
+                gnb_addr: Some(Ipv4Addr::new(127, 0, 0, 1)),
+            })
+            .await;
+        (server, smf, upf_seid, smf_seid)
+    }
+
+    async fn recv_report(smf: &UdpSocket) -> Vec<u8> {
+        let mut buf = vec![0u8; 4096];
+        let (len, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), smf.recv_from(&mut buf))
+                .await
+                .expect("a Session Report Request must arrive")
+                .unwrap();
+        buf.truncate(len);
+        buf
+    }
+
+    /// A Session Report Request (Downlink Data Report) is tracked pending, and
+    /// cleared when the SMF returns a Session Report Response with the same seq
+    /// — no retransmission then occurs.
+    #[tokio::test]
+    async fn test_ddn_cleared_on_response_no_retransmit() {
+        let (server, smf, upf_seid, smf_seid) = server_with_session().await;
+
+        server
+            .send_downlink_data_report(upf_seid, smf_seid, 2, Some(9))
+            .await
+            .unwrap();
+
+        // Original transmission received and one request is pending.
+        let original = recv_report(&smf).await;
+        assert_eq!(original[1], pfcp_type::SESSION_REPORT_REQUEST);
+        assert_eq!(server.pending_report_count().await, 1);
+        let seq = server.test_only_pending_seq().await;
+
+        // SMF acknowledges with a Session Report Response carrying that seq.
+        let mut b = crate::n4_build::PfcpMessageBuilder::new();
+        b.add_u8(pfcp_ie::CAUSE, PfcpCause::RequestAccepted as u8);
+        let resp = encode_pfcp(
+            pfcp_type::SESSION_REPORT_RESPONSE,
+            Some(smf_seid),
+            seq,
+            &b.build(),
+        );
+        // Drive the response through the message handler directly (no run loop).
+        server
+            .handle_message(&resp, smf.local_addr().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            server.pending_report_count().await,
+            0,
+            "response must clear the pending request"
+        );
+
+        // After expiring T1, no retransmission happens (nothing pending).
+        server.test_expire_pending_t1().await;
+        server.retransmit_pending_reports().await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                smf.recv_from(&mut [0u8; 64])
+            )
+            .await
+            .is_err(),
+            "no retransmission after acknowledgement"
+        );
+    }
+
+    /// With no response, a Session Report Request is retransmitted on each T1
+    /// expiry up to N1 times, then abandoned (TS 29.244 §7.2.2.3).
+    #[tokio::test]
+    async fn test_ddn_retransmits_then_gives_up() {
+        let (server, smf, upf_seid, smf_seid) = server_with_session().await;
+
+        server
+            .send_downlink_data_report(upf_seid, smf_seid, 2, Some(9))
+            .await
+            .unwrap();
+        let _original = recv_report(&smf).await; // attempt 0 (original)
+        assert_eq!(server.pending_report_count().await, 1);
+
+        // N1 retransmissions: each T1 expiry resends the same request.
+        for n in 1..=PFCP_N1_MAX_RETRANSMIT {
+            server.test_expire_pending_t1().await;
+            server.retransmit_pending_reports().await;
+            let retx = recv_report(&smf).await;
+            assert_eq!(
+                retx[1],
+                pfcp_type::SESSION_REPORT_REQUEST,
+                "retransmission {n} must be a Session Report Request"
+            );
+            assert_eq!(
+                server.pending_report_count().await,
+                1,
+                "still pending after retransmission {n}"
+            );
+        }
+
+        // One more T1 expiry: N1 is now exhausted → abandon the request.
+        server.test_expire_pending_t1().await;
+        server.retransmit_pending_reports().await;
+        assert_eq!(
+            server.pending_report_count().await,
+            0,
+            "request abandoned after N1 retransmissions"
+        );
+        // And no further packet is sent on the give-up pass.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                smf.recv_from(&mut [0u8; 64])
+            )
+            .await
+            .is_err(),
+            "no send on the give-up pass"
+        );
     }
 }

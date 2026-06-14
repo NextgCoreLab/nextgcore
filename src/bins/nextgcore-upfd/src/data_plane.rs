@@ -10,7 +10,6 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -45,6 +44,10 @@ pub const IP_VERSION_4: u8 = 4;
 
 /// IP version 6
 pub const IP_VERSION_6: u8 = 6;
+
+/// Sentinel for "GTP-U socket IP_TOS not yet applied" (no real TOS equals this
+/// 64-bit value, so the first downlink send always issues setsockopt).
+pub const GTPU_TOS_UNSET: u64 = u64::MAX;
 
 // ============================================================================
 // TUN Device
@@ -605,7 +608,56 @@ pub fn is_xr_5qi(qfi: u8) -> bool {
     (82..=85).contains(&qfi)
 }
 
+/// Compute the IPv4 header checksum (RFC 791 / RFC 1071) over the IHL-derived
+/// header length, treating the checksum field (bytes 10-11) as zero. Returns
+/// the 16-bit ones-complement value to be stored in network byte order.
+pub fn ipv4_header_checksum(header: &[u8]) -> u16 {
+    let ihl = ((header[0] & 0x0F) as usize) * 4;
+    let len = ihl.min(header.len());
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < len {
+        // Skip the checksum field itself (bytes 10-11).
+        if i == 10 {
+            i += 2;
+            continue;
+        }
+        sum += u16::from_be_bytes([header[i], header[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < len {
+        // Odd trailing byte (should not happen for a 4-octet-aligned header).
+        sum += (header[i] as u32) << 8;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Whether an IPv4 packet's stored header checksum is correct (a real
+/// receiver verifies this and silently drops packets that fail).
+pub fn ipv4_header_checksum_valid(packet: &[u8]) -> bool {
+    if packet.len() < 20 || (packet[0] >> 4) != 4 {
+        return false;
+    }
+    let ihl = ((packet[0] & 0x0F) as usize) * 4;
+    if ihl < 20 || packet.len() < ihl {
+        return false;
+    }
+    let stored = u16::from_be_bytes([packet[10], packet[11]]);
+    ipv4_header_checksum(&packet[..ihl]) == stored
+}
+
 /// Apply DSCP marking to an IP packet's TOS/Traffic Class field.
+///
+/// IMPORTANT: this mutates the IPv4 TOS byte (or IPv6 Traffic Class), so for
+/// IPv4 the header checksum (RFC 791) MUST be recomputed afterwards or a real
+/// receiver will silently drop the packet (TS 29.281 carries the original
+/// inner IP packet unchanged on the wire). Per TS 23.501 §5.7.4 DSCP normally
+/// applies to the OUTER transport header; use this helper only where inner
+/// marking is genuinely required, and it keeps the checksum valid for you.
+/// IPv6 has no header checksum, so no recompute is needed there.
 pub fn apply_dscp_to_ip_packet(packet: &mut [u8], dscp: u8) -> bool {
     if packet.is_empty() {
         return false;
@@ -613,12 +665,20 @@ pub fn apply_dscp_to_ip_packet(packet: &mut [u8], dscp: u8) -> bool {
     let version = (packet[0] >> 4) & 0x0F;
     match version {
         4 if packet.len() >= 20 => {
-            // IPv4: DSCP is in TOS field (byte 1), bits 7:2
+            // IPv4: DSCP is in TOS field (byte 1), bits 7:2.
+            let ihl = ((packet[0] & 0x0F) as usize) * 4;
+            if ihl < 20 || packet.len() < ihl {
+                return false;
+            }
             packet[1] = (dscp << 2) | (packet[1] & 0x03);
+            // Recompute the IPv4 header checksum over the changed header.
+            let csum = ipv4_header_checksum(&packet[..ihl]);
+            packet[10..12].copy_from_slice(&csum.to_be_bytes());
             true
         }
         6 if packet.len() >= 40 => {
-            // IPv6: Traffic Class spans bytes 0-1 (bits 4:11)
+            // IPv6: Traffic Class spans bytes 0-1 (bits 4:11). No header
+            // checksum to recompute (RFC 8200).
             let tc = (dscp << 2) | (packet[1] & 0x03);
             packet[0] = (packet[0] & 0xF0) | ((tc >> 4) & 0x0F);
             packet[1] = ((tc & 0x0F) << 4) | (packet[1] & 0x0F);
@@ -1518,6 +1578,10 @@ pub struct DataPlane {
     pub report_tx: RwLock<Option<mpsc::Sender<UpfReportEvent>>>,
     /// Local GTP-U address (used as GTP-U Peer Address in Error Indications)
     pub local_gtpu_addr: RwLock<Ipv4Addr>,
+    /// Last IP_TOS value applied to the GTP-U socket for outer-header DSCP
+    /// marking (TS 23.501 §5.7.4). Cached so we only issue setsockopt when the
+    /// per-flow DSCP actually changes between consecutive downlink sends.
+    pub gtpu_tos: AtomicU64,
 }
 
 /// Data plane statistics
@@ -1527,6 +1591,12 @@ pub struct DataPlaneStats {
     pub ul_bytes: AtomicU64,
     pub dl_bytes: AtomicU64,
     pub dropped_packets: AtomicU64,
+    /// Uplink G-PDUs dropped because the inner source IP did not match the
+    /// session's UE IP / framed route (anti-spoofing, TS 23.501 §5.6.1).
+    pub spoofed_packets: AtomicU64,
+    /// Packets dropped because the inner IP packet exceeded the TUN MTU and
+    /// could not be safely forwarded (no fragmentation here).
+    pub oversize_packets: AtomicU64,
 }
 
 impl Default for DataPlaneStats {
@@ -1537,6 +1607,8 @@ impl Default for DataPlaneStats {
             ul_bytes: AtomicU64::new(0),
             dl_bytes: AtomicU64::new(0),
             dropped_packets: AtomicU64::new(0),
+            spoofed_packets: AtomicU64::new(0),
+            oversize_packets: AtomicU64::new(0),
         }
     }
 }
@@ -1552,6 +1624,7 @@ impl DataPlane {
             stats: DataPlaneStats::default(),
             report_tx: RwLock::new(None),
             local_gtpu_addr: RwLock::new(Ipv4Addr::UNSPECIFIED),
+            gtpu_tos: AtomicU64::new(GTPU_TOS_UNSET),
         }
     }
 
@@ -1571,6 +1644,47 @@ impl DataPlane {
         } else {
             log::debug!("No report channel attached; dropping report event");
         }
+    }
+
+    /// Apply DSCP to the OUTER GTP-U transport header (TS 23.501 §5.7.4) by
+    /// setting IP_TOS on the GTP-U socket for subsequent sends. The OS then
+    /// stamps the outer IPv4 ToS byte (and recomputes the outer checksum), so
+    /// the inner UE packet stays byte-for-byte intact on the wire (TS 29.281).
+    ///
+    /// `dscp` is the 6-bit DiffServ codepoint; it is placed in bits 7:2 of the
+    /// ToS byte with the ECN bits left at 0. The applied value is cached so
+    /// repeated sends at the same DSCP do not re-issue setsockopt. Returns
+    /// false if the socket option could not be set (non-fatal; the packet is
+    /// still sent, just without outer marking).
+    fn set_gtpu_outer_tos(&self, dscp: u8) -> bool {
+        let tos = ((dscp & 0x3F) << 2) as u64; // ECN bits = 0
+        if self.gtpu_tos.load(Ordering::Relaxed) == tos {
+            return true; // already applied
+        }
+        let sock = match &self.gtpu_socket {
+            Some(s) => s,
+            None => return false,
+        };
+        let fd = sock.as_raw_fd();
+        let tos_c = (tos as libc::c_int).to_ne_bytes();
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_TOS,
+                tos_c.as_ptr() as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            log::debug!(
+                "setsockopt(IP_TOS={tos}) failed: {} — outer DSCP not marked",
+                io::Error::last_os_error()
+            );
+            return false;
+        }
+        self.gtpu_tos.store(tos, Ordering::Relaxed);
+        true
     }
 
     /// Initialize the data plane
@@ -1835,6 +1949,31 @@ impl DataPlane {
             }
         };
 
+        // --- Uplink anti-spoofing (TS 23.501 §5.6.1): the inner source IP of
+        // a G-PDU received on a tunnel MUST equal the UE IP allocated to that
+        // PDU session. A mismatch is a spoofed/misrouted packet and is dropped.
+        // (Only enforced when the session has an allocated UE IPv4; IPv6 / no
+        // address sessions fall through unchanged.)
+        if let Some(ue_ip) = session.ue_ipv4 {
+            if ip_payload.len() >= 20 && (ip_payload[0] >> 4) == IP_VERSION_4 {
+                let src_ip = Ipv4Addr::new(
+                    ip_payload[12],
+                    ip_payload[13],
+                    ip_payload[14],
+                    ip_payload[15],
+                );
+                if src_ip != ue_ip {
+                    log::warn!(
+                        "UL source spoofing on TEID 0x{:x}: inner src {src_ip} != UE IP {ue_ip} — dropped",
+                        header.teid
+                    );
+                    self.stats.spoofed_packets.fetch_add(1, Ordering::Relaxed);
+                    self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+
         // --- PDR matching (uplink: source_interface = Access) ---
         let pkt_tuple = PacketTuple::from_ipv4_packet(ip_payload);
         let pkt_qfi = extract_qfi_from_gtp_header(pkt);
@@ -1894,7 +2033,27 @@ impl DataPlane {
             return;
         }
 
-        // Apply DSCP marking to inner IP packet before writing to TUN
+        // MTU guard: the decapsulated inner packet must fit the TUN MTU before
+        // it is injected toward the data network. Oversize packets cannot be
+        // forwarded here (no fragmentation/reassembly in the fast path), so
+        // they are dropped and counted rather than truncated.
+        if payload_len > TUN_MTU as u64 {
+            log::debug!(
+                "UL inner packet {payload_len}B exceeds TUN MTU {} on TEID 0x{:x} — dropped",
+                TUN_MTU,
+                header.teid
+            );
+            self.stats.oversize_packets.fetch_add(1, Ordering::Relaxed);
+            self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+
+        // Apply DSCP marking to the inner IP packet before writing to TUN.
+        // apply_dscp_to_ip_packet recomputes the IPv4 header checksum so the
+        // packet stays valid for the data-network-side receiver. (Transport-
+        // level DSCP per TS 23.501 §5.7.4 is the outer header on N3; on the UL
+        // egress the TUN-written packet IS the transport, so inner marking is
+        // the correct place here.)
         let ip_payload = if let Some(dscp) = dscp_to_apply {
             let mut marked = ip_payload.to_vec();
             apply_dscp_to_ip_packet(&mut marked, dscp);
@@ -1939,6 +2098,19 @@ impl DataPlane {
 
         let ip_version = (pkt[0] >> 4) & 0x0F;
         let payload_len = pkt.len() as u64;
+
+        // MTU guard: an inner packet larger than the TUN MTU cannot be carried
+        // toward the UE without fragmentation (which the fast path does not
+        // perform), so drop and count it rather than emit an oversize G-PDU.
+        if payload_len > TUN_MTU as u64 {
+            log::debug!(
+                "DL inner packet {payload_len}B exceeds TUN MTU {} — dropped",
+                TUN_MTU
+            );
+            self.stats.oversize_packets.fetch_add(1, Ordering::Relaxed);
+            self.stats.dropped_packets.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
 
         let dst_ip = match ip_version {
             IP_VERSION_4 if pkt.len() >= 20 => {
@@ -2063,18 +2235,25 @@ impl DataPlane {
             session.record_urrs(&urr_ids, payload_len, false);
         }
 
-        // Apply DSCP marking to inner IP packet before GTP-U encapsulation
-        let marked_pkt = if let Some(dscp) = dscp_to_apply {
-            let mut marked = pkt.to_vec();
-            apply_dscp_to_ip_packet(&mut marked, dscp);
-            marked
-        } else {
-            pkt.to_vec()
-        };
+        // Apply DSCP to the OUTER transport (GTP-U/UDP/IP) header, NOT the
+        // inner UE packet (TS 23.501 §5.7.4): the inner packet is carried
+        // unchanged on N3 (TS 29.281), so mutating its ToS would both violate
+        // transparency and break its IPv4 header checksum. We set IP_TOS on the
+        // GTP-U socket so the kernel stamps the outer IPv4 ToS byte.
+        match dscp_to_apply {
+            Some(dscp) => {
+                self.set_gtpu_outer_tos(dscp);
+            }
+            None => {
+                // No per-flow DSCP: clear any previously applied outer marking.
+                self.set_gtpu_outer_tos(0);
+            }
+        }
 
         // Build GTP-U encapsulated packet, carrying the QFI in a PDU Session
-        // Container extension header on N3 (TS 38.415 / TS 29.281 5.2.2.7)
-        let gtpu_pkt = encapsulate_dl_gpdu(&marked_pkt, dl_teid, qfi_to_apply);
+        // Container extension header on N3 (TS 38.415 / TS 29.281 5.2.2.7). The
+        // inner IP packet is forwarded byte-for-byte intact.
+        let gtpu_pkt = encapsulate_dl_gpdu(pkt, dl_teid, qfi_to_apply);
 
         // Send to gNB
         match gtpu.send_to(&gtpu_pkt, gnb_addr).await {
@@ -2508,26 +2687,12 @@ pub fn extract_qfi_from_gtp_header(gtp_bytes: &[u8]) -> Option<u8> {
 /// Sets the DSCP field (bits 7:2 of the TOS/Traffic Class byte) for both
 /// IPv4 (byte 1) and IPv6 (bytes 0-1).  The ECN bits (low 2) are preserved.
 /// The packet must be at least 20 bytes for IPv4 or 40 bytes for IPv6.
-pub fn mark_dscp(ip_bytes: &mut Vec<u8>, dscp: u8) {
-    if ip_bytes.is_empty() {
-        return;
-    }
-    let version = (ip_bytes[0] >> 4) & 0x0F;
-    match version {
-        4 if ip_bytes.len() >= 20 => {
-            // IPv4: DSCP is bits 7:2 of the TOS byte (byte 1).
-            // Preserve the two ECN bits in bits 1:0.
-            ip_bytes[1] = (dscp << 2) | (ip_bytes[1] & 0x03);
-        }
-        6 if ip_bytes.len() >= 40 => {
-            // IPv6: Traffic Class is bits 11:4 of the first 16-bit word.
-            // Byte 0 holds version (4 bits) + TC[7:4], byte 1 holds TC[3:0] + Flow[19:16].
-            let tc = (dscp << 2) | (ip_bytes[1] & 0x03);
-            ip_bytes[0] = (ip_bytes[0] & 0xF0) | ((tc >> 4) & 0x0F);
-            ip_bytes[1] = ((tc & 0x0F) << 4) | (ip_bytes[1] & 0x0F);
-        }
-        _ => {}
-    }
+/// For IPv4 the header checksum (RFC 791) is recomputed after mutating the
+/// TOS byte so the packet remains valid on the wire.
+pub fn mark_dscp(ip_bytes: &mut [u8], dscp: u8) {
+    // Delegates to apply_dscp_to_ip_packet, which also recomputes the IPv4
+    // header checksum (a real receiver drops packets with a stale checksum).
+    apply_dscp_to_ip_packet(ip_bytes, dscp);
 }
 
 // ============================================================================
@@ -3667,6 +3832,225 @@ mod tests {
         assert_eq!(dp.sessions.session_count(), 0);
     }
 
+    // -- C3 + anti-spoof + MTU: live data-plane robustness --
+
+    /// Build a session whose UL TEID maps to a match-all UL PDR/FAR, returning
+    /// a DataPlane with a real (loopback) GTP-U socket so the live UL path runs.
+    async fn dp_with_ul_session(ue_ip: Ipv4Addr, ul_teid: u32) -> DataPlane {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let dp = DataPlane::new(shutdown);
+        let upf_sock = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dp = DataPlane {
+            gtpu_socket: Some(Arc::new(upf_sock)),
+            ..dp
+        };
+        let gnb_addr: SocketAddr = "127.0.0.1:2152".parse().unwrap();
+        dp.add_session_from_pfcp(0x55, 0x1055, ue_ip, ul_teid, 0x200, gnb_addr, Some(1), Some(9));
+        dp
+    }
+
+    /// Finalize an IPv4 packet's total-length, TTL and header checksum so it
+    /// is wire-valid before we hand it to the data plane.
+    fn finalize_ipv4(pkt: &mut [u8]) {
+        let len = pkt.len() as u16;
+        pkt[2..4].copy_from_slice(&len.to_be_bytes());
+        pkt[8] = 64; // TTL
+        pkt[10..12].copy_from_slice(&[0, 0]);
+        let csum = ipv4_header_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&csum.to_be_bytes());
+    }
+
+    /// An uplink G-PDU whose inner source IP does not match the session's UE
+    /// IP is dropped and counted as spoofed (TS 23.501 §5.6.1).
+    #[tokio::test]
+    async fn test_ul_source_spoofing_dropped() {
+        let ue_ip = Ipv4Addr::new(10, 45, 0, 7);
+        let dp = dp_with_ul_session(ue_ip, 0x100).await;
+
+        // Inner packet claims a source IP that is NOT the UE's allocated IP.
+        let mut inner = make_ipv4_udp_packet([10, 45, 0, 99], [8, 8, 8, 8], 1234, 53);
+        finalize_ipv4(&mut inner);
+        let gpdu = encapsulate_dl_gpdu(&inner, 0x100, None);
+        dp.handle_uplink_packet(&gpdu, "127.0.0.1:2152".parse().unwrap(), -1).await;
+
+        assert_eq!(
+            dp.stats.spoofed_packets.load(Ordering::Relaxed),
+            1,
+            "spoofed packet must be counted"
+        );
+        assert_eq!(
+            dp.stats.dropped_packets.load(Ordering::Relaxed),
+            1,
+            "spoofed packet must be dropped"
+        );
+        assert_eq!(
+            dp.stats.ul_packets.load(Ordering::Relaxed),
+            0,
+            "spoofed packet must not be forwarded"
+        );
+    }
+
+    /// A legitimate uplink G-PDU (inner src == UE IP) passes the anti-spoofing
+    /// check (it reaches the TUN write; with tun_fd=-1 the write fails, but the
+    /// packet was NOT counted as spoofed).
+    #[tokio::test]
+    async fn test_ul_legitimate_source_not_spoofed() {
+        let ue_ip = Ipv4Addr::new(10, 45, 0, 7);
+        let dp = dp_with_ul_session(ue_ip, 0x100).await;
+
+        let mut inner = make_ipv4_udp_packet(ue_ip.octets(), [8, 8, 8, 8], 1234, 53);
+        finalize_ipv4(&mut inner);
+        let gpdu = encapsulate_dl_gpdu(&inner, 0x100, None);
+        dp.handle_uplink_packet(&gpdu, "127.0.0.1:2152".parse().unwrap(), -1).await;
+
+        assert_eq!(
+            dp.stats.spoofed_packets.load(Ordering::Relaxed),
+            0,
+            "legitimate source must not be flagged as spoofed"
+        );
+    }
+
+    /// An uplink inner packet larger than the TUN MTU is dropped and counted
+    /// as oversize, never written to the TUN.
+    #[tokio::test]
+    async fn test_ul_oversize_packet_dropped() {
+        let ue_ip = Ipv4Addr::new(10, 45, 0, 7);
+        let dp = dp_with_ul_session(ue_ip, 0x100).await;
+
+        // Inner packet exceeding the TUN MTU (valid src so spoofing passes).
+        let mut inner = make_ipv4_udp_packet(ue_ip.octets(), [8, 8, 8, 8], 1234, 53);
+        inner.resize(TUN_MTU as usize + 100, 0);
+        finalize_ipv4(&mut inner);
+        let gpdu = encapsulate_dl_gpdu(&inner, 0x100, None);
+        dp.handle_uplink_packet(&gpdu, "127.0.0.1:2152".parse().unwrap(), -1).await;
+
+        assert_eq!(
+            dp.stats.oversize_packets.load(Ordering::Relaxed),
+            1,
+            "oversize packet must be counted"
+        );
+        assert_eq!(
+            dp.stats.dropped_packets.load(Ordering::Relaxed),
+            1,
+            "oversize packet must be dropped"
+        );
+        assert_eq!(dp.stats.ul_packets.load(Ordering::Relaxed), 0);
+    }
+
+    /// A downlink inner packet larger than the TUN MTU is dropped (oversize),
+    /// no G-PDU emitted.
+    #[tokio::test]
+    async fn test_dl_oversize_packet_dropped() {
+        let ue_ip = Ipv4Addr::new(10, 45, 0, 7);
+        let gnb_sock = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gnb_addr = gnb_sock.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let dp = DataPlane::new(shutdown);
+        let upf_sock = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dp = DataPlane {
+            gtpu_socket: Some(Arc::new(upf_sock)),
+            ..dp
+        };
+        dp.add_session_from_pfcp(0x66, 0x1066, ue_ip, 0x100, 0x200, gnb_addr, Some(1), Some(9));
+
+        let mut pkt = make_ipv4_udp_packet([8, 8, 8, 8], ue_ip.octets(), 53, 1234);
+        pkt.resize(TUN_MTU as usize + 50, 0);
+        finalize_ipv4(&mut pkt);
+        let gtpu = dp.gtpu_socket.as_ref().unwrap().clone();
+        dp.handle_downlink_packet(&pkt, &gtpu).await;
+
+        assert_eq!(dp.stats.oversize_packets.load(Ordering::Relaxed), 1);
+        assert_eq!(dp.stats.dl_packets.load(Ordering::Relaxed), 0);
+        // Nothing was sent to the gNB.
+        let mut buf = [0u8; 2048];
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                gnb_sock.recv_from(&mut buf)
+            )
+            .await
+            .is_err(),
+            "oversize DL packet must not be forwarded"
+        );
+    }
+
+    /// Downlink DSCP marking is applied to the OUTER transport header via the
+    /// GTP-U socket (TS 23.501 §5.7.4); the inner UE packet is forwarded
+    /// byte-for-byte intact (inner checksum unchanged) on N3.
+    #[tokio::test]
+    async fn test_dl_dscp_marks_outer_not_inner() {
+        let ue_ip = Ipv4Addr::new(10, 45, 0, 7);
+        let gnb_sock = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gnb_addr = gnb_sock.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let dp = DataPlane::new(shutdown);
+        let upf_sock = TokioUdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dp = DataPlane {
+            gtpu_socket: Some(Arc::new(upf_sock)),
+            ..dp
+        };
+        dp.add_session_from_pfcp(0x66, 0x1066, ue_ip, 0x100, 0x200, gnb_addr, Some(1), Some(9));
+
+        // Attach a QER (id 5) carrying a DSCP and bind it to the DL PDR.
+        let session = dp.sessions.find_by_seid(0x66).unwrap();
+        let mut qer = DataPlaneQer::new(5);
+        qer.set_qfi(9);
+        qer.dscp = 46; // EF, forced non-zero for the marking assertion
+        session.qers.write().unwrap().insert(5, qer);
+        // Forward to the session's gNB address (the test socket's ephemeral
+        // port), not the standard GTP-U port, by clearing the FAR's OHC addr.
+        if let Some(far) = session.fars.write().unwrap().get_mut(&2) {
+            far.ohc_addr = None;
+        }
+        {
+            let mut pdrs = session.pdrs.write().unwrap();
+            for p in pdrs.iter_mut() {
+                if p.source_interface == SRC_INTF_CORE {
+                    p.qer_id = Some(5);
+                }
+            }
+        }
+
+        // Inner DL packet, wire-valid.
+        let mut inner = make_ipv4_udp_packet([8, 8, 8, 8], ue_ip.octets(), 53, 1234);
+        finalize_ipv4(&mut inner);
+        let inner_csum_before = u16::from_be_bytes([inner[10], inner[11]]);
+        let inner_tos_before = inner[1];
+
+        let gtpu = dp.gtpu_socket.as_ref().unwrap().clone();
+        dp.handle_downlink_packet(&inner, &gtpu).await;
+
+        // The GTP-U socket's IP_TOS must have been set for the EF DSCP.
+        assert_eq!(
+            dp.gtpu_tos.load(Ordering::Relaxed),
+            ((46u8) << 2) as u64,
+            "outer transport TOS set to DSCP EF"
+        );
+
+        // Receive the G-PDU at the gNB and confirm the inner packet is intact.
+        let mut buf = [0u8; 2048];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            gnb_sock.recv_from(&mut buf),
+        )
+        .await
+        .expect("DL G-PDU must arrive")
+        .unwrap();
+        // Strip the GTP-U header (E flag set -> QFI ext header present).
+        let hdr = parse_gtpu_header(&buf[..len]).unwrap();
+        let inner_out = &buf[hdr.header_len..len];
+        assert_eq!(inner_out[1], inner_tos_before, "inner TOS untouched");
+        assert_eq!(
+            u16::from_be_bytes([inner_out[10], inner_out[11]]),
+            inner_csum_before,
+            "inner IPv4 checksum untouched (transparent transport)"
+        );
+        assert!(
+            ipv4_header_checksum_valid(inner_out),
+            "inner packet still wire-valid"
+        );
+    }
+
     // -- Task 1: extract_qfi_from_gtp_header tests --
 
     #[test]
@@ -3741,6 +4125,52 @@ mod tests {
         let mut pkt = vec![0x45u8, 0x00, 0x00]; // too short for IPv4
         mark_dscp(&mut pkt, 46);
         assert_eq!(pkt[1], 0x00, "Should not modify too-short packet");
+    }
+
+    // -- C3: DSCP marking keeps the IPv4 header checksum valid --
+
+    /// A real receiver verifies the IPv4 header checksum (RFC 791) and drops
+    /// packets that fail it. After marking the inner TOS the checksum MUST be
+    /// recomputed so the marked packet is accepted on the wire.
+    #[test]
+    fn test_apply_dscp_ipv4_recomputes_checksum() {
+        // Build a real IPv4 packet with a correct initial checksum.
+        let mut pkt = make_ipv4_udp_packet([10, 45, 0, 7], [8, 8, 8, 8], 1234, 53);
+        let total_len = pkt.len() as u16;
+        pkt[2..4].copy_from_slice(&total_len.to_be_bytes()); // total length
+        pkt[8] = 64; // TTL
+        let csum = ipv4_header_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&csum.to_be_bytes());
+        assert!(
+            ipv4_header_checksum_valid(&pkt),
+            "precondition: initial checksum valid"
+        );
+
+        // Mark DSCP EF (46) and confirm the checksum is still valid afterwards.
+        assert!(apply_dscp_to_ip_packet(&mut pkt, 46));
+        assert_eq!(pkt[1] >> 2, 46, "DSCP set");
+        assert!(
+            ipv4_header_checksum_valid(&pkt),
+            "checksum must be recomputed after marking (else receiver drops it)"
+        );
+        // Checksum field over the (zeroed-csum) header sums to the stored value
+        let stored = u16::from_be_bytes([pkt[10], pkt[11]]);
+        assert_eq!(ipv4_header_checksum(&pkt[..20]), stored);
+    }
+
+    /// mark_dscp (Vec variant) must also keep the checksum valid since it now
+    /// delegates to apply_dscp_to_ip_packet.
+    #[test]
+    fn test_mark_dscp_keeps_checksum_valid() {
+        let mut pkt = make_ipv4_udp_packet([10, 0, 0, 5], [1, 1, 1, 1], 100, 200);
+        let total_len = pkt.len() as u16;
+        pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
+        pkt[8] = 64;
+        let csum = ipv4_header_checksum(&pkt[..20]);
+        pkt[10..12].copy_from_slice(&csum.to_be_bytes());
+        mark_dscp(&mut pkt, 34); // AF41
+        assert_eq!(pkt[1] >> 2, 34);
+        assert!(ipv4_header_checksum_valid(&pkt));
     }
 
     // -- Task 3: TokenBucket tests --

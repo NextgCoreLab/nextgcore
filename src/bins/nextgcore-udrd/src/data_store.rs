@@ -14,6 +14,7 @@
 //! second map lock — see the documented ABBA lock-order rule).
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::Duration;
@@ -34,6 +35,28 @@ pub enum SubKind {
     AppData,
 }
 
+impl SubKind {
+    /// Stable string tag used in the on-disk snapshot.
+    fn as_tag(self) -> &'static str {
+        match self {
+            SubKind::SubscriptionData => "SubscriptionData",
+            SubKind::ExposureData => "ExposureData",
+            SubKind::AppInfluence => "AppInfluence",
+            SubKind::AppData => "AppData",
+        }
+    }
+
+    fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "SubscriptionData" => Some(SubKind::SubscriptionData),
+            "ExposureData" => Some(SubKind::ExposureData),
+            "AppInfluence" => Some(SubKind::AppInfluence),
+            "AppData" => Some(SubKind::AppData),
+            _ => None,
+        }
+    }
+}
+
 /// A stored change subscription.
 #[derive(Debug, Clone)]
 pub struct StoredSub {
@@ -48,6 +71,12 @@ pub struct StoredSub {
 }
 
 /// In-memory UDR data store for non-subscriber-DB resource trees.
+///
+/// When a `state_path` is configured (via [`UdrDataStore::with_state_path`] /
+/// [`init_store`]), every mutation snapshots the full store to that JSON file
+/// (atomic temp+rename) so the resource trees survive a process restart. With
+/// no path configured the store is purely in-memory and all persistence is a
+/// no-op, preserving the previous behaviour (and the Docker/E2E default).
 #[derive(Default)]
 pub struct UdrDataStore {
     /// supi -> full Amf3GppAccessRegistration
@@ -60,19 +89,193 @@ pub struct UdrDataStore {
     pfds: RwLock<HashMap<String, Value>>,
     /// influenceId -> TrafficInfluData
     influence: RwLock<HashMap<String, Value>>,
+    /// (supi, pduSessionId) -> full SmfRegistration document (TS 29.505).
+    /// Stores the ACTUAL registered values (smfInstanceId, sNssai, dnn,
+    /// pduSessionId, plmnId, ...) as PUT by the consumer, not a hardcoded
+    /// summary, so GET returns exactly what was registered.
+    smf_registrations: RwLock<HashMap<(String, String), Value>>,
     /// subId -> subscription
     subs: RwLock<HashMap<String, StoredSub>>,
     /// Subscription id allocator
     next_sub_id: AtomicU64,
+    /// Optional on-disk snapshot path. `None` => purely in-memory.
+    state_path: Option<PathBuf>,
 }
 
 impl UdrDataStore {
+    /// Construct a store that snapshots to `path` on every mutation. If the
+    /// file already exists it is loaded so prior state is restored.
+    pub fn with_state_path(path: impl Into<PathBuf>) -> Self {
+        let mut store = UdrDataStore {
+            state_path: Some(path.into()),
+            ..Default::default()
+        };
+        store.load();
+        store
+    }
+
+    // -- persistence -------------------------------------------------------
+
+    /// Serialize the full store as a single JSON snapshot document.
+    fn snapshot(&self) -> Value {
+        let amf_3gpp: HashMap<String, Value> = self.amf_3gpp.read().expect("lock").clone();
+        let exposure_am: HashMap<String, Value> = self.exposure_am.read().expect("lock").clone();
+        // (ueId, psi) tuple keys are flattened to "ueId\u{1f}psi" strings so the
+        // map round-trips through JSON object keys without ambiguity.
+        let exposure_sm: HashMap<String, Value> = self
+            .exposure_sm
+            .read()
+            .expect("lock")
+            .iter()
+            .map(|((ue, psi), v)| (format!("{ue}\u{1f}{psi}"), v.clone()))
+            .collect();
+        let pfds: HashMap<String, Value> = self.pfds.read().expect("lock").clone();
+        let influence: HashMap<String, Value> = self.influence.read().expect("lock").clone();
+        let smf_registrations: HashMap<String, Value> = self
+            .smf_registrations
+            .read()
+            .expect("lock")
+            .iter()
+            .map(|((supi, psi), v)| (format!("{supi}\u{1f}{psi}"), v.clone()))
+            .collect();
+        let subs: Vec<Value> = self
+            .subs
+            .read()
+            .expect("lock")
+            .values()
+            .map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "kind": s.kind.as_tag(),
+                    "notify_uri": s.notify_uri,
+                    "body": s.body,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "version": 1,
+            "next_sub_id": self.next_sub_id.load(Ordering::SeqCst),
+            "amf_3gpp": amf_3gpp,
+            "exposure_am": exposure_am,
+            "exposure_sm": exposure_sm,
+            "pfds": pfds,
+            "influence": influence,
+            "smf_registrations": smf_registrations,
+            "subs": subs,
+        })
+    }
+
+    /// Persist the current store to disk. No-op when no path is configured.
+    /// Failures are logged, never propagated (best-effort durability — the
+    /// in-memory store remains authoritative for the live process).
+    fn persist(&self) {
+        let Some(path) = self.state_path.as_ref() else {
+            return;
+        };
+        let doc = self.snapshot();
+        if let Err(e) = write_atomic(path, &doc) {
+            log::warn!("UDR state persist to {} failed: {e}", path.display());
+        }
+    }
+
+    /// Load state from the configured path into this (empty) store. No-op when
+    /// no path is set or the file does not exist yet.
+    fn load(&mut self) {
+        let Some(path) = self.state_path.clone() else {
+            return;
+        };
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                log::warn!("UDR state load from {} failed: {e}", path.display());
+                return;
+            }
+        };
+        let doc: Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("UDR state file {} is not valid JSON: {e}", path.display());
+                return;
+            }
+        };
+        self.restore_from(&doc);
+    }
+
+    /// Restore in-memory maps from a snapshot document (used by `load` and by
+    /// tests). Unknown/missing fields are tolerated.
+    fn restore_from(&self, doc: &Value) {
+        let obj_map = |key: &str| -> HashMap<String, Value> {
+            doc.get(key)
+                .and_then(Value::as_object)
+                .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default()
+        };
+        *self.amf_3gpp.write().expect("lock") = obj_map("amf_3gpp");
+        *self.exposure_am.write().expect("lock") = obj_map("exposure_am");
+        {
+            let mut sm = self.exposure_sm.write().expect("lock");
+            sm.clear();
+            if let Some(m) = doc.get("exposure_sm").and_then(Value::as_object) {
+                for (k, v) in m {
+                    if let Some((ue, psi)) = k.split_once('\u{1f}') {
+                        sm.insert((ue.to_string(), psi.to_string()), v.clone());
+                    }
+                }
+            }
+        }
+        *self.pfds.write().expect("lock") = obj_map("pfds");
+        *self.influence.write().expect("lock") = obj_map("influence");
+        {
+            let mut sr = self.smf_registrations.write().expect("lock");
+            sr.clear();
+            if let Some(m) = doc.get("smf_registrations").and_then(Value::as_object) {
+                for (k, v) in m {
+                    if let Some((supi, psi)) = k.split_once('\u{1f}') {
+                        sr.insert((supi.to_string(), psi.to_string()), v.clone());
+                    }
+                }
+            }
+        }
+        {
+            let mut subs = self.subs.write().expect("lock");
+            subs.clear();
+            if let Some(arr) = doc.get("subs").and_then(Value::as_array) {
+                for s in arr {
+                    let (Some(id), Some(kind), Some(uri)) = (
+                        s.get("id").and_then(Value::as_str),
+                        s.get("kind").and_then(Value::as_str).and_then(SubKind::from_tag),
+                        s.get("notify_uri").and_then(Value::as_str),
+                    ) else {
+                        continue;
+                    };
+                    subs.insert(
+                        id.to_string(),
+                        StoredSub {
+                            id: id.to_string(),
+                            kind,
+                            notify_uri: uri.to_string(),
+                            body: s.get("body").cloned().unwrap_or(Value::Null),
+                        },
+                    );
+                }
+            }
+        }
+        if let Some(n) = doc.get("next_sub_id").and_then(Value::as_u64) {
+            self.next_sub_id.store(n, Ordering::SeqCst);
+        }
+    }
+
     // -- amf-3gpp-access ---------------------------------------------------
 
     /// Store a registration; returns true when newly created.
     pub fn amf_3gpp_put(&self, supi: &str, doc: Value) -> bool {
-        let mut map = self.amf_3gpp.write().expect("lock");
-        map.insert(supi.to_string(), doc).is_none()
+        let created = {
+            let mut map = self.amf_3gpp.write().expect("lock");
+            map.insert(supi.to_string(), doc).is_none()
+        };
+        self.persist();
+        created
     }
 
     pub fn amf_3gpp_get(&self, supi: &str) -> Option<Value> {
@@ -80,14 +283,20 @@ impl UdrDataStore {
     }
 
     pub fn amf_3gpp_remove(&self, supi: &str) -> Option<Value> {
-        self.amf_3gpp.write().expect("lock").remove(supi)
+        let removed = self.amf_3gpp.write().expect("lock").remove(supi);
+        self.persist();
+        removed
     }
 
     // -- exposure-data -----------------------------------------------------
 
     pub fn exposure_am_put(&self, ue_id: &str, doc: Value) -> bool {
-        let mut map = self.exposure_am.write().expect("lock");
-        map.insert(ue_id.to_string(), doc).is_none()
+        let created = {
+            let mut map = self.exposure_am.write().expect("lock");
+            map.insert(ue_id.to_string(), doc).is_none()
+        };
+        self.persist();
+        created
     }
 
     pub fn exposure_am_get(&self, ue_id: &str) -> Option<Value> {
@@ -95,13 +304,19 @@ impl UdrDataStore {
     }
 
     pub fn exposure_am_remove(&self, ue_id: &str) -> Option<Value> {
-        self.exposure_am.write().expect("lock").remove(ue_id)
+        let removed = self.exposure_am.write().expect("lock").remove(ue_id);
+        self.persist();
+        removed
     }
 
     pub fn exposure_sm_put(&self, ue_id: &str, psi: &str, doc: Value) -> bool {
-        let mut map = self.exposure_sm.write().expect("lock");
-        map.insert((ue_id.to_string(), psi.to_string()), doc)
-            .is_none()
+        let created = {
+            let mut map = self.exposure_sm.write().expect("lock");
+            map.insert((ue_id.to_string(), psi.to_string()), doc)
+                .is_none()
+        };
+        self.persist();
+        created
     }
 
     pub fn exposure_sm_get(&self, ue_id: &str, psi: &str) -> Option<Value> {
@@ -113,17 +328,24 @@ impl UdrDataStore {
     }
 
     pub fn exposure_sm_remove(&self, ue_id: &str, psi: &str) -> Option<Value> {
-        self.exposure_sm
+        let removed = self
+            .exposure_sm
             .write()
             .expect("lock")
-            .remove(&(ue_id.to_string(), psi.to_string()))
+            .remove(&(ue_id.to_string(), psi.to_string()));
+        self.persist();
+        removed
     }
 
     // -- application-data --------------------------------------------------
 
     pub fn pfd_put(&self, app_id: &str, doc: Value) -> bool {
-        let mut map = self.pfds.write().expect("lock");
-        map.insert(app_id.to_string(), doc).is_none()
+        let created = {
+            let mut map = self.pfds.write().expect("lock");
+            map.insert(app_id.to_string(), doc).is_none()
+        };
+        self.persist();
+        created
     }
 
     pub fn pfd_get(&self, app_id: &str) -> Option<Value> {
@@ -131,7 +353,9 @@ impl UdrDataStore {
     }
 
     pub fn pfd_remove(&self, app_id: &str) -> Option<Value> {
-        self.pfds.write().expect("lock").remove(app_id)
+        let removed = self.pfds.write().expect("lock").remove(app_id);
+        self.persist();
+        removed
     }
 
     /// List PFD data, optionally filtered by a set of application ids.
@@ -144,8 +368,12 @@ impl UdrDataStore {
     }
 
     pub fn influence_put(&self, influence_id: &str, doc: Value) -> bool {
-        let mut map = self.influence.write().expect("lock");
-        map.insert(influence_id.to_string(), doc).is_none()
+        let created = {
+            let mut map = self.influence.write().expect("lock");
+            map.insert(influence_id.to_string(), doc).is_none()
+        };
+        self.persist();
+        created
     }
 
     pub fn influence_get(&self, influence_id: &str) -> Option<Value> {
@@ -157,7 +385,9 @@ impl UdrDataStore {
     }
 
     pub fn influence_remove(&self, influence_id: &str) -> Option<Value> {
-        self.influence.write().expect("lock").remove(influence_id)
+        let removed = self.influence.write().expect("lock").remove(influence_id);
+        self.persist();
+        removed
     }
 
     /// List influence data filtered by the TS 29.519 ReadInfluenceData query
@@ -187,6 +417,71 @@ impl UdrDataStore {
             .collect()
     }
 
+    // -- smf-registrations (TS 29.505 context-data) ------------------------
+
+    /// Store/replace the full SmfRegistration document for (supi, psi).
+    /// Returns true when newly created. The document is stored verbatim so a
+    /// later GET returns the actual registered values, not a hardcoded summary.
+    pub fn smf_registration_put(&self, supi: &str, psi: &str, doc: Value) -> bool {
+        let created = {
+            let mut map = self.smf_registrations.write().expect("lock");
+            map.insert((supi.to_string(), psi.to_string()), doc).is_none()
+        };
+        self.persist();
+        created
+    }
+
+    /// Get the full SmfRegistration document for a single (supi, psi).
+    pub fn smf_registration_get(&self, supi: &str, psi: &str) -> Option<Value> {
+        self.smf_registrations
+            .read()
+            .expect("lock")
+            .get(&(supi.to_string(), psi.to_string()))
+            .cloned()
+    }
+
+    /// List all SmfRegistration documents for a SUPI (across all PDU sessions),
+    /// sorted by pduSessionId for a stable collection response.
+    pub fn smf_registrations_for_supi(&self, supi: &str) -> Vec<Value> {
+        let map = self.smf_registrations.read().expect("lock");
+        let mut out: Vec<(String, Value)> = map
+            .iter()
+            .filter(|((s, _), _)| s == supi)
+            .map(|((_, psi), v)| (psi.clone(), v.clone()))
+            .collect();
+        out.sort_by(|a, b| {
+            a.0.parse::<u64>()
+                .unwrap_or(u64::MAX)
+                .cmp(&b.0.parse::<u64>().unwrap_or(u64::MAX))
+        });
+        out.into_iter().map(|(_, v)| v).collect()
+    }
+
+    /// Remove the SmfRegistration document for (supi, psi).
+    pub fn smf_registration_remove(&self, supi: &str, psi: &str) -> Option<Value> {
+        let removed = self
+            .smf_registrations
+            .write()
+            .expect("lock")
+            .remove(&(supi.to_string(), psi.to_string()));
+        self.persist();
+        removed
+    }
+
+    /// Remove all SmfRegistration documents for a SUPI (UE deletion).
+    pub fn smf_registrations_remove_by_supi(&self, supi: &str) -> usize {
+        let removed = {
+            let mut map = self.smf_registrations.write().expect("lock");
+            let before = map.len();
+            map.retain(|(s, _), _| s != supi);
+            before - map.len()
+        };
+        if removed > 0 {
+            self.persist();
+        }
+        removed
+    }
+
     // -- subscriptions -----------------------------------------------------
 
     /// Create a subscription; returns the stored record with allocated id.
@@ -199,6 +494,7 @@ impl UdrDataStore {
             body,
         };
         self.subs.write().expect("lock").insert(id, sub.clone());
+        self.persist();
         sub
     }
 
@@ -209,34 +505,48 @@ impl UdrDataStore {
     /// Replace an existing subscription's notify URI/body. Returns false when
     /// the subscription does not exist or is of a different kind.
     pub fn sub_replace(&self, sub_id: &str, kind: SubKind, notify_uri: &str, body: Value) -> bool {
-        let mut map = self.subs.write().expect("lock");
-        match map.get_mut(sub_id) {
-            Some(sub) if sub.kind == kind => {
-                sub.notify_uri = notify_uri.to_string();
-                sub.body = body;
-                true
+        let replaced = {
+            let mut map = self.subs.write().expect("lock");
+            match map.get_mut(sub_id) {
+                Some(sub) if sub.kind == kind => {
+                    sub.notify_uri = notify_uri.to_string();
+                    sub.body = body;
+                    true
+                }
+                _ => false,
             }
-            _ => false,
+        };
+        if replaced {
+            self.persist();
         }
+        replaced
     }
 
     /// Patch an existing subscription's body in place (already-merged body).
     pub fn sub_set_body(&self, sub_id: &str, body: Value, notify_uri: Option<String>) -> bool {
-        let mut map = self.subs.write().expect("lock");
-        match map.get_mut(sub_id) {
-            Some(sub) => {
-                if let Some(uri) = notify_uri {
-                    sub.notify_uri = uri;
+        let updated = {
+            let mut map = self.subs.write().expect("lock");
+            match map.get_mut(sub_id) {
+                Some(sub) => {
+                    if let Some(uri) = notify_uri {
+                        sub.notify_uri = uri;
+                    }
+                    sub.body = body;
+                    true
                 }
-                sub.body = body;
-                true
+                None => false,
             }
-            None => false,
+        };
+        if updated {
+            self.persist();
         }
+        updated
     }
 
     pub fn sub_remove(&self, sub_id: &str) -> Option<StoredSub> {
-        self.subs.write().expect("lock").remove(sub_id)
+        let removed = self.subs.write().expect("lock").remove(sub_id);
+        self.persist();
+        removed
     }
 
     /// List subscriptions of a kind matching a predicate (copies out).
@@ -256,20 +566,61 @@ impl UdrDataStore {
 
     /// Remove all SubscriptionData subscriptions for a ue-id; returns count.
     pub fn subs_remove_by_ue(&self, ue_id: &str) -> usize {
-        let mut map = self.subs.write().expect("lock");
-        let before = map.len();
-        map.retain(|_, s| {
-            !(s.kind == SubKind::SubscriptionData
-                && s.body.get("ueId").and_then(Value::as_str) == Some(ue_id))
-        });
-        before - map.len()
+        let removed = {
+            let mut map = self.subs.write().expect("lock");
+            let before = map.len();
+            map.retain(|_, s| {
+                !(s.kind == SubKind::SubscriptionData
+                    && s.body.get("ueId").and_then(Value::as_str) == Some(ue_id))
+            });
+            before - map.len()
+        };
+        if removed > 0 {
+            self.persist();
+        }
+        removed
     }
 }
 
+/// Atomically write `doc` to `path` (write a temp file in the same directory,
+/// then rename over the target) so a crash mid-write can never leave a
+/// truncated snapshot. Creates parent directories as needed.
+fn write_atomic(path: &Path, doc: &Value) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let serialized = serde_json::to_vec_pretty(doc)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &serialized)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Backing cell for the global UDR data store singleton.
+static STORE: OnceLock<UdrDataStore> = OnceLock::new();
+
 /// Global UDR data store singleton.
+///
+/// If [`init_store`] has not been called, this lazily initialises a purely
+/// in-memory store (no on-disk snapshot), matching the previous behaviour.
 pub fn store() -> &'static UdrDataStore {
-    static STORE: OnceLock<UdrDataStore> = OnceLock::new();
     STORE.get_or_init(UdrDataStore::default)
+}
+
+/// Initialise the global store with an on-disk snapshot path, loading any
+/// previously persisted state. Must be called before the first [`store`] use
+/// to take effect; returns `false` if the store was already initialised (in
+/// which case the existing store, including its path, is left untouched).
+///
+/// Passing `None` leaves the store purely in-memory (the default).
+pub fn init_store(state_path: Option<PathBuf>) -> bool {
+    let store = match state_path {
+        Some(p) => UdrDataStore::with_state_path(p),
+        None => UdrDataStore::default(),
+    };
+    STORE.set(store).is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -608,5 +959,111 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// Unique snapshot path per test so concurrent runs do not collide.
+    fn temp_state_path(tag: &str) -> std::path::PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("udrd-test-{tag}-{pid}-{nanos}.json"))
+    }
+
+    /// PUT a value, then re-open the store from the same path and confirm the
+    /// value survived the simulated restart (across every resource tree).
+    #[test]
+    fn test_persistence_survives_restart() {
+        let path = temp_state_path("restart");
+        let _ = std::fs::remove_file(&path);
+
+        // First lifetime: populate every tree, then drop the store.
+        {
+            let s = UdrDataStore::with_state_path(&path);
+            assert!(s.amf_3gpp_put("imsi-1", json!({"amfInstanceId": "amf-x"})));
+            assert!(s.exposure_am_put("imsi-1", json!({"roamingStatus": true})));
+            assert!(s.exposure_sm_put("imsi-1", "5", json!({"dnn": "internet"})));
+            assert!(s.pfd_put("app-1", json!({"pfds": []})));
+            assert!(s.influence_put("inf-1", json!({"dnn": "ims"})));
+            let sub = s.sub_create(
+                SubKind::ExposureData,
+                "http://cb:1/x",
+                json!({"monitoredResourceUris": ["/a"]}),
+            );
+            assert_eq!(sub.id, "1");
+        }
+
+        // Second lifetime: a brand-new store re-opened from the same file must
+        // see all prior data, and continue the subscription-id sequence.
+        {
+            let s = UdrDataStore::with_state_path(&path);
+            assert_eq!(
+                s.amf_3gpp_get("imsi-1"),
+                Some(json!({"amfInstanceId": "amf-x"}))
+            );
+            assert_eq!(
+                s.exposure_am_get("imsi-1"),
+                Some(json!({"roamingStatus": true}))
+            );
+            assert_eq!(
+                s.exposure_sm_get("imsi-1", "5"),
+                Some(json!({"dnn": "internet"}))
+            );
+            assert_eq!(s.pfd_get("app-1"), Some(json!({"pfds": []})));
+            assert_eq!(s.influence_get("inf-1"), Some(json!({"dnn": "ims"})));
+            let restored = s.sub_get("1").expect("subscription restored");
+            assert_eq!(restored.kind, SubKind::ExposureData);
+            assert_eq!(restored.notify_uri, "http://cb:1/x");
+            // Allocator continues past the restored id (no collision).
+            let next = s.sub_create(SubKind::AppData, "http://cb:2/y", json!({}));
+            assert_eq!(next.id, "2");
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A removal must also be persisted (the restart must NOT resurrect it).
+    #[test]
+    fn test_persistence_remove_survives_restart() {
+        let path = temp_state_path("remove");
+        let _ = std::fs::remove_file(&path);
+        {
+            let s = UdrDataStore::with_state_path(&path);
+            s.amf_3gpp_put("imsi-9", json!({"a": 1}));
+            assert!(s.amf_3gpp_remove("imsi-9").is_some());
+        }
+        {
+            let s = UdrDataStore::with_state_path(&path);
+            assert!(
+                s.amf_3gpp_get("imsi-9").is_none(),
+                "removed entry must not reappear after restart"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// No configured path => no file written, store stays in-memory.
+    #[test]
+    fn test_no_path_is_pure_memory() {
+        let s = UdrDataStore::default();
+        s.amf_3gpp_put("imsi-1", json!({"a": 1}));
+        // snapshot() works regardless, but persist() is a no-op without a path.
+        s.persist();
+        assert!(s.state_path.is_none());
+    }
+
+    /// Snapshot/restore round-trips through JSON without a file.
+    #[test]
+    fn test_snapshot_restore_roundtrip() {
+        let s = UdrDataStore::default();
+        s.amf_3gpp_put("imsi-1", json!({"x": 1}));
+        s.exposure_sm_put("imsi-1", "7", json!({"dnn": "ims"}));
+        let snap = s.snapshot();
+
+        let t = UdrDataStore::default();
+        t.restore_from(&snap);
+        assert_eq!(t.amf_3gpp_get("imsi-1"), Some(json!({"x": 1})));
+        assert_eq!(t.exposure_sm_get("imsi-1", "7"), Some(json!({"dnn": "ims"})));
     }
 }

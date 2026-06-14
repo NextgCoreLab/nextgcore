@@ -73,6 +73,13 @@ struct Args {
     /// TLS key path
     #[arg(long)]
     tls_key: Option<String>,
+
+    /// Path to the JSON snapshot file for non-subscriber resource trees
+    /// (exposure-data, application-data, smf-registrations, subs-to-notify).
+    /// When unset (the default), these trees are kept purely in-memory and are
+    /// lost on restart. Also settable via NEXTGCORE_UDR_STATE_FILE.
+    #[arg(long)]
+    state_file: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +159,25 @@ async fn main() -> Result<()> {
     // Initialize UDR context
     udr_context_init();
     log::info!("UDR context initialized");
+
+    // Initialise the persistent data store for non-subscriber resource trees.
+    // Path precedence: --state-file flag, then NEXTGCORE_UDR_STATE_FILE env.
+    // With neither set the store stays purely in-memory (previous behaviour).
+    let state_file = args
+        .state_file
+        .clone()
+        .or_else(|| std::env::var("NEXTGCORE_UDR_STATE_FILE").ok())
+        .filter(|s| !s.is_empty());
+    match &state_file {
+        Some(path) => {
+            nextgcore_udrd::data_store::init_store(Some(std::path::PathBuf::from(path)));
+            log::info!("UDR resource-tree persistence enabled: {path}");
+        }
+        None => {
+            nextgcore_udrd::data_store::init_store(None);
+            log::info!("UDR resource-tree persistence disabled (in-memory only)");
+        }
+    }
 
     // Initialize UDR state machine
     let mut udr_sm = UdrSmContext::new();
@@ -789,7 +815,17 @@ async fn handle_amf_3gpp_access(supi: &str, method: &str, request: &SbiRequest) 
     }
 }
 
-/// Handle SMF registration context
+/// TS 29.505 SmfRegistration mandatory IEs (Table 6.1.6.2.3-1: smfInstanceId,
+/// pduSessionId, singleNssai, dnn, plmnId).
+const SMF_REGISTRATION_MANDATORY_IES: [&str; 5] =
+    ["smfInstanceId", "pduSessionId", "singleNssai", "dnn", "plmnId"];
+
+/// Handle SMF registration context.
+///
+/// Stores and returns the ACTUAL registered SmfRegistration document (the full
+/// PUT body: smfInstanceId, singleNssai, dnn, pduSessionId, plmnId, ...), not a
+/// hardcoded summary. Backed by the persistent [`data_store`] so registrations
+/// survive a UDR restart.
 fn handle_smf_registrations(
     supi: &str,
     method: &str,
@@ -797,49 +833,19 @@ fn handle_smf_registrations(
     pdu_session_id: &str,
 ) -> SbiResponse {
     let udr_ctx = nextgcore_udrd::context::udr_self();
+    let ds = nextgcore_udrd::data_store::store();
     match method {
         "GET" => {
             if pdu_session_id.is_empty() {
-                let registrations = udr_ctx
-                    .read()
-                    .ok()
-                    .and_then(|ctx| {
-                        ctx.ue_find(supi).map(|ue| {
-                            ue.sessions
-                                .values()
-                                .map(|sess| {
-                                    serde_json::json!({
-                                        "smfInstanceId": "00000000-0000-0000-0000-000000000000",
-                                        "pduSessionId": sess.psi,
-                                        "singleNssai": {"sst": 1},
-                                        "dnn": sess.dnn.as_deref().unwrap_or("internet")
-                                    })
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                    })
-                    // Unknown UE (or poisoned lock) -> empty array, not a
-                    // panic: a crafted GET for a non-existent SUPI must not
-                    // crash the NF (remote DoS). TS 29.505 returns an empty
-                    // collection for a UE with no SMF registrations.
-                    .unwrap_or_default();
+                // Collection GET: every stored registration for the SUPI.
+                // Unknown UE -> empty array (TS 29.505), never a panic.
+                let registrations = ds.smf_registrations_for_supi(supi);
                 SbiResponse::with_status(200).with_body(
                     serde_json::Value::Array(registrations).to_string(),
                     "application/json",
                 )
             } else {
-                let psi: u8 = pdu_session_id.parse().unwrap_or(0);
-                let response = udr_ctx.read().ok().and_then(|ctx| {
-                    ctx.sess_find(supi, psi).map(|sess| {
-                        serde_json::json!({
-                            "smfInstanceId": "00000000-0000-0000-0000-000000000000",
-                            "pduSessionId": sess.psi,
-                            "singleNssai": {"sst": 1},
-                            "dnn": sess.dnn.as_deref().unwrap_or("internet")
-                        })
-                    })
-                });
-                match response {
+                match ds.smf_registration_get(supi, pdu_session_id) {
                     Some(json) => SbiResponse::with_status(200)
                         .with_body(json.to_string(), "application/json"),
                     None => send_not_found("SMF registration not found", Some("CONTEXT_NOT_FOUND")),
@@ -847,16 +853,73 @@ fn handle_smf_registrations(
             }
         }
         "PUT" => {
-            let psi: u8 = pdu_session_id.parse().unwrap_or(5);
-            let dnn = request.http.content.as_ref().and_then(|c| {
-                serde_json::from_str::<serde_json::Value>(c)
-                    .ok()
-                    .and_then(|v| v.get("dnn").and_then(|d| d.as_str()).map(|s| s.to_string()))
-            });
+            if pdu_session_id.is_empty() {
+                return send_bad_request("Missing pduSessionId", Some("MANDATORY_IE_MISSING"));
+            }
+            // Parse the SmfRegistration document from the request body.
+            let Some(content) = request.http.content.as_ref() else {
+                return send_bad_request("Missing SmfRegistration body", Some("MANDATORY_IE_MISSING"));
+            };
+            let mut doc: serde_json::Value = match serde_json::from_str(content) {
+                Ok(v @ serde_json::Value::Object(_)) => v,
+                _ => {
+                    return send_bad_request(
+                        "Invalid SmfRegistration document",
+                        Some("INVALID_MSG_FORMAT"),
+                    )
+                }
+            };
+            // Validate mandatory IEs (TS 29.505 SmfRegistration).
+            let missing: Vec<&str> = SMF_REGISTRATION_MANDATORY_IES
+                .iter()
+                .filter(|ie| match doc.get(**ie) {
+                    None | Some(serde_json::Value::Null) => true,
+                    Some(serde_json::Value::String(s)) => s.is_empty(),
+                    Some(_) => false,
+                })
+                .copied()
+                .collect();
+            if !missing.is_empty() {
+                return send_bad_request(
+                    &format!("Missing mandatory IE(s): {}", missing.join(", ")),
+                    Some("MANDATORY_IE_MISSING"),
+                );
+            }
+            // The pduSessionId in the body must match the URI path segment
+            // (TS 29.505 §6.1.3.1.3.1) so the stored key is consistent.
+            let body_psi = doc.get("pduSessionId").and_then(|v| v.as_u64());
+            if let Some(bp) = body_psi {
+                if bp.to_string() != pdu_session_id {
+                    return send_bad_request(
+                        "pduSessionId in body does not match URI",
+                        Some("INVALID_MSG_FORMAT"),
+                    );
+                }
+            }
+            // Normalise pduSessionId to the URI value as a numeric IE.
+            if let Ok(num) = pdu_session_id.parse::<u64>() {
+                if let Some(obj) = doc.as_object_mut() {
+                    obj.insert("pduSessionId".to_string(), serde_json::json!(num));
+                }
+            }
+            // Keep the context UE/session tracking in sync (for
+            // subscription-data change notifications and request correlation).
+            let psi: u8 = pdu_session_id.parse().unwrap_or(0);
+            let dnn = doc
+                .get("dnn")
+                .and_then(|d| d.as_str())
+                .map(|s| s.to_string());
             if let Ok(mut ctx) = udr_ctx.write() {
                 ctx.sess_find_or_add(supi, psi, dnn.as_deref());
             }
-            SbiResponse::with_status(204)
+            // Store the actual registered document (created vs. replaced).
+            let created = ds.smf_registration_put(supi, pdu_session_id, doc);
+            // TS 29.505: 201 Created for a new registration, 204 for replace.
+            if created {
+                SbiResponse::with_status(201)
+            } else {
+                SbiResponse::with_status(204)
+            }
         }
         "DELETE" => {
             if !pdu_session_id.is_empty() {
@@ -864,6 +927,10 @@ fn handle_smf_registrations(
                 if let Ok(mut ctx) = udr_ctx.write() {
                     ctx.sess_remove(supi, psi);
                 }
+                ds.smf_registration_remove(supi, pdu_session_id);
+            } else {
+                // Collection DELETE removes all registrations for the SUPI.
+                ds.smf_registrations_remove_by_supi(supi);
             }
             SbiResponse::with_status(204)
         }
@@ -2362,17 +2429,36 @@ udr:
         let resp = client.get(&single).await.expect("GET unknown smf-reg/5");
         assert_eq!(resp.status, 404);
 
-        // Success path: PUT a registration then GET the list back.
+        // Success path: PUT a full SmfRegistration then GET the actual stored
+        // values back (not a hardcoded summary). A new registration is 201.
         let supi = "imsi-001019900000077";
         let coll = format!(
             "/nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations"
         );
         let single = format!("{coll}/5");
+        let reg = json!({
+            "smfInstanceId": "11111111-2222-3333-4444-555555555555",
+            "pduSessionId": 5,
+            "singleNssai": {"sst": 2, "sd": "000001"},
+            "dnn": "ims",
+            "plmnId": {"mcc": "001", "mnc": "01"}
+        });
         let resp = client
-            .put_json(&single, &json!({"dnn": "internet"}))
+            .put_json(&single, &reg)
             .await
             .expect("PUT smf-reg");
-        assert_eq!(resp.status, 204);
+        assert_eq!(resp.status, 201, "new SmfRegistration must be 201 Created");
+
+        // Per-PDU GET returns the ACTUAL registered document.
+        let resp = client.get(&single).await.expect("GET smf-reg/5");
+        assert_eq!(resp.status, 200);
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(got["smfInstanceId"], "11111111-2222-3333-4444-555555555555");
+        assert_eq!(got["singleNssai"], json!({"sst": 2, "sd": "000001"}));
+        assert_eq!(got["dnn"], "ims");
+        assert_eq!(got["plmnId"], json!({"mcc": "001", "mnc": "01"}));
+        assert_eq!(got["pduSessionId"], 5);
 
         let resp = client.get(&coll).await.expect("GET smf-regs list");
         assert_eq!(resp.status, 200);
@@ -2381,7 +2467,22 @@ udr:
         let arr = body.as_array().expect("array");
         assert_eq!(arr.len(), 1, "one registration after PUT");
         assert_eq!(arr[0]["pduSessionId"], 5);
-        assert_eq!(arr[0]["dnn"], "internet");
+        assert_eq!(arr[0]["dnn"], "ims");
+        assert_eq!(arr[0]["smfInstanceId"], "11111111-2222-3333-4444-555555555555");
+
+        // Replacing the same registration is 204 (not created).
+        let resp = client
+            .put_json(&single, &reg)
+            .await
+            .expect("re-PUT smf-reg");
+        assert_eq!(resp.status, 204, "replace must be 204");
+
+        // Missing mandatory IEs -> 400 MANDATORY_IE_MISSING.
+        let resp = client
+            .put_json(&single, &json!({"dnn": "ims"}))
+            .await
+            .expect("PUT incomplete smf-reg");
+        assert_eq!(resp.status, 400, "missing mandatory IEs must be 400");
 
         udr.stop().await.expect("udr stops");
         listener.stop().await.expect("listener stops");

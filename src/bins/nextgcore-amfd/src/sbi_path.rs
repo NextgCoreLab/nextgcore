@@ -24,6 +24,7 @@ pub mod service_name {
     pub const NSMF_PDUSESSION: &str = "nsmf-pdusession";
     pub const NNSSF_NSSELECTION: &str = "nnssf-nsselection";
     pub const NPCF_AM_POLICY_CONTROL: &str = "npcf-am-policy-control";
+    pub const NNSACF_NSAC: &str = "nnsacf-nsac";
     pub const NNRF_NFM: &str = "nnrf-nfm";
     pub const NNRF_DISC: &str = "nnrf-disc";
 }
@@ -152,6 +153,8 @@ pub enum SbiServiceType {
     NnssfNsselection,
     /// NPCF AM policy control
     NpcfAmPolicyControl,
+    /// NNSACF network slice admission control
+    NnsacfNsac,
     /// NNRF NF management
     NnrfNfm,
     /// NNRF discovery
@@ -168,6 +171,7 @@ impl SbiServiceType {
             Self::NsmfPdusession => service_name::NSMF_PDUSESSION,
             Self::NnssfNsselection => service_name::NNSSF_NSSELECTION,
             Self::NpcfAmPolicyControl => service_name::NPCF_AM_POLICY_CONTROL,
+            Self::NnsacfNsac => service_name::NNSACF_NSAC,
             Self::NnrfNfm => service_name::NNRF_NFM,
             Self::NnrfDisc => service_name::NNRF_DISC,
         }
@@ -1217,6 +1221,12 @@ pub async fn resolve_nf_endpoint_async(service_type: SbiServiceType) -> SbiResul
             "PCF_SBI_PORT",
             7777,
         ),
+        SbiServiceType::NnsacfNsac => (
+            ogs_sbi::types::SbiServiceType::NnsacfNsac,
+            "NSACF_SBI_ADDR",
+            "NSACF_SBI_PORT",
+            7777,
+        ),
         _ => return Err(SbiError::ServiceNotFound(format!("{service_type:?}"))),
     };
 
@@ -1439,6 +1449,86 @@ pub async fn call_pcf_am_policy_create(
     Ok(assoc_id)
 }
 
+/// Result of an Nnsacf UE-admission query (TS 29.536 UeACResponseData).
+#[derive(Debug, Clone)]
+pub struct NsacfUeAdmissionResult {
+    /// Whether the UE was admitted for the requested S-NSSAI.
+    pub admitted: bool,
+    /// Configured maximum number of UEs for the slice (informational).
+    pub max_num_ues: Option<u64>,
+}
+
+/// Nnsacf_NSAC UE-admission query (TS 29.536 Section 5.2.2.2 / 6.1).
+///
+/// POST {apiRoot}/nnsacf-nsac/v1/slices/ues with UeACRequestData. The NSACF
+/// returns HTTP 200 with `UeACResponseData { admittedFlag, maxNumUEs? }` for
+/// BOTH admit and reject decisions — over-limit is signalled by
+/// `admittedFlag=false`, never by a non-2xx status. `update_flag=true` requests
+/// the NSACF to enforce (increase) the per-slice UE count.
+pub async fn call_nsacf_ue_admission(
+    nsacf_host: &str,
+    nsacf_port: u16,
+    nf_id: &str,
+    snssai_sst: u8,
+    snssai_sd: Option<u32>,
+    access_type: &str,
+    update_flag: bool,
+) -> SbiResult<NsacfUeAdmissionResult> {
+    let client = SbiClient::with_host_port(nsacf_host, nsacf_port);
+
+    let mut snssai = serde_json::json!({ "sst": snssai_sst });
+    if let Some(sd) = snssai_sd {
+        snssai["sd"] = serde_json::Value::String(format!("{sd:06X}"));
+    }
+
+    let body = serde_json::json!({
+        "snssai": snssai,
+        "nfId": nf_id,
+        "updateFlag": update_flag,
+        "updateList": [ { "accessType": access_type } ],
+    });
+
+    let response = client
+        .post_json("/nnsacf-nsac/v1/slices/ues", &body)
+        .await
+        .map_err(|e| SbiError::RequestFailed(format!("NSACF UE admission failed: {e}")))?;
+
+    // The NSACF answers admit AND reject with HTTP 200; only a transport/other
+    // status is a hard error.
+    if !response.is_success() {
+        return Err(SbiError::RequestFailed(format!(
+            "NSACF UE admission returned status {}",
+            response.status
+        )));
+    }
+
+    let json: serde_json::Value = response
+        .http
+        .content
+        .as_deref()
+        .and_then(|c| serde_json::from_str(c).ok())
+        .ok_or_else(|| {
+            SbiError::RequestFailed("NSACF UE admission: empty/invalid body".to_string())
+        })?;
+
+    let result = parse_nsacf_ue_admission_response(&json);
+    log::info!(
+        "Nnsacf UE admission (SST={snssai_sst}, SD={snssai_sd:?}): admittedFlag={}, maxNumUEs={:?}",
+        result.admitted,
+        result.max_num_ues
+    );
+    Ok(result)
+}
+
+/// Parse a UeACResponseData body (TS 29.536). `admittedFlag` absent or false
+/// means the UE is NOT admitted (default deny).
+fn parse_nsacf_ue_admission_response(json: &serde_json::Value) -> NsacfUeAdmissionResult {
+    NsacfUeAdmissionResult {
+        admitted: json["admittedFlag"].as_bool().unwrap_or(false),
+        max_num_ues: json["maxNumUEs"].as_u64(),
+    }
+}
+
 /// Nudm_UECM_DeregistrationNotification cleanup: PATCH purge on deregistration
 /// (TS 29.503 5.3.2.4: AMF sets purgeFlag when the UE deregisters).
 pub async fn call_udm_uecm_deregistration(
@@ -1492,6 +1582,35 @@ mod tests {
             SbiServiceType::NsmfPdusession.service_name(),
             "nsmf-pdusession"
         );
+    }
+
+    #[test]
+    fn test_nsacf_service_name() {
+        assert_eq!(SbiServiceType::NnsacfNsac.service_name(), "nnsacf-nsac");
+    }
+
+    #[test]
+    fn test_nsacf_admission_response_parse() {
+        // admittedFlag=true -> admitted; registration proceeds.
+        let granted = serde_json::json!({
+            "snssai": { "sst": 1 },
+            "admittedFlag": true,
+            "maxNumUEs": 1000
+        });
+        let r = parse_nsacf_ue_admission_response(&granted);
+        assert!(r.admitted);
+        assert_eq!(r.max_num_ues, Some(1000));
+
+        // admittedFlag=false (HTTP 200, over-limit) -> rejected.
+        let denied = serde_json::json!({
+            "snssai": { "sst": 1 },
+            "admittedFlag": false
+        });
+        assert!(!parse_nsacf_ue_admission_response(&denied).admitted);
+
+        // Missing admittedFlag -> default deny.
+        let empty = serde_json::json!({ "snssai": { "sst": 1 } });
+        assert!(!parse_nsacf_ue_admission_response(&empty).admitted);
     }
 
     #[test]

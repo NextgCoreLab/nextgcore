@@ -184,6 +184,13 @@ struct Args {
     /// Auto-generated when not given.
     #[arg(long)]
     nf_instance_id: Option<String>,
+
+    /// Path to the JSON snapshot file for registered NFProfiles and
+    /// subscriptions. When unset (the default) the registry is purely
+    /// in-memory and is lost on restart. Also settable via
+    /// NEXTGCORE_NRF_STATE_FILE.
+    #[arg(long)]
+    state_file: Option<String>,
 }
 
 /// Global shutdown flag
@@ -258,6 +265,25 @@ async fn main() -> Result<()> {
     // Initialize NRF context
     nrf_context_init(args.max_ue);
     log::info!("NRF context initialized (max_ue={})", args.max_ue);
+
+    // Initialise the NF registry, optionally restoring persisted profiles and
+    // subscriptions. Path precedence: --state-file, then NEXTGCORE_NRF_STATE_FILE.
+    // With neither set the registry stays purely in-memory (previous behaviour).
+    let nrf_state_file = args
+        .state_file
+        .clone()
+        .or_else(|| std::env::var("NEXTGCORE_NRF_STATE_FILE").ok())
+        .filter(|s| !s.is_empty());
+    match &nrf_state_file {
+        Some(path) => {
+            nextgcore_nrfd::init_nf_manager(Some(std::path::PathBuf::from(path)));
+            log::info!("NRF registry persistence enabled: {path}");
+        }
+        None => {
+            nextgcore_nrfd::init_nf_manager(None);
+            log::info!("NRF registry persistence disabled (in-memory only)");
+        }
+    }
 
     // Store the NRF's own SBI URI so notification handlers can use it
     let scheme = if args.tls { "https" } else { "http" };
