@@ -715,9 +715,20 @@ pub fn encode_ambr_component(bps: u64) -> (u8, u16) {
     (0x0B, u16::MAX)
 }
 
-/// Build a PDU Session Establishment Accept with policy-derived QoS
-/// (wire shape kept compatible with the existing E2E peers; values are no
-/// longer hardcoded).
+/// Build a PDU Session Establishment Accept with policy-derived QoS,
+/// wire-conformant per TS 24.501 §8.3.2 Table 8.3.2.1.1.
+///
+/// Octet layout (after the 4-octet SM header EPD/PSI/PTI/message-type):
+/// - octet 5: selected SSC mode (bits 5-7) packed with selected PDU
+///   session type (bits 1-3) in a SINGLE octet;
+/// - Authorized QoS rules: LV-E (2-octet length) carrying the rules
+///   produced by [`crate::gsm_build::encode_qos_rules`]
+///   (QoS-rule-id / 2-octet rule length / rule-operation+flags / packet
+///   filters / precedence / QFI);
+/// - Session-AMBR: LV (1-octet length = 6) with DL unit+value and UL
+///   unit+value.
+///
+/// Values are policy-derived (not hardcoded).
 #[allow(clippy::too_many_arguments)]
 pub fn build_establishment_accept(
     psi: u8,
@@ -730,16 +741,47 @@ pub fn build_establishment_accept(
     ue_ip: [u8; 4],
     dnn: &str,
 ) -> Vec<u8> {
+    use crate::gsm_build::{
+        encode_qos_rules, pf_component_type, pf_direction, qos_rule_code, PacketFilterComponent,
+        PacketFilterContent, QosRule, QosRulePacketFilter,
+    };
+
     let mut msg = Vec::with_capacity(32 + dnn.len());
     msg.push(0x2E); // EPD: 5GSM
     msg.push(psi);
     msg.push(pti); // echo the UE's PTI (TS 24.501 §6.3.1.3)
     msg.push(gsm_message_type::ESTABLISHMENT_ACCEPT);
-    msg.push(selected_pdu_session_type & 0x07);
-    msg.push(selected_ssc_mode & 0x07);
-    // Authorized QoS rules (default rule, QFI from policy)
-    msg.extend_from_slice(&[0x06, 0x01, 0x03, 0x01, 0x01, qfi & 0x3F]);
-    // Session-AMBR (length 6: DL unit+value, UL unit+value)
+
+    // Octet 5: SSC mode (bits 5-7, high nibble) | PDU session type
+    // (bits 1-3, low nibble) — single packed octet per Table 8.3.2.1.1.
+    msg.push(((selected_ssc_mode & 0x07) << 4) | (selected_pdu_session_type & 0x07));
+
+    // Authorized QoS rules (mandatory, LV-E): a default CREATE rule with a
+    // match-all bidirectional packet filter, lowest precedence and the
+    // policy-derived QFI. Encoded by the conformant QoS-rule encoder.
+    let default_rule = QosRule {
+        identifier: qfi & 0x3F,
+        code: qos_rule_code::CREATE_NEW_QOS_RULE,
+        dqr_bit: true,
+        packet_filters: vec![QosRulePacketFilter {
+            direction: pf_direction::BIDIRECTIONAL,
+            identifier: 1,
+            content: PacketFilterContent {
+                components: vec![PacketFilterComponent {
+                    component_type: pf_component_type::MATCH_ALL,
+                    data: vec![],
+                }],
+            },
+        }],
+        precedence: 255,
+        segregation: false,
+        qfi: qfi & 0x3F,
+    };
+    let qos_rules = encode_qos_rules(&[default_rule]);
+    msg.extend_from_slice(&(qos_rules.len() as u16).to_be_bytes());
+    msg.extend_from_slice(&qos_rules);
+
+    // Session-AMBR (mandatory, LV; length 6: DL unit+value, UL unit+value)
     let (dl_unit, dl_val) = encode_ambr_component(ambr_dl_bps);
     let (ul_unit, ul_val) = encode_ambr_component(ambr_ul_bps);
     msg.push(0x06);
@@ -747,6 +789,7 @@ pub fn build_establishment_accept(
     msg.extend_from_slice(&dl_val.to_be_bytes());
     msg.push(ul_unit);
     msg.extend_from_slice(&ul_val.to_be_bytes());
+
     // PDU address (IEI 0x29) — IPv4
     msg.push(0x29);
     msg.push(0x05);
@@ -839,34 +882,68 @@ mod tests {
 
     #[test]
     fn accept_message_carries_policy_values() {
+        // SSC mode 2, PDU type IPv4 (0x01), QFI 9
         let msg = build_establishment_accept(
             5,
             3,
             pdu_session_type::IPV4,
-            1,
+            2,
             9,
             200_000_000,
             50_000_000,
             [10, 45, 0, 2],
             "internet",
         );
-        assert_eq!(msg[0], 0x2E);
-        assert_eq!(msg[1], 5);
+        // SM header (TS 24.501 §9.3 / Table 8.3.2.1.1 octets 1-4)
+        assert_eq!(msg[0], 0x2E); // EPD: 5GSM
+        assert_eq!(msg[1], 5); // PSI
         assert_eq!(msg[2], 3); // PTI echoed
-        assert_eq!(msg[3], 0xC2);
-        // Session-AMBR DL: 200 Mbps with unit 1 Mbps
-        let ambr_off = 12; // after QoS rules
-        assert_eq!(msg[ambr_off], 0x06); // length
-        assert_eq!(msg[ambr_off + 1], 0x06); // unit 1 Mbps
+        assert_eq!(msg[3], 0xC2); // message type: Establishment Accept
+
+        // Octet 5: SSC mode (bits 5-7, high nibble) packed with PDU
+        // session type (bits 1-3, low nibble) in a SINGLE octet.
+        // SSC mode 2 (0b010) << 4 | IPv4 (0b001) = 0x21
+        assert_eq!(msg[4], 0x21);
+
+        // Authorized QoS rules as LV-E (2-octet length) per Table 8.3.2.1.1.
+        let qos_len = u16::from_be_bytes([msg[5], msg[6]]) as usize;
+        // One default CREATE rule with a match-all packet filter encoded by
+        // the conformant QoS-rule encoder:
+        //   [qfi][len_hi][len_lo][op+flags=0x31][pf_hdr=0x31][pf_len=1]
+        //   [match-all=0x01][precedence=0xFF][qfi]
+        assert_eq!(qos_len, 9);
+        let qos = &msg[7..7 + qos_len];
+        assert_eq!(qos[0], 9); // QoS rule identifier == QFI
+        assert_eq!(u16::from_be_bytes([qos[1], qos[2]]), 6); // rule length (2-octet)
+        // op (CREATE=1)<<5 | DQR(0x10) | num_pf(1) = 0x31
+        assert_eq!(qos[3], 0x31);
+        // packet filter header: dir BIDIR(3)<<4 | pf id 1 = 0x31
+        assert_eq!(qos[4], 0x31);
+        assert_eq!(qos[5], 1); // pf content length
+        assert_eq!(qos[6], 0x01); // match-all component type
+        assert_eq!(qos[7], 0xFF); // precedence
+        assert_eq!(qos[8], 9); // QFI (segregation bit clear)
+
+        // Session-AMBR LV (1-octet length = 6) immediately after the QoS LV-E.
+        let ambr_off = 7 + qos_len;
+        assert_eq!(msg[ambr_off], 0x06); // length (single octet, no double-length bug)
+        assert_eq!(msg[ambr_off + 1], 0x06); // DL unit: 1 Mbps
         assert_eq!(
             u16::from_be_bytes([msg[ambr_off + 2], msg[ambr_off + 3]]),
             200
         );
-        assert_eq!(msg[ambr_off + 4], 0x06);
+        assert_eq!(msg[ambr_off + 4], 0x06); // UL unit: 1 Mbps
         assert_eq!(
             u16::from_be_bytes([msg[ambr_off + 5], msg[ambr_off + 6]]),
             50
         );
+
+        // PDU address (IEI 0x29) follows the Session-AMBR.
+        let pdu_off = ambr_off + 7;
+        assert_eq!(msg[pdu_off], 0x29);
+        assert_eq!(msg[pdu_off + 1], 0x05); // length
+        assert_eq!(msg[pdu_off + 2], 0x01); // IPv4
+        assert_eq!(&msg[pdu_off + 3..pdu_off + 7], &[10, 45, 0, 2]);
     }
 
     #[test]

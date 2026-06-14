@@ -471,6 +471,133 @@ pub fn build_pdu_session_resource_setup_request_asn1(
     }
 }
 
+/// Convert an AMF-context S-NSSAI (SD packed as a u32) to the ogs-ngap wire
+/// S-NSSAI (SD as a 3-byte big-endian array).
+fn amf_snssai_to_ngap(s: &crate::context::SNssai) -> SNssai {
+    SNssai {
+        sst: s.sst,
+        sd: s.sd.map(|sd_val| {
+            [
+                ((sd_val >> 16) & 0xFF) as u8,
+                ((sd_val >> 8) & 0xFF) as u8,
+                (sd_val & 0xFF) as u8,
+            ]
+        }),
+    }
+}
+
+/// Map the 8-bit replayed NAS UE security capability octet (TS 24.501
+/// §9.11.3.54, bit 8 = algorithm 0) onto the 16-bit NGAP BIT STRING field
+/// (TS 38.413 §9.3.1.86), where algorithm 0 is the most significant bit. The
+/// NAS octet maps verbatim onto the top 8 bits of the 16-bit field.
+fn nas_caps_octet_to_ngap_bits(octet: u8) -> u16 {
+    (octet as u16) << 8
+}
+
+/// Build an Initial Context Setup Request with proper ASN.1 APER encoding
+/// (TS 38.413 §8.3.1 / §9.2.2.1).
+///
+/// The GUAMI is taken from the AMF's first served GUAMI. The replayed UE
+/// security capabilities and KgNB (the UE Security Key) come from the live
+/// AMF UE security context — nothing is hardcoded. The protected initial
+/// Registration Accept rides inside the request as the NAS-PDU
+/// (TS 23.502 §4.2.2.2.2 step 16).
+#[allow(clippy::too_many_arguments)]
+pub fn build_initial_context_setup_request_asn1(
+    ctx: &AmfContext,
+    amf_ue_ngap_id: u64,
+    ran_ue_ngap_id: u32,
+    allowed_nssai: &[crate::context::SNssai],
+    ue_security_capability: &crate::context::UeSecurityCapability,
+    security_key: &[u8; 32],
+    nas_pdu: Option<&[u8]>,
+    ue_ambr: Option<(u64, u64)>,
+) -> Option<Vec<u8>> {
+    // GUAMI (mandatory): the AMF's first served GUAMI.
+    let served = ctx.served_guami.first()?;
+    let guami = Guami {
+        plmn_identity: encode_plmn_id(&served.plmn_id),
+        amf_region_id: served.amf_id.region,
+        amf_set_id: served.amf_id.set,
+        amf_pointer: served.amf_id.pointer,
+    };
+
+    let allowed: Vec<SNssai> = allowed_nssai.iter().map(amf_snssai_to_ngap).collect();
+
+    // Replayed UE security capabilities (TS 38.413 §9.3.1.86). 5G fields carry
+    // the verbatim NAS algorithm octets; E-UTRA fields carry the EEA/EIA octets.
+    let ue_security_capabilities = UeSecurityCapabilities {
+        nr_encryption_algorithms: nas_caps_octet_to_ngap_bits(ue_security_capability.ea),
+        nr_integrity_algorithms: nas_caps_octet_to_ngap_bits(ue_security_capability.ia),
+        eutra_encryption_algorithms: nas_caps_octet_to_ngap_bits(ue_security_capability.eea),
+        eutra_integrity_algorithms: nas_caps_octet_to_ngap_bits(ue_security_capability.eia),
+    };
+
+    let msg = InitialContextSetupRequest {
+        amf_ue_ngap_id,
+        ran_ue_ngap_id,
+        guami,
+        allowed_nssai: allowed,
+        ue_security_capabilities,
+        security_key: *security_key,
+        nas_pdu: nas_pdu.map(|p| p.to_vec()),
+        ue_ambr: ue_ambr.map(|(dl, ul)| UeAmbrInfo { dl, ul }),
+    };
+
+    match builder::build_initial_context_setup_request(&msg) {
+        Ok(bytes) => {
+            log::debug!(
+                "Built Initial Context Setup Request: {} bytes, amf_ue_ngap_id={amf_ue_ngap_id}, \
+                 ran_ue_ngap_id={ran_ue_ngap_id}, allowed_nssai={}, nas_pdu={}",
+                bytes.len(),
+                allowed_nssai.len(),
+                nas_pdu.map(|p| p.len()).unwrap_or(0)
+            );
+            Some(bytes)
+        }
+        Err(e) => {
+            log::error!("Failed to encode Initial Context Setup Request: {e:?}");
+            None
+        }
+    }
+}
+
+/// Decode an Initial Context Setup Response (gNB -> AMF, TS 38.413 §9.2.2.2).
+/// Returns (amf_ue_ngap_id, ran_ue_ngap_id) on success.
+pub fn parse_initial_context_setup_response_asn1(data: &[u8]) -> Option<(u64, u32)> {
+    match parser::decode_ngap_pdu(data) {
+        Ok(NgapMessage::InitialContextSetupResponse(resp)) => {
+            Some((resp.amf_ue_ngap_id, resp.ran_ue_ngap_id))
+        }
+        Ok(other) => {
+            log::warn!("Expected InitialContextSetupResponse, got {other:?}");
+            None
+        }
+        Err(e) => {
+            log::warn!("Failed to decode Initial Context Setup Response: {e:?}");
+            None
+        }
+    }
+}
+
+/// Decode an Initial Context Setup Failure (gNB -> AMF, TS 38.413 §9.2.2.3).
+/// Returns (amf_ue_ngap_id, ran_ue_ngap_id) on success.
+pub fn parse_initial_context_setup_failure_asn1(data: &[u8]) -> Option<(u64, u32)> {
+    match parser::decode_ngap_pdu(data) {
+        Ok(NgapMessage::InitialContextSetupFailure(fail)) => {
+            Some((fail.amf_ue_ngap_id, fail.ran_ue_ngap_id))
+        }
+        Ok(other) => {
+            log::warn!("Expected InitialContextSetupFailure, got {other:?}");
+            None
+        }
+        Err(e) => {
+            log::warn!("Failed to decode Initial Context Setup Failure: {e:?}");
+            None
+        }
+    }
+}
+
 /// Build a PDU Session Resource Release Command with proper ASN.1 APER encoding
 ///
 /// Sent by AMF to gNB to release PDU session resources.
@@ -1084,5 +1211,125 @@ mod tests {
             }
             other => panic!("Expected PduSessionResourceReleaseCommand, got {other:?}"),
         }
+    }
+
+    // ========================================================================
+    // T0.1: Initial Context Setup Request (TS 38.413 §8.3.1)
+    // ========================================================================
+
+    #[test]
+    fn test_build_initial_context_setup_request_mandatory_ies_and_kgnb() {
+        let ctx = create_test_context();
+
+        // A non-zero KgNB (would be the KDF output in production).
+        let kgnb = [0xABu8; 32];
+        // Replayed UE security capabilities (EA0-3 / IA0-3 on the wire octet).
+        let sec_cap = crate::context::UeSecurityCapability {
+            ea: 0xF0,
+            ia: 0xF0,
+            eea: 0x00,
+            eia: 0x00,
+        };
+        let allowed = vec![crate::context::SNssai {
+            sst: 1,
+            sd: Some(0x010203),
+        }];
+        // Piggybacked (already-protected) Registration Accept stand-in.
+        let nas_pdu = vec![0x7E, 0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x00, 0x42];
+
+        let bytes = build_initial_context_setup_request_asn1(
+            &ctx,
+            0x0000_0001,
+            0x0000_0002,
+            &allowed,
+            &sec_cap,
+            &kgnb,
+            Some(&nas_pdu),
+            Some((1_000_000_000, 500_000_000)),
+        )
+        .expect("build ICS request");
+        assert!(!bytes.is_empty());
+
+        // Strict peer: the gNB-side parser must accept it and recover every IE.
+        let decoded = parser::decode_ngap_pdu(&bytes).expect("decode ICS request");
+        let req = match decoded {
+            NgapMessage::InitialContextSetupRequest(r) => r,
+            other => panic!("Expected InitialContextSetupRequest, got {other:?}"),
+        };
+
+        // Mandatory IEs
+        assert_eq!(req.amf_ue_ngap_id, 1);
+        assert_eq!(req.ran_ue_ngap_id, 2);
+        // GUAMI from the AMF's served GUAMI (region 2, set 1, pointer 0)
+        assert_eq!(req.guami.amf_region_id, 2);
+        assert_eq!(req.guami.amf_set_id, 1);
+        assert_eq!(req.guami.amf_pointer, 0);
+        assert_eq!(req.guami.plmn_identity, encode_plmn_id(&PlmnId::new("999", "70")));
+        // Allowed NSSAI round-trips with the SD packed as 3 bytes
+        assert_eq!(req.allowed_nssai.len(), 1);
+        assert_eq!(req.allowed_nssai[0].sst, 1);
+        assert_eq!(req.allowed_nssai[0].sd, Some([0x01, 0x02, 0x03]));
+        // Replayed UE security capabilities: NAS octet maps onto the top byte
+        assert_eq!(req.ue_security_capabilities.nr_encryption_algorithms, 0xF000);
+        assert_eq!(req.ue_security_capabilities.nr_integrity_algorithms, 0xF000);
+        // UE Security Key = KgNB, non-zero and exactly the derived value
+        assert_eq!(req.security_key, kgnb);
+        assert_ne!(req.security_key, [0u8; 32]);
+        // Piggybacked Registration Accept survives the round-trip
+        assert_eq!(req.nas_pdu.as_deref(), Some(nas_pdu.as_slice()));
+        // UE-AMBR survives the round-trip
+        let ambr = req.ue_ambr.expect("UE-AMBR present");
+        assert_eq!(ambr.dl, 1_000_000_000);
+        assert_eq!(ambr.ul, 500_000_000);
+    }
+
+    #[test]
+    fn test_build_initial_context_setup_request_requires_served_guami() {
+        // No served GUAMI -> cannot build a valid ICS request (mandatory IE).
+        let mut ctx = AmfContext::new();
+        ctx.num_of_served_guami = 0;
+        let sec_cap = crate::context::UeSecurityCapability::default();
+        let result = build_initial_context_setup_request_asn1(
+            &ctx,
+            1,
+            2,
+            &[],
+            &sec_cap,
+            &[0u8; 32],
+            None,
+            None,
+        );
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_initial_context_setup_response_failure_roundtrip() {
+        // Build a Response/Failure with the ogs-ngap builder, then ensure the
+        // AMF-side parse helpers recover the UE NGAP IDs (used to gate the
+        // registration on the ICS Response).
+        let resp = builder::build_initial_context_setup_response(
+            &ogs_ngap::types::InitialContextSetupResponse {
+                amf_ue_ngap_id: 7,
+                ran_ue_ngap_id: 9,
+            },
+        )
+        .expect("build ICS response");
+        assert_eq!(
+            parse_initial_context_setup_response_asn1(&resp),
+            Some((7, 9))
+        );
+
+        let fail = builder::build_initial_context_setup_failure(
+            &ogs_ngap::types::InitialContextSetupFailure {
+                amf_ue_ngap_id: 11,
+                ran_ue_ngap_id: 13,
+                cause: Cause::RadioNetwork(CauseRadioNetwork::Unspecified),
+            },
+        )
+        .expect("build ICS failure");
+        assert_eq!(
+            parse_initial_context_setup_failure_asn1(&fail),
+            Some((11, 13))
+        );
     }
 }

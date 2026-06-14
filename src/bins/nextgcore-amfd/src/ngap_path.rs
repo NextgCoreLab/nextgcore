@@ -25,6 +25,7 @@ use crate::context::{AmfContext, AmfGnb, AmfUe, Guti5gs, PlmnId, SNssai, UeSecur
 use crate::event::AmfEvent;
 use crate::gmm_build::{self, message_type, mobile_identity_type, security_header, GmmCause};
 use crate::gmm_handler::payload_container_type;
+use crate::gmm_sm::GmmFsm;
 use crate::nas_security;
 use crate::ngap_asn1;
 use crate::ngap_handler::{self, time_to_wait, NgSetupRequest, NgapHandlerResult};
@@ -46,6 +47,10 @@ pub const MAX_GNB_CONNECTIONS: usize = 64;
 
 /// SCTP receive timeout
 const SCTP_RECV_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// KgNB access type distinguisher for 3GPP access (TS 33.501 Annex A.9).
+/// Non-3GPP access uses 0x02; both match the stored `AmfUe::access_type`.
+const ACCESS_TYPE_3GPP: u8 = 0x01;
 
 // ============================================================================
 // NGAP Server State
@@ -154,6 +159,14 @@ struct UeNasContext {
     sdm_subscription_id: Option<String>,
     /// PCF AM policy association ID (from Npcf_AMPolicyControl_Create)
     policy_association_id: Option<String>,
+    /// Per-UE GMM state machine (TS 24.501): tracks the registration phase,
+    /// including the InitialContextSetup wait after the ICS Request is sent.
+    gmm_fsm: GmmFsm,
+    /// Initial Context Setup Request has been sent to the gNB; the registration
+    /// is only established once the ICS Response arrives (TS 38.413 §8.3.1).
+    initial_context_setup_request_sent: bool,
+    /// Initial Context Setup Response received from the gNB.
+    initial_context_setup_response_received: bool,
 }
 
 impl UeNasContext {
@@ -171,6 +184,9 @@ impl UeNasContext {
             retx: None,
             sdm_subscription_id: None,
             policy_association_id: None,
+            gmm_fsm: GmmFsm::new(amf_ue_ngap_id),
+            initial_context_setup_request_sent: false,
+            initial_context_setup_response_received: false,
         }
     }
 }
@@ -405,6 +421,20 @@ impl NgapServer {
                 log::info!("Dispatching to handle_uplink_nas_transport");
                 self.handle_uplink_nas_transport(association_id, data)
                     .await?;
+            }
+            Some(14) => {
+                // InitialContextSetup (procedure code 14)
+                if data[0] == 0x20 {
+                    // SuccessfulOutcome = InitialContextSetupResponse from gNB
+                    log::info!("Initial Context Setup Response from gNB");
+                    self.handle_initial_context_setup_response(association_id, data)
+                        .await?;
+                } else if data[0] == 0x40 {
+                    // UnsuccessfulOutcome = InitialContextSetupFailure from gNB
+                    log::warn!("Initial Context Setup Failure from gNB");
+                    self.handle_initial_context_setup_failure(association_id, data)
+                        .await?;
+                }
             }
             Some(29) => {
                 // PDU Session Resource Setup (procedure code 29)
@@ -2062,6 +2092,19 @@ impl NgapServer {
         }
         state.amf_ue.allowed_nssai = allowed;
 
+        // Subscribed UE-AMBR (UDM am-data, TS 29.571 BitRate strings) — carried
+        // to the gNB in the Initial Context Setup Request (TS 38.413 §9.3.1.58).
+        if let Some(dl) = am_data
+            .ue_ambr_downlink
+            .as_deref()
+            .and_then(parse_bitrate_bps)
+        {
+            state.amf_ue.ue_ambr.downlink = dl;
+        }
+        if let Some(ul) = am_data.ue_ambr_uplink.as_deref().and_then(parse_bitrate_bps) {
+            state.amf_ue.ue_ambr.uplink = ul;
+        }
+
         // New 5G-GUTI: GUAMI of this AMF + CSPRNG 5G-TMSI (TS 23.003 2.10.1)
         state.amf_ue.generate_new_guti();
         state.amf_ue.next_guti.plmn_id = guami_plmn;
@@ -2074,7 +2117,16 @@ impl NgapServer {
             .await
     }
 
-    /// Build and send the protected Registration Accept and arm T3550
+    /// Establish AS-layer security and deliver the initial Registration Accept.
+    ///
+    /// Per TS 23.502 §4.2.2.2.2 step 16 / TS 38.413 §8.3.1, the AMF derives
+    /// KgNB (TS 33.501 Annex A.9) and sends NGAP InitialContextSetupRequest to
+    /// the gNB carrying the GUAMI, the replayed UE security capabilities, the
+    /// UE Security Key (KgNB), the Allowed NSSAI, the UE-AMBR and — piggybacked
+    /// as the NAS-PDU — the protected Registration Accept. The registration is
+    /// only considered established once the gNB returns
+    /// InitialContextSetupResponse; T3550 is armed for the NAS-layer
+    /// Registration Complete.
     async fn send_registration_accept(
         &mut self,
         association_id: u64,
@@ -2099,15 +2151,87 @@ impl NgapServer {
             return Ok(());
         };
 
+        // Periodic / mobility registration update on a UE that ALREADY has an
+        // established AS-security context: deliver the protected Registration
+        // Accept over DownlinkNASTransport. A fresh InitialContextSetupRequest
+        // is for the *initial* context only (TS 23.502 §4.2.2.2.2 step 16);
+        // re-issuing it on a periodic update would needlessly re-establish AS
+        // security. `registered` is false during initial registration (set only
+        // after Registration Complete), so this branch is taken solely on update.
+        if state.registered && state.amf_ue.security_context_available {
+            let tmsi = state.amf_ue.next_guti.tmsi;
+            self.ue_auth_state.insert(amf_ue_ngap_id, state);
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
+                .await?;
+            log::info!(
+                "Registration Accept (update) sent via DownlinkNASTransport to UE \
+                 {amf_ue_ngap_id} (5G-TMSI=0x{tmsi:08x})"
+            );
+            return Ok(());
+        }
+
+        // Derive KgNB (TS 33.501 Annex A.9): KDF(Kamf, uplink NAS COUNT, access
+        // type distinguisher). The access type distinguisher is 0x01 for 3GPP
+        // access and 0x02 for non-3GPP access — matching the stored access_type.
+        let access_type_distinguisher = if state.amf_ue.access_type == 0 {
+            ACCESS_TYPE_3GPP
+        } else {
+            state.amf_ue.access_type
+        };
+        let kgnb = ogs_crypt::kdf::ogs_kdf_kgnb_and_kn3iwf(
+            &state.amf_ue.kamf,
+            state.amf_ue.ul_count,
+            access_type_distinguisher,
+        );
+        state.amf_ue.kgnb = kgnb;
+
         let tmsi = state.amf_ue.next_guti.tmsi;
+        let allowed_nssai = state.amf_ue.allowed_nssai.clone();
+        let ue_security_capability = state.amf_ue.ue_security_capability.clone();
+        // UE-AMBR from the subscription (UDM am-data, copied onto the context);
+        // omitted when the subscription carries no aggregate bitrate.
+        let ue_ambr = if state.amf_ue.ue_ambr.downlink > 0 || state.amf_ue.ue_ambr.uplink > 0 {
+            Some((state.amf_ue.ue_ambr.downlink, state.amf_ue.ue_ambr.uplink))
+        } else {
+            None
+        };
+
+        // Build the Initial Context Setup Request carrying the protected
+        // Registration Accept as the NAS-PDU.
+        let ics = {
+            let ctx = self.amf_context.read().await;
+            crate::ngap_asn1::build_initial_context_setup_request_asn1(
+                &ctx,
+                amf_ue_ngap_id,
+                ran_ue_ngap_id,
+                &allowed_nssai,
+                &ue_security_capability,
+                &kgnb,
+                Some(&protected),
+                ue_ambr,
+            )
+        };
+        let Some(ics) = ics else {
+            log::error!(
+                "Failed to build Initial Context Setup Request for UE {amf_ue_ngap_id} \
+                 (no served GUAMI?)"
+            );
+            self.ue_auth_state.insert(amf_ue_ngap_id, state);
+            return Ok(());
+        };
+
+        state.initial_context_setup_request_sent = true;
+        state.gmm_fsm.transition_to_initial_context_setup();
         self.ue_auth_state.insert(amf_ue_ngap_id, state);
 
-        let ngap_pdu = self
-            .send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
-            .await?;
-        self.arm_retx(amf_ue_ngap_id, NasProcTimer::T3550, ngap_pdu);
+        self.send_to_association(association_id, &ics).await?;
+        // Arm T3550 against the ICS PDU: until the gNB confirms with an ICS
+        // Response, the retransmission carries the whole request (Registration
+        // Accept included), so the UE still receives the NAS message on retx.
+        self.arm_retx(amf_ue_ngap_id, NasProcTimer::T3550, ics);
         log::info!(
-            "Registration Accept sent to UE {amf_ue_ngap_id} (protected, TAI list + Allowed NSSAI, 5G-TMSI=0x{tmsi:08x})"
+            "Initial Context Setup Request sent to gNB for UE {amf_ue_ngap_id} \
+             (KgNB derived, Registration Accept piggybacked, 5G-TMSI=0x{tmsi:08x})"
         );
         Ok(())
     }
@@ -2458,7 +2582,25 @@ impl NgapServer {
                         )
                         .await?;
 
-                        // N2: PDU Session Resource Setup Request toward the gNB
+                        // N2: PDU Session Resource Setup Request toward the gNB.
+                        // The UE context (AS-layer security) must be established
+                        // first — i.e. the gNB must have returned an Initial
+                        // Context Setup Response (TS 38.413 §8.3.1 precedes the
+                        // PDU session setup of TS 38.413 §8.2.1). Without it the
+                        // gNB has no KgNB/DRBs to attach the session to.
+                        let ics_done = self
+                            .ue_auth_state
+                            .get(&amf_ue_ngap_id)
+                            .map(|s| s.initial_context_setup_response_received)
+                            .unwrap_or(false);
+                        if !ics_done {
+                            log::warn!(
+                                "Deferring PDU Session Resource Setup for PSI={psi}: Initial \
+                                 Context Setup not yet confirmed for UE {amf_ue_ngap_id}"
+                            );
+                            return Ok(());
+                        }
+
                         let setup_req =
                             match crate::ngap_asn1::build_pdu_session_resource_setup_request_asn1(
                                 amf_ue_ngap_id,
@@ -2850,6 +2992,81 @@ impl NgapServer {
             );
         }
         Ok(())
+    }
+
+    /// Handle Initial Context Setup Response from the gNB (TS 38.413 §8.3.1.2).
+    ///
+    /// The gNB has set up AS-layer security and delivered the piggybacked
+    /// Registration Accept to the UE. The AMF marks the UE context as
+    /// established and transitions the GMM FSM out of InitialContextSetup; the
+    /// NAS-layer Registration Complete then drives the move to Registered. The
+    /// ICS-based retransmission timer is cleared since the gNB has the NAS PDU.
+    async fn handle_initial_context_setup_response(
+        &mut self,
+        association_id: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        let Some((amf_ue_ngap_id, ran_ue_ngap_id)) =
+            crate::ngap_asn1::parse_initial_context_setup_response_asn1(data)
+        else {
+            return Ok(());
+        };
+        log::info!(
+            "Initial Context Setup Response: amf_ue_ngap_id={amf_ue_ngap_id}, \
+             ran_ue_ngap_id={ran_ue_ngap_id} (association {association_id})"
+        );
+
+        if let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+            state.initial_context_setup_response_received = true;
+            // The gNB has the Registration Accept; stop retransmitting the ICS
+            // request. T3550 logic that waits for Registration Complete is reset
+            // here — Registration Complete arrives on the uplink NAS path.
+            state.retx = None;
+            // Leave InitialContextSetup; Registration Complete moves the FSM to
+            // Registered (TS 24.501 §5.5.1.2.4).
+            state.gmm_fsm.transition_to_registered();
+            log::info!("UE {amf_ue_ngap_id} context established (AS-layer security up)");
+        } else {
+            log::warn!(
+                "Initial Context Setup Response for unknown UE {amf_ue_ngap_id}; ignoring"
+            );
+        }
+        Ok(())
+    }
+
+    /// Handle Initial Context Setup Failure from the gNB (TS 38.413 §8.3.1.3).
+    ///
+    /// The gNB could not establish AS-layer security. The registration cannot
+    /// complete, so the AMF releases the UE context.
+    async fn handle_initial_context_setup_failure(
+        &mut self,
+        association_id: u64,
+        data: &[u8],
+    ) -> Result<()> {
+        let Some((amf_ue_ngap_id, ran_ue_ngap_id)) =
+            crate::ngap_asn1::parse_initial_context_setup_failure_asn1(data)
+        else {
+            return Ok(());
+        };
+        log::warn!(
+            "Initial Context Setup Failure: amf_ue_ngap_id={amf_ue_ngap_id}, \
+             ran_ue_ngap_id={ran_ue_ngap_id} (association {association_id}); releasing UE"
+        );
+
+        // Drop any pending ICS retransmission, then release the NG context.
+        if let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) {
+            state.retx = None;
+            state.gmm_fsm.transition_to_exception();
+        }
+        // NAS cause #22 "congestion" is not appropriate; use #9 (UE identity
+        // cannot be derived) so the UE re-registers (TS 24.501 Annex).
+        self.release_ue(
+            association_id,
+            amf_ue_ngap_id,
+            ran_ue_ngap_id,
+            GmmCause::UeIdentityCannotBeDerivedByTheNetwork as u8,
+        )
+        .await
     }
 
     /// Handle PDU Session Resource Setup Response from gNB
@@ -3497,10 +3714,37 @@ fn parse_suci_identity(content: &[u8]) -> Option<(String, PlmnId)> {
     let routing = decode_bcd_digits(&content[4..6]);
     let scheme = content[6] & 0x0f;
     let hn_key = content[7];
-    let scheme_output = decode_bcd_digits(&content[8..]);
+    // Scheme output encoding (TS 24.501 Section 9.11.3.4 / TS 23.003 §28.7.3):
+    //   - null scheme (0): the scheme output IS the MSIN, carried as TBCD with
+    //     swapped nibbles and 0xF fillers -> decode to cleartext digits.
+    //   - ECIES profile A (1) / profile B (2): the scheme output is an opaque
+    //     octet string (ephemeral public key || ciphertext || MAC). It must be
+    //     carried verbatim and reversibly, so hex-encode the raw bytes. The UDM
+    //     recovers them with hex_str_to_bytes (context.rs) before deconcealment.
+    //     A BCD decode here would silently drop any nibble > 9, corrupting the
+    //     ciphertext.
+    let scheme_output = if scheme == SUCI_PROTECTION_SCHEME_NULL {
+        decode_bcd_digits(&content[8..])
+    } else {
+        encode_hex_lower(&content[8..])
+    };
 
     let suci = format!("suci-0-{mcc}-{mnc}-{routing}-{scheme}-{hn_key}-{scheme_output}");
     Some((suci, plmn))
+}
+
+/// SUCI protection scheme identifier for the null scheme (TS 33.501 Annex C).
+const SUCI_PROTECTION_SCHEME_NULL: u8 = 0;
+
+/// Lowercase, fixed-width (two chars/byte) hex encoding. Used for the ECIES
+/// SUCI scheme output so it round-trips through `hex_str_to_bytes` on the UDM.
+fn encode_hex_lower(data: &[u8]) -> String {
+    let mut s = String::with_capacity(data.len() * 2);
+    for b in data {
+        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
+    }
+    s
 }
 
 /// Derive a SUPI string from a null-scheme SUCI
@@ -3539,6 +3783,30 @@ fn plmn_mcc_mnc_strings(plmn: &PlmnId) -> (String, String) {
         format!("{}{}{}", plmn.mnc1, plmn.mnc2, plmn.mnc3)
     };
     (mcc, mnc)
+}
+
+/// Parse a TS 29.571 BitRate string ("<number> <unit>", e.g. "1 Gbps") into
+/// bits per second. Supported units: bps, Kbps, Mbps, Gbps, Tbps (decimal,
+/// 10^3 steps per TS 29.571 §5.5). Returns None for malformed input.
+fn parse_bitrate_bps(s: &str) -> Option<u64> {
+    let mut parts = s.split_whitespace();
+    let value: f64 = parts.next()?.parse().ok()?;
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let unit = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let multiplier: f64 = match unit {
+        "bps" => 1.0,
+        "Kbps" => 1e3,
+        "Mbps" => 1e6,
+        "Gbps" => 1e9,
+        "Tbps" => 1e12,
+        _ => return None,
+    };
+    Some((value * multiplier) as u64)
 }
 
 /// Serving network name (TS 24.501 Section 9.12.1 / TS 33.501 Section 6.1.1.4)
@@ -3978,6 +4246,72 @@ mod tests {
         );
     }
 
+    /// Mirror of the UDM's strict hex decode (context.rs `hex_str_to_bytes`):
+    /// rejects odd length and non-hex characters.
+    fn udm_hex_str_to_bytes(hex: &str) -> Option<Vec<u8>> {
+        if !hex.len().is_multiple_of(2) {
+            return None;
+        }
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+            .collect()
+    }
+
+    #[test]
+    fn test_null_scheme_suci_keeps_bcd_msin() {
+        // Null scheme (TS 23.003 §28.7.3): scheme output is the MSIN in TBCD.
+        // Content: type/format, PLMN 999/70, routing "0", scheme 0, hn key 0,
+        // MSIN BCD (swapped nibbles, 0xF filler) for MSIN "0000000001".
+        let content = [
+            0x01, // SUPI format IMSI, type SUCI
+            0x99, 0xF9, 0x07, // PLMN 999/70
+            0xF0, 0xFF, // routing indicator "0"
+            0x00, // protection scheme: null
+            0x00, // home network public key id
+            0x00, 0x00, 0x00, 0x00, 0x10, // MSIN BCD -> "0000000001"
+        ];
+        let (suci, _plmn) = parse_suci_identity(&content).expect("parse null SUCI");
+        // schemeOutput must be decimal MSIN digits, not hex.
+        assert_eq!(suci, "suci-0-999-70-0-0-0-0000000001");
+    }
+
+    #[test]
+    fn test_ecies_scheme1_suci_output_is_reversible_hex() {
+        // ECIES profile A (scheme 1, TS 33.501 Annex C.3.4.1): the scheme output
+        // is an opaque octet string. The AMF must hex-encode it so the UDM can
+        // recover the exact bytes with hex_str_to_bytes before deconcealment.
+        // Deliberately include bytes with high nibbles > 9 (e.g. 0xDE, 0xAD)
+        // that a BCD decode would silently corrupt.
+        let raw_output: [u8; 6] = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x9A];
+        let mut content = vec![
+            0x01, // SUPI format IMSI, type SUCI
+            0x99, 0xF9, 0x07, // PLMN 999/70
+            0xF0, 0xFF, // routing indicator "0"
+            0x01, // protection scheme: ECIES profile A
+            0x02, // home network public key id
+        ];
+        content.extend_from_slice(&raw_output);
+
+        let (suci, plmn) = parse_suci_identity(&content).expect("parse ECIES SUCI");
+        assert_eq!(plmn, PlmnId::new("999", "70"));
+
+        // The string form keeps the canonical 8-field layout the UDM parser
+        // (parse_suci) expects: suci-0-mcc-mnc-routing-scheme-hnkey-output
+        let parts: Vec<&str> = suci.split('-').collect();
+        assert_eq!(parts.len(), 8, "{suci}");
+        assert_eq!(parts[5], "1"); // scheme
+        assert_eq!(parts[6], "2"); // hn key id
+        let scheme_output = parts[7];
+
+        // Lowercase hex, two chars per byte (matches UdmContext expectation)
+        assert_eq!(scheme_output, "deadbeef019a");
+
+        // Round-trip: the UDM's hex_str_to_bytes recovers the original bytes.
+        let recovered = udm_hex_str_to_bytes(scheme_output).expect("UDM hex decode");
+        assert_eq!(recovered, raw_output);
+    }
+
     #[test]
     fn test_gmm_cause_from_sbi_error_mapping() {
         use crate::sbi_path::SbiError;
@@ -4021,6 +4355,110 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].sst, 1);
         assert_eq!(parsed[1].sd, Some(0x010203));
+    }
+
+    #[test]
+    fn test_parse_bitrate_bps() {
+        // TS 29.571 BitRate strings -> bits/s
+        assert_eq!(parse_bitrate_bps("1 Gbps"), Some(1_000_000_000));
+        assert_eq!(parse_bitrate_bps("100 Mbps"), Some(100_000_000));
+        assert_eq!(parse_bitrate_bps("50 Kbps"), Some(50_000));
+        assert_eq!(parse_bitrate_bps("64000 bps"), Some(64_000));
+        assert_eq!(parse_bitrate_bps("2 Tbps"), Some(2_000_000_000_000));
+        // Malformed input
+        assert_eq!(parse_bitrate_bps("1Gbps"), None); // no separator
+        assert_eq!(parse_bitrate_bps("Gbps"), None); // no value
+        assert_eq!(parse_bitrate_bps("1 Pbps"), None); // unknown unit
+        assert_eq!(parse_bitrate_bps("1 Gbps extra"), None);
+    }
+
+    #[test]
+    fn test_kgnb_derivation_is_nonzero_and_drives_ics() {
+        // T0.1: KgNB (TS 33.501 Annex A.9) derived from a non-zero Kamf must be
+        // non-zero, and the resulting Initial Context Setup Request must carry
+        // exactly that key as the UE Security Key.
+        let kamf = [0x42u8; 32];
+        let ul_count = 1u32;
+        let kgnb = ogs_crypt::kdf::ogs_kdf_kgnb_and_kn3iwf(&kamf, ul_count, ACCESS_TYPE_3GPP);
+        assert_ne!(kgnb, [0u8; 32], "KgNB must be non-zero");
+
+        // Different UL NAS COUNT -> different KgNB (input binding holds).
+        let kgnb2 = ogs_crypt::kdf::ogs_kdf_kgnb_and_kn3iwf(&kamf, ul_count + 1, ACCESS_TYPE_3GPP);
+        assert_ne!(kgnb, kgnb2);
+
+        // Wire it into an ICS request and confirm the security key round-trips.
+        let mut ctx = AmfContext::new();
+        ctx.num_of_served_guami = 1;
+        ctx.served_guami.push(crate::context::Guami {
+            plmn_id: PlmnId::new("999", "70"),
+            amf_id: crate::context::AmfId {
+                region: 2,
+                set: 1,
+                pointer: 0,
+            },
+        });
+        let sec_cap = UeSecurityCapability {
+            ea: 0xF0,
+            ia: 0xF0,
+            eea: 0,
+            eia: 0,
+        };
+        let bytes = crate::ngap_asn1::build_initial_context_setup_request_asn1(
+            &ctx,
+            1,
+            2,
+            &[SNssai { sst: 1, sd: None }],
+            &sec_cap,
+            &kgnb,
+            Some(&[0x7E, 0x00, 0x42]),
+            None,
+        )
+        .expect("build ICS");
+        let decoded = ogs_ngap::parser::decode_ngap_pdu(&bytes).expect("decode");
+        match decoded {
+            ogs_ngap::NgapMessage::InitialContextSetupRequest(req) => {
+                assert_eq!(req.security_key, kgnb);
+                assert_ne!(req.security_key, [0u8; 32]);
+            }
+            other => panic!("expected InitialContextSetupRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_registration_is_gated_on_ics_response() {
+        // T0.1: a fresh UE context starts with the ICS Response not yet
+        // received, so the PDU-session-setup gate (and the "context
+        // established" decision) must be false until the gNB confirms.
+        let mut state = UeNasContext::new(1, 2, 100);
+        assert!(!state.initial_context_setup_response_received);
+        assert!(!state.initial_context_setup_request_sent);
+        assert_eq!(state.gmm_fsm.state, crate::gmm_sm::GmmState::Initial);
+
+        // After the AMF sends the ICS request the FSM tracks the wait state.
+        state.initial_context_setup_request_sent = true;
+        state.gmm_fsm.transition_to_initial_context_setup();
+        assert_eq!(
+            state.gmm_fsm.state,
+            crate::gmm_sm::GmmState::InitialContextSetup
+        );
+        // Still not established: the PDU-session gate must hold.
+        assert!(!state.initial_context_setup_response_received);
+
+        // The gNB confirms: parse a real ICS Response and apply the gate.
+        let resp = ogs_ngap::builder::build_initial_context_setup_response(
+            &ogs_ngap::types::InitialContextSetupResponse {
+                amf_ue_ngap_id: 1,
+                ran_ue_ngap_id: 2,
+            },
+        )
+        .expect("build resp");
+        let parsed = crate::ngap_asn1::parse_initial_context_setup_response_asn1(&resp);
+        assert_eq!(parsed, Some((1, 2)));
+        // Applying the response opens the gate.
+        state.initial_context_setup_response_received = true;
+        state.gmm_fsm.transition_to_registered();
+        assert!(state.initial_context_setup_response_received);
+        assert_eq!(state.gmm_fsm.state, crate::gmm_sm::GmmState::Registered);
     }
 
     #[test]
