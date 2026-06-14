@@ -6,11 +6,60 @@ use crate::nnrf_build::{nrf_nnrf_nfm_build_nf_status_notify, NotificationEventTy
 use crate::nnrf_handler::{nf_manager, NfProfile, SubscriptionData};
 use ogs_sbi::client::{SbiClient, SbiClientConfig};
 use ogs_sbi::message::SbiRequest;
-use ogs_sbi::types::UriScheme;
+use ogs_sbi::oauth::OAuth2Client;
+use ogs_sbi::types::{NfType, UriScheme};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 /// SBI server state
 static SBI_SERVER_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Process-wide OAuth2 client for automatic Bearer-token acquisition on the
+/// NRF's outbound SBI calls. Installed from `main` when
+/// `nrf.sbi.oauth2.require` is true; absent (None) otherwise, preserving the
+/// default token-free path.
+static OAUTH2_CLIENT: OnceLock<Arc<OAuth2Client>> = OnceLock::new();
+
+/// Install the process-wide OAuth2 client (T1.1). Idempotent; the first call
+/// wins. Called by `main` only when SBI OAuth2 is enabled.
+pub fn set_oauth2_client(client: Arc<OAuth2Client>) {
+    let _ = OAUTH2_CLIENT.set(client);
+}
+
+/// The installed OAuth2 client, if any.
+fn oauth2_client() -> Option<Arc<OAuth2Client>> {
+    OAUTH2_CLIENT.get().cloned()
+}
+
+/// Attach the process-wide OAuth2 client (when installed) so the outbound
+/// request carries an NRF-issued Bearer token scoped to `target`. A no-op
+/// when SBI OAuth2 is disabled, preserving the default path.
+fn attach_oauth2(client: SbiClient, target: NfType) -> SbiClient {
+    match oauth2_client() {
+        Some(oauth2) => client.with_oauth2(oauth2, target),
+        None => client,
+    }
+}
+
+/// Best-effort map of an NF type string (TS 29.510 NFType) to [`NfType`] for
+/// OAuth2 token scoping. Only the common NRF-notification consumers are
+/// recognised; unknown values fall back to the caller's default.
+fn nf_type_from_str(s: &str) -> Option<NfType> {
+    Some(match s.to_uppercase().as_str() {
+        "AMF" => NfType::Amf,
+        "SMF" => NfType::Smf,
+        "PCF" => NfType::Pcf,
+        "UDM" => NfType::Udm,
+        "UDR" => NfType::Udr,
+        "AUSF" => NfType::Ausf,
+        "NSSF" => NfType::Nssf,
+        "NEF" => NfType::Nef,
+        "BSF" => NfType::Bsf,
+        "SCP" => NfType::Scp,
+        "NRF" => NfType::Nrf,
+        _ => return None,
+    })
+}
 
 /// SBI server configuration
 #[derive(Debug, Clone)]
@@ -185,9 +234,17 @@ pub async fn nrf_nnrf_nfm_send_nf_status_notify_async(
         }
     };
 
-    // Build an SBI client for the subscriber endpoint
+    // Build an SBI client for the subscriber endpoint, attaching an
+    // NRF-issued Bearer token scoped to the subscriber's NF type when SBI
+    // OAuth2 is enabled (no-op otherwise).
     let client_config = SbiClientConfig::new(&host, port).with_scheme(scheme);
     let client = SbiClient::new(client_config);
+    let target = subscription_data
+        .req_nf_type
+        .as_deref()
+        .and_then(nf_type_from_str)
+        .unwrap_or(NfType::Amf);
+    let client = attach_oauth2(client, target);
 
     // Build the SBI request
     let sbi_request = SbiRequest::post(&path)
@@ -653,5 +710,18 @@ mod tests {
             ClientNotifyResult::Ok => {}
             _ => panic!("Expected Ok even with wrong status"),
         }
+    }
+
+    #[test]
+    fn test_nf_type_from_str() {
+        // Common NRF-notification consumers map correctly, case-insensitively.
+        assert_eq!(nf_type_from_str("AMF"), Some(NfType::Amf));
+        assert_eq!(nf_type_from_str("smf"), Some(NfType::Smf));
+        assert_eq!(nf_type_from_str("Pcf"), Some(NfType::Pcf));
+        assert_eq!(nf_type_from_str("UDR"), Some(NfType::Udr));
+        // Unknown / non-NF strings fall through to None so the caller can
+        // pick a default.
+        assert_eq!(nf_type_from_str("WHATEVER"), None);
+        assert_eq!(nf_type_from_str(""), None);
     }
 }

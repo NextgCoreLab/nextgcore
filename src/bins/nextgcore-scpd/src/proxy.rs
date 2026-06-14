@@ -29,7 +29,8 @@ use std::time::Duration;
 use ogs_sbi::client::{SbiClient, SbiClientConfig};
 use ogs_sbi::constants::{custom_header, discovery_header};
 use ogs_sbi::message::{ProblemDetails, SbiRequest, SbiResponse};
-use ogs_sbi::types::UriScheme;
+use ogs_sbi::oauth::OAuth2Client;
+use ogs_sbi::types::{NfType, UriScheme};
 use ogs_sbi::SbiError;
 
 use crate::sbi_path::{parse_search_result, select_nf_instance};
@@ -38,6 +39,10 @@ use crate::sbi_path::{parse_search_result, select_nf_instance};
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// Default upstream request timeout.
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Fallback NF Instance ID claimed by the SCP when acquiring delegated OAuth2
+/// access tokens (`nfInstanceId` in the TS 29.510 token request) if none is
+/// configured. A stable value keeps NRF-side token bookkeeping coherent.
+const DEFAULT_SCP_NF_INSTANCE_ID: &str = "nextgcore-scp";
 
 /// Hop-by-hop headers that must not be forwarded by a proxy
 /// (RFC 9110 §7.6.1; `host`/`content-length` are recomputed by the client).
@@ -66,6 +71,10 @@ pub struct ScpProxyConfig {
     pub connect_timeout: Duration,
     /// Upstream request timeout.
     pub request_timeout: Duration,
+    /// The SCP's own NF Instance ID, sent as `nfInstanceId` in delegated
+    /// OAuth2 token requests to the NRF (TS 29.510 §6.3). When `None`, a
+    /// stable default (`DEFAULT_SCP_NF_INSTANCE_ID`) is used.
+    pub nf_instance_id: Option<String>,
 }
 
 impl Default for ScpProxyConfig {
@@ -74,6 +83,7 @@ impl Default for ScpProxyConfig {
             nrf_uri: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            nf_instance_id: None,
         }
     }
 }
@@ -154,6 +164,65 @@ fn normalize_binding(value: &str) -> String {
         .filter(|c| !c.is_whitespace())
         .collect::<String>()
         .to_ascii_lowercase()
+}
+
+/// Remove any `Authorization` header (case-insensitive) from a forwardable
+/// header map. Used on the Model D path before the SCP attaches its own
+/// delegated OAuth2 token: the consumer's token (if any) was not scoped to the
+/// discovered producer, so it must not leak through.
+fn strip_authorization(headers: &mut HashMap<String, String>) {
+    headers.retain(|k, _| !k.eq_ignore_ascii_case("authorization"));
+}
+
+/// Map a `3gpp-Sbi-Discovery-target-nf-type` header value (e.g. `"UDM"`,
+/// case-insensitive) to an [`NfType`] for OAuth2 token scoping. Mirrors
+/// [`NfType::to_str`]; unknown values yield `None` (the SCP then forwards
+/// without minting a token rather than guessing a wrong audience).
+fn nf_type_from_str(s: &str) -> Option<NfType> {
+    let upper = s.trim().to_ascii_uppercase();
+    let nf = match upper.as_str() {
+        "NRF" => NfType::Nrf,
+        "UDM" => NfType::Udm,
+        "AMF" => NfType::Amf,
+        "SMF" => NfType::Smf,
+        "AUSF" => NfType::Ausf,
+        "NEF" => NfType::Nef,
+        "PCF" => NfType::Pcf,
+        "SMSF" => NfType::Smsf,
+        "NSSF" => NfType::Nssf,
+        "UDR" => NfType::Udr,
+        "LMF" => NfType::Lmf,
+        "GMLC" => NfType::Gmlc,
+        "5G_EIR" => NfType::FiveGEir,
+        "SEPP" => NfType::Sepp,
+        "UPF" => NfType::Upf,
+        "N3IWF" => NfType::N3iwf,
+        "AF" => NfType::Af,
+        "UDSF" => NfType::Udsf,
+        "BSF" => NfType::Bsf,
+        "CHF" => NfType::Chf,
+        "NWDAF" => NfType::Nwdaf,
+        "PCSCF" => NfType::Pcscf,
+        "CBCF" => NfType::Cbcf,
+        "HSS" => NfType::Hss,
+        "UCMF" => NfType::Ucmf,
+        "SCP" => NfType::Scp,
+        "NSSAAF" => NfType::Nssaaf,
+        "MFAF" => NfType::Mfaf,
+        "MBSMF" => NfType::Mbsmf,
+        "MBSTF" => NfType::Mbstf,
+        "PANF" => NfType::Panf,
+        "TSCTSF" => NfType::Tsctsf,
+        "EASDF" => NfType::Easdf,
+        "EES" => NfType::Ees,
+        "DCCF" => NfType::Dccf,
+        "NSACF" => NfType::Nsacf,
+        "PKMF" => NfType::Pkmf,
+        "MNPF" => NfType::Mnpf,
+        "SMSF_5G" => NfType::Smsf5G,
+        _ => return None,
+    };
+    Some(nf)
 }
 
 /// True for header names a proxy must not forward, in either direction:
@@ -244,19 +313,40 @@ enum RouteDecision {
 /// The SCP proxy: per-request async forwarding engine.
 pub struct ScpProxy {
     config: ScpProxyConfig,
-    /// HTTP/2 client cache keyed by `scheme://host:port`.
+    /// HTTP/2 client cache keyed by `scheme://host:port` (no OAuth2 — used for
+    /// Model C / sticky-binding forwarding and NRF discovery).
     clients: RwLock<HashMap<String, Arc<SbiClient>>>,
+    /// HTTP/2 client cache for OAuth2-attaching clients, keyed by
+    /// `scheme://host:port|TARGET_NF_TYPE`. Used only on the Model D
+    /// (delegated) path so the SCP, acting as the consumer's delegate,
+    /// attaches a valid access token for the discovered producer.
+    oauth_clients: RwLock<HashMap<String, Arc<SbiClient>>>,
     /// Binding stickiness cache: normalized `3gpp-Sbi-Binding` value →
     /// producer apiRoot it was returned from (TS 29.500 §6.12).
     bindings: RwLock<HashMap<String, ApiRoot>>,
+    /// Shared OAuth2 client (consumer-side, client-credentials grant against
+    /// the NRF). `Some` only when an NRF URI is configured; `None` disables
+    /// delegated token acquisition (Authorization is then left as received).
+    oauth2: Option<Arc<OAuth2Client>>,
 }
 
 impl ScpProxy {
     pub fn new(config: ScpProxyConfig) -> Self {
+        // The SCP is itself an OAuth2 client (NfType::Scp) when it knows its
+        // NRF; tokens are acquired lazily per (target NF type, scope).
+        let oauth2 = config.nrf_uri.as_deref().map(|nrf_uri| {
+            let nf_instance_id = config
+                .nf_instance_id
+                .clone()
+                .unwrap_or_else(|| DEFAULT_SCP_NF_INSTANCE_ID.to_string());
+            Arc::new(OAuth2Client::new(nrf_uri, nf_instance_id, NfType::Scp))
+        });
         Self {
             config,
             clients: RwLock::new(HashMap::new()),
+            oauth_clients: RwLock::new(HashMap::new()),
             bindings: RwLock::new(HashMap::new()),
+            oauth2,
         }
     }
 
@@ -296,6 +386,41 @@ impl ScpProxy {
             clients.insert(key, client.clone());
         }
         client
+    }
+
+    /// Get or create a pooled HTTP/2 client that automatically attaches a
+    /// delegated OAuth2 Bearer token for `target_nf_type` (TS 33.501 §13;
+    /// TS 29.510 client-credentials grant). Returns `None` when the SCP has no
+    /// OAuth2 client configured (no NRF), in which case the caller forwards
+    /// without minting a token.
+    ///
+    /// The token is acquired by L1 (`SbiClient` + `OAuth2Client`) on send: it
+    /// derives the scope from the request URI's service name and only attaches
+    /// a token when the request carries no `Authorization` header — so the
+    /// Model D path strips the consumer's opaque Authorization first.
+    fn oauth_client_for(&self, target: &ApiRoot, target_nf_type: NfType) -> Option<Arc<SbiClient>> {
+        let oauth2 = self.oauth2.clone()?;
+        let key = format!(
+            "{}://{}:{}|{}",
+            target.scheme,
+            target.host,
+            target.port,
+            target_nf_type.to_str()
+        );
+        if let Ok(clients) = self.oauth_clients.read() {
+            if let Some(client) = clients.get(&key) {
+                return Some(client.clone());
+            }
+        }
+        let mut config = SbiClientConfig::new(target.host.clone(), target.port)
+            .with_connect_timeout(self.config.connect_timeout)
+            .with_request_timeout(self.config.request_timeout);
+        config.scheme = target.scheme;
+        let client = Arc::new(SbiClient::new(config).with_oauth2(oauth2, target_nf_type));
+        if let Ok(mut clients) = self.oauth_clients.write() {
+            clients.insert(key, client.clone());
+        }
+        Some(client)
     }
 
     /// Decide how to route an incoming request (TS 29.500 §6.10.2):
@@ -444,11 +569,18 @@ impl ScpProxy {
     /// verbatim — status, end-to-end headers, and body — so upstream
     /// ProblemDetails bodies reach the consumer unmodified. Only transport
     /// failures synthesize a 502/504 at the SCP.
+    ///
+    /// `delegated_nf_type` is `Some` only on the Model D (delegated discovery)
+    /// path: the SCP then acts as the consumer's delegate and acquires a valid
+    /// OAuth2 access token for the discovered producer (TS 33.501 §13). Model C
+    /// and binding-stickiness forwarding leave any `Authorization` header
+    /// untouched (the consumer remains the OAuth2 client).
     async fn forward(
         &self,
         request: &SbiRequest,
         target: &ApiRoot,
         producer_id: Option<&str>,
+        delegated_nf_type: Option<NfType>,
     ) -> SbiResponse {
         let mut fwd = SbiRequest::default();
         fwd.header.method = request.header.method.clone();
@@ -458,7 +590,20 @@ impl ScpProxy {
         fwd.http.content = request.http.content.clone();
         fwd.http.parts = request.http.parts.clone();
 
-        let result = self.client_for(target).send_request(fwd).await;
+        // Model D: if the SCP can mint a delegated token, drop whatever
+        // Authorization the consumer sent (it was scoped to the consumer, not
+        // to this producer) so L1 attaches a fresh, correctly scoped Bearer
+        // token. If no OAuth2 client is configured, fall back to forwarding the
+        // request as-is (Authorization, if any, passes through).
+        let client = match delegated_nf_type.and_then(|nf| self.oauth_client_for(target, nf)) {
+            Some(oauth_client) => {
+                strip_authorization(&mut fwd.http.headers);
+                oauth_client
+            }
+            None => self.client_for(target),
+        };
+
+        let result = client.send_request(fwd).await;
 
         let upstream = match result {
             Ok(response) => response,
@@ -498,7 +643,7 @@ impl ScpProxy {
                     request.header.uri,
                     target.to_uri()
                 );
-                self.forward(&request, &target, None).await
+                self.forward(&request, &target, None, None).await
             }
             RouteDecision::StickyBinding(target) => {
                 log::debug!(
@@ -507,10 +652,16 @@ impl ScpProxy {
                     request.header.uri,
                     target.to_uri()
                 );
-                self.forward(&request, &target, None).await
+                self.forward(&request, &target, None, None).await
             }
             RouteDecision::Discover => match self.discover(&request).await {
                 Ok((target, producer_id)) => {
+                    // The producer NF type comes from the delegated-discovery
+                    // header; used to scope the OAuth2 token the SCP attaches.
+                    let delegated_nf_type = request
+                        .http
+                        .get_header(discovery_header::TARGET_NF_TYPE)
+                        .and_then(|s| nf_type_from_str(s));
                     log::debug!(
                         "SCP Model D: {} {} -> {} (producer {})",
                         request.header.method,
@@ -518,7 +669,8 @@ impl ScpProxy {
                         target.to_uri(),
                         producer_id
                     );
-                    self.forward(&request, &target, Some(&producer_id)).await
+                    self.forward(&request, &target, Some(&producer_id), delegated_nf_type)
+                        .await
                 }
                 Err(error_response) => error_response,
             },
@@ -1113,6 +1265,7 @@ mod tests {
             nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
             connect_timeout: Duration::from_millis(500),
             request_timeout: Duration::from_millis(500),
+            nf_instance_id: None,
         });
         let mut req = SbiRequest::get("/nudm-sdm/v1/x");
         req.http.set_header(discovery_header::TARGET_NF_TYPE, "UDM");
@@ -1124,5 +1277,203 @@ mod tests {
         assert_eq!(problem.cause.as_deref(), Some("NF_DISCOVERY_FAILURE"));
 
         server.stop().await.expect("nrf stop");
+    }
+
+    // ------------------------------------------------------------------
+    // T1.6: delegated (Model D) OAuth2 token attachment
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_nf_type_from_str_mapping() {
+        assert_eq!(nf_type_from_str("UDM"), Some(NfType::Udm));
+        // Case-insensitive and whitespace-tolerant.
+        assert_eq!(nf_type_from_str("  udm "), Some(NfType::Udm));
+        assert_eq!(nf_type_from_str("5G_EIR"), Some(NfType::FiveGEir));
+        assert_eq!(nf_type_from_str("SCP"), Some(NfType::Scp));
+        // Unknown -> None (the SCP then forwards without minting a token).
+        assert_eq!(nf_type_from_str("NOT_A_NF"), None);
+    }
+
+    #[test]
+    fn test_strip_authorization_case_insensitive() {
+        let mut h = HashMap::new();
+        h.insert("Authorization".to_string(), "Bearer consumer".to_string());
+        h.insert("content-type".to_string(), "application/json".to_string());
+        strip_authorization(&mut h);
+        assert!(!h.keys().any(|k| k.eq_ignore_ascii_case("authorization")));
+        assert!(h.contains_key("content-type"));
+
+        // Lowercased (as hyper delivers it) is also removed.
+        let mut h2 = HashMap::new();
+        h2.insert("authorization".to_string(), "Bearer x".to_string());
+        strip_authorization(&mut h2);
+        assert!(h2.is_empty());
+    }
+
+    /// A mock NRF that serves BOTH nnrf-disc (one-producer SearchResult) and
+    /// the nnrf-oauth2 access-token endpoint, so the SCP can perform delegated
+    /// discovery and then acquire an OAuth2 token. Counts token requests.
+    async fn start_mock_nrf_with_oauth2(
+        port: u16,
+        producer_port: u16,
+        token: &'static str,
+        token_hits: Arc<AtomicU64>,
+    ) -> ogs_sbi::server::SbiServer {
+        let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+            SocketAddr::from(([127, 0, 0, 1], port)),
+        ));
+        server
+            .start(move |request: SbiRequest| {
+                let token_hits = token_hits.clone();
+                async move {
+                    if request.header.uri == "/nnrf-oauth2/v1/access-token" {
+                        // The SCP is the OAuth2 client: it must identify itself
+                        // as an SCP and request a token for the producer (UDM).
+                        let body = request.http.content.clone().unwrap_or_default();
+                        assert!(
+                            body.contains("nfType=SCP"),
+                            "SCP must claim nfType=SCP in the token request, got: {body}"
+                        );
+                        assert!(
+                            body.contains("targetNfType=UDM"),
+                            "token request must target UDM, got: {body}"
+                        );
+                        token_hits.fetch_add(1, Ordering::SeqCst);
+                        let resp = format!(
+                            r#"{{"access_token":"{token}","token_type":"Bearer","expires_in":3600}}"#
+                        );
+                        return SbiResponse::ok().with_body(resp, "application/json");
+                    }
+                    // Otherwise: delegated discovery.
+                    assert_eq!(request.header.uri, "/nnrf-disc/v1/nf-instances");
+                    let search_result = serde_json::json!({
+                        "validityPeriod": 3600,
+                        "nfInstances": [{
+                            "nfInstanceId": "udm-instance-1",
+                            "nfType": "UDM",
+                            "nfStatus": "REGISTERED",
+                            "ipv4Addresses": ["127.0.0.1"],
+                            "priority": 1,
+                            "capacity": 100,
+                            "load": 0,
+                            "nfServices": [{
+                                "serviceInstanceId": "nudm-uecm-1",
+                                "serviceName": "nudm-uecm",
+                                "ipEndPoints": [{"ipv4Address": "127.0.0.1", "port": producer_port}]
+                            }]
+                        }]
+                    });
+                    SbiResponse::ok().with_body(search_result.to_string(), "application/json")
+                }
+            })
+            .await
+            .expect("nrf start");
+        server
+    }
+
+    /// A producer that echoes back the Authorization header it received, so a
+    /// test can assert the SCP attached a delegated Bearer token.
+    async fn start_auth_echo_producer(port: u16) -> ogs_sbi::server::SbiServer {
+        let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+            SocketAddr::from(([127, 0, 0, 1], port)),
+        ));
+        server
+            .start(|request: SbiRequest| async move {
+                let auth = request
+                    .http
+                    .get_header("Authorization")
+                    .cloned()
+                    .unwrap_or_default();
+                let echoed = serde_json::json!({ "authorization": auth });
+                SbiResponse::ok().with_body(echoed.to_string(), "application/json")
+            })
+            .await
+            .expect("producer start");
+        server
+    }
+
+    /// T1.6: a delegated (Model D) forward must attach a valid OAuth2 Bearer
+    /// token acquired by the SCP from the NRF — replacing any opaque
+    /// Authorization the consumer sent.
+    #[tokio::test]
+    async fn test_model_d_attaches_delegated_bearer_token() {
+        let producer_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let token_hits = Arc::new(AtomicU64::new(0));
+
+        let producer = start_auth_echo_producer(producer_port).await;
+        let nrf = start_mock_nrf_with_oauth2(
+            nrf_port,
+            producer_port,
+            "scp-delegated-token",
+            token_hits.clone(),
+        )
+        .await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                nf_instance_id: Some("scp-instance-1".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // Delegated request carrying the consumer's own (now-irrelevant) token.
+        let request = SbiRequest::post("/nudm-uecm/v1/registrations")
+            .with_body(r#"{"amf":"reg"}"#, "application/json")
+            .with_header(discovery_header::TARGET_NF_TYPE, "UDM")
+            .with_header(discovery_header::REQUESTER_NF_TYPE, "AMF")
+            .with_header(discovery_header::SERVICE_NAMES, "nudm-uecm")
+            .with_header("Authorization", "Bearer consumer-supplied-stale");
+
+        let response = fast_client(scp_port)
+            .send_request(request)
+            .await
+            .expect("model D roundtrip");
+        assert_eq!(response.status, 200);
+
+        let echoed: serde_json::Value = response.json_body().unwrap();
+        // The producer saw the SCP's freshly minted delegated token, NOT the
+        // consumer's stale opaque one.
+        assert_eq!(
+            echoed["authorization"], "Bearer scp-delegated-token",
+            "SCP must attach the delegated OAuth2 token on Model D forwards"
+        );
+        // The SCP actually went to the NRF's token endpoint.
+        assert_eq!(token_hits.load(Ordering::SeqCst), 1);
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// When no NRF (and thus no OAuth2 client) is configured, a Model C forward
+    /// leaves the consumer's Authorization untouched (the consumer remains the
+    /// OAuth2 client; the SCP does not strip or replace it).
+    #[tokio::test]
+    async fn test_model_c_preserves_consumer_authorization() {
+        let producer_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let producer = start_auth_echo_producer(producer_port).await;
+        let scp = start_scp(scp_port, ScpProxyConfig::default()).await;
+
+        let request = SbiRequest::post("/nudm-uecm/v1/registrations")
+            .with_header(
+                "3gpp-Sbi-Target-apiRoot",
+                format!("http://127.0.0.1:{producer_port}"),
+            )
+            .with_header("Authorization", "Bearer consumer-token");
+        let response = fast_client(scp_port)
+            .send_request(request)
+            .await
+            .expect("model C roundtrip");
+        assert_eq!(response.status, 200);
+        let echoed: serde_json::Value = response.json_body().unwrap();
+        assert_eq!(echoed["authorization"], "Bearer consumer-token");
+
+        scp.stop().await.expect("scp stop");
+        producer.stop().await.expect("producer stop");
     }
 }

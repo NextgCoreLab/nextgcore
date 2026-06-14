@@ -74,8 +74,8 @@ pub use message::{
 };
 pub use multipart::MultipartBody;
 pub use oauth::{
-    AccessTokenClaims, AccessTokenError, AccessTokenRequest, AccessTokenResponse, OAuth2Client,
-    TokenCache,
+    authorize_bearer, authorize_bearer_aud, check_audience, AccessTokenClaims, AccessTokenError,
+    AccessTokenRequest, AccessTokenResponse, JwksCache, OAuth2Client, TokenCache,
 };
 #[cfg(feature = "6g-extensions")]
 pub use pubsub::{
@@ -92,7 +92,11 @@ pub use security::{
 pub use server::{
     send_bad_request, send_error, send_forbidden, send_gateway_timeout, send_internal_error,
     send_method_not_allowed, send_not_found, send_service_unavailable, send_unauthorized,
-    SbiRequestHandler, SbiServer, SbiServerConfig, StreamId,
+    SbiRequestHandler, SbiServer, SbiServerConfig, StreamId, DEFAULT_MAX_CONCURRENT_STREAMS,
+    DEFAULT_MAX_FRAME_SIZE, DEFAULT_MAX_HEADER_LIST_SIZE, DEFAULT_MAX_REQUEST_BODY_SIZE,
+};
+pub use tls::{
+    export_keying_material, export_n32f_session_key, N32F_EXPORTER_KEY_LEN, N32F_EXPORTER_LABEL,
 };
 pub use types::{NfType, SbiAppError, SbiServiceType, UriScheme};
 

@@ -818,7 +818,11 @@ fn handle_smf_registrations(
                                 .collect::<Vec<_>>()
                         })
                     })
-                    .expect("value expected");
+                    // Unknown UE (or poisoned lock) -> empty array, not a
+                    // panic: a crafted GET for a non-existent SUPI must not
+                    // crash the NF (remote DoS). TS 29.505 returns an empty
+                    // collection for a UE with no SMF registrations.
+                    .unwrap_or_default();
                 SbiResponse::with_status(200).with_body(
                     serde_json::Value::Array(registrations).to_string(),
                     "application/json",
@@ -2324,6 +2328,60 @@ udr:
         req.http.set_param("ue-id", supi);
         let resp = client.send_request(req).await.expect("DELETE subs");
         assert_eq!(resp.status, 204);
+
+        udr.stop().await.expect("udr stops");
+        listener.stop().await.expect("listener stops");
+    }
+
+    /// Regression (C5 / remote DoS): GET smf-registrations for a SUPI that
+    /// the UDR has never seen must return 200 with an empty array, NOT panic
+    /// (the handler previously `.expect()`-ed on a missing UE, crashing the
+    /// NF on a crafted GET). Also covers the per-PDU GET (404) and the PUT ->
+    /// GET-list round-trip so the success path stays intact.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_smf_registrations_unknown_ue_no_panic() {
+        let (udr, client, listener, _cb_port, _rx) = start_udr_and_listener().await;
+
+        // Unknown UE, collection GET -> 200 + empty JSON array (no panic).
+        let unknown = "imsi-001019999999999";
+        let coll = format!(
+            "/nudr-dr/v1/subscription-data/{unknown}/context-data/smf-registrations"
+        );
+        let resp = client.get(&coll).await.expect("GET unknown smf-regs");
+        assert_eq!(resp.status, 200, "unknown UE collection GET must be 200");
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!([]),
+            "unknown UE must yield an empty array, not a panic"
+        );
+
+        // Unknown UE, per-PDU GET -> 404 ProblemDetails (also no panic).
+        let single = format!("{coll}/5");
+        let resp = client.get(&single).await.expect("GET unknown smf-reg/5");
+        assert_eq!(resp.status, 404);
+
+        // Success path: PUT a registration then GET the list back.
+        let supi = "imsi-001019900000077";
+        let coll = format!(
+            "/nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations"
+        );
+        let single = format!("{coll}/5");
+        let resp = client
+            .put_json(&single, &json!({"dnn": "internet"}))
+            .await
+            .expect("PUT smf-reg");
+        assert_eq!(resp.status, 204);
+
+        let resp = client.get(&coll).await.expect("GET smf-regs list");
+        assert_eq!(resp.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let arr = body.as_array().expect("array");
+        assert_eq!(arr.len(), 1, "one registration after PUT");
+        assert_eq!(arr[0]["pduSessionId"], 5);
+        assert_eq!(arr[0]["dnn"], "internet");
 
         udr.stop().await.expect("udr stops");
         listener.stop().await.expect("listener stops");

@@ -2778,7 +2778,16 @@ impl UsageReportSrr {
                 }
                 t if t == IeType::UsageReportTrigger as u16 => {
                     let data = &ie.data;
+                    // Usage Report Trigger is at least 2 octets (3 from Rel-16).
+                    // A zero-length payload must be rejected rather than indexing
+                    // data[0] and panicking on attacker-controlled input.
                     let val = match data.len() {
+                        0 => {
+                            return Err(PfcpError::BufferTooShort {
+                                needed: 1,
+                                available: 0,
+                            });
+                        }
                         1 => data[0] as u32,
                         2 => ((data[0] as u32) << 8) | (data[1] as u32),
                         _ => ((data[0] as u32) << 16) | ((data[1] as u32) << 8) | (data[2] as u32),
@@ -3180,5 +3189,28 @@ mod tests {
         // TOVOL flag set but only 2 of the 8 volume octets present
         let mut bytes = Bytes::from_static(&[0x01, 0x00, 0x01]);
         assert!(VolumeMeasurement::decode(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn test_usage_report_srr_zero_length_trigger_rejected() {
+        // UsageReportSrr containing a UsageReportTrigger IE (type 63) with a
+        // zero-length payload. Previously the `match data.len()` arm indexed
+        // data[0] and panicked; it must now return a graceful Err.
+        // IE = type(2) + length(2) + data(len). Type 63 = 0x003F, length 0.
+        let mut bytes = Bytes::from_static(&[0x00, 0x3F, 0x00, 0x00]);
+        let res = UsageReportSrr::decode(&mut bytes);
+        assert!(
+            res.is_err(),
+            "zero-length UsageReportTrigger must error, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn test_usage_report_srr_valid_trigger_decodes() {
+        // Success path preserved: a 2-octet UsageReportTrigger payload decodes.
+        // IE type 63, length 2, value 0x0102.
+        let mut bytes = Bytes::from_static(&[0x00, 0x3F, 0x00, 0x02, 0x01, 0x02]);
+        let decoded = UsageReportSrr::decode(&mut bytes).expect("valid trigger decodes");
+        assert_eq!(decoded.usage_report_trigger, Some(0x0102));
     }
 }

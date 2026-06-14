@@ -93,6 +93,12 @@ struct Args {
     /// (falls back to the NRF_URI environment variable)
     #[arg(long)]
     nrf_uri: Option<String>,
+
+    /// The SCP's own NF Instance ID, used as `nfInstanceId` when the SCP
+    /// acquires delegated OAuth2 access tokens for Model D requests
+    /// (falls back to the NF_INSTANCE_ID environment variable)
+    #[arg(long)]
+    nf_instance_id: Option<String>,
 }
 
 /// Global shutdown flag
@@ -174,8 +180,13 @@ async fn main() -> Result<()> {
              Model D delegated discovery is disabled"
         );
     }
+    let nf_instance_id = args
+        .nf_instance_id
+        .clone()
+        .or_else(|| std::env::var("NF_INSTANCE_ID").ok());
     let scp_proxy = Arc::new(ScpProxy::new(ScpProxyConfig {
         nrf_uri,
+        nf_instance_id,
         ..Default::default()
     }));
     let mut http_config =

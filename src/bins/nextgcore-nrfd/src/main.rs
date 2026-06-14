@@ -15,15 +15,50 @@ use nextgcore_nrfd::{
     SbiServerConfig,
 };
 use ogs_sbi::message::{SbiRequest, SbiResponse};
-use ogs_sbi::oauth::AccessTokenResponse;
+use ogs_sbi::oauth::{AccessTokenResponse, OAuth2Client};
 use ogs_sbi::server::{
     send_bad_request, send_error, send_method_not_allowed, send_not_found, SbiServer,
     SbiServerConfig as OgsSbiServerConfig,
 };
+use ogs_sbi::types::NfType;
+use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+// ---------------------------------------------------------------------------
+// Typed YAML configuration structs for the SBI OAuth2 knob
+// ---------------------------------------------------------------------------
+
+/// SBI OAuth2 enforcement knob (`nrf.sbi.oauth2.require`).
+///
+/// Defaults to disabled. NOTE (TS 33.501 / TS 29.510): the NRF is itself the
+/// OAuth2 Authorization Server — its `/nnrf-oauth2/v1/access-token` and
+/// `/nnrf-oauth2/v1/jwks` endpoints must stay reachable WITHOUT a token (no NF
+/// can obtain a token before calling the token endpoint). L1's SBI server
+/// middleware has no per-path exemption, so blanket server-side enforcement is
+/// NOT applied on the NRF; this knob drives the CLIENT-side token acquisition
+/// for the NRF's own outbound calls (status notifications to consumers).
+#[derive(Debug, Default, Deserialize)]
+struct SbiOauth2Yaml {
+    require: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SbiYaml {
+    oauth2: Option<SbiOauth2Yaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct NrfSection {
+    sbi: Option<SbiYaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct NrfYaml {
+    nrf: Option<NrfSection>,
+}
 
 /// Per-process ES256 (ECDSA P-256) signing key, generated once at startup.
 /// Asymmetric so consumers can verify tokens with the public key (published via
@@ -241,12 +276,22 @@ async fn main() -> Result<()> {
     nrf_sm.init();
     log::info!("NRF state machine initialized");
 
-    // Parse configuration (if file exists)
+    // Parse configuration (if file exists) and pick up the SBI OAuth2 knob
+    // (nrf.sbi.oauth2.require).
+    let mut require_oauth2 = false;
     if std::path::Path::new(&args.config).exists() {
         log::info!("Loading configuration from {}", args.config);
         match std::fs::read_to_string(&args.config) {
             Ok(content) => {
                 log::debug!("Configuration file loaded ({} bytes)", content.len());
+                if let Ok(yaml) = serde_yaml::from_str::<NrfYaml>(&content) {
+                    require_oauth2 = yaml
+                        .nrf
+                        .and_then(|n| n.sbi)
+                        .and_then(|s| s.oauth2)
+                        .and_then(|o| o.require)
+                        .unwrap_or(false);
+                }
             }
             Err(e) => {
                 log::warn!("Failed to read configuration file: {e}");
@@ -254,6 +299,29 @@ async fn main() -> Result<()> {
         }
     } else {
         log::debug!("Configuration file not found: {}", args.config);
+    }
+
+    // Client side (T1.1): when SBI OAuth2 is enabled, the NRF acquires and
+    // attaches NRF-issued tokens on its own outbound calls (status notify to
+    // consumers). The NRF is the Authorization Server, so it points the token
+    // client at itself (self_uri).
+    //
+    // Server side: NOT applied here. Enabling require_oauth2 on the NRF's SBI
+    // server would gate the NRF's own /nnrf-oauth2/v1/access-token + /jwks
+    // endpoints (L1's middleware has no per-path exemption), deadlocking token
+    // issuance for the whole core. See SbiOauth2Yaml docs.
+    if require_oauth2 {
+        let oauth2 = Arc::new(OAuth2Client::new(
+            nrf_self_uri().to_string(),
+            nrf_instance_id().to_string(),
+            NfType::Nrf,
+        ));
+        nextgcore_nrfd::sbi_path::set_oauth2_client(oauth2);
+        log::info!(
+            "SBI OAuth2 enabled: NRF will attach Bearer tokens on outbound \
+             calls (issuer/self: {})",
+            nrf_self_uri()
+        );
     }
 
     // Build SBI server configuration (legacy, for context)
@@ -1652,5 +1720,51 @@ mod tests {
         client.close().await;
         server.stop().await.expect("server stops");
         outcome.expect("lifecycle test timed out");
+    }
+
+    // -----------------------------------------------------------------
+    // SBI OAuth2 knob (T1.1): config parsing + the NRF-as-issuer rule
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_yaml_oauth2_require_parses() {
+        let yaml = "nrf:\n  sbi:\n    oauth2:\n      require: true\n";
+        let parsed: NrfYaml = serde_yaml::from_str(yaml).unwrap();
+        let require = parsed
+            .nrf
+            .and_then(|n| n.sbi)
+            .and_then(|s| s.oauth2)
+            .and_then(|o| o.require)
+            .unwrap_or(false);
+        assert!(require, "oauth2.require should parse to true");
+    }
+
+    #[test]
+    fn test_yaml_oauth2_absent_defaults_off() {
+        // Default config (no oauth2 block) leaves the knob off, preserving the
+        // dev/E2E path and the unauthenticated token/jwks endpoints.
+        let yaml = "nrf:\n  sbi:\n    server:\n      - address: 0.0.0.0\n        port: 7777\n";
+        let parsed: NrfYaml = serde_yaml::from_str(yaml).unwrap();
+        let require = parsed
+            .nrf
+            .and_then(|n| n.sbi)
+            .and_then(|s| s.oauth2)
+            .and_then(|o| o.require)
+            .unwrap_or(false);
+        assert!(!require, "absent oauth2 block must default to off");
+    }
+
+    /// The NRF is the OAuth2 Authorization Server: its token endpoint must be
+    /// reachable WITHOUT a bearer token. We never blanket-enable
+    /// require_oauth2 on the NRF's own SBI server (no per-path exemption
+    /// exists), so the token endpoint stays open even with the knob on. This
+    /// guards that the default server config has require_oauth2 off.
+    #[test]
+    fn test_nrf_server_never_blanket_requires_oauth2() {
+        let cfg = OgsSbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], 7777)));
+        assert!(
+            !cfg.require_oauth2,
+            "the NRF server must not gate its own token/jwks endpoints"
+        );
     }
 }

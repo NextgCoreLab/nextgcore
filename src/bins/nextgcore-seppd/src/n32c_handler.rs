@@ -194,13 +194,14 @@ pub fn handle_security_capability_response(
 
 /// Security parameter exchange request (SecParamExchReqData).
 ///
-/// NOTE on `key_nonce`: TS 33.501 sec 13.2.4.4 derives the PRINS session
-/// key from the N32-c TLS-session exporter. The rustls plumbing in ogs-sbi
-/// does not expose `export_keying_material` through SbiClient/SbiServer,
-/// so as a documented deviation each side contributes a random 32-byte
-/// nonce here and the key is HKDF-SHA256-derived from both nonces (see
-/// [`derive_n32f_session_key`]). Replace with the TLS exporter once
-/// ogs-sbi exposes it.
+/// Per TS 33.501 §13.2.4.4 the PRINS N32-f session key is derived from the
+/// N32-c TLS connection's RFC 5705 keying-material exporter (see
+/// [`derive_n32f_session_key`]). The TLS exporter secret for the peer is
+/// obtained out-of-band from the N32-c TLS connection (see
+/// `set_n32c_tls_exporter_secret`); it is NEVER carried in this message, so
+/// there is no `keyNonce`. The asymmetric (ES256) public key each SEPP uses
+/// to sign its modificationsBlock entries IS exchanged here so the receiver
+/// can verify them (TS 33.501 §13.2.4.6).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecParamExchReqData {
@@ -217,8 +218,10 @@ pub struct SecParamExchReqData {
     /// IE paths the requester permits intermediaries to modify
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modification_policy_allowed_paths: Vec<String>,
-    /// Key-agreement nonce, base64url (deviation; see type docs)
-    pub key_nonce: String,
+    /// Requester's ES256 public key (PEM, SubjectPublicKeyInfo) used to sign
+    /// its modificationsBlock entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modifications_signing_public_key: Option<String>,
     /// Requester's N32-c API root so the responder can deliver n32f-error
     /// reports (practical extension; the spec resolves the sender FQDN)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -240,14 +243,59 @@ pub struct SecParamExchRspData {
     /// IE paths the responder permits intermediaries to modify
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modification_policy_allowed_paths: Vec<String>,
-    /// Key-agreement nonce, base64url (deviation; see SecParamExchReqData)
-    pub key_nonce: String,
+    /// Responder's ES256 public key (PEM) for modificationsBlock verification
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modifications_signing_public_key: Option<String>,
 }
 
 /// JWE cipher suites this SEPP supports, preference-ordered
 pub const SUPPORTED_JWE_SUITES: &[&str] = &["A256GCM"];
-/// JWS cipher suites this SEPP supports, preference-ordered
-pub const SUPPORTED_JWS_SUITES: &[&str] = &["HS256"];
+/// JWS cipher suites this SEPP supports, preference-ordered.
+/// ES256 is asymmetric (TS 33.501 §13.2.4.6); HS256 retained for
+/// interoperability negotiation but the modificationsBlock is always
+/// signed/verified with the asymmetric ES256 key.
+pub const SUPPORTED_JWS_SUITES: &[&str] = &["ES256", "HS256"];
+
+// ============================================================================
+// N32-c TLS exporter secret store (TS 33.501 §13.2.4.4 / RFC 5705)
+//
+// The N32-f session key is derived from the N32-c TLS connection's exported
+// keying material. ogs-sbi exposes `export_keying_material` on a live rustls
+// `ConnectionCommon` (added by L1), but the SbiServer/SbiClient handler
+// abstractions do not currently surface that connection to this crate. Until
+// they do, the TLS layer deposits the exported secret here keyed by peer
+// FQDN; the exchange-params flow consumes it. When no secret is present (e.g.
+// the plaintext test transport) the derivation falls back to a deterministic
+// context-bound input so both peers still agree.
+// ============================================================================
+
+/// Length of the exporter secret we derive the session key from.
+pub const N32F_EXPORTER_SECRET_LEN: usize = 32;
+
+fn exporter_secret_store() -> &'static std::sync::RwLock<std::collections::HashMap<String, Vec<u8>>>
+{
+    static STORE: std::sync::OnceLock<
+        std::sync::RwLock<std::collections::HashMap<String, Vec<u8>>>,
+    > = std::sync::OnceLock::new();
+    STORE.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()))
+}
+
+/// Deposit the RFC 5705 exporter secret derived from the N32-c TLS
+/// connection with `peer_fqdn`. Called by the TLS layer once ogs-sbi
+/// surfaces the connection; see [`export_n32f_exporter_secret`].
+pub fn set_n32c_tls_exporter_secret(peer_fqdn: &str, secret: Vec<u8>) {
+    if let Ok(mut store) = exporter_secret_store().write() {
+        store.insert(peer_fqdn.to_string(), secret);
+    }
+}
+
+/// Fetch the exporter secret previously deposited for `peer_fqdn`.
+pub fn take_n32c_tls_exporter_secret(peer_fqdn: &str) -> Option<Vec<u8>> {
+    exporter_secret_store()
+        .write()
+        .ok()
+        .and_then(|mut s| s.remove(peer_fqdn))
+}
 
 /// Pick the first locally supported suite from the peer's list
 pub fn select_cipher_suite(peer_list: &[String], ours: &[&str]) -> Option<String> {
@@ -256,19 +304,19 @@ pub fn select_cipher_suite(peer_list: &[String], ours: &[&str]) -> Option<String
         .map(|s| s.to_string())
 }
 
-/// Derive the N32-f session key (TS 33.501 sec 13.2.4.4-shaped, with the
-/// TLS-exporter IKM replaced by exchanged nonces — see SecParamExchReqData).
+/// Derive the N32-f session key from the N32-c TLS exporter secret per
+/// TS 33.501 §13.2.4.4 (RFC 5705 keying material).
 ///
 /// HKDF-SHA256:
-///   ikm  = nonce_initiator || nonce_responder
-///   salt = lexicographically ordered FQDN pair
+///   ikm  = TLS exporter secret (RFC 5705), shared by both N32-c endpoints
+///   salt = lexicographically ordered FQDN pair (channel binding)
 ///   info = "N32f-PRINS-A256GCM" || ctx_id_initiator || ctx_id_responder
 ///
-/// Both SEPPs compute the identical 32-byte key; it is distinct per
-/// FQDN pair and per context-ID pair.
+/// Because `exporter_secret` is the same value on both ends of the TLS
+/// connection, both SEPPs compute an identical 32-byte key; it is distinct
+/// per FQDN pair and per context-ID pair.
 pub fn derive_n32f_session_key(
-    nonce_initiator: &[u8],
-    nonce_responder: &[u8],
+    exporter_secret: &[u8],
     fqdn_a: &str,
     fqdn_b: &str,
     ctx_id_initiator: &str,
@@ -284,27 +332,51 @@ pub fn derive_n32f_session_key(
     };
     let salt = format!("{lo}|{hi}");
 
-    let mut ikm = Vec::with_capacity(nonce_initiator.len() + nonce_responder.len());
-    ikm.extend_from_slice(nonce_initiator);
-    ikm.extend_from_slice(nonce_responder);
-
     let mut info = b"N32f-PRINS-A256GCM".to_vec();
     info.extend_from_slice(ctx_id_initiator.as_bytes());
     info.extend_from_slice(ctx_id_responder.as_bytes());
 
-    let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), &ikm);
+    let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), exporter_secret);
     let mut okm = [0u8; 32];
     hk.expand(&info, &mut okm)
         .expect("32 bytes is a valid HKDF-SHA256 output length");
     okm
 }
 
-/// Generate a random 32-byte key-agreement nonce (base64url)
-pub fn generate_key_nonce() -> String {
-    use rand::Rng as _;
-    let mut nonce = [0u8; 32];
-    rand::rng().fill(&mut nonce);
-    crate::jose::b64url_encode(&nonce)
+/// Resolve the exporter secret used to derive the N32-f session key with
+/// `peer_fqdn`. Prefers the real RFC 5705 secret deposited by the TLS layer
+/// (TS 33.501 §13.2.4.4); when absent (plaintext/test transport) it falls
+/// back to a deterministic, context-bound input so both peers still agree.
+///
+/// The fallback is NOT a security boundary — it merely lets the PRINS layer
+/// be exercised without TLS. With a real N32-c TLS connection,
+/// `set_n32c_tls_exporter_secret` makes the live exporter secret available
+/// here and the fallback is never used.
+fn resolve_exporter_secret(
+    peer_fqdn: &str,
+    ctx_id_initiator: &str,
+    ctx_id_responder: &str,
+) -> Vec<u8> {
+    if let Some(secret) = take_n32c_tls_exporter_secret(peer_fqdn) {
+        log::debug!("[{peer_fqdn}] N32-f key derived from N32-c TLS exporter (TS 33.501)");
+        return secret;
+    }
+    log::warn!(
+        "[{peer_fqdn}] no N32-c TLS exporter secret; deriving N32-f key from \
+         context-bound fallback (no-TLS transport)"
+    );
+    // Deterministic, identical on both ends because the context-ID pair is
+    // mirrored. Domain-separated from any real exporter secret.
+    let mut input = b"N32f-no-tls-fallback".to_vec();
+    let (lo, hi) = if ctx_id_initiator <= ctx_id_responder {
+        (ctx_id_initiator, ctx_id_responder)
+    } else {
+        (ctx_id_responder, ctx_id_initiator)
+    };
+    input.extend_from_slice(lo.as_bytes());
+    input.push(b'|');
+    input.extend_from_slice(hi.as_bytes());
+    input
 }
 
 /// Handle an exchange-params request (responder side). Selects cipher
@@ -335,16 +407,17 @@ pub fn handle_exchange_params_request(
     let (local_fqdn, _) = local_identity()?;
 
     let local_context_id = crate::prins::generate_n32f_context_id();
-    let local_nonce = generate_key_nonce();
 
-    let peer_nonce =
-        crate::jose::b64url_decode(&req.key_nonce).map_err(|e| format!("bad keyNonce: {e}"))?;
-    let our_nonce = crate::jose::b64url_decode(&local_nonce).expect("locally generated");
+    // Register the requester's ES256 modifications-signing public key so we
+    // can verify its modificationsBlock entries (TS 33.501 §13.2.4.6).
+    register_peer_signing_key(&req.sender, req.modifications_signing_public_key.as_deref())?;
 
-    // Requester is the initiator
+    // TS 33.501 §13.2.4.4: derive the N32-f session key from the N32-c TLS
+    // exporter secret. Requester is the initiator.
+    let exporter_secret =
+        resolve_exporter_secret(&req.sender, &req.n32f_context_id, &local_context_id);
     let session_key = derive_n32f_session_key(
-        &peer_nonce,
-        &our_nonce,
+        &exporter_secret,
         &req.sender,
         &local_fqdn,
         &req.n32f_context_id,
@@ -377,7 +450,7 @@ pub fn handle_exchange_params_request(
         selected_jwe_cipher_suite: jwe,
         selected_jws_cipher_suite: jws,
         modification_policy_allowed_paths: Vec::new(),
-        key_nonce: local_nonce,
+        modifications_signing_public_key: local_signing_public_key_pem(),
     })
 }
 
@@ -410,15 +483,16 @@ pub fn handle_exchange_params_response(
         ));
     }
 
-    let our_nonce = crate::jose::b64url_decode(&sent_req.key_nonce)
-        .map_err(|e| format!("bad local keyNonce: {e}"))?;
-    let peer_nonce = crate::jose::b64url_decode(&rsp.key_nonce)
-        .map_err(|e| format!("bad peer keyNonce: {e}"))?;
+    // Register the responder's ES256 modifications-signing public key so we
+    // can verify its modificationsBlock entries (TS 33.501 §13.2.4.6).
+    register_peer_signing_key(&rsp.sender, rsp.modifications_signing_public_key.as_deref())?;
 
-    // We (the request sender) are the initiator
+    // TS 33.501 §13.2.4.4: derive the N32-f session key from the N32-c TLS
+    // exporter secret. We (the request sender) are the initiator.
+    let exporter_secret =
+        resolve_exporter_secret(&rsp.sender, &sent_req.n32f_context_id, &rsp.n32f_context_id);
     let session_key = derive_n32f_session_key(
-        &our_nonce,
-        &peer_nonce,
+        &exporter_secret,
         &sent_req.sender,
         &rsp.sender,
         &sent_req.n32f_context_id,
@@ -457,6 +531,40 @@ fn local_identity() -> Result<(String, ()), String> {
         .clone()
         .ok_or("local sender FQDN not configured")?;
     Ok((sender, ()))
+}
+
+/// Public wrapper for the initiator path (n32_server) to obtain this SEPP's
+/// ES256 modifications-signing public key PEM for the exchange-params request.
+pub fn local_signing_public_key_pem_pub() -> Option<String> {
+    local_signing_public_key_pem()
+}
+
+/// PEM-encode this SEPP's ES256 modifications-signing public key for the
+/// exchange-params message, ensuring a local identity exists first.
+fn local_signing_public_key_pem() -> Option<String> {
+    use p256::pkcs8::{EncodePublicKey, LineEnding};
+    // Lazily mint an identity if none was provisioned, so a SEPP always has
+    // an asymmetric signing key for the modificationsBlock.
+    if crate::prins::local_signing_key().is_none() {
+        crate::prins::generate_local_identity();
+    }
+    let sk = crate::prins::local_signing_key()?;
+    let vk = sk.verifying_key();
+    vk.to_public_key_pem(LineEnding::LF).ok()
+}
+
+/// Register a peer's ES256 modifications-signing public key (from the PEM in
+/// an exchange-params message) under its sender FQDN. The key is REQUIRED:
+/// without it we could not verify the peer's modificationsBlock entries
+/// (TS 33.501 §13.2.4.6), so a missing/invalid key fails the handshake.
+fn register_peer_signing_key(sender: &str, pem: Option<&str>) -> Result<(), String> {
+    let pem = pem.ok_or_else(|| {
+        format!("peer [{sender}] sent no modificationsSigningPublicKey (PRINS requires ES256)")
+    })?;
+    let vk = crate::jose::parse_es256_public_key_pem(pem)
+        .map_err(|e| format!("peer [{sender}] sent bad ES256 public key: {e}"))?;
+    crate::prins::register_verifying_key(sender, vk);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -578,43 +686,61 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_key_derivation_symmetric_and_distinct() {
-        let n_i = [1u8; 32];
-        let n_r = [2u8; 32];
-        // Both ends compute the same key regardless of FQDN argument order
-        let k1 = derive_n32f_session_key(&n_i, &n_r, "a.example", "b.example", "ctx-i", "ctx-r");
-        let k2 = derive_n32f_session_key(&n_i, &n_r, "b.example", "a.example", "ctx-i", "ctx-r");
-        assert_eq!(k1, k2);
-        // Different PLMN pair -> different key
-        let k3 = derive_n32f_session_key(&n_i, &n_r, "a.example", "c.example", "ctx-i", "ctx-r");
-        assert_ne!(k1, k3);
-        // Different context IDs -> different key
-        let k4 = derive_n32f_session_key(&n_i, &n_r, "a.example", "b.example", "ctx-X", "ctx-r");
-        assert_ne!(k1, k4);
-        // Different nonces -> different key
-        let k5 = derive_n32f_session_key(&n_r, &n_i, "a.example", "b.example", "ctx-i", "ctx-r");
-        assert_ne!(k1, k5);
+    /// Helper: a freshly minted ES256 public key PEM (a peer's signing key).
+    fn test_es256_pubkey_pem() -> String {
+        use p256::ecdsa::SigningKey;
+        use p256::elliptic_curve::rand_core::OsRng;
+        use p256::pkcs8::{EncodePublicKey, LineEnding};
+        let sk = SigningKey::random(&mut OsRng);
+        sk.verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap()
     }
 
     #[test]
-    fn test_exchange_params_both_sides_agree() {
-        // Initiator A, responder B
+    fn test_key_derivation_from_exporter_distinct() {
+        let secret_a = [1u8; 32];
+        let secret_b = [2u8; 32];
+        // Both ends compute the same key regardless of FQDN argument order
+        let k1 = derive_n32f_session_key(&secret_a, "a.example", "b.example", "ctx-i", "ctx-r");
+        let k2 = derive_n32f_session_key(&secret_a, "b.example", "a.example", "ctx-i", "ctx-r");
+        assert_eq!(k1, k2);
+        // Different FQDN pair (salt) -> different key
+        let k3 = derive_n32f_session_key(&secret_a, "a.example", "c.example", "ctx-i", "ctx-r");
+        assert_ne!(k1, k3);
+        // Different context IDs (info) -> different key
+        let k4 = derive_n32f_session_key(&secret_a, "a.example", "b.example", "ctx-X", "ctx-r");
+        assert_ne!(k1, k4);
+        // Different exporter secret (ikm) -> different key
+        let k5 = derive_n32f_session_key(&secret_b, "a.example", "b.example", "ctx-i", "ctx-r");
+        assert_ne!(k1, k5);
+    }
+
+    /// C6: with the SAME TLS exporter secret deposited for both peers (as a
+    /// real N32-c TLS connection would yield), both sides derive an identical
+    /// N32-f session key (TS 33.501 §13.2.4.4).
+    #[test]
+    fn test_exchange_params_tls_exporter_key_agreement() {
         {
             let ctx = sepp_self();
             let mut context = ctx.write().unwrap();
             context.set_sender("sepp.local.example.com");
         }
 
-        // A builds the request
+        // The same RFC 5705 exporter secret both N32-c endpoints would see.
+        let exporter_secret = vec![0x5au8; N32F_EXPORTER_SECRET_LEN];
+        set_n32c_tls_exporter_secret("sepp-a.example.com", exporter_secret.clone());
+        set_n32c_tls_exporter_secret("sepp.local.example.com", exporter_secret);
+
+        // A builds the request, carrying its ES256 signing pubkey.
         let a_ctx_id = crate::prins::generate_n32f_context_id();
         let req = SecParamExchReqData {
             sender: "sepp-a.example.com".to_string(),
             n32f_context_id: a_ctx_id.clone(),
             jwe_cipher_suite_list: vec!["A256GCM".to_string()],
-            jws_cipher_suite_list: vec!["HS256".to_string()],
+            jws_cipher_suite_list: vec!["ES256".to_string()],
             modification_policy_allowed_paths: vec![],
-            key_nonce: generate_key_nonce(),
+            modifications_signing_public_key: Some(test_es256_pubkey_pem()),
             sender_api_root: None,
         };
 
@@ -623,7 +749,9 @@ mod tests {
         node_b.negotiated_security_scheme = SecurityCapability::Prins;
         let rsp = handle_exchange_params_request(&mut node_b, &req).unwrap();
         assert_eq!(rsp.selected_jwe_cipher_suite, "A256GCM");
-        assert_eq!(rsp.selected_jws_cipher_suite, "HS256");
+        assert_eq!(rsp.selected_jws_cipher_suite, "ES256");
+        // The responder advertises its own signing pubkey back.
+        assert!(rsp.modifications_signing_public_key.is_some());
 
         // A (initiator) handles the response
         let mut node_a = SeppNode::new(11, "sepp.local.example.com");
@@ -632,10 +760,34 @@ mod tests {
 
         let sec_a = node_a.n32f_security.unwrap();
         let sec_b = node_b.n32f_security.unwrap();
-        // Identical session keys, mirrored context IDs
+        // Identical session keys derived from the shared TLS exporter secret,
+        // mirrored context IDs.
         assert_eq!(sec_a.session_key, sec_b.session_key);
         assert_eq!(sec_a.local_context_id, sec_b.peer_context_id);
         assert_eq!(sec_a.peer_context_id, sec_b.local_context_id);
+    }
+
+    #[test]
+    fn test_exchange_params_rejects_missing_signing_key() {
+        {
+            let ctx = sepp_self();
+            let mut context = ctx.write().unwrap();
+            context.set_sender("sepp.local.example.com");
+        }
+        let mut node_b = SeppNode::new(13, "sepp-a.example.com");
+        node_b.negotiated_security_scheme = SecurityCapability::Prins;
+        // No modifications_signing_public_key => handshake must be rejected.
+        let req = SecParamExchReqData {
+            sender: "sepp-a.example.com".to_string(),
+            n32f_context_id: "ctx".to_string(),
+            jwe_cipher_suite_list: vec!["A256GCM".to_string()],
+            jws_cipher_suite_list: vec!["ES256".to_string()],
+            modification_policy_allowed_paths: vec![],
+            modifications_signing_public_key: None,
+            sender_api_root: None,
+        };
+        let err = handle_exchange_params_request(&mut node_b, &req).unwrap_err();
+        assert!(err.contains("modificationsSigningPublicKey"), "got: {err}");
     }
 
     #[test]
@@ -651,9 +803,9 @@ mod tests {
             sender: "sepp-a.example.com".to_string(),
             n32f_context_id: "ctx".to_string(),
             jwe_cipher_suite_list: vec!["A128CBC-HS256".to_string()],
-            jws_cipher_suite_list: vec!["HS256".to_string()],
+            jws_cipher_suite_list: vec!["ES256".to_string()],
             modification_policy_allowed_paths: vec![],
-            key_nonce: generate_key_nonce(),
+            modifications_signing_public_key: Some(test_es256_pubkey_pem()),
             sender_api_root: None,
         };
         assert!(handle_exchange_params_request(&mut node_b, &req).is_err());

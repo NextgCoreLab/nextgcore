@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http2;
 use hyper::service::Service;
@@ -23,7 +23,26 @@ use tokio_rustls::TlsAcceptor;
 use crate::error::{SbiError, SbiResult};
 use crate::message::{SbiHttpMessage, SbiRequest, SbiResponse};
 use crate::tls;
-use crate::types::UriScheme;
+use crate::types::{NfType, UriScheme};
+
+/// Default maximum size, in bytes, of a request body the server will buffer
+/// before rejecting with 413 Payload Too Large. 1 MiB comfortably covers
+/// every JSON / multipart SBI body (TS 29.500) while bounding the memory a
+/// single request can pin, closing the unbounded-`collect()` DoS.
+pub const DEFAULT_MAX_REQUEST_BODY_SIZE: usize = 1024 * 1024;
+
+/// Default cap on concurrent HTTP/2 streams per connection. Bounds the number
+/// of in-flight requests one peer can open and the per-connection state the
+/// server keeps, mitigating stream-flood DoS.
+pub const DEFAULT_MAX_CONCURRENT_STREAMS: u32 = 128;
+
+/// Default maximum HTTP/2 frame size the server will accept (16 KiB — the
+/// HTTP/2 spec minimum, RFC 7540 §4.2). Keeps per-frame buffering small.
+pub const DEFAULT_MAX_FRAME_SIZE: u32 = 16 * 1024;
+
+/// Default cap on the total decoded size of a request header list (8 KiB),
+/// bounding HPACK-decompressed header memory per request.
+pub const DEFAULT_MAX_HEADER_LIST_SIZE: u32 = 8 * 1024;
 
 /// Server configuration
 #[derive(Debug, Clone)]
@@ -54,6 +73,28 @@ pub struct SbiServerConfig {
     /// When `require_oauth2` is enabled and `oauth2_jwks` is unset, keys are
     /// fetched from here on first use and cached (see [`JwksCache`]).
     pub oauth2_jwks_uri: Option<String>,
+    /// Expected OAuth2 `aud` (audience) claim, per RFC 7519 §4.1.3 and
+    /// TS 33.501 §13.4.1.2. When `Some`, a verified access token is rejected
+    /// unless its `aud` includes this value — normally the NF's own type
+    /// (e.g. "UDM") or NF Instance ID. `None` (default) skips the audience
+    /// check, preserving prior behaviour. Only consulted when
+    /// `require_oauth2` is enabled.
+    pub oauth2_expected_audience: Option<String>,
+    /// Maximum request body size, in bytes, accepted before the body is
+    /// buffered. Oversize requests are rejected with 413 (ProblemDetails)
+    /// without allocating the full body. Defaults to
+    /// [`DEFAULT_MAX_REQUEST_BODY_SIZE`].
+    pub max_request_body_size: usize,
+    /// Cap on concurrent HTTP/2 streams per connection. `None` leaves hyper's
+    /// own default in place. Defaults to
+    /// `Some(`[`DEFAULT_MAX_CONCURRENT_STREAMS`]`)`.
+    pub max_concurrent_streams: Option<u32>,
+    /// Maximum HTTP/2 frame size accepted. `None` keeps hyper's default.
+    /// Defaults to `Some(`[`DEFAULT_MAX_FRAME_SIZE`]`)`.
+    pub max_frame_size: Option<u32>,
+    /// Cap on the decoded HTTP/2 header-list size. `None` keeps hyper's
+    /// default. Defaults to `Some(`[`DEFAULT_MAX_HEADER_LIST_SIZE`]`)`.
+    pub max_header_list_size: Option<u32>,
 }
 
 impl Default for SbiServerConfig {
@@ -69,6 +110,11 @@ impl Default for SbiServerConfig {
             require_oauth2: false,
             oauth2_jwks: None,
             oauth2_jwks_uri: None,
+            oauth2_expected_audience: None,
+            max_request_body_size: DEFAULT_MAX_REQUEST_BODY_SIZE,
+            max_concurrent_streams: Some(DEFAULT_MAX_CONCURRENT_STREAMS),
+            max_frame_size: Some(DEFAULT_MAX_FRAME_SIZE),
+            max_header_list_size: Some(DEFAULT_MAX_HEADER_LIST_SIZE),
         }
     }
 }
@@ -103,6 +149,27 @@ impl SbiServerConfig {
         self.cert = Some(cert.into());
         self
     }
+
+    /// Set the maximum buffered request body size, in bytes (T1.4).
+    pub fn with_max_request_body_size(mut self, bytes: usize) -> Self {
+        self.max_request_body_size = bytes;
+        self
+    }
+
+    /// Set the expected OAuth2 `aud` claim this NF will accept (T1.2).
+    ///
+    /// Typically the NF's own type string (e.g. "UDM") or NF Instance ID.
+    /// Only enforced when `require_oauth2` is also enabled.
+    pub fn with_expected_audience(mut self, audience: impl Into<String>) -> Self {
+        self.oauth2_expected_audience = Some(audience.into());
+        self
+    }
+
+    /// Set the expected OAuth2 `aud` claim from an [`NfType`] (T1.2).
+    pub fn with_expected_audience_nf_type(mut self, nf_type: NfType) -> Self {
+        self.oauth2_expected_audience = Some(nf_type.to_str().to_string());
+        self
+    }
 }
 
 /// Request handler trait
@@ -124,7 +191,7 @@ where
 
 /// Where the server gets OAuth2 verification keys when `require_oauth2` is
 /// enabled.
-enum OAuthVerifier {
+enum OAuthKeySource {
     /// A JWKS document provisioned in the server config.
     Static(serde_json::Value),
     /// Keys fetched live from the NRF's JWKS endpoint and cached.
@@ -134,6 +201,15 @@ enum OAuthVerifier {
     Unconfigured,
 }
 
+/// OAuth2 enforcement for incoming requests: a key source plus the optional
+/// expected `aud` claim (T1.2).
+struct OAuthVerifier {
+    keys: OAuthKeySource,
+    /// Expected audience (the NF's own type/instanceId); `None` skips the
+    /// audience check, preserving prior behaviour.
+    expected_audience: Option<String>,
+}
+
 impl OAuthVerifier {
     /// Resolve the verification source from the server config, or `None`
     /// when OAuth2 enforcement is disabled.
@@ -141,24 +217,33 @@ impl OAuthVerifier {
         if !config.require_oauth2 {
             return None;
         }
-        Some(match (&config.oauth2_jwks, &config.oauth2_jwks_uri) {
-            (Some(jwks), _) => Self::Static(jwks.clone()),
-            (None, Some(uri)) => Self::Remote(crate::oauth::JwksCache::new(uri.clone())),
+        let keys = match (&config.oauth2_jwks, &config.oauth2_jwks_uri) {
+            (Some(jwks), _) => OAuthKeySource::Static(jwks.clone()),
+            (None, Some(uri)) => OAuthKeySource::Remote(crate::oauth::JwksCache::new(uri.clone())),
             (None, None) => {
                 log::error!(
                     "require_oauth2 is enabled with no oauth2_jwks/oauth2_jwks_uri; \
                      rejecting all requests"
                 );
-                Self::Unconfigured
+                OAuthKeySource::Unconfigured
             }
+        };
+        Some(Self {
+            keys,
+            expected_audience: config.oauth2_expected_audience.clone(),
         })
     }
 
     async fn authorize(&self, auth_header: Option<&str>) -> SbiResult<()> {
-        match self {
-            Self::Static(jwks) => crate::oauth::authorize_bearer(auth_header, jwks).map(|_| ()),
-            Self::Remote(cache) => cache.authorize(auth_header).await.map(|_| ()),
-            Self::Unconfigured => Err(SbiError::ServerError(
+        let aud = self.expected_audience.as_deref();
+        match &self.keys {
+            OAuthKeySource::Static(jwks) => {
+                crate::oauth::authorize_bearer_aud(auth_header, jwks, aud).map(|_| ())
+            }
+            OAuthKeySource::Remote(cache) => {
+                cache.authorize_aud(auth_header, aud).await.map(|_| ())
+            }
+            OAuthKeySource::Unconfigured => Err(SbiError::ServerError(
                 "require_oauth2 is enabled but neither oauth2_jwks nor oauth2_jwks_uri is configured".into(),
             )),
         }
@@ -171,6 +256,9 @@ struct SbiService<H: SbiRequestHandler> {
     /// When `Some`, every request must carry a valid OAuth2 bearer token;
     /// bad tokens are rejected with 401, unavailable keys with 503.
     oauth: Option<Arc<OAuthVerifier>>,
+    /// Maximum request body size, in bytes, buffered before rejecting with
+    /// 413 (T1.4).
+    max_request_body_size: usize,
 }
 
 impl<H: SbiRequestHandler> Clone for SbiService<H> {
@@ -178,6 +266,7 @@ impl<H: SbiRequestHandler> Clone for SbiService<H> {
         Self {
             handler: self.handler.clone(),
             oauth: self.oauth.clone(),
+            max_request_body_size: self.max_request_body_size,
         }
     }
 }
@@ -190,6 +279,7 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
     fn call(&self, req: Request<Incoming>) -> Self::Future {
         let handler = self.handler.clone();
         let oauth = self.oauth.clone();
+        let max_body = self.max_request_body_size;
         let path = req.uri().path().to_string();
 
         Box::pin(async move {
@@ -203,8 +293,26 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                     .expect("value expected"));
             }
 
-            // Convert hyper request to SbiRequest
-            let sbi_request = convert_request(req).await;
+            // Convert hyper request to SbiRequest, enforcing the body-size cap
+            // BEFORE buffering (T1.4). An oversize body is rejected with 413
+            // ProblemDetails without allocating the full body.
+            let sbi_request = match convert_request(req, max_body).await {
+                Ok(request) => request,
+                Err(ConvertRequestError::BodyTooLarge) => {
+                    let body = serde_json::json!({
+                        "title": "Payload Too Large",
+                        "status": 413,
+                        "detail": format!(
+                            "request body exceeds the maximum of {max_body} bytes"
+                        ),
+                        "cause": "PAYLOAD_TOO_LARGE",
+                    })
+                    .to_string();
+                    let resp = SbiResponse::with_status(413)
+                        .with_body(body, "application/problem+json");
+                    return Ok(convert_response(resp));
+                }
+            };
 
             // OAuth2 enforcement (opt-in). Verify the bearer token against the
             // configured key material before dispatching to the NF handler.
@@ -232,8 +340,23 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                 }
             }
 
-            // Call the handler
-            let sbi_response = handler.handle(sbi_request).await;
+            // Call the handler, guarded against panics (T1.3). A panic in any
+            // NF handler becomes a 500 application/problem+json instead of
+            // tearing down the whole HTTP/2 connection task (which would drop
+            // every other multiplexed request on the same connection).
+            let sbi_response = match catch_handler_panic(handler.handle(sbi_request)).await {
+                Ok(response) => response,
+                Err(()) => {
+                    let body = serde_json::json!({
+                        "title": "Internal Server Error",
+                        "status": 500,
+                        "detail": "the request handler panicked",
+                        "cause": "INTERNAL_ERROR",
+                    })
+                    .to_string();
+                    SbiResponse::with_status(500).with_body(body, "application/problem+json")
+                }
+            };
 
             // Convert SbiResponse to hyper response
             let response = convert_response(sbi_response);
@@ -243,8 +366,96 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
     }
 }
 
-/// Convert hyper request to SbiRequest
-async fn convert_request(req: Request<Incoming>) -> SbiRequest {
+/// Drive a handler future to completion, converting a panic into `Err(())`.
+///
+/// `AssertUnwindSafe` is sound here: on a caught panic we discard the future
+/// and any partially-mutated state it owned and synthesize a fresh 500
+/// response, so no logically-inconsistent state is observed afterwards.
+async fn catch_handler_panic<F>(fut: F) -> Result<SbiResponse, ()>
+where
+    F: Future<Output = SbiResponse>,
+{
+    use std::panic::AssertUnwindSafe;
+    use std::task::Poll;
+
+    let mut fut = Box::pin(fut);
+    std::future::poll_fn(move |cx| {
+        match std::panic::catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
+            Ok(Poll::Ready(response)) => Poll::Ready(Ok(response)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(panic) => {
+                let detail = panic_message(&panic);
+                log::error!("SBI request handler panicked: {detail}");
+                Poll::Ready(Err(()))
+            }
+        }
+    })
+    .await
+}
+
+/// Best-effort extraction of a human-readable message from a caught panic.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
+
+/// Why [`convert_request`] could not produce an `SbiRequest`.
+enum ConvertRequestError {
+    /// The request body exceeded the configured maximum size (T1.4).
+    BodyTooLarge,
+}
+
+/// HTTP/2 server-side resource limits applied to every accepted connection
+/// (T1.4). Copied into each connection task so a single peer cannot exhaust
+/// memory via stream floods or oversized frames/header lists.
+#[derive(Debug, Clone, Copy)]
+struct Http2Limits {
+    max_concurrent_streams: Option<u32>,
+    max_frame_size: Option<u32>,
+    max_header_list_size: Option<u32>,
+}
+
+impl Http2Limits {
+    fn from_config(config: &SbiServerConfig) -> Self {
+        Self {
+            max_concurrent_streams: config.max_concurrent_streams,
+            max_frame_size: config.max_frame_size,
+            max_header_list_size: config.max_header_list_size,
+        }
+    }
+
+    /// Apply the configured limits to a hyper HTTP/2 server builder. Each
+    /// `None` leaves hyper's own default untouched.
+    fn apply<E>(&self, builder: &mut http2::Builder<E>) {
+        if let Some(max) = self.max_concurrent_streams {
+            builder.max_concurrent_streams(max);
+        }
+        if let Some(sz) = self.max_frame_size {
+            builder.max_frame_size(sz);
+        }
+        if let Some(sz) = self.max_header_list_size {
+            builder.max_header_list_size(sz);
+        }
+    }
+}
+
+/// Convert hyper request to SbiRequest, enforcing `max_body_size` (T1.4).
+///
+/// The body is read through [`Limited`], which yields an error as soon as the
+/// accumulated body exceeds `max_body_size` rather than buffering an unbounded
+/// amount first — this is what closes the memory-exhaustion DoS. An oversize
+/// body surfaces as [`ConvertRequestError::BodyTooLarge`] (mapped to 413 by
+/// the caller). Any other body-read error is treated as an empty body, matching
+/// the previous behaviour.
+async fn convert_request(
+    req: Request<Incoming>,
+    max_body_size: usize,
+) -> Result<SbiRequest, ConvertRequestError> {
     let method = req.method().to_string();
     let uri = req.uri().path().to_string();
 
@@ -265,31 +476,45 @@ async fn convert_request(req: Request<Incoming>) -> SbiRequest {
         }
     }
 
-    // Read body. multipart/related bodies (N1/N2 binary containers, TS
-    // 29.500 §6.1.2.3) are decoded into the JSON root + binary parts before
-    // any UTF-8 conversion so binary content survives byte-exact.
-    if let Ok(body) = req.into_body().collect().await {
-        let bytes = body.to_bytes();
-        if !bytes.is_empty() {
-            let multipart_content_type = http
-                .get_header(crate::constants::header::CONTENT_TYPE)
-                .filter(|ct| crate::multipart::is_multipart_related(ct))
-                .cloned();
-            match multipart_content_type {
-                Some(ct) => match crate::multipart::decode(&ct, &bytes) {
-                    Ok(decoded) => {
-                        http.content = decoded.json;
-                        for part in decoded.parts {
-                            http.add_part(part);
+    // Read body under a size cap. multipart/related bodies (N1/N2 binary
+    // containers, TS 29.500 §6.1.2.3) are decoded into the JSON root + binary
+    // parts before any UTF-8 conversion so binary content survives byte-exact.
+    let limited = Limited::new(req.into_body(), max_body_size);
+    match limited.collect().await {
+        Ok(body) => {
+            let bytes = body.to_bytes();
+            if !bytes.is_empty() {
+                let multipart_content_type = http
+                    .get_header(crate::constants::header::CONTENT_TYPE)
+                    .filter(|ct| crate::multipart::is_multipart_related(ct))
+                    .cloned();
+                match multipart_content_type {
+                    Some(ct) => match crate::multipart::decode(&ct, &bytes) {
+                        Ok(decoded) => {
+                            http.content = decoded.json;
+                            for part in decoded.parts {
+                                http.add_part(part);
+                            }
                         }
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to decode multipart request body: {e}");
-                        http.set_content(String::from_utf8_lossy(&bytes).to_string());
-                    }
-                },
-                None => http.set_content(String::from_utf8_lossy(&bytes).to_string()),
+                        Err(e) => {
+                            log::warn!("Failed to decode multipart request body: {e}");
+                            http.set_content(String::from_utf8_lossy(&bytes).to_string());
+                        }
+                    },
+                    None => http.set_content(String::from_utf8_lossy(&bytes).to_string()),
+                }
             }
+        }
+        Err(e) => {
+            // Limited returns a boxed LengthLimitError once the cap is passed;
+            // distinguish that from a generic transport error.
+            if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
+                log::warn!(
+                    "Rejecting request body over the {max_body_size}-byte limit on {uri}"
+                );
+                return Err(ConvertRequestError::BodyTooLarge);
+            }
+            log::warn!("Failed to read request body on {uri}: {e}");
         }
     }
 
@@ -298,7 +523,7 @@ async fn convert_request(req: Request<Incoming>) -> SbiRequest {
     let mut header = crate::message::SbiHeader::with_method_uri(method, uri);
     header.decompose_uri();
 
-    SbiRequest { header, http }
+    Ok(SbiRequest { header, http })
 }
 
 /// Convert SbiResponse to hyper response
@@ -456,6 +681,12 @@ impl SbiServer {
         let oauth: Option<Arc<OAuthVerifier>> =
             OAuthVerifier::from_config(&self.config).map(Arc::new);
 
+        // Capture the DoS-relevant limits so each spawned connection task gets
+        // a consistently-configured HTTP/2 builder and per-request body cap
+        // (T1.4) without borrowing `self`.
+        let max_request_body_size = self.config.max_request_body_size;
+        let http2_limits = Http2Limits::from_config(&self.config);
+
         // Spawn the server task
         tokio::spawn(async move {
             loop {
@@ -466,7 +697,9 @@ impl SbiServer {
                                 let service = SbiService {
                                     handler: handler.clone(),
                                     oauth: oauth.clone(),
+                                    max_request_body_size,
                                 };
+                                let http2_limits = http2_limits;
 
                                 if let Some(ref acceptor) = tls_acceptor {
                                     let acceptor = acceptor.clone();
@@ -474,11 +707,13 @@ impl SbiServer {
                                         match acceptor.accept(stream).await {
                                             Ok(tls_stream) => {
                                                 let io = TokioIo::new(tls_stream);
-                                                if let Err(e) = http2::Builder::new(
+                                                let mut builder = http2::Builder::new(
                                                     hyper_util::rt::TokioExecutor::new()
-                                                )
-                                                .serve_connection(io, service)
-                                                .await
+                                                );
+                                                http2_limits.apply(&mut builder);
+                                                if let Err(e) = builder
+                                                    .serve_connection(io, service)
+                                                    .await
                                                 {
                                                     eprintln!("HTTP/2 TLS connection error: {e}");
                                                 }
@@ -491,11 +726,13 @@ impl SbiServer {
                                 } else {
                                     let io = TokioIo::new(stream);
                                     tokio::spawn(async move {
-                                        if let Err(e) = http2::Builder::new(
+                                        let mut builder = http2::Builder::new(
                                             hyper_util::rt::TokioExecutor::new()
-                                        )
-                                        .serve_connection(io, service)
-                                        .await
+                                        );
+                                        http2_limits.apply(&mut builder);
+                                        if let Err(e) = builder
+                                            .serve_connection(io, service)
+                                            .await
                                         {
                                             eprintln!("HTTP/2 connection error: {e}");
                                         }
@@ -645,8 +882,8 @@ mod tests {
             ..base.clone()
         };
         assert!(matches!(
-            OAuthVerifier::from_config(&both),
-            Some(OAuthVerifier::Static(_))
+            OAuthVerifier::from_config(&both).map(|v| v.keys),
+            Some(OAuthKeySource::Static(_))
         ));
 
         // URI alone resolves to the live-fetching cache.
@@ -656,9 +893,23 @@ mod tests {
             ..base.clone()
         };
         assert!(matches!(
-            OAuthVerifier::from_config(&uri_only),
-            Some(OAuthVerifier::Remote(_))
+            OAuthVerifier::from_config(&uri_only).map(|v| v.keys),
+            Some(OAuthKeySource::Remote(_))
         ));
+
+        // The expected-audience field flows from config into the verifier.
+        let with_aud = SbiServerConfig {
+            require_oauth2: true,
+            oauth2_jwks: Some(serde_json::json!({"keys": []})),
+            oauth2_expected_audience: Some("UDM".into()),
+            ..base.clone()
+        };
+        assert_eq!(
+            OAuthVerifier::from_config(&with_aud)
+                .and_then(|v| v.expected_audience)
+                .as_deref(),
+            Some("UDM")
+        );
 
         // Enforcement with no key material fails closed.
         let neither = SbiServerConfig {
@@ -666,8 +917,8 @@ mod tests {
             ..base
         };
         assert!(matches!(
-            OAuthVerifier::from_config(&neither),
-            Some(OAuthVerifier::Unconfigured)
+            OAuthVerifier::from_config(&neither).map(|v| v.keys),
+            Some(OAuthKeySource::Unconfigured)
         ));
     }
 
@@ -675,7 +926,10 @@ mod tests {
     async fn test_oauth_verifier_error_classes() {
         // Unconfigured rejects everything with a non-authorization error
         // (mapped to 503), even a syntactically plausible bearer token.
-        let unconfigured = OAuthVerifier::Unconfigured;
+        let unconfigured = OAuthVerifier {
+            keys: OAuthKeySource::Unconfigured,
+            expected_audience: None,
+        };
         let err = unconfigured
             .authorize(Some("Bearer a.b.c"))
             .await
@@ -684,14 +938,20 @@ mod tests {
 
         // A static JWKS that can't verify the token is the caller's fault
         // (AuthorizationFailed, mapped to 401).
-        let static_v = OAuthVerifier::Static(serde_json::json!({"keys": []}));
+        let static_v = OAuthVerifier {
+            keys: OAuthKeySource::Static(serde_json::json!({"keys": []})),
+            expected_audience: None,
+        };
         let err = static_v.authorize(None).await.unwrap_err();
         assert!(matches!(err, SbiError::AuthorizationFailed(_)));
 
         // A remote source that can't be reached is our fault (mapped to 503).
-        let remote = OAuthVerifier::Remote(crate::oauth::JwksCache::new(
-            "http://127.0.0.1:1/nnrf-oauth2/v1/jwks",
-        ));
+        let remote = OAuthVerifier {
+            keys: OAuthKeySource::Remote(crate::oauth::JwksCache::new(
+                "http://127.0.0.1:1/nnrf-oauth2/v1/jwks",
+            )),
+            expected_audience: None,
+        };
         let err = remote.authorize(Some("Bearer a.b.c")).await.unwrap_err();
         assert!(!matches!(err, SbiError::AuthorizationFailed(_)));
     }
@@ -882,5 +1142,178 @@ mod tests {
         assert_eq!(response.http.parts[0].data.as_ref(), nas_bytes);
 
         server.stop().await.expect("value expected");
+    }
+
+    // --- T1.4: request-body size limit ---
+
+    #[test]
+    fn test_default_config_has_dos_limits() {
+        let config = SbiServerConfig::default();
+        assert_eq!(config.max_request_body_size, DEFAULT_MAX_REQUEST_BODY_SIZE);
+        assert_eq!(
+            config.max_concurrent_streams,
+            Some(DEFAULT_MAX_CONCURRENT_STREAMS)
+        );
+        assert_eq!(config.max_frame_size, Some(DEFAULT_MAX_FRAME_SIZE));
+        assert_eq!(
+            config.max_header_list_size,
+            Some(DEFAULT_MAX_HEADER_LIST_SIZE)
+        );
+    }
+
+    /// Pick a free localhost port and start an echo server with the given
+    /// config + handler, returning the bound port.
+    async fn start_test_server<H: SbiRequestHandler>(
+        mut config: SbiServerConfig,
+        handler: H,
+    ) -> (SbiServer, u16) {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("value expected");
+        let port = probe.local_addr().expect("value expected").port();
+        drop(probe);
+        config.addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let server = SbiServer::new(config);
+        server.start(handler).await.expect("value expected");
+        (server, port)
+    }
+
+    #[tokio::test]
+    async fn test_oversize_body_rejected_with_413() {
+        use crate::client::SbiClient;
+
+        // Tiny cap so the test body is unambiguously oversize.
+        let config = SbiServerConfig::default().with_max_request_body_size(64);
+        let (server, port) =
+            start_test_server(config, |_req: SbiRequest| async move { SbiResponse::ok() }).await;
+
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+
+        // A body well over the 64-byte cap is rejected with 413 before the
+        // handler runs.
+        let big = "x".repeat(10_000);
+        let request = SbiRequest::post("/ntest/v1/echo").with_body(&big, "text/plain");
+        let response = client.send_request(request).await.expect("value expected");
+        assert_eq!(response.status, 413);
+        assert_eq!(
+            response.http.get_header("content-type").map(String::as_str),
+            Some("application/problem+json")
+        );
+
+        // A small body under the cap still succeeds (success path preserved).
+        let small = SbiRequest::post("/ntest/v1/echo").with_body("ok", "text/plain");
+        let ok = client.send_request(small).await.expect("value expected");
+        assert_eq!(ok.status, 200);
+
+        server.stop().await.expect("value expected");
+    }
+
+    // --- T1.3: handler panic guard ---
+
+    #[tokio::test]
+    async fn test_catch_handler_panic_unit() {
+        // A panicking future is converted to Err(()).
+        let panicking = async { panic!("boom in handler") };
+        assert!(catch_handler_panic(panicking).await.is_err());
+
+        // A normal future passes its value through.
+        let ok = async { SbiResponse::ok() };
+        let response = catch_handler_panic(ok).await.expect("non-panicking ok");
+        assert_eq!(response.status, 200);
+    }
+
+    #[tokio::test]
+    async fn test_panicking_handler_yields_500() {
+        use crate::client::SbiClient;
+
+        let (server, port) = start_test_server(
+            SbiServerConfig::default(),
+            |_req: SbiRequest| async move {
+                panic!("handler blew up");
+                #[allow(unreachable_code)]
+                SbiResponse::ok()
+            },
+        )
+        .await;
+
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+
+        // First request hits the panicking handler: 500 problem+json, and the
+        // connection task survives (no torn-down connection).
+        let request = SbiRequest::post("/ntest/v1/boom").with_body("{}", "application/json");
+        let response = client.send_request(request).await.expect("value expected");
+        assert_eq!(response.status, 500);
+        assert_eq!(
+            response.http.get_header("content-type").map(String::as_str),
+            Some("application/problem+json")
+        );
+        let problem: serde_json::Value =
+            serde_json::from_str(response.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(problem["status"], 500);
+
+        // A second request still gets a 500 (the server keeps serving rather
+        // than the whole connection dying after the first panic).
+        let again = SbiRequest::post("/ntest/v1/boom").with_body("{}", "application/json");
+        let response2 = client.send_request(again).await.expect("value expected");
+        assert_eq!(response2.status, 500);
+
+        server.stop().await.expect("value expected");
+    }
+
+    // --- T1.2: server-level expected-audience wiring ---
+
+    /// Build an ES256 token with an explicit `aud` plus a matching JWKS.
+    fn token_jwks_with_aud(aud: &str) -> (String, serde_json::Value) {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+
+        let sk = SigningKey::from_slice(&[7u8; 32]).expect("valid scalar");
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","kid":"k1"}"#);
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let claims = serde_json::json!({
+            "iss": "NRF", "sub": "amf-1", "aud": aud, "scope": "nudm-sdm", "exp": exp
+        });
+        let payload = URL_SAFE_NO_PAD.encode(claims.to_string().as_bytes());
+        let sig: Signature = sk.sign(format!("{header}.{payload}").as_bytes());
+        let token = format!("{header}.{payload}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()));
+
+        let point = sk.verifying_key().to_encoded_point(false);
+        let jwks = serde_json::json!({"keys":[{
+            "kty":"EC","crv":"P-256","alg":"ES256","kid":"k1",
+            "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+            "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+        }]});
+        (token, jwks)
+    }
+
+    #[tokio::test]
+    async fn test_server_oauth_audience_enforced() {
+        // Token's aud is "UDM"; the verifier expects "UDM": authorized.
+        let (token, jwks) = token_jwks_with_aud("UDM");
+        let verifier = OAuthVerifier {
+            keys: OAuthKeySource::Static(jwks.clone()),
+            expected_audience: Some("UDM".into()),
+        };
+        let header = format!("Bearer {token}");
+        assert!(verifier.authorize(Some(&header)).await.is_ok());
+
+        // Same token, but the verifier expects "AMF": rejected as
+        // AuthorizationFailed (mapped to 401 on the wire).
+        let wrong = OAuthVerifier {
+            keys: OAuthKeySource::Static(jwks.clone()),
+            expected_audience: Some("AMF".into()),
+        };
+        let err = wrong.authorize(Some(&header)).await.unwrap_err();
+        assert!(matches!(err, SbiError::AuthorizationFailed(_)));
+
+        // No expectation: audience not checked (current behaviour preserved).
+        let none = OAuthVerifier {
+            keys: OAuthKeySource::Static(jwks),
+            expected_audience: None,
+        };
+        assert!(none.authorize(Some(&header)).await.is_ok());
     }
 }

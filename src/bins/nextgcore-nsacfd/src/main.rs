@@ -22,16 +22,73 @@ use clap::Parser;
 use ogs_sbi::client::{SbiClient, SbiClientConfig};
 use ogs_sbi::context::global_context;
 use ogs_sbi::message::{SbiRequest, SbiResponse};
+use ogs_sbi::oauth::{JwksCache, OAuth2Client};
 use ogs_sbi::server::{send_method_not_allowed, SbiServer, SbiServerConfig as OgsSbiServerConfig};
+use ogs_sbi::types::NfType;
+use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 mod context;
 
 pub use context::*;
+
+// ---------------------------------------------------------------------------
+// Typed YAML configuration structs (nsacf.nrf.uri + nsacf.sbi.oauth2.require)
+// ---------------------------------------------------------------------------
+
+/// SBI OAuth2 enforcement knob (`nsacf.sbi.oauth2.require`).
+///
+/// Defaults to disabled so the existing dev/E2E path keeps working without
+/// tokens; the production/docker `nsacf-oauth2.yaml` variant sets it true.
+#[derive(Debug, Default, Deserialize)]
+struct SbiOauth2Yaml {
+    require: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SbiYaml {
+    oauth2: Option<SbiOauth2Yaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct NrfYaml {
+    uri: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct NsacfSection {
+    sbi: Option<SbiYaml>,
+    nrf: Option<NrfYaml>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct NsacfYaml {
+    nsacf: Option<NsacfSection>,
+}
+
+/// Process-wide OAuth2 client for automatic Bearer-token acquisition on
+/// outbound SBI calls (set only when `nsacf.sbi.oauth2.require` is true).
+static OAUTH2_CLIENT: OnceLock<Option<Arc<OAuth2Client>>> = OnceLock::new();
+
+/// The shared OAuth2 client, if SBI OAuth2 enforcement is enabled. Outbound
+/// SBI clients attach tokens via [`attach_oauth2`].
+fn oauth2_client() -> Option<Arc<OAuth2Client>> {
+    OAUTH2_CLIENT.get().and_then(|opt| opt.clone())
+}
+
+/// Attach the process-wide OAuth2 client (when enforcement is on) so the
+/// outbound request carries an NRF-issued Bearer token scoped to `target`.
+/// A no-op when enforcement is off.
+fn attach_oauth2(client: SbiClient, target: NfType) -> SbiClient {
+    match oauth2_client() {
+        Some(oauth2) => client.with_oauth2(oauth2, target),
+        None => client,
+    }
+}
 
 /// Notification client timeouts (bounded; callbacks must not hang the NSACF)
 const NOTIFY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -95,6 +152,12 @@ struct Args {
     /// EAC activation threshold in percent of max UEs (TS 23.502 §4.2.9.5)
     #[arg(long, default_value = "80")]
     eac_threshold: u8,
+
+    /// Force SBI OAuth2 bearer-token enforcement on/off, overriding the
+    /// config file's `nsacf.sbi.oauth2.require`. Dev override; leave unset to
+    /// follow config (default off).
+    #[arg(long)]
+    oauth2_require: Option<bool>,
 }
 
 fn init_logging(level: &str) {
@@ -147,6 +210,30 @@ async fn main() -> Result<()> {
 
     let nf_instance_id = format!("nsacf-{}", uuid::Uuid::new_v4());
 
+    // Parse the config file for the NRF URI and the OAuth2 enforcement knob
+    // (nsacf.sbi.oauth2.require). The CLI --nrf-uri remains the fallback, and
+    // --oauth2-require is a dev override of the config value.
+    let mut nrf_uri_cfg: Option<String> = Some(args.nrf_uri.clone());
+    let mut require_oauth2 = false;
+    if let Ok(content) = std::fs::read_to_string(&args.config) {
+        if let Ok(yaml) = serde_yaml::from_str::<NsacfYaml>(&content) {
+            if let Some(nsacf) = yaml.nsacf {
+                if let Some(uri) = nsacf.nrf.and_then(|n| n.uri) {
+                    nrf_uri_cfg = Some(uri);
+                }
+                require_oauth2 = nsacf
+                    .sbi
+                    .and_then(|s| s.oauth2)
+                    .and_then(|o| o.require)
+                    .unwrap_or(false);
+            }
+        }
+    }
+    // Dev override: --oauth2-require true|false wins over the config value.
+    if let Some(forced) = args.oauth2_require {
+        require_oauth2 = forced;
+    }
+
     // Setup shutdown
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());
@@ -169,6 +256,33 @@ async fn main() -> Result<()> {
         sbi_server_config = sbi_server_config.with_tls(key, cert);
         log::info!("TLS enabled: cert={cert}, key={key}");
     }
+    if require_oauth2 {
+        // Server side (TS 33.501 §13.4.1): verify incoming Bearer tokens
+        // against the NRF's JWKS and require the token's `aud` to include this
+        // NF's own type ("NSACF"). With no NRF URI the server fails closed
+        // (503).
+        sbi_server_config.require_oauth2 = true;
+        sbi_server_config.oauth2_jwks_uri = nrf_uri_cfg
+            .as_deref()
+            .map(|uri| JwksCache::for_nrf(uri).jwks_uri().to_string());
+        sbi_server_config =
+            sbi_server_config.with_expected_audience_nf_type(NfType::Nsacf);
+
+        // Client side (T1.1): install the process-wide OAuth2 client so
+        // outbound SBI calls acquire and attach an NRF-issued Bearer token.
+        if let Some(nrf_uri) = nrf_uri_cfg.as_deref() {
+            let oauth2 =
+                Arc::new(OAuth2Client::new(nrf_uri, nf_instance_id.clone(), NfType::Nsacf));
+            let _ = OAUTH2_CLIENT.set(Some(oauth2));
+        }
+        log::info!(
+            "OAuth2 enforcement enabled (JWKS: {})",
+            sbi_server_config
+                .oauth2_jwks_uri
+                .as_deref()
+                .unwrap_or("UNCONFIGURED")
+        );
+    }
 
     let sbi_server = SbiServer::new(sbi_server_config);
 
@@ -182,9 +296,11 @@ async fn main() -> Result<()> {
     let scheme = if args.tls { "HTTPS" } else { "HTTP" };
     log::info!("SBI HTTP/2 {scheme} server listening on {addr}");
 
-    // Register with NRF
+    // Register with NRF (config URI if present, else the CLI fallback)
     let sbi_ctx = global_context();
-    sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
+    sbi_ctx
+        .set_nrf_uri(nrf_uri_cfg.as_deref().unwrap_or(&args.nrf_uri))
+        .await;
     if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port, &nf_instance_id).await {
         log::warn!("NRF registration failed (will operate without NRF): {e}");
     } else {
@@ -827,6 +943,9 @@ async fn deliver_notification(notification_uri: String, body: serde_json::Value)
             .with_connect_timeout(NOTIFY_CONNECT_TIMEOUT)
             .with_request_timeout(NOTIFY_REQUEST_TIMEOUT),
     );
+    // Slice-event-exposure notifications are consumed by AMFs; attach an
+    // NRF-issued token when OAuth2 enforcement is on (no-op otherwise).
+    let client = attach_oauth2(client, NfType::Amf);
     match client.post_json(&path, &body).await {
         Ok(resp) if resp.status == 204 || resp.is_success() => {
             log::debug!("Notification delivered to {notification_uri}");
@@ -1074,6 +1193,151 @@ mod tests {
             .await
             .expect("server start");
         (server, port)
+    }
+
+    // -----------------------------------------------------------------
+    // OAuth2 enforcement (T1.1): server-side require_oauth2 + aud check
+    // -----------------------------------------------------------------
+
+    /// Mint an ES256 access token (matching the NRF's token shape) with the
+    /// given `aud`, signed by `sk` and tagged with `kid`.
+    fn build_es256_token(sk: &p256::ecdsa::SigningKey, kid: &str, aud: &str) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use p256::ecdsa::{signature::Signer, Signature};
+
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let header = format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{kid}"}}"#);
+        let claims = serde_json::json!({
+            "iss": "NRF", "sub": "amf-1", "aud": aud,
+            "scope": "nnsacf-nsac", "exp": exp, "iat": 0
+        })
+        .to_string();
+        let h = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let p = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        let sig: Signature = sk.sign(format!("{h}.{p}").as_bytes());
+        let s = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        format!("{h}.{p}.{s}")
+    }
+
+    /// Public JWKS for the signing key `sk` under `kid`.
+    fn jwks_for(sk: &p256::ecdsa::SigningKey, kid: &str) -> serde_json::Value {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let point = sk.verifying_key().to_encoded_point(false);
+        serde_json::json!({"keys":[{
+            "kty":"EC","crv":"P-256","use":"sig","alg":"ES256","kid":kid,
+            "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+            "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+        }]})
+    }
+
+    /// Start an NSACF SBI server with OAuth2 enforcement keyed to a static
+    /// JWKS and the NSACF audience.
+    async fn start_nsacf_server_oauth2(jwks: serde_json::Value) -> (SbiServer, u16) {
+        nsacf_context_init(64);
+        let port = free_port();
+        let mut cfg = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], port)));
+        cfg.require_oauth2 = true;
+        cfg.oauth2_jwks = Some(jwks);
+        cfg = cfg.with_expected_audience_nf_type(NfType::Nsacf);
+        let server = SbiServer::new(cfg);
+        server
+            .start(nsacf_sbi_request_handler)
+            .await
+            .expect("server start");
+        (server, port)
+    }
+
+    #[test]
+    fn test_yaml_oauth2_require_parses() {
+        let yaml = "nsacf:\n  sbi:\n    oauth2:\n      require: true\n  nrf:\n    uri: http://nrf:7777\n";
+        let parsed: NsacfYaml = serde_yaml::from_str(yaml).unwrap();
+        let nsacf = parsed.nsacf.unwrap();
+        let require = nsacf
+            .sbi
+            .and_then(|s| s.oauth2)
+            .and_then(|o| o.require)
+            .unwrap_or(false);
+        assert!(require, "oauth2.require should parse to true");
+        assert_eq!(
+            nsacf.nrf.and_then(|n| n.uri).as_deref(),
+            Some("http://nrf:7777")
+        );
+    }
+
+    #[test]
+    fn test_yaml_oauth2_absent_defaults_off() {
+        let yaml = "nsacf:\n  sbi:\n    server:\n      - address: 127.0.0.1\n        port: 7813\n";
+        let parsed: NsacfYaml = serde_yaml::from_str(yaml).unwrap();
+        let require = parsed
+            .nsacf
+            .and_then(|n| n.sbi)
+            .and_then(|s| s.oauth2)
+            .and_then(|o| o.require)
+            .unwrap_or(false);
+        assert!(!require, "absent oauth2 block must default to off");
+    }
+
+    #[tokio::test]
+    async fn test_oauth2_missing_token_rejected() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let (server, port) = start_nsacf_server_oauth2(jwks_for(&sk, "nrf-es256")).await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get("/nnsacf-nsac/v1/slice-quotas"),
+        )
+        .await
+        .expect("bounded")
+        .expect("response");
+        assert_eq!(resp.status, 401, "unauthenticated request must be 401");
+
+        server.stop().await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn test_oauth2_valid_token_accepted() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let (server, port) = start_nsacf_server_oauth2(jwks_for(&sk, "nrf-es256")).await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+
+        // Valid token whose aud includes "NSACF" reaches the handler: the
+        // slice-quota list is served (200), NOT 401/403.
+        let token = build_es256_token(&sk, "nrf-es256", "NSACF");
+        let req = SbiRequest::get("/nnsacf-nsac/v1/slice-quotas")
+            .with_header("Authorization", format!("Bearer {token}"));
+        let resp = tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
+            .await
+            .expect("bounded")
+            .expect("response");
+        assert_eq!(resp.status, 200, "valid token reaches handler (200)");
+
+        server.stop().await.expect("stop");
+    }
+
+    #[tokio::test]
+    async fn test_oauth2_wrong_audience_rejected() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let (server, port) = start_nsacf_server_oauth2(jwks_for(&sk, "nrf-es256")).await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+
+        // Token addressed to a different NF (aud="UDM") is rejected (401).
+        let token = build_es256_token(&sk, "nrf-es256", "UDM");
+        let req = SbiRequest::get("/nnsacf-nsac/v1/slice-quotas")
+            .with_header("Authorization", format!("Bearer {token}"));
+        let resp = tokio::time::timeout(Duration::from_secs(5), client.send_request(req))
+            .await
+            .expect("bounded")
+            .expect("response");
+        assert_eq!(resp.status, 401, "wrong-audience token must be 401");
+
+        server.stop().await.expect("stop");
     }
 
     async fn create_quota(client: &SbiClient, sst: u8, max_ues: u64, max_pdu: u64) {

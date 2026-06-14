@@ -1219,8 +1219,18 @@ pub fn build_message(message: &PfcpMessage, sequence_number: u32, seid: Option<u
 pub fn parse_message(buf: &mut Bytes) -> PfcpResult<(PfcpHeader, PfcpMessage)> {
     let header = PfcpHeader::decode(buf)?;
 
-    // Calculate body length
-    let body_len = header.length as usize - if header.seid_presence { 12 } else { 4 };
+    // The PFCP length field counts every byte after the length field itself:
+    // the mandatory header tail (SEID + sequence + spare = 12 bytes when a SEID
+    // is present, sequence + spare = 4 bytes otherwise) plus the message body.
+    // Reject lengths smaller than that tail before subtracting, so a crafted
+    // short length cannot underflow (debug panic / release wrap).
+    let header_tail = if header.seid_presence { 12 } else { 4 };
+    let body_len = (header.length as usize)
+        .checked_sub(header_tail)
+        .ok_or(PfcpError::BufferTooShort {
+            needed: header_tail,
+            available: header.length as usize,
+        })?;
 
     if buf.remaining() < body_len {
         return Err(PfcpError::BufferTooShort {
@@ -1268,6 +1278,43 @@ mod tests {
         } else {
             panic!("Wrong message type");
         }
+    }
+
+    #[test]
+    fn test_parse_message_undersized_length_errs() {
+        // Craft a header (no SEID) whose length field is smaller than the 4-byte
+        // mandatory header tail. Previously `length - 4` underflowed (debug panic
+        // / release wrap); it must now return a graceful error.
+        // Build a valid header first, then corrupt the length field.
+        let msg = PfcpMessage::HeartbeatRequest(HeartbeatRequest::new(1));
+        let buf = build_message(&msg, 1, None);
+        let mut raw = buf.to_vec();
+        // Length is the u16 at offsets [2..4]. Set it to 1 (< 4-byte tail).
+        raw[2] = 0x00;
+        raw[3] = 0x01;
+        let mut bytes = Bytes::from(raw);
+        let res = parse_message(&mut bytes);
+        assert!(
+            res.is_err(),
+            "undersized PFCP length must error, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_message_undersized_length_with_seid_errs() {
+        // Same check for the SEID-present path (12-byte tail).
+        let msg = PfcpMessage::HeartbeatRequest(HeartbeatRequest::new(1));
+        let buf = build_message(&msg, 1, Some(0x1122334455667788));
+        let mut raw = buf.to_vec();
+        // Set length to 3 (< 12-byte tail).
+        raw[2] = 0x00;
+        raw[3] = 0x03;
+        let mut bytes = Bytes::from(raw);
+        let res = parse_message(&mut bytes);
+        assert!(
+            res.is_err(),
+            "undersized PFCP length (SEID) must error, got {res:?}"
+        );
     }
 
     #[test]

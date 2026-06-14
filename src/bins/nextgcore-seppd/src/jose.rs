@@ -281,6 +281,91 @@ pub fn jws_verify(key: &[u8], jws: &FlatJws) -> Result<Vec<u8>, JoseError> {
     b64url_decode(&jws.payload)
 }
 
+// ============================================================================
+// JWS - flattened JSON serialization, alg "ES256" (asymmetric, ECDSA P-256)
+//
+// TS 33.501 §13.2.4.6 / TS 29.573 §6.3.4: each modificationsBlock entry must
+// be signed with the *asymmetric* key of the SEPP/IPX that created it, and
+// verified against that entity's registered public key. The shared symmetric
+// N32-f session key is reserved for the JWE only; using it for the
+// modificationsBlock JWS would make every entry forgeable by either peer.
+// ============================================================================
+
+use p256::ecdsa::signature::{Signer, Verifier};
+use p256::ecdsa::{Signature as P256Signature, SigningKey, VerifyingKey};
+use p256::pkcs8::{DecodePrivateKey, DecodePublicKey};
+
+/// Sign `payload` as a flattened ES256 (ECDSA P-256 / SHA-256) JWS with the
+/// signer's asymmetric private key.
+pub fn jws_sign_es256(
+    signing_key: &SigningKey,
+    payload: &[u8],
+    kid: Option<&str>,
+) -> Result<FlatJws, JoseError> {
+    let header = JwsHeader {
+        alg: "ES256".to_string(),
+        kid: kid.map(|s| s.to_string()),
+    };
+    let protected = b64url_encode(
+        serde_json::to_string(&header)
+            .map_err(|e| JoseError::Format(e.to_string()))?
+            .as_bytes(),
+    );
+    let payload_b64 = b64url_encode(payload);
+    let signing_input = format!("{protected}.{payload_b64}");
+    // ES256 JWS signature is the raw R||S (64 bytes) per RFC 7518 §3.4.
+    let sig: P256Signature = signing_key.sign(signing_input.as_bytes());
+    let sig_bytes = sig.to_bytes();
+    Ok(FlatJws {
+        protected,
+        payload: payload_b64,
+        signature: b64url_encode(&sig_bytes),
+    })
+}
+
+/// Verify a flattened ES256 JWS against the signer's public key and return
+/// the raw payload bytes. Rejects any alg other than ES256.
+pub fn jws_verify_es256(
+    verifying_key: &VerifyingKey,
+    jws: &FlatJws,
+) -> Result<Vec<u8>, JoseError> {
+    let header_bytes = b64url_decode(&jws.protected)?;
+    let header: JwsHeader = serde_json::from_slice(&header_bytes)
+        .map_err(|e| JoseError::Format(format!("JWS header: {e}")))?;
+    if header.alg != "ES256" {
+        return Err(JoseError::UnsupportedAlgorithm(header.alg));
+    }
+    let sig_bytes = b64url_decode(&jws.signature)?;
+    let signature =
+        P256Signature::try_from(sig_bytes.as_slice()).map_err(|_| JoseError::Tampered)?;
+    let signing_input = format!("{}.{}", jws.protected, jws.payload);
+    verifying_key
+        .verify(signing_input.as_bytes(), &signature)
+        .map_err(|_| JoseError::Tampered)?;
+    b64url_decode(&jws.payload)
+}
+
+/// Parse a PEM-encoded PKCS#8 ECDSA P-256 private key.
+pub fn parse_es256_private_key_pem(pem: &str) -> Result<SigningKey, JoseError> {
+    SigningKey::from_pkcs8_pem(pem)
+        .map_err(|e| JoseError::Crypto(format!("bad ES256 private key PEM: {e}")))
+}
+
+/// Parse a PEM-encoded SubjectPublicKeyInfo ECDSA P-256 public key.
+pub fn parse_es256_public_key_pem(pem: &str) -> Result<VerifyingKey, JoseError> {
+    VerifyingKey::from_public_key_pem(pem)
+        .map_err(|e| JoseError::Crypto(format!("bad ES256 public key PEM: {e}")))
+}
+
+/// Read the `kid` and `alg` header of a flattened JWS without verifying it.
+/// Used to locate the registered public key for the entity that signed it.
+pub fn jws_peek_header(jws: &FlatJws) -> Result<(String, Option<String>), JoseError> {
+    let header_bytes = b64url_decode(&jws.protected)?;
+    let header: JwsHeader = serde_json::from_slice(&header_bytes)
+        .map_err(|e| JoseError::Format(format!("JWS header: {e}")))?;
+    Ok((header.alg, header.kid))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,5 +517,72 @@ mod tests {
         for data in [&b""[..], b"f", b"fo", b"foo", b"foobar", &[0u8, 255, 128]] {
             assert_eq!(b64url_decode(&b64url_encode(data)).unwrap(), data);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // ES256 asymmetric JWS (TS 33.501 §13.2.4.6)
+    // ------------------------------------------------------------------
+
+    fn es256_keypair() -> (SigningKey, VerifyingKey) {
+        // p256 expects rand_core 0.6's OsRng (re-exported via elliptic-curve),
+        // distinct from the workspace `rand` 0.9 OsRng.
+        use p256::elliptic_curve::rand_core::OsRng;
+        let sk = SigningKey::random(&mut OsRng);
+        let vk = *sk.verifying_key();
+        (sk, vk)
+    }
+
+    #[test]
+    fn es256_jws_roundtrip() {
+        let (sk, vk) = es256_keypair();
+        let jws = jws_sign_es256(&sk, b"{\"op\":\"replace\"}", Some("sepp-a")).unwrap();
+        let (alg, kid) = jws_peek_header(&jws).unwrap();
+        assert_eq!(alg, "ES256");
+        assert_eq!(kid.as_deref(), Some("sepp-a"));
+        let payload = jws_verify_es256(&vk, &jws).unwrap();
+        assert_eq!(payload, b"{\"op\":\"replace\"}");
+    }
+
+    #[test]
+    fn es256_jws_tampered_payload_rejected() {
+        let (sk, vk) = es256_keypair();
+        let mut jws = jws_sign_es256(&sk, b"original", None).unwrap();
+        jws.payload = b64url_encode(b"modified");
+        assert_eq!(jws_verify_es256(&vk, &jws), Err(JoseError::Tampered));
+    }
+
+    #[test]
+    fn es256_jws_wrong_key_rejected() {
+        let (sk, _vk) = es256_keypair();
+        let (_sk2, vk2) = es256_keypair();
+        let jws = jws_sign_es256(&sk, b"original", None).unwrap();
+        // Signed by sk, but verified against an unrelated public key
+        assert_eq!(jws_verify_es256(&vk2, &jws), Err(JoseError::Tampered));
+    }
+
+    #[test]
+    fn es256_jws_rejects_hs256_alg() {
+        // An HS256 (symmetric) JWS must NOT verify under the ES256 path:
+        // this prevents algorithm-confusion / symmetric-key forgery.
+        let (_sk, vk) = es256_keypair();
+        let hs = jws_sign(&[7u8; 32], b"forged", None).unwrap();
+        assert!(matches!(
+            jws_verify_es256(&vk, &hs),
+            Err(JoseError::UnsupportedAlgorithm(_))
+        ));
+    }
+
+    #[test]
+    fn es256_pem_roundtrip() {
+        use p256::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+        let (sk, vk) = es256_keypair();
+        let sk_pem = sk.to_pkcs8_pem(LineEnding::LF).unwrap();
+        let vk_pem = vk.to_public_key_pem(LineEnding::LF).unwrap();
+
+        let sk2 = parse_es256_private_key_pem(&sk_pem).unwrap();
+        let vk2 = parse_es256_public_key_pem(&vk_pem).unwrap();
+
+        let jws = jws_sign_es256(&sk2, b"payload", None).unwrap();
+        assert_eq!(jws_verify_es256(&vk2, &jws).unwrap(), b"payload");
     }
 }

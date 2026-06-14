@@ -17,8 +17,79 @@
 //! exchange-params handshake (see `n32c_handler::derive_n32f_session_key`).
 
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock, RwLock};
+
+use p256::ecdsa::{SigningKey, VerifyingKey};
 
 use crate::jose::{self, b64url_decode, b64url_encode, FlatJwe, FlatJws, JoseError, JWE_KEY_LEN};
+
+// ============================================================================
+// Asymmetric (ES256) identity key store (TS 33.501 §13.2.4.6)
+//
+// The SEPP has a single asymmetric identity used to sign the first
+// modificationsBlock entry of every message it originates. Peer-SEPP and
+// IPX public keys are registered by identity FQDN so received
+// modificationsBlock entries can be verified against the correct key.
+// ============================================================================
+
+struct Es256KeyStore {
+    /// This SEPP's own ES256 signing key (its asymmetric identity)
+    local_signing_key: Option<Arc<SigningKey>>,
+    /// Registered ES256 public keys of peers/IPX, keyed by identity FQDN
+    verifying_keys: HashMap<String, VerifyingKey>,
+}
+
+fn es256_store() -> &'static RwLock<Es256KeyStore> {
+    static STORE: OnceLock<RwLock<Es256KeyStore>> = OnceLock::new();
+    STORE.get_or_init(|| {
+        RwLock::new(Es256KeyStore {
+            local_signing_key: None,
+            verifying_keys: HashMap::new(),
+        })
+    })
+}
+
+/// Install this SEPP's own ES256 signing key (its asymmetric identity for
+/// signing modificationsBlock entries). Loaded from PEM at startup.
+pub fn set_local_signing_key(key: SigningKey) {
+    if let Ok(mut store) = es256_store().write() {
+        store.local_signing_key = Some(Arc::new(key));
+    }
+}
+
+/// Get this SEPP's own ES256 signing key, if configured.
+pub fn local_signing_key() -> Option<Arc<SigningKey>> {
+    es256_store()
+        .read()
+        .ok()
+        .and_then(|s| s.local_signing_key.clone())
+}
+
+/// Register a peer/IPX ES256 public key under its identity FQDN.
+pub fn register_verifying_key(identity: impl Into<String>, key: VerifyingKey) {
+    if let Ok(mut store) = es256_store().write() {
+        store.verifying_keys.insert(identity.into(), key);
+    }
+}
+
+/// Snapshot of all registered verifying keys (for building a PrinsContext).
+pub fn all_verifying_keys() -> HashMap<String, VerifyingKey> {
+    es256_store()
+        .read()
+        .map(|s| s.verifying_keys.clone())
+        .unwrap_or_default()
+}
+
+/// Generate a fresh ES256 identity keypair, install the private half as this
+/// SEPP's local signing key, and return the public key (for tests / when no
+/// PEM key is provisioned). Self-signed asymmetric identity.
+pub fn generate_local_identity() -> VerifyingKey {
+    use p256::elliptic_curve::rand_core::OsRng;
+    let sk = SigningKey::random(&mut OsRng);
+    let vk = *sk.verifying_key();
+    set_local_signing_key(sk);
+    vk
+}
 
 // ============================================================================
 // Data-type / protection-policy profiles (TS 29.573 sec 6.1.5.3.4)
@@ -53,7 +124,14 @@ pub struct ModificationPolicy {
 }
 
 /// PRINS security context for an established N32-f connection.
-#[derive(Debug, Clone)]
+///
+/// The symmetric `session_key` is used **only** for the JWE
+/// (confidentiality + integrity of the protected payload). The
+/// modificationsBlock JWS chain is signed/verified with *asymmetric* keys
+/// (TS 33.501 §13.2.4.6): each SEPP/IPX signs its own entry with its
+/// private key, and every entry is verified against the registered public
+/// key for the entity that created it.
+#[derive(Clone)]
 pub struct PrinsContext {
     /// N32-f context ID allocated by the local SEPP (peer puts this into
     /// the metaData of messages it sends to us)
@@ -61,16 +139,44 @@ pub struct PrinsContext {
     /// N32-f context ID allocated by the peer SEPP (we put this into the
     /// metaData of messages we send to the peer)
     pub peer_context_id: String,
-    /// Session key established during the N32-c exchange-params handshake
+    /// Session key established during the N32-c exchange-params handshake.
+    /// Reserved for the JWE only (never the modificationsBlock JWS).
     pub session_key: [u8; JWE_KEY_LEN],
     /// Key identifier (kid) for the session key
     pub kid: String,
     /// This SEPP's FQDN (JWS identity of locally created modification entries)
     pub local_fqdn: String,
+    /// This SEPP's asymmetric (ES256) signing key, used to sign the first
+    /// modificationsBlock entry. `None` => this SEPP cannot originate
+    /// PRINS-protected messages with a signed modifications chain.
+    pub local_signing_key: Option<Arc<SigningKey>>,
+    /// Registered ES256 public keys of peers/IPX intermediaries, keyed by
+    /// their identity FQDN (== the JWS `kid` / modificationsBlock identity).
+    /// A modificationsBlock entry is rejected unless the signer's public
+    /// key is registered here.
+    pub peer_verifying_keys: HashMap<String, VerifyingKey>,
     /// Data-type profiles agreed during the N32-c handshake
     pub profiles: Vec<DataTypeProfile>,
     /// Modification policy agreed during the N32-c handshake
     pub modification_policy: ModificationPolicy,
+}
+
+impl std::fmt::Debug for PrinsContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrinsContext")
+            .field("local_context_id", &self.local_context_id)
+            .field("peer_context_id", &self.peer_context_id)
+            .field("kid", &self.kid)
+            .field("local_fqdn", &self.local_fqdn)
+            .field("has_local_signing_key", &self.local_signing_key.is_some())
+            .field(
+                "registered_verifying_keys",
+                &self.peer_verifying_keys.keys().collect::<Vec<_>>(),
+            )
+            .field("profiles", &self.profiles)
+            .field("modification_policy", &self.modification_policy)
+            .finish()
+    }
 }
 
 impl PrinsContext {
@@ -87,11 +193,26 @@ impl PrinsContext {
             session_key,
             kid: kid.into(),
             local_fqdn: local_fqdn.into(),
+            local_signing_key: None,
+            peer_verifying_keys: HashMap::new(),
             profiles: Vec::new(),
             modification_policy: ModificationPolicy::default(),
         };
         ctx.add_default_profiles();
         ctx
+    }
+
+    /// Install this SEPP's asymmetric (ES256) signing key for originating
+    /// PRINS-protected messages.
+    pub fn with_signing_key(mut self, key: Arc<SigningKey>) -> Self {
+        self.local_signing_key = Some(key);
+        self
+    }
+
+    /// Register a peer/IPX ES256 public key under its identity FQDN. The
+    /// modificationsBlock JWS for that identity is verified against it.
+    pub fn register_verifying_key(&mut self, identity: impl Into<String>, key: VerifyingKey) {
+        self.peer_verifying_keys.insert(identity.into(), key);
     }
 
     /// Add default data-type profiles for common 5G APIs
@@ -415,7 +536,13 @@ pub fn protect_message(
     )?;
 
     // First modificationsBlock entry: signed by the sending SEPP over the
-    // JWE tag (binds the chain to this exact protected message).
+    // JWE tag (binds the chain to this exact protected message). Per
+    // TS 33.501 §13.2.4.6 this uses the SEPP's *asymmetric* (ES256) key,
+    // keyed (kid) by its identity FQDN so the receiver can locate the
+    // public key. The symmetric session key is NOT used here.
+    let signing_key = ctx.local_signing_key.as_ref().ok_or_else(|| {
+        JoseError::Crypto("no local ES256 signing key for modificationsBlock".into())
+    })?;
     let mods_payload = ModificationsBlockPayload {
         identity: ctx.local_fqdn.clone(),
         operations: Vec::new(),
@@ -423,7 +550,7 @@ pub fn protect_message(
     };
     let mods_bytes =
         serde_json::to_vec(&mods_payload).map_err(|e| JoseError::Format(e.to_string()))?;
-    let jws = jose::jws_sign(&ctx.session_key, &mods_bytes, Some(&ctx.kid))?;
+    let jws = jose::jws_sign_es256(signing_key, &mods_bytes, Some(&ctx.local_fqdn))?;
 
     log::info!(
         "PRINS protect: {} {} ({} encrypted IEs, msg_id in AAD)",
@@ -510,13 +637,54 @@ pub fn unprotect_message(
     let mut operations: Vec<serde_json::Value> = Vec::new();
     let mut expected_tag = msg.reformatted_data.tag.clone();
     for (i, jws) in msg.modifications_block.iter().enumerate() {
-        let payload_bytes = jose::jws_verify(&ctx.session_key, jws).map_err(|e| {
+        // Locate the signer's registered ES256 public key by the JWS `kid`
+        // (== signer identity FQDN). An unregistered or non-ES256 entry is
+        // rejected: the symmetric session key is NOT accepted for the
+        // modificationsBlock (TS 33.501 §13.2.4.6).
+        let (alg, kid) = jose::jws_peek_header(jws).map_err(|e| {
+            let mut err = N32fUnprotectError::new(
+                N32fErrorType::IntegrityCheckOnModificationsFailed,
+                Some(message_id.clone()),
+                format!("modificationsBlock[{i}] header: {e}"),
+            );
+            err.failed_modifications.push(format!("entry-{i}"));
+            err
+        })?;
+        if alg != "ES256" {
+            let mut err = N32fUnprotectError::new(
+                N32fErrorType::IntegrityCheckOnModificationsFailed,
+                Some(message_id.clone()),
+                format!("modificationsBlock[{i}] uses non-asymmetric alg [{alg}]"),
+            );
+            err.failed_modifications
+                .push(kid.unwrap_or_else(|| format!("entry-{i}")));
+            return Err(err);
+        }
+        let signer_id = kid.ok_or_else(|| {
+            let mut err = N32fUnprotectError::new(
+                N32fErrorType::IntegrityCheckOnModificationsFailed,
+                Some(message_id.clone()),
+                format!("modificationsBlock[{i}] missing signer kid"),
+            );
+            err.failed_modifications.push(format!("entry-{i}"));
+            err
+        })?;
+        let verifying_key = ctx.peer_verifying_keys.get(&signer_id).ok_or_else(|| {
+            let mut err = N32fUnprotectError::new(
+                N32fErrorType::IntegrityCheckOnModificationsFailed,
+                Some(message_id.clone()),
+                format!("modificationsBlock[{i}] signer [{signer_id}] has no registered key"),
+            );
+            err.failed_modifications.push(signer_id.clone());
+            err
+        })?;
+        let payload_bytes = jose::jws_verify_es256(verifying_key, jws).map_err(|e| {
             let mut err = N32fUnprotectError::new(
                 N32fErrorType::IntegrityCheckOnModificationsFailed,
                 Some(message_id.clone()),
                 format!("modificationsBlock[{i}]: {e}"),
             );
-            err.failed_modifications.push(format!("entry-{i}"));
+            err.failed_modifications.push(signer_id.clone());
             err
         })?;
         let payload: ModificationsBlockPayload =
@@ -527,6 +695,19 @@ pub fn unprotect_message(
                     format!("modificationsBlock[{i}] payload: {e}"),
                 )
             })?;
+        // Bind the signed identity to the key used to verify it.
+        if payload.identity != signer_id {
+            let mut err = N32fUnprotectError::new(
+                N32fErrorType::IntegrityCheckOnModificationsFailed,
+                Some(message_id.clone()),
+                format!(
+                    "modificationsBlock[{i}] identity [{}] != kid [{signer_id}]",
+                    payload.identity
+                ),
+            );
+            err.failed_modifications.push(payload.identity.clone());
+            return Err(err);
+        }
         // Chain check: entry must reference the JWE tag (first) or the
         // previous entry's signature.
         if payload.tag != expected_tag {
@@ -739,25 +920,38 @@ pub fn generate_n32f_context_id() -> String {
 mod tests {
     use super::*;
 
-    fn test_ctx() -> PrinsContext {
-        PrinsContext::new(
-            "ctx-local-1111",
-            "ctx-peer-2222",
-            [0x42u8; 32],
-            "kid-test",
-            "sepp.home.example.com",
-        )
+    const SENDER_FQDN: &str = "sepp.home.example.com";
+    const RECEIVER_FQDN: &str = "sepp.visited.example.com";
+
+    fn es256_keypair() -> (Arc<SigningKey>, VerifyingKey) {
+        use p256::elliptic_curve::rand_core::OsRng;
+        let sk = SigningKey::random(&mut OsRng);
+        let vk = *sk.verifying_key();
+        (Arc::new(sk), vk)
     }
 
-    /// The receiving side of the pair above (keys equal, context IDs mirrored)
-    fn receiver_ctx() -> PrinsContext {
-        PrinsContext::new(
+    /// Build a sender/receiver PrinsContext pair sharing the JWE session key,
+    /// with the sender's ES256 signing key installed and its public key
+    /// registered (under the sender FQDN) on the receiver.
+    fn ctx_pair() -> (PrinsContext, PrinsContext) {
+        let (sender_sk, sender_vk) = es256_keypair();
+        let sender = PrinsContext::new(
+            "ctx-local-1111",
+            "ctx-peer-2222",
+            [0x42u8; 32],
+            "kid-test",
+            SENDER_FQDN,
+        )
+        .with_signing_key(sender_sk);
+        let mut receiver = PrinsContext::new(
             "ctx-peer-2222",
             "ctx-local-1111",
             [0x42u8; 32],
             "kid-test",
-            "sepp.visited.example.com",
-        )
+            RECEIVER_FQDN,
+        );
+        receiver.register_verifying_key(SENDER_FQDN, sender_vk);
+        (sender, receiver)
     }
 
     fn sample_body() -> Vec<u8> {
@@ -771,8 +965,7 @@ mod tests {
 
     #[test]
     fn protect_unprotect_roundtrip() {
-        let sender = test_ctx();
-        let receiver = receiver_ctx();
+        let (sender, receiver) = ctx_pair();
         let headers = vec![("content-type".to_string(), "application/json".to_string())];
 
         let msg = protect_message(
@@ -804,8 +997,7 @@ mod tests {
 
     #[test]
     fn tampered_aad_detected_as_integrity_failure() {
-        let sender = test_ctx();
-        let receiver = receiver_ctx();
+        let (sender, receiver) = ctx_pair();
         let mut msg = protect_message(
             &sender,
             "POST",
@@ -827,8 +1019,7 @@ mod tests {
 
     #[test]
     fn tampered_ciphertext_detected() {
-        let sender = test_ctx();
-        let receiver = receiver_ctx();
+        let (sender, receiver) = ctx_pair();
         let mut msg = protect_message(
             &sender,
             "POST",
@@ -847,8 +1038,7 @@ mod tests {
 
     #[test]
     fn tampered_modifications_chain_detected() {
-        let sender = test_ctx();
-        let receiver = receiver_ctx();
+        let (sender, receiver) = ctx_pair();
         let mut msg = protect_message(
             &sender,
             "POST",
@@ -877,11 +1067,135 @@ mod tests {
         assert!(!err.failed_modifications.is_empty());
     }
 
+    /// CORE C7 PROPERTY: a modificationsBlock entry forged with the *shared
+    /// symmetric session key* (HS256) — which both peers know — must be
+    /// rejected. Only the SEPP's asymmetric (ES256) key may sign its entry.
+    #[test]
+    fn symmetric_key_forged_first_entry_rejected() {
+        let (sender, receiver) = ctx_pair();
+
+        // Build a legitimately-encrypted message, then REPLACE the first
+        // (asymmetric) entry with one forged using the shared session key.
+        let mut msg = protect_message(
+            &sender,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
+
+        let forged_payload = ModificationsBlockPayload {
+            identity: SENDER_FQDN.to_string(),
+            operations: Vec::new(),
+            tag: msg.reformatted_data.tag.clone(),
+        };
+        // Attacker knows the symmetric session key (it's shared) and forges
+        // an HS256 JWS — this is exactly the pre-fix forgery.
+        let forged = jose::jws_sign(
+            &receiver.session_key,
+            &serde_json::to_vec(&forged_payload).unwrap(),
+            Some(SENDER_FQDN),
+        )
+        .unwrap();
+        msg.modifications_block[0] = forged;
+
+        let err = unprotect_message(&receiver, &msg).unwrap_err();
+        // The HS256 alg is refused outright for the modificationsBlock.
+        assert_eq!(
+            err.error_type,
+            N32fErrorType::IntegrityCheckOnModificationsFailed
+        );
+        assert!(err.detail.contains("non-asymmetric") || err.detail.contains("ES256"));
+    }
+
+    /// An entry from an entity whose public key is NOT registered must be
+    /// rejected even if the ES256 signature is internally valid.
+    #[test]
+    fn unregistered_signer_rejected() {
+        let (sender, receiver) = ctx_pair(); // does not know "rogue-ipx"
+        let (rogue_sk, _rogue_vk) = es256_keypair();
+
+        let mut msg = protect_message(
+            &sender,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
+        let prev_sig = msg.modifications_block[0].signature.clone();
+        let payload = ModificationsBlockPayload {
+            identity: "rogue-ipx.example.com".to_string(),
+            operations: Vec::new(),
+            tag: prev_sig,
+        };
+        let jws = jose::jws_sign_es256(
+            &rogue_sk,
+            &serde_json::to_vec(&payload).unwrap(),
+            Some("rogue-ipx.example.com"),
+        )
+        .unwrap();
+        msg.modifications_block.push(jws);
+
+        let err = unprotect_message(&receiver, &msg).unwrap_err();
+        assert_eq!(
+            err.error_type,
+            N32fErrorType::IntegrityCheckOnModificationsFailed
+        );
+        assert!(err.detail.contains("no registered key"));
+    }
+
+    /// An entry whose JWS `kid` (verified-against key) disagrees with the
+    /// signed `identity` in the payload is rejected (identity binding).
+    #[test]
+    fn identity_kid_mismatch_rejected() {
+        let (sender, mut receiver) = ctx_pair();
+        let (ipx_sk, ipx_vk) = es256_keypair();
+        // Register the IPX key under its real identity...
+        receiver.register_verifying_key("ipx-real.example.com", ipx_vk);
+
+        let mut msg = protect_message(
+            &sender,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
+        let prev_sig = msg.modifications_block[0].signature.clone();
+        // ...but the payload claims a DIFFERENT identity than the kid.
+        let payload = ModificationsBlockPayload {
+            identity: "someone-else.example.com".to_string(),
+            operations: Vec::new(),
+            tag: prev_sig,
+        };
+        let jws = jose::jws_sign_es256(
+            &ipx_sk,
+            &serde_json::to_vec(&payload).unwrap(),
+            Some("ipx-real.example.com"),
+        )
+        .unwrap();
+        msg.modifications_block.push(jws);
+
+        let err = unprotect_message(&receiver, &msg).unwrap_err();
+        assert_eq!(
+            err.error_type,
+            N32fErrorType::IntegrityCheckOnModificationsFailed
+        );
+        assert!(err.detail.contains("identity"));
+    }
+
     #[test]
     fn modification_chain_with_valid_allowed_patch_applies() {
-        let sender = test_ctx();
-        let mut receiver = receiver_ctx();
+        let (sender, mut receiver) = ctx_pair();
         receiver.modification_policy.allowed_paths = vec!["/nssai/sst".to_string()];
+
+        // An IPX intermediary has its own asymmetric keypair; the receiver
+        // must have its public key registered under the IPX identity.
+        let (ipx_sk, ipx_vk) = es256_keypair();
+        let ipx_id = "ipx1.example.com";
+        receiver.register_verifying_key(ipx_id, ipx_vk);
 
         let mut msg = protect_message(
             &sender,
@@ -892,17 +1206,18 @@ mod tests {
         )
         .unwrap();
 
-        // A (key-holding) intermediary appends a chained, signed patch entry
+        // The IPX appends a chained entry signed with ITS OWN asymmetric key
+        // (kid = its identity FQDN), referencing the previous entry's sig.
         let prev_sig = msg.modifications_block[0].signature.clone();
         let patch_payload = ModificationsBlockPayload {
-            identity: "ipx1.example.com".to_string(),
+            identity: ipx_id.to_string(),
             operations: vec![serde_json::json!({"op":"replace","path":"/nssai/sst","value":7})],
             tag: prev_sig,
         };
-        let jws = jose::jws_sign(
-            &sender.session_key,
+        let jws = jose::jws_sign_es256(
+            &ipx_sk,
             &serde_json::to_vec(&patch_payload).unwrap(),
-            Some("kid-test"),
+            Some(ipx_id),
         )
         .unwrap();
         msg.modifications_block.push(jws);
@@ -916,8 +1231,13 @@ mod tests {
 
     #[test]
     fn modification_violating_policy_rejected() {
-        let sender = test_ctx();
-        let receiver = receiver_ctx(); // empty policy: nothing modifiable
+        let (sender, mut receiver) = ctx_pair(); // empty policy: nothing modifiable
+
+        // The IPX's key is registered (so the entry verifies) but the empty
+        // policy must still reject the requested modification.
+        let (ipx_sk, ipx_vk) = es256_keypair();
+        let ipx_id = "ipx1.example.com";
+        receiver.register_verifying_key(ipx_id, ipx_vk);
 
         let mut msg = protect_message(
             &sender,
@@ -929,14 +1249,14 @@ mod tests {
         .unwrap();
         let prev_sig = msg.modifications_block[0].signature.clone();
         let patch_payload = ModificationsBlockPayload {
-            identity: "ipx1.example.com".to_string(),
+            identity: ipx_id.to_string(),
             operations: vec![serde_json::json!({"op":"replace","path":"/nssai/sst","value":7})],
             tag: prev_sig,
         };
-        let jws = jose::jws_sign(
-            &sender.session_key,
+        let jws = jose::jws_sign_es256(
+            &ipx_sk,
             &serde_json::to_vec(&patch_payload).unwrap(),
-            None,
+            Some(ipx_id),
         )
         .unwrap();
         msg.modifications_block.push(jws);
@@ -947,8 +1267,7 @@ mod tests {
 
     #[test]
     fn wrong_session_key_detected() {
-        let sender = test_ctx();
-        let mut receiver = receiver_ctx();
+        let (sender, mut receiver) = ctx_pair();
         receiver.session_key = [0x43u8; 32];
 
         let msg = protect_message(
@@ -960,17 +1279,15 @@ mod tests {
         )
         .unwrap();
         let err = unprotect_message(&receiver, &msg).unwrap_err();
-        // JWS chain is checked first and fails under the wrong key
-        assert_eq!(
-            err.error_type,
-            N32fErrorType::IntegrityCheckOnModificationsFailed
-        );
+        // The modificationsBlock JWS now uses the *asymmetric* key, so the
+        // chain check passes; the wrong symmetric session key is caught at
+        // the JWE AEAD step instead.
+        assert_eq!(err.error_type, N32fErrorType::IntegrityCheckFailed);
     }
 
     #[test]
     fn unknown_context_id_rejected() {
-        let sender = test_ctx();
-        let mut receiver = receiver_ctx();
+        let (sender, mut receiver) = ctx_pair();
         receiver.local_context_id = "ctx-other-9999".to_string();
 
         let msg = protect_message(
@@ -987,8 +1304,7 @@ mod tests {
 
     #[test]
     fn non_json_body_roundtrip() {
-        let sender = test_ctx();
-        let receiver = receiver_ctx();
+        let (sender, receiver) = ctx_pair();
         let raw = b"\x00\x01binary payload\xff";
         let msg =
             protect_message(&sender, "PUT", "/nsmf-pdusession/v1/sm", &[], Some(raw)).unwrap();

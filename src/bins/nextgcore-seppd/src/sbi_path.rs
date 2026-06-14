@@ -310,13 +310,20 @@ pub fn build_prins_context(node_id: u64) -> Option<crate::prins::PrinsContext> {
         let local_fqdn = context.sender.clone().unwrap_or_default();
         (security, local_fqdn)
     };
-    Some(crate::prins::PrinsContext::new(
+    let mut prins_ctx = crate::prins::PrinsContext::new(
         security.local_context_id,
         security.peer_context_id,
         security.session_key,
         security.kid,
         local_fqdn,
-    ))
+    );
+    // Install our asymmetric signing identity (for the first modificationsBlock
+    // entry) and the registered peer/IPX verifying keys (TS 33.501 §13.2.4.6).
+    if let Some(key) = crate::prins::local_signing_key() {
+        prins_ctx.local_signing_key = Some(key);
+    }
+    prins_ctx.peer_verifying_keys = crate::prins::all_verifying_keys();
+    Some(prins_ctx)
 }
 
 /// Async N32f forwarding - sends the request via HTTP/2 to the peer SEPP.
@@ -639,6 +646,26 @@ fn remove_assoc(assoc_id: u64) {
     let _ = ctx.read().map(|context| {
         context.assoc_remove(assoc_id);
     });
+}
+
+/// Select the peer SEPP that serves the VPLMN named by `target_apiroot`.
+/// Used by the consumer-facing SBI server's forwarding pipeline (C8):
+/// VPLMN detect -> peer SEPP select. Returns an error string suitable for an
+/// SBI problem-details `detail` if the target is not a VPLMN or no peer SEPP
+/// serves it.
+pub fn select_peer_for_target(target_apiroot: &str) -> Result<crate::context::SeppNode, String> {
+    if !is_fqdn_in_vplmn(target_apiroot) {
+        return Err(format!(
+            "target-apiRoot [{target_apiroot}] is not in a visited PLMN"
+        ));
+    }
+    let (mcc, mnc) = extract_plmn_from_fqdn(target_apiroot);
+    let ctx = sepp_self();
+    let node = ctx
+        .read()
+        .ok()
+        .and_then(|context| context.node_find_by_plmn_id(mcc, mnc));
+    node.ok_or_else(|| format!("No peer SEPP for VPLMN {mcc}:{mnc} ([{target_apiroot}])"))
 }
 
 /// Check if FQDN is in VPLMN (visited PLMN)

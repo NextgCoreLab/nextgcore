@@ -365,6 +365,74 @@ pub fn build_client_config_mtls_with_pqc(
     Ok(config)
 }
 
+// ============================================================================
+// TLS exporter (RFC 5705) — N32-f session-key derivation dependency (B2/SEPP)
+// ============================================================================
+
+/// RFC 5705 / TS 33.501 §13.2.4.4 exporter label SEPP uses to derive the
+/// N32-f PRINS session key from the N32-c TLS connection. B2 should pass this
+/// as the `label` to [`export_keying_material`].
+pub const N32F_EXPORTER_LABEL: &[u8] = b"EXPORTER-3GPP-N32f-Session-Key";
+
+/// Default length, in bytes, of the keying material SEPP exports for the
+/// N32-f session key (256-bit / AES-256-GCM-class secret).
+pub const N32F_EXPORTER_KEY_LEN: usize = 32;
+
+/// Export `len` bytes of keying material from an established rustls connection
+/// per RFC 5705 ("Keying Material Exporters for TLS").
+///
+/// This is the additive accessor B2 (SEPP) must call to derive the N32-f
+/// session key from the N32-c TLS exporter (TS 33.501 §13.2.4.4), replacing
+/// the random-nonce HKDF deviation documented in
+/// `seppd::n32c_handler::derive_n32f_session_key`.
+///
+/// `conn` is the rustls connection obtained from the established TLS stream —
+/// e.g. `tokio_rustls::server::TlsStream::get_ref().1` (a `&ServerConnection`)
+/// or `client::TlsStream::get_ref().1` (a `&ClientConnection`). Both deref to
+/// [`rustls::ConnectionCommon`], which carries `export_keying_material`.
+///
+/// `label` is the exporter label (use [`N32F_EXPORTER_LABEL`] for N32-f) and
+/// `context` is the optional RFC 5705 context value. Fails if called before
+/// the handshake completes or if `len` is zero.
+///
+/// # Example (what B2 should call)
+/// ```ignore
+/// // after `acceptor.accept(tcp).await?` yields a server TlsStream `tls`:
+/// let (_io, conn) = tls.get_ref();
+/// let key = ogs_sbi::tls::export_keying_material(
+///     conn,
+///     ogs_sbi::tls::N32F_EXPORTER_LABEL,
+///     None,
+///     ogs_sbi::tls::N32F_EXPORTER_KEY_LEN,
+/// )?;
+/// ```
+pub fn export_keying_material<Data>(
+    conn: &rustls::ConnectionCommon<Data>,
+    label: &[u8],
+    context: Option<&[u8]>,
+    len: usize,
+) -> SbiResult<Vec<u8>> {
+    if len == 0 {
+        return Err(SbiError::TlsError(
+            "export_keying_material: requested length must be non-zero".into(),
+        ));
+    }
+    let output = vec![0u8; len];
+    conn.export_keying_material(output, label, context)
+        .map_err(|e| SbiError::TlsError(format!("TLS keying-material export failed: {e}")))
+}
+
+/// Convenience wrapper deriving the N32-f session key from an N32-c TLS
+/// connection using the N32-f exporter label and 32-byte length (B2/SEPP).
+pub fn export_n32f_session_key<Data>(
+    conn: &rustls::ConnectionCommon<Data>,
+    context: Option<&[u8]>,
+) -> SbiResult<Vec<u8>> {
+    let output = vec![0u8; N32F_EXPORTER_KEY_LEN];
+    conn.export_keying_material(output, N32F_EXPORTER_LABEL, context)
+        .map_err(|e| SbiError::TlsError(format!("N32-f keying-material export failed: {e}")))
+}
+
 /// Dangerous: skip all server certificate verification (for testing only).
 #[derive(Debug)]
 struct NoCertificateVerification;
@@ -446,5 +514,96 @@ mod tests {
     fn test_build_client_config_insecure() {
         let config = build_client_config(None, true);
         assert!(config.is_ok());
+    }
+
+    // --- RFC 5705 TLS exporter (B2/SEPP N32-f dependency) ---
+
+    #[test]
+    fn test_export_keying_material_zero_len_rejected() {
+        // The length guard rejects a zero-length request (RFC 5705 forbids it).
+        let HandshakeOutput { server, .. } = test_handshake();
+        let err = export_keying_material(&server, N32F_EXPORTER_LABEL, None, 0).unwrap_err();
+        assert!(matches!(err, SbiError::TlsError(_)));
+    }
+
+    #[test]
+    fn test_export_keying_material_agrees_across_peers() {
+        let HandshakeOutput { client, server } = test_handshake();
+
+        // Both peers derive the same N32-f session key from the shared TLS
+        // secret (RFC 5705 / TS 33.501 §13.2.4.4).
+        let client_key = export_n32f_session_key(&client, None).expect("client export");
+        let server_key = export_n32f_session_key(&server, None).expect("server export");
+        assert_eq!(client_key.len(), N32F_EXPORTER_KEY_LEN);
+        assert_eq!(client_key, server_key);
+
+        // A different label/context yields different material.
+        let other = export_keying_material(&client, b"OTHER-LABEL", None, 32).expect("export");
+        assert_ne!(other, client_key);
+
+        // Context diversification: same label, different context => different key.
+        let ctx_a = export_keying_material(&client, N32F_EXPORTER_LABEL, Some(b"a"), 32).unwrap();
+        let ctx_b = export_keying_material(&client, N32F_EXPORTER_LABEL, Some(b"b"), 32).unwrap();
+        assert_ne!(ctx_a, ctx_b);
+    }
+
+    /// Completed in-memory TLS 1.3 handshake, exposing both rustls connections
+    /// for exporter testing.
+    struct HandshakeOutput {
+        client: rustls::ClientConnection,
+        server: rustls::ServerConnection,
+    }
+
+    /// Perform a full in-memory rustls handshake with a self-signed cert and
+    /// return both completed connections.
+    fn test_handshake() -> HandshakeOutput {
+        use rustls::pki_types::ServerName;
+
+        // Self-signed leaf cert + key for "localhost".
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+        let key_der =
+            PrivateKeyDer::try_from(cert.key_pair.serialize_der()).expect("private key");
+
+        let server_config = build_server_config(vec![cert_der.clone()], key_der).unwrap();
+
+        let mut roots = RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let client_config = ClientConfig::builder_with_provider(provider())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let mut client =
+            rustls::ClientConnection::new(Arc::new(client_config), server_name).unwrap();
+        let mut server = rustls::ServerConnection::new(Arc::new(server_config)).unwrap();
+
+        // Pump handshake bytes between the two in-memory connections until
+        // neither side wants to write more.
+        for _ in 0..16 {
+            let mut buf = Vec::new();
+            client.write_tls(&mut buf).unwrap();
+            if !buf.is_empty() {
+                server.read_tls(&mut buf.as_slice()).unwrap();
+                server.process_new_packets().unwrap();
+            }
+
+            let mut buf2 = Vec::new();
+            server.write_tls(&mut buf2).unwrap();
+            if !buf2.is_empty() {
+                client.read_tls(&mut buf2.as_slice()).unwrap();
+                client.process_new_packets().unwrap();
+            }
+
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking(), "client handshake incomplete");
+        assert!(!server.is_handshaking(), "server handshake incomplete");
+
+        HandshakeOutput { client, server }
     }
 }

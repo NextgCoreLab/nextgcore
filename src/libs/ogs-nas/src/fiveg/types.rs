@@ -730,40 +730,71 @@ impl TaiList {
         let mut elements = Vec::new();
         let mut remaining = length as usize;
 
+        // Helper: subtract `n` from the declared remaining length, failing on
+        // underflow rather than panicking (debug) / wrapping (release).
+        fn take(remaining: &mut usize, n: usize) -> NasResult<()> {
+            *remaining = remaining.checked_sub(n).ok_or_else(|| {
+                NasError::DecodingError("Truncated TAI list: length underflow".to_string())
+            })?;
+            Ok(())
+        }
+
         while remaining > 0 {
+            // The type byte itself consumes one declared byte.
+            take(&mut remaining, 1)?;
+            if buf.remaining() < 1 {
+                return Err(NasError::BufferTooShort {
+                    expected: 1,
+                    actual: buf.remaining(),
+                });
+            }
             let type_byte = buf.get_u8();
-            remaining -= 1;
 
             let list_type = (type_byte >> 5) & 0x03;
             let num = (type_byte & 0x1F) as usize + 1;
 
             match list_type {
                 0 => {
+                    // 3-byte PLMN id + num * 3-byte TAC.
+                    take(&mut remaining, 3)?;
                     let plmn_id = PlmnId::decode(buf)?;
-                    remaining -= 3;
                     let mut tacs = Vec::with_capacity(num);
                     for _ in 0..num {
+                        take(&mut remaining, 3)?;
+                        if buf.remaining() < 3 {
+                            return Err(NasError::BufferTooShort {
+                                expected: 3,
+                                actual: buf.remaining(),
+                            });
+                        }
                         let mut tac = [0u8; 3];
                         buf.copy_to_slice(&mut tac);
                         tacs.push(tac);
-                        remaining -= 3;
                     }
                     elements.push(TaiListElement::PartialTaiList0 { plmn_id, tacs });
                 }
                 1 => {
+                    // 3-byte PLMN id + single 3-byte TAC.
+                    take(&mut remaining, 3)?;
                     let plmn_id = PlmnId::decode(buf)?;
-                    remaining -= 3;
+                    take(&mut remaining, 3)?;
+                    if buf.remaining() < 3 {
+                        return Err(NasError::BufferTooShort {
+                            expected: 3,
+                            actual: buf.remaining(),
+                        });
+                    }
                     let mut tac = [0u8; 3];
                     buf.copy_to_slice(&mut tac);
-                    remaining -= 3;
                     elements.push(TaiListElement::PartialTaiList1 { plmn_id, tac });
                 }
                 2 => {
+                    // num * 6-byte TAI (PLMN id + TAC).
                     let mut tais = Vec::with_capacity(num);
                     for _ in 0..num {
+                        take(&mut remaining, 6)?;
                         let tai = Tai::decode(buf)?;
                         tais.push(tai);
-                        remaining -= 6;
                     }
                     elements.push(TaiListElement::PartialTaiList2 { tais });
                 }
@@ -774,5 +805,91 @@ impl TaiList {
         }
 
         Ok(Self { length, elements })
+    }
+}
+
+#[cfg(test)]
+mod tai_list_tests {
+    use super::*;
+    use bytes::Bytes;
+
+    /// Round-trip a well-formed TAI list (type 0: PLMN + 2 TACs) to make sure
+    /// the success path is preserved after the bounds-checking changes.
+    #[test]
+    fn decode_valid_partial_tai_list0_roundtrips() {
+        // length byte + type byte (type=0, num-1=1 -> 2 TACs) + 3-byte PLMN + 6 bytes TAC
+        // declared length = 1 (type) + 3 (plmn) + 6 (two TACs) = 10
+        let mut data = vec![10u8, 0x01];
+        data.extend_from_slice(&[0x02, 0xF8, 0x39]); // PLMN id (3 bytes)
+        data.extend_from_slice(&[0x00, 0x00, 0x01]); // TAC 1
+        data.extend_from_slice(&[0x00, 0x00, 0x02]); // TAC 2
+        let mut buf = Bytes::from(data);
+
+        let list = TaiList::decode(&mut buf).expect("valid TAI list must decode");
+        assert_eq!(list.length, 10);
+        assert_eq!(list.elements.len(), 1);
+        match &list.elements[0] {
+            TaiListElement::PartialTaiList0 { tacs, .. } => {
+                assert_eq!(tacs.len(), 2);
+                assert_eq!(tacs[0], [0x00, 0x00, 0x01]);
+                assert_eq!(tacs[1], [0x00, 0x00, 0x02]);
+            }
+            other => panic!("unexpected element: {other:?}"),
+        }
+    }
+
+    /// Declared length larger than the actual buffer must Err, not panic.
+    #[test]
+    fn decode_truncated_buffer_errs() {
+        // length=10 but only the type byte present after it
+        let mut buf = Bytes::from(vec![10u8, 0x01]);
+        let res = TaiList::decode(&mut buf);
+        assert!(res.is_err(), "truncated TAI list must error, got {res:?}");
+    }
+
+    /// A length that is consumed by the type byte but then claims a sub-element
+    /// larger than what `remaining` allows must Err via the checked subtraction,
+    /// not underflow/panic.
+    #[test]
+    fn decode_length_underflow_errs() {
+        // length=1: only enough for the type byte, but type 0 needs a PLMN id (3
+        // bytes) which would drive `remaining` below zero.
+        let mut data = vec![1u8, 0x00]; // length=1, type=0 num=1
+        data.extend_from_slice(&[0x02, 0xF8, 0x39]); // PLMN bytes present in buffer
+        data.extend_from_slice(&[0x00, 0x00, 0x01]); // TAC present in buffer
+        let mut buf = Bytes::from(data);
+        let res = TaiList::decode(&mut buf);
+        assert!(res.is_err(), "length underflow must error, got {res:?}");
+    }
+
+    /// Oversized num driving TAC copies beyond the buffer must Err, not panic on
+    /// copy_to_slice.
+    #[test]
+    fn decode_oversized_tac_count_errs() {
+        // type 0 with num-1 = 0x1F -> 32 TACs, but buffer only has one PLMN + 1 TAC.
+        // declared length set large so the loop attempts all 32 copies.
+        let mut data = vec![200u8, 0x1F]; // length=200 (lies), type=0 num=32
+        data.extend_from_slice(&[0x02, 0xF8, 0x39]); // PLMN id
+        data.extend_from_slice(&[0x00, 0x00, 0x01]); // single TAC only
+        let mut buf = Bytes::from(data);
+        let res = TaiList::decode(&mut buf);
+        assert!(res.is_err(), "oversized TAC count must error, got {res:?}");
+    }
+
+    /// Type 2 with an oversized TAI count beyond the buffer must Err, not panic.
+    #[test]
+    fn decode_oversized_tai_count_errs() {
+        let mut data = vec![200u8, 0x9F]; // length=200 (lies), type=2 (0b10), num=32
+        data.extend_from_slice(&[0x02, 0xF8, 0x39, 0x00, 0x00, 0x01]); // one TAI only
+        let mut buf = Bytes::from(data);
+        let res = TaiList::decode(&mut buf);
+        assert!(res.is_err(), "oversized TAI count must error, got {res:?}");
+    }
+
+    /// Empty buffer must Err on the length-byte read, not panic.
+    #[test]
+    fn decode_empty_buffer_errs() {
+        let mut buf = Bytes::new();
+        assert!(TaiList::decode(&mut buf).is_err());
     }
 }

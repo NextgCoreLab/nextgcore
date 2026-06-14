@@ -591,4 +591,112 @@ mod tests {
             "nbsf-management"
         );
     }
+
+    // --- T1.1: automatic OAuth2 token acquisition + attachment ---
+
+    /// A combined stub that serves the NRF token endpoint
+    /// (`/nnrf-oauth2/v1/access-token`) and echoes the request's
+    /// `authorization` header back as the response body for every other path.
+    /// Returns the bound socket address.
+    async fn serve_token_and_echo(token: &'static str) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let svc = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+                        let path = req.uri().path().to_string();
+                        let auth = req
+                            .headers()
+                            .get("authorization")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("<none>")
+                            .to_string();
+                        async move {
+                            let body = if path == "/nnrf-oauth2/v1/access-token" {
+                                format!(
+                                    r#"{{"access_token":"{token}","token_type":"Bearer","expires_in":3600}}"#
+                                )
+                            } else {
+                                // Echo the authorization header the client sent.
+                                format!(r#"{{"authorization":"{auth}"}}"#)
+                            };
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                                http_body_util::Full::new(bytes::Bytes::from(body)),
+                            ))
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc)
+                    .await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn test_oauth2_token_attached_when_enabled() {
+        let addr = serve_token_and_echo("test-access-token").await;
+        let nrf_uri = format!("http://{addr}");
+
+        // Point both the NRF (token source) and the target NF at the stub.
+        let oauth2 = Arc::new(OAuth2Client::new(nrf_uri, "amf-instance-1", NfType::Amf));
+        let client = SbiClient::with_host_port("127.0.0.1", addr.port())
+            .with_oauth2(oauth2.clone(), NfType::Udm);
+
+        // A request without an Authorization header gets a Bearer token
+        // acquired from the NRF and attached automatically.
+        let request = SbiRequest::get("/nudm-sdm/v1/imsi-1/am-data");
+        let response = client.send_request(request).await.expect("request sent");
+        let body = response.http.content.as_deref().expect("echo body");
+        assert!(
+            body.contains("Bearer test-access-token"),
+            "expected attached bearer token, got: {body}"
+        );
+
+        // The token was cached for (target NF type, scope).
+        assert!(oauth2.get_token(NfType::Udm, "nudm-sdm").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_oauth2_not_attached_when_disabled() {
+        let addr = serve_token_and_echo("test-access-token").await;
+
+        // No OAuth2 configured on the client (default off): no token attached.
+        let client = SbiClient::with_host_port("127.0.0.1", addr.port());
+        let request = SbiRequest::get("/nudm-sdm/v1/imsi-1/am-data");
+        let response = client.send_request(request).await.expect("request sent");
+        let body = response.http.content.as_deref().expect("echo body");
+        assert!(
+            body.contains("<none>"),
+            "expected no authorization header, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oauth2_explicit_header_not_overwritten() {
+        let addr = serve_token_and_echo("nrf-token").await;
+        let nrf_uri = format!("http://{addr}");
+        let oauth2 = Arc::new(OAuth2Client::new(nrf_uri, "amf-instance-1", NfType::Amf));
+        let client = SbiClient::with_host_port("127.0.0.1", addr.port())
+            .with_oauth2(oauth2, NfType::Udm);
+
+        // A caller-supplied Authorization header is respected (not replaced by
+        // an NRF-acquired token).
+        let request = SbiRequest::get("/nudm-sdm/v1/imsi-1/am-data")
+            .with_header("Authorization", "Bearer caller-supplied");
+        let response = client.send_request(request).await.expect("request sent");
+        let body = response.http.content.as_deref().expect("echo body");
+        assert!(
+            body.contains("Bearer caller-supplied"),
+            "caller header should be preserved, got: {body}"
+        );
+    }
 }

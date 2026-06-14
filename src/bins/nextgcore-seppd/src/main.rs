@@ -141,6 +141,12 @@ struct Args {
     /// CA bundle for verifying peer-SEPP server certificates
     #[arg(long)]
     n32_ca_cert: Option<String>,
+
+    /// Disable mandatory mTLS on the N32-c listener (LAB USE ONLY). N32-c is
+    /// a mutually-authenticated TLS connection per TS 33.501; mTLS is on by
+    /// default whenever --tls is set and a client CA is available.
+    #[arg(long)]
+    n32_allow_insecure_no_mtls: bool,
 }
 
 /// Parse "mcc:mnc" into a PlmnId
@@ -259,15 +265,11 @@ async fn main() -> Result<()> {
         n32_port: args.n32_port,
     };
 
-    // Open SBI server
+    // Mark SBI state open (context-level bookkeeping)
     sepp_sbi_open(Some(sbi_config)).map_err(|e| anyhow::anyhow!(e))?;
-    log::info!(
-        "SBI server listening on {}:{}",
-        args.sbi_addr,
-        args.sbi_port
-    );
 
-    // N32 TLS/mTLS settings shared by the listener and the N32-c client
+    // N32 TLS/mTLS settings shared by the listener and the N32-c client.
+    // mTLS is mandatory by default whenever TLS is enabled (TS 33.501).
     let n32_tls = n32_server::N32TlsConfig {
         cert: args.tls_cert.clone(),
         key: args.tls_key.clone(),
@@ -275,8 +277,21 @@ async fn main() -> Result<()> {
         client_cert: args.n32_client_cert.clone(),
         client_key: args.n32_client_key.clone(),
         ca_cert: args.n32_ca_cert.clone(),
+        allow_insecure_no_mtls: args.n32_allow_insecure_no_mtls,
     };
     let n32_tls_opt = if args.tls { Some(&n32_tls) } else { None };
+
+    // Start the consumer-facing SBI server (C8): home-PLMN NFs send outbound
+    // roaming requests here; the handler runs the forwarding pipeline through
+    // the selected peer SEPP over N32-f.
+    let sbi_server = n32_server::start_sbi_server(&args.sbi_addr, args.sbi_port, n32_tls_opt)
+        .await
+        .map_err(|e| anyhow::anyhow!(e))?;
+    log::info!(
+        "SBI server listening on {}:{}",
+        args.sbi_addr,
+        args.sbi_port
+    );
 
     // Start the N32 listener (N32-c handshake + N32-f forwarding endpoints)
     let mut n32_listener = None;
@@ -334,7 +349,8 @@ async fn main() -> Result<()> {
         log::info!("N32 listener stopped");
     }
 
-    // Close SBI server
+    // Stop the consumer-facing SBI server
+    let _ = sbi_server.stop().await;
     sepp_sbi_close();
     log::info!("SBI server closed");
 

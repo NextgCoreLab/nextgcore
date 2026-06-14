@@ -193,7 +193,9 @@ async fn two_sepp_n32_handshake_and_forwarding() {
         assert!(!security.local_context_id.is_empty());
         assert!(!security.peer_context_id.is_empty());
         assert_eq!(security.jwe_cipher_suite, "A256GCM");
-        assert_eq!(security.jws_cipher_suite, "HS256");
+        // modificationsBlock is signed with the asymmetric ES256 key
+        // (TS 33.501 §13.2.4.6), not the symmetric session key.
+        assert_eq!(security.jws_cipher_suite, "ES256");
         // Peer learned our serving PLMN list (sent in the handshake)
         // and we learned the peer's (configured as 999:70 on the child)
         assert!(node.has_plmn_id(999, 70), "peer serving PLMNs not learned");
@@ -362,7 +364,7 @@ async fn two_sepp_n32_handshake_and_forwarding() {
         );
         let sec_b3 = node_b3.n32f_security.unwrap();
         assert_eq!(sec_b3.jwe_cipher_suite, "A256GCM");
-        assert_eq!(sec_b3.jws_cipher_suite, "HS256");
+        assert_eq!(sec_b3.jws_cipher_suite, "ES256");
 
         let _ = a_server.stop().await;
         drop(b1);

@@ -148,12 +148,9 @@ fn build_cause(group: u8, value: i64) -> Cause {
 }
 
 fn radio_network_cause(v: u8) -> CauseRadioNetwork {
-    // SAFETY: CauseRadioNetwork is #[repr(u8)] with values 0..=46
-    if v <= 46 {
-        unsafe { std::mem::transmute(v) }
-    } else {
-        CauseRadioNetwork::Unspecified
-    }
+    // Safe conversion via the library's TryFrom; unknown values map to the
+    // 3GPP "unspecified" fallback rather than invoking undefined behaviour.
+    CauseRadioNetwork::try_from(v as i64).unwrap_or(CauseRadioNetwork::Unspecified)
 }
 
 fn transport_cause(v: u8) -> CauseTransport {
@@ -173,21 +170,15 @@ fn nas_cause(v: u8) -> CauseNas {
 }
 
 fn protocol_cause(v: u8) -> CauseProtocol {
-    // SAFETY: CauseProtocol is #[repr(u8)] with values 0..=6
-    if v <= 6 {
-        unsafe { std::mem::transmute(v) }
-    } else {
-        CauseProtocol::Unspecified
-    }
+    // Safe conversion via the library's TryFrom; unknown values map to the
+    // 3GPP "unspecified" fallback rather than invoking undefined behaviour.
+    CauseProtocol::try_from(v as i64).unwrap_or(CauseProtocol::Unspecified)
 }
 
 fn misc_cause(v: u8) -> CauseMisc {
-    // SAFETY: CauseMisc is #[repr(u8)] with values 0..=5
-    if v <= 5 {
-        unsafe { std::mem::transmute(v) }
-    } else {
-        CauseMisc::Unspecified
-    }
+    // Safe conversion via the library's TryFrom; unknown values map to the
+    // 3GPP "unspecified" fallback rather than invoking undefined behaviour.
+    CauseMisc::try_from(v as i64).unwrap_or(CauseMisc::Unspecified)
 }
 
 /// Encode PLMN ID to 3-byte format per 3GPP TS 24.501
@@ -1300,6 +1291,91 @@ mod tests {
             None,
         );
         assert!(result.is_none());
+    }
+
+    // ========================================================================
+    // T1.7: Cause conversion safety (no unsafe transmute on wire-decoded data)
+    // ========================================================================
+
+    #[test]
+    fn test_cause_value_conversions_in_range() {
+        // Every group maps a known wire value to the expected typed cause.
+        // group 0 = RadioNetwork, value 20 = user-inactivity
+        assert_eq!(
+            build_cause(0, 20),
+            Cause::RadioNetwork(CauseRadioNetwork::UserInactivity)
+        );
+        // RadioNetwork extension boundary (value 46)
+        assert_eq!(
+            build_cause(0, 46),
+            Cause::RadioNetwork(CauseRadioNetwork::ReleaseDueToPreEmption)
+        );
+        // group 1 = Transport
+        assert_eq!(
+            build_cause(1, 0),
+            Cause::Transport(CauseTransport::TransportResourceUnavailable)
+        );
+        // group 2 = NAS
+        assert_eq!(build_cause(2, 1), Cause::Nas(CauseNas::AuthenticationFailure));
+        // group 3 = Protocol, value 4 = semantic-error
+        assert_eq!(
+            build_cause(3, 4),
+            Cause::Protocol(CauseProtocol::SemanticError)
+        );
+        // group 4 = Misc, value 4 = unknown-PLMN-or-SNPN
+        assert_eq!(build_cause(4, 4), Cause::Misc(CauseMisc::UnknownPlmnOrSnpn));
+    }
+
+    #[test]
+    fn test_out_of_range_cause_values_fall_back_safely() {
+        // Out-of-range values (would have been UB under the old transmute) must
+        // map to the per-group "unspecified" fallback, not undefined behaviour.
+
+        // RadioNetwork: valid 0..=46; 47 and the max u8 fall back.
+        assert_eq!(
+            radio_network_cause(47),
+            CauseRadioNetwork::Unspecified
+        );
+        assert_eq!(
+            radio_network_cause(u8::MAX),
+            CauseRadioNetwork::Unspecified
+        );
+        assert_eq!(
+            build_cause(0, 200),
+            Cause::RadioNetwork(CauseRadioNetwork::Unspecified)
+        );
+
+        // Protocol: valid 0..=6; 7 and beyond fall back.
+        assert_eq!(protocol_cause(7), CauseProtocol::Unspecified);
+        assert_eq!(protocol_cause(u8::MAX), CauseProtocol::Unspecified);
+        assert_eq!(
+            build_cause(3, 7),
+            Cause::Protocol(CauseProtocol::Unspecified)
+        );
+
+        // Misc: valid 0..=5; 6 and beyond fall back.
+        assert_eq!(misc_cause(6), CauseMisc::Unspecified);
+        assert_eq!(misc_cause(u8::MAX), CauseMisc::Unspecified);
+        assert_eq!(build_cause(4, 99), Cause::Misc(CauseMisc::Unspecified));
+
+        // Unknown cause group falls back to Misc/Unspecified.
+        assert_eq!(build_cause(9, 0), Cause::Misc(CauseMisc::Unspecified));
+    }
+
+    #[test]
+    fn test_out_of_range_cause_value_encodes_and_decodes_safely() {
+        // End-to-end: an out-of-range RadioNetwork value must not UB; it
+        // degrades to Unspecified and still round-trips through the encoder.
+        let bytes = build_ng_setup_failure_asn1(0, 250, Some(0));
+        match parser::decode_ngap_pdu(&bytes).expect("decode") {
+            NgapMessage::NgSetupFailure(f) => {
+                assert_eq!(
+                    f.cause,
+                    Cause::RadioNetwork(CauseRadioNetwork::Unspecified)
+                );
+            }
+            other => panic!("Expected NgSetupFailure, got {other:?}"),
+        }
     }
 
     #[test]

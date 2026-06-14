@@ -387,6 +387,18 @@ pub fn authorize_bearer(
     auth_header: Option<&str>,
     jwks: &serde_json::Value,
 ) -> SbiResult<AccessTokenClaims> {
+    authorize_bearer_aud(auth_header, jwks, None)
+}
+
+/// Like [`authorize_bearer`], but additionally validates the token's `aud`
+/// (audience) claim when `expected_audience` is `Some` (RFC 7519 §4.1.3,
+/// TS 33.501 §13.4.1.2). `None` skips the audience check, preserving
+/// [`authorize_bearer`]'s behaviour.
+pub fn authorize_bearer_aud(
+    auth_header: Option<&str>,
+    jwks: &serde_json::Value,
+    expected_audience: Option<&str>,
+) -> SbiResult<AccessTokenClaims> {
     let token = auth_header
         .and_then(|h| {
             h.strip_prefix("Bearer ")
@@ -395,7 +407,35 @@ pub fn authorize_bearer(
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .ok_or_else(|| SbiError::AuthorizationFailed("missing or malformed Bearer token".into()))?;
-    verify_access_token_with_jwks(token, jwks)
+    let claims = verify_access_token_with_jwks(token, jwks)?;
+    if let Some(expected) = expected_audience {
+        check_audience(&claims.aud, expected)?;
+    }
+    Ok(claims)
+}
+
+/// Validate that a token's `aud` claim includes `expected`.
+///
+/// Per RFC 7519 §4.1.3 the `aud` claim is either a single string or an array
+/// of strings; in 5G SBA (TS 29.510 §6.3.5.2.4) the NRF sets it to the target
+/// NF's type or NF Instance ID. The token is accepted when any audience entry
+/// equals `expected`. Returns `AuthorizationFailed` otherwise so the SBI
+/// server maps it to 401.
+pub fn check_audience(aud: &serde_json::Value, expected: &str) -> SbiResult<()> {
+    let matches = match aud {
+        serde_json::Value::String(s) => s == expected,
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|v| v.as_str().map(|s| s == expected).unwrap_or(false)),
+        _ => false,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(SbiError::AuthorizationFailed(format!(
+            "token audience {aud} does not include expected audience '{expected}'"
+        )))
+    }
 }
 
 // ============================================================================
@@ -666,11 +706,22 @@ impl JwksCache {
     /// so callers can distinguish "bad token" (401) from "keys unavailable"
     /// (503).
     pub async fn authorize(&self, auth_header: Option<&str>) -> SbiResult<AccessTokenClaims> {
+        self.authorize_aud(auth_header, None).await
+    }
+
+    /// Like [`JwksCache::authorize`], but additionally validates the token's
+    /// `aud` claim against `expected_audience` when `Some` (T1.2). The
+    /// kid-rotation refresh-and-retry behaviour is preserved.
+    pub async fn authorize_aud(
+        &self,
+        auth_header: Option<&str>,
+        expected_audience: Option<&str>,
+    ) -> SbiResult<AccessTokenClaims> {
         let jwks = self.get().await?;
-        match authorize_bearer(auth_header, &jwks) {
+        match authorize_bearer_aud(auth_header, &jwks, expected_audience) {
             Err(SbiError::AuthorizationFailed(msg)) if msg == KID_MISMATCH_MSG => {
                 let fresh = self.refresh().await?;
-                authorize_bearer(auth_header, &fresh)
+                authorize_bearer_aud(auth_header, &fresh, expected_audience)
             }
             other => other,
         }
@@ -1026,6 +1077,82 @@ mod tests {
         assert!(authorize_bearer(None, &jwks).is_err());
         assert!(authorize_bearer(Some("Basic abc"), &jwks).is_err());
         assert!(authorize_bearer(Some("Bearer not.a.jwt"), &jwks).is_err());
+    }
+
+    // --- audience ('aud') validation (T1.2, RFC 7519 / TS 33.501 §13.4.1.2) ---
+
+    #[test]
+    fn test_check_audience_string_and_array() {
+        // Single-string aud: exact match accepted, mismatch rejected.
+        assert!(check_audience(&serde_json::json!("UDM"), "UDM").is_ok());
+        assert!(check_audience(&serde_json::json!("UDM"), "AMF").is_err());
+
+        // Array aud: accepted when any entry matches.
+        let arr = serde_json::json!(["AMF", "UDM", "SMF"]);
+        assert!(check_audience(&arr, "UDM").is_ok());
+        assert!(check_audience(&arr, "PCF").is_err());
+
+        // Non-string/array aud (malformed) is rejected.
+        assert!(check_audience(&serde_json::json!(42), "UDM").is_err());
+    }
+
+    /// The fixed test token (see `build_es256_token`) has `aud == "UDM"`.
+    #[test]
+    fn test_authorize_bearer_aud_matching_accepted() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let token = build_es256_token(&sk, "nrf-es256", future_exp());
+        let jwks = jwks_for(&sk, "nrf-es256");
+        let header = format!("Bearer {token}");
+
+        // Matching expected audience: accepted.
+        let claims = authorize_bearer_aud(Some(&header), &jwks, Some("UDM"))
+            .expect("matching aud authorizes");
+        assert_eq!(claims.aud, serde_json::json!("UDM"));
+    }
+
+    #[test]
+    fn test_authorize_bearer_aud_wrong_rejected() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let token = build_es256_token(&sk, "nrf-es256", future_exp());
+        let jwks = jwks_for(&sk, "nrf-es256");
+        let header = format!("Bearer {token}");
+
+        // Wrong expected audience: rejected even though signature/exp are good.
+        let err = authorize_bearer_aud(Some(&header), &jwks, Some("AMF")).unwrap_err();
+        assert!(matches!(err, SbiError::AuthorizationFailed(_)));
+    }
+
+    #[test]
+    fn test_authorize_bearer_aud_absent_expectation_skips() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let token = build_es256_token(&sk, "nrf-es256", future_exp());
+        let jwks = jwks_for(&sk, "nrf-es256");
+        let header = format!("Bearer {token}");
+
+        // No expected audience: audience check skipped (prior behaviour).
+        assert!(authorize_bearer_aud(Some(&header), &jwks, None).is_ok());
+        // And plain authorize_bearer still works (delegates with None).
+        assert!(authorize_bearer(Some(&header), &jwks).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_jwks_cache_authorize_aud() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let cache = JwksCache::new("http://127.0.0.1:1/unused");
+        cache.seed(jwks_for(&sk, "nrf-es256")).await;
+
+        let token = build_es256_token(&sk, "nrf-es256", future_exp());
+        let header = format!("Bearer {token}");
+
+        // Matching aud through the cache path.
+        assert!(cache.authorize_aud(Some(&header), Some("UDM")).await.is_ok());
+        // Wrong aud rejected.
+        assert!(matches!(
+            cache.authorize_aud(Some(&header), Some("AMF")).await,
+            Err(SbiError::AuthorizationFailed(_))
+        ));
+        // No expectation skips.
+        assert!(cache.authorize_aud(Some(&header), None).await.is_ok());
     }
 
     // --- JWKS fetch + cache (NRF auth stage 4b) ---

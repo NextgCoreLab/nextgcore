@@ -1,0 +1,32 @@
+# NSACF (Network Slice Admission Control Function) Configuration — OAuth2 variant
+# Same as nsacf.yaml but with SBI OAuth2 bearer-token enforcement enabled.
+# Used via docker-compose.oauth2.yml:
+#   docker compose -f docker-compose.yml -f docker-compose.oauth2.yml up -d
+#
+# With nsacf.sbi.oauth2.require true, every incoming SBI request must carry a
+# Bearer token issued by the NRF (POST /nnrf-oauth2/v1/access-token) whose
+# audience includes "NSACF"; the NSACF verifies it against the NRF's JWKS
+# (GET /nnrf-oauth2/v1/jwks). The default nsacf.yaml leaves enforcement off so
+# the dev/E2E data-plane path keeps working.
+#
+# Dev override: the binary also accepts --oauth2-require true|false, which wins
+# over this config value.
+logger:
+  level: info
+
+nsacf:
+  sbi:
+    server:
+      - address: 172.23.0.34
+        port: 7777
+    oauth2:
+      require: true
+  nrf:
+    uri: http://172.23.0.10:7777
+  slice_quotas:
+    - sst: 1
+      max_ues: 1000
+    - sst: 2
+      max_ues: 500
+    - sst: 3
+      max_ues: 2000
