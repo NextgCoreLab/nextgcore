@@ -138,7 +138,7 @@ impl ProgrammablePlane {
 
         if let Some(stage) = self.stages.iter_mut().find(|s| s.table_id == table_id) {
             stage.entries.push(entry);
-            stage.entries.sort_by(|a, b| b.priority.cmp(&a.priority));
+            stage.entries.sort_by_key(|e| std::cmp::Reverse(e.priority));
         }
         id
     }

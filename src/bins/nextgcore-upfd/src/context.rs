@@ -529,8 +529,8 @@ impl PtpTransparentClock {
         let residence = egress_ns.saturating_sub(ingress_ns);
         self.residence_time_ns += residence;
         self.messages_processed += 1;
-        if self.messages_processed > 0 {
-            self.mean_path_delay_ns = self.residence_time_ns / self.messages_processed;
+        if let Some(mean) = self.residence_time_ns.checked_div(self.messages_processed) {
+            self.mean_path_delay_ns = mean;
         }
     }
 }

@@ -42,8 +42,10 @@ pub mod pfcp_msg_type {
 
 /// PFCP FSM state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum PfcpState {
     /// Initial state
+    #[default]
     Initial,
     /// Will associate state (attempting association)
     WillAssociate,
@@ -55,11 +57,6 @@ pub enum PfcpState {
     Exception,
 }
 
-impl Default for PfcpState {
-    fn default() -> Self {
-        Self::Initial
-    }
-}
 
 // ============================================================================
 // PFCP State Machine Context

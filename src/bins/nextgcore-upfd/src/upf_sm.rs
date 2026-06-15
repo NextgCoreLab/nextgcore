@@ -10,8 +10,10 @@ use crate::event::{UpfEvent, UpfEventId};
 
 /// UPF FSM state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum UpfState {
     /// Initial state
+    #[default]
     Initial,
     /// Operational state
     Operational,
@@ -21,11 +23,6 @@ pub enum UpfState {
     Exception,
 }
 
-impl Default for UpfState {
-    fn default() -> Self {
-        Self::Initial
-    }
-}
 
 // ============================================================================
 // UPF State Machine Context
