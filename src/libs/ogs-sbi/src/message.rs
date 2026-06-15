@@ -379,6 +379,25 @@ pub struct SbiRequest {
     pub header: SbiHeader,
     /// HTTP message (params, headers, body)
     pub http: SbiHttpMessage,
+    /// Correlation / request ID for distributed tracing (T6.4).
+    ///
+    /// Populated by the server glue in `convert_request`: taken from
+    /// the incoming `x-request-id` header, extracted from the W3C
+    /// `traceparent` trace-id field (the 16-byte hex segment), or
+    /// generated as a 32-hex-char string from the wall-clock nanoseconds
+    /// when neither header is present.  The client propagates the same
+    /// value outbound via the `x-request-id` header when forwarding.
+    ///
+    /// Defaults to an empty string when an `SbiRequest` is constructed
+    /// outside the server path (builder methods, unit tests, NF handlers
+    /// constructing outbound requests) so existing code needs no changes.
+    pub correlation_id: String,
+    /// RFC 5705 TLS exporter secret derived from the N32-c TLS connection
+    /// (T1.5b / TS 33.501 §13.2.4.4). Present only on requests received over
+    /// TLS; `None` for plaintext connections and for requests constructed
+    /// programmatically. The SEPP N32-c handler consumes this to derive the
+    /// N32-f session key via `set_n32c_tls_exporter_secret`.
+    pub tls_exporter_secret: Option<Vec<u8>>,
 }
 
 impl SbiRequest {
@@ -391,6 +410,7 @@ impl SbiRequest {
         Self {
             header: SbiHeader::with_method_uri("GET", uri),
             http: SbiHttpMessage::new(),
+            ..Self::default()
         }
     }
 
@@ -399,6 +419,7 @@ impl SbiRequest {
         Self {
             header: SbiHeader::with_method_uri("POST", uri),
             http: SbiHttpMessage::new(),
+            ..Self::default()
         }
     }
 
@@ -407,6 +428,7 @@ impl SbiRequest {
         Self {
             header: SbiHeader::with_method_uri("PUT", uri),
             http: SbiHttpMessage::new(),
+            ..Self::default()
         }
     }
 
@@ -415,6 +437,7 @@ impl SbiRequest {
         Self {
             header: SbiHeader::with_method_uri("DELETE", uri),
             http: SbiHttpMessage::new(),
+            ..Self::default()
         }
     }
 
@@ -423,6 +446,7 @@ impl SbiRequest {
         Self {
             header: SbiHeader::with_method_uri("PATCH", uri),
             http: SbiHttpMessage::new(),
+            ..Self::default()
         }
     }
 

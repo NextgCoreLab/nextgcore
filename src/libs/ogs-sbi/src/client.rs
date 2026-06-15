@@ -35,6 +35,61 @@ fn new_span_id() -> [u8; 8] {
     ns.to_be_bytes()
 }
 
+// ── T1.5b: TLS exporter hook (client side) ──────────────────────────────────
+// The SBI client is used by every NF, but only seppd needs the N32-f TLS
+// exporter secret. Rather than adding a hard compile-time dependency on the
+// seppd crate from ogs-sbi, we let seppd register a one-time callback at
+// startup. The hook receives `(peer_fqdn, secret_bytes)` and deposits it into
+// the seppd-side store (`set_n32c_tls_exporter_secret`).
+//
+// Design: `Option<fn(&str, Vec<u8>)>` stored in a `OnceLock` so it is both
+// `Send + Sync` and requires no heap allocation for the function pointer.
+// Non-SEPP NFs never call `register_tls_exporter_hook`, so the lock stays
+// `None` and the fast-path is a single load.
+
+/// Type alias for the TLS exporter deposit hook.
+pub type TlsExporterHook = fn(&str, Vec<u8>);
+
+static TLS_EXPORTER_HOOK: TlsExporterHookSlot = TlsExporterHookSlot::new();
+
+struct TlsExporterHookSlot(std::sync::OnceLock<TlsExporterHook>);
+
+impl TlsExporterHookSlot {
+    const fn new() -> Self {
+        Self(std::sync::OnceLock::new())
+    }
+
+    fn load(&self) -> Option<TlsExporterHook> {
+        self.0.get().copied()
+    }
+
+    fn store(&self, hook: TlsExporterHook) {
+        // Ignore if already set (e.g. called twice in tests).
+        let _ = self.0.set(hook);
+    }
+}
+
+// SAFETY: fn pointers are Send+Sync.
+unsafe impl Send for TlsExporterHookSlot {}
+unsafe impl Sync for TlsExporterHookSlot {}
+
+/// Register a hook that the SBI client calls after every successful TLS
+/// handshake to deposit the RFC 5705 N32-f exporter secret.
+///
+/// Only seppd needs to call this. The hook is invoked with `(peer_fqdn,
+/// secret_bytes)`. Call once at NF startup before the first outbound
+/// connection is made. Subsequent calls are silently ignored.
+///
+/// # Example (seppd startup)
+/// ```ignore
+/// ogs_sbi::client::register_tls_exporter_hook(
+///     nextgcore_seppd::n32c_handler::set_n32c_tls_exporter_secret
+/// );
+/// ```
+pub fn register_tls_exporter_hook(hook: TlsExporterHook) {
+    TLS_EXPORTER_HOOK.store(hook);
+}
+
 /// Default connection timeout in seconds
 const DEFAULT_CONNECT_TIMEOUT: u64 = 5;
 /// Default request timeout in seconds
@@ -237,6 +292,55 @@ impl SbiClient {
             .map_err(|_| SbiError::Timeout)?
             .map_err(|e| SbiError::TlsError(format!("TLS handshake failed: {e}")))?;
 
+            // ── T1.5b: extract RFC 5705 N32-f exporter secret (client side) ──
+            // `get_ref()` on a tokio_rustls client TlsStream yields
+            // `(&TcpStream, &ClientConnection)`. `ClientConnection` derefs to
+            // `ConnectionCommon<ClientConnectionData>` which exposes
+            // `export_keying_material`. We call this BEFORE `TokioIo::new()`
+            // moves the stream, then deposit it into the SEPP-side store keyed
+            // by the peer host so `take_n32c_tls_exporter_secret` can pick it
+            // up during the N32-c exchange-params handshake.
+            {
+                let (_, client_conn) = tls_stream.get_ref();
+                match crate::tls::export_n32f_session_key(client_conn, None) {
+                    Ok(secret) => {
+                        log::debug!(
+                            "N32-f TLS exporter secret derived for peer {}",
+                            self.config.host
+                        );
+                        // The seppd n32c_handler consumes this via
+                        // `take_n32c_tls_exporter_secret(peer_fqdn)`.
+                        // We key by host (FQDN or IP) which the handler
+                        // uses as the peer identifier.
+                        //
+                        // This import is resolved at link time only when
+                        // nextgcore-seppd is in the binary; for other NFs
+                        // the function is unused but not dead (the seppd
+                        // crate re-exports it). We call it via the ogs-sbi
+                        // public re-export to avoid a hard dep on seppd here.
+                        // The side-channel store lives in seppd; we reach it
+                        // through a thin hook registered at startup (below).
+                        // For now, store it on the request side via the hook
+                        // if one is registered; otherwise log and discard.
+                        if let Some(hook) = TLS_EXPORTER_HOOK.load() {
+                            hook(&self.config.host, secret);
+                        } else {
+                            log::debug!(
+                                "No TLS exporter hook registered; secret for {} discarded \
+                                 (non-SEPP NF)",
+                                self.config.host
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "N32-f TLS exporter failed for peer {}: {e}",
+                            self.config.host
+                        );
+                    }
+                }
+            }
+
             let io = TokioIo::new(tls_stream);
 
             let (sender, conn) =
@@ -316,9 +420,24 @@ impl SbiClient {
             }
         }
 
+        // ── T6.4: propagate correlation / request ID outbound ────────────────
+        // If the SbiRequest carries a non-empty correlation_id (set by the
+        // server glue when the request arrived from a peer), echo it as
+        // `x-request-id` so the downstream NF can correlate log entries.
+        // Do not overwrite a caller-supplied `x-request-id`.
+        if !request.correlation_id.is_empty()
+            && request.http.get_header("x-request-id").is_none()
+        {
+            request
+                .http
+                .set_header("x-request-id", request.correlation_id.clone());
+        }
+
         // G32/G43: Propagate W3C traceparent header for distributed tracing.
         // If the incoming request already carries a traceparent (set by caller)
-        // we respect it; otherwise we generate a new child span.
+        // we respect it; otherwise we generate a new child span. When a
+        // correlation_id was extracted from an inbound traceparent trace-id we
+        // reuse it here so the outbound trace-id matches the inbound one.
         if request.http.get_header("traceparent").is_none() {
             // Generate a minimal traceparent from thread-local trace context.
             // If no ambient trace context is set we start a new trace with a

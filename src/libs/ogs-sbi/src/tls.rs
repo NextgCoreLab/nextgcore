@@ -549,6 +549,54 @@ mod tests {
         assert_ne!(ctx_a, ctx_b);
     }
 
+    // --- T1.5b: exporter extraction matches across server/client connections ---
+
+    /// Verify that the label and length used by the server glue (T1.5b) produce
+    /// the same 32-byte key as the client glue on the other end of the same
+    /// handshake. This is the in-process analogue of the `get_ref()` path in
+    /// `server.rs` (server side) and `client.rs` (client side).
+    #[test]
+    fn test_server_and_client_exporter_match_via_get_ref_analogue() {
+        let HandshakeOutput { client, server } = test_handshake();
+
+        // Mimic what server.rs does after `acceptor.accept()`:
+        //   let (_, server_conn) = tls_stream.get_ref();
+        //   export_n32f_session_key(server_conn, None)
+        let server_secret = export_n32f_session_key(&server, None)
+            .expect("server-side N32-f exporter must succeed after handshake");
+
+        // Mimic what client.rs does after `connector.connect()`:
+        //   let (_, client_conn) = tls_stream.get_ref();
+        //   export_n32f_session_key(client_conn, None)
+        let client_secret = export_n32f_session_key(&client, None)
+            .expect("client-side N32-f exporter must succeed after handshake");
+
+        // Both ends use the exact same label (`N32F_EXPORTER_LABEL`) and the
+        // same output length (`N32F_EXPORTER_KEY_LEN = 32`), so RFC 5705
+        // guarantees they produce identical material.
+        assert_eq!(
+            server_secret, client_secret,
+            "server-side and client-side N32-f exporter secrets must agree \
+             (T1.5b / TS 33.501 §13.2.4.4)"
+        );
+        assert_eq!(
+            server_secret.len(),
+            N32F_EXPORTER_KEY_LEN,
+            "exporter output must be exactly N32F_EXPORTER_KEY_LEN bytes"
+        );
+
+        // The label constant used by both glue paths must be N32F_EXPORTER_LABEL.
+        // A different label produces different material — confirming the label
+        // selection is significant and the right one is wired in.
+        let wrong_label =
+            export_keying_material(&server, b"WRONG-LABEL", None, N32F_EXPORTER_KEY_LEN)
+                .expect("export with wrong label");
+        assert_ne!(
+            server_secret, wrong_label,
+            "different label must produce different material"
+        );
+    }
+
     /// Completed in-memory TLS 1.3 handshake, exposing both rustls connections
     /// for exporter testing.
     struct HandshakeOutput {

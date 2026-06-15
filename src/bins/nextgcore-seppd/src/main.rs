@@ -197,6 +197,14 @@ async fn main() -> Result<()> {
         args.max_assoc
     );
 
+    // T1.5b: Register the TLS exporter hook so the SBI client deposits the
+    // RFC 5705 N32-f exporter secret into the n32c_handler store after every
+    // successful outbound TLS handshake. The hook is a plain fn pointer so it
+    // is Send+Sync and requires no heap allocation.
+    ogs_sbi::client::register_tls_exporter_hook(
+        n32c_handler::set_n32c_tls_exporter_secret,
+    );
+
     // Set sender FQDN if provided
     if let Some(ref sender) = args.sender {
         let ctx = sepp_self();

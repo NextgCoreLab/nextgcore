@@ -57,7 +57,7 @@ pub mod client;
 pub mod server;
 
 // Re-export commonly used types
-pub use client::{SbiClient, SbiClientConfig};
+pub use client::{register_tls_exporter_hook, SbiClient, SbiClientConfig, TlsExporterHook};
 pub use context::{global_context, NfInstance, NfService, NfStatus, NfSubscription, SbiContext};
 pub use error::{SbiError, SbiResult};
 #[cfg(feature = "6g-extensions")]

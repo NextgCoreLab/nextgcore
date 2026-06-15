@@ -133,12 +133,24 @@ async fn n32_request_handler(request: HttpRequest) -> HttpResponse {
     let method = request.header.method.clone();
     let path = request.header.uri.clone();
     let body = request.http.content.clone().unwrap_or_default();
+    // T1.5b: real RFC 5705 exporter secret threaded in by the server glue.
+    let tls_secret = request.tls_exporter_secret.clone();
+    // T6.4: correlation id from inbound request.
+    let cid = request.correlation_id.clone();
 
-    log::debug!("N32 request: {method} {path} ({}B)", body.len());
+    if !cid.is_empty() {
+        log::debug!("N32 request: cid={cid} {method} {path} ({}B)", body.len());
+    } else {
+        log::debug!("N32 request: {method} {path} ({}B)", body.len());
+    }
 
     match (method.as_str(), path.as_str()) {
-        ("POST", "/n32c-handshake/v1/exchange-capability") => handle_exchange_capability(&body),
-        ("POST", "/n32c-handshake/v1/exchange-params") => handle_exchange_params(&body),
+        ("POST", "/n32c-handshake/v1/exchange-capability") => {
+            handle_exchange_capability(&body, &cid)
+        }
+        ("POST", "/n32c-handshake/v1/exchange-params") => {
+            handle_exchange_params(&body, tls_secret.as_deref(), &cid)
+        }
         ("POST", "/n32c-handshake/v1/n32f-error") => handle_n32f_error_report(&body),
         ("POST", "/n32f-forward/v1/n32f-process") => handle_n32f_process(&body).await,
         _ => send_error(
@@ -209,16 +221,19 @@ fn update_node(node: &SeppNode) {
     };
 }
 
-fn handle_exchange_capability(body: &str) -> HttpResponse {
+fn handle_exchange_capability(body: &str, cid: &str) -> HttpResponse {
     let json: SecurityCapabilityRequestJson = match serde_json::from_str(body) {
         Ok(j) => j,
         Err(e) => {
+            log::warn!(
+                "cid={cid} reason=MALFORMED_EXCHANGE_CAPABILITY: {e}"
+            );
             return send_error(
                 400,
                 "Bad Request",
                 &format!("Malformed SecNegotiateReqData: {e}"),
                 Some("MANDATORY_IE_INCORRECT"),
-            )
+            );
         }
     };
     let req_data = req_data_from_json(&json);
@@ -268,24 +283,43 @@ fn handle_exchange_capability(body: &str) -> HttpResponse {
         }
         Err(e) => {
             // Capability mismatch => negotiation failure per TS 29.573
-            log::warn!("exchange-capability rejected: {e}");
+            log::warn!("cid={cid} reason=NEGOTIATION_NOT_ALLOWED: {e}");
             send_error(400, "Bad Request", &e, Some("NEGOTIATION_NOT_ALLOWED"))
         }
     }
 }
 
-fn handle_exchange_params(body: &str) -> HttpResponse {
+/// Handle an exchange-params request (responder side, T1.5b).
+///
+/// `tls_secret` is the RFC 5705 exporter secret extracted by the server
+/// glue from the N32-c TLS connection. When present (real TLS transport), we
+/// deposit it into the n32c_handler store keyed by the sender FQDN so
+/// `resolve_exporter_secret` picks it up instead of the no-TLS fallback.
+fn handle_exchange_params(body: &str, tls_secret: Option<&[u8]>, cid: &str) -> HttpResponse {
     let req: SecParamExchReqData = match serde_json::from_str(body) {
         Ok(j) => j,
         Err(e) => {
+            log::warn!(
+                "cid={cid} reason=MALFORMED_EXCHANGE_PARAMS: {e}"
+            );
             return send_error(
                 400,
                 "Bad Request",
                 &format!("Malformed SecParamExchReqData: {e}"),
                 Some("MANDATORY_IE_INCORRECT"),
-            )
+            );
         }
     };
+
+    // T1.5b: deposit the real TLS exporter secret before the handler calls
+    // `resolve_exporter_secret`, replacing the deterministic fallback.
+    if let Some(secret) = tls_secret {
+        log::debug!(
+            "cid={cid} depositing N32-c TLS exporter secret for peer [{}] (T1.5b)",
+            req.sender
+        );
+        n32c_handler::set_n32c_tls_exporter_secret(&req.sender, secret.to_vec());
+    }
 
     let mut node = match find_or_add_node(&req.sender) {
         Some(n) => n,
@@ -311,7 +345,10 @@ fn handle_exchange_params(body: &str) -> HttpResponse {
                 .unwrap_or_else(|_| HttpResponse::internal_error())
         }
         Err(e) => {
-            log::warn!("exchange-params rejected: {e}");
+            log::warn!(
+                "cid={cid} peer=[{}] reason=NEGOTIATION_NOT_ALLOWED: {e}",
+                req.sender
+            );
             send_error(400, "Bad Request", &e, Some("NEGOTIATION_NOT_ALLOWED"))
         }
     }

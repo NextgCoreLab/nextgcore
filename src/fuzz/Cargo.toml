@@ -55,3 +55,17 @@ path = "fuzz_targets/fuzz_diameter_message.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_ngap_message"
+path = "fuzz_targets/fuzz_ngap_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_s1ap_message"
+path = "fuzz_targets/fuzz_s1ap_message.rs"
+test = false
+doc = false
+bench = false

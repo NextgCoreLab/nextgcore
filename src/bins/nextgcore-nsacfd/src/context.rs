@@ -522,6 +522,9 @@ impl NsacfContext {
     /// Serialize quotas + memberships to the state file (atomic tmp+rename).
     /// Best-effort: failures are logged, never fatal.
     pub fn save_state(&self) {
+        // Monotonic sequence so concurrent saves use distinct tmp files (the
+        // rename is atomic, so last-writer-wins yields a consistent snapshot).
+        static SAVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = match self.state_file.read() {
             Ok(p) => match p.clone() {
                 Some(p) => p,
@@ -551,11 +554,25 @@ impl NsacfContext {
             "nextQuotaId": self.next_quota_id.load(Ordering::SeqCst),
             "quotas": quotas,
         });
-        let tmp = path.with_extension("tmp");
-        let result =
-            std::fs::write(&tmp, state.to_string()).and_then(|_| std::fs::rename(&tmp, &path));
-        if let Err(e) = result {
-            log::warn!("Failed to persist NSACF state to {}: {e}", path.display());
+        // Serialization above touches only in-memory RwLocks (fast). Offload the
+        // BLOCKING filesystem write+rename off the async executor so a request
+        // handler never stalls a tokio worker on disk I/O: when a runtime is
+        // active (the request-reachable path) spawn it on the blocking pool;
+        // otherwise (sync tests / non-async startup) write inline.
+        let body = state.to_string();
+        let seq = SAVE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp{seq}"));
+        let write = move || {
+            let result = std::fs::write(&tmp, &body).and_then(|_| std::fs::rename(&tmp, &path));
+            if let Err(e) = result {
+                log::warn!("Failed to persist NSACF state to {}: {e}", path.display());
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(write);
+            }
+            Err(_) => write(),
         }
     }
 
@@ -895,6 +912,43 @@ mod tests {
         assert_eq!(
             ctx2.quota_find_by_snssai(&s_nssai).unwrap().current_ues(),
             2
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn test_save_state_offloads_under_runtime() {
+        // Under a tokio runtime, save_state() offloads the file write to the
+        // blocking pool (fire-and-forget) instead of blocking the worker.
+        // Confirm the state still lands and reloads correctly.
+        let path = std::env::temp_dir()
+            .join(format!("nsacf-state-async-{}.json", uuid::Uuid::new_v4()));
+        let mut ctx = NsacfContext::new();
+        ctx.init(64);
+        ctx.set_state_file(Some(path.clone()));
+
+        let s_nssai = SNssai::new(6, Some(0x0A0B0C));
+        ctx.quota_add(s_nssai.clone(), 5, 10); // triggers an offloaded save_state
+
+        // The blocking write runs on the pool; poll briefly for it to land.
+        let mut persisted = false;
+        for _ in 0..100 {
+            if path.exists() {
+                persisted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(persisted, "save_state must persist under a tokio runtime");
+
+        let mut ctx2 = NsacfContext::new();
+        ctx2.init(64);
+        ctx2.set_state_file(Some(path.clone()));
+        assert!(ctx2.load_state());
+        assert_eq!(
+            ctx2.quota_find_by_snssai(&s_nssai).expect("restored").max_ues,
+            5
         );
 
         let _ = std::fs::remove_file(&path);

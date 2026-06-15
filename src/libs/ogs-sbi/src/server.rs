@@ -259,6 +259,10 @@ struct SbiService<H: SbiRequestHandler> {
     /// Maximum request body size, in bytes, buffered before rejecting with
     /// 413 (T1.4).
     max_request_body_size: usize,
+    /// RFC 5705 TLS exporter secret extracted from the N32-c TLS connection
+    /// once per connection (T1.5b). Shared across all multiplexed requests on
+    /// the same HTTP/2 connection and threaded into each `SbiRequest`.
+    tls_exporter_secret: Option<Vec<u8>>,
 }
 
 impl<H: SbiRequestHandler> Clone for SbiService<H> {
@@ -267,6 +271,7 @@ impl<H: SbiRequestHandler> Clone for SbiService<H> {
             handler: self.handler.clone(),
             oauth: self.oauth.clone(),
             max_request_body_size: self.max_request_body_size,
+            tls_exporter_secret: self.tls_exporter_secret.clone(),
         }
     }
 }
@@ -280,6 +285,7 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
         let handler = self.handler.clone();
         let oauth = self.oauth.clone();
         let max_body = self.max_request_body_size;
+        let tls_exporter_secret = self.tls_exporter_secret.clone();
         let path = req.uri().path().to_string();
 
         Box::pin(async move {
@@ -296,7 +302,7 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
             // Convert hyper request to SbiRequest, enforcing the body-size cap
             // BEFORE buffering (T1.4). An oversize body is rejected with 413
             // ProblemDetails without allocating the full body.
-            let sbi_request = match convert_request(req, max_body).await {
+            let sbi_request = match convert_request(req, max_body, tls_exporter_secret).await {
                 Ok(request) => request,
                 Err(ConvertRequestError::BodyTooLarge) => {
                     let body = serde_json::json!({
@@ -452,9 +458,18 @@ impl Http2Limits {
 /// body surfaces as [`ConvertRequestError::BodyTooLarge`] (mapped to 413 by
 /// the caller). Any other body-read error is treated as an empty body, matching
 /// the previous behaviour.
+///
+/// `tls_exporter_secret` is the RFC 5705 keying material derived from the
+/// N32-c TLS connection (T1.5b); `None` for plaintext connections.
+///
+/// Correlation ID extraction order (T6.4):
+/// 1. `x-request-id` header (verbatim)
+/// 2. `traceparent` trace-id field (the 32-hex-char segment after `00-`)
+/// 3. Synthesised from wall-clock nanoseconds as 32 hex chars
 async fn convert_request(
     req: Request<Incoming>,
     max_body_size: usize,
+    tls_exporter_secret: Option<Vec<u8>>,
 ) -> Result<SbiRequest, ConvertRequestError> {
     let method = req.method().to_string();
     let uri = req.uri().path().to_string();
@@ -466,6 +481,13 @@ async fn convert_request(
             http.set_header(key.to_string(), v.to_string());
         }
     }
+
+    // ── T6.4: correlation / request-ID extraction ──────────────────────────
+    // Prefer an explicit x-request-id, fall back to the trace-id embedded in
+    // a W3C traceparent, and synthesise one from the clock when neither is
+    // present. The chosen id is threaded into structured log lines and echoed
+    // outbound by the SBI client.
+    let correlation_id = extract_or_generate_correlation_id(&http);
 
     // Extract query parameters
     if let Some(query) = req.uri().query() {
@@ -497,7 +519,10 @@ async fn convert_request(
                             }
                         }
                         Err(e) => {
-                            log::warn!("Failed to decode multipart request body: {e}");
+                            log::warn!(
+                                "cid={correlation_id} Failed to decode multipart request body \
+                                 on {uri}: {e}"
+                            );
                             http.set_content(String::from_utf8_lossy(&bytes).to_string());
                         }
                     },
@@ -510,11 +535,15 @@ async fn convert_request(
             // distinguish that from a generic transport error.
             if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() {
                 log::warn!(
-                    "Rejecting request body over the {max_body_size}-byte limit on {uri}"
+                    "cid={correlation_id} method={method} path={uri} \
+                     reason=PAYLOAD_TOO_LARGE: body exceeds {max_body_size}-byte limit"
                 );
                 return Err(ConvertRequestError::BodyTooLarge);
             }
-            log::warn!("Failed to read request body on {uri}: {e}");
+            log::warn!(
+                "cid={correlation_id} method={method} path={uri} \
+                 reason=BODY_READ_ERROR: {e}"
+            );
         }
     }
 
@@ -523,7 +552,45 @@ async fn convert_request(
     let mut header = crate::message::SbiHeader::with_method_uri(method, uri);
     header.decompose_uri();
 
-    Ok(SbiRequest { header, http })
+    Ok(SbiRequest {
+        header,
+        http,
+        correlation_id,
+        tls_exporter_secret,
+    })
+}
+
+/// Extract or generate a correlation ID for request tracing (T6.4).
+///
+/// Priority:
+/// 1. `x-request-id` header (verbatim, at most 128 chars to bound memory)
+/// 2. Trace-id field from W3C `traceparent` (`00-<trace-id>-<span>-<flags>`)
+/// 3. 32 hex chars synthesised from wall-clock nanoseconds (128-bit ns value
+///    in big-endian, giving monotonically-ish increasing IDs without any new
+///    dependency).
+pub(crate) fn extract_or_generate_correlation_id(http: &SbiHttpMessage) -> String {
+    // 1. Explicit request ID header (preferred).
+    if let Some(id) = http.get_header("x-request-id") {
+        let id = id.trim();
+        if !id.is_empty() {
+            return id.chars().take(128).collect();
+        }
+    }
+
+    // 2. W3C traceparent: "00-<32-hex-trace-id>-<16-hex-span-id>-<2-hex-flags>"
+    if let Some(tp) = http.get_header("traceparent") {
+        let parts: Vec<&str> = tp.splitn(4, '-').collect();
+        if parts.len() == 4 && parts[1].len() == 32 {
+            return parts[1].to_string();
+        }
+    }
+
+    // 3. Synthesise from wall-clock nanoseconds (no new deps: just hex + time).
+    let ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{ns:032x}")
 }
 
 /// Convert SbiResponse to hyper response
@@ -694,11 +761,8 @@ impl SbiServer {
                     result = listener.accept() => {
                         match result {
                             Ok((stream, _)) => {
-                                let service = SbiService {
-                                    handler: handler.clone(),
-                                    oauth: oauth.clone(),
-                                    max_request_body_size,
-                                };
+                                let handler_ref = handler.clone();
+                                let oauth_ref = oauth.clone();
                                 let http2_limits = http2_limits;
 
                                 if let Some(ref acceptor) = tls_acceptor {
@@ -706,6 +770,34 @@ impl SbiServer {
                                     tokio::spawn(async move {
                                         match acceptor.accept(stream).await {
                                             Ok(tls_stream) => {
+                                                // ── T1.5b: extract RFC 5705 exporter secret ──
+                                                // `get_ref()` on a tokio_rustls server TlsStream
+                                                // yields `(&TcpStream, &ServerConnection)`.
+                                                // `ServerConnection` derefs to
+                                                // `ConnectionCommon<ServerConnectionData>` which
+                                                // exposes `export_keying_material`. We call this
+                                                // BEFORE moving the stream into TokioIo so we
+                                                // still hold the reference.
+                                                let tls_exporter_secret = {
+                                                    let (_, server_conn) = tls_stream.get_ref();
+                                                    crate::tls::export_n32f_session_key(
+                                                        server_conn,
+                                                        None,
+                                                    )
+                                                    .map_err(|e| {
+                                                        log::warn!(
+                                                            "N32-f TLS exporter failed on \
+                                                             server accept: {e}"
+                                                        );
+                                                    })
+                                                    .ok()
+                                                };
+                                                let service = SbiService {
+                                                    handler: handler_ref,
+                                                    oauth: oauth_ref,
+                                                    max_request_body_size,
+                                                    tls_exporter_secret,
+                                                };
                                                 let io = TokioIo::new(tls_stream);
                                                 let mut builder = http2::Builder::new(
                                                     hyper_util::rt::TokioExecutor::new()
@@ -724,6 +816,13 @@ impl SbiServer {
                                         }
                                     });
                                 } else {
+                                    let service = SbiService {
+                                        handler: handler_ref,
+                                        oauth: oauth_ref,
+                                        max_request_body_size,
+                                        // No TLS on plaintext connections.
+                                        tls_exporter_secret: None,
+                                    };
                                     let io = TokioIo::new(stream);
                                     tokio::spawn(async move {
                                         let mut builder = http2::Builder::new(
@@ -865,6 +964,92 @@ mod tests {
 
         assert_eq!(config.addr.port(), 8080);
         assert_eq!(config.interface, Some("sbi".to_string()));
+    }
+
+    // --- T6.4: correlation-id extraction and generation ---
+
+    /// Helper: build an `SbiHttpMessage` with the supplied headers.
+    fn http_with_headers(headers: &[(&str, &str)]) -> crate::message::SbiHttpMessage {
+        let mut http = crate::message::SbiHttpMessage::new();
+        for (k, v) in headers {
+            http.set_header(*k, *v);
+        }
+        http
+    }
+
+    #[test]
+    fn test_correlation_id_from_x_request_id() {
+        // An explicit x-request-id is used verbatim (T6.4 priority 1).
+        let http = http_with_headers(&[("x-request-id", "my-req-123")]);
+        let cid = extract_or_generate_correlation_id(&http);
+        assert_eq!(cid, "my-req-123");
+    }
+
+    #[test]
+    fn test_correlation_id_from_traceparent() {
+        // When x-request-id is absent the trace-id segment of a W3C traceparent
+        // is used (T6.4 priority 2).
+        let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let http = http_with_headers(&[("traceparent", tp)]);
+        let cid = extract_or_generate_correlation_id(&http);
+        assert_eq!(cid, "4bf92f3577b34da6a3ce929d0e0e4736");
+    }
+
+    #[test]
+    fn test_correlation_id_x_request_id_takes_precedence_over_traceparent() {
+        // x-request-id wins over traceparent when both are present (priority 1).
+        let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let http = http_with_headers(&[
+            ("x-request-id", "explicit-id"),
+            ("traceparent", tp),
+        ]);
+        let cid = extract_or_generate_correlation_id(&http);
+        assert_eq!(cid, "explicit-id");
+    }
+
+    #[test]
+    fn test_correlation_id_generated_when_no_headers() {
+        // No x-request-id or traceparent: synthesise from clock (priority 3).
+        let http = crate::message::SbiHttpMessage::new();
+        let cid = extract_or_generate_correlation_id(&http);
+        // The generated ID is 32 hex chars (128-bit nanoseconds in hex).
+        assert_eq!(cid.len(), 32, "generated cid must be 32 hex chars, got: {cid}");
+        assert!(
+            cid.chars().all(|c| c.is_ascii_hexdigit()),
+            "generated cid must be all hex digits, got: {cid}"
+        );
+    }
+
+    #[test]
+    fn test_correlation_id_generated_ids_are_distinct() {
+        // Two consecutive synthetic IDs should differ (wall-clock advances).
+        // We can't guarantee sub-nanosecond uniqueness in all environments, but
+        // after a brief sleep they must differ.
+        let http = crate::message::SbiHttpMessage::new();
+        let cid1 = extract_or_generate_correlation_id(&http);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let cid2 = extract_or_generate_correlation_id(&http);
+        assert_ne!(cid1, cid2, "successive generated cids should differ");
+    }
+
+    #[test]
+    fn test_correlation_id_x_request_id_truncated_to_128_chars() {
+        // Pathologically long x-request-id values are capped at 128 chars.
+        let long_id = "a".repeat(200);
+        let http = http_with_headers(&[("x-request-id", &long_id)]);
+        let cid = extract_or_generate_correlation_id(&http);
+        assert_eq!(cid.len(), 128);
+    }
+
+    #[test]
+    fn test_correlation_id_malformed_traceparent_falls_through_to_generated() {
+        // A traceparent that does not match the 4-segment / 32-hex-char shape
+        // must not be used; the function must fall through to synthesis.
+        let http = http_with_headers(&[("traceparent", "not-a-real-traceparent")]);
+        let cid = extract_or_generate_correlation_id(&http);
+        // Falls through to synthesis: 32 hex chars.
+        assert_eq!(cid.len(), 32);
+        assert!(cid.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
