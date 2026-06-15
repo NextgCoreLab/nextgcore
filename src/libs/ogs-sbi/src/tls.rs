@@ -3,8 +3,8 @@
 //! Provides certificate loading, key loading, and rustls configuration
 //! builders for TLS and mTLS on the SBI interface.
 //!
-//! Rel-20 (6G) additions:
-//! - Post-Quantum Cryptography (PQC) TLS 1.3 support
+//! Research/future-direction additions (not in any frozen 3GPP release; no Rel-20 stage-3 spec exists):
+//! - Post-Quantum Cryptography (PQC) TLS 1.3 support (NIST FIPS 203/204 algorithms)
 //! - Hybrid key exchange (X25519 + ML-KEM-768)
 //! - PQC signature algorithms (ML-DSA-65)
 //! - Certificate chain validation with PQC
@@ -20,7 +20,9 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig, SignatureScheme};
 use crate::error::{SbiError, SbiResult};
 
 // ============================================================================
-// Post-Quantum Cryptography (PQC) Support - Rel-20 (6G)
+// Post-Quantum Cryptography (PQC) Support
+// Research/future-direction — not in any frozen 3GPP release (no Rel-20 stage-3 spec exists).
+// Algorithms follow NIST FIPS 203 (ML-KEM) and FIPS 204 (ML-DSA).
 // ============================================================================
 
 /// PQC cipher suite support for TLS 1.3

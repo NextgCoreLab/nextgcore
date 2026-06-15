@@ -22,6 +22,7 @@ pub mod analytics;
 mod context;
 pub mod federation;
 pub mod ml_service;
+pub mod notification_dispatcher;
 mod sbi_handler;
 pub mod subscription;
 
@@ -160,6 +161,21 @@ async fn main() -> Result<()> {
     } else {
         ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id.clone(), 5);
     }
+
+    // Spawn the notification dispatcher background task (T5.3).
+    // It wakes every DEFAULT_DISPATCH_INTERVAL_SECS (30 s), computes analytics,
+    // and POSTs Nnwdaf_EventsSubscription_Notify to all due subscribers.
+    // The interval is intentionally short so subscriptions with the default
+    // repetition_period_secs=60 receive their first notification quickly.
+    let dispatch_interval = std::env::var("NWDAF_DISPATCH_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(notification_dispatcher::DEFAULT_DISPATCH_INTERVAL_SECS);
+    notification_dispatcher::spawn_dispatcher(nwdaf_self(), dispatch_interval);
+    log::info!(
+        "Notification dispatcher spawned (interval={}s)",
+        dispatch_interval
+    );
 
     log::info!("NextGCore NWDAF ready (instance: {nf_instance_id})");
 

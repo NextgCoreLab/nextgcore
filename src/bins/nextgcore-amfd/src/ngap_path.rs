@@ -4267,6 +4267,49 @@ fn snpn_allowed_nids() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Decode the 44-bit packed SNPN NID (TS 23.003 §12.7) carried in the
+/// Registration Request NID IE back to its canonical 11-uppercase-hex-digit
+/// string. The wire form is 6 octets: assignment-mode nibble first, then the
+/// 10-digit NID value MSB-first; the trailing nibble of the 6th octet is spare.
+/// Must mirror the sim encoder (`nextgsim-nas` `encode_nid_44bit`). Returns
+/// `None` if fewer than 6 octets are present.
+fn decode_nid_44bit(octets: &[u8]) -> Option<String> {
+    if octets.len() < 6 {
+        return None;
+    }
+    let mut s = String::with_capacity(11);
+    for &b in &octets[..5] {
+        s.push(char::from_digit((b >> 4) as u32, 16)?.to_ascii_uppercase());
+        s.push(char::from_digit((b & 0x0F) as u32, 16)?.to_ascii_uppercase());
+    }
+    s.push(char::from_digit((octets[5] >> 4) as u32, 16)?.to_ascii_uppercase());
+    Some(s)
+}
+
+/// Parse a Service-level-AA container's contents (TS 24.501 §9.11.2.10) and
+/// return the CAA-level UAV ID from the Service-level device ID parameter
+/// (param-IEI 0x10, type-4, UTF-8). Mirrors the sim encoder
+/// (`nextgsim-nas` `encode_service_level_aa_container`). Unknown type-4
+/// parameters are skipped per the spec's "ignore unknown IEI" rule.
+fn decode_service_level_aa_container(bytes: &[u8]) -> Option<String> {
+    let mut i = 0;
+    while i + 2 <= bytes.len() {
+        let ptype = bytes[i];
+        let plen = bytes[i + 1] as usize;
+        let start = i + 2;
+        if start + plen > bytes.len() {
+            break;
+        }
+        if ptype == 0x10 {
+            return std::str::from_utf8(&bytes[start..start + plen])
+                .ok()
+                .map(|s| s.to_string());
+        }
+        i = start + plen;
+    }
+    None
+}
+
 /// UAV geofence configuration for this AMF (Rel-18, TS 23.256).
 ///
 /// Returns `(min_lat, max_lat, min_lon, max_lon, min_alt, max_alt)` read from
@@ -4414,15 +4457,16 @@ fn parse_registration_request_pdu(nas: &[u8]) -> Option<ParsedRegistrationReques
                 pos += 2 + len;
             }
             // SNPN NID (IEI 0xA6, TLV): UE-included SNPN Network Identifier
-            // (Rel-17, TS 23.501 §5.30). Parse before the generic Type-1 arm.
+            // (Rel-17, TS 23.501 §5.30) carried as the 44-bit packed NID of
+            // TS 23.003 §12.7 (6 octets). Parse before the generic Type-1 arm.
             0xA6 => {
                 if pos + 1 >= nas.len() {
                     break;
                 }
                 let len = nas[pos + 1] as usize;
                 if pos + 2 + len <= nas.len() {
-                    if let Ok(nid) = std::str::from_utf8(&nas[pos + 2..pos + 2 + len]) {
-                        req.snpn_nid = Some(nid.to_string());
+                    if let Some(nid) = decode_nid_44bit(&nas[pos + 2..pos + 2 + len]) {
+                        req.snpn_nid = Some(nid);
                     }
                 }
                 pos += 2 + len;
@@ -4440,21 +4484,20 @@ fn parse_registration_request_pdu(nas: &[u8]) -> Option<ParsedRegistrationReques
                 }
                 pos += 2 + len;
             }
-            // UAV indication (IEI 0xA8, TLV): Rel-18, TS 23.256. Flags octet
-            // (bit 1 = aerial UE) followed by the UAV CAA-level ID string.
-            // Parse before the generic Type-1 arm.
-            0xA8 => {
-                if pos + 1 >= nas.len() {
+            // Service-level-AA container (IEI 0x72, TLV-E): Rel-17/18,
+            // TS 24.501 §9.11.2.10 / §8.2.6. Type-6 IE with a 2-octet length;
+            // contents carry the UAS CAA-level UAV ID as the Service-level
+            // device ID parameter (0x10, UTF-8). Parse before the generic arms.
+            0x72 => {
+                if pos + 2 >= nas.len() {
                     break;
                 }
-                let len = nas[pos + 1] as usize;
-                if len >= 1 && pos + 2 + len <= nas.len() && nas[pos + 2] & 0x01 == 0x01 {
-                    let caa_id = std::str::from_utf8(&nas[pos + 3..pos + 2 + len])
-                        .unwrap_or("")
-                        .to_string();
-                    req.uav_indication = Some(caa_id);
+                let len = ((nas[pos + 1] as usize) << 8) | nas[pos + 2] as usize;
+                if pos + 3 + len <= nas.len() {
+                    req.uav_indication =
+                        decode_service_level_aa_container(&nas[pos + 3..pos + 3 + len]);
                 }
-                pos += 2 + len;
+                pos += 3 + len;
             }
             // RedCap indication (IEI 0xA9, TLV): Rel-17, TS 38.101. A single
             // value octet whose bit 0 marks a reduced-capability device. Parse
@@ -4951,17 +4994,67 @@ mod tests {
 
     #[test]
     fn test_parse_registration_request_snpn_nid() {
-        // SNPN (Rel-17, TS 23.501 §5.30): the AMF parser extracts the NID IE.
+        // SNPN (Rel-17, TS 23.501 §5.30): the AMF parser extracts the NID IE,
+        // carried as the 44-bit packed NID of TS 23.003 §12.7 (6 octets).
         let mut nas = sample_registration_request();
-        let nid = b"7AB01234567";
+        // "7AB01234567" packed MSB-first, trailing nibble spare.
+        let packed = [0x7A, 0xB0, 0x12, 0x34, 0x56, 0x70];
         nas.push(0xA6); // SNPN NID IEI
-        nas.push(nid.len() as u8);
-        nas.extend_from_slice(nid);
+        nas.push(packed.len() as u8); // 6
+        nas.extend_from_slice(&packed);
 
         let req = parse_registration_request_pdu(&nas).expect("parse");
         assert_eq!(req.snpn_nid.as_deref(), Some("7AB01234567"));
         // The other IEs still parse correctly after the NID IE.
         assert_eq!(req.requested_nssai.len(), 1);
+    }
+
+    #[test]
+    fn test_decode_nid_44bit() {
+        // Mirrors the sim encoder; rejects short input (strict).
+        assert_eq!(
+            decode_nid_44bit(&[0x7A, 0xB0, 0x12, 0x34, 0x56, 0x70]).as_deref(),
+            Some("7AB01234567")
+        );
+        assert_eq!(
+            decode_nid_44bit(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF0]).as_deref(),
+            Some("FFFFFFFFFFF")
+        );
+        assert!(decode_nid_44bit(&[0x00; 5]).is_none());
+    }
+
+    #[test]
+    fn test_parse_registration_request_service_level_aa_container() {
+        // UAS (Rel-17/18, TS 24.501 §9.11.2.10): the AMF extracts the CAA-level
+        // UAV ID from the Service-level-AA container (IEI 0x72, TLV-E) via the
+        // Service-level device ID parameter (0x10, UTF-8).
+        let mut nas = sample_registration_request();
+        let caa = b"FAA-N12345";
+        let contents = [&[0x10u8, caa.len() as u8][..], caa].concat(); // device-ID param
+        nas.push(0x72); // Service-level-AA container IEI
+        nas.push((contents.len() >> 8) as u8); // 2-octet length, hi
+        nas.push((contents.len() & 0xFF) as u8); // lo
+        nas.extend_from_slice(&contents);
+
+        let req = parse_registration_request_pdu(&nas).expect("parse");
+        assert_eq!(req.uav_indication.as_deref(), Some("FAA-N12345"));
+        // The other IEs still parse correctly after the TLV-E container.
+        assert_eq!(req.requested_nssai.len(), 1);
+    }
+
+    #[test]
+    fn test_decode_service_level_aa_container() {
+        assert_eq!(
+            decode_service_level_aa_container(&[0x10, 0x03, b'A', b'B', b'C']).as_deref(),
+            Some("ABC")
+        );
+        // Unknown leading param skipped; device ID still found.
+        assert_eq!(
+            decode_service_level_aa_container(&[0x30, 0x01, 0xAA, 0x10, 0x02, b'X', b'Y'])
+                .as_deref(),
+            Some("XY")
+        );
+        assert!(decode_service_level_aa_container(&[0x30, 0x01, 0xAA]).is_none());
     }
 
     #[test]

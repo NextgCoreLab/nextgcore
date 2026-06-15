@@ -93,6 +93,14 @@ pub struct AnalyticsSubscription {
     pub expiry: u64,
     /// Subscription active flag
     pub active: bool,
+    /// Notification correlation ID (echoed in every Notify body)
+    pub notification_correlation_id: String,
+    /// Repetition period in seconds (None = one-shot / no periodic repeat).
+    /// Enforced by the dispatcher: a notification is suppressed if the elapsed
+    /// time since `last_notification_time` is less than this value.
+    pub repetition_period_secs: Option<u64>,
+    /// Unix timestamp of the last successfully dispatched notification.
+    pub last_notification_time: Option<u64>,
 }
 
 impl AnalyticsSubscription {
@@ -102,6 +110,7 @@ impl AnalyticsSubscription {
         notification_uri: String,
         expiry: u64,
     ) -> Self {
+        let notification_correlation_id = format!("corr-{}", uuid::Uuid::new_v4());
         Self {
             subscription_id,
             analytics_id,
@@ -110,6 +119,9 @@ impl AnalyticsSubscription {
             notification_uri,
             expiry,
             active: true,
+            notification_correlation_id,
+            repetition_period_secs: Some(60),
+            last_notification_time: None,
         }
     }
 
@@ -129,6 +141,29 @@ impl AnalyticsSubscription {
             .expect("value expected")
             .as_secs();
         now > self.expiry
+    }
+
+    /// Returns true if this subscription is due for a periodic notification.
+    ///
+    /// A subscription is due when:
+    /// - It is active and not expired.
+    /// - Either no notification has been sent yet, OR the elapsed time since
+    ///   the last notification meets or exceeds `repetition_period_secs`.
+    ///   If `repetition_period_secs` is `None` the subscription is treated as
+    ///   a one-shot: due only on the very first dispatch.
+    pub fn is_due_for_notification(&self) -> bool {
+        if !self.active || self.is_expired() {
+            return false;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::ZERO)
+            .as_secs();
+        match (self.last_notification_time, self.repetition_period_secs) {
+            (None, _) => true, // never notified → always due
+            (Some(_), None) => false, // one-shot already fired
+            (Some(last), Some(period)) => now.saturating_sub(last) >= period,
+        }
     }
 }
 
@@ -374,6 +409,33 @@ impl NwdafContext {
             .read()
             .map(|sources| sources.values().filter(|s| s.enabled).cloned().collect())
             .expect("value expected")
+    }
+
+    /// Get all active, non-expired subscriptions (for the notification dispatcher)
+    pub fn get_all_active_subscriptions(&self) -> Vec<AnalyticsSubscription> {
+        self.analytics_subscriptions
+            .read()
+            .map(|subs| {
+                subs.values()
+                    .filter(|s| s.active && !s.is_expired())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Record that a notification was just dispatched for a subscription.
+    /// Updates `last_notification_time` to the current Unix timestamp.
+    pub fn update_subscription_last_notification(&self, subscription_id: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or(std::time::Duration::ZERO)
+            .as_secs();
+        if let Ok(mut subs) = self.analytics_subscriptions.write() {
+            if let Some(sub) = subs.get_mut(subscription_id) {
+                sub.last_notification_time = Some(now);
+            }
+        }
     }
 
     pub fn subscription_count(&self) -> usize {

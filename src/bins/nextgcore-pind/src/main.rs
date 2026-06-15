@@ -9,9 +9,9 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use ogs_sbi::context::global_context;
-use ogs_sbi::message::{SbiRequest, SbiResponse};
+use ogs_sbi::message::{ProblemDetails, SbiRequest, SbiResponse};
 use ogs_sbi::server::{
-    send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
+    send_bad_request, send_forbidden, send_method_not_allowed, send_not_found, SbiServer,
     SbiServerConfig as OgsSbiServerConfig,
 };
 use std::net::SocketAddr;
@@ -149,6 +149,76 @@ async fn main() -> Result<()> {
     log::info!("PIN Manager shutdown complete");
 
     Ok(())
+}
+
+/// Extract the caller's SUPI (subscriber permanent identifier) from an
+/// incoming SBI request.
+///
+/// Extraction strategy (in priority order):
+///
+/// 1. **`x-caller-supi`** — a lightweight bespoke header set by NF consumers
+///    (AMF, SMF, UDM) when invoking PIN management operations directly.
+///    This is the primary mechanism for intra-core calls where the caller is
+///    already authenticated.
+///
+/// 2. **`3gpp-Sbi-Consumer-Info`** — TS 29.500 §5.2.3 consumer identity
+///    header; the SUPI is the value verbatim when the NF consumer is a UE
+///    (format: `imsi-…`, `nai-…`, `msisdn-…`).  For machine NF-to-NF calls
+///    this header carries an NF instance ID, which we accept as-is — the
+///    caller_supi check in the context layer will reject it unless it
+///    coincidentally matches the owner SUPI, effectively denying the operation.
+///
+/// **Gap note**: there is no standardised 3GPP SBI header that carries a UE
+/// SUPI on NF-to-NF requests.  In a production deployment the SUPI would
+/// typically be extracted from the JWT bearer token's `sub` claim after
+/// OAuth2 verification (TS 33.501 §13.4).  Until `require_oauth2` is enabled
+/// on the pind server config and the JWT sub-claim extraction is wired in,
+/// management-operation callers without the `x-caller-supi` header will be
+/// treated as anonymous and denied PEMC registration.
+fn extract_caller_supi(request: &SbiRequest) -> Option<String> {
+    // 1. Bespoke intra-core header (highest trust — set by authenticated NF consumers)
+    if let Some(v) = request.http.get_header("x-caller-supi") {
+        let v = v.trim();
+        if !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    // 2. TS 29.500 §5.2.3 consumer-info header (best-effort)
+    if let Some(v) = request.http.get_header("3gpp-Sbi-Consumer-Info") {
+        let v = v.trim();
+        if !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+/// Build a 403 Forbidden `application/problem+json` response for a PIN
+/// authorization failure (TS 29.500 §5.2.7).
+fn send_pin_forbidden(err: &PinContextError, problem_type: &str) -> SbiResponse {
+    let problem = ProblemDetails::with_status(403)
+        .with_title("Forbidden")
+        .with_detail(err.detail())
+        .with_cause(err.cause());
+    // Attach the PIN-specific problem type URI.
+    let mut response = SbiResponse::with_status(403).with_problem(&problem);
+    // Overwrite the body with the type field included.
+    let body = serde_json::json!({
+        "type": problem_type,
+        "title": "Forbidden",
+        "status": 403,
+        "detail": err.detail(),
+        "cause": err.cause(),
+    });
+    if let Ok(json) = serde_json::to_string(&body) {
+        response
+            .http
+            .set_content(json);
+        response
+            .http
+            .set_header("Content-Type", "application/problem+json");
+    }
+    response
 }
 
 /// PIN Manager SBI request handler
@@ -328,15 +398,24 @@ async fn handle_element_register(pin_id: &str, request: &SbiRequest) -> SbiRespo
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    // Extract caller identity for authorization.
+    let caller_supi = extract_caller_supi(request);
+
     let ctx = pin_self();
     let result = if let Ok(context) = ctx.read() {
-        context.element_register(pin_id, elem_type, capabilities, host_supi)
+        context.element_register(
+            pin_id,
+            elem_type,
+            capabilities,
+            host_supi,
+            caller_supi.as_deref(),
+        )
     } else {
-        None
+        Err(PinContextError::NotFound)
     };
 
     match result {
-        Some(elem) => SbiResponse::with_status(201)
+        Ok(elem) => SbiResponse::with_status(201)
             .with_json_body(&serde_json::json!({
                 "elementId": elem.element_id,
                 "elementType": elem_type_str,
@@ -345,10 +424,18 @@ async fn handle_element_register(pin_id: &str, request: &SbiRequest) -> SbiRespo
                 "capabilities": elem.capabilities,
             }))
             .unwrap_or_else(|_| SbiResponse::with_status(201)),
-        None => send_bad_request(
-            &format!("Failed to register element in PIN {pin_id}"),
-            Some("REGISTRATION_FAILED"),
+        Err(PinContextError::NotFound) => send_not_found(
+            &format!("PIN {pin_id} not found"),
+            Some("PIN_NOT_FOUND"),
         ),
+        Err(PinContextError::PemcRequiresOwner) => send_pin_forbidden(
+            &PinContextError::PemcRequiresOwner,
+            "urn:3gpp:pin:element-authorization-failed",
+        ),
+        Err(PinContextError::RelayOnlyForPegc) => {
+            // Logically impossible here, but satisfy the exhaustive match.
+            send_forbidden("Unexpected role violation", Some("ROLE_VIOLATION"))
+        }
     }
 }
 
@@ -447,21 +534,28 @@ async fn handle_element_relay(element_id: &str, request: &SbiRequest) -> SbiResp
         .unwrap_or_default();
 
     let ctx = pin_self();
-    let ok = if let Ok(context) = ctx.read() {
+    let result = if let Ok(context) = ctx.read() {
         context.element_set_relay(element_id, relay_path)
     } else {
-        false
+        Err(PinContextError::NotFound)
     };
 
-    if ok {
-        SbiResponse::with_status(200)
+    match result {
+        Ok(()) => SbiResponse::with_status(200)
             .with_json_body(&serde_json::json!({"elementId": element_id, "result": "RELAY_SET"}))
-            .unwrap_or_else(|_| SbiResponse::with_status(200))
-    } else {
-        send_not_found(
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        Err(PinContextError::NotFound) => send_not_found(
             &format!("Element {element_id} not found"),
             Some("ELEMENT_NOT_FOUND"),
-        )
+        ),
+        Err(PinContextError::RelayOnlyForPegc) => send_pin_forbidden(
+            &PinContextError::RelayOnlyForPegc,
+            "urn:3gpp:pin:relay-authorization-failed",
+        ),
+        Err(PinContextError::PemcRequiresOwner) => {
+            // Logically impossible here, but satisfy the exhaustive match.
+            send_forbidden("Unexpected role violation", Some("ROLE_VIOLATION"))
+        }
     }
 }
 
@@ -533,6 +627,7 @@ fn parse_host_port(uri: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ogs_sbi::message::SbiRequest;
 
     #[test]
     fn test_args_default() {
@@ -540,5 +635,74 @@ mod tests {
         assert_eq!(args.config, "/etc/nextgcore/pin.yaml");
         assert_eq!(args.sbi_port, 7815);
         assert_eq!(args.max_pins, 1024);
+    }
+
+    // T4.4: extract_caller_supi helper tests
+    #[test]
+    fn test_extract_caller_supi_x_header() {
+        let request = SbiRequest::post("/npin-pinmanagement/v1/pins/pin-1/elements")
+            .with_header("x-caller-supi", "imsi-001010000000007");
+        assert_eq!(
+            extract_caller_supi(&request).as_deref(),
+            Some("imsi-001010000000007")
+        );
+    }
+
+    #[test]
+    fn test_extract_caller_supi_consumer_info_fallback() {
+        let request = SbiRequest::post("/npin-pinmanagement/v1/pins/pin-1/elements")
+            .with_header("3gpp-Sbi-Consumer-Info", "imsi-001010000000008");
+        assert_eq!(
+            extract_caller_supi(&request).as_deref(),
+            Some("imsi-001010000000008")
+        );
+    }
+
+    #[test]
+    fn test_extract_caller_supi_x_header_takes_precedence() {
+        let request = SbiRequest::post("/npin-pinmanagement/v1/pins/pin-1/elements")
+            .with_header("x-caller-supi", "imsi-primary")
+            .with_header("3gpp-Sbi-Consumer-Info", "imsi-secondary");
+        assert_eq!(
+            extract_caller_supi(&request).as_deref(),
+            Some("imsi-primary")
+        );
+    }
+
+    #[test]
+    fn test_extract_caller_supi_absent() {
+        let request = SbiRequest::post("/npin-pinmanagement/v1/pins/pin-1/elements");
+        assert_eq!(extract_caller_supi(&request), None);
+    }
+
+    // T4.4: send_pin_forbidden produces correct problem+json
+    #[test]
+    fn test_send_pin_forbidden_problem_shape() {
+        let response = send_pin_forbidden(
+            &PinContextError::PemcRequiresOwner,
+            "urn:3gpp:pin:element-authorization-failed",
+        );
+        assert_eq!(response.status, 403);
+        let ct = response.http.get_header("content-type").map(String::as_str);
+        assert_eq!(ct, Some("application/problem+json"));
+
+        let body: serde_json::Value =
+            serde_json::from_str(response.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["status"], 403);
+        assert_eq!(body["cause"], "PEMC_REQUIRES_OWNER");
+        assert_eq!(body["type"], "urn:3gpp:pin:element-authorization-failed");
+    }
+
+    #[test]
+    fn test_send_pin_forbidden_relay_shape() {
+        let response = send_pin_forbidden(
+            &PinContextError::RelayOnlyForPegc,
+            "urn:3gpp:pin:relay-authorization-failed",
+        );
+        assert_eq!(response.status, 403);
+        let body: serde_json::Value =
+            serde_json::from_str(response.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["cause"], "RELAY_ONLY_FOR_PEGC");
+        assert_eq!(body["type"], "urn:3gpp:pin:relay-authorization-failed");
     }
 }

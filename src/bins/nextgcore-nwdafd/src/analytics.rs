@@ -6,6 +6,14 @@
 //! - QoS Sustainability (§6.9): predicted QoS degradation
 //! - Slice Load (§6.10): per-slice resource utilization
 //! - Abnormal Behaviour (§6.5): anomaly detection
+//!
+//! # OPERATIONAL ALGORITHM
+//!
+//! **All analytics in this module use linear regression (slope) on the last N
+//! samples.** The `confidence` field reflects sample count relative to the
+//! maximum window size — it does NOT reflect model accuracy. No ML model is
+//! used. When `Nnwdaf_MLModelProvision` models are integrated, the prediction
+//! path should switch to model-accuracy metrics (TS 23.288 §6.14).
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -126,7 +134,14 @@ impl AnalyticsEngine {
         buf.push(sample);
     }
 
-    /// Compute NF load analytics for a given instance
+    /// Compute NF load analytics for a given instance.
+    ///
+    /// OPERATIONAL ALGORITHM: linear regression (slope) on the last N samples
+    /// (up to 5). `predicted_load` is the last observed CPU plus the linear
+    /// slope, clamped to [0, 1]. `confidence` reflects sample count relative
+    /// to `MAX_SAMPLES`, not model accuracy; no ML model is used. When
+    /// `Nnwdaf_MLModelProvision` models are integrated this should switch to
+    /// model-accuracy metrics (TS 23.288 §6.14).
     pub fn compute_nf_load(&self, nf_instance_id: &str) -> Option<NfLoadAnalytics> {
         let samples = self.nf_samples.get(nf_instance_id)?;
         if samples.is_empty() {

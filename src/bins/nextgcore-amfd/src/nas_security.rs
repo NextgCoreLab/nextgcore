@@ -495,7 +495,7 @@ pub struct SecurityAlgorithmSet {
     pub integrity: u8, // bit mask
 }
 
-/// PQC algorithm identifiers (Rel-20 research, using spare 5G-EA4/5G-IA4 slots)
+/// PQC algorithm identifiers (research prototype, not in any frozen 3GPP release; using spare 5G-EA4/5G-IA4 slots)
 pub mod pqc_algorithm {
     /// 5G-EA4: Hybrid KEM (X25519 + ML-KEM-768) for key derivation
     pub const NEA4_PQC_HYBRID: u8 = 4;

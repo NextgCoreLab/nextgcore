@@ -18,6 +18,37 @@ pub enum PinElementType {
     ManagementEntity,
 }
 
+/// PIN Element role (TS 23.542 §5.2)
+///
+/// Mapping from `PinElementType`:
+///   - `Gateway`          → `Pegc`   (carries relay/routing capability)
+///   - `ManagementEntity` → `Pemc`   (carries management capability)
+///   - `Element`          → `Regular` (plain sensor/actuator, no special privilege)
+///
+/// A separate enum is kept (rather than just using `PinElementType`) so that
+/// future spec revisions can introduce new types without silently expanding
+/// role semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinElementRole {
+    /// PIN Element with Management Capability — may perform PIN management ops.
+    Pemc,
+    /// PIN Element with Gateway Capability — may have relay semantics.
+    Pegc,
+    /// Plain element — no elevated privilege.
+    Regular,
+}
+
+impl PinElementRole {
+    /// Derive the role from the element type.
+    pub fn from_type(element_type: PinElementType) -> Self {
+        match element_type {
+            PinElementType::ManagementEntity => PinElementRole::Pemc,
+            PinElementType::Gateway => PinElementRole::Pegc,
+            PinElementType::Element => PinElementRole::Regular,
+        }
+    }
+}
+
 /// PIN Element status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PinElementStatus {
@@ -35,6 +66,8 @@ pub struct PinElement {
     pub element_id: String,
     /// Element type
     pub element_type: PinElementType,
+    /// Element role (derived from type at registration time)
+    pub role: PinElementRole,
     /// Element status
     pub status: PinElementStatus,
     /// PIN ID this element belongs to
@@ -64,6 +97,44 @@ pub struct PersonalIotNetwork {
     pub member_ids: Vec<String>,
     /// PIN status
     pub active: bool,
+}
+
+/// Error type for authorization-gated context operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinContextError {
+    /// The caller is not the PIN owner and has no PEMC privilege.
+    /// Cause: `PEMC_REQUIRES_OWNER`
+    PemcRequiresOwner,
+    /// The target element exists but is not a PEGC.
+    /// Cause: `RELAY_ONLY_FOR_PEGC`
+    RelayOnlyForPegc,
+    /// The requested resource (PIN or element) was not found.
+    NotFound,
+}
+
+impl PinContextError {
+    /// A machine-readable cause string for ProblemDetails.
+    pub fn cause(&self) -> &'static str {
+        match self {
+            PinContextError::PemcRequiresOwner => "PEMC_REQUIRES_OWNER",
+            PinContextError::RelayOnlyForPegc => "RELAY_ONLY_FOR_PEGC",
+            PinContextError::NotFound => "NOT_FOUND",
+        }
+    }
+
+    /// A human-readable detail string.
+    pub fn detail(&self) -> &'static str {
+        match self {
+            PinContextError::PemcRequiresOwner => {
+                "Registering a PEMC (management) element requires the caller \
+                 to be the PIN owner or an already-registered PEMC of this PIN"
+            }
+            PinContextError::RelayOnlyForPegc => {
+                "A relay path may only be set on a PEGC (gateway) element"
+            }
+            PinContextError::NotFound => "The requested resource was not found",
+        }
+    }
 }
 
 /// PIN Context
@@ -208,23 +279,63 @@ impl PinContext {
         self.pin_networks.read().map(|p| p.len()).unwrap_or(0)
     }
 
-    /// Register a PIN Element (TS 23.542 6.2)
+    /// Register a PIN Element (TS 23.542 6.2).
+    ///
+    /// Authorization rule: registering a PEMC (`ManagementEntity`) element
+    /// requires `caller_supi` to be either the PIN owner or an already-
+    /// registered PEMC member of the same PIN.  All other element types are
+    /// unrestricted.
+    ///
+    /// Returns `Err(PinContextError::NotFound)` when `pin_id` does not exist.
+    /// Returns `Err(PinContextError::PemcRequiresOwner)` on role violation.
     pub fn element_register(
         &self,
         pin_id: &str,
         element_type: PinElementType,
         capabilities: Vec<String>,
         host_supi: Option<String>,
-    ) -> Option<PinElement> {
-        let mut pins = self.pin_networks.write().ok()?;
-        let mut elements = self.elements.write().ok()?;
+        caller_supi: Option<&str>,
+    ) -> Result<PinElement, PinContextError> {
+        let mut pins = self.pin_networks.write().map_err(|_| PinContextError::NotFound)?;
+        let mut elements = self.elements.write().map_err(|_| PinContextError::NotFound)?;
 
-        let pin = pins.get_mut(pin_id)?;
+        let pin = pins.get_mut(pin_id).ok_or(PinContextError::NotFound)?;
+
+        // Authorization: only the PIN owner or an existing PEMC may register
+        // a new PEMC (management) element.
+        if element_type == PinElementType::ManagementEntity {
+            let caller = caller_supi.unwrap_or("");
+            let is_owner = caller == pin.owner_supi;
+            let is_existing_pemc = pin.member_ids.iter().any(|id| {
+                elements
+                    .get(id)
+                    .map(|e| e.role == PinElementRole::Pemc)
+                    .unwrap_or(false)
+                    && elements
+                        .get(id)
+                        .and_then(|e| e.host_supi.as_deref())
+                        .map(|s| s == caller)
+                        .unwrap_or(false)
+            });
+
+            if !is_owner && !is_existing_pemc {
+                log::warn!(
+                    "PEMC registration denied: caller={:?} is not owner of PIN {} (owner={})",
+                    caller_supi,
+                    pin_id,
+                    pin.owner_supi
+                );
+                return Err(PinContextError::PemcRequiresOwner);
+            }
+        }
+
         let element_id = self.alloc_id("pe");
+        let role = PinElementRole::from_type(element_type);
 
         let element = PinElement {
             element_id: element_id.clone(),
             element_type,
+            role,
             status: PinElementStatus::Registered,
             pin_id: pin_id.to_string(),
             capabilities,
@@ -242,12 +353,13 @@ impl PinContext {
         elements.insert(element_id, element.clone());
 
         log::info!(
-            "PIN Element registered: {} (type={:?}, pin={})",
+            "PIN Element registered: {} (type={:?}, role={:?}, pin={})",
             element.element_id,
             element_type,
+            role,
             pin_id
         );
-        Some(element)
+        Ok(element)
     }
 
     /// Deregister a PIN Element
@@ -294,15 +406,39 @@ impl PinContext {
             .collect()
     }
 
-    /// Set up communication relay path between elements
-    pub fn element_set_relay(&self, element_id: &str, relay_path: Vec<String>) -> bool {
+    /// Set up communication relay path between elements (TS 23.542 §6).
+    ///
+    /// Authorization rule: relay semantics may only be assigned to a PEGC
+    /// (gateway) element.
+    ///
+    /// Returns:
+    ///   - `Ok(())` on success.
+    ///   - `Err(PinContextError::NotFound)` when the element does not exist.
+    ///   - `Err(PinContextError::RelayOnlyForPegc)` when the element is not a PEGC.
+    pub fn element_set_relay(
+        &self,
+        element_id: &str,
+        relay_path: Vec<String>,
+    ) -> Result<(), PinContextError> {
         if let Ok(mut elements) = self.elements.write() {
-            if let Some(element) = elements.get_mut(element_id) {
-                element.relay_path = relay_path;
-                return true;
+            match elements.get_mut(element_id) {
+                None => Err(PinContextError::NotFound),
+                Some(element) => {
+                    if element.role != PinElementRole::Pegc {
+                        log::warn!(
+                            "Relay path denied on element {} (role={:?}): only PEGC allowed",
+                            element_id,
+                            element.role
+                        );
+                        return Err(PinContextError::RelayOnlyForPegc);
+                    }
+                    element.relay_path = relay_path;
+                    Ok(())
+                }
             }
+        } else {
+            Err(PinContextError::NotFound)
         }
-        false
     }
 
     pub fn element_count(&self) -> usize {
@@ -397,10 +533,12 @@ mod tests {
                 PinElementType::Gateway,
                 vec!["relay".to_string(), "routing".to_string()],
                 Some("imsi-001010000000001".to_string()),
+                Some("imsi-001010000000001"),
             )
             .unwrap();
 
         assert_eq!(gw.element_type, PinElementType::Gateway);
+        assert_eq!(gw.role, PinElementRole::Pegc);
         assert_eq!(ctx.element_count(), 1);
 
         // Gateway should be set on PIN
@@ -422,13 +560,17 @@ mod tests {
             PinElementType::Element,
             vec!["temperature".to_string(), "humidity".to_string()],
             None,
-        );
+            None,
+        )
+        .ok();
         ctx.element_register(
             &pin.pin_id,
             PinElementType::Element,
             vec!["camera".to_string()],
             None,
-        );
+            None,
+        )
+        .ok();
 
         let all = ctx.element_discover(&pin.pin_id, None);
         assert_eq!(all.len(), 2);
@@ -440,6 +582,166 @@ mod tests {
         assert_eq!(cameras.len(), 1);
     }
 
+    // T4.4-a: PEMC registration — owner and non-owner paths
+    #[test]
+    fn test_pemc_registration_owner_allowed() {
+        let mut ctx = PinContext::new();
+        ctx.init(64);
+
+        let pin = ctx
+            .pin_create("Home", "imsi-owner-001")
+            .unwrap();
+
+        // Owner registers a PEMC → ok
+        let result = ctx.element_register(
+            &pin.pin_id,
+            PinElementType::ManagementEntity,
+            vec![],
+            Some("imsi-owner-001".to_string()),
+            Some("imsi-owner-001"),
+        );
+        assert!(result.is_ok(), "owner should be allowed to register PEMC");
+        let elem = result.unwrap();
+        assert_eq!(elem.role, PinElementRole::Pemc);
+    }
+
+    #[test]
+    fn test_pemc_registration_non_owner_denied() {
+        let mut ctx = PinContext::new();
+        ctx.init(64);
+
+        let pin = ctx
+            .pin_create("Home", "imsi-owner-001")
+            .unwrap();
+
+        // Non-owner tries to register a PEMC → role error
+        let result = ctx.element_register(
+            &pin.pin_id,
+            PinElementType::ManagementEntity,
+            vec![],
+            Some("imsi-attacker-999".to_string()),
+            Some("imsi-attacker-999"),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            PinContextError::PemcRequiresOwner,
+            "non-owner must be denied PEMC registration"
+        );
+    }
+
+    #[test]
+    fn test_pemc_registration_absent_caller_denied() {
+        let mut ctx = PinContext::new();
+        ctx.init(64);
+
+        let pin = ctx.pin_create("Home", "imsi-owner-001").unwrap();
+
+        // No caller identity → denied
+        let result = ctx.element_register(
+            &pin.pin_id,
+            PinElementType::ManagementEntity,
+            vec![],
+            None,
+            None,
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            PinContextError::PemcRequiresOwner,
+            "absent caller must be denied PEMC registration"
+        );
+    }
+
+    // T4.4-b: relay path — PEGC allowed, plain element denied
+    #[test]
+    fn test_relay_set_on_pegc_allowed() {
+        let mut ctx = PinContext::new();
+        ctx.init(64);
+
+        let pin = ctx.pin_create("Smart Home", "imsi-001010000000001").unwrap();
+        let gw = ctx
+            .element_register(
+                &pin.pin_id,
+                PinElementType::Gateway,
+                vec!["relay".to_string()],
+                None,
+                Some("imsi-001010000000001"),
+            )
+            .unwrap();
+
+        let result = ctx.element_set_relay(&gw.element_id, vec!["pe-upstream".to_string()]);
+        assert!(result.is_ok(), "relay on PEGC should succeed");
+
+        let found = ctx.element_find(&gw.element_id).unwrap();
+        assert_eq!(found.relay_path, vec!["pe-upstream".to_string()]);
+    }
+
+    #[test]
+    fn test_relay_set_on_plain_element_denied() {
+        let mut ctx = PinContext::new();
+        ctx.init(64);
+
+        let pin = ctx.pin_create("Smart Home", "imsi-001010000000001").unwrap();
+        let elem = ctx
+            .element_register(
+                &pin.pin_id,
+                PinElementType::Element,
+                vec!["sensor".to_string()],
+                None,
+                None,
+            )
+            .unwrap();
+
+        let result = ctx.element_set_relay(&elem.element_id, vec!["pe-gw".to_string()]);
+        assert_eq!(
+            result.unwrap_err(),
+            PinContextError::RelayOnlyForPegc,
+            "relay on plain element must be denied"
+        );
+    }
+
+    #[test]
+    fn test_relay_set_on_nonexistent_element() {
+        let ctx = PinContext::new();
+        let result = ctx.element_set_relay("nonexistent-id", vec![]);
+        assert_eq!(result.unwrap_err(), PinContextError::NotFound);
+    }
+
+    // T4.4-c: PIN create records owner (verified via PEMC registration)
+    #[test]
+    fn test_pin_owner_recorded_and_enforced() {
+        let mut ctx = PinContext::new();
+        ctx.init(64);
+
+        let pin = ctx.pin_create("Home", "imsi-real-owner").unwrap();
+        // PIN's owner_supi is stored correctly
+        assert_eq!(pin.owner_supi, "imsi-real-owner");
+
+        // Owner can register PEMC
+        assert!(ctx
+            .element_register(
+                &pin.pin_id,
+                PinElementType::ManagementEntity,
+                vec![],
+                Some("imsi-real-owner".to_string()),
+                Some("imsi-real-owner"),
+            )
+            .is_ok());
+
+        // A different caller cannot
+        assert_eq!(
+            ctx.element_register(
+                &pin.pin_id,
+                PinElementType::ManagementEntity,
+                vec![],
+                Some("imsi-impostor".to_string()),
+                Some("imsi-impostor"),
+            )
+            .unwrap_err(),
+            PinContextError::PemcRequiresOwner
+        );
+    }
+
+    // Legacy relay test updated for new signature
     #[test]
     fn test_element_relay_path() {
         let mut ctx = PinContext::new();
@@ -448,16 +750,20 @@ mod tests {
         let pin = ctx
             .pin_create("Smart Home", "imsi-001010000000001")
             .unwrap();
+        // Use Gateway type so relay is permitted
         let elem = ctx
             .element_register(
                 &pin.pin_id,
-                PinElementType::Element,
+                PinElementType::Gateway,
                 vec!["sensor".to_string()],
                 None,
+                Some("imsi-001010000000001"),
             )
             .unwrap();
 
-        assert!(ctx.element_set_relay(&elem.element_id, vec!["pe-gw".to_string()]));
+        assert!(ctx
+            .element_set_relay(&elem.element_id, vec!["pe-gw".to_string()])
+            .is_ok());
         let found = ctx.element_find(&elem.element_id).unwrap();
         assert_eq!(found.relay_path, vec!["pe-gw".to_string()]);
     }

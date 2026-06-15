@@ -51,6 +51,12 @@ pub async fn handle_analytics_info_query(request: &SbiRequest) -> SbiResponse {
         vec![]
     };
 
+    // T5.4 HONESTY NOTE: the current analytics engine uses linear regression
+    // (slope on the last N samples), NOT an ML model. The `confidence` field
+    // reflects sample count, not model accuracy. If Nnwdaf_MLModelProvision
+    // models are integrated this should switch to model-accuracy metrics
+    // (TS 23.288 §6.14). Registered ML model records are shown when present,
+    // but their `accuracy` field is provisioned externally, not measured here.
     let analytics_result = serde_json::json!({
         "analyticsId": analytics_type,
         "targetOfAnalytics": {
@@ -67,7 +73,10 @@ pub async fn handle_analytics_info_query(request: &SbiRequest) -> SbiResponse {
         }).collect::<Vec<_>>(),
         "analyticsReport": {
             "timestamp": chrono::Utc::now().to_rfc3339(),
+            // Confidence reflects registered model count only; the underlying
+            // prediction algorithm is linear regression, not an ML model.
             "confidence": if !models.is_empty() { 0.85 } else { 0.0 },
+            "algorithmNote": "linear-regression-slope; no ML model active",
         },
     });
 
@@ -114,6 +123,20 @@ pub async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
         .and_then(|v| v.as_u64())
         .unwrap_or(3600);
 
+    // TS 29.520 §5.2.2.2: notificationCorrelationId from the consumer;
+    // fall back to a generated value if absent.
+    let notification_correlation_id = data
+        .get("notificationCorrelationId")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| format!("corr-{}", uuid::Uuid::new_v4()));
+
+    // repetitionPeriod (seconds) controls how frequently the NWDAF fires
+    // periodic notifications for this subscription (TS 29.520 §5.2.2.2).
+    let repetition_period_secs = data
+        .get("repetitionPeriod")
+        .and_then(|v| v.as_u64());
+
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("value expected")
@@ -126,6 +149,8 @@ pub async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
         notification_uri.to_string(),
         now + expiry_seconds,
     );
+    subscription.notification_correlation_id = notification_correlation_id.clone();
+    subscription.repetition_period_secs = repetition_period_secs;
 
     if let Some(supi) = data
         .get("targetOfAnalytics")
@@ -164,6 +189,7 @@ pub async fn handle_subscription_create(request: &SbiRequest) -> SbiResponse {
                 "subscriptionId": sub_id,
                 "analyticsId": analytics_type,
                 "notificationUri": notification_uri,
+                "notificationCorrelationId": notification_correlation_id,
                 "expiryTime": expiry_seconds,
             }))
             .unwrap_or_else(|_| SbiResponse::with_status(201)),

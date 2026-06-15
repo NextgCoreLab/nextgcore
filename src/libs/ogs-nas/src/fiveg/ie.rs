@@ -666,7 +666,8 @@ impl PduAddress {
 }
 
 // ============================================================================
-// 6G Extension IEs (Rel-20)
+// 6G Extension IEs (research prototypes — not in any frozen 3GPP release;
+// no Rel-20 stage-3 spec exists; design informed by TR 22.870 use cases only)
 // ============================================================================
 
 /// AI/ML Capability IE (6G extension)

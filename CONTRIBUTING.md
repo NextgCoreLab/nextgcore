@@ -1,6 +1,6 @@
 # Contributing to NextGCore
 
-NextGCore is a 5G Core Network implementation in Rust targeting 3GPP Rel-15 through Rel-20 (6G research).
+NextGCore is a research-faithful 5G Core Network implementation in Rust targeting 3GPP Rel-15 with selected Rel-17/18 features. 6G/Rel-20 items (ISAC, FL, PQC, semantic, agent-native) are non-normative prototypes — no frozen Rel-20 3GPP specs exist.
 
 ## Prerequisites
 
