@@ -324,13 +324,25 @@ pub fn protect_nas_message(
         message.to_vec()
     };
 
-    // Calculate MAC
-    let mac = ctx.calculate_mac(direction, bearer, count, &protected_message)?;
+    // The on-wire Sequence Number octet uses the COUNT of the sending
+    // direction (uplink for UE→net, downlink for net→UE).
+    let sn = if direction == 0 {
+        ctx.ul_count.sqn
+    } else {
+        ctx.dl_count.sqn
+    };
+
+    // Integrity MAC covers octet 7 to n per TS 24.501 §4.4.3.3 a): the
+    // Sequence Number octet followed by the (ciphered) NAS message IE.
+    let mut mac_input = Vec::with_capacity(1 + protected_message.len());
+    mac_input.push(sn);
+    mac_input.extend_from_slice(&protected_message);
+    let mac = ctx.calculate_mac(direction, bearer, count, &mac_input)?;
 
     // Build security header + protected message
     let mut result = BytesMut::with_capacity(6 + protected_message.len());
     result.put_slice(&mac);
-    result.put_u8(ctx.ul_count.sqn);
+    result.put_u8(sn);
     result.put_slice(&protected_message);
 
     // Increment count
@@ -378,8 +390,10 @@ pub fn unprotect_nas_message(
 
     let bearer = 1u8;
 
-    // Verify MAC
-    let calculated_mac = ctx.calculate_mac(direction, bearer, count, protected_message)?;
+    // Verify MAC over octet 7 to n (TS 24.501 §4.4.3.3 a): the Sequence
+    // Number octet (message[4]) followed by the NAS message IE.
+    let mac_input = &message[4..];
+    let calculated_mac = ctx.calculate_mac(direction, bearer, count, mac_input)?;
     if received_mac != calculated_mac {
         return Err(NasError::MacVerificationFailed);
     }
@@ -392,4 +406,58 @@ pub fn unprotect_nas_message(
     };
 
     Ok(plain_message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_ctx() -> NasSecurityContext {
+        let algorithms = SecurityAlgorithms {
+            ciphering: SecurityAlgorithms::CIPHERING_NONE,
+            integrity: SecurityAlgorithms::INTEGRITY_128_EIA2,
+        };
+        NasSecurityContext::new(algorithms, [0x11u8; 16], [0x22u8; 16])
+    }
+
+    #[test]
+    fn test_mac_covers_sequence_number_octet() {
+        // TS 24.501 §4.4.3.3 a): the MAC must cover the SN octet + NAS message.
+        let body = [0x7eu8, 0x00, 0x55, 0x01, 0x02];
+        let mut tx = test_ctx();
+        let out = protect_nas_message(&mut tx, 0, &body, false).unwrap();
+        // Wire layout: MAC(4) | SN(1) | body.
+        let sn = out[4];
+        let mut input = vec![sn];
+        input.extend_from_slice(&body);
+        let expected = test_ctx().calculate_mac(0, 1, 0, &input).unwrap();
+        assert_eq!(&out[0..4], &expected, "MAC must cover SN octet + body");
+
+        // It must NOT equal the old (buggy) MAC computed over the body alone.
+        let body_only = test_ctx().calculate_mac(0, 1, 0, &body).unwrap();
+        assert_ne!(&out[0..4], &body_only, "MAC must not exclude the SN octet");
+    }
+
+    #[test]
+    fn test_protect_unprotect_roundtrip() {
+        let body = [0x7eu8, 0x01, 0xde, 0xad, 0xbe, 0xef];
+        let mut tx = test_ctx();
+        let out = protect_nas_message(&mut tx, 0, &body, false).unwrap();
+        let mut rx = test_ctx();
+        let recovered = unprotect_nas_message(&mut rx, 0, &out, false).unwrap();
+        assert_eq!(recovered, body);
+    }
+
+    #[test]
+    fn test_tampered_sn_octet_fails_verification() {
+        let body = [0x7eu8, 0x02, 0x01];
+        let mut tx = test_ctx();
+        let mut out = protect_nas_message(&mut tx, 0, &body, false).unwrap();
+        out[4] ^= 0xFF; // tamper the SN octet
+        let mut rx = test_ctx();
+        assert!(matches!(
+            unprotect_nas_message(&mut rx, 0, &out, false),
+            Err(NasError::MacVerificationFailed)
+        ));
+    }
 }
