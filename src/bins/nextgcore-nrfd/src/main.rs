@@ -1079,6 +1079,99 @@ fn token_error(error: &str, description: &str) -> SbiResponse {
         .with_body(body.to_string(), "application/json")
 }
 
+/// OAuth2 access-token authorization decision (TS 33.501 §13.4.1.1.2 step 2;
+/// TS 29.510 §5.4.2.2.2). The NRF acts as the authorization server and must:
+///   1. verify the asserted consumer `nfType` matches the registered consumer
+///      profile (an identity/parameter mismatch is `invalid_request`); and
+///   2. verify each requested service-name scope is offered by — and permitted
+///      to the consumer by — at least one registered producer of the target NF
+///      type (`allowedNfTypes` profile- and service-level filters, TS 29.510
+///      §6.1.6.2; an empty/absent list is "no restriction").
+///
+/// Returns the granted scope subset, or an RFC 6749 §5.2 error
+/// `(code, description)` carried in the 400 `AccessTokenErr`.
+///
+/// Conservative fallback: when the NRF holds NO profile for the target NF type
+/// it cannot positively deny the request — TS 33.501 §13.4.1.1.2 NOTE 1 lets a
+/// token without producer NSSAI/NSI claims access all producers of that type
+/// per local policy — so the requested scope is granted as-is. The bypass this
+/// closes is the prior behaviour of issuing a token to ANY caller for ANY
+/// scope/target without checking the consumer or producer profiles.
+fn authorize_access_token(
+    consumer: &NfProfile,
+    req_nf_type: &str,
+    target_nf_type: &str,
+    requested_scopes: &[String],
+    producers: &[NfProfile],
+) -> Result<Vec<String>, (&'static str, String)> {
+    // (1) The asserted nfType must match the registered consumer profile.
+    if !req_nf_type.eq_ignore_ascii_case(&consumer.nf_type) {
+        return Err((
+            "invalid_request",
+            format!(
+                "nfType {req_nf_type:?} does not match the registered profile of consumer {} (nfType {:?})",
+                consumer.nf_instance_id, consumer.nf_type
+            ),
+        ));
+    }
+
+    // (2) No registered producer of the target type: conservative grant.
+    if producers.is_empty() {
+        log::warn!(
+            "Access-token: no registered {target_nf_type} producer; granting requested scope to \
+             consumer {} per local policy (TS 33.501 §13.4.1.1.2 NOTE 1)",
+            consumer.nf_instance_id
+        );
+        return Ok(requested_scopes.to_vec());
+    }
+
+    // (3) Per requested service-name: must be offered by AND permitted to the
+    //     consumer by at least one producer of the target type.
+    let mut granted = Vec::new();
+    let mut any_offered = false;
+    for service in requested_scopes {
+        let mut offered = false;
+        let mut permitted = false;
+        for p in producers {
+            let (o, perm) = p.authorizes_service(&consumer.nf_type, service);
+            offered |= o;
+            permitted |= perm;
+            if perm {
+                break;
+            }
+        }
+        any_offered |= offered;
+        if permitted {
+            granted.push(service.clone());
+        }
+    }
+
+    if !granted.is_empty() {
+        return Ok(granted);
+    }
+
+    // Nothing authorized: distinguish "a producer offers the service but the
+    // consumer type is barred" (unauthorized_client) from "no producer offers
+    // the requested service at all" (invalid_scope).
+    if any_offered {
+        Err((
+            "unauthorized_client",
+            format!(
+                "consumer nfType {:?} is not in allowedNfTypes of any {target_nf_type} producer \
+                 offering the requested service(s)",
+                consumer.nf_type
+            ),
+        ))
+    } else {
+        Err((
+            "invalid_scope",
+            format!(
+                "no registered {target_nf_type} producer offers the requested service(s) {requested_scopes:?}"
+            ),
+        ))
+    }
+}
+
 async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
     log::info!("OAuth2 Access Token Request");
 
@@ -1165,12 +1258,34 @@ async fn handle_access_token_request(request: &SbiRequest) -> SbiResponse {
     // invalid_client error (RFC 6749 §5.2; TS 29.510 carries it in a 400
     // AccessTokenErr rather than a bare 401).
     let manager = nf_manager();
-    if manager.get(&nf_instance_id).is_none() {
+    let Some(consumer) = manager.get(&nf_instance_id) else {
         return token_error(
             "invalid_client",
             &format!("NF instance {nf_instance_id} is not registered with this NRF"),
         );
-    }
+    };
+
+    // Authorization decision (TS 33.501 §13.4.1.1.2 step 2; TS 29.510
+    // §5.4.2.2.2): the NRF must verify the consumer profile and that the
+    // requested scope is permitted by the target producer set BEFORE minting a
+    // token. Without this, the endpoint is an OAuth2 authorization bypass.
+    let requested_scopes: Vec<String> = scope.split_whitespace().map(String::from).collect();
+    let producers: Vec<NfProfile> = manager
+        .list()
+        .into_iter()
+        .filter(|p| p.nf_type.eq_ignore_ascii_case(&target_nf_type))
+        .collect();
+    let granted_scopes = match authorize_access_token(
+        &consumer,
+        &nf_type,
+        &target_nf_type,
+        &requested_scopes,
+        &producers,
+    ) {
+        Ok(granted) => granted,
+        Err((code, desc)) => return token_error(code, &desc),
+    };
+    let scope = granted_scopes.join(" ");
 
     // Issue a JWT access token signed with ES256 (ECDSA P-256).
     let now = std::time::SystemTime::now()
@@ -1478,6 +1593,133 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(body["error"], "invalid_client");
+    }
+
+    // -----------------------------------------------------------------
+    // nrfd-01: access-token authorization decision (TS 33.501
+    // §13.4.1.1.2 step 2 / TS 29.510 §5.4.2.2.2). These exercise the pure
+    // decision function in isolation (no global manager / no server), so
+    // they are deterministic and parallel-safe.
+    // -----------------------------------------------------------------
+
+    /// A consumer NF profile of the given type.
+    fn auth_consumer(nf_type: &str) -> NfProfile {
+        NfProfile::from_json(&serde_json::json!({
+            "nfInstanceId": "11111111-1111-1111-1111-111111111111",
+            "nfType": nf_type,
+            "nfStatus": "REGISTERED",
+        }))
+        .expect("valid consumer profile")
+    }
+
+    /// A producer NF profile advertising `services`, with an optional
+    /// profile-level `allowedNfTypes`.
+    fn auth_producer(
+        nf_type: &str,
+        services: serde_json::Value,
+        allowed: Option<serde_json::Value>,
+    ) -> NfProfile {
+        let mut doc = serde_json::json!({
+            "nfInstanceId": format!("prod-{nf_type}"),
+            "nfType": nf_type,
+            "nfStatus": "REGISTERED",
+            "nfServices": services,
+        });
+        if let Some(a) = allowed {
+            doc.as_object_mut()
+                .unwrap()
+                .insert("allowedNfTypes".into(), a);
+        }
+        NfProfile::from_json(&doc).expect("valid producer profile")
+    }
+
+    #[test]
+    fn test_authorize_token_happy_path_permitted_scope() {
+        // Valid registered consumer + a producer that offers the service and
+        // permits the consumer type -> token (granted scope == requested).
+        let consumer = auth_consumer("SMF");
+        let udm = auth_producer(
+            "UDM",
+            serde_json::json!([{"serviceInstanceId": "s0", "serviceName": "nudm-sdm"}]),
+            Some(serde_json::json!(["SMF", "AMF"])),
+        );
+        let granted =
+            authorize_access_token(&consumer, "SMF", "UDM", &["nudm-sdm".into()], &[udm])
+                .expect("permitted scope must be granted");
+        assert_eq!(granted, vec!["nudm-sdm".to_string()]);
+    }
+
+    #[test]
+    fn test_authorize_token_unoffered_service_is_invalid_scope() {
+        // The only producer offers a different service -> invalid_scope, no token.
+        let consumer = auth_consumer("SMF");
+        let udm = auth_producer(
+            "UDM",
+            serde_json::json!([{"serviceInstanceId": "s0", "serviceName": "nudm-uecm"}]),
+            None,
+        );
+        let err = authorize_access_token(&consumer, "SMF", "UDM", &["nudm-sdm".into()], &[udm])
+            .expect_err("unoffered service must be rejected");
+        assert_eq!(err.0, "invalid_scope");
+    }
+
+    #[test]
+    fn test_authorize_token_consumer_type_barred_is_unauthorized_client() {
+        // Producer offers the service but restricts it to AMF -> the SMF
+        // consumer is unauthorized_client, no token.
+        let consumer = auth_consumer("SMF");
+        let udm = auth_producer(
+            "UDM",
+            serde_json::json!([{"serviceInstanceId": "s0", "serviceName": "nudm-sdm"}]),
+            Some(serde_json::json!(["AMF"])),
+        );
+        let err = authorize_access_token(&consumer, "SMF", "UDM", &["nudm-sdm".into()], &[udm])
+            .expect_err("barred consumer type must be rejected");
+        assert_eq!(err.0, "unauthorized_client");
+    }
+
+    #[test]
+    fn test_authorize_token_nftype_mismatch_is_invalid_request() {
+        // Asserted nfType differs from the registered consumer profile.
+        let consumer = auth_consumer("SMF");
+        let err = authorize_access_token(&consumer, "AUSF", "UDM", &["nudm-sdm".into()], &[])
+            .expect_err("nfType mismatch must be rejected");
+        assert_eq!(err.0, "invalid_request");
+    }
+
+    #[test]
+    fn test_authorize_token_no_producer_grants_conservatively() {
+        // Matched-sim path: a token requested before the producer registers
+        // must still be granted so legitimate flows keep working
+        // (TS 33.501 §13.4.1.1.2 NOTE 1).
+        let consumer = auth_consumer("SMF");
+        let granted = authorize_access_token(&consumer, "SMF", "UDM", &["nudm-sdm".into()], &[])
+            .expect("conservative grant when no producer is registered");
+        assert_eq!(granted, vec!["nudm-sdm".to_string()]);
+    }
+
+    #[test]
+    fn test_authorize_token_grants_only_permitted_subset() {
+        // Two requested services; one is barred at the per-service level.
+        let consumer = auth_consumer("SMF");
+        let udm = auth_producer(
+            "UDM",
+            serde_json::json!([
+                {"serviceInstanceId": "s0", "serviceName": "nudm-sdm"},
+                {"serviceInstanceId": "s1", "serviceName": "nudm-uecm",
+                 "allowedNfTypes": ["AMF"]}
+            ]),
+            Some(serde_json::json!(["SMF", "AMF"])),
+        );
+        let granted = authorize_access_token(
+            &consumer,
+            "SMF",
+            "UDM",
+            &["nudm-sdm".into(), "nudm-uecm".into()],
+            &[udm],
+        )
+        .expect("at least one service is permitted");
+        assert_eq!(granted, vec!["nudm-sdm".to_string()]);
     }
 
     /// Full HTTP-level lifecycle over a real HTTP/2 SBI server on an

@@ -214,6 +214,85 @@ impl NfProfile {
         }
         doc
     }
+
+    /// Profile-level `allowedNfTypes` (TS 29.510 Table 6.1.6.2.2-1): the NF
+    /// types permitted to access this NF instance. An empty/absent list means
+    /// "no restriction" (any consumer type may access). Read from the verbatim
+    /// registered document so it reflects exactly what the producer published.
+    pub fn allowed_nf_types(&self) -> Vec<String> {
+        self.attributes
+            .get("allowedNfTypes")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The service names this profile advertises (TS 29.510
+    /// NFService.serviceName).
+    pub fn service_names(&self) -> Vec<String> {
+        self.nf_services
+            .iter()
+            .map(|s| s.service_name.clone())
+            .collect()
+    }
+
+    /// Per-service `allowedNfTypes` for the named service (TS 29.510
+    /// Table 6.1.6.2.3-1). `None` if the service is not offered; `Some(empty)`
+    /// if offered with no per-service restriction.
+    fn service_allowed_nf_types(&self, service_name: &str) -> Option<Vec<String>> {
+        let services = self.attributes.get("nfServices")?.as_array()?;
+        services
+            .iter()
+            .find(|s| {
+                s.get("serviceName")
+                    .and_then(|v| v.as_str())
+                    .map(|n| n.eq_ignore_ascii_case(service_name))
+                    .unwrap_or(false)
+            })
+            .map(|s| {
+                s.get("allowedNfTypes")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str())
+                            .map(String::from)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+    }
+
+    /// Authorization view of this (producer) profile for an access-token
+    /// decision (TS 33.501 §13.4.1.1.2 step 2): does this producer authorize a
+    /// consumer of type `consumer_nf_type` to consume `service_name`?
+    ///
+    /// Returns `(offered, permitted)` where `offered` is whether the profile
+    /// advertises the service at all, and `permitted` is whether the consumer
+    /// type passes the profile-level AND per-service `allowedNfTypes` filters
+    /// (an empty/absent list is "no restriction", per TS 29.510 §6.1.6.2).
+    pub fn authorizes_service(&self, consumer_nf_type: &str, service_name: &str) -> (bool, bool) {
+        let offered = self
+            .nf_services
+            .iter()
+            .any(|s| s.service_name.eq_ignore_ascii_case(service_name));
+        if !offered {
+            return (false, false);
+        }
+        let allowed_by = |list: &[String]| {
+            list.is_empty() || list.iter().any(|t| t.eq_ignore_ascii_case(consumer_nf_type))
+        };
+        let profile_ok = allowed_by(&self.allowed_nf_types());
+        let service_ok = self
+            .service_allowed_nf_types(service_name)
+            .map(|l| allowed_by(&l))
+            .unwrap_or(true);
+        (true, profile_ok && service_ok)
+    }
 }
 
 /// PLMN ID
