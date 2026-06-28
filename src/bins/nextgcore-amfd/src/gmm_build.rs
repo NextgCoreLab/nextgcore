@@ -2,10 +2,11 @@
 //!
 //! Port of src/amf/gmm-build.c - GMM message building functions for 5G NAS
 
-use crate::context::{AmfUe, Guti5gs};
+use crate::context::{AmfUe, Guti5gs, OGS_AUTN_LEN};
 use bytes::{BufMut, BytesMut};
 // nas-06: the conformant 5GMM encoder library. amfd is migrating its hand-rolled
 // builders onto ogs-nas message-by-message (Phase 1 = the cause-only builders).
+use ogs_nas::common::types as ogs_types;
 use ogs_nas::fiveg::ie::FiveGsIdentityType;
 use ogs_nas::fiveg::message as ogs_msg;
 
@@ -545,33 +546,33 @@ pub fn build_identity_request(identity_type: u8) -> Vec<u8> {
     ogs_msg::build_5gmm_message(&msg).to_vec()
 }
 
-/// Build Authentication Request message
+/// Build Authentication Request message (TS 24.501 Section 8.2.1).
+///
+/// nas-06 Phase 2 (Tier B, LIVE 5G-AKA path): encoded via ogs-nas. Byte-identical
+/// to the prior hand-rolled output — ngKSI half-octet (TS 24.501 9.11.3.32: bit 4
+/// = TSC, bits 1-3 = key set id), mandatory ABBA (LV), RAND (type-3 TV, IEI 0x21,
+/// no length octet), AUTN (TLV, IEI 0x20). AUTN is the fixed 128-bit field, always
+/// 16 octets per TS 33.501 — ogs-nas hard-codes the length octet to 16, matching
+/// amfd's `autn.len()` for every real input (guarded by debug_assert). Locked by
+/// `drift_authentication_request_through_ogs_nas` + `golden_authentication_request`.
 pub fn build_authentication_request(amf_ue: &AmfUe) -> Vec<u8> {
-    let mut builder = NasMessageBuilder::new();
+    debug_assert_eq!(
+        amf_ue.autn.len(),
+        OGS_AUTN_LEN,
+        "AUTN must be 16 octets (TS 33.501) for a conformant Authentication Request"
+    );
+    let mut autn = [0u8; OGS_AUTN_LEN];
+    let n = amf_ue.autn.len().min(OGS_AUTN_LEN);
+    autn[..n].copy_from_slice(&amf_ue.autn[..n]);
 
-    // GMM header (plain NAS message)
-    builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
-    builder.write_u8(0); // Security header type (plain)
-    builder.write_message_type(message_type::AUTHENTICATION_REQUEST);
-
-    // ngKSI (TS 24.501 9.11.3.32: bit 4 = TSC, bits 1-3 = key set id;
-    // spare half octet in bits 5-8)
-    let ngksi = ((amf_ue.nas_tsc & 0x01) << 3) | (amf_ue.nas_ksi & 0x07);
-    builder.write_u8(ngksi);
-
-    // ABBA (mandatory)
-    builder.write_lv(&amf_ue.abba[..amf_ue.abba_len as usize]);
-
-    // Authentication parameter RAND (optional, IEI = 0x21)
-    builder.write_u8(0x21); // IEI
-    builder.write_bytes(&amf_ue.rand);
-
-    // Authentication parameter AUTN (optional, IEI = 0x20)
-    builder.write_u8(0x20); // IEI
-    builder.write_u8(amf_ue.autn.len() as u8);
-    builder.write_bytes(&amf_ue.autn);
-
-    builder.build()
+    let msg = ogs_msg::FiveGmmMessage::AuthenticationRequest(ogs_msg::AuthenticationRequest {
+        ngksi: ogs_types::KeySetIdentifier::new(amf_ue.nas_tsc, amf_ue.nas_ksi),
+        abba: ogs_types::Abba::new(amf_ue.abba[..amf_ue.abba_len as usize].to_vec()),
+        rand: Some(amf_ue.rand),
+        autn: Some(autn),
+        eap_message: None,
+    });
+    ogs_msg::build_5gmm_message(&msg).to_vec()
 }
 
 /// Build Authentication Reject message (TS 24.501 Section 8.2.4).
@@ -594,43 +595,39 @@ pub fn build_authentication_reject() -> Vec<u8> {
 /// Replays the UE security capability exactly as received in the
 /// Registration Request (anti-bidding-down, TS 33.501 Section 6.7.2).
 pub fn build_security_mode_command(amf_ue: &AmfUe) -> Option<Vec<u8>> {
-    let mut builder = NasMessageBuilder::new();
+    // nas-06 Phase 2 (Tier B, LIVE registration/security-mode path): encoded via
+    // ogs-nas. Byte-identical to the prior hand-rolled output:
+    //   - Selected NAS security algorithms (9.11.3.34: bits 8-5 ciphering, 4-1 integrity)
+    //   - ngKSI (bit 4 = TSC, bits 1-3 = key set id)
+    //   - Replayed UE security capabilities (LV): 2 octets, OR 4 when EPS algorithms
+    //     are present — replicating amfd's exact `eea != 0 || eia != 0` conditional.
+    //   - IMEISV request (type-1 TV, IEI 0xE, value 1 -> 0xE1)
+    //   - Additional 5G security information (TLV, IEI 0x36, "retransmission requested")
+    // ABBA is intentionally not carried (matches the prior encoder). Locked by
+    // `drift_security_mode_command_through_ogs_nas` + `golden_security_mode_command`
+    // (the golden covers BOTH the 2- and 4-octet UE-sec-cap branches).
+    let cap = &amf_ue.ue_security_capability;
+    let replayed = if cap.eea != 0 || cap.eia != 0 {
+        ogs_types::UeSecurityCapability::with_eps(cap.ea, cap.ia, cap.eea, cap.eia)
+    } else {
+        ogs_types::UeSecurityCapability::new(cap.ea, cap.ia)
+    };
 
-    // GMM header (plain inner message)
-    builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
-    builder.write_u8(security_header::PLAIN_NAS_MESSAGE);
-    builder.write_message_type(message_type::SECURITY_MODE_COMMAND);
-
-    // Selected NAS security algorithms (TS 24.501 9.11.3.34:
-    // bits 8-5 = type of ciphering algorithm, bits 4-1 = type of integrity)
-    let security_algorithms =
-        ((amf_ue.selected_enc_algorithm & 0x0f) << 4) | (amf_ue.selected_int_algorithm & 0x0f);
-    builder.write_u8(security_algorithms);
-
-    // ngKSI (bit 4 = TSC, bits 1-3 = key set id)
-    let ngksi = ((amf_ue.nas_tsc & 0x01) << 3) | (amf_ue.nas_ksi & 0x07);
-    builder.write_u8(ngksi);
-
-    // Replayed UE security capabilities
-    let mut ue_sec_cap = vec![
-        amf_ue.ue_security_capability.ea,
-        amf_ue.ue_security_capability.ia,
-    ];
-    if amf_ue.ue_security_capability.eea != 0 || amf_ue.ue_security_capability.eia != 0 {
-        ue_sec_cap.push(amf_ue.ue_security_capability.eea);
-        ue_sec_cap.push(amf_ue.ue_security_capability.eia);
-    }
-    builder.write_lv(&ue_sec_cap);
-
-    // IMEISV request (optional, IEI = 0xE)
-    builder.write_u8(0xE1); // IEI (0xE) + IMEISV requested (1)
-
-    // Additional 5G security information (optional, IEI = 0x36)
-    builder.write_u8(0x36); // IEI
-    builder.write_u8(1); // length
-    builder.write_u8(0x01); // Retransmission of initial NAS message requested
-
-    Some(builder.build())
+    let msg = ogs_msg::FiveGmmMessage::SecurityModeCommand(ogs_msg::SecurityModeCommand {
+        selected_nas_security_algorithms: ogs_types::SecurityAlgorithms::new(
+            amf_ue.selected_enc_algorithm,
+            amf_ue.selected_int_algorithm,
+        ),
+        ngksi: ogs_types::KeySetIdentifier::new(amf_ue.nas_tsc, amf_ue.nas_ksi),
+        replayed_ue_security_capabilities: replayed,
+        imeisv_request: Some(1),
+        selected_eps_nas_security_algorithms: None,
+        additional_5g_security_information: Some(1),
+        eap_message: None,
+        abba: None,
+        replayed_s1_ue_security_capabilities: None,
+    });
+    Some(ogs_msg::build_5gmm_message(&msg).to_vec())
 }
 
 /// Build Configuration Update Command message
@@ -778,7 +775,7 @@ fn get_pdu_session_status(amf_ue: &AmfUe) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::PlmnId;
+    use crate::context::{PlmnId, OGS_RAND_LEN};
 
     fn create_test_amf_ue() -> AmfUe {
         AmfUe {
@@ -1067,6 +1064,56 @@ mod tests {
         assert_eq!(
             build_identity_request(mobile_identity_type::IMEISV),
             vec![0x7e, 0x00, 0x5b, 0x05]
+        );
+    }
+
+    #[test]
+    fn golden_authentication_request() {
+        // Discriminating fixture so a field/IEI/order regression is caught:
+        // tsc=1, ksi=3 -> ngksi 0x0b; abba [ab cd]; rand 0xAA*16; autn 0xBB*16.
+        let mut ue = create_test_amf_ue();
+        ue.nas_tsc = 1;
+        ue.nas_ksi = 3;
+        ue.abba = [0xab, 0xcd];
+        ue.abba_len = 2;
+        ue.rand = [0xaa; OGS_RAND_LEN];
+        ue.autn = vec![0xbb; OGS_AUTN_LEN];
+
+        // EPD|SHT|AUTH REQ(0x56) | ngksi | ABBA LV(02 ab cd) | RAND TV(21 + 16) | AUTN TLV(20 10 + 16)
+        let mut expected = vec![0x7e, 0x00, 0x56, 0x0b, 0x02, 0xab, 0xcd, 0x21];
+        expected.extend_from_slice(&[0xaa; 16]);
+        expected.extend_from_slice(&[0x20, 0x10]);
+        expected.extend_from_slice(&[0xbb; 16]);
+        assert_eq!(build_authentication_request(&ue), expected);
+    }
+
+    #[test]
+    fn golden_security_mode_command() {
+        // 2-octet UE-sec-cap branch (no EPS algorithms): fixture enc=1/int=2 -> 0x12,
+        // tsc=0/ksi=1 -> 0x01, ea=ia=0xf0, eea=eia=0.
+        let mut ue = create_test_amf_ue();
+        ue.ue_security_capability = crate::context::UeSecurityCapability {
+            ea: 0xf0,
+            ia: 0xf0,
+            eea: 0,
+            eia: 0,
+        };
+        // EPD|SHT|SEC MODE CMD(0x5d) | sel-algs | ngksi | UE-cap LV(02 f0 f0) | IMEISV(0xE1) | add-5g(36 01 01)
+        assert_eq!(
+            build_security_mode_command(&ue),
+            Some(vec![
+                0x7e, 0x00, 0x5d, 0x12, 0x01, 0x02, 0xf0, 0xf0, 0xe1, 0x36, 0x01, 0x01
+            ])
+        );
+
+        // 4-octet branch (EPS algorithms present): eea/eia != 0 -> LV grows to 04 f0 f0 0c 0c.
+        ue.ue_security_capability.eea = 0x0c;
+        ue.ue_security_capability.eia = 0x0c;
+        assert_eq!(
+            build_security_mode_command(&ue),
+            Some(vec![
+                0x7e, 0x00, 0x5d, 0x12, 0x01, 0x04, 0xf0, 0xf0, 0x0c, 0x0c, 0xe1, 0x36, 0x01, 0x01
+            ])
         );
     }
 
