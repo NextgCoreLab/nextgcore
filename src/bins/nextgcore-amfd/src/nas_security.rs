@@ -123,8 +123,34 @@ impl NasSecurityHeader {
 // NAS Security Functions
 // ============================================================================
 
-/// Encode NAS message with security protection
+/// Encode NAS message with security protection (gated dispatcher).
+///
+/// nas-06 Phase-6 C2: this is the single security-encode entry point that the
+/// 4 `ngap_path.rs` call sites already use, so they route through the gate
+/// transparently with zero textual change. With the canary
+/// `amf_ue.use_ogs_nas_security` OFF (the DEFAULT) it calls the unchanged
+/// hand-rolled [`nas_5gs_security_encode_legacy`] — byte-for-byte and
+/// behavior-for-behavior identical to the pre-Phase-6 code. With the canary ON
+/// it delegates to the conformant ogs-nas-backed adapter
+/// [`nas_5gs_security_encode_ogs`] (byte-identical for 3GPP-access frames).
 pub fn nas_5gs_security_encode(
+    amf_ue: &mut AmfUe,
+    message: &[u8],
+    security_header_type: u8,
+) -> Option<Vec<u8>> {
+    if amf_ue.use_ogs_nas_security {
+        nas_5gs_security_encode_ogs(amf_ue, message, security_header_type)
+    } else {
+        nas_5gs_security_encode_legacy(amf_ue, message, security_header_type)
+    }
+}
+
+/// Hand-rolled NAS security encoder (the pre-nas-06 production path).
+///
+/// PRESERVED UNCHANGED. Selected when the `use_ogs_nas_security` canary is OFF
+/// (default). Do NOT modify — the Phase-6 adapter is proven byte-identical
+/// against this function (`encode_ogs_matches_legacy_*`).
+fn nas_5gs_security_encode_legacy(
     amf_ue: &mut AmfUe,
     message: &[u8],
     security_header_type: u8,
@@ -210,8 +236,37 @@ pub fn nas_5gs_security_encode(
     Some(result)
 }
 
-/// Decode NAS message with security protection
+/// Decode NAS message with security protection (gated dispatcher).
+///
+/// nas-06 Phase-6 C2: single security-decode entry point used by the
+/// `ngap_path.rs` uplink call site. With the canary `amf_ue.use_ogs_nas_security`
+/// OFF (the DEFAULT) it calls the unchanged hand-rolled
+/// [`nas_5gs_security_decode_legacy`] (LENIENT: advances COUNT before verify,
+/// warn-and-continue on MAC failure, NO replay protection). With the canary ON
+/// it delegates to the STRICT ogs-nas-backed adapter
+/// [`nas_5gs_security_decode_ogs`] (MAC failure -> Err without advancing COUNT,
+/// replay rejection). The strict semantics are E2E-UNVALIDATED — see the
+/// adapter doc.
 pub fn nas_5gs_security_decode(
+    amf_ue: &mut AmfUe,
+    security_header_type: u8,
+    message: &[u8],
+) -> Result<Vec<u8>, NasSecurityError> {
+    if amf_ue.use_ogs_nas_security {
+        nas_5gs_security_decode_ogs(amf_ue, security_header_type, message)
+    } else {
+        nas_5gs_security_decode_legacy(amf_ue, security_header_type, message)
+    }
+}
+
+/// Hand-rolled NAS security decoder (the pre-nas-06 production path).
+///
+/// PRESERVED UNCHANGED. Selected when the `use_ogs_nas_security` canary is OFF
+/// (default). Lenient by design (legacy behavior): updates the UL COUNT from
+/// the sequence number BEFORE verifying the MAC, and on MAC mismatch it sets
+/// `amf_ue.mac_failed` and RETURNS THE DECRYPTED BODY (warn-and-continue) so
+/// the caller applies the TS 24.501 §4.4.3.3 policy. Do NOT modify.
+fn nas_5gs_security_decode_legacy(
     amf_ue: &mut AmfUe,
     security_header_type: u8,
     message: &[u8],
@@ -306,6 +361,219 @@ pub fn nas_5gs_security_decode(
     }
 
     Ok(decrypted)
+}
+
+// ============================================================================
+// nas-06 Phase-6 C1/C3 — ogs-nas-backed security adapter (canary-gated)
+// ============================================================================
+//
+// These adapters delegate the NAS protect/unprotect primitives to the
+// conformant `ogs_nas::common::security` implementation. They run ONLY when
+// `amf_ue.use_ogs_nas_security` is true (default false); the default-OFF path
+// keeps the legacy hand-rolled encoders/decoders above byte-for-byte and
+// behavior-for-behavior unchanged.
+//
+// Layout note: amfd frames are `EPD | SHT | MAC | SQN | payload`; ogs-nas
+// protect/unprotect operate on `MAC | SQN | payload`. The adapter prepends /
+// strips the 2-octet `EPD|SHT` accordingly.
+//
+// COUNT model: `AmfUe.dl_count`/`ul_count` are 24-bit NAS COUNTs (low 8 bits =
+// SQN). ogs-nas models COUNT as a `NasCount { overflow, sqn }`. The two
+// converters below are exact inverses over the 24-bit domain, and EVERY adapter
+// call writes `NasCount::value()` back into the AmfUe u32 so the count persists
+// through the memento (without writeback the counts desync).
+//
+// BEARER caveat: ogs-nas hardwires NAS bearer/connection-id 1 (3GPP access),
+// while the legacy path derives it from `access_type`. So byte-identity with
+// the legacy encoder holds for 3GPP access (bearer 1) only; non-3GPP access is
+// the known divergence locked by `drift_non_3gpp_bearer_divergence_locked`.
+// PQC algorithms (NEA4/NIA4, id 4) are not supported by ogs-nas protect and are
+// out of scope for this adapter (the legacy path still handles them).
+
+/// Convert a 24-bit AmfUe NAS COUNT (u32) to an ogs-nas `NasCount`.
+fn nas_count_from_u32(v: u32) -> ogs_nas::common::security::NasCount {
+    ogs_nas::common::security::NasCount::new(v >> 8, (v & 0xff) as u8)
+}
+
+/// Convert an ogs-nas `NasCount` back to the 24-bit AmfUe COUNT (u32).
+/// Inverse of [`nas_count_from_u32`] over the 24-bit domain.
+fn nas_count_to_u32(c: ogs_nas::common::security::NasCount) -> u32 {
+    c.value() & 0x00ff_ffff
+}
+
+/// nas-06 Phase-6 C1: ogs-nas-backed NAS security ENCODE adapter.
+///
+/// Delegates to `ogs_nas::common::security::protect_nas_message`. Proven
+/// byte-identical to [`nas_5gs_security_encode_legacy`] for 3GPP-access 5GMM
+/// downlink frames (see `encode_ogs_matches_legacy_*`). Gated behind
+/// `amf_ue.use_ogs_nas_security` (default false).
+fn nas_5gs_security_encode_ogs(
+    amf_ue: &mut AmfUe,
+    message: &[u8],
+    security_header_type: u8,
+) -> Option<Vec<u8>> {
+    use ogs_nas::common::security::{protect_nas_message, NasSecurityContext};
+    use ogs_nas::common::types::SecurityAlgorithms;
+
+    // PLAIN passthrough: no header, no count change (identical to legacy).
+    if security_header_type == security_header::PLAIN_NAS_MESSAGE {
+        return Some(message.to_vec());
+    }
+
+    let header_type = SecurityHeaderType::from_byte(security_header_type);
+    let mut integrity_protected = header_type.integrity_protected;
+    let mut ciphered = header_type.ciphered;
+
+    // New security context (SHT = new-context): zero BOTH NAS COUNTs.
+    if header_type.new_security_context {
+        amf_ue.dl_count = 0;
+        amf_ue.ul_count = 0;
+        amf_ue.ul_count_established = false;
+    }
+
+    // Null algorithm => corresponding protection disabled (mirrors legacy).
+    if amf_ue.selected_enc_algorithm == 0 {
+        ciphered = false;
+    }
+    if amf_ue.selected_int_algorithm == 0 {
+        integrity_protected = false;
+    }
+
+    // Force integrity algo to NONE(0) when disabled so ogs-nas emits a zero MAC,
+    // exactly like the legacy encoder leaving MAC=[0;4].
+    let mut ctx = NasSecurityContext::new(
+        SecurityAlgorithms {
+            ciphering: amf_ue.selected_enc_algorithm,
+            integrity: if integrity_protected {
+                amf_ue.selected_int_algorithm
+            } else {
+                0
+            },
+        },
+        amf_ue.knas_enc,
+        amf_ue.knas_int,
+    );
+    ctx.dl_count = nas_count_from_u32(amf_ue.dl_count);
+
+    // direction::DOWNLINK (1) matches ogs-nas downlink. protect emits
+    // MAC|SQN|(ciphered payload) and advances ctx.dl_count.
+    let protected = protect_nas_message(&mut ctx, direction::DOWNLINK, message, ciphered).ok()?;
+
+    // WRITEBACK the advanced DL COUNT (24-bit) so it persists via the memento.
+    amf_ue.dl_count = nas_count_to_u32(ctx.dl_count);
+    amf_ue.security_context_available = true;
+
+    // Prepend the 2-octet EPD|SHT.
+    let mut result = Vec::with_capacity(2 + protected.len());
+    result.push(0x7e); // 5GMM EPD
+    result.push(security_header_type);
+    result.extend_from_slice(&protected);
+    Some(result)
+}
+
+/// nas-06 Phase-6 C1+C3: ogs-nas-backed NAS security DECODE adapter (STRICT).
+///
+/// Delegates to `ogs_nas::common::security::unprotect_nas_message`. Unlike the
+/// lenient [`nas_5gs_security_decode_legacy`] it:
+///   * returns `Err` on MAC failure and does NOT advance the UL COUNT
+///     (verify-then-commit, TS 24.501 §4.4.3.3); and
+///   * rejects replays using the persisted `ul_count_established` high-water
+///     state (TS 24.501 §4.4.3.2).
+///
+/// Gated behind `amf_ue.use_ogs_nas_security` (default false).
+///
+/// E2E-UNVALIDATED: the lenient->strict flip MAY drop frames that the matched
+/// sim retransmits. Flipping the canary default + removing the hand-rolled
+/// decoder is DEFERRED pending matched-sim + real Open5GS E2E (registration +
+/// PDU session + ping).
+fn nas_5gs_security_decode_ogs(
+    amf_ue: &mut AmfUe,
+    security_header_type: u8,
+    message: &[u8],
+) -> Result<Vec<u8>, NasSecurityError> {
+    use ogs_nas::common::security::{unprotect_nas_message, NasSecurityContext};
+    use ogs_nas::common::types::SecurityAlgorithms;
+    use ogs_nas::error::NasError;
+
+    let mut header_type = SecurityHeaderType::from_byte(security_header_type);
+
+    // No security context => disable all (mirrors legacy).
+    if !amf_ue.security_context_available {
+        header_type.integrity_protected = false;
+        header_type.new_security_context = false;
+        header_type.ciphered = false;
+    }
+
+    // New security context => zero UL COUNT + clear replay baseline.
+    if header_type.new_security_context {
+        amf_ue.ul_count = 0;
+        amf_ue.ul_count_established = false;
+    }
+
+    if amf_ue.selected_enc_algorithm == 0 {
+        header_type.ciphered = false;
+    }
+    if amf_ue.selected_int_algorithm == 0 {
+        header_type.integrity_protected = false;
+    }
+
+    // No security needed => passthrough (identical to legacy).
+    if !header_type.ciphered && !header_type.integrity_protected {
+        return Ok(message.to_vec());
+    }
+
+    if message.len() < 7 {
+        return Err(NasSecurityError::MessageTooShort);
+    }
+
+    // Strip the 2-octet EPD|SHT; ogs-nas wants MAC|SQN|payload.
+    let inner = &message[2..];
+    let sqn = message[6]; // == inner[4]
+
+    // C3 STRICT replay (E2E-UNVALIDATED): reject a frame whose estimated COUNT
+    // is not strictly forward of the last successfully-verified UL COUNT. Only
+    // active once integrity is on and a baseline has been established (so the
+    // bootstrap COUNT-0 message is accepted).
+    let stored = nas_count_from_u32(amf_ue.ul_count);
+    let candidate = stored.estimate(sqn);
+    if amf_ue.ul_count_established
+        && header_type.integrity_protected
+        && candidate.value() <= stored.value()
+    {
+        amf_ue.mac_failed = true;
+        return Err(NasSecurityError::MacVerificationFailed);
+    }
+
+    let mut ctx = NasSecurityContext::new(
+        SecurityAlgorithms {
+            ciphering: amf_ue.selected_enc_algorithm,
+            integrity: if header_type.integrity_protected {
+                amf_ue.selected_int_algorithm
+            } else {
+                0
+            },
+        },
+        amf_ue.knas_enc,
+        amf_ue.knas_int,
+    );
+    ctx.ul_count = stored;
+
+    // direction::UPLINK (0). unprotect verifies the MAC over the CANDIDATE count
+    // BEFORE committing; on MAC failure it mutates nothing => no COUNT advance.
+    match unprotect_nas_message(&mut ctx, direction::UPLINK, inner, header_type.ciphered) {
+        Ok(plain) => {
+            // WRITEBACK the validated COUNT so it persists via the memento.
+            amf_ue.ul_count = nas_count_to_u32(ctx.ul_count);
+            amf_ue.ul_count_established = true;
+            Ok(plain)
+        }
+        Err(NasError::MacVerificationFailed) | Err(NasError::ReplayedSequenceNumber) => {
+            // STRICT: MAC failure / replay -> Err with the UL COUNT UNCHANGED.
+            amf_ue.mac_failed = true;
+            Err(NasSecurityError::MacVerificationFailed)
+        }
+        Err(_) => Err(NasSecurityError::InvalidHeader),
+    }
 }
 
 // ============================================================================
@@ -1067,6 +1335,181 @@ mod tests {
             "non-3GPP bearer divergence appears fixed (ogs-nas took a connection-id); \
              convert this guard to assert_eq"
         );
+    }
+
+    // ======================================================================
+    // nas-06 Phase-6 C1/C2/C3 — ogs-nas security adapter (canary-gated)
+    // ======================================================================
+
+    /// C1: the ogs-nas ENCODE adapter must be byte-for-byte identical to the
+    /// legacy encoder across representative SHTs (3GPP access, NEA2/NIA2). This
+    /// is the proof that flipping the canary leaves the ENCODE wire image
+    /// unchanged for the production (3GPP) path.
+    #[test]
+    fn encode_ogs_matches_legacy_byte_for_byte() {
+        let cases: &[(&[u8], u8)] = &[
+            (&[0x7e, 0x00, 0x41], security_header::INTEGRITY_PROTECTED),
+            (
+                &[0x7e, 0x00, 0x42, 0x01, 0x02, 0x03],
+                security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
+            ),
+            (
+                &[0x7e, 0x00, 0x5d, 0x02, 0x00, 0x02, 0xe0, 0xe1],
+                security_header::INTEGRITY_PROTECTED_WITH_NEW_5G_NAS_SECURITY_CONTEXT,
+            ),
+            (
+                &[0x7e, 0x00, 0x5d, 0x02, 0x00, 0x02, 0xe0, 0xe1],
+                security_header::INTEGRITY_PROTECTED_AND_CIPHERED_WITH_NEW_5G_NAS_SECURITY_CONTEXT,
+            ),
+            // PLAIN passthrough.
+            (&[0x7e, 0x00, 0x43], security_header::PLAIN_NAS_MESSAGE),
+        ];
+        for &(msg, sht) in cases {
+            let mut ue_old = create_test_ue();
+            let mut ue_new = create_test_ue();
+            let old = nas_5gs_security_encode_legacy(&mut ue_old, msg, sht);
+            let new = nas_5gs_security_encode_ogs(&mut ue_new, msg, sht);
+            assert_eq!(old, new, "encode adapter byte-mismatch for sht={sht:#x}");
+            // COUNT state must track identically.
+            assert_eq!(ue_old.dl_count, ue_new.dl_count, "dl_count desync sht={sht:#x}");
+            assert_eq!(ue_old.ul_count, ue_new.ul_count, "ul_count desync sht={sht:#x}");
+        }
+    }
+
+    /// C1: byte-identity must hold across multiple consecutive encodes, proving
+    /// the NasCount<->u32 writeback keeps the SQN/COUNT in lock-step.
+    #[test]
+    fn encode_ogs_matches_legacy_across_multiple_counts() {
+        let mut ue_old = create_test_ue();
+        let mut ue_new = create_test_ue();
+        for i in 0..6u8 {
+            let msg = [0x7e, 0x00, 0x55, i];
+            let old = nas_5gs_security_encode_legacy(
+                &mut ue_old,
+                &msg,
+                security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
+            );
+            let new = nas_5gs_security_encode_ogs(
+                &mut ue_new,
+                &msg,
+                security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
+            );
+            assert_eq!(old, new, "byte-mismatch at iter {i}");
+            assert_eq!(ue_old.dl_count, ue_new.dl_count, "dl_count desync at iter {i}");
+        }
+        assert_eq!(ue_new.dl_count, 6, "writeback did not advance the COUNT");
+    }
+
+    /// C2: the public dispatcher honors the canary. OFF (default) => the legacy
+    /// byte image; ON => the adapter, which is byte-identical here.
+    #[test]
+    fn dispatcher_canary_off_equals_legacy_on_equals_adapter() {
+        let msg = [0x7e, 0x00, 0x5d, 0x02, 0x00, 0x02, 0xe0, 0xe1];
+        let sht = security_header::INTEGRITY_PROTECTED_AND_CIPHERED;
+
+        // Default is OFF.
+        let ue_default = create_test_ue();
+        assert!(
+            !ue_default.use_ogs_nas_security,
+            "canary MUST default to false"
+        );
+
+        // OFF -> legacy bytes.
+        let mut ue_off = create_test_ue();
+        let off = nas_5gs_security_encode(&mut ue_off, &msg, sht).unwrap();
+        let mut ue_legacy = create_test_ue();
+        let legacy = nas_5gs_security_encode_legacy(&mut ue_legacy, &msg, sht).unwrap();
+        assert_eq!(off, legacy, "canary OFF must equal the legacy wire image");
+
+        // ON -> adapter bytes (byte-identical to legacy for 3GPP access).
+        let mut ue_on = create_test_ue();
+        ue_on.use_ogs_nas_security = true;
+        let on = nas_5gs_security_encode(&mut ue_on, &msg, sht).unwrap();
+        assert_eq!(on, legacy, "canary ON adapter must be byte-identical to legacy");
+    }
+
+    /// Helper: craft a valid uplink-protected frame (EPD|SHT|MAC|SQN|payload)
+    /// the way a conformant UE would, for the strict decode tests.
+    fn make_uplink_frame(ue: &AmfUe, body: &[u8], sht: u8, count: u32) -> Vec<u8> {
+        use ogs_nas::common::security::{protect_nas_message, NasCount, NasSecurityContext};
+        use ogs_nas::common::types::SecurityAlgorithms;
+        let mut ctx = NasSecurityContext::new(
+            SecurityAlgorithms {
+                ciphering: ue.selected_enc_algorithm,
+                integrity: ue.selected_int_algorithm,
+            },
+            ue.knas_enc,
+            ue.knas_int,
+        );
+        ctx.ul_count = NasCount::new(count >> 8, (count & 0xff) as u8);
+        // direction::UPLINK (0), ciphered.
+        let prot = protect_nas_message(&mut ctx, direction::UPLINK, body, true).unwrap();
+        let mut f = vec![0x7e, sht];
+        f.extend_from_slice(&prot);
+        f
+    }
+
+    /// C3 (E2E-UNVALIDATED): MAC failure on the strict path returns Err and does
+    /// NOT advance the UL COUNT (vs the lenient legacy path which warns +
+    /// continues).
+    #[test]
+    fn decode_ogs_mac_fail_returns_err_no_count_advance() {
+        let mut ue = create_test_ue();
+        ue.use_ogs_nas_security = true;
+        let sht = security_header::INTEGRITY_PROTECTED_AND_CIPHERED;
+        let mut frame = make_uplink_frame(&ue, &[0x7e, 0x00, 0x57, 0x01], sht, 0);
+        // Tamper the trailing payload octet -> MAC mismatch.
+        let last = frame.len() - 1;
+        frame[last] ^= 0xff;
+
+        let before = ue.ul_count;
+        let res = nas_5gs_security_decode_ogs(&mut ue, sht, &frame);
+        assert!(
+            matches!(res, Err(NasSecurityError::MacVerificationFailed)),
+            "strict decode must Err on MAC failure"
+        );
+        assert_eq!(ue.ul_count, before, "MAC failure must NOT advance UL COUNT");
+        assert!(
+            !ue.ul_count_established,
+            "no replay baseline established on failure"
+        );
+    }
+
+    /// C3 (E2E-UNVALIDATED): a valid frame is accepted, then an exact replay of
+    /// it is rejected via the persisted established-count state.
+    #[test]
+    fn decode_ogs_rejects_replay() {
+        let mut ue = create_test_ue();
+        ue.use_ogs_nas_security = true;
+        let sht = security_header::INTEGRITY_PROTECTED_AND_CIPHERED;
+        let f0 = make_uplink_frame(&ue, &[0x7e, 0x00, 0x57, 0x00], sht, 0);
+
+        // First reception is accepted and establishes the baseline.
+        let body = nas_5gs_security_decode_ogs(&mut ue, sht, &f0).expect("first frame accepted");
+        assert_eq!(body, [0x7e, 0x00, 0x57, 0x00], "must recover the plaintext body");
+        assert!(ue.ul_count_established, "baseline must be established");
+
+        // Exact replay (SQN 0, candidate == stored) is rejected.
+        let replay = nas_5gs_security_decode_ogs(&mut ue, sht, &f0);
+        assert!(
+            matches!(replay, Err(NasSecurityError::MacVerificationFailed)),
+            "replayed frame must be rejected"
+        );
+    }
+
+    /// C3: a legitimate in-order successor (next SQN) is still accepted after
+    /// establishing the baseline (the replay guard is strictly-backward only).
+    #[test]
+    fn decode_ogs_accepts_in_order_successor() {
+        let mut ue = create_test_ue();
+        ue.use_ogs_nas_security = true;
+        let sht = security_header::INTEGRITY_PROTECTED_AND_CIPHERED;
+        let f0 = make_uplink_frame(&ue, &[0x7e, 0x00, 0x57, 0x00], sht, 0);
+        let f1 = make_uplink_frame(&ue, &[0x7e, 0x00, 0x57, 0x01], sht, 1);
+        nas_5gs_security_decode_ogs(&mut ue, sht, &f0).expect("frame 0 accepted");
+        let body = nas_5gs_security_decode_ogs(&mut ue, sht, &f1).expect("frame 1 accepted");
+        assert_eq!(body, [0x7e, 0x00, 0x57, 0x01]);
+        assert_eq!(ue.ul_count, 1, "UL COUNT advanced to the verified value");
     }
 
     #[test]

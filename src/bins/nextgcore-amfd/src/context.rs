@@ -1582,6 +1582,8 @@ pub struct AmfUeMemento {
     pub dl_count: u32,
     /// Uplink counter
     pub ul_count: u32,
+    /// nas-06 Phase-6 strict-path replay baseline (persisted with ul_count).
+    pub ul_count_established: bool,
     /// gNB key
     pub kgnb: [u8; OGS_SHA256_DIGEST_SIZE],
     /// Next hop key
@@ -1776,6 +1778,19 @@ pub struct AmfUe {
     pub dl_count: u32,
     /// Uplink counter
     pub ul_count: u32,
+    /// nas-06 Phase-6 CANARY (default false): when true, the NAS security
+    /// ENCODE/DECODE path delegates to the conformant ogs-nas
+    /// protect/unprotect adapter (strict MAC + replay) instead of the
+    /// hand-rolled lenient path. Default-OFF keeps production behavior
+    /// byte-for-byte unchanged. Flipping the default + removing the
+    /// hand-rolled path is DEFERRED pending matched-sim + Open5GS E2E
+    /// (reg + PDU + ping). See `nas_security.rs`.
+    pub use_ogs_nas_security: bool,
+    /// nas-06 Phase-6 strict-path state: true once an uplink NAS message has
+    /// been successfully integrity-verified. Gates replay rejection so the
+    /// first (COUNT 0) message is not self-rejected. Only consulted on the
+    /// `use_ogs_nas_security` path; persisted via the memento.
+    pub ul_count_established: bool,
     /// gNB key
     pub kgnb: [u8; OGS_SHA256_DIGEST_SIZE],
     /// Next hop chaining counter
@@ -2238,6 +2253,8 @@ impl AmfUe {
             knas_enc: [0u8; OGS_SHA256_DIGEST_SIZE / 2],
             dl_count: 0,
             ul_count: 0,
+            use_ogs_nas_security: false,
+            ul_count_established: false,
             kgnb: [0u8; OGS_SHA256_DIGEST_SIZE],
             nhcc: 0,
             nh: [0u8; OGS_SHA256_DIGEST_SIZE],
@@ -2357,6 +2374,7 @@ impl AmfUe {
         self.memento.knas_enc = self.knas_enc;
         self.memento.dl_count = self.dl_count;
         self.memento.ul_count = self.ul_count;
+        self.memento.ul_count_established = self.ul_count_established;
         self.memento.kgnb = self.kgnb;
         self.memento.nh = self.nh;
         self.memento.selected_enc_algorithm = self.selected_enc_algorithm;
@@ -2378,6 +2396,7 @@ impl AmfUe {
         self.knas_enc = self.memento.knas_enc;
         self.dl_count = self.memento.dl_count;
         self.ul_count = self.memento.ul_count;
+        self.ul_count_established = self.memento.ul_count_established;
         self.kgnb = self.memento.kgnb;
         self.nh = self.memento.nh;
         self.selected_enc_algorithm = self.memento.selected_enc_algorithm;
