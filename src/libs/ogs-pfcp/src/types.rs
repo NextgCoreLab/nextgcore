@@ -3001,6 +3001,55 @@ impl UserPlanePathFailureReport {
     }
 }
 
+/// PFCP Association Release Request (TS 29.244 §8.2.47) — octet 5 flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PfcpAssociationReleaseRequest {
+    pub sarr: bool, // Service Association Release Request (bit 1)
+    pub urss: bool, // UP function Reports Stop of Sending (bit 2)
+}
+
+impl PfcpAssociationReleaseRequest {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8((self.sarr as u8) | ((self.urss as u8) << 1));
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        let octet = data.first().copied().ok_or(PfcpError::BufferTooShort {
+            needed: 1,
+            available: 0,
+        })?;
+        Ok(Self {
+            sarr: octet & 0x01 != 0,
+            urss: octet & 0x02 != 0,
+        })
+    }
+}
+
+/// Graceful Release Period (TS 29.244 §8.2.48) — octet 5: timer unit (bits
+/// 6-8) and binary-coded timer value (bits 1-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GracefulReleasePeriod {
+    pub timer_value: u8, // 0..31
+    pub timer_unit: u8,  // 0..7
+}
+
+impl GracefulReleasePeriod {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8((self.timer_value & 0x1f) | ((self.timer_unit & 0x07) << 5));
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        let octet = data.first().copied().ok_or(PfcpError::BufferTooShort {
+            needed: 1,
+            available: 0,
+        })?;
+        Ok(Self {
+            timer_value: octet & 0x1f,
+            timer_unit: (octet >> 5) & 0x07,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

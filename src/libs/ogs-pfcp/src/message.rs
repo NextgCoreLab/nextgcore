@@ -7,8 +7,9 @@ use crate::header::{PfcpHeader, PfcpMessageType};
 use crate::ie::{encode_u16_ie, encode_u32_ie, encode_u8_ie, IeHeader, IeType, RawIe};
 use crate::types::{
     CpFunctionFeatures, CreateBar, CreateFar, CreatePdr, CreateQer, CreateUrr, DownlinkDataReport,
-    FSeid, NodeId, NodeReportType, PfcpCause, RemoveFar, RemovePdr, ReportType, UpFunctionFeatures,
-    UpdateFar, UpdatePdr, UsageReportSrr, UserPlanePathFailureReport,
+    FSeid, GracefulReleasePeriod, NodeId, NodeReportType, PfcpAssociationReleaseRequest, PfcpCause,
+    RemoveFar, RemovePdr, ReportType, UpFunctionFeatures, UpdateFar, UpdatePdr, UsageReportSrr,
+    UserPlanePathFailureReport,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -1200,6 +1201,163 @@ impl NodeReportResponse {
     }
 }
 
+/// PFCP Association Update Request (TS 29.244 §7.4.4.3, message type 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssociationUpdateRequest {
+    pub node_id: NodeId,
+    pub up_function_features: Option<UpFunctionFeatures>,
+    pub cp_function_features: Option<CpFunctionFeatures>,
+    pub pfcp_association_release_request: Option<PfcpAssociationReleaseRequest>,
+    pub graceful_release_period: Option<GracefulReleasePeriod>,
+}
+
+impl AssociationUpdateRequest {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        let mut node_id_buf = BytesMut::new();
+        self.node_id.encode(&mut node_id_buf);
+        IeHeader::new(IeType::NodeId as u16, node_id_buf.len() as u16).encode(buf);
+        buf.put_slice(&node_id_buf);
+
+        if let Some(features) = &self.up_function_features {
+            let mut fb = BytesMut::new();
+            features.encode(&mut fb);
+            IeHeader::new(IeType::UpFunctionFeatures as u16, fb.len() as u16).encode(buf);
+            buf.put_slice(&fb);
+        }
+        if let Some(features) = &self.cp_function_features {
+            let mut fb = BytesMut::new();
+            features.encode(&mut fb);
+            IeHeader::new(IeType::CpFunctionFeatures as u16, fb.len() as u16).encode(buf);
+            buf.put_slice(&fb);
+        }
+        if let Some(rr) = &self.pfcp_association_release_request {
+            let mut rb = BytesMut::new();
+            rr.encode(&mut rb);
+            IeHeader::new(IeType::PfcpAssociationReleaseRequest as u16, rb.len() as u16).encode(buf);
+            buf.put_slice(&rb);
+        }
+        if let Some(grp) = &self.graceful_release_period {
+            let mut gb = BytesMut::new();
+            grp.encode(&mut gb);
+            IeHeader::new(IeType::GracefulReleasePeriod as u16, gb.len() as u16).encode(buf);
+            buf.put_slice(&gb);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        let mut node_id = None;
+        let mut up_function_features = None;
+        let mut cp_function_features = None;
+        let mut pfcp_association_release_request = None;
+        let mut graceful_release_period = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::NodeId as u16 => {
+                    let mut data = ie.data;
+                    node_id = Some(NodeId::decode(&mut data)?);
+                }
+                t if t == IeType::UpFunctionFeatures as u16 => {
+                    let mut data = ie.data;
+                    up_function_features = Some(UpFunctionFeatures::decode(&mut data)?);
+                }
+                t if t == IeType::CpFunctionFeatures as u16 => {
+                    cp_function_features = Some(CpFunctionFeatures::decode(&ie.data)?);
+                }
+                t if t == IeType::PfcpAssociationReleaseRequest as u16 => {
+                    pfcp_association_release_request =
+                        Some(PfcpAssociationReleaseRequest::decode(&ie.data)?);
+                }
+                t if t == IeType::GracefulReleasePeriod as u16 => {
+                    graceful_release_period = Some(GracefulReleasePeriod::decode(&ie.data)?);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            node_id: node_id
+                .ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?,
+            up_function_features,
+            cp_function_features,
+            pfcp_association_release_request,
+            graceful_release_period,
+        })
+    }
+}
+
+/// PFCP Association Update Response (TS 29.244 §7.4.4.4, message type 8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssociationUpdateResponse {
+    pub node_id: NodeId,
+    pub cause: PfcpCause,
+    pub up_function_features: Option<UpFunctionFeatures>,
+    pub cp_function_features: Option<CpFunctionFeatures>,
+}
+
+impl AssociationUpdateResponse {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        let mut node_id_buf = BytesMut::new();
+        self.node_id.encode(&mut node_id_buf);
+        IeHeader::new(IeType::NodeId as u16, node_id_buf.len() as u16).encode(buf);
+        buf.put_slice(&node_id_buf);
+
+        encode_u8_ie(buf, IeType::Cause, self.cause as u8);
+
+        if let Some(features) = &self.up_function_features {
+            let mut fb = BytesMut::new();
+            features.encode(&mut fb);
+            IeHeader::new(IeType::UpFunctionFeatures as u16, fb.len() as u16).encode(buf);
+            buf.put_slice(&fb);
+        }
+        if let Some(features) = &self.cp_function_features {
+            let mut fb = BytesMut::new();
+            features.encode(&mut fb);
+            IeHeader::new(IeType::CpFunctionFeatures as u16, fb.len() as u16).encode(buf);
+            buf.put_slice(&fb);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        let mut node_id = None;
+        let mut cause = None;
+        let mut up_function_features = None;
+        let mut cp_function_features = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::NodeId as u16 => {
+                    let mut data = ie.data;
+                    node_id = Some(NodeId::decode(&mut data)?);
+                }
+                t if t == IeType::Cause as u16 => {
+                    if !ie.data.is_empty() {
+                        cause = Some(PfcpCause::try_from(ie.data[0])?);
+                    }
+                }
+                t if t == IeType::UpFunctionFeatures as u16 => {
+                    let mut data = ie.data;
+                    up_function_features = Some(UpFunctionFeatures::decode(&mut data)?);
+                }
+                t if t == IeType::CpFunctionFeatures as u16 => {
+                    cp_function_features = Some(CpFunctionFeatures::decode(&ie.data)?);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            node_id: node_id
+                .ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?,
+            cause: cause.ok_or_else(|| PfcpError::MissingMandatoryIe("Cause".to_string()))?,
+            up_function_features,
+            cp_function_features,
+        })
+    }
+}
+
 /// PFCP Message enum containing all message types
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PfcpMessage {
@@ -1219,6 +1377,8 @@ pub enum PfcpMessage {
     SessionReportResponse(SessionReportResponse),
     NodeReportRequest(NodeReportRequest),
     NodeReportResponse(NodeReportResponse),
+    AssociationUpdateRequest(AssociationUpdateRequest),
+    AssociationUpdateResponse(AssociationUpdateResponse),
 }
 
 impl PfcpMessage {
@@ -1241,6 +1401,8 @@ impl PfcpMessage {
             Self::SessionReportResponse(_) => PfcpMessageType::SessionReportResponse,
             Self::NodeReportRequest(_) => PfcpMessageType::NodeReportRequest,
             Self::NodeReportResponse(_) => PfcpMessageType::NodeReportResponse,
+            Self::AssociationUpdateRequest(_) => PfcpMessageType::AssociationUpdateRequest,
+            Self::AssociationUpdateResponse(_) => PfcpMessageType::AssociationUpdateResponse,
         }
     }
 
@@ -1263,6 +1425,8 @@ impl PfcpMessage {
             Self::SessionReportResponse(msg) => msg.encode(buf),
             Self::NodeReportRequest(msg) => msg.encode(buf),
             Self::NodeReportResponse(msg) => msg.encode(buf),
+            Self::AssociationUpdateRequest(msg) => msg.encode(buf),
+            Self::AssociationUpdateResponse(msg) => msg.encode(buf),
         }
     }
 
@@ -1317,6 +1481,12 @@ impl PfcpMessage {
             PfcpMessageType::NodeReportResponse => {
                 Ok(Self::NodeReportResponse(NodeReportResponse::decode(buf)?))
             }
+            PfcpMessageType::AssociationUpdateRequest => Ok(Self::AssociationUpdateRequest(
+                AssociationUpdateRequest::decode(buf)?,
+            )),
+            PfcpMessageType::AssociationUpdateResponse => Ok(Self::AssociationUpdateResponse(
+                AssociationUpdateResponse::decode(buf)?,
+            )),
             _ => Err(PfcpError::InvalidMessageType(message_type as u8)),
         }
     }
@@ -1434,6 +1604,48 @@ mod tests {
             NodeReportRequest::decode(&mut buf.freeze()),
             Err(PfcpError::MissingMandatoryIe(_))
         ));
+    }
+
+    #[test]
+    fn test_association_update_request_roundtrip() {
+        let msg = AssociationUpdateRequest {
+            node_id: NodeId::new_ipv4([10, 45, 0, 1]),
+            up_function_features: None,
+            cp_function_features: None,
+            pfcp_association_release_request: Some(PfcpAssociationReleaseRequest {
+                sarr: true,
+                urss: false,
+            }),
+            graceful_release_period: Some(GracefulReleasePeriod {
+                timer_value: 5,
+                timer_unit: 1,
+            }),
+        };
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+        let decoded = AssociationUpdateRequest::decode(&mut buf.freeze()).unwrap();
+        assert_eq!(decoded, msg);
+        assert!(decoded.pfcp_association_release_request.unwrap().sarr);
+        assert_eq!(decoded.graceful_release_period.unwrap().timer_value, 5);
+    }
+
+    #[test]
+    fn test_association_update_response_roundtrip_via_dispatch() {
+        let msg = PfcpMessage::AssociationUpdateResponse(AssociationUpdateResponse {
+            node_id: NodeId::new_ipv4([10, 45, 0, 1]),
+            cause: PfcpCause::RequestAccepted,
+            up_function_features: None,
+            cp_function_features: None,
+        });
+        assert_eq!(msg.message_type(), PfcpMessageType::AssociationUpdateResponse);
+        let mut body = BytesMut::new();
+        msg.encode_body(&mut body);
+        let decoded = PfcpMessage::decode_body(
+            PfcpMessageType::AssociationUpdateResponse,
+            &mut body.freeze(),
+        )
+        .unwrap();
+        assert_eq!(decoded, msg);
     }
 
     #[test]
