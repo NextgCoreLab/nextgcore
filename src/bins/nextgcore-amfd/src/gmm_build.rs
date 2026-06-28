@@ -544,20 +544,28 @@ fn pdu_session_status_ie(amf_ue: &AmfUe) -> Option<PduSessionStatus> {
     }
 }
 
-/// Build Deregistration Accept message (UE-initiated; plain inner)
+/// Build Deregistration Accept message (UE-initiated; plain inner).
+///
+/// nas-06 Phase 2 (Tier D): encoded via ogs-nas. The UE-initiated Deregistration
+/// Accept has no body, so this is the bare plain header — byte-identical to the
+/// prior hand-rolled output. Locked by `golden_deregistration_accept`.
 pub fn build_deregistration_accept(_amf_ue: &AmfUe) -> Option<Vec<u8>> {
-    let mut builder = NasMessageBuilder::new();
-
-    // GMM header (plain inner message)
-    builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
-    builder.write_u8(security_header::PLAIN_NAS_MESSAGE);
-    builder.write_message_type(message_type::DEREGISTRATION_ACCEPT_FROM_UE);
-
-    Some(builder.build())
+    let msg = ogs_msg::FiveGmmMessage::DeregistrationAcceptFromUe;
+    Some(ogs_msg::build_5gmm_message(&msg).to_vec())
 }
 
 /// Build Deregistration Request message (network-initiated; plain inner,
-/// TS 24.501 Section 8.2.11; wrap with nas_5gs_security_encode)
+/// TS 24.501 Section 8.2.11; wrap with nas_5gs_security_encode).
+///
+/// nas-06: NOT migrated to ogs-nas (deferred). amfd writes the de-registration
+/// type as a bare 0x00 (non-re-reg) / 0x01 (re-reg) byte — its own non-conformant
+/// convention (re-reg flag placed in bit 0 rather than the spec's bit 3, switch-off
+/// bit never set, access-type sub-field left 0). ogs-nas `DeRegistrationType` packs
+/// a real `AccessType` whose minimum value is 1, so it cannot represent the 0x00
+/// access-type sub-field; an amfd-built non-re-reg request does not round-trip
+/// byte-equal through ogs-nas (0x00 -> 0x01). Locked by
+/// `drift_deregistration_request_divergence_locked`; migrate once amfd adopts the
+/// conformant de-reg-type bit layout (or ogs-nas gains a raw-byte escape).
 pub fn build_deregistration_request(
     _amf_ue: &AmfUe,
     dereg_reason: DeregistrationReason,
@@ -695,34 +703,54 @@ pub fn build_configuration_update_command(
     amf_ue: &AmfUe,
     param: &ConfigurationUpdateCommandParam,
 ) -> Option<Vec<u8>> {
-    let mut builder = NasMessageBuilder::new();
+    // nas-06 Phase 2 (Tier D): encoded via ogs-nas. Byte-identical to the prior
+    // hand-rolled output — optional configuration update indication (type-1 TV,
+    // IEI 0xD: bit 1 = ack, bit 2 = registration) and optional 5G-GUTI (0x77 TLV-E,
+    // reusing to_ogs_plmn). amfd carries no other configuration IE (NITZ is a
+    // future TODO and was never emitted). Locked by golden_configuration_update_command.
+    let configuration_update_indication =
+        if param.registration_requested || param.acknowledgement_requested {
+            let mut ind = 0u8;
+            if param.acknowledgement_requested {
+                ind |= 0x01;
+            }
+            if param.registration_requested {
+                ind |= 0x02;
+            }
+            Some(ind)
+        } else {
+            None
+        };
 
-    // GMM header (plain inner message)
-    builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
-    builder.write_u8(security_header::PLAIN_NAS_MESSAGE);
-    builder.write_message_type(message_type::CONFIGURATION_UPDATE_COMMAND);
+    let guti = if param.guti && amf_ue.next_guti.tmsi != 0 {
+        let g = &amf_ue.next_guti;
+        Some(ogs_ftypes::MobileIdentity::FiveGGuti(ogs_ftypes::FiveGGuti {
+            plmn_id: to_ogs_plmn(&g.plmn_id),
+            amf_region_id: g.amf_region_id,
+            amf_set_id: g.amf_set_id,
+            amf_pointer: g.amf_pointer,
+            tmsi: g.tmsi,
+        }))
+    } else {
+        None
+    };
 
-    // Configuration update indication (optional, IEI = 0xD)
-    if param.registration_requested || param.acknowledgement_requested {
-        let mut indication = 0u8;
-        if param.acknowledgement_requested {
-            indication |= 0x01;
-        }
-        if param.registration_requested {
-            indication |= 0x02;
-        }
-        builder.write_u8(0xD0 | indication);
-    }
-
-    // 5G-GUTI (optional, IEI = 0x77)
-    if param.guti && amf_ue.next_guti.tmsi != 0 {
-        let guti_data = encode_guti(&amf_ue.next_guti);
-        builder.write_tlv_e(0x77, &guti_data);
-    }
-
-    // NITZ information would be added here if param.nitz is true
-
-    Some(builder.build())
+    let msg = ogs_msg::FiveGmmMessage::ConfigurationUpdateCommand(ogs_msg::ConfigurationUpdateCommand {
+        configuration_update_indication,
+        guti,
+        tai_list: None,
+        allowed_nssai: None,
+        service_area_list: None,
+        full_name_for_network: None,
+        short_name_for_network: None,
+        local_time_zone: None,
+        universal_time_and_local_time_zone: None,
+        network_daylight_saving_time: None,
+        ladn_information: None,
+        configured_nssai: None,
+        rejected_nssai: None,
+    });
+    Some(ogs_msg::build_5gmm_message(&msg).to_vec())
 }
 
 /// Build DL NAS Transport message
@@ -1311,6 +1339,71 @@ mod tests {
         assert_eq!(
             build_service_reject(&ue, GmmCause::Congestion),
             vec![0x7e, 0x00, 0x4d, 22, 0x50, 0x02, 0x02, 0x00]
+        );
+    }
+
+    #[test]
+    fn golden_deregistration_accept() {
+        // EPD | SHT(plain) | DEREGISTRATION ACCEPT (from UE) 0x46; no body.
+        assert_eq!(
+            build_deregistration_accept(&create_test_amf_ue()),
+            Some(vec![0x7e, 0x00, 0x46])
+        );
+    }
+
+    #[test]
+    fn golden_configuration_update_command() {
+        let ue = create_test_amf_ue(); // next_guti.tmsi != 0
+
+        // No indication, no GUTI -> bare header.
+        let none = ConfigurationUpdateCommandParam::default();
+        assert_eq!(
+            build_configuration_update_command(&ue, &none),
+            Some(vec![0x7e, 0x00, 0x54])
+        );
+
+        // Registration + ack requested + GUTI -> indication 0xD3 then 0x77 TLV-E.
+        // Self-verifies against the still-present encode_guti helper.
+        let param = ConfigurationUpdateCommandParam {
+            registration_requested: true,
+            acknowledgement_requested: true,
+            nitz: false,
+            guti: true,
+        };
+        let mut expected = vec![0x7e, 0x00, 0x54, 0xd3];
+        let g = encode_guti(&ue.next_guti);
+        expected.extend_from_slice(&[0x77, (g.len() >> 8) as u8, g.len() as u8]);
+        expected.extend_from_slice(&g);
+        assert_eq!(
+            build_configuration_update_command(&ue, &param),
+            Some(expected)
+        );
+    }
+
+    /// KNOWN DIVERGENCE LOCK (nas-06 Tier D): amfd encodes the de-registration type
+    /// as a bare 0x00 (non-re-reg) byte, but ogs-nas `DeRegistrationType` packs a real
+    /// `AccessType` whose minimum value is 1, so it cannot represent the 0x00 access-
+    /// type sub-field — an amfd-built non-re-reg Deregistration Request does NOT round-
+    /// trip byte-equal through ogs-nas (0x00 -> 0x01). This guard fails the moment the
+    /// divergence is fixed (amfd adopts the conformant de-reg-type bit layout, or
+    /// ogs-nas gains a raw-byte escape); convert it into a positive drift test then.
+    #[test]
+    fn drift_deregistration_request_divergence_locked() {
+        use ogs_nas::fiveg::message::{build_5gmm_message, parse_5gmm_message};
+        let amfd = build_deregistration_request(
+            &create_test_amf_ue(),
+            DeregistrationReason::UeNotSwitchOff, // non-re-reg -> de-reg-type byte 0x00
+            None,
+        )
+        .unwrap();
+        let roundtrips = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd))
+            .map(|parsed| build_5gmm_message(&parsed)[..] == amfd[..])
+            .unwrap_or(false);
+        assert!(
+            !roundtrips,
+            "Deregistration Request now round-trips through ogs-nas — the de-reg-type \
+             0x00 / AccessType divergence is fixed; convert this guard into a byte-equal \
+             drift test and migrate build_deregistration_request"
         );
     }
 
