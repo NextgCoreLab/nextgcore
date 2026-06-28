@@ -100,6 +100,7 @@ pub mod prelude {
         build_5gmm_message,
         build_5gsm_message,
         parse_5gmm_message,
+        parse_5gmm_secured,
         parse_5gsm_message,
         // 6G extension IEs
         AiMlCapability,

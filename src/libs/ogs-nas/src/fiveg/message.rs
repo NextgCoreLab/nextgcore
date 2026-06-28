@@ -5,6 +5,7 @@
 use super::header::*;
 use super::ie::*;
 use super::types::*;
+use crate::common::security::{unprotect_nas_message, NasSecurityContext};
 use crate::common::types::*;
 use crate::error::{NasError, NasResult};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -2115,6 +2116,69 @@ pub fn parse_5gmm_message(buf: &mut Bytes) -> NasResult<FiveGmmMessage> {
     }
 }
 
+/// Parse a 5GMM PDU that may be a SECURITY PROTECTED 5GS NAS MESSAGE
+/// (TS 24.501 §9.1.1, Figure 9.1.1.2). This is the AMF receive side.
+///
+/// - `security_header_type == 0` (plain): the buffer is an unprotected plain
+///   5GMM message; delegate verbatim to [`parse_5gmm_message`].
+/// - `security_header_type != 0`: the buffer is
+///   `EPD(1) | SHT(1) | MAC(4) | SQN(1) | ciphered inner`. Strip the 2-octet
+///   EPD+SHT header, verify (and decipher) via [`unprotect_nas_message`], then
+///   recurse on the recovered plain inner message.
+///
+/// `ctx` is mutated: a successful unprotect advances the uplink NAS COUNT.
+/// MAC mismatch returns [`NasError::MacVerificationFailed`]; a short buffer
+/// returns [`NasError::BufferTooShort`]. Use [`parse_5gmm_message`] directly
+/// for an already-plain message.
+pub fn parse_5gmm_secured(
+    buf: &mut Bytes,
+    ctx: &mut NasSecurityContext,
+) -> NasResult<FiveGmmMessage> {
+    // Need EPD + SHT (2 octets) to read the security header type.
+    if buf.remaining() < 2 {
+        return Err(NasError::BufferTooShort {
+            expected: 2,
+            actual: buf.remaining(),
+        });
+    }
+
+    // Peek the SHT from octet 2's low nibble WITHOUT advancing the cursor; the
+    // plain path then re-reads the full EPD+SHT+type header.
+    let sht = SecurityHeaderType::try_from(buf[1] & 0x0F)?;
+
+    match sht {
+        SecurityHeaderType::PlainNas => parse_5gmm_message(buf),
+        _ => {
+            // EPD+SHT+MAC+SQN (7) + a >= 3-octet inner plain message.
+            if buf.remaining() < FIVEG_NAS_SECURITY_HEADER_LEN {
+                return Err(NasError::BufferTooShort {
+                    expected: FIVEG_NAS_SECURITY_HEADER_LEN,
+                    actual: buf.remaining(),
+                });
+            }
+
+            // Ciphered iff the SHT selects a ciphered codepoint (2 or 4).
+            let ciphered = matches!(
+                sht,
+                SecurityHeaderType::IntegrityProtectedAndCiphered
+                    | SecurityHeaderType::IntegrityProtectedAndCipheredWithNew5gNasSecurityContext
+            );
+
+            // AMF receive side => uplink (UE -> network).
+            const DIRECTION_UPLINK: u8 = 0;
+
+            // unprotect_nas_message expects its slice to START at the MAC, i.e.
+            // wire offset 2 (past EPD+SHT): MAC(4) | SQN(1) | ciphered inner.
+            let plain = unprotect_nas_message(ctx, DIRECTION_UPLINK, &buf[2..], ciphered)?;
+
+            // Recurse on the recovered plain inner message
+            // (its own EPD | SHT=0 | message type | body).
+            let mut inner = Bytes::from(plain);
+            parse_5gmm_message(&mut inner)
+        }
+    }
+}
+
 // =========================================================================
 // 5GSM (5G Session Management) Messages - TS 24.501 Section 8.3
 // =========================================================================
@@ -3272,5 +3336,80 @@ mod nas05_tests {
             FiveGmmMessage::DlNasTransport(m) => assert_eq!(m.gmm_cause, Some(0x2A)),
             other => panic!("expected DlNasTransport, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod nas04_tests {
+    use super::*;
+    use crate::common::security::protect_nas_message;
+
+    fn ctx() -> NasSecurityContext {
+        NasSecurityContext::new(
+            SecurityAlgorithms {
+                ciphering: SecurityAlgorithms::CIPHERING_NONE,
+                integrity: SecurityAlgorithms::INTEGRITY_128_EIA2,
+            },
+            [0x11; 16],
+            [0x22; 16],
+        )
+    }
+
+    /// Build the wire PDU `EPD | SHT | MAC | SQN | inner` for a plain inner
+    /// 5GMM message protected (integrity-only) uplink.
+    fn protect_wire(inner: &[u8], sht: u8) -> Vec<u8> {
+        let mut tx = ctx();
+        let protected = protect_nas_message(&mut tx, 0, inner, false).unwrap();
+        let mut wire = BytesMut::new();
+        wire.put_u8(0x7e); // EPD = 5GMM
+        wire.put_u8(sht);
+        wire.put_slice(&protected);
+        wire.to_vec()
+    }
+
+    #[test]
+    fn test_parse_5gmm_secured_roundtrip() {
+        let original = FiveGmmMessage::SecurityModeComplete(SecurityModeComplete::default());
+        let inner = build_5gmm_message(&original).freeze(); // EPD|SHT0|type|body
+        let wire = protect_wire(&inner, 0x01); // SHT = IntegrityProtected
+        let mut rx = ctx();
+        let recovered = parse_5gmm_secured(&mut Bytes::from(wire), &mut rx).unwrap();
+        assert_eq!(recovered, original);
+    }
+
+    #[test]
+    fn test_parse_5gmm_secured_plain_passthrough() {
+        // SHT == 0 behaves exactly like parse_5gmm_message.
+        let msg = FiveGmmMessage::SecurityModeComplete(SecurityModeComplete::default());
+        let bytes = build_5gmm_message(&msg).freeze();
+        let mut rx = ctx();
+        let via_secured = parse_5gmm_secured(&mut bytes.clone(), &mut rx).unwrap();
+        let via_plain = parse_5gmm_message(&mut bytes.clone()).unwrap();
+        assert_eq!(via_secured, via_plain);
+        assert_eq!(via_secured, msg);
+    }
+
+    #[test]
+    fn test_parse_5gmm_secured_mac_tamper_rejected() {
+        let original = FiveGmmMessage::SecurityModeComplete(SecurityModeComplete::default());
+        let inner = build_5gmm_message(&original).freeze();
+        let mut wire = protect_wire(&inner, 0x01);
+        wire[2] ^= 0xFF; // tamper the first MAC octet (wire offset 2)
+        let mut rx = ctx();
+        assert!(matches!(
+            parse_5gmm_secured(&mut Bytes::from(wire), &mut rx),
+            Err(NasError::MacVerificationFailed)
+        ));
+    }
+
+    #[test]
+    fn test_parse_5gmm_secured_short_buffer() {
+        // SHT != 0 but fewer than the 7-octet protected header.
+        let bytes = Bytes::from(vec![0x7e, 0x01, 0x00, 0x00]);
+        let mut rx = ctx();
+        assert!(matches!(
+            parse_5gmm_secured(&mut bytes.clone(), &mut rx),
+            Err(NasError::BufferTooShort { .. })
+        ));
     }
 }
