@@ -892,7 +892,10 @@ fn build_sm_policy_decision(
     qos_map.insert(
         def_qos_id.clone(),
         serde_json::json!({
-            "qosDecId": def_qos_id,
+            // TS 29.512 Table 5.6.2.8-1: qosId is the mandatory (P=M, card 1)
+            // identifier; the qosDecs map key equals this value. There is no
+            // qosDecId attribute in the spec.
+            "qosId": def_qos_id,
             "5qi": session_data.qos_index,
             "maxbrUl": format_bitrate(session_data.ambr_uplink),
             "maxbrDl": format_bitrate(session_data.ambr_downlink),
@@ -975,7 +978,8 @@ fn build_sm_policy_decision(
         qos_map.insert(
             rule_qos_id.clone(),
             serde_json::json!({
-                "qosDecId": rule_qos_id,
+                // TS 29.512 Table 5.6.2.8-1: mandatory qosId (== map key).
+                "qosId": rule_qos_id,
                 "5qi": rule.qos_index,
             }),
         );
@@ -1202,7 +1206,8 @@ async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest
                 );
 
                 let mut qos_dec = serde_json::json!({
-                    "qosDecId": qos_ref,
+                    // TS 29.512 Table 5.6.2.8-1: mandatory qosId (== map key).
+                    "qosId": qos_ref,
                     "5qi": req_5qi,
                 });
                 if let Some(gbr_ul) = req_gbr_ul {
@@ -1697,6 +1702,56 @@ mod tests {
         assert!(dec.triggers.contains(&"SE_AMBR_CH".to_string()));
         assert!(dec.triggers.contains(&"DEF_QOS_CH".to_string()));
         assert!(dec.triggers.contains(&"RES_MO_RE".to_string()));
+    }
+
+    /// pcfd-01: TS 29.512 Table 5.6.2.8-1 makes `qosId` the mandatory (P=M)
+    /// identifier of a QosData object and there is no `qosDecId` attribute. The
+    /// SMF keys PCC/QoS decisions by qosId, which must equal the qosDecs map
+    /// key. This asserts the corrected wire field for every emitted QosData.
+    #[test]
+    fn test_qos_data_emits_qos_id_not_qos_dec_id() {
+        let session_data = nudr_handler::SessionData {
+            qos_index: 9,
+            arp_priority_level: 8,
+            arp_preempt_cap: false,
+            arp_preempt_vuln: true,
+            ambr_uplink: 100_000_000,
+            ambr_downlink: 200_000_000,
+            pcc_rules: vec![nudr_handler::PccRule {
+                id: "rule-1".to_string(),
+                precedence: 50,
+                qos_index: 5,
+                flow_status: npcf_handler::FlowStatus::Enabled,
+                flows: vec![nudr_handler::FlowDescription {
+                    direction: nudr_handler::FlowDirection::Downlink,
+                    description: "permit out ip from any to assigned".to_string(),
+                }],
+            }],
+        };
+
+        let dec = build_sm_policy_decision("test-policy-1", &session_data);
+        let qos_decs = dec.qos_decs.as_object().expect("qosDecs is an object");
+        assert!(!qos_decs.is_empty(), "expected provisioned QosData entries");
+
+        // Default QoS decision carries the expected mandatory qosId value.
+        assert_eq!(
+            qos_decs["QosDec-test-policy-1"]["qosId"],
+            "QosDec-test-policy-1"
+        );
+
+        // Every QosData object must carry `qosId` == its map key and must NOT
+        // carry the non-conformant `qosDecId` key (strict SMF would reject it).
+        for (key, qos) in qos_decs {
+            assert_eq!(
+                qos.get("qosId").and_then(|v| v.as_str()),
+                Some(key.as_str()),
+                "QosData {key} must carry qosId equal to its qosDecs map key"
+            );
+            assert!(
+                qos.get("qosDecId").is_none(),
+                "QosData {key} must not carry the non-spec qosDecId key"
+            );
+        }
     }
 
     #[test]
