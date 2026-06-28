@@ -166,6 +166,9 @@ pub struct PfcpHeader {
     pub seid_presence: bool,
     /// Message Priority flag (MP bit)
     pub message_priority: bool,
+    /// Follow On flag (FO bit) — when set, another PFCP message follows in the
+    /// same UDP/IP packet (TS 29.244 §7.2.2.1, octet 1 bit 3).
+    pub follow_on: bool,
     /// Message type
     pub message_type: PfcpMessageType,
     /// Message length (excluding first 4 bytes)
@@ -185,6 +188,7 @@ impl PfcpHeader {
             version: PFCP_VERSION,
             seid_presence: false,
             message_priority: false,
+            follow_on: false,
             message_type,
             length: 0,
             seid: None,
@@ -199,6 +203,7 @@ impl PfcpHeader {
             version: PFCP_VERSION,
             seid_presence: true,
             message_priority: false,
+            follow_on: false,
             message_type,
             length: 0,
             seid: Some(seid),
@@ -218,10 +223,12 @@ impl PfcpHeader {
 
     /// Encode the header to bytes
     pub fn encode(&self, buf: &mut BytesMut) {
-        // First byte: version (3 bits) | spare (2 bits) | S (1 bit) | MP (1 bit) | spare (1 bit)
+        // First octet (TS 29.244 §7.2.2.1): bits 6-8 = version, bits 4-5 spare,
+        // bit 3 = FO (0x04), bit 2 = MP (0x02), bit 1 = S (0x01).
         let first_byte = ((self.version & 0x07) << 5)
-            | ((self.seid_presence as u8) << 2)
-            | ((self.message_priority as u8) << 1);
+            | ((self.follow_on as u8) << 2)
+            | ((self.message_priority as u8) << 1)
+            | (self.seid_presence as u8);
         buf.put_u8(first_byte);
 
         // Message type
@@ -255,8 +262,10 @@ impl PfcpHeader {
 
         let first_byte = buf.get_u8();
         let version = (first_byte >> 5) & 0x07;
-        let seid_presence = (first_byte >> 2) & 0x01 != 0;
+        // TS 29.244 §7.2.2.1: bit 1 = S, bit 2 = MP, bit 3 = FO.
+        let seid_presence = first_byte & 0x01 != 0;
         let message_priority = (first_byte >> 1) & 0x01 != 0;
+        let follow_on = (first_byte >> 2) & 0x01 != 0;
 
         if version != PFCP_VERSION {
             return Err(PfcpError::VersionNotSupported(version));
@@ -296,6 +305,7 @@ impl PfcpHeader {
             version,
             seid_presence,
             message_priority,
+            follow_on,
             message_type,
             length,
             seid,
@@ -346,6 +356,56 @@ mod tests {
         assert_eq!(decoded.sequence_number, 54321);
         assert!(decoded.seid_presence);
         assert_eq!(decoded.seid, Some(0x123456789ABCDEF0));
+    }
+
+    #[test]
+    fn test_header_seid_flag_wire_bit() {
+        // TS 29.244 §7.2.2.1: a Session* message (SEID present) must set bit 1 (0x01)
+        // of octet 1, and FO (bit 3, 0x04) must be clear by default.
+        let header = PfcpHeader::new_with_seid(
+            PfcpMessageType::SessionEstablishmentRequest,
+            0x1122334455667788,
+            7,
+        );
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf);
+        let first = buf[0];
+        assert_eq!(first & 0x01, 0x01, "S flag must be bit 1");
+        assert_eq!(first & 0x04, 0x00, "FO flag must be clear");
+        assert_eq!(first >> 5, PFCP_VERSION, "version in bits 6-8");
+
+        // A node-related message (no SEID) must clear bit 1.
+        let node = PfcpHeader::new(PfcpMessageType::HeartbeatRequest, 1);
+        let mut nbuf = BytesMut::new();
+        node.encode(&mut nbuf);
+        assert_eq!(nbuf[0] & 0x01, 0x00, "S flag must be clear with no SEID");
+    }
+
+    #[test]
+    fn test_header_flag_roundtrip_all_combos() {
+        for &(s, mp, fo) in &[
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, true),
+        ] {
+            let mut header = PfcpHeader::new(PfcpMessageType::SessionReportRequest, 42);
+            header.seid_presence = s;
+            header.seid = if s { Some(0xABCD) } else { None };
+            header.message_priority = mp;
+            header.priority = if mp { Some(3) } else { None };
+            header.follow_on = fo;
+
+            let mut buf = BytesMut::new();
+            header.encode(&mut buf);
+            let mut bytes = buf.freeze();
+            let decoded = PfcpHeader::decode(&mut bytes).unwrap();
+
+            assert_eq!(decoded.seid_presence, s);
+            assert_eq!(decoded.message_priority, mp);
+            assert_eq!(decoded.follow_on, fo);
+        }
     }
 
     #[test]

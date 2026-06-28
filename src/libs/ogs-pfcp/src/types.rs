@@ -750,7 +750,9 @@ impl ApplyAction {
         }
     }
 
-    /// Encode to bytes (2 bytes)
+    /// Encode the flags to a packed u16 (logical layout, NOT wire order):
+    /// low byte = TS 29.244 §8.2.26 octet 5 (DROP..DFRT), high byte = octet 6
+    /// (EDRT/BDPN/DDPN). Use [`encode_ie`](Self::encode_ie) to emit on the wire.
     pub fn encode(&self) -> u16 {
         ((self.ddpn as u16) << 10)
             | ((self.bdpn as u16) << 9)
@@ -780,6 +782,23 @@ impl ApplyAction {
             bdpn: (value >> 9) & 0x01 != 0,
             ddpn: (value >> 10) & 0x01 != 0,
         }
+    }
+
+    /// Encode as a complete Apply Action IE (type + length + payload) with the
+    /// correct TS 29.244 §8.2.26 wire octet order: octet 5 (DROP..DFRT) is
+    /// transmitted first, then octet 6 (EDRT/BDPN/DDPN).
+    pub fn encode_ie(&self, buf: &mut BytesMut) {
+        use crate::ie::{encode_bytes_ie, IeType};
+        let v = self.encode();
+        encode_bytes_ie(buf, IeType::ApplyAction, &[(v & 0xFF) as u8, (v >> 8) as u8]);
+    }
+
+    /// Decode the Apply Action IE payload from its wire octets (octet 5 first,
+    /// then octet 6), inverse of [`encode_ie`](Self::encode_ie).
+    pub fn decode_ie(data: &[u8]) -> Self {
+        let octet5 = data.first().copied().unwrap_or(0);
+        let octet6 = data.get(1).copied().unwrap_or(0);
+        Self::decode((octet5 as u16) | ((octet6 as u16) << 8))
     }
 }
 
@@ -2060,10 +2079,10 @@ impl CreateFar {
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
-        use crate::ie::{encode_u16_ie, encode_u32_ie, encode_u8_ie, IeHeader, IeType};
+        use crate::ie::{encode_u32_ie, encode_u8_ie, IeHeader, IeType};
 
         encode_u32_ie(buf, IeType::FarId, self.far_id);
-        encode_u16_ie(buf, IeType::ApplyAction, self.apply_action.encode());
+        self.apply_action.encode_ie(buf);
 
         if let Some(fp) = &self.forwarding_parameters {
             let mut fp_buf = BytesMut::new();
@@ -2097,8 +2116,7 @@ impl CreateFar {
                 }
                 t if t == IeType::ApplyAction as u16 => {
                     if ie.data.len() >= 2 {
-                        let mut data = ie.data;
-                        apply_action = ApplyAction::decode(data.get_u16());
+                        apply_action = ApplyAction::decode_ie(&ie.data[..]);
                     }
                 }
                 t if t == IeType::ForwardingParameters as u16 => {
@@ -2558,12 +2576,12 @@ impl UpdateFar {
     }
 
     pub fn encode(&self, buf: &mut BytesMut) {
-        use crate::ie::{encode_u16_ie, encode_u32_ie, encode_u8_ie, IeHeader, IeType};
+        use crate::ie::{encode_u32_ie, encode_u8_ie, IeHeader, IeType};
 
         encode_u32_ie(buf, IeType::FarId, self.far_id);
 
         if let Some(aa) = &self.apply_action {
-            encode_u16_ie(buf, IeType::ApplyAction, aa.encode());
+            aa.encode_ie(buf);
         }
 
         if let Some(fp) = &self.forwarding_parameters {
@@ -2601,8 +2619,7 @@ impl UpdateFar {
                 }
                 t if t == IeType::ApplyAction as u16 => {
                     if ie.data.len() >= 2 {
-                        let mut data = ie.data;
-                        apply_action = Some(ApplyAction::decode(data.get_u16()));
+                        apply_action = Some(ApplyAction::decode_ie(&ie.data[..]));
                     }
                 }
                 t if t == IeType::UpdateForwardingParameters as u16 => {
@@ -3212,5 +3229,30 @@ mod tests {
         let mut bytes = Bytes::from_static(&[0x00, 0x3F, 0x00, 0x02, 0x01, 0x02]);
         let decoded = UsageReportSrr::decode(&mut bytes).expect("valid trigger decodes");
         assert_eq!(decoded.usage_report_trigger, Some(0x0102));
+    }
+
+    #[test]
+    fn test_apply_action_ie_wire_octet_order() {
+        // TS 29.244 §8.2.26: octet 5 (DROP..DFRT) first, octet 6 (EDRT/BDPN/DDPN) second.
+        let mut buf = BytesMut::new();
+        ApplyAction::forward().encode_ie(&mut buf);
+        // payload is the last two octets of the IE.
+        assert_eq!(&buf[buf.len() - 2..], &[0x02, 0x00], "FORW -> octet5=0x02");
+
+        let mut buf = BytesMut::new();
+        ApplyAction::drop().encode_ie(&mut buf);
+        assert_eq!(&buf[buf.len() - 2..], &[0x01, 0x00], "DROP -> octet5=0x01");
+
+        // An octet-6 flag (DDPN) must land in the second payload octet.
+        let mut aa = ApplyAction::default();
+        aa.ddpn = true;
+        let mut buf = BytesMut::new();
+        aa.encode_ie(&mut buf);
+        assert_eq!(&buf[buf.len() - 2..], &[0x00, 0x04], "DDPN -> octet6 bit3");
+
+        // Round-trip via the payload octets.
+        let payload = &buf[buf.len() - 2..];
+        assert!(ApplyAction::decode_ie(payload).ddpn);
+        assert!(ApplyAction::decode_ie(&[0x02, 0x00]).forw);
     }
 }

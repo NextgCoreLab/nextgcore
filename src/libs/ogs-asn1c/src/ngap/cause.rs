@@ -319,9 +319,13 @@ pub enum Cause {
 }
 
 impl Cause {
-    // 5 alternatives in root, extensible
-    pub const NUM_ALTERNATIVES: usize = 5;
-    pub const EXTENSIBLE: bool = true;
+    // TS 38.413 §9.3.1.2: Cause is a NON-extensible CHOICE (no `...`) with 6
+    // alternatives — radioNetwork, transport, nas, protocol, misc and
+    // choice-Extensions. The index is therefore a constrained whole number
+    // 0..5 (3 bits) with NO leading extension bit. `Cause-ExtIEs` is an empty
+    // extension set, so a conformant peer never selects alternative 5.
+    pub const NUM_ALTERNATIVES: usize = 6;
+    pub const EXTENSIBLE: bool = false;
 }
 
 impl AperEncode for Cause {
@@ -362,6 +366,10 @@ impl AperDecode for Cause {
             2 => Ok(Cause::Nas(CauseNas::decode_aper(decoder)?)),
             3 => Ok(Cause::Protocol(CauseProtocol::decode_aper(decoder)?)),
             4 => Ok(Cause::Misc(CauseMisc::decode_aper(decoder)?)),
+            5 => Err(PerError::DecodeError(
+                "Cause choice-Extensions selected but Cause-ExtIEs is empty in TS 38.413"
+                    .to_string(),
+            )),
             _ => Err(PerError::InvalidChoiceIndex {
                 index,
                 max: Self::NUM_ALTERNATIVES - 1,
@@ -388,6 +396,44 @@ mod tests {
         let decoded = Cause::decode_aper(&mut decoder).unwrap();
 
         assert_eq!(cause, decoded);
+    }
+
+    #[test]
+    fn test_cause_choice_index_non_extensible_3bit() {
+        // TS 38.413 §9.3.1.2: non-extensible CHOICE → 3-bit index in the top
+        // bits with NO leading extension bit. Transport = index 1 must appear
+        // as `001` in the high 3 bits of octet 0 (== 1 when shifted), which
+        // would be impossible if a spurious extension bit preceded the index.
+        let mut encoder = AperEncoder::new();
+        Cause::Transport(CauseTransport::TransportResourceUnavailable)
+            .encode_aper(&mut encoder)
+            .unwrap();
+        encoder.align();
+        let bytes = encoder.into_bytes();
+        assert_eq!(
+            bytes[0] >> 5,
+            1,
+            "Transport choice index must occupy the top 3 bits with no extension bit"
+        );
+    }
+
+    #[test]
+    fn test_cause_all_alternatives_roundtrip() {
+        let cases = [
+            Cause::RadioNetwork(CauseRadioNetwork::UserInactivity),
+            Cause::Transport(CauseTransport::Unspecified),
+            Cause::Nas(CauseNas::Unspecified),
+            Cause::Protocol(CauseProtocol::Unspecified),
+            Cause::Misc(CauseMisc::HardwareFailure),
+        ];
+        for cause in cases {
+            let mut encoder = AperEncoder::new();
+            cause.encode_aper(&mut encoder).unwrap();
+            encoder.align();
+            let bytes = encoder.into_bytes();
+            let mut decoder = AperDecoder::new(&bytes);
+            assert_eq!(Cause::decode_aper(&mut decoder).unwrap(), cause);
+        }
     }
 
     #[test]
