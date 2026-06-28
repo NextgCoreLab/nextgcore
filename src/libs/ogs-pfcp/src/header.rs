@@ -175,7 +175,9 @@ pub struct PfcpHeader {
     pub length: u16,
     /// Session Endpoint Identifier (optional)
     pub seid: Option<u64>,
-    /// Sequence number
+    /// Sequence number. PFCP sequence numbers are 3 octets (TS 29.244 §7.2.2),
+    /// so only the low 24 bits (valid range `0..=0x00FF_FFFF`) are encoded on
+    /// the wire; any higher bits are masked off on encode.
     pub sequence_number: u32,
     /// Message priority value (if MP bit is set)
     pub priority: Option<u8>,
@@ -242,8 +244,16 @@ impl PfcpHeader {
             buf.put_u64(seid);
         }
 
-        // Sequence number (3 bytes) + spare/priority (1 byte)
-        let seq_bytes = self.sequence_number.to_be_bytes();
+        // Sequence number (3 bytes) + spare/priority (1 byte).
+        // PFCP sequence numbers are 3 octets (TS 29.244 §7.2.2); mask to the low
+        // 24 bits so an out-of-range value can never corrupt adjacent header
+        // octets. This is wire-equivalent for valid values since the
+        // to_be_bytes()[1..4] slice already drops the high byte.
+        debug_assert!(
+            self.sequence_number <= 0x00FF_FFFF,
+            "PFCP sequence number must fit in 24 bits"
+        );
+        let seq_bytes = (self.sequence_number & 0x00FF_FFFF).to_be_bytes();
         buf.put_slice(&seq_bytes[1..4]); // Only 3 bytes
 
         // Priority or spare
@@ -406,6 +416,34 @@ mod tests {
             assert_eq!(decoded.message_priority, mp);
             assert_eq!(decoded.follow_on, fo);
         }
+    }
+
+    #[test]
+    fn test_sequence_number_masked_to_24_bits() {
+        // TS 29.244 §7.2.2: the sequence number is 3 octets. The maximum valid
+        // 24-bit value must round-trip, and the encoded wire bytes are exactly
+        // the low 3 octets (big-endian) — confirming the mask is wire-equivalent
+        // for valid values. A no-SEID header lays the seq out at offset 4..7.
+        let header = PfcpHeader::new(PfcpMessageType::HeartbeatRequest, 0x00AB_CDEF);
+        let mut buf = BytesMut::new();
+        header.encode(&mut buf);
+        assert_eq!(&buf[4..7], &[0xAB, 0xCD, 0xEF], "low 3 octets, big-endian");
+
+        let mut bytes = buf.freeze();
+        let decoded = PfcpHeader::decode(&mut bytes).unwrap();
+        assert_eq!(decoded.sequence_number, 0x00AB_CDEF);
+        // Decode is inherently bounded to 24 bits (only 3 octets are read).
+        assert!(decoded.sequence_number <= 0x00FF_FFFF);
+
+        // The maximum valid 24-bit value also round-trips unchanged.
+        let max = PfcpHeader::new(PfcpMessageType::HeartbeatRequest, 0x00FF_FFFF);
+        let mut mbuf = BytesMut::new();
+        max.encode(&mut mbuf);
+        let mut mbytes = mbuf.freeze();
+        assert_eq!(
+            PfcpHeader::decode(&mut mbytes).unwrap().sequence_number,
+            0x00FF_FFFF
+        );
     }
 
     #[test]

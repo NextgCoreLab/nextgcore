@@ -270,108 +270,9 @@ pub enum IeType {
     PfdPartialFailureInformation = 397,
 }
 
-impl TryFrom<u16> for IeType {
-    type Error = PfcpError;
-
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::CreatePdr),
-            2 => Ok(Self::Pdi),
-            3 => Ok(Self::CreateFar),
-            4 => Ok(Self::ForwardingParameters),
-            5 => Ok(Self::DuplicatingParameters),
-            6 => Ok(Self::CreateUrr),
-            7 => Ok(Self::CreateQer),
-            8 => Ok(Self::CreatedPdr),
-            9 => Ok(Self::UpdatePdr),
-            10 => Ok(Self::UpdateFar),
-            11 => Ok(Self::UpdateForwardingParameters),
-            12 => Ok(Self::UpdateBar),
-            13 => Ok(Self::UpdateUrr),
-            14 => Ok(Self::UpdateQer),
-            15 => Ok(Self::RemovePdr),
-            16 => Ok(Self::RemoveFar),
-            17 => Ok(Self::RemoveUrr),
-            18 => Ok(Self::RemoveQer),
-            19 => Ok(Self::Cause),
-            20 => Ok(Self::SourceInterface),
-            21 => Ok(Self::FTeid),
-            22 => Ok(Self::NetworkInstance),
-            23 => Ok(Self::SdfFilter),
-            24 => Ok(Self::ApplicationId),
-            25 => Ok(Self::GateStatus),
-            26 => Ok(Self::Mbr),
-            27 => Ok(Self::Gbr),
-            28 => Ok(Self::QerCorrelationId),
-            29 => Ok(Self::Precedence),
-            30 => Ok(Self::TransportLevelMarking),
-            31 => Ok(Self::VolumeThreshold),
-            32 => Ok(Self::TimeThreshold),
-            33 => Ok(Self::MonitoringTime),
-            37 => Ok(Self::ReportingTriggers),
-            38 => Ok(Self::RedirectInformation),
-            39 => Ok(Self::ReportType),
-            40 => Ok(Self::OffendingIe),
-            41 => Ok(Self::ForwardingPolicy),
-            42 => Ok(Self::DestinationInterface),
-            43 => Ok(Self::UpFunctionFeatures),
-            44 => Ok(Self::ApplyAction),
-            45 => Ok(Self::DownlinkDataServiceInformation),
-            46 => Ok(Self::DownlinkDataNotificationDelay),
-            47 => Ok(Self::DlBufferingDuration),
-            48 => Ok(Self::DlBufferingSuggestedPacketCount),
-            49 => Ok(Self::PfcpSmreqFlags),
-            50 => Ok(Self::PfcpSrrspFlags),
-            56 => Ok(Self::PdrId),
-            57 => Ok(Self::FSeid),
-            60 => Ok(Self::NodeId),
-            62 => Ok(Self::MeasurementMethod),
-            63 => Ok(Self::UsageReportTrigger),
-            64 => Ok(Self::MeasurementPeriod),
-            65 => Ok(Self::FqCsid),
-            66 => Ok(Self::VolumeMeasurement),
-            67 => Ok(Self::DurationMeasurement),
-            69 => Ok(Self::TimeOfFirstPacket),
-            70 => Ok(Self::TimeOfLastPacket),
-            73 => Ok(Self::VolumeQuota),
-            74 => Ok(Self::TimeQuota),
-            75 => Ok(Self::StartTime),
-            76 => Ok(Self::EndTime),
-            78 => Ok(Self::UsageReportSmr),
-            80 => Ok(Self::UsageReportSrr),
-            81 => Ok(Self::UrrId),
-            83 => Ok(Self::DownlinkDataReport),
-            84 => Ok(Self::OuterHeaderCreation),
-            85 => Ok(Self::CreateBar),
-            86 => Ok(Self::UpdateBarSmr),
-            87 => Ok(Self::RemoveBar),
-            88 => Ok(Self::BarId),
-            89 => Ok(Self::CpFunctionFeatures),
-            93 => Ok(Self::UeIpAddress),
-            94 => Ok(Self::PacketRate),
-            95 => Ok(Self::OuterHeaderRemoval),
-            96 => Ok(Self::RecoveryTimeStamp),
-            104 => Ok(Self::UrSeqn),
-            108 => Ok(Self::FarId),
-            109 => Ok(Self::QerId),
-            113 => Ok(Self::PdnType),
-            114 => Ok(Self::FailedRuleId),
-            116 => Ok(Self::UserPlaneIpResourceInformation),
-            124 => Ok(Self::Qfi),
-            131 => Ok(Self::TrafficEndpointId),
-            140 => Ok(Self::SuggestedBufferingPacketsCount),
-            159 => Ok(Self::ApnDnn),
-            160 => Ok(Self::ThreeGppInterfaceType),
-            161 => Ok(Self::PfcpSrreqFlags),
-            178 => Ok(Self::AlternativeSmfIpAddress),
-            253 => Ok(Self::NfInstanceId),
-            290 => Ok(Self::PfcpSessionChangeInfo),
-            291 => Ok(Self::GroupId),
-            292 => Ok(Self::CpIpAddress),
-            _ => Err(PfcpError::InvalidIeType(value)),
-        }
-    }
-}
+// NOTE: dispatch throughout the crate compares raw `IeType::X as u16` values, so
+// no `TryFrom<u16>` conversion is needed. A partial table was removed (pfcp-11)
+// to avoid a latent inconsistency where only a subset of discriminants mapped.
 
 /// PFCP IE Header (4 bytes)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -502,107 +403,10 @@ impl DurationMeasurement {
     }
 }
 
-/// VolumeThreshold (IE 31) - Volume thresholds
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct VolumeThreshold {
-    pub total_volume: Option<u64>,
-    pub uplink_volume: Option<u64>,
-    pub downlink_volume: Option<u64>,
-}
-
-impl VolumeThreshold {
-    pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::new();
-        let mut flags = 0u8;
-        if self.total_volume.is_some() {
-            flags |= 0x01;
-        }
-        if self.uplink_volume.is_some() {
-            flags |= 0x02;
-        }
-        if self.downlink_volume.is_some() {
-            flags |= 0x04;
-        }
-
-        buf.put_u8(flags);
-        if let Some(v) = self.total_volume {
-            buf.put_u64(v);
-        }
-        if let Some(v) = self.uplink_volume {
-            buf.put_u64(v);
-        }
-        if let Some(v) = self.downlink_volume {
-            buf.put_u64(v);
-        }
-
-        buf.freeze()
-    }
-
-    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
-        if data.is_empty() {
-            return Err(PfcpError::BufferTooShort {
-                needed: 1,
-                available: 0,
-            });
-        }
-        let mut buf = Bytes::copy_from_slice(data);
-        let flags = buf.get_u8();
-        let mut vt = VolumeThreshold::default();
-
-        if flags & 0x01 != 0 {
-            vt.total_volume = Some(buf.get_u64());
-        }
-        if flags & 0x02 != 0 {
-            vt.uplink_volume = Some(buf.get_u64());
-        }
-        if flags & 0x04 != 0 {
-            vt.downlink_volume = Some(buf.get_u64());
-        }
-
-        Ok(vt)
-    }
-}
-
-/// ReportType (IE 39) - Type of usage report
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReportType {
-    pub downlink_data_report: bool,
-    pub usage_report: bool,
-    pub error_indication_report: bool,
-}
-
-impl ReportType {
-    pub fn encode(&self) -> Bytes {
-        let mut flags = 0u8;
-        if self.downlink_data_report {
-            flags |= 0x01;
-        }
-        if self.usage_report {
-            flags |= 0x02;
-        }
-        if self.error_indication_report {
-            flags |= 0x04;
-        }
-
-        Bytes::copy_from_slice(&[flags])
-    }
-
-    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
-        if data.is_empty() {
-            return Err(PfcpError::BufferTooShort {
-                needed: 1,
-                available: 0,
-            });
-        }
-        let flags = data[0];
-
-        Ok(ReportType {
-            downlink_data_report: flags & 0x01 != 0,
-            usage_report: flags & 0x02 != 0,
-            error_indication_report: flags & 0x04 != 0,
-        })
-    }
-}
+// NOTE: VolumeThreshold (IE 31) and ReportType (IE 39) had duplicate, divergent
+// definitions here that no consumer referenced; the canonical copies live in
+// `crate::types` (used by message.rs / prelude). The dead copies were removed
+// (pfcp-12).
 
 /// UsageReportTrigger (IE 63) - Trigger for usage report
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -740,43 +544,9 @@ impl QerControlIndications {
     }
 }
 
-/// MeasurementMethod (IE 62) - Method used for measurement
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MeasurementMethod {
-    pub duration: bool,
-    pub volume: bool,
-    pub event: bool,
-}
-
-impl MeasurementMethod {
-    pub fn encode(&self) -> Bytes {
-        let mut flags = 0u8;
-        if self.duration {
-            flags |= 0x01;
-        }
-        if self.volume {
-            flags |= 0x02;
-        }
-        if self.event {
-            flags |= 0x04;
-        }
-        Bytes::copy_from_slice(&[flags])
-    }
-
-    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
-        if data.is_empty() {
-            return Err(PfcpError::BufferTooShort {
-                needed: 1,
-                available: 0,
-            });
-        }
-        Ok(MeasurementMethod {
-            duration: data[0] & 0x01 != 0,
-            volume: data[0] & 0x02 != 0,
-            event: data[0] & 0x04 != 0,
-        })
-    }
-}
+// NOTE: MeasurementMethod (IE 62) had a duplicate, divergent definition here
+// that no consumer referenced; the canonical copy lives in `crate::types`
+// (used by message.rs / prelude). The dead copy was removed (pfcp-12).
 
 /// MeasurementInformation (IE 100) - Information about measurements
 #[derive(Debug, Clone, PartialEq, Eq)]
