@@ -9,6 +9,29 @@ use crate::common::types::*;
 use crate::error::{NasError, NasResult};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
+/// Skip an unknown / unhandled optional IE in a default IE-loop arm, per
+/// TS 24.501 §7.6.1 (unknown IEs are ignored, not errored) and the TS 24.007
+/// IE-format rules. `buf` must be positioned at the IEI octet; `iei` is the
+/// peeked IEI (`buf.chunk()[0]`).
+///
+/// - `iei >= 0x80`: type-1 (TV, half-octet IEI in the high nibble) or type-2
+///   (T) — the whole IE is the single IEI octet; consume 1 octet, no length,
+///   no value.
+/// - `iei <  0x80`: treated as type-4 (TLV) — consume the IEI octet, a 1-octet
+///   length, then `len` value octets (clamped to remaining for well-formed
+///   inputs). NOTE: unknown type-3 (fixed-length TV) and type-6 (TLV-E) IEs
+///   share the `< 0x80` space and are not distinguishable here; all *known*
+///   such IEIs are matched explicitly, so this only affects unknown ones.
+fn skip_unknown_ie(buf: &mut Bytes, iei: u8) -> NasResult<()> {
+    buf.advance(1); // consume the IEI octet (peeked, not yet advanced by caller)
+    if iei < 0x80 && buf.remaining() > 0 {
+        let len = buf.get_u8() as usize;
+        let take = len.min(buf.remaining());
+        buf.advance(take);
+    }
+    Ok(())
+}
+
 /// 5GMM message
 #[derive(Debug, Clone, PartialEq)]
 pub enum FiveGmmMessage {
@@ -198,16 +221,7 @@ impl RegistrationRequest {
                     buf.advance(1);
                     msg.additional_guti = Some(MobileIdentity::decode(buf)?);
                 }
-                _ => {
-                    // Skip unknown IE
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
 
@@ -307,15 +321,7 @@ impl RegistrationAccept {
                     buf.advance(1);
                     msg.t3502_value = Some(GprsTimer2::decode(buf)?);
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
 
@@ -383,15 +389,7 @@ impl RegistrationReject {
                     buf.advance(1);
                     msg.eap_message = Some(EapMessage::decode(buf)?);
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
 
@@ -430,15 +428,7 @@ impl RegistrationComplete {
                         msg.sor_transparent_container = Some(buf.copy_to_bytes(len).to_vec());
                     }
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -531,15 +521,7 @@ impl DeregistrationRequestToUe {
                     buf.advance(1);
                     msg.t3346_value = Some(GprsTimer2::decode(buf)?);
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -633,15 +615,7 @@ impl ServiceRequest {
                     buf.advance(1);
                     msg.nas_message_container = Some(NasMessageContainer::decode(buf)?);
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -706,15 +680,7 @@ impl ServiceAccept {
                     buf.advance(1);
                     msg.t3448_value = Some(GprsTimer2::decode(buf)?);
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -778,15 +744,7 @@ impl ServiceReject {
                     buf.advance(1);
                     msg.eap_message = Some(EapMessage::decode(buf)?);
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -869,15 +827,7 @@ impl AuthenticationRequest {
                     buf.advance(1);
                     msg.eap_message = Some(EapMessage::decode(buf)?);
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
 
@@ -920,15 +870,7 @@ impl AuthenticationResponse {
                     buf.advance(1);
                     msg.eap_message = Some(EapMessage::decode(buf)?);
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -959,15 +901,7 @@ impl AuthenticationReject {
                     buf.advance(1);
                     msg.eap_message = Some(EapMessage::decode(buf)?);
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -1018,15 +952,7 @@ impl AuthenticationFailure {
                         }
                     }
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -1075,15 +1001,7 @@ impl AuthenticationResult {
                     buf.advance(1);
                     msg.abba = Some(Abba::decode(buf)?);
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -1240,15 +1158,7 @@ impl SecurityModeCommand {
                     buf.advance(1);
                     msg.abba = Some(Abba::decode(buf)?);
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -1299,15 +1209,7 @@ impl SecurityModeComplete {
                     buf.advance(1);
                     msg.non_imeisv_pei = Some(MobileIdentity::decode(buf)?);
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -1475,15 +1377,7 @@ impl UlNasTransport {
                     buf.advance(1);
                     msg.dnn = Some(Dnn::decode(buf)?);
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -1586,15 +1480,7 @@ impl DlNasTransport {
                     buf.advance(1);
                     msg.back_off_timer_value = Some(GprsTimer3::decode(buf)?);
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -1785,15 +1671,7 @@ impl ConfigurationUpdateCommand {
                         }
                     }
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -1849,15 +1727,7 @@ impl NotificationResponse {
                     buf.advance(1);
                     msg.pdu_session_status = Some(PduSessionStatus::decode(buf)?);
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -1952,15 +1822,7 @@ impl ControlPlaneServiceRequest {
                     buf.advance(1);
                     msg.nas_message_container = Some(NasMessageContainer::decode(buf)?);
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -2345,15 +2207,7 @@ impl PduSessionEstablishmentRequest {
                         }
                     }
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -2460,15 +2314,7 @@ impl PduSessionEstablishmentAccept {
                     buf.advance(1);
                     msg.dnn = Some(Dnn::decode(buf)?);
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -2528,15 +2374,7 @@ impl PduSessionEstablishmentReject {
                         }
                     }
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -2593,15 +2431,7 @@ impl PduSessionModificationRequest {
                         }
                     }
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -2664,15 +2494,7 @@ impl PduSessionModificationCommand {
                     buf.advance(1);
                     msg.authorized_qos_flow_descriptions = Some(QosFlowDescriptions::decode(buf)?);
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -2732,15 +2554,7 @@ impl PduSessionModificationReject {
                         }
                     }
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -2790,15 +2604,7 @@ impl PduSessionModificationCommandReject {
                         }
                     }
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -2847,15 +2653,7 @@ impl PduSessionReleaseRequest {
                         }
                     }
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -2905,15 +2703,7 @@ impl PduSessionReleaseReject {
                         }
                     }
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -2973,15 +2763,7 @@ impl PduSessionReleaseCommand {
                         }
                     }
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -3030,15 +2812,7 @@ impl PduSessionReleaseComplete {
                         }
                     }
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -3107,15 +2881,7 @@ impl PduSessionAuthenticationCommand {
                         }
                     }
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -3159,15 +2925,7 @@ impl PduSessionAuthenticationComplete {
                         }
                     }
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -3214,15 +2972,7 @@ impl PduSessionAuthenticationResult {
                         }
                     }
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -3276,15 +3026,7 @@ impl RemoteUeReport {
                         }
                     }
                 }
-                _ => {
-                    buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
-                    }
-                }
+                _ => skip_unknown_ie(buf, iei)?,
             }
         }
         Ok(msg)
@@ -3301,15 +3043,10 @@ impl RemoteUeReportResponse {
     }
 
     pub fn decode(buf: &mut Bytes) -> NasResult<Self> {
-        // Skip any optional IEs
+        // Skip any optional IEs (type-aware, per TS 24.501 §7.6.1 / TS 24.007).
         while buf.remaining() > 0 {
-            buf.advance(1);
-            if buf.remaining() > 0 {
-                let len = buf.get_u8() as usize;
-                if buf.remaining() >= len {
-                    buf.advance(len);
-                }
-            }
+            let iei = buf.chunk()[0];
+            skip_unknown_ie(buf, iei)?;
         }
         Ok(Self)
     }
@@ -3476,4 +3213,64 @@ pub fn parse_5gsm_message(buf: &mut Bytes) -> NasResult<(u8, u8, FiveGsmMessage)
         header.procedure_transaction_identity,
         msg,
     ))
+}
+
+#[cfg(test)]
+mod nas05_tests {
+    use super::*;
+
+    #[test]
+    fn test_skip_unknown_ie_type1_consumes_one_octet() {
+        // Type-1/2 (IEI >= 0x80): exactly 1 octet, no length, no value.
+        let mut buf = Bytes::from(vec![0xB0, 0x58, 0x2A]);
+        skip_unknown_ie(&mut buf, 0xB0).unwrap();
+        assert_eq!(buf.remaining(), 2);
+        assert_eq!(buf.chunk()[0], 0x58);
+    }
+
+    #[test]
+    fn test_skip_unknown_ie_type4_tlv() {
+        // Type-4 (IEI < 0x80): IEI + 1-octet length + len value octets.
+        let mut buf = Bytes::from(vec![0x4A, 0x02, 0xAA, 0xBB, 0x58]);
+        skip_unknown_ie(&mut buf, 0x4A).unwrap();
+        assert_eq!(buf.remaining(), 1);
+        assert_eq!(buf.chunk()[0], 0x58);
+    }
+
+    #[test]
+    fn test_skip_unknown_ie_truncated_tlv_clamps() {
+        // Malformed length > remaining: clamp and terminate, no panic.
+        let mut buf = Bytes::from(vec![0x4A, 0x05, 0xAA]);
+        skip_unknown_ie(&mut buf, 0x4A).unwrap();
+        assert_eq!(buf.remaining(), 0);
+    }
+
+    #[test]
+    fn test_unknown_type1_ie_does_not_desync_trailing_tv() {
+        // DlNasTransport whose only optional IE is the gmm_cause TV (0x58 + 1).
+        let msg = DlNasTransport {
+            payload_container_type: PayloadContainerType::N1SmInformation,
+            payload_container: PayloadContainer::new(vec![0x01]),
+            pdu_session_id: None,
+            additional_information: None,
+            gmm_cause: Some(0x2A),
+            back_off_timer_value: None,
+        };
+        let encoded = build_5gmm_message(&FiveGmmMessage::DlNasTransport(msg)).freeze();
+
+        // Splice an unknown type-1 IE (0xB0) immediately before the trailing
+        // gmm_cause TV. With the old length-assuming skip the parser read 0x58
+        // as a length and dropped the cause; the type-aware skip consumes the
+        // 0xB0 in one octet so the cause still decodes.
+        let mut spliced = encoded.to_vec();
+        let cut = spliced.len() - 2; // index of the 0x58 IEI
+        assert_eq!(spliced[cut], 0x58, "gmm_cause TV must be the last IE");
+        spliced.insert(cut, 0xB0);
+
+        let parsed = parse_5gmm_message(&mut Bytes::from(spliced)).unwrap();
+        match parsed {
+            FiveGmmMessage::DlNasTransport(m) => assert_eq!(m.gmm_cause, Some(0x2A)),
+            other => panic!("expected DlNasTransport, got {other:?}"),
+        }
+    }
 }
