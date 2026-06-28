@@ -629,31 +629,39 @@ pub fn encode_global_ran_node_id(
             gnb_id,
             gnb_id_len,
         } => {
-            // GlobalRANNodeID CHOICE: globalGNB-ID is index 0 out of 4 alternatives, extensible
-            encoder.encode_choice_index(0, 4, true)?;
-            // GlobalGNB-ID SEQUENCE { plmnIdentity, gNB-ID, iE-Extensions OPTIONAL }
-            encoder.write_bit(false); // extension
+            // GlobalRANNodeID CHOICE: globalGNB-ID = index 0 of 4, NON-extensible
+            // (TS 38.413 §9.3.1.5 has no `...`) -> 2-bit index, no extension bit.
+            encoder.encode_choice_index(0, 4, false)?;
+            // GlobalGNB-ID SEQUENCE { plmnIdentity, gNB-ID, iE-Extensions OPTIONAL, ... }
+            encoder.write_bit(false); // extension marker
             encoder.write_bit(false); // no iE-Extensions
                                       // PLMN Identity
             encoder.encode_octet_string(plmn_identity, Some(3), Some(3))?;
-            // GNB-ID CHOICE: gNB-ID (BIT STRING (22..32)) is index 0 out of 1, extensible
-            encoder.encode_choice_index(0, 1, true)?;
+            // GNB-ID CHOICE { gNB-ID BIT STRING(22..32), choice-Extensions }:
+            // 2 alternatives, NON-extensible -> 1-bit index.
+            encoder.encode_choice_index(0, 2, false)?;
             let len = *gnb_id_len as usize;
-            // BIT STRING (SIZE (22..32)) - constrained length
+            // BIT STRING (SIZE (22..32)): constrained length, then octet-align
+            // before the content (upper bound 32 > 16, X.691 §16).
             encoder.encode_constrained_length(len, 22, 32)?;
+            encoder.align();
             encoder.write_bits(*gnb_id as u64, len);
         }
         GlobalRanNodeId::GlobalNgEnbId {
             plmn_identity,
             ng_enb_id,
         } => {
-            // globalNgENB-ID is index 1
-            encoder.encode_choice_index(1, 4, true)?;
-            encoder.write_bit(false);
-            encoder.write_bit(false);
+            // globalNgENB-ID = index 1 of 4, NON-extensible.
+            encoder.encode_choice_index(1, 4, false)?;
+            encoder.write_bit(false); // extension marker
+            encoder.write_bit(false); // no iE-Extensions
             encoder.encode_octet_string(plmn_identity, Some(3), Some(3))?;
-            // NgENB-ID CHOICE: macroNgENB-ID (BIT STRING (20)) is index 0
-            encoder.encode_choice_index(0, 2, true)?;
+            // NgENB-ID CHOICE { macroNgENB-ID(20), shortMacroNgENB-ID(18),
+            // longMacroNgENB-ID(21), choice-Extensions }: 4 alts, NON-extensible
+            // -> 2-bit index. macroNgENB-ID = index 0.
+            encoder.encode_choice_index(0, 4, false)?;
+            // macroNgENB-ID BIT STRING(20): octet-align before content (>16).
+            encoder.align();
             encoder.write_bits(*ng_enb_id as u64, 20);
         }
     }
@@ -669,7 +677,7 @@ pub fn encode_global_ran_node_id(
 /// Decode Global RAN Node ID from IE field
 pub fn decode_global_ran_node_id(field: &ProtocolIeField) -> NgapResult<GlobalRanNodeId> {
     let mut decoder = AperDecoder::new(&field.value);
-    let choice = decoder.decode_choice_index(4, true)?;
+    let choice = decoder.decode_choice_index(4, false)?;
     match choice {
         0 => {
             // GlobalGNB-ID
@@ -678,9 +686,10 @@ pub fn decode_global_ran_node_id(field: &ProtocolIeField) -> NgapResult<GlobalRa
             let plmn_bytes = decoder.decode_octet_string(Some(3), Some(3))?;
             let mut plmn_identity = [0u8; 3];
             plmn_identity.copy_from_slice(&plmn_bytes);
-            // GNB-ID CHOICE
-            let _gnb_choice = decoder.decode_choice_index(1, true)?;
+            // GNB-ID CHOICE: 2 alternatives, non-extensible (1-bit index)
+            let _gnb_choice = decoder.decode_choice_index(2, false)?;
             let gnb_id_len = decoder.decode_constrained_length(22, 32)?;
+            decoder.align();
             let gnb_id = decoder.read_bits(gnb_id_len)? as u32;
             Ok(GlobalRanNodeId::GlobalGnbId {
                 plmn_identity,
@@ -695,7 +704,9 @@ pub fn decode_global_ran_node_id(field: &ProtocolIeField) -> NgapResult<GlobalRa
             let plmn_bytes = decoder.decode_octet_string(Some(3), Some(3))?;
             let mut plmn_identity = [0u8; 3];
             plmn_identity.copy_from_slice(&plmn_bytes);
-            let _enb_choice = decoder.decode_choice_index(2, true)?;
+            // NgENB-ID CHOICE: 4 alternatives, non-extensible (2-bit index)
+            let _enb_choice = decoder.decode_choice_index(4, false)?;
+            decoder.align();
             let ng_enb_id = decoder.read_bits(20)? as u32;
             Ok(GlobalRanNodeId::GlobalNgEnbId {
                 plmn_identity,
@@ -860,7 +871,9 @@ pub fn encode_user_location_info(
             encoder.write_bit(false); // extension
             encoder.write_bit(false); // no iE-Extensions
             encoder.encode_octet_string(nr_cgi_plmn, Some(3), Some(3))?;
-            // NRCellIdentity BIT STRING (SIZE (36))
+            // NRCellIdentity BIT STRING (SIZE (36)): octet-align before content
+            // (size 36 > 16, X.691 §16). No-op here as it follows a 3-octet PLMN.
+            encoder.align();
             encoder.write_bits(*nr_cell_identity, 36);
             // TAI SEQUENCE { pLMNIdentity, tAC, iE-Extensions OPTIONAL }
             encoder.write_bit(false); // extension
@@ -894,6 +907,7 @@ pub fn decode_user_location_info(field: &ProtocolIeField) -> NgapResult<UserLoca
             let plmn_bytes = decoder.decode_octet_string(Some(3), Some(3))?;
             let mut nr_cgi_plmn = [0u8; 3];
             nr_cgi_plmn.copy_from_slice(&plmn_bytes);
+            decoder.align();
             let nr_cell_identity = decoder.read_bits(36)?;
             // TAI
             let _tai_ext = decoder.read_bit()?;
@@ -2604,4 +2618,69 @@ pub fn decode_pdu_session_switched_list(
             },
         )
         .collect())
+}
+
+#[cfg(test)]
+mod global_ran_node_id_tests {
+    use super::*;
+
+    #[test]
+    fn test_global_gnb_id_non_extensible_and_octet_aligned() {
+        // gNB-ID 0x000ABC over 24 bits -> octet-aligned content [0x00,0x0A,0xBC].
+        let id = GlobalRanNodeId::GlobalGnbId {
+            plmn_identity: [0x00, 0xf1, 0x10],
+            gnb_id: 0x000ABC,
+            gnb_id_len: 24,
+        };
+        let mut container = ProtocolIeContainer::new();
+        encode_global_ran_node_id(&mut container, &id).unwrap();
+        let bytes = &container.ies[0].value;
+
+        // GlobalRANNodeID CHOICE: globalGNB-ID = index 0 over 4 non-extensible
+        // alternatives -> 2-bit "00" at the top of octet 0, no leading ext bit.
+        assert_eq!(bytes[0] >> 6, 0, "globalGNB-ID index must be 2-bit 00");
+        // BIT STRING content is octet-aligned (X.691 §16): the 24-bit gNB-ID
+        // occupies the final three octets verbatim.
+        assert_eq!(
+            &bytes[bytes.len() - 3..],
+            &[0x00, 0x0A, 0xBC],
+            "gNB-ID content must be octet-aligned"
+        );
+        match decode_global_ran_node_id(&container.ies[0]).unwrap() {
+            GlobalRanNodeId::GlobalGnbId {
+                plmn_identity,
+                gnb_id,
+                gnb_id_len,
+            } => {
+                assert_eq!(plmn_identity, [0x00, 0xf1, 0x10]);
+                assert_eq!(gnb_id, 0x000ABC);
+                assert_eq!(gnb_id_len, 24);
+            }
+            other => panic!("expected GlobalGnbId, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_global_ng_enb_id_choice_index_no_extension_bit() {
+        let id = GlobalRanNodeId::GlobalNgEnbId {
+            plmn_identity: [0x00, 0xf1, 0x10],
+            ng_enb_id: 0x0ABCD, // 20-bit macroNgENB-ID
+        };
+        let mut container = ProtocolIeContainer::new();
+        encode_global_ran_node_id(&mut container, &id).unwrap();
+        let bytes = &container.ies[0].value;
+        // globalNgENB-ID = index 1: top 2 bits "01" (== 1). With a spurious
+        // leading extension bit this would read 0, so this proves it is gone.
+        assert_eq!(bytes[0] >> 6, 1, "globalNgENB-ID index must be 2-bit 01");
+        match decode_global_ran_node_id(&container.ies[0]).unwrap() {
+            GlobalRanNodeId::GlobalNgEnbId {
+                plmn_identity,
+                ng_enb_id,
+            } => {
+                assert_eq!(plmn_identity, [0x00, 0xf1, 0x10]);
+                assert_eq!(ng_enb_id, 0x0ABCD);
+            }
+            other => panic!("expected GlobalNgEnbId, got {other:?}"),
+        }
+    }
 }
