@@ -195,6 +195,52 @@ fn gmm_registration_accept() {
     }));
 }
 
+/// nas-10: byte-vector test for the Equivalent PLMNs (0x4A) and Rejected NSSAI
+/// (0x11) optional IEs, asserting the exact TLV encoding and TS 24.501 §8.2.7
+/// IEI order (Equivalent PLMNs after 5G-GUTI, Rejected NSSAI after Allowed NSSAI).
+#[test]
+fn gmm_registration_accept_new_ie_bytes() {
+    let accept = RegistrationAccept {
+        registration_result: RegistrationResult {
+            sms_allowed: true,
+            value: RegistrationResultValue::ThreeGppAccess,
+        },
+        equivalent_plmns: Some(vec![test_plmn()]),
+        rejected_nssai: Some(vec![0x01, 0x01, 0x7B]),
+        ..Default::default()
+    };
+    let mut buf = BytesMut::new();
+    accept.encode(&mut buf);
+
+    let expected: &[u8] = &[
+        0x01, 0x09, // 5GS registration result (LV): len=1, SMS-allowed | 3GPP access
+        0x4A, 0x03, 0x00, 0xF1, 0x10, // Equivalent PLMNs: IEI + len + one PLMN (001/01)
+        0x11, 0x03, 0x01, 0x01, 0x7B, // Rejected NSSAI: IEI + len + opaque value
+    ];
+    assert_eq!(buf.to_vec(), expected);
+}
+
+/// nas-10: full round-trip with Equivalent PLMNs (two entries) and Rejected
+/// NSSAI populated alongside the previously-supported IEs.
+#[test]
+fn gmm_registration_accept_full_ie_roundtrip() {
+    roundtrip_5gmm(FiveGmmMessage::RegistrationAccept(RegistrationAccept {
+        registration_result: RegistrationResult {
+            sms_allowed: true,
+            value: RegistrationResultValue::ThreeGppAccess,
+        },
+        presencemask: 0,
+        guti: Some(MobileIdentity::FiveGGuti(test_5g_guti())),
+        equivalent_plmns: Some(vec![test_plmn(), PlmnId::new([3, 1, 0], [2, 6, 0], 3)]),
+        tai_list: Some(test_tai_list()),
+        allowed_nssai: Some(test_nssai()),
+        rejected_nssai: Some(vec![0x01, 0x01, 0x7B]),
+        pdu_session_status: Some(test_pdu_session_status()),
+        t3512_value: Some(GprsTimer3::new(GprsTimer3::UNIT_1_HOUR, 1)),
+        t3502_value: Some(GprsTimer2::new(12)),
+    }));
+}
+
 #[test]
 fn gmm_registration_reject() {
     roundtrip_5gmm(FiveGmmMessage::RegistrationReject(RegistrationReject {

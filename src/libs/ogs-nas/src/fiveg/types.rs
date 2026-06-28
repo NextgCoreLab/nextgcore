@@ -289,13 +289,30 @@ pub struct Suci {
     pub protection_scheme_id: u8,
     /// Home network public key identifier
     pub home_network_pki: u8,
-    /// Scheme output (MSIN or concealed SUPI)
+    /// Scheme output. For IMSI SUPI format (`supi_format == 0`) this is the
+    /// MSIN / concealed SUPI octets that follow the PKI octet. For the NAI SUPI
+    /// format (`supi_format == 1`, TS 24.501 §9.11.3.4 Figure 9.11.3.4.4) this
+    /// instead carries the variable-length "SUCI NAI" octets (octet 5..y); the
+    /// `plmn_id`, `routing_indicator`, `protection_scheme_id` and
+    /// `home_network_pki` fields are not used in that format.
     pub scheme_output: Vec<u8>,
 }
 
 impl Suci {
     /// Encode SUCI to bytes
     pub fn encode(&self, buf: &mut BytesMut) {
+        if self.supi_format == 1 {
+            // NAI SUPI format (TS 24.501 §9.11.3.4, Figure 9.11.3.4.4): octet 4
+            // is SUPI-format|type-of-identity, octets 5..y are the SUCI NAI
+            // string carried in `scheme_output`. No PLMN/RI/scheme/PKI fields.
+            let content_len = 1 + self.scheme_output.len();
+            buf.put_u16(content_len as u16);
+            buf.put_u8((self.supi_format << 4) | MobileIdentityType::Suci as u8);
+            buf.put_slice(&self.scheme_output);
+            return;
+        }
+        // IMSI SUPI format (supi_format == 0; any other value is treated as
+        // IMSI per TS 24.501 §9.11.3.4) — unchanged on-wire layout.
         let content_len = 1 + 3 + 2 + 1 + 1 + self.scheme_output.len();
         buf.put_u16(content_len as u16);
         buf.put_u8((self.supi_format << 4) | MobileIdentityType::Suci as u8);
@@ -308,6 +325,37 @@ impl Suci {
 
     /// Decode SUCI content from bytes
     pub fn decode_content(buf: &mut Bytes, length: usize) -> NasResult<Self> {
+        // Peek octet 4 (bits 5-7 = SUPI format) without consuming so the
+        // IMSI-format path below stays byte-identical to the original decoder.
+        let supi_format = if buf.remaining() >= 1 {
+            (buf.chunk()[0] >> 4) & 0x07
+        } else {
+            0
+        };
+        if supi_format == 1 {
+            // NAI SUPI format: type byte (octet 4) + variable SUCI NAI string.
+            if length < 1 {
+                return Err(NasError::BufferTooShort {
+                    expected: 1,
+                    actual: length,
+                });
+            }
+            let _first_byte = buf.get_u8();
+            let nai_len = length - 1;
+            if buf.remaining() < nai_len {
+                return Err(NasError::BufferTooShort {
+                    expected: nai_len,
+                    actual: buf.remaining(),
+                });
+            }
+            let scheme_output = buf.copy_to_bytes(nai_len).to_vec();
+            return Ok(Self {
+                supi_format,
+                scheme_output,
+                ..Default::default()
+            });
+        }
+
         if length < 8 {
             return Err(NasError::BufferTooShort {
                 expected: 8,
@@ -891,5 +939,91 @@ mod tai_list_tests {
     fn decode_empty_buffer_errs() {
         let mut buf = Bytes::new();
         assert!(TaiList::decode(&mut buf).is_err());
+    }
+}
+
+#[cfg(test)]
+mod suci_tests {
+    use super::*;
+    use crate::common::types::PlmnId;
+    use bytes::{Buf, BytesMut};
+
+    /// nas-07: byte-vector test for the NAI SUPI-format branch
+    /// (TS 24.501 §9.11.3.4 Figure 9.11.3.4.4). The on-wire content is just the
+    /// type octet (SUPI format 1 | SUCI type 1 = 0x11) followed by the NAI bytes.
+    #[test]
+    fn suci_nai_format_encodes_expected_bytes() {
+        let nai = b"type1.rid678.schid1.userinfo@example.com".to_vec();
+        let suci = Suci {
+            supi_format: 1,
+            scheme_output: nai.clone(),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        suci.encode(&mut buf);
+        let bytes = buf.to_vec();
+
+        // length(u16) = 1 (type octet) + NAI bytes
+        let content_len = (1 + nai.len()) as u16;
+        assert_eq!(&bytes[0..2], &content_len.to_be_bytes());
+        // octet 4: SUPI format (1) in bits 5-7 | type-of-identity SUCI (1)
+        assert_eq!(bytes[2], (1u8 << 4) | MobileIdentityType::Suci as u8);
+        assert_eq!(bytes[2], 0x11);
+        // octets 5..y: the SUCI NAI string verbatim
+        assert_eq!(&bytes[3..], &nai[..]);
+    }
+
+    /// nas-07: NAI-format round-trip via encode -> decode_content.
+    #[test]
+    fn suci_nai_format_roundtrips() {
+        let suci = Suci {
+            supi_format: 1,
+            scheme_output: b"alice@home.realm".to_vec(),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        suci.encode(&mut buf);
+
+        let mut b = buf.freeze();
+        let length = b.get_u16() as usize;
+        let decoded = Suci::decode_content(&mut b, length).expect("NAI SUCI must decode");
+        assert_eq!(decoded.supi_format, 1);
+        assert_eq!(decoded.scheme_output, b"alice@home.realm".to_vec());
+        assert_eq!(decoded, suci);
+    }
+
+    /// nas-07 guard: the IMSI SUPI-format (supi_format == 0) on-wire layout MUST
+    /// remain byte-identical to the pre-nas-07 encoder. This asserts a fixed
+    /// byte vector so any future change to the IMSI path is caught.
+    #[test]
+    fn suci_imsi_format_bytes_unchanged() {
+        let suci = Suci {
+            supi_format: 0,
+            plmn_id: PlmnId::new([0, 0, 1], [0, 1, 0], 2),
+            routing_indicator: [0x00, 0xF0],
+            protection_scheme_id: 0,
+            home_network_pki: 0,
+            scheme_output: vec![0xAB, 0xCD],
+        };
+        let mut buf = BytesMut::new();
+        suci.encode(&mut buf);
+
+        // content_len = 1(type) + 3(PLMN) + 2(RI) + 1(scheme) + 1(PKI) + 2(out) = 10
+        let expected: &[u8] = &[
+            0x00, 0x0A, // length = 10
+            0x01, // SUPI format 0 | SUCI type 1
+            0x00, 0xF1, 0x10, // PLMN 001/01 (2-digit MNC)
+            0x00, 0xF0, // routing indicator
+            0x00, // protection scheme id
+            0x00, // home network PKI
+            0xAB, 0xCD, // scheme output
+        ];
+        assert_eq!(buf.to_vec(), expected);
+
+        // And it still round-trips.
+        let mut b = buf.freeze();
+        let length = b.get_u16() as usize;
+        let decoded = Suci::decode_content(&mut b, length).expect("IMSI SUCI must decode");
+        assert_eq!(decoded, suci);
     }
 }

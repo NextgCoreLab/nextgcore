@@ -231,6 +231,12 @@ impl RegistrationRequest {
 }
 
 /// Registration Accept message (TS 24.501 Section 8.2.7)
+///
+/// Supported optional IEs (encoded/decoded in TS 24.501 §8.2.7 IEI order):
+/// 5G-GUTI (0x77), Equivalent PLMNs (0x4A), TAI list (0x54), Allowed NSSAI
+/// (0x15), Rejected NSSAI (0x11), PDU session status (0x50), T3512 value
+/// (0x5E) and T3502 value (0x16). Other optional IEs from the spec table are
+/// not modelled and are ignored on decode (see `skip_unknown_ie`).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RegistrationAccept {
     /// 5GS registration result
@@ -264,6 +270,15 @@ impl RegistrationAccept {
             buf.put_u8(0x77); // IEI
             guti.encode(buf);
         }
+        if let Some(ref eplmns) = self.equivalent_plmns {
+            // Equivalent PLMNs (TS 24.501 §8.2.7 / §9.11.3.45 "PLMN list"):
+            // TLV, IEI 0x4A, length = 3 octets per PLMN.
+            buf.put_u8(0x4A); // IEI
+            buf.put_u8((eplmns.len() * PlmnId::encoded_len()) as u8);
+            for plmn in eplmns {
+                plmn.encode(buf);
+            }
+        }
         if let Some(ref tai_list) = self.tai_list {
             buf.put_u8(0x54); // IEI
             tai_list.encode(buf);
@@ -271,6 +286,12 @@ impl RegistrationAccept {
         if let Some(ref allowed_nssai) = self.allowed_nssai {
             buf.put_u8(0x15); // IEI
             allowed_nssai.encode(buf);
+        }
+        if let Some(ref rejected_nssai) = self.rejected_nssai {
+            // Rejected NSSAI (TS 24.501 §8.2.7 / §9.11.3.46): TLV, IEI 0x11.
+            buf.put_u8(0x11); // IEI
+            buf.put_u8(rejected_nssai.len() as u8);
+            buf.put_slice(rejected_nssai);
         }
         if let Some(ref pss) = self.pdu_session_status {
             buf.put_u8(0x50); // IEI
@@ -302,6 +323,34 @@ impl RegistrationAccept {
                     buf.advance(1);
                     msg.guti = Some(MobileIdentity::decode(buf)?);
                 }
+                0x4A => {
+                    // Equivalent PLMNs (TLV, 3 octets per PLMN).
+                    buf.advance(1);
+                    if buf.remaining() < 1 {
+                        return Err(NasError::BufferTooShort {
+                            expected: 1,
+                            actual: buf.remaining(),
+                        });
+                    }
+                    let len = buf.get_u8() as usize;
+                    if buf.remaining() < len {
+                        return Err(NasError::BufferTooShort {
+                            expected: len,
+                            actual: buf.remaining(),
+                        });
+                    }
+                    let count = len / PlmnId::encoded_len();
+                    let mut plmns = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        plmns.push(PlmnId::decode(buf)?);
+                    }
+                    // Discard any trailing octets (length not a multiple of 3).
+                    let rem = len % PlmnId::encoded_len();
+                    if rem > 0 {
+                        buf.advance(rem);
+                    }
+                    msg.equivalent_plmns = Some(plmns);
+                }
                 0x54 => {
                     buf.advance(1);
                     msg.tai_list = Some(TaiList::decode(buf)?);
@@ -309,6 +358,24 @@ impl RegistrationAccept {
                 0x15 => {
                     buf.advance(1);
                     msg.allowed_nssai = Some(Nssai::decode(buf)?);
+                }
+                0x11 => {
+                    // Rejected NSSAI (TLV) — stored as opaque octets.
+                    buf.advance(1);
+                    if buf.remaining() < 1 {
+                        return Err(NasError::BufferTooShort {
+                            expected: 1,
+                            actual: buf.remaining(),
+                        });
+                    }
+                    let len = buf.get_u8() as usize;
+                    if buf.remaining() < len {
+                        return Err(NasError::BufferTooShort {
+                            expected: len,
+                            actual: buf.remaining(),
+                        });
+                    }
+                    msg.rejected_nssai = Some(buf.copy_to_bytes(len).to_vec());
                 }
                 0x50 => {
                     buf.advance(1);
