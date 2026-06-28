@@ -710,11 +710,15 @@ impl PfcpMessageBuilder {
         let mut value = BytesMut::new();
         let mut flags: u8 = 0;
 
-        if ipv6.is_some() {
-            flags |= 0x01; // V6 flag
-        }
+        // TS 29.244 §8.2.3 Fig 8.2.3-1, octet 5: Bit1=V4 (0x01), Bit2=V6 (0x02),
+        // Bit3=CH (0x04), Bit4=CHID (0x08). NOTE: this bit order is SPECIFIC to
+        // F-TEID. It is the OPPOSITE of F-SEID (§8.2.37) and UE IP Address
+        // (§8.2.62), which both use Bit1=V6/Bit2=V4 — do not "harmonize" them.
         if ipv4.is_some() {
-            flags |= 0x02; // V4 flag
+            flags |= 0x01; // V4 flag (Bit1)
+        }
+        if ipv6.is_some() {
+            flags |= 0x02; // V6 flag (Bit2)
         }
         if choose_id.is_some() {
             flags |= 0x04; // CH flag (CHOOSE)
@@ -1768,7 +1772,34 @@ mod tests {
 
         // Type (2) + Length (2) + Flags (1) + SEID (8) + IPv4 (4) = 17
         assert_eq!(data.len(), 17);
-        assert_eq!(data[4], 0x02); // V4 flag
+        // F-SEID (§8.2.37) legitimately uses Bit1=V6/Bit2=V4, so an IPv4-only
+        // F-SEID has octet-5 == 0x02. This is the OPPOSITE of F-TEID (§8.2.3,
+        // see test_add_f_teid_octet5_flags_spec_conformant) — do NOT "fix" it.
+        assert_eq!(data[4], 0x02); // V4 flag (F-SEID Bit2)
+    }
+
+    /// TS 29.244 §8.2.3 Fig 8.2.3-1 octet-5 flag conformance for F-TEID:
+    /// Bit1 (0x01) = V4, Bit2 (0x02) = V6, Bit3 (0x04) = CH. Pins the wire
+    /// byte so the smfd↔upfd N4 path stays spec-correct AND mutually
+    /// consistent (matches nextgcore-upfd add_f_teid). Earlier code SWAPPED
+    /// these (V4=0x02/V6=0x01); this guards the regression.
+    #[test]
+    fn test_add_f_teid_octet5_flags_spec_conformant() {
+        // octet-5 lands at data[4]: TLV type(2) + length(2) precede the value.
+        // V4-only -> octet-5 == 0x01
+        let mut b = PfcpMessageBuilder::new();
+        b.add_f_teid(0x0001_0001, Some([192, 168, 1, 1]), None, None);
+        assert_eq!(b.build()[4], 0x01, "V4-only F-TEID octet-5 must be 0x01");
+
+        // V6-only -> octet-5 == 0x02
+        let mut b = PfcpMessageBuilder::new();
+        b.add_f_teid(0x0002_0002, None, Some([0u8; 16]), None);
+        assert_eq!(b.build()[4], 0x02, "V6-only F-TEID octet-5 must be 0x02");
+
+        // V4+V6 (dual-stack) -> octet-5 == 0x03
+        let mut b = PfcpMessageBuilder::new();
+        b.add_f_teid(0x0003_0003, Some([10, 0, 0, 1]), Some([0u8; 16]), None);
+        assert_eq!(b.build()[4], 0x03, "dual-stack F-TEID octet-5 must be 0x03");
     }
 
     #[test]

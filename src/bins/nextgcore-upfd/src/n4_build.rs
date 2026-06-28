@@ -459,10 +459,14 @@ impl PfcpMessageBuilder {
     pub fn add_f_teid(&mut self, f_teid: &FTeid) -> &mut Self {
         let mut value = BytesMut::new();
         let mut flags: u8 = 0;
-        if f_teid.ipv6.is_some() {
+        // TS 29.244 §8.2.3 Fig 8.2.3-1, octet 5: Bit1=V4 (0x01), Bit2=V6 (0x02),
+        // Bit3=CH (0x04), Bit4=CHID (0x08). NOTE: this bit order is SPECIFIC to
+        // F-TEID. It is the OPPOSITE of F-SEID (§8.2.37) and UE IP Address
+        // (§8.2.62), which both use Bit1=V6/Bit2=V4 — do not "harmonize" them.
+        if f_teid.ipv4.is_some() {
             flags |= 0x01;
         }
-        if f_teid.ipv4.is_some() {
+        if f_teid.ipv6.is_some() {
             flags |= 0x02;
         }
         if f_teid.choose {
@@ -986,8 +990,11 @@ impl ParsedFTeid {
             return Err("F-TEID IE empty");
         }
         let flags = data[0];
-        let v6 = (flags & 0x01) != 0;
-        let v4 = (flags & 0x02) != 0;
+        // TS 29.244 §8.2.3 Fig 8.2.3-1, octet 5: Bit1=V4 (0x01), Bit2=V6 (0x02),
+        // Bit3=CH (0x04), Bit4=CHID (0x08). This F-TEID bit order is the OPPOSITE
+        // of F-SEID (§8.2.37) and UE IP Address (§8.2.62) which use Bit1=V6.
+        let v4 = (flags & 0x01) != 0;
+        let v6 = (flags & 0x02) != 0;
         let ch = (flags & 0x04) != 0;
         let chid = (flags & 0x08) != 0;
 
@@ -2014,6 +2021,68 @@ mod tests {
         assert_eq!(msg.len(), 13);
     }
 
+    /// TS 29.244 §8.2.3 Fig 8.2.3-1 octet-5 flag conformance: Bit1 (0x01) = V4,
+    /// Bit2 (0x02) = V6, Bit3 (0x04) = CH, Bit4 (0x08) = CHID. Pins the wire
+    /// bytes so the V4/V6 transposition (upfd-01) cannot regress. The F-TEID
+    /// flags byte sits at index 4 of the built message (2-byte type + 2-byte
+    /// length TLV header precede it).
+    #[test]
+    fn test_f_teid_octet5_flags_spec_conformant() {
+        // V4-only -> octet-5 == 0x01
+        let mut b = PfcpMessageBuilder::new();
+        b.add_f_teid(&FTeid {
+            teid: 0x11223344,
+            ipv4: Some(Ipv4Addr::new(10, 45, 0, 7)),
+            ipv6: None,
+            choose: false,
+            choose_id: None,
+        });
+        assert_eq!(b.build()[4], 0x01, "V4-only F-TEID octet-5 must be 0x01");
+
+        // V6-only -> octet-5 == 0x02
+        let mut b = PfcpMessageBuilder::new();
+        b.add_f_teid(&FTeid {
+            teid: 0x11223344,
+            ipv4: None,
+            ipv6: Some(Ipv6Addr::from([0xAB; 16])),
+            choose: false,
+            choose_id: None,
+        });
+        assert_eq!(b.build()[4], 0x02, "V6-only F-TEID octet-5 must be 0x02");
+
+        // V4+V6 (dual-stack) -> octet-5 == 0x03
+        let mut b = PfcpMessageBuilder::new();
+        b.add_f_teid(&FTeid {
+            teid: 0x11223344,
+            ipv4: Some(Ipv4Addr::new(10, 45, 0, 7)),
+            ipv6: Some(Ipv6Addr::from([0xAB; 16])),
+            choose: false,
+            choose_id: None,
+        });
+        assert_eq!(b.build()[4], 0x03, "dual-stack F-TEID octet-5 must be 0x03");
+    }
+
+    /// Decode side of upfd-01: a hand-built spec-conformant F-TEID with octet-5
+    /// V4=0x01 parses as IPv4 (not IPv6), and the V6=0x02 + 16-byte address case
+    /// parses as IPv6 (not IPv4). TS 29.244 §8.2.3.
+    #[test]
+    fn test_parse_f_teid_v4_v6_bits_spec_conformant() {
+        // octet5 = 0x01 (V4), 4-byte TEID, 4-byte IPv4 address.
+        let v4 = [0x01u8, 0x00, 0x01, 0x00, 0x01, 192, 168, 1, 1];
+        let parsed = ParsedFTeid::parse(&v4).expect("V4 F-TEID must parse");
+        assert_eq!(parsed.ipv4, Some(Ipv4Addr::new(192, 168, 1, 1)));
+        assert!(parsed.ipv6.is_none(), "V4=Bit1 must NOT decode as IPv6");
+        assert_eq!(parsed.teid, 0x0001_0001);
+
+        // Negative guard: octet5 = 0x02 (V6) + 4-byte TEID + 16-byte IPv6 must
+        // decode as IPv6, never IPv4.
+        let mut v6 = vec![0x02u8, 0x00, 0x00, 0x00, 0x02];
+        v6.extend_from_slice(&[0xFE; 16]);
+        let parsed = ParsedFTeid::parse(&v6).expect("V6 F-TEID must parse");
+        assert!(parsed.ipv4.is_none(), "V6=Bit2 must NOT decode as IPv4");
+        assert_eq!(parsed.ipv6, Some(Ipv6Addr::from([0xFE; 16])));
+    }
+
     #[test]
     fn test_ue_ip_address_encoding() {
         let mut builder = PfcpMessageBuilder::new();
@@ -2198,8 +2267,9 @@ mod tests {
         let created_pdr_ie_value = builder.build();
 
         // 3. Decode exactly as the SMF does: find inner F-TEID (type 21),
-        //    require non-zero TEID and an IPv4 (V4 flag 0x02). The outer bytes
-        //    here are the Created PDR IE itself (type 8).
+        //    require non-zero TEID and an IPv4 (V4 flag 0x01 per TS 29.244
+        //    §8.2.3 octet 5 Bit1). The outer bytes here are the Created PDR IE
+        //    itself (type 8).
         let ies = ParsedIe::parse_all(&created_pdr_ie_value);
         let created_ie =
             ParsedIe::find_ie(&ies, pfcp_ie::CREATED_PDR).expect("Created PDR IE must be present");
@@ -2213,7 +2283,9 @@ mod tests {
         assert_ne!(teid, 0, "SMF requires a non-zero allocated F-TEID");
         assert_eq!(teid, allocated_teid);
         assert_eq!(flags & 0x04, 0, "response F-TEID must have CH cleared");
-        assert_ne!(flags & 0x02, 0, "response F-TEID must carry IPv4");
+        // Re-baselined to the spec-correct V4 bit: TS 29.244 §8.2.3 octet 5
+        // Bit1 (0x01) = V4 (was previously asserting the swapped 0x02 bug).
+        assert_ne!(flags & 0x01, 0, "response F-TEID must carry IPv4 (V4=Bit1)");
         assert_eq!(&fteid_val[5..9], &upf_n3.octets());
     }
 }

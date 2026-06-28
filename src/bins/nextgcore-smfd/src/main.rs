@@ -1233,7 +1233,12 @@ async fn pfcp_session_establish(
                         if fteid_val.len() >= 5 {
                             let fteid_flags = fteid_val[0];
                             let teid = u32::from_be_bytes(fteid_val[1..5].try_into().unwrap());
-                            if fteid_flags & 0x02 != 0 && fteid_val.len() >= 9 {
+                            // TS 29.244 §8.2.3 Fig 8.2.3-1, octet 5: Bit1 (0x01) = V4,
+                            // Bit2 (0x02) = V6. The IPv4 address (when present) is the
+                            // first address field, immediately after the 4-byte TEID.
+                            // NOTE: F-TEID's V4=Bit1 is the OPPOSITE of F-SEID (§8.2.37),
+                            // which uses Bit2 for V4 — see the F-SEID parse above.
+                            if fteid_flags & 0x01 != 0 && fteid_val.len() >= 9 {
                                 upf_ip = [fteid_val[5], fteid_val[6], fteid_val[7], fteid_val[8]];
                             }
                             if teid != 0 {
