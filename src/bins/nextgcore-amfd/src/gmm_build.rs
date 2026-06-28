@@ -7,8 +7,9 @@ use bytes::{BufMut, BytesMut};
 // nas-06: the conformant 5GMM encoder library. amfd is migrating its hand-rolled
 // builders onto ogs-nas message-by-message (Phase 1 = the cause-only builders).
 use ogs_nas::common::types as ogs_types;
-use ogs_nas::fiveg::ie::FiveGsIdentityType;
+use ogs_nas::fiveg::ie::{FiveGsIdentityType, Nssai, PduSessionStatus};
 use ogs_nas::fiveg::message as ogs_msg;
+use ogs_nas::fiveg::types as ogs_ftypes;
 
 // ============================================================================
 // Constants
@@ -335,43 +336,100 @@ impl Default for NasMessageBuilder {
 /// Includes: 5GS registration result (mandatory), 5G-GUTI (0x77),
 /// TAI list (0x54), Allowed NSSAI (0x15) and T3512 (0x5E).
 pub fn build_registration_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
-    let mut builder = NasMessageBuilder::new();
+    // nas-06 Phase 2 (Tier C, REGISTRATION-CRITICAL): encoded via ogs-nas. Byte-
+    // identical to the prior hand-rolled output — 5GS registration result LV
+    // [01, access&7]; 5G-GUTI (0x77 TLV-E) when a next-GUTI is assigned; single-TAI
+    // partial list type-00 (0x54 TLV); Allowed NSSAI (0x15 TLV, omitted when empty);
+    // T3512 = 9 minutes (GPRS timer 3, 0x49). Locked by
+    // `drift_registration_accept_minimal_through_ogs_nas` (reg-result+TAI+T3512) and
+    // `golden_registration_accept_full` (GUTI + multi-S-NSSAI branches, derived from
+    // the still-present encode_guti/encode_tai_list/encode_nssai_value helpers).
+    debug_assert!(
+        matches!(amf_ue.access_type & 0x07, 1..=3),
+        "5GS registration result access type must be 1/2/3"
+    );
+    let registration_result = ogs_ftypes::RegistrationResult {
+        sms_allowed: false,
+        value: match amf_ue.access_type & 0x07 {
+            2 => ogs_ftypes::RegistrationResultValue::Non3gppAccess,
+            3 => ogs_ftypes::RegistrationResultValue::ThreeGppAndNon3gppAccess,
+            _ => ogs_ftypes::RegistrationResultValue::ThreeGppAccess,
+        },
+    };
 
-    // GMM header (plain inner message)
-    builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
-    builder.write_u8(security_header::PLAIN_NAS_MESSAGE);
-    builder.write_message_type(message_type::REGISTRATION_ACCEPT);
+    // 5G-GUTI (optional, IEI 0x77 TLV-E) — only when a next-GUTI has been assigned.
+    let guti = if amf_ue.next_guti.tmsi != 0 {
+        let g = &amf_ue.next_guti;
+        Some(ogs_ftypes::MobileIdentity::FiveGGuti(ogs_ftypes::FiveGGuti {
+            plmn_id: to_ogs_plmn(&g.plmn_id),
+            amf_region_id: g.amf_region_id,
+            amf_set_id: g.amf_set_id,
+            amf_pointer: g.amf_pointer,
+            tmsi: g.tmsi,
+        }))
+    } else {
+        None
+    };
 
-    // 5GS registration result (mandatory, LV): bits 1-3 = access type
-    builder.write_u8(1); // length
-    builder.write_u8(amf_ue.access_type & 0x07);
+    // TAI list (single TAI, list type 00 = one PLMN). The ogs-nas encoder backfills
+    // the length octet; one TAC -> num-elements field 0, matching encode_tai_list.
+    let tai = &amf_ue.nr_tai;
+    let tai_list = Some(ogs_ftypes::TaiList {
+        length: 0,
+        elements: vec![ogs_ftypes::TaiListElement::PartialTaiList0 {
+            plmn_id: to_ogs_plmn(&tai.plmn_id),
+            tacs: vec![[(tai.tac >> 16) as u8, (tai.tac >> 8) as u8, tai.tac as u8]],
+        }],
+    });
 
-    // 5G-GUTI (optional, IEI = 0x77, TLV-E)
-    if amf_ue.next_guti.tmsi != 0 {
-        let guti_data = encode_guti(&amf_ue.next_guti);
-        builder.write_tlv_e(0x77, &guti_data);
-    }
-
-    // TAI list (IEI = 0x54, TLV) — registration area assigned to the UE
-    let tai_list = encode_tai_list(&amf_ue.nr_tai);
-    builder.write_tlv(0x54, &tai_list);
-
-    // Allowed NSSAI (IEI = 0x15, TLV)
+    // Allowed NSSAI (allowed if present, else requested); omitted when empty.
     let nssai_source: &[crate::context::SNssai] = if !amf_ue.allowed_nssai.is_empty() {
         &amf_ue.allowed_nssai
     } else {
         &amf_ue.requested_nssai
     };
-    let nssai = encode_nssai_value(nssai_source);
-    if !nssai.is_empty() {
-        builder.write_tlv(0x15, &nssai);
-    }
+    let allowed_nssai = if nssai_source.is_empty() {
+        None
+    } else {
+        Some(Nssai {
+            length: 0,
+            s_nssai_list: nssai_source
+                .iter()
+                .map(|s| match s.sd {
+                    Some(sd) => ogs_types::SNssai::with_sd(
+                        s.sst,
+                        [(sd >> 16) as u8, (sd >> 8) as u8, sd as u8],
+                    ),
+                    None => ogs_types::SNssai::new(s.sst),
+                })
+                .collect(),
+        })
+    };
 
-    // T3512 value (IEI = 0x5E, GPRS timer 3 TLV): 9 minutes
-    // unit = multiples of 1 minute (010), value = 9 → 0b010_01001
-    builder.write_tlv(0x5E, &[0x49]);
+    // T3512 value (IEI 0x5E): 9 minutes — unit 010 (multiples of 1 minute), value 9.
+    let t3512_value = Some(ogs_types::GprsTimer3::new(2, 9));
 
-    Some(builder.build())
+    let msg = ogs_msg::FiveGmmMessage::RegistrationAccept(ogs_msg::RegistrationAccept {
+        registration_result,
+        presencemask: 0,
+        guti,
+        equivalent_plmns: None,
+        tai_list,
+        allowed_nssai,
+        rejected_nssai: None,
+        pdu_session_status: None,
+        t3512_value,
+        t3502_value: None,
+    });
+    Some(ogs_msg::build_5gmm_message(&msg).to_vec())
+}
+
+/// Convert amfd's nibble-encoded PLMN into the ogs-nas digit-array `PlmnId` so the
+/// two encoders emit identical bytes. amfd marks a 2-digit MNC with `mnc3 == 0xf`;
+/// ogs-nas derives the 0xF filler from `mnc_len == 2`, so the two agree byte-for-byte.
+fn to_ogs_plmn(p: &crate::context::PlmnId) -> ogs_types::PlmnId {
+    let mnc_len = if p.mnc3 == 0x0f { 2 } else { 3 };
+    ogs_types::PlmnId::new([p.mcc1, p.mcc2, p.mcc3], [p.mnc1, p.mnc2, p.mnc3], mnc_len)
 }
 
 /// Encode a single-TAI "TAI list" per TS 24.501 Section 9.11.3.9
@@ -441,47 +499,49 @@ pub fn build_security_mode_reject(gmm_cause: GmmCause) -> Vec<u8> {
     ogs_msg::build_5gmm_message(&msg).to_vec()
 }
 
-/// Build Service Accept message (plain inner; wrap with nas_5gs_security_encode)
+/// Build Service Accept message (plain inner; wrap with nas_5gs_security_encode).
+///
+/// nas-06 Phase 2 (Tier C): encoded via ogs-nas. Byte-identical to the prior hand-
+/// rolled output — bare header, plus the optional PDU session status (0x50, LV: len
+/// 2 + the rotate_right(8)-swapped PSI bitmap). Locked by `golden_service_accept`.
 pub fn build_service_accept(amf_ue: &AmfUe) -> Option<Vec<u8>> {
-    let mut builder = NasMessageBuilder::new();
-
-    // GMM header (plain inner message)
-    builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
-    builder.write_u8(security_header::PLAIN_NAS_MESSAGE);
-    builder.write_message_type(message_type::SERVICE_ACCEPT);
-
-    // PDU session status (optional, IEI = 0x50)
-    if amf_ue.pdu_session_status_present {
-        let psi = get_pdu_session_status(amf_ue);
-        builder.write_u8(0x50); // IEI
-        builder.write_u8(2); // length
-        builder.write_u16(psi);
-    }
-
-    Some(builder.build())
+    let msg = ogs_msg::FiveGmmMessage::ServiceAccept(ogs_msg::ServiceAccept {
+        pdu_session_status: pdu_session_status_ie(amf_ue),
+        pdu_session_reactivation_result: None,
+        eap_message: None,
+        t3448_value: None,
+    });
+    Some(ogs_msg::build_5gmm_message(&msg).to_vec())
 }
 
-/// Build Service Reject message
+/// Build Service Reject message (TS 24.501 Section 8.2.18).
+///
+/// nas-06 Phase 2 (Tier C): encoded via ogs-nas. Byte-identical to the prior hand-
+/// rolled output — mandatory 5GMM cause, then the optional PDU session status
+/// (0x50). Locked by `golden_service_reject`.
 pub fn build_service_reject(amf_ue: &AmfUe, gmm_cause: GmmCause) -> Vec<u8> {
-    let mut builder = NasMessageBuilder::new();
+    let msg = ogs_msg::FiveGmmMessage::ServiceReject(ogs_msg::ServiceReject {
+        gmm_cause: gmm_cause as u8,
+        pdu_session_status: pdu_session_status_ie(amf_ue),
+        t3346_value: None,
+        eap_message: None,
+    });
+    ogs_msg::build_5gmm_message(&msg).to_vec()
+}
 
-    // GMM header (plain NAS message)
-    builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
-    builder.write_u8(0); // Security header type (plain)
-    builder.write_message_type(message_type::SERVICE_REJECT);
-
-    // 5GMM cause (mandatory)
-    builder.write_u8(gmm_cause as u8);
-
-    // PDU session status (optional, IEI = 0x50)
+/// The optional PDU-session-status IE (0x50) shared by Service Accept/Reject:
+/// present only when the UE has session status to report, carrying the
+/// rotate_right(8)-swapped PSI bitmap verbatim (the ogs-nas encoder writes the
+/// fixed length octet 2 and the u16 with no further byte-swap).
+fn pdu_session_status_ie(amf_ue: &AmfUe) -> Option<PduSessionStatus> {
     if amf_ue.pdu_session_status_present {
-        let psi = get_pdu_session_status(amf_ue);
-        builder.write_u8(0x50); // IEI
-        builder.write_u8(2); // length
-        builder.write_u16(psi);
+        Some(PduSessionStatus {
+            length: 2,
+            psi: get_pdu_session_status(amf_ue),
+        })
+    } else {
+        None
     }
-
-    builder.build()
 }
 
 /// Build Deregistration Accept message (UE-initiated; plain inner)
@@ -1114,6 +1174,143 @@ mod tests {
             Some(vec![
                 0x7e, 0x00, 0x5d, 0x12, 0x01, 0x04, 0xf0, 0xf0, 0x0c, 0x0c, 0xe1, 0x36, 0x01, 0x01
             ])
+        );
+    }
+
+    #[test]
+    fn golden_registration_accept_full() {
+        // Exercises the GUTI (0x77 TLV-E) and Allowed-NSSAI (0x15, SD + SST-only)
+        // branches that the minimal drift test does NOT cover. The expected wire
+        // image is reconstructed from the OLD, still-present byte helpers
+        // (encode_guti/encode_tai_list/encode_nssai_value) + the documented IE
+        // framing, so this asserts new(ogs-nas) == old(hand-rolled) directly.
+        let mut ue = create_test_amf_ue();
+        ue.access_type = 1; // 3GPP access
+        ue.nr_tai = crate::context::Tai5gs {
+            plmn_id: crate::context::PlmnId::new("001", "01"),
+            tac: 0x010203,
+        };
+        // next_guti already has tmsi 0x12345678 (!= 0) -> GUTI emitted.
+        ue.allowed_nssai = vec![
+            crate::context::SNssai {
+                sst: 1,
+                sd: Some(0x010203),
+            },
+            crate::context::SNssai { sst: 2, sd: None },
+        ];
+
+        let mut expected = vec![0x7e, 0x00, 0x42, 0x01, ue.access_type & 0x07];
+        let g = encode_guti(&ue.next_guti); // 0x77 is TLV-E (2-octet length)
+        expected.extend_from_slice(&[0x77, (g.len() >> 8) as u8, g.len() as u8]);
+        expected.extend_from_slice(&g);
+        let t = encode_tai_list(&ue.nr_tai); // 0x54 TLV (1-octet length)
+        expected.extend_from_slice(&[0x54, t.len() as u8]);
+        expected.extend_from_slice(&t);
+        let n = encode_nssai_value(&ue.allowed_nssai); // 0x15 TLV
+        expected.extend_from_slice(&[0x15, n.len() as u8]);
+        expected.extend_from_slice(&n);
+        expected.extend_from_slice(&[0x5e, 0x01, 0x49]); // T3512
+
+        assert_eq!(build_registration_accept(&ue), Some(expected));
+    }
+
+    #[test]
+    fn golden_registration_accept_no_guti_no_nssai() {
+        // Omission path: tmsi == 0 -> no 0x77; empty NSSAI -> no 0x15.
+        let mut ue = create_test_amf_ue();
+        ue.next_guti.tmsi = 0;
+        ue.allowed_nssai.clear();
+        ue.requested_nssai.clear();
+        ue.nr_tai = crate::context::Tai5gs {
+            plmn_id: crate::context::PlmnId::new("001", "01"),
+            tac: 0x000001,
+        };
+
+        let mut expected = vec![0x7e, 0x00, 0x42, 0x01, ue.access_type & 0x07];
+        let t = encode_tai_list(&ue.nr_tai);
+        expected.extend_from_slice(&[0x54, t.len() as u8]);
+        expected.extend_from_slice(&t);
+        expected.extend_from_slice(&[0x5e, 0x01, 0x49]);
+
+        let out = build_registration_accept(&ue).unwrap();
+        assert_eq!(out, expected);
+        assert!(!out.contains(&0x77) || out[5] != 0x77, "GUTI must be omitted");
+    }
+
+    #[test]
+    fn golden_registration_accept_3digit_mnc() {
+        // 3-digit MNC (310/260): to_ogs_plmn must use mnc_len=3 and the real 3rd
+        // digit, NOT the 0xf filler used for 2-digit MNCs. Exercises the GUTI and
+        // TAI PLMN bytes on the 3-digit path (analytically proven, now golden-locked
+        // via the self-verifying reconstruction from the old nibble helpers).
+        let mut ue = create_test_amf_ue();
+        ue.access_type = 1;
+        ue.nr_tai = crate::context::Tai5gs {
+            plmn_id: crate::context::PlmnId::new("310", "260"),
+            tac: 0x00abcd,
+        };
+        ue.next_guti.plmn_id = crate::context::PlmnId::new("310", "260");
+        ue.allowed_nssai.clear();
+        ue.requested_nssai.clear();
+
+        let mut expected = vec![0x7e, 0x00, 0x42, 0x01, ue.access_type & 0x07];
+        let g = encode_guti(&ue.next_guti);
+        expected.extend_from_slice(&[0x77, (g.len() >> 8) as u8, g.len() as u8]);
+        expected.extend_from_slice(&g);
+        let t = encode_tai_list(&ue.nr_tai);
+        expected.extend_from_slice(&[0x54, t.len() as u8]);
+        expected.extend_from_slice(&t);
+        expected.extend_from_slice(&[0x5e, 0x01, 0x49]);
+
+        let out = build_registration_accept(&ue).unwrap();
+        assert_eq!(out, expected);
+        // Explicitly lock the 3-digit MNC nibble: PLMN byte 1 = (mnc3<<4)|mcc3 with
+        // mnc3 = 0 (real digit), mcc3 = 0 -> 0x00, NOT 0xf0. PLMN bytes are 13 00 62
+        // (MCC 310, MNC 260) and appear in the TAI element.
+        assert!(
+            out.windows(3).any(|w| w == [0x13, 0x00, 0x62]),
+            "3-digit MNC PLMN must encode 13 00 62 (mnc3 nibble is the real 0, not 0xf)"
+        );
+    }
+
+    #[test]
+    fn golden_service_accept() {
+        let mut ue = create_test_amf_ue();
+        // PSS absent -> bare header.
+        ue.pdu_session_status_present = false;
+        assert_eq!(build_service_accept(&ue), Some(vec![0x7e, 0x00, 0x4e]));
+        // PSS present, one session PSI=1 -> bitmap 0x0002, byte-swapped (rotate_right
+        // 8) to 0x0200. Hard-coded asymmetric expected independently locks the
+        // 0x50 / length-2 / big-endian framing (a swap regression would not pass).
+        ue.pdu_session_status_present = true;
+        ue.sessions = vec![crate::context::AmfSessRef {
+            psi: 1,
+            sm_context_in_smf: false,
+        }];
+        assert_eq!(
+            build_service_accept(&ue),
+            Some(vec![0x7e, 0x00, 0x4e, 0x50, 0x02, 0x02, 0x00])
+        );
+    }
+
+    #[test]
+    fn golden_service_reject() {
+        let mut ue = create_test_amf_ue();
+        // PSS absent -> header + mandatory 5GMM cause.
+        ue.pdu_session_status_present = false;
+        assert_eq!(
+            build_service_reject(&ue, GmmCause::Congestion),
+            vec![0x7e, 0x00, 0x4d, 22]
+        );
+        // PSS present, one session PSI=1 -> cause + 0x50 LV with swapped 0x0200.
+        ue.pdu_session_status_present = true;
+        ue.sessions = vec![crate::context::AmfSessRef {
+            psi: 1,
+            sm_context_in_smf: false,
+        }];
+        assert_eq!(
+            build_service_reject(&ue, GmmCause::Congestion),
+            vec![0x7e, 0x00, 0x4d, 22, 0x50, 0x02, 0x02, 0x00]
         );
     }
 
