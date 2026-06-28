@@ -1724,6 +1724,7 @@ impl PathSwitchRequestTransfer {
 mod tests {
     use super::*;
     use ogs_asn1c::ngap::cause::{CauseNas, CauseRadioNetwork};
+    use proptest::prelude::*;
 
     fn sample_tunnel() -> UpTransportLayerInformation {
         UpTransportLayerInformation::GtpTunnel(GtpTunnel {
@@ -1997,5 +1998,42 @@ mod tests {
     #[test]
     fn test_path_switch_request_transfer_rejects_truncated() {
         assert!(PathSwitchRequestTransfer::decode(&[0x00]).is_err());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        // NGAP-08: the outer *RequestTransfer SEQUENCE is extensible (`...`), so
+        // APER must emit a leading extension-marker bit (0) and then octet-align
+        // before the ProtocolIE-Container length determinant. With the ext bit
+        // present, octet 0 is exactly 0x00 (the 0 bit + 7 alignment pad); if the
+        // bit regressed away, the IE count would land in octet 0 instead. This
+        // fences `encode_container`/`decode_container` against that regression.
+        #[test]
+        fn prop_setup_request_transfer_leading_ext_marker(
+            dl in 1u64..=4_000_000_000_000,
+            ul in 1u64..=4_000_000_000_000,
+        ) {
+            let transfer = PduSessionResourceSetupRequestTransfer {
+                pdu_session_aggregate_maximum_bit_rate: Some(PduSessionAggregateMaximumBitRate {
+                    dl,
+                    ul,
+                }),
+                ul_ngu_up_tnl_information: sample_tunnel(),
+                data_forwarding_not_possible: false,
+                pdu_session_type: PduSessionType::Ipv4,
+                security_indication: None,
+                network_instance: None,
+                qos_flow_setup_request_list: vec![QosFlowSetupRequestItem {
+                    qos_flow_identifier: 1,
+                    qos_flow_level_qos_parameters: sample_qos_params(),
+                    e_rab_id: None,
+                }],
+            };
+            let bytes = transfer.encode().unwrap();
+            prop_assert_eq!(bytes[0], 0x00);
+            let decoded = PduSessionResourceSetupRequestTransfer::decode(&bytes).unwrap();
+            prop_assert_eq!(decoded, transfer);
+        }
     }
 }

@@ -4,6 +4,7 @@
 //! These types abstract over the raw ProtocolIeContainer and provide a convenient API.
 
 pub use ogs_asn1c::ngap::cause::Cause;
+use ogs_asn1c::ngap::types::Criticality;
 
 // ============================================================================
 // NG Setup (Section 9.2.6)
@@ -503,8 +504,40 @@ pub struct UeAmbrInfo {
     pub ul: u64,
 }
 
+/// Type of error reported per offending IE in CriticalityDiagnostics.
+///
+/// ASN.1 (TS 38.413 §9.3.1.3):
+/// `TypeOfError ::= ENUMERATED { not-understood, missing, ... }`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeOfError {
+    /// The IE was present but could not be understood
+    NotUnderstood,
+    /// A mandatory/conditional IE was missing
+    Missing,
+}
+
+/// One entry of the CriticalityDiagnostics IE list.
+///
+/// ASN.1 (TS 38.413 §9.3.1.3):
+/// `CriticalityDiagnostics-IE-Item ::= SEQUENCE { iECriticality Criticality,
+/// iE-ID ProtocolIE-ID, typeOfError TypeOfError, iE-Extensions OPTIONAL, ... }`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IeCriticalityDiagnostics {
+    /// Criticality assigned to the offending IE
+    pub ie_criticality: Criticality,
+    /// Protocol IE-ID of the offending IE
+    pub ie_id: u16,
+    /// Whether the IE was not-understood or missing
+    pub type_of_error: TypeOfError,
+}
+
 /// Criticality Diagnostics
-#[derive(Debug, Clone)]
+///
+/// ASN.1 (TS 38.413 §9.3.1.3): an extensible SEQUENCE with five OPTIONAL root
+/// components; `iEsCriticalityDiagnostics` is a `SEQUENCE (SIZE(1..256)) OF`
+/// [`IeCriticalityDiagnostics`]. An empty [`ies`](Self::ies) means the list is
+/// absent on the wire.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CriticalityDiagnostics {
     /// Procedure Code (optional)
     pub procedure_code: Option<u8>,
@@ -512,6 +545,8 @@ pub struct CriticalityDiagnostics {
     pub triggering_message: Option<u8>,
     /// Procedure Criticality (optional)
     pub procedure_criticality: Option<u8>,
+    /// IEsCriticalityDiagnostics list (absent when empty)
+    pub ies: Vec<IeCriticalityDiagnostics>,
 }
 
 // ============================================================================

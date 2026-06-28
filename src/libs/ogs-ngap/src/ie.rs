@@ -16,6 +16,15 @@ use crate::types::*;
 // ============================================================================
 // IE Encoding Helpers
 // ============================================================================
+//
+// AUTHOR GUIDANCE (NGAP-08): a CHOICE without an ASN.1 `...` marker is
+// NON-extensible — encode its alternative with
+// `AperEncoder::encode_choice_index(idx, num_alts, /*extensible=*/false)` so the
+// index is a bare constrained whole number with NO leading extension bit. A BIT
+// STRING whose upper bound exceeds 16 bits must be octet-aligned before its
+// content (X.691 §16); prefer `AperEncoder::encode_bit_string(..)`, which aligns
+// for you, over hand-rolled `align()` + `write_bits`. The `property_tests` module
+// fences both invariants for the encoders below.
 
 /// Encode a value to raw APER bytes for use in ProtocolIeField.value
 fn encode_ie_value<T: AperEncode>(value: &T) -> NgapResult<Vec<u8>> {
@@ -1717,6 +1726,15 @@ pub fn encode_pdu_session_handover_list(
     )
 }
 
+/// Map TypeOfError to its ASN.1 enumeration index (TS 38.413 §9.3.1.3:
+/// `not-understood(0)`, `missing(1)`).
+fn type_of_error_to_index(t: TypeOfError) -> i64 {
+    match t {
+        TypeOfError::NotUnderstood => 0,
+        TypeOfError::Missing => 1,
+    }
+}
+
 /// Encode CriticalityDiagnostics IE (TS 38.413 Section 9.3.1.3)
 pub fn encode_criticality_diagnostics(
     container: &mut ProtocolIeContainer,
@@ -1725,12 +1743,13 @@ pub fn encode_criticality_diagnostics(
     let mut encoder = AperEncoder::new();
     // CriticalityDiagnostics ::= SEQUENCE { procedureCode OPTIONAL,
     //   triggeringMessage OPTIONAL, procedureCriticality OPTIONAL,
-    //   iEsCriticalityDiagnostics OPTIONAL, iE-Extensions OPTIONAL }
+    //   iEsCriticalityDiagnostics OPTIONAL, iE-Extensions OPTIONAL, ... }
+    let ies_present = !diag.ies.is_empty();
     encoder.write_bit(false); // extension
     encoder.write_bit(diag.procedure_code.is_some());
     encoder.write_bit(diag.triggering_message.is_some());
     encoder.write_bit(diag.procedure_criticality.is_some());
-    encoder.write_bit(false); // iEsCriticalityDiagnostics not present
+    encoder.write_bit(ies_present); // iEsCriticalityDiagnostics present
     encoder.write_bit(false); // no iE-Extensions
     if let Some(code) = diag.procedure_code {
         let constraint = ogs_asn1c::per::Constraint::new(0, 255);
@@ -1743,6 +1762,22 @@ pub fn encode_criticality_diagnostics(
     if let Some(crit) = diag.procedure_criticality {
         let constraint = ogs_asn1c::per::Constraint::new(0, 2);
         encoder.encode_enumerated(crit as i64, &constraint)?;
+    }
+    if ies_present {
+        // CriticalityDiagnostics-IE-List ::= SEQUENCE (SIZE(1..maxnoofErrors))
+        //   OF CriticalityDiagnostics-IE-Item, where maxnoofErrors = 256.
+        encoder.encode_constrained_length(diag.ies.len(), 1, 256)?;
+        for item in &diag.ies {
+            // CriticalityDiagnostics-IE-Item ::= SEQUENCE { iECriticality,
+            //   iE-ID, typeOfError, iE-Extensions OPTIONAL, ... }
+            encoder.write_bit(false); // extension marker
+            encoder.write_bit(false); // no iE-Extensions
+            item.ie_criticality.encode_aper(&mut encoder)?;
+            let id_constraint = ogs_asn1c::per::Constraint::new(0, 65535);
+            encoder.encode_constrained_whole_number(item.ie_id as i64, &id_constraint)?;
+            let err_constraint = ogs_asn1c::per::Constraint::extensible(0, 1);
+            encoder.encode_enumerated(type_of_error_to_index(item.type_of_error), &err_constraint)?;
+        }
     }
     encoder.align();
     container.push(ProtocolIeField {
@@ -1782,26 +1817,36 @@ pub fn decode_criticality_diagnostics(
     } else {
         None
     };
+    let mut ies = Vec::new();
     if ies_present {
-        // IEsCriticalityDiagnostics ::= SEQUENCE (SIZE (1..512)) OF
-        //   CriticalityDiagnostics-IE-Item { iECriticality, iE-ID, typeOfError, ... }
-        // Consume the items to stay bit-aligned; the contents are not retained.
-        let count = decoder.decode_constrained_length(1, 512)?;
+        // CriticalityDiagnostics-IE-List ::= SEQUENCE (SIZE (1..maxnoofErrors))
+        //   OF CriticalityDiagnostics-IE-Item, where maxnoofErrors = 256.
+        let count = decoder.decode_constrained_length(1, 256)?;
         for _ in 0..count {
             let _item_ext = decoder.read_bit()?;
             let _item_ie_ext = decoder.read_bit()?;
-            let crit_constraint = ogs_asn1c::per::Constraint::new(0, 2);
-            let _ie_criticality = decoder.decode_enumerated(&crit_constraint)?;
+            let ie_criticality = Criticality::decode_aper(&mut decoder)?;
             let id_constraint = ogs_asn1c::per::Constraint::new(0, 65535);
-            let _ie_id = decoder.decode_constrained_whole_number(&id_constraint)?;
+            let ie_id = decoder.decode_constrained_whole_number(&id_constraint)? as u16;
             let err_constraint = ogs_asn1c::per::Constraint::extensible(0, 1);
-            let _type_of_error = decoder.decode_enumerated(&err_constraint)?;
+            // not-understood(0), missing(1); future extension values map to
+            // not-understood so an extended peer does not fail the decode.
+            let type_of_error = match decoder.decode_enumerated(&err_constraint)? {
+                1 => TypeOfError::Missing,
+                _ => TypeOfError::NotUnderstood,
+            };
+            ies.push(IeCriticalityDiagnostics {
+                ie_criticality,
+                ie_id,
+                type_of_error,
+            });
         }
     }
     Ok(CriticalityDiagnostics {
         procedure_code,
         triggering_message,
         procedure_criticality,
+        ies,
     })
 }
 
@@ -2682,5 +2727,106 @@ mod global_ran_node_id_tests {
             }
             other => panic!("expected GlobalNgEnbId, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod criticality_diagnostics_tests {
+    use super::*;
+
+    // NGAP-06: CriticalityDiagnostics (TS 38.413 §9.3.1.3) is fully retained,
+    // including the IEsCriticalityDiagnostics list. These are byte-vector tests:
+    // the expected APER octets are derived by hand from X.691 (Aligned PER) and
+    // pin the encoder against regressions.
+
+    #[test]
+    fn test_criticality_diagnostics_procedure_code_byte_vector() {
+        // Only procedureCode = 21 (NG-SETUP) present, no list.
+        //   preamble: ext=0, pc=1, tm=0, crit=0, ies=0, ext2=0  -> 0b010000xx
+        //   align before the 0..255 octet -> octet0 = 0x40
+        //   procedureCode 21 -> octet1 = 0x15
+        let diag = CriticalityDiagnostics {
+            procedure_code: Some(21),
+            triggering_message: None,
+            procedure_criticality: None,
+            ies: vec![],
+        };
+        let mut container = ProtocolIeContainer::new();
+        encode_criticality_diagnostics(&mut container, &diag).unwrap();
+        let field = &container.ies[0];
+        assert_eq!(field.id.0, IE_ID_CRITICALITY_DIAGNOSTICS);
+        assert_eq!(field.criticality, Criticality::Ignore);
+        assert_eq!(field.value, vec![0x40, 0x15]);
+        assert_eq!(decode_criticality_diagnostics(field).unwrap(), diag);
+    }
+
+    #[test]
+    fn test_criticality_diagnostics_ie_list_byte_vector() {
+        // No scalar optionals, one IE item: { Reject(0), iE-ID=27, NotUnderstood(0) }.
+        //   preamble: ext=0,pc=0,tm=0,crit=0,ies=1,ext2=0          octet0 hi = 000010
+        //   list length SIZE(1..256): align + (1-1) over 8 bits -> octet0=0x08, octet1=0x00
+        //   item: ext=0, ie-ext=0, iECriticality Reject=2bit 00,
+        //         iE-ID 27 -> align + 16 bits -> octet2=0x00, octet3=0x00, octet4=0x1B
+        //         typeOfError not-understood -> ext=0 + 1bit 0, final align -> octet5=0x00
+        let diag = CriticalityDiagnostics {
+            procedure_code: None,
+            triggering_message: None,
+            procedure_criticality: None,
+            ies: vec![IeCriticalityDiagnostics {
+                ie_criticality: Criticality::Reject,
+                ie_id: 27,
+                type_of_error: TypeOfError::NotUnderstood,
+            }],
+        };
+        let mut container = ProtocolIeContainer::new();
+        encode_criticality_diagnostics(&mut container, &diag).unwrap();
+        let field = &container.ies[0];
+        assert_eq!(field.value, vec![0x08, 0x00, 0x00, 0x00, 0x1B, 0x00]);
+        assert_eq!(decode_criticality_diagnostics(field).unwrap(), diag);
+    }
+
+    #[test]
+    fn test_criticality_diagnostics_full_roundtrip() {
+        let diag = CriticalityDiagnostics {
+            procedure_code: Some(21),
+            triggering_message: Some(2),
+            procedure_criticality: Some(0),
+            ies: vec![
+                IeCriticalityDiagnostics {
+                    ie_criticality: Criticality::Reject,
+                    ie_id: 27,
+                    type_of_error: TypeOfError::NotUnderstood,
+                },
+                IeCriticalityDiagnostics {
+                    ie_criticality: Criticality::Ignore,
+                    ie_id: 0,
+                    type_of_error: TypeOfError::Missing,
+                },
+            ],
+        };
+        let mut container = ProtocolIeContainer::new();
+        encode_criticality_diagnostics(&mut container, &diag).unwrap();
+        let decoded = decode_criticality_diagnostics(&container.ies[0]).unwrap();
+        assert_eq!(decoded, diag);
+    }
+
+    #[test]
+    fn test_criticality_diagnostics_empty_list_bytes_unchanged() {
+        // Additive-safety guard: with an empty list the encoder must emit the
+        // exact same bytes as before NGAP-06 (iEsCriticalityDiagnostics bit = 0).
+        let diag = CriticalityDiagnostics {
+            procedure_code: Some(21),
+            triggering_message: Some(0),
+            procedure_criticality: Some(1),
+            ies: vec![],
+        };
+        let mut container = ProtocolIeContainer::new();
+        encode_criticality_diagnostics(&mut container, &diag).unwrap();
+        // preamble byte has the iEs bit (5th) clear.
+        assert_eq!(container.ies[0].value[0] & 0b0000_1000, 0);
+        assert_eq!(
+            decode_criticality_diagnostics(&container.ies[0]).unwrap(),
+            diag
+        );
     }
 }

@@ -88,6 +88,9 @@ pub mod parser;
 pub mod transfer;
 pub mod types;
 
+#[cfg(test)]
+mod property_tests;
+
 // Re-export key types for convenience
 pub use error::{NgapError, NgapResult};
 pub use parser::NgapMessage;
@@ -416,6 +419,7 @@ mod tests {
                 procedure_code: Some(20),
                 triggering_message: Some(0),
                 procedure_criticality: Some(0),
+                ies: vec![],
             }),
         };
 

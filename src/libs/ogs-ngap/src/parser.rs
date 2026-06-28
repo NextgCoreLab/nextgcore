@@ -453,12 +453,7 @@ fn parse_ng_setup_failure(container: ProtocolIeContainer) -> NgapResult<NgSetupF
                 time_to_wait = Some(ie::decode_time_to_wait(field)?);
             }
             ProtocolIeId::CRITICALITY_DIAGNOSTICS => {
-                // Minimal parse for now
-                criticality_diagnostics = Some(CriticalityDiagnostics {
-                    procedure_code: None,
-                    triggering_message: None,
-                    procedure_criticality: None,
-                });
+                criticality_diagnostics = Some(ie::decode_criticality_diagnostics(field)?);
             }
             _ => {}
         }
