@@ -1037,6 +1037,11 @@ where
 
 fn encode_container(container: &ProtocolIeContainer) -> NgapResult<Vec<u8>> {
     let mut encoder = AperEncoder::new();
+    // The outer *RequestTransfer SEQUENCE (TS 38.413 §9.3.4.x) is extensible
+    // (`...`); APER (Aligned, §9.5) requires a leading extension-presence bit.
+    // The single root field is mandatory, so the preamble is exactly this one
+    // bit; the container's own length determinant then self-aligns.
+    encoder.write_bit(false);
     container.encode_aper(&mut encoder)?;
     encoder.align();
     Ok(encoder.into_bytes().to_vec())
@@ -1044,6 +1049,8 @@ fn encode_container(container: &ProtocolIeContainer) -> NgapResult<Vec<u8>> {
 
 fn decode_container(data: &[u8]) -> NgapResult<ProtocolIeContainer> {
     let mut decoder = AperDecoder::new(data);
+    // Consume the outer SEQUENCE extension-presence bit (see encode_container).
+    let _ext = decoder.read_bit()?;
     Ok(ProtocolIeContainer::decode_aper(&mut decoder)?)
 }
 
