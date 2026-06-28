@@ -32,25 +32,41 @@ impl Gtp1Message {
         }
     }
 
-    /// Create an Echo Request message
-    pub fn echo_request(teid: u32, sequence_number: u16) -> Self {
-        let mut header = Gtp1Header::new(Gtp1cMessageType::EchoRequest as u8, teid);
+    /// Create an Echo Request message.
+    ///
+    /// Per TS 29.281 Section 5.1 the header Tunnel Endpoint Identifier of an
+    /// Echo Request shall be set to all zeroes, so the `_teid` argument is
+    /// retained for source compatibility but ignored — the header TEID is
+    /// always 0.
+    pub fn echo_request(_teid: u32, sequence_number: u16) -> Self {
+        // TS 29.281 Section 5.1: Echo Request header TEID shall be all zeroes.
+        let mut header = Gtp1Header::new(Gtp1cMessageType::EchoRequest as u8, 0);
         header.s = true;
         header.sequence_number = Some(sequence_number);
         Self::new(header)
     }
 
-    /// Create an Echo Response message
-    pub fn echo_response(teid: u32, sequence_number: u16, recovery: u8) -> Self {
-        let mut header = Gtp1Header::new(Gtp1cMessageType::EchoResponse as u8, teid);
+    /// Create an Echo Response message.
+    ///
+    /// Per TS 29.281 Section 5.1 the header Tunnel Endpoint Identifier of an
+    /// Echo Response shall be set to all zeroes; per Section 7.2.2 / 8.2 the
+    /// Recovery information element Restart Counter is not used in GTP-U and
+    /// shall be set to 0 by the sender (it exists only for backwards
+    /// compatibility). Both the `_teid` and `_recovery` arguments are retained
+    /// for source compatibility but ignored — the header TEID and the Recovery
+    /// value are always 0.
+    pub fn echo_response(_teid: u32, sequence_number: u16, _recovery: u8) -> Self {
+        // TS 29.281 Section 5.1: Echo Response header TEID shall be all zeroes.
+        let mut header = Gtp1Header::new(Gtp1cMessageType::EchoResponse as u8, 0);
         header.s = true;
         header.sequence_number = Some(sequence_number);
 
         let mut msg = Self::new(header);
 
-        // Add Recovery IE
+        // Add Recovery IE. TS 29.281 Section 7.2.2 / 8.2: the GTP-U Restart
+        // Counter is unused and shall be set to 0 by the sender.
         let mut ie_buf = BytesMut::new();
-        ie_buf.put_u8(recovery);
+        ie_buf.put_u8(0);
         msg.ies.push(Gtp1Ie::new_tv(14, &ie_buf)); // Recovery IE type = 14
 
         msg
@@ -93,10 +109,13 @@ impl Gtp1Message {
     /// Create an Error Indication message.
     ///
     /// Per TS 29.281 Section 5.1 the S flag shall be set to 1 for Error
-    /// Indication; per Section 7.3.1 the header TEID shall be 0 and the
-    /// offending TEID travels in the Tunnel Endpoint Identifier Data I IE.
-    pub fn error_indication(teid: u32, peer_teid: u32, peer_addr: &[u8]) -> Self {
-        let mut header = Gtp1Header::new(Gtp1uMessageType::ErrorIndication as u8, teid);
+    /// Indication and the header Tunnel Endpoint Identifier shall be set to all
+    /// zeros; the offending TEID travels in the Tunnel Endpoint Identifier
+    /// Data I IE (Section 7.3.1). The `_teid` argument is retained for source
+    /// compatibility but ignored — the header TEID is always 0.
+    pub fn error_indication(_teid: u32, peer_teid: u32, peer_addr: &[u8]) -> Self {
+        // TS 29.281 Section 5.1: Error Indication header TEID shall be all zeros.
+        let mut header = Gtp1Header::new(Gtp1uMessageType::ErrorIndication as u8, 0);
         header.s = true;
         header.sequence_number = Some(0);
         let mut msg = Self::new(header);
@@ -559,7 +578,9 @@ mod tests {
             decoded.header.message_type,
             Gtp1cMessageType::EchoRequest as u8
         );
-        assert_eq!(decoded.header.teid, 0x12345678);
+        // gtp-01 re-baseline: TS 29.281 Section 5.1 forces the Echo Request
+        // header TEID to all zeroes regardless of the value passed in.
+        assert_eq!(decoded.header.teid, 0);
         assert_eq!(decoded.header.sequence_number, Some(0x1234));
     }
 
@@ -575,10 +596,14 @@ mod tests {
             decoded.header.message_type,
             Gtp1cMessageType::EchoResponse as u8
         );
-        assert_eq!(decoded.header.teid, 0x12345678);
+        // gtp-01 re-baseline: TS 29.281 Section 5.1 forces the Echo Response
+        // header TEID to all zeroes regardless of the value passed in.
+        assert_eq!(decoded.header.teid, 0);
 
+        // gtp-05 re-baseline: TS 29.281 Section 7.2.2 / 8.2 force the GTP-U
+        // Recovery Restart Counter to 0 regardless of the value passed in.
         let recovery_ie = decoded.get_ie(14).unwrap();
-        assert_eq!(recovery_ie.value[0], 42);
+        assert_eq!(recovery_ie.value[0], 0);
     }
 
     #[test]
@@ -949,5 +974,92 @@ mod tests {
         let mut bytes = encoded.freeze();
         let decoded = Gtp1Message::decode(&mut bytes).unwrap();
         assert!(decoded.unknown_comprehension_required(true).is_empty());
+    }
+
+    // gtp-01: the header TEID of Echo Request/Response and Error Indication is
+    // forced to all zeroes even when the builder is handed a non-zero argument
+    // (TS 29.281 Section 5.1).
+    #[test]
+    fn test_echo_and_error_indication_header_teid_zero() {
+        // Echo Request: header TEID octets 4..8 are zero despite the argument.
+        let encoded = Gtp1Message::echo_request(0xDEADBEEF, 0x1234).encode();
+        assert_eq!(&encoded[4..8], &[0, 0, 0, 0]);
+
+        // Echo Response: header TEID is zero despite the argument.
+        let encoded = Gtp1Message::echo_response(0xDEADBEEF, 0x1234, 42).encode();
+        assert_eq!(&encoded[4..8], &[0, 0, 0, 0]);
+
+        // Error Indication: header TEID is zero, but the offending TEID still
+        // travels in the Tunnel Endpoint Identifier Data I IE (type 16).
+        let msg = Gtp1Message::error_indication(0xDEADBEEF, 0x12345678, &[192, 168, 1, 1]);
+        let encoded = msg.encode();
+        assert_eq!(&encoded[4..8], &[0, 0, 0, 0]);
+        let mut bytes = encoded.freeze();
+        let decoded = Gtp1Message::decode(&mut bytes).unwrap();
+        assert_eq!(decoded.header.teid, 0);
+        let err_ind = ErrorIndication::decode(&decoded).unwrap();
+        assert_eq!(err_ind.teid, 0x12345678);
+    }
+
+    // gtp-01: exact wire image of an Echo Request — header TEID = 0.
+    #[test]
+    fn test_echo_request_header_teid_zero_byte_vector() {
+        // Non-zero TEID argument must be ignored on the wire (Section 5.1).
+        let encoded = Gtp1Message::echo_request(0x12345678, 0x1234).encode();
+        let expected: &[u8] = &[
+            0x32, // version 1, PT=1, S=1
+            0x01, // Echo Request
+            0x00, 0x04, // length = 4 (opt fields), no IEs
+            0x00, 0x00, 0x00, 0x00, // header TEID = 0 (forced per Section 5.1)
+            0x12, 0x34, // sequence number
+            0x00, // N-PDU number
+            0x00, // next extension header: none
+        ];
+        assert_eq!(&encoded[..], expected);
+    }
+
+    // gtp-01 + gtp-05: exact wire image of an Echo Response — header TEID = 0
+    // and Recovery Restart Counter = 0.
+    #[test]
+    fn test_echo_response_header_teid_recovery_zero_byte_vector() {
+        // Non-zero TEID and Recovery arguments must be ignored on the wire
+        // (Section 5.1 + Section 7.2.2 / 8.2).
+        let encoded = Gtp1Message::echo_response(0x12345678, 0x1234, 42).encode();
+        let expected: &[u8] = &[
+            0x32, // version 1, PT=1, S=1
+            0x02, // Echo Response
+            0x00, 0x06, // length = 4 (opt fields) + 2 (Recovery IE)
+            0x00, 0x00, 0x00, 0x00, // header TEID = 0 (forced per Section 5.1)
+            0x12, 0x34, // sequence number
+            0x00, // N-PDU number
+            0x00, // next extension header: none
+            0x0E, // IE type 14 (Recovery)
+            0x00, // Restart Counter = 0 (forced per Section 7.2.2 / 8.2)
+        ];
+        assert_eq!(&encoded[..], expected);
+    }
+
+    // gtp-01: exact wire image of an Error Indication — header TEID = 0 while
+    // the offending TEID stays in the TEID Data I IE.
+    #[test]
+    fn test_error_indication_header_teid_zero_byte_vector() {
+        // Non-zero header TEID argument must be ignored on the wire (Section 5.1).
+        let encoded =
+            Gtp1Message::error_indication(0x99999999, 0x12345678, &[192, 168, 1, 1]).encode();
+        let expected: &[u8] = &[
+            0x32, // version 1, PT=1, S=1
+            0x1A, // Error Indication (26)
+            0x00, 0x10, // length = 4 (opt) + 5 (TEID IE) + 7 (GSN IE)
+            0x00, 0x00, 0x00, 0x00, // header TEID = 0 (forced per Section 5.1)
+            0x00, 0x00, // sequence number = 0
+            0x00, // N-PDU number
+            0x00, // next extension header: none
+            0x10, // IE type 16 (TEID Data I)
+            0x12, 0x34, 0x56, 0x78, // offending TEID (unchanged)
+            0x85, // IE type 133 (GSN Address / GTP-U Peer Address)
+            0x00, 0x04, // IE length = 4
+            0xC0, 0xA8, 0x01, 0x01, // 192.168.1.1
+        ];
+        assert_eq!(&encoded[..], expected);
     }
 }

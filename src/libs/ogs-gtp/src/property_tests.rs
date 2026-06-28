@@ -38,7 +38,9 @@ mod tests {
                 let decoded = Gtp1Message::decode(&mut bytes).unwrap();
 
                 prop_assert_eq!(decoded.header.message_type, Gtp1cMessageType::EchoRequest as u8);
-                prop_assert_eq!(decoded.header.teid, teid);
+                // gtp-01 re-baseline: TS 29.281 Section 5.1 forces the Echo Request
+                // header TEID to all zeroes regardless of the `teid` argument.
+                prop_assert_eq!(decoded.header.teid, 0);
                 prop_assert_eq!(decoded.header.sequence_number, Some(sequence_number));
                 prop_assert_eq!(decoded.header.version, GTP1_VERSION_1);
             }
@@ -58,13 +60,16 @@ mod tests {
                 let decoded = Gtp1Message::decode(&mut bytes).unwrap();
 
                 prop_assert_eq!(decoded.header.message_type, Gtp1cMessageType::EchoResponse as u8);
-                prop_assert_eq!(decoded.header.teid, teid);
+                // gtp-01 re-baseline: TS 29.281 Section 5.1 forces the Echo Response
+                // header TEID to all zeroes regardless of the `teid` argument.
+                prop_assert_eq!(decoded.header.teid, 0);
                 prop_assert_eq!(decoded.header.sequence_number, Some(sequence_number));
 
-                // Verify Recovery IE
+                // gtp-05 re-baseline: TS 29.281 Section 7.2.2 / 8.2 force the GTP-U
+                // Recovery Restart Counter to 0 regardless of the `recovery` argument.
                 let recovery_ie = decoded.get_ie(14);
                 prop_assert!(recovery_ie.is_some());
-                prop_assert_eq!(recovery_ie.unwrap().value[0], recovery);
+                prop_assert_eq!(recovery_ie.unwrap().value[0], 0);
             }
 
             // Feature: nextgcore-rust-conversion, Property 11: Protocol Message Round-Trip
@@ -137,6 +142,10 @@ mod tests {
                 let decoded = Gtp1Message::decode(&mut bytes).unwrap();
 
                 prop_assert_eq!(decoded.header.message_type, Gtp1uMessageType::ErrorIndication as u8);
+                // gtp-01 re-baseline: TS 29.281 Section 5.1 forces the Error Indication
+                // header TEID to all zeroes regardless of the `header_teid` argument;
+                // the offending TEID travels in the TEID Data I IE instead.
+                prop_assert_eq!(decoded.header.teid, 0);
 
                 let err_ind = ErrorIndication::decode(&decoded).unwrap();
                 prop_assert_eq!(err_ind.teid, peer_teid);
