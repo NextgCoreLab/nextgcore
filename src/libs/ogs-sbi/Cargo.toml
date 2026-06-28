@@ -29,6 +29,9 @@ rustls-pemfile.workspace = true
 webpki-roots.workspace = true
 base64.workspace = true
 hex.workspace = true
+# Randomized W3C traceparent trace-id/span-id (sbi-09) and OCI load-shedding
+# probabilistic reaction (sbi-08). Workspace-pinned; no root Cargo.toml change.
+rand.workspace = true
 p256 = { workspace = true, features = ["ecdsa"] }
 
 [dev-dependencies]

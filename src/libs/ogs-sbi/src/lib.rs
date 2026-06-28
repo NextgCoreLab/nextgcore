@@ -35,6 +35,7 @@
 //! - [`context`] - NF instance and service discovery context
 //! - [`tls`] - TLS/mTLS configuration and certificate loading
 //! - [`oauth`] - OAuth2 client credentials flow for 5G SBA
+//! - [`overload`] - OCI/LCI overload & load control parse/emit + reaction
 //! - [`error`] - Error types
 
 pub mod constants;
@@ -46,6 +47,7 @@ pub mod heartbeat;
 pub mod message;
 pub mod multipart;
 pub mod oauth;
+pub mod overload;
 #[cfg(feature = "6g-extensions")]
 pub mod pubsub;
 pub mod scp;
@@ -77,6 +79,7 @@ pub use oauth::{
     authorize_bearer, authorize_bearer_aud, check_audience, AccessTokenClaims, AccessTokenError,
     AccessTokenRequest, AccessTokenResponse, JwksCache, OAuth2Client, TokenCache,
 };
+pub use overload::{Lci, Oci, OverloadControl};
 #[cfg(feature = "6g-extensions")]
 pub use pubsub::{
     EventBroker, EventFilter, EventReplayBuffer, SbiEvent, SbiEventCategory, Subscription,

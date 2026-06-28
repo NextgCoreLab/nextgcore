@@ -25,14 +25,30 @@ use crate::oauth::OAuth2Client;
 use crate::tls;
 use crate::types::{NfType, UriScheme};
 
-/// Generate a simple 8-byte span ID from the current timestamp nanoseconds.
-/// In production this would use the OTel SDK's span ID generator.
+/// Fill an `N`-byte buffer with CSPRNG output, never returning all-zero
+/// (sbi-09). W3C Trace Context forbids an all-zero trace-id/span-id; the
+/// retry makes that pathological case impossible rather than merely unlikely.
+fn random_nonzero_bytes<const N: usize>() -> [u8; N] {
+    use rand::RngCore;
+    let mut buf = [0u8; N];
+    let mut rng = rand::rng();
+    loop {
+        rng.fill_bytes(&mut buf);
+        if buf.iter().any(|&b| b != 0) {
+            return buf;
+        }
+    }
+}
+
+/// Generate a random 16-byte W3C trace-id (sbi-09). Random, not clock-derived,
+/// so trace-ids are unpredictable and collision-resistant under load.
+fn new_trace_id() -> [u8; 16] {
+    random_nonzero_bytes::<16>()
+}
+
+/// Generate a random 8-byte W3C span ID (sbi-09).
 fn new_span_id() -> [u8; 8] {
-    let ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("value expected")
-        .as_nanos() as u64;
-    ns.to_be_bytes()
+    random_nonzero_bytes::<8>()
 }
 
 // ── T1.5b: TLS exporter hook (client side) ──────────────────────────────────
@@ -210,6 +226,12 @@ pub struct SbiClient {
     oauth2: Option<Arc<OAuth2Client>>,
     /// Target NF type for OAuth2 scope resolution
     target_nf_type: Option<NfType>,
+    /// This NF's own type, used to stamp `User-Agent` on outbound requests
+    /// (sbi-03). `None` (default) preserves the prior no-header behaviour.
+    client_nf_type: Option<NfType>,
+    /// This NF's own instance ID / FQDN, combined with `client_nf_type` as the
+    /// `User-Agent` value `<NFTYPE>-<id>` (sbi-03).
+    client_nf_id: Option<String>,
 }
 
 impl SbiClient {
@@ -223,6 +245,8 @@ impl SbiClient {
             next_slot: Arc::new(AtomicUsize::new(0)),
             oauth2: None,
             target_nf_type: None,
+            client_nf_type: None,
+            client_nf_id: None,
         }
     }
 
@@ -238,6 +262,20 @@ impl SbiClient {
     pub fn with_oauth2(mut self, oauth2: Arc<OAuth2Client>, target_nf_type: NfType) -> Self {
         self.oauth2 = Some(oauth2);
         self.target_nf_type = Some(target_nf_type);
+        self
+    }
+
+    /// Set this NF's own identity for the outbound `User-Agent` header (sbi-03).
+    ///
+    /// Per TS 29.500 Table 5.2.2.2-1, `User-Agent` should be included on every
+    /// SBI request to identify the requester NF type (an SCP derives the
+    /// requester NF type from it for delegated discovery, NOTE 3). When set,
+    /// every request without a caller-supplied `User-Agent` carries
+    /// `<NFTYPE>-<nfInstanceId>` (e.g. `AMF-<uuid>`). Unset (default) preserves
+    /// the prior behaviour of emitting no `User-Agent`.
+    pub fn with_client_identity(mut self, nf_type: NfType, nf_id: impl Into<String>) -> Self {
+        self.client_nf_type = Some(nf_type);
+        self.client_nf_id = Some(nf_id.into());
         self
     }
 
@@ -420,6 +458,23 @@ impl SbiClient {
             }
         }
 
+        // ── sbi-03: stamp User-Agent with this NF's identity ─────────────────
+        // TS 29.500 Table 5.2.2.2-1: User-Agent should be on every SBI request
+        // to identify the requester NF type. Only set when an identity was
+        // configured and the caller did not supply their own User-Agent.
+        if let (Some(nf_type), Some(nf_id)) = (&self.client_nf_type, &self.client_nf_id) {
+            if request
+                .http
+                .get_header(crate::constants::header::USER_AGENT)
+                .is_none()
+            {
+                request.http.set_header(
+                    crate::constants::header::USER_AGENT,
+                    format!("{}-{}", nf_type.as_server_token(), nf_id),
+                );
+            }
+        }
+
         // ── T6.4: propagate correlation / request ID outbound ────────────────
         // If the SbiRequest carries a non-empty correlation_id (set by the
         // server glue when the request arrived from a peer), echo it as
@@ -439,16 +494,12 @@ impl SbiClient {
         // correlation_id was extracted from an inbound traceparent trace-id we
         // reuse it here so the outbound trace-id matches the inbound one.
         if request.http.get_header("traceparent").is_none() {
-            // Generate a minimal traceparent from thread-local trace context.
-            // If no ambient trace context is set we start a new trace with a
-            // sampled root span (flags=01).
-            let trace_id: [u8; 16] = {
-                let ns = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("value expected")
-                    .as_nanos();
-                ns.to_be_bytes()
-            };
+            // Generate a minimal traceparent for a new trace with a sampled
+            // root span (flags=01). The inbound-traceparent reuse path is the
+            // guard above: a caller-supplied traceparent is left untouched.
+            // sbi-09: trace-id and span-id are CSPRNG-random (W3C Trace
+            // Context), not derived from the wall clock.
+            let trace_id = new_trace_id();
             let span_id = new_span_id();
             let traceparent = format!("00-{}-{}-01", hex::encode(trace_id), hex::encode(span_id),);
             request.http.set_header("traceparent", traceparent);
@@ -796,6 +847,110 @@ mod tests {
         assert!(
             body.contains("<none>"),
             "expected no authorization header, got: {body}"
+        );
+    }
+
+    // --- sbi-09: randomized W3C traceparent trace-id / span-id ---
+
+    #[test]
+    fn test_trace_and_span_ids_are_random_and_nonzero() {
+        // Two generated trace-ids/span-ids differ (random, not clock-derived)
+        // and are never all-zero (W3C Trace Context requirement).
+        let t1 = new_trace_id();
+        let t2 = new_trace_id();
+        assert_ne!(t1, t2, "successive trace-ids must differ");
+        assert!(t1.iter().any(|&b| b != 0), "trace-id must not be all-zero");
+        assert!(t2.iter().any(|&b| b != 0));
+
+        let s1 = new_span_id();
+        let s2 = new_span_id();
+        assert_ne!(s1, s2, "successive span-ids must differ");
+        assert!(s1.iter().any(|&b| b != 0), "span-id must not be all-zero");
+
+        // Hex encodings are the W3C-mandated 32 / 16 chars.
+        assert_eq!(hex::encode(t1).len(), 32);
+        assert_eq!(hex::encode(s1).len(), 16);
+    }
+
+    // --- sbi-03: User-Agent on outbound requests ---
+
+    /// Serve any path by echoing the request's `user-agent` header back in the
+    /// JSON body. Returns the bound socket address.
+    async fn serve_user_agent_echo() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let svc = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+                        let ua = req
+                            .headers()
+                            .get("user-agent")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("<none>")
+                            .to_string();
+                        async move {
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                                http_body_util::Full::new(bytes::Bytes::from(format!(
+                                    r#"{{"user-agent":"{ua}"}}"#
+                                ))),
+                            ))
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc)
+                    .await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn test_user_agent_stamped_when_identity_set() {
+        let addr = serve_user_agent_echo().await;
+        let client = SbiClient::with_host_port("127.0.0.1", addr.port())
+            .with_client_identity(NfType::Amf, "3fa85f64-5717-4562-b3fc-2c963f66afa6");
+
+        let request = SbiRequest::get("/nudm-sdm/v1/imsi-1/am-data");
+        let response = client.send_request(request).await.expect("request sent");
+        let body = response.http.content.as_deref().expect("echo body");
+        assert!(
+            body.contains("AMF-3fa85f64-5717-4562-b3fc-2c963f66afa6"),
+            "expected stamped User-Agent, got: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_user_agent_absent_when_no_identity() {
+        // Default client (no identity) emits no User-Agent (prior behaviour).
+        let addr = serve_user_agent_echo().await;
+        let client = SbiClient::with_host_port("127.0.0.1", addr.port());
+        let request = SbiRequest::get("/nudm-sdm/v1/imsi-1/am-data");
+        let response = client.send_request(request).await.expect("request sent");
+        let body = response.http.content.as_deref().expect("echo body");
+        assert!(body.contains("<none>"), "expected no User-Agent, got: {body}");
+    }
+
+    #[tokio::test]
+    async fn test_user_agent_caller_value_preserved() {
+        let addr = serve_user_agent_echo().await;
+        let client = SbiClient::with_host_port("127.0.0.1", addr.port())
+            .with_client_identity(NfType::Amf, "amf-1");
+        // A caller-supplied User-Agent is not overwritten.
+        let request = SbiRequest::get("/nudm-sdm/v1/imsi-1/am-data")
+            .with_header("User-Agent", "custom-agent/1.0");
+        let response = client.send_request(request).await.expect("request sent");
+        let body = response.http.content.as_deref().expect("echo body");
+        assert!(
+            body.contains("custom-agent/1.0"),
+            "caller User-Agent should be preserved, got: {body}"
         );
     }
 

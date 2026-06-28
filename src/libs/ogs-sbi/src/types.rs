@@ -319,6 +319,17 @@ impl NfType {
             Self::Smsf5G => "SMSF_5G",
         }
     }
+
+    /// Server-token spelling of the NF type for the HTTP `Server` (TS 29.500
+    /// §6.10.8.2) and `User-Agent` (TS 29.500 Table 5.2.2.2-1) headers.
+    ///
+    /// Per TS 29.510 clause 6.1.6.3.3 the token is the uppercase NF-type
+    /// enumeration value (e.g. `SMF`, `SCP`, `SEPP`, `5G_EIR`). It is combined
+    /// with the NF Instance ID / FQDN by the caller as `<token>-<identity>`,
+    /// e.g. `SMF-54804518-...` or `SCP-scp1.operator.com`.
+    pub fn as_server_token(&self) -> &'static str {
+        self.to_str()
+    }
 }
 
 /// URI Scheme - matches OpenAPI_uri_scheme_e
@@ -535,6 +546,19 @@ mod tests {
         assert_eq!(UriScheme::Https.as_str(), "https");
         assert_eq!(UriScheme::Http.default_port(), 80);
         assert_eq!(UriScheme::Https.default_port(), 443);
+    }
+
+    #[test]
+    fn test_nf_type_server_token() {
+        // sbi-02/sbi-03: the server/user-agent token is the TS 29.510
+        // uppercase NF-type enumeration value.
+        assert_eq!(NfType::Smf.as_server_token(), "SMF");
+        assert_eq!(NfType::Scp.as_server_token(), "SCP");
+        assert_eq!(NfType::Sepp.as_server_token(), "SEPP");
+        assert_eq!(NfType::FiveGEir.as_server_token(), "5G_EIR");
+        // The token combines with an identity as `<token>-<id>`.
+        let header = format!("{}-{}", NfType::Smf.as_server_token(), "54804518-abcd");
+        assert_eq!(header, "SMF-54804518-abcd");
     }
 
     #[test]

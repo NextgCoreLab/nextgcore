@@ -95,6 +95,13 @@ pub struct SbiServerConfig {
     /// Cap on the decoded HTTP/2 header-list size. `None` keeps hyper's
     /// default. Defaults to `Some(`[`DEFAULT_MAX_HEADER_LIST_SIZE`]`)`.
     pub max_header_list_size: Option<u32>,
+    /// This NF's type, used to stamp the `Server` response header (sbi-02,
+    /// TS 29.500 §6.10.8.2). `None` (default) emits no `Server` header,
+    /// preserving the prior behaviour.
+    pub server_nf_type: Option<NfType>,
+    /// This NF's instance ID / FQDN, combined with `server_nf_type` as the
+    /// `Server` value `<NFTYPE>-<id>` (sbi-02).
+    pub server_nf_id: Option<String>,
 }
 
 impl Default for SbiServerConfig {
@@ -115,6 +122,8 @@ impl Default for SbiServerConfig {
             max_concurrent_streams: Some(DEFAULT_MAX_CONCURRENT_STREAMS),
             max_frame_size: Some(DEFAULT_MAX_FRAME_SIZE),
             max_header_list_size: Some(DEFAULT_MAX_HEADER_LIST_SIZE),
+            server_nf_type: None,
+            server_nf_id: None,
         }
     }
 }
@@ -169,6 +178,27 @@ impl SbiServerConfig {
     pub fn with_expected_audience_nf_type(mut self, nf_type: NfType) -> Self {
         self.oauth2_expected_audience = Some(nf_type.to_str().to_string());
         self
+    }
+
+    /// Set this NF's identity for the `Server` response header (sbi-02).
+    ///
+    /// Per TS 29.500 §6.10.8.2 the originator of a response should set
+    /// `Server: <NFType>-<identity>` where identity is the NF Instance ID (or
+    /// FQDN for SCP/SEPP), e.g. `SMF-54804518-...` or `SCP-scp1.operator.com`.
+    /// When set, every response without a handler-supplied `Server` header
+    /// carries this value. Unset (default) emits no `Server` header.
+    pub fn with_server_identity(mut self, nf_type: NfType, nf_id: impl Into<String>) -> Self {
+        self.server_nf_type = Some(nf_type);
+        self.server_nf_id = Some(nf_id.into());
+        self
+    }
+
+    /// Resolve the configured `(NfType, id)` server identity, if any (sbi-02).
+    fn server_identity(&self) -> Option<(NfType, String)> {
+        match (self.server_nf_type, &self.server_nf_id) {
+            (Some(nf_type), Some(id)) => Some((nf_type, id.clone())),
+            _ => None,
+        }
     }
 }
 
@@ -263,6 +293,9 @@ struct SbiService<H: SbiRequestHandler> {
     /// once per connection (T1.5b). Shared across all multiplexed requests on
     /// the same HTTP/2 connection and threaded into each `SbiRequest`.
     tls_exporter_secret: Option<Vec<u8>>,
+    /// This NF's `(NfType, id)` identity for the `Server` response header
+    /// (sbi-02). `None` emits no `Server` header.
+    server_identity: Option<(NfType, String)>,
 }
 
 impl<H: SbiRequestHandler> Clone for SbiService<H> {
@@ -272,6 +305,7 @@ impl<H: SbiRequestHandler> Clone for SbiService<H> {
             oauth: self.oauth.clone(),
             max_request_body_size: self.max_request_body_size,
             tls_exporter_secret: self.tls_exporter_secret.clone(),
+            server_identity: self.server_identity.clone(),
         }
     }
 }
@@ -286,6 +320,7 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
         let oauth = self.oauth.clone();
         let max_body = self.max_request_body_size;
         let tls_exporter_secret = self.tls_exporter_secret.clone();
+        let server_identity = self.server_identity.clone();
         let path = req.uri().path().to_string();
 
         Box::pin(async move {
@@ -316,7 +351,7 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                     .to_string();
                     let resp = SbiResponse::with_status(413)
                         .with_body(body, "application/problem+json");
-                    return Ok(convert_response(resp));
+                    return Ok(convert_response_with_identity(resp, server_identity.as_ref()));
                 }
             };
 
@@ -342,7 +377,7 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                     .to_string();
                     let resp = SbiResponse::with_status(status)
                         .with_body(body, "application/problem+json");
-                    return Ok(convert_response(resp));
+                    return Ok(convert_response_with_identity(resp, server_identity.as_ref()));
                 }
             }
 
@@ -364,8 +399,9 @@ impl<H: SbiRequestHandler> Service<Request<Incoming>> for SbiService<H> {
                 }
             };
 
-            // Convert SbiResponse to hyper response
-            let response = convert_response(sbi_response);
+            // Convert SbiResponse to hyper response, stamping the Server
+            // header (sbi-02) when a server identity is configured.
+            let response = convert_response_with_identity(sbi_response, server_identity.as_ref());
 
             Ok(response)
         })
@@ -654,6 +690,29 @@ fn convert_response(mut sbi_response: SbiResponse) -> Response<Full<Bytes>> {
     })
 }
 
+/// Convert an [`SbiResponse`] to a hyper response, stamping the `Server`
+/// header (sbi-02) from the NF identity when one is configured and the handler
+/// did not already set a `Server` header.
+///
+/// TS 29.500 §6.10.8.2: a response originator should set
+/// `Server: <NFType>-<identity>`. Applied to all responses (error and
+/// success); harmless on 2xx and aids troubleshooting. With `identity == None`
+/// no header is added, preserving prior behaviour.
+fn convert_response_with_identity(
+    mut sbi_response: SbiResponse,
+    identity: Option<&(NfType, String)>,
+) -> Response<Full<Bytes>> {
+    if let Some((nf_type, nf_id)) = identity {
+        if sbi_response.http.get_header("Server").is_none() {
+            sbi_response.http.set_header(
+                "Server",
+                format!("{}-{}", nf_type.as_server_token(), nf_id),
+            );
+        }
+    }
+    convert_response(sbi_response)
+}
+
 /// Server state
 enum ServerState {
     Stopped,
@@ -753,6 +812,8 @@ impl SbiServer {
         // (T1.4) without borrowing `self`.
         let max_request_body_size = self.config.max_request_body_size;
         let http2_limits = Http2Limits::from_config(&self.config);
+        // sbi-02: resolve the NF identity once for Server-header stamping.
+        let server_identity = self.config.server_identity();
 
         // Spawn the server task
         tokio::spawn(async move {
@@ -764,6 +825,7 @@ impl SbiServer {
                                 let handler_ref = handler.clone();
                                 let oauth_ref = oauth.clone();
                                 let http2_limits = http2_limits;
+                                let server_identity_ref = server_identity.clone();
 
                                 if let Some(ref acceptor) = tls_acceptor {
                                     let acceptor = acceptor.clone();
@@ -797,6 +859,7 @@ impl SbiServer {
                                                     oauth: oauth_ref,
                                                     max_request_body_size,
                                                     tls_exporter_secret,
+                                                    server_identity: server_identity_ref,
                                                 };
                                                 let io = TokioIo::new(tls_stream);
                                                 let mut builder = http2::Builder::new(
@@ -822,6 +885,7 @@ impl SbiServer {
                                         max_request_body_size,
                                         // No TLS on plaintext connections.
                                         tls_exporter_secret: None,
+                                        server_identity: server_identity_ref,
                                     };
                                     let io = TokioIo::new(stream);
                                     tokio::spawn(async move {
@@ -1139,6 +1203,69 @@ mod tests {
         };
         let err = remote.authorize(Some("Bearer a.b.c")).await.unwrap_err();
         assert!(!matches!(err, SbiError::AuthorizationFailed(_)));
+    }
+
+    // --- sbi-02: Server response header ---
+
+    #[test]
+    fn test_server_identity_config() {
+        // Default config has no server identity (no header emitted).
+        let base = SbiServerConfig::new(SocketAddr::from(([127, 0, 0, 1], 7777)));
+        assert!(base.server_identity().is_none());
+
+        // Configured identity resolves to (NfType, id).
+        let cfg = base.with_server_identity(NfType::Smf, "54804518-abcd");
+        assert_eq!(
+            cfg.server_identity(),
+            Some((NfType::Smf, "54804518-abcd".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_convert_response_stamps_server_header() {
+        // An error response gets `Server: SMF-<id>` (uppercase) when an
+        // identity is configured (TS 29.500 §6.10.8.2 EXAMPLE 3 shape).
+        let identity = (NfType::Smf, "54804518-abcd".to_string());
+        let resp = send_error(404, "Not Found", "missing", None);
+        let hyper_resp = convert_response_with_identity(resp, Some(&identity));
+        assert_eq!(
+            hyper_resp
+                .headers()
+                .get("server")
+                .and_then(|v| v.to_str().ok()),
+            Some("SMF-54804518-abcd")
+        );
+
+        // A 2xx success response is stamped too (harmless, aids debugging).
+        let ok = SbiResponse::ok().with_body("{}", "application/json");
+        let hyper_ok = convert_response_with_identity(ok, Some(&identity));
+        assert_eq!(
+            hyper_ok.headers().get("server").and_then(|v| v.to_str().ok()),
+            Some("SMF-54804518-abcd")
+        );
+    }
+
+    #[test]
+    fn test_convert_response_no_server_header_without_identity() {
+        // No identity → no Server header (prior behaviour preserved).
+        let resp = send_error(500, "Internal Server Error", "boom", None);
+        let hyper_resp = convert_response_with_identity(resp, None);
+        assert!(hyper_resp.headers().get("server").is_none());
+    }
+
+    #[test]
+    fn test_convert_response_preserves_handler_server_header() {
+        // A handler-supplied Server header is not overwritten.
+        let identity = (NfType::Scp, "scp1.operator.com".to_string());
+        let resp = SbiResponse::ok().with_header("Server", "custom-server/2.0");
+        let hyper_resp = convert_response_with_identity(resp, Some(&identity));
+        assert_eq!(
+            hyper_resp
+                .headers()
+                .get("server")
+                .and_then(|v| v.to_str().ok()),
+            Some("custom-server/2.0")
+        );
     }
 
     #[test]

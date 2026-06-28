@@ -889,11 +889,29 @@ pub struct SbiMessageParams {
     pub tai: Option<Tai>,
 }
 
+/// Serialize the ProblemDetails `type` member, defaulting to `about:blank`
+/// when unset (sbi-07).
+///
+/// TS 29.500 §5.2.7 / TS 29.571 §5.2.4.1 inherit RFC 7807, under which a
+/// missing `type` is semantically equivalent to `about:blank`. We make that
+/// explicit on the wire so peers and tooling always observe a well-formed
+/// problem type. Deserialization is unaffected (the field stays optional).
+fn serialize_problem_type<S>(value: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        Some(t) => serializer.serialize_str(t),
+        None => serializer.serialize_str("about:blank"),
+    }
+}
+
 /// Problem Details - RFC 7807 compliant error response
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProblemDetails {
-    /// A URI reference that identifies the problem type
-    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    /// A URI reference that identifies the problem type. Defaults to
+    /// `about:blank` on the wire when unset (TS 29.571 §5.2.4.1 / RFC 7807).
+    #[serde(rename = "type", default, serialize_with = "serialize_problem_type")]
     pub problem_type: Option<String>,
     /// A short, human-readable summary of the problem type
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -922,6 +940,25 @@ pub struct ProblemDetails {
     /// OAuth2 access token error details (TS 29.510 AccessTokenErr)
     #[serde(rename = "accessTokenError", skip_serializing_if = "Option::is_none")]
     pub access_token_error: Option<crate::oauth::AccessTokenError>,
+    /// OAuth2 access token request to be (re)tried by the consumer
+    /// (TS 29.571 §5.2.4.1, TS 29.510 AccessTokenReq).
+    #[serde(
+        rename = "accessTokenRequest",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub access_token_request: Option<crate::oauth::AccessTokenRequest>,
+    /// NF Instance ID of the NRF that returned an OAuth2 problem
+    /// (TS 29.571 §5.2.4.1 `nrfId`).
+    #[serde(rename = "nrfId", skip_serializing_if = "Option::is_none")]
+    pub nrf_id: Option<String>,
+    /// Target SCP apiRoot for indirect-communication redirection
+    /// (TS 29.571 §5.2.4.1 `targetScp`, TS 29.500 §6.10.9).
+    #[serde(rename = "targetScp", skip_serializing_if = "Option::is_none")]
+    pub target_scp: Option<String>,
+    /// Target SEPP apiRoot for inter-PLMN redirection
+    /// (TS 29.571 §5.2.4.1 `targetSepp`, TS 29.500 §6.10.9).
+    #[serde(rename = "targetSepp", skip_serializing_if = "Option::is_none")]
+    pub target_sepp: Option<String>,
 }
 
 impl ProblemDetails {
@@ -963,6 +1000,44 @@ impl ProblemDetails {
 
     pub fn with_access_token_error(mut self, error: crate::oauth::AccessTokenError) -> Self {
         self.access_token_error = Some(error);
+        self
+    }
+
+    /// Set an explicit problem `type` URI. When left unset, the `type` member
+    /// still serializes as `about:blank` (sbi-07).
+    pub fn with_type(mut self, problem_type: impl Into<String>) -> Self {
+        self.problem_type = Some(problem_type.into());
+        self
+    }
+
+    /// Attach the OAuth2 access token request the consumer should (re)try
+    /// (TS 29.571 `accessTokenRequest`).
+    pub fn with_access_token_request(
+        mut self,
+        request: crate::oauth::AccessTokenRequest,
+    ) -> Self {
+        self.access_token_request = Some(request);
+        self
+    }
+
+    /// Set the NRF instance ID that produced an OAuth2 problem
+    /// (TS 29.571 `nrfId`).
+    pub fn with_nrf_id(mut self, nrf_id: impl Into<String>) -> Self {
+        self.nrf_id = Some(nrf_id.into());
+        self
+    }
+
+    /// Set the target SCP apiRoot for an indirect-communication redirect
+    /// (TS 29.571 `targetScp`).
+    pub fn with_target_scp(mut self, target_scp: impl Into<String>) -> Self {
+        self.target_scp = Some(target_scp.into());
+        self
+    }
+
+    /// Set the target SEPP apiRoot for an inter-PLMN redirect
+    /// (TS 29.571 `targetSepp`).
+    pub fn with_target_sepp(mut self, target_sepp: impl Into<String>) -> Self {
+        self.target_sepp = Some(target_sepp.into());
         self
     }
 }
@@ -1217,6 +1292,67 @@ mod tests {
         assert!(!bare.contains("supportedFeatures"));
         assert!(!bare.contains("nfId"));
         assert!(!bare.contains("accessTokenError"));
+    }
+
+    #[test]
+    fn test_problem_details_default_type_about_blank() {
+        // sbi-07: with no explicit `type`, serialization emits about:blank.
+        let json = serde_json::to_string(&ProblemDetails::with_status(404)).unwrap();
+        assert!(
+            json.contains(r#""type":"about:blank""#),
+            "default type must be about:blank, got: {json}"
+        );
+
+        // An explicit type is preserved verbatim.
+        let typed = ProblemDetails::with_status(403)
+            .with_type("https://example.com/probs/oauth2");
+        let json = serde_json::to_string(&typed).unwrap();
+        assert!(json.contains(r#""type":"https://example.com/probs/oauth2""#));
+
+        // Round-trip: about:blank deserializes back into the optional field.
+        let bare = serde_json::to_string(&ProblemDetails::with_status(500)).unwrap();
+        let parsed: ProblemDetails = serde_json::from_str(&bare).unwrap();
+        assert_eq!(parsed.problem_type.as_deref(), Some("about:blank"));
+        assert_eq!(parsed.status, Some(500));
+    }
+
+    #[test]
+    fn test_problem_details_new_29571_members() {
+        // sbi-07: the added TS 29.571 members serialize with the spec member
+        // names and are absent when unset (additive).
+        let problem = ProblemDetails::with_status(307)
+            .with_nrf_id("nrf-1")
+            .with_target_scp("https://scp1.operator.com")
+            .with_target_sepp("https://sepp1.operator.com")
+            .with_access_token_request(crate::oauth::AccessTokenRequest {
+                grant_type: "client_credentials".to_string(),
+                nf_instance_id: "amf-1".to_string(),
+                nf_type: NfType::Amf,
+                target_nf_type: NfType::Udm,
+                scope: "nudm-sdm".to_string(),
+                target_nf_instance_id: None,
+            });
+        let json = serde_json::to_string(&problem).unwrap();
+        assert!(json.contains(r#""nrfId":"nrf-1""#));
+        assert!(json.contains(r#""targetScp":"https://scp1.operator.com""#));
+        assert!(json.contains(r#""targetSepp":"https://sepp1.operator.com""#));
+        assert!(json.contains(r#""accessTokenRequest""#));
+
+        // A spec example with the new members deserializes successfully.
+        let parsed: ProblemDetails = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.nrf_id.as_deref(), Some("nrf-1"));
+        assert_eq!(parsed.target_scp.as_deref(), Some("https://scp1.operator.com"));
+        assert_eq!(
+            parsed.access_token_request.unwrap().nf_instance_id,
+            "amf-1"
+        );
+
+        // Unset members are skipped entirely.
+        let bare = serde_json::to_string(&ProblemDetails::with_status(404)).unwrap();
+        assert!(!bare.contains("nrfId"));
+        assert!(!bare.contains("targetScp"));
+        assert!(!bare.contains("targetSepp"));
+        assert!(!bare.contains("accessTokenRequest"));
     }
 
     #[test]
