@@ -971,6 +971,63 @@ mod tests {
         );
     }
 
+    /// nas-06 Phase 0 drift bridge (security path): amfd's hand-rolled
+    /// `nas_5gs_security_encode` must produce the same protected frame as the
+    /// conformant ogs-nas `protect_nas_message`, and ogs-nas `unprotect` must
+    /// recover the body. amfd emits `EPD|SHT|MAC|SQN|ciphered`; ogs-nas emits
+    /// `MAC|SQN|ciphered`, so we compare after stripping the 2-octet EPD|SHT.
+    /// Pinned to access_type=1 (=> bearer 1 on both sides) and COUNT 0.
+    #[test]
+    fn drift_security_encode_matches_ogs_nas_protect() {
+        use ogs_nas::common::security::{
+            protect_nas_message, unprotect_nas_message, NasCount, NasSecurityContext,
+        };
+        use ogs_nas::common::types::SecurityAlgorithms;
+
+        // Representative plain inner downlink 5GMM body.
+        let body: [u8; 8] = [0x7e, 0x00, 0x5d, 0x02, 0x00, 0x02, 0xe0, 0xe1];
+
+        // amfd hand-rolled encode (downlink, integrity + ciphered, NEA2/NIA2).
+        let mut ue = create_test_ue();
+        let amfd = nas_5gs_security_encode(
+            &mut ue,
+            &body,
+            security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
+        )
+        .unwrap();
+
+        // ogs-nas protect with the same keys / algorithms / COUNT / direction.
+        let mut ctx = NasSecurityContext::new(
+            SecurityAlgorithms {
+                ciphering: ue.selected_enc_algorithm,
+                integrity: ue.selected_int_algorithm,
+            },
+            ue.knas_enc,
+            ue.knas_int,
+        );
+        ctx.dl_count = NasCount::new(0, 0); // amfd used COUNT 0 for this frame
+        let ogs = protect_nas_message(&mut ctx, 1, &body, true).unwrap();
+
+        // EPD|SHT (2 octets) stripped => byte-identical protected frames.
+        assert_eq!(
+            &amfd[2..],
+            &ogs[..],
+            "amfd security frame must equal ogs-nas protect (bytes 2..)"
+        );
+
+        // ogs-nas unprotect must recover the original plaintext body.
+        let mut rx = NasSecurityContext::new(
+            SecurityAlgorithms {
+                ciphering: ue.selected_enc_algorithm,
+                integrity: ue.selected_int_algorithm,
+            },
+            ue.knas_enc,
+            ue.knas_int,
+        );
+        let recovered = unprotect_nas_message(&mut rx, 1, &amfd[2..], true).unwrap();
+        assert_eq!(recovered, body, "ogs-nas must recover the amfd-protected body");
+    }
+
     #[test]
     fn test_nas_mac_calculate_nia2() {
         let key = [0x11u8; 16];
