@@ -16,10 +16,17 @@ pub struct NasSecurityContext {
     pub knas_enc: [u8; 16],
     /// NAS integrity key (Knas_int)
     pub knas_int: [u8; 16],
-    /// Downlink NAS COUNT
+    /// Downlink NAS COUNT — the largest downlink COUNT used in a successfully
+    /// integrity-checked message (TS 24.501 §4.4.3.1 high-water mark).
     pub dl_count: NasCount,
-    /// Uplink NAS COUNT
+    /// Uplink NAS COUNT — the largest uplink COUNT used in a successfully
+    /// integrity-checked message (high-water mark).
     pub ul_count: NasCount,
+    /// True once a downlink message has been successfully verified; gates the
+    /// replay check so the first (COUNT 0) message is not self-rejected.
+    dl_established: bool,
+    /// True once an uplink message has been successfully verified.
+    ul_established: bool,
 }
 
 impl NasSecurityContext {
@@ -31,6 +38,8 @@ impl NasSecurityContext {
             knas_int,
             dl_count: NasCount::default(),
             ul_count: NasCount::default(),
+            dl_established: false,
+            ul_established: false,
         }
     }
 
@@ -291,13 +300,52 @@ impl NasCount {
         }
     }
 
-    /// Set from sequence number (estimate overflow from current state)
+    /// Set from sequence number (estimate overflow from current state).
+    ///
+    /// Retained for API stability; the receive path now uses
+    /// [`NasCount::estimate`] + commit-on-verify (see `unprotect_nas_message`),
+    /// which does not mutate the stored COUNT until integrity is validated.
     pub fn set_sqn(&mut self, sqn: u8) {
         if sqn < self.sqn {
             // Overflow occurred
             self.overflow = (self.overflow + 1) & 0x00FFFFFF;
         }
         self.sqn = sqn;
+    }
+
+    /// Forward acceptance half-window over the 8-bit SQN space (TS 24.501
+    /// §4.4.3.1). With an 8-bit SQN a small forward jump and a large backward
+    /// jump are indistinguishable; we split at the midpoint (RFC 1982 style).
+    const FORWARD_WINDOW: u8 = 128;
+
+    /// Estimate the full NAS COUNT for a received 8-bit `sqn`, treating `self`
+    /// as the last successfully-verified COUNT (TS 24.501 §4.4.3.1). Pure —
+    /// mutates nothing. The forward distance `fwd = sqn - stored.sqn (mod 256)`
+    /// classifies the candidate:
+    /// - `fwd == 0`        → same COUNT as last accepted (replay of the latest);
+    /// - `fwd ∈ 1..=128`   → forward progress (overflow++ on the 255→0 wrap);
+    /// - `fwd ∈ 129..=255` → backward reorder/replay (candidate ≤ stored).
+    pub fn estimate(&self, sqn: u8) -> NasCount {
+        let fwd = sqn.wrapping_sub(self.sqn);
+        let overflow = if fwd == 0 {
+            self.overflow
+        } else if fwd <= Self::FORWARD_WINDOW {
+            // Forward; the only legitimate backward-looking SQN is the 255→0 wrap.
+            if sqn < self.sqn {
+                (self.overflow + 1) & 0x00FF_FFFF
+            } else {
+                self.overflow
+            }
+        } else {
+            // Backward reorder/replay: keep the candidate in or below the stored
+            // generation. Clamp at generation 0 (no prior generation exists).
+            if sqn > self.sqn && self.overflow > 0 {
+                (self.overflow - 1) & 0x00FF_FFFF
+            } else {
+                self.overflow
+            }
+        };
+        NasCount { overflow, sqn }
     }
 }
 
@@ -375,30 +423,49 @@ pub fn unprotect_nas_message(
     let sqn = message[4];
     let protected_message = &message[5..];
 
-    // Update count based on received sequence number
-    if direction == 0 {
-        ctx.ul_count.set_sqn(sqn);
+    // (1) Estimate the candidate COUNT into a temporary — do NOT mutate stored
+    //     state yet (TS 24.501 §4.4.3.3: update only after successful verify).
+    //     NasCount is Copy.
+    let (stored, established) = if direction == 0 {
+        (ctx.ul_count, ctx.ul_established)
     } else {
-        ctx.dl_count.set_sqn(sqn);
-    }
-
-    let count = if direction == 0 {
-        ctx.ul_count.value()
-    } else {
-        ctx.dl_count.value()
+        (ctx.dl_count, ctx.dl_established)
     };
+    let candidate = stored.estimate(sqn);
+    let count = candidate.value();
 
     let bearer = 1u8;
 
-    // Verify MAC over octet 7 to n (TS 24.501 §4.4.3.3 a): the Sequence
-    // Number octet (message[4]) followed by the NAS message IE.
+    // (2) Verify MAC over octet 7 to n (TS 24.501 §4.4.3.3 a): the Sequence
+    //     Number octet (message[4]) followed by the NAS message IE — using the
+    //     CANDIDATE count, BEFORE committing anything. On mismatch the stored
+    //     COUNT is left untouched, so a forged/replayed frame cannot desync it.
     let mac_input = &message[4..];
     let calculated_mac = ctx.calculate_mac(direction, bearer, count, mac_input)?;
     if received_mac != calculated_mac {
         return Err(NasError::MacVerificationFailed);
     }
 
-    // Decipher if needed
+    // (3) Replay protection (TS 24.501 §4.4.3.2): an integrity-valid frame whose
+    //     estimated COUNT is not strictly forward of the last-accepted COUNT is
+    //     a replay. Skipped (a) before the direction is established (bootstrap,
+    //     so the first COUNT-0 message is accepted) and (b) for 5G-IA0/NIA0,
+    //     where replay protection is not applicable (§4.4.3.2).
+    let integrity_active = ctx.algorithms.integrity != SecurityAlgorithms::INTEGRITY_NONE;
+    if established && integrity_active && candidate.value() <= stored.value() {
+        return Err(NasError::ReplayedSequenceNumber);
+    }
+
+    // (4) Commit the validated COUNT — only on success.
+    if direction == 0 {
+        ctx.ul_count = candidate;
+        ctx.ul_established = true;
+    } else {
+        ctx.dl_count = candidate;
+        ctx.dl_established = true;
+    }
+
+    // (5) Decipher with the validated count if needed.
     let plain_message = if ciphered {
         ctx.cipher(direction, bearer, count, protected_message)?
     } else {
@@ -458,6 +525,105 @@ mod tests {
         assert!(matches!(
             unprotect_nas_message(&mut rx, 0, &out, false),
             Err(NasError::MacVerificationFailed)
+        ));
+    }
+
+    // --- nas-03: verify-then-commit COUNT + replay protection ---
+
+    #[test]
+    fn test_estimate_forward_wrap_backward() {
+        // Forward in window.
+        let fwd = NasCount::new(0, 10).estimate(11);
+        assert_eq!((fwd.overflow, fwd.sqn), (0, 11));
+        // 255 -> 0 wrap increments the overflow.
+        let wrapped = NasCount::new(0, 255).estimate(0);
+        assert_eq!((wrapped.overflow, wrapped.sqn), (1, 0));
+        assert_eq!(wrapped.value(), 256);
+        // Backward (reorder/replay) stays in/below the stored generation.
+        assert!(NasCount::new(0, 50).estimate(49).value() < NasCount::new(0, 50).value());
+        // Equal SQN -> same COUNT.
+        assert_eq!(NasCount::new(0, 50).estimate(50).value(), 50);
+    }
+
+    #[test]
+    fn test_tampered_mac_leaves_count_unchanged() {
+        // Establish a downlink stream (direction 1): rx accepts msgs 0 and 1.
+        let mut tx = test_ctx();
+        let mut rx = test_ctx();
+        let f0 = protect_nas_message(&mut tx, 1, &[0x7e, 0x00, 0x01], false).unwrap();
+        let f1 = protect_nas_message(&mut tx, 1, &[0x7e, 0x00, 0x02], false).unwrap();
+        unprotect_nas_message(&mut rx, 1, &f0, false).unwrap();
+        unprotect_nas_message(&mut rx, 1, &f1, false).unwrap();
+        assert_eq!((rx.dl_count.overflow, rx.dl_count.sqn), (0, 1));
+        // Tamper a body byte of msg 2 -> MAC fails, stored COUNT untouched.
+        let mut f2 = protect_nas_message(&mut tx, 1, &[0x7e, 0x00, 0x03], false).unwrap();
+        let last = f2.len() - 1;
+        f2[last] ^= 0xFF;
+        assert!(matches!(
+            unprotect_nas_message(&mut rx, 1, &f2, false),
+            Err(NasError::MacVerificationFailed)
+        ));
+        assert_eq!((rx.dl_count.overflow, rx.dl_count.sqn), (0, 1));
+        assert!(rx.dl_established);
+    }
+
+    #[test]
+    fn test_replayed_sqn_rejected() {
+        let mut tx = test_ctx();
+        let mut rx = test_ctx();
+        let frames: Vec<_> = (0u8..3)
+            .map(|i| protect_nas_message(&mut tx, 1, &[0x7e, 0x00, i], false).unwrap())
+            .collect();
+        for f in &frames {
+            unprotect_nas_message(&mut rx, 1, f, false).unwrap();
+        }
+        assert_eq!((rx.dl_count.overflow, rx.dl_count.sqn), (0, 2));
+        // Replay an older in-window frame (SQN 0).
+        assert!(matches!(
+            unprotect_nas_message(&mut rx, 1, &frames[0], false),
+            Err(NasError::ReplayedSequenceNumber)
+        ));
+        // Replay the most-recent frame (SQN 2, candidate == stored).
+        assert!(matches!(
+            unprotect_nas_message(&mut rx, 1, &frames[2], false),
+            Err(NasError::ReplayedSequenceNumber)
+        ));
+        assert_eq!((rx.dl_count.overflow, rx.dl_count.sqn), (0, 2));
+    }
+
+    #[test]
+    fn test_in_order_across_wrap_advances_overflow() {
+        let mut rx = test_ctx();
+        rx.dl_count = NasCount::new(0, 254);
+        rx.dl_established = true;
+        // Frame for COUNT {0,255}.
+        let mut tx = test_ctx();
+        tx.dl_count = NasCount::new(0, 255);
+        let f255 = protect_nas_message(&mut tx, 1, &[0x7e, 0x00, 0x55], false).unwrap();
+        unprotect_nas_message(&mut rx, 1, &f255, false).unwrap();
+        assert_eq!((rx.dl_count.overflow, rx.dl_count.sqn), (0, 255));
+        // Frame for COUNT {1,0} (the wrap).
+        let mut tx2 = test_ctx();
+        tx2.dl_count = NasCount::new(1, 0);
+        let f256 = protect_nas_message(&mut tx2, 1, &[0x7e, 0x00, 0x56], false).unwrap();
+        unprotect_nas_message(&mut rx, 1, &f256, false).unwrap();
+        assert_eq!((rx.dl_count.overflow, rx.dl_count.sqn), (1, 0));
+        assert_eq!(rx.dl_count.value(), 256);
+    }
+
+    #[test]
+    fn test_bootstrap_first_message_then_replay() {
+        let mut tx = test_ctx();
+        let mut rx = test_ctx();
+        let f0 = protect_nas_message(&mut tx, 1, &[0x7e, 0x00, 0x01], false).unwrap();
+        // First message accepted despite stored == candidate == {0,0}.
+        unprotect_nas_message(&mut rx, 1, &f0, false).unwrap();
+        assert!(rx.dl_established);
+        assert_eq!((rx.dl_count.overflow, rx.dl_count.sqn), (0, 0));
+        // An immediate identical replay is now caught.
+        assert!(matches!(
+            unprotect_nas_message(&mut rx, 1, &f0, false),
+            Err(NasError::ReplayedSequenceNumber)
         ));
     }
 }

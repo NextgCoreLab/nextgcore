@@ -56,6 +56,11 @@ pub enum NasError {
     /// MAC verification failed
     #[error("MAC verification failed")]
     MacVerificationFailed,
+
+    /// Replayed or out-of-window (non-forward) NAS sequence number
+    /// (TS 24.501 §4.4.3.2 — a NAS COUNT is accepted at most once)
+    #[error("Replayed NAS sequence number")]
+    ReplayedSequenceNumber,
 }
 
 /// NAS result type
