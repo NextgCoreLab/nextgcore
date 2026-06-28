@@ -4,6 +4,9 @@
 
 use crate::context::{AmfUe, Guti5gs};
 use bytes::{BufMut, BytesMut};
+// nas-06: the conformant 5GMM encoder library. amfd is migrating its hand-rolled
+// builders onto ogs-nas message-by-message (Phase 1 = the cause-only builders).
+use ogs_nas::fiveg::message as ogs_msg;
 
 // ============================================================================
 // Constants
@@ -407,19 +410,18 @@ pub fn encode_nssai_value(snssais: &[crate::context::SNssai]) -> Vec<u8> {
     data
 }
 
-/// Build Registration Reject message
+/// Build Registration Reject message (TS 24.501 Section 8.2.8).
+///
+/// nas-06 Phase 1: encoded via the conformant `ogs-nas` library. Byte-identical
+/// to the previous hand-rolled output (plain header + mandatory 5GMM cause; the
+/// optional T3346/T3502/EAP IEs are not emitted by amfd). Locked by
+/// `drift_registration_reject_through_ogs_nas` and `golden_registration_reject`.
 pub fn build_registration_reject(gmm_cause: GmmCause) -> Vec<u8> {
-    let mut builder = NasMessageBuilder::new();
-
-    // GMM header (plain NAS message)
-    builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
-    builder.write_u8(0); // Security header type (plain)
-    builder.write_message_type(message_type::REGISTRATION_REJECT);
-
-    // 5GMM cause (mandatory)
-    builder.write_u8(gmm_cause as u8);
-
-    builder.build()
+    let msg = ogs_msg::FiveGmmMessage::RegistrationReject(ogs_msg::RegistrationReject {
+        gmm_cause: gmm_cause as u8,
+        ..Default::default()
+    });
+    ogs_msg::build_5gmm_message(&msg).to_vec()
 }
 
 /// Build Security Mode Reject message (TS 24.501 Section 8.2.27).
@@ -428,17 +430,13 @@ pub fn build_registration_reject(gmm_cause: GmmCause) -> Vec<u8> {
 /// e.g. on detection of a UE-security-capabilities mismatch / bidding-down
 /// attack (TS 33.501 Section 6.7.2 → 5GMM cause #23).
 pub fn build_security_mode_reject(gmm_cause: GmmCause) -> Vec<u8> {
-    let mut builder = NasMessageBuilder::new();
-
-    // GMM header (plain NAS message)
-    builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
-    builder.write_u8(security_header::PLAIN_NAS_MESSAGE);
-    builder.write_message_type(message_type::SECURITY_MODE_REJECT);
-
-    // 5GMM cause (mandatory)
-    builder.write_u8(gmm_cause as u8);
-
-    builder.build()
+    // nas-06 Phase 1: encoded via ogs-nas (plain header + mandatory 5GMM cause).
+    // Byte-identical to the prior hand-rolled output; locked by
+    // `drift_security_mode_reject_through_ogs_nas` + `golden_security_mode_reject`.
+    let msg = ogs_msg::FiveGmmMessage::SecurityModeReject(ogs_msg::SecurityModeReject {
+        gmm_cause: gmm_cause as u8,
+    });
+    ogs_msg::build_5gmm_message(&msg).to_vec()
 }
 
 /// Build Service Accept message (plain inner; wrap with nas_5gs_security_encode)
@@ -572,16 +570,17 @@ pub fn build_authentication_request(amf_ue: &AmfUe) -> Vec<u8> {
     builder.build()
 }
 
-/// Build Authentication Reject message
+/// Build Authentication Reject message (TS 24.501 Section 8.2.4).
+///
+/// nas-06 Phase 1: encoded via ogs-nas. amfd never carries the optional EAP
+/// message IE, so the output is the bare plain header — byte-identical to the
+/// prior hand-rolled output. Locked by `drift_authentication_reject_through_ogs_nas`
+/// + `golden_authentication_reject`.
 pub fn build_authentication_reject() -> Vec<u8> {
-    let mut builder = NasMessageBuilder::new();
-
-    // GMM header (plain NAS message)
-    builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
-    builder.write_u8(0); // Security header type (plain)
-    builder.write_message_type(message_type::AUTHENTICATION_REJECT);
-
-    builder.build()
+    let msg = ogs_msg::FiveGmmMessage::AuthenticationReject(ogs_msg::AuthenticationReject {
+        eap_message: None,
+    });
+    ogs_msg::build_5gmm_message(&msg).to_vec()
 }
 
 /// Build Security Mode Command message (TS 24.501 Section 8.2.25)
@@ -712,19 +711,16 @@ pub fn build_dl_nas_transport(
     Some(builder.build())
 }
 
-/// Build 5GMM Status message (plain inner; wrap with nas_5gs_security_encode)
+/// Build 5GMM Status message (plain inner; wrap with nas_5gs_security_encode).
+///
+/// nas-06 Phase 1: encoded via ogs-nas (plain header + mandatory 5GMM cause).
+/// Byte-identical to the prior hand-rolled output; locked by
+/// `drift_gmm_status_through_ogs_nas` + `golden_gmm_status`.
 pub fn build_gmm_status(gmm_cause: GmmCause) -> Option<Vec<u8>> {
-    let mut builder = NasMessageBuilder::new();
-
-    // GMM header (plain inner message)
-    builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
-    builder.write_u8(security_header::PLAIN_NAS_MESSAGE);
-    builder.write_message_type(message_type::GMM_STATUS);
-
-    // 5GMM cause (mandatory)
-    builder.write_u8(gmm_cause as u8);
-
-    Some(builder.build())
+    let msg = ogs_msg::FiveGmmMessage::FiveGmmStatus(ogs_msg::FiveGmmStatus {
+        gmm_cause: gmm_cause as u8,
+    });
+    Some(ogs_msg::build_5gmm_message(&msg).to_vec())
 }
 
 // ============================================================================
@@ -1007,6 +1003,53 @@ mod tests {
         let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
         assert!(matches!(parsed, FiveGmmMessage::RegistrationAccept(_)));
         assert_drift_roundtrip(&amfd, "RegistrationAccept(minimal)");
+    }
+
+    // ------------------------------------------------------------------
+    // nas-06 Phase 1: golden wire vectors for the migrated cause-only builders.
+    //
+    // These pin the EXACT bytes the (now ogs-nas-backed) builders emit. They are
+    // the pre-migration ground truth — hand-rolled output for these four messages
+    // was a plain 3-byte 5GMM header (EPD 0x7E, SHT 0x00, msg-type) followed by the
+    // single mandatory 5GMM-cause octet (none for Authentication Reject). The drift
+    // tests above already prove ogs-nas round-trips amfd's bytes; these guard the
+    // absolute wire image so a future ogs-nas encoding change cannot silently shift
+    // amfd's output without tripping CI.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn golden_authentication_reject() {
+        // EPD | SHT(plain) | AUTHENTICATION REJECT (0x58); no EAP IE.
+        assert_eq!(build_authentication_reject(), vec![0x7e, 0x00, 0x58]);
+    }
+
+    #[test]
+    fn golden_registration_reject() {
+        // EPD | SHT(plain) | REGISTRATION REJECT (0x44) | 5GMM cause.
+        assert_eq!(
+            build_registration_reject(GmmCause::PlmnNotAllowed),
+            vec![0x7e, 0x00, 0x44, 11]
+        );
+    }
+
+    #[test]
+    fn golden_security_mode_reject() {
+        // EPD | SHT(plain) | SECURITY MODE REJECT (0x5f) | 5GMM cause.
+        assert_eq!(
+            build_security_mode_reject(GmmCause::UeSecurityCapabilitiesMismatch),
+            vec![0x7e, 0x00, 0x5f, 23]
+        );
+    }
+
+    #[test]
+    fn golden_gmm_status() {
+        // EPD | SHT(plain) | 5GMM STATUS (0x64) | 5GMM cause.
+        // ProtocolErrorUnspecified is 3GPP cause #111 (0x6f) — distinct from the
+        // From<u8> fallback (which maps *unknown* octets like 255 onto this enum).
+        assert_eq!(
+            build_gmm_status(GmmCause::ProtocolErrorUnspecified),
+            Some(vec![0x7e, 0x00, 0x64, 111])
+        );
     }
 
     #[test]
