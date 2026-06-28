@@ -3336,6 +3336,409 @@ impl PfdPartialFailureInformation {
     }
 }
 
+/// FQ-CSID Node-ID Type (TS 29.244 §8.2.43, octet 5 bits 8-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FqCsidNodeIdType {
+    /// Node-Address is a 4-octet global-unicast IPv4 address.
+    Ipv4 = 0,
+    /// Node-Address is a 16-octet global-unicast IPv6 address.
+    Ipv6 = 1,
+    /// 4-octet field: most-significant 20 bits = MCC*1000 + MNC, least-
+    /// significant 12 bits = operator-assigned value.
+    Other = 2,
+}
+
+impl TryFrom<u8> for FqCsidNodeIdType {
+    type Error = PfcpError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Ipv4),
+            1 => Ok(Self::Ipv6),
+            2 => Ok(Self::Other),
+            _ => Err(PfcpError::InvalidFormat(format!(
+                "FQ-CSID Node-ID Type {value}"
+            ))),
+        }
+    }
+}
+
+/// FQ-CSID Node Type (TS 29.244 §8.2.43, Table 8.2.43-2, octet q+2 bits 4-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FqCsidNodeType {
+    Mme = 0,
+    SgwC = 1,
+    PgwCSmf = 2,
+    Epdg = 3,
+    Twan = 4,
+    PgwUSgwUUpf = 5,
+}
+
+impl TryFrom<u8> for FqCsidNodeType {
+    type Error = PfcpError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::Mme),
+            1 => Ok(Self::SgwC),
+            2 => Ok(Self::PgwCSmf),
+            3 => Ok(Self::Epdg),
+            4 => Ok(Self::Twan),
+            5 => Ok(Self::PgwUSgwUUpf),
+            _ => Err(PfcpError::InvalidFormat(format!(
+                "FQ-CSID Node Type {value}"
+            ))),
+        }
+    }
+}
+
+/// FQ-CSID (TS 29.244 §8.2.43, IE type 65). Octet 5 packs the Node-ID Type
+/// (bits 8-5) and the Number of CSIDs (bits 4-1); the Node-Address follows
+/// (4 octets for Ipv4/Other, 16 for Ipv6); then each 2-octet CSID; then a
+/// trailing octet whose low nibble is the Node Type (Table 8.2.43-2). The
+/// Node Type octet is normative in TS 29.244 (k00) but legacy senders /
+/// GTPv2 omit it, so decode tolerates its absence (`node_type = None`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FqCsid {
+    pub node_id_type: FqCsidNodeIdType,
+    pub ipv4_addr: Option<[u8; 4]>,
+    pub ipv6_addr: Option<[u8; 16]>,
+    pub csids: Vec<u16>,
+    pub node_type: Option<FqCsidNodeType>,
+}
+
+impl FqCsid {
+    /// IPv4 FQ-CSID with the (normative) Node Type octet present.
+    pub fn new_ipv4(addr: [u8; 4], csids: Vec<u16>, node_type: FqCsidNodeType) -> Self {
+        Self {
+            node_id_type: FqCsidNodeIdType::Ipv4,
+            ipv4_addr: Some(addr),
+            ipv6_addr: None,
+            csids,
+            node_type: Some(node_type),
+        }
+    }
+
+    /// IPv6 FQ-CSID with the (normative) Node Type octet present.
+    pub fn new_ipv6(addr: [u8; 16], csids: Vec<u16>, node_type: FqCsidNodeType) -> Self {
+        Self {
+            node_id_type: FqCsidNodeIdType::Ipv6,
+            ipv4_addr: None,
+            ipv6_addr: Some(addr),
+            csids,
+            node_type: Some(node_type),
+        }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        // Number of CSIDs is a 4-bit field; cap at 15.
+        let n = self.csids.len().min(0x0F);
+        buf.put_u8(((self.node_id_type as u8) << 4) | (n as u8));
+
+        match self.node_id_type {
+            FqCsidNodeIdType::Ipv4 | FqCsidNodeIdType::Other => {
+                if let Some(addr) = &self.ipv4_addr {
+                    buf.put_slice(addr);
+                }
+            }
+            FqCsidNodeIdType::Ipv6 => {
+                if let Some(addr) = &self.ipv6_addr {
+                    buf.put_slice(addr);
+                }
+            }
+        }
+
+        for csid in self.csids.iter().take(n) {
+            buf.put_u16(*csid);
+        }
+
+        if let Some(node_type) = self.node_type {
+            buf.put_u8((node_type as u8) & 0x0F);
+        }
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        let mut buf = Bytes::copy_from_slice(data);
+        if buf.remaining() < 1 {
+            return Err(PfcpError::BufferTooShort {
+                needed: 1,
+                available: buf.remaining(),
+            });
+        }
+        let octet5 = buf.get_u8();
+        let node_id_type = FqCsidNodeIdType::try_from(octet5 >> 4)?;
+        let num_csids = (octet5 & 0x0F) as usize;
+
+        let mut ipv4_addr = None;
+        let mut ipv6_addr = None;
+        match node_id_type {
+            FqCsidNodeIdType::Ipv4 | FqCsidNodeIdType::Other => {
+                if buf.remaining() < 4 {
+                    return Err(PfcpError::BufferTooShort {
+                        needed: 4,
+                        available: buf.remaining(),
+                    });
+                }
+                let mut a = [0u8; 4];
+                buf.copy_to_slice(&mut a);
+                ipv4_addr = Some(a);
+            }
+            FqCsidNodeIdType::Ipv6 => {
+                if buf.remaining() < 16 {
+                    return Err(PfcpError::BufferTooShort {
+                        needed: 16,
+                        available: buf.remaining(),
+                    });
+                }
+                let mut a = [0u8; 16];
+                buf.copy_to_slice(&mut a);
+                ipv6_addr = Some(a);
+            }
+        }
+
+        let mut csids = Vec::with_capacity(num_csids);
+        for _ in 0..num_csids {
+            if buf.remaining() < 2 {
+                return Err(PfcpError::BufferTooShort {
+                    needed: 2,
+                    available: buf.remaining(),
+                });
+            }
+            csids.push(buf.get_u16());
+        }
+
+        // Trailing Node Type octet is normative but legacy senders omit it;
+        // tolerate absence and ignore reserved values (6-15 => None).
+        let node_type = if buf.remaining() >= 1 {
+            FqCsidNodeType::try_from(buf.get_u8() & 0x0F).ok()
+        } else {
+            None
+        };
+
+        Ok(Self {
+            node_id_type,
+            ipv4_addr,
+            ipv6_addr,
+            csids,
+            node_type,
+        })
+    }
+}
+
+/// Group Id (TS 29.244 §8.2.198, IE type 291). Opaque octet string.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GroupId(pub Vec<u8>);
+
+impl GroupId {
+    pub fn new(value: impl Into<Vec<u8>>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_slice(&self.0);
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        Ok(Self(data.to_vec()))
+    }
+}
+
+/// CP IP Address (TS 29.244 §8.2.199, IE type 292). Octet 5 flags: bit 1 = V6,
+/// bit 2 = V4; the IPv4 address (when present) precedes the IPv6 address.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CpIpAddress {
+    pub ipv4: Option<[u8; 4]>,
+    pub ipv6: Option<[u8; 16]>,
+}
+
+impl CpIpAddress {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        let flags = (self.ipv6.is_some() as u8) | ((self.ipv4.is_some() as u8) << 1);
+        buf.put_u8(flags);
+        if let Some(addr) = &self.ipv4 {
+            buf.put_slice(addr);
+        }
+        if let Some(addr) = &self.ipv6 {
+            buf.put_slice(addr);
+        }
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        let mut buf = Bytes::copy_from_slice(data);
+        if buf.remaining() < 1 {
+            return Err(PfcpError::BufferTooShort {
+                needed: 1,
+                available: 0,
+            });
+        }
+        let flags = buf.get_u8();
+        let mut out = CpIpAddress::default();
+        if flags & 0x02 != 0 {
+            if buf.remaining() < 4 {
+                return Err(PfcpError::BufferTooShort {
+                    needed: 4,
+                    available: buf.remaining(),
+                });
+            }
+            let mut a = [0u8; 4];
+            buf.copy_to_slice(&mut a);
+            out.ipv4 = Some(a);
+        }
+        if flags & 0x01 != 0 {
+            if buf.remaining() < 16 {
+                return Err(PfcpError::BufferTooShort {
+                    needed: 16,
+                    available: buf.remaining(),
+                });
+            }
+            let mut a = [0u8; 16];
+            buf.copy_to_slice(&mut a);
+            out.ipv6 = Some(a);
+        }
+        Ok(out)
+    }
+}
+
+/// Alternative SMF IP Address (TS 29.244 §8.2.129, IE type 178). Octet 5
+/// flags: bit 1 = V6, bit 2 = V4, bit 3 = PPE (PFCP Pull Equivalent); the
+/// IPv4 address (when present) precedes the IPv6 address.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AlternativeSmfIpAddress {
+    pub ipv4: Option<[u8; 4]>,
+    pub ipv6: Option<[u8; 16]>,
+    pub ppe: bool,
+}
+
+impl AlternativeSmfIpAddress {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        let flags = (self.ipv6.is_some() as u8)
+            | ((self.ipv4.is_some() as u8) << 1)
+            | ((self.ppe as u8) << 2);
+        buf.put_u8(flags);
+        if let Some(addr) = &self.ipv4 {
+            buf.put_slice(addr);
+        }
+        if let Some(addr) = &self.ipv6 {
+            buf.put_slice(addr);
+        }
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        let mut buf = Bytes::copy_from_slice(data);
+        if buf.remaining() < 1 {
+            return Err(PfcpError::BufferTooShort {
+                needed: 1,
+                available: 0,
+            });
+        }
+        let flags = buf.get_u8();
+        let mut out = AlternativeSmfIpAddress {
+            ppe: flags & 0x04 != 0,
+            ..Default::default()
+        };
+        if flags & 0x02 != 0 {
+            if buf.remaining() < 4 {
+                return Err(PfcpError::BufferTooShort {
+                    needed: 4,
+                    available: buf.remaining(),
+                });
+            }
+            let mut a = [0u8; 4];
+            buf.copy_to_slice(&mut a);
+            out.ipv4 = Some(a);
+        }
+        if flags & 0x01 != 0 {
+            if buf.remaining() < 16 {
+                return Err(PfcpError::BufferTooShort {
+                    needed: 16,
+                    available: buf.remaining(),
+                });
+            }
+            let mut a = [0u8; 16];
+            buf.copy_to_slice(&mut a);
+            out.ipv6 = Some(a);
+        }
+        Ok(out)
+    }
+}
+
+/// PFCP Session Change Info (TS 29.244 §7.4.7.1, Table 7.4.7.1-2, IE type
+/// 290). Grouped IE inside Session Set Modification Request: zero or more
+/// PGW-C/SMF FQ-CSID / Group Id / CP IP Address IEs plus a mandatory
+/// Alternative SMF IP Address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PfcpSessionChangeInfo {
+    pub pgw_c_smf_fq_csids: Vec<FqCsid>,
+    pub group_ids: Vec<GroupId>,
+    pub cp_ip_addresses: Vec<CpIpAddress>,
+    pub alternative_smf_ip_address: AlternativeSmfIpAddress,
+}
+
+impl PfcpSessionChangeInfo {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{IeHeader, IeType};
+        for fq in &self.pgw_c_smf_fq_csids {
+            let mut inner = BytesMut::new();
+            fq.encode(&mut inner);
+            IeHeader::new(IeType::FqCsid as u16, inner.len() as u16).encode(buf);
+            buf.put_slice(&inner);
+        }
+        for gid in &self.group_ids {
+            let mut inner = BytesMut::new();
+            gid.encode(&mut inner);
+            IeHeader::new(IeType::GroupId as u16, inner.len() as u16).encode(buf);
+            buf.put_slice(&inner);
+        }
+        for cp in &self.cp_ip_addresses {
+            let mut inner = BytesMut::new();
+            cp.encode(&mut inner);
+            IeHeader::new(IeType::CpIpAddress as u16, inner.len() as u16).encode(buf);
+            buf.put_slice(&inner);
+        }
+        let mut inner = BytesMut::new();
+        self.alternative_smf_ip_address.encode(&mut inner);
+        IeHeader::new(IeType::AlternativeSmfIpAddress as u16, inner.len() as u16).encode(buf);
+        buf.put_slice(&inner);
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        use crate::ie::{IeType, RawIe};
+        let mut buf = Bytes::copy_from_slice(data);
+        let mut pgw_c_smf_fq_csids = Vec::new();
+        let mut group_ids = Vec::new();
+        let mut cp_ip_addresses = Vec::new();
+        let mut alternative_smf_ip_address = None;
+        while buf.remaining() >= 4 {
+            let ie = RawIe::decode(&mut buf)?;
+            match ie.ie_type {
+                t if t == IeType::FqCsid as u16 => {
+                    pgw_c_smf_fq_csids.push(FqCsid::decode(&ie.data)?);
+                }
+                t if t == IeType::GroupId as u16 => {
+                    group_ids.push(GroupId::decode(&ie.data)?);
+                }
+                t if t == IeType::CpIpAddress as u16 => {
+                    cp_ip_addresses.push(CpIpAddress::decode(&ie.data)?);
+                }
+                t if t == IeType::AlternativeSmfIpAddress as u16 => {
+                    alternative_smf_ip_address = Some(AlternativeSmfIpAddress::decode(&ie.data)?);
+                }
+                _ => {}
+            }
+        }
+        Ok(Self {
+            pgw_c_smf_fq_csids,
+            group_ids,
+            cp_ip_addresses,
+            alternative_smf_ip_address: alternative_smf_ip_address.ok_or_else(|| {
+                PfcpError::MissingMandatoryIe("Alternative SMF IP Address".to_string())
+            })?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3851,5 +4254,152 @@ mod tests {
         info.encode(&mut buf);
         let decoded = PfdPartialFailureInformation::decode(&buf.freeze()).unwrap();
         assert_eq!(decoded, info);
+    }
+
+    #[test]
+    fn test_fq_csid_ipv4_byte_vector() {
+        // TS 29.244 §8.2.43: IPv4 node-id 10.45.0.1, one CSID 0x0102, Node
+        // Type PGW-C/SMF(2). Body = octet5(type<<4|count) + addr + csid + node-type.
+        let fq = FqCsid::new_ipv4([10, 45, 0, 1], vec![0x0102], FqCsidNodeType::PgwCSmf);
+        let mut buf = BytesMut::new();
+        fq.encode(&mut buf);
+        assert_eq!(
+            buf.as_ref(),
+            &[
+                0x01, // Node-ID Type=0 (IPv4) | Number of CSIDs=1
+                0x0A, 0x2D, 0x00, 0x01, // node address 10.45.0.1
+                0x01, 0x02, // CSID 0x0102
+                0x02, // Spare(0) | Node Type=2 (PGW-C/SMF)
+            ]
+        );
+        assert_eq!(FqCsid::decode(&buf.freeze()).unwrap(), fq);
+    }
+
+    #[test]
+    fn test_fq_csid_ipv6_multi_csid_round_trip() {
+        let fq = FqCsid::new_ipv6([0x20; 16], vec![0x0001, 0x0002, 0x0003], FqCsidNodeType::Mme);
+        let mut buf = BytesMut::new();
+        fq.encode(&mut buf);
+        // octet5 = type1<<4 | 3 = 0x13, then 16 addr octets, 3x2 CSIDs, node-type.
+        assert_eq!(buf[0], 0x13);
+        assert_eq!(buf.len(), 1 + 16 + 6 + 1);
+        assert_eq!(FqCsid::decode(&buf.freeze()).unwrap(), fq);
+    }
+
+    #[test]
+    fn test_fq_csid_legacy_no_node_type_octet() {
+        // Legacy short form (no trailing Node Type octet) must decode with
+        // node_type = None and the CSID intact.
+        let bytes = [0x01u8, 0x0A, 0x2D, 0x00, 0x01, 0x01, 0x02];
+        let fq = FqCsid::decode(&bytes).unwrap();
+        assert_eq!(fq.node_id_type, FqCsidNodeIdType::Ipv4);
+        assert_eq!(fq.ipv4_addr, Some([10, 45, 0, 1]));
+        assert_eq!(fq.csids, vec![0x0102]);
+        assert_eq!(fq.node_type, None);
+    }
+
+    #[test]
+    fn test_fq_csid_truncated_csid_rejected() {
+        // Count nibble says 1 CSID but only 1 trailing octet (need 2).
+        let bytes = [0x01u8, 0x0A, 0x2D, 0x00, 0x01, 0x01];
+        assert!(matches!(
+            FqCsid::decode(&bytes),
+            Err(PfcpError::BufferTooShort { .. })
+        ));
+    }
+
+    #[test]
+    fn test_cp_ip_address_round_trip() {
+        for cp in [
+            CpIpAddress {
+                ipv4: Some([10, 45, 0, 1]),
+                ipv6: None,
+            },
+            CpIpAddress {
+                ipv4: None,
+                ipv6: Some([0x11; 16]),
+            },
+            CpIpAddress {
+                ipv4: Some([1, 2, 3, 4]),
+                ipv6: Some([0x22; 16]),
+            },
+        ] {
+            let mut buf = BytesMut::new();
+            cp.encode(&mut buf);
+            // V4 flag = bit2 (0x02), V6 flag = bit1 (0x01).
+            let expected_flags =
+                (cp.ipv6.is_some() as u8) | ((cp.ipv4.is_some() as u8) << 1);
+            assert_eq!(buf[0], expected_flags);
+            assert_eq!(CpIpAddress::decode(&buf.freeze()).unwrap(), cp);
+        }
+    }
+
+    #[test]
+    fn test_alternative_smf_ip_address_round_trip() {
+        for alt in [
+            AlternativeSmfIpAddress {
+                ipv4: Some([10, 45, 0, 1]),
+                ipv6: None,
+                ppe: false,
+            },
+            AlternativeSmfIpAddress {
+                ipv4: Some([10, 45, 0, 1]),
+                ipv6: Some([0x33; 16]),
+                ppe: true,
+            },
+        ] {
+            let mut buf = BytesMut::new();
+            alt.encode(&mut buf);
+            assert_eq!((buf[0] & 0x04 != 0), alt.ppe);
+            assert_eq!(AlternativeSmfIpAddress::decode(&buf.freeze()).unwrap(), alt);
+        }
+    }
+
+    #[test]
+    fn test_group_id_round_trip() {
+        let gid = GroupId::new(b"group-7".to_vec());
+        let mut buf = BytesMut::new();
+        gid.encode(&mut buf);
+        assert_eq!(buf.as_ref(), b"group-7");
+        assert_eq!(GroupId::decode(&buf.freeze()).unwrap(), gid);
+    }
+
+    #[test]
+    fn test_pfcp_session_change_info_round_trip() {
+        let info = PfcpSessionChangeInfo {
+            pgw_c_smf_fq_csids: vec![FqCsid::new_ipv4(
+                [10, 45, 0, 1],
+                vec![0x0102],
+                FqCsidNodeType::PgwCSmf,
+            )],
+            group_ids: vec![GroupId::new(b"g1".to_vec())],
+            cp_ip_addresses: vec![CpIpAddress {
+                ipv4: Some([10, 45, 0, 2]),
+                ipv6: None,
+            }],
+            alternative_smf_ip_address: AlternativeSmfIpAddress {
+                ipv4: Some([10, 45, 0, 3]),
+                ipv6: None,
+                ppe: false,
+            },
+        };
+        let mut buf = BytesMut::new();
+        info.encode(&mut buf);
+        assert_eq!(PfcpSessionChangeInfo::decode(&buf.freeze()).unwrap(), info);
+    }
+
+    #[test]
+    fn test_pfcp_session_change_info_missing_alternative_smf_rejected() {
+        // Alternative SMF IP Address is mandatory inside the grouped IE.
+        let mut buf = BytesMut::new();
+        let mut inner = BytesMut::new();
+        GroupId::new(b"g1".to_vec()).encode(&mut inner);
+        crate::ie::IeHeader::new(crate::ie::IeType::GroupId as u16, inner.len() as u16)
+            .encode(&mut buf);
+        buf.put_slice(&inner);
+        assert!(matches!(
+            PfcpSessionChangeInfo::decode(&buf.freeze()),
+            Err(PfcpError::MissingMandatoryIe(_))
+        ));
     }
 }

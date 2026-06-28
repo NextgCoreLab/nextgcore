@@ -264,6 +264,9 @@ pub enum IeType {
     NfInstanceId = 253,
     EthernetContextInformation = 254,
     RedundantTransmissionParameters = 255,
+    PfcpSessionChangeInfo = 290,
+    GroupId = 291,
+    CpIpAddress = 292,
     PfdPartialFailureInformation = 397,
 }
 
@@ -325,6 +328,7 @@ impl TryFrom<u16> for IeType {
             62 => Ok(Self::MeasurementMethod),
             63 => Ok(Self::UsageReportTrigger),
             64 => Ok(Self::MeasurementPeriod),
+            65 => Ok(Self::FqCsid),
             66 => Ok(Self::VolumeMeasurement),
             67 => Ok(Self::DurationMeasurement),
             69 => Ok(Self::TimeOfFirstPacket),
@@ -359,7 +363,11 @@ impl TryFrom<u16> for IeType {
             159 => Ok(Self::ApnDnn),
             160 => Ok(Self::ThreeGppInterfaceType),
             161 => Ok(Self::PfcpSrreqFlags),
+            178 => Ok(Self::AlternativeSmfIpAddress),
             253 => Ok(Self::NfInstanceId),
+            290 => Ok(Self::PfcpSessionChangeInfo),
+            291 => Ok(Self::GroupId),
+            292 => Ok(Self::CpIpAddress),
             _ => Err(PfcpError::InvalidIeType(value)),
         }
     }

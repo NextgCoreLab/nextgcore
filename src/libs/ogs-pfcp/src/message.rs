@@ -7,9 +7,9 @@ use crate::header::{PfcpHeader, PfcpMessageType};
 use crate::ie::{encode_u16_ie, encode_u32_ie, encode_u8_ie, IeHeader, IeType, RawIe};
 use crate::types::{
     ApplicationIdsPfds, CpFunctionFeatures, CreateBar, CreateFar, CreatePdr, CreateQer, CreateUrr,
-    DownlinkDataReport, FSeid, GracefulReleasePeriod, NodeId, NodeReportType,
-    PfcpAssociationReleaseRequest, PfcpCause, PfdPartialFailureInformation, RemoveFar, RemovePdr,
-    ReportType, UpFunctionFeatures, UpdateFar, UpdatePdr, UsageReportSrr,
+    DownlinkDataReport, FSeid, FqCsid, GracefulReleasePeriod, NodeId, NodeReportType,
+    PfcpAssociationReleaseRequest, PfcpCause, PfcpSessionChangeInfo, PfdPartialFailureInformation,
+    RemoveFar, RemovePdr, ReportType, UpFunctionFeatures, UpdateFar, UpdatePdr, UsageReportSrr,
     UserPlanePathFailureReport,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -1497,6 +1497,223 @@ impl PfdManagementResponse {
     }
 }
 
+/// PFCP Session Set Deletion Request (TS 29.244 §7.4.6.1, message type 14).
+/// Node-level (no SEID): mandatory Node ID plus zero or more FQ-CSID IEs (the
+/// six per-node-type slots all share IE type 65 and are disambiguated by the
+/// Node Type field inside each FQ-CSID).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSetDeletionRequest {
+    pub node_id: NodeId,
+    pub fq_csids: Vec<FqCsid>,
+}
+
+impl SessionSetDeletionRequest {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        let mut nb = BytesMut::new();
+        self.node_id.encode(&mut nb);
+        IeHeader::new(IeType::NodeId as u16, nb.len() as u16).encode(buf);
+        buf.put_slice(&nb);
+
+        for fq in &self.fq_csids {
+            let mut inner = BytesMut::new();
+            fq.encode(&mut inner);
+            IeHeader::new(IeType::FqCsid as u16, inner.len() as u16).encode(buf);
+            buf.put_slice(&inner);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        let mut node_id = None;
+        let mut fq_csids = Vec::new();
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::NodeId as u16 => {
+                    let mut data = ie.data;
+                    node_id = Some(NodeId::decode(&mut data)?);
+                }
+                t if t == IeType::FqCsid as u16 => {
+                    fq_csids.push(FqCsid::decode(&ie.data)?);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            node_id: node_id
+                .ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?,
+            fq_csids,
+        })
+    }
+}
+
+/// PFCP Session Set Deletion Response (TS 29.244 §7.4.6.2, message type 15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSetDeletionResponse {
+    pub node_id: NodeId,
+    pub cause: PfcpCause,
+    pub offending_ie: Option<u16>,
+}
+
+impl SessionSetDeletionResponse {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        let mut nb = BytesMut::new();
+        self.node_id.encode(&mut nb);
+        IeHeader::new(IeType::NodeId as u16, nb.len() as u16).encode(buf);
+        buf.put_slice(&nb);
+
+        encode_u8_ie(buf, IeType::Cause, self.cause as u8);
+
+        if let Some(offending) = self.offending_ie {
+            encode_u16_ie(buf, IeType::OffendingIe, offending);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        let mut node_id = None;
+        let mut cause = None;
+        let mut offending_ie = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::NodeId as u16 => {
+                    let mut data = ie.data;
+                    node_id = Some(NodeId::decode(&mut data)?);
+                }
+                t if t == IeType::Cause as u16 => {
+                    if !ie.data.is_empty() {
+                        cause = Some(PfcpCause::try_from(ie.data[0])?);
+                    }
+                }
+                t if t == IeType::OffendingIe as u16 => {
+                    if ie.data.len() >= 2 {
+                        let mut data = ie.data;
+                        offending_ie = Some(data.get_u16());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            node_id: node_id
+                .ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?,
+            cause: cause.ok_or_else(|| PfcpError::MissingMandatoryIe("Cause".to_string()))?,
+            offending_ie,
+        })
+    }
+}
+
+/// PFCP Session Set Modification Request (TS 29.244 §7.4.7.1, message type 16).
+/// Node-level: mandatory Node ID plus one or more PFCP Session Change Info
+/// grouped IEs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSetModificationRequest {
+    pub node_id: NodeId,
+    pub pfcp_session_change_info: Vec<PfcpSessionChangeInfo>,
+}
+
+impl SessionSetModificationRequest {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        let mut nb = BytesMut::new();
+        self.node_id.encode(&mut nb);
+        IeHeader::new(IeType::NodeId as u16, nb.len() as u16).encode(buf);
+        buf.put_slice(&nb);
+
+        for info in &self.pfcp_session_change_info {
+            let mut inner = BytesMut::new();
+            info.encode(&mut inner);
+            IeHeader::new(IeType::PfcpSessionChangeInfo as u16, inner.len() as u16).encode(buf);
+            buf.put_slice(&inner);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        let mut node_id = None;
+        let mut pfcp_session_change_info = Vec::new();
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::NodeId as u16 => {
+                    let mut data = ie.data;
+                    node_id = Some(NodeId::decode(&mut data)?);
+                }
+                t if t == IeType::PfcpSessionChangeInfo as u16 => {
+                    pfcp_session_change_info.push(PfcpSessionChangeInfo::decode(&ie.data)?);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            node_id: node_id
+                .ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?,
+            pfcp_session_change_info,
+        })
+    }
+}
+
+/// PFCP Session Set Modification Response (TS 29.244 §7.4.7.2, message type 17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSetModificationResponse {
+    pub node_id: NodeId,
+    pub cause: PfcpCause,
+    pub offending_ie: Option<u16>,
+}
+
+impl SessionSetModificationResponse {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        let mut nb = BytesMut::new();
+        self.node_id.encode(&mut nb);
+        IeHeader::new(IeType::NodeId as u16, nb.len() as u16).encode(buf);
+        buf.put_slice(&nb);
+
+        encode_u8_ie(buf, IeType::Cause, self.cause as u8);
+
+        if let Some(offending) = self.offending_ie {
+            encode_u16_ie(buf, IeType::OffendingIe, offending);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        let mut node_id = None;
+        let mut cause = None;
+        let mut offending_ie = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::NodeId as u16 => {
+                    let mut data = ie.data;
+                    node_id = Some(NodeId::decode(&mut data)?);
+                }
+                t if t == IeType::Cause as u16 => {
+                    if !ie.data.is_empty() {
+                        cause = Some(PfcpCause::try_from(ie.data[0])?);
+                    }
+                }
+                t if t == IeType::OffendingIe as u16 => {
+                    if ie.data.len() >= 2 {
+                        let mut data = ie.data;
+                        offending_ie = Some(data.get_u16());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            node_id: node_id
+                .ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?,
+            cause: cause.ok_or_else(|| PfcpError::MissingMandatoryIe("Cause".to_string()))?,
+            offending_ie,
+        })
+    }
+}
+
 /// PFCP Message enum containing all message types
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PfcpMessage {
@@ -1520,6 +1737,10 @@ pub enum PfcpMessage {
     AssociationUpdateResponse(AssociationUpdateResponse),
     PfdManagementRequest(PfdManagementRequest),
     PfdManagementResponse(PfdManagementResponse),
+    SessionSetDeletionRequest(SessionSetDeletionRequest),
+    SessionSetDeletionResponse(SessionSetDeletionResponse),
+    SessionSetModificationRequest(SessionSetModificationRequest),
+    SessionSetModificationResponse(SessionSetModificationResponse),
 }
 
 impl PfcpMessage {
@@ -1546,6 +1767,14 @@ impl PfcpMessage {
             Self::AssociationUpdateResponse(_) => PfcpMessageType::AssociationUpdateResponse,
             Self::PfdManagementRequest(_) => PfcpMessageType::PfdManagementRequest,
             Self::PfdManagementResponse(_) => PfcpMessageType::PfdManagementResponse,
+            Self::SessionSetDeletionRequest(_) => PfcpMessageType::SessionSetDeletionRequest,
+            Self::SessionSetDeletionResponse(_) => PfcpMessageType::SessionSetDeletionResponse,
+            Self::SessionSetModificationRequest(_) => {
+                PfcpMessageType::SessionSetModificationRequest
+            }
+            Self::SessionSetModificationResponse(_) => {
+                PfcpMessageType::SessionSetModificationResponse
+            }
         }
     }
 
@@ -1572,6 +1801,10 @@ impl PfcpMessage {
             Self::AssociationUpdateResponse(msg) => msg.encode(buf),
             Self::PfdManagementRequest(msg) => msg.encode(buf),
             Self::PfdManagementResponse(msg) => msg.encode(buf),
+            Self::SessionSetDeletionRequest(msg) => msg.encode(buf),
+            Self::SessionSetDeletionResponse(msg) => msg.encode(buf),
+            Self::SessionSetModificationRequest(msg) => msg.encode(buf),
+            Self::SessionSetModificationResponse(msg) => msg.encode(buf),
         }
     }
 
@@ -1638,6 +1871,22 @@ impl PfcpMessage {
             PfcpMessageType::PfdManagementResponse => Ok(Self::PfdManagementResponse(
                 PfdManagementResponse::decode(buf)?,
             )),
+            PfcpMessageType::SessionSetDeletionRequest => Ok(Self::SessionSetDeletionRequest(
+                SessionSetDeletionRequest::decode(buf)?,
+            )),
+            PfcpMessageType::SessionSetDeletionResponse => Ok(Self::SessionSetDeletionResponse(
+                SessionSetDeletionResponse::decode(buf)?,
+            )),
+            PfcpMessageType::SessionSetModificationRequest => {
+                Ok(Self::SessionSetModificationRequest(
+                    SessionSetModificationRequest::decode(buf)?,
+                ))
+            }
+            PfcpMessageType::SessionSetModificationResponse => {
+                Ok(Self::SessionSetModificationResponse(
+                    SessionSetModificationResponse::decode(buf)?,
+                ))
+            }
             _ => Err(PfcpError::InvalidMessageType(message_type as u8)),
         }
     }
@@ -2216,5 +2465,173 @@ mod tests {
             PfdManagementResponse::decode(&mut body.freeze()),
             Err(PfcpError::MissingMandatoryIe(_))
         ));
+    }
+
+    #[test]
+    fn test_session_set_deletion_request_full_message_bytes() {
+        // Node-level (no SEID): Node ID 10.45.0.1 + one FQ-CSID (IPv4 10.45.0.1,
+        // CSID 0x0102, Node Type PGW-C/SMF). Full wire image per TS 29.244
+        // §7.4.6.1 / §8.2.43.
+        let msg = PfcpMessage::SessionSetDeletionRequest(SessionSetDeletionRequest {
+            node_id: NodeId::new_ipv4([10, 45, 0, 1]),
+            fq_csids: vec![FqCsid::new_ipv4(
+                [10, 45, 0, 1],
+                vec![0x0102],
+                FqCsidNodeType::PgwCSmf,
+            )],
+        });
+        let buf = build_message(&msg, 1, None);
+        assert_eq!(
+            buf.as_ref(),
+            &[
+                // header: version 1 / no SEID, type 14, length 0x19=25, seq 1, spare
+                0x20, 0x0E, 0x00, 0x19, 0x00, 0x00, 0x01, 0x00,
+                // Node ID IE (type 60): len 5, IPv4 10.45.0.1
+                0x00, 0x3C, 0x00, 0x05, 0x00, 0x0A, 0x2D, 0x00, 0x01,
+                // FQ-CSID IE (type 65): len 8
+                0x00, 0x41, 0x00, 0x08, 0x01, 0x0A, 0x2D, 0x00, 0x01, 0x01, 0x02, 0x02,
+            ]
+        );
+        let (header, decoded) = parse_message(&mut buf.freeze()).unwrap();
+        assert_eq!(header.message_type, PfcpMessageType::SessionSetDeletionRequest);
+        assert!(!header.seid_presence);
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn test_session_set_deletion_request_roundtrip_multi_fq_csid() {
+        let msg = SessionSetDeletionRequest {
+            node_id: NodeId::new_ipv4([10, 45, 0, 1]),
+            fq_csids: vec![
+                FqCsid::new_ipv4([10, 45, 0, 1], vec![0x0001], FqCsidNodeType::PgwCSmf),
+                FqCsid::new_ipv6([0x20; 16], vec![0x0002, 0x0003], FqCsidNodeType::PgwUSgwUUpf),
+            ],
+        };
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+        let decoded = SessionSetDeletionRequest::decode(&mut buf.freeze()).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(decoded.fq_csids.len(), 2);
+    }
+
+    #[test]
+    fn test_session_set_deletion_request_missing_node_id_rejected() {
+        // Node ID is mandatory: encode only an FQ-CSID IE.
+        let mut buf = BytesMut::new();
+        let mut inner = BytesMut::new();
+        FqCsid::new_ipv4([1, 2, 3, 4], vec![0x0001], FqCsidNodeType::Mme).encode(&mut inner);
+        IeHeader::new(IeType::FqCsid as u16, inner.len() as u16).encode(&mut buf);
+        buf.put_slice(&inner);
+        assert!(matches!(
+            SessionSetDeletionRequest::decode(&mut buf.freeze()),
+            Err(PfcpError::MissingMandatoryIe(_))
+        ));
+    }
+
+    #[test]
+    fn test_session_set_deletion_response_via_dispatch() {
+        let msg = PfcpMessage::SessionSetDeletionResponse(SessionSetDeletionResponse {
+            node_id: NodeId::new_ipv4([10, 45, 0, 1]),
+            cause: PfcpCause::RequestAccepted,
+            offending_ie: None,
+        });
+        assert_eq!(msg.message_type(), PfcpMessageType::SessionSetDeletionResponse);
+        let mut body = BytesMut::new();
+        msg.encode_body(&mut body);
+        let decoded = PfcpMessage::decode_body(
+            PfcpMessageType::SessionSetDeletionResponse,
+            &mut body.freeze(),
+        )
+        .unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn test_session_set_deletion_response_missing_cause_rejected() {
+        let mut buf = BytesMut::new();
+        let mut nb = BytesMut::new();
+        NodeId::new_ipv4([1, 2, 3, 4]).encode(&mut nb);
+        IeHeader::new(IeType::NodeId as u16, nb.len() as u16).encode(&mut buf);
+        buf.put_slice(&nb);
+        assert!(matches!(
+            SessionSetDeletionResponse::decode(&mut buf.freeze()),
+            Err(PfcpError::MissingMandatoryIe(_))
+        ));
+    }
+
+    #[test]
+    fn test_session_set_modification_request_roundtrip() {
+        let msg = PfcpMessage::SessionSetModificationRequest(SessionSetModificationRequest {
+            node_id: NodeId::new_ipv4([10, 45, 0, 1]),
+            pfcp_session_change_info: vec![PfcpSessionChangeInfo {
+                pgw_c_smf_fq_csids: vec![FqCsid::new_ipv4(
+                    [10, 45, 0, 1],
+                    vec![0x0102],
+                    FqCsidNodeType::PgwCSmf,
+                )],
+                group_ids: vec![GroupId::new(b"grp".to_vec())],
+                cp_ip_addresses: vec![CpIpAddress {
+                    ipv4: Some([10, 45, 0, 2]),
+                    ipv6: None,
+                }],
+                alternative_smf_ip_address: AlternativeSmfIpAddress {
+                    ipv4: Some([10, 45, 0, 3]),
+                    ipv6: None,
+                    ppe: false,
+                },
+            }],
+        });
+        let buf = build_message(&msg, 9, None);
+        let (header, decoded) = parse_message(&mut buf.freeze()).unwrap();
+        assert_eq!(
+            header.message_type,
+            PfcpMessageType::SessionSetModificationRequest
+        );
+        assert!(!header.seid_presence);
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn test_session_set_modification_request_missing_node_id_rejected() {
+        let info = PfcpSessionChangeInfo {
+            pgw_c_smf_fq_csids: vec![],
+            group_ids: vec![],
+            cp_ip_addresses: vec![],
+            alternative_smf_ip_address: AlternativeSmfIpAddress {
+                ipv4: Some([1, 2, 3, 4]),
+                ipv6: None,
+                ppe: false,
+            },
+        };
+        let mut buf = BytesMut::new();
+        let mut inner = BytesMut::new();
+        info.encode(&mut inner);
+        IeHeader::new(IeType::PfcpSessionChangeInfo as u16, inner.len() as u16).encode(&mut buf);
+        buf.put_slice(&inner);
+        assert!(matches!(
+            SessionSetModificationRequest::decode(&mut buf.freeze()),
+            Err(PfcpError::MissingMandatoryIe(_))
+        ));
+    }
+
+    #[test]
+    fn test_session_set_modification_response_via_dispatch() {
+        let msg = PfcpMessage::SessionSetModificationResponse(SessionSetModificationResponse {
+            node_id: NodeId::new_ipv4([10, 45, 0, 1]),
+            cause: PfcpCause::RequestAccepted,
+            offending_ie: Some(IeType::PfcpSessionChangeInfo as u16),
+        });
+        assert_eq!(
+            msg.message_type(),
+            PfcpMessageType::SessionSetModificationResponse
+        );
+        let mut body = BytesMut::new();
+        msg.encode_body(&mut body);
+        let decoded = PfcpMessage::decode_body(
+            PfcpMessageType::SessionSetModificationResponse,
+            &mut body.freeze(),
+        )
+        .unwrap();
+        assert_eq!(decoded, msg);
     }
 }
