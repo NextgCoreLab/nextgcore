@@ -973,6 +973,28 @@ mod tests {
         assert_drift_roundtrip(&amfd, "SecurityModeCommand");
     }
 
+    /// KNOWN DIVERGENCE LOCK (nas-06): amfd writes the PDU-session-id as a
+    /// 2-octet type-3 TV (`12 <psi>`, spec-correct per TS 24.501 §9.11.3.41),
+    /// but ogs-nas `DlNasTransport` decode/encode treats it as a 3-octet TLV
+    /// (`12 01 <psi>`). So an amfd-built DL NAS Transport does NOT yet
+    /// round-trip byte-equal through ogs-nas. This guard fails the moment the
+    /// divergence is fixed (ogs-nas `message.rs` ~1411 encode / ~1461 decode,
+    /// TLV->TV) — at which point convert it into a positive drift round-trip.
+    #[test]
+    fn drift_dl_nas_transport_psi_divergence_locked() {
+        use ogs_nas::fiveg::message::{build_5gmm_message, parse_5gmm_message};
+        let payload = [0x2eu8, 0x01, 0x01, 0xc1]; // minimal N1-SM-ish container
+        let amfd = build_dl_nas_transport(Some(5), 1, &payload, None, None).unwrap();
+        let roundtrips = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd))
+            .map(|parsed| build_5gmm_message(&parsed)[..] == amfd[..])
+            .unwrap_or(false);
+        assert!(
+            !roundtrips,
+            "DL NAS Transport now round-trips through ogs-nas — the PSI TLV/TV \
+             divergence is fixed; convert this guard into a byte-equal drift test"
+        );
+    }
+
     #[test]
     fn test_build_registration_accept() {
         let amf_ue = create_test_amf_ue();

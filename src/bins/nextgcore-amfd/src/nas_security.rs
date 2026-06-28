@@ -1028,6 +1028,47 @@ mod tests {
         assert_eq!(recovered, body, "ogs-nas must recover the amfd-protected body");
     }
 
+    /// KNOWN DIVERGENCE LOCK (nas-06): amfd derives the NAS connection-id
+    /// (bearer) from access_type — non-3GPP (access_type=2) uses bearer 2, per
+    /// TS 33.501 — whereas ogs-nas hardwires bearer 1. So for non-3GPP access
+    /// the protected frames differ. This guard fails the moment ogs-nas takes
+    /// a connection-id parameter (the divergence fix), at which point convert
+    /// it to an assert_eq. The 3GPP path (access_type=1) is byte-equal and is
+    /// covered by `drift_security_encode_matches_ogs_nas_protect`.
+    #[test]
+    fn drift_non_3gpp_bearer_divergence_locked() {
+        use ogs_nas::common::security::{protect_nas_message, NasCount, NasSecurityContext};
+        use ogs_nas::common::types::SecurityAlgorithms;
+
+        let body: [u8; 8] = [0x7e, 0x00, 0x5d, 0x02, 0x00, 0x02, 0xe0, 0xe1];
+        let mut ue = create_test_ue();
+        ue.access_type = 2; // non-3GPP => amfd uses bearer 2
+        let amfd = nas_5gs_security_encode(
+            &mut ue,
+            &body,
+            security_header::INTEGRITY_PROTECTED_AND_CIPHERED,
+        )
+        .unwrap();
+
+        let mut ctx = NasSecurityContext::new(
+            SecurityAlgorithms {
+                ciphering: ue.selected_enc_algorithm,
+                integrity: ue.selected_int_algorithm,
+            },
+            ue.knas_enc,
+            ue.knas_int,
+        );
+        ctx.dl_count = NasCount::new(0, 0);
+        let ogs = protect_nas_message(&mut ctx, 1, &body, true).unwrap(); // bearer 1
+
+        assert_ne!(
+            &amfd[2..],
+            &ogs[..],
+            "non-3GPP bearer divergence appears fixed (ogs-nas took a connection-id); \
+             convert this guard to assert_eq"
+        );
+    }
+
     #[test]
     fn test_nas_mac_calculate_nia2() {
         let key = [0x11u8; 16];
