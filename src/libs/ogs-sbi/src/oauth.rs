@@ -461,9 +461,22 @@ pub struct OAuth2Client {
     /// TLS connector used for `https://` NRF URIs; `None` keeps the cleartext
     /// `http://` path unchanged (the connector is consulted only for `https`).
     tls: Option<TlsConnector>,
+    /// Resource path (appended to `nrf_uri`) of the NRF access-token endpoint
+    /// (sbi-06). Defaults to the bespoke [`OAuth2Client::TOKEN_PATH_BESPOKE`];
+    /// set [`OAuth2Client::TOKEN_PATH_STANDARD`] via
+    /// [`OAuth2Client::with_token_path`] once the NRF serves the TS 29.510 path.
+    token_path: String,
 }
 
 impl OAuth2Client {
+    /// Bespoke (Open5GS-style) access-token path — the **default**, kept until
+    /// the nrfd consumer is migrated to the standard path (sbi-06).
+    pub const TOKEN_PATH_BESPOKE: &'static str = "/nnrf-oauth2/v1/access-token";
+    /// TS 29.510 §5.4 / clause 6.3 standard access-token path
+    /// (`POST {nrfApiRoot}/oauth2/token`). Opt in with
+    /// [`OAuth2Client::with_token_path`].
+    pub const TOKEN_PATH_STANDARD: &'static str = "/oauth2/token";
+
     /// Create a new OAuth2 client.
     pub fn new(
         nrf_uri: impl Into<String>,
@@ -476,7 +489,22 @@ impl OAuth2Client {
             nf_type,
             cache: TokenCache::new(),
             tls: None,
+            token_path: Self::TOKEN_PATH_BESPOKE.to_string(),
         }
+    }
+
+    /// Override the access-token resource path (sbi-06). The default is the
+    /// bespoke [`OAuth2Client::TOKEN_PATH_BESPOKE`]; pass
+    /// [`OAuth2Client::TOKEN_PATH_STANDARD`] (or a custom path) to address an
+    /// NRF that serves the TS 29.510 standard route. Leading slash expected.
+    pub fn with_token_path(mut self, token_path: impl Into<String>) -> Self {
+        self.token_path = token_path.into();
+        self
+    }
+
+    /// The configured access-token resource path.
+    pub fn token_path(&self) -> &str {
+        &self.token_path
     }
 
     /// Enable TLS for `https://` NRF URIs. Default off (`None`) ⇒ the
@@ -538,7 +566,10 @@ impl OAuth2Client {
             AccessTokenRequest::new(&self.nf_instance_id, self.nf_type, target_nf_type, scope);
 
         let body = request.to_form_body();
-        let uri = format!("{}/nnrf-oauth2/v1/access-token", self.nrf_uri);
+        // sbi-06: the resource path is configurable; the default keeps the
+        // bespoke `/nnrf-oauth2/v1/access-token` so the wire request is
+        // unchanged until the NRF is migrated to the TS 29.510 standard path.
+        let uri = format!("{}{}", self.nrf_uri, self.token_path);
 
         // Cleartext for `http://`, TLS for `https://` (scheme-branched).
         let mut sender = http2_connect(
@@ -738,8 +769,14 @@ pub struct JwksCache {
 impl JwksCache {
     /// Default reuse window for a fetched JWKS document.
     pub const DEFAULT_TTL: Duration = Duration::from_secs(300);
-    /// Path of the NRF's JWKS endpoint (3GPP-adjacent; see nrfd).
+    /// Bespoke (Open5GS-style) JWKS endpoint path — the **default** used by
+    /// [`JwksCache::for_nrf`], kept until the nrfd consumer is migrated
+    /// (sbi-06).
     pub const NRF_JWKS_PATH: &'static str = "/nnrf-oauth2/v1/jwks";
+    /// TS 29.510 standard key-retrieval path
+    /// (`POST {nrfApiRoot}/oauth2/retrieve-key`). Opt in via
+    /// [`JwksCache::for_nrf_with_path`].
+    pub const NRF_KEY_PATH_STANDARD: &'static str = "/oauth2/retrieve-key";
 
     /// Create a cache for an explicit JWKS URI.
     pub fn new(jwks_uri: impl Into<String>) -> Self {
@@ -751,13 +788,18 @@ impl JwksCache {
         }
     }
 
-    /// Create a cache pointing at the NRF's JWKS endpoint.
+    /// Create a cache pointing at the NRF's JWKS endpoint, using the bespoke
+    /// default path ([`JwksCache::NRF_JWKS_PATH`]).
     pub fn for_nrf(nrf_uri: &str) -> Self {
-        Self::new(format!(
-            "{}{}",
-            nrf_uri.trim_end_matches('/'),
-            Self::NRF_JWKS_PATH
-        ))
+        Self::for_nrf_with_path(nrf_uri, Self::NRF_JWKS_PATH)
+    }
+
+    /// Create a cache pointing at the NRF, with an explicit key resource path
+    /// (sbi-06). Pass [`JwksCache::NRF_KEY_PATH_STANDARD`] for the TS 29.510
+    /// route, or [`JwksCache::NRF_JWKS_PATH`] (the [`for_nrf`](Self::for_nrf)
+    /// default) for the bespoke one.
+    pub fn for_nrf_with_path(nrf_uri: &str, path: &str) -> Self {
+        Self::new(format!("{}{}", nrf_uri.trim_end_matches('/'), path))
     }
 
     /// Override the cache TTL.
@@ -1488,5 +1530,102 @@ mod tests {
         let cache = JwksCache::new("http://127.0.0.1:1/nnrf-oauth2/v1/jwks");
         let err = cache.authorize(Some("Bearer a.b.c")).await.unwrap_err();
         assert!(!matches!(err, SbiError::AuthorizationFailed(_)));
+    }
+
+    // --- sbi-06: configurable OAuth2 token + JWKS resource paths ---
+
+    #[test]
+    fn test_token_path_defaults_to_bespoke() {
+        // The default keeps the bespoke path so the wire request is unchanged
+        // until the NRF is migrated to the TS 29.510 route.
+        let c = OAuth2Client::new("http://nrf:7777", "amf-1", NfType::Amf);
+        assert_eq!(c.token_path(), "/nnrf-oauth2/v1/access-token");
+        assert_eq!(c.token_path(), OAuth2Client::TOKEN_PATH_BESPOKE);
+
+        // Opt-in override to the standard TS 29.510 path.
+        let c = c.with_token_path(OAuth2Client::TOKEN_PATH_STANDARD);
+        assert_eq!(c.token_path(), "/oauth2/token");
+    }
+
+    #[test]
+    fn test_jwks_path_default_and_standard() {
+        // Default `for_nrf` uses the bespoke path.
+        assert_eq!(
+            JwksCache::for_nrf("http://nrf:7777").jwks_uri(),
+            "http://nrf:7777/nnrf-oauth2/v1/jwks"
+        );
+        // Opt-in to the TS 29.510 standard key-retrieval path.
+        assert_eq!(
+            JwksCache::for_nrf_with_path("http://nrf:7777", JwksCache::NRF_KEY_PATH_STANDARD)
+                .jwks_uri(),
+            "http://nrf:7777/oauth2/retrieve-key"
+        );
+    }
+
+    /// Serve an access-token response only for `expected_path`; 404 otherwise.
+    /// Lets a test assert which path the client actually requested on the wire.
+    async fn serve_token_on_path(expected_path: &'static str) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let svc = hyper::service::service_fn(
+                        move |req: hyper::Request<hyper::body::Incoming>| {
+                            let path = req.uri().path().to_string();
+                            async move {
+                                let resp = if path == expected_path {
+                                    hyper::Response::builder().status(200).body(
+                                        http_body_util::Full::new(bytes::Bytes::from(
+                                            r#"{"access_token":"tok","token_type":"Bearer","expires_in":3600}"#,
+                                        )),
+                                    )
+                                } else {
+                                    hyper::Response::builder().status(404).body(
+                                        http_body_util::Full::new(bytes::Bytes::from("nope")),
+                                    )
+                                };
+                                Ok::<_, std::convert::Infallible>(resp.unwrap())
+                            }
+                        },
+                    );
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc)
+                    .await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn test_default_token_path_used_on_wire() {
+        // A server that only answers the bespoke path → default client succeeds.
+        let addr = serve_token_on_path("/nnrf-oauth2/v1/access-token").await;
+        let client = OAuth2Client::new(format!("http://{addr}"), "amf-1", NfType::Amf);
+        let resp = client
+            .request_token(NfType::Udm, "nudm-sdm")
+            .await
+            .expect("default bespoke token path succeeds");
+        assert_eq!(resp.access_token, "tok");
+    }
+
+    #[tokio::test]
+    async fn test_standard_token_path_override_used_on_wire() {
+        // A server that only answers the standard path → overridden client wins.
+        let addr = serve_token_on_path("/oauth2/token").await;
+        let client = OAuth2Client::new(format!("http://{addr}"), "amf-1", NfType::Amf)
+            .with_token_path(OAuth2Client::TOKEN_PATH_STANDARD);
+        let resp = client
+            .request_token(NfType::Udm, "nudm-sdm")
+            .await
+            .expect("standard token path succeeds when configured");
+        assert_eq!(resp.access_token, "tok");
     }
 }

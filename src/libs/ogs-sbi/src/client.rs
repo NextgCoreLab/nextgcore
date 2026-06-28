@@ -118,6 +118,81 @@ const DEFAULT_REQUEST_TIMEOUT: u64 = 30;
 /// every concurrent request behind a single mutex during connection churn.
 const DEFAULT_POOL_SIZE: usize = 4;
 
+/// Maximum number of 307/308 redirects the client follows before giving up
+/// (sbi-04). TS 29.500 §6.4.2.4 / §6.10.9: an SCP/SEPP may answer with a
+/// redirect; the consumer re-issues to the indicated target. A small bound
+/// stops a redirect loop from spinning forever.
+const MAX_REDIRECTS: u32 = 3;
+
+/// Default backoff between retry attempts when no `Retry-After` is supplied
+/// (sbi-05). Only consulted when a retry actually happens, i.e. when the retry
+/// policy is opted into (`max_attempts > 1`); the default policy
+/// (`max_attempts == 1`) never reaches this.
+const DEFAULT_RETRY_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Bounded retry / NF-reselection policy (sbi-05).
+///
+/// **Dormant by default**: `max_attempts == 1` means a single attempt with no
+/// retry loop and no backoff — byte-for-byte and call-sequence identical to the
+/// pre-sbi-05 client. Set `max_attempts > 1` (via
+/// [`SbiClient::with_retry_policy`]) to enable bounded retry of retryable
+/// failures (connection errors, timeouts, 429/503) per TS 29.500 §6.5.
+#[derive(Debug, Clone)]
+pub struct RetryPolicy {
+    /// Total attempts including the first. `1` (default) disables retry.
+    pub max_attempts: u32,
+    /// Backoff between attempts when the response carries no `Retry-After`.
+    pub base_backoff: Duration,
+    /// Honour a `Retry-After` header (delta-seconds) on 429/503 responses
+    /// (RFC 9110 §10.2.3) in preference to `base_backoff`.
+    pub honor_retry_after: bool,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        // max_attempts = 1 ⇒ no retry: preserves the prior single-attempt
+        // behaviour unless a caller opts in.
+        Self {
+            max_attempts: 1,
+            base_backoff: DEFAULT_RETRY_BACKOFF,
+            honor_retry_after: true,
+        }
+    }
+}
+
+impl RetryPolicy {
+    /// Build a policy with a given attempt budget (clamped to ≥ 1).
+    pub fn with_max_attempts(max_attempts: u32) -> Self {
+        Self {
+            max_attempts: max_attempts.max(1),
+            ..Default::default()
+        }
+    }
+
+    /// Set the base backoff used when no `Retry-After` is present.
+    pub fn with_base_backoff(mut self, backoff: Duration) -> Self {
+        self.base_backoff = backoff;
+        self
+    }
+
+    /// Enable or disable honouring the `Retry-After` response header.
+    pub fn with_honor_retry_after(mut self, honor: bool) -> Self {
+        self.honor_retry_after = honor;
+        self
+    }
+}
+
+/// Where to dial for a single send attempt. `None` (the default for the first
+/// attempt) uses the client's pooled connection to `config.host:config.port`;
+/// `Some` is used only when following a 307/308 redirect to a different
+/// authority (sbi-04), where a fresh, non-pooled connection is made.
+#[derive(Debug, Clone)]
+struct ConnectTarget {
+    scheme: UriScheme,
+    host: String,
+    port: u16,
+}
+
 /// SBI Client configuration
 #[derive(Debug, Clone)]
 pub struct SbiClientConfig {
@@ -232,6 +307,9 @@ pub struct SbiClient {
     /// This NF's own instance ID / FQDN, combined with `client_nf_type` as the
     /// `User-Agent` value `<NFTYPE>-<id>` (sbi-03).
     client_nf_id: Option<String>,
+    /// Bounded retry / NF-reselection policy (sbi-05). Defaults to a single
+    /// attempt (`max_attempts == 1`), so retry is dormant unless opted in.
+    retry: RetryPolicy,
 }
 
 impl SbiClient {
@@ -247,6 +325,7 @@ impl SbiClient {
             target_nf_type: None,
             client_nf_type: None,
             client_nf_id: None,
+            retry: RetryPolicy::default(),
         }
     }
 
@@ -279,6 +358,18 @@ impl SbiClient {
         self
     }
 
+    /// Set the bounded retry / NF-reselection policy (sbi-05).
+    ///
+    /// The default policy is a single attempt (`max_attempts == 1`), i.e. retry
+    /// is **dormant** and the send path is identical to the pre-sbi-05 client.
+    /// Supplying a policy with `max_attempts > 1` enables bounded retry of
+    /// retryable failures (connection errors, timeouts, 429/503) with backoff
+    /// and optional `Retry-After` honouring.
+    pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
     /// Get the client configuration
     pub fn config(&self) -> &SbiClientConfig {
         &self.config
@@ -308,18 +399,44 @@ impl SbiClient {
         Ok(TlsConnector::from(Arc::new(client_config)))
     }
 
-    /// Connect to the server
+    /// Connect to the configured server (`config.host:config.port`).
+    ///
+    /// Thin forwarder over [`connect_target`](Self::connect_target) with the
+    /// client's configured scheme/host/port, so the pooled connection path is
+    /// byte-for-byte identical to the pre-refactor inline code.
     async fn connect(&self) -> SbiResult<SendRequest<Full<Bytes>>> {
-        let addr = format!("{}:{}", self.config.host, self.config.port);
+        self.connect_target(self.config.scheme, &self.config.host, self.config.port)
+            .await
+    }
+
+    /// Open a fresh (non-pooled) connection to an explicit redirect target
+    /// (sbi-04). Used only when following a 307/308 to a different authority.
+    async fn connect_to(&self, target: &ConnectTarget) -> SbiResult<SendRequest<Full<Bytes>>> {
+        self.connect_target(target.scheme, &target.host, target.port)
+            .await
+    }
+
+    /// Connect to an arbitrary `scheme://host:port`, performing the TLS
+    /// handshake (and N32-f exporter deposit) for `https`. The TLS material
+    /// (CA / client cert / verify policy) is taken from the client config; only
+    /// the dial target (scheme/host/port) is parametrised so the same logic
+    /// serves both the configured target and a redirect target.
+    async fn connect_target(
+        &self,
+        scheme: UriScheme,
+        host: &str,
+        port: u16,
+    ) -> SbiResult<SendRequest<Full<Bytes>>> {
+        let addr = format!("{host}:{port}");
 
         let stream = tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(&addr))
             .await
             .map_err(|_| SbiError::Timeout)?
             .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
 
-        if self.config.scheme == UriScheme::Https {
+        if scheme == UriScheme::Https {
             let connector = self.build_tls_connector()?;
-            let server_name = ServerName::try_from(self.config.host.clone())
+            let server_name = ServerName::try_from(host.to_string())
                 .map_err(|e| SbiError::TlsError(format!("Invalid server name: {e}")))?;
 
             let tls_stream = tokio::time::timeout(
@@ -342,10 +459,7 @@ impl SbiClient {
                 let (_, client_conn) = tls_stream.get_ref();
                 match crate::tls::export_n32f_session_key(client_conn, None) {
                     Ok(secret) => {
-                        log::debug!(
-                            "N32-f TLS exporter secret derived for peer {}",
-                            self.config.host
-                        );
+                        log::debug!("N32-f TLS exporter secret derived for peer {host}");
                         // The seppd n32c_handler consumes this via
                         // `take_n32c_tls_exporter_secret(peer_fqdn)`.
                         // We key by host (FQDN or IP) which the handler
@@ -361,20 +475,16 @@ impl SbiClient {
                         // For now, store it on the request side via the hook
                         // if one is registered; otherwise log and discard.
                         if let Some(hook) = TLS_EXPORTER_HOOK.load() {
-                            hook(&self.config.host, secret);
+                            hook(host, secret);
                         } else {
                             log::debug!(
-                                "No TLS exporter hook registered; secret for {} discarded \
-                                 (non-SEPP NF)",
-                                self.config.host
+                                "No TLS exporter hook registered; secret for {host} discarded \
+                                 (non-SEPP NF)"
                             );
                         }
                     }
                     Err(e) => {
-                        log::warn!(
-                            "N32-f TLS exporter failed for peer {}: {e}",
-                            self.config.host
-                        );
+                        log::warn!("N32-f TLS exporter failed for peer {host}: {e}");
                     }
                 }
             }
@@ -435,8 +545,29 @@ impl SbiClient {
         Ok(sender)
     }
 
-    /// Send an SBI request and receive a response
-    pub async fn send_request(&self, mut request: SbiRequest) -> SbiResult<SbiResponse> {
+    /// Send an SBI request and receive a response.
+    ///
+    /// Layering (all dormant by default):
+    /// * Outbound headers (OAuth2 Bearer, `User-Agent`, `x-request-id`,
+    ///   `traceparent`) are stamped once in [`prepare_request`](Self::prepare_request).
+    /// * **sbi-04**: 307/308 responses are followed (bounded by
+    ///   [`MAX_REDIRECTS`]) in [`send_following_redirects`](Self::send_following_redirects).
+    /// * **sbi-05**: retryable failures are retried per the
+    ///   [`RetryPolicy`]; with the default `max_attempts == 1` the retry loop is
+    ///   skipped entirely (fast path), so a normal request is byte-for-byte and
+    ///   call-sequence identical to the pre-sbi-04/05 client.
+    pub async fn send_request(&self, request: SbiRequest) -> SbiResult<SbiResponse> {
+        if self.retry.max_attempts <= 1 {
+            // Fast path: a single attempt, no retry loop, no request clone.
+            return self.send_following_redirects(request).await;
+        }
+        self.send_with_retry(request).await
+    }
+
+    /// Stamp the standard outbound headers on `request` exactly once before the
+    /// (possibly retried / redirected) send. Mutations are identical, and in the
+    /// same order, to the pre-refactor inline code.
+    async fn prepare_request(&self, request: &mut SbiRequest) {
         // Automatically attach Bearer token if OAuth2 is configured
         // and the request does not already carry an Authorization header
         if let (Some(oauth2), Some(target_nf_type)) = (&self.oauth2, &self.target_nf_type) {
@@ -504,8 +635,115 @@ impl SbiClient {
             let traceparent = format!("00-{}-{}-01", hex::encode(trace_id), hex::encode(span_id),);
             request.http.set_header("traceparent", traceparent);
         }
+    }
 
-        let mut sender = self.get_connection().await?;
+    /// sbi-05 retry wrapper. Only entered when `max_attempts > 1`. Re-runs the
+    /// full redirect-following send on a retryable failure (connection error,
+    /// timeout, 429/503) until the attempt budget is spent, with backoff
+    /// honouring `Retry-After` when present.
+    async fn send_with_retry(&self, request: SbiRequest) -> SbiResult<SbiResponse> {
+        let max_attempts = self.retry.max_attempts.max(1);
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            let last = attempt >= max_attempts;
+            match self.send_following_redirects(request.clone()).await {
+                Ok(resp) => {
+                    if !last && is_retryable_status(resp.status) {
+                        if let Some(delay) = self.retry_delay(Some(&resp)) {
+                            tokio::time::sleep(delay).await;
+                        }
+                        continue;
+                    }
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    if !last && e.is_retryable() {
+                        if let Some(delay) = self.retry_delay(None) {
+                            tokio::time::sleep(delay).await;
+                        }
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// Compute the backoff before the next retry: `Retry-After` (delta-seconds)
+    /// when honoured and present, otherwise the policy's base backoff. `None`
+    /// means "no wait".
+    fn retry_delay(&self, response: Option<&SbiResponse>) -> Option<Duration> {
+        if self.retry.honor_retry_after {
+            if let Some(after) = response
+                .and_then(|r| r.http.get_header("Retry-After"))
+                .and_then(|v| parse_retry_after(v))
+            {
+                return Some(after);
+            }
+        }
+        if self.retry.base_backoff.is_zero() {
+            None
+        } else {
+            Some(self.retry.base_backoff)
+        }
+    }
+
+    /// sbi-04 redirect follower. Stamps the outbound headers once, then sends;
+    /// on a 307/308 with a usable `Location` it re-dials the indicated target
+    /// (honouring `3gpp-Sbi-Target-apiRoot`), preserving method + body, bounded
+    /// by [`MAX_REDIRECTS`]. A normal (non-redirect) response takes a single
+    /// `send_once` call against the pooled connection — identical to before.
+    async fn send_following_redirects(&self, mut request: SbiRequest) -> SbiResult<SbiResponse> {
+        self.prepare_request(&mut request).await;
+
+        // First attempt uses the pooled connection (target = None).
+        let mut target: Option<ConnectTarget> = None;
+        let mut redirects_left = MAX_REDIRECTS;
+        loop {
+            let response = self.send_once(&request, target.as_ref()).await?;
+
+            // sbi-04: follow a 307/308 redirect when a budget remains.
+            if matches!(response.status, 307 | 308) {
+                match next_redirect(&response)? {
+                    Some((new_uri, new_target)) => {
+                        if redirects_left == 0 {
+                            return Err(SbiError::ClientError(
+                                "redirect loop: exceeded maximum redirects".into(),
+                            ));
+                        }
+                        redirects_left -= 1;
+                        // 307/308 preserve the method and body; re-target the
+                        // request URI. The absolute Location is authoritative,
+                        // so any pre-existing query params are dropped to avoid
+                        // double-encoding.
+                        request.header.uri = new_uri;
+                        request.http.params.clear();
+                        target = Some(new_target);
+                        continue;
+                    }
+                    // 307/308 without a usable Location: nothing to follow —
+                    // hand the response back to the caller verbatim.
+                    None => return Ok(response),
+                }
+            }
+
+            return Ok(response);
+        }
+    }
+
+    /// Perform exactly one request/response round-trip over either the pooled
+    /// connection (`target == None`) or a fresh connection to a redirect target
+    /// (`target == Some`). Does not mutate `request`.
+    async fn send_once(
+        &self,
+        request: &SbiRequest,
+        target: Option<&ConnectTarget>,
+    ) -> SbiResult<SbiResponse> {
+        let mut sender = match target {
+            None => self.get_connection().await?,
+            Some(t) => self.connect_to(t).await?,
+        };
 
         // Build the URI
         let uri_str = if request.header.uri.starts_with("http") {
@@ -544,13 +782,16 @@ impl SbiClient {
 
         // Build the request body. Binary N1/N2 parts are encoded as
         // multipart/related with the JSON content as the root part
-        // (TS 29.500 §6.1.2.3).
+        // (TS 29.500 §6.1.2.3). `send_once` never mutates `request`, so the
+        // multipart Content-Type is computed locally and substituted for any
+        // pre-existing Content-Type header below (matching the prior
+        // set_header-then-iterate behaviour: exactly one Content-Type on the
+        // wire).
+        let mut multipart_content_type: Option<String> = None;
         let body_bytes: Bytes = if !request.http.parts.is_empty() {
             let boundary = crate::multipart::generate_boundary();
-            request.http.set_header(
-                crate::constants::header::CONTENT_TYPE,
-                crate::multipart::content_type_with_boundary(&boundary),
-            );
+            multipart_content_type =
+                Some(crate::multipart::content_type_with_boundary(&boundary));
             Bytes::from(crate::multipart::encode(
                 request.http.content.as_deref(),
                 &request.http.parts,
@@ -569,9 +810,16 @@ impl SbiClient {
         // Build the HTTP request
         let mut req_builder = Request::builder().method(method).uri(uri);
 
-        // Add headers
+        // Add headers. When a multipart body overrides Content-Type, skip any
+        // caller-supplied Content-Type and stamp the multipart one once.
         for (key, value) in &request.http.headers {
+            if multipart_content_type.is_some() && key.eq_ignore_ascii_case("content-type") {
+                continue;
+            }
             req_builder = req_builder.header(key.as_str(), value.as_str());
+        }
+        if let Some(ct) = multipart_content_type {
+            req_builder = req_builder.header(crate::constants::header::CONTENT_TYPE, ct);
         }
 
         let http_request = req_builder
@@ -705,6 +953,89 @@ fn derive_scope_from_uri(uri: &str) -> String {
     crate::message::UriComponents::parse(uri)
         .api_name
         .unwrap_or_default()
+}
+
+/// sbi-04: decide the next hop for a 307/308 response.
+///
+/// Returns `Some((new_request_uri, connect_target))` when the redirect is
+/// followable, or `Ok(None)` when there is no usable `Location` (the caller
+/// then hands the 307/308 back verbatim). The new connection target is taken
+/// from `3gpp-Sbi-Target-apiRoot` when present (TS 29.500 §6.10.x indirect
+/// communication), otherwise from the `Location` authority. The new request URI
+/// is the absolute `Location` (307/308 preserve method + body).
+fn next_redirect(response: &SbiResponse) -> SbiResult<Option<(String, ConnectTarget)>> {
+    let location = match response
+        .http
+        .get_header(crate::constants::header::LOCATION)
+    {
+        Some(l) if !l.trim().is_empty() => l.trim().to_string(),
+        _ => return Ok(None),
+    };
+    // A relative Location cannot be re-dialled on its own; require an absolute
+    // URI (as SBI mandates for 307/308).
+    if !location.starts_with("http://") && !location.starts_with("https://") {
+        return Ok(None);
+    }
+    // `3gpp-Sbi-Target-apiRoot`, when present, selects the producer apiRoot to
+    // dial for indirect communication; otherwise dial Location's authority.
+    let dial_uri = response
+        .http
+        .target_apiroot()
+        .map(String::as_str)
+        .unwrap_or(location.as_str());
+    let target = parse_connect_target(dial_uri)?;
+    Ok(Some((location, target)))
+}
+
+/// Parse an absolute `scheme://host[:port][/...]` URI into a dial target.
+/// Defaults the port to 80 (`http`) / 443 (`https`) when absent.
+fn parse_connect_target(uri: &str) -> SbiResult<ConnectTarget> {
+    let (scheme, rest) = if let Some(r) = uri.strip_prefix("https://") {
+        (UriScheme::Https, r)
+    } else if let Some(r) = uri.strip_prefix("http://") {
+        (UriScheme::Http, r)
+    } else {
+        return Err(SbiError::InvalidUri(format!(
+            "redirect target is not an absolute URI: {uri}"
+        )));
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => {
+            let port = p.parse::<u16>().map_err(|_| {
+                SbiError::InvalidUri(format!("invalid port in redirect target: {uri}"))
+            })?;
+            (h.to_string(), port)
+        }
+        None => {
+            let default_port = match scheme {
+                UriScheme::Https => 443,
+                _ => 80,
+            };
+            (authority.to_string(), default_port)
+        }
+    };
+    if host.is_empty() {
+        return Err(SbiError::InvalidUri(format!(
+            "redirect target has no host: {uri}"
+        )));
+    }
+    Ok(ConnectTarget { scheme, host, port })
+}
+
+/// sbi-05: which response status codes are retryable. Mirrors the HTTP arms of
+/// [`SbiError::is_retryable`] — only 429 (Too Many Requests) and 503 (Service
+/// Unavailable), the codes TS 29.500 §6.5 marks for retransmission.
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 503)
+}
+
+/// sbi-05: parse a `Retry-After` value (RFC 9110 §10.2.3) into a `Duration`.
+/// Supports the delta-seconds form (a non-negative integer). The HTTP-date form
+/// is not parsed (no date dependency in this lib) and yields `None`, so the
+/// caller falls back to its base backoff.
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
 #[cfg(test)]
@@ -972,5 +1303,367 @@ mod tests {
             body.contains("Bearer caller-supplied"),
             "caller header should be preserved, got: {body}"
         );
+    }
+
+    // --- helper-fn unit tests (sbi-04 / sbi-05) ---
+
+    #[test]
+    fn test_parse_connect_target() {
+        let t = parse_connect_target("http://10.0.0.1:8080/x/y").unwrap();
+        assert_eq!(t.scheme, UriScheme::Http);
+        assert_eq!(t.host, "10.0.0.1");
+        assert_eq!(t.port, 8080);
+
+        // Default ports per scheme when the authority omits a port.
+        assert_eq!(parse_connect_target("http://nrf").unwrap().port, 80);
+        let s = parse_connect_target("https://nrf.local").unwrap();
+        assert_eq!(s.scheme, UriScheme::Https);
+        assert_eq!(s.port, 443);
+
+        // A relative / schemeless target is rejected.
+        assert!(parse_connect_target("/relative/path").is_err());
+        assert!(parse_connect_target("http://:8080").is_err());
+    }
+
+    #[test]
+    fn test_is_retryable_status() {
+        assert!(is_retryable_status(429));
+        assert!(is_retryable_status(503));
+        assert!(!is_retryable_status(200));
+        assert!(!is_retryable_status(404));
+        assert!(!is_retryable_status(500));
+    }
+
+    #[test]
+    fn test_parse_retry_after() {
+        assert_eq!(parse_retry_after("1"), Some(Duration::from_secs(1)));
+        assert_eq!(parse_retry_after(" 120 "), Some(Duration::from_secs(120)));
+        // HTTP-date form is not parsed (no date dep) → None (caller backs off).
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+        assert_eq!(parse_retry_after("-3"), None);
+    }
+
+    #[test]
+    fn test_retry_policy_default_is_dormant() {
+        // The default client uses a single-attempt (dormant) retry policy.
+        let client = SbiClient::with_host_port("127.0.0.1", 1);
+        assert_eq!(client.retry.max_attempts, 1);
+    }
+
+    // --- test servers for redirect / retry ---
+
+    /// Serve a fixed `status` with the supplied headers and body on every
+    /// request. Counts the requests it received in `counter`.
+    async fn serve_fixed(
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: &'static str,
+        counter: Arc<AtomicUsize>,
+    ) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let headers = headers.clone();
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let svc = hyper::service::service_fn(move |_req: hyper::Request<Incoming>| {
+                        let headers = headers.clone();
+                        let counter = counter.clone();
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            let mut builder = hyper::Response::builder().status(status);
+                            for (k, v) in &headers {
+                                builder = builder.header(k.as_str(), v.as_str());
+                            }
+                            Ok::<_, std::convert::Infallible>(
+                                builder
+                                    .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc)
+                    .await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Serve 200 echoing the request method + body. Counts requests.
+    async fn serve_echo_method_body(counter: Arc<AtomicUsize>) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let svc = hyper::service::service_fn(move |req: hyper::Request<Incoming>| {
+                        let counter = counter.clone();
+                        let method = req.method().to_string();
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            let body = req
+                                .into_body()
+                                .collect()
+                                .await
+                                .map(|c| c.to_bytes())
+                                .unwrap_or_default();
+                            let payload = format!(
+                                r#"{{"method":"{method}","body":"{}"}}"#,
+                                String::from_utf8_lossy(&body)
+                            );
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                                http_body_util::Full::new(bytes::Bytes::from(payload)),
+                            ))
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc)
+                    .await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Serve 503 the first `fail_times` requests, then 200 (echoing body).
+    async fn serve_503_then_ok(
+        fail_times: usize,
+        counter: Arc<AtomicUsize>,
+    ) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let svc = hyper::service::service_fn(move |_req: hyper::Request<Incoming>| {
+                        let counter = counter.clone();
+                        async move {
+                            let n = counter.fetch_add(1, Ordering::SeqCst);
+                            let (status, body) = if n < fail_times {
+                                (503u16, "unavailable")
+                            } else {
+                                (200u16, "ok")
+                            };
+                            Ok::<_, std::convert::Infallible>(
+                                hyper::Response::builder()
+                                    .status(status)
+                                    .body(http_body_util::Full::new(bytes::Bytes::from(body)))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc)
+                    .await;
+                });
+            }
+        });
+        addr
+    }
+
+    // --- (a) a normal 200 request is unchanged ---
+
+    #[tokio::test]
+    async fn test_normal_request_single_call_unchanged() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let addr = serve_echo_method_body(counter.clone()).await;
+        let client = SbiClient::with_host_port("127.0.0.1", addr.port());
+
+        let request = SbiRequest::post("/nudm-sdm/v1/imsi-1/x").with_body("hello", "text/plain");
+        let response = client.send_request(request).await.expect("request sent");
+        assert_eq!(response.status, 200);
+        let body = response.http.content.as_deref().unwrap();
+        assert!(body.contains(r#""method":"POST""#), "got: {body}");
+        assert!(body.contains(r#""body":"hello""#), "got: {body}");
+        // Exactly one round-trip: no redirect, no retry.
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    // --- (b) a 307/308 with target-apiRoot is followed to the new root ---
+
+    #[tokio::test]
+    async fn test_redirect_307_honours_target_apiroot() {
+        // Final producer: echoes the POST body at 200.
+        let final_count = Arc::new(AtomicUsize::new(0));
+        let final_addr = serve_echo_method_body(final_count.clone()).await;
+
+        // Redirector: 307 with a *bogus* Location authority but a valid
+        // 3gpp-Sbi-Target-apiRoot → success proves target-apiRoot is dialled.
+        let redir_count = Arc::new(AtomicUsize::new(0));
+        let redir_addr = serve_fixed(
+            307,
+            vec![
+                (
+                    "Location".to_string(),
+                    "http://127.0.0.1:1/redirected".to_string(),
+                ),
+                (
+                    "3gpp-Sbi-Target-apiRoot".to_string(),
+                    format!("http://{final_addr}"),
+                ),
+            ],
+            "redirecting",
+            redir_count.clone(),
+        )
+        .await;
+
+        let client = SbiClient::with_host_port("127.0.0.1", redir_addr.port());
+        let request =
+            SbiRequest::post("/nudm-sdm/v1/imsi-1/x").with_body("payload-307", "text/plain");
+        let response = client.send_request(request).await.expect("redirect followed");
+
+        assert_eq!(response.status, 200);
+        let body = response.http.content.as_deref().unwrap();
+        assert!(body.contains(r#""method":"POST""#), "method preserved: {body}");
+        assert!(body.contains("payload-307"), "body preserved: {body}");
+        assert_eq!(redir_count.load(Ordering::SeqCst), 1);
+        assert_eq!(final_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_redirect_308_follows_location_without_apiroot() {
+        let final_count = Arc::new(AtomicUsize::new(0));
+        let final_addr = serve_echo_method_body(final_count.clone()).await;
+
+        // 308 with only a Location (no target-apiRoot): dial Location's authority.
+        let redir_count = Arc::new(AtomicUsize::new(0));
+        let redir_addr = serve_fixed(
+            308,
+            vec![(
+                "Location".to_string(),
+                format!("http://{final_addr}/redirected"),
+            )],
+            "moved",
+            redir_count.clone(),
+        )
+        .await;
+
+        let client = SbiClient::with_host_port("127.0.0.1", redir_addr.port());
+        let response = client
+            .send_request(SbiRequest::get("/nudm-sdm/v1/imsi-1/x"))
+            .await
+            .expect("redirect followed");
+        assert_eq!(response.status, 200);
+        assert_eq!(final_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_redirect_budget_exhaustion_errors() {
+        // Always 307 pointing back at itself → exceeds MAX_REDIRECTS.
+        let count = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let self_loc = format!("http://{addr}/loop");
+        let count2 = count.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let self_loc = self_loc.clone();
+                let count2 = count2.clone();
+                tokio::spawn(async move {
+                    let io = hyper_util::rt::TokioIo::new(stream);
+                    let svc = hyper::service::service_fn(move |_req: hyper::Request<Incoming>| {
+                        let self_loc = self_loc.clone();
+                        let count2 = count2.clone();
+                        async move {
+                            count2.fetch_add(1, Ordering::SeqCst);
+                            Ok::<_, std::convert::Infallible>(
+                                hyper::Response::builder()
+                                    .status(307)
+                                    .header("Location", self_loc.as_str())
+                                    .body(http_body_util::Full::new(bytes::Bytes::from("loop")))
+                                    .unwrap(),
+                            )
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc)
+                    .await;
+                });
+            }
+        });
+
+        let client = SbiClient::with_host_port("127.0.0.1", addr.port());
+        let err = client
+            .send_request(SbiRequest::get("/x/v1/y"))
+            .await
+            .expect_err("redirect loop must error");
+        assert!(matches!(err, SbiError::ClientError(_)), "got: {err:?}");
+        // 1 initial + MAX_REDIRECTS follows = 4 round-trips.
+        assert_eq!(count.load(Ordering::SeqCst), (MAX_REDIRECTS + 1) as usize);
+    }
+
+    // --- (c) max_attempts == 1 does not retry ---
+
+    #[tokio::test]
+    async fn test_max_attempts_one_does_not_retry() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let addr = serve_fixed(503, vec![], "unavailable", count.clone()).await;
+        // Default client: single attempt (dormant retry).
+        let client = SbiClient::with_host_port("127.0.0.1", addr.port());
+        let response = client
+            .send_request(SbiRequest::get("/x/v1/y"))
+            .await
+            .expect("503 is returned, not retried");
+        assert_eq!(response.status, 503);
+        assert_eq!(count.load(Ordering::SeqCst), 1, "must not retry by default");
+    }
+
+    #[tokio::test]
+    async fn test_retry_recovers_after_503() {
+        let count = Arc::new(AtomicUsize::new(0));
+        // 503 once, then 200.
+        let addr = serve_503_then_ok(1, count.clone()).await;
+        let client = SbiClient::with_host_port("127.0.0.1", addr.port()).with_retry_policy(
+            RetryPolicy::with_max_attempts(3).with_base_backoff(Duration::from_millis(1)),
+        );
+        let response = client
+            .send_request(SbiRequest::get("/x/v1/y"))
+            .await
+            .expect("retry recovers");
+        assert_eq!(response.status, 200);
+        assert_eq!(count.load(Ordering::SeqCst), 2, "one retry then success");
+    }
+
+    #[tokio::test]
+    async fn test_retry_gives_up_after_budget() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let addr = serve_fixed(503, vec![], "down", count.clone()).await;
+        let client = SbiClient::with_host_port("127.0.0.1", addr.port()).with_retry_policy(
+            RetryPolicy::with_max_attempts(2).with_base_backoff(Duration::from_millis(1)),
+        );
+        let response = client
+            .send_request(SbiRequest::get("/x/v1/y"))
+            .await
+            .expect("returns last 503");
+        assert_eq!(response.status, 503);
+        assert_eq!(count.load(Ordering::SeqCst), 2, "exactly max_attempts tries");
     }
 }

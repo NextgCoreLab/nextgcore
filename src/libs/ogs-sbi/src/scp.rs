@@ -135,6 +135,31 @@ impl ScpRouter {
         default_scp.clone()
     }
 
+    /// Pick an alternate SCP binding for NF reselection (sbi-05).
+    ///
+    /// On a retryable failure against a binding, a retry should target a
+    /// *different* SCP/producer rather than hammer the dead one (TS 29.500
+    /// §6.5 / §6.10.x reselection). Returns the first binding for `nf_type`
+    /// whose `scp_instance_id` is not in `exclude`, falling back to the default
+    /// SCP when it too is not excluded. `None` means no alternate remains.
+    pub fn next_binding(&self, nf_type: NfType, exclude: &[String]) -> Option<ScpBinding> {
+        let bindings = self.bindings.read().unwrap();
+        if let Some(nf_bindings) = bindings.get(&nf_type) {
+            if let Some(binding) = nf_bindings
+                .iter()
+                .find(|b| !exclude.contains(&b.scp_instance_id))
+            {
+                return Some(binding.clone());
+            }
+        }
+        drop(bindings);
+        let default_scp = self.default_scp.read().unwrap();
+        default_scp
+            .as_ref()
+            .filter(|b| !exclude.contains(&b.scp_instance_id))
+            .cloned()
+    }
+
     /// Route request through SCP
     pub fn route_request(
         &self,
@@ -359,6 +384,50 @@ mod tests {
             binding.mode = mode;
             assert_eq!(binding.mode, mode);
         }
+    }
+
+    #[test]
+    fn test_next_binding_reselection() {
+        let router = ScpRouter::new();
+        router.add_binding(
+            NfType::Amf,
+            ScpBinding::new("scp-a".into(), "a.com".into(), "1.1.1.1".into(), 80),
+        );
+        router.add_binding(
+            NfType::Amf,
+            ScpBinding::new("scp-b".into(), "b.com".into(), "2.2.2.2".into(), 80),
+        );
+
+        // No exclusions → first binding.
+        assert_eq!(
+            router.next_binding(NfType::Amf, &[]).unwrap().scp_instance_id,
+            "scp-a"
+        );
+        // Exclude the first → reselect the alternate.
+        assert_eq!(
+            router
+                .next_binding(NfType::Amf, &["scp-a".to_string()])
+                .unwrap()
+                .scp_instance_id,
+            "scp-b"
+        );
+        // Exclude all specific bindings → falls back to default SCP when set.
+        assert!(router
+            .next_binding(NfType::Amf, &["scp-a".to_string(), "scp-b".to_string()])
+            .is_none());
+        router.set_default_scp(ScpBinding::new(
+            "scp-def".into(),
+            "d.com".into(),
+            "3.3.3.3".into(),
+            80,
+        ));
+        assert_eq!(
+            router
+                .next_binding(NfType::Amf, &["scp-a".to_string(), "scp-b".to_string()])
+                .unwrap()
+                .scp_instance_id,
+            "scp-def"
+        );
     }
 
     #[test]
