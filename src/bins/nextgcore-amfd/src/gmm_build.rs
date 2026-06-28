@@ -996,6 +996,20 @@ mod tests {
     }
 
     #[test]
+    fn drift_registration_accept_minimal_through_ogs_nas() {
+        use ogs_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+        // Minimal happy-path Registration Accept: tmsi=0 skips the GUTI IE and
+        // the default (empty) NSSAI skips the 0x15 IE, leaving reg-result +
+        // TAI list (0x54) + T3512 (0x5E) — the registration-critical core.
+        let mut ue = create_test_amf_ue();
+        ue.next_guti.tmsi = 0;
+        let amfd = build_registration_accept(&ue).unwrap();
+        let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
+        assert!(matches!(parsed, FiveGmmMessage::RegistrationAccept(_)));
+        assert_drift_roundtrip(&amfd, "RegistrationAccept(minimal)");
+    }
+
+    #[test]
     fn test_build_registration_accept() {
         let amf_ue = create_test_amf_ue();
         let msg = build_registration_accept(&amf_ue);
