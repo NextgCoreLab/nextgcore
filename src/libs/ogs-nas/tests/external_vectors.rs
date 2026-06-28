@@ -17,7 +17,7 @@
 //! - 3GPP TS 24.501 v18.4.0 — 5GS NAS protocol
 //! - 3GPP TS 24.301 v18.4.0 — EPS NAS protocol
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use ogs_nas::eps::*;
 use ogs_nas::fiveg::*;
 
@@ -26,6 +26,8 @@ use ogs_nas::fiveg::*;
 // ============================================================================
 
 /// Convert a compile-time hex string (no spaces) into owned Bytes for decoding.
+/// Retained for future hand-derived vectors; not all are wired up yet.
+#[allow(unused_macros)]
 macro_rules! hex_bytes {
     ($s:expr) => {{
         let s: &str = $s;
