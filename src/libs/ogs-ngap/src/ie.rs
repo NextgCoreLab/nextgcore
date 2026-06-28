@@ -53,6 +53,36 @@ fn decode_ie_value<T: AperDecode>(raw: &[u8]) -> NgapResult<T> {
     Ok(T::decode_aper(&mut decoder)?)
 }
 
+/// Criticality-driven handling of a not-comprehended IE on receive
+/// (TS 38.413 §10.3.4/§10.3.5). This is the conservative NGAP-05 default
+/// applied at every `parse_*` / transfer-decode catch-all arm:
+///
+/// - `reject`  -> surface a typed [`crate::error::NgapError::IeNotComprehended`]
+///   carrying [`CriticalityDiagnostics`] with `typeOfError = not-understood`,
+///   so the caller can answer with an Error Indication / unsuccessful outcome.
+/// - `ignore`  -> drop silently.
+/// - `notify`  -> drop (ignore-and-notify is modeled conservatively as a drop;
+///   there is no notify side-channel yet).
+///
+/// Genuinely-handled IEs never reach this helper (their match arm fires first),
+/// so it cannot regress decoding of any currently-modeled IE.
+pub(crate) fn handle_unknown_ie(field: &ProtocolIeField) -> NgapResult<()> {
+    match field.criticality {
+        Criticality::Reject => Err(crate::error::NgapError::IeNotComprehended {
+            ie_id: field.id.0,
+            criticality_diagnostics: CriticalityDiagnostics {
+                ies: vec![IeCriticalityDiagnostics {
+                    ie_criticality: field.criticality,
+                    ie_id: field.id.0,
+                    type_of_error: TypeOfError::NotUnderstood,
+                }],
+                ..Default::default()
+            },
+        }),
+        Criticality::Ignore | Criticality::Notify => Ok(()),
+    }
+}
+
 // ============================================================================
 // AMF-UE-NGAP-ID IE
 // ============================================================================
@@ -632,6 +662,26 @@ pub fn encode_global_ran_node_id(
     id: &GlobalRanNodeId,
 ) -> NgapResult<()> {
     let mut encoder = AperEncoder::new();
+    encode_global_ran_node_id_into(&mut encoder, id)?;
+    encoder.align();
+    container.push(ProtocolIeField {
+        id: ProtocolIeId(IE_ID_GLOBAL_RAN_NODE_ID),
+        criticality: Criticality::Reject,
+        value: encoder.into_bytes().to_vec(),
+    });
+    Ok(())
+}
+
+/// Encode the GlobalRANNodeID CHOICE directly into an existing encoder.
+///
+/// Single source of truth for the NGAP-02/03-conformant (non-extensible,
+/// octet-aligned) GlobalRANNodeID encoding, shared by the standalone IE
+/// (`encode_global_ran_node_id`) and the inline handover TargetID path
+/// (`encode_target_id`) so the two can never drift again (NGAP-02b).
+fn encode_global_ran_node_id_into(
+    encoder: &mut AperEncoder,
+    id: &GlobalRanNodeId,
+) -> NgapResult<()> {
     match id {
         GlobalRanNodeId::GlobalGnbId {
             plmn_identity,
@@ -674,18 +724,19 @@ pub fn encode_global_ran_node_id(
             encoder.write_bits(*ng_enb_id as u64, 20);
         }
     }
-    encoder.align();
-    container.push(ProtocolIeField {
-        id: ProtocolIeId(IE_ID_GLOBAL_RAN_NODE_ID),
-        criticality: Criticality::Reject,
-        value: encoder.into_bytes().to_vec(),
-    });
     Ok(())
 }
 
 /// Decode Global RAN Node ID from IE field
 pub fn decode_global_ran_node_id(field: &ProtocolIeField) -> NgapResult<GlobalRanNodeId> {
     let mut decoder = AperDecoder::new(&field.value);
+    decode_global_ran_node_id_into(&mut decoder)
+}
+
+/// Decode the GlobalRANNodeID CHOICE from an existing decoder (mirror of
+/// `encode_global_ran_node_id_into`); shared by the standalone IE and the
+/// inline handover TargetID path so decode can never drift either (NGAP-02b).
+fn decode_global_ran_node_id_into(decoder: &mut AperDecoder) -> NgapResult<GlobalRanNodeId> {
     let choice = decoder.decode_choice_index(4, false)?;
     match choice {
         0 => {
@@ -1412,7 +1463,9 @@ pub fn encode_target_id(
             // TargetRANNodeID SEQUENCE { globalRANNodeID, selectedTAI, iE-Extensions OPTIONAL }
             encoder.write_bit(false); // extension
             encoder.write_bit(false); // no iE-Extensions
-            encode_global_ran_node_id_inline(&mut encoder, global_ran_node_id)?;
+            // NGAP-02b: reuse the single shared (conformant) GlobalRANNodeID
+            // encoder instead of a now-deleted misaligned/extensible inline copy.
+            encode_global_ran_node_id_into(&mut encoder, global_ran_node_id)?;
             encode_tai_inline(&mut encoder, selected_tai)?;
         }
         TargetId::TargetGlobalNgEnbId {
@@ -1435,43 +1488,6 @@ pub fn encode_target_id(
         criticality: Criticality::Reject,
         value: encoder.into_bytes().to_vec(),
     });
-    Ok(())
-}
-
-/// Encode GlobalRANNodeID inline
-fn encode_global_ran_node_id_inline(
-    encoder: &mut AperEncoder,
-    ran_id: &GlobalRanNodeId,
-) -> NgapResult<()> {
-    match ran_id {
-        GlobalRanNodeId::GlobalGnbId {
-            plmn_identity,
-            gnb_id,
-            gnb_id_len,
-        } => {
-            encoder.encode_choice_index(0, 2, true)?;
-            encoder.write_bit(false);
-            encoder.write_bit(false);
-            encoder.encode_octet_string(plmn_identity, Some(3), Some(3))?;
-            // GNB-ID CHOICE: gNB-ID is a BIT STRING (SIZE(22..32))
-            encoder.encode_choice_index(0, 1, true)?;
-            let len = *gnb_id_len as usize;
-            encoder.encode_constrained_length(len, 22, 32)?;
-            encoder.write_bits(*gnb_id as u64, len);
-        }
-        GlobalRanNodeId::GlobalNgEnbId {
-            plmn_identity,
-            ng_enb_id,
-        } => {
-            encoder.encode_choice_index(1, 2, true)?;
-            encoder.write_bit(false);
-            encoder.write_bit(false);
-            encoder.encode_octet_string(plmn_identity, Some(3), Some(3))?;
-            // NgENB-ID CHOICE: macroNgENB-ID is a BIT STRING (SIZE(20))
-            encoder.encode_choice_index(0, 2, true)?;
-            encoder.write_bits(*ng_enb_id as u64, 20);
-        }
-    }
     Ok(())
 }
 
@@ -2004,40 +2020,6 @@ pub fn decode_handover_type(field: &ProtocolIeField) -> NgapResult<HandoverType>
     }
 }
 
-/// Decode GlobalRANNodeID inline (mirrors `encode_global_ran_node_id_inline`)
-fn decode_global_ran_node_id_inline(decoder: &mut AperDecoder) -> NgapResult<GlobalRanNodeId> {
-    let choice = decoder.decode_choice_index(2, true)?;
-    let _ext = decoder.read_bit()?;
-    let _ie_ext = decoder.read_bit()?;
-    let plmn_bytes = decoder.decode_octet_string(Some(3), Some(3))?;
-    let mut plmn_identity = [0u8; 3];
-    plmn_identity.copy_from_slice(&plmn_bytes);
-    match choice {
-        0 => {
-            let _gnb_choice = decoder.decode_choice_index(1, true)?;
-            let gnb_id_len = decoder.decode_constrained_length(22, 32)?;
-            let gnb_id = decoder.read_bits(gnb_id_len)? as u32;
-            Ok(GlobalRanNodeId::GlobalGnbId {
-                plmn_identity,
-                gnb_id,
-                gnb_id_len: gnb_id_len as u8,
-            })
-        }
-        1 => {
-            let _enb_choice = decoder.decode_choice_index(2, true)?;
-            let ng_enb_id = decoder.read_bits(20)? as u32;
-            Ok(GlobalRanNodeId::GlobalNgEnbId {
-                plmn_identity,
-                ng_enb_id,
-            })
-        }
-        _ => Err(crate::error::NgapError::InvalidIeValue {
-            ie_name: "GlobalRANNodeID",
-            reason: format!("Unknown choice index: {choice}"),
-        }),
-    }
-}
-
 /// Decode TAI inline (mirrors `encode_tai_inline`)
 fn decode_tai_inline(decoder: &mut AperDecoder) -> NgapResult<TaiListItem> {
     let _ext = decoder.read_bit()?;
@@ -2059,7 +2041,8 @@ pub fn decode_target_id(field: &ProtocolIeField) -> NgapResult<TargetId> {
         0 => {
             let _ext = decoder.read_bit()?;
             let _ie_ext = decoder.read_bit()?;
-            let global_ran_node_id = decode_global_ran_node_id_inline(&mut decoder)?;
+            // NGAP-02b: shared decoder (mirror of the shared encoder).
+            let global_ran_node_id = decode_global_ran_node_id_into(&mut decoder)?;
             let selected_tai = decode_tai_inline(&mut decoder)?;
             Ok(TargetId::TargetRanNodeId {
                 global_ran_node_id,
@@ -2726,6 +2709,113 @@ mod global_ran_node_id_tests {
                 assert_eq!(ng_enb_id, 0x0ABCD);
             }
             other => panic!("expected GlobalNgEnbId, got {other:?}"),
+        }
+    }
+
+    /// NGAP-02b: the handover TargetID path must encode its inner
+    /// GlobalRANNodeID with the SAME conformant (non-extensible, octet-aligned)
+    /// form as the NG-Setup path — it previously used a duplicate, broken
+    /// (extensible + misaligned) inline encoder. Byte-vector pins the new bytes.
+    #[test]
+    fn test_handover_target_id_global_ran_node_id_byte_vector() {
+        let target = TargetId::TargetRanNodeId {
+            global_ran_node_id: GlobalRanNodeId::GlobalGnbId {
+                plmn_identity: [0x00, 0xf1, 0x10],
+                gnb_id: 0x000ABC,
+                gnb_id_len: 24,
+            },
+            selected_tai: TaiListItem {
+                tai_plmn: [0x00, 0xf1, 0x10],
+                tai_tac: [0x00, 0x00, 0x01],
+            },
+        };
+        let mut container = ProtocolIeContainer::new();
+        encode_target_id(&mut container, &target).unwrap();
+        let value = &container.ies[0].value;
+
+        // Reference vector (hand-derived from X.691 Aligned PER):
+        //   octet0 = 0x00: TargetID choice "00" + SEQ ext 0 + ie-ext 0 +
+        //                  GlobalRANNodeID choice "00" (no ext bit) + SEQ ext 0 + ie-ext 0
+        //   octet1..3      = PLMN 00 f1 10
+        //   octet4 = 0x10: GNB-ID choice bit 0 + len-determinant (24-22=2 over 4 bits) + pad
+        //   octet5..7      = gNB-ID 00 0A BC  (octet-aligned, X.691 §16)
+        //   octet8 = 0x00: TAI ext 0 + ie-ext 0 + pad
+        //   octet9..11     = selected-TAI PLMN 00 f1 10
+        //   octet12..14    = selected-TAI TAC 00 00 01
+        assert_eq!(
+            value,
+            &vec![
+                0x00, 0x00, 0xf1, 0x10, 0x10, 0x00, 0x0A, 0xBC, 0x00, 0x00, 0xf1, 0x10, 0x00,
+                0x00, 0x01
+            ]
+        );
+        // No spurious leading extension bit on the GlobalRANNodeID choice and the
+        // gNB-ID content sits octet-aligned in octets 5..8.
+        assert_eq!(value[0], 0x00);
+        assert_eq!(&value[5..8], &[0x00, 0x0A, 0xBC]);
+
+        // Roundtrips through the shared decoder.
+        match decode_target_id(&container.ies[0]).unwrap() {
+            TargetId::TargetRanNodeId {
+                global_ran_node_id:
+                    GlobalRanNodeId::GlobalGnbId {
+                        plmn_identity,
+                        gnb_id,
+                        gnb_id_len,
+                    },
+                selected_tai,
+            } => {
+                assert_eq!(plmn_identity, [0x00, 0xf1, 0x10]);
+                assert_eq!(gnb_id, 0x000ABC);
+                assert_eq!(gnb_id_len, 24);
+                assert_eq!(selected_tai.tai_tac, [0x00, 0x00, 0x01]);
+            }
+            other => panic!("expected TargetRanNodeId/GlobalGnbId, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod unknown_ie_tests {
+    use super::*;
+
+    /// NGAP-05: a not-comprehended IE with reject criticality is surfaced as a
+    /// typed error carrying CriticalityDiagnostics (typeOfError=not-understood);
+    /// ignore/notify criticality drop silently.
+    #[test]
+    fn test_handle_unknown_ie_criticality_behavior() {
+        let reject = ProtocolIeField {
+            id: ProtocolIeId(9999),
+            criticality: Criticality::Reject,
+            value: vec![],
+        };
+        match handle_unknown_ie(&reject).unwrap_err() {
+            crate::error::NgapError::IeNotComprehended {
+                ie_id,
+                criticality_diagnostics,
+            } => {
+                assert_eq!(ie_id, 9999);
+                assert_eq!(criticality_diagnostics.ies.len(), 1);
+                assert_eq!(criticality_diagnostics.ies[0].ie_id, 9999);
+                assert_eq!(
+                    criticality_diagnostics.ies[0].type_of_error,
+                    TypeOfError::NotUnderstood
+                );
+                assert_eq!(
+                    criticality_diagnostics.ies[0].ie_criticality,
+                    Criticality::Reject
+                );
+            }
+            other => panic!("expected IeNotComprehended, got {other:?}"),
+        }
+
+        for crit in [Criticality::Ignore, Criticality::Notify] {
+            let field = ProtocolIeField {
+                id: ProtocolIeId(9999),
+                criticality: crit,
+                value: vec![],
+            };
+            assert!(handle_unknown_ie(&field).is_ok());
         }
     }
 }

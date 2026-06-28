@@ -21,6 +21,9 @@ use crate::error::{NgapError, NgapResult};
 // Transfer-container ProtocolIE IDs (TS 38.413 Section 9.4)
 const IE_ID_PDU_SESSION_AGGREGATE_MAXIMUM_BIT_RATE: u16 = 130;
 const IE_ID_UL_NGU_UP_TNL_INFORMATION: u16 = 139;
+/// AdditionalUL-NGU-UP-TNLInformation (TS 38.413 §9.3.4.1, Rel-15 multi-
+/// connectivity, criticality reject). NGAP-07.
+const IE_ID_ADDITIONAL_UL_NGU_UP_TNL_INFORMATION: u16 = 126;
 const IE_ID_DATA_FORWARDING_NOT_POSSIBLE: u16 = 127;
 const IE_ID_PDU_SESSION_TYPE: u16 = 134;
 const IE_ID_SECURITY_INDICATION: u16 = 138;
@@ -197,6 +200,28 @@ impl UpTransportLayerInformation {
             gtp_teid,
         }))
     }
+}
+
+/// Decode an `AdditionalUL-NGU-UP-TNLInformation` (NGAP-07).
+///
+/// `AdditionalUL-NGU-UP-TNLInformation ::= UPTransportLayerInformationList`,
+/// `UPTransportLayerInformationList ::= SEQUENCE (SIZE(1..maxnoofMultiConnectivityMinusOne=3))
+/// OF UPTransportLayerInformationItem`, where each item is the extensible
+/// `SEQUENCE { nGU-UP-TNLInformation UPTransportLayerInformation, iE-Extensions OPTIONAL, ... }`
+/// (TS 38.413 §9.3.4.1, Rel-15 multi-connectivity). Returning the endpoints lets
+/// a caller validate a conformant peer's transfer instead of treating this known
+/// optional reject-criticality IE as not-comprehended.
+fn decode_additional_ul_ngu_up_tnl_information(
+    decoder: &mut AperDecoder,
+) -> NgapResult<Vec<UpTransportLayerInformation>> {
+    let count = decoder.decode_constrained_length(1, 3)?;
+    let mut list = Vec::with_capacity(count);
+    for _ in 0..count {
+        let _ext = decoder.read_bit()?; // item extension marker
+        let _ie_ext = decoder.read_bit()?; // no iE-Extensions
+        list.push(UpTransportLayerInformation::decode(decoder)?);
+    }
+    Ok(list)
 }
 
 // ============================================================================
@@ -1165,6 +1190,17 @@ impl PduSessionResourceSetupRequestTransfer {
                 IE_ID_UL_NGU_UP_TNL_INFORMATION => {
                     ul_tnl = Some(UpTransportLayerInformation::decode(&mut decoder)?);
                 }
+                IE_ID_ADDITIONAL_UL_NGU_UP_TNL_INFORMATION => {
+                    // NGAP-07: known Rel-15 multi-connectivity optional IE that
+                    // was previously silently skipped. Decode + validate so a
+                    // conformant peer's transfer is accepted (not rejected as
+                    // not-comprehended). The additional UL endpoints are not
+                    // retained on the public struct — adding a field would force
+                    // amfd/smfd construction-site churn outside this crate, and a
+                    // single-connectivity SMF ignores additional UL tunnels.
+                    let _additional =
+                        decode_additional_ul_ngu_up_tnl_information(&mut decoder)?;
+                }
                 IE_ID_DATA_FORWARDING_NOT_POSSIBLE => {
                     let constraint = Constraint::extensible(0, 0);
                     let _val = decoder.decode_enumerated(&constraint)?;
@@ -1187,7 +1223,7 @@ impl PduSessionResourceSetupRequestTransfer {
                     }
                     qos_flow_list = Some(list);
                 }
-                _ => {} // Skip unknown IEs
+                _ => crate::ie::handle_unknown_ie(field)?,
             }
         }
         Ok(Self {
@@ -1473,7 +1509,7 @@ impl PduSessionResourceModifyRequestTransfer {
                     transfer.qos_flow_to_release_list =
                         decode_qos_flow_with_cause_list(&mut decoder)?;
                 }
-                _ => {} // Skip unknown IEs
+                _ => crate::ie::handle_unknown_ie(field)?,
             }
         }
         Ok(transfer)
@@ -1745,6 +1781,104 @@ mod tests {
             reflective_qos_attribute: false,
             additional_qos_flow_information: false,
         }
+    }
+
+    /// Build a minimal valid SetupRequestTransfer container (mandatory IEs only)
+    /// and let the caller inject extra IEs, then return the encoded bytes.
+    fn build_setup_request_container(
+        extra: impl FnOnce(&mut ProtocolIeContainer) -> NgapResult<()>,
+    ) -> NgapResult<Vec<u8>> {
+        let mut container = ProtocolIeContainer::new();
+        push_transfer_ie(
+            &mut container,
+            IE_ID_UL_NGU_UP_TNL_INFORMATION,
+            Criticality::Reject,
+            |enc| sample_tunnel().encode(enc),
+        )?;
+        extra(&mut container)?;
+        push_transfer_ie(
+            &mut container,
+            IE_ID_PDU_SESSION_TYPE,
+            Criticality::Reject,
+            |enc| {
+                enc.encode_enumerated(PduSessionType::Ipv4 as i64, &PduSessionType::CONSTRAINT)?;
+                Ok(())
+            },
+        )?;
+        push_transfer_ie(
+            &mut container,
+            IE_ID_QOS_FLOW_SETUP_REQUEST_LIST,
+            Criticality::Reject,
+            |enc| {
+                enc.encode_constrained_length(1, 1, 64)?;
+                QosFlowSetupRequestItem {
+                    qos_flow_identifier: 1,
+                    qos_flow_level_qos_parameters: sample_qos_params(),
+                    e_rab_id: None,
+                }
+                .encode(enc)
+            },
+        )?;
+        encode_container(&container)
+    }
+
+    /// NGAP-07: a SetupRequestTransfer carrying the Rel-15 multi-connectivity
+    /// AdditionalUL-NGU-UP-TNLInformation (id 126, criticality reject) — formerly
+    /// silently skipped — now decodes successfully (the IE is comprehended and
+    /// validated, not treated as not-comprehended).
+    #[test]
+    fn test_setup_request_transfer_with_additional_ul_ngu() {
+        let bytes = build_setup_request_container(|c| {
+            push_transfer_ie(
+                c,
+                IE_ID_ADDITIONAL_UL_NGU_UP_TNL_INFORMATION,
+                Criticality::Reject,
+                |enc| {
+                    // UPTransportLayerInformationList: 1 item, extensible item
+                    // SEQUENCE preamble (ext=0, ie-ext=0), then a GTP tunnel.
+                    enc.encode_constrained_length(1, 1, 3)?;
+                    enc.write_bit(false);
+                    enc.write_bit(false);
+                    sample_tunnel().encode(enc)
+                },
+            )
+        })
+        .unwrap();
+        let decoded = PduSessionResourceSetupRequestTransfer::decode(&bytes).unwrap();
+        // Mandatory fields still parse; additional UL endpoints are validated then dropped.
+        assert_eq!(decoded.pdu_session_type, PduSessionType::Ipv4);
+        assert_eq!(decoded.qos_flow_setup_request_list.len(), 1);
+    }
+
+    /// NGAP-05: a not-comprehended IE drives decode by its criticality —
+    /// reject is surfaced as IeNotComprehended, ignore is dropped and the rest
+    /// of the (valid) transfer still decodes.
+    #[test]
+    fn test_setup_request_transfer_unknown_ie_criticality() {
+        const UNKNOWN_IE_ID: u16 = 60000;
+
+        let reject_bytes = build_setup_request_container(|c| {
+            push_transfer_ie(c, UNKNOWN_IE_ID, Criticality::Reject, |enc| {
+                enc.encode_octet_string(&[0xAB, 0xCD], None, None)?;
+                Ok(())
+            })
+        })
+        .unwrap();
+        match PduSessionResourceSetupRequestTransfer::decode(&reject_bytes) {
+            Err(NgapError::IeNotComprehended { ie_id, .. }) => assert_eq!(ie_id, UNKNOWN_IE_ID),
+            other => panic!("expected IeNotComprehended, got {other:?}"),
+        }
+
+        let ignore_bytes = build_setup_request_container(|c| {
+            push_transfer_ie(c, UNKNOWN_IE_ID, Criticality::Ignore, |enc| {
+                enc.encode_octet_string(&[0xAB, 0xCD], None, None)?;
+                Ok(())
+            })
+        })
+        .unwrap();
+        let decoded = PduSessionResourceSetupRequestTransfer::decode(&ignore_bytes).unwrap();
+        assert_eq!(decoded.pdu_session_type, PduSessionType::Ipv4);
+        assert_eq!(decoded.qos_flow_setup_request_list.len(), 1);
     }
 
     #[test]

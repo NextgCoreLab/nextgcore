@@ -32,6 +32,16 @@ pub enum NgapError {
     /// Encoding error
     #[error("Encoding error: {0}")]
     EncodingError(String),
+
+    /// A received IE was not comprehended and carried reject criticality
+    /// (TS 38.413 §10.3.4/§10.3.5). Carries CriticalityDiagnostics so the
+    /// caller (amfd) can answer with an Error Indication / unsuccessful
+    /// outcome. NGAP-05.
+    #[error("IE not comprehended with reject criticality: id={ie_id}")]
+    IeNotComprehended {
+        ie_id: u16,
+        criticality_diagnostics: crate::types::CriticalityDiagnostics,
+    },
 }
 
 pub type NgapResult<T> = Result<T, NgapError>;

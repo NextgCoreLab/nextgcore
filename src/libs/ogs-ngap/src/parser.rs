@@ -376,7 +376,7 @@ fn parse_ng_setup_request(container: ProtocolIeContainer) -> NgapResult<NgSetupR
             ie::IE_ID_DEFAULT_PAGING_DRX => {
                 default_paging_drx = ie::decode_default_paging_drx(field)?;
             }
-            _ => {} // Skip unknown IEs
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -415,7 +415,7 @@ fn parse_ng_setup_response(container: ProtocolIeContainer) -> NgapResult<NgSetup
             ie::IE_ID_PLMN_SUPPORT_LIST => {
                 plmn_support_list = Some(ie::decode_plmn_support_list(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -455,7 +455,7 @@ fn parse_ng_setup_failure(container: ProtocolIeContainer) -> NgapResult<NgSetupF
             ProtocolIeId::CRITICALITY_DIAGNOSTICS => {
                 criticality_diagnostics = Some(ie::decode_criticality_diagnostics(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -497,7 +497,7 @@ fn parse_initial_ue_message(container: ProtocolIeContainer) -> NgapResult<Initia
             _ if field.id.0 == ie::IE_ID_UE_CONTEXT_REQUEST => {
                 ue_context_request = Some(true);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -537,7 +537,7 @@ fn parse_downlink_nas_transport(
             ProtocolIeId::NAS_PDU => {
                 nas_pdu = Some(ie::decode_nas_pdu(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -577,7 +577,7 @@ fn parse_uplink_nas_transport(container: ProtocolIeContainer) -> NgapResult<Upli
             ProtocolIeId::USER_LOCATION_INFORMATION => {
                 user_location_info = Some(ie::decode_user_location_info(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -643,7 +643,7 @@ fn parse_initial_context_setup_request(
             _ if field.id.0 == ie::IE_ID_UE_AGGREGATE_MAXIMUM_BIT_RATE => {
                 ue_ambr = Some(ie::decode_ue_ambr(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -693,7 +693,7 @@ fn parse_initial_context_setup_response(
             ProtocolIeId::RAN_UE_NGAP_ID => {
                 ran_ue_ngap_id = Some(ie::decode_ran_ue_ngap_id(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -727,7 +727,7 @@ fn parse_initial_context_setup_failure(
             ProtocolIeId::CAUSE => {
                 cause = Some(ie::decode_cause(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -773,7 +773,7 @@ fn parse_pdu_session_resource_setup_request(
             _ if field.id.0 == ie::IE_ID_PDU_SESSION_RESOURCE_SETUP_LIST_SU_REQ => {
                 pdu_session_list = Some(ie::decode_pdu_session_setup_list_su_req(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -816,7 +816,7 @@ fn parse_pdu_session_resource_setup_response(
             _ if field.id.0 == ie::IE_ID_PDU_SESSION_RESOURCE_FAILED_TO_SETUP_LIST_SU_RES => {
                 failed_list = ie::decode_pdu_session_failed_list(field)?;
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -856,7 +856,7 @@ fn parse_pdu_session_resource_release_command(
             _ if field.id.0 == ie::IE_ID_PDU_SESSION_RESOURCE_TO_RELEASE_LIST_REL_CMD => {
                 pdu_session_list = ie::decode_pdu_session_release_list(field)?;
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -899,7 +899,7 @@ fn parse_pdu_session_resource_release_response(
             _ if field.id.0 == ie::IE_ID_PDU_SESSION_RESOURCE_RELEASED_LIST_REL_RES => {
                 released_list = ie::decode_pdu_session_released_list(field)?;
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -934,7 +934,7 @@ fn parse_ue_context_release_command(
             _ if field.id.0 == ie::IE_ID_UE_NGAP_IDS => {
                 ue_ngap_ids = Some(ie::decode_ue_ngap_ids(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -964,7 +964,7 @@ fn parse_ue_context_release_complete(
             ProtocolIeId::RAN_UE_NGAP_ID => {
                 ran_ue_ngap_id = Some(ie::decode_ran_ue_ngap_id(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -998,7 +998,7 @@ fn parse_ue_context_release_request(
             ProtocolIeId::CAUSE => {
                 cause = Some(ie::decode_cause(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -1040,7 +1040,7 @@ fn parse_pdu_session_resource_modify_request(
             _ if field.id.0 == ie::IE_ID_PDU_SESSION_RESOURCE_MODIFY_LIST_MOD_REQ => {
                 pdu_session_list = Some(ie::decode_pdu_session_modify_list_req(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -1082,7 +1082,7 @@ fn parse_pdu_session_resource_modify_response(
             _ if field.id.0 == ie::IE_ID_PDU_SESSION_RESOURCE_FAILED_TO_MODIFY_LIST_MOD_RES => {
                 failed_list = ie::decode_pdu_session_failed_list(field)?;
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -1122,7 +1122,7 @@ fn parse_pdu_session_resource_notify(
             _ if field.id.0 == ie::IE_ID_PDU_SESSION_RESOURCE_RELEASED_LIST_NOT => {
                 released_list = ie::decode_pdu_session_released_list(field)?;
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -1165,7 +1165,7 @@ fn parse_pdu_session_resource_modify_indication(
             _ if field.id.0 == ie::IE_ID_PDU_SESSION_RESOURCE_MODIFY_LIST_MOD_IND => {
                 modify_list = Some(ie::decode_pdu_session_modify_list_mod_ind(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -1207,7 +1207,7 @@ fn parse_pdu_session_resource_modify_confirm(
             _ if field.id.0 == ie::IE_ID_PDU_SESSION_RESOURCE_FAILED_TO_MODIFY_LIST_MOD_CFM => {
                 failed_list = ie::decode_pdu_session_failed_list(field)?;
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -1241,7 +1241,7 @@ fn parse_ng_reset(container: ProtocolIeContainer) -> NgapResult<NgReset> {
             _ if field.id.0 == ie::IE_ID_RESET_TYPE => {
                 reset_type = Some(ie::decode_reset_type(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -1269,7 +1269,7 @@ fn parse_ng_reset_acknowledge(container: ProtocolIeContainer) -> NgapResult<NgRe
             _ if field.id.0 == ie::IE_ID_UE_ASSOCIATED_LOGICAL_NG_CONNECTION_LIST => {
                 connections = Some(ie::decode_ng_connection_list(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -1303,7 +1303,7 @@ fn parse_error_indication(container: ProtocolIeContainer) -> NgapResult<ErrorInd
             ProtocolIeId::CRITICALITY_DIAGNOSTICS => {
                 criticality_diagnostics = Some(ie::decode_criticality_diagnostics(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -1341,7 +1341,7 @@ fn parse_ran_configuration_update(
             ie::IE_ID_GLOBAL_RAN_NODE_ID => {
                 global_ran_node_id = Some(ie::decode_global_ran_node_id(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -1387,7 +1387,7 @@ fn parse_ran_configuration_update_failure(
             ProtocolIeId::CRITICALITY_DIAGNOSTICS => {
                 criticality_diagnostics = Some(ie::decode_criticality_diagnostics(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -1423,7 +1423,7 @@ fn parse_amf_configuration_update(
             ie::IE_ID_PLMN_SUPPORT_LIST => {
                 plmn_support_list = Some(ie::decode_plmn_support_list(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -1509,7 +1509,7 @@ fn parse_nas_non_delivery_indication(
             ProtocolIeId::CAUSE => {
                 cause = Some(ie::decode_cause(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -1569,7 +1569,7 @@ fn parse_handover_required(container: ProtocolIeContainer) -> NgapResult<Handove
             _ if field.id.0 == ie::IE_ID_SOURCE_TO_TARGET_TRANSPARENT_CONTAINER => {
                 source_to_target_container = Some(ie::decode_raw_octet_ie(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -1629,7 +1629,7 @@ fn parse_handover_preparation_failure(
             ProtocolIeId::CRITICALITY_DIAGNOSTICS => {
                 criticality_diagnostics = Some(ie::decode_criticality_diagnostics(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -1678,7 +1678,7 @@ fn parse_path_switch_request(container: ProtocolIeContainer) -> NgapResult<PathS
             _ if field.id.0 == ie::IE_ID_PDU_SESSION_RESOURCE_FAILED_TO_SETUP_LIST_PS_REQ => {
                 failed_list = Some(ie::decode_pdu_session_failed_list(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -1743,7 +1743,7 @@ fn parse_path_switch_request_acknowledge(
             _ if field.id.0 == ie::IE_ID_ALLOWED_NSSAI => {
                 allowed_nssai = Some(ie::decode_allowed_nssai(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -1799,7 +1799,7 @@ fn parse_path_switch_request_failure(
             _ if field.id.0 == ie::IE_ID_PDU_SESSION_RESOURCE_RELEASED_LIST_PS_FAIL => {
                 released_list = Some(ie::decode_pdu_session_released_list(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -1871,7 +1871,7 @@ fn parse_handover_request(container: ProtocolIeContainer) -> NgapResult<Handover
             _ if field.id.0 == ie::IE_ID_GUAMI => {
                 guami = Some(ie::decode_guami_ie(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -1950,7 +1950,7 @@ fn parse_handover_request_acknowledge(
             _ if field.id.0 == ie::IE_ID_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER => {
                 target_to_source_container = Some(ie::decode_raw_octet_ie(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -1994,7 +1994,7 @@ fn parse_handover_failure(container: ProtocolIeContainer) -> NgapResult<Handover
             ProtocolIeId::CRITICALITY_DIAGNOSTICS => {
                 criticality_diagnostics = Some(ie::decode_criticality_diagnostics(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -2052,7 +2052,7 @@ fn parse_handover_command(container: ProtocolIeContainer) -> NgapResult<Handover
             _ if field.id.0 == ie::IE_ID_TARGET_TO_SOURCE_TRANSPARENT_CONTAINER => {
                 target_to_source_container = Some(ie::decode_raw_octet_ie(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -2101,7 +2101,7 @@ fn parse_handover_notify(container: ProtocolIeContainer) -> NgapResult<HandoverN
             ProtocolIeId::USER_LOCATION_INFORMATION => {
                 user_location_info = Some(ie::decode_user_location_info(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -2138,7 +2138,7 @@ fn parse_handover_cancel(container: ProtocolIeContainer) -> NgapResult<HandoverC
             ProtocolIeId::CAUSE => {
                 cause = Some(ie::decode_cause(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
@@ -2177,7 +2177,7 @@ fn parse_handover_cancel_acknowledge(
             ProtocolIeId::CRITICALITY_DIAGNOSTICS => {
                 criticality_diagnostics = Some(ie::decode_criticality_diagnostics(field)?);
             }
-            _ => {}
+            _ => ie::handle_unknown_ie(field)?,
         }
     }
 
