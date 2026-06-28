@@ -6,9 +6,10 @@ use crate::error::{PfcpError, PfcpResult};
 use crate::header::{PfcpHeader, PfcpMessageType};
 use crate::ie::{encode_u16_ie, encode_u32_ie, encode_u8_ie, IeHeader, IeType, RawIe};
 use crate::types::{
-    CpFunctionFeatures, CreateBar, CreateFar, CreatePdr, CreateQer, CreateUrr, DownlinkDataReport,
-    FSeid, GracefulReleasePeriod, NodeId, NodeReportType, PfcpAssociationReleaseRequest, PfcpCause,
-    RemoveFar, RemovePdr, ReportType, UpFunctionFeatures, UpdateFar, UpdatePdr, UsageReportSrr,
+    ApplicationIdsPfds, CpFunctionFeatures, CreateBar, CreateFar, CreatePdr, CreateQer, CreateUrr,
+    DownlinkDataReport, FSeid, GracefulReleasePeriod, NodeId, NodeReportType,
+    PfcpAssociationReleaseRequest, PfcpCause, PfdPartialFailureInformation, RemoveFar, RemovePdr,
+    ReportType, UpFunctionFeatures, UpdateFar, UpdatePdr, UsageReportSrr,
     UserPlanePathFailureReport,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -1358,6 +1359,144 @@ impl AssociationUpdateResponse {
     }
 }
 
+/// PFCP PFD Management Request (TS 29.244 §7.4.3.1, message type 3). Carries
+/// zero or more Application ID's PFDs IEs (absence => delete all stored PFDs for
+/// every Application ID, §6.2.5.3) plus an optional Node ID.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PfdManagementRequest {
+    pub application_ids_pfds: Vec<ApplicationIdsPfds>,
+    pub node_id: Option<NodeId>,
+}
+
+impl PfdManagementRequest {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        for app in &self.application_ids_pfds {
+            let mut inner = BytesMut::new();
+            app.encode(&mut inner);
+            IeHeader::new(IeType::ApplicationIdsPfds as u16, inner.len() as u16).encode(buf);
+            buf.put_slice(&inner);
+        }
+        if let Some(node_id) = &self.node_id {
+            let mut nb = BytesMut::new();
+            node_id.encode(&mut nb);
+            IeHeader::new(IeType::NodeId as u16, nb.len() as u16).encode(buf);
+            buf.put_slice(&nb);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        let mut application_ids_pfds = Vec::new();
+        let mut node_id = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::ApplicationIdsPfds as u16 => {
+                    application_ids_pfds.push(ApplicationIdsPfds::decode(&ie.data)?);
+                }
+                t if t == IeType::NodeId as u16 => {
+                    let mut data = ie.data;
+                    node_id = Some(NodeId::decode(&mut data)?);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            application_ids_pfds,
+            node_id,
+        })
+    }
+}
+
+/// PFCP PFD Management Response (TS 29.244 §7.4.3.2, message type 4). Mandatory
+/// Cause, optional Offending IE / Node ID, and zero or more PFD Partial Failure
+/// Information IEs (present on partial acceptance, §5.42).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PfdManagementResponse {
+    pub cause: PfcpCause,
+    pub offending_ie: Option<u16>,
+    pub node_id: Option<NodeId>,
+    pub pfd_partial_failure_information: Vec<PfdPartialFailureInformation>,
+}
+
+impl PfdManagementResponse {
+    pub fn new(cause: PfcpCause) -> Self {
+        Self {
+            cause,
+            offending_ie: None,
+            node_id: None,
+            pfd_partial_failure_information: Vec::new(),
+        }
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        encode_u8_ie(buf, IeType::Cause, self.cause as u8);
+
+        if let Some(offending) = self.offending_ie {
+            encode_u16_ie(buf, IeType::OffendingIe, offending);
+        }
+
+        if let Some(node_id) = &self.node_id {
+            let mut nb = BytesMut::new();
+            node_id.encode(&mut nb);
+            IeHeader::new(IeType::NodeId as u16, nb.len() as u16).encode(buf);
+            buf.put_slice(&nb);
+        }
+
+        for info in &self.pfd_partial_failure_information {
+            let mut inner = BytesMut::new();
+            info.encode(&mut inner);
+            IeHeader::new(
+                IeType::PfdPartialFailureInformation as u16,
+                inner.len() as u16,
+            )
+            .encode(buf);
+            buf.put_slice(&inner);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        let mut cause = None;
+        let mut offending_ie = None;
+        let mut node_id = None;
+        let mut pfd_partial_failure_information = Vec::new();
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::Cause as u16 => {
+                    if !ie.data.is_empty() {
+                        cause = Some(PfcpCause::try_from(ie.data[0])?);
+                    }
+                }
+                t if t == IeType::OffendingIe as u16 => {
+                    if ie.data.len() >= 2 {
+                        let mut data = ie.data;
+                        offending_ie = Some(data.get_u16());
+                    }
+                }
+                t if t == IeType::NodeId as u16 => {
+                    let mut data = ie.data;
+                    node_id = Some(NodeId::decode(&mut data)?);
+                }
+                t if t == IeType::PfdPartialFailureInformation as u16 => {
+                    pfd_partial_failure_information
+                        .push(PfdPartialFailureInformation::decode(&ie.data)?);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            cause: cause.ok_or_else(|| PfcpError::MissingMandatoryIe("Cause".to_string()))?,
+            offending_ie,
+            node_id,
+            pfd_partial_failure_information,
+        })
+    }
+}
+
 /// PFCP Message enum containing all message types
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PfcpMessage {
@@ -1379,6 +1518,8 @@ pub enum PfcpMessage {
     NodeReportResponse(NodeReportResponse),
     AssociationUpdateRequest(AssociationUpdateRequest),
     AssociationUpdateResponse(AssociationUpdateResponse),
+    PfdManagementRequest(PfdManagementRequest),
+    PfdManagementResponse(PfdManagementResponse),
 }
 
 impl PfcpMessage {
@@ -1403,6 +1544,8 @@ impl PfcpMessage {
             Self::NodeReportResponse(_) => PfcpMessageType::NodeReportResponse,
             Self::AssociationUpdateRequest(_) => PfcpMessageType::AssociationUpdateRequest,
             Self::AssociationUpdateResponse(_) => PfcpMessageType::AssociationUpdateResponse,
+            Self::PfdManagementRequest(_) => PfcpMessageType::PfdManagementRequest,
+            Self::PfdManagementResponse(_) => PfcpMessageType::PfdManagementResponse,
         }
     }
 
@@ -1427,6 +1570,8 @@ impl PfcpMessage {
             Self::NodeReportResponse(msg) => msg.encode(buf),
             Self::AssociationUpdateRequest(msg) => msg.encode(buf),
             Self::AssociationUpdateResponse(msg) => msg.encode(buf),
+            Self::PfdManagementRequest(msg) => msg.encode(buf),
+            Self::PfdManagementResponse(msg) => msg.encode(buf),
         }
     }
 
@@ -1486,6 +1631,12 @@ impl PfcpMessage {
             )),
             PfcpMessageType::AssociationUpdateResponse => Ok(Self::AssociationUpdateResponse(
                 AssociationUpdateResponse::decode(buf)?,
+            )),
+            PfcpMessageType::PfdManagementRequest => Ok(Self::PfdManagementRequest(
+                PfdManagementRequest::decode(buf)?,
+            )),
+            PfcpMessageType::PfdManagementResponse => Ok(Self::PfdManagementResponse(
+                PfdManagementResponse::decode(buf)?,
             )),
             _ => Err(PfcpError::InvalidMessageType(message_type as u8)),
         }
@@ -1931,5 +2082,139 @@ mod tests {
         } else {
             panic!("Wrong message type");
         }
+    }
+
+    #[test]
+    fn test_pfd_management_request_byte_vector() {
+        // One Application ID's PFDs (app "app1", one PFD context, one PFD
+        // Contents carrying a Flow Description), no Node ID. Verifies the full
+        // nested TLV wire layout per TS 29.244 §7.4.3.1.
+        let msg = PfdManagementRequest {
+            application_ids_pfds: vec![ApplicationIdsPfds {
+                application_id: ApplicationId::new(b"app1".to_vec()),
+                pfd_contexts: vec![PfdContext {
+                    pfd_contents: vec![PfdContents {
+                        flow_description: Some(b"abc".to_vec()),
+                        ..Default::default()
+                    }],
+                }],
+            }],
+            node_id: None,
+        };
+        let mut body = BytesMut::new();
+        msg.encode(&mut body);
+        assert_eq!(
+            body.as_ref(),
+            &[
+                // Application ID's PFDs IE (type 58): len 23
+                0x00, 0x3A, 0x00, 0x17, //
+                // Application ID IE (type 24): len 4
+                0x00, 0x18, 0x00, 0x04, b'a', b'p', b'p', b'1', //
+                // PFD context IE (type 59): len 11
+                0x00, 0x3B, 0x00, 0x0B, //
+                // PFD Contents IE (type 61): len 7
+                0x00, 0x3D, 0x00, 0x07, //
+                0x01, 0x00, 0x00, 0x03, b'a', b'b', b'c',
+            ]
+        );
+        let decoded = PfdManagementRequest::decode(&mut body.freeze()).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn test_pfd_management_request_roundtrip_via_build_parse() {
+        // Node-level procedure: no SEID. Round-trip through the header path.
+        let msg = PfcpMessage::PfdManagementRequest(PfdManagementRequest {
+            application_ids_pfds: vec![
+                ApplicationIdsPfds {
+                    application_id: ApplicationId::new(b"voip".to_vec()),
+                    pfd_contexts: vec![PfdContext {
+                        pfd_contents: vec![PfdContents {
+                            flow_description: Some(b"permit out ip from any to any".to_vec()),
+                            url: Some(b"http://example.com".to_vec()),
+                            ..Default::default()
+                        }],
+                    }],
+                },
+                // Second app with no PFD context => delete-all for that app.
+                ApplicationIdsPfds {
+                    application_id: ApplicationId::new(b"video".to_vec()),
+                    pfd_contexts: vec![],
+                },
+            ],
+            node_id: Some(NodeId::new_ipv4([10, 45, 0, 1])),
+        });
+        let buf = build_message(&msg, 7, None);
+        let (header, decoded) = parse_message(&mut buf.freeze()).unwrap();
+        assert_eq!(header.message_type, PfcpMessageType::PfdManagementRequest);
+        assert!(!header.seid_presence);
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn test_pfd_management_request_empty_delete_all() {
+        // An empty request (no IEs) means "delete all PFDs for all apps".
+        let msg = PfdManagementRequest::default();
+        let mut body = BytesMut::new();
+        msg.encode(&mut body);
+        assert!(body.is_empty());
+        let decoded = PfdManagementRequest::decode(&mut body.freeze()).unwrap();
+        assert_eq!(decoded, msg);
+        assert!(decoded.application_ids_pfds.is_empty());
+        assert!(decoded.node_id.is_none());
+    }
+
+    #[test]
+    fn test_pfd_management_response_roundtrip_via_dispatch() {
+        let msg = PfcpMessage::PfdManagementResponse(PfdManagementResponse {
+            cause: PfcpCause::RequestAccepted,
+            offending_ie: None,
+            node_id: Some(NodeId::new_ipv4([10, 45, 0, 1])),
+            pfd_partial_failure_information: Vec::new(),
+        });
+        assert_eq!(msg.message_type(), PfcpMessageType::PfdManagementResponse);
+        let mut body = BytesMut::new();
+        msg.encode_body(&mut body);
+        let decoded =
+            PfcpMessage::decode_body(PfcpMessageType::PfdManagementResponse, &mut body.freeze())
+                .unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn test_pfd_management_response_partial_failure() {
+        let msg = PfdManagementResponse {
+            cause: PfcpCause::RuleCreationModificationFailure,
+            offending_ie: Some(IeType::ApplicationIdsPfds as u16),
+            node_id: None,
+            pfd_partial_failure_information: vec![PfdPartialFailureInformation {
+                application_id: ApplicationId::new(b"app1".to_vec()),
+                failure_cause: PfcpCause::RuleCreationModificationFailure,
+            }],
+        };
+        let mut body = BytesMut::new();
+        msg.encode(&mut body);
+        let decoded = PfdManagementResponse::decode(&mut body.freeze()).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(decoded.pfd_partial_failure_information.len(), 1);
+        assert_eq!(
+            decoded.offending_ie,
+            Some(IeType::ApplicationIdsPfds as u16)
+        );
+    }
+
+    #[test]
+    fn test_pfd_management_response_missing_cause_rejected() {
+        // Cause is mandatory.
+        let mut body = BytesMut::new();
+        let node_id = NodeId::new_ipv4([1, 2, 3, 4]);
+        let mut nb = BytesMut::new();
+        node_id.encode(&mut nb);
+        IeHeader::new(IeType::NodeId as u16, nb.len() as u16).encode(&mut body);
+        body.put_slice(&nb);
+        assert!(matches!(
+            PfdManagementResponse::decode(&mut body.freeze()),
+            Err(PfcpError::MissingMandatoryIe(_))
+        ));
     }
 }

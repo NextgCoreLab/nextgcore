@@ -264,6 +264,7 @@ pub enum IeType {
     NfInstanceId = 253,
     EthernetContextInformation = 254,
     RedundantTransmissionParameters = 255,
+    PfdPartialFailureInformation = 397,
 }
 
 impl TryFrom<u16> for IeType {

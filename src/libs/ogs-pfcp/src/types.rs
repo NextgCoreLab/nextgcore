@@ -3050,6 +3050,292 @@ impl GracefulReleasePeriod {
     }
 }
 
+/// Application ID (TS 29.244 §8.2.6, IE type 24). An OctetString referencing an
+/// application detection filter in the UP function (its value may represent an
+/// application such as a list of URLs).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ApplicationId(pub Vec<u8>);
+
+impl ApplicationId {
+    pub fn new(value: impl Into<Vec<u8>>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_slice(&self.0);
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        Ok(Self(data.to_vec()))
+    }
+}
+
+/// PFD Contents (TS 29.244 §8.2.39, IE type 61). Describes one PFD as a set of
+/// optional, individually-flagged properties. Octet 5 carries the presence
+/// flags, octet 6 is spare, then each present property is encoded as a 2-octet
+/// length followed by its OctetString value, in the fixed field order
+/// FD, URL, DN, CP, DNP, AFD, AURL, ADNP (Figure 8.2.39-1).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PfdContents {
+    /// Flow Description (FD, octet-5 bit 1).
+    pub flow_description: Option<Vec<u8>>,
+    /// URL (URL, octet-5 bit 2).
+    pub url: Option<Vec<u8>>,
+    /// Domain Name (DN, octet-5 bit 3).
+    pub domain_name: Option<Vec<u8>>,
+    /// Custom PFD Content (CP, octet-5 bit 4).
+    pub custom_pfd_content: Option<Vec<u8>>,
+    /// Domain Name Protocol (DNP, octet-5 bit 5). Per spec, presence of DNP
+    /// also requires the Domain Name field to be present.
+    pub domain_name_protocol: Option<Vec<u8>>,
+    /// Additional Flow Description (AFD, octet-5 bit 6).
+    pub additional_flow_description: Option<Vec<u8>>,
+    /// Additional URL (AURL, octet-5 bit 7).
+    pub additional_url: Option<Vec<u8>>,
+    /// Additional Domain Name and Domain Name Protocol (ADNP, octet-5 bit 8).
+    pub additional_domain_name_and_protocol: Option<Vec<u8>>,
+}
+
+impl PfdContents {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        // Each present property is written as a 2-octet length followed by its
+        // value, in spec field order.
+        fn put_lv(buf: &mut BytesMut, value: &Option<Vec<u8>>) {
+            if let Some(v) = value {
+                buf.put_u16(v.len() as u16);
+                buf.put_slice(v);
+            }
+        }
+
+        let mut flags = 0u8;
+        if self.flow_description.is_some() {
+            flags |= 0x01;
+        }
+        if self.url.is_some() {
+            flags |= 0x02;
+        }
+        if self.domain_name.is_some() {
+            flags |= 0x04;
+        }
+        if self.custom_pfd_content.is_some() {
+            flags |= 0x08;
+        }
+        if self.domain_name_protocol.is_some() {
+            flags |= 0x10;
+        }
+        if self.additional_flow_description.is_some() {
+            flags |= 0x20;
+        }
+        if self.additional_url.is_some() {
+            flags |= 0x40;
+        }
+        if self.additional_domain_name_and_protocol.is_some() {
+            flags |= 0x80;
+        }
+
+        buf.put_u8(flags);
+        buf.put_u8(0); // octet 6: spare
+
+        put_lv(buf, &self.flow_description);
+        put_lv(buf, &self.url);
+        put_lv(buf, &self.domain_name);
+        put_lv(buf, &self.custom_pfd_content);
+        put_lv(buf, &self.domain_name_protocol);
+        put_lv(buf, &self.additional_flow_description);
+        put_lv(buf, &self.additional_url);
+        put_lv(buf, &self.additional_domain_name_and_protocol);
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        // Read a 2-octet length-prefixed OctetString.
+        fn read_lv(buf: &mut Bytes) -> PfcpResult<Vec<u8>> {
+            if buf.remaining() < 2 {
+                return Err(PfcpError::BufferTooShort {
+                    needed: 2,
+                    available: buf.remaining(),
+                });
+            }
+            let len = buf.get_u16() as usize;
+            if buf.remaining() < len {
+                return Err(PfcpError::BufferTooShort {
+                    needed: len,
+                    available: buf.remaining(),
+                });
+            }
+            Ok(buf.copy_to_bytes(len).to_vec())
+        }
+
+        let mut buf = Bytes::copy_from_slice(data);
+        if buf.remaining() < 2 {
+            return Err(PfcpError::BufferTooShort {
+                needed: 2,
+                available: buf.remaining(),
+            });
+        }
+        let flags = buf.get_u8();
+        let _spare = buf.get_u8();
+
+        let mut contents = PfdContents::default();
+        if flags & 0x01 != 0 {
+            contents.flow_description = Some(read_lv(&mut buf)?);
+        }
+        if flags & 0x02 != 0 {
+            contents.url = Some(read_lv(&mut buf)?);
+        }
+        if flags & 0x04 != 0 {
+            contents.domain_name = Some(read_lv(&mut buf)?);
+        }
+        if flags & 0x08 != 0 {
+            contents.custom_pfd_content = Some(read_lv(&mut buf)?);
+        }
+        if flags & 0x10 != 0 {
+            contents.domain_name_protocol = Some(read_lv(&mut buf)?);
+        }
+        if flags & 0x20 != 0 {
+            contents.additional_flow_description = Some(read_lv(&mut buf)?);
+        }
+        if flags & 0x40 != 0 {
+            contents.additional_url = Some(read_lv(&mut buf)?);
+        }
+        if flags & 0x80 != 0 {
+            contents.additional_domain_name_and_protocol = Some(read_lv(&mut buf)?);
+        }
+        Ok(contents)
+    }
+}
+
+/// PFD context (TS 29.244 §7.4.3.1, Table 7.4.3.1-3, IE type 59). Grouped IE
+/// carrying one or more PFD Contents IEs describing the PFDs of an application.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PfdContext {
+    pub pfd_contents: Vec<PfdContents>,
+}
+
+impl PfdContext {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{IeHeader, IeType};
+        for contents in &self.pfd_contents {
+            let mut inner = BytesMut::new();
+            contents.encode(&mut inner);
+            IeHeader::new(IeType::PfdContents as u16, inner.len() as u16).encode(buf);
+            buf.put_slice(&inner);
+        }
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        use crate::ie::{IeType, RawIe};
+        let mut buf = Bytes::copy_from_slice(data);
+        let mut pfd_contents = Vec::new();
+        while buf.remaining() >= 4 {
+            let ie = RawIe::decode(&mut buf)?;
+            if ie.ie_type == IeType::PfdContents as u16 {
+                pfd_contents.push(PfdContents::decode(&ie.data)?);
+            }
+        }
+        Ok(Self { pfd_contents })
+    }
+}
+
+/// Application ID's PFDs (TS 29.244 §7.4.3.1, Table 7.4.3.1-2, IE type 58).
+/// Grouped IE binding one Application ID (mandatory) to zero or more PFD
+/// context IEs. Absence of any PFD context instructs the UP function to delete
+/// all PFDs stored for the Application ID (§6.2.5.3).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ApplicationIdsPfds {
+    pub application_id: ApplicationId,
+    pub pfd_contexts: Vec<PfdContext>,
+}
+
+impl ApplicationIdsPfds {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{IeHeader, IeType};
+        let mut app_buf = BytesMut::new();
+        self.application_id.encode(&mut app_buf);
+        IeHeader::new(IeType::ApplicationId as u16, app_buf.len() as u16).encode(buf);
+        buf.put_slice(&app_buf);
+
+        for ctx in &self.pfd_contexts {
+            let mut inner = BytesMut::new();
+            ctx.encode(&mut inner);
+            IeHeader::new(IeType::PfdContext as u16, inner.len() as u16).encode(buf);
+            buf.put_slice(&inner);
+        }
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        use crate::ie::{IeType, RawIe};
+        let mut buf = Bytes::copy_from_slice(data);
+        let mut application_id = None;
+        let mut pfd_contexts = Vec::new();
+        while buf.remaining() >= 4 {
+            let ie = RawIe::decode(&mut buf)?;
+            match ie.ie_type {
+                t if t == IeType::ApplicationId as u16 => {
+                    application_id = Some(ApplicationId::decode(&ie.data)?);
+                }
+                t if t == IeType::PfdContext as u16 => {
+                    pfd_contexts.push(PfdContext::decode(&ie.data)?);
+                }
+                _ => {}
+            }
+        }
+        Ok(Self {
+            application_id: application_id
+                .ok_or_else(|| PfcpError::MissingMandatoryIe("Application ID".to_string()))?,
+            pfd_contexts,
+        })
+    }
+}
+
+/// PFD Partial Failure Information (TS 29.244 §7.4.3.2, Table 7.4.3.2-2, IE
+/// type 397). Reports, per Application ID, the failure cause when partial
+/// acceptance of a PFD Management Request is signalled (§5.42). Both the
+/// Application ID and the Failure Cause inner IEs are mandatory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PfdPartialFailureInformation {
+    pub application_id: ApplicationId,
+    pub failure_cause: PfcpCause,
+}
+
+impl PfdPartialFailureInformation {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{encode_u8_ie, IeHeader, IeType};
+        let mut app_buf = BytesMut::new();
+        self.application_id.encode(&mut app_buf);
+        IeHeader::new(IeType::ApplicationId as u16, app_buf.len() as u16).encode(buf);
+        buf.put_slice(&app_buf);
+
+        encode_u8_ie(buf, IeType::Cause, self.failure_cause as u8);
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        use crate::ie::{IeType, RawIe};
+        let mut buf = Bytes::copy_from_slice(data);
+        let mut application_id = None;
+        let mut failure_cause = None;
+        while buf.remaining() >= 4 {
+            let ie = RawIe::decode(&mut buf)?;
+            match ie.ie_type {
+                t if t == IeType::ApplicationId as u16 => {
+                    application_id = Some(ApplicationId::decode(&ie.data)?);
+                }
+                t if t == IeType::Cause as u16 => {
+                    if !ie.data.is_empty() {
+                        failure_cause = Some(PfcpCause::try_from(ie.data[0])?);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(Self {
+            application_id: application_id
+                .ok_or_else(|| PfcpError::MissingMandatoryIe("Application ID".to_string()))?,
+            failure_cause: failure_cause
+                .ok_or_else(|| PfcpError::MissingMandatoryIe("Failure Cause".to_string()))?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3425,5 +3711,145 @@ mod tests {
         let payload = &buf[buf.len() - 2..];
         assert!(ApplyAction::decode_ie(payload).ddpn);
         assert!(ApplyAction::decode_ie(&[0x02, 0x00]).forw);
+    }
+
+    #[test]
+    fn test_pfd_contents_byte_vector() {
+        // FD + URL set; per TS 29.244 §8.2.39 octet 5 = flags, octet 6 = spare,
+        // then each present property as 2-octet length + value, in field order.
+        let contents = PfdContents {
+            flow_description: Some(b"abc".to_vec()),
+            url: Some(b"de".to_vec()),
+            ..Default::default()
+        };
+        let mut buf = BytesMut::new();
+        contents.encode(&mut buf);
+        assert_eq!(
+            buf.as_ref(),
+            &[
+                0x03, // flags: FD(0x01) | URL(0x02)
+                0x00, // octet 6: spare
+                0x00, 0x03, b'a', b'b', b'c', // Flow Description: len 3
+                0x00, 0x02, b'd', b'e', // URL: len 2
+            ]
+        );
+        // Round-trip.
+        let decoded = PfdContents::decode(&buf.freeze()).unwrap();
+        assert_eq!(decoded, contents);
+    }
+
+    #[test]
+    fn test_pfd_contents_spare_octet_always_present() {
+        // Even an empty PFD Contents carries the flags + spare octets (2 bytes).
+        let contents = PfdContents::default();
+        let mut buf = BytesMut::new();
+        contents.encode(&mut buf);
+        assert_eq!(buf.as_ref(), &[0x00, 0x00]);
+        assert_eq!(PfdContents::decode(&buf.freeze()).unwrap(), contents);
+    }
+
+    #[test]
+    fn test_pfd_contents_all_fields_round_trip() {
+        // Exercise every flag bit (FD..ADNP) and confirm field order survives.
+        let contents = PfdContents {
+            flow_description: Some(b"fd".to_vec()),
+            url: Some(b"url".to_vec()),
+            domain_name: Some(b"dn".to_vec()),
+            custom_pfd_content: Some(b"cp".to_vec()),
+            domain_name_protocol: Some(b"dnp".to_vec()),
+            additional_flow_description: Some(b"afd".to_vec()),
+            additional_url: Some(b"aurl".to_vec()),
+            additional_domain_name_and_protocol: Some(b"adnp".to_vec()),
+        };
+        let mut buf = BytesMut::new();
+        contents.encode(&mut buf);
+        // octet 5 has every flag set.
+        assert_eq!(buf[0], 0xFF);
+        assert_eq!(buf[1], 0x00);
+        assert_eq!(PfdContents::decode(&buf.freeze()).unwrap(), contents);
+    }
+
+    #[test]
+    fn test_pfd_contents_truncated_value_errs() {
+        // Flag claims a 4-octet Flow Description but only 1 octet follows.
+        let bytes = [0x01u8, 0x00, 0x00, 0x04, 0xAA];
+        assert!(matches!(
+            PfdContents::decode(&bytes),
+            Err(PfcpError::BufferTooShort { .. })
+        ));
+    }
+
+    #[test]
+    fn test_application_ids_pfds_byte_vector() {
+        // One Application ID + one PFD context (one PFD Contents with FD only).
+        let app = ApplicationIdsPfds {
+            application_id: ApplicationId::new(b"app1".to_vec()),
+            pfd_contexts: vec![PfdContext {
+                pfd_contents: vec![PfdContents {
+                    flow_description: Some(b"abc".to_vec()),
+                    ..Default::default()
+                }],
+            }],
+        };
+        let mut buf = BytesMut::new();
+        app.encode(&mut buf);
+        assert_eq!(
+            buf.as_ref(),
+            &[
+                // Application ID IE (type 24): len 4, "app1"
+                0x00, 0x18, 0x00, 0x04, b'a', b'p', b'p', b'1',
+                // PFD context IE (type 59): len 11
+                0x00, 0x3B, 0x00, 0x0B,
+                // PFD Contents IE (type 61): len 7
+                0x00, 0x3D, 0x00, 0x07, //
+                0x01, 0x00, 0x00, 0x03, b'a', b'b', b'c',
+            ]
+        );
+        let decoded = ApplicationIdsPfds::decode(&buf.freeze()).unwrap();
+        assert_eq!(decoded, app);
+    }
+
+    #[test]
+    fn test_application_ids_pfds_missing_application_id_rejected() {
+        // Application ID is mandatory inside the grouped IE.
+        let ctx = PfdContext {
+            pfd_contents: vec![PfdContents::default()],
+        };
+        let mut buf = BytesMut::new();
+        let mut inner = BytesMut::new();
+        ctx.encode(&mut inner);
+        crate::ie::IeHeader::new(crate::ie::IeType::PfdContext as u16, inner.len() as u16)
+            .encode(&mut buf);
+        buf.put_slice(&inner);
+        assert!(matches!(
+            ApplicationIdsPfds::decode(&buf.freeze()),
+            Err(PfcpError::MissingMandatoryIe(_))
+        ));
+    }
+
+    #[test]
+    fn test_application_ids_pfds_delete_all_for_app() {
+        // No PFD context => delete-all semantics for the Application ID.
+        let app = ApplicationIdsPfds {
+            application_id: ApplicationId::new(b"voip".to_vec()),
+            pfd_contexts: vec![],
+        };
+        let mut buf = BytesMut::new();
+        app.encode(&mut buf);
+        let decoded = ApplicationIdsPfds::decode(&buf.freeze()).unwrap();
+        assert_eq!(decoded, app);
+        assert!(decoded.pfd_contexts.is_empty());
+    }
+
+    #[test]
+    fn test_pfd_partial_failure_information_round_trip() {
+        let info = PfdPartialFailureInformation {
+            application_id: ApplicationId::new(b"app1".to_vec()),
+            failure_cause: PfcpCause::RuleCreationModificationFailure,
+        };
+        let mut buf = BytesMut::new();
+        info.encode(&mut buf);
+        let decoded = PfdPartialFailureInformation::decode(&buf.freeze()).unwrap();
+        assert_eq!(decoded, info);
     }
 }
