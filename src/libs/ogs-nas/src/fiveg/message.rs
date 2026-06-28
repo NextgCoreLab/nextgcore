@@ -2065,6 +2065,15 @@ pub fn build_5gmm_message(msg: &FiveGmmMessage) -> BytesMut {
 /// Parse a 5GMM message
 pub fn parse_5gmm_message(buf: &mut Bytes) -> NasResult<FiveGmmMessage> {
     let header = FiveGsNasHeader::decode(buf)?;
+    // TS 24.501 §9.2 — the EPD of a 5GMM message is 0x7E; reject anything else
+    // so a foreign / corrupt PDU is not mis-parsed as a 5GMM body.
+    if header.extended_protocol_discriminator
+        != ProtocolDiscriminator::FiveGsMobilityManagement as u8
+    {
+        return Err(NasError::InvalidProtocolDiscriminator(
+            header.extended_protocol_discriminator,
+        ));
+    }
     let message_type = FiveGmmMessageType::try_from(header.message_type)?;
 
     match message_type {
@@ -3252,6 +3261,15 @@ pub fn build_5gsm_message(pdu_session_id: u8, pti: u8, msg: &FiveGsmMessage) -> 
 /// Parse a 5GSM message
 pub fn parse_5gsm_message(buf: &mut Bytes) -> NasResult<(u8, u8, FiveGsmMessage)> {
     let header = FiveGsNasSmHeader::decode(buf)?;
+    // TS 24.501 §9.2 — the EPD of a 5GSM message is 0x2E; reject anything else
+    // so a foreign / corrupt PDU is not mis-parsed as a 5GSM body.
+    if header.extended_protocol_discriminator
+        != ProtocolDiscriminator::FiveGsSessionManagement as u8
+    {
+        return Err(NasError::InvalidProtocolDiscriminator(
+            header.extended_protocol_discriminator,
+        ));
+    }
     let message_type = FiveGsmMessageType::try_from(header.message_type)?;
 
     let msg = match message_type {
@@ -3467,6 +3485,62 @@ mod nas04_tests {
         assert!(matches!(
             parse_5gmm_secured(&mut bytes.clone(), &mut rx),
             Err(NasError::BufferTooShort { .. })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod nas08_tests {
+    //! TS 24.501 §9.2 — the parse entrypoints must reject a NAS PDU whose
+    //! Extended Protocol Discriminator is neither 0x7E (5GMM) nor 0x2E (5GSM),
+    //! instead of mis-parsing its body.
+    use super::*;
+
+    #[test]
+    fn test_valid_5gmm_epd_still_parses() {
+        // A well-formed 5GMM message (EPD = 0x7E) round-trips unchanged.
+        let original = FiveGmmMessage::SecurityModeComplete(SecurityModeComplete::default());
+        let bytes = build_5gmm_message(&original).freeze();
+        assert_eq!(bytes[0], 0x7e, "5GMM EPD must be 0x7E on the wire");
+        let parsed = parse_5gmm_message(&mut bytes.clone()).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn test_bogus_epd_5gmm_rejected() {
+        // Same valid body, but the EPD octet is corrupted to a bogus value:
+        // the parser must reject it rather than mis-parse the body.
+        let original = FiveGmmMessage::SecurityModeComplete(SecurityModeComplete::default());
+        let valid = build_5gmm_message(&original).freeze();
+
+        for bogus in [0x00u8, 0xFF] {
+            let mut bytes = valid.to_vec();
+            bytes[0] = bogus; // overwrite the EPD octet only
+            assert!(
+                matches!(
+                    parse_5gmm_message(&mut Bytes::from(bytes)),
+                    Err(NasError::InvalidProtocolDiscriminator(b)) if b == bogus
+                ),
+                "EPD 0x{bogus:02x} must be rejected by parse_5gmm_message"
+            );
+        }
+    }
+
+    #[test]
+    fn test_valid_5gsm_epd_still_parses_and_bogus_rejected() {
+        // 5GSM (EPD = 0x2E) symmetry: valid parses, bogus EPD rejected.
+        let msg = FiveGsmMessage::PduSessionReleaseComplete(PduSessionReleaseComplete::default());
+        let valid = build_5gsm_message(5, 1, &msg).freeze();
+        assert_eq!(valid[0], 0x2e, "5GSM EPD must be 0x2E on the wire");
+        let (psi, pti, parsed) = parse_5gsm_message(&mut valid.clone()).unwrap();
+        assert_eq!((psi, pti), (5, 1));
+        assert_eq!(parsed, msg);
+
+        let mut bytes = valid.to_vec();
+        bytes[0] = 0x7e; // a valid-but-wrong EPD (5GMM) for a 5GSM entrypoint
+        assert!(matches!(
+            parse_5gsm_message(&mut Bytes::from(bytes)),
+            Err(NasError::InvalidProtocolDiscriminator(0x7e))
         ));
     }
 }
