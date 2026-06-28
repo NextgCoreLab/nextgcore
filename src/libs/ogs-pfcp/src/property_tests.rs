@@ -223,9 +223,14 @@ mod tests {
                 seid in any::<u64>(),
                 sequence_number in 0u32..0xFFFFFF, // 24-bit sequence number
             ) {
-                let msg = PfcpMessage::SessionEstablishmentResponse(
-                    SessionEstablishmentResponse::new(PfcpCause::RequestAccepted)
-                );
+                // TS 29.244 §7.5.3: an accepted Session Establishment Response
+                // carries the Mandatory Node ID and (when accepted) the UP
+                // F-SEID; build a conformant message so it survives the strict
+                // decode.
+                let mut resp = SessionEstablishmentResponse::new(PfcpCause::RequestAccepted);
+                resp.node_id = Some(NodeId::new_ipv4([10, 45, 0, 1]));
+                resp.up_f_seid = Some(FSeid::new_ipv4(seid, [10, 45, 0, 1]));
+                let msg = PfcpMessage::SessionEstablishmentResponse(resp);
                 let buf = build_message(&msg, sequence_number, Some(seid));
 
                 let mut bytes = buf.freeze();

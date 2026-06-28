@@ -572,10 +572,11 @@ impl FTeid {
 pub struct UeIpAddress {
     pub ipv4: bool,
     pub ipv6: bool,
-    pub sd: bool,    // Source/Destination flag
-    pub ipv6d: bool, // IPv6 prefix delegation
-    pub chv4: bool,  // CHOOSE IPv4
-    pub chv6: bool,  // CHOOSE IPv6
+    pub sd: bool,    // Source/Destination flag (octet 5 bit 3)
+    pub ipv6d: bool, // IPv6 prefix delegation (octet 5 bit 4)
+    pub chv4: bool,  // CHOOSE IPv4 (octet 5 bit 5)
+    pub chv6: bool,  // CHOOSE IPv6 (octet 5 bit 6)
+    pub ip6pl: bool, // IPv6 Prefix Length present (octet 5 bit 7, TS 29.244 §8.2.62)
     pub ipv4_addr: Option<[u8; 4]>,
     pub ipv6_addr: Option<[u8; 16]>,
     pub ipv6_prefix_delegation_bits: Option<u8>,
@@ -592,6 +593,7 @@ impl UeIpAddress {
             ipv6d: false,
             chv4: false,
             chv6: false,
+            ip6pl: false,
             ipv4_addr: Some(addr),
             ipv6_addr: None,
             ipv6_prefix_delegation_bits: None,
@@ -608,6 +610,7 @@ impl UeIpAddress {
             ipv6d: false,
             chv4: false,
             chv6: false,
+            ip6pl: false,
             ipv4_addr: None,
             ipv6_addr: Some(addr),
             ipv6_prefix_delegation_bits: None,
@@ -617,7 +620,8 @@ impl UeIpAddress {
 
     /// Encode to bytes
     pub fn encode(&self, buf: &mut BytesMut) {
-        let flags = ((self.chv6 as u8) << 5)
+        let flags = ((self.ip6pl as u8) << 6)
+            | ((self.chv6 as u8) << 5)
             | ((self.chv4 as u8) << 4)
             | ((self.ipv6d as u8) << 3)
             | ((self.sd as u8) << 2)
@@ -653,6 +657,9 @@ impl UeIpAddress {
         let ipv6d = (flags >> 3) & 0x01 != 0;
         let chv4 = (flags >> 4) & 0x01 != 0;
         let chv6 = (flags >> 5) & 0x01 != 0;
+        // IP6PL (octet 5 bit 7, TS 29.244 §8.2.62) governs presence of the
+        // trailing IPv6 Prefix Length octet.
+        let ip6pl = (flags >> 6) & 0x01 != 0;
 
         let ipv4_addr = if ipv4 && !chv4 {
             if buf.remaining() < 4 {
@@ -682,13 +689,29 @@ impl UeIpAddress {
             None
         };
 
-        let ipv6_prefix_delegation_bits = if ipv6d && buf.remaining() > 0 {
+        // IPv6 Prefix Delegation Bits (octet r) present iff IPv6D is set
+        // (TS 29.244 §8.2.62), not by a "bytes remaining" heuristic.
+        let ipv6_prefix_delegation_bits = if ipv6d {
+            if buf.remaining() < 1 {
+                return Err(PfcpError::BufferTooShort {
+                    needed: 1,
+                    available: buf.remaining(),
+                });
+            }
             Some(buf.get_u8())
         } else {
             None
         };
 
-        let ipv6_prefix_length = if ipv6 && buf.remaining() > 0 {
+        // IPv6 Prefix Length (octet s) present iff IP6PL is set (TS 29.244
+        // §8.2.62), not whenever IPv6 is present.
+        let ipv6_prefix_length = if ip6pl {
+            if buf.remaining() < 1 {
+                return Err(PfcpError::BufferTooShort {
+                    needed: 1,
+                    available: buf.remaining(),
+                });
+            }
             Some(buf.get_u8())
         } else {
             None
@@ -701,6 +724,7 @@ impl UeIpAddress {
             ipv6d,
             chv4,
             chv6,
+            ip6pl,
             ipv4_addr,
             ipv6_addr,
             ipv6_prefix_delegation_bits,
@@ -4400,6 +4424,58 @@ mod tests {
         assert!(matches!(
             PfcpSessionChangeInfo::decode(&buf.freeze()),
             Err(PfcpError::MissingMandatoryIe(_))
+        ));
+    }
+
+    // ----- pfcp-10: UE IP Address flag-driven trailing-octet decode -----
+
+    #[test]
+    fn test_ue_ip_address_v6_ip6pl_round_trip() {
+        // (a) V6 + IP6PL: the IPv6 Prefix Length octet is present and is read
+        // because the IP6PL flag (octet 5 bit 7) is set.
+        let mut ue = UeIpAddress::new_ipv6([0x20; 16], false);
+        ue.ip6pl = true;
+        ue.ipv6_prefix_length = Some(56);
+
+        let mut buf = BytesMut::new();
+        ue.encode(&mut buf);
+        let encoded = buf.freeze();
+        // flags = V6 (0x02) | IP6PL (0x40) = 0x42
+        assert_eq!(encoded[0], 0x42);
+        assert_eq!(encoded.len(), 1 + 16 + 1);
+        assert_eq!(*encoded.last().unwrap(), 56);
+
+        let decoded = UeIpAddress::decode(&mut encoded.clone()).unwrap();
+        assert_eq!(decoded, ue);
+        assert!(decoded.ip6pl);
+        assert_eq!(decoded.ipv6_prefix_length, Some(56));
+    }
+
+    #[test]
+    fn test_ue_ip_address_v4_only_no_trailing_misread() {
+        // A V4-only IE must not synthesise an IPv6 Prefix Length (IP6PL clear).
+        let ue = UeIpAddress::new_ipv4([10, 45, 0, 2], false);
+        let mut buf = BytesMut::new();
+        ue.encode(&mut buf);
+        let encoded = buf.freeze();
+        assert_eq!(encoded.len(), 1 + 4);
+        let decoded = UeIpAddress::decode(&mut encoded.clone()).unwrap();
+        assert_eq!(decoded, ue);
+        assert!(decoded.ipv6_prefix_length.is_none());
+        assert!(decoded.ipv6_prefix_delegation_bits.is_none());
+    }
+
+    #[test]
+    fn test_ue_ip_address_ip6pl_set_but_truncated_rejected() {
+        // (b) IP6PL flag set but the trailing prefix-length octet is absent:
+        // flags = V6 (0x02) | IP6PL (0x40) followed by only the 16-byte IPv6
+        // address. Strict decode must reject rather than silently drop it.
+        let mut bytes = BytesMut::new();
+        bytes.put_u8(0x42);
+        bytes.put_slice(&[0x20; 16]);
+        assert!(matches!(
+            UeIpAddress::decode(&mut bytes.freeze()),
+            Err(PfcpError::BufferTooShort { .. })
         ));
     }
 }

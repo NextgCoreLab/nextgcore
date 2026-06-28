@@ -233,7 +233,9 @@ impl AssociationSetupResponse {
 
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
         let mut node_id = None;
-        let mut cause = PfcpCause::RequestAccepted;
+        // Cause is a Mandatory IE (TS 29.244 §7.4.4.2); track presence rather
+        // than silently defaulting a missing Cause to "Request Accepted".
+        let mut cause: Option<PfcpCause> = None;
         let mut recovery_time_stamp = 0u32;
         let mut up_function_features = None;
         let mut cp_function_features = None;
@@ -247,7 +249,7 @@ impl AssociationSetupResponse {
                 }
                 t if t == IeType::Cause as u16 => {
                     if !ie.data.is_empty() {
-                        cause = PfcpCause::try_from(ie.data[0])?;
+                        cause = Some(PfcpCause::try_from(ie.data[0])?);
                     }
                 }
                 t if t == IeType::RecoveryTimeStamp as u16 => {
@@ -269,6 +271,7 @@ impl AssociationSetupResponse {
 
         let node_id =
             node_id.ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?;
+        let cause = cause.ok_or_else(|| PfcpError::MissingMandatoryIe("Cause".to_string()))?;
 
         Ok(Self {
             node_id,
@@ -340,7 +343,8 @@ impl AssociationReleaseResponse {
 
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
         let mut node_id = None;
-        let mut cause = PfcpCause::RequestAccepted;
+        // Cause is a Mandatory IE (TS 29.244 §7.4.4.4).
+        let mut cause: Option<PfcpCause> = None;
 
         while buf.remaining() >= IeHeader::LEN {
             let ie = RawIe::decode(buf)?;
@@ -351,7 +355,7 @@ impl AssociationReleaseResponse {
                 }
                 t if t == IeType::Cause as u16 => {
                     if !ie.data.is_empty() {
-                        cause = PfcpCause::try_from(ie.data[0])?;
+                        cause = Some(PfcpCause::try_from(ie.data[0])?);
                     }
                 }
                 _ => {}
@@ -360,6 +364,7 @@ impl AssociationReleaseResponse {
 
         let node_id =
             node_id.ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?;
+        let cause = cause.ok_or_else(|| PfcpError::MissingMandatoryIe("Cause".to_string()))?;
         Ok(Self { node_id, cause })
     }
 }
@@ -511,12 +516,15 @@ impl SessionEstablishmentRequest {
     }
 }
 
-/// Session Establishment Response message (simplified)
+/// Session Establishment Response message (TS 29.244 §7.5.3)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEstablishmentResponse {
     pub node_id: Option<NodeId>,
     pub cause: PfcpCause,
     pub up_f_seid: Option<FSeid>,
+    /// Created PDR(s) carrying the UP-allocated local F-TEID(s); present when
+    /// the request is accepted (§7.5.3.2).
+    pub created_pdrs: Vec<CreatedPdr>,
 }
 
 impl SessionEstablishmentResponse {
@@ -525,6 +533,7 @@ impl SessionEstablishmentResponse {
             node_id: None,
             cause,
             up_f_seid: None,
+            created_pdrs: Vec::new(),
         }
     }
 
@@ -549,12 +558,23 @@ impl SessionEstablishmentResponse {
             header.encode(buf);
             buf.put_slice(&fseid_buf);
         }
+
+        // Created PDR(s) (empty by default => no bytes emitted)
+        for cpdr in &self.created_pdrs {
+            let mut cpdr_buf = BytesMut::new();
+            cpdr.encode(&mut cpdr_buf);
+            let header = IeHeader::new(IeType::CreatedPdr as u16, cpdr_buf.len() as u16);
+            header.encode(buf);
+            buf.put_slice(&cpdr_buf);
+        }
     }
 
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
         let mut node_id = None;
-        let mut cause = PfcpCause::RequestAccepted;
+        // Cause is a Mandatory IE (TS 29.244 §7.5.3).
+        let mut cause: Option<PfcpCause> = None;
         let mut up_f_seid = None;
+        let mut created_pdrs = Vec::new();
 
         while buf.remaining() >= IeHeader::LEN {
             let ie = RawIe::decode(buf)?;
@@ -565,21 +585,37 @@ impl SessionEstablishmentResponse {
                 }
                 t if t == IeType::Cause as u16 => {
                     if !ie.data.is_empty() {
-                        cause = PfcpCause::try_from(ie.data[0])?;
+                        cause = Some(PfcpCause::try_from(ie.data[0])?);
                     }
                 }
                 t if t == IeType::FSeid as u16 => {
                     let mut data = ie.data;
                     up_f_seid = Some(FSeid::decode(&mut data)?);
                 }
+                t if t == IeType::CreatedPdr as u16 => {
+                    let mut data = ie.data;
+                    created_pdrs.push(CreatedPdr::decode(&mut data)?);
+                }
                 _ => {}
             }
         }
 
+        // Node ID is Mandatory (TS 29.244 §7.5.3).
+        let node_id =
+            node_id.ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?;
+        let cause = cause.ok_or_else(|| PfcpError::MissingMandatoryIe("Cause".to_string()))?;
+
+        // When the request is accepted, UP F-SEID is Conditional-Mandatory
+        // (TS 29.244 §7.5.3): the UP function must return the allocated F-SEID.
+        if cause == PfcpCause::RequestAccepted && up_f_seid.is_none() {
+            return Err(PfcpError::MissingMandatoryIe("UP F-SEID".to_string()));
+        }
+
         Ok(Self {
-            node_id,
+            node_id: Some(node_id),
             cause,
             up_f_seid,
+            created_pdrs,
         })
     }
 }
@@ -620,15 +656,17 @@ impl SessionDeletionResponse {
     }
 
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
-        let mut cause = PfcpCause::RequestAccepted;
+        // Cause is a Mandatory IE (TS 29.244 §7.5.7).
+        let mut cause: Option<PfcpCause> = None;
 
         while buf.remaining() >= IeHeader::LEN {
             let ie = RawIe::decode(buf)?;
             if ie.ie_type == IeType::Cause as u16 && !ie.data.is_empty() {
-                cause = PfcpCause::try_from(ie.data[0])?;
+                cause = Some(PfcpCause::try_from(ie.data[0])?);
             }
         }
 
+        let cause = cause.ok_or_else(|| PfcpError::MissingMandatoryIe("Cause".to_string()))?;
         Ok(Self { cause })
     }
 }
@@ -853,7 +891,8 @@ impl SessionModificationResponse {
     }
 
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
-        let mut cause = PfcpCause::RequestAccepted;
+        // Cause is a Mandatory IE (TS 29.244 §7.5.5).
+        let mut cause: Option<PfcpCause> = None;
         let mut offending_ie = None;
         let mut created_pdrs = Vec::new();
 
@@ -862,7 +901,7 @@ impl SessionModificationResponse {
             match ie.ie_type {
                 t if t == IeType::Cause as u16 => {
                     if !ie.data.is_empty() {
-                        cause = PfcpCause::try_from(ie.data[0])?;
+                        cause = Some(PfcpCause::try_from(ie.data[0])?);
                     }
                 }
                 t if t == IeType::OffendingIe as u16 => {
@@ -879,6 +918,7 @@ impl SessionModificationResponse {
             }
         }
 
+        let cause = cause.ok_or_else(|| PfcpError::MissingMandatoryIe("Cause".to_string()))?;
         Ok(Self {
             cause,
             offending_ie,
@@ -1046,7 +1086,8 @@ impl SessionReportResponse {
     }
 
     pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
-        let mut cause = PfcpCause::RequestAccepted;
+        // Cause is a Mandatory IE (TS 29.244 §7.5.9).
+        let mut cause: Option<PfcpCause> = None;
         let mut offending_ie = None;
         let mut pfcp_srrsp_flags = None;
 
@@ -1055,7 +1096,7 @@ impl SessionReportResponse {
             match ie.ie_type {
                 t if t == IeType::Cause as u16 => {
                     if !ie.data.is_empty() {
-                        cause = PfcpCause::try_from(ie.data[0])?;
+                        cause = Some(PfcpCause::try_from(ie.data[0])?);
                     }
                 }
                 t if t == IeType::OffendingIe as u16 => {
@@ -1073,6 +1114,7 @@ impl SessionReportResponse {
             }
         }
 
+        let cause = cause.ok_or_else(|| PfcpError::MissingMandatoryIe("Cause".to_string()))?;
         Ok(Self {
             cause,
             offending_ie,
@@ -2633,5 +2675,159 @@ mod tests {
         )
         .unwrap();
         assert_eq!(decoded, msg);
+    }
+
+    // ----- pfcp-07: mandatory Cause enforcement in the six response decoders -----
+
+    #[test]
+    fn test_association_setup_response_with_cause_round_trip() {
+        // (a) A valid response carrying Cause still decodes correctly.
+        let msg = AssociationSetupResponse::new(
+            NodeId::new_ipv4([10, 45, 0, 1]),
+            PfcpCause::RequestAccepted,
+            1234,
+        );
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+        let decoded = AssociationSetupResponse::decode(&mut buf.freeze()).unwrap();
+        assert_eq!(decoded, msg);
+        assert_eq!(decoded.cause, PfcpCause::RequestAccepted);
+    }
+
+    #[test]
+    fn test_association_setup_response_missing_cause_rejected() {
+        // (b) Node ID present, Cause omitted -> Cause is mandatory.
+        let mut buf = BytesMut::new();
+        let mut nb = BytesMut::new();
+        NodeId::new_ipv4([10, 45, 0, 1]).encode(&mut nb);
+        IeHeader::new(IeType::NodeId as u16, nb.len() as u16).encode(&mut buf);
+        buf.put_slice(&nb);
+        assert!(matches!(
+            AssociationSetupResponse::decode(&mut buf.freeze()),
+            Err(PfcpError::MissingMandatoryIe(_))
+        ));
+    }
+
+    #[test]
+    fn test_association_release_response_with_cause_round_trip() {
+        let msg = AssociationReleaseResponse::new(
+            NodeId::new_ipv4([10, 45, 0, 1]),
+            PfcpCause::RequestAccepted,
+        );
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+        let decoded = AssociationReleaseResponse::decode(&mut buf.freeze()).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn test_association_release_response_missing_cause_rejected() {
+        let mut buf = BytesMut::new();
+        let mut nb = BytesMut::new();
+        NodeId::new_ipv4([10, 45, 0, 1]).encode(&mut nb);
+        IeHeader::new(IeType::NodeId as u16, nb.len() as u16).encode(&mut buf);
+        buf.put_slice(&nb);
+        assert!(matches!(
+            AssociationReleaseResponse::decode(&mut buf.freeze()),
+            Err(PfcpError::MissingMandatoryIe(_))
+        ));
+    }
+
+    #[test]
+    fn test_session_deletion_response_with_cause_round_trip() {
+        let msg = SessionDeletionResponse::new(PfcpCause::RequestAccepted);
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+        let decoded = SessionDeletionResponse::decode(&mut buf.freeze()).unwrap();
+        assert_eq!(decoded, msg);
+    }
+
+    #[test]
+    fn test_session_deletion_response_missing_cause_rejected() {
+        // Empty body -> no Cause IE.
+        assert!(matches!(
+            SessionDeletionResponse::decode(&mut BytesMut::new().freeze()),
+            Err(PfcpError::MissingMandatoryIe(_))
+        ));
+    }
+
+    #[test]
+    fn test_session_modification_response_missing_cause_rejected() {
+        // Body carries only an Offending IE, no Cause.
+        let mut buf = BytesMut::new();
+        IeHeader::new(IeType::OffendingIe as u16, 2).encode(&mut buf);
+        buf.put_u16(IeType::Cause as u16);
+        assert!(matches!(
+            SessionModificationResponse::decode(&mut buf.freeze()),
+            Err(PfcpError::MissingMandatoryIe(_))
+        ));
+    }
+
+    #[test]
+    fn test_session_report_response_missing_cause_rejected() {
+        // Empty body -> no Cause IE.
+        assert!(matches!(
+            SessionReportResponse::decode(&mut BytesMut::new().freeze()),
+            Err(PfcpError::MissingMandatoryIe(_))
+        ));
+    }
+
+    // ----- pfcp-08: Session Establishment Response mandatory IEs -----
+
+    #[test]
+    fn test_session_establishment_response_accepted_round_trip() {
+        // (a) Conformant accepted response (Node ID + UP F-SEID + Created PDR)
+        // round-trips byte-identically.
+        let mut resp = SessionEstablishmentResponse::new(PfcpCause::RequestAccepted);
+        resp.node_id = Some(NodeId::new_ipv4([10, 45, 0, 1]));
+        resp.up_f_seid = Some(FSeid::new_ipv4(0x1122, [10, 45, 0, 7]));
+        let mut cpdr = CreatedPdr::new(1);
+        cpdr.local_f_teid = Some(FTeid::new_ipv4(0x5566_7788, [10, 45, 0, 7]));
+        resp.created_pdrs.push(cpdr);
+
+        let mut buf = BytesMut::new();
+        resp.encode(&mut buf);
+        let bytes = buf.clone().freeze();
+        let decoded = SessionEstablishmentResponse::decode(&mut buf.freeze()).unwrap();
+        assert_eq!(decoded, resp);
+        assert_eq!(decoded.created_pdrs.len(), 1);
+        assert_eq!(
+            decoded.created_pdrs[0].local_f_teid.as_ref().unwrap().teid,
+            0x5566_7788
+        );
+        // Re-encode is byte-identical to the original encoding.
+        let mut buf2 = BytesMut::new();
+        decoded.encode(&mut buf2);
+        assert_eq!(buf2.freeze(), bytes);
+    }
+
+    #[test]
+    fn test_session_establishment_response_missing_node_id_rejected() {
+        // (b) Accepted response with Cause + UP F-SEID but no Node ID -> error.
+        let mut buf = BytesMut::new();
+        encode_u8_ie(&mut buf, IeType::Cause, PfcpCause::RequestAccepted as u8);
+        let mut fb = BytesMut::new();
+        FSeid::new_ipv4(0x1122, [10, 45, 0, 7]).encode(&mut fb);
+        IeHeader::new(IeType::FSeid as u16, fb.len() as u16).encode(&mut buf);
+        buf.put_slice(&fb);
+        assert!(matches!(
+            SessionEstablishmentResponse::decode(&mut buf.freeze()),
+            Err(PfcpError::MissingMandatoryIe(_))
+        ));
+    }
+
+    #[test]
+    fn test_session_establishment_response_accepted_missing_up_fseid_rejected() {
+        // Accepted response with Node ID + Cause but no UP F-SEID -> error.
+        let mut buf = BytesMut::new();
+        let mut nb = BytesMut::new();
+        NodeId::new_ipv4([10, 45, 0, 1]).encode(&mut nb);
+        IeHeader::new(IeType::NodeId as u16, nb.len() as u16).encode(&mut buf);
+        buf.put_slice(&nb);
+        encode_u8_ie(&mut buf, IeType::Cause, PfcpCause::RequestAccepted as u8);
+        assert!(matches!(
+            SessionEstablishmentResponse::decode(&mut buf.freeze()),
+            Err(PfcpError::MissingMandatoryIe(_))
+        ));
     }
 }
