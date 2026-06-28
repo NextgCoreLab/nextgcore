@@ -8,10 +8,12 @@
 //! NF service producers.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use tokio_rustls::TlsConnector;
 
 use crate::error::{SbiError, SbiResult};
 use crate::types::NfType;
@@ -456,6 +458,9 @@ pub struct OAuth2Client {
     nf_type: NfType,
     /// Token cache
     cache: TokenCache,
+    /// TLS connector used for `https://` NRF URIs; `None` keeps the cleartext
+    /// `http://` path unchanged (the connector is consulted only for `https`).
+    tls: Option<TlsConnector>,
 }
 
 impl OAuth2Client {
@@ -470,7 +475,32 @@ impl OAuth2Client {
             nf_instance_id: nf_instance_id.into(),
             nf_type,
             cache: TokenCache::new(),
+            tls: None,
         }
+    }
+
+    /// Enable TLS for `https://` NRF URIs. Default off (`None`) ⇒ the
+    /// `http://` path is byte-for-byte unchanged; the connector is consulted
+    /// only when the NRF URI scheme is `https`.
+    pub fn with_tls(mut self, connector: TlsConnector) -> Self {
+        self.tls = Some(connector);
+        self
+    }
+
+    /// Convenience: enable TLS with a default server-auth (webpki-roots)
+    /// connector. Use [`OAuth2Client::with_tls`] to supply a private-CA or
+    /// mTLS connector instead.
+    ///
+    /// ```no_run
+    /// # async fn f() -> ogs_sbi::SbiResult<()> {
+    /// use ogs_sbi::oauth::OAuth2Client;
+    /// use ogs_sbi::types::NfType;
+    /// let c = OAuth2Client::new("https://nrf:7777", "amf-1", NfType::Amf).with_default_tls()?;
+    /// # let _ = c; Ok(()) }
+    /// ```
+    pub fn with_default_tls(self) -> SbiResult<Self> {
+        let cfg = crate::tls::build_client_config(None, false)?;
+        Ok(self.with_tls(TlsConnector::from(Arc::new(cfg))))
     }
 
     /// Get the NRF URI.
@@ -510,28 +540,13 @@ impl OAuth2Client {
         let body = request.to_form_body();
         let uri = format!("{}/nnrf-oauth2/v1/access-token", self.nrf_uri);
 
-        // Build HTTP request using hyper
-        let addr = parse_uri_to_addr(&self.nrf_uri)?;
-
-        let stream = tokio::time::timeout(
-            Duration::from_secs(5),
-            tokio::net::TcpStream::connect(&addr),
+        // Cleartext for `http://`, TLS for `https://` (scheme-branched).
+        let mut sender = http2_connect(
+            &self.nrf_uri,
+            self.tls.as_ref(),
+            "OAuth2 HTTP/2 connection error",
         )
-        .await
-        .map_err(|_| SbiError::Timeout)?
-        .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
-
-        let io = hyper_util::rt::TokioIo::new(stream);
-        let (mut sender, conn) =
-            hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
-                .await
-                .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
-
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                log::error!("OAuth2 HTTP/2 connection error: {e}");
-            }
-        });
+        .await?;
 
         let http_request = hyper::Request::builder()
             .method(hyper::Method::POST)
@@ -600,6 +615,81 @@ fn parse_uri_to_addr(uri: &str) -> SbiResult<String> {
     Ok(host_port.to_string())
 }
 
+/// Scheme test that decides whether a connection uses TLS. The sole TLS
+/// trigger, kept pure so it is unit-testable without sockets.
+#[inline]
+fn uri_is_https(uri: &str) -> bool {
+    uri.starts_with("https://")
+}
+
+/// Open an HTTP/2 connection to the authority in `uri` and return its request
+/// sender.
+///
+/// * `http://`  → cleartext h2c (prior knowledge), byte-for-byte identical to
+///   the previous inline connect code: no TLS, no ALPN. The `tls` connector is
+///   ignored for this scheme.
+/// * `https://` → a rustls TLS 1.2/1.3 handshake (ALPN `h2`) then HTTP/2, using
+///   the supplied `tls` connector or, when `None`, a default webpki-roots
+///   server-auth connector (secure by default).
+///
+/// `conn_label` names the spawned connection-driver error log so each call
+/// site preserves its original message text.
+async fn http2_connect(
+    uri: &str,
+    tls: Option<&TlsConnector>,
+    conn_label: &'static str,
+) -> SbiResult<hyper::client::conn::http2::SendRequest<http_body_util::Full<bytes::Bytes>>> {
+    let addr = parse_uri_to_addr(uri)?;
+    let stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    .map_err(|_| SbiError::Timeout)?
+    .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
+
+    if uri_is_https(uri) {
+        let connector = match tls {
+            Some(c) => c.clone(),
+            None => TlsConnector::from(Arc::new(crate::tls::build_client_config(None, false)?)),
+        };
+        let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(&addr);
+        let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(|e| SbiError::TlsError(format!("Invalid server name: {e}")))?;
+        let tls_stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            connector.connect(server_name, stream),
+        )
+        .await
+        .map_err(|_| SbiError::Timeout)?
+        .map_err(|e| SbiError::TlsError(format!("TLS handshake failed: {e}")))?;
+        let io = hyper_util::rt::TokioIo::new(tls_stream);
+        let (sender, conn) =
+            hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
+                .await
+                .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                log::error!("{conn_label} (TLS): {e}");
+            }
+        });
+        Ok(sender)
+    } else {
+        // Cleartext h2c — byte-for-byte the previous inline connect code.
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let (sender, conn) =
+            hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
+                .await
+                .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                log::error!("{conn_label}: {e}");
+            }
+        });
+        Ok(sender)
+    }
+}
+
 /// Minimal percent-encoding for form values.
 fn url_encode(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
@@ -630,8 +720,9 @@ fn url_encode(s: &str) -> String {
 /// The document is fetched lazily on first use and reused until `ttl`
 /// expires. When a token carries a `kid` that is not in the cached document
 /// (NRF key rotation or restart), [`JwksCache::authorize`] re-fetches once
-/// before rejecting. Like [`OAuth2Client`], the fetch speaks cleartext
-/// HTTP/2 (h2c prior knowledge); `https` JWKS URIs are not supported yet.
+/// before rejecting. The fetch speaks cleartext HTTP/2 (h2c prior knowledge)
+/// for `http://` JWKS URIs; enable TLS for `https://` URIs with
+/// [`JwksCache::with_tls`] / [`JwksCache::with_default_tls`].
 pub struct JwksCache {
     /// Full JWKS URI, e.g. `http://nrf:7777/nnrf-oauth2/v1/jwks`.
     jwks_uri: String,
@@ -639,6 +730,9 @@ pub struct JwksCache {
     cached: RwLock<Option<(serde_json::Value, Instant)>>,
     /// How long a fetched document is reused before re-fetching.
     ttl: Duration,
+    /// TLS connector for `https://` JWKS URIs; `None` keeps the cleartext
+    /// `http://` path unchanged.
+    tls: Option<TlsConnector>,
 }
 
 impl JwksCache {
@@ -653,6 +747,7 @@ impl JwksCache {
             jwks_uri: jwks_uri.into(),
             cached: RwLock::new(None),
             ttl: Self::DEFAULT_TTL,
+            tls: None,
         }
     }
 
@@ -669,6 +764,21 @@ impl JwksCache {
     pub fn with_ttl(mut self, ttl: Duration) -> Self {
         self.ttl = ttl;
         self
+    }
+
+    /// Enable TLS for an `https://` JWKS URI. Default off; the connector is
+    /// consulted only when the JWKS URI scheme is `https`, so an `http://`
+    /// cache is unaffected.
+    pub fn with_tls(mut self, connector: TlsConnector) -> Self {
+        self.tls = Some(connector);
+        self
+    }
+
+    /// Convenience: enable TLS with a default server-auth (webpki-roots)
+    /// connector.
+    pub fn with_default_tls(self) -> SbiResult<Self> {
+        let cfg = crate::tls::build_client_config(None, false)?;
+        Ok(self.with_tls(TlsConnector::from(Arc::new(cfg))))
     }
 
     /// The JWKS URI this cache fetches from.
@@ -688,7 +798,7 @@ impl JwksCache {
 
     /// Force a re-fetch, replacing the cached document on success.
     pub async fn refresh(&self) -> SbiResult<serde_json::Value> {
-        let doc = fetch_jwks(&self.jwks_uri).await?;
+        let doc = fetch_jwks_with(&self.jwks_uri, self.tls.as_ref()).await?;
         *self.cached.write().await = Some((doc.clone(), Instant::now()));
         Ok(doc)
     }
@@ -728,29 +838,14 @@ impl JwksCache {
     }
 }
 
-/// Fetch a JWKS document over cleartext HTTP/2 and validate its shape.
-pub async fn fetch_jwks(jwks_uri: &str) -> SbiResult<serde_json::Value> {
-    let addr = parse_uri_to_addr(jwks_uri)?;
-
-    let stream = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::net::TcpStream::connect(&addr),
-    )
-    .await
-    .map_err(|_| SbiError::Timeout)?
-    .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
-
-    let io = hyper_util::rt::TokioIo::new(stream);
-    let (mut sender, conn) =
-        hyper::client::conn::http2::handshake(hyper_util::rt::TokioExecutor::new(), io)
-            .await
-            .map_err(|e| SbiError::ConnectionError(e.to_string()))?;
-
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            log::error!("JWKS HTTP/2 connection error: {e}");
-        }
-    });
+/// Fetch a JWKS document and validate its shape, using TLS for `https://`
+/// URIs and cleartext HTTP/2 for `http://`. `tls = None` uses a default
+/// webpki-roots connector for `https` (and is ignored for `http`).
+pub async fn fetch_jwks_with(
+    jwks_uri: &str,
+    tls: Option<&TlsConnector>,
+) -> SbiResult<serde_json::Value> {
+    let mut sender = http2_connect(jwks_uri, tls, "JWKS HTTP/2 connection error").await?;
 
     let http_request = hyper::Request::builder()
         .method(hyper::Method::GET)
@@ -787,6 +882,12 @@ pub async fn fetch_jwks(jwks_uri: &str) -> SbiResult<serde_json::Value> {
         ));
     }
     Ok(doc)
+}
+
+/// Fetch a JWKS document: cleartext HTTP/2 for `http://`, default TLS for
+/// `https://`. Back-compat wrapper over [`fetch_jwks_with`].
+pub async fn fetch_jwks(jwks_uri: &str) -> SbiResult<serde_json::Value> {
+    fetch_jwks_with(jwks_uri, None).await
 }
 
 #[cfg(test)]
@@ -1224,6 +1325,125 @@ mod tests {
             .await
             .expect("live JWKS fetch succeeds");
         assert_eq!(doc["keys"][0]["kid"], "nrf-es256");
+    }
+
+    // --- sbi-01: TLS for OAuth2 token + JWKS over https:// ---
+
+    #[test]
+    fn test_uri_is_https_scheme_branch() {
+        // The single TLS decision point.
+        assert!(uri_is_https("https://nrf:7777/x"));
+        assert!(!uri_is_https("http://nrf:7777/x"));
+        assert!(!uri_is_https("nrf:7777"));
+    }
+
+    #[test]
+    fn test_oauth2_client_tls_default_off() {
+        let c = OAuth2Client::new("http://127.0.0.10:7777", "amf-1", NfType::Amf);
+        assert!(c.tls.is_none());
+    }
+
+    #[test]
+    fn test_jwks_cache_tls_default_off() {
+        assert!(JwksCache::new("http://nrf:7777/jwks").tls.is_none());
+        assert!(JwksCache::for_nrf("http://nrf:7777").tls.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_fetch_jwks_http_ignores_tls_connector() {
+        // Load-bearing matched-sim guard: passing a real TLS connector to an
+        // http:// URI must be a no-op — the cleartext path is taken and the
+        // connector is never consulted, so the plaintext fetch still succeeds
+        // (a TLS handshake against this plaintext h2c server would fail).
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let addr = serve_jwks(jwks_for(&sk, "nrf-es256")).await;
+        let connector = TlsConnector::from(Arc::new(
+            crate::tls::build_client_config(None, false).unwrap(),
+        ));
+        let doc = fetch_jwks_with(
+            &format!("http://{addr}/nnrf-oauth2/v1/jwks"),
+            Some(&connector),
+        )
+        .await
+        .expect("http:// path ignores the TLS connector");
+        assert_eq!(doc["keys"][0]["kid"], "nrf-es256");
+    }
+
+    /// Serve `jwks` over HTTP/2-in-TLS (self-signed "localhost" cert) from an
+    /// ephemeral local port.
+    async fn serve_jwks_tls(jwks: serde_json::Value) -> std::net::SocketAddr {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = CertificateDer::from(cert.cert.der().to_vec());
+        let key_der = PrivateKeyDer::try_from(cert.key_pair.serialize_der()).unwrap();
+        let server_config = crate::tls::build_server_config(vec![cert_der], key_der).unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let acceptor = acceptor.clone();
+                let body = jwks.to_string();
+                tokio::spawn(async move {
+                    let Ok(tls_stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let io = hyper_util::rt::TokioIo::new(tls_stream);
+                    let svc = hyper::service::service_fn(move |_req| {
+                        let body = body.clone();
+                        async move {
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                                http_body_util::Full::new(bytes::Bytes::from(body)),
+                            ))
+                        }
+                    });
+                    let _ = hyper::server::conn::http2::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    )
+                    .serve_connection(io, svc)
+                    .await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn test_fetch_jwks_over_tls() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let addr = serve_jwks_tls(jwks_for(&sk, "nrf-es256")).await;
+        // Self-signed server cert ⇒ an insecure client connector skips verify.
+        let connector = TlsConnector::from(Arc::new(
+            crate::tls::build_client_config(None, true).unwrap(),
+        ));
+        let doc = fetch_jwks_with(
+            &format!("https://{addr}/nnrf-oauth2/v1/jwks"),
+            Some(&connector),
+        )
+        .await
+        .expect("https:// JWKS fetch over TLS succeeds");
+        assert_eq!(doc["keys"][0]["kid"], "nrf-es256");
+    }
+
+    #[tokio::test]
+    async fn test_jwks_cache_over_tls_with_connector() {
+        let sk = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let addr = serve_jwks_tls(jwks_for(&sk, "nrf-es256")).await;
+        let connector = TlsConnector::from(Arc::new(
+            crate::tls::build_client_config(None, true).unwrap(),
+        ));
+        let cache =
+            JwksCache::new(format!("https://{addr}/nnrf-oauth2/v1/jwks")).with_tls(connector);
+        let token = build_es256_token(&sk, "nrf-es256", future_exp());
+        let claims = cache
+            .authorize(Some(&format!("Bearer {token}")))
+            .await
+            .expect("TLS JWKS cache verifies a token");
+        assert_eq!(claims.iss, "NRF");
     }
 
     #[tokio::test]
