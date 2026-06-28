@@ -2879,6 +2879,128 @@ impl DownlinkDataReport {
     }
 }
 
+/// Node Report Type (TS 29.244 §8.2.91) — octet 5 flag bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct NodeReportType {
+    pub upfr: bool, // User Plane Path Failure Report (bit 1)
+    pub uprr: bool, // User Plane Path Recovery Report (bit 2)
+    pub ckdr: bool, // Clock Drift Report (bit 3)
+    pub gpqr: bool, // GTP-U Path QoS Report (bit 4)
+}
+
+impl NodeReportType {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        let octet = (self.upfr as u8)
+            | ((self.uprr as u8) << 1)
+            | ((self.ckdr as u8) << 2)
+            | ((self.gpqr as u8) << 3);
+        buf.put_u8(octet);
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        let octet = data.first().copied().ok_or(PfcpError::BufferTooShort {
+            needed: 1,
+            available: 0,
+        })?;
+        Ok(Self {
+            upfr: octet & 0x01 != 0,
+            uprr: octet & 0x02 != 0,
+            ckdr: octet & 0x04 != 0,
+            gpqr: octet & 0x08 != 0,
+        })
+    }
+}
+
+/// Remote GTP-U Peer (TS 29.244 §8.2.83). Models the V4/V6 peer address; the
+/// optional Destination Interface / Network Instance fields are not emitted.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemoteGtpUPeer {
+    pub ipv4: Option<[u8; 4]>,
+    pub ipv6: Option<[u8; 16]>,
+}
+
+impl RemoteGtpUPeer {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        let flags = (self.ipv4.is_some() as u8) | ((self.ipv6.is_some() as u8) << 1);
+        buf.put_u8(flags);
+        if let Some(v4) = self.ipv4 {
+            buf.put_slice(&v4);
+        }
+        if let Some(v6) = self.ipv6 {
+            buf.put_slice(&v6);
+        }
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        let mut buf = Bytes::copy_from_slice(data);
+        if buf.remaining() < 1 {
+            return Err(PfcpError::BufferTooShort {
+                needed: 1,
+                available: 0,
+            });
+        }
+        let flags = buf.get_u8();
+        let v4 = flags & 0x01 != 0;
+        let v6 = flags & 0x02 != 0;
+        let mut peer = RemoteGtpUPeer::default();
+        if v4 {
+            if buf.remaining() < 4 {
+                return Err(PfcpError::BufferTooShort {
+                    needed: 4,
+                    available: buf.remaining(),
+                });
+            }
+            let mut a = [0u8; 4];
+            buf.copy_to_slice(&mut a);
+            peer.ipv4 = Some(a);
+        }
+        if v6 {
+            if buf.remaining() < 16 {
+                return Err(PfcpError::BufferTooShort {
+                    needed: 16,
+                    available: buf.remaining(),
+                });
+            }
+            let mut a = [0u8; 16];
+            buf.copy_to_slice(&mut a);
+            peer.ipv6 = Some(a);
+        }
+        Ok(peer)
+    }
+}
+
+/// User Plane Path Failure Report grouped IE (TS 29.244 §7.4.5.1.2): one or
+/// more Remote GTP-U Peer IEs identifying the peers whose path failed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UserPlanePathFailureReport {
+    pub remote_gtpu_peers: Vec<RemoteGtpUPeer>,
+}
+
+impl UserPlanePathFailureReport {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        use crate::ie::{IeHeader, IeType};
+        for peer in &self.remote_gtpu_peers {
+            let mut peer_buf = BytesMut::new();
+            peer.encode(&mut peer_buf);
+            IeHeader::new(IeType::RemoteGtpUPeer as u16, peer_buf.len() as u16).encode(buf);
+            buf.put_slice(&peer_buf);
+        }
+    }
+
+    pub fn decode(data: &[u8]) -> PfcpResult<Self> {
+        use crate::ie::{IeType, RawIe};
+        let mut buf = Bytes::copy_from_slice(data);
+        let mut remote_gtpu_peers = Vec::new();
+        while buf.remaining() >= 4 {
+            let ie = RawIe::decode(&mut buf)?;
+            if ie.ie_type == IeType::RemoteGtpUPeer as u16 {
+                remote_gtpu_peers.push(RemoteGtpUPeer::decode(&ie.data)?);
+            }
+        }
+        Ok(Self { remote_gtpu_peers })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

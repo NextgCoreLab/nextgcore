@@ -4,11 +4,11 @@
 
 use crate::error::{PfcpError, PfcpResult};
 use crate::header::{PfcpHeader, PfcpMessageType};
-use crate::ie::{encode_u32_ie, encode_u8_ie, IeHeader, IeType, RawIe};
+use crate::ie::{encode_u16_ie, encode_u32_ie, encode_u8_ie, IeHeader, IeType, RawIe};
 use crate::types::{
     CpFunctionFeatures, CreateBar, CreateFar, CreatePdr, CreateQer, CreateUrr, DownlinkDataReport,
-    FSeid, NodeId, PfcpCause, RemoveFar, RemovePdr, ReportType, UpFunctionFeatures, UpdateFar,
-    UpdatePdr, UsageReportSrr,
+    FSeid, NodeId, NodeReportType, PfcpCause, RemoveFar, RemovePdr, ReportType, UpFunctionFeatures,
+    UpdateFar, UpdatePdr, UsageReportSrr, UserPlanePathFailureReport,
 };
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -1079,6 +1079,127 @@ impl SessionReportResponse {
     }
 }
 
+/// Node Report Request (TS 29.244 §7.4.5) — sent by the UP function on
+/// detection of a user plane path failure (§5.10A).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeReportRequest {
+    pub node_id: NodeId,
+    pub node_report_type: NodeReportType,
+    pub user_plane_path_failure_report: Option<UserPlanePathFailureReport>,
+}
+
+impl NodeReportRequest {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        let mut node_id_buf = BytesMut::new();
+        self.node_id.encode(&mut node_id_buf);
+        IeHeader::new(IeType::NodeId as u16, node_id_buf.len() as u16).encode(buf);
+        buf.put_slice(&node_id_buf);
+
+        let mut nrt_buf = BytesMut::new();
+        self.node_report_type.encode(&mut nrt_buf);
+        IeHeader::new(IeType::NodeReportType as u16, nrt_buf.len() as u16).encode(buf);
+        buf.put_slice(&nrt_buf);
+
+        if let Some(report) = &self.user_plane_path_failure_report {
+            let mut report_buf = BytesMut::new();
+            report.encode(&mut report_buf);
+            IeHeader::new(IeType::UserPlanePathFailureReport as u16, report_buf.len() as u16)
+                .encode(buf);
+            buf.put_slice(&report_buf);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        let mut node_id = None;
+        let mut node_report_type = None;
+        let mut user_plane_path_failure_report = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::NodeId as u16 => {
+                    let mut data = ie.data;
+                    node_id = Some(NodeId::decode(&mut data)?);
+                }
+                t if t == IeType::NodeReportType as u16 => {
+                    node_report_type = Some(NodeReportType::decode(&ie.data)?);
+                }
+                t if t == IeType::UserPlanePathFailureReport as u16 => {
+                    user_plane_path_failure_report =
+                        Some(UserPlanePathFailureReport::decode(&ie.data)?);
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            node_id: node_id
+                .ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?,
+            node_report_type: node_report_type
+                .ok_or_else(|| PfcpError::MissingMandatoryIe("Node Report Type".to_string()))?,
+            user_plane_path_failure_report,
+        })
+    }
+}
+
+/// Node Report Response (TS 29.244 §7.4.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeReportResponse {
+    pub node_id: NodeId,
+    pub cause: PfcpCause,
+    pub offending_ie: Option<u16>,
+}
+
+impl NodeReportResponse {
+    pub fn encode(&self, buf: &mut BytesMut) {
+        let mut node_id_buf = BytesMut::new();
+        self.node_id.encode(&mut node_id_buf);
+        IeHeader::new(IeType::NodeId as u16, node_id_buf.len() as u16).encode(buf);
+        buf.put_slice(&node_id_buf);
+
+        encode_u8_ie(buf, IeType::Cause, self.cause as u8);
+
+        if let Some(offending) = self.offending_ie {
+            encode_u16_ie(buf, IeType::OffendingIe, offending);
+        }
+    }
+
+    pub fn decode(buf: &mut Bytes) -> PfcpResult<Self> {
+        let mut node_id = None;
+        let mut cause = None;
+        let mut offending_ie = None;
+
+        while buf.remaining() >= IeHeader::LEN {
+            let ie = RawIe::decode(buf)?;
+            match ie.ie_type {
+                t if t == IeType::NodeId as u16 => {
+                    let mut data = ie.data;
+                    node_id = Some(NodeId::decode(&mut data)?);
+                }
+                t if t == IeType::Cause as u16 => {
+                    if !ie.data.is_empty() {
+                        cause = Some(PfcpCause::try_from(ie.data[0])?);
+                    }
+                }
+                t if t == IeType::OffendingIe as u16 => {
+                    if ie.data.len() >= 2 {
+                        let mut data = ie.data;
+                        offending_ie = Some(data.get_u16());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            node_id: node_id
+                .ok_or_else(|| PfcpError::MissingMandatoryIe("Node ID".to_string()))?,
+            cause: cause.ok_or_else(|| PfcpError::MissingMandatoryIe("Cause".to_string()))?,
+            offending_ie,
+        })
+    }
+}
+
 /// PFCP Message enum containing all message types
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PfcpMessage {
@@ -1096,6 +1217,8 @@ pub enum PfcpMessage {
     SessionDeletionResponse(SessionDeletionResponse),
     SessionReportRequest(SessionReportRequest),
     SessionReportResponse(SessionReportResponse),
+    NodeReportRequest(NodeReportRequest),
+    NodeReportResponse(NodeReportResponse),
 }
 
 impl PfcpMessage {
@@ -1116,6 +1239,8 @@ impl PfcpMessage {
             Self::SessionDeletionResponse(_) => PfcpMessageType::SessionDeletionResponse,
             Self::SessionReportRequest(_) => PfcpMessageType::SessionReportRequest,
             Self::SessionReportResponse(_) => PfcpMessageType::SessionReportResponse,
+            Self::NodeReportRequest(_) => PfcpMessageType::NodeReportRequest,
+            Self::NodeReportResponse(_) => PfcpMessageType::NodeReportResponse,
         }
     }
 
@@ -1136,6 +1261,8 @@ impl PfcpMessage {
             Self::SessionDeletionResponse(msg) => msg.encode(buf),
             Self::SessionReportRequest(msg) => msg.encode(buf),
             Self::SessionReportResponse(msg) => msg.encode(buf),
+            Self::NodeReportRequest(msg) => msg.encode(buf),
+            Self::NodeReportResponse(msg) => msg.encode(buf),
         }
     }
 
@@ -1184,6 +1311,12 @@ impl PfcpMessage {
             PfcpMessageType::SessionReportResponse => Ok(Self::SessionReportResponse(
                 SessionReportResponse::decode(buf)?,
             )),
+            PfcpMessageType::NodeReportRequest => {
+                Ok(Self::NodeReportRequest(NodeReportRequest::decode(buf)?))
+            }
+            PfcpMessageType::NodeReportResponse => {
+                Ok(Self::NodeReportResponse(NodeReportResponse::decode(buf)?))
+            }
             _ => Err(PfcpError::InvalidMessageType(message_type as u8)),
         }
     }
@@ -1260,6 +1393,63 @@ mod tests {
         let decoded = HeartbeatRequest::decode(&mut bytes).unwrap();
 
         assert_eq!(decoded.recovery_time_stamp, 1234567890);
+    }
+
+    #[test]
+    fn test_node_report_request_roundtrip() {
+        let msg = NodeReportRequest {
+            node_id: NodeId::new_ipv4([10, 45, 0, 1]),
+            node_report_type: NodeReportType {
+                upfr: true,
+                ..Default::default()
+            },
+            user_plane_path_failure_report: Some(UserPlanePathFailureReport {
+                remote_gtpu_peers: vec![RemoteGtpUPeer {
+                    ipv4: Some([10, 45, 0, 7]),
+                    ipv6: None,
+                }],
+            }),
+        };
+        let mut buf = BytesMut::new();
+        msg.encode(&mut buf);
+        let decoded = NodeReportRequest::decode(&mut buf.freeze()).unwrap();
+        assert_eq!(decoded, msg);
+        assert!(decoded.node_report_type.upfr);
+        assert_eq!(
+            decoded.user_plane_path_failure_report.unwrap().remote_gtpu_peers[0].ipv4,
+            Some([10, 45, 0, 7])
+        );
+    }
+
+    #[test]
+    fn test_node_report_request_missing_type_rejected() {
+        // Node Report Type is mandatory.
+        let mut buf = BytesMut::new();
+        let node_id = NodeId::new_ipv4([1, 2, 3, 4]);
+        let mut nb = BytesMut::new();
+        node_id.encode(&mut nb);
+        IeHeader::new(IeType::NodeId as u16, nb.len() as u16).encode(&mut buf);
+        buf.put_slice(&nb);
+        assert!(matches!(
+            NodeReportRequest::decode(&mut buf.freeze()),
+            Err(PfcpError::MissingMandatoryIe(_))
+        ));
+    }
+
+    #[test]
+    fn test_node_report_response_roundtrip_via_dispatch() {
+        let msg = PfcpMessage::NodeReportResponse(NodeReportResponse {
+            node_id: NodeId::new_ipv4([10, 45, 0, 1]),
+            cause: PfcpCause::RequestAccepted,
+            offending_ie: None,
+        });
+        assert_eq!(msg.message_type(), PfcpMessageType::NodeReportResponse);
+        let mut body = BytesMut::new();
+        msg.encode_body(&mut body);
+        let decoded =
+            PfcpMessage::decode_body(PfcpMessageType::NodeReportResponse, &mut body.freeze())
+                .unwrap();
+        assert_eq!(decoded, msg);
     }
 
     #[test]
