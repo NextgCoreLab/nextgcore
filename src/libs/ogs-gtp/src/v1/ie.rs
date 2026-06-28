@@ -137,6 +137,8 @@ pub enum Gtp1IeTypeTlv {
     IovUpdatesCounter = 222,
     MappedUeUsageType = 223,
     UpFunctionSelectionIndicationFlags = 224,
+    GtpuTunnelStatusInformation = 230,
+    RecoveryTimeStamp = 231,
     SpecialIeTypeForIeTypeExtension = 238,
     ChargingGatewayAddress = 251,
 }
@@ -447,6 +449,126 @@ impl GsnAddressIe {
     }
 }
 
+/// Extension Header Type List IE (TLV, type 141; TS 29.281 Section 8.5).
+///
+/// Carries the list of `n` Extension Header Type octets supported by the
+/// sending GTP entity; the Length field is `n`. Mandatory IE in a Supported
+/// Extension Headers Notification (Section 7.2.3).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExtHeaderTypeListIe {
+    /// The list of extension header type octets.
+    pub types: Vec<u8>,
+}
+
+impl ExtHeaderTypeListIe {
+    pub fn new(types: Vec<u8>) -> Self {
+        Self { types }
+    }
+
+    /// Encode the full TLV (type 141, 2-octet length = n, then the n octets).
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(Gtp1IeTypeTlv::ExtensionHeaderTypeList as u8);
+        buf.put_u16(self.types.len() as u16);
+        buf.put_slice(&self.types);
+    }
+
+    /// Decode the value field (`length` octets) into the type list.
+    pub fn decode(buf: &mut Bytes, length: u16) -> GtpResult<Self> {
+        let len = length as usize;
+        if buf.remaining() < len {
+            return Err(GtpError::BufferTooShort {
+                needed: len,
+                available: buf.remaining(),
+            });
+        }
+        let mut types = vec![0u8; len];
+        buf.copy_to_slice(&mut types);
+        Ok(Self { types })
+    }
+}
+
+/// GTP-U Tunnel Status Information IE (TLV, type 230; TS 29.281 Section 8.7).
+///
+/// Octet 4 carries the SPOC (Start Pause Of Charging) flag in bit 1; bits 2-8
+/// are spare and set to 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TunnelStatusInfoIe {
+    /// Start Pause Of Charging (octet 4, bit 1).
+    pub spoc: bool,
+}
+
+impl TunnelStatusInfoIe {
+    pub fn new(spoc: bool) -> Self {
+        Self { spoc }
+    }
+
+    /// Encode the full TLV (type 230, length 1, octet 4 = SPOC in bit 1).
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(Gtp1IeTypeTlv::GtpuTunnelStatusInformation as u8);
+        buf.put_u16(1);
+        buf.put_u8(self.spoc as u8);
+    }
+
+    /// Decode the value field (`length` octets, octet 4 first) into the flags.
+    pub fn decode(buf: &mut Bytes, length: u16) -> GtpResult<Self> {
+        let len = length as usize;
+        if len < 1 || buf.remaining() < len {
+            return Err(GtpError::BufferTooShort {
+                needed: len.max(1),
+                available: buf.remaining(),
+            });
+        }
+        let octet4 = buf.get_u8();
+        // Skip any further explicitly-specified octets (spare/future use).
+        for _ in 1..len {
+            buf.get_u8();
+        }
+        Ok(Self {
+            spoc: octet4 & 0x01 != 0,
+        })
+    }
+}
+
+/// Recovery Time Stamp IE (TLV, type 231; TS 29.281 Section 8.8).
+///
+/// Octets 4-7 hold the recovery time stamp, encoded as the first four octets of
+/// the 64-bit NTP timestamp (seconds since 1900-01-01, per IETF RFC 5905).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RecoveryTimeStampIe {
+    /// Recovery time stamp value (NTP seconds since 1900-01-01).
+    pub timestamp: u32,
+}
+
+impl RecoveryTimeStampIe {
+    pub fn new(timestamp: u32) -> Self {
+        Self { timestamp }
+    }
+
+    /// Encode the full TLV (type 231, length 4, then the 32-bit time stamp).
+    pub fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u8(Gtp1IeTypeTlv::RecoveryTimeStamp as u8);
+        buf.put_u16(4);
+        buf.put_u32(self.timestamp);
+    }
+
+    /// Decode the value field (`length` octets, time stamp in octets 4-7).
+    pub fn decode(buf: &mut Bytes, length: u16) -> GtpResult<Self> {
+        let len = length as usize;
+        if len < 4 || buf.remaining() < len {
+            return Err(GtpError::BufferTooShort {
+                needed: len.max(4),
+                available: buf.remaining(),
+            });
+        }
+        let timestamp = buf.get_u32();
+        // Skip any further explicitly-specified octets.
+        for _ in 4..len {
+            buf.get_u8();
+        }
+        Ok(Self { timestamp })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,5 +615,53 @@ mod tests {
         // Skip the type byte for decoding
         let ie_type = bytes.get_u8();
         assert_eq!(ie_type, Gtp1IeTypeTv::Recovery as u8);
+    }
+
+    // gtp-03: Extension Header Type List IE (141), exact wire bytes
+    #[test]
+    fn test_ext_header_type_list_ie_byte_vector() {
+        let ie = ExtHeaderTypeListIe::new(vec![0x85, 0x84]);
+        let mut buf = BytesMut::new();
+        ie.encode(&mut buf);
+        // type 141 (0x8D), length 0x0002, then the two type octets
+        assert_eq!(&buf[..], &[0x8D, 0x00, 0x02, 0x85, 0x84]);
+
+        // Round-trip from the value field
+        let mut value = Bytes::from_static(&[0x85, 0x84]);
+        let decoded = ExtHeaderTypeListIe::decode(&mut value, 2).unwrap();
+        assert_eq!(decoded, ie);
+    }
+
+    // gtp-07: GTP-U Tunnel Status Information IE (230), exact wire bytes
+    #[test]
+    fn test_tunnel_status_info_ie_byte_vector() {
+        let ie = TunnelStatusInfoIe::new(true);
+        let mut buf = BytesMut::new();
+        ie.encode(&mut buf);
+        // type 230 (0xE6), length 0x0001, octet4 = 0x01 (SPOC set)
+        assert_eq!(&buf[..], &[0xE6, 0x00, 0x01, 0x01]);
+
+        let mut value = Bytes::from_static(&[0x01]);
+        let decoded = TunnelStatusInfoIe::decode(&mut value, 1).unwrap();
+        assert!(decoded.spoc);
+
+        // SPOC clear
+        let mut buf = BytesMut::new();
+        TunnelStatusInfoIe::new(false).encode(&mut buf);
+        assert_eq!(&buf[..], &[0xE6, 0x00, 0x01, 0x00]);
+    }
+
+    // gtp-06: Recovery Time Stamp IE (231), exact wire bytes
+    #[test]
+    fn test_recovery_timestamp_ie_byte_vector() {
+        let ie = RecoveryTimeStampIe::new(0xE000_0000);
+        let mut buf = BytesMut::new();
+        ie.encode(&mut buf);
+        // type 231 (0xE7), length 0x0004, then the 32-bit time stamp
+        assert_eq!(&buf[..], &[0xE7, 0x00, 0x04, 0xE0, 0x00, 0x00, 0x00]);
+
+        let mut value = Bytes::from_static(&[0xE0, 0x00, 0x00, 0x00]);
+        let decoded = RecoveryTimeStampIe::decode(&mut value, 4).unwrap();
+        assert_eq!(decoded.timestamp, 0xE000_0000);
     }
 }

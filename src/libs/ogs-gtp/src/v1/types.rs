@@ -5,16 +5,34 @@
 use crate::error::{GtpError, GtpResult};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-/// GTPv1 Extension Header Types
+/// GTPv1 Extension Header Types (TS 29.281 Section 5.2.1, Figure 5.2.1-2 type table)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ExtensionHeaderType {
     /// No more extension headers
     NoMoreExtensionHeaders = 0x00,
-    /// UDP Port
+    /// Long PDCP PDU Number (source eNB/gNB, this release)
+    LongPdcpPduNumber = 0x03,
+    /// PDU Set Information Container (low code point)
+    PduSetInformationContainer = 0x04,
+    /// Service Class Indicator
+    ServiceClassIndicator = 0x20,
+    /// UDP Port (provides the UDP source port of the triggering message)
     UdpPort = 0x40,
+    /// RAN Container
+    RanContainer = 0x81,
+    /// Long PDCP PDU Number (legacy code point)
+    LongPdcpPduNumberLegacy = 0x82,
+    /// Xw RAN Container
+    XwRanContainer = 0x83,
+    /// NR RAN Container
+    NrRanContainer = 0x84,
     /// PDU Session Container
     PduSessionContainer = 0x85,
+    /// PDU Set Information Container (high code point)
+    PduSetInformationContainerHigh = 0x86,
+    /// PDCP PDU Number
+    PdcpPduNumber = 0xC0,
 }
 
 impl TryFrom<u8> for ExtensionHeaderType {
@@ -23,12 +41,48 @@ impl TryFrom<u8> for ExtensionHeaderType {
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
             0x00 => Ok(ExtensionHeaderType::NoMoreExtensionHeaders),
+            0x03 => Ok(ExtensionHeaderType::LongPdcpPduNumber),
+            0x04 => Ok(ExtensionHeaderType::PduSetInformationContainer),
+            0x20 => Ok(ExtensionHeaderType::ServiceClassIndicator),
             0x40 => Ok(ExtensionHeaderType::UdpPort),
+            0x81 => Ok(ExtensionHeaderType::RanContainer),
+            0x82 => Ok(ExtensionHeaderType::LongPdcpPduNumberLegacy),
+            0x83 => Ok(ExtensionHeaderType::XwRanContainer),
+            0x84 => Ok(ExtensionHeaderType::NrRanContainer),
             0x85 => Ok(ExtensionHeaderType::PduSessionContainer),
+            0x86 => Ok(ExtensionHeaderType::PduSetInformationContainerHigh),
+            0xC0 => Ok(ExtensionHeaderType::PdcpPduNumber),
             _ => Err(GtpError::InvalidFormat(format!(
                 "Unknown extension header type: {value:#x}"
             ))),
         }
+    }
+}
+
+/// Comprehension class of an extension header, derived from bits 7 and 8 of the
+/// Next Extension Header Type field (TS 29.281 Section 5.2.1, Figure 5.2.1-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtHeaderComprehension {
+    /// Bits `00`/`01`: comprehension of this extension header is not required.
+    NotRequired,
+    /// Bits `10`: comprehension required by the Endpoint Receiver only, not by
+    /// an Intermediate Node.
+    RequiredEndpointOnly,
+    /// Bits `11`: comprehension required by the recipient (Endpoint Receiver or
+    /// Intermediate Node).
+    Required,
+}
+
+/// Classify an extension header type by bits 7 and 8 (TS 29.281 Figure 5.2.1-2).
+///
+/// The two most significant bits of the type octet define how an unknown
+/// extension header must be handled: `00`/`01` not required, `10` required by
+/// the Endpoint Receiver only, `11` required by the recipient.
+pub fn comprehension_of(ext_type: u8) -> ExtHeaderComprehension {
+    match (ext_type >> 6) & 0b11 {
+        0b00 | 0b01 => ExtHeaderComprehension::NotRequired,
+        0b10 => ExtHeaderComprehension::RequiredEndpointOnly,
+        _ => ExtHeaderComprehension::Required, // 0b11
     }
 }
 
@@ -91,6 +145,30 @@ impl Gtp1ExtHeader {
             ExtensionHeaderType::PduSessionContainer as u8,
             &container.encode_content(),
         )
+    }
+
+    /// Whether the given extension header type is one defined/recognized by
+    /// this implementation (TS 29.281 Section 5.2.1 type table). Used by the
+    /// comprehension procedure so that defined N3/N9/Xn headers are not
+    /// spuriously flagged as unknown.
+    pub fn is_known(ext_type: u8) -> bool {
+        ExtensionHeaderType::try_from(ext_type).is_ok()
+    }
+
+    /// Whether this extension header, if unknown, must be comprehended by the
+    /// local role per TS 29.281 Section 5.2.1. Returns false for known types.
+    ///
+    /// `is_endpoint` is true when the local node is the Endpoint Receiver
+    /// (e.g. gNB/UPF terminating the tunnel), false for an Intermediate Node.
+    pub fn requires_comprehension(&self, is_endpoint: bool) -> bool {
+        if Self::is_known(self.ext_type) {
+            return false;
+        }
+        match comprehension_of(self.ext_type) {
+            ExtHeaderComprehension::Required => true,
+            ExtHeaderComprehension::RequiredEndpointOnly => is_endpoint,
+            ExtHeaderComprehension::NotRequired => false,
+        }
     }
 
     /// Length field value (total header size in 4-octet units)
@@ -1175,5 +1253,65 @@ mod tests {
             Gtp1ExtHeader::decode(ExtensionHeaderType::PduSessionContainer as u8, &mut buf)
                 .is_err()
         );
+    }
+
+    // gtp-02: comprehension-bit classification (TS 29.281 Figure 5.2.1-2)
+    #[test]
+    fn test_comprehension_of_bits_7_8() {
+        // bits 11 -> required by recipient
+        assert_eq!(comprehension_of(0xC4), ExtHeaderComprehension::Required);
+        assert_eq!(comprehension_of(0xC2), ExtHeaderComprehension::Required);
+        // bits 10 -> required by Endpoint Receiver only
+        assert_eq!(
+            comprehension_of(0x82),
+            ExtHeaderComprehension::RequiredEndpointOnly
+        );
+        assert_eq!(
+            comprehension_of(0x84),
+            ExtHeaderComprehension::RequiredEndpointOnly
+        );
+        // bits 01 and 00 -> comprehension not required
+        assert_eq!(comprehension_of(0x44), ExtHeaderComprehension::NotRequired);
+        assert_eq!(comprehension_of(0x40), ExtHeaderComprehension::NotRequired);
+        assert_eq!(comprehension_of(0x04), ExtHeaderComprehension::NotRequired);
+    }
+
+    // gtp-08: all defined user-plane ext header types are recognized
+    #[test]
+    fn test_known_ext_header_types() {
+        for t in [
+            0x00u8, 0x03, 0x04, 0x20, 0x40, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0xC0,
+        ] {
+            assert!(Gtp1ExtHeader::is_known(t), "type {t:#x} should be known");
+            assert!(ExtensionHeaderType::try_from(t).is_ok());
+        }
+        // An unspecified type is unknown
+        assert!(!Gtp1ExtHeader::is_known(0xC4));
+        assert!(ExtensionHeaderType::try_from(0xC4).is_err());
+    }
+
+    // gtp-02: a known type never requires comprehension; an unknown one does
+    // per its bits-7/8 class and the local role.
+    #[test]
+    fn test_requires_comprehension() {
+        // Known NR RAN Container (0x84) -> never flagged even though bits=10
+        let known = Gtp1ExtHeader::new(0x84, &[0x00, 0x00]);
+        assert!(!known.requires_comprehension(true));
+        assert!(!known.requires_comprehension(false));
+
+        // Unknown 0xC4 (bits 11) -> required for both endpoint and intermediate
+        let req = Gtp1ExtHeader::new(0xC4, &[0x00, 0x00]);
+        assert!(req.requires_comprehension(true));
+        assert!(req.requires_comprehension(false));
+
+        // Unknown 0x8A (bits 10) -> required by endpoint only
+        let ep_only = Gtp1ExtHeader::new(0x8A, &[0x00, 0x00]);
+        assert!(ep_only.requires_comprehension(true));
+        assert!(!ep_only.requires_comprehension(false));
+
+        // Unknown 0x44 (bits 01) -> never required
+        let not_req = Gtp1ExtHeader::new(0x44, &[0x00, 0x00]);
+        assert!(!not_req.requires_comprehension(true));
+        assert!(!not_req.requires_comprehension(false));
     }
 }

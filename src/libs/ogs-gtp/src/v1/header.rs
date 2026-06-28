@@ -33,6 +33,7 @@ pub enum Gtp1uMessageType {
     EchoResponse = 2,
     ErrorIndication = 26,
     SupportedExtensionHeadersNotification = 31,
+    TunnelStatus = 253,
     EndMarker = 254,
     GPdu = 255,
 }
@@ -46,6 +47,7 @@ impl TryFrom<u8> for Gtp1uMessageType {
             2 => Ok(Gtp1uMessageType::EchoResponse),
             26 => Ok(Gtp1uMessageType::ErrorIndication),
             31 => Ok(Gtp1uMessageType::SupportedExtensionHeadersNotification),
+            253 => Ok(Gtp1uMessageType::TunnelStatus),
             254 => Ok(Gtp1uMessageType::EndMarker),
             255 => Ok(Gtp1uMessageType::GPdu),
             _ => Err(GtpError::InvalidMessageType(value)),
@@ -304,6 +306,20 @@ impl Gtp1Header {
         }
     }
 
+    /// Validate that this header carries Protocol Type = GTP (TS 29.281 §5.1).
+    ///
+    /// The lenient [`Gtp1Header::decode`] accepts both GTP (PT=1) and the legacy
+    /// GTP' (PT=0) framing. A GTP-U-only entity should call this after decode to
+    /// reject GTP' frames; it is opt-in so the default decode path is unchanged.
+    pub fn validate_gtpu(&self) -> GtpResult<()> {
+        if !self.pt {
+            return Err(GtpError::InvalidFormat(
+                "Protocol Type GTP' (PT=0) not supported".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Convert transaction ID to sequence number
     pub fn xid_to_sqn(xid: u32) -> u16 {
         (xid & 0xFFFF) as u16
@@ -436,5 +452,27 @@ mod tests {
         assert_eq!(header.teid, 0xABCDEF01);
         assert_eq!(header.version, GTP1_VERSION_1);
         assert!(header.pt);
+    }
+
+    // gtp-09: opt-in Protocol Type enforcement
+    #[test]
+    fn test_validate_gtpu_protocol_type() {
+        let mut header = Gtp1Header::new(Gtp1uMessageType::GPdu as u8, 1);
+        assert!(header.pt);
+        assert!(header.validate_gtpu().is_ok());
+
+        // GTP' framing (PT=0) is rejected by the strict validator
+        header.pt = false;
+        assert!(header.validate_gtpu().is_err());
+    }
+
+    // gtp-07: Tunnel Status message type round-trips through TryFrom
+    #[test]
+    fn test_tunnel_status_message_type() {
+        assert_eq!(
+            Gtp1uMessageType::try_from(253).unwrap(),
+            Gtp1uMessageType::TunnelStatus
+        );
+        assert_eq!(Gtp1uMessageType::TunnelStatus as u8, 253);
     }
 }
