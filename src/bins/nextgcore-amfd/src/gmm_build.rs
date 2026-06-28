@@ -884,6 +884,95 @@ mod tests {
         assert_eq!(msg[0], OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
     }
 
+    // ------------------------------------------------------------------
+    // nas-06 Phase 0: cross-stack drift bridge (amfd <-> ogs-nas)
+    //
+    // amfd hand-rolls its 5GMM encoders; ogs-nas is the conformant library
+    // but is not yet on the runtime path. These tests lock the two stacks
+    // together until convergence completes: every byte-compatible amfd-built
+    // message must (a) parse through ogs-nas and (b) re-encode byte-for-byte
+    // identically. Any divergence fails CI — the intent of the "land first"
+    // safety net. (DL NAS Transport and the non-3GPP bearer case diverge and
+    // are tracked separately; they are NOT asserted green here.)
+    // ------------------------------------------------------------------
+
+    /// Assert amfd-built plain 5GMM bytes parse via ogs-nas and re-encode
+    /// byte-identically.
+    fn assert_drift_roundtrip(amfd_bytes: &[u8], label: &str) {
+        use ogs_nas::fiveg::message::{build_5gmm_message, parse_5gmm_message};
+        let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(amfd_bytes))
+            .unwrap_or_else(|e| panic!("ogs-nas must parse amfd {label}: {e:?}"));
+        let re = build_5gmm_message(&parsed);
+        assert_eq!(
+            &re[..],
+            amfd_bytes,
+            "amfd {label} must round-trip byte-equal through ogs-nas"
+        );
+    }
+
+    #[test]
+    fn drift_authentication_reject_through_ogs_nas() {
+        use ogs_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+        let amfd = build_authentication_reject();
+        let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
+        assert!(matches!(parsed, FiveGmmMessage::AuthenticationReject(_)));
+        assert_drift_roundtrip(&amfd, "AuthenticationReject");
+    }
+
+    #[test]
+    fn drift_registration_reject_through_ogs_nas() {
+        use ogs_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+        let amfd = build_registration_reject(GmmCause::PlmnNotAllowed);
+        let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
+        assert!(matches!(parsed, FiveGmmMessage::RegistrationReject(_)));
+        assert_drift_roundtrip(&amfd, "RegistrationReject");
+    }
+
+    #[test]
+    fn drift_security_mode_reject_through_ogs_nas() {
+        use ogs_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+        let amfd = build_security_mode_reject(GmmCause::PlmnNotAllowed);
+        let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
+        assert!(matches!(parsed, FiveGmmMessage::SecurityModeReject(_)));
+        assert_drift_roundtrip(&amfd, "SecurityModeReject");
+    }
+
+    #[test]
+    fn drift_gmm_status_through_ogs_nas() {
+        use ogs_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+        let amfd = build_gmm_status(GmmCause::PlmnNotAllowed).unwrap();
+        let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
+        assert!(matches!(parsed, FiveGmmMessage::FiveGmmStatus(_)));
+        assert_drift_roundtrip(&amfd, "FiveGmmStatus");
+    }
+
+    #[test]
+    fn drift_identity_request_through_ogs_nas() {
+        use ogs_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+        let amfd = build_identity_request(mobile_identity_type::SUCI);
+        let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
+        assert!(matches!(parsed, FiveGmmMessage::IdentityRequest(_)));
+        assert_drift_roundtrip(&amfd, "IdentityRequest");
+    }
+
+    #[test]
+    fn drift_authentication_request_through_ogs_nas() {
+        use ogs_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+        let amfd = build_authentication_request(&create_test_amf_ue());
+        let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
+        assert!(matches!(parsed, FiveGmmMessage::AuthenticationRequest(_)));
+        assert_drift_roundtrip(&amfd, "AuthenticationRequest");
+    }
+
+    #[test]
+    fn drift_security_mode_command_through_ogs_nas() {
+        use ogs_nas::fiveg::message::{parse_5gmm_message, FiveGmmMessage};
+        let amfd = build_security_mode_command(&create_test_amf_ue()).unwrap();
+        let parsed = parse_5gmm_message(&mut bytes::Bytes::copy_from_slice(&amfd)).unwrap();
+        assert!(matches!(parsed, FiveGmmMessage::SecurityModeCommand(_)));
+        assert_drift_roundtrip(&amfd, "SecurityModeCommand");
+    }
+
     #[test]
     fn test_build_registration_accept() {
         let amf_ue = create_test_amf_ue();
