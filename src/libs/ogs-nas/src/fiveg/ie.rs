@@ -370,6 +370,23 @@ pub enum FiveGsIdentityType {
     Eui64 = 7,
 }
 
+impl From<u8> for FiveGsIdentityType {
+    /// Map the type-of-identity octet (low 3 bits) to its variant. Lenient on the
+    /// invalid "no identity" (0) and any out-of-range value, defaulting to `Suci`
+    /// to mirror the NAS decode path. TS 24.501 Section 9.11.3.3.
+    fn from(byte: u8) -> Self {
+        match byte & 0x07 {
+            2 => Self::FiveGGuti,
+            3 => Self::Imei,
+            4 => Self::FiveGSTmsi,
+            5 => Self::Imeisv,
+            6 => Self::MacAddress,
+            7 => Self::Eui64,
+            _ => Self::Suci, // 1 = SUCI, and 0/invalid floors to SUCI
+        }
+    }
+}
+
 /// MICO indication (TS 24.501 Section 9.11.3.31)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MicoIndication {

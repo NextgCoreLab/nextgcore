@@ -1028,17 +1028,7 @@ impl IdentityRequest {
                 actual: buf.remaining(),
             });
         }
-        let byte = buf.get_u8();
-        let identity_type = match byte & 0x07 {
-            1 => FiveGsIdentityType::Suci,
-            2 => FiveGsIdentityType::FiveGGuti,
-            3 => FiveGsIdentityType::Imei,
-            4 => FiveGsIdentityType::FiveGSTmsi,
-            5 => FiveGsIdentityType::Imeisv,
-            6 => FiveGsIdentityType::MacAddress,
-            7 => FiveGsIdentityType::Eui64,
-            _ => FiveGsIdentityType::Suci,
-        };
+        let identity_type = FiveGsIdentityType::from(buf.get_u8());
         Ok(Self { identity_type })
     }
 }

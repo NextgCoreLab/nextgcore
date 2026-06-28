@@ -6,6 +6,7 @@ use crate::context::{AmfUe, Guti5gs};
 use bytes::{BufMut, BytesMut};
 // nas-06: the conformant 5GMM encoder library. amfd is migrating its hand-rolled
 // builders onto ogs-nas message-by-message (Phase 1 = the cause-only builders).
+use ogs_nas::fiveg::ie::FiveGsIdentityType;
 use ogs_nas::fiveg::message as ogs_msg;
 
 // ============================================================================
@@ -528,17 +529,20 @@ pub fn build_deregistration_request(
 /// `identity_type` is one of `mobile_identity_type::*` (SUCI for the
 /// subscription identity before authentication, IMEI/IMEISV for PEI).
 pub fn build_identity_request(identity_type: u8) -> Vec<u8> {
-    let mut builder = NasMessageBuilder::new();
-
-    // GMM header (plain NAS message)
-    builder.write_epd(OGS_NAS_EXTENDED_PROTOCOL_DISCRIMINATOR_5GMM);
-    builder.write_u8(0); // Security header type (plain)
-    builder.write_message_type(message_type::IDENTITY_REQUEST);
-
-    // Identity type (mandatory, V)
-    builder.write_u8(identity_type & 0x07);
-
-    builder.build()
+    // nas-06 Phase 2 (Tier A): encoded via ogs-nas (plain header + mandatory
+    // type-of-identity V field, low 3 bits). Byte-identical to the prior hand-
+    // rolled output for every valid identity type; locked by
+    // `drift_identity_request_through_ogs_nas` + `golden_identity_request`.
+    // Identity type 0 ("no identity") is invalid in an Identity Request (callers
+    // pass SUCI/IMEISV); ogs-nas floors it to SUCI, so guard it in debug builds.
+    debug_assert!(
+        identity_type & 0x07 != 0,
+        "Identity Request with identity type 0 (no identity) is invalid"
+    );
+    let msg = ogs_msg::FiveGmmMessage::IdentityRequest(ogs_msg::IdentityRequest {
+        identity_type: FiveGsIdentityType::from(identity_type),
+    });
+    ogs_msg::build_5gmm_message(&msg).to_vec()
 }
 
 /// Build Authentication Request message
@@ -1049,6 +1053,20 @@ mod tests {
         assert_eq!(
             build_gmm_status(GmmCause::ProtocolErrorUnspecified),
             Some(vec![0x7e, 0x00, 0x64, 111])
+        );
+    }
+
+    #[test]
+    fn golden_identity_request() {
+        // EPD | SHT(plain) | IDENTITY REQUEST (0x5b) | type-of-identity (V, low 3 bits).
+        // The two identity types amfd ever requests: SUCI (1) and IMEISV (5).
+        assert_eq!(
+            build_identity_request(mobile_identity_type::SUCI),
+            vec![0x7e, 0x00, 0x5b, 0x01]
+        );
+        assert_eq!(
+            build_identity_request(mobile_identity_type::IMEISV),
+            vec![0x7e, 0x00, 0x5b, 0x05]
         );
     }
 
