@@ -34,6 +34,16 @@ pub const SCOPE_APPCTXTRELOC: &str = "eees-appctxtreloc";
 pub const SCOPE_EEL_ACR: &str = "eees-eel-acr";
 /// OAuth2 scope required for the `eees-acrstatus-update` service operations (eesd-07).
 pub const SCOPE_ACRSTATUS_UPDATE: &str = "eees-acrstatus-update";
+/// OAuth2 scope required for the `eees-cea` service operations (eesd-13).
+pub const SCOPE_CEA: &str = "eees-cea";
+/// OAuth2 scope required for the `eees-appclientinformation` service operations (eesd-13).
+pub const SCOPE_APPCLIENTINFORMATION: &str = "eees-appclientinformation";
+/// OAuth2 scope required for the `eees-acrmgntevent` service operations (eesd-13).
+pub const SCOPE_ACRMGNTEVENT: &str = "eees-acrmgntevent";
+/// OAuth2 scope required for the `eees-eeccontextreloc` service operations (eesd-13).
+pub const SCOPE_EECCONTEXTRELOC: &str = "eees-eeccontextreloc";
+/// OAuth2 scope required for the `eees-acr-param` service operations (eesd-13).
+pub const SCOPE_ACR_PARAM: &str = "eees-acr-param";
 
 /// Process-wide JWKS used to verify access tokens. `None` ⇒ unconfigured
 /// (fail-closed). Seeded from `--oauth2-jwks-file` or by tests.

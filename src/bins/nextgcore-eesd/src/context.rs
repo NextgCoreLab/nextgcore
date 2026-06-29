@@ -7,6 +7,7 @@
 
 use crate::acr::{AcrContextError, AcrParameters, AcrState, AcrStatus};
 use crate::eec::EecRegistration;
+use crate::services::{AcrMgntEventSubsc, AppClientInfo, CeaAnnouncement};
 use crate::types::{
     apply_merge_patch, is_expired, EasDiscoveryFilter, EasDiscoverySubscription, EasProfile,
     EasRegistration,
@@ -43,6 +44,12 @@ pub struct EesContext {
     disc_subscriptions: RwLock<HashMap<String, EasDiscoverySubscription>>,
     /// ACR relocation states (eesd-07), keyed by `"eecId:sEasId"`.
     acr_states: RwLock<HashMap<String, AcrState>>,
+    /// CEA announcements (eesd-13 `eees-cea`), keyed by server-minted `announcementId`.
+    cea_announcements: RwLock<HashMap<String, CeaAnnouncement>>,
+    /// App-client information records (eesd-13 `eees-appclientinformation`), keyed by `acInfoId`.
+    app_client_infos: RwLock<HashMap<String, AppClientInfo>>,
+    /// ACR management event subscriptions (eesd-13 `eees-acrmgntevent`), keyed by `subscriptionId`.
+    acr_mgnt_subscriptions: RwLock<HashMap<String, AcrMgntEventSubsc>>,
     /// Maximum registrations (applied per resource family).
     max_eas: usize,
     /// Context initialized flag.
@@ -57,6 +64,9 @@ impl EesContext {
             eec_registrations: RwLock::new(HashMap::new()),
             disc_subscriptions: RwLock::new(HashMap::new()),
             acr_states: RwLock::new(HashMap::new()),
+            cea_announcements: RwLock::new(HashMap::new()),
+            app_client_infos: RwLock::new(HashMap::new()),
+            acr_mgnt_subscriptions: RwLock::new(HashMap::new()),
             max_eas: 0,
             initialized: AtomicBool::new(false),
         }
@@ -89,6 +99,15 @@ impl EesContext {
         }
         if let Ok(mut states) = self.acr_states.write() {
             states.clear();
+        }
+        if let Ok(mut anns) = self.cea_announcements.write() {
+            anns.clear();
+        }
+        if let Ok(mut infos) = self.app_client_infos.write() {
+            infos.clear();
+        }
+        if let Ok(mut subs) = self.acr_mgnt_subscriptions.write() {
+            subs.clear();
         }
         self.initialized.store(false, Ordering::SeqCst);
         log::info!("EES context finalized");
@@ -671,6 +690,158 @@ impl EesContext {
     pub fn acr_find(&self, eec_id: &str, s_eas_id: &str) -> Option<AcrState> {
         let key = format!("{eec_id}:{s_eas_id}");
         self.acr_states.read().ok()?.get(&key).cloned()
+    }
+
+    // ---- eesd-13: eees-cea — Common EAS Announcement -------------------------
+
+    /// Create a CEA announcement; mints an `announcementId`.
+    pub fn cea_create(&self, mut ann: CeaAnnouncement) -> Option<CeaAnnouncement> {
+        let mut anns = self.cea_announcements.write().ok()?;
+        if anns.len() >= self.max_eas {
+            return None;
+        }
+        let id = Uuid::new_v4().to_string();
+        ann.announcement_id = Some(id.clone());
+        anns.insert(id.clone(), ann.clone());
+        log::info!("CEA announcement created: announcementId={id} easId={}", ann.eas_id);
+        Some(ann)
+    }
+
+    pub fn cea_find(&self, announcement_id: &str) -> Option<CeaAnnouncement> {
+        self.cea_announcements.read().ok()?.get(announcement_id).cloned()
+    }
+
+    pub fn cea_list(&self) -> Vec<CeaAnnouncement> {
+        self.cea_announcements
+            .read()
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn cea_delete(&self, announcement_id: &str) -> Option<CeaAnnouncement> {
+        let removed = self.cea_announcements.write().ok()?.remove(announcement_id);
+        if removed.is_some() {
+            log::info!("CEA announcement deleted: announcementId={announcement_id}");
+        }
+        removed
+    }
+
+    // ---- eesd-13: eees-appclientinformation — App Client Information ---------
+
+    /// Store an `AppClientInfo`; mints an `acInfoId`.
+    pub fn acinfo_create(&self, mut info: AppClientInfo) -> Option<AppClientInfo> {
+        let mut infos = self.app_client_infos.write().ok()?;
+        if infos.len() >= self.max_eas {
+            return None;
+        }
+        let id = Uuid::new_v4().to_string();
+        info.ac_info_id = Some(id.clone());
+        infos.insert(id.clone(), info.clone());
+        log::info!("AppClientInfo created: acInfoId={id} acId={}", info.ac_id);
+        Some(info)
+    }
+
+    pub fn acinfo_find(&self, ac_info_id: &str) -> Option<AppClientInfo> {
+        self.app_client_infos.read().ok()?.get(ac_info_id).cloned()
+    }
+
+    pub fn acinfo_list(&self) -> Vec<AppClientInfo> {
+        self.app_client_infos
+            .read()
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn acinfo_delete(&self, ac_info_id: &str) -> Option<AppClientInfo> {
+        let removed = self.app_client_infos.write().ok()?.remove(ac_info_id);
+        if removed.is_some() {
+            log::info!("AppClientInfo deleted: acInfoId={ac_info_id}");
+        }
+        removed
+    }
+
+    // ---- eesd-13: eees-acrmgntevent — ACR Management Event subscriptions -----
+
+    /// Create an ACR management event subscription; mints a `subscriptionId`.
+    pub fn acrmgnt_sub_create(
+        &self,
+        mut sub: AcrMgntEventSubsc,
+    ) -> Option<AcrMgntEventSubsc> {
+        let mut subs = self.acr_mgnt_subscriptions.write().ok()?;
+        if subs.len() >= self.max_eas {
+            return None;
+        }
+        let id = Uuid::new_v4().to_string();
+        sub.subscription_id = Some(id.clone());
+        subs.insert(id.clone(), sub.clone());
+        log::info!(
+            "ACR management event subscription created: subscriptionId={id} notificationUri={}",
+            sub.notification_uri
+        );
+        Some(sub)
+    }
+
+    pub fn acrmgnt_sub_find(&self, subscription_id: &str) -> Option<AcrMgntEventSubsc> {
+        self.acr_mgnt_subscriptions.read().ok()?.get(subscription_id).cloned()
+    }
+
+    pub fn acrmgnt_sub_list(&self) -> Vec<AcrMgntEventSubsc> {
+        self.acr_mgnt_subscriptions
+            .read()
+            .map(|m| m.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// PUT full-replace an ACR management event subscription.
+    pub fn acrmgnt_sub_update(
+        &self,
+        subscription_id: &str,
+        mut sub: AcrMgntEventSubsc,
+    ) -> Result<AcrMgntEventSubsc, UpdateError> {
+        let mut subs = self
+            .acr_mgnt_subscriptions
+            .write()
+            .map_err(|_| UpdateError::Internal)?;
+        if !subs.contains_key(subscription_id) {
+            return Err(UpdateError::NotFound);
+        }
+        sub.subscription_id = Some(subscription_id.to_string());
+        subs.insert(subscription_id.to_string(), sub.clone());
+        Ok(sub)
+    }
+
+    pub fn acrmgnt_sub_delete(&self, subscription_id: &str) -> Option<AcrMgntEventSubsc> {
+        let removed = self.acr_mgnt_subscriptions.write().ok()?.remove(subscription_id);
+        if removed.is_some() {
+            log::info!("ACR management event subscription deleted: subscriptionId={subscription_id}");
+        }
+        removed
+    }
+
+    /// Notify stub: count subscriptions whose `eecId`/`easId` filter matches the
+    /// event. Delivery is logged only (no live callback peer).
+    pub fn notify_acrmgnt_subscribers(
+        &self,
+        event_eec_id: Option<&str>,
+        event_eas_id: Option<&str>,
+    ) -> usize {
+        let subs = match self.acr_mgnt_subscriptions.read() {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+        let mut matched = 0;
+        for sub in subs.values() {
+            let eec_match = sub.eec_id.as_deref().is_none_or(|id| Some(id) == event_eec_id);
+            let eas_match = sub.eas_id.as_deref().is_none_or(|id| Some(id) == event_eas_id);
+            if eec_match && eas_match {
+                matched += 1;
+                log::debug!(
+                    "ACR management event notify (stub): would POST to {}",
+                    sub.notification_uri
+                );
+            }
+        }
+        matched
     }
 }
 
