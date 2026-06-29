@@ -277,6 +277,12 @@ async fn main() -> Result<()> {
             }
         }
     });
+    // GTP-U N3 path management (upfd-04): periodic Echo Request / path-failure detection
+    let dp_for_path = data_plane.clone();
+    let path_mgmt_handle = tokio::spawn(async move {
+        dp_for_path.run_path_management().await;
+    });
+
     let data_plane_handle = if data_plane_enabled {
         log::info!("Starting data plane task...");
         let dp_clone = data_plane.clone();
@@ -370,6 +376,7 @@ async fn main() -> Result<()> {
     urr_check_handle.abort();
     report_handle.abort();
     heartbeat_handle.abort();
+    path_mgmt_handle.abort();
 
     // Stop data plane (if enabled)
     if let Some(handle) = data_plane_handle {
