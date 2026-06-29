@@ -842,13 +842,13 @@ impl SbiServer {
                                                 // still hold the reference.
                                                 let tls_exporter_secret = {
                                                     let (_, server_conn) = tls_stream.get_ref();
-                                                    crate::tls::export_n32f_session_key(
+                                                    crate::tls::export_n32_master_key(
                                                         server_conn,
                                                         None,
                                                     )
                                                     .map_err(|e| {
                                                         log::warn!(
-                                                            "N32-f TLS exporter failed on \
+                                                            "N32 master exporter failed on \
                                                              server accept: {e}"
                                                         );
                                                     })

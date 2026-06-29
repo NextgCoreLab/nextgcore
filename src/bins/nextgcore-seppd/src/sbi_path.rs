@@ -313,7 +313,8 @@ pub fn build_prins_context(node_id: u64) -> Option<crate::prins::PrinsContext> {
     let mut prins_ctx = crate::prins::PrinsContext::new(
         security.local_context_id,
         security.peer_context_id,
-        security.session_key,
+        security.key_material,
+        security.role,
         security.kid,
         local_fqdn,
     );

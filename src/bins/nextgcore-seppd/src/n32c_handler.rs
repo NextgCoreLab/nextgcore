@@ -194,9 +194,9 @@ pub fn handle_security_capability_response(
 
 /// Security parameter exchange request (SecParamExchReqData).
 ///
-/// Per TS 33.501 §13.2.4.4 the PRINS N32-f session key is derived from the
-/// N32-c TLS connection's RFC 5705 keying-material exporter (see
-/// [`derive_n32f_session_key`]). The TLS exporter secret for the peer is
+/// Per TS 33.501 §13.2.4.4.1 the PRINS N32-f key hierarchy is derived from the
+/// N32-c TLS connection's 64-octet RFC 5705 master exporter (see
+/// [`derive_n32f_key_material`]). The TLS master secret for the peer is
 /// obtained out-of-band from the N32-c TLS connection (see
 /// `set_n32c_tls_exporter_secret`); it is NEVER carried in this message, so
 /// there is no `keyNonce`. The asymmetric (ES256) public key each SEPP uses
@@ -269,8 +269,10 @@ pub const SUPPORTED_JWS_SUITES: &[&str] = &["ES256", "HS256"];
 // context-bound input so both peers still agree.
 // ============================================================================
 
-/// Length of the exporter secret we derive the session key from.
-pub const N32F_EXPORTER_SECRET_LEN: usize = 32;
+/// Length of the N32 master key (the RFC 5705 exporter secret) we derive the
+/// N32-f key hierarchy from (TS 33.501 §13.2.4.4.1). A 64-octet master is a
+/// valid HKDF PRK (>= HashLen for SHA-256).
+pub const N32F_EXPORTER_SECRET_LEN: usize = 64;
 
 fn exporter_secret_store() -> &'static std::sync::RwLock<std::collections::HashMap<String, Vec<u8>>>
 {
@@ -304,43 +306,116 @@ pub fn select_cipher_suite(peer_list: &[String], ours: &[&str]) -> Option<String
         .map(|s| s.to_string())
 }
 
-/// Derive the N32-f session key from the N32-c TLS exporter secret per
-/// TS 33.501 §13.2.4.4 (RFC 5705 keying material).
-///
-/// HKDF-SHA256:
-///   ikm  = TLS exporter secret (RFC 5705), shared by both N32-c endpoints
-///   salt = lexicographically ordered FQDN pair (channel binding)
-///   info = "N32f-PRINS-A256GCM" || ctx_id_initiator || ctx_id_responder
-///
-/// Because `exporter_secret` is the same value on both ends of the TLS
-/// connection, both SEPPs compute an identical 32-byte key; it is distinct
-/// per FQDN pair and per context-ID pair.
-pub fn derive_n32f_session_key(
-    exporter_secret: &[u8],
-    fqdn_a: &str,
-    fqdn_b: &str,
-    ctx_id_initiator: &str,
-    ctx_id_responder: &str,
-) -> [u8; 32] {
+/// Role of this SEPP in the N32-c handshake. It selects which half of the
+/// N32-f key hierarchy this SEPP uses to PROTECT the messages it originates
+/// (TS 33.501 §13.2.4.4.1): the handshake initiator uses the "parallel" key
+/// set, the responder uses the "reverse" set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum N32fRole {
+    /// N32-c exchange-params requester → "parallel" key set
+    Initiator,
+    /// N32-c exchange-params responder → "reverse" key set
+    Responder,
+}
+
+impl N32fRole {
+    /// The peer's role (the originator of inbound messages we unprotect).
+    pub fn opposite(self) -> Self {
+        match self {
+            N32fRole::Initiator => N32fRole::Responder,
+            N32fRole::Responder => N32fRole::Initiator,
+        }
+    }
+}
+
+/// Direction of an N32-f message relative to the SBI exchange it carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum N32fDirection {
+    Request,
+    Response,
+}
+
+/// The full N32-f key hierarchy derived from the 64-octet N32 master key
+/// (TS 33.501 §13.2.4.4.1). Four 256-bit session keys + four 64-bit IV salts,
+/// one (key, salt) pair per (role, direction). Both SEPPs derive an identical
+/// `N32fKeyMaterial` because the master is shared (RFC 5705 exporter) and the
+/// N32-f context ID is canonical (`{initiator}-{responder}`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct N32fKeyMaterial {
+    /// Initiator-originated request: (key, iv_salt)
+    pub parallel_req: ([u8; 32], [u8; 8]),
+    /// Initiator-originated response: (key, iv_salt)
+    pub parallel_resp: ([u8; 32], [u8; 8]),
+    /// Responder-originated request: (key, iv_salt)
+    pub reverse_req: ([u8; 32], [u8; 8]),
+    /// Responder-originated response: (key, iv_salt)
+    pub reverse_resp: ([u8; 32], [u8; 8]),
+}
+
+impl N32fKeyMaterial {
+    /// Select the (session key, IV salt) for a message ORIGINATED by a SEPP
+    /// acting in `originator_role`, travelling in `direction`. The sender
+    /// passes its own role; the receiver passes the peer's role (so both ends
+    /// of one message select the same pair).
+    pub fn select(
+        &self,
+        originator_role: N32fRole,
+        direction: N32fDirection,
+    ) -> (&[u8; 32], &[u8; 8]) {
+        let pair = match (originator_role, direction) {
+            (N32fRole::Initiator, N32fDirection::Request) => &self.parallel_req,
+            (N32fRole::Initiator, N32fDirection::Response) => &self.parallel_resp,
+            (N32fRole::Responder, N32fDirection::Request) => &self.reverse_req,
+            (N32fRole::Responder, N32fDirection::Response) => &self.reverse_resp,
+        };
+        (&pair.0, &pair.1)
+    }
+}
+
+/// N32-KDF (TS 33.501 §13.2.4.4.1): HKDF-Expand ONLY. The 64-octet N32 master
+/// from the N32-c TLS RFC 5705 exporter is already a uniformly-random PRK, so
+/// the Extract step is skipped (`from_prk`) and only Expand is applied with
+/// `info = "N32" || n32_context_id || label`.
+fn n32_kdf(master: &[u8], n32_context_id: &str, label: &str, out: &mut [u8]) {
     use hkdf::Hkdf;
     use sha2::Sha256;
+    let hk = Hkdf::<Sha256>::from_prk(master).expect("master >= 32 bytes (PRK length)");
+    let info = [b"N32".as_slice(), n32_context_id.as_bytes(), label.as_bytes()].concat();
+    hk.expand(&info, out)
+        .expect("valid HKDF-SHA256 Expand output length");
+}
 
-    let (lo, hi) = if fqdn_a <= fqdn_b {
-        (fqdn_a, fqdn_b)
-    } else {
-        (fqdn_b, fqdn_a)
+/// Derive the four N32-f session keys and four IV salts from the 64-octet
+/// master via the N32-KDF (TS 33.501 §13.2.4.4.1). `n32_context_id` is the
+/// canonical, shared N32-f context identifier (`{initiator}-{responder}`) so
+/// both SEPPs derive identical material.
+pub fn derive_n32f_key_material(master: &[u8], n32_context_id: &str) -> N32fKeyMaterial {
+    let key = |label: &str| -> [u8; 32] {
+        let mut out = [0u8; 32];
+        n32_kdf(master, n32_context_id, label, &mut out);
+        out
     };
-    let salt = format!("{lo}|{hi}");
+    let salt = |label: &str| -> [u8; 8] {
+        let mut out = [0u8; 8];
+        n32_kdf(master, n32_context_id, label, &mut out);
+        out
+    };
+    N32fKeyMaterial {
+        parallel_req: (key("parallel_request_key"), salt("parallel_request_iv_salt")),
+        parallel_resp: (
+            key("parallel_response_key"),
+            salt("parallel_response_iv_salt"),
+        ),
+        reverse_req: (key("reverse_request_key"), salt("reverse_request_iv_salt")),
+        reverse_resp: (key("reverse_response_key"), salt("reverse_response_iv_salt")),
+    }
+}
 
-    let mut info = b"N32f-PRINS-A256GCM".to_vec();
-    info.extend_from_slice(ctx_id_initiator.as_bytes());
-    info.extend_from_slice(ctx_id_responder.as_bytes());
-
-    let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), exporter_secret);
-    let mut okm = [0u8; 32];
-    hk.expand(&info, &mut okm)
-        .expect("32 bytes is a valid HKDF-SHA256 output length");
-    okm
+/// Canonical, shared N32-f context identifier used to bind the key hierarchy:
+/// `{initiator_ctx}-{responder_ctx}`. Both peers build the same value (it is
+/// also the JOSE `kid`), so they derive identical key material.
+pub fn canonical_n32f_context_id(ctx_id_initiator: &str, ctx_id_responder: &str) -> String {
+    format!("{ctx_id_initiator}-{ctx_id_responder}")
 }
 
 /// Resolve the exporter secret used to derive the N32-f session key with
@@ -362,11 +437,13 @@ fn resolve_exporter_secret(
         return secret;
     }
     log::warn!(
-        "[{peer_fqdn}] no N32-c TLS exporter secret; deriving N32-f key from \
-         context-bound fallback (no-TLS transport)"
+        "[{peer_fqdn}] no N32-c TLS exporter secret; deriving N32-f key \
+         hierarchy from context-bound fallback (no-TLS transport)"
     );
     // Deterministic, identical on both ends because the context-ID pair is
-    // mirrored. Domain-separated from any real exporter secret.
+    // mirrored. Domain-separated from any real exporter secret. SHA-512
+    // yields exactly 64 octets, a valid HKDF PRK for the N32-KDF.
+    use sha2::{Digest, Sha512};
     let mut input = b"N32f-no-tls-fallback".to_vec();
     let (lo, hi) = if ctx_id_initiator <= ctx_id_responder {
         (ctx_id_initiator, ctx_id_responder)
@@ -376,7 +453,7 @@ fn resolve_exporter_secret(
     input.extend_from_slice(lo.as_bytes());
     input.push(b'|');
     input.extend_from_slice(hi.as_bytes());
-    input
+    Sha512::digest(&input).to_vec()
 }
 
 /// Handle an exchange-params request (responder side). Selects cipher
@@ -412,23 +489,21 @@ pub fn handle_exchange_params_request(
     // can verify its modificationsBlock entries (TS 33.501 §13.2.4.6).
     register_peer_signing_key(&req.sender, req.modifications_signing_public_key.as_deref())?;
 
-    // TS 33.501 §13.2.4.4: derive the N32-f session key from the N32-c TLS
-    // exporter secret. Requester is the initiator.
-    let exporter_secret =
-        resolve_exporter_secret(&req.sender, &req.n32f_context_id, &local_context_id);
-    let session_key = derive_n32f_session_key(
-        &exporter_secret,
-        &req.sender,
-        &local_fqdn,
-        &req.n32f_context_id,
-        &local_context_id,
-    );
+    // TS 33.501 §13.2.4.4.1: derive the full N32-f key hierarchy from the
+    // 64-octet N32 master (RFC 5705 exporter). The requester is the N32-c
+    // initiator; we (the responder) use the "reverse" key set to protect the
+    // messages we originate. The canonical context ID `{initiator}-{responder}`
+    // makes both peers derive identical material.
+    let master = resolve_exporter_secret(&req.sender, &req.n32f_context_id, &local_context_id);
+    let n32_context_id = canonical_n32f_context_id(&req.n32f_context_id, &local_context_id);
+    let key_material = derive_n32f_key_material(&master, &n32_context_id);
 
     node.n32f_security = Some(crate::context::N32fSecurityInfo {
         local_context_id: local_context_id.clone(),
         peer_context_id: req.n32f_context_id.clone(),
-        session_key,
-        kid: format!("{}-{}", req.n32f_context_id, local_context_id),
+        key_material,
+        role: N32fRole::Responder,
+        kid: n32_context_id,
         jwe_cipher_suite: jwe.clone(),
         jws_cipher_suite: jws.clone(),
     });
@@ -487,23 +562,23 @@ pub fn handle_exchange_params_response(
     // can verify its modificationsBlock entries (TS 33.501 §13.2.4.6).
     register_peer_signing_key(&rsp.sender, rsp.modifications_signing_public_key.as_deref())?;
 
-    // TS 33.501 §13.2.4.4: derive the N32-f session key from the N32-c TLS
-    // exporter secret. We (the request sender) are the initiator.
-    let exporter_secret =
+    // TS 33.501 §13.2.4.4.1: derive the full N32-f key hierarchy from the
+    // 64-octet N32 master (RFC 5705 exporter). We (the request sender) are the
+    // N32-c initiator and use the "parallel" key set to protect the messages
+    // we originate. The canonical context ID `{initiator}-{responder}` makes
+    // both peers derive identical material.
+    let master =
         resolve_exporter_secret(&rsp.sender, &sent_req.n32f_context_id, &rsp.n32f_context_id);
-    let session_key = derive_n32f_session_key(
-        &exporter_secret,
-        &sent_req.sender,
-        &rsp.sender,
-        &sent_req.n32f_context_id,
-        &rsp.n32f_context_id,
-    );
+    let n32_context_id =
+        canonical_n32f_context_id(&sent_req.n32f_context_id, &rsp.n32f_context_id);
+    let key_material = derive_n32f_key_material(&master, &n32_context_id);
 
     node.n32f_security = Some(crate::context::N32fSecurityInfo {
         local_context_id: sent_req.n32f_context_id.clone(),
         peer_context_id: rsp.n32f_context_id.clone(),
-        session_key,
-        kid: format!("{}-{}", sent_req.n32f_context_id, rsp.n32f_context_id),
+        key_material,
+        role: N32fRole::Initiator,
+        kid: n32_context_id,
         jwe_cipher_suite: rsp.selected_jwe_cipher_suite.clone(),
         jws_cipher_suite: rsp.selected_jws_cipher_suite.clone(),
     });
@@ -697,23 +772,134 @@ mod tests {
             .unwrap()
     }
 
+    /// Lowercase-hex of a byte slice (KAT documentation helper).
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// KAT (TS 33.501 §13.2.4.4.1 N32-KDF): a fixed 64-octet master `[0x5a;64]`
+    /// and a fixed N32-f context ID derive four 32-byte session keys + four
+    /// 8-byte IV salts. Each output is checked against an INDEPENDENT in-test
+    /// HKDF-Expand-SHA256 reference computed from the documented `info` bytes
+    /// (`"N32" || n32_context_id || label`), so the test is self-verifying.
     #[test]
-    fn test_key_derivation_from_exporter_distinct() {
-        let secret_a = [1u8; 32];
-        let secret_b = [2u8; 32];
-        // Both ends compute the same key regardless of FQDN argument order
-        let k1 = derive_n32f_session_key(&secret_a, "a.example", "b.example", "ctx-i", "ctx-r");
-        let k2 = derive_n32f_session_key(&secret_a, "b.example", "a.example", "ctx-i", "ctx-r");
-        assert_eq!(k1, k2);
-        // Different FQDN pair (salt) -> different key
-        let k3 = derive_n32f_session_key(&secret_a, "a.example", "c.example", "ctx-i", "ctx-r");
+    fn test_n32_kdf_known_answer_vector() {
+        use hkdf::Hkdf;
+        use sha2::Sha256;
+
+        let master = [0x5au8; 64];
+        let n32_context_id = "kat-ctx-0001";
+        let km = derive_n32f_key_material(&master, n32_context_id);
+
+        // Independent reference: HKDF-Expand-only over the same PRK + info.
+        let expand = |label: &str, len: usize| -> Vec<u8> {
+            let hk = Hkdf::<Sha256>::from_prk(&master).unwrap();
+            let info =
+                [b"N32".as_slice(), n32_context_id.as_bytes(), label.as_bytes()].concat();
+            let mut out = vec![0u8; len];
+            hk.expand(&info, &mut out).unwrap();
+            out
+        };
+
+        assert_eq!(km.parallel_req.0.as_slice(), expand("parallel_request_key", 32));
+        assert_eq!(km.parallel_req.1.as_slice(), expand("parallel_request_iv_salt", 8));
+        assert_eq!(km.parallel_resp.0.as_slice(), expand("parallel_response_key", 32));
+        assert_eq!(
+            km.parallel_resp.1.as_slice(),
+            expand("parallel_response_iv_salt", 8)
+        );
+        assert_eq!(km.reverse_req.0.as_slice(), expand("reverse_request_key", 32));
+        assert_eq!(km.reverse_req.1.as_slice(), expand("reverse_request_iv_salt", 8));
+        assert_eq!(km.reverse_resp.0.as_slice(), expand("reverse_response_key", 32));
+        assert_eq!(
+            km.reverse_resp.1.as_slice(),
+            expand("reverse_response_iv_salt", 8)
+        );
+
+        // Pinned expected hex for `master=[0x5a;64]`, `n32_context_id="kat-ctx-0001"`
+        // (documents the vector; matches the independent HKDF reference above).
+        assert_eq!(hex(&km.parallel_req.0), KAT_PARALLEL_REQUEST_KEY);
+        assert_eq!(hex(&km.parallel_req.1), KAT_PARALLEL_REQUEST_IV_SALT);
+        assert_eq!(hex(&km.parallel_resp.0), KAT_PARALLEL_RESPONSE_KEY);
+        assert_eq!(hex(&km.parallel_resp.1), KAT_PARALLEL_RESPONSE_IV_SALT);
+        assert_eq!(hex(&km.reverse_req.0), KAT_REVERSE_REQUEST_KEY);
+        assert_eq!(hex(&km.reverse_req.1), KAT_REVERSE_REQUEST_IV_SALT);
+        assert_eq!(hex(&km.reverse_resp.0), KAT_REVERSE_RESPONSE_KEY);
+        assert_eq!(hex(&km.reverse_resp.1), KAT_REVERSE_RESPONSE_IV_SALT);
+
+        // The four session keys are pairwise distinct.
+        let keys = [
+            km.parallel_req.0,
+            km.parallel_resp.0,
+            km.reverse_req.0,
+            km.reverse_resp.0,
+        ];
+        for i in 0..keys.len() {
+            for j in (i + 1)..keys.len() {
+                assert_ne!(keys[i], keys[j], "keys {i} and {j} must differ");
+            }
+        }
+        // Each IV salt is exactly 8 bytes, and the four are pairwise distinct.
+        let salts = [
+            km.parallel_req.1,
+            km.parallel_resp.1,
+            km.reverse_req.1,
+            km.reverse_resp.1,
+        ];
+        for s in &salts {
+            assert_eq!(s.len(), 8);
+        }
+        for i in 0..salts.len() {
+            for j in (i + 1)..salts.len() {
+                assert_ne!(salts[i], salts[j], "salts {i} and {j} must differ");
+            }
+        }
+    }
+
+    // Pinned KAT vector for master=[0x5a;64], n32_context_id="kat-ctx-0001".
+    const KAT_PARALLEL_REQUEST_KEY: &str =
+        "5b6170e2eddda87d53846435e2e123dd0af477ee78fd4d32e0a5de0eacdbf91b";
+    const KAT_PARALLEL_REQUEST_IV_SALT: &str = "e075ef5cf1e183bf";
+    const KAT_PARALLEL_RESPONSE_KEY: &str =
+        "9f7d358bec9041fcc2daa467e84d937c67fe36b1054c30336475c3b43a1b330f";
+    const KAT_PARALLEL_RESPONSE_IV_SALT: &str = "48ae73f00fec4cff";
+    const KAT_REVERSE_REQUEST_KEY: &str =
+        "de260e5e520a2ef2f1fc6361d47841922b5ebd667ea41b6b86432ea8bf10c1be";
+    const KAT_REVERSE_REQUEST_IV_SALT: &str = "1c2d3023d4d39ade";
+    const KAT_REVERSE_RESPONSE_KEY: &str =
+        "bcd5cf7906d4ad3f83e42cc299c73505b8890b9bb3c9e3dfb25286db8b84fdc0";
+    const KAT_REVERSE_RESPONSE_IV_SALT: &str = "fe1d7b847195935d";
+
+    /// Determinism + sensitivity of the N32-KDF: identical inputs yield
+    /// identical material; a different master or a different N32-f context ID
+    /// yields different material (TS 33.501 §13.2.4.4.1).
+    #[test]
+    fn test_key_material_determinism_and_sensitivity() {
+        let master_a = [0x11u8; 64];
+        let master_b = [0x22u8; 64];
+
+        let k1 = derive_n32f_key_material(&master_a, "ctx-i-ctx-r");
+        let k2 = derive_n32f_key_material(&master_a, "ctx-i-ctx-r");
+        assert_eq!(k1, k2, "same master + context => identical material");
+
+        // Different context ID (info) -> different material
+        let k3 = derive_n32f_key_material(&master_a, "ctx-X-ctx-r");
         assert_ne!(k1, k3);
-        // Different context IDs (info) -> different key
-        let k4 = derive_n32f_session_key(&secret_a, "a.example", "b.example", "ctx-X", "ctx-r");
+
+        // Different master (PRK) -> different material
+        let k4 = derive_n32f_key_material(&master_b, "ctx-i-ctx-r");
         assert_ne!(k1, k4);
-        // Different exporter secret (ikm) -> different key
-        let k5 = derive_n32f_session_key(&secret_b, "a.example", "b.example", "ctx-i", "ctx-r");
-        assert_ne!(k1, k5);
+    }
+
+    /// The no-TLS fallback exporter secret is exactly 64 octets (a valid HKDF
+    /// PRK) and is mirrored across the context-ID pair so both peers agree.
+    #[test]
+    fn test_resolve_exporter_secret_fallback_is_64_octets() {
+        // No secret deposited for this peer => fallback path.
+        let s1 = resolve_exporter_secret("no-tls-peer.example.com", "ctx-i", "ctx-r");
+        let s2 = resolve_exporter_secret("no-tls-peer.example.com", "ctx-r", "ctx-i");
+        assert_eq!(s1.len(), 64);
+        assert_eq!(s1, s2, "fallback is order-independent across the ctx pair");
     }
 
     /// C6: with the SAME TLS exporter secret deposited for both peers (as a
@@ -760,11 +946,16 @@ mod tests {
 
         let sec_a = node_a.n32f_security.unwrap();
         let sec_b = node_b.n32f_security.unwrap();
-        // Identical session keys derived from the shared TLS exporter secret,
-        // mirrored context IDs.
-        assert_eq!(sec_a.session_key, sec_b.session_key);
+        // Identical key hierarchy derived from the shared TLS master secret;
+        // mirrored context IDs and mirrored roles (initiator vs responder).
+        assert_eq!(sec_a.key_material, sec_b.key_material);
+        assert_eq!(sec_a.role, N32fRole::Initiator);
+        assert_eq!(sec_b.role, N32fRole::Responder);
         assert_eq!(sec_a.local_context_id, sec_b.peer_context_id);
         assert_eq!(sec_a.peer_context_id, sec_b.local_context_id);
+        // Both kids equal the canonical `{initiator}-{responder}` context ID.
+        assert_eq!(sec_a.kid, sec_b.kid);
+        assert_eq!(sec_a.kid, format!("{}-{}", a_ctx_id, sec_b.local_context_id));
     }
 
     #[test]

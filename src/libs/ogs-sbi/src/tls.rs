@@ -380,13 +380,25 @@ pub const N32F_EXPORTER_LABEL: &[u8] = b"EXPORTER-3GPP-N32f-Session-Key";
 /// N32-f session key (256-bit / AES-256-GCM-class secret).
 pub const N32F_EXPORTER_KEY_LEN: usize = 32;
 
+/// TS 33.501 §13.2.4.4.1 exporter label for the 64-octet N32 master key.
+/// This is the RFC 5705 label whose exported material is the PRK ("master")
+/// fed into the N32-KDF (HKDF-Expand) that produces the four N32-f session
+/// keys and IV salts. The two SEPPs share this master because both ends of
+/// the N32-c TLS connection export identical keying material.
+pub const N32_MASTER_EXPORTER_LABEL: &[u8] = b"EXPORTER_3GPP_N32_MASTER";
+
+/// Length, in bytes, of the N32 master key exported from the N32-c TLS
+/// connection (512-bit, per TS 33.501 §13.2.4.4.1). A 64-octet PRK satisfies
+/// HKDF's `from_prk` requirement (PRK length >= HashLen = 32 for SHA-256).
+pub const N32_MASTER_KEY_LEN: usize = 64;
+
 /// Export `len` bytes of keying material from an established rustls connection
 /// per RFC 5705 ("Keying Material Exporters for TLS").
 ///
-/// This is the additive accessor B2 (SEPP) must call to derive the N32-f
-/// session key from the N32-c TLS exporter (TS 33.501 §13.2.4.4), replacing
-/// the random-nonce HKDF deviation documented in
-/// `seppd::n32c_handler::derive_n32f_session_key`.
+/// This is the additive accessor SEPP uses to derive the N32-f key hierarchy
+/// from the N32-c TLS exporter (TS 33.501 §13.2.4.4.1); the glue uses
+/// [`export_n32_master_key`] to obtain the 64-octet master fed into
+/// `seppd::n32c_handler::derive_n32f_key_material`.
 ///
 /// `conn` is the rustls connection obtained from the established TLS stream —
 /// e.g. `tokio_rustls::server::TlsStream::get_ref().1` (a `&ServerConnection`)
@@ -433,6 +445,21 @@ pub fn export_n32f_session_key<Data>(
     let output = vec![0u8; N32F_EXPORTER_KEY_LEN];
     conn.export_keying_material(output, N32F_EXPORTER_LABEL, context)
         .map_err(|e| SbiError::TlsError(format!("N32-f keying-material export failed: {e}")))
+}
+
+/// Export the 64-octet N32 master key from an established N32-c TLS
+/// connection (TS 33.501 §13.2.4.4.1). This is the value SEPP deposits via
+/// `set_n32c_tls_exporter_secret` and feeds, as the HKDF PRK, into the
+/// N32-KDF that derives the four N32-f session keys + IV salts. Both N32-c
+/// endpoints export an identical master, so both derive identical key
+/// material. This is what the `client.rs`/`server.rs` exporter glue calls.
+pub fn export_n32_master_key<Data>(
+    conn: &rustls::ConnectionCommon<Data>,
+    context: Option<&[u8]>,
+) -> SbiResult<Vec<u8>> {
+    let output = vec![0u8; N32_MASTER_KEY_LEN];
+    conn.export_keying_material(output, N32_MASTER_EXPORTER_LABEL, context)
+        .map_err(|e| SbiError::TlsError(format!("N32 master keying-material export failed: {e}")))
 }
 
 /// Dangerous: skip all server certificate verification (for testing only).
@@ -551,50 +578,57 @@ mod tests {
 
     // --- T1.5b: exporter extraction matches across server/client connections ---
 
-    /// Verify that the label and length used by the server glue (T1.5b) produce
-    /// the same 32-byte key as the client glue on the other end of the same
-    /// handshake. This is the in-process analogue of the `get_ref()` path in
-    /// `server.rs` (server side) and `client.rs` (client side).
+    /// Verify that the label and length used by the server glue (sepp-00)
+    /// produce the same 64-octet N32 master key as the client glue on the
+    /// other end of the same handshake. This is the in-process analogue of
+    /// the `get_ref()` path in `server.rs` and `client.rs`, which now call
+    /// [`export_n32_master_key`] (TS 33.501 §13.2.4.4.1).
     #[test]
     fn test_server_and_client_exporter_match_via_get_ref_analogue() {
         let HandshakeOutput { client, server } = test_handshake();
 
         // Mimic what server.rs does after `acceptor.accept()`:
         //   let (_, server_conn) = tls_stream.get_ref();
-        //   export_n32f_session_key(server_conn, None)
-        let server_secret = export_n32f_session_key(&server, None)
-            .expect("server-side N32-f exporter must succeed after handshake");
+        //   export_n32_master_key(server_conn, None)
+        let server_secret = export_n32_master_key(&server, None)
+            .expect("server-side N32 master exporter must succeed after handshake");
 
         // Mimic what client.rs does after `connector.connect()`:
         //   let (_, client_conn) = tls_stream.get_ref();
-        //   export_n32f_session_key(client_conn, None)
-        let client_secret = export_n32f_session_key(&client, None)
-            .expect("client-side N32-f exporter must succeed after handshake");
+        //   export_n32_master_key(client_conn, None)
+        let client_secret = export_n32_master_key(&client, None)
+            .expect("client-side N32 master exporter must succeed after handshake");
 
-        // Both ends use the exact same label (`N32F_EXPORTER_LABEL`) and the
-        // same output length (`N32F_EXPORTER_KEY_LEN = 32`), so RFC 5705
+        // Both ends use the exact same label (`N32_MASTER_EXPORTER_LABEL`) and
+        // the same output length (`N32_MASTER_KEY_LEN = 64`), so RFC 5705
         // guarantees they produce identical material.
         assert_eq!(
             server_secret, client_secret,
-            "server-side and client-side N32-f exporter secrets must agree \
-             (T1.5b / TS 33.501 §13.2.4.4)"
+            "server-side and client-side N32 master secrets must agree \
+             (sepp-00 / TS 33.501 §13.2.4.4.1)"
         );
         assert_eq!(
             server_secret.len(),
-            N32F_EXPORTER_KEY_LEN,
-            "exporter output must be exactly N32F_EXPORTER_KEY_LEN bytes"
+            N32_MASTER_KEY_LEN,
+            "exporter output must be exactly N32_MASTER_KEY_LEN (64) bytes"
         );
 
-        // The label constant used by both glue paths must be N32F_EXPORTER_LABEL.
-        // A different label produces different material — confirming the label
-        // selection is significant and the right one is wired in.
+        // The label constant used by both glue paths must be
+        // N32_MASTER_EXPORTER_LABEL. A different label produces different
+        // material — confirming the label selection is significant.
         let wrong_label =
-            export_keying_material(&server, b"WRONG-LABEL", None, N32F_EXPORTER_KEY_LEN)
+            export_keying_material(&server, b"WRONG-LABEL", None, N32_MASTER_KEY_LEN)
                 .expect("export with wrong label");
         assert_ne!(
             server_secret, wrong_label,
             "different label must produce different material"
         );
+
+        // The 64-octet master is also distinct from the legacy 32-octet
+        // N32-f session-key export (different label and length).
+        let legacy = export_n32f_session_key(&server, None).expect("legacy export");
+        assert_eq!(legacy.len(), N32F_EXPORTER_KEY_LEN);
+        assert_ne!(server_secret[..32], legacy[..], "master != legacy session key");
     }
 
     /// Completed in-memory TLS 1.3 handshake, exposing both rustls connections

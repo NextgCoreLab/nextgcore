@@ -14,14 +14,15 @@
 //!   `/n32c-handshake/v1/n32f-error` report (TS 29.573 sec 6.1.5.4)
 //!
 //! Session keys are per-peer, established during the N32-c
-//! exchange-params handshake (see `n32c_handler::derive_n32f_session_key`).
+//! exchange-params handshake (see `n32c_handler::derive_n32f_key_material`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use p256::ecdsa::{SigningKey, VerifyingKey};
 
-use crate::jose::{self, b64url_decode, b64url_encode, FlatJwe, FlatJws, JoseError, JWE_KEY_LEN};
+use crate::jose::{self, b64url_decode, b64url_encode, FlatJwe, FlatJws, JoseError};
+use crate::n32c_handler::{N32fDirection, N32fKeyMaterial, N32fRole};
 
 // ============================================================================
 // Asymmetric (ES256) identity key store (TS 33.501 §13.2.4.6)
@@ -139,9 +140,13 @@ pub struct PrinsContext {
     /// N32-f context ID allocated by the peer SEPP (we put this into the
     /// metaData of messages we send to the peer)
     pub peer_context_id: String,
-    /// Session key established during the N32-c exchange-params handshake.
-    /// Reserved for the JWE only (never the modificationsBlock JWS).
-    pub session_key: [u8; JWE_KEY_LEN],
+    /// The full N32-f key hierarchy (TS 33.501 §13.2.4.4.1): four A256GCM
+    /// session keys + four IV salts, selected by role + direction. Reserved
+    /// for the JWE only (never the modificationsBlock JWS).
+    pub key_material: N32fKeyMaterial,
+    /// This SEPP's N32-c role; selects which key set we use to PROTECT the
+    /// messages we originate (the peer's role is its `opposite`).
+    pub role: N32fRole,
     /// Key identifier (kid) for the session key
     pub kid: String,
     /// This SEPP's FQDN (JWS identity of locally created modification entries)
@@ -183,14 +188,16 @@ impl PrinsContext {
     pub fn new(
         local_context_id: impl Into<String>,
         peer_context_id: impl Into<String>,
-        session_key: [u8; JWE_KEY_LEN],
+        key_material: N32fKeyMaterial,
+        role: N32fRole,
         kid: impl Into<String>,
         local_fqdn: impl Into<String>,
     ) -> Self {
         let mut ctx = Self {
             local_context_id: local_context_id.into(),
             peer_context_id: peer_context_id.into(),
-            session_key,
+            key_material,
+            role,
             kid: kid.into(),
             local_fqdn: local_fqdn.into(),
             local_signing_key: None,
@@ -200,6 +207,18 @@ impl PrinsContext {
         };
         ctx.add_default_profiles();
         ctx
+    }
+
+    /// The (session key, IV salt) this SEPP uses to PROTECT a message it
+    /// originates in `direction` (selected by its own role).
+    pub fn protect_key(&self, direction: N32fDirection) -> (&[u8; 32], &[u8; 8]) {
+        self.key_material.select(self.role, direction)
+    }
+
+    /// The (session key, IV salt) this SEPP uses to UNPROTECT a message the
+    /// peer originated in `direction` (selected by the peer's role).
+    pub fn unprotect_key(&self, direction: N32fDirection) -> (&[u8; 32], &[u8; 8]) {
+        self.key_material.select(self.role.opposite(), direction)
     }
 
     /// Install this SEPP's asymmetric (ES256) signing key for originating
@@ -528,8 +547,14 @@ pub fn protect_message(
     let plaintext =
         serde_json::to_vec(&cipher_block).map_err(|e| JoseError::Format(e.to_string()))?;
 
-    let jwe = jose::jwe_encrypt(
-        &ctx.session_key,
+    // The forwarded SBI request is an N32-f request: protect it with this
+    // SEPP's request-direction session key + IV salt, selected by role from
+    // the N32-f key hierarchy (TS 33.501 §13.2.4.4.1). The 96-bit GCM IV is
+    // seeded with the 64-bit IV salt.
+    let (key, iv_salt) = ctx.protect_key(N32fDirection::Request);
+    let jwe = jose::jwe_encrypt_with_iv_salt(
+        key,
+        iv_salt,
         &plaintext,
         Some(&aad_bytes),
         Some(&ctx.kid),
@@ -742,7 +767,12 @@ pub fn unprotect_message(
     }
 
     // --- AEAD decrypt; authenticates the AAD (integrity block) ---
-    let plaintext = jose::jwe_decrypt(&ctx.session_key, &msg.reformatted_data).map_err(|e| {
+    // The inbound message was originated by the PEER as an N32-f request, so
+    // it is decrypted with the peer's request-direction session key (selected
+    // by the peer's role). The IV is carried on the wire, so only the key is
+    // needed here.
+    let (key, _iv_salt) = ctx.unprotect_key(N32fDirection::Request);
+    let plaintext = jose::jwe_decrypt(key, &msg.reformatted_data).map_err(|e| {
         let error_type = match e {
             JoseError::Tampered => N32fErrorType::IntegrityCheckFailed,
             _ => N32fErrorType::DecipheringFailed,
@@ -930,15 +960,27 @@ mod tests {
         (Arc::new(sk), vk)
     }
 
-    /// Build a sender/receiver PrinsContext pair sharing the JWE session key,
-    /// with the sender's ES256 signing key installed and its public key
-    /// registered (under the sender FQDN) on the receiver.
+    /// Shared N32-f key material both peers derive from the same 64-octet
+    /// master and canonical context ID (TS 33.501 §13.2.4.4.1).
+    fn shared_material() -> N32fKeyMaterial {
+        crate::n32c_handler::derive_n32f_key_material(
+            &[0x42u8; 64],
+            "ctx-local-1111-ctx-peer-2222",
+        )
+    }
+
+    /// Build a sender/receiver PrinsContext pair sharing the N32-f key
+    /// hierarchy with MIRRORED roles (sender = initiator/parallel, receiver =
+    /// responder/reverse), with the sender's ES256 signing key installed and
+    /// its public key registered (under the sender FQDN) on the receiver.
     fn ctx_pair() -> (PrinsContext, PrinsContext) {
         let (sender_sk, sender_vk) = es256_keypair();
+        let km = shared_material();
         let sender = PrinsContext::new(
             "ctx-local-1111",
             "ctx-peer-2222",
-            [0x42u8; 32],
+            km.clone(),
+            N32fRole::Initiator,
             "kid-test",
             SENDER_FQDN,
         )
@@ -946,7 +988,8 @@ mod tests {
         let mut receiver = PrinsContext::new(
             "ctx-peer-2222",
             "ctx-local-1111",
-            [0x42u8; 32],
+            km,
+            N32fRole::Responder,
             "kid-test",
             RECEIVER_FQDN,
         );
@@ -1090,10 +1133,12 @@ mod tests {
             operations: Vec::new(),
             tag: msg.reformatted_data.tag.clone(),
         };
-        // Attacker knows the symmetric session key (it's shared) and forges
-        // an HS256 JWS — this is exactly the pre-fix forgery.
+        // Attacker knows the symmetric JWE session key (it's shared between
+        // both peers) and forges an HS256 JWS — this is exactly the pre-fix
+        // forgery. The request-direction session key is what both peers share.
+        let shared_key = *receiver.unprotect_key(N32fDirection::Request).0;
         let forged = jose::jws_sign(
-            &receiver.session_key,
+            &shared_key,
             &serde_json::to_vec(&forged_payload).unwrap(),
             Some(SENDER_FQDN),
         )
@@ -1268,7 +1313,10 @@ mod tests {
     #[test]
     fn wrong_session_key_detected() {
         let (sender, mut receiver) = ctx_pair();
-        receiver.session_key = [0x43u8; 32];
+        // Give the receiver a DIFFERENT key hierarchy (different master), so
+        // its request-direction session key no longer matches the sender's.
+        receiver.key_material =
+            crate::n32c_handler::derive_n32f_key_material(&[0x43u8; 64], "other-ctx");
 
         let msg = protect_message(
             &sender,
@@ -1324,6 +1372,52 @@ mod tests {
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["n32fMessageId"], "abc123");
         assert_eq!(json["n32fErrorType"], "DECIPHERING_FAILED");
+    }
+
+    /// Cross-stack: two SEPP contexts with MIRRORED roles (initiator/parallel
+    /// vs responder/reverse) sharing one key hierarchy encrypt->decrypt a
+    /// message successfully, and the four session keys are per-direction
+    /// distinct (TS 33.501 §13.2.4.4.1).
+    #[test]
+    fn cross_stack_mirrored_roles_roundtrip_distinct_keys() {
+        let (sender, receiver) = ctx_pair();
+        assert_eq!(sender.role, N32fRole::Initiator);
+        assert_eq!(receiver.role, N32fRole::Responder);
+
+        // Encrypt with the initiator's (parallel) request key; the responder
+        // decrypts by selecting the peer's (initiator/parallel) request key.
+        let msg = protect_message(
+            &sender,
+            "POST",
+            "/nudm-sdm/v1/supi",
+            &[],
+            Some(&sample_body()),
+        )
+        .unwrap();
+        let rec = unprotect_message(&receiver, &msg).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&rec.body.unwrap()).unwrap();
+        assert_eq!(body["supi"], "imsi-001010000000001");
+
+        // The protect key the initiator used == the unprotect key the
+        // responder used for that message.
+        assert_eq!(
+            sender.protect_key(N32fDirection::Request).0,
+            receiver.unprotect_key(N32fDirection::Request).0
+        );
+
+        // The four session keys are pairwise distinct per (role, direction).
+        let km = &sender.key_material;
+        assert_ne!(km.parallel_req.0, km.reverse_req.0);
+        assert_ne!(km.parallel_req.0, km.parallel_resp.0);
+        assert_ne!(km.reverse_req.0, km.reverse_resp.0);
+        assert_ne!(km.parallel_resp.0, km.reverse_resp.0);
+
+        // Per-direction key separation: the initiator's request key (parallel)
+        // differs from the responder's request key (reverse).
+        assert_ne!(
+            sender.protect_key(N32fDirection::Request).0,
+            receiver.protect_key(N32fDirection::Request).0
+        );
     }
 
     #[test]

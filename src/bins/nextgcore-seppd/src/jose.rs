@@ -147,11 +147,12 @@ fn jwe_aad_input(protected_b64: &str, aad_b64: Option<&str>) -> Vec<u8> {
     }
 }
 
-/// Encrypt `plaintext` as a flattened JWE with alg="dir"/enc="A256GCM".
-/// `external_aad` (raw bytes, will be base64url-encoded) carries the
-/// integrity-protected-but-cleartext block per TS 29.573 sec 6.3.
-pub fn jwe_encrypt(
+/// Encrypt `plaintext` as a flattened JWE with alg="dir"/enc="A256GCM" using
+/// the caller-supplied 96-bit IV. Shared core of [`jwe_encrypt`] and
+/// [`jwe_encrypt_with_iv_salt`].
+fn jwe_encrypt_with_iv(
     key: &[u8; JWE_KEY_LEN],
+    iv: &[u8; JWE_IV_LEN],
     plaintext: &[u8],
     external_aad: Option<&[u8]>,
     kid: Option<&str>,
@@ -168,20 +169,51 @@ pub fn jwe_encrypt(
     );
     let aad_b64 = external_aad.map(b64url_encode);
 
-    let mut iv = [0u8; JWE_IV_LEN];
-    use rand::Rng as _;
-    rand::rng().fill(&mut iv);
-
     let aad_input = jwe_aad_input(&protected, aad_b64.as_deref());
-    let (ciphertext, tag) = a256gcm_encrypt(key, &iv, &aad_input, plaintext)?;
+    let (ciphertext, tag) = a256gcm_encrypt(key, iv, &aad_input, plaintext)?;
 
     Ok(FlatJwe {
         protected,
         aad: aad_b64,
-        iv: b64url_encode(&iv),
+        iv: b64url_encode(iv),
         ciphertext: b64url_encode(&ciphertext),
         tag: b64url_encode(&tag),
     })
+}
+
+/// Encrypt `plaintext` as a flattened JWE with alg="dir"/enc="A256GCM".
+/// `external_aad` (raw bytes, will be base64url-encoded) carries the
+/// integrity-protected-but-cleartext block per TS 29.573 sec 6.3. A fresh
+/// 96-bit IV is generated at random.
+pub fn jwe_encrypt(
+    key: &[u8; JWE_KEY_LEN],
+    plaintext: &[u8],
+    external_aad: Option<&[u8]>,
+    kid: Option<&str>,
+) -> Result<FlatJwe, JoseError> {
+    let mut iv = [0u8; JWE_IV_LEN];
+    use rand::Rng as _;
+    rand::rng().fill(&mut iv);
+    jwe_encrypt_with_iv(key, &iv, plaintext, external_aad, kid)
+}
+
+/// Encrypt `plaintext` as a flattened JWE with alg="dir"/enc="A256GCM",
+/// seeding the 96-bit AES-GCM IV with the 64-bit N32-f IV salt
+/// (TS 33.501 §13.2.4.4.1/§13.2.4.5): `IV = iv_salt (8B) || random (4B)`.
+/// The IV is transmitted in the JWE, so the receiver decrypts via
+/// [`jwe_decrypt`] without reconstructing it.
+pub fn jwe_encrypt_with_iv_salt(
+    key: &[u8; JWE_KEY_LEN],
+    iv_salt: &[u8; 8],
+    plaintext: &[u8],
+    external_aad: Option<&[u8]>,
+    kid: Option<&str>,
+) -> Result<FlatJwe, JoseError> {
+    let mut iv = [0u8; JWE_IV_LEN];
+    iv[..8].copy_from_slice(iv_salt);
+    use rand::Rng as _;
+    rand::rng().fill(&mut iv[8..]);
+    jwe_encrypt_with_iv(key, &iv, plaintext, external_aad, kid)
 }
 
 /// Decrypt and verify a flattened JWE produced by [`jwe_encrypt`].

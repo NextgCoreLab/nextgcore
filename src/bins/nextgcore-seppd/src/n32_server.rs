@@ -1154,7 +1154,11 @@ mod tests {
             node.n32f_security = Some(crate::context::N32fSecurityInfo {
                 local_context_id: "unestab-local-ctx".to_string(),
                 peer_context_id: "unestab-peer-ctx".to_string(),
-                session_key: [0u8; 32],
+                key_material: crate::n32c_handler::derive_n32f_key_material(
+                    &[0u8; 64],
+                    "unestab-local-ctx-unestab-peer-ctx",
+                ),
+                role: crate::n32c_handler::N32fRole::Responder,
                 kid: "unestab-kid".to_string(),
                 jwe_cipher_suite: "A256GCM".to_string(),
                 jws_cipher_suite: "ES256".to_string(),

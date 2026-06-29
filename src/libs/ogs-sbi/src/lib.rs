@@ -101,7 +101,8 @@ pub use server::{
     DEFAULT_MAX_FRAME_SIZE, DEFAULT_MAX_HEADER_LIST_SIZE, DEFAULT_MAX_REQUEST_BODY_SIZE,
 };
 pub use tls::{
-    export_keying_material, export_n32f_session_key, N32F_EXPORTER_KEY_LEN, N32F_EXPORTER_LABEL,
+    export_keying_material, export_n32_master_key, export_n32f_session_key, N32F_EXPORTER_KEY_LEN,
+    N32F_EXPORTER_LABEL, N32_MASTER_EXPORTER_LABEL, N32_MASTER_KEY_LEN,
 };
 pub use types::{NfType, SbiAppError, SbiServiceType, UriScheme};
 

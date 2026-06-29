@@ -457,9 +457,9 @@ impl SbiClient {
             // up during the N32-c exchange-params handshake.
             {
                 let (_, client_conn) = tls_stream.get_ref();
-                match crate::tls::export_n32f_session_key(client_conn, None) {
+                match crate::tls::export_n32_master_key(client_conn, None) {
                     Ok(secret) => {
-                        log::debug!("N32-f TLS exporter secret derived for peer {host}");
+                        log::debug!("N32 master key (64B) derived for peer {host}");
                         // The seppd n32c_handler consumes this via
                         // `take_n32c_tls_exporter_secret(peer_fqdn)`.
                         // We key by host (FQDN or IP) which the handler
