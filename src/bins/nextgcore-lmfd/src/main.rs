@@ -19,6 +19,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+// lmfd-05/06: codec decode glue — NRPPa APER → CellMeasurement, LPP UPER →
+// CellMeasurement.  Exposes the two inbound binary-report route helpers used
+// by `handle_nrppa_binary_report` and `handle_lpp_binary_report` below.
+mod codec_glue;
 mod context;
 mod nlmf;
 // lmfd-08: real multilateration solvers (ECID / Multi-RTT / TDOA / AoA).
@@ -191,6 +195,20 @@ async fn lmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         ["nlmf-loc", "v1", "nrppa-reports"] => match method {
             "POST" => handle_nrppa_report(&request).await,
             _ => send_method_not_allowed(method, "nrppa-reports"),
+        },
+        // lmfd-05: raw NRPPa APER binary report (Content-Type: application/octet-stream).
+        // The body is a complete APER-encoded NrppaPdu; the LMF request-id is
+        // extracted from the embedded lmf-UE-Measurement-ID IE (TS 38.455 §9.2.13).
+        ["nlmf-loc", "v1", "nrppa-binary-reports"] => match method {
+            "POST" => handle_nrppa_binary_report(&request).await,
+            _ => send_method_not_allowed(method, "nrppa-binary-reports"),
+        },
+        // lmfd-06: raw LPP UPER binary report (Content-Type: application/octet-stream).
+        // The body is a complete UPER-encoded LppMessage carrying
+        // ProvideLocationInformation → nr-Multi-RTT.
+        ["nlmf-loc", "v1", "lpp-binary-reports"] => match method {
+            "POST" => handle_lpp_binary_report(&request).await,
+            _ => send_method_not_allowed(method, "lpp-binary-reports"),
         },
         // UE location queries
         ["nlmf-loc", "v1", "ue-locations", supi] => match method {
@@ -592,6 +610,121 @@ async fn handle_nrppa_report(request: &SbiRequest) -> SbiResponse {
                 .collect()
         })
         .unwrap_or_default();
+
+    let ctx = lmf_self();
+    let location = if let Ok(context) = ctx.read() {
+        context.measurement_report(request_id, cells)
+    } else {
+        None
+    };
+
+    match location {
+        Some(loc) => SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({
+                "requestId": request_id,
+                "result": "COMPLETED",
+                "location": {
+                    "latitude": loc.latitude,
+                    "longitude": loc.longitude,
+                    "horizontalAccuracy": loc.horizontal_accuracy,
+                    "methodUsed": loc.method_used,
+                },
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("Measurement request {request_id} not found"),
+            Some("MEASUREMENT_NOT_FOUND"),
+        ),
+    }
+}
+
+/// Handle a raw NRPPa APER-encoded E-CID Measurement Report (gNB → LMF,
+/// relayed by AMF). lmfd-05.
+///
+/// Expects the request body to be a raw APER-encoded `NrppaPdu`
+/// (Content-Type: application/octet-stream).  The LMF measurement request-id
+/// is extracted from the `lmf-UE-Measurement-ID` IE embedded in the PDU
+/// (TS 38.455 §9.2.13).  On success the decoded cells are fed directly into
+/// [`LmfContext::measurement_report`] and a location estimate is returned.
+async fn handle_nrppa_binary_report(request: &SbiRequest) -> SbiResponse {
+    log::info!("NRPPa binary E-CID measurement report");
+
+    let body = match &request.http.content {
+        Some(c) => c,
+        None => return problem(400, nlmf::cause::MANDATORY_IE_MISSING, "Missing body"),
+    };
+
+    let (request_id, cells) = match codec_glue::decode_nrppa_ecid_report(body.as_bytes()) {
+        Ok(pair) => pair,
+        Err(e) => {
+            return problem(
+                400,
+                nlmf::cause::INVALID_MSG_FORMAT,
+                &format!("NRPPa decode failed: {e}"),
+            )
+        }
+    };
+
+    let ctx = lmf_self();
+    let location = if let Ok(context) = ctx.read() {
+        context.measurement_report(request_id, cells)
+    } else {
+        None
+    };
+
+    match location {
+        Some(loc) => SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({
+                "requestId": request_id,
+                "result": "COMPLETED",
+                "location": {
+                    "latitude": loc.latitude,
+                    "longitude": loc.longitude,
+                    "horizontalAccuracy": loc.horizontal_accuracy,
+                    "methodUsed": loc.method_used,
+                },
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("Measurement request {request_id} not found"),
+            Some("MEASUREMENT_NOT_FOUND"),
+        ),
+    }
+}
+
+/// Handle a raw LPP UPER-encoded ProvideLocationInformation (UE → LMF, relayed
+/// by AMF). lmfd-06.
+///
+/// Expects the request body to be a raw UPER-encoded `LppMessage`
+/// (Content-Type: application/octet-stream) carrying
+/// `ProvideLocationInformation` → `nr-Multi-RTT`.  The correlation
+/// request-id is taken from the LPP `transactionID.transactionNumber`.
+async fn handle_lpp_binary_report(request: &SbiRequest) -> SbiResponse {
+    log::info!("LPP binary ProvideLocationInformation (nr-Multi-RTT)");
+
+    let body = match &request.http.content {
+        Some(c) => c,
+        None => return problem(400, nlmf::cause::MANDATORY_IE_MISSING, "Missing body"),
+    };
+
+    let (request_id, cells) = match codec_glue::decode_lpp_multi_rtt_report(body.as_bytes()) {
+        Ok(pair) => pair,
+        Err(e) => {
+            return problem(
+                400,
+                nlmf::cause::INVALID_MSG_FORMAT,
+                &format!("LPP decode failed: {e}"),
+            )
+        }
+    };
+
+    if cells.is_empty() {
+        return problem(
+            400,
+            nlmf::cause::MANDATORY_IE_MISSING,
+            "LPP message carries no nr-Multi-RTT measurements",
+        );
+    }
 
     let ctx = lmf_self();
     let location = if let Ok(context) = ctx.read() {

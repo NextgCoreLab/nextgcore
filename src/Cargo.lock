@@ -2288,6 +2288,7 @@ dependencies = [
  "env_logger",
  "log",
  "ogs-app",
+ "ogs-asn1c",
  "ogs-core",
  "ogs-metrics",
  "ogs-sbi",

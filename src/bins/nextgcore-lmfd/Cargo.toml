@@ -11,6 +11,7 @@ name = "nextgcore-lmfd"
 path = "src/main.rs"
 
 [dependencies]
+ogs-asn1c = { workspace = true }
 ogs-core = { workspace = true }
 ogs-sbi = { workspace = true }
 ogs-metrics = { workspace = true }
