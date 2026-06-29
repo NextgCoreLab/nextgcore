@@ -28,6 +28,12 @@ pub const SCOPE_EASREGISTRATION: &str = "eees-easregistration";
 pub const SCOPE_EASDISCOVERY: &str = "eees-easdiscovery";
 /// OAuth2 scope required for the `eees-eecregistration` service operations.
 pub const SCOPE_EECREGISTRATION: &str = "eees-eecregistration";
+/// OAuth2 scope required for the `eees-appctxtreloc` service operations (eesd-07).
+pub const SCOPE_APPCTXTRELOC: &str = "eees-appctxtreloc";
+/// OAuth2 scope required for the `eees-eel-acr` service operations (eesd-07).
+pub const SCOPE_EEL_ACR: &str = "eees-eel-acr";
+/// OAuth2 scope required for the `eees-acrstatus-update` service operations (eesd-07).
+pub const SCOPE_ACRSTATUS_UPDATE: &str = "eees-acrstatus-update";
 
 /// Process-wide JWKS used to verify access tokens. `None` ⇒ unconfigured
 /// (fail-closed). Seeded from `--oauth2-jwks-file` or by tests.

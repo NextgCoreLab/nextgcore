@@ -5,6 +5,7 @@
 //! resources keyed by a server-minted `registrationId` (eesd-03) and indexes
 //! the consumer `easId` separately for discovery.
 
+use crate::acr::{AcrContextError, AcrParameters, AcrState, AcrStatus};
 use crate::eec::EecRegistration;
 use crate::types::{
     apply_merge_patch, is_expired, EasDiscoveryFilter, EasDiscoverySubscription, EasProfile,
@@ -40,6 +41,8 @@ pub struct EesContext {
     eec_registrations: RwLock<HashMap<String, EecRegistration>>,
     /// EAS discovery-change subscriptions (eesd-05), keyed by `subscriptionId`.
     disc_subscriptions: RwLock<HashMap<String, EasDiscoverySubscription>>,
+    /// ACR relocation states (eesd-07), keyed by `"eecId:sEasId"`.
+    acr_states: RwLock<HashMap<String, AcrState>>,
     /// Maximum registrations (applied per resource family).
     max_eas: usize,
     /// Context initialized flag.
@@ -53,6 +56,7 @@ impl EesContext {
             eas_id_index: RwLock::new(HashMap::new()),
             eec_registrations: RwLock::new(HashMap::new()),
             disc_subscriptions: RwLock::new(HashMap::new()),
+            acr_states: RwLock::new(HashMap::new()),
             max_eas: 0,
             initialized: AtomicBool::new(false),
         }
@@ -82,6 +86,9 @@ impl EesContext {
         }
         if let Ok(mut subs) = self.disc_subscriptions.write() {
             subs.clear();
+        }
+        if let Ok(mut states) = self.acr_states.write() {
+            states.clear();
         }
         self.initialized.store(false, Ordering::SeqCst);
         log::info!("EES context finalized");
@@ -445,6 +452,225 @@ impl EesContext {
             log::info!("EES lifecycle sweep removed {removed} expired registration(s)");
         }
         removed
+    }
+
+    // ---- eesd-07: Application Context Relocation (ACR) ----------------------
+
+    /// ACR Determine — select a T-EAS candidate for the given (eecId, sEasId).
+    ///
+    /// Looks up the S-EAS from registered profiles; then picks the first
+    /// registered EAS whose `easId` ≠ `s_eas_id` as the T-EAS candidate.
+    /// Records the `(eecId, sEasId)` ACR state as `DETERMINED` and returns
+    /// the `AcrParameters` (with endpoint info). Returns:
+    /// * `Err(SEasNotFound)` — S-EAS not in the registered pool.
+    /// * `Err(NoTEasAvailable)` — S-EAS found but no other EAS is registered.
+    /// * `Ok(params)` — determination succeeded.
+    pub fn acr_determine(
+        &self,
+        eec_id: &str,
+        s_eas_id: &str,
+    ) -> Result<AcrParameters, AcrContextError> {
+        let regs = self.registrations.read().map_err(|_| AcrContextError::Internal)?;
+
+        let s_profile = regs
+            .values()
+            .map(|r| &r.eas_prof)
+            .find(|p| p.eas_id == s_eas_id)
+            .ok_or(AcrContextError::SEasNotFound)?;
+        let s_endpoint = Some(s_profile.end_pt.clone());
+
+        let t_profile = regs
+            .values()
+            .map(|r| &r.eas_prof)
+            .find(|p| p.eas_id != s_eas_id);
+
+        let (t_eas_id, t_endpoint) = match t_profile {
+            Some(p) => (Some(p.eas_id.clone()), Some(p.end_pt.clone())),
+            None => return Err(AcrContextError::NoTEasAvailable),
+        };
+
+        let params = AcrParameters {
+            s_eas_id: s_eas_id.to_string(),
+            t_eas_id: t_eas_id.clone(),
+            s_eas_endpoint: s_endpoint,
+            t_eas_endpoint: t_endpoint,
+        };
+        drop(regs);
+
+        // Record as Determined (create or overwrite any prior state for this key).
+        let key = format!("{eec_id}:{s_eas_id}");
+        if let Ok(mut states) = self.acr_states.write() {
+            states.insert(
+                key,
+                AcrState {
+                    eec_id: eec_id.to_string(),
+                    s_eas_id: s_eas_id.to_string(),
+                    t_eas_id: t_eas_id.clone(),
+                    status: AcrStatus::Determined,
+                },
+            );
+        }
+        log::debug!(
+            "ACR determined: eecId={eec_id} sEasId={s_eas_id} tEasId={:?}",
+            t_eas_id
+        );
+        Ok(params)
+    }
+
+    /// ACR Initiate — transition the relocation state to `INITIATED`.
+    ///
+    /// Stores (or updates) the `(eecId, sEasId)` ACR state with the supplied
+    /// `acrParams` and `INITIATED` status. The `tEasId` must already be set
+    /// in `params` (validated by the handler). Returns the echoed params.
+    pub fn acr_initiate(&self, eec_id: &str, params: AcrParameters) -> AcrParameters {
+        let key = format!("{}:{}", eec_id, params.s_eas_id);
+        if let Ok(mut states) = self.acr_states.write() {
+            states.insert(
+                key,
+                AcrState {
+                    eec_id: eec_id.to_string(),
+                    s_eas_id: params.s_eas_id.clone(),
+                    t_eas_id: params.t_eas_id.clone(),
+                    status: AcrStatus::Initiated,
+                },
+            );
+        }
+        log::debug!(
+            "ACR initiated: eecId={eec_id} sEasId={} tEasId={:?}",
+            params.s_eas_id,
+            params.t_eas_id
+        );
+        params
+    }
+
+    /// ACR Declare — mark the relocation `COMPLETED` and (stub) notify.
+    ///
+    /// Stores the final `(eecId, sEasId)` ACR state as `COMPLETED`. The EES
+    /// would notify the T-EAS and any ACR-status subscribers here; delivery is
+    /// STUB (logged) — no live EAS callback peer exists in this stack.
+    /// Returns the final `AcrParameters`.
+    pub fn acr_declare(
+        &self,
+        eec_id: &str,
+        s_eas_id: &str,
+        t_eas_id: &str,
+    ) -> AcrParameters {
+        let key = format!("{eec_id}:{s_eas_id}");
+        let params = AcrParameters {
+            s_eas_id: s_eas_id.to_string(),
+            t_eas_id: Some(t_eas_id.to_string()),
+            s_eas_endpoint: None,
+            t_eas_endpoint: None,
+        };
+        if let Ok(mut states) = self.acr_states.write() {
+            states.insert(
+                key,
+                AcrState {
+                    eec_id: eec_id.to_string(),
+                    s_eas_id: s_eas_id.to_string(),
+                    t_eas_id: Some(t_eas_id.to_string()),
+                    status: AcrStatus::Completed,
+                },
+            );
+        }
+        log::info!(
+            "ACR completed (stub notify): eecId={eec_id} sEasId={s_eas_id} tEasId={t_eas_id}"
+        );
+        params
+    }
+
+    /// EEL-managed ACR request (TS 29.558 §5.11) — Determine + Initiate in
+    /// one operation, driven by the EEL.
+    ///
+    /// Semantically equivalent to `acr_determine` followed by `acr_initiate`:
+    /// picks a T-EAS candidate and immediately sets the state to `INITIATED`.
+    /// Returns the same errors as `acr_determine`.
+    pub fn acr_eel_request(
+        &self,
+        eec_id: &str,
+        s_eas_id: &str,
+    ) -> Result<AcrParameters, AcrContextError> {
+        let regs = self.registrations.read().map_err(|_| AcrContextError::Internal)?;
+
+        let s_profile = regs
+            .values()
+            .map(|r| &r.eas_prof)
+            .find(|p| p.eas_id == s_eas_id)
+            .ok_or(AcrContextError::SEasNotFound)?;
+        let s_endpoint = Some(s_profile.end_pt.clone());
+
+        let t_profile = regs
+            .values()
+            .map(|r| &r.eas_prof)
+            .find(|p| p.eas_id != s_eas_id);
+
+        let (t_eas_id, t_endpoint) = match t_profile {
+            Some(p) => (Some(p.eas_id.clone()), Some(p.end_pt.clone())),
+            None => return Err(AcrContextError::NoTEasAvailable),
+        };
+
+        let params = AcrParameters {
+            s_eas_id: s_eas_id.to_string(),
+            t_eas_id: t_eas_id.clone(),
+            s_eas_endpoint: s_endpoint,
+            t_eas_endpoint: t_endpoint,
+        };
+        drop(regs);
+
+        let key = format!("{eec_id}:{s_eas_id}");
+        if let Ok(mut states) = self.acr_states.write() {
+            states.insert(
+                key,
+                AcrState {
+                    eec_id: eec_id.to_string(),
+                    s_eas_id: s_eas_id.to_string(),
+                    t_eas_id: t_eas_id.clone(),
+                    status: AcrStatus::Initiated,
+                },
+            );
+        }
+        log::debug!(
+            "EEL ACR initiated: eecId={eec_id} sEasId={s_eas_id} tEasId={:?}",
+            t_eas_id
+        );
+        Ok(params)
+    }
+
+    /// ACR status update (TS 29.558 §5.12) — record a status change from an
+    /// EAS or the EEL.
+    ///
+    /// Creates or updates the `(eecId, sEasId)` ACR state with `status`. The
+    /// EES would notify subscribed EAS/EEC endpoints here; delivery is STUB
+    /// (logged).
+    pub fn acr_status_update(
+        &self,
+        eec_id: &str,
+        params: &AcrParameters,
+        status: AcrStatus,
+    ) {
+        let key = format!("{}:{}", eec_id, params.s_eas_id);
+        if let Ok(mut states) = self.acr_states.write() {
+            let state = states
+                .entry(key)
+                .or_insert_with(|| AcrState {
+                    eec_id: eec_id.to_string(),
+                    s_eas_id: params.s_eas_id.clone(),
+                    t_eas_id: params.t_eas_id.clone(),
+                    status: status.clone(),
+                });
+            state.t_eas_id = params.t_eas_id.clone();
+            state.status = status.clone();
+        }
+        log::debug!(
+            "ACR status update (stub notify): eecId={eec_id} sEasId={} status={status:?}",
+            params.s_eas_id
+        );
+    }
+
+    /// Look up the current ACR state for a (eecId, sEasId) pair.
+    pub fn acr_find(&self, eec_id: &str, s_eas_id: &str) -> Option<AcrState> {
+        let key = format!("{eec_id}:{s_eas_id}");
+        self.acr_states.read().ok()?.get(&key).cloned()
     }
 }
 

@@ -25,9 +25,18 @@
 //! - eesd-11: `suppFeat` negotiation (echoed) + valid 3GPP ProblemDetails causes.
 //! - eesd-12: EAS/EEC `expTime` + a periodic lifecycle sweep.
 //!
-//! DEFERRED (flagged): eesd-07 (ACR suite), eesd-09/10 (UE location/identifier
-//! exposure — NEF-path-blocked), eesd-13 (remaining service APIs), eesd-14
-//! (standalone conformance suite; tests are added colocated as items land).
+//! Implemented (eesd-07):
+//! - eesd-07: Application Context Relocation (ACR) suite (`acr.rs`) — three
+//!   service APIs: `eees-appctxtreloc` (Determine/Initiate/Declare, TS 24.558
+//!   §5.5), `eees-eel-acr` (EEL-managed ACR, TS 29.558 §5.11), and
+//!   `eees-acrstatus-update` (ACR status update, TS 29.558 §5.12). ACR state
+//!   machine keyed by (eecId, sEasId) in `EesContext`. Notification delivery
+//!   is STUB (logged; no live EAS/EEC callback peer). The legacy bespoke
+//!   `nees-uecontexttransfer` route is absent (removed in eesd-01).
+//!
+//! DEFERRED (flagged): eesd-09/10 (UE location/identifier exposure —
+//! NEF-path-blocked), eesd-13 (remaining service APIs), eesd-14 (standalone
+//! conformance suite; tests are added colocated as items land).
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -41,12 +50,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod acr;
 mod auth;
 mod context;
 mod ecs_registration;
 mod eec;
 mod types;
 
+use acr::{
+    AcrContextError, AcrDeclareReq, AcrDetermReq, AcrDetermResp, AcrDeclareResp, AcrInitReq,
+    AcrInitResp, AcrStatusUpdateReq, AcrStatusUpdateResp, EelManagedAcrReq, EelManagedAcrResp,
+};
 use context::{ees_context_final, ees_context_init, ees_self, UpdateError};
 use eec::EecRegistration;
 use types::{cause, EasDiscoveryReq, EasDiscoveryResp, EasDiscoverySubscription, EasRegistration};
@@ -63,6 +77,7 @@ const EASDISC_SUBSCRIPTIONS_PATH: &str = "/eees-easdiscovery/v1/subscriptions";
 /// Resource path prefix (relative to the EES apiRoot) for the individual EAS
 /// registration resources — `{apiRoot}/eees-easregistration/v1/registrations`.
 const EASREG_REGISTRATIONS_PATH: &str = "/eees-easregistration/v1/registrations";
+
 
 /// NextGCore EES - Edge Enabler Server
 #[derive(Parser, Debug)]
@@ -342,6 +357,54 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                 "PATCH" => handle_eec_modify(registration_id, &request).await,
                 "DELETE" => handle_eec_deregister(registration_id).await,
                 _ => send_method_not_allowed(method, "registrations/{registrationId}"),
+            }
+        }
+        // eesd-07: eees-appctxtreloc (TS 24.558 §5.5) — EEC-triggered ACR flow.
+        ["eees-appctxtreloc", "v1", "determine"] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_APPCTXTRELOC) {
+                return resp;
+            }
+            match method {
+                "POST" => handle_acr_determine(&request).await,
+                _ => send_method_not_allowed(method, "determine"),
+            }
+        }
+        ["eees-appctxtreloc", "v1", "initiate"] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_APPCTXTRELOC) {
+                return resp;
+            }
+            match method {
+                "POST" => handle_acr_initiate(&request).await,
+                _ => send_method_not_allowed(method, "initiate"),
+            }
+        }
+        ["eees-appctxtreloc", "v1", "declare"] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_APPCTXTRELOC) {
+                return resp;
+            }
+            match method {
+                "POST" => handle_acr_declare(&request).await,
+                _ => send_method_not_allowed(method, "declare"),
+            }
+        }
+        // eesd-07: eees-eel-acr (TS 29.558 §5.11) — EEL-managed ACR.
+        ["eees-eel-acr", "v1", "request-eelacr"] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EEL_ACR) {
+                return resp;
+            }
+            match method {
+                "POST" => handle_eel_acr_request(&request).await,
+                _ => send_method_not_allowed(method, "request-eelacr"),
+            }
+        }
+        // eesd-07: eees-acrstatus-update (TS 29.558 §5.12) — ACR status notification.
+        ["eees-acrstatus-update", "v1", "request-acrupdate"] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_ACRSTATUS_UPDATE) {
+                return resp;
+            }
+            match method {
+                "POST" => handle_acr_status_update(&request).await,
+                _ => send_method_not_allowed(method, "request-acrupdate"),
             }
         }
         _ => send_not_found(&format!("Resource not found: {path}"), None),
@@ -876,6 +939,248 @@ async fn handle_eec_deregister(registration_id: &str) -> SbiResponse {
     }
 }
 
+// ---- eesd-07: ACR handlers --------------------------------------------------
+
+/// Map an [`AcrContextError`] to the appropriate HTTP response.
+fn acr_context_error_response(err: AcrContextError, detail: &str) -> SbiResponse {
+    match err {
+        AcrContextError::SEasNotFound => {
+            send_not_found(detail, Some(cause::SUBSCRIPTION_NOT_FOUND))
+        }
+        AcrContextError::NoTEasAvailable => send_error(
+            503,
+            "Service Unavailable",
+            detail,
+            Some(cause::INSUFFICIENT_RESOURCES),
+        ),
+        AcrContextError::Internal => {
+            send_error(500, "Internal Server Error", detail, Some("UNSPECIFIED_NF_FAILURE"))
+        }
+    }
+}
+
+/// eesd-07: `Determine` (`POST .../eees-appctxtreloc/v1/determine`).
+///
+/// Parses `AcrDetermReq` (mandatory: `eecId`, `sEasId`), picks a T-EAS from
+/// the registered pool, records `DETERMINED` state, and returns
+/// `AcrDetermResp` (200) with the S-EAS + T-EAS endpoints.
+async fn handle_acr_determine(request: &SbiRequest) -> SbiResponse {
+    log::info!("ACR Determine");
+    let value = match parse_json_body(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let req: AcrDetermReq = match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Missing or invalid mandatory IE (eecId/sEasId): {e}"),
+                Some(cause::MANDATORY_IE_MISSING),
+            );
+        }
+    };
+    if req.eec_id.trim().is_empty() || req.s_eas_id.trim().is_empty() {
+        return send_bad_request(
+            "Mandatory IE eecId/sEasId is empty",
+            Some(cause::MANDATORY_IE_MISSING),
+        );
+    }
+    let supp_feat = types::negotiate_supp_feat(req.supp_feat.as_deref());
+    let ctx = ees_self();
+    match ctx.read().map_err(|_| AcrContextError::Internal).and_then(|c| {
+        c.acr_determine(&req.eec_id, &req.s_eas_id)
+    }) {
+        Ok(acr_params) => {
+            let resp = AcrDetermResp { acr_params, supp_feat };
+            SbiResponse::with_status(200)
+                .with_json_body(&resp)
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
+        Err(e) => acr_context_error_response(
+            e,
+            &format!(
+                "ACR Determine failed: sEasId={} not registered or no T-EAS available",
+                req.s_eas_id
+            ),
+        ),
+    }
+}
+
+/// eesd-07: `Initiate` (`POST .../eees-appctxtreloc/v1/initiate`).
+///
+/// Parses `AcrInitReq` (mandatory: `eecId`, `acrParams.sEasId`,
+/// `acrParams.tEasId`), transitions the ACR state to `INITIATED`, and
+/// returns `AcrInitResp` (200).
+async fn handle_acr_initiate(request: &SbiRequest) -> SbiResponse {
+    log::info!("ACR Initiate");
+    let value = match parse_json_body(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let req: AcrInitReq = match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Missing or invalid mandatory IE (eecId/acrParams): {e}"),
+                Some(cause::MANDATORY_IE_MISSING),
+            );
+        }
+    };
+    if req.eec_id.trim().is_empty() || req.acr_params.s_eas_id.trim().is_empty() {
+        return send_bad_request(
+            "Mandatory IE eecId/acrParams.sEasId is empty",
+            Some(cause::MANDATORY_IE_MISSING),
+        );
+    }
+    // tEasId is mandatory for Initiate (TS 24.558 §5.5).
+    if req.acr_params.t_eas_id.as_deref().unwrap_or("").trim().is_empty() {
+        return send_bad_request(
+            "Mandatory IE acrParams.tEasId missing for Initiate",
+            Some(cause::MANDATORY_IE_MISSING),
+        );
+    }
+    let supp_feat = types::negotiate_supp_feat(req.supp_feat.as_deref());
+    let ctx = ees_self();
+    let acr_params_opt = ctx.read().ok().map(|c| c.acr_initiate(&req.eec_id, req.acr_params));
+    match acr_params_opt {
+        Some(acr_params) => {
+            let resp = AcrInitResp { acr_params, supp_feat };
+            SbiResponse::with_status(200)
+                .with_json_body(&resp)
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
+        None => send_error(500, "Internal Server Error", "Context lock failure", Some("UNSPECIFIED_NF_FAILURE")),
+    }
+}
+
+/// eesd-07: `Declare` (`POST .../eees-appctxtreloc/v1/declare`).
+///
+/// Parses `AcrDeclareReq` (mandatory: `eecId`, `sEasId`, `tEasId`), marks
+/// the relocation `COMPLETED`, and returns `AcrDeclareResp` (200). The EES
+/// (stub) logs the notification to the T-EAS and ACR-status subscribers.
+async fn handle_acr_declare(request: &SbiRequest) -> SbiResponse {
+    log::info!("ACR Declare");
+    let value = match parse_json_body(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let req: AcrDeclareReq = match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Missing or invalid mandatory IE (eecId/sEasId/tEasId): {e}"),
+                Some(cause::MANDATORY_IE_MISSING),
+            );
+        }
+    };
+    if req.eec_id.trim().is_empty()
+        || req.s_eas_id.trim().is_empty()
+        || req.t_eas_id.trim().is_empty()
+    {
+        return send_bad_request(
+            "Mandatory IE eecId/sEasId/tEasId is empty",
+            Some(cause::MANDATORY_IE_MISSING),
+        );
+    }
+    let supp_feat = types::negotiate_supp_feat(req.supp_feat.as_deref());
+    let ctx = ees_self();
+    let acr_params_opt =
+        ctx.read().ok().map(|c| c.acr_declare(&req.eec_id, &req.s_eas_id, &req.t_eas_id));
+    match acr_params_opt {
+        Some(acr_params) => {
+            let resp = AcrDeclareResp { acr_params, supp_feat };
+            SbiResponse::with_status(200)
+                .with_json_body(&resp)
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
+        None => send_error(500, "Internal Server Error", "Context lock failure", Some("UNSPECIFIED_NF_FAILURE")),
+    }
+}
+
+/// eesd-07: `RequestEELManagedACR` (`POST .../eees-eel-acr/v1/request-eelacr`).
+///
+/// Parses `EelManagedAcrReq` (mandatory: `eecId`, `sEasId`), performs
+/// Determine + Initiate internally (Scenario C), and returns
+/// `EelManagedAcrResp` (200) with the selected T-EAS.
+async fn handle_eel_acr_request(request: &SbiRequest) -> SbiResponse {
+    log::info!("EEL ACR Request");
+    let value = match parse_json_body(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let req: EelManagedAcrReq = match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Missing or invalid mandatory IE (eecId/sEasId): {e}"),
+                Some(cause::MANDATORY_IE_MISSING),
+            );
+        }
+    };
+    if req.eec_id.trim().is_empty() || req.s_eas_id.trim().is_empty() {
+        return send_bad_request(
+            "Mandatory IE eecId/sEasId is empty",
+            Some(cause::MANDATORY_IE_MISSING),
+        );
+    }
+    let supp_feat = types::negotiate_supp_feat(req.supp_feat.as_deref());
+    let ctx = ees_self();
+    match ctx.read().map_err(|_| AcrContextError::Internal).and_then(|c| {
+        c.acr_eel_request(&req.eec_id, &req.s_eas_id)
+    }) {
+        Ok(acr_params) => {
+            let resp = EelManagedAcrResp { acr_params, supp_feat };
+            SbiResponse::with_status(200)
+                .with_json_body(&resp)
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
+        Err(e) => acr_context_error_response(
+            e,
+            &format!(
+                "EEL ACR request failed: sEasId={} not registered or no T-EAS available",
+                req.s_eas_id
+            ),
+        ),
+    }
+}
+
+/// eesd-07: `RequestACRUpdate` (`POST .../eees-acrstatus-update/v1/request-acrupdate`).
+///
+/// Parses `AcrStatusUpdateReq` (mandatory: `eecId`, `acrParams`, `acrStatus`),
+/// updates the ACR state, and returns `AcrStatusUpdateResp` (200). The EES
+/// (stub) logs notifications to interested EAS/EEC subscribers.
+async fn handle_acr_status_update(request: &SbiRequest) -> SbiResponse {
+    log::info!("ACR Status Update");
+    let value = match parse_json_body(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let req: AcrStatusUpdateReq = match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Missing or invalid mandatory IE (eecId/acrParams/acrStatus): {e}"),
+                Some(cause::MANDATORY_IE_MISSING),
+            );
+        }
+    };
+    if req.eec_id.trim().is_empty() || req.acr_params.s_eas_id.trim().is_empty() {
+        return send_bad_request(
+            "Mandatory IE eecId/acrParams.sEasId is empty",
+            Some(cause::MANDATORY_IE_MISSING),
+        );
+    }
+    let supp_feat = types::negotiate_supp_feat(req.supp_feat.as_deref());
+    let ctx = ees_self();
+    if let Ok(c) = ctx.read() {
+        c.acr_status_update(&req.eec_id, &req.acr_params, req.acr_status);
+    }
+    let resp = AcrStatusUpdateResp { supp_feat };
+    SbiResponse::with_status(200)
+        .with_json_body(&resp)
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1322,6 +1627,359 @@ mod tests {
         let stored: EasRegistration =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(stored.supp_feat.as_deref(), Some("1"));
+
+        auth::clear_auth_jwks();
+    }
+
+    // ---- eesd-07: ACR suite tests -------------------------------------------
+
+    /// Register S-EAS and T-EAS, then issue an ACR Determine — must return 200
+    /// with `acrParams.tEasId` set to the T-EAS (not the S-EAS).
+    #[test]
+    fn test_acr_determine_returns_t_eas() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        // Register S-EAS and T-EAS.
+        register_eas(&sk, "s-eas.example.com", "V2X");
+        register_eas(&sk, "t-eas.example.com", "V2X");
+
+        let body =
+            r#"{"eecId":"eec-acr-1","sEasId":"s-eas.example.com","suppFeat":"1"}"#;
+        let req = SbiRequest::post("/eees-appctxtreloc/v1/determine")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-appctxtreloc"))
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+
+        let dr: acr::AcrDetermResp =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(dr.acr_params.s_eas_id, "s-eas.example.com");
+        // The T-EAS must be a registered EAS that is NOT the S-EAS (could be any
+        // of the EASes registered in this or prior test runs in the shared context).
+        let t_eas_id = dr.acr_params.t_eas_id.expect("T-EAS must be determined");
+        assert_ne!(t_eas_id, "s-eas.example.com");
+        // sEasEndpoint echoed from the registered EASProfile.
+        assert!(dr.acr_params.s_eas_endpoint.is_some());
+        // tEasEndpoint filled from T-EAS registration.
+        assert!(dr.acr_params.t_eas_endpoint.is_some());
+        // suppFeat echoed.
+        assert_eq!(dr.supp_feat.as_deref(), Some("1"));
+
+        auth::clear_auth_jwks();
+    }
+
+    /// ACR Determine with an unregistered sEasId → 404.
+    #[test]
+    fn test_acr_determine_unknown_s_eas_404() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        let body = r#"{"eecId":"eec-acr-2","sEasId":"ghost.example.com"}"#;
+        let req = SbiRequest::post("/eees-appctxtreloc/v1/determine")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-appctxtreloc"))
+            .with_body(body, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 404);
+
+        auth::clear_auth_jwks();
+    }
+
+    /// ACR Determine with a missing mandatory IE → 400.
+    #[test]
+    fn test_acr_determine_missing_ie_400() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        // Missing sEasId.
+        let body = r#"{"eecId":"eec-1"}"#;
+        let req = SbiRequest::post("/eees-appctxtreloc/v1/determine")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-appctxtreloc"))
+            .with_body(body, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 400);
+
+        auth::clear_auth_jwks();
+    }
+
+    /// ACR Initiate transitions state: POST with tEasId → 200 with INITIATED
+    /// state recorded; a missing tEasId → 400.
+    #[test]
+    fn test_acr_initiate_transitions_state() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        // Valid Initiate (with tEasId) → 200.
+        let body = r#"{
+            "eecId":"eec-init-1",
+            "acrParams":{"sEasId":"eas-s.example.com","tEasId":"eas-t.example.com"}
+        }"#;
+        let req = SbiRequest::post("/eees-appctxtreloc/v1/initiate")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-appctxtreloc"))
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let ir: acr::AcrInitResp =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(ir.acr_params.s_eas_id, "eas-s.example.com");
+        assert_eq!(ir.acr_params.t_eas_id.as_deref(), Some("eas-t.example.com"));
+
+        // Verify state is INITIATED in the context.
+        let state = ees_self()
+            .read()
+            .unwrap()
+            .acr_find("eec-init-1", "eas-s.example.com")
+            .unwrap();
+        assert_eq!(state.status, acr::AcrStatus::Initiated);
+
+        // Initiate without tEasId → 400.
+        let bad = r#"{"eecId":"eec-init-1","acrParams":{"sEasId":"eas-s.example.com"}}"#;
+        let req = SbiRequest::post("/eees-appctxtreloc/v1/initiate")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-appctxtreloc"))
+            .with_body(bad, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 400);
+
+        auth::clear_auth_jwks();
+    }
+
+    /// ACR Declare: POST with all three mandatory IDs → 200 + COMPLETED state;
+    /// missing tEasId → 400.
+    #[test]
+    fn test_acr_declare_completes_relocation() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        let body =
+            r#"{"eecId":"eec-decl-1","sEasId":"eas-s.example.com","tEasId":"eas-t.example.com"}"#;
+        let req = SbiRequest::post("/eees-appctxtreloc/v1/declare")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-appctxtreloc"))
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let dr: acr::AcrDeclareResp =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(dr.acr_params.s_eas_id, "eas-s.example.com");
+        assert_eq!(dr.acr_params.t_eas_id.as_deref(), Some("eas-t.example.com"));
+
+        // Verify COMPLETED state.
+        let state = ees_self()
+            .read()
+            .unwrap()
+            .acr_find("eec-decl-1", "eas-s.example.com")
+            .unwrap();
+        assert_eq!(state.status, acr::AcrStatus::Completed);
+
+        // Missing tEasId → 400.
+        let bad = r#"{"eecId":"eec-decl-1","sEasId":"eas-s.example.com","tEasId":""}"#;
+        let req = SbiRequest::post("/eees-appctxtreloc/v1/declare")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-appctxtreloc"))
+            .with_body(bad, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 400);
+
+        auth::clear_auth_jwks();
+    }
+
+    /// EEL-managed ACR: POST `EelManagedAcrReq` with two EASes registered →
+    /// 200 + tEasId set; unknown sEasId → 404.
+    #[test]
+    fn test_eel_acr_request_200_and_404() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        register_eas(&sk, "eel-s-eas.example.com", "AR");
+        register_eas(&sk, "eel-t-eas.example.com", "AR");
+
+        // Valid EEL-managed ACR → 200 with tEasId.
+        let body = r#"{"eecId":"eec-eel-1","sEasId":"eel-s-eas.example.com"}"#;
+        let req = SbiRequest::post("/eees-eel-acr/v1/request-eelacr")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-eel-acr"))
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let er: EelManagedAcrResp =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(er.acr_params.s_eas_id, "eel-s-eas.example.com");
+        // T-EAS is any registered EAS that is not the S-EAS.
+        let t_id = er.acr_params.t_eas_id.expect("EEL ACR must select a T-EAS");
+        assert_ne!(t_id, "eel-s-eas.example.com");
+
+        // Verify INITIATED state set by the EEL-managed flow.
+        let state = ees_self()
+            .read()
+            .unwrap()
+            .acr_find("eec-eel-1", "eel-s-eas.example.com")
+            .unwrap();
+        assert_eq!(state.status, acr::AcrStatus::Initiated);
+
+        // Unknown sEasId → 404.
+        let bad = r#"{"eecId":"eec-eel-1","sEasId":"ghost.example.com"}"#;
+        let req = SbiRequest::post("/eees-eel-acr/v1/request-eelacr")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-eel-acr"))
+            .with_body(bad, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 404);
+
+        auth::clear_auth_jwks();
+    }
+
+    /// ACR status update: POST `AcrStatusUpdateReq` → 200; the ACR state in
+    /// the context reflects the new status; missing `acrStatus` → 400.
+    #[test]
+    fn test_acr_status_update_200_and_missing_status_400() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        // Valid ACR status update → 200.
+        let body = r#"{
+            "eecId":"eec-upd-1",
+            "acrParams":{"sEasId":"upd-s.example.com","tEasId":"upd-t.example.com"},
+            "acrStatus":"COMPLETED"
+        }"#;
+        let req = SbiRequest::post("/eees-acrstatus-update/v1/request-acrupdate")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-acrstatus-update"))
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let ur: AcrStatusUpdateResp =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        // suppFeat absent (no suppFeat in request).
+        assert!(ur.supp_feat.is_none());
+
+        // The ACR state is updated to COMPLETED.
+        let state = ees_self()
+            .read()
+            .unwrap()
+            .acr_find("eec-upd-1", "upd-s.example.com")
+            .unwrap();
+        assert_eq!(state.status, acr::AcrStatus::Completed);
+        assert_eq!(state.t_eas_id.as_deref(), Some("upd-t.example.com"));
+
+        // Missing acrStatus → 400.
+        let bad = r#"{"eecId":"eec-upd-1","acrParams":{"sEasId":"s","tEasId":"t"}}"#;
+        let req = SbiRequest::post("/eees-acrstatus-update/v1/request-acrupdate")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-acrstatus-update"))
+            .with_body(bad, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 400);
+
+        auth::clear_auth_jwks();
+    }
+
+    /// eesd-07: ACR routes are OAuth2-gated (no token → 401).
+    #[test]
+    fn test_acr_routes_require_auth() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        auth::clear_auth_jwks();
+
+        for path in [
+            "/eees-appctxtreloc/v1/determine",
+            "/eees-appctxtreloc/v1/initiate",
+            "/eees-appctxtreloc/v1/declare",
+            "/eees-eel-acr/v1/request-eelacr",
+            "/eees-acrstatus-update/v1/request-acrupdate",
+        ] {
+            let req = SbiRequest::post(path);
+            assert_eq!(
+                block_on(ees_sbi_request_handler(req)).status,
+                401,
+                "expected 401 for {path}"
+            );
+        }
+    }
+
+    /// eesd-07: the legacy `nees-uecontexttransfer` path is absent → 404.
+    #[test]
+    fn test_uecontexttransfer_path_is_gone() {
+        for path in [
+            "/nees-uecontexttransfer/v1/contexts/gpsi-12345",
+            "/nees-uecontexttransfer/v1/contexts",
+        ] {
+            let req = SbiRequest::get(path);
+            assert_eq!(
+                block_on(ees_sbi_request_handler(req)).status,
+                404,
+                "expected 404 for {path} (uecontexttransfer removed in eesd-01/07)"
+            );
+        }
+    }
+
+    /// eesd-07: full EEC-triggered ACR flow through the router
+    /// (Determine → Initiate → Declare) transitions state correctly.
+    #[test]
+    fn test_acr_full_eec_triggered_flow() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        register_eas(&sk, "flow-s.example.com", "VIDEO");
+        register_eas(&sk, "flow-t.example.com", "VIDEO");
+
+        // Step 1: Determine.
+        let det_body = r#"{"eecId":"eec-flow","sEasId":"flow-s.example.com"}"#;
+        let req = SbiRequest::post("/eees-appctxtreloc/v1/determine")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-appctxtreloc"))
+            .with_body(det_body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        {
+            let state = ees_self().read().unwrap().acr_find("eec-flow", "flow-s.example.com");
+            assert_eq!(state.unwrap().status, acr::AcrStatus::Determined);
+        }
+
+        // Step 2: Initiate.
+        let init_body = r#"{
+            "eecId":"eec-flow",
+            "acrParams":{"sEasId":"flow-s.example.com","tEasId":"flow-t.example.com"}
+        }"#;
+        let req = SbiRequest::post("/eees-appctxtreloc/v1/initiate")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-appctxtreloc"))
+            .with_body(init_body, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 200);
+        {
+            let state = ees_self().read().unwrap().acr_find("eec-flow", "flow-s.example.com");
+            assert_eq!(state.unwrap().status, acr::AcrStatus::Initiated);
+        }
+
+        // Step 3: Declare → COMPLETED.
+        let decl_body =
+            r#"{"eecId":"eec-flow","sEasId":"flow-s.example.com","tEasId":"flow-t.example.com"}"#;
+        let req = SbiRequest::post("/eees-appctxtreloc/v1/declare")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-appctxtreloc"))
+            .with_body(decl_body, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 200);
+        {
+            let state = ees_self().read().unwrap().acr_find("eec-flow", "flow-s.example.com");
+            assert_eq!(state.unwrap().status, acr::AcrStatus::Completed);
+        }
 
         auth::clear_auth_jwks();
     }
