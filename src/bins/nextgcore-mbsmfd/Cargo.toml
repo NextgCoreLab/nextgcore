@@ -26,10 +26,10 @@ uuid.workspace = true
 hex.workspace = true
 clap.workspace = true
 ctrlc.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-bytes.workspace = true
 
 [lints]
 workspace = true

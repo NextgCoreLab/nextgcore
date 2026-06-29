@@ -16,14 +16,12 @@ use ogs_sbi::server::{
     SbiServerConfig as OgsSbiServerConfig,
 };
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Per-process N4mb PFCP sequence number counter, incremented for each message.
-static PFCP_SEQ: AtomicU32 = AtomicU32::new(1);
-
 mod context;
+mod n4mb;
 mod types;
 
 pub use context::*;
@@ -199,32 +197,68 @@ async fn mbsmf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             "GET" => handle_mbs_session_list().await,
             _ => send_method_not_allowed(method, "mbs-sessions"),
         },
+        // ContextUpdate — start/terminate MBS data reception (TS 29.532 §5.3.2.5).
+        // [mbsmfd-03] Must precede the `{session_id}` arm (disjoint length, but
+        // kept adjacent for clarity).
+        ["nmbsmf-mbssession", "v1", "mbs-sessions", "contexts", "update"] => match method {
+            "POST" => handle_mbs_session_context_update(&request).await,
+            _ => send_method_not_allowed(method, "mbs-sessions/contexts/update"),
+        },
         ["nmbsmf-mbssession", "v1", "mbs-sessions", session_id] => match method {
             "GET" => handle_mbs_session_get(session_id).await,
             "PATCH" => handle_mbs_session_update(session_id, &request).await,
             "DELETE" => handle_mbs_session_release(session_id).await,
             _ => send_method_not_allowed(method, "mbs-sessions/{id}"),
         },
-        // N4mb PFCP activation (TS 23.247 7.3)
-        ["nmbsmf-mbssession", "v1", "mbs-sessions", session_id, "activate"] => match method {
-            "POST" => handle_mbs_session_activate(session_id, &request).await,
-            _ => send_method_not_allowed(method, "mbs-sessions/{id}/activate"),
+        // Nmbsmf_TMGI service (TS 29.532 §5.2, TS29532_Nmbsmf_TMGI.yaml). [mbsmfd-04]
+        ["nmbsmf-tmgi", "v1", "tmgi"] => match method {
+            "POST" => handle_tmgi_allocate(&request).await,
+            "DELETE" => handle_tmgi_deallocate(&request).await,
+            _ => send_method_not_allowed(method, "tmgi"),
         },
-        // Group membership management
-        ["nmbsmf-mbssession", "v1", "mbs-sessions", session_id, "members"] => match method {
-            "POST" => handle_member_join(session_id, &request).await,
-            "GET" => handle_member_list(session_id).await,
-            _ => send_method_not_allowed(method, "mbs-sessions/{id}/members"),
-        },
-        ["nmbsmf-mbssession", "v1", "mbs-sessions", session_id, "members", supi] => match method {
-            "DELETE" => handle_member_leave(session_id, supi).await,
-            _ => send_method_not_allowed(method, "mbs-sessions/{id}/members/{supi}"),
-        },
+        // --- Non-spec debug routes (mbsmfd-10): only when MBSMF_DEBUG_ROUTES is
+        // set. The N4mb activation that `/activate` used to drive is now folded
+        // into the ContextUpdate Start path; group membership is internal
+        // MBS-session-context state, not an SBI sub-resource.
+        ["nmbsmf-mbssession", "v1", "mbs-sessions", session_id, "activate"]
+            if debug_routes_enabled() =>
+        {
+            match method {
+                "POST" => handle_mbs_session_activate(session_id, &request).await,
+                _ => send_method_not_allowed(method, "mbs-sessions/{id}/activate"),
+            }
+        }
+        ["nmbsmf-mbssession", "v1", "mbs-sessions", session_id, "members"]
+            if debug_routes_enabled() =>
+        {
+            match method {
+                "POST" => handle_member_join(session_id, &request).await,
+                "GET" => handle_member_list(session_id).await,
+                _ => send_method_not_allowed(method, "mbs-sessions/{id}/members"),
+            }
+        }
+        ["nmbsmf-mbssession", "v1", "mbs-sessions", session_id, "members", supi]
+            if debug_routes_enabled() =>
+        {
+            match method {
+                "DELETE" => handle_member_leave(session_id, supi).await,
+                _ => send_method_not_allowed(method, "mbs-sessions/{id}/members/{supi}"),
+            }
+        }
         _ => {
             log::debug!("Unknown path: {path}");
             send_not_found(&format!("Resource not found: {path}"), None)
         }
     }
+}
+
+/// Whether the non-spec debug routes (`/activate`, `/members*`) are exposed.
+/// Off by default so the SBI surface is exactly the TS 29.532 resource set;
+/// enabled by setting `MBSMF_DEBUG_ROUTES` (any non-empty value). [mbsmfd-10]
+fn debug_routes_enabled() -> bool {
+    std::env::var("MBSMF_DEBUG_ROUTES")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
 }
 
 /// Parse session pool ID from string like "mbs-sess-123"
@@ -494,16 +528,19 @@ async fn handle_mbs_session_release(session_id: &str) -> SbiResponse {
     }
 }
 
-/// Handle MBS Session Activate - establish N4mb PFCP with UPF (TS 23.247 7.3)
+/// Handle MBS Session Activate (debug route) - establish N4mb PFCP with the
+/// MB-UPF (TS 23.247 7.3). [mbsmfd-10] The production trigger for this is the
+/// ContextUpdate Start path; this debug alias reuses the same establishment
+/// drive ([`drive_n4mb_establishment`]).
 async fn handle_mbs_session_activate(session_id: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("MBS Session Activate (N4mb): {session_id}");
+    log::info!("MBS Session Activate (N4mb, debug): {session_id}");
 
     let pool_id = match parse_session_id(session_id) {
         Some(id) => id,
         None => return send_bad_request("Invalid session ID", Some("INVALID_SESSION_ID")),
     };
 
-    // Parse UPF address from request body
+    // Parse UPF address from request body (defaults to the configured MB-UPF).
     let upf_addr: std::net::Ipv4Addr = if let Some(body) = &request.http.content {
         let data: serde_json::Value = match serde_json::from_str(body) {
             Ok(p) => p,
@@ -512,9 +549,9 @@ async fn handle_mbs_session_activate(session_id: &str, request: &SbiRequest) -> 
         data.get("upfAddr")
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse().ok())
-            .unwrap_or(std::net::Ipv4Addr::new(127, 0, 0, 7))
+            .unwrap_or_else(configured_mb_upf_ip)
     } else {
-        std::net::Ipv4Addr::new(127, 0, 0, 7)
+        configured_mb_upf_ip()
     };
 
     let ctx = mbsmf_self();
@@ -526,62 +563,16 @@ async fn handle_mbs_session_activate(session_id: &str, request: &SbiRequest) -> 
 
     match session {
         Some(session) => {
-            let n4mb = match session.n4mb_session.as_ref() {
-                Some(n) => n,
-                None => {
-                    log::error!("MBS Session {session_id} has no N4mb session after activation");
-                    return send_bad_request(
-                        "N4mb session not initialized",
-                        Some("N4MB_SESSION_MISSING"),
-                    );
-                }
+            let Some(n4mb) = session.n4mb_session.as_ref() else {
+                log::error!("MBS Session {session_id} has no N4mb session after activation");
+                return send_bad_request("N4mb session not initialized", Some("N4MB_SESSION_MISSING"));
             };
             let local_seid = n4mb.local_seid;
             let dl_teid = n4mb.dl_teid;
-            let mcast_pdr_id = n4mb.mcast_pdr_id;
-            let mcast_far_id = n4mb.mcast_far_id;
 
-            log::info!(
-                "MBS Session {session_id} activated: N4mb SEID={local_seid}, UPF={upf_addr}, TEID={dl_teid:#x}"
-            );
-
-            // Send PFCP Session Establishment Request to UPF with MBS-specific
-            // PDR/FAR rules for multicast transport (TS 23.247 §7.3.2, TS 29.244).
-            // Fire-and-forget: the response is processed asynchronously.
-            let upf_pfcp_port: u16 = std::env::var("UPF_PFCP_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(8805);
-            let upf_addr_octets = upf_addr.octets();
-            // CP (MB-SMF) node/F-SEID address for the N4mb establishment.
-            let cp_addr_octets: [u8; 4] = std::env::var("MBSMF_N4MB_ADDR")
-                .ok()
-                .and_then(|a| a.parse::<std::net::Ipv4Addr>().ok())
-                .unwrap_or(std::net::Ipv4Addr::new(127, 0, 0, 1))
-                .octets();
-
-            tokio::spawn(async move {
-                let msg = build_n4mb_pfcp_establishment(
-                    local_seid,
-                    dl_teid,
-                    mcast_pdr_id,
-                    mcast_far_id,
-                    cp_addr_octets,
-                    upf_addr_octets,
-                );
-                let dest = std::net::SocketAddr::from((upf_addr_octets, upf_pfcp_port));
-                match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-                    Ok(sock) => match sock.send_to(&msg, dest).await {
-                        Ok(n) => log::info!(
-                            "[N4mb] PFCP Session Establishment Request sent to {dest} ({n} bytes)"
-                        ),
-                        Err(e) => log::warn!(
-                            "[N4mb] Failed to send PFCP Session Establishment to {dest}: {e}"
-                        ),
-                    },
-                    Err(e) => log::warn!("[N4mb] Failed to bind UDP socket: {e}"),
-                }
-            });
+            // Drive a real PFCP establishment (assoc-gated, response-processed,
+            // T1/N1) through the persistent node. [mbsmfd-02]
+            tokio::spawn(drive_n4mb_establishment(pool_id, session.clone()));
 
             SbiResponse::with_status(200)
                 .with_json_body(&serde_json::json!({
@@ -590,10 +581,8 @@ async fn handle_mbs_session_activate(session_id: &str, request: &SbiRequest) -> 
                     "n4mbSession": {
                         "localSeid": local_seid,
                         "upfAddr": upf_addr.to_string(),
-                        "dlTeid": format!("{:#010x}", dl_teid),
+                        "dlTeid": format!("{dl_teid:#010x}"),
                         "state": "ESTABLISHMENT_PENDING",
-                        "mcastPdrId": mcast_pdr_id,
-                        "mcastFarId": mcast_far_id,
                     },
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(200))
@@ -605,64 +594,334 @@ async fn handle_mbs_session_activate(session_id: &str, request: &SbiRequest) -> 
     }
 }
 
-/// Build a PFCP Session Establishment Request for N4mb multicast transport,
-/// encoded via the conformant `ogs-pfcp` library (TS 29.244). [mbsmfd-01]
-///
-/// Replaces the previous hand-rolled TLV writer, which had wire-fatal bugs
-/// (F-TEID flag set to V6=0x02 instead of V4=0x01, Apply-Action emitted in the
-/// wrong octet order so FORW never landed in octet 5, and a missing mandatory
-/// Node ID IE). The library encoders fix all three: F-TEID V4 flag = 0x01
-/// (§8.2.3), Apply-Action FORW in octet 5 = 0x02 (§8.2.26), Node ID IE present
-/// (§7.5.2.1).
-///
-/// Structure:
-///   - Node ID (IPv4 of the MB-SMF / CP function)
-///   - CP F-SEID (local SEID + CP IPv4)
-///   - Create PDR: Source-Interface=ACCESS, F-TEID (V4, multicast DL TEID),
-///     referencing the forwarding FAR
-///   - Create FAR: Apply-Action=FORW, Forwarding-Parameters Destination=CORE
-fn build_n4mb_pfcp_establishment(
-    local_seid: u64,
-    dl_teid: u32,
-    pdr_id: u16,
-    far_id: u32,
-    cp_addr: [u8; 4],
-    upf_addr: [u8; 4],
-) -> Vec<u8> {
-    use ogs_pfcp::message::{build_message, PfcpMessage, SessionEstablishmentRequest};
-    use ogs_pfcp::types::{
-        ApplyAction, CreateFar, CreatePdr, DestinationInterface, FSeid, FTeid, ForwardingParameters,
-        NodeId, Pdi, SourceInterface,
+/// Configured MB-UPF PFCP endpoint (env `MB_UPF_ADDR` / `UPF_PFCP_PORT`).
+fn configured_mb_upf() -> SocketAddr {
+    SocketAddr::from((configured_mb_upf_ip(), configured_upf_pfcp_port()))
+}
+
+/// Configured MB-UPF IPv4 address (env `MB_UPF_ADDR`, default 127.0.0.7).
+fn configured_mb_upf_ip() -> std::net::Ipv4Addr {
+    std::env::var("MB_UPF_ADDR")
+        .ok()
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(std::net::Ipv4Addr::new(127, 0, 0, 7))
+}
+
+/// Configured MB-UPF PFCP port (env `UPF_PFCP_PORT`, default 8805).
+fn configured_upf_pfcp_port() -> u16 {
+    std::env::var("UPF_PFCP_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(8805)
+}
+
+/// Configured MB-SMF (CP function) N4mb address (env `MBSMF_N4MB_ADDR`,
+/// default 127.0.0.1) used as the PFCP Node ID / F-SEID address.
+fn configured_cp_addr() -> [u8; 4] {
+    std::env::var("MBSMF_N4MB_ADDR")
+        .ok()
+        .and_then(|a| a.parse::<std::net::Ipv4Addr>().ok())
+        .unwrap_or(std::net::Ipv4Addr::new(127, 0, 0, 1))
+        .octets()
+}
+
+/// Configured serving PLMN for TMGI allocation (env `MBSMF_PLMN_MCC/MNC`).
+fn default_plmn() -> PlmnId {
+    PlmnId {
+        mcc: std::env::var("MBSMF_PLMN_MCC").unwrap_or_else(|_| "001".to_string()),
+        mnc: std::env::var("MBSMF_PLMN_MNC").unwrap_or_else(|_| "01".to_string()),
+    }
+}
+
+/// Persistent N4mb PFCP node toward the MB-UPF, bound lazily on first use.
+/// [mbsmfd-02]
+static N4MB_NODE: tokio::sync::OnceCell<Arc<n4mb::N4mbPfcpNode>> =
+    tokio::sync::OnceCell::const_new();
+
+/// Get (or lazily bind) the persistent N4mb PFCP node.
+async fn n4mb_node() -> Option<Arc<n4mb::N4mbPfcpNode>> {
+    N4MB_NODE
+        .get_or_try_init(|| async {
+            n4mb::N4mbPfcpNode::new(
+                "0.0.0.0:0".parse().expect("valid bind addr"),
+                configured_mb_upf(),
+                configured_cp_addr(),
+            )
+            .await
+        })
+        .await
+        .map_err(|e| log::warn!("[N4mb] failed to bind PFCP node: {e}"))
+        .ok()
+        .cloned()
+}
+
+/// Drive a real N4mb PFCP establishment for `session` through the persistent
+/// node: association-gated, response-processed, with T1/N1 retransmission. On a
+/// successful establishment the stored session transitions to `Established`.
+/// [mbsmfd-02/03]
+async fn drive_n4mb_establishment(pool_id: u64, session: MbsSession) {
+    let Some(n4mb) = session.n4mb_session.as_ref() else {
+        return;
+    };
+    let upf_addr = n4mb.upf_addr;
+    let params = n4mb::N4mbEstablishParams {
+        local_seid: n4mb.local_seid,
+        cp_addr: configured_cp_addr(),
+        upf_addr: upf_addr.octets(),
+        dl_teid: n4mb.dl_teid,
+        pdr_id: n4mb.mcast_pdr_id,
+        far_id: n4mb.mcast_far_id,
+        // OuterHeaderCreation toward the multicast group (mbsmfd-09).
+        mcast_transport_addr: n4mb.ll_ssm_dst.unwrap_or(upf_addr).octets(),
+        c_teid: n4mb.dl_teid,
     };
 
-    // Mandatory Node ID + CP F-SEID identify the MB-SMF (CP function).
-    let node_id = NodeId::new_ipv4(cp_addr);
-    let cp_f_seid = FSeid::new_ipv4(local_seid, cp_addr);
+    let Some(node) = n4mb_node().await else {
+        return;
+    };
 
-    // Multicast downlink PDR: ACCESS source interface, F-TEID (V4 flag = 0x01)
-    // carrying the multicast DL TEID + transport address, referencing the FAR.
-    let mut pdi = Pdi::new(SourceInterface::Access);
-    pdi.local_f_teid = Some(FTeid::new_ipv4(dl_teid, upf_addr));
-    let mut create_pdr = CreatePdr::new(pdr_id, 100, pdi);
-    create_pdr.far_id = Some(far_id);
+    match node.establish_session(&params).await {
+        Ok(outcome) => {
+            let transport = outcome.transport_addr.unwrap_or(upf_addr);
+            let dl_teid = outcome.up_dl_teid.unwrap_or(params.dl_teid);
+            let ctx = mbsmf_self();
+            if let Ok(c) = ctx.read() {
+                c.apply_n4mb_response(pool_id, outcome.remote_seid, dl_teid, transport);
+            }
+            log::info!(
+                "[N4mb] session {pool_id} established (remote_seid={})",
+                outcome.remote_seid
+            );
+        }
+        Err(e) => log::warn!("[N4mb] session {pool_id} establishment failed: {e}"),
+    }
+}
 
-    // Multicast forwarding FAR: Apply-Action FORW (octet 5 = 0x02),
-    // Forwarding-Parameters Destination-Interface = CORE.
-    let mut create_far = CreateFar::new(far_id, ApplyAction::forward());
-    create_far.forwarding_parameters = Some(ForwardingParameters::new(DestinationInterface::Core));
+/// Handle ContextUpdate (TS 29.532 §5.3.2.5) - start/terminate MBS data
+/// reception. [mbsmfd-03] On an SMF multicast Start the MB-SMF allocates and
+/// returns a `cTeid` + `llSsm` and drives N4mb establishment; on Terminate /
+/// leave it releases the N4mb transport; on the AMF path it returns an N2 MBS
+/// SM container.
+async fn handle_mbs_session_context_update(request: &SbiRequest) -> SbiResponse {
+    let body = match &request.http.content {
+        Some(content) => content,
+        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+    };
 
-    let mut req = SessionEstablishmentRequest::new(node_id, cp_f_seid);
-    req.create_pdrs.push(create_pdr);
-    req.create_fars.push(create_far);
+    let req: types::ContextUpdateReqData = match serde_json::from_str(body) {
+        Ok(p) => p,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Invalid ContextUpdateReqData: {e}"),
+                Some("INVALID_MSG_FORMAT"),
+            )
+        }
+    };
 
-    let seq_num: u32 = PFCP_SEQ.fetch_add(1, Ordering::Relaxed);
-    // SEID toward the UP is 0 for the initial establishment (TS 29.244 §7.2.2.4.2).
-    build_message(
-        &PfcpMessage::SessionEstablishmentRequest(req),
-        seq_num,
-        Some(0),
-    )
-    .to_vec()
+    // mbsSessionId is mandatory; resolve the session by TMGI.
+    let tmgi = match req.mbs_session_id.tmgi.as_ref() {
+        Some(t) => context_tmgi_from(Some(t)),
+        None => {
+            return send_bad_request(
+                "ContextUpdate requires mbsSessionId.tmgi",
+                Some("MANDATORY_IE_MISSING"),
+            )
+        }
+    };
+
+    let action = req
+        .requested_action
+        .clone()
+        .unwrap_or(types::ContextUpdateAction::Start);
+    let is_amf = req.ran_node_id.is_some() || req.n2_mbs_sm_info.is_some();
+    let terminate =
+        matches!(action, types::ContextUpdateAction::Terminate) || req.leave_ind == Some(true);
+
+    let ctx = mbsmf_self();
+
+    // --- Terminate / leave: release the N4mb multicast transport.
+    if terminate {
+        let released = ctx
+            .read()
+            .map(|c| c.session_context_terminate(&tmgi))
+            .unwrap_or(false);
+        if !released {
+            return send_not_found(
+                "MBS session not found for ContextUpdate",
+                Some("CONTEXT_NOT_FOUND"),
+            );
+        }
+        log::info!("ContextUpdate Terminate (TMGI {:02x?})", tmgi.mbs_service_id);
+        return SbiResponse::with_status(204);
+    }
+
+    // --- AMF path: produce an N2 MBS SM container for distribution setup.
+    if is_amf {
+        let exists = ctx
+            .read()
+            .map(|c| c.session_find_by_tmgi(&tmgi).is_some())
+            .unwrap_or(false);
+        if !exists {
+            return send_not_found(
+                "MBS session not found for ContextUpdate",
+                Some("CONTEXT_NOT_FOUND"),
+            );
+        }
+        let rsp = types::ContextUpdateRspData {
+            ll_ssm: None,
+            c_teid: None,
+            n2_mbs_sm_info: Some(types::N2MbsSmInfo {
+                ngap_ie_type: "MBS_DIS_SETUP_REQ".to_string(),
+                ngap_data: types::RefToBinaryData {
+                    content_id: "n2MbsSmInfo".to_string(),
+                },
+            }),
+        };
+        return SbiResponse::with_status(200)
+            .with_json_body(&rsp)
+            .unwrap_or_else(|_| SbiResponse::with_status(200));
+    }
+
+    // --- SMF multicast Start: allocate cTeid + llSsm, drive N4mb establishment.
+    let upf_addr = configured_mb_upf_ip();
+    let started = ctx
+        .read()
+        .ok()
+        .and_then(|c| c.session_context_start(&tmgi, upf_addr));
+    let session = match started {
+        Some(s) => s,
+        None => {
+            return send_not_found(
+                "MBS session not found for ContextUpdate",
+                Some("CONTEXT_NOT_FOUND"),
+            )
+        }
+    };
+    let Some(n4mb) = session.n4mb_session.as_ref() else {
+        return send_bad_request("N4mb session not initialized", Some("N4MB_SESSION_MISSING"));
+    };
+    let c_teid = n4mb.dl_teid;
+    let ll_ssm = types::Ssm {
+        source_ip_addr: types::IpAddr {
+            ipv4_addr: n4mb.ll_ssm_src.map(|a| a.to_string()),
+            ipv6_addr: None,
+        },
+        dest_ip_addr: types::IpAddr {
+            ipv4_addr: n4mb.ll_ssm_dst.map(|a| a.to_string()),
+            ipv6_addr: None,
+        },
+    };
+    let pool_id = session.id;
+
+    log::info!(
+        "ContextUpdate Start (TMGI {:02x?}): cTeid={c_teid:#010x}, llSsm dst={:?}",
+        tmgi.mbs_service_id,
+        n4mb.ll_ssm_dst
+    );
+
+    // Drive the real N4mb establishment in the background. [mbsmfd-02]
+    tokio::spawn(drive_n4mb_establishment(pool_id, session.clone()));
+
+    let rsp = types::ContextUpdateRspData {
+        ll_ssm: Some(ll_ssm),
+        c_teid: Some(c_teid),
+        n2_mbs_sm_info: None,
+    };
+    SbiResponse::with_status(200)
+        .with_json_body(&rsp)
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+/// Handle TMGI Allocate (TS 29.532 §5.2.2.2, POST /nmbsmf-tmgi/v1/tmgi).
+/// [mbsmfd-04] Allocates `tmgiNumber` fresh TMGIs and/or refreshes a supplied
+/// `tmgiList`, returning `TmgiAllocated` with one common `expirationTime`.
+async fn handle_tmgi_allocate(request: &SbiRequest) -> SbiResponse {
+    let body = match &request.http.content {
+        Some(content) => content,
+        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+    };
+
+    let req: types::TmgiAllocate = match serde_json::from_str(body) {
+        Ok(p) => p,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Invalid TmgiAllocate: {e}"),
+                Some("INVALID_MSG_FORMAT"),
+            )
+        }
+    };
+
+    let ctx = mbsmf_self();
+    let plmn = default_plmn();
+    let ttl = TMGI_DEFAULT_TTL_SECS;
+
+    let context = match ctx.read() {
+        Ok(c) => c,
+        Err(_) => return send_bad_request("Context unavailable", None),
+    };
+
+    let mut allocated: Vec<Tmgi> = Vec::new();
+    let mut expiry = 0u64;
+
+    // Refresh any supplied TMGIs (TS 29.532 §5.2.2.2).
+    if let Some(refresh) = &req.tmgi_list {
+        let ctmgis: Vec<Tmgi> = refresh.iter().map(|t| context_tmgi_from(Some(t))).collect();
+        expiry = context.tmgi_refresh(&ctmgis, ttl);
+        allocated.extend(ctmgis);
+    }
+    // Allocate the requested number of fresh TMGIs.
+    if let Some(count) = req.tmgi_number.filter(|n| *n > 0) {
+        let (fresh, e) = context.tmgi_allocate(&plmn, count, ttl);
+        expiry = e;
+        allocated.extend(fresh);
+    }
+    drop(context);
+
+    if allocated.is_empty() {
+        return send_bad_request(
+            "TmgiAllocate requires tmgiNumber and/or tmgiList",
+            Some("MANDATORY_IE_MISSING"),
+        );
+    }
+
+    let spec_list: Vec<types::Tmgi> = allocated.iter().map(spec_tmgi_from).collect();
+    let rsp = types::TmgiAllocated {
+        tmgi_list: spec_list,
+        expiration_time: unix_to_rfc3339(expiry),
+        nid: None,
+    };
+    log::info!("TMGI Allocate: {} TMGI(s) (expiry={expiry})", allocated.len());
+    SbiResponse::with_status(200)
+        .with_json_body(&rsp)
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+/// Handle TMGI Deallocate (TS 29.532 §5.2.2.3, DELETE /nmbsmf-tmgi/v1/tmgi).
+/// [mbsmfd-04] A `tmgi-list` query param selects specific TMGIs; absent means
+/// deallocate all. Always returns 204 No Content.
+async fn handle_tmgi_deallocate(request: &SbiRequest) -> SbiResponse {
+    let ctx = mbsmf_self();
+
+    let freed = if let Some(raw) = request.http.get_param("tmgi-list") {
+        match serde_json::from_str::<Vec<types::Tmgi>>(raw) {
+            Ok(list) => {
+                let ctmgis: Vec<Tmgi> =
+                    list.iter().map(|t| context_tmgi_from(Some(t))).collect();
+                ctx.read().map(|c| c.tmgi_deallocate(&ctmgis)).unwrap_or(0)
+            }
+            Err(e) => {
+                return send_bad_request(
+                    &format!("Invalid tmgi-list query parameter: {e}"),
+                    Some("INVALID_QUERY_PARAM"),
+                )
+            }
+        }
+    } else {
+        ctx.read().map(|c| c.tmgi_deallocate_all()).unwrap_or(0)
+    };
+
+    log::info!("TMGI Deallocate: freed {freed} TMGI(s)");
+    SbiResponse::with_status(204)
 }
 
 /// Handle member join (TMGI group membership)
@@ -805,6 +1064,14 @@ async fn register_with_nrf(
             "scheme": "http",
             "nfServiceStatus": "REGISTERED",
             "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+        }, {
+            // Nmbsmf_TMGI service (Allocate/Deallocate). [mbsmfd-04]
+            "serviceInstanceId": format!("{}-nmbsmf-tmgi", nf_instance_id),
+            "serviceName": "nmbsmf-tmgi",
+            "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.1.0"}],
+            "scheme": "http",
+            "nfServiceStatus": "REGISTERED",
+            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
         }],
         "allowedNfTypes": ["AMF", "SMF", "NEF", "SCP"],
         "heartBeatTimer": 10
@@ -907,18 +1174,39 @@ mod tests {
 
     // ---- mbsmfd-01: N4mb PFCP establishment encoded via ogs-pfcp ----
 
+    /// Encode an N4mb establishment packet via the shared [`n4mb`] builder.
+    fn encode_establishment(
+        cp_addr: [u8; 4],
+        upf_addr: [u8; 4],
+        local_seid: u64,
+        dl_teid: u32,
+        pdr_id: u16,
+        far_id: u32,
+    ) -> Vec<u8> {
+        let params = n4mb::N4mbEstablishParams {
+            local_seid,
+            cp_addr,
+            upf_addr,
+            dl_teid,
+            pdr_id,
+            far_id,
+            mcast_transport_addr: [239, 1, 0, 1],
+            c_teid: dl_teid,
+        };
+        let req = n4mb::build_establishment_request(&params);
+        ogs_pfcp::message::build_message(
+            &ogs_pfcp::message::PfcpMessage::SessionEstablishmentRequest(req),
+            7,
+            Some(0),
+        )
+        .to_vec()
+    }
+
     #[test]
     fn test_n4mb_establishment_byte_vector() {
         let cp_addr = [127, 0, 0, 1];
         let upf_addr = [10, 0, 0, 7];
-        let local_seid = 0x0000_0000_0000_0100u64;
-        let dl_teid = 0x0BCA_0001u32;
-        let pdr_id = 1002u16;
-        let far_id = 2002u32;
-
-        let pkt = build_n4mb_pfcp_establishment(
-            local_seid, dl_teid, pdr_id, far_id, cp_addr, upf_addr,
-        );
+        let pkt = encode_establishment(cp_addr, upf_addr, 0x100, 0x0BCA_0001, 1002, 2002);
 
         // PFCP header: version=1 + S(seid) flag => 0x21, msg type 50.
         assert_eq!(pkt[0], 0x21, "version/SEID flag byte");
@@ -958,9 +1246,7 @@ mod tests {
         let pdr_id = 1002u16;
         let far_id = 2002u32;
 
-        let pkt = build_n4mb_pfcp_establishment(
-            local_seid, dl_teid, pdr_id, far_id, cp_addr, upf_addr,
-        );
+        let pkt = encode_establishment(cp_addr, upf_addr, local_seid, dl_teid, pdr_id, far_id);
 
         let mut buf = bytes::Bytes::copy_from_slice(&pkt);
         let (header, msg) = parse_message(&mut buf).expect("decode N4mb establishment");
@@ -991,7 +1277,8 @@ mod tests {
         assert_eq!(fteid.teid, dl_teid);
         assert_eq!(fteid.ipv4_addr, Some(upf_addr));
 
-        // FAR round-trips Apply-Action FORW + Destination=CORE.
+        // FAR round-trips Apply-Action FORW + Destination=ACCESS for DL
+        // multicast distribution toward NG-RAN (mbsmfd-09).
         assert_eq!(req.create_fars.len(), 1);
         let far = &req.create_fars[0];
         assert_eq!(far.far_id, far_id);
@@ -1002,7 +1289,7 @@ mod tests {
             .expect("forwarding parameters present");
         assert_eq!(
             fp.destination_interface,
-            ogs_pfcp::types::DestinationInterface::Core
+            ogs_pfcp::types::DestinationInterface::Access
         );
     }
 
@@ -1034,5 +1321,148 @@ mod tests {
         let found = ctx.session_find_by_tmgi(&resolve_tmgi).expect("resolved by TMGI");
         assert_eq!(found.id, created.id);
         assert_eq!(found.tmgi.mbs_service_id, [0x0A, 0x0B, 0x0C]);
+    }
+
+    // ---- mbsmfd-03/04/10: SBI router behaviour (against the global context) ----
+
+    /// Seed a session in the *global* context keyed by `tmgi`, returning its
+    /// `mbsServiceId` hex string for building an `MbsSessionId`.
+    fn seed_global_session(svc_id: [u8; 3]) -> String {
+        mbsmf_context_init(256);
+        let tmgi = Tmgi {
+            mbs_service_id: svc_id,
+            plmn_id: PlmnId {
+                mcc: "001".to_string(),
+                mnc: "01".to_string(),
+            },
+        };
+        let ctx = mbsmf_self();
+        let guard = ctx.read().unwrap();
+        guard
+            .session_add(tmgi, MbsSessionType::Multicast)
+            .expect("session added");
+        hex::encode(svc_id)
+    }
+
+    // mbsmfd-03: ContextUpdate SMF Start → 200 with cTeid + llSsm.
+    #[tokio::test]
+    async fn test_router_context_update_smf_start() {
+        let svc = seed_global_session([0xC0, 0x01, 0x01]);
+        let body = format!(
+            r#"{{"nfcInstanceId":"smf-x","mbsSessionId":{{"tmgi":{{"mbsServiceId":"{svc}","plmnId":{{"mcc":"001","mnc":"01"}}}}}},"requestedAction":"START"}}"#
+        );
+        let req = SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
+            .with_body(body, "application/json");
+        let rsp = mbsmf_sbi_request_handler(req).await;
+        assert_eq!(rsp.status, 200);
+        let parsed: types::ContextUpdateRspData =
+            serde_json::from_str(rsp.http.content.as_deref().unwrap()).unwrap();
+        assert!(parsed.c_teid.is_some(), "cTeid allocated");
+        let ssm = parsed.ll_ssm.expect("llSsm present");
+        assert!(ssm.dest_ip_addr.ipv4_addr.is_some(), "llSsm dest allocated");
+    }
+
+    // mbsmfd-03: ContextUpdate Terminate → 204; unknown session → 404.
+    #[tokio::test]
+    async fn test_router_context_update_terminate_and_unknown() {
+        let svc = seed_global_session([0xC0, 0x02, 0x02]);
+        // First Start so there is an N4mb context to release.
+        let start = format!(
+            r#"{{"nfcInstanceId":"smf-x","mbsSessionId":{{"tmgi":{{"mbsServiceId":"{svc}","plmnId":{{"mcc":"001","mnc":"01"}}}}}},"requestedAction":"START"}}"#
+        );
+        let _ = mbsmf_sbi_request_handler(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
+                .with_body(start, "application/json"),
+        )
+        .await;
+
+        let term = format!(
+            r#"{{"nfcInstanceId":"smf-x","mbsSessionId":{{"tmgi":{{"mbsServiceId":"{svc}","plmnId":{{"mcc":"001","mnc":"01"}}}}}},"requestedAction":"TERMINATE"}}"#
+        );
+        let rsp = mbsmf_sbi_request_handler(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
+                .with_body(term, "application/json"),
+        )
+        .await;
+        assert_eq!(rsp.status, 204, "Terminate releases → 204");
+
+        // An unknown TMGI is 404.
+        let unknown = r#"{"nfcInstanceId":"smf-x","mbsSessionId":{"tmgi":{"mbsServiceId":"eeeeee","plmnId":{"mcc":"001","mnc":"01"}}},"requestedAction":"START"}"#;
+        let rsp = mbsmf_sbi_request_handler(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
+                .with_body(unknown, "application/json"),
+        )
+        .await;
+        assert_eq!(rsp.status, 404);
+    }
+
+    // mbsmfd-03: ContextUpdate AMF path → 200 with an N2 MBS SM container.
+    #[tokio::test]
+    async fn test_router_context_update_amf_n2() {
+        let svc = seed_global_session([0xC0, 0x03, 0x03]);
+        let body = format!(
+            r#"{{"nfcInstanceId":"amf-x","mbsSessionId":{{"tmgi":{{"mbsServiceId":"{svc}","plmnId":{{"mcc":"001","mnc":"01"}}}}}},"ranNodeId":{{"gNbId":{{"bitLength":24,"gNBValue":"000001"}}}}}}"#
+        );
+        let rsp = mbsmf_sbi_request_handler(
+            SbiRequest::post("/nmbsmf-mbssession/v1/mbs-sessions/contexts/update")
+                .with_body(body, "application/json"),
+        )
+        .await;
+        assert_eq!(rsp.status, 200);
+        let parsed: types::ContextUpdateRspData =
+            serde_json::from_str(rsp.http.content.as_deref().unwrap()).unwrap();
+        assert!(parsed.n2_mbs_sm_info.is_some(), "N2 container produced");
+    }
+
+    // mbsmfd-04: TMGI Allocate → 200 + TmgiAllocated; Deallocate → 204.
+    #[tokio::test]
+    async fn test_router_tmgi_allocate_deallocate() {
+        mbsmf_context_init(256);
+        let rsp = mbsmf_sbi_request_handler(
+            SbiRequest::post("/nmbsmf-tmgi/v1/tmgi").with_body(r#"{"tmgiNumber":3}"#, "application/json"),
+        )
+        .await;
+        assert_eq!(rsp.status, 200);
+        let alloc: types::TmgiAllocated =
+            serde_json::from_str(rsp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(alloc.tmgi_list.len(), 3);
+        assert!(!alloc.expiration_time.is_empty());
+
+        // Deallocate exactly the three we got back → 204.
+        let list_json = serde_json::to_string(&alloc.tmgi_list).unwrap();
+        let rsp = mbsmf_sbi_request_handler(
+            SbiRequest::delete("/nmbsmf-tmgi/v1/tmgi").with_param("tmgi-list", list_json),
+        )
+        .await;
+        assert_eq!(rsp.status, 204);
+    }
+
+    // mbsmfd-10: only the spec resource set responds — `/members` is not exposed
+    // (404) while `/contexts/update` is a real route (400 on a missing body, not
+    // 404), with debug routes disabled.
+    #[tokio::test]
+    async fn test_router_only_spec_resources() {
+        std::env::remove_var("MBSMF_DEBUG_ROUTES");
+        mbsmf_context_init(256);
+
+        // Non-spec /members route is absent → 404.
+        let rsp = mbsmf_sbi_request_handler(SbiRequest::get(
+            "/nmbsmf-mbssession/v1/mbs-sessions/mbs-sess-1/members",
+        ))
+        .await;
+        assert_eq!(rsp.status, 404, "/members is not a spec resource");
+
+        // Spec /contexts/update route exists → 400 (bad/missing body), not 404.
+        let rsp = mbsmf_sbi_request_handler(SbiRequest::post(
+            "/nmbsmf-mbssession/v1/mbs-sessions/contexts/update",
+        ))
+        .await;
+        assert_eq!(rsp.status, 400, "/contexts/update exists (400, not 404)");
+    }
+
+    #[test]
+    fn test_debug_routes_disabled_by_default() {
+        std::env::remove_var("MBSMF_DEBUG_ROUTES");
+        assert!(!debug_routes_enabled());
     }
 }

@@ -171,6 +171,115 @@ pub fn apply_patch_data(patch: &PatchData, tacs: &mut Vec<u32>) -> PatchOutcome 
     }
 }
 
+// ---------------------------------------------------------------------------
+// mbsmfd-03: ContextUpdate service operation (TS 29.532 §5.3.2.5, §6.2.6.2.5/6)
+// ---------------------------------------------------------------------------
+
+/// ContextUpdateAction (TS 29.532 §6.2.6.3.3) — START or TERMINATE MBS data
+/// reception. Modelled `anyOf` (the spec allows an open string), so any
+/// unrecognized value decodes to [`ContextUpdateAction::Unknown`] rather than
+/// failing the request.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub enum ContextUpdateAction {
+    #[serde(rename = "START")]
+    Start,
+    #[serde(rename = "TERMINATE")]
+    Terminate,
+    #[serde(other)]
+    Unknown,
+}
+
+/// RefToBinaryData (TS 29.571) — a `contentId` referencing a multipart binary
+/// part (e.g. the NGAP container of an [`N2MbsSmInfo`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RefToBinaryData {
+    pub content_id: String,
+}
+
+/// N2MbsSmInfo (TS 29.532 §6.2.6.4) — the N2 (NGAP) MBS session-management
+/// container exchanged with the AMF for shared MBS distribution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct N2MbsSmInfo {
+    /// `NgapIeType` (e.g. `MBS_DIS_SETUP_REQ`).
+    pub ngap_ie_type: String,
+    pub ngap_data: RefToBinaryData,
+}
+
+/// ContextUpdateReqData (TS 29.532 §6.2.6.2.5) — the ContextUpdate request body.
+///
+/// `nfcInstanceId` + `mbsSessionId` are mandatory. The SMF path carries
+/// `requestedAction` (and optionally `dlTunnelInfo` for unicast individual
+/// delivery); the AMF path carries `ranNodeId` + `n2MbsSmInfo`. Unknown fields
+/// are ignored on decode.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUpdateReqData {
+    pub nfc_instance_id: String,
+    #[serde(default)]
+    pub mbs_session_id: MbsSessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub area_session_id: Option<serde_json::Value>,
+    #[serde(default)]
+    pub requested_action: Option<ContextUpdateAction>,
+    /// `dlTunnelInfo` (`Bytes`, base64): a SMF DL GTP-U F-TEID for unicast
+    /// individual MBS delivery; absent ⇒ multicast (the MB-SMF allocates a
+    /// `cTeid` + `llSsm`).
+    #[serde(default)]
+    pub dl_tunnel_info: Option<String>,
+    #[serde(default)]
+    pub n2_mbs_sm_info: Option<N2MbsSmInfo>,
+    #[serde(default)]
+    pub ran_node_id: Option<serde_json::Value>,
+    #[serde(default)]
+    pub leave_ind: Option<bool>,
+}
+
+/// ContextUpdateRspData (TS 29.532 §6.2.6.2.6) — the ContextUpdate response body.
+///
+/// On a multicast Start the MB-SMF returns the allocated `cTeid` (GTP-U common
+/// TEID, `Uint32`) + `llSsm` (lower-layer source-specific multicast address); on
+/// the AMF path it returns the `n2MbsSmInfo` container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUpdateRspData {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ll_ssm: Option<Ssm>,
+    /// `cTeid` is a `Uint32` per TS 29.532 (an integer, not a hex string).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub c_teid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub n2_mbs_sm_info: Option<N2MbsSmInfo>,
+}
+
+// ---------------------------------------------------------------------------
+// mbsmfd-04: Nmbsmf_TMGI service (TS 29.532 §5.2, TS29532_Nmbsmf_TMGI.yaml)
+// ---------------------------------------------------------------------------
+
+/// TmgiAllocate (TS 29.532 §6.x, `TS29532_Nmbsmf_TMGI.yaml`) — the Allocate
+/// request body: `tmgiNumber` new TMGIs to allocate and/or a `tmgiList` to
+/// refresh.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TmgiAllocate {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmgi_number: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmgi_list: Option<Vec<Tmgi>>,
+}
+
+/// TmgiAllocated (TS 29.532) — the Allocate 200 response: the allocated/refreshed
+/// `tmgiList` plus one common `expirationTime`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct TmgiAllocated {
+    pub tmgi_list: Vec<Tmgi>,
+    pub expiration_time: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nid: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,5 +414,104 @@ mod tests {
             other => panic!("expected ReducedArea, got {other:?}"),
         }
         assert_eq!(tacs, vec![1, 2, 3]);
+    }
+
+    // ---- mbsmfd-03: ContextUpdate serde ----
+
+    #[test]
+    fn test_context_update_req_smf_start() {
+        // SMF Start with no dlTunnelInfo => multicast (MB-SMF allocates).
+        let json = r#"{
+            "nfcInstanceId":"smf-1",
+            "mbsSessionId":{"tmgi":{"mbsServiceId":"010203","plmnId":{"mcc":"001","mnc":"01"}}},
+            "requestedAction":"START"
+        }"#;
+        let req: ContextUpdateReqData = serde_json::from_str(json).unwrap();
+        assert_eq!(req.nfc_instance_id, "smf-1");
+        assert_eq!(req.requested_action, Some(ContextUpdateAction::Start));
+        assert!(req.dl_tunnel_info.is_none());
+        assert!(req.ran_node_id.is_none());
+        assert_eq!(
+            req.mbs_session_id.tmgi.as_ref().map(|t| t.service_id_bytes()),
+            Some([0x01, 0x02, 0x03])
+        );
+    }
+
+    #[test]
+    fn test_context_update_req_amf_n2() {
+        // AMF request carries ranNodeId + n2MbsSmInfo.
+        let json = r#"{
+            "nfcInstanceId":"amf-1",
+            "mbsSessionId":{"tmgi":{"mbsServiceId":"0a0b0c","plmnId":{"mcc":"001","mnc":"01"}}},
+            "ranNodeId":{"gNbId":{"bitLength":24,"gNBValue":"000001"}},
+            "n2MbsSmInfo":{"ngapIeType":"MBS_DIS_SETUP_REQ","ngapData":{"contentId":"n2"}}
+        }"#;
+        let req: ContextUpdateReqData = serde_json::from_str(json).unwrap();
+        assert!(req.ran_node_id.is_some());
+        let n2 = req.n2_mbs_sm_info.unwrap();
+        assert_eq!(n2.ngap_ie_type, "MBS_DIS_SETUP_REQ");
+        assert_eq!(n2.ngap_data.content_id, "n2");
+    }
+
+    #[test]
+    fn test_context_update_action_unknown_is_lenient() {
+        let json = r#"{"nfcInstanceId":"x","mbsSessionId":{},"requestedAction":"FUTURE_OP"}"#;
+        let req: ContextUpdateReqData = serde_json::from_str(json).unwrap();
+        assert_eq!(req.requested_action, Some(ContextUpdateAction::Unknown));
+    }
+
+    #[test]
+    fn test_context_update_rsp_roundtrip() {
+        let rsp = ContextUpdateRspData {
+            ll_ssm: Some(Ssm {
+                source_ip_addr: IpAddr {
+                    ipv4_addr: Some("10.0.0.7".to_string()),
+                    ipv6_addr: None,
+                },
+                dest_ip_addr: IpAddr {
+                    ipv4_addr: Some("239.1.0.1".to_string()),
+                    ipv6_addr: None,
+                },
+            }),
+            c_teid: Some(0x0BCA_0001),
+            n2_mbs_sm_info: None,
+        };
+        let json = serde_json::to_string(&rsp).unwrap();
+        // cTeid serializes as an integer (Uint32), not a string.
+        assert!(json.contains(&format!("\"cTeid\":{}", 0x0BCA_0001u32)));
+        assert!(!json.contains("\"cTeid\":\""), "cTeid is an integer, not a string");
+        assert!(json.contains("\"llSsm\""));
+        let back: ContextUpdateRspData = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, rsp);
+    }
+
+    // ---- mbsmfd-04: Nmbsmf_TMGI serde ----
+
+    #[test]
+    fn test_tmgi_allocate_request_parse() {
+        let json = r#"{"tmgiNumber":3}"#;
+        let req: TmgiAllocate = serde_json::from_str(json).unwrap();
+        assert_eq!(req.tmgi_number, Some(3));
+        assert!(req.tmgi_list.is_none());
+    }
+
+    #[test]
+    fn test_tmgi_allocated_roundtrip() {
+        let rsp = TmgiAllocated {
+            tmgi_list: vec![Tmgi {
+                mbs_service_id: "000001".to_string(),
+                plmn_id: PlmnId {
+                    mcc: "001".to_string(),
+                    mnc: "01".to_string(),
+                },
+            }],
+            expiration_time: "2026-06-28T00:00:00Z".to_string(),
+            nid: None,
+        };
+        let json = serde_json::to_string(&rsp).unwrap();
+        assert!(json.contains("\"tmgiList\""));
+        assert!(json.contains("\"expirationTime\":\"2026-06-28T00:00:00Z\""));
+        let back: TmgiAllocated = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, rsp);
     }
 }
