@@ -1822,6 +1822,33 @@ fn build_smf_selection_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde
     serde_json::Value::Object(smf_sel)
 }
 
+/// Build the TS 29.571 §5.5.3 `Arp` JSON object.
+///
+/// All three members (`priorityLevel`, `preemptCap`, `preemptVuln`) are
+/// required by the schema; a strict OpenAPI-validating SMF rejects the
+/// DnnConfiguration when either pre-emption field is absent.
+///
+/// Mapping (mirrors the legacy `nudr_handler.rs:636-648`):
+/// - `pre_emption_capability == 1`   → `"MAY_PREEMPT"`, else `"NOT_PREEMPT"`
+/// - `pre_emption_vulnerability == 1` → `"PREEMPTABLE"`, else `"NOT_PREEMPTABLE"`
+fn arp_json(arp: &ogs_dbi::types::OgsArp) -> serde_json::Value {
+    let preempt_cap = if arp.pre_emption_capability == 1 {
+        "MAY_PREEMPT"
+    } else {
+        "NOT_PREEMPT"
+    };
+    let preempt_vuln = if arp.pre_emption_vulnerability == 1 {
+        "PREEMPTABLE"
+    } else {
+        "NOT_PREEMPTABLE"
+    };
+    serde_json::json!({
+        "priorityLevel": arp.priority_level,
+        "preemptCap": preempt_cap,
+        "preemptVuln": preempt_vuln,
+    })
+}
+
 fn build_sm_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Value {
     let mut sm_data_list = Vec::new();
     for slice in &data.slice {
@@ -1850,7 +1877,7 @@ fn build_sm_data(data: &ogs_dbi::types::OgsSubscriptionData) -> serde_json::Valu
                 dnn_configs.insert(dnn.clone(), serde_json::json!({
                     "pduSessionTypes": { "defaultSessionType": pdu_type, "allowedSessionTypes": [pdu_type] },
                     "sscModes": { "defaultSscMode": "SSC_MODE_1", "allowedSscModes": ["SSC_MODE_1"] },
-                    "5gQosProfile": { "5qi": sess.qos.index, "arp": { "priorityLevel": sess.qos.arp.priority_level } },
+                    "5gQosProfile": { "5qi": sess.qos.index, "arp": arp_json(&sess.qos.arp) },
                     "sessionAmbr": { "uplink": format_ambr(sess.ambr.uplink), "downlink": format_ambr(sess.ambr.downlink) }
                 }));
             }
@@ -2808,5 +2835,90 @@ udr:
         assert_eq!(resp.status, 404);
 
         udr.stop().await.expect("udr stops");
+    }
+
+    // ------------------------------------------------------------------
+    // udrd-01: arp_json / build_sm_data pre-emption fields
+    // ------------------------------------------------------------------
+
+    /// TS 29.571 §5.5.3 Arp schema requires priorityLevel + preemptCap +
+    /// preemptVuln.  Verify that build_sm_data emits all three and that
+    /// the pre-emption mappings are correct:
+    ///   pre_emption_capability == 1  → "MAY_PREEMPT"
+    ///   pre_emption_vulnerability == 0 → "NOT_PREEMPTABLE"
+    #[test]
+    fn test_build_sm_data_arp_all_three_fields() {
+        use ogs_dbi::types::{
+            OgsAmbr, OgsArp, OgsQos, OgsSession, OgsSliceData, OgsSNssai, OgsSubscriptionData,
+        };
+
+        let arp = OgsArp {
+            priority_level: 8,
+            pre_emption_capability: 1,
+            pre_emption_vulnerability: 0,
+        };
+        let sess = OgsSession {
+            name: Some("internet".to_string()),
+            session_type: 1, // IPV4
+            qos: OgsQos { index: 9, arp, ..Default::default() },
+            ambr: OgsAmbr { uplink: 1_000_000_000, downlink: 1_000_000_000 },
+            ..Default::default()
+        };
+        let slice = OgsSliceData {
+            s_nssai: OgsSNssai::new(1, None),
+            session: vec![sess],
+            ..Default::default()
+        };
+        let data = OgsSubscriptionData {
+            slice: vec![slice],
+            ..Default::default()
+        };
+
+        let result = build_sm_data(&data);
+
+        let arr = result.as_array().expect("sm-data is array");
+        assert_eq!(arr.len(), 1);
+        let arp_val = &arr[0]["dnnConfigurations"]["internet"]["5gQosProfile"]["arp"];
+
+        assert_eq!(arp_val["priorityLevel"], 8_u64,  "priorityLevel must be 8");
+        assert_eq!(arp_val["preemptCap"],  "MAY_PREEMPT",     "capability==1 → MAY_PREEMPT");
+        assert_eq!(arp_val["preemptVuln"], "NOT_PREEMPTABLE", "vulnerability==0 → NOT_PREEMPTABLE");
+    }
+
+    /// Complementary case: capability==0 / vulnerability==1 flips both strings.
+    #[test]
+    fn test_build_sm_data_arp_not_preempt_preemptable() {
+        use ogs_dbi::types::{
+            OgsAmbr, OgsArp, OgsQos, OgsSession, OgsSliceData, OgsSNssai, OgsSubscriptionData,
+        };
+
+        let arp = OgsArp {
+            priority_level: 1,
+            pre_emption_capability: 0,
+            pre_emption_vulnerability: 1,
+        };
+        let sess = OgsSession {
+            name: Some("ims".to_string()),
+            session_type: 3, // IPV4V6
+            qos: OgsQos { index: 5, arp, ..Default::default() },
+            ambr: OgsAmbr { uplink: 0, downlink: 0 },
+            ..Default::default()
+        };
+        let slice = OgsSliceData {
+            s_nssai: OgsSNssai::new(1, None),
+            session: vec![sess],
+            ..Default::default()
+        };
+        let data = OgsSubscriptionData {
+            slice: vec![slice],
+            ..Default::default()
+        };
+
+        let result = build_sm_data(&data);
+        let arr = result.as_array().unwrap();
+        let arp_val = &arr[0]["dnnConfigurations"]["ims"]["5gQosProfile"]["arp"];
+
+        assert_eq!(arp_val["preemptCap"],  "NOT_PREEMPT",  "capability==0 → NOT_PREEMPT");
+        assert_eq!(arp_val["preemptVuln"], "PREEMPTABLE",  "vulnerability==1 → PREEMPTABLE");
     }
 }
