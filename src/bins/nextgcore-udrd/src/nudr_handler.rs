@@ -1,8 +1,15 @@
-//! UDR NUDR Handler Functions
+//! UDR NUDR Handler Functions — NON-SERVING LEGACY PATH (udrd-09)
 //!
-//! Port of src/udr/nudr-handler.c - Handler functions for NUDR DR service
+//! **This module produces no wire responses.** It is a ported C implementation
+//! (`src/udr/nudr-handler.c`) that diverges from the live SBI builders in
+//! `main.rs` and is never reached from `udr_sbi_request_handler`.  It is
+//! retained as a crate-internal (non-public) module only because `udr_sm`
+//! still references its symbols; it will be deleted once those references are
+//! removed.
 //!
-//! These handlers process requests from UDM and PCF for:
+//! Do NOT add new logic here — extend the live builders in `main.rs` instead.
+//!
+//! Original port handled requests from UDM and PCF for:
 //! - Authentication subscription data
 //! - Context data (AMF/SMF registrations)
 //! - Provisioned data (AM data, SMF selection, SM data)
