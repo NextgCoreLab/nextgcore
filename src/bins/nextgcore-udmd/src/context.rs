@@ -257,6 +257,15 @@ pub struct UdmSdmSubscription {
     pub data_change_callback_uri: Option<String>,
     /// Parent UDM UE ID
     pub udm_ue_id: u64,
+    // udmd-07: additional fields for correct persistence and unsubscribe
+    /// SUPI this subscription is for
+    pub supi: String,
+    /// NF instance ID of the subscriber
+    pub nf_instance_id: Option<String>,
+    /// Callback reference URI for ModificationNotification
+    pub callback_reference: Option<String>,
+    /// Monitored resource URIs
+    pub monitored_resource_uris: Vec<String>,
 }
 
 impl UdmSdmSubscription {
@@ -266,6 +275,28 @@ impl UdmSdmSubscription {
             id: Uuid::new_v4().to_string(),
             data_change_callback_uri: None,
             udm_ue_id,
+            supi: String::new(),
+            nf_instance_id: None,
+            callback_reference: None,
+            monitored_resource_uris: Vec::new(),
+        }
+    }
+
+    /// Create a subscription for a known SUPI (udmd-07).
+    pub fn for_supi(
+        supi: impl Into<String>,
+        nf_instance_id: Option<String>,
+        callback_reference: Option<String>,
+        monitored_resource_uris: Vec<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            data_change_callback_uri: callback_reference.clone(),
+            udm_ue_id: 0,
+            supi: supi.into(),
+            nf_instance_id,
+            callback_reference,
+            monitored_resource_uris,
         }
     }
 }
@@ -402,6 +433,9 @@ pub struct UdmContext {
     max_num_of_sdm_subscriptions: usize,
     /// Context initialized flag
     initialized: AtomicBool,
+    /// udmd-11: whether the null-scheme SUCI is accepted.
+    /// Default true preserves matched-sim behaviour; operator can disable via config.
+    allow_null_scheme: AtomicBool,
 }
 
 impl UdmContext {
@@ -420,6 +454,8 @@ impl UdmContext {
             max_num_of_sess: 0,
             max_num_of_sdm_subscriptions: 0,
             initialized: AtomicBool::new(false),
+            // Default true: accept null-scheme SUCIs (matched-sim uses them).
+            allow_null_scheme: AtomicBool::new(true),
         }
     }
 
@@ -460,6 +496,43 @@ impl UdmContext {
         self.initialized.load(Ordering::SeqCst)
     }
 
+    // udmd-11: null-scheme SUCI gating ----------------------------------------
+
+    /// Allow or deny the null-scheme SUCI (TS 33.501 §6.12.2).
+    /// Default is `true` so the matched-sim still works out-of-the-box.
+    pub fn set_allow_null_scheme(&self, allow: bool) {
+        self.allow_null_scheme.store(allow, Ordering::SeqCst);
+    }
+
+    /// Returns `true` when the null-scheme SUCI is accepted.
+    pub fn get_allow_null_scheme(&self) -> bool {
+        self.allow_null_scheme.load(Ordering::SeqCst)
+    }
+
+    // udmd-07: SDM subscription direct insert ----------------------------------
+
+    /// Store a pre-built SDM subscription (udmd-07).
+    /// Returns `true` on success; `false` when the subscription limit is reached.
+    pub fn sdm_subscription_insert(&self, sub: UdmSdmSubscription) -> bool {
+        let mut sdm_list = match self.sdm_subscription_list.write() {
+            Ok(l) => l,
+            Err(_) => return false,
+        };
+        if sdm_list.len() >= self.max_num_of_sdm_subscriptions
+            && self.max_num_of_sdm_subscriptions > 0
+        {
+            log::error!(
+                "Maximum number of SDM subscriptions [{}] reached",
+                self.max_num_of_sdm_subscriptions
+            );
+            return false;
+        }
+        let id = sub.id.clone();
+        sdm_list.insert(id.clone(), sub);
+        log::debug!("SDM subscription inserted (id={id})");
+        true
+    }
+
     /// Provision a home network private key for SUCI deconcealment.
     pub fn hnet_key_add(&self, key_id: u8, scheme: u8, key: Vec<u8>) {
         if let Ok(mut keys) = self.hnet_keys.write() {
@@ -475,6 +548,40 @@ impl UdmContext {
     /// - Profile B (2): ECIES P-256 deconcealment with the provisioned key.
     /// - `imsi-...` strings pass through unchanged.
     pub fn deconceal_suci(&self, suci_or_supi: &str) -> Option<String> {
+        // imsi-prefix passthrough always allowed (not a concealed SUCI)
+        if suci_or_supi.starts_with("imsi-") {
+            return Some(suci_or_supi.to_string());
+        }
+        // Null scheme: gate behind allow_null_scheme (udmd-11).
+        if suci_or_supi.starts_with("suci-") {
+            if let Some(parsed) = parse_suci(suci_or_supi) {
+                if parsed.protection_scheme == PROTECTION_SCHEME_NULL {
+                    if !self.allow_null_scheme.load(Ordering::SeqCst) {
+                        log::warn!(
+                            "[{suci_or_supi}] Null-scheme SUCI rejected (allow_null_scheme=false)"
+                        );
+                        return None;
+                    }
+                    // Validate routing indicator: 1–4 decimal digits (TS 23.003 §2.2B).
+                    // Parts: suci-<type>-<mcc>-<mnc>-<routingInd>-<scheme>-<keyId>-<output>
+                    let parts: Vec<&str> = suci_or_supi.split('-').collect();
+                    if parts.len() == 8 {
+                        let ri = parts[4];
+                        if !ri.is_empty()
+                            && ri != "0000"
+                            && !(!ri.is_empty()
+                                && ri.len() <= 4
+                                && ri.bytes().all(|b| b.is_ascii_digit()))
+                        {
+                            log::warn!(
+                                "[{suci_or_supi}] Invalid routing indicator '{ri}'"
+                            );
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
         // Null scheme / imsi passthrough require no key material
         if let Some(supi) = supi_from_suci(suci_or_supi) {
             return Some(supi);
@@ -1039,6 +1146,48 @@ mod tests {
 
         assert!(parse_suci("imsi-001010000000001").is_none());
         assert!(parse_suci("suci-0-001-01-0000-0-0").is_none()); // too few parts
+    }
+
+    // udmd-11: null-scheme SUCI gating -----------------------------------------
+
+    #[test]
+    fn test_null_scheme_gating() {
+        let mut ctx = UdmContext::new();
+        ctx.init(100, 200);
+
+        // Default: allow_null_scheme=true → null-scheme accepted
+        assert!(
+            ctx.deconceal_suci("suci-0-001-01-0000-0-0-0000000001").is_some(),
+            "null scheme must be accepted when allow_null_scheme=true (default)"
+        );
+
+        // Disable null scheme → rejected
+        ctx.set_allow_null_scheme(false);
+        assert!(
+            ctx.deconceal_suci("suci-0-001-01-0000-0-0-0000000001").is_none(),
+            "null scheme must be rejected when allow_null_scheme=false"
+        );
+
+        // Profile A/B unaffected by the flag (require key material, fail with no key)
+        assert!(
+            ctx.deconceal_suci("suci-0-001-01-0000-1-1-deadbeef").is_none(),
+            "Profile A without key must still be rejected (no key provisioned)"
+        );
+
+        // Re-enable → accepted again
+        ctx.set_allow_null_scheme(true);
+        assert!(
+            ctx.deconceal_suci("suci-0-001-01-0000-0-0-0000000001").is_some(),
+            "null scheme must be accepted after re-enabling"
+        );
+
+        // imsi- passthrough always works regardless of flag
+        ctx.set_allow_null_scheme(false);
+        assert_eq!(
+            ctx.deconceal_suci("imsi-001010000000001"),
+            Some("imsi-001010000000001".to_string()),
+            "imsi passthrough unaffected by allow_null_scheme"
+        );
     }
 
     #[test]

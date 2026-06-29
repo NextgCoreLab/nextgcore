@@ -168,6 +168,26 @@ impl UdrClient {
         }
     }
 
+    async fn amf_context_patch(&self, supi: &str, body: &Value) -> Result<SbiResponse, String> {
+        match self {
+            UdrClient::Live => {
+                crate::sbi_path::udm_nudr_dr_send_amf_context_patch(supi, body).await
+            }
+            #[cfg(test)]
+            UdrClient::Mock(m) => Ok(m.amf_context_patch(supi, body)),
+        }
+    }
+
+    async fn smf_context_get(&self, supi: &str, psi: &str) -> Result<SbiResponse, String> {
+        match self {
+            UdrClient::Live => {
+                crate::sbi_path::udm_nudr_dr_send_smf_context_get(supi, psi).await
+            }
+            #[cfg(test)]
+            UdrClient::Mock(m) => Ok(m.smf_context_get(supi, psi)),
+        }
+    }
+
     async fn send_dereg_notification(
         &self,
         callback_uri: &str,
@@ -287,7 +307,19 @@ fn udr_write_outcome(supi: &str, op: &str, result: Result<SbiResponse, String>) 
     }
 }
 
-/// Process an AMF 3GPP-access registration PUT (udmd-03/01/02).
+/// Compare two GUAMI objects for equality (udmd-05).
+///
+/// Considers amfId + plmnId.mcc + plmnId.mnc. Missing fields never match.
+fn guami_matches(a: &Value, b: &Value) -> bool {
+    a.get("amfId").and_then(|x| x.as_str())
+        == b.get("amfId").and_then(|x| x.as_str())
+        && a.pointer("/plmnId/mcc").and_then(|x| x.as_str())
+            == b.pointer("/plmnId/mcc").and_then(|x| x.as_str())
+        && a.pointer("/plmnId/mnc").and_then(|x| x.as_str())
+            == b.pointer("/plmnId/mnc").and_then(|x| x.as_str())
+}
+
+/// Process an AMF 3GPP-access registration PUT (udmd-03/01/02/06).
 pub async fn process_amf_registration(supi: &str, body: &Value, client: &UdrClient) -> SbiResponse {
     // udmd-03: reject payloads missing any mandatory IE.
     if let Err(problem) = validate_amf_3gpp_registration(body) {
@@ -297,6 +329,8 @@ pub async fn process_amf_registration(supi: &str, body: &Value, client: &UdrClie
 
     // udmd-02: read the prior registration before overwriting.
     let prior = read_prior_amf_registration(supi, client).await;
+    // udmd-06: remember whether a prior registration existed for status-code choice.
+    let is_update = prior.is_some();
 
     // udmd-01: persist the validated registration to UDR.
     if let Some(resp) = udr_write_outcome(
@@ -315,21 +349,96 @@ pub async fn process_amf_registration(supi: &str, body: &Value, client: &UdrClie
     // Local cache (UDR is the system of record).
     cache_amf_registration(supi, body);
 
-    SbiResponse::with_status(201)
-        .with_header(
-            "Location",
-            format!("/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access"),
-        )
+    // udmd-06: 201 on create, 200 on update.
+    let status = if is_update { 200 } else { 201 };
+    let mut resp = SbiResponse::with_status(status)
         .with_json_body(&json!({
             "amfInstanceId": body.get("amfInstanceId"),
             "deregCallbackUri": body.get("deregCallbackUri"),
             "guami": body.get("guami"),
             "ratType": body.get("ratType"),
         }))
-        .unwrap_or_else(|_| SbiResponse::with_status(201))
+        .unwrap_or_else(|_| SbiResponse::with_status(status));
+    if status == 201 {
+        resp = resp.with_header(
+            "Location",
+            format!("/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access"),
+        );
+    }
+    resp
 }
 
-/// Process an SMF registration PUT (udmd-03/01).
+/// Process a PATCH to the AMF 3GPP-access registration (udmd-05).
+///
+/// Validates that the GUAMI in the PATCH body matches the stored registration
+/// (ownership check, TS 29.503 §5.3.2.4); applies the update to UDR on match.
+pub async fn process_amf_registration_update(
+    supi: &str,
+    body: &Value,
+    client: &UdrClient,
+) -> SbiResponse {
+    // Read the stored registration.
+    let stored = match client.amf_context_get(supi).await {
+        Ok(resp) if resp.is_success() => {
+            match resp
+                .http
+                .content
+                .as_deref()
+                .and_then(|b| serde_json::from_str::<Value>(b).ok())
+            {
+                Some(v) => v,
+                None => {
+                    log::error!("[{supi}] UDR AMF context GET returned unparseable body");
+                    return ogs_sbi::server::send_service_unavailable("UDR response invalid");
+                }
+            }
+        }
+        Ok(resp) if resp.status == 404 => {
+            return ProblemDetails {
+                status: 404,
+                cause: "NOT_FOUND".to_string(),
+                detail: "No AMF registration found for this SUPI".to_string(),
+            }
+            .into_response();
+        }
+        Ok(resp) => {
+            log::error!("[{supi}] UDR AMF context GET returned {}", resp.status);
+            return ogs_sbi::server::send_service_unavailable("UDR context GET failed");
+        }
+        Err(e) => {
+            log::warn!("[{supi}] UDR AMF context GET failed: {e} (no prior stored)");
+            return ogs_sbi::server::send_service_unavailable("UDR unavailable");
+        }
+    };
+
+    // GUAMI ownership check (TS 29.503 §5.3.2.4).
+    if let (Some(stored_guami), Some(req_guami)) =
+        (stored.get("guami"), body.get("guami"))
+    {
+        if !guami_matches(stored_guami, req_guami) {
+            log::warn!("[{supi}] PATCH rejected: GUAMI mismatch");
+            return ProblemDetails {
+                status: 403,
+                cause: "INVALID_GUAMI".to_string(),
+                detail: "GUAMI in PATCH body does not match stored registration".to_string(),
+            }
+            .into_response();
+        }
+    }
+
+    // Apply the PATCH to UDR.
+    if let Some(err_resp) = udr_write_outcome(
+        supi,
+        "AMF context PATCH",
+        client.amf_context_patch(supi, body).await,
+    ) {
+        return err_resp;
+    }
+
+    SbiResponse::with_status(204)
+}
+
+/// Process an SMF registration PUT (udmd-03/01/06).
 pub async fn process_smf_registration(
     supi: &str,
     pdu_session_id: &str,
@@ -342,6 +451,12 @@ pub async fn process_smf_registration(
         return problem.into_response();
     }
 
+    // udmd-06: check whether a prior registration exists.
+    let is_update = matches!(
+        client.smf_context_get(supi, pdu_session_id).await,
+        Ok(resp) if resp.is_success()
+    );
+
     // udmd-01: persist the per-PDU-session registration to UDR.
     if let Some(resp) = udr_write_outcome(
         supi,
@@ -351,18 +466,23 @@ pub async fn process_smf_registration(
         return resp;
     }
 
-    SbiResponse::with_status(201)
-        .with_header(
-            "Location",
-            format!("/nudm-uecm/v1/{supi}/registrations/smf-registrations/{pdu_session_id}"),
-        )
+    // udmd-06: 201 on create, 200 on update.
+    let status = if is_update { 200 } else { 201 };
+    let mut resp = SbiResponse::with_status(status)
         .with_json_body(&json!({
             "smfInstanceId": body.get("smfInstanceId"),
             "pduSessionId": body.get("pduSessionId"),
             "singleNssai": body.get("singleNssai"),
             "dnn": body.get("dnn"),
         }))
-        .unwrap_or_else(|_| SbiResponse::with_status(201))
+        .unwrap_or_else(|_| SbiResponse::with_status(status));
+    if status == 201 {
+        resp = resp.with_header(
+            "Location",
+            format!("/nudm-uecm/v1/{supi}/registrations/smf-registrations/{pdu_session_id}"),
+        );
+    }
+    resp
 }
 
 /// Process an AMF deregistration DELETE (udmd-01): purge UDR context-data, then
@@ -412,6 +532,14 @@ pub enum UdrCall {
         supi: String,
         body: Value,
     },
+    AmfPatch {
+        supi: String,
+        body: Value,
+    },
+    SmfGet {
+        supi: String,
+        psi: String,
+    },
     SmfPut {
         supi: String,
         psi: String,
@@ -433,7 +561,9 @@ pub enum UdrCall {
 #[cfg(test)]
 pub struct MockUdr {
     stored_amf: std::sync::Mutex<Option<Value>>,
+    stored_smf: std::sync::Mutex<std::collections::HashMap<String, Value>>,
     put_status: u16,
+    patch_status: u16,
     calls: std::sync::Mutex<Vec<UdrCall>>,
 }
 
@@ -442,7 +572,9 @@ impl MockUdr {
     fn new() -> Self {
         Self {
             stored_amf: std::sync::Mutex::new(None),
+            stored_smf: std::sync::Mutex::new(std::collections::HashMap::new()),
             put_status: 201,
+            patch_status: 204,
             calls: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -474,12 +606,36 @@ impl MockUdr {
         SbiResponse::with_status(self.put_status)
     }
 
+    fn amf_context_patch(&self, supi: &str, body: &Value) -> SbiResponse {
+        self.calls.lock().unwrap().push(UdrCall::AmfPatch {
+            supi: supi.to_string(),
+            body: body.clone(),
+        });
+        SbiResponse::with_status(self.patch_status)
+    }
+
+    fn smf_context_get(&self, supi: &str, psi: &str) -> SbiResponse {
+        self.calls.lock().unwrap().push(UdrCall::SmfGet {
+            supi: supi.to_string(),
+            psi: psi.to_string(),
+        });
+        let key = format!("{supi}:{psi}");
+        match self.stored_smf.lock().unwrap().get(&key).cloned() {
+            Some(v) => SbiResponse::with_status(200)
+                .with_json_body(&v)
+                .unwrap_or_else(|_| SbiResponse::with_status(200)),
+            None => SbiResponse::with_status(404),
+        }
+    }
+
     fn smf_context_put(&self, supi: &str, psi: &str, body: &Value) -> SbiResponse {
         self.calls.lock().unwrap().push(UdrCall::SmfPut {
             supi: supi.to_string(),
             psi: psi.to_string(),
             body: body.clone(),
         });
+        let key = format!("{supi}:{psi}");
+        self.stored_smf.lock().unwrap().insert(key, body.clone());
         SbiResponse::with_status(self.put_status)
     }
 
@@ -691,6 +847,108 @@ mod tests {
         );
     }
 
+    // ----- udmd-05 ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_amf_registration_update_wrong_guami_returns_403() {
+        let stored = json!({
+            "amfInstanceId": "amf-a-0001",
+            "deregCallbackUri": "http://amf-a.example.org/dereg",
+            "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "cafe00" },
+            "ratType": "NR"
+        });
+        let mock = Arc::new(MockUdr::with_prior(stored));
+        let client = UdrClient::Mock(mock.clone());
+
+        let wrong_guami = json!({
+            "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "deadff" },
+            "purgeFlag": true
+        });
+        let resp =
+            process_amf_registration_update("imsi-udmd05-0001", &wrong_guami, &client).await;
+        assert_eq!(resp.status, 403, "wrong GUAMI must be 403");
+        assert_eq!(
+            problem_cause(&resp).as_deref(),
+            Some("INVALID_GUAMI"),
+            "cause must be INVALID_GUAMI"
+        );
+        // No PATCH should have been sent to UDR
+        assert!(
+            !mock.calls().iter().any(|c| matches!(c, UdrCall::AmfPatch { .. })),
+            "UDR PATCH must not be issued when GUAMI mismatches"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_amf_registration_update_matching_guami_returns_204_and_patches_udr() {
+        let stored = json!({
+            "amfInstanceId": "amf-a-0001",
+            "deregCallbackUri": "http://amf-a.example.org/dereg",
+            "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "cafe00" },
+            "ratType": "NR"
+        });
+        let mock = Arc::new(MockUdr::with_prior(stored));
+        let client = UdrClient::Mock(mock.clone());
+
+        let patch = json!({
+            "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "cafe00" },
+            "purgeFlag": true
+        });
+        let resp =
+            process_amf_registration_update("imsi-udmd05-0002", &patch, &client).await;
+        assert_eq!(resp.status, 204, "matching GUAMI must be 204");
+        assert!(
+            mock.calls().iter().any(|c| matches!(c, UdrCall::AmfPatch { .. })),
+            "UDR PATCH must be issued when GUAMI matches"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_amf_registration_update_no_prior_returns_404() {
+        // Empty mock → no stored registration → 404
+        let mock = Arc::new(MockUdr::new());
+        let client = UdrClient::Mock(mock);
+        let patch = json!({ "guami": { "plmnId": { "mcc": "001", "mnc": "01" }, "amfId": "cafe00" } });
+        let resp = process_amf_registration_update("imsi-udmd05-0003", &patch, &client).await;
+        assert_eq!(resp.status, 404);
+    }
+
+    // ----- udmd-06 ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_amf_registration_first_put_201_second_put_200() {
+        crate::context::udm_context_init(1024, 4096);
+        let supi = "imsi-udmd06-0001";
+        let mock = Arc::new(MockUdr::new());
+        let client = UdrClient::Mock(mock.clone());
+
+        // First PUT → no prior → 201 + Location
+        let resp = process_amf_registration(supi, &valid_amf_body(), &client).await;
+        assert_eq!(resp.status, 201, "first PUT must be 201");
+        // set_header lowercases all header keys (HTTP/2 convention).
+        let loc = resp.http.headers.get("location").cloned().unwrap_or_default();
+        assert!(loc.contains(supi), "Location header must reference the SUPI");
+
+        // Second PUT → prior exists → 200
+        let resp = process_amf_registration(supi, &valid_amf_body(), &client).await;
+        assert_eq!(resp.status, 200, "second PUT must be 200");
+    }
+
+    #[tokio::test]
+    async fn test_smf_registration_first_put_201_second_put_200() {
+        let supi = "imsi-udmd06-0002";
+        let mock = Arc::new(MockUdr::new());
+        let client = UdrClient::Mock(mock.clone());
+
+        // First PUT → 201
+        let resp = process_smf_registration(supi, "5", &valid_smf_body(), &client).await;
+        assert_eq!(resp.status, 201, "first SMF PUT must be 201");
+
+        // Second PUT → prior stored → 200
+        let resp = process_smf_registration(supi, "5", &valid_smf_body(), &client).await;
+        assert_eq!(resp.status, 200, "second SMF PUT must be 200");
+    }
+
     // ----- udmd-02 ---------------------------------------------------------
 
     #[tokio::test]
@@ -710,12 +968,14 @@ mod tests {
         let client = UdrClient::Mock(mock.clone());
 
         // AMF-B registers over AMF-A -> a DeregistrationData POST to AMF-A.
+        // The UDR already holds AMF-A's registration, so this is an UPDATE → 200
+        // (TS 29.503 §5.3.2.2: resource exists → 200 OK, not 201 Created).
         let mut body_b = valid_amf_body();
         body_b["amfInstanceId"] = json!("amf-b-0002");
         body_b["deregCallbackUri"] =
             json!("http://amf-b.example.org:7777/namf-callback/v1/imsi-x/dereg-notify");
         let resp = process_amf_registration(supi, &body_b, &client).await;
-        assert_eq!(resp.status, 201);
+        assert_eq!(resp.status, 200, "re-registration over existing AMF-A must be 200 (update)");
 
         let calls = mock.calls();
         assert_eq!(deregister_count(&calls), 1, "exactly one dereg notification");
@@ -731,8 +991,9 @@ mod tests {
         );
 
         // Re-register with the SAME AMF-B id -> suppressed, no new notification.
+        // Still an update (prior = AMF-B now stored) → 200.
         let resp = process_amf_registration(supi, &body_b, &client).await;
-        assert_eq!(resp.status, 201);
+        assert_eq!(resp.status, 200, "same-AMF re-registration still updates the resource → 200");
         assert_eq!(
             deregister_count(&mock.calls()),
             1,

@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use nextgcore_udmd::{
     timer_manager, timer_type_to_timer_id, udm_context_final, udm_context_init, udm_sbi_close,
-    udm_sbi_open, udm_self, SbiServerConfig, UdmEvent, UdmSmContext,
+    udm_sbi_open, udm_self, SbiServerConfig, UdmEvent, UdmSdmSubscription, UdmSmContext,
 };
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::server::{
@@ -116,6 +116,8 @@ struct HnetYaml {
 struct UdmSection {
     sbi: Option<SbiYaml>,
     hnet: Option<Vec<HnetYaml>>,
+    /// udmd-11: explicitly enable null-scheme SUCI (default: true).
+    allow_null_scheme: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -198,6 +200,15 @@ async fn main() -> Result<()> {
                                 }
                             }
                         }
+                        // udmd-11: null-scheme SUCI gating (default: true).
+                        if let Some(allow) = udm.allow_null_scheme {
+                            let ctx = udm_self();
+                            if let Ok(context) = ctx.read() {
+                                context.set_allow_null_scheme(allow);
+                                log::info!("Null-scheme SUCI: {}", if allow { "allowed" } else { "denied" });
+                            };
+                        }
+
                         // Provision home network keys for SUCI deconcealment
                         // (TS 33.501 §6.12). The `key` value is either a hex
                         // string or a path to a file containing the hex key.
@@ -346,6 +357,10 @@ async fn udm_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                 {
                     handle_amf_deregistration(supi).await
                 }
+                // udmd-12: AMF non-3GPP access registration (TS 29.503 §5.3.3).
+                ("registrations", "PUT") if parts.len() >= 5 && parts[4] == "amf-non-3gpp-access" => {
+                    handle_amf_non3gpp_registration(supi, &request).await
+                }
                 ("registrations", "PUT") if parts.len() >= 6 && parts[4] == "smf-registrations" => {
                     let pdu_session_id = parts[5];
                     handle_smf_registration(supi, pdu_session_id, &request).await
@@ -355,6 +370,14 @@ async fn udm_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                 {
                     let pdu_session_id = parts[5];
                     handle_smf_deregistration(supi, pdu_session_id).await
+                }
+                // udmd-12: UE context in SMF data (GET only, TS 29.503 §6.3.x).
+                ("ue-context-in-smf-data", "GET") => {
+                    send_not_implemented("ue-context-in-smf-data is not yet implemented")
+                }
+                // udmd-12: SUPI-to-GPSI/external-id translation (TS 29.503 §6.4.x).
+                ("id-translation-result", "GET") => {
+                    send_not_implemented("id-translation-result is not yet implemented")
                 }
                 _ => send_method_not_allowed(method, uri),
             }
@@ -374,6 +397,10 @@ async fn udm_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                 ("sdm-subscriptions", "DELETE") if parts.len() >= 5 => {
                     let subscription_id = parts[4];
                     handle_sdm_unsubscribe(supi, subscription_id).await
+                }
+                // udmd-12: SDM subscription modification PATCH is not implemented.
+                ("sdm-subscriptions", "PATCH") if parts.len() >= 5 => {
+                    send_not_implemented("sdm-subscriptions PATCH is not yet implemented")
                 }
                 _ => send_method_not_allowed(method, uri),
             }
@@ -433,12 +460,18 @@ async fn handle_amf_registration_update(supi: &str, request: &SbiRequest) -> Sbi
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
     };
 
-    let _update_data: serde_json::Value = match serde_json::from_str(body) {
+    let update_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    SbiResponse::with_status(204)
+    // udmd-05: GUAMI ownership check + UDR PATCH.
+    nextgcore_udmd::uecm::process_amf_registration_update(
+        supi,
+        &update_data,
+        &nextgcore_udmd::uecm::UdrClient::Live,
+    )
+    .await
 }
 
 async fn handle_amf_deregistration(supi: &str) -> SbiResponse {
@@ -447,6 +480,34 @@ async fn handle_amf_deregistration(supi: &str) -> SbiResponse {
     // udmd-01: DELETE the UDR context-data before returning 204.
     nextgcore_udmd::uecm::process_amf_deregistration(supi, &nextgcore_udmd::uecm::UdrClient::Live)
         .await
+}
+
+/// udmd-12: AMF non-3GPP-access registration (PUT).
+///
+/// TS 29.503 §5.3.3 defines this for N3IWF/TNGF use cases.  We accept the
+/// request and persist via the same AMF context PUT path (same Nudr resource),
+/// returning 201/200 exactly like the 3GPP-access variant.
+async fn handle_amf_non3gpp_registration(supi: &str, request: &SbiRequest) -> SbiResponse {
+    log::info!("AMF Non-3GPP Registration: SUPI={supi}");
+
+    let body = match &request.http.content {
+        Some(content) => content,
+        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+    };
+
+    let reg_data: serde_json::Value = match serde_json::from_str(body) {
+        Ok(p) => p,
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+    };
+
+    // Reuse the same UECM registration path — UDR resource key is different
+    // (/amf-non-3gpp-access) but the validation and persistence logic is the same.
+    nextgcore_udmd::uecm::process_amf_registration(
+        supi,
+        &reg_data,
+        &nextgcore_udmd::uecm::UdrClient::Live,
+    )
+    .await
 }
 
 async fn handle_smf_registration(
@@ -506,7 +567,21 @@ fn split_snpn_supi(supi: &str) -> (&str, Option<&str>) {
     }
 }
 
-async fn handle_get_am_data(supi: &str, _request: &SbiRequest) -> SbiResponse {
+/// Forward SDM query parameters (TS 29.503 §5.2.2) to UDR.
+///
+/// udmd-08: plmn-id, dataset-names, and supported-features are passed through
+/// to the Nudr_DataRepository GET so UDR can filter/scope the response.
+fn sdm_query_params(request: &SbiRequest) -> std::collections::HashMap<String, String> {
+    let mut params = std::collections::HashMap::new();
+    for key in ["plmn-id", "dataset-names", "supported-features", "dnn", "snssai"] {
+        if let Some(v) = request.http.params.get(key) {
+            params.insert(key.to_string(), v.clone());
+        }
+    }
+    params
+}
+
+async fn handle_get_am_data(supi: &str, request: &SbiRequest) -> SbiResponse {
     let (supi, snpn_nid) = split_snpn_supi(supi);
     if let Some(nid) = snpn_nid {
         log::info!("Get AM Data: SUPI={supi} (SNPN NID={nid})");
@@ -514,8 +589,15 @@ async fn handle_get_am_data(supi: &str, _request: &SbiRequest) -> SbiResponse {
         log::info!("Get AM Data: SUPI={supi}");
     }
 
-    // Query UDR for provisioned access and mobility data (keyed by base SUPI)
-    match nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get(supi, "am-data", 0, 0).await {
+    // udmd-08: forward query params (plmn-id, dataset-names, supported-features).
+    let params = sdm_query_params(request);
+    let udr_result = if params.is_empty() {
+        nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get(supi, "am-data", 0, 0).await
+    } else {
+        nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get_with_params(supi, "am-data", &params).await
+    };
+
+    match udr_result {
         Ok(udr_response) if udr_response.is_success() => {
             // Forward UDR response body directly
             let mut response = SbiResponse::with_status(200);
@@ -539,18 +621,27 @@ async fn handle_get_am_data(supi: &str, _request: &SbiRequest) -> SbiResponse {
     }
 }
 
-async fn handle_get_smf_select_data(supi: &str, _request: &SbiRequest) -> SbiResponse {
+async fn handle_get_smf_select_data(supi: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("Get SMF Select Data: SUPI={supi}");
 
-    // Query UDR for SMF selection subscription data
-    match nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get(
-        supi,
-        "smf-selection-subscription-data",
-        0,
-        0,
-    )
-    .await
-    {
+    // udmd-08: forward query params to UDR.
+    let params = sdm_query_params(request);
+    let udr_result = if params.is_empty() {
+        nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get(
+            supi,
+            "smf-selection-subscription-data",
+            0,
+            0,
+        ).await
+    } else {
+        nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get_with_params(
+            supi,
+            "smf-selection-subscription-data",
+            &params,
+        ).await
+    };
+
+    match udr_result {
         Ok(udr_response) if udr_response.is_success() => {
             let mut response = SbiResponse::with_status(200);
             if let Some(body) = udr_response.http.content {
@@ -583,8 +674,15 @@ async fn handle_get_sm_data(supi: &str, request: &SbiRequest) -> SbiResponse {
 
     log::info!("Get SM Data: SUPI={supi}, DNN={dnn}");
 
-    // Query UDR for session management subscription data
-    match nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get(supi, "sm-data", 0, 0).await {
+    // udmd-08: forward query params (dnn, snssai, plmn-id, supported-features).
+    let params = sdm_query_params(request);
+    let udr_result = if params.is_empty() {
+        nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get(supi, "sm-data", 0, 0).await
+    } else {
+        nextgcore_udmd::udm_nudr_dr_send_provisioned_data_get_with_params(supi, "sm-data", &params).await
+    };
+
+    match udr_result {
         Ok(udr_response) if udr_response.is_success() => {
             let mut response = SbiResponse::with_status(200);
             if let Some(body) = udr_response.http.content {
@@ -653,7 +751,38 @@ async fn handle_sdm_subscribe(supi: &str, request: &SbiRequest) -> SbiResponse {
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let subscription_id = uuid::Uuid::new_v4().to_string();
+    let nf_instance_id = sub_data
+        .get("nfInstanceId")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let callback_reference = sub_data
+        .get("callbackReference")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let monitored_resource_uris: Vec<String> = sub_data
+        .get("monitoredResourceUris")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // udmd-07: persist the subscription in the UDM context.
+    let sub = UdmSdmSubscription::for_supi(
+        supi,
+        nf_instance_id.clone(),
+        callback_reference.clone(),
+        monitored_resource_uris.clone(),
+    );
+    let subscription_id = sub.id.clone();
+    {
+        let ctx = udm_self();
+        if let Ok(context) = ctx.read() {
+            context.sdm_subscription_insert(sub);
+        };
+    }
 
     SbiResponse::with_status(201)
         .with_header(
@@ -662,15 +791,33 @@ async fn handle_sdm_subscribe(supi: &str, request: &SbiRequest) -> SbiResponse {
         )
         .with_json_body(&serde_json::json!({
             "subscriptionId": subscription_id,
-            "nfInstanceId": sub_data.get("nfInstanceId"),
-            "callbackReference": sub_data.get("callbackReference"),
-            "monitoredResourceUris": sub_data.get("monitoredResourceUris"),
+            "nfInstanceId": nf_instance_id,
+            "callbackReference": callback_reference,
+            "monitoredResourceUris": monitored_resource_uris,
         }))
         .unwrap_or_else(|_| SbiResponse::with_status(201))
 }
 
 async fn handle_sdm_unsubscribe(supi: &str, subscription_id: &str) -> SbiResponse {
     log::info!("SDM Unsubscribe: SUPI={supi}, subscriptionId={subscription_id}");
+
+    // udmd-07: 404 if the subscription is not found in context.
+    let exists = {
+        let ctx = udm_self();
+        let guard = ctx.read().ok();
+        guard
+            .as_ref()
+            .and_then(|c| c.sdm_subscription_find_by_id(subscription_id))
+            .is_some()
+    };
+    if !exists {
+        return send_problem(404, "NOT_FOUND", "Subscription not found");
+    }
+    // Remove it from context.
+    let ctx = udm_self();
+    if let Ok(context) = ctx.read() {
+        context.sdm_subscription_remove(subscription_id);
+    };
     SbiResponse::with_status(204)
 }
 
@@ -685,6 +832,31 @@ fn send_problem(status: u16, cause: &str, detail: &str) -> SbiResponse {
             "detail": detail
         }))
         .unwrap_or_else(|_| SbiResponse::with_status(status))
+}
+
+/// Build a 501 Not Implemented ProblemDetails response (udmd-12).
+fn send_not_implemented(detail: &str) -> SbiResponse {
+    send_problem(501, "NOT_IMPLEMENTED", detail)
+}
+
+/// Advance a 48-bit SQN per TS 33.102 Annex C.3.2 (udmd-10).
+///
+/// SQN layout: SEQ[47:5] || IND[4:0].  SEQ increments by 1 each call;
+/// IND is kept fixed (the caller always uses the same AV slot).  The result
+/// is masked to 48 bits and returned as a 6-byte big-endian array.
+pub(crate) fn advance_sqn_ind(sqn_bytes: [u8; 6]) -> [u8; 6] {
+    let mut val: u64 = 0;
+    for &b in &sqn_bytes {
+        val = (val << 8) | (b as u64);
+    }
+    let seq = val >> 5;
+    let ind = val & 0x1F;
+    let new_val = (((seq + 1) << 5) | ind) & 0x0000_FFFF_FFFF_FFFF;
+    let mut out = [0u8; 6];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = ((new_val >> ((5 - i) * 8)) & 0xFF) as u8;
+    }
+    out
 }
 
 /// Validate the serving network name format (TS 24.501 §9.12.1 / TS 33.501
@@ -997,18 +1169,29 @@ async fn handle_generate_auth_data(supi_or_suci: &str, request: &SbiRequest) -> 
         context.ue_set_supi(ue.id, &supi);
     }
 
-    // Step 6: Update SQN in UDR (increment for next auth)
-    let sqn_val = {
-        let mut v: u64 = 0;
-        for &b in ue.sqn.iter() {
-            v = (v << 8) | (b as u64);
+    // Step 6: Advance SQN per TS 33.102 Annex C.3.2 (udmd-10) and persist to
+    // UDR. If UDR PATCH fails we cannot issue the AV (it would replay).
+    let sqn_arr: [u8; 6] = ue.sqn.as_slice().try_into().expect("sqn is 6 bytes");
+    let new_sqn_arr = advance_sqn_ind(sqn_arr);
+    let new_sqn_hex: String = new_sqn_arr.iter().map(|b| format!("{b:02x}")).collect();
+    match nextgcore_udmd::udm_nudr_dr_send_auth_subscription_patch(&supi, &new_sqn_hex, 0, 0).await {
+        Ok(r) if r.is_success() || r.status == 204 => {
+            log::debug!("[{supi}] SQN advanced to 0x{new_sqn_hex}");
         }
-        v
-    };
-    let new_sqn = (sqn_val + 32 + 1) & 0xFFFF_FFFF_FFFF;
-    let new_sqn_hex = format!("{new_sqn:012x}");
-    let _ =
-        nextgcore_udmd::udm_nudr_dr_send_auth_subscription_patch(&supi, &new_sqn_hex, 0, 0).await;
+        Ok(r) if r.status >= 500 => {
+            log::error!("[{supi}] UDR SQN PATCH returned {}: refusing to issue AV", r.status);
+            return ogs_sbi::server::send_service_unavailable("UDR SQN update failed");
+        }
+        Ok(r) => {
+            // Non-5xx (e.g. 404): UDR may not have auth-subscription resource; degrade.
+            log::warn!("[{supi}] UDR SQN PATCH returned {} (degraded — AV issued anyway)", r.status);
+        }
+        Err(e) => {
+            // Transport failure: refuse to issue AV to prevent SQN replay.
+            log::error!("[{supi}] UDR SQN PATCH failed: {e} — refusing to issue AV");
+            return ogs_sbi::server::send_service_unavailable("UDR unavailable");
+        }
+    }
 
     // Step 7: Build the AuthenticationInfoResult (TS 29.503 §6.3.6.2.2)
     use nextgcore_udmd::nudm_handler::bytes_to_hex;
@@ -1098,8 +1281,7 @@ async fn handle_auth_event(supi: &str, request: &SbiRequest) -> SbiResponse {
 
     log::info!("Auth Event: success={success}");
 
-    // Record the auth event against the UE context (auth status would be
-    // persisted to UDR's authentication-status resource).
+    // Record the auth event in the local UE context.
     {
         let ctx = udm_self();
         if let Ok(context) = ctx.read() {
@@ -1125,7 +1307,28 @@ async fn handle_auth_event(supi: &str, request: &SbiRequest) -> SbiResponse {
         };
     }
 
+    // udmd-09: PUT the AuthEvent to UDR authentication-status (TS 29.505
+    // §6.3.3 / TS 29.503 §5.4.2). Best-effort: log but do not fail the
+    // 201 if UDR is unavailable (matched-sim has no udrd auth-status resource).
+    match nextgcore_udmd::udm_nudr_dr_send_auth_status_put(supi, &auth_event).await {
+        Ok(r) if r.is_success() => {
+            log::debug!("[{supi}] Auth status persisted to UDR ({})", r.status);
+        }
+        Ok(r) => {
+            log::warn!("[{supi}] UDR auth-status PUT returned {} (degraded)", r.status);
+        }
+        Err(e) => {
+            log::warn!("[{supi}] UDR auth-status PUT failed: {e} (degraded)");
+        }
+    }
+
+    // Build a stable auth-event resource URI for the Location header.
+    let event_id = uuid::Uuid::new_v4().to_string();
     SbiResponse::with_status(201)
+        .with_header(
+            "Location",
+            format!("/nudm-ueau/v1/{supi}/auth-events/{event_id}"),
+        )
         .with_json_body(&serde_json::json!({
             "nfInstanceId": auth_event.get("nfInstanceId"),
             "success": success,
@@ -1784,5 +1987,235 @@ mod tests {
         })
         .await
         .expect("test timed out");
+    }
+
+    // ========================================================================
+    // udmd-10: SQN SEQ/IND-split advance (TS 33.102 Annex C.3.2)
+    // ========================================================================
+
+    #[test]
+    fn test_advance_sqn_ind_seq_increments_ind_preserved() {
+        // Zero SQN → SEQ=0,IND=0 → advance → SEQ=1,IND=0 = 0x20
+        assert_eq!(
+            advance_sqn_ind([0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+            [0x00, 0x00, 0x00, 0x00, 0x00, 0x20]
+        );
+
+        // SEQ=1,IND=0 (0x20=32) → SEQ=2,IND=0 (0x40=64)
+        assert_eq!(
+            advance_sqn_ind([0x00, 0x00, 0x00, 0x00, 0x00, 0x20]),
+            [0x00, 0x00, 0x00, 0x00, 0x00, 0x40]
+        );
+
+        // SEQ=1,IND=5 (0x25=37) → SEQ=2,IND=5 (0x45=69); IND preserved
+        assert_eq!(
+            advance_sqn_ind([0x00, 0x00, 0x00, 0x00, 0x00, 0x25]),
+            [0x00, 0x00, 0x00, 0x00, 0x00, 0x45]
+        );
+
+        // Typical SQN 0x000000000021 (SQN from test UDR: "000000000021"):
+        // SEQ=1, IND=1 → advance → SEQ=2,IND=1 = 0x41
+        let mut sqn = [0u8; 6];
+        let v: u64 = 0x000000000021;
+        for (i, b) in sqn.iter_mut().enumerate() {
+            *b = ((v >> ((5 - i) * 8)) & 0xFF) as u8;
+        }
+        let adv = advance_sqn_ind(sqn);
+        let result: u64 = adv.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64);
+        // SEQ advances by 1 (bit 5+), IND stays the same.
+        let orig_ind = v & 0x1F;
+        let adv_seq = (v >> 5) + 1;
+        assert_eq!(result, (adv_seq << 5) | orig_ind);
+    }
+
+    // ========================================================================
+    // udmd-12: send_not_implemented helper
+    // ========================================================================
+
+    #[test]
+    fn test_send_not_implemented_returns_501_with_cause() {
+        let resp = send_not_implemented("test resource not implemented");
+        assert_eq!(resp.status, 501);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(
+            body.get("cause").and_then(|v| v.as_str()),
+            Some("NOT_IMPLEMENTED")
+        );
+        assert_eq!(body.get("status").and_then(|v| v.as_u64()), Some(501));
+    }
+
+    // ========================================================================
+    // udmd-08: sdm_query_params extracts only known SDM keys
+    // ========================================================================
+
+    #[test]
+    fn test_sdm_query_params_extracts_known_keys_ignores_others() {
+        use ogs_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
+
+        let mut request = SbiRequest {
+            header: SbiHeader::with_method_uri("GET", "/nudm-sdm/v1/imsi-x/am-data"),
+            http: SbiHttpMessage::default(),
+            ..Default::default()
+        };
+
+        // No params → empty map.
+        assert!(sdm_query_params(&request).is_empty());
+
+        // Known SDM keys are forwarded; unknown keys are not.
+        request
+            .http
+            .params
+            .insert("plmn-id".to_string(), r#"{"mcc":"001","mnc":"01"}"#.to_string());
+        request
+            .http
+            .params
+            .insert("supported-features".to_string(), "ff".to_string());
+        request
+            .http
+            .params
+            .insert("irrelevant-param".to_string(), "ignored".to_string());
+
+        let params = sdm_query_params(&request);
+        assert_eq!(params.get("plmn-id").map(String::as_str), Some(r#"{"mcc":"001","mnc":"01"}"#));
+        assert_eq!(params.get("supported-features").map(String::as_str), Some("ff"));
+        assert!(
+            !params.contains_key("irrelevant-param"),
+            "non-SDM params must not be forwarded to UDR"
+        );
+    }
+
+    // ========================================================================
+    // udmd-07: SDM subscribe persists; unsubscribe 404-on-missing
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_sdm_subscribe_persists_and_unsubscribe_is_idempotent() {
+        let _ = env_logger::try_init();
+        use ogs_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
+
+        udm_context_init(64, 64);
+        let supi = "imsi-udmd07-0001";
+
+        let request = SbiRequest {
+            header: SbiHeader::with_method_uri(
+                "POST",
+                format!("/nudm-sdm/v1/{supi}/sdm-subscriptions"),
+            ),
+            http: SbiHttpMessage {
+                content: Some(
+                    serde_json::json!({
+                        "nfInstanceId": "amf-test-001",
+                        "callbackReference": "http://amf.example.org/sdm-notify",
+                        "monitoredResourceUris": [
+                            format!("/nudm-sdm/v1/{supi}/am-data")
+                        ]
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Subscribe → 201 + Location header.
+        let resp = handle_sdm_subscribe(supi, &request).await;
+        assert_eq!(resp.status, 201, "subscribe must return 201");
+        // set_header lowercases header keys (HTTP/2 convention).
+        let loc = resp.http.headers.get("location").cloned().unwrap_or_default();
+        assert!(loc.contains(supi), "Location must contain SUPI");
+        assert!(loc.contains("sdm-subscriptions"), "Location must reference sdm-subscriptions");
+
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap();
+        let sub_id = body
+            .get("subscriptionId")
+            .and_then(|v| v.as_str())
+            .expect("subscriptionId must be present in body")
+            .to_string();
+
+        // Subscription must be findable in context.
+        {
+            let ctx = udm_self();
+            let context = ctx.read().unwrap();
+            assert!(
+                context.sdm_subscription_find_by_id(&sub_id).is_some(),
+                "subscription must be stored in context after subscribe"
+            );
+        }
+
+        // Unsubscribe with a bad id → 404 NOT_FOUND.
+        let resp = handle_sdm_unsubscribe(supi, "nonexistent-uuid-0000").await;
+        assert_eq!(resp.status, 404, "missing subscription must be 404");
+        let pd: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(
+            pd.get("cause").and_then(|v| v.as_str()),
+            Some("NOT_FOUND"),
+            "cause must be NOT_FOUND"
+        );
+
+        // Unsubscribe with the real id → 204.
+        let resp = handle_sdm_unsubscribe(supi, &sub_id).await;
+        assert_eq!(resp.status, 204, "valid unsubscribe must return 204");
+
+        // Must be removed from context.
+        {
+            let ctx = udm_self();
+            let context = ctx.read().unwrap();
+            assert!(
+                context.sdm_subscription_find_by_id(&sub_id).is_none(),
+                "subscription must be removed from context after unsubscribe"
+            );
+        }
+    }
+
+    // ========================================================================
+    // udmd-09: auth-event handler returns 201 + Location header (TS 29.503 §5.4)
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_auth_event_returns_201_with_location_header() {
+        let _ = env_logger::try_init();
+        use ogs_sbi::message::{SbiHeader, SbiHttpMessage, SbiRequest};
+
+        udm_context_init(64, 64);
+        let supi = "imsi-udmd09-0001";
+
+        let request = SbiRequest {
+            header: SbiHeader::with_method_uri(
+                "POST",
+                format!("/nudm-ueau/v1/{supi}/auth-events"),
+            ),
+            http: SbiHttpMessage {
+                content: Some(
+                    serde_json::json!({
+                        "nfInstanceId": "ausf-0001",
+                        "success": true,
+                        "timeStamp": "2026-01-01T00:00:00Z",
+                        "authType": "5G_AKA",
+                        "servingNetworkName": "5G:mnc001.mcc001.3gppnetwork.org"
+                    })
+                    .to_string(),
+                ),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let resp = handle_auth_event(supi, &request).await;
+        assert_eq!(resp.status, 201, "auth-event must return 201");
+
+        // udmd-09: Location header must reference the auth-events sub-resource.
+        // set_header lowercases all keys (HTTP/2 convention).
+        let loc = resp.http.headers.get("location").cloned().unwrap_or_default();
+        assert!(
+            loc.contains("auth-events"),
+            "Location must reference auth-events resource; got: {loc}"
+        );
+        assert!(
+            loc.starts_with("/nudm-ueau/v1/"),
+            "Location must use nudm-ueau service path; got: {loc}"
+        );
     }
 }

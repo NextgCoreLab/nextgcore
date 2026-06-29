@@ -448,6 +448,24 @@ pub async fn udm_nudr_dr_send_provisioned_data_get(
     udm_sbi_discover_and_send_nudr_dr(udm_ue_id, stream_id, request).await
 }
 
+/// Build and send provisioned data GET to UDR with forwarded query parameters (udmd-08).
+///
+/// Forwards standardised SDM query params (`plmn-id`, `dataset-names`,
+/// `supported-features`, `single-nssai`) to the UDR so the response is
+/// already scoped.
+pub async fn udm_nudr_dr_send_provisioned_data_get_with_params(
+    supi: &str,
+    dataset: &str,
+    params: &std::collections::HashMap<String, String>,
+) -> Result<SbiResponse, String> {
+    let path = format!("/nudr-dr/v1/subscription-data/{supi}/provisioned-data/{dataset}");
+    let mut request = SbiRequest::get(&path);
+    for (k, v) in params {
+        request = request.with_param(k, v);
+    }
+    udm_sbi_discover_and_send_nudr_dr(0, 0, request).await
+}
+
 // ---------------------------------------------------------------------------
 // UECM context-data persistence (Nudr_DataRepository, TS 29.505) — udmd-01/02
 // ---------------------------------------------------------------------------
@@ -502,6 +520,48 @@ pub async fn udm_nudr_dr_send_context_delete(
     let path =
         format!("/nudr-dr/v1/subscription-data/{supi}/context-data/{relative_path}");
     udm_sbi_discover_and_send_nudr_dr(0, 0, SbiRequest::delete(&path)).await
+}
+
+/// PATCH the AMF 3GPP-access registration in UDR (udmd-05: purgeFlag / modification).
+///
+/// Builds: `PATCH /nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access`
+pub async fn udm_nudr_dr_send_amf_context_patch(
+    supi: &str,
+    body: &serde_json::Value,
+) -> Result<SbiResponse, String> {
+    let path = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access");
+    let request = SbiRequest::patch(&path)
+        .with_json_body(body)
+        .map_err(|e| format!("Failed to serialize AMF context patch: {e}"))?;
+    udm_sbi_discover_and_send_nudr_dr(0, 0, request).await
+}
+
+/// GET the stored SMF registration from UDR (udmd-06: create vs update check).
+///
+/// Builds: `GET /nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations/{psi}`
+pub async fn udm_nudr_dr_send_smf_context_get(
+    supi: &str,
+    psi: &str,
+) -> Result<SbiResponse, String> {
+    let path =
+        format!("/nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations/{psi}");
+    udm_sbi_discover_and_send_nudr_dr(0, 0, SbiRequest::get(&path)).await
+}
+
+/// PUT an AuthEvent to the UDR authentication-status resource (udmd-09).
+///
+/// Builds: `PUT /nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-status`
+pub async fn udm_nudr_dr_send_auth_status_put(
+    supi: &str,
+    body: &serde_json::Value,
+) -> Result<SbiResponse, String> {
+    let path = format!(
+        "/nudr-dr/v1/subscription-data/{supi}/authentication-data/authentication-status"
+    );
+    let request = SbiRequest::put(&path)
+        .with_json_body(body)
+        .map_err(|e| format!("Failed to serialize auth status body: {e}"))?;
+    udm_sbi_discover_and_send_nudr_dr(0, 0, request).await
 }
 
 /// Parse an absolute SBI callback URI into `(host, port, path)`.
