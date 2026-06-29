@@ -555,14 +555,25 @@ async fn handle_5g_aka_confirmation(auth_ctx_id: &str, request: &SbiRequest) -> 
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let res_star_hex = confirmation.get("resStar").and_then(|v| v.as_str());
+    // ausfd-03: distinguish null/absent resStar (→ 200 failure) from present-but-bad hex (→ 400).
+    // TS 29.509 §6.1.6.2.6: "If no RES*, the null value is conveyed to the AUSF."
+    let res_star_raw = confirmation.get("resStar");
+    let res_star_null_or_absent = res_star_raw.is_none_or(|v| v.is_null());
 
-    if let Err(msg) = nextgcore_ausfd::nausf_handler::validate_confirmation_data(res_star_hex) {
-        return send_bad_request(msg, Some("INVALID_REQUEST"));
-    }
-
-    let res_star_hex = res_star_hex.expect("value expected");
-    log::info!("5G-AKA Confirmation: RES*={res_star_hex}");
+    // If resStar is present and non-null, validate it is a non-empty string; if not → 400
+    let res_star_hex_opt: Option<&str> = if !res_star_null_or_absent {
+        match res_star_raw.and_then(|v| v.as_str()) {
+            Some(s) if !s.is_empty() => Some(s),
+            _ => {
+                return send_bad_request(
+                    "ConfirmationData.resStar present but not a valid string",
+                    Some("INVALID_REQUEST"),
+                );
+            }
+        }
+    } else {
+        None
+    };
 
     // Find UE by auth context ID
     let ctx = ausf_self();
@@ -581,14 +592,47 @@ async fn handle_5g_aka_confirmation(auth_ctx_id: &str, request: &SbiRequest) -> 
         }
     };
 
+    // ausfd-03: null/absent resStar → 200 AUTHENTICATION_FAILURE (no kseaf, no supi)
+    // TS 29.509 §6.1.6.2.8: both kseaf and supi are conditional on authentication success.
+    if res_star_null_or_absent {
+        log::warn!(
+            "[{}] 5G-AKA: resStar null/absent → AUTHENTICATION_FAILURE",
+            ausf_ue.suci
+        );
+        ausf_ue.auth_result = nextgcore_ausfd::AuthResult::AuthenticationFailure;
+        if let Ok(context) = ctx.read() {
+            context.ue_update(&ausf_ue);
+        }
+        if let (Some(supi), Some(snn)) = (
+            ausf_ue.supi.clone(),
+            ausf_ue.serving_network_name.clone(),
+        ) {
+            tokio::spawn(async move {
+                if let Err(e) = send_udm_auth_result(&supi, false, &snn, "5G_AKA").await {
+                    log::warn!("Failed to notify UDM of auth result: {e}");
+                }
+            });
+        }
+        return SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({"authResult": "AUTHENTICATION_FAILURE"}))
+            .unwrap_or_else(|_| SbiResponse::with_status(200));
+    }
+
+    // resStar is present and non-null from here on
+    let res_star_hex = res_star_hex_opt.expect("value expected");
+    log::info!("5G-AKA Confirmation: RES*={res_star_hex}");
+
     if ausf_ue.supi.is_none() {
         return send_bad_request("No SUPI available for UE", Some("MISSING_SUPI"));
     }
 
-    // Store RES* hex for the handler and perform HRES*/HXRES* comparison
+    // Decode hex; genuinely malformed non-null hex → 400 INVALID_REQUEST
     let res_star_bytes = nextgcore_ausfd::nudm_handler::hex_to_bytes(res_star_hex);
     if res_star_bytes.len() != 16 {
-        return send_bad_request("Invalid RES* length", Some("INVALID_RES_STAR"));
+        return send_bad_request(
+            "Invalid ConfirmationData.resStar (bad hex or wrong length)",
+            Some("INVALID_REQUEST"),
+        );
     }
 
     let mut res_star = [0u8; 16];
@@ -609,8 +653,13 @@ async fn handle_5g_aka_confirmation(auth_ctx_id: &str, request: &SbiRequest) -> 
         );
     }
 
-    // Calculate KSEAF for the response
-    ausf_ue.calculate_kseaf();
+    let auth_success = ausf_ue.auth_result == nextgcore_ausfd::AuthResult::AuthenticationSuccess;
+
+    // ausfd-01: calculate KSEAF only on authentication success.
+    // TS 29.509 §6.1.6.2.8: kseaf is conditional "if authentication is successful".
+    if auth_success {
+        ausf_ue.calculate_kseaf();
+    }
 
     // Update UE in context
     if let Ok(context) = ctx.read() {
@@ -618,34 +667,53 @@ async fn handle_5g_aka_confirmation(auth_ctx_id: &str, request: &SbiRequest) -> 
     }
 
     // Notify UDM of authentication result (fire-and-forget)
-    let supi = ausf_ue.supi.clone().expect("value expected");
-    let auth_success = ausf_ue.auth_result == nextgcore_ausfd::AuthResult::AuthenticationSuccess;
-    let serving_network_name = ausf_ue
-        .serving_network_name
-        .clone()
-        .expect("value expected");
+    let supi_for_udm = ausf_ue.supi.clone().expect("value expected");
+    let snn_for_udm = ausf_ue.serving_network_name.clone().expect("value expected");
     tokio::spawn(async move {
         if let Err(e) =
-            send_udm_auth_result(&supi, auth_success, &serving_network_name, "5G_AKA").await
+            send_udm_auth_result(&supi_for_udm, auth_success, &snn_for_udm, "5G_AKA").await
         {
             log::warn!("Failed to notify UDM of auth result: {e}");
         }
     });
 
-    let auth_result_str = match ausf_ue.auth_result {
-        nextgcore_ausfd::AuthResult::AuthenticationSuccess => "AUTHENTICATION_SUCCESS",
-        nextgcore_ausfd::AuthResult::AuthenticationFailure => "AUTHENTICATION_FAILURE",
-        nextgcore_ausfd::AuthResult::AuthenticationOngoing => "AUTHENTICATION_ONGOING",
+    // ausfd-01, ausfd-04: build response body conditionally.
+    // TS 29.509 §6.1.6.2.8 Table 6.1.6.2.8-1:
+    //   authResult — always present
+    //   kseaf      — C: present if authentication successful
+    //   supi       — C: present if authentication successful AND original identity was a SUCI
+    let auth_result_str = if auth_success {
+        "AUTHENTICATION_SUCCESS"
+    } else {
+        "AUTHENTICATION_FAILURE"
     };
 
-    let kseaf_hex = nextgcore_ausfd::nudm_handler::bytes_to_hex(&ausf_ue.kseaf);
+    let mut resp_body = serde_json::Map::new();
+    resp_body.insert(
+        "authResult".to_string(),
+        serde_json::Value::String(auth_result_str.to_string()),
+    );
+
+    if auth_success {
+        resp_body.insert(
+            "kseaf".to_string(),
+            serde_json::Value::String(
+                nextgcore_ausfd::nudm_handler::bytes_to_hex(&ausf_ue.kseaf),
+            ),
+        );
+        // ausfd-04: include supi only when the original identity was a SUCI
+        if ausf_ue.suci.starts_with("suci-") {
+            if let Some(ref supi_val) = ausf_ue.supi {
+                resp_body.insert(
+                    "supi".to_string(),
+                    serde_json::Value::String(supi_val.clone()),
+                );
+            }
+        }
+    }
 
     SbiResponse::with_status(200)
-        .with_json_body(&serde_json::json!({
-            "authResult": auth_result_str,
-            "kseaf": kseaf_hex,
-            "supi": ausf_ue.supi
-        }))
+        .with_json_body(&serde_json::Value::Object(resp_body))
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
@@ -767,13 +835,29 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
             if auth_success {
                 // EAP-Success keeps the identifier of the last EAP-Request
                 let eap_success = vec![3u8, eap_id, 0, 4];
+                // ausfd-01, ausfd-04: build response body conditionally.
+                // TS 29.509 §6.1.6.2.8: kSeaf conditional on success; supi conditional
+                // on success AND original identity was a SUCI.
+                let mut eap_body = serde_json::Map::new();
+                eap_body.insert(
+                    "authResult".to_string(),
+                    serde_json::json!("AUTHENTICATION_SUCCESS"),
+                );
+                eap_body.insert(
+                    "kSeaf".to_string(),
+                    serde_json::json!(nextgcore_ausfd::nudm_handler::bytes_to_hex(
+                        &ausf_ue.kseaf
+                    )),
+                );
+                if ausf_ue.suci.starts_with("suci-") {
+                    eap_body.insert("supi".to_string(), serde_json::json!(ausf_ue.supi));
+                }
+                eap_body.insert(
+                    "eapPayload".to_string(),
+                    serde_json::json!(ogs_crypt::base64::encode(&eap_success)),
+                );
                 SbiResponse::with_status(200)
-                    .with_json_body(&serde_json::json!({
-                        "authResult": "AUTHENTICATION_SUCCESS",
-                        "kSeaf": nextgcore_ausfd::nudm_handler::bytes_to_hex(&ausf_ue.kseaf),
-                        "supi": ausf_ue.supi,
-                        "eapPayload": ogs_crypt::base64::encode(&eap_success)
-                    }))
+                    .with_json_body(&serde_json::Value::Object(eap_body))
                     .unwrap_or_else(|_| SbiResponse::with_status(200))
             } else {
                 let eap_failure = vec![4u8, eap_id, 0, 4];
@@ -1430,6 +1514,42 @@ async fn run_event_loop_async(
 mod tests {
     use super::*;
 
+    /// Serialise integration tests that share global env vars (UDM_SBI_ADDR/PORT)
+    /// and the process-wide AUSF context.
+    static TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Initiate a 5G-AKA authentication session and return the confirmation href
+    /// and the RAND bytes needed to compute a valid RES*.
+    async fn initiate_5g_aka(
+        client: &ogs_sbi::client::SbiClient,
+        identity: &str,
+        snn: &str,
+    ) -> (String, [u8; 16]) {
+        let resp = client
+            .post_json(
+                "/nausf-auth/v1/ue-authentications",
+                &serde_json::json!({"supiOrSuci": identity, "servingNetworkName": snn}),
+            )
+            .await
+            .expect("POST ue-authentications");
+        assert_eq!(resp.status, 201, "initiate_5g_aka: expected 201, got {}", resp.status);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().expect("body")).unwrap();
+        let href = body
+            .pointer("/_links/5g-aka/href")
+            .and_then(|v| v.as_str())
+            .expect("5g-aka link")
+            .to_string();
+        let rand_hex = body
+            .pointer("/5gAuthData/rand")
+            .and_then(|v| v.as_str())
+            .expect("rand");
+        let rand_bytes = nextgcore_ausfd::nudm_handler::hex_to_bytes(rand_hex);
+        let mut rand = [0u8; 16];
+        rand.copy_from_slice(&rand_bytes);
+        (href, rand)
+    }
+
     #[test]
     fn test_args_default() {
         let args = Args::parse_from(["nextgcore-ausfd"]);
@@ -1594,6 +1714,7 @@ mod tests {
     #[tokio::test]
     async fn test_http_auth_flows_5g_aka_and_eap_aka_prime() {
         let _ = env_logger::try_init();
+        let _lock = TEST_MUTEX.lock().await;
         tokio::time::timeout(Duration::from_secs(60), async {
             ausf_context_init(64);
 
@@ -1721,7 +1842,11 @@ mod tests {
                 conf.get("authResult").and_then(|v| v.as_str()),
                 Some("AUTHENTICATION_SUCCESS")
             );
-            assert_eq!(conf.get("supi").and_then(|v| v.as_str()), Some(SUPI_5G_AKA));
+            // ausfd-04: SUPI_5G_AKA = "imsi-..." is not a SUCI → supi absent from response
+            assert!(
+                conf.get("supi").is_none(),
+                "supi must be absent for SUPI-initiated auth (ausfd-04)"
+            );
             let kseaf_hex = conf.get("kseaf").and_then(|v| v.as_str()).expect("kseaf");
             assert_eq!(kseaf_hex.len(), 64);
 
@@ -1912,7 +2037,11 @@ mod tests {
                 sess.get("authResult").and_then(|v| v.as_str()),
                 Some("AUTHENTICATION_SUCCESS")
             );
-            assert_eq!(sess.get("supi").and_then(|v| v.as_str()), Some(SUPI_EAP));
+            // ausfd-04: SUPI_EAP = "imsi-..." is not a SUCI → supi absent from response
+            assert!(
+                sess.get("supi").is_none(),
+                "supi must be absent for SUPI-initiated EAP auth (ausfd-04)"
+            );
             // EAP-Success packet returned
             let ok_payload = sess.get("eapPayload").and_then(|v| v.as_str()).unwrap();
             assert_eq!(ogs_crypt::base64::decode(ok_payload).unwrap()[0], 3);
@@ -1932,5 +2061,174 @@ mod tests {
         })
         .await
         .expect("test timed out");
+    }
+
+    /// Acceptance tests for ausfd-01 / ausfd-03 / ausfd-04:
+    ///
+    /// - wrong-RES*                      → 200 AUTHENTICATION_FAILURE, kseaf absent, supi absent
+    /// - correct-RES* with SUCI identity → 200 AUTHENTICATION_SUCCESS, kseaf (64 hex), supi present
+    /// - correct-RES* with SUPI identity → 200 AUTHENTICATION_SUCCESS, kseaf present, supi absent
+    /// - {"resStar": null}               → 200 AUTHENTICATION_FAILURE  (ausfd-03 null path)
+    /// - {"resStar": "zz"}               → 400                         (ausfd-03 bad-hex path)
+    #[tokio::test]
+    async fn test_confirmation_response_shaping() {
+        let _ = env_logger::try_init();
+        let _lock = TEST_MUTEX.lock().await;
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            ausf_context_init(128);
+
+            // Mock UDM
+            let udm_port = free_port();
+            let udm_server = SbiServer::new(OgsSbiServerConfig::new(SocketAddr::from((
+                [127, 0, 0, 1],
+                udm_port,
+            ))));
+            udm_server.start(mock_udm_handler).await.expect("udm start");
+            std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+            std::env::set_var("UDM_SBI_PORT", udm_port.to_string());
+
+            // Real AUSF handler
+            let ausf_port = free_port();
+            let ausf_server = SbiServer::new(OgsSbiServerConfig::new(SocketAddr::from((
+                [127, 0, 0, 1],
+                ausf_port,
+            ))));
+            ausf_server
+                .start(ausf_sbi_request_handler)
+                .await
+                .expect("ausf start");
+
+            let client = ogs_sbi::client::SbiClient::with_host_port("127.0.0.1", ausf_port);
+
+            // Identities distinct from the other integration test
+            const SUCI_AKA: &str = "suci-0-001-01-0000-0-0-8888888801";
+            const SUPI_AKA: &str = "imsi-001010008888801";
+
+            // ----------------------------------------------------------------
+            // Test: wrong-RES* → 200 AUTHENTICATION_FAILURE, kseaf absent, supi absent
+            // ----------------------------------------------------------------
+            let (href, _rand) = initiate_5g_aka(&client, SUCI_AKA, TEST_SNN).await;
+            let resp = client
+                .put_json(
+                    &href,
+                    &serde_json::json!({"resStar": "00000000000000000000000000000000"}),
+                )
+                .await
+                .expect("PUT wrong RES*");
+            assert_eq!(resp.status, 200, "wrong RES* must return 200");
+            let body: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                body.get("authResult").and_then(|v| v.as_str()),
+                Some("AUTHENTICATION_FAILURE"),
+                "wrong RES* → AUTHENTICATION_FAILURE"
+            );
+            assert!(body.get("kseaf").is_none(), "kseaf must be absent on failure (ausfd-01)");
+            assert!(body.get("supi").is_none(), "supi must be absent on failure (ausfd-01)");
+
+            // ----------------------------------------------------------------
+            // Test: correct-RES* (SUCI identity) → kseaf present (64 hex), supi present
+            // ----------------------------------------------------------------
+            let (href, rand) = initiate_5g_aka(&client, SUCI_AKA, TEST_SNN).await;
+            let (res, ck, ik, _ak, _akstar) =
+                ogs_crypt::milenage::milenage_f2345(&TEST_OPC, &TEST_K, &rand).unwrap();
+            let res_star =
+                ogs_crypt::kdf::ogs_kdf_xres_star(&ck, &ik, TEST_SNN, &rand, &res);
+            let resp = client
+                .put_json(
+                    &href,
+                    &serde_json::json!({
+                        "resStar": nextgcore_ausfd::nudm_handler::bytes_to_hex(&res_star)
+                    }),
+                )
+                .await
+                .expect("PUT correct RES* SUCI");
+            assert_eq!(resp.status, 200);
+            let body: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                body.get("authResult").and_then(|v| v.as_str()),
+                Some("AUTHENTICATION_SUCCESS"),
+                "correct RES* (SUCI) → AUTHENTICATION_SUCCESS"
+            );
+            let kseaf = body
+                .get("kseaf")
+                .and_then(|v| v.as_str())
+                .expect("kseaf must be present on SUCI success (ausfd-01)");
+            assert_eq!(kseaf.len(), 64, "kseaf must be 64 hex chars");
+            assert!(
+                body.get("supi").is_some(),
+                "supi must be present for SUCI-initiated success (ausfd-04)"
+            );
+
+            // ----------------------------------------------------------------
+            // Test: correct-RES* (SUPI identity) → kseaf present, supi absent
+            // ----------------------------------------------------------------
+            let (href, rand) = initiate_5g_aka(&client, SUPI_AKA, TEST_SNN).await;
+            let (res, ck, ik, _ak, _akstar) =
+                ogs_crypt::milenage::milenage_f2345(&TEST_OPC, &TEST_K, &rand).unwrap();
+            let res_star =
+                ogs_crypt::kdf::ogs_kdf_xres_star(&ck, &ik, TEST_SNN, &rand, &res);
+            let resp = client
+                .put_json(
+                    &href,
+                    &serde_json::json!({
+                        "resStar": nextgcore_ausfd::nudm_handler::bytes_to_hex(&res_star)
+                    }),
+                )
+                .await
+                .expect("PUT correct RES* SUPI");
+            assert_eq!(resp.status, 200);
+            let body: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                body.get("authResult").and_then(|v| v.as_str()),
+                Some("AUTHENTICATION_SUCCESS"),
+                "correct RES* (SUPI) → AUTHENTICATION_SUCCESS"
+            );
+            assert!(
+                body.get("kseaf").is_some(),
+                "kseaf must be present on SUPI success (ausfd-01)"
+            );
+            assert!(
+                body.get("supi").is_none(),
+                "supi must be absent for SUPI-initiated success (ausfd-04)"
+            );
+
+            // ----------------------------------------------------------------
+            // Test: {"resStar": null} → 200 AUTHENTICATION_FAILURE  (ausfd-03 null path)
+            // ----------------------------------------------------------------
+            let (href, _rand) = initiate_5g_aka(&client, SUCI_AKA, TEST_SNN).await;
+            let resp = client
+                .put_json(&href, &serde_json::json!({"resStar": null}))
+                .await
+                .expect("PUT resStar:null");
+            assert_eq!(resp.status, 200, "null resStar must return 200 (ausfd-03)");
+            let body: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                body.get("authResult").and_then(|v| v.as_str()),
+                Some("AUTHENTICATION_FAILURE"),
+                "null resStar → AUTHENTICATION_FAILURE (ausfd-03)"
+            );
+            assert!(body.get("kseaf").is_none(), "kseaf absent on null resStar");
+            assert!(body.get("supi").is_none(), "supi absent on null resStar");
+
+            // ----------------------------------------------------------------
+            // Test: {"resStar": "zz"} → 400 INVALID_REQUEST (ausfd-03 bad-hex path)
+            // ----------------------------------------------------------------
+            let (href, _rand) = initiate_5g_aka(&client, SUCI_AKA, TEST_SNN).await;
+            let resp = client
+                .put_json(&href, &serde_json::json!({"resStar": "zz"}))
+                .await
+                .expect("PUT resStar:zz");
+            assert_eq!(resp.status, 400, "bad-hex resStar must return 400 (ausfd-03)");
+
+            ausf_server.stop().await.expect("stop ausf");
+            udm_server.stop().await.expect("stop udm");
+        })
+        .await
+        .expect("test_confirmation_response_shaping timed out");
     }
 }
