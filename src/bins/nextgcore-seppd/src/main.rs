@@ -147,6 +147,14 @@ struct Args {
     /// default whenever --tls is set and a client CA is available.
     #[arg(long)]
     n32_allow_insecure_no_mtls: bool,
+
+    /// Permit deriving the N32-f key hierarchy from a deterministic, no-TLS
+    /// fallback when the N32-c TLS RFC 5705 exporter secret is unavailable
+    /// (LAB/TEST ONLY). Strict-by-default (off): in production the N32-f master
+    /// MUST come from the TLS exporter per TS 33.501 §13.2.4.4.1, else
+    /// exchange-params fails (sepp-10).
+    #[arg(long)]
+    allow_insecure_no_tls: bool,
 }
 
 /// Parse "mcc:mnc" into a PlmnId
@@ -238,6 +246,16 @@ async fn main() -> Result<()> {
                 log::info!("PRINS security capability enabled");
             }
         };
+    }
+
+    // sepp-10: the N32-f no-TLS key-derivation fallback is strict-by-default
+    // (off). Enable only for plaintext lab/test transports.
+    if args.allow_insecure_no_tls {
+        n32c_handler::set_allow_insecure_no_tls(true);
+        log::warn!(
+            "N32-f no-TLS key-derivation fallback ENABLED (allow_insecure_no_tls); \
+             LAB/TEST ONLY — production requires the N32-c TLS RFC 5705 exporter"
+        );
     }
 
     // Initialize SEPP state machine

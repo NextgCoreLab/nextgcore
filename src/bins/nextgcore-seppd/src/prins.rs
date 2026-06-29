@@ -17,11 +17,13 @@
 //! exchange-params handshake (see `n32c_handler::derive_n32f_key_material`).
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use p256::ecdsa::{SigningKey, VerifyingKey};
 
-use crate::jose::{self, b64url_decode, b64url_encode, FlatJwe, FlatJws, JoseError};
+use crate::context::PlmnId;
+use crate::jose::{self, b64url_decode, b64url_encode, FlatJwe, FlatJws, JoseError, JweEnc};
 use crate::n32c_handler::{N32fDirection, N32fKeyMaterial, N32fRole};
 
 // ============================================================================
@@ -90,6 +92,112 @@ pub fn generate_local_identity() -> VerifyingKey {
     let vk = *sk.verifying_key();
     set_local_signing_key(sk);
     vk
+}
+
+// ============================================================================
+// N32-f SEQ counters + anti-replay windows (TS 33.501 §13.2.4.4.1, sepp-02)
+//
+// Nonce = IV salt(8) || SEQ(32-bit). SEQ starts at 0 and increments per
+// encryption, with a separate counter per IV salt (i.e. per (N32-f context,
+// originator role, direction)). The receiver reads SEQ back from the JWE nonce
+// and runs a sliding-window anti-replay check. These stores are keyed by the
+// canonical N32-f context id (`kid`) so they persist across the per-message
+// PrinsContext rebuilds (`build_prins_context`).
+// ============================================================================
+
+/// Store key for a (context, originator role, direction) sequence space.
+fn seq_key(kid: &str, originator: N32fRole, dir: N32fDirection) -> String {
+    format!("{kid}|{originator:?}|{dir:?}")
+}
+
+fn send_seq_counters() -> &'static RwLock<HashMap<String, Arc<AtomicU32>>> {
+    static S: OnceLock<RwLock<HashMap<String, Arc<AtomicU32>>>> = OnceLock::new();
+    S.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Next SEQ for the (kid, originator, direction) sequence space (starts at 0).
+/// Errors when the 32-bit space is exhausted (force rekey / new context).
+fn next_send_seq(
+    kid: &str,
+    originator: N32fRole,
+    dir: N32fDirection,
+) -> Result<u32, JoseError> {
+    let key = seq_key(kid, originator, dir);
+    let counter = {
+        let mut map = send_seq_counters()
+            .write()
+            .map_err(|_| JoseError::Crypto("N32-f SEQ store poisoned".into()))?;
+        map.entry(key)
+            .or_insert_with(|| Arc::new(AtomicU32::new(0)))
+            .clone()
+    };
+    let seq = counter.fetch_add(1, Ordering::SeqCst);
+    if seq == u32::MAX {
+        return Err(JoseError::Crypto(
+            "N32-f SEQ space exhausted; rekey required".into(),
+        ));
+    }
+    Ok(seq)
+}
+
+fn recv_replay_windows() -> &'static RwLock<HashMap<String, Arc<Mutex<ReplayWindow>>>> {
+    static S: OnceLock<RwLock<HashMap<String, Arc<Mutex<ReplayWindow>>>>> = OnceLock::new();
+    S.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// 64-entry sliding anti-replay window (IPsec/RFC 6479 style). `high` is the
+/// largest accepted SEQ; bit `high - seq` of `bitmap` marks an accepted SEQ
+/// within the window.
+struct ReplayWindow {
+    high: Option<u32>,
+    bitmap: u64,
+}
+
+impl ReplayWindow {
+    const WIDTH: u32 = 64;
+
+    fn new() -> Self {
+        Self {
+            high: None,
+            bitmap: 0,
+        }
+    }
+
+    /// Accept `seq` if it is new and within the window, committing it; reject a
+    /// duplicate or a SEQ older than the window.
+    fn check_and_commit(&mut self, seq: u32) -> Result<(), String> {
+        match self.high {
+            None => {
+                self.high = Some(seq);
+                self.bitmap = 1; // bit 0 = the high water mark itself
+                Ok(())
+            }
+            Some(high) if seq > high => {
+                let shift = seq - high;
+                self.bitmap = if shift >= Self::WIDTH {
+                    1
+                } else {
+                    (self.bitmap << shift) | 1
+                };
+                self.high = Some(seq);
+                Ok(())
+            }
+            Some(high) => {
+                let diff = high - seq;
+                if diff >= Self::WIDTH {
+                    return Err(format!(
+                        "N32-f SEQ {seq} is older than the replay window (high {high})"
+                    ));
+                }
+                let bit = 1u64 << diff;
+                if self.bitmap & bit != 0 {
+                    return Err(format!("N32-f SEQ {seq} replayed"));
+                }
+                self.bitmap |= bit;
+                Ok(())
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -164,6 +272,16 @@ pub struct PrinsContext {
     pub profiles: Vec<DataTypeProfile>,
     /// Modification policy agreed during the N32-c handshake
     pub modification_policy: ModificationPolicy,
+    /// Negotiated JWE content-encryption profile (sepp-12): A128GCM or A256GCM.
+    /// The session-key length follows it (16 vs 32 octets of `key_material`).
+    pub jwe_enc: JweEnc,
+    /// This SEPP's serving PLMN-IDs, stamped into the metaData of messages it
+    /// originates (sepp-09). Empty => no PLMN stamped (backward compatible).
+    pub local_plmn_ids: Vec<PlmnId>,
+    /// PLMN-IDs bound to this N32-f context (the peer's serving PLMNs learned
+    /// at handshake). On receive, the message's claimed sender PLMN-ID must be
+    /// one of these (sepp-09). Empty => the consistency check is skipped.
+    pub peer_plmn_ids: Vec<PlmnId>,
 }
 
 impl std::fmt::Debug for PrinsContext {
@@ -204,6 +322,9 @@ impl PrinsContext {
             peer_verifying_keys: HashMap::new(),
             profiles: Vec::new(),
             modification_policy: ModificationPolicy::default(),
+            jwe_enc: JweEnc::A256Gcm,
+            local_plmn_ids: Vec::new(),
+            peer_plmn_ids: Vec::new(),
         };
         ctx.add_default_profiles();
         ctx
@@ -219,6 +340,34 @@ impl PrinsContext {
     /// peer originated in `direction` (selected by the peer's role).
     pub fn unprotect_key(&self, direction: N32fDirection) -> (&[u8; 32], &[u8; 8]) {
         self.key_material.select(self.role.opposite(), direction)
+    }
+
+    /// Allocate the next SEQ for a message this SEPP ORIGINATES in `direction`
+    /// (sepp-02). SEQ starts at 0 and increments per encryption, with a
+    /// separate counter per (N32-f context, originator role, direction) — i.e.
+    /// per IV salt. Errors when the 32-bit SEQ space is exhausted (rekey).
+    pub fn next_send_seq(&self, direction: N32fDirection) -> Result<u32, JoseError> {
+        next_send_seq(&self.kid, self.role, direction)
+    }
+
+    /// Anti-replay check + commit for a received message the PEER originated in
+    /// `direction` (sepp-02). Rejects a SEQ already seen or older than the
+    /// sliding window. Must be called only AFTER the JWE AEAD authenticates the
+    /// message, so a tampered message never advances the window.
+    pub fn check_recv_seq(&self, direction: N32fDirection, seq: u32) -> Result<(), String> {
+        let key = seq_key(&self.kid, self.role.opposite(), direction);
+        let win = {
+            let mut map = recv_replay_windows()
+                .write()
+                .map_err(|_| "N32-f replay-window store poisoned".to_string())?;
+            map.entry(key)
+                .or_insert_with(|| Arc::new(Mutex::new(ReplayWindow::new())))
+                .clone()
+        };
+        let mut w = win
+            .lock()
+            .map_err(|_| "N32-f replay window poisoned".to_string())?;
+        w.check_and_commit(seq)
     }
 
     /// Install this SEPP's asymmetric (ES256) signing key for originating
@@ -278,6 +427,42 @@ pub enum IeLocation {
     UriPath,
 }
 
+/// PLMN-ID as carried in the reformatted message metaData (TS 29.573 `PlmnId`:
+/// 3-digit `mcc`, 2-3-digit `mnc`). Used for the sepp-09 consistency check.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlmnIdMeta {
+    pub mcc: String,
+    pub mnc: String,
+}
+
+impl PlmnIdMeta {
+    /// Encode an internal `PlmnId` into the wire form (zero-padded mcc/mnc).
+    fn from_plmn(p: &PlmnId) -> Self {
+        let mnc = if p.mnc_len == 2 {
+            format!("{:02}", p.mnc)
+        } else {
+            format!("{:03}", p.mnc)
+        };
+        Self {
+            mcc: format!("{:03}", p.mcc),
+            mnc,
+        }
+    }
+
+    /// Whether this claimed PLMN-ID is one of `plmns` (numeric mcc/mnc compare).
+    fn matches_any(&self, plmns: &[PlmnId]) -> bool {
+        match (self.mcc.parse::<u16>(), self.mnc.parse::<u16>()) {
+            (Ok(mcc), Ok(mnc)) => plmns.iter().any(|p| p.mcc == mcc && p.mnc == mnc),
+            _ => false,
+        }
+    }
+}
+
+/// The literal stored in `authorizedIpxId` when no first-hop RI is authorized
+/// (TS 29.573 §6.2.5.2.9: the field is mandatory; sepp-07).
+const AUTHORIZED_IPX_ID_NONE: &str = "NULL";
+
 /// metaData of the DataToIntegrityProtectBlock (TS 29.573 table 6.3.2-1)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -286,9 +471,18 @@ pub struct N32fMetaData {
     pub n32f_context_id: String,
     /// Unique message ID (for n32f-error correlation)
     pub message_id: String,
-    /// Identity of the first-hop IPX (empty when none)
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// Identity of the first-hop IPX (TS 29.573 §6.2.5.2.9: mandatory, always
+    /// serialized; "NULL" when no RI is authorized — sepp-07).
+    #[serde(default = "default_authorized_ipx_id")]
     pub authorized_ipx_id: String,
+    /// Sender (home/visited) PLMN-ID, for the receiving SEPP's PLMN-ID
+    /// consistency check (sepp-09). Omitted when the originator serves no PLMN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_plmn_id: Option<PlmnIdMeta>,
+}
+
+fn default_authorized_ipx_id() -> String {
+    AUTHORIZED_IPX_ID_NONE.to_string()
 }
 
 /// Request line of the original SBI request (TS 29.573 §6.2.5.2.6 `RequestLine`).
@@ -312,11 +506,28 @@ pub struct RequestLine {
     pub path_query_protect_ind: Option<Vec<IeLocation>>,
 }
 
-/// HTTP header carried in the clear (integrity-protected) block
+/// Encoded HTTP header value (TS 29.573 §6.2.5.2.7 `EncodedHttpHeaderValue`):
+/// either the cleartext value (string) or a reference `{ "encBlockIndex": i }`
+/// to an encrypted leaf in the `dataToEncrypt` array.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum EncodedHttpHeaderValue {
+    /// Cleartext header value
+    Plain(String),
+    /// Reference into the cipher block's `dataToEncrypt`
+    Encrypted {
+        #[serde(rename = "encBlockIndex")]
+        enc_block_index: usize,
+    },
+}
+
+/// HTTP header carried in the integrity-protected block (TS 29.573 §6.2.5.2.7
+/// `HttpHeader`): the field key is `header` and the value is an
+/// `EncodedHttpHeaderValue` (sepp-06).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct N32fHeader {
-    pub name: String,
-    pub value: String,
+pub struct HttpHeader {
+    pub header: String,
+    pub value: EncodedHttpHeaderValue,
 }
 
 /// One HttpPayload element (TS 29.573 §6.2.5.2.8): a single leaf of the body
@@ -339,7 +550,7 @@ pub struct DataToIntegrityProtectBlock {
     pub meta_data: N32fMetaData,
     pub request_line: RequestLine,
     #[serde(default)]
-    pub headers: Vec<N32fHeader>,
+    pub headers: Vec<HttpHeader>,
     #[serde(default)]
     pub payload: Vec<N32fPayloadElement>,
 }
@@ -360,7 +571,10 @@ pub struct ModificationsBlockPayload {
     /// JSON-Patch (RFC 6902) operations against the clear payload
     #[serde(default)]
     pub operations: Vec<serde_json::Value>,
-    /// JWE tag (first entry) or previous entry's JWS signature (chain link)
+    /// The JWE Authentication Tag of the sending SEPP's JWE (TS 33.501
+    /// §13.2.4.5.1 / TS 29.573 §6.2.5.2.10): EVERY modificationsBlock entry
+    /// binds to this same tag for replay protection — entries are NOT chained
+    /// to the previous JWS signature (RI ordering is the array order). sepp-08.
     pub tag: String,
 }
 
@@ -525,14 +739,20 @@ pub fn protect_message(
             // The receiver looks the context up by the ID *it* allocated
             n32f_context_id: ctx.peer_context_id.clone(),
             message_id: generate_message_id(),
-            authorized_ipx_id: String::new(),
+            // sepp-07: mandatory; "NULL" when no first-hop RI is authorized.
+            authorized_ipx_id: AUTHORIZED_IPX_ID_NONE.to_string(),
+            // sepp-09: stamp this SEPP's serving PLMN-ID (if configured) so the
+            // receiver can verify PLMN-ID consistency against the N32-f context.
+            sender_plmn_id: ctx.local_plmn_ids.first().map(PlmnIdMeta::from_plmn),
         },
         request_line: build_request_line(method, url),
+        // sepp-06: HttpHeader { header, value: EncodedHttpHeaderValue }. This
+        // SEPP carries header values in the clear (integrity-protected).
         headers: headers
             .iter()
-            .map(|(name, value)| N32fHeader {
-                name: name.clone(),
-                value: value.clone(),
+            .map(|(name, value)| HttpHeader {
+                header: name.clone(),
+                value: EncodedHttpHeaderValue::Plain(value.clone()),
             })
             .collect(),
         payload: payload_elements,
@@ -545,12 +765,17 @@ pub fn protect_message(
 
     // The forwarded SBI request is an N32-f request: protect it with this
     // SEPP's request-direction session key + IV salt, selected by role from
-    // the N32-f key hierarchy (TS 33.501 §13.2.4.4.1). The 96-bit GCM IV is
-    // seeded with the 64-bit IV salt.
+    // the N32-f key hierarchy (TS 33.501 §13.2.4.4.1). sepp-02: the 96-bit GCM
+    // nonce is `IV salt (8B) || SEQ (32-bit)`, the SEQ allocated from this
+    // SEPP's per-salt request counter. sepp-12: the enc (A128/A256GCM) follows
+    // the negotiated profile; the session key is its leading `key_len` octets.
     let (key, iv_salt) = ctx.protect_key(N32fDirection::Request);
+    let seq = ctx.next_send_seq(N32fDirection::Request)?;
     let jwe = jose::jwe_encrypt_with_iv_salt(
         key,
+        ctx.jwe_enc,
         iv_salt,
+        seq,
         &plaintext,
         Some(&aad_bytes),
         Some(&ctx.kid),
@@ -656,7 +881,9 @@ pub fn unprotect_message(
         ));
     }
     let mut operations: Vec<serde_json::Value> = Vec::new();
-    let mut expected_tag = msg.reformatted_data.tag.clone();
+    // sepp-08: every entry's `tag` must equal the JWE Authentication Tag
+    // (TS 33.501 §13.2.4.5.1); entries are not chained to the prior signature.
+    let jwe_tag = &msg.reformatted_data.tag;
     for (i, jws) in msg.modifications_block.iter().enumerate() {
         // Locate the signer's registered ES256 public key by the JWS `kid`
         // (== signer identity FQDN). An unregistered or non-ES256 entry is
@@ -729,13 +956,13 @@ pub fn unprotect_message(
             err.failed_modifications.push(payload.identity.clone());
             return Err(err);
         }
-        // Chain check: entry must reference the JWE tag (first) or the
-        // previous entry's signature.
-        if payload.tag != expected_tag {
+        // sepp-08: each entry's tag MUST be the JWE Authentication Tag (replay
+        // protection), not the previous entry's signature.
+        if &payload.tag != jwe_tag {
             let mut err = N32fUnprotectError::new(
                 N32fErrorType::IntegrityCheckOnModificationsFailed,
                 Some(message_id.clone()),
-                format!("modificationsBlock[{i}] chain tag mismatch"),
+                format!("modificationsBlock[{i}] tag does not bind to the JWE Authentication Tag"),
             );
             err.failed_modifications.push(payload.identity.clone());
             return Err(err);
@@ -759,7 +986,6 @@ pub fn unprotect_message(
             }
         }
         operations.extend(payload.operations.iter().cloned());
-        expected_tag = jws.signature.clone();
     }
 
     // --- AEAD decrypt; authenticates the AAD (integrity block) ---
@@ -783,6 +1009,43 @@ pub fn unprotect_message(
                 format!("bad DataToIntegrityProtectAndCipherBlock: {e}"),
             )
         })?;
+
+    // --- sepp-02: anti-replay on the authenticated SEQ ---
+    // The AEAD has authenticated the message; recover SEQ from the JWE nonce
+    // (IV salt || SEQ) and reject a replayed or out-of-window SEQ. Run only
+    // after a successful decrypt so a tampered message never advances the
+    // window.
+    let (_iv_salt, seq) = jose::jwe_iv_salt_and_seq(&msg.reformatted_data).ok_or_else(|| {
+        N32fUnprotectError::new(
+            N32fErrorType::IntegrityCheckFailed,
+            Some(message_id.clone()),
+            "malformed JWE nonce (expected IV salt(8) || SEQ(32-bit))",
+        )
+    })?;
+    ctx.check_recv_seq(N32fDirection::Request, seq).map_err(|reason| {
+        N32fUnprotectError::new(
+            N32fErrorType::IntegrityCheckFailed,
+            Some(message_id.clone()),
+            reason,
+        )
+    })?;
+
+    // --- sepp-09: PLMN-ID consistency check ---
+    // The sender's PLMN-ID (in the now-authenticated metaData) must be one of
+    // the PLMN-IDs bound to this N32-f context (TS 33.501 §13.2.4.7). Skipped
+    // when the message carries no PLMN-ID or no binding was established.
+    if let Some(ref claimed) = integrity_block.meta_data.sender_plmn_id {
+        if !ctx.peer_plmn_ids.is_empty() && !claimed.matches_any(&ctx.peer_plmn_ids) {
+            return Err(N32fUnprotectError::new(
+                N32fErrorType::PolicyMismatch,
+                Some(message_id.clone()),
+                format!(
+                    "sender PLMN-ID {}-{} is not bound to the N32-f context",
+                    claimed.mcc, claimed.mnc
+                ),
+            ));
+        }
+    }
 
     // --- Reassemble the original request ---
     // Each HttpPayload leaf is applied back to the rebuilt body at its RFC 6901
@@ -861,11 +1124,32 @@ pub fn unprotect_message(
         (None, None) => None,
     };
 
-    let headers: HashMap<String, String> = integrity_block
-        .headers
-        .iter()
-        .map(|h| (h.name.clone(), h.value.clone()))
-        .collect();
+    // sepp-06: reconstruct each header from its EncodedHttpHeaderValue. A
+    // cleartext value is used as-is; an `{encBlockIndex}` reference resolves to
+    // the corresponding encrypted leaf in the cipher block.
+    let mut headers: HashMap<String, String> = HashMap::new();
+    for h in &integrity_block.headers {
+        let value = match &h.value {
+            EncodedHttpHeaderValue::Plain(s) => s.clone(),
+            EncodedHttpHeaderValue::Encrypted { enc_block_index } => {
+                let v = cipher_block
+                    .data_to_encrypt
+                    .get(*enc_block_index)
+                    .ok_or_else(|| {
+                        N32fUnprotectError::new(
+                            N32fErrorType::MessageReconstructionFailed,
+                            Some(message_id.clone()),
+                            format!("header [{}] encBlockIndex {enc_block_index} out of range", h.header),
+                        )
+                    })?;
+                match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                }
+            }
+        };
+        headers.insert(h.header.clone(), value);
+    }
 
     let url = join_request_line(&integrity_block.request_line);
     log::info!(
@@ -1104,12 +1388,15 @@ mod tests {
     fn ctx_pair() -> (PrinsContext, PrinsContext) {
         let (sender_sk, sender_vk) = es256_keypair();
         let km = shared_material();
+        // Unique kid per pair isolates the global SEQ-counter / replay-window
+        // stores (keyed by kid) across tests (sepp-02).
+        let kid = format!("kid-{}", generate_n32f_context_id());
         let sender = PrinsContext::new(
             "ctx-local-1111",
             "ctx-peer-2222",
             km.clone(),
             N32fRole::Initiator,
-            "kid-test",
+            kid.clone(),
             SENDER_FQDN,
         )
         .with_signing_key(sender_sk);
@@ -1118,7 +1405,7 @@ mod tests {
             "ctx-local-1111",
             km,
             N32fRole::Responder,
-            "kid-test",
+            kid,
             RECEIVER_FQDN,
         );
         receiver.register_verifying_key(SENDER_FQDN, sender_vk);
@@ -1297,11 +1584,12 @@ mod tests {
             Some(&sample_body()),
         )
         .unwrap();
-        let prev_sig = msg.modifications_block[0].signature.clone();
+        // sepp-08: a chained entry binds to the JWE tag, not the prior signature.
+        let jwe_tag = msg.reformatted_data.tag.clone();
         let payload = ModificationsBlockPayload {
             identity: "rogue-ipx.example.com".to_string(),
             operations: Vec::new(),
-            tag: prev_sig,
+            tag: jwe_tag,
         };
         let jws = jose::jws_sign_es256(
             &rogue_sk,
@@ -1336,12 +1624,13 @@ mod tests {
             Some(&sample_body()),
         )
         .unwrap();
-        let prev_sig = msg.modifications_block[0].signature.clone();
+        // sepp-08: a chained entry binds to the JWE tag, not the prior signature.
+        let jwe_tag = msg.reformatted_data.tag.clone();
         // ...but the payload claims a DIFFERENT identity than the kid.
         let payload = ModificationsBlockPayload {
             identity: "someone-else.example.com".to_string(),
             operations: Vec::new(),
-            tag: prev_sig,
+            tag: jwe_tag,
         };
         let jws = jose::jws_sign_es256(
             &ipx_sk,
@@ -1381,11 +1670,12 @@ mod tests {
 
         // The IPX appends a chained entry signed with ITS OWN asymmetric key
         // (kid = its identity FQDN), referencing the previous entry's sig.
-        let prev_sig = msg.modifications_block[0].signature.clone();
+        // sepp-08: a chained entry binds to the JWE tag, not the prior signature.
+        let jwe_tag = msg.reformatted_data.tag.clone();
         let patch_payload = ModificationsBlockPayload {
             identity: ipx_id.to_string(),
             operations: vec![serde_json::json!({"op":"replace","path":"/nssai/sst","value":7})],
-            tag: prev_sig,
+            tag: jwe_tag,
         };
         let jws = jose::jws_sign_es256(
             &ipx_sk,
@@ -1420,11 +1710,12 @@ mod tests {
             Some(&sample_body()),
         )
         .unwrap();
-        let prev_sig = msg.modifications_block[0].signature.clone();
+        // sepp-08: a chained entry binds to the JWE tag, not the prior signature.
+        let jwe_tag = msg.reformatted_data.tag.clone();
         let patch_payload = ModificationsBlockPayload {
             identity: ipx_id.to_string(),
             operations: vec![serde_json::json!({"op":"replace","path":"/nssai/sst","value":7})],
-            tag: prev_sig,
+            tag: jwe_tag,
         };
         let jws = jose::jws_sign_es256(
             &ipx_sk,
@@ -1652,7 +1943,8 @@ mod tests {
             meta_data: N32fMetaData {
                 n32f_context_id: sender.peer_context_id.clone(),
                 message_id: "deadbeefdeadbeef".to_string(),
-                authorized_ipx_id: String::new(),
+                authorized_ipx_id: AUTHORIZED_IPX_ID_NONE.to_string(),
+                sender_plmn_id: None,
             },
             request_line: build_request_line("POST", "/nudm-sdm/v1/supi"),
             headers: vec![],
@@ -1666,9 +1958,16 @@ mod tests {
         let cipher = DataToIntegrityProtectAndCipherBlock::default();
         let plaintext = serde_json::to_vec(&cipher).unwrap();
         let (key, salt) = sender.protect_key(N32fDirection::Request);
-        let jwe =
-            jose::jwe_encrypt_with_iv_salt(key, salt, &plaintext, Some(&aad), Some(&sender.kid))
-                .unwrap();
+        let jwe = jose::jwe_encrypt_with_iv_salt(
+            key,
+            sender.jwe_enc,
+            salt,
+            0,
+            &plaintext,
+            Some(&aad),
+            Some(&sender.kid),
+        )
+        .unwrap();
         let signing_key = sender.local_signing_key.clone().unwrap();
         let mods_payload = ModificationsBlockPayload {
             identity: sender.local_fqdn.clone(),
@@ -1712,5 +2011,251 @@ mod tests {
             "nausf-auth"
         );
         assert_eq!(extract_service_name(""), "");
+    }
+
+    // ------------------------------------------------------------------
+    // sepp-02: nonce = IV salt || SEQ + receive-side replay window
+    // ------------------------------------------------------------------
+
+    /// Two messages under the same context+direction get SEQ 0 then 1 (same IV
+    /// salt, incrementing SEQ), so the JWE nonces differ.
+    #[test]
+    fn protect_increments_seq_per_message() {
+        let (sender, _receiver) = ctx_pair();
+        let m0 =
+            protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body())).unwrap();
+        let m1 =
+            protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body())).unwrap();
+        let (s0, seq0) = jose::jwe_iv_salt_and_seq(&m0.reformatted_data).unwrap();
+        let (s1, seq1) = jose::jwe_iv_salt_and_seq(&m1.reformatted_data).unwrap();
+        assert_eq!(s0, s1, "same IV salt for the same (role, direction)");
+        assert_eq!(seq0, 0, "SEQ starts at 0");
+        assert_eq!(seq1, 1, "SEQ increments per encryption");
+    }
+
+    /// A replayed N32-f message (received twice) is rejected with
+    /// IntegrityCheckFailed on the second receive (anti-replay window).
+    #[test]
+    fn replayed_message_rejected() {
+        let (sender, receiver) = ctx_pair();
+        let msg =
+            protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body())).unwrap();
+        // First receive succeeds and commits the SEQ.
+        assert!(unprotect_message(&receiver, &msg).is_ok());
+        // Replay of the identical message is rejected.
+        let err = unprotect_message(&receiver, &msg).unwrap_err();
+        assert_eq!(err.error_type, N32fErrorType::IntegrityCheckFailed);
+        assert!(err.detail.contains("replay"), "got: {}", err.detail);
+    }
+
+    // ------------------------------------------------------------------
+    // sepp-06: HttpHeader field `header` + EncodedHttpHeaderValue
+    // ------------------------------------------------------------------
+
+    /// Header JSON uses key `header`; a value routed to the encrypted block
+    /// serializes as `{ "encBlockIndex": i }`.
+    #[test]
+    fn http_header_serialization_uses_header_key_and_encoded_value() {
+        let plain = HttpHeader {
+            header: "content-type".to_string(),
+            value: EncodedHttpHeaderValue::Plain("application/json".to_string()),
+        };
+        let j = serde_json::to_value(&plain).unwrap();
+        assert!(j.get("header").is_some(), "field key must be `header`");
+        assert_eq!(j["header"], "content-type");
+        assert_eq!(j["value"], "application/json");
+
+        let enc = HttpHeader {
+            header: "authorization".to_string(),
+            value: EncodedHttpHeaderValue::Encrypted { enc_block_index: 2 },
+        };
+        let je = serde_json::to_value(&enc).unwrap();
+        assert_eq!(je["value"], serde_json::json!({ "encBlockIndex": 2 }));
+    }
+
+    /// A header round-trips, and the reformatted AAD uses the `header` key
+    /// (not `name`).
+    #[test]
+    fn header_roundtrips_and_aad_uses_header_key() {
+        let (sender, receiver) = ctx_pair();
+        let headers = vec![("x-custom".to_string(), "v1".to_string())];
+        let msg = protect_message(&sender, "GET", "/nnrf-disc/v1/x", &headers, None).unwrap();
+        let aad = b64url_decode(msg.reformatted_data.aad.as_ref().unwrap()).unwrap();
+        let aad_str = String::from_utf8(aad).unwrap();
+        assert!(aad_str.contains("\"header\":\"x-custom\""));
+        assert!(!aad_str.contains("\"name\":\"x-custom\""));
+        let rec = unprotect_message(&receiver, &msg).unwrap();
+        assert_eq!(rec.headers.get("x-custom").unwrap(), "v1");
+    }
+
+    /// An encrypted header value (`{encBlockIndex}`) is resolved from the
+    /// cipher block on unprotect (sepp-06 reconstruction path).
+    #[test]
+    fn encrypted_header_value_resolved_on_unprotect() {
+        let (sender, receiver) = ctx_pair();
+        let mut cipher = DataToIntegrityProtectAndCipherBlock::default();
+        cipher
+            .data_to_encrypt
+            .push(serde_json::json!("Bearer secret-token"));
+        let integrity_block = DataToIntegrityProtectBlock {
+            meta_data: N32fMetaData {
+                n32f_context_id: sender.peer_context_id.clone(),
+                message_id: "feedface".to_string(),
+                authorized_ipx_id: AUTHORIZED_IPX_ID_NONE.to_string(),
+                sender_plmn_id: None,
+            },
+            request_line: build_request_line("GET", "/nudm-sdm/v1/supi"),
+            headers: vec![HttpHeader {
+                header: "authorization".to_string(),
+                value: EncodedHttpHeaderValue::Encrypted { enc_block_index: 0 },
+            }],
+            payload: vec![],
+        };
+        let aad = serde_json::to_vec(&integrity_block).unwrap();
+        let plaintext = serde_json::to_vec(&cipher).unwrap();
+        let (key, salt) = sender.protect_key(N32fDirection::Request);
+        let jwe = jose::jwe_encrypt_with_iv_salt(
+            key,
+            sender.jwe_enc,
+            salt,
+            0,
+            &plaintext,
+            Some(&aad),
+            Some(&sender.kid),
+        )
+        .unwrap();
+        let signing_key = sender.local_signing_key.clone().unwrap();
+        let mods_payload = ModificationsBlockPayload {
+            identity: sender.local_fqdn.clone(),
+            operations: vec![],
+            tag: jwe.tag.clone(),
+        };
+        let jws = jose::jws_sign_es256(
+            &signing_key,
+            &serde_json::to_vec(&mods_payload).unwrap(),
+            Some(&sender.local_fqdn),
+        )
+        .unwrap();
+        let msg = N32fReformattedMessage {
+            reformatted_data: jwe,
+            modifications_block: vec![jws],
+        };
+        let rec = unprotect_message(&receiver, &msg).unwrap();
+        assert_eq!(rec.headers.get("authorization").unwrap(), "Bearer secret-token");
+    }
+
+    // ------------------------------------------------------------------
+    // sepp-07: MetaData.authorizedIpxId always serialized, default "NULL"
+    // ------------------------------------------------------------------
+    #[test]
+    fn metadata_authorized_ipx_id_defaults_to_null_and_roundtrips() {
+        let (sender, receiver) = ctx_pair();
+        let msg =
+            protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body())).unwrap();
+        let aad = b64url_decode(msg.reformatted_data.aad.as_ref().unwrap()).unwrap();
+        let block: DataToIntegrityProtectBlock = serde_json::from_slice(&aad).unwrap();
+        assert_eq!(block.meta_data.authorized_ipx_id, "NULL");
+        let aad_str = String::from_utf8(aad).unwrap();
+        assert!(
+            aad_str.contains("\"authorizedIpxId\":\"NULL\""),
+            "authorizedIpxId must always be serialized as NULL"
+        );
+        assert!(unprotect_message(&receiver, &msg).is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // sepp-08: modificationsBlock tag binds to the JWE Authentication Tag
+    // ------------------------------------------------------------------
+    #[test]
+    fn modifications_entries_bind_to_jwe_tag_not_chain() {
+        let (sender, mut receiver) = ctx_pair();
+        receiver.modification_policy.allowed_paths = vec!["/nssai/sst".to_string()];
+        let (ipx_sk, ipx_vk) = es256_keypair();
+        let ipx_id = "ipx-bind.example.com";
+        receiver.register_verifying_key(ipx_id, ipx_vk);
+
+        // A 2nd entry whose tag is the JWE tag (NOT the prior signature) passes.
+        let mut msg =
+            protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body())).unwrap();
+        let patch = ModificationsBlockPayload {
+            identity: ipx_id.to_string(),
+            operations: vec![serde_json::json!({"op":"replace","path":"/nssai/sst","value":5})],
+            tag: msg.reformatted_data.tag.clone(),
+        };
+        let jws = jose::jws_sign_es256(
+            &ipx_sk,
+            &serde_json::to_vec(&patch).unwrap(),
+            Some(ipx_id),
+        )
+        .unwrap();
+        msg.modifications_block.push(jws);
+        let rec = unprotect_message(&receiver, &msg).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&rec.body.unwrap()).unwrap();
+        assert_eq!(body["nssai"]["sst"], 5);
+
+        // An entry carrying a WRONG tag is rejected.
+        let mut msg2 =
+            protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body())).unwrap();
+        let bad = ModificationsBlockPayload {
+            identity: ipx_id.to_string(),
+            operations: vec![],
+            tag: "not-the-jwe-tag".to_string(),
+        };
+        let jws_bad =
+            jose::jws_sign_es256(&ipx_sk, &serde_json::to_vec(&bad).unwrap(), Some(ipx_id)).unwrap();
+        msg2.modifications_block.push(jws_bad);
+        let err = unprotect_message(&receiver, &msg2).unwrap_err();
+        assert_eq!(
+            err.error_type,
+            N32fErrorType::IntegrityCheckOnModificationsFailed
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // sepp-09: PLMN-ID consistency check on the received N32-f message
+    // ------------------------------------------------------------------
+    #[test]
+    fn plmn_id_consistency_checked_on_receive() {
+        // Matching PLMN: sender stamps 999-70, receiver binds 999-70 => OK.
+        let (mut sender, mut receiver) = ctx_pair();
+        sender.local_plmn_ids = vec![PlmnId::new(999, 70, 2)];
+        receiver.peer_plmn_ids = vec![PlmnId::new(999, 70, 2)];
+        let msg =
+            protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body())).unwrap();
+        assert!(unprotect_message(&receiver, &msg).is_ok());
+
+        // Mismatching PLMN: sender stamps 999-70, receiver binds 001-01 => reject.
+        let (mut sender2, mut receiver2) = ctx_pair();
+        sender2.local_plmn_ids = vec![PlmnId::new(999, 70, 2)];
+        receiver2.peer_plmn_ids = vec![PlmnId::new(1, 1, 2)];
+        let msg2 =
+            protect_message(&sender2, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body())).unwrap();
+        let err = unprotect_message(&receiver2, &msg2).unwrap_err();
+        assert_eq!(err.error_type, N32fErrorType::PolicyMismatch);
+
+        // No binding (receiver has no peer PLMNs) => check skipped (compat).
+        let (mut sender3, receiver3) = ctx_pair();
+        sender3.local_plmn_ids = vec![PlmnId::new(999, 70, 2)];
+        let msg3 =
+            protect_message(&sender3, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body())).unwrap();
+        assert!(unprotect_message(&receiver3, &msg3).is_ok());
+    }
+
+    // ------------------------------------------------------------------
+    // sepp-12: PrinsContext negotiated to A128GCM round-trips
+    // ------------------------------------------------------------------
+    #[test]
+    fn prins_roundtrip_under_a128gcm() {
+        let (mut sender, mut receiver) = ctx_pair();
+        sender.jwe_enc = JweEnc::A128Gcm;
+        receiver.jwe_enc = JweEnc::A128Gcm; // enc is also read from the header
+        let msg =
+            protect_message(&sender, "POST", "/nudm-sdm/v1/supi", &[], Some(&sample_body())).unwrap();
+        // The JWE header advertises A128GCM.
+        let hdr = b64url_decode(&msg.reformatted_data.protected).unwrap();
+        assert!(String::from_utf8(hdr).unwrap().contains("A128GCM"));
+        let rec = unprotect_message(&receiver, &msg).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&rec.body.unwrap()).unwrap();
+        assert_eq!(body["supi"], "imsi-001010000000001");
     }
 }

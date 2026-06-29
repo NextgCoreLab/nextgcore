@@ -303,14 +303,20 @@ pub fn forward_n32f_request(
 /// Copies the data out of the context locks (no guard is held afterwards).
 pub fn build_prins_context(node_id: u64) -> Option<crate::prins::PrinsContext> {
     let ctx = sepp_self();
-    let (security, local_fqdn) = {
+    let (security, local_fqdn, local_plmns, peer_plmns) = {
         let context = ctx.read().ok()?;
         let node = context.node_find(node_id)?;
         let security = node.n32f_security.clone()?;
         let local_fqdn = context.sender.clone().unwrap_or_default();
-        (security, local_fqdn)
+        let local_plmns = context.serving_plmn_ids.clone();
+        let peer_plmns = node.plmn_ids.clone();
+        (security, local_fqdn, local_plmns, peer_plmns)
     };
     let enc_profiles = security.enc_profiles;
+    // sepp-12: the negotiated JWE enc profile (A128GCM/A256GCM) selects the
+    // session-key length used for the JWE.
+    let jwe_enc = crate::jose::JweEnc::from_name(&security.jwe_cipher_suite)
+        .unwrap_or(crate::jose::JweEnc::A256Gcm);
     let mut prins_ctx = crate::prins::PrinsContext::new(
         security.local_context_id,
         security.peer_context_id,
@@ -319,6 +325,11 @@ pub fn build_prins_context(node_id: u64) -> Option<crate::prins::PrinsContext> {
         security.kid,
         local_fqdn,
     );
+    prins_ctx.jwe_enc = jwe_enc;
+    // sepp-09: stamp our serving PLMN-IDs on messages we originate, and verify
+    // received messages against the peer's PLMN-IDs bound to this N32-f context.
+    prins_ctx.local_plmn_ids = local_plmns;
+    prins_ctx.peer_plmn_ids = peer_plmns;
     // Drive the encryption profile set from the NEGOTIATED data-type policy
     // (TS 29.573 §6.1.5.2); the constructor's default profiles are only the
     // local capability advertisement. An empty set (no policy negotiated)

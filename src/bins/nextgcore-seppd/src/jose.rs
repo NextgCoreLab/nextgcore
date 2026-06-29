@@ -9,7 +9,7 @@
 //! DataToIntegrityProtectAndCipherBlock as the JWE plaintext.
 
 use aes_gcm::aead::{Aead, Payload};
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use aes_gcm::{Aes128Gcm, Aes256Gcm, KeyInit, Nonce};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use hmac::{Hmac, Mac};
@@ -53,15 +53,51 @@ pub fn b64url_decode(input: &str) -> Result<Vec<u8>, JoseError> {
 }
 
 // ============================================================================
-// JWE - flattened JSON serialization, alg "dir", enc "A256GCM"
+// JWE - flattened JSON serialization, alg "dir", enc "A128GCM"/"A256GCM"
 // ============================================================================
 
-/// A256GCM key length (bytes)
+/// A256GCM key length (bytes). The N32-KDF derives a 32-octet session key;
+/// A128GCM uses its first 16 octets (HKDF-Expand is prefix-stable, so this is
+/// identical to a direct 16-octet derivation).
 pub const JWE_KEY_LEN: usize = 32;
 /// AES-GCM IV length (bytes) per RFC 7518 section 5.3
 const JWE_IV_LEN: usize = 12;
 /// AES-GCM tag length (bytes)
 const JWE_TAG_LEN: usize = 16;
+
+/// JWE content-encryption algorithm profile (TS 33.501 §13.2.4.9 / TS 33.210):
+/// at least A128GCM and A256GCM. The N32-f session-key length follows the
+/// selected enc (16 vs 32 octets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JweEnc {
+    A128Gcm,
+    A256Gcm,
+}
+
+impl JweEnc {
+    /// Parse the IANA "enc" header value; `None` if unsupported.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "A128GCM" => Some(JweEnc::A128Gcm),
+            "A256GCM" => Some(JweEnc::A256Gcm),
+            _ => None,
+        }
+    }
+    /// IANA "enc" header value.
+    pub fn name(self) -> &'static str {
+        match self {
+            JweEnc::A128Gcm => "A128GCM",
+            JweEnc::A256Gcm => "A256GCM",
+        }
+    }
+    /// Content-encryption key length in octets (16 for A128GCM, 32 for A256GCM).
+    pub fn key_len(self) -> usize {
+        match self {
+            JweEnc::A128Gcm => 16,
+            JweEnc::A256Gcm => 32,
+        }
+    }
+}
 
 /// Flattened JWE JSON serialization (RFC 7516 section 7.2.2), the
 /// `FlatJweJson` shape required by TS 29.573 for `reformattedData`.
@@ -89,31 +125,38 @@ struct JweHeader {
     kid: Option<String>,
 }
 
-/// Low-level A256GCM encryption with caller-provided IV.
-/// Returns (ciphertext, tag). Exposed for RFC 7516 known-answer tests.
-pub fn a256gcm_encrypt(
-    key: &[u8; JWE_KEY_LEN],
+/// Low-level AES-GCM encryption with caller-provided IV, dispatched by `enc`
+/// (A128GCM / A256GCM). `key` must be exactly `enc.key_len()` octets.
+/// Returns (ciphertext, tag).
+fn gcm_encrypt(
+    enc: JweEnc,
+    key: &[u8],
     iv: &[u8; JWE_IV_LEN],
     aad: &[u8],
     plaintext: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), JoseError> {
-    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| JoseError::Crypto(e.to_string()))?;
-    let mut out = cipher
-        .encrypt(
-            Nonce::from_slice(iv),
-            Payload {
-                msg: plaintext,
-                aad,
-            },
-        )
-        .map_err(|e| JoseError::Crypto(e.to_string()))?;
+    let mut out = match enc {
+        JweEnc::A128Gcm => {
+            let cipher =
+                Aes128Gcm::new_from_slice(key).map_err(|e| JoseError::Crypto(e.to_string()))?;
+            cipher.encrypt(Nonce::from_slice(iv), Payload { msg: plaintext, aad })
+        }
+        JweEnc::A256Gcm => {
+            let cipher =
+                Aes256Gcm::new_from_slice(key).map_err(|e| JoseError::Crypto(e.to_string()))?;
+            cipher.encrypt(Nonce::from_slice(iv), Payload { msg: plaintext, aad })
+        }
+    }
+    .map_err(|e| JoseError::Crypto(e.to_string()))?;
     let tag = out.split_off(out.len() - JWE_TAG_LEN);
     Ok((out, tag))
 }
 
-/// Low-level A256GCM decryption.
-fn a256gcm_decrypt(
-    key: &[u8; JWE_KEY_LEN],
+/// Low-level AES-GCM decryption dispatched by `enc`. `key` must be exactly
+/// `enc.key_len()` octets; `iv` must be 12 octets and `tag` 16 octets.
+fn gcm_decrypt(
+    enc: JweEnc,
+    key: &[u8],
     iv: &[u8],
     aad: &[u8],
     ciphertext: &[u8],
@@ -122,19 +165,44 @@ fn a256gcm_decrypt(
     if iv.len() != JWE_IV_LEN || tag.len() != JWE_TAG_LEN {
         return Err(JoseError::Format("bad IV/tag length".into()));
     }
-    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| JoseError::Crypto(e.to_string()))?;
     let mut ct_and_tag = Vec::with_capacity(ciphertext.len() + tag.len());
     ct_and_tag.extend_from_slice(ciphertext);
     ct_and_tag.extend_from_slice(tag);
-    cipher
-        .decrypt(
-            Nonce::from_slice(iv),
-            Payload {
-                msg: &ct_and_tag,
-                aad,
-            },
-        )
-        .map_err(|_| JoseError::Tampered)
+    match enc {
+        JweEnc::A128Gcm => {
+            let cipher =
+                Aes128Gcm::new_from_slice(key).map_err(|e| JoseError::Crypto(e.to_string()))?;
+            cipher.decrypt(Nonce::from_slice(iv), Payload { msg: &ct_and_tag, aad })
+        }
+        JweEnc::A256Gcm => {
+            let cipher =
+                Aes256Gcm::new_from_slice(key).map_err(|e| JoseError::Crypto(e.to_string()))?;
+            cipher.decrypt(Nonce::from_slice(iv), Payload { msg: &ct_and_tag, aad })
+        }
+    }
+    .map_err(|_| JoseError::Tampered)
+}
+
+/// Low-level A256GCM encryption with caller-provided IV.
+/// Returns (ciphertext, tag). Exposed for RFC 7516 known-answer tests.
+pub fn a256gcm_encrypt(
+    key: &[u8; JWE_KEY_LEN],
+    iv: &[u8; JWE_IV_LEN],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>), JoseError> {
+    gcm_encrypt(JweEnc::A256Gcm, key, iv, aad, plaintext)
+}
+
+/// Low-level A256GCM decryption (RFC 7516 known-answer tests).
+fn a256gcm_decrypt(
+    key: &[u8; JWE_KEY_LEN],
+    iv: &[u8],
+    aad: &[u8],
+    ciphertext: &[u8],
+    tag: &[u8],
+) -> Result<Vec<u8>, JoseError> {
+    gcm_decrypt(JweEnc::A256Gcm, key, iv, aad, ciphertext, tag)
 }
 
 /// Build the AEAD AAD input per RFC 7516 section 5.1 step 14:
@@ -147,19 +215,30 @@ fn jwe_aad_input(protected_b64: &str, aad_b64: Option<&str>) -> Vec<u8> {
     }
 }
 
-/// Encrypt `plaintext` as a flattened JWE with alg="dir"/enc="A256GCM" using
-/// the caller-supplied 96-bit IV. Shared core of [`jwe_encrypt`] and
-/// [`jwe_encrypt_with_iv_salt`].
+/// Encrypt `plaintext` as a flattened JWE with alg="dir" and the selected
+/// `enc`, using the caller-supplied 96-bit IV. `key` must hold at least
+/// `enc.key_len()` octets (the leading `enc.key_len()` are used). Shared core
+/// of [`jwe_encrypt`] and [`jwe_encrypt_with_iv_salt`].
 fn jwe_encrypt_with_iv(
-    key: &[u8; JWE_KEY_LEN],
+    key: &[u8],
+    enc: JweEnc,
     iv: &[u8; JWE_IV_LEN],
     plaintext: &[u8],
     external_aad: Option<&[u8]>,
     kid: Option<&str>,
 ) -> Result<FlatJwe, JoseError> {
+    let klen = enc.key_len();
+    if key.len() < klen {
+        return Err(JoseError::Crypto(format!(
+            "key too short for {}: need {klen}, got {}",
+            enc.name(),
+            key.len()
+        )));
+    }
+    let key = &key[..klen];
     let header = JweHeader {
         alg: "dir".to_string(),
-        enc: "A256GCM".to_string(),
+        enc: enc.name().to_string(),
         kid: kid.map(|s| s.to_string()),
     };
     let protected = b64url_encode(
@@ -170,7 +249,7 @@ fn jwe_encrypt_with_iv(
     let aad_b64 = external_aad.map(b64url_encode);
 
     let aad_input = jwe_aad_input(&protected, aad_b64.as_deref());
-    let (ciphertext, tag) = a256gcm_encrypt(key, iv, &aad_input, plaintext)?;
+    let (ciphertext, tag) = gcm_encrypt(enc, key, iv, &aad_input, plaintext)?;
 
     Ok(FlatJwe {
         protected,
@@ -194,41 +273,72 @@ pub fn jwe_encrypt(
     let mut iv = [0u8; JWE_IV_LEN];
     use rand::Rng as _;
     rand::rng().fill(&mut iv);
-    jwe_encrypt_with_iv(key, &iv, plaintext, external_aad, kid)
+    jwe_encrypt_with_iv(key, JweEnc::A256Gcm, &iv, plaintext, external_aad, kid)
 }
 
-/// Encrypt `plaintext` as a flattened JWE with alg="dir"/enc="A256GCM",
-/// seeding the 96-bit AES-GCM IV with the 64-bit N32-f IV salt
-/// (TS 33.501 §13.2.4.4.1/§13.2.4.5): `IV = iv_salt (8B) || random (4B)`.
-/// The IV is transmitted in the JWE, so the receiver decrypts via
-/// [`jwe_decrypt`] without reconstructing it.
+/// Encrypt `plaintext` as a flattened JWE with alg="dir" and the selected
+/// `enc`, building the 96-bit AES-GCM nonce as the N32-f
+/// `IV salt (8B) || SEQ (32-bit big-endian)` per TS 33.501 §13.2.4.4.1: the
+/// per-(IV-salt/direction) SEQ counter guarantees nonce uniqueness without a
+/// random component. The IV is transmitted in the JWE, so the receiver decrypts
+/// via [`jwe_decrypt`] without reconstructing it (and reads SEQ back from it
+/// for replay protection).
 pub fn jwe_encrypt_with_iv_salt(
-    key: &[u8; JWE_KEY_LEN],
+    key: &[u8],
+    enc: JweEnc,
     iv_salt: &[u8; 8],
+    seq: u32,
     plaintext: &[u8],
     external_aad: Option<&[u8]>,
     kid: Option<&str>,
 ) -> Result<FlatJwe, JoseError> {
     let mut iv = [0u8; JWE_IV_LEN];
     iv[..8].copy_from_slice(iv_salt);
-    use rand::Rng as _;
-    rand::rng().fill(&mut iv[8..]);
-    jwe_encrypt_with_iv(key, &iv, plaintext, external_aad, kid)
+    iv[8..].copy_from_slice(&seq.to_be_bytes());
+    jwe_encrypt_with_iv(key, enc, &iv, plaintext, external_aad, kid)
 }
 
-/// Decrypt and verify a flattened JWE produced by [`jwe_encrypt`].
-/// Returns the plaintext. The external AAD (if any) is authenticated as
+/// Recover the `(IV salt, SEQ)` pair from a JWE's 12-octet nonce
+/// (TS 33.501 §13.2.4.4.1: `Nonce = IV salt (8B) || SEQ (32-bit BE)`); used on
+/// receive for the anti-replay window. `None` if the nonce is malformed.
+pub fn jwe_iv_salt_and_seq(jwe: &FlatJwe) -> Option<([u8; 8], u32)> {
+    let iv = b64url_decode(&jwe.iv).ok()?;
+    if iv.len() != JWE_IV_LEN {
+        return None;
+    }
+    let mut salt = [0u8; 8];
+    salt.copy_from_slice(&iv[..8]);
+    let seq = u32::from_be_bytes([iv[8], iv[9], iv[10], iv[11]]);
+    Some((salt, seq))
+}
+
+/// Decrypt and verify a flattened JWE produced by [`jwe_encrypt`]. `key` must
+/// hold at least the selected enc's key length (the leading octets are used);
+/// callers pass the full 32-octet N32-f session key and the enc (A128/A256GCM)
+/// is taken from the JWE header. The external AAD (if any) is authenticated as
 /// part of decryption; the caller obtains it from `jwe.aad`.
-pub fn jwe_decrypt(key: &[u8; JWE_KEY_LEN], jwe: &FlatJwe) -> Result<Vec<u8>, JoseError> {
+pub fn jwe_decrypt(key: &[u8], jwe: &FlatJwe) -> Result<Vec<u8>, JoseError> {
     let header_bytes = b64url_decode(&jwe.protected)?;
     let header: JweHeader = serde_json::from_slice(&header_bytes)
         .map_err(|e| JoseError::Format(format!("JWE header: {e}")))?;
-    if header.alg != "dir" || header.enc != "A256GCM" {
+    if header.alg != "dir" {
         return Err(JoseError::UnsupportedAlgorithm(format!(
             "alg={} enc={}",
             header.alg, header.enc
         )));
     }
+    let enc = JweEnc::from_name(&header.enc).ok_or_else(|| {
+        JoseError::UnsupportedAlgorithm(format!("alg={} enc={}", header.alg, header.enc))
+    })?;
+    let klen = enc.key_len();
+    if key.len() < klen {
+        return Err(JoseError::Crypto(format!(
+            "key too short for {}: need {klen}, got {}",
+            enc.name(),
+            key.len()
+        )));
+    }
+    let key = &key[..klen];
     let iv = b64url_decode(&jwe.iv)?;
     let ciphertext = b64url_decode(&jwe.ciphertext)?;
     let tag = b64url_decode(&jwe.tag)?;
@@ -237,7 +347,7 @@ pub fn jwe_decrypt(key: &[u8; JWE_KEY_LEN], jwe: &FlatJwe) -> Result<Vec<u8>, Jo
         b64url_decode(aad)?;
     }
     let aad_input = jwe_aad_input(&jwe.protected, jwe.aad.as_deref());
-    a256gcm_decrypt(key, &iv, &aad_input, &ciphertext, &tag)
+    gcm_decrypt(enc, key, &iv, &aad_input, &ciphertext, &tag)
 }
 
 // ============================================================================
@@ -503,6 +613,64 @@ mod tests {
             jwe_decrypt(&KEY, &jwe),
             Err(JoseError::UnsupportedAlgorithm(_))
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // sepp-02: nonce = IV salt(8) || SEQ(32-bit BE)
+    // ------------------------------------------------------------------
+    #[test]
+    fn jwe_nonce_is_iv_salt_concat_seq() {
+        let salt: [u8; 8] = [0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7];
+        let seq: u32 = 0x0001_02ff;
+        let jwe = jwe_encrypt_with_iv_salt(&KEY, JweEnc::A256Gcm, &salt, seq, b"pt", None, None)
+            .unwrap();
+        let iv = b64url_decode(&jwe.iv).unwrap();
+        assert_eq!(&iv[..8], &salt, "leading 8 octets are the IV salt");
+        assert_eq!(&iv[8..], &seq.to_be_bytes(), "trailing 4 octets are SEQ (BE)");
+        // And the recovered (salt, seq) round-trips.
+        let (rsalt, rseq) = jwe_iv_salt_and_seq(&jwe).unwrap();
+        assert_eq!(rsalt, salt);
+        assert_eq!(rseq, seq);
+        // Decrypt still works (full 32-octet key, enc from header).
+        assert_eq!(jwe_decrypt(&KEY, &jwe).unwrap(), b"pt");
+    }
+
+    #[test]
+    fn jwe_same_salt_distinct_seq_distinct_nonces() {
+        let salt: [u8; 8] = [9u8; 8];
+        let a = jwe_encrypt_with_iv_salt(&KEY, JweEnc::A256Gcm, &salt, 0, b"x", None, None).unwrap();
+        let b = jwe_encrypt_with_iv_salt(&KEY, JweEnc::A256Gcm, &salt, 1, b"x", None, None).unwrap();
+        assert_ne!(a.iv, b.iv, "SEQ 0 and 1 must yield different nonces");
+    }
+
+    // ------------------------------------------------------------------
+    // sepp-12: JWE enc profile A128GCM and A256GCM round trip
+    // ------------------------------------------------------------------
+    #[test]
+    fn jwe_enc_profile_roundtrip_a128_and_a256() {
+        let salt = [3u8; 8];
+        for enc in [JweEnc::A128Gcm, JweEnc::A256Gcm] {
+            let jwe =
+                jwe_encrypt_with_iv_salt(&KEY, enc, &salt, 7, b"secret-supi", Some(b"aad"), Some("k"))
+                    .unwrap();
+            // Header advertises the selected enc.
+            let hdr: JweHeader =
+                serde_json::from_slice(&b64url_decode(&jwe.protected).unwrap()).unwrap();
+            assert_eq!(hdr.enc, enc.name());
+            // A128GCM uses the first 16 octets of the 32-octet key.
+            assert_eq!(jwe_decrypt(&KEY, &jwe).unwrap(), b"secret-supi");
+        }
+    }
+
+    #[test]
+    fn jwe_a128gcm_uses_16_byte_key_prefix() {
+        // The leading 16 octets of `KEY` must decrypt an A128GCM JWE made with
+        // the full key (proves "session-key length follows the selected enc").
+        let salt = [1u8; 8];
+        let jwe = jwe_encrypt_with_iv_salt(&KEY, JweEnc::A128Gcm, &salt, 0, b"m", None, None).unwrap();
+        let mut k16 = [0u8; 32];
+        k16[..16].copy_from_slice(&KEY[..16]);
+        assert_eq!(jwe_decrypt(&k16, &jwe).unwrap(), b"m");
     }
 
     #[test]

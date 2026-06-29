@@ -445,13 +445,15 @@ pub fn negotiate_protection_policy(
     (selected, profiles)
 }
 
-/// JWE cipher suites this SEPP supports, preference-ordered
-pub const SUPPORTED_JWE_SUITES: &[&str] = &["A256GCM"];
-/// JWS cipher suites this SEPP supports, preference-ordered.
-/// ES256 is asymmetric (TS 33.501 §13.2.4.6); HS256 retained for
-/// interoperability negotiation but the modificationsBlock is always
-/// signed/verified with the asymmetric ES256 key.
-pub const SUPPORTED_JWS_SUITES: &[&str] = &["ES256", "HS256"];
+/// JWE cipher suites this SEPP supports, preference-ordered (TS 33.501
+/// §13.2.4.9 / TS 33.210): at least A128GCM and A256GCM. A256GCM is preferred.
+pub const SUPPORTED_JWE_SUITES: &[&str] = &["A256GCM", "A128GCM"];
+/// JWS cipher suites this SEPP supports (TS 33.501 §13.2.4.9): the N32-f
+/// modificationsBlock JWS profile mandates ES256 ONLY. HS256 is deliberately
+/// NOT advertised — the modificationsBlock is signed/verified with the
+/// asymmetric ES256 key (TS 33.501 §13.2.4.6); a symmetric suite would make
+/// every entry forgeable by either peer. A peer offering no ES256 is rejected.
+pub const SUPPORTED_JWS_SUITES: &[&str] = &["ES256"];
 
 // ============================================================================
 // N32-c TLS exporter secret store (TS 33.501 §13.2.4.4 / RFC 5705)
@@ -494,6 +496,25 @@ pub fn take_n32c_tls_exporter_secret(peer_fqdn: &str) -> Option<Vec<u8>> {
         .write()
         .ok()
         .and_then(|mut s| s.remove(peer_fqdn))
+}
+
+/// Production-strict gate for the deterministic no-TLS key-derivation fallback
+/// (sepp-10). `false` by default: in production the N32-f master key MUST come
+/// from the N32-c TLS RFC 5705 exporter (label `EXPORTER_3GPP_N32_MASTER`,
+/// Length=64) per TS 33.501 §13.2.4.4.1; with no exporter secret the
+/// exchange-params flow fails. It is enabled only for plaintext lab/test
+/// transports (the integration test passes `--allow-insecure-no-tls`).
+static ALLOW_INSECURE_NO_TLS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enable/disable the no-TLS key-derivation fallback (LAB/TEST ONLY).
+pub fn set_allow_insecure_no_tls(allow: bool) {
+    ALLOW_INSECURE_NO_TLS.store(allow, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether the no-TLS fallback is permitted (default `false` = strict).
+pub fn allow_insecure_no_tls() -> bool {
+    ALLOW_INSECURE_NO_TLS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// Pick the first locally supported suite from the peer's list
@@ -615,31 +636,12 @@ pub fn canonical_n32f_context_id(ctx_id_initiator: &str, ctx_id_responder: &str)
     format!("{ctx_id_initiator}-{ctx_id_responder}")
 }
 
-/// Resolve the exporter secret used to derive the N32-f session key with
-/// `peer_fqdn`. Prefers the real RFC 5705 secret deposited by the TLS layer
-/// (TS 33.501 §13.2.4.4); when absent (plaintext/test transport) it falls
-/// back to a deterministic, context-bound input so both peers still agree.
-///
-/// The fallback is NOT a security boundary — it merely lets the PRINS layer
-/// be exercised without TLS. With a real N32-c TLS connection,
-/// `set_n32c_tls_exporter_secret` makes the live exporter secret available
-/// here and the fallback is never used.
-fn resolve_exporter_secret(
-    peer_fqdn: &str,
-    ctx_id_initiator: &str,
-    ctx_id_responder: &str,
-) -> Vec<u8> {
-    if let Some(secret) = take_n32c_tls_exporter_secret(peer_fqdn) {
-        log::debug!("[{peer_fqdn}] N32-f key derived from N32-c TLS exporter (TS 33.501)");
-        return secret;
-    }
-    log::warn!(
-        "[{peer_fqdn}] no N32-c TLS exporter secret; deriving N32-f key \
-         hierarchy from context-bound fallback (no-TLS transport)"
-    );
-    // Deterministic, identical on both ends because the context-ID pair is
-    // mirrored. Domain-separated from any real exporter secret. SHA-512
-    // yields exactly 64 octets, a valid HKDF PRK for the N32-KDF.
+/// Deterministic, context-bound no-TLS fallback master key (LAB/TEST ONLY,
+/// sepp-10). Identical on both ends because the context-ID pair is mirrored;
+/// domain-separated from any real RFC 5705 exporter secret. SHA-512 yields
+/// exactly 64 octets, a valid HKDF PRK for the N32-KDF. NOT a security
+/// boundary — only used when `allow_insecure_no_tls()` is set.
+fn no_tls_fallback(ctx_id_initiator: &str, ctx_id_responder: &str) -> Vec<u8> {
     use sha2::{Digest, Sha512};
     let mut input = b"N32f-no-tls-fallback".to_vec();
     let (lo, hi) = if ctx_id_initiator <= ctx_id_responder {
@@ -651,6 +653,39 @@ fn resolve_exporter_secret(
     input.push(b'|');
     input.extend_from_slice(hi.as_bytes());
     Sha512::digest(&input).to_vec()
+}
+
+/// Resolve the 64-octet N32 master used to derive the N32-f key hierarchy with
+/// `peer_fqdn` (TS 33.501 §13.2.4.4.1). Prefers the real RFC 5705 secret
+/// deposited by the N32-c TLS layer (label `EXPORTER_3GPP_N32_MASTER`,
+/// Length=64). When absent:
+/// - if `allow_fallback` (lab/test transport) → the deterministic,
+///   context-bound [`no_tls_fallback`] so both peers still agree;
+/// - otherwise (production, sepp-10) → `Err` so the exchange-params flow fails
+///   cleanly (mapped to `UNAVAILABLE_PRINS_CONTEXT`). The no-TLS path is thus
+///   unreachable in a default (strict) build.
+fn resolve_exporter_secret(
+    peer_fqdn: &str,
+    ctx_id_initiator: &str,
+    ctx_id_responder: &str,
+    allow_fallback: bool,
+) -> Result<Vec<u8>, String> {
+    if let Some(secret) = take_n32c_tls_exporter_secret(peer_fqdn) {
+        log::debug!("[{peer_fqdn}] N32-f key derived from N32-c TLS exporter (TS 33.501)");
+        return Ok(secret);
+    }
+    if allow_fallback {
+        log::warn!(
+            "[{peer_fqdn}] no N32-c TLS exporter secret; deriving N32-f key \
+             hierarchy from context-bound fallback (allow_insecure_no_tls; LAB/TEST)"
+        );
+        return Ok(no_tls_fallback(ctx_id_initiator, ctx_id_responder));
+    }
+    Err(format!(
+        "[{peer_fqdn}] UNAVAILABLE_PRINS_CONTEXT: no N32-c TLS RFC 5705 exporter \
+         secret and the no-TLS fallback is disabled (production strict); cannot \
+         derive the N32-f key hierarchy"
+    ))
 }
 
 /// Handle an exchange-params request (responder side). Selects cipher
@@ -691,7 +726,12 @@ pub fn handle_exchange_params_request(
     // initiator; we (the responder) use the "reverse" key set to protect the
     // messages we originate. The canonical context ID `{initiator}-{responder}`
     // makes both peers derive identical material.
-    let master = resolve_exporter_secret(&req.sender, &req.n32f_context_id, &local_context_id);
+    let master = resolve_exporter_secret(
+        &req.sender,
+        &req.n32f_context_id,
+        &local_context_id,
+        allow_insecure_no_tls(),
+    )?;
     let n32_context_id = canonical_n32f_context_id(&req.n32f_context_id, &local_context_id);
     let key_material = derive_n32f_key_material(&master, &n32_context_id);
 
@@ -773,8 +813,12 @@ pub fn handle_exchange_params_response(
     // N32-c initiator and use the "parallel" key set to protect the messages
     // we originate. The canonical context ID `{initiator}-{responder}` makes
     // both peers derive identical material.
-    let master =
-        resolve_exporter_secret(&rsp.sender, &sent_req.n32f_context_id, &rsp.n32f_context_id);
+    let master = resolve_exporter_secret(
+        &rsp.sender,
+        &sent_req.n32f_context_id,
+        &rsp.n32f_context_id,
+        allow_insecure_no_tls(),
+    )?;
     let n32_context_id =
         canonical_n32f_context_id(&sent_req.n32f_context_id, &rsp.n32f_context_id);
     let key_material = derive_n32f_key_material(&master, &n32_context_id);
@@ -1113,11 +1157,81 @@ mod tests {
     /// PRK) and is mirrored across the context-ID pair so both peers agree.
     #[test]
     fn test_resolve_exporter_secret_fallback_is_64_octets() {
-        // No secret deposited for this peer => fallback path.
-        let s1 = resolve_exporter_secret("no-tls-peer.example.com", "ctx-i", "ctx-r");
-        let s2 = resolve_exporter_secret("no-tls-peer.example.com", "ctx-r", "ctx-i");
+        // No secret deposited for this peer, fallback allowed => fallback path.
+        let s1 = resolve_exporter_secret("no-tls-peer.example.com", "ctx-i", "ctx-r", true).unwrap();
+        let s2 = resolve_exporter_secret("no-tls-peer.example.com", "ctx-r", "ctx-i", true).unwrap();
         assert_eq!(s1.len(), 64);
         assert_eq!(s1, s2, "fallback is order-independent across the ctx pair");
+    }
+
+    /// sepp-10: with the no-TLS fallback DISABLED (production strict) and no
+    /// RFC 5705 exporter secret deposited, key resolution fails with
+    /// UNAVAILABLE_PRINS_CONTEXT; with it enabled (lab/test) it derives the
+    /// deterministic 64-octet fallback.
+    #[test]
+    fn test_resolve_exporter_secret_strict_requires_tls() {
+        let err =
+            resolve_exporter_secret("strict-peer.example.com", "ci", "cr", false).unwrap_err();
+        assert!(err.contains("UNAVAILABLE_PRINS_CONTEXT"), "got: {err}");
+        let ok = resolve_exporter_secret("strict-peer.example.com", "ci", "cr", true).unwrap();
+        assert_eq!(ok.len(), 64);
+    }
+
+    /// sepp-11: only ES256 is advertised for the JWS, and a peer offering no
+    /// ES256 (HS256-only) fails exchange-params (suite mismatch, before key
+    /// derivation — no TLS fallback needed).
+    #[test]
+    fn test_jws_suite_es256_only_rejects_hs256_peer() {
+        assert_eq!(SUPPORTED_JWS_SUITES, &["ES256"]);
+        {
+            let ctx = sepp_self();
+            let mut context = ctx.write().unwrap();
+            context.set_sender("sepp.local.example.com");
+        }
+        let mut node_b = SeppNode::new(30, "sepp-hs256.example.com");
+        node_b.negotiated_security_scheme = SecurityCapability::Prins;
+        let req = SecParamExchReqData {
+            sender: "sepp-hs256.example.com".to_string(),
+            n32f_context_id: "ctx".to_string(),
+            jwe_cipher_suite_list: vec!["A256GCM".to_string()],
+            jws_cipher_suite_list: vec!["HS256".to_string()], // no ES256
+            protection_policy_info: None,
+            sec_profiles: None,
+            ipx_provider_sec_info_list: None,
+            modifications_signing_public_key: Some(test_es256_pubkey_pem()),
+            sender_api_root: None,
+        };
+        let err = handle_exchange_params_request(&mut node_b, &req).unwrap_err();
+        assert!(err.contains("JWS cipher suite"), "got: {err}");
+    }
+
+    /// sepp-12: a peer offering only A128GCM negotiates A128GCM; the JWE
+    /// session key then uses 16 octets (the leading 16 of the 32-octet N32-KDF
+    /// output).
+    #[test]
+    fn test_jwe_suite_negotiates_a128gcm() {
+        set_allow_insecure_no_tls(true);
+        {
+            let ctx = sepp_self();
+            let mut context = ctx.write().unwrap();
+            context.set_sender("sepp.local.example.com");
+        }
+        let mut node_b = SeppNode::new(31, "sepp-a128.example.com");
+        node_b.negotiated_security_scheme = SecurityCapability::Prins;
+        let req = SecParamExchReqData {
+            sender: "sepp-a128.example.com".to_string(),
+            n32f_context_id: "a128ctx".to_string(),
+            jwe_cipher_suite_list: vec!["A128GCM".to_string()],
+            jws_cipher_suite_list: vec!["ES256".to_string()],
+            protection_policy_info: None,
+            sec_profiles: None,
+            ipx_provider_sec_info_list: None,
+            modifications_signing_public_key: Some(test_es256_pubkey_pem()),
+            sender_api_root: None,
+        };
+        let rsp = handle_exchange_params_request(&mut node_b, &req).unwrap();
+        assert_eq!(rsp.selected_jwe_cipher_suite, "A128GCM");
+        assert_eq!(crate::jose::JweEnc::from_name("A128GCM").unwrap().key_len(), 16);
     }
 
     /// C6: with the SAME TLS exporter secret deposited for both peers (as a
@@ -1267,6 +1381,8 @@ mod tests {
     /// never touches the shared TLS-exporter store of the other handshake tests.
     #[test]
     fn test_exchange_params_responder_drives_profiles_from_negotiated_policy() {
+        // No TLS exporter is deposited for this peer; enable the lab fallback.
+        set_allow_insecure_no_tls(true);
         {
             let ctx = sepp_self();
             let mut context = ctx.write().unwrap();

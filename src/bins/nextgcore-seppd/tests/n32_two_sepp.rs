@@ -80,6 +80,10 @@ impl ChildSepp {
         if prins {
             cmd.arg("--prins");
         }
+        // sepp-10: these peer SEPPs run over plaintext HTTP (no N32-c TLS), so
+        // permit the deterministic no-TLS N32-f key-derivation fallback. In
+        // production this is off and exchange-params requires the TLS exporter.
+        cmd.arg("--allow-insecure-no-tls");
         if let Some(peer) = peer {
             cmd.args(["--peer-sepp", peer]);
         }
@@ -122,6 +126,9 @@ impl Drop for ChildSepp {
 
 /// Configure the in-process SEPP-A identity and capabilities
 fn configure_local_sepp(tls: bool, prins: bool) {
+    // sepp-10: the in-process SEPP-A also runs over plaintext HTTP here, so
+    // permit the no-TLS N32-f key-derivation fallback (off by default).
+    nextgcore_seppd::n32c_handler::set_allow_insecure_no_tls(true);
     let ctx = sepp_self();
     let mut context = ctx.write().expect("context lock");
     if !context.is_initialized() {
