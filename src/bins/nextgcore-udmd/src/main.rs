@@ -416,24 +416,13 @@ async fn handle_amf_registration(supi: &str, request: &SbiRequest) -> SbiRespons
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    // Store AMF registration in context
-    let ctx = udm_self();
-    if let Ok(context) = ctx.read() {
-        context.ue_add(supi);
-    }
-
-    SbiResponse::with_status(201)
-        .with_header(
-            "Location",
-            format!("/nudm-uecm/v1/{supi}/registrations/amf-3gpp-access"),
-        )
-        .with_json_body(&serde_json::json!({
-            "amfInstanceId": reg_data.get("amfInstanceId"),
-            "deregCallbackUri": reg_data.get("deregCallbackUri"),
-            "guami": reg_data.get("guami"),
-            "ratType": reg_data.get("ratType"),
-        }))
-        .unwrap_or_else(|_| SbiResponse::with_status(201))
+    // udmd-03 (validate) -> udmd-01 (persist to UDR) -> udmd-02 (notify old AMF).
+    nextgcore_udmd::uecm::process_amf_registration(
+        supi,
+        &reg_data,
+        &nextgcore_udmd::uecm::UdrClient::Live,
+    )
+    .await
 }
 
 async fn handle_amf_registration_update(supi: &str, request: &SbiRequest) -> SbiResponse {
@@ -455,14 +444,9 @@ async fn handle_amf_registration_update(supi: &str, request: &SbiRequest) -> Sbi
 async fn handle_amf_deregistration(supi: &str) -> SbiResponse {
     log::info!("AMF Deregistration: SUPI={supi}");
 
-    let ctx = udm_self();
-    if let Ok(context) = ctx.read() {
-        if let Some(ue) = context.ue_find_by_supi(supi) {
-            context.ue_remove(ue.id);
-        }
-    }
-
-    SbiResponse::with_status(204)
+    // udmd-01: DELETE the UDR context-data before returning 204.
+    nextgcore_udmd::uecm::process_amf_deregistration(supi, &nextgcore_udmd::uecm::UdrClient::Live)
+        .await
 }
 
 async fn handle_smf_registration(
@@ -482,23 +466,26 @@ async fn handle_smf_registration(
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    SbiResponse::with_status(201)
-        .with_header(
-            "Location",
-            format!("/nudm-uecm/v1/{supi}/registrations/smf-registrations/{pdu_session_id}"),
-        )
-        .with_json_body(&serde_json::json!({
-            "smfInstanceId": reg_data.get("smfInstanceId"),
-            "pduSessionId": pdu_session_id,
-            "singleNssai": reg_data.get("singleNssai"),
-            "dnn": reg_data.get("dnn"),
-        }))
-        .unwrap_or_else(|_| SbiResponse::with_status(201))
+    // udmd-03 (validate) -> udmd-01 (persist to UDR).
+    nextgcore_udmd::uecm::process_smf_registration(
+        supi,
+        pdu_session_id,
+        &reg_data,
+        &nextgcore_udmd::uecm::UdrClient::Live,
+    )
+    .await
 }
 
 async fn handle_smf_deregistration(supi: &str, pdu_session_id: &str) -> SbiResponse {
     log::info!("SMF Deregistration: SUPI={supi}, PDU Session={pdu_session_id}");
-    SbiResponse::with_status(204)
+
+    // udmd-01: DELETE the per-PDU-session UDR context-data before returning 204.
+    nextgcore_udmd::uecm::process_smf_deregistration(
+        supi,
+        pdu_session_id,
+        &nextgcore_udmd::uecm::UdrClient::Live,
+    )
+    .await
 }
 
 // Subscriber Data Management handlers

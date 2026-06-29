@@ -448,6 +448,104 @@ pub async fn udm_nudr_dr_send_provisioned_data_get(
     udm_sbi_discover_and_send_nudr_dr(udm_ue_id, stream_id, request).await
 }
 
+// ---------------------------------------------------------------------------
+// UECM context-data persistence (Nudr_DataRepository, TS 29.505) — udmd-01/02
+// ---------------------------------------------------------------------------
+
+/// GET the stored AMF 3GPP-access registration from UDR (udmd-02 prior read).
+///
+/// Builds: `GET /nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access`
+pub async fn udm_nudr_dr_send_amf_context_get(supi: &str) -> Result<SbiResponse, String> {
+    let path = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access");
+    udm_sbi_discover_and_send_nudr_dr(0, 0, SbiRequest::get(&path)).await
+}
+
+/// PUT the AMF 3GPP-access registration to UDR (udmd-01).
+///
+/// Builds: `PUT /nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access`
+pub async fn udm_nudr_dr_send_amf_context_put(
+    supi: &str,
+    body: &serde_json::Value,
+) -> Result<SbiResponse, String> {
+    let path = format!("/nudr-dr/v1/subscription-data/{supi}/context-data/amf-3gpp-access");
+    let request = SbiRequest::put(&path)
+        .with_json_body(body)
+        .map_err(|e| format!("Failed to serialize AMF context: {e}"))?;
+    udm_sbi_discover_and_send_nudr_dr(0, 0, request).await
+}
+
+/// PUT a per-PDU-session SMF registration to UDR (udmd-01).
+///
+/// Builds: `PUT /nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations/{psi}`
+pub async fn udm_nudr_dr_send_smf_context_put(
+    supi: &str,
+    psi: &str,
+    body: &serde_json::Value,
+) -> Result<SbiResponse, String> {
+    let path =
+        format!("/nudr-dr/v1/subscription-data/{supi}/context-data/smf-registrations/{psi}");
+    let request = SbiRequest::put(&path)
+        .with_json_body(body)
+        .map_err(|e| format!("Failed to serialize SMF registration: {e}"))?;
+    udm_sbi_discover_and_send_nudr_dr(0, 0, request).await
+}
+
+/// DELETE a UECM context-data resource from UDR (udmd-01 deregistration).
+///
+/// `relative_path` is the resource under `context-data/`, e.g.
+/// `amf-3gpp-access` or `smf-registrations/{psi}`. Builds:
+/// `DELETE /nudr-dr/v1/subscription-data/{supi}/context-data/{relative_path}`
+pub async fn udm_nudr_dr_send_context_delete(
+    supi: &str,
+    relative_path: &str,
+) -> Result<SbiResponse, String> {
+    let path =
+        format!("/nudr-dr/v1/subscription-data/{supi}/context-data/{relative_path}");
+    udm_sbi_discover_and_send_nudr_dr(0, 0, SbiRequest::delete(&path)).await
+}
+
+/// Parse an absolute SBI callback URI into `(host, port, path)`.
+///
+/// Returns `None` for a relative URI (no scheme/authority) since a host cannot
+/// be resolved — the caller treats that as a best-effort skip.
+fn parse_callback_uri(uri: &str) -> Option<(String, u16, String)> {
+    let (default_port, without_scheme) = if let Some(rest) = uri.strip_prefix("https://") {
+        (443u16, rest)
+    } else if let Some(rest) = uri.strip_prefix("http://") {
+        (80u16, rest)
+    } else {
+        return None;
+    };
+    let (authority, path) = match without_scheme.split_once('/') {
+        Some((a, p)) => (a, format!("/{p}")),
+        None => (without_scheme, "/".to_string()),
+    };
+    if authority.is_empty() {
+        return None;
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().ok()?),
+        None => (authority.to_string(), default_port),
+    };
+    Some((host, port, path))
+}
+
+/// POST a `DeregistrationData` to an old AMF's deregistration callback URI
+/// (udmd-02, TS 29.503 §5.3.2.3.2). Best-effort: the caller logs failures and
+/// does not fail the new registration.
+pub async fn udm_sbi_send_dereg_notification(
+    callback_uri: &str,
+    body: &serde_json::Value,
+) -> Result<SbiResponse, String> {
+    let (host, port, path) = parse_callback_uri(callback_uri)
+        .ok_or_else(|| format!("deregCallbackUri is not an absolute URI: {callback_uri}"))?;
+    let client = global_context().get_client(&host, port).await;
+    client
+        .post_json(&path, body)
+        .await
+        .map_err(|e| format!("Dereg notification POST to {callback_uri} failed: {e}"))
+}
+
 /// SBI transaction for tracking requests
 #[derive(Debug, Clone)]
 pub struct SbiXact {

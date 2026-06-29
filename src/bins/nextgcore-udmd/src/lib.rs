@@ -14,6 +14,7 @@ pub mod sess_sm;
 pub mod timer;
 pub mod udm_sm;
 pub mod ue_sm;
+pub mod uecm;
 
 // Re-export commonly used types
 pub use context::{
@@ -29,7 +30,10 @@ pub use ue_sm::{UdmUeSmContext, UdmUeState};
 // Re-export SBI path functions
 pub use sbi_path::{
     udm_nrf_deregister, udm_nrf_discover, udm_nrf_heartbeat, udm_nrf_register,
+    udm_nudr_dr_send_amf_context_get, udm_nudr_dr_send_amf_context_put,
     udm_nudr_dr_send_auth_subscription_get, udm_nudr_dr_send_auth_subscription_patch,
-    udm_nudr_dr_send_provisioned_data_get, udm_sbi_close, udm_sbi_discover_and_send_nudr_dr,
-    udm_sbi_is_running, udm_sbi_open, udm_sbi_send_request, SbiServer, SbiServerConfig, SbiXact,
+    udm_nudr_dr_send_context_delete, udm_nudr_dr_send_provisioned_data_get,
+    udm_nudr_dr_send_smf_context_put, udm_sbi_close, udm_sbi_discover_and_send_nudr_dr,
+    udm_sbi_is_running, udm_sbi_open, udm_sbi_send_dereg_notification, udm_sbi_send_request,
+    SbiServer, SbiServerConfig, SbiXact,
 };
