@@ -1268,6 +1268,135 @@ async fn handle_sm_policy_update_notify(sm_policy_id: &str, request: &SbiRequest
 
 // Policy Authorization handlers
 
+/// Parse a TS 29.514 MediaSubComponent (`fNum`, `fDescs`) from JSON.
+fn parse_media_sub_component(v: &serde_json::Value) -> Option<MediaSubComponent> {
+    let obj = v.as_object()?;
+    let f_num = obj.get("fNum").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+    let f_descs = obj
+        .get("fDescs")
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|d| d.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(MediaSubComponent {
+        f_num,
+        flow_usage: FlowUsage::default(),
+        f_descs,
+    })
+}
+
+/// Parse a TS 29.514 MediaComponent (medCompN, medType, marBw*, qosReference,
+/// fStatus, medSubComps) from JSON.
+fn parse_media_component(v: &serde_json::Value) -> Option<MediaComponent> {
+    let obj = v.as_object()?;
+    let get_str = |k: &str| obj.get(k).and_then(|x| x.as_str()).map(str::to_string);
+    let med_sub_comps = obj
+        .get("medSubComps")
+        .and_then(|x| x.as_object())
+        .map(|m| m.values().filter_map(parse_media_sub_component).collect())
+        .unwrap_or_default();
+    Some(MediaComponent {
+        med_comp_n: obj.get("medCompN").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+        med_type: obj
+            .get("medType")
+            .and_then(|x| x.as_str())
+            .map(MediaType::from_wire)
+            .unwrap_or_default(),
+        mar_bw_dl: get_str("marBwDl"),
+        mar_bw_ul: get_str("marBwUl"),
+        mir_bw_dl: get_str("mirBwDl"),
+        mir_bw_ul: get_str("mirBwUl"),
+        rr_bw: get_str("rrBw"),
+        rs_bw: get_str("rsBw"),
+        qos_ref: get_str("qosReference").or_else(|| get_str("qosRef")),
+        f_status: obj
+            .get("fStatus")
+            .and_then(|x| x.as_str())
+            .map(FlowStatus::from_wire)
+            .unwrap_or_default(),
+        med_sub_comps,
+    })
+}
+
+/// Parse a TS 29.514 AppSessionContextReqData (`ascReqData`) from JSON. The
+/// `medComponents` attribute is a map keyed by medCompN.
+fn parse_asc_req_data(root: &serde_json::Value) -> AscReqData {
+    let med_components = root
+        .get("medComponents")
+        .and_then(|v| v.as_object())
+        .map(|map| map.values().filter_map(parse_media_component).collect())
+        .unwrap_or_default();
+    AscReqData {
+        supp_feat: root
+            .get("suppFeat")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        notif_uri: root
+            .get("notifUri")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        med_components,
+    }
+}
+
+/// Whether AscRespData is conditionally required in the response (TS 29.514
+/// §4.2.2.2): emergency sessions or AF requests carrying UE identity / service
+/// URN. Otherwise the negotiated `suppFeat` alone is returned.
+fn asc_resp_required(root: &serde_json::Value) -> bool {
+    root.get("ueIds").is_some()
+        || root.get("servUrn").is_some()
+        || root
+            .get("dnn")
+            .and_then(|v| v.as_str())
+            .map(|d| d.eq_ignore_ascii_case("sos") || d.eq_ignore_ascii_case("emergency"))
+            .unwrap_or(false)
+}
+
+/// Merge newly-built AF PCC rules into a session, replacing any rule with the
+/// same id (stable per (psi, medCompN)) and appending the rest.
+fn merge_af_pcc_rules(sess: &mut PcfSess, new_rules: Vec<npcf_handler::AfPccRule>) {
+    let new_ids: std::collections::HashSet<String> =
+        new_rules.iter().map(|r| r.pcc_rule_id.clone()).collect();
+    sess.af_pcc_rules
+        .retain(|r| !new_ids.contains(&r.pcc_rule_id));
+    sess.af_pcc_rules.extend(new_rules);
+}
+
+/// Build the AppSessionContext body returned in the create/modify response.
+/// Backward-compat: a request WITHOUT medComponents yields exactly
+/// `{appSessionId, notifUri, suppFeat}` (the bind + suppFeat-echo behaviour).
+/// When medComponents are present the echoed `ascReqData` is added, plus
+/// `ascRespData` when it is conditionally required (else the `suppFeat` echo).
+fn build_app_session_context(
+    app_session_id: &str,
+    req_root: &serde_json::Value,
+    asc: &AscReqData,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "appSessionId": app_session_id,
+        "notifUri": req_root.get("notifUri"),
+        "suppFeat": req_root.get("suppFeat"),
+    });
+    if !asc.med_components.is_empty() {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("ascReqData".to_string(), req_root.clone());
+            if asc_resp_required(req_root) {
+                let mut rd = serde_json::json!({ "servAuthInfo": "NOT_KNOWN" });
+                if let Some(sf) = req_root.get("suppFeat") {
+                    if let Some(rd_obj) = rd.as_object_mut() {
+                        rd_obj.insert("suppFeat".to_string(), sf.clone());
+                    }
+                }
+                obj.insert("ascRespData".to_string(), rd);
+            }
+        }
+    }
+    body
+}
+
 async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
     log::info!("App Session Create");
 
@@ -1281,15 +1410,16 @@ async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    let notif_uri = session_data
-        .get("notifUri")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+    // TS 29.514 AppSessionContext carries the request under `ascReqData`; the
+    // legacy flat body (matched-sim) is accepted as a fallback.
+    let req_root = session_data.get("ascReqData").unwrap_or(&session_data);
+    let asc = parse_asc_req_data(req_root);
+    let notif_uri = asc.notif_uri.clone();
 
     // Bind the AF session to the PCC session via the UE IP (TS 29.514
     // AppSessionContextReqData.ueIpv4) so AF-triggered PCC rule changes can
     // be pushed to the SMF.
-    let ue_ipv4 = session_data.get("ueIpv4").and_then(|v| v.as_str());
+    let ue_ipv4 = req_root.get("ueIpv4").and_then(|v| v.as_str());
     let ctx = pcf_self();
     let bound_sess = ue_ipv4.and_then(|ip| {
         ctx.read()
@@ -1313,9 +1443,30 @@ async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
         .map(|a| a.app_session_id.clone())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    // AF media components install PCC rules at the SMF: push the SM policy
-    // update notification (real HTTP POST, TS 29.512 §4.2.3.2).
-    if let Some(ref sess) = bound_sess {
+    if !asc.med_components.is_empty() {
+        // AF media components → PCC rules persisted on the bound session and
+        // pushed to the SMF in an SM policy update notify (TS 29.514 §4.2.2.2).
+        if let Some(ref sess) = bound_sess {
+            let new_rules = media_components_to_pcc(&asc, sess);
+            let installed = new_rules.len();
+            if let Ok(context) = ctx.read() {
+                if let Some(mut latest) = context.sess_find_by_id(sess.id) {
+                    merge_af_pcc_rules(&mut latest, new_rules);
+                    context.sess_update(&latest);
+                }
+            }
+            pcf_sbi_send_af_smpolicycontrol_update_notify(sess.id);
+            log::info!(
+                "App session create installed {installed} AF PCC rule(s) on sess_id={}",
+                sess.id
+            );
+        } else {
+            log::warn!(
+                "App session create with medComponents but no PCC session bound to ueIpv4={ue_ipv4:?}"
+            );
+        }
+    } else if let Some(ref sess) = bound_sess {
+        // Backward-compat (no medComponents): bind + generic notify, as today.
         pcf_sbi_send_smpolicycontrol_update_notify(sess.id);
     } else if ue_ipv4.is_some() {
         log::warn!("App session create: no PCC session bound to ueIpv4={ue_ipv4:?}");
@@ -1331,11 +1482,7 @@ async fn handle_app_session_create(request: &SbiRequest) -> SbiResponse {
             "Location",
             format!("/npcf-policyauthorization/v1/app-sessions/{app_session_id}"),
         )
-        .with_json_body(&serde_json::json!({
-            "appSessionId": app_session_id,
-            "notifUri": session_data.get("notifUri"),
-            "suppFeat": session_data.get("suppFeat"),
-        }))
+        .with_json_body(&build_app_session_context(&app_session_id, req_root, &asc))
         .unwrap_or_else(|_| SbiResponse::with_status(201))
 }
 
@@ -1400,10 +1547,15 @@ async fn handle_app_session_modify(app_session_id: &str, request: &SbiRequest) -
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
     };
 
-    let _modify_data: serde_json::Value = match serde_json::from_str(body) {
+    let modify_data: serde_json::Value = match serde_json::from_str(body) {
         Ok(p) => p,
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
+
+    // TS 29.514 §4.2.3.3: a PATCH carries AppSessionContextUpdateData; accept
+    // either the nested `ascReqData` or the flat form.
+    let req_root = modify_data.get("ascReqData").unwrap_or(&modify_data);
+    let asc = parse_asc_req_data(req_root);
 
     let ctx = pcf_self();
     let app = if let Ok(context) = ctx.read() {
@@ -1413,12 +1565,39 @@ async fn handle_app_session_modify(app_session_id: &str, request: &SbiRequest) -
     };
 
     match app {
-        Some(app) => SbiResponse::with_status(200)
-            .with_json_body(&serde_json::json!({
-                "appSessionId": app.app_session_id,
-                "notifUri": app.notif_uri,
-            }))
-            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        Some(app) => {
+            if !asc.med_components.is_empty() {
+                // Re-derive the AF PCC rules and push them to the SMF.
+                let mut installed = 0usize;
+                if let Ok(context) = ctx.read() {
+                    if let Some(mut sess) = context.sess_find_by_id(app.sess_id) {
+                        let new_rules = media_components_to_pcc(&asc, &sess);
+                        installed = new_rules.len();
+                        merge_af_pcc_rules(&mut sess, new_rules);
+                        context.sess_update(&sess);
+                    }
+                }
+                pcf_sbi_send_af_smpolicycontrol_update_notify(app.sess_id);
+                log::info!(
+                    "App session modify updated {installed} AF PCC rule(s) on sess_id={}",
+                    app.sess_id
+                );
+            }
+
+            let mut resp_body = build_app_session_context(&app.app_session_id, req_root, &asc);
+            // Always reflect the stored notifUri on the resource representation.
+            if let Some(obj) = resp_body.as_object_mut() {
+                if obj.get("notifUri").map(|v| v.is_null()).unwrap_or(true) {
+                    obj.insert(
+                        "notifUri".to_string(),
+                        serde_json::json!(app.notif_uri),
+                    );
+                }
+            }
+            SbiResponse::with_status(200)
+                .with_json_body(&resp_body)
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
         None => send_not_found(
             &format!("App Session {app_session_id} not found"),
             Some("SESSION_NOT_FOUND"),
@@ -1985,5 +2164,158 @@ mod tests {
         );
         let resp = pcf_sbi_request_handler(req).await;
         assert_eq!(resp.status, 200);
+    }
+
+    /// pcfd-02: an AF app-session create carrying one audio media component
+    /// installs an AF-derived PccRule on the bound PDU session and the outbound
+    /// SM policy update notify body carries it; the 201 echoes suppFeat.
+    #[tokio::test]
+    async fn app_session_create_with_media_components_installs_pcc_rule() {
+        pcf_context_init(64, 64);
+
+        // Bind a PDU session with a known UE IP via SM policy create.
+        let mut create = full_create_body("imsi-001010000000088", 11);
+        create
+            .as_object_mut()
+            .unwrap()
+            .insert("ipv4Address".to_string(), serde_json::json!("10.45.0.88"));
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(create),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+
+        // AF POST app-session with one audio media component.
+        let af_body = serde_json::json!({
+            "notifUri": "http://127.0.0.1:9/af-notif/1",
+            "suppFeat": "0",
+            "ueIpv4": "10.45.0.88",
+            "medComponents": {
+                "1": {
+                    "medCompN": 1,
+                    "medType": "AUDIO",
+                    "marBwDl": "256 Kbps",
+                    "marBwUl": "128 Kbps",
+                    "fStatus": "ENABLED",
+                    "medSubComps": {
+                        "1": {
+                            "fNum": 1,
+                            "fDescs": [
+                                "permit out ip from 10.45.0.88 to any",
+                                "permit in ip from any to 10.45.0.88"
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions",
+            Some(af_body),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(body["appSessionId"].as_str().is_some());
+        assert_eq!(body["suppFeat"], "0");
+        assert!(body.get("ascReqData").is_some());
+
+        // The bound session now carries the AF-derived PCC rule.
+        let ctx = pcf_self();
+        let sess = ctx
+            .read()
+            .unwrap()
+            .sess_find_by_ipv4addr("10.45.0.88")
+            .expect("bound PDU session");
+        assert_eq!(sess.af_pcc_rules.len(), 1);
+        assert_eq!(sess.af_pcc_rules[0].qos_data.five_qi, 1);
+        assert_eq!(
+            sess.af_pcc_rules[0].qos_data.maxbr_dl.as_deref(),
+            Some("256 Kbps")
+        );
+
+        // The outbound SM policy update notify body carries the new PccRule.
+        let notify = npcf_handler::build_af_sm_policy_notification(&sess);
+        let pcc_rules = notify["smPolicyDecision"]["pccRules"]
+            .as_object()
+            .expect("pccRules object");
+        assert_eq!(pcc_rules.len(), 1);
+        let (_id, rule) = pcc_rules.iter().next().unwrap();
+        assert_eq!(
+            rule["flowInfos"][0]["flowDescription"],
+            "permit out ip from 10.45.0.88 to any"
+        );
+        let qos_id = rule["refQosData"][0].as_str().unwrap();
+        assert_eq!(
+            notify["smPolicyDecision"]["qosDecs"][qos_id]["maxbrDl"],
+            "256 Kbps"
+        );
+        assert_eq!(notify["smPolicyDecision"]["qosDecs"][qos_id]["qosId"], qos_id);
+    }
+
+    /// pcfd-02 backward-compat: an app-session create WITHOUT medComponents
+    /// behaves exactly as before — bind + suppFeat echo, no ascReqData/Resp.
+    #[tokio::test]
+    async fn app_session_create_without_media_components_is_backward_compatible() {
+        pcf_context_init(64, 64);
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions",
+            Some(serde_json::json!({
+                "notifUri": "http://127.0.0.1:9/af-notif/2",
+                "suppFeat": "0",
+                "ueIpv4": "10.45.0.250"
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let obj = body.as_object().unwrap();
+        // Exactly the legacy shape: appSessionId, notifUri, suppFeat.
+        assert_eq!(obj.len(), 3);
+        assert!(obj.contains_key("appSessionId"));
+        assert_eq!(obj["notifUri"], "http://127.0.0.1:9/af-notif/2");
+        assert_eq!(obj["suppFeat"], "0");
+        assert!(!obj.contains_key("ascReqData"));
+        assert!(!obj.contains_key("ascRespData"));
+    }
+
+    /// pcfd-02: an emergency AF request (dnn=sos) yields ascRespData in the 201.
+    #[tokio::test]
+    async fn app_session_create_emergency_emits_asc_resp_data() {
+        pcf_context_init(64, 64);
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-policyauthorization/v1/app-sessions",
+            Some(serde_json::json!({
+                "notifUri": "http://127.0.0.1:9/af-notif/3",
+                "suppFeat": "0",
+                "dnn": "sos",
+                "medComponents": {
+                    "1": {
+                        "medCompN": 1,
+                        "medType": "AUDIO",
+                        "marBwDl": "64 Kbps",
+                        "marBwUl": "64 Kbps",
+                        "fStatus": "ENABLED",
+                        "medSubComps": {
+                            "1": { "fNum": 1, "fDescs": ["permit out ip from any to assigned"] }
+                        }
+                    }
+                }
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(body.get("ascRespData").is_some());
+        assert_eq!(body["ascRespData"]["suppFeat"], "0");
+        assert_eq!(body["ascRespData"]["servAuthInfo"], "NOT_KNOWN");
     }
 }

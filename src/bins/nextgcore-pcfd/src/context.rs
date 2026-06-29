@@ -424,6 +424,10 @@ pub struct PcfSess {
     pub pcf_ue_sm_id: u64,
     /// Associated stream ID
     pub stream_id: Option<u64>,
+    /// PCC rules installed for AF application sessions bound to this PDU
+    /// session (TS 29.514 PolicyAuthorization → TS 29.512 SmPolicyDecision).
+    /// Pushed to the SMF in the SM policy update notification.
+    pub af_pcc_rules: Vec<crate::npcf_handler::AfPccRule>,
 }
 
 impl PcfSess {
@@ -452,6 +456,7 @@ impl PcfSess {
             app_ids: Vec::new(),
             pcf_ue_sm_id,
             stream_id: None,
+            af_pcc_rules: Vec::new(),
         }
     }
 

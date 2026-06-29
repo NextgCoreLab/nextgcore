@@ -396,6 +396,28 @@ pub fn pcf_sbi_send_smpolicycontrol_update_notify(sess_id: u64) -> bool {
     spawn_notification(uri, "/update", body, "SM policy update")
 }
 
+/// Send an SM policy control update notify to the SMF carrying the AF-derived
+/// PCC rules stored on the session (TS 29.514 PolicyAuthorization → TS 29.512
+/// §4.2.3.2). Unlike `pcf_sbi_send_smpolicycontrol_update_notify` (which
+/// re-derives the subscription decision), this pushes the
+/// media-component-installed PccRule/QosData decisions.
+pub fn pcf_sbi_send_af_smpolicycontrol_update_notify(sess_id: u64) -> bool {
+    let sess = crate::context::pcf_self()
+        .read()
+        .ok()
+        .and_then(|ctx| ctx.sess_find_by_id(sess_id));
+    let Some(sess) = sess else {
+        log::warn!("[sess_id={sess_id}] AF SM policy update notify: session not found");
+        return false;
+    };
+    let Some(uri) = sess.notification_uri.clone() else {
+        log::warn!("[sess_id={sess_id}] AF SM policy update notify: no notification URI stored");
+        return false;
+    };
+    let body = crate::npcf_handler::build_af_sm_policy_notification(&sess);
+    spawn_notification(uri, "/update", body, "AF SM policy update")
+}
+
 /// Send SM policy control delete notify to the SMF over HTTP: an update
 /// notification removing the PCC rules installed for the app session
 /// (TS 29.512 — a null PCC-rule entry means removal).
