@@ -1385,6 +1385,68 @@ fn problem_400(cause: &str, detail: &str) -> SbiResponse {
     SbiResponse::with_status(400).with_body(body.to_string(), "application/problem+json")
 }
 
+/// Resolve an N1 (NAS) or N2 (NGAP) binary payload referenced from the JSON
+/// root of an inbound SBI request, accepting BOTH the conformant
+/// multipart/related form and the legacy base64-in-JSON form.
+///
+/// Per TS 29.502 §6.1.2.2.2 / §6.1.2.4 the JSON attribute is a RefToBinaryData
+/// pointer (`{ "contentId": "<id>" }`) and the bytes live in the multipart
+/// binary part whose `Content-Id` equals `<id>` (carried on
+/// `request.http.parts`). When no matching part is present the attribute is
+/// read as a base64 string — the form the matched-sim AMF previously emitted —
+/// so both wire encodings interoperate without an E2E flip.
+fn resolve_binary_ref(request: &SbiRequest, field: &serde_json::Value) -> Option<Vec<u8>> {
+    if let Some(content_id) = field["contentId"].as_str() {
+        if let Some(part) = request
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some(content_id))
+        {
+            return Some(part.data.to_vec());
+        }
+    }
+    if let Some(b64) = field.as_str() {
+        use base64::Engine;
+        return base64::engine::general_purpose::STANDARD.decode(b64).ok();
+    }
+    None
+}
+
+/// Build a multipart/related SBI response carrying the N1 (PDU session NAS,
+/// `application/vnd.3gpp.5gnas`) and N2 (NGAP transfer,
+/// `application/vnd.3gpp.ngap`) payloads as binary parts referenced from the
+/// JSON root by RefToBinaryData pointers (TS 29.502 §6.1.2.2.2 / §6.1.2.4).
+///
+/// `json_root` provides the SmContext* JSON attributes (e.g. `smContextRef`,
+/// `n2SmInfoType`); the `n1SmMsg` / `n2SmInfo` attributes are overwritten here
+/// with their `{ "contentId": ... }` references. Keeping N1/N2 IN the response
+/// matches the current SMF behaviour (the separate Namf_Communication transfer
+/// is smfd-03, out of scope).
+fn sbi_response_with_n1_n2(
+    status: u16,
+    mut json_root: serde_json::Value,
+    n1_sm_msg: &[u8],
+    n2_sm_info: &[u8],
+) -> SbiResponse {
+    use ogs_sbi::constants::content_type;
+    use ogs_sbi::message::SbiPart;
+    json_root["n1SmMsg"] = serde_json::json!({ "contentId": "n1SmMsg" });
+    json_root["n2SmInfo"] = serde_json::json!({ "contentId": "n2SmInfo" });
+    SbiResponse::with_status(status)
+        .with_body(json_root.to_string(), content_type::APPLICATION_JSON)
+        .with_part(SbiPart::with_content(
+            "n1SmMsg",
+            content_type::APPLICATION_5GNAS,
+            bytes::Bytes::copy_from_slice(n1_sm_msg),
+        ))
+        .with_part(SbiPart::with_content(
+            "n2SmInfo",
+            content_type::APPLICATION_NGAP,
+            bytes::Bytes::copy_from_slice(n2_sm_info),
+        ))
+}
+
 /// Build the N2 SM `PDUSessionResourceSetupRequestTransfer` (TS 38.413
 /// §9.3.4.1) carrying the UPF N3 GTP-U F-TEID and the QoS flow setup list,
 /// using the real-APER `ogs-ngap` transfer codec (not bespoke bytes).
@@ -1507,13 +1569,22 @@ fn sm_context_create_error(
     pti: u8,
     gsm_cause_5gsm: u8,
 ) -> SbiResponse {
-    use base64::Engine;
+    use ogs_sbi::constants::content_type;
+    use ogs_sbi::message::SbiPart;
     let n1 = policy::build_establishment_reject(psi, pti, gsm_cause_5gsm);
+    // N1-bearing reject: the PDU Session Establishment Reject travels as a
+    // 5gnas binary part referenced by RefToBinaryData (TS 29.502 §6.1.2.4).
     let body = serde_json::json!({
         "error": { "status": status, "cause": cause },
-        "n1SmMsg": base64::engine::general_purpose::STANDARD.encode(&n1),
+        "n1SmMsg": { "contentId": "n1SmMsg" },
     });
-    SbiResponse::with_status(status).with_body(body.to_string(), "application/json")
+    SbiResponse::with_status(status)
+        .with_body(body.to_string(), content_type::APPLICATION_JSON)
+        .with_part(SbiPart::with_content(
+            "n1SmMsg",
+            content_type::APPLICATION_5GNAS,
+            bytes::Bytes::copy_from_slice(&n1),
+        ))
 }
 
 /// Dispatch an Npcf_SMPolicyControl client response into a session's GSM FSM
@@ -1595,12 +1666,12 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     );
 
     // ---- N1 SM container: PDU Session Establishment Request (TS 24.501) ----
-    let (pti, requested_type, requested_ssc) = match req_body["n1SmMsg"].as_str() {
-        Some(b64) => {
-            use base64::Engine;
-            let Ok(n1_bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else {
-                return problem_400("N1_SM_ERROR", "n1SmMsg is not valid base64");
-            };
+    // The N1 container arrives either as a multipart 5gnas binary part
+    // (resolved via its RefToBinaryData contentId) or, from a legacy peer, as
+    // a base64 string. `resolve_binary_ref` accepts both.
+    let (pti, requested_type, requested_ssc) = match resolve_binary_ref(request, &req_body["n1SmMsg"])
+    {
+        Some(n1_bytes) => {
             match policy::parse_establishment_request(&n1_bytes) {
                 Some(req) => {
                     if req.psi != pdu_session_id {
@@ -2074,16 +2145,14 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         }
     };
 
-    use base64::Engine;
-    let n1_b64 = base64::engine::general_purpose::STANDARD.encode(&n1_sm_msg);
-    let n2_b64 = base64::engine::general_purpose::STANDARD.encode(&n2_sm_info);
-
+    // SmContextCreatedData root: N1 (PDU Session Establishment Accept) and N2
+    // (PDUSessionResourceSetupRequestTransfer) are carried as multipart/related
+    // binary parts (5gnas + ngap) referenced by RefToBinaryData, per TS 29.502
+    // §6.1.2.2.2 / §6.1.2.4.
     let response_body = serde_json::json!({
         "smContextRef": sm_context_ref,
         "pduSessionId": pdu_session_id,
         "upCnxState": "ACTIVATING",
-        "n1SmMsg": n1_b64,
-        "n2SmInfo": n2_b64,
         "n2SmInfoType": "PDU_RES_SETUP_REQ"
     });
 
@@ -2099,9 +2168,8 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         upf_teid
     );
 
-    SbiResponse::with_status(201)
+    sbi_response_with_n1_n2(201, response_body, &n1_sm_msg, &n2_sm_info)
         .with_header("Location", location)
-        .with_body(response_body.to_string(), "application/json")
 }
 
 /// Look up the stored UPF SEID for an SM context (copy-then-drop the guards
@@ -2203,11 +2271,9 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         // new DL F-TEID that the UPF must forward to, but in different APER
         // transfer containers (TS 38.413 §9.3.4.2 vs §9.3.4.8).
         "PDU_RES_SETUP_RSP" | "PATH_SWITCH_REQ" => {
-            use base64::Engine;
-            let Some(n2_bytes) = req_body["n2SmInfo"]
-                .as_str()
-                .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-            else {
+            // N2 SM transfer: multipart ngap part (RefToBinaryData) or legacy
+            // base64 string — `resolve_binary_ref` accepts both.
+            let Some(n2_bytes) = resolve_binary_ref(request, &req_body["n2SmInfo"]) else {
                 return problem_400("N2_SM_ERROR", "n2SmInfo missing or not valid base64");
             };
 
@@ -2279,11 +2345,9 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
         // container; QoS comes from an Npcf_SMPolicyControl_Update — not
         // hardcoded values.
         "PDU_RES_MOD_REQ" => {
-            use base64::Engine;
-            let Some(n1_sm_msg) = req_body["n1SmMsg"]
-                .as_str()
-                .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
-            else {
+            // N1 SM container: multipart 5gnas part (RefToBinaryData) or legacy
+            // base64 string — `resolve_binary_ref` accepts both.
+            let Some(n1_sm_msg) = resolve_binary_ref(request, &req_body["n1SmMsg"]) else {
                 return problem_400("N1_SM_ERROR", "n1SmMsg missing or not valid base64");
             };
             let Some(hdr) = policy::parse_n1_sm_header(&n1_sm_msg) else {
@@ -2374,12 +2438,12 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
             // N2 SM Info: QoS flow modification for gNB (QFI + confirm)
             let n2_sm_info = vec![qfi, 0x01];
 
+            // N1 (PDU Session Modification Command) + N2 (QoS flow mod) carried
+            // as multipart/related binary parts referenced by RefToBinaryData.
             let response_body = serde_json::json!({
-                "n1SmMsg": base64::engine::general_purpose::STANDARD.encode(&n1_mod_cmd),
-                "n2SmInfo": base64::engine::general_purpose::STANDARD.encode(&n2_sm_info),
                 "n2SmInfoType": "PDU_RES_MOD_REQ"
             });
-            SbiResponse::with_status(200).with_body(response_body.to_string(), "application/json")
+            sbi_response_with_n1_n2(200, response_body, &n1_mod_cmd, &n2_sm_info)
         }
 
         // gNB confirmed a modification / released resources / reported
@@ -2825,5 +2889,190 @@ mod tests {
         assert_eq!(teid, 0x0002_0002);
         assert_eq!(addr, [10, 46, 0, 1]);
         assert_eq!(qfi, 1);
+    }
+
+    // ------------------------------------------------------------------
+    // smfd-01 / smfd-02: multipart/related N1/N2 carriage
+    // (TS 29.502 §6.1.2.2.2 / §6.1.2.4)
+    // ------------------------------------------------------------------
+
+    use ogs_sbi::constants::content_type;
+    use ogs_sbi::message::SbiPart;
+
+    /// A valid PDU Session Establishment Request N1 container (PSI=5, PTI=2,
+    /// IPv4v6, SSC mode 2) — the vector parsed in the policy unit tests.
+    const N1_ESTABLISHMENT_REQUEST: [u8; 14] = [
+        0x2E, 0x05, 0x02, 0xC1, 0xFF, 0xFF, 0x93, 0xA2, 0x28, 0x01, 0x00, 0x55, 0x00, 0x10,
+    ];
+
+    /// The 201 SmContextCreatedData response is multipart/related: the JSON
+    /// root references N1/N2 via RefToBinaryData, and the two binary parts carry
+    /// the exact bytes produced by smfd's N1-accept and N2-transfer builders,
+    /// with the conformant 5gnas / ngap content types.
+    #[test]
+    fn sm_context_created_response_is_multipart_with_binary_refs() {
+        let n1 = policy::build_establishment_accept(
+            5,
+            2,
+            policy::pdu_session_type::IPV4,
+            1,
+            1,
+            1_000_000,
+            1_000_000,
+            [10, 45, 0, 2],
+            "internet",
+        );
+        let n2 = build_setup_request_transfer(0x0001_0001, [10, 45, 0, 1], 1, 9, 8).unwrap();
+
+        let resp = sbi_response_with_n1_n2(
+            201,
+            serde_json::json!({
+                "smContextRef": "7",
+                "pduSessionId": 5,
+                "upCnxState": "ACTIVATING",
+                "n2SmInfoType": "PDU_RES_SETUP_REQ"
+            }),
+            &n1,
+            &n2,
+        )
+        .with_header("Location", "/nsmf-pdusession/v1/sm-contexts/7");
+
+        assert_eq!(resp.status, 201);
+        // Serialize exactly as the SBI client serializes parts (multipart/
+        // related), then decode it back to prove the wire shape.
+        let boundary = ogs_sbi::multipart::generate_boundary();
+        let body =
+            ogs_sbi::multipart::encode(resp.http.content.as_deref(), &resp.http.parts, &boundary);
+        let ct = ogs_sbi::multipart::content_type_with_boundary(&boundary);
+        let decoded = ogs_sbi::multipart::decode(&ct, &body).expect("decode multipart");
+
+        // JSON root: N1/N2 are RefToBinaryData pointers; n2SmInfoType preserved.
+        let root: serde_json::Value =
+            serde_json::from_str(decoded.json.as_deref().unwrap()).unwrap();
+        assert_eq!(root["n1SmMsg"]["contentId"].as_str(), Some("n1SmMsg"));
+        assert_eq!(root["n2SmInfo"]["contentId"].as_str(), Some("n2SmInfo"));
+        assert_eq!(root["n2SmInfoType"].as_str(), Some("PDU_RES_SETUP_REQ"));
+        assert_eq!(root["smContextRef"].as_str(), Some("7"));
+
+        // Binary parts: exact builder bytes + conformant content types.
+        let n1_part = decoded
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+            .expect("n1 part");
+        let n2_part = decoded
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n2SmInfo"))
+            .expect("n2 part");
+        assert_eq!(n1_part.data.as_ref(), n1.as_slice());
+        assert_eq!(n2_part.data.as_ref(), n2.as_slice());
+        assert_eq!(
+            n1_part.content_type.as_deref(),
+            Some(content_type::APPLICATION_5GNAS)
+        );
+        assert_eq!(
+            n2_part.content_type.as_deref(),
+            Some(content_type::APPLICATION_NGAP)
+        );
+    }
+
+    /// The N1-bearing reject (SmContextCreateError) carries the PDU Session
+    /// Establishment Reject as a 5gnas binary part referenced by RefToBinaryData.
+    #[test]
+    fn sm_context_create_error_carries_n1_reject_part() {
+        let resp = sm_context_create_error(403, "PDU_SESSION_TYPE_NOT_SUPPORTED", 5, 2, 50);
+        assert_eq!(resp.status, 403);
+        let root: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(root["n1SmMsg"]["contentId"].as_str(), Some("n1SmMsg"));
+        let part = resp
+            .http
+            .parts
+            .iter()
+            .find(|p| p.content_id.as_deref() == Some("n1SmMsg"))
+            .expect("n1 reject part");
+        assert_eq!(
+            part.content_type.as_deref(),
+            Some(content_type::APPLICATION_5GNAS)
+        );
+        assert_eq!(
+            part.data.as_ref(),
+            policy::build_establishment_reject(5, 2, 50).as_slice()
+        );
+    }
+
+    /// smfd resolves the N1 container identically from a multipart 5gnas part
+    /// and from the legacy base64-in-JSON form (backward compatibility).
+    #[test]
+    fn smfd_resolves_n1_multipart_same_as_base64() {
+        // Multipart form: JSON root holds a RefToBinaryData pointer; bytes in a part.
+        let mut multipart_req = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts");
+        multipart_req.http.set_content(
+            serde_json::json!({ "n1SmMsg": { "contentId": "n1SmMsg" } }).to_string(),
+        );
+        multipart_req.http.add_part(SbiPart::with_content(
+            "n1SmMsg",
+            content_type::APPLICATION_5GNAS,
+            bytes::Bytes::copy_from_slice(&N1_ESTABLISHMENT_REQUEST),
+        ));
+        let mp_body: serde_json::Value =
+            serde_json::from_str(multipart_req.http.content.as_deref().unwrap()).unwrap();
+        let from_multipart = resolve_binary_ref(&multipart_req, &mp_body["n1SmMsg"]).unwrap();
+
+        // Legacy form: base64 string, no parts.
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(N1_ESTABLISHMENT_REQUEST);
+        let legacy_req = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts");
+        let legacy_body = serde_json::json!({ "n1SmMsg": b64 });
+        let from_base64 = resolve_binary_ref(&legacy_req, &legacy_body["n1SmMsg"]).unwrap();
+
+        assert_eq!(from_multipart, from_base64);
+        assert_eq!(from_multipart, N1_ESTABLISHMENT_REQUEST.to_vec());
+        // ...and the decoded internal result is identical.
+        let a = policy::parse_establishment_request(&from_multipart).unwrap();
+        let b = policy::parse_establishment_request(&from_base64).unwrap();
+        assert_eq!(a.pti, b.pti);
+        assert_eq!(a.requested_pdu_session_type, b.requested_pdu_session_type);
+        assert_eq!(a.requested_ssc_mode, b.requested_ssc_mode);
+    }
+
+    /// Cross-decode: bytes shaped exactly as amfd emits a multipart
+    /// CreateSmContext request (JSON root + N1 5gnas part) are decoded by the
+    /// shared multipart codec and resolved by smfd to the exact N1 container.
+    #[test]
+    fn smfd_parses_amfd_multipart_create_request() {
+        // Reproduce amfd's wire emission via the shared multipart encoder.
+        let root = serde_json::json!({
+            "pduSessionId": 5,
+            "sNssai": { "sst": 1 },
+            "dnn": "internet",
+            "n1SmMsg": { "contentId": "n1SmMsg" },
+            "redcapIndication": false
+        });
+        let part = SbiPart::with_content(
+            "n1SmMsg",
+            content_type::APPLICATION_5GNAS,
+            bytes::Bytes::copy_from_slice(&N1_ESTABLISHMENT_REQUEST),
+        );
+        let boundary = ogs_sbi::multipart::generate_boundary();
+        let body = ogs_sbi::multipart::encode(
+            Some(&root.to_string()),
+            std::slice::from_ref(&part),
+            &boundary,
+        );
+        let ct = ogs_sbi::multipart::content_type_with_boundary(&boundary);
+
+        // Server-side: decode into the request the smfd handler would see.
+        let decoded = ogs_sbi::multipart::decode(&ct, &body).unwrap();
+        let mut request = SbiRequest::post("/nsmf-pdusession/v1/sm-contexts");
+        request.http.content = decoded.json.clone();
+        request.http.parts = decoded.parts;
+        let req_body: serde_json::Value =
+            serde_json::from_str(decoded.json.as_deref().unwrap()).unwrap();
+
+        let n1 = resolve_binary_ref(&request, &req_body["n1SmMsg"]).unwrap();
+        assert_eq!(n1, N1_ESTABLISHMENT_REQUEST.to_vec());
+        assert!(policy::parse_establishment_request(&n1).is_some());
     }
 }
