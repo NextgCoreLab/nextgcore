@@ -369,6 +369,13 @@ pub struct NssfContext {
     /// allow-all (matched-sim back-compat); `Some(set)` => only these
     /// S-NSSAIs may be reported in an NSSAIAvailability PUT/PATCH.
     plmn_supported_snssai_restriction: RwLock<Option<Vec<SNssai>>>,
+    /// Per-home-PLMN S-NSSAI restrictions included in
+    /// `AuthorizedNssaiAvailabilityData.restrictedSnssaiList` responses
+    /// (TS 29.531 §5.3.2.2 / §6.2.6.2.4 RestrictedSnssai). Key:
+    /// (home_mcc, home_mnc). Value: S-NSSAIs restricted for subscribers of
+    /// that home PLMN. Default empty = no restrictions (matched-sim
+    /// back-compat; `restrictedSnssaiList` is absent when this map is empty).
+    per_plmn_snssai_restrictions: RwLock<HashMap<(String, String), Vec<SNssai>>>,
     /// Next NSI ID
     next_nsi_id: AtomicUsize,
     /// Next Home ID
@@ -393,6 +400,7 @@ impl NssfContext {
             subscriptions: RwLock::new(HashMap::new()),
             target_amf_set: RwLock::new(None),
             plmn_supported_snssai_restriction: RwLock::new(None),
+            per_plmn_snssai_restrictions: RwLock::new(HashMap::new()),
             next_nsi_id: AtomicUsize::new(1),
             next_home_id: AtomicUsize::new(1),
             max_num_of_nf: 0,
@@ -813,6 +821,13 @@ impl NssfContext {
         }
     }
 
+    /// Clear the configured target AMF set (reverts to `None`).
+    pub fn clear_target_amf_set(&self) {
+        if let Ok(mut t) = self.target_amf_set.write() {
+            *t = None;
+        }
+    }
+
     pub fn get_target_amf_set(&self) -> Option<String> {
         self.target_amf_set.read().ok()?.clone()
     }
@@ -863,6 +878,44 @@ impl NssfContext {
     /// but is not consulted under the default-allow policy.
     pub fn nf_authorized_for_availability(&self, nf_id: &str, _tai: &Tai) -> bool {
         !nf_id.trim().is_empty()
+    }
+
+    // -- nssfd-02: per-home-PLMN S-NSSAI restrictions (restrictedSnssaiList) --
+
+    /// Configure S-NSSAI restrictions for a specific home PLMN
+    /// (TS 29.531 §5.3.2.2 / §6.2.6.2.4 `restrictedSnssaiList`).
+    ///
+    /// When configured, `authorized_availability_response` includes these in
+    /// the `restrictedSnssaiList` of the `AuthorizedNssaiAvailabilityData`
+    /// response. Default: empty map (no restrictions).
+    pub fn set_plmn_snssai_restrictions(&self, home_plmn: &PlmnId, restricted: Vec<SNssai>) {
+        if let Ok(mut m) = self.per_plmn_snssai_restrictions.write() {
+            m.insert((home_plmn.mcc.clone(), home_plmn.mnc.clone()), restricted);
+        }
+    }
+
+    /// Clear all per-PLMN S-NSSAI restrictions (restores matched-sim
+    /// back-compat / default-allow state).
+    pub fn clear_plmn_snssai_restrictions(&self) {
+        if let Ok(mut m) = self.per_plmn_snssai_restrictions.write() {
+            m.clear();
+        }
+    }
+
+    /// Per-PLMN S-NSSAI restrictions for a given TAI
+    /// (TS 29.531 §5.3.2.2 / §6.2.6.2.4). Returns an empty `Vec` when no
+    /// restrictions are configured. The `_tai` parameter is accepted for
+    /// future per-TA scoping; the current implementation uses the global
+    /// per-PLMN map (TAI-scoped restrictions are not yet config-driven).
+    pub fn restricted_snssais_for_tai(&self, _tai: &Tai) -> Vec<(PlmnId, Vec<SNssai>)> {
+        self.per_plmn_snssai_restrictions
+            .read()
+            .map(|m| {
+                m.iter()
+                    .map(|((mcc, mnc), snssais)| (PlmnId::new(mcc, mnc), snssais.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Get supported S-NSSAIs for a specific TAI from NSSAI availability data.
