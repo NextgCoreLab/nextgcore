@@ -208,10 +208,13 @@ async fn two_sepp_n32_handshake_and_forwarding() {
             "nssai": {"sst": 1}
         });
         let headers = vec![("content-type".to_string(), "application/json".to_string())];
+        // Include a query string so the spec RequestLine (sepp-03,
+        // scheme/authority/path/queryFragment) round-trips over real HTTP.
+        let forward_url = "/nudm-sdm/v1/supi?supported-features=1";
         let (status, rsp_body) = forward_via_n32f(
             outcome.node_id,
             "POST",
-            "/nudm-sdm/v1/supi",
+            forward_url,
             &headers,
             Some(serde_json::to_vec(&body).unwrap().as_slice()),
             None,
@@ -222,7 +225,8 @@ async fn two_sepp_n32_handshake_and_forwarding() {
 
         let rec: ReconstructedJson = serde_json::from_str(&rsp_body).unwrap();
         assert_eq!(rec.method, "POST");
-        assert_eq!(rec.url, "/nudm-sdm/v1/supi");
+        // The path and query must be reconstructed identically by the peer.
+        assert_eq!(rec.url, forward_url);
         assert!(rec.message_id.is_some());
         let rec_body = b64url_decode(&rec.body.expect("body")).unwrap();
         let rec_json: serde_json::Value = serde_json::from_slice(&rec_body).unwrap();

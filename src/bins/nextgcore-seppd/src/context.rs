@@ -182,6 +182,10 @@ pub struct N32fSecurityInfo {
     pub jwe_cipher_suite: String,
     /// Selected JWS cipher suite (e.g. "ES256")
     pub jws_cipher_suite: String,
+    /// Runtime data-type encryption profiles, projected from the NEGOTIATED
+    /// protection policy (TS 29.573 §6.1.5.2): which IEs of which APIs this
+    /// N32-f context encrypts. Drives `build_prins_context`'s PrinsContext.
+    pub enc_profiles: Vec<crate::prins::DataTypeProfile>,
 }
 
 /// SEPP Node structure - represents a peer SEPP

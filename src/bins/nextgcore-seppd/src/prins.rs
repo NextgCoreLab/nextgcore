@@ -97,7 +97,7 @@ pub fn generate_local_identity() -> VerifyingKey {
 // ============================================================================
 
 /// Data-type profile defining which IEs to protect for a given API.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataTypeProfile {
     /// Profile identifier
     pub id: String,
@@ -108,11 +108,11 @@ pub struct DataTypeProfile {
 }
 
 /// Descriptor for an information element to protect
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IeDescriptor {
     /// Location: "BODY", "HEADER", or "URI_PARAM"
     pub location: String,
-    /// JSON path expression (e.g., "$.supi", "$.pei")
+    /// RFC 6901 JSON Pointer into the body (e.g., "/supi", "/a/supi")
     pub path: String,
 }
 
@@ -234,54 +234,13 @@ impl PrinsContext {
         self.peer_verifying_keys.insert(identity.into(), key);
     }
 
-    /// Add default data-type profiles for common 5G APIs
+    /// Add the default data-type profiles for common 5G APIs. These are this
+    /// SEPP's **local protection-policy capability** (advertised in
+    /// exchange-params); the runtime profile set actually used to protect
+    /// messages is driven by the NEGOTIATED `dataTypeEncPolicy`
+    /// (see `n32c_handler::negotiate_protection_policy` / `build_prins_context`).
     pub fn add_default_profiles(&mut self) {
-        self.profiles.push(DataTypeProfile {
-            id: "nudm-sdm-profile".to_string(),
-            service_name: "nudm-sdm".to_string(),
-            encrypt_ies: vec![
-                IeDescriptor {
-                    location: "BODY".to_string(),
-                    path: "$.supi".to_string(),
-                },
-                IeDescriptor {
-                    location: "BODY".to_string(),
-                    path: "$.pei".to_string(),
-                },
-                IeDescriptor {
-                    location: "BODY".to_string(),
-                    path: "$.gpsi".to_string(),
-                },
-            ],
-        });
-        self.profiles.push(DataTypeProfile {
-            id: "nudm-uecm-profile".to_string(),
-            service_name: "nudm-uecm".to_string(),
-            encrypt_ies: vec![
-                IeDescriptor {
-                    location: "BODY".to_string(),
-                    path: "$.supi".to_string(),
-                },
-                IeDescriptor {
-                    location: "BODY".to_string(),
-                    path: "$.pei".to_string(),
-                },
-            ],
-        });
-        self.profiles.push(DataTypeProfile {
-            id: "nausf-auth-profile".to_string(),
-            service_name: "nausf-auth".to_string(),
-            encrypt_ies: vec![
-                IeDescriptor {
-                    location: "BODY".to_string(),
-                    path: "$.supiOrSuci".to_string(),
-                },
-                IeDescriptor {
-                    location: "BODY".to_string(),
-                    path: "$.authenticationVector".to_string(),
-                },
-            ],
-        });
+        self.profiles = default_data_type_profiles();
     }
 
     /// Find applicable profile for a given service name
@@ -292,9 +251,32 @@ impl PrinsContext {
     }
 }
 
+/// This SEPP's default runtime data-type profiles: the projection of its local
+/// protection-policy capability under the full local `dataTypeEncPolicy`. Used
+/// as the local capability advertisement and as the fallback when no policy is
+/// negotiated (single source of truth: `n32c_handler::local_protection_policy`).
+pub fn default_data_type_profiles() -> Vec<DataTypeProfile> {
+    let policy = crate::n32c_handler::local_protection_policy();
+    let types = policy.data_type_enc_policy.clone().unwrap_or_default();
+    crate::n32c_handler::profiles_from_protection_policy(&policy, &types)
+}
+
 // ============================================================================
 // TS 29.573 sec 6.3 reformatted-message structures
 // ============================================================================
+
+/// Location of an IE within the reformatted HTTP message (TS 29.573
+/// §6.1.5.3.6 / OpenAPI `IeLocation`). Shared by `RequestLine` (sepp-03) and
+/// `HttpPayload` (sepp-04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum IeLocation {
+    UriParam,
+    Header,
+    Body,
+    MultipartBinary,
+    UriPath,
+}
 
 /// metaData of the DataToIntegrityProtectBlock (TS 29.573 table 6.3.2-1)
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -309,12 +291,25 @@ pub struct N32fMetaData {
     pub authorized_ipx_id: String,
 }
 
-/// Request line of the original SBI request
+/// Request line of the original SBI request (TS 29.573 §6.2.5.2.6 `RequestLine`).
+/// The SBI URL is split into scheme / authority / path / queryFragment on
+/// protect and re-joined on unprotect; `protocolVersion` is fixed at "2".
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct N32fRequestLine {
+#[serde(rename_all = "camelCase")]
+pub struct RequestLine {
     pub method: String,
-    pub url: String,
-    pub protocol: String,
+    pub scheme: String,
+    pub authority: String,
+    /// Request path, excluding any query/fragment.
+    pub path: String,
+    /// HTTP version token; always "2" for N32-f (HTTP/2).
+    pub protocol_version: String,
+    /// Query (and/or fragment) part of the URL, without the leading '?'.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_fragment: Option<String>,
+    /// Which IeLocations of the path/query are protected (TS 29.573).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_query_protect_ind: Option<Vec<IeLocation>>,
 }
 
 /// HTTP header carried in the clear (integrity-protected) block
@@ -324,13 +319,16 @@ pub struct N32fHeader {
     pub value: String,
 }
 
-/// One payload element: either a cleartext JSON value or a reference into
-/// the encrypted `dataToEncrypt` array (`{"encBlockIndex": i}`).
+/// One HttpPayload element (TS 29.573 §6.2.5.2.8): a single leaf of the body
+/// addressed by an RFC 6901 JSON Pointer `iePath`. A cleartext leaf carries
+/// its JSON value; an encrypted leaf carries `{"encBlockIndex": i}` referencing
+/// the `dataToEncrypt` array. A non-JSON body is a single `MULTIPART_BINARY`
+/// element whose value is the base64url-encoded bytes.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct N32fPayloadElement {
     pub ie_path: String,
-    pub ie_value_location: String,
+    pub ie_value_location: IeLocation,
     pub value: serde_json::Value,
 }
 
@@ -339,7 +337,7 @@ pub struct N32fPayloadElement {
 #[serde(rename_all = "camelCase")]
 pub struct DataToIntegrityProtectBlock {
     pub meta_data: N32fMetaData,
-    pub request_line: N32fRequestLine,
+    pub request_line: RequestLine,
     #[serde(default)]
     pub headers: Vec<N32fHeader>,
     #[serde(default)]
@@ -480,40 +478,42 @@ pub fn protect_message(
     if let Some(body_bytes) = body {
         let parsed: Option<serde_json::Value> = serde_json::from_slice(body_bytes).ok();
         match parsed {
-            Some(mut json) => {
-                // Move profile-designated IEs into the cipher block,
-                // replacing them with encBlockIndex references.
-                if let (Some(profile), Some(obj)) = (profile, json.as_object_mut()) {
-                    for ie in &profile.encrypt_ies {
-                        if ie.location != "BODY" {
-                            continue;
-                        }
-                        let Some(field) = ie.path.strip_prefix("$.") else {
-                            continue;
-                        };
-                        if let Some(original) = obj.remove(field) {
-                            let idx = cipher_block.data_to_encrypt.len();
-                            cipher_block.data_to_encrypt.push(original);
-                            payload_elements.push(N32fPayloadElement {
-                                ie_path: ie.path.clone(),
-                                ie_value_location: "BODY".to_string(),
-                                value: serde_json::json!({ "encBlockIndex": idx }),
-                            });
-                        }
-                    }
+            Some(json) => {
+                // Flatten the body into one HttpPayload per leaf (RFC 6901
+                // pointers). Profile-designated IEs are moved into the cipher
+                // block and referenced by `{encBlockIndex}`; everything else is
+                // a cleartext leaf. The whole-body "$" element is gone.
+                let encrypt_paths: std::collections::HashSet<&str> = profile
+                    .map(|p| {
+                        p.encrypt_ies
+                            .iter()
+                            .filter(|ie| ie.location == "BODY")
+                            .map(|ie| ie.path.as_str())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                flatten_body_leaves(
+                    &json,
+                    String::new(),
+                    &encrypt_paths,
+                    &mut cipher_block,
+                    &mut payload_elements,
+                );
+                if payload_elements.is_empty() {
+                    // Degenerate structureless body (e.g. `{}`): carry it whole
+                    // so the receiver reproduces it byte-for-byte.
+                    payload_elements.push(N32fPayloadElement {
+                        ie_path: String::new(),
+                        ie_value_location: IeLocation::Body,
+                        value: json,
+                    });
                 }
-                // The remaining (cleartext) body
-                payload_elements.push(N32fPayloadElement {
-                    ie_path: "$".to_string(),
-                    ie_value_location: "BODY".to_string(),
-                    value: json,
-                });
             }
             None => {
-                // Non-JSON body: carry opaque, base64url-encoded
+                // Non-JSON body: single MULTIPART_BINARY element, base64url-encoded
                 payload_elements.push(N32fPayloadElement {
-                    ie_path: "$".to_string(),
-                    ie_value_location: "BODY_RAW".to_string(),
+                    ie_path: String::new(),
+                    ie_value_location: IeLocation::MultipartBinary,
                     value: serde_json::Value::String(b64url_encode(body_bytes)),
                 });
             }
@@ -527,11 +527,7 @@ pub fn protect_message(
             message_id: generate_message_id(),
             authorized_ipx_id: String::new(),
         },
-        request_line: N32fRequestLine {
-            method: method.to_string(),
-            url: url.to_string(),
-            protocol: "HTTP/2".to_string(),
-        },
+        request_line: build_request_line(method, url),
         headers: headers
             .iter()
             .map(|(name, value)| N32fHeader {
@@ -789,41 +785,42 @@ pub fn unprotect_message(
         })?;
 
     // --- Reassemble the original request ---
+    // Each HttpPayload leaf is applied back to the rebuilt body at its RFC 6901
+    // pointer; encrypted leaves resolve `{encBlockIndex}` from the cipher block.
     let mut body_json: Option<serde_json::Value> = None;
     let mut body_raw: Option<Vec<u8>> = None;
-    let mut encrypted_fields: Vec<(String, serde_json::Value)> = Vec::new();
 
     for element in &integrity_block.payload {
-        match element.ie_value_location.as_str() {
-            "BODY" => {
-                if element.ie_path == "$" {
-                    body_json = Some(element.value.clone());
-                } else if let Some(field) = element.ie_path.strip_prefix("$.") {
-                    let idx = element
-                        .value
-                        .get("encBlockIndex")
-                        .and_then(|v| v.as_u64())
+        match element.ie_value_location {
+            IeLocation::Body => {
+                // Encrypted leaf: `{encBlockIndex}` ref; else cleartext value.
+                let resolved = if let Some(idx) =
+                    element.value.get("encBlockIndex").and_then(|v| v.as_u64())
+                {
+                    cipher_block
+                        .data_to_encrypt
+                        .get(idx as usize)
+                        .cloned()
                         .ok_or_else(|| {
                             N32fUnprotectError::new(
                                 N32fErrorType::MessageReconstructionFailed,
                                 Some(message_id.clone()),
-                                format!(
-                                    "payload element [{}] missing encBlockIndex",
-                                    element.ie_path
-                                ),
+                                format!("encBlockIndex {idx} out of range"),
                             )
-                        })? as usize;
-                    let value = cipher_block.data_to_encrypt.get(idx).ok_or_else(|| {
-                        N32fUnprotectError::new(
-                            N32fErrorType::MessageReconstructionFailed,
-                            Some(message_id.clone()),
-                            format!("encBlockIndex {idx} out of range"),
-                        )
-                    })?;
-                    encrypted_fields.push((field.to_string(), value.clone()));
-                }
+                        })?
+                } else {
+                    element.value.clone()
+                };
+                let root = body_json.get_or_insert(serde_json::Value::Null);
+                set_at_json_pointer(root, &element.ie_path, resolved).map_err(|detail| {
+                    N32fUnprotectError::new(
+                        N32fErrorType::MessageReconstructionFailed,
+                        Some(message_id.clone()),
+                        format!("INVALID_JSON_POINTER [{}]: {detail}", element.ie_path),
+                    )
+                })?;
             }
-            "BODY_RAW" => {
+            IeLocation::MultipartBinary => {
                 let encoded = element.value.as_str().unwrap_or("");
                 body_raw = Some(b64url_decode(encoded).map_err(|e| {
                     N32fUnprotectError::new(
@@ -833,17 +830,9 @@ pub fn unprotect_message(
                     )
                 })?);
             }
+            // URI_PARAM / HEADER / URI_PATH IEs are not carried in the body
+            // payload by this SEPP; ignore for body reconstruction.
             _ => {}
-        }
-    }
-
-    // Restore encrypted IEs into the body
-    if !encrypted_fields.is_empty() {
-        let json = body_json.get_or_insert_with(|| serde_json::json!({}));
-        if let Some(obj) = json.as_object_mut() {
-            for (field, value) in encrypted_fields {
-                obj.insert(field, value);
-            }
         }
     }
 
@@ -878,16 +867,17 @@ pub fn unprotect_message(
         .map(|h| (h.name.clone(), h.value.clone()))
         .collect();
 
+    let url = join_request_line(&integrity_block.request_line);
     log::info!(
         "PRINS unprotect OK: {} {} (msg_id={})",
         integrity_block.request_line.method,
-        integrity_block.request_line.url,
+        url,
         message_id
     );
 
     Ok(ReconstructedRequest {
         method: integrity_block.request_line.method.clone(),
-        url: integrity_block.request_line.url.clone(),
+        url,
         headers,
         body,
         message_id,
@@ -921,6 +911,144 @@ fn apply_json_patch_replaces(
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Escape one RFC 6901 reference token (`~` -> `~0`, `/` -> `~1`).
+fn rfc6901_escape(token: &str) -> String {
+    token.replace('~', "~0").replace('/', "~1")
+}
+
+/// Unescape one RFC 6901 reference token (`~1` -> `/`, `~0` -> `~`).
+fn rfc6901_unescape(token: &str) -> String {
+    token.replace("~1", "/").replace("~0", "~")
+}
+
+/// Recursively flatten a JSON body into one `N32fPayloadElement` per leaf,
+/// keyed by its RFC 6901 JSON Pointer. Objects are descended into; any value
+/// whose pointer is in `encrypt_paths` is moved into `cipher_block` and emitted
+/// as an `{encBlockIndex}` reference (without recursing into it); every other
+/// non-object value is emitted as a cleartext leaf. Emission follows document
+/// order so the receiver reproduces the body byte-for-byte.
+fn flatten_body_leaves(
+    value: &serde_json::Value,
+    pointer: String,
+    encrypt_paths: &std::collections::HashSet<&str>,
+    cipher_block: &mut DataToIntegrityProtectAndCipherBlock,
+    out: &mut Vec<N32fPayloadElement>,
+) {
+    if encrypt_paths.contains(pointer.as_str()) {
+        let idx = cipher_block.data_to_encrypt.len();
+        cipher_block.data_to_encrypt.push(value.clone());
+        out.push(N32fPayloadElement {
+            ie_path: pointer,
+            ie_value_location: IeLocation::Body,
+            value: serde_json::json!({ "encBlockIndex": idx }),
+        });
+        return;
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                let child = format!("{pointer}/{}", rfc6901_escape(k));
+                flatten_body_leaves(v, child, encrypt_paths, cipher_block, out);
+            }
+        }
+        leaf => out.push(N32fPayloadElement {
+            ie_path: pointer,
+            ie_value_location: IeLocation::Body,
+            value: leaf.clone(),
+        }),
+    }
+}
+
+/// Apply `value` at the RFC 6901 `pointer` in `root`, creating intermediate
+/// objects as needed. An empty pointer replaces the whole document. A pointer
+/// that is non-empty but does not start with '/' is rejected as malformed
+/// (INVALID_JSON_POINTER).
+fn set_at_json_pointer(
+    root: &mut serde_json::Value,
+    pointer: &str,
+    value: serde_json::Value,
+) -> Result<(), String> {
+    if pointer.is_empty() {
+        *root = value;
+        return Ok(());
+    }
+    let Some(rest) = pointer.strip_prefix('/') else {
+        return Err("pointer must be empty or start with '/'".to_string());
+    };
+    let tokens: Vec<String> = rest.split('/').map(rfc6901_unescape).collect();
+    let mut current = root;
+    for token in &tokens[..tokens.len() - 1] {
+        if !current.is_object() {
+            *current = serde_json::json!({});
+        }
+        current = current
+            .as_object_mut()
+            .expect("coerced to object above")
+            .entry(token.clone())
+            .or_insert(serde_json::Value::Null);
+    }
+    let last = tokens.last().expect("pointer has at least one token");
+    if !current.is_object() {
+        *current = serde_json::json!({});
+    }
+    current
+        .as_object_mut()
+        .expect("coerced to object above")
+        .insert(last.clone(), value);
+    Ok(())
+}
+
+/// Split an SBI request URL into the `RequestLine` fields (scheme / authority /
+/// path / queryFragment), fixing `protocolVersion` at "2" (TS 29.573
+/// §6.2.5.2.6). Relative request targets (the common case) leave scheme and
+/// authority empty. The query is everything after the first '?', stored without
+/// the leading delimiter so [`join_request_line`] reproduces the URL exactly.
+fn build_request_line(method: &str, url: &str) -> RequestLine {
+    let (scheme, after_scheme) = match url.find("://") {
+        Some(pos) => (url[..pos].to_string(), &url[pos + 3..]),
+        None => (String::new(), url),
+    };
+    let (authority, path_and_query) = if scheme.is_empty() {
+        (String::new(), after_scheme)
+    } else {
+        match after_scheme.find('/') {
+            Some(p) => (after_scheme[..p].to_string(), &after_scheme[p..]),
+            None => (after_scheme.to_string(), ""),
+        }
+    };
+    let (path, query_fragment) = match path_and_query.split_once('?') {
+        Some((p, q)) => (p.to_string(), Some(q.to_string())),
+        None => (path_and_query.to_string(), None),
+    };
+    RequestLine {
+        method: method.to_string(),
+        scheme,
+        authority,
+        path,
+        protocol_version: "2".to_string(),
+        query_fragment,
+        path_query_protect_ind: None,
+    }
+}
+
+/// Re-join a `RequestLine` into the original SBI request URL.
+fn join_request_line(rl: &RequestLine) -> String {
+    let mut url = String::new();
+    if !rl.scheme.is_empty() {
+        url.push_str(&rl.scheme);
+        url.push_str("://");
+        url.push_str(&rl.authority);
+    } else if !rl.authority.is_empty() {
+        url.push_str(&rl.authority);
+    }
+    url.push_str(&rl.path);
+    if let Some(q) = &rl.query_fragment {
+        url.push('?');
+        url.push_str(q);
+    }
+    url
+}
 
 /// Extract service name from URL (e.g., "/nudm-sdm/v1/..." -> "nudm-sdm")
 pub fn extract_service_name(url: &str) -> String {
@@ -1053,7 +1181,7 @@ mod tests {
         // Tamper with a cleartext field inside the integrity block
         let aad = b64url_decode(msg.reformatted_data.aad.as_ref().unwrap()).unwrap();
         let mut block: DataToIntegrityProtectBlock = serde_json::from_slice(&aad).unwrap();
-        block.request_line.url = "/nudm-sdm/v1/EVIL".to_string();
+        block.request_line.path = "/nudm-sdm/v1/EVIL".to_string();
         msg.reformatted_data.aad = Some(b64url_encode(&serde_json::to_vec(&block).unwrap()));
 
         let err = unprotect_message(&receiver, &msg).unwrap_err();
@@ -1418,6 +1546,162 @@ mod tests {
             sender.protect_key(N32fDirection::Request).0,
             receiver.protect_key(N32fDirection::Request).0
         );
+    }
+
+    // ------------------------------------------------------------------
+    // sepp-03: RequestLine (method/scheme/authority/path/protocolVersion)
+    // ------------------------------------------------------------------
+
+    /// A GET-with-query protects then unprotects back to the identical
+    /// method+URL; the serialized RequestLine carries scheme/authority/path/
+    /// protocolVersion:"2" and no `url`/"HTTP/2".
+    #[test]
+    fn request_line_roundtrips_get_with_query() {
+        let (sender, receiver) = ctx_pair();
+        let url = "/nnrf-disc/v1/nf-instances?target-nf-type=AMF&limit=10";
+
+        let msg = protect_message(&sender, "GET", url, &[], None).unwrap();
+
+        // The reformatted RequestLine is spec-shaped, not the legacy url/proto.
+        let aad = b64url_decode(msg.reformatted_data.aad.as_ref().unwrap()).unwrap();
+        let aad_str = String::from_utf8(aad).unwrap();
+        assert!(aad_str.contains("\"scheme\""));
+        assert!(aad_str.contains("\"authority\""));
+        assert!(aad_str.contains("\"path\":\"/nnrf-disc/v1/nf-instances\""));
+        assert!(aad_str.contains("\"protocolVersion\":\"2\""));
+        assert!(aad_str.contains("\"queryFragment\":\"target-nf-type=AMF&limit=10\""));
+        assert!(!aad_str.contains("\"url\""));
+        assert!(!aad_str.contains("HTTP/2"));
+
+        let rec = unprotect_message(&receiver, &msg).unwrap();
+        assert_eq!(rec.method, "GET");
+        assert_eq!(rec.url, url, "URL must round-trip identically");
+    }
+
+    /// An absolute SBI URL round-trips through scheme/authority/path/query.
+    #[test]
+    fn request_line_roundtrips_absolute_url() {
+        let (sender, receiver) = ctx_pair();
+        let url = "https://nrf.example.com:8443/nnrf-disc/v1/nf-instances?nf-type=UDM";
+        let msg = protect_message(&sender, "GET", url, &[], None).unwrap();
+        let aad = b64url_decode(msg.reformatted_data.aad.as_ref().unwrap()).unwrap();
+        let aad_str = String::from_utf8(aad).unwrap();
+        assert!(aad_str.contains("\"scheme\":\"https\""));
+        assert!(aad_str.contains("\"authority\":\"nrf.example.com:8443\""));
+        let rec = unprotect_message(&receiver, &msg).unwrap();
+        assert_eq!(rec.url, url);
+    }
+
+    // ------------------------------------------------------------------
+    // sepp-04: HttpPayload RFC 6901 leaf pointers + IeLocation enum
+    // ------------------------------------------------------------------
+
+    /// A nested body protects to leaf pointers `/a/supi` (encrypted ref) and
+    /// `/x` (cleartext), and unprotects byte-identically.
+    #[test]
+    fn nested_body_flattens_to_leaf_pointers_and_roundtrips() {
+        let (mut sender, receiver) = ctx_pair();
+        // Designate the nested `/a/supi` IE for encryption on this service.
+        sender.profiles = vec![DataTypeProfile {
+            id: "myapi-profile".to_string(),
+            service_name: "myapi".to_string(),
+            encrypt_ies: vec![IeDescriptor {
+                location: "BODY".to_string(),
+                path: "/a/supi".to_string(),
+            }],
+        }];
+
+        let body = serde_json::json!({ "a": { "supi": "imsi-1" }, "x": 1 });
+        let body_bytes = serde_json::to_vec(&body).unwrap();
+        let msg = protect_message(&sender, "POST", "/myapi/v1/r", &[], Some(&body_bytes)).unwrap();
+
+        // AAD payload carries leaf pointers; the encrypted leaf is an
+        // encBlockIndex ref and the SUPI value is absent from cleartext.
+        let aad = b64url_decode(msg.reformatted_data.aad.as_ref().unwrap()).unwrap();
+        let block: DataToIntegrityProtectBlock = serde_json::from_slice(&aad).unwrap();
+        let enc = block
+            .payload
+            .iter()
+            .find(|e| e.ie_path == "/a/supi")
+            .expect("/a/supi leaf present");
+        assert_eq!(enc.ie_value_location, IeLocation::Body);
+        assert!(enc.value.get("encBlockIndex").is_some());
+        let clear = block
+            .payload
+            .iter()
+            .find(|e| e.ie_path == "/x")
+            .expect("/x leaf present");
+        assert_eq!(clear.value, serde_json::json!(1));
+        let aad_str = String::from_utf8(aad).unwrap();
+        assert!(!aad_str.contains("imsi-1"), "SUPI must not be in cleartext");
+
+        // Byte-identical reconstruction.
+        let rec = unprotect_message(&receiver, &msg).unwrap();
+        assert_eq!(rec.body.unwrap(), body_bytes);
+    }
+
+    /// A malformed (non-RFC-6901) iePath in an authenticated payload is
+    /// rejected on unprotect with an INVALID_JSON_POINTER-style error.
+    #[test]
+    fn malformed_json_pointer_rejected_on_unprotect() {
+        let (sender, receiver) = ctx_pair();
+        // Hand-build a message whose AAD carries a malformed iePath, sealed
+        // under the real session key (so it survives the AEAD check and
+        // reaches reconstruction).
+        let integrity_block = DataToIntegrityProtectBlock {
+            meta_data: N32fMetaData {
+                n32f_context_id: sender.peer_context_id.clone(),
+                message_id: "deadbeefdeadbeef".to_string(),
+                authorized_ipx_id: String::new(),
+            },
+            request_line: build_request_line("POST", "/nudm-sdm/v1/supi"),
+            headers: vec![],
+            payload: vec![N32fPayloadElement {
+                ie_path: "not-a-pointer".to_string(),
+                ie_value_location: IeLocation::Body,
+                value: serde_json::json!(1),
+            }],
+        };
+        let aad = serde_json::to_vec(&integrity_block).unwrap();
+        let cipher = DataToIntegrityProtectAndCipherBlock::default();
+        let plaintext = serde_json::to_vec(&cipher).unwrap();
+        let (key, salt) = sender.protect_key(N32fDirection::Request);
+        let jwe =
+            jose::jwe_encrypt_with_iv_salt(key, salt, &plaintext, Some(&aad), Some(&sender.kid))
+                .unwrap();
+        let signing_key = sender.local_signing_key.clone().unwrap();
+        let mods_payload = ModificationsBlockPayload {
+            identity: sender.local_fqdn.clone(),
+            operations: vec![],
+            tag: jwe.tag.clone(),
+        };
+        let mods_bytes = serde_json::to_vec(&mods_payload).unwrap();
+        let jws =
+            jose::jws_sign_es256(&signing_key, &mods_bytes, Some(&sender.local_fqdn)).unwrap();
+        let msg = N32fReformattedMessage {
+            reformatted_data: jwe,
+            modifications_block: vec![jws],
+        };
+
+        let err = unprotect_message(&receiver, &msg).unwrap_err();
+        assert_eq!(err.error_type, N32fErrorType::MessageReconstructionFailed);
+        assert!(err.detail.contains("INVALID_JSON_POINTER"), "got: {}", err.detail);
+    }
+
+    /// `set_at_json_pointer` creates intermediates, replaces whole-document on
+    /// empty pointer, and rejects a malformed pointer.
+    #[test]
+    fn set_at_json_pointer_behaviour() {
+        let mut root = serde_json::Value::Null;
+        set_at_json_pointer(&mut root, "/a/b", serde_json::json!(7)).unwrap();
+        assert_eq!(root, serde_json::json!({ "a": { "b": 7 } }));
+
+        let mut whole = serde_json::json!({ "x": 1 });
+        set_at_json_pointer(&mut whole, "", serde_json::json!("scalar")).unwrap();
+        assert_eq!(whole, serde_json::json!("scalar"));
+
+        let mut bad = serde_json::Value::Null;
+        assert!(set_at_json_pointer(&mut bad, "no-slash", serde_json::json!(1)).is_err());
     }
 
     #[test]

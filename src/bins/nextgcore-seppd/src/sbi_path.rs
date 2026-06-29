@@ -310,6 +310,7 @@ pub fn build_prins_context(node_id: u64) -> Option<crate::prins::PrinsContext> {
         let local_fqdn = context.sender.clone().unwrap_or_default();
         (security, local_fqdn)
     };
+    let enc_profiles = security.enc_profiles;
     let mut prins_ctx = crate::prins::PrinsContext::new(
         security.local_context_id,
         security.peer_context_id,
@@ -318,6 +319,13 @@ pub fn build_prins_context(node_id: u64) -> Option<crate::prins::PrinsContext> {
         security.kid,
         local_fqdn,
     );
+    // Drive the encryption profile set from the NEGOTIATED data-type policy
+    // (TS 29.573 §6.1.5.2); the constructor's default profiles are only the
+    // local capability advertisement. An empty set (no policy negotiated)
+    // keeps the defaults for backward compatibility.
+    if !enc_profiles.is_empty() {
+        prins_ctx.profiles = enc_profiles;
+    }
     // Install our asymmetric signing identity (for the first modificationsBlock
     // entry) and the registered peer/IPX verifying keys (TS 33.501 §13.2.4.6).
     if let Some(key) = crate::prins::local_signing_key() {

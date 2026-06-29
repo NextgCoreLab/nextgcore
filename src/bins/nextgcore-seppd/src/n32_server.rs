@@ -820,7 +820,11 @@ pub async fn initiate_n32c_handshake(
                     .iter()
                     .map(|s| s.to_string())
                     .collect(),
-                modification_policy_allowed_paths: Vec::new(),
+                // Advertise our protection policy so the responder can negotiate
+                // the dataTypeEncPolicy (TS 29.573 §6.1.5.2.4).
+                protection_policy_info: Some(n32c_handler::local_protection_policy()),
+                sec_profiles: None,
+                ipx_provider_sec_info_list: None,
                 // Our ES256 modifications-signing public key so the peer can
                 // verify our modificationsBlock entries (TS 33.501 §13.2.4.6).
                 modifications_signing_public_key: n32c_handler::local_signing_public_key_pem_pub(),
@@ -1162,6 +1166,7 @@ mod tests {
                 kid: "unestab-kid".to_string(),
                 jwe_cipher_suite: "A256GCM".to_string(),
                 jws_cipher_suite: "ES256".to_string(),
+                enc_profiles: Vec::new(),
             });
             c.node_update(&node);
             node_id = node.id;

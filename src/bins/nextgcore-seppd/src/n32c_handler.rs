@@ -3,6 +3,7 @@
 //! Port of src/sepp/n32c-handler.c - Security capability request/response handlers
 
 use crate::context::{sepp_self, PlmnId, SecurityCapability, SeppNode};
+use crate::prins::{DataTypeProfile, IeDescriptor, IeLocation};
 
 /// Security capability request data (from OpenAPI SecNegotiateReqData)
 #[derive(Debug, Clone, Default)]
@@ -215,9 +216,17 @@ pub struct SecParamExchReqData {
     /// Supported JWS cipher suites, preference-ordered
     #[serde(default)]
     pub jws_cipher_suite_list: Vec<String>,
-    /// IE paths the requester permits intermediaries to modify
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub modification_policy_allowed_paths: Vec<String>,
+    /// Requester's protection policy (apiIeMappingList + dataTypeEncPolicy)
+    /// to be negotiated with the responder (TS 29.573 §6.1.5.2.4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protection_policy_info: Option<ProtectionPolicy>,
+    /// Named security profiles the requester supports (opaque identifiers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sec_profiles: Option<Vec<String>>,
+    /// IPX provider security info (raw public keys / certificates) of the RIs
+    /// on the requester's side (TS 29.573 §6.1.5.2.18).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipx_provider_sec_info_list: Option<Vec<IpxProviderSecInfo>>,
     /// Requester's ES256 public key (PEM, SubjectPublicKeyInfo) used to sign
     /// its modificationsBlock entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -240,12 +249,200 @@ pub struct SecParamExchRspData {
     pub selected_jwe_cipher_suite: String,
     /// Selected JWS cipher suite
     pub selected_jws_cipher_suite: String,
-    /// IE paths the responder permits intermediaries to modify
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub modification_policy_allowed_paths: Vec<String>,
+    /// The protection policy selected by the responder (intersection of the
+    /// requester's policy with local capability; TS 29.573 §6.1.5.2.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sel_protection_policy_info: Option<ProtectionPolicy>,
+    /// The security profiles selected by the responder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sel_sec_profiles: Option<Vec<String>>,
+    /// IPX provider security info on the responder's side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipx_provider_sec_info_list: Option<Vec<IpxProviderSecInfo>>,
     /// Responder's ES256 public key (PEM) for modificationsBlock verification
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modifications_signing_public_key: Option<String>,
+}
+
+// ============================================================================
+// Protection policy IEs (TS 29.573 §6.1.5.2.15 ProtectionPolicy, §6.1.5.2.17
+// ApiIeMapping, §6.1.5.2.16 IeInfo, §6.1.5.2.18 IpxProviderSecInfo)
+// ============================================================================
+
+/// Kind of IE for the data-type encryption policy (TS 29.573 `IeType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum IeType {
+    Ueid,
+    Location,
+    KeyMaterial,
+    AuthenticationMaterial,
+    AuthorizationToken,
+    RecursiveNonLeaf,
+    Other,
+    Nonsensitive,
+}
+
+/// Protection & modification policy for a single IE (TS 29.573 `IeInfo`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IeInfo {
+    /// Location of the IE in the HTTP message.
+    pub ie_loc: IeLocation,
+    /// Kind of the IE (drives whether `dataTypeEncPolicy` encrypts it).
+    pub ie_type: IeType,
+    /// RFC 6901 pointer of the IE in the request body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub req_ie: Option<String>,
+    /// RFC 6901 pointer of the IE in the response body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rsp_ie: Option<String>,
+    /// Whether an IPX may modify the IE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_modifiable: Option<bool>,
+}
+
+/// API URI → IE mapping the protection policy applies to (TS 29.573
+/// `ApiIeMapping`). `IeList` keeps the spec's (non-conventional) field name.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiIeMapping {
+    /// API signature (here the service name, e.g. "nudm-sdm").
+    pub api_signature: String,
+    /// HTTP method the mapping applies to.
+    pub api_method: String,
+    /// IEs of this API and their protection policy.
+    #[serde(rename = "IeList")]
+    pub ie_list: Vec<IeInfo>,
+}
+
+/// Protection policy negotiated between SEPPs (TS 29.573 `ProtectionPolicy`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProtectionPolicy {
+    /// API → IE mapping the policy applies to (required, minItems 1).
+    pub api_ie_mapping_list: Vec<ApiIeMapping>,
+    /// IE types to encrypt across all mapped APIs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_type_enc_policy: Option<Vec<IeType>>,
+}
+
+/// Security information of an IPX/RI on the N32-f path (TS 29.573
+/// `IpxProviderSecInfo`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IpxProviderSecInfo {
+    /// IPX provider identity (FQDN).
+    pub ipx_provider_id: String,
+    /// Raw public keys (e.g. JWK / PEM) the IPX signs modificationsBlock with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_public_key_list: Option<Vec<String>>,
+    /// X.509 certificates of the IPX.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_list: Option<Vec<String>>,
+}
+
+/// This SEPP's local protection-policy capability: the API → IE mapping it
+/// understands and the IE types it is willing to encrypt. The runtime profile
+/// set is the projection of this policy under the negotiated `dataTypeEncPolicy`
+/// (see [`profiles_from_protection_policy`]).
+pub fn local_protection_policy() -> ProtectionPolicy {
+    let body_ie = |ptr: &str, ie_type: IeType| IeInfo {
+        ie_loc: IeLocation::Body,
+        ie_type,
+        req_ie: Some(ptr.to_string()),
+        rsp_ie: None,
+        is_modifiable: Some(false),
+    };
+    ProtectionPolicy {
+        api_ie_mapping_list: vec![
+            ApiIeMapping {
+                api_signature: "nudm-sdm".to_string(),
+                api_method: "GET".to_string(),
+                ie_list: vec![
+                    body_ie("/supi", IeType::Ueid),
+                    body_ie("/pei", IeType::Ueid),
+                    body_ie("/gpsi", IeType::Ueid),
+                ],
+            },
+            ApiIeMapping {
+                api_signature: "nudm-uecm".to_string(),
+                api_method: "PUT".to_string(),
+                ie_list: vec![
+                    body_ie("/supi", IeType::Ueid),
+                    body_ie("/pei", IeType::Ueid),
+                ],
+            },
+            ApiIeMapping {
+                api_signature: "nausf-auth".to_string(),
+                api_method: "POST".to_string(),
+                ie_list: vec![
+                    body_ie("/supiOrSuci", IeType::Ueid),
+                    body_ie("/authenticationVector", IeType::AuthenticationMaterial),
+                ],
+            },
+        ],
+        data_type_enc_policy: Some(vec![IeType::Ueid, IeType::AuthenticationMaterial]),
+    }
+}
+
+/// Project a `ProtectionPolicy` into the runtime `DataTypeProfile` set: for each
+/// mapped API, collect the BODY IEs whose `ieType` is in `enc_types` as the IEs
+/// to encrypt. Both SEPPs run this over the same negotiated policy so they
+/// derive an identical encryption profile (byte-symmetric protect/unprotect).
+pub fn profiles_from_protection_policy(
+    policy: &ProtectionPolicy,
+    enc_types: &[IeType],
+) -> Vec<DataTypeProfile> {
+    policy
+        .api_ie_mapping_list
+        .iter()
+        .map(|mapping| {
+            let encrypt_ies = mapping
+                .ie_list
+                .iter()
+                .filter(|ie| ie.ie_loc == IeLocation::Body && enc_types.contains(&ie.ie_type))
+                .filter_map(|ie| {
+                    ie.req_ie.as_ref().map(|p| IeDescriptor {
+                        location: "BODY".to_string(),
+                        path: p.clone(),
+                    })
+                })
+                .collect();
+            DataTypeProfile {
+                id: format!("{}-profile", mapping.api_signature),
+                service_name: mapping.api_signature.clone(),
+                encrypt_ies,
+            }
+        })
+        .collect()
+}
+
+/// Negotiate the peer's advertised protection policy against local capability.
+/// Returns `(selected_policy, runtime_profiles)`: the selected policy carries
+/// the local API→IE mapping and the **intersection** of the peer's and local
+/// `dataTypeEncPolicy`; the runtime profiles are that selection projected to
+/// the IEs actually encrypted. A peer that advertises no policy falls back to
+/// the full local capability (matched-sim happy path unchanged).
+pub fn negotiate_protection_policy(
+    peer: Option<&ProtectionPolicy>,
+) -> (ProtectionPolicy, Vec<DataTypeProfile>) {
+    let local = local_protection_policy();
+    let local_types = local.data_type_enc_policy.clone().unwrap_or_default();
+    let agreed_types: Vec<IeType> = match peer.and_then(|p| p.data_type_enc_policy.as_ref()) {
+        Some(peer_types) => local_types
+            .iter()
+            .copied()
+            .filter(|t| peer_types.contains(t))
+            .collect(),
+        None => local_types,
+    };
+    let selected = ProtectionPolicy {
+        api_ie_mapping_list: local.api_ie_mapping_list.clone(),
+        data_type_enc_policy: Some(agreed_types.clone()),
+    };
+    let profiles = profiles_from_protection_policy(&selected, &agreed_types);
+    (selected, profiles)
 }
 
 /// JWE cipher suites this SEPP supports, preference-ordered
@@ -498,6 +695,12 @@ pub fn handle_exchange_params_request(
     let n32_context_id = canonical_n32f_context_id(&req.n32f_context_id, &local_context_id);
     let key_material = derive_n32f_key_material(&master, &n32_context_id);
 
+    // Negotiate the protection policy: intersect the requester's advertised
+    // policy with local capability, and drive the runtime encryption profile
+    // set from the NEGOTIATED dataTypeEncPolicy (TS 29.573 §6.1.5.2.4/.6).
+    let (sel_policy, enc_profiles) =
+        negotiate_protection_policy(req.protection_policy_info.as_ref());
+
     node.n32f_security = Some(crate::context::N32fSecurityInfo {
         local_context_id: local_context_id.clone(),
         peer_context_id: req.n32f_context_id.clone(),
@@ -506,6 +709,7 @@ pub fn handle_exchange_params_request(
         kid: n32_context_id,
         jwe_cipher_suite: jwe.clone(),
         jws_cipher_suite: jws.clone(),
+        enc_profiles,
     });
 
     // Learn where to deliver n32f-error reports for this peer
@@ -524,7 +728,9 @@ pub fn handle_exchange_params_request(
         n32f_context_id: local_context_id,
         selected_jwe_cipher_suite: jwe,
         selected_jws_cipher_suite: jws,
-        modification_policy_allowed_paths: Vec::new(),
+        sel_protection_policy_info: Some(sel_policy),
+        sel_sec_profiles: req.sec_profiles.clone(),
+        ipx_provider_sec_info_list: None,
         modifications_signing_public_key: local_signing_public_key_pem(),
     })
 }
@@ -573,6 +779,17 @@ pub fn handle_exchange_params_response(
         canonical_n32f_context_id(&sent_req.n32f_context_id, &rsp.n32f_context_id);
     let key_material = derive_n32f_key_material(&master, &n32_context_id);
 
+    // Adopt the protection policy the responder selected, projecting its
+    // negotiated dataTypeEncPolicy to the runtime encryption profile set. Both
+    // SEPPs project the same selected policy, so they encrypt identical IEs.
+    let enc_profiles = match rsp.sel_protection_policy_info.as_ref() {
+        Some(sel) => {
+            let types = sel.data_type_enc_policy.clone().unwrap_or_default();
+            profiles_from_protection_policy(sel, &types)
+        }
+        None => negotiate_protection_policy(None).1,
+    };
+
     node.n32f_security = Some(crate::context::N32fSecurityInfo {
         local_context_id: sent_req.n32f_context_id.clone(),
         peer_context_id: rsp.n32f_context_id.clone(),
@@ -581,6 +798,7 @@ pub fn handle_exchange_params_response(
         kid: n32_context_id,
         jwe_cipher_suite: rsp.selected_jwe_cipher_suite.clone(),
         jws_cipher_suite: rsp.selected_jws_cipher_suite.clone(),
+        enc_profiles,
     });
 
     log::info!(
@@ -925,7 +1143,9 @@ mod tests {
             n32f_context_id: a_ctx_id.clone(),
             jwe_cipher_suite_list: vec!["A256GCM".to_string()],
             jws_cipher_suite_list: vec!["ES256".to_string()],
-            modification_policy_allowed_paths: vec![],
+            protection_policy_info: None,
+            sec_profiles: None,
+            ipx_provider_sec_info_list: None,
             modifications_signing_public_key: Some(test_es256_pubkey_pem()),
             sender_api_root: None,
         };
@@ -973,7 +1193,9 @@ mod tests {
             n32f_context_id: "ctx".to_string(),
             jwe_cipher_suite_list: vec!["A256GCM".to_string()],
             jws_cipher_suite_list: vec!["ES256".to_string()],
-            modification_policy_allowed_paths: vec![],
+            protection_policy_info: None,
+            sec_profiles: None,
+            ipx_provider_sec_info_list: None,
             modifications_signing_public_key: None,
             sender_api_root: None,
         };
@@ -995,10 +1217,131 @@ mod tests {
             n32f_context_id: "ctx".to_string(),
             jwe_cipher_suite_list: vec!["A128CBC-HS256".to_string()],
             jws_cipher_suite_list: vec!["ES256".to_string()],
-            modification_policy_allowed_paths: vec![],
+            protection_policy_info: None,
+            sec_profiles: None,
+            ipx_provider_sec_info_list: None,
             modifications_signing_public_key: Some(test_es256_pubkey_pem()),
             sender_api_root: None,
         };
         assert!(handle_exchange_params_request(&mut node_b, &req).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // sepp-05: exchange-params protection-policy negotiation
+    // ------------------------------------------------------------------
+
+    /// Intersecting a peer policy that only wants UEID encrypted with local
+    /// capability selects UEID and drives the runtime profile accordingly.
+    #[test]
+    fn test_negotiate_protection_policy_intersects_enc_types() {
+        let mut peer = local_protection_policy();
+        peer.data_type_enc_policy = Some(vec![IeType::Ueid]);
+        let (sel, profiles) = negotiate_protection_policy(Some(&peer));
+        assert_eq!(sel.data_type_enc_policy.as_deref(), Some(&[IeType::Ueid][..]));
+
+        let nausf = profiles
+            .iter()
+            .find(|p| p.service_name == "nausf-auth")
+            .unwrap();
+        let paths: Vec<&str> = nausf.encrypt_ies.iter().map(|d| d.path.as_str()).collect();
+        assert_eq!(paths, vec!["/supiOrSuci"]);
+
+        // The initiator projects the SAME selected policy and so derives an
+        // identical runtime profile set (byte-symmetric protect/unprotect).
+        let sel_types = sel.data_type_enc_policy.clone().unwrap();
+        let initiator_profiles = profiles_from_protection_policy(&sel, &sel_types);
+        assert_eq!(initiator_profiles, profiles);
+
+        // No peer policy => full local capability (matched-sim path unchanged).
+        let (_, full) = negotiate_protection_policy(None);
+        let nausf_full = full
+            .iter()
+            .find(|p| p.service_name == "nausf-auth")
+            .unwrap();
+        assert_eq!(nausf_full.encrypt_ies.len(), 2);
+    }
+
+    /// The exchange-params responder stores the runtime encryption profile set
+    /// driven by the NEGOTIATED `dataTypeEncPolicy` and returns the selected
+    /// policy. Uses a unique peer FQDN + the deterministic no-TLS fallback so it
+    /// never touches the shared TLS-exporter store of the other handshake tests.
+    #[test]
+    fn test_exchange_params_responder_drives_profiles_from_negotiated_policy() {
+        {
+            let ctx = sepp_self();
+            let mut context = ctx.write().unwrap();
+            context.set_sender("sepp.local.example.com");
+        }
+
+        let mut peer_policy = local_protection_policy();
+        peer_policy.data_type_enc_policy = Some(vec![IeType::Ueid]);
+
+        let req = SecParamExchReqData {
+            sender: "sepp-neg-peer.example.com".to_string(),
+            n32f_context_id: "00aa11bb22cc33dd".to_string(),
+            jwe_cipher_suite_list: vec!["A256GCM".to_string()],
+            jws_cipher_suite_list: vec!["ES256".to_string()],
+            protection_policy_info: Some(peer_policy),
+            sec_profiles: Some(vec!["profA".to_string()]),
+            ipx_provider_sec_info_list: None,
+            modifications_signing_public_key: Some(test_es256_pubkey_pem()),
+            sender_api_root: None,
+        };
+
+        let mut node_b = SeppNode::new(20, "sepp-neg-peer.example.com");
+        node_b.negotiated_security_scheme = SecurityCapability::Prins;
+        let rsp = handle_exchange_params_request(&mut node_b, &req).unwrap();
+
+        // The response carries the selected policy with the intersected types
+        // and echoes the selected security profiles.
+        let sel = rsp.sel_protection_policy_info.as_ref().unwrap();
+        assert_eq!(sel.data_type_enc_policy.as_deref(), Some(&[IeType::Ueid][..]));
+        assert_eq!(rsp.sel_sec_profiles.as_deref(), Some(&["profA".to_string()][..]));
+
+        // The stored runtime profiles encrypt exactly the negotiated UEID, not
+        // the (un-negotiated) AUTHENTICATION_MATERIAL.
+        let enc_profiles = node_b.n32f_security.unwrap().enc_profiles;
+        let nausf = enc_profiles
+            .iter()
+            .find(|p| p.service_name == "nausf-auth")
+            .unwrap();
+        let paths: Vec<&str> = nausf.encrypt_ies.iter().map(|d| d.path.as_str()).collect();
+        assert!(paths.contains(&"/supiOrSuci"), "UEID must be encrypted");
+        assert!(
+            !paths.contains(&"/authenticationVector"),
+            "AUTHENTICATION_MATERIAL must NOT be encrypted (not negotiated)"
+        );
+    }
+
+    /// The SecParamExchReqData serializes with the spec field names
+    /// (protectionPolicyInfo / ipxProviderSecInfoList / apiIeMappingList /
+    /// dataTypeEncPolicy / IeList) and no bespoke modificationPolicyAllowedPaths.
+    #[test]
+    fn test_sec_param_exch_req_serialization_is_spec_shaped() {
+        let req = SecParamExchReqData {
+            sender: "sepp-a.example.com".to_string(),
+            n32f_context_id: "0011223344556677".to_string(),
+            jwe_cipher_suite_list: vec!["A256GCM".to_string()],
+            jws_cipher_suite_list: vec!["ES256".to_string()],
+            protection_policy_info: Some(local_protection_policy()),
+            sec_profiles: Some(vec!["profA".to_string()]),
+            ipx_provider_sec_info_list: Some(vec![IpxProviderSecInfo {
+                ipx_provider_id: "ipx1.example.com".to_string(),
+                raw_public_key_list: Some(vec!["rawkey".to_string()]),
+                certificate_list: None,
+            }]),
+            modifications_signing_public_key: None,
+            sender_api_root: None,
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(v.get("protectionPolicyInfo").is_some());
+        assert!(v.get("ipxProviderSecInfoList").is_some());
+        assert!(s.contains("apiIeMappingList"));
+        assert!(s.contains("dataTypeEncPolicy"));
+        assert!(s.contains("\"IeList\""));
+        assert!(s.contains("UEID"));
+        assert!(s.contains("AUTHENTICATION_MATERIAL"));
+        assert!(!s.contains("modificationPolicyAllowedPaths"));
     }
 }
