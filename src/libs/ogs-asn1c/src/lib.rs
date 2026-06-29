@@ -10,6 +10,7 @@
 
 pub mod e1ap;
 pub mod f1ap; // F1AP codec - CU-DU (TS 38.473)
+pub mod lpp; // LPP codec - LTE/NR Positioning Protocol (TS 37.355), UPER, LMF<->UE
 pub mod ngap; // NGAP codec (directory module)
 pub mod nrppa; // NRPPa codec - NR Positioning Protocol A (TS 38.455), APER, NGAP-carried
 pub mod per; // Packed Encoding Rules (APER)
