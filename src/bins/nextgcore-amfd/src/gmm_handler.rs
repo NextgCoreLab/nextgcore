@@ -538,6 +538,10 @@ pub enum UlTransportAction {
     /// reply with DL NAS Transport echoing the container with
     /// 5GMM cause #90 "payload was not forwarded" (Section 5.4.5.3.1)
     PayloadNotForwarded,
+    /// LPP positioning container (TS 23.273): forward the uplink LPP message to
+    /// the serving LMF over Nlmf. Until an LMF association exists (lmfd-07) the
+    /// caller falls back to the #90 abnormal action, so the wire is unchanged.
+    ForwardLppToLmf { lpp: Vec<u8> },
 }
 
 /// Handle UL NAS transport (TS 24.501 Section 8.2.10)
@@ -587,8 +591,21 @@ pub fn handle_ul_nas_transport(
             amf_ue.pending_psi = Some(psi);
             Ok(UlTransportAction::RouteToSmf { psi })
         }
+        payload_container_type::LPP => {
+            // LPP positioning (TS 23.273): the uplink LPP message is destined
+            // for the serving LMF. Recognised distinctly from the unsupported
+            // containers below; the caller forwards it (or, with no LMF
+            // association yet, falls back to the #90 abnormal action).
+            log::info!(
+                "[{}] UL NAS Transport - LPP positioning container ({} bytes) for the LMF",
+                amf_ue.supi.as_deref().unwrap_or("Unknown"),
+                transport.payload_container.len()
+            );
+            Ok(UlTransportAction::ForwardLppToLmf {
+                lpp: transport.payload_container.clone(),
+            })
+        }
         payload_container_type::SMS
-        | payload_container_type::LPP
         | payload_container_type::SOR_TRANSPARENT_CONTAINER
         | payload_container_type::UE_POLICY_CONTAINER
         | payload_container_type::UE_PARAMETERS_UPDATE
@@ -956,6 +973,25 @@ mod tests {
 
         let result = handle_ul_nas_transport(&mut amf_ue, &ran_ue, &transport);
         assert_eq!(result, Ok(UlTransportAction::PayloadNotForwarded));
+    }
+
+    #[test]
+    fn test_handle_ul_nas_transport_lpp_forwards_to_lmf() {
+        let mut amf_ue = create_test_amf_ue();
+        let ran_ue = create_test_ran_ue();
+
+        // LPP positioning container (TS 23.273): recognised distinctly from the
+        // unsupported containers and routed toward the LMF, not lumped into #90.
+        let lpp = vec![0x90u8, 0x01, 0x20, 0x09, 0x30];
+        let transport = UlNasTransport {
+            payload_container_type: payload_container_type::LPP,
+            payload_container: lpp.clone(),
+            pdu_session_id: None,
+            ..Default::default()
+        };
+
+        let result = handle_ul_nas_transport(&mut amf_ue, &ran_ue, &transport);
+        assert_eq!(result, Ok(UlTransportAction::ForwardLppToLmf { lpp }));
     }
 
     #[test]

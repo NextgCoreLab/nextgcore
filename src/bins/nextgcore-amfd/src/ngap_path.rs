@@ -2747,6 +2747,30 @@ impl NgapServer {
                         .await?;
                 }
             }
+            Ok(crate::gmm_handler::UlTransportAction::ForwardLppToLmf { lpp }) => {
+                // TS 23.273: forward the uplink LPP message to the serving LMF
+                // over Nlmf. No LMF association exists yet (lmfd-07), so fall
+                // back to the spec abnormal action (DL NAS Transport, 5GMM cause
+                // #90) — wire-identical to the legacy behaviour. Recognising LPP
+                // distinctly is what readies the real forward.
+                log::info!(
+                    "UL LPP positioning container ({} B) pending LMF forward; no LMF \
+                     associated — replying 5GMM #90",
+                    lpp.len()
+                );
+                let plain = gmm_build::build_dl_nas_transport(
+                    None,
+                    container_type,
+                    &lpp,
+                    Some(GmmCause::PayloadWasNotForwarded),
+                    None,
+                )
+                .unwrap_or_default();
+                if let Some(protected) = self.protect_nas(amf_ue_ngap_id, &plain) {
+                    self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &protected)
+                        .await?;
+                }
+            }
             Err(cause) => {
                 // Protocol error: 5GMM STATUS (TS 24.501 Section 5.4.7)
                 let plain = gmm_build::build_gmm_status(cause).unwrap_or_default();
