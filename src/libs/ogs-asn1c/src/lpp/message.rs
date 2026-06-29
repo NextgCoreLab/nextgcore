@@ -261,6 +261,10 @@ mod tests {
         DlPrsIdInfo, NrDlTdoaMeasElement, NrDlTdoaMeasList, NrDlTdoaProvideLocationInformation,
         NrDlTdoaSignalMeasurementInformation, NrRstd, NrSlot, NrTimeStamp, NrTimingQuality,
     };
+    use crate::lpp::nr_multi_rtt::{
+        NrMultiRttMeasElement, NrMultiRttMeasList, NrMultiRttProvideLocationInformation,
+        NrMultiRttSignalMeasurementInformation, NrUeRxTxTimeDiff,
+    };
     use crate::lpp::types::{Initiator, TransactionNumber};
     use bitvec::prelude::*;
 
@@ -393,6 +397,7 @@ mod tests {
             message_body: Some(LppMessageBody::C1(
                 MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
                     ies: ProvideLocationInformationR9 {
+                        nr_multi_rtt: None,
                         ecid: Some(EcidProvideLocationInformation {
                             signal_measurement_information: Some(
                                 EcidSignalMeasurementInformation {
@@ -426,6 +431,7 @@ mod tests {
             message_body: Some(LppMessageBody::C1(
                 MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
                     ies: ProvideLocationInformationR9 {
+                        nr_multi_rtt: None,
                         ecid: None,
                         nr_dl_tdoa: Some(NrDlTdoaProvideLocationInformation {
                             signal_measurement_information: Some(
@@ -454,6 +460,57 @@ mod tests {
                                 },
                             ),
                         }),
+                    },
+                }),
+            )),
+        };
+        let bytes = msg.encode().unwrap();
+        assert_eq!(LppMessage::decode(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn rt_lpp_message_provide_path_nr_multi_rtt() {
+        // A full LppMessage carrying ProvideLocationInformation -> nr-Multi-RTT
+        // (the r16 extension-addition group, member index 1), end to end.
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::TargetDevice,
+                transaction_number: TransactionNumber(13),
+            }),
+            end_transaction: true,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(
+                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
+                    ies: ProvideLocationInformationR9 {
+                        ecid: None,
+                        nr_multi_rtt: Some(NrMultiRttProvideLocationInformation {
+                            signal_measurement_information: Some(
+                                NrMultiRttSignalMeasurementInformation {
+                                    meas_list: NrMultiRttMeasList {
+                                        items: vec![NrMultiRttMeasElement {
+                                            dl_prs_id: 5,
+                                            nr_phys_cell_id: Some(123),
+                                            nr_arfcn: Some(640_000),
+                                            nr_ue_rx_tx_time_diff: NrUeRxTxTimeDiff::K2(300_000),
+                                            nr_time_stamp: NrTimeStamp {
+                                                dl_prs_id: 5,
+                                                nr_phys_cell_id: Some(123),
+                                                nr_arfcn: None,
+                                                nr_sfn: 700,
+                                                nr_slot: NrSlot::Scs30(11),
+                                            },
+                                            nr_timing_quality: NrTimingQuality {
+                                                timing_quality_value: 12,
+                                                timing_quality_resolution: 2,
+                                            },
+                                            nr_dl_prs_rsrp_result: Some(80),
+                                        }],
+                                    },
+                                },
+                            ),
+                        }),
+                        nr_dl_tdoa: None,
                     },
                 }),
             )),

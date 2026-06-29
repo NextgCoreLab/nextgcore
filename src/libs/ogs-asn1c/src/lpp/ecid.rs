@@ -17,6 +17,7 @@
 use bitvec::prelude::*;
 
 use super::nr_dl_tdoa::NrDlTdoaProvideLocationInformation;
+use super::nr_multi_rtt::NrMultiRttProvideLocationInformation;
 use crate::per::{Constraint, PerError, PerResult};
 use crate::uper::{UperDecode, UperDecoder, UperEncode, UperEncoder};
 
@@ -172,25 +173,30 @@ impl UperDecode for ProvideLocationInformation {
 ///     [[ G3(r19): nr-DL-AIML ]] }
 ///
 /// The 5 root optionals type ONLY the `ecid` method (others UNSUPPORTED-ABSENT,
-/// as on the request side). The NR DL-TDOA provide-body rides in the **r16
-/// extension-addition group G2, member index 3** (4th of
-/// `[nr-ECID, nr-Multi-RTT, nr-DL-AoD, nr-DL-TDOA]`). Per X.691 §18.9 the group
-/// is itself encoded as a non-extensible SEQUENCE of its 4 OPTIONAL members,
-/// open-type-wrapped as the 2nd of the 3 declared addition groups (G1/G2/G3).
+/// as on the request side). The NR Multi-RTT and NR DL-TDOA provide-bodies ride
+/// in the **r16 extension-addition group G2**, as member index 1 (nr-Multi-RTT)
+/// and member index 3 (nr-DL-TDOA) of
+/// `[nr-ECID, nr-Multi-RTT, nr-DL-AoD, nr-DL-TDOA]`. Per X.691 §18.9 the group
+/// is itself encoded as a non-extensible SEQUENCE of its 4 OPTIONAL members;
+/// present members are encoded in declaration order (nr-Multi-RTT before
+/// nr-DL-TDOA). The group is open-type-wrapped as G2 of the declared addition
+/// groups (G1/G2/G3), with the trailing-absent G3 trimmed (X.691 §18.8).
 ///
-/// BACKWARD COMPAT: when `nr_dl_tdoa` is `None`, no addition is emitted
-/// (extension marker 0), so the encoding is byte-identical to the E-CID-only
-/// v1 form.
+/// BACKWARD COMPAT: when neither `nr_multi_rtt` nor `nr_dl_tdoa` is set, no
+/// addition is emitted (extension marker 0), so the encoding is byte-identical
+/// to the E-CID-only v1 form.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProvideLocationInformationR9 {
     pub ecid: Option<EcidProvideLocationInformation>,
-    /// NR DL-TDOA provide-body, carried in the r16 extension-addition group.
+    /// NR Multi-RTT provide-body (r16 group member index 1).
+    pub nr_multi_rtt: Option<NrMultiRttProvideLocationInformation>,
+    /// NR DL-TDOA provide-body (r16 group member index 3).
     pub nr_dl_tdoa: Option<NrDlTdoaProvideLocationInformation>,
 }
 
 impl UperEncode for ProvideLocationInformationR9 {
     fn encode_uper(&self, encoder: &mut UperEncoder) -> PerResult<()> {
-        let has_add = self.nr_dl_tdoa.is_some();
+        let has_add = self.nr_multi_rtt.is_some() || self.nr_dl_tdoa.is_some();
         // Extension marker = whether any extension addition follows.
         encoder.encode_sequence_preamble(
             Some(has_add),
@@ -202,12 +208,20 @@ impl UperEncode for ProvideLocationInformationR9 {
         if has_add {
             // Build the r16 group (G2) content: a non-extensible SEQUENCE whose
             // 4 OPTIONAL members are [nr-ECID, nr-Multi-RTT, nr-DL-AoD,
-            // nr-DL-TDOA]; only nr-DL-TDOA (index 3) is present.
+            // nr-DL-TDOA]. Present members are emitted in declaration order.
             let mut g2 = UperEncoder::new();
             g2.encode_sequence_preamble(
                 None,
-                &[false, false, false, self.nr_dl_tdoa.is_some()],
+                &[
+                    false,
+                    self.nr_multi_rtt.is_some(),
+                    false,
+                    self.nr_dl_tdoa.is_some(),
+                ],
             );
+            if let Some(multi_rtt) = &self.nr_multi_rtt {
+                multi_rtt.encode_uper(&mut g2)?;
+            }
             if let Some(tdoa) = &self.nr_dl_tdoa {
                 tdoa.encode_uper(&mut g2)?;
             }
@@ -235,6 +249,7 @@ impl UperDecode for ProvideLocationInformationR9 {
         } else {
             None
         };
+        let mut nr_multi_rtt = None;
         let mut nr_dl_tdoa = None;
         if ext {
             // groups[0]=G1(r13), groups[1]=G2(r16), groups[2]=G3(r19) — index by
@@ -244,12 +259,17 @@ impl UperDecode for ProvideLocationInformationR9 {
                 let mut g2 = UperDecoder::new(g2_bytes);
                 let (_g_ext, g_opts) = g2.decode_sequence_preamble(false, 4)?;
                 // g_opts = [nr-ECID, nr-Multi-RTT, nr-DL-AoD, nr-DL-TDOA]
-                if g_opts[0] || g_opts[1] || g_opts[2] {
+                if g_opts[0] || g_opts[2] {
                     return Err(PerError::DecodeError(
-                        "LPP r16 provide group: nr-ECID / nr-Multi-RTT / nr-DL-AoD not supported \
-                         in C3 (nr-DL-TDOA only)"
+                        "LPP r16 provide group: nr-ECID / nr-DL-AoD not supported (nr-Multi-RTT \
+                         and nr-DL-TDOA only)"
                             .to_string(),
                     ));
+                }
+                // Declaration order: nr-Multi-RTT (idx1) before nr-DL-TDOA (idx3).
+                if g_opts[1] {
+                    nr_multi_rtt =
+                        Some(NrMultiRttProvideLocationInformation::decode_uper(&mut g2)?);
                 }
                 if g_opts[3] {
                     nr_dl_tdoa =
@@ -259,7 +279,11 @@ impl UperDecode for ProvideLocationInformationR9 {
             // groups[0] (r13) and groups[2] (r19), if present, are ignored
             // (forward-compat skip).
         }
-        Ok(ProvideLocationInformationR9 { ecid, nr_dl_tdoa })
+        Ok(ProvideLocationInformationR9 {
+            ecid,
+            nr_multi_rtt,
+            nr_dl_tdoa,
+        })
     }
 }
 
@@ -675,6 +699,37 @@ mod tests {
         DlPrsIdInfo, NrDlTdoaMeasElement, NrDlTdoaMeasList, NrDlTdoaSignalMeasurementInformation,
         NrRstd, NrSlot, NrTimeStamp, NrTimingQuality,
     };
+    use crate::lpp::nr_multi_rtt::{
+        NrMultiRttMeasElement, NrMultiRttMeasList, NrMultiRttSignalMeasurementInformation,
+        NrUeRxTxTimeDiff,
+    };
+
+    fn minimal_nr_multi_rtt() -> NrMultiRttProvideLocationInformation {
+        NrMultiRttProvideLocationInformation {
+            signal_measurement_information: Some(NrMultiRttSignalMeasurementInformation {
+                meas_list: NrMultiRttMeasList {
+                    items: vec![NrMultiRttMeasElement {
+                        dl_prs_id: 0,
+                        nr_phys_cell_id: None,
+                        nr_arfcn: None,
+                        nr_ue_rx_tx_time_diff: NrUeRxTxTimeDiff::K0(0),
+                        nr_time_stamp: NrTimeStamp {
+                            dl_prs_id: 0,
+                            nr_phys_cell_id: None,
+                            nr_arfcn: None,
+                            nr_sfn: 0,
+                            nr_slot: NrSlot::Scs15(0),
+                        },
+                        nr_timing_quality: NrTimingQuality {
+                            timing_quality_value: 0,
+                            timing_quality_resolution: 0,
+                        },
+                        nr_dl_prs_rsrp_result: None,
+                    }],
+                },
+            }),
+        }
+    }
 
     fn minimal_nr_dl_tdoa() -> NrDlTdoaProvideLocationInformation {
         NrDlTdoaProvideLocationInformation {
@@ -852,6 +907,7 @@ mod tests {
         // byte-identical to the pre-C3 encoding (backward compatibility).
         roundtrip(&ProvideLocationInformation {
             ies: ProvideLocationInformationR9 {
+                nr_multi_rtt: None,
                 ecid: Some(EcidProvideLocationInformation {
                     signal_measurement_information: Some(EcidSignalMeasurementInformation {
                         primary_cell_measured_results: Some(all_present_element()),
@@ -869,6 +925,7 @@ mod tests {
         // nr-DL-TDOA only (no E-CID).
         roundtrip(&ProvideLocationInformation {
             ies: ProvideLocationInformationR9 {
+                nr_multi_rtt: None,
                 ecid: None,
                 nr_dl_tdoa: Some(minimal_nr_dl_tdoa()),
             },
@@ -876,6 +933,7 @@ mod tests {
         // E-CID AND nr-DL-TDOA together.
         roundtrip(&ProvideLocationInformation {
             ies: ProvideLocationInformationR9 {
+                nr_multi_rtt: None,
                 ecid: Some(EcidProvideLocationInformation {
                     signal_measurement_information: Some(EcidSignalMeasurementInformation {
                         primary_cell_measured_results: None,
@@ -894,6 +952,7 @@ mod tests {
     #[test]
     fn ecid_only_provide_r9_has_no_extension_addition() {
         let r9 = ProvideLocationInformationR9 {
+            nr_multi_rtt: None,
             ecid: Some(EcidProvideLocationInformation {
                 signal_measurement_information: None,
                 ecid_error: None,
@@ -941,6 +1000,7 @@ mod tests {
     #[test]
     fn test_nr_dl_tdoa_r16_group_framing_reference_hex() {
         let r9 = ProvideLocationInformationR9 {
+            nr_multi_rtt: None,
             ecid: None,
             nr_dl_tdoa: Some(minimal_nr_dl_tdoa()),
         };
@@ -963,17 +1023,17 @@ mod tests {
         assert_eq!(decoded, r9);
     }
 
-    /// Negative: a peer's r16 group with nr-Multi-RTT (member index 1) present is
-    /// rejected in C3 (only nr-DL-TDOA, index 3, is typed).
+    /// Negative: a peer's r16 group with nr-ECID (member index 0) present is
+    /// rejected — only nr-Multi-RTT (idx1) and nr-DL-TDOA (idx3) are typed.
     #[test]
-    fn err_r16_group_multi_rtt_present() {
+    fn err_r16_group_nr_ecid_present() {
         let mut main = UperEncoder::new();
         // Root preamble: ext-marker 1, all root optionals absent.
         main.encode_sequence_preamble(Some(true), &[false, false, false, false, false]);
-        // G2 group with nr-Multi-RTT (index 1) present, no content needed (the
-        // decoder rejects on the group bitmap before reading any body).
+        // G2 group with nr-ECID (index 0) present; the decoder rejects on the
+        // group bitmap before reading any body.
         let mut g2 = UperEncoder::new();
-        g2.encode_sequence_preamble(None, &[false, true, false, false]);
+        g2.encode_sequence_preamble(None, &[true, false, false, false]);
         let g2_bytes = g2.into_bytes().to_vec();
         main.encode_extension_additions(&[None, Some(g2_bytes)])
             .unwrap();
@@ -981,6 +1041,52 @@ mod tests {
 
         let mut dec = UperDecoder::new(&bytes);
         assert!(ProvideLocationInformationR9::decode_uper(&mut dec).is_err());
+    }
+
+    #[test]
+    fn rt_provide_location_information_nr_multi_rtt() {
+        // nr-Multi-RTT only (no E-CID, no DL-TDOA).
+        roundtrip(&ProvideLocationInformation {
+            ies: ProvideLocationInformationR9 {
+                ecid: None,
+                nr_multi_rtt: Some(minimal_nr_multi_rtt()),
+                nr_dl_tdoa: None,
+            },
+        });
+    }
+
+    /// BOTH r16 G2 members present (nr-Multi-RTT idx1 AND nr-DL-TDOA idx3): the
+    /// group preamble is [nr-ECID=0, nr-Multi-RTT=1, nr-DL-AoD=0, nr-DL-TDOA=1]
+    /// = `0101`, and the two bodies are emitted in declaration order
+    /// (nr-Multi-RTT first). Verifies the ordered multi-member group encode.
+    #[test]
+    fn rt_provide_location_information_both_g2_members() {
+        let value = ProvideLocationInformation {
+            ies: ProvideLocationInformationR9 {
+                ecid: None,
+                nr_multi_rtt: Some(minimal_nr_multi_rtt()),
+                nr_dl_tdoa: Some(minimal_nr_dl_tdoa()),
+            },
+        };
+        roundtrip(&value);
+
+        // Spot-check the group preamble bits: encode the inner r9, decode the G2
+        // open type, and confirm the member bitmap is `0101`.
+        let mut enc = UperEncoder::new();
+        value.ies.encode_uper(&mut enc).unwrap();
+        let bytes = enc.into_bytes();
+        let mut dec = UperDecoder::new(&bytes);
+        let (ext, _opts) = dec.decode_sequence_preamble(true, 5).unwrap();
+        assert!(ext, "an extension addition must be present");
+        let groups = dec.decode_extension_additions().unwrap();
+        let g2_bytes = groups.get(1).and_then(|g| g.clone()).expect("G2 present");
+        let mut g2 = UperDecoder::new(&g2_bytes);
+        let (_g_ext, g_opts) = g2.decode_sequence_preamble(false, 4).unwrap();
+        assert_eq!(
+            g_opts,
+            vec![false, true, false, true],
+            "G2 member bitmap [nr-ECID, nr-Multi-RTT, nr-DL-AoD, nr-DL-TDOA]"
+        );
     }
 
     #[test]
