@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::positioning::{
-    rtt_ns_to_range_m, solve_aoa, solve_ecid, solve_multi_rtt, AoaObservation, RttObservation,
-    TrpCoord, TrpRegistry,
+    rtt_ns_to_range_m, solve_aoa, solve_ecid, solve_multi_rtt, solve_tdoa, AoaObservation,
+    RttObservation, TdoaObservation, TrpCoord, TrpRegistry,
 };
 
 /// Positioning method (TS 23.273 6.1)
@@ -115,6 +115,9 @@ pub struct CellMeasurement {
     pub aoa: Option<f64>,
     /// Round-trip time (nanoseconds)
     pub rtt_ns: Option<u64>,
+    /// NR DL-TDOA reference-signal time difference vs the DL-PRS reference TRP
+    /// (nanoseconds, SIGNED; the reference TRP itself reports 0). TS 37.355.
+    pub rstd_ns: Option<f64>,
 }
 
 /// Positioning QoS requirements
@@ -364,8 +367,9 @@ impl LmfContext {
 /// Solver priority (highest confidence first):
 ///
 /// 1. **Multi-RTT** — if ≥ 3 cells report `rtt_ns` and are in the registry.
-/// 2. **AoA** — if ≥ 2 cells report `aoa` and are in the registry.
-/// 3. **ECID** — if the best-RSRP cell has `timing_advance` and is in the registry.
+/// 2. **NR DL-TDOA** — if ≥ 3 cells report `rstd_ns` and are in the registry.
+/// 3. **AoA** — if ≥ 2 cells report `aoa` and are in the registry.
+/// 4. **ECID** — if the best-RSRP cell has `timing_advance` and is in the registry.
 ///
 /// On any solver failure or when the registry is empty / has no matching
 /// cells, falls back to the heuristic placeholder (lat/lon 0.0, method-based
@@ -418,6 +422,42 @@ fn try_real_solve(
                 })
             }
             Err(e) => log::warn!("Multi-RTT solve failed: {e}"),
+        }
+    }
+
+    // --- NR DL-TDOA (≥3 cells with rstd_ns known to the registry) -----------
+    // RSTD is relative to the DL-PRS reference TRP (rstd_ns == 0). solve_tdoa
+    // expects observation[0] to be that reference, so order by |rstd| to put
+    // the zero-RSTD reference first.
+    let mut tdoa_obs: Vec<TdoaObservation> = measurements
+        .iter()
+        .filter(|m| m.rstd_ns.is_some() && registry.lookup(&m.nr_cgi).is_some())
+        .map(|m| TdoaObservation {
+            trp_id: m.nr_cgi.clone(),
+            tdoa_ns: m.rstd_ns.unwrap(),
+        })
+        .collect();
+    tdoa_obs.sort_by(|a, b| {
+        a.tdoa_ns
+            .abs()
+            .partial_cmp(&b.tdoa_ns.abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    if tdoa_obs.len() >= 3 {
+        match solve_tdoa(registry, &tdoa_obs) {
+            Ok(est) => {
+                return Some(LocationEstimate {
+                    latitude: est.lat_deg,
+                    longitude: est.lon_deg,
+                    altitude: est.height_m,
+                    horizontal_accuracy: est.horizontal_uncertainty_m(),
+                    vertical_accuracy: None,
+                    method_used: Some(est.method.as_spec_str().to_string()),
+                    timestamp: 0,
+                })
+            }
+            Err(e) => log::warn!("DL-TDOA solve failed: {e}"),
         }
     }
 
@@ -598,6 +638,7 @@ mod tests {
             timing_advance: Some(100),
             aoa: None,
             rtt_ns: None,
+            rstd_ns: None,
         }];
 
         let location = ctx.measurement_report(req.request_id, cells).unwrap();
@@ -633,6 +674,7 @@ mod tests {
                 timing_advance: None,
                 aoa: Some(45.0),
                 rtt_ns: Some(1000),
+                rstd_ns: None,
             },
             CellMeasurement {
                 nr_cgi: "001-01-0002-02".to_string(),
@@ -641,6 +683,7 @@ mod tests {
                 timing_advance: None,
                 aoa: Some(120.0),
                 rtt_ns: Some(2000),
+                rstd_ns: None,
             },
         ];
 
@@ -678,6 +721,7 @@ mod tests {
             timing_advance: None,
             aoa: None,
             rtt_ns: None,
+            rstd_ns: None,
         }];
         let loc = compute_location(&PositioningMethod::Ecid, &cells, &registry);
         assert!(loc.horizontal_accuracy > 50.0); // ECID is coarse
@@ -696,6 +740,7 @@ mod tests {
             timing_advance: None,
             aoa: None,
             rtt_ns: None,
+            rstd_ns: None,
         }];
         let loc = compute_location(&PositioningMethod::Gnss, &cells, &registry);
         assert!(loc.horizontal_accuracy <= 5.0); // GNSS is accurate
@@ -779,6 +824,7 @@ mod tests_real_solve {
                     timing_advance: None,
                     aoa: None,
                     rtt_ns: Some(rtt_ns),
+                    rstd_ns: None,
                 }
             })
             .collect();
@@ -792,6 +838,48 @@ mod tests_real_solve {
         );
         assert!(loc.horizontal_accuracy > 0.0);
         assert_eq!(loc.method_used.as_deref(), Some("MULTI-RTT"));
+    }
+
+    // -- NR DL-TDOA path ------------------------------------------------------
+    #[test]
+    fn test_compute_location_dl_tdoa_real_solve() {
+        let (ctx, entries, true_geo, true_enu, origin) = scene();
+        let registry = ctx.build_trp_registry();
+
+        // Reference TRP = entries[0] (RSTD 0). Each cell's RSTD is the signed
+        // range difference vs the reference, in ns: (range_i − range_ref)/c.
+        let ref_range = exact_range_m(entries[0].1, true_enu, origin);
+        let cells: Vec<CellMeasurement> = entries
+            .iter()
+            .map(|(id, coord)| {
+                let range_m = exact_range_m(*coord, true_enu, origin);
+                let rstd_ns = (range_m - ref_range) / SPEED_OF_LIGHT_M_S * 1e9;
+                CellMeasurement {
+                    nr_cgi: id.clone(),
+                    rsrp: Some(-80),
+                    rsrq: None,
+                    timing_advance: None,
+                    aoa: None,
+                    rtt_ns: None,
+                    rstd_ns: Some(rstd_ns),
+                }
+            })
+            .collect();
+
+        let loc = compute_location(&PositioningMethod::NrBased, &cells, &registry);
+        let got = TrpCoord::new(loc.latitude, loc.longitude, 0.0);
+        let err_m = geo_dist_m(got, true_geo);
+        assert!(
+            err_m < 50.0,
+            "DL-TDOA position error {err_m:.2}m exceeds 50 m tolerance"
+        );
+        assert!(loc.horizontal_accuracy > 0.0);
+        // Only rstd_ns is set (no rtt/aoa/ta), so the TDOA branch must be what
+        // produced the fix.
+        assert!(
+            loc.method_used.is_some(),
+            "expected a method from the DL-TDOA solver"
+        );
     }
 
     // -- ECID path ------------------------------------------------------------
@@ -810,6 +898,7 @@ mod tests_real_solve {
             timing_advance: Some(ta),
             aoa: None,
             rtt_ns: None,
+            rstd_ns: None,
         }];
 
         let loc = compute_location(&PositioningMethod::Ecid, &cells, &registry);
@@ -851,6 +940,7 @@ mod tests_real_solve {
                     timing_advance: None,
                     aoa: Some(azimuth_deg),
                     rtt_ns: None,
+                    rstd_ns: None,
                 }
             })
             .collect();
@@ -886,6 +976,7 @@ mod tests_real_solve {
                     timing_advance: None,
                     aoa: Some(azimuth_deg),
                     rtt_ns: Some(rtt_ns),
+                    rstd_ns: None,
                 }
             })
             .collect();
@@ -909,6 +1000,7 @@ mod tests_real_solve {
             timing_advance: Some(100),
             aoa: None,
             rtt_ns: None,
+            rstd_ns: None,
         }];
         let loc = compute_location(&PositioningMethod::Ecid, &cells, &registry);
         // Placeholder: origin 0/0 with heuristic accuracy.

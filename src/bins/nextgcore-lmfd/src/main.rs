@@ -606,6 +606,7 @@ async fn handle_nrppa_report(request: &SbiRequest) -> SbiResponse {
                         .map(|n| n as u32),
                     aoa: c.get("aoa").and_then(|v| v.as_f64()),
                     rtt_ns: c.get("rttNs").and_then(|v| v.as_u64()),
+                    rstd_ns: c.get("rstdNs").and_then(|v| v.as_f64()),
                 })
                 .collect()
         })
@@ -700,15 +701,27 @@ async fn handle_nrppa_binary_report(request: &SbiRequest) -> SbiResponse {
 /// `ProvideLocationInformation` → `nr-Multi-RTT`.  The correlation
 /// request-id is taken from the LPP `transactionID.transactionNumber`.
 async fn handle_lpp_binary_report(request: &SbiRequest) -> SbiResponse {
-    log::info!("LPP binary ProvideLocationInformation (nr-Multi-RTT)");
+    log::info!("LPP binary ProvideLocationInformation (nr-Multi-RTT / nr-DL-TDOA)");
 
     let body = match &request.http.content {
         Some(c) => c,
         None => return problem(400, nlmf::cause::MANDATORY_IE_MISSING, "Missing body"),
     };
 
+    // A ProvideLocationInformation may carry nr-Multi-RTT or nr-DL-TDOA signal
+    // measurements; try the Multi-RTT adapter first, fall back to DL-TDOA.
     let (request_id, cells) = match codec_glue::decode_lpp_multi_rtt_report(body.as_bytes()) {
-        Ok(pair) => pair,
+        Ok((rid, c)) if !c.is_empty() => (rid, c),
+        Ok(_) => match codec_glue::decode_lpp_dl_tdoa_report(body.as_bytes()) {
+            Ok(pair) => pair,
+            Err(e) => {
+                return problem(
+                    400,
+                    nlmf::cause::INVALID_MSG_FORMAT,
+                    &format!("LPP decode failed: {e}"),
+                )
+            }
+        },
         Err(e) => {
             return problem(
                 400,
@@ -722,7 +735,7 @@ async fn handle_lpp_binary_report(request: &SbiRequest) -> SbiResponse {
         return problem(
             400,
             nlmf::cause::MANDATORY_IE_MISSING,
-            "LPP message carries no nr-Multi-RTT measurements",
+            "LPP message carries no nr-Multi-RTT or nr-DL-TDOA measurements",
         );
     }
 

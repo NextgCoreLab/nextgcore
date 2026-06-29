@@ -50,9 +50,15 @@ fn ng_ran_cgi_to_string(cgi: &ogs_asn1c::nrppa::ies::NgRanCgi) -> String {
     }
 }
 
-/// Convert an NR-RSTD (= NR-UE-Rx-Tx-TimeDiff) k0..k5 CHOICE value to
-/// nanoseconds.  Variant `Kn(v)` represents `v × 2^n × T_c`
-/// (TS 37.355 Tables 6.5.7.1-2 / 6.5.10.1-2).
+/// Convert an NR-UE-Rx-Tx-TimeDiff k0..k5 CHOICE value to nanoseconds as an
+/// unsigned magnitude `v × 2^n × T_c`, used by the Multi-RTT path for ranging.
+///
+/// NOTE: per TS 38.133 §10.1.25 the UE Rx–Tx time difference is itself a SIGNED
+/// quantity with the same per-arm midpoint offset as NR-RSTD; treating it as an
+/// unsigned magnitude here is a known simplification of the Multi-RTT RTT model
+/// (RTT = UE-Rx-Tx + gNB-Rx-Tx) and is left unchanged to avoid regressing the
+/// committed Multi-RTT path — revisit alongside a proper two-sided RTT model.
+/// The DL-TDOA path uses the spec-correct signed converter [`nrrstd_to_signed_ns`].
 fn nrrstd_to_ns(rstd: &NrRstd) -> u64 {
     let (val, shift): (f64, u32) = match rstd {
         NrRstd::K0(v) => (*v as f64, 0),
@@ -63,6 +69,32 @@ fn nrrstd_to_ns(rstd: &NrRstd) -> u64 {
         NrRstd::K5(v) => (*v as f64, 5),
     };
     (val * (1u64 << shift) as f64 * TC_NS) as u64
+}
+
+/// Convert an NR-RSTD k0..k5 CHOICE value to SIGNED nanoseconds (TS 37.355
+/// §6.5.10, mapping table TS 38.133 §10.1.23).
+///
+/// NR-RSTD is a *signed* reference-signal time difference relative to the
+/// DL-PRS reference TRP, but is encoded as an unsigned `INTEGER(0..maxK)` whose
+/// sign is carried by a per-arm midpoint offset. The signed value is
+/// `(v × 2^k − 985024) × T_c`: the offset 985024 is the LTE RSTD span
+/// (15391·Ts) scaled to `T_c = Ts/64`, so `v = 985024/2^k` decodes to exactly
+/// 0 ns (the reference TRP) and the range spans ≈ ±501 µs.
+///
+/// The exact ±1-LSB bin convention is defined by the TS 38.133 quantization
+/// table (not bundled in the local `specs/`); two independent spec derivations
+/// agreed on this formula to within one code, and it is validated here by
+/// synthetic round-trip recovery rather than a golden vector.
+fn nrrstd_to_signed_ns(rstd: &NrRstd) -> f64 {
+    let (val, shift): (i64, u32) = match rstd {
+        NrRstd::K0(v) => (*v as i64, 0),
+        NrRstd::K1(v) => (*v as i64, 1),
+        NrRstd::K2(v) => (*v as i64, 2),
+        NrRstd::K3(v) => (*v as i64, 3),
+        NrRstd::K4(v) => (*v as i64, 4),
+        NrRstd::K5(v) => (*v as i64, 5),
+    };
+    ((val << shift) - 985_024) as f64 * TC_NS
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +167,7 @@ pub fn nrppa_ecid_report_to_measurements(pdu: &NrppaPdu) -> Vec<CellMeasurement>
         timing_advance,
         aoa,
         rtt_ns: None,
+        rstd_ns: None,
     }]
 }
 
@@ -215,6 +248,7 @@ pub fn lpp_multi_rtt_provide_to_measurements(msg: &LppMessage) -> Vec<CellMeasur
                 timing_advance: None,
                 aoa: None,
                 rtt_ns: Some(nrrstd_to_ns(&elem.nr_ue_rx_tx_time_diff)),
+                rstd_ns: None,
             }
         })
         .collect()
@@ -242,6 +276,74 @@ pub fn decode_lpp_multi_rtt_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasure
     Ok((request_id, lpp_multi_rtt_provide_to_measurements(&msg)))
 }
 
+/// Adapt a UE NR-DL-TDOA `ProvideLocationInformation` (TS 37.355 §6.5.10) to a
+/// flat [`CellMeasurement`] list for [`crate::LmfContext::measurement_report`].
+///
+/// The reference TRP (`dl-PRS-ReferenceInfo`) is emitted first with `rstd_ns =
+/// 0` (RSTD is defined relative to it); each `NR-DL-TDOA-MeasElement` then
+/// contributes one entry whose `rstd_ns` is the SIGNED time difference vs that
+/// reference (see [`nrrstd_to_signed_ns`]). The CGI key is `"pci-<n>"` (NR PCI)
+/// when present, else `"prs-<id>"` (DL-PRS-ID). `compute_location` feeds these
+/// to the TDOA solver (reference first).
+///
+/// Returns an empty `Vec` when the message is not a `ProvideLocationInformation`
+/// or carries no `nr-DL-TDOA` signal-measurement information.
+pub fn lpp_dl_tdoa_provide_to_measurements(msg: &LppMessage) -> Vec<CellMeasurement> {
+    let prov = match msg.message_body.as_ref() {
+        Some(LppMessageBody::C1(MessageBodyC1::ProvideLocationInformation(p))) => p,
+        _ => return vec![],
+    };
+    let sig_info = match prov
+        .ies
+        .nr_dl_tdoa
+        .as_ref()
+        .and_then(|m| m.signal_measurement_information.as_ref())
+    {
+        Some(s) => s,
+        None => return vec![],
+    };
+
+    let mut out = Vec::with_capacity(sig_info.meas_list.items.len() + 1);
+    // Reference TRP: RSTD ≡ 0 by definition.
+    out.push(CellMeasurement {
+        nr_cgi: format!("prs-{}", sig_info.dl_prs_reference_info.dl_prs_id),
+        rsrp: None,
+        rsrq: None,
+        timing_advance: None,
+        aoa: None,
+        rtt_ns: None,
+        rstd_ns: Some(0.0),
+    });
+    for elem in &sig_info.meas_list.items {
+        let nr_cgi = match elem.nr_phys_cell_id {
+            Some(pci) => format!("pci-{pci}"),
+            None => format!("prs-{}", elem.dl_prs_id),
+        };
+        // nr_dl_prs_rsrp_result 0..127 → −140..−13 dBm (TS 37.355 §6.5.10).
+        let rsrp = elem.nr_dl_prs_rsrp_result.map(|v| v as i16 - 140);
+        out.push(CellMeasurement {
+            nr_cgi,
+            rsrp,
+            rsrq: None,
+            timing_advance: None,
+            aoa: None,
+            rtt_ns: None,
+            rstd_ns: Some(nrrstd_to_signed_ns(&elem.nr_rstd)),
+        });
+    }
+    out
+}
+
+/// Decode raw LPP UPER bytes and adapt NR-DL-TDOA measurements.
+///
+/// Returns `(request_id, Vec<CellMeasurement>)`; `request_id` is the LPP
+/// transaction number (0 when absent).
+pub fn decode_lpp_dl_tdoa_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasurement>), String> {
+    let msg = LppMessage::decode(bytes).map_err(|e| format!("LPP UPER decode: {e}"))?;
+    let request_id = extract_lpp_request_id(&msg).unwrap_or(0);
+    Ok((request_id, lpp_dl_tdoa_provide_to_measurements(&msg)))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -250,7 +352,8 @@ pub fn decode_lpp_multi_rtt_report(bytes: &[u8]) -> Result<(u64, Vec<CellMeasure
 mod tests {
     use super::{
         decode_nrppa_ecid_report, extract_lpp_request_id, extract_nrppa_request_id,
-        lpp_multi_rtt_provide_to_measurements, nrppa_ecid_report_to_measurements, nrrstd_to_ns,
+        lpp_dl_tdoa_provide_to_measurements, lpp_multi_rtt_provide_to_measurements,
+        nrppa_ecid_report_to_measurements, nrrstd_to_ns, nrrstd_to_signed_ns, TC_NS,
     };
     use ogs_asn1c::lpp::ecid::{ProvideLocationInformation, ProvideLocationInformationR9};
     use ogs_asn1c::lpp::message::{LppMessage, LppMessageBody, MessageBodyC1};
@@ -454,6 +557,85 @@ mod tests {
             (203_000..=204_000).contains(&rtt1),
             "K1(200_000) rtt_ns={rtt1}, expected ~203_450"
         );
+    }
+
+    /// `nrrstd_to_signed_ns`: NR-RSTD is a SIGNED time difference; verify the
+    /// midpoint-offset mapping ns = (v·2^k − 985024)·T_c at the spec endpoints.
+    #[test]
+    fn nrrstd_signed_endpoints() {
+        // Per-arm zero point 985024/2^k decodes to exactly 0 ns (reference TRP).
+        assert_eq!(nrrstd_to_signed_ns(&NrRstd::K0(985_024)), 0.0);
+        assert_eq!(nrrstd_to_signed_ns(&NrRstd::K2(246_256)), 0.0); // 985024/4
+        assert_eq!(nrrstd_to_signed_ns(&NrRstd::K5(30_782)), 0.0); // 985024/32
+        // One k0 code = ±T_c around the midpoint (sign carried by the offset).
+        assert!((nrrstd_to_signed_ns(&NrRstd::K0(985_025)) - TC_NS).abs() < 1e-9);
+        assert!((nrrstd_to_signed_ns(&NrRstd::K0(985_023)) + TC_NS).abs() < 1e-9);
+        // Endpoints span ≈ ±501 µs.
+        assert!((nrrstd_to_signed_ns(&NrRstd::K0(0)) + 985_024.0 * TC_NS).abs() < 1e-6);
+        assert!(nrrstd_to_signed_ns(&NrRstd::K0(1_970_049)) > 500_000.0);
+    }
+
+    /// LPP NR-DL-TDOA round-trip: build → UPER encode → decode → adapt.
+    /// The reference TRP leads with rstd_ns 0; each element carries its signed RSTD.
+    #[test]
+    fn rt_lpp_dl_tdoa_to_measurements() {
+        use ogs_asn1c::lpp::nr_dl_tdoa::{
+            DlPrsIdInfo, NrDlTdoaMeasElement, NrDlTdoaMeasList,
+            NrDlTdoaProvideLocationInformation, NrDlTdoaSignalMeasurementInformation,
+        };
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::TargetDevice,
+                transaction_number: TransactionNumber(9),
+            }),
+            end_transaction: true,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(
+                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
+                    ies: ProvideLocationInformationR9 {
+                        ecid: None,
+                        nr_multi_rtt: None,
+                        nr_dl_tdoa: Some(NrDlTdoaProvideLocationInformation {
+                            signal_measurement_information: Some(
+                                NrDlTdoaSignalMeasurementInformation {
+                                    dl_prs_reference_info: DlPrsIdInfo { dl_prs_id: 3 },
+                                    meas_list: NrDlTdoaMeasList {
+                                        items: vec![NrDlTdoaMeasElement {
+                                            dl_prs_id: 7,
+                                            nr_phys_cell_id: Some(123),
+                                            nr_arfcn: None,
+                                            nr_time_stamp: sample_nr_timestamp(),
+                                            nr_rstd: NrRstd::K0(985_124),
+                                            nr_timing_quality: NrTimingQuality {
+                                                timing_quality_value: 10,
+                                                timing_quality_resolution: 1,
+                                            },
+                                            nr_dl_prs_rsrp_result: Some(100),
+                                        }],
+                                    },
+                                },
+                            ),
+                        }),
+                    },
+                }),
+            )),
+        };
+
+        let encoded = msg.encode().expect("LppMessage::encode");
+        let decoded = LppMessage::decode(&encoded).expect("LppMessage::decode");
+        assert_eq!(extract_lpp_request_id(&decoded), Some(9));
+
+        let cells = lpp_dl_tdoa_provide_to_measurements(&decoded);
+        assert_eq!(cells.len(), 2, "reference + 1 measurement element");
+        // Reference TRP first, RSTD 0.
+        assert_eq!(cells[0].nr_cgi, "prs-3");
+        assert_eq!(cells[0].rstd_ns, Some(0.0));
+        // Element: PCI present → "pci-123"; K0(985_124) → (985124−985024)·T_c = 100·T_c.
+        assert_eq!(cells[1].nr_cgi, "pci-123");
+        assert_eq!(cells[1].rsrp, Some(-40)); // 100 − 140
+        let rstd = cells[1].rstd_ns.expect("rstd_ns");
+        assert!((rstd - 100.0 * TC_NS).abs() < 1e-6, "rstd_ns={rstd}");
     }
 
     /// `decode_nrppa_ecid_report`: thin wrapper returns same request-id and CGI
