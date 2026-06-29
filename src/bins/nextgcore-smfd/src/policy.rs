@@ -38,7 +38,7 @@ pub mod gsm_cause {
     pub const PDU_SESSION_TYPE_IPV4_ONLY_ALLOWED: u8 = 50;
     /// #67 Insufficient resources for specific slice (TS 24.501 §9.11.4.2).
     /// Used when the NSACF declines a PDU-session admission for the S-NSSAI
-    /// (slice PDU-session quota exhausted, admittedFlag=false).
+    /// (slice PDU-session quota exhausted: NSACF 403, or 200 acuFailureList).
     pub const INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE: u8 = 67;
 }
 
@@ -368,22 +368,27 @@ pub async fn resolve_nsacf_endpoint() -> Option<NsacfEndpoint> {
 /// Outcome of an Nnsacf_NSAC PDU-session admission query (TS 29.536).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NsacAdmission {
-    /// PDU session admitted (admittedFlag=true) — proceed with establishment.
+    /// PDU session admitted (HTTP 204) — proceed with establishment.
     Admitted,
-    /// PDU session rejected (admittedFlag=false) — reject with 5GSM cause #67.
+    /// PDU session rejected (HTTP 403, or 200 with this SUPI in acuFailureList)
+    /// — reject with 5GSM cause #67.
     Rejected,
-    /// NSACF could not be reached / returned an error. The caller decides the
-    /// fail-open vs fail-closed policy.
+    /// NSACF could not be reached / returned an unexpected status. The caller
+    /// decides the fail-open vs fail-closed policy.
     Unavailable,
 }
 
 /// Query the NSACF whether a new PDU session may be established on `s_nssai`
-/// for `psi` (TS 29.536 §6.1.3.2, POST /nnsacf-nsac/v1/slices/pdu-sessions).
+/// for `psi` (TS 29.536 §6.1.3.3, POST /nnsacf-nsac/v1/slices/pdus).
 ///
-/// Per the contract, a rejection is an HTTP 200 with `admittedFlag=false`
-/// (NOT a 4xx), so we distinguish [`NsacAdmission::Rejected`] (200 +
-/// admittedFlag=false) from [`NsacAdmission::Unavailable`] (transport/HTTP
-/// error). `nf_id` is this SMF's NF instance id (the request's `nfId`).
+/// Sends a nested `PduACRequestData` (§6.1.6.2.7): `pduACRequestInfo[]` each
+/// with `supi`, `anType`, `pduSessionId` and an `acuOperationList[]` of
+/// `{updateFlag, snssai}`. The decision is the HTTP status (§6.1.3.3.3.1):
+/// **204** admitted, **200** with an `acuFailureList` keyed by SUPI when this
+/// SUPI's session failed → [`NsacAdmission::Rejected`], **403** ProblemDetails
+/// (total failure) → [`NsacAdmission::Rejected`]. A transport error or an
+/// unexpected status is [`NsacAdmission::Unavailable`] so the caller can
+/// degrade-open. `nf_id` is this SMF's NF instance id (the request's `nfId`).
 pub async fn nsac_pdu_session_admit(
     nsacf: &NsacfEndpoint,
     nf_id: &str,
@@ -396,19 +401,19 @@ pub async fn nsac_pdu_session_admit(
     if let Some(sd) = sd {
         snssai["sd"] = serde_json::json!(sd);
     }
+    // TS 29.536 §6.1.6.2.7/.10/.5 nested PduACRequestData.
     let body = serde_json::json!({
-        "snssai": snssai,
         "nfId": nf_id,
-        "updateFlag": "INCREASE",
-        "pduSessionId": psi,
-        "supi": supi,
+        "pduACRequestInfo": [{
+            "supi": supi,
+            "anType": "3GPP_ACCESS",
+            "pduSessionId": psi,
+            "acuOperationList": [{ "updateFlag": "INCREASE", "snssai": snssai }],
+        }],
     });
 
     let client = nsacf.client();
-    let resp = match client
-        .post_json("/nnsacf-nsac/v1/slices/pdu-sessions", &body)
-        .await
-    {
+    let resp = match client.post_json("/nnsacf-nsac/v1/slices/pdus", &body).await {
         Ok(r) => r,
         Err(e) => {
             log::warn!("NSACF PDU-session admission query failed: {e}");
@@ -418,36 +423,43 @@ pub async fn nsac_pdu_session_admit(
     };
     client.close().await;
 
-    if resp.status != 200 {
-        log::warn!(
-            "NSACF PDU-session admission returned HTTP {} (expected 200)",
-            resp.status
-        );
-        return NsacAdmission::Unavailable;
-    }
-    let parsed: Option<serde_json::Value> = resp
-        .http
-        .content
-        .as_deref()
-        .and_then(|c| serde_json::from_str(c).ok());
-    let Some(parsed) = parsed else {
-        log::warn!("NSACF PDU-session admission response had no/invalid JSON body");
-        return NsacAdmission::Unavailable;
-    };
-    match parsed.get("admittedFlag").and_then(|v| v.as_bool()) {
-        Some(true) => NsacAdmission::Admitted,
-        Some(false) => {
-            let cause = parsed
-                .get("rejectCause")
-                .and_then(|v| v.as_str())
-                .unwrap_or("UNSPECIFIED");
+    match resp.status {
+        // All requested S-NSSAIs for this PDU session admitted.
+        204 => NsacAdmission::Admitted,
+        // Total failure (ProblemDetails) -> reject with 5GSM cause #67.
+        403 => {
             log::info!(
-                "NSACF rejected PDU session for S-NSSAI[SST:{sst} SD:{sd:?}] (cause={cause})"
+                "NSACF rejected PDU session for S-NSSAI[SST:{sst} SD:{sd:?}] (403 total failure)"
             );
             NsacAdmission::Rejected
         }
-        None => {
-            log::warn!("NSACF PDU-session admission response missing admittedFlag");
+        // Partial failure: UeACResponseData.acuFailureList keyed by SUPI. Our
+        // SUPI appearing means this PDU session's S-NSSAI failed.
+        200 => {
+            let our_supi_failed = resp
+                .http
+                .content
+                .as_deref()
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+                .and_then(|j| {
+                    j.get("acuFailureList")
+                        .and_then(|m| m.get(supi))
+                        .map(|entries| !entries.is_null())
+                })
+                .unwrap_or(false);
+            if our_supi_failed {
+                log::info!(
+                    "NSACF rejected PDU session for S-NSSAI[SST:{sst} SD:{sd:?}] (acuFailureList)"
+                );
+                NsacAdmission::Rejected
+            } else {
+                NsacAdmission::Admitted
+            }
+        }
+        other => {
+            log::warn!(
+                "NSACF PDU-session admission returned HTTP {other} (expected 204/200/403)"
+            );
             NsacAdmission::Unavailable
         }
     }
@@ -467,18 +479,19 @@ pub async fn nsac_pdu_session_release(
     if let Some(sd) = sd {
         snssai["sd"] = serde_json::json!(sd);
     }
+    // Mirror nsac_pdu_session_admit's nested PduACRequestData, with a DECREASE
+    // op, posted to the same conformant /slices/pdus resource (TS 29.536).
     let body = serde_json::json!({
-        "snssai": snssai,
         "nfId": nf_id,
-        "updateFlag": "DECREASE",
-        "pduSessionId": psi,
-        "supi": supi,
+        "pduACRequestInfo": [{
+            "supi": supi,
+            "anType": "3GPP_ACCESS",
+            "pduSessionId": psi,
+            "acuOperationList": [{ "updateFlag": "DECREASE", "snssai": snssai }],
+        }],
     });
     let client = nsacf.client();
-    if let Err(e) = client
-        .post_json("/nnsacf-nsac/v1/slices/pdu-sessions", &body)
-        .await
-    {
+    if let Err(e) = client.post_json("/nnsacf-nsac/v1/slices/pdus", &body).await {
         log::warn!("NSACF PDU-session release (rollback) failed: {e}");
     }
     client.close().await;
@@ -1666,11 +1679,13 @@ mod tests {
 
     // ------------------- Nnsacf_NSAC PDU-session admission ----------------
 
-    /// Stub NSACF: admits unless `pduSessionId == 99` (the over-limit marker),
-    /// in which case it returns the TS 29.536 200 + admittedFlag=false body.
+    /// Stub NSACF: validates the nested PduACRequestData shape (TS 29.536) on the
+    /// conformant /slices/pdus resource, then admits (204) unless
+    /// `pduSessionId == 99` (the over-limit marker), in which case it returns a
+    /// 403 ProblemDetails (total failure).
     async fn stub_nsacf_handler(req: ogs_sbi::message::SbiRequest) -> ogs_sbi::message::SbiResponse {
         let path = req.header.uri.split('?').next().unwrap_or("").to_string();
-        if !path.ends_with("/nnsacf-nsac/v1/slices/pdu-sessions") {
+        if !path.ends_with("/nnsacf-nsac/v1/slices/pdus") {
             return ogs_sbi::message::SbiResponse::with_status(404);
         }
         let body: serde_json::Value = req
@@ -1679,27 +1694,28 @@ mod tests {
             .as_deref()
             .and_then(|c| serde_json::from_str(c).ok())
             .unwrap_or(serde_json::Value::Null);
-        // Mandatory fields must be present (snssai, nfId, updateFlag, pduSessionId).
-        assert_eq!(body["snssai"]["sst"], 1, "request must carry snssai");
+        // Conformant nested shape: nfId + pduACRequestInfo[].{supi,anType,
+        // pduSessionId,acuOperationList[].{updateFlag,snssai}}.
         assert!(body["nfId"].is_string(), "request must carry nfId");
+        let info = &body["pduACRequestInfo"][0];
+        assert!(info["supi"].is_string(), "pduACRequestInfo carries supi");
+        assert!(info["anType"].is_string(), "anType present");
+        let psi = info["pduSessionId"].as_u64().unwrap_or(0);
+        let op = &info["acuOperationList"][0];
         assert!(
-            body["updateFlag"] == "INCREASE" || body["updateFlag"] == "DECREASE",
+            op["updateFlag"] == "INCREASE" || op["updateFlag"] == "DECREASE",
             "updateFlag must be INCREASE/DECREASE"
         );
-        let psi = body["pduSessionId"].as_u64().unwrap_or(0);
-        let admitted = psi != 99;
-        let mut resp = serde_json::json!({
-            "snssai": {"sst": 1},
-            "admittedFlag": admitted,
-            "maxNumPduSessions": 100,
-        });
-        if !admitted {
-            resp["rejectCause"] = serde_json::json!("QUOTA_EXCEEDED");
+        assert_eq!(op["snssai"]["sst"], 1, "op carries snssai");
+
+        if psi == 99 {
+            ogs_sbi::message::SbiResponse::with_status(403).with_body(
+                serde_json::json!({"status": 403, "cause": "ALL_SLICE_FAILED"}).to_string(),
+                "application/problem+json",
+            )
+        } else {
+            ogs_sbi::message::SbiResponse::with_status(204)
         }
-        // TS 29.536: even a rejection is HTTP 200.
-        ogs_sbi::message::SbiResponse::with_status(200)
-            .with_json_body(&resp)
-            .unwrap_or_else(|_| ogs_sbi::message::SbiResponse::with_status(200))
     }
 
     #[tokio::test]
@@ -1723,7 +1739,7 @@ mod tests {
                 nsac_pdu_session_admit(&nsacf, "smf-1", "imsi-1", 5, 1, None).await;
             assert_eq!(res, NsacAdmission::Admitted);
 
-            // Over-limit marker (psi 99) -> Rejected (200 + admittedFlag=false)
+            // Over-limit marker (psi 99) -> Rejected (NSACF 403 total failure)
             let res =
                 nsac_pdu_session_admit(&nsacf, "smf-1", "imsi-2", 99, 1, None).await;
             assert_eq!(res, NsacAdmission::Rejected);

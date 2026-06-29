@@ -1527,26 +1527,30 @@ pub async fn call_pcf_am_policy_create(
     Ok(assoc_id)
 }
 
-/// Result of an Nnsacf UE-admission query (TS 29.536 UeACResponseData).
+/// Result of an Nnsacf UE-admission query (TS 29.536).
 #[derive(Debug, Clone)]
 pub struct NsacfUeAdmissionResult {
     /// Whether the UE was admitted for the requested S-NSSAI.
     pub admitted: bool,
-    /// Configured maximum number of UEs for the slice (informational).
-    pub max_num_ues: Option<u64>,
 }
 
-/// Nnsacf_NSAC UE-admission query (TS 29.536 Section 5.2.2.2 / 6.1).
+/// Nnsacf_NSAC UE-admission query (TS 29.536 §6.1.3.2).
 ///
-/// POST {apiRoot}/nnsacf-nsac/v1/slices/ues with UeACRequestData. The NSACF
-/// returns HTTP 200 with `UeACResponseData { admittedFlag, maxNumUEs? }` for
-/// BOTH admit and reject decisions — over-limit is signalled by
-/// `admittedFlag=false`, never by a non-2xx status. `update_flag=true` requests
-/// the NSACF to enforce (increase) the per-slice UE count.
+/// POST {apiRoot}/nnsacf-nsac/v1/slices/ues with a nested `UeACRequestData`
+/// (§6.1.6.2.2): `ueACRequestInfo[]` each with a mandatory `supi`, `anType` and
+/// an `acuOperationList[]` of `{updateFlag, snssai}`. The admission RESULT is
+/// the HTTP status (§6.1.3.2.3.1): **204** all requested S-NSSAIs admitted,
+/// **200** `UeACResponseData.acuFailureList` (a map keyed by SUPI) for partial
+/// failure, **403** ProblemDetails for total failure. `update_flag=true`
+/// requests INCREASE (enforce the per-slice UE count); false requests DECREASE.
+///
+/// Degrade-open: any transport error or unexpected status returns
+/// `admitted=true`, so a missing/failing NSACF never blocks registration.
 pub async fn call_nsacf_ue_admission(
     nsacf_host: &str,
     nsacf_port: u16,
     nf_id: &str,
+    supi: &str,
     snssai_sst: u8,
     snssai_sd: Option<u32>,
     access_type: &str,
@@ -1559,52 +1563,60 @@ pub async fn call_nsacf_ue_admission(
         snssai["sd"] = serde_json::Value::String(format!("{sd:06X}"));
     }
 
+    // TS 29.536 §6.1.6.2.2/.9/.5 nested UeACRequestData.
     let body = serde_json::json!({
-        "snssai": snssai,
         "nfId": nf_id,
-        "updateFlag": update_flag,
-        "updateList": [ { "accessType": access_type } ],
+        "ueACRequestInfo": [{
+            "supi": supi,
+            "anType": access_type,
+            "acuOperationList": [{
+                "updateFlag": if update_flag { "INCREASE" } else { "DECREASE" },
+                "snssai": snssai,
+            }],
+        }],
     });
 
-    let response = client
-        .post_json("/nnsacf-nsac/v1/slices/ues", &body)
-        .await
-        .map_err(|e| SbiError::RequestFailed(format!("NSACF UE admission failed: {e}")))?;
+    let response = match client.post_json("/nnsacf-nsac/v1/slices/ues", &body).await {
+        Ok(r) => r,
+        Err(e) => {
+            // Degrade-open: NSACF unreachable -> admit.
+            log::warn!("NSACF UE admission unreachable, admitting (degrade-open): {e}");
+            return Ok(NsacfUeAdmissionResult { admitted: true });
+        }
+    };
 
-    // The NSACF answers admit AND reject with HTTP 200; only a transport/other
-    // status is a hard error.
-    if !response.is_success() {
-        return Err(SbiError::RequestFailed(format!(
-            "NSACF UE admission returned status {}",
-            response.status
-        )));
-    }
+    let admitted = match response.status {
+        // All requested S-NSSAIs admitted.
+        204 => true,
+        // Total failure (ProblemDetails) -> not admitted.
+        403 => false,
+        // Partial failure: UeACResponseData.acuFailureList keyed by SUPI. Our
+        // SUPI appearing means our single requested S-NSSAI failed.
+        200 => {
+            let our_supi_failed = response
+                .http
+                .content
+                .as_deref()
+                .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+                .and_then(|j| {
+                    j.get("acuFailureList")
+                        .and_then(|m| m.get(supi))
+                        .map(|entries| !entries.is_null())
+                })
+                .unwrap_or(false);
+            !our_supi_failed
+        }
+        // Unexpected status: degrade-open rather than block registration.
+        other => {
+            log::warn!("NSACF UE admission returned status {other}, admitting (degrade-open)");
+            true
+        }
+    };
 
-    let json: serde_json::Value = response
-        .http
-        .content
-        .as_deref()
-        .and_then(|c| serde_json::from_str(c).ok())
-        .ok_or_else(|| {
-            SbiError::RequestFailed("NSACF UE admission: empty/invalid body".to_string())
-        })?;
-
-    let result = parse_nsacf_ue_admission_response(&json);
     log::info!(
-        "Nnsacf UE admission (SST={snssai_sst}, SD={snssai_sd:?}): admittedFlag={}, maxNumUEs={:?}",
-        result.admitted,
-        result.max_num_ues
+        "Nnsacf UE admission (SST={snssai_sst}, SD={snssai_sd:?}, supi={supi}): admitted={admitted}"
     );
-    Ok(result)
-}
-
-/// Parse a UeACResponseData body (TS 29.536). `admittedFlag` absent or false
-/// means the UE is NOT admitted (default deny).
-fn parse_nsacf_ue_admission_response(json: &serde_json::Value) -> NsacfUeAdmissionResult {
-    NsacfUeAdmissionResult {
-        admitted: json["admittedFlag"].as_bool().unwrap_or(false),
-        max_num_ues: json["maxNumUEs"].as_u64(),
-    }
+    Ok(NsacfUeAdmissionResult { admitted })
 }
 
 /// Nudm_UECM_DeregistrationNotification cleanup: PATCH purge on deregistration
@@ -1667,28 +1679,117 @@ mod tests {
         assert_eq!(SbiServiceType::NnsacfNsac.service_name(), "nnsacf-nsac");
     }
 
-    #[test]
-    fn test_nsacf_admission_response_parse() {
-        // admittedFlag=true -> admitted; registration proceeds.
-        let granted = serde_json::json!({
-            "snssai": { "sst": 1 },
-            "admittedFlag": true,
-            "maxNumUEs": 1000
-        });
-        let r = parse_nsacf_ue_admission_response(&granted);
-        assert!(r.admitted);
-        assert_eq!(r.max_num_ues, Some(1000));
+    // ------------------------------------------------------------------
+    // nsacf-01/02 pairing: call_nsacf_ue_admission sends a nested
+    // UeACRequestData and maps 204 / 200-acuFailureList / 403, degrade-open.
+    // ------------------------------------------------------------------
 
-        // admittedFlag=false (HTTP 200, over-limit) -> rejected.
-        let denied = serde_json::json!({
-            "snssai": { "sst": 1 },
-            "admittedFlag": false
-        });
-        assert!(!parse_nsacf_ue_admission_response(&denied).admitted);
+    fn nsacf_free_port() -> u16 {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        port
+    }
 
-        // Missing admittedFlag -> default deny.
-        let empty = serde_json::json!({ "snssai": { "sst": 1 } });
-        assert!(!parse_nsacf_ue_admission_response(&empty).admitted);
+    /// Stub NSACF: validates the nested UeACRequestData shape (TS 29.536), then
+    /// answers by SUPI — "imsi-reject" -> 403 (total failure), "imsi-partial" ->
+    /// 200 with an acuFailureList naming that SUPI, otherwise 204 (admitted).
+    async fn stub_nsacf_ue(req: ogs_sbi::message::SbiRequest) -> ogs_sbi::message::SbiResponse {
+        let path = req.header.uri.split('?').next().unwrap_or("").to_string();
+        if !path.ends_with("/nnsacf-nsac/v1/slices/ues") {
+            return ogs_sbi::message::SbiResponse::with_status(404);
+        }
+        let body: serde_json::Value = req
+            .http
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str(c).ok())
+            .unwrap_or(serde_json::Value::Null);
+        // Conformant nested shape (no flat data.snssai/updateFlag/supi).
+        assert!(body["nfId"].is_string(), "request must carry nfId");
+        let info = &body["ueACRequestInfo"][0];
+        assert!(info["anType"].is_string(), "anType present");
+        let supi = info["supi"].as_str().unwrap_or("").to_string();
+        let op = &info["acuOperationList"][0];
+        assert!(
+            op["updateFlag"] == "INCREASE" || op["updateFlag"] == "DECREASE",
+            "updateFlag INCREASE/DECREASE"
+        );
+        assert!(op["snssai"]["sst"].is_u64(), "op carries snssai");
+
+        match supi.as_str() {
+            "imsi-reject" => ogs_sbi::message::SbiResponse::with_status(403).with_body(
+                serde_json::json!({"status": 403, "cause": "ALL_SLICE_FAILED"}).to_string(),
+                "application/problem+json",
+            ),
+            "imsi-partial" => {
+                let resp = serde_json::json!({
+                    "acuFailureList": {
+                        supi: [{ "snssai": op["snssai"].clone(), "reason": "EXCEED_MAX_UE_NUM" }]
+                    }
+                });
+                ogs_sbi::message::SbiResponse::with_status(200)
+                    .with_json_body(&resp)
+                    .unwrap_or_else(|_| ogs_sbi::message::SbiResponse::with_status(200))
+            }
+            _ => ogs_sbi::message::SbiResponse::with_status(204),
+        }
+    }
+
+    #[tokio::test]
+    async fn nsacf_ue_admission_204_403_200_failure_list() {
+        let port = nsacf_free_port();
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let server =
+            ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(addr));
+        server.start(stub_nsacf_ue).await.expect("start stub NSACF");
+
+        let run = async {
+            // 204 No Content -> admitted (registration proceeds).
+            let r = call_nsacf_ue_admission(
+                "127.0.0.1", port, "amf-1", "imsi-admit", 1, None, "3GPP_ACCESS", true,
+            )
+            .await
+            .expect("ok");
+            assert!(r.admitted, "204 -> admitted");
+
+            // 403 ProblemDetails (total failure) -> not admitted.
+            let r = call_nsacf_ue_admission(
+                "127.0.0.1", port, "amf-1", "imsi-reject", 1, None, "3GPP_ACCESS", true,
+            )
+            .await
+            .expect("ok");
+            assert!(!r.admitted, "403 -> not admitted");
+
+            // 200 acuFailureList naming our SUPI -> not admitted.
+            let r = call_nsacf_ue_admission(
+                "127.0.0.1", port, "amf-1", "imsi-partial", 1, None, "3GPP_ACCESS", true,
+            )
+            .await
+            .expect("ok");
+            assert!(!r.admitted, "200 acuFailureList[supi] -> not admitted");
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("round trip timed out");
+        server.stop().await.ok();
+    }
+
+    #[tokio::test]
+    async fn nsacf_ue_admission_degrade_open_on_transport_error() {
+        // Nothing listening -> degrade-open: admitted=true so registration is
+        // never blocked by a missing/unreachable NSACF.
+        let port = nsacf_free_port();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            call_nsacf_ue_admission(
+                "127.0.0.1", port, "amf-1", "imsi-x", 1, None, "3GPP_ACCESS", true,
+            ),
+        )
+        .await
+        .expect("bounded")
+        .expect("degrade-open returns Ok");
+        assert!(r.admitted, "transport error must degrade-open to admitted");
     }
 
     #[test]

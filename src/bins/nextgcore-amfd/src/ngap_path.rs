@@ -2277,10 +2277,13 @@ impl NgapServer {
 
         // Network Slice Admission Control (TS 29.536 / TS 23.501 §5.15.11):
         // query the NSACF for each Allowed S-NSSAI subject to admission control
-        // before accepting the registration. The NSACF returns HTTP 200 with
-        // admittedFlag=false when the per-slice UE quota is exhausted; in that
-        // case the registration is rejected with 5GMM cause #69 (insufficient
-        // resources for the specific slice, TS 24.501 Annex A).
+        // before accepting the registration. The NSACF answers 204 when the
+        // S-NSSAI is admitted, and 403 (or 200 with this SUPI in acuFailureList)
+        // when the per-slice UE quota is exhausted; in that case the
+        // registration is rejected with 5GMM cause #69 (insufficient resources
+        // for the specific slice, TS 24.501 Annex A). A missing/unreachable
+        // NSACF degrades open (call_nsacf_ue_admission admits) so it never
+        // blocks attach.
         {
             let (nsacf_host, nsacf_port) = crate::sbi_path::resolve_nf_endpoint_async(
                 crate::sbi_path::SbiServiceType::NnsacfNsac,
@@ -2299,6 +2302,7 @@ impl NgapServer {
                     &nsacf_host,
                     nsacf_port,
                     &nf_id,
+                    &supi,
                     snssai.sst,
                     snssai.sd,
                     access_type,
