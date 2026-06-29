@@ -17,8 +17,8 @@ use ogs_sbi::server::{send_error, send_method_not_allowed, send_not_found};
 use serde_json::{json, Value};
 
 use crate::context::{
-    amf_self, AmfSess, AmfUe, EventSubscription, NrCgi, PlmnId, RanUe, Tai5gs,
-    UeContextTransferState, OGS_INVALID_POOL_ID,
+    amf_self, AmfSess, AmfUe, EventSubscription, NrCgi, PendingPositioningDl, PlmnId,
+    PositioningDlKind, RanUe, Tai5gs, UeContextTransferState, OGS_INVALID_POOL_ID,
 };
 use crate::namf_handler::{
     self, N1N2MessageTransferCause, N1N2MessageTransferReqData, N2InfoContainer, NgapIeType,
@@ -945,13 +945,12 @@ pub fn send_n1n2_failure_notification(notify_uri: String, cause: &str, n1n2_msg_
 /// `smInfo` / `pduSessionId`. This guard runs before the SM-centric logic so
 /// that path is completely untouched (strictly additive).
 ///
-/// NOTE — egress is deferred: the SCTP send to the gNB and the protected DL-NAS
-/// send to the UE are owned by the NGAP server task, not this SBI handler. That
-/// cross-task hand-off is the same one the paging N1/N2 path still lacks; it is
-/// wired together with the `Nlmf` consumer under `lmfd-07`. This function builds
-/// and validates the exact wire bytes (proven by the `positioning` + `ogs-asn1c`
-/// unit tests); swapping the build-site `log` for an egress enqueue is all that
-/// then remains.
+/// Egress is performed by the NGAP server task (it owns the SCTP associations +
+/// the per-UE NAS security context): this handler validates the request, models
+/// the downlink, and enqueues it on `positioning_dl_queue`; the NGAP pump
+/// (`process_positioning_downlinks`) resolves the serving association and
+/// delivers. The opaque NRPPa/LPP payloads are carried verbatim — the AMF is a
+/// transparent relay. The `Nlmf` uplink callback (UE/gNB→LMF) is `lmfd-07`.
 fn try_positioning_relay(
     ue_context_id: &str,
     ue: &AmfUe,
@@ -968,13 +967,15 @@ fn try_positioning_relay(
     }
 
     // Both LPP→UE and UE-associated NRPPa→gNB require the UE to be CM-CONNECTED.
-    let Some(ran_ue) = ue_ran_context(ue) else {
+    if ue_ran_context(ue).is_none() {
         return Some(ue_not_reachable_error(ue_context_id, None));
-    };
+    }
+
+    let mut downlinks: Vec<PendingPositioningDl> = Vec::new();
 
     // LPP → UE (N1, DL NAS Transport, payload container type LPP).
     if is_lpp {
-        let Some(lpp) = body
+        let Some(lpp_pdu) = body
             .pointer("/n1MessageContainer/n1MessageContent/contentId")
             .and_then(Value::as_str)
             .and_then(|cid| find_binary_part(request, cid))
@@ -984,19 +985,10 @@ fn try_positioning_relay(
                 "no binary part for the LPP payload",
             ));
         };
-        let Some(nas) = crate::positioning::build_lpp_dl_nas(&lpp) else {
-            return Some(send_error(
-                500,
-                "Internal Server Error",
-                "LPP DL NAS Transport build failed",
-                None,
-            ));
-        };
-        // Built and validated; pending NGAP-task egress (see lmfd-07).
-        log::info!(
-            "[{ue_context_id}] LCS: built LPP DL NAS Transport ({} B) for the UE",
-            nas.len()
-        );
+        downlinks.push(PendingPositioningDl {
+            amf_ue_ngap_id: ue.id,
+            kind: PositioningDlKind::LppToUe { lpp_pdu },
+        });
     }
 
     // NRPPa → serving gNB (N2, UE-associated NRPPa transport, NGAP procedure 8).
@@ -1012,7 +1004,7 @@ fn try_positioning_relay(
                 "expected NRPPA_PDU",
             ));
         }
-        let Some(pdu) = nrppa
+        let Some(nrppa_pdu) = nrppa
             .pointer("/nrppaPdu/ngapData/contentId")
             .and_then(Value::as_str)
             .and_then(|cid| find_binary_part(request, cid))
@@ -1029,24 +1021,23 @@ fn try_positioning_relay(
             .and_then(Value::as_str)
             .map(|s| s.as_bytes().to_vec())
             .unwrap_or_default();
-        let Some(ngap) = crate::positioning::build_nrppa_dl_ue_associated(
-            ue.id,
-            ran_ue.ran_ue_ngap_id as u32,
-            &routing_id,
-            &pdu,
-        ) else {
-            return Some(send_error(
-                500,
-                "Internal Server Error",
-                "UE-associated NRPPa DL transport build failed",
-                None,
-            ));
-        };
-        // Built and validated; pending NGAP-task egress (see lmfd-07).
-        log::info!(
-            "[{ue_context_id}] LCS: built UE-associated NRPPa DL transport ({} B) for the gNB",
-            ngap.len()
-        );
+        downlinks.push(PendingPositioningDl {
+            amf_ue_ngap_id: ue.id,
+            kind: PositioningDlKind::NrppaToGnb {
+                routing_id,
+                nrppa_pdu,
+            },
+        });
+    }
+
+    // Enqueue for NGAP-task egress (TS 23.273). The pump resolves the serving
+    // SCTP association from its per-UE state and delivers over N2/N1.
+    if let Ok(context) = amf_self().read() {
+        let n = downlinks.len();
+        for dl in downlinks {
+            context.positioning_dl_add(dl);
+        }
+        log::info!("[{ue_context_id}] LCS: enqueued {n} positioning downlink(s) for egress");
     }
 
     let rsp = json!({ "cause": "N1_N2_TRANSFER_INITIATED" });

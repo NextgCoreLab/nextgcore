@@ -288,6 +288,10 @@ impl NgapServer {
         // Check GMM procedure timers (T3550/T3560/T3570/T3522 retransmission)
         self.process_nas_timers().await?;
 
+        // Deliver any LCS positioning downlinks the Namf SBI handler enqueued
+        // (TS 23.273): NRPPa→gNB (N2) / LPP→UE (N1). Dormant when none pending.
+        self.process_positioning_downlinks().await;
+
         // Process any pending server events
         while let Ok(event) = self.server_event_rx.try_recv() {
             self.handle_server_event(event).await?;
@@ -3076,6 +3080,89 @@ impl NgapServer {
         self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &pdu)
             .await?;
         Ok(())
+    }
+
+    /// Deliver LCS positioning downlinks the Namf SBI handler enqueued
+    /// (TS 23.273). For each item the serving SCTP association + RAN-UE-NGAP-ID
+    /// are resolved from this server's per-UE state; NRPPa is relayed to the gNB
+    /// over N2 (UE-associated NRPPa transport), LPP to the UE over a
+    /// security-protected N1 DL NAS Transport. Best effort: a UE that has since
+    /// gone CM-IDLE, or a build/send failure, is logged and skipped — never
+    /// propagated, so a positioning hiccup cannot break the NGAP pump.
+    async fn process_positioning_downlinks(&mut self) {
+        let ctx = crate::context::amf_self();
+        let pending = {
+            let Ok(guard) = ctx.read() else {
+                return;
+            };
+            guard.positioning_dl_drain()
+        };
+        for item in pending {
+            // Resolve the serving association + RAN-UE-NGAP-ID (Copy values, so
+            // the immutable borrow is released before the &mut send calls).
+            let Some((association_id, ran_ue_ngap_id)) = self
+                .ue_auth_state
+                .get(&item.amf_ue_ngap_id)
+                .map(|s| (s.association_id, s.ran_ue_ngap_id))
+            else {
+                log::warn!(
+                    "LCS positioning DL for UE {} dropped: no live NGAP context",
+                    item.amf_ue_ngap_id
+                );
+                continue;
+            };
+            match item.kind {
+                crate::context::PositioningDlKind::NrppaToGnb {
+                    routing_id,
+                    nrppa_pdu,
+                } => {
+                    let Some(pdu) = crate::positioning::build_nrppa_dl_ue_associated(
+                        item.amf_ue_ngap_id,
+                        ran_ue_ngap_id,
+                        &routing_id,
+                        &nrppa_pdu,
+                    ) else {
+                        log::warn!(
+                            "LCS positioning DL NRPPa build failed for UE {}",
+                            item.amf_ue_ngap_id
+                        );
+                        continue;
+                    };
+                    match self.send_to_association(association_id, &pdu).await {
+                        Ok(()) => log::info!(
+                            "LCS: delivered NRPPa DL transport ({} B) to gNB for UE {}",
+                            pdu.len(),
+                            item.amf_ue_ngap_id
+                        ),
+                        Err(e) => log::warn!("LCS positioning DL NRPPa send failed: {e}"),
+                    }
+                }
+                crate::context::PositioningDlKind::LppToUe { lpp_pdu } => {
+                    let Some(plain) = crate::positioning::build_lpp_dl_nas(&lpp_pdu) else {
+                        log::warn!(
+                            "LCS positioning DL LPP build failed for UE {}",
+                            item.amf_ue_ngap_id
+                        );
+                        continue;
+                    };
+                    // Protect with the UE's NAS security context where available
+                    // (registered UE); fall back to plain for a legacy peer.
+                    let nas = self
+                        .protect_nas(item.amf_ue_ngap_id, &plain)
+                        .unwrap_or(plain);
+                    match self
+                        .send_nas_pdu(association_id, item.amf_ue_ngap_id, ran_ue_ngap_id, &nas)
+                        .await
+                    {
+                        Ok(_) => log::info!(
+                            "LCS: delivered LPP DL NAS Transport to UE {}",
+                            item.amf_ue_ngap_id
+                        ),
+                        Err(e) => log::warn!("LCS positioning DL LPP send failed: {e}"),
+                    }
+                }
+            }
+        }
     }
 
     /// Protect a plain inner NAS message with the UE's security context

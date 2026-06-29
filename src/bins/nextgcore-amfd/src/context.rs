@@ -472,6 +472,37 @@ pub struct AmfContext {
     /// Namf_EventExposure subscriptions: subscriptionId -> EventSubscription
     /// (TS 29.518 §5.3). Persisted across requests; expiry-aware.
     event_subscriptions: RwLock<HashMap<String, EventSubscription>>,
+
+    /// LCS positioning downlink queue (TS 23.273): positioning payloads the LMF
+    /// asked the AMF to relay (NRPPa→gNB / LPP→UE), enqueued by the Namf SBI
+    /// handler and drained + delivered by the NGAP server task. Empty on the
+    /// reg/PDU/ping path — only populated by positioning N1N2 transfers.
+    positioning_dl_queue: RwLock<Vec<PendingPositioningDl>>,
+}
+
+/// A positioning payload the LMF asked the AMF to relay downlink (TS 23.273),
+/// enqueued by the Namf SBI handler task and delivered by the NGAP server task.
+#[derive(Debug, Clone)]
+pub struct PendingPositioningDl {
+    /// Target UE (AMF-UE-NGAP-ID). The NGAP task resolves the serving SCTP
+    /// association + RAN-UE-NGAP-ID from its per-UE state at delivery time.
+    pub amf_ue_ngap_id: u64,
+    /// What to deliver and over which interface.
+    pub kind: PositioningDlKind,
+}
+
+/// Downlink positioning payload variants (TS 23.273).
+#[derive(Debug, Clone)]
+pub enum PositioningDlKind {
+    /// NRPPa PDU → serving gNB (N2, UE-associated NRPPa transport). `routing_id`
+    /// is the LMF's opaque RoutingID, echoed so the gNB's uplink reply routes
+    /// back to the originating LMF.
+    NrppaToGnb {
+        routing_id: Vec<u8>,
+        nrppa_pdu: Vec<u8>,
+    },
+    /// LPP message → UE (N1, DL NAS Transport with payload container type LPP).
+    LppToUe { lpp_pdu: Vec<u8> },
 }
 
 /// Namf_EventExposure subscription stored in the AMF context
@@ -542,6 +573,7 @@ impl AmfContext {
             initialized: AtomicBool::new(false),
             paging_map: RwLock::new(HashMap::new()),
             event_subscriptions: RwLock::new(HashMap::new()),
+            positioning_dl_queue: RwLock::new(Vec::new()),
         }
     }
 
@@ -1190,6 +1222,21 @@ impl AmfContext {
             return paging_map.get(&amf_ue_ngap_id).cloned();
         }
         None
+    }
+
+    /// Enqueue a positioning downlink for NGAP-task egress (TS 23.273).
+    pub fn positioning_dl_add(&self, item: PendingPositioningDl) {
+        if let Ok(mut q) = self.positioning_dl_queue.write() {
+            q.push(item);
+        }
+    }
+
+    /// Drain all pending positioning downlinks (called by the NGAP server pump).
+    pub fn positioning_dl_drain(&self) -> Vec<PendingPositioningDl> {
+        match self.positioning_dl_queue.write() {
+            Ok(mut q) => std::mem::take(&mut *q),
+            Err(_) => Vec::new(),
+        }
     }
 
     /// Increment retransmit count, returns false if max reached
@@ -2986,6 +3033,40 @@ mod tests {
         let removed = ctx.paging_remove(42);
         assert!(removed.is_some());
         assert_eq!(ctx.paging_count(), 0);
+    }
+
+    #[test]
+    fn test_positioning_dl_queue_add_drain() {
+        let ctx = AmfContext::new();
+
+        // Empty queue drains to nothing.
+        assert!(ctx.positioning_dl_drain().is_empty());
+
+        ctx.positioning_dl_add(PendingPositioningDl {
+            amf_ue_ngap_id: 7,
+            kind: PositioningDlKind::NrppaToGnb {
+                routing_id: vec![0x00, 0x01],
+                nrppa_pdu: vec![0xAA, 0xBB],
+            },
+        });
+        ctx.positioning_dl_add(PendingPositioningDl {
+            amf_ue_ngap_id: 9,
+            kind: PositioningDlKind::LppToUe {
+                lpp_pdu: vec![0x90, 0x01],
+            },
+        });
+
+        // Drain returns all items in FIFO order and leaves the queue empty.
+        let drained = ctx.positioning_dl_drain();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].amf_ue_ngap_id, 7);
+        assert!(matches!(
+            drained[0].kind,
+            PositioningDlKind::NrppaToGnb { .. }
+        ));
+        assert_eq!(drained[1].amf_ue_ngap_id, 9);
+        assert!(matches!(drained[1].kind, PositioningDlKind::LppToUe { .. }));
+        assert!(ctx.positioning_dl_drain().is_empty());
     }
 
     #[test]
