@@ -498,6 +498,232 @@ pub fn pcf_sess_sbi_discover_and_send(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Real NRF NF-discovery + nudr-dr GET / nbsf-management binding wiring (pcfd-09)
+//
+// These helpers implement the real discover-and-send mechanism the PCF needs to
+// retrieve UDR PolicyData (TS 29.519 nudr-dr) and register/deregister a BSF
+// binding (TS 29.521 Nbsf_Management) over the shared ogs-sbi client.
+//
+// FLAGGED (deferred E2E): invoking these from the live SM-policy create/delete
+// path against real udrd/bsfd is the deferred, E2E-gated pcfd-04 work. The
+// mechanism here is unit-tested against mock NRF/UDR/BSF servers (see tests).
+// The live SM/AM policy create path is intentionally unchanged so nothing that
+// currently passes can newly fail.
+// ---------------------------------------------------------------------------
+
+/// A discovered NF service endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredEndpoint {
+    pub host: String,
+    pub port: u16,
+    pub scheme: String,
+}
+
+/// Minimal RFC 3986 percent-encoding for a query-string value (no external dep).
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Parse the first matching service endpoint from an NRF SearchResult body.
+fn parse_first_endpoint(
+    json: &serde_json::Value,
+    service_name: &str,
+) -> Option<DiscoveredEndpoint> {
+    let instances = json.get("nfInstances")?.as_array()?;
+    for nf in instances {
+        let Some(services) = nf.get("nfServices").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for svc in services {
+            if svc.get("serviceName").and_then(|v| v.as_str()) != Some(service_name) {
+                continue;
+            }
+            let scheme = svc
+                .get("scheme")
+                .and_then(|v| v.as_str())
+                .unwrap_or("http")
+                .to_string();
+            // Prefer the service ipEndPoints; only when the matching service
+            // carries no endpoint fall back to the instance-level ipv4Addresses.
+            if let Some(ep) = svc
+                .get("ipEndPoints")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+            {
+                if let Some(host) = ep.get("ipv4Address").and_then(|v| v.as_str()) {
+                    let port = ep.get("port").and_then(|v| v.as_u64()).unwrap_or(80) as u16;
+                    return Some(DiscoveredEndpoint {
+                        host: host.to_string(),
+                        port,
+                        scheme,
+                    });
+                }
+            }
+            if let Some(host) = nf
+                .get("ipv4Addresses")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| v.as_str())
+            {
+                return Some(DiscoveredEndpoint {
+                    host: host.to_string(),
+                    port: 80,
+                    scheme,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Discover the first NF instance of `target_nf_type` exposing `service_name`
+/// via the NRF (`GET /nnrf-disc/v1/nf-instances`) and return its endpoint.
+/// `Ok(None)` when no NRF is configured or no matching instance is found.
+pub async fn pcf_discover_endpoint(
+    target_nf_type: &str,
+    service_name: &str,
+) -> Result<Option<DiscoveredEndpoint>, String> {
+    let ctx = global_context();
+    let Some(nrf_uri) = ctx.get_nrf_uri().await else {
+        log::debug!("No NRF URI configured; cannot discover {target_nf_type}");
+        return Ok(None);
+    };
+    let (nrf_host, nrf_port) = parse_uri_host_port(&nrf_uri)?;
+    let client = ctx.get_client(&nrf_host, nrf_port).await;
+    let path = format!(
+        "/nnrf-disc/v1/nf-instances?target-nf-type={target_nf_type}&requester-nf-type=PCF&service-names={service_name}"
+    );
+    let response = client
+        .get(&path)
+        .await
+        .map_err(|e| format!("NRF discovery failed: {e}"))?;
+    if response.status != 200 {
+        return Err(format!("NRF discovery returned status {}", response.status));
+    }
+    let body = response.http.content.ok_or("Empty NRF discovery response")?;
+    let json: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("Invalid NRF discovery response: {e}"))?;
+    Ok(parse_first_endpoint(&json, service_name))
+}
+
+/// Build a bounded-timeout SBI client for a discovered endpoint.
+fn client_for(ep: &DiscoveredEndpoint) -> ogs_sbi::client::SbiClient {
+    use ogs_sbi::client::{SbiClient, SbiClientConfig};
+    use std::time::Duration;
+    SbiClient::new(
+        SbiClientConfig::new(ep.host.clone(), ep.port)
+            .with_connect_timeout(Duration::from_secs(2))
+            .with_request_timeout(Duration::from_secs(3)),
+    )
+}
+
+/// Discover a UDR and GET the SM PolicyData for `(supi, snssai, dnn)`
+/// (TS 29.519 nudr-dr: `GET /nudr-dr/v2/policy-data/ues/{ueId}/sm-data`).
+/// Returns the decoded body on 200, `Ok(None)` on 404 or when no UDR is
+/// reachable (caller then falls back to config defaults, as today).
+pub async fn pcf_udr_get_sm_policy_data(
+    supi: &str,
+    snssai_sst: u8,
+    snssai_sd: Option<u32>,
+    dnn: &str,
+) -> Result<Option<serde_json::Value>, String> {
+    let Some(ep) = pcf_discover_endpoint("UDR", "nudr-dr").await? else {
+        return Ok(None);
+    };
+    let client = client_for(&ep);
+    let snssai = match snssai_sd {
+        Some(sd) => format!("{{\"sst\":{snssai_sst},\"sd\":\"{sd:06x}\"}}"),
+        None => format!("{{\"sst\":{snssai_sst}}}"),
+    };
+    let path = format!(
+        "/nudr-dr/v2/policy-data/ues/{}/sm-data?snssai={}&dnn={}",
+        percent_encode(supi),
+        percent_encode(&snssai),
+        percent_encode(dnn),
+    );
+    let resp = client
+        .get(&path)
+        .await
+        .map_err(|e| format!("nudr-dr GET failed: {e}"))?;
+    match resp.status {
+        200 => {
+            let body = resp.http.content.ok_or("empty nudr-dr body")?;
+            let json = serde_json::from_str(&body)
+                .map_err(|e| format!("invalid nudr-dr body: {e}"))?;
+            Ok(Some(json))
+        }
+        404 => {
+            log::warn!("nudr-dr returned 404 for SUPI {supi}; using config defaults");
+            Ok(None)
+        }
+        other => Err(format!("nudr-dr GET returned status {other}")),
+    }
+}
+
+/// Register a PCF binding with a discovered BSF
+/// (TS 29.521 Nbsf_Management: `POST /nbsf-management/v1/pcfBindings`).
+/// Returns the binding id (from the Location header, else the response
+/// `bindingId`) on 201/200; `Ok(None)` when no BSF is reachable.
+pub async fn pcf_register_bsf_binding(
+    binding: &serde_json::Value,
+) -> Result<Option<String>, String> {
+    let Some(ep) = pcf_discover_endpoint("BSF", "nbsf-management").await? else {
+        return Ok(None);
+    };
+    let client = client_for(&ep);
+    let resp = client
+        .post_json("/nbsf-management/v1/pcfBindings", binding)
+        .await
+        .map_err(|e| format!("nbsf-management register failed: {e}"))?;
+    match resp.status {
+        200 | 201 => {
+            let id = resp
+                .http
+                .get_header("location")
+                .and_then(|loc| loc.rsplit('/').next())
+                .map(str::to_string)
+                .or_else(|| {
+                    resp.http
+                        .content
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+                        .and_then(|v| {
+                            v.get("bindingId")
+                                .and_then(|b| b.as_str())
+                                .map(str::to_string)
+                        })
+                });
+            Ok(id)
+        }
+        other => Err(format!("nbsf-management register returned status {other}")),
+    }
+}
+
+/// Deregister a PCF binding with a discovered BSF
+/// (`DELETE /nbsf-management/v1/pcfBindings/{bindingId}`). `Ok(true)` on 204/200.
+pub async fn pcf_deregister_bsf_binding(binding_id: &str) -> Result<bool, String> {
+    let Some(ep) = pcf_discover_endpoint("BSF", "nbsf-management").await? else {
+        return Ok(false);
+    };
+    let client = client_for(&ep);
+    let path = format!("/nbsf-management/v1/pcfBindings/{binding_id}");
+    let resp = client
+        .delete(&path)
+        .await
+        .map_err(|e| format!("nbsf-management delete failed: {e}"))?;
+    Ok(resp.status == 204 || resp.status == 200)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -644,5 +870,137 @@ mod tests {
         assert!(res.is_err());
 
         server.stop().await.ok();
+    }
+
+    /// pcfd-09: real NRF NF-discovery + nudr-dr GET + nbsf-management binding
+    /// against a single mock server that plays NRF, UDR and BSF (routed by
+    /// path). Proves the discover-and-send wiring end to end without a live
+    /// peer; live-interop invocation from the SM-policy path remains E2E-gated.
+    #[tokio::test]
+    async fn discover_and_send_udr_and_bsf_mock() {
+        use ogs_sbi::message::SbiRequest as Req;
+        use ogs_sbi::server::{SbiServer, SbiServerConfig};
+        use std::time::Duration;
+
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .map(|a| a.port())
+            .expect("probe ephemeral port");
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let server = SbiServer::new(SbiServerConfig::new(addr));
+
+        // Mock NRF/UDR/BSF: the closure captures its own port so the NRF
+        // SearchResult advertises UDR/BSF endpoints that point back at itself.
+        let handler = move |req: Req| {
+            let resp = build_mock_response(&req, port);
+            async move { resp }
+        };
+        server.start(handler).await.expect("start mock NRF/UDR/BSF");
+
+        // Point the PCF's SBI context at the mock NRF.
+        global_context()
+            .set_nrf_uri(format!("http://127.0.0.1:{port}"))
+            .await;
+
+        let run = async {
+            // Discovery returns the UDR's nudr-dr endpoint (pointing at the mock).
+            let ep = pcf_discover_endpoint("UDR", "nudr-dr")
+                .await
+                .expect("discover ok")
+                .expect("udr found");
+            assert_eq!(ep.host, "127.0.0.1");
+            assert_eq!(ep.port, port);
+
+            // nudr-dr GET SmPolicyData → decoded body.
+            let data = pcf_udr_get_sm_policy_data("imsi-001010000000777", 1, Some(0x010203), "internet")
+                .await
+                .expect("udr GET ok")
+                .expect("policy data present");
+            assert!(data.get("smPolicySnssaiData").is_some());
+
+            // nbsf-management register → binding id from the Location header.
+            let binding = serde_json::json!({
+                "supi": "imsi-001010000000777",
+                "ipv4Addr": "10.45.0.77",
+                "dnn": "internet",
+                "snssai": { "sst": 1 },
+            });
+            let binding_id = pcf_register_bsf_binding(&binding)
+                .await
+                .expect("bsf register ok")
+                .expect("binding id present");
+            assert_eq!(binding_id, "bind-777");
+
+            // nbsf-management deregister → 204.
+            assert!(pcf_deregister_bsf_binding(&binding_id)
+                .await
+                .expect("bsf delete ok"));
+        };
+        tokio::time::timeout(Duration::from_secs(15), run)
+            .await
+            .expect("discover-and-send timed out");
+
+        server.stop().await.ok();
+    }
+
+    /// Mock NRF/UDR/BSF response router used by the pcfd-09 test.
+    fn build_mock_response(
+        req: &ogs_sbi::message::SbiRequest,
+        port: u16,
+    ) -> ogs_sbi::message::SbiResponse {
+        let method = req.header.method.clone();
+        let path = req.header.uri.split('?').next().unwrap_or("").to_string();
+        if path == "/nnrf-disc/v1/nf-instances" {
+            let body = serde_json::json!({
+                "nfInstances": [
+                    {
+                        "nfInstanceId": "udr-mock",
+                        "nfType": "UDR",
+                        "ipv4Addresses": ["127.0.0.1"],
+                        "nfServices": [{
+                            "serviceName": "nudr-dr",
+                            "scheme": "http",
+                            "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": port }]
+                        }]
+                    },
+                    {
+                        "nfInstanceId": "bsf-mock",
+                        "nfType": "BSF",
+                        "ipv4Addresses": ["127.0.0.1"],
+                        "nfServices": [{
+                            "serviceName": "nbsf-management",
+                            "scheme": "http",
+                            "ipEndPoints": [{ "ipv4Address": "127.0.0.1", "port": port }]
+                        }]
+                    }
+                ]
+            });
+            return ogs_sbi::message::SbiResponse::with_status(200)
+                .with_json_body(&body)
+                .unwrap_or_else(|_| ogs_sbi::message::SbiResponse::with_status(500));
+        }
+        if path.starts_with("/nudr-dr/v2/policy-data/") && path.ends_with("/sm-data") {
+            let body = serde_json::json!({
+                "smPolicySnssaiData": {
+                    "01010203": {
+                        "snssai": { "sst": 1, "sd": "010203" },
+                        "smPolicyDnnData": { "internet": { "dnn": "internet" } }
+                    }
+                }
+            });
+            return ogs_sbi::message::SbiResponse::with_status(200)
+                .with_json_body(&body)
+                .unwrap_or_else(|_| ogs_sbi::message::SbiResponse::with_status(500));
+        }
+        if method == "POST" && path == "/nbsf-management/v1/pcfBindings" {
+            return ogs_sbi::message::SbiResponse::with_status(201)
+                .with_header("Location", "/nbsf-management/v1/pcfBindings/bind-777")
+                .with_json_body(&serde_json::json!({ "bindingId": "bind-777" }))
+                .unwrap_or_else(|_| ogs_sbi::message::SbiResponse::with_status(500));
+        }
+        if method == "DELETE" && path.starts_with("/nbsf-management/v1/pcfBindings/") {
+            return ogs_sbi::message::SbiResponse::with_status(204);
+        }
+        ogs_sbi::message::SbiResponse::with_status(404)
     }
 }

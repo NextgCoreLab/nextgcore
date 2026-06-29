@@ -407,6 +407,50 @@ async fn pcf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Supported-feature negotiation (pcfd-05) — TS 29.500 cl 6.6 / TS 29.571 §5.2.2
+// ---------------------------------------------------------------------------
+
+/// Optional features the PCF implements per service, as a SupportedFeatures hex
+/// bitmask (TS 29.571 §5.2.2). The value returned to a consumer is
+/// `intersection(consumer, producer)`; advertising only genuinely-supported bits
+/// keeps a strict peer from depending on an unimplemented feature.
+///
+/// AM (TS 29.507 §5.8): no optional features are negotiated, so the result is
+/// always "0" — the spec NOTE requires `suppFeat` present and set to 0 when
+/// negotiation is not needed.
+const PCF_AM_POLICY_SUPPORTED_FEATURES: u64 = 0x0;
+/// SM (TS 29.512 §5.8): conservative optional-feature set the decision builder
+/// actually exercises. Intersected with the SMF-requested value.
+const PCF_SM_POLICY_SUPPORTED_FEATURES: u64 = 0x3;
+/// PolicyAuthorization (TS 29.514): no optional features negotiated → "0".
+const PCF_PA_SUPPORTED_FEATURES: u64 = 0x0;
+
+/// Negotiate a SupportedFeatures bitmask: parse the consumer hex string,
+/// intersect with the producer-supported mask, and return the lowercase-hex
+/// result (TS 29.571 §5.2.2). A missing, empty, or unparseable consumer value
+/// negotiates to "0" (no optional features) — never an error, so a consumer
+/// that omits `suppFeat` still gets a conformant, working feature set.
+fn negotiate_features(consumer_hex: Option<&str>, supported: u64) -> String {
+    let consumer = consumer_hex
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| u64::from_str_radix(s, 16).ok())
+        .unwrap_or(0);
+    format!("{:x}", consumer & supported)
+}
+
+/// Build the TS 29.512 Arp (Allocation/Retention Priority) JSON object shared by
+/// `authDefQos` and provisioned `QosData` (pcfd-07). The preemption booleans map
+/// to the spec enum strings.
+fn arp_json(priority_level: u8, preempt_cap: bool, preempt_vuln: bool) -> serde_json::Value {
+    serde_json::json!({
+        "priorityLevel": priority_level,
+        "preemptCap": if preempt_cap { "MAY_PREEMPT" } else { "NOT_PREEMPT" },
+        "preemptVuln": if preempt_vuln { "PREEMPTABLE" } else { "NOT_PREEMPTABLE" },
+    })
+}
+
 // AM Policy Control handlers
 
 async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
@@ -422,11 +466,20 @@ async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
     };
 
-    // Extract SUPI from request
-    let supi = policy_data
-        .get("supi")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+    // ---- PolicyAssociationRequest mandatory IEs (TS 29.507 §5.6.2.3) ----
+    // notificationUri, supi and suppFeat are mandatory. Reject with 400
+    // ProblemDetails when any is absent rather than synthesizing a SUPI
+    // (pcfd-08). suppFeat may be the empty string ("") — that is "present",
+    // and negotiates to "0".
+    let Some(notification_uri) = policy_data.get("notificationUri").and_then(|v| v.as_str()) else {
+        return send_bad_request("notificationUri is required", Some("MANDATORY_IE_MISSING"));
+    };
+    let Some(supi) = policy_data.get("supi").and_then(|v| v.as_str()) else {
+        return send_bad_request("supi is required", Some("MANDATORY_IE_MISSING"));
+    };
+    let Some(supp_feat) = policy_data.get("suppFeat").and_then(|v| v.as_str()) else {
+        return send_bad_request("suppFeat is required", Some("MANDATORY_IE_MISSING"));
+    };
 
     // Add UE AM to context
     let ctx = pcf_self();
@@ -438,6 +491,15 @@ async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
 
     match ue_am {
         Some(ue_am) => {
+            // Persist the notification URI so later AM policy update notifies
+            // (pcf_sbi_send_am_policy_control_notify) can reach the AMF.
+            {
+                let mut updated = ue_am.clone();
+                updated.notification_uri = Some(notification_uri.to_string());
+                if let Ok(context) = ctx.read() {
+                    context.ue_am_update(&updated);
+                }
+            }
             log::info!(
                 "AM Policy created for SUPI {} (id={})",
                 supi,
@@ -479,6 +541,9 @@ async fn handle_am_policy_create(request: &SbiRequest) -> SbiResponse {
                 "triggers": triggers,
                 "servAreaRes": null,
                 "rfsp": null,
+                // TS 29.507 §5.8: suppFeat is mandatory in PolicyAssociation and
+                // is the negotiated (consumer ∩ producer) value (pcfd-05).
+                "suppFeat": negotiate_features(Some(supp_feat), PCF_AM_POLICY_SUPPORTED_FEATURES),
             });
             if let Some(ambr) = ue_ambr {
                 resp["ueAmbr"] = ambr;
@@ -833,7 +898,12 @@ async fn handle_sm_policy_create(request: &SbiRequest) -> SbiResponse {
                     "chgDecs": decision.chg_decs,
                     "traffContDecs": decision.traff_cont_decs,
                     "policyCtrlReqTriggers": decision.triggers,
-                    "suppFeat": policy_data.get("suppFeat").and_then(|v| v.as_str()).unwrap_or(""),
+                    // TS 29.512 §5.8: negotiated (consumer ∩ producer) features,
+                    // not an echo of the SMF-requested value (pcfd-05).
+                    "suppFeat": negotiate_features(
+                        policy_data.get("suppFeat").and_then(|v| v.as_str()),
+                        PCF_SM_POLICY_SUPPORTED_FEATURES,
+                    ),
                 }))
                 .unwrap_or_else(|_| SbiResponse::with_status(201))
         }
@@ -867,7 +937,15 @@ fn build_sm_policy_decision(
     let sess_rule_id = format!("SessRule-{sm_policy_id}");
     let def_qos_id = format!("QosDec-{sm_policy_id}");
 
-    // Session rules with authorized session AMBR and default QoS
+    let arp = arp_json(
+        session_data.arp_priority_level,
+        session_data.arp_preempt_cap,
+        session_data.arp_preempt_vuln,
+    );
+
+    // Session rules with authorized session AMBR and the inline default QoS.
+    // TS 29.512 Table 5.6.2.7-1: the default QoS is conveyed inline via
+    // `authDefQos`; SessionRule has no `defQosRef` attribute (pcfd-06).
     let sess_rules = serde_json::json!({
         &sess_rule_id: {
             "sessRuleId": sess_rule_id,
@@ -877,13 +955,8 @@ fn build_sm_policy_decision(
             },
             "authDefQos": {
                 "5qi": session_data.qos_index,
-                "arp": {
-                    "priorityLevel": session_data.arp_priority_level,
-                    "preemptCap": if session_data.arp_preempt_cap { "MAY_PREEMPT" } else { "NOT_PREEMPT" },
-                    "preemptVuln": if session_data.arp_preempt_vuln { "PREEMPTABLE" } else { "NOT_PREEMPTABLE" },
-                },
+                "arp": arp.clone(),
             },
-            "defQosRef": def_qos_id,
         }
     });
 
@@ -897,6 +970,9 @@ fn build_sm_policy_decision(
             // qosDecId attribute in the spec.
             "qosId": def_qos_id,
             "5qi": session_data.qos_index,
+            // ARP is C ("shall be included when the QoS data is initially
+            // provisioned") — TS 29.512 §5.6.2.8 (pcfd-07).
+            "arp": arp.clone(),
             "maxbrUl": format_bitrate(session_data.ambr_uplink),
             "maxbrDl": format_bitrate(session_data.ambr_downlink),
         }),
@@ -974,13 +1050,16 @@ fn build_sm_policy_decision(
             }),
         );
 
-        // Per-rule QoS decision
+        // Per-rule QoS decision. ARP is included on every provisioned QosData
+        // (TS 29.512 §5.6.2.8, pcfd-07); the subscription PccRule model carries
+        // no per-rule maxbr/gbr, so those are emitted only when present.
         qos_map.insert(
             rule_qos_id.clone(),
             serde_json::json!({
                 // TS 29.512 Table 5.6.2.8-1: mandatory qosId (== map key).
                 "qosId": rule_qos_id,
                 "5qi": rule.qos_index,
+                "arp": arp.clone(),
             }),
         );
     }
@@ -1009,16 +1088,33 @@ fn build_sm_policy_decision(
         );
     }
 
-    // Policy control request triggers (TS 29.512 Table 5.6.2.6-1)
-    let triggers = vec![
+    // Policy control request triggers (TS 29.512 Table 5.6.2.6-1), derived from
+    // the actual decision contents (pcfd-12) rather than a static list. The base
+    // set covers the session-level changes the PCF always re-evaluates; the
+    // dynamic triggers are added only when the decision installs resources the
+    // PCF will act on.
+    let mut triggers = vec![
         "SE_AMBR_CH".to_string(), // Session AMBR change
         "DEF_QOS_CH".to_string(), // Default QoS change
         "UE_IP_CH".to_string(),   // UE IP address change
         "PLMN_CH".to_string(),    // Serving network change
         "AC_TY_CH".to_string(),   // Access type change
         "RAT_TY_CH".to_string(),  // RAT type change
-        "RES_MO_RE".to_string(),  // UE-initiated resource modification
     ];
+    // RES_MO_RE only when subscription PCC rules are installed that the UE can
+    // request to modify (a default-only session cannot UE-modify resources).
+    if !session_data.pcc_rules.is_empty() {
+        triggers.push("RES_MO_RE".to_string());
+    }
+    // QOS_NOTIF when any installed rule is a GBR resource subject to QoS
+    // notification control (TS 23.501 §5.7.4 GBR 5QIs).
+    if session_data
+        .pcc_rules
+        .iter()
+        .any(|r| npcf_handler::is_gbr_5qi(r.qos_index))
+    {
+        triggers.push("QOS_NOTIF".to_string());
+    }
 
     SmPolicyDecisionParts {
         sess_rules,
@@ -1054,14 +1150,36 @@ async fn handle_sm_policy_get(sm_policy_id: &str) -> SbiResponse {
     };
 
     match sess {
-        Some(sess) => SbiResponse::with_status(200)
-            .with_json_body(&serde_json::json!({
-                "smPolicyId": sess.sm_policy_id,
-                "pduSessionId": sess.psi,
-                "sessRules": {},
-                "pccRules": {},
-            }))
-            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        Some(sess) => {
+            // Reconstruct the stored SmPolicyDecision from the persisted session
+            // (TS 29.512 §5.3 Individual SM Policy resource) rather than empty
+            // maps (pcfd-11). The decision is rebuilt from the same subscription
+            // data used at create so the GET body matches the create response.
+            let dnn = sess.dnn.as_deref().unwrap_or("internet");
+            let session_data = pcf_get_session_data("", None, &sess.s_nssai, dnn)
+                .unwrap_or_else(|| nudr_handler::SessionData {
+                    qos_index: 9,
+                    arp_priority_level: 8,
+                    arp_preempt_cap: false,
+                    arp_preempt_vuln: true,
+                    ambr_uplink: 100_000_000,
+                    ambr_downlink: 100_000_000,
+                    pcc_rules: vec![],
+                });
+            let decision = build_sm_policy_decision(&sess.sm_policy_id, &session_data);
+            SbiResponse::with_status(200)
+                .with_json_body(&serde_json::json!({
+                    "smPolicyId": sess.sm_policy_id,
+                    "pduSessionId": sess.psi,
+                    "sessRules": decision.sess_rules,
+                    "pccRules": decision.pcc_rules,
+                    "qosDecs": decision.qos_decs,
+                    "chgDecs": decision.chg_decs,
+                    "traffContDecs": decision.traff_cont_decs,
+                    "policyCtrlReqTriggers": decision.triggers,
+                }))
+                .unwrap_or_else(|_| SbiResponse::with_status(200))
+        }
         None => send_not_found(
             &format!("SM Policy {sm_policy_id} not found"),
             Some("POLICY_NOT_FOUND"),
@@ -1375,21 +1493,26 @@ fn build_app_session_context(
     req_root: &serde_json::Value,
     asc: &AscReqData,
 ) -> serde_json::Value {
+    // TS 29.514 §4.2.2.2 / pcfd-05: the AppSessionContext carries the negotiated
+    // (consumer ∩ producer) suppFeat, not an echo. A missing consumer value
+    // negotiates to "0".
+    let negotiated = negotiate_features(
+        req_root.get("suppFeat").and_then(|v| v.as_str()),
+        PCF_PA_SUPPORTED_FEATURES,
+    );
     let mut body = serde_json::json!({
         "appSessionId": app_session_id,
         "notifUri": req_root.get("notifUri"),
-        "suppFeat": req_root.get("suppFeat"),
+        "suppFeat": negotiated.clone(),
     });
     if !asc.med_components.is_empty() {
         if let Some(obj) = body.as_object_mut() {
             obj.insert("ascReqData".to_string(), req_root.clone());
             if asc_resp_required(req_root) {
-                let mut rd = serde_json::json!({ "servAuthInfo": "NOT_KNOWN" });
-                if let Some(sf) = req_root.get("suppFeat") {
-                    if let Some(rd_obj) = rd.as_object_mut() {
-                        rd_obj.insert("suppFeat".to_string(), sf.clone());
-                    }
-                }
+                let rd = serde_json::json!({
+                    "servAuthInfo": "NOT_KNOWN",
+                    "suppFeat": negotiated,
+                });
                 obj.insert("ascRespData".to_string(), rd);
             }
         }
@@ -2317,5 +2440,228 @@ mod tests {
         assert!(body.get("ascRespData").is_some());
         assert_eq!(body["ascRespData"]["suppFeat"], "0");
         assert_eq!(body["ascRespData"]["servAuthInfo"], "NOT_KNOWN");
+    }
+
+    /// pcfd-05: feature negotiation is `intersection(consumer, producer)` as a
+    /// lowercase hex string (TS 29.571 §5.2.2); a missing/empty/invalid consumer
+    /// value negotiates to "0", never an error.
+    #[test]
+    fn test_negotiate_features() {
+        assert_eq!(negotiate_features(Some("3"), 0x1), "1");
+        assert_eq!(negotiate_features(None, 0x1), "0");
+        assert_eq!(negotiate_features(Some(""), 0x3), "0");
+        assert_eq!(negotiate_features(Some("ffff"), 0x3), "3");
+        assert_eq!(negotiate_features(Some("not-hex"), 0x3), "0");
+        // Empty-string consumer (the matched AMF sends suppFeat="") → "0".
+        assert_eq!(
+            negotiate_features(Some(""), PCF_AM_POLICY_SUPPORTED_FEATURES),
+            "0"
+        );
+    }
+
+    /// pcfd-08: AM policy create rejects (400 MANDATORY_IE_MISSING) when `supi`
+    /// is absent — it must never synthesize a SUPI.
+    #[tokio::test]
+    async fn am_policy_create_missing_supi_is_400() {
+        pcf_context_init(64, 64);
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-am-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/9",
+                "suppFeat": "0"
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 400);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["cause"], "MANDATORY_IE_MISSING");
+    }
+
+    /// pcfd-08 / pcfd-05: a full AM policy create (all mandatory IEs, including
+    /// the matched-AMF's empty `suppFeat`) succeeds and the 201 always carries a
+    /// negotiated `suppFeat` (mandatory per TS 29.507 §5.8).
+    #[tokio::test]
+    async fn am_policy_create_includes_negotiated_supp_feat() {
+        pcf_context_init(64, 64);
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-am-policy-control/v1/policies",
+            Some(serde_json::json!({
+                "supi": "imsi-001010000000201",
+                "notificationUri": "http://127.0.0.1:9/namf-callback/v1/am-policy/2",
+                "servingPlmn": { "mcc": "001", "mnc": "01" },
+                // The matched AMF sends an empty suppFeat — must be accepted.
+                "suppFeat": ""
+            })),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["supi"], "imsi-001010000000201");
+        // suppFeat is mandatory and present even when negotiation yields nothing.
+        assert_eq!(body["suppFeat"], "0");
+    }
+
+    /// pcfd-05: SM policy create returns the negotiated (AND) suppFeat, not an
+    /// echo of the SMF-requested value.
+    #[tokio::test]
+    async fn sm_policy_create_negotiates_supp_feat_not_echo() {
+        pcf_context_init(64, 64);
+        let mut body = full_create_body("imsi-001010000000202", 12);
+        // Consumer requests every bit; producer supports only PCF_SM mask.
+        body.as_object_mut()
+            .unwrap()
+            .insert("suppFeat".to_string(), serde_json::json!("ffffffff"));
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(body),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        // Negotiated = ffffffff & PCF_SM_POLICY_SUPPORTED_FEATURES, not the echo.
+        assert_eq!(
+            body["suppFeat"],
+            format!("{:x}", PCF_SM_POLICY_SUPPORTED_FEATURES)
+        );
+        assert_ne!(body["suppFeat"], "ffffffff");
+    }
+
+    /// pcfd-06: the SessionRule conveys the default QoS inline via `authDefQos`
+    /// and carries no non-conformant `defQosRef` (TS 29.512 Table 5.6.2.7-1).
+    #[test]
+    fn test_session_rule_has_no_def_qos_ref() {
+        let session_data = nudr_handler::SessionData {
+            qos_index: 9,
+            arp_priority_level: 8,
+            arp_preempt_cap: false,
+            arp_preempt_vuln: true,
+            ambr_uplink: 100_000_000,
+            ambr_downlink: 100_000_000,
+            pcc_rules: vec![],
+        };
+        let dec = build_sm_policy_decision("p-defqos", &session_data);
+        let sr = &dec.sess_rules["SessRule-p-defqos"];
+        assert!(sr.get("authDefQos").is_some());
+        assert!(
+            sr.get("defQosRef").is_none(),
+            "SessionRule must not carry defQosRef"
+        );
+    }
+
+    /// pcfd-07: every provisioned QosData carries an `arp` object with the three
+    /// sub-fields (TS 29.512 §5.6.2.8 — ARP is C on initial provisioning).
+    #[test]
+    fn test_qos_data_includes_arp() {
+        let session_data = nudr_handler::SessionData {
+            qos_index: 9,
+            arp_priority_level: 8,
+            arp_preempt_cap: true,
+            arp_preempt_vuln: false,
+            ambr_uplink: 100_000_000,
+            ambr_downlink: 100_000_000,
+            pcc_rules: vec![nudr_handler::PccRule {
+                id: "rule-1".to_string(),
+                precedence: 50,
+                qos_index: 5,
+                flow_status: npcf_handler::FlowStatus::Enabled,
+                flows: vec![],
+            }],
+        };
+        let dec = build_sm_policy_decision("p-arp", &session_data);
+        let qos_decs = dec.qos_decs.as_object().unwrap();
+        assert!(!qos_decs.is_empty());
+        for (key, qos) in qos_decs {
+            let arp = qos
+                .get("arp")
+                .unwrap_or_else(|| panic!("QosData {key} missing arp"));
+            assert!(arp.get("priorityLevel").is_some(), "{key} arp.priorityLevel");
+            assert!(arp.get("preemptCap").is_some(), "{key} arp.preemptCap");
+            assert!(arp.get("preemptVuln").is_some(), "{key} arp.preemptVuln");
+        }
+        // Default QoS ARP reflects the session data (preemptCap=true).
+        assert_eq!(qos_decs["QosDec-p-arp"]["arp"]["preemptCap"], "MAY_PREEMPT");
+        assert_eq!(
+            qos_decs["QosDec-p-arp"]["arp"]["preemptVuln"],
+            "NOT_PREEMPTABLE"
+        );
+    }
+
+    /// pcfd-12: triggers are derived from the decision contents — a default-only
+    /// session yields the base subset (no RES_MO_RE / QOS_NOTIF); a session with
+    /// a GBR PCC rule adds QOS_NOTIF (and RES_MO_RE for the installed rule).
+    #[test]
+    fn test_triggers_derived_from_decision() {
+        // Default-only session: no subscription PCC rules.
+        let default_only = nudr_handler::SessionData {
+            qos_index: 9,
+            arp_priority_level: 8,
+            arp_preempt_cap: false,
+            arp_preempt_vuln: true,
+            ambr_uplink: 100_000_000,
+            ambr_downlink: 100_000_000,
+            pcc_rules: vec![],
+        };
+        let dec = build_sm_policy_decision("p-trig-1", &default_only);
+        assert!(dec.triggers.contains(&"SE_AMBR_CH".to_string()));
+        assert!(dec.triggers.contains(&"DEF_QOS_CH".to_string()));
+        assert!(!dec.triggers.contains(&"RES_MO_RE".to_string()));
+        assert!(!dec.triggers.contains(&"QOS_NOTIF".to_string()));
+
+        // Session with a GBR PCC rule (5QI 1 is GBR).
+        let gbr = nudr_handler::SessionData {
+            pcc_rules: vec![nudr_handler::PccRule {
+                id: "gbr-rule".to_string(),
+                precedence: 10,
+                qos_index: 1,
+                flow_status: npcf_handler::FlowStatus::Enabled,
+                flows: vec![],
+            }],
+            ..default_only
+        };
+        let dec = build_sm_policy_decision("p-trig-2", &gbr);
+        assert!(dec.triggers.contains(&"RES_MO_RE".to_string()));
+        assert!(dec.triggers.contains(&"QOS_NOTIF".to_string()));
+    }
+
+    /// pcfd-11: GET on an individual SM policy returns the stored
+    /// SmPolicyDecision (non-empty rule maps), not empty placeholders.
+    #[tokio::test]
+    async fn sm_policy_get_returns_stored_decision() {
+        pcf_context_init(64, 64);
+        let resp = pcf_sbi_request_handler(make_request(
+            "POST",
+            "/npcf-smpolicycontrol/v1/sm-policies",
+            Some(full_create_body("imsi-001010000000203", 13)),
+        ))
+        .await;
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let pol_id = body["smPolicyId"].as_str().unwrap().to_string();
+
+        let resp = pcf_sbi_request_handler(make_request(
+            "GET",
+            &format!("/npcf-smpolicycontrol/v1/sm-policies/{pol_id}"),
+            None,
+        ))
+        .await;
+        assert_eq!(resp.status, 200);
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(
+            got["sessRules"].as_object().is_some_and(|m| !m.is_empty()),
+            "GET must return non-empty sessRules"
+        );
+        assert!(
+            got["pccRules"].as_object().is_some_and(|m| !m.is_empty()),
+            "GET must return non-empty pccRules"
+        );
+        assert!(got["qosDecs"].as_object().is_some_and(|m| !m.is_empty()));
     }
 }

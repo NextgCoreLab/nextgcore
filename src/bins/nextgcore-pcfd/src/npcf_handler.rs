@@ -487,8 +487,10 @@ pub fn pcf_npcf_am_policy_control_handle_create(
         pcf_ue_am.subscribed_ue_ambr = Some(ue_ambr.clone());
     }
 
-    // Check if SUPI is in VPLMN (visited PLMN)
-    let is_vplmn = is_supi_in_vplmn(&pcf_ue_am.supi);
+    // Determine V-PCF/H-PCF role from the serving PLMN (the AMF GUAMI PLMN for
+    // an AM policy association) vs. the configured local PLMN (pcfd-10).
+    let is_vplmn =
+        is_serving_plmn_vplmn(&pcf_ue_am.guami.plmn_id.mcc, &pcf_ue_am.guami.plmn_id.mnc);
 
     if is_vplmn {
         // Visited PLMN - return immediately with PolicyAssociation
@@ -634,8 +636,10 @@ pub fn pcf_npcf_smpolicycontrol_handle_create(
         sess.subscribed_sess_ambr = Some(ambr.clone());
     }
 
-    // Check if SUPI is in VPLMN
-    let is_vplmn = is_supi_in_vplmn(pcf_ue_sm_supi);
+    // Determine V-PCF/H-PCF role from the session's serving PLMN vs. the
+    // configured local PLMN (pcfd-10).
+    let is_vplmn =
+        is_serving_plmn_vplmn(&sess.serving.plmn_id.mcc, &sess.serving.plmn_id.mnc);
 
     if is_vplmn {
         // Visited PLMN - register with BSF
@@ -799,14 +803,29 @@ pub fn pcf_npcf_policyauthorization_handle_delete(
     HandlerResult::no_content()
 }
 
-/// Check if SUPI is in visited PLMN
-/// Port of ogs_sbi_supi_in_vplmn() from lib/sbi/
-fn is_supi_in_vplmn(supi: &str) -> bool {
-    // In C: This checks if the SUPI's PLMN ID matches the local PLMN ID
-    // Note: Proper VPLMN detection requires configuration of local PLMN ID
-    // For now, return false (assume home PLMN)
-    log::trace!("Checking if SUPI {supi} is in VPLMN");
-    false
+/// Configured local (home) PLMN as `(mcc, mnc)`, read from the `PCF_LOCAL_PLMN`
+/// environment variable formatted "MCC-MNC" (e.g. "001-01"); defaults to
+/// 001/01 when unset or malformed.
+fn local_plmn() -> (String, String) {
+    let raw = std::env::var("PCF_LOCAL_PLMN").unwrap_or_else(|_| "001-01".to_string());
+    match raw.split_once('-') {
+        Some((mcc, mnc)) => (mcc.trim().to_string(), mnc.trim().to_string()),
+        None => ("001".to_string(), "01".to_string()),
+    }
+}
+
+/// Whether a request's serving PLMN identifies a visited PLMN (V-PCF role).
+///
+/// Drives the V-PCF / H-PCF BSF behavior from the serving network rather than a
+/// hardcoded `false` (pcfd-10): true when the serving PLMN differs from the
+/// configured local PLMN. An empty/absent serving PLMN is treated as home
+/// (`false`), preserving the H-PCF default for non-roaming sessions.
+pub fn is_serving_plmn_vplmn(serving_mcc: &str, serving_mnc: &str) -> bool {
+    if serving_mcc.is_empty() && serving_mnc.is_empty() {
+        return false;
+    }
+    let (local_mcc, local_mnc) = local_plmn();
+    serving_mcc != local_mcc || serving_mnc != local_mnc
 }
 
 #[cfg(test)]
@@ -1008,5 +1027,22 @@ mod tests {
         assert_eq!(qos["qosId"], qos_id);
         assert_eq!(qos["5qi"], 2); // video → GBR 5QI 2
         assert_eq!(qos["maxbrDl"], "2 Mbps");
+    }
+
+    /// pcfd-10: VPLMN detection is driven by the serving PLMN vs. the configured
+    /// local PLMN (default 001/01), not a hardcoded `false`. An empty serving
+    /// PLMN is treated as home.
+    #[test]
+    fn test_is_serving_plmn_vplmn() {
+        // Default local PLMN is 001/01 (env unset in test).
+        std::env::remove_var("PCF_LOCAL_PLMN");
+        // Equal to local → home (false).
+        assert!(!is_serving_plmn_vplmn("001", "01"));
+        // Different MCC → visited (true).
+        assert!(is_serving_plmn_vplmn("310", "260"));
+        // Different MNC only → visited (true).
+        assert!(is_serving_plmn_vplmn("001", "99"));
+        // Absent serving PLMN → home (false), preserving the H-PCF default.
+        assert!(!is_serving_plmn_vplmn("", ""));
     }
 }
