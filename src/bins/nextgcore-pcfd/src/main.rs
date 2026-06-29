@@ -2189,16 +2189,35 @@ mod tests {
 
         pcf_context_init(64, 64);
 
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|l| l.local_addr())
-            .map(|a| a.port())
-            .expect("probe ephemeral port");
-        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let server = SbiServer::new(SbiServerConfig::new(addr));
-        server
-            .start(pcf_sbi_request_handler)
+        // Start a real SbiServer on an ephemeral port. The probe-then-rebind
+        // pattern has a small TOCTOU window and SbiServer startup can race under
+        // heavy concurrent test load, so retry on a fresh port and bound each
+        // attempt with a timeout — a transient bind/startup stall must never hang
+        // the whole `cargo test --workspace` run (it previously could deadlock the
+        // suite indefinitely while holding the shared pcf_context).
+        let mut started: Option<(SbiServer, u16)> = None;
+        for attempt in 0..4u32 {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .and_then(|l| l.local_addr())
+                .map(|a| a.port())
+                .expect("probe ephemeral port");
+            let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+            let server = SbiServer::new(SbiServerConfig::new(addr));
+            match tokio::time::timeout(
+                Duration::from_secs(10),
+                server.start(pcf_sbi_request_handler),
+            )
             .await
-            .expect("start pcfd handler server");
+            {
+                Ok(Ok(())) => {
+                    started = Some((server, port));
+                    break;
+                }
+                Ok(Err(e)) => log::warn!("pcfd test server start attempt {attempt} failed: {e}"),
+                Err(_) => log::warn!("pcfd test server start attempt {attempt} timed out"),
+            }
+        }
+        let (server, port) = started.expect("SbiServer failed to start after 4 attempts");
 
         let client = SbiClient::new(
             SbiClientConfig::new("127.0.0.1", port)
@@ -2258,7 +2277,7 @@ mod tests {
             .await
             .expect("HTTP round trip timed out");
 
-        server.stop().await.ok();
+        let _ = tokio::time::timeout(Duration::from_secs(5), server.stop()).await;
     }
 
     #[tokio::test]
