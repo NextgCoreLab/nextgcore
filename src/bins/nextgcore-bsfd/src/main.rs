@@ -229,8 +229,7 @@ async fn main() -> Result<()> {
                                 }
                             }
                             // SBI OAuth2 enforcement knob (bsf.sbi.oauth2.require).
-                            require_oauth2 =
-                                sbi.oauth2.and_then(|o| o.require).unwrap_or(false);
+                            require_oauth2 = sbi.oauth2.and_then(|o| o.require).unwrap_or(false);
                         }
                     }
                 }
@@ -270,8 +269,7 @@ async fn main() -> Result<()> {
         sbi_server_config.oauth2_jwks_uri = nrf_uri_cfg
             .as_deref()
             .map(|uri| JwksCache::for_nrf(uri).jwks_uri().to_string());
-        sbi_server_config =
-            sbi_server_config.with_expected_audience_nf_type(NfType::Bsf);
+        sbi_server_config = sbi_server_config.with_expected_audience_nf_type(NfType::Bsf);
 
         // Client side (T1.1): install the process-wide OAuth2 client so
         // outbound SBI calls acquire and attach an NRF-issued Bearer token.
@@ -738,9 +736,11 @@ async fn handle_pcf_binding_discovery(request: &SbiRequest) -> SbiResponse {
         filter.dnn
     );
 
-    if !filter.has_ue_identifier() {
+    // TS 29.521 §4.2.4.2: the query "shall include: UE address". A SUPI/GPSI- or
+    // DNN-only query (no ipv4Addr/ipv6Prefix/macAddr48) is rejected 400.
+    if !filter.has_ue_address() {
         return send_bad_request(
-            "At least one of ipv4Addr, ipv6Prefix, macAddr48, supi or gpsi is required",
+            "Discovery query must include a UE address (ipv4Addr, ipv6Prefix or macAddr48)",
             Some("MANDATORY_QUERY_PARAM_MISSING"),
         );
     }
@@ -753,10 +753,9 @@ async fn handle_pcf_binding_discovery(request: &SbiRequest) -> SbiResponse {
     };
 
     match matches.as_slice() {
-        [] => send_not_found(
-            "No PCF binding found for the specified parameters",
-            Some("BINDING_NOT_FOUND"),
-        ),
+        // TS 29.521 §4.2.4.2: no binding matching the query parameters -> 204 No
+        // Content (empty body). 404 is reserved for an absent resource path.
+        [] => SbiResponse::with_status(204),
         [sess] => {
             log::info!("PCF Binding found: {}", sess.binding_id);
             SbiResponse::with_status(200)
@@ -820,8 +819,53 @@ async fn handle_pcf_binding_delete(binding_id: &str) -> SbiResponse {
     }
 }
 
+/// RFC 7396 merge-patch interpretation of a single attribute in a PATCH body.
+enum Patch<'a> {
+    /// JSON `null` present -> remove/clear the attribute.
+    Clear,
+    /// A concrete string value present -> set the attribute.
+    Set(&'a str),
+    /// Attribute absent (or a non-string, non-null value) -> leave unchanged.
+    Keep,
+}
+
+/// Classify a string-valued attribute in a merge-patch document, distinguishing
+/// JSON `null` (clear) from an absent key (no-op) per RFC 7396.
+fn patch_str<'a>(data: &'a serde_json::Value, key: &str) -> Patch<'a> {
+    match data.get(key) {
+        Some(serde_json::Value::Null) => Patch::Clear,
+        Some(serde_json::Value::String(s)) => Patch::Set(s),
+        _ => Patch::Keep,
+    }
+}
+
+/// TS 29.521 §5.2 requires the PATCH body to be encoded as JSON Merge Patch and
+/// signalled by `application/merge-patch+json`. `application/json` is accepted
+/// leniently for current consumers; any other media type is rejected 415.
+/// An absent Content-Type is accepted (lenient).
+fn merge_patch_content_type_ok(request: &SbiRequest) -> bool {
+    match request.http.get_header("Content-Type") {
+        None => true,
+        Some(ct) => {
+            let media = ct.split(';').next().unwrap_or(ct).trim();
+            media.eq_ignore_ascii_case("application/merge-patch+json")
+                || media.eq_ignore_ascii_case("application/json")
+        }
+    }
+}
+
 async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("PCF Binding Update (PATCH): {binding_id}");
+
+    // TS 29.521 §5.2: validate the merge-patch Content-Type before any mutation.
+    if !merge_patch_content_type_ok(request) {
+        return ogs_sbi::server::send_error(
+            415,
+            "Unsupported Media Type",
+            "PATCH body must be application/merge-patch+json",
+            None,
+        );
+    }
 
     let body = match &request.http.content {
         Some(content) => content,
@@ -834,57 +878,136 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
     };
 
     let ctx = bsf_self();
-    let sess = if let Ok(context) = ctx.read() {
-        context.sess_find_by_binding_id(binding_id)
-    } else {
-        None
-    };
 
-    match sess {
-        Some(mut sess) => {
-            // Apply patch fields from the request body
-            if let Some(pcf_fqdn) = update_data.get("pcfFqdn").and_then(|v| v.as_str()) {
-                sess.pcf_fqdn = Some(pcf_fqdn.to_string());
+    // Apply the merge patch under the context read-guard, yielding the updated
+    // session. The guard (which is `!Send`) is confined to this block so it is
+    // released before the persistence `.await` below. Validation failures
+    // `return` directly (no await is crossed on those paths).
+    let sess = {
+        let context = match ctx.read() {
+            Ok(c) => c,
+            Err(_) => {
+                return ogs_sbi::server::send_error(
+                    500,
+                    "Internal Server Error",
+                    "BSF context unavailable",
+                    Some("SYSTEM_FAILURE"),
+                )
             }
-            if let Some(ipv4) = update_data.get("ipv4Addr").and_then(|v| v.as_str()) {
-                sess.set_ipv4addr(ipv4);
+        };
+
+        let Some(mut sess) = context.sess_find_by_binding_id(binding_id) else {
+            return send_not_found(
+                &format!("PCF Binding {binding_id} not found"),
+                Some("BINDING_NOT_FOUND"),
+            );
+        };
+
+        // pcfFqdn
+        match patch_str(&update_data, "pcfFqdn") {
+            Patch::Clear => sess.pcf_fqdn = None,
+            Patch::Set(s) => sess.pcf_fqdn = Some(s.to_string()),
+            Patch::Keep => {}
+        }
+
+        // UE addresses are routed through the context so the lookup hashes stay
+        // consistent on both set and clear (bsfd-10). ipv4 null also clears
+        // ipDomain inside the helper (TS 29.521 §4.2.5.2).
+        match patch_str(&update_data, "ipv4Addr") {
+            Patch::Clear => {
+                context.set_ue_ipv4(&mut sess, None);
             }
-            if let Some(ipv6) = update_data.get("ipv6Prefix").and_then(|v| v.as_str()) {
-                sess.set_ipv6prefix(ipv6);
-            }
-            if let Some(mac) = update_data.get("macAddr48").and_then(|v| v.as_str()) {
-                if !sess.set_mac_addr48(mac) {
+            Patch::Set(s) => {
+                if !context.set_ue_ipv4(&mut sess, Some(s)) {
                     return ogs_sbi::server::send_error(
                         400,
                         "Bad Request",
-                        &format!("Invalid macAddr48: {mac}"),
+                        &format!("Invalid ipv4Addr: {s}"),
                         Some("MANDATORY_IE_INCORRECT"),
                     );
                 }
             }
-            if let Some(ip_domain) = update_data.get("ipDomain").and_then(|v| v.as_str()) {
-                sess.ip_domain = Some(ip_domain.to_string());
+            Patch::Keep => {}
+        }
+        match patch_str(&update_data, "ipv6Prefix") {
+            Patch::Clear => {
+                context.set_ue_ipv6(&mut sess, None);
             }
-            if let Some(expiry) = update_data.get("expiry").and_then(|v| v.as_str()) {
-                if !sess.set_expiry(expiry) {
+            Patch::Set(s) => {
+                if !context.set_ue_ipv6(&mut sess, Some(s)) {
                     return ogs_sbi::server::send_error(
                         400,
                         "Bad Request",
-                        &format!("expiry is not a valid RFC 3339 DateTime: {expiry}"),
+                        &format!("Invalid ipv6Prefix: {s}"),
                         Some("MANDATORY_IE_INCORRECT"),
                     );
                 }
             }
-            if let Some(supi) = update_data.get("supi").and_then(|v| v.as_str()) {
-                sess.supi = Some(supi.to_string());
+            Patch::Keep => {}
+        }
+        match patch_str(&update_data, "macAddr48") {
+            Patch::Clear => {
+                context.set_ue_mac(&mut sess, None);
             }
-            if let Some(gpsi) = update_data.get("gpsi").and_then(|v| v.as_str()) {
-                sess.gpsi = Some(gpsi.to_string());
+            Patch::Set(s) => {
+                if !context.set_ue_mac(&mut sess, Some(s)) {
+                    return ogs_sbi::server::send_error(
+                        400,
+                        "Bad Request",
+                        &format!("Invalid macAddr48: {s}"),
+                        Some("MANDATORY_IE_INCORRECT"),
+                    );
+                }
             }
-            if let Some(dnn) = update_data.get("dnn").and_then(|v| v.as_str()) {
-                sess.dnn = Some(dnn.to_string());
+            Patch::Keep => {}
+        }
+
+        // ipDomain (an explicit value in the patch overrides the ipv4-null clear)
+        match patch_str(&update_data, "ipDomain") {
+            Patch::Clear => sess.ip_domain = None,
+            Patch::Set(s) => sess.ip_domain = Some(s.to_string()),
+            Patch::Keep => {}
+        }
+
+        // expiry
+        match patch_str(&update_data, "expiry") {
+            Patch::Clear => {
+                sess.expiry = None;
+                sess.expiry_epoch = None;
             }
-            if let Some(snssai) = update_data.get("snssai") {
+            Patch::Set(s) => {
+                if !sess.set_expiry(s) {
+                    return ogs_sbi::server::send_error(
+                        400,
+                        "Bad Request",
+                        &format!("expiry is not a valid RFC 3339 DateTime: {s}"),
+                        Some("MANDATORY_IE_INCORRECT"),
+                    );
+                }
+            }
+            Patch::Keep => {}
+        }
+
+        // supi / gpsi
+        match patch_str(&update_data, "supi") {
+            Patch::Clear => sess.supi = None,
+            Patch::Set(s) => sess.supi = Some(s.to_string()),
+            Patch::Keep => {}
+        }
+        match patch_str(&update_data, "gpsi") {
+            Patch::Clear => sess.gpsi = None,
+            Patch::Set(s) => sess.gpsi = Some(s.to_string()),
+            Patch::Keep => {}
+        }
+
+        // dnn is mandatory: only a concrete value is honored (a null is ignored).
+        if let Patch::Set(s) = patch_str(&update_data, "dnn") {
+            sess.dnn = Some(s.to_string());
+        }
+
+        // snssai (mandatory): apply only a concrete object.
+        if let Some(snssai) = update_data.get("snssai") {
+            if !snssai.is_null() {
                 let sst = snssai.get("sst").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
                 let sd = snssai
                     .get("sd")
@@ -892,46 +1015,50 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
                     .and_then(|s| u32::from_str_radix(s, 16).ok());
                 sess.s_nssai = context::SNssai::new(sst, sd);
             }
-            if let Some(routes) = update_data
-                .get("ipv4FrameRouteList")
-                .and_then(|v| v.as_array())
-            {
+        }
+
+        // Frame route lists: null -> clear, array -> replace, absent -> no-op.
+        match update_data.get("ipv4FrameRouteList") {
+            Some(serde_json::Value::Null) => sess.ipv4_frame_route_list.clear(),
+            Some(serde_json::Value::Array(routes)) => {
                 sess.ipv4_frame_route_list = routes
                     .iter()
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect();
             }
-            if let Some(routes) = update_data
-                .get("ipv6FrameRouteList")
-                .and_then(|v| v.as_array())
-            {
+            _ => {}
+        }
+        match update_data.get("ipv6FrameRouteList") {
+            Some(serde_json::Value::Null) => sess.ipv6_frame_route_list.clear(),
+            Some(serde_json::Value::Array(routes)) => {
                 sess.ipv6_frame_route_list = routes
                     .iter()
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect();
             }
-            if let Some(endpoints) = update_data.get("pcfIpEndPoints") {
-                sess.pcf_ip = parse_pcf_ip_endpoints(endpoints);
-            }
-
-            // Update session in context, then persist off-thread (guard
-            // dropped before the await).
-            if let Ok(context) = ctx.read() {
-                context.sess_update(&sess);
-            }
-            context::persist_binding_async(sess.clone()).await;
-
-            log::info!("PCF Binding {binding_id} updated");
-
-            SbiResponse::with_status(200)
-                .with_json_body(&binding_json(&sess))
-                .unwrap_or_else(|_| SbiResponse::with_status(200))
+            _ => {}
         }
-        None => send_not_found(
-            &format!("PCF Binding {binding_id} not found"),
-            Some("BINDING_NOT_FOUND"),
-        ),
-    }
+
+        // pcfIpEndPoints: null -> clear, array -> replace, absent -> no-op.
+        match update_data.get("pcfIpEndPoints") {
+            Some(serde_json::Value::Null) => sess.pcf_ip.clear(),
+            Some(v) if v.is_array() => sess.pcf_ip = parse_pcf_ip_endpoints(v),
+            _ => {}
+        }
+
+        // Write the updated session back; the context guard is released when
+        // this block ends, before the persistence await.
+        context.sess_update(&sess);
+        sess
+    };
+
+    context::persist_binding_async(sess.clone()).await;
+
+    log::info!("PCF Binding {binding_id} updated");
+
+    SbiResponse::with_status(200)
+        .with_json_body(&binding_json(&sess))
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
 /// Initialize logging based on command line arguments
@@ -1354,7 +1481,7 @@ mod tests {
         let (server, client) = start_bsf_oauth2(jwks_for(&sk, "nrf-es256")).await;
 
         // Valid token whose aud includes "BSF" passes enforcement and reaches
-        // the handler (a lookup miss is 404, NOT 401/403).
+        // the handler (a discovery miss is 204 No Content, NOT 401/403).
         let token = build_es256_token(&sk, "nrf-es256", "BSF");
         let req = SbiRequest::get("/nbsf-management/v1/pcfBindings?ipv4Addr=10.45.9.1")
             .with_header("Authorization", format!("Bearer {token}"));
@@ -1364,7 +1491,7 @@ mod tests {
             .expect("response");
         assert_ne!(resp.status, 401, "valid token must not be 401");
         assert_ne!(resp.status, 403, "valid token must not be 403");
-        assert_eq!(resp.status, 404, "request reached handler (binding miss)");
+        assert_eq!(resp.status, 204, "request reached handler (discovery miss)");
 
         server.stop().await.expect("stop");
     }
@@ -1510,10 +1637,30 @@ mod tests {
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         let second_id = second_body["pcfBindingId"].as_str().unwrap().to_string();
 
-        // Discovery without any UE identifier -> 400.
+        // Third binding sharing the SAME UE IPv4 address as the second (on yet
+        // another DNN), to exercise the multiple-match path with a UE address.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "dnn": "internet2",
+                    "snssai": {"sst": 1},
+                    "ipv4Addr": "10.45.9.7",
+                    "supi": "imsi-001019900100001"
+                }),
+            )
+            .await
+            .expect("POST third");
+        assert_eq!(resp.status, 201);
+        let third_body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let third_id = third_body["pcfBindingId"].as_str().unwrap().to_string();
+
+        // Discovery without any UE address -> 400 MANDATORY_QUERY_PARAM_MISSING.
         let req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
         let resp = client.send_request(req).await.expect("discover none");
         assert_eq!(resp.status, 400);
+        assert_eq!(problem(&resp)["cause"], "MANDATORY_QUERY_PARAM_MISSING");
 
         // Discovery by MAC (different separator/case) -> the MAC binding.
         let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
@@ -1525,28 +1672,29 @@ mod tests {
         assert_eq!(found["pcfBindingId"].as_str().unwrap(), binding_id);
         assert_eq!(found["pcfIpEndPoints"][0]["port"], 7777);
 
-        // Discovery by SUPI alone -> two matches -> 400 MULTIPLE_BINDING_INFO_FOUND.
+        // Discovery by SUPI alone (no UE address) -> 400 MANDATORY_QUERY_PARAM_MISSING.
         let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
         req.http.set_param("supi", "imsi-001019900100001");
         let resp = client.send_request(req).await.expect("discover supi");
         assert_eq!(resp.status, 400);
+        assert_eq!(problem(&resp)["cause"], "MANDATORY_QUERY_PARAM_MISSING");
+
+        // Discovery by the shared ipv4Addr alone -> two matches -> 400 MULTIPLE.
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
+        req.http.set_param("ipv4Addr", "10.45.9.7");
+        let resp = client.send_request(req).await.expect("discover ipv4 multi");
+        assert_eq!(resp.status, 400);
         assert_eq!(problem(&resp)["cause"], "MULTIPLE_BINDING_INFO_FOUND");
 
-        // Discovery by SUPI + DNN narrows to one.
+        // Discovery by ipv4Addr + DNN narrows to a single binding (200).
         let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
-        req.http.set_param("supi", "imsi-001019900100001");
+        req.http.set_param("ipv4Addr", "10.45.9.7");
         req.http.set_param("dnn", "ims");
-        let resp = client.send_request(req).await.expect("discover supi+dnn");
+        let resp = client.send_request(req).await.expect("discover ipv4+dnn");
         assert_eq!(resp.status, 200);
         let found: serde_json::Value =
             serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
         assert_eq!(found["pcfBindingId"].as_str().unwrap(), second_id);
-
-        // Discovery by ipv4Addr still works.
-        let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
-        req.http.set_param("ipv4Addr", "10.45.9.7");
-        let resp = client.send_request(req).await.expect("discover ipv4");
-        assert_eq!(resp.status, 200);
 
         // PATCH the MAC binding's endpoints; echoed in the response and GET.
         let mut req = SbiRequest::patch(format!("/nbsf-management/v1/pcfBindings/{binding_id}"));
@@ -1586,10 +1734,12 @@ mod tests {
         let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
         req.http.set_param("ipv4Addr", "10.45.9.99");
         let resp = client.send_request(req).await.expect("discover expired");
-        assert_eq!(resp.status, 404);
+        // No matching (live) binding for a valid UE address -> 204 No Content.
+        assert_eq!(resp.status, 204);
+        assert!(resp.http.content.as_deref().unwrap_or("").is_empty());
 
-        // DELETE both live bindings -> 204; GET -> 404 afterwards.
-        for id in [&binding_id, &second_id] {
+        // DELETE all live bindings -> 204; GET -> 404 afterwards.
+        for id in [&binding_id, &second_id, &third_id] {
             let resp = client
                 .delete(&format!("/nbsf-management/v1/pcfBindings/{id}"))
                 .await
@@ -1607,6 +1757,187 @@ mod tests {
             .await
             .expect("DELETE again");
         assert_eq!(resp.status, 404);
+
+        server.stop().await.expect("server stops");
+    }
+
+    /// bsfd-02: discovery must carry a UE address; a SUPI/GPSI-only query is
+    /// rejected 400 MANDATORY_QUERY_PARAM_MISSING, while a UE-address query is
+    /// accepted (and a clean miss returns 204, not 400/404).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_discovery_requires_ue_address() {
+        let (server, client) = start_bsf().await;
+
+        // SUPI only -> 400 MANDATORY_QUERY_PARAM_MISSING.
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
+        req.http.set_param("supi", "imsi-001019900177701");
+        let resp = client.send_request(req).await.expect("discover supi-only");
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem(&resp)["cause"], "MANDATORY_QUERY_PARAM_MISSING");
+
+        // GPSI only -> 400 as well.
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
+        req.http.set_param("gpsi", "msisdn-7770000");
+        let resp = client.send_request(req).await.expect("discover gpsi-only");
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem(&resp)["cause"], "MANDATORY_QUERY_PARAM_MISSING");
+
+        // A UE address (ipv4) with no matching binding -> 204 (not 400/404).
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
+        req.http.set_param("ipv4Addr", "10.77.0.1");
+        let resp = client.send_request(req).await.expect("discover ipv4 miss");
+        assert_eq!(resp.status, 204);
+
+        server.stop().await.expect("server stops");
+    }
+
+    /// bsfd-01: a discovery with a valid UE address that matches no binding
+    /// returns 204 No Content with an empty body.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_discovery_no_match_returns_204() {
+        let (server, client) = start_bsf().await;
+
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
+        req.http.set_param("ipv4Addr", "10.77.0.2");
+        let resp = client.send_request(req).await.expect("discover miss");
+        assert_eq!(resp.status, 204);
+        assert!(resp.http.content.as_deref().unwrap_or("").is_empty());
+
+        server.stop().await.expect("server stops");
+    }
+
+    /// bsfd-03: IPv6 longest-prefix containment match over HTTP (a /128 query
+    /// inside a stored /64 prefix returns that binding).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_discovery_ipv6_prefix_match() {
+        let (server, client) = start_bsf().await;
+
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "dnn": "internet",
+                    "snssai": {"sst": 1},
+                    "ipv6Prefix": "2001:dba::/64",
+                    "supi": "imsi-001019900166601"
+                }),
+            )
+            .await
+            .expect("POST ipv6");
+        assert_eq!(resp.status, 201);
+        let created: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let id = created["pcfBindingId"].as_str().unwrap().to_string();
+
+        // Bare in-prefix address matches the stored /64.
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
+        req.http.set_param("ipv6Prefix", "2001:dba::1");
+        let resp = client.send_request(req).await.expect("discover ipv6 in");
+        assert_eq!(resp.status, 200);
+        let found: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(found["pcfBindingId"].as_str().unwrap(), id);
+
+        // Out-of-prefix address -> 204.
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
+        req.http.set_param("ipv6Prefix", "2001:dbb::1");
+        let resp = client.send_request(req).await.expect("discover ipv6 out");
+        assert_eq!(resp.status, 204);
+
+        client
+            .delete(&format!("/nbsf-management/v1/pcfBindings/{id}"))
+            .await
+            .expect("DELETE ipv6");
+
+        server.stop().await.expect("server stops");
+    }
+
+    /// bsfd-04: PATCH JSON Merge Patch null-removal clears the attribute and its
+    /// dependent hash index (old-address discovery then returns 204), ipv4 null
+    /// also clears ipDomain, and a non-merge-patch Content-Type is rejected 415.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_patch_null_removal_and_content_type() {
+        let (server, client) = start_bsf().await;
+
+        // Create a binding with ipv4Addr + ipDomain + macAddr48.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "dnn": "internet",
+                    "snssai": {"sst": 1},
+                    "ipv4Addr": "10.88.0.1",
+                    "ipDomain": "domain-x",
+                    "macAddr48": "AA:BB:CC:88:00:01",
+                    "supi": "imsi-001019900188801"
+                }),
+            )
+            .await
+            .expect("POST patchable");
+        assert_eq!(resp.status, 201);
+        let created: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let id = created["pcfBindingId"].as_str().unwrap().to_string();
+        assert_eq!(created["ipDomain"], "domain-x");
+
+        // text/plain Content-Type is rejected 415 (before any mutation).
+        let mut req = SbiRequest::patch(format!("/nbsf-management/v1/pcfBindings/{id}"));
+        req.http.set_content(json!({"ipv4Addr": null}).to_string());
+        req.http.set_header("Content-Type", "text/plain");
+        let resp = client.send_request(req).await.expect("PATCH wrong CT");
+        assert_eq!(resp.status, 415);
+
+        // merge-patch+json Content-Type is accepted: clear ipv4Addr.
+        let mut req = SbiRequest::patch(format!("/nbsf-management/v1/pcfBindings/{id}"));
+        req.http.set_content(json!({"ipv4Addr": null}).to_string());
+        req.http
+            .set_header("Content-Type", "application/merge-patch+json");
+        let resp = client.send_request(req).await.expect("PATCH ipv4 null");
+        assert_eq!(resp.status, 200);
+        let patched: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        // ipv4Addr and the dependent ipDomain are both gone.
+        assert!(patched.get("ipv4Addr").is_none());
+        assert!(patched.get("ipDomain").is_none());
+
+        // GET confirms removal persisted.
+        let resp = client
+            .get(&format!("/nbsf-management/v1/pcfBindings/{id}"))
+            .await
+            .expect("GET after ipv4 null");
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(got.get("ipv4Addr").is_none());
+        assert!(got.get("ipDomain").is_none());
+
+        // Discovery by the now-removed ipv4 address -> 204 (hash re-keyed).
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
+        req.http.set_param("ipv4Addr", "10.88.0.1");
+        let resp = client
+            .send_request(req)
+            .await
+            .expect("discover removed ipv4");
+        assert_eq!(resp.status, 204);
+
+        // PATCH macAddr48 null removes the MAC and clears the mac hash.
+        let mut req = SbiRequest::patch(format!("/nbsf-management/v1/pcfBindings/{id}"));
+        req.http.set_content(json!({"macAddr48": null}).to_string());
+        req.http
+            .set_header("Content-Type", "application/merge-patch+json");
+        let resp = client.send_request(req).await.expect("PATCH mac null");
+        assert_eq!(resp.status, 200);
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcfBindings");
+        req.http.set_param("macAddr48", "aa-bb-cc-88-00-01");
+        let resp = client
+            .send_request(req)
+            .await
+            .expect("discover removed mac");
+        assert_eq!(resp.status, 204);
+
+        client
+            .delete(&format!("/nbsf-management/v1/pcfBindings/{id}"))
+            .await
+            .expect("DELETE patchable");
 
         server.stop().await.expect("server stops");
     }

@@ -81,6 +81,37 @@ impl Ipv6Prefix {
         key.extend_from_slice(&self.addr6[..key_len.min(16)]);
         key
     }
+
+    /// TS 29.521 §4.2.4.2: true when `addr` is within the address range covered
+    /// by this prefix, i.e. the first `len` bits of `addr` equal the first `len`
+    /// bits of the prefix. The final partial byte (when `len` is not a multiple
+    /// of 8) is compared under a high-bit mask.
+    pub fn contains(&self, addr: &Ipv6Addr) -> bool {
+        let len = self.len as usize;
+        if len > 128 {
+            return false;
+        }
+        let octets = addr.octets();
+        let full_bytes = len / 8;
+        if self.addr6[..full_bytes] != octets[..full_bytes] {
+            return false;
+        }
+        let rem_bits = len % 8;
+        if rem_bits != 0 {
+            let mask: u8 = 0xFFu8 << (8 - rem_bits);
+            if (self.addr6[full_bytes] & mask) != (octets[full_bytes] & mask) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// True when the (typically /128) `query` prefix's address falls within this
+    /// prefix. The query's own length is ignored; its address is treated as a
+    /// single host address per the longest-prefix-match rule.
+    pub fn contains_prefix(&self, query: &Ipv6Prefix) -> bool {
+        self.contains(&Ipv6Addr::from(query.addr6))
+    }
 }
 
 impl fmt::Display for Ipv6Prefix {
@@ -223,6 +254,47 @@ impl BindingFilter {
             || self.supi.is_some()
             || self.gpsi.is_some()
     }
+
+    /// TS 29.521 §4.2.4.2: a discovery query "shall include: UE address",
+    /// where a UE address is one of `ipv4Addr` / `ipv6Prefix` / `macAddr48`.
+    /// SUPI/GPSI/DNN/S-NSSAI are supplementary "may include" filters and do
+    /// not by themselves satisfy the mandatory UE-address requirement.
+    pub fn has_ue_address(&self) -> bool {
+        self.ipv4addr.is_some() || self.ipv6prefix.is_some() || self.mac_addr48.is_some()
+    }
+}
+
+/// Parse a discovery IPv6 query value into a host address, accepting both the
+/// bare-address form (`2001:db8::1`) and the `addr/len` form (`2001:db8::1/128`)
+/// the TS 29.521 spec describes ("formatted as … /128"). The prefix length, if
+/// present, is ignored — the query is always treated as a single host address.
+fn parse_query_ipv6(v: &str) -> Option<Ipv6Addr> {
+    let addr_part = v.split('/').next().unwrap_or(v);
+    addr_part.parse::<Ipv6Addr>().ok()
+}
+
+/// True when `addr` falls within the IPv4 CIDR `cidr` (`a.b.c.d/n`).
+fn ipv4_in_cidr(addr: Ipv4Addr, cidr: &str) -> bool {
+    let (net_str, len_str) = match cidr.split_once('/') {
+        Some(parts) => parts,
+        None => return cidr.parse::<Ipv4Addr>().map(|n| n == addr).unwrap_or(false),
+    };
+    let Ok(net) = net_str.parse::<Ipv4Addr>() else {
+        return false;
+    };
+    let Ok(len) = len_str.parse::<u8>() else {
+        return false;
+    };
+    if len > 32 {
+        return false;
+    }
+    let mask: u32 = if len == 0 { 0 } else { u32::MAX << (32 - len) };
+    (u32::from(addr) & mask) == (u32::from(net) & mask)
+}
+
+/// True when `addr` falls within the IPv6 CIDR `cidr` (`addr/len`).
+fn ipv6_in_cidr(addr: &Ipv6Addr, cidr: &str) -> bool {
+    Ipv6Prefix::from_string(cidr).is_some_and(|p| p.contains(addr))
 }
 
 /// BSF Session structure
@@ -369,14 +441,68 @@ impl BsfSess {
         self.expiry_epoch.is_some_and(|e| e <= now)
     }
 
+    /// TS 29.521 §4.2.4.2: true when an IPv4 query address is covered by any of
+    /// this binding's `ipv4FrameRouteList` CIDRs.
+    pub fn ipv4_in_frame_routes(&self, addr: Ipv4Addr) -> bool {
+        self.ipv4_frame_route_list
+            .iter()
+            .any(|r| ipv4_in_cidr(addr, r))
+    }
+
+    /// TS 29.521 §4.2.4.2: true when an IPv6 query address is covered by any of
+    /// this binding's `ipv6FrameRouteList` CIDRs.
+    pub fn ipv6_in_frame_routes(&self, addr: &Ipv6Addr) -> bool {
+        self.ipv6_frame_route_list
+            .iter()
+            .any(|r| ipv6_in_cidr(addr, r))
+    }
+
+    /// Longest prefix length (0..=128) by which this binding matches the IPv6
+    /// query `addr`, considering both the primary UE prefix and any
+    /// `ipv6FrameRouteList` route that contains it. Used for longest-prefix
+    /// selection across candidate bindings (TS 29.521 §4.2.4.2).
+    pub fn ipv6_best_match_len(&self, addr: &Ipv6Addr) -> Option<u8> {
+        let mut best: Option<u8> = None;
+        if let Some(ref p) = self.ipv6prefix {
+            if p.contains(addr) {
+                best = Some(best.map_or(p.len, |b| b.max(p.len)));
+            }
+        }
+        for r in &self.ipv6_frame_route_list {
+            if let Some(p) = Ipv6Prefix::from_string(r) {
+                if p.contains(addr) {
+                    best = Some(best.map_or(p.len, |b| b.max(p.len)));
+                }
+            }
+        }
+        best
+    }
+
     /// True when this binding matches every provided discovery filter.
+    ///
+    /// IPv4/IPv6 addresses match either the binding's primary UE address (exact
+    /// for IPv4, longest-prefix containment for IPv6) or any framed route. MAC
+    /// and the remaining identity filters match exactly (DNN case-insensitively).
     pub fn matches(&self, f: &BindingFilter) -> bool {
         f.ipv4addr
             .as_deref()
-            .is_none_or(|v| self.ipv4addr_string.as_deref() == Some(v))
+            .is_none_or(|v| match v.parse::<Ipv4Addr>() {
+                Ok(addr) => {
+                    self.ipv4addr_string.as_deref() == Some(v) || self.ipv4_in_frame_routes(addr)
+                }
+                // Unparseable query: fall back to exact string comparison.
+                Err(_) => self.ipv4addr_string.as_deref() == Some(v),
+            })
             && f.ipv6prefix
                 .as_deref()
-                .is_none_or(|v| self.ipv6prefix_string.as_deref() == Some(v))
+                .is_none_or(|v| match parse_query_ipv6(v) {
+                    Some(addr) => {
+                        self.ipv6prefix.as_ref().is_some_and(|p| p.contains(&addr))
+                            || self.ipv6_in_frame_routes(&addr)
+                    }
+                    // Unparseable query: fall back to exact string comparison.
+                    None => self.ipv6prefix_string.as_deref() == Some(v),
+                })
             && f.mac_addr48
                 .as_deref()
                 .is_none_or(|v| normalize_mac(v).as_deref() == self.mac_addr48.as_deref())
@@ -601,11 +727,35 @@ impl BsfContext {
             Ok(l) => l,
             Err(_) => return Vec::new(),
         };
-        sess_list
+        let matches: Vec<BsfSess> = sess_list
             .values()
             .filter(|s| !s.is_expired(now) && s.matches(filter))
             .cloned()
-            .collect()
+            .collect();
+        drop(sess_list);
+
+        // TS 29.521 §4.2.4.2: for an IPv6 query, select the binding(s) with the
+        // longest matching prefix. A single longest match wins (200); an
+        // equal-length true multi-match is left for the caller to reject (400).
+        if let Some(query) = filter.ipv6prefix.as_deref() {
+            if let Some(addr) = parse_query_ipv6(query) {
+                if matches.len() > 1 {
+                    let scored: Vec<(Option<u8>, BsfSess)> = matches
+                        .into_iter()
+                        .map(|s| (s.ipv6_best_match_len(&addr), s))
+                        .collect();
+                    if let Some(max_len) = scored.iter().filter_map(|(l, _)| *l).max() {
+                        return scored
+                            .into_iter()
+                            .filter(|(l, _)| *l == Some(max_len))
+                            .map(|(_, s)| s)
+                            .collect();
+                    }
+                    return scored.into_iter().map(|(_, s)| s).collect();
+                }
+            }
+        }
+        matches
     }
 
     /// Remove every expired binding; returns the removed binding ids so the
@@ -690,6 +840,100 @@ impl BsfContext {
             }
         }
         false
+    }
+
+    /// Set or clear a binding's UE IPv4 address, keeping the `ipv4addr_hash`
+    /// lookup index consistent (bsfd-10).
+    ///
+    /// `Some(addr)` parses and sets the address, removing the old hash key and
+    /// inserting the new one; `None` clears the address (and, per
+    /// TS 29.521 §4.2.5.2, the dependent `ipDomain`) and drops the old hash key.
+    /// Returns `false` only when a provided address fails to parse (the session
+    /// is left unchanged in that case).
+    pub fn set_ue_ipv4(&self, sess: &mut BsfSess, value: Option<&str>) -> bool {
+        let old = sess.ipv4addr;
+        match value {
+            Some(v) => {
+                if !sess.set_ipv4addr(v) {
+                    return false;
+                }
+                if let Ok(mut hash) = self.ipv4addr_hash.write() {
+                    if let Some(o) = old {
+                        hash.remove(&o);
+                    }
+                    if let Some(addr) = sess.ipv4addr {
+                        hash.insert(addr, sess.id);
+                    }
+                }
+            }
+            None => {
+                sess.ipv4addr = None;
+                sess.ipv4addr_string = None;
+                // ipv4 removal also clears ipDomain (TS 29.521 §4.2.5.2).
+                sess.ip_domain = None;
+                if let (Ok(mut hash), Some(o)) = (self.ipv4addr_hash.write(), old) {
+                    hash.remove(&o);
+                }
+            }
+        }
+        true
+    }
+
+    /// Set or clear a binding's UE IPv6 prefix, keeping the `ipv6prefix_hash`
+    /// lookup index consistent (bsfd-10).
+    pub fn set_ue_ipv6(&self, sess: &mut BsfSess, value: Option<&str>) -> bool {
+        let old_key = sess.ipv6prefix.as_ref().map(|p| p.hash_key());
+        match value {
+            Some(v) => {
+                if !sess.set_ipv6prefix(v) {
+                    return false;
+                }
+                if let Ok(mut hash) = self.ipv6prefix_hash.write() {
+                    if let Some(k) = old_key {
+                        hash.remove(&k);
+                    }
+                    if let Some(ref p) = sess.ipv6prefix {
+                        hash.insert(p.hash_key(), sess.id);
+                    }
+                }
+            }
+            None => {
+                sess.ipv6prefix = None;
+                sess.ipv6prefix_string = None;
+                if let (Ok(mut hash), Some(k)) = (self.ipv6prefix_hash.write(), old_key) {
+                    hash.remove(&k);
+                }
+            }
+        }
+        true
+    }
+
+    /// Set or clear a binding's UE MAC address, keeping the `mac_hash` lookup
+    /// index consistent (bsfd-10).
+    pub fn set_ue_mac(&self, sess: &mut BsfSess, value: Option<&str>) -> bool {
+        let old = sess.mac_addr48.clone();
+        match value {
+            Some(v) => {
+                if !sess.set_mac_addr48(v) {
+                    return false;
+                }
+                if let Ok(mut hash) = self.mac_hash.write() {
+                    if let Some(ref o) = old {
+                        hash.remove(o);
+                    }
+                    if let Some(ref m) = sess.mac_addr48 {
+                        hash.insert(m.clone(), sess.id);
+                    }
+                }
+            }
+            None => {
+                sess.mac_addr48 = None;
+                if let (Ok(mut hash), Some(ref o)) = (self.mac_hash.write(), old) {
+                    hash.remove(o);
+                }
+            }
+        }
+        true
     }
 
     /// Get session load percentage
@@ -1238,12 +1482,16 @@ mod tests {
         ctx.sess_update(&sess);
 
         let now = 1_000_000;
+        // SUPI-only is a UE *identifier* but NOT a UE *address* (bsfd-02):
+        // such a query is rejected 400 by the discovery handler, though the
+        // matcher itself still narrows correctly when combined with a UE address.
         let mut f = BindingFilter {
             supi: Some("imsi-001010000000001".to_string()),
             dnn: Some("INTERNET".to_string()), // case-insensitive DNN
             ..Default::default()
         };
         assert!(f.has_ue_identifier());
+        assert!(!f.has_ue_address());
         assert_eq!(ctx.sess_find_matching(&f, now).len(), 1);
 
         f.snssai = Some(SNssai::new(1, Some(0x010203)));
@@ -1255,10 +1503,186 @@ mod tests {
             mac_addr48: Some("AA-BB-CC-DD-EE-FF".to_string()),
             ..Default::default()
         };
+        assert!(f.has_ue_address());
         assert_eq!(ctx.sess_find_matching(&f, now).len(), 1);
+
+        // ipv4 alone is a UE address; supi/gpsi alone is not.
+        assert!(BindingFilter {
+            ipv4addr: Some("10.45.0.2".to_string()),
+            ..Default::default()
+        }
+        .has_ue_address());
+        assert!(!BindingFilter {
+            gpsi: Some("msisdn-1".to_string()),
+            ..Default::default()
+        }
+        .has_ue_address());
 
         let f = BindingFilter::default();
         assert!(!f.has_ue_identifier());
+        assert!(!f.has_ue_address());
+    }
+
+    #[test]
+    fn test_ipv6_prefix_contains() {
+        let p64 = Ipv6Prefix::from_string("2001:db8::/64").unwrap();
+        assert!(p64.contains(&"2001:db8::1".parse().unwrap()));
+        assert!(p64.contains(&"2001:db8:0:0:ffff::1".parse().unwrap()));
+        assert!(!p64.contains(&"2001:db9::1".parse().unwrap()));
+
+        // Non-byte-aligned prefix length masks the final partial byte. /60
+        // fixes the first 60 bits, i.e. group3 in the range 0a00..=0a0f.
+        let p60 = Ipv6Prefix::from_string("2001:db8:0:0a00::/60").unwrap();
+        assert!(p60.contains(&"2001:db8:0:0a0f::5".parse().unwrap()));
+        assert!(!p60.contains(&"2001:db8:0:0a10::5".parse().unwrap()));
+        assert!(!p60.contains(&"2001:db8:0:0b00::5".parse().unwrap()));
+
+        // contains_prefix treats a /128 query as a host address.
+        let q = Ipv6Prefix::from_string("2001:db8::1/128").unwrap();
+        assert!(p64.contains_prefix(&q));
+    }
+
+    #[test]
+    fn test_binding_filter_ipv6_prefix_match() {
+        let mut ctx = BsfContext::new();
+        ctx.init(100);
+        let _ = ctx
+            .sess_add_by_ip_address(None, Some("2001:db8::/64"))
+            .unwrap();
+        let now = 1_000_000;
+
+        // /128 query inside the stored /64 matches.
+        let f = BindingFilter {
+            ipv6prefix: Some("2001:db8::1/128".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(ctx.sess_find_matching(&f, now).len(), 1);
+
+        // Bare-address form also matches.
+        let f = BindingFilter {
+            ipv6prefix: Some("2001:db8::abcd".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(ctx.sess_find_matching(&f, now).len(), 1);
+
+        // Out-of-prefix query does not match.
+        let f = BindingFilter {
+            ipv6prefix: Some("2001:db9::1/128".to_string()),
+            ..Default::default()
+        };
+        assert!(ctx.sess_find_matching(&f, now).is_empty());
+    }
+
+    #[test]
+    fn test_longest_prefix_selection() {
+        let mut ctx = BsfContext::new();
+        ctx.init(100);
+        // Two nested prefixes covering the same base address: the /64 is the
+        // longest match, nested inside the broader /32.
+        ctx.sess_add_by_ip_address(None, Some("2001:db8::/32"))
+            .unwrap();
+        let specific = ctx
+            .sess_add_by_ip_address(None, Some("2001:db8::/64"))
+            .unwrap();
+        let now = 1_000_000;
+
+        // Query inside both prefixes: the longest (/64) wins -> single result.
+        let f = BindingFilter {
+            ipv6prefix: Some("2001:db8::5/128".to_string()),
+            ..Default::default()
+        };
+        let found = ctx.sess_find_matching(&f, now);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, specific.id);
+
+        // Query inside only the broader /32 (4th hextet != 0): single result.
+        let f = BindingFilter {
+            ipv6prefix: Some("2001:db8:0:1::5/128".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(ctx.sess_find_matching(&f, now).len(), 1);
+    }
+
+    #[test]
+    fn test_framed_route_match() {
+        let mut ctx = BsfContext::new();
+        ctx.init(100);
+        let sess = ctx.sess_add_by_ip_address(Some("10.45.0.2"), None).unwrap();
+        let mut sess = sess;
+        sess.ipv4_frame_route_list = vec!["10.0.0.0/24".to_string()];
+        sess.ipv6_frame_route_list = vec!["2001:dbf::/48".to_string()];
+        ctx.sess_update(&sess);
+        let now = 1_000_000;
+
+        // IPv4 inside the framed route matches even though it is not the
+        // binding's primary UE address.
+        let f = BindingFilter {
+            ipv4addr: Some("10.0.0.5".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(ctx.sess_find_matching(&f, now).len(), 1);
+        // Outside the route: no match.
+        let f = BindingFilter {
+            ipv4addr: Some("10.1.0.5".to_string()),
+            ..Default::default()
+        };
+        assert!(ctx.sess_find_matching(&f, now).is_empty());
+
+        // IPv6 inside the framed route matches.
+        let f = BindingFilter {
+            ipv6prefix: Some("2001:dbf::1234/128".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(ctx.sess_find_matching(&f, now).len(), 1);
+    }
+
+    #[test]
+    fn test_context_rekey_ipv4() {
+        let mut ctx = BsfContext::new();
+        ctx.init(100);
+        let mut sess = ctx.sess_add_by_ip_address(Some("10.45.1.1"), None).unwrap();
+        sess.ip_domain = Some("domain1".to_string());
+        ctx.sess_update(&sess);
+        assert!(ctx.sess_find_by_ipv4addr("10.45.1.1").is_some());
+
+        // Change A -> B: hash follows.
+        assert!(ctx.set_ue_ipv4(&mut sess, Some("10.45.1.2")));
+        ctx.sess_update(&sess);
+        assert!(ctx.sess_find_by_ipv4addr("10.45.1.1").is_none());
+        assert!(ctx.sess_find_by_ipv4addr("10.45.1.2").is_some());
+
+        // Clear: hash key dropped and ipDomain cleared.
+        assert!(ctx.set_ue_ipv4(&mut sess, None));
+        ctx.sess_update(&sess);
+        assert!(ctx.sess_find_by_ipv4addr("10.45.1.2").is_none());
+        assert!(sess.ip_domain.is_none());
+        assert!(sess.ipv4addr_string.is_none());
+
+        // Invalid address leaves the session unchanged.
+        let mut s2 = ctx.sess_add_by_ip_address(Some("10.45.1.3"), None).unwrap();
+        assert!(!ctx.set_ue_ipv4(&mut s2, Some("not-an-ip")));
+        assert_eq!(s2.ipv4addr_string.as_deref(), Some("10.45.1.3"));
+    }
+
+    #[test]
+    fn test_context_rekey_ipv6_and_mac() {
+        let mut ctx = BsfContext::new();
+        ctx.init(100);
+        let mut sess = ctx
+            .sess_add_binding(None, Some("2001:db8::/64"), Some("aa:bb:cc:dd:ee:01"))
+            .unwrap();
+
+        // Re-key IPv6 prefix.
+        assert!(ctx.set_ue_ipv6(&mut sess, Some("2001:db8:1::/64")));
+        ctx.sess_update(&sess);
+        assert!(ctx.sess_find_by_ipv6prefix("2001:db8::/64").is_none());
+        assert!(ctx.sess_find_by_ipv6prefix("2001:db8:1::/64").is_some());
+
+        // Clear MAC: mac_hash drops the key.
+        assert!(ctx.set_ue_mac(&mut sess, None));
+        ctx.sess_update(&sess);
+        assert!(ctx.sess_find_by_mac("aa-bb-cc-dd-ee-01").is_none());
+        assert!(sess.mac_addr48.is_none());
     }
 
     #[test]
