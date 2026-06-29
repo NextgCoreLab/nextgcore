@@ -215,6 +215,37 @@ impl NfProfile {
         doc
     }
 
+    /// Sets the negotiated `heartBeatTimer` (nrfd-03) on both the parsed
+    /// summary field and the verbatim `attributes` document, so the value the
+    /// NRF enforces is the value GET / discovery / register-response return
+    /// (TS 29.510 Table 6.1.6.2.2-1: the NRF returns the value it will use).
+    pub fn set_heartbeat_timer(&mut self, seconds: u32) {
+        self.heartbeat_timer = Some(seconds);
+        if let Some(obj) = self.attributes.as_object_mut() {
+            obj.insert("heartBeatTimer".to_string(), seconds.into());
+        }
+    }
+
+    /// The S-NSSAIs this profile advertises (TS 29.510 NFProfile.sNssais),
+    /// returned verbatim as JSON objects for slice-restriction matching.
+    pub fn snssais(&self) -> Vec<serde_json::Value> {
+        self.attributes
+            .get("sNssais")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The PLMNs this profile advertises (TS 29.510 NFProfile.plmnList),
+    /// returned verbatim as JSON objects for PLMN-restriction matching.
+    pub fn plmns(&self) -> Vec<serde_json::Value> {
+        self.attributes
+            .get("plmnList")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Profile-level `allowedNfTypes` (TS 29.510 Table 6.1.6.2.2-1): the NF
     /// types permitted to access this NF instance. An empty/absent list means
     /// "no restriction" (any consumer type may access). Read from the verbatim
@@ -893,31 +924,12 @@ pub fn nrf_nnrf_handle_nf_register(nf_instance_id: &str, profile: &NfProfile) ->
     }
 }
 
-/// Handle NF update (PATCH /nf-instances/{nfInstanceId})
-pub fn nrf_nnrf_handle_nf_update(
-    nf_instance_id: &str,
-    _patch_items: &[PatchItem],
-) -> HandlerResult {
-    log::debug!("[{nf_instance_id}] NF update request");
-
-    let manager = nf_manager();
-    if manager.find_instance(nf_instance_id).is_none() {
-        return HandlerResult::Error(404, "NF instance not found".to_string());
-    }
-
-    // Note: Apply patch items
-    // Patch application would update the NF profile fields based on RFC 6902 JSON Patch operations
-
-    HandlerResult::Success(204) // No Content
-}
-
-/// Patch item for NF update
-#[derive(Debug, Clone)]
-pub struct PatchItem {
-    pub op: String,
-    pub path: String,
-    pub value: Option<String>,
-}
+// nrfd-11: the duplicated NFManagement stubs `nrf_nnrf_handle_nf_update`,
+// `nrf_nnrf_handle_nf_profile_retrieval`, `nrf_nnrf_handle_nf_list_retrieval`
+// (and the `PatchItem` type they used) were removed. The single authoritative
+// path is the live SBI dispatch in `main.rs` (`handle_nf_update`,
+// `handle_nf_profile_retrieval`, `handle_nf_list_retrieval`), which implements
+// the full RFC 6902 / RFC 7396 PATCH engine and returns the real NFProfile.
 
 /// Handle NF status subscribe (POST /subscriptions)
 pub fn nrf_nnrf_handle_nf_status_subscribe(subscription: SubscriptionData) -> HandlerResult {
@@ -968,33 +980,10 @@ pub fn nrf_nnrf_handle_nf_status_unsubscribe(subscription_id: &str) -> HandlerRe
     }
 }
 
-/// Handle NF list retrieval (GET /nf-instances)
-pub fn nrf_nnrf_handle_nf_list_retrieval(
-    nf_type: Option<&str>,
-    limit: Option<u32>,
-) -> HandlerResult {
-    log::debug!("NF list retrieval request (type={nf_type:?}, limit={limit:?})");
-
-    // Note: Return list of NF instance URIs
-    // The response body would contain a Links structure with hrefs to each NF instance
-
-    HandlerResult::Success(200)
-}
-
-/// Handle NF profile retrieval (GET /nf-instances/{nfInstanceId})
-pub fn nrf_nnrf_handle_nf_profile_retrieval(nf_instance_id: &str) -> HandlerResult {
-    log::debug!("[{nf_instance_id}] NF profile retrieval request");
-
-    let manager = nf_manager();
-    if manager.find_instance(nf_instance_id).is_none() {
-        return HandlerResult::Error(404, "NF instance not found".to_string());
-    }
-
-    // Note: Return NF profile
-    // The response body would contain the complete NfProfile for this instance
-
-    HandlerResult::Success(200)
-}
+// nrfd-11: `nrf_nnrf_handle_nf_list_retrieval` and
+// `nrf_nnrf_handle_nf_profile_retrieval` stubs removed — the authoritative
+// implementations are `handle_nf_list_retrieval` / `handle_nf_profile_retrieval`
+// on the live SBI path in `main.rs`.
 
 /// Handle NF discover (GET /nf-instances for discovery)
 pub fn nrf_nnrf_handle_nf_discover(
