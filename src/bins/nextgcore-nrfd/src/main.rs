@@ -10,8 +10,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use nextgcore_nrfd::{
     apply_json_patch, discover_profiles, json_merge_patch, nf_manager, nrf_context_final,
-    nrf_context_init, nrf_nnrf_nfm_send_nf_status_notify_all_async, nrf_sbi_close, nrf_sbi_open,
-    timer_manager, DiscoveryQuery, NfProfile, NotificationEventType, NrfSmContext, PatchError,
+    nrf_context_init, nrf_nnrf_nfm_send_nf_profile_changed_notify_all_async,
+    nrf_nnrf_nfm_send_nf_status_notify_all_async, nrf_sbi_close, nrf_sbi_open, timer_manager,
+    ChangeItem, DiscoveryQuery, NfProfile, NotificationEventType, NrfSmContext, PatchError,
     SbiServerConfig,
 };
 use ogs_sbi::message::{SbiRequest, SbiResponse};
@@ -682,6 +683,86 @@ async fn handle_nf_deregister(nf_instance_id: &str) -> SbiResponse {
     }
 }
 
+/// Derive an RFC 6902-style `ChangeItem` list from a PATCH operation.
+///
+/// For JSON Patch (`is_json_patch = true`) the applied ops are translated
+/// directly (skipping `test` ops which are guards, not changes).  For merge
+/// patches the pre- and post-documents are diffed at the top level: each
+/// key whose value changed becomes a `replace`, each new key becomes an
+/// `add`, and each null-valued key (RFC 7396 delete) becomes a `remove`.
+///
+/// `pre` must be the stored profile document before the patch; `post` is the
+/// document after a successful application.
+pub fn compute_profile_changes(
+    pre: &serde_json::Value,
+    post: &serde_json::Value,
+    patch: &serde_json::Value,
+    is_json_patch: bool,
+) -> Vec<ChangeItem> {
+    if is_json_patch {
+        let Some(items) = patch.as_array() else {
+            return vec![];
+        };
+        items
+            .iter()
+            .filter_map(|item| {
+                let op = item.get("op")?.as_str()?;
+                if op == "test" {
+                    return None; // guard op — not a profile change
+                }
+                let path = item.get("path")?.as_str()?.to_string();
+                let value = item.get("value").cloned();
+                // For replace/remove, capture the original value from pre-patch doc.
+                let orig_value = if op == "replace" || op == "remove" {
+                    pre.pointer(&path).cloned()
+                } else {
+                    None
+                };
+                Some(ChangeItem {
+                    op: op.to_string(),
+                    path,
+                    value,
+                    orig_value,
+                })
+            })
+            .collect()
+    } else {
+        // Merge patch: diff pre vs post at the top level.
+        let Some(patch_obj) = patch.as_object() else {
+            return vec![];
+        };
+        patch_obj
+            .iter()
+            .map(|(key, patch_val)| {
+                let path = format!("/{key}");
+                if patch_val.is_null() {
+                    // RFC 7396 null = remove
+                    ChangeItem {
+                        op: "remove".to_string(),
+                        path,
+                        value: None,
+                        orig_value: pre.get(key).cloned(),
+                    }
+                } else if pre.get(key).is_some() {
+                    ChangeItem {
+                        op: "replace".to_string(),
+                        path,
+                        value: post.get(key).cloned(),
+                        orig_value: pre.get(key).cloned(),
+                    }
+                } else {
+                    ChangeItem {
+                        op: "add".to_string(),
+                        path,
+                        value: post.get(key).cloned(),
+                        orig_value: None,
+                    }
+                }
+            })
+            .collect()
+    }
+}
+
 /// Handle NF Update request (PATCH)
 ///
 /// TS 29.510 §5.2.2.3 mandates `application/json-patch+json` (RFC 6902
@@ -718,14 +799,19 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
         }
     };
 
+    // Snapshot the pre-patch JSON — needed for diff / ChangeItem extraction
+    // and to detect whether anything actually changed (nrfd-02).
+    let pre_patch_doc = profile.to_json();
+
     // Apply the patch to a copy of the full stored document.
-    let mut doc = profile.to_json();
+    let mut doc = pre_patch_doc.clone();
     let content_type = request
         .http
         .get_header("content-type")
         .cloned()
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let is_json_patch = content_type.contains("json-patch+json") || patch.is_array();
     let patch_result = if content_type.contains("json-patch+json") {
         apply_json_patch(&mut doc, &patch)
     } else if content_type.contains("merge-patch+json") {
@@ -782,9 +868,52 @@ async fn handle_nf_update(nf_instance_id: &str, request: &SbiRequest) -> SbiResp
         log::debug!("Heartbeat timer refreshed for NF {nf_instance_id} ({expiry_secs}s)");
     }
 
-    // A heartbeat on a SUSPENDED NF restores it to REGISTERED (TS 29.510)
+    // nrfd-02: Emit NF_PROFILE_CHANGED to matching subscribers when the
+    // profile document changed materially (TS 29.510 §5.2.2.3 / §5.2.2.6).
+    let profile_changed = pre_patch_doc != doc;
+    if profile_changed {
+        let profile_changes = compute_profile_changes(&pre_patch_doc, &doc, &patch, is_json_patch);
+        let notify_profile = updated.clone();
+        let server_uri = nrf_self_uri().to_string();
+        tokio::spawn(async move {
+            if let Err(e) = nrf_nnrf_nfm_send_nf_profile_changed_notify_all_async(
+                &notify_profile,
+                &server_uri,
+                profile_changes,
+            )
+            .await
+            {
+                log::error!("Failed to send NF_PROFILE_CHANGED notifications: {e}");
+            }
+        });
+    }
+
+    // A heartbeat on a SUSPENDED NF restores it to REGISTERED (TS 29.510).
+    // The status transition is always a material change — notify regardless
+    // of whether other fields changed (nrfd-02 reactivate path).
     if manager.reactivate(nf_instance_id) {
         log::info!("NF {nf_instance_id} heartbeat received while SUSPENDED, back to REGISTERED");
+        // Build the status-change ChangeItem from the reactivation.
+        let reactivate_changes = vec![ChangeItem {
+            op: "replace".to_string(),
+            path: "/nfStatus".to_string(),
+            value: Some(serde_json::json!("REGISTERED")),
+            orig_value: Some(serde_json::json!("SUSPENDED")),
+        }];
+        // Re-fetch the now-REGISTERED profile so the body is accurate.
+        let reactivated_profile = manager.get(nf_instance_id).unwrap_or_else(|| updated.clone());
+        let server_uri2 = nrf_self_uri().to_string();
+        tokio::spawn(async move {
+            if let Err(e) = nrf_nnrf_nfm_send_nf_profile_changed_notify_all_async(
+                &reactivated_profile,
+                &server_uri2,
+                reactivate_changes,
+            )
+            .await
+            {
+                log::error!("Failed to send NF_PROFILE_CHANGED (reactivate) notifications: {e}");
+            }
+        });
     }
 
     // Re-read so the response reflects the live nfStatus after reactivation.
@@ -2034,5 +2163,206 @@ mod tests {
             !cfg.require_oauth2,
             "the NRF server must not gate its own token/jwks endpoints"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // nrfd-02: NF_PROFILE_CHANGED on NFUpdate (TS 29.510 §5.2.2.3/§5.2.2.6)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_nrfd_02_compute_changes_from_json_patch_replace() {
+        use serde_json::json;
+        let pre = json!({"nfInstanceId": "a", "nfType": "SMF", "nfStatus": "REGISTERED", "load": 40});
+        let patch = json!([
+            {"op": "test",    "path": "/nfStatus", "value": "REGISTERED"},
+            {"op": "replace", "path": "/load",     "value": 75}
+        ]);
+        let mut post = pre.clone();
+        apply_json_patch(&mut post, &patch).unwrap();
+
+        let changes = compute_profile_changes(&pre, &post, &patch, true);
+        // "test" op must be filtered out — only the replace survives.
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].op, "replace");
+        assert_eq!(changes[0].path, "/load");
+        assert_eq!(changes[0].value, Some(json!(75)));
+        assert_eq!(changes[0].orig_value, Some(json!(40)));
+    }
+
+    #[test]
+    fn test_nrfd_02_compute_changes_from_json_patch_add() {
+        use serde_json::json;
+        let pre = json!({"nfInstanceId": "a", "nfType": "SMF", "nfStatus": "REGISTERED"});
+        let patch = json!([{"op": "add", "path": "/load", "value": 12}]);
+        let mut post = pre.clone();
+        apply_json_patch(&mut post, &patch).unwrap();
+
+        let changes = compute_profile_changes(&pre, &post, &patch, true);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].op, "add");
+        assert_eq!(changes[0].path, "/load");
+        assert_eq!(changes[0].value, Some(json!(12)));
+        assert!(changes[0].orig_value.is_none());
+    }
+
+    #[test]
+    fn test_nrfd_02_compute_changes_from_merge_patch_replace_and_add() {
+        use serde_json::json;
+        let pre =
+            json!({"nfInstanceId": "a", "nfType": "SMF", "nfStatus": "REGISTERED", "load": 40});
+        let patch = json!({"load": 70, "priority": 3});
+        let mut post = pre.clone();
+        json_merge_patch(&mut post, &patch);
+
+        let mut changes = compute_profile_changes(&pre, &post, &patch, false);
+        // Sort for determinism
+        changes.sort_by(|a, b| a.path.cmp(&b.path));
+
+        assert_eq!(changes.len(), 2);
+        let load = changes.iter().find(|c| c.path == "/load").unwrap();
+        assert_eq!(load.op, "replace");
+        assert_eq!(load.value, Some(json!(70)));
+        assert_eq!(load.orig_value, Some(json!(40)));
+
+        let prio = changes.iter().find(|c| c.path == "/priority").unwrap();
+        assert_eq!(prio.op, "add");
+        assert_eq!(prio.value, Some(json!(3)));
+        assert!(prio.orig_value.is_none());
+    }
+
+    #[test]
+    fn test_nrfd_02_compute_changes_from_merge_patch_null_is_remove() {
+        use serde_json::json;
+        let pre =
+            json!({"nfInstanceId": "a", "nfType": "SMF", "nfStatus": "REGISTERED", "fqdn": "smf.example.com"});
+        let patch = json!({"fqdn": null});
+        let mut post = pre.clone();
+        json_merge_patch(&mut post, &patch);
+
+        let changes = compute_profile_changes(&pre, &post, &patch, false);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].op, "remove");
+        assert_eq!(changes[0].path, "/fqdn");
+        assert_eq!(
+            changes[0].orig_value,
+            Some(json!("smf.example.com"))
+        );
+        assert!(changes[0].value.is_none());
+    }
+
+    /// Register an NF + a matching subscriber, apply a load PATCH via the
+    /// sync notify path, and assert that NF_PROFILE_CHANGED with the correct
+    /// `profileChanges` payload is dispatched to the subscriber.
+    #[test]
+    fn test_nrfd_02_profile_changed_notify_dispatched_on_patch() {
+        use nextgcore_nrfd::{
+            nrf_nnrf_nfm_send_nf_profile_changed_notify_all, SubscriptionData,
+        };
+        use nextgcore_nrfd::nnrf_handler::SubscrCond;
+        use serde_json::json;
+
+        // Build an NF profile.
+        let profile = NfProfile::from_json(&json!({
+            "nfInstanceId": "nrfd02-test-nf-01",
+            "nfType": "SMF",
+            "nfStatus": "REGISTERED",
+            "load": 40,
+        }))
+        .unwrap();
+
+        // Build a subscription that matches this NF type.
+        let subscription = SubscriptionData {
+            id: "nrfd02-sub-01".to_string(),
+            req_nf_type: Some("AMF".to_string()),
+            req_nf_instance_id: None,
+            notification_uri: "http://amf.example.com/nrfd02/notify".to_string(),
+            subscr_cond: Some(SubscrCond {
+                nf_type: Some("SMF".to_string()),
+                service_name: None,
+                nf_instance_id: None,
+            }),
+            validity_duration: 3600,
+        };
+
+        // Simulate a PATCH replacing /load.
+        let pre = profile.to_json();
+        let patch = json!([{"op": "replace", "path": "/load", "value": 75}]);
+        let mut post = pre.clone();
+        apply_json_patch(&mut post, &patch).unwrap();
+        let updated = NfProfile::from_json(&post).unwrap();
+
+        let changes = compute_profile_changes(&pre, &post, &patch, true);
+        assert_eq!(changes.len(), 1, "one change item for /load replace");
+
+        // Dispatch via the sync stub (no real HTTP, always returns Success).
+        let result = nrf_nnrf_nfm_send_nf_profile_changed_notify_all(
+            &updated,
+            "http://nrf.example.com",
+            &[subscription],
+            changes,
+        );
+        assert!(result.is_ok(), "dispatch must succeed: {result:?}");
+        assert_eq!(result.unwrap(), 1, "exactly one notification dispatched");
+    }
+
+    /// Assert that the SUSPENDED→REGISTERED reactivate path produces a
+    /// NF_PROFILE_CHANGED ChangeItem with nfStatus replace op.
+    #[test]
+    fn test_nrfd_02_reactivate_change_item_shape() {
+        use serde_json::json;
+
+        // The reactivate path in handle_nf_update always constructs this fixed ChangeItem.
+        let reactivate_changes = vec![ChangeItem {
+            op: "replace".to_string(),
+            path: "/nfStatus".to_string(),
+            value: Some(json!("REGISTERED")),
+            orig_value: Some(json!("SUSPENDED")),
+        }];
+
+        assert_eq!(reactivate_changes[0].op, "replace");
+        assert_eq!(reactivate_changes[0].path, "/nfStatus");
+        assert_eq!(reactivate_changes[0].value, Some(json!("REGISTERED")));
+        assert_eq!(reactivate_changes[0].orig_value, Some(json!("SUSPENDED")));
+
+        // Verify it serializes correctly into a NF_PROFILE_CHANGED body.
+        use nextgcore_nrfd::{nrf_nnrf_nfm_build_nf_profile_changed_notify, SubscriptionData};
+        use nextgcore_nrfd::nnrf_handler::SubscrCond;
+
+        let profile = NfProfile::from_json(&json!({
+            "nfInstanceId": "nrfd02-reactivate-nf",
+            "nfType": "AMF",
+            "nfStatus": "REGISTERED",
+        }))
+        .unwrap();
+
+        let subscription = SubscriptionData {
+            id: "nrfd02-reactivate-sub".to_string(),
+            req_nf_type: Some("SMF".to_string()),
+            req_nf_instance_id: None,
+            notification_uri: "http://smf.example.com/nrfd02/notify".to_string(),
+            subscr_cond: Some(SubscrCond {
+                nf_type: Some("AMF".to_string()),
+                service_name: None,
+                nf_instance_id: None,
+            }),
+            validity_duration: 3600,
+        };
+
+        let request = nrf_nnrf_nfm_build_nf_profile_changed_notify(
+            &subscription,
+            &profile,
+            "http://nrf.example.com",
+            reactivate_changes,
+        )
+        .expect("builder must produce a request");
+
+        let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+        assert_eq!(body["event"], "NF_PROFILE_CHANGED");
+        let pc = body["profileChanges"].as_array().unwrap();
+        assert_eq!(pc.len(), 1);
+        assert_eq!(pc[0]["op"], "replace");
+        assert_eq!(pc[0]["path"], "/nfStatus");
+        assert_eq!(pc[0]["newValue"], "REGISTERED");
+        assert_eq!(pc[0]["origValue"], "SUSPENDED");
     }
 }

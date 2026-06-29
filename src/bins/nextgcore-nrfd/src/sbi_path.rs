@@ -2,7 +2,10 @@
 //!
 //! Port of src/nrf/sbi-path.c - SBI server open/close and notification sending
 
-use crate::nnrf_build::{nrf_nnrf_nfm_build_nf_status_notify, NotificationEventType};
+use crate::nnrf_build::{
+    nrf_nnrf_nfm_build_nf_profile_changed_notify, nrf_nnrf_nfm_build_nf_status_notify,
+    ChangeItem, NotificationEventType,
+};
 use crate::nnrf_handler::{nf_manager, NfProfile, SubscriptionData};
 use ogs_sbi::client::{SbiClient, SbiClientConfig};
 use ogs_sbi::message::SbiRequest;
@@ -191,6 +194,79 @@ pub enum NotifySendResult {
     NoClient,
 }
 
+/// Send a pre-built notify request over HTTP/2 to the subscriber URI.
+/// Shared by all async single-subscriber send functions.
+async fn dispatch_notify_request_async(
+    notify_request: &crate::nnrf_build::SbiNotifyRequest,
+    nf_instance_id: &str,
+    notification_uri: &str,
+    req_nf_type: Option<&str>,
+    event_str: &str,
+) -> NotifySendResult {
+    log::debug!(
+        "Sending NF status notify to {} (event={}, nf_instance={})",
+        notify_request.uri,
+        event_str,
+        nf_instance_id
+    );
+
+    let (host, port, path, scheme) = match parse_notification_uri(&notify_request.uri) {
+        Some(parts) => parts,
+        None => {
+            log::error!("Failed to parse notification URI: {}", notify_request.uri);
+            return NotifySendResult::Failed(format!(
+                "Invalid notification URI: {}",
+                notify_request.uri
+            ));
+        }
+    };
+
+    let client_config = SbiClientConfig::new(&host, port).with_scheme(scheme);
+    let client = SbiClient::new(client_config);
+    let target = req_nf_type
+        .and_then(nf_type_from_str)
+        .unwrap_or(NfType::Amf);
+    let client = attach_oauth2(client, target);
+
+    let sbi_request = SbiRequest::post(&path)
+        .with_header("Content-Type", &notify_request.content_type)
+        .with_header("Accept", &notify_request.accept)
+        .with_body(notify_request.body.clone(), &notify_request.content_type);
+
+    match client.send_request(sbi_request).await {
+        Ok(response) => {
+            let status = response.status;
+            if status == 204 || (200..300).contains(&status) {
+                log::info!(
+                    "NF status notify delivered: {} -> {} ({}) [HTTP {}]",
+                    nf_instance_id,
+                    notification_uri,
+                    event_str,
+                    status
+                );
+                NotifySendResult::Success
+            } else {
+                log::warn!(
+                    "NF status notify rejected: {} -> {} ({}) [HTTP {}]",
+                    nf_instance_id,
+                    notification_uri,
+                    event_str,
+                    status
+                );
+                NotifySendResult::Failed(format!("HTTP {status}"))
+            }
+        }
+        Err(e) => {
+            log::error!(
+                "Failed to deliver NF status notify to {}: {}",
+                notification_uri,
+                e
+            );
+            NotifySendResult::Failed(e.to_string())
+        }
+    }
+}
+
 /// Send NF status notify to a single subscriber (async version)
 ///
 /// Builds and sends an NF status notification to the subscriber's callback URI
@@ -201,7 +277,6 @@ pub async fn nrf_nnrf_nfm_send_nf_status_notify_async(
     nf_instance: &NfProfile,
     server_uri: &str,
 ) -> NotifySendResult {
-    // Build the notification request
     let notify_request = match nrf_nnrf_nfm_build_nf_status_notify(
         subscription_data,
         event,
@@ -215,76 +290,45 @@ pub async fn nrf_nnrf_nfm_send_nf_status_notify_async(
         }
     };
 
-    log::debug!(
-        "Sending NF status notify to {} (event={:?}, nf_instance={})",
-        notify_request.uri,
-        event,
-        nf_instance.nf_instance_id
-    );
+    dispatch_notify_request_async(
+        &notify_request,
+        &nf_instance.nf_instance_id,
+        &subscription_data.notification_uri,
+        subscription_data.req_nf_type.as_deref(),
+        event.as_str(),
+    )
+    .await
+}
 
-    // Parse the notification URI to extract host and port
-    let (host, port, path, scheme) = match parse_notification_uri(&notify_request.uri) {
-        Some(parts) => parts,
+/// Send an NF_PROFILE_CHANGED notification carrying `profile_changes` to a
+/// single subscriber (async version, TS 29.510 §5.2.2.6).
+pub async fn nrf_nnrf_nfm_send_nf_profile_changed_notify_async(
+    subscription_data: &SubscriptionData,
+    nf_instance: &NfProfile,
+    server_uri: &str,
+    profile_changes: Vec<ChangeItem>,
+) -> NotifySendResult {
+    let notify_request = match nrf_nnrf_nfm_build_nf_profile_changed_notify(
+        subscription_data,
+        nf_instance,
+        server_uri,
+        profile_changes,
+    ) {
+        Some(req) => req,
         None => {
-            log::error!("Failed to parse notification URI: {}", notify_request.uri);
-            return NotifySendResult::Failed(format!(
-                "Invalid notification URI: {}",
-                notify_request.uri
-            ));
+            log::error!("nrf_nnrf_nfm_build_nf_profile_changed_notify() failed");
+            return NotifySendResult::Failed("Failed to build profile-changed notification".to_string());
         }
     };
 
-    // Build an SBI client for the subscriber endpoint, attaching an
-    // NRF-issued Bearer token scoped to the subscriber's NF type when SBI
-    // OAuth2 is enabled (no-op otherwise).
-    let client_config = SbiClientConfig::new(&host, port).with_scheme(scheme);
-    let client = SbiClient::new(client_config);
-    let target = subscription_data
-        .req_nf_type
-        .as_deref()
-        .and_then(nf_type_from_str)
-        .unwrap_or(NfType::Amf);
-    let client = attach_oauth2(client, target);
-
-    // Build the SBI request
-    let sbi_request = SbiRequest::post(&path)
-        .with_header("Content-Type", &notify_request.content_type)
-        .with_header("Accept", &notify_request.accept)
-        .with_body(notify_request.body.clone(), &notify_request.content_type);
-
-    // Send the notification
-    match client.send_request(sbi_request).await {
-        Ok(response) => {
-            let status = response.status;
-            if status == 204 || (200..300).contains(&status) {
-                log::info!(
-                    "NF status notify delivered: {} -> {} ({}) [HTTP {}]",
-                    nf_instance.nf_instance_id,
-                    subscription_data.notification_uri,
-                    event.as_str(),
-                    status
-                );
-                NotifySendResult::Success
-            } else {
-                log::warn!(
-                    "NF status notify rejected: {} -> {} ({}) [HTTP {}]",
-                    nf_instance.nf_instance_id,
-                    subscription_data.notification_uri,
-                    event.as_str(),
-                    status
-                );
-                NotifySendResult::Failed(format!("HTTP {status}"))
-            }
-        }
-        Err(e) => {
-            log::error!(
-                "Failed to deliver NF status notify to {}: {}",
-                subscription_data.notification_uri,
-                e
-            );
-            NotifySendResult::Failed(e.to_string())
-        }
-    }
+    dispatch_notify_request_async(
+        &notify_request,
+        &nf_instance.nf_instance_id,
+        &subscription_data.notification_uri,
+        subscription_data.req_nf_type.as_deref(),
+        NotificationEventType::NfProfileChanged.as_str(),
+    )
+    .await
 }
 
 /// Send NF status notify to a single subscriber (sync stub for backward compat)
@@ -403,6 +447,103 @@ pub async fn nrf_nnrf_nfm_send_nf_status_notify_all_async(
         sent_count,
         nf_instance.nf_instance_id,
         event
+    );
+
+    Ok(sent_count)
+}
+
+/// Send NF_PROFILE_CHANGED notifications to all matching subscribers (async).
+///
+/// Mirrors `nrf_nnrf_nfm_send_nf_status_notify_all_async` but carries the
+/// RFC 6902-style `profileChanges` list in the body (TS 29.510 §5.2.2.6).
+pub async fn nrf_nnrf_nfm_send_nf_profile_changed_notify_all_async(
+    nf_instance: &NfProfile,
+    server_uri: &str,
+    profile_changes: Vec<ChangeItem>,
+) -> Result<u32, String> {
+    let manager = nf_manager();
+    let subscriptions = manager.list_subscriptions();
+    let mut sent_count = 0u32;
+
+    for subscription in &subscriptions {
+        if !subscription_matches(subscription, nf_instance) {
+            continue;
+        }
+
+        match nrf_nnrf_nfm_send_nf_profile_changed_notify_async(
+            subscription,
+            nf_instance,
+            server_uri,
+            profile_changes.clone(),
+        )
+        .await
+        {
+            NotifySendResult::Success => {
+                sent_count += 1;
+            }
+            NotifySendResult::Failed(err) => {
+                log::error!(
+                    "Failed to send NF_PROFILE_CHANGED notify to {}: {}",
+                    subscription.notification_uri,
+                    err
+                );
+                // Continue to remaining subscribers.
+            }
+            NotifySendResult::NoClient => {
+                log::warn!("No client for subscription {}", subscription.id);
+            }
+        }
+    }
+
+    log::info!(
+        "Sent {} NF_PROFILE_CHANGED notifications for {}",
+        sent_count,
+        nf_instance.nf_instance_id
+    );
+
+    Ok(sent_count)
+}
+
+/// Send NF_PROFILE_CHANGED notifications to a provided subscriber list (sync
+/// stub, used in unit tests — mirrors the existing sync all function).
+pub fn nrf_nnrf_nfm_send_nf_profile_changed_notify_all(
+    nf_instance: &NfProfile,
+    server_uri: &str,
+    subscriptions: &[SubscriptionData],
+    profile_changes: Vec<ChangeItem>,
+) -> Result<u32, String> {
+    let mut sent_count = 0u32;
+
+    for subscription in subscriptions {
+        if !subscription_matches(subscription, nf_instance) {
+            continue;
+        }
+
+        let notify_request = nrf_nnrf_nfm_build_nf_profile_changed_notify(
+            subscription,
+            nf_instance,
+            server_uri,
+            profile_changes.clone(),
+        );
+        match notify_request {
+            Some(_) => {
+                log::info!(
+                    "NF_PROFILE_CHANGED notify queued: {} -> {}",
+                    nf_instance.nf_instance_id,
+                    subscription.notification_uri
+                );
+                sent_count += 1;
+            }
+            None => {
+                return Err("Failed to build NF_PROFILE_CHANGED notification".to_string());
+            }
+        }
+    }
+
+    log::info!(
+        "Sent {} NF_PROFILE_CHANGED notifications for {}",
+        sent_count,
+        nf_instance.nf_instance_id
     );
 
     Ok(sent_count)

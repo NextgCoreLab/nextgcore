@@ -33,11 +33,15 @@ pub use nnrf_handler::{
 
 // Re-export build types
 pub use nnrf_build::{
-    nrf_nnrf_nfm_build_nf_status_notify, NotificationData, NotificationEventType, SbiNotifyRequest,
+    nrf_nnrf_nfm_build_nf_profile_changed_notify, nrf_nnrf_nfm_build_nf_status_notify,
+    ChangeItem, NotificationData, NotificationEventType, SbiNotifyRequest,
 };
 
 // Re-export SBI path functions
 pub use sbi_path::{
+    nrf_nnrf_nfm_send_nf_profile_changed_notify_all,
+    nrf_nnrf_nfm_send_nf_profile_changed_notify_all_async,
+    nrf_nnrf_nfm_send_nf_profile_changed_notify_async,
     nrf_nnrf_nfm_send_nf_status_notify, nrf_nnrf_nfm_send_nf_status_notify_all,
     nrf_nnrf_nfm_send_nf_status_notify_all_async, nrf_nnrf_nfm_send_nf_status_notify_async,
     nrf_sbi_close, nrf_sbi_is_running, nrf_sbi_open, SbiServer, SbiServerConfig,
