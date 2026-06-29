@@ -173,6 +173,38 @@ impl NotificationMethod {
     }
 }
 
+/// TS 29.520 `MatchingDirection` — the direction in which a measured analytic
+/// must cross a threshold for a `THRESHOLD` event to fire (nwafd-07).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchingDirection {
+    /// `ASCENDING` — fire when the value rises to/above the threshold.
+    Ascending,
+    /// `DESCENDING` — fire when the value falls to/below the threshold.
+    Descending,
+    /// `CROSSED` — fire when the value crosses the threshold in either
+    /// direction relative to the previously observed value.
+    Crossed,
+}
+
+impl MatchingDirection {
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "ASCENDING" => Some(Self::Ascending),
+            "DESCENDING" => Some(Self::Descending),
+            "CROSSED" => Some(Self::Crossed),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ascending => "ASCENDING",
+            Self::Descending => "DESCENDING",
+            Self::Crossed => "CROSSED",
+        }
+    }
+}
+
 /// One entry of TS 29.520 `NnwdafEventsSubscription.eventSubscriptions[]`
 /// (`EventSubscription`).
 #[derive(Debug, Clone)]
@@ -205,6 +237,16 @@ impl EventSubscription {
             matching_dir: None,
             snssais: Vec::new(),
         }
+    }
+
+    /// The parsed `matchingDir` (nwafd-07); defaults to `ASCENDING` when the
+    /// consumer omitted it or sent an unrecognised token, mirroring the common
+    /// 3GPP default for threshold reporting.
+    pub fn matching_direction(&self) -> MatchingDirection {
+        self.matching_dir
+            .as_deref()
+            .and_then(MatchingDirection::from_wire)
+            .unwrap_or(MatchingDirection::Ascending)
     }
 }
 
@@ -338,57 +380,40 @@ impl AnalyticsSubscription {
     }
 }
 
-/// ML model status
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MlModelStatus {
-    /// Model is being trained
-    Training,
-    /// Model is trained and ready for inference
-    Deployed,
-    /// Model is being evaluated
-    Evaluating,
-    /// Model is inactive
-    Inactive,
-}
-
-/// ML model information for analytics
+/// Stored Nnwdaf_MLModelProvision subscription (TS 29.520 `NwdafMLModelProvSubsc`).
+///
+/// nwafd-05: the bespoke REST `/models` registry was removed in favour of the
+/// spec Subscribe/Notify resource. A consumer (e.g. an AnLF) subscribes for ML
+/// model availability for one or more `NwdafEvent`s; the NWDAF delivers an
+/// `NwdafMLModelProvNotif` callback carrying the model file address(es).
 #[derive(Debug, Clone)]
-pub struct MlModelInfo {
-    /// Unique model ID
-    pub model_id: String,
-    /// Analytics type this model supports
-    pub analytics_id: AnalyticsId,
-    /// Model version
-    pub version: String,
-    /// Model accuracy (0.0 - 1.0)
-    pub accuracy: f64,
-    /// Model status
-    pub status: MlModelStatus,
-    /// Training data count
-    pub training_samples: usize,
-    /// Last update timestamp
-    pub updated_at: u64,
+pub struct MlProvSubscription {
+    /// Unique subscription ID (`{subscriptionId}` in the resource URI).
+    pub subscription_id: String,
+    /// Consumer callback URI (`notifUri`, mandatory).
+    pub notif_uri: String,
+    /// Notification correlation ID (`notifCorreId`, optional — spec casing).
+    pub notif_corr_id: Option<String>,
+    /// Subscribed ML events (`mLEventSubscs[].mLEvent`, minItems 1).
+    pub ml_events: Vec<AnalyticsId>,
+    /// Whether the (one-shot, "model available") callback has been dispatched.
+    pub notified: bool,
 }
 
-impl MlModelInfo {
-    pub fn new(model_id: String, analytics_id: AnalyticsId, version: String) -> Self {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("value expected")
-            .as_secs();
+impl MlProvSubscription {
+    pub fn new(
+        subscription_id: String,
+        notif_uri: String,
+        notif_corr_id: Option<String>,
+        ml_events: Vec<AnalyticsId>,
+    ) -> Self {
         Self {
-            model_id,
-            analytics_id,
-            version,
-            accuracy: 0.0,
-            status: MlModelStatus::Training,
-            training_samples: 0,
-            updated_at: now,
+            subscription_id,
+            notif_uri,
+            notif_corr_id,
+            ml_events,
+            notified: false,
         }
-    }
-
-    pub fn is_deployed(&self) -> bool {
-        self.status == MlModelStatus::Deployed
     }
 }
 
@@ -411,8 +436,13 @@ pub struct NwdafContext {
     pub nf_instance_id: String,
     /// Analytics subscriptions (subscription_id -> subscription)
     analytics_subscriptions: RwLock<HashMap<String, AnalyticsSubscription>>,
-    /// ML models (model_id -> model_info)
-    ml_models: RwLock<HashMap<String, MlModelInfo>>,
+    /// Nnwdaf_MLModelProvision subscriptions (subscription_id -> subscription)
+    ml_prov_subscriptions: RwLock<HashMap<String, MlProvSubscription>>,
+    /// Last observed analytic level per `(subscription_id, event)`, keyed
+    /// `"{sub_id}\u{1f}{EVENT_TOKEN}"`. Drives THRESHOLD edge detection
+    /// (nwafd-07) so `CROSSED`/`ASCENDING`/`DESCENDING` can compare against the
+    /// previous value rather than re-firing on every cycle.
+    event_levels: RwLock<HashMap<String, f64>>,
     /// Data sources (nf_instance_id -> source)
     data_sources: RwLock<HashMap<String, DataSource>>,
     /// Next internal ID generator
@@ -428,7 +458,8 @@ impl NwdafContext {
         Self {
             nf_instance_id,
             analytics_subscriptions: RwLock::new(HashMap::new()),
-            ml_models: RwLock::new(HashMap::new()),
+            ml_prov_subscriptions: RwLock::new(HashMap::new()),
+            event_levels: RwLock::new(HashMap::new()),
             data_sources: RwLock::new(HashMap::new()),
             next_id: AtomicUsize::new(1),
             max_subscriptions: 0,
@@ -456,8 +487,11 @@ impl NwdafContext {
         if let Ok(mut subs) = self.analytics_subscriptions.write() {
             subs.clear();
         }
-        if let Ok(mut models) = self.ml_models.write() {
-            models.clear();
+        if let Ok(mut subs) = self.ml_prov_subscriptions.write() {
+            subs.clear();
+        }
+        if let Ok(mut levels) = self.event_levels.write() {
+            levels.clear();
         }
         if let Ok(mut sources) = self.data_sources.write() {
             sources.clear();
@@ -521,48 +555,89 @@ impl NwdafContext {
             .expect("value expected")
     }
 
-    /// Register an ML model
-    pub fn register_model(&self, model: MlModelInfo) -> Option<String> {
-        let mut models = self.ml_models.write().ok()?;
-        let model_id = model.model_id.clone();
-        models.insert(model_id.clone(), model);
-        log::info!("ML model registered: {model_id}");
-        Some(model_id)
+    /// Add an Nnwdaf_MLModelProvision subscription (nwafd-05).
+    pub fn add_ml_prov_subscription(&self, sub: MlProvSubscription) -> Option<String> {
+        let mut subs = self.ml_prov_subscriptions.write().ok()?;
+        if subs.len() >= self.max_subscriptions {
+            log::error!(
+                "Maximum ML-provision subscriptions [{}] reached",
+                self.max_subscriptions
+            );
+            return None;
+        }
+        let id = sub.subscription_id.clone();
+        subs.insert(id.clone(), sub);
+        log::info!("ML-provision subscription added: {id}");
+        Some(id)
     }
 
-    /// Get ML model by ID
-    pub fn get_model(&self, model_id: &str) -> Option<MlModelInfo> {
-        self.ml_models.read().ok()?.get(model_id).cloned()
-    }
-
-    /// Get all deployed models for a specific analytics type
-    pub fn get_deployed_models(&self, analytics_id: AnalyticsId) -> Vec<MlModelInfo> {
-        self.ml_models
+    /// Get an Nnwdaf_MLModelProvision subscription by ID.
+    pub fn get_ml_prov_subscription(&self, subscription_id: &str) -> Option<MlProvSubscription> {
+        self.ml_prov_subscriptions
             .read()
-            .map(|models| {
-                models
-                    .values()
-                    .filter(|m| m.analytics_id == analytics_id && m.is_deployed())
-                    .cloned()
-                    .collect()
-            })
-            .expect("value expected")
+            .ok()?
+            .get(subscription_id)
+            .cloned()
     }
 
-    /// Update ML model status
-    pub fn update_model_status(&self, model_id: &str, status: MlModelStatus) -> bool {
-        if let Ok(mut models) = self.ml_models.write() {
-            if let Some(model) = models.get_mut(model_id) {
-                model.status = status;
-                model.updated_at = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("value expected")
-                    .as_secs();
-                log::info!("ML model {model_id} status updated to {status:?}");
+    /// Replace an existing ML-provision subscription (PUT). Returns false if the
+    /// subscription does not exist (so the handler can answer 404).
+    pub fn update_ml_prov_subscription(&self, sub: MlProvSubscription) -> bool {
+        if let Ok(mut subs) = self.ml_prov_subscriptions.write() {
+            if let std::collections::hash_map::Entry::Occupied(mut e) =
+                subs.entry(sub.subscription_id.clone())
+            {
+                e.insert(sub);
                 return true;
             }
         }
         false
+    }
+
+    /// Remove an ML-provision subscription (DELETE).
+    pub fn remove_ml_prov_subscription(&self, subscription_id: &str) -> Option<MlProvSubscription> {
+        let mut subs = self.ml_prov_subscriptions.write().ok()?;
+        subs.remove(subscription_id)
+    }
+
+    /// All ML-provision subscriptions that have not yet had their (one-shot)
+    /// "model available" callback dispatched. Used by the dispatcher.
+    pub fn get_pending_ml_prov_subscriptions(&self) -> Vec<MlProvSubscription> {
+        self.ml_prov_subscriptions
+            .read()
+            .map(|subs| subs.values().filter(|s| !s.notified).cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Mark an ML-provision subscription's callback as delivered.
+    pub fn mark_ml_prov_notified(&self, subscription_id: &str) {
+        if let Ok(mut subs) = self.ml_prov_subscriptions.write() {
+            if let Some(sub) = subs.get_mut(subscription_id) {
+                sub.notified = true;
+            }
+        }
+    }
+
+    pub fn ml_prov_subscription_count(&self) -> usize {
+        self.ml_prov_subscriptions
+            .read()
+            .map(|s| s.len())
+            .unwrap_or(0)
+    }
+
+    /// Last observed analytic level for a `(subscription, event)` pair, or
+    /// `None` if this is the first observation (nwafd-07 edge detection).
+    pub fn get_event_level(&self, subscription_id: &str, event: AnalyticsId) -> Option<f64> {
+        let key = format!("{subscription_id}\u{1f}{}", event.as_str());
+        self.event_levels.read().ok()?.get(&key).copied()
+    }
+
+    /// Record the latest observed analytic level for a `(subscription, event)`.
+    pub fn set_event_level(&self, subscription_id: &str, event: AnalyticsId, level: f64) {
+        let key = format!("{subscription_id}\u{1f}{}", event.as_str());
+        if let Ok(mut levels) = self.event_levels.write() {
+            levels.insert(key, level);
+        }
     }
 
     /// Add a data source
@@ -614,10 +689,6 @@ impl NwdafContext {
             .read()
             .map(|s| s.len())
             .unwrap_or(0)
-    }
-
-    pub fn model_count(&self) -> usize {
-        self.ml_models.read().map(|m| m.len()).unwrap_or(0)
     }
 
     pub fn data_source_count(&self) -> usize {
@@ -758,37 +829,73 @@ mod tests {
         assert_eq!(ctx.subscription_count(), 0);
     }
 
+    /// nwafd-05: ML-provision subscriptions are stored, updated and removed
+    /// through the dedicated Subscribe/Notify store (no bespoke `/models`
+    /// registry remains).
     #[test]
-    fn test_register_model() {
+    fn test_ml_prov_subscription_crud() {
         let mut ctx = NwdafContext::new("nwdaf-test".to_string());
         ctx.init(100);
 
-        let model = MlModelInfo::new(
-            "model-1".to_string(),
-            AnalyticsId::UeMobility,
-            "v1.0".to_string(),
+        let sub = MlProvSubscription::new(
+            "mlsub-1".to_string(),
+            "http://anlf.local/ml-notify".to_string(),
+            Some("corr-1".to_string()),
+            vec![AnalyticsId::NfLoad, AnalyticsId::UeMobility],
         );
+        let id = ctx.add_ml_prov_subscription(sub).unwrap();
+        assert_eq!(id, "mlsub-1");
+        assert_eq!(ctx.ml_prov_subscription_count(), 1);
 
-        let model_id = ctx.register_model(model).unwrap();
-        assert_eq!(model_id, "model-1");
-        assert_eq!(ctx.model_count(), 1);
+        // Update (PUT) replaces the events; updating a missing id returns false.
+        let updated = MlProvSubscription::new(
+            "mlsub-1".to_string(),
+            "http://anlf.local/ml-notify".to_string(),
+            Some("corr-1".to_string()),
+            vec![AnalyticsId::NfLoad],
+        );
+        assert!(ctx.update_ml_prov_subscription(updated));
+        assert_eq!(
+            ctx.get_ml_prov_subscription("mlsub-1").unwrap().ml_events.len(),
+            1
+        );
+        let absent = MlProvSubscription::new(
+            "nope".to_string(),
+            "http://x/y".to_string(),
+            None,
+            vec![AnalyticsId::NfLoad],
+        );
+        assert!(!ctx.update_ml_prov_subscription(absent));
+
+        assert!(ctx.remove_ml_prov_subscription("mlsub-1").is_some());
+        assert_eq!(ctx.ml_prov_subscription_count(), 0);
     }
 
+    /// nwafd-07: per-(subscription, event) level state round-trips and is keyed
+    /// so different events on the same subscription do not collide.
     #[test]
-    fn test_update_model_status() {
-        let mut ctx = NwdafContext::new("nwdaf-test".to_string());
-        ctx.init(100);
+    fn test_event_level_state() {
+        let ctx = NwdafContext::new("nwdaf-test".to_string());
+        assert_eq!(ctx.get_event_level("s1", AnalyticsId::NfLoad), None);
+        ctx.set_event_level("s1", AnalyticsId::NfLoad, 42.0);
+        ctx.set_event_level("s1", AnalyticsId::UeMobility, 7.0);
+        assert_eq!(ctx.get_event_level("s1", AnalyticsId::NfLoad), Some(42.0));
+        assert_eq!(ctx.get_event_level("s1", AnalyticsId::UeMobility), Some(7.0));
+        assert_eq!(ctx.get_event_level("s2", AnalyticsId::NfLoad), None);
+    }
 
-        let model = MlModelInfo::new(
-            "model-1".to_string(),
-            AnalyticsId::UeMobility,
-            "v1.0".to_string(),
-        );
-        ctx.register_model(model);
-
-        assert!(ctx.update_model_status("model-1", MlModelStatus::Deployed));
-        let updated = ctx.get_model("model-1").unwrap();
-        assert_eq!(updated.status, MlModelStatus::Deployed);
+    /// nwafd-07: `matchingDir` parses to the typed enum and defaults to
+    /// ASCENDING when omitted or unrecognised.
+    #[test]
+    fn test_matching_direction_default() {
+        let mut e = EventSubscription::periodic(AnalyticsId::NfLoad);
+        assert_eq!(e.matching_direction(), MatchingDirection::Ascending);
+        e.matching_dir = Some("DESCENDING".to_string());
+        assert_eq!(e.matching_direction(), MatchingDirection::Descending);
+        e.matching_dir = Some("CROSSED".to_string());
+        assert_eq!(e.matching_direction(), MatchingDirection::Crossed);
+        e.matching_dir = Some("bogus".to_string());
+        assert_eq!(e.matching_direction(), MatchingDirection::Ascending);
     }
 
     #[test]

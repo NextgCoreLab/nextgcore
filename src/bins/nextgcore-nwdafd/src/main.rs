@@ -24,7 +24,6 @@ pub mod federation;
 pub mod ml_service;
 pub mod notification_dispatcher;
 mod sbi_handler;
-pub mod subscription;
 
 pub use context::*;
 pub use sbi_handler::*;
@@ -224,14 +223,16 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "subscriptions/{id}"),
         },
 
-        // Nnwdaf_MLModelProvision service
-        ["nnwdaf-mlmodelprovision", "v1", "models"] => match method {
-            "POST" => handle_model_provision(&request).await,
-            _ => send_method_not_allowed(method, "models"),
+        // Nnwdaf_MLModelProvision service — TS 29.520 is a Subscribe/Notify
+        // resource on /subscriptions (there is no /models resource).
+        ["nnwdaf-mlmodelprovision", "v1", "subscriptions"] => match method {
+            "POST" => handle_ml_prov_subscription_create(&request).await,
+            _ => send_method_not_allowed(method, "subscriptions"),
         },
-        ["nnwdaf-mlmodelprovision", "v1", "models", model_id] => match method {
-            "GET" => handle_model_get(model_id).await,
-            _ => send_method_not_allowed(method, "models/{id}"),
+        ["nnwdaf-mlmodelprovision", "v1", "subscriptions", subscription_id] => match method {
+            "PUT" => handle_ml_prov_subscription_update(subscription_id, &request).await,
+            "DELETE" => handle_ml_prov_subscription_delete(subscription_id).await,
+            _ => send_method_not_allowed(method, "subscriptions/{id}"),
         },
 
         _ => send_not_found(&format!("Resource not found: {path}"), None),
@@ -276,6 +277,14 @@ async fn register_with_nrf(
             {
                 "serviceInstanceId": format!("{}-nnwdaf-analyticsinfo", nf_instance_id),
                 "serviceName": "nnwdaf-analyticsinfo",
+                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
+                "scheme": "http",
+                "nfServiceStatus": "REGISTERED",
+                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+            },
+            {
+                "serviceInstanceId": format!("{}-nnwdaf-mlmodelprovision", nf_instance_id),
+                "serviceName": "nnwdaf-mlmodelprovision",
                 "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
                 "scheme": "http",
                 "nfServiceStatus": "REGISTERED",
@@ -389,6 +398,32 @@ mod tests {
         let req = SbiRequest::get("/nnwdaf-analyticsinfo/v1/analytics?event-id=NF_LOAD");
         let resp = nwdaf_sbi_request_handler(req).await;
         assert_eq!(resp.status, 200, "GET /analytics?event-id=NF_LOAD must be 200");
+    }
+
+    // --- nwafd-05: Nnwdaf_MLModelProvision is Subscribe/Notify, not /models ---
+
+    #[tokio::test]
+    async fn test_routing_mlmodelprovision_models_gone() {
+        // The bespoke /models registry resource no longer exists → 404.
+        let req = SbiRequest::post("/nnwdaf-mlmodelprovision/v1/models");
+        let resp = nwdaf_sbi_request_handler(req).await;
+        assert_eq!(resp.status, 404, "the /models resource must be removed");
+    }
+
+    #[tokio::test]
+    async fn test_routing_mlmodelprovision_subscriptions_post_routed() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+        let req = SbiRequest::post("/nnwdaf-mlmodelprovision/v1/subscriptions")
+            .with_json_body(&serde_json::json!({
+                "notifUri": "http://anlf.local/cb",
+                "mLEventSubscs": [ { "mLEvent": "NF_LOAD" } ]
+            }))
+            .expect("valid JSON body");
+        let resp = nwdaf_sbi_request_handler(req).await;
+        assert_eq!(
+            resp.status, 201,
+            "POST /nnwdaf-mlmodelprovision/v1/subscriptions must reach the create handler"
+        );
     }
 
     #[tokio::test]

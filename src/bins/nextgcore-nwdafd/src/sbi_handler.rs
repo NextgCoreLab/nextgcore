@@ -3,7 +3,7 @@
 //! Implements Nnwdaf SBI services (TS 23.288):
 //! - Nnwdaf_AnalyticsInfo: Analytics query and retrieval
 //! - Nnwdaf_EventsSubscription: Analytics subscription management
-//! - Nnwdaf_MLModelProvision: ML model training and deployment info
+//! - Nnwdaf_MLModelProvision: ML model provision Subscribe/Notify (nwafd-05)
 
 use crate::analytics::AnalyticsEngine;
 use crate::context::*;
@@ -405,109 +405,131 @@ pub async fn handle_subscription_delete(subscription_id: &str) -> SbiResponse {
     }
 }
 
-/// Handle ML model provisioning (registration)
-pub async fn handle_model_provision(request: &SbiRequest) -> SbiResponse {
-    log::info!("ML Model Provision");
+// ── Nnwdaf_MLModelProvision: Subscribe/Notify (nwafd-05, TS 29.520) ──────────
 
+/// Parse the request body of an ML-provision subscription POST/PUT into JSON.
+/// On failure returns a small `(detail, cause)` pair the caller turns into a
+/// 400 `ProblemDetails` (keeps the `Err` variant tiny — `clippy::result_large_err`).
+fn ml_prov_request_json(
+    request: &SbiRequest,
+) -> Result<serde_json::Value, (&'static str, &'static str)> {
     let body = match &request.http.content {
         Some(content) => content,
-        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+        None => return Err(("Missing request body", "MISSING_BODY")),
+    };
+    serde_json::from_str(body).map_err(|_| ("Invalid request body JSON", "INVALID_JSON"))
+}
+
+/// Handle `POST /nnwdaf-mlmodelprovision/v1/subscriptions`.
+///
+/// TS 29.520 `NwdafMLModelProvSubsc`: requires `notifUri` and a non-empty
+/// `mLEventSubscs[]`. On success returns 201 with a `Location` header pointing
+/// at `/nnwdaf-mlmodelprovision/v1/subscriptions/{subscriptionId}` and echoes
+/// the subscription representation. There is no `/models` resource.
+pub async fn handle_ml_prov_subscription_create(request: &SbiRequest) -> SbiResponse {
+    log::info!("ML Model Provision subscribe");
+
+    let data = match ml_prov_request_json(request) {
+        Ok(d) => d,
+        Err((detail, cause)) => return send_bad_request(detail, Some(cause)),
     };
 
-    let data: serde_json::Value = match serde_json::from_str(body) {
+    let parsed = match crate::ml_service::parse_ml_model_prov_subsc(&data) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+        Err(detail) => return send_bad_request(&detail, Some("MANDATORY_IE_MISSING")),
     };
 
-    let analytics_type = data
-        .get("analyticsId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let analytics_id = match AnalyticsId::from_str(analytics_type) {
-        Some(id) => id,
-        None => {
-            return send_bad_request(
-                &format!("Invalid analytics type: {analytics_type}"),
-                Some("INVALID_ANALYTICS_TYPE"),
-            )
-        }
-    };
-
-    let model_id = data.get("modelId").and_then(|v| v.as_str()).unwrap_or("");
-    let version = data
-        .get("version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("v1.0");
-
-    let final_model_id = if model_id.is_empty() {
-        format!("model-{}", uuid::Uuid::new_v4())
-    } else {
-        model_id.to_string()
-    };
-
-    let mut model = MlModelInfo::new(final_model_id.clone(), analytics_id, version.to_string());
-
-    if let Some(accuracy) = data.get("accuracy").and_then(|v| v.as_f64()) {
-        model.accuracy = accuracy;
-    }
-
-    if let Some(samples) = data.get("trainingSamples").and_then(|v| v.as_u64()) {
-        model.training_samples = samples as usize;
-    }
+    let subscription_id = format!("mlsub-{}", uuid::Uuid::new_v4());
+    let sub = MlProvSubscription::new(
+        subscription_id.clone(),
+        parsed.notif_uri,
+        parsed.notif_corr_id,
+        parsed.ml_events,
+    );
 
     let ctx = nwdaf_self();
     let result = if let Ok(context) = ctx.read() {
-        context.register_model(model)
+        context.add_ml_prov_subscription(sub.clone())
     } else {
         None
     };
 
     match result {
-        Some(mid) => SbiResponse::with_status(201)
+        Some(sub_id) => SbiResponse::with_status(201)
             .with_header(
                 "Location",
-                format!("/nnwdaf-mlmodelprovision/v1/models/{mid}"),
+                format!("/nnwdaf-mlmodelprovision/v1/subscriptions/{sub_id}"),
             )
-            .with_json_body(&serde_json::json!({
-                "modelId": mid,
-                "analyticsId": analytics_type,
-                "version": version,
-                "status": "TRAINING",
-            }))
+            .with_json_body(&crate::ml_service::ml_prov_subsc_json(&sub))
             .unwrap_or_else(|_| SbiResponse::with_status(201)),
         None => send_bad_request(
-            "Failed to register model",
-            Some("MODEL_REGISTRATION_FAILED"),
+            "Failed to create ML-provision subscription",
+            Some("SUBSCRIPTION_FAILED"),
         ),
     }
 }
 
-/// Handle ML model status retrieval
-pub async fn handle_model_get(model_id: &str) -> SbiResponse {
-    log::debug!("Get model: {model_id}");
+/// Handle `PUT /nnwdaf-mlmodelprovision/v1/subscriptions/{id}` — replace an
+/// existing ML-provision subscription. 200 + representation on success, 404 if
+/// the subscription is unknown.
+pub async fn handle_ml_prov_subscription_update(
+    subscription_id: &str,
+    request: &SbiRequest,
+) -> SbiResponse {
+    log::info!("ML Model Provision update: {subscription_id}");
+
+    let data = match ml_prov_request_json(request) {
+        Ok(d) => d,
+        Err((detail, cause)) => return send_bad_request(detail, Some(cause)),
+    };
+
+    let parsed = match crate::ml_service::parse_ml_model_prov_subsc(&data) {
+        Ok(p) => p,
+        Err(detail) => return send_bad_request(&detail, Some("MANDATORY_IE_MISSING")),
+    };
+
+    let sub = MlProvSubscription::new(
+        subscription_id.to_string(),
+        parsed.notif_uri,
+        parsed.notif_corr_id,
+        parsed.ml_events,
+    );
 
     let ctx = nwdaf_self();
-    let model = if let Ok(context) = ctx.read() {
-        context.get_model(model_id)
+    let updated = if let Ok(context) = ctx.read() {
+        context.update_ml_prov_subscription(sub.clone())
+    } else {
+        false
+    };
+
+    if updated {
+        SbiResponse::with_status(200)
+            .with_json_body(&crate::ml_service::ml_prov_subsc_json(&sub))
+            .unwrap_or_else(|_| SbiResponse::with_status(200))
+    } else {
+        send_not_found(
+            &format!("ML-provision subscription {subscription_id} not found"),
+            Some("SUBSCRIPTION_NOT_FOUND"),
+        )
+    }
+}
+
+/// Handle `DELETE /nnwdaf-mlmodelprovision/v1/subscriptions/{id}`.
+pub async fn handle_ml_prov_subscription_delete(subscription_id: &str) -> SbiResponse {
+    log::info!("ML Model Provision delete: {subscription_id}");
+
+    let ctx = nwdaf_self();
+    let removed = if let Ok(context) = ctx.read() {
+        context.remove_ml_prov_subscription(subscription_id)
     } else {
         None
     };
 
-    match model {
-        Some(m) => SbiResponse::with_status(200)
-            .with_json_body(&serde_json::json!({
-                "modelId": m.model_id,
-                "analyticsId": m.analytics_id.as_str(),
-                "version": m.version,
-                "accuracy": m.accuracy,
-                "status": format!("{:?}", m.status),
-                "trainingSamples": m.training_samples,
-                "updatedAt": m.updated_at,
-            }))
-            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+    match removed {
+        Some(_) => SbiResponse::with_status(204),
         None => send_not_found(
-            &format!("Model {model_id} not found"),
-            Some("MODEL_NOT_FOUND"),
+            &format!("ML-provision subscription {subscription_id} not found"),
+            Some("SUBSCRIPTION_NOT_FOUND"),
         ),
     }
 }
@@ -722,5 +744,119 @@ mod tests {
             body.get("notificationUri").is_none(),
             "GET body must not carry the legacy lowercase notificationUri key"
         );
+    }
+
+    // ── nwafd-05: Nnwdaf_MLModelProvision Subscribe/Notify ────────────────────
+
+    /// POST a conformant `NwdafMLModelProvSubsc` → 201, a Location pointing at
+    /// the `/subscriptions/{id}` resource (never `/models`), and a body echoing
+    /// the `NwdafMLModelProvSubsc` representation.
+    #[tokio::test]
+    async fn test_ml_prov_subscribe_201() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+
+        let req = SbiRequest::post("/nnwdaf-mlmodelprovision/v1/subscriptions")
+            .with_json_body(&json!({
+                "notifUri": "http://anlf.example.org/ml-cb",
+                "notifCorreId": "corr-ml-1",
+                "mLEventSubscs": [
+                    { "mLEvent": "NF_LOAD", "mLEventFilter": {} }
+                ]
+            }))
+            .expect("valid JSON body");
+
+        let resp = handle_ml_prov_subscription_create(&req).await;
+        assert_eq!(resp.status, 201, "conformant ML-prov subscribe must be 201");
+
+        let location = resp
+            .http
+            .get_header("Location")
+            .expect("201 must carry a Location header");
+        assert!(
+            location.starts_with("/nnwdaf-mlmodelprovision/v1/subscriptions/"),
+            "Location must point at the subscriptions collection, got {location}"
+        );
+        assert!(
+            !location.contains("/models"),
+            "the bespoke /models resource must be gone"
+        );
+
+        let body = body_json(&resp);
+        assert_eq!(
+            body.get("notifUri").and_then(|v| v.as_str()),
+            Some("http://anlf.example.org/ml-cb")
+        );
+        assert_eq!(
+            body.get("notifCorreId").and_then(|v| v.as_str()),
+            Some("corr-ml-1")
+        );
+        let events = body
+            .get("mLEventSubscs")
+            .and_then(|v| v.as_array())
+            .expect("mLEventSubscs echoed as an array");
+        assert_eq!(events[0].get("mLEvent").and_then(|v| v.as_str()), Some("NF_LOAD"));
+    }
+
+    /// Missing `notifUri` (a required IE) → 400.
+    #[tokio::test]
+    async fn test_ml_prov_subscribe_missing_notif_uri_400() {
+        let req = SbiRequest::post("/nnwdaf-mlmodelprovision/v1/subscriptions")
+            .with_json_body(&json!({
+                "mLEventSubscs": [ { "mLEvent": "NF_LOAD" } ]
+            }))
+            .expect("valid JSON body");
+        let resp = handle_ml_prov_subscription_create(&req).await;
+        assert_eq!(resp.status, 400, "missing notifUri must be a 400");
+    }
+
+    /// PUT updates an existing subscription (200) and 404s an unknown id;
+    /// DELETE removes it (204) then 404s.
+    #[tokio::test]
+    async fn test_ml_prov_update_and_delete() {
+        nwdaf_context_init("nwdaf-test".to_string(), 1024);
+
+        let create = SbiRequest::post("/nnwdaf-mlmodelprovision/v1/subscriptions")
+            .with_json_body(&json!({
+                "notifUri": "http://anlf.example.org/ml-cb",
+                "mLEventSubscs": [ { "mLEvent": "NF_LOAD" } ]
+            }))
+            .expect("valid JSON body");
+        let create_resp = handle_ml_prov_subscription_create(&create).await;
+        assert_eq!(create_resp.status, 201);
+        let sub_id = body_json(&create_resp)["subscriptionId"]
+            .as_str()
+            .expect("subscriptionId")
+            .to_string();
+
+        // PUT a known id → 200 + updated representation.
+        let put = SbiRequest::put(format!(
+            "/nnwdaf-mlmodelprovision/v1/subscriptions/{sub_id}"
+        ))
+        .with_json_body(&json!({
+            "notifUri": "http://anlf.example.org/ml-cb2",
+            "mLEventSubscs": [ { "mLEvent": "UE_MOBILITY" } ]
+        }))
+        .expect("valid JSON body");
+        let put_resp = handle_ml_prov_subscription_update(&sub_id, &put).await;
+        assert_eq!(put_resp.status, 200);
+        let put_body = body_json(&put_resp);
+        assert_eq!(
+            put_body["notifUri"].as_str(),
+            Some("http://anlf.example.org/ml-cb2")
+        );
+
+        // PUT an unknown id → 404.
+        let put_missing = SbiRequest::put("/nnwdaf-mlmodelprovision/v1/subscriptions/nope")
+            .with_json_body(&json!({
+                "notifUri": "http://x/y",
+                "mLEventSubscs": [ { "mLEvent": "NF_LOAD" } ]
+            }))
+            .expect("valid JSON body");
+        let put_missing_resp = handle_ml_prov_subscription_update("nope", &put_missing).await;
+        assert_eq!(put_missing_resp.status, 404);
+
+        // DELETE the known id → 204, then 404 on the second attempt.
+        assert_eq!(handle_ml_prov_subscription_delete(&sub_id).await.status, 204);
+        assert_eq!(handle_ml_prov_subscription_delete(&sub_id).await.status, 404);
     }
 }

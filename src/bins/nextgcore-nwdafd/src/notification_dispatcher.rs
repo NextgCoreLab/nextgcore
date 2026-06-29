@@ -30,16 +30,20 @@
 //! `NwdafContext::update_subscription_last_notification()` so that
 //! `repetition_period_secs` is honoured on the next cycle.
 //!
-//! # Threshold conditions
+//! # Threshold conditions (nwafd-07)
 //!
-//! Threshold-based triggering (e.g. fire only when CPU > 0.8) is **not yet
-//! wired** — the dispatcher fires on periodicity only (remediation item
-//! nwafd-07).  `EventSubscription` already carries `load_level_threshold` /
-//! `matching_dir`; a future pass should evaluate those against the analytics
-//! output here and skip the POST when the threshold is not crossed.
+//! When an event's `notificationMethod` is `THRESHOLD`, the dispatcher evaluates
+//! the computed analytic against the subscription's `load_level_threshold` and
+//! `matchingDir` ([`threshold_crossed`]) and only includes that event in the
+//! notification when the threshold is crossed. The previous level is held in the
+//! context per `(subscription, event)` so `ASCENDING`/`DESCENDING`/`CROSSED` are
+//! edge-triggered rather than re-firing every cycle. `PERIODIC` events are
+//! unaffected and always reported on their period.
 
 use crate::analytics::{AnalyticsEngine, NfLoadSample};
-use crate::context::{AnalyticsId, AnalyticsSubscription, NwdafContext};
+use crate::context::{
+    AnalyticsId, AnalyticsSubscription, MatchingDirection, NotificationMethod, NwdafContext,
+};
 use ogs_sbi::client::{SbiClient, SbiClientConfig};
 use serde_json::{json, Map, Value};
 use std::sync::{Arc, RwLock};
@@ -94,11 +98,58 @@ pub(crate) fn parse_notify_uri(uri: &str) -> Option<(String, u16, String)> {
 // Client factory (mirrors namf_server.rs:693-698)
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn notify_client(host: &str, port: u16) -> SbiClient {
+pub(crate) fn notify_client(host: &str, port: u16) -> SbiClient {
     let config = SbiClientConfig::new(host, port)
         .with_connect_timeout(Duration::from_secs(NOTIFY_CONNECT_TIMEOUT_SECS))
         .with_request_timeout(Duration::from_secs(NOTIFY_REQUEST_TIMEOUT_SECS));
     SbiClient::new(config)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// nwafd-07: THRESHOLD evaluation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// TS 29.520 THRESHOLD predicate. Returns `true` when `current` satisfies the
+/// crossing condition for `threshold` under `dir`, given the previously observed
+/// level `previous` (`None` on the first observation).
+///
+/// - `ASCENDING`: fires on the rising edge to/above the threshold.
+/// - `DESCENDING`: fires on the falling edge to/below the threshold.
+/// - `CROSSED`: fires whenever the value moves across the threshold in either
+///   direction relative to `previous`.
+pub fn threshold_crossed(
+    previous: Option<f64>,
+    current: f64,
+    threshold: f64,
+    dir: MatchingDirection,
+) -> bool {
+    match dir {
+        MatchingDirection::Ascending => {
+            current >= threshold && previous.is_none_or(|p| p < threshold)
+        }
+        MatchingDirection::Descending => {
+            current <= threshold && previous.is_none_or(|p| p > threshold)
+        }
+        MatchingDirection::Crossed => match previous {
+            Some(p) => (p < threshold) != (current < threshold),
+            None => current >= threshold,
+        },
+    }
+}
+
+/// Extract the scalar level (0–100) used for THRESHOLD evaluation from a
+/// previously-computed per-event `*Infos` array. Only `NF_LOAD` exposes such a
+/// scalar today (`nfLoadLevelAverage`); other events return `None`, so a
+/// THRESHOLD subscription on them cannot be evaluated and is suppressed.
+fn extract_level(event: AnalyticsId, infos: &Value) -> Option<f64> {
+    match event {
+        AnalyticsId::NfLoad => infos
+            .as_array()?
+            .first()?
+            .get("nfLoadLevelAverage")?
+            .as_f64(),
+        _ => None,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -154,21 +205,50 @@ pub fn compute_event_infos(engine: &mut AnalyticsEngine, event: AnalyticsId) -> 
 /// Build the TS 29.520 `eventNotifications[]` array for a subscription: one
 /// `EventNotification` per subscribed event, each carrying `event`,
 /// `start`/`expiry` and the event-specific `*Infos` array.
-fn build_event_notifications(engine: &mut AnalyticsEngine, sub: &AnalyticsSubscription) -> Vec<Value> {
+///
+/// nwafd-07: events whose `notificationMethod` is `THRESHOLD` are only emitted
+/// when their computed analytic crosses the configured threshold in the
+/// configured `matchingDir`; the previous level is read from / written back to
+/// `ctx` so the crossing is edge-triggered. `PERIODIC` (and unspecified) events
+/// are always emitted.
+fn build_event_notifications(
+    ctx: &NwdafContext,
+    engine: &mut AnalyticsEngine,
+    sub: &AnalyticsSubscription,
+) -> Vec<Value> {
     let now = chrono::Utc::now();
     let start = now.to_rfc3339();
     let expiry = (now + chrono::Duration::seconds(3600)).to_rfc3339();
 
     sub.events
         .iter()
-        .map(|e| {
+        .filter_map(|e| {
             let infos = compute_event_infos(engine, e.event);
+
+            // THRESHOLD gate (nwafd-07).
+            if e.notification_method == Some(NotificationMethod::Threshold) {
+                let measured = extract_level(e.event, &infos);
+                let threshold = e.load_level_threshold.map(|t| t as f64);
+                match (measured, threshold) {
+                    (Some(m), Some(th)) => {
+                        let prev = ctx.get_event_level(&sub.subscription_id, e.event);
+                        ctx.set_event_level(&sub.subscription_id, e.event, m);
+                        if !threshold_crossed(prev, m, th, e.matching_direction()) {
+                            return None;
+                        }
+                    }
+                    // No computable metric or no configured threshold → the
+                    // THRESHOLD condition cannot be evaluated; suppress.
+                    _ => return None,
+                }
+            }
+
             let mut obj = Map::new();
             obj.insert("event".to_string(), json!(e.event.as_str()));
             obj.insert("start".to_string(), json!(start));
             obj.insert("expiry".to_string(), json!(expiry));
             obj.insert(e.event.infos_key().to_string(), infos);
-            Value::Object(obj)
+            Some(Value::Object(obj))
         })
         .collect()
 }
@@ -225,7 +305,13 @@ pub async fn dispatch_notifications(ctx: Arc<RwLock<NwdafContext>>) {
             continue;
         }
 
-        let event_notifications = build_event_notifications(&mut engine, sub);
+        let event_notifications = match ctx.read() {
+            Ok(guard) => build_event_notifications(&guard, &mut engine, sub),
+            Err(e) => {
+                log::error!("dispatch_notifications: failed to read context: {e}");
+                continue;
+            }
+        };
         if event_notifications.is_empty() {
             log::debug!(
                 "dispatch: no events to report for subscription {}",
@@ -277,6 +363,60 @@ pub async fn dispatch_notifications(ctx: Arc<RwLock<NwdafContext>>) {
                     sub.notification_uri
                 );
             }
+        }
+    }
+
+    // nwafd-05: deliver pending Nnwdaf_MLModelProvision callbacks.
+    dispatch_ml_prov_notifications(ctx).await;
+}
+
+/// Deliver the one-shot "model available" `Nnwdaf_MLModelProvision` callbacks.
+///
+/// For each subscription that has not yet been notified, POST an array of
+/// `NwdafMLModelProvNotif` (built by [`crate::ml_service::build_ml_model_prov_notif_body`])
+/// to its `notifUri` and, on success, mark it delivered so it is not re-sent.
+/// This reuses the same URI parsing + client plumbing as the analytics path.
+async fn dispatch_ml_prov_notifications(ctx: Arc<RwLock<NwdafContext>>) {
+    let pending = match ctx.read() {
+        Ok(guard) => guard.get_pending_ml_prov_subscriptions(),
+        Err(e) => {
+            log::error!("dispatch_ml_prov_notifications: failed to read context: {e}");
+            return;
+        }
+    };
+
+    for sub in &pending {
+        let body = crate::ml_service::build_ml_model_prov_notif_body(sub);
+
+        let (host, port, path) = match parse_notify_uri(&sub.notif_uri) {
+            Some(t) => t,
+            None => {
+                log::warn!(
+                    "dispatch: invalid ML-prov notifUri '{}' for sub={}",
+                    sub.notif_uri,
+                    sub.subscription_id
+                );
+                continue;
+            }
+        };
+
+        let client = notify_client(&host, port);
+        match client.post_json(&path, &body).await {
+            Ok(resp) if resp.is_success() => {
+                if let Ok(guard) = ctx.read() {
+                    guard.mark_ml_prov_notified(&sub.subscription_id);
+                }
+            }
+            Ok(resp) => log::warn!(
+                "dispatch: ML-prov notify non-success status={} sub={}",
+                resp.status,
+                sub.subscription_id
+            ),
+            Err(e) => log::warn!(
+                "dispatch: ML-prov notify POST failed sub={} uri={}: {e}",
+                sub.subscription_id,
+                sub.notif_uri
+            ),
         }
     }
 }
@@ -357,7 +497,7 @@ mod tests {
         let sub = ctx.get_subscription(&sub_id).unwrap();
 
         let mut engine = AnalyticsEngine::new();
-        let event_notifications = build_event_notifications(&mut engine, &sub);
+        let event_notifications = build_event_notifications(&ctx, &mut engine, &sub);
         let body = build_notify_body(&sub, event_notifications);
 
         assert_eq!(
@@ -537,5 +677,86 @@ mod tests {
         let (ctx_arc, _sub_id) = make_ctx_with_sub("not-a-valid-uri", Some(60));
         // Should complete without panicking
         dispatch_notifications(ctx_arc).await;
+    }
+
+    // ── nwafd-07: THRESHOLD evaluation ───────────────────────────────────────
+
+    /// The pure predicate honours every `matchingDir` and is edge-triggered.
+    #[test]
+    fn test_threshold_predicate_directions() {
+        // ASCENDING: fires only on the rising edge to/above the threshold.
+        assert!(!threshold_crossed(None, 30.0, 80.0, MatchingDirection::Ascending));
+        assert!(threshold_crossed(None, 90.0, 80.0, MatchingDirection::Ascending));
+        // Already above → no re-fire.
+        assert!(!threshold_crossed(Some(90.0), 95.0, 80.0, MatchingDirection::Ascending));
+
+        // DESCENDING: fires on the falling edge to/below the threshold.
+        assert!(threshold_crossed(None, 30.0, 80.0, MatchingDirection::Descending));
+        assert!(!threshold_crossed(None, 90.0, 80.0, MatchingDirection::Descending));
+
+        // CROSSED: fires on a crossing in either direction, not otherwise.
+        assert!(threshold_crossed(Some(30.0), 90.0, 80.0, MatchingDirection::Crossed));
+        assert!(threshold_crossed(Some(90.0), 30.0, 80.0, MatchingDirection::Crossed));
+        assert!(!threshold_crossed(Some(85.0), 95.0, 80.0, MatchingDirection::Crossed));
+    }
+
+    /// A THRESHOLD event is suppressed below its threshold and emitted at/above
+    /// it; a PERIODIC event is unaffected. The synthetic NF load is ≈30
+    /// (cpu 0.3 × 100).
+    #[test]
+    fn test_threshold_event_gating_vs_periodic() {
+        use crate::context::EventSubscription;
+
+        let ctx = NwdafContext::new("nwdaf-test".to_string());
+        let mut engine = AnalyticsEngine::new();
+
+        let thr_event = |threshold: u64| EventSubscription {
+            event: AnalyticsId::NfLoad,
+            notification_method: Some(NotificationMethod::Threshold),
+            rep_period_secs: None,
+            load_level_threshold: Some(threshold),
+            matching_dir: Some("ASCENDING".to_string()),
+            snssais: Vec::new(),
+        };
+
+        // Threshold 80 > load ≈30 → suppressed (no event reported).
+        let mut sub_high = AnalyticsSubscription::new(
+            "sub-high".into(),
+            AnalyticsId::NfLoad,
+            "http://x/y".into(),
+            u64::MAX,
+        );
+        sub_high.events = vec![thr_event(80)];
+        assert!(
+            build_event_notifications(&ctx, &mut engine, &sub_high).is_empty(),
+            "THRESHOLD must not fire when load (≈30) is below threshold 80"
+        );
+
+        // Threshold 20 ≤ load ≈30 → fires (one EventNotification).
+        let mut sub_low = AnalyticsSubscription::new(
+            "sub-low".into(),
+            AnalyticsId::NfLoad,
+            "http://x/y".into(),
+            u64::MAX,
+        );
+        sub_low.events = vec![thr_event(20)];
+        assert_eq!(
+            build_event_notifications(&ctx, &mut engine, &sub_low).len(),
+            1,
+            "THRESHOLD must fire when load (≈30) is at/above threshold 20"
+        );
+
+        // PERIODIC (the default from `new`) is unaffected by thresholds.
+        let sub_periodic = AnalyticsSubscription::new(
+            "sub-per".into(),
+            AnalyticsId::NfLoad,
+            "http://x/y".into(),
+            u64::MAX,
+        );
+        assert_eq!(
+            build_event_notifications(&ctx, &mut engine, &sub_periodic).len(),
+            1,
+            "PERIODIC subscription must always report"
+        );
     }
 }
