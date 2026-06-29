@@ -1178,17 +1178,22 @@ impl PcfContext {
     }
 
     pub fn ue_sm_remove(&self, id: u64) -> Option<PcfUeSm> {
-        let mut ue_sm_list = self.ue_sm_list.write().ok()?;
-        let mut supi_sm_hash = self.supi_sm_hash.write().ok()?;
-
-        if let Some(ue_sm) = ue_sm_list.remove(&id) {
+        // Remove the UE-SM under the ue_sm_list/supi_sm_hash guards, then DROP
+        // them before touching sess_list. Holding ue_sm_list while acquiring
+        // sess_list (via sess_remove_all_for_ue) inverts the canonical
+        // sess_list -> ue_sm_list order used by sess_add/sess_remove and
+        // deadlocks under concurrent SBI requests (AB-BA lock inversion).
+        let ue_sm = {
+            let mut ue_sm_list = self.ue_sm_list.write().ok()?;
+            let mut supi_sm_hash = self.supi_sm_hash.write().ok()?;
+            let ue_sm = ue_sm_list.remove(&id)?;
             supi_sm_hash.remove(&ue_sm.supi);
-            // Remove all sessions for this UE
-            self.sess_remove_all_for_ue(id);
-            log::debug!("[{}] PCF UE SM removed (id={})", ue_sm.supi, id);
-            return Some(ue_sm);
-        }
-        None
+            ue_sm
+        };
+        // Guards released: safe to take sess_list in the canonical order.
+        self.sess_remove_all_for_ue(id);
+        log::debug!("[{}] PCF UE SM removed (id={})", ue_sm.supi, id);
+        Some(ue_sm)
     }
 
     pub fn ue_sm_remove_all(&self) {
@@ -1395,9 +1400,14 @@ impl PcfContext {
     // App session management
 
     pub fn app_add(&self, sess_id: u64) -> Option<PcfApp> {
+        // Canonical lock order is sess_list before app_list: sess_remove holds
+        // sess_list then takes app_list (via app_remove_all_for_sess), so
+        // app_add/app_remove MUST take sess_list first too — acquiring app_list
+        // then sess_list here would deadlock against a concurrent sess_remove
+        // (AB-BA lock inversion).
+        let mut sess_list = self.sess_list.write().ok()?;
         let mut app_list = self.app_list.write().ok()?;
         let mut app_session_id_hash = self.app_session_id_hash.write().ok()?;
-        let mut sess_list = self.sess_list.write().ok()?;
 
         let id = self.next_app_id.fetch_add(1, Ordering::SeqCst) as u64;
         let app = PcfApp::new(id, sess_id);
@@ -1415,9 +1425,10 @@ impl PcfContext {
     }
 
     pub fn app_remove(&self, id: u64) -> Option<PcfApp> {
+        // Canonical lock order: sess_list before app_list (see app_add).
+        let mut sess_list = self.sess_list.write().ok()?;
         let mut app_list = self.app_list.write().ok()?;
         let mut app_session_id_hash = self.app_session_id_hash.write().ok()?;
-        let mut sess_list = self.sess_list.write().ok()?;
 
         if let Some(app) = app_list.remove(&id) {
             app_session_id_hash.remove(&app.app_session_id);
