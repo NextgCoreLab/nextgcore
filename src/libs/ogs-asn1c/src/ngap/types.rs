@@ -134,10 +134,12 @@ impl ProtocolIeId {
     pub const GLOBAL_RAN_NODE_ID: Self = Self(27);
     pub const GUAMI: Self = Self(28);
     pub const NAS_PDU: Self = Self(38);
+    pub const NRPPA_PDU: Self = Self(46);
     pub const PLMN_SUPPORT_LIST: Self = Self(80);
     pub const RAN_NODE_NAME: Self = Self(82);
     pub const RAN_UE_NGAP_ID: Self = Self(85);
     pub const RELATIVE_AMF_CAPACITY: Self = Self(86);
+    pub const ROUTING_ID: Self = Self(89);
     pub const SERVED_GUAMI_LIST: Self = Self(96);
     pub const SUPPORTED_TA_LIST: Self = Self(102);
     pub const TIME_TO_WAIT: Self = Self(107);

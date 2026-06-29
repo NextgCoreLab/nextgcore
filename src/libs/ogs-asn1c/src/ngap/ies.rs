@@ -272,6 +272,67 @@ impl AperDecode for NasPdu {
     }
 }
 
+/// NRPPa-PDU - the opaque NRPPa payload carried transparently between gNB and
+/// AMF inside the NRPPa-transport NGAP messages (TS 38.413 §9.3.x).
+/// ASN.1: NRPPa-PDU ::= OCTET STRING
+///
+/// The NGAP layer NEVER decodes this — it carries the raw bytes produced by the
+/// NRPPa codec (`crate::nrppa`) and hands them off verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NrppaPdu(pub Vec<u8>);
+
+impl NrppaPdu {
+    pub fn new(data: Vec<u8>) -> Self {
+        Self(data)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AperEncode for NrppaPdu {
+    fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()> {
+        encoder.encode_octet_string(&self.0, None, None)
+    }
+}
+
+impl AperDecode for NrppaPdu {
+    fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
+        let data = decoder.decode_octet_string(None, None)?;
+        Ok(NrppaPdu(data))
+    }
+}
+
+/// RoutingID - opaque routing identifier selecting the LMF for an NRPPa
+/// transaction (TS 38.413 §9.3.x).
+/// ASN.1: RoutingID ::= OCTET STRING
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RoutingId(pub Vec<u8>);
+
+impl RoutingId {
+    pub fn new(data: Vec<u8>) -> Self {
+        Self(data)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl AperEncode for RoutingId {
+    fn encode_aper(&self, encoder: &mut AperEncoder) -> PerResult<()> {
+        encoder.encode_octet_string(&self.0, None, None)
+    }
+}
+
+impl AperDecode for RoutingId {
+    fn decode_aper(decoder: &mut AperDecoder) -> PerResult<Self> {
+        let data = decoder.decode_octet_string(None, None)?;
+        Ok(RoutingId(data))
+    }
+}
+
 //
 // Additional typed NGAP IEs (B16.1)
 //
