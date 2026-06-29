@@ -17,6 +17,8 @@
 //! and rejected on decode if a peer sets/selects them (each deferral documented
 //! inline). The r18 `kMinus*` nr-RSTD CHOICE additions decode-error too.
 
+use bitvec::prelude::*;
+
 use crate::per::{Constraint, PerError, PerResult};
 use crate::uper::{UperDecode, UperDecoder, UperEncode, UperEncoder};
 
@@ -599,6 +601,81 @@ impl UperDecode for NrDlTdoaProvideLocationInformation {
     }
 }
 
+// ---------------------------------------------------------------------------
+// NR-DL-TDOA-RequestLocationInformation-r16 (LMF -> UE ask side)
+// ---------------------------------------------------------------------------
+
+/// NR-DL-TDOA-RequestLocationInformation-r16 ::= SEQUENCE {   -- EXTENSIBLE
+///     nr-DL-PRS-RstdMeasurementInfoRequest-r16 ENUMERATED{true} OPTIONAL, -- opt0
+///     nr-RequestedMeasurements-r16 BIT STRING {
+///         prsrsrpReq(0), firstPathRsrpReq-r17(1), dl-PRS-RSCPD-Request-r18(2)
+///       } (SIZE(1..8)),                                                    -- mandatory
+///     nr-AssistanceAvailability-r16 BOOLEAN,                              -- mandatory
+///     nr-DL-TDOA-ReportConfig-r16 OPTIONAL,                              -- opt1 UNSUPPORTED
+///     additionalPaths-r16 ENUMERATED{requested} OPTIONAL,                -- opt2
+///     ..., [[ r17 ]], [[ r18 ]] }
+///
+/// The two single-value enums (`ENUMERATED{true}` / `ENUMERATED{requested}`)
+/// carry NO content — their only signal is the OPTIONAL presence bit — so they
+/// are modeled as `bool`. `nr-DL-TDOA-ReportConfig` (opt1) is UNSUPPORTED in v1
+/// (absent on encode; rejected on decode if its presence bit is set).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NrDlTdoaRequestLocationInformation {
+    /// nr-DL-PRS-RstdMeasurementInfoRequest presence (ENUMERATED{true}).
+    pub rstd_measurement_info_request: bool,
+    /// nr-RequestedMeasurements bit map, SIZE(1..8): bit 0 = prsrsrpReq,
+    /// bit 1 = firstPathRsrpReq-r17, bit 2 = dl-PRS-RSCPD-Request-r18.
+    pub requested_measurements: BitVec<u8, Msb0>,
+    pub assistance_availability: bool,
+    /// additionalPaths presence (ENUMERATED{requested}).
+    pub additional_paths: bool,
+}
+
+impl UperEncode for NrDlTdoaRequestLocationInformation {
+    fn encode_uper(&self, encoder: &mut UperEncoder) -> PerResult<()> {
+        // 3 root optionals in declaration order:
+        // [rstdMeasurementInfoRequest, nr-DL-TDOA-ReportConfig (UNSUPPORTED),
+        //  additionalPaths].
+        encoder.encode_sequence_preamble(
+            Some(false),
+            &[
+                self.rstd_measurement_info_request,
+                false,
+                self.additional_paths,
+            ],
+        );
+        // rstdMeasurementInfoRequest: ENUMERATED{true} -> presence only, no content.
+        encoder.encode_bit_string(&self.requested_measurements, Some(1), Some(8))?;
+        encoder.write_bit(self.assistance_availability);
+        // reportConfig absent; additionalPaths: presence only, no content.
+        Ok(())
+    }
+}
+
+impl UperDecode for NrDlTdoaRequestLocationInformation {
+    fn decode_uper(decoder: &mut UperDecoder) -> PerResult<Self> {
+        let (ext, opts) = decoder.decode_sequence_preamble(true, 3)?;
+        // opts = [rstdMeasurementInfoRequest, reportConfig, additionalPaths]
+        if opts[1] {
+            return Err(PerError::DecodeError(
+                "NR-DL-TDOA-RequestLocationInformation nr-DL-TDOA-ReportConfig not supported in C5"
+                    .to_string(),
+            ));
+        }
+        let requested_measurements = decoder.decode_bit_string(Some(1), Some(8))?;
+        let assistance_availability = decoder.read_bit()?;
+        if ext {
+            decoder.decode_extension_additions()?;
+        }
+        Ok(NrDlTdoaRequestLocationInformation {
+            rstd_measurement_info_request: opts[0],
+            requested_measurements,
+            assistance_availability,
+            additional_paths: opts[2],
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,5 +832,42 @@ mod tests {
         let bytes = enc.into_bytes();
         let mut dec = UperDecoder::new(&bytes);
         assert!(NrRstd::decode_uper(&mut dec).is_err());
+    }
+
+    fn bits(values: &[bool]) -> BitVec<u8, Msb0> {
+        let mut bv: BitVec<u8, Msb0> = BitVec::new();
+        for &b in values {
+            bv.push(b);
+        }
+        bv
+    }
+
+    #[test]
+    fn rt_request_location_information() {
+        // All optionals present.
+        roundtrip(&NrDlTdoaRequestLocationInformation {
+            rstd_measurement_info_request: true,
+            requested_measurements: bits(&[true, false, true]),
+            assistance_availability: true,
+            additional_paths: true,
+        });
+        // Minimal: only the two mandatory fields.
+        roundtrip(&NrDlTdoaRequestLocationInformation {
+            rstd_measurement_info_request: false,
+            requested_measurements: bits(&[true]),
+            assistance_availability: false,
+            additional_paths: false,
+        });
+    }
+
+    #[test]
+    fn err_request_report_config_present() {
+        // Preamble ext 0 + [rstd=0, reportConfig=1, additionalPaths=0] = `0 010`.
+        // The deferred nr-DL-TDOA-ReportConfig (opt1) must be rejected.
+        let mut enc = UperEncoder::new();
+        enc.encode_sequence_preamble(Some(false), &[false, true, false]);
+        let bytes = enc.into_bytes();
+        let mut dec = UperDecoder::new(&bytes);
+        assert!(NrDlTdoaRequestLocationInformation::decode_uper(&mut dec).is_err());
     }
 }

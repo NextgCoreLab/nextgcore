@@ -22,6 +22,8 @@
 //! r17/r18 extension group are UNSUPPORTED — never emitted, rejected on decode
 //! if a peer sets/selects them (each deferral documented inline).
 
+use bitvec::prelude::*;
+
 use super::nr_dl_tdoa::{NrRstd, NrTimeStamp, NrTimingQuality};
 use crate::per::{Constraint, PerError, PerResult};
 use crate::uper::{UperDecode, UperDecoder, UperEncode, UperEncoder};
@@ -285,6 +287,131 @@ impl UperDecode for NrMultiRttProvideLocationInformation {
     }
 }
 
+// ---------------------------------------------------------------------------
+// NR-Multi-RTT-RequestLocationInformation-r16 (LMF -> UE ask side)
+// ---------------------------------------------------------------------------
+
+/// NR-Multi-RTT-ReportConfig-r16 ::= SEQUENCE {   -- NON-extensible
+///     maxDL-PRS-RxTxTimeDiffMeasPerTRP-r16 INTEGER (1..4) OPTIONAL,
+///     timingReportingGranularityFactor-r16 INTEGER (0..5) OPTIONAL }
+///
+/// Both optionals are simple constrained integers and are fully typed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NrMultiRttReportConfig {
+    pub max_dl_prs_rx_tx_time_diff_meas_per_trp: Option<u8>,
+    pub timing_reporting_granularity_factor: Option<u8>,
+}
+
+impl NrMultiRttReportConfig {
+    const MAX_MEAS: Constraint = Constraint::new(1, 4);
+    const TIMING_GRANULARITY: Constraint = Constraint::new(0, 5);
+}
+
+impl UperEncode for NrMultiRttReportConfig {
+    fn encode_uper(&self, encoder: &mut UperEncoder) -> PerResult<()> {
+        encoder.encode_sequence_preamble(
+            None,
+            &[
+                self.max_dl_prs_rx_tx_time_diff_meas_per_trp.is_some(),
+                self.timing_reporting_granularity_factor.is_some(),
+            ],
+        );
+        if let Some(max) = self.max_dl_prs_rx_tx_time_diff_meas_per_trp {
+            encoder.encode_constrained_whole_number(max as i64, &Self::MAX_MEAS)?;
+        }
+        if let Some(gran) = self.timing_reporting_granularity_factor {
+            encoder.encode_constrained_whole_number(gran as i64, &Self::TIMING_GRANULARITY)?;
+        }
+        Ok(())
+    }
+}
+
+impl UperDecode for NrMultiRttReportConfig {
+    fn decode_uper(decoder: &mut UperDecoder) -> PerResult<Self> {
+        let (_ext, opts) = decoder.decode_sequence_preamble(false, 2)?;
+        let max_dl_prs_rx_tx_time_diff_meas_per_trp = if opts[0] {
+            Some(decoder.decode_constrained_whole_number(&Self::MAX_MEAS)? as u8)
+        } else {
+            None
+        };
+        let timing_reporting_granularity_factor = if opts[1] {
+            Some(decoder.decode_constrained_whole_number(&Self::TIMING_GRANULARITY)? as u8)
+        } else {
+            None
+        };
+        Ok(NrMultiRttReportConfig {
+            max_dl_prs_rx_tx_time_diff_meas_per_trp,
+            timing_reporting_granularity_factor,
+        })
+    }
+}
+
+/// NR-Multi-RTT-RequestLocationInformation-r16 ::= SEQUENCE {   -- EXTENSIBLE
+///     nr-UE-RxTxTimeDiffMeasurementInfoRequest-r16 ENUMERATED{true} OPTIONAL, -- opt0
+///     nr-RequestedMeasurements-r16 BIT STRING {
+///         prsrsrpReq(0), firstPathRsrpReq-r17(1), dl-PRS-RSCP-Request-r18(2)
+///       } (SIZE(1..8)),                                                       -- mandatory
+///     nr-AssistanceAvailability-r16 BOOLEAN,                                 -- mandatory
+///     nr-Multi-RTT-ReportConfig-r16 NR-Multi-RTT-ReportConfig-r16,           -- MANDATORY
+///     additionalPaths-r16 ENUMERATED{requested} OPTIONAL,                    -- opt1
+///     ..., [[ r17 ]], [[ r18 ]] }
+///
+/// NOTE `nr-Multi-RTT-ReportConfig` is MANDATORY here (no presence bit) and is
+/// encoded after `nr-AssistanceAvailability`, before the optional
+/// `additionalPaths`. The two single-value enums are modeled as presence
+/// `bool`s (no content), as on the DL-TDOA request side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NrMultiRttRequestLocationInformation {
+    /// nr-UE-RxTxTimeDiffMeasurementInfoRequest presence (ENUMERATED{true}).
+    pub rx_tx_time_diff_measurement_info_request: bool,
+    /// nr-RequestedMeasurements bit map, SIZE(1..8): bit 0 = prsrsrpReq,
+    /// bit 1 = firstPathRsrpReq-r17, bit 2 = dl-PRS-RSCP-Request-r18.
+    pub requested_measurements: BitVec<u8, Msb0>,
+    pub assistance_availability: bool,
+    pub report_config: NrMultiRttReportConfig,
+    /// additionalPaths presence (ENUMERATED{requested}).
+    pub additional_paths: bool,
+}
+
+impl UperEncode for NrMultiRttRequestLocationInformation {
+    fn encode_uper(&self, encoder: &mut UperEncoder) -> PerResult<()> {
+        // 2 root optionals in declaration order: [rxTxMeasInfoRequest, additionalPaths].
+        encoder.encode_sequence_preamble(
+            Some(false),
+            &[
+                self.rx_tx_time_diff_measurement_info_request,
+                self.additional_paths,
+            ],
+        );
+        // rxTxMeasInfoRequest: ENUMERATED{true} -> presence only, no content.
+        encoder.encode_bit_string(&self.requested_measurements, Some(1), Some(8))?;
+        encoder.write_bit(self.assistance_availability);
+        self.report_config.encode_uper(encoder)?; // mandatory
+        // additionalPaths: presence only, no content.
+        Ok(())
+    }
+}
+
+impl UperDecode for NrMultiRttRequestLocationInformation {
+    fn decode_uper(decoder: &mut UperDecoder) -> PerResult<Self> {
+        let (ext, opts) = decoder.decode_sequence_preamble(true, 2)?;
+        // opts = [rxTxMeasInfoRequest, additionalPaths]
+        let requested_measurements = decoder.decode_bit_string(Some(1), Some(8))?;
+        let assistance_availability = decoder.read_bit()?;
+        let report_config = NrMultiRttReportConfig::decode_uper(decoder)?;
+        if ext {
+            decoder.decode_extension_additions()?;
+        }
+        Ok(NrMultiRttRequestLocationInformation {
+            rx_tx_time_diff_measurement_info_request: opts[0],
+            requested_measurements,
+            assistance_availability,
+            report_config,
+            additional_paths: opts[1],
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,5 +545,59 @@ mod tests {
         let bytes = enc.into_bytes();
         let mut dec = UperDecoder::new(&bytes);
         assert!(NrMultiRttSignalMeasurementInformation::decode_uper(&mut dec).is_err());
+    }
+
+    fn bits(values: &[bool]) -> BitVec<u8, Msb0> {
+        let mut bv: BitVec<u8, Msb0> = BitVec::new();
+        for &b in values {
+            bv.push(b);
+        }
+        bv
+    }
+
+    #[test]
+    fn rt_report_config() {
+        roundtrip(&NrMultiRttReportConfig {
+            max_dl_prs_rx_tx_time_diff_meas_per_trp: Some(4),
+            timing_reporting_granularity_factor: Some(5),
+        });
+        roundtrip(&NrMultiRttReportConfig {
+            max_dl_prs_rx_tx_time_diff_meas_per_trp: Some(1),
+            timing_reporting_granularity_factor: None,
+        });
+        roundtrip(&NrMultiRttReportConfig {
+            max_dl_prs_rx_tx_time_diff_meas_per_trp: None,
+            timing_reporting_granularity_factor: None,
+        });
+    }
+
+    pub(crate) fn minimal_request() -> NrMultiRttRequestLocationInformation {
+        NrMultiRttRequestLocationInformation {
+            rx_tx_time_diff_measurement_info_request: false,
+            requested_measurements: bits(&[true]),
+            assistance_availability: false,
+            report_config: NrMultiRttReportConfig {
+                max_dl_prs_rx_tx_time_diff_meas_per_trp: None,
+                timing_reporting_granularity_factor: None,
+            },
+            additional_paths: false,
+        }
+    }
+
+    #[test]
+    fn rt_request_location_information() {
+        // All optionals present + a populated report config.
+        roundtrip(&NrMultiRttRequestLocationInformation {
+            rx_tx_time_diff_measurement_info_request: true,
+            requested_measurements: bits(&[true, false, true]),
+            assistance_availability: true,
+            report_config: NrMultiRttReportConfig {
+                max_dl_prs_rx_tx_time_diff_meas_per_trp: Some(3),
+                timing_reporting_granularity_factor: Some(2),
+            },
+            additional_paths: true,
+        });
+        // Minimal: mandatory fields only, empty report config.
+        roundtrip(&minimal_request());
     }
 }

@@ -259,7 +259,8 @@ mod tests {
     };
     use crate::lpp::nr_dl_tdoa::{
         DlPrsIdInfo, NrDlTdoaMeasElement, NrDlTdoaMeasList, NrDlTdoaProvideLocationInformation,
-        NrDlTdoaSignalMeasurementInformation, NrRstd, NrSlot, NrTimeStamp, NrTimingQuality,
+        NrDlTdoaRequestLocationInformation, NrDlTdoaSignalMeasurementInformation, NrRstd, NrSlot,
+        NrTimeStamp, NrTimingQuality,
     };
     use crate::lpp::nr_multi_rtt::{
         NrMultiRttMeasElement, NrMultiRttMeasList, NrMultiRttProvideLocationInformation,
@@ -345,6 +346,8 @@ mod tests {
                                 true, true, false, false, false,
                             ]),
                         }),
+                        nr_multi_rtt: None,
+                        nr_dl_tdoa: None,
                     },
                 }),
             )),
@@ -371,6 +374,39 @@ mod tests {
                     ies: RequestLocationInformationR9 {
                         ecid: Some(EcidRequestLocationInformation {
                             requested_measurements: measurements(&[true, false, true]),
+                        }),
+                        nr_multi_rtt: None,
+                        nr_dl_tdoa: None,
+                    },
+                }),
+            )),
+        };
+        let bytes = msg.encode().unwrap();
+        assert_eq!(LppMessage::decode(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn rt_lpp_message_request_path_nr_dl_tdoa() {
+        // A full LppMessage (LMF -> UE) carrying RequestLocationInformation ->
+        // nr-DL-TDOA (the r16 extension-addition group), end to end.
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::LocationServer,
+                transaction_number: TransactionNumber(4),
+            }),
+            end_transaction: false,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(
+                MessageBodyC1::RequestLocationInformation(RequestLocationInformation {
+                    ies: RequestLocationInformationR9 {
+                        ecid: None,
+                        nr_multi_rtt: None,
+                        nr_dl_tdoa: Some(NrDlTdoaRequestLocationInformation {
+                            rstd_measurement_info_request: true,
+                            requested_measurements: measurements(&[true, false, true]),
+                            assistance_availability: true,
+                            additional_paths: false,
                         }),
                     },
                 }),
