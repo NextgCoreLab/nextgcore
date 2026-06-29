@@ -60,6 +60,9 @@ pub enum NgapIeType {
     PduResNotify,
     /// PDU session resource modify indication
     PduResModInd,
+    /// NRPPa PDU (LCS positioning, TS 23.273) — relayed transparently to the
+    /// NG-RAN over an NGAP `*NRPPaTransport` message, never a PDU-session IE.
+    Nrppa,
 }
 
 /// N1N2 message transfer request data

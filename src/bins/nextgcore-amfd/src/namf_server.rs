@@ -861,6 +861,9 @@ fn parse_ngap_ie_type(s: &str) -> Option<NgapIeType> {
         "PDU_RES_REL_CMD" => Some(NgapIeType::PduResRelCmd),
         "PDU_RES_NTY" => Some(NgapIeType::PduResNotify),
         "PDU_RES_MOD_IND" => Some(NgapIeType::PduResModInd),
+        // LCS positioning (TS 29.518 / TS 23.273): the LMF tags an NRPPa PDU
+        // carried under n2InfoContainer.nrppaInfo with this ngapIeType.
+        "NRPPA_PDU" => Some(NgapIeType::Nrppa),
         _ => None,
     }
 }
@@ -931,6 +934,128 @@ pub fn send_n1n2_failure_notification(notify_uri: String, cause: &str, n1n2_msg_
     });
 }
 
+/// LCS positioning relay (TS 23.273 §7): build the downlink wire messages for
+/// an LMF-originated `Namf_Communication_N1N2MessageTransfer` carrying NRPPa
+/// (→ serving gNB over N2) and/or LPP (→ UE over N1). Returns `Some(response)`
+/// when `body` is a positioning transfer (so the caller skips SM handling), or
+/// `None` when it is an ordinary SM transfer.
+///
+/// A positioning transfer is identified structurally: it carries
+/// `n1MessageClass == "LPP"` and/or an `n2InfoContainer.nrppaInfo`, and never an
+/// `smInfo` / `pduSessionId`. This guard runs before the SM-centric logic so
+/// that path is completely untouched (strictly additive).
+///
+/// NOTE — egress is deferred: the SCTP send to the gNB and the protected DL-NAS
+/// send to the UE are owned by the NGAP server task, not this SBI handler. That
+/// cross-task hand-off is the same one the paging N1/N2 path still lacks; it is
+/// wired together with the `Nlmf` consumer under `lmfd-07`. This function builds
+/// and validates the exact wire bytes (proven by the `positioning` + `ogs-asn1c`
+/// unit tests); swapping the build-site `log` for an egress enqueue is all that
+/// then remains.
+fn try_positioning_relay(
+    ue_context_id: &str,
+    ue: &AmfUe,
+    request: &SbiRequest,
+    body: &Value,
+) -> Option<SbiResponse> {
+    let is_lpp = body
+        .pointer("/n1MessageContainer/n1MessageClass")
+        .and_then(Value::as_str)
+        == Some("LPP");
+    let nrppa_info = body.pointer("/n2InfoContainer/nrppaInfo");
+    if !is_lpp && nrppa_info.is_none() {
+        return None; // not a positioning transfer — fall through to SM handling
+    }
+
+    // Both LPP→UE and UE-associated NRPPa→gNB require the UE to be CM-CONNECTED.
+    let Some(ran_ue) = ue_ran_context(ue) else {
+        return Some(ue_not_reachable_error(ue_context_id, None));
+    };
+
+    // LPP → UE (N1, DL NAS Transport, payload container type LPP).
+    if is_lpp {
+        let Some(lpp) = body
+            .pointer("/n1MessageContainer/n1MessageContent/contentId")
+            .and_then(Value::as_str)
+            .and_then(|cid| find_binary_part(request, cid))
+        else {
+            return Some(mandatory_ie_incorrect(
+                "n1MessageContainer.n1MessageContent.contentId",
+                "no binary part for the LPP payload",
+            ));
+        };
+        let Some(nas) = crate::positioning::build_lpp_dl_nas(&lpp) else {
+            return Some(send_error(
+                500,
+                "Internal Server Error",
+                "LPP DL NAS Transport build failed",
+                None,
+            ));
+        };
+        // Built and validated; pending NGAP-task egress (see lmfd-07).
+        log::info!(
+            "[{ue_context_id}] LCS: built LPP DL NAS Transport ({} B) for the UE",
+            nas.len()
+        );
+    }
+
+    // NRPPa → serving gNB (N2, UE-associated NRPPa transport, NGAP procedure 8).
+    if let Some(nrppa) = nrppa_info {
+        let ie_ok = nrppa
+            .pointer("/nrppaPdu/ngapIeType")
+            .and_then(Value::as_str)
+            .and_then(parse_ngap_ie_type)
+            == Some(NgapIeType::Nrppa);
+        if !ie_ok {
+            return Some(mandatory_ie_incorrect(
+                "n2InfoContainer.nrppaInfo.nrppaPdu.ngapIeType",
+                "expected NRPPA_PDU",
+            ));
+        }
+        let Some(pdu) = nrppa
+            .pointer("/nrppaPdu/ngapData/contentId")
+            .and_then(Value::as_str)
+            .and_then(|cid| find_binary_part(request, cid))
+        else {
+            return Some(mandatory_ie_incorrect(
+                "n2InfoContainer.nrppaInfo.nrppaPdu.ngapData.contentId",
+                "no binary part for the NRPPa PDU",
+            ));
+        };
+        // The originating LMF id seeds the NGAP RoutingID so the gNB's uplink
+        // reply routes back to the right LMF (opaque echo for our relay).
+        let routing_id = nrppa
+            .get("nfId")
+            .and_then(Value::as_str)
+            .map(|s| s.as_bytes().to_vec())
+            .unwrap_or_default();
+        let Some(ngap) = crate::positioning::build_nrppa_dl_ue_associated(
+            ue.id,
+            ran_ue.ran_ue_ngap_id as u32,
+            &routing_id,
+            &pdu,
+        ) else {
+            return Some(send_error(
+                500,
+                "Internal Server Error",
+                "UE-associated NRPPa DL transport build failed",
+                None,
+            ));
+        };
+        // Built and validated; pending NGAP-task egress (see lmfd-07).
+        log::info!(
+            "[{ue_context_id}] LCS: built UE-associated NRPPa DL transport ({} B) for the gNB",
+            ngap.len()
+        );
+    }
+
+    let rsp = json!({ "cause": "N1_N2_TRANSFER_INITIATED" });
+    Some(match SbiResponse::ok().with_json_body(&rsp) {
+        Ok(resp) => resp,
+        Err(e) => send_error(500, "Internal Server Error", &e.to_string(), None),
+    })
+}
+
 /// POST /namf-comm/v1/ue-contexts/{ueContextId}/n1-n2-messages —
 /// Namf_Communication_N1N2MessageTransfer (TS 29.518 §5.2.2.3.1).
 fn handle_n1_n2_message_transfer_request(ue_context_id: &str, request: &SbiRequest) -> SbiResponse {
@@ -946,6 +1071,13 @@ fn handle_n1_n2_message_transfer_request(ue_context_id: &str, request: &SbiReque
     if n1_container.is_none() && n2_container.is_none() {
         // At least one of N1/N2 content must be present
         return mandatory_ie_missing("n1MessageContainer or n2InfoContainer");
+    }
+
+    // LCS positioning relay (TS 23.273): an LMF push of NRPPa (→gNB, N2) and/or
+    // LPP (→UE, N1) carries no PDU session and no smInfo. Detect and handle it
+    // up front so the SM-centric path below is completely untouched.
+    if let Some(resp) = try_positioning_relay(ue_context_id, &ue, request, &body) {
+        return resp;
     }
 
     // N1 message: RefToBinaryData into the multipart binary parts
@@ -1952,6 +2084,76 @@ mod tests {
 
         let body = n1n2_body(5, true, false, None);
         let resp = namf_request_handler(n1n2_request(supi, &body, true)).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            body_json(&resp)["cause"].as_str(),
+            Some("N1_N2_TRANSFER_INITIATED")
+        );
+    }
+
+    /// LCS: an LMF push of LPP (n1MessageClass "LPP", no PDU session) to a
+    /// connected UE is recognised by the positioning relay, the DL NAS Transport
+    /// is built, and the transfer is accepted (200) — the SM path is skipped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_n1n2_lpp_to_connected_ue_relays() {
+        let supi = "imsi-001010000060030";
+        setup_ue(supi, true, true);
+
+        let body = json!({
+            "n1MessageContainer": {
+                "n1MessageClass": "LPP",
+                "n1MessageContent": { "contentId": "lpp-pdu" }
+            }
+        });
+        let req = SbiRequest::post(format!(
+            "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"
+        ))
+        .with_json_body(&body)
+        .expect("json")
+        .with_part(SbiPart::with_content(
+            "lpp-pdu",
+            "application/vnd.3gpp.lpp",
+            bytes::Bytes::from_static(&[0x90, 0x01, 0x20, 0x09, 0x30]),
+        ));
+        let resp = namf_request_handler(req).await;
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            body_json(&resp)["cause"].as_str(),
+            Some("N1_N2_TRANSFER_INITIATED")
+        );
+    }
+
+    /// LCS: an LMF push of NRPPa (n2InfoContainer.nrppaInfo, ngapIeType
+    /// NRPPA_PDU, no PDU session) to a connected UE is recognised, the
+    /// UE-associated NRPPa DL transport is built, and the transfer is accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_n1n2_nrppa_to_connected_ue_relays() {
+        let supi = "imsi-001010000060031";
+        setup_ue(supi, true, true);
+
+        let body = json!({
+            "n2InfoContainer": {
+                "n2InformationClass": "NRPPa",
+                "nrppaInfo": {
+                    "nfId": "lmf-0001",
+                    "nrppaPdu": {
+                        "ngapIeType": "NRPPA_PDU",
+                        "ngapData": { "contentId": "nrppa-pdu" }
+                    }
+                }
+            }
+        });
+        let req = SbiRequest::post(format!(
+            "/namf-comm/v1/ue-contexts/{supi}/n1-n2-messages"
+        ))
+        .with_json_body(&body)
+        .expect("json")
+        .with_part(SbiPart::with_content(
+            "nrppa-pdu",
+            "application/vnd.3gpp.ngap",
+            bytes::Bytes::from_static(&[0x00, 0x00, 0x01, 0x00, 0x1d, 0x00]),
+        ));
+        let resp = namf_request_handler(req).await;
         assert_eq!(resp.status, 200);
         assert_eq!(
             body_json(&resp)["cause"].as_str(),
