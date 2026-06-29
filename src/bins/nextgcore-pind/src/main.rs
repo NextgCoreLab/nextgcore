@@ -20,8 +20,8 @@ use clap::Parser;
 use ogs_sbi::message::{ProblemDetails, SbiRequest, SbiResponse};
 use ogs_sbi::oauth::JwksCache;
 use ogs_sbi::server::{
-    send_bad_request, send_forbidden, send_method_not_allowed, send_not_found, SbiServer,
-    SbiServerConfig as OgsSbiServerConfig,
+    send_bad_request, send_error, send_forbidden, send_method_not_allowed, send_not_found,
+    SbiServer, SbiServerConfig as OgsSbiServerConfig,
 };
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -112,6 +112,19 @@ struct Args {
     /// create (TS 23.542 Table 8.5.2.3.3-1).
     #[arg(long, default_value = "30")]
     default_heartbeat_secs: u64,
+
+    /// PIND-08: require an available PEGC at PIN create. When set, PIN creation
+    /// fails with `NO_PEGC_AVAILABLE` (TS 23.542 §8.5.2.2) unless the owner has
+    /// a gateway-capable (or PEMC-as-PEGC) element registered. Default false so
+    /// a fresh owner can bootstrap their first PIN.
+    #[arg(long, default_value = "false")]
+    require_pegc_at_create: bool,
+
+    /// PIND-09: liveness reaper interval (seconds). The background reaper
+    /// deregisters elements that miss their heartbeat timer and deletes PINs
+    /// past expiration. Set to 0 to disable the reaper.
+    #[arg(long, default_value = "30")]
+    reaper_interval_secs: u64,
 }
 
 fn init_logging(level: &str) {
@@ -149,6 +162,14 @@ async fn main() -> Result<()> {
         args.default_pin_lifetime_secs,
         args.default_heartbeat_secs,
     );
+
+    // PIND-08: PEGC-availability policy at PIN create.
+    {
+        let ctx = pin_self();
+        if let Ok(mut context) = ctx.write() {
+            context.set_require_pegc_at_create(args.require_pegc_at_create);
+        };
+    }
 
     // PIND-10: caller-identity trust policy.
     OAUTH2_ENABLED.store(args.require_oauth2, Ordering::Relaxed);
@@ -206,6 +227,39 @@ async fn main() -> Result<()> {
     // discovery for the PIN application is out of band of the 5GC SBA.
 
     log::info!("NextGCore PIN application server ready (instance: {nf_instance_id})");
+
+    // PIND-09: background liveness reaper. Periodically deregisters elements
+    // that miss their heartbeat timer and deletes PINs past expiration, firing
+    // the PIND-07 role take-over on primary/default loss.
+    if args.reaper_interval_secs > 0 {
+        let reaper_shutdown = shutdown.clone();
+        let interval = Duration::from_secs(args.reaper_interval_secs);
+        tokio::spawn(async move {
+            log::info!(
+                "PIN liveness reaper started (interval {}s)",
+                interval.as_secs()
+            );
+            loop {
+                tokio::time::sleep(interval).await;
+                if reaper_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let ctx = pin_self();
+                let stats = match ctx.read() {
+                    Ok(context) => context.reap_now(),
+                    Err(_) => continue,
+                };
+                if stats.reaped_elements > 0 || stats.deleted_pins > 0 {
+                    log::info!(
+                        "PIN reaper pass: {} element(s) reaped, {} PIN(s) deleted",
+                        stats.reaped_elements,
+                        stats.deleted_pins
+                    );
+                }
+            }
+            log::info!("PIN liveness reaper stopped");
+        });
+    }
 
     while !shutdown.load(Ordering::SeqCst) {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -367,6 +421,11 @@ async fn pin_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             "DELETE" => handle_element_deregister(element_id, &request).await,
             _ => send_method_not_allowed(method, "pins/{id}/elements/{eid}"),
         },
+        // PIND-09: per-element liveness keep-alive (TS 23.542 §8.8).
+        ["pinapp", "v1", "pins", _pin_id, "elements", element_id, "heartbeat"] => match method {
+            "PUT" => handle_element_heartbeat(element_id).await,
+            _ => send_method_not_allowed(method, "pins/{id}/elements/{eid}/heartbeat"),
+        },
         // PIN Element Relay (PIN-7)
         ["pinapp", "v1", "elements", element_id, "relay"] => match method {
             "PUT" => handle_element_relay(element_id, &request).await,
@@ -437,26 +496,54 @@ async fn handle_pin_create(request: &SbiRequest) -> SbiResponse {
     let ctx = pin_self();
     let result = if let Ok(context) = ctx.read() {
         // PIND-03: lifecycle defaults assigned inside pin_create.
+        // PIND-08: PEGC candidate selection / NO_PEGC_AVAILABLE inside pin_create.
         context.pin_create(name, &caller)
     } else {
-        None
+        Err(PinContextError::NotFound)
     };
 
     match result {
         // PIND-03: 201 carries the mandatory PIN ID, Expiration time and
         // Heartbeat Timer (TS 23.542 Table 8.5.2.3.3-1).
-        Some(pin) => SbiResponse::with_status(201)
-            .with_json_body(&serde_json::json!({
-                "pinId": pin.pin_id,
-                "name": pin.name,
-                "ownerSupi": pin.owner_supi,
-                "ueId": ue_id,
-                "active": pin.active,
-                "expirationTime": pin.expiration_time,
-                "heartbeatTimer": pin.heartbeat_timer,
-            }))
-            .unwrap_or_else(|_| SbiResponse::with_status(201)),
-        None => send_bad_request("Failed to create PIN", Some("CREATION_FAILED")),
+        // PIND-08: 201 also carries the selected PEGC info when available.
+        Ok(pin) => {
+            // Resolve pegcInfo (identifier + address) from the selected PEGC.
+            let pegc_info = pin.default_pegc_id.as_ref().and_then(|id| {
+                let elem = ctx.read().ok().and_then(|c| c.element_find(id))?;
+                Some(serde_json::json!({
+                    "pegcId": elem.element_id,
+                    "pegcAddress": elem.pine_address,
+                    "port": elem.port,
+                }))
+            });
+            SbiResponse::with_status(201)
+                .with_json_body(&serde_json::json!({
+                    "pinId": pin.pin_id,
+                    "name": pin.name,
+                    "ownerSupi": pin.owner_supi,
+                    "ueId": ue_id,
+                    "active": pin.active,
+                    "expirationTime": pin.expiration_time,
+                    "heartbeatTimer": pin.heartbeat_timer,
+                    "defaultPegcId": pin.default_pegc_id,
+                    "pegcInfo": pegc_info,
+                }))
+                .unwrap_or_else(|_| SbiResponse::with_status(201))
+        }
+        // PIND-08: no PEGC candidate qualifies → 409 NO_PEGC_AVAILABLE.
+        Err(PinContextError::NoPegcAvailable) => send_error(
+            409,
+            "Conflict",
+            PinContextError::NoPegcAvailable.detail(),
+            Some(PinContextError::NoPegcAvailable.cause()),
+        ),
+        Err(PinContextError::MaxPinsReached) => send_error(
+            507,
+            "Insufficient Storage",
+            PinContextError::MaxPinsReached.detail(),
+            Some(PinContextError::MaxPinsReached.cause()),
+        ),
+        Err(_) => send_bad_request("Failed to create PIN", Some("CREATION_FAILED")),
     }
 }
 
@@ -472,7 +559,8 @@ async fn handle_pin_list() -> SbiResponse {
                     "name": p.name,
                     "ownerSupi": p.owner_supi,
                     "memberCount": p.member_ids.len(),
-                    "gatewayId": p.gateway_id,
+                    "primaryPemcId": p.primary_pemc_id,
+                    "defaultPegcId": p.default_pegc_id,
                     "active": p.active,
                     "expirationTime": p.expiration_time,
                     "heartbeatTimer": p.heartbeat_timer,
@@ -502,7 +590,8 @@ async fn handle_pin_get(pin_id: &str) -> SbiResponse {
                 "pinId": p.pin_id,
                 "name": p.name,
                 "ownerSupi": p.owner_supi,
-                "gatewayId": p.gateway_id,
+                "primaryPemcId": p.primary_pemc_id,
+                "defaultPegcId": p.default_pegc_id,
                 "memberIds": p.member_ids,
                 "active": p.active,
                 "expirationTime": p.expiration_time,
@@ -532,8 +621,8 @@ async fn handle_pin_delete(pin_id: &str, request: &SbiRequest) -> SbiResponse {
             &PinContextError::PemcRequiresOwner,
             "urn:nextgcore:pin:delete-authorization-failed",
         ),
-        Err(PinContextError::RelayOnlyForPegc) => {
-            // Logically impossible on delete, but satisfy the exhaustive match.
+        Err(_) => {
+            // Other variants are logically impossible on delete.
             send_forbidden("Unexpected role violation", Some("ROLE_VIOLATION"))
         }
     }
@@ -558,6 +647,49 @@ async fn handle_element_register(pin_id: &str, request: &SbiRequest) -> SbiRespo
         "MANAGEMENT" => PinElementType::ManagementEntity,
         _ => PinElementType::Element,
     };
+
+    // PIND-05: mandatory PINE registration IEs per TS 23.542 Table 8.4.2.3.2-1.
+    // UE Identifier (M).
+    let ue_identifier = match data.get("ueIdentifier").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => {
+            return send_bad_request(
+                "Missing UE Identifier (ueIdentifier)",
+                Some("MANDATORY_IE_MISSING"),
+            )
+        }
+    };
+    // Security credentials (M). Presence + non-empty format check.
+    match data.get("securityCredentials") {
+        Some(v) if !v.is_null() && v.as_str().map(|s| !s.trim().is_empty()).unwrap_or(true) => {}
+        _ => {
+            return send_bad_request(
+                "Missing Security credentials (securityCredentials)",
+                Some("MANDATORY_IE_MISSING"),
+            )
+        }
+    }
+    // PINE Address (M).
+    let pine_address = match data.get("pineAddress").and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => {
+            return send_bad_request(
+                "Missing PINE Address (pineAddress)",
+                Some("MANDATORY_IE_MISSING"),
+            )
+        }
+    };
+    // Port number (M).
+    let port = match data.get("port").and_then(|v| v.as_u64()) {
+        Some(p) if (1..=u16::MAX as u64).contains(&p) => p as u16,
+        _ => {
+            return send_bad_request(
+                "Missing or invalid Port number (port)",
+                Some("MANDATORY_IE_MISSING"),
+            )
+        }
+    };
+
     let capabilities: Vec<String> = data
         .get("capabilities")
         .and_then(|v| v.as_array())
@@ -567,47 +699,65 @@ async fn handle_element_register(pin_id: &str, request: &SbiRequest) -> SbiRespo
                 .collect()
         })
         .unwrap_or_default();
-    let host_supi = data
-        .get("hostSupi")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    // host SUPI defaults to the UE Identifier when not explicitly supplied.
+    let host_supi = Some(
+        data.get("hostSupi")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| ue_identifier.clone()),
+    );
+    let string_field = |key: &str| {
+        data.get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+
+    let registration = PinElementRegistration::new(elem_type, pine_address, port)
+        .with_capabilities(capabilities)
+        .with_host_supi(host_supi);
+    let registration = PinElementRegistration {
+        mac_address: string_field("macAddress"),
+        vendor_name: string_field("vendorName"),
+        device_description: string_field("deviceDescription"),
+        ..registration
+    };
 
     // Extract caller identity for authorization (PIND-10 trust policy).
     let caller = caller_supi(request);
 
     let ctx = pin_self();
     let result = if let Ok(context) = ctx.read() {
-        context.element_register(
-            pin_id,
-            elem_type,
-            capabilities,
-            host_supi,
-            caller.as_deref(),
-        )
+        context.element_register(pin_id, registration, caller.as_deref())
     } else {
         Err(PinContextError::NotFound)
     };
 
     match result {
+        // PIND-06: 201 carries the newly assigned PIN client ID (M) and echoes
+        // Role of PEMC / Role of PEGC only when the role was granted.
         Ok(elem) => SbiResponse::with_status(201)
             .with_json_body(&serde_json::json!({
                 "elementId": elem.element_id,
+                "pinClientId": elem.pin_client_id,
                 "elementType": elem_type_str,
                 "pinId": elem.pin_id,
                 "status": "REGISTERED",
                 "capabilities": elem.capabilities,
+                "pineAddress": elem.pine_address,
+                "port": elem.port,
+                "roleOfPemc": elem.role == PinElementRole::Pemc,
+                "roleOfPegc": elem.role == PinElementRole::Pegc,
             }))
             .unwrap_or_else(|_| SbiResponse::with_status(201)),
-        Err(PinContextError::NotFound) => send_not_found(
-            &format!("PIN {pin_id} not found"),
-            Some("PIN_NOT_FOUND"),
-        ),
+        Err(PinContextError::NotFound) => {
+            send_not_found(&format!("PIN {pin_id} not found"), Some("PIN_NOT_FOUND"))
+        }
         Err(PinContextError::PemcRequiresOwner) => send_pin_forbidden(
             &PinContextError::PemcRequiresOwner,
             "urn:nextgcore:pin:element-authorization-failed",
         ),
-        Err(PinContextError::RelayOnlyForPegc) => {
-            // Logically impossible here, but satisfy the exhaustive match.
+        Err(_) => {
+            // Other variants are logically impossible on register; satisfy match.
             send_forbidden("Unexpected role violation", Some("ROLE_VIOLATION"))
         }
     }
@@ -628,10 +778,16 @@ async fn handle_element_discover(pin_id: &str, request: &SbiRequest) -> SbiRespo
             .map(|e| {
                 serde_json::json!({
                     "elementId": e.element_id,
+                    "pinClientId": e.pin_client_id,
                     "elementType": format!("{:?}", e.element_type),
+                    "role": format!("{:?}", e.role),
                     "capabilities": e.capabilities,
                     "status": format!("{:?}", e.status),
                     "gatewayId": e.gateway_id,
+                    "pineAddress": e.pine_address,
+                    "port": e.port,
+                    "pemcRank": e.pemc_rank.map(|r| format!("{r:?}")),
+                    "pegcRank": e.pegc_rank.map(|r| format!("{r:?}")),
                 })
             })
             .collect()
@@ -656,14 +812,50 @@ async fn handle_element_get(element_id: &str) -> SbiResponse {
         Some(e) => SbiResponse::with_status(200)
             .with_json_body(&serde_json::json!({
                 "elementId": e.element_id,
+                "pinClientId": e.pin_client_id,
                 "elementType": format!("{:?}", e.element_type),
+                "role": format!("{:?}", e.role),
                 "pinId": e.pin_id,
                 "capabilities": e.capabilities,
                 "status": format!("{:?}", e.status),
                 "relayPath": e.relay_path,
+                "pineAddress": e.pine_address,
+                "port": e.port,
+                "macAddress": e.mac_address,
+                "vendorName": e.vendor_name,
+                "deviceDescription": e.device_description,
+                "pemcRank": e.pemc_rank.map(|r| format!("{r:?}")),
+                "pegcRank": e.pegc_rank.map(|r| format!("{r:?}")),
+                "heartbeatTimer": e.heartbeat_timer,
+                "lastHeartbeat": e.last_heartbeat,
             }))
             .unwrap_or_else(|_| SbiResponse::with_status(200)),
         None => send_not_found(
+            &format!("Element {element_id} not found"),
+            Some("ELEMENT_NOT_FOUND"),
+        ),
+    }
+}
+
+/// PIND-09: handle a per-element keep-alive (PUT
+/// `.../elements/{id}/heartbeat`). Resets the element's liveness deadline so
+/// the background reaper does not deregister it.
+async fn handle_element_heartbeat(element_id: &str) -> SbiResponse {
+    let ctx = pin_self();
+    let result = if let Ok(context) = ctx.read() {
+        context.element_heartbeat(element_id)
+    } else {
+        Err(PinContextError::NotFound)
+    };
+
+    match result {
+        Ok(()) => SbiResponse::with_status(200)
+            .with_json_body(&serde_json::json!({
+                "elementId": element_id,
+                "result": "HEARTBEAT_ACK",
+            }))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        Err(_) => send_not_found(
             &format!("Element {element_id} not found"),
             Some("ELEMENT_NOT_FOUND"),
         ),
@@ -690,8 +882,8 @@ async fn handle_element_deregister(element_id: &str, request: &SbiRequest) -> Sb
             &PinContextError::PemcRequiresOwner,
             "urn:nextgcore:pin:deregister-authorization-failed",
         ),
-        Err(PinContextError::RelayOnlyForPegc) => {
-            // Logically impossible on deregister, but satisfy the match.
+        Err(_) => {
+            // Other variants are logically impossible on deregister.
             send_forbidden("Unexpected role violation", Some("ROLE_VIOLATION"))
         }
     }
@@ -736,8 +928,8 @@ async fn handle_element_relay(element_id: &str, request: &SbiRequest) -> SbiResp
             &PinContextError::RelayOnlyForPegc,
             "urn:nextgcore:pin:relay-authorization-failed",
         ),
-        Err(PinContextError::PemcRequiresOwner) => {
-            // Logically impossible here, but satisfy the exhaustive match.
+        Err(_) => {
+            // Other variants are logically impossible on relay.
             send_forbidden("Unexpected role violation", Some("ROLE_VIOLATION"))
         }
     }
@@ -1072,9 +1264,7 @@ mod tests {
             guard
                 .element_register(
                     &pin.pin_id,
-                    PinElementType::Element,
-                    vec![],
-                    None,
+                    PinElementRegistration::new(PinElementType::Element, "10.0.0.5", 8000),
                     Some("imsi-owner-dereg"),
                 )
                 .expect("seed element")
@@ -1086,5 +1276,218 @@ mod tests {
         let resp = block_on(handle_element_deregister(&elem_id, &request));
         TRUST_CALLER_SUPI_HEADER.store(false, Ordering::Relaxed);
         assert_eq!(resp.status, 403, "non-owner deregister must be 403");
+    }
+
+    // ── PIND-05: PINE registration mandatory IEs (Address + Port) ───────────
+    fn register_request(pin_id: &str, caller: &str, body: serde_json::Value) -> SbiRequest {
+        SbiRequest::post(format!("/pinapp/v1/pins/{pin_id}/elements"))
+            .with_header("x-caller-supi", caller)
+            .with_json_body(&body)
+            .expect("serialize test body")
+    }
+
+    fn seed_pin(owner: &str) -> String {
+        let ctx = pin_self();
+        let guard = ctx.read().expect("ctx read");
+        guard.pin_create("Home", owner).expect("seed pin").pin_id
+    }
+
+    #[test]
+    fn handle_element_register_missing_pine_address_returns_400() {
+        let _g = lock_globals();
+        pin_context_init(1024, 86_400, 30);
+        OAUTH2_ENABLED.store(false, Ordering::Relaxed);
+        TRUST_CALLER_SUPI_HEADER.store(true, Ordering::Relaxed);
+        let pin_id = seed_pin("imsi-reg-owner-1");
+
+        // ueIdentifier + securityCredentials + port present, pineAddress absent.
+        let req = register_request(
+            &pin_id,
+            "imsi-reg-owner-1",
+            serde_json::json!({
+                "ueIdentifier": "imsi-reg-owner-1",
+                "securityCredentials": "tok",
+                "port": 8080,
+            }),
+        );
+        let resp = block_on(handle_element_register(&pin_id, &req));
+        TRUST_CALLER_SUPI_HEADER.store(false, Ordering::Relaxed);
+        assert_eq!(resp.status, 400, "missing PINE Address must be 400");
+    }
+
+    #[test]
+    fn handle_element_register_missing_port_returns_400() {
+        let _g = lock_globals();
+        pin_context_init(1024, 86_400, 30);
+        OAUTH2_ENABLED.store(false, Ordering::Relaxed);
+        TRUST_CALLER_SUPI_HEADER.store(true, Ordering::Relaxed);
+        let pin_id = seed_pin("imsi-reg-owner-2");
+
+        let req = register_request(
+            &pin_id,
+            "imsi-reg-owner-2",
+            serde_json::json!({
+                "ueIdentifier": "imsi-reg-owner-2",
+                "securityCredentials": "tok",
+                "pineAddress": "192.0.2.10",
+            }),
+        );
+        let resp = block_on(handle_element_register(&pin_id, &req));
+        TRUST_CALLER_SUPI_HEADER.store(false, Ordering::Relaxed);
+        assert_eq!(resp.status, 400, "missing Port must be 400");
+    }
+
+    #[test]
+    fn handle_element_register_missing_ue_identifier_returns_400() {
+        let _g = lock_globals();
+        pin_context_init(1024, 86_400, 30);
+        OAUTH2_ENABLED.store(false, Ordering::Relaxed);
+        TRUST_CALLER_SUPI_HEADER.store(true, Ordering::Relaxed);
+        let pin_id = seed_pin("imsi-reg-owner-3");
+
+        let req = register_request(
+            &pin_id,
+            "imsi-reg-owner-3",
+            serde_json::json!({
+                "securityCredentials": "tok",
+                "pineAddress": "192.0.2.10",
+                "port": 8080,
+            }),
+        );
+        let resp = block_on(handle_element_register(&pin_id, &req));
+        TRUST_CALLER_SUPI_HEADER.store(false, Ordering::Relaxed);
+        assert_eq!(resp.status, 400, "missing UE Identifier must be 400");
+    }
+
+    // ── PIND-06: full register returns PIN client ID + gated role echo ──────
+    #[test]
+    fn handle_element_register_owner_pemc_returns_201_with_client_id_and_role() {
+        let _g = lock_globals();
+        pin_context_init(1024, 86_400, 30);
+        OAUTH2_ENABLED.store(false, Ordering::Relaxed);
+        TRUST_CALLER_SUPI_HEADER.store(true, Ordering::Relaxed);
+        let owner = "imsi-reg-owner-pemc";
+        let pin_id = seed_pin(owner);
+
+        let req = register_request(
+            &pin_id,
+            owner,
+            serde_json::json!({
+                "elementType": "MANAGEMENT",
+                "ueIdentifier": owner,
+                "securityCredentials": "tok",
+                "pineAddress": "192.0.2.20",
+                "port": 9090,
+            }),
+        );
+        let resp = block_on(handle_element_register(&pin_id, &req));
+        TRUST_CALLER_SUPI_HEADER.store(false, Ordering::Relaxed);
+
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(
+            body["pinClientId"].as_str().unwrap().starts_with("pinc-"),
+            "201 must carry a PIN client ID"
+        );
+        assert_eq!(body["pineAddress"], "192.0.2.20");
+        assert_eq!(body["port"], 9090);
+        // Owner is authorized → roleOfPemc echoed true.
+        assert_eq!(body["roleOfPemc"], true);
+    }
+
+    #[test]
+    fn handle_element_register_unauthorized_pemc_downgraded_no_role_echo() {
+        let _g = lock_globals();
+        pin_context_init(1024, 86_400, 30);
+        OAUTH2_ENABLED.store(false, Ordering::Relaxed);
+        TRUST_CALLER_SUPI_HEADER.store(true, Ordering::Relaxed);
+        let pin_id = seed_pin("imsi-reg-real-owner");
+
+        // A non-owner requests a MANAGEMENT (PEMC) role → downgraded to Regular.
+        let req = register_request(
+            &pin_id,
+            "imsi-reg-attacker",
+            serde_json::json!({
+                "elementType": "MANAGEMENT",
+                "ueIdentifier": "imsi-reg-attacker",
+                "securityCredentials": "tok",
+                "pineAddress": "192.0.2.30",
+                "port": 7000,
+            }),
+        );
+        let resp = block_on(handle_element_register(&pin_id, &req));
+        TRUST_CALLER_SUPI_HEADER.store(false, Ordering::Relaxed);
+
+        assert_eq!(resp.status, 201, "downgrade still registers (no rejection)");
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(!body["pinClientId"].as_str().unwrap().is_empty());
+        assert_eq!(body["roleOfPemc"], false, "unauthorized PEMC not echoed");
+        assert_eq!(body["roleOfPegc"], false);
+    }
+
+    // ── PIND-08: create fails with NO_PEGC_AVAILABLE when required ──────────
+    #[test]
+    fn handle_pin_create_no_pegc_returns_409_when_required() {
+        let _g = lock_globals();
+        pin_context_init(1024, 86_400, 30);
+        OAUTH2_ENABLED.store(false, Ordering::Relaxed);
+        TRUST_CALLER_SUPI_HEADER.store(true, Ordering::Relaxed);
+        {
+            let ctx = pin_self();
+            ctx.write().unwrap().set_require_pegc_at_create(true);
+        }
+
+        let caller = "imsi-no-pegc-owner";
+        let request = SbiRequest::post("/pinapp/v1/pins")
+            .with_header("x-caller-supi", caller)
+            .with_json_body(&serde_json::json!({
+                "ueId": caller,
+                "securityCredentials": "tok",
+                "name": "Home",
+            }))
+            .expect("serialize test body");
+        let resp = block_on(handle_pin_create(&request));
+        // Reset shared policy so other tests are unaffected.
+        {
+            let ctx = pin_self();
+            ctx.write().unwrap().set_require_pegc_at_create(false);
+        }
+        TRUST_CALLER_SUPI_HEADER.store(false, Ordering::Relaxed);
+
+        assert_eq!(resp.status, 409, "no PEGC available must be 409");
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["cause"], "NO_PEGC_AVAILABLE");
+    }
+
+    // ── PIND-09: heartbeat handler resets liveness / 404 on unknown ─────────
+    #[test]
+    fn handle_element_heartbeat_acks_known_and_404_unknown() {
+        let _g = lock_globals();
+        pin_context_init(1024, 86_400, 30);
+        OAUTH2_ENABLED.store(false, Ordering::Relaxed);
+        TRUST_CALLER_SUPI_HEADER.store(false, Ordering::Relaxed);
+
+        let elem_id = {
+            let ctx = pin_self();
+            let guard = ctx.read().expect("ctx read");
+            let pin = guard.pin_create("Home", "imsi-hb-owner").expect("seed pin");
+            guard
+                .element_register(
+                    &pin.pin_id,
+                    PinElementRegistration::new(PinElementType::Element, "10.0.0.8", 8800),
+                    None,
+                )
+                .expect("seed element")
+                .element_id
+        };
+
+        let ok = block_on(handle_element_heartbeat(&elem_id));
+        assert_eq!(ok.status, 200, "heartbeat on a known element acks");
+
+        let missing = block_on(handle_element_heartbeat("pe-absent-999"));
+        assert_eq!(missing.status, 404, "heartbeat on unknown element is 404");
     }
 }
