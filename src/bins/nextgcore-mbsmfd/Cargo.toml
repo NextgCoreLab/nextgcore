@@ -13,12 +13,14 @@ path = "src/main.rs"
 [dependencies]
 ogs-core = { workspace = true }
 ogs-sbi = { workspace = true }
+ogs-pfcp = { workspace = true }
 ogs-metrics = { workspace = true }
 ogs-app = { workspace = true }
 log.workspace = true
 env_logger.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 uuid.workspace = true
 hex.workspace = true
@@ -27,6 +29,7 @@ ctrlc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+bytes.workspace = true
 
 [lints]
 workspace = true

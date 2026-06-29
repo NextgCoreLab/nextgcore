@@ -24,6 +24,7 @@ use std::time::Duration;
 static PFCP_SEQ: AtomicU32 = AtomicU32::new(1);
 
 mod context;
+mod types;
 
 pub use context::*;
 
@@ -233,7 +234,41 @@ fn parse_session_id(session_id: &str) -> Option<u64> {
         .and_then(|s| s.parse::<u64>().ok())
 }
 
-/// Handle MBS Session Create (TS 23.247 7.2.1)
+/// Build an internal [`context::Tmgi`] from a spec [`types::Tmgi`], or a default
+/// `010203` TMGI in PLMN 001/01 when the request carries no TMGI (e.g. a
+/// multicast create where the MB-SMF would allocate one).
+fn context_tmgi_from(spec: Option<&types::Tmgi>) -> Tmgi {
+    match spec {
+        Some(t) => Tmgi {
+            mbs_service_id: t.service_id_bytes(),
+            plmn_id: PlmnId {
+                mcc: t.plmn_id.mcc.clone(),
+                mnc: t.plmn_id.mnc.clone(),
+            },
+        },
+        None => Tmgi {
+            mbs_service_id: [0x01, 0x02, 0x03],
+            plmn_id: PlmnId {
+                mcc: "001".to_string(),
+                mnc: "01".to_string(),
+            },
+        },
+    }
+}
+
+/// Render an internal [`context::Tmgi`] as a spec [`types::Tmgi`] for response
+/// bodies (6 hex-digit `mbsServiceId`).
+fn spec_tmgi_from(tmgi: &Tmgi) -> types::Tmgi {
+    types::Tmgi {
+        mbs_service_id: hex::encode(tmgi.mbs_service_id),
+        plmn_id: types::PlmnId {
+            mcc: tmgi.plmn_id.mcc.clone(),
+            mnc: tmgi.plmn_id.mnc.clone(),
+        },
+    }
+}
+
+/// Handle MBS Session Create (TS 29.532 §5.3.2.2, CreateReqData/CreateRspData)
 async fn handle_mbs_session_create(request: &SbiRequest) -> SbiResponse {
     log::info!("MBS Session Create");
 
@@ -242,54 +277,25 @@ async fn handle_mbs_session_create(request: &SbiRequest) -> SbiResponse {
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
     };
 
-    let session_data: serde_json::Value = match serde_json::from_str(body) {
+    // mbsmfd-06: parse the spec CreateReqData{ mbsSession: ExtMbsSession }.
+    let req: types::CreateReqData = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid CreateReqData: {e}"), Some("INVALID_JSON")),
     };
 
-    // Parse MBS session type
-    let session_type_str = session_data
-        .get("mbsSessionType")
-        .and_then(|v| v.as_str())
-        .unwrap_or("MULTICAST");
-    let session_type = match session_type_str {
-        "BROADCAST" => MbsSessionType::Broadcast,
+    // Read mbsSession.serviceType (the spec field name).
+    let session_type = match req.mbs_session.service_type {
+        Some(types::MbsServiceType::Broadcast) => MbsSessionType::Broadcast,
         _ => MbsSessionType::Multicast,
     };
 
-    // Parse TMGI
-    let mbs_service_id = session_data
-        .get("tmgi")
-        .and_then(|t| t.get("mbsServiceId"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("010203");
-    let plmn_mcc = session_data
-        .get("tmgi")
-        .and_then(|t| t.get("plmnId"))
-        .and_then(|p| p.get("mcc"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("001");
-    let plmn_mnc = session_data
-        .get("tmgi")
-        .and_then(|t| t.get("plmnId"))
-        .and_then(|p| p.get("mnc"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("01");
-
-    let mut service_id_bytes = [0u8; 3];
-    if let Ok(bytes) = hex::decode(mbs_service_id) {
-        for (i, b) in bytes.iter().take(3).enumerate() {
-            service_id_bytes[i] = *b;
-        }
-    }
-
-    let tmgi = Tmgi {
-        mbs_service_id: service_id_bytes,
-        plmn_id: PlmnId {
-            mcc: plmn_mcc.to_string(),
-            mnc: plmn_mnc.to_string(),
-        },
-    };
+    // mbsmfd-07: resolve the TMGI from mbsSession.mbsSessionId (else default).
+    let spec_tmgi = req
+        .mbs_session
+        .mbs_session_id
+        .as_ref()
+        .and_then(|id| id.tmgi.as_ref());
+    let tmgi = context_tmgi_from(spec_tmgi);
 
     let ctx = mbsmf_self();
     let session = if let Ok(context) = ctx.read() {
@@ -303,21 +309,27 @@ async fn handle_mbs_session_create(request: &SbiRequest) -> SbiResponse {
             let session_id = format!("mbs-sess-{}", session.id);
             log::info!("MBS Session created: {session_id} (type={session_type:?})");
 
+            // mbsmfd-06: respond with CreateRspData{ mbsSession }.
+            let rsp = types::CreateRspData {
+                mbs_session: types::ExtMbsSession {
+                    mbs_session_id: Some(types::MbsSessionId {
+                        tmgi: Some(spec_tmgi_from(&session.tmgi)),
+                        ssm: None,
+                    }),
+                    service_type: Some(match session_type {
+                        MbsSessionType::Broadcast => types::MbsServiceType::Broadcast,
+                        MbsSessionType::Multicast => types::MbsServiceType::Multicast,
+                    }),
+                    ingress_tun_addr: Some(format!("{:#010x}", session.gtp_teid)),
+                },
+            };
+
             SbiResponse::with_status(201)
                 .with_header(
                     "Location",
                     format!("/nmbsmf-mbssession/v1/mbs-sessions/{session_id}"),
                 )
-                .with_json_body(&serde_json::json!({
-                    "mbsSessionId": session_id,
-                    "mbsSessionType": session_type_str,
-                    "tmgi": {
-                        "mbsServiceId": mbs_service_id,
-                        "plmnId": {"mcc": plmn_mcc, "mnc": plmn_mnc}
-                    },
-                    "mbsSessionStatus": "CREATED",
-                    "gtpTeid": format!("{:#010x}", session.gtp_teid),
-                }))
+                .with_json_body(&rsp)
                 .unwrap_or_else(|_| SbiResponse::with_status(201))
         }
         None => send_bad_request("Failed to create MBS session", Some("CREATION_FAILED")),
@@ -401,7 +413,11 @@ async fn handle_mbs_session_get(session_id: &str) -> SbiResponse {
     }
 }
 
-/// Handle MBS Session Update (TS 23.247 7.2.2)
+/// Handle MBS Session Update (TS 29.532 §5.3.2.3, PATCH with PatchData)
+///
+/// Parses the spec `PatchData` (RFC 6902 `PatchItem` array) and applies the
+/// modifiable attributes. Returns 204 No Content on success, or 200 with
+/// `redMbsServArea` when the MBS service area is reduced.
 async fn handle_mbs_session_update(session_id: &str, request: &SbiRequest) -> SbiResponse {
     log::info!("MBS Session Update: {session_id}");
 
@@ -410,9 +426,10 @@ async fn handle_mbs_session_update(session_id: &str, request: &SbiRequest) -> Sb
         None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
     };
 
-    let update_data: serde_json::Value = match serde_json::from_str(body) {
+    // mbsmfd-08: parse the spec PatchData (array of PatchItem).
+    let patch: types::PatchData = match serde_json::from_str(body) {
         Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+        Err(e) => return send_bad_request(&format!("Invalid PatchData: {e}"), Some("INVALID_JSON")),
     };
 
     let pool_id = parse_session_id(session_id);
@@ -428,25 +445,20 @@ async fn handle_mbs_session_update(session_id: &str, request: &SbiRequest) -> Sb
 
     match session {
         Some(mut session) => {
-            // Update session state if provided
-            if let Some(status) = update_data.get("mbsSessionStatus").and_then(|v| v.as_str()) {
-                session.state = match status {
-                    "ACTIVE" => MbsSessionState::Active,
-                    "SUSPENDED" => MbsSessionState::Suspended,
-                    _ => session.state,
-                };
-            }
+            let outcome = types::apply_patch_data(&patch, &mut session.service_area_tacs);
 
             if let Ok(context) = ctx.read() {
                 context.session_update(&session);
             }
 
-            SbiResponse::with_status(200)
-                .with_json_body(&serde_json::json!({
-                    "mbsSessionId": session_id,
-                    "mbsSessionStatus": format!("{:?}", session.state).to_uppercase(),
-                }))
-                .unwrap_or_else(|_| SbiResponse::with_status(200))
+            match outcome {
+                // Service area reduced -> 200 + redMbsServArea (TS 29.532 §5.3.2.3).
+                types::PatchOutcome::ReducedArea(area) => SbiResponse::with_status(200)
+                    .with_json_body(&serde_json::json!({ "redMbsServArea": area }))
+                    .unwrap_or_else(|_| SbiResponse::with_status(200)),
+                // Otherwise success is 204 No Content.
+                types::PatchOutcome::NoContent => SbiResponse::with_status(204),
+            }
         }
         None => send_not_found(
             &format!("MBS Session {session_id} not found"),
@@ -541,6 +553,12 @@ async fn handle_mbs_session_activate(session_id: &str, request: &SbiRequest) -> 
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(8805);
             let upf_addr_octets = upf_addr.octets();
+            // CP (MB-SMF) node/F-SEID address for the N4mb establishment.
+            let cp_addr_octets: [u8; 4] = std::env::var("MBSMF_N4MB_ADDR")
+                .ok()
+                .and_then(|a| a.parse::<std::net::Ipv4Addr>().ok())
+                .unwrap_or(std::net::Ipv4Addr::new(127, 0, 0, 1))
+                .octets();
 
             tokio::spawn(async move {
                 let msg = build_n4mb_pfcp_establishment(
@@ -548,6 +566,7 @@ async fn handle_mbs_session_activate(session_id: &str, request: &SbiRequest) -> 
                     dl_teid,
                     mcast_pdr_id,
                     mcast_far_id,
+                    cp_addr_octets,
                     upf_addr_octets,
                 );
                 let dest = std::net::SocketAddr::from((upf_addr_octets, upf_pfcp_port));
@@ -586,120 +605,64 @@ async fn handle_mbs_session_activate(session_id: &str, request: &SbiRequest) -> 
     }
 }
 
-/// Build a PFCP Session Establishment Request for N4mb multicast (TS 29.244).
+/// Build a PFCP Session Establishment Request for N4mb multicast transport,
+/// encoded via the conformant `ogs-pfcp` library (TS 29.244). [mbsmfd-01]
 ///
-/// Message layout (TLV, big-endian):
-///   PFCP header (version=1, SEID flag set, msg_type=50)
-///   F-SEID IE (SMF local SEID + IPv4)
-///   CREATE_PDR IE  (multicast downlink PDR)
-///     PDR-ID, Precedence, PDI (Source-Interface=ACCESS, F-TEID with multicast TEID)
-///     FAR-ID (reference to the FAR below)
-///   CREATE_FAR IE  (multicast forwarding FAR)
-///     FAR-ID, Apply-Action=FORW (0x02), Forwarding-Parameters (Destination-Interface=CORE)
+/// Replaces the previous hand-rolled TLV writer, which had wire-fatal bugs
+/// (F-TEID flag set to V6=0x02 instead of V4=0x01, Apply-Action emitted in the
+/// wrong octet order so FORW never landed in octet 5, and a missing mandatory
+/// Node ID IE). The library encoders fix all three: F-TEID V4 flag = 0x01
+/// (§8.2.3), Apply-Action FORW in octet 5 = 0x02 (§8.2.26), Node ID IE present
+/// (§7.5.2.1).
+///
+/// Structure:
+///   - Node ID (IPv4 of the MB-SMF / CP function)
+///   - CP F-SEID (local SEID + CP IPv4)
+///   - Create PDR: Source-Interface=ACCESS, F-TEID (V4, multicast DL TEID),
+///     referencing the forwarding FAR
+///   - Create FAR: Apply-Action=FORW, Forwarding-Parameters Destination=CORE
 fn build_n4mb_pfcp_establishment(
     local_seid: u64,
     dl_teid: u32,
     pdr_id: u16,
     far_id: u32,
+    cp_addr: [u8; 4],
     upf_addr: [u8; 4],
 ) -> Vec<u8> {
-    // IE type codes (TS 29.244 Table 7.5.2-1)
-    const IE_CREATE_PDR: u16 = 1;
-    const IE_PDI: u16 = 2;
-    const IE_CREATE_FAR: u16 = 3;
-    const IE_FORWARDING_PARAMETERS: u16 = 4;
-    const IE_SOURCE_INTERFACE: u16 = 20;
-    const IE_F_TEID: u16 = 21;
-    const IE_PRECEDENCE: u16 = 29;
-    const IE_APPLY_ACTION: u16 = 44;
-    const IE_DESTINATION_INTERFACE: u16 = 42;
-    const IE_PDR_ID: u16 = 56;
-    const IE_F_SEID: u16 = 57;
-    const IE_FAR_ID: u16 = 108;
+    use ogs_pfcp::message::{build_message, PfcpMessage, SessionEstablishmentRequest};
+    use ogs_pfcp::types::{
+        ApplyAction, CreateFar, CreatePdr, DestinationInterface, FSeid, FTeid, ForwardingParameters,
+        NodeId, Pdi, SourceInterface,
+    };
 
-    // Helper: append a TLV IE to buf
-    fn tlv(buf: &mut Vec<u8>, ie_type: u16, value: &[u8]) {
-        buf.extend_from_slice(&ie_type.to_be_bytes());
-        buf.extend_from_slice(&(value.len() as u16).to_be_bytes());
-        buf.extend_from_slice(value);
-    }
+    // Mandatory Node ID + CP F-SEID identify the MB-SMF (CP function).
+    let node_id = NodeId::new_ipv4(cp_addr);
+    let cp_f_seid = FSeid::new_ipv4(local_seid, cp_addr);
 
-    // ---- F-SEID IE ----
-    let mut f_seid_val: Vec<u8> = Vec::new();
-    f_seid_val.push(0x02); // V4 flag
-    f_seid_val.extend_from_slice(&local_seid.to_be_bytes());
-    f_seid_val.extend_from_slice(&upf_addr);
-    let mut f_seid_ie: Vec<u8> = Vec::new();
-    tlv(&mut f_seid_ie, IE_F_SEID, &f_seid_val);
+    // Multicast downlink PDR: ACCESS source interface, F-TEID (V4 flag = 0x01)
+    // carrying the multicast DL TEID + transport address, referencing the FAR.
+    let mut pdi = Pdi::new(SourceInterface::Access);
+    pdi.local_f_teid = Some(FTeid::new_ipv4(dl_teid, upf_addr));
+    let mut create_pdr = CreatePdr::new(pdr_id, 100, pdi);
+    create_pdr.far_id = Some(far_id);
 
-    // ---- PDI grouped IE ----
-    // Source-Interface = 0 (ACCESS)
-    let mut pdi_buf: Vec<u8> = Vec::new();
-    tlv(&mut pdi_buf, IE_SOURCE_INTERFACE, &[0u8]);
-    // F-TEID: flags=V4(0x02), TEID, IPv4 (upf_addr is multicast transport addr)
-    let mut f_teid_val: Vec<u8> = Vec::new();
-    f_teid_val.push(0x02);
-    f_teid_val.extend_from_slice(&dl_teid.to_be_bytes());
-    f_teid_val.extend_from_slice(&upf_addr);
-    tlv(&mut pdi_buf, IE_F_TEID, &f_teid_val);
+    // Multicast forwarding FAR: Apply-Action FORW (octet 5 = 0x02),
+    // Forwarding-Parameters Destination-Interface = CORE.
+    let mut create_far = CreateFar::new(far_id, ApplyAction::forward());
+    create_far.forwarding_parameters = Some(ForwardingParameters::new(DestinationInterface::Core));
 
-    // ---- CREATE_PDR grouped IE ----
-    let mut pdr_buf: Vec<u8> = Vec::new();
-    tlv(&mut pdr_buf, IE_PDR_ID, &pdr_id.to_be_bytes());
-    tlv(&mut pdr_buf, IE_PRECEDENCE, &100u32.to_be_bytes());
-    // Embed PDI
-    pdr_buf.extend_from_slice(&IE_PDI.to_be_bytes());
-    pdr_buf.extend_from_slice(&(pdi_buf.len() as u16).to_be_bytes());
-    pdr_buf.extend_from_slice(&pdi_buf);
-    // FAR-ID reference
-    tlv(&mut pdr_buf, IE_FAR_ID, &far_id.to_be_bytes());
+    let mut req = SessionEstablishmentRequest::new(node_id, cp_f_seid);
+    req.create_pdrs.push(create_pdr);
+    req.create_fars.push(create_far);
 
-    // ---- Forwarding Parameters grouped IE ----
-    let mut fwd_params: Vec<u8> = Vec::new();
-    // Destination-Interface = 1 (CORE)
-    tlv(&mut fwd_params, IE_DESTINATION_INTERFACE, &[1u8]);
-
-    // ---- CREATE_FAR grouped IE ----
-    let mut far_buf: Vec<u8> = Vec::new();
-    tlv(&mut far_buf, IE_FAR_ID, &far_id.to_be_bytes());
-    // Apply-Action = FORW (0x02)
-    tlv(&mut far_buf, IE_APPLY_ACTION, &0x0002u16.to_be_bytes());
-    // Forwarding-Parameters
-    far_buf.extend_from_slice(&IE_FORWARDING_PARAMETERS.to_be_bytes());
-    far_buf.extend_from_slice(&(fwd_params.len() as u16).to_be_bytes());
-    far_buf.extend_from_slice(&fwd_params);
-
-    // ---- Assemble IEs ----
-    let mut ies: Vec<u8> = Vec::new();
-    ies.extend_from_slice(&f_seid_ie);
-    // CREATE_PDR
-    ies.extend_from_slice(&IE_CREATE_PDR.to_be_bytes());
-    ies.extend_from_slice(&(pdr_buf.len() as u16).to_be_bytes());
-    ies.extend_from_slice(&pdr_buf);
-    // CREATE_FAR
-    ies.extend_from_slice(&IE_CREATE_FAR.to_be_bytes());
-    ies.extend_from_slice(&(far_buf.len() as u16).to_be_bytes());
-    ies.extend_from_slice(&far_buf);
-
-    // ---- PFCP Header (TS 29.244 §7.2.2) ----
-    // Byte 0: version=1 (bits 7-5), FO=0, MP=0, S=1 (SEID present, bit 0)
-    // Byte 1: Message Type = 50 (Session Establishment Request)
-    // Bytes 2-3: Message Length = everything after the first 4 bytes of header.
-    // With SEID present: 8 (SEID) + 3 (seq) + 1 (spare) + IEs = 12 + ies.len()
     let seq_num: u32 = PFCP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let msg_len: u16 = (12 + ies.len()) as u16;
-    let mut packet: Vec<u8> = Vec::with_capacity(16 + ies.len());
-    packet.push(0x21); // version=1, S=1
-    packet.push(50); // SESSION_ESTABLISHMENT_REQUEST
-    packet.extend_from_slice(&msg_len.to_be_bytes());
-    packet.extend_from_slice(&0u64.to_be_bytes()); // SEID=0 for establishment (CP→UP)
-                                                   // Sequence number (3 bytes) + spare (1 byte)
-    packet.push(((seq_num >> 16) & 0xFF) as u8);
-    packet.push(((seq_num >> 8) & 0xFF) as u8);
-    packet.push((seq_num & 0xFF) as u8);
-    packet.push(0); // spare
-    packet.extend_from_slice(&ies);
-    packet
+    // SEID toward the UP is 0 for the initial establishment (TS 29.244 §7.2.2.4.2).
+    build_message(
+        &PfcpMessage::SessionEstablishmentRequest(req),
+        seq_num,
+        Some(0),
+    )
+    .to_vec()
 }
 
 /// Handle member join (TMGI group membership)
@@ -932,5 +895,144 @@ mod tests {
         assert_eq!(parse_session_id("mbs-sess-42"), Some(42));
         assert_eq!(parse_session_id("mbs-sess-0"), Some(0));
         assert_eq!(parse_session_id("invalid"), None);
+    }
+
+    /// Locate a byte subsequence (used to assert specific IE windows on the
+    /// encoded N4mb establishment packet).
+    fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|w| w == needle)
+    }
+
+    // ---- mbsmfd-01: N4mb PFCP establishment encoded via ogs-pfcp ----
+
+    #[test]
+    fn test_n4mb_establishment_byte_vector() {
+        let cp_addr = [127, 0, 0, 1];
+        let upf_addr = [10, 0, 0, 7];
+        let local_seid = 0x0000_0000_0000_0100u64;
+        let dl_teid = 0x0BCA_0001u32;
+        let pdr_id = 1002u16;
+        let far_id = 2002u32;
+
+        let pkt = build_n4mb_pfcp_establishment(
+            local_seid, dl_teid, pdr_id, far_id, cp_addr, upf_addr,
+        );
+
+        // PFCP header: version=1 + S(seid) flag => 0x21, msg type 50.
+        assert_eq!(pkt[0], 0x21, "version/SEID flag byte");
+        assert_eq!(pkt[1], 50, "Session Establishment Request type");
+
+        // Node ID IE (type 60 = 0x003C), len 5, node-id-type 0 (IPv4) — the
+        // mandatory IE the old hand-rolled encoder omitted entirely.
+        assert!(
+            find_subsequence(&pkt, &[0x00, 0x3C, 0x00, 0x05, 0x00]).is_some(),
+            "Node ID IE (type 60, IPv4) present"
+        );
+
+        // F-TEID IE (type 21 = 0x0015), len 9, flags octet == 0x01 (V4) — the
+        // old encoder wrongly set 0x02 (V6).
+        assert!(
+            find_subsequence(&pkt, &[0x00, 0x15, 0x00, 0x09, 0x01]).is_some(),
+            "F-TEID IE V4 flag octet == 0x01"
+        );
+
+        // Apply-Action IE (type 44 = 0x002C), len 2, octet5 == 0x02 (FORW),
+        // octet6 == 0x00 — the old encoder put 0x02 in octet6 instead.
+        assert!(
+            find_subsequence(&pkt, &[0x00, 0x2C, 0x00, 0x02, 0x02, 0x00]).is_some(),
+            "Apply-Action FORW in octet 5 == 0x02"
+        );
+    }
+
+    #[test]
+    fn test_n4mb_establishment_roundtrip_decode() {
+        use ogs_pfcp::message::{parse_message, PfcpMessage};
+        use ogs_pfcp::types::NodeIdType;
+
+        let cp_addr = [127, 0, 0, 1];
+        let upf_addr = [10, 0, 0, 7];
+        let local_seid = 0x0000_0000_0000_0100u64;
+        let dl_teid = 0x0BCA_0001u32;
+        let pdr_id = 1002u16;
+        let far_id = 2002u32;
+
+        let pkt = build_n4mb_pfcp_establishment(
+            local_seid, dl_teid, pdr_id, far_id, cp_addr, upf_addr,
+        );
+
+        let mut buf = bytes::Bytes::copy_from_slice(&pkt);
+        let (header, msg) = parse_message(&mut buf).expect("decode N4mb establishment");
+        assert!(header.seid_presence);
+        assert_eq!(header.seid, Some(0));
+
+        let req = match msg {
+            PfcpMessage::SessionEstablishmentRequest(r) => r,
+            other => panic!("expected SessionEstablishmentRequest, got {other:?}"),
+        };
+
+        // Node ID round-trips as the CP IPv4 address.
+        assert_eq!(req.node_id.node_id_type, NodeIdType::Ipv4);
+        assert_eq!(req.node_id.ipv4_addr, Some(cp_addr));
+
+        // CP F-SEID carries the local SEID.
+        assert!(req.cp_f_seid.ipv4);
+        assert_eq!(req.cp_f_seid.seid, local_seid);
+
+        // PDR/PDI F-TEID round-trips the multicast DL TEID + V4 flag.
+        assert_eq!(req.create_pdrs.len(), 1);
+        let pdr = &req.create_pdrs[0];
+        assert_eq!(pdr.pdr_id, pdr_id);
+        assert_eq!(pdr.far_id, Some(far_id));
+        let fteid = pdr.pdi.local_f_teid.as_ref().expect("F-TEID present");
+        assert!(fteid.ipv4);
+        assert!(!fteid.ipv6);
+        assert_eq!(fteid.teid, dl_teid);
+        assert_eq!(fteid.ipv4_addr, Some(upf_addr));
+
+        // FAR round-trips Apply-Action FORW + Destination=CORE.
+        assert_eq!(req.create_fars.len(), 1);
+        let far = &req.create_fars[0];
+        assert_eq!(far.far_id, far_id);
+        assert!(far.apply_action.forw);
+        let fp = far
+            .forwarding_parameters
+            .as_ref()
+            .expect("forwarding parameters present");
+        assert_eq!(
+            fp.destination_interface,
+            ogs_pfcp::types::DestinationInterface::Core
+        );
+    }
+
+    // ---- mbsmfd-07: resolve a created session by its TMGI ----
+
+    #[test]
+    fn test_lookup_session_by_tmgi() {
+        let mut ctx = MbSmfContext::new();
+        ctx.init(256);
+
+        // Create via a spec MbsSessionId carrying a TMGI.
+        let spec_id = types::MbsSessionId {
+            tmgi: Some(types::Tmgi {
+                mbs_service_id: "0a0b0c".to_string(),
+                plmn_id: types::PlmnId {
+                    mcc: "001".to_string(),
+                    mnc: "01".to_string(),
+                },
+            }),
+            ssm: None,
+        };
+        let ctx_tmgi = context_tmgi_from(spec_id.tmgi.as_ref());
+        let created = ctx
+            .session_add(ctx_tmgi.clone(), MbsSessionType::Broadcast)
+            .unwrap();
+
+        // Resolving the same spec TMGI maps back to the created internal id.
+        let resolve_tmgi = context_tmgi_from(spec_id.tmgi.as_ref());
+        let found = ctx.session_find_by_tmgi(&resolve_tmgi).expect("resolved by TMGI");
+        assert_eq!(found.id, created.id);
+        assert_eq!(found.tmgi.mbs_service_id, [0x0A, 0x0B, 0x0C]);
     }
 }
