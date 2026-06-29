@@ -26,6 +26,8 @@ use ogs_sbi::server::{send_forbidden, send_unauthorized};
 pub const SCOPE_EASREGISTRATION: &str = "eees-easregistration";
 /// OAuth2 scope required for the `eees-easdiscovery` service operations.
 pub const SCOPE_EASDISCOVERY: &str = "eees-easdiscovery";
+/// OAuth2 scope required for the `eees-eecregistration` service operations.
+pub const SCOPE_EECREGISTRATION: &str = "eees-eecregistration";
 
 /// Process-wide JWKS used to verify access tokens. `None` ⇒ unconfigured
 /// (fail-closed). Seeded from `--oauth2-jwks-file` or by tests.

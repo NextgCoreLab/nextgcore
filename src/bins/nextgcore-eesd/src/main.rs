@@ -6,7 +6,7 @@
 //! layout and self-registers toward the Edge Configuration Server (ECS) over
 //! EDGE-6, not the NRF.
 //!
-//! Implemented in this bounded chunk:
+//! Implemented (Batch 1):
 //! - eesd-01: `eees-*` apiName routing + ECS-registration scaffold; the bespoke
 //!   `nees-*`/NRF/`NfType::Ees` self-registration is removed.
 //! - eesd-02: `EASRegistration`/`EASProfile`/`EndPoint` data model (`types.rs`)
@@ -15,17 +15,25 @@
 //!   preserved verbatim and indexed separately.
 //! - eesd-08: per-operation OAuth2 authorization (`auth::require_oauth2`).
 //!
-//! DEFERRED (flagged): eesd-04 (PUT/PATCH update), eesd-05 (full discovery
-//! req/resp/filter + subscriptions), eesd-06 (EEC registration), eesd-07 (ACR),
-//! eesd-09/10 (UE location/identifier exposure), eesd-11 (suppFeat negotiation),
-//! eesd-12 (expTime sweep), eesd-13 (remaining service APIs), eesd-14 (full
-//! conformance suite).
+//! Implemented (Batch 2):
+//! - eesd-04: EAS Registration update — PUT full-replace (reject `easId` change)
+//!   and PATCH RFC 7396 merge (200/204).
+//! - eesd-05: full EAS Discovery (`EasDiscoveryReq`/`Resp`/filter on
+//!   easId/easType/acIds/svcArea) + `/subscriptions` CRUD + notify stub.
+//! - eesd-06: EEC Registration API (`eees-eecregistration`, `eec.rs`) with a
+//!   server-minted `registrationId` + `expTime` lifecycle.
+//! - eesd-11: `suppFeat` negotiation (echoed) + valid 3GPP ProblemDetails causes.
+//! - eesd-12: EAS/EEC `expTime` + a periodic lifecycle sweep.
+//!
+//! DEFERRED (flagged): eesd-07 (ACR suite), eesd-09/10 (UE location/identifier
+//! exposure — NEF-path-blocked), eesd-13 (remaining service APIs), eesd-14
+//! (standalone conformance suite; tests are added colocated as items land).
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::server::{
-    send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
+    send_bad_request, send_error, send_method_not_allowed, send_not_found, SbiServer,
     SbiServerConfig as OgsSbiServerConfig,
 };
 use std::net::SocketAddr;
@@ -36,10 +44,21 @@ use std::time::Duration;
 mod auth;
 mod context;
 mod ecs_registration;
+mod eec;
 mod types;
 
-use context::{ees_context_final, ees_context_init, ees_self};
-use types::EasRegistration;
+use context::{ees_context_final, ees_context_init, ees_self, UpdateError};
+use eec::EecRegistration;
+use types::{cause, EasDiscoveryReq, EasDiscoveryResp, EasDiscoverySubscription, EasRegistration};
+
+/// Interval (seconds) between lifecycle sweeps that drop expired registrations.
+const LIFECYCLE_SWEEP_INTERVAL_SECS: u64 = 30;
+
+/// Resource path prefix for EEC registration resources.
+const EECREG_REGISTRATIONS_PATH: &str = "/eees-eecregistration/v1/registrations";
+
+/// Resource path prefix for EAS discovery subscription resources.
+const EASDISC_SUBSCRIPTIONS_PATH: &str = "/eees-easdiscovery/v1/subscriptions";
 
 /// Resource path prefix (relative to the EES apiRoot) for the individual EAS
 /// registration resources — `{apiRoot}/eees-easregistration/v1/registrations`.
@@ -209,6 +228,9 @@ async fn main() -> Result<()> {
     )
     .await;
 
+    // eesd-12: drop lapsed EAS/EEC registrations on a periodic schedule.
+    spawn_lifecycle_sweep();
+
     log::info!("NextGCore EES ready (eesId: {ees_id})");
 
     while !shutdown.load(Ordering::SeqCst) {
@@ -261,13 +283,13 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             match method {
                 "GET" => handle_eas_get(registration_id).await,
                 "DELETE" => handle_eas_deregister(registration_id).await,
-                // eesd-04 (PUT/PATCH update) DEFERRED.
+                // eesd-04: full-replace (PUT) and RFC 7396 merge (PATCH).
+                "PUT" => handle_eas_update(registration_id, &request).await,
+                "PATCH" => handle_eas_modify(registration_id, &request).await,
                 _ => send_method_not_allowed(method, "registrations/{registrationId}"),
             }
         }
         // eees-easdiscovery (TS 24.558 §5.3) — EAS discovery (EDGE-1/EDGE-3).
-        // NOTE: full EasDiscoveryReq/Resp/Filter model + subscriptions are
-        // DEFERRED (eesd-05); this exposes the spec path with a minimal filter.
         ["eees-easdiscovery", "v1", "eas-profiles", "request-discovery"] => {
             if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EASDISCOVERY) {
                 return resp;
@@ -277,8 +299,106 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
                 _ => send_method_not_allowed(method, "eas-profiles/request-discovery"),
             }
         }
+        // eesd-05: EAS discovery-change subscriptions.
+        ["eees-easdiscovery", "v1", "subscriptions"] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EASDISCOVERY) {
+                return resp;
+            }
+            match method {
+                "POST" => handle_disc_sub_create(&request).await,
+                "GET" => handle_disc_sub_list().await,
+                _ => send_method_not_allowed(method, "subscriptions"),
+            }
+        }
+        ["eees-easdiscovery", "v1", "subscriptions", subscription_id] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EASDISCOVERY) {
+                return resp;
+            }
+            match method {
+                "GET" => handle_disc_sub_get(subscription_id).await,
+                "PUT" => handle_disc_sub_update(subscription_id, &request).await,
+                "DELETE" => handle_disc_sub_delete(subscription_id).await,
+                _ => send_method_not_allowed(method, "subscriptions/{subscriptionId}"),
+            }
+        }
+        // eesd-06: eees-eecregistration (TS 24.558 §5.2) — EEC registration (EDGE-1).
+        ["eees-eecregistration", "v1", "registrations"] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EECREGISTRATION) {
+                return resp;
+            }
+            match method {
+                "POST" => handle_eec_register(&request).await,
+                "GET" => handle_eec_list().await,
+                _ => send_method_not_allowed(method, "registrations"),
+            }
+        }
+        ["eees-eecregistration", "v1", "registrations", registration_id] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EECREGISTRATION) {
+                return resp;
+            }
+            match method {
+                "GET" => handle_eec_get(registration_id).await,
+                "PUT" => handle_eec_update(registration_id, &request).await,
+                "PATCH" => handle_eec_modify(registration_id, &request).await,
+                "DELETE" => handle_eec_deregister(registration_id).await,
+                _ => send_method_not_allowed(method, "registrations/{registrationId}"),
+            }
+        }
         _ => send_not_found(&format!("Resource not found: {path}"), None),
     }
+}
+
+/// Spawn the periodic expTime lifecycle sweep (eesd-12).
+fn spawn_lifecycle_sweep() {
+    tokio::spawn(async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(LIFECYCLE_SWEEP_INTERVAL_SECS)).await;
+            let now = types::now_epoch();
+            if let Ok(ctx) = ees_self().read() {
+                ctx.sweep_expired(now);
+            }
+        }
+    });
+}
+
+/// Map a context [`UpdateError`] to the appropriate RFC 7807 response.
+fn update_error_response(err: UpdateError, resource: &str) -> SbiResponse {
+    match err {
+        UpdateError::NotFound => send_not_found(
+            &format!("{resource} not found"),
+            Some(cause::SUBSCRIPTION_NOT_FOUND),
+        ),
+        UpdateError::IdImmutable => send_error(
+            403,
+            "Forbidden",
+            "The immutable identifier (easId/eecId) shall not be modified",
+            Some(cause::MODIFICATION_NOT_ALLOWED),
+        ),
+        UpdateError::Invalid => {
+            send_bad_request("Update failed validation", Some(cause::MANDATORY_IE_MISSING))
+        }
+        UpdateError::Internal => {
+            send_error(500, "Internal Server Error", "Update failed", Some("UNSPECIFIED_NF_FAILURE"))
+        }
+    }
+}
+
+/// Parse the request body as JSON, distinguishing a missing body and malformed
+/// JSON with the right 3GPP cause. The error response is boxed (it is large
+/// relative to the success value; clippy `result_large_err`).
+fn parse_json_body(request: &SbiRequest) -> Result<serde_json::Value, Box<SbiResponse>> {
+    let body = request.http.content.as_ref().ok_or_else(|| {
+        Box::new(send_bad_request(
+            "Missing request body",
+            Some(cause::MANDATORY_IE_MISSING),
+        ))
+    })?;
+    serde_json::from_str(body).map_err(|e| {
+        Box::new(send_bad_request(
+            &format!("Invalid JSON: {e}"),
+            Some(cause::INVALID_MSG_FORMAT),
+        ))
+    })
 }
 
 /// eesd-02/03: handle EAS Registration (`CreateEASRegistration`).
@@ -302,30 +422,41 @@ async fn handle_eas_register(request: &SbiRequest) -> SbiResponse {
         Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_MSG_FORMAT")),
     };
 
-    let reg: EasRegistration = match serde_json::from_value(value) {
+    let mut reg: EasRegistration = match serde_json::from_value(value) {
         Ok(r) => r,
         Err(e) => {
             return send_bad_request(
                 &format!("Missing or invalid mandatory IE: {e}"),
-                Some("MANDATORY_IE_MISSING"),
+                Some(cause::MANDATORY_IE_MISSING),
             );
         }
     };
 
     // eesd-03: the consumer-provided easId is mandatory and must be non-empty.
     if reg.eas_prof.eas_id.trim().is_empty() {
-        return send_bad_request("Mandatory IE easProf.easId is empty", Some("MANDATORY_IE_MISSING"));
+        return send_bad_request(
+            "Mandatory IE easProf.easId is empty",
+            Some(cause::MANDATORY_IE_MISSING),
+        );
     }
     // eesd-02: endPt must carry at least one reachable address form.
     if reg.eas_prof.end_pt.is_empty() {
         return send_bad_request(
             "Mandatory IE easProf.endPt carries no address",
-            Some("MANDATORY_IE_MISSING"),
+            Some(cause::MANDATORY_IE_MISSING),
         );
     }
 
+    // eesd-11: negotiate suppFeat (echoed in the 201 body).
+    reg.supp_feat = types::negotiate_supp_feat(reg.supp_feat.as_deref());
+
     let ctx = ees_self();
-    let stored = ctx.read().ok().and_then(|context| context.eas_register(reg));
+    let stored = ctx.read().ok().and_then(|context| {
+        let stored = context.eas_register(reg)?;
+        // eesd-05: notify any discovery subscriptions selecting the new EAS.
+        context.notify_discovery_subscribers(&stored.eas_prof);
+        Some(stored)
+    });
 
     match stored {
         Some(stored) => {
@@ -338,10 +469,72 @@ async fn handle_eas_register(request: &SbiRequest) -> SbiResponse {
                 .with_json_body(&stored)
                 .unwrap_or_else(|_| SbiResponse::with_status(201))
         }
-        None => send_bad_request(
+        None => send_error(
+            507,
+            "Insufficient Storage",
             "Failed to register EAS (capacity exhausted)",
-            Some("INSUFFICIENT_RESOURCES"),
+            Some(cause::INSUFFICIENT_RESOURCES),
         ),
+    }
+}
+
+/// eesd-04: handle EAS Registration full-replace (`UpdateIndEASRegistration`,
+/// PUT). Deserializes a full `EASRegistration`, rejects a changed `easId`
+/// (immutable), preserves the `registrationId`, and returns the updated
+/// representation (200).
+async fn handle_eas_update(registration_id: &str, request: &SbiRequest) -> SbiResponse {
+    let value = match parse_json_body(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let mut reg: EasRegistration = match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Missing or invalid mandatory IE: {e}"),
+                Some(cause::MANDATORY_IE_MISSING),
+            );
+        }
+    };
+    if reg.eas_prof.eas_id.trim().is_empty() || reg.eas_prof.end_pt.is_empty() {
+        return send_bad_request(
+            "Mandatory IE easProf.easId/endPt missing",
+            Some(cause::MANDATORY_IE_MISSING),
+        );
+    }
+    reg.supp_feat = types::negotiate_supp_feat(reg.supp_feat.as_deref());
+
+    let ctx = ees_self();
+    let result = ctx
+        .read()
+        .map_err(|_| UpdateError::Internal)
+        .and_then(|c| c.eas_update(registration_id, reg));
+    match result {
+        Ok(updated) => SbiResponse::with_status(200)
+            .with_json_body(&updated)
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        Err(e) => update_error_response(e, &format!("EAS registration {registration_id}")),
+    }
+}
+
+/// eesd-04: handle EAS Registration merge (`ModifyIndEASRegistration`, PATCH,
+/// `application/merge-patch+json`). Applies an RFC 7396 merge-patch, rejecting
+/// an `easId` change, and returns the updated representation (200).
+async fn handle_eas_modify(registration_id: &str, request: &SbiRequest) -> SbiResponse {
+    let patch = match parse_json_body(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let ctx = ees_self();
+    let result = ctx
+        .read()
+        .map_err(|_| UpdateError::Internal)
+        .and_then(|c| c.eas_modify(registration_id, &patch));
+    match result {
+        Ok(updated) => SbiResponse::with_status(200)
+            .with_json_body(&updated)
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        Err(e) => update_error_response(e, &format!("EAS registration {registration_id}")),
     }
 }
 
@@ -390,49 +583,297 @@ async fn handle_eas_deregister(registration_id: &str) -> SbiResponse {
     }
 }
 
-/// eesd-05 (minimal): handle EAS Discovery (`GetEASDiscInfo`).
+/// eesd-05: handle EAS Discovery (`GetEASDiscInfo`).
 ///
-/// Parses an optional `easId` / `type` filter from either the top level or the
-/// `easDiscoveryFilter.easChars` object and returns matching `EASProfile`s
-/// wrapped as `discoveredEas[].eas` (TS 24.558 `EasDiscoveryResp` shape). The
-/// full filter model, location filtering, and discovery subscriptions are
-/// DEFERRED (eesd-05/eesd-09). The invented `distanceScore` is gone.
+/// Deserializes the spec `EasDiscoveryReq` (mandatory `requestorId`), applies
+/// the `easDiscoveryFilter` (easId/easType/acIds/svcArea), and returns an
+/// `EasDiscoveryResp` carrying full `EASProfile`s as `discoveredEas[].eas` with
+/// the negotiated `suppFeat`. No invented `distanceScore`. UE-location filtering
+/// from `locInf`/NEF is DEFERRED (eesd-09).
 async fn handle_eas_discover(request: &SbiRequest) -> SbiResponse {
     log::info!("EAS Discovery");
 
-    let body = match &request.http.content {
-        Some(content) => content,
-        None => return send_bad_request("Missing request body", Some("MANDATORY_IE_MISSING")),
-    };
-
-    let data: serde_json::Value = match serde_json::from_str(body) {
+    let value = match parse_json_body(request) {
         Ok(v) => v,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_MSG_FORMAT")),
+        Err(resp) => return *resp,
+    };
+    let req: EasDiscoveryReq = match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Missing or invalid mandatory IE (requestorId): {e}"),
+                Some(cause::MANDATORY_IE_MISSING),
+            );
+        }
     };
 
-    let eas_id = data
-        .pointer("/easDiscoveryFilter/easChars/easId")
-        .or_else(|| data.get("easId"))
-        .and_then(|v| v.as_str());
-    let eas_type = data
-        .pointer("/easDiscoveryFilter/easChars/type")
-        .or_else(|| data.get("type"))
-        .and_then(|v| v.as_str());
-
+    let supp_feat = types::negotiate_supp_feat(req.supp_feat.as_deref());
     let ctx = ees_self();
-    let discovered: Vec<serde_json::Value> = ctx
+    let discovered_eas = ctx
         .read()
         .map(|c| {
-            c.eas_discover(eas_id, eas_type)
+            c.eas_discover_filter(req.eas_discovery_filter.as_ref())
                 .into_iter()
-                .map(|eas| serde_json::json!({ "eas": eas }))
+                .map(|eas| types::DiscoveredEas { eas })
                 .collect()
         })
         .unwrap_or_default();
 
+    let resp = EasDiscoveryResp {
+        discovered_eas,
+        supp_feat,
+    };
     SbiResponse::with_status(200)
-        .with_json_body(&serde_json::json!({ "discoveredEas": discovered }))
+        .with_json_body(&resp)
         .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+// ---- eesd-05: EAS discovery subscription handlers --------------------------
+
+/// `CreateEASDiscSub` (POST /subscriptions): create a discovery-change
+/// subscription with a server-minted `subscriptionId` and a `Location` header.
+async fn handle_disc_sub_create(request: &SbiRequest) -> SbiResponse {
+    let value = match parse_json_body(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let mut sub: EasDiscoverySubscription = match serde_json::from_value(value) {
+        Ok(s) => s,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Missing or invalid mandatory IE (notificationUri): {e}"),
+                Some(cause::MANDATORY_IE_MISSING),
+            );
+        }
+    };
+    if sub.notification_uri.trim().is_empty() {
+        return send_bad_request(
+            "Mandatory IE notificationUri is empty",
+            Some(cause::MANDATORY_IE_MISSING),
+        );
+    }
+    sub.supp_feat = types::negotiate_supp_feat(sub.supp_feat.as_deref());
+
+    let ctx = ees_self();
+    let created = ctx.read().ok().and_then(|c| c.disc_sub_create(sub));
+    match created {
+        Some(created) => {
+            let id = created.subscription_id.clone().unwrap_or_default();
+            SbiResponse::with_status(201)
+                .with_header("Location", format!("{EASDISC_SUBSCRIPTIONS_PATH}/{id}"))
+                .with_json_body(&created)
+                .unwrap_or_else(|_| SbiResponse::with_status(201))
+        }
+        None => send_error(
+            507,
+            "Insufficient Storage",
+            "Failed to create discovery subscription (capacity exhausted)",
+            Some(cause::INSUFFICIENT_RESOURCES),
+        ),
+    }
+}
+
+async fn handle_disc_sub_list() -> SbiResponse {
+    let subs = ees_self().read().map(|c| c.disc_sub_list()).unwrap_or_default();
+    SbiResponse::with_status(200)
+        .with_json_body(&subs)
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+async fn handle_disc_sub_get(subscription_id: &str) -> SbiResponse {
+    let sub = ees_self().read().ok().and_then(|c| c.disc_sub_find(subscription_id));
+    match sub {
+        Some(sub) => SbiResponse::with_status(200)
+            .with_json_body(&sub)
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("Discovery subscription {subscription_id} not found"),
+            Some(cause::SUBSCRIPTION_NOT_FOUND),
+        ),
+    }
+}
+
+async fn handle_disc_sub_update(subscription_id: &str, request: &SbiRequest) -> SbiResponse {
+    let value = match parse_json_body(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let mut sub: EasDiscoverySubscription = match serde_json::from_value(value) {
+        Ok(s) => s,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Missing or invalid mandatory IE: {e}"),
+                Some(cause::MANDATORY_IE_MISSING),
+            );
+        }
+    };
+    if sub.notification_uri.trim().is_empty() {
+        return send_bad_request(
+            "Mandatory IE notificationUri is empty",
+            Some(cause::MANDATORY_IE_MISSING),
+        );
+    }
+    sub.supp_feat = types::negotiate_supp_feat(sub.supp_feat.as_deref());
+
+    let ctx = ees_self();
+    let result = ctx
+        .read()
+        .map_err(|_| UpdateError::Internal)
+        .and_then(|c| c.disc_sub_update(subscription_id, sub));
+    match result {
+        Ok(updated) => SbiResponse::with_status(200)
+            .with_json_body(&updated)
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        Err(e) => update_error_response(e, &format!("Discovery subscription {subscription_id}")),
+    }
+}
+
+async fn handle_disc_sub_delete(subscription_id: &str) -> SbiResponse {
+    let removed = ees_self().read().ok().and_then(|c| c.disc_sub_delete(subscription_id));
+    match removed {
+        Some(_) => SbiResponse::with_status(204),
+        None => send_not_found(
+            &format!("Discovery subscription {subscription_id} not found"),
+            Some(cause::SUBSCRIPTION_NOT_FOUND),
+        ),
+    }
+}
+
+// ---- eesd-06: EEC registration handlers ------------------------------------
+
+/// `CreateEECReg` (POST /registrations): register an EEC with a server-minted
+/// `registrationId` and an `expTime` lifecycle (minted when absent, eesd-12).
+async fn handle_eec_register(request: &SbiRequest) -> SbiResponse {
+    log::info!("EEC Register");
+    let value = match parse_json_body(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let mut reg: EecRegistration = match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Missing or invalid mandatory IE (eecId): {e}"),
+                Some(cause::MANDATORY_IE_MISSING),
+            );
+        }
+    };
+    if let Err(detail) = reg.validate() {
+        return send_bad_request(&detail, Some(cause::MANDATORY_IE_MISSING));
+    }
+    // eesd-12: mint an expTime when the consumer supplied none.
+    if reg.exp_time.is_none() {
+        reg.exp_time = Some(types::epoch_to_rfc3339(
+            types::now_epoch() + eec::DEFAULT_EEC_REG_LIFETIME_SECS,
+        ));
+    }
+    // eesd-11: negotiate suppFeat.
+    reg.supp_feat = types::negotiate_supp_feat(reg.supp_feat.as_deref());
+
+    let ctx = ees_self();
+    let stored = ctx.read().ok().and_then(|c| c.eec_register(reg));
+    match stored {
+        Some(stored) => {
+            let id = stored.registration_id.clone().unwrap_or_default();
+            SbiResponse::with_status(201)
+                .with_header("Location", format!("{EECREG_REGISTRATIONS_PATH}/{id}"))
+                .with_json_body(&stored)
+                .unwrap_or_else(|_| SbiResponse::with_status(201))
+        }
+        None => send_error(
+            507,
+            "Insufficient Storage",
+            "Failed to register EEC (capacity exhausted)",
+            Some(cause::INSUFFICIENT_RESOURCES),
+        ),
+    }
+}
+
+async fn handle_eec_list() -> SbiResponse {
+    let regs = ees_self().read().map(|c| c.eec_list()).unwrap_or_default();
+    SbiResponse::with_status(200)
+        .with_json_body(&regs)
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+async fn handle_eec_get(registration_id: &str) -> SbiResponse {
+    let reg = ees_self().read().ok().and_then(|c| c.eec_find(registration_id));
+    match reg {
+        Some(reg) => SbiResponse::with_status(200)
+            .with_json_body(&reg)
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("EEC registration {registration_id} not found"),
+            Some(cause::SUBSCRIPTION_NOT_FOUND),
+        ),
+    }
+}
+
+async fn handle_eec_update(registration_id: &str, request: &SbiRequest) -> SbiResponse {
+    let value = match parse_json_body(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let mut reg: EecRegistration = match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Missing or invalid mandatory IE (eecId): {e}"),
+                Some(cause::MANDATORY_IE_MISSING),
+            );
+        }
+    };
+    if let Err(detail) = reg.validate() {
+        return send_bad_request(&detail, Some(cause::MANDATORY_IE_MISSING));
+    }
+    if reg.exp_time.is_none() {
+        reg.exp_time = Some(types::epoch_to_rfc3339(
+            types::now_epoch() + eec::DEFAULT_EEC_REG_LIFETIME_SECS,
+        ));
+    }
+    reg.supp_feat = types::negotiate_supp_feat(reg.supp_feat.as_deref());
+
+    let ctx = ees_self();
+    let result = ctx
+        .read()
+        .map_err(|_| UpdateError::Internal)
+        .and_then(|c| c.eec_update(registration_id, reg));
+    match result {
+        Ok(updated) => SbiResponse::with_status(200)
+            .with_json_body(&updated)
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        Err(e) => update_error_response(e, &format!("EEC registration {registration_id}")),
+    }
+}
+
+async fn handle_eec_modify(registration_id: &str, request: &SbiRequest) -> SbiResponse {
+    let patch = match parse_json_body(request) {
+        Ok(v) => v,
+        Err(resp) => return *resp,
+    };
+    let ctx = ees_self();
+    let result = ctx
+        .read()
+        .map_err(|_| UpdateError::Internal)
+        .and_then(|c| c.eec_modify(registration_id, &patch));
+    match result {
+        Ok(updated) => SbiResponse::with_status(200)
+            .with_json_body(&updated)
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        Err(e) => update_error_response(e, &format!("EEC registration {registration_id}")),
+    }
+}
+
+async fn handle_eec_deregister(registration_id: &str) -> SbiResponse {
+    log::info!("EEC Deregister: {registration_id}");
+    let removed = ees_self().read().ok().and_then(|c| c.eec_deregister(registration_id));
+    match removed {
+        Some(_) => SbiResponse::with_status(204),
+        None => send_not_found(
+            &format!("EEC registration {registration_id} not found"),
+            Some(cause::SUBSCRIPTION_NOT_FOUND),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -622,6 +1063,265 @@ mod tests {
         let resp = block_on(ees_sbi_request_handler(req));
         assert_eq!(resp.status, 200);
         assert!(resp.http.content.as_deref().unwrap().contains("discoveredEas"));
+
+        auth::clear_auth_jwks();
+    }
+
+    /// Register an EAS through the router and return its server-minted
+    /// `registrationId` (from the `Location` header).
+    fn register_eas(sk: &SigningKey, eas_id: &str, eas_type: &str) -> String {
+        let body = format!(
+            r#"{{"easProf":{{"easId":"{eas_id}","endPt":{{"fqdn":"{eas_id}"}},"type":"{eas_type}"}}}}"#
+        );
+        let req = SbiRequest::post("/eees-easregistration/v1/registrations")
+            .with_header("Authorization", bearer(sk, "k1", "eees-easregistration"))
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 201);
+        resp.http
+            .get_header("location")
+            .unwrap()
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_string()
+    }
+
+    /// eesd-04: PUT full-replace updates `expTime`/`type` (200) keeping `easId`;
+    /// PUT that changes `easId` is rejected (403).
+    #[test]
+    fn test_eas_put_replace_and_reject_eas_id_change() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        let id = register_eas(&sk, "eas-put.example.com", "VIDEO");
+
+        // PUT replace: new type + expTime, same easId → 200.
+        let body = r#"{"easProf":{"easId":"eas-put.example.com","endPt":{"fqdn":"x"},"type":"AR"},"expTime":"2030-01-01T00:00:00Z"}"#;
+        let req = SbiRequest::put(format!("/eees-easregistration/v1/registrations/{id}"))
+            .with_header("Authorization", bearer(&sk, "k1", "eees-easregistration"))
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let updated: EasRegistration =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(updated.eas_prof.eas_type.as_deref(), Some("AR"));
+        assert_eq!(updated.exp_time.as_deref(), Some("2030-01-01T00:00:00Z"));
+        assert_eq!(updated.registration_id.as_deref(), Some(id.as_str()));
+
+        // PUT that changes easId → 403.
+        let bad = r#"{"easProf":{"easId":"other.example.com","endPt":{"fqdn":"x"}}}"#;
+        let req = SbiRequest::put(format!("/eees-easregistration/v1/registrations/{id}"))
+            .with_header("Authorization", bearer(&sk, "k1", "eees-easregistration"))
+            .with_body(bad, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 403);
+
+        // PUT on an unknown id → 404.
+        let req = SbiRequest::put("/eees-easregistration/v1/registrations/does-not-exist")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-easregistration"))
+            .with_body(body, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 404);
+
+        auth::clear_auth_jwks();
+    }
+
+    /// eesd-04: PATCH RFC 7396 merge updates a mutable field (200).
+    #[test]
+    fn test_eas_patch_merge() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        let id = register_eas(&sk, "eas-patch.example.com", "VIDEO");
+        let patch = r#"{"easProf":{"type":"AR"}}"#;
+        let req = SbiRequest::patch(format!("/eees-easregistration/v1/registrations/{id}"))
+            .with_header("Authorization", bearer(&sk, "k1", "eees-easregistration"))
+            .with_body(patch, "application/merge-patch+json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let updated: EasRegistration =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(updated.eas_prof.eas_type.as_deref(), Some("AR"));
+        assert_eq!(updated.eas_prof.eas_id, "eas-patch.example.com");
+
+        // PATCH changing the immutable easId → 403.
+        let bad = r#"{"easProf":{"easId":"changed.example.com"}}"#;
+        let req = SbiRequest::patch(format!("/eees-easregistration/v1/registrations/{id}"))
+            .with_header("Authorization", bearer(&sk, "k1", "eees-easregistration"))
+            .with_body(bad, "application/merge-patch+json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 403);
+
+        auth::clear_auth_jwks();
+    }
+
+    /// eesd-05: discovery filter returns only the matching `EASProfile`; a
+    /// non-matching filter returns an empty `discoveredEas`.
+    #[test]
+    fn test_eas_discovery_filter_returns_matching_profile() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        register_eas(&sk, "eas-disc-uniq.example.com", "V2X");
+
+        // Filter by the exact easId → exactly one match.
+        let body = r#"{"requestorId":"eec-1","easDiscoveryFilter":{"easChars":{"easId":"eas-disc-uniq.example.com"}}}"#;
+        let req = SbiRequest::post("/eees-easdiscovery/v1/eas-profiles/request-discovery")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-easdiscovery"))
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let dr: EasDiscoveryResp =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(dr.discovered_eas.len(), 1);
+        assert_eq!(dr.discovered_eas[0].eas.eas_id, "eas-disc-uniq.example.com");
+
+        // Non-matching filter → empty.
+        let body = r#"{"requestorId":"eec-1","easDiscoveryFilter":{"easChars":{"easId":"nope.example.com"}}}"#;
+        let req = SbiRequest::post("/eees-easdiscovery/v1/eas-profiles/request-discovery")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-easdiscovery"))
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        let dr: EasDiscoveryResp =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(dr.discovered_eas.is_empty());
+
+        auth::clear_auth_jwks();
+    }
+
+    /// eesd-05: a discovery subscription create returns 201 + a `Location`.
+    #[test]
+    fn test_disc_subscription_create() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        let body = r#"{"notificationUri":"http://eec/cb","easDiscoveryFilter":{"easChars":{"easType":"V2X"}}}"#;
+        let req = SbiRequest::post("/eees-easdiscovery/v1/subscriptions")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-easdiscovery"))
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 201);
+        let loc = resp.http.get_header("location").cloned().unwrap();
+        assert!(loc.starts_with(EASDISC_SUBSCRIPTIONS_PATH));
+
+        // The minted subscriptionId is fetchable.
+        let sub_id = loc.rsplit('/').next().unwrap();
+        let req = SbiRequest::get(format!("/eees-easdiscovery/v1/subscriptions/{sub_id}"))
+            .with_header("Authorization", bearer(&sk, "k1", "eees-easdiscovery"));
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 200);
+
+        auth::clear_auth_jwks();
+    }
+
+    /// eesd-06: full EEC registration lifecycle through the router
+    /// (POST→201/GET→200/PUT→200/PATCH→200/DELETE→204/GET→404) with a
+    /// server-minted `expTime`.
+    #[test]
+    fn test_eec_register_lifecycle_router() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        // POST → 201 + Location + minted expTime.
+        let body = r#"{"eecId":"eec1.example.com","ueId":"gpsi-1","acProfs":[{"acId":"ac1"}]}"#;
+        let req = SbiRequest::post("/eees-eecregistration/v1/registrations")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-eecregistration"))
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 201);
+        let stored: EecRegistration =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(stored.eec_id, "eec1.example.com");
+        assert!(stored.exp_time.is_some(), "EES mints an expTime when absent");
+        let id = stored.registration_id.clone().unwrap();
+
+        // GET → 200.
+        let req = SbiRequest::get(format!("/eees-eecregistration/v1/registrations/{id}"))
+            .with_header("Authorization", bearer(&sk, "k1", "eees-eecregistration"));
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 200);
+
+        // PUT replace → 200; eecId change → 403.
+        let put = r#"{"eecId":"eec1.example.com","ueId":"gpsi-2"}"#;
+        let req = SbiRequest::put(format!("/eees-eecregistration/v1/registrations/{id}"))
+            .with_header("Authorization", bearer(&sk, "k1", "eees-eecregistration"))
+            .with_body(put, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 200);
+        let bad = r#"{"eecId":"eec2.example.com"}"#;
+        let req = SbiRequest::put(format!("/eees-eecregistration/v1/registrations/{id}"))
+            .with_header("Authorization", bearer(&sk, "k1", "eees-eecregistration"))
+            .with_body(bad, "application/json");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 403);
+
+        // PATCH merge → 200.
+        let patch = r#"{"ueId":"gpsi-3"}"#;
+        let req = SbiRequest::patch(format!("/eees-eecregistration/v1/registrations/{id}"))
+            .with_header("Authorization", bearer(&sk, "k1", "eees-eecregistration"))
+            .with_body(patch, "application/merge-patch+json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        let patched: EecRegistration =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(patched.ue_id.as_deref(), Some("gpsi-3"));
+
+        // DELETE → 204; subsequent GET → 404.
+        let req = SbiRequest::delete(format!("/eees-eecregistration/v1/registrations/{id}"))
+            .with_header("Authorization", bearer(&sk, "k1", "eees-eecregistration"));
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 204);
+        let req = SbiRequest::get(format!("/eees-eecregistration/v1/registrations/{id}"))
+            .with_header("Authorization", bearer(&sk, "k1", "eees-eecregistration"));
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 404);
+
+        auth::clear_auth_jwks();
+    }
+
+    /// eesd-08: the EEC registration route is OAuth2-gated (no token → 401).
+    #[test]
+    fn test_eec_route_requires_auth() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        auth::clear_auth_jwks();
+        let req = SbiRequest::post("/eees-eecregistration/v1/registrations");
+        assert_eq!(block_on(ees_sbi_request_handler(req)).status, 401);
+    }
+
+    /// eesd-11: a registration carrying `suppFeat="1"` echoes the negotiated
+    /// `suppFeat` in the 201 body.
+    #[test]
+    fn test_supp_feat_echoed_on_register() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        let body = r#"{"easProf":{"easId":"eas-feat.example.com","endPt":{"fqdn":"x"}},"suppFeat":"1"}"#;
+        let req = SbiRequest::post("/eees-easregistration/v1/registrations")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-easregistration"))
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 201);
+        let stored: EasRegistration =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(stored.supp_feat.as_deref(), Some("1"));
 
         auth::clear_auth_jwks();
     }

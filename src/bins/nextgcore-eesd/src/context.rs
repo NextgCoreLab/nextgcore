@@ -5,11 +5,29 @@
 //! resources keyed by a server-minted `registrationId` (eesd-03) and indexes
 //! the consumer `easId` separately for discovery.
 
-use crate::types::{EasProfile, EasRegistration};
+use crate::eec::EecRegistration;
+use crate::types::{
+    apply_merge_patch, is_expired, EasDiscoveryFilter, EasDiscoverySubscription, EasProfile,
+    EasRegistration,
+};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
+
+/// Outcome of a merge-patch / replace update that can fail for several
+/// spec-distinct reasons mapped to different HTTP status codes by the handler.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UpdateError {
+    /// Resource `registrationId` does not exist → 404.
+    NotFound,
+    /// Attempt to change an immutable identifier (`easId`/`eecId`) → 403.
+    IdImmutable,
+    /// Result failed re-validation (e.g. missing mandatory IE) → 400.
+    Invalid,
+    /// Internal lock/serialization failure → 500.
+    Internal,
+}
 
 /// EES Context - main context structure.
 pub struct EesContext {
@@ -18,7 +36,11 @@ pub struct EesContext {
     /// `easId` -> `[registrationId]` index (one easId may map to several
     /// registrations); used for discovery.
     eas_id_index: RwLock<HashMap<String, Vec<String>>>,
-    /// Maximum EAS registrations.
+    /// EEC registrations (eesd-06), keyed by the server-minted `registrationId`.
+    eec_registrations: RwLock<HashMap<String, EecRegistration>>,
+    /// EAS discovery-change subscriptions (eesd-05), keyed by `subscriptionId`.
+    disc_subscriptions: RwLock<HashMap<String, EasDiscoverySubscription>>,
+    /// Maximum registrations (applied per resource family).
     max_eas: usize,
     /// Context initialized flag.
     initialized: AtomicBool,
@@ -29,6 +51,8 @@ impl EesContext {
         Self {
             registrations: RwLock::new(HashMap::new()),
             eas_id_index: RwLock::new(HashMap::new()),
+            eec_registrations: RwLock::new(HashMap::new()),
+            disc_subscriptions: RwLock::new(HashMap::new()),
             max_eas: 0,
             initialized: AtomicBool::new(false),
         }
@@ -52,6 +76,12 @@ impl EesContext {
         }
         if let Ok(mut index) = self.eas_id_index.write() {
             index.clear();
+        }
+        if let Ok(mut eecs) = self.eec_registrations.write() {
+            eecs.clear();
+        }
+        if let Ok(mut subs) = self.disc_subscriptions.write() {
+            subs.clear();
         }
         self.initialized.store(false, Ordering::SeqCst);
         log::info!("EES context finalized");
@@ -143,6 +173,278 @@ impl EesContext {
             .filter(|p| eas_type.is_none_or(|t| p.eas_type.as_deref() == Some(t)))
             .cloned()
             .collect()
+    }
+
+    /// eesd-05: full discovery — return every stored `EASProfile` that satisfies
+    /// `filter` (an absent filter returns all served EASs). No invented scoring.
+    pub fn eas_discover_filter(&self, filter: Option<&EasDiscoveryFilter>) -> Vec<EasProfile> {
+        let regs = match self.registrations.read() {
+            Ok(r) => r,
+            Err(_) => return vec![],
+        };
+        regs.values()
+            .map(|r| &r.eas_prof)
+            .filter(|p| filter.is_none_or(|f| f.matches(p)))
+            .cloned()
+            .collect()
+    }
+
+    /// eesd-04: full-replace an EAS registration (`UpdateIndEASRegistration`,
+    /// PUT). Preserves the `registrationId`; rejects an attempt to change the
+    /// immutable `easId`. `reg` is assumed already mandatory-IE-validated.
+    pub fn eas_update(
+        &self,
+        registration_id: &str,
+        mut reg: EasRegistration,
+    ) -> Result<EasRegistration, UpdateError> {
+        let mut regs = self.registrations.write().map_err(|_| UpdateError::Internal)?;
+        let existing = regs.get(registration_id).ok_or(UpdateError::NotFound)?;
+        if existing.eas_prof.eas_id != reg.eas_prof.eas_id {
+            return Err(UpdateError::IdImmutable);
+        }
+        reg.registration_id = Some(registration_id.to_string());
+        regs.insert(registration_id.to_string(), reg.clone());
+        log::info!("EAS registration replaced: registrationId={registration_id}");
+        Ok(reg)
+    }
+
+    /// eesd-04: RFC 7396 merge-patch an EAS registration
+    /// (`ModifyIndEASRegistration`, PATCH). Applies `patch` onto the stored
+    /// JSON, re-validates, and rejects an `easId` change.
+    pub fn eas_modify(
+        &self,
+        registration_id: &str,
+        patch: &serde_json::Value,
+    ) -> Result<EasRegistration, UpdateError> {
+        let mut regs = self.registrations.write().map_err(|_| UpdateError::Internal)?;
+        let stored = regs.get(registration_id).ok_or(UpdateError::NotFound)?;
+        let old_eas_id = stored.eas_prof.eas_id.clone();
+
+        let mut value = serde_json::to_value(stored).map_err(|_| UpdateError::Internal)?;
+        apply_merge_patch(&mut value, patch);
+        let mut updated: EasRegistration =
+            serde_json::from_value(value).map_err(|_| UpdateError::Invalid)?;
+
+        if updated.eas_prof.eas_id != old_eas_id {
+            return Err(UpdateError::IdImmutable);
+        }
+        if updated.eas_prof.eas_id.trim().is_empty() || updated.eas_prof.end_pt.is_empty() {
+            return Err(UpdateError::Invalid);
+        }
+        updated.registration_id = Some(registration_id.to_string());
+        regs.insert(registration_id.to_string(), updated.clone());
+        log::info!("EAS registration merge-patched: registrationId={registration_id}");
+        Ok(updated)
+    }
+
+    // ---- eesd-06: EEC registration store -------------------------------------
+
+    /// Register an EEC; mints a `registrationId`, preserves the `eecId`.
+    pub fn eec_register(&self, mut reg: EecRegistration) -> Option<EecRegistration> {
+        let mut eecs = self.eec_registrations.write().ok()?;
+        if eecs.len() >= self.max_eas {
+            log::error!("Maximum EEC registrations [{}] reached", self.max_eas);
+            return None;
+        }
+        let registration_id = Uuid::new_v4().to_string();
+        reg.registration_id = Some(registration_id.clone());
+        eecs.insert(registration_id.clone(), reg.clone());
+        log::info!(
+            "EEC registered: registrationId={registration_id} eecId={}",
+            reg.eec_id
+        );
+        Some(reg)
+    }
+
+    pub fn eec_find(&self, registration_id: &str) -> Option<EecRegistration> {
+        self.eec_registrations
+            .read()
+            .ok()?
+            .get(registration_id)
+            .cloned()
+    }
+
+    pub fn eec_list(&self) -> Vec<EecRegistration> {
+        self.eec_registrations
+            .read()
+            .map(|r| r.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn eec_deregister(&self, registration_id: &str) -> Option<EecRegistration> {
+        let removed = self.eec_registrations.write().ok()?.remove(registration_id);
+        if removed.is_some() {
+            log::info!("EEC deregistered: registrationId={registration_id}");
+        }
+        removed
+    }
+
+    /// PUT full-replace an EEC registration; rejects an `eecId` change.
+    pub fn eec_update(
+        &self,
+        registration_id: &str,
+        mut reg: EecRegistration,
+    ) -> Result<EecRegistration, UpdateError> {
+        let mut eecs = self
+            .eec_registrations
+            .write()
+            .map_err(|_| UpdateError::Internal)?;
+        let existing = eecs.get(registration_id).ok_or(UpdateError::NotFound)?;
+        if existing.eec_id != reg.eec_id {
+            return Err(UpdateError::IdImmutable);
+        }
+        reg.registration_id = Some(registration_id.to_string());
+        eecs.insert(registration_id.to_string(), reg.clone());
+        Ok(reg)
+    }
+
+    /// PATCH merge an EEC registration; rejects an `eecId` change.
+    pub fn eec_modify(
+        &self,
+        registration_id: &str,
+        patch: &serde_json::Value,
+    ) -> Result<EecRegistration, UpdateError> {
+        let mut eecs = self
+            .eec_registrations
+            .write()
+            .map_err(|_| UpdateError::Internal)?;
+        let stored = eecs.get(registration_id).ok_or(UpdateError::NotFound)?;
+        let old_eec_id = stored.eec_id.clone();
+
+        let mut value = serde_json::to_value(stored).map_err(|_| UpdateError::Internal)?;
+        apply_merge_patch(&mut value, patch);
+        let mut updated: EecRegistration =
+            serde_json::from_value(value).map_err(|_| UpdateError::Invalid)?;
+        if updated.eec_id != old_eec_id {
+            return Err(UpdateError::IdImmutable);
+        }
+        if updated.validate().is_err() {
+            return Err(UpdateError::Invalid);
+        }
+        updated.registration_id = Some(registration_id.to_string());
+        eecs.insert(registration_id.to_string(), updated.clone());
+        Ok(updated)
+    }
+
+    // ---- eesd-05: EAS discovery subscription store ---------------------------
+
+    pub fn disc_sub_create(
+        &self,
+        mut sub: EasDiscoverySubscription,
+    ) -> Option<EasDiscoverySubscription> {
+        let mut subs = self.disc_subscriptions.write().ok()?;
+        if subs.len() >= self.max_eas {
+            return None;
+        }
+        let subscription_id = Uuid::new_v4().to_string();
+        sub.subscription_id = Some(subscription_id.clone());
+        subs.insert(subscription_id, sub.clone());
+        Some(sub)
+    }
+
+    pub fn disc_sub_find(&self, subscription_id: &str) -> Option<EasDiscoverySubscription> {
+        self.disc_subscriptions
+            .read()
+            .ok()?
+            .get(subscription_id)
+            .cloned()
+    }
+
+    pub fn disc_sub_list(&self) -> Vec<EasDiscoverySubscription> {
+        self.disc_subscriptions
+            .read()
+            .map(|s| s.values().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn disc_sub_delete(&self, subscription_id: &str) -> Option<EasDiscoverySubscription> {
+        self.disc_subscriptions.write().ok()?.remove(subscription_id)
+    }
+
+    pub fn disc_sub_update(
+        &self,
+        subscription_id: &str,
+        mut sub: EasDiscoverySubscription,
+    ) -> Result<EasDiscoverySubscription, UpdateError> {
+        let mut subs = self
+            .disc_subscriptions
+            .write()
+            .map_err(|_| UpdateError::Internal)?;
+        if !subs.contains_key(subscription_id) {
+            return Err(UpdateError::NotFound);
+        }
+        sub.subscription_id = Some(subscription_id.to_string());
+        subs.insert(subscription_id.to_string(), sub.clone());
+        Ok(sub)
+    }
+
+    /// eesd-05 notify stub: count the subscriptions whose filter selects
+    /// `changed`. No live notification peer exists in this stack, so delivery is
+    /// logged rather than POSTed (wire delivery DEFERRED). Returns the number of
+    /// matching subscriptions for testability.
+    pub fn notify_discovery_subscribers(&self, changed: &EasProfile) -> usize {
+        let subs = match self.disc_subscriptions.read() {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+        let mut matched = 0;
+        for sub in subs.values() {
+            if sub.filter_matches(changed) {
+                matched += 1;
+                log::debug!(
+                    "EAS discovery notify (stub): would POST to {} for easId={}",
+                    sub.notification_uri,
+                    changed.eas_id
+                );
+            }
+        }
+        matched
+    }
+
+    // ---- eesd-12: expTime lifecycle sweep ------------------------------------
+
+    /// Drop EAS and EEC registrations whose `expTime` is at/before `now_epoch`.
+    /// Absent `expTime` ⇒ never expires. Returns the number removed.
+    pub fn sweep_expired(&self, now_epoch: i64) -> usize {
+        let mut removed = 0;
+
+        if let (Ok(mut regs), Ok(mut index)) =
+            (self.registrations.write(), self.eas_id_index.write())
+        {
+            let expired: Vec<String> = regs
+                .iter()
+                .filter(|(_, r)| is_expired(r.exp_time.as_deref(), now_epoch))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for id in expired {
+                if let Some(r) = regs.remove(&id) {
+                    if let Some(ids) = index.get_mut(&r.eas_prof.eas_id) {
+                        ids.retain(|x| x != &id);
+                        if ids.is_empty() {
+                            index.remove(&r.eas_prof.eas_id);
+                        }
+                    }
+                    removed += 1;
+                }
+            }
+        }
+
+        if let Ok(mut eecs) = self.eec_registrations.write() {
+            let expired: Vec<String> = eecs
+                .iter()
+                .filter(|(_, r)| is_expired(r.exp_time.as_deref(), now_epoch))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for id in expired {
+                eecs.remove(&id);
+                removed += 1;
+            }
+        }
+
+        if removed > 0 {
+            log::info!("EES lifecycle sweep removed {removed} expired registration(s)");
+        }
+        removed
     }
 }
 
@@ -273,5 +575,147 @@ mod tests {
         ctx.init(1);
         assert!(ctx.eas_register(make_reg("a.example.com", "VIDEO")).is_some());
         assert!(ctx.eas_register(make_reg("b.example.com", "VIDEO")).is_none());
+    }
+
+    /// eesd-04: PUT full-replace preserves the registrationId and rejects an
+    /// easId change.
+    #[test]
+    fn test_eas_update_replace_and_reject_eas_id_change() {
+        let mut ctx = EesContext::new();
+        ctx.init(8);
+        let stored = ctx.eas_register(make_reg("eas1.example.com", "VIDEO")).unwrap();
+        let reg_id = stored.registration_id.unwrap();
+
+        // Replace svc/type, keep easId → 200-equivalent Ok.
+        let mut replacement = make_reg("eas1.example.com", "AR");
+        replacement.exp_time = Some("2030-01-01T00:00:00Z".into());
+        let updated = ctx.eas_update(&reg_id, replacement).unwrap();
+        assert_eq!(updated.registration_id.as_deref(), Some(reg_id.as_str()));
+        assert_eq!(updated.eas_prof.eas_type.as_deref(), Some("AR"));
+        assert_eq!(updated.exp_time.as_deref(), Some("2030-01-01T00:00:00Z"));
+
+        // Changing easId is rejected.
+        let changed = make_reg("eas2.example.com", "AR");
+        assert_eq!(ctx.eas_update(&reg_id, changed), Err(UpdateError::IdImmutable));
+
+        // Unknown registrationId → NotFound.
+        assert_eq!(
+            ctx.eas_update("nope", make_reg("eas1.example.com", "AR")),
+            Err(UpdateError::NotFound)
+        );
+    }
+
+    /// eesd-04: PATCH merge-patch updates mutable fields and rejects easId change.
+    #[test]
+    fn test_eas_modify_merge_patch() {
+        let mut ctx = EesContext::new();
+        ctx.init(8);
+        let stored = ctx.eas_register(make_reg("eas1.example.com", "VIDEO")).unwrap();
+        let reg_id = stored.registration_id.unwrap();
+
+        let patch = serde_json::json!({"easProf": {"type": "AR"}});
+        let updated = ctx.eas_modify(&reg_id, &patch).unwrap();
+        assert_eq!(updated.eas_prof.eas_type.as_deref(), Some("AR"));
+        assert_eq!(updated.eas_prof.eas_id, "eas1.example.com"); // untouched
+
+        // Patching the immutable easId is rejected.
+        let bad = serde_json::json!({"easProf": {"easId": "other.example.com"}});
+        assert_eq!(ctx.eas_modify(&reg_id, &bad), Err(UpdateError::IdImmutable));
+    }
+
+    fn make_eec(eec_id: &str) -> EecRegistration {
+        EecRegistration {
+            eec_id: eec_id.into(),
+            ue_id: Some("gpsi-1".into()),
+            ac_profs: None,
+            exp_time: None,
+            supp_feat: None,
+            registration_id: None,
+        }
+    }
+
+    /// eesd-06: EEC register/find/update/modify/deregister lifecycle.
+    #[test]
+    fn test_eec_register_lifecycle() {
+        let mut ctx = EesContext::new();
+        ctx.init(8);
+
+        let stored = ctx.eec_register(make_eec("eec1.example.com")).unwrap();
+        let reg_id = stored.registration_id.clone().unwrap();
+        assert_ne!(reg_id, "eec1.example.com");
+        assert!(ctx.eec_find(&reg_id).is_some());
+        assert_eq!(ctx.eec_list().len(), 1);
+
+        // PUT replace keeps eecId, rejects an eecId change.
+        let mut replace = make_eec("eec1.example.com");
+        replace.ue_id = Some("gpsi-2".into());
+        let updated = ctx.eec_update(&reg_id, replace).unwrap();
+        assert_eq!(updated.ue_id.as_deref(), Some("gpsi-2"));
+        assert_eq!(
+            ctx.eec_update(&reg_id, make_eec("eec2")),
+            Err(UpdateError::IdImmutable)
+        );
+
+        // PATCH merge.
+        let patch = serde_json::json!({"ueId": "gpsi-3"});
+        assert_eq!(
+            ctx.eec_modify(&reg_id, &patch).unwrap().ue_id.as_deref(),
+            Some("gpsi-3")
+        );
+
+        assert!(ctx.eec_deregister(&reg_id).is_some());
+        assert!(ctx.eec_find(&reg_id).is_none());
+        assert!(ctx.eec_deregister(&reg_id).is_none());
+    }
+
+    /// eesd-05: discovery subscription create/find/delete + notify-stub matching.
+    #[test]
+    fn test_disc_subscription_and_notify() {
+        let mut ctx = EesContext::new();
+        ctx.init(8);
+        ctx.eas_register(make_reg("eas1.example.com", "V2X"));
+
+        let sub = EasDiscoverySubscription {
+            notification_uri: "http://eec/callback".into(),
+            eas_discovery_filter: Some(EasDiscoveryFilter {
+                eas_chars: Some(crate::types::EasCharacteristics {
+                    eas_type: Some("V2X".into()),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        let created = ctx.disc_sub_create(sub).unwrap();
+        let sub_id = created.subscription_id.clone().unwrap();
+        assert!(ctx.disc_sub_find(&sub_id).is_some());
+
+        // The V2X EAS matches the V2X-filtered subscription.
+        let v2x = make_reg("eas1.example.com", "V2X");
+        assert_eq!(ctx.notify_discovery_subscribers(&v2x.eas_prof), 1);
+        let ar = make_reg("eas9.example.com", "AR");
+        assert_eq!(ctx.notify_discovery_subscribers(&ar.eas_prof), 0);
+
+        assert!(ctx.disc_sub_delete(&sub_id).is_some());
+        assert!(ctx.disc_sub_find(&sub_id).is_none());
+    }
+
+    /// eesd-12: the sweep drops a lapsed EAS registration but keeps an
+    /// expTime-absent (never-expires) one.
+    #[test]
+    fn test_sweep_expired() {
+        let mut ctx = EesContext::new();
+        ctx.init(8);
+
+        let mut lapsed = make_reg("expired.example.com", "VIDEO");
+        lapsed.exp_time = Some("2000-01-01T00:00:00Z".into());
+        ctx.eas_register(lapsed);
+        ctx.eas_register(make_reg("forever.example.com", "VIDEO")); // no expTime
+
+        assert_eq!(ctx.eas_count(), 2);
+        // now well past 2000 → only the lapsed entry is dropped.
+        let removed = ctx.sweep_expired(crate::types::parse_rfc3339_to_epoch("2020-01-01T00:00:00Z").unwrap());
+        assert_eq!(removed, 1);
+        assert_eq!(ctx.eas_count(), 1);
+        assert!(!ctx.eas_discover(Some("forever.example.com"), None).is_empty());
     }
 }
