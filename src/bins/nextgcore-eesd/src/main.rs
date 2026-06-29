@@ -1,15 +1,28 @@
 //! NextGCore EES (Edge Enabler Server)
 //!
-//! The EES is a Rel-17 network function responsible for (TS 23.558):
-//! - Edge Application Server (EAS) registration and lifecycle
-//! - EAS discovery based on UE location and app requirements
-//! - DNS-based or NRF-based EAS discovery
-//! - UE context transfer during edge relocation
-//! - Edge relocation triggers based on UE mobility
+//! The EES is an Edge Enabler Layer entity (TS 23.558 / TS 24.558 / TS 29.558),
+//! NOT a 5GC NRF-discoverable NF (there is no `nfType "EES"` in TS 29.510). It
+//! exposes the `eees-*` service APIs with the `{apiRoot}/<apiName>/<apiVersion>`
+//! layout and self-registers toward the Edge Configuration Server (ECS) over
+//! EDGE-6, not the NRF.
+//!
+//! Implemented in this bounded chunk:
+//! - eesd-01: `eees-*` apiName routing + ECS-registration scaffold; the bespoke
+//!   `nees-*`/NRF/`NfType::Ees` self-registration is removed.
+//! - eesd-02: `EASRegistration`/`EASProfile`/`EndPoint` data model (`types.rs`)
+//!   with mandatory-IE rejection (400 ProblemDetails).
+//! - eesd-03: server-minted `registrationId` resource key; consumer `easId`
+//!   preserved verbatim and indexed separately.
+//! - eesd-08: per-operation OAuth2 authorization (`auth::require_oauth2`).
+//!
+//! DEFERRED (flagged): eesd-04 (PUT/PATCH update), eesd-05 (full discovery
+//! req/resp/filter + subscriptions), eesd-06 (EEC registration), eesd-07 (ACR),
+//! eesd-09/10 (UE location/identifier exposure), eesd-11 (suppFeat negotiation),
+//! eesd-12 (expTime sweep), eesd-13 (remaining service APIs), eesd-14 (full
+//! conformance suite).
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ogs_sbi::context::global_context;
 use ogs_sbi::message::{SbiRequest, SbiResponse};
 use ogs_sbi::server::{
     send_bad_request, send_method_not_allowed, send_not_found, SbiServer,
@@ -20,9 +33,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod auth;
 mod context;
+mod ecs_registration;
+mod types;
 
-pub use context::*;
+use context::{ees_context_final, ees_context_init, ees_self};
+use types::EasRegistration;
+
+/// Resource path prefix (relative to the EES apiRoot) for the individual EAS
+/// registration resources — `{apiRoot}/eees-easregistration/v1/registrations`.
+const EASREG_REGISTRATIONS_PATH: &str = "/eees-easregistration/v1/registrations";
 
 /// NextGCore EES - Edge Enabler Server
 #[derive(Parser, Debug)]
@@ -71,9 +92,21 @@ struct Args {
     #[arg(long, default_value = "512")]
     max_eas: usize,
 
-    /// NRF URI for registration
-    #[arg(long, default_value = "http://127.0.0.1:7777")]
-    nrf_uri: String,
+    /// ECS apiRoot for EES self-registration over EDGE-6 (TS 29.558 §9.1).
+    /// When unset, the registration request is built and logged but skipped
+    /// (no live ECS peer in this stack). Replaces the former `--nrf-uri`.
+    #[arg(long)]
+    ecs_uri: Option<String>,
+
+    /// EES identifier advertised to the ECS (eesId). Defaults to a fresh UUID.
+    #[arg(long)]
+    ees_id: Option<String>,
+
+    /// Path to a JSON JWKS used to verify OAuth2 access tokens (CAPIF/NRF
+    /// issuer). When unset, every protected operation fails closed with 401
+    /// (authorization is mandatory, TS 29.558 §6).
+    #[arg(long)]
+    oauth2_jwks_file: Option<String>,
 }
 
 fn init_logging(level: &str) {
@@ -88,6 +121,20 @@ fn setup_signal_handlers(shutdown: Arc<AtomicBool>) {
         shutdown.store(true, Ordering::SeqCst);
     })
     .expect("value expected");
+}
+
+/// Load the OAuth2 verification JWKS from `path` into the process-global store.
+fn load_oauth2_jwks(path: &str) {
+    match std::fs::read_to_string(path) {
+        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(jwks) => {
+                auth::set_auth_jwks(jwks);
+                log::info!("Loaded OAuth2 verification JWKS from {path}");
+            }
+            Err(e) => log::error!("Failed to parse OAuth2 JWKS file {path}: {e}"),
+        },
+        Err(e) => log::error!("Failed to read OAuth2 JWKS file {path}: {e}"),
+    }
 }
 
 #[tokio::main]
@@ -109,7 +156,21 @@ async fn main() -> Result<()> {
 
     ees_context_init(args.max_eas);
 
-    let nf_instance_id = format!("ees-{}", uuid::Uuid::new_v4());
+    let ees_id = args
+        .ees_id
+        .clone()
+        .unwrap_or_else(|| format!("ees-{}", uuid::Uuid::new_v4()));
+
+    // eesd-08: provision OAuth2 verification keys (fail-closed when absent).
+    if let Some(path) = args.oauth2_jwks_file.as_deref() {
+        load_oauth2_jwks(path);
+    }
+    if !auth::is_auth_configured() {
+        log::warn!(
+            "OAuth2 verification keys not configured: all EES operations will be rejected with \
+             401 (per-operation OAuth2 is mandatory, TS 29.558 §6)"
+        );
+    }
 
     let shutdown = Arc::new(AtomicBool::new(false));
     setup_signal_handlers(shutdown.clone());
@@ -139,16 +200,16 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start SBI server: {e}"))?;
 
-    // Register with NRF
-    let sbi_ctx = global_context();
-    sbi_ctx.set_nrf_uri(&args.nrf_uri).await;
-    if let Err(e) = register_with_nrf(&args.sbi_addr, args.sbi_port, &nf_instance_id).await {
-        log::warn!("NRF registration failed (will operate without NRF): {e}");
-    } else {
-        ogs_sbi::heartbeat::spawn_heartbeat_worker(nf_instance_id.clone(), 5);
-    }
+    // eesd-01: self-register toward the ECS (EDGE-6), not the NRF.
+    ecs_registration::start_ecs_registration(
+        args.ecs_uri.as_deref(),
+        &ees_id,
+        &args.sbi_addr,
+        args.sbi_port,
+    )
+    .await;
 
-    log::info!("NextGCore EES ready (instance: {nf_instance_id})");
+    log::info!("NextGCore EES ready (eesId: {ees_id})");
 
     while !shutdown.load(Ordering::SeqCst) {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -166,7 +227,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// EES SBI request handler
+/// EES SBI request handler.
+///
+/// Routes on the `eees-*` apiNames with the `{apiRoot}/<apiName>/<apiVersion>`
+/// layout (eesd-01). Every protected operation is gated by per-operation OAuth2
+/// (eesd-08) *before* the method is dispatched. The legacy `nees-*` /
+/// `uecontexttransfer` paths are gone and fall through to 404.
 async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let method = request.header.method.as_str();
     let uri = &request.header.uri;
@@ -177,452 +243,247 @@ async fn ees_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
     match parts.as_slice() {
-        // EAS Registration (Nees_EASRegistration)
-        ["nees-easregistration", "v1", "registrations"] => match method {
-            "POST" => handle_eas_register(&request).await,
-            "GET" => handle_eas_list().await,
-            _ => send_method_not_allowed(method, "registrations"),
-        },
-        ["nees-easregistration", "v1", "registrations", eas_id] => match method {
-            "GET" => handle_eas_get(eas_id).await,
-            "DELETE" => handle_eas_deregister(eas_id).await,
-            _ => send_method_not_allowed(method, "registrations/{id}"),
-        },
-        // EAS Discovery (Nees_EASDiscovery)
-        ["nees-easdiscovery", "v1", "discover"] => match method {
-            "POST" => handle_eas_discover(&request).await,
-            _ => send_method_not_allowed(method, "discover"),
-        },
-        // UE Context Transfer (Nees_UEContextTransfer)
-        ["nees-uecontexttransfer", "v1", "contexts"] => match method {
-            "POST" => handle_ue_context_store(&request).await,
-            _ => send_method_not_allowed(method, "contexts"),
-        },
-        ["nees-uecontexttransfer", "v1", "contexts", supi] => match method {
-            "GET" => handle_ue_context_get(supi).await,
-            "PATCH" => handle_ue_context_transfer(supi, &request).await,
-            _ => send_method_not_allowed(method, "contexts/{supi}"),
-        },
+        // eees-easregistration (TS 29.558 §5.2) — EAS registration (EDGE-3).
+        ["eees-easregistration", "v1", "registrations"] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EASREGISTRATION) {
+                return resp;
+            }
+            match method {
+                "POST" => handle_eas_register(&request).await,
+                "GET" => handle_eas_list().await,
+                _ => send_method_not_allowed(method, "registrations"),
+            }
+        }
+        ["eees-easregistration", "v1", "registrations", registration_id] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EASREGISTRATION) {
+                return resp;
+            }
+            match method {
+                "GET" => handle_eas_get(registration_id).await,
+                "DELETE" => handle_eas_deregister(registration_id).await,
+                // eesd-04 (PUT/PATCH update) DEFERRED.
+                _ => send_method_not_allowed(method, "registrations/{registrationId}"),
+            }
+        }
+        // eees-easdiscovery (TS 24.558 §5.3) — EAS discovery (EDGE-1/EDGE-3).
+        // NOTE: full EasDiscoveryReq/Resp/Filter model + subscriptions are
+        // DEFERRED (eesd-05); this exposes the spec path with a minimal filter.
+        ["eees-easdiscovery", "v1", "eas-profiles", "request-discovery"] => {
+            if let Some(resp) = auth::require_oauth2(&request, auth::SCOPE_EASDISCOVERY) {
+                return resp;
+            }
+            match method {
+                "POST" => handle_eas_discover(&request).await,
+                _ => send_method_not_allowed(method, "eas-profiles/request-discovery"),
+            }
+        }
         _ => send_not_found(&format!("Resource not found: {path}"), None),
     }
 }
 
-/// Handle EAS Registration
+/// eesd-02/03: handle EAS Registration (`CreateEASRegistration`).
+///
+/// Parses the `easProf`-wrapped `EASRegistration` body, rejects a missing
+/// mandatory `easProf.easId`/`easProf.endPt` with 400 ProblemDetails
+/// (`MANDATORY_IE_MISSING`), mints a server `registrationId`, preserves the
+/// consumer `easId`, and echoes the stored `EASRegistration` with a `Location`
+/// header keyed on the `registrationId`.
 async fn handle_eas_register(request: &SbiRequest) -> SbiResponse {
     log::info!("EAS Register");
 
     let body = match &request.http.content {
         Some(content) => content,
-        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+        None => return send_bad_request("Missing request body", Some("MANDATORY_IE_MISSING")),
     };
 
-    let data: serde_json::Value = match serde_json::from_str(body) {
-        Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+    // Distinguish malformed JSON from a structurally-missing mandatory IE.
+    let value: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_MSG_FORMAT")),
     };
 
-    let endpoint = data
-        .get("endpoint")
-        .and_then(|v| v.as_str())
-        .unwrap_or("http://localhost:8080");
-    let app_id = data
-        .get("appId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("default-app");
-    let eas_type = data
-        .get("easType")
-        .and_then(|v| v.as_str())
-        .unwrap_or("GENERIC");
-    let dns_name = data
-        .get("dnsName")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let tacs: Vec<u32> = data
-        .get("servingAreaTacs")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_u64().map(|n| n as u32))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let profile = EasProfile {
-        eas_id: String::new(),
-        endpoint: endpoint.to_string(),
-        app_id: app_id.to_string(),
-        eas_type: eas_type.to_string(),
-        serving_area_tacs: tacs,
-        status: EasStatus::Registered,
-        capabilities: EasCapabilities::default(),
-        dns_name,
+    let reg: EasRegistration = match serde_json::from_value(value) {
+        Ok(r) => r,
+        Err(e) => {
+            return send_bad_request(
+                &format!("Missing or invalid mandatory IE: {e}"),
+                Some("MANDATORY_IE_MISSING"),
+            );
+        }
     };
+
+    // eesd-03: the consumer-provided easId is mandatory and must be non-empty.
+    if reg.eas_prof.eas_id.trim().is_empty() {
+        return send_bad_request("Mandatory IE easProf.easId is empty", Some("MANDATORY_IE_MISSING"));
+    }
+    // eesd-02: endPt must carry at least one reachable address form.
+    if reg.eas_prof.end_pt.is_empty() {
+        return send_bad_request(
+            "Mandatory IE easProf.endPt carries no address",
+            Some("MANDATORY_IE_MISSING"),
+        );
+    }
 
     let ctx = ees_self();
-    let result = if let Ok(context) = ctx.read() {
-        context.eas_register(profile)
-    } else {
-        None
-    };
+    let stored = ctx.read().ok().and_then(|context| context.eas_register(reg));
 
-    match result {
-        Some(profile) => SbiResponse::with_status(201)
-            .with_header(
-                "Location",
-                format!("/nees-easregistration/v1/registrations/{}", profile.eas_id),
-            )
-            .with_json_body(&serde_json::json!({
-                "easId": profile.eas_id,
-                "endpoint": profile.endpoint,
-                "appId": profile.app_id,
-                "easType": profile.eas_type,
-                "status": "REGISTERED",
-            }))
-            .unwrap_or_else(|_| SbiResponse::with_status(201)),
-        None => send_bad_request("Failed to register EAS", Some("REGISTRATION_FAILED")),
+    match stored {
+        Some(stored) => {
+            let registration_id = stored.registration_id.clone().unwrap_or_default();
+            SbiResponse::with_status(201)
+                .with_header(
+                    "Location",
+                    format!("{EASREG_REGISTRATIONS_PATH}/{registration_id}"),
+                )
+                .with_json_body(&stored)
+                .unwrap_or_else(|_| SbiResponse::with_status(201))
+        }
+        None => send_bad_request(
+            "Failed to register EAS (capacity exhausted)",
+            Some("INSUFFICIENT_RESOURCES"),
+        ),
     }
 }
 
-/// Handle EAS List
+/// List all stored EAS registrations.
 async fn handle_eas_list() -> SbiResponse {
     let ctx = ees_self();
-    let profiles: Vec<serde_json::Value> = if let Ok(context) = ctx.read() {
-        context
-            .eas_list()
-            .iter()
-            .map(|p| {
-                serde_json::json!({
-                    "easId": p.eas_id,
-                    "endpoint": p.endpoint,
-                    "appId": p.app_id,
-                    "easType": p.eas_type,
-                    "status": format!("{:?}", p.status),
-                })
-            })
-            .collect()
-    } else {
-        vec![]
-    };
+    let registrations = ctx.read().map(|c| c.eas_list()).unwrap_or_default();
 
     SbiResponse::with_status(200)
-        .with_json_body(&serde_json::json!({"registrations": profiles}))
+        .with_json_body(&registrations)
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
-/// Handle EAS Get
-async fn handle_eas_get(eas_id: &str) -> SbiResponse {
+/// Get an individual EAS registration by its server-minted `registrationId`.
+async fn handle_eas_get(registration_id: &str) -> SbiResponse {
     let ctx = ees_self();
-    let profile = if let Ok(context) = ctx.read() {
-        context.eas_find(eas_id)
-    } else {
-        None
-    };
+    let reg = ctx.read().ok().and_then(|c| c.eas_find(registration_id));
 
-    match profile {
-        Some(p) => SbiResponse::with_status(200)
-            .with_json_body(&serde_json::json!({
-                "easId": p.eas_id,
-                "endpoint": p.endpoint,
-                "appId": p.app_id,
-                "easType": p.eas_type,
-                "dnsName": p.dns_name,
-                "servingAreaTacs": p.serving_area_tacs,
-                "status": format!("{:?}", p.status),
-            }))
+    match reg {
+        Some(reg) => SbiResponse::with_status(200)
+            .with_json_body(&reg)
             .unwrap_or_else(|_| SbiResponse::with_status(200)),
-        None => send_not_found(&format!("EAS {eas_id} not found"), Some("EAS_NOT_FOUND")),
+        None => send_not_found(
+            &format!("EAS registration {registration_id} not found"),
+            Some("SUBSCRIPTION_NOT_FOUND"),
+        ),
     }
 }
 
-/// Handle EAS Deregister
-async fn handle_eas_deregister(eas_id: &str) -> SbiResponse {
-    log::info!("EAS Deregister: {eas_id}");
+/// Deregister an EAS by its `registrationId` (`DeleteIndEASRegistration`).
+async fn handle_eas_deregister(registration_id: &str) -> SbiResponse {
+    log::info!("EAS Deregister: {registration_id}");
 
     let ctx = ees_self();
-    let removed = if let Ok(context) = ctx.read() {
-        context.eas_deregister(eas_id)
-    } else {
-        None
-    };
+    let removed = ctx
+        .read()
+        .ok()
+        .and_then(|c| c.eas_deregister(registration_id));
 
     match removed {
         Some(_) => SbiResponse::with_status(204),
-        None => send_not_found(&format!("EAS {eas_id} not found"), Some("EAS_NOT_FOUND")),
+        None => send_not_found(
+            &format!("EAS registration {registration_id} not found"),
+            Some("SUBSCRIPTION_NOT_FOUND"),
+        ),
     }
 }
 
-/// Handle EAS Discovery (TS 23.558 8.5)
+/// eesd-05 (minimal): handle EAS Discovery (`GetEASDiscInfo`).
+///
+/// Parses an optional `easId` / `type` filter from either the top level or the
+/// `easDiscoveryFilter.easChars` object and returns matching `EASProfile`s
+/// wrapped as `discoveredEas[].eas` (TS 24.558 `EasDiscoveryResp` shape). The
+/// full filter model, location filtering, and discovery subscriptions are
+/// DEFERRED (eesd-05/eesd-09). The invented `distanceScore` is gone.
 async fn handle_eas_discover(request: &SbiRequest) -> SbiResponse {
     log::info!("EAS Discovery");
 
     let body = match &request.http.content {
         Some(content) => content,
-        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+        None => return send_bad_request("Missing request body", Some("MANDATORY_IE_MISSING")),
     };
 
     let data: serde_json::Value = match serde_json::from_str(body) {
-        Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+        Ok(v) => v,
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_MSG_FORMAT")),
     };
 
-    let app_id = data.get("appId").and_then(|v| v.as_str()).unwrap_or("");
-    let tac = data
-        .get("servingTac")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as u32);
+    let eas_id = data
+        .pointer("/easDiscoveryFilter/easChars/easId")
+        .or_else(|| data.get("easId"))
+        .and_then(|v| v.as_str());
+    let eas_type = data
+        .pointer("/easDiscoveryFilter/easChars/type")
+        .or_else(|| data.get("type"))
+        .and_then(|v| v.as_str());
 
     let ctx = ees_self();
-    let results: Vec<serde_json::Value> = if let Ok(context) = ctx.read() {
-        context
-            .eas_discover(app_id, tac)
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "easId": r.eas_id,
-                    "endpoint": r.endpoint,
-                    "appId": r.app_id,
-                    "dnsName": r.dns_name,
-                    "distanceScore": r.distance_score,
-                })
-            })
-            .collect()
-    } else {
-        vec![]
-    };
+    let discovered: Vec<serde_json::Value> = ctx
+        .read()
+        .map(|c| {
+            c.eas_discover(eas_id, eas_type)
+                .into_iter()
+                .map(|eas| serde_json::json!({ "eas": eas }))
+                .collect()
+        })
+        .unwrap_or_default();
 
     SbiResponse::with_status(200)
-        .with_json_body(&serde_json::json!({
-            "discoveryResults": results,
-            "resultCount": results.len(),
-        }))
+        .with_json_body(&serde_json::json!({ "discoveredEas": discovered }))
         .unwrap_or_else(|_| SbiResponse::with_status(200))
-}
-
-/// Handle UE Context Store
-async fn handle_ue_context_store(request: &SbiRequest) -> SbiResponse {
-    let body = match &request.http.content {
-        Some(content) => content,
-        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
-    };
-
-    let data: serde_json::Value = match serde_json::from_str(body) {
-        Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
-    };
-
-    let supi = data
-        .get("supi")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let eas_id = data
-        .get("currentEasId")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let app_data = data
-        .get("appContextData")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let tac = data.get("servingTac").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-
-    let ue_ctx = UeEdgeContext {
-        supi: supi.to_string(),
-        current_eas_id: eas_id,
-        app_context_data: app_data,
-        serving_tac: tac,
-    };
-
-    let ctx = ees_self();
-    let stored = if let Ok(context) = ctx.read() {
-        context.ue_context_store(ue_ctx)
-    } else {
-        false
-    };
-
-    if stored {
-        SbiResponse::with_status(201)
-            .with_json_body(&serde_json::json!({"supi": supi, "result": "STORED"}))
-            .unwrap_or_else(|_| SbiResponse::with_status(201))
-    } else {
-        send_bad_request("Failed to store UE context", Some("STORE_FAILED"))
-    }
-}
-
-/// Handle UE Context Get
-async fn handle_ue_context_get(supi: &str) -> SbiResponse {
-    let ctx = ees_self();
-    let ue_ctx = if let Ok(context) = ctx.read() {
-        context.ue_context_get(supi)
-    } else {
-        None
-    };
-
-    match ue_ctx {
-        Some(c) => SbiResponse::with_status(200)
-            .with_json_body(&serde_json::json!({
-                "supi": c.supi,
-                "currentEasId": c.current_eas_id,
-                "servingTac": c.serving_tac,
-            }))
-            .unwrap_or_else(|_| SbiResponse::with_status(200)),
-        None => send_not_found(
-            &format!("UE context for {supi} not found"),
-            Some("CONTEXT_NOT_FOUND"),
-        ),
-    }
-}
-
-/// Handle UE Context Transfer (edge relocation)
-async fn handle_ue_context_transfer(supi: &str, request: &SbiRequest) -> SbiResponse {
-    log::info!("UE Context Transfer: {supi}");
-
-    let body = match &request.http.content {
-        Some(content) => content,
-        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
-    };
-
-    let data: serde_json::Value = match serde_json::from_str(body) {
-        Ok(p) => p,
-        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
-    };
-
-    let new_eas_id = data
-        .get("targetEasId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    let ctx = ees_self();
-    let transferred = if let Ok(context) = ctx.read() {
-        context.ue_context_transfer(supi, new_eas_id)
-    } else {
-        false
-    };
-
-    if transferred {
-        SbiResponse::with_status(200)
-            .with_json_body(&serde_json::json!({
-                "supi": supi,
-                "targetEasId": new_eas_id,
-                "result": "TRANSFERRED",
-            }))
-            .unwrap_or_else(|_| SbiResponse::with_status(200))
-    } else {
-        send_not_found(
-            &format!("UE context for {supi} not found"),
-            Some("CONTEXT_NOT_FOUND"),
-        )
-    }
-}
-
-/// Register EES with NRF
-async fn register_with_nrf(
-    sbi_addr: &str,
-    sbi_port: u16,
-    nf_instance_id: &str,
-) -> Result<(), String> {
-    let sbi_ctx = global_context();
-
-    let nrf_uri = sbi_ctx.get_nrf_uri().await;
-    let nrf_uri = match nrf_uri {
-        Some(uri) => uri,
-        None => {
-            log::debug!("No NRF URI configured, skipping NRF registration");
-            return Ok(());
-        }
-    };
-
-    log::info!("Registering EES with NRF at {nrf_uri}");
-
-    let (nrf_host, nrf_port) = parse_host_port(&nrf_uri).ok_or("Invalid NRF URI")?;
-    let client = sbi_ctx.get_client(&nrf_host, nrf_port).await;
-
-    let nf_profile = serde_json::json!({
-        "nfInstanceId": nf_instance_id,
-        "nfType": "EES",
-        "nfStatus": "REGISTERED",
-        "ipv4Addresses": [sbi_addr],
-        "nfServices": [
-            {
-                "serviceInstanceId": format!("{}-nees-easregistration", nf_instance_id),
-                "serviceName": "nees-easregistration",
-                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
-                "nfServiceStatus": "REGISTERED",
-                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-            },
-            {
-                "serviceInstanceId": format!("{}-nees-easdiscovery", nf_instance_id),
-                "serviceName": "nees-easdiscovery",
-                "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.0.0"}],
-                "scheme": "http",
-                "nfServiceStatus": "REGISTERED",
-                "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
-            }
-        ],
-        "allowedNfTypes": ["AMF", "SMF", "NEF", "SCP"],
-        "heartBeatTimer": 10
-    });
-
-    let path = format!("/nnrf-nfm/v1/nf-instances/{nf_instance_id}");
-    log::debug!("NRF registration: PUT {path}");
-
-    let response = client
-        .put_json(&path, &nf_profile)
-        .await
-        .map_err(|e| format!("NRF registration failed: {e}"))?;
-
-    match response.status {
-        200 | 201 => {
-            log::info!("EES registered with NRF successfully (id={nf_instance_id})");
-
-            let mut self_instance =
-                ogs_sbi::context::NfInstance::new(nf_instance_id, ogs_sbi::types::NfType::Ees);
-            self_instance.ipv4_addresses = vec![sbi_addr.to_string()];
-            let mut svc = ogs_sbi::context::NfService::new(
-                "nees-easregistration",
-                ogs_sbi::types::SbiServiceType::NneesEasregistration,
-            );
-            svc.port = sbi_port;
-            svc.ip_addresses = vec![sbi_addr.to_string()];
-            self_instance.add_service(svc);
-            let mut svc2 = ogs_sbi::context::NfService::new(
-                "nees-easdiscovery",
-                ogs_sbi::types::SbiServiceType::NneesEasdiscovery,
-            );
-            svc2.port = sbi_port;
-            svc2.ip_addresses = vec![sbi_addr.to_string()];
-            self_instance.add_service(svc2);
-            sbi_ctx.set_self_instance(self_instance).await;
-
-            Ok(())
-        }
-        _ => Err(format!(
-            "NRF registration returned status {}",
-            response.status
-        )),
-    }
-}
-
-/// Parse host and port from a URI string (e.g., "http://localhost:7777")
-fn parse_host_port(uri: &str) -> Option<(String, u16)> {
-    let without_scheme = uri
-        .strip_prefix("https://")
-        .or_else(|| uri.strip_prefix("http://"))
-        .unwrap_or(uri);
-    let (host_port, _path) = without_scheme
-        .split_once('/')
-        .unwrap_or((without_scheme, ""));
-    if let Some((host, port_str)) = host_port.rsplit_once(':') {
-        let port: u16 = port_str.parse().ok()?;
-        Some((host.to_string(), port))
-    } else {
-        let default_port = if uri.starts_with("https://") { 443 } else { 80 };
-        Some((host_port.to_string(), default_port))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+
+    fn signing_key() -> SigningKey {
+        SigningKey::from_slice(&[9u8; 32]).unwrap()
+    }
+
+    fn jwks_for(sk: &SigningKey, kid: &str) -> serde_json::Value {
+        let point = sk.verifying_key().to_encoded_point(false);
+        serde_json::json!({"keys":[{
+            "kty":"EC","crv":"P-256","use":"sig","alg":"ES256","kid":kid,
+            "x": URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+            "y": URL_SAFE_NO_PAD.encode(point.y().unwrap()),
+        }]})
+    }
+
+    fn bearer(sk: &SigningKey, kid: &str, scope: &str) -> String {
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+        let header = format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{kid}"}}"#);
+        let claims = serde_json::json!({
+            "iss":"CAPIF","sub":"eec-1","aud":"EES","scope":scope,"exp":exp,"iat":0
+        })
+        .to_string();
+        let h = URL_SAFE_NO_PAD.encode(header.as_bytes());
+        let p = URL_SAFE_NO_PAD.encode(claims.as_bytes());
+        let sig: Signature = sk.sign(format!("{h}.{p}").as_bytes());
+        let s = URL_SAFE_NO_PAD.encode(sig.to_bytes());
+        format!("Bearer {h}.{p}.{s}")
+    }
+
+    /// Drive the async router from a synchronous test on a current-thread
+    /// runtime. Used by the global-state tests so the serializing `Mutex` guard
+    /// is held only across a *synchronous* `block_on`, never across an async
+    /// await point (clippy `await_holding_lock`).
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
 
     #[test]
     fn test_args_default() {
@@ -630,5 +491,138 @@ mod tests {
         assert_eq!(args.config, "/etc/nextgcore/ees.yaml");
         assert_eq!(args.sbi_port, 7814);
         assert_eq!(args.max_eas, 512);
+        // eesd-01: NRF removed in favour of an optional ECS apiRoot.
+        assert!(args.ecs_uri.is_none());
+    }
+
+    /// eesd-01: a legacy `nees-*` path is no longer routed → 404.
+    #[tokio::test]
+    async fn test_router_rejects_legacy_nees_path() {
+        let req = SbiRequest::post("/nees-easregistration/v1/registrations");
+        let resp = ees_sbi_request_handler(req).await;
+        assert_eq!(resp.status, 404);
+    }
+
+    /// eesd-08: a protected `eees-*` route with no token → 401 (the route
+    /// matched and the OAuth2 gate fired before any handler ran).
+    #[test]
+    fn test_router_eees_route_requires_auth() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        auth::clear_auth_jwks();
+        let req = SbiRequest::post("/eees-easregistration/v1/registrations");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 401);
+    }
+
+    /// eesd-08: a valid token carrying the wrong scope → 403.
+    #[test]
+    fn test_router_wrong_scope_403() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+        let req = SbiRequest::post("/eees-easregistration/v1/registrations")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-easdiscovery"));
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 403);
+        auth::clear_auth_jwks();
+    }
+
+    /// eesd-01/02/03: a valid token + spec example body → 201 with a `Location`
+    /// keyed on a server-minted `registrationId` (≠ easId) and an echoed body
+    /// whose `easProf.easId` round-trips.
+    #[test]
+    fn test_eas_register_mints_registration_id_and_location() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        let body = r#"{"easProf":{"easId":"eas1.example.com","endPt":{"fqdn":"eas1.example.com"}}}"#;
+        let req = SbiRequest::post("/eees-easregistration/v1/registrations")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-easregistration"))
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+
+        assert_eq!(resp.status, 201);
+        let location = resp.http.get_header("location").cloned().unwrap();
+        assert!(location.starts_with(EASREG_REGISTRATIONS_PATH));
+        let registration_id = location.rsplit('/').next().unwrap();
+        assert_ne!(registration_id, "eas1.example.com");
+        assert!(!registration_id.is_empty());
+
+        let stored: EasRegistration =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(stored.eas_prof.eas_id, "eas1.example.com");
+        assert_eq!(stored.registration_id.as_deref(), Some(registration_id));
+
+        auth::clear_auth_jwks();
+    }
+
+    /// eesd-02: a body missing the mandatory `endPt` → 400 ProblemDetails.
+    #[test]
+    fn test_eas_register_missing_endpt_400() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        let body = r#"{"easProf":{"easId":"eas1.example.com"}}"#;
+        let req = SbiRequest::post("/eees-easregistration/v1/registrations")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-easregistration"))
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 400);
+
+        auth::clear_auth_jwks();
+    }
+
+    /// eesd-03: an empty `easId` is rejected as a missing mandatory IE → 400.
+    #[test]
+    fn test_eas_register_empty_eas_id_400() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        let body = r#"{"easProf":{"easId":"","endPt":{"fqdn":"eas1.example.com"}}}"#;
+        let req = SbiRequest::post("/eees-easregistration/v1/registrations")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-easregistration"))
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 400);
+
+        auth::clear_auth_jwks();
+    }
+
+    /// eesd-01/05: the `eees-easdiscovery` spec path is routed and, with a valid
+    /// discovery-scope token, returns a `discoveredEas` envelope (200).
+    #[test]
+    fn test_eas_discovery_route_dispatches() {
+        let _g = auth::GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        ees_context_init(512);
+        let sk = signing_key();
+        auth::set_auth_jwks(jwks_for(&sk, "k1"));
+
+        let body = r#"{"requestorId":"eec-1","easDiscoveryFilter":{"easChars":{"type":"V2X"}}}"#;
+        let req = SbiRequest::post("/eees-easdiscovery/v1/eas-profiles/request-discovery")
+            .with_header("Authorization", bearer(&sk, "k1", "eees-easdiscovery"))
+            .with_body(body, "application/json");
+        let resp = block_on(ees_sbi_request_handler(req));
+        assert_eq!(resp.status, 200);
+        assert!(resp.http.content.as_deref().unwrap().contains("discoveredEas"));
+
+        auth::clear_auth_jwks();
     }
 }

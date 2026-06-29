@@ -2206,6 +2206,7 @@ name = "nextgcore-eesd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "ctrlc",
  "env_logger",
@@ -2214,7 +2215,9 @@ dependencies = [
  "ogs-core",
  "ogs-metrics",
  "ogs-sbi",
+ "p256",
  "proptest",
+ "serde",
  "serde_json",
  "tokio",
  "uuid",
@@ -2289,6 +2292,7 @@ dependencies = [
  "ogs-metrics",
  "ogs-sbi",
  "proptest",
+ "serde",
  "serde_json",
  "tokio",
  "uuid",
@@ -2299,6 +2303,7 @@ name = "nextgcore-mbsmfd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "ctrlc",
  "env_logger",
@@ -2307,8 +2312,10 @@ dependencies = [
  "ogs-app",
  "ogs-core",
  "ogs-metrics",
+ "ogs-pfcp",
  "ogs-sbi",
  "proptest",
+ "serde",
  "serde_json",
  "tokio",
  "uuid",
