@@ -7,6 +7,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
+use crate::positioning::{
+    rtt_ns_to_range_m, solve_aoa, solve_ecid, solve_multi_rtt, AoaObservation, RttObservation,
+    TrpCoord, TrpRegistry,
+};
+
 /// Positioning method (TS 23.273 6.1)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PositioningMethod {
@@ -156,6 +161,10 @@ pub struct LmfContext {
     supported_methods: Vec<PositioningMethod>,
     /// Context initialized
     initialized: AtomicBool,
+    /// Cell coordinate registry (NR-CGI -> geodetic coord) for the real solvers.
+    /// Populated via [`LmfContext::set_cell_coord`] from config or tests.
+    /// Empty means unconfigured; real solvers fall back to the heuristic placeholder.
+    cell_registry: RwLock<HashMap<String, TrpCoord>>,
 }
 
 impl LmfContext {
@@ -173,6 +182,7 @@ impl LmfContext {
                 PositioningMethod::Gnss,
             ],
             initialized: AtomicBool::new(false),
+            cell_registry: RwLock::new(HashMap::new()),
         }
     }
 
@@ -253,6 +263,10 @@ impl LmfContext {
         request_id: u64,
         cell_measurements: Vec<CellMeasurement>,
     ) -> Option<LocationEstimate> {
+        // Build the registry snapshot while holding only the cell_registry read
+        // lock; drop it before acquiring the write locks below to avoid deadlock.
+        let registry = self.build_trp_registry();
+
         let mut measurements = self.measurements.write().ok()?;
         let mut reports = self.reports.write().ok()?;
 
@@ -260,7 +274,7 @@ impl LmfContext {
         measurement.state = MeasurementState::Completed;
 
         // Compute location estimate based on method and measurements
-        let location = compute_location(&measurement.method, &cell_measurements);
+        let location = compute_location(&measurement.method, &cell_measurements, &registry);
 
         let report = NrppaMeasurementReport {
             request_id,
@@ -321,18 +335,149 @@ impl LmfContext {
     pub fn measurement_count(&self) -> usize {
         self.measurements.read().map(|m| m.len()).unwrap_or(0)
     }
+
+    /// Register (or update) a cell geodetic coordinate for use by the real
+    /// positioning solvers. `nr_cgi` is the NR-CGI string that matches
+    /// [`CellMeasurement::nr_cgi`]. Call this from config loading or tests.
+    pub fn set_cell_coord(&self, nr_cgi: impl Into<String>, coord: TrpCoord) {
+        if let Ok(mut reg) = self.cell_registry.write() {
+            reg.insert(nr_cgi.into(), coord);
+        }
+    }
+
+    /// Build an owned [`TrpRegistry`] snapshot from the current cell
+    /// coordinates (centroid-anchored origin). The caller drops the read lock
+    /// before any write operations.
+    pub fn build_trp_registry(&self) -> TrpRegistry {
+        if let Ok(cells) = self.cell_registry.read() {
+            TrpRegistry::from_entries(cells.iter().map(|(k, v)| (k.clone(), *v)))
+        } else {
+            TrpRegistry::from_entries(std::iter::empty())
+        }
+    }
 }
 
-/// Compute location estimate from cell measurements (simplified)
+/// Compute a location estimate from cell measurements.
+///
+/// When `registry` is non-empty and contains coordinates for the reported
+/// cells, this calls the real geometric solvers from [`crate::positioning`].
+/// Solver priority (highest confidence first):
+///
+/// 1. **Multi-RTT** — if ≥ 3 cells report `rtt_ns` and are in the registry.
+/// 2. **AoA** — if ≥ 2 cells report `aoa` and are in the registry.
+/// 3. **ECID** — if the best-RSRP cell has `timing_advance` and is in the registry.
+///
+/// On any solver failure or when the registry is empty / has no matching
+/// cells, falls back to the heuristic placeholder (lat/lon 0.0, method-based
+/// accuracy estimate) so no existing behaviour regresses.
 fn compute_location(
     method: &PositioningMethod,
     measurements: &[CellMeasurement],
+    registry: &TrpRegistry,
 ) -> LocationEstimate {
     if measurements.is_empty() {
         return LocationEstimate::default();
     }
 
-    // Simplified ECID: use serving cell's RSRP for rough accuracy estimate
+    if !registry.is_empty() {
+        if let Some(est) = try_real_solve(measurements, registry) {
+            return est;
+        }
+    }
+
+    compute_location_placeholder(method, measurements)
+}
+
+/// Attempt a real geometric solve using the positioning solvers.
+/// Returns `None` when there are insufficient registry-matched measurements.
+fn try_real_solve(
+    measurements: &[CellMeasurement],
+    registry: &TrpRegistry,
+) -> Option<LocationEstimate> {
+    // --- Multi-RTT (≥3 cells with rtt_ns known to the registry) -------------
+    let rtt_obs: Vec<RttObservation> = measurements
+        .iter()
+        .filter(|m| m.rtt_ns.is_some() && registry.lookup(&m.nr_cgi).is_some())
+        .map(|m| RttObservation {
+            trp_id: m.nr_cgi.clone(),
+            range_m: rtt_ns_to_range_m(m.rtt_ns.unwrap() as f64),
+        })
+        .collect();
+
+    if rtt_obs.len() >= 3 {
+        match solve_multi_rtt(registry, &rtt_obs) {
+            Ok(est) => {
+                return Some(LocationEstimate {
+                    latitude: est.lat_deg,
+                    longitude: est.lon_deg,
+                    altitude: est.height_m,
+                    horizontal_accuracy: est.horizontal_uncertainty_m(),
+                    vertical_accuracy: None,
+                    method_used: Some(est.method.as_spec_str().to_string()),
+                    timestamp: 0,
+                })
+            }
+            Err(e) => log::warn!("Multi-RTT solve failed: {e}"),
+        }
+    }
+
+    // --- AoA (≥2 cells with aoa known to the registry) ----------------------
+    let aoa_obs: Vec<AoaObservation> = measurements
+        .iter()
+        .filter(|m| m.aoa.is_some() && registry.lookup(&m.nr_cgi).is_some())
+        .map(|m| AoaObservation {
+            trp_id: m.nr_cgi.clone(),
+            azimuth_deg: m.aoa.unwrap(),
+        })
+        .collect();
+
+    if aoa_obs.len() >= 2 {
+        match solve_aoa(registry, &aoa_obs) {
+            Ok(est) => {
+                return Some(LocationEstimate {
+                    latitude: est.lat_deg,
+                    longitude: est.lon_deg,
+                    altitude: est.height_m,
+                    horizontal_accuracy: est.horizontal_uncertainty_m(),
+                    vertical_accuracy: None,
+                    method_used: Some(est.method.as_spec_str().to_string()),
+                    timestamp: 0,
+                })
+            }
+            Err(e) => log::warn!("AoA solve failed: {e}"),
+        }
+    }
+
+    // --- ECID (serving cell = best RSRP; needs timing_advance + registry hit) -
+    let serving = measurements
+        .iter()
+        .filter(|m| m.timing_advance.is_some() && registry.lookup(&m.nr_cgi).is_some())
+        .max_by_key(|m| m.rsrp.unwrap_or(i16::MIN))?;
+
+    match solve_ecid(registry, &serving.nr_cgi, serving.timing_advance, 1) {
+        Ok(est) => Some(LocationEstimate {
+            latitude: est.lat_deg,
+            longitude: est.lon_deg,
+            altitude: est.height_m,
+            horizontal_accuracy: est.horizontal_uncertainty_m(),
+            vertical_accuracy: None,
+            method_used: Some(est.method.as_spec_str().to_string()),
+            timestamp: 0,
+        }),
+        Err(e) => {
+            log::warn!("ECID solve failed: {e}");
+            None
+        }
+    }
+}
+
+/// Heuristic placeholder used when no registry coordinates are available.
+/// Returns lat/lon 0.0 with a method-derived accuracy estimate; kept so
+/// unconfigured deployments still produce a well-formed (if fake) response.
+fn compute_location_placeholder(
+    method: &PositioningMethod,
+    measurements: &[CellMeasurement],
+) -> LocationEstimate {
     let accuracy = match method {
         PositioningMethod::Ecid => {
             // ECID accuracy: ~100-300m typically
@@ -356,9 +501,6 @@ fn compute_location(
         PositioningMethod::Gnss => 3.0,
         _ => 100.0,
     };
-
-    // In a real implementation, these would be computed from the measurements
-    // For now we return a placeholder location with the computed accuracy
     LocationEstimate {
         latitude: 0.0,
         longitude: 0.0,
@@ -527,6 +669,8 @@ mod tests {
 
     #[test]
     fn test_compute_location_ecid() {
+        // Empty registry -> placeholder path (lat/lon 0.0, coarse accuracy).
+        let registry = TrpRegistry::from_entries(std::iter::empty());
         let cells = vec![CellMeasurement {
             nr_cgi: "test-cell".to_string(),
             rsrp: Some(-70),
@@ -535,12 +679,16 @@ mod tests {
             aoa: None,
             rtt_ns: None,
         }];
-        let loc = compute_location(&PositioningMethod::Ecid, &cells);
+        let loc = compute_location(&PositioningMethod::Ecid, &cells, &registry);
         assert!(loc.horizontal_accuracy > 50.0); // ECID is coarse
+        assert_eq!(loc.latitude, 0.0);
+        assert_eq!(loc.longitude, 0.0);
     }
 
     #[test]
     fn test_compute_location_gnss() {
+        // Empty registry -> placeholder path.
+        let registry = TrpRegistry::from_entries(std::iter::empty());
         let cells = vec![CellMeasurement {
             nr_cgi: "test-cell".to_string(),
             rsrp: None,
@@ -549,7 +697,236 @@ mod tests {
             aoa: None,
             rtt_ns: None,
         }];
-        let loc = compute_location(&PositioningMethod::Gnss, &cells);
+        let loc = compute_location(&PositioningMethod::Gnss, &cells, &registry);
         assert!(loc.horizontal_accuracy <= 5.0); // GNSS is accurate
+    }
+}
+
+// ===========================================================================
+// Real-solver integration tests (lmfd-08)
+// ===========================================================================
+// These build a known synthetic scene (4 cells at known ENU offsets from a
+// reference origin, a UE at a known geodetic point), feed consistent
+// measurements into compute_location via a populated LmfContext registry, and
+// assert the returned lat/lon recovers the known position within tolerance.
+#[cfg(test)]
+mod tests_real_solve {
+    use super::*;
+    use crate::positioning::{
+        enu_to_geodetic, geodetic_to_enu, EnuPoint, TrpCoord, SPEED_OF_LIGHT_M_S,
+    };
+
+    const ORIGIN_LAT: f64 = 37.7749;
+    const ORIGIN_LON: f64 = -122.4194;
+
+    /// Build a 4-cell scene at known ENU offsets, plus a UE at a known point.
+    /// Returns (ctx_with_registry, trp_coords, true_ue_geodetic, true_ue_enu, origin).
+    fn scene() -> (LmfContext, Vec<(String, TrpCoord)>, TrpCoord, EnuPoint, TrpCoord) {
+        let origin = TrpCoord::new(ORIGIN_LAT, ORIGIN_LON, 0.0);
+        let trp_enu = [
+            ("cell-a", EnuPoint { e: 0.0, n: 0.0, u: 0.0 }),
+            ("cell-b", EnuPoint { e: 1000.0, n: 0.0, u: 0.0 }),
+            ("cell-c", EnuPoint { e: 0.0, n: 1000.0, u: 0.0 }),
+            ("cell-d", EnuPoint { e: 1000.0, n: 1000.0, u: 0.0 }),
+        ];
+        let entries: Vec<(String, TrpCoord)> = trp_enu
+            .iter()
+            .map(|(id, p)| (id.to_string(), enu_to_geodetic(*p, origin)))
+            .collect();
+
+        let mut ctx = LmfContext::new();
+        ctx.init(256);
+        for (id, coord) in &entries {
+            ctx.set_cell_coord(id.clone(), *coord);
+        }
+
+        let true_enu = EnuPoint { e: 350.0, n: 600.0, u: 0.0 };
+        let true_geo = enu_to_geodetic(true_enu, origin);
+        (ctx, entries, true_geo, true_enu, origin)
+    }
+
+    /// Horizontal distance (metres) between two geodetic coords via a shared origin.
+    fn geo_dist_m(a: TrpCoord, b: TrpCoord) -> f64 {
+        let origin = TrpCoord::new(ORIGIN_LAT, ORIGIN_LON, 0.0);
+        let pa = geodetic_to_enu(a, origin);
+        let pb = geodetic_to_enu(b, origin);
+        (pa.e - pb.e).hypot(pa.n - pb.n)
+    }
+
+    /// Exact one-way range (m) from a TRP geodetic coord to a UE ENU point.
+    fn exact_range_m(trp: TrpCoord, ue_enu: EnuPoint, origin: TrpCoord) -> f64 {
+        let p = geodetic_to_enu(trp, origin);
+        (ue_enu.e - p.e).hypot(ue_enu.n - p.n)
+    }
+
+    // -- Multi-RTT path -------------------------------------------------------
+    #[test]
+    fn test_compute_location_multi_rtt_real_solve() {
+        let (ctx, entries, true_geo, true_enu, origin) = scene();
+        let registry = ctx.build_trp_registry();
+
+        // Derive exact RTT (ns) for each cell from the known UE position.
+        let cells: Vec<CellMeasurement> = entries
+            .iter()
+            .map(|(id, coord)| {
+                let range_m = exact_range_m(*coord, true_enu, origin);
+                // rtt_ns is round-trip; rtt_ns_to_range_m divides by 2.
+                let rtt_ns = (range_m * 2.0 / SPEED_OF_LIGHT_M_S * 1e9) as u64;
+                CellMeasurement {
+                    nr_cgi: id.clone(),
+                    rsrp: Some(-80),
+                    rsrq: Some(-10),
+                    timing_advance: None,
+                    aoa: None,
+                    rtt_ns: Some(rtt_ns),
+                }
+            })
+            .collect();
+
+        let loc = compute_location(&PositioningMethod::NrBased, &cells, &registry);
+        let got = TrpCoord::new(loc.latitude, loc.longitude, 0.0);
+        let err_m = geo_dist_m(got, true_geo);
+        assert!(
+            err_m < 50.0,
+            "Multi-RTT position error {err_m:.2}m exceeds 50 m tolerance"
+        );
+        assert!(loc.horizontal_accuracy > 0.0);
+        assert_eq!(loc.method_used.as_deref(), Some("MULTI-RTT"));
+    }
+
+    // -- ECID path ------------------------------------------------------------
+    #[test]
+    fn test_compute_location_ecid_real_solve() {
+        let (ctx, entries, _true_geo, _true_enu, _origin) = scene();
+        let registry = ctx.build_trp_registry();
+
+        // ECID: only one cell (serving), with timing_advance, no rtt_ns.
+        let cell_a_coord = entries.iter().find(|(id, _)| id == "cell-a").unwrap().1;
+        let ta = 50u32;
+        let cells = vec![CellMeasurement {
+            nr_cgi: "cell-a".to_string(),
+            rsrp: Some(-75),
+            rsrq: Some(-8),
+            timing_advance: Some(ta),
+            aoa: None,
+            rtt_ns: None,
+        }];
+
+        let loc = compute_location(&PositioningMethod::Ecid, &cells, &registry);
+        // ECID places the estimate exactly on the serving cell.
+        assert!(
+            (loc.latitude - cell_a_coord.lat_deg).abs() < 1e-9,
+            "ECID lat mismatch: {} vs {}",
+            loc.latitude,
+            cell_a_coord.lat_deg
+        );
+        assert!(
+            (loc.longitude - cell_a_coord.lon_deg).abs() < 1e-9,
+            "ECID lon mismatch: {} vs {}",
+            loc.longitude,
+            cell_a_coord.lon_deg
+        );
+        assert!(loc.horizontal_accuracy > 0.0);
+        assert_eq!(loc.method_used.as_deref(), Some("NR_ECID"));
+    }
+
+    // -- AoA path -------------------------------------------------------------
+    #[test]
+    fn test_compute_location_aoa_real_solve() {
+        let (ctx, entries, true_geo, true_enu, origin) = scene();
+        let registry = ctx.build_trp_registry();
+
+        // Exact azimuth (clockwise from North) from each cell toward the UE.
+        let cells: Vec<CellMeasurement> = entries
+            .iter()
+            .map(|(id, coord)| {
+                let p = geodetic_to_enu(*coord, origin);
+                let de = true_enu.e - p.e;
+                let dn = true_enu.n - p.n;
+                let azimuth_deg = de.atan2(dn).to_degrees();
+                CellMeasurement {
+                    nr_cgi: id.clone(),
+                    rsrp: Some(-80),
+                    rsrq: Some(-10),
+                    timing_advance: None,
+                    aoa: Some(azimuth_deg),
+                    rtt_ns: None,
+                }
+            })
+            .collect();
+
+        let loc = compute_location(&PositioningMethod::NrBased, &cells, &registry);
+        let got = TrpCoord::new(loc.latitude, loc.longitude, 0.0);
+        let err_m = geo_dist_m(got, true_geo);
+        assert!(
+            err_m < 50.0,
+            "AoA position error {err_m:.2}m exceeds 50 m tolerance"
+        );
+        assert_eq!(loc.method_used.as_deref(), Some("UL_AOA"));
+    }
+
+    // -- Solver priority: Multi-RTT wins when both rtt_ns and aoa present -----
+    #[test]
+    fn test_multi_rtt_takes_priority_over_aoa() {
+        let (ctx, entries, _true_geo, true_enu, origin) = scene();
+        let registry = ctx.build_trp_registry();
+
+        let cells: Vec<CellMeasurement> = entries
+            .iter()
+            .map(|(id, coord)| {
+                let range_m = exact_range_m(*coord, true_enu, origin);
+                let rtt_ns = (range_m * 2.0 / SPEED_OF_LIGHT_M_S * 1e9) as u64;
+                let p = geodetic_to_enu(*coord, origin);
+                let azimuth_deg =
+                    (true_enu.e - p.e).atan2(true_enu.n - p.n).to_degrees();
+                CellMeasurement {
+                    nr_cgi: id.clone(),
+                    rsrp: Some(-80),
+                    rsrq: None,
+                    timing_advance: None,
+                    aoa: Some(azimuth_deg),
+                    rtt_ns: Some(rtt_ns),
+                }
+            })
+            .collect();
+
+        let loc = compute_location(&PositioningMethod::NrBased, &cells, &registry);
+        assert_eq!(
+            loc.method_used.as_deref(),
+            Some("MULTI-RTT"),
+            "Multi-RTT should be chosen over AoA when rtt_ns is present"
+        );
+    }
+
+    // -- Empty registry falls back to placeholder (no lat/lon change) ---------
+    #[test]
+    fn test_empty_registry_placeholder_fallback() {
+        let registry = TrpRegistry::from_entries(std::iter::empty());
+        let cells = vec![CellMeasurement {
+            nr_cgi: "cell-x".to_string(),
+            rsrp: Some(-80),
+            rsrq: None,
+            timing_advance: Some(100),
+            aoa: None,
+            rtt_ns: None,
+        }];
+        let loc = compute_location(&PositioningMethod::Ecid, &cells, &registry);
+        // Placeholder: origin 0/0 with heuristic accuracy.
+        assert_eq!(loc.latitude, 0.0);
+        assert_eq!(loc.longitude, 0.0);
+        assert!(loc.horizontal_accuracy > 50.0);
+    }
+
+    // -- Registry API ---------------------------------------------------------
+    #[test]
+    fn test_set_cell_coord_and_build_registry() {
+        let mut ctx = LmfContext::new();
+        ctx.init(256);
+        ctx.set_cell_coord("cell-1", TrpCoord::new(37.7749, -122.4194, 0.0));
+        ctx.set_cell_coord("cell-2", TrpCoord::new(37.7760, -122.4180, 0.0));
+        let reg = ctx.build_trp_registry();
+        assert_eq!(reg.len(), 2);
+        assert!(reg.lookup("cell-1").is_some());
+        assert!(reg.lookup("no-such-cell").is_none());
     }
 }

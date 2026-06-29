@@ -22,9 +22,8 @@ use std::time::Duration;
 mod context;
 mod nlmf;
 // lmfd-08: real multilateration solvers (ECID / Multi-RTT / TDOA / AoA).
-// STANDALONE + synthetic-tested; not yet wired into `compute_location`
-// (final wiring waits on lmfd-05/06). Dead-code until then (workspace allows
-// `dead_code`); fully unit-tested in the module itself.
+// Wired into `context::compute_location`; solve_tdoa remains available for
+// lmfd-05/06 (NRPPa TDOA) but is not yet called (dead_code = "allow").
 mod positioning;
 
 pub use context::*;

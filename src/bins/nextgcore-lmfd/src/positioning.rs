@@ -9,14 +9,18 @@
 //!
 //! ## Status (lmfd-08, Wave-3)
 //!
-//! This file is intentionally STANDALONE and SYNTHETIC-tested: it carries no
-//! dependency on the NRPPa / LPP ASN.1 codecs (lmfd-LIB-01/02) and is NOT yet
-//! wired into [`crate::context::compute_location`] — that final wiring waits on
-//! lmfd-05/06 (NRPPa/LPP measurement procedures) and lmfd-07 (Namf consumer).
-//! The solver math is exercised here against closed-form synthetic geometries
-//! (known TRP coordinates + a known UE position) so it can be validated before
-//! the wire codecs exist. Public items not yet consumed are dead-code; the
-//! workspace allows `dead_code`, and the math is fully unit-tested below.
+//! This file is STANDALONE (no dependency on the NRPPa / LPP ASN.1 codecs
+//! lmfd-LIB-01/02) and is **wired into [`crate::context::compute_location`]**
+//! as of lmfd-08. The solver selection order is: Multi-RTT (≥3 cells with
+//! `rtt_ns`) → AoA (≥2 cells with `aoa`) → ECID (serving cell with
+//! `timing_advance`); fallback to the heuristic placeholder when the cell
+//! coordinate registry is empty or no matching cells are found.
+//!
+//! `solve_tdoa` and `TdoaObservation` remain available for lmfd-05/06 (NRPPa
+//! TDOA measurements) but are not yet called by `compute_location`; the
+//! workspace `dead_code = "allow"` suppresses the lint. The solver math is
+//! exercised against closed-form synthetic geometries (known TRP coordinates +
+//! a known UE position) below.
 //!
 //! ## Coordinate model — local ENU tangent plane
 //!
