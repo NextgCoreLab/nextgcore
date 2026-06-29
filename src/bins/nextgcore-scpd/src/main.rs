@@ -30,10 +30,9 @@ pub use proxy::{
     forwardable_request_headers, relayable_response_headers, ApiRoot, ScpProxy, ScpProxyConfig,
 };
 pub use sbi_path::{
-    build_forwarded_request, copy_request_headers, discovery_cache, headers,
-    parse_discovery_headers, parse_search_result, route_request, scp_sbi_close, scp_sbi_is_running,
-    scp_sbi_open, select_nf_instance, select_nf_instance_round_robin, DiscoveryCache,
-    NfInstanceCandidate, SbiRequest, SbiServerConfig,
+    discovery_cache, headers, parse_search_result, scp_sbi_close, scp_sbi_is_running, scp_sbi_open,
+    select_nf_instance, select_nf_instance_round_robin, DiscoveryCache, NfInstanceCandidate,
+    SbiServerConfig,
 };
 pub use scp_sm::{ScpSmContext, ScpState};
 pub use timer::{timer_manager, ScpTimerManager};
@@ -99,6 +98,18 @@ struct Args {
     /// (falls back to the NF_INSTANCE_ID environment variable)
     #[arg(long)]
     nf_instance_id: Option<String>,
+
+    /// The SCP's own FQDN/identity, used for the `Via`/`Server` headers and
+    /// `SCP-<FQDN>` loop detection (TS 29.500 §6.10.8/§6.10.10). Falls back to
+    /// the SCP_FQDN environment variable, then to a built-in default.
+    #[arg(long)]
+    scp_fqdn: Option<String>,
+
+    /// Treat the next hop on forwarded requests as another SCP: convey the
+    /// selected producer apiRoot in `3gpp-Sbi-Target-apiRoot` instead of
+    /// stripping it (TS 29.500 §6.10.2.5).
+    #[arg(long)]
+    next_hop_scp: bool,
 }
 
 /// Global shutdown flag
@@ -184,9 +195,16 @@ async fn main() -> Result<()> {
         .nf_instance_id
         .clone()
         .or_else(|| std::env::var("NF_INSTANCE_ID").ok());
+    let own_fqdn = args
+        .scp_fqdn
+        .clone()
+        .or_else(|| std::env::var("SCP_FQDN").ok())
+        .unwrap_or_else(|| ScpProxyConfig::default().own_fqdn);
     let scp_proxy = Arc::new(ScpProxy::new(ScpProxyConfig {
         nrf_uri,
         nf_instance_id,
+        own_fqdn,
+        next_hop_scp: args.next_hop_scp,
         ..Default::default()
     }));
     let mut http_config =

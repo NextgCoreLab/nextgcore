@@ -28,12 +28,12 @@ use std::time::Duration;
 
 use ogs_sbi::client::{SbiClient, SbiClientConfig};
 use ogs_sbi::constants::{custom_header, discovery_header};
-use ogs_sbi::message::{ProblemDetails, SbiRequest, SbiResponse};
+use ogs_sbi::message::{ProblemDetails, SbiHttpMessage, SbiRequest, SbiResponse};
 use ogs_sbi::oauth::OAuth2Client;
 use ogs_sbi::types::{NfType, UriScheme};
 use ogs_sbi::SbiError;
 
-use crate::sbi_path::{parse_search_result, select_nf_instance};
+use crate::sbi_path::{parse_search_result, select_nf_instance, DiscoveryCache};
 
 /// Default upstream connect timeout (bounded per TS 29.500 §6.11 guidance).
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -43,6 +43,29 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// access tokens (`nfInstanceId` in the TS 29.510 token request) if none is
 /// configured. A stable value keeps NRF-side token bookkeeping coherent.
 const DEFAULT_SCP_NF_INSTANCE_ID: &str = "nextgcore-scp";
+
+/// Default SCP own-FQDN used to build the `Via` (relayed errors, §6.10.8.3),
+/// `Server` (SCP-originated errors, §6.10.8.2) and loop-detection identity
+/// (`SCP-<FQDN>`, §6.10.10.3) when none is configured.
+const DEFAULT_SCP_FQDN: &str = "scp.5gc.local";
+
+/// `Via` header name (RFC 9110 §7.6.3; reused for SCP loop detection /
+/// relayed-error annotation per TS 29.500 §6.10.8.3 / §6.10.10.3).
+const VIA_HEADER: &str = "Via";
+/// `Server` header name (RFC 9110 §10.2.4; SCP-originated error identity,
+/// TS 29.500 §6.10.8.2).
+const SERVER_HEADER: &str = "Server";
+/// `3gpp-Sbi-Max-Forward-Hops` header (TS 29.500 §5.2.3.2.14 / §6.10.10.2).
+/// Not in `ogs_sbi::custom_header`; defined locally (additive, consumer-side).
+const MAX_FORWARD_HOPS_HEADER: &str = "3gpp-Sbi-Max-Forward-Hops";
+/// `WWW-Authenticate` response header (RFC 9110 §11.6.1) carrying the
+/// producer's Bearer challenge (TS 29.500 §6.10.11.2.3).
+const WWW_AUTHENTICATE_HEADER: &str = "WWW-Authenticate";
+
+/// Query parameters the SCP consumes internally and MUST NOT forward to the
+/// producer. `ck` is the cache-key (TS 29.500 §6.10.2.6); the list is a const
+/// so future SCP-internal params can be added in one place (scpd-05).
+const SCP_INTERNAL_PARAMS: &[&str] = &["ck"];
 
 /// Hop-by-hop headers that must not be forwarded by a proxy
 /// (RFC 9110 §7.6.1; `host`/`content-length` are recomputed by the client).
@@ -75,6 +98,16 @@ pub struct ScpProxyConfig {
     /// OAuth2 token requests to the NRF (TS 29.510 §6.3). When `None`, a
     /// stable default (`DEFAULT_SCP_NF_INSTANCE_ID`) is used.
     pub nf_instance_id: Option<String>,
+    /// The SCP's own FQDN/identity, used to build `Via` (relayed errors,
+    /// §6.10.8.3), `Server` (SCP-originated errors, §6.10.8.2) and the
+    /// loop-detection identity `SCP-<FQDN>` (§6.10.10.3). Defaults to
+    /// [`DEFAULT_SCP_FQDN`].
+    pub own_fqdn: String,
+    /// Whether the next hop on a forwarded request is another SCP rather than
+    /// the producer. When `true`, the selected producer apiRoot is conveyed in
+    /// `3gpp-Sbi-Target-apiRoot` instead of being stripped (TS 29.500
+    /// §6.10.2.5, scpd-10). Defaults to `false` (next hop is the producer).
+    pub next_hop_scp: bool,
 }
 
 impl Default for ScpProxyConfig {
@@ -84,6 +117,8 @@ impl Default for ScpProxyConfig {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             nf_instance_id: None,
+            own_fqdn: DEFAULT_SCP_FQDN.to_string(),
+            next_hop_scp: false,
         }
     }
 }
@@ -225,6 +260,187 @@ fn nf_type_from_str(s: &str) -> Option<NfType> {
     Some(nf)
 }
 
+/// Case-insensitive header lookup on a plain header map (used for forwardable
+/// request headers, which are a bare `HashMap` rather than an `SbiHttpMessage`).
+fn header_get<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v)
+}
+
+/// Case-insensitive header set on a plain header map: removes any case-variant
+/// of `name` then inserts `value` under `name`.
+fn header_set(headers: &mut HashMap<String, String>, name: &str, value: String) {
+    headers.retain(|k, _| !k.eq_ignore_ascii_case(name));
+    headers.insert(name.to_string(), value);
+}
+
+/// True for SCP-internal query params that must never reach the producer
+/// (currently just the `ck` cache-key, TS 29.500 §6.10.2.6).
+fn is_scp_internal_param(name: &str) -> bool {
+    SCP_INTERNAL_PARAMS
+        .iter()
+        .any(|p| name.eq_ignore_ascii_case(p))
+}
+
+/// True when a `WWW-Authenticate` challenge on the response names the `Bearer`
+/// scheme (TS 29.500 §6.10.11.2.3 token-retry trigger).
+fn www_authenticate_is_bearer(response: &SbiResponse) -> bool {
+    response
+        .http
+        .get_header(WWW_AUTHENTICATE_HEADER)
+        .map(|v| v.to_ascii_lowercase().contains("bearer"))
+        .unwrap_or(false)
+}
+
+/// Parse a `3gpp-Sbi-Max-Forward-Hops` value (TS 29.500 §5.2.3.2.14), e.g.
+/// `5; nodetype=scp`, into `(hop_count, nodetype)`. Returns `None` when the
+/// leading hop count is not a number.
+fn parse_max_forward_hops(value: &str) -> Option<(u32, Option<String>)> {
+    let mut parts = value.split(';');
+    let count = parts.next()?.trim().parse::<u32>().ok()?;
+    let mut nodetype = None;
+    for p in parts {
+        if let Some((k, v)) = p.split_once('=') {
+            if k.trim().eq_ignore_ascii_case("nodetype") {
+                nodetype = Some(v.trim().to_string());
+            }
+        }
+    }
+    Some((count, nodetype))
+}
+
+/// Map a received `3gpp-Sbi-Discovery-<x>` header name to its nnrf-disc query
+/// parameter name `<x>` (TS 29.500 §6.10.3.2 ↔ TS 29.510 §6.2.3.2.3). Returns
+/// `None` for non-discovery headers and for the factors handled out-of-band
+/// (`target-nf-type` / `requester-nf-type` are added explicitly; `hnrf-uri`
+/// selects the queried NRF and is not an nnrf-disc parameter). The generic
+/// prefix-strip covers every other factor (guami, tai, snssais, dnn,
+/// target/requester-plmn-list, requester-features, target-nf-instance-id,
+/// requester-nf-instance-id, service-names, target-nf-set-id, nsi, …).
+fn nnrf_disc_param_from_discovery_header(name: &str) -> Option<String> {
+    let prefix = discovery_header::PREFIX;
+    let is_disc = name
+        .get(..prefix.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(prefix));
+    if !is_disc {
+        return None;
+    }
+    let param = name[prefix.len()..].to_ascii_lowercase();
+    if param.is_empty()
+        || matches!(
+            param.as_str(),
+            "target-nf-type" | "requester-nf-type" | "hnrf-uri"
+        )
+    {
+        return None;
+    }
+    Some(param)
+}
+
+/// Build a `3gpp-Sbi-Producer-Id` value in the TS 29.500 §5.2.3.2.8 ABNF form
+/// `nfinst=<uuid>[; nfset=<set-id>]`. Returns `None` for an empty instance id.
+fn build_producer_id(nf_instance_id: &str, nf_set_id: Option<&str>) -> Option<String> {
+    if nf_instance_id.is_empty() {
+        return None;
+    }
+    let mut value = format!("nfinst={nf_instance_id}");
+    if let Some(set) = nf_set_id.filter(|s| !s.is_empty()) {
+        value.push_str("; nfset=");
+        value.push_str(set);
+    }
+    Some(value)
+}
+
+/// Extract the producer's NF set id (`nfSetIdList[0]`) and NF group id
+/// (`{udm,udr,ausf,pcf}Info.groupId`) for the selected instance from a parsed
+/// SearchResult, used for `3gpp-Sbi-Producer-Id`/`3gpp-Sbi-Target-Nf-Group-Id`.
+fn extract_set_and_group(
+    value: &serde_json::Value,
+    nf_instance_id: &str,
+) -> (Option<String>, Option<String>) {
+    let inst = value
+        .get("nfInstances")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            arr.iter().find(|i| {
+                i.get("nfInstanceId").and_then(|x| x.as_str()) == Some(nf_instance_id)
+            })
+        });
+    let set = inst
+        .and_then(|i| i.get("nfSetIdList"))
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let group = inst.and_then(group_id_from_profile);
+    (set, group)
+}
+
+/// Read the NF group id from whichever per-type info object the NF profile
+/// carries (UDM/UDR/AUSF/PCF group membership, TS 29.510 §6.1.6.2.x).
+fn group_id_from_profile(inst: &serde_json::Value) -> Option<String> {
+    for key in ["udmInfo", "udrInfo", "ausfInfo", "pcfInfo"] {
+        if let Some(g) = inst
+            .get(key)
+            .and_then(|x| x.get("groupId"))
+            .and_then(|x| x.as_str())
+        {
+            return Some(g.to_string());
+        }
+    }
+    None
+}
+
+/// A `3gpp-Sbi-Binding` / `3gpp-Sbi-Routing-Binding` value decomposed into its
+/// binding level and entity identifiers (TS 29.500 §5.2.3.2.5/§5.2.3.2.6).
+/// Only the members the SCP keys stickiness on are retained.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ParsedBinding {
+    /// Binding level: `nf-instance` / `nf-set` / `nf-service-set` (lowercased).
+    bl: Option<String>,
+    nfinst: Option<String>,
+    nfset: Option<String>,
+    nfservinst: Option<String>,
+    nfserviceset: Option<String>,
+}
+
+impl ParsedBinding {
+    fn parse(value: &str) -> Self {
+        let mut b = Self::default();
+        for token in value.split(';') {
+            if let Some((k, v)) = token.split_once('=') {
+                let val = v.trim().to_string();
+                match k.trim().to_ascii_lowercase().as_str() {
+                    "bl" => b.bl = Some(val.to_ascii_lowercase()),
+                    "nfinst" => b.nfinst = Some(val),
+                    "nfset" => b.nfset = Some(val),
+                    "nfservinst" => b.nfservinst = Some(val),
+                    "nfserviceset" => b.nfserviceset = Some(val),
+                    _ => {}
+                }
+            }
+        }
+        b
+    }
+
+    /// True when this binding selects at the NF-set level, so the SCP may
+    /// reselect any registered member of the set.
+    fn is_set_level(&self) -> bool {
+        self.bl.as_deref() == Some("nf-set")
+    }
+}
+
+/// A producer selected by Model D delegated discovery, with the identifiers the
+/// SCP surfaces to the consumer.
+struct DiscoveredProducer {
+    target: ApiRoot,
+    nf_instance_id: String,
+    nf_set_id: Option<String>,
+    nf_group_id: Option<String>,
+}
+
 /// True for header names a proxy must not forward, in either direction:
 /// HTTP/2 pseudo-headers and RFC 9110 hop-by-hop headers.
 fn is_hop_by_hop(name: &str) -> bool {
@@ -324,6 +540,15 @@ pub struct ScpProxy {
     /// Binding stickiness cache: normalized `3gpp-Sbi-Binding` value →
     /// producer apiRoot it was returned from (TS 29.500 §6.12).
     bindings: RwLock<HashMap<String, ApiRoot>>,
+    /// NF-set stickiness cache (scpd-11): lowercased `nfset` id → a learnt
+    /// member apiRoot, so an `nf-set` Routing-Binding can reselect another set
+    /// member when the originally-bound instance is gone (TS 29.500 §5.2.3.2.6).
+    set_bindings: RwLock<HashMap<String, ApiRoot>>,
+    /// Per-instance NF discovery cache (scpd-08): Model D SearchResults are
+    /// cached with their `validityPeriod` TTL so repeated requests for the same
+    /// target do not re-query the NRF (TS 29.500 §6.10.3). Per-instance (not the
+    /// process-global cache) so each SCP — and each test — has an isolated view.
+    discovery_cache: DiscoveryCache,
     /// Shared OAuth2 client (consumer-side, client-credentials grant against
     /// the NRF). `Some` only when an NRF URI is configured; `None` disables
     /// delegated token acquisition (Authorization is then left as received).
@@ -346,8 +571,111 @@ impl ScpProxy {
             clients: RwLock::new(HashMap::new()),
             oauth_clients: RwLock::new(HashMap::new()),
             bindings: RwLock::new(HashMap::new()),
+            set_bindings: RwLock::new(HashMap::new()),
+            discovery_cache: DiscoveryCache::new(),
             oauth2,
         }
+    }
+
+    /// The SCP's own `Via`/`Server` identity token `SCP-<own-fqdn>`
+    /// (TS 29.500 §6.10.8.2/§6.10.8.3/§6.10.10.3).
+    fn scp_node_id(&self) -> String {
+        format!("SCP-{}", self.config.own_fqdn)
+    }
+
+    /// Stamp the `Server` header with this SCP's identity on an SCP-originated
+    /// error response (TS 29.500 §6.10.8.2). Never applied to relayed producer
+    /// responses (those keep the producer's `Server`).
+    fn stamp_server(&self, mut response: SbiResponse) -> SbiResponse {
+        response
+            .http
+            .set_header(SERVER_HEADER, self.scp_node_id());
+        response
+    }
+
+    /// Append this SCP's `Via` entry (`2.0 SCP-<fqdn>`) to an existing Via list,
+    /// preserving any upstream tokens (comma-separated, RFC 9110 §7.6.3).
+    fn append_via(&self, http: &mut SbiHttpMessage) {
+        let entry = format!("2.0 {}", self.scp_node_id());
+        let value = match http.get_header(VIA_HEADER) {
+            Some(existing) if !existing.trim().is_empty() => format!("{existing}, {entry}"),
+            _ => entry,
+        };
+        http.set_header(VIA_HEADER, value);
+    }
+
+    /// Like [`append_via`](Self::append_via) but on a bare forwardable-request
+    /// header map.
+    fn append_request_via(&self, headers: &mut HashMap<String, String>) {
+        let entry = format!("2.0 {}", self.scp_node_id());
+        let value = match header_get(headers, VIA_HEADER) {
+            Some(existing) if !existing.trim().is_empty() => format!("{existing}, {entry}"),
+            _ => entry,
+        };
+        header_set(headers, VIA_HEADER, value);
+    }
+
+    /// scpd-04: ingress loop / hop-exhaustion guard (TS 29.500 §6.10.10).
+    /// Returns a Server-stamped error when the request must be rejected:
+    /// - own `SCP-<FQDN>` already present in a received `Via` → 400
+    ///   `MSG_LOOP_DETECTED` (§6.10.10.3);
+    /// - an scp-typed `3gpp-Sbi-Max-Forward-Hops` of `0` → 502
+    ///   `MAX_SCP_HOPS_REACHED` (§6.10.10.2).
+    ///
+    /// A normal single-hop request (no `Via`, no hop header) is never blocked.
+    fn ingress_guard(&self, request: &SbiRequest) -> Option<SbiResponse> {
+        let self_token = self.scp_node_id().to_ascii_lowercase();
+        if let Some(via) = request.http.get_header(VIA_HEADER) {
+            if via.to_ascii_lowercase().contains(&self_token) {
+                return Some(self.stamp_server(problem_response(
+                    400,
+                    "Bad Request",
+                    "Request looped back to this SCP (own identity present in Via header)",
+                    "MSG_LOOP_DETECTED",
+                )));
+            }
+        }
+        if let Some(mfh) = request.http.get_header(MAX_FORWARD_HOPS_HEADER) {
+            if let Some((count, nodetype)) = parse_max_forward_hops(mfh) {
+                let applies = nodetype
+                    .as_deref()
+                    .map(|n| n.eq_ignore_ascii_case("scp"))
+                    .unwrap_or(true);
+                if applies && count == 0 {
+                    return Some(self.stamp_server(problem_response(
+                        502,
+                        "Bad Gateway",
+                        "Maximum number of SCP hops reached",
+                        "MAX_SCP_HOPS_REACHED",
+                    )));
+                }
+            }
+        }
+        None
+    }
+
+    /// scpd-04: on a forwarded request, decrement an scp-typed
+    /// `3gpp-Sbi-Max-Forward-Hops` (only when present — never added when absent,
+    /// to keep the single-hop wire unchanged) and insert this SCP's `Via`.
+    fn apply_forward_loop_headers(&self, headers: &mut HashMap<String, String>) {
+        if let Some(mfh) = header_get(headers, MAX_FORWARD_HOPS_HEADER).cloned() {
+            if let Some((count, nodetype)) = parse_max_forward_hops(&mfh) {
+                let applies = nodetype
+                    .as_deref()
+                    .map(|n| n.eq_ignore_ascii_case("scp"))
+                    .unwrap_or(true);
+                if applies {
+                    let dec = count.saturating_sub(1);
+                    let nt = nodetype.unwrap_or_else(|| "scp".to_string());
+                    header_set(
+                        headers,
+                        MAX_FORWARD_HOPS_HEADER,
+                        format!("{dec}; nodetype={nt}"),
+                    );
+                }
+            }
+        }
+        self.append_request_via(headers);
     }
 
     /// Look up a producer apiRoot previously learnt from a
@@ -362,11 +690,39 @@ impl ScpProxy {
 
     /// Record a `3gpp-Sbi-Binding` value from a producer response so later
     /// requests carrying it in `3gpp-Sbi-Routing-Binding` stick to the same
-    /// producer.
+    /// producer. When the binding names an `nfset`, the target is also indexed
+    /// at the set level (scpd-11) so an `nf-set` Routing-Binding can reselect a
+    /// set member after the originally-bound instance is gone.
     pub fn binding_store(&self, binding: &str, target: &ApiRoot) {
         if let Ok(mut map) = self.bindings.write() {
             map.insert(normalize_binding(binding), target.clone());
         }
+        if let Some(set) = ParsedBinding::parse(binding).nfset {
+            if let Ok(mut sets) = self.set_bindings.write() {
+                sets.insert(set.to_ascii_lowercase(), target.clone());
+            }
+        }
+    }
+
+    /// Resolve a `3gpp-Sbi-Routing-Binding` to a cached producer, first by exact
+    /// (normalized) match, then — for an `nf-set` binding — by reselecting a
+    /// learnt member of the named set (scpd-11, TS 29.500 §5.2.3.2.6).
+    fn binding_lookup_setaware(&self, routing_binding: &str) -> Option<ApiRoot> {
+        if let Some(target) = self.binding_lookup(routing_binding) {
+            return Some(target);
+        }
+        let parsed = ParsedBinding::parse(routing_binding);
+        if parsed.is_set_level() {
+            if let Some(set) = parsed.nfset {
+                return self
+                    .set_bindings
+                    .read()
+                    .ok()?
+                    .get(&set.to_ascii_lowercase())
+                    .cloned();
+            }
+        }
+        None
     }
 
     /// Get or create a pooled HTTP/2 client for a target authority.
@@ -436,7 +792,7 @@ impl ScpProxy {
         }
 
         if let Some(routing_binding) = request.http.routing_binding() {
-            if let Some(target) = self.binding_lookup(routing_binding) {
+            if let Some(target) = self.binding_lookup_setaware(routing_binding) {
                 return RouteDecision::StickyBinding(target);
             }
         }
@@ -457,10 +813,7 @@ impl ScpProxy {
     /// the `3gpp-Sbi-Discovery-*` request headers, parse the SearchResult,
     /// and select a producer. The requester identity comes from
     /// `3gpp-Sbi-Discovery-requester-nf-type` (NOT User-Agent).
-    async fn discover(
-        &self,
-        request: &SbiRequest,
-    ) -> Result<(ApiRoot, String /* producer NF instance id */), SbiResponse> {
+    async fn discover(&self, request: &SbiRequest) -> Result<DiscoveredProducer, SbiResponse> {
         let target_nf_type = request
             .http
             .get_header(discovery_header::TARGET_NF_TYPE)
@@ -486,6 +839,29 @@ impl ScpProxy {
                 )
             })?;
 
+        // scpd-08: serve un-expired SearchResults from the per-instance cache,
+        // keyed on (target-nf-type, service-names), without re-querying the NRF.
+        let service_key = request
+            .http
+            .get_header(discovery_header::SERVICE_NAMES)
+            .cloned()
+            .unwrap_or_default();
+        if let Some(cached) = self.discovery_cache.get(&target_nf_type, &service_key) {
+            if let Some(selected) = select_nf_instance(&cached) {
+                return Ok(DiscoveredProducer {
+                    target: ApiRoot {
+                        scheme: selected.scheme,
+                        host: selected.host.clone(),
+                        port: selected.port,
+                        prefix: selected.prefix.clone(),
+                    },
+                    nf_instance_id: selected.nf_instance_id.clone(),
+                    nf_set_id: None,
+                    nf_group_id: None,
+                });
+            }
+        }
+
         let nrf_uri = self.config.nrf_uri.as_deref().ok_or_else(|| {
             problem_response(
                 503,
@@ -504,28 +880,15 @@ impl ScpProxy {
         })?;
 
         let mut disc = SbiRequest::get(format!("{}/nnrf-disc/v1/nf-instances", nrf.prefix))
-            .with_param("target-nf-type", target_nf_type)
+            .with_param("target-nf-type", target_nf_type.clone())
             .with_param("requester-nf-type", requester_nf_type);
-        if let Some(names) = request.http.get_header(discovery_header::SERVICE_NAMES) {
-            disc = disc.with_param("service-names", names.clone());
-        }
-        if let Some(id) = request
-            .http
-            .get_header(discovery_header::TARGET_NF_INSTANCE_ID)
-        {
-            disc = disc.with_param("target-nf-instance-id", id.clone());
-        }
-        if let Some(id) = request
-            .http
-            .get_header(discovery_header::REQUESTER_NF_INSTANCE_ID)
-        {
-            disc = disc.with_param("requester-nf-instance-id", id.clone());
-        }
-        if let Some(dnn) = request.http.get_header(discovery_header::DNN) {
-            disc = disc.with_param("dnn", dnn.clone());
-        }
-        if let Some(snssais) = request.http.get_header(discovery_header::SNSSAIS) {
-            disc = disc.with_param("snssais", snssais.clone());
+        // scpd-06: forward every other 3gpp-Sbi-Discovery-* factor the consumer
+        // conveyed as its corresponding nnrf-disc query parameter
+        // (TS 29.500 §6.10.3.2 ↔ TS 29.510 §6.2.3.2.3).
+        for (name, value) in &request.http.headers {
+            if let Some(param) = nnrf_disc_param_from_discovery_header(name) {
+                disc = disc.with_param(param, value.clone());
+            }
         }
 
         let response = self
@@ -544,6 +907,8 @@ impl ScpProxy {
         }
 
         let body = response.http.content.as_deref().unwrap_or("");
+        let value: serde_json::Value =
+            serde_json::from_slice(body.as_bytes()).unwrap_or(serde_json::Value::Null);
         let candidates = parse_search_result(body.as_bytes());
         let selected = select_nf_instance(&candidates).ok_or_else(|| {
             problem_response(
@@ -553,6 +918,24 @@ impl ScpProxy {
                 "NF_DISCOVERY_FAILURE",
             )
         })?;
+
+        // scpd-08: cache the parsed candidates with the SearchResult
+        // `validityPeriod` (seconds) as TTL (default 3600 when absent).
+        if !candidates.is_empty() {
+            let validity = value
+                .get("validityPeriod")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3600);
+            self.discovery_cache.put(
+                &target_nf_type,
+                &service_key,
+                candidates.clone(),
+                Duration::from_secs(validity),
+            );
+        }
+
+        // scpd-02/scpd-12: surface the producer's set id / group id when present.
+        let (nf_set_id, nf_group_id) = extract_set_and_group(&value, &selected.nf_instance_id);
 
         // Build the producer ApiRoot from the NF profile fields parsed out of
         // the SearchResult: scheme and prefix come from nfServices[].scheme /
@@ -565,7 +948,12 @@ impl ScpProxy {
             port: selected.port,
             prefix: selected.prefix.clone(),
         };
-        Ok((target, selected.nf_instance_id.clone()))
+        Ok(DiscoveredProducer {
+            target,
+            nf_instance_id: selected.nf_instance_id.clone(),
+            nf_set_id,
+            nf_group_id,
+        })
     }
 
     /// Forward a request to the selected producer and relay its response.
@@ -585,35 +973,71 @@ impl ScpProxy {
         request: &SbiRequest,
         target: &ApiRoot,
         producer_id: Option<&str>,
+        group_id: Option<&str>,
         delegated_nf_type: Option<NfType>,
     ) -> SbiResponse {
         let mut fwd = SbiRequest::default();
         fwd.header.method = request.header.method.clone();
         fwd.header.uri = format!("{}{}", target.prefix, request.header.uri);
         fwd.http.params = request.http.params.clone();
+        // scpd-05: never leak the SCP cache-key (`ck`) or any other SCP-internal
+        // query parameter to the producer (TS 29.500 §6.10.2.6).
+        fwd.http.params.retain(|k, _| !is_scp_internal_param(k));
         fwd.http.headers = forwardable_request_headers(&request.http.headers);
         fwd.http.content = request.http.content.clone();
         fwd.http.parts = request.http.parts.clone();
+
+        // scpd-04: loop protection — decrement an scp-typed Max-Forward-Hops and
+        // insert this SCP's Via on the forwarded request (TS 29.500 §6.10.10).
+        self.apply_forward_loop_headers(&mut fwd.http.headers);
+
+        // scpd-10: when the next hop is another SCP, convey the selected
+        // producer apiRoot in 3gpp-Sbi-Target-apiRoot instead of stripping it
+        // (TS 29.500 §6.10.2.5). Default deployment (next hop = producer) strips.
+        if self.config.next_hop_scp {
+            header_set(
+                &mut fwd.http.headers,
+                custom_header::TARGET_APIROOT,
+                target.to_uri(),
+            );
+        }
 
         // Model D: if the SCP can mint a delegated token, drop whatever
         // Authorization the consumer sent (it was scoped to the consumer, not
         // to this producer) so L1 attaches a fresh, correctly scoped Bearer
         // token. If no OAuth2 client is configured, fall back to forwarding the
         // request as-is (Authorization, if any, passes through).
-        let client = match delegated_nf_type.and_then(|nf| self.oauth_client_for(target, nf)) {
-            Some(oauth_client) => {
-                strip_authorization(&mut fwd.http.headers);
-                oauth_client
-            }
-            None => self.client_for(target),
-        };
+        let (client, delegated) =
+            match delegated_nf_type.and_then(|nf| self.oauth_client_for(target, nf)) {
+                Some(oauth_client) => {
+                    strip_authorization(&mut fwd.http.headers);
+                    (oauth_client, true)
+                }
+                None => (self.client_for(target), false),
+            };
 
-        let result = client.send_request(fwd).await;
+        // scpd-07: keep a pristine (pre-token) copy for a single refresh-and-
+        // retry on a delegated 401/403 Bearer challenge.
+        let retry_fwd = if delegated { Some(fwd.clone()) } else { None };
 
-        let upstream = match result {
+        let mut upstream = match client.send_request(fwd).await {
             Ok(response) => response,
-            Err(e) => return upstream_error_response(&target.to_uri(), &e),
+            Err(e) => return self.stamp_server(upstream_error_response(&target.to_uri(), &e)),
         };
+
+        // scpd-07: on a delegated forward that the producer rejects with
+        // 401/403 + a Bearer `WWW-Authenticate`, the cached token was refused —
+        // invalidate it, mint a fresh one, and retry exactly once
+        // (TS 29.500 §6.10.11.2.3). If it still fails, the response is relayed.
+        if delegated && matches!(upstream.status, 401 | 403) && www_authenticate_is_bearer(&upstream)
+        {
+            if let (Some(oauth2), Some(retry)) = (self.oauth2.as_ref(), retry_fwd) {
+                oauth2.clear_cache().await;
+                if let Ok(retried) = client.send_request(retry).await {
+                    upstream = retried;
+                }
+            }
+        }
 
         // §6.12: learn the producer's Binding for later Routing-Binding
         // stickiness, and still relay the header to the consumer.
@@ -626,12 +1050,22 @@ impl ScpProxy {
         relayed.http.content = upstream.http.content.clone();
         relayed.http.parts = upstream.http.parts.clone();
 
-        // Model D: tell the consumer which producer was selected
-        // (TS 29.500 §5.2.3.2.6).
-        if let Some(id) = producer_id {
-            if !id.is_empty() {
+        // scpd-02/scpd-12: tell the consumer which producer the SCP (re)selected,
+        // in `nfinst=<uuid>[; nfset=<set>]` ABNF form, plus its NF group id —
+        // gated to success responses (TS 29.500 §5.2.3.2.8 / §6.10.3.4).
+        if (200..=299).contains(&upstream.status) {
+            if let Some(id) = producer_id.filter(|s| !s.is_empty()) {
                 relayed.http.set_header(custom_header::PRODUCER_ID, id);
             }
+            if let Some(g) = group_id.filter(|s| !s.is_empty()) {
+                relayed.http.set_header(custom_header::TARGET_NF_GROUP_ID, g);
+            }
+        }
+
+        // scpd-03: a relayed producer error (4xx/5xx) carries this SCP's Via
+        // (TS 29.500 §6.10.8.3); its body/status stay verbatim.
+        if upstream.status >= 400 {
+            self.append_via(&mut relayed.http);
         }
 
         relayed
@@ -640,6 +1074,11 @@ impl ScpProxy {
     /// Handle one inbound SBI request end-to-end (the server handler entry
     /// point).
     pub async fn handle(&self, request: SbiRequest) -> SbiResponse {
+        // scpd-04: reject looped / hop-exhausted requests before any forwarding.
+        if let Some(rejection) = self.ingress_guard(&request) {
+            return rejection;
+        }
+
         match self.route(&request) {
             RouteDecision::TargetApiRoot(target) => {
                 log::debug!(
@@ -648,44 +1087,63 @@ impl ScpProxy {
                     request.header.uri,
                     target.to_uri()
                 );
-                self.forward(&request, &target, None, None).await
+                self.forward(&request, &target, None, None, None).await
             }
             RouteDecision::StickyBinding(target) => {
+                // scpd-12: a sticky / set-level reselection still reports the
+                // (re)selected producer to the consumer. The bound instance id
+                // is carried in the consumer's Routing-Binding `nfinst=`.
+                let producer_id = request
+                    .http
+                    .routing_binding()
+                    .and_then(|b| ParsedBinding::parse(b).nfinst)
+                    .map(|inst| format!("nfinst={inst}"));
                 log::debug!(
                     "SCP binding stickiness: {} {} -> {}",
                     request.header.method,
                     request.header.uri,
                     target.to_uri()
                 );
-                self.forward(&request, &target, None, None).await
+                self.forward(&request, &target, producer_id.as_deref(), None, None)
+                    .await
             }
             RouteDecision::Discover => match self.discover(&request).await {
-                Ok((target, producer_id)) => {
+                Ok(producer) => {
                     // The producer NF type comes from the delegated-discovery
                     // header; used to scope the OAuth2 token the SCP attaches.
                     let delegated_nf_type = request
                         .http
                         .get_header(discovery_header::TARGET_NF_TYPE)
                         .and_then(|s| nf_type_from_str(s));
+                    let producer_id =
+                        build_producer_id(&producer.nf_instance_id, producer.nf_set_id.as_deref());
                     log::debug!(
                         "SCP Model D: {} {} -> {} (producer {})",
                         request.header.method,
                         request.header.uri,
-                        target.to_uri(),
-                        producer_id
+                        producer.target.to_uri(),
+                        producer.nf_instance_id
                     );
-                    self.forward(&request, &target, Some(&producer_id), delegated_nf_type)
-                        .await
+                    self.forward(
+                        &request,
+                        &producer.target,
+                        producer_id.as_deref(),
+                        producer.nf_group_id.as_deref(),
+                        delegated_nf_type,
+                    )
+                    .await
                 }
-                Err(error_response) => error_response,
+                // scpd-03: SCP-originated discovery errors carry our `Server`.
+                Err(error_response) => self.stamp_server(error_response),
             },
-            RouteDecision::Reject => problem_response(
+            // scpd-03: SCP-originated routing rejection carries our `Server`.
+            RouteDecision::Reject => self.stamp_server(problem_response(
                 400,
                 "Bad Request",
                 "Request carries neither a valid 3gpp-Sbi-Target-apiRoot, a known \
                  3gpp-Sbi-Routing-Binding, nor 3gpp-Sbi-Discovery-* headers",
                 "MANDATORY_IE_MISSING",
-            ),
+            )),
         }
     }
 }
@@ -947,12 +1405,19 @@ mod tests {
                     "uri": request.header.uri,
                     "body": request.http.content,
                     "sawTargetApiroot": request.http.target_apiroot().is_some(),
+                    "targetApiroot": request.http.target_apiroot(),
                     "sawDiscovery": request.http.headers.keys()
                         .any(|k| k.to_ascii_lowercase().starts_with("3gpp-sbi-discovery-")),
                     "sawRoutingBinding": request.http.routing_binding().is_some(),
                     "oci": request.http.get_header("3gpp-Sbi-Oci"),
                     "lci": request.http.get_header("3gpp-Sbi-Lci"),
                     "param": request.http.get_param("k"),
+                    // scpd-05/scpd-04 observability: the producer surfaces the
+                    // (forbidden) ck cache-key param, our inserted Via, and the
+                    // decremented Max-Forward-Hops so tests can assert them.
+                    "ck": request.http.get_param("ck"),
+                    "via": request.http.get_header("Via"),
+                    "maxHops": request.http.get_header("3gpp-Sbi-Max-Forward-Hops"),
                 });
                 SbiResponse::ok()
                     .with_body(echoed.to_string(), "application/json")
@@ -1131,10 +1596,11 @@ mod tests {
 
         assert_eq!(response.status, 200);
         assert_eq!(nrf_hits.load(Ordering::SeqCst), 1);
-        // Producer-Id of the selected producer is returned to the consumer.
+        // scpd-02: Producer-Id is returned in the TS 29.500 §5.2.3.2.8 ABNF
+        // `nfinst=<id>` form (not the bare instance id), gated on a 2xx.
         assert_eq!(
             response.http.producer_id().map(String::as_str),
-            Some("udm-instance-1")
+            Some("nfinst=udm-instance-1")
         );
         let echoed: serde_json::Value = response.json_body().unwrap();
         assert_eq!(echoed["body"], r#"{"amf":"reg"}"#);
@@ -1270,7 +1736,7 @@ mod tests {
             nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
             connect_timeout: Duration::from_millis(500),
             request_timeout: Duration::from_millis(500),
-            nf_instance_id: None,
+            ..Default::default()
         });
         let mut req = SbiRequest::get("/nudm-sdm/v1/x");
         req.http.set_header(discovery_header::TARGET_NF_TYPE, "UDM");
@@ -1566,5 +2032,781 @@ mod tests {
 
         scp.stop().await.expect("scp stop");
         producer.stop().await.expect("producer stop");
+    }
+
+    // ------------------------------------------------------------------
+    // scpd-03/04/05/06/07/08/09/10/11/12: relaying obligations, loop
+    // protection, ck-stripping, full discovery factors, token retry,
+    // discovery cache, apiPrefix, next-hop-SCP, set-aware stickiness,
+    // producer-id / group-id.
+    // ------------------------------------------------------------------
+
+    /// A producer that always answers a fixed error status with a small body.
+    async fn start_status_producer(port: u16, status: u16) -> ogs_sbi::server::SbiServer {
+        let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+            SocketAddr::from(([127, 0, 0, 1], port)),
+        ));
+        server
+            .start(move |_request: SbiRequest| async move {
+                SbiResponse::with_status(status).with_body(
+                    format!(r#"{{"status":{status},"cause":"PRODUCER_ERROR"}}"#),
+                    "application/problem+json",
+                )
+            })
+            .await
+            .expect("producer start");
+        server
+    }
+
+    /// A producer that 401s (Bearer challenge) for its first `fail_count`
+    /// requests, then answers 200 — used to drive the scpd-07 token retry.
+    async fn start_token_gated_producer(
+        port: u16,
+        fail_count: u64,
+    ) -> ogs_sbi::server::SbiServer {
+        let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+            SocketAddr::from(([127, 0, 0, 1], port)),
+        ));
+        let calls = Arc::new(AtomicU64::new(0));
+        server
+            .start(move |_request: SbiRequest| {
+                let calls = calls.clone();
+                async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    if n < fail_count {
+                        SbiResponse::with_status(401)
+                            .with_body(
+                                r#"{"status":401,"cause":"UNAUTHORIZED"}"#,
+                                "application/problem+json",
+                            )
+                            .with_header(
+                                "WWW-Authenticate",
+                                r#"Bearer realm="5gc", error="invalid_token""#,
+                            )
+                    } else {
+                        SbiResponse::ok().with_body(r#"{"ok":true}"#, "application/json")
+                    }
+                }
+            })
+            .await
+            .expect("producer start");
+        server
+    }
+
+    /// An NRF whose nnrf-disc records every query parameter it received into
+    /// `captured`, then returns a one-producer SearchResult.
+    async fn start_mock_nrf_capturing(
+        port: u16,
+        producer_port: u16,
+        captured: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    ) -> ogs_sbi::server::SbiServer {
+        let server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+            SocketAddr::from(([127, 0, 0, 1], port)),
+        ));
+        server
+            .start(move |request: SbiRequest| {
+                let captured = captured.clone();
+                async move {
+                    if let Ok(mut map) = captured.lock() {
+                        for (k, v) in &request.http.params {
+                            map.insert(k.clone(), v.clone());
+                        }
+                    }
+                    let search_result = serde_json::json!({
+                        "validityPeriod": 3600,
+                        "nfInstances": [{
+                            "nfInstanceId": "udm-instance-1",
+                            "nfType": "UDM",
+                            "nfStatus": "REGISTERED",
+                            "ipv4Addresses": ["127.0.0.1"],
+                            "nfServices": [{
+                                "serviceName": "nudm-uecm",
+                                "ipEndPoints": [{"ipv4Address": "127.0.0.1", "port": producer_port}]
+                            }]
+                        }]
+                    });
+                    SbiResponse::ok().with_body(search_result.to_string(), "application/json")
+                }
+            })
+            .await
+            .expect("nrf start");
+        server
+    }
+
+    /// scpd-03: an SCP-originated error (here a routing Reject) carries the
+    /// SCP's own identity in the `Server` header.
+    #[tokio::test]
+    async fn test_scp_originated_error_carries_server_header() {
+        let proxy = ScpProxy::new(ScpProxyConfig::default());
+        let response = proxy.handle(SbiRequest::get("/nudm-sdm/v1/x")).await;
+        assert_eq!(response.status, 400);
+        assert_eq!(
+            response.http.get_header(SERVER_HEADER).map(String::as_str),
+            Some("SCP-scp.5gc.local")
+        );
+    }
+
+    /// scpd-03: a relayed producer 4xx/5xx gains the SCP's `Via` while the
+    /// body and status stay verbatim; the SCP does not stamp `Server` on it.
+    #[tokio::test]
+    async fn test_relayed_error_gains_via_verbatim_body() {
+        let producer_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let producer = start_status_producer(producer_port, 409).await;
+        let scp = start_scp(scp_port, ScpProxyConfig::default()).await;
+
+        let request = SbiRequest::post("/nudm-uecm/v1/registrations").with_header(
+            "3gpp-Sbi-Target-apiRoot",
+            format!("http://127.0.0.1:{producer_port}"),
+        );
+        let response = fast_client(scp_port)
+            .send_request(request)
+            .await
+            .expect("error relay roundtrip");
+
+        assert_eq!(response.status, 409);
+        assert!(response
+            .http
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("PRODUCER_ERROR"));
+        // Via appended on the relayed error (TS 29.500 §6.10.8.3).
+        assert_eq!(
+            response.http.get_header(VIA_HEADER).map(String::as_str),
+            Some("2.0 SCP-scp.5gc.local")
+        );
+        // Relayed (not SCP-originated) → no Server header added by the SCP.
+        assert!(response.http.get_header(SERVER_HEADER).is_none());
+
+        scp.stop().await.expect("scp stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// scpd-04: a request whose `Via` already lists this SCP loops → 400
+    /// MSG_LOOP_DETECTED before any forwarding.
+    #[tokio::test]
+    async fn test_ingress_via_loop_detected() {
+        let proxy = ScpProxy::new(ScpProxyConfig::default());
+        let req = SbiRequest::get("/nudm-sdm/v1/x")
+            .with_header("Via", "2.0 SCP-scp.5gc.local")
+            .with_header("3gpp-Sbi-Target-apiRoot", "http://127.0.0.1:1");
+        let response = proxy.handle(req).await;
+        assert_eq!(response.status, 400);
+        let problem: ProblemDetails = response.json_body().unwrap();
+        assert_eq!(problem.cause.as_deref(), Some("MSG_LOOP_DETECTED"));
+        assert_eq!(
+            response.http.get_header(SERVER_HEADER).map(String::as_str),
+            Some("SCP-scp.5gc.local")
+        );
+    }
+
+    /// scpd-04: an exhausted scp-typed Max-Forward-Hops → 502
+    /// MAX_SCP_HOPS_REACHED.
+    #[tokio::test]
+    async fn test_ingress_max_hops_reached() {
+        let proxy = ScpProxy::new(ScpProxyConfig::default());
+        let req = SbiRequest::get("/nudm-sdm/v1/x")
+            .with_header(MAX_FORWARD_HOPS_HEADER, "0; nodetype=scp")
+            .with_header("3gpp-Sbi-Target-apiRoot", "http://127.0.0.1:1");
+        let response = proxy.handle(req).await;
+        assert_eq!(response.status, 502);
+        let problem: ProblemDetails = response.json_body().unwrap();
+        assert_eq!(problem.cause.as_deref(), Some("MAX_SCP_HOPS_REACHED"));
+    }
+
+    /// scpd-04: a normal forward decrements the scp-typed hop count and inserts
+    /// the SCP's own Via on the request seen by the producer.
+    #[tokio::test]
+    async fn test_forward_decrements_hops_and_inserts_via() {
+        let producer_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let producer = start_mock_producer(producer_port).await;
+        let scp = start_scp(scp_port, ScpProxyConfig::default()).await;
+
+        let request = SbiRequest::get("/nudm-uecm/v1/registrations")
+            .with_header(
+                "3gpp-Sbi-Target-apiRoot",
+                format!("http://127.0.0.1:{producer_port}"),
+            )
+            .with_header("3gpp-Sbi-Max-Forward-Hops", "5; nodetype=scp");
+        let response = fast_client(scp_port)
+            .send_request(request)
+            .await
+            .expect("roundtrip");
+        assert_eq!(response.status, 200);
+        let echoed: serde_json::Value = response.json_body().unwrap();
+        assert_eq!(echoed["maxHops"], "4; nodetype=scp");
+        assert_eq!(
+            echoed["via"].as_str(),
+            Some("2.0 SCP-scp.5gc.local"),
+            "the producer must see the SCP's inserted Via"
+        );
+
+        scp.stop().await.expect("scp stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// scpd-05: the `ck` cache-key param is stripped before forwarding; other
+    /// params pass through (TS 29.500 §6.10.2.6).
+    #[tokio::test]
+    async fn test_ck_cache_key_param_is_stripped() {
+        let producer_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let producer = start_mock_producer(producer_port).await;
+        let scp = start_scp(scp_port, ScpProxyConfig::default()).await;
+
+        let request = SbiRequest::get("/nudm-uecm/v1/registrations")
+            .with_param("ck", "cache-key-abc")
+            .with_param("k", "v")
+            .with_header(
+                "3gpp-Sbi-Target-apiRoot",
+                format!("http://127.0.0.1:{producer_port}"),
+            );
+        let response = fast_client(scp_port)
+            .send_request(request)
+            .await
+            .expect("roundtrip");
+        assert_eq!(response.status, 200);
+        let echoed: serde_json::Value = response.json_body().unwrap();
+        assert_eq!(echoed["param"], "v");
+        assert!(
+            echoed["ck"].is_null(),
+            "ck must not reach the producer, got: {}",
+            echoed["ck"]
+        );
+
+        scp.stop().await.expect("scp stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// scpd-06: every conveyed `3gpp-Sbi-Discovery-*` factor is forwarded to the
+    /// NRF as its nnrf-disc query parameter.
+    #[tokio::test]
+    async fn test_all_discovery_factors_forwarded_to_nrf() {
+        let producer_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let captured = Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let producer = start_mock_producer(producer_port).await;
+        let nrf = start_mock_nrf_capturing(nrf_port, producer_port, captured.clone()).await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // NOTE: the ogs-sbi client serializes query params verbatim (no
+        // percent-encoding, a pre-existing lib gap outside scpd's ownership), so
+        // factor *values* here are query-safe tokens. scpd-06 is about the
+        // header→param *mapping*, which is value-independent.
+        let request = SbiRequest::post("/nudm-uecm/v1/registrations")
+            .with_header("3gpp-Sbi-Discovery-target-nf-type", "UDM")
+            .with_header("3gpp-Sbi-Discovery-requester-nf-type", "AMF")
+            .with_header("3gpp-Sbi-Discovery-service-names", "nudm-uecm")
+            .with_header("3gpp-Sbi-Discovery-guami", "001-01-cafe00")
+            .with_header("3gpp-Sbi-Discovery-tai", "001-01-000001")
+            .with_header("3gpp-Sbi-Discovery-target-plmn-list", "001-01")
+            .with_header("3gpp-Sbi-Discovery-requester-features", "2b");
+        let response = fast_client(scp_port)
+            .send_request(request)
+            .await
+            .expect("roundtrip");
+        assert_eq!(response.status, 200);
+
+        // Snapshot the captured params (releasing the lock) before any await.
+        let params: HashMap<String, String> = captured.lock().unwrap().clone();
+        assert_eq!(params.get("target-nf-type").map(String::as_str), Some("UDM"));
+        assert_eq!(
+            params.get("requester-nf-type").map(String::as_str),
+            Some("AMF")
+        );
+        assert_eq!(
+            params.get("service-names").map(String::as_str),
+            Some("nudm-uecm")
+        );
+        assert!(params.contains_key("guami"), "guami factor forwarded");
+        assert!(params.contains_key("tai"), "tai factor forwarded");
+        assert!(
+            params.contains_key("target-plmn-list"),
+            "target-plmn-list factor forwarded"
+        );
+        assert_eq!(
+            params.get("requester-features").map(String::as_str),
+            Some("2b")
+        );
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// scpd-07: a delegated forward that the producer 401s with a Bearer
+    /// challenge invalidates the cached token, mints a fresh one and retries
+    /// once — the consumer sees 200 and the NRF served ≥2 token requests.
+    #[tokio::test]
+    async fn test_delegated_401_refreshes_token_and_retries_once() {
+        let producer_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let token_hits = Arc::new(AtomicU64::new(0));
+
+        let producer = start_token_gated_producer(producer_port, 1).await;
+        let nrf = start_mock_nrf_with_oauth2(
+            nrf_port,
+            producer_port,
+            "scp-delegated-token",
+            token_hits.clone(),
+        )
+        .await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                nf_instance_id: Some("scp-instance-1".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let request = SbiRequest::post("/nudm-uecm/v1/registrations")
+            .with_body(r#"{"amf":"reg"}"#, "application/json")
+            .with_header(discovery_header::TARGET_NF_TYPE, "UDM")
+            .with_header(discovery_header::REQUESTER_NF_TYPE, "AMF")
+            .with_header(discovery_header::SERVICE_NAMES, "nudm-uecm");
+        let response = fast_client(scp_port)
+            .send_request(request)
+            .await
+            .expect("roundtrip");
+
+        assert_eq!(response.status, 200, "retry with fresh token succeeds");
+        assert!(
+            token_hits.load(Ordering::SeqCst) >= 2,
+            "the SCP must mint a second token after the 401, got {}",
+            token_hits.load(Ordering::SeqCst)
+        );
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// scpd-07: a producer that keeps returning 401 → the response is relayed
+    /// to the consumer after the single retry.
+    #[tokio::test]
+    async fn test_delegated_persistent_401_is_relayed() {
+        let producer_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let token_hits = Arc::new(AtomicU64::new(0));
+
+        let producer = start_token_gated_producer(producer_port, u64::MAX).await;
+        let nrf = start_mock_nrf_with_oauth2(
+            nrf_port,
+            producer_port,
+            "scp-delegated-token",
+            token_hits.clone(),
+        )
+        .await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                nf_instance_id: Some("scp-instance-1".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let request = SbiRequest::post("/nudm-uecm/v1/registrations")
+            .with_header(discovery_header::TARGET_NF_TYPE, "UDM")
+            .with_header(discovery_header::REQUESTER_NF_TYPE, "AMF")
+            .with_header(discovery_header::SERVICE_NAMES, "nudm-uecm");
+        let response = fast_client(scp_port)
+            .send_request(request)
+            .await
+            .expect("roundtrip");
+        assert_eq!(response.status, 401, "persistent 401 is relayed verbatim");
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// scpd-08: two consecutive Model D requests for the same target produce a
+    /// single NRF discovery hit (the second is served from the cache).
+    #[tokio::test]
+    async fn test_discovery_cache_serves_second_request() {
+        let producer_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let nrf_hits = Arc::new(AtomicU64::new(0));
+
+        let producer = start_mock_producer(producer_port).await;
+        let nrf = start_mock_nrf(nrf_port, producer_port, nrf_hits.clone()).await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let client = fast_client(scp_port);
+        for _ in 0..2 {
+            let request = SbiRequest::post("/nudm-uecm/v1/registrations")
+                .with_header("3gpp-Sbi-Discovery-target-nf-type", "UDM")
+                .with_header("3gpp-Sbi-Discovery-requester-nf-type", "AMF")
+                .with_header("3gpp-Sbi-Discovery-service-names", "nudm-uecm");
+            let response = client.send_request(request).await.expect("roundtrip");
+            assert_eq!(response.status, 200);
+        }
+        assert_eq!(
+            nrf_hits.load(Ordering::SeqCst),
+            1,
+            "second Model D request must be served from the discovery cache"
+        );
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// scpd-09: a discovered `apiPrefix` is prepended to the forwarded request
+    /// URI seen by the producer.
+    #[tokio::test]
+    async fn test_apiprefix_propagates_into_forwarded_uri() {
+        let producer_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+
+        let producer = start_mock_producer(producer_port).await;
+        let nrf_server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+            SocketAddr::from(([127, 0, 0, 1], nrf_port)),
+        ));
+        nrf_server
+            .start(move |_request: SbiRequest| async move {
+                let search_result = serde_json::json!({
+                    "validityPeriod": 3600,
+                    "nfInstances": [{
+                        "nfInstanceId": "udm-prefixed",
+                        "nfType": "UDM",
+                        "nfStatus": "REGISTERED",
+                        "ipv4Addresses": ["127.0.0.1"],
+                        "nfServices": [{
+                            "serviceName": "nudm-uecm",
+                            "apiPrefix": "/deploy",
+                            "ipEndPoints": [{"ipv4Address": "127.0.0.1", "port": producer_port}]
+                        }]
+                    }]
+                });
+                SbiResponse::ok().with_body(search_result.to_string(), "application/json")
+            })
+            .await
+            .expect("nrf start");
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let request = SbiRequest::post("/nudm-uecm/v1/registrations")
+            .with_header("3gpp-Sbi-Discovery-target-nf-type", "UDM")
+            .with_header("3gpp-Sbi-Discovery-requester-nf-type", "AMF")
+            .with_header("3gpp-Sbi-Discovery-service-names", "nudm-uecm");
+        let response = fast_client(scp_port)
+            .send_request(request)
+            .await
+            .expect("roundtrip");
+        assert_eq!(response.status, 200);
+        let echoed: serde_json::Value = response.json_body().unwrap();
+        assert_eq!(echoed["uri"], "/deploy/nudm-uecm/v1/registrations");
+
+        scp.stop().await.expect("scp stop");
+        nrf_server.stop().await.expect("nrf stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// scpd-10: with next-hop-SCP enabled, the forwarded request carries the
+    /// selected producer apiRoot in `3gpp-Sbi-Target-apiRoot` (instead of being
+    /// stripped as in the default next-hop-producer deployment).
+    #[tokio::test]
+    async fn test_next_hop_scp_reinserts_target_apiroot() {
+        let producer_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let producer = start_mock_producer(producer_port).await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                next_hop_scp: true,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let producer_apiroot = format!("http://127.0.0.1:{producer_port}");
+        let request = SbiRequest::post("/nudm-uecm/v1/registrations")
+            .with_header("3gpp-Sbi-Target-apiRoot", producer_apiroot.clone());
+        let response = fast_client(scp_port)
+            .send_request(request)
+            .await
+            .expect("roundtrip");
+        assert_eq!(response.status, 200);
+        let echoed: serde_json::Value = response.json_body().unwrap();
+        assert_eq!(echoed["sawTargetApiroot"], true);
+        assert_eq!(echoed["targetApiroot"].as_str(), Some(producer_apiroot.as_str()));
+
+        scp.stop().await.expect("scp stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// scpd-11: an `nf-set` Routing-Binding reselects another learnt set member
+    /// when the originally-bound instance is gone; an `nf-instance` binding to
+    /// an unknown instance does not fall through to a set.
+    #[test]
+    fn test_set_aware_binding_reselection() {
+        let proxy = ScpProxy::new(ScpProxyConfig::default());
+        let member = ApiRoot::parse("http://smf-setmember:7778").unwrap();
+        let pinned = ApiRoot::parse("http://smf-pinned:7778").unwrap();
+
+        // Learn a set member (via a producer Binding) and a pinned instance.
+        proxy.binding_store("bl=nf-set; nfset=setA.smfset.5gc; nfinst=i-orig", &member);
+        proxy.binding_store("bl=nf-instance; nfinst=i-pinned", &pinned);
+
+        // Exact instance binding still pins to the exact instance.
+        let mut pin_req = SbiRequest::get("/nsmf-pdusession/v1/x");
+        pin_req
+            .http
+            .set_routing_binding("bl=nf-instance; nfinst=i-pinned");
+        assert!(matches!(proxy.route(&pin_req), RouteDecision::StickyBinding(t) if t == pinned));
+
+        // Set-level binding naming a now-gone instance reselects a set member.
+        let mut set_req = SbiRequest::get("/nsmf-pdusession/v1/x");
+        set_req
+            .http
+            .set_routing_binding("bl=nf-set; nfset=setA.smfset.5gc; nfinst=i-gone");
+        assert!(matches!(proxy.route(&set_req), RouteDecision::StickyBinding(t) if t == member));
+
+        // An nf-instance binding to an unknown instance does NOT match a set.
+        let mut unknown = SbiRequest::get("/nsmf-pdusession/v1/x");
+        unknown
+            .http
+            .set_routing_binding("bl=nf-instance; nfinst=i-unknown");
+        assert_eq!(proxy.route(&unknown), RouteDecision::Reject);
+    }
+
+    /// scpd-12: a sticky (non-delegated) reselection still reports the bound
+    /// producer to the consumer via `3gpp-Sbi-Producer-Id` in `nfinst=` form.
+    #[tokio::test]
+    async fn test_sticky_reselection_reports_producer_id() {
+        let producer_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let nrf_hits = Arc::new(AtomicU64::new(0));
+
+        let producer = start_mock_producer(producer_port).await;
+        let nrf = start_mock_nrf(nrf_port, producer_port, nrf_hits.clone()).await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                ..Default::default()
+            },
+        )
+        .await;
+        let client = fast_client(scp_port);
+
+        // Model D to learn the producer's Binding (bl=nf-instance; nfinst=producer-1).
+        let model_d = SbiRequest::post("/nudm-uecm/v1/registrations")
+            .with_header("3gpp-Sbi-Discovery-target-nf-type", "UDM")
+            .with_header("3gpp-Sbi-Discovery-requester-nf-type", "AMF")
+            .with_header("3gpp-Sbi-Discovery-service-names", "nudm-uecm");
+        let resp = client.send_request(model_d).await.expect("model D");
+        let binding = resp.http.binding().cloned().expect("binding");
+
+        // Sticky request: the response carries the bound producer id in nfinst= form.
+        let sticky = SbiRequest::get("/nudm-uecm/v1/registrations/1")
+            .with_header("3gpp-Sbi-Routing-Binding", binding);
+        let resp = client.send_request(sticky).await.expect("sticky");
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.http.producer_id().map(String::as_str),
+            Some("nfinst=producer-1")
+        );
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// scpd-12: a Model D selection of a group-member producer carries
+    /// `3gpp-Sbi-Target-Nf-Group-Id`; scpd-02: also a `nfinst=...; nfset=...`
+    /// Producer-Id when the profile declares an NF set.
+    #[tokio::test]
+    async fn test_group_and_set_member_selection_reports_ids() {
+        let producer_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+
+        let producer = start_mock_producer(producer_port).await;
+        let nrf_server = ogs_sbi::server::SbiServer::new(ogs_sbi::server::SbiServerConfig::new(
+            SocketAddr::from(([127, 0, 0, 1], nrf_port)),
+        ));
+        nrf_server
+            .start(move |_request: SbiRequest| async move {
+                let search_result = serde_json::json!({
+                    "validityPeriod": 3600,
+                    "nfInstances": [{
+                        "nfInstanceId": "udm-grouped",
+                        "nfType": "UDM",
+                        "nfStatus": "REGISTERED",
+                        "ipv4Addresses": ["127.0.0.1"],
+                        "nfSetIdList": ["set1.udmset.5gc.mnc012.mcc345"],
+                        "udmInfo": {"groupId": "udm-group-1"},
+                        "nfServices": [{
+                            "serviceName": "nudm-uecm",
+                            "ipEndPoints": [{"ipv4Address": "127.0.0.1", "port": producer_port}]
+                        }]
+                    }]
+                });
+                SbiResponse::ok().with_body(search_result.to_string(), "application/json")
+            })
+            .await
+            .expect("nrf start");
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let request = SbiRequest::post("/nudm-uecm/v1/registrations")
+            .with_header("3gpp-Sbi-Discovery-target-nf-type", "UDM")
+            .with_header("3gpp-Sbi-Discovery-requester-nf-type", "AMF")
+            .with_header("3gpp-Sbi-Discovery-service-names", "nudm-uecm");
+        let response = fast_client(scp_port)
+            .send_request(request)
+            .await
+            .expect("roundtrip");
+        assert_eq!(response.status, 200);
+        // scpd-02: Producer-Id carries both nfinst and nfset.
+        assert_eq!(
+            response.http.producer_id().map(String::as_str),
+            Some("nfinst=udm-grouped; nfset=set1.udmset.5gc.mnc012.mcc345")
+        );
+        // scpd-12: group membership surfaced as Target-Nf-Group-Id.
+        assert_eq!(
+            response
+                .http
+                .get_header(custom_header::TARGET_NF_GROUP_ID)
+                .map(String::as_str),
+            Some("udm-group-1")
+        );
+
+        scp.stop().await.expect("scp stop");
+        nrf_server.stop().await.expect("nrf stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// scpd-02: a relayed producer error (no reselection) carries NO
+    /// Producer-Id (status-gated to 2xx), but still gains the relay Via.
+    #[tokio::test]
+    async fn test_relayed_500_carries_no_producer_id() {
+        let producer_port = ephemeral_port();
+        let nrf_port = ephemeral_port();
+        let scp_port = ephemeral_port();
+        let nrf_hits = Arc::new(AtomicU64::new(0));
+
+        let producer = start_status_producer(producer_port, 500).await;
+        let nrf = start_mock_nrf(nrf_port, producer_port, nrf_hits.clone()).await;
+        let scp = start_scp(
+            scp_port,
+            ScpProxyConfig {
+                nrf_uri: Some(format!("http://127.0.0.1:{nrf_port}")),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let request = SbiRequest::post("/nudm-uecm/v1/registrations")
+            .with_header("3gpp-Sbi-Discovery-target-nf-type", "UDM")
+            .with_header("3gpp-Sbi-Discovery-requester-nf-type", "AMF")
+            .with_header("3gpp-Sbi-Discovery-service-names", "nudm-uecm");
+        let response = fast_client(scp_port)
+            .send_request(request)
+            .await
+            .expect("roundtrip");
+        assert_eq!(response.status, 500);
+        assert!(
+            response.http.producer_id().is_none(),
+            "no Producer-Id on a relayed error without reselection"
+        );
+        assert_eq!(
+            response.http.get_header(VIA_HEADER).map(String::as_str),
+            Some("2.0 SCP-scp.5gc.local")
+        );
+
+        scp.stop().await.expect("scp stop");
+        nrf.stop().await.expect("nrf stop");
+        producer.stop().await.expect("producer stop");
+    }
+
+    /// scpd-04 unit: Max-Forward-Hops parsing.
+    #[test]
+    fn test_parse_max_forward_hops_unit() {
+        assert_eq!(
+            parse_max_forward_hops("5; nodetype=scp"),
+            Some((5, Some("scp".to_string())))
+        );
+        assert_eq!(parse_max_forward_hops("0"), Some((0, None)));
+        assert_eq!(parse_max_forward_hops("notanumber"), None);
+    }
+
+    /// scpd-02 unit: Producer-Id ABNF builder.
+    #[test]
+    fn test_build_producer_id_unit() {
+        assert_eq!(
+            build_producer_id("uuid-1", None).as_deref(),
+            Some("nfinst=uuid-1")
+        );
+        assert_eq!(
+            build_producer_id("uuid-1", Some("setX")).as_deref(),
+            Some("nfinst=uuid-1; nfset=setX")
+        );
+        assert_eq!(build_producer_id("", Some("setX")), None);
+    }
+
+    /// scpd-06 unit: discovery-header → nnrf-disc param mapping.
+    #[test]
+    fn test_nnrf_disc_param_mapping_unit() {
+        assert_eq!(
+            nnrf_disc_param_from_discovery_header("3gpp-Sbi-Discovery-guami").as_deref(),
+            Some("guami")
+        );
+        // case-insensitive prefix, lowercased param
+        assert_eq!(
+            nnrf_disc_param_from_discovery_header("3GPP-SBI-DISCOVERY-Target-Plmn-List").as_deref(),
+            Some("target-plmn-list")
+        );
+        // out-of-band / non-disc factors are skipped
+        assert_eq!(
+            nnrf_disc_param_from_discovery_header("3gpp-Sbi-Discovery-target-nf-type"),
+            None
+        );
+        assert_eq!(
+            nnrf_disc_param_from_discovery_header("3gpp-Sbi-Discovery-hnrf-uri"),
+            None
+        );
+        assert_eq!(nnrf_disc_param_from_discovery_header("content-type"), None);
     }
 }
