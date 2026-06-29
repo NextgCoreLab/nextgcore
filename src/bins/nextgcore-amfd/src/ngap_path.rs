@@ -909,6 +909,9 @@ impl NgapServer {
                     amf_ue_ngap_id,
                     initial_ue.ran_ue_ngap_id,
                     &nas,
+                    // InitialUEMessage: unprotected initial NAS message — the
+                    // §4.4.6 cleartext-IE gate applies.
+                    false,
                 )
                 .await?;
             }
@@ -1036,12 +1039,16 @@ impl NgapServer {
 
         match msg_type {
             message_type::REGISTRATION_REQUEST => {
-                // Mobility / periodic registration update over existing connection
+                // Mobility / periodic registration update over existing connection.
+                // Integrity-protected iff it arrived under a NAS security context
+                // (a plain message has security-header PLAIN_NAS_MESSAGE).
+                let integrity_protected = sec_hdr != security_header::PLAIN_NAS_MESSAGE;
                 self.handle_registration_request_nas(
                     association_id,
                     ul_nas.amf_ue_ngap_id,
                     ul_nas.ran_ue_ngap_id,
                     &inner,
+                    integrity_protected,
                 )
                 .await?;
             }
@@ -1272,6 +1279,11 @@ impl NgapServer {
         amf_ue_ngap_id: u64,
         ran_ue_ngap_id: u32,
         nas: &[u8],
+        // True when this Registration Request arrived integrity-protected (a
+        // mobility/periodic update over an existing NAS security context, or the
+        // replay inside Security Mode Complete); false for an unprotected
+        // initial NAS message (InitialUEMessage). Drives the §4.4.6 gate.
+        integrity_protected: bool,
     ) -> Result<()> {
         let Some(req) = parse_registration_request_pdu(nas) else {
             log::error!("Malformed Registration Request: rejecting (#96)");
@@ -1281,6 +1293,17 @@ impl NgapServer {
                 .await?;
             return Ok(());
         };
+
+        // TS 24.501 §4.4.6 / TS 33.501 §6.4.6: enforce cleartext-IE + integrity
+        // rules BEFORE any IE influences UE context state. An unprotected initial
+        // Registration Request carrying a non-cleartext IE (e.g. Requested NSSAI)
+        // or a NAS message container is rejected with 5GMM #95.
+        if let Some(cause) = validate_initial_registration_cleartext(&req, integrity_protected) {
+            let reject = gmm_build::build_registration_reject(cause);
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                .await?;
+            return Ok(());
+        }
 
         log::info!(
             "Registration Request: type={}, ngKSI={}/{}, identity_type={}, suci={:?}",
@@ -1353,7 +1376,10 @@ impl NgapServer {
                 eia: 0,
             };
         }
-        state.amf_ue.requested_nssai = req.requested_nssai.clone();
+        // TS 24.501 §4.4.6: the Requested NSSAI is a NON-cleartext IE and MUST
+        // NOT be taken from the unprotected initial Registration Request. It is
+        // populated only from the integrity-protected replay inside Security
+        // Mode Complete (`handle_security_mode_complete_nas`).
 
         match req.identity_type {
             t if t == mobile_identity_type::SUCI => {
@@ -1681,8 +1707,31 @@ impl NgapServer {
         let ue_int_mask = wire_caps_to_mask(state.amf_ue.ue_security_capability.ia);
         let ue_enc_mask = wire_caps_to_mask(state.amf_ue.ue_security_capability.ea);
 
-        state.amf_ue.selected_int_algorithm =
-            nas_security::select_integrity_algorithm(ue_int_mask, amf_int_mask);
+        // Fail-closed integrity-algorithm selection (TS 33.501 §5.5.2 / §6.7.2):
+        // an empty UE/AMF NIA intersection yields None. We must NOT fabricate
+        // NIA2 the UE never advertised — reject the registration and release the
+        // UE. Ciphering is asymmetric: NEA0 (null) is a permitted selection, so
+        // `select_encryption_algorithm` keeps returning NEA0 on empty
+        // intersection and is left unchanged.
+        let Some(selected_int) =
+            nas_security::select_integrity_algorithm(ue_int_mask, amf_int_mask)
+        else {
+            log::error!(
+                "UE {amf_ue_ngap_id}: no common NAS integrity algorithm \
+                 (ue_ia={:#04x}, amf_mask={amf_int_mask:#06x}); rejecting registration \
+                 (TS 33.501 §5.5.2 fail-closed)",
+                state.amf_ue.ue_security_capability.ia
+            );
+            let reject =
+                gmm_build::build_registration_reject(GmmCause::SecurityModeRejectedUnspecified);
+            self.ue_auth_state.insert(amf_ue_ngap_id, state);
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                .await?;
+            self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                .await?;
+            return Ok(());
+        };
+        state.amf_ue.selected_int_algorithm = selected_int;
         state.amf_ue.selected_enc_algorithm =
             nas_security::select_encryption_algorithm(ue_enc_mask, amf_enc_mask);
 
@@ -1915,8 +1964,13 @@ impl NgapServer {
         // received in the cleartext initial RegistrationRequest. A mismatch means
         // an attacker tampered with the unprotected initial message to downgrade
         // the algorithms; the AMF aborts with 5GMM cause #23.
+        // TS 24.501 §4.4.6: the Requested NSSAI is a non-cleartext IE, so it is
+        // taken ONLY from the integrity-protected replay here (never from the
+        // unprotected initial Registration Request).
+        let mut replayed_requested_nssai: Vec<SNssai> = Vec::new();
         if let Some(replayed) = extract_nas_message_container(nas) {
             if let Some(inner) = parse_registration_request_pdu(&replayed) {
+                replayed_requested_nssai = inner.requested_nssai.clone();
                 if let Some(replayed_caps) = inner.sec_cap {
                     let stored = self
                         .ue_auth_state
@@ -1986,6 +2040,11 @@ impl NgapServer {
             let Some(state) = self.ue_auth_state.get_mut(&amf_ue_ngap_id) else {
                 return Ok(());
             };
+            // Populate the Requested NSSAI from the integrity-protected replay
+            // (TS 24.501 §4.4.6); the unprotected initial request no longer sets
+            // it. Empty replay leaves it empty (subscription/PLMN config drive
+            // the Allowed NSSAI downstream).
+            state.amf_ue.requested_nssai = replayed_requested_nssai;
             // Stop T3560
             if matches!(
                 state.retx,
@@ -4226,6 +4285,78 @@ struct ParsedRegistrationRequest {
     /// UE signals a reduced-capability device (NAS IEI 0xA9) so the AMF caps
     /// UE-AMBR and forwards the indication to the SMF for a reduced session-AMBR.
     redcap_indication: bool,
+    /// Presence bitmask of the optional IEs surfaced by
+    /// `parse_registration_request_pdu`, used by the §4.4.6 cleartext-IE gate
+    /// (`validate_initial_registration_cleartext`). See the `reg_present` bit
+    /// constants.
+    presencemask: u64,
+    /// Whether a NAS message container IE (0x71) was present. Per TS 24.501
+    /// §4.4.6 it must not appear in an unprotected initial NAS message.
+    nas_message_container_present: bool,
+}
+
+/// Presence bits set in `ParsedRegistrationRequest::presencemask` for the
+/// TS 24.501 §4.4.6 cleartext-IE gate. Mirrors the (dead-code) gmm_handler
+/// logic but operates on the live `ParsedRegistrationRequest`. Cleartext IEs
+/// (permitted in an unprotected initial NAS message) are folded into
+/// `REGISTRATION_CLEARTEXT_PRESENT`; any bit OUTSIDE that mask is a
+/// non-cleartext IE whose presence in an unprotected initial Registration
+/// Request is a §4.4.6 violation (5GMM #95). Rel-17/18 capability indications
+/// (SNPN NID / RedCap / MINT / UAV) are intentionally NOT assigned a bit so
+/// they never trip the gate.
+mod reg_present {
+    /// UE security capability (IEI 0x2E) — cleartext.
+    pub const UE_SECURITY_CAPABILITY: u64 = 1 << 0;
+    /// Additional GUTI (IEI 0x77, TLV-E) — cleartext.
+    pub const ADDITIONAL_GUTI: u64 = 1 << 1;
+    /// Requested NSSAI (IEI 0x2F) — NOT cleartext.
+    pub const REQUESTED_NSSAI: u64 = 1 << 2;
+    /// Last visited registered TAI (IEI 0x52) — NOT cleartext.
+    pub const LAST_VISITED_TAI: u64 = 1 << 3;
+}
+
+/// IEs permitted in an unprotected initial NAS message per TS 24.501 §4.4.6.
+const REGISTRATION_CLEARTEXT_PRESENT: u64 =
+    reg_present::UE_SECURITY_CAPABILITY | reg_present::ADDITIONAL_GUTI;
+
+/// Enforce the TS 24.501 §4.4.6 / TS 33.501 §6.4.6 cleartext-IE rule on a
+/// Registration Request before it influences UE context state.
+///
+/// When the message is integrity-protected — the full request replayed inside
+/// Security Mode Complete, or a mobility/periodic update sent over an existing
+/// NAS security context — every IE is permitted and this returns `None`.
+///
+/// When the message is an unprotected initial NAS message (no security context
+/// yet), only the §4.4.6 cleartext IEs are allowed: a non-cleartext IE (e.g.
+/// Requested NSSAI), or a NAS message container, present in the clear is a
+/// conformance violation and returns `Some(SemanticallyIncorrectMessage)`
+/// (5GMM #95). The full Requested NSSAI etc. must instead be taken from the
+/// integrity-protected replay inside Security Mode Complete.
+fn validate_initial_registration_cleartext(
+    req: &ParsedRegistrationRequest,
+    integrity_protected: bool,
+) -> Option<GmmCause> {
+    if integrity_protected {
+        return None;
+    }
+    // Non-cleartext IE present in an unprotected initial NAS message.
+    if (req.presencemask & !REGISTRATION_CLEARTEXT_PRESENT) != 0 {
+        log::error!(
+            "Non-cleartext IE in unprotected initial Registration Request \
+             (presencemask={:#x}); rejecting (5GMM #95)",
+            req.presencemask
+        );
+        return Some(GmmCause::SemanticallyIncorrectMessage);
+    }
+    // A NAS message container cannot be trusted before a security context exists.
+    if req.nas_message_container_present {
+        log::error!(
+            "NAS message container in unprotected initial Registration Request; \
+             rejecting (5GMM #95)"
+        );
+        return Some(GmmCause::SemanticallyIncorrectMessage);
+    }
+    None
 }
 
 /// SNPN allowed-NID list for this AMF (Rel-17, TS 23.501 §5.30).
@@ -4442,6 +4573,7 @@ fn parse_registration_request_pdu(nas: &[u8]) -> Option<ParsedRegistrationReques
                         eea: if len >= 3 { nas[pos + 4] } else { 0 },
                         eia: if len >= 4 { nas[pos + 5] } else { 0 },
                     });
+                    req.presencemask |= reg_present::UE_SECURITY_CAPABILITY;
                 }
                 pos += 2 + len;
             }
@@ -4453,6 +4585,8 @@ fn parse_registration_request_pdu(nas: &[u8]) -> Option<ParsedRegistrationReques
                 let len = nas[pos + 1] as usize;
                 if pos + 2 + len <= nas.len() {
                     req.requested_nssai = parse_nssai_value(&nas[pos + 2..pos + 2 + len]);
+                    // Requested NSSAI is a NON-cleartext IE (TS 24.501 §4.4.6).
+                    req.presencemask |= reg_present::REQUESTED_NSSAI;
                 }
                 pos += 2 + len;
             }
@@ -4512,8 +4646,12 @@ fn parse_registration_request_pdu(nas: &[u8]) -> Option<ParsedRegistrationReques
                 }
                 pos += 2 + len;
             }
-            // Last visited registered TAI (IEI 0x52, TV, 7 bytes total)
-            0x52 => pos += 7,
+            // Last visited registered TAI (IEI 0x52, TV, 7 bytes total).
+            // NON-cleartext IE (TS 24.501 §4.4.6).
+            0x52 => {
+                req.presencemask |= reg_present::LAST_VISITED_TAI;
+                pos += 7;
+            }
             // TLV-E IEs (2-byte length): EPS NAS container (0x70),
             // NAS message container (0x71), additional GUTI (0x77),
             // payload containers (0x7B/0x7C)
@@ -4522,6 +4660,14 @@ fn parse_registration_request_pdu(nas: &[u8]) -> Option<ParsedRegistrationReques
                     break;
                 }
                 let len = ((nas[pos + 1] as usize) << 8) | (nas[pos + 2] as usize);
+                match iei {
+                    // NAS message container (TS 24.501 §4.4.6): not permitted in
+                    // an unprotected initial NAS message.
+                    0x71 => req.nas_message_container_present = true,
+                    // Additional GUTI — cleartext IE.
+                    0x77 => req.presencemask |= reg_present::ADDITIONAL_GUTI,
+                    _ => {}
+                }
                 pos += 3 + len;
             }
             // Type-1 TV (IEI in high nibble)
@@ -4992,6 +5138,80 @@ mod tests {
         assert_eq!(req.requested_nssai[0].sst, 1);
     }
 
+    /// A cleartext-only initial Registration Request (TS 24.501 §4.4.6): SUCI
+    /// identity + UE security capability, but no Requested NSSAI IE.
+    fn cleartext_only_registration_request() -> Vec<u8> {
+        let mut nas = vec![0x7E, 0x00, 0x41, 0x09];
+        let suci = vec![
+            0x01, 0x99, 0xF9, 0x07, 0xF0, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10,
+        ];
+        nas.extend_from_slice(&(suci.len() as u16).to_be_bytes());
+        nas.extend_from_slice(&suci);
+        // UE security capability (IEI 0x2E) — a cleartext IE.
+        nas.extend_from_slice(&[0x2E, 0x02, 0xF0, 0xF0]);
+        nas
+    }
+
+    #[test]
+    fn test_parse_registration_request_sets_presencemask() {
+        // sample_registration_request carries UE security capability (cleartext)
+        // and Requested NSSAI (non-cleartext).
+        let req = parse_registration_request_pdu(&sample_registration_request()).expect("parse");
+        assert_ne!(req.presencemask & reg_present::UE_SECURITY_CAPABILITY, 0);
+        assert_ne!(req.presencemask & reg_present::REQUESTED_NSSAI, 0);
+        assert!(!req.nas_message_container_present);
+
+        // Cleartext-only request: no non-cleartext bit set.
+        let clear =
+            parse_registration_request_pdu(&cleartext_only_registration_request()).expect("parse");
+        assert_eq!(clear.presencemask & !REGISTRATION_CLEARTEXT_PRESENT, 0);
+    }
+
+    #[test]
+    fn test_validate_initial_registration_cleartext_rejects_non_cleartext() {
+        // Unprotected initial Registration Request with a Requested-NSSAI IE
+        // (non-cleartext) -> Registration Reject #95 (TS 24.501 §4.4.6).
+        let req = parse_registration_request_pdu(&sample_registration_request()).expect("parse");
+        assert_eq!(
+            validate_initial_registration_cleartext(&req, false),
+            Some(GmmCause::SemanticallyIncorrectMessage)
+        );
+    }
+
+    #[test]
+    fn test_validate_initial_registration_cleartext_accepts_cleartext_only() {
+        // A cleartext-only initial registration is accepted (matches the
+        // nextgsim UE, which sends no Requested-NSSAI in the clear).
+        let req =
+            parse_registration_request_pdu(&cleartext_only_registration_request()).expect("parse");
+        assert_eq!(validate_initial_registration_cleartext(&req, false), None);
+    }
+
+    #[test]
+    fn test_validate_initial_registration_cleartext_protected_allows_all() {
+        // When integrity-protected (the SMC replay or a mobility update over an
+        // existing security context), all IEs are permitted.
+        let req = parse_registration_request_pdu(&sample_registration_request()).expect("parse");
+        assert_eq!(validate_initial_registration_cleartext(&req, true), None);
+    }
+
+    #[test]
+    fn test_validate_initial_registration_cleartext_rejects_unprotected_container() {
+        // A NAS message container in an unprotected initial NAS message is a
+        // §4.4.6 violation even with no other non-cleartext IE.
+        let mut req = ParsedRegistrationRequest {
+            identity_type: mobile_identity_type::SUCI,
+            ..Default::default()
+        };
+        req.nas_message_container_present = true;
+        assert_eq!(
+            validate_initial_registration_cleartext(&req, false),
+            Some(GmmCause::SemanticallyIncorrectMessage)
+        );
+        // Same message, integrity-protected -> accepted.
+        assert_eq!(validate_initial_registration_cleartext(&req, true), None);
+    }
+
     #[test]
     fn test_parse_registration_request_snpn_nid() {
         // SNPN (Rel-17, TS 23.501 §5.30): the AMF parser extracts the NID IE,
@@ -5224,7 +5444,7 @@ mod tests {
                                                    // Selection from EA0-3 with default AMF mask prefers NEA2/NIA2
         assert_eq!(
             nas_security::select_integrity_algorithm(wire_caps_to_mask(0xF0), 0x0E),
-            2
+            Some(2)
         );
     }
 

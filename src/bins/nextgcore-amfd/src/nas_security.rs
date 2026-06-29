@@ -821,32 +821,52 @@ pub fn select_encryption_algorithm_with_pqc(
 /// Returns algorithm ID (0=NIA0, 1=NIA1, 2=NIA2, 3=NIA3, 4=NIA4-PQC)
 /// Selection priority (PQC enabled): NIA4 > NIA2 > NIA1 > NIA3 > NIA0
 /// Selection priority (PQC disabled): NIA2 > NIA1 > NIA3 > NIA0
-pub fn select_integrity_algorithm(ue_algos: u8, amf_supported: u8) -> u8 {
+pub fn select_integrity_algorithm(ue_algos: u8, amf_supported: u8) -> Option<u8> {
     select_integrity_algorithm_with_pqc(ue_algos, amf_supported, &PqcConfig::default())
 }
 
-/// Select best integrity algorithm with PQC support
-pub fn select_integrity_algorithm_with_pqc(ue_algos: u8, amf_supported: u8, pqc: &PqcConfig) -> u8 {
+/// Select best integrity algorithm with PQC support.
+///
+/// Returns `Some(alg)` (0=NIA0, 1=NIA1, 2=NIA2, 3=NIA3, 4=NIA4-PQC) when the
+/// UE-advertised and AMF-supported NIA sets intersect, or `None` when they do
+/// not.
+///
+/// Fail-closed (TS 33.501 §5.5.2 / §6.7.2): on an empty intersection this
+/// returns `None` so the caller aborts the SMC/registration. It MUST NOT
+/// fabricate NIA2 for an algorithm the UE never advertised. This is
+/// deliberately asymmetric with ciphering: NEA0 (null ciphering) is a permitted
+/// selection per §6.7.2, so the ciphering twin (`select_encryption_algorithm`)
+/// returns NEA0 on an empty intersection; integrity has no such permitted null
+/// fallback for NAS signalling, so the empty-intersection result here is `None`
+/// (never NIA0/NIA2 by default).
+pub fn select_integrity_algorithm_with_pqc(
+    ue_algos: u8,
+    amf_supported: u8,
+    pqc: &PqcConfig,
+) -> Option<u8> {
     let supported = ue_algos & amf_supported;
 
     // If PQC enabled + preferred, try NIA4 first
     if pqc.enabled && pqc.prefer_pqc && supported & (1 << 4) != 0 {
-        return pqc_algorithm::NIA4_PQC_DSA;
+        return Some(pqc_algorithm::NIA4_PQC_DSA);
     }
 
     // Classical priority: NIA2 (AES) > NIA1 (SNOW 3G) > NIA3 (ZUC) > NIA0 (null)
     if supported & (1 << 2) != 0 {
-        2 // NIA2 (AES-CMAC)
+        Some(2) // NIA2 (AES-CMAC)
     } else if supported & (1 << 1) != 0 {
-        1 // NIA1 (SNOW 3G)
+        Some(1) // NIA1 (SNOW 3G)
     } else if supported & (1 << 3) != 0 {
-        3 // NIA3 (ZUC)
+        Some(3) // NIA3 (ZUC)
     } else if pqc.enabled && supported & (1 << 4) != 0 {
-        pqc_algorithm::NIA4_PQC_DSA
+        Some(pqc_algorithm::NIA4_PQC_DSA)
     } else if supported & (1 << 0) != 0 {
-        0 // NIA0 (null integrity) - only as last resort
+        Some(0) // NIA0 (null integrity) - the UE explicitly advertised only NIA0
     } else {
-        2 // Default to NIA2 if no match
+        // Empty intersection: no common NAS integrity algorithm. Fail closed —
+        // never default to NIA2 (that would fabricate an algorithm the UE never
+        // advertised). The caller must reject the registration.
+        None
     }
 }
 
@@ -924,9 +944,14 @@ pub fn select_security_algorithms_with_policy(
         select_encryption_algorithm(ue_security_capability.encryption, amf_supported.encryption);
     amf_ue.selected_enc_algorithm = selected_enc;
 
-    // Select integrity algorithm
+    // Select integrity algorithm. `None` = empty intersection (no common NAS
+    // integrity algorithm). The live SMC path (`ngap_path`) aborts the
+    // registration on `None`; this convenience helper is used for
+    // reporting/tests, so it falls back to NIA0 here and lets the ciphering
+    // policy enforcement below act — it never fabricates NIA2 by default.
     let selected_int =
-        select_integrity_algorithm(ue_security_capability.integrity, amf_supported.integrity);
+        select_integrity_algorithm(ue_security_capability.integrity, amf_supported.integrity)
+            .unwrap_or(0);
     amf_ue.selected_int_algorithm = selected_int;
 
     // Enforce ciphering policy
@@ -1621,7 +1646,7 @@ mod tests {
         let ue_algos = 0b1110; // Supports NIA1, NIA2, NIA3
         let amf_algos = 0b1111;
         let selected = select_integrity_algorithm(ue_algos, amf_algos);
-        assert_eq!(selected, 2); // Should select NIA2 (highest priority)
+        assert_eq!(selected, Some(2)); // Should select NIA2 (highest priority)
     }
 
     #[test]
@@ -1629,15 +1654,25 @@ mod tests {
         let ue_algos = 0b1010; // Supports NIA1, NIA3
         let amf_algos = 0b1111;
         let selected = select_integrity_algorithm(ue_algos, amf_algos);
-        assert_eq!(selected, 1); // Should select NIA1
+        assert_eq!(selected, Some(1)); // Should select NIA1
+    }
+
+    #[test]
+    fn test_select_integrity_algorithm_nia3() {
+        let ue_algos = 0b1000; // Supports NIA3 only
+        let amf_algos = 0b1111;
+        let selected = select_integrity_algorithm(ue_algos, amf_algos);
+        assert_eq!(selected, Some(3)); // Should select NIA3
     }
 
     #[test]
     fn test_select_integrity_algorithm_no_match() {
-        let ue_algos = 0b0000; // No support
-        let amf_algos = 0b1111;
-        let selected = select_integrity_algorithm(ue_algos, amf_algos);
-        assert_eq!(selected, 2); // Should default to NIA2
+        // Empty intersection: fail closed (TS 33.501 §5.5.2). The function must
+        // return None, NOT a fabricated NIA2 the UE never advertised.
+        assert_eq!(select_integrity_algorithm(0b0000, 0b1111), None);
+        assert_eq!(select_integrity_algorithm(0x00, 0x00), None);
+        // UE advertises only an algorithm the AMF does not support -> None.
+        assert_eq!(select_integrity_algorithm(0b0010, 0b1100), None);
     }
 
     #[test]
