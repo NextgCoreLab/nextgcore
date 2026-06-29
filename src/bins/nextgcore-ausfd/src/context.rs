@@ -327,8 +327,11 @@ impl AusfContext {
 
     /// Find UE by SUCI
     pub fn ue_find_by_suci(&self, suci: &str) -> Option<AusfUe> {
-        let suci_hash = self.suci_hash.read().ok()?;
+        // Lock order ue_list < suci_hash (matches ue_add/ue_remove). Acquiring
+        // suci_hash before ue_list would be an AB-BA deadlock vs ue_add (which
+        // holds ue_list while taking suci_hash).
         let ue_list = self.ue_list.read().ok()?;
+        let suci_hash = self.suci_hash.read().ok()?;
 
         if let Some(&id) = suci_hash.get(suci) {
             return ue_list.get(&id).cloned();
@@ -338,8 +341,9 @@ impl AusfContext {
 
     /// Find UE by SUPI
     pub fn ue_find_by_supi(&self, supi: &str) -> Option<AusfUe> {
-        let supi_hash = self.supi_hash.read().ok()?;
+        // Lock order ue_list < supi_hash (matches ue_remove / the SUPI setters).
         let ue_list = self.ue_list.read().ok()?;
+        let supi_hash = self.supi_hash.read().ok()?;
 
         if let Some(&id) = supi_hash.get(supi) {
             return ue_list.get(&id).cloned();

@@ -895,17 +895,20 @@ impl PinContext {
     ///
     /// PIND-00: a poisoned lock returns an empty `Vec` instead of panicking.
     pub fn element_discover(&self, pin_id: &str, capability: Option<&str>) -> Vec<PinElement> {
-        let elements = match self.elements.read() {
-            Ok(g) => g,
-            Err(_) => {
-                log::error!("element_discover: elements lock poisoned; returning empty");
-                return Vec::new();
-            }
-        };
+        // Acquire pin_networks before elements to match the canonical lock order
+        // (pins -> owners -> elements) used by pin_create/reap; taking elements
+        // first would be an AB-BA deadlock vs those mutating paths.
         let pins = match self.pin_networks.read() {
             Ok(g) => g,
             Err(_) => {
                 log::error!("element_discover: pin_networks lock poisoned; returning empty");
+                return Vec::new();
+            }
+        };
+        let elements = match self.elements.read() {
+            Ok(g) => g,
+            Err(_) => {
+                log::error!("element_discover: elements lock poisoned; returning empty");
                 return Vec::new();
             }
         };

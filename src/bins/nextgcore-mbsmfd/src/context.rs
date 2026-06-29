@@ -523,8 +523,11 @@ impl MbSmfContext {
     }
 
     pub fn session_find_by_tmgi(&self, tmgi: &Tmgi) -> Option<MbsSession> {
-        let tmgi_hash = self.tmgi_hash.read().ok()?;
+        // Lock order session_list < tmgi_hash (matches session_add/session_remove).
+        // Taking tmgi_hash before session_list would be an AB-BA deadlock vs
+        // session_add (which holds session_list while acquiring tmgi_hash).
         let session_list = self.session_list.read().ok()?;
+        let tmgi_hash = self.tmgi_hash.read().ok()?;
         tmgi_hash
             .get(tmgi)
             .and_then(|&id| session_list.get(&id).cloned())

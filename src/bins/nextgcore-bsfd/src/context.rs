@@ -859,10 +859,12 @@ impl BsfContext {
         let addr: Ipv4Addr = ipv4addr_string.parse().ok()?;
         let addr_u32 = u32::from(addr);
 
+        // Lock order sess_list < ipv4addr_hash (matches sess_add_binding/sess_remove,
+        // which hold sess_list while inserting into the hash). Acquiring the hash
+        // before sess_list would be an AB-BA deadlock vs sess_add_binding.
+        let sess_list = self.sess_list.read().ok()?;
         let ipv4_hash = self.ipv4addr_hash.read().ok()?;
         let sess_id = ipv4_hash.get(&addr_u32)?;
-
-        let sess_list = self.sess_list.read().ok()?;
         sess_list.get(sess_id).cloned()
     }
 
@@ -871,10 +873,10 @@ impl BsfContext {
         let prefix = Ipv6Prefix::from_string(ipv6prefix_string)?;
         let key = prefix.hash_key();
 
+        // Lock order sess_list < ipv6prefix_hash (matches sess_add_binding/sess_remove).
+        let sess_list = self.sess_list.read().ok()?;
         let ipv6_hash = self.ipv6prefix_hash.read().ok()?;
         let sess_id = ipv6_hash.get(&key)?;
-
-        let sess_list = self.sess_list.read().ok()?;
         sess_list.get(sess_id).cloned()
     }
 

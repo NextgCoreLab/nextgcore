@@ -571,8 +571,10 @@ impl NssfContext {
     }
 
     pub fn nsi_find_by_s_nssai(&self, s_nssai: &SNssai) -> Option<NssfNsi> {
-        let snssai_hash = self.snssai_hash.read().ok()?;
+        // Lock order nsi_list < snssai_hash (matches nsi_add/nsi_remove); taking
+        // snssai_hash first would be an AB-BA deadlock vs nsi_add.
         let nsi_list = self.nsi_list.read().ok()?;
+        let snssai_hash = self.snssai_hash.read().ok()?;
         snssai_hash
             .get(&(s_nssai.sst, s_nssai.sd))
             .and_then(|&id| nsi_list.get(&id).cloned())
@@ -658,8 +660,11 @@ impl NssfContext {
     }
 
     pub fn home_find(&self, plmn_id: &PlmnId, s_nssai: &SNssai) -> Option<NssfHome> {
-        let home_hash = self.home_hash.read().ok()?;
+        // Lock order home_list < home_hash (matches home_add/home_remove); taking
+        // home_hash first would be an AB-BA deadlock vs home_add (live under
+        // concurrent SBI reads in nssf_nnssf_nsselection_handle_get_from_amf_or_vnssf).
         let home_list = self.home_list.read().ok()?;
+        let home_hash = self.home_hash.read().ok()?;
         let key = (
             plmn_id.mcc.clone(),
             plmn_id.mnc.clone(),

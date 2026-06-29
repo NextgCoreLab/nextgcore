@@ -1819,8 +1819,10 @@ impl SmfContext {
 
     /// Find UE by SUPI
     pub fn ue_find_by_supi(&self, supi: &str) -> Option<SmfUe> {
-        let supi_hash = self.supi_hash.read().ok()?;
+        // Lock order smf_ue_list < supi_hash (matches ue_add_by_supi/ue_remove);
+        // taking supi_hash first would be an AB-BA deadlock vs the mutation paths.
         let smf_ue_list = self.smf_ue_list.read().ok()?;
+        let supi_hash = self.supi_hash.read().ok()?;
         supi_hash
             .get(supi)
             .and_then(|&id| smf_ue_list.get(&id).cloned())
@@ -1828,8 +1830,9 @@ impl SmfContext {
 
     /// Find UE by IMSI
     pub fn ue_find_by_imsi(&self, imsi: &[u8]) -> Option<SmfUe> {
-        let imsi_hash = self.imsi_hash.read().ok()?;
+        // Lock order smf_ue_list < imsi_hash (matches ue_add_by_imsi/ue_remove).
         let smf_ue_list = self.smf_ue_list.read().ok()?;
+        let imsi_hash = self.imsi_hash.read().ok()?;
         imsi_hash
             .get(imsi)
             .and_then(|&id| smf_ue_list.get(&id).cloned())
@@ -2013,8 +2016,9 @@ impl SmfContext {
 
     /// Find session by SEID
     pub fn sess_find_by_seid(&self, seid: u64) -> Option<SmfSess> {
-        let smf_n4_seid_hash = self.smf_n4_seid_hash.read().ok()?;
+        // Lock order sess_list < smf_n4_seid_hash (matches sess_add_*/sess_remove).
         let sess_list = self.sess_list.read().ok()?;
+        let smf_n4_seid_hash = self.smf_n4_seid_hash.read().ok()?;
         smf_n4_seid_hash
             .get(&seid)
             .and_then(|&id| sess_list.get(&id).cloned())
@@ -2065,8 +2069,9 @@ impl SmfContext {
 
     /// Find session by IPv4 address
     pub fn sess_find_by_ipv4(&self, addr: Ipv4Addr) -> Option<SmfSess> {
-        let ipv4_hash = self.ipv4_hash.read().ok()?;
+        // Lock order sess_list < ipv4_hash (matches sess_remove/sess_update).
         let sess_list = self.sess_list.read().ok()?;
+        let ipv4_hash = self.ipv4_hash.read().ok()?;
         ipv4_hash
             .get(&u32::from(addr))
             .and_then(|&id| sess_list.get(&id).cloned())
@@ -2074,8 +2079,9 @@ impl SmfContext {
 
     /// Find session by IPv6 prefix
     pub fn sess_find_by_ipv6(&self, addr: &[u8; 8]) -> Option<SmfSess> {
-        let ipv6_hash = self.ipv6_hash.read().ok()?;
+        // Lock order sess_list < ipv6_hash (matches sess_remove/sess_update).
         let sess_list = self.sess_list.read().ok()?;
+        let ipv6_hash = self.ipv6_hash.read().ok()?;
         ipv6_hash
             .get(addr)
             .and_then(|&id| sess_list.get(&id).cloned())
@@ -2083,8 +2089,10 @@ impl SmfContext {
 
     /// Find session by paging N1N2 message location
     pub fn sess_find_by_paging_n1n2message_location(&self, location: &str) -> Option<SmfSess> {
-        let n1n2message_hash = self.n1n2message_hash.read().ok()?;
+        // Lock order sess_list < n1n2message_hash (matches sess_remove/sess_update/
+        // sess_set_paging_n1n2message_location).
         let sess_list = self.sess_list.read().ok()?;
+        let n1n2message_hash = self.n1n2message_hash.read().ok()?;
         n1n2message_hash
             .get(location)
             .and_then(|&id| sess_list.get(&id).cloned())
@@ -2309,8 +2317,10 @@ impl SmfContext {
 
     /// Get default bearer in session
     pub fn default_bearer_in_sess(&self, sess_id: u64) -> Option<SmfBearer> {
-        let sess_list = self.sess_list.read().ok()?;
+        // Lock order bearer_list < sess_list (matches qos_flow_add/bearer_remove,
+        // which hold bearer_list while taking sess_list).
         let bearer_list = self.bearer_list.read().ok()?;
+        let sess_list = self.sess_list.read().ok()?;
 
         if let Some(sess) = sess_list.get(&sess_id) {
             if let Some(&first_bearer_id) = sess.bearer_ids.first() {
@@ -2590,8 +2600,9 @@ impl SmfContext {
 
     /// Find MBS session by TMGI
     pub fn mbs_sess_find_by_tmgi(&self, tmgi: &Tmgi) -> Option<MbsSession> {
-        let tmgi_hash = self.tmgi_hash.read().ok()?;
+        // Lock order mbs_sess_list < tmgi_hash (matches create_mbs_session/release_mbs_session).
         let mbs_sess_list = self.mbs_sess_list.read().ok()?;
+        let tmgi_hash = self.tmgi_hash.read().ok()?;
         tmgi_hash
             .get(tmgi)
             .and_then(|&id| mbs_sess_list.get(&id).cloned())

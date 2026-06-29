@@ -1501,49 +1501,51 @@ impl UpfContext {
 
     /// Find session by SMF N4 SEID
     pub fn sess_find_by_smf_n4_seid(&self, seid: u64) -> Option<UpfSess> {
-        let smf_n4_seid_hash = self.smf_n4_seid_hash.read().ok()?;
-        let sess_id = smf_n4_seid_hash.get(&seid)?;
+        // Resolve the id and DROP the index guard before locking sess_list:
+        // sess_add/sess_remove lock sess_list before the index hashes, so holding
+        // an index lock while acquiring sess_list would be an AB-BA deadlock.
+        let sess_id = *self.smf_n4_seid_hash.read().ok()?.get(&seid)?;
         let sess_list = self.sess_list.read().ok()?;
-        sess_list.get(sess_id).cloned()
+        sess_list.get(&sess_id).cloned()
     }
 
     /// Find session by SMF N4 F-SEID
     pub fn sess_find_by_smf_n4_f_seid(&self, f_seid: &FSeid) -> Option<UpfSess> {
-        let smf_n4_f_seid_hash = self.smf_n4_f_seid_hash.read().ok()?;
-        let sess_id = smf_n4_f_seid_hash.get(f_seid)?;
+        // Drop the index guard before locking sess_list (see sess_find_by_smf_n4_seid).
+        let sess_id = *self.smf_n4_f_seid_hash.read().ok()?.get(f_seid)?;
         let sess_list = self.sess_list.read().ok()?;
-        sess_list.get(sess_id).cloned()
+        sess_list.get(&sess_id).cloned()
     }
 
     /// Find session by UPF N4 SEID
     pub fn sess_find_by_upf_n4_seid(&self, seid: u64) -> Option<UpfSess> {
-        let upf_n4_seid_hash = self.upf_n4_seid_hash.read().ok()?;
-        let sess_id = upf_n4_seid_hash.get(&seid)?;
+        // Drop the index guard before locking sess_list (see sess_find_by_smf_n4_seid).
+        let sess_id = *self.upf_n4_seid_hash.read().ok()?.get(&seid)?;
         let sess_list = self.sess_list.read().ok()?;
-        sess_list.get(sess_id).cloned()
+        sess_list.get(&sess_id).cloned()
     }
 
     /// Find session by IPv4 address
     pub fn sess_find_by_ipv4(&self, addr: u32) -> Option<UpfSess> {
-        // First check direct IP hash
-        if let Ok(ipv4_hash) = self.ipv4_hash.read() {
-            if let Some(sess_id) = ipv4_hash.get(&addr) {
-                if let Ok(sess_list) = self.sess_list.read() {
-                    if let Some(sess) = sess_list.get(sess_id) {
-                        return Some(sess.clone());
-                    }
-                }
+        // Resolve the session id from the direct hash first, then the framed-routes
+        // trie. In each step DROP the index/trie guard before locking sess_list:
+        // sess_add/sess_remove lock sess_list before ipv4_hash/ipv4_framed_routes,
+        // so holding either before sess_list would be an AB-BA deadlock.
+        let direct_id = self.ipv4_hash.read().ok().and_then(|h| h.get(&addr).copied());
+        if let Some(id) = direct_id {
+            if let Some(sess) = self.sess_list.read().ok().and_then(|l| l.get(&id).cloned()) {
+                return Some(sess);
             }
         }
 
-        // Then check framed routes trie
-        if let Ok(trie) = self.ipv4_framed_routes.read() {
-            if let Some(sess_id) = trie.find(&[addr, 0, 0, 0], false) {
-                if let Ok(sess_list) = self.sess_list.read() {
-                    if let Some(sess) = sess_list.get(&sess_id) {
-                        return Some(sess.clone());
-                    }
-                }
+        let route_id = self
+            .ipv4_framed_routes
+            .read()
+            .ok()
+            .and_then(|t| t.find(&[addr, 0, 0, 0], false));
+        if let Some(id) = route_id {
+            if let Some(sess) = self.sess_list.read().ok().and_then(|l| l.get(&id).cloned()) {
+                return Some(sess);
             }
         }
 
@@ -1552,25 +1554,23 @@ impl UpfContext {
 
     /// Find session by IPv6 address
     pub fn sess_find_by_ipv6(&self, addr: &[u32; 4]) -> Option<UpfSess> {
-        // First check direct IP hash (using first 64 bits)
-        if let Ok(ipv6_hash) = self.ipv6_hash.read() {
-            if let Some(sess_id) = ipv6_hash.get(&[addr[0], addr[1]]) {
-                if let Ok(sess_list) = self.sess_list.read() {
-                    if let Some(sess) = sess_list.get(sess_id) {
-                        return Some(sess.clone());
-                    }
-                }
+        // See sess_find_by_ipv4: resolve the id from the direct hash then the
+        // framed-routes trie, dropping each guard before locking sess_list.
+        let direct_id = self
+            .ipv6_hash
+            .read()
+            .ok()
+            .and_then(|h| h.get(&[addr[0], addr[1]]).copied());
+        if let Some(id) = direct_id {
+            if let Some(sess) = self.sess_list.read().ok().and_then(|l| l.get(&id).cloned()) {
+                return Some(sess);
             }
         }
 
-        // Then check framed routes trie
-        if let Ok(trie) = self.ipv6_framed_routes.read() {
-            if let Some(sess_id) = trie.find(addr, true) {
-                if let Ok(sess_list) = self.sess_list.read() {
-                    if let Some(sess) = sess_list.get(&sess_id) {
-                        return Some(sess.clone());
-                    }
-                }
+        let route_id = self.ipv6_framed_routes.read().ok().and_then(|t| t.find(addr, true));
+        if let Some(id) = route_id {
+            if let Some(sess) = self.sess_list.read().ok().and_then(|l| l.get(&id).cloned()) {
+                return Some(sess);
             }
         }
 
