@@ -3,12 +3,14 @@
 //! `LPP-Message` is the top-level PDU exchanged between the LMF (location
 //! server) and the UE (target device). It carries optional transaction
 //! management (transaction id / sequence number / acknowledgement) plus an
-//! optional `LPP-MessageBody`. v1 types the `c1` message-body indices 4 and 5
-//! (request / provide location information); the other 14 `c1` alternatives and
-//! the `messageClassExtension` arm are carried by follow-on chunks.
+//! optional `LPP-MessageBody`. v1 types the `c1` message-body indices 0/1
+//! (request / provide capabilities) and 4/5 (request / provide location
+//! information); the other 12 `c1` alternatives and the `messageClassExtension`
+//! arm are carried by follow-on chunks.
 
 use bytes::Bytes;
 
+use super::capabilities::{ProvideCapabilities, RequestCapabilities};
 use super::ecid::{ProvideLocationInformation, RequestLocationInformation};
 use super::types::{Acknowledgement, LppTransactionId, SequenceNumber};
 use crate::per::{PerError, PerResult};
@@ -167,12 +169,16 @@ impl UperDecode for LppMessageBody {
 /// and 5); all other indices are carried by a follow-on chunk.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MessageBodyC1 {
+    RequestCapabilities(RequestCapabilities),
+    ProvideCapabilities(ProvideCapabilities),
     RequestLocationInformation(RequestLocationInformation),
     ProvideLocationInformation(ProvideLocationInformation),
 }
 
 impl MessageBodyC1 {
     const NUM_ALTERNATIVES: usize = 16;
+    const IDX_REQUEST_CAPABILITIES: usize = 0;
+    const IDX_PROVIDE_CAPABILITIES: usize = 1;
     const IDX_REQUEST_LOCATION_INFORMATION: usize = 4;
     const IDX_PROVIDE_LOCATION_INFORMATION: usize = 5;
 }
@@ -180,6 +186,22 @@ impl MessageBodyC1 {
 impl UperEncode for MessageBodyC1 {
     fn encode_uper(&self, encoder: &mut UperEncoder) -> PerResult<()> {
         match self {
+            MessageBodyC1::RequestCapabilities(body) => {
+                encoder.encode_choice_index(
+                    Self::IDX_REQUEST_CAPABILITIES,
+                    Self::NUM_ALTERNATIVES,
+                    false,
+                )?;
+                body.encode_uper(encoder)
+            }
+            MessageBodyC1::ProvideCapabilities(body) => {
+                encoder.encode_choice_index(
+                    Self::IDX_PROVIDE_CAPABILITIES,
+                    Self::NUM_ALTERNATIVES,
+                    false,
+                )?;
+                body.encode_uper(encoder)
+            }
             MessageBodyC1::RequestLocationInformation(body) => {
                 encoder.encode_choice_index(
                     Self::IDX_REQUEST_LOCATION_INFORMATION,
@@ -204,6 +226,12 @@ impl UperDecode for MessageBodyC1 {
     fn decode_uper(decoder: &mut UperDecoder) -> PerResult<Self> {
         let index = decoder.decode_choice_index(Self::NUM_ALTERNATIVES, false)?;
         match index {
+            0 => Ok(MessageBodyC1::RequestCapabilities(
+                RequestCapabilities::decode_uper(decoder)?,
+            )),
+            1 => Ok(MessageBodyC1::ProvideCapabilities(
+                ProvideCapabilities::decode_uper(decoder)?,
+            )),
             4 => Ok(MessageBodyC1::RequestLocationInformation(
                 RequestLocationInformation::decode_uper(decoder)?,
             )),
@@ -224,6 +252,10 @@ mod tests {
         EcidProvideLocationInformation, EcidRequestLocationInformation,
         EcidSignalMeasurementInformation, MeasuredResultsElement, ProvideLocationInformationR9,
         RequestLocationInformationR9,
+    };
+    use crate::lpp::capabilities::{
+        CommonIEsProvideCapabilities, CommonIEsRequestCapabilities, EcidProvideCapabilities,
+        EcidRequestCapabilities, ProvideCapabilitiesR9, RequestCapabilitiesR9,
     };
     use crate::lpp::types::{Initiator, TransactionNumber};
     use bitvec::prelude::*;
@@ -404,15 +436,64 @@ mod tests {
     }
 
     #[test]
+    fn rt_lpp_message_request_capabilities_path() {
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::TargetDevice,
+                transaction_number: TransactionNumber(1),
+            }),
+            end_transaction: false,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(MessageBodyC1::RequestCapabilities(
+                RequestCapabilities {
+                    ies: RequestCapabilitiesR9 {
+                        common: Some(CommonIEsRequestCapabilities),
+                        ecid: Some(EcidRequestCapabilities),
+                    },
+                },
+            ))),
+        };
+        let bytes = msg.encode().unwrap();
+        assert_eq!(LppMessage::decode(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn rt_lpp_message_provide_capabilities_path() {
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::TargetDevice,
+                transaction_number: TransactionNumber(1),
+            }),
+            end_transaction: true,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(MessageBodyC1::ProvideCapabilities(
+                ProvideCapabilities {
+                    ies: ProvideCapabilitiesR9 {
+                        common: Some(CommonIEsProvideCapabilities),
+                        ecid: Some(EcidProvideCapabilities {
+                            ecid_meas_supported: measurements(&[true, true, false, false, false]),
+                        }),
+                    },
+                },
+            ))),
+        };
+        let bytes = msg.encode().unwrap();
+        assert_eq!(LppMessage::decode(&bytes).unwrap(), msg);
+    }
+
+    #[test]
     fn err_unsupported_c1_body_index() {
-        // c1 CHOICE index 0 (requestCapabilities) is not implemented in v1.
-        // Build a minimal stream: LPP-Message preamble [0,0,0,body=1] + end 0 +
-        // outer choice c1 (0) + c1 index 0 (0000).
+        // c1 CHOICE index 2 (requestAssistanceData) is not implemented in v1, so
+        // the catch-all decode arm must reject it (indices 0/1/4/5 are typed).
+        // Stream: LPP-Message preamble [0,0,0,body=1] + endTransaction 0 +
+        // outer choice c1 (0) + c1 index 2 (0010).
         let mut enc = UperEncoder::new();
         enc.encode_sequence_preamble(None, &[false, false, false, true]);
         enc.write_bit(false); // endTransaction
         enc.encode_choice_index(0, 2, false).unwrap(); // outer -> c1
-        enc.encode_choice_index(0, 16, false).unwrap(); // c1 -> requestCapabilities (index 0)
+        enc.encode_choice_index(2, 16, false).unwrap(); // c1 -> requestAssistanceData (index 2)
         let bytes = enc.into_bytes();
         assert!(LppMessage::decode(&bytes).is_err());
     }
