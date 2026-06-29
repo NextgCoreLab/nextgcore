@@ -10,6 +10,12 @@
 
 use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, Constraint, PerResult};
 
+// TRP-related size bounds (TS 38.455 §9.4 / NRPPA-Constants).
+/// maxnoTRPs — upper bound of TRP lists and the TRP-ID root range.
+pub const MAX_NO_TRPS: usize = 65535;
+/// maxnoTRPInfoTypes — upper bound of TRP information-type lists.
+pub const MAX_NO_TRP_INFO_TYPES: usize = 64;
+
 /// Criticality - indicates how to handle unrecognized IEs
 /// ASN.1 (TS 38.455 §9.3.6): Criticality ::= ENUMERATED { reject, ignore, notify }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -117,6 +123,11 @@ impl ProtocolIeId {
     pub const OTHER_RAT_MEASUREMENT_RESULT: Self = Self(17);
     pub const WLAN_MEASUREMENT_QUANTITIES: Self = Self(19);
     pub const WLAN_MEASUREMENT_RESULT: Self = Self(21);
+    // TRP Information Exchange (TS 38.455 §9.4).
+    pub const TRP_INFORMATION_TYPE_LIST_TRP_REQ: Self = Self(29);
+    pub const TRP_INFORMATION_LIST_TRP_RESP: Self = Self(30);
+    pub const TRP_LIST: Self = Self(47);
+    pub const TRP_INFORMATION_TYPE_ITEM: Self = Self(57);
     pub const CGI_NR: Self = Self(58);
     pub const NR_PCI: Self = Self(155);
 }

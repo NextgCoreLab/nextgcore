@@ -15,6 +15,7 @@ use super::ies::{
     CellPortionId, ECidMeasurementResult, MeasurementPeriodicity, MeasurementQuantities,
     ProtocolIeContainer, ProtocolIeField, ReportCharacteristics, UeMeasurementId,
 };
+use super::trp::{TrpId, TrpInformation, TrpInformationListTrpResp, TrpInformationTypeListTrpReq, TrpInformationTypeItem, TrpItem, TrpList};
 use super::types::{Criticality, NrppaTransactionId, ProcedureCode, ProtocolIeId};
 use crate::per::{AperDecode, AperDecoder, AperEncode, AperEncoder, PerError, PerResult};
 
@@ -154,6 +155,7 @@ pub enum InitiatingMessageValue {
     ECidMeasurementReport(ProtocolIeContainer),
     ECidMeasurementTerminationCommand(ProtocolIeContainer),
     ErrorIndication(ProtocolIeContainer),
+    TrpInformationRequest(ProtocolIeContainer),
     /// Any other procedure: carried as an opaque container.
     Other(ProtocolIeContainer),
 }
@@ -166,6 +168,7 @@ impl InitiatingMessageValue {
             | InitiatingMessageValue::ECidMeasurementReport(c)
             | InitiatingMessageValue::ECidMeasurementTerminationCommand(c)
             | InitiatingMessageValue::ErrorIndication(c)
+            | InitiatingMessageValue::TrpInformationRequest(c)
             | InitiatingMessageValue::Other(c) => c,
         }
     }
@@ -208,6 +211,9 @@ impl AperDecode for InitiatingMessage {
                 InitiatingMessageValue::ECidMeasurementTerminationCommand(ies)
             }
             ProcedureCode::ERROR_INDICATION => InitiatingMessageValue::ErrorIndication(ies),
+            ProcedureCode::TRP_INFORMATION_EXCHANGE => {
+                InitiatingMessageValue::TrpInformationRequest(ies)
+            }
             _ => InitiatingMessageValue::Other(ies),
         };
 
@@ -237,6 +243,7 @@ pub struct SuccessfulOutcome {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SuccessfulOutcomeValue {
     ECidMeasurementInitiationResponse(ProtocolIeContainer),
+    TrpInformationResponse(ProtocolIeContainer),
     Other(ProtocolIeContainer),
 }
 
@@ -244,6 +251,7 @@ impl SuccessfulOutcomeValue {
     fn container(&self) -> &ProtocolIeContainer {
         match self {
             SuccessfulOutcomeValue::ECidMeasurementInitiationResponse(c)
+            | SuccessfulOutcomeValue::TrpInformationResponse(c)
             | SuccessfulOutcomeValue::Other(c) => c,
         }
     }
@@ -274,6 +282,9 @@ impl AperDecode for SuccessfulOutcome {
             ProcedureCode::E_CID_MEASUREMENT_INITIATION => {
                 SuccessfulOutcomeValue::ECidMeasurementInitiationResponse(ies)
             }
+            ProcedureCode::TRP_INFORMATION_EXCHANGE => {
+                SuccessfulOutcomeValue::TrpInformationResponse(ies)
+            }
             _ => SuccessfulOutcomeValue::Other(ies),
         };
 
@@ -303,6 +314,7 @@ pub struct UnsuccessfulOutcome {
 #[derive(Debug, Clone, PartialEq)]
 pub enum UnsuccessfulOutcomeValue {
     ECidMeasurementInitiationFailure(ProtocolIeContainer),
+    TrpInformationFailure(ProtocolIeContainer),
     Other(ProtocolIeContainer),
 }
 
@@ -310,6 +322,7 @@ impl UnsuccessfulOutcomeValue {
     fn container(&self) -> &ProtocolIeContainer {
         match self {
             UnsuccessfulOutcomeValue::ECidMeasurementInitiationFailure(c)
+            | UnsuccessfulOutcomeValue::TrpInformationFailure(c)
             | UnsuccessfulOutcomeValue::Other(c) => c,
         }
     }
@@ -339,6 +352,9 @@ impl AperDecode for UnsuccessfulOutcome {
         let value = match procedure_code {
             ProcedureCode::E_CID_MEASUREMENT_INITIATION => {
                 UnsuccessfulOutcomeValue::ECidMeasurementInitiationFailure(ies)
+            }
+            ProcedureCode::TRP_INFORMATION_EXCHANGE => {
+                UnsuccessfulOutcomeValue::TrpInformationFailure(ies)
             }
             _ => UnsuccessfulOutcomeValue::Other(ies),
         };
@@ -525,13 +541,116 @@ pub fn parse_ecid_measurement_report(pdu: &NrppaPdu) -> PerResult<EcidMeasuremen
     })
 }
 
+// ---------------------------------------------------------------------------
+// TRP Information Exchange procedure builders / parser
+// ---------------------------------------------------------------------------
+
+/// Build a `TRPInformationRequest` (procedure code 16, initiating message),
+/// per TS 38.455 §9.3.5 (ASN.1 L12272+).
+///
+/// `trp_list` is the OPTIONAL id-TRPList IE (criticality ignore); `info_types`
+/// is the MANDATORY id-TRPInformationTypeListTRPReq IE (criticality reject).
+pub fn build_trp_information_request(
+    nrppa_transaction_id: NrppaTransactionId,
+    trp_list: Option<Vec<TrpId>>,
+    info_types: Vec<TrpInformationTypeItem>,
+) -> PerResult<NrppaPdu> {
+    let mut container = ProtocolIeContainer::new();
+    if let Some(ids) = trp_list {
+        let list = TrpList {
+            items: ids.into_iter().map(|trp_id| TrpItem { trp_id }).collect(),
+        };
+        container.push(ie(ProtocolIeId::TRP_LIST, Criticality::Ignore, &list)?);
+    }
+    let info_list = TrpInformationTypeListTrpReq { items: info_types };
+    container.push(ie(
+        ProtocolIeId::TRP_INFORMATION_TYPE_LIST_TRP_REQ,
+        Criticality::Reject,
+        &info_list,
+    )?);
+
+    Ok(NrppaPdu::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode::TRP_INFORMATION_EXCHANGE,
+        criticality: Criticality::Reject,
+        nrppa_transaction_id,
+        value: InitiatingMessageValue::TrpInformationRequest(container),
+    }))
+}
+
+/// Build a `TRPInformationResponse` (procedure code 16, successful outcome),
+/// per TS 38.455 §9.3.5 (ASN.1 L12301+).
+///
+/// Carries the MANDATORY id-TRPInformationListTRPResp IE (criticality ignore);
+/// the optional id-CriticalityDiagnostics IE is not emitted in v1.
+pub fn build_trp_information_response(
+    nrppa_transaction_id: NrppaTransactionId,
+    trp_info_list: Vec<TrpInformation>,
+) -> PerResult<NrppaPdu> {
+    let mut container = ProtocolIeContainer::new();
+    let list = TrpInformationListTrpResp {
+        items: trp_info_list,
+    };
+    container.push(ie(
+        ProtocolIeId::TRP_INFORMATION_LIST_TRP_RESP,
+        Criticality::Ignore,
+        &list,
+    )?);
+
+    Ok(NrppaPdu::SuccessfulOutcome(SuccessfulOutcome {
+        procedure_code: ProcedureCode::TRP_INFORMATION_EXCHANGE,
+        criticality: Criticality::Reject,
+        nrppa_transaction_id,
+        value: SuccessfulOutcomeValue::TrpInformationResponse(container),
+    }))
+}
+
+/// Parse a decoded `NrppaPdu` as a `TRPInformationResponse`, decoding the typed
+/// `TRPInformation` list out of the opaque container.
+pub fn parse_trp_information_response(pdu: &NrppaPdu) -> PerResult<Vec<TrpInformation>> {
+    let msg = match pdu {
+        NrppaPdu::SuccessfulOutcome(m)
+            if m.procedure_code == ProcedureCode::TRP_INFORMATION_EXCHANGE =>
+        {
+            m
+        }
+        _ => {
+            return Err(PerError::DecodeError(
+                "PDU is not a TRPInformationResponse successful outcome".to_string(),
+            ))
+        }
+    };
+
+    let container = match &msg.value {
+        SuccessfulOutcomeValue::TrpInformationResponse(c) => c,
+        _ => {
+            return Err(PerError::DecodeError(
+                "TRPInformationResponse value mismatch".to_string(),
+            ))
+        }
+    };
+
+    let field = container
+        .find(ProtocolIeId::TRP_INFORMATION_LIST_TRP_RESP)
+        .ok_or_else(|| {
+            PerError::DecodeError("missing mandatory TRPInformationListTRPResp".to_string())
+        })?;
+    let list: TrpInformationListTrpResp = decode_ie_value(&field.value)?;
+    Ok(list.items)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::nrppa::cause::{Cause, CauseRadioNetwork};
     use crate::nrppa::ies::{
-        MeasurementQuantitiesItem, MeasurementQuantitiesValue, NgRanCell, NgRanCgi, PlmnIdentity,
-        Tac,
+        MeasurementQuantitiesItem, MeasurementQuantitiesValue, NgRanAccessPointPosition, NgRanCell,
+        NgRanCgi, PlmnIdentity, Tac,
+    };
+    use crate::nrppa::trp::{
+        GeographicalCoordinates, TrpId, TrpInformation, TrpInformationTypeItem,
+        TrpInformationTypeListTrpReq, TrpInformationTypeResponseItem,
+        TrpInformationTypeResponseList, TrpPositionDefinitionType, TrpPositionDirect,
+        TrpPositionDirectAccuracy,
     };
 
     fn sample_result() -> ECidMeasurementResult {
@@ -778,5 +897,184 @@ mod tests {
         // The hand-derived vector must equal what our own encoder produces.
         let reencoded = decoded.encode().unwrap();
         assert_eq!(reencoded.as_ref(), &reference[..]);
+    }
+
+    // ---- TRP Information Exchange -------------------------------------------
+
+    fn sample_trp_position() -> NgRanAccessPointPosition {
+        NgRanAccessPointPosition {
+            latitude_sign_south: false,
+            latitude: 1_234_567,
+            longitude: -1_000_000,
+            direction_of_altitude_depth: false,
+            altitude: 12_345,
+            uncertainty_semi_major: 10,
+            uncertainty_semi_minor: 20,
+            orientation_of_major_axis: 90,
+            uncertainty_altitude: 30,
+            confidence: 95,
+        }
+    }
+
+    #[test]
+    fn test_trp_information_request_roundtrip() {
+        let pdu = build_trp_information_request(
+            NrppaTransactionId(7),
+            Some(vec![TrpId(1), TrpId(2)]),
+            vec![TrpInformationTypeItem::NrPci, TrpInformationTypeItem::GeoCoord],
+        )
+        .unwrap();
+
+        let bytes = pdu.encode().unwrap();
+        let decoded = NrppaPdu::decode(&bytes).unwrap();
+        assert_eq!(decoded, pdu);
+
+        match &decoded {
+            NrppaPdu::InitiatingMessage(m) => {
+                assert_eq!(m.procedure_code, ProcedureCode::TRP_INFORMATION_EXCHANGE);
+                assert_eq!(m.nrppa_transaction_id, NrppaTransactionId(7));
+                assert!(matches!(
+                    m.value,
+                    InitiatingMessageValue::TrpInformationRequest(_)
+                ));
+            }
+            _ => panic!("expected initiating message"),
+        }
+    }
+
+    #[test]
+    fn test_trp_information_request_without_trp_list_roundtrip() {
+        let pdu = build_trp_information_request(
+            NrppaTransactionId(0),
+            None,
+            vec![TrpInformationTypeItem::NrPci],
+        )
+        .unwrap();
+        let bytes = pdu.encode().unwrap();
+        assert_eq!(NrppaPdu::decode(&bytes).unwrap(), pdu);
+    }
+
+    #[test]
+    fn test_trp_information_response_roundtrip_and_parse() {
+        let info = vec![
+            TrpInformation {
+                trp_id: TrpId(1),
+                response_list: TrpInformationTypeResponseList {
+                    items: vec![
+                        TrpInformationTypeResponseItem::PciNr(500),
+                        TrpInformationTypeResponseItem::Arfcn(640_000),
+                    ],
+                },
+            },
+            TrpInformation {
+                trp_id: TrpId(2),
+                response_list: TrpInformationTypeResponseList {
+                    items: vec![TrpInformationTypeResponseItem::GeographicalCoordinates(
+                        GeographicalCoordinates {
+                            position_definition_type: TrpPositionDefinitionType::Direct(
+                                TrpPositionDirect {
+                                    accuracy: TrpPositionDirectAccuracy::TrpPosition(
+                                        sample_trp_position(),
+                                    ),
+                                },
+                            ),
+                        },
+                    )],
+                },
+            },
+        ];
+
+        let pdu = build_trp_information_response(NrppaTransactionId(42), info.clone()).unwrap();
+        let bytes = pdu.encode().unwrap();
+        let decoded = NrppaPdu::decode(&bytes).unwrap();
+        assert_eq!(decoded, pdu);
+
+        let parsed = parse_trp_information_response(&decoded).unwrap();
+        assert_eq!(parsed, info);
+    }
+
+    /// Self-derived reference-hex test for a minimal TRPInformationRequest.
+    ///
+    /// No golden NRPPa capture exists in-repo and there is no network egress, so
+    /// this vector is hand-derived from X.691 (APER) + TS 38.455 §9.3.5. The PDU:
+    ///
+    ///   NRPPA-PDU = initiatingMessage (CHOICE index 0)
+    ///   InitiatingMessage {
+    ///     procedureCode      = 16 (id-tRPInformationExchange)
+    ///     criticality        = reject (0)
+    ///     nrppatransactionID = 0
+    ///     value (OPEN TYPE) = TRPInformationRequest {
+    ///       protocolIEs (1 IE):
+    ///         { id 29 (TRPInformationTypeListTRPReq), reject,
+    ///           SEQUENCE(SIZE 1) OF single-container:
+    ///             { id 57 (TRPInformationTypeItem), reject,
+    ///               TRPInformationTypeItem = nrPCI(0) } }
+    ///     }
+    ///   }
+    ///
+    /// Bit-level derivation (each group annotated):
+    ///   OUTER PDU:
+    ///     byte0 = 0x00 : NRPPA-PDU CHOICE = ext-bit 0 + 2-bit index `00` = `000`,
+    ///                    then procedureCode (range-256 INTEGER) octet-aligns ->
+    ///                    5 pad bits.
+    ///     byte1 = 0x10 : procedureCode = 16 (one aligned octet).
+    ///     byte2 = 0x00 : criticality reject = `00` (2-bit ENUM 0..2) + 6 pad
+    ///                    before the octet-aligned transactionID.
+    ///     byte3 byte4 = 0x00 0x00 : nrppatransactionID = 0 (range 32768 -> 2
+    ///                    aligned octets).
+    ///     byte5 = 0x0D : open-type length determinant = 13 octets.
+    ///   INNER message value (13 octets, b0..b12):
+    ///     b0  = 0x00 : TRPInformationRequest SEQUENCE ext-bit 0, then the IE
+    ///                  container length octet-aligns -> 7 pad bits.
+    ///     b1 b2 = 0x00 0x01 : ProtocolIE-Container length = 1 (range 0..65535 ->
+    ///                  2 aligned octets).
+    ///     IE (TRPInformationTypeListTRPReq):
+    ///       b3 b4 = 0x00 0x1D : id = 29 (range 0..65535 -> 2 aligned octets).
+    ///       b5    = 0x00      : criticality reject `00` + 6 pad before length.
+    ///       b6    = 0x06      : open-type length = 6 octets.
+    ///       TRPInformationTypeListTRPReq value (6 octets, b7..b12):
+    ///         b7  = 0x00 : SEQUENCE-OF length(1..64) = 1 -> offset 0 in 6 bits
+    ///                      `000000`, then the single-container id octet-aligns ->
+    ///                      2 pad bits.
+    ///         b8 b9 = 0x00 0x39 : id = 57 (range 0..65535 -> 2 aligned octets).
+    ///         b10 = 0x00 : criticality reject `00` + 6 pad before length.
+    ///         b11 = 0x01 : open-type length = 1 octet.
+    ///         b12 = 0x00 : TRPInformationTypeItem = nrPCI: ext-bit 0 + 3-bit
+    ///                      root index `000` (0..7) = `0000` -> padded 0x00.
+    #[test]
+    fn test_trp_information_request_reference_hex() {
+        let reference: [u8; 19] = [
+            0x00, 0x10, 0x00, 0x00, 0x00, 0x0D, 0x00, 0x00, 0x01, 0x00, 0x1D, 0x00, 0x06, 0x00,
+            0x00, 0x39, 0x00, 0x01, 0x00,
+        ];
+
+        let pdu = build_trp_information_request(
+            NrppaTransactionId(0),
+            None,
+            vec![TrpInformationTypeItem::NrPci],
+        )
+        .unwrap();
+
+        // Encode must equal the hand-derived vector...
+        assert_eq!(pdu.encode().unwrap().as_ref(), &reference[..]);
+
+        // ...and the vector must decode back to the same PDU, with the typed
+        // info-type list recovered out of the opaque container.
+        let decoded = NrppaPdu::decode(&reference).expect("reference hex must decode");
+        assert_eq!(decoded, pdu);
+        match &decoded {
+            NrppaPdu::InitiatingMessage(m) => match &m.value {
+                InitiatingMessageValue::TrpInformationRequest(c) => {
+                    let field = c
+                        .find(ProtocolIeId::TRP_INFORMATION_TYPE_LIST_TRP_REQ)
+                        .unwrap();
+                    let list: TrpInformationTypeListTrpReq =
+                        decode_ie_value(&field.value).unwrap();
+                    assert_eq!(list.items, vec![TrpInformationTypeItem::NrPci]);
+                }
+                _ => panic!("expected TrpInformationRequest"),
+            },
+            _ => panic!("expected initiating message"),
+        }
     }
 }

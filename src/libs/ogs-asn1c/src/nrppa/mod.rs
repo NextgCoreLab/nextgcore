@@ -13,10 +13,12 @@
 pub mod cause;
 pub mod ies;
 pub mod pdu;
+pub mod trp;
 pub mod types;
 
 // Re-export commonly used types.
 pub use cause::*;
 pub use ies::*;
 pub use pdu::*;
+pub use trp::*;
 pub use types::*;
