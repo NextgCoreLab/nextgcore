@@ -23,7 +23,6 @@ use std::time::Duration;
 mod bsf_sm;
 mod context;
 mod event;
-mod nbsf_handler;
 mod nnrf_handler;
 mod sbi_path;
 mod sbi_response;
@@ -34,7 +33,6 @@ pub use context::*;
 pub use event::{
     BsfEvent, BsfEventId, BsfTimerId, EventSbiRequest, EventSbiResponse, SbiEventData, SbiMessage,
 };
-pub use nbsf_handler::*;
 pub use nnrf_handler::*;
 pub use sbi_path::*;
 pub use timer::{timer_manager, BsfTimerManager};
@@ -362,29 +360,66 @@ async fn bsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let resource = parts[2];
 
     match (service, resource, method) {
-        // BSF Management Service (nbsf-management)
+        // bsfd-13 stub: subscription sub-resource (any method) -> 501.
+        // Must be checked BEFORE the generic pcfBindings/POST arm.
+        ("nbsf-management", "pcfBindings", _) if parts.len() >= 5 && parts[4] == "subscriptions" => {
+            ogs_sbi::server::send_error(
+                501,
+                "Not Implemented",
+                "Nbsf_Management Subscribe/Unsubscribe is not implemented (bsfd-13 stub)",
+                None,
+            )
+        }
+        // BSF Management Service (nbsf-management) — PDU-session bindings
         ("nbsf-management", "pcfBindings", "POST") => {
-            // Create PCF Binding
             handle_pcf_binding_create(&request).await
         }
         ("nbsf-management", "pcfBindings", "GET") if parts.len() >= 4 => {
-            // Get PCF Binding
             let binding_id = parts[3];
             handle_pcf_binding_get(binding_id).await
         }
         ("nbsf-management", "pcfBindings", "GET") => {
-            // Discovery PCF Binding (with query params)
             handle_pcf_binding_discovery(&request).await
         }
         ("nbsf-management", "pcfBindings", "DELETE") if parts.len() >= 4 => {
-            // Delete PCF Binding
             let binding_id = parts[3];
             handle_pcf_binding_delete(binding_id).await
         }
         ("nbsf-management", "pcfBindings", "PATCH") if parts.len() >= 4 => {
-            // Update PCF Binding
             let binding_id = parts[3];
             handle_pcf_binding_update(binding_id, &request).await
+        }
+        // bsfd-11: pcf-ue-bindings resource
+        ("nbsf-management", "pcf-ue-bindings", "POST") => {
+            handle_pcf_ue_binding_create(&request).await
+        }
+        ("nbsf-management", "pcf-ue-bindings", "GET") if parts.len() >= 4 => {
+            handle_pcf_ue_binding_get(parts[3]).await
+        }
+        ("nbsf-management", "pcf-ue-bindings", "GET") => {
+            handle_pcf_ue_binding_discovery(&request).await
+        }
+        ("nbsf-management", "pcf-ue-bindings", "DELETE") if parts.len() >= 4 => {
+            handle_pcf_ue_binding_delete(parts[3]).await
+        }
+        ("nbsf-management", "pcf-ue-bindings", "PATCH") if parts.len() >= 4 => {
+            handle_pcf_ue_binding_update(parts[3], &request).await
+        }
+        // bsfd-12: pcf-mbs-bindings resource
+        ("nbsf-management", "pcf-mbs-bindings", "POST") => {
+            handle_pcf_mbs_binding_create(&request).await
+        }
+        ("nbsf-management", "pcf-mbs-bindings", "GET") if parts.len() >= 4 => {
+            handle_pcf_mbs_binding_get(parts[3]).await
+        }
+        ("nbsf-management", "pcf-mbs-bindings", "GET") => {
+            handle_pcf_mbs_binding_discovery(&request).await
+        }
+        ("nbsf-management", "pcf-mbs-bindings", "DELETE") if parts.len() >= 4 => {
+            handle_pcf_mbs_binding_delete(parts[3]).await
+        }
+        ("nbsf-management", "pcf-mbs-bindings", "PATCH") if parts.len() >= 4 => {
+            handle_pcf_mbs_binding_update(parts[3], &request).await
         }
 
         _ => {
@@ -395,6 +430,14 @@ async fn bsf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
 }
 
 // PCF Binding handlers
+
+/// BSF-supported SBI feature bitmask (TS 29.521 Table 5.8-1, hex encoding).
+/// Bit 0 (0x1) = BindingUpdate (PATCH already wired).
+/// Bit 1 (0x2) = SamePcf (duplicate detection, bsfd-07).
+const BSF_SUPPORTED_FEATURES: u64 = 0x3;
+
+/// SamePcf feature bit (TS 29.521 Table 5.8-1, Feature 2).
+const SAME_PCF_BIT: u64 = 0x2;
 
 /// 400 ProblemDetails for a missing mandatory PcfBinding attribute.
 fn missing_mandatory(attr: &str) -> SbiResponse {
@@ -514,10 +557,45 @@ fn binding_json(sess: &BsfSess) -> serde_json::Value {
             ),
         );
     }
-    b.insert(
-        "suppFeat".to_string(),
-        serde_json::Value::String("1".to_string()),
-    );
+    // bsfd-08: optional PCF identity / Diameter addressing fields
+    if let Some(ref v) = sess.pcf_id {
+        b.insert("pcfId".to_string(), serde_json::Value::String(v.clone()));
+    }
+    if let Some(ref v) = sess.pcf_set_id {
+        b.insert("pcfSetId".to_string(), serde_json::Value::String(v.clone()));
+    }
+    if let Some(ref v) = sess.bind_level {
+        b.insert(
+            "bindLevel".to_string(),
+            serde_json::Value::String(v.clone()),
+        );
+    }
+    if let Some(ref v) = sess.recovery_time {
+        b.insert(
+            "recoveryTime".to_string(),
+            serde_json::Value::String(v.clone()),
+        );
+    }
+    if let Some(ref v) = sess.pcf_diam_host {
+        b.insert(
+            "pcfDiamHost".to_string(),
+            serde_json::Value::String(v.clone()),
+        );
+    }
+    if let Some(ref v) = sess.pcf_diam_realm {
+        b.insert(
+            "pcfDiamRealm".to_string(),
+            serde_json::Value::String(v.clone()),
+        );
+    }
+    // bsfd-06: echo the per-session negotiated suppFeat (consumer ∩ BSF-supported).
+    // Omit when zero per the C cardinality (TS 29.521 §5.8).
+    if sess.management_features != 0 {
+        b.insert(
+            "suppFeat".to_string(),
+            serde_json::Value::String(format!("{:X}", sess.management_features)),
+        );
+    }
     serde_json::Value::Object(b)
 }
 
@@ -603,6 +681,103 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
         }
     }
 
+    // bsfd-08: parse PCF address and identity attributes early (needed for
+    // bsfd-05 mandatory check and bsfd-07 duplicate detection).
+    let pcf_fqdn = binding_data.get("pcfFqdn").and_then(|v| v.as_str());
+    let has_pcf_endpoints = binding_data
+        .get("pcfIpEndPoints")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty());
+    let pcf_diam_host = binding_data.get("pcfDiamHost").and_then(|v| v.as_str());
+    let pcf_diam_realm = binding_data.get("pcfDiamRealm").and_then(|v| v.as_str());
+    let has_pcf_diam = pcf_diam_host.is_some() && pcf_diam_realm.is_some();
+    let pcf_id_val = binding_data.get("pcfId").and_then(|v| v.as_str());
+    let pcf_set_id_val = binding_data.get("pcfSetId").and_then(|v| v.as_str());
+    let bind_level_val = binding_data.get("bindLevel").and_then(|v| v.as_str());
+    let recovery_time_val = binding_data.get("recoveryTime").and_then(|v| v.as_str());
+
+    // bsfd-05: a PcfBinding must carry at least one PCF address:
+    // pcfFqdn, pcfIpEndPoints, or pcfDiamHost+pcfDiamRealm (Rx interface).
+    if pcf_fqdn.is_none() && !has_pcf_endpoints && !has_pcf_diam {
+        return missing_mandatory("pcfFqdn|pcfIpEndPoints");
+    }
+
+    // bsfd-06: negotiate suppFeat = consumer_requested ∩ BSF_SUPPORTED_FEATURES.
+    let consumer_feat = binding_data
+        .get("suppFeat")
+        .and_then(|v| v.as_str())
+        .and_then(|s| u64::from_str_radix(s, 16).ok())
+        .unwrap_or(0);
+    let negotiated_features = consumer_feat & BSF_SUPPORTED_FEATURES;
+
+    // bsfd-07: SamePcf duplicate detection.
+    // Only fires when the SamePcf feature was negotiated AND paraCom is present.
+    if negotiated_features & SAME_PCF_BIT != 0 && binding_data.get("paraCom").is_some() {
+        if let Some(supi_val) = binding_data.get("supi").and_then(|v| v.as_str()) {
+                let check_sd = binding_data
+                    .get("snssai")
+                    .and_then(|s| s.get("sd"))
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| u32::from_str_radix(s, 16).ok());
+                let check_snssai = context::SNssai::new(sst as u8, check_sd);
+                let dup = {
+                    let ctx = bsf_self();
+                    ctx.read()
+                        .ok()
+                        .and_then(|g| g.sess_find_by_dnn_snssai_supi(dnn, &check_snssai, supi_val))
+                };
+                if let Some(dup) = dup {
+                    let mut ext = serde_json::Map::new();
+                    ext.insert("status".to_string(), serde_json::json!(403));
+                    ext.insert(
+                        "cause".to_string(),
+                        serde_json::json!("EXISTING_BINDING_INFO_FOUND"),
+                    );
+                    if let Some(ref fqdn) = dup.pcf_fqdn {
+                        ext.insert(
+                            "pcfSmFqdn".to_string(),
+                            serde_json::Value::String(fqdn.clone()),
+                        );
+                    }
+                    if !dup.pcf_ip.is_empty() {
+                        let eps: Vec<serde_json::Value> = dup
+                            .pcf_ip
+                            .iter()
+                            .map(|ep| {
+                                let mut e = serde_json::Map::new();
+                                if let Some(ref a) = ep.addr {
+                                    e.insert(
+                                        "ipv4Address".to_string(),
+                                        serde_json::Value::String(a.clone()),
+                                    );
+                                }
+                                if let Some(ref a6) = ep.addr6 {
+                                    e.insert(
+                                        "ipv6Address".to_string(),
+                                        serde_json::Value::String(a6.clone()),
+                                    );
+                                }
+                                if ep.is_port {
+                                    e.insert(
+                                        "port".to_string(),
+                                        serde_json::Value::Number(ep.port.into()),
+                                    );
+                                }
+                                serde_json::Value::Object(e)
+                            })
+                            .collect();
+                        ext.insert(
+                            "pcfSmIpEndPoints".to_string(),
+                            serde_json::Value::Array(eps),
+                        );
+                    }
+                    return SbiResponse::with_status(403)
+                        .with_json_body(&serde_json::Value::Object(ext))
+                        .unwrap_or_else(|_| SbiResponse::with_status(403));
+                }
+            }
+    }
+
     // Add session to context
     let ctx = bsf_self();
     let sess = if let Ok(context) = ctx.read() {
@@ -629,14 +804,36 @@ async fn handle_pcf_binding_create(request: &SbiRequest) -> SbiResponse {
             if let Some(ip_domain) = binding_data.get("ipDomain").and_then(|v| v.as_str()) {
                 sess.ip_domain = Some(ip_domain.to_string());
             }
-            if let Some(pcf_fqdn) = binding_data.get("pcfFqdn").and_then(|v| v.as_str()) {
-                sess.pcf_fqdn = Some(pcf_fqdn.to_string());
+            // bsfd-06: store the negotiated suppFeat for this session.
+            sess.management_features = negotiated_features;
+
+            if let Some(v) = pcf_fqdn {
+                sess.pcf_fqdn = Some(v.to_string());
             }
             if let Some(endpoints) = binding_data.get("pcfIpEndPoints") {
                 sess.pcf_ip = parse_pcf_ip_endpoints(endpoints);
             }
             if let Some(e) = expiry {
                 sess.set_expiry(e);
+            }
+            // bsfd-08: optional PCF identity and Diameter fields.
+            if let Some(v) = pcf_id_val {
+                sess.pcf_id = Some(v.to_string());
+            }
+            if let Some(v) = pcf_set_id_val {
+                sess.pcf_set_id = Some(v.to_string());
+            }
+            if let Some(v) = bind_level_val {
+                sess.bind_level = Some(v.to_string());
+            }
+            if let Some(v) = recovery_time_val {
+                sess.recovery_time = Some(v.to_string());
+            }
+            if let Some(v) = pcf_diam_host {
+                sess.pcf_diam_host = Some(v.to_string());
+            }
+            if let Some(v) = pcf_diam_realm {
+                sess.pcf_diam_realm = Some(v.to_string());
             }
 
             // Update session in context, then persist off-thread (guard
@@ -1046,6 +1243,38 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
             _ => {}
         }
 
+        // bsfd-08: optional PCF identity / Diameter fields (clearable via null).
+        match patch_str(&update_data, "pcfId") {
+            Patch::Clear => sess.pcf_id = None,
+            Patch::Set(s) => sess.pcf_id = Some(s.to_string()),
+            Patch::Keep => {}
+        }
+        match patch_str(&update_data, "pcfSetId") {
+            Patch::Clear => sess.pcf_set_id = None,
+            Patch::Set(s) => sess.pcf_set_id = Some(s.to_string()),
+            Patch::Keep => {}
+        }
+        match patch_str(&update_data, "bindLevel") {
+            Patch::Clear => sess.bind_level = None,
+            Patch::Set(s) => sess.bind_level = Some(s.to_string()),
+            Patch::Keep => {}
+        }
+        match patch_str(&update_data, "recoveryTime") {
+            Patch::Clear => sess.recovery_time = None,
+            Patch::Set(s) => sess.recovery_time = Some(s.to_string()),
+            Patch::Keep => {}
+        }
+        match patch_str(&update_data, "pcfDiamHost") {
+            Patch::Clear => sess.pcf_diam_host = None,
+            Patch::Set(s) => sess.pcf_diam_host = Some(s.to_string()),
+            Patch::Keep => {}
+        }
+        match patch_str(&update_data, "pcfDiamRealm") {
+            Patch::Clear => sess.pcf_diam_realm = None,
+            Patch::Set(s) => sess.pcf_diam_realm = Some(s.to_string()),
+            Patch::Keep => {}
+        }
+
         // Write the updated session back; the context guard is released when
         // this block ends, before the persistence await.
         context.sess_update(&sess);
@@ -1058,6 +1287,589 @@ async fn handle_pcf_binding_update(binding_id: &str, request: &SbiRequest) -> Sb
 
     SbiResponse::with_status(200)
         .with_json_body(&binding_json(&sess))
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+// ---------------------------------------------------------------------------
+// bsfd-11: pcf-ue-bindings resource (TS 29.521 §4.2.2.3/§4.2.4.3)
+// ---------------------------------------------------------------------------
+
+/// Build the PcfForUeBinding JSON representation of a UE binding.
+fn ue_binding_json(b: &context::PcfUeBinding) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "pcfUeBindingId".to_string(),
+        serde_json::Value::String(b.binding_id.clone()),
+    );
+    if let Some(ref v) = b.supi {
+        m.insert("supi".to_string(), serde_json::Value::String(v.clone()));
+    }
+    if let Some(ref v) = b.gpsi {
+        m.insert("gpsi".to_string(), serde_json::Value::String(v.clone()));
+    }
+    if let Some(ref v) = b.pcf_fqdn {
+        m.insert("pcfFqdn".to_string(), serde_json::Value::String(v.clone()));
+    }
+    if !b.pcf_ip.is_empty() {
+        let eps: Vec<serde_json::Value> = b
+            .pcf_ip
+            .iter()
+            .map(|ep| {
+                let mut e = serde_json::Map::new();
+                if let Some(ref a) = ep.addr {
+                    e.insert(
+                        "ipv4Address".to_string(),
+                        serde_json::Value::String(a.clone()),
+                    );
+                }
+                if let Some(ref a6) = ep.addr6 {
+                    e.insert(
+                        "ipv6Address".to_string(),
+                        serde_json::Value::String(a6.clone()),
+                    );
+                }
+                if ep.is_port {
+                    e.insert(
+                        "port".to_string(),
+                        serde_json::Value::Number(ep.port.into()),
+                    );
+                }
+                serde_json::Value::Object(e)
+            })
+            .collect();
+        m.insert("pcfIpEndPoints".to_string(), serde_json::Value::Array(eps));
+    }
+    if let Some(ref v) = b.pcf_id {
+        m.insert("pcfId".to_string(), serde_json::Value::String(v.clone()));
+    }
+    if let Some(ref v) = b.pcf_set_id {
+        m.insert("pcfSetId".to_string(), serde_json::Value::String(v.clone()));
+    }
+    if let Some(ref v) = b.bind_level {
+        m.insert(
+            "bindLevel".to_string(),
+            serde_json::Value::String(v.clone()),
+        );
+    }
+    if let Some(ref v) = b.recovery_time {
+        m.insert(
+            "recoveryTime".to_string(),
+            serde_json::Value::String(v.clone()),
+        );
+    }
+    if let Some(ref v) = b.pcf_diam_host {
+        m.insert(
+            "pcfDiamHost".to_string(),
+            serde_json::Value::String(v.clone()),
+        );
+    }
+    if let Some(ref v) = b.pcf_diam_realm {
+        m.insert(
+            "pcfDiamRealm".to_string(),
+            serde_json::Value::String(v.clone()),
+        );
+    }
+    if b.management_features != 0 {
+        m.insert(
+            "suppFeat".to_string(),
+            serde_json::Value::String(format!("{:X}", b.management_features)),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+async fn handle_pcf_ue_binding_create(request: &SbiRequest) -> SbiResponse {
+    log::info!("PCF UE Binding Create");
+    let body = match &request.http.content {
+        Some(c) => c,
+        None => return send_bad_request("Missing request body", Some("MANDATORY_IE_MISSING")),
+    };
+    let data: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_MSG_FORMAT"))
+        }
+    };
+
+    // Mandatory: supi or gpsi (UE identifier for UE-policy bindings).
+    let supi = data.get("supi").and_then(|v| v.as_str());
+    let gpsi = data.get("gpsi").and_then(|v| v.as_str());
+    if supi.is_none() && gpsi.is_none() {
+        return missing_mandatory("supi|gpsi");
+    }
+
+    // Mandatory: PCF address (same requirement as PDU-session binding, bsfd-05).
+    let pcf_fqdn = data.get("pcfFqdn").and_then(|v| v.as_str());
+    let has_eps = data
+        .get("pcfIpEndPoints")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty());
+    let diam_host = data.get("pcfDiamHost").and_then(|v| v.as_str());
+    let diam_realm = data.get("pcfDiamRealm").and_then(|v| v.as_str());
+    if pcf_fqdn.is_none() && !has_eps && !(diam_host.is_some() && diam_realm.is_some()) {
+        return missing_mandatory("pcfFqdn|pcfIpEndPoints");
+    }
+
+    let consumer_feat = data
+        .get("suppFeat")
+        .and_then(|v| v.as_str())
+        .and_then(|s| u64::from_str_radix(s, 16).ok())
+        .unwrap_or(0);
+    let negotiated = consumer_feat & BSF_SUPPORTED_FEATURES;
+
+    let binding_id = uuid::Uuid::new_v4().to_string();
+    let binding = context::PcfUeBinding {
+        binding_id: binding_id.clone(),
+        supi: supi.map(|s| s.to_string()),
+        gpsi: gpsi.map(|s| s.to_string()),
+        pcf_fqdn: pcf_fqdn.map(|s| s.to_string()),
+        pcf_ip: data
+            .get("pcfIpEndPoints")
+            .map(parse_pcf_ip_endpoints)
+            .unwrap_or_default(),
+        pcf_id: data
+            .get("pcfId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        pcf_set_id: data
+            .get("pcfSetId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        bind_level: data
+            .get("bindLevel")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        recovery_time: data
+            .get("recoveryTime")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        pcf_diam_host: diam_host.map(|s| s.to_string()),
+        pcf_diam_realm: diam_realm.map(|s| s.to_string()),
+        management_features: negotiated,
+    };
+
+    let ctx = bsf_self();
+    if let Ok(context) = ctx.read() {
+        context.ue_binding_add(binding.clone());
+    }
+
+    log::info!(
+        "PCF UE Binding created (id={}, supi={:?}, gpsi={:?})",
+        binding_id,
+        supi,
+        gpsi
+    );
+
+    SbiResponse::with_status(201)
+        .with_header(
+            "Location",
+            format!("/nbsf-management/v1/pcf-ue-bindings/{binding_id}"),
+        )
+        .with_json_body(&ue_binding_json(&binding))
+        .unwrap_or_else(|_| SbiResponse::with_status(201))
+}
+
+async fn handle_pcf_ue_binding_get(binding_id: &str) -> SbiResponse {
+    let ctx = bsf_self();
+    match ctx
+        .read()
+        .ok()
+        .and_then(|g| g.ue_binding_find_by_id(binding_id))
+    {
+        Some(b) => SbiResponse::with_status(200)
+            .with_json_body(&ue_binding_json(&b))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("PCF UE Binding {binding_id} not found"),
+            Some("BINDING_NOT_FOUND"),
+        ),
+    }
+}
+
+async fn handle_pcf_ue_binding_discovery(request: &SbiRequest) -> SbiResponse {
+    let params = &request.http.params;
+    let supi = params.get("supi").map(|s| s.as_str());
+    let gpsi = params.get("gpsi").map(|s| s.as_str());
+
+    if supi.is_none() && gpsi.is_none() {
+        return send_bad_request(
+            "Discovery query must include supi or gpsi",
+            Some("MANDATORY_QUERY_PARAM_MISSING"),
+        );
+    }
+
+    let ctx = bsf_self();
+    let results = ctx
+        .read()
+        .map(|g| g.ue_binding_find_matching(supi, gpsi))
+        .unwrap_or_default();
+
+    if results.is_empty() {
+        return SbiResponse::with_status(204);
+    }
+
+    let arr: Vec<serde_json::Value> = results.iter().map(ue_binding_json).collect();
+    SbiResponse::with_status(200)
+        .with_json_body(&serde_json::Value::Array(arr))
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+async fn handle_pcf_ue_binding_delete(binding_id: &str) -> SbiResponse {
+    let ctx = bsf_self();
+    match ctx.read().ok().and_then(|g| g.ue_binding_remove(binding_id)) {
+        Some(_) => {
+            log::info!("PCF UE Binding {binding_id} deleted");
+            SbiResponse::with_status(204)
+        }
+        None => send_not_found(
+            &format!("PCF UE Binding {binding_id} not found"),
+            Some("BINDING_NOT_FOUND"),
+        ),
+    }
+}
+
+async fn handle_pcf_ue_binding_update(binding_id: &str, request: &SbiRequest) -> SbiResponse {
+    if !merge_patch_content_type_ok(request) {
+        return ogs_sbi::server::send_error(
+            415,
+            "Unsupported Media Type",
+            "PATCH body must be application/merge-patch+json",
+            None,
+        );
+    }
+    let body = match &request.http.content {
+        Some(c) => c,
+        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+    };
+    let data: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+    };
+
+    let ctx = bsf_self();
+    let Some(mut b) = ctx
+        .read()
+        .ok()
+        .and_then(|g| g.ue_binding_find_by_id(binding_id))
+    else {
+        return send_not_found(
+            &format!("PCF UE Binding {binding_id} not found"),
+            Some("BINDING_NOT_FOUND"),
+        );
+    };
+
+    // Apply merge-patch: string fields (null = clear, string = set, absent = keep).
+    macro_rules! patch_opt {
+        ($field:expr, $key:expr) => {
+            match patch_str(&data, $key) {
+                Patch::Clear => $field = None,
+                Patch::Set(s) => $field = Some(s.to_string()),
+                Patch::Keep => {}
+            }
+        };
+    }
+    patch_opt!(b.pcf_fqdn, "pcfFqdn");
+    patch_opt!(b.pcf_id, "pcfId");
+    patch_opt!(b.pcf_set_id, "pcfSetId");
+    patch_opt!(b.bind_level, "bindLevel");
+    patch_opt!(b.recovery_time, "recoveryTime");
+    patch_opt!(b.pcf_diam_host, "pcfDiamHost");
+    patch_opt!(b.pcf_diam_realm, "pcfDiamRealm");
+    match data.get("pcfIpEndPoints") {
+        Some(serde_json::Value::Null) => b.pcf_ip.clear(),
+        Some(v) if v.is_array() => b.pcf_ip = parse_pcf_ip_endpoints(v),
+        _ => {}
+    }
+
+    if let Ok(g) = ctx.read() {
+        g.ue_binding_update(&b);
+    }
+
+    SbiResponse::with_status(200)
+        .with_json_body(&ue_binding_json(&b))
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+// ---------------------------------------------------------------------------
+// bsfd-12: pcf-mbs-bindings resource (TS 29.521 §4.2.2.4/§4.2.4.4)
+// ---------------------------------------------------------------------------
+
+/// Build the PcfMbsBinding JSON representation.
+fn mbs_binding_json(b: &context::PcfMbsBinding) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "pcfMbsBindingId".to_string(),
+        serde_json::Value::String(b.binding_id.clone()),
+    );
+    m.insert(
+        "mbsSessionId".to_string(),
+        serde_json::Value::String(b.mbs_session_id.clone()),
+    );
+    if let Some(ref v) = b.pcf_fqdn {
+        m.insert("pcfFqdn".to_string(), serde_json::Value::String(v.clone()));
+    }
+    if !b.pcf_ip.is_empty() {
+        let eps: Vec<serde_json::Value> = b
+            .pcf_ip
+            .iter()
+            .map(|ep| {
+                let mut e = serde_json::Map::new();
+                if let Some(ref a) = ep.addr {
+                    e.insert(
+                        "ipv4Address".to_string(),
+                        serde_json::Value::String(a.clone()),
+                    );
+                }
+                if let Some(ref a6) = ep.addr6 {
+                    e.insert(
+                        "ipv6Address".to_string(),
+                        serde_json::Value::String(a6.clone()),
+                    );
+                }
+                if ep.is_port {
+                    e.insert(
+                        "port".to_string(),
+                        serde_json::Value::Number(ep.port.into()),
+                    );
+                }
+                serde_json::Value::Object(e)
+            })
+            .collect();
+        m.insert("pcfIpEndPoints".to_string(), serde_json::Value::Array(eps));
+    }
+    if let Some(ref v) = b.pcf_id {
+        m.insert("pcfId".to_string(), serde_json::Value::String(v.clone()));
+    }
+    if let Some(ref v) = b.pcf_set_id {
+        m.insert("pcfSetId".to_string(), serde_json::Value::String(v.clone()));
+    }
+    if b.management_features != 0 {
+        m.insert(
+            "suppFeat".to_string(),
+            serde_json::Value::String(format!("{:X}", b.management_features)),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+async fn handle_pcf_mbs_binding_create(request: &SbiRequest) -> SbiResponse {
+    log::info!("PCF MBS Binding Create");
+    let body = match &request.http.content {
+        Some(c) => c,
+        None => return send_bad_request("Missing request body", Some("MANDATORY_IE_MISSING")),
+    };
+    let data: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => {
+            return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_MSG_FORMAT"))
+        }
+    };
+
+    // Mandatory: mbsSessionId.
+    let Some(mbs_session_id) = data.get("mbsSessionId").and_then(|v| v.as_str()) else {
+        return missing_mandatory("mbsSessionId");
+    };
+
+    // Mandatory: PCF address.
+    let pcf_fqdn = data.get("pcfFqdn").and_then(|v| v.as_str());
+    let has_eps = data
+        .get("pcfIpEndPoints")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty());
+    if pcf_fqdn.is_none() && !has_eps {
+        return missing_mandatory("pcfFqdn|pcfIpEndPoints");
+    }
+
+    // bsfd-12: 403 if a binding with the same mbsSessionId already exists.
+    let ctx = bsf_self();
+    let existing = ctx
+        .read()
+        .map(|g| g.mbs_binding_find_by_mbs_session_id(mbs_session_id))
+        .unwrap_or_default();
+    if !existing.is_empty() {
+        let first = &existing[0];
+        let mut ext = serde_json::Map::new();
+        ext.insert("status".to_string(), serde_json::json!(403));
+        ext.insert(
+            "cause".to_string(),
+            serde_json::json!("EXISTING_BINDING_INFO_FOUND"),
+        );
+        if let Some(ref fqdn) = first.pcf_fqdn {
+            ext.insert(
+                "pcfSmFqdn".to_string(),
+                serde_json::Value::String(fqdn.clone()),
+            );
+        }
+        return SbiResponse::with_status(403)
+            .with_json_body(&serde_json::Value::Object(ext))
+            .unwrap_or_else(|_| SbiResponse::with_status(403));
+    }
+
+    let consumer_feat = data
+        .get("suppFeat")
+        .and_then(|v| v.as_str())
+        .and_then(|s| u64::from_str_radix(s, 16).ok())
+        .unwrap_or(0);
+
+    let binding_id = uuid::Uuid::new_v4().to_string();
+    let binding = context::PcfMbsBinding {
+        binding_id: binding_id.clone(),
+        mbs_session_id: mbs_session_id.to_string(),
+        pcf_fqdn: pcf_fqdn.map(|s| s.to_string()),
+        pcf_ip: data
+            .get("pcfIpEndPoints")
+            .map(parse_pcf_ip_endpoints)
+            .unwrap_or_default(),
+        pcf_id: data
+            .get("pcfId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        pcf_set_id: data
+            .get("pcfSetId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        management_features: consumer_feat & BSF_SUPPORTED_FEATURES,
+    };
+
+    if let Ok(g) = ctx.read() {
+        g.mbs_binding_add(binding.clone());
+    }
+
+    log::info!(
+        "PCF MBS Binding created (id={}, mbsSessionId={})",
+        binding_id,
+        mbs_session_id
+    );
+
+    SbiResponse::with_status(201)
+        .with_header(
+            "Location",
+            format!("/nbsf-management/v1/pcf-mbs-bindings/{binding_id}"),
+        )
+        .with_json_body(&mbs_binding_json(&binding))
+        .unwrap_or_else(|_| SbiResponse::with_status(201))
+}
+
+async fn handle_pcf_mbs_binding_get(binding_id: &str) -> SbiResponse {
+    let ctx = bsf_self();
+    match ctx
+        .read()
+        .ok()
+        .and_then(|g| g.mbs_binding_find_by_id(binding_id))
+    {
+        Some(b) => SbiResponse::with_status(200)
+            .with_json_body(&mbs_binding_json(&b))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        None => send_not_found(
+            &format!("PCF MBS Binding {binding_id} not found"),
+            Some("BINDING_NOT_FOUND"),
+        ),
+    }
+}
+
+async fn handle_pcf_mbs_binding_discovery(request: &SbiRequest) -> SbiResponse {
+    let Some(mbs_session_id) = request.http.params.get("mbsSessionId") else {
+        return send_bad_request(
+            "Discovery query must include mbsSessionId",
+            Some("MANDATORY_QUERY_PARAM_MISSING"),
+        );
+    };
+
+    let ctx = bsf_self();
+    let results = ctx
+        .read()
+        .map(|g| g.mbs_binding_find_by_mbs_session_id(mbs_session_id))
+        .unwrap_or_default();
+
+    match results.as_slice() {
+        [] => SbiResponse::with_status(204),
+        [b] => SbiResponse::with_status(200)
+            .with_json_body(&mbs_binding_json(b))
+            .unwrap_or_else(|_| SbiResponse::with_status(200)),
+        _ => ogs_sbi::server::send_error(
+            400,
+            "Bad Request",
+            "Multiple MBS bindings match the query parameter combination",
+            Some("MULTIPLE_BINDING_INFO_FOUND"),
+        ),
+    }
+}
+
+async fn handle_pcf_mbs_binding_delete(binding_id: &str) -> SbiResponse {
+    let ctx = bsf_self();
+    match ctx
+        .read()
+        .ok()
+        .and_then(|g| g.mbs_binding_remove(binding_id))
+    {
+        Some(_) => {
+            log::info!("PCF MBS Binding {binding_id} deleted");
+            SbiResponse::with_status(204)
+        }
+        None => send_not_found(
+            &format!("PCF MBS Binding {binding_id} not found"),
+            Some("BINDING_NOT_FOUND"),
+        ),
+    }
+}
+
+async fn handle_pcf_mbs_binding_update(binding_id: &str, request: &SbiRequest) -> SbiResponse {
+    if !merge_patch_content_type_ok(request) {
+        return ogs_sbi::server::send_error(
+            415,
+            "Unsupported Media Type",
+            "PATCH body must be application/merge-patch+json",
+            None,
+        );
+    }
+    let body = match &request.http.content {
+        Some(c) => c,
+        None => return send_bad_request("Missing request body", Some("MISSING_BODY")),
+    };
+    let data: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(e) => return send_bad_request(&format!("Invalid JSON: {e}"), Some("INVALID_JSON")),
+    };
+
+    let ctx = bsf_self();
+    let Some(mut b) = ctx
+        .read()
+        .ok()
+        .and_then(|g| g.mbs_binding_find_by_id(binding_id))
+    else {
+        return send_not_found(
+            &format!("PCF MBS Binding {binding_id} not found"),
+            Some("BINDING_NOT_FOUND"),
+        );
+    };
+
+    match patch_str(&data, "pcfFqdn") {
+        Patch::Clear => b.pcf_fqdn = None,
+        Patch::Set(s) => b.pcf_fqdn = Some(s.to_string()),
+        Patch::Keep => {}
+    }
+    match patch_str(&data, "pcfId") {
+        Patch::Clear => b.pcf_id = None,
+        Patch::Set(s) => b.pcf_id = Some(s.to_string()),
+        Patch::Keep => {}
+    }
+    match patch_str(&data, "pcfSetId") {
+        Patch::Clear => b.pcf_set_id = None,
+        Patch::Set(s) => b.pcf_set_id = Some(s.to_string()),
+        Patch::Keep => {}
+    }
+    match data.get("pcfIpEndPoints") {
+        Some(serde_json::Value::Null) => b.pcf_ip.clear(),
+        Some(v) if v.is_array() => b.pcf_ip = parse_pcf_ip_endpoints(v),
+        _ => {}
+    }
+
+    if let Ok(g) = ctx.read() {
+        g.mbs_binding_update(&b);
+    }
+
+    SbiResponse::with_status(200)
+        .with_json_body(&mbs_binding_json(&b))
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
@@ -1627,7 +2439,8 @@ mod tests {
                     "dnn": "ims",
                     "snssai": {"sst": 1},
                     "ipv4Addr": "10.45.9.7",
-                    "supi": "imsi-001019900100001"
+                    "supi": "imsi-001019900100001",
+                    "pcfFqdn": "pcf.ims.example.com"
                 }),
             )
             .await
@@ -1646,7 +2459,8 @@ mod tests {
                     "dnn": "internet2",
                     "snssai": {"sst": 1},
                     "ipv4Addr": "10.45.9.7",
-                    "supi": "imsi-001019900100001"
+                    "supi": "imsi-001019900100001",
+                    "pcfFqdn": "pcf.internet2.example.com"
                 }),
             )
             .await
@@ -1725,7 +2539,8 @@ mod tests {
                     "dnn": "expired",
                     "snssai": {"sst": 1},
                     "ipv4Addr": "10.45.9.99",
-                    "expiry": "2000-01-01T00:00:00Z"
+                    "expiry": "2000-01-01T00:00:00Z",
+                    "pcfFqdn": "pcf.expired.example.com"
                 }),
             )
             .await
@@ -1819,7 +2634,8 @@ mod tests {
                     "dnn": "internet",
                     "snssai": {"sst": 1},
                     "ipv6Prefix": "2001:dba::/64",
-                    "supi": "imsi-001019900166601"
+                    "supi": "imsi-001019900166601",
+                    "pcfFqdn": "pcf.ipv6.example.com"
                 }),
             )
             .await
@@ -1869,7 +2685,8 @@ mod tests {
                     "ipv4Addr": "10.88.0.1",
                     "ipDomain": "domain-x",
                     "macAddr48": "AA:BB:CC:88:00:01",
-                    "supi": "imsi-001019900188801"
+                    "supi": "imsi-001019900188801",
+                    "pcfFqdn": "pcf.patch.example.com"
                 }),
             )
             .await
@@ -1938,6 +2755,503 @@ mod tests {
             .delete(&format!("/nbsf-management/v1/pcfBindings/{id}"))
             .await
             .expect("DELETE patchable");
+
+        server.stop().await.expect("server stops");
+    }
+
+    // bsfd-05: mandatory PCF address on Register
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_create_rejects_missing_pcf_address() {
+        let (server, client) = start_bsf().await;
+
+        // No PCF address at all → 400 MANDATORY_IE_MISSING.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "dnn": "internet",
+                    "snssai": {"sst": 1},
+                    "ipv4Addr": "10.45.5.1"
+                }),
+            )
+            .await
+            .expect("POST no pcf addr");
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem(&resp)["cause"], "MANDATORY_IE_MISSING");
+        assert!(problem(&resp)["detail"]
+            .as_str()
+            .unwrap()
+            .contains("pcfFqdn"));
+
+        // pcfFqdn only → 201 (sufficient).
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "dnn": "internet",
+                    "snssai": {"sst": 1},
+                    "ipv4Addr": "10.45.5.2",
+                    "pcfFqdn": "pcf.example.com"
+                }),
+            )
+            .await
+            .expect("POST pcfFqdn only");
+        assert_eq!(resp.status, 201);
+
+        // pcfDiamHost + pcfDiamRealm only (Rx) → 201.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "dnn": "internet",
+                    "snssai": {"sst": 1},
+                    "ipv4Addr": "10.45.5.3",
+                    "pcfDiamHost": "pcf.diam.example.com",
+                    "pcfDiamRealm": "example.com"
+                }),
+            )
+            .await
+            .expect("POST Diameter addr");
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["pcfDiamHost"], "pcf.diam.example.com");
+        assert_eq!(body["pcfDiamRealm"], "example.com");
+
+        server.stop().await.expect("server stops");
+    }
+
+    // bsfd-06: suppFeat negotiation — intersection returned, absent → omitted
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_supp_feat_negotiation() {
+        let (server, client) = start_bsf().await;
+
+        // Consumer sends "3" (bits 0+1), BSF supports 0x3 → echoed "3".
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "dnn": "internet",
+                    "snssai": {"sst": 1},
+                    "ipv4Addr": "10.45.6.1",
+                    "pcfFqdn": "pcf.example.com",
+                    "suppFeat": "3"
+                }),
+            )
+            .await
+            .expect("POST suppFeat 3");
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["suppFeat"], "3", "intersection of 3 & 3 = 3");
+
+        // Consumer sends "F" (all low bits), BSF supports 0x3 → echoed "3".
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "dnn": "internet",
+                    "snssai": {"sst": 1},
+                    "ipv4Addr": "10.45.6.2",
+                    "pcfFqdn": "pcf.example.com",
+                    "suppFeat": "F"
+                }),
+            )
+            .await
+            .expect("POST suppFeat F");
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["suppFeat"], "3", "intersection of F & 3 = 3");
+
+        // No suppFeat sent → intersection = 0 → suppFeat omitted from response.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "dnn": "internet",
+                    "snssai": {"sst": 1},
+                    "ipv4Addr": "10.45.6.3",
+                    "pcfFqdn": "pcf.example.com"
+                }),
+            )
+            .await
+            .expect("POST no suppFeat");
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(
+            body.get("suppFeat").is_none(),
+            "absent consumer suppFeat → omitted (intersection = 0)"
+        );
+
+        server.stop().await.expect("server stops");
+    }
+
+    // bsfd-07: SamePcf duplicate detection → 403 EXISTING_BINDING_INFO_FOUND
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_same_pcf_duplicate_detection() {
+        let (server, client) = start_bsf().await;
+
+        // Create binding A (dnn + snssai + supi).
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "dnn": "internet",
+                    "snssai": {"sst": 1},
+                    "ipv4Addr": "10.45.7.1",
+                    "supi": "imsi-001019900700001",
+                    "pcfFqdn": "pcf-a.example.com",
+                    "suppFeat": "2"
+                }),
+            )
+            .await
+            .expect("POST binding A");
+        assert_eq!(resp.status, 201);
+
+        // POST B: same dnn+snssai+supi + paraCom + SamePcf negotiated → 403.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "dnn": "internet",
+                    "snssai": {"sst": 1},
+                    "ipv4Addr": "10.45.7.2",
+                    "supi": "imsi-001019900700001",
+                    "pcfFqdn": "pcf-b.example.com",
+                    "suppFeat": "2",
+                    "paraCom": {}
+                }),
+            )
+            .await
+            .expect("POST binding B duplicate");
+        assert_eq!(resp.status, 403);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["cause"], "EXISTING_BINDING_INFO_FOUND");
+        assert_eq!(
+            body["pcfSmFqdn"], "pcf-a.example.com",
+            "existing PCF address echoed"
+        );
+
+        // Without SamePcf feature negotiated (suppFeat absent → 0): no 403.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "dnn": "internet",
+                    "snssai": {"sst": 1},
+                    "ipv4Addr": "10.45.7.2",
+                    "supi": "imsi-001019900700001",
+                    "pcfFqdn": "pcf-b.example.com",
+                    "paraCom": {}
+                }),
+            )
+            .await
+            .expect("POST without SamePcf");
+        assert_ne!(resp.status, 403, "SamePcf not negotiated → no duplicate 403");
+
+        server.stop().await.expect("server stops");
+    }
+
+    // bsfd-08: pcfId/pcfSetId/bindLevel/recoveryTime/pcfDiamHost/pcfDiamRealm stored + echoed
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_pcf_identity_fields_stored_and_echoed() {
+        let (server, client) = start_bsf().await;
+
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings",
+                &json!({
+                    "dnn": "internet",
+                    "snssai": {"sst": 1},
+                    "ipv4Addr": "10.45.8.1",
+                    "pcfFqdn": "pcf.example.com",
+                    "pcfId": "pcf-uuid-abcd",
+                    "pcfSetId": "pcfSet-01",
+                    "bindLevel": "NF_INSTANCE",
+                    "recoveryTime": "2026-06-01T00:00:00Z"
+                }),
+            )
+            .await
+            .expect("POST with identity fields");
+        assert_eq!(resp.status, 201);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        let id = body["pcfBindingId"].as_str().unwrap().to_string();
+        assert_eq!(body["pcfId"], "pcf-uuid-abcd");
+        assert_eq!(body["pcfSetId"], "pcfSet-01");
+        assert_eq!(body["bindLevel"], "NF_INSTANCE");
+        assert_eq!(body["recoveryTime"], "2026-06-01T00:00:00Z");
+
+        // GET by id echoes them too.
+        let resp = client
+            .get(&format!("/nbsf-management/v1/pcfBindings/{id}"))
+            .await
+            .expect("GET identity");
+        assert_eq!(resp.status, 200);
+        let got: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(got["pcfId"], "pcf-uuid-abcd");
+        assert_eq!(got["bindLevel"], "NF_INSTANCE");
+
+        // PATCH clears pcfId (null remove).
+        let mut req =
+            SbiRequest::patch(format!("/nbsf-management/v1/pcfBindings/{id}"));
+        req.http
+            .set_content(json!({"pcfId": null}).to_string());
+        req.http
+            .set_header("Content-Type", "application/merge-patch+json");
+        let resp = client.send_request(req).await.expect("PATCH pcfId null");
+        assert_eq!(resp.status, 200);
+        let patched: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(patched.get("pcfId").is_none(), "pcfId cleared by null patch");
+
+        server.stop().await.expect("server stops");
+    }
+
+    // bsfd-11: pcf-ue-bindings full CRUD lifecycle
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_pcf_ue_bindings_lifecycle() {
+        let (server, client) = start_bsf().await;
+
+        // POST without supi|gpsi → 400.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-ue-bindings",
+                &json!({"pcfFqdn": "pcf.example.com"}),
+            )
+            .await
+            .expect("POST ue no identity");
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem(&resp)["cause"], "MANDATORY_IE_MISSING");
+
+        // POST without PCF address → 400.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-ue-bindings",
+                &json!({"supi": "imsi-001019900111001"}),
+            )
+            .await
+            .expect("POST ue no pcf addr");
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem(&resp)["cause"], "MANDATORY_IE_MISSING");
+
+        // Valid POST → 201 + Location.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-ue-bindings",
+                &json!({
+                    "supi": "imsi-001019900111001",
+                    "pcfFqdn": "pcf.ue.example.com",
+                    "suppFeat": "1"
+                }),
+            )
+            .await
+            .expect("POST ue binding");
+        assert_eq!(resp.status, 201);
+        let location = resp.http.get_header("Location").expect("Location").clone();
+        let ue_id = location.rsplit('/').next().unwrap().to_string();
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["supi"], "imsi-001019900111001");
+        assert_eq!(body["pcfFqdn"], "pcf.ue.example.com");
+        assert_eq!(body["suppFeat"], "1");
+
+        // GET by id → 200.
+        let resp = client
+            .get(&format!("/nbsf-management/v1/pcf-ue-bindings/{ue_id}"))
+            .await
+            .expect("GET ue binding");
+        assert_eq!(resp.status, 200);
+
+        // Discovery by supi → 200 with array.
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcf-ue-bindings");
+        req.http.set_param("supi", "imsi-001019900111001");
+        let resp = client
+            .send_request(req)
+            .await
+            .expect("discover ue supi");
+        assert_eq!(resp.status, 200);
+        let arr: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(arr.as_array().is_some_and(|a| a.len() == 1));
+
+        // Discovery without supi|gpsi → 400.
+        let req = SbiRequest::get("/nbsf-management/v1/pcf-ue-bindings");
+        let resp = client.send_request(req).await.expect("discover ue no filter");
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem(&resp)["cause"], "MANDATORY_QUERY_PARAM_MISSING");
+
+        // PATCH pcfFqdn → 200.
+        let mut req =
+            SbiRequest::patch(format!("/nbsf-management/v1/pcf-ue-bindings/{ue_id}"));
+        req.http
+            .set_content(json!({"pcfFqdn": "pcf.ue2.example.com"}).to_string());
+        req.http
+            .set_header("Content-Type", "application/merge-patch+json");
+        let resp = client.send_request(req).await.expect("PATCH ue");
+        assert_eq!(resp.status, 200);
+        let patched: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(patched["pcfFqdn"], "pcf.ue2.example.com");
+
+        // DELETE → 204; GET → 404 afterwards.
+        let resp = client
+            .delete(&format!("/nbsf-management/v1/pcf-ue-bindings/{ue_id}"))
+            .await
+            .expect("DELETE ue");
+        assert_eq!(resp.status, 204);
+        let resp = client
+            .get(&format!("/nbsf-management/v1/pcf-ue-bindings/{ue_id}"))
+            .await
+            .expect("GET deleted ue");
+        assert_eq!(resp.status, 404);
+
+        // Discovery after delete → 204 (empty).
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcf-ue-bindings");
+        req.http.set_param("supi", "imsi-001019900111001");
+        let resp = client.send_request(req).await.expect("discover ue after delete");
+        assert_eq!(resp.status, 204);
+
+        server.stop().await.expect("server stops");
+    }
+
+    // bsfd-12: pcf-mbs-bindings lifecycle + duplicate 403 + multi-match 400
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_pcf_mbs_bindings_lifecycle() {
+        let (server, client) = start_bsf().await;
+
+        // POST without mbsSessionId → 400.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-mbs-bindings",
+                &json!({"pcfFqdn": "pcf.example.com"}),
+            )
+            .await
+            .expect("POST mbs no mbsSessionId");
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem(&resp)["cause"], "MANDATORY_IE_MISSING");
+
+        // POST without PCF address → 400.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-mbs-bindings",
+                &json!({"mbsSessionId": "TMGI-001"}),
+            )
+            .await
+            .expect("POST mbs no pcf");
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem(&resp)["cause"], "MANDATORY_IE_MISSING");
+
+        // Valid POST → 201.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-mbs-bindings",
+                &json!({
+                    "mbsSessionId": "TMGI-001",
+                    "pcfFqdn": "pcf.mbs.example.com"
+                }),
+            )
+            .await
+            .expect("POST mbs binding");
+        assert_eq!(resp.status, 201);
+        let loc = resp.http.get_header("Location").expect("Location").clone();
+        let mbs_id = loc.rsplit('/').next().unwrap().to_string();
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["mbsSessionId"], "TMGI-001");
+
+        // Duplicate mbsSessionId → 403 EXISTING_BINDING_INFO_FOUND.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcf-mbs-bindings",
+                &json!({
+                    "mbsSessionId": "TMGI-001",
+                    "pcfFqdn": "pcf.mbs2.example.com"
+                }),
+            )
+            .await
+            .expect("POST mbs duplicate");
+        assert_eq!(resp.status, 403);
+        let body: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(body["cause"], "EXISTING_BINDING_INFO_FOUND");
+
+        // Discovery by mbsSessionId → 200 single result.
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcf-mbs-bindings");
+        req.http.set_param("mbsSessionId", "TMGI-001");
+        let resp = client.send_request(req).await.expect("discover mbs");
+        assert_eq!(resp.status, 200);
+
+        // Discovery without mbsSessionId → 400.
+        let req = SbiRequest::get("/nbsf-management/v1/pcf-mbs-bindings");
+        let resp = client
+            .send_request(req)
+            .await
+            .expect("discover mbs no filter");
+        assert_eq!(resp.status, 400);
+        assert_eq!(problem(&resp)["cause"], "MANDATORY_QUERY_PARAM_MISSING");
+
+        // Unknown mbsSessionId → 204.
+        let mut req = SbiRequest::get("/nbsf-management/v1/pcf-mbs-bindings");
+        req.http.set_param("mbsSessionId", "TMGI-999");
+        let resp = client.send_request(req).await.expect("discover mbs miss");
+        assert_eq!(resp.status, 204);
+
+        // PATCH → 200.
+        let mut req =
+            SbiRequest::patch(format!("/nbsf-management/v1/pcf-mbs-bindings/{mbs_id}"));
+        req.http
+            .set_content(json!({"pcfFqdn": "pcf.mbs-patched.example.com"}).to_string());
+        req.http
+            .set_header("Content-Type", "application/merge-patch+json");
+        let resp = client.send_request(req).await.expect("PATCH mbs");
+        assert_eq!(resp.status, 200);
+        let patched: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(patched["pcfFqdn"], "pcf.mbs-patched.example.com");
+
+        // DELETE → 204; GET → 404.
+        let resp = client
+            .delete(&format!("/nbsf-management/v1/pcf-mbs-bindings/{mbs_id}"))
+            .await
+            .expect("DELETE mbs");
+        assert_eq!(resp.status, 204);
+        let resp = client
+            .get(&format!("/nbsf-management/v1/pcf-mbs-bindings/{mbs_id}"))
+            .await
+            .expect("GET deleted mbs");
+        assert_eq!(resp.status, 404);
+
+        server.stop().await.expect("server stops");
+    }
+
+    // bsfd-13: Subscribe/Unsubscribe stub returns 501 Not Implemented.
+    // GAP: Notify callback fanout is not implemented; the BSF does not advertise
+    // Subscribe feature bits in BSF_SUPPORTED_FEATURES. This stub documents the
+    // gap for future implementation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_http_subscription_stub_not_implemented() {
+        let (server, client) = start_bsf().await;
+
+        // POST to the subscriptions sub-resource → 501.
+        let resp = client
+            .post_json(
+                "/nbsf-management/v1/pcfBindings/1/subscriptions",
+                &json!({
+                    "notifUri": "http://smf.example.com/notify",
+                    "monResUri": "http://bsf/pcfBindings/1"
+                }),
+            )
+            .await
+            .expect("POST subscription");
+        assert_eq!(
+            resp.status, 501,
+            "bsfd-13: Subscribe is a stub (not implemented)"
+        );
 
         server.stop().await.expect("server stops");
     }

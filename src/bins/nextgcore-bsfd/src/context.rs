@@ -51,6 +51,38 @@ pub struct PcfIpEndpoint {
     pub port: u16,
 }
 
+/// PCF for UE binding (TS 29.521 §4.2.2.3, pcf-ue-bindings resource).
+/// Keyed by `binding_id`; discoverable by supi or gpsi.
+#[derive(Debug, Clone)]
+pub struct PcfUeBinding {
+    pub binding_id: String,
+    pub supi: Option<String>,
+    pub gpsi: Option<String>,
+    pub pcf_fqdn: Option<String>,
+    pub pcf_ip: Vec<PcfIpEndpoint>,
+    pub pcf_id: Option<String>,
+    pub pcf_set_id: Option<String>,
+    pub bind_level: Option<String>,
+    pub recovery_time: Option<String>,
+    pub pcf_diam_host: Option<String>,
+    pub pcf_diam_realm: Option<String>,
+    pub management_features: u64,
+}
+
+/// PCF for MBS binding (TS 29.521 §4.2.2.4, pcf-mbs-bindings resource).
+/// Keyed by `binding_id`; discoverable by `mbs_session_id`.
+#[derive(Debug, Clone)]
+pub struct PcfMbsBinding {
+    pub binding_id: String,
+    /// Opaque MBS Session ID (TMGI or SSM form per TS 29.571).
+    pub mbs_session_id: String,
+    pub pcf_fqdn: Option<String>,
+    pub pcf_ip: Vec<PcfIpEndpoint>,
+    pub pcf_id: Option<String>,
+    pub pcf_set_id: Option<String>,
+    pub management_features: u64,
+}
+
 /// IPv6 prefix structure
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Ipv6Prefix {
@@ -344,6 +376,18 @@ pub struct BsfSess {
     pub pcf_fqdn: Option<String>,
     /// PCF IP endpoints
     pub pcf_ip: Vec<PcfIpEndpoint>,
+    /// PCF instance ID (TS 29.512 NF instance ID, bsfd-08)
+    pub pcf_id: Option<String>,
+    /// PCF set ID (bsfd-08)
+    pub pcf_set_id: Option<String>,
+    /// PCF binding level: NF_SET or NF_INSTANCE (bsfd-08)
+    pub bind_level: Option<String>,
+    /// PCF recovery time as RFC 3339 DateTime (TS 23.527, bsfd-08)
+    pub recovery_time: Option<String>,
+    /// PCF Diameter host for Rx interface (bsfd-08)
+    pub pcf_diam_host: Option<String>,
+    /// PCF Diameter realm for Rx interface (bsfd-08)
+    pub pcf_diam_realm: Option<String>,
 
     /// SBI management features
     pub management_features: u64,
@@ -373,6 +417,12 @@ impl BsfSess {
             dnn: None,
             pcf_fqdn: None,
             pcf_ip: Vec::new(),
+            pcf_id: None,
+            pcf_set_id: None,
+            bind_level: None,
+            recovery_time: None,
+            pcf_diam_host: None,
+            pcf_diam_realm: None,
             management_features: SBI_NBSF_MANAGEMENT_BINDING_UPDATE,
         }
     }
@@ -553,6 +603,10 @@ pub struct BsfContext {
     max_num_of_sess: usize,
     /// Context initialized flag
     initialized: AtomicBool,
+    /// UE policy bindings (pcf-ue-bindings, keyed by binding_id, bsfd-11)
+    ue_binding_list: RwLock<HashMap<String, PcfUeBinding>>,
+    /// MBS bindings (pcf-mbs-bindings, keyed by binding_id, bsfd-12)
+    mbs_binding_list: RwLock<HashMap<String, PcfMbsBinding>>,
 }
 
 impl BsfContext {
@@ -565,6 +619,8 @@ impl BsfContext {
             next_sess_id: AtomicUsize::new(1),
             max_num_of_sess: 0,
             initialized: AtomicBool::new(false),
+            ue_binding_list: RwLock::new(HashMap::new()),
+            mbs_binding_list: RwLock::new(HashMap::new()),
         }
     }
 
@@ -707,6 +763,12 @@ impl BsfContext {
             ipv4_hash.clear();
             ipv6_hash.clear();
             mac_hash.clear();
+        }
+        if let Ok(mut list) = self.ue_binding_list.write() {
+            list.clear();
+        }
+        if let Ok(mut list) = self.mbs_binding_list.write() {
+            list.clear();
         }
     }
 
@@ -949,6 +1011,128 @@ impl BsfContext {
     pub fn sess_count(&self) -> usize {
         self.sess_list.read().map(|l| l.len()).unwrap_or(0)
     }
+
+    // ------------------------------------------------------------------
+    // bsfd-07: duplicate detection for SamePcf feature
+    // ------------------------------------------------------------------
+
+    /// Find a PDU-session binding with matching dnn + snssai + supi (used by
+    /// the SamePcf duplicate-detection check in `handle_pcf_binding_create`).
+    pub fn sess_find_by_dnn_snssai_supi(
+        &self,
+        dnn: &str,
+        snssai: &SNssai,
+        supi: &str,
+    ) -> Option<BsfSess> {
+        let sess_list = self.sess_list.read().ok()?;
+        for sess in sess_list.values() {
+            if sess
+                .dnn
+                .as_deref()
+                .is_some_and(|d| d.eq_ignore_ascii_case(dnn))
+                && sess.s_nssai.sst == snssai.sst
+                && sess.s_nssai.sd == snssai.sd
+                && sess.supi.as_deref() == Some(supi)
+            {
+                return Some(sess.clone());
+            }
+        }
+        None
+    }
+
+    // ------------------------------------------------------------------
+    // bsfd-11: pcf-ue-bindings CRUD
+    // ------------------------------------------------------------------
+
+    pub fn ue_binding_add(&self, binding: PcfUeBinding) {
+        if let Ok(mut list) = self.ue_binding_list.write() {
+            list.insert(binding.binding_id.clone(), binding);
+        }
+    }
+
+    pub fn ue_binding_find_by_id(&self, id: &str) -> Option<PcfUeBinding> {
+        let list = self.ue_binding_list.read().ok()?;
+        list.get(id).cloned()
+    }
+
+    /// Return all UE bindings whose supi/gpsi match the provided filters
+    /// (None means "no filter on this field").
+    pub fn ue_binding_find_matching(
+        &self,
+        supi: Option<&str>,
+        gpsi: Option<&str>,
+    ) -> Vec<PcfUeBinding> {
+        match self.ue_binding_list.read() {
+            Ok(list) => list
+                .values()
+                .filter(|b| {
+                    supi.is_none_or(|s| b.supi.as_deref() == Some(s))
+                        && gpsi.is_none_or(|g| b.gpsi.as_deref() == Some(g))
+                })
+                .cloned()
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub fn ue_binding_remove(&self, id: &str) -> Option<PcfUeBinding> {
+        self.ue_binding_list.write().ok()?.remove(id)
+    }
+
+    pub fn ue_binding_update(&self, binding: &PcfUeBinding) -> bool {
+        if let Ok(mut list) = self.ue_binding_list.write() {
+            if let Some(existing) = list.get_mut(&binding.binding_id) {
+                *existing = binding.clone();
+                return true;
+            }
+        }
+        false
+    }
+
+    // ------------------------------------------------------------------
+    // bsfd-12: pcf-mbs-bindings CRUD
+    // ------------------------------------------------------------------
+
+    pub fn mbs_binding_add(&self, binding: PcfMbsBinding) {
+        if let Ok(mut list) = self.mbs_binding_list.write() {
+            list.insert(binding.binding_id.clone(), binding);
+        }
+    }
+
+    pub fn mbs_binding_find_by_id(&self, id: &str) -> Option<PcfMbsBinding> {
+        let list = self.mbs_binding_list.read().ok()?;
+        list.get(id).cloned()
+    }
+
+    /// Return all MBS bindings keyed by the given mbs_session_id.
+    /// TS 29.521 §4.2.2.4: a duplicate is 403; multi-match is 400.
+    pub fn mbs_binding_find_by_mbs_session_id(
+        &self,
+        mbs_session_id: &str,
+    ) -> Vec<PcfMbsBinding> {
+        match self.mbs_binding_list.read() {
+            Ok(list) => list
+                .values()
+                .filter(|b| b.mbs_session_id == mbs_session_id)
+                .cloned()
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    pub fn mbs_binding_remove(&self, id: &str) -> Option<PcfMbsBinding> {
+        self.mbs_binding_list.write().ok()?.remove(id)
+    }
+
+    pub fn mbs_binding_update(&self, binding: &PcfMbsBinding) -> bool {
+        if let Ok(mut list) = self.mbs_binding_list.write() {
+            if let Some(existing) = list.get_mut(&binding.binding_id) {
+                *existing = binding.clone();
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl BsfContext {
@@ -1044,6 +1228,24 @@ pub fn sess_to_doc(sess: &BsfSess) -> ogs_dbi::mongodb::bson::Document {
     if let Some(ref pcf_fqdn) = sess.pcf_fqdn {
         d.insert("pcf_fqdn", pcf_fqdn);
     }
+    if let Some(ref v) = sess.pcf_id {
+        d.insert("pcf_id", v);
+    }
+    if let Some(ref v) = sess.pcf_set_id {
+        d.insert("pcf_set_id", v);
+    }
+    if let Some(ref v) = sess.bind_level {
+        d.insert("bind_level", v);
+    }
+    if let Some(ref v) = sess.recovery_time {
+        d.insert("recovery_time", v);
+    }
+    if let Some(ref v) = sess.pcf_diam_host {
+        d.insert("pcf_diam_host", v);
+    }
+    if let Some(ref v) = sess.pcf_diam_realm {
+        d.insert("pcf_diam_realm", v);
+    }
     if !sess.pcf_ip.is_empty() {
         let endpoints: Vec<Bson> = sess
             .pcf_ip
@@ -1107,6 +1309,24 @@ pub fn doc_to_sess(doc: &ogs_dbi::mongodb::bson::Document) -> BsfSess {
     }
     if let Ok(pcf_fqdn) = doc.get_str("pcf_fqdn") {
         sess.pcf_fqdn = Some(pcf_fqdn.to_string());
+    }
+    if let Ok(v) = doc.get_str("pcf_id") {
+        sess.pcf_id = Some(v.to_string());
+    }
+    if let Ok(v) = doc.get_str("pcf_set_id") {
+        sess.pcf_set_id = Some(v.to_string());
+    }
+    if let Ok(v) = doc.get_str("bind_level") {
+        sess.bind_level = Some(v.to_string());
+    }
+    if let Ok(v) = doc.get_str("recovery_time") {
+        sess.recovery_time = Some(v.to_string());
+    }
+    if let Ok(v) = doc.get_str("pcf_diam_host") {
+        sess.pcf_diam_host = Some(v.to_string());
+    }
+    if let Ok(v) = doc.get_str("pcf_diam_realm") {
+        sess.pcf_diam_realm = Some(v.to_string());
     }
     if let Ok(endpoints) = doc.get_array("pcfIpEndPoints") {
         sess.pcf_ip = endpoints
@@ -1744,6 +1964,13 @@ mod tests {
                 port: 0,
             },
         ];
+        // bsfd-08: new optional PCF identity fields
+        sess.pcf_id = Some("pcf-uuid-1234".to_string());
+        sess.pcf_set_id = Some("pcfSet-01".to_string());
+        sess.bind_level = Some("NF_INSTANCE".to_string());
+        sess.recovery_time = Some("2026-06-01T00:00:00Z".to_string());
+        sess.pcf_diam_host = Some("pcf.diam.example.com".to_string());
+        sess.pcf_diam_realm = Some("example.com".to_string());
 
         let doc = sess_to_doc(&sess);
         let restored = doc_to_sess(&doc);
@@ -1766,6 +1993,153 @@ mod tests {
         assert_eq!(restored.pcf_ip[0].port, 7777);
         assert_eq!(restored.pcf_ip[1].addr6.as_deref(), Some("2001:db8::10"));
         assert!(!restored.pcf_ip[1].is_port);
+        // bsfd-08: new fields round-trip through Mongo doc
+        assert_eq!(restored.pcf_id.as_deref(), Some("pcf-uuid-1234"));
+        assert_eq!(restored.pcf_set_id.as_deref(), Some("pcfSet-01"));
+        assert_eq!(restored.bind_level.as_deref(), Some("NF_INSTANCE"));
+        assert_eq!(restored.recovery_time.as_deref(), Some("2026-06-01T00:00:00Z"));
+        assert_eq!(restored.pcf_diam_host.as_deref(), Some("pcf.diam.example.com"));
+        assert_eq!(restored.pcf_diam_realm.as_deref(), Some("example.com"));
+    }
+
+    // bsfd-07: sess_find_by_dnn_snssai_supi
+    #[test]
+    fn test_sess_find_by_dnn_snssai_supi() {
+        let mut ctx = BsfContext::new();
+        ctx.init(100);
+
+        let sess = ctx.sess_add_binding(Some("10.45.3.1"), None, None).unwrap();
+        let mut sess = sess;
+        sess.dnn = Some("internet".to_string());
+        sess.s_nssai = SNssai::new(1, Some(0x010203));
+        sess.supi = Some("imsi-001010000007001".to_string());
+        ctx.sess_update(&sess);
+
+        // Exact match.
+        assert!(ctx
+            .sess_find_by_dnn_snssai_supi(
+                "internet",
+                &SNssai::new(1, Some(0x010203)),
+                "imsi-001010000007001"
+            )
+            .is_some());
+        // DNN case-insensitive.
+        assert!(ctx
+            .sess_find_by_dnn_snssai_supi(
+                "INTERNET",
+                &SNssai::new(1, Some(0x010203)),
+                "imsi-001010000007001"
+            )
+            .is_some());
+        // Different SUPI: no match.
+        assert!(ctx
+            .sess_find_by_dnn_snssai_supi(
+                "internet",
+                &SNssai::new(1, Some(0x010203)),
+                "imsi-999"
+            )
+            .is_none());
+        // Different DNN: no match.
+        assert!(ctx
+            .sess_find_by_dnn_snssai_supi(
+                "ims",
+                &SNssai::new(1, Some(0x010203)),
+                "imsi-001010000007001"
+            )
+            .is_none());
+    }
+
+    // bsfd-11: pcf-ue-bindings CRUD
+    #[test]
+    fn test_ue_binding_crud() {
+        let mut ctx = BsfContext::new();
+        ctx.init(100);
+
+        let b = PcfUeBinding {
+            binding_id: "ue-1".to_string(),
+            supi: Some("imsi-001010000008001".to_string()),
+            gpsi: None,
+            pcf_fqdn: Some("pcf.example.com".to_string()),
+            pcf_ip: Vec::new(),
+            pcf_id: None,
+            pcf_set_id: None,
+            bind_level: None,
+            recovery_time: None,
+            pcf_diam_host: None,
+            pcf_diam_realm: None,
+            management_features: 0x1,
+        };
+        ctx.ue_binding_add(b.clone());
+
+        // Find by ID.
+        assert!(ctx.ue_binding_find_by_id("ue-1").is_some());
+        assert!(ctx.ue_binding_find_by_id("ue-2").is_none());
+
+        // Find by supi.
+        let found = ctx.ue_binding_find_matching(Some("imsi-001010000008001"), None);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].pcf_fqdn.as_deref(), Some("pcf.example.com"));
+
+        // No match on supi filter.
+        assert!(ctx.ue_binding_find_matching(Some("imsi-000"), None).is_empty());
+
+        // Update.
+        let mut updated = b.clone();
+        updated.pcf_fqdn = Some("pcf2.example.com".to_string());
+        assert!(ctx.ue_binding_update(&updated));
+        assert_eq!(
+            ctx.ue_binding_find_by_id("ue-1").unwrap().pcf_fqdn.as_deref(),
+            Some("pcf2.example.com")
+        );
+
+        // Remove.
+        assert!(ctx.ue_binding_remove("ue-1").is_some());
+        assert!(ctx.ue_binding_find_by_id("ue-1").is_none());
+    }
+
+    // bsfd-12: pcf-mbs-bindings CRUD + duplicate detection
+    #[test]
+    fn test_mbs_binding_crud() {
+        let mut ctx = BsfContext::new();
+        ctx.init(100);
+
+        let b1 = PcfMbsBinding {
+            binding_id: "mbs-1".to_string(),
+            mbs_session_id: "TMGI-ABC".to_string(),
+            pcf_fqdn: Some("pcf.example.com".to_string()),
+            pcf_ip: Vec::new(),
+            pcf_id: None,
+            pcf_set_id: None,
+            management_features: 0x1,
+        };
+        ctx.mbs_binding_add(b1.clone());
+
+        // Find by id.
+        assert!(ctx.mbs_binding_find_by_id("mbs-1").is_some());
+
+        // Find by mbs_session_id (single match).
+        let found = ctx.mbs_binding_find_by_mbs_session_id("TMGI-ABC");
+        assert_eq!(found.len(), 1);
+
+        // Duplicate mbs_session_id: two bindings → caller detects multi-match.
+        let b2 = PcfMbsBinding {
+            binding_id: "mbs-2".to_string(),
+            mbs_session_id: "TMGI-ABC".to_string(),
+            pcf_fqdn: Some("pcf2.example.com".to_string()),
+            pcf_ip: Vec::new(),
+            pcf_id: None,
+            pcf_set_id: None,
+            management_features: 0x1,
+        };
+        ctx.mbs_binding_add(b2);
+        assert_eq!(ctx.mbs_binding_find_by_mbs_session_id("TMGI-ABC").len(), 2);
+
+        // Remove one; only one left.
+        ctx.mbs_binding_remove("mbs-1");
+        assert_eq!(ctx.mbs_binding_find_by_mbs_session_id("TMGI-ABC").len(), 1);
+
+        // Different mbs_session_id: no match.
+        assert!(ctx.mbs_binding_find_by_mbs_session_id("TMGI-XYZ").is_empty());
     }
 
     #[test]
