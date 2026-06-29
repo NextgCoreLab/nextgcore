@@ -96,6 +96,20 @@ fn attach_oauth2(client: SbiClient, target: NfType) -> SbiClient {
 const NOTIFY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const NOTIFY_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// TS 29.536 §6.1.8 SupportedFeatures advertised by this NSACF, in the
+/// 3GPP hex-string form (TS 29.571 §5.2.2). This NSACF implements none of the
+/// optional features — in particular HNSAC/VHNSAC home/visited delegation is
+/// NOT supported — so the negotiation string is `"0"` (every optional bit
+/// clear). Consumers therefore know never to expect `ueAdmissionList` (nsacf-11).
+const SUPPORTED_FEATURES: &str = "0";
+
+/// TS 29.536 §6.1.8 feature bit 1 = HNSAC (Home Network Slice Admission Control).
+#[cfg(test)]
+const FEAT_HNSAC_BIT: u32 = 0x01;
+/// TS 29.536 §6.1.8 feature bit 2 = VHNSAC (Visited HNSAC delegation).
+#[cfg(test)]
+const FEAT_VHNSAC_BIT: u32 = 0x02;
+
 /// NextGCore NSACF - Network Slice Admission Control Function
 #[derive(Parser, Debug)]
 #[command(name = "nextgcore-nsacfd")]
@@ -380,7 +394,24 @@ async fn nsacf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
         },
 
         // ------------------------------------------------------------------
-        // Quota provisioning (operator/admin API)
+        // Custom operations (TS 29.536 Table 6.1.3.1-1):
+        //  - local-configs `update` (§6.1.3.4): update local NSAC configs.
+        //  - roaming-quotas `query` (§6.1.3.5): query roaming quotas at the
+        //    central/primary HPLMN NSACF.
+        // ------------------------------------------------------------------
+        ["nnsacf-nsac", "v1", "slices", "local-configs", "update"] => match method {
+            "POST" => handle_local_configs_update(&request).await,
+            _ => send_method_not_allowed(method, "slices/local-configs/update"),
+        },
+        ["nnsacf-nsac", "v1", "slices", "roaming-quotas", "query"] => match method {
+            "POST" => handle_roaming_quotas_query(&request).await,
+            _ => send_method_not_allowed(method, "slices/roaming-quotas/query"),
+        },
+
+        // ------------------------------------------------------------------
+        // NextGCore admin-only extension (NOT a TS 29.536 resource): direct
+        // slice-quota provisioning. The spec way to provision local NSAC config
+        // is the `slices/local-configs/update` custom op above.
         // ------------------------------------------------------------------
         ["nnsacf-nsac", "v1", "slice-quotas"] => match method {
             "POST" => handle_slice_quota_create(&request).await,
@@ -393,7 +424,7 @@ async fn nsacf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
             _ => send_method_not_allowed(method, "slice-quotas/{id}"),
         },
 
-        // Utilization reporting
+        // Utilization reporting (NextGCore admin-only extension, NOT TS 29.536).
         ["nnsacf-nsac", "v1", "utilization"] => match method {
             "GET" => handle_utilization_report().await,
             _ => send_method_not_allowed(method, "utilization"),
@@ -457,16 +488,17 @@ struct AcuOperationItem {
 #[serde(rename_all = "camelCase")]
 struct UeACRequestInfo {
     supi: String,
-    /// TS 29.571 AccessType; per-access-type counting is nsacf-05 (deferred),
-    /// so it is parsed/logged only.
+    /// TS 29.571 AccessType (mandatory in the spec). Kept optional here so an
+    /// not-yet-aligned sender is accepted; absent defaults to 3GPP access via
+    /// [`AccessType::from_an_type`] (nsacf-05 accept-and-default).
     #[serde(default)]
     an_type: Option<String>,
     acu_operation_list: Vec<AcuOperationItem>,
 }
 
-/// UeACRequestData (TS 29.536 §6.1.6.2.2). `nfId` (mandatory in the spec) is
-/// accepted leniently — strict enforcement is nsacf-09 (deferred) — so serde
-/// ignores it here.
+/// UeACRequestData (TS 29.536 §6.1.6.2.2). `nfId` is mandatory (nsacf-09): a
+/// non-`Option` field, so serde rejects its absence and the parser maps that to
+/// 400 `MANDATORY_IE_MISSING`.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UeACRequestData {
@@ -475,6 +507,8 @@ struct UeACRequestData {
     // explicitly so a conformant AMF body deserializes.
     #[serde(rename = "ueACRequestInfo")]
     ue_ac_request_info: Vec<UeACRequestInfo>,
+    /// NF instance id of the requesting consumer (M, TS 29.536 §6.1.6.2.2).
+    nf_id: String,
 }
 
 /// PduACRequestInfo (TS 29.536 §6.1.6.2.10): SUPI + pduSessionId + ops.
@@ -488,7 +522,7 @@ struct PduACRequestInfo {
     acu_operation_list: Vec<AcuOperationItem>,
 }
 
-/// PduACRequestData (TS 29.536 §6.1.6.2.7).
+/// PduACRequestData (TS 29.536 §6.1.6.2.7). `nfId` mandatory (nsacf-09).
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PduACRequestData {
@@ -496,15 +530,22 @@ struct PduACRequestData {
     // `pduACRequestInfo`, not serde's default `pduAcRequestInfo`.
     #[serde(rename = "pduACRequestInfo")]
     pdu_ac_request_info: Vec<PduACRequestInfo>,
+    /// NF instance id of the requesting consumer (M, TS 29.536 §6.1.6.2.7).
+    nf_id: String,
 }
 
-/// AcuFailureReason (TS 29.536 §6.1.6.3.5). The `_3GPP`/`_N3GPP` per-access
-/// variants are nsacf-05 (deferred); this chunk emits the aggregate strings.
+/// AcuFailureReason (TS 29.536 §6.1.6.3.5). The aggregate strings plus the
+/// per-access-type `_3GPP`/`_N3GPP` variants selected when a per-access ceiling
+/// is configured (nsacf-05).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AcuFailureReason {
     SliceNotFound,
     ExceedMaxUeNum,
+    ExceedMaxUeNum3Gpp,
+    ExceedMaxUeNumN3Gpp,
     ExceedMaxPduNum,
+    ExceedMaxPduNum3Gpp,
+    ExceedMaxPduNumN3Gpp,
 }
 
 impl AcuFailureReason {
@@ -512,7 +553,11 @@ impl AcuFailureReason {
         match self {
             AcuFailureReason::SliceNotFound => "SLICE_NOT_FOUND",
             AcuFailureReason::ExceedMaxUeNum => "EXCEED_MAX_UE_NUM",
+            AcuFailureReason::ExceedMaxUeNum3Gpp => "EXCEED_MAX_UE_NUM_3GPP",
+            AcuFailureReason::ExceedMaxUeNumN3Gpp => "EXCEED_MAX_UE_NUM_N3GPP",
             AcuFailureReason::ExceedMaxPduNum => "EXCEED_MAX_PDU_NUM",
+            AcuFailureReason::ExceedMaxPduNum3Gpp => "EXCEED_MAX_PDU_NUM_3GPP",
+            AcuFailureReason::ExceedMaxPduNumN3Gpp => "EXCEED_MAX_PDU_NUM_N3GPP",
         }
     }
 }
@@ -541,11 +586,18 @@ impl AcFailure {
 }
 
 /// Map an internal [`AdmissionResult`] rejection to its spec failure reason
-/// (TS 29.536 §6.1.6.3.5). `is_pdu` selects EXCEED_MAX_PDU_NUM vs _UE_NUM.
+/// (TS 29.536 §6.1.6.3.5). `is_pdu` selects EXCEED_MAX_PDU_NUM vs _UE_NUM; a
+/// per-access ceiling breach selects the `_3GPP`/`_N3GPP` variant (nsacf-05).
 fn rejection_reason(result: AdmissionResult, is_pdu: bool) -> AcuFailureReason {
-    match result {
-        AdmissionResult::RejectedQuotaExceeded if is_pdu => AcuFailureReason::ExceedMaxPduNum,
-        AdmissionResult::RejectedQuotaExceeded => AcuFailureReason::ExceedMaxUeNum,
+    use AccessType::{NonThreeGpp, ThreeGpp};
+    use AdmissionResult::{RejectedQuotaExceeded, RejectedQuotaExceededPerAccess};
+    match (result, is_pdu) {
+        (RejectedQuotaExceeded, true) => AcuFailureReason::ExceedMaxPduNum,
+        (RejectedQuotaExceeded, false) => AcuFailureReason::ExceedMaxUeNum,
+        (RejectedQuotaExceededPerAccess(ThreeGpp), true) => AcuFailureReason::ExceedMaxPduNum3Gpp,
+        (RejectedQuotaExceededPerAccess(NonThreeGpp), true) => AcuFailureReason::ExceedMaxPduNumN3Gpp,
+        (RejectedQuotaExceededPerAccess(ThreeGpp), false) => AcuFailureReason::ExceedMaxUeNum3Gpp,
+        (RejectedQuotaExceededPerAccess(NonThreeGpp), false) => AcuFailureReason::ExceedMaxUeNumN3Gpp,
         // Slice not NSAC-subject / unknown.
         _ => AcuFailureReason::SliceNotFound,
     }
@@ -590,23 +642,29 @@ fn build_ac_response(failures: Vec<AcFailure>, total_ops: usize) -> SbiResponse 
             .expect("array")
             .push(f.item);
     }
-    let body = serde_json::json!({ "acuFailureList": acu_failure_list });
+    // UeACResponseData / PduACResponseData (TS 29.536 §6.1.6.2.3/.8). We
+    // advertise `supportedFeatures` (HNSAC/VHNSAC bits clear) and never emit
+    // `ueAdmissionList` (nsacf-11).
+    let body = serde_json::json!({
+        "acuFailureList": acu_failure_list,
+        "supportedFeatures": SUPPORTED_FEATURES,
+    });
     SbiResponse::with_status(200)
         .with_json_body(&body)
         .unwrap_or_else(|_| SbiResponse::with_status(200))
 }
 
-/// Validate every op's `updateFlag` (INCREASE/DECREASE; UPDATE is nsacf-06,
-/// deferred → INVALID_IE_VALUE) before any state mutation.
+/// Validate every op's `updateFlag` (TS 29.536 §6.1.6.3.4 AcuFlag:
+/// INCREASE/DECREASE/UPDATE) before any state mutation.
 #[allow(clippy::result_large_err)] // SbiResponse is the natural error type here
 fn validate_flags<'a>(ops: impl Iterator<Item = &'a AcuOperationItem>) -> Result<(), SbiResponse> {
     for op in ops {
-        if op.update_flag != "INCREASE" && op.update_flag != "DECREASE" {
+        if !matches!(op.update_flag.as_str(), "INCREASE" | "DECREASE" | "UPDATE") {
             return Err(problem_details(
                 400,
                 "Bad Request",
                 &format!(
-                    "Invalid updateFlag '{}' (expected INCREASE or DECREASE)",
+                    "Invalid updateFlag '{}' (expected INCREASE, DECREASE or UPDATE)",
                     op.update_flag
                 ),
                 Some("INVALID_IE_VALUE"),
@@ -670,46 +728,78 @@ async fn handle_ue_ac_update(request: &SbiRequest) -> SbiResponse {
         }
     }
 
+    log::debug!("UE AC request from nfId={}", req.nf_id);
     let mut failures: Vec<AcFailure> = Vec::new();
     let mut total_ops = 0usize;
     for info in &req.ue_ac_request_info {
+        // anType is mandatory in the spec; an absent value defaults to 3GPP
+        // (nsacf-05 accept-and-default).
+        let access = AccessType::from_an_type(info.an_type.as_deref());
         for op in &info.acu_operation_list {
             total_ops += 1;
             let s_nssai = &op.snssai.0;
             log::debug!(
-                "[{}] UE AC {} S-NSSAI[SST:{} SD:{:?}] anType={:?}",
+                "[{}] UE AC {} S-NSSAI[SST:{} SD:{:?}] access={}",
                 info.supi,
                 op.update_flag,
                 s_nssai.sst,
                 s_nssai.sd,
-                info.an_type
+                access.as_str()
             );
-            if op.update_flag == "INCREASE" {
-                let (result, eac) = with_nsacf_context(|c| c.admit_ue(s_nssai, &info.supi))
-                    .unwrap_or((AdmissionResult::RejectedSliceNotAvailable, None));
-                match result {
-                    AdmissionResult::Admitted => {
+            match op.update_flag.as_str() {
+                "INCREASE" => {
+                    let (result, eac) =
+                        with_nsacf_context(|c| c.admit_ue(s_nssai, &info.supi, access))
+                            .unwrap_or((AdmissionResult::RejectedSliceNotAvailable, None));
+                    match result {
+                        AdmissionResult::Admitted => {
+                            if let Some(eac) = eac {
+                                spawn_eac_notifications(eac);
+                            }
+                            spawn_event_reports(s_nssai);
+                        }
+                        rejected => failures.push(AcFailure::new(
+                            &info.supi,
+                            s_nssai,
+                            rejection_reason(rejected, false),
+                            None,
+                        )),
+                    }
+                }
+                "UPDATE" => {
+                    // Move the UE between 3GPP/N3GPP buckets (nsacf-06).
+                    match with_nsacf_context(|c| c.update_ue_access(s_nssai, &info.supi, access))
+                        .unwrap_or(UpdateOutcome::NotFound)
+                    {
+                        UpdateOutcome::Updated => spawn_event_reports(s_nssai),
+                        UpdateOutcome::NotFound => failures.push(AcFailure::new(
+                            &info.supi,
+                            s_nssai,
+                            AcuFailureReason::SliceNotFound,
+                            None,
+                        )),
+                    }
+                }
+                // DECREASE (validate_flags guarantees the only remaining flag).
+                // nsacf-10: clean release / idempotent member-absent → success;
+                // S-NSSAI not NSAC-subject → SLICE_NOT_FOUND failure.
+                _ => match with_nsacf_context(|c| c.release_ue(s_nssai, &info.supi))
+                    .unwrap_or(ReleaseOutcome::SliceNotFound)
+                {
+                    ReleaseOutcome::Released(eac) => {
                         if let Some(eac) = eac {
                             spawn_eac_notifications(eac);
                         }
                         spawn_event_reports(s_nssai);
                     }
-                    rejected => failures.push(AcFailure::new(
+                    ReleaseOutcome::MemberAbsent => { /* idempotent: counts as admitted */ }
+                    ReleaseOutcome::SliceNotFound => failures.push(AcFailure::new(
                         &info.supi,
                         s_nssai,
-                        rejection_reason(rejected, false),
+                        AcuFailureReason::SliceNotFound,
                         None,
                     )),
-                }
-            } else {
-                // DECREASE: idempotent release (nsacf-10 membership distinction
-                // is deferred; a release is always acknowledged → counts toward
-                // an admitted op).
-                let eac = with_nsacf_context(|c| c.release_ue(s_nssai, &info.supi)).flatten();
-                if let Some(eac) = eac {
-                    spawn_eac_notifications(eac);
-                }
-                spawn_event_reports(s_nssai);
+                },
             }
         }
     }
@@ -744,37 +834,68 @@ async fn handle_pdu_ac_update(request: &SbiRequest) -> SbiResponse {
         }
     }
 
+    log::debug!("PDU AC request from nfId={}", req.nf_id);
     let mut failures: Vec<AcFailure> = Vec::new();
     let mut total_ops = 0usize;
     for info in &req.pdu_ac_request_info {
         let session_key = format!("{}:{}", info.supi, info.pdu_session_id);
+        let access = AccessType::from_an_type(info.an_type.as_deref());
         for op in &info.acu_operation_list {
             total_ops += 1;
             let s_nssai = &op.snssai.0;
             log::debug!(
-                "[{}] PDU AC {} psi={} S-NSSAI[SST:{} SD:{:?}] anType={:?}",
+                "[{}] PDU AC {} psi={} S-NSSAI[SST:{} SD:{:?}] access={}",
                 info.supi,
                 op.update_flag,
                 info.pdu_session_id,
                 s_nssai.sst,
                 s_nssai.sd,
-                info.an_type
+                access.as_str()
             );
-            if op.update_flag == "INCREASE" {
-                let result = with_nsacf_context(|c| c.admit_pdu_session(s_nssai, &session_key))
-                    .unwrap_or(AdmissionResult::RejectedSliceNotAvailable);
-                match result {
-                    AdmissionResult::Admitted => spawn_event_reports(s_nssai),
-                    rejected => failures.push(AcFailure::new(
+            match op.update_flag.as_str() {
+                "INCREASE" => {
+                    let result =
+                        with_nsacf_context(|c| c.admit_pdu_session(s_nssai, &session_key, access))
+                            .unwrap_or(AdmissionResult::RejectedSliceNotAvailable);
+                    match result {
+                        AdmissionResult::Admitted => spawn_event_reports(s_nssai),
+                        rejected => failures.push(AcFailure::new(
+                            &info.supi,
+                            s_nssai,
+                            rejection_reason(rejected, true),
+                            Some(info.pdu_session_id),
+                        )),
+                    }
+                }
+                "UPDATE" => {
+                    match with_nsacf_context(|c| {
+                        c.update_pdu_access(s_nssai, &session_key, access)
+                    })
+                    .unwrap_or(UpdateOutcome::NotFound)
+                    {
+                        UpdateOutcome::Updated => spawn_event_reports(s_nssai),
+                        UpdateOutcome::NotFound => failures.push(AcFailure::new(
+                            &info.supi,
+                            s_nssai,
+                            AcuFailureReason::SliceNotFound,
+                            Some(info.pdu_session_id),
+                        )),
+                    }
+                }
+                // DECREASE (nsacf-10).
+                _ => match with_nsacf_context(|c| c.release_pdu_session(s_nssai, &session_key))
+                    .unwrap_or(ReleaseOutcome::SliceNotFound)
+                {
+                    ReleaseOutcome::Released(_) | ReleaseOutcome::MemberAbsent => {
+                        spawn_event_reports(s_nssai)
+                    }
+                    ReleaseOutcome::SliceNotFound => failures.push(AcFailure::new(
                         &info.supi,
                         s_nssai,
-                        rejection_reason(rejected, true),
+                        AcuFailureReason::SliceNotFound,
                         Some(info.pdu_session_id),
                     )),
-                }
-            } else {
-                with_nsacf_context(|c| c.release_pdu_session(s_nssai, &session_key));
-                spawn_event_reports(s_nssai);
+                },
             }
         }
     }
@@ -976,6 +1097,186 @@ async fn handle_utilization_report() -> SbiResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Custom operations (TS 29.536 §6.1.3.4 / §6.1.3.5)
+//
+// Field names mirror TS 29.536 LocalConfigurations terminology (the r16/r17
+// vendored OpenAPI does not include TS29536_Nnsacf_*.yaml).
+// ---------------------------------------------------------------------------
+
+/// Parse the optional per-access-type ceilings from a config object.
+fn parse_access_limits(v: &serde_json::Value) -> AccessLimits {
+    AccessLimits {
+        max_ues_3gpp: v.get("maxUes3gpp").and_then(|x| x.as_u64()),
+        max_ues_n3gpp: v.get("maxUesN3gpp").and_then(|x| x.as_u64()),
+        max_pdu_3gpp: v.get("maxPdu3gpp").and_then(|x| x.as_u64()),
+        max_pdu_n3gpp: v.get("maxPduN3gpp").and_then(|x| x.as_u64()),
+    }
+}
+
+/// Render a slice quota as a LocalConfigurations entry (only the per-access
+/// ceilings that are actually set are emitted).
+fn local_config_json(q: &SliceQuota) -> serde_json::Value {
+    let mut obj = serde_json::json!({
+        "snssai": q.s_nssai.to_json(),
+        "maxUes": q.max_ues,
+        "maxPduSessions": q.max_pdu_sessions,
+    });
+    for (key, val) in [
+        ("maxUes3gpp", q.max_ues_3gpp),
+        ("maxUesN3gpp", q.max_ues_n3gpp),
+        ("maxPdu3gpp", q.max_pdu_3gpp),
+        ("maxPduN3gpp", q.max_pdu_n3gpp),
+    ] {
+        if let Some(v) = val {
+            obj[key] = serde_json::json!(v);
+        }
+    }
+    obj
+}
+
+/// POST /nnsacf-nsac/v1/slices/local-configs/update  (TS 29.536 §6.1.3.4)
+///
+/// Update the local NSAC configuration (per-slice max UEs / PDU sessions and
+/// optional per-access ceilings). Memberships of existing quotas are preserved.
+async fn handle_local_configs_update(request: &SbiRequest) -> SbiResponse {
+    log::info!("LocalConfigurations update");
+
+    let data: serde_json::Value = match &request.http.content {
+        Some(content) => match serde_json::from_str(content) {
+            Ok(v) => v,
+            Err(e) => {
+                return problem_details(
+                    400,
+                    "Bad Request",
+                    &format!("Invalid JSON: {e}"),
+                    Some("INVALID_MSG_FORMAT"),
+                )
+            }
+        },
+        None => {
+            return problem_details(
+                400,
+                "Bad Request",
+                "Missing mandatory request body",
+                Some("MANDATORY_IE_MISSING"),
+            )
+        }
+    };
+
+    let configs = match data.get("localConfigurations").and_then(|v| v.as_array()) {
+        Some(c) if !c.is_empty() => c,
+        _ => {
+            return problem_details(
+                400,
+                "Bad Request",
+                "Missing mandatory attribute: localConfigurations",
+                Some("MANDATORY_IE_MISSING"),
+            )
+        }
+    };
+
+    let mut applied: Vec<serde_json::Value> = Vec::new();
+    for cfg in configs {
+        let s_nssai = match cfg.get("snssai").and_then(SNssai::from_json) {
+            Some(s) => s,
+            None => {
+                return problem_details(
+                    400,
+                    "Bad Request",
+                    "Missing/invalid mandatory attribute snssai in localConfigurations",
+                    Some("MANDATORY_IE_MISSING"),
+                )
+            }
+        };
+        let max_ues = cfg.get("maxUes").and_then(|v| v.as_u64()).unwrap_or(10000);
+        let max_pdu = cfg
+            .get("maxPduSessions")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(50000);
+        let limits = parse_access_limits(cfg);
+        if let Some(quota) = with_nsacf_context(|c| {
+            c.quota_update_or_add(s_nssai.clone(), max_ues, max_pdu, limits)
+        })
+        .flatten()
+        {
+            applied.push(local_config_json(&quota));
+        }
+    }
+
+    SbiResponse::with_status(200)
+        .with_json_body(&serde_json::json!({
+            "localConfigurations": applied,
+            "supportedFeatures": SUPPORTED_FEATURES,
+        }))
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+/// POST /nnsacf-nsac/v1/slices/roaming-quotas/query  (TS 29.536 §6.1.3.5)
+///
+/// Query the roaming quotas held by this (central/primary HPLMN) NSACF. An
+/// optional `snssais` filter narrows the result; absent => all configured
+/// slices.
+async fn handle_roaming_quotas_query(request: &SbiRequest) -> SbiResponse {
+    log::info!("RoamingQuotas query");
+
+    // Body is optional for the query op; tolerate an empty/absent body.
+    let data: serde_json::Value = match &request.http.content {
+        Some(content) if !content.trim().is_empty() => match serde_json::from_str(content) {
+            Ok(v) => v,
+            Err(e) => {
+                return problem_details(
+                    400,
+                    "Bad Request",
+                    &format!("Invalid JSON: {e}"),
+                    Some("INVALID_MSG_FORMAT"),
+                )
+            }
+        },
+        _ => serde_json::Value::Null,
+    };
+
+    let filter: Vec<SNssai> = data
+        .get("snssais")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(SNssai::from_json).collect())
+        .unwrap_or_default();
+
+    let quotas = with_nsacf_context(|c| {
+        if filter.is_empty() {
+            c.quotas_snapshot()
+        } else {
+            filter
+                .iter()
+                .filter_map(|s| c.quota_find_by_snssai(s))
+                .collect()
+        }
+    })
+    .unwrap_or_default();
+
+    let roaming_quotas: Vec<serde_json::Value> = quotas
+        .iter()
+        .map(|q| {
+            serde_json::json!({
+                "snssai": q.s_nssai.to_json(),
+                "maxUes": q.max_ues,
+                "currentUes": q.current_ues(),
+                "maxPduSessions": q.max_pdu_sessions,
+                "currentPduSessions": q.current_pdu_sessions(),
+                "currentUes3gpp": q.current_ues_access(AccessType::ThreeGpp),
+                "currentUesN3gpp": q.current_ues_access(AccessType::NonThreeGpp),
+            })
+        })
+        .collect();
+
+    SbiResponse::with_status(200)
+        .with_json_body(&serde_json::json!({
+            "roamingQuotas": roaming_quotas,
+            "supportedFeatures": SUPPORTED_FEATURES,
+        }))
+        .unwrap_or_else(|_| SbiResponse::with_status(200))
+}
+
+// ---------------------------------------------------------------------------
 // SliceEventExposure subscriptions + notifications
 // ---------------------------------------------------------------------------
 
@@ -1133,18 +1434,19 @@ async fn deliver_notification(notification_uri: String, body: serde_json::Value)
     client.close().await;
 }
 
-/// Fire EAC (early admission control) mode notifications to all subscribers
-/// interested in the slice (TS 23.502 §4.2.9.5).
+/// Fire EAC (early admission control) mode notifications to subscribers
+/// interested in the slice (TS 23.502 §4.2.9.5). The body is an
+/// `EacNotification` (TS 29.536 §6.1.6.2.4): an `eacModeList` map keyed by the
+/// S-NSSAI with an `EACMode` value `"ACTIVE"`/`"DEACTIVE"` (§6.1.6.3.3) — NOT
+/// the old `eacMode: "EAC_ACTIVE"/"EAC_INACTIVE"` scalar (nsacf-07). The
+/// subscription's notificationUri is the EAC callback URI conveyed at
+/// subscription time. `plmnIdNid` is optional and omitted (not tracked here).
 fn spawn_eac_notifications(eac: EacTransition) {
     let subs = with_nsacf_context(|c| c.subscriptions_matching(&eac.s_nssai)).unwrap_or_default();
     if subs.is_empty() {
         return;
     }
-    let mode = if eac.activated {
-        "EAC_ACTIVE"
-    } else {
-        "EAC_INACTIVE"
-    };
+    let mode = if eac.activated { "ACTIVE" } else { "DEACTIVE" };
     log::info!(
         "EAC mode {} for S-NSSAI[SST:{} SD:{:?}] -> notifying {} subscriber(s)",
         mode,
@@ -1152,12 +1454,14 @@ fn spawn_eac_notifications(eac: EacTransition) {
         eac.s_nssai.sd,
         subs.len()
     );
+    let mut eac_mode_list = serde_json::Map::new();
+    eac_mode_list.insert(eac.s_nssai.to_key(), serde_json::Value::String(mode.to_string()));
+    let eac_mode_list = serde_json::Value::Object(eac_mode_list);
     for sub in subs {
         let body = serde_json::json!({
             "subscriptionId": sub.subscription_id,
             "eacNotification": {
-                "snssai": eac.s_nssai.to_json(),
-                "eacMode": mode,
+                "eacModeList": eac_mode_list.clone(),
             }
         });
         tokio::spawn(deliver_notification(sub.notification_uri, body));
@@ -1233,14 +1537,18 @@ async fn register_with_nrf(
             "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.1.0"}],
             "scheme": "http",
             "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
+            // nsacf-11: advertise SupportedFeatures with HNSAC/VHNSAC bits clear
+            // so consumers never expect home/visited delegation (ueAdmissionList).
+            "supportedFeatures": SUPPORTED_FEATURES
         }, {
             "serviceInstanceId": format!("{}-nnsacf-slice-ee", nf_instance_id),
             "serviceName": "nnsacf-slice-ee",
             "versions": [{"apiVersionInUri": "v1", "apiFullVersion": "1.1.0"}],
             "scheme": "http",
             "nfServiceStatus": "REGISTERED",
-            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}]
+            "ipEndPoints": [{"ipv4Address": sbi_addr, "port": sbi_port}],
+            "supportedFeatures": SUPPORTED_FEATURES
         }],
         "allowedNfTypes": ["AMF", "SMF", "SCP", "NEF", "NWDAF"],
         "heartBeatTimer": 10
@@ -1672,7 +1980,7 @@ mod tests {
             .unwrap()
             .contains("MANDATORY_IE_MISSING"));
 
-        // Invalid updateFlag (UPDATE is nsacf-06, deferred) -> 400 INVALID_IE_VALUE.
+        // Unknown updateFlag (not INCREASE/DECREASE/UPDATE) -> 400 INVALID_IE_VALUE.
         let resp = client
             .post_json(
                 "/nnsacf-nsac/v1/slices/ues",
@@ -1859,24 +2167,29 @@ mod tests {
             assert_eq!(resp.status, 204);
         }
 
-        // Expect at least one EAC_ACTIVE notification (count reports may
-        // arrive first; scan until found, bounded by timeout per recv)
+        // Expect at least one EacNotification with eacModeList["74"]=="ACTIVE"
+        // (TS 29.536 §6.1.6.2.4 shape, nsacf-07). Count reports may arrive
+        // first; parse each and scan until found, bounded by timeout per recv.
+        // The old `eacMode: "EAC_ACTIVE"` scalar must NOT appear.
         let mut saw_eac_active = false;
         for _ in 0..8 {
             let Ok(Some(notif)) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await
             else {
                 break;
             };
-            if notif.contains("EAC_ACTIVE") {
-                let v: serde_json::Value = serde_json::from_str(&notif).unwrap();
-                assert_eq!(v["eacNotification"]["snssai"]["sst"], 74);
+            assert!(
+                !notif.contains("EAC_ACTIVE") && !notif.contains("eacMode\""),
+                "old EAC scalar shape must be gone"
+            );
+            let v: serde_json::Value = serde_json::from_str(&notif).unwrap();
+            if v["eacNotification"]["eacModeList"]["74"] == "ACTIVE" {
                 saw_eac_active = true;
                 break;
             }
         }
-        assert!(saw_eac_active, "expected EAC_ACTIVE notification");
+        assert!(saw_eac_active, "expected EacNotification eacModeList ACTIVE");
 
-        // Release below threshold -> EAC_INACTIVE notification
+        // Release below threshold -> EacNotification eacModeList "DEACTIVE"
         let resp = client
             .post_json(
                 "/nnsacf-nsac/v1/slices/ues",
@@ -1892,12 +2205,13 @@ mod tests {
             else {
                 break;
             };
-            if notif.contains("EAC_INACTIVE") {
+            let v: serde_json::Value = serde_json::from_str(&notif).unwrap();
+            if v["eacNotification"]["eacModeList"]["74"] == "DEACTIVE" {
                 saw_eac_inactive = true;
                 break;
             }
         }
-        assert!(saw_eac_inactive, "expected EAC_INACTIVE notification");
+        assert!(saw_eac_inactive, "expected EacNotification eacModeList DEACTIVE");
 
         // Unsubscribe -> 204, repeat -> 404
         let resp = client
@@ -2168,6 +2482,372 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(resp.status, 404, "/slices/pdu-sessions must 404");
+
+        server.stop().await.expect("stop");
+    }
+
+    // -----------------------------------------------------------------
+    // nsacf-05: per-access-type counting + _3GPP/_N3GPP reason over the wire
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_per_access_ue_counting_and_reason() {
+        let (server, port) = start_nsacf_server().await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+
+        // Provision per-access ceilings via the local-configs custom op: 1 UE
+        // per access, aggregate room for 10.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/local-configs/update",
+                &json!({"localConfigurations": [{
+                    "snssai": {"sst": 90}, "maxUes": 10, "maxPduSessions": 50,
+                    "maxUes3gpp": 1, "maxUesN3gpp": 1
+                }]}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 200);
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(v["localConfigurations"][0]["maxUes3gpp"], 1);
+
+        // First 3GPP UE admits -> the 3GPP bucket is now full (1/1).
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({"nfId": "amf-1", "ueACRequestInfo": [{
+                    "supi": "imsi-90-a", "anType": "3GPP_ACCESS",
+                    "acuOperationList": [{"updateFlag": "INCREASE", "snssai": {"sst": 90}}]
+                }]}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 204);
+
+        // Mixed request: an N3GPP UE admits (its bucket has room) while a 2nd
+        // 3GPP UE fails per-access -> partial 200 with EXCEED_MAX_UE_NUM_3GPP.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({"nfId": "amf-1", "ueACRequestInfo": [
+                    {"supi": "imsi-90-c", "anType": "NON_3GPP_ACCESS",
+                     "acuOperationList": [{"updateFlag": "INCREASE", "snssai": {"sst": 90}}]},
+                    {"supi": "imsi-90-d", "anType": "3GPP_ACCESS",
+                     "acuOperationList": [{"updateFlag": "INCREASE", "snssai": {"sst": 90}}]}
+                ]}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 200);
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert!(
+            v["acuFailureList"]["imsi-90-c"].is_null(),
+            "the N3GPP UE admitted"
+        );
+        assert_eq!(
+            v["acuFailureList"]["imsi-90-d"][0]["reason"],
+            "EXCEED_MAX_UE_NUM_3GPP"
+        );
+
+        server.stop().await.expect("stop");
+    }
+
+    // -----------------------------------------------------------------
+    // nsacf-06: AcuFlag UPDATE moves the access bucket without double-counting
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_ue_update_moves_access_bucket() {
+        let (server, port) = start_nsacf_server().await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        create_quota(&client, 91, 10, 100).await;
+
+        // Admit imsi-91 on 3GPP.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &ue_ac_body("imsi-91", "INCREASE", 91),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 204);
+
+        // UPDATE to non-3GPP -> 204 (entry located and moved).
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({"nfId": "amf-1", "ueACRequestInfo": [{
+                    "supi": "imsi-91", "anType": "NON_3GPP_ACCESS",
+                    "acuOperationList": [{"updateFlag": "UPDATE", "snssai": {"sst": 91}}]
+                }]}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 204, "UPDATE of a known member -> 204");
+
+        // roaming-quotas/query confirms: aggregate unchanged (1), 3GPP=0, N3GPP=1.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/roaming-quotas/query",
+                &json!({"snssais": [{"sst": 91}]}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 200);
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(v["roamingQuotas"][0]["currentUes"], 1, "no double-count");
+        assert_eq!(v["roamingQuotas"][0]["currentUes3gpp"], 0);
+        assert_eq!(v["roamingQuotas"][0]["currentUesN3gpp"], 1);
+
+        // Mixed request: a fresh INCREASE + an UPDATE for an unknown member ->
+        // partial 200 with acuFailureList SLICE_NOT_FOUND for the unknown.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({"nfId": "amf-1", "ueACRequestInfo": [
+                    {"supi": "imsi-91-b", "anType": "3GPP_ACCESS",
+                     "acuOperationList": [{"updateFlag": "INCREASE", "snssai": {"sst": 91}}]},
+                    {"supi": "imsi-unknown", "anType": "3GPP_ACCESS",
+                     "acuOperationList": [{"updateFlag": "UPDATE", "snssai": {"sst": 91}}]}
+                ]}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 200);
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            v["acuFailureList"]["imsi-unknown"][0]["reason"],
+            "SLICE_NOT_FOUND"
+        );
+        assert!(v["acuFailureList"]["imsi-91-b"].is_null());
+
+        server.stop().await.expect("stop");
+    }
+
+    // -----------------------------------------------------------------
+    // nsacf-08: custom operations local-configs/update + roaming-quotas/query
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_custom_ops_local_configs_and_roaming_quotas() {
+        let (server, port) = start_nsacf_server().await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+
+        // local-configs/update is routed (not 404) and returns a spec-shaped body.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/local-configs/update",
+                &json!({"localConfigurations": [
+                    {"snssai": {"sst": 92}, "maxUes": 7, "maxPduSessions": 9}
+                ]}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            resp.status, 200,
+            "/slices/local-configs/update must be routed"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(v["localConfigurations"][0]["snssai"]["sst"], 92);
+        assert_eq!(v["localConfigurations"][0]["maxUes"], 7);
+
+        // Missing localConfigurations -> 400 MANDATORY_IE_MISSING.
+        let resp = client
+            .post_json("/nnsacf-nsac/v1/slices/local-configs/update", &json!({}))
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 400);
+        assert!(resp
+            .http
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("MANDATORY_IE_MISSING"));
+
+        // roaming-quotas/query is routed (not 404) and returns the quota state.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/roaming-quotas/query",
+                &json!({"snssais": [{"sst": 92}]}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            resp.status, 200,
+            "/slices/roaming-quotas/query must be routed"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(v["roamingQuotas"][0]["snssai"]["sst"], 92);
+        assert_eq!(v["roamingQuotas"][0]["maxUes"], 7);
+        assert_eq!(v["roamingQuotas"][0]["currentUes"], 0);
+
+        server.stop().await.expect("stop");
+    }
+
+    // -----------------------------------------------------------------
+    // nsacf-09: mandatory nfId -> 400 MANDATORY_IE_MISSING when absent
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_ac_missing_nf_id() {
+        let (server, port) = start_nsacf_server().await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+
+        // UE AC body WITHOUT nfId -> 400 MANDATORY_IE_MISSING.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({"ueACRequestInfo": [{
+                    "supi": "imsi-1", "anType": "3GPP_ACCESS",
+                    "acuOperationList": [{"updateFlag": "INCREASE", "snssai": {"sst": 93}}]
+                }]}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 400);
+        assert!(resp
+            .http
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("MANDATORY_IE_MISSING"));
+
+        // PDU AC body WITHOUT nfId -> 400 MANDATORY_IE_MISSING (nfId is M there too).
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/pdus",
+                &json!({"pduACRequestInfo": [{
+                    "supi": "imsi-1", "anType": "3GPP_ACCESS", "pduSessionId": 1,
+                    "acuOperationList": [{"updateFlag": "INCREASE", "snssai": {"sst": 93}}]
+                }]}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 400);
+        assert!(resp
+            .http
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("MANDATORY_IE_MISSING"));
+
+        server.stop().await.expect("stop");
+    }
+
+    // -----------------------------------------------------------------
+    // nsacf-10: DECREASE 204 (clean / idempotent) vs SLICE_NOT_FOUND
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_http_ue_decrease_membership_and_cause() {
+        let (server, port) = start_nsacf_server().await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        create_quota(&client, 94, 10, 100).await;
+
+        // Admit then DECREASE a known member -> clean release 204.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &ue_ac_body("imsi-94", "INCREASE", 94),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 204);
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &ue_ac_body("imsi-94", "DECREASE", 94),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 204, "clean release -> 204");
+
+        // DECREASE an already-absent member -> idempotent 204.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &ue_ac_body("imsi-94", "DECREASE", 94),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 204, "idempotent release of absent member -> 204");
+
+        // Mixed: DECREASE on a known slice + DECREASE on an unconfigured slice
+        // -> partial 200 with acuFailureList reason SLICE_NOT_FOUND for the
+        // S-NSSAI that is not NSAC-subject.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({"nfId": "amf-1", "ueACRequestInfo": [
+                    {"supi": "imsi-94", "anType": "3GPP_ACCESS",
+                     "acuOperationList": [{"updateFlag": "DECREASE", "snssai": {"sst": 94}}]},
+                    {"supi": "imsi-x", "anType": "3GPP_ACCESS",
+                     "acuOperationList": [{"updateFlag": "DECREASE", "snssai": {"sst": 95}}]}
+                ]}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 200);
+        let v: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            v["acuFailureList"]["imsi-x"][0]["reason"],
+            "SLICE_NOT_FOUND"
+        );
+        assert!(v["acuFailureList"]["imsi-94"].is_null());
+
+        server.stop().await.expect("stop");
+    }
+
+    // -----------------------------------------------------------------
+    // nsacf-11: SupportedFeatures advertised with HNSAC/VHNSAC bits clear;
+    // ueAdmissionList never emitted.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_supported_features_hnsac_vhnsac_clear() {
+        let v = u32::from_str_radix(SUPPORTED_FEATURES, 16).expect("valid hex");
+        assert_eq!(
+            v & (FEAT_HNSAC_BIT | FEAT_VHNSAC_BIT),
+            0,
+            "HNSAC/VHNSAC delegation must not be advertised"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_http_ac_response_features_no_ue_admission_list() {
+        let (server, port) = start_nsacf_server().await;
+        let client = SbiClient::with_host_port("127.0.0.1", port);
+        create_quota(&client, 96, 1, 100).await; // room for exactly 1 UE
+
+        // Force a partial 200 (one admit + one over-quota) and inspect the body.
+        let resp = client
+            .post_json(
+                "/nnsacf-nsac/v1/slices/ues",
+                &json!({"nfId": "amf-1", "ueACRequestInfo": [
+                    {"supi": "imsi-96-a", "anType": "3GPP_ACCESS",
+                     "acuOperationList": [{"updateFlag": "INCREASE", "snssai": {"sst": 96}}]},
+                    {"supi": "imsi-96-b", "anType": "3GPP_ACCESS",
+                     "acuOperationList": [{"updateFlag": "INCREASE", "snssai": {"sst": 96}}]}
+                ]}),
+            )
+            .await
+            .expect("response");
+        assert_eq!(resp.status, 200);
+        let raw = resp.http.content.as_deref().unwrap();
+        let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let feat = u32::from_str_radix(v["supportedFeatures"].as_str().unwrap(), 16).unwrap();
+        assert_eq!(feat & (FEAT_HNSAC_BIT | FEAT_VHNSAC_BIT), 0);
+        assert!(
+            !raw.contains("ueAdmissionList"),
+            "ueAdmissionList must never be emitted"
+        );
 
         server.stop().await.expect("stop");
     }

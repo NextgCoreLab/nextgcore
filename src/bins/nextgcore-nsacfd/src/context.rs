@@ -56,6 +56,82 @@ impl SNssai {
             None => Some(Self::new(seg.parse().ok()?, None)),
         }
     }
+
+    /// Canonical string key for this S-NSSAI: `{sst}` or `{sst}-{sd-hex}`.
+    /// Used as the `eacModeList` map key (TS 29.536 §6.1.6.2.4) and as the
+    /// per-access membership-map key. Round-trips with [`from_path_segment`].
+    pub fn to_key(&self) -> String {
+        match self.sd {
+            Some(sd) => format!("{}-{sd:06x}", self.sst),
+            None => format!("{}", self.sst),
+        }
+    }
+}
+
+/// Access type (TS 29.571 AccessType) used for per-access-type slice admission
+/// counting (TS 29.536 §6.1.6.2.9/.10). Only the two NSAC-relevant values are
+/// modelled; an absent/unknown `anType` defaults to 3GPP access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AccessType {
+    /// 3GPP_ACCESS
+    ThreeGpp,
+    /// NON_3GPP_ACCESS
+    NonThreeGpp,
+}
+
+impl AccessType {
+    /// Map an optional `anType` string to an [`AccessType`], defaulting to
+    /// 3GPP access when absent or unrecognised (nsacf-05 accept-and-default).
+    pub fn from_an_type(s: Option<&str>) -> AccessType {
+        match s {
+            Some("NON_3GPP_ACCESS") => AccessType::NonThreeGpp,
+            _ => AccessType::ThreeGpp,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccessType::ThreeGpp => "3GPP_ACCESS",
+            AccessType::NonThreeGpp => "NON_3GPP_ACCESS",
+        }
+    }
+
+    pub fn is_3gpp(self) -> bool {
+        matches!(self, AccessType::ThreeGpp)
+    }
+}
+
+/// Optional per-access-type ceilings for a slice quota (TS 29.536 §6.1.6.2.9
+/// procedural text). All `None` => aggregate-only counting (legacy path
+/// unchanged); a `Some` ceiling enables per-access enforcement for that access.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AccessLimits {
+    pub max_ues_3gpp: Option<u64>,
+    pub max_ues_n3gpp: Option<u64>,
+    pub max_pdu_3gpp: Option<u64>,
+    pub max_pdu_n3gpp: Option<u64>,
+}
+
+/// Outcome of a DECREASE (release) operation (nsacf-10). Distinguishes a clean
+/// release from an idempotent no-op (member already absent) and from an
+/// S-NSSAI that is not NSAC-subject (no quota configured).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReleaseOutcome {
+    /// Member was present and removed; carries any EAC mode transition.
+    Released(Option<EacTransition>),
+    /// S-NSSAI is NSAC-subject but the member/session was not present.
+    MemberAbsent,
+    /// S-NSSAI is not NSAC-subject (no quota configured for it).
+    SliceNotFound,
+}
+
+/// Outcome of an UPDATE (access-type move) operation (nsacf-06).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateOutcome {
+    /// Entry located; its access type is now `new_access` (idempotent).
+    Updated,
+    /// S-NSSAI not NSAC-subject, or the member/session is not present.
+    NotFound,
 }
 
 /// PLMN ID
@@ -70,8 +146,11 @@ pub struct PlmnId {
 pub enum AdmissionResult {
     /// Admitted
     Admitted,
-    /// Rejected - quota exceeded
+    /// Rejected - aggregate slice quota exceeded
     RejectedQuotaExceeded,
+    /// Rejected - the per-access-type ceiling for this access is exceeded
+    /// (aggregate may still have room). Selects the `_3GPP`/`_N3GPP` reason.
+    RejectedQuotaExceededPerAccess(AccessType),
     /// Rejected - slice not available
     RejectedSliceNotAvailable,
 }
@@ -91,14 +170,28 @@ pub struct SliceQuota {
     pub id: u64,
     /// S-NSSAI this quota applies to
     pub s_nssai: SNssai,
-    /// Maximum number of UEs allowed in this slice
+    /// Maximum number of UEs allowed in this slice (aggregate over accesses)
     pub max_ues: u64,
-    /// Maximum number of PDU sessions allowed in this slice
+    /// Maximum number of PDU sessions allowed in this slice (aggregate)
     pub max_pdu_sessions: u64,
+    /// Optional per-access-type UE ceiling for 3GPP access (nsacf-05)
+    pub max_ues_3gpp: Option<u64>,
+    /// Optional per-access-type UE ceiling for non-3GPP access (nsacf-05)
+    pub max_ues_n3gpp: Option<u64>,
+    /// Optional per-access-type PDU-session ceiling for 3GPP access
+    pub max_pdu_3gpp: Option<u64>,
+    /// Optional per-access-type PDU-session ceiling for non-3GPP access
+    pub max_pdu_n3gpp: Option<u64>,
     /// Registered UE identities (SUPIs)
     pub(crate) ues: HashSet<String>,
     /// Established PDU session keys (`{supi}:{pduSessionId}`)
     pub(crate) pdu_sessions: HashSet<String>,
+    /// Per-member access type for registered UEs (nsacf-05/06). Always kept in
+    /// sync with `ues`; lets per-access counts be derived and UPDATE move a UE
+    /// between 3GPP/N3GPP buckets without changing the aggregate count.
+    pub(crate) ue_access: HashMap<String, AccessType>,
+    /// Per-session access type for established PDU sessions (nsacf-05/06).
+    pub(crate) pdu_access: HashMap<String, AccessType>,
     /// Whether EAC mode is currently active for this slice
     pub(crate) eac_active: bool,
 }
@@ -110,10 +203,25 @@ impl SliceQuota {
             s_nssai,
             max_ues,
             max_pdu_sessions,
+            max_ues_3gpp: None,
+            max_ues_n3gpp: None,
+            max_pdu_3gpp: None,
+            max_pdu_n3gpp: None,
             ues: HashSet::new(),
             pdu_sessions: HashSet::new(),
+            ue_access: HashMap::new(),
+            pdu_access: HashMap::new(),
             eac_active: false,
         }
+    }
+
+    /// Apply optional per-access-type ceilings (nsacf-05).
+    pub fn with_access_limits(mut self, limits: AccessLimits) -> Self {
+        self.max_ues_3gpp = limits.max_ues_3gpp;
+        self.max_ues_n3gpp = limits.max_ues_n3gpp;
+        self.max_pdu_3gpp = limits.max_pdu_3gpp;
+        self.max_pdu_n3gpp = limits.max_pdu_n3gpp;
+        self
     }
 
     pub fn current_ues(&self) -> u64 {
@@ -122,6 +230,32 @@ impl SliceQuota {
 
     pub fn current_pdu_sessions(&self) -> u64 {
         self.pdu_sessions.len() as u64
+    }
+
+    /// Registered UE count for a single access type (nsacf-05).
+    pub fn current_ues_access(&self, access: AccessType) -> u64 {
+        self.ue_access.values().filter(|a| **a == access).count() as u64
+    }
+
+    /// Established PDU-session count for a single access type (nsacf-05).
+    pub fn current_pdu_access(&self, access: AccessType) -> u64 {
+        self.pdu_access.values().filter(|a| **a == access).count() as u64
+    }
+
+    /// The configured per-access UE ceiling for `access`, if any.
+    pub fn max_ues_for(&self, access: AccessType) -> Option<u64> {
+        match access {
+            AccessType::ThreeGpp => self.max_ues_3gpp,
+            AccessType::NonThreeGpp => self.max_ues_n3gpp,
+        }
+    }
+
+    /// The configured per-access PDU-session ceiling for `access`, if any.
+    pub fn max_pdu_for(&self, access: AccessType) -> Option<u64> {
+        match access {
+            AccessType::ThreeGpp => self.max_pdu_3gpp,
+            AccessType::NonThreeGpp => self.max_pdu_n3gpp,
+        }
     }
 
     /// Get UE utilization percentage
@@ -152,8 +286,14 @@ impl Clone for SliceQuota {
             s_nssai: self.s_nssai.clone(),
             max_ues: self.max_ues,
             max_pdu_sessions: self.max_pdu_sessions,
+            max_ues_3gpp: self.max_ues_3gpp,
+            max_ues_n3gpp: self.max_ues_n3gpp,
+            max_pdu_3gpp: self.max_pdu_3gpp,
+            max_pdu_n3gpp: self.max_pdu_n3gpp,
             ues: self.ues.clone(),
             pdu_sessions: self.pdu_sessions.clone(),
+            ue_access: self.ue_access.clone(),
+            pdu_access: self.pdu_access.clone(),
             eac_active: self.eac_active,
         }
     }
@@ -263,6 +403,19 @@ impl NsacfContext {
         max_ues: u64,
         max_pdu_sessions: u64,
     ) -> Option<SliceQuota> {
+        self.quota_add_with_limits(s_nssai, max_ues, max_pdu_sessions, AccessLimits::default())
+    }
+
+    /// Add a slice quota carrying optional per-access-type ceilings (nsacf-05).
+    /// `AccessLimits::default()` (all `None`) yields the legacy aggregate-only
+    /// quota, so [`quota_add`] is just the no-per-access spelling of this.
+    pub fn quota_add_with_limits(
+        &self,
+        s_nssai: SNssai,
+        max_ues: u64,
+        max_pdu_sessions: u64,
+        limits: AccessLimits,
+    ) -> Option<SliceQuota> {
         let quota = {
             let mut quota_list = self.quota_list.write().ok()?;
 
@@ -275,7 +428,8 @@ impl NsacfContext {
             }
 
             let id = self.next_quota_id.fetch_add(1, Ordering::SeqCst) as u64;
-            let quota = SliceQuota::new(id, s_nssai.clone(), max_ues, max_pdu_sessions);
+            let quota =
+                SliceQuota::new(id, s_nssai.clone(), max_ues, max_pdu_sessions).with_access_limits(limits);
             quota_list.insert(id, quota.clone());
             quota
         }; // quota_list guard dropped before taking snssai_hash (no two-map hold)
@@ -293,6 +447,34 @@ impl NsacfContext {
         );
         self.save_state();
         Some(quota)
+    }
+
+    /// Update an existing quota's ceilings in place (preserving memberships),
+    /// or create it if absent (nsacf-08 LocalConfigurations update).
+    pub fn quota_update_or_add(
+        &self,
+        s_nssai: SNssai,
+        max_ues: u64,
+        max_pdu_sessions: u64,
+        limits: AccessLimits,
+    ) -> Option<SliceQuota> {
+        if let Some(id) = self.quota_id_for(&s_nssai) {
+            let updated = {
+                let mut quota_list = self.quota_list.write().ok()?;
+                let quota = quota_list.get_mut(&id)?;
+                quota.max_ues = max_ues;
+                quota.max_pdu_sessions = max_pdu_sessions;
+                quota.max_ues_3gpp = limits.max_ues_3gpp;
+                quota.max_ues_n3gpp = limits.max_ues_n3gpp;
+                quota.max_pdu_3gpp = limits.max_pdu_3gpp;
+                quota.max_pdu_n3gpp = limits.max_pdu_n3gpp;
+                quota.clone()
+            };
+            self.save_state();
+            Some(updated)
+        } else {
+            self.quota_add_with_limits(s_nssai, max_ues, max_pdu_sessions, limits)
+        }
     }
 
     fn quota_id_for(&self, s_nssai: &SNssai) -> Option<u64> {
@@ -347,10 +529,13 @@ impl NsacfContext {
 
     /// Admit a UE (idempotent per SUPI). Returns the admission result and an
     /// EAC transition when the registered-UE count crosses the threshold.
+    /// `an_type` selects the per-access bucket and, on a per-access ceiling
+    /// breach, drives the `_3GPP`/`_N3GPP` failure reason (nsacf-05).
     pub fn admit_ue(
         &self,
         s_nssai: &SNssai,
         supi: &str,
+        an_type: AccessType,
     ) -> (AdmissionResult, Option<EacTransition>) {
         let Some(id) = self.quota_id_for(s_nssai) else {
             log::warn!(
@@ -369,13 +554,22 @@ impl NsacfContext {
             let Some(quota) = quota_list.get_mut(&id) else {
                 return (AdmissionResult::RejectedSliceNotAvailable, None);
             };
+            // Per-access ceiling breached (only when a ceiling is configured for
+            // this access). Aggregate is checked first so it keeps the plain
+            // reason; per-access selects the _3GPP/_N3GPP reason.
+            let over_per_access = quota
+                .max_ues_for(an_type)
+                .is_some_and(|max| quota.current_ues_access(an_type) >= max);
             if quota.ues.contains(supi) {
                 // Already counted; INCREASE is idempotent per TS 29.536
                 (AdmissionResult::Admitted, None)
             } else if quota.current_ues() >= quota.max_ues {
                 (AdmissionResult::RejectedQuotaExceeded, None)
+            } else if over_per_access {
+                (AdmissionResult::RejectedQuotaExceededPerAccess(an_type), None)
             } else {
                 quota.ues.insert(supi.to_string());
+                quota.ue_access.insert(supi.to_string(), an_type);
                 let eac = update_eac(quota, threshold);
                 (AdmissionResult::Admitted, eac)
             }
@@ -386,28 +580,78 @@ impl NsacfContext {
         result
     }
 
-    /// Release a UE (updateFlag DECREASE; idempotent). Returns an EAC
-    /// transition when the count falls back below the threshold.
-    pub fn release_ue(&self, s_nssai: &SNssai, supi: &str) -> Option<EacTransition> {
-        let id = self.quota_id_for(s_nssai)?;
-        let threshold = self.eac_threshold();
-        let eac = {
-            let mut quota_list = self.quota_list.write().ok()?;
-            let quota = quota_list.get_mut(&id)?;
-            if !quota.ues.remove(supi) {
-                return None;
-            }
-            update_eac(quota, threshold)
+    /// Release a UE (updateFlag DECREASE). Distinguishes a clean release from
+    /// an idempotent no-op and from an S-NSSAI that is not NSAC-subject
+    /// (nsacf-10). Carries the EAC transition when the count falls back below
+    /// the threshold.
+    pub fn release_ue(&self, s_nssai: &SNssai, supi: &str) -> ReleaseOutcome {
+        let Some(id) = self.quota_id_for(s_nssai) else {
+            return ReleaseOutcome::SliceNotFound;
         };
-        self.save_state();
-        eac
+        let threshold = self.eac_threshold();
+        let outcome = {
+            let mut quota_list = match self.quota_list.write() {
+                Ok(l) => l,
+                Err(_) => return ReleaseOutcome::SliceNotFound,
+            };
+            let Some(quota) = quota_list.get_mut(&id) else {
+                return ReleaseOutcome::SliceNotFound;
+            };
+            if !quota.ues.remove(supi) {
+                ReleaseOutcome::MemberAbsent
+            } else {
+                quota.ue_access.remove(supi);
+                ReleaseOutcome::Released(update_eac(quota, threshold))
+            }
+        };
+        if matches!(outcome, ReleaseOutcome::Released(_)) {
+            self.save_state();
+        }
+        outcome
+    }
+
+    /// Move a UE between access-type buckets (updateFlag UPDATE, nsacf-06). The
+    /// aggregate count is unchanged (no double-count); only the per-access
+    /// bucket moves. `NotFound` when the S-NSSAI is not NSAC-subject or the UE
+    /// is not a member.
+    pub fn update_ue_access(
+        &self,
+        s_nssai: &SNssai,
+        supi: &str,
+        new_access: AccessType,
+    ) -> UpdateOutcome {
+        let Some(id) = self.quota_id_for(s_nssai) else {
+            return UpdateOutcome::NotFound;
+        };
+        let changed = {
+            let mut quota_list = match self.quota_list.write() {
+                Ok(l) => l,
+                Err(_) => return UpdateOutcome::NotFound,
+            };
+            let Some(quota) = quota_list.get_mut(&id) else {
+                return UpdateOutcome::NotFound;
+            };
+            if !quota.ues.contains(supi) {
+                return UpdateOutcome::NotFound;
+            }
+            quota.ue_access.insert(supi.to_string(), new_access) != Some(new_access)
+        };
+        if changed {
+            self.save_state();
+        }
+        UpdateOutcome::Updated
     }
 
     // ------------------------------------------------------------------
     // PDU session admission control (TS 29.536 NumOfPDUsUpdate)
     // ------------------------------------------------------------------
 
-    pub fn admit_pdu_session(&self, s_nssai: &SNssai, session_key: &str) -> AdmissionResult {
+    pub fn admit_pdu_session(
+        &self,
+        s_nssai: &SNssai,
+        session_key: &str,
+        an_type: AccessType,
+    ) -> AdmissionResult {
         let Some(id) = self.quota_id_for(s_nssai) else {
             return AdmissionResult::RejectedSliceNotAvailable;
         };
@@ -419,12 +663,18 @@ impl NsacfContext {
             let Some(quota) = quota_list.get_mut(&id) else {
                 return AdmissionResult::RejectedSliceNotAvailable;
             };
+            let over_per_access = quota
+                .max_pdu_for(an_type)
+                .is_some_and(|max| quota.current_pdu_access(an_type) >= max);
             if quota.pdu_sessions.contains(session_key) {
                 AdmissionResult::Admitted
             } else if quota.current_pdu_sessions() >= quota.max_pdu_sessions {
                 AdmissionResult::RejectedQuotaExceeded
+            } else if over_per_access {
+                AdmissionResult::RejectedQuotaExceededPerAccess(an_type)
             } else {
                 quota.pdu_sessions.insert(session_key.to_string());
+                quota.pdu_access.insert(session_key.to_string(), an_type);
                 AdmissionResult::Admitted
             }
         };
@@ -434,28 +684,72 @@ impl NsacfContext {
         result
     }
 
-    pub fn release_pdu_session(&self, s_nssai: &SNssai, session_key: &str) -> bool {
+    /// Release a PDU session (DECREASE). Mirrors [`release_ue`] (nsacf-10):
+    /// clean release vs idempotent member-absent vs slice-not-NSAC-subject.
+    pub fn release_pdu_session(&self, s_nssai: &SNssai, session_key: &str) -> ReleaseOutcome {
         let Some(id) = self.quota_id_for(s_nssai) else {
-            return false;
+            return ReleaseOutcome::SliceNotFound;
         };
-        let removed = {
+        let outcome = {
             let mut quota_list = match self.quota_list.write() {
                 Ok(l) => l,
-                Err(_) => return false,
+                Err(_) => return ReleaseOutcome::SliceNotFound,
             };
-            match quota_list.get_mut(&id) {
-                Some(quota) => quota.pdu_sessions.remove(session_key),
-                None => false,
+            let Some(quota) = quota_list.get_mut(&id) else {
+                return ReleaseOutcome::SliceNotFound;
+            };
+            if quota.pdu_sessions.remove(session_key) {
+                quota.pdu_access.remove(session_key);
+                ReleaseOutcome::Released(None)
+            } else {
+                ReleaseOutcome::MemberAbsent
             }
         };
-        if removed {
+        if matches!(outcome, ReleaseOutcome::Released(_)) {
             self.save_state();
         }
-        removed
+        outcome
+    }
+
+    /// Move a PDU session between access-type buckets (UPDATE, nsacf-06).
+    pub fn update_pdu_access(
+        &self,
+        s_nssai: &SNssai,
+        session_key: &str,
+        new_access: AccessType,
+    ) -> UpdateOutcome {
+        let Some(id) = self.quota_id_for(s_nssai) else {
+            return UpdateOutcome::NotFound;
+        };
+        let changed = {
+            let mut quota_list = match self.quota_list.write() {
+                Ok(l) => l,
+                Err(_) => return UpdateOutcome::NotFound,
+            };
+            let Some(quota) = quota_list.get_mut(&id) else {
+                return UpdateOutcome::NotFound;
+            };
+            if !quota.pdu_sessions.contains(session_key) {
+                return UpdateOutcome::NotFound;
+            }
+            quota.pdu_access.insert(session_key.to_string(), new_access) != Some(new_access)
+        };
+        if changed {
+            self.save_state();
+        }
+        UpdateOutcome::Updated
     }
 
     pub fn quota_count(&self) -> usize {
         self.quota_list.read().map(|l| l.len()).unwrap_or(0)
+    }
+
+    /// Snapshot of every configured slice quota (nsacf-08 roaming-quotas query).
+    pub fn quotas_snapshot(&self) -> Vec<SliceQuota> {
+        self.quota_list
+            .read()
+            .map(|l| l.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Get all quota utilizations: (S-NSSAI, ue%, pdu%)
@@ -536,14 +830,32 @@ impl NsacfContext {
             Ok(list) => list
                 .values()
                 .map(|q| {
+                    // Per-access membership maps (nsacf-05); absent in legacy
+                    // state files, so load_state defaults them to 3GPP access.
+                    let ues_access: serde_json::Map<String, serde_json::Value> = q
+                        .ue_access
+                        .iter()
+                        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.as_str().to_string())))
+                        .collect();
+                    let pdu_access: serde_json::Map<String, serde_json::Value> = q
+                        .pdu_access
+                        .iter()
+                        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.as_str().to_string())))
+                        .collect();
                     serde_json::json!({
                         "id": q.id,
                         "sst": q.s_nssai.sst,
                         "sd": q.s_nssai.sd,
                         "maxUes": q.max_ues,
                         "maxPduSessions": q.max_pdu_sessions,
+                        "maxUes3gpp": q.max_ues_3gpp,
+                        "maxUesN3gpp": q.max_ues_n3gpp,
+                        "maxPdu3gpp": q.max_pdu_3gpp,
+                        "maxPduN3gpp": q.max_pdu_n3gpp,
                         "ues": q.ues.iter().collect::<Vec<_>>(),
                         "pduSessions": q.pdu_sessions.iter().collect::<Vec<_>>(),
+                        "uesAccess": serde_json::Value::Object(ues_access),
+                        "pduSessionsAccess": serde_json::Value::Object(pdu_access),
                         "eacActive": q.eac_active,
                     })
                 })
@@ -611,6 +923,11 @@ impl NsacfContext {
                 let sd = q.get("sd").and_then(|v| v.as_u64()).map(|v| v as u32);
                 let s_nssai = SNssai::new(sst as u8, sd);
                 let mut quota = SliceQuota::new(id, s_nssai.clone(), max_ues, max_pdu);
+                // Optional per-access ceilings (nsacf-05); absent in legacy files.
+                quota.max_ues_3gpp = q.get("maxUes3gpp").and_then(|v| v.as_u64());
+                quota.max_ues_n3gpp = q.get("maxUesN3gpp").and_then(|v| v.as_u64());
+                quota.max_pdu_3gpp = q.get("maxPdu3gpp").and_then(|v| v.as_u64());
+                quota.max_pdu_n3gpp = q.get("maxPduN3gpp").and_then(|v| v.as_u64());
                 if let Some(ues) = q.get("ues").and_then(|v| v.as_array()) {
                     quota.ues = ues
                         .iter()
@@ -622,6 +939,27 @@ impl NsacfContext {
                         .iter()
                         .filter_map(|v| v.as_str().map(String::from))
                         .collect();
+                }
+                // Reconcile per-access membership maps with the aggregate sets.
+                // Legacy state files have no `uesAccess`/`pduSessionsAccess`, so
+                // every member defaults to 3GPP access (backward-compatible).
+                let ues_access = q.get("uesAccess").and_then(|v| v.as_object());
+                for supi in quota.ues.iter().cloned().collect::<Vec<_>>() {
+                    let at = ues_access
+                        .and_then(|m| m.get(&supi))
+                        .and_then(|v| v.as_str())
+                        .map(|s| AccessType::from_an_type(Some(s)))
+                        .unwrap_or(AccessType::ThreeGpp);
+                    quota.ue_access.insert(supi, at);
+                }
+                let pdu_access = q.get("pduSessionsAccess").and_then(|v| v.as_object());
+                for key in quota.pdu_sessions.iter().cloned().collect::<Vec<_>>() {
+                    let at = pdu_access
+                        .and_then(|m| m.get(&key))
+                        .and_then(|v| v.as_str())
+                        .map(|s| AccessType::from_an_type(Some(s)))
+                        .unwrap_or(AccessType::ThreeGpp);
+                    quota.pdu_access.insert(key, at);
                 }
                 quota.eac_active = q
                     .get("eacActive")
@@ -741,10 +1079,10 @@ mod tests {
         let s_nssai = SNssai::new(1, None);
         ctx.quota_add(s_nssai.clone(), 100, 500);
 
-        let (result, _) = ctx.admit_ue(&s_nssai, "imsi-1");
+        let (result, _) = ctx.admit_ue(&s_nssai, "imsi-1", AccessType::ThreeGpp);
         assert_eq!(result, AdmissionResult::Admitted);
         // Same SUPI again: idempotent, still counted once
-        let (result, _) = ctx.admit_ue(&s_nssai, "imsi-1");
+        let (result, _) = ctx.admit_ue(&s_nssai, "imsi-1", AccessType::ThreeGpp);
         assert_eq!(result, AdmissionResult::Admitted);
         assert_eq!(ctx.quota_find_by_snssai(&s_nssai).unwrap().current_ues(), 1);
     }
@@ -758,20 +1096,20 @@ mod tests {
         ctx.quota_add(s_nssai.clone(), 2, 10);
 
         assert_eq!(
-            ctx.admit_ue(&s_nssai, "imsi-1").0,
+            ctx.admit_ue(&s_nssai, "imsi-1", AccessType::ThreeGpp).0,
             AdmissionResult::Admitted
         );
         assert_eq!(
-            ctx.admit_ue(&s_nssai, "imsi-2").0,
+            ctx.admit_ue(&s_nssai, "imsi-2", AccessType::ThreeGpp).0,
             AdmissionResult::Admitted
         );
         assert_eq!(
-            ctx.admit_ue(&s_nssai, "imsi-3").0,
+            ctx.admit_ue(&s_nssai, "imsi-3", AccessType::ThreeGpp).0,
             AdmissionResult::RejectedQuotaExceeded
         );
         // imsi-1 was already admitted: not rejected
         assert_eq!(
-            ctx.admit_ue(&s_nssai, "imsi-1").0,
+            ctx.admit_ue(&s_nssai, "imsi-1", AccessType::ThreeGpp).0,
             AdmissionResult::Admitted
         );
     }
@@ -782,7 +1120,7 @@ mod tests {
         ctx.init(64);
 
         let s_nssai = SNssai::new(99, None);
-        let (result, _) = ctx.admit_ue(&s_nssai, "imsi-1");
+        let (result, _) = ctx.admit_ue(&s_nssai, "imsi-1", AccessType::ThreeGpp);
         assert_eq!(result, AdmissionResult::RejectedSliceNotAvailable);
     }
 
@@ -794,16 +1132,21 @@ mod tests {
         let s_nssai = SNssai::new(3, None);
         ctx.quota_add(s_nssai.clone(), 2, 10);
 
-        ctx.admit_ue(&s_nssai, "imsi-1");
-        ctx.admit_ue(&s_nssai, "imsi-2");
+        ctx.admit_ue(&s_nssai, "imsi-1", AccessType::ThreeGpp);
+        ctx.admit_ue(&s_nssai, "imsi-2", AccessType::ThreeGpp);
         assert_eq!(
-            ctx.admit_ue(&s_nssai, "imsi-3").0,
+            ctx.admit_ue(&s_nssai, "imsi-3", AccessType::ThreeGpp).0,
             AdmissionResult::RejectedQuotaExceeded
         );
 
-        ctx.release_ue(&s_nssai, "imsi-2");
+        // Releasing imsi-2 frees a slot (the EAC transition, if any, is
+        // incidental to this test).
+        assert!(matches!(
+            ctx.release_ue(&s_nssai, "imsi-2"),
+            ReleaseOutcome::Released(_)
+        ));
         assert_eq!(
-            ctx.admit_ue(&s_nssai, "imsi-3").0,
+            ctx.admit_ue(&s_nssai, "imsi-3", AccessType::ThreeGpp).0,
             AdmissionResult::Admitted
         );
     }
@@ -817,25 +1160,28 @@ mod tests {
         ctx.quota_add(s_nssai.clone(), 10, 2);
 
         assert_eq!(
-            ctx.admit_pdu_session(&s_nssai, "imsi-1:1"),
+            ctx.admit_pdu_session(&s_nssai, "imsi-1:1", AccessType::ThreeGpp),
             AdmissionResult::Admitted
         );
         // idempotent
         assert_eq!(
-            ctx.admit_pdu_session(&s_nssai, "imsi-1:1"),
+            ctx.admit_pdu_session(&s_nssai, "imsi-1:1", AccessType::ThreeGpp),
             AdmissionResult::Admitted
         );
         assert_eq!(
-            ctx.admit_pdu_session(&s_nssai, "imsi-1:2"),
+            ctx.admit_pdu_session(&s_nssai, "imsi-1:2", AccessType::ThreeGpp),
             AdmissionResult::Admitted
         );
         assert_eq!(
-            ctx.admit_pdu_session(&s_nssai, "imsi-2:1"),
+            ctx.admit_pdu_session(&s_nssai, "imsi-2:1", AccessType::ThreeGpp),
             AdmissionResult::RejectedQuotaExceeded
         );
-        assert!(ctx.release_pdu_session(&s_nssai, "imsi-1:2"));
         assert_eq!(
-            ctx.admit_pdu_session(&s_nssai, "imsi-2:1"),
+            ctx.release_pdu_session(&s_nssai, "imsi-1:2"),
+            ReleaseOutcome::Released(None)
+        );
+        assert_eq!(
+            ctx.admit_pdu_session(&s_nssai, "imsi-2:1", AccessType::ThreeGpp),
             AdmissionResult::Admitted
         );
     }
@@ -851,11 +1197,11 @@ mod tests {
 
         // 1..=7 admissions: below 80% threshold, no transition
         for i in 1..=7 {
-            let (_, eac) = ctx.admit_ue(&s_nssai, &format!("imsi-{i}"));
+            let (_, eac) = ctx.admit_ue(&s_nssai, &format!("imsi-{i}"), AccessType::ThreeGpp);
             assert!(eac.is_none(), "no EAC transition expected at {i}/10");
         }
         // 8th admission: 80% reached -> EAC activated
-        let (_, eac) = ctx.admit_ue(&s_nssai, "imsi-8");
+        let (_, eac) = ctx.admit_ue(&s_nssai, "imsi-8", AccessType::ThreeGpp);
         assert_eq!(
             eac,
             Some(EacTransition {
@@ -864,18 +1210,20 @@ mod tests {
             })
         );
         // 9th: still active, no new transition
-        let (_, eac) = ctx.admit_ue(&s_nssai, "imsi-9");
+        let (_, eac) = ctx.admit_ue(&s_nssai, "imsi-9", AccessType::ThreeGpp);
         assert!(eac.is_none());
-        // release back below threshold -> deactivated
-        let eac = ctx.release_ue(&s_nssai, "imsi-9");
-        assert!(eac.is_none(), "8/10 still at threshold");
-        let eac = ctx.release_ue(&s_nssai, "imsi-8");
+        // release back below threshold -> deactivated. A clean release that does
+        // NOT cross the threshold is Released(None); the crossing carries the
+        // EacTransition.
+        let out = ctx.release_ue(&s_nssai, "imsi-9");
+        assert_eq!(out, ReleaseOutcome::Released(None), "8/10 still at threshold");
+        let out = ctx.release_ue(&s_nssai, "imsi-8");
         assert_eq!(
-            eac,
-            Some(EacTransition {
+            out,
+            ReleaseOutcome::Released(Some(EacTransition {
                 s_nssai: s_nssai.clone(),
                 activated: false
-            })
+            }))
         );
     }
 
@@ -890,9 +1238,9 @@ mod tests {
 
         let s_nssai = SNssai::new(6, Some(0x0A0B0C));
         ctx.quota_add(s_nssai.clone(), 5, 10);
-        ctx.admit_ue(&s_nssai, "imsi-100");
-        ctx.admit_ue(&s_nssai, "imsi-101");
-        ctx.admit_pdu_session(&s_nssai, "imsi-100:1");
+        ctx.admit_ue(&s_nssai, "imsi-100", AccessType::ThreeGpp);
+        ctx.admit_ue(&s_nssai, "imsi-101", AccessType::NonThreeGpp);
+        ctx.admit_pdu_session(&s_nssai, "imsi-100:1", AccessType::ThreeGpp);
 
         // Simulate restart: fresh context restores from the state file
         let mut ctx2 = NsacfContext::new();
@@ -904,9 +1252,13 @@ mod tests {
         assert_eq!(quota.max_ues, 5);
         assert_eq!(quota.current_ues(), 2);
         assert_eq!(quota.current_pdu_sessions(), 1);
+        // Per-access membership survives the round-trip (nsacf-05): imsi-100 on
+        // 3GPP, imsi-101 on non-3GPP.
+        assert_eq!(quota.current_ues_access(AccessType::ThreeGpp), 1);
+        assert_eq!(quota.current_ues_access(AccessType::NonThreeGpp), 1);
         // Membership survives: re-admitting an existing SUPI is idempotent
         assert_eq!(
-            ctx2.admit_ue(&s_nssai, "imsi-100").0,
+            ctx2.admit_ue(&s_nssai, "imsi-100", AccessType::ThreeGpp).0,
             AdmissionResult::Admitted
         );
         assert_eq!(
@@ -999,5 +1351,239 @@ mod tests {
         quota.ues.insert("imsi-1".to_string());
         quota.ues.insert("imsi-2".to_string());
         assert!((quota.ue_utilization() - 2.0).abs() < 0.01);
+    }
+
+    // -----------------------------------------------------------------
+    // nsacf-05: per-access-type (anType) counting + per-access reason
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_per_access_ue_counting() {
+        let mut ctx = NsacfContext::new();
+        ctx.init(64);
+
+        // Per-access quota: aggregate room for 10, but only 1 UE per access.
+        let s_nssai = SNssai::new(11, None);
+        ctx.quota_add_with_limits(
+            s_nssai.clone(),
+            10,
+            50,
+            AccessLimits {
+                max_ues_3gpp: Some(1),
+                max_ues_n3gpp: Some(1),
+                ..Default::default()
+            },
+        );
+
+        // First 3GPP UE admits; the 3GPP bucket is now full.
+        assert_eq!(
+            ctx.admit_ue(&s_nssai, "imsi-a", AccessType::ThreeGpp).0,
+            AdmissionResult::Admitted
+        );
+        // Second 3GPP UE: aggregate has room (1/10) but the 3GPP ceiling is hit
+        // -> per-access rejection drives the _3GPP reason (nsacf-05).
+        assert_eq!(
+            ctx.admit_ue(&s_nssai, "imsi-b", AccessType::ThreeGpp).0,
+            AdmissionResult::RejectedQuotaExceededPerAccess(AccessType::ThreeGpp)
+        );
+        // An N3GPP UE for the same slice still admits (separate bucket).
+        assert_eq!(
+            ctx.admit_ue(&s_nssai, "imsi-c", AccessType::NonThreeGpp).0,
+            AdmissionResult::Admitted
+        );
+
+        let quota = ctx.quota_find_by_snssai(&s_nssai).unwrap();
+        assert_eq!(quota.current_ues(), 2, "aggregate counts both accesses");
+        assert_eq!(quota.current_ues_access(AccessType::ThreeGpp), 1);
+        assert_eq!(quota.current_ues_access(AccessType::NonThreeGpp), 1);
+    }
+
+    #[test]
+    fn test_aggregate_only_quota_keeps_plain_reason() {
+        let mut ctx = NsacfContext::new();
+        ctx.init(64);
+
+        // No per-access ceilings configured -> aggregate path, plain reason.
+        let s_nssai = SNssai::new(12, None);
+        ctx.quota_add(s_nssai.clone(), 1, 50);
+        assert_eq!(
+            ctx.admit_ue(&s_nssai, "imsi-a", AccessType::ThreeGpp).0,
+            AdmissionResult::Admitted
+        );
+        assert_eq!(
+            ctx.admit_ue(&s_nssai, "imsi-b", AccessType::NonThreeGpp).0,
+            AdmissionResult::RejectedQuotaExceeded,
+            "aggregate-only quota yields the plain reason regardless of anType"
+        );
+    }
+
+    #[test]
+    fn test_per_access_pdu_counting() {
+        let mut ctx = NsacfContext::new();
+        ctx.init(64);
+
+        let s_nssai = SNssai::new(13, None);
+        ctx.quota_add_with_limits(
+            s_nssai.clone(),
+            50,
+            10,
+            AccessLimits {
+                max_pdu_3gpp: Some(1),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            ctx.admit_pdu_session(&s_nssai, "imsi-a:1", AccessType::ThreeGpp),
+            AdmissionResult::Admitted
+        );
+        assert_eq!(
+            ctx.admit_pdu_session(&s_nssai, "imsi-b:1", AccessType::ThreeGpp),
+            AdmissionResult::RejectedQuotaExceededPerAccess(AccessType::ThreeGpp)
+        );
+        // N3GPP unconstrained -> admits.
+        assert_eq!(
+            ctx.admit_pdu_session(&s_nssai, "imsi-c:1", AccessType::NonThreeGpp),
+            AdmissionResult::Admitted
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // nsacf-06: AcuFlag UPDATE moves access buckets without double-counting
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_update_ue_access_moves_bucket() {
+        let mut ctx = NsacfContext::new();
+        ctx.init(64);
+
+        let s_nssai = SNssai::new(14, None);
+        ctx.quota_add(s_nssai.clone(), 10, 50);
+
+        ctx.admit_ue(&s_nssai, "imsi-1", AccessType::ThreeGpp);
+        let q = ctx.quota_find_by_snssai(&s_nssai).unwrap();
+        assert_eq!(q.current_ues_access(AccessType::ThreeGpp), 1);
+        assert_eq!(q.current_ues_access(AccessType::NonThreeGpp), 0);
+        assert_eq!(q.current_ues(), 1);
+
+        // UPDATE to non-3GPP: bucket moves, aggregate unchanged (no double-count).
+        assert_eq!(
+            ctx.update_ue_access(&s_nssai, "imsi-1", AccessType::NonThreeGpp),
+            UpdateOutcome::Updated
+        );
+        let q = ctx.quota_find_by_snssai(&s_nssai).unwrap();
+        assert_eq!(q.current_ues_access(AccessType::ThreeGpp), 0);
+        assert_eq!(q.current_ues_access(AccessType::NonThreeGpp), 1);
+        assert_eq!(q.current_ues(), 1, "aggregate not double-counted on UPDATE");
+
+        // UPDATE again to the same access is idempotent.
+        assert_eq!(
+            ctx.update_ue_access(&s_nssai, "imsi-1", AccessType::NonThreeGpp),
+            UpdateOutcome::Updated
+        );
+
+        // UPDATE for an unknown SUPI -> NotFound (becomes SLICE_NOT_FOUND).
+        assert_eq!(
+            ctx.update_ue_access(&s_nssai, "imsi-unknown", AccessType::ThreeGpp),
+            UpdateOutcome::NotFound
+        );
+        // UPDATE on an unconfigured slice -> NotFound.
+        assert_eq!(
+            ctx.update_ue_access(&SNssai::new(97, None), "imsi-1", AccessType::ThreeGpp),
+            UpdateOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn test_update_pdu_access_moves_bucket() {
+        let mut ctx = NsacfContext::new();
+        ctx.init(64);
+
+        let s_nssai = SNssai::new(15, None);
+        ctx.quota_add(s_nssai.clone(), 50, 10);
+        ctx.admit_pdu_session(&s_nssai, "imsi-1:1", AccessType::ThreeGpp);
+
+        assert_eq!(
+            ctx.update_pdu_access(&s_nssai, "imsi-1:1", AccessType::NonThreeGpp),
+            UpdateOutcome::Updated
+        );
+        let q = ctx.quota_find_by_snssai(&s_nssai).unwrap();
+        assert_eq!(q.current_pdu_access(AccessType::ThreeGpp), 0);
+        assert_eq!(q.current_pdu_access(AccessType::NonThreeGpp), 1);
+        assert_eq!(q.current_pdu_sessions(), 1);
+
+        assert_eq!(
+            ctx.update_pdu_access(&s_nssai, "imsi-unknown:1", AccessType::ThreeGpp),
+            UpdateOutcome::NotFound
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // nsacf-10: DECREASE membership/cause correctness
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_release_outcomes() {
+        let mut ctx = NsacfContext::new();
+        ctx.init(64);
+
+        let s_nssai = SNssai::new(16, None);
+        ctx.quota_add(s_nssai.clone(), 10, 50);
+        ctx.admit_ue(&s_nssai, "imsi-1", AccessType::ThreeGpp);
+
+        // Clean release of a present member.
+        assert_eq!(
+            ctx.release_ue(&s_nssai, "imsi-1"),
+            ReleaseOutcome::Released(None)
+        );
+        // Releasing again: slice known, member absent -> idempotent.
+        assert_eq!(
+            ctx.release_ue(&s_nssai, "imsi-1"),
+            ReleaseOutcome::MemberAbsent
+        );
+        // Release on a slice that is not NSAC-subject -> SliceNotFound.
+        assert_eq!(
+            ctx.release_ue(&SNssai::new(96, None), "imsi-1"),
+            ReleaseOutcome::SliceNotFound
+        );
+
+        // PDU mirror.
+        ctx.admit_pdu_session(&s_nssai, "imsi-1:1", AccessType::ThreeGpp);
+        assert_eq!(
+            ctx.release_pdu_session(&s_nssai, "imsi-1:1"),
+            ReleaseOutcome::Released(None)
+        );
+        assert_eq!(
+            ctx.release_pdu_session(&s_nssai, "imsi-1:1"),
+            ReleaseOutcome::MemberAbsent
+        );
+        assert_eq!(
+            ctx.release_pdu_session(&SNssai::new(96, None), "imsi-1:1"),
+            ReleaseOutcome::SliceNotFound
+        );
+    }
+
+    #[test]
+    fn test_access_type_from_an_type_defaults_3gpp() {
+        assert_eq!(
+            AccessType::from_an_type(Some("3GPP_ACCESS")),
+            AccessType::ThreeGpp
+        );
+        assert_eq!(
+            AccessType::from_an_type(Some("NON_3GPP_ACCESS")),
+            AccessType::NonThreeGpp
+        );
+        // Absent or unrecognised -> default 3GPP (accept-and-default).
+        assert_eq!(AccessType::from_an_type(None), AccessType::ThreeGpp);
+        assert_eq!(AccessType::from_an_type(Some("WLAN")), AccessType::ThreeGpp);
+    }
+
+    #[test]
+    fn test_snssai_to_key_roundtrip() {
+        assert_eq!(SNssai::new(1, None).to_key(), "1");
+        assert_eq!(SNssai::new(2, Some(0x0A0B0C)).to_key(), "2-0a0b0c");
+        assert_eq!(
+            SNssai::from_path_segment(&SNssai::new(2, Some(0x0A0B0C)).to_key()),
+            Some(SNssai::new(2, Some(0x0A0B0C)))
+        );
     }
 }
