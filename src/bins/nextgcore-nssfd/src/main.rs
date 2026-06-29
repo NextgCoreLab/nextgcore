@@ -166,11 +166,25 @@ fn attach_oauth2(client: SbiClient, target: NfType) -> SbiClient {
     }
 }
 
+/// A single configured S-NSSAI (`{ sst: <u8>, sd: "<6 hex>" }`), used by the
+/// optional PLMN-supported-S-NSSAI restriction (nssfd-01).
+#[derive(Debug, Default, Deserialize)]
+struct SnssaiYaml {
+    sst: u8,
+    sd: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct NssfSection {
     sbi: Option<SbiYaml>,
     /// Target AMF Set ID used for AMF re-selection in registration scenarios
     amf_set_id: Option<String>,
+    /// Optional explicit set of S-NSSAIs supported in this PLMN
+    /// (TS 29.531 §6.2.3.2.3.1). ABSENT (the default) => NO restriction =>
+    /// allow-all (matched-sim back-compat). When present, an NSSAIAvailability
+    /// PUT/PATCH reporting an S-NSSAI outside this set is rejected with 403
+    /// SNSSAI_NOT_SUPPORTED.
+    supported_snssai_list: Option<Vec<SnssaiYaml>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -257,6 +271,32 @@ async fn main() -> Result<()> {
                             log::info!("Target AMF Set configured: {set_id}");
                             if let Ok(ctx) = nssf_self().read() {
                                 ctx.set_target_amf_set(&set_id);
+                            }
+                        }
+                        // nssfd-01: optional PLMN-supported S-NSSAI restriction.
+                        // When ABSENT (the default) the NSSF imposes no
+                        // restriction (allow-all, matched-sim back-compat); when
+                        // present, an availability update reporting an S-NSSAI
+                        // outside this set is rejected with 403
+                        // SNSSAI_NOT_SUPPORTED (TS 29.531 §6.2.3.2.3.1).
+                        if let Some(list) = nssf.supported_snssai_list {
+                            let snssais: Vec<context::SNssai> = list
+                                .iter()
+                                .map(|s| {
+                                    let sd = s
+                                        .sd
+                                        .as_deref()
+                                        .and_then(|h| u32::from_str_radix(h, 16).ok())
+                                        .and_then(|v| if v == 0xFF_FFFF { None } else { Some(v) });
+                                    context::SNssai::new(s.sst, sd)
+                                })
+                                .collect();
+                            log::info!(
+                                "PLMN-supported S-NSSAI restriction configured: {} entries",
+                                snssais.len()
+                            );
+                            if let Ok(ctx) = nssf_self().read() {
+                                ctx.set_plmn_supported_snssais(Some(snssais));
                             }
                         }
                         if let Some(sbi) = nssf.sbi {
@@ -1185,6 +1225,110 @@ fn validate_availability_doc(doc: &serde_json::Value) -> Result<Vec<context::Tai
     Ok(tais)
 }
 
+/// Outcome of the NSSAIAvailability authorization / PLMN-support cross-check
+/// (TS 29.531 §6.2.3.2.3.1, TS 33.521). Both variants map to 403 Forbidden;
+/// only the ProblemDetails `cause` differs.
+enum AvailabilityAuthError {
+    /// NF service consumer (identified by NF Id) is not authorized to update
+    /// the NSSAI availability information -> cause `NOT_AUTHORIZED`.
+    Unauthorized(String),
+    /// A reported S-NSSAI is not supported in the PLMN -> `SNSSAI_NOT_SUPPORTED`.
+    UnsupportedSnssai(String),
+}
+
+impl AvailabilityAuthError {
+    /// Render the 403 ProblemDetails (TS 29.531 §6.2.3.2.3.1 Table
+    /// 6.2.3.2.3.1-2) carrying the appropriate `cause`.
+    fn into_problem(self) -> SbiResponse {
+        match self {
+            AvailabilityAuthError::Unauthorized(detail) => {
+                problem_details(403, "Forbidden", &detail, Some("NOT_AUTHORIZED"))
+            }
+            AvailabilityAuthError::UnsupportedSnssai(detail) => {
+                problem_details(403, "Forbidden", &detail, Some("SNSSAI_NOT_SUPPORTED"))
+            }
+        }
+    }
+}
+
+/// Cross-check an NssaiAvailabilityInfo document against the consumer's
+/// authorization and the PLMN-supported S-NSSAI set (TS 29.531 §6.2.3.2.3.1,
+/// TS 33.521). Pure (no global state) so it is unit-testable in isolation.
+///
+/// Default-allow stance (matched-sim back-compat, TS 29.531 §6.2.3.2.3.1):
+///   * `authorized == true` is the default for any non-empty NF Id; only a
+///     missing/empty NF Id yields `NOT_AUTHORIZED`. We deliberately do NOT
+///     require an NRF lookup here, which would otherwise reject the matched
+///     simulator's AMF.
+///   * `restriction == None` means NO PLMN restriction is configured, so EVERY
+///     reported S-NSSAI is accepted (the matched-sim registers default slices,
+///     e.g. sst=1, and must not be newly rejected). `SNSSAI_NOT_SUPPORTED` is
+///     returned ONLY when a restriction is explicitly configured AND a reported
+///     S-NSSAI falls outside it.
+///
+/// Authorization is checked before PLMN support so a forbidden consumer is
+/// rejected regardless of slice contents.
+fn authorize_availability_doc(
+    nf_id: &str,
+    doc: &serde_json::Value,
+    authorized: bool,
+    restriction: Option<&[context::SNssai]>,
+) -> Result<(), AvailabilityAuthError> {
+    if !authorized {
+        return Err(AvailabilityAuthError::Unauthorized(format!(
+            "NF Id '{nf_id}' is not authorized to update NSSAI availability information"
+        )));
+    }
+    let Some(allowed) = restriction else {
+        // No restriction configured -> allow all (default-allow, see above).
+        return Ok(());
+    };
+    for (_tais, snssais) in context::availability_entries(doc) {
+        for s in &snssais {
+            if !allowed.contains(s) {
+                let sd = s
+                    .sd
+                    .map(|v| format!("{v:06x}"))
+                    .unwrap_or_else(|| "none".to_string());
+                return Err(AvailabilityAuthError::UnsupportedSnssai(format!(
+                    "S-NSSAI (sst={}, sd={sd}) is not supported in the PLMN",
+                    s.sst
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Snapshot the NSSF's availability-authorization config from the global
+/// context and run [`authorize_availability_doc`]. Returns the 403
+/// ProblemDetails response on failure, `None` when the update is permitted.
+fn check_availability_authorization(
+    nf_id: &str,
+    doc: &serde_json::Value,
+    affected_tais: &[context::Tai],
+) -> Option<SbiResponse> {
+    let tai = affected_tais.first().cloned().unwrap_or_default();
+    let (authorized, restriction) = with_nssf_context(|context| {
+        let restriction = if context.has_plmn_snssai_restriction() {
+            Some(context.plmn_supported_snssais())
+        } else {
+            None
+        };
+        (
+            context.nf_authorized_for_availability(nf_id, &tai),
+            restriction,
+        )
+    })
+    // If the context lock is poisoned, fall back to the default-allow policy
+    // (authorize any non-empty NF Id; impose no S-NSSAI restriction).
+    .unwrap_or_else(|| (!nf_id.trim().is_empty(), None));
+
+    authorize_availability_doc(nf_id, doc, authorized, restriction.as_deref())
+        .err()
+        .map(AvailabilityAuthError::into_problem)
+}
+
 /// Build the AuthorizedNssaiAvailabilityInfo response for a stored doc
 fn authorized_availability_response(doc: &serde_json::Value) -> SbiResponse {
     let response = serde_json::json!({
@@ -1227,6 +1371,14 @@ async fn handle_nssai_availability_update(nf_id: &str, request: &SbiRequest) -> 
         Ok(t) => t,
         Err(e) => return problem_details(400, "Bad Request", &e, Some("MANDATORY_IE_MISSING")),
     };
+
+    // nssfd-01: authorize the consumer + cross-check every reported S-NSSAI
+    // against the PLMN-supported set BEFORE storing or notifying (TS 29.531
+    // §6.2.3.2.3.1, TS 33.521). On failure the 403 returns here, so nothing is
+    // stored and no notification is spawned.
+    if let Some(resp) = check_availability_authorization(nf_id, &doc, &affected_tais) {
+        return resp;
+    }
 
     let info = context::availability_info_from_doc(nf_id, doc.clone());
     with_nssf_context(|context| context.set_nssai_availability(nf_id, info));
@@ -1304,6 +1456,14 @@ async fn handle_nssai_availability_patch(nf_id: &str, request: &SbiRequest) -> S
             )
         }
     };
+
+    // nssfd-01: apply the identical authorization + PLMN-support cross-check to
+    // the POST-PATCH document before committing (TS 29.531 §6.2.3.2.3.1). A
+    // patch that introduces an S-NSSAI unsupported in the PLMN is rejected with
+    // 403 and the previously stored document is left unchanged.
+    if let Some(resp) = check_availability_authorization(nf_id, &patched, &affected_tais) {
+        return resp;
+    }
 
     let info = context::availability_info_from_doc(nf_id, patched.clone());
     with_nssf_context(|context| context.set_nssai_availability(nf_id, info));
@@ -2177,6 +2337,18 @@ mod tests {
         port
     }
 
+    /// Serializes tests that mutate the *global* NSSF availability/restriction
+    /// state (the context is a process-wide singleton). Without this, the
+    /// PLMN-supported restriction one test installs could leak into another
+    /// running concurrently and flip an expected 200 into a 403 (or vice
+    /// versa). An async-aware `tokio::sync::Mutex` is used so the guard may be
+    /// held across the handler `.await` points (clippy `await_holding_lock`),
+    /// and it does not poison on a failing test.
+    async fn availability_state_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        static GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        GUARD.lock().await
+    }
+
     async fn start_nssf_server() -> (SbiServer, u16) {
         nssf_context_init(512);
         let port = free_port();
@@ -2432,7 +2604,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_http_availability_lifecycle_with_notifications() {
+        // Serialize against the nssfd-01 restriction tests and clear any
+        // restriction so this lifecycle PUT/PATCH path sees the default
+        // allow-all (matched-sim back-compat).
+        let _state_guard = availability_state_guard().await;
         let (server, port) = start_nssf_server().await;
+        with_nssf_context(|c| c.set_plmn_supported_snssais(None));
         let client = SbiClient::with_host_port("127.0.0.1", port);
 
         // Notification receiver on its own ephemeral port
@@ -2633,5 +2810,182 @@ mod tests {
 
         server.stop().await.expect("stop");
         receiver.stop().await.expect("stop receiver");
+    }
+
+    // -----------------------------------------------------------------
+    // nssfd-01: NSSAIAvailability PUT/PATCH PLMN-support + authorization
+    // (TS 29.531 §6.2.3.2.3.1, TS 33.521). Handlers are driven directly so
+    // the 403-before-store/notify ordering is observable.
+    // -----------------------------------------------------------------
+
+    /// (a) With a configured restricted set, PUT an S-NSSAI outside it ->
+    /// 403 SNSSAI_NOT_SUPPORTED; nothing stored, no notification spawned.
+    #[tokio::test]
+    async fn test_availability_put_unsupported_snssai_403() {
+        let _state_guard = availability_state_guard().await;
+        nssf_context_init(512);
+        // Restrict the PLMN to sst=1 only; the PUT reports sst=2 (outside it).
+        with_nssf_context(|c| {
+            c.set_plmn_supported_snssais(Some(vec![context::SNssai::new(1, None)]))
+        });
+
+        let nf_id = "amf-nssfd01-unsupported";
+        let _ = with_nssf_context(|c| c.remove_nssai_availability(nf_id));
+
+        let body = json!({
+            "supportedNssaiAvailabilityData": [{
+                "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "000001"},
+                "supportedSnssaiList": [{"sst": 2, "sd": "0a0b0c"}]
+            }]
+        });
+        let req = SbiRequest::put(format!(
+            "/nnssf-nssaiavailability/v1/nssai-availability/{nf_id}"
+        ))
+        .with_json_body(&body)
+        .unwrap();
+        let resp = handle_nssai_availability_update(nf_id, &req).await;
+
+        assert_eq!(resp.status, 403);
+        let pd: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(pd["status"], 403);
+        assert_eq!(pd["cause"], "SNSSAI_NOT_SUPPORTED");
+        // Nothing stored. The 403 returns before set_nssai_availability + the
+        // spawn_availability_notifications call, so no notification is spawned.
+        assert!(with_nssf_context(|c| c.get_nssai_availability(nf_id))
+            .flatten()
+            .is_none());
+
+        with_nssf_context(|c| c.set_plmn_supported_snssais(None));
+    }
+
+    /// (b) PUT with an empty NF Id -> 403 NOT_AUTHORIZED.
+    #[tokio::test]
+    async fn test_availability_put_empty_nf_id_403_not_authorized() {
+        let _state_guard = availability_state_guard().await;
+        nssf_context_init(512);
+        with_nssf_context(|c| c.set_plmn_supported_snssais(None)); // no restriction
+
+        let body = json!({
+            "supportedNssaiAvailabilityData": [{
+                "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "000001"},
+                "supportedSnssaiList": [{"sst": 1}]
+            }]
+        });
+        let req = SbiRequest::put("/nnssf-nssaiavailability/v1/nssai-availability/")
+            .with_json_body(&body)
+            .unwrap();
+        // Empty NF Id is unauthorized regardless of slice contents.
+        let resp = handle_nssai_availability_update("", &req).await;
+
+        assert_eq!(resp.status, 403);
+        let pd: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(pd["status"], 403);
+        assert_eq!(pd["cause"], "NOT_AUTHORIZED");
+        assert!(with_nssf_context(|c| c.get_nssai_availability(""))
+            .flatten()
+            .is_none());
+    }
+
+    /// (c) PUT with all-supported S-NSSAIs (here: no restriction configured)
+    /// -> 200 and stored.
+    #[tokio::test]
+    async fn test_availability_put_all_supported_200_stored() {
+        let _state_guard = availability_state_guard().await;
+        nssf_context_init(512);
+        with_nssf_context(|c| c.set_plmn_supported_snssais(None)); // default allow-all
+
+        let nf_id = "amf-nssfd01-ok";
+        let _ = with_nssf_context(|c| c.remove_nssai_availability(nf_id));
+
+        let body = json!({
+            "supportedNssaiAvailabilityData": [{
+                "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "000001"},
+                "supportedSnssaiList": [{"sst": 1}]
+            }]
+        });
+        let req = SbiRequest::put(format!(
+            "/nnssf-nssaiavailability/v1/nssai-availability/{nf_id}"
+        ))
+        .with_json_body(&body)
+        .unwrap();
+        let resp = handle_nssai_availability_update(nf_id, &req).await;
+
+        assert_eq!(resp.status, 200);
+        let stored = with_nssf_context(|c| c.get_nssai_availability(nf_id)).flatten();
+        assert!(stored.is_some(), "supported PUT must be stored");
+        assert_eq!(
+            stored.unwrap().supported_snssai_list,
+            vec![context::SNssai::new(1, None)]
+        );
+
+        let _ = with_nssf_context(|c| c.remove_nssai_availability(nf_id));
+    }
+
+    /// (d) PATCH producing an unsupported S-NSSAI -> 403; original doc
+    /// unchanged.
+    #[tokio::test]
+    async fn test_availability_patch_unsupported_snssai_403_original_unchanged() {
+        let _state_guard = availability_state_guard().await;
+        nssf_context_init(512);
+        // Restrict to sst=1: the initial PUT (sst=1) is accepted; the PATCH
+        // that appends sst=2 must be rejected and leave the stored doc intact.
+        with_nssf_context(|c| {
+            c.set_plmn_supported_snssais(Some(vec![context::SNssai::new(1, None)]))
+        });
+
+        let nf_id = "amf-nssfd01-patch";
+        let _ = with_nssf_context(|c| c.remove_nssai_availability(nf_id));
+
+        let put_body = json!({
+            "supportedNssaiAvailabilityData": [{
+                "tai": {"plmnId": {"mcc": "999", "mnc": "70"}, "tac": "000001"},
+                "supportedSnssaiList": [{"sst": 1}]
+            }]
+        });
+        let put_req = SbiRequest::put(format!(
+            "/nnssf-nssaiavailability/v1/nssai-availability/{nf_id}"
+        ))
+        .with_json_body(&put_body)
+        .unwrap();
+        assert_eq!(
+            handle_nssai_availability_update(nf_id, &put_req).await.status,
+            200
+        );
+
+        // PATCH appends an unsupported S-NSSAI (sst=2) -> 403, doc unchanged.
+        let patch = json!([{
+            "op": "add",
+            "path": "/supportedNssaiAvailabilityData/0/supportedSnssaiList/-",
+            "value": {"sst": 2}
+        }]);
+        let patch_req = SbiRequest::patch(format!(
+            "/nnssf-nssaiavailability/v1/nssai-availability/{nf_id}"
+        ))
+        .with_body(patch.to_string(), "application/json-patch+json");
+        let resp = handle_nssai_availability_patch(nf_id, &patch_req).await;
+
+        assert_eq!(resp.status, 403);
+        let pd: serde_json::Value =
+            serde_json::from_str(resp.http.content.as_deref().unwrap()).unwrap();
+        assert_eq!(pd["status"], 403);
+        assert_eq!(pd["cause"], "SNSSAI_NOT_SUPPORTED");
+
+        // Original document unchanged: still exactly [sst=1].
+        let stored = with_nssf_context(|c| c.get_nssai_availability(nf_id))
+            .flatten()
+            .expect("original doc must remain stored after a rejected PATCH");
+        assert_eq!(
+            stored.supported_snssai_list,
+            vec![context::SNssai::new(1, None)]
+        );
+        let arr = stored.doc["supportedNssaiAvailabilityData"][0]["supportedSnssaiList"]
+            .as_array()
+            .unwrap();
+        assert_eq!(arr.len(), 1, "rejected PATCH must not mutate the stored doc");
+
+        with_nssf_context(|c| c.set_plmn_supported_snssais(None));
+        let _ = with_nssf_context(|c| c.remove_nssai_availability(nf_id));
     }
 }

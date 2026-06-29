@@ -364,6 +364,11 @@ pub struct NssfContext {
     subscriptions: RwLock<HashMap<String, NssfSubscription>>,
     /// Configured target AMF Set ID for AMF re-selection (TS 29.531 targetAmfSet)
     target_amf_set: RwLock<Option<String>>,
+    /// Explicitly configured set of S-NSSAIs supported in this PLMN
+    /// (TS 29.531 §6.2.3.2.3.1). `None` => NO restriction configured =>
+    /// allow-all (matched-sim back-compat); `Some(set)` => only these
+    /// S-NSSAIs may be reported in an NSSAIAvailability PUT/PATCH.
+    plmn_supported_snssai_restriction: RwLock<Option<Vec<SNssai>>>,
     /// Next NSI ID
     next_nsi_id: AtomicUsize,
     /// Next Home ID
@@ -387,6 +392,7 @@ impl NssfContext {
             nssai_availability: RwLock::new(HashMap::new()),
             subscriptions: RwLock::new(HashMap::new()),
             target_amf_set: RwLock::new(None),
+            plmn_supported_snssai_restriction: RwLock::new(None),
             next_nsi_id: AtomicUsize::new(1),
             next_home_id: AtomicUsize::new(1),
             max_num_of_nf: 0,
@@ -809,6 +815,54 @@ impl NssfContext {
 
     pub fn get_target_amf_set(&self) -> Option<String> {
         self.target_amf_set.read().ok()?.clone()
+    }
+
+    // -- NSSAI-availability authorization & PLMN S-NSSAI support (nssfd-01) --
+
+    /// Configure (or clear) the set of S-NSSAIs supported in this PLMN.
+    ///
+    /// `Some(list)` installs an explicit restriction; `None` clears it,
+    /// restoring the default allow-all behaviour (matched-sim back-compat).
+    pub fn set_plmn_supported_snssais(&self, list: Option<Vec<SNssai>>) {
+        if let Ok(mut g) = self.plmn_supported_snssai_restriction.write() {
+            *g = list;
+        }
+    }
+
+    /// The PLMN-supported S-NSSAI set sourced from NSSF configuration
+    /// (TS 29.531 §6.2.3.2.3.1). Returns an empty vector when NO restriction
+    /// is configured; callers MUST consult [`Self::has_plmn_snssai_restriction`]
+    /// to distinguish "no restriction (allow all)" from "restricted to {}".
+    pub fn plmn_supported_snssais(&self) -> Vec<SNssai> {
+        self.plmn_supported_snssai_restriction
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether an explicit PLMN-supported-S-NSSAI restriction is configured.
+    ///
+    /// Default-allow stance (TS 29.531 §6.2.3.2.3.1 + matched-sim back-compat):
+    /// when this is `false` the NSSF accepts ANY reported S-NSSAI; only an
+    /// explicitly configured restriction can trigger 403 SNSSAI_NOT_SUPPORTED.
+    pub fn has_plmn_snssai_restriction(&self) -> bool {
+        self.plmn_supported_snssai_restriction
+            .read()
+            .map(|g| g.is_some())
+            .unwrap_or(false)
+    }
+
+    /// Whether the NF service consumer identified by `nf_id` is authorized to
+    /// update the NSSAI-availability information for `_tai` (TS 33.521).
+    ///
+    /// Default-allow stance (matched-sim back-compat): authorize any non-empty
+    /// NF Id and reject only a missing/empty NF Id, rather than requiring an
+    /// NRF round-trip that would break the matched simulator's AMF. `_tai` is
+    /// accepted for spec fidelity and future per-TA authorization (TS 33.521)
+    /// but is not consulted under the default-allow policy.
+    pub fn nf_authorized_for_availability(&self, nf_id: &str, _tai: &Tai) -> bool {
+        !nf_id.trim().is_empty()
     }
 
     /// Get supported S-NSSAIs for a specific TAI from NSSAI availability data.
