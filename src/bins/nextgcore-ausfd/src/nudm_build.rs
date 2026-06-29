@@ -203,10 +203,14 @@ fn is_leap_year(year: u64) -> bool {
     (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
 }
 
-/// Get NF instance ID (placeholder)
+/// Get the AUSF NF instance ID for the inert FSM-path request builders.
+///
+/// ausfd-09: the LIVE Nudm request path (`send_udm_generate_auth_data` in
+/// main.rs) resolves the real registered NF instance id from the SBI context
+/// (`get_self_instance().await`). These synchronous builders are the legacy
+/// state-machine path and cannot await the async accessor, so they retain the
+/// static fallback used when no self instance has been registered yet.
 fn get_nf_instance_id() -> String {
-    // Note: In production, this should be obtained from SBI context
-    // For now, using placeholder value
     "ausf-instance-id".to_string()
 }
 

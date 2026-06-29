@@ -366,6 +366,31 @@ async fn handle_ue_authentication(request: &SbiRequest) -> SbiResponse {
         );
     }
 
+    // ausfd-05: bind the SNN to the requesting consumer (AMF/SEAF) identity.
+    // TS 33.501 §6.1.2: the AUSF shall check the SNN is allowed for the
+    // requester. We resolve the consumer's PLMN set from the OAuth2 access token
+    // (plmnList claim). DEFAULT-PERMISSIVE: when no token is present (or it
+    // carries no plmnList) the set is empty and the SNN is allowed, so token-less
+    // peers (e.g. the matched simulator) are not rejected.
+    let consumer_plmns = request
+        .http
+        .get_header("Authorization")
+        .map(|h| extract_consumer_plmns(h))
+        .unwrap_or_default();
+    if !nextgcore_ausfd::nausf_handler::snn_authorized_for_consumer(
+        serving_network_name,
+        &consumer_plmns,
+    ) {
+        log::warn!(
+            "SNN '{serving_network_name}' not authorized for consumer PLMNs {consumer_plmns:?}"
+        );
+        return send_problem(
+            403,
+            "SERVING_NETWORK_NOT_AUTHORIZED",
+            &format!("Serving network '{serving_network_name}' not allowed for consumer"),
+        );
+    }
+
     log::info!("UE Authentication: SUPI/SUCI={supi_or_suci}, SNN={serving_network_name}");
 
     // Find or create UE in context
@@ -531,6 +556,58 @@ async fn handle_ue_authentication(request: &SbiRequest) -> SbiResponse {
     }
 }
 
+/// Extract the consumer's allowed PLMN set from an OAuth2 access token (ausfd-05).
+///
+/// The `Authorization: Bearer <jwt>` header carries a TS 33.501 / RFC 9068 access
+/// token. We decode the JWT payload (base64url, second segment) and read the
+/// `plmnList` claim (array of `{mcc, mnc}` strings, TS 29.571 PlmnId). Any
+/// failure (no token, unparseable JWT, absent claim) yields an empty set, which
+/// the entitlement check treats as default-permissive.
+///
+/// NOTE: the SBI server layer does not yet surface validated token claims to the
+/// handler, so this performs an unverified payload decode purely to read the
+/// asserted PLMN list. Full enforcement (signature-validated claims, or an
+/// NRF NF-profile PLMN lookup) is a follow-up once that plumbing exists.
+fn extract_consumer_plmns(authorization: &str) -> Vec<(String, String)> {
+    let token = authorization
+        .strip_prefix("Bearer ")
+        .or_else(|| authorization.strip_prefix("bearer "))
+        .unwrap_or(authorization)
+        .trim();
+
+    let payload_b64 = match token.split('.').nth(1) {
+        Some(p) if !p.is_empty() => p,
+        _ => return Vec::new(),
+    };
+
+    // base64url -> standard base64 (+ padding) for the shared decoder.
+    let mut std_b64 = payload_b64.replace('-', "+").replace('_', "/");
+    while std_b64.len() % 4 != 0 {
+        std_b64.push('=');
+    }
+    let bytes = match ogs_crypt::base64::decode(&std_b64) {
+        Some(b) => b,
+        None => return Vec::new(),
+    };
+    let json: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(j) => j,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut plmns = Vec::new();
+    if let Some(arr) = json.get("plmnList").and_then(|v| v.as_array()) {
+        for p in arr {
+            if let (Some(mcc), Some(mnc)) = (
+                p.get("mcc").and_then(|v| v.as_str()),
+                p.get("mnc").and_then(|v| v.as_str()),
+            ) {
+                plmns.push((mcc.to_string(), mnc.to_string()));
+            }
+        }
+    }
+    plmns
+}
+
 /// Build an RFC 7807 / TS 29.500 ProblemDetails response.
 fn send_problem(status: u16, cause: &str, detail: &str) -> SbiResponse {
     SbiResponse::with_status(status)
@@ -638,17 +715,17 @@ async fn handle_5g_aka_confirmation(auth_ctx_id: &str, request: &SbiRequest) -> 
     let mut res_star = [0u8; 16];
     res_star.copy_from_slice(&res_star_bytes);
 
-    // Compute HRES* from RAND and RES* (same derivation as HXRES* from RAND and XRES*)
-    let hres_star = ogs_crypt::kdf::ogs_kdf_hxres_star(&ausf_ue.rand, &res_star);
-
-    // Compare HRES* with stored HXRES*
-    if nextgcore_ausfd::nausf_handler::compare_res_star(&hres_star, &ausf_ue.hxres_star) {
+    // ausfd-02: the AUSF compares the received RES* directly against the stored
+    // XRES* using a constant-time comparison (TS 33.501 §6.1.3.2 step 11). The
+    // HRES*/HXRES* comparison (step 9) is the SEAF's job; HXRES* is computed only
+    // for the 201 `5gAuthData.hxresStar` body, not for this decision.
+    if nextgcore_ausfd::nausf_handler::compare_res_star(&res_star, &ausf_ue.xres_star) {
         ausf_ue.auth_result = nextgcore_ausfd::AuthResult::AuthenticationSuccess;
         log::info!("[{}] 5G-AKA authentication succeeded", ausf_ue.suci);
     } else {
         ausf_ue.auth_result = nextgcore_ausfd::AuthResult::AuthenticationFailure;
         log::warn!(
-            "[{}] 5G-AKA authentication failed (HRES* != HXRES*)",
+            "[{}] 5G-AKA authentication failed (RES* != XRES*)",
             ausf_ue.suci
         );
     }
@@ -797,6 +874,67 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
     match eap_subtype {
         // Challenge Response (subtype=1) - RFC 5448 / RFC 9048
         1 => {
+            // ausfd-06: AT_KDF negotiation (RFC 9048 §3.2) and AT_BIDDING
+            // down-protection (RFC 5448 §4) are evaluated before RES/MAC
+            // verification. A bidding-down attempt or an unsupported KDF fails
+            // the exchange; a supported-but-different KDF triggers a single
+            // re-issue of the Challenge with the negotiated KDF.
+            use nextgcore_ausfd::eap_aka_prime::KdfNegotiation;
+            if let Some(packet) =
+                nextgcore_ausfd::eap_aka_prime::EapPacket::decode(&eap_bytes)
+            {
+                match session.check_kdf_and_bidding(&packet) {
+                    KdfNegotiation::BiddingDown | KdfNegotiation::Unsupported(_) => {
+                        log::warn!(
+                            "[{}] EAP-AKA' rejected: KDF/bidding negotiation failure",
+                            ausf_ue.suci
+                        );
+                        ausf_ue.auth_result =
+                            nextgcore_ausfd::AuthResult::AuthenticationFailure;
+                        ausf_ue.eap_session = Some(session);
+                        if let Ok(context) = ctx.read() {
+                            context.ue_update(&ausf_ue);
+                        }
+                        let eap_failure = vec![4u8, eap_id, 0, 4];
+                        return SbiResponse::with_status(200)
+                            .with_json_body(&serde_json::json!({
+                                "authResult": "AUTHENTICATION_FAILURE",
+                                "eapPayload": ogs_crypt::base64::encode(&eap_failure)
+                            }))
+                            .unwrap_or_else(|_| SbiResponse::with_status(200));
+                    }
+                    KdfNegotiation::Renegotiate(kdf) => {
+                        log::info!(
+                            "[{}] EAP-AKA' renegotiating AT_KDF -> {kdf}",
+                            ausf_ue.suci
+                        );
+                        session.offered_kdf = kdf;
+                        session.kdf_renegotiated = true;
+                        session.identifier = session.identifier.wrapping_add(1);
+                        let challenge = session.generate_challenge();
+                        let eap_payload_b64 =
+                            ogs_crypt::base64::encode(&challenge.encode());
+                        ausf_ue.eap_session = Some(session);
+                        if let Ok(context) = ctx.read() {
+                            context.ue_update(&ausf_ue);
+                        }
+                        return SbiResponse::with_status(200)
+                            .with_json_body(&serde_json::json!({
+                                "eapPayload": eap_payload_b64,
+                                "_links": {
+                                    "eap-session": {
+                                        "href": format!(
+                                            "/nausf-auth/v1/ue-authentications/{auth_ctx_id_owned}/eap-session"
+                                        )
+                                    }
+                                }
+                            }))
+                            .unwrap_or_else(|_| SbiResponse::with_status(200));
+                    }
+                    KdfNegotiation::Accept => {}
+                }
+            }
+
             // Full verification: AT_MAC over the packet with zeroed MAC field
             // (K_aut from the RFC 5448 key schedule), then RES against XRES.
             let auth_success = session.process_challenge_response_bytes(&eap_bytes);
@@ -972,7 +1110,108 @@ async fn handle_eap_session(auth_ctx_id: &str, request: &SbiRequest) -> SbiRespo
 
 async fn handle_auth_context_delete(auth_ctx_id: &str) -> SbiResponse {
     log::info!("Auth Context Delete: auth_ctx_id={auth_ctx_id}");
-    SbiResponse::with_status(204)
+
+    // ausfd-08: TS 29.509 DELETE ue-authentications/{authCtxId} and TS 33.501
+    // §6.1.4.1a context teardown — look up the UE, return 404 if absent, else
+    // remove it and zeroize its key material (KAUSF/KSEAF/XRES*).
+    let ctx = ausf_self();
+
+    let ue_id = {
+        if let Ok(context) = ctx.read() {
+            context.ue_find_by_ctx_id(auth_ctx_id).map(|ue| ue.id)
+        } else {
+            None
+        }
+    };
+
+    let ue_id = match ue_id {
+        Some(id) => id,
+        None => {
+            return send_not_found("Authentication context not found", None);
+        }
+    };
+
+    let removed = {
+        if let Ok(context) = ctx.read() {
+            context.ue_remove(ue_id)
+        } else {
+            None
+        }
+    };
+
+    match removed {
+        Some(mut ue) => {
+            // Zeroize the removed context's keys before it is dropped.
+            ue.zeroize();
+            log::info!("[{}] Authentication context deleted and zeroized", ue.suci);
+            SbiResponse::with_status(204)
+        }
+        None => send_not_found("Authentication context not found", None),
+    }
+}
+
+/// Validate the UDM AuthenticationInfoResult `avType` against the selected
+/// `authType` (ausfd-07).
+///
+/// TS 29.503: `avType` ∈ {`5G_HE_AKA`, `EAP_AKA_PRIME`}; it must be consistent
+/// with the AKA method the AUSF intends to run:
+///   - `5G_AKA`        ↔ `5G_HE_AKA`
+///   - `EAP_AKA_PRIME` ↔ `EAP_AKA_PRIME`
+///
+/// When `avType` is absent the check is skipped (permissive) so peers that omit
+/// the optional field are not rejected; when present it must match.
+fn validate_av_type(auth_type: &str, av_type: Option<&str>) -> Result<(), String> {
+    let av_type = match av_type {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+    let consistent = matches!(
+        (auth_type, av_type),
+        ("5G_AKA", "5G_HE_AKA") | ("EAP_AKA_PRIME", "EAP_AKA_PRIME")
+    );
+    if consistent {
+        Ok(())
+    } else {
+        Err(format!(
+            "UDM avType '{av_type}' inconsistent with authType '{auth_type}'"
+        ))
+    }
+}
+
+/// Build the Nudm_UEAuthentication generate-auth-data request body (ausfd-09).
+///
+/// `ausf_instance_id` is the AUSF's real registered NF instance id (resolved by
+/// [`resolve_ausf_instance_id`]), not a hard-coded literal.
+fn build_generate_auth_data_body(
+    serving_network_name: &str,
+    ausf_instance_id: &str,
+    resync_info: Option<&nextgcore_ausfd::ResynchronizationInfo>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "servingNetworkName": serving_network_name,
+        "ausfInstanceId": ausf_instance_id
+    });
+    if let Some(resync) = resync_info {
+        body["resynchronizationInfo"] = serde_json::json!({
+            "rand": resync.rand,
+            "auts": resync.auts
+        });
+    }
+    body
+}
+
+/// Resolve the AUSF's NF instance id for outgoing Nudm requests (ausfd-09).
+///
+/// Returns the registered self NF instance id from the SBI context; falls back
+/// to the static `"ausf-instance-id"` only when no self instance has been
+/// registered yet (e.g. NRF registration disabled).
+async fn resolve_ausf_instance_id() -> String {
+    ogs_sbi::context::global_context()
+        .get_self_instance()
+        .await
+        .map(|i| i.id)
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| "ausf-instance-id".to_string())
 }
 
 /// Authentication data received from UDM (TS 29.503 AuthenticationInfoResult)
@@ -1035,18 +1274,9 @@ async fn send_udm_generate_auth_data(
 
     let client = sbi_ctx.get_client(&host_owned, port).await;
 
-    // Build request body
-    let mut body = serde_json::json!({
-        "servingNetworkName": serving_network_name,
-        "ausfInstanceId": "ausf-instance-id"
-    });
-
-    if let Some(resync) = resync_info {
-        body["resynchronizationInfo"] = serde_json::json!({
-            "rand": resync.rand,
-            "auts": resync.auts
-        });
-    }
+    // ausfd-09: populate ausfInstanceId from the real registered NF instance id.
+    let ausf_instance_id = resolve_ausf_instance_id().await;
+    let body = build_generate_auth_data_body(serving_network_name, &ausf_instance_id, resync_info);
 
     let path = format!("/nudm-ueau/v1/{supi_or_suci}/security-information/generate-auth-data");
 
@@ -1076,6 +1306,12 @@ async fn send_udm_generate_auth_data(
     let av = json
         .get("authenticationVector")
         .ok_or("No authenticationVector in UDM response")?;
+
+    // ausfd-07: validate the AV's avType is consistent with the selected
+    // authType before trusting/storing the vector (TS 33.501 §6.1.3.2.0 step 2,
+    // TS 29.503 AuthenticationInfoResult.avType).
+    let av_type = av.get("avType").and_then(|v| v.as_str());
+    validate_av_type(auth_type, av_type)?;
 
     let get_hex = |field: &str| -> Result<Vec<u8>, String> {
         let hex = av
@@ -2230,5 +2466,198 @@ mod tests {
         })
         .await
         .expect("test_confirmation_response_shaping timed out");
+    }
+
+    // ====================================================================
+    // ausfd-07: avType vs authType validation
+    // ====================================================================
+    #[test]
+    fn test_validate_av_type() {
+        // Matching pairs are accepted.
+        assert!(validate_av_type("5G_AKA", Some("5G_HE_AKA")).is_ok());
+        assert!(validate_av_type("EAP_AKA_PRIME", Some("EAP_AKA_PRIME")).is_ok());
+        // Absent avType is permissive (optional field).
+        assert!(validate_av_type("5G_AKA", None).is_ok());
+        // Mismatches are rejected.
+        assert!(validate_av_type("5G_AKA", Some("EAP_AKA_PRIME")).is_err());
+        assert!(validate_av_type("EAP_AKA_PRIME", Some("5G_HE_AKA")).is_err());
+    }
+
+    // ====================================================================
+    // ausfd-09: outgoing Nudm body carries the resolved NF instance id
+    // ====================================================================
+    #[test]
+    fn test_build_generate_auth_data_body_uses_instance_id() {
+        let body = build_generate_auth_data_body(
+            "5G:mnc001.mcc001.3gppnetwork.org",
+            "ausf-7c9e-real-instance-id",
+            None,
+        );
+        assert_eq!(
+            body.get("ausfInstanceId").and_then(|v| v.as_str()),
+            Some("ausf-7c9e-real-instance-id"),
+            "body must carry the resolved (real) NF instance id, not a literal"
+        );
+        assert_eq!(
+            body.get("servingNetworkName").and_then(|v| v.as_str()),
+            Some("5G:mnc001.mcc001.3gppnetwork.org")
+        );
+        assert!(body.get("resynchronizationInfo").is_none());
+
+        // With resync info present.
+        let resync = nextgcore_ausfd::ResynchronizationInfo {
+            rand: "0123456789abcdef0123456789abcdef".to_string(),
+            auts: "fedcba9876543210fedcba98765432".to_string(),
+        };
+        let body =
+            build_generate_auth_data_body("5G:mnc001.mcc001.3gppnetwork.org", "id-2", Some(&resync));
+        assert!(body.get("resynchronizationInfo").is_some());
+    }
+
+    // ====================================================================
+    // ausfd-05: consumer PLMN extraction from an OAuth2 access token
+    // ====================================================================
+    #[test]
+    fn test_extract_consumer_plmns() {
+        // Build a JWT-shaped token whose payload carries a plmnList claim.
+        let payload =
+            serde_json::json!({"plmnList": [{"mcc": "208", "mnc": "093"}]}).to_string();
+        let payload_b64 = ogs_crypt::base64::encode(payload.as_bytes());
+        let token = format!("Bearer hdr.{payload_b64}.sig");
+        let plmns = extract_consumer_plmns(&token);
+        assert_eq!(plmns, vec![("208".to_string(), "093".to_string())]);
+
+        // No token / no plmnList -> empty (default-permissive).
+        assert!(extract_consumer_plmns("Bearer hdr.e30.sig").is_empty()); // {} payload
+        assert!(extract_consumer_plmns("not-a-token").is_empty());
+    }
+
+    // ====================================================================
+    // ausfd-08: DELETE cleans up the context (204), second DELETE -> 404
+    // ====================================================================
+    #[tokio::test]
+    async fn test_auth_context_delete_lifecycle() {
+        let _lock = TEST_MUTEX.lock().await;
+        ausf_context_init(128);
+
+        let ctx_id = {
+            let ctx = ausf_self();
+            let guard = ctx.read().expect("ctx read");
+            let ue = guard
+                .ue_add("suci-0-001-01-0000-0-0-7777777701")
+                .expect("ue_add");
+            ue.ctx_id
+        };
+
+        // Present before delete.
+        assert!(ausf_self()
+            .read()
+            .unwrap()
+            .ue_find_by_ctx_id(&ctx_id)
+            .is_some());
+
+        // DELETE -> 204 and context removed.
+        let resp = handle_auth_context_delete(&ctx_id).await;
+        assert_eq!(resp.status, 204, "first DELETE must return 204");
+        assert!(
+            ausf_self()
+                .read()
+                .unwrap()
+                .ue_find_by_ctx_id(&ctx_id)
+                .is_none(),
+            "context must be gone after DELETE"
+        );
+
+        // Second DELETE -> 404.
+        let resp = handle_auth_context_delete(&ctx_id).await;
+        assert_eq!(resp.status, 404, "second DELETE must return 404");
+    }
+
+    // ====================================================================
+    // ausfd-05: serving-network-name entitlement vs consumer token PLMN
+    // ====================================================================
+    #[tokio::test]
+    async fn test_snn_entitlement_against_consumer_token() {
+        let _ = env_logger::try_init();
+        let _lock = TEST_MUTEX.lock().await;
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            ausf_context_init(128);
+
+            // Mock UDM (so the permissive/matching case can reach 201).
+            let udm_port = free_port();
+            let udm_server = SbiServer::new(OgsSbiServerConfig::new(SocketAddr::from((
+                [127, 0, 0, 1],
+                udm_port,
+            ))));
+            udm_server.start(mock_udm_handler).await.expect("udm start");
+            std::env::set_var("UDM_SBI_ADDR", "127.0.0.1");
+            std::env::set_var("UDM_SBI_PORT", udm_port.to_string());
+
+            // Real AUSF handler.
+            let ausf_port = free_port();
+            let ausf_server = SbiServer::new(OgsSbiServerConfig::new(SocketAddr::from((
+                [127, 0, 0, 1],
+                ausf_port,
+            ))));
+            ausf_server
+                .start(ausf_sbi_request_handler)
+                .await
+                .expect("ausf start");
+            let client = ogs_sbi::client::SbiClient::with_host_port("127.0.0.1", ausf_port);
+
+            // TEST_SNN PLMN is (mcc=001, mnc=001).
+            let bearer = |mcc: &str, mnc: &str| -> String {
+                let payload =
+                    serde_json::json!({"plmnList": [{"mcc": mcc, "mnc": mnc}]}).to_string();
+                format!("Bearer h.{}.s", ogs_crypt::base64::encode(payload.as_bytes()))
+            };
+
+            // Foreign PLMN in the token -> 403 SERVING_NETWORK_NOT_AUTHORIZED.
+            let req = ogs_sbi::message::SbiRequest::post("/nausf-auth/v1/ue-authentications")
+                .with_header("Authorization", bearer("208", "093"))
+                .with_json_body(&serde_json::json!({
+                    "supiOrSuci": SUPI_5G_AKA,
+                    "servingNetworkName": TEST_SNN
+                }))
+                .expect("build request");
+            let resp = client.send_request(req).await.expect("send");
+            assert_eq!(resp.status, 403, "foreign-PLMN token must be rejected");
+            let pd: serde_json::Value =
+                serde_json::from_str(resp.http.content.as_deref().unwrap_or("{}")).unwrap();
+            assert_eq!(
+                pd.get("cause").and_then(|v| v.as_str()),
+                Some("SERVING_NETWORK_NOT_AUTHORIZED")
+            );
+
+            // Matching PLMN in the token -> entitlement passes (201).
+            let req = ogs_sbi::message::SbiRequest::post("/nausf-auth/v1/ue-authentications")
+                .with_header("Authorization", bearer("001", "001"))
+                .with_json_body(&serde_json::json!({
+                    "supiOrSuci": SUPI_5G_AKA,
+                    "servingNetworkName": TEST_SNN
+                }))
+                .expect("build request");
+            let resp = client.send_request(req).await.expect("send");
+            assert_eq!(resp.status, 201, "matching-PLMN token must be authorized");
+
+            // No token at all -> default-permissive (201).
+            let resp = client
+                .post_json(
+                    "/nausf-auth/v1/ue-authentications",
+                    &serde_json::json!({
+                        "supiOrSuci": SUPI_5G_AKA,
+                        "servingNetworkName": TEST_SNN
+                    }),
+                )
+                .await
+                .expect("send");
+            assert_eq!(resp.status, 201, "token-less peer must remain permissive");
+
+            ausf_server.stop().await.expect("stop ausf");
+            udm_server.stop().await.expect("stop udm");
+        })
+        .await
+        .expect("test_snn_entitlement_against_consumer_token timed out");
     }
 }

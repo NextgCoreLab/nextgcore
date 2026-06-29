@@ -30,32 +30,11 @@ pub fn ausf_nudm_ueau_handle_get(ausf_ue_id: u64, _stream_id: u64) -> bool {
 
     log::debug!("[{}] Handle NUDM UEAU get response", ausf_ue.suci);
 
-    // Note: In the C code, this extracts AuthenticationInfoResult from the response
-    // and validates the authentication vector. The following values are extracted:
-    // - AuthenticationInfoResult.auth_type
-    // - AuthenticationInfoResult.supi
-    // - AuthenticationVector.rand
-    // - AuthenticationVector.xres_star
-    // - AuthenticationVector.autn
-    // - AuthenticationVector.kausf
-    // For now, we'll simulate the processing
-
-    // Validate auth type (only 5G_AKA supported)
-    // if auth_type != AuthType::FiveGAka {
-    //     log::error!("[{}] Not supported Auth Method", ausf_ue.suci);
-    //     return false;
-    // }
-
-    // Validate AV type (only 5G_HE_AKA supported)
-    // if av_type != AvType::FiveGHeAka {
-    //     log::error!("[{}] Not supported Auth Method", ausf_ue.suci);
-    //     return false;
-    // }
-
-    // Set SUPI from response
-    // if let Some(supi) = authentication_info_result.supi {
-    //     context.ue_set_supi(ausf_ue_id, &supi);
-    // }
+    // ausfd-10: the live path parses the UDM AuthenticationInfoResult, validates
+    // authType vs avType (ausfd-07) and stores the AV in
+    // `send_udm_generate_auth_data` (main.rs), which is the single source of
+    // truth. This FSM handler only finalizes the context (HXRES* for the 201
+    // body) for the state-machine unit tests.
 
     // Set auth type
     ausf_ue.auth_type = AuthType::FiveGAka;
@@ -130,8 +109,8 @@ pub fn ausf_nudm_ueau_handle_result_confirmation_inform(ausf_ue_id: u64, _stream
     // - AuthEvent.success
     // - http.location (resource URI)
 
-    // Auth result is already set by nausf_handler during confirmation
-    // (either AuthenticationSuccess or AuthenticationFailure based on HRES* vs HXRES*)
+    // Auth result is already set during confirmation (either AuthenticationSuccess
+    // or AuthenticationFailure based on RES* vs stored XRES*, ausfd-02).
     // The UDM just confirms storage of the auth event.
     log::debug!(
         "[{}] Auth result from UDM confirmation: {:?}",

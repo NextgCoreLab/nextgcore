@@ -1,6 +1,13 @@
 //! AUSF SBI Path Functions
 //!
-//! Port of src/ausf/sbi-path.c - SBI server and client path functions
+//! Port of src/ausf/sbi-path.c - SBI server and client path functions.
+//!
+//! NOTE (ausfd-10): the live SBI server is the HTTP/2 `ogs_sbi::server::SbiServer`
+//! started in `main.rs`, and live Nudm client requests are issued directly from
+//! `main.rs` (`send_udm_generate_auth_data` / `send_udm_auth_result`). The
+//! `ausf_sbi_discover_and_send_*` functions here are the inert FSM-path
+//! shims retained for the state-machine; they build the request shape but do not
+//! perform network I/O.
 
 use crate::nudm_build::{self, ResynchronizationInfo};
 use std::sync::atomic::{AtomicBool, Ordering};

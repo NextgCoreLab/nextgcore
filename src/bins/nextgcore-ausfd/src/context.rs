@@ -145,6 +145,29 @@ impl AusfUe {
         }
     }
 
+    /// Zeroize all sensitive key material held in this UE context (ausfd-08).
+    ///
+    /// TS 33.501 §6.1.4.1a: when the authentication context is deleted the AUSF
+    /// must not retain anchor/home keys (KAUSF/KSEAF) or the expected response
+    /// (XRES*/HXRES*) in memory. Invoked when the UE context is removed on
+    /// `DELETE .../ue-authentications/{authCtxId}`.
+    pub fn zeroize(&mut self) {
+        self.kausf = [0u8; 32];
+        self.kseaf = [0u8; 32];
+        self.xres_star = [0u8; 16];
+        self.hxres_star = [0u8; 16];
+        self.rand = [0u8; 16];
+        self.autn = [0u8; 16];
+        self.res_star_hex = None;
+        if let Some(session) = self.eap_session.as_mut() {
+            session.kausf = [0u8; 32];
+            session.k_aut = [0u8; 32];
+            session.ck_prime = [0u8; 16];
+            session.ik_prime = [0u8; 16];
+        }
+        self.eap_session = None;
+    }
+
     // ========================================================================
     // SNPN Authentication Support (Rel-17 TS 33.501)
     // ========================================================================
@@ -514,6 +537,33 @@ mod tests {
             ctx.ue_add(&format!("suci-0-001-01-0000-0-0-{i:010}"));
         }
         assert_eq!(ctx.get_ue_load(), 50);
+    }
+
+    #[test]
+    fn test_ausf_ue_zeroize() {
+        // ausfd-08: zeroize() must clear all sensitive key material.
+        let mut ue = AusfUe::new(1, "suci-test");
+        ue.kausf = [0x11u8; 32];
+        ue.kseaf = [0x22u8; 32];
+        ue.xres_star = [0x33u8; 16];
+        ue.hxres_star = [0x44u8; 16];
+        ue.rand = [0x55u8; 16];
+        ue.autn = [0x66u8; 16];
+        ue.res_star_hex = Some("deadbeef".to_string());
+        ue.eap_session = Some(crate::eap_aka_prime::EapAkaSession::new(
+            "5G:mnc001.mcc001.3gppnetwork.org",
+        ));
+
+        ue.zeroize();
+
+        assert_eq!(ue.kausf, [0u8; 32], "kausf must be zeroized");
+        assert_eq!(ue.kseaf, [0u8; 32], "kseaf must be zeroized");
+        assert_eq!(ue.xres_star, [0u8; 16], "xres_star must be zeroized");
+        assert_eq!(ue.hxres_star, [0u8; 16], "hxres_star must be zeroized");
+        assert_eq!(ue.rand, [0u8; 16], "rand must be zeroized");
+        assert_eq!(ue.autn, [0u8; 16], "autn must be zeroized");
+        assert!(ue.res_star_hex.is_none(), "res_star_hex must be cleared");
+        assert!(ue.eap_session.is_none(), "eap_session must be cleared");
     }
 
     #[test]

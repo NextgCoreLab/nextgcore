@@ -102,6 +102,8 @@ pub enum AkaPrimeAttribute {
     AtKdf = 24,
     AtCheckcode = 134,
     AtResultInd = 135,
+    /// AT_BIDDING (RFC 5448 §4) - EAP-AKA -> EAP-AKA' bidding-down protection.
+    AtBidding = 136,
 }
 
 impl AkaPrimeAttribute {
@@ -118,6 +120,7 @@ impl AkaPrimeAttribute {
             24 => Some(Self::AtKdf),
             134 => Some(Self::AtCheckcode),
             135 => Some(Self::AtResultInd),
+            136 => Some(Self::AtBidding),
             _ => None,
         }
     }
@@ -503,6 +506,58 @@ pub enum EapAkaState {
     Failure,
 }
 
+/// AT_KDF identifier for the EAP-AKA' key derivation (RFC 9048 §3.2).
+/// Value 1 = the HMAC-SHA-256 based KDF; it is currently the only standardized
+/// AT_KDF value and is what the AUSF offers in the EAP-Request/AKA'-Challenge.
+pub const AT_KDF_HMAC_SHA256: u16 = 1;
+
+/// KDF identifiers the AUSF is willing to run.
+pub const SUPPORTED_AT_KDFS: &[u16] = &[AT_KDF_HMAC_SHA256];
+
+/// Outcome of AT_KDF negotiation / AT_BIDDING down-protection (RFC 9048 §3.2,
+/// RFC 5448 §4) evaluated over an EAP-Response/AKA'-Challenge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KdfNegotiation {
+    /// The response is consistent with the offered KDF (or carries no AT_KDF)
+    /// and no bidding-down was signalled - continue normal processing.
+    Accept,
+    /// The peer requested a different but supported KDF; the AUSF must re-send
+    /// the EAP-Request/AKA'-Challenge using this KDF (bounded to one round).
+    Renegotiate(u16),
+    /// The peer requested an unsupported KDF -> authentication must fail.
+    Unsupported(u16),
+    /// AT_BIDDING signalled an EAP-AKA -> EAP-AKA' bidding-down attempt -> fail.
+    BiddingDown,
+}
+
+/// Pure RFC 9048 §3.2 AT_KDF negotiation decision.
+///
+/// `offered` is the KDF the AUSF put in the Challenge, `supported` is the set of
+/// KDFs the AUSF can run, `requested` is the AT_KDF echoed/selected by the peer
+/// in its EAP-Response/AKA'-Challenge, and `already_renegotiated` guards against
+/// an unbounded renegotiation loop.
+///
+/// - requested == offered  -> Accept
+/// - requested supported, not yet renegotiated -> Renegotiate(requested)
+/// - requested supported, but a renegotiation already happened -> Unsupported
+///   (the peer must accept the second offer; looping is a protocol error)
+/// - requested unsupported -> Unsupported
+pub fn negotiate_kdf(
+    offered: u16,
+    supported: &[u16],
+    requested: u16,
+    already_renegotiated: bool,
+) -> KdfNegotiation {
+    if requested == offered {
+        return KdfNegotiation::Accept;
+    }
+    if supported.contains(&requested) && !already_renegotiated {
+        KdfNegotiation::Renegotiate(requested)
+    } else {
+        KdfNegotiation::Unsupported(requested)
+    }
+}
+
 /// EAP-AKA' session context held at the AUSF.
 #[derive(Debug, Clone)]
 pub struct EapAkaSession {
@@ -528,6 +583,11 @@ pub struct EapAkaSession {
     pub identity: String,
     /// Serving network name
     pub serving_network_name: String,
+    /// AT_KDF the AUSF offered in the Challenge (RFC 9048 §3.2)
+    pub offered_kdf: u16,
+    /// Whether an AT_KDF renegotiation round has already been issued (bounds the
+    /// renegotiation to a single round per RFC 9048 §3.2).
+    pub kdf_renegotiated: bool,
 }
 
 impl EapAkaSession {
@@ -545,7 +605,45 @@ impl EapAkaSession {
             k_aut: [0u8; 32],
             identity: String::new(),
             serving_network_name: serving_network_name.to_string(),
+            offered_kdf: AT_KDF_HMAC_SHA256,
+            kdf_renegotiated: false,
         }
+    }
+
+    /// Evaluate AT_KDF negotiation (RFC 9048 §3.2) and AT_BIDDING down-protection
+    /// (RFC 5448 §4) over a received EAP-Response/AKA'-Challenge (ausfd-06).
+    ///
+    /// AT_BIDDING is checked first: if the peer signals (D bit, 0x8000) that the
+    /// network attempted to bid down from EAP-AKA' to EAP-AKA, the exchange is
+    /// rejected. Otherwise the peer's AT_KDF (if present) is compared against the
+    /// offered KDF via [`negotiate_kdf`].
+    pub fn check_kdf_and_bidding(&self, response: &EapPacket) -> KdfNegotiation {
+        // AT_BIDDING down-protection (RFC 5448 §4): the D bit indicates the
+        // network supports/prefers EAP-AKA' yet a downgrade was observed.
+        if let Some(bidding) = response.find_attribute(AkaPrimeAttribute::AtBidding) {
+            // Attribute payload: 2 reserved/flag bytes (+ optional padding).
+            if bidding.len() >= 2 {
+                let flags = u16::from_be_bytes([bidding[0], bidding[1]]);
+                if flags & 0x8000 != 0 {
+                    return KdfNegotiation::BiddingDown;
+                }
+            }
+        }
+
+        // AT_KDF negotiation (RFC 9048 §3.2).
+        if let Some(kdf_attr) = response.find_attribute(AkaPrimeAttribute::AtKdf) {
+            if kdf_attr.len() >= 2 {
+                let requested = u16::from_be_bytes([kdf_attr[0], kdf_attr[1]]);
+                return negotiate_kdf(
+                    self.offered_kdf,
+                    SUPPORTED_AT_KDFS,
+                    requested,
+                    self.kdf_renegotiated,
+                );
+            }
+        }
+
+        KdfNegotiation::Accept
     }
 
     /// Initialize session with the EAP-AKA' transformed authentication vector
@@ -1112,6 +1210,115 @@ mod tests {
         let mut s3 = session.clone();
         assert!(!s3.process_challenge_response_bytes(&raw_wrong_res));
         assert_eq!(s3.state, EapAkaState::Failure);
+    }
+
+    // ------------------------------------------------------------------
+    // ausfd-06: AT_KDF negotiation (RFC 9048 §3.2) + AT_BIDDING (RFC 5448 §4)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_negotiate_kdf_pure() {
+        // Matching offer -> Accept.
+        assert_eq!(
+            negotiate_kdf(1, &[1], 1, false),
+            KdfNegotiation::Accept
+        );
+        // Different but supported KDF, first round -> one renegotiation.
+        assert_eq!(
+            negotiate_kdf(1, &[1, 2], 2, false),
+            KdfNegotiation::Renegotiate(2)
+        );
+        // Same case but a renegotiation already happened -> reject (no loop).
+        assert_eq!(
+            negotiate_kdf(1, &[1, 2], 2, true),
+            KdfNegotiation::Unsupported(2)
+        );
+        // Unknown KDF -> reject.
+        assert_eq!(
+            negotiate_kdf(1, &[1], 7, false),
+            KdfNegotiation::Unsupported(7)
+        );
+    }
+
+    /// Build an EAP-Response/AKA'-Challenge byte fixture carrying optional
+    /// AT_KDF and AT_BIDDING TLVs, then decode it (exercises the wire path).
+    fn build_challenge_response(at_kdf: Option<u16>, at_bidding: Option<u16>) -> EapPacket {
+        let mut response = EapPacket {
+            code: EapCode::Response,
+            identifier: 7,
+            eap_type: Some(EapType::AkaPrime),
+            subtype: Some(AkaPrimeSubtype::Challenge),
+            attributes: Vec::new(),
+        };
+        // AT_RES (8-byte RES)
+        let res = [0x30u8; 8];
+        let mut res_attr = Vec::new();
+        res_attr.extend_from_slice(&((res.len() * 8) as u16).to_be_bytes());
+        res_attr.extend_from_slice(&res);
+        response
+            .attributes
+            .push((AkaPrimeAttribute::AtRes as u8, res_attr));
+        if let Some(kdf) = at_kdf {
+            response
+                .attributes
+                .push((AkaPrimeAttribute::AtKdf as u8, kdf.to_be_bytes().to_vec()));
+        }
+        if let Some(bidding) = at_bidding {
+            response.attributes.push((
+                AkaPrimeAttribute::AtBidding as u8,
+                bidding.to_be_bytes().to_vec(),
+            ));
+        }
+        // Roundtrip through encode/decode to validate the on-wire TLVs.
+        let encoded = response.encode();
+        EapPacket::decode(&encoded).expect("decode challenge response fixture")
+    }
+
+    #[test]
+    fn test_check_kdf_matching_unaffected() {
+        // (a) AT_KDF matches the offered KDF -> Accept.
+        let session = EapAkaSession::new("5G:mnc001.mcc001.3gppnetwork.org");
+        let resp = build_challenge_response(Some(AT_KDF_HMAC_SHA256), None);
+        assert_eq!(session.check_kdf_and_bidding(&resp), KdfNegotiation::Accept);
+
+        // No AT_KDF at all -> Accept.
+        let resp = build_challenge_response(None, None);
+        assert_eq!(session.check_kdf_and_bidding(&resp), KdfNegotiation::Accept);
+    }
+
+    #[test]
+    fn test_check_kdf_renegotiation() {
+        // (b) peer requests a different supported KDF -> one renegotiation.
+        // Model: the AUSF offered a (legacy) KDF id the peer corrects back to 1.
+        let mut session = EapAkaSession::new("5G:mnc001.mcc001.3gppnetwork.org");
+        session.offered_kdf = 2; // hypothetical non-default offer
+        let resp = build_challenge_response(Some(AT_KDF_HMAC_SHA256), None);
+        assert_eq!(
+            session.check_kdf_and_bidding(&resp),
+            KdfNegotiation::Renegotiate(AT_KDF_HMAC_SHA256)
+        );
+
+        // After a renegotiation round, a further mismatch must not loop.
+        session.kdf_renegotiated = true;
+        assert_eq!(
+            session.check_kdf_and_bidding(&resp),
+            KdfNegotiation::Unsupported(AT_KDF_HMAC_SHA256)
+        );
+    }
+
+    #[test]
+    fn test_check_bidding_down_rejected() {
+        // (c) AT_BIDDING with the D bit set signals a downgrade -> reject.
+        let session = EapAkaSession::new("5G:mnc001.mcc001.3gppnetwork.org");
+        let resp = build_challenge_response(None, Some(0x8000));
+        assert_eq!(
+            session.check_kdf_and_bidding(&resp),
+            KdfNegotiation::BiddingDown
+        );
+
+        // AT_BIDDING present but D bit clear -> not a downgrade.
+        let resp = build_challenge_response(Some(AT_KDF_HMAC_SHA256), Some(0x0000));
+        assert_eq!(session.check_kdf_and_bidding(&resp), KdfNegotiation::Accept);
     }
 
     #[test]
