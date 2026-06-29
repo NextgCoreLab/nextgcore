@@ -1,20 +1,23 @@
-//! NWDAF Event-Notification Dispatcher (TS 29.520 §5.2)
+//! NWDAF Event-Notification Dispatcher (TS 29.520 Nnwdaf_EventsSubscription)
 //!
 //! When an analytics event triggers (periodic interval or threshold breach),
-//! the NWDAF SHALL POST an `Nnwdaf_EventsSubscription_Notify` to the
-//! consumer's `notificationUri` (TS 29.520 §5.2.2.3).
+//! the NWDAF SHALL POST an `Nnwdaf_EventsSubscription_Notify` carrying an
+//! `NnwdafEventsSubscriptionNotification` to the consumer's `notificationURI`.
+//! The schema lives in `components.schemas.NnwdafEventsSubscriptionNotification`
+//! of `TS29520_Nnwdaf_EventsSubscription.yaml`.
 //!
 //! # Notify body shape
 //!
 //! ```json
 //! {
-//!   "notificationCorrelationId": "<from subscription>",
-//!   "subscriptionId":            "<sub id>",
-//!   "reportList": [
+//!   "subscriptionId": "<sub id>",
+//!   "notifCorrId":    "<from subscription, optional>",
+//!   "eventNotifications": [
 //!     {
-//!       "analyticsId":  "NF_LOAD",
-//!       "timestamp":    "<RFC-3339>",
-//!       "nfLoadLevelInfo": { ... }   // analyticsId-specific payload
+//!       "event":  "NF_LOAD",
+//!       "start":  "<RFC-3339>",
+//!       "expiry": "<RFC-3339>",
+//!       "nfLoadLevelInfos": [ { ... } ]   // per-event *Infos array
 //!     }
 //!   ]
 //! }
@@ -30,15 +33,15 @@
 //! # Threshold conditions
 //!
 //! Threshold-based triggering (e.g. fire only when CPU > 0.8) is **not yet
-//! wired** — the dispatcher fires on periodicity only.  The `ReportingCondition`
-//! struct in `subscription.rs` already carries a `threshold` field; a future
-//! pass should evaluate that against the analytics output here and skip the
-//! POST when the threshold is not breached.
+//! wired** — the dispatcher fires on periodicity only (remediation item
+//! nwafd-07).  `EventSubscription` already carries `load_level_threshold` /
+//! `matching_dir`; a future pass should evaluate those against the analytics
+//! output here and skip the POST when the threshold is not crossed.
 
 use crate::analytics::{AnalyticsEngine, NfLoadSample};
 use crate::context::{AnalyticsId, AnalyticsSubscription, NwdafContext};
 use ogs_sbi::client::{SbiClient, SbiClientConfig};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -102,80 +105,92 @@ fn notify_client(host: &str, port: u16) -> SbiClient {
 // Analytics runner
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Synthesise a synthetic NF load sample and compute analytics.
+/// Compute the per-event `*Infos` **array** (the value stored under
+/// `event.infos_key()`) for a single analytics event.
 ///
-/// In production this would query OAM/metrics endpoints for each registered
-/// data source. For now it ingests a placeholder sample so the engine always
-/// has something to report. The important part is that `compute_nf_load`
-/// exercises the linear-regression path and returns a real report struct.
-fn compute_analytics_for_subscription(
-    engine: &mut AnalyticsEngine,
-    sub: &AnalyticsSubscription,
-) -> Option<Value> {
-    match sub.analytics_id {
+/// Shared by `Nnwdaf_AnalyticsInfo` (GET → `AnalyticsData`) and the
+/// `Nnwdaf_EventsSubscription_Notify` dispatcher so both stay wire-aligned on
+/// TS 29.520. Only NF_LOAD has a live analytics path today (linear regression);
+/// other events return an empty array of the correct key until their
+/// collectors exist.
+///
+/// T5.4 HONESTY NOTE: `compute_nf_load` is linear regression on the last N
+/// samples, not a trained ML model; `confidence` reflects sample count, not
+/// model accuracy (TS 23.288 §6.14).
+pub fn compute_event_infos(engine: &mut AnalyticsEngine, event: AnalyticsId) -> Value {
+    match event {
         AnalyticsId::NfLoad => {
             // Ingest a placeholder sample representing the NWDAF's own NF load.
             // A real implementation would collect these from data sources.
             let sample = NfLoadSample::now("NWDAF", "nwdaf-self", 0.3, 0.4, 0);
             engine.ingest_nf_load(sample);
 
-            engine.compute_nf_load("nwdaf-self").map(|r| {
-                json!({
-                    "analyticsId": AnalyticsId::NfLoad.as_str(),
-                    "timestamp":   chrono::Utc::now().to_rfc3339(),
-                    "nfLoadLevelInfo": {
-                        "nfType":        r.nf_type,
-                        "nfInstanceId":  r.nf_instance_id,
-                        "meanCpu":       r.mean_cpu,
-                        "peakCpu":       r.peak_cpu,
-                        "predictedLoad": r.predicted_load,
-                        "confidence":    r.confidence,
-                    }
+            let infos = engine
+                .compute_nf_load("nwdaf-self")
+                .map(|r| {
+                    vec![json!({
+                        // TS 29.520 NfLoadLevelInformation (subset).
+                        "nfType":             r.nf_type,
+                        "nfInstanceId":       r.nf_instance_id,
+                        "nfStatus":           "REGISTERED",
+                        "nfCpuUsage":         (r.mean_cpu * 100.0).round() as u64,
+                        "nfLoadLevelAverage": (r.mean_cpu * 100.0).round() as u64,
+                        "nfLoadLevelpeak":    (r.peak_cpu * 100.0).round() as u64,
+                        // Vendor extensions: the linear-regression projection and
+                        // its sample-count confidence (not a trained-model score).
+                        "predictedLoad":      r.predicted_load,
+                        "confidence":         r.confidence,
+                    })]
                 })
-            })
+                .unwrap_or_default();
+            Value::Array(infos)
         }
-
-        AnalyticsId::UeMobility => {
-            // No live UE cell data collected yet; emit a placeholder report
-            // so subscriptions receive *something*.
-            Some(json!({
-                "analyticsId": AnalyticsId::UeMobility.as_str(),
-                "timestamp":   chrono::Utc::now().to_rfc3339(),
-                "ueMobilityInfo": {
-                    "note": "no UE mobility data collected yet",
-                }
-            }))
-        }
-
-        other => {
-            // Generic fallback for other analytics types
-            Some(json!({
-                "analyticsId": other.as_str(),
-                "timestamp":   chrono::Utc::now().to_rfc3339(),
-            }))
-        }
+        // No live collector yet for other events: emit an empty (but correctly
+        // keyed) array so a strict consumer can still parse the notification.
+        _ => Value::Array(Vec::new()),
     }
+}
+
+/// Build the TS 29.520 `eventNotifications[]` array for a subscription: one
+/// `EventNotification` per subscribed event, each carrying `event`,
+/// `start`/`expiry` and the event-specific `*Infos` array.
+fn build_event_notifications(engine: &mut AnalyticsEngine, sub: &AnalyticsSubscription) -> Vec<Value> {
+    let now = chrono::Utc::now();
+    let start = now.to_rfc3339();
+    let expiry = (now + chrono::Duration::seconds(3600)).to_rfc3339();
+
+    sub.events
+        .iter()
+        .map(|e| {
+            let infos = compute_event_infos(engine, e.event);
+            let mut obj = Map::new();
+            obj.insert("event".to_string(), json!(e.event.as_str()));
+            obj.insert("start".to_string(), json!(start));
+            obj.insert("expiry".to_string(), json!(expiry));
+            obj.insert(e.event.infos_key().to_string(), infos);
+            Value::Object(obj)
+        })
+        .collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Notify body builder (pure, testable without network)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Build the `Nnwdaf_EventsSubscription_Notify` JSON body for one subscription.
-///
-/// Shape (TS 29.520 §5.2.2.3):
+/// Build the `NnwdafEventsSubscriptionNotification` JSON body for one
+/// subscription (TS 29.520 `components.schemas`):
 /// ```json
 /// {
-///   "notificationCorrelationId": "...",
-///   "subscriptionId":            "...",
-///   "reportList": [ { "analyticsId": "...", "timestamp": "...", ... } ]
+///   "subscriptionId": "...",
+///   "notifCorrId":    "...",
+///   "eventNotifications": [ { "event": "...", "start": "...", "<event>Infos": [...] } ]
 /// }
 /// ```
-pub fn build_notify_body(sub: &AnalyticsSubscription, report: Value) -> Value {
+pub fn build_notify_body(sub: &AnalyticsSubscription, event_notifications: Vec<Value>) -> Value {
     json!({
-        "notificationCorrelationId": sub.notification_correlation_id,
-        "subscriptionId":            sub.subscription_id,
-        "reportList": [ report ],
+        "subscriptionId":     sub.subscription_id,
+        "notifCorrId":        sub.notification_correlation_id,
+        "eventNotifications": event_notifications,
     })
 }
 
@@ -210,19 +225,16 @@ pub async fn dispatch_notifications(ctx: Arc<RwLock<NwdafContext>>) {
             continue;
         }
 
-        let report = match compute_analytics_for_subscription(&mut engine, sub) {
-            Some(r) => r,
-            None => {
-                log::debug!(
-                    "dispatch: no analytics data for subscription {} ({})",
-                    sub.subscription_id,
-                    sub.analytics_id.as_str()
-                );
-                continue;
-            }
-        };
+        let event_notifications = build_event_notifications(&mut engine, sub);
+        if event_notifications.is_empty() {
+            log::debug!(
+                "dispatch: no events to report for subscription {}",
+                sub.subscription_id
+            );
+            continue;
+        }
 
-        let body = build_notify_body(sub, report);
+        let body = build_notify_body(sub, event_notifications);
 
         // Parse the notification URI
         let (host, port, path) = match parse_notify_uri(&sub.notification_uri) {
@@ -333,46 +345,57 @@ mod tests {
 
     // ── T5.3: notify body shape ──────────────────────────────────────────────
 
-    /// The Notify body MUST carry `notificationCorrelationId`, `subscriptionId`,
-    /// and `reportList` with at least one entry that has `analyticsId` and
-    /// `timestamp`.
+    /// nwafd-04: the Notify body is an `NnwdafEventsSubscriptionNotification`:
+    /// it MUST carry `subscriptionId`, `notifCorrId`, and `eventNotifications[]`
+    /// where each entry has `event` and the event-specific `*Infos` **array**
+    /// (`nfLoadLevelInfos` for NF_LOAD). The legacy `reportList` /
+    /// `notificationCorrelationId` keys MUST be gone.
     #[test]
     fn test_notify_body_shape() {
         let (ctx_arc, sub_id) = make_ctx_with_sub("http://amf.local:8080/notify", Some(60));
         let ctx = ctx_arc.read().unwrap();
         let sub = ctx.get_subscription(&sub_id).unwrap();
 
-        let report = json!({
-            "analyticsId": "NF_LOAD",
-            "timestamp":   "2026-06-14T00:00:00Z",
-            "nfLoadLevelInfo": { "meanCpu": 0.3 }
-        });
-
-        let body = build_notify_body(&sub, report);
+        let mut engine = AnalyticsEngine::new();
+        let event_notifications = build_event_notifications(&mut engine, &sub);
+        let body = build_notify_body(&sub, event_notifications);
 
         assert_eq!(
-            body["notificationCorrelationId"].as_str(),
+            body["notifCorrId"].as_str(),
             Some("corr-abc123"),
-            "notificationCorrelationId must be echoed from the subscription"
+            "notifCorrId must be echoed from the subscription"
         );
         assert_eq!(
             body["subscriptionId"].as_str(),
             Some("sub-test-001"),
             "subscriptionId must identify the subscription"
         );
-
-        let report_list = body["reportList"].as_array().expect("reportList must be an array");
-        assert_eq!(report_list.len(), 1, "reportList must have exactly one entry");
-
-        let entry = &report_list[0];
-        assert_eq!(entry["analyticsId"].as_str(), Some("NF_LOAD"));
         assert!(
-            entry["timestamp"].as_str().is_some(),
-            "report entry must carry a timestamp"
+            body.get("reportList").is_none(),
+            "legacy reportList key must be gone"
         );
         assert!(
-            entry["nfLoadLevelInfo"].is_object(),
-            "NF_LOAD report must include nfLoadLevelInfo"
+            body.get("notificationCorrelationId").is_none(),
+            "legacy notificationCorrelationId key must be gone"
+        );
+
+        let notifs = body["eventNotifications"]
+            .as_array()
+            .expect("eventNotifications must be an array");
+        assert_eq!(notifs.len(), 1, "one event → one EventNotification");
+
+        let entry = &notifs[0];
+        assert_eq!(entry["event"].as_str(), Some("NF_LOAD"));
+        assert!(
+            entry["start"].as_str().is_some(),
+            "EventNotification must carry a start timestamp"
+        );
+        let infos = entry["nfLoadLevelInfos"]
+            .as_array()
+            .expect("NF_LOAD notification must carry an nfLoadLevelInfos array");
+        assert!(
+            !infos.is_empty(),
+            "NF_LOAD nfLoadLevelInfos must have at least one element"
         );
     }
 

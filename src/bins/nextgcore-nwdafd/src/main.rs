@@ -206,9 +206,10 @@ async fn nwdaf_sbi_request_handler(request: SbiRequest) -> SbiResponse {
     let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
 
     match parts.as_slice() {
-        // Nnwdaf_AnalyticsInfo service
+        // Nnwdaf_AnalyticsInfo service — TS 29.520 §4.3.2.2.2 mandates HTTP GET
+        // with an `event-id` query parameter (no request body).
         ["nnwdaf-analyticsinfo", "v1", "analytics"] => match method {
-            "POST" => handle_analytics_info_query(&request).await,
+            "GET" => handle_analytics_info_query(&request).await,
             _ => send_method_not_allowed(method, "analytics"),
         },
 
@@ -369,6 +370,25 @@ mod tests {
             result.is_ok(),
             "no NRF URI on the injected context should skip registration: {result:?}"
         );
+    }
+
+    // --- nwafd-02: Nnwdaf_AnalyticsInfo is GET-only at the routing layer ---
+
+    #[tokio::test]
+    async fn test_routing_analytics_post_is_405() {
+        // TS 29.520 §4.3.2.2.2: Nnwdaf_AnalyticsInfo is HTTP GET. A POST to the
+        // analytics resource must be rejected with 405 Method Not Allowed.
+        let req = SbiRequest::post("/nnwdaf-analyticsinfo/v1/analytics");
+        let resp = nwdaf_sbi_request_handler(req).await;
+        assert_eq!(resp.status, 405, "POST /analytics must be 405");
+    }
+
+    #[tokio::test]
+    async fn test_routing_analytics_get_is_routed() {
+        // A GET with a valid event-id reaches the handler and yields 200.
+        let req = SbiRequest::get("/nnwdaf-analyticsinfo/v1/analytics?event-id=NF_LOAD");
+        let resp = nwdaf_sbi_request_handler(req).await;
+        assert_eq!(resp.status, 200, "GET /analytics?event-id=NF_LOAD must be 200");
     }
 
     #[tokio::test]

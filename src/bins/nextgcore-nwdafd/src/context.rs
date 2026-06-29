@@ -7,41 +7,92 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
-/// Analytics ID types defined in TS 23.288
+/// Analytics event types defined in TS 29.520 `NwdafEvent` (Rel-16/17/18).
+///
+/// The wire tokens returned by [`as_str`](Self::as_str) / accepted by
+/// [`from_str`](Self::from_str) are the exact 3GPP enumeration values. The Rust
+/// identifiers are spelled out for clarity (`UeCommunication`, `SliceLoadLevel`)
+/// rather than the abbreviated forms used previously. Variants beyond the
+/// original nine are accepted-and-carried so a conformant consumer's `event` is
+/// not blanket-rejected, even where no analytics computation exists for them
+/// yet (the dispatcher emits an empty per-event `*Infos` array in that case).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AnalyticsId {
-    /// NF load analytics
+    /// NF load analytics (`NF_LOAD`)
     NfLoad,
-    /// Network performance analytics
+    /// Network performance analytics (`NETWORK_PERFORMANCE`)
     NetworkPerformance,
-    /// UE mobility analytics
+    /// UE mobility analytics (`UE_MOBILITY`)
     UeMobility,
-    /// UE communication patterns
-    UeComm,
-    /// Abnormal behavior detection
+    /// UE communication patterns (`UE_COMMUNICATION`)
+    UeCommunication,
+    /// Abnormal behaviour detection (`ABNORMAL_BEHAVIOUR`)
     AbnormalBehaviour,
-    /// Service experience analytics
+    /// Service experience analytics (`SERVICE_EXPERIENCE`)
     ServiceExperience,
-    /// QoS sustainability analytics
+    /// QoS sustainability analytics (`QOS_SUSTAINABILITY`)
     QosSustainability,
-    /// Slice load analytics
-    SliceLoad,
-    /// User data congestion analytics
+    /// Slice load-level analytics (`SLICE_LOAD_LEVEL`)
+    SliceLoadLevel,
+    /// User data congestion analytics (`USER_DATA_CONGESTION`)
     UserDataCongestion,
+    /// Network-slice-instance load level (`NSI_LOAD_LEVEL`, Rel-17)
+    NsiLoadLevel,
+    /// Session-management congestion (`SM_CONGESTION`, Rel-17)
+    SmCongestion,
+    /// Dispersion analytics (`DISPERSION`, Rel-17)
+    Dispersion,
+    /// Redundant-transmission experience (`RED_TRANS_EXP`, Rel-17)
+    RedTransExp,
+    /// WLAN performance analytics (`WLAN_PERFORMANCE`, Rel-17)
+    WlanPerformance,
+    /// Data-network performance (`DN_PERFORMANCE`, Rel-17)
+    DnPerformance,
+    /// PDU session traffic analytics (`PDU_SESSION_TRAFFIC`, Rel-18)
+    PduSessionTraffic,
 }
 
 impl AnalyticsId {
+    /// Every TS 29.520 `NwdafEvent` token this binary recognises, in
+    /// declaration order. Used by the round-trip conformance test and as the
+    /// authoritative iteration source.
+    pub const ALL: &'static [AnalyticsId] = &[
+        Self::NfLoad,
+        Self::NetworkPerformance,
+        Self::UeMobility,
+        Self::UeCommunication,
+        Self::AbnormalBehaviour,
+        Self::ServiceExperience,
+        Self::QosSustainability,
+        Self::SliceLoadLevel,
+        Self::UserDataCongestion,
+        Self::NsiLoadLevel,
+        Self::SmCongestion,
+        Self::Dispersion,
+        Self::RedTransExp,
+        Self::WlanPerformance,
+        Self::DnPerformance,
+        Self::PduSessionTraffic,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::NfLoad => "NF_LOAD",
             Self::NetworkPerformance => "NETWORK_PERFORMANCE",
             Self::UeMobility => "UE_MOBILITY",
-            Self::UeComm => "UE_COMM",
+            Self::UeCommunication => "UE_COMMUNICATION",
             Self::AbnormalBehaviour => "ABNORMAL_BEHAVIOUR",
             Self::ServiceExperience => "SERVICE_EXPERIENCE",
             Self::QosSustainability => "QOS_SUSTAINABILITY",
-            Self::SliceLoad => "SLICE_LOAD",
+            Self::SliceLoadLevel => "SLICE_LOAD_LEVEL",
             Self::UserDataCongestion => "USER_DATA_CONGESTION",
+            Self::NsiLoadLevel => "NSI_LOAD_LEVEL",
+            Self::SmCongestion => "SM_CONGESTION",
+            Self::Dispersion => "DISPERSION",
+            Self::RedTransExp => "RED_TRANS_EXP",
+            Self::WlanPerformance => "WLAN_PERFORMANCE",
+            Self::DnPerformance => "DN_PERFORMANCE",
+            Self::PduSessionTraffic => "PDU_SESSION_TRAFFIC",
         }
     }
 
@@ -50,13 +101,109 @@ impl AnalyticsId {
             "NF_LOAD" => Some(Self::NfLoad),
             "NETWORK_PERFORMANCE" => Some(Self::NetworkPerformance),
             "UE_MOBILITY" => Some(Self::UeMobility),
-            "UE_COMM" => Some(Self::UeComm),
+            "UE_COMMUNICATION" => Some(Self::UeCommunication),
             "ABNORMAL_BEHAVIOUR" => Some(Self::AbnormalBehaviour),
             "SERVICE_EXPERIENCE" => Some(Self::ServiceExperience),
             "QOS_SUSTAINABILITY" => Some(Self::QosSustainability),
-            "SLICE_LOAD" => Some(Self::SliceLoad),
+            "SLICE_LOAD_LEVEL" => Some(Self::SliceLoadLevel),
             "USER_DATA_CONGESTION" => Some(Self::UserDataCongestion),
+            "NSI_LOAD_LEVEL" => Some(Self::NsiLoadLevel),
+            "SM_CONGESTION" => Some(Self::SmCongestion),
+            "DISPERSION" => Some(Self::Dispersion),
+            "RED_TRANS_EXP" => Some(Self::RedTransExp),
+            "WLAN_PERFORMANCE" => Some(Self::WlanPerformance),
+            "DN_PERFORMANCE" => Some(Self::DnPerformance),
+            "PDU_SESSION_TRAFFIC" => Some(Self::PduSessionTraffic),
             _ => None,
+        }
+    }
+
+    /// The per-event `*Infos` array key used in `AnalyticsData`
+    /// (Nnwdaf_AnalyticsInfo) and `EventNotification`
+    /// (Nnwdaf_EventsSubscription_Notify) bodies, per TS 29.520.
+    pub fn infos_key(&self) -> &'static str {
+        match self {
+            Self::NfLoad => "nfLoadLevelInfos",
+            Self::SliceLoadLevel | Self::NsiLoadLevel => "sliceLoadLevelInfos",
+            Self::NetworkPerformance => "nwPerfs",
+            Self::UeMobility => "ueMobs",
+            Self::UeCommunication => "ueComms",
+            Self::QosSustainability => "qosSustainInfos",
+            Self::AbnormalBehaviour => "abnorBehavrs",
+            Self::ServiceExperience => "svcExps",
+            Self::UserDataCongestion => "userDataCongInfos",
+            Self::Dispersion => "disperInfos",
+            Self::RedTransExp => "redTransInfos",
+            Self::WlanPerformance => "wlanPerfInfos",
+            Self::DnPerformance => "dnPerfInfos",
+            Self::SmCongestion => "smcInfos",
+            Self::PduSessionTraffic => "pduSesTrafInfos",
+        }
+    }
+}
+
+/// TS 29.520 `NotificationMethod` — how the consumer is notified for an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationMethod {
+    /// `PERIODIC` — notify once per reporting period.
+    Periodic,
+    /// `THRESHOLD` — notify when a threshold is crossed.
+    ///
+    /// Threshold evaluation itself is deferred (remediation item nwafd-07); the
+    /// dispatcher currently fires periodically regardless of method. The value
+    /// is parsed and carried so the evaluation pass can be added without a
+    /// wire-surface change.
+    Threshold,
+}
+
+impl NotificationMethod {
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "PERIODIC" => Some(Self::Periodic),
+            "THRESHOLD" => Some(Self::Threshold),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Periodic => "PERIODIC",
+            Self::Threshold => "THRESHOLD",
+        }
+    }
+}
+
+/// One entry of TS 29.520 `NnwdafEventsSubscription.eventSubscriptions[]`
+/// (`EventSubscription`).
+#[derive(Debug, Clone)]
+pub struct EventSubscription {
+    /// The analytics event (`event`, NwdafEvent).
+    pub event: AnalyticsId,
+    /// `notificationMethod` (PERIODIC / THRESHOLD); `None` = unspecified.
+    pub notification_method: Option<NotificationMethod>,
+    /// Reporting period in seconds, from `extraReportReq.repPeriod`
+    /// (`EventReportingRequirement`).
+    pub rep_period_secs: Option<u64>,
+    /// Load-level threshold (`loadLevelThreshold` / `nfLoadLvlThds`), carried
+    /// for the deferred THRESHOLD evaluation (nwafd-07); not yet evaluated.
+    pub load_level_threshold: Option<u64>,
+    /// `matchingDir` (ASCENDING / DESCENDING / CROSSED), carried for nwafd-07.
+    pub matching_dir: Option<String>,
+    /// Per-event slice filters (`snssais`).
+    pub snssais: Vec<SNssai>,
+}
+
+impl EventSubscription {
+    /// A bare periodic subscription to a single event, used by the convenience
+    /// [`AnalyticsSubscription::new`] constructor and by tests.
+    pub fn periodic(event: AnalyticsId) -> Self {
+        Self {
+            event,
+            notification_method: Some(NotificationMethod::Periodic),
+            rep_period_secs: None,
+            load_level_threshold: None,
+            matching_dir: None,
+            snssais: Vec::new(),
         }
     }
 }
@@ -76,24 +223,27 @@ impl Default for SNssai {
     }
 }
 
-/// Analytics subscription
+/// Analytics subscription (TS 29.520 `NnwdafEventsSubscription`).
+///
+/// A single subscription record may carry multiple events via
+/// [`events`](Self::events), matching the spec `eventSubscriptions[]` array.
 #[derive(Debug, Clone)]
 pub struct AnalyticsSubscription {
     /// Unique subscription ID
     pub subscription_id: String,
-    /// Analytics type requested
-    pub analytics_id: AnalyticsId,
+    /// Per-event subscriptions (`eventSubscriptions[]`, minItems 1).
+    pub events: Vec<EventSubscription>,
     /// Target SUPI (for UE-specific analytics)
     pub target_supi: Option<String>,
     /// Target S-NSSAI (for slice-specific analytics)
     pub target_snssai: Option<SNssai>,
-    /// Notification URI for analytics reports
+    /// Notification URI for analytics reports (`notificationURI`)
     pub notification_uri: String,
     /// Subscription expiry time (Unix timestamp)
     pub expiry: u64,
     /// Subscription active flag
     pub active: bool,
-    /// Notification correlation ID (echoed in every Notify body)
+    /// Notification correlation ID (`notifCorrId`, echoed in every Notify body)
     pub notification_correlation_id: String,
     /// Repetition period in seconds (None = one-shot / no periodic repeat).
     /// Enforced by the dispatcher: a notification is suppressed if the elapsed
@@ -104,16 +254,32 @@ pub struct AnalyticsSubscription {
 }
 
 impl AnalyticsSubscription {
+    /// Convenience constructor for a single-event, periodic subscription.
     pub fn new(
         subscription_id: String,
         analytics_id: AnalyticsId,
         notification_uri: String,
         expiry: u64,
     ) -> Self {
+        Self::new_with_events(
+            subscription_id,
+            vec![EventSubscription::periodic(analytics_id)],
+            notification_uri,
+            expiry,
+        )
+    }
+
+    /// Full constructor carrying the parsed `eventSubscriptions[]`.
+    pub fn new_with_events(
+        subscription_id: String,
+        events: Vec<EventSubscription>,
+        notification_uri: String,
+        expiry: u64,
+    ) -> Self {
         let notification_correlation_id = format!("corr-{}", uuid::Uuid::new_v4());
         Self {
             subscription_id,
-            analytics_id,
+            events,
             target_supi: None,
             target_snssai: None,
             notification_uri,
@@ -123,6 +289,11 @@ impl AnalyticsSubscription {
             repetition_period_secs: Some(60),
             last_notification_time: None,
         }
+    }
+
+    /// Returns true if any event in this subscription matches `analytics_id`.
+    pub fn covers(&self, analytics_id: AnalyticsId) -> bool {
+        self.events.iter().any(|e| e.event == analytics_id)
     }
 
     pub fn with_target_supi(mut self, supi: String) -> Self {
@@ -343,7 +514,7 @@ impl NwdafContext {
             .read()
             .map(|subs| {
                 subs.values()
-                    .filter(|s| s.analytics_id == analytics_id && s.active && !s.is_expired())
+                    .filter(|s| s.covers(analytics_id) && s.active && !s.is_expired())
                     .cloned()
                     .collect()
             })
@@ -497,6 +668,57 @@ mod tests {
         assert_eq!(AnalyticsId::NfLoad.as_str(), "NF_LOAD");
         assert_eq!(AnalyticsId::from_str("NF_LOAD"), Some(AnalyticsId::NfLoad));
         assert_eq!(AnalyticsId::from_str("INVALID"), None);
+    }
+
+    /// nwafd-01: every TS 29.520 `NwdafEvent` token round-trips both ways, and
+    /// the two previously-wrong tokens are now correct while the old abbreviated
+    /// spellings are rejected.
+    #[test]
+    fn test_analytics_id_token_round_trip() {
+        // Full spec token list this binary recognises.
+        let tokens = [
+            "NF_LOAD",
+            "NETWORK_PERFORMANCE",
+            "UE_MOBILITY",
+            "UE_COMMUNICATION",
+            "ABNORMAL_BEHAVIOUR",
+            "SERVICE_EXPERIENCE",
+            "QOS_SUSTAINABILITY",
+            "SLICE_LOAD_LEVEL",
+            "USER_DATA_CONGESTION",
+            "NSI_LOAD_LEVEL",
+            "SM_CONGESTION",
+            "DISPERSION",
+            "RED_TRANS_EXP",
+            "WLAN_PERFORMANCE",
+            "DN_PERFORMANCE",
+            "PDU_SESSION_TRAFFIC",
+        ];
+
+        // from_str(t).as_str() == t for every spec token.
+        for t in tokens {
+            let id = AnalyticsId::from_str(t)
+                .unwrap_or_else(|| panic!("spec token {t} must be accepted by from_str"));
+            assert_eq!(id.as_str(), t, "token {t} must round-trip back to itself");
+        }
+
+        // ALL covers exactly the token list, as_str() in declaration order.
+        let from_all: Vec<&str> = AnalyticsId::ALL.iter().map(|e| e.as_str()).collect();
+        assert_eq!(from_all, tokens, "ALL must enumerate every token in order");
+
+        // The two corrected tokens are accepted.
+        assert_eq!(
+            AnalyticsId::from_str("UE_COMMUNICATION"),
+            Some(AnalyticsId::UeCommunication)
+        );
+        assert_eq!(
+            AnalyticsId::from_str("SLICE_LOAD_LEVEL"),
+            Some(AnalyticsId::SliceLoadLevel)
+        );
+
+        // The old abbreviated tokens are rejected.
+        assert_eq!(AnalyticsId::from_str("UE_COMM"), None);
+        assert_eq!(AnalyticsId::from_str("SLICE_LOAD"), None);
     }
 
     #[test]
