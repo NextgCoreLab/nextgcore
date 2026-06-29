@@ -257,6 +257,10 @@ mod tests {
         CommonIEsProvideCapabilities, CommonIEsRequestCapabilities, EcidProvideCapabilities,
         EcidRequestCapabilities, ProvideCapabilitiesR9, RequestCapabilitiesR9,
     };
+    use crate::lpp::nr_dl_tdoa::{
+        DlPrsIdInfo, NrDlTdoaMeasElement, NrDlTdoaMeasList, NrDlTdoaProvideLocationInformation,
+        NrDlTdoaSignalMeasurementInformation, NrRstd, NrSlot, NrTimeStamp, NrTimingQuality,
+    };
     use crate::lpp::types::{Initiator, TransactionNumber};
     use bitvec::prelude::*;
 
@@ -397,6 +401,58 @@ mod tests {
                                 },
                             ),
                             ecid_error: None,
+                        }),
+                        nr_dl_tdoa: None,
+                    },
+                }),
+            )),
+        };
+        let bytes = msg.encode().unwrap();
+        assert_eq!(LppMessage::decode(&bytes).unwrap(), msg);
+    }
+
+    #[test]
+    fn rt_lpp_message_provide_path_nr_dl_tdoa() {
+        // A full LppMessage carrying ProvideLocationInformation -> nr-DL-TDOA
+        // (the r16 extension-addition group), end to end.
+        let msg = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::TargetDevice,
+                transaction_number: TransactionNumber(9),
+            }),
+            end_transaction: true,
+            sequence_number: None,
+            acknowledgement: None,
+            message_body: Some(LppMessageBody::C1(
+                MessageBodyC1::ProvideLocationInformation(ProvideLocationInformation {
+                    ies: ProvideLocationInformationR9 {
+                        ecid: None,
+                        nr_dl_tdoa: Some(NrDlTdoaProvideLocationInformation {
+                            signal_measurement_information: Some(
+                                NrDlTdoaSignalMeasurementInformation {
+                                    dl_prs_reference_info: DlPrsIdInfo { dl_prs_id: 5 },
+                                    meas_list: NrDlTdoaMeasList {
+                                        items: vec![NrDlTdoaMeasElement {
+                                            dl_prs_id: 5,
+                                            nr_phys_cell_id: Some(123),
+                                            nr_arfcn: Some(640_000),
+                                            nr_time_stamp: NrTimeStamp {
+                                                dl_prs_id: 5,
+                                                nr_phys_cell_id: Some(123),
+                                                nr_arfcn: None,
+                                                nr_sfn: 700,
+                                                nr_slot: NrSlot::Scs30(11),
+                                            },
+                                            nr_rstd: NrRstd::K1(500_000),
+                                            nr_timing_quality: NrTimingQuality {
+                                                timing_quality_value: 12,
+                                                timing_quality_resolution: 2,
+                                            },
+                                            nr_dl_prs_rsrp_result: Some(80),
+                                        }],
+                                    },
+                                },
+                            ),
                         }),
                     },
                 }),

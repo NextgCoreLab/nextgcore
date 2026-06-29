@@ -16,6 +16,7 @@
 
 use bitvec::prelude::*;
 
+use super::nr_dl_tdoa::NrDlTdoaProvideLocationInformation;
 use crate::per::{Constraint, PerError, PerResult};
 use crate::uper::{UperDecode, UperDecoder, UperEncode, UperEncoder};
 
@@ -165,22 +166,56 @@ impl UperDecode for ProvideLocationInformation {
 ///     otdoa-ProvideLocationInformation    OPTIONAL,
 ///     ecid-ProvideLocationInformation     OPTIONAL,
 ///     epdu-ProvideLocationInformation     OPTIONAL,
-///     ..., [[ ...later release groups... ]] }
+///     ...,
+///     [[ G1(r13): sensor / tbs / wlan / bt ]],
+///     [[ G2(r16): nr-ECID / nr-Multi-RTT / nr-DL-AoD / nr-DL-TDOA ]],
+///     [[ G3(r19): nr-DL-AIML ]] }
 ///
-/// As on the request side, v1 types ONLY the `ecid` root method.
+/// The 5 root optionals type ONLY the `ecid` method (others UNSUPPORTED-ABSENT,
+/// as on the request side). The NR DL-TDOA provide-body rides in the **r16
+/// extension-addition group G2, member index 3** (4th of
+/// `[nr-ECID, nr-Multi-RTT, nr-DL-AoD, nr-DL-TDOA]`). Per X.691 §18.9 the group
+/// is itself encoded as a non-extensible SEQUENCE of its 4 OPTIONAL members,
+/// open-type-wrapped as the 2nd of the 3 declared addition groups (G1/G2/G3).
+///
+/// BACKWARD COMPAT: when `nr_dl_tdoa` is `None`, no addition is emitted
+/// (extension marker 0), so the encoding is byte-identical to the E-CID-only
+/// v1 form.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProvideLocationInformationR9 {
     pub ecid: Option<EcidProvideLocationInformation>,
+    /// NR DL-TDOA provide-body, carried in the r16 extension-addition group.
+    pub nr_dl_tdoa: Option<NrDlTdoaProvideLocationInformation>,
 }
 
 impl UperEncode for ProvideLocationInformationR9 {
     fn encode_uper(&self, encoder: &mut UperEncoder) -> PerResult<()> {
+        let has_add = self.nr_dl_tdoa.is_some();
+        // Extension marker = whether any extension addition follows.
         encoder.encode_sequence_preamble(
-            Some(false),
+            Some(has_add),
             &[false, false, false, self.ecid.is_some(), false],
         );
         if let Some(ecid) = &self.ecid {
             ecid.encode_uper(encoder)?;
+        }
+        if has_add {
+            // Build the r16 group (G2) content: a non-extensible SEQUENCE whose
+            // 4 OPTIONAL members are [nr-ECID, nr-Multi-RTT, nr-DL-AoD,
+            // nr-DL-TDOA]; only nr-DL-TDOA (index 3) is present.
+            let mut g2 = UperEncoder::new();
+            g2.encode_sequence_preamble(
+                None,
+                &[false, false, false, self.nr_dl_tdoa.is_some()],
+            );
+            if let Some(tdoa) = &self.nr_dl_tdoa {
+                tdoa.encode_uper(&mut g2)?;
+            }
+            let g2_bytes = g2.into_bytes().to_vec();
+            // Addition groups [G1(r13), G2(r16), G3(r19)] — only G2 present.
+            // Canonical X.691 §18.8: the extension-presence bit-field is trimmed
+            // to the last present addition, so the trailing-absent G3 is dropped.
+            encoder.encode_extension_additions(&[None, Some(g2_bytes)])?;
         }
         Ok(())
     }
@@ -200,10 +235,31 @@ impl UperDecode for ProvideLocationInformationR9 {
         } else {
             None
         };
+        let mut nr_dl_tdoa = None;
         if ext {
-            decoder.decode_extension_additions()?;
+            // groups[0]=G1(r13), groups[1]=G2(r16), groups[2]=G3(r19) — index by
+            // position; a peer may send fewer groups (trailing-absent trimmed).
+            let groups = decoder.decode_extension_additions()?;
+            if let Some(Some(g2_bytes)) = groups.get(1) {
+                let mut g2 = UperDecoder::new(g2_bytes);
+                let (_g_ext, g_opts) = g2.decode_sequence_preamble(false, 4)?;
+                // g_opts = [nr-ECID, nr-Multi-RTT, nr-DL-AoD, nr-DL-TDOA]
+                if g_opts[0] || g_opts[1] || g_opts[2] {
+                    return Err(PerError::DecodeError(
+                        "LPP r16 provide group: nr-ECID / nr-Multi-RTT / nr-DL-AoD not supported \
+                         in C3 (nr-DL-TDOA only)"
+                            .to_string(),
+                    ));
+                }
+                if g_opts[3] {
+                    nr_dl_tdoa =
+                        Some(NrDlTdoaProvideLocationInformation::decode_uper(&mut g2)?);
+                }
+            }
+            // groups[0] (r13) and groups[2] (r19), if present, are ignored
+            // (forward-compat skip).
         }
-        Ok(ProvideLocationInformationR9 { ecid })
+        Ok(ProvideLocationInformationR9 { ecid, nr_dl_tdoa })
     }
 }
 
@@ -615,6 +671,38 @@ impl UperDecode for EcidTargetDeviceErrorCauses {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lpp::nr_dl_tdoa::{
+        DlPrsIdInfo, NrDlTdoaMeasElement, NrDlTdoaMeasList, NrDlTdoaSignalMeasurementInformation,
+        NrRstd, NrSlot, NrTimeStamp, NrTimingQuality,
+    };
+
+    fn minimal_nr_dl_tdoa() -> NrDlTdoaProvideLocationInformation {
+        NrDlTdoaProvideLocationInformation {
+            signal_measurement_information: Some(NrDlTdoaSignalMeasurementInformation {
+                dl_prs_reference_info: DlPrsIdInfo { dl_prs_id: 0 },
+                meas_list: NrDlTdoaMeasList {
+                    items: vec![NrDlTdoaMeasElement {
+                        dl_prs_id: 0,
+                        nr_phys_cell_id: None,
+                        nr_arfcn: None,
+                        nr_time_stamp: NrTimeStamp {
+                            dl_prs_id: 0,
+                            nr_phys_cell_id: None,
+                            nr_arfcn: None,
+                            nr_sfn: 0,
+                            nr_slot: NrSlot::Scs15(0),
+                        },
+                        nr_rstd: NrRstd::K0(0),
+                        nr_timing_quality: NrTimingQuality {
+                            timing_quality_value: 0,
+                            timing_quality_resolution: 0,
+                        },
+                        nr_dl_prs_rsrp_result: None,
+                    }],
+                },
+            }),
+        }
+    }
 
     fn roundtrip<T>(value: &T)
     where
@@ -760,6 +848,8 @@ mod tests {
 
     #[test]
     fn rt_provide_location_information() {
+        // E-CID-only provide body: nr_dl_tdoa None -> no extension addition,
+        // byte-identical to the pre-C3 encoding (backward compatibility).
         roundtrip(&ProvideLocationInformation {
             ies: ProvideLocationInformationR9 {
                 ecid: Some(EcidProvideLocationInformation {
@@ -769,8 +859,128 @@ mod tests {
                     }),
                     ecid_error: None,
                 }),
+                nr_dl_tdoa: None,
             },
         });
+    }
+
+    #[test]
+    fn rt_provide_location_information_nr_dl_tdoa() {
+        // nr-DL-TDOA only (no E-CID).
+        roundtrip(&ProvideLocationInformation {
+            ies: ProvideLocationInformationR9 {
+                ecid: None,
+                nr_dl_tdoa: Some(minimal_nr_dl_tdoa()),
+            },
+        });
+        // E-CID AND nr-DL-TDOA together.
+        roundtrip(&ProvideLocationInformation {
+            ies: ProvideLocationInformationR9 {
+                ecid: Some(EcidProvideLocationInformation {
+                    signal_measurement_information: Some(EcidSignalMeasurementInformation {
+                        primary_cell_measured_results: None,
+                        measured_results_list: vec![sample_element()],
+                    }),
+                    ecid_error: None,
+                }),
+                nr_dl_tdoa: Some(minimal_nr_dl_tdoa()),
+            },
+        });
+    }
+
+    /// Backward compatibility: an E-CID-only provide body (nr_dl_tdoa None) must
+    /// encode byte-identically whether or not the C3 field exists — i.e. NO
+    /// extension addition is emitted (extension marker 0, no group bytes).
+    #[test]
+    fn ecid_only_provide_r9_has_no_extension_addition() {
+        let r9 = ProvideLocationInformationR9 {
+            ecid: Some(EcidProvideLocationInformation {
+                signal_measurement_information: None,
+                ecid_error: None,
+            }),
+            nr_dl_tdoa: None,
+        };
+        let mut enc = UperEncoder::new();
+        r9.encode_uper(&mut enc).unwrap();
+        // Preamble: ext-marker 0 + [0,0,0,ecid=1,0] = `0 00010` (6 bits), then
+        // ECID-ProvideLocationInformation preamble `0 00` (ext 0 + [sig=0,err=0])
+        // = 9 bits total -> `0000_1000 0` -> padded 0x08, 0x00.
+        assert_eq!(enc.bit_length(), 9);
+        assert_eq!(enc.into_bytes().as_ref(), &[0x08, 0x00]);
+    }
+
+    /// REQUIRED hand-derived bit-annotated vector for the r16 GROUP FRAMING.
+    ///
+    /// Encodes `ProvideLocationInformationR9 { ecid: None, nr_dl_tdoa: Some(min) }`
+    /// and verifies the framing prefix bit-for-bit (X.691 §18.9 extension-
+    /// addition-group encoding). The deep nr-DL-TDOA sub-type internals are
+    /// covered by the round-trip tests; here we pin the GROUP framing.
+    ///
+    /// Bit-level derivation of the main encoder:
+    ///   ProvideLocationInformation-r9-IEs SEQUENCE preamble:
+    ///     pos0  ext-marker = 1   (an extension addition follows)
+    ///     pos1  commonIEs  = 0
+    ///     pos2  a-gnss     = 0
+    ///     pos3  otdoa      = 0
+    ///     pos4  ecid       = 0   (None)
+    ///     pos5  epdu       = 0
+    ///   encode_extension_additions(&[None, Some(G2)]):   // canonical: trailing-absent G3 trimmed
+    ///     normally-small-length(2) = `0` + (2-1)=1 in 6 bits `000001`
+    ///       pos6=0 pos7=0 pos8=0 pos9=0 pos10=0 pos11=0 pos12=1
+    ///     group presence bitmap [G1=0, G2=1]   (X.691 §18.8 trims trailing-absent G3)
+    ///       pos13=0 pos14=1
+    ///   => byte0 = pos0..7  = 1000_0000 = 0x80
+    ///      byte1 = pos8..15 = 0000_1010 = 0x0A
+    ///        (pos8..12 nsl tail 00001, pos13..14 bitmap 01, pos15 open-type len hi-bit 0)
+    ///   After the trimmed 2-bit bitmap (ends pos14) the G2 open type follows
+    ///   bit-UNALIGNED at pos15 (length determinant, then content) — a correct
+    ///   UPER property (no realignment), so the G2 content is not octet-aligned.
+    ///   The G2 content (group preamble `0001` + NR-DL-TDOA provide preamble
+    ///   `0100`) and the length are therefore verified by the round-trip below,
+    ///   not as fixed octets; only the byte-aligned framing prefix is pinned.
+    #[test]
+    fn test_nr_dl_tdoa_r16_group_framing_reference_hex() {
+        let r9 = ProvideLocationInformationR9 {
+            ecid: None,
+            nr_dl_tdoa: Some(minimal_nr_dl_tdoa()),
+        };
+        let mut enc = UperEncoder::new();
+        r9.encode_uper(&mut enc).unwrap();
+        let bytes = enc.into_bytes();
+
+        // Framing prefix (cleanly byte-aligned): root preamble + normally-small-
+        // length(2) + 2-bit group bitmap. The G2 open type follows bit-unaligned
+        // (correct UPER) and is verified by the round-trip below.
+        assert_eq!(bytes[0], 0x80, "ext-marker 1 + 5 root presence bits (all 0)");
+        assert_eq!(
+            bytes[1], 0x0A,
+            "normally-small-length(2) tail + group presence bitmap 01 (trailing G3 trimmed)"
+        );
+
+        // The full vector must also round-trip back to the same value.
+        let mut dec = UperDecoder::new(&bytes);
+        let decoded = ProvideLocationInformationR9::decode_uper(&mut dec).unwrap();
+        assert_eq!(decoded, r9);
+    }
+
+    /// Negative: a peer's r16 group with nr-Multi-RTT (member index 1) present is
+    /// rejected in C3 (only nr-DL-TDOA, index 3, is typed).
+    #[test]
+    fn err_r16_group_multi_rtt_present() {
+        let mut main = UperEncoder::new();
+        // Root preamble: ext-marker 1, all root optionals absent.
+        main.encode_sequence_preamble(Some(true), &[false, false, false, false, false]);
+        // G2 group with nr-Multi-RTT (index 1) present, no content needed (the
+        // decoder rejects on the group bitmap before reading any body).
+        let mut g2 = UperEncoder::new();
+        g2.encode_sequence_preamble(None, &[false, true, false, false]);
+        let g2_bytes = g2.into_bytes().to_vec();
+        main.encode_extension_additions(&[None, Some(g2_bytes)])
+            .unwrap();
+        let bytes = main.into_bytes();
+
+        let mut dec = UperDecoder::new(&bytes);
+        assert!(ProvideLocationInformationR9::decode_uper(&mut dec).is_err());
     }
 
     #[test]

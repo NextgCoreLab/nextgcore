@@ -34,9 +34,11 @@
 pub mod capabilities;
 pub mod ecid;
 pub mod message;
+pub mod nr_dl_tdoa;
 pub mod types;
 
 pub use capabilities::*;
 pub use ecid::*;
 pub use message::*;
+pub use nr_dl_tdoa::*;
 pub use types::*;
