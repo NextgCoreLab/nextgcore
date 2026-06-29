@@ -731,8 +731,12 @@ impl UdmContext {
 
     /// Find UE by SUCI
     pub fn ue_find_by_suci(&self, suci: &str) -> Option<UdmUe> {
-        let suci_hash = self.suci_hash.read().ok()?;
+        // Canonical lock order is ue_list before the *_hash maps (ue_add /
+        // ue_remove / ue_update all take ue_list first). Acquiring suci_hash
+        // then ue_list here would invert that and deadlock against a concurrent
+        // ue_add (ue_list -> suci_hash) — AB-BA. Acquire ue_list first.
         let ue_list = self.ue_list.read().ok()?;
+        let suci_hash = self.suci_hash.read().ok()?;
 
         if let Some(&id) = suci_hash.get(suci) {
             return ue_list.get(&id).cloned();
@@ -742,8 +746,9 @@ impl UdmContext {
 
     /// Find UE by SUPI
     pub fn ue_find_by_supi(&self, supi: &str) -> Option<UdmUe> {
-        let supi_hash = self.supi_hash.read().ok()?;
+        // Canonical lock order: ue_list before supi_hash (see ue_find_by_suci).
         let ue_list = self.ue_list.read().ok()?;
+        let supi_hash = self.supi_hash.read().ok()?;
 
         if let Some(&id) = supi_hash.get(supi) {
             return ue_list.get(&id).cloned();
