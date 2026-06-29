@@ -554,11 +554,16 @@ impl ScpProxy {
             )
         })?;
 
+        // Build the producer ApiRoot from the NF profile fields parsed out of
+        // the SearchResult: scheme and prefix come from nfServices[].scheme /
+        // nfServices[].apiPrefix; host is ipv4→fqdn→ipv6(bracketed).
+        // `client_for`/`oauth_client_for` already honour the scheme field, so
+        // an `https` producer is now contacted over TLS automatically.
         let target = ApiRoot {
-            scheme: UriScheme::Http,
+            scheme: selected.scheme,
             host: selected.host.clone(),
             port: selected.port,
-            prefix: String::new(),
+            prefix: selected.prefix.clone(),
         };
         Ok((target, selected.nf_instance_id.clone()))
     }
@@ -1447,6 +1452,92 @@ mod tests {
         scp.stop().await.expect("scp stop");
         nrf.stop().await.expect("nrf stop");
         producer.stop().await.expect("producer stop");
+    }
+
+    // ------------------------------------------------------------------
+    // scpd-01: Model D ApiRoot derivation honours producer NF profile
+    // ------------------------------------------------------------------
+
+    /// scpd-01 acceptance: a SearchResult with `scheme:"https"`, an IPv6
+    /// address, and `apiPrefix` produces `ApiRoot` `https://[v6]:port/prefix`.
+    /// The existing http/ipv4 path is unchanged.
+    #[test]
+    fn test_discover_builds_apiroot_from_https_ipv6_apiprefix_profile() {
+        let https_ipv6_result = serde_json::json!({
+            "validityPeriod": 3600,
+            "nfInstances": [{
+                "nfInstanceId": "udm-tls-v6",
+                "nfType": "UDM",
+                "nfStatus": "REGISTERED",
+                "ipv6Addresses": ["2001:db8::cafe"],
+                "priority": 1,
+                "capacity": 100,
+                "load": 0,
+                "nfServices": [{
+                    "serviceName": "nudm-sdm",
+                    "scheme": "https",
+                    "apiPrefix": "/5g/v1",
+                    "ipEndPoints": [{"transport": "TCP", "port": 8443}]
+                }]
+            }]
+        });
+        let body = serde_json::to_vec(&https_ipv6_result).unwrap();
+        let candidates = parse_search_result(&body);
+        let selected = select_nf_instance(&candidates).expect("candidate selected");
+
+        // Simulate what discover() now does.
+        let target = ApiRoot {
+            scheme: selected.scheme,
+            host: selected.host.clone(),
+            port: selected.port,
+            prefix: selected.prefix.clone(),
+        };
+
+        assert_eq!(target.scheme, UriScheme::Https);
+        assert_eq!(target.host, "[2001:db8::cafe]");
+        assert_eq!(target.port, 8443);
+        assert_eq!(target.prefix, "/5g/v1");
+        assert_eq!(target.to_uri(), "https://[2001:db8::cafe]:8443/5g/v1");
+    }
+
+    /// scpd-01 acceptance: a plain http/ipv4 profile (no scheme or apiPrefix
+    /// in the SearchResult) still yields the existing `http://ipv4:port` root
+    /// — backward-compat is preserved, so the matched-sim Model D path is
+    /// unchanged.
+    #[test]
+    fn test_discover_builds_apiroot_from_http_ipv4_profile_unchanged() {
+        let http_ipv4_result = serde_json::json!({
+            "validityPeriod": 3600,
+            "nfInstances": [{
+                "nfInstanceId": "udm-plain",
+                "nfType": "UDM",
+                "nfStatus": "REGISTERED",
+                "ipv4Addresses": ["10.0.0.1"],
+                "priority": 1,
+                "capacity": 100,
+                "load": 0,
+                "nfServices": [{
+                    "serviceName": "nudm-uecm",
+                    "ipEndPoints": [{"port": 7777}]
+                }]
+            }]
+        });
+        let body = serde_json::to_vec(&http_ipv4_result).unwrap();
+        let candidates = parse_search_result(&body);
+        let selected = select_nf_instance(&candidates).expect("candidate selected");
+
+        let target = ApiRoot {
+            scheme: selected.scheme,
+            host: selected.host.clone(),
+            port: selected.port,
+            prefix: selected.prefix.clone(),
+        };
+
+        assert_eq!(target.scheme, UriScheme::Http);
+        assert_eq!(target.host, "10.0.0.1");
+        assert_eq!(target.port, 7777);
+        assert_eq!(target.prefix, "");
+        assert_eq!(target.to_uri(), "http://10.0.0.1:7777");
     }
 
     /// When no NRF (and thus no OAuth2 client) is configured, a Model C forward

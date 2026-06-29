@@ -16,6 +16,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use ogs_sbi::types::UriScheme;
+
 use crate::context::{DiscoveryOption, NfType, SbiServiceType};
 
 /// SBI server configuration
@@ -272,6 +274,12 @@ pub struct NfInstanceCandidate {
     pub load: u16,
     /// Whether the instance is considered healthy
     pub healthy: bool,
+    /// URI scheme derived from `nfServices[].scheme` (TS 29.510 §6.1.6.2.x).
+    /// Defaults to `Http` when no TLS indicator is present in the NF profile.
+    pub scheme: UriScheme,
+    /// Optional deployment-specific API prefix from `nfServices[].apiPrefix`
+    /// (TS 29.501 §4.4.1 / TS 29.500 §6.10.2.5).
+    pub prefix: String,
 }
 
 /// Select the best NF instance from a list of candidates using weighted round-robin.
@@ -457,7 +465,17 @@ pub fn discovery_cache() -> &'static DiscoveryCache {
 /// Parse NF discovery search result JSON into NfInstanceCandidate list.
 ///
 /// Parses the SearchResult response from NRF discovery
-/// (TS 29.510 Section 6.2.3.2.3.1).
+/// (TS 29.510 §6.2.3.2.3.1).  For each nfInstance the following fields are
+/// extracted per TS 29.510 §6.1.6.2.x and TS 29.500 §6.10.2.5:
+///
+/// - **scheme**: from `nfServices[0].scheme`; `https` → `UriScheme::Https`,
+///   absent/other → `UriScheme::Http` (backward-compat default).
+/// - **host**: `ipv4Addresses[0]` → `fqdn` → `ipv6Addresses[0]` (bracketed
+///   as `[addr]` so it is valid in an authority component).
+/// - **port**: from the first `ipEndPoints` entry whose `transport` is `TCP`
+///   (case-insensitive), falling back to `ipEndPoints[0]` if none specifies
+///   a transport.
+/// - **prefix**: from `nfServices[0].apiPrefix` (empty string when absent).
 pub fn parse_search_result(body: &[u8]) -> Vec<NfInstanceCandidate> {
     let value: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
@@ -485,23 +503,65 @@ pub fn parse_search_result(body: &[u8]) -> Vec<NfInstanceCandidate> {
                 .and_then(|v| v.as_str())
                 .unwrap_or("REGISTERED");
 
-            // Extract host/port from ipv4Addresses or fqdn
+            // Host resolution: ipv4Addresses[0] → fqdn → ipv6Addresses[0].
+            // IPv6 literals are bracketed (e.g. `[2001:db8::1]`) so they are
+            // valid inside an HTTP authority component (RFC 3986 §3.2.2).
             let host = inst
                 .get("ipv4Addresses")
                 .and_then(|v| v.as_array())
                 .and_then(|a| a.first())
                 .and_then(|v| v.as_str())
-                .or_else(|| inst.get("fqdn").and_then(|v| v.as_str()))
-                .unwrap_or("127.0.0.1")
-                .to_string();
+                .map(str::to_string)
+                .or_else(|| inst.get("fqdn").and_then(|v| v.as_str()).map(str::to_string))
+                .or_else(|| {
+                    inst.get("ipv6Addresses")
+                        .and_then(|v| v.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|v| v.as_str())
+                        .map(|v6| format!("[{v6}]"))
+                })
+                .unwrap_or_else(|| "127.0.0.1".to_string());
 
-            let port = inst
+            // Service-level fields: scheme, port, and apiPrefix come from
+            // nfServices[0].  Port is taken from the first ipEndPoints entry
+            // whose transport is TCP (case-insensitive); falls back to [0].
+            let first_service = inst
                 .get("nfServices")
                 .and_then(|v| v.as_array())
-                .and_then(|services| services.first())
+                .and_then(|s| s.first());
+
+            let scheme = first_service
+                .and_then(|svc| svc.get("scheme"))
+                .and_then(|v| v.as_str())
+                .map(|s| {
+                    if s.eq_ignore_ascii_case("https") {
+                        UriScheme::Https
+                    } else {
+                        UriScheme::Http
+                    }
+                })
+                .unwrap_or(UriScheme::Http);
+
+            let prefix = first_service
+                .and_then(|svc| svc.get("apiPrefix"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let port = first_service
                 .and_then(|svc| svc.get("ipEndPoints"))
                 .and_then(|v| v.as_array())
-                .and_then(|eps| eps.first())
+                .and_then(|eps| {
+                    // Prefer an endpoint explicitly marked as TCP.
+                    eps.iter()
+                        .find(|ep| {
+                            ep.get("transport")
+                                .and_then(|t| t.as_str())
+                                .map(|t| t.eq_ignore_ascii_case("TCP"))
+                                .unwrap_or(false)
+                        })
+                        .or_else(|| eps.first())
+                })
                 .and_then(|ep| ep.get("port"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(7777) as u16;
@@ -519,6 +579,8 @@ pub fn parse_search_result(body: &[u8]) -> Vec<NfInstanceCandidate> {
                 capacity,
                 load,
                 healthy: nf_status == "REGISTERED",
+                scheme,
+                prefix,
             });
         }
     }
@@ -712,6 +774,8 @@ mod tests {
             capacity: 100,
             load: 50,
             healthy: true,
+            scheme: UriScheme::Http,
+            prefix: String::new(),
         }];
         let selected = select_nf_instance(&candidates);
         assert!(selected.is_some());
@@ -730,6 +794,8 @@ mod tests {
                 capacity: 100,
                 load: 10,
                 healthy: true,
+                scheme: UriScheme::Http,
+                prefix: String::new(),
             },
             NfInstanceCandidate {
                 nf_instance_id: "nf-high".to_string(),
@@ -740,6 +806,8 @@ mod tests {
                 capacity: 100,
                 load: 90,
                 healthy: true,
+                scheme: UriScheme::Http,
+                prefix: String::new(),
             },
         ];
         let selected = select_nf_instance(&candidates);
@@ -758,6 +826,8 @@ mod tests {
                 capacity: 100,
                 load: 90,
                 healthy: true,
+                scheme: UriScheme::Http,
+                prefix: String::new(),
             },
             NfInstanceCandidate {
                 nf_instance_id: "nf-idle".to_string(),
@@ -768,6 +838,8 @@ mod tests {
                 capacity: 100,
                 load: 10,
                 healthy: true,
+                scheme: UriScheme::Http,
+                prefix: String::new(),
             },
         ];
         let selected = select_nf_instance(&candidates);
@@ -786,6 +858,8 @@ mod tests {
                 capacity: 100,
                 load: 0,
                 healthy: false,
+                scheme: UriScheme::Http,
+                prefix: String::new(),
             },
             NfInstanceCandidate {
                 nf_instance_id: "nf-healthy".to_string(),
@@ -796,6 +870,8 @@ mod tests {
                 capacity: 100,
                 load: 50,
                 healthy: true,
+                scheme: UriScheme::Http,
+                prefix: String::new(),
             },
         ];
         let selected = select_nf_instance(&candidates);
@@ -814,6 +890,8 @@ mod tests {
                 capacity: 100,
                 load: 50,
                 healthy: true,
+                scheme: UriScheme::Http,
+                prefix: String::new(),
             },
             NfInstanceCandidate {
                 nf_instance_id: "nf-b".to_string(),
@@ -824,6 +902,8 @@ mod tests {
                 capacity: 100,
                 load: 50,
                 healthy: true,
+                scheme: UriScheme::Http,
+                prefix: String::new(),
             },
         ];
         // Call twice to see round-robin switching
@@ -854,6 +934,8 @@ mod tests {
             capacity: 100,
             load: 0,
             healthy: true,
+            scheme: UriScheme::Http,
+            prefix: String::new(),
         }];
 
         cache.put(
@@ -899,8 +981,124 @@ mod tests {
         assert_eq!(candidates[0].nf_instance_id, "smf-001");
         assert_eq!(candidates[0].host, "10.0.0.1");
         assert!(candidates[0].healthy);
+        // No scheme in the profile → defaults to Http (backward-compat).
+        assert_eq!(candidates[0].scheme, UriScheme::Http);
+        assert_eq!(candidates[0].prefix, "");
         assert_eq!(candidates[1].nf_instance_id, "smf-002");
         assert!(!candidates[1].healthy);
+    }
+
+    /// scpd-01 acceptance: an `https` profile with an IPv6 address and
+    /// apiPrefix yields `ApiRoot` `https://[v6]:port/prefix`.
+    #[test]
+    fn test_parse_search_result_https_ipv6_apiprefix() {
+        let json = serde_json::json!({
+            "validityPeriod": 3600,
+            "nfInstances": [{
+                "nfInstanceId": "udm-tls-1",
+                "nfType": "UDM",
+                "nfStatus": "REGISTERED",
+                "ipv6Addresses": ["2001:db8::1"],
+                "priority": 1,
+                "capacity": 100,
+                "load": 0,
+                "nfServices": [{
+                    "serviceInstanceId": "nudm-sdm-1",
+                    "serviceName": "nudm-sdm",
+                    "scheme": "https",
+                    "apiPrefix": "/nudm",
+                    "ipEndPoints": [{"transport": "TCP", "port": 8443}]
+                }]
+            }]
+        });
+        let body = serde_json::to_vec(&json).unwrap();
+        let candidates = parse_search_result(&body);
+        assert_eq!(candidates.len(), 1);
+        let c = &candidates[0];
+        // IPv6 literal must be bracketed for use in an authority component.
+        assert_eq!(c.host, "[2001:db8::1]");
+        assert_eq!(c.port, 8443);
+        assert_eq!(c.scheme, UriScheme::Https);
+        assert_eq!(c.prefix, "/nudm");
+    }
+
+    /// scpd-01 acceptance: a plain http/ipv4 profile yields the current
+    /// default scheme and empty prefix (backward-compat).
+    #[test]
+    fn test_parse_search_result_http_ipv4_default() {
+        let json = serde_json::json!({
+            "validityPeriod": 3600,
+            "nfInstances": [{
+                "nfInstanceId": "udm-plain-1",
+                "nfType": "UDM",
+                "nfStatus": "REGISTERED",
+                "ipv4Addresses": ["10.0.0.2"],
+                "priority": 1,
+                "capacity": 100,
+                "load": 0,
+                "nfServices": [{
+                    "serviceInstanceId": "nudm-uecm-1",
+                    "serviceName": "nudm-uecm",
+                    "ipEndPoints": [{"port": 7777}]
+                }]
+            }]
+        });
+        let body = serde_json::to_vec(&json).unwrap();
+        let candidates = parse_search_result(&body);
+        assert_eq!(candidates.len(), 1);
+        let c = &candidates[0];
+        assert_eq!(c.host, "10.0.0.2");
+        assert_eq!(c.port, 7777);
+        assert_eq!(c.scheme, UriScheme::Http);
+        assert_eq!(c.prefix, "");
+    }
+
+    /// scpd-01: when multiple ipEndPoints are present, the one with
+    /// `transport: TCP` is preferred over the first entry.
+    #[test]
+    fn test_parse_search_result_prefers_tcp_endpoint() {
+        let json = serde_json::json!({
+            "validityPeriod": 3600,
+            "nfInstances": [{
+                "nfInstanceId": "smf-multi-ep",
+                "nfType": "SMF",
+                "nfStatus": "REGISTERED",
+                "ipv4Addresses": ["10.0.0.3"],
+                "nfServices": [{
+                    "serviceName": "nsmf-pdusession",
+                    "ipEndPoints": [
+                        {"transport": "SCTP", "port": 9999},
+                        {"transport": "TCP",  "port": 8888}
+                    ]
+                }]
+            }]
+        });
+        let body = serde_json::to_vec(&json).unwrap();
+        let candidates = parse_search_result(&body);
+        assert_eq!(candidates.len(), 1);
+        // TCP endpoint (port 8888) wins over the first (SCTP, port 9999).
+        assert_eq!(candidates[0].port, 8888);
+    }
+
+    /// scpd-01: fqdn is chosen when ipv4Addresses is absent.
+    #[test]
+    fn test_parse_search_result_fqdn_fallback() {
+        let json = serde_json::json!({
+            "validityPeriod": 3600,
+            "nfInstances": [{
+                "nfInstanceId": "ausf-fqdn",
+                "nfType": "AUSF",
+                "nfStatus": "REGISTERED",
+                "fqdn": "ausf.5gc.example.org",
+                "nfServices": [{
+                    "serviceName": "nausf-auth",
+                    "ipEndPoints": [{"port": 8443}]
+                }]
+            }]
+        });
+        let body = serde_json::to_vec(&json).unwrap();
+        let candidates = parse_search_result(&body);
+        assert_eq!(candidates[0].host, "ausf.5gc.example.org");
     }
 
     #[test]
