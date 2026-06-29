@@ -8,6 +8,8 @@ use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::subscription::{MbsEvent, SubEntry, SubscriptionStore};
+
 /// S-NSSAI (Single Network Slice Selection Assistance Information)
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct SNssai {
@@ -409,6 +411,10 @@ pub struct MbSmfContext {
     next_mcast_teid: AtomicU32,
     /// Nmbsmf_TMGI allocation pool (per-PLMN, with expiry). [mbsmfd-04]
     tmgi_pool: Mutex<TmgiPool>,
+    /// Status subscription store (NEF/MBSF/AF-facing). [mbsmfd-05]
+    status_subs: Mutex<SubscriptionStore>,
+    /// ContextStatus subscription store (SMF-facing). [mbsmfd-05]
+    context_status_subs: Mutex<SubscriptionStore>,
 }
 
 impl MbSmfContext {
@@ -422,6 +428,8 @@ impl MbSmfContext {
             next_n4mb_seid: AtomicUsize::new(0x100),
             next_mcast_teid: AtomicU32::new(0x0BCA_0001),
             tmgi_pool: Mutex::new(TmgiPool::new()),
+            status_subs: Mutex::new(SubscriptionStore::new()),
+            context_status_subs: Mutex::new(SubscriptionStore::new()),
         }
     }
 
@@ -643,6 +651,85 @@ impl MbSmfContext {
     /// Expiry (Unix seconds) of a specific allocated TMGI, if present.
     pub fn tmgi_expiry_of(&self, tmgi: &Tmgi) -> Option<u64> {
         self.tmgi_pool.lock().ok().and_then(|p| p.expiry_of(tmgi))
+    }
+
+    // ---- mbsmfd-05: Status / ContextStatus subscription CRUD ----
+
+    /// Add a Status subscription (NEF/MBSF/AF-facing). Returns the new ID.
+    pub fn status_sub_add(&self, entry: SubEntry) -> Option<String> {
+        self.status_subs.lock().ok().map(|mut s| s.add(entry))
+    }
+
+    /// Update a Status subscription (PUT). Returns false if not found.
+    pub fn status_sub_update(&self, id: &str, entry: SubEntry) -> bool {
+        self.status_subs
+            .lock()
+            .ok()
+            .map(|mut s| s.update(id, entry))
+            .unwrap_or(false)
+    }
+
+    /// Remove a Status subscription (DELETE). Returns false if not found.
+    pub fn status_sub_remove(&self, id: &str) -> bool {
+        self.status_subs
+            .lock()
+            .ok()
+            .map(|mut s| s.remove(id))
+            .unwrap_or(false)
+    }
+
+    /// Collect Status subscriptions that match `event` (for notify fan-out).
+    pub fn status_subs_matching(&self, event: &MbsEvent) -> Vec<SubEntry> {
+        self.status_subs
+            .lock()
+            .ok()
+            .map(|s| s.matching(event))
+            .unwrap_or_default()
+    }
+
+    /// Number of active Status subscriptions.
+    pub fn status_sub_count(&self) -> usize {
+        self.status_subs.lock().map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Add a ContextStatus subscription (SMF-facing). Returns the new ID.
+    pub fn ctx_sub_add(&self, entry: SubEntry) -> Option<String> {
+        self.context_status_subs
+            .lock()
+            .ok()
+            .map(|mut s| s.add(entry))
+    }
+
+    /// Update a ContextStatus subscription (PUT). Returns false if not found.
+    pub fn ctx_sub_update(&self, id: &str, entry: SubEntry) -> bool {
+        self.context_status_subs
+            .lock()
+            .ok()
+            .map(|mut s| s.update(id, entry))
+            .unwrap_or(false)
+    }
+
+    /// Remove a ContextStatus subscription (DELETE). Returns false if not found.
+    pub fn ctx_sub_remove(&self, id: &str) -> bool {
+        self.context_status_subs
+            .lock()
+            .ok()
+            .map(|mut s| s.remove(id))
+            .unwrap_or(false)
+    }
+
+    /// Collect ContextStatus subscriptions that match `event`.
+    pub fn ctx_subs_matching(&self, event: &MbsEvent) -> Vec<SubEntry> {
+        self.context_status_subs
+            .lock()
+            .ok()
+            .map(|s| s.matching(event))
+            .unwrap_or_default()
+    }
+
+    /// Number of active ContextStatus subscriptions.
+    pub fn ctx_sub_count(&self) -> usize {
+        self.context_status_subs.lock().map(|s| s.len()).unwrap_or(0)
     }
 
     // ---- mbsmfd-03: ContextUpdate Start / Terminate ----
