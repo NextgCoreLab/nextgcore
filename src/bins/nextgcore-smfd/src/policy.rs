@@ -277,7 +277,7 @@ pub async fn resolve_pcf_endpoint() -> Option<PcfEndpoint> {
     Some(PcfEndpoint { host, port })
 }
 
-fn split_host_port(uri: &str) -> Option<(String, u16)> {
+pub(crate) fn split_host_port(uri: &str) -> Option<(String, u16)> {
     let stripped = uri
         .strip_prefix("https://")
         .or_else(|| uri.strip_prefix("http://"))
@@ -926,6 +926,19 @@ pub fn encode_ambr_component(bps: u64) -> (u8, u16) {
 ///   unit+value.
 ///
 /// Values are policy-derived (not hardcoded).
+/// `five_qi` drives the conditional Authorized QoS flow descriptions IE (0x79,
+/// TS 24.501 §6.4.1.3): it is included when the QFI differs from the 5QI (the
+/// non-default mapping used for delay-critical GBR / XR 5QIs such as 82-85).
+/// `sst`/`sd` populate the S-NSSAI IE (0x22, §8.3.2.5), always present in the
+/// normal 5G SA case where the AMF supplied an S-NSSAI. `ipv6_iid` is the IPv6
+/// interface identifier used only when `selected_pdu_session_type` is IPv4v6.
+///
+/// IMPORTANT (matched-sim preservation): the mandatory IE layout — octet-5
+/// (SSC|type), Authorized QoS rules LV-E, Session-AMBR LV and the IPv4 PDU
+/// address — is byte-identical to the legacy encoding. The S-NSSAI (0x22) and
+/// conditional QoS flow descriptions (0x79) are appended as additional
+/// spec-ordered optional IEs (after the PDU address, before the DNN) without
+/// disturbing the existing bytes (golden-tested).
 #[allow(clippy::too_many_arguments)]
 pub fn build_establishment_accept(
     psi: u8,
@@ -933,14 +946,19 @@ pub fn build_establishment_accept(
     selected_pdu_session_type: u8,
     selected_ssc_mode: u8,
     qfi: u8,
+    five_qi: u8,
     ambr_dl_bps: u64,
     ambr_ul_bps: u64,
     ue_ip: [u8; 4],
+    ipv6_iid: [u8; 8],
+    sst: u8,
+    sd: Option<u32>,
     dnn: &str,
 ) -> Vec<u8> {
     use crate::gsm_build::{
-        encode_qos_rules, pf_component_type, pf_direction, qos_rule_code, PacketFilterComponent,
-        PacketFilterContent, QosRule, QosRulePacketFilter,
+        encode_qos_flow_descriptions, encode_qos_rules, pf_component_type, pf_direction,
+        qos_flow_description_code, qos_flow_param_id, qos_rule_code, PacketFilterComponent,
+        PacketFilterContent, QosFlowDescription, QosFlowParam, QosRule, QosRulePacketFilter,
     };
 
     let mut msg = Vec::with_capacity(32 + dnn.len());
@@ -987,11 +1005,62 @@ pub fn build_establishment_accept(
     msg.push(ul_unit);
     msg.extend_from_slice(&ul_val.to_be_bytes());
 
-    // PDU address (IEI 0x29) — IPv4
-    msg.push(0x29);
-    msg.push(0x05);
-    msg.push(0x01);
-    msg.extend_from_slice(&ue_ip);
+    // PDU address (IEI 0x29) — encoded per the selected PDU session type
+    // (TS 24.501 §9.11.4.10). The IPv4 form is byte-identical to the legacy
+    // 5-octet layout; IPv4v6 emits the 13-octet value (type + 8-byte IPv6
+    // interface identifier + 4-byte IPv4) — smfd-05.
+    match selected_pdu_session_type {
+        pdu_session_type::IPV4V6 => {
+            msg.push(0x29);
+            msg.push(0x0D); // 1 (type) + 8 (IID) + 4 (IPv4)
+            msg.push(pdu_session_type::IPV4V6);
+            msg.extend_from_slice(&ipv6_iid);
+            msg.extend_from_slice(&ue_ip);
+        }
+        _ => {
+            // IPv4 (and the IPv4 leg granted for any other selected type):
+            // legacy byte-identical 5-octet form.
+            msg.push(0x29);
+            msg.push(0x05);
+            msg.push(pdu_session_type::IPV4);
+            msg.extend_from_slice(&ue_ip);
+        }
+    }
+
+    // S-NSSAI (IEI 0x22, TLV) — included whenever the AMF supplied an S-NSSAI,
+    // i.e. the normal 5G SA case (TS 24.501 §8.3.2.5). smfd-04.
+    let mut snssai = Vec::with_capacity(4);
+    snssai.push(sst);
+    if let Some(sd) = sd {
+        snssai.push(((sd >> 16) & 0xff) as u8);
+        snssai.push(((sd >> 8) & 0xff) as u8);
+        snssai.push((sd & 0xff) as u8);
+    }
+    msg.push(0x22);
+    msg.push(snssai.len() as u8);
+    msg.extend_from_slice(&snssai);
+
+    // Authorized QoS flow descriptions (IEI 0x79, TLV-E) — conditional per
+    // TS 24.501 §6.4.1.3: included when the QFI differs from the 5QI (the
+    // non-default mapping of delay-critical GBR / XR 5QIs, e.g. 5QI 82 → QFI
+    // 18). For the default non-GBR flow QFI == 5QI and the IE is omitted
+    // (matches the byte-stable legacy accept). smfd-04.
+    if qfi != five_qi {
+        let desc = QosFlowDescription {
+            identifier: qfi & 0x3F,
+            code: qos_flow_description_code::CREATE_NEW_QOS_FLOW_DESCRIPTION,
+            e_bit: true,
+            params: vec![QosFlowParam {
+                identifier: qos_flow_param_id::FIVE_QI,
+                data: vec![five_qi],
+            }],
+        };
+        let qos_desc_bytes = encode_qos_flow_descriptions(&[desc]);
+        msg.push(0x79);
+        msg.extend_from_slice(&(qos_desc_bytes.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&qos_desc_bytes);
+    }
+
     // DNN (IEI 0x25)
     let dnn_bytes = dnn.as_bytes();
     msg.push(0x25);
@@ -1001,16 +1070,62 @@ pub fn build_establishment_accept(
     msg
 }
 
+/// Encode a GPRS timer 3 octet (TS 24.008 §10.5.7.4a) for `minutes` with the
+/// "1 minute" unit (bits 6-8 = 101). Used for the 5GSM back-off timer (T3396).
+fn gprs_timer3_minutes(minutes: u8) -> u8 {
+    (0b101 << 5) | (minutes & 0x1F)
+}
+
+/// Default 5GSM back-off timer applied to congestion rejections (10 minutes).
+const DEFAULT_BACK_OFF_MINUTES: u8 = 10;
+
 /// Build a PDU Session Establishment Reject with a 5GSM cause
-/// (TS 24.501 §8.3.3).
+/// (TS 24.501 §8.3.3 Table 8.3.3.1.1).
+///
+/// For congestion-related causes (#26 insufficient resources, #27 missing/
+/// unknown DNN, #67 insufficient resources for the slice) a Back-off timer
+/// value (T3396, GPRS timer 3, IEI 0x37) is appended so the UE applies the
+/// mandated back-off (TS 24.501 §6.2.8). smfd-08.
 pub fn build_establishment_reject(psi: u8, pti: u8, cause_5gsm: u8) -> Vec<u8> {
-    vec![
+    build_establishment_reject_ext(psi, pti, cause_5gsm, None)
+}
+
+/// Build a PDU Session Establishment Reject, optionally carrying the Allowed
+/// SSC mode IE (IEI 0xF, type-1 TV; bits 1-3 = SSC mode 1/2/3 allowed) used on
+/// SSC-mode-related rejections (TS 24.501 §8.3.3.1, §9.11.4.5). The Back-off
+/// timer (IEI 0x37) is still appended for congestion causes. smfd-08.
+pub fn build_establishment_reject_ext(
+    psi: u8,
+    pti: u8,
+    cause_5gsm: u8,
+    allowed_ssc_mode: Option<u8>,
+) -> Vec<u8> {
+    let mut msg = vec![
         0x2E,
         psi,
         pti,
         gsm_message_type::ESTABLISHMENT_REJECT,
         cause_5gsm,
-    ]
+    ];
+
+    // Back-off timer value (T3396, GPRS timer 3) for congestion causes.
+    if matches!(
+        cause_5gsm,
+        gsm_cause::INSUFFICIENT_RESOURCES
+            | gsm_cause::MISSING_OR_UNKNOWN_DNN
+            | gsm_cause::INSUFFICIENT_RESOURCES_FOR_SPECIFIC_SLICE
+    ) {
+        msg.push(0x37); // IEI: Back-off timer value (GPRS timer 3, TLV)
+        msg.push(0x01); // length
+        msg.push(gprs_timer3_minutes(DEFAULT_BACK_OFF_MINUTES));
+    }
+
+    // Allowed SSC mode (type-1 IE: IEI nibble 0xF | bitmap in the low nibble).
+    if let Some(bitmap) = allowed_ssc_mode {
+        msg.push(0xF0 | (bitmap & 0x07));
+    }
+
+    msg
 }
 
 /// Build a PDU Session Modification Command echoing the UE's PTI and
@@ -1079,16 +1194,20 @@ mod tests {
 
     #[test]
     fn accept_message_carries_policy_values() {
-        // SSC mode 2, PDU type IPv4 (0x01), QFI 9
+        // SSC mode 2, PDU type IPv4 (0x01), QFI 9, 5QI 9 (QFI == 5QI → no 0x79)
         let msg = build_establishment_accept(
             5,
             3,
             pdu_session_type::IPV4,
             2,
             9,
+            9,
             200_000_000,
             50_000_000,
             [10, 45, 0, 2],
+            [0u8; 8],
+            1,
+            None,
             "internet",
         );
         // SM header (TS 24.501 §9.3 / Table 8.3.2.1.1 octets 1-4)
@@ -1151,6 +1270,153 @@ mod tests {
             gsm_cause::USER_AUTHENTICATION_OR_AUTHORIZATION_FAILED,
         );
         assert_eq!(msg, vec![0x2E, 1, 2, 0xC3, 29]);
+    }
+
+    // ----------------------- smfd-04 / smfd-05 --------------------------
+
+    /// Golden byte-stability test (smfd-04): the EXISTING mandatory IE layout
+    /// the matched-sim UE parses — octet-5 (SSC|type), Authorized QoS rules
+    /// LV-E, Session-AMBR LV and the IPv4 PDU address — MUST remain
+    /// byte-identical to the legacy accept. Adding the S-NSSAI (0x22) and the
+    /// conditional QoS flow descriptions (0x79) must not disturb these bytes.
+    #[test]
+    fn accept_existing_mandatory_ies_byte_stable() {
+        // Same inputs as accept_message_carries_policy_values; 5QI 9 → QFI 9
+        // (QFI == 5QI) so no 0x79 is emitted.
+        let msg = build_establishment_accept(
+            5,
+            3,
+            pdu_session_type::IPV4,
+            2,
+            9,
+            9,
+            200_000_000,
+            50_000_000,
+            [10, 45, 0, 2],
+            [0u8; 8],
+            1,
+            None,
+            "internet",
+        );
+        // header | octet-5 | QoS rules LV-E | Session-AMBR LV | PDU address.
+        const PINNED_PREFIX: [u8; 30] = [
+            0x2E, 0x05, 0x03, 0xC2, // EPD, PSI, PTI, message type
+            0x21, // octet-5: SSC mode 2 | IPv4
+            0x00, 0x09, // QoS rules LV-E length
+            0x09, 0x00, 0x06, 0x31, 0x31, 0x01, 0x01, 0xFF, 0x09, // QoS rule
+            0x06, 0x06, 0x00, 0xC8, 0x06, 0x00, 0x32, // Session-AMBR LV
+            0x29, 0x05, 0x01, 10, 45, 0, 2, // PDU address (IPv4)
+        ];
+        assert_eq!(&msg[..PINNED_PREFIX.len()], &PINNED_PREFIX);
+        // S-NSSAI (0x22) is the first additional optional IE, before the DNN.
+        assert_eq!(
+            &msg[PINNED_PREFIX.len()..PINNED_PREFIX.len() + 3],
+            &[0x22, 0x01, 0x01]
+        );
+        // No 0x79 when QFI == 5QI: the DNN (0x25) follows the S-NSSAI directly.
+        assert_eq!(msg[PINNED_PREFIX.len() + 3], 0x25);
+    }
+
+    /// smfd-04 (b): an XR DNN with 5QI 82 (QFI 18 != 5QI) emits both the
+    /// S-NSSAI (0x22) and an Authorized QoS flow descriptions IE (0x79) whose
+    /// single descriptor carries the 5QI parameter.
+    #[test]
+    fn accept_xr_flow_carries_snssai_and_qos_flow_desc() {
+        let five_qi = 82u8;
+        let qfi = five_qi & 0x3F; // 18
+        let msg = build_establishment_accept(
+            5,
+            2,
+            pdu_session_type::IPV4,
+            1,
+            qfi,
+            five_qi,
+            1_000_000,
+            1_000_000,
+            [10, 45, 0, 2],
+            [0u8; 8],
+            1,
+            Some(0x010203),
+            "xr",
+        );
+        // S-NSSAI present with SST + 3-byte SD.
+        let snssai_at = msg.windows(5).position(|w| w == [0x22, 0x04, 0x01, 0x01, 0x02]);
+        assert!(snssai_at.is_some(), "S-NSSAI (0x22) with SST+SD expected");
+        // QoS flow descriptions IE present (TLV-E): IEI 0x79, then the 5QI.
+        let qfd_at = msg
+            .windows(2)
+            .position(|w| w[0] == 0x79)
+            .expect("0x79 QoS flow descriptions IE expected");
+        // 0x79, len_hi, len_lo, [QFI][2nd byte][param 5QI][len=1][value=82]
+        assert_eq!(msg[qfd_at], 0x79);
+        let len = u16::from_be_bytes([msg[qfd_at + 1], msg[qfd_at + 2]]) as usize;
+        let body = &msg[qfd_at + 3..qfd_at + 3 + len];
+        assert_eq!(body[0], qfi); // QFI
+        assert!(body.contains(&82)); // 5QI value present
+    }
+
+    /// smfd-05: an IPv4v6 grant emits the 13-octet PDU address (type + 8-byte
+    /// IPv6 interface identifier + 4-byte IPv4) while the rest of the message
+    /// is unchanged. (Live trigger is E2E-deferred — the SMF has no IPv6 pool
+    /// yet — but the encoding is exercised here directly.)
+    #[test]
+    fn accept_ipv4v6_emits_dual_pdu_address() {
+        let iid = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let msg = build_establishment_accept(
+            5,
+            2,
+            pdu_session_type::IPV4V6,
+            1,
+            9,
+            9,
+            1_000_000,
+            1_000_000,
+            [10, 45, 0, 2],
+            iid,
+            1,
+            None,
+            "internet",
+        );
+        // octet-5: SSC mode 1 | IPv4v6 (0x13)
+        assert_eq!(msg[4], (1 << 4) | pdu_session_type::IPV4V6);
+        // Locate the PDU address IE (0x29) and verify the dual-stack value.
+        let pdu_at = msg
+            .windows(2)
+            .position(|w| w[0] == 0x29 && w[1] == 0x0D)
+            .expect("IPv4v6 PDU address (len 0x0D) expected");
+        assert_eq!(msg[pdu_at + 1], 0x0D); // 1 + 8 + 4
+        assert_eq!(msg[pdu_at + 2], pdu_session_type::IPV4V6);
+        assert_eq!(&msg[pdu_at + 3..pdu_at + 11], &iid); // IPv6 IID
+        assert_eq!(&msg[pdu_at + 11..pdu_at + 15], &[10, 45, 0, 2]); // IPv4
+    }
+
+    // ----------------------------- smfd-08 ------------------------------
+
+    /// smfd-08: a congestion reject (#26 insufficient resources) carries the
+    /// Back-off timer value IE (IEI 0x37, GPRS timer 3) after the 5GSM cause.
+    #[test]
+    fn reject_congestion_carries_back_off_timer() {
+        let msg = build_establishment_reject(5, 2, gsm_cause::INSUFFICIENT_RESOURCES);
+        assert_eq!(&msg[..5], &[0x2E, 5, 2, 0xC3, 26]);
+        assert_eq!(msg[5], 0x37); // IEI: Back-off timer value
+        assert_eq!(msg[6], 0x01); // length
+        // GPRS timer 3: unit "1 minute" (101) | 10
+        assert_eq!(msg[7] >> 5, 0b101);
+        assert_eq!(msg[7] & 0x1F, 10);
+        // A non-congestion cause carries no back-off timer (byte-stable).
+        let plain = build_establishment_reject(5, 2, gsm_cause::NETWORK_FAILURE);
+        assert_eq!(plain, vec![0x2E, 5, 2, 0xC3, 38]);
+    }
+
+    /// smfd-08: an SSC-mode-related reject carries the Allowed SSC mode IE
+    /// (type-1, IEI nibble 0xF) with the allowed-mode bitmap.
+    #[test]
+    fn reject_ssc_mode_carries_allowed_ssc_mode_ie() {
+        // Allow SSC mode 1 only (bitmap 0b001).
+        let msg = build_establishment_reject_ext(5, 2, gsm_cause::REQUEST_REJECTED_UNSPECIFIED, Some(0b001));
+        let last = *msg.last().unwrap();
+        assert_eq!(last >> 4, 0x0F); // IEI nibble
+        assert_eq!(last & 0x07, 0b001); // SSC mode 1 allowed
     }
 
     #[test]

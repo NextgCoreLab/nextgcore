@@ -1601,6 +1601,43 @@ fn fsm_dispatch_policy_response(fsm: &mut gsm_sm::GsmFsm, status: u16) {
     fsm.dispatch(&ev);
 }
 
+/// Validate the mandatory / conditionally-mandatory IEs of an inbound
+/// SmContextCreateData (TS 29.502 Table 6.1.6.2.2-1). Returns the
+/// ProblemDetails `cause` (all map to HTTP 400) for the FIRST violation, or
+/// `None` when the body satisfies the mandatory-IE policy. smfd-06.
+///
+/// DEFAULT-PERMISSIVE on `supi` and `anType`: the matched-sim AMF omits both
+/// (no NF-set / emergency context yet), so they are treated as
+/// conditional-absent rather than rejected — a documented migration shim. The
+/// genuinely-mandatory IEs for a create — `pduSessionId`, `dnn`, `sNssai.sst`
+/// and the `n1SmMsg` container — are enforced strictly (the matched-sim AMF
+/// always supplies them, so the happy path is unaffected).
+fn validate_sm_context_create_data(body: &serde_json::Value) -> Option<&'static str> {
+    // pduSessionId (M, range 1..=15)
+    let psi_ok = body["pduSessionId"]
+        .as_u64()
+        .map(|p| (1..=15).contains(&p))
+        .unwrap_or(false);
+    if !psi_ok {
+        return Some("MANDATORY_IE_INCORRECT");
+    }
+    // dnn (M for this SMF)
+    if body["dnn"].as_str().is_none() {
+        return Some("MANDATORY_IE_MISSING");
+    }
+    // sNssai.sst (M)
+    if body["sNssai"]["sst"].as_u64().is_none() {
+        return Some("MANDATORY_IE_MISSING");
+    }
+    // n1SmMsg (C — required at establishment): present either as a
+    // RefToBinaryData pointer ({contentId}) or as a legacy base64 string.
+    let n1 = &body["n1SmMsg"];
+    if n1["contentId"].as_str().is_none() && n1.as_str().is_none() {
+        return Some("N1_SM_ERROR");
+    }
+    None
+}
+
 /// Handle SM Context Create (from AMF via N11, TS 29.502 §5.2.2.2)
 async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     log::info!("SM Context Create request received");
@@ -1616,6 +1653,15 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
         },
         None => return problem_400("MANDATORY_IE_MISSING", "SmContextCreateData body required"),
     };
+
+    // ---- Strict mandatory/conditional IE validation (smfd-06) ----
+    // Reject genuinely-missing mandatory IEs up front with the correct
+    // ProblemDetails cause (default-permissive on supi/anType, which the
+    // matched-sim AMF omits).
+    if let Some(cause) = validate_sm_context_create_data(&req_body) {
+        log::warn!("SmContextCreateData rejected: {cause}");
+        return problem_400(cause, "mandatory IE missing or incorrect");
+    }
 
     // ---- SmContextCreateData attributes (TS 29.502 Table 6.1.6.2.2-1) ----
     let Some(pdu_session_id) = req_body["pduSessionId"]
@@ -1705,8 +1751,10 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
             }
         }
         None => {
-            log::warn!("SmContextCreateData without n1SmMsg — using defaults (PTI=0)");
-            (0u8, policy::pdu_session_type::IPV4, 1u8)
+            // The n1SmMsg attribute passed validation but its referenced
+            // binary part is absent / not decodable — reject (smfd-06).
+            log::error!("SmContextCreateData n1SmMsg present but binary part missing/invalid");
+            return problem_400("N1_SM_ERROR", "n1SmMsg binary part missing or invalid");
         }
     };
 
@@ -2100,15 +2148,27 @@ async fn handle_sm_context_create(request: &SbiRequest) -> SbiResponse {
     }
 
     // ---- N1: PDU Session Establishment Accept with authorized QoS ----
+    // S-NSSAI (smfd-04) is taken from the create request's S-NSSAI; the SD hex
+    // string (if any) is parsed back to its 24-bit value. The conditional QoS
+    // flow descriptions IE (0x79) is driven by `def_five_qi` vs the QFI. The
+    // IPv6 interface identifier is unused on the live path (this SMF grants the
+    // IPv4 leg only — see `selected_type`); the IPv4v6 encoding is smfd-05.
+    let snssai_sd_u32 = snssai_sd
+        .as_deref()
+        .and_then(|s| u32::from_str_radix(s, 16).ok());
     let n1_sm_msg = policy::build_establishment_accept(
         pdu_session_id,
         pti,
         selected_type,
         selected_ssc,
         qfi,
+        decision.def_five_qi,
         decision.sess_ambr_dl_bps,
         decision.sess_ambr_ul_bps,
         ue_ip_octets,
+        [0u8; 8],
+        sst,
+        snssai_sd_u32,
         &dnn,
     );
 
@@ -2483,6 +2543,66 @@ async fn handle_sm_context_update(sm_context_ref: &str, request: &SbiRequest) ->
     }
 }
 
+/// Build the SmContextStatusNotification body (TS 29.502 §6.1.6.2.8): a
+/// `statusInfo` carrying the `resourceStatus` (e.g. `RELEASED`) and an optional
+/// release `cause`. smfd-07.
+fn build_sm_context_status_notification(
+    resource_status: &str,
+    cause: Option<&str>,
+) -> serde_json::Value {
+    let mut status_info = serde_json::json!({ "resourceStatus": resource_status });
+    if let Some(c) = cause {
+        status_info["cause"] = serde_json::json!(c);
+    }
+    serde_json::json!({ "statusInfo": status_info })
+}
+
+/// Extract the path (and query) portion of an absolute or relative URI.
+fn uri_path(uri: &str) -> String {
+    let stripped = uri
+        .strip_prefix("https://")
+        .or_else(|| uri.strip_prefix("http://"))
+        .unwrap_or(uri);
+    match stripped.find('/') {
+        Some(idx) => stripped[idx..].to_string(),
+        None => "/".to_string(),
+    }
+}
+
+/// POST an SmContextStatusNotification to the AMF-supplied `smContextStatusUri`
+/// (TS 29.502 §5.2.2.8) on SMF-initiated release / abnormal termination. A
+/// missing URI is a no-op (notifications disabled). Best-effort: transport
+/// failures are logged, not propagated — the local release proceeds regardless.
+/// smfd-07.
+async fn send_sm_context_status_notification(
+    uri: Option<&str>,
+    resource_status: &str,
+    cause: Option<&str>,
+) {
+    let Some(uri) = uri else {
+        log::debug!("No smContextStatusUri — skipping SmContextStatusNotification");
+        return;
+    };
+    let Some((host, port)) = policy::split_host_port(uri) else {
+        log::warn!("smContextStatusUri '{uri}' is not a valid URI — skipping notification");
+        return;
+    };
+    let path = uri_path(uri);
+    let body = build_sm_context_status_notification(resource_status, cause);
+    let client = ogs_sbi::client::SbiClient::new(
+        ogs_sbi::client::SbiClientConfig::new(host, port)
+            .with_connect_timeout(std::time::Duration::from_secs(2))
+            .with_request_timeout(std::time::Duration::from_secs(3)),
+    );
+    match client.post_json(&path, &body).await {
+        Ok(resp) => log::info!(
+            "SmContextStatusNotification ({resource_status}) → {uri}: status={}",
+            resp.status
+        ),
+        Err(e) => log::warn!("SmContextStatusNotification to {uri} failed: {e}"),
+    }
+}
+
 /// Handle SM Context Release (TS 29.502 §5.2.2.4)
 ///
 /// Deletes the PCF SM policy association (Npcf_SMPolicyControl_Delete,
@@ -2582,6 +2702,11 @@ async fn handle_sm_context_release(sm_context_ref: &str) -> SbiResponse {
             context.sess_remove(sess.id);
         }
     }
+
+    // Notify the AMF the SM context is RELEASED (TS 29.502 §5.2.2.8). No-op
+    // when the AMF supplied no smContextStatusUri (the matched-sim AMF). smfd-07.
+    let status_uri = binding.as_ref().and_then(|b| b.sm_context_status_uri.clone());
+    send_sm_context_status_notification(status_uri.as_deref(), "RELEASED", None).await;
 
     SbiResponse::with_status(204)
 }
@@ -2917,9 +3042,13 @@ mod tests {
             policy::pdu_session_type::IPV4,
             1,
             1,
+            1,
             1_000_000,
             1_000_000,
             [10, 45, 0, 2],
+            [0u8; 8],
+            1,
+            None,
             "internet",
         );
         let n2 = build_setup_request_transfer(0x0001_0001, [10, 45, 0, 1], 1, 9, 8).unwrap();
@@ -3074,5 +3203,97 @@ mod tests {
         let n1 = resolve_binary_ref(&request, &req_body["n1SmMsg"]).unwrap();
         assert_eq!(n1, N1_ESTABLISHMENT_REQUEST.to_vec());
         assert!(policy::parse_establishment_request(&n1).is_some());
+    }
+
+    // ----------------------------- smfd-06 ------------------------------
+
+    /// The exact SmContextCreateData body the matched-sim AMF sends (no supi /
+    /// anType / smContextStatusUri) MUST still pass the strict validator, while
+    /// genuinely-missing mandatory IEs are rejected with the correct cause.
+    #[test]
+    fn validate_sm_context_create_data_table() {
+        // Matched-sim AMF body shape (see amfd build_create_sm_context_request).
+        let matched_sim = serde_json::json!({
+            "pduSessionId": 5,
+            "sNssai": { "sst": 1, "sd": "010203" },
+            "dnn": "internet",
+            "n1SmMsg": { "contentId": "n1SmMsg" },
+            "redcapIndication": false,
+            "servingNetwork": { "mcc": "001", "mnc": "01" }
+        });
+        assert_eq!(validate_sm_context_create_data(&matched_sim), None);
+
+        // supi / anType absent but otherwise complete → still permitted.
+        assert_eq!(
+            validate_sm_context_create_data(&serde_json::json!({
+                "pduSessionId": 1,
+                "sNssai": { "sst": 2 },
+                "dnn": "ims",
+                "n1SmMsg": "BASE64DATA"
+            })),
+            None
+        );
+
+        // Each genuinely-missing mandatory IE → its expected cause.
+        let mut no_psi = matched_sim.clone();
+        no_psi["pduSessionId"] = serde_json::json!(0); // out of 1..=15
+        assert_eq!(
+            validate_sm_context_create_data(&no_psi),
+            Some("MANDATORY_IE_INCORRECT")
+        );
+
+        let mut no_dnn = matched_sim.clone();
+        no_dnn["dnn"] = serde_json::Value::Null;
+        assert_eq!(
+            validate_sm_context_create_data(&no_dnn),
+            Some("MANDATORY_IE_MISSING")
+        );
+
+        let mut no_sst = matched_sim.clone();
+        no_sst["sNssai"] = serde_json::json!({});
+        assert_eq!(
+            validate_sm_context_create_data(&no_sst),
+            Some("MANDATORY_IE_MISSING")
+        );
+
+        let mut no_n1 = matched_sim.clone();
+        no_n1["n1SmMsg"] = serde_json::Value::Null;
+        assert_eq!(
+            validate_sm_context_create_data(&no_n1),
+            Some("N1_SM_ERROR")
+        );
+    }
+
+    // ----------------------------- smfd-07 ------------------------------
+
+    /// The SmContextStatusNotification body carries `statusInfo.resourceStatus`
+    /// and an optional `cause` (TS 29.502 §6.1.6.2.8).
+    #[test]
+    fn sm_context_status_notification_body() {
+        let released = build_sm_context_status_notification("RELEASED", None);
+        assert_eq!(released["statusInfo"]["resourceStatus"], "RELEASED");
+        assert!(released["statusInfo"]["cause"].is_null());
+
+        let with_cause = build_sm_context_status_notification("RELEASED", Some("REL_DUE_TO_HO"));
+        assert_eq!(with_cause["statusInfo"]["resourceStatus"], "RELEASED");
+        assert_eq!(with_cause["statusInfo"]["cause"], "REL_DUE_TO_HO");
+    }
+
+    /// A missing smContextStatusUri is a silent no-op (notifications disabled).
+    #[tokio::test]
+    async fn sm_context_status_notification_absent_uri_is_noop() {
+        // Must return without panicking / without attempting a request.
+        send_sm_context_status_notification(None, "RELEASED", None).await;
+    }
+
+    /// The path portion is extracted from an absolute AMF callback URI.
+    #[test]
+    fn uri_path_extraction() {
+        assert_eq!(
+            uri_path("http://amf.example:7777/namf-comm/v1/ue-contexts/imsi-1/sm-context-status/7"),
+            "/namf-comm/v1/ue-contexts/imsi-1/sm-context-status/7"
+        );
+        assert_eq!(uri_path("/already/a/path"), "/already/a/path");
+        assert_eq!(uri_path("https://amf:443"), "/");
     }
 }
