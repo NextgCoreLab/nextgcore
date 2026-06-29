@@ -74,6 +74,21 @@ pub fn build_ng_setup_response_asn1(ctx: &AmfContext) -> Option<Vec<u8>> {
         })
         .collect();
 
+    // amfd-09 (TS 38.413 §9.2.6.2): a strict-peer gNB needs a non-empty
+    // PLMNSupportList with slice support for load-balancing / slice selection.
+    // An empty list is an AMF misconfiguration; surface it loudly at build time
+    // rather than letting the gNB reject the response on the wire.
+    if ctx.num_of_plmn_support == 0 {
+        log::error!(
+            "NG Setup Response built with an EMPTY PLMNSupportList \
+             (num_of_plmn_support=0); check AMF slice configuration"
+        );
+        debug_assert!(
+            ctx.num_of_plmn_support > 0,
+            "NGSetupResponse PLMNSupportList must not be empty (TS 38.413 §9.2.6.2)"
+        );
+    }
+
     let msg = NgSetupResponse {
         amf_name,
         served_guami_list,
@@ -493,6 +508,16 @@ fn nas_caps_octet_to_ngap_bits(octet: u8) -> u16 {
 /// AMF UE security context — nothing is hardcoded. The protected initial
 /// Registration Accept rides inside the request as the NAS-PDU
 /// (TS 23.502 §4.2.2.2.2 step 16).
+///
+/// amfd-08 (FLAGGED / blocked on ogs-ngap): the OPTIONAL Mobility Restriction
+/// List and Masked IMEISV IEs are not emitted. Both are optional in
+/// TS 38.413 §9.2.2.1, so omitting them is conformant for the non-roaming /
+/// no-forbidden-area case (the matched-sim path). Emitting them requires the
+/// shared `ogs_ngap::types::InitialContextSetupRequest` struct + builder to
+/// expose those fields first (an additive shared-lib change, out of this
+/// amfd-only change's scope). Tracked for a follow-up that lands the ogs-ngap
+/// fields, then populates MobilityRestrictionList from the UE's roaming/
+/// forbidden-area policy and Masked IMEISV from the 5GMM context.
 #[allow(clippy::too_many_arguments)]
 pub fn build_initial_context_setup_request_asn1(
     ctx: &AmfContext,
@@ -1020,6 +1045,44 @@ mod tests {
             }
             _ => panic!("Expected NgSetupResponse"),
         }
+    }
+
+    /// amfd-09 — NG Setup Response field-completeness regression guard
+    /// (TS 38.413 §9.2.6.2). Every NGSetupResponse must carry amfName, a
+    /// non-empty servedGUAMIList, a non-empty PLMNSupportList with slice
+    /// support, and a relativeAMFCapacity in range, so a strict-peer gNB can
+    /// load-balance and select slices.
+    #[test]
+    fn amfd09_ng_setup_response_field_completeness() {
+        let ctx = create_test_context();
+        let bytes = build_ng_setup_response_asn1(&ctx).expect("build NG Setup Response");
+
+        let decoded = parser::decode_ngap_pdu(&bytes).expect("decode");
+        let NgapMessage::NgSetupResponse(resp) = decoded else {
+            panic!("expected NgSetupResponse");
+        };
+
+        // amfName present and as configured.
+        assert_eq!(resp.amf_name, "AMF-Test", "amfName missing/incorrect");
+        // servedGUAMIList non-empty.
+        assert!(
+            !resp.served_guami_list.is_empty(),
+            "servedGUAMIList must be present and non-empty"
+        );
+        // relativeAMFCapacity in range 0..=255 (u8) — assert the configured value.
+        assert_eq!(resp.relative_amf_capacity, 255, "relativeAMFCapacity");
+        // PLMNSupportList non-empty, with at least one slice in slice support.
+        assert!(
+            !resp.plmn_support_list.is_empty(),
+            "PLMNSupportList must be present and non-empty"
+        );
+        assert!(
+            resp.plmn_support_list
+                .iter()
+                .all(|p| !p.slice_support_list.is_empty()),
+            "every PLMNSupportItem must carry at least one S-NSSAI"
+        );
+        assert_eq!(resp.plmn_support_list[0].slice_support_list[0].sst, 1);
     }
 
     #[test]

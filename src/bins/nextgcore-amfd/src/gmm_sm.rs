@@ -1,6 +1,20 @@
-//! GMM (5G Mobility Management) State Machine
+//! GMM (5G Mobility Management) state labels — REPORTING ONLY.
 //!
-//! Port of src/amf/gmm-sm.c - GMM state machine for UE registration and mobility
+//! Port of src/amf/gmm-sm.c (TS 24.501 §5.1.3 5GMM states).
+//!
+//! amfd-07 — NOT the procedure driver. The authoritative 5GMM state for the
+//! live registration / authentication / security-mode / registered flow lives
+//! imperatively in `ngap_path.rs` (the `ue_auth_state` map of `UeNasContext`,
+//! driven by the NGAP/NAS message handlers). [`GmmState`] here is a single
+//! label that those handlers keep in step via the `transition_to_*` setters, so
+//! metrics/events can report the stage a UE reached. It is the one source of
+//! *reported* state; it is NOT consulted for control flow.
+//!
+//! The [`GmmFsm::dispatch`] / `handle_*` event machinery is exercised only by
+//! unit/property tests as an executable model of the spec's transition table —
+//! no production code path calls `dispatch`. Do not wire it into the live path
+//! without a full state-machine migration and a Docker E2E (deliberately
+//! deferred as the risky option; the safe demotion is documented here instead).
 
 use crate::event::{AmfEvent, AmfEventId, AmfTimerId};
 

@@ -240,13 +240,17 @@ fn nas_5gs_security_encode_legacy(
 ///
 /// nas-06 Phase-6 C2: single security-decode entry point used by the
 /// `ngap_path.rs` uplink call site. With the canary `amf_ue.use_ogs_nas_security`
-/// OFF (the DEFAULT) it calls the unchanged hand-rolled
-/// [`nas_5gs_security_decode_legacy`] (LENIENT: advances COUNT before verify,
-/// warn-and-continue on MAC failure, NO replay protection). With the canary ON
-/// it delegates to the STRICT ogs-nas-backed adapter
-/// [`nas_5gs_security_decode_ogs`] (MAC failure -> Err without advancing COUNT,
-/// replay rejection). The strict semantics are E2E-UNVALIDATED — see the
-/// adapter doc.
+/// OFF (the DEFAULT, LIVE path) it calls the hand-rolled
+/// [`nas_5gs_security_decode_legacy`]. With the canary ON it delegates to the
+/// ogs-nas-backed adapter [`nas_5gs_security_decode_ogs`].
+///
+/// amfd-03/amfd-04: BOTH paths are now fail-closed and verify-then-commit. A MAC
+/// mismatch returns `Err(MacVerificationFailed)` (the tampered plaintext is never
+/// produced, TS 24.501 §4.4.3.3); the UL COUNT is only advanced after the MAC
+/// verifies, and a replay (a non-advancing COUNT once a baseline exists) is
+/// rejected (TS 24.501 §4.4.3.2). The two paths therefore agree on the decode
+/// security policy; they differ only in which crypto/codec implementation backs
+/// the primitive.
 pub fn nas_5gs_security_decode(
     amf_ue: &mut AmfUe,
     security_header_type: u8,
@@ -259,13 +263,23 @@ pub fn nas_5gs_security_decode(
     }
 }
 
-/// Hand-rolled NAS security decoder (the pre-nas-06 production path).
+/// Hand-rolled NAS security decoder — the LIVE production decode path
+/// (selected when the `use_ogs_nas_security` canary is OFF, the default).
 ///
-/// PRESERVED UNCHANGED. Selected when the `use_ogs_nas_security` canary is OFF
-/// (default). Lenient by design (legacy behavior): updates the UL COUNT from
-/// the sequence number BEFORE verifying the MAC, and on MAC mismatch it sets
-/// `amf_ue.mac_failed` and RETURNS THE DECRYPTED BODY (warn-and-continue) so
-/// the caller applies the TS 24.501 §4.4.3.3 policy. Do NOT modify.
+/// amfd-03 / amfd-04 (fail-closed, verify-then-commit): unlike the original
+/// lenient behaviour this:
+///   * computes a CANDIDATE UL COUNT from the received SQN WITHOUT mutating the
+///     stored `amf_ue.ul_count` (TS 24.501 §4.4.3.5 overflow handling);
+///   * returns `Err(MacVerificationFailed)` on a MAC mismatch and produces NO
+///     plaintext — the tampered message is dropped (TS 24.501 §4.4.3.3);
+///   * only commits the candidate to `amf_ue.ul_count` AFTER the MAC verifies
+///     (so a forged SQN can never advance the stored COUNT); and
+///   * rejects a replay/old COUNT — a candidate that does not strictly advance
+///     the last accepted COUNT once a baseline is established (§4.4.3.2).
+///
+/// The matched-sim UE sends correct MACs and strictly-monotonic COUNTs, so a
+/// conformant registration is unaffected: only tampered or replayed frames drop.
+/// The ENCODE legacy path remains byte-for-byte unchanged.
 fn nas_5gs_security_decode_legacy(
     amf_ue: &mut AmfUe,
     security_header_type: u8,
@@ -280,9 +294,10 @@ fn nas_5gs_security_decode_legacy(
         header_type.ciphered = false;
     }
 
-    // Reset counters for new security context
+    // Reset counters for new security context (clear the replay baseline too).
     if header_type.new_security_context {
         amf_ue.ul_count = 0;
+        amf_ue.ul_count_established = false;
     }
 
     // Disable ciphering/integrity if algorithm is null
@@ -305,30 +320,49 @@ fn nas_5gs_security_decode_legacy(
 
     // Parse security header
     let header = NasSecurityHeader::decode(message).ok_or(NasSecurityError::InvalidHeader)?;
-
-    // Update UL count based on sequence number
     let sqn = header.sequence_number;
-    let current_sqn = (amf_ue.ul_count & 0xff) as u8;
-    if current_sqn > sqn {
-        // Overflow occurred
-        amf_ue.ul_count = ((amf_ue.ul_count & 0xffff00) + 0x100) | (sqn as u32);
-    } else {
-        amf_ue.ul_count = (amf_ue.ul_count & 0xffff00) | (sqn as u32);
+
+    // amfd-04: derive a CANDIDATE UL COUNT from the received SQN WITHOUT touching
+    // the stored COUNT. The overflow octet (high 16 bits) is taken from the
+    // stored COUNT and bumped exactly once on an SQN wrap (TS 24.501 §4.4.3.5),
+    // so a forged/replayed SQN cannot mutate state before the MAC is checked.
+    let stored = amf_ue.ul_count & 0x00ff_ffff;
+    let candidate = {
+        let current_sqn = (stored & 0xff) as u8;
+        if current_sqn > sqn {
+            ((stored & 0xffff00) + 0x100) | (sqn as u32)
+        } else {
+            (stored & 0xffff00) | (sqn as u32)
+        }
+    } & 0x00ff_ffff;
+
+    // amfd-04: replay protection (TS 24.501 §4.4.3.2). Once a baseline has been
+    // established under an active integrity context, a frame whose candidate
+    // COUNT does not strictly advance the last accepted COUNT is a replay/old
+    // message and is dropped. The bootstrap frame (no baseline yet) is accepted.
+    if header_type.integrity_protected && amf_ue.ul_count_established && candidate <= stored {
+        log::warn!(
+            "NAS replay/old COUNT rejected: candidate=0x{candidate:06x} \
+             <= last-accepted=0x{stored:06x}, discarding"
+        );
+        amf_ue.mac_failed = true;
+        return Err(NasSecurityError::MacVerificationFailed);
     }
 
     // Get the protected payload (after security header)
     let payload = &message[7..];
 
-    // Verify MAC if integrity protected
+    // amfd-03: verify the MAC against the CANDIDATE count BEFORE producing any
+    // plaintext. On mismatch return Err (fail-closed) and DO NOT advance the UL
+    // COUNT — the tampered message is dropped (TS 24.501 §4.4.3.3).
     if header_type.integrity_protected {
-        // Build data for MAC calculation (sequence number + payload)
         let mut mac_data = vec![sqn];
         mac_data.extend_from_slice(payload);
 
         let calculated_mac = nas_mac_calculate(
             amf_ue.selected_int_algorithm,
             &amf_ue.knas_int,
-            amf_ue.ul_count,
+            candidate,
             amf_ue.access_type,
             direction::UPLINK,
             &mac_data,
@@ -336,15 +370,23 @@ fn nas_5gs_security_decode_legacy(
 
         if calculated_mac != header.message_authentication_code {
             log::warn!(
-                "NAS MAC verification failed: expected {:02x?}, got {:02x?}",
+                "NAS MAC verification failed: expected {:02x?}, got {:02x?}; discarding",
                 calculated_mac,
                 header.message_authentication_code
             );
             amf_ue.mac_failed = true;
+            return Err(NasSecurityError::MacVerificationFailed);
         }
     }
 
-    // Decrypt if ciphered
+    // amfd-04: MAC verified (or integrity not required) — COMMIT the candidate
+    // COUNT. Only an integrity-protected frame establishes the replay baseline.
+    amf_ue.ul_count = candidate;
+    if header_type.integrity_protected {
+        amf_ue.ul_count_established = true;
+    }
+
+    // Decrypt if ciphered (against the committed count).
     let mut decrypted = payload.to_vec();
     if header_type.ciphered {
         if decrypted.is_empty() {
@@ -1792,5 +1834,128 @@ mod tests {
             NasCipheringPolicy::default(),
             NasCipheringPolicy::RejectNullIntegrity
         );
+    }
+
+    // ======================================================================
+    // amfd-03 / amfd-04 — LIVE (legacy) decode: fail-closed MAC + replay/
+    // commit-after-verify of the UL COUNT.
+    // ======================================================================
+
+    /// Craft a valid uplink-protected frame (EPD|SHT|MAC|SQN|ciphered) exactly
+    /// the way the matched-sim UE does on the legacy wire: amfd's own
+    /// `nas_encrypt` + `nas_mac_calculate` over `SQN || ciphered`, at `count`.
+    fn make_legacy_uplink_frame(ue: &AmfUe, inner: &[u8], sht: u8, count: u32) -> Vec<u8> {
+        let sqn = (count & 0xff) as u8;
+        let header_type = SecurityHeaderType::from_byte(sht);
+        let mut payload = inner.to_vec();
+        if header_type.ciphered && ue.selected_enc_algorithm != 0 {
+            nas_encrypt(
+                ue.selected_enc_algorithm,
+                &ue.knas_enc,
+                count,
+                ue.access_type,
+                direction::UPLINK,
+                &mut payload,
+            );
+        }
+        let mut mac_data = vec![sqn];
+        mac_data.extend_from_slice(&payload);
+        let mac = nas_mac_calculate(
+            ue.selected_int_algorithm,
+            &ue.knas_int,
+            count,
+            ue.access_type,
+            direction::UPLINK,
+            &mac_data,
+        );
+        let mut f = vec![0x7e, sht];
+        f.extend_from_slice(&mac);
+        f.push(sqn);
+        f.extend_from_slice(&payload);
+        f
+    }
+
+    /// CRITICAL matched-sim guard: a CORRECT-MAC frame still verifies on the
+    /// LIVE (canary-OFF) decode path, returns the plaintext, advances/commits
+    /// the UL COUNT, and never sets `mac_failed`.
+    #[test]
+    fn legacy_decode_accepts_correct_mac() {
+        let mut ue = create_test_ue();
+        ue.ul_count = 0;
+        let sht = security_header::INTEGRITY_PROTECTED_AND_CIPHERED;
+        let inner = [0x7e, 0x00, 0x43, 0x01]; // e.g. Registration Complete
+        let frame = make_legacy_uplink_frame(&ue, &inner, sht, 0);
+
+        assert!(!ue.use_ogs_nas_security, "must exercise the LIVE legacy path");
+        let out = nas_5gs_security_decode(&mut ue, sht, &frame).expect("correct MAC must verify");
+        assert_eq!(out, inner, "must recover the plaintext body");
+        assert!(!ue.mac_failed, "a correct MAC must NOT flag mac_failed");
+        assert_eq!(ue.ul_count, 0, "UL COUNT committed to the verified value");
+        assert!(ue.ul_count_established, "replay baseline established");
+    }
+
+    /// amfd-03: a tampered MAC returns Err(MacVerificationFailed), yields no
+    /// plaintext, and does NOT advance the UL COUNT.
+    #[test]
+    fn legacy_decode_tampered_mac_returns_err_no_advance() {
+        let mut ue = create_test_ue();
+        ue.ul_count = 0;
+        let sht = security_header::INTEGRITY_PROTECTED_AND_CIPHERED;
+        let mut frame = make_legacy_uplink_frame(&ue, &[0x7e, 0x00, 0x43, 0x02], sht, 0);
+        let last = frame.len() - 1;
+        frame[last] ^= 0xff; // tamper the ciphered payload -> MAC mismatch
+
+        let before = ue.ul_count;
+        let res = nas_5gs_security_decode(&mut ue, sht, &frame);
+        assert!(
+            matches!(res, Err(NasSecurityError::MacVerificationFailed)),
+            "tampered MAC must fail closed with Err, got {res:?}"
+        );
+        assert_eq!(ue.ul_count, before, "MAC failure must NOT advance the UL COUNT");
+        assert!(!ue.ul_count_established, "no baseline established on failure");
+    }
+
+    /// amfd-04: an exact replay (non-advancing COUNT) is rejected once a
+    /// baseline is established; an in-order successor is still accepted.
+    #[test]
+    fn legacy_decode_rejects_replay_accepts_monotonic() {
+        let mut ue = create_test_ue();
+        ue.ul_count = 0;
+        let sht = security_header::INTEGRITY_PROTECTED_AND_CIPHERED;
+        let f0 = make_legacy_uplink_frame(&ue, &[0x7e, 0x00, 0x43, 0x00], sht, 0);
+
+        // First reception accepted, baseline established.
+        nas_5gs_security_decode(&mut ue, sht, &f0).expect("first frame accepted");
+        assert!(ue.ul_count_established);
+
+        // Exact replay (SQN 0, candidate == stored) rejected, COUNT unchanged.
+        let replay = nas_5gs_security_decode(&mut ue, sht, &f0);
+        assert!(
+            matches!(replay, Err(NasSecurityError::MacVerificationFailed)),
+            "replayed frame must be rejected"
+        );
+        assert_eq!(ue.ul_count, 0, "replay must not advance the COUNT");
+
+        // In-order successor (SQN 1) accepted, COUNT advances to 1.
+        let f1 = make_legacy_uplink_frame(&ue, &[0x7e, 0x00, 0x43, 0x01], sht, 1);
+        let out = nas_5gs_security_decode(&mut ue, sht, &f1).expect("successor accepted");
+        assert_eq!(out, [0x7e, 0x00, 0x43, 0x01]);
+        assert_eq!(ue.ul_count, 1, "UL COUNT advanced to the verified value");
+    }
+
+    /// amfd-04: SQN wrap (0xFF -> 0x00) increments the overflow octet exactly
+    /// once, deterministically, from the stored high bytes (TS 24.501 §4.4.3.5).
+    #[test]
+    fn legacy_decode_wraparound_increments_overflow_once() {
+        let mut ue = create_test_ue();
+        ue.ul_count = 0x0000_00ff; // last accepted SQN 0xFF
+        ue.ul_count_established = true;
+        let sht = security_header::INTEGRITY_PROTECTED_AND_CIPHERED;
+        // Next frame carries SQN 0x00 with full COUNT 0x000100.
+        let frame = make_legacy_uplink_frame(&ue, &[0x7e, 0x00, 0x43, 0x09], sht, 0x0000_0100);
+
+        let out = nas_5gs_security_decode(&mut ue, sht, &frame).expect("wrap frame accepted");
+        assert_eq!(out, [0x7e, 0x00, 0x43, 0x09]);
+        assert_eq!(ue.ul_count, 0x0000_0100, "overflow octet incremented exactly once");
     }
 }

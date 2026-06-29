@@ -1546,6 +1546,9 @@ impl NgapServer {
                 state.amf_ue.nas_ksi = 0;
 
                 let auth_request = gmm_build::build_authentication_request(&state.amf_ue);
+                // amfd-07: keep the reporting GmmState in step with the live
+                // procedure stage (the authoritative state is imperative here).
+                state.gmm_fsm.transition_to_authentication();
                 self.ue_auth_state.insert(amf_ue_ngap_id, state);
 
                 let ngap_pdu = self
@@ -1770,6 +1773,8 @@ impl NgapServer {
             return Ok(());
         };
 
+        // amfd-07: reflect the live SECURITY-MODE stage in the reporting GmmState.
+        state.gmm_fsm.transition_to_security_mode();
         self.ue_auth_state.insert(amf_ue_ngap_id, state);
         let ngap_pdu = self
             .send_nas_pdu(
@@ -2234,20 +2239,39 @@ impl NgapServer {
             }
         }
 
-        // Allowed NSSAI: subscribed (UDM) > requested > PLMN support config
-        let mut allowed: Vec<SNssai> = am_data
+        // amfd-06 — Allowed NSSAI (TS 23.502 §4.2.2.2.3 / TS 24.501 §9.11.3.37):
+        // the authorized set comes ONLY from network-authoritative sources — the
+        // UDM subscription, else the AMF's configured PLMN slice support. The
+        // Requested NSSAI is the UE's *ask*, never an authorization, so it is
+        // NEVER echoed back as the Allowed NSSAI. If no S-NSSAI is authorized the
+        // registration is rejected with 5GMM cause #62 (No network slices
+        // available); no Registration Accept is emitted.
+        let subscribed: Vec<SNssai> = am_data
             .nssai
             .iter()
             .map(|(sst, sd)| SNssai { sst: *sst, sd: *sd })
             .collect();
-        if allowed.is_empty() {
-            allowed = state.amf_ue.requested_nssai.clone();
-        }
-        if allowed.is_empty() {
+        let plmn_default: Vec<SNssai> = {
             let ctx = self.amf_context.read().await;
-            if let Some(ps) = ctx.plmn_support.first() {
-                allowed = ps.s_nssai.clone();
-            }
+            ctx.plmn_support
+                .first()
+                .map(|ps| ps.s_nssai.clone())
+                .unwrap_or_default()
+        };
+        let allowed = select_allowed_nssai(&subscribed, &plmn_default);
+        if allowed.is_empty() {
+            log::warn!(
+                "[{supi}] no authorized S-NSSAI (UDM subscription + PLMN support \
+                 both empty); rejecting registration with 5GMM #62"
+            );
+            let reject =
+                gmm_build::build_registration_reject(GmmCause::NoNetworkSlicesAvailable);
+            self.ue_auth_state.insert(amf_ue_ngap_id, state);
+            self.send_nas_pdu(association_id, amf_ue_ngap_id, ran_ue_ngap_id, &reject)
+                .await?;
+            self.release_ue(association_id, amf_ue_ngap_id, ran_ue_ngap_id, 1)
+                .await?;
+            return Ok(());
         }
         state.amf_ue.allowed_nssai = allowed;
 
@@ -4359,6 +4383,86 @@ fn validate_initial_registration_cleartext(
     None
 }
 
+/// amfd-06: choose the authorized Allowed-NSSAI for a Registration Accept
+/// (TS 23.502 §4.2.2.2.3, TS 24.501 §9.11.3.37).
+///
+/// Authorization is network-authoritative only: the UDM `subscribed` slice set
+/// is used when present, otherwise the AMF's configured `plmn_default` slice
+/// support. The UE's Requested NSSAI is deliberately NOT a parameter — it is the
+/// UE's *ask*, never an authorization, and must never be echoed back as the
+/// Allowed NSSAI. An empty return value means no S-NSSAI is authorized; the
+/// caller MUST then reject the registration with 5GMM cause #62 (No network
+/// slices available) rather than send a Registration Accept.
+fn select_allowed_nssai(subscribed: &[SNssai], plmn_default: &[SNssai]) -> Vec<SNssai> {
+    if !subscribed.is_empty() {
+        subscribed.to_vec()
+    } else {
+        plmn_default.to_vec()
+    }
+}
+
+/// amfd-05: build a NAS Authentication Request that relays an AUSF EAP-Request
+/// to the UE (EAP-AKA', TS 33.501 §6.1.3.1; TS 24.501 §5.4.1.2.4 / §9.11.2.2).
+///
+/// The AMF is a transparent EAP passthrough: it copies the `eap_payload` bytes
+/// returned by the AUSF (`Nausf_UEAuthentication`, TS 29.509 §6.1.3) verbatim
+/// into the EAP message IE (IEI 0x78, type 6 TLV-E) of an Authentication Request,
+/// alongside the ngKSI and ABBA. No RAND/AUTN are present (those belong to the
+/// 5G-AKA path). Encoded via ogs-nas so the wire image is conformant.
+///
+/// This is the additive, self-contained core of amfd-05. Driving the EAP
+/// round-trips needs the AUSF `eap-session` SBI plumbing in `sbi_path.rs`
+/// (out of this change's scope) — see the module status note.
+///
+/// FLAGGED: not yet called by the live authentication path. The branch that
+/// selects EAP-AKA' (on AUSF `authType == "EAP_AKA_PRIME"`) and loops
+/// `eapPayload` to/from the AUSF `eap-session` lives in `sbi_path.rs`, which is
+/// out of scope for this amfd-only change; wiring is E2E-deferred.
+#[allow(dead_code)]
+fn build_eap_authentication_request(tsc: u8, ksi: u8, abba: &[u8], eap_payload: &[u8]) -> Vec<u8> {
+    use ogs_nas::common::types::{Abba, EapMessage, KeySetIdentifier};
+    use ogs_nas::fiveg::message::{build_5gmm_message, AuthenticationRequest, FiveGmmMessage};
+
+    let msg = FiveGmmMessage::AuthenticationRequest(AuthenticationRequest {
+        ngksi: KeySetIdentifier::new(tsc, ksi),
+        abba: Abba::new(abba.to_vec()),
+        rand: None,
+        autn: None,
+        eap_message: Some(EapMessage::new(eap_payload.to_vec())),
+    });
+    build_5gmm_message(&msg).to_vec()
+}
+
+/// amfd-05: extract the EAP-Response payload from a UE Authentication Response
+/// so the AMF can relay it back to the AUSF unchanged (transparent passthrough).
+///
+/// The plain NAS message is `EPD | SHT | msg-type | ...IEs`; the EAP message IE
+/// (IEI 0x78, TS 24.501 §9.11.2.2) carries a 2-octet length followed by the EAP
+/// packet. Returns the raw EAP packet, or `None` when no EAP message IE is
+/// present (e.g. a 5G-AKA Authentication Response carrying RES* under IEI 0x2D).
+///
+/// FLAGGED: paired with [`build_eap_authentication_request`]; not yet called by
+/// the live path (the relay loop to the AUSF lives in `sbi_path.rs`).
+#[allow(dead_code)]
+fn parse_eap_message_from_authentication_response(nas: &[u8]) -> Option<Vec<u8>> {
+    // Skip EPD, SHT, message-type.
+    let mut pos = 3;
+    while pos < nas.len() {
+        if nas[pos] == 0x78 {
+            // IEI(1) + length(2) + EAP packet.
+            let len = ((*nas.get(pos + 1)? as usize) << 8) | (*nas.get(pos + 2)? as usize);
+            let start = pos + 3;
+            let end = start.checked_add(len)?;
+            if end <= nas.len() {
+                return Some(nas[start..end].to_vec());
+            }
+            return None;
+        }
+        pos += 1;
+    }
+    None
+}
+
 /// SNPN allowed-NID list for this AMF (Rel-17, TS 23.501 §5.30).
 ///
 /// Read from `AMF_SNPN_ALLOWED_NIDS` as a comma-separated list of 11-hex-char
@@ -5408,7 +5512,7 @@ mod tests {
         protected.push(sqn);
         protected.extend_from_slice(&inner);
 
-        // Valid MAC decodes without mac_failed
+        // Valid MAC decodes to the plaintext, no mac_failed (amfd-03 happy path).
         let mut amf_side = ue_side.clone();
         amf_side.ul_count = 0;
         let out = nas_security::nas_5gs_security_decode(&mut amf_side, protected[1], &protected)
@@ -5416,14 +5520,22 @@ mod tests {
         assert_eq!(out, inner);
         assert!(!amf_side.mac_failed, "valid MAC must pass");
 
-        // Tampered MAC must be flagged (and the dispatcher discards it)
+        // amfd-03 (fail-closed): a tampered MAC now hard-rejects with
+        // Err(MacVerificationFailed) — the plaintext is never produced — and the
+        // UL COUNT is not advanced (amfd-04 commit-after-verify).
         let mut tampered = protected.clone();
         tampered[2] ^= 0xFF;
         let mut amf_side2 = ue_side.clone();
         amf_side2.ul_count = 0;
-        let _ = nas_security::nas_5gs_security_decode(&mut amf_side2, tampered[1], &tampered)
-            .expect("decode");
-        assert!(amf_side2.mac_failed, "tampered MAC must be detected");
+        let res = nas_security::nas_5gs_security_decode(&mut amf_side2, tampered[1], &tampered);
+        assert!(
+            matches!(
+                res,
+                Err(nas_security::NasSecurityError::MacVerificationFailed)
+            ),
+            "tampered MAC must fail closed with Err, got {res:?}"
+        );
+        assert_eq!(amf_side2.ul_count, 0, "tampered MAC must not advance UL COUNT");
     }
 
     #[test]
@@ -5888,5 +6000,103 @@ mod tests {
         assert_eq!(ngap.nr_integrity_algorithms, 0xC000);
         assert_eq!(ngap.eutra_encryption_algorithms, 0x8000);
         assert_eq!(ngap.eutra_integrity_algorithms, 0x4000);
+    }
+
+    // amfd-06 — Allowed-NSSAI must never echo Requested-NSSAI.
+    #[test]
+    fn amfd06_allowed_nssai_never_echoes_requested() {
+        let subscribed = vec![SNssai { sst: 2, sd: None }];
+        let plmn_default = vec![SNssai { sst: 1, sd: None }];
+
+        // Subscription present -> the authorized (subscribed) set, verbatim.
+        let allowed = select_allowed_nssai(&subscribed, &plmn_default);
+        assert_eq!(allowed.len(), 1);
+        assert_eq!(allowed[0].sst, 2, "must use the network-authorized (subscribed) set");
+
+        // No subscription -> AMF-configured PLMN slice support (still authorized,
+        // not the UE's request). Matches the matched-sim sst=1.
+        let allowed = select_allowed_nssai(&[], &plmn_default);
+        assert_eq!(allowed.len(), 1);
+        assert_eq!(allowed[0].sst, 1);
+
+        // Nothing authorized anywhere -> empty => caller rejects with 5GMM #62.
+        assert!(select_allowed_nssai(&[], &[]).is_empty());
+
+        // Sanity: #62 is the "No network slices available" cause.
+        assert_eq!(GmmCause::NoNetworkSlicesAvailable as u8, 62);
+    }
+
+    // amfd-05 — EAP-AKA' transparent passthrough: AUSF eapPayload -> NAS
+    // Authentication Request EAP message IE (0x78) + ABBA, and the reverse.
+    #[test]
+    fn amfd05_eap_authentication_request_carries_eap_ie_and_abba() {
+        let abba = [0x00u8, 0x00];
+        let eap = [0x01u8, 0x02, 0x05, 0x10, 0xaa, 0xbb]; // opaque AUSF EAP-Request
+        let req = build_eap_authentication_request(0, 0, &abba, &eap);
+
+        // 5GMM plain header + Authentication Request message type.
+        assert_eq!(req[0], 0x7e, "5GMM EPD");
+        assert_eq!(req[1], 0x00, "plain security header");
+        assert_eq!(
+            req[2],
+            gmm_build::message_type::AUTHENTICATION_REQUEST,
+            "message type 0x56"
+        );
+        // ngKSI, then ABBA as LV (len=2, [00,00]).
+        assert_eq!(req[4], 0x02, "ABBA length");
+        assert_eq!(&req[5..7], &abba, "ABBA value carried");
+        // EAP message IE: IEI 0x78, 2-octet length, then the verbatim payload.
+        let iei = req.iter().position(|&b| b == 0x78).expect("EAP message IEI 0x78");
+        let len = ((req[iei + 1] as usize) << 8) | (req[iei + 2] as usize);
+        assert_eq!(len, eap.len(), "EAP length octets");
+        assert_eq!(&req[iei + 3..iei + 3 + len], &eap, "EAP payload relayed verbatim");
+
+        // Reverse direction: parse the EAP-Response back out of an Auth Response.
+        let mut resp = vec![
+            0x7e,
+            0x00,
+            gmm_build::message_type::AUTHENTICATION_RESPONSE,
+            0x78,
+            (eap.len() >> 8) as u8,
+            (eap.len() & 0xff) as u8,
+        ];
+        resp.extend_from_slice(&eap);
+        assert_eq!(
+            parse_eap_message_from_authentication_response(&resp).as_deref(),
+            Some(&eap[..]),
+            "EAP-Response recovered for relay to AUSF"
+        );
+        // A 5G-AKA Authentication Response (RES* under IEI 0x2D, no EAP) -> None.
+        let aka = vec![0x7e, 0x00, 0x57, 0x2d, 0x10];
+        assert!(parse_eap_message_from_authentication_response(&aka).is_none());
+    }
+
+    // amfd-07 — the reporting GmmState tracks the live procedure stage at each
+    // step. The authoritative state is imperative in this module; gmm_sm.rs is a
+    // label that the handlers keep in step via transition_to_*.
+    #[test]
+    fn amfd07_gmm_state_reporting_tracks_live_procedure_stages() {
+        use crate::gmm_sm::GmmState;
+        let mut state = UeNasContext::new(1, 2, 100);
+
+        // Fresh context (pre-registration).
+        assert_eq!(state.gmm_fsm.state, GmmState::Initial);
+
+        // start_authentication() reports Authentication.
+        state.gmm_fsm.transition_to_authentication();
+        assert_eq!(state.gmm_fsm.state, GmmState::Authentication);
+
+        // Security Mode Command reports SecurityMode.
+        state.gmm_fsm.transition_to_security_mode();
+        assert_eq!(state.gmm_fsm.state, GmmState::SecurityMode);
+
+        // Initial Context Setup Request sent.
+        state.gmm_fsm.transition_to_initial_context_setup();
+        assert_eq!(state.gmm_fsm.state, GmmState::InitialContextSetup);
+
+        // gNB confirms / Registration Complete -> Registered.
+        state.gmm_fsm.transition_to_registered();
+        assert_eq!(state.gmm_fsm.state, GmmState::Registered);
+        assert!(state.gmm_fsm.is_registered());
     }
 }
