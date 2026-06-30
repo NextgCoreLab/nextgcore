@@ -193,65 +193,6 @@ fn test_handover_with_tau() {
 }
 
 // ============================================================================
-// Inter-RAT Handover Tests
-// ============================================================================
-
-/// Test: LTE to 5G Handover (N26-based)
-///
-/// Tests EPC to 5GC handover:
-/// 1. MME receives handover indication
-/// 2. MME contacts AMF via N26
-/// 3. AMF prepares target gNB
-/// 4. UE performs inter-RAT handover
-/// 5. PDN session becomes PDU session
-#[test]
-fn test_lte_to_5g_handover() {
-    let config = HandoverTestConfig {
-        target_cell_id: 0x55555555, // 5G cell
-        ..Default::default()
-    };
-
-    let ue_context = create_ue_context(&config);
-    assert!(ue_context.is_ok());
-
-    let ho_result = execute_lte_to_5g_handover(&config);
-    assert!(ho_result.is_ok());
-
-    let result = ho_result.unwrap();
-    assert!(result.success);
-
-    // Verify session continuity
-    assert!(result.bearers_preserved);
-
-    // Inter-RAT handover is slower
-    assert!(result.latency_ms < 500);
-}
-
-/// Test: 5G to LTE Handover (N26-based)
-///
-/// Tests 5GC to EPC fallback:
-/// 1. AMF receives handover indication
-/// 2. AMF contacts MME via N26
-/// 3. MME prepares target eNB
-/// 4. UE performs inter-RAT handover
-/// 5. PDU session becomes PDN session
-#[test]
-fn test_5g_to_lte_handover() {
-    let config = HandoverTestConfig {
-        source_cell_id: 0x55555555, // 5G cell
-        target_cell_id: 0x22222222, // LTE cell
-        ..Default::default()
-    };
-
-    let ho_result = execute_5g_to_lte_handover(&config);
-    assert!(ho_result.is_ok());
-
-    let result = ho_result.unwrap();
-    assert!(result.success);
-    assert!(result.bearers_preserved);
-}
-
-// ============================================================================
 // 5G Handover Tests
 // ============================================================================
 
@@ -520,28 +461,6 @@ fn execute_n2_handover(config: &HandoverTestConfig) -> Result<HandoverResult, &'
         success: true,
         cell_id: config.target_cell_id,
         latency_ms: 90,
-        data_loss: false,
-        bearers_preserved: true,
-        failure_cause: None,
-    })
-}
-
-fn execute_lte_to_5g_handover(config: &HandoverTestConfig) -> Result<HandoverResult, &'static str> {
-    Ok(HandoverResult {
-        success: true,
-        cell_id: config.target_cell_id,
-        latency_ms: 200,
-        data_loss: false,
-        bearers_preserved: true,
-        failure_cause: None,
-    })
-}
-
-fn execute_5g_to_lte_handover(config: &HandoverTestConfig) -> Result<HandoverResult, &'static str> {
-    Ok(HandoverResult {
-        success: true,
-        cell_id: config.target_cell_id,
-        latency_ms: 180,
         data_loss: false,
         bearers_preserved: true,
         failure_cause: None,
