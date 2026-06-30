@@ -85,7 +85,6 @@ Options:
   -p, --push              Push images after building
   -a, --all               Build all network functions
   -5, --5gc               Build only 5G Core NFs
-  -4, --epc               Build only EPC (4G) NFs
   -T, --template          Use template Dockerfile
   -P, --parallel          Build images in parallel
   -j, --jobs N            Number of parallel jobs (default: 4)
@@ -218,13 +217,6 @@ configs/
 │   ├── nssf.yaml
 │   ├── bsf.yaml
 │   └── hnet/              # Home network keys
-├── epc/                    # EPC configurations
-│   ├── mme.yaml
-│   ├── hss.yaml
-│   ├── pcrf.yaml
-│   ├── sgwc.yaml
-│   ├── sgwu.yaml
-│   └── freeDiameter/      # Diameter configurations
 ├── scp.yaml               # SCP configuration
 ├── sepp1.yaml             # SEPP1 configuration
 ├── sepp2.yaml             # SEPP2 configuration
@@ -283,41 +275,6 @@ services:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### EPC Network (172.24.0.0/24)
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        EPC Network                              │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                    HSS (.0.8)                            │   │
-│  │                 Diameter: 3868                           │   │
-│  └─────────────────────────┬───────────────────────────────┘   │
-│                            │ S6a                               │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                    MME (.0.5)                            │   │
-│  │              S1AP: 36412/sctp, GTP-C: 2123              │   │
-│  └─────────────────────────┬───────────────────────────────┘   │
-│                            │ S11                               │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                   SGW-C (.0.3)                           │   │
-│  │              GTP-C: 2123, PFCP: 8805                    │   │
-│  └─────────────────────────┬───────────────────────────────┘   │
-│                            │ Sxa                               │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                   SGW-U (.0.6)                           │   │
-│  │                    GTP-U: 2152                           │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │                   PCRF (.0.9)                            │   │
-│  │                 Diameter: 3868                           │   │
-│  └─────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-```
-
 ### Port Mappings
 
 | Service | Protocol | Port | Description |
@@ -329,8 +286,6 @@ services:
 | SMF | HTTP/2 | 7777 | SBI interface |
 | UPF | UDP | 2152 | GTP-U (N3 to gNB) |
 | UPF | UDP | 8805 | PFCP (N4 to SMF) |
-| MME | SCTP | 36412 | S1AP (to eNB) |
-| HSS | TCP | 3868 | Diameter (S6a) |
 | MongoDB | TCP | 27017 | Database |
 | WebUI | TCP | 9999 | Management UI |
 

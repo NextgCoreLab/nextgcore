@@ -51,7 +51,6 @@ ogs-ngap = { path = "../libs/ogs-ngap" }
 ogs-gtp = { path = "../libs/ogs-gtp" }
 ogs-pfcp = { path = "../libs/ogs-pfcp" }
 ogs-sbi = { path = "../libs/ogs-sbi" }
-ogs-diameter = { path = "../libs/ogs-diameter" }
 ogs-app = { path = "../libs/ogs-app" }
 
 [[test]]

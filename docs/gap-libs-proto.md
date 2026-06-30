@@ -12,7 +12,6 @@ Analysis of 9 protocol libraries under `nextgcore/src/libs/` assessing 5G comple
 | ogs-gtp | Medium | ~2200 | 8+ | 55% | None |
 | ogs-pfcp | Low | ~1200 | 4+ | 25% | None |
 | ogs-sctp | High | ~2750 | 60+ | 85% | Low |
-| ogs-diameter | High | ~3800 | 15+ | 75% | N/A |
 | ogs-asn1c | High | ~3200 | 20+ | 65% | None |
 
 ---
@@ -91,13 +90,6 @@ Missing: Multi-homing, PR-SCTP. 6G: No QUIC transport alternative.
 
 ---
 
-## 8. ogs-diameter
-
-Full RFC 6733 base protocol. 7 interface modules (S6a, Gx, Gy, Rx, Cx, SWx, S6b) with message builders.
-
-**Critical missing**: No transport layer (TCP/SCTP), no peer state machine.
-
----
 
 ## 9. ogs-asn1c (ASN.1 Codec)
 

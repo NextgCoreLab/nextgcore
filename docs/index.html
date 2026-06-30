@@ -304,17 +304,6 @@
           <div class="arch-node data-plane">UPF</div>
         </div>
       </div>
-      <div class="arch-connector">&#8597;</div>
-      <div class="arch-layer">
-        <div class="arch-label">EPC (4G)</div>
-        <div class="arch-nodes">
-          <div class="arch-node epc">MME</div>
-          <div class="arch-node epc">SGW-C</div>
-          <div class="arch-node epc">SGW-U</div>
-          <div class="arch-node epc">HSS</div>
-          <div class="arch-node epc">PCRF</div>
-        </div>
-      </div>
     </div>
   </div>
 </section>
@@ -558,31 +547,7 @@
       </div>
     </div>
 
-    <h3 class="group-heading">EPC (4G Interworking)</h3>
-    <div class="components-grid">
-      <div class="component-card">
-        <div class="component-header"><span class="component-name">MME</span><span class="component-badge badge-epc">EPC</span></div>
-        <div class="component-desc">Mobility Management Entity — LTE attach, TAU, S1-MME.</div>
-      </div>
-      <div class="component-card">
-        <div class="component-header"><span class="component-name">SGW-C</span><span class="component-badge badge-epc">EPC</span></div>
-        <div class="component-desc">Serving Gateway Control — GTP-C, bearer management, S11/S5.</div>
-      </div>
-      <div class="component-card">
-        <div class="component-header"><span class="component-name">SGW-U</span><span class="component-badge badge-epc">EPC</span></div>
-        <div class="component-desc">Serving Gateway User Plane — GTP-U forwarding, buffering.</div>
-      </div>
-      <div class="component-card">
-        <div class="component-header"><span class="component-name">HSS</span><span class="component-badge badge-epc">EPC</span></div>
-        <div class="component-desc">Home Subscriber Server — Diameter S6a, auth vectors.</div>
-      </div>
-      <div class="component-card">
-        <div class="component-header"><span class="component-name">PCRF</span><span class="component-badge badge-epc">EPC</span></div>
-        <div class="component-desc">Policy and Charging Rules — Diameter Gx/Rx.</div>
-      </div>
-    </div>
-
-    <h3 class="group-heading">Shared Libraries (18)</h3>
+    <h3 class="group-heading">Shared Libraries (16)</h3>
     <div class="components-grid">
       <div class="component-card">
         <div class="component-header"><span class="component-name">ogs-sbi</span><span class="component-badge badge-lib">Lib</span></div>
@@ -603,10 +568,6 @@
       <div class="component-card">
         <div class="component-header"><span class="component-name">ogs-gtp</span><span class="component-badge badge-lib">Lib</span></div>
         <div class="component-desc">GTP-C v2 and GTP-U tunneling protocol.</div>
-      </div>
-      <div class="component-card">
-        <div class="component-header"><span class="component-name">ogs-diameter</span><span class="component-badge badge-lib">Lib</span></div>
-        <div class="component-desc">Diameter S6a, Gx, Rx, Cx for EPC/IMS.</div>
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">ogs-metrics</span><span class="component-badge badge-lib">Lib</span></div>
@@ -630,7 +591,7 @@
       </div>
       <div class="component-card">
         <div class="component-header"><span class="component-name">ogs-sctp</span><span class="component-badge badge-lib">Lib</span></div>
-        <div class="component-desc">SCTP transport for NGAP/S1AP signaling.</div>
+        <div class="component-desc">SCTP transport for NGAP signaling.</div>
       </div>
     </div>
   </div>

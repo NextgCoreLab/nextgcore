@@ -10,7 +10,6 @@ members = [
     "libs/ogs-pfcp",
     "libs/ogs-nas",
     "libs/ogs-sbi",
-    "libs/ogs-diameter",
     "libs/ogs-sctp",
     "libs/ogs-ngap",
     "libs/ogs-dbi",
@@ -158,7 +157,6 @@ ogs-gtp = { path = "libs/ogs-gtp" }
 ogs-pfcp = { path = "libs/ogs-pfcp" }
 ogs-nas = { path = "libs/ogs-nas" }
 ogs-sbi = { path = "libs/ogs-sbi" }
-ogs-diameter = { path = "libs/ogs-diameter" }
 ogs-sctp = { path = "libs/ogs-sctp" }
 ogs-ngap = { path = "libs/ogs-ngap" }
 ogs-dbi = { path = "libs/ogs-dbi" }

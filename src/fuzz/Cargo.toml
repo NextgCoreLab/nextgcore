@@ -17,7 +17,6 @@ ogs-pfcp = { path = "../libs/ogs-pfcp" }
 ogs-gtp = { path = "../libs/ogs-gtp" }
 ogs-nas = { path = "../libs/ogs-nas" }
 ogs-ngap = { path = "../libs/ogs-ngap" }
-ogs-diameter = { path = "../libs/ogs-diameter" }
 
 # Workspace members used for fuzzing
 bytes = "1"
@@ -44,13 +43,6 @@ bench = false
 [[bin]]
 name = "fuzz_nas_message"
 path = "fuzz_targets/fuzz_nas_message.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
-name = "fuzz_diameter_message"
-path = "fuzz_targets/fuzz_diameter_message.rs"
 test = false
 doc = false
 bench = false

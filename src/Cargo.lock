@@ -2240,7 +2240,6 @@ dependencies = [
  "ogs-app",
  "ogs-core",
  "ogs-crypt",
- "ogs-diameter",
  "ogs-gtp",
  "ogs-nas",
  "ogs-ngap",
@@ -2492,7 +2491,6 @@ dependencies = [
  "log",
  "ogs-app",
  "ogs-core",
- "ogs-diameter",
  "ogs-gtp",
  "ogs-metrics",
  "ogs-nas",
@@ -2723,21 +2721,6 @@ dependencies = [
  "ogs-core",
  "proptest",
  "serde",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
-name = "ogs-diameter"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bitflags 2.10.0",
- "bytes",
- "log",
- "ogs-core",
- "ogs-crypt",
- "proptest",
  "thiserror 1.0.69",
  "tokio",
 ]
