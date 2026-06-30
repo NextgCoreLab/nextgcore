@@ -54,25 +54,7 @@ docker compose -f docker-compose-5gc.yml up -d
 docker compose -f docker-compose-5gc.yml logs -f
 ```
 
-### Deploy EPC (4G LTE)
-
-```bash
-cd docker/rust
-
-# Build images
-./build.sh -4
-
-# Deploy
-docker compose -f docker-compose-epc.yml up -d
-
-# Verify deployment
-./validate-deployment.sh -4
-
-# View logs
-docker compose -f docker-compose-epc.yml logs -f
-```
-
-### Deploy Full Stack (5GC + EPC)
+### Deploy Full Stack
 
 ```bash
 cd docker/rust
@@ -154,9 +136,8 @@ docker build -f Dockerfile.nf-template \
 
 | File | Description |
 |------|-------------|
-| `docker-compose.yml` | Full deployment (5GC + EPC) |
+| `docker-compose.yml` | Full 5GC deployment |
 | `docker-compose-5gc.yml` | 5G Core only |
-| `docker-compose-epc.yml` | EPC (4G) only |
 
 ### Deployment Profiles
 

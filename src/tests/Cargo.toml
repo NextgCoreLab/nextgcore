@@ -48,7 +48,6 @@ ogs-core = { path = "../libs/ogs-core" }
 ogs-crypt = { path = "../libs/ogs-crypt" }
 ogs-nas = { path = "../libs/ogs-nas" }
 ogs-ngap = { path = "../libs/ogs-ngap" }
-ogs-s1ap = { path = "../libs/ogs-s1ap" }
 ogs-gtp = { path = "../libs/ogs-gtp" }
 ogs-pfcp = { path = "../libs/ogs-pfcp" }
 ogs-sbi = { path = "../libs/ogs-sbi" }

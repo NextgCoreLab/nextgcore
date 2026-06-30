@@ -59,7 +59,6 @@ The gap to a 6G-ready core network is therefore two-layered:
 | **ogs-core** | Core utilities | **Functional** | 26 modules: list, hash, pool, pkbuf, timer, FSM, TLV, socket, poll, TCP/UDP |
 | **ogs-metrics** | Prometheus metrics | **Functional** | Counter/Gauge/Histogram, labels, Prometheus HTTP server |
 | **ogs-ngap** | NGAP protocol | **Minimal** | Only lib.rs stub (ASN.1 APER note) |
-| **ogs-s1ap** | S1AP protocol | Scaffolding | ASN.1 encoding via ogs-asn1c |
 | **ogs-sctp** | SCTP transport | **Working** | sctp-proto 0.6 integration (migration complete per must_be_implemented.txt) |
 | **ogs-gtp** | GTPv2-C protocol | Scaffolding | GTP-C message building |
 | **ogs-diameter** | Diameter protocol | Scaffolding | FreeDiameter integration stubs |
@@ -105,15 +104,9 @@ The project documents 316 TODOs across 8 phases. These represent the prerequisit
 - **SEPP:** N32 interface, PRINS/TLS security, message filtering.
 - **Impact:** No inter-PLMN roaming or service mesh support.
 
-### Phase 6: Protocol Libraries - NGAP/S1AP (MEDIUM, ~20 TODOs)
+### Phase 6: Protocol Libraries - NGAP (MEDIUM, ~20 TODOs)
 - **ogs-ngap:** Only a single-line stub. ASN.1 APER encoding not implemented.
-- **ogs-s1ap:** Scaffolding only.
-- **Impact:** AMF cannot communicate with gNBs; MME cannot communicate with eNBs.
-
-### Phase 7: EPC/Diameter (LOW, ~25 TODOs)
-- **ogs-diameter:** FreeDiameter integration is stub-only.
-- **HSS/PCRF:** S6a, Cx, SWx, Gx, Rx handlers are all stubbed.
-- **Impact:** No EPC authentication or policy control.
+- **Impact:** AMF cannot communicate with gNBs.
 
 ### Phase 8: UPF Enhancements (LOW, ~5 TODOs)
 - **UPF:** Already the most complete NF. Remaining work: URR (usage reporting), QER (QoS enforcement), FAR enhancements.

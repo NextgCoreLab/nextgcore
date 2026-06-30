@@ -13,7 +13,6 @@ members = [
     "libs/ogs-diameter",
     "libs/ogs-sctp",
     "libs/ogs-ngap",
-    "libs/ogs-s1ap",
     "libs/ogs-dbi",
     "libs/ogs-app",
     "libs/ogs-metrics",
@@ -26,16 +25,11 @@ members = [
     "bins/nextgcore-amfd",
     "bins/nextgcore-ausfd",
     "bins/nextgcore-bsfd",
-    "bins/nextgcore-hssd",
-    "bins/nextgcore-mmed",
     "bins/nextgcore-nrfd",
     "bins/nextgcore-nssfd",
     "bins/nextgcore-pcfd",
-    "bins/nextgcore-pcrfd",
     "bins/nextgcore-scpd",
     "bins/nextgcore-seppd",
-    "bins/nextgcore-sgwcd",
-    "bins/nextgcore-sgwud",
     "bins/nextgcore-smfd",
     "bins/nextgcore-udmd",
     "bins/nextgcore-udrd",
@@ -167,7 +161,6 @@ ogs-sbi = { path = "libs/ogs-sbi" }
 ogs-diameter = { path = "libs/ogs-diameter" }
 ogs-sctp = { path = "libs/ogs-sctp" }
 ogs-ngap = { path = "libs/ogs-ngap" }
-ogs-s1ap = { path = "libs/ogs-s1ap" }
 ogs-dbi = { path = "libs/ogs-dbi" }
 ogs-app = { path = "libs/ogs-app" }
 ogs-metrics = { path = "libs/ogs-metrics" }

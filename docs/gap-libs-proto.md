@@ -12,7 +12,6 @@ Analysis of 9 protocol libraries under `nextgcore/src/libs/` assessing 5G comple
 | ogs-gtp | Medium | ~2200 | 8+ | 55% | None |
 | ogs-pfcp | Low | ~1200 | 4+ | 25% | None |
 | ogs-sctp | High | ~2750 | 60+ | 85% | Low |
-| ogs-s1ap | Stub | ~6 | 0 | 0% | None |
 | ogs-diameter | High | ~3800 | 15+ | 75% | N/A |
 | ogs-asn1c | High | ~3200 | 20+ | 65% | None |
 
@@ -89,12 +88,6 @@ Basic session lifecycle messages. 255 IE types defined but only ~20 decoded.
 Dual implementation (pure Rust + kernel). ~60 unit tests. Full lifecycle management.
 
 Missing: Multi-homing, PR-SCTP. 6G: No QUIC transport alternative.
-
----
-
-## 7. ogs-s1ap -- STUB LIBRARY
-
-Same situation as ogs-ngap.
 
 ---
 
