@@ -470,8 +470,9 @@ impl HssContext {
 
     /// Internal helper to get IMSI BCD without acquiring cx_lock (caller must hold lock)
     fn cx_get_imsi_bcd_internal(&self, public_identity: &str) -> Option<String> {
-        let impu_hash = self.impu_hash.read().ok()?;
+        // AB-BA: primary list (impi_list) before index (impu_hash) — canonical order
         let impi_list = self.impi_list.read().ok()?;
+        let impu_hash = self.impu_hash.read().ok()?;
 
         if let Some(&(impi_idx, _)) = impu_hash.get(public_identity) {
             if impi_idx < impi_list.len() {
@@ -500,8 +501,9 @@ impl HssContext {
     pub fn cx_get_user_name(&self, public_identity: &str) -> Option<String> {
         let _lock = self.cx_lock.lock().unwrap();
 
-        let impu_hash = self.impu_hash.read().ok()?;
+        // AB-BA: primary list (impi_list) before index (impu_hash) — canonical order
         let impi_list = self.impi_list.read().ok()?;
+        let impu_hash = self.impu_hash.read().ok()?;
 
         if let Some(&(impi_idx, _)) = impu_hash.get(public_identity) {
             if impi_idx < impi_list.len() {
@@ -516,8 +518,9 @@ impl HssContext {
         let _lock = self.cx_lock.lock().unwrap();
 
         // First check IMPU's server name
-        let impu_hash = self.impu_hash.read().ok()?;
+        // AB-BA: primary list (impi_list) before index (impu_hash) — canonical order
         let impi_list = self.impi_list.read().ok()?;
+        let impu_hash = self.impu_hash.read().ok()?;
 
         if let Some(&(impi_idx, _)) = impu_hash.get(public_identity) {
             if impi_idx < impi_list.len() {

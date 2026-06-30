@@ -286,13 +286,15 @@ impl PcrfContext {
 
     /// Remove Gx session
     pub fn gx_session_remove(&self, sid: &str) -> bool {
+        // AB-BA: primary list (gx_sessions) before index/IP hashes — canonical order
+        let sessions = self.gx_sessions.read();
         let mut hash = self.gx_sid_hash.write().unwrap();
         let mut ipv4_hash = self.ipv4_hash.write().unwrap();
         let mut ipv6_hash = self.ipv6_hash.write().unwrap();
 
         if let Some(&idx) = hash.get(sid) {
             // Remove IP mappings
-            if let Ok(sessions) = self.gx_sessions.read() {
+            if let Ok(ref sessions) = sessions {
                 if let Some(session) = sessions.get(idx) {
                     if let Some(addr) = session.ipv4_addr {
                         ipv4_hash.remove(&u32::from(addr));
@@ -450,11 +452,13 @@ impl PcrfContext {
 
     /// Remove Rx session
     pub fn rx_session_remove(&self, sid: &str) -> bool {
+        // AB-BA: primary list (rx_sessions) before index (rx_sid_hash) — canonical order
+        let rx_sessions = self.rx_sessions.read();
         let mut hash = self.rx_sid_hash.write().unwrap();
 
         if let Some(&idx) = hash.get(sid) {
             // Remove from Gx session's rx_sessions list
-            if let Ok(rx_sessions) = self.rx_sessions.read() {
+            if let Ok(ref rx_sessions) = rx_sessions {
                 if let Some(rx_session) = rx_sessions.get(idx) {
                     let gx_idx = rx_session.gx_session_idx;
                     if let Ok(mut gx_sessions) = self.gx_sessions.write() {
