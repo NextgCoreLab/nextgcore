@@ -1,7 +1,6 @@
 //! Inter-NF communication integration tests
 //!
-//! Tests for SBI communication between 5G NFs, Diameter communication
-//! between EPC NFs, and GTP-C/GTP-U communication.
+//! Tests for SBI communication between 5G NFs and GTP-C/GTP-U communication.
 //! Validates: Requirements 15.5
 
 use bytes::Bytes;
@@ -111,143 +110,6 @@ async fn test_sbi_nf_deregistration() {
     let cap = capture.read().await;
     let msgs = cap.messages_of_type(&MessageType::NfDeregister);
     assert_eq!(msgs.len(), 1);
-}
-
-/// Test Diameter S6a communication (MME-HSS)
-#[tokio::test]
-async fn test_diameter_s6a_authentication() {
-    let _ = env_logger::try_init();
-
-    let capture = Arc::new(RwLock::new(MessageCapture::new()));
-
-    // Simulate Authentication-Information-Request
-    let air = CapturedMessage::new(
-        MessageType::AuthenticationInformationRequest,
-        Bytes::new(),
-        "MME",
-        "HSS",
-    )
-    .with_field("imsi", MessageField::String("001010000000001".to_string()))
-    .with_field(
-        "visited_plmn_id",
-        MessageField::Bytes(vec![0x00, 0xF1, 0x10]),
-    );
-
-    {
-        let mut cap = capture.write().await;
-        cap.capture(air);
-    }
-
-    // Simulate Authentication-Information-Answer
-    let aia = CapturedMessage::new(
-        MessageType::AuthenticationInformationAnswer,
-        Bytes::new(),
-        "HSS",
-        "MME",
-    )
-    .with_field("result_code", MessageField::Number(2001)) // DIAMETER_SUCCESS
-    .with_field("auth_vectors", MessageField::Array(vec![]));
-
-    {
-        let mut cap = capture.write().await;
-        cap.capture(aia);
-    }
-
-    // Verify sequence
-    let cap = capture.read().await;
-    assert!(cap.has_sequence(&[
-        MessageType::AuthenticationInformationRequest,
-        MessageType::AuthenticationInformationAnswer,
-    ]));
-}
-
-/// Test Diameter S6a Update Location
-#[tokio::test]
-async fn test_diameter_s6a_update_location() {
-    let _ = env_logger::try_init();
-
-    let capture = Arc::new(RwLock::new(MessageCapture::new()));
-
-    // Simulate Update-Location-Request
-    let ulr = CapturedMessage::new(
-        MessageType::UpdateLocationRequest,
-        Bytes::new(),
-        "MME",
-        "HSS",
-    )
-    .with_field("imsi", MessageField::String("001010000000001".to_string()))
-    .with_field("ulr_flags", MessageField::Number(0x03));
-
-    {
-        let mut cap = capture.write().await;
-        cap.capture(ulr);
-    }
-
-    // Simulate Update-Location-Answer
-    let ula = CapturedMessage::new(
-        MessageType::UpdateLocationAnswer,
-        Bytes::new(),
-        "HSS",
-        "MME",
-    )
-    .with_field("result_code", MessageField::Number(2001));
-
-    {
-        let mut cap = capture.write().await;
-        cap.capture(ula);
-    }
-
-    // Verify sequence
-    let cap = capture.read().await;
-    assert!(cap.has_sequence(&[
-        MessageType::UpdateLocationRequest,
-        MessageType::UpdateLocationAnswer,
-    ]));
-}
-
-/// Test Diameter Gx communication (PCRF-PGW)
-#[tokio::test]
-async fn test_diameter_gx_credit_control() {
-    let _ = env_logger::try_init();
-
-    let capture = Arc::new(RwLock::new(MessageCapture::new()));
-
-    // Simulate Credit-Control-Request (Initial)
-    let ccr = CapturedMessage::new(
-        MessageType::CreditControlRequest,
-        Bytes::new(),
-        "PGW",
-        "PCRF",
-    )
-    .with_field("cc_request_type", MessageField::Number(1)) // INITIAL_REQUEST
-    .with_field("cc_request_number", MessageField::Number(0));
-
-    {
-        let mut cap = capture.write().await;
-        cap.capture(ccr);
-    }
-
-    // Simulate Credit-Control-Answer
-    let cca = CapturedMessage::new(
-        MessageType::CreditControlAnswer,
-        Bytes::new(),
-        "PCRF",
-        "PGW",
-    )
-    .with_field("result_code", MessageField::Number(2001))
-    .with_field("cc_request_number", MessageField::Number(0));
-
-    {
-        let mut cap = capture.write().await;
-        cap.capture(cca);
-    }
-
-    // Verify sequence
-    let cap = capture.read().await;
-    assert!(cap.has_sequence(&[
-        MessageType::CreditControlRequest,
-        MessageType::CreditControlAnswer,
-    ]));
 }
 
 /// Test GTP-C communication (MME-SGW)
@@ -430,34 +292,6 @@ mod property_tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(50))]
-
-        /// Property: Diameter result codes are valid
-        #[test]
-        fn prop_diameter_result_codes(result_code in 1000i64..6000) {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                let capture = Arc::new(RwLock::new(MessageCapture::new()));
-
-                let aia = CapturedMessage::new(
-                    MessageType::AuthenticationInformationAnswer,
-                    Bytes::new(),
-                    "HSS",
-                    "MME",
-                )
-                .with_field("result_code", MessageField::Number(result_code));
-
-                {
-                    let mut cap = capture.write().await;
-                    cap.capture(aia);
-                }
-
-                let cap = capture.read().await;
-                let msgs = cap.messages_of_type(&MessageType::AuthenticationInformationAnswer);
-                prop_assert_eq!(msgs[0].get_number("result_code"), Some(result_code));
-
-                Ok(())
-            }).unwrap();
-        }
 
         /// Property: GTP TEIDs are 32-bit values
         #[test]

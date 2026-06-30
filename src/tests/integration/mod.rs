@@ -7,7 +7,7 @@
 //!
 //! - `registration`: 5G UE registration and 4G UE attach flows
 //! - `session`: PDU session and EPS bearer establishment
-//! - `inter_nf`: Inter-NF communication (SBI, Diameter, GTP)
+//! - `inter_nf`: Inter-NF communication (SBI, GTP)
 //! - `property`: Property-based tests for protocol flows
 //! - `volte`: Voice over LTE call flows and IMS procedures
 //! - `handover`: Mobility procedures (X2, S1, Xn, N2, inter-RAT)
